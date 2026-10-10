@@ -1,0 +1,129 @@
+# Конфигурация XGW (/etc/xgw/config.toml, права 0600).
+# У всех полей есть значения по умолчанию; неизвестные ключи игнорируются
+# с предупреждением в лог. Пример: скопируйте в /etc/xgw/config.toml
+# и отредактируйте как минимум url подписки.
+
+[network]
+# WAN-интерфейс; пусто — интерфейс маршрута по умолчанию.
+wan_if = ""
+# LAN-интерфейс к Wi-Fi-роутеру; пусто — режим «только эта машина»
+# (без DHCP и форвардинга для устройств).
+lan_if = ""
+# Адрес шлюза в Wi-Fi-сети.
+lan_address = "192.168.50.1/24"
+# ap — роутер в режиме точки доступа (рекомендуется);
+# router — кабель в WAN-порт роутера (двойной NAT).
+router_mode = "ap"
+dhcp_range = "192.168.50.100,192.168.50.200,12h"
+# MAC WAN-порта роутера, нужен только для router_mode = "router".
+router_mac = ""
+# Статические аренды DHCP: "aa:bb:cc:dd:ee:ff,192.168.50.20,tv".
+static_leases = []
+# IP или MAC устройств, которые ходят в интернет мимо VPN.
+bypass_hosts = []
+# off — отключить IPv6 на WAN и LAN (иначе трафик уйдёт мимо перехвата).
+ipv6 = "off"
+# Не давать машине засыпать: уснувшая машина оставляет без интернета весь дом.
+disable_sleep = true
+
+[capture]
+# Перехватывать трафик Wi-Fi-сети.
+lan = true
+# Трафик самой Ubuntu тоже через Xray.
+local = true
+# closed — при упавшем Xray перехваченный трафик никуда не уходит (утечки нет);
+# open — снять перехват, если Xray недоступен дольше 60 с.
+fail_mode = "closed"
+forward_icmp = true
+# Сети мимо Xray, например личный кабинет провайдера.
+exclude_cidrs = []
+tproxy_port = 12345
+mark_proxy = 1   # «в Xray»
+mark_bypass = 2  # «мимо перехвата» (сокеты Xray и прямые запросы XGW)
+route_table = 100
+
+# Подписок может быть несколько.
+[[subscriptions]]
+name = "main"
+url = "https://example.com/sub/TOKEN"
+# Панели выбирают формат ответа по User-Agent; пусто — «xgw/<версия>».
+user_agent = ""
+# Например { "x-hwid" = "..." }, чтобы не занять лишний слот устройств.
+headers = {}
+refresh_minutes = 60
+
+[manual]
+# Дополнительные ссылки vless://, vmess://, trojan://, ss:// вручную.
+links = []
+
+[filters]
+# Если задан — в конфиг попадают только узлы с совпадающим именем.
+include_regex = ""
+# Отсев служебных узлов панелей («истекает», «осталось трафика»).
+exclude_regex = '(?i)(истека|осталось|трафик|expire)'
+# Серверов в балансировщике; остальные — запасные (не тратят трафик проб).
+max_members = 5
+# Участник мёртв дольше — заменить запасным (минуты).
+rotate_after_min = 15
+
+[probe]
+# GET-проба: тело больше 15–20 КиБ выявляет «заморозку» соединения
+# провайдером, которую не видят HEAD-проверки sing-box/mihomo.
+url = "https://speed.cloudflare.com/__down?bytes=65536"
+url_fallback = ""
+trace_url = "https://www.cloudflare.com/cdn-cgi/trace"
+interval = "30s"
+sampling = 2
+timeout = "8s"
+# Как часто проверять запасные серверы (минуты).
+scan_spares_minutes = 60
+# Предупреждать при превышении суточного бюджета проб.
+max_daily_probe_mb = 1024
+
+[routing]
+direct_domains = ["domain:ru", "domain:su", "domain:xn--p1ai"]
+direct_ips = ["geoip:ru"]
+proxy_domains = []
+# Соединение без данных в обе стороны дольше этого закрывается.
+conn_idle_s = 120
+# Выход в эту страну при включённом перехвате = утечка.
+home_country = "RU"
+
+[dns]
+# Через балансировщик Xray.
+proxy_servers = ["1.1.1.1", "8.8.8.8"]
+# Для direct_domains, ходят напрямую.
+direct_servers = ["77.88.8.8"]
+# Разрешение доменов VPN-серверов самим XGW: DoH по IP, затем обычный DNS.
+bootstrap = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "udp://77.88.8.8"]
+
+[xray]
+# "latest" или конкретная версия, не ниже 25.7.23.
+version = "latest"
+api_port = 10085
+metrics_port = 10086
+socks_port = 10808
+http_port = 10809
+probe_port_base = 20001
+
+[apply]
+# Окно планового полного перезапуска Xray (рвёт соединения).
+restart_window = "04:00-05:00"
+
+[watchdog]
+interval_s = 20
+fail_threshold = 3
+wan_check = "ya.ru:443"
+
+[status]
+# Страница статуса на lan_address:8780 (только чтение, по токену).
+lan_page = false
+# Генерируется при установке.
+token = ""
+
+[notify]
+desktop = true
+telegram_bot_token = ""
+telegram_chat_id = ""
+# Один тип события — не чаще чем раз в это число минут.
+min_interval_min = 10

@@ -1,0 +1,412 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:10085",
+    "services": [
+      "HandlerService",
+      "RoutingService",
+      "StatsService"
+    ]
+  },
+  "metrics": {
+    "tag": "metrics",
+    "listen": "127.0.0.1:10086"
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 120
+      }
+    },
+    "system": {
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+  "dns": {
+    "hosts": {
+      "de.example.com": [
+        "203.0.113.11"
+      ],
+      "fr.example.com": [
+        "203.0.113.12"
+      ]
+    },
+    "servers": [
+      {
+        "address": "77.88.8.8",
+        "domains": [
+          "domain:ru",
+          "domain:su",
+          "domain:xn--p1ai"
+        ],
+        "skipFallback": true
+      },
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
+  "inbounds": [
+    {
+      "tag": "tproxy-in",
+      "protocol": "tunnel",
+      "listen": "127.0.0.1",
+      "port": 12345,
+      "settings": {
+        "allowedNetwork": "tcp,udp",
+        "followRedirect": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    },
+    {
+      "tag": "socks-in",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "settings": {
+        "udp": true
+      }
+    },
+    {
+      "tag": "http-in",
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 10809
+    },
+    {
+      "tag": "probe-nl-1243",
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 20001,
+      "settings": {
+        "accounts": [
+          {
+            "user": "xgw",
+            "pass": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
+          }
+        ]
+      }
+    },
+    {
+      "tag": "probe-de-1f80",
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 20002,
+      "settings": {
+        "accounts": [
+          {
+            "user": "xgw",
+            "pass": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
+          }
+        ]
+      }
+    },
+    {
+      "tag": "probe-fr-a55d",
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 20003,
+      "settings": {
+        "accounts": [
+          {
+            "user": "xgw",
+            "pass": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
+          }
+        ]
+      }
+    },
+    {
+      "tag": "probe-nl-d8a7",
+      "protocol": "http",
+      "listen": "127.0.0.1",
+      "port": 20004,
+      "settings": {
+        "accounts": [
+          {
+            "user": "xgw",
+            "pass": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
+          }
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "203.0.113.20",
+            "port": 443,
+            "password": "tr0jan-pass"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "nl2.example.org"
+        },
+        "sockopt": {
+          "mark": 2,
+          "domainStrategy": "UseIPv4"
+        }
+      },
+      "tag": "proxy-nl-1243"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "de.example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "11111111-2222-3333-4455-666666666662",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/ws",
+          "headers": {
+            "Host": "de.example.com"
+          }
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "de.example.com",
+          "fingerprint": "chrome",
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ]
+        },
+        "sockopt": {
+          "mark": 2,
+          "domainStrategy": "UseIPv4"
+        }
+      },
+      "tag": "proxy-de-1f80"
+    },
+    {
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "fr.example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "alterId": 0,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess",
+          "headers": {
+            "Host": "fr.example.com"
+          }
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "fr.example.com",
+          "fingerprint": "chrome"
+        },
+        "sockopt": {
+          "mark": 2,
+          "domainStrategy": "UseIPv4"
+        }
+      },
+      "tag": "spare-fr-a55d"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "203.0.113.10",
+            "port": 443,
+            "users": [
+              {
+                "id": "11111111-2222-3333-4455-666666666661",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "www.example.org",
+          "fingerprint": "chrome",
+          "publicKey": "ERERERERERERERERERERERERERERERERERERERERERE",
+          "shortId": "abcd1234"
+        },
+        "sockopt": {
+          "mark": 2,
+          "domainStrategy": "UseIPv4"
+        }
+      },
+      "tag": "spare-nl-d8a7"
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "mark": 2
+        }
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "dns-out",
+      "protocol": "dns",
+      "streamSettings": {
+        "sockopt": {
+          "mark": 2
+        }
+      }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "probe-nl-1243"
+        ],
+        "outboundTag": "proxy-nl-1243"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "probe-de-1f80"
+        ],
+        "outboundTag": "proxy-de-1f80"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "probe-fr-a55d"
+        ],
+        "outboundTag": "spare-fr-a55d"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "probe-nl-d8a7"
+        ],
+        "outboundTag": "spare-nl-d8a7"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "tproxy-in"
+        ],
+        "port": "53",
+        "outboundTag": "dns-out"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "77.88.8.8"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "geoip:private"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "domain:ru",
+          "domain:su",
+          "domain:xn--p1ai"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "geoip:ru"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "balancerTag": "auto"
+      }
+    ],
+    "balancers": [
+      {
+        "tag": "auto",
+        "selector": [
+          "proxy-"
+        ],
+        "strategy": {
+          "type": "leastPing"
+        },
+        "fallbackTag": "proxy-nl-1243"
+      }
+    ]
+  },
+  "burstObservatory": {
+    "subjectSelector": [
+      "proxy-"
+    ],
+    "pingConfig": {
+      "destination": "https://speed.cloudflare.com/__down?bytes=65536",
+      "connectivity": "",
+      "interval": "30s",
+      "sampling": 2,
+      "timeout": "8s",
+      "httpMethod": "GET"
+    }
+  }
+}

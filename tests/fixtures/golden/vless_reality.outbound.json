@@ -1,0 +1,28 @@
+{
+  "protocol": "vless",
+  "settings": {
+    "vnext": [
+      {
+        "address": "203.0.113.10",
+        "port": 443,
+        "users": [
+          {
+            "id": "11111111-2222-3333-4455-666666666661",
+            "encryption": "none",
+            "flow": "xtls-rprx-vision"
+          }
+        ]
+      }
+    ]
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "serverName": "www.example.org",
+      "fingerprint": "chrome",
+      "publicKey": "ERERERERERERERERERERERERERERERERERERERERERE",
+      "shortId": "abcd1234"
+    }
+  }
+}
