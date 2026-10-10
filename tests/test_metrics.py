@@ -52,3 +52,12 @@ def test_parse_duration_units():
     assert parse_duration(4_809_600, unit_ms=False) == 0.0048096  # average в наносекундах
     assert parse_duration("2s") == 2.0
     assert parse_duration("мусор") is None
+
+
+def test_count_members_separates_unknown_from_dead():
+    from xgw.xraycore.metrics import count_members
+
+    observatory = parse_observatory(REAL_SHAPE)
+    # proxy-a жив, proxy-b мёртв, proxy-c ядро ещё не проверяло; spare-* не считаются
+    assert count_members(observatory, ["proxy-a", "proxy-b", "proxy-c"]) == (1, 1, 1)
+    assert count_members({}, ["proxy-a", "proxy-b"]) == (0, 0, 2)

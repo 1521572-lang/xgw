@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 
 class ConfigError(Exception):
-    """Конфиг unreadable или битый TOML."""
+    """Конфиг не читается или это битый TOML."""
 
 
 @dataclass
@@ -233,15 +233,50 @@ def _type_ok(value: object, default: object) -> bool:
         return isinstance(value, int) and not isinstance(value, bool)
     if isinstance(default, str):
         return isinstance(value, str)
-    if isinstance(default, list):
-        return isinstance(value, list)
-    if isinstance(default, dict):
-        return isinstance(value, dict)
+    if isinstance(default, list):  # все списки в конфиге — списки строк
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if isinstance(default, dict):  # headers: строка → строка
+        return isinstance(value, dict) and all(isinstance(item, str) for item in value.values())
     return True
 
 
+def _seconds(value: str) -> int | None:
+    match = re.fullmatch(r"(\d+)([smh])", value)
+    if not match:
+        return None
+    return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
 def _validate(cfg: Config) -> list[str]:
+    """Проверяет значения; опасные для работы исправляет на значения по умолчанию."""
     warnings: list[str] = []
+    for name in ("include_regex", "exclude_regex"):
+        try:
+            re.compile(getattr(cfg.filters, name))
+        except re.error as exc:
+            default = getattr(Filters(), name)
+            warnings.append(f"filters.{name}: неверное регулярное выражение ({exc}) — сброшено")
+            setattr(cfg.filters, name, default)
+    if cfg.filters.max_members < 1:
+        warnings.append("filters.max_members должен быть не меньше 1 — используется 1")
+        cfg.filters.max_members = 1
+    if cfg.probe.sampling < 1:
+        warnings.append("probe.sampling должен быть не меньше 1 — используется 2")
+        cfg.probe.sampling = Probe().sampling
+    interval = _seconds(cfg.probe.interval)
+    if interval is not None and interval < 10:
+        warnings.append("probe.interval меньше 10s — Xray не принимает интервал короче")
+    if not re.fullmatch(
+        r"\s*([01]\d|2[0-3]):[0-5]\d\s*-\s*([01]\d|2[0-3]):[0-5]\d\s*", cfg.apply.restart_window
+    ):
+        warnings.append(
+            f"apply.restart_window={cfg.apply.restart_window}: ожидается ЧЧ:ММ-ЧЧ:ММ — "
+            f"используется {Apply().restart_window}"
+        )
+        cfg.apply.restart_window = Apply().restart_window
+    for sub in cfg.subscriptions:
+        if not sub.url:
+            warnings.append(f"подписка «{sub.name}»: не задан url")
     if cfg.network.router_mode not in ("ap", "router"):
         warnings.append(f"network.router_mode={cfg.network.router_mode}: допустимо ap или router")
     if cfg.network.ipv6 != "off":
@@ -265,8 +300,9 @@ def _validate(cfg: Config) -> list[str]:
     ]
     if len(set(ports)) != len(ports):
         warnings.append("служебные порты и probe-порты пересекаются — проверьте [xray] и [capture]")
-    if cfg.filters.max_members < 1:
-        warnings.append("filters.max_members должен быть не меньше 1")
+    for name, port in {**listening, "probe_port_base": cfg.xray.probe_port_base}.items():
+        if not 1 <= port <= 65535:
+            warnings.append(f"порт {name}={port} вне диапазона 1–65535")
     if cfg.xray.version != "latest" and not re.fullmatch(r"\d+(\.\d+){0,2}", cfg.xray.version):
         warnings.append('xray.version: "latest" или версия цифрами, например 25.7.23')
     if cfg.notify.telegram_bot_token and not cfg.notify.telegram_chat_id:

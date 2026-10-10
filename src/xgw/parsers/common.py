@@ -8,7 +8,7 @@ import binascii
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import unquote, urlsplit
+from urllib.parse import SplitResult, unquote, urlsplit
 
 
 class ParseError(Exception):
@@ -59,6 +59,23 @@ def split_host_port(text: str) -> tuple[str, int]:
     return host.lower(), int(port_s)
 
 
+def split_link(link: str, label: str) -> tuple[SplitResult, str, int | None]:
+    """urlsplit с понятными ошибками: (части, адрес, порт или None).
+
+    Текст исключения urlsplit в сообщение не попадает: в нём бывает netloc
+    целиком, то есть UUID или пароль.
+    """
+    try:
+        parts = urlsplit(link)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError as exc:
+        raise ParseError(f"{label}: битая ссылка (неверный адрес или порт)") from exc
+    if not host:
+        raise ParseError(f"{label}: нет адреса")
+    return parts, host, port
+
+
 def single(query: dict[str, list[str]], key: str, default: str = "") -> str:
     values = query.get(key)
     if not values:
@@ -91,10 +108,10 @@ def build_stream(
     net: str, security: str, query: dict[str, list[str]], warnings: list[str]
 ) -> tuple[dict, str]:
     """Собирает streamSettings из параметров ссылки. Спорные случаи — как в v2rayN."""
-    net = (net or "tcp").lower()
-    net = _NETWORKS.get(net)
+    requested = (net or "tcp").lower()
+    net = _NETWORKS.get(requested)
     if net is None:
-        warnings.append(f"неизвестный транспорт {net!r}, используется tcp")
+        warnings.append(f"неизвестный транспорт {requested!r}, используется tcp")
         net = "tcp"
     stream: dict = {"network": net}
 
@@ -122,6 +139,8 @@ def build_stream(
         grpc: dict = {"serviceName": single(query, "serviceName")}
         if single(query, "mode") == "multi":
             grpc["multiMode"] = True
+        if single(query, "authority"):
+            grpc["authority"] = single(query, "authority")
         stream["grpcSettings"] = grpc
     elif net == "xhttp":
         xhttp: dict = {}
@@ -160,8 +179,11 @@ def build_stream(
     security = (security or "none").lower()
     if security == "tls":
         tls: dict = {}
-        if single(query, "sni"):
-            tls["serverName"] = single(query, "sni")
+        # Как в v2rayN: без sni именем сервера становится host транспорта —
+        # иначе узел «IP-адрес + CDN-домен в host» не пройдёт проверку сертификата.
+        sni = single(query, "sni") or single(query, "host").split(",")[0].strip()
+        if sni:
+            tls["serverName"] = sni
         if single(query, "fp"):
             tls["fingerprint"] = single(query, "fp")
         if single(query, "alpn"):
@@ -196,7 +218,7 @@ def build_stream(
 def parse_link(link: str) -> RawServer:
     scheme, sep, _ = link.partition("://")
     if not sep:
-        raise ParseError(f"не ссылка: {link[:48]}")
+        raise ParseError("строка не похожа на ссылку сервера")
     scheme = scheme.lower()
     if scheme == "vless":
         from .vless import parse
@@ -218,16 +240,10 @@ def parse_link(link: str) -> RawServer:
 
 
 def _parse_socks(link: str) -> RawServer:
-    try:
-        parts = urlsplit(link)
-    except ValueError as exc:
-        raise ParseError(f"socks: битая ссылка ({exc})") from exc
-    host = (parts.hostname or "").lower()
-    if not host:
-        raise ParseError("socks: нет адреса")
-    if parts.port is None:
+    parts, host, port = split_link(link, "socks")
+    if port is None:
         raise ParseError("socks: нет порта")
-    name = unquote(parts.fragment) or f"{host}:{parts.port}"
+    name = unquote(parts.fragment) or f"{host}:{port}"
     users: list[dict] = []
     userinfo = unquote(parts.username or "")
     if parts.password is not None:
@@ -241,10 +257,10 @@ def _parse_socks(link: str) -> RawServer:
         users.append({"user": user, "pass": password})
     outbound = {
         "protocol": "socks",
-        "settings": {"servers": [{"address": host, "port": parts.port, "users": users}]},
+        "settings": {"servers": [{"address": host, "port": port, "users": users}]},
     }
     credential = users[0]["user"] if users else ""
-    return RawServer(name, "socks", host, parts.port, credential, "tcp/none", outbound)
+    return RawServer(name, "socks", host, port, credential, "tcp/none", outbound)
 
 
 # --- разбор тел подписок -------------------------------------------------------
@@ -256,7 +272,7 @@ _META_RE = re.compile(r"^#\s*([A-Za-z0-9_-]+)\s*:\s*(.*)$")
 def parse_body(raw: bytes | str, source: str = "manual") -> tuple[list[RawServer], dict, list[str]]:
     """base64 (обычный/URL-safe), plain-текст или JSON полных конфигов Xray."""
     text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-    text = text.strip().lstrip("\ufeff")
+    text = text.lstrip("\ufeff").strip()
     if not text:
         return [], {}, [f"{source}: пустой ответ подписки"]
     if text[0] in "{[":
@@ -328,7 +344,10 @@ def _parse_json_body(text: str, source: str) -> tuple[list[RawServer], dict, lis
         outbounds = config.get("outbounds")
         if not isinstance(outbounds, list):
             raise ParseError(f"{source}: JSON без outbounds — не похоже на конфиг Xray")
-        got, got_warnings = xray_json.parse_outbounds(outbounds, source)
+        remarks = config.get("remarks")
+        got, got_warnings = xray_json.parse_outbounds(
+            outbounds, source, remarks=remarks if isinstance(remarks, str) else ""
+        )
         servers.extend(got)
         warnings.extend(got_warnings)
     return servers, {}, warnings

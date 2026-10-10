@@ -81,3 +81,46 @@ def test_missing_file_raises():
 
     with pytest.raises(ConfigError):
         load(Path("Z:/nonexistent-xgw/config.toml"))
+
+
+def _load_text(tmp_path, text: str):
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    return load(path)
+
+
+def test_bad_values_are_replaced_not_fatal(tmp_path):
+    """Значения, с которыми генерация упала бы, заменяются на безопасные с предупреждением."""
+    cfg, warnings = _load_text(
+        tmp_path,
+        '[filters]\ninclude_regex = "(["\nexclude_regex = "*"\nmax_members = 0\n\n'
+        '[probe]\nsampling = 0\ninterval = "5s"\n\n[apply]\nrestart_window = "ночью"\n',
+    )
+    assert cfg.filters.include_regex == ""
+    assert cfg.filters.exclude_regex == Config().filters.exclude_regex
+    assert cfg.filters.max_members == 1
+    assert cfg.probe.sampling == 2
+    assert cfg.apply.restart_window == "04:00-05:00"
+    for needle in ("include_regex", "exclude_regex", "max_members", "sampling",
+                   "меньше 10s", "restart_window"):
+        assert any(needle in warning for warning in warnings), needle
+
+
+def test_list_and_table_items_must_be_strings(tmp_path):
+    cfg, warnings = _load_text(
+        tmp_path,
+        '[manual]\nlinks = [1, 2]\n\n[[subscriptions]]\nname = "a"\n'
+        'url = "https://a.example.com/s"\nheaders = { x-hwid = 5 }\n',
+    )
+    assert cfg.manual.links == []
+    assert cfg.subscriptions[0].headers == {}
+    assert any("manual.links" in warning for warning in warnings)
+    assert any("subscriptions.headers" in warning for warning in warnings)
+
+
+def test_subscription_without_url_and_bad_ports_warn(tmp_path):
+    _cfg, warnings = _load_text(
+        tmp_path, '[[subscriptions]]\nname = "empty"\n\n[xray]\napi_port = 70000\n'
+    )
+    assert any("empty" in warning and "url" in warning for warning in warnings)
+    assert any("api=70000" in warning for warning in warnings)

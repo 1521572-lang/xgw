@@ -21,11 +21,22 @@ from .. import fetch
 
 def fetch_metrics(port: int, *, timeout: float = 5.0) -> dict:
     result = fetch.fetch_url(
-        f"http://127.0.0.1:{port}/debug/vars", timeout=timeout, retries=1
+        f"http://127.0.0.1:{port}/debug/vars", timeout=timeout, retries=0
     )
     if result.status != 200:
         raise RuntimeError(f"/debug/vars: HTTP {result.status}")
     return json.loads(result.body.decode("utf-8"))
+
+
+def count_members(observatory: dict[str, dict], member_tags: list[str]) -> tuple[int, int, int]:
+    """(живые, мёртвые, неизвестные) участники для watch.states.Signals.
+
+    Тега нет в observatory — ядро ещё не завершило по нему ни одной пробы:
+    это «неизвестно», а не «мёртв».
+    """
+    alive = sum(1 for tag in member_tags if tag in observatory and observatory[tag]["alive"])
+    unknown = sum(1 for tag in member_tags if tag not in observatory)
+    return alive, len(member_tags) - alive - unknown, unknown
 
 
 def parse_duration(value: str | int | float, *, unit_ms: bool = True) -> float | None:

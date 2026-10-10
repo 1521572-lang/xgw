@@ -6,10 +6,12 @@ Xray не умеет перечитывать конфиг, поэтому:
 - изменились dns / burstObservatory / policy / api / основные inbounds →
   полный перезапуск: сразу в состояниях ALL_DEAD и XRAY_DOWN (urgent),
   иначе в restart_window или по force_now (xgw apply --now);
-- ошибка любого вызова API → полный перезапуск с новым конфигом;
+- ошибка любого вызова API → полный перезапуск с новым конфигом по тем же
+  правилам; до перезапуска ядро считается изменённым частично, и через API
+  больше ничего не применяется;
 - Xray не поднялся за 15 с после перезапуска → откат на last-good.
 
-Все операции — под файловой блокировкой; конфиг пишется атомарно.
+Все операции — под файловой блокировкой; файлы пишутся атомарно.
 """
 
 from __future__ import annotations
@@ -17,36 +19,43 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
-import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import log
+from ..generator.builder import BALANCER_TAG
 from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
-from ..paths import Paths
+from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.api import ApiClient, ApiError
 from ..xraycore.service import XrayService, XrayServiceError
 
 RESTART_WAIT_SECONDS = 15.0
+Validator = Callable[[dict], "tuple[bool | None, str]"]
 
 
 @dataclass
 class ApplyOutcome:
-    mode: str  # api | restart | restart_deferred | unchanged | rejected | rollback
+    # api | restart | restart_deferred | unchanged | rejected | rollback | failed
+    mode: str
     ops: list[str] = field(default_factory=list)
     detail: str = ""
 
 
 def in_restart_window(window: str, now: datetime.time) -> bool:
-    """«04:00-05:00» — окно планового перезапуска (учитывает переход через полночь)."""
+    """«04:00-05:00» — окно планового перезапуска (учитывает переход через полночь).
+
+    Формат проверяет config._validate; сюда битое окно попасть не должно, а если
+    попало — перезапуск не откладываем навсегда.
+    """
     try:
         start_s, end_s = window.split("-")
         start = datetime.time.fromisoformat(start_s.strip())
         end = datetime.time.fromisoformat(end_s.strip())
     except ValueError:
-        return True  # битое окно считаем «всегда разрешено» + предупреждение в логе
+        return True
     if start <= end:
         return start <= now <= end
     return now >= start or now <= end  # окно через полночь
@@ -61,6 +70,7 @@ class Applier:
         service: XrayService,
         *,
         xray_bin: Path | None = None,
+        validator: Validator | None = None,
         logger=None,
         now_fn=lambda: datetime.datetime.now().time(),
         wait_seconds: float = RESTART_WAIT_SECONDS,
@@ -69,7 +79,10 @@ class Applier:
         self.paths = paths
         self.api = api
         self.service = service
-        self.xray_bin = xray_bin if xray_bin is not None else find_xray(None, paths)
+        if validator is None:
+            binary = xray_bin if xray_bin is not None else find_xray(None, paths)
+            validator = lambda config: validate_config(config, binary)  # noqa: E731
+        self.validator = validator
         self.log = logger or log.get_logger("apply")
         self.now_fn = now_fn
         self.wait_seconds = wait_seconds
@@ -77,103 +90,120 @@ class Applier:
     def apply(
         self, new_config: dict, *, urgent: bool = False, force_now: bool = False
     ) -> ApplyOutcome:
-        ok, output = validate_config(new_config, self.xray_bin)
-        if ok is False:
+        ok, output = self.validator(new_config)
+        if not ok:
+            # Без проверки xray run -test конфиг не применяется: Xray продолжает
+            # работать на последнем рабочем.
             return ApplyOutcome("rejected", detail=output)
-        if ok is None:
-            self.log.warning("xray не найден — конфиг не проверен xray run -test")
-
-        current = self._read_current()
-        if current == new_config:
-            return ApplyOutcome("unchanged")
-
-        if current is None:
-            self._promote(new_config)
-            return self._restart(new_config, urgent=True, reason="первый запуск")
-
-        diff = diff_configs(current, new_config)
-        if not diff.changed:
-            return ApplyOutcome("unchanged")
-
-        if diff.plan is not None:
-            try:
-                ops = apply_plan(self.api, diff.plan)
-                self._promote(new_config)
-                return ApplyOutcome("api", ops=ops)
-            except ApiError as exc:
-                self.log.error("ошибка API (%s) — полный перезапуск", exc)
-                self._promote(new_config)
-                return self._restart(new_config, urgent=True, reason="ошибка API")
-
-        if urgent or force_now:
-            self._promote(new_config)
-            return self._restart(new_config, urgent=True, reason="срочное применение")
-        if in_restart_window(self.cfg.apply.restart_window, self.now_fn()):
-            self._promote(new_config)
-            return self._restart(new_config, reason="окно перезапуска")
-        self._write_pending(new_config)
-        return ApplyOutcome(
-            "restart_deferred",
-            ops=diff.restart_reasons,
-            detail="ожидание окна " + self.cfg.apply.restart_window,
-        )
+        with file_lock(self.paths.lock_file):
+            return self._apply_locked(new_config, restart_now=urgent or force_now)
 
     # --- внутреннее ------------------------------------------------------------
 
-    def _restart(self, config: dict, *, urgent: bool, reason: str) -> ApplyOutcome:
+    def _apply_locked(self, new_config: dict, *, restart_now: bool) -> ApplyOutcome:
+        current = self._read_current()
+        if current is None:
+            return self._restart(new_config, reason="первый запуск")
+        if current == new_config:
+            self._clear_pending()
+            return ApplyOutcome("unchanged")
+
+        diff = diff_configs(current, new_config)
+        reasons = list(diff.restart_reasons)
+        if diff.plan is not None and self.paths.api_dirty_file.exists():
+            reasons.append("ядро изменено через API частично")
+
+        if not reasons and diff.plan is not None:
+            try:
+                ops = apply_plan(self.api, diff.plan)
+            except ApiError as exc:
+                self.log.error("ошибка API (%s) — нужен полный перезапуск", exc)
+                self._mark_dirty()
+                reasons.append("ошибка API")
+            else:
+                self._promote(new_config)
+                return ApplyOutcome("api", ops=ops + diff.deferred)
+
+        if restart_now:
+            return self._restart(new_config, reason="срочное применение: " + ", ".join(reasons))
+        if in_restart_window(self.cfg.apply.restart_window, self.now_fn()):
+            return self._restart(new_config, reason="окно перезапуска: " + ", ".join(reasons))
+        atomic_write_json(self.paths.pending_config_file, new_config)
+        return ApplyOutcome(
+            "restart_deferred",
+            ops=reasons,
+            detail="ожидание окна " + self.cfg.apply.restart_window,
+        )
+
+    def _restart(self, config: dict, *, reason: str) -> ApplyOutcome:
+        self._promote(config)
+        error = self._restart_and_wait()
+        if error is None:
+            return ApplyOutcome("restart", ops=[f"restart ({reason})"])
+        return self._rollback(reason=error)
+
+    def _restart_and_wait(self) -> str | None:
+        """Перезапускает Xray и ждёт ответа API. None — поднялся, иначе причина."""
         try:
             self.service.restart()
         except XrayServiceError as exc:
-            return self._rollback(reason=f"перезапуск не удался: {exc}")
+            return f"перезапуск не удался: {exc}"
+        # Ядро запущено заново с конфигом с диска — следов частичного применения нет.
+        self._clear_dirty()
         deadline = time.monotonic() + self.wait_seconds
-        while time.monotonic() < deadline:
+        while True:
             try:
-                self.api.balancer_info()
-                return ApplyOutcome("restart", ops=[f"restart ({reason})"])
+                # Балансировщик называем явно: без тега `xray api bi` отвечает ошибкой.
+                self.api.balancer_info(BALANCER_TAG)
+                return None
             except ApiError:
+                if time.monotonic() >= deadline:
+                    return f"Xray не поднялся за {self.wait_seconds:.0f} с"
                 time.sleep(0.5)
-        return self._rollback(reason="Xray не поднялся за 15 с")
 
     def _rollback(self, *, reason: str) -> ApplyOutcome:
         last_good = self.paths.last_good_file
-        if not last_good.exists():
-            return ApplyOutcome("rollback", detail=f"{reason}; last-good отсутствует")
         try:
-            good = json.loads(last_good.read_text(encoding="utf-8"))
-            self.paths.xray_config_file.write_text(
-                json.dumps(good, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            self.service.restart()
-        except (OSError, json.JSONDecodeError, XrayServiceError) as exc:
-            self.log.error("откат на last-good не удался: %s", exc)
+            good_text = last_good.read_text(encoding="utf-8")
+            json.loads(good_text)
+        except (OSError, json.JSONDecodeError) as exc:
+            self.log.error("%s; откат невозможен: last-good не читается (%s)", reason, exc)
+            return ApplyOutcome("failed", detail=f"{reason}; last-good отсутствует или бит")
+        atomic_write_text(self.paths.xray_config_file, good_text)
+        error = self._restart_and_wait()
+        if error is not None:
+            self.log.error("%s; откат на last-good не помог: %s", reason, error)
+            return ApplyOutcome("failed", detail=f"{reason}; после отката: {error}")
         return ApplyOutcome("rollback", detail=reason)
 
     def _read_current(self) -> dict | None:
         path = self.paths.xray_config_file
-        if not path.exists():
-            return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            self.log.error("текущий конфиг бит — применяюсь как при первом запуске")
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return None
+        except (OSError, json.JSONDecodeError) as exc:
+            self.log.error("текущий конфиг не читается (%s) — применяю как первый запуск", exc)
+            return None
+        return loaded if isinstance(loaded, dict) else None
 
     def _promote(self, new_config: dict) -> None:
-        """Новый конфиг становится текущим, предыдущий — last-good."""
+        """Новый конфиг становится текущим, предыдущий — last-good.
+
+        Текущий копируется, а не переносится: между двумя записями конфиг Xray
+        не должен пропадать с диска (служба может перезапуститься в любой момент).
+        """
         path = self.paths.xray_config_file
-        if path.exists():
-            last_good = self.paths.last_good_file
-            last_good.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(path, last_good)
-        self._atomic_write(path, new_config)
+        with contextlib.suppress(FileNotFoundError):
+            atomic_write_text(self.paths.last_good_file, path.read_text(encoding="utf-8"))
+        atomic_write_json(path, new_config)
+        self._clear_pending()
 
-    def _write_pending(self, new_config: dict) -> None:
-        self._atomic_write(self.paths.xray_config_dir / "config.pending.json", new_config)
+    def _clear_pending(self) -> None:
+        self.paths.pending_config_file.unlink(missing_ok=True)
 
-    def _atomic_write(self, path: Path, payload: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp, 0o640)
-        os.replace(tmp, path)
+    def _mark_dirty(self) -> None:
+        atomic_write_text(self.paths.api_dirty_file, "1\n", mode=0o644)
+
+    def _clear_dirty(self) -> None:
+        self.paths.api_dirty_file.unlink(missing_ok=True)

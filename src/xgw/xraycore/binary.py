@@ -1,9 +1,7 @@
-"""Загрузка официального Xray-core с GitHub.
+"""Загрузка официального Xray-core с GitHub и проверка установленной версии.
 
 Версия не ниже 25.7.23 (поле httpMethod и дочитывание тела при GET);
-SHA-256 сверяется с файлом .dgst того же релиза. Для разработки
-минимальную версию можно снять переменной XGW_SKIP_VERSION_MIN=1
-(фиксируется в ASSUMPTIONS.md, на целевую машину не переносится).
+SHA-256 сверяется с файлом .dgst того же релиза.
 """
 
 from __future__ import annotations
@@ -15,9 +13,11 @@ import platform
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +64,34 @@ def version_ok(text: str) -> bool:
         return False
 
 
+def min_version_text() -> str:
+    return ".".join(map(str, MIN_VERSION))
+
+
+def installed_version(
+    bin_path: Path | str, *, timeout: float = 15.0
+) -> tuple[int, int, int] | None:
+    """Версия установленного бинарника по `xray version`; None — узнать не удалось.
+
+    Нужна до любой проверки конфига: Xray старше 25.7.23 не знает поля
+    httpMethod, молча его игнорирует и проверяет серверы HEAD-запросом —
+    `xray run -test` при этом проходит, а «заморозку» шлюз перестаёт видеть.
+    """
+    try:
+        proc = subprocess.run(
+            [str(bin_path), "version"], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r"\bXray\s+v?(\d+\.\d+(?:\.\d+)?)", proc.stdout or "")
+    if not match:
+        return None
+    try:
+        return parse_version(match.group(1))
+    except BinaryError:
+        return None
+
+
 def platform_pair() -> tuple[str, str]:
     if sys.platform.startswith("win"):
         goos = "windows"
@@ -74,6 +102,8 @@ def platform_pair() -> tuple[str, str]:
     machine = platform.machine().lower() or "x86_64"
     if machine in ("amd64", "x64"):
         machine = "x86_64"
+    elif machine == "arm64":
+        machine = "aarch64"
     return goos, machine
 
 
@@ -86,7 +116,13 @@ def pick_asset(release: Release, goos: str, machine: str) -> str | None:
     return None
 
 
-def get_release(version: str = "latest", *, timeout: float = 20.0) -> Release:
+def get_release(
+    version: str = "latest",
+    *,
+    timeout: float = 20.0,
+    mark: int | None = None,
+    bootstrap: Sequence[str] | None = None,
+) -> Release:
     if version in ("", "latest"):
         url = f"{RELEASES_API}/latest"
     else:
@@ -95,15 +131,23 @@ def get_release(version: str = "latest", *, timeout: float = 20.0) -> Release:
         url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "xgw-updater"},
         timeout=timeout,
-        retries=2,
+        retries=1,
+        mark=mark,
+        bootstrap=bootstrap,
     )
     if result.status != 200:
         raise BinaryError(f"GitHub API вернул HTTP {result.status}")
-    data = json.loads(result.body.decode("utf-8"))
+    try:
+        data = json.loads(result.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BinaryError("GitHub API вернул не JSON") from exc
+    if not isinstance(data, dict):
+        raise BinaryError("GitHub API вернул неожиданный ответ")
     tag = str(data.get("tag_name") or "")
     assets = {
         str(asset.get("name")): str(asset.get("browser_download_url"))
-        for asset in data.get("assets", [])
+        for asset in data.get("assets") or []
+        if isinstance(asset, dict)
     }
     if not tag or not assets:
         raise BinaryError("в релизе нет тега или файлов")
@@ -111,8 +155,16 @@ def get_release(version: str = "latest", *, timeout: float = 20.0) -> Release:
 
 
 def verify_sha256(data: bytes, dgst_text: str) -> bool:
+    """Сверяет SHA-256 со строкой «SHA2-256= …» файла .dgst.
+
+    Берётся именно эта строка: в .dgst есть и SHA2-512, а любые 64 hex-символа
+    подряд совпали бы и с половиной чужого хеша.
+    """
     digest = hashlib.sha256(data).hexdigest()
-    return any(token.lower() == digest for token in re.findall(r"[0-9a-fA-F]{64}", dgst_text))
+    declared = re.findall(
+        r"(?im)^\s*SHA(?:2-)?256\s*=\s*([0-9a-f]{64})\s*$", dgst_text
+    )
+    return any(value.lower() == digest for value in declared)
 
 
 def download_release(
@@ -120,46 +172,53 @@ def download_release(
     version: str = "latest",
     *,
     mark: int | None = None,
-    enforce_min: bool | None = None,
+    bootstrap: Sequence[str] | None = None,
+    enforce_min: bool = True,
 ) -> tuple[str, Path]:
     """Скачивает zip + .dgst, проверяет SHA-256, распаковывает в dest_dir.
 
-    Возвращает (тег релиза, путь к бинарнику). Существующие файлы заменяет.
+    Возвращает (тег релиза, путь к бинарнику). Файлы заменяются переименованием
+    в пределах одной файловой системы: работающий xray при этом не мешает
+    (запись поверх исполняемого файла дала бы ETXTBSY), а недокачанный
+    бинарник на месте рабочего не окажется.
     """
-    release = get_release(version)
-    if enforce_min is None:
-        enforce_min = os.environ.get("XGW_SKIP_VERSION_MIN") != "1"
+    release = get_release(version, mark=mark, bootstrap=bootstrap)
     if enforce_min and not version_ok(release.tag):
-        raise BinaryError(
-            f"версия {release.tag} ниже требуемой v{'.'.join(map(str, MIN_VERSION))}"
-        )
+        raise BinaryError(f"версия {release.tag} ниже требуемой v{min_version_text()}")
     goos, machine = platform_pair()
     asset = pick_asset(release, goos, machine)
     if asset is None:
         raise BinaryError(f"для {goos}/{machine} нет подходящего файла в релизе {release.tag}")
+    dgst_url = release.assets.get(asset + ".dgst") or release.assets[asset] + ".dgst"
 
-    zip_result = fetch.fetch_url(release.assets[asset], mark=mark, timeout=180, retries=2)
-    dgst_result = fetch.fetch_url(
-        release.assets[asset] + ".dgst", mark=mark, timeout=30, retries=2
+    zip_result = fetch.fetch_url(
+        release.assets[asset], mark=mark, bootstrap=bootstrap, timeout=180, retries=1
     )
+    dgst_result = fetch.fetch_url(dgst_url, mark=mark, bootstrap=bootstrap, timeout=30, retries=1)
+    if zip_result.status != 200 or dgst_result.status != 200:
+        raise BinaryError(
+            f"GitHub не отдал файлы релиза (HTTP {zip_result.status}/{dgst_result.status})"
+        )
     if not verify_sha256(zip_result.body, dgst_result.body.decode("utf-8", "replace")):
         raise BinaryError("SHA-256 архива не совпал с .dgst релиза")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="xgw-xray-") as tmp_dir:
+    binary_name = "xray.exe" if goos == "windows" else "xray"
+    with tempfile.TemporaryDirectory(prefix=".xgw-xray-", dir=dest_dir) as tmp_dir:
         tmp_zip = Path(tmp_dir) / asset
         tmp_zip.write_bytes(zip_result.body)
         with zipfile.ZipFile(tmp_zip) as archive:
             archive.extractall(tmp_dir)
-        for item in Path(tmp_dir).iterdir():
-            if item.is_file() and item != tmp_zip:
-                target = dest_dir / item.name
-                shutil.move(str(item), target)
-                if target.stem == "xray":
-                    target.chmod(
-                        target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-                    )
-    binary = dest_dir / ("xray.exe" if goos == "windows" else "xray")
-    if not binary.exists():
-        raise BinaryError("в архиве релиза нет бинарника xray")
-    return release.tag, binary
+        tmp_zip.unlink()
+        files = [item for item in Path(tmp_dir).iterdir() if item.is_file()]
+        if not any(item.name == binary_name for item in files):
+            raise BinaryError("в архиве релиза нет бинарника xray")
+        # Бинарник переносится последним: geo-файлы к этому моменту уже на месте.
+        for item in sorted(files, key=lambda item: item.name == binary_name):
+            if item.name == binary_name:
+                item.chmod(item.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            try:
+                os.replace(item, dest_dir / item.name)
+            except OSError:
+                shutil.move(str(item), dest_dir / item.name)
+    return release.tag, dest_dir / binary_name

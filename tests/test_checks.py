@@ -1,28 +1,36 @@
 """Детектор «тишины» и классификация сканов — на локальных фейковых серверах."""
 
+import contextlib
+import shutil
 import socket
+import ssl
+import subprocess
 import threading
+import time
 
 import pytest
 
-from xgw.watch.checks import DownloadResult, http_get_via_proxy, tcp_check
+from xgw.watch.checks import DownloadResult, http_get_via_proxy, tcp_check, trace_location
 from xgw.watch.scan import classify
 
+BODY = 65536
 HEADERS = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n"
+URL = "http://origin.example.com/big"
 
 
-class FakeOrigin(threading.Thread):
-    """Локальный сервер-«провайдер»: ok / freeze_after / stall_before_body / refuse."""
+class FakeServer(threading.Thread):
+    """Локальный сервер: на каждое соединение читает запрос и выполняет сценарий —
+    список шагов: bytes (отправить) или float (пауза, секунды)."""
 
-    def __init__(self, mode: str, body: int = 65536, freeze_after: int = 16384):
+    def __init__(self, script: list):
         super().__init__(daemon=True)
-        self.mode = mode
-        self.body = body
-        self.freeze_after = freeze_after
+        self.script = script
+        self.requests: list[bytes] = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
         self.port = self.sock.getsockname()[1]
+        self.start()
 
     def run(self):
         while True:
@@ -34,72 +42,146 @@ class FakeOrigin(threading.Thread):
 
     def _serve(self, conn: socket.socket):
         try:
-            conn.recv(65536)
-            if self.mode == "refuse":
-                conn.close()
-                return
-            conn.sendall(HEADERS)
-            if self.mode == "stall_before_body":
-                import time
-
-                time.sleep(3)
-                conn.close()
-                return
-            payload = b"x" * self.body
-            if self.mode == "freeze_after":
-                conn.sendall(payload[: self.freeze_after])
-                import time
-
-                time.sleep(3)  # «заморозка»: соединение не закрывается, данных нет
-                conn.close()
-                return
-            conn.sendall(payload)
-            conn.close()
+            self.requests.append(conn.recv(65536))
+            for step in self.script:
+                if isinstance(step, bytes):
+                    conn.sendall(step)
+                else:
+                    time.sleep(step)
         except OSError:
             pass
+        finally:
+            conn.close()
 
 
 @pytest.fixture()
-def ok_origin():
-    server = FakeOrigin("ok")
-    server.start()
-    yield server
-    server.sock.close()
+def serve():
+    servers: list[FakeServer] = []
+
+    def factory(*script) -> FakeServer:
+        server = FakeServer(list(script))
+        servers.append(server)
+        return server
+
+    yield factory
+    for server in servers:
+        server.sock.close()
 
 
-@pytest.fixture()
-def frozen_origin():
-    server = FakeOrigin("freeze_after")
-    server.start()
-    yield server
-    server.sock.close()
+@pytest.fixture(scope="module")
+def unbuffered_loopback():
+    """Пропуск, если локальный HTTP-фильтр (веб-защита антивируса и т. п.) придерживает
+    неполные ответы на loopback: тогда «тишину посреди тела» открытым HTTP не
+    воспроизвести. Эти же сценарии поверх TLS проверяются ниже — их фильтр не видит.
+    """
+    server = FakeServer([HEADERS + b"x" * 1024, 2.0])
+    request = b"GET http://origin.example.com/big HTTP/1.1\r\nHost: origin.example.com\r\n\r\n"
+    try:
+        with socket.create_connection(("127.0.0.1", server.port), timeout=2) as client:
+            client.sendall(request)
+            client.settimeout(1.0)
+            received = 0
+            try:
+                while received < len(HEADERS) + 1024:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+            except TimeoutError:
+                pass
+    finally:
+        server.sock.close()
+    if received < len(HEADERS) + 1024:
+        pytest.skip("HTTP на loopback буферизует сторонний фильтр — сценарий проверяется по TLS")
 
 
-def test_full_download_ok(ok_origin):
-    result = http_get_via_proxy(
-        "127.0.0.1", ok_origin.port, "http://origin.example.com/big",
-        timeout=10, silence=1.0,
-    )
-    assert result.ok
-    assert result.downloaded == len(HEADERS) + 65536
+def _get(server: FakeServer, **kwargs) -> DownloadResult:
+    kwargs.setdefault("timeout", 5)
+    kwargs.setdefault("silence", 0.5)
+    return http_get_via_proxy("127.0.0.1", server.port, URL, **kwargs)
+
+
+def test_full_download_ok(serve):
+    result = _get(serve(HEADERS + b"x" * BODY))
+    assert result.ok and result.status == 200
+    assert result.downloaded == BODY  # считаются байты тела, без заголовков
     assert not result.stalled
+    assert classify(result, 1.0) == "OK"
 
 
-def test_freeze_detected_as_stall(frozen_origin):
-    result = http_get_via_proxy(
-        "127.0.0.1", frozen_origin.port, "http://origin.example.com/big",
-        timeout=10, silence=0.5,
-    )
+def test_headers_split_between_packets(serve):
+    """Конец заголовков может прийти в следующем пакете — это не сбой."""
+    result = _get(serve(HEADERS[:-2], 0.1, HEADERS[-2:] + b"x" * BODY))
+    assert result.ok and result.downloaded == BODY
+
+
+def test_freeze_detected_as_stall(serve, unbuffered_loopback):
+    result = _get(serve(HEADERS + b"x" * 16384, 3.0))
     assert not result.ok
-    assert result.stalled
     assert result.frozen  # часть тела пришла, потом тишина
-    assert len(HEADERS) <= result.downloaded < len(HEADERS) + 65536
+    assert result.downloaded == 16384
+    assert classify(result, 5.0) == "FROZEN"
+
+
+def test_silence_after_headers_is_stall_before_body(serve):
+    """Заголовки без единого байта тела — STALL_BEFORE_BODY, а не FROZEN."""
+    result = _get(serve(HEADERS, 3.0))
+    assert result.stalled and result.downloaded == 0 and not result.frozen
+    assert classify(result, 5.0) == "STALL_BEFORE_BODY"
+
+
+def test_silence_before_headers_is_stall_before_body(serve):
+    result = _get(serve(3.0))
+    assert result.stalled and not result.frozen
+    assert classify(result, 5.0) == "STALL_BEFORE_BODY"
+
+
+def test_truncated_body_is_not_ok(serve):
+    """Соединение закрыли после 16 КиБ из 64 — загрузка не состоялась."""
+    result = _get(serve(HEADERS + b"x" * 16384))
+    assert not result.ok and result.kind == "truncated"
+    assert result.downloaded == 16384
+    assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+def test_proxy_auth_failure_is_not_ok(serve):
+    """Неверный пароль probe-inbound (407) не должен выглядеть как живой сервер."""
+    result = _get(serve(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
+    assert not result.ok and result.status == 407 and result.kind == "proxy"
+    assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+def test_http_error_is_not_ok(serve):
+    result = _get(serve(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"))
+    assert not result.ok and result.status == 503
+
+
+def test_slow_drip_hits_total_timeout(serve, unbuffered_loopback):
+    """Сервер «капает» по байту чаще порога тишины — спасает общий таймаут."""
+    drip: list = [HEADERS]
+    for _ in range(40):
+        drip += [b"x", 0.1]
+    result = _get(serve(*drip), max_total=1.0)
+    assert not result.ok and result.kind == "timeout"
+    assert 0 < result.downloaded < 40
+    assert classify(result, 1.0) == "TIMEOUT"
+
+
+def test_chunked_body_ok(serve):
+    head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    result = _get(serve(head + b"5\r\nhello\r\n0\r\n\r\n", 3.0))
+    assert result.ok
+
+
+def test_proxy_credentials_are_sent(serve):
+    server = serve(HEADERS + b"x" * BODY)
+    assert _get(server, proxy_user="xgw", proxy_pass="secret").ok
+    assert b"Proxy-Authorization: Basic eGd3OnNlY3JldA==" in server.requests[0]
+    assert server.requests[0].startswith(b"GET http://origin.example.com/big HTTP/1.1\r\n")
 
 
 def test_connect_fail():
-    result = http_get_via_proxy(
-        "127.0.0.1", 1, "http://origin.example.com/big", timeout=2, silence=1.0
-    )
+    result = http_get_via_proxy("127.0.0.1", 1, URL, timeout=2, silence=1.0)
     assert not result.ok
     assert classify(result, 0.1) == "CONNECT_FAIL"
 
@@ -112,10 +194,192 @@ def test_classify_verdicts():
     assert classify(frozen, 5.0) == "FROZEN"
     stall = DownloadResult(ok=False, downloaded=0, stalled=True)
     assert classify(stall, 5.0) == "STALL_BEFORE_BODY"
-    timeout = DownloadResult(ok=False, error="таймаут соединения")
+    timeout = DownloadResult(ok=False, kind="timeout", error="таймаут соединения")
     assert classify(timeout, 5.0) == "TIMEOUT"
 
 
-def test_tcp_check_local(ok_origin):
-    assert tcp_check("127.0.0.1", ok_origin.port, timeout=2)
+def test_tcp_check_local(serve):
+    assert tcp_check("127.0.0.1", serve(HEADERS).port, timeout=2)
     assert not tcp_check("127.0.0.1", 1, timeout=0.5)
+
+
+def test_trace_location_via_proxy(serve):
+    body = b"fl=1f1\nip=203.0.113.5\nloc=nl\ntls=off\n"
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body)
+    via = ("127.0.0.1", serve(head + body).port)
+    assert trace_location("http://trace.example.com/cdn-cgi/trace", via=via) == "NL"
+    broken = ("127.0.0.1", serve(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").port)
+    assert trace_location("http://trace.example.com/cdn-cgi/trace", via=broken) is None
+
+
+# --- https через CONNECT: так устроены probe.url и trace_url по умолчанию -------
+
+
+class ConnectProxy(threading.Thread):
+    """Минимальный http-inbound: отвечает на CONNECT как Xray и склеивает потоки."""
+
+    REPLY = b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+    def __init__(self, target_port: int, reply: bytes = REPLY):
+        super().__init__(daemon=True)
+        self.target_port = target_port
+        self.reply = reply
+        self.requests: list[bytes] = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.start()
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket):
+        try:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(4096)
+            self.requests.append(request)
+            conn.sendall(self.reply)
+            if not self.reply.startswith(b"HTTP/1.1 2"):
+                conn.close()
+                return
+            upstream = socket.create_connection(("127.0.0.1", self.target_port))
+        except OSError:
+            conn.close()
+            return
+        threading.Thread(target=self._pipe, args=(conn, upstream), daemon=True).start()
+        self._pipe(upstream, conn)
+
+    @staticmethod
+    def _pipe(source: socket.socket, sink: socket.socket):
+        try:
+            while data := source.recv(65536):
+                sink.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (source, sink):
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+
+@pytest.fixture(scope="module")
+def tls_files(tmp_path_factory):
+    """Самоподписанный сертификат на localhost — только для этого теста."""
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("нет openssl — тест https через CONNECT пропущен")
+    directory = tmp_path_factory.mktemp("tls")
+    cert, key = directory / "cert.pem", directory / "key.pem"
+    proc = subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-keyout", str(key), "-out", str(cert), "-subj", "/CN=localhost",
+         "-addext", "subjectAltName=DNS:localhost"],
+        capture_output=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        pytest.skip("openssl не выпустил тестовый сертификат")
+    return cert, key
+
+
+class TlsOrigin(threading.Thread):
+    def __init__(self, cert, key, script: list):
+        super().__init__(daemon=True)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(str(cert), str(key))
+        self.script = script
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.start()
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket):
+        try:
+            tls = self.context.wrap_socket(conn, server_side=True)
+            tls.recv(65536)
+            for step in self.script:
+                if isinstance(step, bytes):
+                    tls.sendall(step)
+                else:
+                    time.sleep(step)
+            tls.close()
+        except (OSError, ssl.SSLError):
+            conn.close()
+
+
+def test_https_download_through_connect_tunnel(tls_files):
+    cert, key = tls_files
+    origin = TlsOrigin(cert, key, [HEADERS + b"x" * BODY])
+    proxy = ConnectProxy(origin.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big",
+        timeout=5, silence=2, proxy_user="xgw", proxy_pass="secret",
+        tls_context=ssl.create_default_context(cafile=str(cert)),
+    )
+    assert result.ok, result.error
+    assert result.downloaded == BODY
+    assert proxy.requests[0].startswith(f"CONNECT localhost:{origin.port} HTTP/1.1".encode())
+    assert b"Proxy-Authorization: Basic eGd3OnNlY3JldA==" in proxy.requests[0]
+
+
+def test_https_freeze_through_connect_tunnel(tls_files):
+    cert, key = tls_files
+    origin = TlsOrigin(cert, key, [HEADERS + b"x" * 16384, 3.0])
+    proxy = ConnectProxy(origin.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big",
+        timeout=5, silence=0.5, tls_context=ssl.create_default_context(cafile=str(cert)),
+    )
+    assert result.frozen and result.downloaded == 16384
+    assert classify(result, 1.0) == "FROZEN"
+
+
+def test_https_slow_drip_hits_total_timeout(tls_files):
+    cert, key = tls_files
+    drip: list = [HEADERS]
+    for _ in range(40):
+        drip += [b"x", 0.1]
+    origin = TlsOrigin(cert, key, drip)
+    proxy = ConnectProxy(origin.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big", timeout=5,
+        silence=0.5, max_total=1.0, tls_context=ssl.create_default_context(cafile=str(cert)),
+    )
+    assert result.kind == "timeout" and 0 < result.downloaded < 40
+    assert classify(result, 1.0) == "TIMEOUT"
+
+
+def test_https_silence_after_headers_is_stall_before_body(tls_files):
+    cert, key = tls_files
+    origin = TlsOrigin(cert, key, [HEADERS, 3.0])
+    proxy = ConnectProxy(origin.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big",
+        timeout=5, silence=0.5, tls_context=ssl.create_default_context(cafile=str(cert)),
+    )
+    assert result.stalled and result.downloaded == 0
+    assert classify(result, 1.0) == "STALL_BEFORE_BODY"
+
+
+def test_connect_rejected_by_proxy():
+    proxy = ConnectProxy(1, reply=b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, "https://origin.example.com/big", timeout=5, silence=1
+    )
+    assert not result.ok and result.kind == "proxy" and result.status == 407
+    assert classify(result, 0.1) == "CONNECT_FAIL"

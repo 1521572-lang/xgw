@@ -2,30 +2,24 @@
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote
 
-from .common import ParseError, RawServer, build_stream, single
+from .common import ParseError, RawServer, build_stream, single, split_link
 
 KNOWN = {
     "type", "security", "sni", "fp", "alpn", "allowInsecure", "insecure",
-    "host", "path", "serviceName", "mode", "pbk", "sid", "headerType", "flow",
+    "host", "path", "serviceName", "mode", "authority", "pbk", "sid", "spx",
+    "headerType", "flow", "extra", "seed",
 }
 
 
 def parse(link: str) -> RawServer:
-    try:
-        parts = urlsplit(link)
-    except ValueError as exc:
-        raise ParseError(f"trojan: битая ссылка ({exc})") from exc
+    parts, host, port = split_link(link, "trojan")
     password = unquote(parts.username or "")
     if not password:
         raise ParseError("trojan: нет пароля")
-    host = (parts.hostname or "").lower()
-    if not host:
-        raise ParseError("trojan: нет адреса")
-    if parts.port is None:
+    if port is None:
         raise ParseError("trojan: нет порта")
-    port = parts.port
 
     query = parse_qs(parts.query, keep_blank_values=True)
     name = unquote(parts.fragment) or f"{host}:{port}"

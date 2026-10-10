@@ -77,3 +77,25 @@ def test_state_kept_between_updates():
 )
 def test_table_from_tz(signals, expected):
     assert StateMachine().update(signals).state is expected
+
+
+def test_unknown_members_are_not_dead():
+    """Сразу после запуска Xray observatory пуст: это не ALL_DEAD и не DEGRADED."""
+    machine = StateMachine()
+    assert machine.update(Signals(alive_members=0, total_members=3, unknown_members=3)).state \
+        is State.HEALTHY
+    assert machine.update(Signals(alive_members=1, total_members=3, unknown_members=2)).state \
+        is State.HEALTHY
+    assert machine.update(Signals(alive_members=1, total_members=3, unknown_members=1)).state \
+        is State.DEGRADED
+    assert machine.update(Signals(alive_members=0, total_members=3, unknown_members=0)).state \
+        is State.ALL_DEAD
+    # сквозная проверка важнее «неизвестно»: поток не идёт fail_threshold раз подряд
+    assert machine.update(
+        Signals(alive_members=0, total_members=3, unknown_members=3,
+                e2e_ok=False, e2e_fail_streak=3)
+    ).state is State.ALL_DEAD
+
+
+def test_no_members_is_not_all_dead():
+    assert StateMachine().update(Signals()).state is State.HEALTHY

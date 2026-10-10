@@ -5,8 +5,9 @@
 включает роль, поэтому замена — это ado нового тега, adrules и rmo старого:
 ровно то, что делает Applier через diff_configs при пересборке конфига.
 
-Теги запасных берутся из текущего BuildResult (как их построил генератор),
-а не вычисляются заново — иначе коллизии тегов дадут расхождение с ядром.
+Порядок работы: plan_rotation → preferred_members → select_nodes(prefer=…) →
+build → Applier.apply. Состав участников хранится в самом применённом конфиге
+(теги proxy-*), поэтому следующая сборка замену не откатит.
 """
 
 from __future__ import annotations
@@ -35,28 +36,36 @@ def plan_rotation(
     cfg: Config,
     now: float,
 ) -> Rotation | None:
+    """alive — только по участникам с известным состоянием: узел, которого ещё
+    нет в observatory (ядро только что запущено), мёртвым не считается."""
     rotate_after = cfg.filters.rotate_after_min * 60
     dead_members = [
         info.tag
         for info in members
-        if not alive.get(info.tag, True)
-        and (now - dead_since.get(info.tag, now)) >= rotate_after
+        if alive.get(info.tag) is False
+        and info.tag in dead_since
+        and (now - dead_since[info.tag]) >= rotate_after
     ]
     if not dead_members:
         return None
     candidates = sorted(
-        (node for info, node in spares if scans.get(info.tag) in REPLACEABLE_VERDICTS),
-        key=lambda node: (
-            0 if scans.get(_current_tag(spares, node)) == "OK" else 1,
-            scan_seconds.get(_current_tag(spares, node), float("inf")),
+        ((info, node) for info, node in spares if scans.get(info.tag) in REPLACEABLE_VERDICTS),
+        key=lambda pair: (
+            0 if scans[pair[0].tag] == "OK" else 1,
+            scan_seconds.get(pair[0].tag, float("inf")),
         ),
     )
-    replacements = list(zip(dead_members, candidates, strict=False))
+    replacements = [
+        (dead_tag, node) for dead_tag, (_info, node) in zip(dead_members, candidates, strict=False)
+    ]
     return Rotation(replacements=replacements) if replacements else None
 
 
-def _current_tag(spares: list[tuple[NodeInfo, ServerNode]], node: ServerNode) -> str:
-    for info, candidate in spares:
-        if candidate.fingerprint == node.fingerprint:
-            return info.tag
-    return ""
+def preferred_members(members: list[NodeInfo], rotation: Rotation | None) -> list[str]:
+    """Отпечатки участников после замены — аргумент prefer для select_nodes.
+
+    Замена встаёт на место выбывшего, остальные сохраняют порядок; выбывший
+    в списке не остаётся и при сборке становится запасным.
+    """
+    swap = {tag: node.fingerprint for tag, node in (rotation.replacements if rotation else [])}
+    return [swap.get(info.tag, info.fingerprint) for info in members]

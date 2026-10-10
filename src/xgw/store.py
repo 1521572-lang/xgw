@@ -1,11 +1,16 @@
-"""Состояние XGW в SQLite: известные узлы, события, мета."""
+"""Состояние XGW: SQLite (известные узлы, события, мета) и кэш подписок."""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .paths import atomic_write_bytes, atomic_write_json
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -31,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events (
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
@@ -62,6 +67,17 @@ class Store:
         )
         self.conn.commit()
 
+    def replace_nodes(self, entries: list[dict]) -> None:
+        """Таблица узлов отражает последний сгенерированный конфиг целиком:
+        серверы, пропавшие из подписки, в ней не остаются."""
+        with self.conn:
+            self.conn.execute("DELETE FROM nodes")
+            self.conn.executemany(
+                "INSERT INTO nodes (fingerprint, tag, role, name, source, address, port, updated) "
+                "VALUES (:fingerprint, :tag, :role, :name, :source, :address, :port, :updated)",
+                entries,
+            )
+
     def all_nodes(self) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM nodes ORDER BY role, tag").fetchall()
         return [dict(row) for row in rows]
@@ -86,4 +102,57 @@ class Store:
              "events": self.recent_events(10)},
             ensure_ascii=False,
             indent=2,
+        )
+
+
+@dataclass
+class CachedSubscription:
+    body: bytes
+    userinfo: dict[str, int] = field(default_factory=dict)
+    saved_at: float = 0.0
+
+
+class SubscriptionCache:
+    """Последняя удачная версия каждой подписки в /var/lib/xgw/cache.
+
+    Тело содержит ссылки с секретами, поэтому файлы — 0600. Сохраняется только
+    ответ, из которого удалось разобрать серверы: пустой или битый кэш не затирает.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    def _stem(self, name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "sub"
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+        return f"{safe[:40]}-{digest}"
+
+    def save(self, name: str, body: bytes, userinfo: dict[str, int] | None = None) -> None:
+        stem = self._stem(name)
+        atomic_write_bytes(self.directory / f"{stem}.body", body, mode=0o600)
+        atomic_write_json(
+            self.directory / f"{stem}.json",
+            {"name": name, "saved_at": time.time(), "userinfo": userinfo or {}},
+            mode=0o600,
+        )
+
+    def load(self, name: str) -> CachedSubscription | None:
+        stem = self._stem(name)
+        try:
+            body = (self.directory / f"{stem}.body").read_bytes()
+        except OSError:
+            return None
+        meta: dict = {}
+        try:
+            loaded = json.loads((self.directory / f"{stem}.json").read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+        userinfo = meta.get("userinfo")
+        saved_at = meta.get("saved_at")
+        return CachedSubscription(
+            body=body,
+            userinfo=userinfo if isinstance(userinfo, dict) else {},
+            saved_at=float(saved_at) if isinstance(saved_at, (int, float)) else 0.0,
         )

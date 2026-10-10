@@ -2,31 +2,24 @@
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote
 
-from .common import ParseError, RawServer, build_stream, single
+from .common import ParseError, RawServer, build_stream, single, split_link
 
 KNOWN = {
     "type", "security", "encryption", "flow", "headerType", "host", "path",
-    "serviceName", "mode", "sni", "fp", "alpn", "pbk", "sid", "spx",
+    "serviceName", "mode", "authority", "sni", "fp", "alpn", "pbk", "sid", "spx",
     "allowInsecure", "insecure", "extra", "seed",
 }
 
 
 def parse(link: str) -> RawServer:
-    try:
-        parts = urlsplit(link)
-    except ValueError as exc:
-        raise ParseError(f"vless: битая ссылка ({exc})") from exc
+    parts, host, port = split_link(link, "vless")
     user = unquote(parts.username or "")
     if not user:
         raise ParseError("vless: нет UUID")
-    host = (parts.hostname or "").lower()
-    if not host:
-        raise ParseError("vless: нет адреса")
-    if parts.port is None:
+    if port is None:
         raise ParseError("vless: нет порта")
-    port = parts.port
 
     query = parse_qs(parts.query, keep_blank_values=True)
     name = unquote(parts.fragment) or f"{host}:{port}"

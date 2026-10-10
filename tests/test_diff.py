@@ -65,10 +65,51 @@ def test_removed_outbound_is_rmo():
 def test_dns_change_requires_restart():
     old = _current()
     new = json_copy(old)
-    new["dns"]["hosts"]["extra.example.com"] = ["203.0.113.99"]
+    new["dns"]["servers"].append("9.9.9.9")
     diff = diff_configs(old, new)
     assert diff.plan is None
     assert "секция dns" in diff.restart_reasons
+
+
+def test_dns_hosts_change_alone_does_not_require_restart():
+    """Раздел 6.4: домен сервера, добавленного через API, попадает в hosts при
+    следующем перезапуске — сам по себе перезапуска не требует."""
+    old = _current()
+    new = json_copy(old)
+    new["dns"]["hosts"]["extra.example.com"] = ["203.0.113.99"]
+    diff = diff_configs(old, new)
+    assert diff.plan is not None and diff.plan.empty
+    assert diff.restart_reasons == []
+    assert diff.changed  # конфиг на диске обновить нужно
+    assert any("dns.hosts" in note for note in diff.deferred)
+
+
+def test_changed_outbound_and_probe_are_replaced():
+    """Тег тот же, содержимое другое — старый обработчик снимается, ставится новый."""
+    old = _current()
+    new = json_copy(old)
+    new["outbounds"][0]["streamSettings"]["tlsSettings"] = {"serverName": "changed.example.org"}
+    new["inbounds"][3]["port"] = 20777
+    diff = diff_configs(old, new)
+    assert diff.changed and diff.restart_reasons == []
+    assert [o["tag"] for o in diff.plan.replace_outbounds] == [new["outbounds"][0]["tag"]]
+    assert [i["tag"] for i in diff.plan.replace_inbounds] == [new["inbounds"][3]["tag"]]
+    assert diff.plan.add_outbounds == [] and diff.plan.remove_outbound_tags == []
+
+    client = _RecordingClient()
+    apply_plan(client, diff.plan)
+    probe_tag, proxy_tag = new["inbounds"][3]["tag"], new["outbounds"][0]["tag"]
+    assert client.calls == [f"rmi:{probe_tag}", "adi", f"rmo:{proxy_tag}", "ado"]
+
+
+def test_static_outbound_change_requires_restart():
+    """direct/block/dns-out — каркас: через них идёт служебный трафик ядра."""
+    old = _current()
+    new = json_copy(old)
+    direct = next(o for o in new["outbounds"] if o["tag"] == "direct")
+    direct["streamSettings"]["sockopt"]["mark"] = 7
+    diff = diff_configs(old, new)
+    assert diff.plan is None and "основные outbounds" in diff.restart_reasons
 
 
 def test_burst_observatory_change_requires_restart():

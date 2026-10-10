@@ -84,3 +84,52 @@ def test_no_candidates_no_rotation():
         now=1000.0,
     )
     assert rotation is None
+
+
+def test_node_without_observation_is_not_rotated():
+    """Участника нет в observatory (ядро только что запущено) — не мёртвый."""
+    members = [_info("proxy-a-1111", "a")]
+    spares = [(_info("spare-c-3333", "c", "spare"), _node("33333333", "C"))]
+    rotation = plan_rotation(
+        alive={}, dead_since={"proxy-a-1111": 0.0}, scans={"spare-c-3333": "OK"},
+        scan_seconds={}, members=members, spares=spares, cfg=Config(), now=10_000.0,
+    )
+    assert rotation is None
+
+
+def test_rotation_survives_rebuild():
+    """plan_rotation → preferred_members → select_nodes: замена закрепляется в составе."""
+    from xgw.apply.rotation import preferred_members
+    from xgw.generator.builder import build, select_nodes
+
+    cfg = Config()
+    cfg.filters.max_members = 2
+    nodes = [_node("aaaa0000", "A"), _node("bbbb0000", "B"), _node("cccc0000", "C")]
+    for node in nodes:
+        node.outbound = {"protocol": "vless", "settings": {}}
+    first = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="p" * 32)
+    members = [info for info in first.nodes if info.role == "proxy"]
+    spares = [(info, nodes[2]) for info in first.nodes if info.role == "spare"]
+    assert [info.tag for info in members] == ["proxy-xx-aaaa", "proxy-xx-bbbb"]
+
+    rotation = plan_rotation(
+        alive={"proxy-xx-aaaa": False, "proxy-xx-bbbb": True},
+        dead_since={"proxy-xx-aaaa": 0.0},
+        scans={"spare-xx-cccc": "OK"},
+        scan_seconds={"spare-xx-cccc": 0.4},
+        members=members, spares=spares, cfg=cfg, now=16 * 60.0,
+    )
+    prefer = preferred_members(members, rotation)
+    assert prefer == ["cccc0000", "bbbb0000"]
+    second = build(cfg, select_nodes(nodes, cfg, prefer=prefer), hosts={},
+                   probe_password="p" * 32)
+    assert [info.tag for info in second.nodes] == [
+        "proxy-xx-cccc", "proxy-xx-bbbb", "spare-xx-aaaa",
+    ]
+    # probe-inbounds и их порты при смене ролей не трогаются
+    assert {i.probe_tag: i.probe_port for i in first.nodes} == {
+        i.probe_tag: i.probe_port
+        for i in build(cfg, select_nodes(nodes, cfg, prefer=prefer), hosts={},
+                       probe_password="p" * 32,
+                       probe_ports={i.probe_tag: i.probe_port for i in first.nodes}).nodes
+    }

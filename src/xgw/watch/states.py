@@ -27,6 +27,10 @@ class Signals:
     xray_ok: bool = True           # API и метрики отвечают
     alive_members: int = 0
     total_members: int = 0
+    # Участники, по которым observatory ещё ничего не сообщил (ядро только что
+    # запущено, первая проба не завершилась). Это не «мёртвые»: иначе каждый
+    # перезапуск Xray давал бы ложный ALL_DEAD с обновлением подписки и уведомлением.
+    unknown_members: int = 0
     e2e_ok: bool = True            # сквозная загрузка probe.url через http-in
     e2e_fail_streak: int = 0
     leak: bool = False             # trace_url вышел в home_country
@@ -55,17 +59,19 @@ class StateMachine:
         self.state: State = State.HEALTHY
 
     def update(self, signals: Signals) -> StateDecision:
+        dead_members = signals.total_members - signals.alive_members - signals.unknown_members
+        all_dead = signals.total_members > 0 and dead_members >= signals.total_members
         if not signals.xray_ok:
             self.state = State.XRAY_DOWN
         elif not signals.provider_ok:
             self.state = State.WAN_DOWN
         elif signals.leak:
             self.state = State.LEAK
-        elif signals.alive_members == 0 or (
+        elif all_dead or (
             signals.e2e_fail_streak >= self.fail_threshold and not signals.e2e_ok
         ):
             self.state = State.ALL_DEAD
-        elif signals.alive_members < signals.total_members:
+        elif dead_members > 0:
             self.state = State.DEGRADED
         else:
             self.state = State.HEALTHY

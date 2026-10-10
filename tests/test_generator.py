@@ -6,7 +6,14 @@ import links
 from conftest import golden
 
 from xgw.config import Config
-from xgw.generator.builder import BuildResult, _unique_tag, build, select_nodes
+from xgw.generator.builder import (
+    BuildResult,
+    assign_suffixes,
+    build,
+    member_fingerprints,
+    probe_state,
+    select_nodes,
+)
 from xgw.model import ServerNode, raw_to_node
 from xgw.parsers.common import parse_links_text
 
@@ -106,14 +113,93 @@ def test_tags_stable_when_input_shuffled():
     assert straight.config == shuffled.config
 
 
+def _node(fingerprint: str, name: str, country: str = "nl") -> ServerNode:
+    outbound = {"protocol": "vless", "settings": {}}
+    return ServerNode(fingerprint, name, country, "vless", "203.0.113.1", 443, outbound, "t")
+
+
 def test_tag_collision_uses_more_hex():
-    taken: set[str] = set()
-    first = ServerNode("abc12345", "A", "nl", "vless", "203.0.113.1", 443, {}, "t")
-    second = ServerNode("abc12399", "B", "nl", "vless", "203.0.113.2", 443, {}, "t")
-    tag1 = _unique_tag("proxy", first, taken)
-    tag2 = _unique_tag("proxy", second, taken)
-    assert tag1 == "proxy-nl-abc1"
-    assert tag2 == "proxy-nl-abc123"  # при коллизии — 6 hex
+    first, second, other = _node("abc12345", "A"), _node("abc12399", "B"), _node("abc1ffff", "C")
+    third = _node("abc12345"[:4] + "0000", "D", country="de")  # другая страна — не коллизия
+    suffixes = assign_suffixes([first, second, other, third])
+    assert suffixes["abc1ffff"] == "nl-abc1ff"  # при коллизии — 6 hex
+    assert suffixes["abc12345"] == "nl-abc12345"  # 6 hex тоже совпали — 8
+    assert suffixes["abc12399"] == "nl-abc12399"
+    assert suffixes["abc10000"] == "de-abc1"
+    # результат не зависит от порядка обхода
+    assert assign_suffixes([third, other, second, first]) == suffixes
+
+
+def test_member_and_spare_with_same_prefix_get_distinct_probe_tags():
+    """Участник и запасной с одинаковыми 4 hex не должны делить один probe-тег."""
+    cfg = Config()
+    cfg.filters.max_members = 1
+    selection = select_nodes([_node("3fa2aaaa", "NL a"), _node("3fa2bbbb", "NL b")], cfg)
+    result = build(cfg, selection, hosts={}, probe_password="P" * 32)
+    assert [info.tag for info in result.nodes] == ["proxy-nl-3fa2aa", "spare-nl-3fa2bb"]
+    inbound_tags = [inbound["tag"] for inbound in result.config["inbounds"]]
+    assert len(inbound_tags) == len(set(inbound_tags))
+    outbound_tags = [outbound["tag"] for outbound in result.config["outbounds"]]
+    assert len(outbound_tags) == len(set(outbound_tags))
+
+
+def _ports(result: BuildResult) -> dict[str, int]:
+    return {info.probe_tag: info.probe_port for info in result.nodes}
+
+
+def test_probe_ports_and_password_survive_new_server():
+    """Новый сервер в подписке не меняет порты и пароль уже работающих probe-inbounds."""
+    first, cfg, _ = _build(password=None)
+    password, ports = probe_state(first.config)
+    assert password and ports == _ports(first)
+
+    raws, _, _ = parse_links_text("\n".join([*links.FULL_LINKS, links.TROJAN_INSECURE]), "test")
+    nodes = [raw_to_node(raw, "test") for raw in raws]
+    prefer = member_fingerprints(first.config, nodes)
+    second = build(
+        cfg, select_nodes(nodes, cfg, prefer=prefer), hosts={},
+        probe_password=password, probe_ports=ports,
+    )
+    new_ports = _ports(second)
+    assert all(new_ports[tag] == port for tag, port in ports.items())
+    assert len(set(new_ports.values())) == len(new_ports) == 5
+    assert probe_state(second.config)[0] == password
+    # состав участников тоже сохранён: новый сервер стал запасным
+    assert [i.tag for i in second.nodes if i.role == "proxy"] == [
+        i.tag for i in first.nodes if i.role == "proxy"
+    ]
+
+
+def test_probe_ports_skip_service_ports():
+    cfg = Config()
+    cfg.xray.probe_port_base = cfg.xray.socks_port  # 10808; следом идёт http_port 10809
+    selection = select_nodes([_node("11112222", "A"), _node("33334444", "B")], cfg)
+    result = build(cfg, selection, hosts={}, probe_password="P" * 32)
+    assert [info.probe_port for info in result.nodes] == [10810, 10811]
+
+
+def test_prefer_keeps_rotation_result():
+    """select_nodes(prefer=…) закрепляет состав участников — замена не откатывается."""
+    cfg = Config()
+    cfg.filters.max_members = 2
+    nodes = [_node("aaaa0000", "A"), _node("bbbb0000", "B"), _node("cccc0000", "C")]
+    default = select_nodes(nodes, cfg)
+    assert [n.fingerprint for n in default.members] == ["aaaa0000", "bbbb0000"]
+    rotated = select_nodes(nodes, cfg, prefer=["cccc0000", "bbbb0000"])
+    assert [n.fingerprint for n in rotated.members] == ["cccc0000", "bbbb0000"]
+    assert [n.fingerprint for n in rotated.spares] == ["aaaa0000"]
+    # отпечаток, которого больше нет в подписке, игнорируется; место занимает следующий
+    gone = select_nodes(nodes, cfg, prefer=["dddd0000", "cccc0000"])
+    assert [n.fingerprint for n in gone.members] == ["cccc0000", "aaaa0000"]
+
+
+def test_ipv6_server_dropped_when_ipv6_off():
+    cfg = Config()
+    node = _node("aaaa0000", "v6")
+    node.address = "2001:db8::1"
+    selection = select_nodes([node, _node("bbbb0000", "v4")], cfg)
+    assert [n.name for n in selection.members] == ["v4"]
+    assert any("IPv6" in warning for warning in selection.warnings)
 
 
 def test_select_filters_and_junk():

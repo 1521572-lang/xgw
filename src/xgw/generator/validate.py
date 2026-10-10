@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import shutil
@@ -16,6 +15,7 @@ from pathlib import Path
 
 from .. import masking
 from ..paths import Paths
+from ..xraycore import binary
 
 
 def find_xray(explicit: str | Path | None = None, paths: Paths | None = None) -> Path | None:
@@ -37,17 +37,12 @@ def find_xray(explicit: str | Path | None = None, paths: Paths | None = None) ->
     return None
 
 
-def validate_config(config: dict, xray_bin: Path | None) -> tuple[bool | None, str]:
-    """True/False — вердикт xray run -test; None — Xray не найден (проверка пропущена)."""
-    if xray_bin is None:
-        return None, "xray не найден — проверка xray run -test пропущена"
-    fd, tmp_name = tempfile.mkstemp(prefix="xgw-validate-", suffix=".json")
+def _run_test(config: dict, xray_bin: Path) -> tuple[bool, str]:
+    fd, tmp_name = tempfile.mkstemp(prefix="xgw-validate-", suffix=".json")  # права 0600
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(config, handle, ensure_ascii=False, indent=2)
-        with contextlib.suppress(OSError):
-            os.chmod(tmp, 0o600)
         try:
             proc = subprocess.run(
                 [str(xray_bin), "run", "-test", "-c", str(tmp)],
@@ -57,7 +52,44 @@ def validate_config(config: dict, xray_bin: Path | None) -> tuple[bool | None, s
             )
         except subprocess.TimeoutExpired:
             return False, "xray run -test: таймаут 60 с"
-        output = masking.mask_text((proc.stdout or "") + (proc.stderr or ""))
+        except OSError as exc:
+            return False, f"xray run -test не запустился: {exc}"
+        secrets = masking.collect_secrets(config)
+        output = masking.mask_text((proc.stdout or "") + (proc.stderr or ""), secrets)
         return proc.returncode == 0, output.strip()
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def validate_config(config: dict, xray_bin: Path | None) -> tuple[bool | None, str]:
+    """True/False — вердикт xray run -test; None — Xray не найден (проверка пропущена).
+
+    Xray старше минимальной версии — отказ ещё до проверки: такой бинарник
+    конфиг примет, но поле httpMethod проигнорирует.
+    """
+    if xray_bin is None:
+        return None, "xray не найден — проверка xray run -test пропущена"
+    version = binary.installed_version(xray_bin)
+    if version is not None and version < binary.MIN_VERSION:
+        found = ".".join(map(str, version))
+        return False, (
+            f"установлен Xray {found}, нужен не ниже {binary.min_version_text()}: "
+            "в более старых нет GET-проб (burstObservatory.pingConfig.httpMethod)"
+        )
+    return _run_test(config, xray_bin)
+
+
+def find_invalid_outbounds(outbounds: list[dict], xray_bin: Path) -> dict[str, str]:
+    """Тег → ошибка для outbounds, которые установленный Xray не принимает.
+
+    Каждый outbound проверяется отдельным минимальным конфигом. Нужно, чтобы
+    один сервер с неподдерживаемым транспортом или шифром не блокировал
+    обновление всей подписки: его можно отбросить и собрать конфиг без него.
+    """
+    invalid: dict[str, str] = {}
+    for outbound in outbounds:
+        ok, output = _run_test({"log": {"loglevel": "warning"}, "outbounds": [outbound]}, xray_bin)
+        if not ok:
+            lines = [line for line in output.splitlines() if line.strip()]
+            invalid[str(outbound.get("tag", ""))] = lines[-1] if lines else "ошибка проверки"
+    return invalid

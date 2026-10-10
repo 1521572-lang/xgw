@@ -36,11 +36,17 @@ class SystemdXrayService(XrayService):
         self.unit = unit
 
     def _systemctl(self, *args: str) -> str:
-        proc = subprocess.run(
-            ["systemctl", *args, self.unit], capture_output=True, text=True, timeout=30
-        )
+        command = " ".join(args)
+        try:
+            proc = subprocess.run(
+                ["systemctl", *args, self.unit], capture_output=True, text=True, timeout=30
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise XrayServiceError(f"systemctl {command}: таймаут 30 с") from exc
+        except OSError as exc:
+            raise XrayServiceError(f"systemctl {command}: {exc}") from exc
         if proc.returncode != 0:
-            raise XrayServiceError(f"systemctl {args}: {proc.stderr.strip()}")
+            raise XrayServiceError(f"systemctl {command}: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
     def start(self) -> None:
@@ -53,9 +59,12 @@ class SystemdXrayService(XrayService):
         self._systemctl("restart")
 
     def is_active(self) -> bool:
-        proc = subprocess.run(
-            ["systemctl", "is-active", "--quiet", self.unit], timeout=30
-        )
+        try:
+            proc = subprocess.run(
+                ["systemctl", "is-active", "--quiet", self.unit], timeout=30
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
         return proc.returncode == 0
 
 
@@ -71,12 +80,17 @@ class ProcessXrayService(XrayService):
     def start(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
-        self._proc = subprocess.Popen(
-            [self.bin_path, "run", "-c", self.config_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + self.grace
+        try:
+            self._proc = subprocess.Popen(
+                [self.bin_path, "run", "-c", self.config_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise XrayServiceError(f"xray не запустился: {exc}") from exc
+        # Ловим только мгновенное падение (битый конфиг, занятый порт); готовность
+        # API вызывающий код проверяет сам, ждать здесь весь grace незачем.
+        deadline = time.monotonic() + min(self.grace, 1.0)
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
                 raise XrayServiceError("xray завершился сразу после запуска")

@@ -106,7 +106,7 @@ def runtime(tmp_path_factory):
     service.stop()
 
 
-def test_balloancer_info(runtime):
+def test_balancer_info(runtime):
     info = runtime.balancer_info("auto")
     assert isinstance(info, str) and info.strip()
 

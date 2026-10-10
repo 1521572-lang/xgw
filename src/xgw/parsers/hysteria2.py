@@ -7,9 +7,9 @@
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import unquote
 
-from .common import ParseError, RawServer
+from .common import RawServer, split_link
 
 REASON = (
     "поля hysteria2-outbound не описаны в документации Xray; "
@@ -18,19 +18,11 @@ REASON = (
 
 
 def parse(link: str) -> RawServer:
-    try:
-        parts = urlsplit(link)
-    except ValueError as exc:
-        raise ParseError(f"hysteria2: битая ссылка ({exc})") from exc
-    host = (parts.hostname or "").lower()
-    if not host:
-        raise ParseError("hysteria2: нет адреса")
-    port = parts.port
+    parts, host, port = split_link(link, "hysteria2")
     if port is None:
         port = 443
     password = unquote(parts.username or "")
     name = unquote(parts.fragment) or f"{host}:{port}"
-    _ = parse_qs(parts.query, keep_blank_values=True)  # параметры: sni/insecure/obfs/pinSHA256
     return RawServer(
         name=name,
         protocol="hysteria2",
