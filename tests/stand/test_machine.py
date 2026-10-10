@@ -8,7 +8,9 @@ ufw. `xgw install` и `xgw uninstall` выполняются внутри нег
     sudo -E XGW_XRAY_BIN=<путь к xray> pytest tests/stand/test_machine.py -q
 
 Проверки идут по порядку и продолжают одна другую: первый запуск без конфига →
-установка → работа из LAN → правка конфига → уведомление → перезагрузка → удаление.
+установка без подписки и всё остальное из панели (подписка, включение VPN, список
+серверов) → удаление → установка с подпиской в config.toml → работа из LAN →
+правка конфига → уведомление → перезагрузка → удаление.
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ from stand import UUID, Stand, wait_for
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
 REPO = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+PANEL_PORT = "8781"
+LAUNCHER = "/usr/local/share/applications/xgw-panel.desktop"
+STATUS_PAGE = "\n[status]\nlan_page = true\n"
 VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
 UNITS = ("xgw-net", "xgw-xray", "xgw", "dnsmasq")
@@ -69,7 +75,8 @@ def _snapshot(box: Machine) -> dict[str, str]:
         "ufw before.rules": box.sh("cat /etc/ufw/before.rules 2>/dev/null || true"),
         "files": box.sh(
             "ls -d /opt/xgw /usr/local/bin/xgw /etc/dnsmasq.d/xgw.conf /etc/sysctl.d/90-xgw.conf "
-            "/var/lib/xgw /etc/xgw/xray 2>/dev/null || true"
+            f"/var/lib/xgw /etc/xgw/xray {LAUNCHER} /usr/local/share/applications "
+            "2>/dev/null || true"
         ),
     }
 
@@ -93,7 +100,7 @@ def gw():
         box.reboot()
         before = _snapshot(box)
         stand.set_subscription(stand.names)
-        stand.write_config(capture=True, extra="\n[status]\nlan_page = true\n")
+        stand.write_config(capture=True, panel=True, extra=STATUS_PAGE)
         yield SimpleNamespace(box=box, stand=stand, before=before)
     finally:
         stand.stop()
@@ -126,6 +133,40 @@ def _install(gw, *args: str):
     )
 
 
+def _put_config(gw) -> None:
+    """Конфиг стенда — на место /etc/xgw/config.toml. Сети в контейнере нет, поэтому
+    Xray кладётся заранее: установка его не скачивает, если версия подходит."""
+    shutil.copyfile(gw.stand.config_file, gw.box.root / "etc/xgw/config.toml")
+    gw.box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
+              "&& chmod 600 /etc/xgw/config.toml")
+
+
+def _panel(gw, *args: str) -> dict:
+    """Запрос к панели с самого шлюза — как из браузера на этой машине."""
+    result = gw.box.run(
+        "python3", str(HERE / "panel_client.py"), PANEL_PORT, *args, check=False, timeout=60
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _panel_token(gw) -> str:
+    return gw.box.sh("cat /var/lib/xgw/panel-token").strip()
+
+
+def _panel_state(gw) -> dict:
+    return _panel(gw, "state", _panel_token(gw))
+
+
+def _press(gw, name: str, **body) -> dict:
+    return _panel(gw, "act", _panel_token(gw), name, json.dumps(body))
+
+
+def _core_tags(gw) -> list[str]:
+    """Теги серверов, которые сейчас заведены в работающий Xray."""
+    servers = gw.stand.xgw_json("servers")
+    return [node["tag"] for node in [*servers["members"], *servers["spares"]]]
+
+
 def test_first_run_creates_the_config_and_changes_nothing_else(gw):
     box = gw.box
     first = _install(gw, "--yes")
@@ -134,19 +175,202 @@ def test_first_run_creates_the_config_and_changes_nothing_else(gw):
     assert box.sh("stat -c '%U:%G %a' /etc/xgw/config.toml").strip() == "root:root 600"
     example = (REPO / "config.example.toml").read_text(encoding="utf-8")
     assert (box.root / "etc/xgw/config.toml").read_text(encoding="utf-8") == example
-    # С подпиской-примером установка не начинается.
-    second = _install(gw, "--yes")
-    assert second.returncode == 1 and "нет ни подписки" in second.stdout
-    assert "Установка не начата" in second.stdout
+    assert "sudo xgw install" in first.stdout  # что делать дальше
     after = _snapshot(box)
     assert {key: after[key] for key in after if key != "files"} == {
         key: gw.before[key] for key in gw.before if key != "files"
     }
-    # «Пользователь вписывает подписку»: конфиг стенда. Сети в контейнере нет —
-    # Xray кладём заранее; установка его не скачивает, если версия подходит.
-    shutil.copyfile(gw.stand.config_file, box.root / "etc/xgw/config.toml")
-    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
-           "&& chmod 600 /etc/xgw/config.toml")
+    # С подпиской-примером, если её раскомментировать, установка не начинается.
+    (box.root / "etc/xgw/config.toml").write_text(
+        example.replace("# [[subscriptions]]", "[[subscriptions]]").replace(
+            '# url = "https://example.com/sub/TOKEN"', 'url = "https://example.com/sub/TOKEN"'),
+        encoding="utf-8",
+    )
+    second = _install(gw, "--yes")
+    assert second.returncode == 1 and "подписка-пример" in second.stdout
+    assert "Установка не начата" in second.stdout
+
+
+# --- путь «без терминала»: установка без подписки, дальше всё из панели ---------------
+
+
+def test_install_without_a_subscription_leaves_the_internet_direct(gw):
+    box, stand = gw.box, gw.stand
+    stand.write_config(capture=True, panel=True, subscription=False, extra=STATUS_PAGE)
+    _put_config(gw)
+    result = _install(gw, "--yes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "пакеты: dnsmasq" in out  # поставлен через apt-get из репозитория контейнера
+    assert "подписок пока нет: VPN не включится" in out  # сказано ещё в плане
+    assert "XGW установлен. Подписок пока нет — VPN выключен" in out
+    token = _panel_token(gw)
+    assert len(token) >= 24
+    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/?token={token}" in out
+    assert box.sh("stat -c '%U:%G %a' /var/lib/xgw/panel-token").strip() == "root:root 600"
+
+    # Xray запускать не с чем; остальное работает, шлюз — обычный роутер.
+    active = _active(gw)
+    assert active["xgw-xray"] != "active"
+    assert [active[unit] for unit in ("xgw-net", "xgw", "dnsmasq")] == ["active"] * 3
+    assert wait_for(lambda: _exit_ip(gw) == DIRECT, 20), "устройство осталось без интернета"
+    assert stand.exit_ip("gw") == DIRECT
+    table = box.sh("nft list table ip xgw")
+    assert "tproxy" not in table and "masquerade" in table
+
+    # Ярлык в меню приложений: открывает панель, токена в нём нет.
+    entry = box.sh(f"cat {LAUNCHER}")
+    assert f"Exec=xdg-open http://127.0.0.1:{PANEL_PORT}/" in entry and token not in entry
+    assert "Icon=/opt/xgw/lib/xgw/ui/icon.svg" in entry
+    assert box.sh("test -f /opt/xgw/lib/xgw/ui/icon.svg && echo есть").strip() == "есть"
+    check = box.sh(
+        f"command -v desktop-file-validate >/dev/null && desktop-file-validate {LAUNCHER}; true"
+    )
+    assert check.strip() == "", check
+    printed = _xgw(gw, "panel")
+    assert printed.returncode == 0 and f"?token={token}" in printed.stdout
+
+
+def test_panel_is_reachable_only_from_the_machine_itself_and_by_token(gw):
+    box, stand = gw.box, gw.stand
+    listening = box.sh(f"ss -ltnH 'sport = :{PANEL_PORT}'")
+    assert f"127.0.0.1:{PANEL_PORT}" in listening
+    for elsewhere in ("0.0.0.0", "*", netns.GW_LAN_IP, netns.GW_WAN_IP):
+        assert f"{elsewhere}:{PANEL_PORT}" not in listening, listening
+    for address in (netns.GW_LAN_IP, netns.GW_WAN_IP):
+        where = "lan" if address == netns.GW_LAN_IP else "inet"
+        reply = stand.client(where, "get", f"http://{address}:{PANEL_PORT}/", "--timeout", "3")
+        assert "error" in reply and reply.get("status", 0) != 200, reply
+
+    assert wait_for(lambda: _panel(gw, "raw", "/").get("status") == 200, 30), box.journal("xgw")
+    assert 'name="token"' in _panel(gw, "raw", "/")["body"]  # без токена — только вход
+    assert _panel(gw, "raw", "/api/state")["status"] == 401
+    assert "error" in _panel(gw, "state", "не-тот-токен")
+
+    state = _panel_state(gw)
+    assert state["subscriptions"] == [] and state["servers"] == [] and state["members"] == []
+    assert state["capture"]["mode"] == "off" and state["lan"]["interface"] == "lan0"
+    assert state["power"]["can_on"] is False and "добавьте подписку" in state["power"]["why"]
+    refused = _press(gw, "power", on=True)
+    assert not refused["ok"] and "Xray не отвечает" in refused["text"]
+    assert _exit_ip(gw) == DIRECT
+
+
+def test_subscription_added_in_the_panel_starts_xray_and_the_button_turns_vpn_on(gw):
+    box, stand = gw.box, gw.stand
+    added = _press(gw, "add", text=stand.subscription_url())
+    assert added["ok"] and "получаю серверы" in added["text"], added
+
+    def ready() -> bool:
+        state = _panel_state(gw)
+        return len(state.get("members") or []) == 2 and state.get("state") == "HEALTHY"
+
+    # Демон сам заметил новую подписку, получил серверы и запустил Xray.
+    assert wait_for(ready, 90), box.journal("xgw", 60)
+    assert _active(gw)["xgw-xray"] == "active"
+    assert box.sh("ps -o user= -C xray").split() == ["xray"]
+    rights = box.sh("stat -c '%U:%G %a' /etc/xgw/panel.json /etc/xgw/xray/config.json")
+    assert rights.splitlines() == ["root:root 600", "root:xray 640"]
+
+    state = _panel_state(gw)
+    (sub,) = state["subscriptions"]
+    assert sub["managed"] and sub["host"] == netns.INET_IP and sub["secure"] is False
+    assert sub["servers"] == 3 and sub["error"] == "" and sub["fetched"]
+    assert sub["quota"]["total"] == 100_000_000_000  # квота из заголовка ответа
+    text = json.dumps(state, ensure_ascii=False)
+    assert "s3cr3t-stand-token" not in text and UUID not in text
+    assert sorted(server["status"] for server in state["servers"]) == ["member", "member", "spare"]
+    assert all(len(server["fingerprint"]) == 8 for server in state["servers"])
+    assert "s3cr3t-stand-token" not in box.journal("xgw", 300)
+
+    # Подписка есть, но VPN включает человек: до нажатия интернет прямой.
+    assert _exit_ip(gw) == DIRECT and state["power"]["can_on"] is True
+    pressed = _press(gw, "power", on=True)
+    assert pressed["ok"] and "перехват включён" in pressed["text"], pressed
+    assert wait_for(lambda: _exit_ip(gw) == VIA_VPN, 10, step=0.2), "VPN не включился"
+    assert stand.exit_ip("gw") == VIA_VPN
+    assert "tproxy to 127.0.0.1:12345" in box.sh("nft list table ip xgw")
+    state = _panel_state(gw)
+    assert state["capture"]["mode"] == "on" and state["power"]["can_off"] is True
+    assert sum(1 for server in state["servers"] if server.get("selected")) == 1
+
+    assert _press(gw, "power", on=False)["ok"]
+    assert wait_for(lambda: _exit_ip(gw) == DIRECT, 5, step=0.2)
+    assert _press(gw, "power", on=True)["ok"]
+    assert wait_for(lambda: _exit_ip(gw) == VIA_VPN, 10, step=0.2)
+
+
+def test_servers_are_switched_off_and_removed_from_the_panel(gw):
+    box = gw.box
+    servers = _panel_state(gw)["servers"]
+    spare = next(server for server in servers if server["status"] == "spare")
+    member = next(server for server in servers if server["status"] == "member")
+    last = next(s for s in servers if s["status"] == "member" and s is not member)
+    xray_pid = box.sh("pgrep -x xray").strip()
+
+    def row(fingerprint: str) -> dict:
+        return next(
+            (s for s in _panel_state(gw)["servers"] if s["fingerprint"] == fingerprint), {})
+
+    # Убрать запасной: шлюз перестаёт его проверять, обновление подписки его не возвращает.
+    removed = _press(gw, "servers", fingerprints=[spare["fingerprint"]], mode="removed")
+    assert removed["ok"], removed
+    assert wait_for(lambda: spare["tag"] not in _core_tags(gw), 40), box.journal("xgw")
+    state = _panel_state(gw)
+    assert [server["fingerprint"] for server in state["removed"]] == [spare["fingerprint"]]
+    assert spare["fingerprint"] not in [server["fingerprint"] for server in state["servers"]]
+    assert _press(gw, "refresh")["ok"]
+    assert wait_for(lambda: not _panel_state(gw)["busy"]["refresh"], 40)
+    time.sleep(3)
+    assert spare["tag"] not in _core_tags(gw)
+
+    # Отключить участника: из ядра он уходит, в списке остаётся — отключённым.
+    assert _press(gw, "servers", fingerprints=[member["fingerprint"]], mode="disabled")["ok"]
+    assert wait_for(lambda: _core_tags(gw) == [last["tag"]], 40), box.journal("xgw")
+    assert wait_for(lambda: row(member["fingerprint"]).get("pending") is False, 20)
+    assert row(member["fingerprint"])["status"] == "disabled"
+    config_text = (box.root / "etc/xgw/xray/config.json").read_text(encoding="utf-8")
+    assert member["tag"] not in config_text and spare["tag"] not in config_text
+    # Через API, без перезапуска Xray и без нового запроса подписки; трафик идёт.
+    assert box.sh("pgrep -x xray").strip() == xray_pid
+    events = [event["detail"] for event in _panel_state(gw)["events"]]
+    assert any("изменение настроек: применено через API" in text for text in events), events
+    assert _exit_ip(gw) == VIA_VPN
+
+    # Последний включённый сервер отключить нельзя.
+    refused = _press(gw, "servers", fingerprints=[last["fingerprint"]], mode="disabled")
+    assert not refused["ok"] and "ни одного включённого сервера" in refused["text"]
+    assert _core_tags(gw) == [last["tag"]]
+
+    # Вернуть оба: снова два участника и запасной.
+    both = [member["fingerprint"], spare["fingerprint"]]
+    assert _press(gw, "servers", fingerprints=both, mode="enabled")["ok"]
+    assert wait_for(lambda: len(_core_tags(gw)) == 3, 40), box.journal("xgw")
+    state = _panel_state(gw)
+    assert state["removed"] == []
+    assert sorted(server["status"] for server in state["servers"]) == ["member", "member", "spare"]
+    assert box.sh("pgrep -x xray").strip() == xray_pid
+    assert wait_for(lambda: _state(gw) == "HEALTHY", 60), _xgw(gw, "status").stdout
+    assert _exit_ip(gw) == VIA_VPN
+
+
+def test_uninstall_after_the_panel_keeps_only_the_users_settings(gw):
+    box = gw.box
+    result = _xgw(gw, "uninstall", "--yes", timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ярлык панели удалён" in result.stdout and "panel.json" in result.stdout
+    after = _snapshot(box)
+    for key, value in gw.before.items():
+        assert after[key] == value, f"{key}:\n--- было\n{value}\n--- стало\n{after[key]}"
+    # Остаются только настройки пользователя: конфиг и подписки, добавленные в панели.
+    assert sorted(path.name for path in (box.root / "etc/xgw").iterdir()) == [
+        "config.toml", "panel.json"]
+    assert _exit_ip(gw) == ""  # шлюза больше нет
+
+    # Дальше — обычный путь: подписка вписана в config.toml.
+    (box.root / "etc/xgw/panel.json").unlink()
+    gw.stand.write_config(capture=True, panel=True, extra=STATUS_PAGE)
+    _put_config(gw)
 
 
 def test_diag_before_install_has_no_failures(gw):
@@ -167,8 +391,9 @@ def test_install(gw):
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
     assert "План установки XGW" in out and "XGW установлен." in out
-    assert "пакеты: dnsmasq" in out  # поставлен через apt-get из репозитория контейнера
     assert "ufw: ufw allow in on lan0" in out
+    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/?token={_panel_token(gw)}" in out
+    assert box.sh(f"stat -c '%U:%G %a' {LAUNCHER}").strip() == "root:root 644"
 
     assert _active(gw) == dict.fromkeys(UNITS, "active")
     # Xray — от пользователя xray и только с двумя возможностями.
@@ -217,8 +442,10 @@ def test_second_install_changes_nothing_and_keeps_the_original_state(gw):
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
     second = json.loads(journal.read_text(encoding="utf-8"))
+    # Пакет dnsmasq поставила ещё первая установка (до панели), поэтому в этом
+    # журнале записи о пакетах может не быть вовсе.
     for key in ("sysctl", "nm_lan", "nm_wan", "dnsmasq", "packages", "user_created", "sleep"):
-        assert second[key] == first[key], key
+        assert second.get(key) == first.get(key), key
     assert [item["autoconnect"] for item in second["nm_lan"]["disabled"]] == ["yes"]
     assert box.sh("pgrep -x xray").strip() == xray_pid  # Xray не перезапускался
     assert box.sh("nmcli -t -f NAME connection show").count("xgw-lan") == 1
@@ -279,7 +506,7 @@ def test_status_page_is_read_only_and_needs_the_token(gw):
 def test_config_change_is_picked_up_without_restarting_the_daemon(gw):
     stand, box = gw.stand, gw.box
     pid = box.sh("systemctl show xgw -p MainPID --value").strip()
-    stand.write_config(capture=True, max_members=3, extra="\n[status]\nlan_page = true\n")
+    stand.write_config(capture=True, max_members=3, panel=True, extra=STATUS_PAGE)
     text = stand.config_file.read_text(encoding="utf-8").replace(
         "192.168.50.150", "192.168.50.160"
     )

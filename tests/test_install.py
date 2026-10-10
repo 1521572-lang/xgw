@@ -119,9 +119,10 @@ def test_plan_is_shown_and_nothing_changes_when_declined(box):
     ("change", "expected"),
     [
         (lambda b: setattr(b.cfg.network, "lan_if", "wan0"), "интерфейс выхода в интернет"),
-        (lambda b: setattr(b.cfg, "subscriptions", []), "нет ни подписки"),
+        (lambda b: (setattr(b.cfg, "subscriptions", []),
+                    setattr(b.cfg.panel, "enabled", False)), "нет ни подписки"),
         (lambda b: b.cfg.subscriptions.__setitem__(
-            0, config.Subscription(url="https://example.com/sub/TOKEN")), "нет ни подписки"),
+            0, config.Subscription(url="https://example.com/sub/TOKEN")), "подписка-пример"),
         (lambda b: b.system.devices["lan0"].update(state="unmanaged"), "unmanaged"),
         (lambda b: b.system.devices.pop("lan0"), "интерфейса lan0"),
         (lambda b: setattr(b.system, "nm_running", False), "NetworkManager не запущен"),
@@ -440,3 +441,127 @@ def test_ufw_before_rules_follow_interface_and_mark(tmp_path):
 def test_ufw_rules_without_known_wan():
     assert ufw.wanted("lan0", "") == [
         ["allow", "in", "on", "lan0"], ["route", "allow", "in", "on", "lan0"]]
+
+
+# --- панель: ярлык, токен, установка без подписки ------------------------------------
+
+
+def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
+    from xgw.watch import panel
+
+    assert box.install() == 0, box.text()
+    desktop = box.paths.desktop_file
+    entry = desktop.read_text(encoding="utf-8")
+    token = panel.read_token(box.paths)
+    assert "Exec=xdg-open http://127.0.0.1:8781/\n" in entry and token not in entry
+    assert f"Icon={(box.paths.lib_dir / 'xgw' / 'ui' / 'icon.svg').as_posix()}\n" in entry
+    for name in ("index.html", "login.html", "app.js", "app.css", "icon.svg"):
+        assert (box.paths.lib_dir / "xgw" / "ui" / name).is_file(), name
+    text = box.text()
+    assert "панель управления — http://127.0.0.1:8781/" in text  # в плане
+    assert f"Панель управления: http://127.0.0.1:8781/?token={token}" in text  # в итоге
+    assert "sudo xgw panel" in text and "Вставьте в панели" not in text
+    journal = Journal(box.paths.journal_file)
+    assert journal.get("launcher") == str(desktop) and journal.get("launcher_dir") is True
+    if os.name != "nt":
+        assert panel.token_file(box.paths).stat().st_mode & 0o777 == 0o600
+        assert desktop.stat().st_mode & 0o777 == 0o644
+
+    assert box.install() == 0  # повторная установка токен не меняет
+    assert panel.read_token(box.paths) == token
+    assert Journal(box.paths.journal_file).get("launcher_dir") is True
+    assert box.uninstall() == 0, box.text()
+    assert "ярлык панели удалён" in box.text()
+    assert not desktop.exists() and not desktop.parent.exists()
+
+
+def test_foreign_launchers_survive_uninstall(box):
+    other = box.paths.desktop_file.with_name("other-app.desktop")
+    other.parent.mkdir(parents=True)
+    other.write_text("[Desktop Entry]\n", encoding="utf-8")
+    assert box.install() == 0 and box.uninstall() == 0
+    assert other.exists() and not box.paths.desktop_file.exists()
+
+
+def test_install_with_the_panel_switched_off(box):
+    box.cfg.panel.enabled = False
+    assert box.install() == 0
+    assert not box.paths.desktop_file.exists() and "Панель управления" not in box.text()
+    assert "launcher" not in Journal(box.paths.journal_file)
+
+
+def test_install_without_a_subscription_leaves_vpn_off_and_points_to_the_panel(box):
+    from xgw.net.capture import Capture
+
+    box.cfg.subscriptions = []
+    applied: list[bool] = []
+    installer = box.installer()
+    installer.first_apply = lambda: applied.append(True) or True
+    assert installer.run(assume_yes=True) == 0, box.text()
+    text = box.text()
+    assert applied == []  # собирать конфиг Xray пока не из чего
+    assert "подписок пока нет: VPN не включится" in text  # предупреждено ещё в плане
+    assert "XGW установлен. Подписок пока нет — VPN выключен" in text
+    assert "Вставьте в панели адрес подписки и нажмите кнопку включения" in text
+    assert "Предупреждений" not in text  # это ожидаемое состояние, а не сбой
+    capture = Capture(box.cfg, box.paths, runner=box.system, proc_sys=box.proc)
+    assert capture.choice() is False and capture.mode() == "off"
+    assert "tproxy" not in box.system.kernel.table and "masquerade" in box.system.kernel.table
+    assert box.system.units["xgw.service"]["active"]
+
+
+# --- вопрос о сетевой карте к роутеру -------------------------------------------------
+
+
+def _ask_lan(system, *answers):
+    from xgw.install import choose_lan
+
+    out: list[str] = []
+    replies = iter(answers)
+
+    def read(prompt: str) -> str:
+        out.append(prompt)
+        try:
+            return next(replies)
+        except StopIteration:
+            raise EOFError from None
+
+    return choose_lan(system, read=read, out=out.append), "\n".join(out)
+
+
+def test_lan_question_offers_wired_cards_except_the_internet_one(box):
+    box.system.devices["wlan0"] = {"type": "wifi", "state": "connected"}
+    box.system.devices["lan1"] = {"type": "ethernet", "state": "unavailable"}
+    chosen, text = _ask_lan(box.system, "9", "мимо", "2")
+    assert chosen == "lan1"
+    assert "1) lan0 — подключена" in text and "2) lan1 — кабель не подключён" in text
+    assert "интернет идёт через wan0" in text and "wlan0" not in text and "wan0 —" not in text
+    assert text.count("Введите номер из списка") == 2
+    assert _ask_lan(box.system, "lan0")[0] == "lan0"  # можно и именем
+    assert _ask_lan(box.system, "")[0] == ""  # Enter — роутера нет
+    assert _ask_lan(box.system)[0] == ""  # ввод закрыт
+
+
+def test_lan_question_is_skipped_when_there_is_no_second_card(box):
+    del box.system.devices["lan0"]
+    chosen, text = _ask_lan(box.system, "1")
+    assert chosen == "" and "только эту машину" in text and "Номер" not in text
+    box.system.nm_running = False
+    assert _ask_lan(box.system, "1")[0] == ""
+
+
+def test_chosen_card_is_written_into_a_fresh_config(tmp_path):
+    from xgw.install import set_lan_if
+
+    path = tmp_path / "config.toml"
+    path.write_text((REPO / "config.example.toml").read_text(encoding="utf-8"), encoding="utf-8")
+    assert set_lan_if(path, "enp4s0") is True
+    cfg, warnings = config.load(path)
+    assert cfg.network.lan_if == "enp4s0" and warnings == []
+    assert path.read_text(encoding="utf-8").count("\n# ") > 20  # комментарии примера на месте
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+    before = path.read_text(encoding="utf-8")
+    assert set_lan_if(path, "enp5s0") is False  # строки lan_if = "" уже нет — не трогаем
+    assert set_lan_if(path, 'x"; rm') is False
+    assert path.read_text(encoding="utf-8") == before

@@ -184,7 +184,7 @@ class Stand:
             "origin", "inet",
             [sys.executable, str(HERE / "origin.py"), "--host", self.inet_ip,
              "--port", str(self.origin_port), "--dns-port", str(self.dns_port),
-             "--answer", self.inet_ip, *also],
+             "--answer", self.inet_ip, "--sub-file", str(self.subscription), *also],
             "READY",
         )
         for name in self.names:
@@ -251,8 +251,13 @@ class Stand:
     def write_config(
         self, *, max_members: int = 2, watchdog_s: int = 2,
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
+        panel: bool = False, subscription: bool = True,
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
+
+        panel=True — с панелью управления, как на установленной машине; на стенде
+        она по умолчанию выключена, чтобы шлюз не открывал лишний порт.
+        subscription=False — без подписки: её добавят в панели (subscription_url).
 
         capture=True (только netns) — шлюз с перехватом: LAN на lan0, трафик самого
         шлюза тоже через Xray, одно устройство в обход VPN, прямой DNS на втором
@@ -277,13 +282,16 @@ fail_mode = "{fail_mode}"
         else:
             network = "\n[capture]\nlan = false\nlocal = false\n"
             direct_dns = "[]"
-        self.config_file.write_text(
-            f"""{network}
+        if not panel:
+            extra += "\n[panel]\nenabled = false\n"
+        source = f"""
 [[subscriptions]]
 name = "stand"
 url = "{self.subscription.as_uri()}"
 refresh_minutes = 1
-
+""" if subscription else ""
+        self.config_file.write_text(
+            f"""{network}{source}
 [filters]
 exclude_regex = ""
 max_members = {max_members}
@@ -322,6 +330,10 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
 {extra}""",
             encoding="utf-8",
         )
+
+    def subscription_url(self) -> str:
+        """Та же подписка по HTTP — как у настоящего провайдера, с токеном в адресе."""
+        return self.origin_url("/sub/s3cr3t-stand-token")
 
     def xgw(self, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
         """Команда `xgw …` в контексте шлюза."""

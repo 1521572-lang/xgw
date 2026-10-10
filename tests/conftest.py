@@ -18,6 +18,14 @@ def _no_github(monkeypatch):
     monkeypatch.setattr(
         "xgw.xraycore.binary.RELEASES_API", "http://127.0.0.1:9/tests-must-not-reach-github"
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_panel(monkeypatch):
+    """`xgw run` в тестах не открывает порт панели; сама панель проверяется в test_panel."""
+    monkeypatch.setattr("xgw.cli._sync_panel", lambda panel, *args, **kwargs: None)
+
+
 REGEN = os.environ.get("XGW_REGEN_GOLDEN") == "1"
 
 

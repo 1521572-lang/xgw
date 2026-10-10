@@ -66,7 +66,9 @@ def test_example_config_loads_clean():
     cfg, warnings = load(EXAMPLE)
     assert warnings == []
     assert isinstance(cfg, Config)
-    assert cfg.subscriptions and cfg.subscriptions[0].name == "main"
+    # Подписка в примере закомментирована: её добавляют в панели либо вписывают сами.
+    assert cfg.subscriptions == [] and cfg.panel.enabled and cfg.panel.port == 8781
+    assert "example.com/sub/TOKEN" in EXAMPLE.read_text(encoding="utf-8")
 
 
 def test_probe_bytes():

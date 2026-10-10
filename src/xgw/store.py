@@ -181,6 +181,23 @@ class SubscriptionCache:
             mode=0o600,
         )
 
+    def saved_at(self, name: str) -> float:
+        """Когда подписку удалось получить в последний раз; 0 — ни разу."""
+        try:
+            loaded = json.loads(
+                (self.directory / f"{self._stem(name)}.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return 0.0
+        value = loaded.get("saved_at") if isinstance(loaded, dict) else None
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    def forget(self, name: str) -> None:
+        """Убирает кэш удалённой подписки: в теле — ссылки с ключами."""
+        stem = self._stem(name)
+        for suffix in (".body", ".json"):
+            (self.directory / f"{stem}{suffix}").unlink(missing_ok=True)
+
     def load(self, name: str) -> CachedSubscription | None:
         stem = self._stem(name)
         try:

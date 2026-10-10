@@ -710,3 +710,123 @@ def test_run_returns_when_the_config_file_changes(daemon):
     daemon.store = type("Closed", (), {"close": lambda self: ticks.append(-1)})()
     daemon.run(stop, changed=lambda: len(ticks) >= 2)
     assert ticks == [1, 1, -1] and not stop.is_set()
+
+
+# --- запросы из панели ---------------------------------------------------------
+
+
+def test_refresh_request_is_served_on_the_next_tick(daemon):
+    _started(daemon)
+    daemon.tick()
+    assert daemon.collected == []  # до срока обычный шаг подписки не трогает
+    daemon.request_refresh()
+    assert daemon.refresh_pending and daemon.poke.is_set()
+    daemon.tick()
+    assert daemon.collected == [True] and not daemon.refresh_pending
+
+
+def test_scan_request_checks_the_spares_now(daemon):
+    _started(daemon)
+    daemon.tick()
+    assert daemon.scanned == []
+    daemon.request_scan()
+    assert daemon.scan_pending
+    daemon.tick()
+    assert sorted(daemon.scanned) == sorted(daemon.tags("spare")) and not daemon.scan_pending
+
+
+def test_pause_between_ticks_ends_on_a_request_a_change_or_a_stop(daemon):
+    stop = threading.Event()
+    started = time.monotonic()
+    daemon.poke.set()
+    daemon._sleep(stop, lambda: False, 60.0)
+    assert not daemon.poke.is_set()
+    daemon._sleep(stop, lambda: True, 60.0)
+    stop.set()
+    daemon._sleep(stop, lambda: False, 60.0)
+    assert time.monotonic() - started < 5
+
+
+def test_server_list_is_saved_for_the_panel_without_keys(daemon):
+    _started(daemon)
+    servers = engine.load_inventory(daemon.paths)
+    assert len(servers) == len(ALL_LINKS)
+    assert {server["source"] for server in servers} == {"main"}
+    assert all(set(server) == {"fingerprint", "name", "source", "protocol", "skip"}
+               for server in servers)
+    text = engine.inventory_file(daemon.paths).read_text(encoding="utf-8")
+    assert links.FAKE_PBK not in text and "203.0.113." not in text  # ни ключей, ни адресов
+    status = daemon.status()
+    known = {server["fingerprint"] for server in servers}
+    assert {node["fingerprint"] for node in [*status["members"], *status["spares"]]} == known
+
+
+def _second(daemon: Harness, change) -> Harness:
+    """Демон после перечитывания настроек: тот же каталог, изменённый конфиг."""
+    import copy
+
+    cfg = copy.deepcopy(daemon.cfg)
+    change(cfg)
+    second = Harness(cfg, daemon.paths)
+    second.t = daemon.t
+    second.adopt(daemon)
+    return second
+
+
+def test_disabled_server_leaves_the_core_without_asking_subscriptions_again(daemon):
+    _started(daemon)
+    from xgw.generator import builder
+
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    member = next(
+        info for info in builder.applied_nodes(applied, daemon.inventory.nodes)
+        if info.role == "proxy"
+    )
+    assert len(member.fingerprint) == 8
+    second = _second(daemon, lambda cfg: cfg.managed.disabled.append(member.fingerprint))
+    try:
+        second.tick()
+        assert second.collected == []  # подписки заново не запрашивались
+        assert len(second.applied) == 1
+        tags = [*second.tags("proxy"), *second.tags("spare")]
+        assert member.tag not in tags and len(tags) == len(ALL_LINKS) - 1
+        assert len(second.tags("proxy")) == 2  # его место занял другой сервер
+        listed = {server["fingerprint"] for server in engine.load_inventory(second.paths)}
+        assert member.fingerprint in listed  # в списке панели он остаётся — отключённым
+        assert any("изменение настроек" in event for event in second.events())
+        second.tick()
+        assert len(second.applied) == 1  # второй раз пересобирать нечего
+    finally:
+        second.store.close()
+
+
+def test_new_subscription_is_fetched_at_once(daemon):
+    _started(daemon)
+    second = _second(daemon, lambda cfg: cfg.manual.links.append(links.SS_PLAIN))
+    try:
+        second.tick()
+        assert second.collected == [True]  # источники изменились — опрос сразу
+    finally:
+        second.store.close()
+
+
+def test_subscription_errors_reach_the_status(daemon):
+    _started(daemon)
+    daemon.source.errors = {"main": "HTTP 403"}
+    daemon.request_refresh()
+    daemon.tick()
+    assert daemon.status()["sub_errors"]["main"]["error"] == "HTTP 403"
+    daemon.source.errors = {}
+    daemon.request_refresh()
+    daemon.tick()
+    assert daemon.status()["sub_errors"] == {}
+
+
+def test_no_subscriptions_yet_is_not_an_error(daemon):
+    """Установка без подписок: их добавят в панели, уведомлять не о чем."""
+    daemon.source = engine.Inventory([], {}, True)
+    assert daemon.tick() is State.HEALTHY
+    daemon.t += 1000
+    daemon.tick()
+    assert daemon.applied == [] and daemon.events() == []
+    assert daemon.status()["members"] == []

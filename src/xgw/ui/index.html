@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>XGW</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <img src="/icon.svg" alt="" width="30" height="30">
+    <span class="brand-name">XGW</span>
+    <span class="brand-note">шлюз</span>
+  </div>
+  <div id="chip" class="chip" data-tone="off">Загрузка…</div>
+</header>
+
+<div id="banner" class="banner" role="alert" hidden></div>
+
+<main class="grid">
+  <div class="col side">
+    <section class="card hero" id="hero" data-tone="off" aria-labelledby="power-title">
+      <button id="power" class="power" type="button" aria-pressed="false"
+              aria-describedby="power-sub" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 3.5v8.5"/>
+          <path d="M6.6 7.2a7.6 7.6 0 1 0 10.8 0"/>
+        </svg>
+        <span class="visually-hidden" id="power-label">Включить VPN</span>
+      </button>
+      <h1 id="power-title">Загрузка…</h1>
+      <p id="power-sub" class="muted"></p>
+      <p id="power-why" class="why" hidden></p>
+      <div id="current" class="current" hidden>
+        <div class="current-text">
+          <span id="current-label" class="muted small"></span>
+          <span id="current-name" class="current-name"></span>
+        </div>
+        <button id="unpin" class="btn small-btn" type="button" hidden>Снять</button>
+      </div>
+    </section>
+
+    <section class="card subs-card" aria-labelledby="subs-title">
+      <div class="card-head">
+        <h2 id="subs-title">Подписки</h2>
+        <button id="refresh" class="btn ghost" type="button">Обновить</button>
+      </div>
+      <form id="add" class="add" autocomplete="off">
+        <label class="visually-hidden" for="add-text">Адрес подписки или ссылка сервера</label>
+        <textarea id="add-text" rows="2" spellcheck="false"
+                  placeholder="Вставьте адрес подписки (https://…) или ссылку сервера (vless://…)"></textarea>
+        <div class="add-actions">
+          <button id="paste" class="btn ghost" type="button" hidden>Вставить из буфера</button>
+          <button id="add-submit" class="btn primary" type="submit">Добавить</button>
+        </div>
+      </form>
+      <ul id="subs" class="list"></ul>
+      <ul id="links" class="list"></ul>
+    </section>
+  </div>
+
+  <div class="col main">
+    <section class="card servers-card" aria-labelledby="servers-title">
+      <div class="card-head">
+        <h2 id="servers-title">Серверы <span id="members-count" class="count"></span></h2>
+        <button id="scan" class="btn ghost" type="button">Проверить запасные</button>
+      </div>
+      <p id="pin-note" class="note" hidden></p>
+      <div id="groups"></div>
+      <p id="servers-empty" class="muted empty-text" hidden></p>
+      <details id="removed-box" class="group removed" hidden>
+        <summary><span class="group-name">Убранные</span>
+          <span id="removed-count" class="group-count muted small"></span></summary>
+        <ul id="removed" class="list servers"></ul>
+      </details>
+    </section>
+
+    <section class="card devices-card" id="devices-card" aria-labelledby="devices-title" hidden>
+      <div class="card-head">
+        <h2 id="devices-title">Устройства <span id="devices-count" class="count"></span></h2>
+        <span id="devices-note" class="muted small"></span>
+      </div>
+      <ul id="devices" class="list"></ul>
+    </section>
+
+    <section class="card events-card" aria-labelledby="events-title">
+      <div class="card-head">
+        <h2 id="events-title">События</h2>
+      </div>
+      <ul id="events" class="list events"></ul>
+    </section>
+  </div>
+</main>
+
+<footer class="foot muted small" id="foot"></footer>
+
+<dialog id="pin-dialog" class="dialog" aria-labelledby="pin-title">
+  <form method="dialog">
+    <h3 id="pin-title">Закрепить сервер</h3>
+    <p id="pin-name" class="dialog-name"></p>
+    <p class="muted">Пока сервер закреплён, автопереключение отключено: если его «заморозят»,
+      интернет встанет до конца срока. По истечении срока закрепление снимется само.</p>
+    <div id="pin-ttls" class="choices"></div>
+    <div class="dialog-actions">
+      <button class="btn ghost" value="cancel">Отмена</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-text" class="muted"></p>
+    <div class="dialog-actions">
+      <button class="btn ghost" value="cancel">Отмена</button>
+      <button id="confirm-yes" class="btn danger" value="yes">Убрать</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

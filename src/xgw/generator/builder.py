@@ -65,6 +65,29 @@ def _is_ipv6(address: str) -> bool:
         return False
 
 
+def skip_reason(node: ServerNode, cfg: Config, include_re=None, exclude_re=None) -> str:
+    """Почему сервер не попадёт в конфиг Xray; пусто — попадёт.
+
+    excluded — отключён или убран в панели; junk — служебный адрес; ipv6 —
+    IPv6-адрес при network.ipv6 = off; filter — отсеян фильтрами по имени.
+    """
+    if node.fingerprint in cfg.managed.disabled or node.fingerprint in cfg.managed.removed:
+        return "excluded"
+    if is_junk(node.address, node.port):
+        return "junk"
+    if cfg.network.ipv6 == "off" and _is_ipv6(node.address):
+        return "ipv6"
+    if include_re is None and cfg.filters.include_regex:
+        include_re = re.compile(cfg.filters.include_regex)
+    if exclude_re is None and cfg.filters.exclude_regex:
+        exclude_re = re.compile(cfg.filters.exclude_regex)
+    if include_re is not None and not include_re.search(node.name):
+        return "filter"
+    if exclude_re is not None and exclude_re.search(node.name):
+        return "filter"
+    return ""
+
+
 def select_nodes(
     nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = ()
 ) -> Selection:
@@ -89,17 +112,14 @@ def select_nodes(
                 chain_tags.add(node.keep_tag)
                 chains.append(node)
             continue
-        if is_junk(node.address, node.port):
+        reason = skip_reason(node, cfg, include_re, exclude_re)
+        if reason == "junk":
             warnings.append(
                 f"узел «{node.name}» отброшен: служебный адрес {node.address}:{node.port}"
             )
-            continue
-        if cfg.network.ipv6 == "off" and _is_ipv6(node.address):
+        elif reason == "ipv6":
             warnings.append(f"узел «{node.name}» отброшен: IPv6-адрес при network.ipv6 = off")
-            continue
-        if include_re is not None and not include_re.search(node.name):
-            continue
-        if exclude_re is not None and exclude_re.search(node.name):
+        if reason:
             continue
         if node.fingerprint in unique:
             warnings.append(f"дубль «{node.name}» схлопнут с «{unique[node.fingerprint].name}»")

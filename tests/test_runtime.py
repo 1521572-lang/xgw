@@ -202,7 +202,9 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         state="HEALTHY", action="вмешательство не требуется", since=time.time(), daemon=True,
     )
     assert snapshot["members"][0] == {
-        "tag": "proxy-nl-aaaa", "name": "NL-1", "alive": True, "delay_ms": 123, "dead_since": None,
+        "tag": "proxy-nl-aaaa", "fingerprint": "aaaa1111", "name": "NL-1", "source": "main",
+        "alive": True,
+        "delay_ms": 123, "dead_since": None,
     }
     assert snapshot["members"][1]["alive"] is None  # ядро по узлу ещё ничего не сообщило
     assert snapshot["spares"][0]["verdict"] == "FROZEN" and snapshot["spares"][0]["bytes"] == 16384

@@ -61,8 +61,9 @@ def known_secrets(cfg: Config | None, paths: Paths) -> set[str]:
         loaded = engine.read_json(path)
         if loaded is not None:
             secrets.update(masking.collect_secrets(loaded))
-    with contextlib.suppress(OSError):
-        secrets.add(paths.status_token_file.read_text(encoding="ascii").strip())
+    for token_file in (paths.status_token_file, paths.panel_token_file):
+        with contextlib.suppress(OSError):
+            secrets.add(token_file.read_text(encoding="ascii").strip())
     return {secret for secret in secrets if len(secret) >= 4}
 
 

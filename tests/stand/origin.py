@@ -5,6 +5,7 @@ HTTP:
   /bytes?n=N                N байт сразу
   /slow?bytes=N&seconds=S   N байт равномерно за S секунд — «длинная загрузка»
   /trace                    ip=…, loc=NL — как /cdn-cgi/trace
+  /sub/<что угодно>         подписка из файла (--sub-file) с заголовком квоты
 HEAD на любой путь отдаёт только заголовки с настоящим Content-Length: так
 ведёт себя HEAD-проверка, которая «замороженный» сервер считает живым.
 
@@ -22,15 +23,19 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 PROBE_BYTES = 65536
 CHUNK = b"x" * 4096
+# Квота, которую отдаёт «панель провайдера»: израсходовано 3 из 100 ГБ.
+USERINFO = "upload=1000000000; download=2000000000; total=100000000000; expire=1893456000"
 
 
 class OriginHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     country = "NL"
+    sub_file = ""
 
     def log_message(self, *_args) -> None:  # тишина в логах стенда
         pass
@@ -49,6 +54,12 @@ class OriginHandler(BaseHTTPRequestHandler):
         if parts.path == "/trace":
             body = f"fl=stand\nip={self.client_address[0]}\nloc={self.country}\n".encode()
             return len(body), 0.0, body
+        if parts.path.startswith("/sub/") and self.sub_file:
+            try:
+                body = Path(self.sub_file).read_bytes()
+            except OSError:
+                return -1, 0.0, None
+            return len(body), 0.0, body
         return -1, 0.0, None
 
     def _head(self, length: int) -> None:
@@ -59,6 +70,8 @@ class OriginHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(length))
+            if self.path.startswith("/sub/"):
+                self.send_header("subscription-userinfo", USERINFO)
         self.send_header("Connection", "close")
         self.end_headers()
 
@@ -137,9 +150,11 @@ def main() -> None:
         help="ещё один адрес DNS-заглушки (можно несколько раз)",
     )
     parser.add_argument("--country", default="NL", help="значение loc= в /trace")
+    parser.add_argument("--sub-file", default="", help="файл подписки для /sub/…")
     args = parser.parse_args()
 
     OriginHandler.country = args.country
+    OriginHandler.sub_file = args.sub_file
     server = ThreadingHTTPServer((args.host, args.port), OriginHandler)
     server.daemon_threads = True
     if args.dns_port:

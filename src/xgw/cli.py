@@ -4,6 +4,7 @@
 Этап 2: apply, status, servers, probe, pin/unpin и run (демон xgw.service).
 Этап 3: enable, disable и net — перехват трафика (nftables, ip rule).
 Этап 4: install, uninstall, diag, update-xray и logs — установка на машину.
+Сверх ТЗ: panel — ссылка на панель управления (графический интерфейс в браузере).
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import __version__, config, engine, log
+from . import __version__, actions, config, engine, log, managed
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, nft
@@ -32,7 +33,7 @@ from .watch import scan, status
 from .xraycore import binary, metrics
 from .xraycore.api import ApiError
 
-MAX_PIN_SECONDS = 24 * 3600
+MAX_PIN_SECONDS = actions.MAX_PIN_SECONDS
 # Команды, которые работают и без читаемого config.toml.
 NO_CONFIG = frozenset({"install", "uninstall", "diag", "logs"})
 
@@ -132,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
     logs.add_argument("-f", "--follow", action="store_true", help="следить за журналом")
     logs.add_argument("--export", action="store_true", help="собрать архив без секретов")
     logs.add_argument("--out", default=None, help="куда записать архив (с --export)")
+    subparsers.add_parser(
+        "panel", parents=[common], help="ссылка на панель управления (открывается в браузере)"
+    )
 
     args = parser.parse_args(argv)
     log.setup()
@@ -169,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         "diag": _cmd_diag,
         "update-xray": _cmd_update_xray,
         "logs": _cmd_logs,
+        "panel": _cmd_panel,
     }[args.command]
     try:
         return handler(args, cfg, paths, logger)
@@ -398,52 +403,22 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
 # --- pin / unpin ---------------------------------------------------------------
 
 
-def _cmd_pin(args, cfg: config.Config, paths: Paths, logger) -> int:
-    xray_bin = _require_xray(paths)
-    if xray_bin is None:
-        return 1
-    ttl = config.parse_seconds(args.ttl)
-    if ttl is None or not 0 < ttl <= MAX_PIN_SECONDS:
-        return _fail("--ttl: ожидается срок вида 30s, 10m или 2h, не больше 24h", 2)
-    members = [
-        info.tag
-        for info in builder.applied_nodes(engine.read_json(paths.xray_config_file))
-        if info.role == "proxy"
-    ]
-    if args.tag not in members:
-        return _fail(
-            f"{args.tag} — не участник балансировщика; участники: {', '.join(members) or 'нет'}", 2
-        )
-    try:
-        engine.make_api(cfg, xray_bin).pin(BALANCER_TAG, args.tag)
-    except ApiError as exc:
-        return _fail(str(exc))
-    until = time.time() + ttl
-    with _store(paths) as store:
-        store.set_meta("pin", json.dumps({"tag": args.tag, "until": until}))
-        store.add_event("pin", f"{args.tag} закреплён вручную на {args.ttl}")
-    print(
-        f"{args.tag} закреплён на {args.ttl}. Автопереключение на это время отключено: "
-        "если узел «заморозят», трафик встанет. Снять раньше: xgw unpin"
-    )
-    if status.read_status(paths, max(3.0 * cfg.watchdog.interval_s, 180.0)) is None:
-        print("внимание: демон XGW не запущен — по истечении срока снимите закрепление сами")
+def _emit(outcome: actions.Outcome) -> int:
+    """Итог действия — в терминал: текст и примечания либо ошибка с кодом возврата."""
+    if not outcome.ok:
+        return _fail(outcome.text, outcome.code)
+    print(outcome.text)
+    for line in (*outcome.notes, *outcome.hints):
+        print(line)
     return 0
+
+
+def _cmd_pin(args, cfg: config.Config, paths: Paths, logger) -> int:
+    return _emit(actions.pin(cfg, paths, args.tag, args.ttl))
 
 
 def _cmd_unpin(args, cfg: config.Config, paths: Paths, logger) -> int:
-    xray_bin = _require_xray(paths)
-    if xray_bin is None:
-        return 1
-    try:
-        engine.make_api(cfg, xray_bin).unpin(BALANCER_TAG)
-    except ApiError as exc:
-        return _fail(str(exc))
-    with _store(paths) as store:
-        store.set_meta("pin", "")
-        store.add_event("pin", "закрепление снято вручную")
-    print("закрепление снято, выбором узла снова управляет Xray")
-    return 0
+    return _emit(actions.unpin(cfg, paths))
 
 
 # --- enable / disable / net ----------------------------------------------------
@@ -451,69 +426,21 @@ def _cmd_unpin(args, cfg: config.Config, paths: Paths, logger) -> int:
 
 def _root_problem() -> str | None:
     """Почему сетью управлять нельзя; None — можно."""
-    if not sys.platform.startswith("linux"):
-        return "управление сетью работает только в Linux"
-    if os.geteuid() != 0:
-        return "нужны права root: sudo xgw …"
-    return None
-
-
-def _scope(info: dict) -> str:
-    parts = [f"сеть {info['lan_if']}"] if info["lan"] else []
-    if info["local"]:
-        parts.append("эта машина")
-    return " и ".join(parts)
+    return actions.root_problem()
 
 
 def _cmd_enable(args, cfg: config.Config, paths: Paths, logger) -> int:
     problem = _root_problem()
     if problem:
         return _fail(problem)
-    capture = Capture(cfg, paths, logger=logger)
-    if not capture.capturing:
-        return _fail(
-            "в конфиге нечего перехватывать: capture.local = false, а для capture.lan "
-            "нужен network.lan_if",
-            2,
-        )
-    paths.ensure()
-    try:
-        capture.enable()
-    except CaptureError as exc:
-        return _fail(f"перехват не включён: {exc}")
-    info = capture.describe(check=False)
-    text = f"перехват включён: {_scope(info)} — через Xray"
-    if info["bypass"]:
-        text += "; мимо VPN: " + ", ".join(info["bypass"])
-    with _store(paths) as store:
-        store.add_event("capture", text)
-    print(text)
-    if engine.healthy_http_in(cfg) is None:
-        print(
-            "внимание: Xray не отвечает — пока он не запущен, перехваченный трафик "
-            "никуда не уходит. Вернуть прямой интернет: sudo xgw disable"
-        )
-    return 0
+    return _emit(actions.enable(cfg, paths, Capture(cfg, paths, logger=logger)))
 
 
 def _cmd_disable(args, cfg: config.Config, paths: Paths, logger) -> int:
     problem = _root_problem()
     if problem:
         return _fail(problem)
-    capture = Capture(cfg, paths, logger=logger)
-    paths.ensure()
-    try:
-        capture.disable()
-    except CaptureError as exc:
-        return _fail(f"перехват не снят: {exc}")
-    text = "перехват снят: трафик идёт напрямую, мимо VPN"
-    if capture.lan_if:
-        text += f"; шлюз остаётся роутером для сети {capture.lan_if}"
-    with _store(paths) as store:
-        store.add_event("capture", text)
-    print(text)
-    print("вернуть перехват: sudo xgw enable")
-    return 0
+    return _emit(actions.disable(cfg, paths, Capture(cfg, paths, logger=logger)))
 
 
 def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
@@ -558,6 +485,34 @@ def _mtime(path: Path) -> float:
         return 0.0
 
 
+def _stamp(config_path: Path) -> tuple[float, float]:
+    """Отметка настроек: config.toml и то, что добавлено из панели (panel.json)."""
+    return _mtime(config_path), _mtime(managed.path_for(config_path))
+
+
+def _sync_panel(panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
+    """Панель живёт дольше одного демона: перечитывание настроек её не перезапускает."""
+    from .watch.panel import Panel
+
+    if panel is not None and (not cfg.panel.enabled or panel.port != cfg.panel.port):
+        panel.stop()
+        panel = None
+    if panel is None and cfg.panel.enabled:
+        try:
+            panel = Panel.from_config(
+                cfg, paths, config_path,
+                root_problem=lambda: _root_problem(),
+                capture_factory=lambda *args, **kwargs: Capture(*args, **kwargs),
+            )
+            panel.start()
+        except OSError as exc:
+            logger.error("панель управления не запущена (порт %d): %s", cfg.panel.port, exc)
+            return None
+    if panel is not None:
+        panel.configure(cfg, daemon)
+    return panel
+
+
 def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .daemon import Daemon
     from .watch import notify
@@ -573,50 +528,60 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             signal.signal(getattr(signal, name), lambda *_args: stop.set())
 
     reloaded = False
-    while True:
-        stamp = _mtime(args.config_path)
-        capture = Capture(cfg, paths)
-        if not capture.configured or _root_problem():
-            capture = None  # следить не за чем либо нечем: правила меняет только root
-        elif reloaded:
-            # Настройки изменились — правила (обход, исключения) загружаются заново.
-            try:
-                capture.up()
-            except CaptureError as exc:
-                logger.error("правила сети не обновлены: %s", exc)
-        sinks = notify.build_sinks(cfg, mark=engine.bypass_mark(cfg, logger))
-        daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture, sinks=sinks)
-        if args.once:
-            print(daemon.tick())
-            daemon.store.close()
-            return 0
-        page = None
-        try:
-            page = StatusPage.from_config(cfg, paths)
-            if page is not None:
-                page.start()
-        except OSError as exc:
-            logger.error("страница статуса не запущена: %s", exc)
+    previous = None
+    panel = None
+    try:
+        while True:
+            stamp = _stamp(args.config_path)
+            capture = Capture(cfg, paths)
+            if not capture.configured or _root_problem():
+                capture = None  # следить не за чем либо нечем: правила меняет только root
+            elif reloaded:
+                # Настройки изменились — правила (обход, исключения) загружаются заново.
+                try:
+                    capture.up()
+                except CaptureError as exc:
+                    logger.error("правила сети не обновлены: %s", exc)
+            sinks = notify.build_sinks(cfg, mark=engine.bypass_mark(cfg, logger))
+            daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture, sinks=sinks)
+            if args.once:
+                print(daemon.tick())
+                daemon.store.close()
+                return 0
+            if previous is not None:
+                daemon.adopt(previous)
+            previous = daemon
+            panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger)
             page = None
-        try:
-            daemon.run(stop, changed=lambda stamp=stamp: _mtime(args.config_path) != stamp)
-        finally:
-            if page is not None:
-                page.stop()
-        if stop.is_set():
-            return 0
-        # config.toml изменён: перечитываем, не перезапуская процесс. Иначе демон
-        # при следующем обновлении подписки вернул бы ядро к прежним настройкам.
-        try:
-            cfg, warnings = config.load(args.config_path)
-        except config.ConfigError as exc:
-            logger.error("%s — работаю с прежними настройками", exc)
-            continue
-        log.add_secrets(engine.config_secrets(cfg))
-        for warning in warnings:
-            logger.warning("%s", warning)
-        logger.info("настройки перечитаны из %s", args.config_path)
-        reloaded = True
+            try:
+                page = StatusPage.from_config(cfg, paths)
+                if page is not None:
+                    page.start()
+            except OSError as exc:
+                logger.error("страница статуса не запущена: %s", exc)
+                page = None
+            try:
+                daemon.run(stop, changed=lambda stamp=stamp: _stamp(args.config_path) != stamp)
+            finally:
+                if page is not None:
+                    page.stop()
+            if stop.is_set():
+                return 0
+            # Настройки изменены (config.toml либо панель): перечитываем, не перезапуская
+            # процесс. Иначе демон при следующем обновлении подписки вернул бы ядро к прежним.
+            try:
+                cfg, warnings = config.load(args.config_path)
+            except config.ConfigError as exc:
+                logger.error("%s — работаю с прежними настройками", exc)
+                continue
+            log.add_secrets(engine.config_secrets(cfg))
+            for warning in warnings:
+                logger.warning("%s", warning)
+            logger.info("настройки перечитаны из %s", args.config_path)
+            reloaded = True
+    finally:
+        if panel is not None:
+            panel.stop()
 
 
 # --- install / uninstall / diag / update-xray / logs ----------------------------
@@ -650,7 +615,7 @@ def _cmd_diag(args, cfg: config.Config, paths: Paths, logger) -> int:
 
 def _cmd_install(args, cfg: config.Config, paths: Paths, logger) -> int:
     from . import diag
-    from .install import SOURCE_ROOT, Installer
+    from .install import SOURCE_ROOT, Installer, choose_lan, set_lan_if
 
     problem = _root_problem()
     if problem:
@@ -667,13 +632,27 @@ def _cmd_install(args, cfg: config.Config, paths: Paths, logger) -> int:
             os.chmod(paths.config_file, 0o600)
         except OSError as exc:
             return _fail(f"не удалось создать {paths.config_file} из {example}: {exc}")
-        print(
-            f"Создан {paths.config_file} (права 0600) из примера.\n"
-            "Впишите в него подписку ([[subscriptions]], поле url), а если Wi-Fi-роутер "
-            "подключён ко второй сетевой карте — её имя в network.lan_if.\n"
-            "Затем запустите установку ещё раз: sudo xgw install"
-        )
-        return 1
+        print(f"Создан {paths.config_file} (права 0600) из примера.")
+        if args.yes or not sys.stdin.isatty():
+            print(
+                "Если Wi-Fi-роутер подключён ко второй сетевой карте, впишите её имя в "
+                "network.lan_if; без этого XGW защищает только эту машину.\n"
+                "Подписку можно вписать туда же ([[subscriptions]], поле url) или добавить "
+                "после установки в панели.\n"
+                "Затем запустите установку ещё раз: sudo xgw install"
+            )
+            return 1
+        # Запуск человеком в терминале: спросить про роутер и продолжить без правки файла.
+        lan_if = choose_lan()
+        if lan_if and not set_lan_if(paths.config_file, lan_if):
+            print(f"Не удалось вписать network.lan_if — впишите {lan_if} сами и повторите.")
+            return 1
+        try:
+            cfg, args.config_warnings = config.load(paths.config_file)
+        except config.ConfigError as exc:
+            return _fail(str(exc), 2)
+        args.config_error = ""
+        print()
     checks = _run_diag(args, cfg, paths, logger)
     print(diag.render(checks))
     print()
@@ -706,6 +685,25 @@ def _cmd_update_xray(args, cfg: config.Config, paths: Paths, logger) -> int:
     if problem:
         return _fail(problem)
     return update_xray(cfg, paths, logger=logger)
+
+
+def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from .watch import panel
+
+    if not cfg.panel.enabled:
+        return _fail("панель выключена: [panel] enabled = false в config.toml", 2)
+    token = panel.read_token(paths)
+    if not token:
+        problem = _system_root_problem(paths)
+        if problem:
+            return _fail(problem)
+        token = panel.ensure_token(paths)
+    print(f"Панель XGW: {panel.address(cfg)}?token={token}")
+    print(
+        "Откройте ссылку в браузере на этой машине. Браузер запомнит вход: дальше панель "
+        "открывается ярлыком «XGW» или адресом без токена."
+    )
+    return 0
 
 
 def _cmd_logs(args, cfg: config.Config, paths: Paths, logger) -> int:

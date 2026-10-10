@@ -164,7 +164,8 @@ class Diag:
         if self.config_error:
             return [Check(
                 "Конфиг", FAIL, self.config_error,
-                f"sudo xgw install создаст {path} из примера — впишите в него подписку",
+                f"sudo xgw install создаст {path} из примера; подписку можно добавить "
+                "после установки в панели",
             )]
         result: list[Check] = []
         try:

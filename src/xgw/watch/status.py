@@ -91,6 +91,8 @@ def collect_status(
     """Снимок состояния для status.json. observatory=None — метрики недоступны."""
     now = time.time()
     names: dict[str, str] = {}
+    origins: dict[str, str] = {}
+    sub_errors: dict = {}
     scans: dict[str, dict] = {}
     quotas: dict[str, dict[str, int]] = {}
     events: list[dict] = []
@@ -98,7 +100,10 @@ def collect_status(
     try:
         store = Store(paths.db_file)
         try:
-            names = {node["tag"]: node["name"] for node in store.all_nodes()}
+            for node in store.all_nodes():
+                names[node["tag"]] = node["name"]
+                origins[node["tag"]] = node["source"]
+            sub_errors = _load_json(store.get_meta("sub_errors")) or {}
             scans = store.scans()
             quotas = _load_json(store.get_meta("quota")) or {}
             pin = _load_json(store.get_meta("pin")) or None
@@ -116,7 +121,9 @@ def collect_status(
             members.append(
                 {
                     "tag": info.tag,
+                    "fingerprint": info.fingerprint,
                     "name": names.get(info.tag, ""),
+                    "source": origins.get(info.tag, ""),
                     # None — ядро ещё не завершило по узлу ни одной пробы
                     "alive": entry["alive"] if entry else None,
                     "delay_ms": round(entry["delay"] * 1000)
@@ -130,7 +137,9 @@ def collect_status(
             spares.append(
                 {
                     "tag": info.tag,
+                    "fingerprint": info.fingerprint,
                     "name": names.get(info.tag, ""),
+                    "source": origins.get(info.tag, ""),
                     "verdict": scan["verdict"] if scan else None,
                     "bytes": scan["bytes"] if scan else None,
                     "seconds": scan["seconds"] if scan else None,
@@ -152,6 +161,7 @@ def collect_status(
         "selecting": list(selecting),
         "pin": pin if pin and pin.get("until", 0) > now else None,
         "quota": quotas,
+        "sub_errors": sub_errors,
         "budget": {
             "probes_mb": round(budget.probes / MB, 1),
             "scans_mb": round(budget.scans / MB, 1),

@@ -21,7 +21,7 @@ xgw = "xgw.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-xgw = ["py.typed"]
+xgw = ["py.typed", "ui/*"]
 
 [tool.ruff]
 line-length = 100

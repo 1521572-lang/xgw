@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -22,13 +23,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import engine, fetch, log
+from . import engine, fetch, log, managed
 from .config import Config
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
 from .net.capture import Capture, CaptureError
 from .paths import Paths, atomic_write_json, atomic_write_text
-from .watch import status_page
+from .watch import panel, status_page
 from .xraycore import binary
 from .xraycore.api import ApiError
 from .xraycore.service import XrayServiceError
@@ -49,6 +50,30 @@ from xgw.cli import main  # noqa: E402
 
 raise SystemExit(main())
 '''
+
+
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Version=1.0
+Name=XGW
+GenericName=VPN gateway
+GenericName[ru]=VPN-шлюз
+Comment=Control panel of the XGW gateway
+Comment[ru]=Панель управления шлюзом XGW
+Exec=xdg-open {url}
+Icon={icon}
+Terminal=false
+Categories=Network;
+Keywords=vpn;xray;proxy;
+StartupNotify=false
+"""
+
+_DEVICE_STATES = {
+    "connected": "подключена",
+    "disconnected": "кабель подключён, сеть не настроена",
+    "unavailable": "кабель не подключён",
+    "unmanaged": "NetworkManager ею не управляет",
+}
 
 
 class InstallError(Exception):
@@ -97,6 +122,70 @@ def default_ask(question: str) -> bool:
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes", "д", "да")
+
+
+def lan_candidates(runner: cmd.Runner = cmd.run) -> tuple[list[nm.Device], str]:
+    """Проводные карты, к которым можно подключить роутер, и интерфейс выхода в интернет."""
+    wan = lan.default_route_interface(runner)
+    manager = nm.Nm(runner)
+    try:
+        devices = manager.devices() if manager.running() else {}
+    except cmd.CommandError:
+        devices = {}
+    found = [
+        device for device in devices.values()
+        if device.type == "ethernet" and device.name != wan and lan.valid_interface(device.name)
+    ]
+    return found, wan
+
+
+def choose_lan(
+    runner: cmd.Runner = cmd.run,
+    *,
+    read: Callable[[str], str] = input,
+    out: Callable[[str], None] = print,
+) -> str:
+    """Спрашивает, к какой сетевой карте подключён Wi-Fi-роутер.
+
+    Пустой ответ — роутера нет: XGW защищает только эту машину.
+    """
+    candidates, wan = lan_candidates(runner)
+    if not candidates:
+        out("Второй проводной сетевой карты нет — XGW будет защищать только эту машину.")
+        return ""
+    through = f" (интернет идёт через {wan})" if wan else ""
+    out(f"Сетевые карты, к которым можно подключить Wi-Fi-роутер{through}:")
+    for number, device in enumerate(candidates, 1):
+        out(f"  {number}) {device.name} — {_DEVICE_STATES.get(device.state, device.state)}")
+    names = [device.name for device in candidates]
+    while True:
+        try:
+            answer = read("К какой подключён роутер? Номер, или Enter — роутера нет: ").strip()
+        except EOFError:
+            return ""
+        if not answer:
+            return ""
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        if answer in names:
+            return answer
+        out("Введите номер из списка или просто нажмите Enter.")
+
+
+def set_lan_if(config_path: Path, name: str) -> bool:
+    """Вписывает network.lan_if в только что созданный config.toml.
+
+    Меняется единственная строка `lan_if = ""` из примера; если её нет или их
+    несколько, файл не трогается — тогда имя карты вписывает человек.
+    """
+    if not lan.valid_interface(name):
+        return False
+    text = config_path.read_text(encoding="utf-8")
+    changed, count = re.subn(r'(?m)^lan_if[ \t]*=[ \t]*""[ \t]*$', f'lan_if = "{name}"', text)
+    if count != 1:
+        return False
+    atomic_write_text(config_path, changed, mode=0o600)
+    return True
 
 
 @dataclass
@@ -223,11 +312,16 @@ class Installer:
             text, warnings = dnsmasq.render(self.cfg)
             if not text:
                 found.extend(warnings or ["конфиг dnsmasq собрать не удалось"])
-        urls = [sub.url for sub in self.cfg.subscriptions if sub.url and EXAMPLE_URL not in sub.url]
-        if not urls and not self.cfg.manual.links:
+        if any(EXAMPLE_URL in sub.url for sub in self.cfg.subscriptions):
+            found.append(
+                f"в {self.paths.config_file} осталась подписка-пример ({EXAMPLE_URL}) — "
+                "впишите свою либо удалите блок [[subscriptions]]: подписку можно "
+                "добавить и после установки, в панели"
+            )
+        elif not engine.has_sources(self.cfg) and not self.cfg.panel.enabled:
             found.append(
                 f"в {self.paths.config_file} нет ни подписки ([[subscriptions]] url), "
-                "ни ссылок в [manual] links"
+                "ни ссылок в [manual] links, а панель, где их можно добавить, выключена"
             )
         return found
 
@@ -252,6 +346,11 @@ class Installer:
                 "SHA-256 сверяется с .dgst релиза"
             )
         lines.append("  • службы systemd: xgw-net, xgw-xray, xgw — с автозапуском")
+        if cfg.panel.enabled:
+            lines.append(
+                f"  • панель управления — {panel.address(cfg)} (только с этой машины, "
+                "по токену), ярлык «XGW» в меню приложений"
+            )
         lines += ["", "Сеть:"]
         if facts.lan_if:
             lines.append(
@@ -293,6 +392,11 @@ class Installer:
                 else "без Xray перехват через минуту снимется (fail_mode = open)"
             )
             lines.append(f"  • перехват: {' и '.join(scope)} — через Xray; {closed}")
+            if not engine.has_sources(cfg):
+                lines.append(
+                    "  • подписок пока нет: VPN не включится, пока вы не добавите подписку "
+                    "в панели и не нажмёте кнопку — до этого интернет работает напрямую"
+                )
         if cfg.network.disable_sleep:
             lines.append("  • сон: sleep, suspend, hibernate и hybrid-sleep будут замаскированы")
         if facts.ufw_active and facts.lan_if:
@@ -472,8 +576,9 @@ class Installer:
         Каталог конфигов Xray получает setgid: файлы, которые XGW создаёт в нём
         позже (атомарная запись через временный файл), наследуют группу xray.
         """
-        with contextlib.suppress(OSError):
-            os.chmod(self.paths.config_file, 0o600)
+        for secret in (self.paths.config_file, managed.path_for(self.paths.config_file)):
+            with contextlib.suppress(OSError):
+                os.chmod(secret, 0o600)
         if os.name == "nt" or os.geteuid() != 0:
             return
         os.chmod(self.paths.etc, 0o755)
@@ -519,8 +624,11 @@ class Installer:
         if facts.lan_if:
             self._dnsmasq()
         self._units()
-        xray_ok = self.first_apply()
+        # Без подписок собирать нечего: Xray запустит демон, когда их добавят в панели.
+        xray_ok = self.first_apply() if engine.has_sources(self.cfg) else False
         self._capture(xray_ok)
+        if self.cfg.panel.enabled:
+            self._panel()
         self.runner(["systemctl", "restart", "xgw.service"], timeout=60.0)
         self._step("демон xgw запущен")
         if self.cfg.status.lan_page and facts.lan_if:
@@ -655,6 +763,9 @@ class Installer:
             capture.up()  # повторная установка: выбор пользователя (enable/disable) в силе
         elif xray_ok:
             capture.enable()
+        elif not engine.has_sources(self.cfg):
+            capture.disable()
+            self._step("подписок пока нет — VPN не включён, интернет работает напрямую")
         else:
             capture.disable()
             self._warn(
@@ -671,11 +782,47 @@ class Installer:
         status_page.ensure_token(self.cfg, self.paths)
         self._step("токен страницы статуса готов")
 
+    def _panel(self) -> None:
+        """Токен панели и ярлык в меню приложений."""
+        panel.ensure_token(self.paths)
+        path = self.paths.desktop_file
+        icon = self.paths.lib_dir / "xgw" / "ui" / "icon.svg"
+        # Каталог мог появиться вместе с ярлыком — тогда удаление уберёт и его.
+        self.journal.setdefault("launcher_dir", not path.parent.exists())
+        try:
+            atomic_write_text(
+                path, DESKTOP_ENTRY.format(url=panel.address(self.cfg), icon=icon.as_posix()),
+                mode=0o644,
+            )
+        except OSError as exc:
+            self._warn(f"ярлык панели не создан ({exc}) — открывайте её по ссылке")
+            return
+        self.journal.set("launcher", str(path))
+        self._step(f"панель управления: {panel.address(self.cfg)}, ярлык «XGW» в меню приложений")
+
     # --- итог -------------------------------------------------------------------
 
     def _summary(self, facts: Facts, xray_ok: bool) -> None:
         self.out("")
-        self.out("XGW установлен." if xray_ok else "XGW установлен, но Xray пока не запущен.")
+        sources = engine.has_sources(self.cfg)
+        if xray_ok:
+            self.out("XGW установлен.")
+        elif sources:
+            self.out("XGW установлен, но Xray пока не запущен.")
+        else:
+            self.out("XGW установлен. Подписок пока нет — VPN выключен, интернет идёт напрямую.")
+        if self.cfg.panel.enabled:
+            token = panel.read_token(self.paths)
+            self.out(f"Панель управления: {panel.address(self.cfg)}?token={token}")
+            self.out(
+                "  Откройте эту ссылку в браузере на этой машине (в терминале — Ctrl и щелчок)."
+            )
+            if not sources:
+                self.out("  Вставьте в панели адрес подписки и нажмите кнопку включения.")
+            self.out(
+                "  Дальше панель открывается ярлыком «XGW» в меню приложений; ссылку заново "
+                "напечатает sudo xgw panel."
+            )
         if facts.lan_if:
             address = self.cfg.network.lan_address.split("/")[0]
             self.out(

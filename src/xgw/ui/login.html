@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>XGW — вход</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="login">
+<main class="card login-card">
+  <img src="/icon.svg" alt="" width="56" height="56">
+  <h1>Панель XGW</h1>
+  <p class="muted">Панель открывается по личной ссылке. Её показывает установка, а ещё раз
+    напечатает команда в терминале:</p>
+  <pre class="command">sudo xgw panel</pre>
+  <p class="muted">Откройте ссылку из её вывода либо вставьте сюда токен — он идёт в ссылке
+    после «token=».</p>
+  <form method="get" action="/" class="login-form">
+    <label for="token">Токен</label>
+    <input id="token" name="token" type="password" autocomplete="off" required autofocus>
+    <button class="btn primary" type="submit">Войти</button>
+  </form>
+  <p class="muted small">Если токен не подошёл, эта страница откроется снова.</p>
+</main>
+</body>
+</html>

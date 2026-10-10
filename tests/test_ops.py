@@ -12,7 +12,8 @@ import links
 import pytest
 from fakesys import FakeSystem
 
-from xgw import cli, config, engine, logs
+from xgw import cli, config, engine, logs, managed
+from xgw.cli import _sync_panel as REAL_SYNC_PANEL
 from xgw.cli import main
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths
@@ -59,6 +60,7 @@ def test_log_export_contains_no_secrets(tmp_path):
     ]}
     paths.xray_config_file.write_text(json.dumps(applied), encoding="utf-8")
     paths.status_file.write_text('{"state": "HEALTHY"}', encoding="utf-8")
+    paths.panel_token_file.write_text("pnl-tkn-9\n", encoding="ascii")
     store = Store(paths.db_file)
     store.add_event("apply", f"подписка {SUB_URL}")
     store.close()
@@ -68,6 +70,7 @@ def test_log_export_contains_no_secrets(tmp_path):
             return (
                 f"xgw.daemon: узел {UUID} пароль {SHORT_PASSWORD} заголовок hw-1d-77\n"
                 f"xray: {links.FULL_LINKS[0]}\nxgw: бот {BOT_TOKEN}, страница page-token-12345\n"
+                "sudo: COMMAND=xgw panel, ссылка http://127.0.0.1:8781/?token=pnl-tkn-9\n"
             )
         return f"вывод {' '.join(argv)}\n"
 
@@ -79,7 +82,7 @@ def test_log_export_contains_no_secrets(tmp_path):
     members = _members(out_path)
     whole = "\n".join(members.values())
     for secret in (UUID, SHORT_PASSWORD, "hw-1d-77", BOT_TOKEN, "page-token-12345",
-                   "s3cr3t-subscription-token", links.FULL_LINKS[0]):
+                   "s3cr3t-subscription-token", links.FULL_LINKS[0], "pnl-tkn-9"):
         assert secret not in whole, secret
     # Полезное для разбора при этом остаётся.
     assert "****6661" in members["xgw-logs/journal.txt"]
@@ -398,6 +401,7 @@ def test_daemon_rereads_changed_config_without_restarting(root, tmp_path, monkey
     # Без root демон правилами сети не управляет — и тест их не касается.
     monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
     seen: list[int] = []
+    adopted: list[int] = []
     scripts = [
         lambda: _write_gateway_config(config_path, 3),  # правка
         lambda: config_path.write_text("[filters\n", encoding="utf-8"),  # опечатка
@@ -408,6 +412,9 @@ def test_daemon_rereads_changed_config_without_restarting(root, tmp_path, monkey
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             self.cfg = cfg
             assert capture is None and list(sinks) == []
+
+        def adopt(self, previous) -> None:
+            adopted.append(previous.cfg.filters.max_members)
 
         def run(self, stop: threading.Event, changed) -> None:
             seen.append(self.cfg.filters.max_members)
@@ -424,6 +431,8 @@ def test_daemon_rereads_changed_config_without_restarting(root, tmp_path, monkey
     monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
     assert main(["run", "--config", str(config_path)]) == 0
     assert seen == [2, 3, 3]
+    # Новый демон получает прежний: при тех же подписках их незачем запрашивать заново.
+    assert adopted == [2, 3]
 
 
 def test_daemon_reloads_capture_rules_after_config_change(root, tmp_path, monkeypatch):
@@ -451,6 +460,9 @@ def test_daemon_reloads_capture_rules_after_config_change(root, tmp_path, monkey
     class FakeDaemon:
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             assert capture is not None  # перехват трафика самой машины включён по умолчанию
+
+        def adopt(self, previous) -> None:
+            pass
 
         def run(self, stop: threading.Event, changed) -> None:
             runs.append(bool(kernel.table))
@@ -517,3 +529,146 @@ def test_archive_members_are_private(tmp_path):
         assert member.name == "xgw-logs/a.txt" and member.mode == 0o600
         assert archive.extractfile(member).read() == "текст".encode()
     assert io.BytesIO(path.read_bytes()).read(2) == b"\x1f\x8b"
+
+
+# --- панель: команда, запуск вместе с демоном, первый запуск установки ---------------
+
+
+def test_panel_command_prints_the_link_with_the_token(root, capsys):
+    from xgw.watch import panel
+
+    root.etc.mkdir(parents=True)
+    root.config_file.write_text("[panel]\nport = 8899\n", encoding="utf-8")
+    assert main(["panel"]) == 0
+    token = panel.read_token(root)
+    assert token and f"Панель XGW: http://127.0.0.1:8899/?token={token}" in capsys.readouterr().out
+    assert main(["panel"]) == 0 and panel.read_token(root) == token  # токен не меняется
+    root.config_file.write_text("[panel]\nenabled = false\n", encoding="utf-8")
+    assert main(["panel"]) == 2
+    assert "панель выключена" in capsys.readouterr().err
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _panel_answers(port: int) -> bool:
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("GET", "/")
+        return conn.getresponse().status == 200
+    except OSError:
+        return False
+    finally:
+        conn.close()
+
+
+def test_daemon_serves_the_panel_and_keeps_it_across_reloads(root, tmp_path, monkeypatch):
+    import xgw.daemon
+
+    port = _free_port()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
+    monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
+    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    panels: list = []
+
+    def sync(panel, *args, **kwargs):
+        panels.append(REAL_SYNC_PANEL(panel, *args, **kwargs))
+        return panels[-1]
+
+    monkeypatch.setattr(cli, "_sync_panel", sync)
+    answers: list[bool] = []
+    daemons: list = []
+
+    class FakeDaemon:
+        def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
+            self.poke = threading.Event()
+            daemons.append(self)
+
+        def adopt(self, previous) -> None:
+            pass
+
+        def run(self, stop: threading.Event, changed) -> None:
+            answers.append(_panel_answers(port))
+            assert panels[-1].daemon is self  # кнопки панели обращаются к текущему демону
+            if len(daemons) == 2:
+                stop.set()
+                return
+            # Подписка добавлена из панели — демон должен это заметить.
+            managed.add_subscription(
+                managed.path_for(config_path), "https://s.example.org/sub", taken=set())
+            assert changed()
+
+    monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
+    assert main(["run", "--config", str(config_path)]) == 0
+    assert answers == [True, True] and len(daemons) == 2
+    assert panels[0] is panels[1]  # панель одна, перечитывание её не перезапускает
+    assert panels[0].cfg.managed.subscriptions == ["s.example.org"]
+    assert not _panel_answers(port)  # вместе с демоном остановлена и панель
+
+
+def test_busy_panel_port_does_not_stop_the_daemon(root, tmp_path, monkeypatch, caplog):
+    import socket
+
+    import xgw.daemon
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            f"[panel]\nport = {taken.getsockname()[1]}\n", encoding="utf-8")
+        monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
+        monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+        monkeypatch.setattr(cli, "_sync_panel", REAL_SYNC_PANEL)
+        ran: list[bool] = []
+
+        class FakeDaemon:
+            def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
+                pass
+
+            def run(self, stop: threading.Event, changed) -> None:
+                ran.append(True)
+                stop.set()
+
+        monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
+        if os.name == "nt":
+            # В Windows SO_REUSEADDR позволил бы занять чужой порт; целевая система — Linux.
+            monkeypatch.setattr("xgw.watch.panel._Server.allow_reuse_address", False)
+        assert main(["run", "--config", str(config_path)]) == 0
+    assert ran == [True] and "панель управления не запущена" in caplog.text
+
+
+def test_first_install_run_asks_about_the_router_and_goes_on(root, monkeypatch, capsys):
+    """Запуск человеком в терминале: файл править не нужно — карту спрашивает установка."""
+    import xgw.install
+
+    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(xgw.install, "choose_lan", lambda: "enp4s0")
+    monkeypatch.setattr(cli, "_run_diag", lambda *args, **kwargs: [])
+    seen: list[tuple] = []
+
+    class FakeInstaller:
+        def __init__(self, cfg, paths, **kwargs):
+            seen.append((cfg.network.lan_if, cfg.subscriptions))
+
+        def run(self, *, assume_yes, force):
+            return 0
+
+    monkeypatch.setattr(xgw.install, "Installer", FakeInstaller)
+    assert main(["install"]) == 0
+    assert seen == [("enp4s0", [])]
+    assert 'lan_if = "enp4s0"' in root.config_file.read_text(encoding="utf-8")
+    assert f"Создан {root.config_file}" in capsys.readouterr().out
+    # С ключом --yes вопросов нет: файл создан, установка ждёт второго запуска.
+    root.config_file.unlink()
+    assert main(["install", "--yes"]) == 1 and len(seen) == 1
+    assert 'lan_if = ""' in root.config_file.read_text(encoding="utf-8")

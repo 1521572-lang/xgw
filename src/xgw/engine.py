@@ -20,7 +20,7 @@ from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
 from .model import ServerNode, raw_to_node
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
-from .paths import Paths
+from .paths import Paths, atomic_write_json
 from .store import Store, SubscriptionCache
 from .xraycore.api import ApiClient
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
@@ -39,6 +39,8 @@ class Inventory:
     # False — хотя бы одна подписка не дала серверов даже из кэша: применять такой
     # список нельзя, из работающего конфига пропали бы её серверы.
     complete: bool = True
+    # Подписки, которые сейчас получить не удалось: имя → причина (без секретов).
+    errors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +72,52 @@ def healthy_http_in(cfg: config.Config) -> tuple[str, int] | None:
         return None
 
 
+def has_sources(cfg: config.Config) -> bool:
+    """Есть ли откуда брать серверы: хотя бы одна подписка или ссылка."""
+    return any(sub.url for sub in cfg.subscriptions) or bool(cfg.manual.links)
+
+
+def sources_key(cfg: config.Config) -> tuple:
+    """Откуда берутся серверы: пока это не меняется, подписки заново не запрашиваются."""
+    subs = tuple(
+        (sub.name, sub.url, sub.user_agent, tuple(sorted(sub.headers.items())))
+        for sub in cfg.subscriptions
+    )
+    return subs, tuple(cfg.manual.links)
+
+
+def inventory_file(paths: Paths) -> Path:
+    return paths.var / "inventory.json"
+
+
+def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> None:
+    """Список всех серверов подписок — для панели: и тех, что в конфиг не попали.
+
+    В нём только то, что видно и так (имя, протокол, источник); ключей нет.
+    """
+    servers = []
+    for node in inventory.nodes:
+        if node.keep_tag:
+            continue  # звенья цепочек — не самостоятельные серверы
+        reason = builder.skip_reason(node, cfg)
+        servers.append({
+            "fingerprint": node.fingerprint,
+            "name": node.name,
+            "source": node.source,
+            "protocol": node.protocol,
+            "skip": "" if reason == "excluded" else reason,
+        })
+    atomic_write_json(
+        inventory_file(paths), {"saved": time.time(), "servers": servers}, mode=0o600
+    )
+
+
+def load_inventory(paths: Paths) -> list[dict]:
+    loaded = read_json(inventory_file(paths)) or {}
+    servers = loaded.get("servers")
+    return [item for item in servers if isinstance(item, dict)] if isinstance(servers, list) else []
+
+
 def config_secrets(cfg: config.Config) -> list[str]:
     """Секреты из config.toml, которые регулярками не распознать."""
     values = [cfg.notify.telegram_bot_token, cfg.status.token]
@@ -98,9 +146,11 @@ def collect(
     for sub in cfg.subscriptions:
         if not sub.url:
             continue
-        raws, userinfo = _load_subscription(sub, cfg, cache, mark, proxy, logger)
+        raws, userinfo, error = _load_subscription(sub, cfg, cache, mark, proxy, logger)
         if not raws:
             inventory.complete = False
+        if error:
+            inventory.errors[sub.name] = error
         if userinfo:
             inventory.quotas[sub.name] = userinfo
         inventory.nodes.extend(raw_to_node(raw, sub.name) for raw in raws)
@@ -120,10 +170,12 @@ def _load_subscription(
     mark: int | None,
     proxy: tuple[str, int] | None,
     logger,
-) -> tuple[list[RawServer], dict[str, int]]:
-    """Серверы подписки и её квота. Ответ без серверов считается сбоем: тогда
-    берётся последняя удачная версия из кэша, а кэш не перезаписывается."""
+) -> tuple[list[RawServer], dict[str, int], str]:
+    """Серверы подписки, её квота и причина сбоя (пустая, если запрос удался).
+    Ответ без серверов считается сбоем: тогда берётся последняя удачная версия из
+    кэша, а кэш не перезаписывается."""
     label = f"{sub.name} ({masking.mask_url(sub.url)})"
+    error = ""
     routes: list[tuple[str, tuple[str, int] | None]] = [("напрямую", None)]
     if proxy is not None and not sub.url.startswith("file://"):
         routes.insert(0, ("через Xray", proxy))
@@ -143,6 +195,7 @@ def _load_subscription(
                 raise ParseError("в ответе нет серверов")
         except (fetch.FetchError, ParseError) as exc:
             logger.error("подписка %s, запрос %s: %s", label, route, exc)
+            error = masking.mask_text(str(exc))[:300]
             continue
         for warning in sub_warnings:
             logger.warning("%s", warning)
@@ -153,23 +206,24 @@ def _load_subscription(
             cache.save(sub.name, result.body, userinfo)
         except OSError as exc:
             logger.error("подписка %s: кэш не записан: %s", label, exc)
-        return raws, userinfo
+        return raws, userinfo, ""
 
+    error = error or "получить не удалось"
     cached = cache.load(sub.name)
     if cached is None:
         logger.error("подписка %s: получить не удалось, кэша нет", label)
-        return [], {}
+        return [], {}, error
     try:
         raws, _meta, _warnings = parse_body(cached.body, sub.name)
     except ParseError as exc:
         logger.error("подписка %s: кэш не читается: %s", label, exc)
-        return [], {}
+        return [], {}, error
     age_min = max(0, int((time.time() - cached.saved_at) // 60)) if cached.saved_at else 0
     logger.warning(
         "подписка %s: используется кэш (%d серверов, сохранён %d мин назад)",
         label, len(raws), age_min,
     )
-    return raws, cached.userinfo
+    return raws, cached.userinfo, error
 
 
 def read_json(path: Path) -> dict | None:

@@ -65,6 +65,7 @@ class Uninstaller:
             ("сон", self._sleep),
             ("ufw", self._ufw),
             ("файлы служб", self._unit_files),
+            ("ярлык панели", self._launcher),
         ]
         if not keep_files:
             steps.append(("пользователь", self._user))
@@ -178,6 +179,16 @@ class Uninstaller:
         self.runner(["systemctl", "daemon-reload"], timeout=60.0, check=False)
         return "файлы служб удалены"
 
+    def _launcher(self) -> str | None:
+        path = self.paths.desktop_file
+        if not path.exists():
+            return None
+        path.unlink()
+        if self.journal.get("launcher_dir"):
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()  # только пустой: чужие ярлыки не трогаются
+        return "ярлык панели удалён"
+
     def _user(self) -> str | None:
         if not self.journal.get("user_created"):
             return None
@@ -216,7 +227,10 @@ class Uninstaller:
             return 0
         self.out("XGW удалён, сеть возвращена в состояние до установки.")
         if not purge and self.paths.config_file.exists():
-            self.out(f"Конфиг оставлен: {self.paths.config_file} (в нём ваша подписка).")
+            self.out(
+                f"Конфиг оставлен: {self.paths.config_file} (в нём ваша подписка); подписки, "
+                "добавленные в панели, — в panel.json рядом. Убрать и их: --purge."
+            )
         if packages:
             self.out(
                 f"Пакеты, поставленные при установке, оставлены: {', '.join(packages)} "

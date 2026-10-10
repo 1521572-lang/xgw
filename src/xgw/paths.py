@@ -133,6 +133,16 @@ class Paths:
         """Токен страницы статуса, если он не задан в config.toml."""
         return self.var / "status-token"
 
+    @property
+    def panel_token_file(self) -> Path:
+        """Токен панели управления."""
+        return self.var / "panel-token"
+
+    @property
+    def desktop_file(self) -> Path:
+        """Ярлык панели в меню приложений (каталог локально установленных программ)."""
+        return self.root / "usr" / "local" / "share" / "applications" / "xgw-panel.desktop"
+
     def ensure(self) -> None:
         for directory in (
             self.etc,

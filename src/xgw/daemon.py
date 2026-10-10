@@ -48,6 +48,8 @@ SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок пос�
 PROVIDER_DNS_TTL = 600.0
 ROLLBACK_AFTER = 2  # «после двух неудач — откат на last-good»
 FAIL_OPEN_AFTER = 60.0  # fail_mode = "open": Xray недоступен дольше — снять перехват
+WAIT_SLICE = 1.0  # как часто пауза между шагами смотрит, не пора ли проснуться
+MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -120,6 +122,13 @@ class Daemon:
         self.next_rescan = 0.0
         self._provider_ip: tuple[float, str] | None = None
         self._budget_warnings: tuple[str, ...] = ()
+        # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
+        self.poke = threading.Event()
+        self._refresh_asked = False
+        self._scan_asked = False
+        self._manual_scan = False
+        self._refreshing = False
+        self._rebuild_asked = False
 
     # --- цикл ------------------------------------------------------------------
 
@@ -133,17 +142,60 @@ class Daemon:
                 self.log.exception("шаг watchdog завершился ошибкой")
                 state = self.machine.state
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
-            stop.wait(jitter(pause))
+            if self._manual_scan and self.scan_queue:
+                pause = MANUAL_SCAN_PAUSE
+            self._sleep(stop, changed, jitter(pause))
         self.store.close()
-        self.log.info("демон XGW остановлен" if stop.is_set() else "config.toml изменён")
+        self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+
+    def _sleep(self, stop: threading.Event, changed, seconds: float) -> None:
+        """Пауза между шагами. Её прерывают остановка, правка настроек и запрос из панели."""
+        deadline = time.monotonic() + seconds
+        while not self.poke.is_set() and not changed():
+            left = deadline - time.monotonic()
+            if left <= 0 or stop.wait(min(left, WAIT_SLICE)):
+                break
+        self.poke.clear()
+
+    def request_refresh(self) -> None:
+        """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes."""
+        self._refresh_asked = True
+        self.poke.set()
+
+    def adopt(self, previous: Daemon) -> None:
+        """Настройки перечитаны. Если источники серверов прежние, подписки заново
+        не запрашиваются: конфиг пересобирается из уже полученного списка — так
+        отключение сервера в панели не стоит запроса к каждой подписке."""
+        if previous.inventory is None or (
+            engine.sources_key(previous.cfg) != engine.sources_key(self.cfg)
+        ):
+            return
+        self.inventory = previous.inventory
+        self.next_refresh = previous.next_refresh
+        self._rebuild_asked = True
+
+    def request_scan(self) -> None:
+        """Панель: проверить запасные серверы сейчас."""
+        self._scan_asked = True
+        self.poke.set()
+
+    @property
+    def refresh_pending(self) -> bool:
+        return self._refresh_asked or self._refreshing
+
+    @property
+    def scan_pending(self) -> bool:
+        return self._scan_asked or (self._manual_scan and bool(self.scan_queue))
 
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
+        refresh_asked, self._refresh_asked = self._refresh_asked, False
+        scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
         if applied is None:
             # Первый запуск: рабочего конфига ещё нет — собрать и запустить Xray.
-            if now >= self.next_refresh:
+            if now >= self.next_refresh or refresh_asked or self._rebuild_asked:
                 self._refresh(now, via_xray=False, urgent=True)
             applied = engine.read_json(self.paths.xray_config_file)
             if applied is None:
@@ -184,9 +236,18 @@ class Daemon:
             self.next_all_dead = now + ALL_DEAD_RETRY
             changed = self._refresh(now, via_xray=False, urgent=True)
             self._queue_scan(view, now)
-        elif not changed and state is not State.WAN_DOWN and now >= self.next_refresh:
+        elif not changed and (
+            refresh_asked or (state is not State.WAN_DOWN and now >= self.next_refresh)
+        ):
             changed = self._refresh(now, via_xray=signals.xray_ok, urgent=urgent)
+        elif not changed and self._rebuild_asked and self.inventory is not None:
+            self._rebuild_asked = False
+            self._save_inventory(self.inventory)
+            changed = self._rebuild(None, urgent=urgent, reason="изменение настроек")
 
+        if scan_asked:
+            self._manual_scan = True
+            self._queue_scan(view, now)
         if not changed and signals.xray_ok and signals.provider_ok:
             if now >= self.next_scan:
                 self.next_scan = now + jitter(self.cfg.probe.scan_spares_minutes * 60.0)
@@ -195,6 +256,8 @@ class Daemon:
             if state in (State.DEGRADED, State.ALL_DEAD):
                 changed = self._rotate(view, observatory or {}, state, now)
 
+        if not self.scan_queue:
+            self._manual_scan = False
         self._check_pin()
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
@@ -402,10 +465,25 @@ class Daemon:
 
     def _refresh(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
         """Опрос подписок и применение изменений."""
+        self._refreshing = True
+        try:
+            return self._refresh_now(now, via_xray=via_xray, urgent=urgent)
+        finally:
+            self._refreshing = False
+
+    def _refresh_now(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
         minutes = min((sub.refresh_minutes for sub in self.cfg.subscriptions), default=60)
         self.next_refresh = now + jitter(max(1, minutes) * 60.0)
         inventory = self._collect(via_xray)
+        self._save_errors(inventory)
+        if inventory.nodes:
+            self._save_inventory(inventory)
         first_start = not self.paths.xray_config_file.exists()
+        if not inventory.nodes and not engine.has_sources(self.cfg):
+            # Подписок и ссылок нет вовсе — это не сбой: их добавят в панели. Ядро,
+            # если оно уже работало, остаётся на прежних серверах.
+            self.next_refresh = now + jitter(SUBSCRIPTION_RETRY)
+            return False
         if not inventory.nodes or not (inventory.complete or first_start):
             # Неполный список применять нельзя: из ядра пропали бы серверы подписки,
             # которую сейчас не удалось получить.
@@ -419,6 +497,7 @@ class Daemon:
             self.next_refresh = min(self.next_refresh, now + jitter(SUBSCRIPTION_RETRY))
             return False
         self.inventory = inventory
+        self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
         return self._rebuild(None, urgent=urgent, reason="обновление подписки")
 
     def _rebuild(self, prefer: list[str] | None, *, urgent: bool, reason: str) -> bool:
@@ -443,6 +522,23 @@ class Daemon:
             self._repin()
             return True
         return outcome.mode == "rollback"
+
+    def _save_inventory(self, inventory: engine.Inventory) -> None:
+        try:
+            engine.save_inventory(self.paths, self.cfg, inventory)
+        except OSError as exc:  # список нужен только панели
+            self.log.error("список серверов не записан: %s", exc)
+
+    def _save_errors(self, inventory: engine.Inventory) -> None:
+        """Почему подписка не обновилась — чтобы панель показала это рядом с ней."""
+        errors = {
+            name: {"error": text, "ts": self.wall()} for name, text in inventory.errors.items()
+        }
+        try:
+            if errors or self.store.get_meta("sub_errors") not in (None, "", "{}"):
+                self.store.set_meta("sub_errors", json.dumps(errors, ensure_ascii=False))
+        except Exception as exc:  # состояние не критично для работы шлюза
+            self.log.error("ошибки подписок не записаны: %s", exc)
 
     def _collect(self, via_xray: bool) -> engine.Inventory:
         return engine.collect(

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import managed as managed_file
+
 
 class ConfigError(Exception):
     """Конфиг не читается или это битый TOML."""
@@ -137,6 +139,24 @@ class Notify:
 
 
 @dataclass
+class PanelConf:
+    enabled: bool = True
+    port: int = 8781
+
+
+@dataclass
+class Managed:
+    """Что пришло не из config.toml, а из panel.json (добавлено кнопкой в панели)."""
+
+    subscriptions: list[str] = field(default_factory=list)  # имена подписок
+    links: list[str] = field(default_factory=list)
+    # Отпечатки серверов, которые в конфиг Xray не попадают: отключённые остаются
+    # в списке панели, убранные из него исчезают.
+    disabled: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     network: Network = field(default_factory=Network)
     capture: Capture = field(default_factory=Capture)
@@ -151,6 +171,8 @@ class Config:
     watchdog: Watchdog = field(default_factory=Watchdog)
     status: StatusConf = field(default_factory=StatusConf)
     notify: Notify = field(default_factory=Notify)
+    panel: PanelConf = field(default_factory=PanelConf)
+    managed: Managed = field(default_factory=Managed)
 
 
 _SECTIONS = {
@@ -166,6 +188,7 @@ _SECTIONS = {
     "watchdog": Watchdog,
     "status": StatusConf,
     "notify": Notify,
+    "panel": PanelConf,
 }
 
 
@@ -199,8 +222,35 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
         else:
             warnings.append(f"неизвестная секция [{key}] проигнорирована")
     config = Config(**kwargs)  # type: ignore[arg-type]
+    warnings.extend(_merge_managed(config, managed_file.path_for(path)))
     warnings.extend(_validate(config))
     return config, warnings
+
+
+def _merge_managed(cfg: Config, path: Path) -> list[str]:
+    """Дополняет конфиг тем, что добавлено из панели (panel.json рядом с config.toml)."""
+    data, error = managed_file.load(path)
+    warnings = [error] if error else []
+    names = {sub.name for sub in cfg.subscriptions}
+    for item in data["subscriptions"]:
+        if item["name"] in names:
+            warnings.append(
+                f"подписка «{item['name']}» из панели пропущена: такое имя уже есть в config.toml"
+            )
+            continue
+        names.add(item["name"])
+        cfg.subscriptions.append(Subscription(
+            name=item["name"], url=item["url"], user_agent=item["user_agent"],
+            refresh_minutes=item["refresh_minutes"],
+        ))
+        cfg.managed.subscriptions.append(item["name"])
+    for link in data["links"]:
+        if link not in cfg.manual.links:
+            cfg.manual.links.append(link)
+            cfg.managed.links.append(link)
+    cfg.managed.disabled = list(data["disabled"])
+    cfg.managed.removed = list(data["removed"])
+    return warnings
 
 
 def probe_bytes(url: str) -> int | None:
@@ -329,6 +379,7 @@ def _validate(cfg: Config) -> list[str]:
         "metrics": cfg.xray.metrics_port,
         "socks": cfg.xray.socks_port,
         "http": cfg.xray.http_port,
+        "panel": cfg.panel.port,
     }
     ports = list(listening.values()) + [
         cfg.xray.probe_port_base + i for i in range(cfg.filters.max_members + 8)
