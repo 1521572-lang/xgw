@@ -31,6 +31,11 @@ def valid_interface(name: str) -> bool:
     return bool(_IFACE_RE.fullmatch(name)) and name not in (".", "..")
 
 
+def valid_hostname(name: str) -> bool:
+    """Имя, которое можно записать в dhcp-host."""
+    return bool(_NAME_RE.fullmatch(name))
+
+
 def normalize_mac(text: str) -> str | None:
     mac = text.strip().lower().replace("-", ":")
     return mac if _MAC_RE.fullmatch(mac) else None

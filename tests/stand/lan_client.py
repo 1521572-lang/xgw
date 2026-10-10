@@ -1,7 +1,7 @@
 """Клиент стенда — «устройство в Wi-Fi»: то, что на настоящей машине делают
 curl, dig и DHCP-клиент. Обычные сокеты, только стандартная библиотека.
 
-  lan_client.py get <url> [--dns СЕРВЕР] [--bind IP] [--mark N] [--timeout С]
+  lan_client.py get <url> [--dns СЕРВЕР] [--connect IP] [--bind IP] [--mark N] [--timeout С]
   lan_client.py dns <сервер> <имя> [--tcp] [--bind IP] [--timeout С]
   lan_client.py dhcp <интерфейс> [--mac MAC] [--timeout С]
 
@@ -87,8 +87,9 @@ def do_get(args) -> dict:
     url = urlsplit(args.url)
     host, port = url.hostname or "", url.port or 80
     try:
-        ipaddress.ip_address(host)
-        address = host
+        # --connect: соединиться с этим адресом, а в Host назвать имя из URL.
+        ipaddress.ip_address(args.connect or host)
+        address = args.connect or host
     except ValueError:
         if not args.dns:
             raise ValueError("для имени хоста нужен --dns СЕРВЕР") from None
@@ -207,6 +208,7 @@ def main() -> None:
     get = commands.add_parser("get")
     get.add_argument("url")
     get.add_argument("--dns", default="", help="DNS-сервер для имени хоста")
+    get.add_argument("--connect", default="", help="адрес соединения вместо имени из URL")
     get.add_argument("--bind", default="", help="адрес источника")
     get.add_argument("--mark", type=int, default=0, help="SO_MARK (нужен root)")
     get.add_argument("--timeout", type=float, default=6.0)

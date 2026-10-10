@@ -252,6 +252,7 @@ class Stand:
         self, *, max_members: int = 2, watchdog_s: int = 2,
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
+        direct_domains: tuple[str, ...] = (),
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -306,7 +307,7 @@ timeout = "3s"
 scan_spares_minutes = 1
 
 [routing]
-direct_domains = []
+direct_domains = {json.dumps(list(direct_domains))}
 direct_ips = []
 
 [dns]
@@ -488,6 +489,15 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
         if check and result.returncode != 0:
             raise RuntimeError(f"{' '.join(argv)}: {result.stdout}{result.stderr}")
         return result.stdout
+
+    def serve_in_gw(self, port: int, country: str) -> subprocess.Popen:
+        """HTTP-служба, слушающая только 127.0.0.1 шлюза (отвечает /trace)."""
+        return self._spawn(
+            f"service-{port}", "gw",
+            [sys.executable, str(HERE / "origin.py"), "--host", "127.0.0.1",
+             "--port", str(port), "--country", country],
+            "READY",
+        )
 
     def start_dnsmasq(self) -> subprocess.Popen:
         """dnsmasq шлюза с конфигом, который выдаёт `xgw net show dnsmasq`."""

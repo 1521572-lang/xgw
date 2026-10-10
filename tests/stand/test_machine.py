@@ -354,6 +354,45 @@ def test_servers_are_switched_off_and_removed_from_the_panel(gw):
     assert _exit_ip(gw) == VIA_VPN
 
 
+def test_device_is_taken_around_the_vpn_and_back_from_the_panel(gw):
+    """Переключатель устройства в панели: аренда DHCP закрепляется, адрес попадает в
+    набор bypass4, устройство выходит напрямую, остальные — через VPN; демон не
+    теряет это при перезагрузке правил."""
+    box, stand = gw.box, gw.stand
+    mac = "02:00:00:00:00:51"
+    lease = stand.lan("dhcp", "eth0", "--mac", mac)
+    assert "error" not in lease, f"{lease}\n{box.journal('dnsmasq', 20)}"
+    ip = lease["ip"]
+    stand.run_in("lan", "ip", "addr", "add", f"{ip}/24", "dev", "eth0")  # адрес «получен»
+    try:
+        assert wait_for(lambda: mac in [d["mac"] for d in _panel_state(gw)["devices"]], 20)
+        assert stand.exit_ip("lan", "--bind", ip) == VIA_VPN
+
+        pressed = _press(gw, "device", mac=mac, bypass=True)
+        assert pressed["ok"] and "идёт мимо VPN" in pressed["text"], pressed
+        assert ip in box.sh("nft list set ip xgw bypass4")
+        assert f"dhcp-host={mac},{ip}" in box.sh("cat /etc/dnsmasq.d/xgw.conf")
+        assert box.sh("stat -c '%U:%G %a' /etc/xgw/panel.json").strip() == "root:root 600"
+        assert wait_for(lambda: stand.exit_ip("lan", "--bind", ip) == DIRECT, 10, step=0.3)
+        assert _exit_ip(gw) == VIA_VPN  # остальные устройства — через VPN
+        (device,) = [d for d in _panel_state(gw)["devices"] if d["mac"] == mac]
+        assert device["bypass"] is True and device["managed"] is True
+
+        # Правила пропали (чужой сбой) — демон загружает их заново, уже с этим устройством.
+        box.sh("nft delete table ip xgw")
+        assert wait_for(lambda: _exit_ip(gw) == VIA_VPN, 30, step=1), box.journal("xgw", 40)
+        assert stand.exit_ip("lan", "--bind", ip) == DIRECT
+
+        back = _press(gw, "device", mac=mac, bypass=False)
+        assert back["ok"] and "снова идёт через VPN" in back["text"], back
+        assert ip not in box.sh("nft list set ip xgw bypass4")
+        assert mac not in box.sh("cat /etc/dnsmasq.d/xgw.conf")
+        assert wait_for(lambda: stand.exit_ip("lan", "--bind", ip) == VIA_VPN, 10, step=0.3)
+        assert json.loads(box.sh("cat /etc/xgw/panel.json"))["devices"] == []
+    finally:
+        stand.run_in("lan", "ip", "addr", "del", f"{ip}/24", "dev", "eth0")
+
+
 def test_uninstall_after_the_panel_keeps_only_the_users_settings(gw):
     box = gw.box
     result = _xgw(gw, "uninstall", "--yes", timeout=300)

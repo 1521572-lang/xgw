@@ -206,7 +206,7 @@ class Capture:
             return None
         expected: set[str] = set()
         if rules.capture:
-            expected.add("prerouting")
+            expected |= {"prerouting", "loopback_guard"}
         if rules.capture_local:
             expected.add("output")
         if rules.lan_if:
@@ -214,7 +214,7 @@ class Capture:
         if not expected <= chains:
             return False
         if not rules.capture:
-            return not chains & {"prerouting", "output"}
+            return not chains & {"prerouting", "output", "loopback_guard"}
         with contextlib.suppress(cmd.CommandError):
             return iprule.present(
                 self.cfg.capture.mark_proxy, self.cfg.capture.route_table, self.runner

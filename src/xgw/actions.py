@@ -12,11 +12,13 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import config, engine
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
+from .net import cmd, dnsmasq
 from .net.capture import Capture, CaptureError
 from .paths import Paths
 from .store import Store
@@ -106,6 +108,38 @@ def disable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
     with open_store(paths) as store:
         store.add_event("capture", text)
     return Outcome(0, text, hints=("вернуть перехват: sudo xgw enable",))
+
+
+# --- сеть после изменения настроек ---------------------------------------------
+
+
+def apply_network(
+    cfg: config.Config, paths: Paths, capture: Capture, *, logger,
+    runner: Callable[..., str] = cmd.run,
+) -> tuple[list[str], list[str]]:
+    """Доводит до конфига правила nftables (bypass_hosts, exclude_cidrs) и DHCP
+    (dhcp_range, static_leases). Возвращает (что сделано, что не удалось): сбой одного
+    шага не отменяет другой. Правила nft перед загрузкой проверяются `nft -c` и
+    заменяются целиком одной транзакцией."""
+    done: list[str] = []
+    problems: list[str] = []
+    if capture.configured:
+        try:
+            capture.up()
+        except CaptureError as exc:
+            problems.append(f"правила сети не обновлены: {exc}")
+    if not capture.lan_if:
+        return done, problems
+    changed, warnings = dnsmasq.write_conf(cfg, paths)
+    for warning in warnings:
+        logger.warning("%s", warning)
+    if changed:
+        try:
+            runner(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0)
+            done.append("dnsmasq: настройки DHCP обновлены")
+        except cmd.CommandError as exc:
+            problems.append(f"dnsmasq не перезапущен: {exc}")
+    return done, problems
 
 
 # --- ручное закрепление --------------------------------------------------------

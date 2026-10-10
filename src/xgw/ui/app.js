@@ -203,6 +203,7 @@
   }
 
   const setServers = (fingerprints, mode) => act("servers", { fingerprints, mode });
+  const setDevice = (mac, bypass) => act("device", { mac, bypass });
 
   // --- отрисовка ------------------------------------------------------------
 
@@ -493,12 +494,42 @@
     $("devices-card").hidden = !s.lan.interface;
     $("devices-count").textContent = s.devices.length ? String(s.devices.length) : "";
     $("devices-note").textContent = s.lan.gateway ? `сеть ${s.lan.interface}, шлюз ${s.lan.gateway}` : "";
-    fill($("devices"), s.devices.map((device) => el("li", {},
-      el("div", { class: "row-main" },
-        el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" })),
-        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` })),
-      el("span", { class: device.bypass ? "tag warn" : "tag on", text: device.bypass ? "мимо VPN" : "через VPN" }))),
+    fill($("devices"), s.devices.map(deviceRow),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
+  }
+
+  // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
+  // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
+  function deviceRow(device) {
+    const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
+    if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
+    const name = device.name || device.mac;
+    const locked = device.bypass && !device.managed;
+    let control = null;
+    if (device.managed || !device.bypass) {
+      const vpn = !device.bypass;
+      control = el("button", {
+        class: "switch", type: "button", role: "switch", "aria-checked": String(vpn),
+        "aria-label": `VPN для устройства ${name}`,
+        title: vpn ? "Пустить это устройство мимо VPN" : "Вернуть это устройство в VPN",
+        onclick: () => {
+          if (!vpn) return setDevice(device.mac, false);
+          confirmRemove(
+            `Пустить «${name}» мимо VPN?`,
+            "Его трафик пойдёт напрямую, без шифрования и защиты от утечек, и не остановится, даже если Xray перестанет работать. Адрес устройства закрепится за ним.",
+            () => setDevice(device.mac, true), "Пустить мимо VPN");
+        },
+      });
+    }
+    return el("li", {},
+      el("div", { class: "row-main" }, title,
+        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` })),
+      el("span", {
+        class: device.bypass ? "tag warn" : "tag on",
+        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN") : "через VPN",
+        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
+      }),
+      control ? el("div", { class: "row-tools" }, control) : null);
   }
 
   function renderEvents(s) {
@@ -525,9 +556,10 @@
 
   let confirmed = null;
 
-  function confirmRemove(title, text, action) {
+  function confirmRemove(title, text, action, yes = "Убрать") {
     $("confirm-title").textContent = title;
     $("confirm-text").textContent = text;
+    $("confirm-yes").textContent = yes;
     confirmed = action;
     $("confirm-dialog").showModal();
   }

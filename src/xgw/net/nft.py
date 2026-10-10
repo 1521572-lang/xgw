@@ -5,8 +5,8 @@
 заменяется целиком и атомарно одной транзакцией («создать, удалить, создать»).
 
 Три вида набора правил:
-  перехват включён — prerouting (TPROXY) и output (метка), forward только для
-                     обхода и ICMP;
+  перехват включён — prerouting (TPROXY) и output (метка), loopback_guard (Xray не
+                     ходит к службам шлюза), forward только для обхода и ICMP;
   перехват снят    — xgw disable или fail_mode = open: обычный роутер, форвардинг
                      LAN → WAN с маскарадингом;
   без LAN и без перехвата — таблицы нет вовсе.
@@ -221,6 +221,20 @@ def render(rules: Rules) -> str:
         output.append(f"meta l4proto {{ tcp, udp }} counter meta mark set {proxy}")
         blocks.append(
             _chain("output", "type route hook output priority mangle; policy accept;", output)
+        )
+
+    if rules.capture:
+        # Сниффинг подставляет в соединение имя из запроса, а outbound direct
+        # разрешает его сам: имя из direct_domains, указывающее на 127.0.0.1, привело
+        # бы Xray к службам самого шлюза. Сокеты direct помечены mark_bypass —
+        # к loopback с этой меткой не пускаем. Свои запросы к loopback XGW шлёт без
+        # метки (marknet.connect_marked), остальные сокеты Xray к нему не ходят.
+        blocks.append(
+            _chain(
+                "loopback_guard",
+                "type filter hook output priority filter; policy accept;",
+                [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"],
+            )
         )
 
     if lan_if:

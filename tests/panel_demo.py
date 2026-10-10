@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from xgw import actions, config, engine
-from xgw.net import dnsmasq
+from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
 from xgw.watch.panel import Panel
@@ -135,12 +135,17 @@ class DemoCapture:
     mode_now = "on"
 
     def __init__(self, cfg, paths, **_kwargs) -> None:
+        self.cfg = cfg
         self.lan_if = cfg.network.lan_if
         self.capturing = self.configured = True
 
+    def up(self) -> str:  # правила в демо не загружаются
+        return DemoCapture.mode_now
+
     def describe(self, *, check: bool = True) -> dict:
         return {"mode": DemoCapture.mode_now, "lan_if": self.lan_if, "lan": True, "local": True,
-                "bypass": ["192.168.50.23"], "fail_mode": "closed", "loaded": None}
+                "bypass": lan.bypass_addresses(self.cfg)[0], "fail_mode": "closed",
+                "loaded": None}
 
 
 class DemoDaemon:
@@ -230,7 +235,7 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         DemoCapture.mode_now = "off"
     cfg, _warnings = config.load(config_path)
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
-                      capture_factory=DemoCapture)
+                      capture_factory=DemoCapture, runner=lambda *_args, **_kwargs: "")
     panel.configure(cfg, DemoDaemon())
     return panel
 

@@ -12,7 +12,9 @@ import pytest
 from fakenet import FakeKernel
 
 from xgw import actions, config, engine, managed
+from xgw.net import dnsmasq
 from xgw.net.capture import Capture
+from xgw.net.cmd import CommandError
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
 from xgw.watch import panel as panel_module
@@ -134,6 +136,8 @@ class Rig:
         (proc / "net/ipv4").mkdir(parents=True)
         (proc / "net/ipv4/ip_forward").write_text("0\n", encoding="ascii")
         self.root_problem: str | None = None
+        self.system_calls: list[tuple[str, ...]] = []  # systemctl и прочее, кроме nft и ip
+        self.dnsmasq_fails = False
         self.xray_up = True
         monkeypatch.setattr(
             engine, "healthy_http_in", lambda _cfg: ("127.0.0.1", 10809) if self.xray_up else None
@@ -144,6 +148,7 @@ class Rig:
             root_problem=lambda: self.root_problem,
             capture_factory=lambda cfg, paths, **kwargs: Capture(
                 cfg, paths, runner=self.kernel, proc_sys=proc, time_uids=(), **kwargs),
+            runner=self._system,
         )
         monkeypatch.setattr(Panel, "_selected", lambda self, ok, now: ["proxy-nl-aaaa"])
         cfg, _warnings = config.load(self.config_path)
@@ -151,8 +156,19 @@ class Rig:
         self.panel.start()
         self.client = Client(self.panel.port)
 
+    def _system(self, argv, *, input=None, timeout=15.0, check=True) -> str:
+        self.system_calls.append(tuple(argv))
+        if self.dnsmasq_fails:
+            raise CommandError("systemctl restart dnsmasq.service: Job failed")
+        return ""
+
     def saved(self) -> dict:
         return json.loads(self.store_path.read_text(encoding="utf-8"))
+
+    def lease(self, mac="aa:bb:cc:00:11:22", ip="192.168.50.101", name="phone") -> None:
+        leases = dnsmasq.leases_path(self.paths)
+        leases.parent.mkdir(parents=True, exist_ok=True)
+        leases.write_text(f"1791600000 {mac} {ip} {name or '*'} *\n", encoding="utf-8")
 
 
 @pytest.fixture()
@@ -285,8 +301,131 @@ def test_devices_and_events_are_listed(rig, user):
         store.add_event("apply", f"подписка {SUB_URL} применена")
     state = user.state()
     assert state["devices"] == [{"expires": 1791600000, "mac": "aa:bb:cc:00:11:22",
-                                 "ip": "192.168.50.101", "name": "phone", "bypass": False}]
+                                 "ip": "192.168.50.101", "name": "phone", "bypass": False,
+                                 "managed": False}]
     assert state["events"][0]["kind"] == "apply" and "S3CR3T" not in state["events"][0]["detail"]
+
+
+# --- устройства: пустить мимо VPN ----------------------------------------------------
+
+PHONE = "aa:bb:cc:00:11:22"
+
+
+def _bypass_set(rig) -> str:
+    """Что загружено в набор bypass4 таблицы xgw."""
+    return rig.kernel.table.split("set bypass4 {")[1].split("}")[0]
+
+
+def test_device_goes_around_the_vpn_and_back(rig, user):
+    rig.lease()
+    assert user.act("power", {"on": True})["ok"]  # правила загружены, перехват включён
+    rig.kernel.calls.clear()
+
+    result = user.act("device", {"mac": PHONE, "bypass": True})
+    assert result["ok"] and "«phone» идёт мимо VPN" in result["text"]
+    assert result["notes"] and "не защищён VPN" in result["notes"][0]
+    # Адрес закреплён арендой DHCP и записан в панельный файл, config.toml не тронут.
+    assert rig.saved()["devices"] == [{"mac": PHONE, "ip": "192.168.50.101", "name": "phone"}]
+    assert "bypass_hosts" not in rig.config_path.read_text(encoding="utf-8")
+    assert "192.168.50.101" in _bypass_set(rig)
+    conf = dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
+    assert f"dhcp-host={PHONE},192.168.50.101,phone" in conf
+    assert rig.system_calls == [("systemctl", "restart", "dnsmasq.service")]
+    assert ("nft", "-c", "-f", "-") in rig.kernel.calls  # правила проверены до загрузки
+
+    row = user.state()["devices"][0]
+    assert row["bypass"] is True and row["managed"] is True
+    assert user.state()["capture"]["bypass"] == ["192.168.50.101"]
+    assert next(e["kind"] for e in user.state()["events"]) == "panel"
+    assert rig.daemon.poke.is_set()
+
+    again = user.act("device", {"mac": PHONE, "bypass": True})
+    assert again["ok"] and again["text"] == "Ничего не изменилось"
+    assert len(rig.system_calls) == 1  # без изменений сеть не трогаем
+
+    result = user.act("device", {"mac": PHONE, "bypass": False})
+    assert result["ok"] and "снова идёт через VPN" in result["text"]
+    assert rig.saved()["devices"] == []
+    assert "192.168.50.101" not in _bypass_set(rig)
+    assert "dhcp-host" not in dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
+    assert user.state()["devices"][0]["bypass"] is False
+
+
+def test_bypassed_device_stays_in_the_list_when_it_is_offline(rig, user):
+    rig.lease()
+    user.act("device", {"mac": PHONE, "bypass": True})
+    dnsmasq.leases_path(rig.paths).write_text("", encoding="utf-8")  # аренда истекла
+    (row,) = user.state()["devices"]
+    assert row["mac"] == PHONE and row["offline"] is True
+    assert row["bypass"] is True and row["managed"] is True and row["ip"] == "192.168.50.101"
+    assert user.act("device", {"mac": PHONE, "bypass": False})["ok"]  # вернуть можно и так
+    assert user.state()["devices"] == []
+
+
+def test_network_failure_rolls_the_device_back(rig, user):
+    rig.lease()
+    rig.dnsmasq_fails = True
+    result = user.act("device", {"mac": PHONE, "bypass": True})
+    assert not result["ok"] and "прежние настройки возвращены" in result["text"]
+    assert "dnsmasq не перезапущен" in result["text"]
+    assert rig.saved()["devices"] == []  # запись откатилась
+    assert "dhcp-host" not in dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
+    assert "192.168.50.101" not in _bypass_set(rig)
+    assert user.state()["devices"][0]["bypass"] is False
+
+    rig.dnsmasq_fails = False
+    rig.kernel.refuse = "nft -c"  # ядро не принимает правила
+    result = user.act("device", {"mac": PHONE, "bypass": True})
+    assert not result["ok"] and "правила сети не обновлены" in result["text"]
+    assert rig.saved()["devices"] == []
+
+
+def test_device_requests_are_checked(rig, user):
+    rig.lease()
+    for body in ({}, {"mac": PHONE}, {"mac": "не mac", "bypass": True},
+                 {"mac": PHONE, "bypass": "yes"}, {"mac": 5, "bypass": True}):
+        assert not user.act("device", body)["ok"]
+    result = user.act("device", {"mac": "aa:bb:cc:99:99:99", "bypass": True})
+    assert "в сети нет" in result["text"]
+    assert not rig.store_path.exists() and rig.system_calls == []
+
+    rig.root_problem = "нужны права root: sudo xgw …"
+    result = user.act("device", {"mac": PHONE, "bypass": True})
+    assert not result["ok"] and "root" in result["text"] and not rig.store_path.exists()
+    rig.root_problem = None
+
+    # Адрес вне сети шлюза или сам шлюз закрепить нельзя.
+    for ip in ("10.9.9.9", "192.168.50.1"):
+        rig.lease(ip=ip)
+        result = user.act("device", {"mac": PHONE, "bypass": True})
+        assert not result["ok"] and "вне сети шлюза" in result["text"], ip
+    assert not rig.store_path.exists()
+
+
+def test_device_set_in_config_toml_is_not_changed_by_the_panel(rig, user):
+    rig.config_path.write_text(
+        CONFIG.replace(
+            'lan_if = "lan0"', f'lan_if = "lan0"\nbypass_hosts = ["{PHONE}", "192.168.50.7"]'
+        ),
+        encoding="utf-8",
+    )
+    rig.panel._wake()
+    rig.lease()
+    other = "aa:bb:cc:00:11:77"
+    with dnsmasq.leases_path(rig.paths).open("a", encoding="utf-8") as leases:
+        leases.write(f"1791600000 {other} 192.168.50.7 tv *\n")
+    tv, phone = user.state()["devices"]  # по возрастанию адреса
+    assert (tv["bypass"], tv["managed"]) == (True, False)  # мимо VPN по адресу, из config.toml
+    # MAC без статической аренды адреса не даёт, пока устройство не закреплено: через VPN.
+    assert (phone["bypass"], phone["managed"]) == (False, False)
+
+    result = user.act("device", {"mac": PHONE, "bypass": False})
+    assert not result["ok"] and "network.bypass_hosts" in result["text"]
+    for mac in (PHONE, other):
+        result = user.act("device", {"mac": mac, "bypass": True})
+        assert result["ok"] and result["text"].endswith("config.toml")
+    assert user.act("device", {"mac": other, "bypass": False})["text"] == "Ничего не изменилось"
+    assert not rig.store_path.exists() and rig.system_calls == []
 
 
 # --- кнопка включения ----------------------------------------------------------------

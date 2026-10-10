@@ -29,7 +29,7 @@ def _save(conf, data) -> None:
 
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
-        {"subscriptions": [], "links": [], "disabled": [], "removed": []}, "")
+        {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": []}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -80,6 +80,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "links": [links.VMESS],
         "disabled": ["aaaa1111"],  # убранный сервер отключённым уже не считается
         "removed": ["bbbb2222"],
+        "devices": [],
     }
 
 
@@ -182,3 +183,91 @@ def test_skip_reason_names_the_filter():
     assert skip_reason(node, cfg) == "filter"
     cfg.filters.include_regex, cfg.filters.exclude_regex = "", "."
     assert skip_reason(node, cfg) == "filter"
+
+
+# --- устройства мимо VPN ---------------------------------------------------------------
+
+
+def test_device_bypass_is_stored_and_turned_back(conf):
+    path = managed.path_for(conf)
+    assert managed.set_device(path, "AA-BB-CC-00-11-22", "192.168.50.101", "phone", bypass=True)
+    assert not managed.set_device(path, "aa:bb:cc:00:11:22", "192.168.50.101", "phone", bypass=True)
+    assert managed.load(path)[0]["devices"] == [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": "phone"}]
+    # Адрес принадлежит одному устройству; повтор того же MAC обновляет запись.
+    with pytest.raises(ManagedError, match="закреплён"):
+        managed.set_device(path, "aa:bb:cc:00:11:33", "192.168.50.101", "", bypass=True)
+    assert managed.set_device(path, "aa:bb:cc:00:11:22", "192.168.50.102", "bad name", bypass=True)
+    assert managed.load(path)[0]["devices"][0]["name"] == ""  # имя не для dhcp-host — без имени
+    assert managed.set_device(path, "aa:bb:cc:00:11:22", "", "", bypass=False)
+    assert not managed.set_device(path, "aa:bb:cc:00:11:22", "", "", bypass=False)
+    assert managed.load(path)[0]["devices"] == []
+    for mac, ip in (("не mac", "192.168.50.5"), ("aa:bb:cc:00:11:22", "не адрес")):
+        with pytest.raises(ManagedError):
+            managed.set_device(path, mac, ip, "", bypass=True)
+
+
+def test_devices_survive_other_changes_and_junk_is_dropped(conf):
+    path = managed.path_for(conf)
+    _save(conf, {"devices": [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": "tv"},
+        {"mac": "AA:BB:CC:00:11:22", "ip": "192.168.50.150"},  # тот же MAC
+        {"mac": "aa:bb:cc:00:11:44", "ip": "192.168.50.101"},  # тот же адрес
+        {"mac": "нет", "ip": "192.168.50.7"}, {"mac": "aa:bb:cc:00:11:55", "ip": 5},
+        {"mac": "aa:bb:cc:00:11:66", "ip": "::1"}, "строка", 7,
+        {"mac": "aa:bb:cc:00:11:77", "ip": "192.168.50.77", "name": "x y"},
+    ]})
+    assert managed.load(path)[0]["devices"] == [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": "tv"},
+        {"mac": "aa:bb:cc:00:11:77", "ip": "192.168.50.77", "name": ""},
+    ]
+    managed.set_servers(path, ["aaaa1111"], "disabled")
+    managed.add_links(path, links.VMESS, taken=set())
+    assert len(managed.load(path)[0]["devices"]) == 2  # чужие правки список не трогают
+    managed.replace_devices(path, [{"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101"}])
+    assert managed.load(path)[0]["devices"] == [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": ""}]
+
+
+def test_device_limit(conf, monkeypatch):
+    monkeypatch.setattr(managed, "MAX_DEVICES", 2)
+    path = managed.path_for(conf)
+    managed.set_device(path, "aa:bb:cc:00:00:01", "192.168.50.1", "", bypass=True)
+    managed.set_device(path, "aa:bb:cc:00:00:02", "192.168.50.2", "", bypass=True)
+    with pytest.raises(ManagedError, match="больше нельзя"):
+        managed.set_device(path, "aa:bb:cc:00:00:03", "192.168.50.3", "", bypass=True)
+
+
+def test_panel_devices_become_a_static_lease_and_a_bypass_host(conf):
+    _save(conf, {"devices": [{"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": "tv"}]})
+    cfg, warnings = config.load(conf)
+    assert warnings == []
+    assert cfg.network.static_leases == ["aa:bb:cc:00:11:22,192.168.50.101,tv"]
+    assert cfg.network.bypass_hosts == ["aa:bb:cc:00:11:22"]
+    assert cfg.managed.devices == ["aa:bb:cc:00:11:22"]
+    from xgw.net import lan
+    assert lan.bypass_addresses(cfg) == (["192.168.50.101"], [])  # арендой MAC стал адресом
+
+
+def test_config_toml_wins_over_panel_devices(conf):
+    conf.write_text(
+        conf.read_text(encoding="utf-8")
+        + '[network]\nstatic_leases = ["AA-BB-CC-00-11-22,192.168.50.101,tv", '
+        '"aa:bb:cc:00:11:99,192.168.50.99", "aa:bb:cc:00:11:88,192.168.50.88"]\n'
+        'bypass_hosts = ["aa:bb:cc:00:11:99"]\n', encoding="utf-8")
+    _save(conf, {"devices": [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.101", "name": "tv"},  # аренда уже есть
+        {"mac": "aa:bb:cc:00:11:99", "ip": "192.168.50.99", "name": ""},  # уже мимо VPN в toml
+        {"mac": "aa:bb:cc:00:11:33", "ip": "192.168.50.88", "name": ""},  # адрес занят в toml
+        {"mac": "aa:bb:cc:00:11:44", "ip": "192.168.50.40", "name": ""},
+    ]})
+    cfg, warnings = config.load(conf)
+    assert cfg.network.static_leases == [
+        "AA-BB-CC-00-11-22,192.168.50.101,tv", "aa:bb:cc:00:11:99,192.168.50.99",
+        "aa:bb:cc:00:11:88,192.168.50.88", "aa:bb:cc:00:11:44,192.168.50.40"]
+    assert cfg.network.bypass_hosts == [
+        "aa:bb:cc:00:11:99", "aa:bb:cc:00:11:22", "aa:bb:cc:00:11:44"]
+    assert cfg.managed.devices == ["aa:bb:cc:00:11:22", "aa:bb:cc:00:11:44"]
+    assert warnings == [
+        "устройство aa:bb:cc:00:11:33 из панели пропущено: MAC или адрес 192.168.50.88 "
+        "уже заняты в network.static_leases"]

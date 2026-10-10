@@ -266,23 +266,13 @@ def _sync_network(cfg: config.Config, paths: Paths, logger) -> None:
     nftables (bypass_hosts, exclude_cidrs) и DHCP (dhcp_range, static_leases)."""
     if _root_problem() or not paths.journal_file.exists():
         return
-    capture = Capture(cfg, paths, logger=logger)
-    if capture.configured:
-        try:
-            capture.up()
-        except CaptureError as exc:
-            print(f"внимание: правила сети не обновлены: {exc}", file=sys.stderr)
-    if not capture.lan_if:
-        return
-    changed, warnings = dnsmasq.write_conf(cfg, paths)
-    for warning in warnings:
-        logger.warning("%s", warning)
-    if changed:
-        try:
-            cmd.run(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0)
-            print("dnsmasq: настройки DHCP обновлены")
-        except cmd.CommandError as exc:
-            print(f"внимание: dnsmasq не перезапущен: {exc}", file=sys.stderr)
+    done, problems = actions.apply_network(
+        cfg, paths, Capture(cfg, paths, logger=logger), logger=logger, runner=cmd.run
+    )
+    for line in done:
+        print(line)
+    for problem in problems:
+        print(f"внимание: {problem}", file=sys.stderr)
 
 
 @contextlib.contextmanager

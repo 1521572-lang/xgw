@@ -11,6 +11,7 @@ bootstrap-резолверы (fetch.resolve_domain).
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import sys
 
@@ -40,10 +41,19 @@ class MarkUnavailable(RuntimeError):
     pass
 
 
+def is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def connect_marked(host: str, port: int, *, timeout: float, mark: int | None) -> socket.socket:
+    """К loopback метка не ставится: он не перехватывается, а правило loopback_guard
+    (net/nft.py) отказывает помеченным пакетам к 127.0.0.0/8 — их шлёт только Xray."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        if mark is not None:
+        if mark is not None and not is_loopback(host):
             if not is_mark_supported():
                 raise MarkUnavailable("SO_MARK доступен только в Linux")
             sock.setsockopt(socket.SOL_SOCKET, SO_MARK, mark)

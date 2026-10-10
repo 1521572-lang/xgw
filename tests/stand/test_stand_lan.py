@@ -216,6 +216,54 @@ def test_daemon_restores_rules_and_dhcp_serves_leases(gateway):
     assert static.get("ip") == netns.LAN_BYPASS_IP, static  # статическая аренда по MAC
 
 
+def test_lan_device_cannot_reach_gateway_loopback_through_direct(tmp_path):
+    """Имя из direct_domains, указывающее на 127.0.0.1, не приводит Xray к службам
+    самого шлюза (ASSUMPTIONS, п. 119): сниффинг подставляет имя, outbound direct
+    разрешает его сам, а цепочка loopback_guard отвергает пакеты с меткой обхода
+    к 127.0.0.0/8. Без цепочки это достижимо — тест доказывает и то, и другое."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up(capture=True, direct_domains=("domain:direct.stand.test",))
+        assert stand.xgw("enable").returncode == 0
+        stand.serve_in_gw(8080, "GW-LOOPBACK")
+        metrics = stand.ports["metrics"]
+
+        def through_name(name: str, port: int, path: str) -> dict:
+            # Устройство идёт на адрес «интернета», а в Host (и в SNI) называет домен;
+            # имя разрешает DNS-заглушка стенда: loopback.* → 127.0.0.1.
+            return stand.lan(
+                "get", f"http://{name}.direct.stand.test:{port}{path}",
+                "--connect", netns.INET_IP, "--timeout", "6", "--body",
+            )
+
+        def reached_gateway() -> bool:
+            service = through_name("loopback", 8080, "/trace")
+            stats = through_name("loopback", metrics, "/debug/vars")
+            return "GW-LOOPBACK" in service.get("body", "") or stats.get("status") == 200
+
+        # Обычное имя из direct_domains по-прежнему идёт напрямую.
+        named = through_name("site", 8080, "/trace")
+        assert f"ip={DIRECT}" in named.get("body", ""), named
+
+        assert not reached_gateway()
+        guard = stand.gw_run("nft", "list", "chain", "ip", "xgw", "loopback_guard")
+        assert "packets 0 " not in guard and "reject" in guard, guard  # отказал именно он
+
+        # Контроль: без цепочки службы шлюза достижимы — тест видит дыру.
+        stand.gw_run("nft", "flush", "chain", "ip", "xgw", "loopback_guard")
+        assert reached_gateway()
+        # Команды XGW возвращают правила на место (enable заменяет таблицу целиком).
+        assert stand.xgw("net", "up").returncode == 0
+        assert not reached_gateway()
+
+        # Свой трафик XGW не страдает: проба идёт через probe-inbounds на 127.0.0.1.
+        assert stand.xgw("probe", "--all").returncode == 0
+        assert stand.exit_ip("lan") == VIA_VPN
+    finally:
+        stand.stop()
+
+
 def test_fail_open_removes_capture_until_xray_returns(tmp_path):
     """fail_mode = "open": Xray недоступен дольше минуты — демон снимает перехват,
     сеть работает напрямую; Xray вернулся — перехват возвращается сам."""

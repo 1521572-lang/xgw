@@ -154,6 +154,9 @@ class Managed:
     # в списке панели, убранные из него исчезают.
     disabled: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
+    # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
+    devices: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -250,6 +253,42 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
             cfg.managed.links.append(link)
     cfg.managed.disabled = list(data["disabled"])
     cfg.managed.removed = list(data["removed"])
+    warnings.extend(_merge_devices(cfg, data["devices"]))
+    return warnings
+
+
+def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
+    """Устройства мимо VPN из панели: статическая аренда и запись в bypass_hosts.
+
+    То, что уже есть в config.toml, главнее: совпадающую аренду не дублируем, а
+    конфликтующую (тот же MAC с другим адресом или тот же адрес у другого MAC)
+    пропускаем с предупреждением.
+    """
+    warnings: list[str] = []
+    lease_ip: dict[str, str] = {}
+    for entry in cfg.network.static_leases:
+        parts = [part.strip() for part in entry.split(",")]
+        if len(parts) > 1:
+            lease_ip[parts[0].lower().replace("-", ":")] = parts[1]
+    listed = {host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts}
+    for device in devices:
+        mac, ip, name = device["mac"], device["ip"], device["name"]
+        if mac in listed:
+            continue  # уже мимо VPN по config.toml — панель этим не управляет
+        if lease_ip.get(mac, ip) != ip or any(
+            other != mac and taken == ip for other, taken in lease_ip.items()
+        ):
+            warnings.append(
+                f"устройство {mac} из панели пропущено: MAC или адрес {ip} уже заняты "
+                "в network.static_leases"
+            )
+            continue
+        if mac not in lease_ip:
+            cfg.network.static_leases.append(f"{mac},{ip}" + (f",{name}" if name else ""))
+            lease_ip[mac] = ip
+        cfg.network.bypass_hosts.append(mac)
+        listed.add(mac)
+        cfg.managed.devices.append(mac)
     return warnings
 
 

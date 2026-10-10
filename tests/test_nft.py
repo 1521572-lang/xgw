@@ -37,7 +37,7 @@ def test_gateway_with_lan_and_local_capture():
     # Таблица заменяется атомарно и только своя: никакого flush ruleset.
     assert text.startswith("table ip xgw\ndelete table ip xgw\ntable ip xgw {\n")
     assert "flush" not in text
-    for chain in ("prerouting", "output", "dns_direct", "forward", "postrouting"):
+    for chain in ("prerouting", "output", "loopback_guard", "dns_direct", "forward", "postrouting"):
         assert f"chain {chain} {{" in text
 
     prerouting = _chain(text, "prerouting")
@@ -70,6 +70,26 @@ def test_gateway_with_lan_and_local_capture():
     dns_direct = _chain(text, "dns_direct")[0]  # DNS устройств в обход VPN — на прямой резолвер
     assert "ip saddr @bypass4 meta l4proto { tcp, udp } th dport 53" in dns_direct
     assert dns_direct.endswith("dnat to 77.88.8.8")
+
+
+def test_loopback_guard_refuses_marked_packets_to_loopback():
+    """Сокеты direct в Xray помечены mark_bypass; имя из direct_domains, указывающее
+    на 127.0.0.1, не должно привести их к службам самого шлюза (ASSUMPTIONS, п. 119)."""
+    text = _render(_cfg())
+    assert "hook output priority filter" in text.split("chain loopback_guard {")[1].splitlines()[1]
+    assert _chain(text, "loopback_guard") == ["meta mark 0x2 ip daddr 127.0.0.0/8 counter reject"]
+    cfg = _cfg()
+    cfg.capture.mark_bypass = 255
+    assert _chain(_render(cfg), "loopback_guard") == [
+        "meta mark 0xff ip daddr 127.0.0.0/8 counter reject"
+    ]
+    # Нужна при любом перехвате: и когда Xray обслуживает только LAN, и только машину.
+    lan_only = _cfg()
+    lan_only.capture.local = False
+    assert "chain loopback_guard {" in _render(lan_only)
+    assert "chain loopback_guard {" in _render(Config())
+    # Перехват снят — Xray трафик устройств не обслуживает, цепочка не нужна.
+    assert "loopback_guard" not in _render(_cfg(), capture=False)
 
 
 def test_reserved_set_has_ranges_from_xray_guide_and_excludes():
@@ -186,7 +206,7 @@ def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     assert nft.apply(rules, kernel) == []
     assert [call[1:] for call in kernel.calls] == [("-c", "-f", "-"), ("-f", "-"), ("-f", "-")]
     assert nft.loaded_chains(kernel) == {
-        "prerouting", "output", "dns_direct", "forward", "postrouting"
+        "prerouting", "output", "loopback_guard", "dns_direct", "forward", "postrouting"
     }
 
     class NoIpv6(FakeKernel):

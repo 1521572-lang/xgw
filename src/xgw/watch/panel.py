@@ -3,7 +3,8 @@
 Что умеет: включить и выключить VPN (то же, что `xgw enable` и `xgw disable`),
 показать серверы каждой подписки с задержками, закрепить один из них, отключить
 сервер или убрать его из списка, добавить и убрать подписку или ссылку сервера,
-обновить подписки и проверить запасные серверы.
+обновить подписки и проверить запасные серверы, пустить устройство из Wi-Fi-сети
+мимо VPN и вернуть его обратно.
 
 Безопасность:
   * слушает только 127.0.0.1 — из сети панель не открыть;
@@ -22,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import secrets
 import sqlite3
@@ -38,7 +40,7 @@ from .. import __version__, actions, config, engine, log, managed, masking
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
-from ..net import dnsmasq, lan
+from ..net import cmd, dnsmasq, lan
 from ..net.capture import Capture
 from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
@@ -125,6 +127,7 @@ class Panel:
         logger=None,
         root_problem: Callable[[], str | None] = actions.root_problem,
         capture_factory: Callable[..., Capture] = Capture,
+        runner: Callable[..., str] = cmd.run,
     ) -> None:
         self.paths = paths
         self.config_path = Path(config_path)
@@ -133,6 +136,7 @@ class Panel:
         self.log = logger or log.get_logger("panel")
         self.root_problem = root_problem
         self.capture_factory = capture_factory
+        self.runner = runner
         self.cfg = Config()
         self.daemon = None
         self._lock = threading.Lock()  # одно действие за раз
@@ -399,11 +403,7 @@ class Panel:
             for link in cfg.manual.links
         ]
 
-        bypass = set(info["bypass"])
-        devices = []
-        if info["lan_if"]:
-            for device in dnsmasq.read_leases(self.paths):
-                devices.append({**device, "bypass": device.get("ip") in bypass})
+        devices = self._devices(info)
         gateway = lan.gateway(cfg)
         events = [
             {"ts": row["ts"], "kind": row["kind"], "detail": row["detail"]}
@@ -450,6 +450,28 @@ class Panel:
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
         return masked
+
+    def _devices(self, info: dict) -> list[dict]:
+        """Устройства сети: аренды dnsmasq плюс пущенные мимо VPN в панели, которых
+        сейчас нет в сети (аренда истекла). managed — переключатель работает;
+        иначе устройство задано в config.toml, и панель его не меняет."""
+        if not info["lan_if"]:
+            return []
+        bypass = set(info["bypass"])
+        mine = set(self.cfg.managed.devices)
+        devices = [
+            {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine}
+            for device in dnsmasq.read_leases(self.paths)
+        ]
+        online = {device["mac"] for device in devices}
+        leases, _warnings = lan.parse_leases(self.cfg)
+        for lease in leases:
+            if lease.mac in mine and lease.mac not in online:
+                devices.append({
+                    "mac": lease.mac, "ip": lease.ip, "name": lease.name, "expires": 0,
+                    "bypass": lease.ip in bypass, "managed": True, "offline": True,
+                })
+        return devices
 
     # --- действия -----------------------------------------------------------------
 
@@ -506,6 +528,93 @@ class Panel:
         self._wake()
         return actions.Outcome(0, text, notes)
 
+    def _set_device(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Пустить устройство мимо VPN (bypass: true) или вернуть в VPN (false).
+
+        Шлюз узнаёт устройство по адресу, поэтому его адрес закрепляется статической
+        арендой DHCP. Сеть меняется кодом `xgw apply` — правила проверяются до
+        загрузки; если сеть изменение не приняла, прежний список возвращается."""
+        mac, bypass = managed.normalize_mac(body.get("mac")), body.get("bypass")
+        if mac is None or not isinstance(bypass, bool):
+            return actions.Outcome(2, "ожидается устройство и bypass: true или false")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        cfg = self.cfg
+        gateway = lan.gateway(cfg)
+        if not lan.lan_interface(cfg) or gateway is None:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        mine = mac in cfg.managed.devices
+        listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
+        if not bypass:
+            if not mine:
+                if mac in listed:
+                    return actions.Outcome(
+                        2, "Это устройство мимо VPN по config.toml: уберите его из "
+                           "network.bypass_hosts там",
+                    )
+                return actions.Outcome(0, "Ничего не изменилось")
+            leases = {lease.mac: lease for lease in lan.parse_leases(cfg)[0]}
+            label = (leases[mac].name if mac in leases else "") or mac
+            return self._apply_devices(
+                store_path,
+                lambda: managed.set_device(store_path, mac, "", "", bypass=False),
+                f"Устройство «{label}» снова идёт через VPN", (),
+            )
+        if mine:
+            return actions.Outcome(0, "Ничего не изменилось")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        if found is None:
+            return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
+        if mac in listed or found["ip"] in lan.bypass_addresses(cfg)[0]:
+            return actions.Outcome(0, "Это устройство уже мимо VPN: так задано в config.toml")
+        try:
+            address = ipaddress.IPv4Address(found["ip"])
+        except ValueError:
+            return actions.Outcome(2, "у устройства нет адреса IPv4")
+        if address not in gateway.network or address == gateway.ip:
+            return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        name = found["name"] if lan.valid_hostname(found["name"]) else ""
+        return self._apply_devices(
+            store_path,
+            lambda: managed.set_device(store_path, mac, found["ip"], name, bypass=True),
+            f"Устройство «{found['name'] or mac}» идёт мимо VPN",
+            ("Его трафик не защищён VPN: если Xray остановится, оно по-прежнему выходит в "
+             "интернет напрямую",),
+        )
+
+    def _apply_devices(
+        self, store_path: Path, change: Callable[[], bool], done: str, notes: tuple[str, ...]
+    ) -> actions.Outcome:
+        previous = managed.load(store_path)[0]["devices"]
+        if not change():
+            return actions.Outcome(0, "Ничего не изменилось")
+        problems: list[str] = []
+        try:
+            new_cfg, _warnings = config.load(self.config_path)
+        except config.ConfigError as exc:
+            new_cfg, problems = None, [str(exc)]
+        if new_cfg is not None:
+            _done, problems = actions.apply_network(
+                new_cfg, self.paths, self.capture_factory(new_cfg, self.paths, logger=self.log),
+                logger=self.log, runner=self.runner,
+            )
+        if problems:
+            managed.replace_devices(store_path, previous)
+            with contextlib.suppress(config.ConfigError):
+                old_cfg, _warnings = config.load(self.config_path)
+                actions.apply_network(
+                    old_cfg, self.paths,
+                    self.capture_factory(old_cfg, self.paths, logger=self.log),
+                    logger=self.log, runner=self.runner,
+                )
+            return actions.Outcome(
+                1, "Сеть не приняла изменение, прежние настройки возвращены: " + "; ".join(problems)
+            )
+        self._event(done)
+        self._wake()
+        return actions.Outcome(0, done, notes)
+
     def _config_names(self) -> set[str]:
         """Имена подписок, вписанных в config.toml: панель их не трогает."""
         mine = set(self.cfg.managed.subscriptions)
@@ -555,6 +664,8 @@ class Panel:
             return self._add(body, store_path)
         if name == "servers":
             return self._set_servers(body, store_path)
+        if name == "device":
+            return self._set_device(body, store_path)
         if name == "subscription/remove":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:

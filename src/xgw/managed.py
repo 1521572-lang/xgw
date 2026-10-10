@@ -1,14 +1,15 @@
-"""Подписки и ссылки, добавленные из панели: /etc/xgw/panel.json.
+"""Подписки, ссылки и устройства, добавленные из панели: /etc/xgw/panel.json.
 
 config.toml пишет человек — с комментариями и в своём порядке; программа его не
 переписывает. То, что добавлено кнопкой в панели, лежит отдельным файлом рядом
 (права 0600: в адресах подписок токены) и при чтении конфига дополняет его:
-подписки и ссылки из обоих файлов складываются.
+подписки, ссылки и устройства из обоих файлов складываются.
 """
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 from pathlib import Path
@@ -21,11 +22,14 @@ FILE_NAME = "panel.json"
 MAX_SUBSCRIPTIONS = 16
 MAX_LINKS = 200
 MAX_SERVERS = 2000  # сколько отключённых и убранных серверов помнить
+MAX_DEVICES = 256
 MAX_URL = 2048
 MAX_NAME = 40
 DEFAULT_REFRESH = 60
 SERVER_MODES = ("enabled", "disabled", "removed")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
+_MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 
 
 class ManagedError(Exception):
@@ -40,9 +44,11 @@ def load(path: Path) -> tuple[dict, str]:
     """Содержимое panel.json и текст ошибки (пустой, если файла нет или он цел).
 
     Возвращается только проверенное: подписки с именем и адресом, ссылки — строки,
-    отключённые и убранные серверы — отпечатки.
+    отключённые и убранные серверы — отпечатки, устройства мимо VPN — MAC и IPv4.
     """
-    empty: dict = {"subscriptions": [], "links": [], "disabled": [], "removed": []}
+    empty: dict = {
+        "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
+    }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -72,6 +78,7 @@ def load(path: Path) -> tuple[dict, str]:
     disabled = [item for item in _fingerprints(raw.get("disabled")) if item not in removed]
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
+        "devices": _devices(raw.get("devices")),
     }, ""
 
 
@@ -81,6 +88,75 @@ def _fingerprints(value: object) -> list[str]:
         if isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) and item not in result:
             result.append(item)
     return result
+
+
+def normalize_mac(text: object) -> str | None:
+    if not isinstance(text, str):
+        return None
+    mac = text.strip().lower().replace("-", ":")
+    return mac if _MAC_RE.fullmatch(mac) else None
+
+
+def _devices(value: object) -> list[dict]:
+    """Устройства, которые ходят мимо VPN: {"mac", "ip", "name"}; повторы отбрасываются."""
+    result: list[dict] = []
+    seen_mac: set[str] = set()
+    seen_ip: set[str] = set()
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        mac, address, name = normalize_mac(item.get("mac")), item.get("ip"), item.get("name")
+        try:
+            ip = str(ipaddress.IPv4Address(address)) if isinstance(address, str) else ""
+        except ValueError:
+            ip = ""
+        if mac is None or not ip or mac in seen_mac or ip in seen_ip:
+            continue
+        seen_mac.add(mac)
+        seen_ip.add(ip)
+        result.append({
+            "mac": mac, "ip": ip,
+            "name": name if isinstance(name, str) and _NAME_RE.fullmatch(name) else "",
+        })
+    return result[:MAX_DEVICES]
+
+
+def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -> bool:
+    """Ставит устройство «мимо VPN» (bypass) либо возвращает его в VPN; True — что-то
+    изменилось. Адрес запоминается: шлюз узнаёт устройство по адресу, поэтому запись
+    превращается в статическую аренду DHCP — иначе адрес достался бы другому."""
+    mac_ok = normalize_mac(mac)
+    if mac_ok is None:
+        raise ManagedError("неверный MAC устройства")
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    devices = [item for item in data["devices"] if item["mac"] != mac_ok]
+    if bypass:
+        try:
+            address = str(ipaddress.IPv4Address(ip))
+        except ValueError as exc:
+            raise ManagedError("неверный адрес устройства") from exc
+        if any(item["ip"] == address for item in devices):
+            raise ManagedError("этот адрес уже закреплён за другим устройством")
+        if len(devices) >= MAX_DEVICES:
+            raise ManagedError(f"устройств мимо VPN уже {MAX_DEVICES} — больше нельзя")
+        clean = name if _NAME_RE.fullmatch(name) else ""
+        devices.append({"mac": mac_ok, "ip": address, "name": clean})
+    if devices == data["devices"]:
+        return False
+    data["devices"] = devices
+    save(path, data)
+    return True
+
+
+def replace_devices(path: Path, devices: list[dict]) -> None:
+    """Возвращает прежний список устройств — откат, если сеть изменение не приняла."""
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    data["devices"] = _devices(devices)
+    save(path, data)
 
 
 def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:

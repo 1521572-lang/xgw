@@ -10,7 +10,9 @@ HEAD на любой путь отдаёт только заголовки с н
 ведёт себя HEAD-проверка, которая «замороженный» сервер считает живым.
 
 DNS (UDP): на любой A-запрос отвечает одним адресом — и для доменов серверов
-(*.stand.test), и, на этапе 3, для `dig @8.8.8.8` из LAN.
+(*.stand.test), и, на этапе 3, для `dig @8.8.8.8` из LAN. Исключение — имена,
+начинающиеся с «loopback.»: на них ответ 127.0.0.1, как у домена, владелец
+которого целится в службы самого шлюза.
 
 Запуск: python origin.py --host 127.0.0.1 --port 8080 --dns-port 5353 --answer 127.0.0.1
 """
@@ -30,6 +32,7 @@ PROBE_BYTES = 65536
 CHUNK = b"x" * 4096
 # Квота, которую отдаёт «панель провайдера»: израсходовано 3 из 100 ГБ.
 USERINFO = "upload=1000000000; download=2000000000; total=100000000000; expire=1893456000"
+LOOPBACK_LABEL = b"loopback"
 
 
 class OriginHandler(BaseHTTPRequestHandler):
@@ -111,6 +114,10 @@ def dns_answer(query: bytes, address: str) -> bytes | None:
     question_end = offset + 5
     if question_end > len(query):
         return None
+    if query[12:13] == bytes([len(LOOPBACK_LABEL)]) and (
+        query[13 : 13 + len(LOOPBACK_LABEL)].lower() == LOOPBACK_LABEL
+    ):
+        address = "127.0.0.1"
     qtype = struct.unpack(">H", query[offset + 1 : offset + 3])[0]
     question = query[12:question_end]
     answers = 1 if qtype == 1 else 0
