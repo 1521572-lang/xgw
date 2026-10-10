@@ -192,9 +192,7 @@
         "network": "ws",
         "wsSettings": {
           "path": "/ws",
-          "headers": {
-            "Host": "de.example.com"
-          }
+          "host": "de.example.com"
         },
         "security": "tls",
         "tlsSettings": {
@@ -233,9 +231,7 @@
         "network": "ws",
         "wsSettings": {
           "path": "/vmess",
-          "headers": {
-            "Host": "fr.example.com"
-          }
+          "host": "fr.example.com"
         },
         "security": "tls",
         "tlsSettings": {

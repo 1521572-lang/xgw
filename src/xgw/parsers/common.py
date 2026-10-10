@@ -133,7 +133,9 @@ def build_stream(
         ws: dict = {"path": single(query, "path", "/") or "/"}
         host = single(query, "host")
         if host:
-            ws["headers"] = {"Host": host}
+            # Отдельное поле host: запись headers.Host Xray объявил устаревшей
+            # («will be removed soon»), а версия по умолчанию — latest.
+            ws["host"] = host
         stream["wsSettings"] = ws
     elif net == "grpc":
         grpc: dict = {"serviceName": single(query, "serviceName")}

@@ -35,7 +35,7 @@ def test_vless_ws_tls():
     assert stream["network"] == "ws"
     assert stream["security"] == "tls"
     assert stream["tlsSettings"]["alpn"] == ["h2", "http/1.1"]
-    assert stream["wsSettings"] == {"path": "/ws", "headers": {"Host": "de.example.com"}}
+    assert stream["wsSettings"] == {"path": "/ws", "host": "de.example.com"}
     assert raw_to_node(raw, "test").country == "de"
 
 

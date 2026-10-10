@@ -91,5 +91,7 @@ def find_invalid_outbounds(outbounds: list[dict], xray_bin: Path) -> dict[str, s
         ok, output = _run_test({"log": {"loglevel": "warning"}, "outbounds": [outbound]}, xray_bin)
         if not ok:
             lines = [line for line in output.splitlines() if line.strip()]
-            invalid[str(outbound.get("tag", ""))] = lines[-1] if lines else "ошибка проверки"
+            # Xray пишет цепочку «… > infra/conf: … > причина»: нужна только причина.
+            reason = lines[-1].rsplit(" > ", 1)[-1] if lines else "ошибка проверки"
+            invalid[str(outbound.get("tag", ""))] = reason
     return invalid

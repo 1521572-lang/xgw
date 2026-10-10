@@ -16,5 +16,6 @@ def golden(name: str, payload) -> object:
     path = GOLDEN_DIR / name
     if REGEN:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        path.write_text(text, encoding="utf-8", newline="\n")  # LF и на Windows
     return json.loads(path.read_text(encoding="utf-8"))
