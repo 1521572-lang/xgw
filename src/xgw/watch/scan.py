@@ -1,0 +1,90 @@
+"""Скан запасных серверов: probe.url через probe-inbound каждого spare-*.
+
+Классы (раздел 6.8): OK, SLOW, FROZEN (часть тела, затем тишина — фиксируем
+число байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from ..config import Config
+from ..generator.builder import NodeInfo
+from .checks import DownloadResult, http_get_via_proxy
+
+SLOW_SECONDS = 3.0  # эмпирический порог «медленно, но живо»
+
+
+@dataclass
+class ScanResult:
+    tag: str
+    verdict: str          # OK | SLOW | FROZEN | STALL_BEFORE_BODY | CONNECT_FAIL | TIMEOUT
+    bytes_read: int
+    seconds: float
+    error: str = ""
+
+
+def classify(result: DownloadResult, seconds: float, slow: float = SLOW_SECONDS) -> str:
+    if result.ok:
+        return "SLOW" if seconds > slow else "OK"
+    if result.frozen:
+        return "FROZEN"
+    if result.stalled:  # тишина до начала тела
+        return "STALL_BEFORE_BODY"
+    if "connect" in result.error.lower() or "отклонён" in result.error:
+        return "CONNECT_FAIL"
+    if "таймаут" in result.error.lower() or "timed out" in result.error.lower():
+        return "TIMEOUT"
+    return "CONNECT_FAIL"
+
+
+def scan_node(
+    node: NodeInfo,
+    cfg: Config,
+    *,
+    probe_user: str,
+    probe_pass: str,
+    url: str | None = None,
+    silence: float = 5.0,
+) -> ScanResult:
+    """Проба одного spare через его probe-inbound (127.0.0.1:<probe_port>)."""
+    started = time.monotonic()
+    result = http_get_via_proxy(
+        "127.0.0.1",
+        node.probe_port,
+        url or cfg.probe.url,
+        timeout=max(silence + 5.0, 15.0),
+        silence=silence,
+        proxy_user=probe_user,
+        proxy_pass=probe_pass,
+    )
+    seconds = time.monotonic() - started
+    return ScanResult(
+        tag=node.tag,
+        verdict=classify(result, seconds),
+        bytes_read=result.downloaded,
+        seconds=round(seconds, 2),
+        error=result.error,
+    )
+
+
+def scan_spares(
+    spares: list[NodeInfo],
+    cfg: Config,
+    *,
+    probe_user: str,
+    probe_pass: str,
+) -> list[ScanResult]:
+    """Скан запасных с интервалом, сдвинутым на ±20 % (против фингерпринтинга)."""
+    import random
+
+    results: list[ScanResult] = []
+    for node in spares:
+        results.append(
+            scan_node(node, cfg, probe_user=probe_user, probe_pass=probe_pass)
+        )
+        if node is not spares[-1]:
+            pause = 0.2 * random.random()
+            time.sleep(pause)
+    return results

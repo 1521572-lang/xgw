@@ -45,7 +45,7 @@ adrules` — Xray не умеет перечитывать конфиг), сле
 | Этап | Содержание | Статус |
 |---|---|---|
 | 1 | Конфиг, подписки, парсеры ссылок, генератор, загрузка Xray, `xgw generate`, `xray run -test` | ✅ готов |
-| 2 | API Xray, сравнение конфигов, применение без разрыва, watchdog, скан запасных, замена участников | в работе |
+| 2 | API (ado/rmo/adi/rmi/adrules/bi), diff, применение без разрыва, метрики, watchdog-состояния, скан запасных, замена участников | ✅ код и тесты (включая живые API-тесты); стендовые проверки — на Linux-машине |
 | 3 | nftables/TPROXY, dnsmasq, перехват DNS, fail-closed, enable/disable, стенд | план |
 | 4 | install/uninstall, systemd, NetworkManager, сон, ufw, diag, уведомления, страница статуса | план |
 | 5 | IPv6, TUN-inbound, Telegram-бот, правила per-device | опционально |
