@@ -87,6 +87,10 @@ class Paths:
         return self.run / "apply.lock"
 
     @property
+    def status_file(self) -> Path:
+        return self.run / "status.json"
+
+    @property
     def api_dirty_file(self) -> Path:
         """Метка «ядро изменено через API лишь частично» — живёт до перезапуска Xray
         (каталог /run очищается при перезагрузке вместе с состоянием ядра)."""

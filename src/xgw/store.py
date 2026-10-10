@@ -30,6 +30,14 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS scans (
+    probe_tag TEXT PRIMARY KEY,
+    verdict TEXT,
+    bytes INTEGER,
+    seconds REAL,
+    error TEXT,
+    ts REAL
+);
 """
 
 
@@ -94,6 +102,43 @@ class Store:
             "SELECT ts, kind, detail FROM events ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def last_event_time(self, kind: str) -> float | None:
+        row = self.conn.execute(
+            "SELECT ts FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)
+        ).fetchone()
+        return float(row["ts"]) if row else None
+
+    def save_scan(
+        self,
+        probe_tag: str,
+        verdict: str,
+        bytes_read: int,
+        seconds: float,
+        error: str = "",
+        ts: float | None = None,
+    ) -> None:
+        """Результат скана. Ключ — probe-тег: он не меняется, когда узел переходит
+        из запасных в участники и обратно."""
+        self.conn.execute(
+            "INSERT INTO scans (probe_tag, verdict, bytes, seconds, error, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(probe_tag) DO UPDATE SET "
+            "verdict=excluded.verdict, bytes=excluded.bytes, seconds=excluded.seconds, "
+            "error=excluded.error, ts=excluded.ts",
+            (probe_tag, verdict, bytes_read, seconds, error, time.time() if ts is None else ts),
+        )
+        self.conn.commit()
+
+    def scans(self) -> dict[str, dict]:
+        rows = self.conn.execute("SELECT * FROM scans").fetchall()
+        return {row["probe_tag"]: dict(row) for row in rows}
+
+    def prune_scans(self, keep: set[str]) -> None:
+        """Убирает сканы узлов, которых больше нет в конфиге."""
+        stale = [(tag,) for tag in self.scans() if tag not in keep]
+        if stale:
+            self.conn.executemany("DELETE FROM scans WHERE probe_tag = ?", stale)
+            self.conn.commit()
 
     def dump_state(self) -> str:
         return json.dumps(

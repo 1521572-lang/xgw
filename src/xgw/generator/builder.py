@@ -257,6 +257,52 @@ def _allocate_ports(
     return ports
 
 
+def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
+    """Участники и запасные так, как они заведены в работающем ядре: теги, роли
+    и порты проб из применённого конфига. Нужны демону и CLI — следить за
+    ядром можно и тогда, когда подписку получить не удалось.
+
+    fingerprint — полный отпечаток, если узел однозначно нашёлся среди nodes,
+    иначе только hex-часть тега (для замены участников такого узла недостаточно).
+    """
+    _password, ports = probe_state(config)
+    result: list[NodeInfo] = []
+    if not isinstance(config, Mapping):
+        return result
+    for outbound in config.get("outbounds") or []:
+        if not isinstance(outbound, Mapping):
+            continue
+        match = _TAG_RE.match(str(outbound.get("tag") or ""))
+        if not match or match.group(1) not in ("proxy", "spare"):
+            continue
+        role, country, prefix = match.groups()
+        probe_tag = f"probe-{country}-{prefix}"
+        found = {
+            node.fingerprint
+            for node in nodes
+            if not node.keep_tag and node.country == country and node.fingerprint.startswith(prefix)
+        }
+        result.append(
+            NodeInfo(
+                fingerprint=found.pop() if len(found) == 1 else prefix,
+                tag=f"{role}-{country}-{prefix}",
+                probe_tag=probe_tag,
+                probe_port=ports.get(probe_tag, 0),
+                role=role,
+            )
+        )
+    return result
+
+
+def _dns_server(entry: str) -> tuple[str, int | None]:
+    """«1.1.1.1» или «1.1.1.1:5353» → (адрес, порт). Порт не 53 Xray принимает
+    только объектом {"address", "port"}."""
+    address, sep, port = entry.rpartition(":")
+    if sep and port.isdigit() and address.count(".") == 3:
+        return address, int(port)
+    return entry, None
+
+
 def _apply_sockopt(outbound: dict, mark: int) -> None:
     stream = outbound.setdefault("streamSettings", {})
     sockopt = dict(stream.get("sockopt") or {})
@@ -336,37 +382,57 @@ def build(
         }
         for info in nodes
     ]
-    inbounds: list[dict] = [
-        {
-            "tag": "tproxy-in",
-            "protocol": "tunnel",
-            "listen": "127.0.0.1",
-            "port": cfg.capture.tproxy_port,
-            "settings": {"allowedNetwork": "tcp,udp", "followRedirect": True},
-            "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
-        },
-        {
-            "tag": "socks-in",
-            "protocol": "socks",
-            "listen": "127.0.0.1",
-            "port": cfg.xray.socks_port,
-            "settings": {"udp": True},
-        },
-        {"tag": "http-in", "protocol": "http", "listen": "127.0.0.1", "port": cfg.xray.http_port},
-        *probe_inbounds,
-    ]
+    # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
+    # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
+    capture = cfg.capture.lan or cfg.capture.local
+    inbounds: list[dict] = []
+    if capture:
+        inbounds.append(
+            {
+                "tag": "tproxy-in",
+                "protocol": "tunnel",
+                "listen": "127.0.0.1",
+                "port": cfg.capture.tproxy_port,
+                "settings": {"allowedNetwork": "tcp,udp", "followRedirect": True},
+                "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+            }
+        )
+    inbounds.extend(
+        [
+            {
+                "tag": "socks-in",
+                "protocol": "socks",
+                "listen": "127.0.0.1",
+                "port": cfg.xray.socks_port,
+                "settings": {"udp": True},
+            },
+            {
+                "tag": "http-in",
+                "protocol": "http",
+                "listen": "127.0.0.1",
+                "port": cfg.xray.http_port,
+            },
+            *probe_inbounds,
+        ]
+    )
 
+    direct_dns = [_dns_server(server) for server in cfg.dns.direct_servers]
     rules: list[dict] = [
         {"type": "field", "inboundTag": [info.probe_tag], "outboundTag": info.tag}
         for info in nodes
     ]
-    rules.append(
-        {"type": "field", "inboundTag": ["tproxy-in"], "port": "53", "outboundTag": "dns-out"}
-    )
-    if cfg.dns.direct_servers:
+    if capture:
         rules.append(
-            {"type": "field", "ip": list(cfg.dns.direct_servers), "outboundTag": "direct"}
+            {"type": "field", "inboundTag": ["tproxy-in"], "port": "53", "outboundTag": "dns-out"}
+        )
+    if direct_dns:
+        rules.append(
+            {
+                "type": "field",
+                "ip": [address for address, _port in direct_dns],
+                "outboundTag": "direct",
+            }
         )
     rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
     if cfg.routing.direct_domains:
@@ -391,16 +457,18 @@ def build(
 
     fallback_tag = nodes[0].tag
     dns_servers: list[object] = []
-    if cfg.dns.direct_servers and cfg.routing.direct_domains:
-        for server in cfg.dns.direct_servers:
-            dns_servers.append(
-                {
-                    "address": server,
-                    "domains": list(cfg.routing.direct_domains),
-                    "skipFallback": True,
-                }
-            )
-    dns_servers.extend(cfg.dns.proxy_servers)
+    if cfg.routing.direct_domains:
+        for address, port in direct_dns:
+            entry: dict = {
+                "address": address,
+                "domains": list(cfg.routing.direct_domains),
+                "skipFallback": True,
+            }
+            if port is not None:
+                entry["port"] = port
+            dns_servers.append(entry)
+    for address, port in map(_dns_server, cfg.dns.proxy_servers):
+        dns_servers.append(address if port is None else {"address": address, "port": port})
 
     config = {
         "log": {"loglevel": "warning"},

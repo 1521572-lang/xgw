@@ -320,3 +320,16 @@ def test_resolve_domain_sorted_and_falls_through(monkeypatch):
     assert calls == ["https://1.1.1.1/dns-query", "77.88.8.8"]
     with pytest.raises(ResolveError):
         fetch.resolve_domain("nl.example.com", ["https://1.1.1.1/dns-query"])
+
+
+def test_bootstrap_udp_with_port(monkeypatch):
+    asked: list[tuple[str, int]] = []
+
+    def fake_plain(server, name, *, mark=None, timeout=5.0, port=53):
+        asked.append((server, port))
+        return ["203.0.113.5"]
+
+    monkeypatch.setattr(fetch, "plain_dns", fake_plain)
+    fetch.resolve_domain("nl.example.com", ["udp://203.0.113.53:5353"])
+    fetch.resolve_domain("nl.example.com", ["udp://77.88.8.8"])
+    assert asked == [("203.0.113.53", 5353), ("77.88.8.8", 53)]

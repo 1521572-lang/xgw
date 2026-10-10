@@ -21,7 +21,8 @@ def root(tmp_path, monkeypatch):
 
 def _write_config(root, body: str):
     path = root / "config.toml"
-    path.write_text(body + '\n[filters]\nexclude_regex = ""\nmax_members = 2\n', encoding="utf-8")
+    tail = '\n[filters]\nexclude_regex = ""\nmax_members = 2\n[dns]\nbootstrap = []\n'
+    path.write_text(body + tail, encoding="utf-8")
     return path
 
 
@@ -161,7 +162,8 @@ def test_invalid_config_without_culprit_fails(root, monkeypatch):
 def test_bad_regex_in_config_does_not_crash(root):
     config = root / "config.toml"
     config.write_text(
-        _manual(links.FULL_LINKS) + '[filters]\ninclude_regex = "(["\nexclude_regex = ""\n',
+        _manual(links.FULL_LINKS)
+        + '[filters]\ninclude_regex = "(["\nexclude_regex = ""\n[dns]\nbootstrap = []\n',
         encoding="utf-8",
     )
     assert _generate(config, "--out", str(root / "c.json")) == 0

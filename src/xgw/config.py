@@ -240,7 +240,8 @@ def _type_ok(value: object, default: object) -> bool:
     return True
 
 
-def _seconds(value: str) -> int | None:
+def parse_seconds(value: str) -> int | None:
+    """«30s», «10m», «1h» → секунды; None — не разобрать."""
     match = re.fullmatch(r"(\d+)([smh])", value)
     if not match:
         return None
@@ -263,7 +264,7 @@ def _validate(cfg: Config) -> list[str]:
     if cfg.probe.sampling < 1:
         warnings.append("probe.sampling должен быть не меньше 1 — используется 2")
         cfg.probe.sampling = Probe().sampling
-    interval = _seconds(cfg.probe.interval)
+    interval = parse_seconds(cfg.probe.interval)
     if interval is not None and interval < 10:
         warnings.append("probe.interval меньше 10s — Xray не принимает интервал короче")
     if not re.fullmatch(

@@ -98,6 +98,18 @@ class Applier:
         with file_lock(self.paths.lock_file):
             return self._apply_locked(new_config, restart_now=urgent or force_now)
 
+    def rollback(self, reason: str) -> ApplyOutcome:
+        """Откат на last-good по решению watchdog: Xray не поднимается с текущим
+        конфигом. Если last-good нет или он совпадает с текущим — откатывать нечего."""
+        with file_lock(self.paths.lock_file):
+            try:
+                good = json.loads(self.paths.last_good_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return ApplyOutcome("unchanged", detail="last-good отсутствует")
+            if good == self._read_current():
+                return ApplyOutcome("unchanged", detail="last-good совпадает с текущим конфигом")
+            return self._rollback(reason=reason)
+
     # --- внутреннее ------------------------------------------------------------
 
     def _apply_locked(self, new_config: dict, *, restart_now: bool) -> ApplyOutcome:

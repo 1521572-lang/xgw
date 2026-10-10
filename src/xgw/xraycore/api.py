@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -22,6 +23,45 @@ from .. import masking
 
 class ApiError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class BalancerInfo:
+    override: str | None  # закреплённый вручную узел (bo), если есть
+    selects: tuple[str, ...]  # узлы, которые сейчас выбирает стратегия
+
+
+_ROW_RE = re.compile(r"^\s*\d+\s+(\S+)\s*$")
+
+
+def parse_balancer_info(text: str) -> BalancerInfo:
+    """Разбор вывода `xray api bi` (проверено на 26.3.27):
+
+        - Selecting Override:
+            1   proxy-nl-1243
+          - Selects:
+            1   proxy-de-1f80
+
+    Строка с номером без тега означает «никого»: живых узлов стратегия не видит.
+    """
+    override: str | None = None
+    selects: list[str] = []
+    section = ""
+    for line in text.splitlines():
+        lowered = line.lower()
+        if "override" in lowered:
+            section = "override"
+        elif "selects" in lowered:
+            section = "selects"
+        else:
+            match = _ROW_RE.match(line)
+            if not match:
+                continue
+            if section == "override":
+                override = match.group(1)
+            elif section == "selects":
+                selects.append(match.group(1))
+    return BalancerInfo(override=override, selects=tuple(selects))
 
 
 @dataclass(frozen=True)
@@ -95,6 +135,9 @@ class ApiClient:
     def balancer_info(self, *balancers: str) -> str:
         """Состояние балансировщика(ов): health, strategy, selecting."""
         return self._run("bi", *balancers)
+
+    def balancer_state(self, balancer: str) -> BalancerInfo:
+        return parse_balancer_info(self.balancer_info(balancer))
 
     def list_outbounds(self) -> str:
         return self._run("lso")

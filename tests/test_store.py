@@ -65,3 +65,19 @@ def test_subscription_cache_is_private(tmp_path):
     cache.save("main", b"secret links")
     for path in (tmp_path / "cache").iterdir():
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_scans_are_keyed_by_probe_tag(tmp_path):
+    store = Store(tmp_path / "state.db")
+    store.save_scan("probe-nl-aaaa", "OK", 65536, 0.4)
+    store.save_scan("probe-de-bbbb", "FROZEN", 16384, 5.1, "тишина", ts=1000.0)
+    store.save_scan("probe-nl-aaaa", "SLOW", 65536, 4.2)  # новый результат заменяет прежний
+    scans = store.scans()
+    assert scans["probe-nl-aaaa"]["verdict"] == "SLOW" and scans["probe-nl-aaaa"]["ts"] > 1000
+    assert scans["probe-de-bbbb"]["ts"] == 1000.0 and scans["probe-de-bbbb"]["error"] == "тишина"
+    store.prune_scans({"probe-nl-aaaa"})  # узел пропал из конфига — скан больше не нужен
+    assert list(store.scans()) == ["probe-nl-aaaa"]
+    store.add_event("rotation", "a → b")
+    assert store.last_event_time("rotation") is not None
+    assert store.last_event_time("нет такого") is None
+    store.close()

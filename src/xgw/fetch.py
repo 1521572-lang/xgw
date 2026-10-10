@@ -422,7 +422,11 @@ def resolve_domain(name: str, bootstrap: list[str], *, mark: int | None = None) 
             if entry.startswith("https://"):
                 ips = doh_query(entry, name, mark=mark)
             elif entry.startswith("udp://"):
-                ips = plain_dns(entry[len("udp://") :], name, mark=mark)
+                server, sep, port = entry[len("udp://") :].rpartition(":")
+                if sep and port.isdigit():
+                    ips = plain_dns(server, name, mark=mark, port=int(port))
+                else:
+                    ips = plain_dns(entry[len("udp://") :], name, mark=mark)
             else:
                 errors.append(f"неизвестный bootstrap: {entry}")
                 continue

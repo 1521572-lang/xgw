@@ -27,7 +27,9 @@ ipv6 = "off"
 disable_sleep = true
 
 [capture]
-# Перехватывать трафик Wi-Fi-сети.
+# Перехватывать трафик Wi-Fi-сети. Если и lan, и local выключены, XGW только
+# управляет Xray (подписки, балансировщик, socks/http на 127.0.0.1) и
+# TPROXY-inbound в конфиг не добавляет.
 lan = true
 # Трафик самой Ubuntu тоже через Xray.
 local = true
@@ -90,11 +92,12 @@ conn_idle_s = 120
 home_country = "RU"
 
 [dns]
-# Через балансировщик Xray.
+# Через балансировщик Xray. Нестандартный порт — "адрес:порт".
 proxy_servers = ["1.1.1.1", "8.8.8.8"]
 # Для direct_domains, ходят напрямую.
 direct_servers = ["77.88.8.8"]
-# Разрешение доменов VPN-серверов самим XGW: DoH по IP, затем обычный DNS.
+# Разрешение доменов VPN-серверов самим XGW: DoH по IP, затем обычный DNS
+# (udp://адрес или udp://адрес:порт).
 bootstrap = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "udp://77.88.8.8"]
 
 [xray]

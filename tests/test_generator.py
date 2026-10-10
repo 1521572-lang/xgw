@@ -8,6 +8,7 @@ from conftest import golden
 from xgw.config import Config
 from xgw.generator.builder import (
     BuildResult,
+    applied_nodes,
     assign_suffixes,
     build,
     member_fingerprints,
@@ -248,3 +249,46 @@ def test_max_members_moves_rest_to_spares():
     roles = [info.role for info in result.nodes]
     assert roles == ["proxy", "spare", "spare", "spare"]
     assert isinstance(result, BuildResult)
+
+
+def test_no_tproxy_inbound_when_capture_is_off():
+    """Перехват выключен целиком — TPROXY-inbound и правило DNS не нужны (и без
+    root не открылись бы)."""
+    cfg = Config()
+    cfg.capture.lan = cfg.capture.local = False
+    result = build(cfg, select_nodes([_node("11112222", "A")], cfg), hosts={})
+    assert [i["tag"] for i in result.config["inbounds"]][:2] == ["socks-in", "http-in"]
+    assert not any(rule.get("port") == "53" for rule in result.config["routing"]["rules"])
+    cfg.capture.local = True  # перехват только своей машины — inbound нужен
+    result = build(cfg, select_nodes([_node("11112222", "A")], cfg), hosts={})
+    assert result.config["inbounds"][0]["tag"] == "tproxy-in"
+
+
+def test_dns_servers_with_custom_port():
+    """Порт не 53 Xray принимает только объектом {"address", "port"}."""
+    cfg = Config()
+    cfg.dns.proxy_servers = ["1.1.1.1", "203.0.113.53:5353"]
+    cfg.dns.direct_servers = ["203.0.113.54:5354"]
+    config = build(cfg, select_nodes([_node("11112222", "A")], cfg), hosts={}).config
+    assert config["dns"]["servers"] == [
+        {"address": "203.0.113.54", "port": 5354, "skipFallback": True,
+         "domains": cfg.routing.direct_domains},
+        "1.1.1.1",
+        {"address": "203.0.113.53", "port": 5353},
+    ]
+    direct_rule = next(r for r in config["routing"]["rules"] if r.get("ip") == ["203.0.113.54"])
+    assert direct_rule["outboundTag"] == "direct"
+
+
+def test_applied_nodes_reads_running_layout():
+    """Теги, роли и порты проб — из применённого конфига; отпечаток — если узел опознан."""
+    result, _cfg, selection = _build()
+    nodes = [*selection.members, *selection.spares]
+    view = applied_nodes(result.config, nodes)
+    assert [(i.tag, i.role, i.probe_tag, i.probe_port, i.fingerprint) for i in view] == [
+        (i.tag, i.role, i.probe_tag, i.probe_port, i.fingerprint) for i in result.nodes
+    ]
+    blind = applied_nodes(result.config)  # подписка недоступна — следить за ядром всё равно можно
+    assert [i.tag for i in blind] == [i.tag for i in result.nodes]
+    assert all(len(i.fingerprint) == 4 for i in blind)
+    assert applied_nodes(None) == [] and applied_nodes({"outbounds": [{"tag": "direct"}]}) == []

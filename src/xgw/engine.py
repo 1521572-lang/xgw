@@ -1,0 +1,366 @@
+"""Общий конвейер XGW: подписки → узлы → конфиг Xray → применение.
+
+Им пользуются и команды CLI (`generate`, `apply`), и демон: получить серверы
+(через Xray или напрямую, с кэшем), собрать конфиг с сохранением состава
+участников, проверить его установленным Xray и отдать Applier.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import socket
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import config, fetch, log, marknet, masking
+from .apply.applier import Applier, ApplyOutcome
+from .generator import builder, validate
+from .model import ServerNode, raw_to_node
+from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
+from .paths import Paths
+from .store import Store, SubscriptionCache
+from .xraycore.api import ApiClient
+from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
+
+
+class EngineError(Exception):
+    """Конфиг собрать не удалось: нет серверов или Xray его не принимает."""
+
+
+@dataclass
+class Inventory:
+    """Все серверы, известные на момент последнего опроса подписок."""
+
+    nodes: list[ServerNode] = field(default_factory=list)
+    quotas: dict[str, dict[str, int]] = field(default_factory=dict)
+    # False — хотя бы одна подписка не дала серверов даже из кэша: применять такой
+    # список нельзя, из работающего конфига пропали бы её серверы.
+    complete: bool = True
+
+
+@dataclass
+class Assembly:
+    result: builder.BuildResult
+    selection: builder.Selection
+    verdict: bool | None  # итог xray run -test; None — проверка не выполнялась
+
+
+def bypass_mark(cfg: config.Config, logger) -> int | None:
+    """Метка для прямых запросов. Без CAP_NET_ADMIN (запуск не от root) SO_MARK
+    недоступен — работаем без метки и предупреждаем: при включённом перехвате
+    такие запросы пойдут через Xray."""
+    if not marknet.is_mark_supported():
+        return None
+    if marknet.mark_usable(cfg.capture.mark_bypass):
+        return cfg.capture.mark_bypass
+    logger.warning("нет прав на SO_MARK (нужен root) — прямые запросы идут без метки")
+    return None
+
+
+def healthy_http_in(cfg: config.Config) -> tuple[str, int] | None:
+    """http-in работающего Xray: при здоровом ядре подписка запрашивается через него."""
+    address = ("127.0.0.1", cfg.xray.http_port)
+    try:
+        with socket.create_connection(address, timeout=1.0):
+            return address
+    except OSError:
+        return None
+
+
+def config_secrets(cfg: config.Config) -> list[str]:
+    """Секреты из config.toml, которые регулярками не распознать."""
+    values = [cfg.notify.telegram_bot_token, cfg.status.token]
+    for sub in cfg.subscriptions:
+        values.extend(sub.headers.values())
+    return [value for value in values if value]
+
+
+def collect(
+    cfg: config.Config,
+    paths: Paths,
+    *,
+    mark: int | None,
+    logger,
+    via_xray: bool = True,
+) -> Inventory:
+    """Опрос всех подписок и ручных ссылок.
+
+    via_xray=False — запрашивать только напрямую (внеочередное обновление в
+    ALL_DEAD: через мёртвые серверы подписку не получить).
+    """
+    remote = any(sub.url and not sub.url.startswith("file://") for sub in cfg.subscriptions)
+    proxy = healthy_http_in(cfg) if via_xray and remote else None
+    cache = SubscriptionCache(paths.cache_dir)
+    inventory = Inventory()
+    for sub in cfg.subscriptions:
+        if not sub.url:
+            continue
+        raws, userinfo = _load_subscription(sub, cfg, cache, mark, proxy, logger)
+        if not raws:
+            inventory.complete = False
+        if userinfo:
+            inventory.quotas[sub.name] = userinfo
+        inventory.nodes.extend(raw_to_node(raw, sub.name) for raw in raws)
+    if cfg.manual.links:
+        raws, _meta, manual_warnings = parse_links_text("\n".join(cfg.manual.links), "manual")
+        for warning in manual_warnings:
+            logger.warning("%s", warning)
+        inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
+    log.add_secrets(masking.collect_secrets([node.outbound for node in inventory.nodes]))
+    return inventory
+
+
+def _load_subscription(
+    sub: config.Subscription,
+    cfg: config.Config,
+    cache: SubscriptionCache,
+    mark: int | None,
+    proxy: tuple[str, int] | None,
+    logger,
+) -> tuple[list[RawServer], dict[str, int]]:
+    """Серверы подписки и её квота. Ответ без серверов считается сбоем: тогда
+    берётся последняя удачная версия из кэша, а кэш не перезаписывается."""
+    label = f"{sub.name} ({masking.mask_url(sub.url)})"
+    routes: list[tuple[str, tuple[str, int] | None]] = [("напрямую", None)]
+    if proxy is not None and not sub.url.startswith("file://"):
+        routes.insert(0, ("через Xray", proxy))
+    for route, via in routes:
+        try:
+            result = fetch.fetch_subscription(
+                sub.url, user_agent=sub.user_agent, headers=sub.headers, proxy=via,
+                # Напрямую — меткой мимо перехвата и со своим резолвером: системный
+                # DNS при упавшем Xray не отвечает. Через Xray хватит одного повтора:
+                # если серверы мертвы, быстрее перейти к прямому запросу.
+                mark=None if via else mark,
+                bootstrap=None if via or mark is None else cfg.dns.bootstrap,
+                retries=1 if via else 3,
+            )
+            raws, meta, sub_warnings = parse_body(result.body, sub.name)
+            if not raws:
+                raise ParseError("в ответе нет серверов")
+        except (fetch.FetchError, ParseError) as exc:
+            logger.error("подписка %s, запрос %s: %s", label, route, exc)
+            continue
+        for warning in sub_warnings:
+            logger.warning("%s", warning)
+        userinfo = fetch.parse_userinfo(
+            result.headers.get("subscription-userinfo") or meta.get("subscription-userinfo", "")
+        )
+        try:
+            cache.save(sub.name, result.body, userinfo)
+        except OSError as exc:
+            logger.error("подписка %s: кэш не записан: %s", label, exc)
+        return raws, userinfo
+
+    cached = cache.load(sub.name)
+    if cached is None:
+        logger.error("подписка %s: получить не удалось, кэша нет", label)
+        return [], {}
+    try:
+        raws, _meta, _warnings = parse_body(cached.body, sub.name)
+    except ParseError as exc:
+        logger.error("подписка %s: кэш не читается: %s", label, exc)
+        return [], {}
+    age_min = max(0, int((time.time() - cached.saved_at) // 60)) if cached.saved_at else 0
+    logger.warning(
+        "подписка %s: используется кэш (%d серверов, сохранён %d мин назад)",
+        label, len(raws), age_min,
+    )
+    return raws, cached.userinfo
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def assemble(
+    cfg: config.Config,
+    paths: Paths,
+    inventory: Inventory,
+    *,
+    mark: int | None,
+    logger,
+    xray_bin: Path | None,
+    check: bool = True,
+    prefer: list[str] | None = None,
+) -> Assembly:
+    """Конфиг Xray из известных серверов.
+
+    Состав участников, порты и пароль проб берутся из применённого конфига:
+    обновление подписки не должно перетасовывать то, что уже работает в ядре.
+    prefer — явный состав участников (замена «мёртвого» при ротации).
+    Сервер, конфиг которого установленный Xray не принимает, отбрасывается.
+    """
+    applied = read_json(paths.xray_config_file)
+    probe_password, probe_ports = builder.probe_state(applied)
+    if prefer is None:
+        prefer = builder.member_fingerprints(applied, inventory.nodes)
+
+    rejected: set[str] = set()
+    while True:
+        usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
+        selection = builder.select_nodes(usable, cfg, prefer=prefer)
+        if not rejected:
+            for warning in selection.warnings:
+                logger.warning("%s", warning)
+        if not selection.members:
+            raise EngineError("после фильтров не осталось серверов")
+        hosts = _resolve_hosts(selection, cfg, mark, logger)
+        try:
+            result = builder.build(
+                cfg, selection, hosts=hosts,
+                probe_password=probe_password, probe_ports=probe_ports,
+            )
+        except builder.BuildError as exc:
+            raise EngineError(str(exc)) from exc
+        if not check:
+            return Assembly(result, selection, None)
+        verdict, output = validate.validate_config(result.config, xray_bin)
+        if verdict is not False:
+            return Assembly(result, selection, verdict)
+        # Конфиг не прошёл: ищем серверы, которые установленный Xray не принимает
+        # (снятый транспорт, неизвестный шифр), и собираем конфиг без них.
+        newly = _reject_invalid(result, xray_bin, logger) - rejected
+        if not newly:
+            raise EngineError(f"конфиг не прошёл xray run -test:\n{output}")
+        rejected |= newly
+
+
+def _reject_invalid(result: builder.BuildResult, xray_bin: Path | None, logger) -> set[str]:
+    """Отпечатки серверов, чьи outbounds установленный Xray не принимает."""
+    if xray_bin is None:
+        return set()
+    by_tag = {info.tag: info.fingerprint for info in result.nodes}
+    candidates = [o for o in result.config["outbounds"] if o.get("tag") in by_tag]
+    invalid = validate.find_invalid_outbounds(candidates, xray_bin)
+    for tag, reason in invalid.items():
+        logger.warning("узел %s отброшен: Xray не принимает его конфиг (%s)", tag, reason)
+    return {by_tag[tag] for tag in invalid if tag in by_tag}
+
+
+# Домены серверов меняют адреса редко, а резолвить их приходится при каждой
+# сборке: держим ответы в памяти процесса (демона) четверть часа.
+_HOSTS_TTL = 900.0
+_hosts_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def _resolve_hosts(selection: builder.Selection, cfg: config.Config, mark, logger) -> dict:
+    """Домены серверов разрешаются через bootstrap-резолверы и попадают в dns.hosts."""
+    hosts: dict[str, list[str]] = {}
+    failed: set[str] = set()
+    now = time.monotonic()
+    for node in [*selection.members, *selection.spares, *selection.chains]:
+        if not node.address or node.address in hosts or node.address in failed:
+            continue
+        try:
+            ipaddress.ip_address(node.address)
+            continue
+        except ValueError:
+            pass
+        cached = _hosts_cache.get(node.address)
+        if cached and now - cached[0] < _HOSTS_TTL:
+            hosts[node.address] = cached[1]
+            continue
+        try:
+            ips = fetch.resolve_domain(node.address, cfg.dns.bootstrap, mark=mark)
+        except fetch.ResolveError as exc:
+            failed.add(node.address)
+            if cached:  # резолверы недоступны — лучше прежний адрес, чем никакого
+                hosts[node.address] = cached[1]
+            logger.warning("домен %s не разрешён: %s", node.address, exc)
+            continue
+        hosts[node.address] = ips
+        _hosts_cache[node.address] = (now, ips)
+    return hosts
+
+
+def persist(
+    paths: Paths,
+    assembly: Assembly,
+    quotas: dict[str, dict[str, int]],
+    *,
+    record_event: bool = True,
+) -> None:
+    """Записывает в SQLite состав узлов последней сборки и квоты подписок."""
+    result = assembly.result
+    nodes = [*assembly.selection.members, *assembly.selection.spares]
+    by_fingerprint = {node.fingerprint: node for node in nodes}
+    now = int(time.time())
+    entries = []
+    for info in result.nodes:
+        node = by_fingerprint[info.fingerprint]
+        entries.append(
+            {
+                "fingerprint": info.fingerprint,
+                "tag": info.tag,
+                "role": info.role,
+                "name": node.name,
+                "source": node.source,
+                "address": node.address,
+                "port": node.port,
+                "updated": now,
+            }
+        )
+    members = sum(1 for info in result.nodes if info.role == "proxy")
+    try:
+        store = Store(paths.db_file)
+        try:
+            store.replace_nodes(entries)
+            store.prune_scans({info.probe_tag for info in result.nodes})
+            store.set_meta("quota", json.dumps(quotas, ensure_ascii=False))
+            if record_event:
+                store.add_event(
+                    "generate", f"участников: {members}, запасных: {len(entries) - members}"
+                )
+        finally:
+            store.close()
+    except Exception as exc:  # состояние не критично для генерации
+        log.get_logger("engine").error("не удалось записать состояние: %s", exc)
+
+
+# --- доступ к работающему ядру -------------------------------------------------
+
+
+def make_api(cfg: config.Config, xray_bin: Path) -> ApiClient:
+    return ApiClient(xray_bin, server=f"127.0.0.1:{cfg.xray.api_port}")
+
+
+def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
+    """systemd-юнит xgw-xray.service; там, где юнита нет (стенд до этапа 4), —
+    обычный процесс с pid-файлом: XGW_XRAY_SERVICE=process."""
+    if os.environ.get("XGW_XRAY_SERVICE") == "process":
+        return PidfileXrayService(
+            xray_bin or paths.xray_bin, paths.xray_config_file, paths.run / "xray.pid"
+        )
+    return SystemdXrayService()
+
+
+def make_applier(cfg: config.Config, paths: Paths, xray_bin: Path) -> Applier:
+    return Applier(
+        cfg, paths, make_api(cfg, xray_bin), make_service(paths, xray_bin), xray_bin=xray_bin
+    )
+
+
+def describe(outcome: ApplyOutcome) -> str:
+    """Итог применения одной строкой — для лога и вывода команд."""
+    text = {
+        "api": "применено через API без перезапуска",
+        "restart": "применено с перезапуском Xray",
+        "restart_deferred": "нужен перезапуск Xray — отложен",
+        "unchanged": "изменений нет",
+        "rejected": "конфиг отклонён, Xray работает на прежнем",
+        "rollback": "Xray не поднялся с новым конфигом — выполнен откат на last-good",
+        "failed": "Xray не поднялся, откат на last-good не помог",
+    }.get(outcome.mode, outcome.mode)
+    if outcome.ops:
+        text += ": " + "; ".join(outcome.ops)
+    if outcome.detail:
+        text += f" ({outcome.detail})"
+    return text
