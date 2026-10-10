@@ -68,8 +68,10 @@ def fetch_url(
     backoffs: tuple[float, ...] = RETRY_DELAYS,
     bootstrap: Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
+    data: bytes | None = None,
 ) -> FetchResult:
-    """GET: первая попытка и до `retries` повторов с паузами 2, 4 и 8 с.
+    """GET (или POST, если задано тело `data`): первая попытка и до `retries`
+    повторов с паузами 2, 4 и 8 с.
 
     Повторяются только временные сбои: сетевые ошибки и ответы 429/5xx.
     `bootstrap` — резолверы для имени хоста (сокетами с той же меткой); без них
@@ -86,7 +88,7 @@ def fetch_url(
     for attempt in range(attempts):
         try:
             result = _request_with_redirects(
-                url, headers or {}, timeout, mark, bootstrap, proxy
+                url, headers or {}, timeout, mark, bootstrap, proxy, data
             )
         except (
             FetchError,
@@ -171,11 +173,13 @@ def _request_with_redirects(
     mark: int | None,
     bootstrap: Sequence[str] | None,
     proxy: tuple[str, int] | None = None,
+    data: bytes | None = None,
 ) -> FetchResult:
     current = url
     for _ in range(5):
-        result = _request_once(current, headers, timeout, mark, bootstrap, proxy)
-        if result.status in (301, 302, 303, 307, 308):
+        result = _request_once(current, headers, timeout, mark, bootstrap, proxy, data)
+        # Тело за перенаправлением не отправляется: POST у XGW один — в Telegram.
+        if data is None and result.status in (301, 302, 303, 307, 308):
             location = result.headers.get("location", "")
             if not location:
                 return result
@@ -260,6 +264,7 @@ def _request_once(
     mark: int | None,
     bootstrap: Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
+    data: bytes | None = None,
 ) -> FetchResult:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -292,7 +297,10 @@ def _request_once(
             "Connection": "close",
             **headers,
         }
-        conn.request("GET", path, headers=request_headers)
+        if data is None:
+            conn.request("GET", path, headers=request_headers)
+        else:
+            conn.request("POST", path, body=data, headers=request_headers)
         response = conn.getresponse()
         body = response.read(MAX_BODY + 1)
         if len(body) > MAX_BODY:

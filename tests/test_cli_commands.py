@@ -466,7 +466,7 @@ def test_run_once(gateway, monkeypatch, capsys):
     created: list = []
 
     class FakeDaemon:
-        def __init__(self, cfg, paths, *, xray_bin, capture=None):
+        def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             self.store = Store(paths.db_file)
             self.ticks = 0
             created.append(self)

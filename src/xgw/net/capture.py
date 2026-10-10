@@ -82,6 +82,11 @@ class Capture:
                 state[key] = value
         atomic_write_json(self.state_file, state, mode=0o644)
 
+    def choice(self) -> bool | None:
+        """Явный выбор пользователя; None — ни enable, ни disable ещё не выполнялись."""
+        value = self._state().get("enabled")
+        return value if isinstance(value, bool) else None
+
     def wanted(self) -> bool:
         """Выбор пользователя: `xgw enable` (по умолчанию) или `xgw disable`."""
         return bool(self._state().get("enabled", True))

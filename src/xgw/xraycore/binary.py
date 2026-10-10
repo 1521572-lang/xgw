@@ -92,6 +92,26 @@ def installed_version(
         return None
 
 
+def has_string(bin_path: Path | str, needle: bytes, *, chunk: int = 1 << 20) -> bool:
+    """Есть ли в бинарнике строка — например, имя поля конфига.
+
+    Xray молча игнорирует незнакомые поля, и `xray run -test` такой конфиг
+    принимает; имена полей при этом лежат в бинарнике открытым текстом.
+    """
+    tail = b""
+    try:
+        with open(bin_path, "rb") as handle:
+            while block := handle.read(chunk):
+                window = tail + block
+                if needle in window:
+                    return True
+                # Хвост — на случай, если строка легла на границу двух блоков.
+                tail = window[-(len(needle) - 1):] if len(needle) > 1 else b""
+    except OSError:
+        return False
+    return False
+
+
 def platform_pair() -> tuple[str, str]:
     if sys.platform.startswith("win"):
         goos = "windows"
@@ -174,6 +194,7 @@ def download_release(
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,
     enforce_min: bool = True,
+    release: Release | None = None,
 ) -> tuple[str, Path]:
     """Скачивает zip + .dgst, проверяет SHA-256, распаковывает в dest_dir.
 
@@ -182,7 +203,8 @@ def download_release(
     (запись поверх исполняемого файла дала бы ETXTBSY), а недокачанный
     бинарник на месте рабочего не окажется.
     """
-    release = get_release(version, mark=mark, bootstrap=bootstrap)
+    if release is None:
+        release = get_release(version, mark=mark, bootstrap=bootstrap)
     if enforce_min and not version_ok(release.tag):
         raise BinaryError(f"версия {release.tag} ниже требуемой v{min_version_text()}")
     goos, machine = platform_pair()

@@ -1,6 +1,6 @@
 """Управление процессом/службой Xray.
 
-На хосте — systemd-юнит xgw-xray.service (этап 4). Там, где юнита нет (стенд,
+На хосте — systemd-юнит xgw-xray.service (его ставит `xgw install`). Там, где юнита нет (стенд,
 интеграционные тесты), — обычный процесс: ProcessXrayService живёт внутри
 одного процесса Python, PidfileXrayService виден всем командам XGW через
 pid-файл. Единый интерфейс: start/stop/restart/is_active.
@@ -36,7 +36,7 @@ class XrayService(ABC):
 
 
 class SystemdXrayService(XrayService):
-    """systemctl для юнита xgw-xray.service (устанавливается на этапе 4)."""
+    """systemctl для юнита xgw-xray.service."""
 
     def __init__(self, unit: str = "xgw-xray.service") -> None:
         self.unit = unit

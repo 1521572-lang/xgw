@@ -192,4 +192,8 @@ def test_daemon_replaces_frozen_member_and_expires_pin(stand):
     assert wait_for(lambda: stand.xgw_json("status")["pin"] is None, 30, step=2)
     from xgw.xraycore.api import parse_balancer_info
 
-    assert parse_balancer_info(stand.xray_api("bi", "auto")).override is None
+    # Статус перестаёт показывать закрепление ровно в срок, а `bo -r` демон
+    # выполняет на ближайшем шаге watchdog — ждём его, а не угадываем момент.
+    assert wait_for(
+        lambda: parse_balancer_info(stand.xray_api("bi", "auto")).override is None, 15, step=0.5
+    ), stand.tail("daemon", 20)

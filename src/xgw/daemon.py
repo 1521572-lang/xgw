@@ -66,6 +66,7 @@ class Daemon:
         capture=None,
         capture_active=lambda: False,
         reapply_capture=lambda: None,
+        sinks=(),
         clock=time.monotonic,
         wall=time.time,
     ) -> None:
@@ -94,7 +95,11 @@ class Daemon:
         self.service = self.applier.service
         self.mark = engine.bypass_mark(cfg, self.log)
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
-        self.notifier = Notifier(paths.db_file, cfg.notify.min_interval_min, logger=self.log)
+        # sinks — куда доставлять уведомления (рабочий стол, Telegram); их собирает
+        # `xgw run`, в тестах и на стенде получателей нет.
+        self.notifier = Notifier(
+            paths.db_file, cfg.notify.min_interval_min, sinks=sinks, logger=self.log
+        )
         self.store = Store(paths.db_file)
         self.xray_version = ".".join(map(str, binary.installed_version(xray_bin) or ()))
 
@@ -118,9 +123,10 @@ class Daemon:
 
     # --- цикл ------------------------------------------------------------------
 
-    def run(self, stop: threading.Event) -> None:
+    def run(self, stop: threading.Event, changed=lambda: False) -> None:
+        """Цикл watchdog до остановки либо до изменения config.toml (changed)."""
         self.log.info("демон XGW запущен, шаг watchdog %d с", self.cfg.watchdog.interval_s)
-        while not stop.is_set():
+        while not stop.is_set() and not changed():
             try:
                 state = self.tick()
             except Exception:  # сбой одного шага не должен ронять демон
@@ -129,7 +135,7 @@ class Daemon:
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
             stop.wait(jitter(pause))
         self.store.close()
-        self.log.info("демон XGW остановлен")
+        self.log.info("демон XGW остановлен" if stop.is_set() else "config.toml изменён")
 
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""

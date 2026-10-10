@@ -1,0 +1,715 @@
+"""`xgw diag` — проверки машины с вердиктом OK, WARN или FAIL и советом (раздел 6.9).
+
+Ничего не меняет в системе. Правила nftables проверяются в отдельном сетевом
+пространстве имён (`unshare -n`): ядро принимает их по-настоящему, а сеть
+машины при этом не затрагивается. FAIL — установку начинать нельзя.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import sys
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from . import engine, fetch, log
+from .config import Config, probe_bytes
+from .generator import validate
+from .generator.builder import BALANCER_TAG
+from .install import UNITS
+from .net import cmd, dnsmasq, lan, nft, nm, sleep, ufw
+from .net.capture import Capture
+from .paths import Paths
+from .store import Store
+from .watch import checks as probes
+from .watch import status
+from .xraycore import binary, metrics
+
+OK, WARN, FAIL = "OK", "WARN", "FAIL"
+STATUS_PAGE_PORT = 8780
+OS_RELEASE = Path("/etc/os-release")
+CHRONY_DIR = Path("/etc/chrony")
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    level: str
+    text: str
+    advice: str = ""
+
+
+def render(checks: Sequence[Check]) -> str:
+    lines: list[str] = []
+    for check in checks:
+        lines.append(f"{check.level:<4}  {check.name}: {check.text}")
+        if check.advice:
+            lines.append(f"      → {check.advice}")
+    counts = {level: sum(1 for check in checks if check.level == level)
+              for level in (OK, WARN, FAIL)}
+    lines.append(f"Итог: OK — {counts[OK]}, WARN — {counts[WARN]}, FAIL — {counts[FAIL]}")
+    return "\n".join(lines)
+
+
+def can_bind(port: int) -> bool:
+    """Свободен ли TCP-порт на 127.0.0.1."""
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+class Diag:
+    def __init__(
+        self,
+        cfg: Config,
+        paths: Paths,
+        *,
+        runner: cmd.Runner = cmd.run,
+        logger=None,
+        net: bool = True,
+        config_error: str = "",
+        config_warnings: Sequence[str] = (),
+        which: Callable[[str], str | None] = shutil.which,
+        is_root: bool | None = None,
+        os_release: Path = OS_RELEASE,
+        port_free: Callable[[int], bool] = can_bind,
+    ) -> None:
+        self.cfg = cfg
+        self.paths = paths
+        self.runner = runner
+        self.log = logger or log.get_logger("diag")
+        self.net = net
+        self.config_error = config_error
+        self.config_warnings = list(config_warnings)
+        self.which = which
+        if is_root is None:
+            is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        self.root = is_root
+        self.os_release = os_release
+        self.port_free = port_free
+        self.lan_if = lan.lan_interface(cfg)
+        self.installed = (paths.systemd_dir / "xgw.service").exists()
+        self.xray_bin = validate.find_xray(None, paths)
+        self._xray_up: bool | None = None
+
+    def run(self) -> list[Check]:
+        groups: list[tuple[str, Callable[[], list[Check]]]] = [
+            ("Система", self._system),
+            ("Конфиг", self._config),
+            ("Программы", self._programs),
+            ("Xray", self._xray),
+            ("Ядро", self._kernel),
+            ("Файрвол", self._firewall),
+            ("NetworkManager", self._nm),
+            ("Порты", self._ports),
+            ("Xray API", self._xray_api),
+            ("Время", self._time),
+            ("Сон", self._sleep),
+            ("IPv6", self._ipv6),
+            ("Службы", self._services),
+            ("Трафик проверок", self._budget),
+        ]
+        if self.net:
+            groups += [("probe.url", self._probe), ("bootstrap DNS", self._bootstrap)]
+        result: list[Check] = []
+        for name, group in groups:
+            try:
+                result.extend(group())
+            except Exception as exc:  # одна проверка не должна ронять остальные
+                self.log.error("diag, проверка «%s»: %s", name, exc)
+                result.append(Check(name, WARN, f"проверка не выполнена: {exc}"))
+        return result
+
+    # --- система и конфиг -------------------------------------------------------
+
+    def _system(self) -> list[Check]:
+        if not sys.platform.startswith("linux"):
+            return [Check("Система", FAIL, "XGW работает только в Linux (Ubuntu 26.04)")]
+        release: dict[str, str] = {}
+        try:
+            for line in self.os_release.read_text(encoding="utf-8").splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    release[key] = value.strip().strip('"')
+        except OSError:
+            pass
+        name = release.get("PRETTY_NAME") or "неизвестная система"
+        python = f"Python {sys.version_info.major}.{sys.version_info.minor}"
+        result: list[Check] = []
+        if release.get("ID") == "ubuntu" and release.get("VERSION_ID") == "26.04":
+            result.append(Check("Система", OK, f"{name}, {python}"))
+        else:
+            result.append(Check(
+                "Система", WARN, f"{name}, {python} — XGW проверялся только на Ubuntu 26.04"
+            ))
+        if not self.root:
+            result.append(Check(
+                "Права", WARN, "запущено без root — проверки ядра, файрвола и портов пропущены",
+                "sudo xgw diag",
+            ))
+        return result
+
+    def _config(self) -> list[Check]:
+        path = self.paths.config_file
+        if self.config_error:
+            return [Check(
+                "Конфиг", FAIL, self.config_error,
+                f"sudo xgw install создаст {path} из примера — впишите в него подписку",
+            )]
+        result: list[Check] = []
+        try:
+            if os.name != "nt" and path.stat().st_mode & 0o077:
+                result.append(Check(
+                    "Конфиг", WARN, f"{path} доступен другим пользователям, а в нём подписка",
+                    f"sudo chmod 600 {path}",
+                ))
+        except OSError:
+            pass
+        if self.config_warnings:
+            result.append(Check("Конфиг", WARN, "; ".join(self.config_warnings)))
+        if not result:
+            mode = f"сеть {self.lan_if} и эта машина" if self.lan_if else "только эта машина"
+            result.append(Check("Конфиг", OK, f"{path} читается; режим — {mode}"))
+        return result
+
+    def _programs(self) -> list[Check]:
+        required = ["ip", "systemctl"]
+        if self.lan_if:
+            required.append("nmcli")
+        missing = [name for name in required if self.which(name) is None]
+        later = [] if self.which("nft") is not None else ["nftables"]
+        # Нужен пакет dnsmasq со службой, а не только программа из dnsmasq-base.
+        if self.lan_if and not self._has_unit(dnsmasq.UNIT):
+            later.append("dnsmasq")
+        if missing:
+            return [Check(
+                "Программы", FAIL, "не найдены: " + ", ".join(missing),
+                "XGW рассчитан на Ubuntu Desktop с NetworkManager и systemd",
+            )]
+        if later:
+            return [Check(
+                "Программы", WARN, "пакеты " + ", ".join(later) + " не установлены",
+                "sudo xgw install поставит их из apt",
+            )]
+        return [Check("Программы", OK, "nft, ip, systemctl" + (
+            ", nmcli, dnsmasq" if self.lan_if else "") + " на месте")]
+
+    def _has_unit(self, unit: str) -> bool:
+        return any(
+            (self.paths.root / directory / unit).exists()
+            for directory in ("usr/lib/systemd/system", "lib/systemd/system",
+                              "etc/systemd/system")
+        )
+
+    # --- Xray -------------------------------------------------------------------
+
+    def _xray(self) -> list[Check]:
+        if self.xray_bin is None:
+            return [Check(
+                "Xray", WARN, f"не установлен ({self.paths.xray_bin})",
+                "sudo xgw install загрузит его с GitHub и сверит SHA-256",
+            )]
+        version = binary.installed_version(self.xray_bin)
+        if version is None:
+            return [Check("Xray", FAIL, f"{self.xray_bin} не запускается", "sudo xgw update-xray")]
+        text = ".".join(map(str, version))
+        if version < binary.MIN_VERSION:
+            return [Check(
+                "Xray", FAIL,
+                f"версия {text} ниже {binary.min_version_text()}: поля httpMethod в ней нет, "
+                "серверы проверялись бы HEAD-запросом и «заморозка» осталась бы незамеченной",
+                "sudo xgw update-xray",
+            )]
+        if not binary.has_string(self.xray_bin, b"httpMethod"):
+            return [Check(
+                "Xray", FAIL, f"версия {text}, но поля httpMethod в бинарнике нет",
+                "sudo xgw update-xray",
+            )]
+        return [Check("Xray", OK, f"версия {text}, GET-проверка (httpMethod) поддерживается")]
+
+    def xray_up(self) -> bool:
+        if self._xray_up is None:
+            try:
+                metrics.fetch_metrics(self.cfg.xray.metrics_port)
+                self._xray_up = True
+            except Exception:
+                self._xray_up = False
+        return self._xray_up
+
+    def _xray_api(self) -> list[Check]:
+        if self.xray_bin is None or not (self.installed or self.xray_up()):
+            return []  # до установки проверять нечего
+        try:
+            observatory = metrics.parse_observatory(
+                metrics.fetch_metrics(self.cfg.xray.metrics_port)
+            )
+        except Exception as exc:
+            return [Check(
+                "Xray API", FAIL, f"метрики не отвечают: {exc}",
+                "sudo systemctl status xgw-xray; sudo journalctl -u xgw-xray -n 30",
+            )]
+        try:
+            engine.make_api(self.cfg, self.xray_bin).balancer_info(BALANCER_TAG)
+        except Exception as exc:
+            return [Check("Xray API", FAIL, f"API не отвечает: {exc}",
+                          "sudo journalctl -u xgw-xray -n 30")]
+        members = {tag: entry for tag, entry in observatory.items() if tag.startswith("proxy-")}
+        alive = sum(1 for entry in members.values() if entry["alive"])
+        level = OK if alive or not members else WARN
+        return [Check(
+            "Xray API", level,
+            f"API и метрики отвечают; живых участников {alive} из {len(members)}",
+            "" if level == OK else "sudo xgw probe --all покажет, что с серверами",
+        )]
+
+    # --- ядро и файрвол ---------------------------------------------------------
+
+    def _kernel(self) -> list[Check]:
+        if not self.root:
+            return []
+        if self.which("nft") is None:
+            return [Check("Ядро", WARN, "nft не установлен — правила проверить нечем",
+                          "sudo xgw install поставит nftables")]
+        rules, _warnings = nft.build_rules(self.cfg, capture=True)
+        if rules.empty:
+            return [Check("Ядро", OK, "перехват выключен в конфиге — правила не нужны")]
+        text = nft.render(rules) + nft.render6(rules)
+        if self.which("unshare") is None:
+            try:
+                self.runner(["nft", "-c", "-f", "-"], input=text)
+            except cmd.CommandError as exc:
+                return [Check("Ядро", FAIL, f"nft не принимает правила: {_first_line(exc)}")]
+            return [Check("Ядро", WARN, "синтаксис правил верен; ядро не проверено (нет unshare)")]
+        try:
+            # Отдельное пространство имён: правила загружаются по-настоящему
+            # (нужные модули ядро подгружает само) и исчезают вместе с ним.
+            self.runner(["unshare", "-n", "nft", "-f", "-"], input=text, timeout=30.0)
+        except cmd.CommandError as exc:
+            return [Check(
+                "Ядро", FAIL, f"ядро не принимает правила перехвата: {_first_line(exc)}",
+                "нужны модули nft_tproxy, nft_fib, nft_ct, nft_masq (пакет linux-modules-extra)",
+            )]
+        return [Check("Ядро", OK, "ядро принимает правила TPROXY (tproxy, fib, ct, masquerade)")]
+
+    def _firewall(self) -> list[Check]:
+        if not self.root or self.which("nft") is None:
+            return []
+        result: list[Check] = []
+        try:
+            ruleset = json.loads(self.runner(["nft", "-j", "list", "ruleset"], timeout=30.0))
+        except (cmd.CommandError, json.JSONDecodeError) as exc:
+            return [Check("Файрвол", WARN, f"правила nftables не прочитаны: {_first_line(exc)}")]
+        dropping: dict[str, list[str]] = {"forward": [], "input": []}
+        docker = False
+        for item in ruleset.get("nftables", []) if isinstance(ruleset, dict) else []:
+            chain = item.get("chain") if isinstance(item, dict) else None
+            if not chain or chain.get("table") in (nft.TABLE, nft.TABLE6):
+                continue
+            if str(chain.get("name", "")).startswith("DOCKER"):
+                docker = True
+            if chain.get("hook") in dropping and chain.get("policy") == "drop":
+                dropping[chain["hook"]].append(f"{chain.get('family')} {chain.get('table')}")
+        ufw_on = self.which("ufw") is not None and ufw.active(self.runner)
+        wan_if = lan.effective_wan(self.cfg, self.runner)
+        if ufw_on and self.lan_if:
+            result.append(self._ufw(wan_if))
+        elif ufw_on:
+            result.append(Check("ufw", OK, "включён; трафику самой машины не мешает"))
+        if docker and dropping["forward"] and self.lan_if:
+            result.append(Check(
+                "Docker", WARN,
+                "ставит политику drop в FORWARD: устройства в обход VPN, ICMP и режим "
+                "`xgw disable` не пройдут через шлюз",
+                f"sudo iptables -I DOCKER-USER -i {self.lan_if} -j ACCEPT; "
+                f"sudo iptables -I DOCKER-USER -o {self.lan_if} -m conntrack "
+                "--ctstate RELATED,ESTABLISHED -j ACCEPT",
+            ))
+        elif dropping["forward"] and self.lan_if and not ufw_on:
+            tables = ", ".join(sorted(set(dropping["forward"])))
+            result.append(Check(
+                "Файрвол", WARN,
+                f"чужая цепочка forward с политикой drop ({tables}): форвардинг для устройств "
+                "в обход VPN и ICMP может не пройти",
+                f"разрешите в ней трафик с интерфейса {self.lan_if}",
+            ))
+        if dropping["input"] and self.lan_if and not ufw_on:
+            tables = ", ".join(sorted(set(dropping["input"])))
+            result.append(Check(
+                "Файрвол", WARN,
+                f"чужая цепочка input с политикой drop ({tables}): перехваченный трафик "
+                f"устройств приходит в Xray как входящий с {self.lan_if}",
+                f"разрешите в ней входящие с интерфейса {self.lan_if}",
+            ))
+        if self.runner(["systemctl", "is-enabled", "nftables.service"],
+                       check=False).strip() == "enabled":
+            result.append(Check(
+                "nftables.service", WARN,
+                "включена, а её конфиг начинается с flush ruleset: при её перезапуске правила "
+                "XGW пропадут, пока демон не вернёт их (до одного шага watchdog)",
+                "если своих правил в /etc/nftables.conf нет: sudo systemctl disable nftables",
+            ))
+        if not result:
+            result.append(Check("Файрвол", OK, "ufw и Docker перехвату не мешают"))
+        return result
+
+    def _ufw(self, wan_if: str) -> Check:
+        """ufw включён, есть LAN: хватает ли правил, чтобы устройства вышли в сеть."""
+        listed = self.runner(["ufw", "status"], timeout=20.0, check=False)
+        before = ufw.before_rules(self.paths.root)
+        mark = self.cfg.capture.mark_proxy
+        missing: list[str] = []
+        if f"on {self.lan_if}" not in listed:
+            missing += ["sudo ufw " + " ".join(rule) for rule in ufw.wanted(self.lan_if, wan_if)]
+        if self.cfg.capture.lan and not ufw.has_tproxy_rule(before, self.lan_if, mark):
+            missing.append(
+                f"в {before} перед строкой «{ufw.ANCHOR}» — "
+                f"«{ufw.tproxy_rule(self.lan_if, mark)}», затем sudo ufw reload"
+            )
+        if not missing:
+            return Check("ufw", OK, f"включён, правила для {self.lan_if} есть")
+        text = (
+            f"включён и запрещает входящие: устройства за {self.lan_if} останутся без "
+            "интернета (перехваченные пакеты ufw отбрасывает в ufw-not-local)"
+        )
+        if self.installed:
+            return Check("ufw", FAIL, text, "; ".join(missing))
+        return Check("ufw", WARN, text, "sudo xgw install добавит правила (спросит): "
+                     + "; ".join(missing))
+
+    # --- NetworkManager ---------------------------------------------------------
+
+    def _nm(self) -> list[Check]:
+        if self.which("nmcli") is None:
+            if self.lan_if:
+                return []  # уже FAIL в «Программах»
+            return [Check("NetworkManager", OK, "не установлен; для режима «только эта машина» "
+                          "он не нужен")]
+        manager = nm.Nm(self.runner)
+        if not manager.running():
+            level = FAIL if self.lan_if else WARN
+            return [Check("NetworkManager", level, "не запущен",
+                          "sudo systemctl enable --now NetworkManager")]
+        devices = manager.devices()
+        wan_if = lan.effective_wan(self.cfg, self.runner)
+        result: list[Check] = []
+        if not wan_if:
+            result.append(Check("WAN", WARN, "маршрута по умолчанию нет — интернет не подключён?"))
+        elif not self.lan_if:
+            result.append(Check("NetworkManager", OK, f"запущен; WAN — {wan_if}"))
+        if not self.lan_if:
+            return result
+        if self.lan_if == wan_if:
+            return [Check(
+                "LAN", FAIL, f"network.lan_if = {self.lan_if} — это интерфейс выхода в интернет",
+                "LAN — вторая сетевая карта, к которой подключён Wi-Fi-роутер",
+            )]
+        device = devices.get(self.lan_if)
+        if device is None:
+            names = ", ".join(sorted(name for name in devices if name != "lo")) or "нет"
+            return [Check("LAN", FAIL, f"интерфейса {self.lan_if} нет; есть: {names}",
+                          "исправьте network.lan_if в config.toml")]
+        if device.state == "unmanaged":
+            return [Check(
+                "LAN", FAIL, f"NetworkManager не управляет {self.lan_if} (unmanaged)",
+                "в Ubuntu Server сетью управляет networkd: задайте в /etc/netplan/*.yaml "
+                "renderer: NetworkManager и выполните sudo netplan apply",
+            )]
+        if device.type != "ethernet":
+            result.append(Check("LAN", WARN, f"{self.lan_if} — не Ethernet ({device.type}); "
+                                "XGW рассчитан на проводную карту к роутеру"))
+        shared = [profile.name for profile, info in nm.bound_profiles(manager, self.lan_if)
+                  if info.get("ipv4.method") == "shared"
+                  and info.get("connection.autoconnect") != "no"]
+        if shared:
+            result.append(Check(
+                "LAN", WARN,
+                "профиль " + ", ".join(shared) + " в режиме shared: NetworkManager поднимает "
+                "свой dnsmasq и NAT, они конфликтуют с XGW",
+                "установка лишит такой профиль автоподключения",
+            ))
+        if device.connection == nm.PROFILE:
+            result.append(Check("LAN", OK, f"{self.lan_if}: профиль {nm.PROFILE} активен"))
+        elif any(profile.name == nm.PROFILE for profile in manager.profiles()):
+            result.append(Check(
+                "LAN", WARN, f"профиль {nm.PROFILE} есть, но на {self.lan_if} активен "
+                f"«{device.connection or 'никакой'}» ({device.state})",
+                "проверьте кабель к роутеру; sudo nmcli connection up xgw-lan",
+            ))
+        else:
+            result.append(Check("LAN", OK, f"{self.lan_if} управляется NetworkManager "
+                                f"({device.state}); профиль {nm.PROFILE} создаст установка"))
+        return result
+
+    # --- порты, время, сон, IPv6 ------------------------------------------------
+
+    def _ports(self) -> list[Check]:
+        if not sys.platform.startswith("linux"):
+            return []
+        ports = {
+            "tproxy": self.cfg.capture.tproxy_port, "api": self.cfg.xray.api_port,
+            "metrics": self.cfg.xray.metrics_port, "socks": self.cfg.xray.socks_port,
+            "http": self.cfg.xray.http_port,
+        }
+        busy = [f"{name} {port}" for name, port in ports.items() if not self.port_free(port)]
+        if not busy:
+            return [Check("Порты", OK, "служебные порты Xray свободны")]
+        if self.xray_up():
+            return [Check("Порты", OK, "служебные порты заняты работающим Xray")]
+        pattern = "|".join(str(port) for port in ports.values())
+        return [Check(
+            "Порты", FAIL, "заняты другой программой: " + ", ".join(busy),
+            f"sudo ss -ltnp | grep -E ':({pattern})\\b' — освободите порт или смените его "
+            "в [xray] / [capture]",
+        )]
+
+    def _time(self) -> list[Check]:
+        if self.which("timedatectl") is None:
+            return []
+        synced = self.runner(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"], check=False
+        ).strip()
+        users = [name for name in nft.TIME_USERS if _user_exists(name)]
+        notes = [f"служба времени — {users[0]}"] if users else []
+        if _chrony_uses_nts():
+            notes.append(f"chrony использует NTS (TCP {nft.NTS_KE_PORT} идёт мимо перехвата)")
+        result: list[Check] = []
+        if synced == "yes":
+            result.append(Check("Время", OK, "; ".join(["часы синхронизированы", *notes])))
+        else:
+            result.append(Check(
+                "Время", WARN,
+                "; ".join(["часы не синхронизированы: Reality не подключится при расхождении "
+                           "времени", *notes]),
+                "timedatectl status; sudo systemctl restart chrony",
+            ))
+        if not users and self.cfg.capture.local:
+            result.append(Check(
+                "Время", WARN,
+                "не найден пользователь службы времени (" + ", ".join(nft.TIME_USERS) + "): её "
+                "запросы попадут в перехват и без VPN время не синхронизируется",
+            ))
+        return result
+
+    def _sleep(self) -> list[Check]:
+        if not self.cfg.network.disable_sleep:
+            return [Check("Сон", OK, "disable_sleep = false — сон оставлен на ваше усмотрение")]
+        awake = sleep.unmasked(self.paths.systemd_dir)
+        if not awake:
+            return [Check("Сон", OK, "цели сна замаскированы")]
+        text = "не замаскированы: " + ", ".join(awake) + " — уснувший шлюз оставит дом без сети"
+        advice = "sudo xgw install замаскирует их" if not self.installed else (
+            "sudo systemctl mask " + " ".join(awake))
+        return [Check("Сон", WARN, text, advice + f"; GNOME: {sleep.GNOME_HINT}")]
+
+    def _ipv6(self) -> list[Check]:
+        if self.which("ip") is None:
+            return []
+        try:
+            entries = json.loads(
+                self.runner(["ip", "-j", "-6", "addr", "show", "scope", "global"]) or "[]"
+            )
+        except (cmd.CommandError, json.JSONDecodeError):
+            return []
+        devices = sorted({
+            entry.get("ifname", "") for entry in entries
+            if isinstance(entry, dict) and entry.get("addr_info")
+        } - {""})
+        if not devices:
+            return [Check("IPv6", OK, "глобальных IPv6-адресов нет — мимо перехвата идти нечему")]
+        text = "глобальный IPv6-адрес на " + ", ".join(devices) + ": по IPv6 трафик идёт мимо VPN"
+        if not self.installed:
+            return [Check("IPv6", WARN, text, "sudo xgw install отключит IPv6 в профиле WAN")]
+        return [Check(
+            "IPv6", FAIL, text,
+            "sudo nmcli connection modify <профиль> ipv6.method disabled && "
+            "sudo nmcli device reapply <интерфейс>",
+        )]
+
+    # --- службы и бюджет --------------------------------------------------------
+
+    def _services(self) -> list[Check]:
+        if not self.installed:
+            return []
+        units = list(UNITS) + ([dnsmasq.UNIT] if self.lan_if else [])
+        down = [
+            unit for unit in units
+            if self.runner(["systemctl", "is-active", unit], check=False).strip() != "active"
+        ]
+        result: list[Check] = []
+        if down:
+            result.append(Check(
+                "Службы", FAIL, "не работают: " + ", ".join(down),
+                "sudo systemctl status " + " ".join(down),
+            ))
+        else:
+            result.append(Check("Службы", OK, ", ".join(
+                unit.removesuffix(".service") for unit in units) + " работают"))
+        if self.root:
+            capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+            info = capture.describe()
+            if info["mode"] == "on" and info["loaded"] is False:
+                result.append(Check("Перехват", FAIL, "включён, но правила не загружены",
+                                    "sudo xgw net up"))
+            elif info["mode"] in ("off", "open"):
+                result.append(Check("Перехват", WARN, "снят — трафик идёт напрямую, мимо VPN",
+                                    "sudo xgw enable"))
+            elif info["mode"] == "on":
+                result.append(Check("Перехват", OK, "включён, правила загружены"))
+        return result
+
+    def _budget(self) -> list[Check]:
+        members, spares = self.cfg.filters.max_members, 0
+        quotas: dict = {}
+        if self.paths.db_file.exists():
+            try:
+                store = Store(self.paths.db_file)
+                try:
+                    nodes = store.all_nodes()
+                    quotas = json.loads(store.get_meta("quota") or "{}")
+                finally:
+                    store.close()
+                if nodes:
+                    members = sum(1 for node in nodes if node["role"] == "proxy")
+                    spares = len(nodes) - members
+            except Exception as exc:
+                self.log.debug("состояние не прочитано: %s", exc)
+        budget = status.probe_budget(self.cfg, members, spares)
+        text = (
+            f"~{budget.total / status.MB:.0f} МБ в сутки при {members} участниках и "
+            f"{spares} запасных (лимит {self.cfg.probe.max_daily_probe_mb} МБ)"
+        )
+        warnings = status.budget_warnings(self.cfg, budget, quotas if isinstance(quotas, dict)
+                                          else {})
+        if warnings:
+            return [Check("Трафик проверок", WARN, "; ".join(warnings))]
+        return [Check("Трафик проверок", OK, text)]
+
+    # --- сеть -------------------------------------------------------------------
+
+    def _mark(self) -> int | None:
+        return engine.bypass_mark(self.cfg, self.log)
+
+    def _probe(self) -> list[Check]:
+        url = self.cfg.probe.url
+        expected = probe_bytes(url)
+        mark = self._mark()
+        result: list[Check] = []
+        started = time.monotonic()
+        try:
+            reply = fetch.fetch_url(
+                url, mark=mark, timeout=15.0, retries=0,
+                bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+            )
+        except fetch.FetchError as exc:
+            result.append(Check(
+                "probe.url", WARN, f"напрямую не скачивается: {exc}",
+                "не страшно, если скачивается через серверы: sudo xgw probe --all",
+            ))
+        else:
+            size, seconds = len(reply.body), time.monotonic() - started
+            if reply.status != 200 or (expected and size < expected):
+                result.append(Check(
+                    "probe.url", WARN,
+                    f"напрямую: HTTP {reply.status}, {size} Б" + (
+                        f" из {expected}" if expected else ""),
+                    "задайте probe.url_fallback или другой probe.url",
+                ))
+            else:
+                result.append(Check("probe.url", OK, f"напрямую: {size} Б за {seconds:.1f} с"))
+        if engine.healthy_http_in(self.cfg) is not None:
+            started = time.monotonic()
+            download = probes.http_get_via_proxy(
+                "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0, max_total=30.0
+            )
+            if download.ok:
+                result.append(Check(
+                    "probe.url", OK,
+                    f"через Xray: {download.downloaded} Б за "
+                    f"{time.monotonic() - started:.1f} с",
+                ))
+            else:
+                result.append(Check(
+                    "probe.url", FAIL, f"через Xray не скачивается: {download.error}",
+                    "sudo xgw probe --all покажет серверы по одному",
+                ))
+        return result
+
+    def _bootstrap(self) -> list[Check]:
+        name = _domain_to_resolve(self.cfg)
+        if not name:
+            return []
+        mark = self._mark()
+        good: list[str] = []
+        bad: list[str] = []
+        for resolver in self.cfg.dns.bootstrap:
+            try:
+                fetch.resolve_domain(name, [resolver], mark=mark)
+                good.append(resolver)
+            except Exception as exc:
+                bad.append(f"{resolver} ({exc})")
+        total = len(self.cfg.dns.bootstrap)
+        if not good:
+            return [Check(
+                "bootstrap DNS", FAIL,
+                "ни один резолвер не отвечает: домены серверов не разрешить — " + "; ".join(bad),
+                "проверьте dns.bootstrap; обычный DNS провайдера: udp://<адрес>",
+            )]
+        if bad:
+            return [Check("bootstrap DNS", WARN,
+                          f"отвечают {len(good)} из {total}; не отвечают: " + "; ".join(bad))]
+        return [Check("bootstrap DNS", OK, f"отвечают все {total}")]
+
+
+def _first_line(exc: Exception) -> str:
+    lines = [line for line in str(exc).splitlines() if line.strip()]
+    return lines[0] if lines else type(exc).__name__
+
+
+def _user_exists(name: str) -> bool:
+    try:
+        import pwd
+    except ImportError:
+        return False
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def _chrony_uses_nts(directory: Path = CHRONY_DIR) -> bool:
+    """Есть ли в конфиге chrony источник с ключом nts."""
+    try:
+        files = [path for path in directory.rglob("*") if path.is_file()]
+    except OSError:
+        return False
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            words = line.split("#", 1)[0].split()
+            if words[:1] and words[0] in ("server", "pool", "peer") and "nts" in words[2:]:
+                return True
+    return False
+
+
+def _domain_to_resolve(cfg: Config) -> str:
+    """Имя для проверки резолверов — из URL конфигурации: лишних запросов XGW не делает."""
+    candidates = [cfg.probe.url, *(sub.url for sub in cfg.subscriptions)]
+    for url in candidates:
+        host = urlsplit(url).hostname or ""
+        if host and not host.replace(".", "").isdigit() and ":" not in host:
+            return host
+    return ""

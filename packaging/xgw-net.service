@@ -1,0 +1,26 @@
+# XGW: правила перехвата — таблицы nftables и маршрутизация по меткам.
+# Загружаются раньше сетевых интерфейсов: пока сеть поднимается, мимо VPN ничего
+# не уходит. Остановка службы правил не снимает — для этого есть `xgw disable`
+# (перехват) и `xgw net down` (все правила XGW).
+[Unit]
+Description=XGW: правила перехвата (nftables, ip rule)
+Documentation=https://github.com/1521572-lang/xgw
+DefaultDependencies=no
+# nftables.service начинает свой конфиг с flush ruleset — наши правила после него.
+After=local-fs.target systemd-sysctl.service nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/xgw/config.toml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/xgw net up
+ExecReload=/usr/local/bin/xgw net up
+RuntimeDirectory=xgw
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=sysinit.target

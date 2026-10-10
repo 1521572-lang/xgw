@@ -112,7 +112,10 @@ class Stand:
     names: tuple[str, ...] = ("nl", "de", "fr")
     servers: dict[str, Server] = field(default_factory=dict)
     _procs: list[subprocess.Popen] = field(default_factory=list)
+    # Готовая топология (шлюз — контейнер, см. machine.py); без неё режим netns
+    # создаёт и удаляет свои пространства имён сам.
     _topology: netns.Topology | None = None
+    _own_topology: bool = False
 
     def __post_init__(self) -> None:
         self.logs = self.workdir / "logs"
@@ -172,9 +175,10 @@ class Stand:
         return env
 
     def start(self) -> None:
-        if self.mode == "netns":
+        if self.mode == "netns" and self._topology is None:
             self._topology = netns.Topology()
             self._topology.create()
+            self._own_topology = True
         also = ["--dns-also", netns.INET_DNS_IP] if self.mode == "netns" else []
         self._spawn(
             "origin", "inet",
@@ -231,7 +235,7 @@ class Stand:
             if proc.poll() is None:
                 proc.kill()
         self._procs.clear()
-        if self._topology is not None:
+        if self._topology is not None and self._own_topology:
             self._topology.destroy()
             self._topology = None
 
@@ -246,7 +250,7 @@ class Stand:
 
     def write_config(
         self, *, max_members: int = 2, watchdog_s: int = 2,
-        capture: bool = False, fail_mode: str = "closed",
+        capture: bool = False, fail_mode: str = "closed", extra: str = "",
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -315,7 +319,7 @@ restart_window = "00:00-00:01"
 [watchdog]
 interval_s = {watchdog_s}
 wan_check = "{self.inet_ip}:{self.origin_port}"
-""",
+{extra}""",
             encoding="utf-8",
         )
 

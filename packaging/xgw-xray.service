@@ -1,0 +1,27 @@
+# XGW: Xray-core. Имя своё, чтобы не конфликтовать с xray.service официального
+# установщика. Конфиг пишет XGW; перечитывать его Xray не умеет — только перезапуск.
+[Unit]
+Description=XGW: Xray-core
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target xgw-net.service
+Wants=xgw-net.service
+ConditionPathExists=/etc/xgw/xray/config.json
+
+[Service]
+User=xray
+Group=xray
+# CAP_NET_ADMIN — метка на сокетах (sockopt.mark) и приём TPROXY.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStartPre=/opt/xgw/xray/xray run -test -c /etc/xgw/xray/config.json
+ExecStart=/opt/xgw/xray/xray run -c /etc/xgw/xray/config.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

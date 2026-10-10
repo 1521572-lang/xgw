@@ -106,8 +106,10 @@ def do_get(args) -> dict:
             sock.bind((args.bind, 0))
         sock.settimeout(args.timeout)
         sock.connect((address, port))
+        extra = "".join(f"{header}\r\n" for header in args.header)
         sock.sendall(
-            f"GET {path} HTTP/1.1\r\nHost: {url.netloc}\r\nConnection: close\r\n\r\n".encode()
+            f"GET {path} HTTP/1.1\r\nHost: {url.netloc}\r\n{extra}Connection: close\r\n\r\n"
+            .encode()
         )
         data = b""
         while True:
@@ -131,7 +133,11 @@ def do_get(args) -> dict:
         "bytes": len(body),
         "address": address,
     }
-    if len(body) <= 300:
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.decode("latin-1").partition(":")
+        if name.lower() in ("location", "set-cookie"):
+            result[name.lower()] = value.strip()
+    if len(body) <= 300 or args.body:
         result["body"] = body.decode("utf-8", errors="replace")
     return result
 
@@ -204,6 +210,8 @@ def main() -> None:
     get.add_argument("--bind", default="", help="адрес источника")
     get.add_argument("--mark", type=int, default=0, help="SO_MARK (нужен root)")
     get.add_argument("--timeout", type=float, default=6.0)
+    get.add_argument("--header", action="append", default=[], help="заголовок запроса")
+    get.add_argument("--body", action="store_true", help="вернуть тело любой длины")
     dns = commands.add_parser("dns")
     dns.add_argument("server")
     dns.add_argument("name")

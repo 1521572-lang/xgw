@@ -175,6 +175,11 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ConfigError(f"конфиг не найден: {path}") from exc
+    except PermissionError as exc:
+        # В конфиге подписка, поэтому его права — 0600 root.
+        raise ConfigError(f"нет доступа к {path} — запустите команду через sudo") from exc
+    except OSError as exc:
+        raise ConfigError(f"конфиг не читается: {path}: {exc}") from exc
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"ошибка чтения TOML: {exc}") from exc
 

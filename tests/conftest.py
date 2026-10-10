@@ -7,7 +7,17 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import pytest  # noqa: E402
+
 GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
+
+
+@pytest.fixture(autouse=True)
+def _no_github(monkeypatch):
+    """Тесты не ходят на GitHub: забытая подмена не должна скачать релиз Xray."""
+    monkeypatch.setattr(
+        "xgw.xraycore.binary.RELEASES_API", "http://127.0.0.1:9/tests-must-not-reach-github"
+    )
 REGEN = os.environ.get("XGW_REGEN_GOLDEN") == "1"
 
 

@@ -34,6 +34,8 @@ _SECRET_KEYS = frozenset(
     }
 )
 
+SECRET_KEYS = _SECRET_KEYS
+
 
 def mask_uuid(value: str) -> str:
     return f"****{value[-4:]}" if len(value) >= 8 else "***"

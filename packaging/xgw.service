@@ -1,0 +1,24 @@
+# XGW: демон — подписки, применение через API, watchdog, сканы, уведомления.
+[Unit]
+Description=XGW: демон (подписки, watchdog, замена серверов)
+Documentation=https://github.com/1521572-lang/xgw
+After=network.target xgw-net.service xgw-xray.service
+Wants=xgw-net.service xgw-xray.service
+ConditionPathExists=/etc/xgw/config.toml
+
+[Service]
+ExecStart=/usr/local/bin/xgw run
+Restart=always
+RestartSec=5
+RuntimeDirectory=xgw
+RuntimeDirectoryPreserve=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/xgw /var/lib/xgw /run/xgw
+PrivateTmp=true
+NoNewPrivileges=true
+# CAP_NET_ADMIN — nft, ip rule, sysctl сети и метка SO_MARK на прямых запросах;
+# CAP_SETUID и CAP_SETGID — runuser для уведомления на рабочий стол пользователя.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

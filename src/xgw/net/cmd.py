@@ -16,8 +16,14 @@ class CommandError(Exception):
     """Программа не найдена, не уложилась в таймаут или завершилась с ошибкой."""
 
 
-def run(argv: Sequence[str], *, input: str | None = None, timeout: float = 15.0) -> str:
-    """Выполняет команду и возвращает её stdout; ненулевой код — CommandError."""
+def run(
+    argv: Sequence[str], *, input: str | None = None, timeout: float = 15.0, check: bool = True
+) -> str:
+    """Выполняет команду и возвращает её stdout; ненулевой код — CommandError.
+
+    check=False — для программ, которые отвечают кодом возврата (`systemctl
+    is-active`): ненулевой код не ошибка, возвращается их вывод.
+    """
     command = " ".join(argv)
     try:
         proc = subprocess.run(
@@ -29,7 +35,7 @@ def run(argv: Sequence[str], *, input: str | None = None, timeout: float = 15.0)
         raise CommandError(f"{command}: таймаут {timeout:.0f} с") from exc
     except OSError as exc:
         raise CommandError(f"{command}: {exc}") from exc
-    if proc.returncode != 0:
+    if proc.returncode != 0 and check:
         detail = (proc.stderr or proc.stdout).strip() or f"код {proc.returncode}"
         raise CommandError(f"{command}: {detail}")
     return proc.stdout

@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from dataclasses import dataclass
 
 from ..config import Config
+from . import cmd
 
 _IFACE_RE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
@@ -44,6 +46,24 @@ def wan_interface(cfg: Config) -> str:
     """Явно заданный WAN; пусто — «любой интерфейс, кроме LAN»."""
     name = cfg.network.wan_if.strip()
     return name if name and valid_interface(name) else ""
+
+
+def default_route_interface(runner: cmd.Runner = cmd.run) -> str:
+    """Интерфейс маршрута по умолчанию; пусто — маршрута нет или `ip` недоступен."""
+    try:
+        routes = json.loads(runner(["ip", "-j", "route", "show", "default"]) or "[]")
+    except (cmd.CommandError, json.JSONDecodeError):
+        return ""
+    for route in routes if isinstance(routes, list) else []:
+        device = route.get("dev", "") if isinstance(route, dict) else ""
+        if device and valid_interface(device):
+            return device
+    return ""
+
+
+def effective_wan(cfg: Config, runner: cmd.Runner = cmd.run) -> str:
+    """WAN: network.wan_if, а если он пуст — интерфейс маршрута по умолчанию."""
+    return wan_interface(cfg) or default_route_interface(runner)
 
 
 def gateway(cfg: Config) -> ipaddress.IPv4Interface | None:

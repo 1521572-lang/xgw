@@ -101,7 +101,7 @@ def test_dnsmasq_config():
     assert warnings == []
     lines = text.splitlines()
     assert "port=0" in lines  # DNS обслуживает Xray, конфликта с systemd-resolved нет
-    assert "interface=enp3s0" in lines and "bind-interfaces" in lines
+    assert "interface=enp3s0" in lines and "bind-dynamic" in lines
     assert "dhcp-range=192.168.50.100,192.168.50.200,12h" in lines
     assert "dhcp-option=option:router,192.168.50.1" in lines
     assert "dhcp-option=option:dns-server,192.168.50.1" in lines

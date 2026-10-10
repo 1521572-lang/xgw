@@ -104,6 +104,35 @@ class Paths:
     def xray_bin(self) -> Path:
         return self.xray_dir / ("xray.exe" if os.name == "nt" else "xray")
 
+    # --- установка (этап 4) -------------------------------------------------------
+
+    @property
+    def lib_dir(self) -> Path:
+        """Код XGW: /opt/xgw/lib/xgw."""
+        return self.opt / "lib"
+
+    @property
+    def launcher(self) -> Path:
+        return self.root / "usr" / "local" / "bin" / "xgw"
+
+    @property
+    def systemd_dir(self) -> Path:
+        return self.root / "etc" / "systemd" / "system"
+
+    @property
+    def sysctl_file(self) -> Path:
+        return self.root / "etc" / "sysctl.d" / "90-xgw.conf"
+
+    @property
+    def journal_file(self) -> Path:
+        """Что установка изменила в системе и что было до неё — по нему работает uninstall."""
+        return self.backup_dir / "install.json"
+
+    @property
+    def status_token_file(self) -> Path:
+        """Токен страницы статуса, если он не задан в config.toml."""
+        return self.var / "status-token"
+
     def ensure(self) -> None:
         for directory in (
             self.etc,

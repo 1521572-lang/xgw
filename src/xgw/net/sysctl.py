@@ -2,12 +2,15 @@
 
 Форвардинг нужен только для устройств в обход VPN, ICMP и режима «перехват
 снят»: трафик через TPROXY доставляется локально. Значения меняются записью в
-/proc/sys; постоянный файл /etc/sysctl.d/90-xgw.conf ставит установка (этап 4).
+/proc/sys; постоянный файл /etc/sysctl.d/90-xgw.conf ставит `xgw install`.
 """
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
+
+from ..paths import Paths, atomic_write_text
 
 PROC_SYS = Path("/proc/sys")
 IP_FORWARD = "net/ipv4/ip_forward"
@@ -30,3 +33,27 @@ def read(key: str, root: Path = PROC_SYS) -> str | None:
 
 def write(key: str, value: str, root: Path = PROC_SYS) -> None:
     (root / key).write_text(f"{value}\n", encoding="ascii")
+
+
+def install(paths: Paths, root: Path = PROC_SYS) -> dict[str, str]:
+    """Ставит 90-xgw.conf и применяет значения. Возвращает прежние — для журнала."""
+    previous: dict[str, str] = {}
+    for name in SETTINGS:
+        value = read(name.replace(".", "/"), root)
+        if value is not None:
+            previous[name] = value
+    atomic_write_text(paths.sysctl_file, file_text(), mode=0o644)
+    for name, value in SETTINGS.items():
+        # Ключа может не быть: IPv6 выключен в ядре целиком.
+        with contextlib.suppress(OSError):
+            write(name.replace(".", "/"), value, root)
+    return previous
+
+
+def restore(previous: dict[str, str], paths: Paths, root: Path = PROC_SYS) -> None:
+    """Убирает 90-xgw.conf и возвращает значения, которые были до установки."""
+    paths.sysctl_file.unlink(missing_ok=True)
+    for name, value in previous.items():
+        if name in SETTINGS:
+            with contextlib.suppress(OSError):
+                write(name.replace(".", "/"), value, root)

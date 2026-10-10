@@ -672,3 +672,41 @@ def test_leak_reloads_rules_only_when_own_traffic_is_captured(guarded):
     daemon.t += 400
     assert daemon.tick() is State.HEALTHY
     assert capture.calls == ["up"]
+
+
+# --- уведомления и перечитывание конфига (этап 4) ---
+
+
+def test_state_change_reaches_the_sinks_once_per_kind(tmp_path, monkeypatch):
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.filters.exclude_regex = ""
+    cfg.dns.bootstrap = []
+    sent: list[tuple[str, str]] = []
+    instance = Harness(cfg, paths, sinks=[lambda kind, text: sent.append((kind, text))])
+    try:
+        _started(instance)
+        assert sent == []  # в HEALTHY уведомлять не о чем
+        instance.observatory, instance.api.down = None, True
+        assert instance.tick() is State.XRAY_DOWN
+        assert [kind for kind, _ in sent] == ["XRAY_DOWN"]
+        assert "HEALTHY → XRAY_DOWN" in sent[0][1]
+        instance.tick()
+        assert len([kind for kind, _ in sent if kind == "XRAY_DOWN"]) == 1
+    finally:
+        instance.store.close()
+
+
+def test_run_returns_when_the_config_file_changes(daemon):
+    import threading
+
+    stop = threading.Event()
+    ticks: list[int] = []
+    daemon.tick = lambda: ticks.append(1) or State.HEALTHY
+    daemon.cfg.watchdog.interval_s = 0
+    daemon.store = type("Closed", (), {"close": lambda self: ticks.append(-1)})()
+    daemon.run(stop, changed=lambda: len(ticks) >= 2)
+    assert ticks == [1, 1, -1] and not stop.is_set()

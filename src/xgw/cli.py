@@ -3,16 +3,19 @@
 Этап 1: generate — подписки/ссылки → конфиг Xray + xray run -test.
 Этап 2: apply, status, servers, probe, pin/unpin и run (демон xgw.service).
 Этап 3: enable, disable и net — перехват трафика (nftables, ip rule).
-Команды установки (install/uninstall, diag, update-xray, logs) — этап 4.
+Этап 4: install, uninstall, diag, update-xray и logs — установка на машину.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
+import shutil
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -21,7 +24,7 @@ from pathlib import Path
 from . import __version__, config, engine, log
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
-from .net import dnsmasq, nft
+from .net import cmd, dnsmasq, nft
 from .net.capture import Capture, CaptureError
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
@@ -30,6 +33,8 @@ from .xraycore import binary, metrics
 from .xraycore.api import ApiError
 
 MAX_PIN_SECONDS = 24 * 3600
+# Команды, которые работают и без читаемого config.toml.
+NO_CONFIG = frozenset({"install", "uninstall", "diag", "logs"})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,19 +101,56 @@ def main(argv: list[str] | None = None) -> int:
     run = subparsers.add_parser("run", parents=[common], help="демон XGW (служба xgw.service)")
     run.add_argument("--once", action="store_true", help="выполнить один шаг watchdog и выйти")
 
+    install = subparsers.add_parser(
+        "install", parents=[common],
+        help="установить XGW на эту машину: службы, сеть, Xray (покажет план и спросит)",
+    )
+    install.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждения")
+    install.add_argument(
+        "--force", action="store_true", help="продолжить, даже если проверки дали FAIL"
+    )
+    uninstall = subparsers.add_parser(
+        "uninstall", parents=[common], help="удалить XGW и вернуть сеть в исходное состояние"
+    )
+    uninstall.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждения")
+    uninstall.add_argument(
+        "--purge", action="store_true", help="удалить и /etc/xgw вместе с config.toml"
+    )
+    diag = subparsers.add_parser(
+        "diag", parents=[common], help="проверить машину: OK, WARN или FAIL с советом"
+    )
+    diag.add_argument("--json", action="store_true", help="вывести JSON")
+    diag.add_argument(
+        "--no-net", action="store_true", help="без запросов наружу (probe.url, bootstrap DNS)"
+    )
+    subparsers.add_parser(
+        "update-xray", parents=[common],
+        help="обновить Xray с проверкой SHA-256 и xray run -test",
+    )
+    logs = subparsers.add_parser("logs", parents=[common], help="журнал служб XGW")
+    logs.add_argument("-n", "--lines", type=int, default=200, help="сколько строк показать")
+    logs.add_argument("-f", "--follow", action="store_true", help="следить за журналом")
+    logs.add_argument("--export", action="store_true", help="собрать архив без секретов")
+    logs.add_argument("--out", default=None, help="куда записать архив (с --export)")
+
     args = parser.parse_args(argv)
     log.setup()
     paths = Paths.from_env()
     config_path = Path(args.config) if args.config else paths.config_file
+    args.config_path, args.config_error = config_path, ""
     try:
         cfg, warnings = config.load(config_path)
     except config.ConfigError as exc:
-        print(f"ошибка: {exc}", file=sys.stderr)
-        return 2
+        if args.command not in NO_CONFIG:
+            print(f"ошибка: {exc}", file=sys.stderr)
+            return 2
+        cfg, warnings, args.config_error = config.Config(), [], str(exc)
+    args.config_warnings = warnings
     logger = log.get_logger(args.command)
     log.add_secrets(engine.config_secrets(cfg))
-    for warning in warnings:
-        logger.warning("%s", warning)
+    if args.command != "diag":  # diag показывает их сам, среди проверок
+        for warning in warnings:
+            logger.warning("%s", warning)
 
     handler = {
         "generate": _cmd_generate,
@@ -122,6 +164,11 @@ def main(argv: list[str] | None = None) -> int:
         "disable": _cmd_disable,
         "net": _cmd_net,
         "run": _cmd_run,
+        "install": _cmd_install,
+        "uninstall": _cmd_uninstall,
+        "diag": _cmd_diag,
+        "update-xray": _cmd_update_xray,
+        "logs": _cmd_logs,
     }[args.command]
     try:
         return handler(args, cfg, paths, logger)
@@ -205,7 +252,32 @@ def _cmd_apply(args, cfg: config.Config, paths: Paths, logger) -> int:
     print(engine.describe(outcome))
     if outcome.mode == "restart_deferred":
         print("чтобы применить сейчас (соединения оборвутся): xgw apply --now")
+    _sync_network(cfg, paths, logger)
     return 0 if outcome.mode in ("api", "restart", "unchanged", "restart_deferred") else 1
+
+
+def _sync_network(cfg: config.Config, paths: Paths, logger) -> None:
+    """На установленном шлюзе `xgw apply` доводит до конфига и сеть: правила
+    nftables (bypass_hosts, exclude_cidrs) и DHCP (dhcp_range, static_leases)."""
+    if _root_problem() or not paths.journal_file.exists():
+        return
+    capture = Capture(cfg, paths, logger=logger)
+    if capture.configured:
+        try:
+            capture.up()
+        except CaptureError as exc:
+            print(f"внимание: правила сети не обновлены: {exc}", file=sys.stderr)
+    if not capture.lan_if:
+        return
+    changed, warnings = dnsmasq.write_conf(cfg, paths)
+    for warning in warnings:
+        logger.warning("%s", warning)
+    if changed:
+        try:
+            cmd.run(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0)
+            print("dnsmasq: настройки DHCP обновлены")
+        except cmd.CommandError as exc:
+            print(f"внимание: dnsmasq не перезапущен: {exc}", file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -218,12 +290,12 @@ def _store(paths: Paths):
 
 
 def _active_pin(paths: Paths) -> dict | None:
-    with _store(paths) as store:
-        raw = store.get_meta("pin")
     try:
+        with _store(paths) as store:
+            raw = store.get_meta("pin")
         pin = json.loads(raw or "null")
-    except json.JSONDecodeError:
-        return None
+    except (json.JSONDecodeError, OSError, sqlite3.Error):
+        return None  # нет доступа к состоянию (запуск без root) — статус покажем и так
     if isinstance(pin, dict) and pin.get("tag") and pin.get("until", 0) > time.time():
         return pin
     return None
@@ -479,26 +551,180 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
 # --- run -----------------------------------------------------------------------
 
 
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .daemon import Daemon
+    from .watch import notify
+    from .watch.status_page import StatusPage
 
     xray_bin = _require_xray(paths)
     if xray_bin is None:
         return 1
     paths.ensure()
-    capture = Capture(cfg, paths)
-    if not capture.configured or _root_problem():
-        capture = None  # следить не за чем либо нечем: правила меняет только root
-    daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture)
-    if args.once:
-        print(daemon.tick())
-        daemon.store.close()
-        return 0
     stop = threading.Event()
     for name in ("SIGTERM", "SIGINT"):
         with contextlib.suppress(ValueError, AttributeError):  # не главный поток / нет сигнала
             signal.signal(getattr(signal, name), lambda *_args: stop.set())
-    daemon.run(stop)
+
+    reloaded = False
+    while True:
+        stamp = _mtime(args.config_path)
+        capture = Capture(cfg, paths)
+        if not capture.configured or _root_problem():
+            capture = None  # следить не за чем либо нечем: правила меняет только root
+        elif reloaded:
+            # Настройки изменились — правила (обход, исключения) загружаются заново.
+            try:
+                capture.up()
+            except CaptureError as exc:
+                logger.error("правила сети не обновлены: %s", exc)
+        sinks = notify.build_sinks(cfg, mark=engine.bypass_mark(cfg, logger))
+        daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture, sinks=sinks)
+        if args.once:
+            print(daemon.tick())
+            daemon.store.close()
+            return 0
+        page = None
+        try:
+            page = StatusPage.from_config(cfg, paths)
+            if page is not None:
+                page.start()
+        except OSError as exc:
+            logger.error("страница статуса не запущена: %s", exc)
+            page = None
+        try:
+            daemon.run(stop, changed=lambda stamp=stamp: _mtime(args.config_path) != stamp)
+        finally:
+            if page is not None:
+                page.stop()
+        if stop.is_set():
+            return 0
+        # config.toml изменён: перечитываем, не перезапуская процесс. Иначе демон
+        # при следующем обновлении подписки вернул бы ядро к прежним настройкам.
+        try:
+            cfg, warnings = config.load(args.config_path)
+        except config.ConfigError as exc:
+            logger.error("%s — работаю с прежними настройками", exc)
+            continue
+        log.add_secrets(engine.config_secrets(cfg))
+        for warning in warnings:
+            logger.warning("%s", warning)
+        logger.info("настройки перечитаны из %s", args.config_path)
+        reloaded = True
+
+
+# --- install / uninstall / diag / update-xray / logs ----------------------------
+
+
+def _system_root_problem(paths: Paths) -> str | None:
+    """Для команд, меняющих систему. С XGW_ROOT (тесты) root не нужен."""
+    return _root_problem() if paths.root == Path("/") else None
+
+
+def _run_diag(args, cfg: config.Config, paths: Paths, logger, *, net: bool = True) -> list:
+    from .diag import Diag
+
+    return Diag(
+        cfg, paths, logger=logger, net=net,
+        config_error=args.config_error, config_warnings=args.config_warnings,
+    ).run()
+
+
+def _cmd_diag(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from . import diag
+
+    checks = _run_diag(args, cfg, paths, logger, net=not args.no_net)
+    if args.json:
+        print(json.dumps([dataclasses.asdict(check) for check in checks],
+                         ensure_ascii=False, indent=2))
+    else:
+        print(diag.render(checks))
+    return 1 if any(check.level == diag.FAIL for check in checks) else 0
+
+
+def _cmd_install(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from . import diag
+    from .install import SOURCE_ROOT, Installer
+
+    problem = _root_problem()
+    if problem:
+        return _fail(problem)
+    if args.config:
+        return _fail(f"установка читает только {paths.config_file} — положите конфиг туда", 2)
+    if args.config_error:
+        if paths.config_file.exists():
+            return _fail(args.config_error, 2)
+        example = SOURCE_ROOT / "config.example.toml"
+        try:
+            paths.etc.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(example, paths.config_file)
+            os.chmod(paths.config_file, 0o600)
+        except OSError as exc:
+            return _fail(f"не удалось создать {paths.config_file} из {example}: {exc}")
+        print(
+            f"Создан {paths.config_file} (права 0600) из примера.\n"
+            "Впишите в него подписку ([[subscriptions]], поле url), а если Wi-Fi-роутер "
+            "подключён ко второй сетевой карте — её имя в network.lan_if.\n"
+            "Затем запустите установку ещё раз: sudo xgw install"
+        )
+        return 1
+    checks = _run_diag(args, cfg, paths, logger)
+    print(diag.render(checks))
+    print()
+    return Installer(cfg, paths, logger=logger, checks=lambda: checks).run(
+        assume_yes=args.yes, force=args.force
+    )
+
+
+def _cmd_uninstall(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from .install import default_ask
+    from .uninstall import Uninstaller
+
+    problem = _root_problem()
+    if problem:
+        return _fail(problem)
+    if not args.yes and not default_ask(
+        "Удалить XGW и вернуть сеть в состояние до установки?"
+    ):
+        print("Отменено.")
+        return 1
+    return Uninstaller(None if args.config_error else cfg, paths, logger=logger).run(
+        purge=args.purge
+    )
+
+
+def _cmd_update_xray(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from .xraycore.update import update_xray
+
+    problem = _system_root_problem(paths)
+    if problem:
+        return _fail(problem)
+    return update_xray(cfg, paths, logger=logger)
+
+
+def _cmd_logs(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from . import diag, logs
+
+    if not args.export:
+        return logs.show(max(1, args.lines), args.follow)
+    out_path = Path(args.out) if args.out else (
+        Path.cwd() / time.strftime("xgw-logs-%Y%m%d-%H%M%S.tar.gz")
+    )
+    try:
+        names = logs.export(
+            None if args.config_error else cfg, paths, out_path, config_path=args.config_path,
+            diag_text=lambda: diag.render(_run_diag(args, cfg, paths, logger, net=False)),
+        )
+    except OSError as exc:
+        return _fail(f"архив не записан: {exc}")
+    print(f"архив без секретов: {out_path}")
+    print("в нём: " + ", ".join(names))
     return 0
 
 

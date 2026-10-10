@@ -20,7 +20,7 @@ class FakeKernel:
         self.refuse: str | None = None  # подстрока команды, которая «не выполняется»
         self.forbidden = False  # запуск не от root: nft ничего не показывает
 
-    def __call__(self, argv, *, input=None, timeout=15.0) -> str:
+    def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         argv = list(argv)
         self.calls.append(tuple(argv))
         command = " ".join(argv)
