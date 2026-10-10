@@ -103,8 +103,9 @@ python3 -m venv .venv
   (используйте только после осознанного изменения генератора).
 - Скачивание Xray для локальной проверки: см. `xgw.xraycore.binary`
   (`download_release`), кладётся в `tools/xray` (gitignored).
-- Тесты на живом Xray (синтаксис `xray api`): `XGW_XRAY_BIN=<путь> pytest
-  tests/test_api_integration.py`; без переменной они пропускаются.
+- Тесты на живом Xray — синтаксис `xray api` (`tests/test_api_integration.py`) и
+  применение конфига генератор → Applier → ядро (`tests/test_apply_live.py`):
+  `XGW_XRAY_BIN=<путь к xray> pytest tests/ -q`; без переменной они пропускаются.
 - Тесты https-проб через CONNECT выпускают временный самоподписанный сертификат
   командой `openssl`; без неё пропускаются.
 - Стенд на network namespaces (раздел 9 ТЗ) требует Linux и root — в репозитории
