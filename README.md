@@ -44,14 +44,24 @@ adrules` — Xray не умеет перечитывать конфиг), сле
 
 | Этап | Содержание | Статус |
 |---|---|---|
-| 1 | Конфиг, подписки, парсеры ссылок, генератор, загрузка Xray, `xgw generate`, `xray run -test` | ✅ готов |
-| 2 | API (ado/rmo/adi/rmi/adrules/bi), diff, применение без разрыва, метрики, watchdog-состояния, скан запасных, замена участников | ✅ код и тесты (включая живые API-тесты); стендовые проверки — на Linux-машине |
-| 3 | nftables/TPROXY, dnsmasq, перехват DNS, fail-closed, enable/disable, стенд | план |
-| 4 | install/uninstall, systemd, NetworkManager, сон, ufw, diag, уведомления, страница статуса | план |
+| 1 | Конфиг, подписки (кэш, квота), парсеры ссылок, генератор, загрузка Xray, `xgw generate`, `xray run -test` | ✅ готов (юнит-тесты; `xray run -test` — при наличии бинарника) |
+| 2 | API (ado/rmo/adi/rmi/adrules/bi), diff, применение без разрыва, метрики, watchdog-состояния, скан запасных, замена участников | ⚠️ частично: библиотечные модули и юнит-тесты. **DoD этапа не выполнен** — см. ниже |
+| 3 | nftables/TPROXY, dnsmasq, перехват DNS, fail-closed, enable/disable, стенд | не начат |
+| 4 | install/uninstall, systemd, NetworkManager, сон, ufw, diag, уведомления, страница статуса | не начат |
 | 5 | IPv6, TUN-inbound, Telegram-бот, правила per-device | опционально |
+
+Чего на этапе 2 ещё нет (поэтому он не считается готовым по разделу 10 ТЗ):
+
+- **стенда на network namespaces** (`tests/stand/`): переключение с «замороженного»
+  узла, применение без разрыва и замена участников на живом Xray не проверены;
+- **демона** (`xgw.service`): нет цикла, который раз в `interval_s` собирает сигналы,
+  ведёт машину состояний, запускает сканы и ротацию — есть только сами функции;
+- **команд CLI**, кроме `generate`: `apply`, `status`, `servers`, `probe`, `pin`/`unpin`;
+- уведомлений, `/run/xgw/status.json` и расчёта суточного трафика проб.
 
 Сеть хоста не меняется до прохождения стенда из раздела 9 ТЗ (network
 namespaces); изменения сети — только командами XGW с проверкой и откатом.
+В нынешнем виде XGW на шлюз ставить нельзя: перехвата трафика в нём ещё нет.
 
 ## Требования
 
@@ -73,7 +83,7 @@ sudo xgw install     # проверки diag, пакеты, профиль LAN, 
 
 1. Переведите роутер в режим точки доступа (Access Point): DHCP на нём выключить.
 2. Кабель из LAN-карты шлюза — в **LAN-порт** роутера.
-3. Wi-Fi devices получают адреса от dnsmasq шлюза (192.168.50.x) и видны
+3. Устройства Wi-Fi получают адреса от dnsmasq шлюза (192.168.50.x) и видны
    шлюзу по отдельности (bypass_hosts, статика).
 
 Альтернатива — режим `router_mode = "router"`: кабель в WAN-порт роутера,
@@ -93,6 +103,10 @@ python3 -m venv .venv
   (используйте только после осознанного изменения генератора).
 - Скачивание Xray для локальной проверки: см. `xgw.xraycore.binary`
   (`download_release`), кладётся в `tools/xray` (gitignored).
+- Тесты на живом Xray (синтаксис `xray api`): `XGW_XRAY_BIN=<путь> pytest
+  tests/test_api_integration.py`; без переменной они пропускаются.
+- Тесты https-проб через CONNECT выпускают временный самоподписанный сертификат
+  командой `openssl`; без неё пропускаются.
 - Стенд на network namespaces (раздел 9 ТЗ) требует Linux и root — в репозитории
   появится в `tests/stand/`; без root тесты пропускаются.
 
@@ -103,6 +117,21 @@ xgw generate --config config.example.toml --out /tmp/config.json
 xray run -test -c /tmp/config.json
 ```
 
+Без `--out` результат пишется в `/etc/xgw/xray/config.generated.json` — рядом с
+рабочим `config.json`, но не поверх него: рабочий конфиг меняет только
+применение (`xgw apply`, этап 2), с проверкой, last-good и откатом.
+
+Что делает `generate` помимо сборки:
+
+- подписку запрашивает через http-in работающего Xray, а если он не отвечает —
+  напрямую, сокетом с меткой `mark_bypass` и собственным резолвером (`dns.bootstrap`);
+- ответ без серверов (страница ошибки, пустое тело) считает сбоем и берёт
+  последнюю удачную версию из `/var/lib/xgw/cache`;
+- сохраняет состав участников, порты и пароль probe-inbounds из применённого
+  конфига — новый сервер в подписке становится запасным, а не перетасовывает балансировщик;
+- сервер, конфиг которого установленный Xray не принимает (снятый транспорт,
+  неизвестный шифр), отбрасывает с предупреждением и собирает конфиг без него.
+
 ## Структура
 
 ```
@@ -110,12 +139,15 @@ src/xgw/
   cli.py config.py paths.py log.py masking.py model.py store.py
   fetch.py marknet.py            # HTTP- и DoH-клиент с SO_MARK
   parsers/    common.py vless.py vmess.py trojan.py ss.py hysteria2.py xray_json.py
-  xraycore/   binary.py (api.py metrics.py service.py — этап 2)
-  generator/  builder.py validate.py (diff.py — этап 2)
-  apply/ applier.py rotation.py (этап 2)   net/ nft.py … (этап 3)
-  watch/ checks.py states.py … (этап 2)    diag.py install.py uninstall.py (этап 4)
-tests/       fixtures/ golden/ test_parsers.py test_generator.py …
+  xraycore/   binary.py api.py metrics.py service.py
+  generator/  builder.py validate.py diff.py
+  apply/      applier.py rotation.py
+  watch/      checks.py states.py scan.py      # notify.py status_page.py — этап 4
+tests/        fixtures/golden/ test_*.py
 ```
+
+Ещё не созданы: `net/` (nft, iprule, nm, dnsmasq, sysctl, sleep, ufw — этап 3),
+`diag.py`, `install.py`, `uninstall.py`, `packaging/` (этап 4), `tests/stand/`.
 
 ## Безопасность
 
@@ -137,6 +169,11 @@ tests/       fixtures/ golden/ test_parsers.py test_generator.py …
 - **hysteria2-ссылки пропускаются с предупреждением** — поля
   hysteria2-outbound не описаны в документации; включается после проверки
   установленной версии (см. ASSUMPTIONS.md).
+- **ss-ссылки с плагином (simple-obfs, v2ray-plugin) пропускаются** — у
+  shadowsocks-outbound Xray-core плагинов нет.
+- **«установлен Xray X, нужен не ниже 25.7.23»** — старый бинарник конфиг
+  примет, но проверять серверы будет HEAD-запросом и «заморозку» не увидит;
+  поэтому XGW отказывается с ним работать.
 
 ## Удаление
 
