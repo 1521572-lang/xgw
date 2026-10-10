@@ -264,6 +264,18 @@ def test_no_tproxy_inbound_when_capture_is_off():
     assert result.config["inbounds"][0]["tag"] == "tproxy-in"
 
 
+def test_tproxy_inbound_accepts_udp():
+    """UDP у inbound tunnel включает поле network: Xray 26.3.27 не знает
+    allowedNetwork и молча его игнорирует — без network перехватывался бы только
+    TCP, а обычный DNS и QUIC устройств терялись бы (найдено на стенде)."""
+    cfg = Config()
+    tproxy = build(cfg, select_nodes([_node("11112222", "A")], cfg), hosts={}).config["inbounds"][0]
+    assert tproxy["settings"]["network"] == "tcp,udp"
+    assert tproxy["settings"]["followRedirect"] is True
+    assert tproxy["listen"] == "127.0.0.1"  # из LAN порт не виден
+    assert tproxy["streamSettings"]["sockopt"] == {"tproxy": "tproxy"}
+
+
 def test_dns_servers_with_custom_port():
     """Порт не 53 Xray принимает только объектом {"address", "port"}."""
     cfg = Config()

@@ -47,6 +47,7 @@ RESCAN_PAUSE = 60.0  # внеочередной скан запасных — н
 SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок после неудачи
 PROVIDER_DNS_TTL = 600.0
 ROLLBACK_AFTER = 2  # «после двух неудач — откат на last-good»
+FAIL_OPEN_AFTER = 60.0  # fail_mode = "open": Xray недоступен дольше — снять перехват
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -62,6 +63,7 @@ class Daemon:
         *,
         xray_bin: Path,
         logger=None,
+        capture=None,
         capture_active=lambda: False,
         reapply_capture=lambda: None,
         clock=time.monotonic,
@@ -71,9 +73,19 @@ class Daemon:
         self.paths = paths
         self.xray_bin = xray_bin
         self.log = logger or log.get_logger("daemon")
-        # Перехват появляется на этапе 3: до тех пор утечку проверять не на чем.
+        # capture — управление перехватом (net.capture.Capture); None — перехвата нет
+        # (стенд этапа 2, запуск не от root): тогда и утечку проверять не на чем.
+        self.capture = capture
+        if capture is not None:
+            # Утечку ищет обычный сокет самой машины, поэтому проверка имеет смысл,
+            # только когда перехватывается и её трафик (capture.local).
+            capture_active = lambda: capture.mode() == "on" and cfg.capture.local  # noqa: E731
+            reapply_capture = capture.up
         self.capture_active = capture_active
         self.reapply_capture = reapply_capture
+        self.capture_info: dict | None = None
+        self._capture_error = ""
+        self.xray_down_since: float | None = None
         self.clock = clock
         self.wall = wall
 
@@ -157,6 +169,7 @@ class Daemon:
             self.rolled_back = False
         if state is State.LEAK:
             self._handle_leak()
+        self._guard_capture(signals.xray_ok, now)
 
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
@@ -318,6 +331,53 @@ class Daemon:
             "leak", f"выход в {self.cfg.routing.home_country} при включённом перехвате",
             notify=True,
         )
+
+    def _guard_capture(self, xray_ok: bool, now: float) -> None:
+        """Следит за правилами перехвата: возвращает пропавшие, а при
+        fail_mode = "open" снимает перехват, пока Xray недоступен дольше минуты."""
+        capture = self.capture
+        if capture is None:
+            return
+        if xray_ok:
+            self.xray_down_since = None
+        elif self.xray_down_since is None:
+            self.xray_down_since = now
+        try:
+            mode = capture.mode()
+            if self.cfg.capture.fail_mode == "open":
+                down_for = now - self.xray_down_since if self.xray_down_since is not None else 0.0
+                if mode == "on" and down_for >= FAIL_OPEN_AFTER:
+                    mode = capture.open()
+                    self.notifier.event(
+                        "capture",
+                        "Xray недоступен дольше минуты — перехват временно снят "
+                        "(fail_mode = open), трафик идёт напрямую",
+                        notify=True,
+                    )
+                elif mode == "open" and xray_ok:
+                    mode = capture.close()
+                    self.notifier.event(
+                        "capture", "Xray снова отвечает — перехват возвращён", notify=True
+                    )
+            elif mode == "open":
+                mode = capture.close()  # fail_mode сменили на closed, а метка осталась
+            loaded = capture.loaded()
+            if loaded is False:
+                # Правила пропали (чужой flush ruleset, перезапуск nftables) или ещё не
+                # загружались: без них трафик пошёл бы мимо VPN.
+                capture.up()
+                loaded = capture.loaded()
+                self.notifier.event(
+                    "capture", "правила сети не были загружены — загружены заново", notify=True
+                )
+            self.capture_info = {**capture.describe(check=False), "loaded": loaded}
+            self._capture_error = ""
+        except Exception as exc:  # сбой сети не должен ронять шаг watchdog
+            text = f"правила перехвата не загружены: {exc}"
+            self.log.error("%s", text)
+            if text != self._capture_error:  # одно событие на причину, а не на каждый шаг
+                self._capture_error = text
+                self.notifier.event("capture", text, notify=True)
 
     def _apply_pending(self, urgent: bool) -> bool:
         """Конфиг, ждущий перезапуска: в окне restart_window либо срочно."""
@@ -520,6 +580,7 @@ class Daemon:
             observatory=observatory, xray_ok=xray_ok, state=str(state),
             action=self.action, since=self.state_since,
             dead_since=self.dead_since, xray_version=self.xray_version, daemon=True,
+            capture=self.capture_info,
         )
         warnings = tuple(snapshot["budget"]["warnings"])
         if warnings != self._budget_warnings:

@@ -58,6 +58,7 @@
       "listen": "127.0.0.1",
       "port": 12345,
       "settings": {
+        "network": "tcp,udp",
         "allowedNetwork": "tcp,udp",
         "followRedirect": true
       },

@@ -86,6 +86,7 @@ def collect_status(
     selecting: tuple[str, ...] = (),
     xray_version: str = "",
     daemon: bool = False,
+    capture: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны."""
     now = time.time()
@@ -145,6 +146,7 @@ def collect_status(
         "action": action,
         "since": since,
         "xray": {"ok": xray_ok, "version": xray_version},
+        "capture": capture,
         "members": members,
         "spares": spares,
         "selecting": list(selecting),
@@ -238,6 +240,29 @@ def render_servers(status: dict) -> str:
     return "\n".join(lines)
 
 
+def render_capture(capture: dict) -> str:
+    """Строка о перехвате: что через Xray, что мимо, загружены ли правила."""
+    mode = capture.get("mode")
+    if mode == "none":
+        return "Перехват: выключен в конфиге — XGW только управляет Xray"
+    if mode == "off":
+        return "Перехват: СНЯТ (xgw disable) — трафик идёт напрямую, мимо VPN"
+    if mode == "open":
+        return (
+            "Перехват: ВРЕМЕННО СНЯТ — Xray недоступен, fail_mode = open; "
+            "трафик идёт напрямую, мимо VPN"
+        )
+    scope = [f"сеть {capture['lan_if']}"] if capture.get("lan") else []
+    if capture.get("local"):
+        scope.append("эта машина")
+    text = "Перехват: включён — " + " и ".join(scope)
+    if capture.get("bypass"):
+        text += "; мимо VPN: " + ", ".join(capture["bypass"])
+    if capture.get("loaded") is False:
+        text += " — ПРАВИЛА НЕ ЗАГРУЖЕНЫ (sudo xgw enable)"
+    return text
+
+
 def render_status(status: dict) -> str:
     lines: list[str] = []
     if status.get("daemon") and status.get("state"):
@@ -249,6 +274,8 @@ def render_status(status: dict) -> str:
     xray = status.get("xray") or {}
     version = f" {xray['version']}" if xray.get("version") else ""
     lines.append(f"Xray{version}: " + ("отвечает" if xray.get("ok") else "НЕ ОТВЕЧАЕТ"))
+    if status.get("capture"):
+        lines.append(render_capture(status["capture"]))
     pin = status.get("pin")
     if pin:
         lines.append(

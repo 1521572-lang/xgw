@@ -5,6 +5,7 @@ import time
 
 import links
 import pytest
+from fakenet import FakeKernel
 
 from xgw import cli, engine
 from xgw.apply.applier import ApplyOutcome
@@ -72,11 +73,25 @@ def gateway(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.metrics, "fetch_metrics", no_metrics)
 
+    # Сеть: вместо nft и ip — подменённое ядро, вместо /proc/sys — каталог теста.
+    kernel = FakeKernel()
+    proc = tmp_path / "proc"
+    (proc / "net/ipv4").mkdir(parents=True)
+    (proc / "net/ipv4/ip_forward").write_text("0\n")
+    real_capture = cli.Capture
+    monkeypatch.setattr(
+        cli, "Capture",
+        lambda cfg, paths, **kwargs: real_capture(
+            cfg, paths, runner=kernel, proc_sys=proc, time_uids=(), **kwargs
+        ),
+    )
+
     class Gateway:
         pass
 
     gw = Gateway()
     gw.config, gw.paths, gw.api, gw.applier, gw.tmp = config, paths, api, applier, tmp_path
+    gw.kernel = kernel
     gw.run = lambda *args: main([*args, "--config", str(config)])
     gw.applied = lambda: json.loads(paths.xray_config_file.read_text(encoding="utf-8"))
     gw.tags = lambda role: [o["tag"] for o in gw.applied()["outbounds"]
@@ -328,6 +343,120 @@ def test_pin_api_error(gateway, capsys):
     store.close()
 
 
+# --- enable / disable / net ----------------------------------------------------
+
+
+@pytest.fixture()
+def network(gateway, monkeypatch):
+    """Шлюз с LAN-картой; команда запущена от root, Xray отвечает."""
+    text = gateway.config.read_text(encoding="utf-8")
+    gateway.config.write_text(text + '[network]\nlan_if = "lan0"\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli.engine, "healthy_http_in", lambda _cfg: ("127.0.0.1", 10809))
+    return gateway
+
+
+def test_enable_and_disable(network, capsys):
+    assert network.run("enable") == 0
+    out = capsys.readouterr().out
+    assert "перехват включён: сеть lan0 и эта машина — через Xray" in out
+    assert "внимание" not in out
+    assert "tproxy to 127.0.0.1:12345" in network.kernel.table and network.kernel.rules
+
+    assert network.run("disable") == 0
+    out = capsys.readouterr().out
+    assert "перехват снят: трафик идёт напрямую" in out and "роутером для сети lan0" in out
+    assert "sudo xgw enable" in out  # как вернуть
+    assert "tproxy" not in network.kernel.table and "masquerade" in network.kernel.table
+    assert network.kernel.rules == []
+    store = Store(network.paths.db_file)
+    assert [event["kind"] for event in store.recent_events()].count("capture") == 2
+    store.close()
+
+
+def test_enable_warns_when_xray_is_down(network, monkeypatch, capsys):
+    monkeypatch.setattr(cli.engine, "healthy_http_in", lambda _cfg: None)
+    assert network.run("enable") == 0
+    out = capsys.readouterr().out
+    # fail-closed: без Xray интернета не будет — команда говорит об этом сразу.
+    assert "внимание: Xray не отвечает" in out and "sudo xgw disable" in out
+
+
+def test_network_commands_need_root(network, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    for command in (("enable",), ("disable",), ("net", "up"), ("net", "down")):
+        assert network.run(*command) == 1
+        assert "root" in capsys.readouterr().err
+    assert network.kernel.calls == []
+
+
+def test_enable_with_nothing_to_capture(network, capsys):
+    text = network.config.read_text(encoding="utf-8")
+    network.config.write_text(text + "[capture]\nlan = false\nlocal = false\n", encoding="utf-8")
+    assert network.run("enable") == 2
+    assert "нечего перехватывать" in capsys.readouterr().err
+    assert network.kernel.calls == []
+
+
+def test_enable_failure_is_reported(network, capsys):
+    network.kernel.refuse = "nft -c"
+    assert network.run("enable") == 1
+    assert "перехват не включён" in capsys.readouterr().err
+    assert network.kernel.table == ""
+
+
+def test_net_show_works_without_root(network, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root")
+    assert network.run("net", "show") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("table ip xgw\ndelete table ip xgw\n") and "table ip6 xgw6 {" in out
+    assert network.run("net", "show", "dnsmasq") == 0
+    out = capsys.readouterr().out
+    assert "port=0" in out and "interface=lan0" in out
+    assert network.kernel.calls == []  # показ ничего не трогает
+
+
+def test_net_up_loads_saved_choice_and_down_removes_all(network, capsys):
+    assert network.run("net", "up") == 0  # после перезагрузки: по умолчанию перехват включён
+    assert "Перехват: включён — сеть lan0 и эта машина" in capsys.readouterr().out
+    assert "tproxy" in network.kernel.table
+
+    assert network.run("disable") == 0
+    network.kernel.tables.clear()  # перезагрузка
+    assert network.run("net", "up") == 0
+    assert "СНЯТ" in capsys.readouterr().out
+    assert "tproxy" not in network.kernel.table and "masquerade" in network.kernel.table
+
+    assert network.run("net", "down") == 0
+    assert "убраны" in capsys.readouterr().out
+    assert network.kernel.tables == {} and network.kernel.rules == []
+
+
+def test_status_shows_capture(network, capsys):
+    assert network.run("status") == 0
+    out = capsys.readouterr().out
+    assert "Перехват: включён — сеть lan0 и эта машина" in out
+    assert "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" in out  # включён в настройках, но в ядре правил нет
+
+    network.run("enable")
+    capsys.readouterr()
+    assert network.run("status", "--json") == 0
+    capture = json.loads(capsys.readouterr().out)["capture"]
+    assert capture["mode"] == "on" and capture["loaded"] is True and capture["lan_if"] == "lan0"
+
+    network.run("disable")
+    capsys.readouterr()
+    assert network.run("status") == 0
+    assert "Перехват: СНЯТ (xgw disable)" in capsys.readouterr().out
+
+
+def test_status_without_capture_in_config(gateway, capsys):
+    text = gateway.config.read_text(encoding="utf-8")
+    gateway.config.write_text(text + "[capture]\nlan = false\nlocal = false\n", encoding="utf-8")
+    assert gateway.run("status") == 0
+    assert "Перехват" not in capsys.readouterr().out  # XGW только управляет Xray
+
+
 # --- run -----------------------------------------------------------------------
 
 
@@ -337,7 +466,7 @@ def test_run_once(gateway, monkeypatch, capsys):
     created: list = []
 
     class FakeDaemon:
-        def __init__(self, cfg, paths, *, xray_bin):
+        def __init__(self, cfg, paths, *, xray_bin, capture=None):
             self.store = Store(paths.db_file)
             self.ticks = 0
             created.append(self)

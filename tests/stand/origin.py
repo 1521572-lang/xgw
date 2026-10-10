@@ -132,6 +132,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dns-port", type=int, default=0, help="0 — без DNS-заглушки")
     parser.add_argument("--answer", default="127.0.0.1", help="адрес в ответах DNS")
+    parser.add_argument(
+        "--dns-also", action="append", default=[],
+        help="ещё один адрес DNS-заглушки (можно несколько раз)",
+    )
     parser.add_argument("--country", default="NL", help="значение loc= в /trace")
     args = parser.parse_args()
 
@@ -139,7 +143,8 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), OriginHandler)
     server.daemon_threads = True
     if args.dns_port:
-        serve_dns(args.host, args.dns_port, args.answer)
+        for host in (args.host, *args.dns_also):
+            serve_dns(host, args.dns_port, args.answer)
     print("READY", flush=True)
     server.serve_forever()
 

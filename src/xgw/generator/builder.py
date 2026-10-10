@@ -393,7 +393,14 @@ def build(
                 "protocol": "tunnel",
                 "listen": "127.0.0.1",
                 "port": cfg.capture.tproxy_port,
-                "settings": {"allowedNetwork": "tcp,udp", "followRedirect": True},
+                # UDP включает поле network: Xray 26.3.27 поля allowedNetwork не знает
+                # и молча его игнорирует — без network перехватывался бы только TCP.
+                # allowedNetwork оставлено для версий, где поле переименовано.
+                "settings": {
+                    "network": "tcp,udp",
+                    "allowedNetwork": "tcp,udp",
+                    "followRedirect": True,
+                },
                 "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
                 "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
             }

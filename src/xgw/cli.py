@@ -2,8 +2,8 @@
 
 Этап 1: generate — подписки/ссылки → конфиг Xray + xray run -test.
 Этап 2: apply, status, servers, probe, pin/unpin и run (демон xgw.service).
-Команды сети и установки (enable/disable, install/uninstall, diag, update-xray,
-logs) добавляются на этапах 3–4.
+Этап 3: enable, disable и net — перехват трафика (nftables, ip rule).
+Команды установки (install/uninstall, diag, update-xray, logs) — этап 4.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import signal
 import sys
 import threading
@@ -20,6 +21,8 @@ from pathlib import Path
 from . import __version__, config, engine, log
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
+from .net import dnsmasq, nft
+from .net.capture import Capture, CaptureError
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
 from .watch import scan, status
@@ -74,6 +77,22 @@ def main(argv: list[str] | None = None) -> int:
     pin.add_argument("--ttl", default="10m", help="срок: 30s, 10m, 2h (по умолчанию 10m)")
     subparsers.add_parser("unpin", parents=[common], help="снять ручное закрепление")
 
+    subparsers.add_parser(
+        "enable", parents=[common], help="включить перехват: трафик идёт через Xray"
+    )
+    subparsers.add_parser(
+        "disable", parents=[common], help="снять перехват: сеть работает напрямую"
+    )
+    net = subparsers.add_parser(
+        "net", parents=[common],
+        help="правила сети: загрузить (up, служба xgw-net), убрать (down), показать (show)",
+    )
+    net.add_argument("action", choices=("up", "down", "show"))
+    net.add_argument(
+        "what", nargs="?", choices=("nft", "dnsmasq"), default="nft",
+        help="что показать: правила nftables (по умолчанию) или конфиг dnsmasq",
+    )
+
     run = subparsers.add_parser("run", parents=[common], help="демон XGW (служба xgw.service)")
     run.add_argument("--once", action="store_true", help="выполнить один шаг watchdog и выйти")
 
@@ -99,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         "probe": _cmd_probe,
         "pin": _cmd_pin,
         "unpin": _cmd_unpin,
+        "enable": _cmd_enable,
+        "disable": _cmd_disable,
+        "net": _cmd_net,
         "run": _cmd_run,
     }[args.command]
     try:
@@ -239,9 +261,12 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
             observatory=observatory, xray_ok=observatory is not None,
             xray_version=".".join(map(str, version or ())),
         )
-    # Закрепление и текущий выбор балансировщика — на момент вывода, а не
-    # последнего шага демона.
+    # Закрепление, перехват и текущий выбор балансировщика — на момент вывода, а
+    # не последнего шага демона.
     snapshot["pin"] = _active_pin(paths)
+    capture = Capture(cfg, paths)
+    if capture.configured:
+        snapshot["capture"] = capture.describe()
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is not None and snapshot["xray"]["ok"]:
         with contextlib.suppress(ApiError):
@@ -349,6 +374,108 @@ def _cmd_unpin(args, cfg: config.Config, paths: Paths, logger) -> int:
     return 0
 
 
+# --- enable / disable / net ----------------------------------------------------
+
+
+def _root_problem() -> str | None:
+    """Почему сетью управлять нельзя; None — можно."""
+    if not sys.platform.startswith("linux"):
+        return "управление сетью работает только в Linux"
+    if os.geteuid() != 0:
+        return "нужны права root: sudo xgw …"
+    return None
+
+
+def _scope(info: dict) -> str:
+    parts = [f"сеть {info['lan_if']}"] if info["lan"] else []
+    if info["local"]:
+        parts.append("эта машина")
+    return " и ".join(parts)
+
+
+def _cmd_enable(args, cfg: config.Config, paths: Paths, logger) -> int:
+    problem = _root_problem()
+    if problem:
+        return _fail(problem)
+    capture = Capture(cfg, paths, logger=logger)
+    if not capture.capturing:
+        return _fail(
+            "в конфиге нечего перехватывать: capture.local = false, а для capture.lan "
+            "нужен network.lan_if",
+            2,
+        )
+    paths.ensure()
+    try:
+        capture.enable()
+    except CaptureError as exc:
+        return _fail(f"перехват не включён: {exc}")
+    info = capture.describe(check=False)
+    text = f"перехват включён: {_scope(info)} — через Xray"
+    if info["bypass"]:
+        text += "; мимо VPN: " + ", ".join(info["bypass"])
+    with _store(paths) as store:
+        store.add_event("capture", text)
+    print(text)
+    if engine.healthy_http_in(cfg) is None:
+        print(
+            "внимание: Xray не отвечает — пока он не запущен, перехваченный трафик "
+            "никуда не уходит. Вернуть прямой интернет: sudo xgw disable"
+        )
+    return 0
+
+
+def _cmd_disable(args, cfg: config.Config, paths: Paths, logger) -> int:
+    problem = _root_problem()
+    if problem:
+        return _fail(problem)
+    capture = Capture(cfg, paths, logger=logger)
+    paths.ensure()
+    try:
+        capture.disable()
+    except CaptureError as exc:
+        return _fail(f"перехват не снят: {exc}")
+    text = "перехват снят: трафик идёт напрямую, мимо VPN"
+    if capture.lan_if:
+        text += f"; шлюз остаётся роутером для сети {capture.lan_if}"
+    with _store(paths) as store:
+        store.add_event("capture", text)
+    print(text)
+    print("вернуть перехват: sudo xgw enable")
+    return 0
+
+
+def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
+    capture = Capture(cfg, paths, logger=logger)
+    if args.action == "show":
+        if args.what == "dnsmasq":
+            text, warnings = dnsmasq.render(cfg)
+            for warning in warnings:
+                logger.warning("%s", warning)
+            print(text.rstrip("\n") or "# LAN не настроен (network.lan_if пуст): dnsmasq не нужен")
+            return 0
+        rules = capture.rules()
+        text = nft.render(rules) + nft.render6(rules)
+        print(text.rstrip("\n") or "# правил нет: перехват выключен и network.lan_if не задан")
+        return 0
+
+    problem = _root_problem()
+    if problem:
+        return _fail(problem)
+    paths.ensure()
+    try:
+        if args.action == "down":
+            capture.down()
+            print("правила XGW убраны: таблицы nftables, ip rule и маршрут")
+            return 0
+        mode = capture.up()
+    except CaptureError as exc:
+        return _fail(f"правила сети не загружены: {exc}")
+    print(status.render_capture(capture.describe(check=False)) if capture.configured else
+          "правил нет: перехват выключен и network.lan_if не задан")
+    logger.info("правила сети загружены, режим %s", mode)
+    return 0
+
+
 # --- run -----------------------------------------------------------------------
 
 
@@ -359,7 +486,10 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     if xray_bin is None:
         return 1
     paths.ensure()
-    daemon = Daemon(cfg, paths, xray_bin=xray_bin)
+    capture = Capture(cfg, paths)
+    if not capture.configured or _root_problem():
+        capture = None  # следить не за чем либо нечем: правила меняет только root
+    daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture)
     if args.once:
         print(daemon.tick())
         daemon.store.close()

@@ -3,8 +3,8 @@
 
 Нужен настоящий Xray: XGW_XRAY_BIN=<путь к xray> pytest tests/stand -q
 Режим loopback работает без root на любой ОС; тот же набор в пространствах
-имён (netns) запускается на Linux под root. Проверки из LAN (curl/dig через
-шлюз, fail-closed, enable/disable) появятся вместе с перехватом на этапе 3.
+имён (netns) запускается на Linux под root. Проверки из LAN (перехват, DNS,
+fail-closed, enable/disable) — в test_stand_lan.py.
 """
 
 from __future__ import annotations
@@ -41,29 +41,15 @@ def stand(request, tmp_path):
 
 
 def _members(stand: Stand) -> dict[str, dict]:
-    return {member["tag"]: member for member in stand.xgw_json("servers")["members"]}
+    return stand.members()
 
 
 def _up(stand: Stand, names=None, **config) -> list[str]:
-    """Поднимает шлюз и ждёт, пока ядро проверит всех участников. Возвращает их теги."""
-    stand.set_subscription(names or stand.names)
-    stand.write_config(**config)
-    result = stand.xgw("apply", "--now")
-    assert result.returncode == 0, f"{result.stderr}\n{stand.xray_log()}"
-    assert "перезапуском" in result.stdout  # первый запуск — это запуск Xray
-    alive = wait_for(
-        lambda: (m := _members(stand)) and all(x["alive"] for x in m.values()) and m, 40
-    )
-    assert alive, f"участники не ожили: {_members(stand)}"
-    return list(alive)
+    return stand.up(names, **config)
 
 
 def _make_fastest(stand: Stand, tag: str) -> None:
-    """Делает узел заведомо самым быстрым: leastPing выбирает его, пока он жив."""
-    for server in stand.servers.values():
-        server.set_latency(0 if server is stand.server_of(tag) else 250)
-    selected = wait_for(lambda: stand.selecting() == (tag,), 3 * CYCLE)
-    assert selected, f"балансировщик не выбрал {tag}: {stand.selecting()}"
+    stand.make_fastest(tag, CYCLE)
 
 
 def test_frozen_node_is_dropped_within_two_cycles(stand):

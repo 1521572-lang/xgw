@@ -175,11 +175,12 @@ class Stand:
         if self.mode == "netns":
             self._topology = netns.Topology()
             self._topology.create()
+        also = ["--dns-also", netns.INET_DNS_IP] if self.mode == "netns" else []
         self._spawn(
             "origin", "inet",
             [sys.executable, str(HERE / "origin.py"), "--host", self.inet_ip,
              "--port", str(self.origin_port), "--dns-port", str(self.dns_port),
-             "--answer", self.inet_ip],
+             "--answer", self.inet_ip, *also],
             "READY",
         )
         for name in self.names:
@@ -189,13 +190,19 @@ class Stand:
         """Ещё один VLESS-сервер с реле перед ним (можно добавлять на ходу)."""
         server = Server(name, free_port(), free_port(), self.workdir / f"relay-{name}.mode")
         server.mode_file.write_text("pass", encoding="ascii")
+        stub = self.inet_ip if self.dns_port == 53 else {
+            "address": self.inet_ip, "port": self.dns_port,
+        }
         config = {
             "log": {"loglevel": "warning"},
+            # Сниффинг на шлюзе подставляет домен вместо IP — сервер разрешает его
+            # сам, как настоящий VPN-сервер; на стенде его резолвер — DNS-заглушка.
+            "dns": {"servers": [stub]},
             "inbounds": [{
                 "listen": "127.0.0.1", "port": server.listen_port, "protocol": "vless",
                 "settings": {"clients": [{"id": UUID}], "decryption": "none"},
             }],
-            "outbounds": [{"protocol": "freedom"}],
+            "outbounds": [{"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}],
         }
         config_path = self.workdir / f"server-{name}.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -237,15 +244,37 @@ class Stand:
         links = "\n".join(self.servers[name].link() for name in names)
         self.subscription.write_text(links + "\n", encoding="utf-8")
 
-    def write_config(self, *, max_members: int = 2, watchdog_s: int = 2) -> None:
-        """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1."""
-        dns = f"{self.inet_ip}:{self.dns_port}" if self.dns_port != 53 else self.inet_ip
-        self.config_file.write_text(
-            f"""
-[capture]            # перехват — этап 3; здесь XGW только управляет Xray
-lan = false
-local = false
+    def write_config(
+        self, *, max_members: int = 2, watchdog_s: int = 2,
+        capture: bool = False, fail_mode: str = "closed",
+    ) -> None:
+        """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
+        capture=True (только netns) — шлюз с перехватом: LAN на lan0, трафик самого
+        шлюза тоже через Xray, одно устройство в обход VPN, прямой DNS на втором
+        адресе «интернета». Без него XGW только управляет Xray (проверки этапа 2).
+        """
+        dns = f"{self.inet_ip}:{self.dns_port}" if self.dns_port != 53 else self.inet_ip
+        if capture:
+            network = f"""
+[network]
+lan_if = "lan0"
+lan_address = "{netns.GW_LAN_IP}/24"
+dhcp_range = "192.168.50.110,192.168.50.150,1h"
+static_leases = ["{netns.LAN_BYPASS_MAC},{netns.LAN_BYPASS_IP},tv"]
+bypass_hosts = ["{netns.LAN_BYPASS_MAC}"]
+
+[capture]
+lan = true
+local = true
+fail_mode = "{fail_mode}"
+"""
+            direct_dns = f'["{netns.INET_DNS_IP}"]'
+        else:
+            network = "\n[capture]\nlan = false\nlocal = false\n"
+            direct_dns = "[]"
+        self.config_file.write_text(
+            f"""{network}
 [[subscriptions]]
 name = "stand"
 url = "{self.subscription.as_uri()}"
@@ -270,7 +299,7 @@ direct_ips = []
 
 [dns]
 proxy_servers = ["{dns}"]
-direct_servers = []
+direct_servers = {direct_dns}
 bootstrap = ["udp://{self.inet_ip}:{self.dns_port}"]
 
 [xray]
@@ -367,6 +396,96 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
     def server_of(self, tag: str) -> Server:
         """Сервер стенда по тегу узла: страна в теге — это имя сервера."""
         return self.servers[tag.split("-")[1]]
+
+    # --- готовые сценарии ------------------------------------------------------
+
+    def members(self) -> dict[str, dict]:
+        return {member["tag"]: member for member in self.xgw_json("servers")["members"]}
+
+    def up(self, names=None, **config) -> list[str]:
+        """Поднимает шлюз и ждёт, пока ядро проверит всех участников. Возвращает их теги."""
+        self.set_subscription(names or self.names)
+        self.write_config(**config)
+        result = self.xgw("apply", "--now")
+        assert result.returncode == 0, f"{result.stderr}\n{self.xray_log()}"
+        assert "перезапуском" in result.stdout  # первый запуск — это запуск Xray
+        alive = wait_for(
+            lambda: (m := self.members()) and all(x["alive"] for x in m.values()) and m, 40
+        )
+        assert alive, f"участники не ожили: {self.members()}"
+        return list(alive)
+
+    def make_fastest(self, tag: str, cycle: float = 10.0) -> None:
+        """Делает узел заведомо самым быстрым: leastPing выбирает его, пока он жив.
+
+        Мало дождаться, что узел выбран: при равных задержках это бывает и
+        случайно, а следующая проба выбор перевернёт. Ждём, пока ядро само
+        замерит задержку у остальных участников.
+        """
+        for server in self.servers.values():
+            server.set_latency(0 if server is self.server_of(tag) else 250)
+
+        def settled() -> bool:
+            others = [m for name, m in self.members().items() if name != tag and m["alive"]]
+            slower = all((member["delay_ms"] or 0) >= 200 for member in others)
+            return slower and self.selecting() == (tag,)
+
+        assert wait_for(settled, 3 * cycle + 5), (
+            f"балансировщик не выбрал {tag}: {self.selecting()}, {self.members()}"
+        )
+
+    # --- устройство в LAN и сам шлюз (режим netns) ------------------------------
+
+    def client(self, where: str, *args: str, timeout: float = 40) -> dict:
+        """`lan_client.py …` в пространстве имён lan или gw; ответ — словарь."""
+        result = subprocess.run(
+            [*self._prefix(where), sys.executable, str(HERE / "lan_client.py"), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        try:
+            return json.loads(result.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            raise RuntimeError(f"lan_client {args}: {result.stdout}{result.stderr}") from None
+
+    def lan(self, *args: str) -> dict:
+        """Запрос от устройства в LAN."""
+        return self.client("lan", *args)
+
+    def exit_ip(self, where: str = "lan", *args: str) -> str:
+        """С какого адреса запрос дошёл до origin: адрес «интернета» — значит через
+        VPN-сервер, адрес WAN шлюза — напрямую. Пусто — запрос не прошёл."""
+        reply = self.client(where, "get", self.origin_url("/trace"), "--timeout", "4", *args)
+        for line in reply.get("body", "").splitlines():
+            if line.startswith("ip="):
+                return line[3:]
+        return ""
+
+    def run_in(self, where: str, *argv: str) -> subprocess.CompletedProcess:
+        """Произвольная команда в пространстве имён inet, gw или lan."""
+        return subprocess.run(
+            [*self._prefix(where), *argv], capture_output=True, text=True, timeout=30,
+        )
+
+    def gw_run(self, *argv: str, check: bool = True) -> str:
+        """Команда в пространстве имён шлюза (nft, ip); возвращает её вывод."""
+        result = self.run_in("gw", *argv)
+        if check and result.returncode != 0:
+            raise RuntimeError(f"{' '.join(argv)}: {result.stdout}{result.stderr}")
+        return result.stdout
+
+    def start_dnsmasq(self) -> subprocess.Popen:
+        """dnsmasq шлюза с конфигом, который выдаёт `xgw net show dnsmasq`."""
+        conf = self.workdir / "dnsmasq.conf"
+        shown = self.xgw("net", "show", "dnsmasq")
+        assert shown.returncode == 0, shown.stderr
+        conf.write_text(shown.stdout, encoding="utf-8")
+        return self._spawn(
+            "dnsmasq", "gw",
+            ["dnsmasq", "--keep-in-foreground", f"--conf-file={conf}", "--user=root",
+             f"--dhcp-leasefile={self.workdir / 'dnsmasq.leases'}", "--pid-file=",
+             "--log-dhcp", "--log-facility=-"],
+            "started",
+        )
 
 
 def wait_for(predicate, timeout: float, step: float = 0.5):

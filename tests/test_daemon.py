@@ -528,3 +528,147 @@ def test_failed_subscription_is_retried_sooner_but_not_every_tick(daemon):
     daemon.source = _inventory()
     assert daemon.tick() is State.HEALTHY
     assert len(daemon.collected) == 2 and len(daemon.applied) == 1
+
+
+# --- перехват: слежение за правилами, fail_mode = open, утечка -------------------
+
+
+class FakeCapture:
+    """Перехват на подменённом ядре: режим, загружены ли правила, история вызовов."""
+
+    def __init__(self):
+        self.state = "on"
+        self.is_loaded = True
+        self.fail = False
+        self.calls: list[str] = []
+
+    def mode(self):
+        return self.state
+
+    def loaded(self):
+        return self.is_loaded
+
+    def up(self):
+        self.calls.append("up")
+        if self.fail:
+            raise RuntimeError("nft: программа не найдена")
+        self.is_loaded = True
+        return self.state
+
+    def open(self):
+        self.calls.append("open")
+        self.state = "open"
+        return self.state
+
+    def close(self):
+        self.calls.append("close")
+        self.state = "on"
+        return self.state
+
+    def describe(self, *, check=True):
+        return {"mode": self.state, "lan_if": "lan0", "lan": True, "local": True,
+                "bypass": [], "fail_mode": "closed", "loaded": None}
+
+
+@pytest.fixture()
+def guarded(tmp_path, monkeypatch):
+    """Демон шлюза с перехватом; возвращает (демон, перехват)."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.filters.exclude_regex = ""
+    cfg.dns.bootstrap = []
+    capture = FakeCapture()
+    instance = Harness(cfg, paths, capture=capture)
+    _started(instance)
+    yield instance, capture
+    instance.store.close()
+
+
+def test_daemon_reloads_missing_rules(guarded):
+    """Чужой flush ruleset или перезапуск nftables: правила пропали — демон их возвращает."""
+    daemon, capture = guarded
+    assert capture.calls == [] and daemon.status()["capture"]["loaded"] is True
+    capture.is_loaded = False
+    daemon.tick()
+    assert capture.calls == ["up"]
+    assert any("загружены заново" in event for event in daemon.events())
+    assert daemon.status()["capture"]["mode"] == "on"
+    daemon.tick()
+    assert capture.calls == ["up"]  # правила на месте — больше ничего не делает
+
+
+def test_rules_failure_is_reported_once(guarded):
+    daemon, capture = guarded
+    capture.is_loaded, capture.fail = False, True
+    for _ in range(3):
+        assert daemon.tick() is State.HEALTHY  # сбой сети шаг watchdog не роняет
+    assert capture.calls == ["up"] * 3  # попытки продолжаются
+    failures = [event for event in daemon.events() if "не загружены" in event]
+    assert len(failures) == 1 and "nft" in failures[0]  # а событие — одно на причину
+
+
+def test_fail_open_removes_capture_while_xray_is_down(guarded):
+    daemon, capture = guarded
+    daemon.cfg.capture.fail_mode = "open"
+    daemon.observatory, daemon.api.down = None, True  # Xray не отвечает
+    daemon.tick()
+    daemon.t += 30
+    daemon.tick()
+    assert "open" not in capture.calls  # меньше минуты — перехват держится
+    daemon.t += 31
+    daemon.tick()
+    assert capture.calls.count("open") == 1 and capture.state == "open"
+    daemon.t += 20
+    daemon.tick()
+    assert capture.calls.count("open") == 1  # уже снят
+    assert daemon.status()["capture"]["mode"] == "open"
+
+    daemon.api.down = False
+    daemon.set_alive()
+    daemon.tick()
+    assert capture.calls[-1] == "close" and capture.state == "on"
+    events = daemon.events()
+    assert any("временно снят" in event for event in events)
+    assert any("перехват возвращён" in event for event in events)
+
+
+def test_fail_closed_keeps_capture_while_xray_is_down(guarded):
+    daemon, capture = guarded
+    daemon.observatory, daemon.api.down = None, True
+    for _ in range(5):
+        daemon.t += 60
+        assert daemon.tick() is State.XRAY_DOWN
+    assert capture.calls == [] and capture.state == "on"  # трафик никуда не уходит
+
+
+def test_short_xray_outage_does_not_open_capture(guarded):
+    daemon, capture = guarded
+    daemon.cfg.capture.fail_mode = "open"
+    daemon.observatory, daemon.api.down = None, True
+    daemon.tick()
+    daemon.t += 40
+    daemon.api.down = False
+    daemon.set_alive()
+    daemon.tick()  # Xray вернулся — отсчёт сброшен
+    daemon.observatory, daemon.api.down = None, True
+    daemon.t += 40
+    daemon.tick()
+    assert "open" not in capture.calls
+
+
+def test_leak_reloads_rules_only_when_own_traffic_is_captured(guarded):
+    daemon, capture = guarded
+    daemon.location = "RU"
+    daemon.t += 400
+    assert daemon.tick() is State.LEAK
+    assert capture.calls == ["up"]
+    assert any(event.startswith("leak:") for event in daemon.events())
+
+    # capture.local = false: обычный сокет шлюза ходит напрямую по праву — это не утечка.
+    daemon.cfg.capture.local = False
+    daemon.t += 400
+    assert daemon.tick() is State.HEALTHY
+    assert capture.calls == ["up"]

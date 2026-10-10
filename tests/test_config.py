@@ -124,3 +124,21 @@ def test_subscription_without_url_and_bad_ports_warn(tmp_path):
     )
     assert any("empty" in warning and "url" in warning for warning in warnings)
     assert any("api=70000" in warning for warning in warnings)
+
+
+def test_dangerous_capture_values_are_replaced(tmp_path):
+    """Метка 0 и системная таблица маршрутизации сломали бы сеть — не допускаются."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[network]\nlan_if = "lan 0"\nwan_if = "eth0"\nlan_address = "шлюз"\n'
+        "[capture]\nmark_proxy = 0\nmark_bypass = 2\nroute_table = 254\n",
+        encoding="utf-8",
+    )
+    cfg, warnings = load(path)
+    assert cfg.capture.mark_proxy == 1 and cfg.capture.mark_bypass == 2
+    assert cfg.capture.route_table == 100  # 254 — это таблица main
+    assert cfg.network.lan_address == "192.168.50.1/24"
+    text = "\n".join(warnings)
+    assert "capture.mark_proxy" in text and "capture.route_table=254" in text
+    assert "network.lan_if='lan 0'" in text and "wan_if" not in text
+    assert "network.lan_address" in text

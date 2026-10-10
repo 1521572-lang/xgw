@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -284,6 +285,34 @@ def _validate(cfg: Config) -> list[str]:
         warnings.append('поддерживается только network.ipv6 = "off" (проксирование IPv6 — этап 5)')
     if cfg.capture.fail_mode not in ("closed", "open"):
         warnings.append(f"capture.fail_mode={cfg.capture.fail_mode}: допустимо closed или open")
+    for name in ("lan_if", "wan_if"):
+        value = getattr(cfg.network, name)
+        if value and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", value):
+            warnings.append(f"network.{name}={value!r}: недопустимое имя интерфейса")
+    try:
+        ipaddress.IPv4Interface(cfg.network.lan_address)
+    except ValueError:
+        warnings.append(
+            f"network.lan_address={cfg.network.lan_address}: ожидается адрес/префикс — "
+            f"используется {Network().lan_address}"
+        )
+        cfg.network.lan_address = Network().lan_address
+    for name in ("mark_proxy", "mark_bypass"):
+        # Метка 0 — это «без метки»: правила перехвата с ней не работают.
+        if not 1 <= getattr(cfg.capture, name) <= 0xFFFFFFFF:
+            default = getattr(Capture(), name)
+            warnings.append(
+                f"capture.{name} должен быть от 1 до 4294967295 — используется {default}"
+            )
+            setattr(cfg.capture, name, default)
+    # 253–255 — системные таблицы default, main и local: маршрут перехвата в main
+    # оставил бы машину без сети.
+    if not 1 <= cfg.capture.route_table <= 0x7FFFFFFF or cfg.capture.route_table in (253, 254, 255):
+        warnings.append(
+            f"capture.route_table={cfg.capture.route_table}: нужен номер своей таблицы, "
+            f"не 253–255 — используется {Capture().route_table}"
+        )
+        cfg.capture.route_table = Capture().route_table
     if cfg.capture.mark_proxy == cfg.capture.mark_bypass:
         warnings.append("capture.mark_proxy и capture.mark_bypass совпадают")
     for name in ("interval", "timeout"):

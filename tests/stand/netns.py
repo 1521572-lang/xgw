@@ -19,9 +19,12 @@ import subprocess
 import sys
 
 INET_IP = "5.5.5.1"
+INET_DNS_IP = "5.5.5.53"  # второй адрес «интернета»: прямой DNS-сервер (dns.direct_servers)
 GW_WAN_IP = "5.5.5.2"
 GW_LAN_IP = "192.168.50.1"
 LAN_IP = "192.168.50.100"
+LAN_BYPASS_IP = "192.168.50.20"  # второй адрес устройства: «устройство в обход VPN»
+LAN_BYPASS_MAC = "02:00:00:00:00:20"  # его MAC в статической аренде стенда
 
 
 def available() -> bool:
@@ -53,6 +56,8 @@ class Topology:
                 self._ip("-n", namespace, "link", "set", "lo", "up")
             self._link(self.gw, "wan0", f"{GW_WAN_IP}/24", self.inet, "eth0", f"{INET_IP}/24")
             self._link(self.gw, "lan0", f"{GW_LAN_IP}/24", self.lan, "eth0", f"{LAN_IP}/24")
+            self._ip("-n", self.inet, "addr", "add", f"{INET_DNS_IP}/24", "dev", "eth0")
+            self._ip("-n", self.lan, "addr", "add", f"{LAN_BYPASS_IP}/24", "dev", "eth0")
             self._ip("-n", self.gw, "route", "add", "default", "via", INET_IP)
             self._ip("-n", self.lan, "route", "add", "default", "via", GW_LAN_IP)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
