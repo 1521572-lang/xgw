@@ -25,7 +25,8 @@ from xgw.fetch import (
 def test_fetch_file(tmp_path):
     path = tmp_path / "sub.txt"
     path.write_text("hello", encoding="utf-8")
-    for url in (path.as_uri(), path.as_uri().replace("file:///", "file://")):
+    # В Windows это file:///C:/…, file://C:/… и file://C:\…; в POSIX все три — file:///tmp/…
+    for url in {path.as_uri(), f"file://{path.as_posix()}", f"file://{path}"}:
         result = fetch_url(url)
         assert isinstance(result, FetchResult)
         assert result.status == 200

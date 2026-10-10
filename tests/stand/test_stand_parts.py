@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from origin import dns_answer
@@ -32,16 +33,23 @@ def _spawn(script: str, *args: str) -> subprocess.Popen:
 
 @pytest.fixture()
 def upstream():
-    """«Сервер»: на любое соединение сразу отдаёт 64 КиБ и ждёт закрытия."""
+    """«Сервер»: на любое соединение сразу отдаёт 64 КиБ и ждёт закрытия.
+
+    Получив b"close", закрывает соединение первым. `client_gone` выставляется,
+    когда сервер увидел конец потока от клиента.
+    """
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(8)
+    client_gone = threading.Event()
 
     def handle(conn: socket.socket) -> None:
         with contextlib.suppress(OSError), conn:
             conn.sendall(PAYLOAD)
-            while conn.recv(4096):  # дочитываем до закрытия: иначе close() даст RST
-                pass
+            while data := conn.recv(4096):  # дочитываем до закрытия: иначе close() даст RST
+                if data == b"close":
+                    return
+            client_gone.set()
 
     def serve() -> None:
         while True:
@@ -52,7 +60,7 @@ def upstream():
             threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
     threading.Thread(target=serve, daemon=True).start()
-    yield server.getsockname()[1]
+    yield SimpleNamespace(port=server.getsockname()[1], client_gone=client_gone)
     server.close()
 
 
@@ -63,7 +71,7 @@ def relay(upstream, tmp_path):
     port = free_port()
     proc = _spawn(
         "freeze_relay.py", "--listen", f"127.0.0.1:{port}",
-        "--upstream", f"127.0.0.1:{upstream}", "--mode-file", str(mode_file),
+        "--upstream", f"127.0.0.1:{upstream.port}", "--mode-file", str(mode_file),
     )
 
     def set_mode(mode: str) -> None:
@@ -97,6 +105,41 @@ def _read(port: int, silence: float = 1.0) -> tuple[int, str]:
 def test_relay_pass(relay):
     port, _set_mode = relay
     assert _read(port) == (len(PAYLOAD), "complete")
+
+
+def _read_all(client: socket.socket) -> int:
+    received = 0
+    while received < len(PAYLOAD):
+        chunk = client.recv(65536)
+        assert chunk, f"соединение закрылось на {received} байтах"
+        received += len(chunk)
+    return received
+
+
+def test_relay_passes_server_close_to_client(relay):
+    """Сервер закрыл соединение — клиент за реле видит конец потока, а не тишину."""
+    port, _set_mode = relay
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+        client.sendall(b"close")
+        _read_all(client)
+        assert client.recv(4096) == b""
+
+
+def test_relay_passes_client_close_to_server(relay, upstream):
+    """Клиент закрыл соединение — сервер за реле тоже видит конец потока."""
+    port, _set_mode = relay
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+        client.sendall(b"hello")
+        _read_all(client)
+    assert upstream.client_gone.wait(3)
+
+
+def test_relay_frozen_connection_ends_when_client_leaves(relay, upstream):
+    """«Замороженное» соединение реле держит открытым, пока клиент сам не уйдёт."""
+    port, set_mode = relay
+    set_mode("freeze_after=16384")
+    assert _read(port) == (16384, "silence")
+    assert upstream.client_gone.wait(3)
 
 
 def test_relay_freeze_after_keeps_connection_open(relay):

@@ -117,7 +117,10 @@ def test_head_probe_keeps_frozen_node(stand):
     # При этом настоящая загрузка через этот узел не проходит: сервер «жив» только для HEAD.
     probe = stand.xgw("probe", victim)
     assert probe.returncode == 1, probe.stdout
-    assert "FROZEN" in probe.stdout or "STALL_BEFORE_BODY" in probe.stdout
+    # STALL_BEFORE_BODY допустим только в Windows: там локальный HTTP-фильтр может
+    # придержать неполный ответ, и тело до клиента не доходит (ASSUMPTIONS п. 45, 50).
+    verdicts = ("FROZEN", "STALL_BEFORE_BODY") if sys.platform == "win32" else ("FROZEN",)
+    assert any(verdict in probe.stdout for verdict in verdicts), probe.stdout
 
 
 def test_subscription_change_applies_without_dropping_connections(stand):

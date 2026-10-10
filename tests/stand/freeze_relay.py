@@ -95,8 +95,7 @@ class Connection:
         with contextlib.suppress(OSError):
             while sock.recv(65536):
                 pass
-        with contextlib.suppress(OSError):
-            sock.close()
+        _close(sock)
 
     def _up(self, upstream: socket.socket) -> None:
         """Клиент → сервер."""
@@ -106,9 +105,7 @@ class Connection:
                     upstream.sendall(data)
         except OSError:
             pass
-        for sock in (upstream, self.client):
-            with contextlib.suppress(OSError):
-                sock.close()
+        _close(upstream, self.client)
 
     def _down(self, upstream: socket.socket) -> None:
         """Сервер → клиент со счётчиком байтов."""
@@ -132,9 +129,21 @@ class Connection:
         except OSError:
             pass
         if not self.frozen:  # «замороженное» соединение держим открытым
-            for sock in (upstream, self.client):
-                with contextlib.suppress(OSError):
-                    sock.close()
+            _close(upstream, self.client)
+
+
+def _close(*socks: socket.socket) -> None:
+    """Закрывает соединения так, чтобы другая сторона увидела конец потока.
+
+    Одного close() мало: в Linux сокет, на котором соседний поток ждёт в recv(),
+    остаётся открытым до выхода из этого вызова, и FIN не уходит. shutdown()
+    будит ждущий поток и отправляет FIN сразу.
+    """
+    for sock in socks:
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
 
 
 def _address(text: str) -> tuple[str, int]:

@@ -143,7 +143,21 @@ def pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    return not _is_zombie(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    """Процесс завершился, но родитель его ещё не снял: kill(pid, 0) для такого проходит.
+
+    Так выглядит Xray, запущенный демоном и остановленный командой `xgw apply`:
+    без этой проверки остановка ждала бы весь grace, считая процесс живым.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    # Состояние идёт сразу за именем в скобках; в самом имени могут быть скобки и пробелы.
+    return stat.rpartition(")")[2].split()[:1] == ["Z"]
 
 
 class PidfileXrayService(XrayService):
@@ -170,8 +184,11 @@ class PidfileXrayService(XrayService):
 
     def is_active(self) -> bool:
         pid = self._pid()
+        if self._proc is not None and self._proc.poll() is not None:
+            # Наш процесс завершён — возможно, другой командой XGW. poll() его снял.
+            self._proc = None
         if self._proc is not None and self._proc.pid == pid:
-            return self._proc.poll() is None
+            return True
         return pid_alive(pid)
 
     def start(self) -> None:

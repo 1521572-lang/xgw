@@ -77,6 +77,26 @@ def test_pidfile_service_is_shared_between_processes(tmp_path, fake_xray):
     assert not owner.is_active() and not pid_file.exists()
 
 
+def test_pidfile_stop_does_not_wait_for_a_zombie(tmp_path, fake_xray):
+    """Xray запущен одной командой, остановлен другой: пока родитель его не снял,
+    процесс остаётся в таблице (зомби), но живым считаться не должен — иначе
+    остановка ждала бы весь grace."""
+    pid_file = tmp_path / "xray.pid"
+    owner = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=6)
+    other = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=6)
+    owner.start()
+    pid = int(pid_file.read_text())
+    started = time.monotonic()
+    other.stop()
+    assert time.monotonic() - started < 4
+    assert not pid_alive(pid)
+    deadline = time.monotonic() + 3  # в Windows завершение процесса видно не мгновенно
+    while owner._proc is not None and time.monotonic() < deadline:
+        assert not owner.is_active()
+        time.sleep(0.05)
+    assert owner._proc is None  # родитель снял свой процесс
+
+
 def test_pidfile_service_reports_instant_crash(tmp_path, fake_xray):
     fake_xray["code"] = "import sys; print('failed to load config'); sys.exit(23)"
     service = PidfileXrayService("xray", tmp_path / "config.json", tmp_path / "xray.pid")
