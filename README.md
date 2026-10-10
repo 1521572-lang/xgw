@@ -45,19 +45,23 @@ adrules` — Xray не умеет перечитывать конфиг), сле
 | Этап | Содержание | Статус |
 |---|---|---|
 | 1 | Конфиг, подписки (кэш, квота), парсеры ссылок, генератор, загрузка Xray, `xgw generate`, `xray run -test` | ✅ готов (юнит-тесты; `xray run -test` — при наличии бинарника) |
-| 2 | API (ado/rmo/adi/rmi/adrules/bi), diff, применение без разрыва, метрики, watchdog-состояния, скан запасных, замена участников | ⚠️ частично: библиотечные модули и юнит-тесты. **DoD этапа не выполнен** — см. ниже |
-| 3 | nftables/TPROXY, dnsmasq, перехват DNS, fail-closed, enable/disable, стенд | не начат |
+| 2 | API (ado/rmo/adi/rmi/adrules/bi), diff, применение без разрыва, метрики, демон с watchdog, скан запасных, замена участников, команды `apply`/`status`/`servers`/`probe`/`pin`/`unpin`/`run`, стенд | ✅ готов: проверки стенда пройдены на живом Xray 26.3.27 в режиме loopback; режим netns написан, но **не запускался** (нужен Linux с root) |
+| 3 | nftables/TPROXY, dnsmasq, перехват DNS, fail-closed, enable/disable, проверки стенда из LAN | не начат |
 | 4 | install/uninstall, systemd, NetworkManager, сон, ufw, diag, уведомления, страница статуса | не начат |
 | 5 | IPv6, TUN-inbound, Telegram-бот, правила per-device | опционально |
 
-Чего на этапе 2 ещё нет (поэтому он не считается готовым по разделу 10 ТЗ):
+Что проверено на стенде (раздел 9 ТЗ, проверки этапа 2):
 
-- **стенда на network namespaces** (`tests/stand/`): переключение с «замороженного»
-  узла, применение без разрыва и замена участников на живом Xray не проверены;
-- **демона** (`xgw.service`): нет цикла, который раз в `interval_s` собирает сигналы,
-  ведёт машину состояний, запускает сканы и ротацию — есть только сами функции;
-- **команд CLI**, кроме `generate`: `apply`, `status`, `servers`, `probe`, `pin`/`unpin`;
-- уведомлений, `/run/xgw/status.json` и расчёта суточного трафика проб.
+- `freeze_after=16384` на выбранном узле → `xray api bi` показывает другой узел
+  за 6–16 с при `interval = 10s`, `sampling = 1` (предел по ТЗ — 2 цикла, 25 с);
+- контроль: с `httpMethod: HEAD` тот же «замороженный» узел остаётся выбранным;
+- добавление и удаление сервера в подписке применяются через API, загрузка
+  длиной 12 с через неизменившийся узел не прерывается, Xray не перезапускается;
+- «замороженного» участника демон меняет на проверенный запасной; закрепление
+  `xgw pin` снимается по истечении срока.
+
+Чего пока нет: уведомлений на рабочий стол и в Telegram (события пишутся в
+журнал и видны в `xgw status`), страницы статуса, systemd-юнитов — это этап 4.
 
 Сеть хоста не меняется до прохождения стенда из раздела 9 ТЗ (network
 namespaces); изменения сети — только командами XGW с проверкой и откатом.
@@ -70,7 +74,7 @@ namespaces); изменения сети — только командами XGW
   `nmcli`, `systemctl`, `dnsmasq`, `xray`.
 - Xray-core ≥ 25.7.23 (официальный бинарник; SHA-256 сверяется с `.dgst`).
 
-## Установка (после завершения этапов 2–4)
+## Установка (после завершения этапов 3–4)
 
 ```bash
 sudo xgw install     # проверки diag, пакеты, профиль LAN, службы, первая генерация
@@ -108,8 +112,24 @@ python3 -m venv .venv
   `XGW_XRAY_BIN=<путь к xray> pytest tests/ -q`; без переменной они пропускаются.
 - Тесты https-проб через CONNECT выпускают временный самоподписанный сертификат
   командой `openssl`; без неё пропускаются.
-- Стенд на network namespaces (раздел 9 ТЗ) требует Linux и root — в репозитории
-  появится в `tests/stand/`; без root тесты пропускаются.
+
+### Стенд
+
+Стенд (`tests/stand/`) поднимает «интернет» с замораживающим провайдером и шлюз
+на настоящем Xray: origin с DNS-заглушкой, три VLESS-сервера, перед каждым —
+реле с режимами `pass`, `freeze_after=N`, `drop`, `blackhole`.
+
+```bash
+XGW_XRAY_BIN=/opt/xgw/xray/xray .venv/bin/python -m pytest tests/stand -q   # ~2,5 минуты
+```
+
+- Режим **loopback** — все процессы на 127.0.0.1, root не нужен, работает и на
+  Windows. Его хватает для проверок этапа 2.
+- Режим **netns** — пространства имён `inet`/`gw`/`lan`, связанные veth-парами;
+  включается сам на Linux под root (`sudo -E …`). Сеть хоста при этом не
+  затрагивается: интерфейсы создаются сразу внутри пространств имён.
+- Без `XGW_XRAY_BIN` стенд пропускается; части стенда (реле, origin, DNS) проверяются
+  и без Xray — `tests/stand/test_stand_parts.py`.
 
 ### Проверка конфига вручную
 
@@ -120,7 +140,7 @@ xray run -test -c /tmp/config.json
 
 Без `--out` результат пишется в `/etc/xgw/xray/config.generated.json` — рядом с
 рабочим `config.json`, но не поверх него: рабочий конфиг меняет только
-применение (`xgw apply`, этап 2), с проверкой, last-good и откатом.
+применение (`xgw apply`), с проверкой, last-good и откатом.
 
 Что делает `generate` помимо сборки:
 
@@ -133,22 +153,52 @@ xray run -test -c /tmp/config.json
 - сервер, конфиг которого установленный Xray не принимает (снятый транспорт,
   неизвестный шифр), отбрасывает с предупреждением и собирает конфиг без него.
 
+## Команды
+
+| Команда | Что делает |
+|---|---|
+| `xgw generate [--out F]` | Собрать конфиг Xray из подписок и проверить `xray run -test`; рабочий конфиг не трогает |
+| `xgw apply [--now]` | Обновить подписки и применить: через API без разрыва соединений, а если нужен перезапуск — в `restart_window` или сразу с `--now` |
+| `xgw status [--json]` | Состояние, участники и запасные, задержки, квота, трафик проверок, последние события |
+| `xgw servers [--json]` | Только список участников и запасных |
+| `xgw probe [тег \| --all]` | Загрузка `probe.url` через probe-inbound узла: `OK`, `SLOW`, `FROZEN`, `STALL_BEFORE_BODY`, `CONNECT_FAIL`, `TIMEOUT` |
+| `xgw pin <тег> --ttl 10m`, `xgw unpin` | Ручное закрепление узла на ограниченный срок. Пока узел закреплён, автопереключение отключено |
+| `xgw run [--once]` | Демон (служба `xgw.service`): watchdog, подписки, сканы запасных, замена участников |
+
+Демон раз в `watchdog.interval_s` (±20 %) собирает три сигнала — метрики
+observatory, сквозную загрузку через http-in и доступность провайдера — и ведёт
+машину состояний:
+
+| Состояние | Когда | Что делает демон |
+|---|---|---|
+| `HEALTHY` | все сигналы в норме | ничего |
+| `DEGRADED` | часть участников мертва | меняет мёртвых дольше `rotate_after_min` на запасные, прошедшие последний скан |
+| `ALL_DEAD` | живых нет или сквозная проверка падает `fail_threshold` раз подряд | обновляет подписку напрямую, сканирует запасные, меняет участников сразу |
+| `WAN_DOWN` | не отвечает `wan_check` | ждёт, проверки раз в 60 с |
+| `XRAY_DOWN` | не отвечают ни метрики, ни API | после двух неудачных проверок откатывает конфиг на last-good |
+| `LEAK` | выход в `home_country` при включённом перехвате | переприменяет правила (появится с перехватом на этапе 3) |
+
+Пока нет systemd-юнитов (этап 4), Xray можно держать обычным процессом:
+`XGW_XRAY_SERVICE=process` — так работает стенд.
+
 ## Структура
 
 ```
 src/xgw/
-  cli.py config.py paths.py log.py masking.py model.py store.py
+  cli.py engine.py daemon.py     # команды, общий конвейер сборки, демон
+  config.py paths.py log.py masking.py model.py store.py
   fetch.py marknet.py            # HTTP- и DoH-клиент с SO_MARK
   parsers/    common.py vless.py vmess.py trojan.py ss.py hysteria2.py xray_json.py
   xraycore/   binary.py api.py metrics.py service.py
   generator/  builder.py validate.py diff.py
   apply/      applier.py rotation.py
-  watch/      checks.py states.py scan.py      # notify.py status_page.py — этап 4
+  watch/      checks.py states.py scan.py notify.py status.py   # status_page.py — этап 4
 tests/        fixtures/golden/ test_*.py
+tests/stand/  stand.py netns.py origin.py freeze_relay.py download.py test_stand*.py
 ```
 
 Ещё не созданы: `net/` (nft, iprule, nm, dnsmasq, sysctl, sleep, ufw — этап 3),
-`diag.py`, `install.py`, `uninstall.py`, `packaging/` (этап 4), `tests/stand/`.
+`diag.py`, `install.py`, `uninstall.py`, `packaging/` (этап 4).
 
 ## Безопасность
 
