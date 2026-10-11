@@ -24,10 +24,12 @@ import tarfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import machine as machine_mod
 import netns
 import pytest
+from fake_telegram import TOKEN as TELEGRAM_TOKEN
 from machine import Machine, MachineTopology
 from stand import UUID, Stand, wait_for
 
@@ -391,6 +393,104 @@ def test_device_is_taken_around_the_vpn_and_back_from_the_panel(gw):
         assert json.loads(box.sh("cat /etc/xgw/panel.json"))["devices"] == []
     finally:
         stand.run_in("lan", "ip", "addr", "del", f"{ip}/24", "dev", "eth0")
+
+
+def test_telegram_bot_is_paired_from_the_panel_and_obeys_commands(gw):
+    """Бот в службе с урезанными правами: токен вставлен в панели, чат подключён кодом,
+    команды выполняются, чужие и старые сообщения — нет. «Telegram» — процесс стенда."""
+    box, stand = gw.box, gw.stand
+    api = stand.start_telegram()
+    config_file = box.root / "etc/xgw/config.toml"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + f'\n[notify]\ntelegram_api = "{api}"\n',
+        encoding="utf-8")
+
+    def say(text: str, **query) -> None:
+        params = "&".join(f"{k}={quote(str(v))}" for k, v in {"text": text, **query}.items())
+        stand.telegram(f"/_say?{params}")
+
+    def replies() -> list[str]:
+        # Ответы на команды; уведомления тоже идут в чат, их заголовок — «XGW: …».
+        texts = [item["text"] for item in stand.telegram("/_sent")]
+        return [text for text in texts if not text.startswith("XGW: ")]
+
+    def shown() -> str:
+        return "\n---\n".join(replies())
+
+    def bot() -> dict:
+        return _panel_state(gw)["telegram"]
+
+    def vpn_is(expected: str) -> bool:
+        return wait_for(lambda: _exit_ip(gw) == expected, 15, step=0.3) is True
+
+    assert bot()["mode"] == "off"
+    refused = _press(gw, "telegram/connect", token="не токен")
+    assert not refused["ok"] and "токен бота" in refused["text"]
+
+    connected = _press(gw, "telegram/connect", token=TELEGRAM_TOKEN)
+    assert connected["ok"], connected
+    assert wait_for(lambda: bot()["mode"] == "pairing" and bot()["username"], 40), (
+        bot(), box.journal("xgw", 40))
+    assert box.sh("stat -c '%U:%G %a' /etc/xgw/panel.json").strip() == "root:root 600"
+    state = bot()
+    assert TELEGRAM_TOKEN not in json.dumps(state) and state["username"] == "xgw_test_bot"
+    code = state["code"]
+    assert len(code) == 6
+
+    # Без кода и с чужим кодом чат не подключается; с верным — подключается.
+    say("/start")
+    say("/start 000000" if code != "000000" else "/start 111111")
+    assert wait_for(lambda: len(replies()) == 2, 20), shown()
+    assert "Отправьте /start и шесть цифр" in replies()[0] and "Неверный код" in replies()[1]
+    say(f"/start {code}")
+    assert wait_for(lambda: any(r.startswith("Готово") for r in replies()), 20), shown()
+    assert wait_for(lambda: bot()["mode"] == "connected", 30), bot()
+    saved = json.loads(box.sh("cat /etc/xgw/panel.json"))["telegram"]
+    assert saved == {"token": TELEGRAM_TOKEN, "chat_id": "1001"}
+
+    # Команды из своего чата.
+    say("/status")
+    assert wait_for(lambda: any("Состояние:" in r for r in replies()), 20), (
+        shown(), box.journal("xgw", 80))
+    assert "Состояние: HEALTHY" in shown(), shown()
+    assert vpn_is(VIA_VPN)
+    sent = len(replies())
+    say("/disable")
+    assert vpn_is(DIRECT), box.journal("xgw", 40)
+    assert wait_for(lambda: any("перехват снят" in r for r in replies()), 20), replies()
+    say("/enable")
+    assert vpn_is(VIA_VPN), box.journal("xgw", 40)
+    assert wait_for(lambda: any("перехват включён" in r for r in replies()), 20), replies()
+
+    # Чужой чат и давняя команда: ни ответа, ни действия.
+    sent = len(replies())
+    say("/disable", chat=424242)
+    say("/disable", age=600)
+    say("/status")  # свежая команда выстроена после них и ответит — значит, предыдущие разобраны
+    assert wait_for(lambda: len(replies()) == sent + 1, 20), replies()
+    assert "Состояние: HEALTHY" in replies()[-1]
+    assert _exit_ip(gw) == VIA_VPN
+
+    # Закрепление по номеру из /servers, через настоящее API Xray.
+    say("/servers")
+    assert wait_for(lambda: any("1. " in r for r in replies()), 20), replies()
+    say("/pin 1 10m")
+    assert wait_for(lambda: any("закреплён на 10m" in r for r in replies()), 20), replies()
+    assert _panel_state(gw)["pin"] is not None
+    say("/unpin")
+    assert wait_for(lambda: _panel_state(gw)["pin"] is None, 20)
+    events = [event["detail"] for event in _panel_state(gw)["events"]]
+    assert any("Telegram: команда /disable" in text for text in events), events
+    assert TELEGRAM_TOKEN not in box.journal("xgw", 400)
+
+    # Отключение в панели: токен забыт, бот молчит.
+    assert _press(gw, "telegram/disconnect")["ok"]
+    assert wait_for(lambda: bot()["mode"] == "off", 30), bot()
+    assert json.loads(box.sh("cat /etc/xgw/panel.json"))["telegram"] == {"token": "", "chat_id": ""}
+    sent = len(replies())
+    say("/disable")
+    time.sleep(5)
+    assert len(replies()) == sent and _exit_ip(gw) == VIA_VPN
 
 
 def test_uninstall_after_the_panel_keeps_only_the_users_settings(gw):

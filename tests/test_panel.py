@@ -57,6 +57,38 @@ class FakeDaemon:
         self.asked.append("scan")
 
 
+class StubBot:
+    """Бот Telegram: панель с ним только разговаривает, сеть не нужна."""
+
+    mark = None
+
+    def __init__(self) -> None:
+        self.codes = 0
+        self.dropped = 0
+        self.configured: list[str] = []
+        self.coded_for = ""
+        self.mode = "off"
+
+    def info(self) -> dict:
+        return {"mode": self.mode, "managed": True, "username": "xgw_bot", "error": "",
+                "code": "123456" if self.codes else "", "until": None, "commands": True}
+
+    def new_code(self, token: str = "") -> str:
+        self.codes += 1
+        self.mode = "pairing"
+        self.coded_for = token
+        return "123456"
+
+    def forget(self) -> None:
+        self.dropped += 1
+
+    def configure(self, cfg, daemon=None, mark=None) -> None:
+        self.configured.append(cfg.notify.telegram_bot_token)
+
+
+BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly_0123456789abc"
+
+
 class Client:
     """Браузер в миниатюре: помнит cookie и шлёт то же, что страница панели."""
 
@@ -152,7 +184,8 @@ class Rig:
         )
         monkeypatch.setattr(Panel, "_selected", lambda self, ok, now: ["proxy-nl-aaaa"])
         cfg, _warnings = config.load(self.config_path)
-        self.panel.configure(cfg, self.daemon)
+        self.bot = StubBot()
+        self.panel.configure(cfg, self.daemon, self.bot)
         self.panel.start()
         self.client = Client(self.panel.port)
 
@@ -426,6 +459,69 @@ def test_device_set_in_config_toml_is_not_changed_by_the_panel(rig, user):
         assert result["ok"] and result["text"].endswith("config.toml")
     assert user.act("device", {"mac": other, "bypass": False})["text"] == "Ничего не изменилось"
     assert not rig.store_path.exists() and rig.system_calls == []
+
+
+# --- Telegram ---------------------------------------------------------------------------
+
+
+def test_state_shows_the_bot_without_its_token(rig, user):
+    state = user.state()
+    assert state["telegram"]["mode"] == "off" and state["telegram"]["username"] == "xgw_bot"
+    rig.panel.bot = None
+    assert user.state()["telegram"] == {"mode": "unavailable"}
+
+
+def test_bot_is_connected_by_token_then_code_then_disconnected(rig, user):
+    for bad in ("", "не токен", "123:short", None):
+        result = user.act("telegram/connect", {"token": bad})
+        assert not result["ok"] and "токен бота" in result["text"]
+    assert not rig.store_path.exists() and rig.bot.codes == 0
+
+    result = user.act("telegram/connect", {"token": f" {BOT_TOKEN} "})
+    assert result["ok"] and "отправьте код" in result["text"], result
+    assert rig.saved()["telegram"] == {"token": BOT_TOKEN, "chat_id": ""}
+    assert oct(os.stat(rig.store_path).st_mode & 0o777) in ("0o600", "0o666")
+    assert rig.bot.codes == 1 and rig.bot.configured == [BOT_TOKEN]  # бот уже знает токен
+    assert rig.bot.coded_for == BOT_TOKEN  # код выдан именно для него
+    assert rig.daemon.poke.is_set()
+    state = user.state()
+    assert state["telegram"]["mode"] == "pairing" and state["telegram"]["code"] == "123456"
+    assert BOT_TOKEN not in json.dumps(state, ensure_ascii=False)
+    events = [event["detail"] for event in state["events"]]
+    assert any("токен сохранён" in text for text in events) and BOT_TOKEN not in str(events)
+
+    assert user.act("telegram/code", {})["ok"] and rig.bot.codes == 2
+
+    result = user.act("telegram/disconnect", {})
+    assert result["ok"] and rig.saved()["telegram"] == {"token": "", "chat_id": ""}
+    assert rig.bot.dropped == 1 and rig.bot.configured[-1] == ""
+    assert "нет такого действия" in user.act("telegram/nonsense", {})["text"]
+
+
+def test_new_code_is_refused_once_the_chat_is_connected(rig, user):
+    managed.set_telegram(rig.store_path, BOT_TOKEN, "1001")
+    rig.panel._wake()
+    result = user.act("telegram/code", {})
+    assert not result["ok"] and "чат уже подключён" in result["text"] and rig.bot.codes == 0
+    assert user.act("telegram/disconnect", {})["ok"]  # отключить можно
+
+
+def test_bot_from_config_toml_is_not_changed_by_the_panel(rig, user):
+    rig.config_path.write_text(
+        CONFIG + f'\n[notify]\ntelegram_bot_token = "{BOT_TOKEN}"\ntelegram_chat_id = "7"\n',
+        encoding="utf-8")
+    rig.panel._wake()
+    for step, body in (("connect", {"token": BOT_TOKEN}), ("code", {}), ("disconnect", {})):
+        result = user.act(f"telegram/{step}", body)
+        assert not result["ok"] and "config.toml" in result["text"], step
+    assert not rig.store_path.exists() and rig.bot.codes == 0
+
+
+def test_telegram_without_a_running_bot_is_refused(rig, user):
+    rig.panel.bot = None
+    result = user.act("telegram/connect", {"token": BOT_TOKEN})
+    assert not result["ok"] and "ещё не запущен" in result["text"]
+    assert not rig.store_path.exists()
 
 
 # --- кнопка включения ----------------------------------------------------------------

@@ -31,7 +31,7 @@
   };
   const KINDS = {
     capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
-    rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель",
+    rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
@@ -218,6 +218,7 @@
     draw("links", s.links, () => renderLinks(s));
     draw("devices", [s.devices, s.lan], () => renderDevices(s));
     draw("events", s.events, () => renderEvents(s));
+    draw("telegram", [s.telegram, Math.floor(s.now / 20)], () => renderTelegram(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
     $("scan").hidden = !s.spares.length;
@@ -532,6 +533,41 @@
       control ? el("div", { class: "row-tools" }, control) : null);
   }
 
+  // Бот Telegram: токен → код, который отправляют боту → чат подключён. Токен в
+  // страницу не возвращается; поле очищается сразу после отправки.
+  function renderTelegram(s) {
+    const t = s.telegram;
+    const bot = t.username ? `@${t.username}` : "бота";
+    const text = {
+      unavailable: "Бот запускается…",
+      off: "Бот присылает уведомления о сбоях и отвечает на команды (/status, /disable…). Создайте бота у @BotFather и вставьте его токен.",
+      pairing: "Токен принят. Осталось подключить ваш чат.",
+      connected: t.managed
+        ? `Подключён ${bot}. В чате с ботом: /help — список команд. Управлять можно только в личной переписке.`
+        : `Бот ${bot} задан в config.toml: менять его можно только там.`,
+      notify: "Бот присылает уведомления, команды отключены (notify.commands в config.toml).",
+      no_chat: "В config.toml задан токен бота, но не задан telegram_chat_id.",
+    }[t.mode] || "";
+    $("tg-text").textContent = text;
+    const chip = $("tg-chip");
+    chip.hidden = !["connected", "notify", "pairing"].includes(t.mode);
+    chip.className = t.mode === "pairing" ? "tag warn" : "tag on";
+    chip.textContent = t.mode === "pairing" ? "ждёт чат" : "подключён";
+    $("tg-error").hidden = !t.error;
+    $("tg-error").textContent = t.error || "";
+    $("tg-form").hidden = t.mode !== "off";
+    $("tg-pair").hidden = t.mode !== "pairing";
+    if (t.mode === "pairing") {
+      $("tg-pair-text").textContent = t.code
+        ? `Откройте ${bot} в Telegram и отправьте ему сообщение:`
+        : "Код истёк или ещё не получен. Нажмите «Новый код».";
+      $("tg-cmd").hidden = !t.code;
+      $("tg-cmd").textContent = t.code ? `/start ${t.code}` : "";
+      $("tg-until").textContent = t.code ? `Код действует до ${clock(t.until)} и подходит один раз.` : "";
+    }
+    $("tg-actions").hidden = !(t.managed && ["pairing", "connected", "notify"].includes(t.mode));
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -577,6 +613,20 @@
     const pressed = $("power").getAttribute("aria-pressed") === "true";
     act("power", { on: !pressed }, $("power"));
   });
+
+  $("tg-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const token = $("tg-token").value.trim();
+    if (!token) {
+      $("tg-token").focus();
+      return;
+    }
+    if (await act("telegram/connect", { token }, $("tg-submit"))) $("tg-token").value = "";
+  });
+  $("tg-newcode").addEventListener("click", () => act("telegram/code", {}, $("tg-newcode")));
+  $("tg-off").addEventListener("click", () => confirmRemove(
+    "Отключить бота?", "Шлюз перестанет присылать уведомления в Telegram и отвечать на команды. Токен будет забыт.",
+    () => act("telegram/disconnect", {}), "Отключить"));
 
   $("unpin").addEventListener("click", () => act("unpin", {}, $("unpin")));
   $("refresh").addEventListener("click", () => act("refresh", {}));

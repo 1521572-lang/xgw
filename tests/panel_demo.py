@@ -163,7 +163,44 @@ class DemoDaemon:
     scan_pending = property(lambda self: time.time() < self._until["scan"])
 
 
+class DemoBot:
+    """Бот, который ничего не отправляет: токен → код → через 12 секунд «чат подключён»."""
+
+    mark = None
+
+    def __init__(self) -> None:
+        self.mode, self.code, self.since = "off", "", 0.0
+
+    def info(self) -> dict:
+        if self.mode == "pairing" and time.time() - self.since > 12:
+            self.mode, self.code = "connected", ""  # «пользователь отправил /start КОД»
+        return {"mode": self.mode, "managed": True, "username": "xgw_demo_bot", "error": "",
+                "code": self.code, "until": self.since + 900 if self.code else None,
+                "commands": True}
+
+    def new_code(self) -> str:
+        self.mode, self.code, self.since = "pairing", "482915", time.time()
+        return self.code
+
+    def drop_code(self) -> None:
+        self.mode, self.code = "off", ""
+
+    def configure(self, *_args, **_kwargs) -> None:
+        pass
+
+
 class DemoPanel(Panel):
+    def _telegram(self, step: str, body: dict, store_path) -> actions.Outcome:
+        bot = self.bot
+        if step == "connect":
+            bot.new_code()
+            return actions.Outcome(0, "Токен сохранён. Откройте бота в Telegram и отправьте код")
+        if step == "code":
+            bot.new_code()
+            return actions.Outcome(0, "Новый код готов")
+        bot.drop_code()
+        return actions.Outcome(0, "Бот отключён")
+
     def _selected(self, xray_ok: bool, now: float) -> list[str]:
         return ["proxy-nl-a1a1"] if xray_ok else []
 
@@ -236,7 +273,7 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     cfg, _warnings = config.load(config_path)
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
                       capture_factory=DemoCapture, runner=lambda *_args, **_kwargs: "")
-    panel.configure(cfg, DemoDaemon())
+    panel.configure(cfg, DemoDaemon(), DemoBot())
     return panel
 
 

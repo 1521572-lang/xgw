@@ -139,6 +139,7 @@ class Panel:
         self.runner = runner
         self.cfg = Config()
         self.daemon = None
+        self.bot = None
         self._lock = threading.Lock()  # одно действие за раз
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
@@ -154,10 +155,11 @@ class Panel:
         panel.configure(cfg)
         return panel
 
-    def configure(self, cfg: Config, daemon=None) -> None:
-        """Новые настройки и новый демон после перечитывания конфига."""
+    def configure(self, cfg: Config, daemon=None, bot=None) -> None:
+        """Новые настройки, новый демон и бот Telegram после перечитывания конфига."""
         self.cfg = cfg
         self.daemon = daemon
+        self.bot = bot
 
     # --- запуск ------------------------------------------------------------------
 
@@ -439,6 +441,7 @@ class Panel:
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
             "devices": devices,
+            "telegram": self.bot.info() if self.bot is not None else {"mode": "unavailable"},
             "events": events,
             "budget": snapshot.get("budget") or {},
             "pending_restart": bool(snapshot.get("pending_restart")),
@@ -615,6 +618,38 @@ class Panel:
         self._wake()
         return actions.Outcome(0, done, notes)
 
+    def _telegram(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
+        """Подключение бота: токен → код → «/start КОД» в Telegram; отключение."""
+        bot, cfg = self.bot, self.cfg
+        if bot is None:
+            return actions.Outcome(1, "бот Telegram ещё не запущен — повторите через минуту")
+        if cfg.notify.telegram_bot_token and not cfg.managed.telegram:
+            return actions.Outcome(
+                2, "Бот задан в config.toml: менять его можно только там "
+                   "(notify.telegram_bot_token)",
+            )
+        if step == "connect":
+            token = managed.check_bot_token(body.get("token"))
+            managed.set_telegram(store_path, token)  # прежний чат при смене бота не нужен
+            self._wake()
+            bot.configure(self.cfg, self.daemon, bot.mark)
+            bot.new_code(token)
+            self._event("бот Telegram: токен сохранён, жду подключения чата")
+            return actions.Outcome(0, "Токен сохранён. Откройте бота в Telegram и отправьте код")
+        if step == "code":
+            if not cfg.managed.telegram or cfg.notify.telegram_chat_id:
+                return actions.Outcome(2, "чат уже подключён — сначала отключите бота")
+            bot.new_code(cfg.notify.telegram_bot_token)
+            return actions.Outcome(0, "Новый код готов")
+        if step == "disconnect":
+            managed.set_telegram(store_path, "")
+            bot.forget()
+            self._wake()
+            bot.configure(self.cfg, self.daemon, bot.mark)
+            self._event("бот Telegram отключён")
+            return actions.Outcome(0, "Бот отключён")
+        return actions.Outcome(2, "нет такого действия")
+
     def _config_names(self) -> set[str]:
         """Имена подписок, вписанных в config.toml: панель их не трогает."""
         mine = set(self.cfg.managed.subscriptions)
@@ -644,12 +679,7 @@ class Panel:
             if problem:
                 return actions.Outcome(1, problem)
             if body.get("on") is True:
-                if engine.healthy_http_in(cfg) is None:
-                    return actions.Outcome(
-                        1, "Xray не отвечает — VPN не включён: иначе машина осталась бы "
-                           "без интернета. Проверьте подписку и серверы",
-                    )
-                return actions.enable(cfg, paths, self._capture())
+                return actions.enable_checked(cfg, paths, self._capture())
             if body.get("on") is False:
                 return actions.disable(cfg, paths, self._capture())
             return actions.Outcome(2, "ожидается on: true или false")
@@ -666,6 +696,8 @@ class Panel:
             return self._set_servers(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
+        if name.startswith("telegram/"):
+            return self._telegram(name.removeprefix("telegram/"), body, store_path)
         if name == "subscription/remove":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:

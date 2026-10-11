@@ -499,6 +499,29 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
             "READY",
         )
 
+    def start_telegram(self, port: int = 8081) -> str:
+        """Поддельный Telegram Bot API на стороне «интернета». Возвращает его адрес."""
+        self._spawn(
+            "telegram", "inet",
+            [sys.executable, str(HERE.parent / "fake_telegram.py"),
+             "--host", self.inet_ip, "--port", str(port)],
+            "READY",
+        )
+        return f"http://{self.inet_ip}:{port}"
+
+    def telegram(self, path: str, port: int = 8081):
+        """Запрос к управлению поддельным Telegram; ответ разобран из JSON."""
+        script = (
+            "import json, sys, urllib.request\n"
+            "print(urllib.request.urlopen(sys.argv[1], timeout=10).read().decode())"
+        )
+        result = self.run_in(
+            "inet", sys.executable, "-c", script, f"http://{self.inet_ip}:{port}{path}"
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"fake telegram {path}: {result.stderr}")
+        return json.loads(result.stdout)
+
     def start_dnsmasq(self) -> subprocess.Popen:
         """dnsmasq шлюза с конфигом, который выдаёт `xgw net show dnsmasq`."""
         conf = self.workdir / "dnsmasq.conf"

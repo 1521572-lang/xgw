@@ -136,6 +136,10 @@ class Notify:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     min_interval_min: int = 10
+    # Бот отвечает на команды из своего чата (/status, /enable…); false — только
+    # уведомления. Адрес API меняют для собственного сервера Bot API.
+    commands: bool = True
+    telegram_api: str = "https://api.telegram.org"
 
 
 @dataclass
@@ -157,6 +161,8 @@ class Managed:
     # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
     # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
     devices: list[str] = field(default_factory=list)
+    # Токен бота и чат подключены в панели (а не вписаны в config.toml).
+    telegram: bool = False
 
 
 @dataclass
@@ -254,6 +260,14 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.disabled = list(data["disabled"])
     cfg.managed.removed = list(data["removed"])
     warnings.extend(_merge_devices(cfg, data["devices"]))
+    bot = data["telegram"]
+    if bot["token"]:
+        if cfg.notify.telegram_bot_token:
+            warnings.append("бот Telegram из панели пропущен: бот уже задан в config.toml")
+        else:
+            cfg.notify.telegram_bot_token = bot["token"]
+            cfg.notify.telegram_chat_id = bot["chat_id"]
+            cfg.managed.telegram = True
     return warnings
 
 
@@ -430,6 +444,15 @@ def _validate(cfg: Config) -> list[str]:
             warnings.append(f"порт {name}={port} вне диапазона 1–65535")
     if cfg.xray.version != "latest" and not re.fullmatch(r"\d+(\.\d+){0,2}", cfg.xray.version):
         warnings.append('xray.version: "latest" или версия цифрами, например 25.7.23')
-    if cfg.notify.telegram_bot_token and not cfg.notify.telegram_chat_id:
+    # Бот из панели без чата — это ожидание подключения, а не ошибка настройки.
+    waiting = cfg.managed.telegram
+    if cfg.notify.telegram_bot_token and not cfg.notify.telegram_chat_id and not waiting:
         warnings.append("задан telegram_bot_token, но не задан telegram_chat_id")
+    if not re.fullmatch(r"https?://[^\s/]+/?", cfg.notify.telegram_api):
+        warnings.append(
+            f"notify.telegram_api={cfg.notify.telegram_api}: ожидается http(s)://адрес — "
+            f"используется {Notify().telegram_api}"
+        )
+        cfg.notify.telegram_api = Notify().telegram_api
+    cfg.notify.telegram_api = cfg.notify.telegram_api.rstrip("/")
     return warnings

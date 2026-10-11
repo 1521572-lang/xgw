@@ -12,9 +12,12 @@ import contextlib
 import os
 import signal
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+from .. import masking
 
 
 class XrayServiceError(Exception):
@@ -82,15 +85,26 @@ class ProcessXrayService(XrayService):
         self.config_path = str(config_path)
         self.grace = grace
         self._proc: subprocess.Popen | None = None
+        self._err = None  # stderr процесса: нужен, чтобы сказать, почему он упал
+
+    def _error_tail(self) -> str:
+        if self._err is None:
+            return ""
+        self._err.seek(0)
+        text = self._err.read().decode("utf-8", errors="replace").strip()
+        return masking.mask_text(" ".join(text[-300:].split()))
 
     def start(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
+        if self._err is not None:
+            self._err.close()
+        self._err = tempfile.TemporaryFile()  # noqa: SIM115 — живёт, пока жив процесс
         try:
             self._proc = subprocess.Popen(
                 [self.bin_path, "run", "-c", self.config_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._err,
             )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc
@@ -99,7 +113,10 @@ class ProcessXrayService(XrayService):
         deadline = time.monotonic() + min(self.grace, 1.0)
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
-                raise XrayServiceError("xray завершился сразу после запуска")
+                tail = self._error_tail()
+                raise XrayServiceError(
+                    "xray завершился сразу после запуска" + (f": {tail}" if tail else "")
+                )
             time.sleep(0.1)
 
     def stop(self) -> None:

@@ -480,7 +480,9 @@ def _stamp(config_path: Path) -> tuple[float, float]:
     return _mtime(config_path), _mtime(managed.path_for(config_path))
 
 
-def _sync_panel(panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
+def _sync_panel(
+    panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger, bot=None
+):
     """Панель живёт дольше одного демона: перечитывание настроек её не перезапускает."""
     from .watch.panel import Panel
 
@@ -499,8 +501,21 @@ def _sync_panel(panel, cfg: config.Config, paths: Paths, config_path: Path, daem
             logger.error("панель управления не запущена (порт %d): %s", cfg.panel.port, exc)
             return None
     if panel is not None:
-        panel.configure(cfg, daemon)
+        panel.configure(cfg, daemon, bot)
     return panel
+
+
+def _sync_bot(bot, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
+    """Бот Telegram, как и панель, живёт дольше одного демона. Он создаётся всегда, но
+    пока токена нет, молчит: токен можно вставить в панели уже после запуска."""
+    from .watch.telegram import Bot
+
+    if bot is None:
+        bot = Bot(paths, config_path, logger=logger, root_problem=lambda: _root_problem(),
+                  capture_factory=lambda *args, **kwargs: Capture(*args, **kwargs))
+        bot.start()
+    bot.configure(cfg, daemon, engine.bypass_mark(cfg, logger))
+    return bot
 
 
 def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
@@ -520,6 +535,7 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     reloaded = False
     previous = None
     panel = None
+    bot = None
     try:
         while True:
             stamp = _stamp(args.config_path)
@@ -541,7 +557,8 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             if previous is not None:
                 daemon.adopt(previous)
             previous = daemon
-            panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger)
+            bot = _sync_bot(bot, cfg, paths, args.config_path, daemon, logger)
+            panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger, bot)
             page = None
             try:
                 page = StatusPage.from_config(cfg, paths)
@@ -572,6 +589,8 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     finally:
         if panel is not None:
             panel.stop()
+        if bot is not None:
+            bot.stop()
 
 
 # --- install / uninstall / diag / update-xray / logs ----------------------------

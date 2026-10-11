@@ -15,7 +15,12 @@ from xgw.watch import status
 from xgw.watch.notify import Notifier
 from xgw.xraycore import service as service_module
 from xgw.xraycore.api import BalancerInfo, parse_balancer_info
-from xgw.xraycore.service import PidfileXrayService, XrayServiceError, pid_alive
+from xgw.xraycore.service import (
+    PidfileXrayService,
+    ProcessXrayService,
+    XrayServiceError,
+    pid_alive,
+)
 
 # --- xray api bi ---------------------------------------------------------------
 
@@ -104,6 +109,14 @@ def test_pidfile_service_reports_instant_crash(tmp_path, fake_xray):
         service.start()
     assert not service.is_active()
     assert "failed to load config" in service.log_file.read_text()  # причина — в логе рядом
+
+
+def test_process_service_says_why_xray_exited(tmp_path):
+    # Вместо Xray — Python: на «run -c …» он сразу падает и пишет причину в stderr.
+    service = ProcessXrayService(sys.executable, tmp_path / "config.json", grace=5)
+    with pytest.raises(XrayServiceError, match=r"сразу после запуска: .*run") as caught:
+        service.start()
+    assert "\n" not in str(caught.value) and not service.is_active()
 
 
 def test_pid_alive():

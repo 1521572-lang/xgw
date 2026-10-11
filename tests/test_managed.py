@@ -29,7 +29,8 @@ def _save(conf, data) -> None:
 
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
-        {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": []}, "")
+        {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
+         "telegram": {"token": "", "chat_id": ""}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -81,6 +82,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "disabled": ["aaaa1111"],  # убранный сервер отключённым уже не считается
         "removed": ["bbbb2222"],
         "devices": [],
+        "telegram": {"token": "", "chat_id": ""},
     }
 
 
@@ -271,3 +273,84 @@ def test_config_toml_wins_over_panel_devices(conf):
     assert warnings == [
         "устройство aa:bb:cc:00:11:33 из панели пропущено: MAC или адрес 192.168.50.88 "
         "уже заняты в network.static_leases"]
+
+
+# --- бот Telegram из панели ------------------------------------------------------------------
+
+BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly_0123456789abc"
+
+
+def test_bot_token_is_checked_before_it_is_saved(conf):
+    path = managed.path_for(conf)
+    for bad in ("", "  ", "не токен", "123:short", "abc:" + "A" * 35, None, 5):
+        with pytest.raises(ManagedError, match="токен бота"):
+            managed.check_bot_token(bad)
+    assert managed.check_bot_token(f"  {BOT_TOKEN}\n") == BOT_TOKEN
+    with pytest.raises(ManagedError):
+        managed.set_telegram(path, "не токен")
+    with pytest.raises(ManagedError, match="чата"):
+        managed.set_telegram(path, BOT_TOKEN, "не число")
+    assert not path.exists()
+
+    managed.set_telegram(path, BOT_TOKEN)
+    assert managed.load(path)[0]["telegram"] == {"token": BOT_TOKEN, "chat_id": ""}
+    managed.set_telegram(path, BOT_TOKEN, "-100123")
+    assert managed.load(path)[0]["telegram"] == {"token": BOT_TOKEN, "chat_id": "-100123"}
+    assert oct(os.stat(path).st_mode & 0o777) in ("0o600", "0o666")  # токен — как пароль
+    managed.set_telegram(path, "")
+    assert managed.load(path)[0]["telegram"] == {"token": "", "chat_id": ""}
+
+
+def test_junk_telegram_entries_are_dropped(conf):
+    for value in ("строка", 5, [], {"token": 5}, {"token": "123:short", "chat_id": "1"},
+                  {"token": BOT_TOKEN, "chat_id": "abc"}):
+        _save(conf, {"telegram": value})
+        data = managed.load(managed.path_for(conf))[0]["telegram"]
+        assert data == {"token": BOT_TOKEN if isinstance(value, dict) and value.get("token")
+                        == BOT_TOKEN else "", "chat_id": ""}, value
+
+
+def test_panel_bot_fills_the_notify_settings(conf):
+    managed.set_telegram(managed.path_for(conf), BOT_TOKEN)
+    cfg, warnings = config.load(conf)
+    assert warnings == []  # бот без чата — ожидание подключения, а не ошибка
+    assert cfg.notify.telegram_bot_token == BOT_TOKEN and cfg.notify.telegram_chat_id == ""
+    assert cfg.managed.telegram is True
+    managed.set_telegram(managed.path_for(conf), BOT_TOKEN, "1001")
+    cfg, warnings = config.load(conf)
+    assert (cfg.notify.telegram_chat_id, warnings) == ("1001", [])
+
+
+def test_bot_in_config_toml_wins_over_the_panel(conf):
+    conf.write_text(
+        conf.read_text(encoding="utf-8")
+        + f'[notify]\ntelegram_bot_token = "999999999:{"Z" * 35}"\ntelegram_chat_id = "7"\n',
+        encoding="utf-8")
+    managed.set_telegram(managed.path_for(conf), BOT_TOKEN, "1001")
+    cfg, warnings = config.load(conf)
+    assert cfg.notify.telegram_chat_id == "7" and cfg.managed.telegram is False
+    assert warnings == ["бот Telegram из панели пропущен: бот уже задан в config.toml"]
+
+
+def test_toml_token_without_chat_is_still_a_warning(conf):
+    conf.write_text(
+        conf.read_text(encoding="utf-8") + f'[notify]\ntelegram_bot_token = "{BOT_TOKEN}"\n',
+        encoding="utf-8")
+    _cfg, warnings = config.load(conf)
+    assert warnings == ["задан telegram_bot_token, но не задан telegram_chat_id"]
+
+
+@pytest.mark.parametrize("api", ["ftp://x", "api.telegram.org", "http://", "https://a b"])
+def test_telegram_api_must_be_an_http_address(conf, api):
+    conf.write_text(
+        conf.read_text(encoding="utf-8") + f'[notify]\ntelegram_api = "{api}"\n', encoding="utf-8")
+    cfg, warnings = config.load(conf)
+    assert cfg.notify.telegram_api == "https://api.telegram.org"
+    assert any("notify.telegram_api" in warning for warning in warnings)
+
+
+def test_telegram_api_trailing_slash_is_dropped(conf):
+    conf.write_text(
+        conf.read_text(encoding="utf-8") + '[notify]\ntelegram_api = "http://127.0.0.1:8081/"\n',
+        encoding="utf-8")
+    assert config.load(conf)[0].notify.telegram_api == "http://127.0.0.1:8081"

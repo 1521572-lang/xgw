@@ -96,6 +96,18 @@ def enable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
     return Outcome(0, text)
 
 
+def enable_checked(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
+    """Включение для тех, кто не видит терминала (панель, бот): пока Xray не отвечает,
+    не включает — с fail-closed машина осталась бы без интернета, а человек без
+    возможности вернуть его. Команда `xgw enable` включает и предупреждает."""
+    if engine.healthy_http_in(cfg) is None:
+        return Outcome(
+            1, "Xray не отвечает — VPN не включён: иначе машина осталась бы без интернета. "
+               "Проверьте подписку и серверы",
+        )
+    return enable(cfg, paths, capture)
+
+
 def disable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
     paths.ensure()
     try:

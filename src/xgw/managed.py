@@ -1,4 +1,4 @@
-"""Подписки, ссылки и устройства, добавленные из панели: /etc/xgw/panel.json.
+"""Подписки, ссылки, устройства и бот Telegram, добавленные из панели: /etc/xgw/panel.json.
 
 config.toml пишет человек — с комментариями и в своём порядке; программа его не
 переписывает. То, что добавлено кнопкой в панели, лежит отдельным файлом рядом
@@ -30,6 +30,8 @@ SERVER_MODES = ("enabled", "disabled", "removed")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+_BOT_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")  # «123456789:AA…», как выдаёт @BotFather
+_CHAT_ID_RE = re.compile(r"-?\d{1,20}")
 
 
 class ManagedError(Exception):
@@ -48,6 +50,7 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
+        "telegram": {"token": "", "chat_id": ""},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -79,6 +82,7 @@ def load(path: Path) -> tuple[dict, str]:
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
+        "telegram": _telegram(raw.get("telegram")),
     }, ""
 
 
@@ -119,6 +123,42 @@ def _devices(value: object) -> list[dict]:
             "name": name if isinstance(name, str) and _NAME_RE.fullmatch(name) else "",
         })
     return result[:MAX_DEVICES]
+
+
+def _telegram(value: object) -> dict:
+    """Бот из панели: токен и chat_id (пусто, пока чат не подключён). Токен без
+    настоящего вида не принимается — раньше, чем уйдёт в запрос."""
+    token = chat = ""
+    if isinstance(value, dict):
+        raw_token, raw_chat = value.get("token"), value.get("chat_id")
+        if isinstance(raw_token, str) and _BOT_TOKEN_RE.fullmatch(raw_token):
+            token = raw_token
+            if isinstance(raw_chat, str) and _CHAT_ID_RE.fullmatch(raw_chat):
+                chat = raw_chat
+    return {"token": token, "chat_id": chat}
+
+
+def check_bot_token(text: object) -> str:
+    """Токен бота из вставленного текста; иначе ManagedError."""
+    token = text.strip() if isinstance(text, str) else ""
+    if not _BOT_TOKEN_RE.fullmatch(token):
+        raise ManagedError(
+            "это не похоже на токен бота: он выглядит как 123456789:AAH… и выдаётся @BotFather"
+        )
+    return token
+
+
+def set_telegram(path: Path, token: str, chat_id: str = "") -> None:
+    """Запоминает бота; chat_id пуст, пока чат не подключён. Пустой токен убирает бота."""
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    if token:
+        token = check_bot_token(token)
+        if chat_id and not _CHAT_ID_RE.fullmatch(chat_id):
+            raise ManagedError("неверный идентификатор чата")
+    data["telegram"] = {"token": token, "chat_id": chat_id if token else ""}
+    save(path, data)
 
 
 def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -> bool:

@@ -129,7 +129,8 @@ def telegram_sink(cfg: Config, *, mark: int | None, post=fetch.fetch_url) -> Sin
         for route in routes:
             try:
                 reply = post(
-                    f"{TELEGRAM_API}/bot{token}/sendMessage", data=data, timeout=10.0, retries=0,
+                    f"{cfg.notify.telegram_api}/bot{token}/sendMessage", data=data,
+                    timeout=10.0, retries=0,
                     headers={"Content-Type": "application/x-www-form-urlencoded"}, **route,
                 )
             except fetch.FetchError as exc:
