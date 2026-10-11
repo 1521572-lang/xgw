@@ -25,7 +25,7 @@ from pathlib import Path
 from . import __version__, actions, config, engine, log, managed
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
-from .net import cmd, dnsmasq, nft
+from .net import cmd, dnsmasq, nft, tun
 from .net.capture import Capture, CaptureError
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
@@ -455,6 +455,11 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
         if args.action == "down":
             capture.down()
             print("правила XGW убраны: таблицы nftables, ip rule и маршрут")
+            if tun.present(cfg.capture.tun_name, capture.runner):
+                print(
+                    f"интерфейс TUN {cfg.capture.tun_name} оставлен: его держит открытым Xray; "
+                    "убирает его `xgw uninstall` (после перезагрузки его нет)"
+                )
             return 0
         mode = capture.up()
     except CaptureError as exc:

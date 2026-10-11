@@ -10,7 +10,8 @@ ConditionPathExists=/etc/xgw/xray/config.json
 [Service]
 User=xray
 Group=xray
-# CAP_NET_ADMIN — метка на сокетах (sockopt.mark) и приём TPROXY.
+# CAP_NET_ADMIN — метка на сокетах (sockopt.mark), приём TPROXY и подключение к
+# TUN-интерфейсу (его заранее создаёт XGW, см. capture.method = "tun").
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

@@ -48,6 +48,14 @@ class Capture:
     mark_proxy: int = 1
     mark_bypass: int = 2
     route_table: int = 100
+    method: str = "tproxy"  # как трафик самой машины попадает в Xray: tproxy | tun
+    tun_name: str = "xgwtun0"
+    tun_route_table: int = 101  # своя таблица маршрутов в TUN (route_table занят TPROXY LAN)
+
+    @property
+    def tun(self) -> bool:
+        """Трафик самой машины идёт в Xray через TUN. Неизвестное слово — tproxy."""
+        return self.method.strip().lower() == "tun"
 
 
 @dataclass
@@ -434,6 +442,33 @@ def _validate(cfg: Config) -> list[str]:
         cfg.capture.route_table = Capture().route_table
     if cfg.capture.mark_proxy == cfg.capture.mark_bypass:
         warnings.append("capture.mark_proxy и capture.mark_bypass совпадают")
+    if (
+        not 1 <= cfg.capture.tun_route_table <= 0x7FFFFFFF
+        or cfg.capture.tun_route_table in (253, 254, 255, cfg.capture.route_table)
+    ):
+        warnings.append(
+            f"capture.tun_route_table={cfg.capture.tun_route_table}: нужен номер своей таблицы, "
+            f"не 253–255 и не route_table — используется {Capture().tun_route_table}"
+        )
+        cfg.capture.tun_route_table = Capture().tun_route_table
+    if cfg.capture.method.strip().lower() not in ("tproxy", "tun"):
+        warnings.append(
+            f"capture.method={cfg.capture.method!r}: допустимо tproxy или tun; принято tproxy"
+        )
+    elif cfg.capture.tun and not cfg.capture.local:
+        warnings.append(
+            "capture.method = tun относится к трафику самой машины: при capture.local = false "
+            "он ни на что не влияет (сеть Wi-Fi всегда перехватывается через TPROXY)"
+        )
+    others = {cfg.network.lan_if.strip(), cfg.network.wan_if.strip()} - {""}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", cfg.capture.tun_name) or (
+        cfg.capture.tun_name in others
+    ):
+        warnings.append(
+            f"capture.tun_name={cfg.capture.tun_name!r}: нужно своё имя интерфейса (до 15 "
+            f"символов, не карта LAN или WAN) — используется {Capture().tun_name}"
+        )
+        cfg.capture.tun_name = Capture().tun_name
     for name in ("interval", "timeout"):
         if not re.fullmatch(r"\d+[smh]", getattr(cfg.probe, name)):
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")

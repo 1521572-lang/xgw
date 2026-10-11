@@ -34,6 +34,7 @@ from .xraycore import binary, metrics
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 STATUS_PAGE_PORT = 8780
 OS_RELEASE = Path("/etc/os-release")
+DEV_TUN = Path("/dev/net/tun")
 CHRONY_DIR = Path("/etc/chrony")
 
 
@@ -83,7 +84,11 @@ class Diag:
         is_root: bool | None = None,
         os_release: Path = OS_RELEASE,
         port_free: Callable[[int], bool] = can_bind,
+        proc_sys: Path = sysctl.PROC_SYS,
+        dev_tun: Path = DEV_TUN,
     ) -> None:
+        self.proc_sys = proc_sys
+        self.dev_tun = dev_tun
         self.cfg = cfg
         self.paths = paths
         self.runner = runner
@@ -109,6 +114,7 @@ class Diag:
             ("Программы", self._programs),
             ("Xray", self._xray),
             ("Ядро", self._kernel),
+            ("TUN", self._tun),
             ("Файрвол", self._firewall),
             ("NetworkManager", self._nm),
             ("Порты", self._ports),
@@ -301,6 +307,32 @@ class Diag:
                 "нужны модули nft_tproxy, nft_fib, nft_ct, nft_masq (пакет linux-modules-extra)",
             )]
         return [Check("Ядро", OK, "ядро принимает правила TPROXY (tproxy, fib, ct, masquerade)")]
+
+    def _tun(self) -> list[Check]:
+        """capture.method = tun: нужен /dev/net/tun, и ответы Xray не должен резать rp_filter."""
+        cap = self.cfg.capture
+        if not (cap.tun and cap.local):
+            return []
+        result: list[Check] = []
+        if not self.dev_tun.exists():
+            return [Check(
+                "TUN", FAIL, f"нет {self.dev_tun}: в ядре нет TUN, Xray не создаст интерфейс",
+                "sudo modprobe tun (и добавьте tun в /etc/modules-load.d/xgw.conf)",
+            )]
+        result.append(Check("TUN", OK, f"{self.dev_tun} есть; интерфейс {cap.tun_name}"))
+        # Действует наибольшее из общего значения и значения интерфейса; своё значение XGW
+        # обнуляет при создании интерфейса, так что решает общее.
+        for where in ("all", cap.tun_name):
+            if sysctl.read(f"net/ipv4/conf/{where}/rp_filter", self.proc_sys) == "1":
+                result.append(Check(
+                    "TUN", WARN,
+                    f"net.ipv4.conf.{where}.rp_filter = 1 (строгий): ядро отбросит ответы Xray "
+                    "из TUN, и трафик машины зависнет",
+                    "sudo sysctl -w net.ipv4.conf.all.rp_filter=2 (и то же в /etc/sysctl.d/); "
+                    "умолчание Ubuntu — 2",
+                ))
+                break
+        return result
 
     def _firewall(self) -> list[Check]:
         if not self.root or self.which("nft") is None:

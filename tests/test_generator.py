@@ -241,6 +241,46 @@ def test_ipv6_proxy_adds_a_second_tproxy_inbound_and_answers_aaaa():
     assert proxy["streamSettings"]["sockopt"]["domainStrategy"] == "UseIPv4"
 
 
+def _tags(config: dict) -> list[str]:
+    return [i["tag"] for i in config["inbounds"] if i["tag"].startswith(("tproxy", "tun"))]
+
+
+def test_tun_method_adds_the_tun_inbound_and_keeps_tproxy_for_lan():
+    cfg = Config()
+    cfg.capture.method = "tun"
+    config = _v6_build(cfg)
+    assert _tags(config) == ["tun-in", "tproxy-in"]
+    tun = config["inbounds"][0]
+    assert tun["protocol"] == "tun" and tun["settings"] == {"name": "xgwtun0", "mtu": 1500}
+    assert "listen" not in tun and "port" not in tun  # TUN не слушает порт
+    assert tun["sniffing"] == config["inbounds"][1]["sniffing"]  # домены определяются так же
+    dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
+    assert dns_rule["inboundTag"] == ["tproxy-in", "tun-in"]
+    cfg.capture.tun_name = "xgwvpn7"
+    assert _v6_build(cfg)["inbounds"][0]["settings"]["name"] == "xgwvpn7"
+
+
+def test_tun_without_lan_capture_has_no_tproxy_inbound():
+    cfg = Config()
+    cfg.capture.method = "tun"
+    cfg.capture.lan = False
+    config = _v6_build(cfg)
+    assert _tags(config) == ["tun-in"]
+    dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
+    assert dns_rule["inboundTag"] == ["tun-in"]
+    cfg.capture.local = False  # TUN — это про саму машину; без неё inbound не нужен
+    assert _tags(_v6_build(cfg)) == []
+
+
+def test_ipv6_over_tun_needs_no_second_inbound():
+    cfg = Config()
+    cfg.capture.method = "tun"
+    cfg.network.ipv6 = "proxy"
+    config = _v6_build(cfg, ipv6=True)
+    assert _tags(config) == ["tun-in", "tproxy-in"]  # tproxy-in6 не нужен: TUN несёт оба семейства
+    assert config["dns"]["queryStrategy"] == "UseIP"
+
+
 def test_no_ipv6_inbound_by_default_or_without_local_capture(monkeypatch):
     config = _v6_build(Config())
     assert [i["tag"] for i in config["inbounds"] if i["tag"].startswith("tproxy")] == ["tproxy-in"]

@@ -402,6 +402,11 @@ class Installer:
                 else "без Xray перехват через минуту снимется (fail_mode = open)"
             )
             lines.append(f"  • перехват: {' и '.join(scope)} — через Xray; {closed}")
+            if info["tun"]:
+                lines.append(
+                    f"  • TUN: постоянный интерфейс {cfg.capture.tun_name} (его создаёт XGW, а "
+                    "не Xray); трафик самой машины идёт в него, сеть LAN — через TPROXY"
+                )
             if not engine.has_sources(cfg):
                 lines.append(
                     "  • подписок пока нет: VPN не включится, пока вы не добавите подписку "
@@ -445,6 +450,8 @@ class Installer:
         self.journal.set("capture", {
             "mark_proxy": self.cfg.capture.mark_proxy,
             "route_table": self.cfg.capture.route_table,
+            "tun_route_table": self.cfg.capture.tun_route_table,
+            "tun_name": self.cfg.capture.tun_name,
         })
         try:
             self._system(facts)

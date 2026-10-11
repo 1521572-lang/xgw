@@ -81,3 +81,30 @@ def test_find_invalid_outbounds(monkeypatch, tmp_path):
     invalid = validate.find_invalid_outbounds(outbounds, tmp_path / "xray")
     assert list(invalid) == ["spare-de-bbbb"]
     assert "unknown transport" in invalid["spare-de-bbbb"]
+
+
+def test_tun_inbound_is_renamed_for_the_check_and_dropped_without_root(monkeypatch):
+    """`xray run -test` создаёт интерфейс из inbound tun; рабочий Xray держит интерфейс
+    XGW открытым, поэтому проверка идёт с одноразовым именем (а без root — без inbound)."""
+    config = {
+        "inbounds": [
+            {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0", "mtu": 1500}},
+            {"tag": "http-in", "protocol": "http", "port": 10809},
+        ],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+    }
+    monkeypatch.setattr(validate.os, "geteuid", lambda: 0, raising=False)
+    checked = validate._for_test(config)
+    assert checked is not config
+    name = checked["inbounds"][0]["settings"]["name"]
+    assert name.startswith("xgwchk") and name != "xgwtun0" and len(name) <= 15
+    assert checked["inbounds"][0]["settings"]["mtu"] == 1500 and checked["inbounds"][1] == (
+        config["inbounds"][1])
+    assert config["inbounds"][0]["settings"]["name"] == "xgwtun0"  # исходный конфиг цел
+
+    monkeypatch.setattr(validate.os, "geteuid", lambda: 1000, raising=False)
+    assert [i["tag"] for i in validate._for_test(config)["inbounds"]] == ["http-in"]
+
+    plain = {"inbounds": [{"tag": "http-in", "protocol": "http"}]}
+    assert validate._for_test(plain) is plain  # без tun конфиг не копируется
+    assert validate._for_test({"outbounds": []}) == {"outbounds": []}

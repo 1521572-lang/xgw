@@ -284,6 +284,55 @@ def test_apply_fails_when_proxied_ipv6_rules_cannot_be_loaded():
     assert len(nft.apply(rules, kernel)) == 1  # без proxy — только предупреждение
 
 
+def _tun(**network):
+    cfg = _cfg(**network)
+    cfg.capture.method = "tun"
+    return cfg
+
+
+def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
+    rules, warnings = nft.build_rules(_tun(), capture=True, time_uids=())
+    assert warnings == [] and rules.tun and rules.tun_name == "xgwtun0"
+    text = nft.render(rules)
+    # Сеть LAN — по-прежнему TPROXY, но на lo он больше не нужен.
+    assert _chain(text, "prerouting") == [
+        'iifname != "lan0" return',
+        "meta l4proto != { tcp, udp } return",
+        "ip saddr @bypass4 return",
+        "fib daddr type local th dport != 53 return",
+        "ip daddr @reserved4 th dport != 53 return",
+        "meta l4proto { tcp, udp } counter tproxy to 127.0.0.1:12345 meta mark set 0x1 accept",
+    ]
+    # Метит трафик машины та же цепочка output: дальше его ведёт маршрут, а не lo.
+    assert _chain(text, "output") == _chain(_render(_cfg()), "output")
+    assert "loopback_guard" in text
+
+
+def test_tun_without_lan_has_no_tproxy_chain_at_all():
+    cfg = Config()
+    cfg.capture.method = "tun"
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    text = nft.render(rules)
+    assert "chain prerouting" not in text and "tproxy" not in text
+    assert "chain output" in text and "chain loopback_guard" in text
+    assert not rules.prerouting
+    cfg.network.ipv6 = "proxy"
+    text6 = nft.render6(nft.build_rules(cfg, capture=True, time_uids=())[0])
+    assert "chain prerouting" not in text6 and "tproxy" not in text6
+    assert "chain output" in text6 and "chain loopback_guard" in text6
+
+
+def test_tun_is_ignored_without_local_capture_or_while_capture_is_off():
+    cfg = _tun()
+    cfg.capture.local = False
+    assert not nft.build_rules(cfg, capture=True, time_uids=())[0].tun
+    assert not nft.build_rules(_tun(), capture=False, time_uids=())[0].tun
+    assert not nft.build_rules(_cfg(), capture=True, time_uids=())[0].tun
+    cfg = _cfg()
+    cfg.capture.method = "что-то"  # непонятное слово — tproxy, а не tun
+    assert not nft.build_rules(cfg, capture=True, time_uids=())[0].tun
+
+
 def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     kernel = FakeKernel()
@@ -337,7 +386,12 @@ def _variants():
     lan_only.capture.local = False
     ipv6 = _proxy6(wan_if="wan0")
     ipv6.capture.exclude_cidrs = ["2001:db8:77::/48"]
+    tun = _tun(wan_if="wan0")
+    tun_only = Config(network=Network(ipv6="proxy"))
+    tun_only.capture.method = "tun"
     return {
+        "TUN": (tun, True),
+        "TUN без LAN, с IPv6": (tun_only, True),
         "IPv6 машины": (ipv6, True),
         "IPv6 без LAN": (Config(network=Network(ipv6="proxy")), True),
         "шлюз": (_cfg(), True),

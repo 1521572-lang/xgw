@@ -6,6 +6,12 @@
   open — снят демоном на время: Xray недоступен, а в конфиге fail_mode = "open";
   none — в конфиге перехват выключен (capture.lan = capture.local = false).
 
+Трафик самой машины попадает в Xray либо через TPROXY на lo (по умолчанию), либо
+через постоянный TUN-интерфейс (capture.method = "tun", см. net/tun.py); сеть LAN
+всегда через TPROXY. Интерфейс создаётся при включении перехвата и убирается только
+командой `net down`: `xgw disable` и fail_mode = open снимают лишь правило и маршрут,
+иначе Xray остался бы с оборванным интерфейсом и потребовал перезапуска.
+
 Выбор «включён/снят» хранится в /var/lib/xgw и переживает перезагрузку: по нему
 правила загружает xgw-net.service. Временное снятие (open) — метка в /run.
 Все операции идемпотентны и идут под файловой блокировкой.
@@ -21,7 +27,7 @@ from pathlib import Path
 from .. import log
 from ..config import Config
 from ..paths import Paths, atomic_write_json, file_lock
-from . import cmd, iprule, lan, nft, sysctl
+from . import cmd, iprule, lan, nft, sysctl, tun
 
 
 class CaptureError(Exception):
@@ -123,25 +129,56 @@ class Capture:
     def _lock(self):
         return file_lock(self.paths.run / "net.lock", timeout=30.0)
 
+    def _families(self) -> tuple[int, ...]:
+        return (4, 6) if self.ipv6_usable() else (4,)
+
+    @staticmethod
+    def _wanted(rules: nft.Rules, family: int) -> tuple[bool, bool]:
+        """(локальная доставка для TPROXY, маршрут в TUN) для семейства адресов."""
+        tproxy = rules.prerouting if family == 4 else rules.prerouting6
+        return tproxy, rules.tun and (family == 4 or rules.capture6)
+
+    def _routes_up(self, rules: nft.Rules) -> None:
+        """Интерфейс, правила `ip rule` и маршруты, которые нужны текущим правилам."""
+        cap = self.cfg.capture
+        if rules.tun:
+            tun.ensure(rules.tun_name, self.runner, self.proc_sys)
+        for family in self._families():
+            tproxy, via_tun = self._wanted(rules, family)
+            if tproxy:
+                iprule.ensure(cap.mark_proxy, cap.route_table, self.runner, family)
+            if via_tun:
+                iprule.ensure_tun(
+                    cap.mark_proxy, cap.tun_route_table, self.runner, family, rules.tun_name
+                )
+
+    def _routes_down(self, rules: nft.Rules) -> None:
+        """Правила `ip rule` и маршруты, которые текущим правилам не нужны (остались от
+        другого режима, от ipv6 = proxy или от снятого перехвата)."""
+        cap = self.cfg.capture
+        for family in self._families():
+            tproxy, via_tun = self._wanted(rules, family)
+            if not tproxy:
+                iprule.remove(cap.mark_proxy, cap.route_table, self.runner, family)
+            if not via_tun:
+                iprule.remove_tun(
+                    cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name
+                )
+
     def _load(self, mode: str) -> str:
         rules = self.rules(mode)
-        mark, table = self.cfg.capture.mark_proxy, self.cfg.capture.route_table
         try:
             if rules.lan_if:
                 self._forwarding_on()
             if rules.capture:
-                # Сначала маршрут для помеченных пакетов, потом правила, которые метят.
-                iprule.ensure(mark, table, self.runner)
-                if rules.capture6:
-                    iprule.ensure(mark, table, self.runner, 6)
+                # Сначала интерфейс и маршрут для помеченных пакетов, потом правила,
+                # которые метят; ненужное убирается уже после них.
+                self._routes_up(rules)
                 warnings = nft.apply(rules, self.runner)
-                if not rules.capture6 and self.ipv6_usable():
-                    iprule.remove(mark, table, self.runner, 6)  # остался от ipv6 = proxy
+                self._routes_down(rules)
             else:
                 warnings = nft.apply(rules, self.runner)
-                iprule.remove(mark, table, self.runner)
-                if self.ipv6_usable():
-                    iprule.remove(mark, table, self.runner, 6)
+                self._routes_down(rules)
         except (cmd.CommandError, OSError) as exc:
             raise CaptureError(str(exc)) from exc
         for warning in warnings:
@@ -183,19 +220,18 @@ class Capture:
             self.open_marker.unlink(missing_ok=True)
             return self._load(self.mode())
 
-    def down(self) -> None:
-        """Убирает всё, что XGW добавил в сеть: таблицы, правило, маршрут, форвардинг."""
+    def down(self, *, remove_tun: bool = False) -> None:
+        """Убирает всё, что XGW добавил в сеть: таблицы, правило, маршрут, форвардинг.
+
+        TUN-интерфейс остаётся, если не сказано иное: его держит открытым работающий
+        Xray, и без интерфейса его inbound пришлось бы перезапускать. Удаление
+        (`xgw uninstall`) вызывает это уже после остановки служб."""
         with self._lock():
             try:
                 nft.delete(self.runner)
-                iprule.remove(
-                    self.cfg.capture.mark_proxy, self.cfg.capture.route_table, self.runner
-                )
-                if self.ipv6_usable():
-                    iprule.remove(
-                        self.cfg.capture.mark_proxy, self.cfg.capture.route_table,
-                        self.runner, 6,
-                    )
+                self._routes_down(self.rules("off"))  # перехвата нет: убирается всё
+                if remove_tun:
+                    tun.remove(self.cfg.capture.tun_name, self.runner)
                 self._forwarding_restore()
             except (cmd.CommandError, OSError) as exc:
                 raise CaptureError(str(exc)) from exc
@@ -226,7 +262,9 @@ class Capture:
             return None
         expected: set[str] = set()
         if rules.capture:
-            expected |= {"prerouting", "loopback_guard"}
+            expected.add("loopback_guard")
+        if rules.prerouting:
+            expected.add("prerouting")
         if rules.capture_local:
             expected.add("output")
         if rules.lan_if:
@@ -235,20 +273,45 @@ class Capture:
             return False
         if not rules.capture:
             return not chains & {"prerouting", "output", "loopback_guard"}
-        mark, table = self.cfg.capture.mark_proxy, self.cfg.capture.route_table
+        if not rules.prerouting and "prerouting" in chains:
+            return False  # остался TPROXY самой машины от capture.method = "tproxy"
         if rules.capture6 or self.ipv6_usable():
             chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
             if chains6 is None:
                 return None
-            captured6 = {"prerouting", "output", "loopback_guard"}
+            captured6 = {"output", "loopback_guard"}
+            if rules.prerouting6:
+                captured6.add("prerouting")
             if rules.capture6 and not captured6 <= chains6:
                 return False
-            if not rules.capture6 and chains6 & captured6:
+            if not rules.capture6 and chains6 & {"prerouting", "output", "loopback_guard"}:
                 return False  # остались правила от ipv6 = proxy
-        with contextlib.suppress(cmd.CommandError):
-            if not iprule.present(mark, table, self.runner):
+            if rules.capture6 and not rules.prerouting6 and "prerouting" in chains6:
                 return False
-            return not rules.capture6 or iprule.present(mark, table, self.runner, 6)
+        cap = self.cfg.capture
+        with contextlib.suppress(cmd.CommandError):
+            if rules.tun and not tun.present(rules.tun_name, self.runner):
+                return False
+            for family in self._families():
+                tproxy, via_tun = self._wanted(rules, family)
+                if tproxy and not iprule.present(
+                    cap.mark_proxy, cap.route_table, self.runner, family
+                ):
+                    return False
+                if via_tun and not iprule.present_tun(
+                    cap.mark_proxy, cap.tun_route_table, self.runner, family, rules.tun_name
+                ):
+                    return False
+                # Лишнее от другого режима: правило TUN после возврата на tproxy и наоборот.
+                if not via_tun and iprule.has_rule(
+                    cap.mark_proxy, cap.tun_route_table, self.runner, family, "lo"
+                ):
+                    return False
+                if not tproxy and iprule.has_rule(
+                    cap.mark_proxy, cap.route_table, self.runner, family
+                ):
+                    return False
+            return True
         return None
 
     def describe(self, *, check: bool = True) -> dict:
@@ -261,6 +324,7 @@ class Capture:
             "local": rules.capture_local,
             "bypass": list(rules.bypass),
             "ipv6": rules.capture6,
+            "tun": rules.tun,
             "fail_mode": self.cfg.capture.fail_mode,
             "loaded": self.loaded() if check else None,
         }

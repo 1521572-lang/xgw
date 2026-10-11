@@ -61,6 +61,39 @@ def test_ipv6_values(tmp_path):
     assert any("capture.local" in warning for warning in load(path)[1])
 
 
+def test_capture_method_and_tun_values(tmp_path):
+    path = tmp_path / "config.toml"
+
+    def check(text: str):
+        path.write_text(text, encoding="utf-8")
+        return load(path)
+
+    cfg, warnings = check('[capture]\nmethod = "tun"\n')
+    assert cfg.capture.tun and cfg.capture.tun_name == "xgwtun0" and warnings == []
+    cfg, warnings = check('[capture]\nmethod = "TUN"\n')
+    assert cfg.capture.tun and warnings == []
+    cfg, warnings = check('[capture]\nmethod = "wireguard"\n')
+    assert not cfg.capture.tun and any("capture.method" in warning for warning in warnings)
+    cfg, warnings = check('[capture]\nmethod = "tun"\nlocal = false\n')
+    assert any("capture.local" in warning for warning in warnings)
+    # Имя интерфейса: своё, не карта LAN или WAN и не длиннее 15 символов.
+    for name in ("wan0", "lan0", "слово", "x" * 16, ""):
+        cfg, warnings = check(
+            f'[network]\nlan_if = "lan0"\nwan_if = "wan0"\n[capture]\ntun_name = "{name}"\n'
+        )
+        assert cfg.capture.tun_name == "xgwtun0", name
+        assert any("tun_name" in warning for warning in warnings), name
+    cfg, warnings = check('[capture]\ntun_name = "vpn0"\n')
+    assert cfg.capture.tun_name == "vpn0" and warnings == []
+    # Таблица маршрутов: не системная и не та же, что у TPROXY.
+    for table in (0, 253, 254, 255, 100, -4):
+        cfg, warnings = check(f"[capture]\ntun_route_table = {table}\n")
+        assert cfg.capture.tun_route_table == 101, table
+        assert any("tun_route_table" in warning for warning in warnings), table
+    cfg, warnings = check("[capture]\ntun_route_table = 150\n")
+    assert cfg.capture.tun_route_table == 150 and warnings == []
+
+
 def test_subscriptions_list(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(

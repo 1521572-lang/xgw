@@ -28,6 +28,7 @@ from .. import log
 from ..generator.builder import BALANCER_TAG
 from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
+from ..net import cmd, tun
 from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.api import ApiClient, ApiError
 from ..xraycore.service import XrayService, XrayServiceError
@@ -74,7 +75,9 @@ class Applier:
         logger=None,
         now_fn=lambda: datetime.datetime.now().time(),
         wait_seconds: float = RESTART_WAIT_SECONDS,
+        runner: cmd.Runner = cmd.run,
     ) -> None:
+        self.runner = runner
         self.cfg = cfg
         self.paths = paths
         self.api = api
@@ -154,8 +157,25 @@ class Applier:
             return ApplyOutcome("restart", ops=[f"restart ({reason})"])
         return self._rollback(reason=error)
 
+    def _prepare_tun(self) -> None:
+        """Конфиг с inbound `tun`: интерфейс должен появиться раньше Xray и быть
+        постоянным (создан XGW). Созданный самим Xray, он исчезает вместе с ним, а с ним
+        и маршрут в него: после перезапуска Xray трафик машины шёл бы в чёрную дыру,
+        пока демон не вернёт маршрут."""
+        config = self._read_current()
+        name = tun.inbound_name(config) if config else None
+        if name is None:
+            return
+        try:
+            tun.ensure(name, self.runner)
+        except (cmd.CommandError, OSError) as exc:
+            self.log.warning(
+                "TUN-интерфейс %s не подготовлен (Xray создаст свой, не постоянный): %s", name, exc
+            )
+
     def _restart_and_wait(self) -> str | None:
         """Перезапускает Xray и ждёт ответа API. None — поднялся, иначе причина."""
+        self._prepare_tun()
         try:
             self.service.restart()
         except XrayServiceError as exc:

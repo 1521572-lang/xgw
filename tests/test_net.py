@@ -295,8 +295,125 @@ def test_describe(gateway):
     gateway.enable()
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
-        "bypass": ["192.168.50.20"], "ipv6": False, "fail_mode": "closed", "loaded": True,
+        "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "fail_mode": "closed",
+        "loaded": True,
     }
+
+
+# --- TUN (capture.method = tun) -----------------------------------------------------
+
+
+@pytest.fixture()
+def gateway_tun(gateway):
+    gateway.cfg.capture.method = "tun"
+    return gateway
+
+
+def test_tun_is_created_before_the_rules_and_traffic_goes_into_it(gateway_tun):
+    gateway = gateway_tun
+    assert gateway.enable() == "on"
+    kernel = gateway.kernel
+    assert kernel.links == {"xgwtun0": "tun"}
+    # Машина — в TUN (iif lo, table 101), сеть LAN — локальная доставка TPROXY (table 100).
+    assert {(r["table"], r.get("iif")) for r in kernel.rules} == {("101", "lo"), ("100", None)}
+    assert kernel.routes(101)[0] == {"dst": "default", "dev": "xgwtun0", "scope": "link"}
+    assert kernel.route and "iifname \"lo\"" not in kernel.table
+    assert kernel.index("ip", "tuntap", "add") < kernel.index("ip", "rule", "add")
+    assert kernel.index("ip", "route", "replace") < kernel.index("nft", "-f")
+    assert gateway.loaded() is True
+    assert gateway.describe()["tun"] is True
+
+
+def test_tun_machine_only_has_no_tproxy_rule_or_table(gateway_tun):
+    gateway = gateway_tun
+    gateway.cfg.network.lan_if = ""
+    assert gateway.enable() == "on"
+    kernel = gateway.kernel
+    assert [r["table"] for r in kernel.rules] == ["101"] and not kernel.routes(100)
+    assert "chain prerouting" not in kernel.table
+    assert gateway.loaded() is True
+
+
+def test_disable_keeps_the_interface_but_removes_rules_and_routes(gateway_tun):
+    gateway = gateway_tun
+    gateway.enable()
+    assert gateway.disable() == "off"
+    kernel = gateway.kernel
+    assert kernel.rules == [] and not kernel.routes(101) and not kernel.routes(100)
+    assert kernel.links == {"xgwtun0": "tun"}  # его держит открытым Xray
+    assert gateway.loaded() is True
+    assert gateway.enable() == "on" and gateway.loaded() is True
+    assert gateway.open() == "open"  # fail_mode = open: тоже без интерфейса не обходится
+    assert kernel.rules == [] and kernel.links
+    assert gateway.close() == "on"
+
+
+def test_down_keeps_the_interface_unless_asked(gateway_tun):
+    gateway = gateway_tun
+    gateway.enable()
+    gateway.down()
+    kernel = gateway.kernel
+    assert kernel.tables == {} and kernel.rules == [] and not kernel.routes(101)
+    assert kernel.links == {"xgwtun0": "tun"}
+    gateway.down(remove_tun=True)
+    assert kernel.links == {}
+    gateway.down(remove_tun=True)  # повторно — не ошибка
+
+
+def test_loaded_notices_a_lost_interface_route_or_tproxy(gateway_tun):
+    gateway = gateway_tun
+    gateway.enable()
+    kernel = gateway.kernel
+    kernel("ip link del dev xgwtun0".split())  # интерфейс пропал
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True  # демон возвращает его
+    kernel.rules[:] = [r for r in kernel.rules if r.get("iif") != "lo"]
+    assert gateway.loaded() is False
+    gateway.up()
+    kernel.tables[("ip", "xgw")] += "    chain prerouting {\n    }\n"
+    assert gateway.loaded() is True  # prerouting для LAN в TUN-режиме нужен
+    gateway.cfg.network.lan_if = ""
+    assert gateway.loaded() is False  # без LAN TPROXY остался бы лишним
+
+
+def test_switching_the_method_moves_the_routes(gateway):
+    gateway.enable()
+    kernel = gateway.kernel
+    assert kernel.links == {} and [r["table"] for r in kernel.rules] == ["100"]
+    gateway.cfg.capture.method = "tun"
+    assert gateway.loaded() is False  # TPROXY самой машины лишний, TUN ещё нет
+    gateway.up()
+    assert gateway.loaded() is True and kernel.links
+    assert {(r["table"], r.get("iif")) for r in kernel.rules} == {("101", "lo"), ("100", None)}
+    gateway.cfg.capture.method = "tproxy"
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.loaded() is True
+    assert [r["table"] for r in kernel.rules] == ["100"] and not kernel.routes(101)
+    assert kernel.links  # интерфейс не удаляется: Xray мог его уже открыть
+
+
+def test_tun_carries_ipv6_of_the_machine_without_a_tproxy_chain(gateway_tun):
+    (gateway_tun.proc / "net/ipv6/conf/all").mkdir(parents=True)
+    (gateway_tun.proc / "net/ipv6/conf/lo").mkdir(parents=True)
+    gateway_tun.cfg.network.ipv6 = "proxy"
+    assert gateway_tun.enable() == "on"
+    kernel = gateway_tun.kernel
+    assert {(r["table"], r.get("iif")) for r in kernel.rules6} == {("101", "lo")}
+    assert kernel.routes(101, 6)[0]["dev"] == "xgwtun0"
+    assert "chain output" in kernel.table6 and "chain prerouting" not in kernel.table6
+    assert gateway_tun.loaded() is True and gateway_tun.describe()["ipv6"] is True
+    gateway_tun.cfg.network.ipv6 = "off"
+    assert gateway_tun.loaded() is False
+    gateway_tun.up()
+    assert kernel.rules6 == [] and not kernel.routes(101, 6) and gateway_tun.loaded() is True
+
+
+def test_failure_to_create_the_interface_is_reported(gateway_tun):
+    gateway_tun.kernel.refuse = "tuntap add"
+    with pytest.raises(CaptureError, match="отказано"):
+        gateway_tun.enable()
+    assert gateway_tun.kernel.tables == {}  # правила не загружены без интерфейса
 
 
 # --- IPv6 самой машины (network.ipv6 = proxy) ---------------------------------------

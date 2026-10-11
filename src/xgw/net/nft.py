@@ -69,10 +69,23 @@ class Rules:
     # IPv6 самой машины идёт через Xray (network.ipv6 = "proxy"); LAN IPv6 не получает.
     capture6: bool = False
     reserved6: tuple[str, ...] = ()
+    # Трафик самой машины попадает в Xray не через TPROXY на lo, а маршрутом в
+    # TUN-интерфейс tun_name (capture.method = "tun"); сеть LAN по-прежнему через TPROXY.
+    tun: bool = False
+    tun_name: str = ""
 
     @property
     def capture(self) -> bool:
         return self.capture_lan or self.capture_local
+
+    @property
+    def prerouting(self) -> bool:
+        """Цепочка prerouting с TPROXY нужна для LAN и для самой машины без TUN."""
+        return self.capture_lan or (self.capture_local and not self.tun)
+
+    @property
+    def prerouting6(self) -> bool:
+        return self.capture6 and not self.tun
 
     @property
     def empty(self) -> bool:
@@ -158,6 +171,8 @@ def build_rules(
             time_uids=time_service_uids() if time_uids is None else time_uids,
             capture6=capture and cfg.capture.local and proxy6,
             reserved6=reserved6,
+            tun=capture and cfg.capture.local and cfg.capture.tun,
+            tun_name=cfg.capture.tun_name,
         ),
         warnings,
     )
@@ -202,16 +217,16 @@ def render(rules: Rules) -> str:
     if lan_if:
         blocks.append(_set("bypass4", rules.bypass))
 
-    if rules.capture:
+    if rules.prerouting:
         sources = ([f'"{lan_if}"'] if rules.capture_lan else []) + (
-            ['"lo"'] if rules.capture_local else []
+            ['"lo"'] if rules.capture_local and not rules.tun else []
         )
         only = sources[0] if len(sources) == 1 else "{ " + ", ".join(sources) + " }"
         prerouting = [
             f"iifname != {only} return",  # входящие из интернета в Xray не попадают
             "meta l4proto != { tcp, udp } return",
         ]
-        if rules.capture_local:
+        if rules.capture_local and not rules.tun:
             # На lo перехватывается только то, что пометила цепочка output.
             prerouting.append(f'iifname "lo" meta mark != {proxy} return')
         if rules.capture_lan:
@@ -317,21 +332,22 @@ def render6(rules: Rules) -> str:
     if rules.capture6:
         proxy, bypass = f"{rules.mark_proxy:#x}", f"{rules.mark_bypass:#x}"
         blocks.append(_set("reserved6", rules.reserved6, "ipv6_addr"))
-        blocks.append(
-            _chain(
-                "prerouting",
-                "type filter hook prerouting priority mangle; policy accept;",
-                [
-                    'iifname != "lo" return',  # из интернета в Xray не попадает ничто
-                    "meta l4proto != { tcp, udp } return",
-                    f"meta mark != {proxy} return",  # на lo — только пометка цепочки output
-                    "fib daddr type local th dport != 53 return",
-                    "ip6 daddr @reserved6 th dport != 53 return",
-                    "meta l4proto { tcp, udp } counter "
-                    f"tproxy ip6 to [::1]:{rules.tproxy_port} meta mark set {proxy} accept",
-                ],
+        if rules.prerouting6:
+            blocks.append(
+                _chain(
+                    "prerouting",
+                    "type filter hook prerouting priority mangle; policy accept;",
+                    [
+                        'iifname != "lo" return',  # из интернета в Xray не попадает ничто
+                        "meta l4proto != { tcp, udp } return",
+                        f"meta mark != {proxy} return",  # на lo — только пометка из output
+                        "fib daddr type local th dport != 53 return",
+                        "ip6 daddr @reserved6 th dport != 53 return",
+                        "meta l4proto { tcp, udp } counter "
+                        f"tproxy ip6 to [::1]:{rules.tproxy_port} meta mark set {proxy} accept",
+                    ],
+                )
             )
-        )
         output = [
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)

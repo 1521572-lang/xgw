@@ -272,6 +272,36 @@ def test_time_sleep_and_ipv6(box, monkeypatch):
     assert after.level == FAIL and "ipv6.method disabled" in after.advice
 
 
+def test_tun_needs_the_device_and_a_loose_reverse_path_filter(box, tmp_path):
+    box.cfg.capture.method = "tun"
+    proc = tmp_path / "proc"
+    for where, value in (("all", "2"), ("xgwtun0", "0"), ("default", "2")):
+        (proc / "net/ipv4/conf" / where).mkdir(parents=True)
+        (proc / "net/ipv4/conf" / where / "rp_filter").write_text(value + "\n")
+    device = tmp_path / "tun"
+    box.kwargs.update(proc_sys=proc, dev_tun=device)
+
+    missing = box.diag()._tun()
+    assert [c.level for c in missing] == [FAIL] and "modprobe tun" in missing[0].advice
+    device.write_text("")
+    ok = box.diag()._tun()
+    assert [c.level for c in ok] == [OK] and "xgwtun0" in ok[0].text
+
+    (proc / "net/ipv4/conf/all/rp_filter").write_text("1\n")
+    strict = box.diag()._tun()
+    assert [c.level for c in strict] == [OK, WARN]
+    assert "rp_filter" in strict[1].text and "rp_filter=2" in strict[1].advice
+    (proc / "net/ipv4/conf/all/rp_filter").write_text("2\n")
+    (proc / "net/ipv4/conf/xgwtun0/rp_filter").write_text("1\n")  # строгий и на самом интерфейсе
+    assert [c.level for c in box.diag()._tun()] == [OK, WARN]
+
+    box.cfg.capture.method = "tproxy"  # не TUN — проверок нет
+    assert box.diag()._tun() == []
+    box.cfg.capture.method = "tun"
+    box.cfg.capture.local = False
+    assert box.diag()._tun() == []
+
+
 def test_proxied_ipv6_is_checked_through_the_capture_state(box, monkeypatch):
     box.cfg.network.ipv6 = "proxy"
     box.system.ipv6_global = ["wan0"]  # при ipv6 = proxy это не повод для тревоги

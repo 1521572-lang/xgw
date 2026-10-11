@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -37,12 +38,36 @@ def find_xray(explicit: str | Path | None = None, paths: Paths | None = None) ->
     return None
 
 
+def _for_test(config: dict) -> dict:
+    """Конфиг для `xray run -test`. Эта проверка создаёт TUN-интерфейс из inbound `tun`
+    (Xray 26.3.27 делает это и в режиме -test), а рабочий Xray держит интерфейс XGW
+    открытым — вторая попытка подключиться к нему кончилась бы отказом «устройство
+    занято». Поэтому имя подменяется одноразовым; без прав root интерфейс не создать, и
+    inbound убирается из проверки совсем (его принимает службный запуск от xray)."""
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list) or not any(
+        isinstance(item, dict) and item.get("protocol") == "tun" for item in inbounds
+    ):
+        return config
+    can_create = hasattr(os, "geteuid") and os.geteuid() == 0
+    checked = copy.deepcopy(config)
+    items = []
+    for item in checked["inbounds"]:
+        if isinstance(item, dict) and item.get("protocol") == "tun":
+            if not can_create:
+                continue
+            item.setdefault("settings", {})["name"] = f"xgwchk{os.getpid() % 100000}"
+        items.append(item)
+    checked["inbounds"] = items
+    return checked
+
+
 def _run_test(config: dict, xray_bin: Path) -> tuple[bool, str]:
     fd, tmp_name = tempfile.mkstemp(prefix="xgw-validate-", suffix=".json")  # права 0600
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=False, indent=2)
+            json.dump(_for_test(config), handle, ensure_ascii=False, indent=2)
         try:
             proc = subprocess.run(
                 [str(xray_bin), "run", "-test", "-c", str(tmp)],

@@ -49,9 +49,11 @@ class Uninstaller:
         """config.toml не читается — метки и таблица берутся из журнала установки."""
         cfg = Config()
         saved = self.journal.get("capture") or {}
-        for name in ("mark_proxy", "route_table"):
+        for name in ("mark_proxy", "route_table", "tun_route_table"):
             if isinstance(saved.get(name), int):
                 setattr(cfg.capture, name, saved[name])
+        if isinstance(saved.get("tun_name"), str) and saved["tun_name"]:
+            cfg.capture.tun_name = saved["tun_name"]
         return cfg
 
     def run(self, *, keep_files: bool = False, purge: bool = False) -> int:
@@ -103,8 +105,8 @@ class Uninstaller:
     def _rules(self) -> str | None:
         Capture(
             self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
-        ).down()
-        return "таблицы nftables, ip rule и маршрут убраны"
+        ).down(remove_tun=True)
+        return "таблицы nftables, ip rule, маршрут и интерфейс TUN убраны"
 
     def _dnsmasq(self) -> str | None:
         conf = dnsmasq.conf_path(self.paths)

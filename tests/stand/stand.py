@@ -257,7 +257,7 @@ class Stand:
         self, *, max_members: int = 2, watchdog_s: int = 2,
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
-        direct_domains: tuple[str, ...] = (), ipv6: str = "off",
+        direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -283,6 +283,7 @@ bypass_hosts = ["{netns.LAN_BYPASS_MAC}"]
 [capture]
 lan = true
 local = true
+method = "{method}"
 fail_mode = "{fail_mode}"
 """
             direct_dns = f'["{netns.INET_DNS_IP}"]'

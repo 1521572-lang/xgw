@@ -64,6 +64,8 @@ def _snapshot(box: Machine) -> dict[str, str]:
         "ip -6 rule": box.sh("ip -6 rule show"),
         "table 100": box.sh("ip route show table 100 2>/dev/null || true"),
         "table 100 v6": box.sh("ip -6 route show table 100 2>/dev/null || true"),
+        "table 101": box.sh("ip route show table 101 2>/dev/null || true"),
+        "tun link": box.sh("ip -br link show xgwtun0 2>&1 || true"),
         # Профиль lo NetworkManager создаёт заново при каждой загрузке.
         "profiles": box.sh(
             "nmcli -t -f NAME,UUID,AUTOCONNECT connection show | grep -v '^lo:' | sort"
@@ -886,3 +888,72 @@ def test_ipv6_of_the_machine_goes_through_vpn_on_the_installed_system(gw):
         assert after[key] == value, f"{key}:\n--- было\n{value}\n--- стало\n{after[key]}"
     assert "xgw6" not in box.sh("nft list tables")
     assert stand.exit_ip6("gw") == DIRECT6
+
+
+def test_tun_method_on_the_installed_system(gw):
+    """capture.method = "tun" на настоящей системе: интерфейс создаёт XGW до Xray, Xray
+    от пользователя xray подключается к нему под песочницей systemd, трафик машины идёт
+    через VPN, при остановке Xray закрыт (а не мимо), после перезагрузки всё на месте, а
+    удаление убирает и интерфейс."""
+    box, stand = gw.box, gw.stand
+    stand.write_config(capture=True, method="tun")
+    text = stand.config_file.read_text(encoding="utf-8").replace('lan_if = "lan0"', 'lan_if = ""')
+    box.sh("mkdir -p /etc/xgw")
+    (box.root / "etc/xgw/config.toml").write_text(text, encoding="utf-8")
+    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
+           "&& chmod 600 /etc/xgw/config.toml")
+
+    result = _install(gw, "--yes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TUN: постоянный интерфейс xgwtun0" in result.stdout
+    assert wait_for(lambda: _state(gw) == "HEALTHY", 60), _xgw(gw, "status").stdout
+
+    link = box.sh("ip -d -br link show xgwtun0")
+    assert "LOWER_UP" in link and "tun" in box.sh("ip -d link show xgwtun0")  # Xray подключён
+    assert box.sh("ps -o user= -C xray").split() == ["xray"]  # от пользователя xray, без root
+    rules = box.sh("ip rule show")
+    assert "fwmark 0x1 iif lo lookup 101" in rules and "lookup 100" not in rules  # LAN нет
+    table = box.sh("ip route show table 101")
+    assert "default dev xgwtun0" in table and "blackhole default metric 4096" in table
+    assert "tproxy" not in box.sh("nft list table ip xgw")  # TPROXY самой машине не нужен
+    assert "tun-in" in box.sh("cat /etc/xgw/xray/config.json")
+
+    assert stand.exit_ip("gw") == VIA_VPN  # трафик самой машины — через VPN
+    assert stand.exit_ip("gw", "--mark", "2") == DIRECT  # метка mark_bypass — напрямую
+    assert json.loads(_xgw(gw, "status", "--json").stdout)["capture"]["tun"] is True
+    assert "через TUN" in _xgw(gw, "status").stdout
+    diag = _xgw(gw, "diag").stdout
+    assert "TUN: /dev/net/tun есть; интерфейс xgwtun0" in diag, diag
+
+    # Остановили Xray: интерфейс постоянный, поэтому трафик закрыт, а не уходит мимо VPN.
+    # Вернули — он подключается к тому же интерфейсу, и ничего больше делать не нужно.
+    index = box.sh("cat /sys/class/net/xgwtun0/ifindex").strip()
+    box.sh("systemctl stop xgw")  # демон не должен сам поднять Xray посреди проверки
+    box.sh("systemctl stop xgw-xray")
+    assert "NO-CARRIER" in box.sh("ip link show xgwtun0")
+    assert stand.exit_ip("gw") == ""
+    box.sh("systemctl start xgw-xray")
+    assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 40, step=2)
+    assert box.sh("cat /sys/class/net/xgwtun0/ifindex").strip() == index
+    box.sh("systemctl start xgw")
+
+    # Перезагрузка: xgw-net.service создаёт интерфейс раньше Xray, и тот его не теряет.
+    box.reboot()
+    assert wait_for(lambda: _state(gw) == "HEALTHY", 120), _xgw(gw, "status").stdout
+    assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=2)
+    box.sh("systemctl stop xgw")
+    box.sh("systemctl stop xgw-xray")
+    assert "xgwtun0" in box.sh("ip -br link")  # создан XGW, а не Xray — иначе исчез бы
+    assert stand.exit_ip("gw") == ""
+    box.sh("systemctl start xgw-xray")
+    assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 40, step=2)
+    box.sh("systemctl start xgw")
+
+    removed = _xgw(gw, "uninstall", "--yes", "--purge", timeout=300)
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert "интерфейс TUN убраны" in removed.stdout
+    after = _snapshot(box)
+    for key, value in gw.before.items():
+        assert after[key] == value, f"{key}:\n--- было\n{value}\n--- стало\n{after[key]}"
+    assert "does not exist" in after["tun link"] or "Cannot find" in after["tun link"]
+    assert stand.exit_ip("gw") == DIRECT

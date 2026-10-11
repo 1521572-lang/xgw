@@ -197,7 +197,9 @@ def test_install_configures_the_system_and_records_what_was_before(box):
         "uuid": box.old_lan, "name": "Wired connection 2", "autoconnect": "yes", "active": True}]
     assert journal.get("nm_wan")["ipv6_method"] == "auto"
     assert journal.get("sleep") == list(sleep.TARGETS)
-    assert journal.get("capture") == {"mark_proxy": 1, "route_table": 100}
+    assert journal.get("capture") == {
+        "mark_proxy": 1, "route_table": 100, "tun_route_table": 101, "tun_name": "xgwtun0",
+    }
     assert journal.get("finished")
     if os.name != "nt":
         assert paths.journal_file.stat().st_mode & 0o777 == 0o600
@@ -415,6 +417,37 @@ def test_uninstall_without_readable_config_uses_marks_from_the_journal(box):
         None, box.paths, runner=box.system, out=box.out.append, proc_sys=box.proc
     ).run()
     assert code == 0 and not box.system.kernel.rules and not box.system.kernel.tables
+
+
+def test_tun_method_is_announced_installed_and_removed(box):
+    box.cfg.capture.method = "tun"
+    box.answers = [False]
+    assert box.installer().run() == 1
+    assert "TUN: постоянный интерфейс xgwtun0" in box.text()
+    assert not box.system.kernel.links  # план показан, система не тронута
+
+    assert box.install() == 0, box.text()
+    kernel = box.system.kernel
+    assert kernel.links == {"xgwtun0": "tun"}
+    assert {(r["table"], r.get("iif")) for r in kernel.rules} == {("101", "lo"), ("100", None)}
+    assert "tproxy to 127.0.0.1:12345" in kernel.table  # сеть LAN — по-прежнему TPROXY
+
+    assert box.uninstall() == 0, box.text()
+    assert "интерфейс TUN убраны" in box.text()
+    assert kernel.links == {} and kernel.rules == [] and kernel.tables == {}
+
+
+def test_uninstall_without_config_finds_the_tun_interface_in_the_journal(box):
+    box.cfg.capture.method = "tun"
+    box.cfg.capture.tun_name = "vpn7"
+    box.cfg.capture.tun_route_table = 177
+    assert box.install() == 0
+    kernel = box.system.kernel
+    assert kernel.links == {"vpn7": "tun"} and "177" in {r["table"] for r in kernel.rules}
+    code = Uninstaller(
+        None, box.paths, runner=box.system, out=box.out.append, proc_sys=box.proc
+    ).run()
+    assert code == 0 and kernel.links == {} and not kernel.rules and not kernel.tables
 
 
 def test_uninstall_on_a_clean_system_is_harmless(box):

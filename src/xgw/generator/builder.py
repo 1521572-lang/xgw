@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from ..config import Config
 from ..model import ServerNode
 from ..net import sysctl
+from ..net.tun import MTU as tun_mtu
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
@@ -413,9 +414,28 @@ def build(
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
     # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
     capture = cfg.capture.lan or cfg.capture.local
-    tproxy_tags = ["tproxy-in", "tproxy-in6"] if ipv6 else ["tproxy-in"]
+    # TUN (capture.method = "tun") — только для трафика самой машины, сеть LAN остаётся на
+    # TPROXY; IPv6 машины тогда идёт через тот же TUN, и отдельный inbound на ::1 не нужен.
+    tun = cfg.capture.tun and cfg.capture.local
+    tproxy_tags = []
+    if cfg.capture.lan or (cfg.capture.local and not tun):
+        tproxy_tags.append("tproxy-in")
+    if ipv6 and not tun:
+        tproxy_tags.append("tproxy-in6")
+    capture_tags = [*tproxy_tags, *(["tun-in"] if tun else [])]
+    sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
     inbounds: list[dict] = []
     if capture:
+        if tun:
+            inbounds.append(
+                {
+                    "tag": "tun-in",
+                    "protocol": "tun",
+                    # Интерфейс создаёт XGW (постоянный), Xray подключается к нему по имени.
+                    "settings": {"name": cfg.capture.tun_name, "mtu": tun_mtu},
+                    "sniffing": sniffing,
+                }
+            )
         for tag, listen in (("tproxy-in", "127.0.0.1"), ("tproxy-in6", "::1")):
             if tag not in tproxy_tags:
                 continue
@@ -435,7 +455,7 @@ def build(
                         "followRedirect": True,
                     },
                     "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
-                    "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+                    "sniffing": sniffing,
                 }
             )
     inbounds.extend(
@@ -464,7 +484,7 @@ def build(
     ]
     if capture:
         rules.append(
-            {"type": "field", "inboundTag": tproxy_tags, "port": "53", "outboundTag": "dns-out"}
+            {"type": "field", "inboundTag": capture_tags, "port": "53", "outboundTag": "dns-out"}
         )
     if direct_dns:
         rules.append(

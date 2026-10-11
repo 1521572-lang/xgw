@@ -127,6 +127,9 @@ def test_status_line_tells_whether_ipv6_is_captured():
     assert line == "Перехват: включён — сеть lan0 и эта машина с IPv6"
     # Строка остаётся подстрокой прежней: на неё опираются остальные проверки.
     assert "Перехват: включён — сеть lan0 и эта машина" in line
+    both = status.render_capture({**capture, "ipv6": True, "tun": True})
+    assert both == "Перехват: включён — сеть lan0 и эта машина через TUN с IPv6"
+    assert status.render_capture({**capture, "tun": True}).endswith("эта машина через TUN")
 
 
 def test_pid_alive():

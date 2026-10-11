@@ -215,6 +215,59 @@ def test_force_now_restarts_at_any_time(env):
     assert service.restarts == 1
 
 
+def _with_tun_inbound(config: dict) -> dict:
+    new = _needs_restart(config)
+    new["inbounds"].insert(
+        0, {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0", "mtu": 1500}}
+    )
+    return new
+
+
+def test_tun_interface_is_created_before_xray_starts(env):
+    """Интерфейс, созданный самим Xray, исчез бы вместе с ним (и с маршрутом в него);
+    постоянный создаёт XGW — и до запуска ядра."""
+    from fakenet import FakeKernel
+
+    paths, current = env
+    kernel = FakeKernel()
+    order: list[str] = []
+
+    class Service(StubService):
+        def restart(self):
+            order.append("restart")
+            order.append("link" if "xgwtun0" in kernel.links else "no link")
+            super().restart()
+
+    outcome = _applier(paths, StubApi(), Service(), runner=kernel).apply(
+        _with_tun_inbound(current), force_now=True
+    )
+    assert outcome.mode == "restart"
+    assert order == ["restart", "link"]
+    assert kernel.links == {"xgwtun0": "tun"}
+
+
+def test_failed_tun_preparation_does_not_block_the_restart(env):
+    from fakenet import FakeKernel
+
+    paths, current = env
+    kernel = FakeKernel()
+    kernel.refuse = "tuntap add"
+    service = StubService()
+    outcome = _applier(paths, StubApi(), service, runner=kernel).apply(
+        _with_tun_inbound(current), force_now=True
+    )
+    assert outcome.mode == "restart" and service.restarts == 1  # Xray создаст свой интерфейс
+
+
+def test_no_tun_inbound_means_no_ip_commands(env):
+    from fakenet import FakeKernel
+
+    paths, current = env
+    kernel = FakeKernel()
+    _applier(paths, StubApi(), runner=kernel).apply(_needs_restart(current), force_now=True)
+    assert kernel.calls == []
+
+
 def test_api_error_defers_restart_and_blocks_api_path(env):
     """Ошибка API — перезапуск по общим правилам (окно/срочно), а до него
     частично изменённое ядро через API больше не трогаем."""
