@@ -10,6 +10,10 @@
   перехват снят    — xgw disable или fail_mode = open: обычный роутер, форвардинг
                      LAN → WAN с маскарадингом;
   без LAN и без перехвата — таблицы нет вовсе.
+
+IPv6: по умолчанию `ip6 xgw6` только запрещает форвардинг IPv6 из LAN и в LAN.
+При network.ipv6 = "proxy" в ней же перехватывается IPv6 самой машины — теми же
+цепочками, что и IPv4 (output помечает, prerouting на lo отдаёт Xray через TPROXY).
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ RESERVED4 = (
     "240.0.0.0/4",
     "255.255.255.255/32",
 )
+# То же для IPv6: нулевой и loopback-адрес, ULA (в т.ч. локальные сети), link-local, multicast.
+RESERVED6 = ("::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
 # Служба времени идёт мимо перехвата: без точного времени не поднимется Reality.
 TIME_USERS = ("_chrony", "systemd-timesync")
 NTS_KE_PORT = 4460  # chrony с NTS сначала получает ключи по TCP
@@ -60,6 +66,9 @@ class Rules:
     forward_icmp: bool
     dns_direct: str  # куда уходит DNS мимо Xray: «адрес» или «адрес:порт»; "" — никуда
     time_uids: tuple[int, ...]
+    # IPv6 самой машины идёт через Xray (network.ipv6 = "proxy"); LAN IPv6 не получает.
+    capture6: bool = False
+    reserved6: tuple[str, ...] = ()
 
     @property
     def capture(self) -> bool:
@@ -102,12 +111,25 @@ def build_rules(
         warnings.append(f"network.wan_if={wan_name!r}: недопустимое имя интерфейса — пропущено")
 
     networks = [ipaddress.IPv4Network(item) for item in RESERVED4]
+    networks6 = [ipaddress.IPv6Network(item) for item in RESERVED6]
+    proxy6 = cfg.network.ipv6_proxy
     for item in cfg.capture.exclude_cidrs:
         try:
-            networks.append(ipaddress.IPv4Network(item.strip(), strict=False))
+            network = ipaddress.ip_network(item.strip(), strict=False)
         except ValueError:
-            warnings.append(f"capture.exclude_cidrs: «{item}» — не сеть IPv4; пропущено")
+            warnings.append(f"capture.exclude_cidrs: «{item}» — не сеть; пропущено")
+            continue
+        if isinstance(network, ipaddress.IPv4Network):
+            networks.append(network)
+        elif proxy6:
+            networks6.append(network)
+        else:
+            warnings.append(
+                f"capture.exclude_cidrs: «{item}» — сеть IPv6, а IPv6 не проксируется "
+                "(network.ipv6 = off); пропущено"
+            )
     reserved = tuple(str(network) for network in ipaddress.collapse_addresses(networks))
+    reserved6 = tuple(str(network) for network in ipaddress.collapse_addresses(networks6))
 
     bypass: list[str] = []
     if lan_if:
@@ -134,6 +156,8 @@ def build_rules(
             forward_icmp=cfg.capture.forward_icmp,
             dns_direct=dns_direct,
             time_uids=time_service_uids() if time_uids is None else time_uids,
+            capture6=capture and cfg.capture.local and proxy6,
+            reserved6=reserved6,
         ),
         warnings,
     )
@@ -156,8 +180,8 @@ def _dns_direct(cfg: Config) -> str:
 # --- текст правил ---------------------------------------------------------------
 
 
-def _set(name: str, elements: tuple[str, ...]) -> list[str]:
-    lines = [f"set {name} {{", "    type ipv4_addr", "    flags interval"]
+def _set(name: str, elements: tuple[str, ...], kind: str = "ipv4_addr") -> list[str]:
+    lines = [f"set {name} {{", f"    type {kind}", "    flags interval"]
     if elements:
         lines.append("    elements = { " + ", ".join(elements) + " }")
     lines.append("}")
@@ -285,16 +309,66 @@ def render(rules: Rules) -> str:
 
 
 def render6(rules: Rules) -> str:
-    """`ip6 xgw6`: IPv6 из LAN и в LAN не форвардится (ipv6 = "off"). Пусто — без LAN."""
-    if not rules.lan_if:
+    """`ip6 xgw6`: IPv6 из LAN и в LAN не форвардится; при ipv6 = "proxy" ещё и
+    перехват IPv6 самой машины. Пусто — без LAN и без перехвата IPv6."""
+    if not rules.lan_if and not rules.capture6:
         return ""
-    chain = _chain(
-        "forward",
-        "type filter hook forward priority filter; policy accept;",
-        [f'iifname "{rules.lan_if}" drop', f'oifname "{rules.lan_if}" drop'],
-    )
+    blocks: list[list[str]] = []
+    if rules.capture6:
+        proxy, bypass = f"{rules.mark_proxy:#x}", f"{rules.mark_bypass:#x}"
+        blocks.append(_set("reserved6", rules.reserved6, "ipv6_addr"))
+        blocks.append(
+            _chain(
+                "prerouting",
+                "type filter hook prerouting priority mangle; policy accept;",
+                [
+                    'iifname != "lo" return',  # из интернета в Xray не попадает ничто
+                    "meta l4proto != { tcp, udp } return",
+                    f"meta mark != {proxy} return",  # на lo — только пометка цепочки output
+                    "fib daddr type local th dport != 53 return",
+                    "ip6 daddr @reserved6 th dport != 53 return",
+                    "meta l4proto { tcp, udp } counter "
+                    f"tproxy ip6 to [::1]:{rules.tproxy_port} meta mark set {proxy} accept",
+                ],
+            )
+        )
+        output = [
+            f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
+            "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
+            "meta l4proto != { tcp, udp } return",
+            "fib daddr type local return",
+            "ip6 daddr @reserved6 th dport != 53 return",
+            "udp sport 546 return",  # DHCPv6-клиент
+        ]
+        for uid in rules.time_uids:
+            output.append(f"meta skuid {uid} udp dport 123 return")
+            output.append(f"meta skuid {uid} tcp dport {NTS_KE_PORT} return")
+        output.append(f"meta l4proto {{ tcp, udp }} counter meta mark set {proxy}")
+        blocks.append(
+            _chain("output", "type route hook output priority mangle; policy accept;", output)
+        )
+        # То же, что loopback_guard в `ip xgw`: прямой запрос Xray не должен попасть
+        # на службы самого шлюза, если имя разрешилось в ::1.
+        blocks.append(
+            _chain(
+                "loopback_guard",
+                "type filter hook output priority filter; policy accept;",
+                [f"meta mark {bypass} ip6 daddr ::1 counter reject"],
+            )
+        )
+    if rules.lan_if:
+        blocks.append(
+            _chain(
+                "forward",
+                "type filter hook forward priority filter; policy accept;",
+                [f'iifname "{rules.lan_if}" drop', f'oifname "{rules.lan_if}" drop'],
+            )
+        )
     lines = [f"table ip6 {TABLE6}", f"delete table ip6 {TABLE6}", f"table ip6 {TABLE6} {{"]
-    lines.extend(f"    {line}" for line in chain)
+    for index, block in enumerate(blocks):
+        if index:
+            lines.append("")
+        lines.extend(f"    {line}" for line in block)
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -322,6 +396,8 @@ def apply(rules: Rules, runner: Runner) -> list[str]:
     try:
         runner(["nft", "-f", "-"], input=render6(rules) or _delete_text("ip6", TABLE6))
     except CommandError as exc:
+        if rules.capture6:
+            raise  # IPv6 проксируется: без этих правил он ушёл бы мимо перехвата
         warnings.append(f"таблица ip6 {TABLE6} не загружена: {exc}")
     return warnings
 
@@ -333,11 +409,13 @@ def delete(runner: Runner) -> None:
         runner(["nft", "-f", "-"], input=_delete_text("ip6", TABLE6))
 
 
-def loaded_chains(runner: Runner) -> set[str] | None:
-    """Имена цепочек загруженной таблицы `ip xgw`; пустое множество — таблицы нет,
-    None — узнать не удалось (нет прав или nft)."""
+def loaded_chains(
+    runner: Runner, family: str = "ip", table: str = TABLE
+) -> set[str] | None:
+    """Имена цепочек загруженной таблицы (`ip xgw` или `ip6 xgw6`); пустое множество —
+    таблицы нет, None — узнать не удалось (нет прав или nft)."""
     try:
-        listing = runner(["nft", "list", "table", "ip", TABLE])
+        listing = runner(["nft", "list", "table", family, table])
     except CommandError as exc:
         text = str(exc)
         if "No such file or directory" in text or "does not exist" in text:

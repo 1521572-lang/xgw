@@ -2,7 +2,7 @@
 curl, dig и DHCP-клиент. Обычные сокеты, только стандартная библиотека.
 
   lan_client.py get <url> [--dns СЕРВЕР] [--connect IP] [--bind IP] [--mark N] [--timeout С]
-  lan_client.py dns <сервер> <имя> [--tcp] [--bind IP] [--timeout С]
+  lan_client.py dns <сервер> <имя> [--type A|AAAA] [--tcp] [--bind IP] [--timeout С]
   lan_client.py dhcp <интерфейс> [--mac MAC] [--timeout С]
 
 Печатает одну строку JSON; при сбое в ней есть поле "error".
@@ -25,13 +25,19 @@ SO_BINDTODEVICE = 25
 DHCP_MAGIC = b"\x63\x82\x53\x63"
 
 
-def _dns_query(name: str) -> bytes:
+QTYPES = {"A": 1, "AAAA": 28}
+
+
+def _dns_query(name: str, qtype: int = 1) -> bytes:
     labels = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.split("."))
-    return os.urandom(2) + struct.pack(">HHHHH", 0x0100, 1, 0, 0, 0) + labels + b"\0\0\x01\0\x01"
+    return (
+        os.urandom(2) + struct.pack(">HHHHH", 0x0100, 1, 0, 0, 0) + labels
+        + struct.pack(">BHH", 0, qtype, 1)
+    )
 
 
 def _dns_addresses(reply: bytes) -> list[str]:
-    """A-записи ответа (имена в ответах заглушки и Xray сжаты указателем)."""
+    """A- и AAAA-записи ответа (имена в ответах заглушки и Xray сжаты указателем)."""
     count = struct.unpack(">H", reply[6:8])[0]
     offset = 12
     while reply[offset]:
@@ -49,16 +55,19 @@ def _dns_addresses(reply: bytes) -> list[str]:
         offset += 10
         if rtype == 1 and size == 4:
             addresses.append(socket.inet_ntoa(reply[offset : offset + 4]))
+        elif rtype == 28 and size == 16:
+            addresses.append(socket.inet_ntop(socket.AF_INET6, reply[offset : offset + 16]))
         offset += size
     return addresses
 
 
 def resolve(server: str, name: str, *, tcp: bool = False, bind: str = "",
-            timeout: float = 5.0) -> tuple[list[str], str]:
+            timeout: float = 5.0, qtype: int = 1) -> tuple[list[str], str]:
     """(адреса, от кого пришёл ответ)."""
-    query = _dns_query(name)
+    query = _dns_query(name, qtype)
     kind = socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM
-    with socket.socket(socket.AF_INET, kind) as sock:
+    family = socket.AF_INET6 if ":" in server else socket.AF_INET
+    with socket.socket(family, kind) as sock:
         if bind:
             sock.bind((bind, 0))
         sock.settimeout(timeout)
@@ -78,7 +87,8 @@ def resolve(server: str, name: str, *, tcp: bool = False, bind: str = "",
 
 def do_dns(args) -> dict:
     addresses, peer = resolve(
-        args.server, args.name, tcp=args.tcp, bind=args.bind, timeout=args.timeout
+        args.server, args.name, tcp=args.tcp, bind=args.bind, timeout=args.timeout,
+        qtype=QTYPES[args.type],
     )
     return {"answers": addresses, "from": peer}
 
@@ -100,7 +110,7 @@ def do_get(args) -> dict:
     path = url.path or "/"
     if url.query:
         path += "?" + url.query
-    with socket.socket() as sock:
+    with socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET) as sock:
         if args.mark:
             sock.setsockopt(socket.SOL_SOCKET, SO_MARK, args.mark)
         if args.bind:
@@ -217,6 +227,7 @@ def main() -> None:
     dns = commands.add_parser("dns")
     dns.add_argument("server")
     dns.add_argument("name")
+    dns.add_argument("--type", choices=sorted(QTYPES), default="A")
     dns.add_argument("--tcp", action="store_true")
     dns.add_argument("--bind", default="")
     dns.add_argument("--timeout", type=float, default=5.0)

@@ -272,6 +272,38 @@ def test_time_sleep_and_ipv6(box, monkeypatch):
     assert after.level == FAIL and "ipv6.method disabled" in after.advice
 
 
+def test_proxied_ipv6_is_checked_through_the_capture_state(box, monkeypatch):
+    box.cfg.network.ipv6 = "proxy"
+    box.system.ipv6_global = ["wan0"]  # при ipv6 = proxy это не повод для тревоги
+    monkeypatch.setattr(diag.sysctl, "ipv6_usable", lambda *_a: True)
+    assert box.diag()._ipv6()[0].level == OK  # до установки: просто сказано, что будет
+    box.cfg.capture.local = False
+    assert box.diag()._ipv6()[0].level == WARN
+    box.cfg.capture.local = True
+
+    state = {"mode": "on", "loaded": True, "ipv6": True}
+
+    class FakeCapture:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def describe(self):
+            return dict(state)
+
+    monkeypatch.setattr(diag, "Capture", FakeCapture)
+    box.installed()
+    assert box.diag()._ipv6()[0].level == OK
+    state["loaded"] = False
+    check = box.diag()._ipv6()[0]
+    assert check.level == FAIL and "xgw net up" in check.advice
+    state.update(loaded=True, ipv6=False)  # правила для IPv6 не собраны
+    assert box.diag()._ipv6()[0].level == FAIL
+    state.update(mode="off")
+    assert box.diag()._ipv6()[0].level == WARN and "xgw enable" in box.diag()._ipv6()[0].advice
+    monkeypatch.setattr(diag.sysctl, "ipv6_usable", lambda *_a: False)
+    assert "ядре выключен" in box.diag()._ipv6()[0].text
+
+
 def test_chrony_nts_detection(tmp_path):
     (tmp_path / "sources.d").mkdir()
     (tmp_path / "chrony.conf").write_text("pool ntp.ubuntu.com iburst\n# server x nts\n")

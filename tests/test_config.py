@@ -49,6 +49,18 @@ def test_validation_warnings(tmp_path):
     assert any("interval" in warning for warning in warnings)
 
 
+def test_ipv6_values(tmp_path):
+    path = tmp_path / "config.toml"
+    for value, proxied, warns in (("off", False, False), ("proxy", True, False),
+                                  ("PROXY", True, False), ("auto", False, True)):
+        path.write_text(f'[network]\nipv6 = "{value}"\n', encoding="utf-8")
+        cfg, warnings = load(path)
+        assert cfg.network.ipv6_proxy is proxied
+        assert any("network.ipv6" in warning for warning in warnings) is warns
+    path.write_text('[network]\nipv6 = "proxy"\n[capture]\nlocal = false\n', encoding="utf-8")
+    assert any("capture.local" in warning for warning in load(path)[1])
+
+
 def test_subscriptions_list(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(

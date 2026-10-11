@@ -30,6 +30,12 @@ class Network:
     ipv6: str = "off"
     disable_sleep: bool = True
 
+    @property
+    def ipv6_proxy(self) -> bool:
+        """IPv6 самой машины идёт через Xray. Любое значение, кроме «proxy», — «off»:
+        неизвестное слово не должно молча включать IPv6 мимо перехвата."""
+        return self.ipv6.strip().lower() == "proxy"
+
 
 @dataclass
 class Capture:
@@ -389,8 +395,13 @@ def _validate(cfg: Config) -> list[str]:
             warnings.append(f"подписка «{sub.name}»: не задан url")
     if cfg.network.router_mode not in ("ap", "router"):
         warnings.append(f"network.router_mode={cfg.network.router_mode}: допустимо ap или router")
-    if cfg.network.ipv6 != "off":
-        warnings.append('поддерживается только network.ipv6 = "off" (проксирование IPv6 — этап 5)')
+    if cfg.network.ipv6.strip().lower() not in ("off", "proxy"):
+        warnings.append(f'network.ipv6={cfg.network.ipv6!r}: допустимо off или proxy; принято off')
+    elif cfg.network.ipv6_proxy and not cfg.capture.local:
+        warnings.append(
+            "network.ipv6 = proxy действует только при capture.local = true: "
+            "IPv6 устройств в Wi-Fi шлюз не выдаёт и не пропускает"
+        )
     if cfg.capture.fail_mode not in ("closed", "open"):
         warnings.append(f"capture.fail_mode={cfg.capture.fail_mode}: допустимо closed или open")
     for name in ("lan_if", "wan_if"):

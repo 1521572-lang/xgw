@@ -204,6 +204,41 @@ def test_install_configures_the_system_and_records_what_was_before(box):
         assert paths.launcher.stat().st_mode & 0o777 == 0o755
 
 
+def test_ipv6_proxy_leaves_ipv6_on_wan_and_loads_its_rules(box):
+    box.cfg.network.ipv6 = "proxy"
+    box.answers = [False]
+    assert box.installer().run() == 1
+    plan = box.text()
+    assert "IPv6 самой машины пойдёт через Xray" in plan and "будет отключён" not in plan
+
+    assert box.install() == 0, box.text()
+    system = box.system
+    assert system.profile("wan")["ipv6.method"] == "auto"  # чужой профиль не тронут
+    assert ("nmcli", "device", "reapply", "wan0") not in system.calls
+    assert "nm_wan" not in Journal(box.paths.journal_file).data
+    # Перехват IPv6 машины загружен: отдельные правило и маршрут и своя таблица.
+    assert "tproxy ip6 to [::1]:12345" in system.kernel.table6
+    assert system.kernel.rules6 and system.kernel.route6
+
+    assert box.uninstall() == 0, box.text()
+    assert system.kernel.tables == {} and system.kernel.rules6 == [] and not system.kernel.route6
+
+
+def test_ipv6_off_to_proxy_gives_ipv6_back_to_wan_and_back_again(box):
+    assert box.install() == 0
+    assert box.system.profile("wan")["ipv6.method"] == "disabled"
+    box.cfg.network.ipv6 = "proxy"
+    assert box.install() == 0, box.text()
+    assert box.system.profile("wan")["ipv6.method"] == "auto"  # как было до XGW
+    assert "nm_wan" not in Journal(box.paths.journal_file).data
+    assert "IPv6 в профиле WAN (wan0) возвращён" in box.text()
+    box.cfg.network.ipv6 = "off"
+    assert box.install() == 0
+    assert box.system.profile("wan")["ipv6.method"] == "disabled"
+    assert Journal(box.paths.journal_file).get("nm_wan")["ipv6_method"] == "auto"
+    assert box.system.kernel.rules6 == [] and "tproxy" not in box.system.kernel.table6
+
+
 def test_second_install_keeps_the_original_state_in_the_journal(box):
     assert box.install() == 0
     first = Journal(box.paths.journal_file).data

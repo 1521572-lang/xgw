@@ -35,6 +35,16 @@ def write(key: str, value: str, root: Path = PROC_SYS) -> None:
     (root / key).write_text(f"{value}\n", encoding="ascii")
 
 
+def ipv6_usable(root: Path = PROC_SYS) -> bool:
+    """IPv6 в ядре работает: при ipv6.disable=1 нет каталога net/ipv6, а при
+    disable_ipv6=1 нет ::1 на lo — Xray не открыл бы на нём TPROXY-inbound."""
+    if not (root / "net" / "ipv6").is_dir():
+        return False
+    return all(
+        read(f"net/ipv6/conf/{where}/disable_ipv6", root) != "1" for where in ("all", "lo")
+    )
+
+
 def install(paths: Paths, root: Path = PROC_SYS) -> dict[str, str]:
     """Ставит 90-xgw.conf и применяет значения. Возвращает прежние — для журнала."""
     previous: dict[str, str] = {}

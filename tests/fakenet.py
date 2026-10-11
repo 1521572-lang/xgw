@@ -1,7 +1,8 @@
 """Подмена ядра для тестов сети: понимает те команды nft и ip, которыми пользуется XGW.
 
 Хранит «загруженные» таблицы nftables, правила `ip rule` и маршрут таблицы
-перехвата; все вызовы записывает в calls — по ним тесты проверяют порядок.
+перехвата (отдельно для IPv4 и для `ip -6`); все вызовы записывает в calls — по ним
+тесты проверяют порядок.
 """
 
 from __future__ import annotations
@@ -16,9 +17,12 @@ class FakeKernel:
         self.tables: dict[tuple[str, str], str] = {}
         self.rules: list[dict] = []
         self.route = False
+        self.rules6: list[dict] = []
+        self.route6 = False
         self.calls: list[tuple[str, ...]] = []
         self.refuse: str | None = None  # подстрока команды, которая «не выполняется»
         self.forbidden = False  # запуск не от root: nft ничего не показывает
+        self.refuse_ip6 = False  # таблицу ip6 ядро не принимает (IPv6 в ядре нет)
 
     def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         argv = list(argv)
@@ -28,31 +32,41 @@ class FakeKernel:
             raise CommandError(f"{command}: отказано")
         if argv[0] == "nft":
             return self._nft(argv, input or "")
+        if argv[:2] == ["ip", "-6"]:
+            return self._ip(["ip", *argv[2:]], command, 6)
+        return self._ip(argv, command, 4)
+
+    def _ip(self, argv: list[str], command: str, family: int) -> str:
+        rules = self.rules6 if family == 6 else self.rules
         if argv[:3] == ["ip", "-j", "rule"]:
             system = [{"priority": 0, "src": "all", "table": "local"},
                       {"priority": 32766, "src": "all", "table": "main"}]
-            return json.dumps([system[0], *self.rules, system[1]])
+            return json.dumps([system[0], *rules, system[1]])
         if argv[:3] == ["ip", "rule", "add"]:
-            self.rules.append(
+            rules.append(
                 {"priority": int(argv[8]), "src": "all",
                  "fwmark": hex(int(argv[4])), "table": argv[6]}
             )
             return ""
         if argv[:3] == ["ip", "rule", "del"]:
-            for rule in self.rules:
+            for rule in rules:
                 if rule["fwmark"] == hex(int(argv[4])) and rule["table"] == argv[6]:
-                    self.rules.remove(rule)
+                    rules.remove(rule)
                     return ""
             raise CommandError(f"{command}: RTNETLINK answers: No such file or directory")
+        present = self.route6 if family == 6 else self.route
         if argv[:4] == ["ip", "-j", "route", "show"]:
-            if not self.route:
+            if not present:
                 return "[]"
             return json.dumps([{"type": "local", "dst": "default", "dev": "lo", "scope": "host"}])
-        if argv[:3] == ["ip", "route", "replace"]:
-            self.route = True
-            return ""
-        if argv[:3] == ["ip", "route", "del"]:
-            self.route = False
+        if argv[:2] == ["ip", "route"] and argv[2] in ("replace", "del"):
+            added = argv[2] == "replace"
+            expected = "::/0" if family == 6 else "0.0.0.0/0"
+            assert expected in argv, f"маршрут не того семейства: {command}"
+            if family == 6:
+                self.route6 = added
+            else:
+                self.route = added
             return ""
         raise AssertionError(f"неожиданная команда: {command}")
 
@@ -70,6 +84,8 @@ class FakeKernel:
         if argv[1:] == ["-c", "-f", "-"]:
             return ""
         if argv[1:] == ["-f", "-"]:
+            if self.refuse_ip6 and text.startswith("table ip6 "):
+                raise CommandError("nft: Operation not supported")
             _table, family, name = text.splitlines()[0].split()
             if "{" in text:
                 self.tables[(family, name)] = text
@@ -93,3 +109,7 @@ class FakeKernel:
     @property
     def table(self) -> str:
         return self.tables.get(("ip", "xgw"), "")
+
+    @property
+    def table6(self) -> str:
+        return self.tables.get(("ip6", "xgw6"), "")

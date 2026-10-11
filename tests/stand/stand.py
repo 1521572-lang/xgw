@@ -32,21 +32,16 @@ for _path in (str(HERE), str(SRC)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+sys.path.insert(0, str(HERE.parent))  # tests/ports.py
+
 import netns  # noqa: E402
+from ports import free_port  # noqa: E402
 
 from xgw.xraycore.api import parse_balancer_info  # noqa: E402
 from xgw.xraycore.service import PidfileXrayService  # noqa: E402
 
 UUID = "11111111-2222-3333-4455-666666666661"
 FLAGS = {"nl": "🇳🇱", "de": "🇩🇪", "fr": "🇫🇷", "us": "🇺🇸"}
-
-
-def free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def free_block(count: int = 16) -> int:
@@ -116,6 +111,7 @@ class Stand:
     # создаёт и удаляет свои пространства имён сам.
     _topology: netns.Topology | None = None
     _own_topology: bool = False
+    ipv6: bool = False  # netns: IPv6 на стыке шлюза и «интернета», origin слушает и по IPv6
 
     def __post_init__(self) -> None:
         self.logs = self.workdir / "logs"
@@ -176,10 +172,12 @@ class Stand:
 
     def start(self) -> None:
         if self.mode == "netns" and self._topology is None:
-            self._topology = netns.Topology()
+            self._topology = netns.Topology(ipv6=self.ipv6)
             self._topology.create()
             self._own_topology = True
         also = ["--dns-also", netns.INET_DNS_IP] if self.mode == "netns" else []
+        if self.ipv6:
+            also += ["--answer6", netns.INET_IP6]
         self._spawn(
             "origin", "inet",
             [sys.executable, str(HERE / "origin.py"), "--host", self.inet_ip,
@@ -187,6 +185,13 @@ class Stand:
              "--answer", self.inet_ip, "--sub-file", str(self.subscription), *also],
             "READY",
         )
+        if self.ipv6:
+            self._spawn(
+                "origin6", "inet",
+                [sys.executable, str(HERE / "origin.py"), "--host", netns.INET_IP6,
+                 "--port", str(self.origin_port)],
+                "READY",
+            )
         for name in self.names:
             self.add_server(name)
 
@@ -252,7 +257,7 @@ class Stand:
         self, *, max_members: int = 2, watchdog_s: int = 2,
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
-        direct_domains: tuple[str, ...] = (),
+        direct_domains: tuple[str, ...] = (), ipv6: str = "off",
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -270,6 +275,7 @@ class Stand:
 [network]
 lan_if = "lan0"
 lan_address = "{netns.GW_LAN_IP}/24"
+ipv6 = "{ipv6}"
 dhcp_range = "192.168.50.110,192.168.50.150,1h"
 static_leases = ["{netns.LAN_BYPASS_MAC},{netns.LAN_BYPASS_IP},tv"]
 bypass_hosts = ["{netns.LAN_BYPASS_MAC}"]
@@ -477,6 +483,15 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
                 return line[3:]
         return ""
 
+    def exit_ip6(self, where: str = "gw", *args: str) -> str:
+        """То же по IPv6: адрес «интернета» — через VPN-сервер, адрес WAN шлюза — напрямую."""
+        url = f"http://[{netns.INET_IP6}]:{self.origin_port}/trace"
+        reply = self.client(where, "get", url, "--timeout", "4", *args)
+        for line in reply.get("body", "").splitlines():
+            if line.startswith("ip="):
+                return line[3:]
+        return ""
+
     def run_in(self, where: str, *argv: str) -> subprocess.CompletedProcess:
         """Произвольная команда в пространстве имён inet, gw или lan."""
         return subprocess.run(
@@ -490,11 +505,11 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
             raise RuntimeError(f"{' '.join(argv)}: {result.stdout}{result.stderr}")
         return result.stdout
 
-    def serve_in_gw(self, port: int, country: str) -> subprocess.Popen:
-        """HTTP-служба, слушающая только 127.0.0.1 шлюза (отвечает /trace)."""
+    def serve_in_gw(self, port: int, country: str, host: str = "127.0.0.1") -> subprocess.Popen:
+        """HTTP-служба, слушающая только loopback шлюза: 127.0.0.1 или ::1 (отвечает /trace)."""
         return self._spawn(
             f"service-{port}", "gw",
-            [sys.executable, str(HERE / "origin.py"), "--host", "127.0.0.1",
+            [sys.executable, str(HERE / "origin.py"), "--host", host,
              "--port", str(port), "--country", country],
             "READY",
         )

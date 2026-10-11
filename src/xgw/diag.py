@@ -23,7 +23,7 @@ from .config import Config, probe_bytes
 from .generator import validate
 from .generator.builder import BALANCER_TAG
 from .install import UNITS
-from .net import cmd, dnsmasq, lan, nft, nm, sleep, ufw
+from .net import cmd, dnsmasq, lan, nft, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
 from .store import Store
@@ -512,7 +512,32 @@ class Diag:
             "sudo systemctl mask " + " ".join(awake))
         return [Check("Сон", WARN, text, advice + f"; GNOME: {sleep.GNOME_HINT}")]
 
+    def _ipv6_proxy(self) -> list[Check]:
+        """network.ipv6 = proxy: IPv6 самой машины должен идти через Xray."""
+        if not self.cfg.capture.local:
+            return [Check(
+                "IPv6", WARN,
+                "network.ipv6 = proxy, но capture.local = false: IPv6 машины не перехватывается",
+                "включите capture.local или верните network.ipv6 = off",
+            )]
+        if not sysctl.ipv6_usable():
+            return [Check("IPv6", OK, "IPv6 в ядре выключен — проксировать нечего")]
+        if not self.installed or not self.root:
+            return [Check("IPv6", OK, "IPv6 машины пойдёт через Xray (network.ipv6 = proxy)")]
+        info = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log).describe()
+        if info["mode"] != "on":
+            return [Check(
+                "IPv6", WARN, "перехват снят — IPv6 идёт напрямую, мимо VPN", "sudo xgw enable"
+            )]
+        if info["loaded"] is False or not info["ipv6"]:
+            return [Check(
+                "IPv6", FAIL, "IPv6 проксируется, но его правила не загружены", "sudo xgw net up"
+            )]
+        return [Check("IPv6", OK, "IPv6 самой машины идёт через Xray")]
+
     def _ipv6(self) -> list[Check]:
+        if self.cfg.network.ipv6_proxy:
+            return self._ipv6_proxy()
         if self.which("ip") is None:
             return []
         try:

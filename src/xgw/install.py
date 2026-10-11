@@ -107,6 +107,11 @@ class Journal:
             self.set(key, value)
         return self.data[key]
 
+    def discard(self, key: str) -> None:
+        if key in self.data:
+            del self.data[key]
+            self.save()
+
     def extend(self, key: str, items: Sequence) -> None:
         merged = list(self.data.get(key, []))
         merged.extend(item for item in items if item not in merged)
@@ -372,10 +377,15 @@ class Installer:
                 f"  • dnsmasq: DHCP {start.strip()}–{end.strip()} на {facts.lan_if} "
                 f"({dnsmasq.conf_path(self.paths)}); DNS в dnsmasq выключен"
             )
-        if cfg.network.ipv6 == "off":
+        if not cfg.network.ipv6_proxy:
             lines.append(
                 f"  • IPv6 в профиле WAN ({facts.wan_if or 'не найден'}) будет отключён: "
                 "иначе трафик уйдёт мимо VPN"
+            )
+        else:
+            lines.append(
+                "  • IPv6 самой машины пойдёт через Xray (network.ipv6 = proxy); "
+                "на WAN он остаётся включённым, устройствам в Wi-Fi IPv6 не выдаётся"
             )
         info = self.capture.describe(check=False)
         if self.capture.configured:
@@ -613,8 +623,10 @@ class Installer:
             self._step(f"профиль {nm.PROFILE} на {facts.lan_if}: {self.cfg.network.lan_address}")
             for warning in warnings:
                 self._warn(warning)
-        if self.cfg.network.ipv6 == "off":
+        if not self.cfg.network.ipv6_proxy:
             self._wan_ipv6(facts)
+        else:
+            self._wan_ipv6_back(facts)
         if self.cfg.network.disable_sleep:
             masked = sleep.mask(self.paths.systemd_dir, self.runner)
             self.journal.extend("sleep", masked)
@@ -649,6 +661,25 @@ class Installer:
             self._step(f"IPv6 в профиле WAN ({facts.wan_if}) отключён")
         for warning in warnings:
             self._warn(warning)
+
+    def _wan_ipv6_back(self, facts: Facts) -> None:
+        """ipv6 = proxy после ipv6 = off: IPv6 на WAN, отключённый прошлой установкой,
+        возвращается. Чужие настройки профиля, которых XGW не менял, не трогаются."""
+        record = self.journal.get("nm_wan")
+        if not record:
+            return
+        if not facts.nm_running:
+            self._warn(
+                "NetworkManager не запущен — IPv6 на WAN не возвращён; запустите его и "
+                "повторите установку"
+            )
+            return
+        warnings = nm.restore_wan(self.nm, record)
+        for warning in warnings:
+            self._warn(warning)
+        if not warnings:
+            self.journal.discard("nm_wan")
+            self._step(f"IPv6 в профиле WAN ({facts.wan_if}) возвращён: network.ipv6 = proxy")
 
     def _ufw_tproxy(self) -> bool:
         """Нужна ли строка в before.rules: только когда перехватывается трафик LAN."""

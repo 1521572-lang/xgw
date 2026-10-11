@@ -203,6 +203,61 @@ def test_ipv6_server_dropped_when_ipv6_off():
     assert any("IPv6" in warning for warning in selection.warnings)
 
 
+def test_ipv6_server_kept_when_ipv6_is_proxied():
+    cfg = Config()
+    cfg.network.ipv6 = "proxy"
+    node = _node("aaaa0000", "v6")
+    node.address = "2001:db8::1"
+    selection = select_nodes([node, _node("bbbb0000", "v4")], cfg)
+    assert sorted(n.name for n in selection.members) == ["v4", "v6"]
+    cfg.network.ipv6 = "что-то"  # непонятное слово — это «off», а не «proxy»
+    assert [n.name for n in select_nodes([node, _node("bbbb0000", "v4")], cfg).members] == ["v4"]
+
+
+def _v6_build(cfg, **kwargs):
+    return build(cfg, select_nodes([_node("11112222", "A")], cfg), hosts={}, **kwargs).config
+
+
+def test_ipv6_proxy_adds_a_second_tproxy_inbound_and_answers_aaaa():
+    cfg = Config()
+    cfg.network.ipv6 = "proxy"
+    config = _v6_build(cfg, ipv6=True)
+    tproxy = {i["tag"]: i for i in config["inbounds"] if i["tag"].startswith("tproxy")}
+    assert list(tproxy) == ["tproxy-in", "tproxy-in6"]
+    assert tproxy["tproxy-in6"]["listen"] == "::1"  # снаружи не виден
+    assert tproxy["tproxy-in6"]["port"] == tproxy["tproxy-in"]["port"] == cfg.capture.tproxy_port
+    # Остальное — то же, что у IPv4-inbound (UDP, tproxy, сниффинг).
+    assert {k: v for k, v in tproxy["tproxy-in6"].items() if k not in ("tag", "listen")} == {
+        k: v for k, v in tproxy["tproxy-in"].items() if k not in ("tag", "listen")
+    }
+    dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
+    assert dns_rule["inboundTag"] == ["tproxy-in", "tproxy-in6"]
+    # Приложения получают AAAA, а прямые подключения умеют ходить по IPv6.
+    assert config["dns"]["queryStrategy"] == "UseIP"
+    direct = next(o for o in config["outbounds"] if o["tag"] == "direct")
+    assert direct["settings"]["domainStrategy"] == "UseIP"
+    # Серверы подписки по имени по-прежнему ищутся по IPv4: у них своя стратегия.
+    proxy = next(o for o in config["outbounds"] if o["tag"].startswith("proxy-"))
+    assert proxy["streamSettings"]["sockopt"]["domainStrategy"] == "UseIPv4"
+
+
+def test_no_ipv6_inbound_by_default_or_without_local_capture(monkeypatch):
+    config = _v6_build(Config())
+    assert [i["tag"] for i in config["inbounds"] if i["tag"].startswith("tproxy")] == ["tproxy-in"]
+    assert config["dns"]["queryStrategy"] == "UseIPv4"
+    cfg = Config()
+    cfg.network.ipv6 = "proxy"
+    cfg.capture.local = False  # устройствам в Wi-Fi IPv6 не выдаётся
+    config = _v6_build(cfg, ipv6=True)
+    assert [i["tag"] for i in config["inbounds"] if i["tag"].startswith("tproxy")] == ["tproxy-in"]
+    # По умолчанию решает ядро: IPv6 в нём нет — Xray не смог бы открыть ::1.
+    cfg.capture.local = True
+    monkeypatch.setattr("xgw.generator.builder.sysctl.ipv6_usable", lambda *_a: False)
+    assert "tproxy-in6" not in [i["tag"] for i in _v6_build(cfg)["inbounds"]]
+    monkeypatch.setattr("xgw.generator.builder.sysctl.ipv6_usable", lambda *_a: True)
+    assert "tproxy-in6" in [i["tag"] for i in _v6_build(cfg)["inbounds"]]
+
+
 def test_select_filters_and_junk():
     cfg = Config()
     raws, _, _ = parse_links_text(

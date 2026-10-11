@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 from pathlib import Path
 
@@ -98,11 +99,19 @@ class Capture:
             return "off"
         return "open" if self.open_marker.exists() else "on"
 
+    def ipv6_usable(self) -> bool:
+        return sysctl.ipv6_usable(self.proc_sys)
+
     def rules(self, mode: str | None = None) -> nft.Rules:
         """Параметры правил для режима (по умолчанию — текущего)."""
         rules, warnings = nft.build_rules(
             self.cfg, capture=(mode or self.mode()) == "on", time_uids=self.time_uids
         )
+        if rules.capture6 and not self.ipv6_usable():
+            # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
+            # и таблица ip6 в таком ядре не работают и сломали бы загрузку IPv4.
+            rules = dataclasses.replace(rules, capture6=False)
+            warnings.append("network.ipv6 = proxy, но IPv6 в ядре выключен: проксировать нечего")
         for warning in warnings:
             if warning not in self._warned:  # демон собирает правила на каждом шаге
                 self._warned.add(warning)
@@ -123,10 +132,16 @@ class Capture:
             if rules.capture:
                 # Сначала маршрут для помеченных пакетов, потом правила, которые метят.
                 iprule.ensure(mark, table, self.runner)
+                if rules.capture6:
+                    iprule.ensure(mark, table, self.runner, 6)
                 warnings = nft.apply(rules, self.runner)
+                if not rules.capture6 and self.ipv6_usable():
+                    iprule.remove(mark, table, self.runner, 6)  # остался от ipv6 = proxy
             else:
                 warnings = nft.apply(rules, self.runner)
                 iprule.remove(mark, table, self.runner)
+                if self.ipv6_usable():
+                    iprule.remove(mark, table, self.runner, 6)
         except (cmd.CommandError, OSError) as exc:
             raise CaptureError(str(exc)) from exc
         for warning in warnings:
@@ -176,6 +191,11 @@ class Capture:
                 iprule.remove(
                     self.cfg.capture.mark_proxy, self.cfg.capture.route_table, self.runner
                 )
+                if self.ipv6_usable():
+                    iprule.remove(
+                        self.cfg.capture.mark_proxy, self.cfg.capture.route_table,
+                        self.runner, 6,
+                    )
                 self._forwarding_restore()
             except (cmd.CommandError, OSError) as exc:
                 raise CaptureError(str(exc)) from exc
@@ -215,10 +235,20 @@ class Capture:
             return False
         if not rules.capture:
             return not chains & {"prerouting", "output", "loopback_guard"}
+        mark, table = self.cfg.capture.mark_proxy, self.cfg.capture.route_table
+        if rules.capture6 or self.ipv6_usable():
+            chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
+            if chains6 is None:
+                return None
+            captured6 = {"prerouting", "output", "loopback_guard"}
+            if rules.capture6 and not captured6 <= chains6:
+                return False
+            if not rules.capture6 and chains6 & captured6:
+                return False  # остались правила от ipv6 = proxy
         with contextlib.suppress(cmd.CommandError):
-            return iprule.present(
-                self.cfg.capture.mark_proxy, self.cfg.capture.route_table, self.runner
-            )
+            if not iprule.present(mark, table, self.runner):
+                return False
+            return not rules.capture6 or iprule.present(mark, table, self.runner, 6)
         return None
 
     def describe(self, *, check: bool = True) -> dict:
@@ -230,6 +260,7 @@ class Capture:
             "lan": rules.capture_lan,
             "local": rules.capture_local,
             "bypass": list(rules.bypass),
+            "ipv6": rules.capture6,
             "fail_mode": self.cfg.capture.fail_mode,
             "loaded": self.loaded() if check else None,
         }

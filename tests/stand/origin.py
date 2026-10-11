@@ -12,7 +12,10 @@ HEAD на любой путь отдаёт только заголовки с н
 DNS (UDP): на любой A-запрос отвечает одним адресом — и для доменов серверов
 (*.stand.test), и, на этапе 3, для `dig @8.8.8.8` из LAN. Исключение — имена,
 начинающиеся с «loopback.»: на них ответ 127.0.0.1, как у домена, владелец
-которого целится в службы самого шлюза.
+которого целится в службы самого шлюза. На AAAA-запрос отвечает адресом --answer6
+(для «loopback.» это ::1); без --answer6 AAAA-ответов нет.
+
+Адрес --host может быть IPv6 (тогда HTTP слушает по IPv6, а DNS-заглушка не нужна).
 
 Запуск: python origin.py --host 127.0.0.1 --port 8080 --dns-port 5353 --answer 127.0.0.1
 """
@@ -104,8 +107,13 @@ class OriginHandler(BaseHTTPRequestHandler):
             pass  # клиент ушёл («заморозка», оборванная проба)
 
 
-def dns_answer(query: bytes, address: str) -> bytes | None:
-    """Ответ на DNS-запрос: A-запись с заданным адресом, на прочие типы — пусто."""
+class Server6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def dns_answer(query: bytes, address: str, address6: str = "") -> bytes | None:
+    """Ответ на DNS-запрос: A-запись с заданным адресом (для AAAA — адрес address6,
+    если он задан), на прочие типы — пусто."""
     if len(query) < 17:
         return None
     offset = 12
@@ -117,18 +125,20 @@ def dns_answer(query: bytes, address: str) -> bytes | None:
     if query[12:13] == bytes([len(LOOPBACK_LABEL)]) and (
         query[13 : 13 + len(LOOPBACK_LABEL)].lower() == LOOPBACK_LABEL
     ):
-        address = "127.0.0.1"
+        address, address6 = "127.0.0.1", "::1" if address6 else ""
     qtype = struct.unpack(">H", query[offset + 1 : offset + 3])[0]
     question = query[12:question_end]
-    answers = 1 if qtype == 1 else 0
+    answers = 1 if qtype == 1 or (qtype == 28 and address6) else 0
     header = query[:2] + struct.pack(">HHHHH", 0x8180, 1, answers, 0, 0)
     if not answers:
         return header + question
-    record = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 30, 4) + socket.inet_aton(address)
+    v6 = qtype == 28
+    data = socket.inet_pton(socket.AF_INET6 if v6 else socket.AF_INET, address6 if v6 else address)
+    record = b"\xc0\x0c" + struct.pack(">HHIH", qtype, 1, 30, len(data)) + data
     return header + question + record
 
 
-def serve_dns(host: str, port: int, address: str) -> socket.socket:
+def serve_dns(host: str, port: int, address: str, address6: str = "") -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
 
@@ -138,7 +148,7 @@ def serve_dns(host: str, port: int, address: str) -> socket.socket:
                 query, peer = sock.recvfrom(4096)
             except OSError:
                 return
-            answer = dns_answer(query, address)
+            answer = dns_answer(query, address, address6)
             if answer:
                 sock.sendto(answer, peer)
 
@@ -152,6 +162,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dns-port", type=int, default=0, help="0 — без DNS-заглушки")
     parser.add_argument("--answer", default="127.0.0.1", help="адрес в ответах DNS")
+    parser.add_argument("--answer6", default="", help="адрес IPv6 в ответах на AAAA")
     parser.add_argument(
         "--dns-also", action="append", default=[],
         help="ещё один адрес DNS-заглушки (можно несколько раз)",
@@ -162,11 +173,12 @@ def main() -> None:
 
     OriginHandler.country = args.country
     OriginHandler.sub_file = args.sub_file
-    server = ThreadingHTTPServer((args.host, args.port), OriginHandler)
+    server_class = Server6 if ":" in args.host else ThreadingHTTPServer
+    server = server_class((args.host, args.port), OriginHandler)
     server.daemon_threads = True
     if args.dns_port:
         for host in (args.host, *args.dns_also):
-            serve_dns(host, args.dns_port, args.answer)
+            serve_dns(host, args.dns_port, args.answer, args.answer6)
     print("READY", flush=True)
     server.serve_forever()
 

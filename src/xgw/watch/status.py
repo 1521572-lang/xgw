@@ -264,7 +264,7 @@ def render_capture(capture: dict) -> str:
         )
     scope = [f"сеть {capture['lan_if']}"] if capture.get("lan") else []
     if capture.get("local"):
-        scope.append("эта машина")
+        scope.append("эта машина" + (" с IPv6" if capture.get("ipv6") else ""))
     text = "Перехват: включён — " + " и ".join(scope)
     if capture.get("bypass"):
         text += "; мимо VPN: " + ", ".join(capture["bypass"])

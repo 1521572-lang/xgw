@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -41,6 +42,8 @@ LAUNCHER = "/usr/local/share/applications/xgw-panel.desktop"
 STATUS_PAGE = "\n[status]\nlan_page = true\n"
 VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
+VIA_VPN6 = netns.INET_IP6
+DIRECT6 = netns.GW_WAN_IP6
 UNITS = ("xgw-net", "xgw-xray", "xgw", "dnsmasq")
 
 pytestmark = [
@@ -58,7 +61,9 @@ def _snapshot(box: Machine) -> dict[str, str]:
         # Счётчики пакетов в правилах ufw меняются сами по себе.
         "nft": re.sub(r"packets \d+ bytes \d+", "", ruleset),
         "ip rule": box.sh("ip rule show"),
+        "ip -6 rule": box.sh("ip -6 rule show"),
         "table 100": box.sh("ip route show table 100 2>/dev/null || true"),
+        "table 100 v6": box.sh("ip -6 route show table 100 2>/dev/null || true"),
         # Профиль lo NetworkManager создаёт заново при каждой загрузке.
         "profiles": box.sh(
             "nmcli -t -f NAME,UUID,AUTOCONNECT connection show | grep -v '^lo:' | sort"
@@ -818,3 +823,66 @@ def test_machine_only_mode_without_a_second_card(gw):
     assert not (box.root / "etc/xgw").exists()  # --purge убирает и конфиг
     assert stand.exit_ip("gw") == DIRECT
 
+
+def test_ipv6_of_the_machine_goes_through_vpn_on_the_installed_system(gw):
+    """network.ipv6 = "proxy" на настоящей системе (systemd, NetworkManager): установка
+    оставляет IPv6 на WAN включённым, службы открывают TPROXY-inbound на ::1 под
+    песочницей, трафик IPv6 самой машины идёт через VPN, демон возвращает пропавшую
+    таблицу, а удаление возвращает систему в прежнее состояние."""
+    box, stand = gw.box, gw.stand
+    # IPv6 на стыке «интернета» и машины. Роутера с RA в контейнере нет, поэтому
+    # адреса и маршрут ставятся вручную — NetworkManager их не трогает, пока профиль цел.
+    for address in (netns.INET_IP6, netns.INET_DNS_IP6):
+        machine_mod._run(["ip", "-n", machine_mod.INET_NS, "addr", "replace",
+                          f"{address}/64", "dev", "eth0", "nodad"])
+    box.sh(f"ip addr replace {netns.GW_WAN_IP6}/64 dev wan0 nodad "
+           f"&& ip -6 route replace default via {netns.INET_IP6}")
+    stand._spawn(
+        "origin6", "inet",
+        [sys.executable, str(HERE / "origin.py"), "--host", netns.INET_IP6,
+         "--port", str(stand.origin_port)],
+        "READY",
+    )
+    assert stand.exit_ip6("gw") == DIRECT6  # до установки IPv6 идёт напрямую
+
+    stand.write_config(capture=True, ipv6="proxy")
+    text = stand.config_file.read_text(encoding="utf-8").replace('lan_if = "lan0"', 'lan_if = ""')
+    box.sh("mkdir -p /etc/xgw")
+    (box.root / "etc/xgw/config.toml").write_text(text, encoding="utf-8")
+    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
+           "&& chmod 600 /etc/xgw/config.toml")
+
+    result = _install(gw, "--yes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "IPv6 самой машины пойдёт через Xray" in result.stdout
+    assert "будет отключён" not in result.stdout
+    assert wait_for(lambda: _state(gw) == "HEALTHY", 60), _xgw(gw, "status").stdout
+
+    # IPv6 на WAN не тронут (в отличие от ipv6 = off), перехват собран и загружен.
+    assert box.sh("nmcli -g ipv6.method connection show stand-wan").strip() == "auto"
+    table6 = box.sh("nft list table ip6 xgw6")
+    assert "tproxy to [::1]:12345" in table6 and "chain loopback_guard" in table6
+    assert "fwmark 0x1 lookup 100" in box.sh("ip -6 rule show")
+    assert "[::1]:12345" in box.sh("ss -ltnH 'sport = :12345'")  # inbound открыт службой xray
+    assert "tproxy-in6" in box.sh("cat /etc/xgw/xray/config.json")
+
+    assert stand.exit_ip6("gw") == VIA_VPN6  # трафик IPv6 самой машины — через VPN
+    assert stand.exit_ip6("gw", "--mark", "2") == DIRECT6  # метка mark_bypass — напрямую
+    assert stand.exit_ip("gw") == VIA_VPN  # IPv4 — как раньше
+    status = _xgw(gw, "status", "--json")
+    assert json.loads(status.stdout)["capture"]["ipv6"] is True
+    diag = _xgw(gw, "diag")
+    assert "IPv6: IPv6 самой машины идёт через Xray" in diag.stdout, diag.stdout
+
+    # Таблица пропала («чужой» сбой): демон возвращает её сам, и IPv6 снова под перехватом.
+    box.sh("nft delete table ip6 xgw6")
+    assert wait_for(lambda: "xgw6" in box.sh("nft list tables"), 40, step=2), box.journal("xgw")
+    assert wait_for(lambda: stand.exit_ip6("gw") == VIA_VPN6, 20)
+
+    removed = _xgw(gw, "uninstall", "--yes", "--purge", timeout=300)
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    after = _snapshot(box)
+    for key, value in gw.before.items():
+        assert after[key] == value, f"{key}:\n--- было\n{value}\n--- стало\n{after[key]}"
+    assert "xgw6" not in box.sh("nft list tables")
+    assert stand.exit_ip6("gw") == DIRECT6

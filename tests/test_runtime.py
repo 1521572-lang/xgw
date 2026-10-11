@@ -119,6 +119,16 @@ def test_process_service_says_why_xray_exited(tmp_path):
     assert "\n" not in str(caught.value) and not service.is_active()
 
 
+def test_status_line_tells_whether_ipv6_is_captured():
+    capture = {"mode": "on", "lan_if": "lan0", "lan": True, "local": True, "bypass": [],
+               "loaded": True}
+    assert status.render_capture(capture) == "Перехват: включён — сеть lan0 и эта машина"
+    line = status.render_capture({**capture, "ipv6": True})
+    assert line == "Перехват: включён — сеть lan0 и эта машина с IPv6"
+    # Строка остаётся подстрокой прежней: на неё опираются остальные проверки.
+    assert "Перехват: включён — сеть lan0 и эта машина" in line
+
+
 def test_pid_alive():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:

@@ -9,12 +9,12 @@ import copy
 import datetime
 import json
 import os
-import socket
 import time
 from pathlib import Path
 
 import links
 import pytest
+from ports import free_port
 
 from xgw.apply.applier import Applier
 from xgw.config import Config
@@ -33,14 +33,6 @@ pytestmark = pytest.mark.skipif(
     not XRAY_BIN or not Path(XRAY_BIN).exists(),
     reason="нет XGW_XRAY_BIN — тест применения на живом Xray пропущен",
 )
-
-
-def _free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def _live_config(cfg: Config) -> dict:
@@ -69,9 +61,9 @@ def live(tmp_path, monkeypatch):
     cfg = Config()
     cfg.filters.max_members = 2
     cfg.apply.restart_window = "00:00-00:01"
-    cfg.xray.api_port, cfg.xray.metrics_port = _free_port(), _free_port()
-    cfg.xray.socks_port, cfg.xray.http_port = _free_port(), _free_port()
-    cfg.xray.probe_port_base = _free_port()
+    cfg.xray.api_port, cfg.xray.metrics_port = free_port(), free_port()
+    cfg.xray.socks_port, cfg.xray.http_port = free_port(), free_port()
+    cfg.xray.probe_port_base = free_port()
     base = _live_config(cfg)
     paths.xray_config_file.write_text(json.dumps(base), encoding="utf-8")
     service = ProcessXrayService(Path(XRAY_BIN), paths.xray_config_file)

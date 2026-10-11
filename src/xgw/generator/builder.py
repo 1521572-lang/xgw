@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from ..config import Config
 from ..model import ServerNode
+from ..net import sysctl
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
@@ -75,7 +76,7 @@ def skip_reason(node: ServerNode, cfg: Config, include_re=None, exclude_re=None)
         return "excluded"
     if is_junk(node.address, node.port):
         return "junk"
-    if cfg.network.ipv6 == "off" and _is_ipv6(node.address):
+    if not cfg.network.ipv6_proxy and _is_ipv6(node.address):
         return "ipv6"
     if include_re is None and cfg.filters.include_regex:
         include_re = re.compile(cfg.filters.include_regex)
@@ -338,8 +339,15 @@ def build(
     hosts: Mapping[str, Sequence[str]],
     probe_password: str | None = None,
     probe_ports: Mapping[str, int] | None = None,
+    ipv6: bool | None = None,
 ) -> BuildResult:
-    """probe_password и probe_ports — из probe_state(применённый конфиг)."""
+    """probe_password и probe_ports — из probe_state(применённый конфиг).
+
+    ipv6 — открыть TPROXY-inbound для IPv6 самой машины; по умолчанию — если так
+    настроено (network.ipv6 = proxy, capture.local) и IPv6 в ядре работает."""
+    if ipv6 is None:
+        ipv6 = cfg.network.ipv6_proxy and sysctl.ipv6_usable()
+    ipv6 = ipv6 and cfg.capture.local
     if not selection.members:
         raise BuildError("нет участников балансировщика: подписка пуста или всё отфильтровано")
     password = probe_password or secrets.token_urlsafe(24)
@@ -380,7 +388,7 @@ def build(
             {
                 "tag": "direct",
                 "protocol": "freedom",
-                "settings": {"domainStrategy": "UseIPv4"},
+                "settings": {"domainStrategy": "UseIP" if ipv6 else "UseIPv4"},
                 "streamSettings": {"sockopt": {"mark": cfg.capture.mark_bypass}},
             },
             {"tag": "block", "protocol": "blackhole"},
@@ -405,26 +413,31 @@ def build(
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
     # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
     capture = cfg.capture.lan or cfg.capture.local
+    tproxy_tags = ["tproxy-in", "tproxy-in6"] if ipv6 else ["tproxy-in"]
     inbounds: list[dict] = []
     if capture:
-        inbounds.append(
-            {
-                "tag": "tproxy-in",
-                "protocol": "tunnel",
-                "listen": "127.0.0.1",
-                "port": cfg.capture.tproxy_port,
-                # UDP включает поле network: Xray 26.3.27 поля allowedNetwork не знает
-                # и молча его игнорирует — без network перехватывался бы только TCP.
-                # allowedNetwork оставлено для версий, где поле переименовано.
-                "settings": {
-                    "network": "tcp,udp",
-                    "allowedNetwork": "tcp,udp",
-                    "followRedirect": True,
-                },
-                "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
-            }
-        )
+        for tag, listen in (("tproxy-in", "127.0.0.1"), ("tproxy-in6", "::1")):
+            if tag not in tproxy_tags:
+                continue
+            inbounds.append(
+                {
+                    "tag": tag,
+                    "protocol": "tunnel",
+                    "listen": listen,
+                    "port": cfg.capture.tproxy_port,
+                    # UDP включает поле network: Xray 26.3.27 поля allowedNetwork не
+                    # знает и молча его игнорирует — без network перехватывался бы
+                    # только TCP. allowedNetwork оставлено для версий, где поле
+                    # переименовано.
+                    "settings": {
+                        "network": "tcp,udp",
+                        "allowedNetwork": "tcp,udp",
+                        "followRedirect": True,
+                    },
+                    "streamSettings": {"sockopt": {"tproxy": "tproxy"}},
+                    "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+                }
+            )
     inbounds.extend(
         [
             {
@@ -451,7 +464,7 @@ def build(
     ]
     if capture:
         rules.append(
-            {"type": "field", "inboundTag": ["tproxy-in"], "port": "53", "outboundTag": "dns-out"}
+            {"type": "field", "inboundTag": tproxy_tags, "port": "53", "outboundTag": "dns-out"}
         )
     if direct_dns:
         rules.append(
@@ -513,7 +526,9 @@ def build(
         "dns": {
             "hosts": {host: list(ips) for host, ips in sorted(hosts.items())},
             "servers": dns_servers,
-            "queryStrategy": "UseIPv4",
+            # Ответы AAAA нужны, только если IPv6 проксируется: иначе приложения,
+            # получив IPv6-адрес, пошли бы в сеть мимо перехвата.
+            "queryStrategy": "UseIP" if ipv6 else "UseIPv4",
         },
         "inbounds": inbounds,
         "outbounds": outbounds,

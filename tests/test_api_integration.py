@@ -8,11 +8,11 @@
 import base64
 import json
 import os
-import socket
 import time
 from pathlib import Path
 
 import pytest
+from ports import free_port
 
 from xgw.xraycore.api import ApiClient, ApiError
 from xgw.xraycore.service import ProcessXrayService
@@ -25,14 +25,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 FAKE_PBK = base64.urlsafe_b64encode(b"\x11" * 32).rstrip(b"=").decode()
-
-
-def _free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
 
 
 def _outbound(tag: str, port: int) -> dict:
@@ -61,7 +53,7 @@ def _outbound(tag: str, port: int) -> dict:
 
 @pytest.fixture(scope="module")
 def runtime(tmp_path_factory):
-    api_port, metrics_port, socks_port = _free_port(), _free_port(), _free_port()
+    api_port, metrics_port, socks_port = free_port(), free_port(), free_port()
     config = {
         "log": {"loglevel": "warning"},
         "api": {
@@ -120,7 +112,7 @@ def test_add_and_remove_outbound_and_inbound(runtime):
         "tag": "probe-test-cccc",
         "protocol": "http",
         "listen": "127.0.0.1",
-        "port": _free_port(),
+        "port": free_port(),
         "settings": {"accounts": [{"user": "xgw", "pass": "x" * 32}]},
     }
     runtime.add_inbounds([probe])

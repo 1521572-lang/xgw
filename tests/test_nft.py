@@ -8,7 +8,7 @@ import sys
 import pytest
 from fakenet import FakeKernel
 
-from xgw.config import Config
+from xgw.config import Config, Network
 from xgw.net import nft
 from xgw.net.cmd import CommandError
 
@@ -200,6 +200,90 @@ def test_ip6_table_blocks_forwarding_through_lan():
     assert 'iifname "lan0" drop' in text and 'oifname "lan0" drop' in text
 
 
+def _proxy6(**network):
+    return _cfg(ipv6="proxy", **network)
+
+
+def test_ip6_table_without_proxy_has_only_the_forward_block():
+    text = nft.render6(nft.build_rules(_cfg(), capture=True, time_uids=())[0])
+    assert "chain prerouting" not in text and "chain output" not in text
+    assert "reserved6" not in text and "tproxy" not in text
+
+
+def test_ip6_table_captures_the_machine_when_ipv6_is_proxied():
+    rules, warnings = nft.build_rules(_proxy6(), capture=True, time_uids=(100,))
+    assert warnings == [] and rules.capture6
+    text = nft.render6(rules)
+    assert text.startswith("table ip6 xgw6\ndelete table ip6 xgw6\ntable ip6 xgw6 {\n")
+    assert "flush" not in text
+    assert _chain(text, "prerouting") == [
+        'iifname != "lo" return',  # только своя машина: LAN IPv6 не получает
+        "meta l4proto != { tcp, udp } return",
+        "meta mark != 0x1 return",
+        "fib daddr type local th dport != 53 return",
+        "ip6 daddr @reserved6 th dport != 53 return",
+        "meta l4proto { tcp, udp } counter tproxy ip6 to [::1]:12345 meta mark set 0x1 accept",
+    ]
+    output = _chain(text, "output")
+    assert output[:3] == [
+        "meta mark 0x2 return", "ct direction reply return", "meta l4proto != { tcp, udp } return",
+    ]
+    assert "udp sport 546 return" in output  # DHCPv6-клиент
+    assert "meta skuid 100 udp dport 123 return" in output  # служба времени мимо перехвата
+    assert output[-1] == "meta l4proto { tcp, udp } counter meta mark set 0x1"
+    # Прямой запрос Xray не должен попасть на службы шлюза через ::1 (как в ip xgw).
+    assert _chain(text, "loopback_guard") == ["meta mark 0x2 ip6 daddr ::1 counter reject"]
+    # Запрет форвардинга IPv6 из LAN остаётся: устройства IPv6 не получают.
+    assert _chain(text, "forward") == ['iifname "lan0" drop', 'oifname "lan0" drop']
+    assert "elements = { ::/127, fc00::/7, fe80::/10, ff00::/8 }" in text
+
+
+def test_ip6_capture_follows_the_capture_mode_and_local_flag():
+    rules, _ = nft.build_rules(_proxy6(), capture=False, time_uids=())
+    assert not rules.capture6 and "tproxy" not in nft.render6(rules)  # xgw disable
+    cfg = _proxy6()
+    cfg.capture.local = False
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    assert not rules.capture6  # устройствам IPv6 не выдаётся — перехватывать нечего
+    # Без LAN таблица нужна только для IPv6 самой машины.
+    rules, _ = nft.build_rules(Config(), capture=True, time_uids=())
+    assert nft.render6(rules) == ""
+    only = Config()
+    only.network.ipv6 = "proxy"
+    rules, _ = nft.build_rules(only, capture=True, time_uids=())
+    text = nft.render6(rules)
+    assert "chain prerouting" in text and "chain forward" not in text
+
+
+def test_unknown_ipv6_value_is_off():
+    rules, _ = nft.build_rules(_cfg(ipv6="auto"), capture=True, time_uids=())
+    assert not rules.capture6
+
+
+def test_exclude_cidrs_may_name_ipv6_networks_only_when_ipv6_is_proxied():
+    cfg = _proxy6()
+    cfg.capture.exclude_cidrs = ["2001:db8:77::/48", "203.0.113.0/24", "мусор"]
+    rules, warnings = nft.build_rules(cfg, capture=True, time_uids=())
+    assert "2001:db8:77::/48" in rules.reserved6 and "203.0.113.0/24" in rules.reserved
+    assert any("мусор" in warning for warning in warnings)
+    cfg = _cfg()
+    cfg.capture.exclude_cidrs = ["2001:db8:77::/48"]
+    rules, warnings = nft.build_rules(cfg, capture=True, time_uids=())
+    assert "2001:db8:77::/48" not in rules.reserved6
+    assert any("IPv6" in warning and "2001:db8:77::/48" in warning for warning in warnings)
+
+
+def test_apply_fails_when_proxied_ipv6_rules_cannot_be_loaded():
+    """Без таблицы IPv6 машины ушёл бы мимо перехвата: это ошибка, а не предупреждение."""
+    kernel = FakeKernel()
+    kernel.refuse_ip6 = True
+    rules, _ = nft.build_rules(_proxy6(), capture=True, time_uids=())
+    with pytest.raises(CommandError):
+        nft.apply(rules, kernel)
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    assert len(nft.apply(rules, kernel)) == 1  # без proxy — только предупреждение
+
+
 def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     kernel = FakeKernel()
@@ -251,7 +335,11 @@ def _variants():
     full.dns.direct_servers = ["203.0.113.53:5353"]
     lan_only = _cfg()
     lan_only.capture.local = False
+    ipv6 = _proxy6(wan_if="wan0")
+    ipv6.capture.exclude_cidrs = ["2001:db8:77::/48"]
     return {
+        "IPv6 машины": (ipv6, True),
+        "IPv6 без LAN": (Config(network=Network(ipv6="proxy")), True),
         "шлюз": (_cfg(), True),
         "всё сразу": (full, True),
         "только эта машина": (Config(), True),

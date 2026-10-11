@@ -23,6 +23,11 @@ INET_DNS_IP = "5.5.5.53"  # второй адрес «интернета»: пр
 GW_WAN_IP = "5.5.5.2"
 GW_LAN_IP = "192.168.50.1"
 LAN_IP = "192.168.50.100"
+# IPv6 стенда (только Topology(ipv6=True)): документационная сеть, а не ULA — ULA
+# (fc00::/7) входит в «частные» и шла бы мимо перехвата, как 192.168.0.0/16.
+INET_IP6 = "2001:db8:5::1"
+INET_DNS_IP6 = "2001:db8:5::53"  # «чужой» DNS-сервер для проверок из gw: отвечает Xray
+GW_WAN_IP6 = "2001:db8:5::2"
 LAN_BYPASS_IP = "192.168.50.20"  # второй адрес устройства: «устройство в обход VPN»
 LAN_BYPASS_MAC = "02:00:00:00:00:20"  # его MAC в статической аренде стенда
 
@@ -38,7 +43,8 @@ def available() -> bool:
 
 
 class Topology:
-    def __init__(self, suffix: str | None = None) -> None:
+    def __init__(self, suffix: str | None = None, *, ipv6: bool = False) -> None:
+        self.ipv6 = ipv6  # адреса IPv6 на стыке gw и «интернета» (LAN остаётся IPv4)
         suffix = suffix or str(os.getpid())
         self.inet = f"xgw-inet-{suffix}"
         self.gw = f"xgw-gw-{suffix}"
@@ -59,6 +65,15 @@ class Topology:
             self._ip("-n", self.inet, "addr", "add", f"{INET_DNS_IP}/24", "dev", "eth0")
             self._ip("-n", self.lan, "addr", "add", f"{LAN_BYPASS_IP}/24", "dev", "eth0")
             self._ip("-n", self.gw, "route", "add", "default", "via", INET_IP)
+            if self.ipv6:
+                # nodad: без проверки дублей адрес сразу годится для соединений.
+                for namespace, device, address in (
+                    (self.inet, "eth0", INET_IP6), (self.inet, "eth0", INET_DNS_IP6),
+                    (self.gw, "wan0", GW_WAN_IP6),
+                ):
+                    self._ip("-n", namespace, "addr", "add", f"{address}/64", "dev", device,
+                             "nodad")
+                self._ip("-n", self.gw, "-6", "route", "add", "default", "via", INET_IP6)
             self._ip("-n", self.lan, "route", "add", "default", "via", GW_LAN_IP)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             self.destroy()
