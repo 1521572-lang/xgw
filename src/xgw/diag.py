@@ -536,6 +536,8 @@ class Diag:
     def _sleep(self) -> list[Check]:
         if not self.cfg.network.disable_sleep:
             return [Check("Сон", OK, "disable_sleep = false — сон оставлен на ваше усмотрение")]
+        if not sleep.wanted(self.cfg):
+            return [Check("Сон", OK, "роутера нет (network.lan_if пуст) — сон не трогается")]
         awake = sleep.unmasked(self.paths.systemd_dir)
         if not awake:
             return [Check("Сон", OK, "цели сна замаскированы")]

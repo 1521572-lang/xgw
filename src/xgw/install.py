@@ -412,8 +412,12 @@ class Installer:
                     "  • подписок пока нет: VPN не включится, пока вы не добавите подписку "
                     "в панели и не нажмёте кнопку — до этого интернет работает напрямую"
                 )
-        if cfg.network.disable_sleep:
+        if sleep.wanted(cfg):
             lines.append("  • сон: sleep, suspend, hibernate и hybrid-sleep будут замаскированы")
+        elif self.journal.get("sleep"):
+            lines.append("  • сон: маска, поставленная прошлой установкой, будет снята")
+        elif cfg.network.disable_sleep:
+            lines.append("  • сон не трогается: роутера нет, без интернета никто не останется")
         if facts.ufw_active and facts.lan_if:
             lines.append(f"  • ufw включён — будут предложены правила: {self._ufw_text(facts)}")
         lines += [
@@ -634,10 +638,12 @@ class Installer:
             self._wan_ipv6(facts)
         else:
             self._wan_ipv6_back(facts)
-        if self.cfg.network.disable_sleep:
+        if sleep.wanted(self.cfg):
             masked = sleep.mask(self.paths.systemd_dir, self.runner)
             self.journal.extend("sleep", masked)
             self._step("сон замаскирован")
+        else:
+            self._sleep_back()
         if facts.ufw_active and facts.lan_if:
             self._ufw(facts, assume_yes)
         if facts.lan_if:
@@ -654,6 +660,16 @@ class Installer:
             self._token()
         self.journal.set("finished", time.time())
         return xray_ok
+
+    def _sleep_back(self) -> None:
+        """Роутера больше нет или disable_sleep = false: маска, поставленная прошлой
+        установкой, снимается. Цели, замаскированные до XGW, остаются как были."""
+        targets = self.journal.get("sleep") or []
+        if not targets:
+            return
+        sleep.unmask(list(targets), self.runner)
+        self.journal.discard("sleep")
+        self._step("сон размаскирован")
 
     def _wan_ipv6(self, facts: Facts) -> None:
         if not facts.nm_running:
@@ -867,7 +883,7 @@ class Installer:
                 f"Роутер: переведите в режим точки доступа, выключите его DHCP и подключите "
                 f"кабель от {facts.lan_if} в LAN-порт. Шлюз для устройств — {address}."
             )
-        if self.cfg.network.disable_sleep:
+        if sleep.wanted(self.cfg):
             self.out(f"GNOME, чтобы не засыпал по простою: {sleep.GNOME_HINT}")
         if self.cfg.status.lan_page and facts.lan_if:
             address = self.cfg.network.lan_address.split("/")[0]

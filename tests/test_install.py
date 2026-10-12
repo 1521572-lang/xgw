@@ -263,6 +263,45 @@ def test_machine_only_mode_does_not_touch_lan_things(box):
     assert box.system.profile("Wired connection 2")["connection.autoconnect"] == "yes"
     assert "chain output" in box.system.kernel.table  # перехват трафика самой машины
     assert "Роутер:" not in box.text()
+    # Сон не трогается: без роутера уснувшая машина никого без интернета не оставляет.
+    assert not box.system.commands("systemctl", "mask")
+    assert "sleep" not in Journal(box.paths.journal_file).data
+    assert "сон не трогается" in box.text() and "замаскирован" not in box.text()
+    assert "gsettings" not in box.text()
+    box.out.clear()
+    assert box.uninstall() == 0, box.text()
+    assert not box.system.commands("systemctl", "unmask") and "размаскирован" not in box.text()
+
+
+def test_sleep_mask_follows_the_router(box):
+    """Маску со сна снимает и повторная установка уже без роутера (или с
+    disable_sleep = false), а не только удаление; с роутером она возвращается."""
+    assert box.install() == 0
+    assert "сон замаскирован" in box.text() and "gsettings" in box.text()
+    assert Journal(box.paths.journal_file).get("sleep") == list(sleep.TARGETS)
+
+    box.cfg.network.lan_if = ""
+    box.out.clear()
+    box.answers = [False]
+    assert box.installer().run() == 1
+    assert "маска, поставленная прошлой установкой, будет снята" in box.text()
+    assert not box.system.commands("systemctl", "unmask")  # план показан, система не тронута
+
+    box.out.clear()
+    assert box.install() == 0, box.text()
+    assert box.system.calls.count(("systemctl", "unmask", *sleep.TARGETS)) == 1
+    assert "сон размаскирован" in box.text() and "gsettings" not in box.text()
+    assert "sleep" not in Journal(box.paths.journal_file).data
+    assert box.install() == 0  # повторно снимать нечего
+    assert box.system.calls.count(("systemctl", "unmask", *sleep.TARGETS)) == 1
+
+    box.cfg.network.lan_if = "lan0"
+    assert box.install() == 0
+    assert Journal(box.paths.journal_file).get("sleep") == list(sleep.TARGETS)
+    box.cfg.network.disable_sleep = False
+    assert box.install() == 0
+    assert box.system.calls.count(("systemctl", "unmask", *sleep.TARGETS)) == 2
+    assert "sleep" not in Journal(box.paths.journal_file).data
 
 
 def test_capture_stays_off_when_xray_did_not_start(box):

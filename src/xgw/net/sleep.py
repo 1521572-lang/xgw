@@ -1,7 +1,8 @@
 """Сон машины (раздел 6.2): уснувший шлюз оставляет без интернета весь дом.
 
-При disable_sleep = true цели сна маскируются; при удалении снимается маска
-только с тех, что замаскировал XGW.
+При disable_sleep = true и заданном lan_if цели сна маскируются; при удалении (и при
+повторной установке уже без роутера) снимается маска только с тех, что замаскировал
+XGW. В режиме «только эта машина» сон не трогается: оставлять без сети некого.
 """
 
 from __future__ import annotations
@@ -9,13 +10,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from . import cmd
+from ..config import Config
+from . import cmd, lan
 
 TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
 # Маска не мешает GNOME пытаться усыпить машину по простою — он лишь получит отказ.
 GNOME_HINT = (
     "gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'"
 )
+
+
+def wanted(cfg: Config) -> bool:
+    """Маскировать ли сон: только шлюзу, за которым есть сеть. Без роутера уснувшая
+    машина никого без интернета не оставляет, а ноутбук должен засыпать."""
+    return cfg.network.disable_sleep and bool(lan.lan_interface(cfg))
 
 
 def is_masked(target: str, systemd_dir: Path) -> bool:

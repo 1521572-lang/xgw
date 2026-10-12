@@ -8,7 +8,7 @@ import pytest
 from fake_telegram import BOT_NAME, OWNER, TOKEN, FakeTelegram
 from fakenet import FakeKernel
 
-from xgw import actions, config, engine, managed
+from xgw import actions, config, engine, fetch, managed
 from xgw.net import dnsmasq
 from xgw.net.capture import Capture
 from xgw.paths import Paths
@@ -80,8 +80,20 @@ class Rig:
             "request_refresh": lambda s: s.asked.append("refresh"),
             "request_scan": lambda s: s.asked.append("scan"),
         })()
+        self.routes: list[str] = []  # каким путём шёл каждый запрос к Bot API
+
+        def post(url, *, proxy=None, **kwargs):
+            # Прокси Xray в тестах нет: путь «через Xray» отказывает сразу, не трогая
+            # настоящий порт 10809 (на машине разработчика его может занимать чужая
+            # программа), и бот идёт напрямую — как при Xray, который не отвечает.
+            self.routes.append("xray" if proxy is not None else "direct")
+            if proxy is not None:
+                assert proxy == ("127.0.0.1", 10809)
+                raise fetch.FetchError("прокси Xray в тестах нет")
+            return fetch.fetch_url(url, **kwargs)
+
         self.bot = Bot(
-            self.paths, self.config_path, long_poll=0,
+            self.paths, self.config_path, long_poll=0, post=post,
             root_problem=lambda: self.root_problem,
             capture_factory=lambda cfg, paths, **kw: Capture(
                 cfg, paths, runner=self.kernel, proc_sys=proc, time_uids=(), **kw),
@@ -451,23 +463,40 @@ def test_unreachable_telegram_is_an_error(rig):
 
 
 def test_thread_answers_survives_errors_and_recovers(rig, monkeypatch):
-    monkeypatch.setattr(telegram_module, "BACKOFF", (0.1,))
+    monkeypatch.setattr(telegram_module, "BACKOFF", (0.3,))
     rig.fake.refuse = 2  # первые два запроса — отказ
     rig.bot.start()
     try:
-        deadline = time.time() + 10
-        while "не принял токен" not in rig.bot.info()["error"] and time.time() < deadline:
-            time.sleep(0.05)
-        assert "не принял токен" in rig.bot.info()["error"]
-        assert TOKEN not in rig.bot.info()["error"]
+        # Ошибка видна, пока идут отказы (две паузы по 0,3 с); значение читается один
+        # раз за круг: между двумя чтениями бот успел бы восстановиться.
+        error, deadline = "", time.time() + 10
+        while "не принял токен" not in error and time.time() < deadline:
+            time.sleep(0.02)
+            error = rig.bot.info()["error"]
+        assert "не принял токен" in error and TOKEN not in error
         rig.fake.say("/status")
         deadline = time.time() + 10
         while not rig.fake.sent and time.time() < deadline:
-            time.sleep(0.05)
+            time.sleep(0.02)
         assert rig.fake.sent and "Состояние: HEALTHY" in rig.fake.sent[0]["text"]
+        # Ошибка снимается, когда круг опроса закончен, — чуть позже самого ответа.
+        deadline = time.time() + 10
+        while rig.bot.info()["error"] and time.time() < deadline:
+            time.sleep(0.02)
         assert rig.bot.info()["error"] == "" and rig.bot.info()["username"] == BOT_NAME
     finally:
         rig.bot.stop()
+
+
+def test_requests_go_through_xray_first_and_directly_when_it_fails(rig):
+    """Сначала через http-in Xray, а если он не отвечает — напрямую; без работающего
+    Xray прокси не пробуется вовсе."""
+    rig.poll()  # getMe и getUpdates
+    assert rig.routes == ["xray", "direct"] * 2
+    rig.routes.clear()
+    rig.xray_up = False
+    assert "Состояние: HEALTHY" in rig.ask("/status")  # getUpdates и sendMessage
+    assert rig.routes == ["direct"] * 2
 
 
 def test_changing_the_token_forgets_the_old_bot(rig):

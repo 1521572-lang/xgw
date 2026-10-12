@@ -263,6 +263,12 @@ def test_time_sleep_and_ipv6(box, monkeypatch):
     assert sleepy.level == WARN and "gsettings" in sleepy.advice
     box.cfg.network.disable_sleep = False
     assert box.diag()._sleep()[0].level == OK
+    # Без роутера сон не маскируется, и немаскированный сон — не замечание.
+    box.cfg.network.disable_sleep = True
+    box.cfg.network.lan_if = ""
+    alone = box.diag()._sleep()[0]
+    assert alone.level == OK and "сон не трогается" in alone.text
+    box.cfg.network.lan_if = "lan0"
 
     assert box.diag()._ipv6()[0].level == OK
     box.system.ipv6_global = ["wan0"]

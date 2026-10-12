@@ -907,6 +907,9 @@ def test_tun_method_on_the_installed_system(gw):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "TUN: постоянный интерфейс xgwtun0" in result.stdout
     assert wait_for(lambda: _state(gw) == "HEALTHY", 60), _xgw(gw, "status").stdout
+    # Роутера нет — сон остаётся как был: без интернета уснувшая машина никого не оставит.
+    assert "сон не трогается" in result.stdout and "сон замаскирован" not in result.stdout
+    assert "masked" not in box.sh("systemctl is-enabled sleep.target suspend.target || true")
 
     link = box.sh("ip -d -br link show xgwtun0")
     assert "LOWER_UP" in link and "tun" in box.sh("ip -d link show xgwtun0")  # Xray подключён
@@ -924,6 +927,7 @@ def test_tun_method_on_the_installed_system(gw):
     assert "через TUN" in _xgw(gw, "status").stdout
     diag = _xgw(gw, "diag").stdout
     assert "TUN: /dev/net/tun есть; интерфейс xgwtun0" in diag, diag
+    assert "Сон: роутера нет (network.lan_if пуст) — сон не трогается" in diag, diag
 
     # Остановили Xray: интерфейс постоянный, поэтому трафик закрыт, а не уходит мимо VPN.
     # Вернули — он подключается к тому же интерфейсу, и ничего больше делать не нужно.
