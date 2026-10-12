@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -48,7 +49,8 @@ class Capture:
     mark_proxy: int = 1
     mark_bypass: int = 2
     route_table: int = 100
-    method: str = "tproxy"  # как трафик самой машины попадает в Xray: tproxy | tun
+    # Как трафик самой машины попадает в Xray: tproxy | tun (Linux) | sysproxy (Windows).
+    method: str = "tproxy"
     tun_name: str = "xgwtun0"
     tun_route_table: int = 101  # своя таблица маршрутов в TUN (route_table занят TPROXY LAN)
 
@@ -56,6 +58,12 @@ class Capture:
     def tun(self) -> bool:
         """Трафик самой машины идёт в Xray через TUN. Неизвестное слово — tproxy."""
         return self.method.strip().lower() == "tun"
+
+    @property
+    def sysproxy(self) -> bool:
+        """Windows: вместо перехвата — системный прокси пользователя, указывающий на
+        http-in Xray. Правил ядра и прозрачных inbound-ов в этом режиме нет."""
+        return self.method.strip().lower() == "sysproxy"
 
 
 @dataclass
@@ -222,12 +230,13 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
     except FileNotFoundError as exc:
         raise ConfigError(f"конфиг не найден: {path}") from exc
     except PermissionError as exc:
-        # В конфиге подписка, поэтому его права — 0600 root.
-        raise ConfigError(f"нет доступа к {path} — запустите команду через sudo") from exc
+        # В конфиге подписка, поэтому его права — 0600 root (в Windows sudo нет).
+        advice = "" if os.name == "nt" else " — запустите команду через sudo"
+        raise ConfigError(f"нет доступа к {path}{advice}") from exc
     except OSError as exc:
         raise ConfigError(f"конфиг не читается: {path}: {exc}") from exc
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"ошибка чтения TOML: {exc}") from exc
+        raise ConfigError(f"ошибка чтения TOML: {path}: {exc}") from exc
 
     warnings: list[str] = []
     kwargs: dict[str, object] = {}
@@ -451,10 +460,17 @@ def _validate(cfg: Config) -> list[str]:
             f"не 253–255 и не route_table — используется {Capture().tun_route_table}"
         )
         cfg.capture.tun_route_table = Capture().tun_route_table
-    if cfg.capture.method.strip().lower() not in ("tproxy", "tun"):
+    if cfg.capture.method.strip().lower() not in ("tproxy", "tun", "sysproxy"):
         warnings.append(
-            f"capture.method={cfg.capture.method!r}: допустимо tproxy или tun; принято tproxy"
+            f"capture.method={cfg.capture.method!r}: допустимо tproxy или tun "
+            "(в Windows — sysproxy); принято tproxy"
         )
+    elif cfg.capture.sysproxy and os.name != "nt":
+        warnings.append(
+            "capture.method = sysproxy — системный прокси Windows, на этой системе его нет; "
+            "принято tproxy"
+        )
+        cfg.capture.method = Capture().method
     elif cfg.capture.tun and not cfg.capture.local:
         warnings.append(
             "capture.method = tun относится к трафику самой машины: при capture.local = false "

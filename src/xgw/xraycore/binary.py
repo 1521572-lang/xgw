@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import fetch
+from ..net.cmd import HIDDEN
 
 RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases"
 MIN_VERSION = (25, 7, 23)
@@ -79,7 +80,7 @@ def installed_version(
     """
     try:
         proc = subprocess.run(
-            [str(bin_path), "version"], capture_output=True, text=True, timeout=timeout
+            [str(bin_path), "version"], capture_output=True, text=True, timeout=timeout, **HIDDEN
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

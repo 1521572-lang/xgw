@@ -19,30 +19,52 @@ class LockTimeout(Exception):
     """Блокировку держит другой процесс XGW дольше допустимого."""
 
 
+def windows_home(env: dict[str, str], module: Path | None = None) -> Path:
+    """Каталог XGW в Windows. Установленная программа узнаёт его по своему месту
+    (…\\XGW\\app\\lib\\xgw\\paths.py), запуск из исходников — %LOCALAPPDATA%\\XGW."""
+    module = module or Path(__file__).resolve()
+    home = module.parents[3] if len(module.parents) > 3 else None
+    if home is not None and module.parents[1].name == "lib" and module.parents[2].name == "app":
+        return home
+    return Path(env.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "XGW"
+
+
 @dataclass(frozen=True)
 class Paths:
     root: Path
+    # Раскладка Windows: всё в одном каталоге пользователя (config, data, run, app)
+    # вместо /etc, /var/lib, /run и /opt.
+    windows: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Paths:
+        """XGW_ROOT — корень вместо «/» (тесты, стенд). Без него в Windows — каталог
+        программы в профиле пользователя: прав администратора XGW там не нужно."""
         source = dict(os.environ) if env is None else env
+        if "XGW_ROOT" not in source and os.name == "nt":
+            return cls(root=windows_home(source), windows=True)
         return cls(root=Path(source.get("XGW_ROOT", "/")))
 
     @property
     def etc(self) -> Path:
-        return self.root / "etc" / "xgw"
+        return self.root / "config" if self.windows else self.root / "etc" / "xgw"
 
     @property
     def var(self) -> Path:
-        return self.root / "var" / "lib" / "xgw"
+        return self.root / "data" if self.windows else self.root / "var" / "lib" / "xgw"
 
     @property
     def run(self) -> Path:
-        return self.root / "run" / "xgw"
+        return self.root / "run" if self.windows else self.root / "run" / "xgw"
 
     @property
     def opt(self) -> Path:
-        return self.root / "opt" / "xgw"
+        return self.root / "app" if self.windows else self.root / "opt" / "xgw"
+
+    @property
+    def log_file(self) -> Path:
+        """Журнал демона там, где нет journald (Windows)."""
+        return self.var / "logs" / "xgw.log"
 
     @property
     def config_file(self) -> Path:
@@ -205,6 +227,37 @@ else:
 
     def _unlock(handle) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class InstanceLock:
+    """Блокировка на всё время жизни процесса: второй демон рядом не запустится.
+    Система снимает её сама, когда процесс завершается — как бы он ни завершился."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = None
+
+    def acquire(self) -> bool:
+        """False — блокировку держит другой процесс."""
+        if self._handle is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, "a+b")  # noqa: SIM115 — живёт, пока жив процесс
+        try:
+            _try_lock(handle)
+        except OSError:
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        with contextlib.suppress(OSError):
+            _unlock(self._handle)
+        self._handle.close()
+        self._handle = None
 
 
 @contextlib.contextmanager

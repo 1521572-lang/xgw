@@ -387,9 +387,9 @@ def make_api(cfg: config.Config, xray_bin: Path) -> ApiClient:
 
 
 def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
-    """systemd-юнит xgw-xray.service; там, где юнита нет (стенд до этапа 4), —
-    обычный процесс с pid-файлом: XGW_XRAY_SERVICE=process."""
-    if os.environ.get("XGW_XRAY_SERVICE") == "process":
+    """systemd-юнит xgw-xray.service; там, где юнита нет (стенд до этапа 4 —
+    XGW_XRAY_SERVICE=process — и Windows), — обычный процесс с pid-файлом."""
+    if os.environ.get("XGW_XRAY_SERVICE") == "process" or os.name == "nt":
         return PidfileXrayService(
             xray_bin or paths.xray_bin, paths.xray_config_file, paths.run / "xray.pid"
         )

@@ -78,9 +78,9 @@ def gateway(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     (proc / "net/ipv4").mkdir(parents=True)
     (proc / "net/ipv4/ip_forward").write_text("0\n")
-    real_capture = cli.Capture
+    real_capture = cli.capture_for
     monkeypatch.setattr(
-        cli, "Capture",
+        cli, "capture_for",
         lambda cfg, paths, **kwargs: real_capture(
             cfg, paths, runner=kernel, proc_sys=proc, time_uids=(), **kwargs
         ),
@@ -351,7 +351,7 @@ def network(gateway, monkeypatch):
     """Шлюз с LAN-картой; команда запущена от root, Xray отвечает."""
     text = gateway.config.read_text(encoding="utf-8")
     gateway.config.write_text(text + '[network]\nlan_if = "lan0"\n', encoding="utf-8")
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     monkeypatch.setattr(cli.engine, "healthy_http_in", lambda _cfg: ("127.0.0.1", 10809))
     return gateway
 
@@ -383,7 +383,7 @@ def test_enable_warns_when_xray_is_down(network, monkeypatch, capsys):
 
 
 def test_network_commands_need_root(network, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
     for command in (("enable",), ("disable",), ("net", "up"), ("net", "down")):
         assert network.run(*command) == 1
         assert "root" in capsys.readouterr().err
@@ -406,7 +406,7 @@ def test_enable_failure_is_reported(network, capsys):
 
 
 def test_net_show_works_without_root(network, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root")
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root")
     assert network.run("net", "show") == 0
     out = capsys.readouterr().out
     assert out.startswith("table ip xgw\ndelete table ip xgw\n") and "table ip6 xgw6 {" in out

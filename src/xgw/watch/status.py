@@ -154,7 +154,12 @@ def collect_status(
         "state": state,
         "action": action,
         "since": since,
-        "xray": {"ok": xray_ok, "version": xray_version},
+        # configured = False — рабочего конфига ещё нет: Xray не запускался, потому что
+        # серверов пока не добавляли (это не сбой).
+        "xray": {
+            "ok": xray_ok, "version": xray_version,
+            "configured": paths.xray_config_file.exists(),
+        },
         "capture": capture,
         "members": members,
         "spares": spares,
@@ -250,9 +255,29 @@ def render_servers(status: dict) -> str:
     return "\n".join(lines)
 
 
+def _render_sysproxy(capture: dict) -> str:
+    """То же для Windows: вместо перехвата — системный прокси пользователя."""
+    mode = capture.get("mode")
+    if mode == "none":
+        return "VPN: выключен в конфиге (capture.local = false) — XGW только управляет Xray"
+    if mode == "off":
+        return "VPN: ВЫКЛЮЧЕН — системный прокси не тронут, трафик идёт напрямую"
+    if mode == "open":
+        return (
+            "VPN: ВРЕМЕННО ВЫКЛЮЧЕН — Xray недоступен, fail_mode = open; "
+            "трафик идёт напрямую, мимо VPN"
+        )
+    text = f"VPN: включён — системный прокси Windows {capture.get('proxy', '')}".rstrip()
+    if capture.get("loaded") is False:
+        text += " — ПРОКСИ ИЗМЕНЁН НЕ XGW (вернётся на ближайшем шаге; сразу — xgw enable)"
+    return text
+
+
 def render_capture(capture: dict) -> str:
     """Строка о перехвате: что через Xray, что мимо, загружены ли правила."""
     mode = capture.get("mode")
+    if capture.get("sysproxy"):
+        return _render_sysproxy(capture)
     if mode == "none":
         return "Перехват: выключен в конфиге — XGW только управляет Xray"
     if mode == "off":
@@ -276,6 +301,17 @@ def render_capture(capture: dict) -> str:
     return text
 
 
+def render_xray(xray: dict) -> str:
+    version = f" {xray['version']}" if xray.get("version") else ""
+    if xray.get("ok"):
+        state = "отвечает"
+    elif xray.get("configured") is False:
+        state = "ещё не запускался — рабочий конфиг появится с первым сервером из подписки"
+    else:
+        state = "НЕ ОТВЕЧАЕТ"
+    return f"Xray{version}: {state}"
+
+
 def render_status(status: dict) -> str:
     lines: list[str] = []
     if status.get("daemon") and status.get("state"):
@@ -284,9 +320,7 @@ def render_status(status: dict) -> str:
         lines.append(f"Состояние: {status['state']}{tail} — {status.get('action') or 'ничего'}")
     else:
         lines.append("Состояние: демон XGW не запущен — показаны разовые данные")
-    xray = status.get("xray") or {}
-    version = f" {xray['version']}" if xray.get("version") else ""
-    lines.append(f"Xray{version}: " + ("отвечает" if xray.get("ok") else "НЕ ОТВЕЧАЕТ"))
+    lines.append(render_xray(status.get("xray") or {}))
     if status.get("capture"):
         lines.append(render_capture(status["capture"]))
     pin = status.get("pin")

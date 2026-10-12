@@ -112,6 +112,9 @@ class Stand:
     _topology: netns.Topology | None = None
     _own_topology: bool = False
     ipv6: bool = False  # netns: IPv6 на стыке шлюза и «интернета», origin слушает и по IPv6
+    # Переменные окружения для команд и демона шлюза — сверх обычных (Windows: ключи
+    # реестра для проверок вместо настоящих настроек машины).
+    extra_env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.logs = self.workdir / "logs"
@@ -168,6 +171,7 @@ class Stand:
             PYTHONPATH=str(SRC),
             PYTHONIOENCODING="utf-8",
         )
+        env.update(self.extra_env)
         return env
 
     def start(self) -> None:
@@ -258,6 +262,7 @@ class Stand:
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
         direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
+        sysproxy: bool = False, refresh_minutes: int = 1,
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -268,6 +273,13 @@ class Stand:
         capture=True (только netns) — шлюз с перехватом: LAN на lan0, трафик самого
         шлюза тоже через Xray, одно устройство в обход VPN, прямой DNS на втором
         адресе «интернета». Без него XGW только управляет Xray (проверки этапа 2).
+
+        sysproxy=True (Windows, режим loopback) — VPN-клиент самой машины: вместо
+        перехвата системный прокси пользователя.
+
+        refresh_minutes — как часто демон обновляет подписку. Обновление заодно чинит
+        испорченный рабочий конфиг; тесту, которому нужен Xray, сломанный надолго,
+        нужен и большой интервал.
         """
         dns = f"{self.inet_ip}:{self.dns_port}" if self.dns_port != 53 else self.inet_ip
         if capture:
@@ -287,6 +299,12 @@ method = "{method}"
 fail_mode = "{fail_mode}"
 """
             direct_dns = f'["{netns.INET_DNS_IP}"]'
+        elif sysproxy:
+            network = (
+                '\n[capture]\nmethod = "sysproxy"\nlan = false\nlocal = true\n'
+                f'fail_mode = "{fail_mode}"\n'
+            )
+            direct_dns = "[]"
         else:
             network = "\n[capture]\nlan = false\nlocal = false\n"
             direct_dns = "[]"
@@ -296,7 +314,7 @@ fail_mode = "{fail_mode}"
 [[subscriptions]]
 name = "stand"
 url = "{self.subscription.as_uri()}"
-refresh_minutes = 1
+refresh_minutes = {refresh_minutes}
 """ if subscription else ""
         self.config_file.write_text(
             f"""{network}{source}
@@ -343,12 +361,15 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
         """Та же подписка по HTTP — как у настоящего провайдера, с токеном в адресе."""
         return self.origin_url("/sub/s3cr3t-stand-token")
 
-    def xgw(self, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
-        """Команда `xgw …` в контексте шлюза."""
+    def xgw(
+        self, *args: str, timeout: float = 120, encoding: str = "utf-8"
+    ) -> subprocess.CompletedProcess:
+        """Команда `xgw …` в контексте шлюза. encoding — для команд, которые сами
+        выбирают кодировку вывода (`xgw winsetup` печатает для установщика в ANSI)."""
         return subprocess.run(
             [*self._prefix("gw"), sys.executable, "-m", "xgw", *args,
              "--config", str(self.config_file)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, text=True, encoding=encoding, errors="replace",
             env=self._env(), timeout=timeout,
         )
 

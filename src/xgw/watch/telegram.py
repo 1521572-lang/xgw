@@ -434,9 +434,7 @@ class Bot:
             return "Демон XGW не отвечает: состояние неизвестно. Проверьте службу xgw на шлюзе."
         lines = [f"Состояние: {snap.get('state') or 'нет данных'}"
                  + (f" — {snap['action']}" if snap.get("action") else "")]
-        xray = snap.get("xray") or {}
-        version = f" {xray['version']}" if xray.get("version") else ""
-        lines.append(f"Xray{version}: " + ("отвечает" if xray.get("ok") else "НЕ ОТВЕЧАЕТ"))
+        lines.append(status.render_xray(snap.get("xray") or {}))
         if snap.get("capture"):
             lines.append(status.render_capture(snap["capture"]))
         members = snap.get("members") or []

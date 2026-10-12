@@ -34,7 +34,22 @@ class CaptureError(Exception):
     """Правила не загружены: нет прав, nft или ip, либо ядро их не приняло."""
 
 
+def capture_for(cfg: Config, paths: Paths, **kwargs):
+    """Управление перехватом для этой системы: правила ядра (Linux) либо, при
+    capture.method = "sysproxy", системный прокси Windows — с тем же набором действий."""
+    if cfg.capture.sysproxy:
+        from .wincapture import WinCapture
+
+        return WinCapture(cfg, paths, **kwargs)
+    return Capture(cfg, paths, **kwargs)
+
+
 class Capture:
+    # Перехват на уровне сети: обычный сокет самой машины тоже идёт через Xray, и
+    # утечку можно проверить запросом без метки.
+    transparent = True
+    reloaded_text = "правила сети не были загружены — загружены заново"
+
     def __init__(
         self,
         cfg: Config,

@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Callable, Sequence
 
 Runner = Callable[..., str]
+# Windows: консольная программа, запущенная из процесса без консоли (демон под
+# pythonw), открыла бы своё окно — на каждый вызов `xray api`. Параметры для subprocess.
+HIDDEN: dict = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 class CommandError(Exception):
@@ -27,7 +31,7 @@ def run(
     command = " ".join(argv)
     try:
         proc = subprocess.run(
-            list(argv), input=input, capture_output=True, text=True, timeout=timeout
+            list(argv), input=input, capture_output=True, text=True, timeout=timeout, **HIDDEN
         )
     except FileNotFoundError as exc:
         raise CommandError(f"{argv[0]}: программа не найдена") from exc

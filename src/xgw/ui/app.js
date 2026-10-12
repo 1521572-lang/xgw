@@ -157,7 +157,11 @@
       $("banner").hidden = true;
       render();
     } catch (error) {
-      $("banner").textContent = "Нет связи с демоном XGW — пробую снова. Если так продолжается: sudo systemctl status xgw";
+      // Панель открывают на той же машине, где работает XGW: по браузеру видно, где мы.
+      $("banner").textContent = "Нет связи с демоном XGW — пробую снова. Если так продолжается: " + (
+        navigator.userAgent.includes("Windows")
+          ? "откройте панель заново ярлыком «XGW» в меню «Пуск»"
+          : "sudo systemctl status xgw");
       $("banner").hidden = false;
     }
   }
@@ -244,12 +248,15 @@
   }
 
   function scopeText(capture) {
+    // Windows: вместо перехвата — системный прокси, мимо него программы ходят напрямую.
+    if (capture.sysproxy) return "Браузеры и программы, которые смотрят на системный прокси, выходят через VPN";
     if (capture.lan && capture.local) return `Эта машина и сеть ${capture.lan_if} выходят через VPN`;
     if (capture.lan) return `Сеть ${capture.lan_if} выходит через VPN`;
     return "Эта машина выходит через VPN";
   }
 
   function renderHero(s, stale) {
+    $("brand-note").textContent = s.capture.sysproxy ? "VPN-клиент" : "шлюз";
     const mode = s.capture.mode;
     const on = mode === "on";
     const [tone] = health(s, stale);
@@ -266,7 +273,9 @@
       if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
       else if (s.capture.loaded === false) {
         heroTone = "bad";
-        sub = "Правила сети не загружены — демон загрузит их заново";
+        sub = s.capture.sysproxy
+          ? "Системный прокси Windows изменён не в XGW — демон сейчас вернёт его"
+          : "Правила сети не загружены — демон загрузит их заново";
       }
     } else if (mode === "open") {
       title = "VPN временно снят";

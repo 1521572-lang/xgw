@@ -1,6 +1,7 @@
 """Мелкие части этапа 2: разбор `xray api bi`, служба с pid-файлом, события,
 статус и оценка трафика проверок."""
 
+import os
 import subprocess
 import sys
 import time
@@ -20,6 +21,8 @@ from xgw.xraycore.service import (
     ProcessXrayService,
     XrayServiceError,
     pid_alive,
+    process_image,
+    runs_program,
 )
 
 # --- xray api bi ---------------------------------------------------------------
@@ -52,7 +55,9 @@ def test_parse_balancer_info():
 
 @pytest.fixture()
 def fake_xray(monkeypatch):
-    """Вместо xray запускается python-процесс, который просто живёт (или сразу падает)."""
+    """Вместо xray запускается python-процесс, который просто живёт (или сразу падает).
+    Программой службы поэтому назван сам Python: в Windows живой процесс из pid-файла
+    сверяется с ней по имени."""
     real_popen = subprocess.Popen
     behaviour = {"code": "import time; time.sleep(120)"}
 
@@ -65,8 +70,8 @@ def fake_xray(monkeypatch):
 
 def test_pidfile_service_is_shared_between_processes(tmp_path, fake_xray):
     pid_file = tmp_path / "run" / "xray.pid"
-    owner = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=3)
-    other = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=3)
+    owner = PidfileXrayService(sys.executable, tmp_path / "config.json", pid_file, grace=3)
+    other = PidfileXrayService(sys.executable, tmp_path / "config.json", pid_file, grace=3)
     assert not owner.is_active()
     owner.start()
     try:
@@ -87,8 +92,8 @@ def test_pidfile_stop_does_not_wait_for_a_zombie(tmp_path, fake_xray):
     процесс остаётся в таблице (зомби), но живым считаться не должен — иначе
     остановка ждала бы весь grace."""
     pid_file = tmp_path / "xray.pid"
-    owner = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=6)
-    other = PidfileXrayService("xray", tmp_path / "config.json", pid_file, grace=6)
+    owner = PidfileXrayService(sys.executable, tmp_path / "config.json", pid_file, grace=6)
+    other = PidfileXrayService(sys.executable, tmp_path / "config.json", pid_file, grace=6)
     owner.start()
     pid = int(pid_file.read_text())
     started = time.monotonic()
@@ -104,11 +109,30 @@ def test_pidfile_stop_does_not_wait_for_a_zombie(tmp_path, fake_xray):
 
 def test_pidfile_service_reports_instant_crash(tmp_path, fake_xray):
     fake_xray["code"] = "import sys; print('failed to load config'); sys.exit(23)"
-    service = PidfileXrayService("xray", tmp_path / "config.json", tmp_path / "xray.pid")
+    service = PidfileXrayService(sys.executable, tmp_path / "config.json", tmp_path / "xray.pid")
     with pytest.raises(XrayServiceError, match="сразу после запуска"):
         service.start()
     assert not service.is_active()
     assert "failed to load config" in service.log_file.read_text()  # причина — в логе рядом
+
+
+@pytest.mark.skipif(os.name != "nt", reason="сверка имени программы — только в Windows")
+def test_stale_pid_of_another_program_is_not_xray(tmp_path):
+    """pid-файл пережил перезагрузку, а его номер достался чужой программе: это не
+    работающий Xray, и останавливать её нельзя."""
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        pid_file = tmp_path / "xray.pid"
+        pid_file.write_text(str(stranger.pid), encoding="ascii")
+        service = PidfileXrayService("xray.exe", tmp_path / "config.json", pid_file, grace=1)
+        assert pid_alive(stranger.pid) and not service.is_active()
+        assert process_image(stranger.pid).lower().endswith("python.exe")
+        assert runs_program(stranger.pid, "PYTHON") and not runs_program(stranger.pid, "xray")
+        service.stop()
+        assert pid_alive(stranger.pid) and not pid_file.exists()  # чужой процесс жив
+    finally:
+        stranger.terminate()
+        stranger.wait(timeout=5)
 
 
 def test_process_service_says_why_xray_exited(tmp_path):

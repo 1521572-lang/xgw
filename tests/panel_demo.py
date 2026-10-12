@@ -1,11 +1,12 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
-    python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile]
+    python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|windows]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
 каталоге. Сцена hostile подставляет имена сервера и устройства с HTML: в
-браузере они должны остаться текстом.
+браузере они должны остаться текстом. Сцена windows — XGW как VPN-клиент Windows:
+системный прокси вместо перехвата, сети с устройствами нет.
 """
 
 from __future__ import annotations
@@ -133,6 +134,7 @@ class DemoCapture:
     """Перехват, который помнит только «включён или нет»."""
 
     mode_now = "on"
+    sysproxy = False  # сцена windows: системный прокси вместо перехвата
 
     def __init__(self, cfg, paths, **_kwargs) -> None:
         self.cfg = cfg
@@ -143,6 +145,10 @@ class DemoCapture:
         return DemoCapture.mode_now
 
     def describe(self, *, check: bool = True) -> dict:
+        if DemoCapture.sysproxy:
+            return {"mode": DemoCapture.mode_now, "lan_if": "", "lan": False, "local": True,
+                    "bypass": [], "sysproxy": True, "proxy": "127.0.0.1:10819",
+                    "fail_mode": "closed", "loaded": None}
         return {"mode": DemoCapture.mode_now, "lan_if": self.lan_if, "lan": True, "local": True,
                 "bypass": lan.bypass_addresses(self.cfg)[0], "fail_mode": "closed",
                 "loaded": None}
@@ -209,6 +215,11 @@ class DemoPanel(Panel):
             DemoCapture.mode_now = "on" if body.get("on") else "off"
             text = ("перехват включён: сеть enp4s0 и эта машина — через Xray" if body.get("on")
                     else "перехват снят: трафик идёт напрямую, мимо VPN")
+            if DemoCapture.sysproxy:
+                text = ("VPN включён: системный прокси Windows — 127.0.0.1:10819 (Xray)"
+                        if body.get("on") else
+                        "VPN выключен: системный прокси возвращён к прежним настройкам, "
+                        "трафик идёт напрямую")
             with actions.open_store(self.paths) as store:
                 store.add_event("capture", text)
             return actions.Outcome(0, text)
@@ -229,6 +240,10 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     lines = CONFIG.format(port=port)
     if scene == "empty":
         lines = f'[network]\nlan_if = "enp4s0"\n[panel]\nport = {port}\n'
+    if scene == "windows":
+        DemoCapture.sysproxy = True
+        network = '[network]\nlan_if = "enp4s0"\nbypass_hosts = ["192.168.50.23"]\n'
+        lines = lines.replace(network, "")
     config_path.write_text(lines, encoding="utf-8")
     now = time.time()
     if scene != "empty":
@@ -255,7 +270,11 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         store.add_event("DEGRADED", "HEALTHY → DEGRADED: часть серверов недоступна — замена "
                                     "на запасные")
         store.add_event("rotation", "замена участников: proxy-tr-0000 → «🇫🇮 Финляндия · Хельсинки»")
-    store.add_event("capture", "перехват включён: сеть enp4s0 и эта машина — через Xray")
+    store.add_event(
+        "capture",
+        "VPN включён: системный прокси Windows — 127.0.0.1:10819 (Xray)" if scene == "windows"
+        else "перехват включён: сеть enp4s0 и эта машина — через Xray",
+    )
     store.close()
 
     def keep_fresh() -> None:  # как демон: статус переписывается на каждом шаге
@@ -281,7 +300,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8791)
     parser.add_argument(
-        "--scene", choices=("work", "empty", "trouble", "hostile"), default="work")
+        "--scene", choices=("work", "empty", "trouble", "hostile", "windows"), default="work")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)

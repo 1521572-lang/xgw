@@ -40,8 +40,13 @@ class Outcome:
         return self.code == 0
 
 
-def root_problem() -> str | None:
+def root_problem(cfg: config.Config | None = None) -> str | None:
     """Почему сетью управлять нельзя; None — можно."""
+    if cfg is not None and cfg.capture.sysproxy:
+        # Системный прокси — настройка самого пользователя: права администратора не нужны.
+        if os.name == "nt":
+            return None
+        return "системный прокси (capture.method = sysproxy) есть только в Windows"
     if not sys.platform.startswith("linux"):
         return "управление сетью работает только в Linux"
     if os.geteuid() != 0:
@@ -81,12 +86,23 @@ def enable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
     except CaptureError as exc:
         return Outcome(1, f"перехват не включён: {exc}")
     info = capture.describe(check=False)
-    text = f"перехват включён: {scope(info)} — через Xray"
+    sysproxy = bool(info.get("sysproxy"))
+    if sysproxy:
+        text = f"VPN включён: системный прокси Windows — {info['proxy']} (Xray)"
+    else:
+        text = f"перехват включён: {scope(info)} — через Xray"
     if info["bypass"]:
         text += "; мимо VPN: " + ", ".join(info["bypass"])
     with open_store(paths) as store:
         store.add_event("capture", text)
     if engine.healthy_http_in(cfg) is None:
+        if sysproxy:
+            return Outcome(
+                0, text,
+                ("внимание: Xray не отвечает — пока он не запущен, программы, идущие через "
+                 "системный прокси, остаются без интернета",),
+                ("вернуть прямой интернет: xgw disable",),
+            )
         return Outcome(
             0, text,
             ("внимание: Xray не отвечает — пока он не запущен, перехваченный трафик "
@@ -114,12 +130,17 @@ def disable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
         capture.disable()
     except CaptureError as exc:
         return Outcome(1, f"перехват не снят: {exc}")
-    text = "перехват снят: трафик идёт напрямую, мимо VPN"
+    if cfg.capture.sysproxy:
+        text = "VPN выключен: системный прокси возвращён к прежним настройкам, трафик идёт напрямую"
+        hints: tuple[str, ...] = ("включить снова: xgw enable",)
+    else:
+        text = "перехват снят: трафик идёт напрямую, мимо VPN"
+        hints = ("вернуть перехват: sudo xgw enable",)
     if capture.lan_if:
         text += f"; шлюз остаётся роутером для сети {capture.lan_if}"
     with open_store(paths) as store:
         store.add_event("capture", text)
-    return Outcome(0, text, hints=("вернуть перехват: sudo xgw enable",))
+    return Outcome(0, text, hints=hints)
 
 
 # --- сеть после изменения настроек ---------------------------------------------

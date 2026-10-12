@@ -133,6 +133,7 @@ class Updater:
         self.verdict = (True, "")
         self.api_ok = [True]
         self.restarts = 0
+        self.stops = 0
         self.out: list[str] = []
         self.downloads = 0
         versions = {b"old": (26, 3, 27), b"new": (26, 4, 13), b"anc": (25, 6, 8)}
@@ -147,6 +148,11 @@ class Updater:
         class Service:
             def restart(self):
                 updater.restarts += 1
+
+            def stop(self):
+                updater.stops += 1
+                # Останавливают ядро раньше, чем трогают его каталог.
+                assert updater.paths.xray_bin.read_bytes() == b"old httpMethod"
 
         class Api:
             def balancer_info(self, tag):
@@ -186,6 +192,32 @@ def test_update_replaces_binary_and_restarts(updater):
     assert (updater.paths.xray_dir / "geoip.dat").read_bytes() == b"new-geo"
     assert updater.restarts == 1 and updater.leftovers() == ["xray"]
     assert updater.out == ["Xray обновлён и перезапущен: 26.3.27 → 26.4.13"]
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_update_stops_xray_first_only_where_the_folder_is_locked(updater, monkeypatch, windows):
+    """Windows не даёт переименовать каталог работающей программы: там ядро перед
+    заменой останавливается. В Linux оно работает до самого перезапуска."""
+    monkeypatch.setattr(update, "WINDOWS", windows)
+    assert updater.run() == 0
+    assert updater.stops == (1 if windows else 0) and updater.restarts == 1
+    assert updater.paths.xray_bin.read_bytes() == b"new httpMethod"
+
+
+def test_update_keeps_the_old_xray_when_files_cannot_be_replaced(updater, monkeypatch):
+    monkeypatch.setattr(update, "WINDOWS", True)
+    real_replace = os.replace
+
+    def locked(source, target):
+        if Path(source) == updater.paths.xray_dir:
+            raise PermissionError("файл занят другим процессом")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(update.os, "replace", locked)
+    assert updater.run() == 1
+    assert "не заменены" in updater.out[0] and "не тронута" in updater.out[0]
+    assert updater.paths.xray_bin.read_bytes() == b"old httpMethod"
+    assert updater.restarts == 1 and updater.leftovers() == ["xray"]  # ядро запущено снова
 
 
 def test_update_is_a_no_op_for_the_same_version(updater):
@@ -305,7 +337,7 @@ def root(tmp_path, monkeypatch):
 
 
 def test_install_without_config_creates_it_from_the_example(root, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     assert main(["install"]) == 1
     out = capsys.readouterr().out
     assert f"Создан {root.config_file}" in out and "sudo xgw install" in out
@@ -321,7 +353,7 @@ def test_install_refuses_foreign_config_path_broken_config_and_no_root(
 ):
     other = tmp_path / "other.toml"
     other.write_text("", encoding="utf-8")
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     assert main(["install", "--config", str(other)]) == 2
     assert "положите конфиг туда" in capsys.readouterr().err
     root.etc.mkdir(parents=True)
@@ -329,12 +361,12 @@ def test_install_refuses_foreign_config_path_broken_config_and_no_root(
     assert main(["install"]) == 2
     assert "ошибка чтения TOML" in capsys.readouterr().err
     assert root.config_file.read_text(encoding="utf-8") == "[network\n"  # не перезаписан
-    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
     assert main(["install"]) == 1 and main(["uninstall", "--yes"]) == 1
 
 
 def test_uninstall_asks_before_touching_anything(root, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     monkeypatch.setattr("builtins.input", lambda prompt: "n")
     assert main(["uninstall"]) == 1
     assert "Отменено." in capsys.readouterr().out
@@ -399,7 +431,7 @@ def test_daemon_rereads_changed_config_without_restarting(root, tmp_path, monkey
     _write_gateway_config(config_path, 2)
     monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
     # Без root демон правилами сети не управляет — и тест их не касается.
-    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
     seen: list[int] = []
     adopted: list[int] = []
     scripts = [
@@ -445,13 +477,13 @@ def test_daemon_reloads_capture_rules_after_config_change(root, tmp_path, monkey
     proc = tmp_path / "proc"
     (proc / "net/ipv4").mkdir(parents=True)
     (proc / "net/ipv4/ip_forward").write_text("0", encoding="ascii")
-    real_capture = cli.Capture
+    real_capture = cli.capture_for
     monkeypatch.setattr(
-        cli, "Capture",
+        cli, "capture_for",
         lambda cfg, paths, **kwargs: real_capture(
             cfg, paths, runner=kernel, proc_sys=proc, time_uids=(), **kwargs),
     )
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
     config_path = tmp_path / "config.toml"
     _write_gateway_config(config_path, 2)
@@ -488,14 +520,14 @@ def test_apply_on_installed_gateway_syncs_rules_and_dhcp(root, tmp_path, monkeyp
     proc = tmp_path / "proc"
     (proc / "net/ipv4").mkdir(parents=True)
     (proc / "net/ipv4/ip_forward").write_text("0\n", encoding="ascii")
-    real_capture = cli.Capture
+    real_capture = cli.capture_for
     monkeypatch.setattr(
-        cli, "Capture",
+        cli, "capture_for",
         lambda cfg, paths, **kwargs: real_capture(
             cfg, paths, runner=kernel, proc_sys=proc, time_uids=(), **kwargs),
     )
     monkeypatch.setattr(cli.cmd, "run", system)
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     cfg = _lan_cfg()
     logger = cli.log.get_logger("test")
 
@@ -548,6 +580,66 @@ def test_panel_command_prints_the_link_with_the_token(root, capsys):
     assert "панель выключена" in capsys.readouterr().err
 
 
+def test_panel_open_waits_for_the_panel_and_starts_xgw_in_windows(root, capsys, monkeypatch):
+    """`xgw panel --open` (ярлык): браузер открывается, когда панель уже отвечает; в
+    Windows не запущенный XGW ярлык сначала запускает сам."""
+    import socket
+
+    from xgw import winapp
+    from xgw.watch import panel
+
+    opened: list[str] = []
+    started: list[bool] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
+    monkeypatch.setattr(cli, "PANEL_WAIT", 0.6)
+    monkeypatch.setattr(cli, "WINDOWS", False)
+    root.etc.mkdir(parents=True)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        root.config_file.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
+        assert main(["panel", "--open"]) == 0
+        token = panel.read_token(root)
+        assert opened == [f"http://127.0.0.1:{port}/?token={token}"]
+        assert capsys.readouterr().out == ""  # ссылка с токеном в терминал не печатается
+
+        # Windows: демон не запущен — ярлык запускает его и только потом открывает панель.
+        monkeypatch.setattr(cli, "WINDOWS", True)
+        monkeypatch.setattr(winapp, "start_daemon", lambda paths: started.append(True) or True)
+        assert main(["panel", "--open"]) == 0 and started == [True] and len(opened) == 2
+        monkeypatch.setattr(winapp, "start_daemon", lambda paths: False)
+        assert main(["panel", "--open"]) == 1 and len(opened) == 2
+        assert "XGW не запустился" in capsys.readouterr().err
+        monkeypatch.setattr(cli, "WINDOWS", False)
+    # Панель не отвечает — браузер с пустой страницей не открывается.
+    assert main(["panel", "--open"]) == 1 and len(opened) == 2
+    assert "панель не отвечает" in capsys.readouterr().err
+
+
+def test_shortcut_failures_show_a_window_when_there_is_no_console(root, monkeypatch):
+    """Ярлык в меню «Пуск» запускает XGW без окна консоли: о любой ошибке — и о
+    нечитаемом config.toml тоже — говорит окно с сообщением, а не строка в никуда."""
+    import sys
+
+    from xgw import winapp
+
+    shown: list[str] = []
+    monkeypatch.setattr(winapp, "alert", shown.append)
+    monkeypatch.setattr(cli, "WINDOWS", True)
+    root.etc.mkdir(parents=True)
+    root.config_file.write_text("[panel\n", encoding="utf-8")
+    assert main(["panel", "--open"]) == 2 and shown == []  # в терминале окно не нужно
+    monkeypatch.setattr(sys, "stderr", None)
+    assert main(["panel", "--open"]) == 2
+    assert len(shown) == 1 and "ошибка чтения TOML" in shown[0]
+    assert str(root.config_file) in shown[0]  # какой файл править — сказано
+    assert main(["status"]) == 2 and len(shown) == 1  # другие команды окон не показывают
+    assert main(["panel"]) == 2 and len(shown) == 1  # и панель без --open — тоже
+    root.config_file.write_text("[panel]\nenabled = false\n", encoding="utf-8")
+    assert main(["panel", "--open"]) == 2 and "панель выключена" in shown[-1]
+
+
 def _free_port() -> int:
     import socket
 
@@ -576,7 +668,7 @@ def test_daemon_serves_the_panel_and_keeps_it_across_reloads(root, tmp_path, mon
     config_path = tmp_path / "config.toml"
     config_path.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
     monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
-    monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
     panels: list = []
 
     def sync(panel, *args, **kwargs):
@@ -626,7 +718,7 @@ def test_busy_panel_port_does_not_stop_the_daemon(root, tmp_path, monkeypatch, c
         config_path.write_text(
             f"[panel]\nport = {taken.getsockname()[1]}\n", encoding="utf-8")
         monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
-        monkeypatch.setattr(cli, "_root_problem", lambda: "нужны права root: sudo xgw …")
+        monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
         monkeypatch.setattr(cli, "_sync_panel", REAL_SYNC_PANEL)
         ran: list[bool] = []
 
@@ -650,7 +742,7 @@ def test_first_install_run_asks_about_the_router_and_goes_on(root, monkeypatch, 
     """Запуск человеком в терминале: файл править не нужно — карту спрашивает установка."""
     import xgw.install
 
-    monkeypatch.setattr(cli, "_root_problem", lambda: None)
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(xgw.install, "choose_lan", lambda: "enp4s0")
     monkeypatch.setattr(cli, "_run_diag", lambda *args, **kwargs: [])

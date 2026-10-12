@@ -412,8 +412,10 @@ def build(
         for info in nodes
     ]
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
-    # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
-    capture = cfg.capture.lan or cfg.capture.local
+    # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется. То же в
+    # Windows (capture.method = "sysproxy"): программы приходят на http-in через системный
+    # прокси, прозрачных inbound-ов там нет.
+    capture = (cfg.capture.lan or cfg.capture.local) and not cfg.capture.sysproxy
     # TUN (capture.method = "tun") — только для трафика самой машины, сеть LAN остаётся на
     # TPROXY; IPv6 машины тогда идёт через тот же TUN, и отдельный inbound на ::1 не нужен.
     tun = cfg.capture.tun and cfg.capture.local

@@ -54,7 +54,8 @@ mark_bypass = 2  # «мимо перехвата» (сокеты Xray и пря�
 route_table = 100
 # Как трафик самой машины попадает в Xray: tproxy — TPROXY на lo (по умолчанию);
 # tun — постоянный TUN-интерфейс, который создаёт XGW (раздел «TUN» в README). Сеть
-# Wi-Fi в обоих случаях идёт через TPROXY.
+# Wi-Fi в обоих случаях идёт через TPROXY. В Windows — только sysproxy (системный
+# прокси пользователя; этот конфиг там создаёт установщик, раздел «Windows» в README).
 method = "tproxy"
 tun_name = "xgwtun0"
 # Таблица маршрутов в TUN: route_table занята локальной доставкой TPROXY для сети Wi-Fi.

@@ -17,7 +17,10 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from .. import masking
+from .. import log, masking
+from ..net.cmd import HIDDEN
+
+MAX_LOG_BYTES = 2 * 1024 * 1024
 
 
 class XrayServiceError(Exception):
@@ -105,6 +108,7 @@ class ProcessXrayService(XrayService):
                 [self.bin_path, "run", "-c", self.config_path],
                 stdout=subprocess.DEVNULL,
                 stderr=self._err,
+                **HIDDEN,
             )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc
@@ -163,6 +167,44 @@ def pid_alive(pid: int) -> bool:
     return not _is_zombie(pid)
 
 
+def process_image(pid: int) -> str:
+    """Windows: путь к программе процесса; пусто — узнать не удалось."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def runs_program(pid: int, program: str | Path) -> bool:
+    """Жив ли процесс pid и та ли это программа. В Windows pid-файл переживает
+    перезагрузку, а номера процессов переиспользуются: без сверки имени чужая
+    программа с тем же номером сошла бы за работающий Xray — и была бы «остановлена»."""
+    if not pid_alive(pid):
+        return False
+    if os.name != "nt":
+        return True
+    image = process_image(pid)
+    # Имя без расширения: XGW_XRAY_BIN может быть задан и как «xray», и как «xray.exe».
+    return bool(image) and Path(image).stem.lower() == Path(str(program)).stem.lower()
+
+
 def _is_zombie(pid: int) -> bool:
     """Процесс завершился, но родитель его ещё не снял: kill(pid, 0) для такого проходит.
 
@@ -206,20 +248,33 @@ class PidfileXrayService(XrayService):
             self._proc = None
         if self._proc is not None and self._proc.pid == pid:
             return True
-        return pid_alive(pid)
+        return runs_program(pid, self.bin_path)
+
+    def _trim_log(self) -> None:
+        """Журнал ядра дописывается при каждом запуске: большой уходит в .log.1."""
+        try:
+            if self.log_file.stat().st_size > MAX_LOG_BYTES:
+                os.replace(self.log_file, self.log_file.with_suffix(".log.1"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # Файл держит ещё не завершившийся Xray: обрежется при следующем запуске.
+            log.get_logger("xray").debug("журнал %s не перенесён: %s", self.log_file, exc)
 
     def start(self) -> None:
         if self.is_active():
             return
         self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+        self._trim_log()
         try:
-            with open(self.log_file, "ab") as log:
+            with open(self.log_file, "ab") as output:
                 self._proc = subprocess.Popen(
                     [self.bin_path, "run", "-c", self.config_path],
                     stdin=subprocess.DEVNULL,
-                    stdout=log,
+                    stdout=output,
                     stderr=subprocess.STDOUT,
                     start_new_session=os.name != "nt",
+                    **HIDDEN,
                 )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc

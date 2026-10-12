@@ -29,6 +29,7 @@ from .store import Store
 from .xraycore import binary
 
 EXPORT_LINES = 5000
+TAIL_BYTES = 4 * 1024 * 1024  # сколько читать с конца файла журнала
 
 
 def journal_args(lines: int, *, follow: bool = False) -> list[str]:
@@ -40,8 +41,57 @@ def journal_args(lines: int, *, follow: bool = False) -> list[str]:
     return args
 
 
-def show(lines: int, follow: bool) -> int:
+def tail(path: Path, lines: int) -> str:
+    """Последние строки файла журнала (Windows: journald там нет, демон пишет в файл)."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - TAIL_BYTES))
+            data = handle.read()
+    except FileNotFoundError:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    kept = text.splitlines()
+    if size > TAIL_BYTES:
+        kept = kept[1:]  # первая строка могла начаться до прочитанного куска
+    return "\n".join(kept[-lines:]) + ("\n" if kept else "")
+
+
+def _show_file(path: Path, lines: int, follow: bool) -> int:
+    try:
+        text = tail(path, lines)
+    except OSError as exc:
+        print(f"ошибка: журнал {path} не читается: {exc}", file=sys.stderr)
+        return 1
+    if not text and not follow:
+        print(f"журнал пуст: {path} (демон XGW ещё не запускался)")
+        return 0
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    if not follow:
+        return 0
+    try:
+        position = path.stat().st_size if path.exists() else 0
+        while True:
+            time.sleep(1.0)
+            size = path.stat().st_size if path.exists() else 0
+            if size < position:
+                position = 0  # файл сменился при ротации
+            if size > position:
+                with open(path, "rb") as handle:
+                    handle.seek(position)
+                    sys.stdout.write(handle.read().decode("utf-8", errors="replace"))
+                    sys.stdout.flush()
+                position = size
+    except KeyboardInterrupt:
+        return 0
+
+
+def show(lines: int, follow: bool, paths: Paths | None = None) -> int:
     """Печатает журнал как есть: секреты замаскированы ещё при записи."""
+    if paths is not None and paths.windows:
+        return _show_file(paths.log_file, lines, follow)
     try:
         return subprocess.call(journal_args(lines, follow=follow))
     except FileNotFoundError:
@@ -90,7 +140,14 @@ def export(
             return f"# {exc}\n"
 
     members: dict[str, str] = {}
-    members["journal.txt"] = clean(command(journal_args(lines)))
+    if paths.windows:
+        try:
+            members["journal.txt"] = clean(tail(paths.log_file, lines))
+            members["xray.log"] = clean(tail(paths.run / "xray.log", lines))
+        except OSError as exc:
+            members["journal.txt"] = f"# журнал не прочитан: {exc}\n"
+    else:
+        members["journal.txt"] = clean(command(journal_args(lines)))
     xray_bin = validate.find_xray(None, paths)
     version = binary.installed_version(xray_bin) if xray_bin else None
     members["versions.txt"] = "\n".join([
@@ -124,14 +181,19 @@ def export(
                 store.close()
         except Exception as exc:
             members["state.json"] = f"# состояние не прочитано: {exc}\n"
-    members["network.txt"] = clean("".join(
-        f"$ {' '.join(argv)}\n{command(argv)}\n"
-        for argv in (
-            ["ip", "-br", "addr"], ["ip", "rule", "show"], ["ip", "route", "show", "table", "all"],
-            ["nft", "list", "table", "ip", nft.TABLE], ["nft", "list", "table", "ip6", nft.TABLE6],
-            ["systemctl", "--no-pager", "status", *UNITS],
-        )
-    ))
+    if paths.windows:
+        members["network.txt"] = clean(_windows_network(cfg, paths))
+    else:
+        members["network.txt"] = clean("".join(
+            f"$ {' '.join(argv)}\n{command(argv)}\n"
+            for argv in (
+                ["ip", "-br", "addr"], ["ip", "rule", "show"],
+                ["ip", "route", "show", "table", "all"],
+                ["nft", "list", "table", "ip", nft.TABLE],
+                ["nft", "list", "table", "ip6", nft.TABLE6],
+                ["systemctl", "--no-pager", "status", *UNITS],
+            )
+        ))
     if diag_text is not None:
         try:
             members["diag.txt"] = clean(diag_text()) + "\n"
@@ -140,6 +202,32 @@ def export(
 
     write_archive(out_path, members.items())
     return sorted(members)
+
+
+def _windows_network(cfg: Config | None, paths: Paths) -> str:
+    """Windows: вместо правил ядра — системный прокси пользователя и выбор XGW."""
+    from .net import winproxy
+    from .net.capture import capture_for
+
+    registry, _notify = winproxy.default_registry()
+    try:
+        current = winproxy.read(registry)
+        lines = [
+            "системный прокси пользователя:",
+            f"  включён: {'да' if current.enable else 'нет'}",
+            f"  адрес: {current.server or '—'}",
+            f"  мимо прокси: {current.override or '—'}",
+            f"  PAC-файл: {current.autoconfig or '—'}",
+        ]
+    except winproxy.ProxyError as exc:
+        lines = [f"# системный прокси не прочитан: {exc}"]
+    if cfg is not None and cfg.capture.sysproxy:
+        info = capture_for(cfg, paths).describe()
+        lines.append(
+            f"XGW: режим {info['mode']}, прокси XGW {info['proxy']}, "
+            f"соответствует режиму: {info['loaded']}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _mask_secret_fields(obj: object) -> object:

@@ -81,8 +81,12 @@ class Daemon:
         self.capture = capture
         if capture is not None:
             # Утечку ищет обычный сокет самой машины, поэтому проверка имеет смысл,
-            # только когда перехватывается и её трафик (capture.local).
-            capture_active = lambda: capture.mode() == "on" and cfg.capture.local  # noqa: E731
+            # только когда перехватывается и её трафик (capture.local) — и именно на
+            # уровне сети: мимо системного прокси Windows такой сокет ходит всегда.
+            transparent = getattr(capture, "transparent", True)
+            capture_active = lambda: (  # noqa: E731
+                transparent and capture.mode() == "on" and cfg.capture.local
+            )
             reapply_capture = capture.up
         self.capture_active = capture_active
         self.reapply_capture = reapply_capture
@@ -436,9 +440,10 @@ class Daemon:
                 # загружались: без них трафик пошёл бы мимо VPN.
                 capture.up()
                 loaded = capture.loaded()
-                self.notifier.event(
-                    "capture", "правила сети не были загружены — загружены заново", notify=True
+                text = getattr(
+                    capture, "reloaded_text", "правила сети не были загружены — загружены заново"
                 )
+                self.notifier.event("capture", text, notify=True)
             self.capture_info = {**capture.describe(check=False), "loaded": loaded}
             self._capture_error = ""
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
