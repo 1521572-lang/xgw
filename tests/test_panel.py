@@ -7,6 +7,7 @@ import os
 import threading
 import time
 
+import fakexray
 import links
 import pytest
 from fakenet import FakeKernel
@@ -155,6 +156,7 @@ class Rig:
         self.paths.ensure()
         self.config_path = self.paths.config_file
         self.config_path.write_text(CONFIG, encoding="utf-8")
+        fakexray.write(self.paths)  # Xray запущен с inbound'ом перехвата
         self.store_path = managed.path_for(self.config_path)
         status.write_status(self.paths, _snapshot())
         atomic_write_json(engine.inventory_file(self.paths), {"servers": [

@@ -85,6 +85,17 @@ def enable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
         capture.enable()
     except CaptureError as exc:
         return Outcome(1, f"перехват не включён: {exc}")
+    if getattr(capture, "tproxy_missing", False):
+        # Перехват не загружен: в применённом конфиге Xray нет inbound'а перехвата
+        # (изменение настроек ждёт перезапуска Xray). Включить его сейчас — значит
+        # оставить машину без интернета: правила отправят пакеты в никуда.
+        return Outcome(
+            1,
+            "перехват не включён: Xray работает без inbound'а перехвата — правила "
+            "отправили бы трафик в никуда. Дождитесь применения настроек "
+            "(перезапуска Xray) и повторите",
+            hints=("sudo xgw apply --now", "sudo xgw status"),
+        )
     info = capture.describe(check=False)
     sysproxy = bool(info.get("sysproxy"))
     if sysproxy:

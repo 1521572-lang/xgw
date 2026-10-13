@@ -287,6 +287,13 @@ def render_capture(capture: dict) -> str:
             "Перехват: ВРЕМЕННО СНЯТ — Xray недоступен, fail_mode = open; "
             "трафик идёт напрямую, мимо VPN"
         )
+    if capture.get("tproxy_missing"):
+        # Включения ждали, но Xray работает без inbound'а перехвата: правила не
+        # загружены, трафик идёт напрямую (иначе он ушёл бы в никуда).
+        return (
+            "Перехват: НЕ ВКЛЮЧЁН — Xray работает без inbound'а перехвата, "
+            "трафик идёт напрямую; включится после перезапуска Xray"
+        )
     scope = [f"сеть {capture['lan_if']}"] if capture.get("lan") else []
     if capture.get("local"):
         scope.append(

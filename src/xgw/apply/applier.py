@@ -6,6 +6,8 @@ Xray не умеет перечитывать конфиг, поэтому:
 - изменились dns / burstObservatory / policy / api / основные inbounds →
   полный перезапуск: сразу в состояниях ALL_DEAD и XRAY_DOWN (urgent),
   иначе в restart_window или по force_now (xgw apply --now);
+  изменение inbound'а перехвата (tproxy-in) — всегда сразу: пока Xray не
+  перезапущен с ним, включать перехват нельзя (см. net/capture.py);
 - ошибка любого вызова API → полный перезапуск с новым конфигом по тем же
   правилам; до перезапуска ядро считается изменённым частично, и через API
   больше ничего не применяется;
@@ -29,6 +31,7 @@ from ..generator.builder import BALANCER_TAG
 from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
 from ..net import cmd, tun
+from ..net.capture import TPROXY_TAG
 from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.api import ApiClient, ApiError
 from ..xraycore.service import XrayService, XrayServiceError
@@ -60,6 +63,29 @@ def in_restart_window(window: str, now: datetime.time) -> bool:
     if start <= end:
         return start <= now <= end
     return now >= start or now <= end  # окно через полночь
+
+
+def tproxy_inbounds(config: dict) -> list[tuple]:
+    """Inbound'ы перехвата в конфиге — то, от чего зависят правила nftables.
+
+    Пока применённый конфиг и правила расходятся (перехват включён, а Xray не
+    слушает tproxy_port), трафик уходит в никуда: при fail_mode = "closed" машина
+    остаётся без интернета. Поэтому такое расхождение нельзя откладывать до окна
+    перезапуска — его применяют сразу.
+    """
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        return []
+    result = []
+    for inbound in inbounds:
+        if not isinstance(inbound, dict):
+            continue
+        tag = str(inbound.get("tag", ""))
+        if tag == TPROXY_TAG or tag.startswith(TPROXY_TAG + "6"):
+            result.append(
+                (tag, inbound.get("listen"), inbound.get("port"), inbound.get("protocol"))
+            )
+    return sorted(result)
 
 
 class Applier:
@@ -127,6 +153,14 @@ class Applier:
         reasons = list(diff.restart_reasons)
         if diff.plan is not None and self.paths.api_dirty_file.exists():
             reasons.append("ядро изменено через API частично")
+
+        if tproxy_inbounds(current) != tproxy_inbounds(new_config):
+            # Inbound перехвата меняется: откладывать нельзя. Правила nftables
+            # загружаются по новому конфигу сразу, и если ядро останется на старом
+            # (без tproxy-in), перехваченный трафик уйдёт в никуда.
+            if "изменение inbound перехвата" not in reasons:
+                reasons.append("изменение inbound перехвата")
+            restart_now = True
 
         if not reasons and diff.plan is not None:
             try:

@@ -25,7 +25,7 @@ from collections import deque
 from pathlib import Path
 
 from . import engine, fetch, log
-from .apply.applier import ApplyOutcome, in_restart_window
+from .apply.applier import ApplyOutcome, in_restart_window, tproxy_inbounds
 from .apply.rotation import plan_rotation, preferred_members
 from .config import Config
 from .generator import builder
@@ -92,6 +92,8 @@ class Daemon:
         self.reapply_capture = reapply_capture
         self.capture_info: dict | None = None
         self._capture_error = ""
+        # Уже сообщили, что перехват не включён из-за отсутствия inbound'а перехвата.
+        self._tproxy_missing = False
         self.xray_down_since: float | None = None
         self.clock = clock
         self.wall = wall
@@ -445,6 +447,15 @@ class Daemon:
                 )
                 self.notifier.event("capture", text, notify=True)
             self.capture_info = {**capture.describe(check=False), "loaded": loaded}
+            missing = bool(getattr(capture, "tproxy_missing", False))
+            if missing and not self._tproxy_missing:
+                self.notifier.event(
+                    "capture",
+                    "перехват не включён: Xray ещё не перезапущен с inbound перехвата — "
+                    "сеть работает напрямую",
+                    notify=True,
+                )
+            self._tproxy_missing = missing
             self._capture_error = ""
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
@@ -455,12 +466,23 @@ class Daemon:
 
     def _apply_pending(self, urgent: bool) -> bool:
         """Конфиг, ждущий перезапуска: в окне restart_window либо срочно."""
-        if not urgent and not in_restart_window(self.cfg.apply.restart_window, self.now_time()):
-            return False
         pending = engine.read_json(self.paths.pending_config_file)
         if pending is None:
             self.paths.pending_config_file.unlink(missing_ok=True)
             return False
+        if not urgent:
+            applied = engine.read_json(self.paths.xray_config_file) or {}
+            if tproxy_inbounds(pending) != tproxy_inbounds(applied):
+                # Меняется inbound перехвата: правила уже загружены по новому
+                # конфигу, и ждать окна нельзя — трафик уходил бы на порт, который
+                # Xray не слушает (fail-closed = нет интернета).
+                self.log.warning(
+                    "применяю конфиг вне окна %s: меняется inbound перехвата",
+                    self.cfg.apply.restart_window,
+                )
+                urgent = True
+            elif not in_restart_window(self.cfg.apply.restart_window, self.now_time()):
+                return False
         outcome = self._apply(pending, urgent=urgent)
         if outcome.mode == "rejected":
             # Отклонённый конфиг не перепроверяем на каждом шаге: следующее

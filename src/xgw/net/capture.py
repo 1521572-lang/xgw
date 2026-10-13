@@ -34,6 +34,10 @@ class CaptureError(Exception):
     """Правила не загружены: нет прав, nft или ip, либо ядро их не приняло."""
 
 
+# Тег inbound'а перехвата в конфиге Xray (генератор, builder.py); у IPv6 — tproxy-in6.
+TPROXY_TAG = "tproxy-in"
+
+
 def capture_for(cfg: Config, paths: Paths, **kwargs):
     """Управление перехватом для этой системы: правила ядра (Linux) либо, при
     capture.method = "sysproxy", системный прокси Windows — с тем же набором действий."""
@@ -69,6 +73,9 @@ class Capture:
         self.state_file = paths.var / "capture.json"
         self.open_marker = paths.run / "capture-open"
         self._warned: set[str] = set()
+        # Перехват не загружен, потому что в применённом конфиге Xray нет inbound
+        # TPROXY: см. _load.
+        self.tproxy_missing = False
 
     # --- что настроено ----------------------------------------------------------
 
@@ -180,7 +187,54 @@ class Capture:
                     cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name
                 )
 
+    def applied_has_tproxy(self) -> bool:
+        """Есть ли inbound перехвата в применённом конфиге Xray.
+
+        Именно в применённом (`paths.xray_config_file`), а не в собранном: правила
+        перехвата отправляют пакеты на `capture.tproxy_port`, и слушать его будет
+        только тот Xray, который запущен с этим конфигом.
+        """
+        try:
+            config = json.loads(self.paths.xray_config_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        inbounds = config.get("inbounds")
+        if not isinstance(inbounds, list):
+            return False
+        port = self.cfg.capture.tproxy_port
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            # Порт обязан совпадать: правила отправляют пакеты именно на него.
+            if inbound.get("port") != port:
+                continue
+            tag = str(inbound.get("tag", ""))
+            if tag == TPROXY_TAG or tag.startswith(TPROXY_TAG + "6"):
+                return True
+            if inbound.get("protocol") == "tunnel":
+                return True
+        return False
+
     def _load(self, mode: str) -> str:
+        if mode == "on" and not self.applied_has_tproxy():
+            # Правила перехвата отправляют пакеты на tproxy_port. Если в применённом
+            # конфиге Xray такого inbound нет (например, изменение настроек ждёт
+            # перезапуска Xray в окне apply.restart_window), то включать перехват
+            # нельзя: при fail_mode = "closed" машина осталась бы без интернета —
+            # пакеты уходили бы на порт, который никто не слушает. Загружаем режим
+            # «снят»: сеть работает напрямую, а перехват включится сам, когда
+            # конфиг с inbound перехвата применится.
+            self.tproxy_missing = True
+            self.log.error(
+                "перехват не включён: в применённом конфиге Xray (%s) нет inbound "
+                "TPROXY на порту %s — трафик ушёл бы в никуда. Перехват включится "
+                "после перезапуска Xray с новым конфигом",
+                self.paths.xray_config_file,
+                self.cfg.capture.tproxy_port,
+            )
+            mode = "off"
+        else:
+            self.tproxy_missing = False
         rules = self.rules(mode)
         try:
             if rules.lan_if:
@@ -342,4 +396,7 @@ class Capture:
             "tun": rules.tun,
             "fail_mode": self.cfg.capture.fail_mode,
             "loaded": self.loaded() if check else None,
+            # Перехват просили включить, но Xray работает без inbound'а перехвата:
+            # правила не загружены, трафик идёт напрямую (см. _load).
+            "tproxy_missing": self.tproxy_missing,
         }

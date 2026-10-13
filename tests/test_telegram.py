@@ -4,6 +4,7 @@
 import threading
 import time
 
+import fakexray
 import pytest
 from fake_telegram import BOT_NAME, OWNER, TOKEN, FakeTelegram
 from fakenet import FakeKernel
@@ -42,6 +43,7 @@ class Rig:
         self.fake = FakeTelegram().start()
         self.paths = Paths(root=tmp_path / "root")
         self.paths.ensure()
+        fakexray.write(self.paths)  # Xray запущен с inbound'ом перехвата
         self.config_path = self.paths.config_file
         notify = f'telegram_bot_token = "{TOKEN}"\ntelegram_chat_id = "{chat}"\n'
         self.config_path.write_text(

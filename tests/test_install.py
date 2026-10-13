@@ -5,6 +5,7 @@
 import os
 from pathlib import Path
 
+import fakexray
 import pytest
 from fakesys import FakeSystem
 
@@ -40,6 +41,7 @@ class Box:
         self.cfg.subscriptions = [config.Subscription(url="https://sub.example.net/abc")]
         self.paths.etc.mkdir(parents=True)
         self.paths.config_file.write_text("# конфиг\n", encoding="utf-8")
+        fakexray.write(self.paths)  # конфиг Xray: установка его пишет до включения перехвата
         self.out: list[str] = []
         self.answers: list[bool] = []
         self.questions: list[str] = []

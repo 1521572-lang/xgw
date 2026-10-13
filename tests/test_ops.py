@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+import fakexray
 import links
 import pytest
 from fakesys import FakeSystem
@@ -487,6 +488,7 @@ def test_daemon_reloads_capture_rules_after_config_change(root, tmp_path, monkey
     monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
     config_path = tmp_path / "config.toml"
     _write_gateway_config(config_path, 2)
+    fakexray.write(root)  # Xray запущен с inbound'ом перехвата
     runs: list[bool] = []
 
     class FakeDaemon:
@@ -536,6 +538,7 @@ def test_apply_on_installed_gateway_syncs_rules_and_dhcp(root, tmp_path, monkeyp
 
     root.backup_dir.mkdir(parents=True)
     root.journal_file.write_text("{}", encoding="utf-8")
+    fakexray.write(root)  # Xray запущен с inbound'ом перехвата
     cli._sync_network(cfg, root, logger)
     assert "tproxy" in kernel.table
     assert dnsmasq.conf_path(root).exists()

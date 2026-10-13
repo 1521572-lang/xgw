@@ -215,6 +215,41 @@ def test_force_now_restarts_at_any_time(env):
     assert service.restarts == 1
 
 
+def _without_tproxy_inbounds(config: dict) -> dict:
+    new = copy.deepcopy(config)
+    new["inbounds"] = [
+        inbound
+        for inbound in new["inbounds"]
+        if not str(inbound.get("tag", "")).startswith("tproxy-in")
+    ]
+    return new
+
+
+def test_tproxy_inbound_change_is_not_deferred(env):
+    """Inbound перехвата меняется — перезапуск сразу, даже вне окна.
+
+    Правила nftables грузятся по новому конфигу в тот же шаг watchdog; если ядро
+    оставить на старом конфиге до 04:00, перехваченный трафик уйдёт на порт,
+    который никто не слушает, и при fail_mode = closed машина останется без
+    интернета.
+    """
+    paths, current = env
+    service = StubService()
+    outcome = _applier(paths, StubApi(service=service, healthy_after=1), service).apply(
+        _without_tproxy_inbounds(current)
+    )
+    assert outcome.mode == "restart"
+    assert "изменение inbound перехвата" in " ".join(outcome.ops)
+    assert service.restarts == 1
+    assert not paths.pending_config_file.exists()
+
+    # Обратно: появление inbound'а перехвата тоже применяется сразу.
+    service = StubService()
+    outcome = _applier(paths, StubApi(service=service, healthy_after=1), service).apply(current)
+    assert outcome.mode == "restart"
+    assert "изменение inbound перехвата" in " ".join(outcome.ops)
+
+
 def _with_tun_inbound(config: dict) -> dict:
     new = _needs_restart(config)
     new["inbounds"].insert(

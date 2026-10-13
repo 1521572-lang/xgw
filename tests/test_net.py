@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 
+import fakexray
 import pytest
 from fakenet import FakeKernel
 
@@ -182,6 +183,7 @@ def gateway(tmp_path, monkeypatch):
     (proc / sysctl.IP_FORWARD).write_text("0\n")
     cfg = Config()
     cfg.network.lan_if = "lan0"
+    fakexray.write(paths)  # Xray запущен с inbound'ом перехвата
     kernel = FakeKernel()
     capture = Capture(cfg, paths, runner=kernel, proc_sys=proc, time_uids=())
     capture.kernel, capture.proc = kernel, proc
@@ -227,6 +229,42 @@ def test_fail_open_is_temporary(gateway):
     assert gateway.close() == "on" and "tproxy" in gateway.kernel.table
     gateway.open()
     assert gateway.enable() == "on"  # явное включение снимает и временную метку
+
+
+def test_enable_refuses_without_applied_tproxy_inbound(gateway):
+    """Пока применённый конфиг Xray без inbound'а перехвата, включать его нельзя:
+    правила отправили бы весь трафик на порт, который никто не слушает, и при
+    fail_mode = "closed" машина осталась бы без интернета (так и случилось на
+    настоящей машине, когда правка настроек ждала окна перезапуска)."""
+    fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
+    assert gateway.enable() == "off"
+    assert gateway.tproxy_missing is True
+    kernel = gateway.kernel
+    assert "tproxy" not in kernel.table  # трафик не перехвачен
+    assert kernel.rules == [] and not kernel.route  # маршрут по метке тоже не нужен
+    assert "masquerade" in kernel.table  # шлюз остаётся роутером
+    # Желание человека запомнено: перехват включится, когда применится конфиг.
+    assert json.loads(gateway.state_file.read_text())["enabled"] is True
+    fakexray.write(gateway.paths)
+    assert gateway.up() == "on"
+    assert gateway.tproxy_missing is False
+    assert "tproxy to 127.0.0.1:12345" in gateway.kernel.table
+
+
+def test_capture_refuses_when_applied_config_is_missing_or_broken(gateway):
+    """Файла нет или он битый — это тоже «Xray ещё не с inbound'ом перехвата»."""
+    for text in (None, "{не json", '{"inbounds": "нет"}'):
+        if text is None:
+            gateway.paths.xray_config_file.unlink()
+        else:
+            gateway.paths.xray_config_file.write_text(text, encoding="utf-8")
+        assert gateway.applied_has_tproxy() is False
+        assert gateway.up() == "off" and gateway.tproxy_missing is True
+    # Другой порт перехвата — это уже не наш inbound.
+    fakexray.write(
+        gateway.paths, {"inbounds": [{"tag": "tproxy-in", "protocol": "tunnel", "port": 1234}]}
+    )
+    assert gateway.applied_has_tproxy() is False
 
 
 def test_loaded_detects_missing_and_stale_rules(gateway):
@@ -296,7 +334,7 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "fail_mode": "closed",
-        "loaded": True,
+        "loaded": True, "tproxy_missing": False,
     }
 
 
