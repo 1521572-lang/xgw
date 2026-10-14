@@ -37,12 +37,15 @@ def test_gateway_with_lan_and_local_capture():
     # Таблица заменяется атомарно и только своя: никакого flush ruleset.
     assert text.startswith("table ip xgw\ndelete table ip xgw\ntable ip xgw {\n")
     assert "flush" not in text
-    for chain in ("prerouting", "output", "loopback_guard", "dns_direct", "forward", "postrouting"):
+    for chain in ("prerouting", "output", "loopback_guard", "dns_direct", "forward", "postrouting",
+                  "containers"):
         assert f"chain {chain} {{" in text
 
     prerouting = _chain(text, "prerouting")
     assert "hook prerouting priority mangle" in text
     assert prerouting == [
+        'iifname "docker0" goto containers',  # контейнеры Docker — своя цепочка
+        'iifname "br-*" goto containers',
         'iifname != { "lan0", "lo" } return',  # входящие из интернета в Xray не попадают
         "meta l4proto != { tcp, udp } return",
         'iifname "lo" meta mark != 0x1 return',
@@ -70,6 +73,35 @@ def test_gateway_with_lan_and_local_capture():
     dns_direct = _chain(text, "dns_direct")[0]  # DNS устройств в обход VPN — на прямой резолвер
     assert "ip saddr @bypass4 meta l4proto { tcp, udp } th dport 53" in dns_direct
     assert dns_direct.endswith("dnat to 77.88.8.8")
+
+
+def test_containers_go_through_xray_but_their_published_ports_answer_directly():
+    """F4 отчёта 14.10: контейнер Docker выходил в интернет с адресом провайдера, пока
+    сама машина шла через VPN. Его трафик — транзит с мостов docker0 и br-*: теперь у него
+    своя цепочка, которая ставит метку mark_containers (по ней маршрут ведёт в TUN — с
+    TPROXY мосты Docker не дружат). Ответы опубликованных портов (docker run -p 8080:80) —
+    это ct direction reply, они в Xray не попадают; частные сети и сама машина — тоже мимо,
+    а DNS (порт 53) к частным резолверам перехватывается, как у устройств LAN."""
+    text = _render(_cfg())
+    assert text.index("chain containers {") < text.index("chain prerouting {")
+    body = text.split("chain containers {")[1].split("}\n")[0].strip().splitlines()
+    assert [line.strip() for line in body] == [
+        "meta l4proto != { tcp, udp } return",
+        "ct direction reply return",
+        "fib daddr type local return",
+        "ip daddr @reserved4 th dport != 53 return",
+        "meta l4proto { tcp, udp } counter meta mark set 0x3",
+    ]
+    # Обычная цепочка, без hook: в неё только переходят из prerouting.
+    assert "hook" not in text.split("chain containers {")[1].split("chain prerouting")[0]
+    # Выключено в конфиге либо перехват снят — ни цепочки, ни переходов в неё.
+    cfg = _cfg()
+    cfg.capture.containers = False
+    assert "containers" not in _render(cfg)
+    assert "containers" not in _render(_cfg(), capture=False)
+    off = Config()
+    off.capture.lan = off.capture.local = False
+    assert nft.build_rules(off, capture=True, time_uids=())[0].containers == ()
 
 
 def test_loopback_guard_refuses_marked_packets_to_loopback():
@@ -121,7 +153,7 @@ def test_only_this_machine():
     """lan_if пуст: ни форвардинга, ни правил для LAN — только output и lo."""
     cfg = Config()
     text = _render(cfg)
-    assert _chain(text, "prerouting")[0] == 'iifname != "lo" return'
+    assert _chain(text, "prerouting")[2] == 'iifname != "lo" return'
     assert "chain output {" in text
     for absent in ("bypass4", "chain forward", "chain postrouting", "chain dns_direct", "lan"):
         assert absent not in text
@@ -135,7 +167,7 @@ def test_lan_without_local_capture():
     text = _render(cfg)
     assert "chain output {" not in text
     prerouting = _chain(text, "prerouting")
-    assert prerouting[0] == 'iifname != "lan0" return'
+    assert prerouting[2] == 'iifname != "lan0" return'
     assert not any('"lo"' in rule for rule in prerouting)
 
 
@@ -296,6 +328,8 @@ def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
     text = nft.render(rules)
     # Сеть LAN — по-прежнему TPROXY, но на lo он больше не нужен.
     assert _chain(text, "prerouting") == [
+        'iifname "docker0" goto containers',  # контейнеры Docker — своя цепочка
+        'iifname "br-*" goto containers',
         'iifname != "lan0" return',
         "meta l4proto != { tcp, udp } return",
         "ip saddr @bypass4 return",
@@ -311,11 +345,21 @@ def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
 def test_tun_without_lan_has_no_tproxy_chain_at_all():
     cfg = Config()
     cfg.capture.method = "tun"
+    cfg.capture.containers = False
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
     text = nft.render(rules)
     assert "chain prerouting" not in text and "tproxy" not in text
     assert "chain output" in text and "chain loopback_guard" in text
     assert not rules.prerouting
+    # С контейнерами TPROXY нужен только им: в prerouting — одни переходы в их цепочку.
+    cfg.capture.containers = True
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    text = nft.render(rules)
+    assert rules.prerouting and _chain(text, "prerouting") == [
+        'iifname "docker0" goto containers', 'iifname "br-*" goto containers',
+    ]
+    assert "mark set 0x3" in text.split("chain containers {")[1].split("chain prerouting")[0]
+    assert "tproxy" not in text
     cfg.network.ipv6 = "proxy"
     text6 = nft.render6(nft.build_rules(cfg, capture=True, time_uids=())[0])
     assert "chain prerouting" not in text6 and "tproxy" not in text6
@@ -339,7 +383,8 @@ def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     assert nft.apply(rules, kernel) == []
     assert [call[1:] for call in kernel.calls] == [("-c", "-f", "-"), ("-f", "-"), ("-f", "-")]
     assert nft.loaded_chains(kernel) == {
-        "prerouting", "output", "loopback_guard", "dns_direct", "forward", "postrouting"
+        "prerouting", "containers", "output", "loopback_guard", "dns_direct", "forward",
+        "postrouting",
     }
 
     class NoIpv6(FakeKernel):

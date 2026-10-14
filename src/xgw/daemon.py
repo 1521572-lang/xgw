@@ -32,6 +32,7 @@ from .apply.rotation import REPLACE_NOW_VERDICTS, plan_rotation, preferred_membe
 from .config import Config
 from .generator import builder
 from .generator.builder import BALANCER_TAG, NodeInfo
+from .net import tun
 from .net.capture import capture_inbounds
 from .paths import Paths
 from .store import Store
@@ -86,11 +87,9 @@ class Daemon:
         self.capture = capture
         if capture is not None:
             # Утечку ищет обычный сокет самой машины, поэтому проверка имеет смысл,
-            # только когда перехватывается и её трафик (capture.local) — и именно на
-            # уровне сети: мимо системного прокси Windows такой сокет ходит всегда.
-            transparent = getattr(capture, "transparent", True)
+            # только когда перехватывается и её трафик (capture.local).
             capture_active = lambda: (  # noqa: E731
-                transparent and capture.mode() == "on" and cfg.capture.local
+                capture.mode() == "on" and cfg.capture.local
             )
             reapply_capture = capture.up
         self.capture_active = capture_active
@@ -126,6 +125,11 @@ class Daemon:
         self.down_ticks = 0
         self.rolled_back = False
         self.leak = False
+        self.leak_fresh = False  # на этом шаге утечку проверяли заново
+        self._leak_note = ""  # о какой утечке уже сообщили (текст события)
+        # Отпечатки серверов, которые сами выходят в домашнюю страну: участник с таким
+        # отпечатком меняется, запасной на его место не ставится.
+        self.home_exits: set[str] = set()
         self.scan_queue: deque[str] = deque()  # probe-теги узлов, ждущих скана
         # Первая проверка участников собственной пробой шлюза: отпечатки уже проверенных
         # и теги тех, кто её не прошёл (тег → вердикт) — их меняют без ожидания
@@ -135,6 +139,10 @@ class Daemon:
         # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
         self.probe_target = ""
         self.next_target_check = 0.0
+        # Конфиг Xray нужно собрать заново срочно, без окна перезапуска (причина); пусто —
+        # не нужно. Так бывает, когда сменился адрес проб ядра (запасной ↔ probe.url) или
+        # на машине появился Docker и контейнерам нужен inbound TUN.
+        self._urgent_rebuild = ""
         self.next_refresh = 0.0
         self.next_scan = 0.0
         self.next_leak = 0.0
@@ -211,6 +219,8 @@ class Daemon:
         self.e2e_streak = previous.e2e_streak
         self.dead_since = dict(previous.dead_since)
         self.leak, self.next_leak = previous.leak, previous.next_leak
+        self._leak_note = previous._leak_note
+        self.home_exits = set(previous.home_exits)
         self.down_ticks = previous.down_ticks
         self.rolled_back = previous.rolled_back
         self.xray_down_since = previous.xray_down_since
@@ -218,6 +228,7 @@ class Daemon:
         self._inbound_missing = previous._inbound_missing
         self.probe_target = previous.probe_target
         self.next_target_check = previous.next_target_check
+        self._urgent_rebuild = previous._urgent_rebuild
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -276,7 +287,9 @@ class Daemon:
         else:
             self.down_ticks = 0
             self.rolled_back = False
-        if state is State.LEAK:
+        if not self.leak:
+            self._leak_note = ""
+        elif state is State.LEAK and self.leak_fresh:
             self._handle_leak()
         # Правила перехвата. Обычно они проверяются до применения конфига: пропавшие
         # нужно вернуть как можно скорее. Но если правилам нужен inbound, которого у
@@ -289,6 +302,12 @@ class Daemon:
 
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
+        self._containers_appeared(applied)
+        if not changed and self._urgent_rebuild and self.inventory is not None:
+            # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
+            # считает мёртвыми всех участников; без inbound TUN контейнеры без интернета.
+            reason, self._urgent_rebuild = self._urgent_rebuild, ""
+            changed = self._rebuild(None, urgent=True, reason=reason)
         if not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
             # Внеочередное обновление подписки напрямую и скан всех запасных.
             self.next_all_dead = now + ALL_DEAD_RETRY
@@ -309,7 +328,9 @@ class Daemon:
 
         # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
-        probing = state is not State.PROBE_TARGET_UNREACHABLE
+        # Решает сам признак, а не имя состояния: утечка (LEAK) стоит в машине состояний
+        # выше и его заслоняет, а сканам и замене от этого не легче.
+        probing = not self.probe_target
         if scan_asked and probing:
             self._manual_scan = True
             self._queue_scan(view, now)
@@ -323,7 +344,7 @@ class Daemon:
             self._scan_step(view, applied)
             if state in (State.DEGRADED, State.ALL_DEAD) or (
                 state is State.HEALTHY and self.bad_members
-            ):
+            ) or (state is State.LEAK and self._home_members(view)):
                 changed = self._rotate(view, observatory or {}, state, now)
 
         if not self.scan_queue or not probing:
@@ -357,10 +378,12 @@ class Daemon:
             e2e_ok = self._check_e2e()
             self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
 
+        self.leak_fresh = False
         if not self.capture_active():
             self.leak = False
         elif xray_ok and provider_ok and now >= self.next_leak:
             self.next_leak = now + jitter(LEAK_INTERVAL)
+            self.leak_fresh = True
             location = self._check_leak()
             self.leak = (
                 location is not None and location == self.cfg.routing.home_country.upper()
@@ -450,6 +473,24 @@ class Daemon:
             self.cfg.probe.trace_url, user_agent=self.cfg.probe.user_agent
         )
 
+    def _exit_via_xray(self) -> str | None:
+        """Страна выхода явно через http-in Xray — через сервер, выбранный балансировщиком."""
+        return checks.trace_location(
+            self.cfg.probe.trace_url, via=("127.0.0.1", self.cfg.xray.http_port),
+            user_agent=self.cfg.probe.user_agent,
+        )
+
+    def _selected(self) -> tuple[str, bool] | None:
+        """(тег сервера, через который сейчас идёт трафик; закреплён ли он вручную)."""
+        try:
+            info = self.api.balancer_state(BALANCER_TAG)
+        except ApiError as exc:
+            self.log.info("выбор балансировщика не узнать: %s", exc)
+            return None
+        if info.override:
+            return info.override, True
+        return (info.selects[0], False) if info.selects else None
+
     # --- не отвечает сам probe.url -----------------------------------------------
 
     def _probe_target(
@@ -474,6 +515,8 @@ class Daemon:
                     "probe", "probe.url снова отвечает — проверки серверов возобновлены",
                     notify=True,
                 )
+            # И после перезапуска демона: запись о запасном адресе могла остаться с прошлого раза.
+            self._observatory_fallback(False)
             return signals
         dead = signals.total_members - signals.alive_members - signals.unknown_members
         suspect = reachable and not signals.e2e_ok and (
@@ -489,9 +532,41 @@ class Daemon:
                 self.bad_members.clear()
                 self.vetted.clear()
             self.probe_target = diagnosis.text if diagnosis.down else ""
+            self._observatory_fallback(diagnosis.down)
         if self.probe_target:
             return dataclasses.replace(signals, probe_target_ok=False)
         return signals
+
+    def _observatory_fallback(self, on: bool) -> None:
+        """Переводит пробы ядра на запасной адрес (on) или возвращает их на probe.url."""
+        try:
+            switched = target.use_fallback(self.cfg, self.paths, on)
+        except OSError as exc:
+            self.log.error("адрес проб ядра не переключён: %s", exc)
+            return
+        if not switched:
+            return
+        self._urgent_rebuild = "смена адреса проб ядра"
+        if on:
+            text = (
+                f"ядро пробует серверы по {target.fallback_target(self.cfg)}, пока probe.url "
+                "не ответит: иначе оно сочло бы мёртвыми всех участников"
+            )
+        else:
+            text = "ядро снова пробует серверы по probe.url"
+        self.notifier.event("probe", text, notify=on)
+
+    def _containers_appeared(self, applied: dict) -> None:
+        """На машине появился Docker, а Xray запущен без inbound'а TUN: контейнерам он
+        нужен (их трафик идёт в TUN по метке), до тех пор они без интернета."""
+        if self._urgent_rebuild or not engine.containers_tun(self.cfg):
+            return
+        if tun.inbound_name(applied) == self.cfg.capture.tun_name:
+            return
+        self._urgent_rebuild = "появился Docker: контейнерам нужен inbound TUN"
+        self.notifier.event(
+            "capture", "появился Docker — контейнеры пойдут через VPN, Xray перезапускается"
+        )
 
     def _diagnose_target(self, view: list[NodeInfo], applied: dict) -> target.Diagnosis:
         password, _ports = builder.probe_state(applied)
@@ -538,14 +613,46 @@ class Daemon:
         return outcome.mode == "rollback"
 
     def _handle_leak(self) -> None:
-        try:
-            self.reapply_capture()
-        except Exception as exc:
-            self.log.error("правила перехвата не переприменены: %s", exc)
-        self.notifier.event(
-            "leak", f"выход в {self.cfg.routing.home_country} при включённом перехвате",
-            notify=True,
-        )
+        """Выход в домашнюю страну при включённом перехвате — раз на проверку утечки, а не
+        на каждом шаге. Причин две: сервер, выбранный балансировщиком, сам выходит в эту
+        страну (тогда его меняют запасным), либо трафик идёт мимо Xray (тогда правила
+        перехвата загружаются заново). Событие — только когда меняется его текст."""
+        home = self.cfg.routing.home_country.upper()
+        selected = self._selected() if self._exit_via_xray() == home else None
+        if selected is not None:
+            tag, pinned = selected
+            member = self._member_by_tag(tag)
+            if pinned:
+                text = (
+                    f"выход в {home}: закреплённый вручную сервер {tag} сам выходит в {home} — "
+                    "снимите закрепление: xgw unpin"
+                )
+            elif member is not None and len(member.fingerprint) >= 8:
+                self.home_exits.add(member.fingerprint)
+                text = f"выход в {home}: сервер {tag} сам выходит в {home} — меняю его на запасной"
+            else:
+                text = f"выход в {home}: сервер {tag} сам выходит в {home}"
+        else:
+            try:
+                self.reapply_capture()
+            except Exception as exc:  # сбой сети не должен ронять шаг watchdog
+                self.log.error("правила перехвата не переприменены: %s", exc)
+            text = f"выход в {home} мимо Xray при включённом перехвате — правила загружены заново"
+        if text != self._leak_note:
+            self._leak_note = text
+            self.notifier.event("leak", text, notify=True)
+
+    def _member_by_tag(self, tag: str) -> NodeInfo | None:
+        applied = engine.read_json(self.paths.xray_config_file)
+        view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
+        return next((info for info in view if info.role == "proxy" and info.tag == tag), None)
+
+    def _home_members(self, view: list[NodeInfo]) -> list[str]:
+        """Теги участников, которые сами выходят в домашнюю страну."""
+        return [
+            info.tag for info in view
+            if info.role == "proxy" and info.fingerprint in self.home_exits
+        ]
 
     def _capture_waits(self) -> bool:
         """Перехват включён, но правилам нужен inbound, которого в применённом конфиге
@@ -620,6 +727,10 @@ class Daemon:
                 self.notifier.event("capture", text, notify=True)
             self._inbound_missing = missing
             self._capture_error = ""
+            tidy = getattr(capture, "tidy", None)  # у подставного перехвата в тестах — нет
+            tidied = tidy() if tidy is not None else ""
+            if tidied:
+                self.notifier.event("capture", tidied)
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
             self.log.error("%s", text)
@@ -635,10 +746,7 @@ class Daemon:
             return False
         if not urgent:
             applied = engine.read_json(self.paths.xray_config_file) or {}
-            sysproxy = bool(self.cfg.capture.sysproxy)
-            if capture_inbounds(pending, sysproxy=sysproxy) != capture_inbounds(
-                applied, sysproxy=sysproxy
-            ):
+            if capture_inbounds(pending) != capture_inbounds(applied):
                 # Меняется inbound перехвата: правила сети следуют новым настройкам, и
                 # ждать окна нельзя — трафик уходил бы на порт или в интерфейс, которых
                 # у работающего Xray нет (fail-closed = нет интернета).
@@ -811,7 +919,8 @@ class Daemon:
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
         """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;
         не прошедших первую проверку (bad_members) — сразу."""
-        if self.inventory is None or not (self.dead_since or self.bad_members):
+        home = self._home_members(view)
+        if self.inventory is None or not (self.dead_since or self.bad_members or home):
             return False
         by_fingerprint = {node.fingerprint: node for node in self.inventory.nodes}
         members = [info for info in view if info.role == "proxy"]
@@ -821,6 +930,7 @@ class Daemon:
             (info, by_fingerprint[info.fingerprint])
             for info in view
             if info.role == "spare" and info.fingerprint in by_fingerprint
+            and info.fingerprint not in self.home_exits  # тоже выходит в домашнюю страну
         ]
         # «Прошедший последний скан»: результат старше двух периодов скана не в счёт.
         fresh_after = self.wall() - self.cfg.probe.scan_spares_minutes * 120.0 - 120.0
@@ -838,11 +948,11 @@ class Daemon:
         alive = {tag: entry["alive"] for tag, entry in observatory.items()}
         rotation = plan_rotation(
             alive, self.dead_since, verdicts, seconds, members, pairs, cfg, self.wall(),
-            urgent=set(self.bad_members),
+            urgent=set(self.bad_members) | set(home),
         )
         if rotation is None:
             overdue = cfg.filters.rotate_after_min * 60.0
-            waiting = bool(self.bad_members) or any(
+            waiting = bool(self.bad_members or home) or any(
                 self.wall() - since >= overdue for since in self.dead_since.values()
             )
             if waiting and pairs and not self.scan_queue and now >= self.next_rescan:
@@ -853,9 +963,15 @@ class Daemon:
             f"{tag} — {self.bad_members[tag]}"
             for tag, _node in rotation.replacements if tag in self.bad_members
         ]
+        leaking = [tag for tag, _node in rotation.replacements if tag in home]
         text = f"замена участников: {names}"
         if failed:
             text += f" (не прошли первую проверку: {', '.join(failed)})"
+        if leaking:
+            text += (
+                f" (сами выходят в {self.cfg.routing.home_country.upper()}: "
+                f"{', '.join(leaking)})"
+            )
         self.notifier.event("rotation", text, notify=True)
         # Замены пришли из запасных, прошедших скан, — проверять их заново незачем.
         self.vetted.update(node.fingerprint for _tag, node in rotation.replacements)

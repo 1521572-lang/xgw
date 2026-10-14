@@ -194,7 +194,7 @@ class Rig:
     def _system(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         self.system_calls.append(tuple(argv))
         if self.dnsmasq_fails:
-            raise CommandError("systemctl restart dnsmasq.service: Job failed")
+            raise CommandError("systemctl restart xgw-dhcp.service: Job failed")
         return ""
 
     def saved(self) -> dict:
@@ -401,7 +401,7 @@ def test_device_goes_around_the_vpn_and_back(rig, user):
     assert "192.168.50.101" in _bypass_set(rig)
     conf = dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
     assert f"dhcp-host={PHONE},192.168.50.101,phone" in conf
-    assert rig.system_calls == [("systemctl", "restart", "dnsmasq.service")]
+    assert rig.system_calls == [("systemctl", "restart", "xgw-dhcp.service")]
     assert ("nft", "-c", "-f", "-") in rig.kernel.calls  # правила проверены до загрузки
 
     row = user.state()["devices"][0]
@@ -788,7 +788,7 @@ def test_state_carries_the_probe_budget_the_node_summary_and_the_probe_url_warni
     snapshot["budget"] = status.budget_summary(cfg, budget, quotas, 5, 65)
     snapshot["nodes"] = {"members": 5, "spares": 65, "dropped": 4, "duplicates": 12,
                          "excluded": 0, "dns": 2}
-    snapshot["probe_target"] = "Внимание: все пробы падают с одинаковой ошибкой"
+    snapshot["probe_target"] = "Внимание: пробы всех серверов падают"
     snapshot["state"] = "PROBE_TARGET_UNREACHABLE"
     status.write_status(rig.paths, snapshot)
     state = user.state()

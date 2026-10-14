@@ -292,3 +292,21 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
     assert machine.scrub_host_xgw(root) == {}
     with pytest.raises(RuntimeError, match="корень системы"):
         machine.scrub_host_xgw(Path(root.anchor))
+
+
+def test_docker_of_the_host_is_masked_in_the_machine(tmp_path):
+    """Docker, включённый на хосте, в контейнере не запускается: его маска лежит в корне
+    контейнера, а свой файл службы хоста (если он был) там же заменён маской."""
+    import machine
+
+    root = tmp_path / "root"
+    (root / "etc/systemd/system").mkdir(parents=True)
+    (root / "etc/systemd/system/docker.service").write_text("[Service]\n", encoding="utf-8")
+    try:
+        machine.mask_host_services(root)
+    except OSError as exc:  # Windows без права создавать ссылки
+        pytest.skip(f"символьные ссылки недоступны: {exc}")
+    for name in machine.HOST_SERVICES_OFF:
+        link = os.readlink(root / "etc/systemd/system" / name).replace("\\", "/")
+        assert link == "/dev/null", name
+    machine.mask_host_services(root)  # повтор безвреден

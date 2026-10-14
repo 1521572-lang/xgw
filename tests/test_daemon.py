@@ -14,13 +14,14 @@ from xgw import engine
 from xgw.apply.applier import ApplyOutcome
 from xgw.config import Config
 from xgw.daemon import Daemon
+from xgw.generator import builder
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store
 from xgw.watch.scan import ScanResult
 from xgw.watch.states import State
-from xgw.xraycore.api import ApiError
+from xgw.xraycore.api import ApiError, BalancerInfo
 
 ALL_LINKS = [*links.FULL_LINKS, links.TROJAN_INSECURE]
 
@@ -35,11 +36,17 @@ class FakeApi:
     def __init__(self):
         self.down = False
         self.calls: list[tuple] = []
+        self.state = BalancerInfo(override=None, selects=())
 
     def balancer_info(self, *balancers):
         if self.down:
             raise ApiError("нет связи")
         return ""
+
+    def balancer_state(self, balancer):
+        if self.down:
+            raise ApiError("нет связи")
+        return self.state
 
     def pin(self, balancer, tag):
         self.calls.append(("pin", tag))
@@ -90,6 +97,7 @@ class Harness(Daemon):
         self.provider = True
         self.e2e = True
         self.location: str | None = None
+        self.via_location: str | None = None  # страна выхода явно через http-in Xray
         self.source = _inventory()
         self.collected: list[bool] = []  # значения via_xray
         self.applied: list[tuple[dict, bool]] = []
@@ -116,6 +124,9 @@ class Harness(Daemon):
 
     def _check_leak(self):
         return self.location
+
+    def _exit_via_xray(self):
+        return self.via_location
 
     def _collect(self, via_xray):
         self.collected.append(via_xray)
@@ -156,6 +167,12 @@ class Harness(Daemon):
     def tags(self, role: str) -> list[str]:
         config = engine.read_json(self.paths.xray_config_file)
         return [o["tag"] for o in config["outbounds"] if o["tag"].startswith(role + "-")]
+
+    def view(self) -> list:
+        return builder.applied_nodes(
+            engine.read_json(self.paths.xray_config_file),
+            self.inventory.nodes if self.inventory else (),
+        )
 
     def set_alive(self, **overrides: bool) -> None:
         """Все участники живы, кроме перечисленных (тег с «_» вместо «-»)."""
@@ -993,7 +1010,13 @@ def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
     # ушёл бы в ALL_DEAD со сканом запасных и внеочередным обновлением подписки.
     assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
     assert sorted(daemon.scanned) == sorted([*members, *daemon.tags("spare")])  # диагностика
-    assert daemon.applied == [] and daemon.collected == []
+    # Ядро переведено на запасной адрес проб — срочно, без окна перезапуска; состав прежний.
+    assert len(daemon.applied) == 1 and daemon.applied[0][1] is True
+    probes = daemon.applied[0][0]["burstObservatory"]["pingConfig"]["destination"]
+    assert probes == daemon.cfg.probe.trace_url and daemon.tags("proxy") == members
+    assert daemon.collected == []
+    assert any("ядро пробует серверы по" in event for event in daemon.events())
+    daemon.applied.clear()
     daemon.scanned.clear()
     for _ in range(4):
         assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
@@ -1003,7 +1026,7 @@ def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
 
     status = daemon.status()
     assert status["state"] == "PROBE_TARGET_UNREACHABLE"
-    warning = "Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url"
+    warning = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url"
     assert status["probe_target"].startswith(warning) and "HTTP 403" in status["probe_target"]
     events = [event for event in daemon.events() if event.startswith("PROBE_TARGET_UNREACHABLE:")]
     assert len(events) == 1 and warning in events[0]
@@ -1027,9 +1050,126 @@ def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
     daemon.e2e = True
     daemon.failures.clear()
     daemon.set_alive()
+    daemon.applied.clear()
     assert daemon.tick() is State.HEALTHY
     assert daemon.status()["probe_target"] == ""
     assert any("probe.url снова отвечает" in event for event in daemon.events())
+    # Ядро вернулось к probe.url.
+    assert len(daemon.applied) == 1 and daemon.applied[0][1] is True
+    probes = daemon.applied[0][0]["burstObservatory"]["pingConfig"]["destination"]
+    assert probes == daemon.cfg.probe.url
+
+
+def test_leak_does_not_hide_a_dead_probe_url(tmp_path, monkeypatch):
+    """Живая машина, 14.10: балансировщик выбрал сервер с выходом в RU (LEAK), и тут же
+    перестал отвечать probe.url. LEAK стоит в машине состояний выше и заслонял признак:
+    пятнадцать минут шли сканы, вердикты запасных портились, а потом шаг ушёл в ALL_DEAD и
+    начал менять живые серверы. Теперь сканы и замена ждут по самому признаку."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.dns.bootstrap = []
+    cfg.filters.exclude_regex = ""
+    cfg.filters.max_members = 2
+    cfg.filters.rotate_after_min = 0
+    daemon = Harness(cfg, paths, capture_active=lambda: True, reapply_capture=lambda: None)
+    try:
+        _started(daemon)
+        members = daemon.tags("proxy")
+        daemon.next_refresh = daemon.t + 3600
+        daemon.location = daemon.via_location = "RU"  # сервер сам выходит в RU
+        daemon.e2e = False
+        daemon.failures["*"] = ScanResult("", "CONNECT_FAIL", 0, 0.3, "обрыв", "io", 0)
+        daemon.base_ping = True
+        daemon.direct = "нет ответа"
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+        daemon.t += 400  # очередная проверка утечки
+        assert daemon.tick() is State.LEAK
+        assert daemon.probe_target  # признак виден, хоть состояние и LEAK
+        daemon.scanned.clear()
+        for _ in range(6):
+            daemon.t += 20
+            assert daemon.tick() is State.LEAK
+        assert daemon.scanned == []  # ни сканов, ни повторной диагностики на каждом шаге
+        rotations = [event for event in daemon.events() if event.startswith("rotation:")]
+        assert rotations == [] and daemon.tags("proxy") == members
+        # Утечка прошла, а probe.url всё так же не отвечает: не ALL_DEAD, а
+        # PROBE_TARGET_UNREACHABLE — и замен по-прежнему нет.
+        daemon.location = daemon.via_location = "NL"
+        daemon.t += 400
+        assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+        daemon.t += 301  # перепроверка: ошибки разные, файл не получил никто
+        first = next(info.probe_tag for info in daemon.view() if info.role == "proxy")
+        daemon.failures = {
+            first: ScanResult("", "TIMEOUT", 0, 15.0, "таймаут", "timeout", 0),
+            "*": ScanResult("", "CONNECT_FAIL", 0, 0.3, "обрыв", "io", 0),
+        }
+        assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+        assert daemon.tags("proxy") == members
+    finally:
+        daemon.store.close()
+
+
+def test_server_exiting_at_home_is_replaced_and_not_taken_back(tmp_path, monkeypatch):
+    """Самый быстрый сервер подписки сам выходит в RU (у заказчика — на 186 мс): обычный
+    сокет и запрос через Xray выходят в RU. Это не пропавшие правила: сервер меняют на
+    запасной и обратно не берут. Сообщение — одно на причину, а не каждые 20 секунд."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.dns.bootstrap = []
+    cfg.filters.exclude_regex = ""
+    cfg.filters.max_members = 2
+    reapplied = []
+    daemon = Harness(
+        cfg, paths, capture_active=lambda: True, reapply_capture=lambda: reapplied.append(1)
+    )
+    try:
+        _started(daemon)
+        members = daemon.tags("proxy")
+        leaking = members[0]
+        daemon.api.state = BalancerInfo(override=None, selects=(leaking,))
+        daemon.location = daemon.via_location = "RU"
+        daemon.t += 400
+        assert daemon.tick() is State.LEAK
+        assert reapplied == []  # правила тут ни при чём
+        assert leaking not in daemon.tags("proxy") and len(daemon.tags("proxy")) == 2
+        rotation = [event for event in daemon.events() if event.startswith("rotation:")]
+        assert len(rotation) == 1 and f"сами выходят в RU: {leaking}" in rotation[0]
+        leaks = [event for event in daemon.events() if event.startswith("leak:")]
+        expected = f"leak: выход в RU: сервер {leaking} сам выходит в RU — меняю его на запасной"
+        assert leaks == [expected]
+        # Выход в RU держится до следующей проверки утечки: событий на каждом шаге нет.
+        for _ in range(5):
+            daemon.t += 20
+            daemon.tick()
+        assert len([e for e in daemon.events() if e.startswith("leak:")]) == 1
+        # Выбывший сервер стал запасным, но назад его не возьмут ни при какой замене.
+        fingerprint = next(iter(daemon.home_exits))
+        assert fingerprint not in [
+            info.fingerprint for info in daemon.view() if info.role == "proxy"
+        ]
+        daemon.location = daemon.via_location = "NL"
+        daemon.t += 400
+        assert daemon.tick() is State.HEALTHY
+
+        # Выход в RU мимо Xray (через Xray — NL): виноваты правила, их грузят заново.
+        daemon.location = "RU"
+        daemon.t += 400
+        assert daemon.tick() is State.LEAK and reapplied == [1]
+        assert any("мимо Xray" in event for event in daemon.events())
+
+        # Закреплённый вручную сервер не меняется — человеку говорят снять закрепление.
+        pinned = daemon.tags("proxy")[0]
+        daemon.api.state = BalancerInfo(override=pinned, selects=())
+        daemon.via_location = "RU"
+        daemon.t += 400
+        assert daemon.tick() is State.LEAK and pinned in daemon.tags("proxy")
+        assert any("xgw unpin" in event for event in daemon.events())
+    finally:
+        daemon.store.close()
 
 
 def test_probe_url_check_waits_for_the_threshold_while_the_core_sees_members_alive(daemon):

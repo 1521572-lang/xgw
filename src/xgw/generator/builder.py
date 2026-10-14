@@ -398,8 +398,16 @@ def build(
     probe_password: str | None = None,
     probe_ports: Mapping[str, int] | None = None,
     ipv6: bool | None = None,
+    probe_url: str | None = None,
+    containers_tun: bool = False,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
+
+    probe_url — адрес проб ядра (burstObservatory), если не probe.url: пока probe.url не
+    отвечает, ядро пробует серверы по запасному адресу (watch/target.py).
+
+    containers_tun — нужен inbound TUN для контейнеров Docker (engine.containers_tun):
+    их трафик идёт в TUN-интерфейс при любом способе перехвата самой машины.
 
     ipv6 — открыть TPROXY-inbound для IPv6 самой машины; по умолчанию — если так
     настроено (network.ipv6 = proxy, capture.local) и IPv6 в ядре работает."""
@@ -471,17 +479,16 @@ def build(
         for info in nodes
     ]
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
-    # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется. То же в
-    # Windows (capture.method = "sysproxy"): программы приходят на http-in через системный
-    # прокси, прозрачных inbound-ов там нет.
-    capture = (cfg.capture.lan or cfg.capture.local) and not cfg.capture.sysproxy
+    # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
+    capture = cfg.capture.lan or cfg.capture.local
     # TUN (capture.method = "tun") — только для трафика самой машины, сеть LAN остаётся на
     # TPROXY; IPv6 машины тогда идёт через тот же TUN, и отдельный inbound на ::1 не нужен.
-    tun = cfg.capture.tun and cfg.capture.local
+    tun_local = cfg.capture.tun and cfg.capture.local
+    tun = tun_local or containers_tun
     tproxy_tags = []
-    if cfg.capture.lan or (cfg.capture.local and not tun):
+    if cfg.capture.lan or (cfg.capture.local and not tun_local):
         tproxy_tags.append("tproxy-in")
-    if ipv6 and not tun:
+    if ipv6 and not tun_local:
         tproxy_tags.append("tproxy-in6")
     capture_tags = [*tproxy_tags, *(["tun-in"] if tun else [])]
     sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
@@ -628,7 +635,7 @@ def build(
         "burstObservatory": {
             "subjectSelector": ["proxy-"],
             "pingConfig": {
-                "destination": cfg.probe.url,
+                "destination": probe_url or cfg.probe.url,
                 "connectivity": "",
                 "interval": cfg.probe.interval,
                 "sampling": cfg.probe.sampling,

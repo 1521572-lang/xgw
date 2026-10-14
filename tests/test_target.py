@@ -5,10 +5,11 @@ import pytest
 from xgw import fetch
 from xgw.config import Config
 from xgw.generator.builder import NodeInfo
+from xgw.paths import Paths
 from xgw.watch import checks, target
 from xgw.watch.scan import ScanResult
 
-WARNING = "Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url"
+WARNING = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url"
 
 
 def _result(verdict: str, *, bytes_read: int = 0, error: str = "", kind: str = "",
@@ -39,15 +40,25 @@ def test_signature_names_the_class_of_the_failure():
     assert target.signature(_result("CONNECT_FAIL", error="HTTP 403")) == "HTTP 403"
 
 
-def test_uniform_needs_the_same_failure_everywhere():
-    assert target.uniform([HTTP_403, HTTP_403, HTTP_403]) == "HTTP 403"
-    assert target.uniform([TIMEOUT, STALL]) == "таймаут"
-    assert target.uniform([HTTP_403, HTTP_404]) == ""  # разные коды — не «одна ошибка»
-    assert target.uniform([HTTP_403, TIMEOUT]) == ""
-    assert target.uniform([HTTP_403, GOOD]) == ""  # у кого-то проба прошла
-    assert target.uniform([HTTP_403, FROZEN]) == ""  # «заморозка» — это про сервер
-    assert target.uniform([FROZEN, FROZEN]) == ""
-    assert target.uniform([]) == ""
+def test_failure_is_the_most_common_error_unless_someone_got_the_file():
+    assert target.failure([HTTP_403, HTTP_403, HTTP_403]) == ("HTTP 403", 3, 3)
+    assert target.failure([TIMEOUT, STALL]) == ("таймаут", 2, 2)
+    assert target.failure([HTTP_403, HTTP_404, HTTP_403]) == ("HTTP 403", 2, 3)
+    assert target.failure([HTTP_403, GOOD]) == ("", 0, 2)  # у кого-то проба прошла
+    assert target.failure([HTTP_403, FROZEN]) == ("", 0, 2)  # «заморозка» — это про сервер
+    assert target.failure([]) == ("", 0, 0)
+    assert target.failure_text("HTTP 403", 3, 3) == "HTTP 403"
+    assert target.failure_text("обрыв соединения", 64, 67) == "обрыв соединения у 64 из 67"
+
+
+def test_dominant_failure_for_probe_all():
+    """`xgw probe --all` на живой машине: 64 обрыва и 3 таймаута из 67 — прежняя проверка
+    «одна ошибка у всех» здесь молчала, хотя не отвечал именно адрес пробы."""
+    results = [RESET] * 64 + [TIMEOUT] * 3
+    assert target.dominant(results) == "обрыв соединения у 64 из 67"
+    assert target.dominant([HTTP_403] * 5) == "HTTP 403"
+    assert target.dominant([RESET, TIMEOUT]) == ""  # ни одна ошибка не преобладает
+    assert target.dominant([RESET] * 9 + [GOOD]) == ""  # кто-то файл получил
 
 
 def test_sample_takes_all_members_and_a_few_spares_that_passed_the_scan():
@@ -82,6 +93,20 @@ def test_http_error_only_through_vpn_is_confirmed_by_the_base_request():
     assert not blind.down  # через VPN не проходит ничего — это уже не про адрес
 
 
+def test_different_failures_count_too_when_the_base_request_works():
+    """Ошибки разные, но файл не получил никто, а через VPN другие адреса открываются:
+    это адрес пробы. Случай с живой машины — обрывы у большинства и таймауты у остальных."""
+    results = [RESET] * 6 + [TIMEOUT] * 2
+    down = target.diagnose(results, base_ping=lambda: True, direct=lambda: "нет ответа")
+    assert down.down and down.signature == "обрыв соединения у 6 из 8"
+    dead = target.diagnose(results, base_ping=lambda: False, direct=_never)
+    assert not dead.down  # через VPN не проходит ничего — серверы мертвы
+    # Разные коды HTTP: одного прямого запроса мало, решает базовый запрос через VPN.
+    mixed = target.diagnose([HTTP_403, HTTP_403, HTTP_404], base_ping=lambda: True,
+                            direct=lambda: "HTTP 403")
+    assert mixed.down and mixed.signature == "HTTP 403 у 2 из 3"
+
+
 def test_timeouts_need_a_working_base_request():
     """Одинаковые таймауты бывают и у мёртвых серверов; а probe.url напрямую может быть
     просто закрыт провайдером — поэтому прямой запрос тут ничего не решает."""
@@ -92,10 +117,38 @@ def test_timeouts_need_a_working_base_request():
     assert down.text.startswith(WARNING)
 
 
-def test_mixed_results_ask_nothing_and_blame_nobody():
-    for results in ([HTTP_403, GOOD], [FROZEN, FROZEN], [RESET, TIMEOUT], []):
+def test_an_answer_from_anyone_asks_nothing_and_blames_nobody():
+    for results in ([HTTP_403, GOOD], [FROZEN, FROZEN], [RESET, FROZEN], []):
         verdict = target.diagnose(results, base_ping=_never, direct=_never)
         assert not verdict.down and verdict.signature == ""
+
+
+def test_core_probes_use_the_fallback_address_while_the_probe_url_is_down(tmp_path):
+    """Пока probe.url не отвечает, ядро пробует серверы по запасному адресу: по
+    probe.url_fallback, а без него — по probe.trace_url. Запись о запасном относится к
+    своему probe.url и переживает перезапуск (лежит в /var/lib/xgw)."""
+    paths = Paths(root=tmp_path)
+    cfg = Config()
+    primary = cfg.probe.url
+    assert target.fallback_target(cfg) == cfg.probe.trace_url
+    assert target.observatory_url(cfg, paths) == primary
+    assert target.use_fallback(cfg, paths, True) is True
+    assert target.observatory_url(cfg, paths) == cfg.probe.trace_url
+    assert target.use_fallback(cfg, paths, True) is False  # уже на запасном
+    cfg.probe.url_fallback = "https://cdn.example.net/blob.woff"
+    assert target.observatory_url(cfg, paths) == "https://cdn.example.net/blob.woff"
+    # probe.url в конфиге сменили — прежняя запись не действует.
+    other = Config()
+    other.probe.url = "https://files.example.net/new.bin"
+    assert target.observatory_url(other, paths) == other.probe.url
+    assert target.use_fallback(cfg, paths, False) is True
+    assert target.observatory_url(cfg, paths) == primary
+    assert target.use_fallback(cfg, paths, False) is False
+    # Подменять нечем: запасного нет, а trace_url совпадает с probe.url или пуст.
+    cfg.probe.url_fallback, cfg.probe.trace_url = "", ""
+    assert target.fallback_target(cfg) == ""
+    assert target.use_fallback(cfg, paths, True) is False
+    assert target.observatory_url(cfg, paths) == primary
 
 
 def test_direct_request_goes_around_the_vpn_with_the_probe_user_agent(monkeypatch):

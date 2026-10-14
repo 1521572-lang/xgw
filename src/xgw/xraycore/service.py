@@ -18,7 +18,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from .. import log, masking
-from ..net.cmd import HIDDEN
 
 MAX_LOG_BYTES = 2 * 1024 * 1024
 
@@ -108,7 +107,6 @@ class ProcessXrayService(XrayService):
                 [self.bin_path, "run", "-c", self.config_path],
                 stdout=subprocess.DEVNULL,
                 stderr=self._err,
-                **HIDDEN,
             )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc
@@ -274,7 +272,6 @@ class PidfileXrayService(XrayService):
                     stdout=output,
                     stderr=subprocess.STDOUT,
                     start_new_session=os.name != "nt",
-                    **HIDDEN,
                 )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc

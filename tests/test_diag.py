@@ -120,14 +120,11 @@ def test_config_problems(box):
 def test_missing_programs(box):
     missing = box.diag(which=lambda name: None if name == "nmcli" else "/usr/bin/x")._programs()
     assert missing[0].level == FAIL and "nmcli" in missing[0].text
-    later = box.diag(which=lambda name: None if name == "nft" else "/x")._programs()
-    assert later[0].level == WARN and "nftables, dnsmasq" in later[0].text
-    # Программа dnsmasq из dnsmasq-base — ещё не служба: нужен пакет dnsmasq.
-    unit = box.paths.root / "usr/lib/systemd/system/dnsmasq.service"
-    unit.parent.mkdir(parents=True)
-    unit.write_text("[Service]\n", encoding="utf-8")
+    later = box.diag(which=lambda name: None if name in ("nft", "dnsmasq") else "/x")._programs()
+    assert later[0].level == WARN and "nftables, dnsmasq-base" in later[0].text
+    # DHCP раздаёт своя служба xgw-dhcp: хватает программы из dnsmasq-base, пакет dnsmasq
+    # со штатной службой не нужен.
     assert box.diag()._programs()[0].level == OK
-    unit.unlink()
     box.cfg.network.lan_if = ""
     solo = box.diag(which=lambda name: None if name == "nmcli" else "/x")
     assert solo._programs()[0].level == OK  # для одной машины они не нужны
@@ -362,10 +359,10 @@ def test_services_and_capture_after_install(box):
     box.installed()
     down = box.diag()._services()
     assert down[0].level == FAIL and "xgw-net.service" in down[0].text
-    for unit in ("xgw-net.service", "xgw-xray.service", "xgw.service", "dnsmasq.service"):
+    for unit in ("xgw-net.service", "xgw-xray.service", "xgw.service", "xgw-dhcp.service"):
         box.system.unit(unit)["active"] = True
     checks = box.diag()._services()
-    assert checks[0].level == OK and "dnsmasq работают" in checks[0].text
+    assert checks[0].level == OK and "xgw-dhcp работают" in checks[0].text
     assert checks[1].level == FAIL and checks[1].advice == "sudo xgw net up"  # правил нет
     from xgw.net.capture import Capture
 
@@ -521,10 +518,10 @@ def test_dead_probe_url_is_named_by_diag(box, monkeypatch):
     assert [check.level for check in found] == [WARN, FAIL, FAIL]
     assert "напрямую: HTTP 403" in found[0].text
     assert found[2].text.startswith(
-        "Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url")
+        "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url")
     assert "другой probe.url" in found[2].advice
 
-    # Серверы отвечают по-разному — значит, дело не в адресе пробы.
+    # Один из серверов файл получил — значит, дело не в адресе пробы.
     replies = iter([answers["scan"], ScanResult("", "OK", 57620, 0.4)])
     monkeypatch.setattr(diag.scan, "scan_node", lambda info, cfg, **kwargs: next(replies))
     assert [check.level for check in box.diag()._probe()] == [WARN, FAIL]

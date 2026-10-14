@@ -30,6 +30,7 @@ from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
 from .net.capture import Capture, CaptureError
 from .paths import Paths, atomic_write_json, atomic_write_text
 from .watch import panel, status_page
+from .watch.status import join_ru
 from .xraycore import binary
 from .xraycore.api import ApiError
 from .xraycore.service import XrayServiceError
@@ -37,6 +38,9 @@ from .xraycore.service import XrayServiceError
 # Корень дистрибутива: репозиторий при запуске из исходников, /opt/xgw после установки.
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 UNITS = ("xgw-net.service", "xgw-xray.service", "xgw.service")
+# Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
+# LAN настроен. Порядок — порядок запуска; останавливаются в обратном.
+UNIT_FILES = ("xgw-net.service", "xgw-xray.service", dnsmasq.UNIT, "xgw.service")
 XRAY_USER = "xray"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
 EXAMPLE_URL = "example.com/sub/TOKEN"  # подписка из config.example.toml
@@ -269,8 +273,8 @@ class Installer:
         facts.wan_if = lan.effective_wan(self.cfg, self.runner)
         if self.which("nft") is None:
             facts.packages.append("nftables")
-        if facts.lan_if and not self._package_installed("dnsmasq"):
-            facts.packages.append("dnsmasq")
+        if facts.lan_if and self.which("dnsmasq") is None:
+            facts.packages.append(dnsmasq.PACKAGE)
         facts.user_exists = bool(
             self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
         )
@@ -285,10 +289,6 @@ class Installer:
             ]
         facts.ufw_active = self.which("ufw") is not None and ufw.active(self.runner)
         return facts
-
-    def _package_installed(self, name: str) -> bool:
-        text = self.runner(["dpkg-query", "-W", "-f=${Status}", name], check=False)
-        return "ok installed" in text
 
     def _xray_fits(self, version: tuple[int, int, int] | None) -> bool:
         """Подходит ли уже лежащий Xray: не ниже минимальной и той версии, что в конфиге."""
@@ -394,8 +394,8 @@ class Installer:
                 )
             start, end = [*cfg.network.dhcp_range.split(","), "", ""][:2]
             lines.append(
-                f"  • dnsmasq: DHCP {start.strip()}–{end.strip()} на {facts.lan_if} "
-                f"({dnsmasq.conf_path(self.paths)}); DNS в dnsmasq выключен"
+                f"  • DHCP {start.strip()}–{end.strip()} на {facts.lan_if}: своя служба "
+                f"xgw-dhcp (dnsmasq, {dnsmasq.conf_path(self.paths)}); DNS в ней выключен"
             )
         if not cfg.network.ipv6_proxy:
             lines.append(
@@ -416,12 +416,14 @@ class Installer:
             scope = [f"сеть {info['lan_if']}"] if info["lan"] else []
             if info["local"]:
                 scope.append("эта машина")
+            if info["containers"]:
+                scope.append("контейнеры Docker (docker0, br-*)")
             closed = (
                 "без работающего Xray интернета не будет (fail-closed)"
                 if cfg.capture.fail_mode != "open"
                 else "без Xray перехват через минуту снимется (fail_mode = open)"
             )
-            lines.append(f"  • перехват: {' и '.join(scope)} — через Xray; {closed}")
+            lines.append(f"  • перехват: {join_ru(scope)} — через Xray; {closed}")
             if info["tun"]:
                 lines.append(
                     f"  • TUN: постоянный интерфейс {cfg.capture.tun_name} (его создаёт XGW, а "
@@ -517,11 +519,6 @@ class Installer:
     def _system(self, facts: Facts) -> None:
         self.out("")
         self.out("Система:")
-        if facts.lan_if:
-            # До установки пакета: с конфигом по умолчанию dnsmasq занял бы порт 53,
-            # на котором уже слушает systemd-resolved, и его служба не запустилась бы.
-            self._remember_dnsmasq()
-            dnsmasq.write_conf(self.cfg, self.paths)
         self._packages(facts)
         self._user(facts)
         self._code()
@@ -546,19 +543,6 @@ class Installer:
                 ) from exc
         self.journal.extend("packages", facts.packages)
         self._step(f"пакеты: {', '.join(facts.packages)}")
-
-    def _remember_dnsmasq(self) -> None:
-        if "dnsmasq" in self.journal:
-            return
-        installed = self._package_installed("dnsmasq")
-        self.journal.set("dnsmasq", {
-            "package": not installed,  # пакет поставит XGW
-            "enabled": installed and self._unit_is("is-enabled", dnsmasq.UNIT, "enabled"),
-            "active": installed and self._unit_is("is-active", dnsmasq.UNIT, "active"),
-        })
-
-    def _unit_is(self, verb: str, unit: str, expected: str) -> bool:
-        return self.runner(["systemctl", verb, unit], check=False).strip() == expected
 
     def _user(self, facts: Facts) -> None:
         self.journal.setdefault("user_created", not facts.user_exists)
@@ -678,9 +662,9 @@ class Installer:
             self._sleep_back()
         if facts.ufw_active and facts.lan_if:
             self._ufw(facts, assume_yes)
-        if facts.lan_if:
-            self._dnsmasq()
+        self._legacy_dnsmasq()
         self._units()
+        self._dnsmasq(bool(facts.lan_if))
         # Без подписок собирать нечего: Xray запустит демон, когда их добавят в панели.
         xray_ok = self.first_apply() if engine.has_sources(self.cfg) else False
         self._capture(xray_ok)
@@ -801,30 +785,48 @@ class Installer:
                 self._warn(f"ufw: {exc}")
         self._step(f"ufw: {text}")
 
-    def _dnsmasq(self) -> None:
+    def _legacy_dnsmasq(self) -> None:
+        """Установка до 0.1.4 раздавала DHCP штатной службой dnsmasq.service по файлу в
+        /etc/dnsmasq.d. Теперь у XGW своя служба: файл убирается, штатная служба
+        возвращается в состояние до XGW (по журналу), аренды устройств переезжают."""
+        record = self.journal.get("dnsmasq")
+        if record is None and not dnsmasq.legacy_conf_path(self.paths).exists():
+            return
+        dnsmasq.migrate_leases(self.paths)
+        done = dnsmasq.restore_system(self.paths, record, self.runner)
+        self.journal.discard("dnsmasq")
+        self._step(f"{done}: DHCP теперь раздаёт своя служба xgw-dhcp")
+
+    def _dnsmasq(self, lan_on: bool) -> None:
+        """Своя служба DHCP (xgw-dhcp): с LAN — конфиг и запуск; без LAN — конфиг убран,
+        служба остановлена (сеть LAN могли убрать из настроек при повторной установке)."""
         _changed, warnings = dnsmasq.write_conf(self.cfg, self.paths)
         for warning in warnings:
             self._warn(warning)
+        if not lan_on:
+            self.runner(["systemctl", "disable", "--now", dnsmasq.UNIT], timeout=60.0,
+                        check=False)
+            return
         self.runner(["systemctl", "enable", dnsmasq.UNIT], timeout=60.0)
         try:
             self.runner(["systemctl", "restart", dnsmasq.UNIT], timeout=120.0)
         except cmd.CommandError as exc:
-            self._warn(f"dnsmasq не запустился — устройства не получат адреса: {exc}")
+            self._warn(f"служба DHCP xgw-dhcp не запустилась — устройства не получат адреса: {exc}")
             return
-        self._step(f"dnsmasq: DHCP на {lan.lan_interface(self.cfg)}")
+        self._step(f"DHCP на {lan.lan_interface(self.cfg)}: служба xgw-dhcp (dnsmasq)")
 
     def _units(self) -> None:
         source = self.source_root / "packaging"
         if not source.is_dir():
             source = self.paths.opt / "packaging"
         self.paths.systemd_dir.mkdir(parents=True, exist_ok=True)
-        for unit in UNITS:
+        for unit in UNIT_FILES:
             try:
                 text = (source / unit).read_text(encoding="utf-8")
             except OSError as exc:
                 raise InstallError(f"нет файла службы {source / unit}: {exc}") from exc
             atomic_write_text(self.paths.systemd_dir / unit, text, mode=0o644)
-        self.journal.set("units", list(UNITS))
+        self.journal.set("units", list(UNIT_FILES))
         self.runner(["systemctl", "daemon-reload"], timeout=60.0)
         self.runner(["systemctl", "enable", *UNITS], timeout=60.0)
         self._step("службы: " + ", ".join(unit.removesuffix(".service") for unit in UNITS))

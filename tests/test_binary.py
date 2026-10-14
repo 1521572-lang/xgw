@@ -44,7 +44,7 @@ def test_pick_asset_case_insensitive():
     )
     assert pick_asset(release, "linux", "x86_64") == "Xray-Linux-64.zip"
     assert pick_asset(release, "linux", "aarch64") == "Xray-linux-arm64-v8a.zip"
-    assert pick_asset(release, "windows", "x86_64") == "Xray-windows-64.zip"
+    assert pick_asset(release, "windows", "x86_64") is None  # XGW — только для Linux
     assert pick_asset(release, "darwin", "x86_64") is None
 
 

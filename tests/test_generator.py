@@ -265,12 +265,29 @@ def test_tun_without_lan_capture_has_no_tproxy_inbound():
     cfg = Config()
     cfg.capture.method = "tun"
     cfg.capture.lan = False
+    cfg.capture.containers = False
     config = _v6_build(cfg)
     assert _tags(config) == ["tun-in"]
     dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
     assert dns_rule["inboundTag"] == ["tun-in"]
     cfg.capture.local = False  # TUN — это про саму машину; без неё inbound не нужен
     assert _tags(_v6_build(cfg)) == []
+
+
+def test_containers_get_a_tun_inbound_when_docker_is_there():
+    """Контейнеры Docker идут в TUN-интерфейс при любом способе перехвата: с Docker на
+    машине (containers_tun) в конфиге есть tun-in и при capture.method = "tproxy"; DNS из
+    контейнеров обслуживает тот же dns-out. Без Docker inbound'а TUN нет."""
+    cfg = Config()
+    assert _tags(_v6_build(cfg)) == ["tproxy-in"]
+    config = _v6_build(cfg, containers_tun=True)
+    assert sorted(_tags(config)) == ["tproxy-in", "tun-in"]
+    tun_in = next(i for i in config["inbounds"] if i["tag"] == "tun-in")
+    assert tun_in["settings"]["name"] == cfg.capture.tun_name
+    dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
+    assert sorted(dns_rule["inboundTag"]) == ["tproxy-in", "tun-in"]
+    # TPROXY самой машины остаётся: TUN — только для контейнеров.
+    assert any(i["tag"] == "tproxy-in" for i in config["inbounds"])
 
 
 def test_ipv6_over_tun_needs_no_second_inbound():

@@ -8,9 +8,16 @@
 
 Трафик самой машины попадает в Xray либо через TPROXY на lo (по умолчанию), либо
 через постоянный TUN-интерфейс (capture.method = "tun", см. net/tun.py); сеть LAN
-всегда через TPROXY. Интерфейс создаётся при включении перехвата и убирается только
-командой `net down`: `xgw disable` и fail_mode = open снимают лишь правило и маршрут,
-иначе Xray остался бы с оборванным интерфейсом и потребовал перезапуска.
+всегда через TPROXY. Интерфейс создаётся при включении перехвата и убирается командой
+`net down`: `xgw disable` и fail_mode = open снимают лишь правило и маршрут, иначе Xray
+остался бы с оборванным интерфейсом и потребовал перезапуска. Ещё он убирается сам, когда
+стал не нужен: capture.method больше не "tun", и Xray запущен без inbound'а TUN (tidy).
+
+Контейнеры Docker (capture.containers) — всегда через тот же TUN-интерфейс, по своей
+метке: TPROXY с мостами Docker не работает (net/nft.py). Интерфейс для них появляется,
+только когда Docker на машине есть (engine.containers_tun): тогда в конфиге Xray есть
+inbound TUN, и интерфейс перед запуском Xray создаёт Applier. Без интерфейса маршрут
+контейнеров ведёт в чёрную дыру — они закрыты, а не идут мимо VPN.
 
 Выбор «включён/снят» хранится в /var/lib/xgw и переживает перезагрузку: по нему
 правила загружает xgw-net.service. Временное снятие (open) — метка в /run.
@@ -35,16 +42,14 @@ class CaptureError(Exception):
 
 
 # Теги inbound'ов перехвата в конфиге Xray (их пишет генератор, builder.py): TPROXY для
-# IPv4 и IPv6 и TUN для трафика самой машины. В Windows роль такого inbound'а играет
-# http-in: на него указывает системный прокси.
+# IPv4 и IPv6 и TUN для трафика самой машины.
 TPROXY_TAG = "tproxy-in"
 TPROXY6_TAG = "tproxy-in6"
 TUN_TAG = "tun-in"
-SYSPROXY_TAG = "http-in"
 CAPTURE_TAGS = (TPROXY_TAG, TPROXY6_TAG, TUN_TAG)
 
 
-def capture_inbounds(config: dict | None, *, sysproxy: bool = False) -> list[str]:
+def capture_inbounds(config: dict | None) -> list[str]:
     """Inbound'ы перехвата конфига Xray в каноническом виде — то, от чего зависят
     правила сети.
 
@@ -56,32 +61,21 @@ def capture_inbounds(config: dict | None, *, sysproxy: bool = False) -> list[str
     inbounds = config.get("inbounds") if isinstance(config, dict) else None
     if not isinstance(inbounds, list):
         return []
-    tags = (SYSPROXY_TAG,) if sysproxy else CAPTURE_TAGS
     found = []
     for inbound in inbounds:
         if not isinstance(inbound, dict):
             continue
-        if str(inbound.get("tag", "")) in tags or (
-            not sysproxy and inbound.get("protocol") == "tun"
-        ):
+        if str(inbound.get("tag", "")) in CAPTURE_TAGS or inbound.get("protocol") == "tun":
             found.append(json.dumps(inbound, sort_keys=True, ensure_ascii=False))
     return sorted(found)
 
 
-def capture_for(cfg: Config, paths: Paths, **kwargs):
-    """Управление перехватом для этой системы: правила ядра (Linux) либо, при
-    capture.method = "sysproxy", системный прокси Windows — с тем же набором действий."""
-    if cfg.capture.sysproxy:
-        from .wincapture import WinCapture
-
-        return WinCapture(cfg, paths, **kwargs)
+def capture_for(cfg: Config, paths: Paths, **kwargs) -> Capture:
+    """Управление перехватом: правила ядра (nftables, ip rule)."""
     return Capture(cfg, paths, **kwargs)
 
 
 class Capture:
-    # Перехват на уровне сети: обычный сокет самой машины тоже идёт через Xray, и
-    # утечку можно проверить запросом без метки.
-    transparent = True
     reloaded_text = "правила сети не были загружены — загружены заново"
 
     def __init__(
@@ -102,6 +96,7 @@ class Capture:
         self.time_uids = time_uids
         self.state_file = paths.var / "capture.json"
         self.open_marker = paths.run / "capture-open"
+        self.sys_net = Path("/sys/class/net")  # где искать мосты Docker (в тестах — свой)
         self._warned: set[str] = set()
         # Почему последняя загрузка вместо перехвата оставила сеть напрямую: в применённом
         # конфиге Xray нет нужного inbound'а либо нет TUN-интерфейса (см. _load). Пусто —
@@ -188,8 +183,16 @@ class Capture:
     @staticmethod
     def _wanted(rules: nft.Rules, family: int) -> tuple[bool, bool]:
         """(локальная доставка для TPROXY, маршрут в TUN) для семейства адресов."""
-        tproxy = rules.prerouting if family == 4 else rules.prerouting6
+        tproxy = rules.tproxy if family == 4 else rules.prerouting6
         return tproxy, rules.tun and (family == 4 or rules.capture6)
+
+    def _tun_dev(self, rules: nft.Rules) -> str | None:
+        """Интерфейс TUN, если он есть в системе (для маршрута контейнеров)."""
+        try:
+            return rules.tun_name if tun.present(rules.tun_name, self.runner) else None
+        except cmd.CommandError as exc:
+            self.log.debug("интерфейс %s не проверен: %s", rules.tun_name, exc)
+            return None
 
     def _routes_up(self, rules: nft.Rules) -> None:
         """Правила `ip rule` и маршруты, которые нужны текущим правилам. Интерфейс TUN к
@@ -203,6 +206,10 @@ class Capture:
                 iprule.ensure_tun(
                     cap.mark_proxy, cap.tun_route_table, self.runner, family, rules.tun_name
                 )
+        if rules.containers:
+            iprule.ensure_containers(
+                cap.mark_containers, cap.tun_route_table, self.runner, self._tun_dev(rules)
+            )
 
     def _routes_down(self, rules: nft.Rules) -> None:
         """Правила `ip rule` и маршруты, которые текущим правилам не нужны (остались от
@@ -213,9 +220,16 @@ class Capture:
             if not tproxy:
                 iprule.remove(cap.mark_proxy, cap.route_table, self.runner, family)
             if not via_tun:
+                # Маршруты таблицы TUN остаются, пока они нужны контейнерам (только IPv4).
                 iprule.remove_tun(
-                    cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name
+                    cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name,
+                    keep_routes=family == 4 and bool(rules.containers),
                 )
+        if not rules.containers:
+            iprule.remove_containers(
+                cap.mark_containers, cap.tun_route_table, self.runner, cap.tun_name,
+                keep_routes=rules.tun,
+            )
 
     def _applied(self) -> dict | None:
         """Применённый конфиг Xray — тот, с которым ядро запущено или запустится."""
@@ -245,7 +259,7 @@ class Capture:
         listed = config.get("inbounds")
         inbounds = [item for item in listed if isinstance(item, dict)] if isinstance(
             listed, list) else []
-        if rules.prerouting:
+        if rules.tproxy:
             # Порт обязан совпадать: правила отправляют пакеты именно на него.
             port = self.cfg.capture.tproxy_port
             if not any(
@@ -323,7 +337,29 @@ class Capture:
             raise CaptureError(str(exc)) from exc
         for warning in warnings:
             self.log.warning("%s", warning)
+        self.tidy()
         return mode
+
+    def tidy(self) -> str:
+        """Убирает интерфейс TUN, который больше не нужен: в конфиге не capture.method =
+        "tun", а работающий Xray запущен без inbound'а TUN (иначе он держит интерфейс
+        открытым). Возвращает, что сделано; пусто — убирать нечего."""
+        name = self.cfg.capture.tun_name
+        if not name or (self.cfg.capture.local and self.cfg.capture.tun):
+            return ""
+        applied = self._applied()
+        if applied is not None and tun.inbound_name(applied) == name:
+            return ""  # Xray ещё не перезапущен с новым конфигом
+        try:
+            if not tun.present(name, self.runner):
+                return ""
+            tun.remove(name, self.runner)
+        except cmd.CommandError as exc:
+            self.log.error("интерфейс %s не убран: %s", name, exc)
+            return ""
+        text = f"интерфейс {name} убран: capture.method больше не tun"
+        self.log.info("%s", text)
+        return text
 
     def up(self) -> str:
         """Загружает правила текущего режима (после перезагрузки, после сбоя)."""
@@ -405,6 +441,8 @@ class Capture:
             expected.add("loopback_guard")
         if rules.prerouting:
             expected.add("prerouting")
+        if rules.containers:
+            expected.add("containers")
         if rules.capture_local:
             expected.add("output")
         if rules.lan_if:
@@ -415,6 +453,8 @@ class Capture:
             return not chains & {"prerouting", "output", "loopback_guard"}
         if not rules.prerouting and "prerouting" in chains:
             return False  # остался TPROXY самой машины от capture.method = "tproxy"
+        if not rules.containers and "containers" in chains:
+            return False  # capture.containers выключили
         if rules.capture6 or self.ipv6_usable():
             chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
             if chains6 is None:
@@ -451,7 +491,14 @@ class Capture:
                     cap.mark_proxy, cap.route_table, self.runner, family
                 ):
                     return False
-            return True
+            if rules.containers and not iprule.present_containers(
+                cap.mark_containers, cap.tun_route_table, self.runner, self._tun_dev(rules)
+            ):
+                return False  # маршрут контейнеров пропал либо появился интерфейс TUN
+            # Лишнее: маршрут контейнеров остался, хотя capture.containers выключили.
+            return bool(rules.containers) or not iprule.has_rule(
+                cap.mark_containers, cap.tun_route_table, self.runner
+            )
         return None
 
     def describe(self, *, check: bool = True) -> dict:
@@ -465,6 +512,10 @@ class Capture:
             "bypass": list(rules.bypass),
             "ipv6": rules.capture6,
             "tun": rules.tun,
+            "containers": bool(rules.containers),
+            # Docker на машине есть (его мост уже создан): только тогда о контейнерах
+            # стоит говорить в статусе.
+            "docker": bool(lan.container_links(rules.containers, self.sys_net)),
             "fail_mode": self.cfg.capture.fail_mode,
             "loaded": self.loaded() if check else None,
             # Перехват включён, но Xray работает без нужного inbound'а: вместо правил

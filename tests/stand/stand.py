@@ -112,9 +112,6 @@ class Stand:
     _topology: netns.Topology | None = None
     _own_topology: bool = False
     ipv6: bool = False  # netns: IPv6 на стыке шлюза и «интернета», origin слушает и по IPv6
-    # Переменные окружения для команд и демона шлюза — сверх обычных (Windows: ключи
-    # реестра для проверок вместо настоящих настроек машины).
-    extra_env: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.logs = self.workdir / "logs"
@@ -171,7 +168,6 @@ class Stand:
             PYTHONPATH=str(SRC),
             PYTHONIOENCODING="utf-8",
         )
-        env.update(self.extra_env)
         return env
 
     def start(self) -> None:
@@ -262,7 +258,7 @@ class Stand:
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
         direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
-        sysproxy: bool = False, refresh_minutes: int = 1,
+        refresh_minutes: int = 1, containers: bool = True,
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -273,9 +269,6 @@ class Stand:
         capture=True (только netns) — шлюз с перехватом: LAN на lan0, трафик самого
         шлюза тоже через Xray, одно устройство в обход VPN, прямой DNS на втором
         адресе «интернета». Без него XGW только управляет Xray (проверки этапа 2).
-
-        sysproxy=True (Windows, режим loopback) — VPN-клиент самой машины: вместо
-        перехвата системный прокси пользователя.
 
         refresh_minutes — как часто демон обновляет подписку. Обновление заодно чинит
         испорченный рабочий конфиг; тесту, которому нужен Xray, сломанный надолго,
@@ -297,14 +290,9 @@ lan = true
 local = true
 method = "{method}"
 fail_mode = "{fail_mode}"
+containers = {"true" if containers else "false"}
 """
             direct_dns = f'["{netns.INET_DNS_IP}"]'
-        elif sysproxy:
-            network = (
-                '\n[capture]\nmethod = "sysproxy"\nlan = false\nlocal = true\n'
-                f'fail_mode = "{fail_mode}"\n'
-            )
-            direct_dns = "[]"
         else:
             network = "\n[capture]\nlan = false\nlocal = false\n"
             direct_dns = "[]"
@@ -560,11 +548,17 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
         return json.loads(result.stdout)
 
     def start_dnsmasq(self) -> subprocess.Popen:
-        """dnsmasq шлюза с конфигом, который выдаёт `xgw net show dnsmasq`."""
+        """dnsmasq шлюза с конфигом, который выдаёт `xgw net show dnsmasq`. Пользователь,
+        pid-файл и файл аренд — свои у стенда: каталогов службы xgw-dhcp тут нет."""
         conf = self.workdir / "dnsmasq.conf"
         shown = self.xgw("net", "show", "dnsmasq")
         assert shown.returncode == 0, shown.stderr
-        conf.write_text(shown.stdout, encoding="utf-8")
+        own = ("user=", "pid-file=", "dhcp-leasefile=")
+        conf.write_text(
+            "".join(line for line in shown.stdout.splitlines(keepends=True)
+                    if not line.startswith(own)),
+            encoding="utf-8",
+        )
         return self._spawn(
             "dnsmasq", "gw",
             ["dnsmasq", "--keep-in-foreground", f"--conf-file={conf}", "--user=root",

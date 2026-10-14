@@ -226,8 +226,8 @@ def test_page_shows_the_probe_url_warning_the_node_summary_and_the_monthly_traff
     (серверы при этом работают), сводка разбора подписок, расход на проверки за месяц."""
     snapshot = {
         **SNAPSHOT, "state": "PROBE_TARGET_UNREACHABLE",
-        "probe_target": "Внимание: все пробы падают с одинаковой ошибкой — вероятно, "
-                        "недоступен сам probe.url (HTTP 403 <b>)",
+        "probe_target": "Внимание: пробы всех серверов падают — вероятно, недоступен "
+                        "сам probe.url (HTTP 403 <b>)",
         "nodes": {"members": 5, "spares": 65, "dropped": 4, "duplicates": 12},
         "budget": {**SNAPSHOT["budget"], "all_mb": 1169.5, "month_gb": 35.1},
     }

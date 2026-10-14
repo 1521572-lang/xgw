@@ -13,9 +13,9 @@ RestartSec=5
 RuntimeDirectory=xgw
 RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
-# /etc/dnsmasq.d — панель пишет туда xgw.conf, когда устройство уходит мимо VPN;
-# «-» — каталога может не быть, пока dnsmasq не установлен.
-ReadWritePaths=/etc/xgw /var/lib/xgw /run/xgw -/etc/dnsmasq.d
+# /etc/xgw — в том числе dnsmasq.conf: панель переписывает его, когда устройство уходит
+# мимо VPN (служба DHCP xgw-dhcp читает только его).
+ReadWritePaths=/etc/xgw /var/lib/xgw /run/xgw
 PrivateTmp=true
 NoNewPrivileges=true
 # CAP_NET_ADMIN — nft, ip rule, sysctl сети и метка SO_MARK на прямых запросах;

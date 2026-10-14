@@ -7,6 +7,9 @@ ufw. `xgw install` и `xgw uninstall` выполняются внутри нег
 
     sudo -E XGW_XRAY_BIN=<путь к xray> pytest tests/stand/test_machine.py -q
 
+Путь к xray можно дать и относительным (tools/xray/xray) — от каталога, откуда
+запущен pytest.
+
 Проверки идут по порядку и продолжают одна другую: первый запуск без конфига →
 установка без подписки и всё остальное из панели (подписка, включение VPN, список
 серверов) → удаление → установка с подпиской в config.toml → работа из LAN →
@@ -34,7 +37,10 @@ from fake_telegram import TOKEN as TELEGRAM_TOKEN
 from machine import Machine, MachineTopology
 from stand import UUID, Stand, wait_for
 
-XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
+# Абсолютный путь: внутри контейнера команды выполняются из «/», и относительный путь
+# там указывал бы не туда.
+_XRAY_ENV = os.environ.get("XGW_XRAY_BIN", "")
+XRAY_BIN = str(Path(_XRAY_ENV).resolve()) if _XRAY_ENV else ""
 REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PANEL_PORT = "8781"
@@ -44,7 +50,7 @@ VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
 VIA_VPN6 = netns.INET_IP6
 DIRECT6 = netns.GW_WAN_IP6
-UNITS = ("xgw-net", "xgw-xray", "xgw", "dnsmasq")
+UNITS = ("xgw-net", "xgw-xray", "xgw", "xgw-dhcp")
 
 pytestmark = [
     pytest.mark.skipif(
@@ -83,7 +89,8 @@ def _snapshot(box: Machine) -> dict[str, str]:
         "ufw": box.sh("ufw status 2>/dev/null || true"),
         "ufw before.rules": box.sh("cat /etc/ufw/before.rules 2>/dev/null || true"),
         "files": box.sh(
-            "ls -d /opt/xgw /usr/local/bin/xgw /etc/dnsmasq.d/xgw.conf /etc/sysctl.d/90-xgw.conf "
+            "ls -d /opt/xgw /usr/local/bin/xgw /etc/dnsmasq.d/xgw.conf /etc/xgw/dnsmasq.conf "
+            "/etc/sysctl.d/90-xgw.conf "
             f"/var/lib/xgw /etc/xgw/xray {LAUNCHER} /usr/local/share/applications "
             "2>/dev/null || true"
         ),
@@ -142,12 +149,19 @@ def _install(gw, *args: str):
     )
 
 
+def _put_xray(box: Machine) -> None:
+    """Xray стенда — в /opt/xgw/xray. Сети в контейнере нет, поэтому он кладётся заранее:
+    установка его не скачивает, если версия подходит. Прежний файл сначала удаляется
+    (--remove-destination): поверх работающего Xray cp отвечает «Text file busy»."""
+    box.sh(f"mkdir -p /opt/xgw/xray && cp --remove-destination {Path(XRAY_BIN).parent}/* "
+           "/opt/xgw/xray/")
+
+
 def _put_config(gw) -> None:
-    """Конфиг стенда — на место /etc/xgw/config.toml. Сети в контейнере нет, поэтому
-    Xray кладётся заранее: установка его не скачивает, если версия подходит."""
+    """Конфиг стенда — на место /etc/xgw/config.toml, Xray — на своё место."""
     shutil.copyfile(gw.stand.config_file, gw.box.root / "etc/xgw/config.toml")
-    gw.box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
-              "&& chmod 600 /etc/xgw/config.toml")
+    _put_xray(gw.box)
+    gw.box.sh("chmod 600 /etc/xgw/config.toml")
 
 
 def _panel(gw, *args: str) -> dict:
@@ -213,19 +227,22 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
     out = result.stdout
     if os.environ.get("XGW_MACHINE_PREINSTALL_DNSMASQ") == "1":
         assert box.dnsmasq_preinstalled, "пакет dnsmasq не удалось поставить в контейнер заранее"
-    if box.dnsmasq_preinstalled:
-        # Пакет достался контейнеру от хоста (корень — оверлей поверх его корня):
-        # ставить нечего, и строки об установке быть не должно.
-        assert "пакеты: dnsmasq" not in out
-    else:
-        assert "пакеты: dnsmasq" in out  # поставлен через apt-get из репозитория контейнера
-    # Откуда бы пакет ни взялся, важно, что dnsmasq работает: конфиг XGW принят,
-    # служба слушает DHCP на карте LAN и выдаёт устройству адрес из диапазона.
-    assert box.run("dnsmasq", "--test", check=False).returncode == 0
+    # DHCP раздаёт своя служба xgw-dhcp: нужна только программа из dnsmasq-base (на Ubuntu
+    # Desktop она уже стоит), пакет dnsmasq со штатной службой не нужен вовсе.
+    assert "пакеты: dnsmasq" not in out
+    assert box.run("dnsmasq", "--test", "--conf-file=/etc/xgw/dnsmasq.conf",
+                   check=False).returncode == 0
+    assert not (box.root / "etc/dnsmasq.d/xgw.conf").exists()
     assert "dnsmasq" in box.sh("ss -lunpH 'sport = :67'")
     lease = stand.lan("dhcp", "eth0")
-    assert "error" not in lease, f"{lease}\n{box.journal('dnsmasq', 20)}"
+    assert "error" not in lease, f"{lease}\n{box.journal('xgw-dhcp', 20)}"
     assert lease["router"] == netns.GW_LAN_IP
+    # Аренда — в своём файле, его читает панель.
+    assert wait_for(lambda: lease["ip"] in box.sh("cat /var/lib/xgw/dhcp.leases"), 10)
+    if box.dnsmasq_preinstalled:
+        # Штатную службу пакета dnsmasq XGW не трогает: она осталась выключенной.
+        assert box.run("systemctl", "is-enabled", "dnsmasq.service",
+                       check=False).stdout.strip() != "enabled"
     assert "подписок пока нет: VPN не включится" in out  # сказано ещё в плане
     assert "XGW установлен. Подписок пока нет — VPN выключен" in out
     token = _panel_token(gw)
@@ -236,7 +253,7 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
     # Xray запускать не с чем; остальное работает, шлюз — обычный роутер.
     active = _active(gw)
     assert active["xgw-xray"] != "active"
-    assert [active[unit] for unit in ("xgw-net", "xgw", "dnsmasq")] == ["active"] * 3
+    assert [active[unit] for unit in ("xgw-net", "xgw", "xgw-dhcp")] == ["active"] * 3
     assert wait_for(lambda: _exit_ip(gw) == DIRECT, 20), "устройство осталось без интернета"
     assert stand.exit_ip("gw") == DIRECT
     table = box.sh("nft list table ip xgw")
@@ -452,7 +469,7 @@ def test_device_is_taken_around_the_vpn_and_back_from_the_panel(gw):
     box, stand = gw.box, gw.stand
     mac = "02:00:00:00:00:51"
     lease = stand.lan("dhcp", "eth0", "--mac", mac)
-    assert "error" not in lease, f"{lease}\n{box.journal('dnsmasq', 20)}"
+    assert "error" not in lease, f"{lease}\n{box.journal('xgw-dhcp', 20)}"
     ip = lease["ip"]
     stand.run_in("lan", "ip", "addr", "add", f"{ip}/24", "dev", "eth0")  # адрес «получен»
     try:
@@ -462,7 +479,7 @@ def test_device_is_taken_around_the_vpn_and_back_from_the_panel(gw):
         pressed = _press(gw, "device", mac=mac, bypass=True)
         assert pressed["ok"] and "идёт мимо VPN" in pressed["text"], pressed
         assert ip in box.sh("nft list set ip xgw bypass4")
-        assert f"dhcp-host={mac},{ip}" in box.sh("cat /etc/dnsmasq.d/xgw.conf")
+        assert f"dhcp-host={mac},{ip}" in box.sh("cat /etc/xgw/dnsmasq.conf")
         assert box.sh("stat -c '%U:%G %a' /etc/xgw/panel.json").strip() == "root:root 600"
         assert wait_for(lambda: stand.exit_ip("lan", "--bind", ip) == DIRECT, 10, step=0.3)
         assert _exit_ip(gw) == VIA_VPN  # остальные устройства — через VPN
@@ -477,7 +494,7 @@ def test_device_is_taken_around_the_vpn_and_back_from_the_panel(gw):
         back = _press(gw, "device", mac=mac, bypass=False)
         assert back["ok"] and "снова идёт через VPN" in back["text"], back
         assert ip not in box.sh("nft list set ip xgw bypass4")
-        assert mac not in box.sh("cat /etc/dnsmasq.d/xgw.conf")
+        assert mac not in box.sh("cat /etc/xgw/dnsmasq.conf")
         assert wait_for(lambda: stand.exit_ip("lan", "--bind", ip) == VIA_VPN, 10, step=0.3)
         assert json.loads(box.sh("cat /etc/xgw/panel.json"))["devices"] == []
     finally:
@@ -670,9 +687,9 @@ def test_second_install_changes_nothing_and_keeps_the_original_state(gw):
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
     second = json.loads(journal.read_text(encoding="utf-8"))
-    # Пакет dnsmasq поставила ещё первая установка (до панели), поэтому в этом
-    # журнале записи о пакетах может не быть вовсе.
-    for key in ("sysctl", "nm_lan", "nm_wan", "dnsmasq", "packages", "user_created", "sleep"):
+    # Пакетов установка могла не ставить вовсе (dnsmasq-base уже был) — тогда записи о
+    # них нет ни в одном журнале.
+    for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "sleep"):
         assert second.get(key) == first.get(key), key
     assert [item["autoconnect"] for item in second["nm_lan"]["disabled"]] == ["yes"]
     assert box.sh("pgrep -x xray").strip() == xray_pid  # Xray не перезапускался
@@ -690,7 +707,7 @@ def test_lan_device_works_through_the_installed_gateway(gw):
     reply = stand.lan("dns", "8.8.8.8", "example.com")
     assert reply["answers"] == [netns.INET_IP] and reply["from"] == "8.8.8.8"
 
-    # Адреса раздаёт dnsmasq.service: из диапазона и по статической аренде.
+    # Адреса раздаёт служба xgw-dhcp: из диапазона и по статической аренде.
     lease = stand.lan("dhcp", "eth0")
     assert lease["router"] == lease["dns"] == netns.GW_LAN_IP
     assert 110 <= int(lease["ip"].rsplit(".", 1)[1]) <= 150
@@ -755,8 +772,8 @@ def test_config_change_is_picked_up_without_restarting_the_daemon(gw):
     applied = _xgw(gw, "apply")
     assert applied.returncode == 0, applied.stderr
     assert "dnsmasq: настройки DHCP обновлены" in applied.stdout
-    assert "192.168.50.160" in box.sh("cat /etc/dnsmasq.d/xgw.conf")
-    assert _active(gw)["dnsmasq"] == "active"
+    assert "192.168.50.160" in box.sh("cat /etc/xgw/dnsmasq.conf")
+    assert _active(gw)["xgw-dhcp"] == "active"
 
 
 def test_desktop_notification_is_sent_from_the_sandboxed_daemon(gw):
@@ -808,7 +825,8 @@ def test_diag_after_install_and_log_export_without_secrets(gw):
     box = gw.box
     result = _xgw(gw, "diag")
     assert result.returncode == 0, result.stdout
-    for text in ("xgw-net, xgw-xray, xgw, dnsmasq работают", "Перехват: включён, правила загружены",
+    for text in ("xgw-net, xgw-xray, xgw, xgw-dhcp работают",
+                 "Перехват: включён, правила загружены",
                  "ufw: включён, правила для lan0 есть", "профиль xgw-lan активен",
                  "цели сна замаскированы", "через Xray: 65536 Б"):
         assert text in result.stdout, text
@@ -831,9 +849,23 @@ def test_diag_after_install_and_log_export_without_secrets(gw):
 
 
 def test_everything_comes_up_after_reboot_rules_before_network(gw):
+    """Перезагрузка. Заодно — живая машина 14.10: пакет ubuntu-fan (ставится вместе с
+    docker.io) кладёт в /etc/dnsmasq.d строку bind-interfaces, и штатный dnsmasq с
+    конфигом XGW после перезагрузки не запускался. Своя служба DHCP этот каталог не
+    читает: тот же файл ей не мешает."""
     box = gw.box
-    box.reboot()
-    assert wait_for(lambda: _active(gw) == dict.fromkeys(UNITS, "active"), 60), _active(gw)
+    box.sh("mkdir -p /etc/dnsmasq.d && printf 'bind-interfaces\\n' > /etc/dnsmasq.d/ubuntu-fan")
+    try:
+        box.reboot()
+        assert wait_for(lambda: _active(gw) == dict.fromkeys(UNITS, "active"), 60), _active(gw)
+        assert "cannot set" not in box.journal("xgw-dhcp", 50)
+        _came_up_after_reboot(gw)
+    finally:
+        box.sh("rm -f /etc/dnsmasq.d/ubuntu-fan")
+
+
+def _came_up_after_reboot(gw) -> None:
+    box = gw.box
 
     def moment(unit: str) -> int:
         return int(box.sh(f"systemctl show {unit} -p ActiveEnterTimestampMonotonic --value"))
@@ -857,10 +889,11 @@ def test_uninstall_returns_the_system_to_its_original_state(gw):
     after = _snapshot(box)
     for key, value in gw.before.items():
         assert after[key] == value, f"{key}:\n--- было\n{value}\n--- стало\n{after[key]}"
-    # Подписка пользователя остаётся; пакет dnsmasq — тоже, но служба выключена.
+    # Подписка пользователя остаётся; служба DHCP и её конфиг — нет.
     assert (box.root / "etc/xgw/config.toml").exists()
+    assert not (box.root / "etc/xgw/dnsmasq.conf").exists()
+    assert box.run("systemctl", "is-active", "xgw-dhcp", check=False).stdout.strip() != "active"
     assert box.run("systemctl", "is-active", "dnsmasq", check=False).stdout.strip() != "active"
-    assert box.run("systemctl", "is-enabled", "dnsmasq", check=False).stdout.strip() != "enabled"
     assert not box.sh("pgrep -x xray || true")
     # Прежний профиль карты снова подключается сам.
     assert "old-lan:yes" in box.sh("nmcli -t -f NAME,AUTOCONNECT connection show")
@@ -877,7 +910,7 @@ def test_machine_only_mode_without_a_second_card(gw):
         'lan_if = "lan0"', 'lan_if = ""'
     )
     (box.root / "etc/xgw/config.toml").write_text(text, encoding="utf-8")
-    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/")
+    _put_xray(box)
 
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -887,6 +920,7 @@ def test_machine_only_mode_without_a_second_card(gw):
                    check=False).stdout.split() == ["active"] * 3
     assert "xgw-lan" not in box.sh("nmcli -t -f NAME connection show")
     assert not (box.root / "etc/dnsmasq.d/xgw.conf").exists()
+    assert not (box.root / "etc/xgw/dnsmasq.conf").exists()
     assert not (box.root / "etc/sysctl.d/90-xgw.conf").exists()
     assert box.sh("cat /proc/sys/net/ipv4/ip_forward").strip() == "0"
     assert box.sh("ufw status") == gw.before["ufw"]  # правила ufw для LAN не нужны
@@ -919,6 +953,10 @@ def test_ipv6_of_the_machine_goes_through_vpn_on_the_installed_system(gw):
     for address in (netns.INET_IP6, netns.INET_DNS_IP6):
         machine_mod._run(["ip", "-n", machine_mod.INET_NS, "addr", "replace",
                           f"{address}/64", "dev", "eth0", "nodad"])
+    # IPv6 на wan0 мог остаться выключенным после прошлых проверок (ipv6 = off): на
+    # NetworkManager 1.46 профиль после удаления XGW возвращается, а карта — только после
+    # перезагрузки (ASSUMPTIONS, п. 168). Проверке нужен IPv6, включаем его явно.
+    box.sh("sysctl -qw net.ipv6.conf.wan0.disable_ipv6=0")
     box.sh(f"ip addr replace {netns.GW_WAN_IP6}/64 dev wan0 nodad "
            f"&& ip -6 route replace default via {netns.INET_IP6}")
     stand._spawn(
@@ -933,8 +971,8 @@ def test_ipv6_of_the_machine_goes_through_vpn_on_the_installed_system(gw):
     text = stand.config_file.read_text(encoding="utf-8").replace('lan_if = "lan0"', 'lan_if = ""')
     box.sh("mkdir -p /etc/xgw")
     (box.root / "etc/xgw/config.toml").write_text(text, encoding="utf-8")
-    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
-           "&& chmod 600 /etc/xgw/config.toml")
+    _put_xray(box)
+    box.sh("chmod 600 /etc/xgw/config.toml")
 
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -982,8 +1020,8 @@ def test_tun_method_on_the_installed_system(gw):
     text = stand.config_file.read_text(encoding="utf-8").replace('lan_if = "lan0"', 'lan_if = ""')
     box.sh("mkdir -p /etc/xgw")
     (box.root / "etc/xgw/config.toml").write_text(text, encoding="utf-8")
-    box.sh(f"mkdir -p /opt/xgw/xray && cp {Path(XRAY_BIN).parent}/* /opt/xgw/xray/ "
-           "&& chmod 600 /etc/xgw/config.toml")
+    _put_xray(box)
+    box.sh("chmod 600 /etc/xgw/config.toml")
 
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -997,10 +1035,17 @@ def test_tun_method_on_the_installed_system(gw):
     assert "LOWER_UP" in link and "tun" in box.sh("ip -d link show xgwtun0")  # Xray подключён
     assert box.sh("ps -o user= -C xray").split() == ["xray"]  # от пользователя xray, без root
     rules = box.sh("ip rule show")
-    assert "fwmark 0x1 iif lo lookup 101" in rules and "lookup 100" not in rules  # LAN нет
+    assert "fwmark 0x1 iif lo lookup 101" in rules
+    # Контейнеры Docker — меткой mark_containers в ту же таблицу TUN; TPROXY (таблица 100)
+    # не нужен никому: LAN нет.
+    assert "fwmark 0x3 lookup 101" in rules and "lookup 100" not in rules
     table = box.sh("ip route show table 101")
     assert "default dev xgwtun0" in table and "blackhole default metric 4096" in table
-    assert "tproxy" not in box.sh("nft list table ip xgw")  # TPROXY самой машине не нужен
+    nft_table = box.sh("nft list table ip xgw")
+    prerouting = nft_table.split("chain prerouting {")[1].split("}")[0]
+    assert "tproxy" not in prerouting and '"lo"' not in prerouting  # самой машине TPROXY не нужен
+    containers = nft_table.split("chain containers {")[1].split("chain prerouting")[0]
+    assert "tproxy" not in containers and "meta mark set 0x" in containers
     assert "tun-in" in box.sh("cat /etc/xgw/xray/config.json")
 
     assert stand.exit_ip("gw") == VIA_VPN  # трафик самой машины — через VPN

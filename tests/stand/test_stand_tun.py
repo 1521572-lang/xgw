@@ -42,6 +42,8 @@ pytestmark = [
 def _stand(tmp_path: Path, **config) -> Stand:
     stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns", ipv6=config.get("ipv6") == "proxy")
     stand.start()
+    # Контейнеры Docker — в test_stand_docker.py: здесь таблица TUN только у самой машины.
+    config.setdefault("containers", False)
     stand.up(capture=True, method="tun", **config)
     enabled = stand.xgw("enable")
     assert enabled.returncode == 0, enabled.stderr
@@ -162,7 +164,7 @@ def test_method_can_be_switched_both_ways(tmp_path):
         assert stand.exit_ip("gw") == VIA_VPN and f"default dev {TUN}" in _routes(stand)
         # tun → tproxy. Сеть LAN включена, поэтому tproxy-in в Xray есть в обоих режимах, и
         # машина переключается на него сразу, ещё до применения нового конфига Xray.
-        stand.write_config(capture=True, method="tproxy")
+        stand.write_config(capture=True, method="tproxy", containers=False)
         assert stand.xgw("net", "up").returncode == 0
         table = stand.gw_run("nft", "list", "table", "ip", "xgw")
         assert 'iifname "lo"' in table and "tproxy to 127.0.0.1:12345" in table
@@ -178,7 +180,7 @@ def test_method_can_be_switched_both_ways(tmp_path):
         # трафик машины в никуда (так машина и оставалась без интернета — отчёт о проверке
         # на настоящей машине, дефект D1). Поэтому перехват не загружается вовсе: сеть
         # работает напрямую, а команды и статус говорят, чего ждут.
-        stand.write_config(capture=True, method="tun")
+        stand.write_config(capture=True, method="tun", containers=False)
         assert stand.xgw("net", "up").returncode == 0
         assert _routes(stand).strip() == "" and "fwmark" not in _rules(stand)
         table = stand.gw_run("nft", "list", "table", "ip", "xgw")
@@ -283,14 +285,14 @@ def test_daemon_switches_the_method_by_itself_and_never_lets_traffic_out_directl
     stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
     try:
         stand.start()
-        stand.up(capture=True, method="tproxy")
+        stand.up(capture=True, method="tproxy", containers=False)
         assert stand.xgw("enable").returncode == 0
         assert stand.exit_ip("gw") == VIA_VPN and _routes(stand).strip() == ""
         stand.start_daemon()
         assert wait_for(lambda: stand.xgw_json("status").get("state") == "HEALTHY", 40)
         config_json = stand.root / "etc/xgw/xray/config.json"
 
-        stand.write_config(capture=True, method="tun")
+        stand.write_config(capture=True, method="tun", containers=False)
         seen = _watch_switch(stand, lambda: f"default dev {TUN}" in _routes(stand))
         assert DIRECT not in seen, seen
         assert "tun-in" in stand.gw_run("cat", str(config_json))
@@ -301,7 +303,7 @@ def test_daemon_switches_the_method_by_itself_and_never_lets_traffic_out_directl
         log = stand.tail("daemon", 200)
         assert "изменение inbound перехвата" in log, log
 
-        stand.write_config(capture=True, method="tproxy")
+        stand.write_config(capture=True, method="tproxy", containers=False)
         seen = _watch_switch(
             stand, lambda: "tun-in" not in stand.gw_run("cat", str(config_json))
             and _routes(stand).strip() == ""

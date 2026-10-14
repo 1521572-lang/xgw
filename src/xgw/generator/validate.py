@@ -15,7 +15,6 @@ import tempfile
 from pathlib import Path
 
 from .. import masking
-from ..net.cmd import HIDDEN
 from ..paths import Paths
 from ..xraycore import binary
 
@@ -75,7 +74,6 @@ def _run_test(config: dict, xray_bin: Path) -> tuple[bool, str]:
                 capture_output=True,
                 text=True,
                 timeout=60,
-                **HIDDEN,
             )
         except subprocess.TimeoutExpired:
             return False, "xray run -test: таймаут 60 с"

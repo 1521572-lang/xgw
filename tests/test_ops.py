@@ -195,18 +195,15 @@ def test_update_replaces_binary_and_restarts(updater):
     assert updater.out == ["Xray обновлён и перезапущен: 26.3.27 → 26.4.13"]
 
 
-@pytest.mark.parametrize("windows", [True, False])
-def test_update_stops_xray_first_only_where_the_folder_is_locked(updater, monkeypatch, windows):
-    """Windows не даёт переименовать каталог работающей программы: там ядро перед
-    заменой останавливается. В Linux оно работает до самого перезапуска."""
-    monkeypatch.setattr(update, "WINDOWS", windows)
+def test_update_keeps_xray_running_until_the_restart(updater):
+    """Ядро работает на прежнем файле до самого перезапуска: перед заменой файлов его
+    не останавливают."""
     assert updater.run() == 0
-    assert updater.stops == (1 if windows else 0) and updater.restarts == 1
+    assert updater.stops == 0 and updater.restarts == 1
     assert updater.paths.xray_bin.read_bytes() == b"new httpMethod"
 
 
 def test_update_keeps_the_old_xray_when_files_cannot_be_replaced(updater, monkeypatch):
-    monkeypatch.setattr(update, "WINDOWS", True)
     real_replace = os.replace
 
     def locked(source, target):
@@ -218,7 +215,7 @@ def test_update_keeps_the_old_xray_when_files_cannot_be_replaced(updater, monkey
     assert updater.run() == 1
     assert "не заменены" in updater.out[0] and "не тронута" in updater.out[0]
     assert updater.paths.xray_bin.read_bytes() == b"old httpMethod"
-    assert updater.restarts == 1 and updater.leftovers() == ["xray"]  # ядро запущено снова
+    assert updater.restarts == 0 and updater.leftovers() == ["xray"]  # ядро не трогали
 
 
 def test_update_is_a_no_op_for_the_same_version(updater):
@@ -544,7 +541,7 @@ def test_apply_on_installed_gateway_syncs_rules_and_dhcp(root, tmp_path, monkeyp
     cli._sync_network(cfg, root, logger)
     assert "tproxy" in kernel.table
     assert dnsmasq.conf_path(root).exists()
-    assert system.calls == [("systemctl", "restart", "dnsmasq.service")]
+    assert system.calls == [("systemctl", "restart", "xgw-dhcp.service")]
     assert "dnsmasq: настройки DHCP обновлены" in capsys.readouterr().out
     cli._sync_network(cfg, root, logger)
     assert len(system.calls) == 1  # конфиг DHCP не менялся — dnsmasq не перезапускается
@@ -585,19 +582,15 @@ def test_panel_command_prints_the_link_with_the_token(root, capsys):
     assert "панель выключена" in capsys.readouterr().err
 
 
-def test_panel_open_waits_for_the_panel_and_starts_xgw_in_windows(root, capsys, monkeypatch):
-    """`xgw panel --open` (ярлык): браузер открывается, когда панель уже отвечает; в
-    Windows не запущенный XGW ярлык сначала запускает сам."""
+def test_panel_open_waits_for_the_panel(root, capsys, monkeypatch):
+    """`xgw panel --open`: браузер открывается, когда панель уже отвечает."""
     import socket
 
-    from xgw import winapp
     from xgw.watch import panel
 
     opened: list[str] = []
-    started: list[bool] = []
     monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
     monkeypatch.setattr(cli, "PANEL_WAIT", 0.6)
-    monkeypatch.setattr(cli, "WINDOWS", False)
     root.etc.mkdir(parents=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -608,17 +601,8 @@ def test_panel_open_waits_for_the_panel_and_starts_xgw_in_windows(root, capsys, 
         token = panel.read_token(root)
         assert opened == [f"http://127.0.0.1:{port}/?token={token}"]
         assert capsys.readouterr().out == ""  # ссылка с токеном в терминал не печатается
-
-        # Windows: демон не запущен — ярлык запускает его и только потом открывает панель.
-        monkeypatch.setattr(cli, "WINDOWS", True)
-        monkeypatch.setattr(winapp, "start_daemon", lambda paths: started.append(True) or True)
-        assert main(["panel", "--open"]) == 0 and started == [True] and len(opened) == 2
-        monkeypatch.setattr(winapp, "start_daemon", lambda paths: False)
-        assert main(["panel", "--open"]) == 1 and len(opened) == 2
-        assert "XGW не запустился" in capsys.readouterr().err
-        monkeypatch.setattr(cli, "WINDOWS", False)
     # Панель не отвечает — браузер с пустой страницей не открывается.
-    assert main(["panel", "--open"]) == 1 and len(opened) == 2
+    assert main(["panel", "--open"]) == 1 and len(opened) == 1
     assert "панель не отвечает" in capsys.readouterr().err
 
 
@@ -630,7 +614,6 @@ def test_panel_login_from_the_shortcut_asks_for_the_admin_password(root, monkeyp
     asked: list[list[str]] = []
     notes: list[str] = []
     answer = [0]
-    monkeypatch.setattr(cli, "WINDOWS", False)
     monkeypatch.setattr(desktop, "is_root", lambda: False)
     monkeypatch.setattr(desktop, "as_admin", lambda argv: asked.append(argv) or answer[0])
     monkeypatch.setattr(desktop, "notify", lambda user, text: notes.append(text))
@@ -660,7 +643,6 @@ def test_panel_login_as_root_opens_a_one_time_link_for_the_user(root, monkeypatc
     notes: list[str] = []
     session = [True]
     alice = desktop.User("alice", 1000)
-    monkeypatch.setattr(cli, "WINDOWS", False)
     monkeypatch.setattr(cli, "PANEL_WAIT", 0.6)
     monkeypatch.setattr(desktop, "is_root", lambda: True)
     monkeypatch.setattr(desktop, "invoking_user", lambda: alice)
@@ -685,29 +667,6 @@ def test_panel_login_as_root_opens_a_one_time_link_for_the_user(root, monkeypatc
     monkeypatch.setattr(desktop, "invoking_user", lambda: None)
     assert main(["panel", "--login"]) == 1 and "«Войти заново»" in notes[-1]
     assert len(opened) == 1
-
-
-def test_shortcut_failures_show_a_window_when_there_is_no_console(root, monkeypatch):
-    """Ярлык в меню «Пуск» запускает XGW без окна консоли: о любой ошибке — и о
-    нечитаемом config.toml тоже — говорит окно с сообщением, а не строка в никуда."""
-    import sys
-
-    from xgw import winapp
-
-    shown: list[str] = []
-    monkeypatch.setattr(winapp, "alert", shown.append)
-    monkeypatch.setattr(cli, "WINDOWS", True)
-    root.etc.mkdir(parents=True)
-    root.config_file.write_text("[panel\n", encoding="utf-8")
-    assert main(["panel", "--open"]) == 2 and shown == []  # в терминале окно не нужно
-    monkeypatch.setattr(sys, "stderr", None)
-    assert main(["panel", "--open"]) == 2
-    assert len(shown) == 1 and "ошибка чтения TOML" in shown[0]
-    assert str(root.config_file) in shown[0]  # какой файл править — сказано
-    assert main(["status"]) == 2 and len(shown) == 1  # другие команды окон не показывают
-    assert main(["panel"]) == 2 and len(shown) == 1  # и панель без --open — тоже
-    root.config_file.write_text("[panel]\nenabled = false\n", encoding="utf-8")
-    assert main(["panel", "--open"]) == 2 and "панель выключена" in shown[-1]
 
 
 def _free_port() -> int:

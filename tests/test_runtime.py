@@ -252,6 +252,28 @@ def test_probe_budget_uses_the_measured_size(tmp_path):
     store.close()
 
 
+def test_budget_does_not_advise_cuts_while_the_probe_size_is_a_guess():
+    """probe.url не отвечает и размер его неизвестен (ни измерения, ни ?bytes=): расход
+    посчитан по 64 КиБ наугад, и советовать по нему урезать проверки нельзя — на живой
+    машине так получалось ~1041 МБ «больше лимита» при настоящих 57 620 байтах."""
+    cfg = Config()
+    cfg.probe.url = "https://127.0.0.1:9999/bad"
+    budget = status.probe_budget(cfg, members=5, spares=63)
+    assert budget.guessed and budget.total / status.MB > cfg.probe.max_daily_probe_mb
+    assert status.budget_warnings(cfg, budget, {}) == []
+    tight = {"main": {"upload": 10**9, "download": 95 * 10**9, "total": 100 * 10**9}}
+    assert status.budget_warnings(cfg, budget, tight) == []
+    spent = {"main": {"upload": 0, "download": 10**12, "total": 10**11}}
+    assert status.budget_warnings(cfg, budget, spent) == ["квота подписки «main» исчерпана"]
+    summary = status.budget_summary(cfg, budget, {}, 5, 63)
+    assert summary["guessed"] is True
+    text = "\n".join(status.render_budget(summary))
+    assert "наугад: probe.url ещё не ответил ни разу" in text
+    # Размер измерен — предупреждение снова по делу.
+    measured = status.probe_budget(cfg, members=5, spares=63, size=65_536)
+    assert not measured.guessed and status.budget_warnings(cfg, measured, {})
+
+
 def test_budget_summary_shows_the_month_and_the_share_of_the_quota():
     cfg = Config()
     budget = status.probe_budget(cfg, members=5, spares=65)
@@ -266,7 +288,6 @@ def test_budget_summary_shows_the_month_and_the_share_of_the_quota():
     assert "Трафик проверок: ~920 МБ/сут" in text
     assert "~35.1 ГБ/мес" in text and "проба 57 620 Б (по оценке); участников — 5" in text
     assert "запасных — 65, скан раз в 60 мин" in text
-    text.encode("cp1251")  # в консоли и окне установщика Windows строка читается целиком
     assert "за месяц это ~18 % квоты подписки «main»" in text
     cfg.probe.max_daily_probe_mb = 500
     over = status.budget_summary(cfg, budget, quotas, 5, 65)
@@ -348,8 +369,7 @@ def test_status_shows_the_node_summary_and_the_probe_url_warning():
     assert "из отброшенных 2 — домен не разрешается" in line
     assert "отключено или убрано в панели: 3" in status.render_nodes({**summary, "excluded": 3})
 
-    warning = ("Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен "
-               "сам probe.url (HTTP 403)")
+    warning = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url (HTTP 403)"
     snapshot = {
         "daemon": True, "state": "PROBE_TARGET_UNREACHABLE", "action": "…", "since": None,
         "xray": {"ok": True, "version": "26.3.27"}, "members": [], "spares": [],

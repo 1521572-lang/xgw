@@ -162,11 +162,8 @@
       $("banner").hidden = true;
       render();
     } catch (error) {
-      // Панель открывают на той же машине, где работает XGW: по браузеру видно, где мы.
-      $("banner").textContent = "Нет связи с демоном XGW — пробую снова. Если так продолжается: " + (
-        navigator.userAgent.includes("Windows")
-          ? "откройте панель заново ярлыком «XGW» в меню «Пуск»"
-          : "sudo systemctl status xgw");
+      $("banner").textContent =
+        "Нет связи с демоном XGW — пробую снова. Если так продолжается: sudo systemctl status xgw";
       $("banner").hidden = false;
     }
   }
@@ -295,15 +292,22 @@
   }
 
   function scopeText(capture) {
-    // Windows: вместо перехвата — системный прокси, мимо него программы ходят напрямую.
-    if (capture.sysproxy) return "Браузеры и программы, которые смотрят на системный прокси, выходят через VPN";
-    if (capture.lan && capture.local) return `Эта машина и сеть ${capture.lan_if} выходят через VPN`;
-    if (capture.lan) return `Сеть ${capture.lan_if} выходит через VPN`;
-    return "Эта машина выходит через VPN";
+    // Контейнеры Docker — только когда Docker на машине есть и их перехват включён.
+    const docker = Boolean(capture.containers && capture.docker);
+    if (capture.lan && capture.local) {
+      const machine = docker ? "Эта машина, контейнеры Docker" : "Эта машина";
+      return `${machine} и сеть ${capture.lan_if} выходят через VPN`;
+    }
+    if (capture.lan) {
+      return docker
+        ? `Сеть ${capture.lan_if} и контейнеры Docker выходят через VPN`
+        : `Сеть ${capture.lan_if} выходит через VPN`;
+    }
+    return docker ? "Эта машина и контейнеры Docker выходят через VPN" : "Эта машина выходит через VPN";
   }
 
   function renderHero(s, stale) {
-    $("brand-note").textContent = s.capture.sysproxy ? "VPN-клиент" : "шлюз";
+    $("brand-note").textContent = "шлюз";
     const mode = s.capture.mode;
     const on = mode === "on";
     const [tone] = health(s, stale);
@@ -326,9 +330,7 @@
       } else if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
       else if (s.capture.loaded === false) {
         heroTone = "bad";
-        sub = s.capture.sysproxy
-          ? "Системный прокси Windows изменён не в XGW — демон сейчас вернёт его"
-          : "Правила сети не загружены — демон загрузит их заново";
+        sub = "Правила сети не загружены — демон загрузит их заново";
       }
     } else if (mode === "open") {
       title = "VPN временно снят";

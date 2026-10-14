@@ -187,6 +187,9 @@ def gateway(tmp_path, monkeypatch):
     kernel = FakeKernel()
     capture = Capture(cfg, paths, runner=kernel, proc_sys=proc, time_uids=())
     capture.kernel, capture.proc = kernel, proc
+    capture.sys_net = tmp_path / "sys-class-net"  # мостов Docker нет
+    # Контейнеры — в своих проверках ниже: здесь маршруты и правила только LAN и машины.
+    cfg.capture.containers = False
     return capture
 
 
@@ -342,9 +345,15 @@ def test_describe(gateway):
     gateway.enable()
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
-        "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "fail_mode": "closed",
-        "loaded": True, "inbound_missing": "",
+        "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
+        "docker": False, "fail_mode": "closed", "loaded": True, "inbound_missing": "",
     }
+    # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
+    gateway.cfg.capture.containers = True
+    assert gateway.describe(check=False)["docker"] is False
+    gateway.sys_net.mkdir()
+    (gateway.sys_net / "docker0").mkdir()
+    assert gateway.describe(check=False)["docker"] is True
 
 
 # --- TUN (capture.method = tun) -----------------------------------------------------
@@ -413,6 +422,9 @@ def test_pure_tun_does_not_ask_for_a_tproxy_inbound(gateway_tun):
     ]})
     assert gateway.inbound_problem() == ""
     assert gateway.enable() == "on" and gateway.loaded() is True
+    # Контейнеры идут в тот же TUN по метке: TPROXY им не нужен, tproxy-in — тоже.
+    gateway.cfg.capture.containers = True
+    assert gateway.inbound_problem() == ""
 
 
 def test_capture_is_not_loaded_when_the_tun_interface_did_not_appear(gateway_tun, monkeypatch):
@@ -427,6 +439,79 @@ def test_capture_is_not_loaded_when_the_tun_interface_did_not_appear(gateway_tun
     assert gateway.kernel.rules == [] and "tproxy" not in gateway.kernel.table
     # Причина видна и в статусе — той же строкой, что и отсутствие inbound'а.
     assert gateway.describe(check=False)["inbound_missing"] == gateway.held
+
+
+def test_tun_interface_goes_away_after_switching_back_to_tproxy(gateway_tun):
+    """capture.method вернули на tproxy: интерфейс xgwtun0 больше не нужен. Пока Xray ещё
+    работает с inbound'ом TUN, интерфейс остаётся (иначе Xray остался бы с оборванным
+    интерфейсом); после перезапуска Xray без него — убирается сам."""
+    gateway = gateway_tun
+    kernel = gateway.kernel
+    assert gateway.enable() == "on" and kernel.links == {"xgwtun0": "tun"}
+    gateway.cfg.capture.method = "tproxy"
+    assert gateway.up() == "on"
+    assert kernel.links == {"xgwtun0": "tun"}  # применённый конфиг Xray ещё с tun-in
+    assert gateway.tidy() == ""
+    fakexray.write(gateway.paths, fakexray.applied_config(tun=None))  # Xray перезапущен
+    assert gateway.tidy() == "интерфейс xgwtun0 убран: capture.method больше не tun"
+    assert kernel.links == {} and gateway.tidy() == ""
+    assert gateway.loaded() is True
+    # Чужой интерфейс с тем же именем (не TUN) не трогается.
+    kernel.links["xgwtun0"] = "dummy"
+    assert gateway.tidy() == "" and kernel.links == {"xgwtun0": "dummy"}
+
+
+# --- контейнеры Docker ----------------------------------------------------------------
+
+
+def test_containers_are_marked_and_routed_into_the_tun(gateway):
+    """Контейнеры Docker: метка mark_containers в цепочке containers и маршрут по ней в
+    таблицу TUN. Пока интерфейса TUN нет (Xray ещё без inbound'а TUN), маршрут ведёт в
+    чёрную дыру: контейнеры закрыты, а не выходят мимо VPN."""
+    gateway.cfg.capture.containers = True
+    kernel = gateway.kernel
+    assert gateway.enable() == "on"
+    assert "meta mark set 0x3" in kernel.table and 'iifname "docker0" goto containers' in (
+        kernel.table)
+    rule = next(r for r in kernel.rules if r["fwmark"] == "0x3")
+    assert rule["table"] == "101" and rule.get("iif") is None
+    routes = kernel.routes(101)
+    assert [route.get("type") for route in routes] == ["blackhole"]  # интерфейса ещё нет
+    assert gateway.loaded() is True
+    # Docker появился, Xray перезапущен с inbound'ом TUN — Applier создал интерфейс.
+    kernel("ip tuntap add dev xgwtun0 mode tun".split())
+    assert gateway.loaded() is False  # в интерфейс маршрута ещё нет
+    gateway.up()
+    assert {route.get("dev") for route in kernel.routes(101)} >= {"xgwtun0"}
+    assert gateway.loaded() is True
+    # Перехват снят — ни метки, ни маршрута.
+    assert gateway.disable() == "off"
+    assert "0x3" not in [r["fwmark"] for r in kernel.rules] and not kernel.routes(101)
+    assert gateway.loaded() is True
+    # Выключили в конфиге — лишний маршрут заметен.
+    assert gateway.enable() == "on"
+    gateway.cfg.capture.containers = False
+    assert gateway.loaded() is False
+    gateway.up()
+    assert "0x3" not in [r["fwmark"] for r in kernel.rules] and gateway.loaded() is True
+
+
+def test_containers_share_the_tun_table_with_the_machine(gateway_tun):
+    """capture.method = "tun": машина и контейнеры — в одной таблице TUN. Возврат машины на
+    TPROXY не убирает маршруты таблицы, пока они нужны контейнерам."""
+    gateway = gateway_tun
+    gateway.cfg.capture.containers = True
+    kernel = gateway.kernel
+    assert gateway.enable() == "on"
+    assert {(r["table"], r.get("iif"), r["fwmark"]) for r in kernel.rules} == {
+        ("101", "lo", "0x1"), ("100", None, "0x1"), ("101", None, "0x3")}
+    gateway.cfg.capture.method = "tproxy"
+    gateway.up()
+    assert {(r["table"], r.get("iif"), r["fwmark"]) for r in kernel.rules} == {
+        ("100", None, "0x1"), ("101", None, "0x3")}
+    types = {route.get("type") for route in kernel.routes(101)}
+    assert "blackhole" in types  # контейнерам таблица ещё нужна
+    assert gateway.loaded() is True
 
 
 def test_capture_inbounds_lists_everything_the_rules_depend_on():
@@ -446,11 +531,6 @@ def test_capture_inbounds_lists_everything_the_rules_depend_on():
     moved = {"inbounds": [{**tproxy, "port": 12346}, tun_in]}
     assert capture_inbounds(moved) != capture_inbounds(config)
     assert capture_inbounds({"inbounds": [tun_in, tproxy]}) == capture_inbounds(config)
-    # Windows: системный прокси указывает на http-in.
-    assert capture_inbounds(config, sysproxy=True) == capture_inbounds(
-        {"inbounds": [http]}, sysproxy=True)
-    assert capture_inbounds({"inbounds": [{**http, "port": 10819}]}, sysproxy=True) != (
-        capture_inbounds(config, sysproxy=True))
 
 
 def test_tun_machine_only_has_no_tproxy_rule_or_table(gateway_tun):

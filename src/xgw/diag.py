@@ -200,9 +200,9 @@ class Diag:
             required.append("nmcli")
         missing = [name for name in required if self.which(name) is None]
         later = [] if self.which("nft") is not None else ["nftables"]
-        # Нужен пакет dnsmasq со службой, а не только программа из dnsmasq-base.
-        if self.lan_if and not self._has_unit(dnsmasq.UNIT):
-            later.append("dnsmasq")
+        # DHCP раздаёт своя служба xgw-dhcp: нужна только программа из dnsmasq-base.
+        if self.lan_if and self.which("dnsmasq") is None:
+            later.append(dnsmasq.PACKAGE)
         if missing:
             return [Check(
                 "Программы", FAIL, "не найдены: " + ", ".join(missing),
@@ -215,13 +215,6 @@ class Diag:
             )]
         return [Check("Программы", OK, "nft, ip, systemctl" + (
             ", nmcli, dnsmasq" if self.lan_if else "") + " на месте")]
-
-    def _has_unit(self, unit: str) -> bool:
-        return any(
-            (self.paths.root / directory / unit).exists()
-            for directory in ("usr/lib/systemd/system", "lib/systemd/system",
-                              "etc/systemd/system")
-        )
 
     # --- Xray -------------------------------------------------------------------
 
@@ -396,8 +389,20 @@ class Diag:
                 "XGW пропадут, пока демон не вернёт их (до одного шага watchdog)",
                 "если своих правил в /etc/nftables.conf нет: sudo systemctl disable nftables",
             ))
+        containers = self.cfg.capture.containers and (
+            self.cfg.capture.lan or self.cfg.capture.local)
+        has_docker = docker or bool(lan.container_links(nft.CONTAINER_IFS))
+        if has_docker and not containers and (self.cfg.capture.lan or self.cfg.capture.local):
+            result.append(Check(
+                "Docker", WARN,
+                "контейнеры выходят в интернет мимо VPN: capture.containers = false",
+                "впишите capture.containers = true в /etc/xgw/config.toml",
+            ))
         if not result:
-            result.append(Check("Файрвол", OK, "ufw и Docker перехвату не мешают"))
+            text = "ufw и Docker перехвату не мешают"
+            if has_docker and containers:
+                text += "; контейнеры Docker — через VPN"
+            result.append(Check("Файрвол", OK, text))
         return result
 
     def _ufw(self, wan_if: str) -> Check:
@@ -701,6 +706,11 @@ class Diag:
             f"~{month:.0f} ГБ в месяц (проба {budget.size} Б, "
             f"{'измерено' if budget.measured else 'по оценке'})"
         )
+        if budget.guessed:
+            text += (
+                "; размер пробы пока неизвестен — probe.url ещё не ответил ни разу, цифра "
+                "уточнится после первой удачной проверки"
+            )
         for name, share in status.quota_share(budget, quotas).items():
             text += f"; за месяц это ~{share:.0f} % квоты подписки «{name}»"
         warnings = status.budget_warnings(self.cfg, budget, quotas)

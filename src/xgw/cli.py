@@ -4,8 +4,7 @@
 Этап 2: apply, status, servers, probe, pin/unpin и run (демон xgw.service).
 Этап 3: enable, disable и net — перехват трафика (nftables, ip rule).
 Этап 4: install, uninstall, diag, update-xray и logs — установка на машину.
-Сверх ТЗ: panel — ссылка на панель управления (графический интерфейс в браузере);
-в Windows — start, stop и winsetup (их вызывает установщик) вместо install и systemd.
+Сверх ТЗ: panel — ссылка на панель управления (графический интерфейс в браузере).
 """
 
 from __future__ import annotations
@@ -37,34 +36,10 @@ from .xraycore.api import ApiError
 
 MAX_PIN_SECONDS = actions.MAX_PIN_SECONDS
 # Команды, которые работают и без читаемого config.toml.
-NO_CONFIG = frozenset({"install", "uninstall", "diag", "logs", "start", "stop", "winsetup"})
-WINDOWS = os.name == "nt"
-
-
-def _tolerant_output() -> None:
-    """Windows: вывод не в консоль (в файл, в другую программу) идёт в кодировке
-    системы, а в ней нет, например, флагов из имён серверов. Такой знак заменяется
-    вопросом — команда не должна обрываться ошибкой кодировки."""
-    for stream in (sys.stdout, sys.stderr):
-        if stream is not None and hasattr(stream, "reconfigure") and not stream.isatty():
-            stream.reconfigure(errors="replace")
-
-
-def _ansi_output() -> None:
-    """Вывод шагов установщика (`xgw winsetup`) читает сам установщик — в кодировке
-    ANSI системы, и показывает в своём окне. Кодировка задаётся явно: переменная
-    PYTHONIOENCODING или PYTHONUTF8 в окружении пользователя иначе превратила бы
-    русский текст в окне установки в кашу. Подменённые потоки (тесты) не трогаются."""
-    if os.name != "nt":
-        return
-    for stream, original in ((sys.stdout, sys.__stdout__), (sys.stderr, sys.__stderr__)):
-        if stream is not None and stream is original and not stream.isatty():
-            stream.reconfigure(encoding="mbcs", errors="replace")
+NO_CONFIG = frozenset({"install", "uninstall", "diag", "logs"})
 
 
 def main(argv: list[str] | None = None) -> int:
-    if WINDOWS:
-        _tolerant_output()
     parser = argparse.ArgumentParser(
         prog="xgw", description="XGW — шлюз на Xray-core для Ubuntu 26.04"
     )
@@ -127,10 +102,6 @@ def main(argv: list[str] | None = None) -> int:
 
     run = subparsers.add_parser("run", parents=[common], help="демон XGW (служба xgw.service)")
     run.add_argument("--once", action="store_true", help="выполнить один шаг watchdog и выйти")
-    run.add_argument(
-        "--log-file", action="store_true",
-        help="писать журнал в файл (так запускается демон в Windows: окна и stderr у него нет)",
-    )
 
     install = subparsers.add_parser(
         "install", parents=[common],
@@ -171,41 +142,21 @@ def main(argv: list[str] | None = None) -> int:
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
     )
-    if WINDOWS:
-        subparsers.add_parser("start", parents=[common], help="запустить XGW (демон без окна)")
-        subparsers.add_parser("stop", parents=[common], help="остановить XGW и Xray")
-        winsetup = subparsers.add_parser(
-            "winsetup", parents=[common],
-            help="шаги установщика Windows: после копирования файлов и перед удалением",
-        )
-        winsetup.add_argument("action", choices=("install", "uninstall"))
-        winsetup.add_argument("--no-start", action="store_true", help="не запускать демон")
-        winsetup.add_argument(
-            "--no-autostart", action="store_true", help="не включать автозапуск при входе"
-        )
-        winsetup.add_argument(
-            "--purge", action="store_true", help="при удалении стереть настройки и подписки"
-        )
 
     args = parser.parse_args(argv)
-    if args.command == "winsetup":
-        _ansi_output()
     paths = Paths.from_env()
-    if args.command == "panel" and args.login and not WINDOWS and not desktop.is_root():
+    if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
         # прочитать, — та же команда от root через pkexec.
         return _panel_login_hop(paths)
-    # Демон в Windows пишет журнал в файл: journald там нет, а у процесса без окна
-    # (pythonw) нет и stderr. Остальные команды печатают в терминал.
-    to_file = args.command == "run" and (args.log_file or paths.windows or sys.stderr is None)
-    log.setup(file=paths.log_file if to_file else None)
+    log.setup()
     config_path = Path(args.config) if args.config else paths.config_file
     args.config_path, args.config_error = config_path, ""
     try:
         cfg, warnings = config.load(config_path)
     except config.ConfigError as exc:
         if args.command not in NO_CONFIG:
-            return _fail(str(exc), 2, window=bool(getattr(args, "open", False)))
+            return _fail(str(exc), 2)
         cfg, warnings, args.config_error = config.Config(), [], str(exc)
     args.config_warnings = warnings
     logger = log.get_logger(args.command)
@@ -232,9 +183,6 @@ def main(argv: list[str] | None = None) -> int:
         "update-xray": _cmd_update_xray,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
-        "start": _cmd_start,
-        "stop": _cmd_stop,
-        "winsetup": _cmd_winsetup,
     }[args.command]
     try:
         return handler(args, cfg, paths, logger)
@@ -243,15 +191,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _fail(message: str, code: int = 1, *, window: bool = False) -> int:
-    """window — команду мог запустить ярлык Windows: у процесса без окна консоли
-    печатать некуда, и о сбое говорит окно с сообщением."""
+def _fail(message: str, code: int = 1) -> int:
     print(f"ошибка: {message}", file=sys.stderr)
-    if window and WINDOWS:
-        from . import winapp
-
-        if winapp.windowless():
-            winapp.alert(message)
     return code
 
 
@@ -378,10 +319,32 @@ def _restore_pin(paths: Paths, api, logger) -> None:
 # --- status / servers ----------------------------------------------------------
 
 
+DAEMON_DOWN_EXIT = 3  # как у `systemctl is-active` и LSB status: служба не работает
+
+
+def _daemon_down(paths: Paths, runner: cmd.Runner | None = None) -> bool:
+    """Демон установлен службой systemd, но она не работает: watchdog, замена серверов,
+    события и уведомления стоят. Без установки спрашивать некого — False."""
+    if not (paths.systemd_dir / "xgw.service").exists():
+        return False
+    try:
+        state = (runner or cmd.run)(
+            ["systemctl", "is-active", "xgw.service"], check=False, timeout=10.0
+        )
+    except cmd.CommandError as exc:
+        log.get_logger("cli").debug("состояние службы xgw не узнать: %s", exc)
+        return False
+    return state.strip() not in ("active", "activating", "reloading")
+
+
 def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
-    """Статус демона, если он свежий; иначе разовый снимок без машины состояний."""
+    """Статус демона, если он свежий; иначе разовый снимок без машины состояний.
+
+    Служба демона остановлена — файл статуса не в счёт, даже свежий: он описывает
+    наблюдение, которого больше нет."""
     max_age = max(3.0 * cfg.watchdog.interval_s, 180.0)
-    snapshot = status.read_status(paths, max_age)
+    down = _daemon_down(paths)
+    snapshot = None if down else status.read_status(paths, max_age)
     applied = engine.read_json(paths.xray_config_file)
     if snapshot is None:
         if applied is None:
@@ -396,6 +359,7 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
             observatory=observatory, xray_ok=observatory is not None,
             xray_version=".".join(map(str, version or ())),
         )
+    snapshot["daemon_down"] = down
     # Закрепление, перехват и текущий выбор балансировщика — на момент вывода, а
     # не последнего шага демона.
     snapshot["pin"] = _active_pin(paths)
@@ -418,9 +382,10 @@ def _cmd_status(args, cfg: config.Config, paths: Paths, logger) -> int:
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
     elif args.command == "servers":
         print(status.render_servers(snapshot))
+        return 0
     else:
         print(status.render_status(snapshot))
-    return 0
+    return DAEMON_DOWN_EXIT if snapshot.get("daemon_down") else 0
 
 
 # --- probe ---------------------------------------------------------------------
@@ -455,11 +420,12 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
             )
     if len(view) == 1:
         return 0 if results[0].verdict in ("OK", "SLOW") else 1
-    common = target.uniform(results)
+    common = target.dominant(results)
     if common:
-        # Одна и та же ошибка у всех — чаще это адрес пробы, чем все серверы разом.
+        # Ни один сервер не получил probe.url, и почти у всех одна ошибка — чаще это адрес
+        # пробы, чем все серверы разом.
         print(
-            f"Внимание: {target.WARNING} ({common} у всех {len(results)} серверов). "
+            f"Внимание: {target.WARNING} ({common}). "
             "Что именно не отвечает, покажет sudo xgw diag",
             file=sys.stderr,
         )
@@ -512,37 +478,7 @@ def _cmd_disable(args, cfg: config.Config, paths: Paths, logger) -> int:
     return _emit(actions.disable(cfg, paths, capture_for(cfg, paths, logger=logger)))
 
 
-def _net_sysproxy(args, cfg: config.Config, paths: Paths, logger) -> int:
-    """`xgw net` в Windows: вместо правил ядра — системный прокси пользователя."""
-    from .net import winproxy
-
-    capture = capture_for(cfg, paths, logger=logger)
-    try:
-        if args.action == "show":
-            current = winproxy.read(capture.registry)
-            print(f"прокси XGW: {capture.describe(check=False)['proxy']}")
-            print("системный прокси сейчас: " + (
-                f"PAC-файл {current.autoconfig}" if current.autoconfig
-                else current.server if current.enable and current.server else "не задан"
-            ))
-            print(status.render_capture(capture.describe()))
-            return 0
-        paths.ensure()
-        if args.action == "down":
-            capture.down()
-            print("системный прокси возвращён к настройкам до XGW")
-            return 0
-        capture.up()
-    except (winproxy.ProxyError, CaptureError) as exc:
-        return _fail(f"системный прокси: {exc}")
-    print(status.render_capture(capture.describe()))
-    return 0
-
-
 def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
-    if cfg.capture.sysproxy:
-        problem = _root_problem(cfg)
-        return _fail(problem) if problem else _net_sysproxy(args, cfg, paths, logger)
     capture = capture_for(cfg, paths, logger=logger)
     if args.action == "show":
         if args.what == "dnsmasq":
@@ -609,7 +545,6 @@ def _sync_panel(
                 cfg, paths, config_path,
                 capture_factory=lambda *args, **kwargs: capture_for(*args, **kwargs),
             )
-            # Права зависят от способа: системному прокси Windows root не нужен.
             panel.root_problem = lambda panel=panel: _root_problem(panel.cfg)
             panel.start()
         except OSError as exc:
@@ -647,18 +582,6 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     for name in ("SIGTERM", "SIGINT"):
         with contextlib.suppress(ValueError, AttributeError):  # не главный поток / нет сигнала
             signal.signal(getattr(signal, name), lambda *_args: stop.set())
-
-    guard = None
-    if WINDOWS and not args.once:
-        # Того, что в Linux делает systemd: один экземпляр и остановка по просьбе.
-        from . import winapp
-
-        guard = winapp.DaemonGuard(paths)
-        if not guard.acquire():
-            print("демон XGW уже запущен")
-            return 0
-        winapp.prepare_xray(paths, logger)
-        guard.watch(stop)
 
     reloaded = False
     previous = None
@@ -727,8 +650,6 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             panel.stop()
         if bot is not None:
             bot.stop()
-        if guard is not None:
-            guard.release()
 
 
 # --- install / uninstall / diag / update-xray / logs ----------------------------
@@ -742,13 +663,6 @@ def _system_root_problem(paths: Paths) -> str | None:
 def _run_diag(args, cfg: config.Config, paths: Paths, logger, *, net: bool = True) -> list:
     from .diag import Diag
 
-    if WINDOWS and (paths.windows or cfg.capture.sysproxy):
-        from .windiag import WinDiag
-
-        return WinDiag(
-            cfg, paths, logger=logger, net=net,
-            config_error=args.config_error, config_warnings=args.config_warnings,
-        ).run()
     return Diag(
         cfg, paths, logger=logger, net=net,
         config_error=args.config_error, config_warnings=args.config_warnings,
@@ -771,11 +685,6 @@ def _cmd_install(args, cfg: config.Config, paths: Paths, logger) -> int:
     from . import diag
     from .install import SOURCE_ROOT, Installer, choose_lan, set_lan_if
 
-    if paths.windows:
-        return _fail(
-            "эта команда ставит шлюз в Ubuntu. В Windows XGW ставится установщиком "
-            "XGW-Setup.exe и работает как VPN-клиент этой машины"
-        )
     problem = _root_problem()
     if problem:
         return _fail(problem)
@@ -826,11 +735,6 @@ def _cmd_uninstall(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .install import default_ask
     from .uninstall import Uninstaller
 
-    if paths.windows:
-        return _fail(
-            "в Windows XGW удаляется через «Параметры → Приложения → Установленные "
-            "приложения» (или ярлыком «Удалить XGW»)"
-        )
     problem = _root_problem()
     if problem:
         return _fail(problem)
@@ -919,24 +823,11 @@ def _panel_login(cfg: config.Config, paths: Paths) -> int:
 
 
 def _open_panel(cfg: config.Config, paths: Paths, url: str) -> int:
-    """`xgw panel --open` — так панель открывает ярлык. В Windows ярлык запускается
-    без окна консоли, поэтому о сбое говорит окно с сообщением, а не строка в терминале;
-    если XGW не запущен, ярлык сначала запускает его."""
-    def fail(text: str) -> int:
-        return _fail(text, window=True)
-
-    if WINDOWS:
-        from . import winapp
-
-        try:
-            if not winapp.start_daemon(paths):
-                return fail(f"XGW не запустился — подробности в журнале {paths.log_file}")
-        except winapp.WinAppError as exc:
-            return fail(str(exc))
+    """`xgw panel --open` — открыть панель в браузере этой машины."""
     if not _panel_answers(cfg.panel.port):
-        return fail(_panel_silent(cfg.panel.port))
+        return _fail(_panel_silent(cfg.panel.port))
     if not webbrowser.open(url):
-        return fail(f"браузер не открылся — откройте сами: {url}")
+        return _fail(f"браузер не открылся — откройте сами: {url}")
     return 0
 
 
@@ -944,18 +835,14 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .watch import panel
 
     if not cfg.panel.enabled:
-        return _fail(
-            "панель выключена: [panel] enabled = false в config.toml", 2, window=args.open
-        )
+        return _fail("панель выключена: [panel] enabled = false в config.toml", 2)
     if args.login:
-        if WINDOWS:
-            return _fail("--login — для Ubuntu; в Windows панель открывает ярлык «XGW»", 2)
         return _panel_login(cfg, paths)
     token = panel.read_token(paths)
     if not token:
         problem = _system_root_problem(paths)
         if problem:
-            return _fail(problem, window=args.open)
+            return _fail(problem)
         token = panel.ensure_token(paths)
     url = f"{panel.address(cfg)}?token={token}"
     if args.open:
@@ -966,54 +853,6 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
         "открывается ярлыком «XGW» или адресом без токена."
     )
     return 0
-
-
-# --- Windows: запуск, остановка, шаги установщика -----------------------------------
-
-
-def _cmd_start(args, cfg: config.Config, paths: Paths, logger) -> int:
-    from . import winapp
-
-    if winapp.daemon_running(paths):
-        print("XGW уже запущен")
-        return 0
-    try:
-        running = winapp.start_daemon(paths)
-    except winapp.WinAppError as exc:
-        return _fail(str(exc))
-    if not running:
-        return _fail(f"демон XGW не запустился — см. xgw logs ({paths.log_file})")
-    print("XGW запущен")
-    return 0
-
-
-def _cmd_stop(args, cfg: config.Config, paths: Paths, logger) -> int:
-    from . import winapp
-
-    try:
-        print(winapp.stop_daemon(paths))
-        print(winapp.stop_xray(paths))
-    except (winapp.WinAppError, OSError) as exc:
-        return _fail(str(exc))
-    if not args.config_error and cfg.capture.sysproxy and (
-        capture_for(cfg, paths, logger=logger).mode() == "on"
-    ):
-        print(
-            "внимание: VPN включён — системный прокси по-прежнему указывает на XGW, и "
-            "программы, идущие через него, останутся без интернета до запуска XGW.\n"
-            "Вернуть прямой интернет: xgw disable; запустить XGW снова: xgw start"
-        )
-    return 0
-
-
-def _cmd_winsetup(args, cfg: config.Config, paths: Paths, logger) -> int:
-    from . import winapp
-
-    if args.action == "install":
-        return winapp.install(
-            paths, start=not args.no_start, with_autostart=not args.no_autostart
-        )
-    return winapp.uninstall(paths, purge=args.purge)
 
 
 def _cmd_logs(args, cfg: config.Config, paths: Paths, logger) -> int:

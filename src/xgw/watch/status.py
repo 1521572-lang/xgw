@@ -36,6 +36,10 @@ class Budget:
 
     size: int = DEFAULT_PROBE_BYTES  # размер одной пробы, от которого всё посчитано
     measured: bool = False  # размер измерен сквозной проверкой, а не взят по умолчанию
+    # Размер не известен ничем — ни измерением, ни URL, ни файлом по умолчанию — и взят
+    # наугад (64 КиБ). Так бывает, пока probe.url не ответил ни разу: советовать по такой
+    # цифре урезать проверки нельзя.
+    guessed: bool = False
 
     @property
     def total(self) -> int:
@@ -69,7 +73,8 @@ def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
     незнакомого адреса — 64 КиБ."""
     measured = bool(size)
-    size = size or probe_bytes(cfg.probe.url) or DEFAULT_PROBE_BYTES
+    known = size or probe_bytes(cfg.probe.url)
+    size = known or DEFAULT_PROBE_BYTES
     interval = parse_seconds(cfg.probe.interval) or 30
     scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
     return Budget(
@@ -78,6 +83,7 @@ def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None
         e2e=int(size * 86400 / max(1, cfg.watchdog.interval_s)),
         size=size,
         measured=measured,
+        guessed=not known,
     )
 
 
@@ -107,6 +113,7 @@ def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]
         "over": budget.total / MB > cfg.probe.max_daily_probe_mb,
         "probe_bytes": budget.size,
         "measured": budget.measured,
+        "guessed": budget.guessed,
         "members": members,
         "spares": spares,
         "interval_s": parse_seconds(cfg.probe.interval) or 30,
@@ -117,10 +124,14 @@ def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]
 
 
 def budget_warnings(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]]) -> list[str]:
-    """Превышение max_daily_probe_mb или 10 % остатка квоты подписки."""
+    """Превышение max_daily_probe_mb или 10 % остатка квоты подписки, исчерпанная квота.
+
+    Размер пробы взят наугад (budget.guessed) — о расходе не предупреждаем: цифра ни о
+    чём не говорит, а совет урезать проверки, пока probe.url не ответил, только навредил
+    бы. Исчерпанная квота от размера пробы не зависит — о ней сказано всегда."""
     warnings: list[str] = []
     daily_mb = budget.total / MB
-    if daily_mb > cfg.probe.max_daily_probe_mb:
+    if daily_mb > cfg.probe.max_daily_probe_mb and not budget.guessed:
         warnings.append(
             f"трафик проверок ~{daily_mb:.0f} МБ/сут больше лимита "
             f"{cfg.probe.max_daily_probe_mb} МБ — уменьшите max_members или увеличьте interval"
@@ -132,7 +143,7 @@ def budget_warnings(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int
         left = total - quota.get("upload", 0) - quota.get("download", 0)
         if left <= 0:
             warnings.append(f"квота подписки «{name}» исчерпана")
-        elif budget.total > left * 0.10:
+        elif budget.total > left * 0.10 and not budget.guessed:
             warnings.append(
                 f"трафик проверок ~{daily_mb:.0f} МБ/сут — больше 10 % остатка квоты "
                 f"подписки «{name}» ({left / MB:.0f} МБ)"
@@ -325,29 +336,16 @@ def render_servers(status: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_sysproxy(capture: dict) -> str:
-    """То же для Windows: вместо перехвата — системный прокси пользователя."""
-    mode = capture.get("mode")
-    if mode == "none":
-        return "VPN: выключен в конфиге (capture.local = false) — XGW только управляет Xray"
-    if mode == "off":
-        return "VPN: ВЫКЛЮЧЕН — системный прокси не тронут, трафик идёт напрямую"
-    if mode == "open":
-        return (
-            "VPN: ВРЕМЕННО ВЫКЛЮЧЕН — Xray недоступен, fail_mode = open; "
-            "трафик идёт напрямую, мимо VPN"
-        )
-    text = f"VPN: включён — системный прокси Windows {capture.get('proxy', '')}".rstrip()
-    if capture.get("loaded") is False:
-        text += " — ПРОКСИ ИЗМЕНЁН НЕ XGW (вернётся на ближайшем шаге; сразу — xgw enable)"
-    return text
+def join_ru(items: list[str]) -> str:
+    """«a», «a и b», «a, b и c»."""
+    if len(items) <= 2:
+        return " и ".join(items)
+    return ", ".join(items[:-1]) + " и " + items[-1]
 
 
 def render_capture(capture: dict) -> str:
     """Строка о перехвате: что через Xray, что мимо, загружены ли правила."""
     mode = capture.get("mode")
-    if capture.get("sysproxy"):
-        return _render_sysproxy(capture)
     if mode == "none":
         return "Перехват: выключен в конфиге — XGW только управляет Xray"
     if mode == "off":
@@ -371,7 +369,9 @@ def render_capture(capture: dict) -> str:
             "эта машина" + (" через TUN" if capture.get("tun") else "")
             + (" с IPv6" if capture.get("ipv6") else "")
         )
-    text = "Перехват: включён — " + " и ".join(scope)
+    if capture.get("containers") and capture.get("docker"):
+        scope.append("контейнеры Docker")
+    text = "Перехват: включён — " + join_ru(scope)
     if capture.get("bypass"):
         text += "; мимо VPN: " + ", ".join(capture["bypass"])
     if capture.get("loaded") is False:
@@ -421,7 +421,8 @@ def render_budget(budget: dict) -> list[str]:
     if "month_gb" in budget:
         size = _thousands(int(budget.get("probe_bytes") or 0))
         origin = "измерено" if budget.get("measured") else "по оценке"
-        # Без знаков вне кодовой страницы Windows: вывод читают и из окна установщика.
+        if budget.get("guessed"):
+            origin = "наугад: probe.url ещё не ответил ни разу"
         lines.append(
             f"  всего ~{budget['all_mb']:.0f} МБ/сут, ~{budget['month_gb']:.1f} ГБ/мес: проба "
             f"{size} Б ({origin}); участников — {budget.get('members', 0)}, проба раз в "
@@ -436,7 +437,13 @@ def render_budget(budget: dict) -> list[str]:
 
 def render_status(status: dict) -> str:
     lines: list[str] = []
-    if status.get("daemon") and status.get("state"):
+    if status.get("daemon_down"):
+        lines.append(
+            "Состояние: СЛУЖБА xgw НЕ РАБОТАЕТ — наблюдение остановлено: серверы не "
+            "меняются, событий и уведомлений нет (запустить: sudo systemctl start xgw); "
+            "ниже — разовые данные"
+        )
+    elif status.get("daemon") and status.get("state"):
         since = status.get("since")
         tail = f" с {_clock(since)}" if since else ""
         lines.append(f"Состояние: {status['state']}{tail} — {status.get('action') or 'ничего'}")

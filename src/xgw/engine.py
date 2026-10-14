@@ -19,9 +19,11 @@ from . import config, fetch, log, marknet, masking
 from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
 from .model import ServerNode, raw_to_node
+from .net import lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
 from .store import Store, SubscriptionCache
+from .watch import target
 from .xraycore.api import ApiClient
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
 
@@ -227,6 +229,12 @@ def _load_subscription(
     return raws, cached.userinfo, error
 
 
+def containers_tun(cfg: config.Config) -> bool:
+    """Нужен ли в конфиге Xray inbound TUN для контейнеров Docker: их перехват включён, и
+    Docker на машине есть (его мост уже создан). Без Docker интерфейса TUN не будет вовсе."""
+    return nft.containers_wanted(cfg) and bool(lan.container_links(nft.CONTAINER_IFS))
+
+
 def read_json(path: Path) -> dict | None:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -287,6 +295,8 @@ def assemble(
             result = builder.build(
                 cfg, selection, hosts=hosts,
                 probe_password=probe_password, probe_ports=probe_ports,
+                probe_url=target.observatory_url(cfg, paths),
+                containers_tun=containers_tun(cfg),
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
@@ -465,8 +475,8 @@ def make_api(cfg: config.Config, xray_bin: Path) -> ApiClient:
 
 def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
     """systemd-юнит xgw-xray.service; там, где юнита нет (стенд до этапа 4 —
-    XGW_XRAY_SERVICE=process — и Windows), — обычный процесс с pid-файлом."""
-    if os.environ.get("XGW_XRAY_SERVICE") == "process" or os.name == "nt":
+    XGW_XRAY_SERVICE=process), — обычный процесс с pid-файлом."""
+    if os.environ.get("XGW_XRAY_SERVICE") == "process":
         return PidfileXrayService(
             xray_bin or paths.xray_bin, paths.xray_config_file, paths.run / "xray.pid"
         )

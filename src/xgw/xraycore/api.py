@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import masking
-from ..net.cmd import HIDDEN
 
 
 class ApiError(Exception):
@@ -95,7 +94,7 @@ class ApiClient:
                 argv.append(str(tmp))
             try:
                 proc = subprocess.run(
-                    argv, capture_output=True, text=True, timeout=self.timeout + 5, **HIDDEN
+                    argv, capture_output=True, text=True, timeout=self.timeout + 5
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ApiError(f"таймаут xray api {command}") from exc

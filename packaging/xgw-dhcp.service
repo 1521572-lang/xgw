@@ -1,0 +1,20 @@
+# XGW: DHCP в сети LAN — свой экземпляр dnsmasq со своим конфигом.
+# Не штатная служба dnsmasq.service: её каталог /etc/dnsmasq.d делят все пакеты, и
+# чужая строка там (bind-interfaces из пакета ubuntu-fan, который ставится вместе с
+# Docker) не давала dnsmasq запуститься вовсе. Здесь читается только /etc/xgw/dnsmasq.conf;
+# программа — из пакета dnsmasq-base (он же нужен NetworkManager), DNS в ней выключен.
+[Unit]
+Description=XGW: DHCP в сети LAN (dnsmasq)
+Documentation=https://github.com/1521572-lang/xgw
+After=network.target xgw-net.service
+ConditionPathExists=/etc/xgw/dnsmasq.conf
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/xgw/dnsmasq.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=xgw-dhcp
+
+[Install]
+WantedBy=multi-user.target

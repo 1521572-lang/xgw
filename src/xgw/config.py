@@ -69,21 +69,20 @@ class Capture:
     mark_proxy: int = 1
     mark_bypass: int = 2
     route_table: int = 100
-    # Как трафик самой машины попадает в Xray: tproxy | tun (Linux) | sysproxy (Windows).
+    # Как трафик самой машины попадает в Xray: tproxy | tun.
     method: str = "tproxy"
     tun_name: str = "xgwtun0"
     tun_route_table: int = 101  # своя таблица маршрутов в TUN (route_table занят TPROXY LAN)
+    # Трафик контейнеров Docker (мосты docker0 и br-*) — тоже через Xray: по метке
+    # mark_containers он уходит в TUN-интерфейс tun_name (см. net/nft.py).
+    containers: bool = True
+    mark_containers: int = 3
 
     @property
     def tun(self) -> bool:
         """Трафик самой машины идёт в Xray через TUN. Неизвестное слово — tproxy."""
         return self.method.strip().lower() == "tun"
 
-    @property
-    def sysproxy(self) -> bool:
-        """Windows: вместо перехвата — системный прокси пользователя, указывающий на
-        http-in Xray. Правил ядра и прозрачных inbound-ов в этом режиме нет."""
-        return self.method.strip().lower() == "sysproxy"
 
 
 @dataclass
@@ -457,7 +456,7 @@ def _validate(cfg: Config) -> list[str]:
             f"используется {Network().lan_address}"
         )
         cfg.network.lan_address = Network().lan_address
-    for name in ("mark_proxy", "mark_bypass"):
+    for name in ("mark_proxy", "mark_bypass", "mark_containers"):
         # Метка 0 — это «без метки»: правила перехвата с ней не работают.
         if not 1 <= getattr(cfg.capture, name) <= 0xFFFFFFFF:
             default = getattr(Capture(), name)
@@ -475,6 +474,12 @@ def _validate(cfg: Config) -> list[str]:
         cfg.capture.route_table = Capture().route_table
     if cfg.capture.mark_proxy == cfg.capture.mark_bypass:
         warnings.append("capture.mark_proxy и capture.mark_bypass совпадают")
+    if cfg.capture.mark_containers in (cfg.capture.mark_proxy, cfg.capture.mark_bypass):
+        warnings.append(
+            "capture.mark_containers совпадает с mark_proxy или mark_bypass — используется "
+            f"{Capture().mark_containers}"
+        )
+        cfg.capture.mark_containers = Capture().mark_containers
     if (
         not 1 <= cfg.capture.tun_route_table <= 0x7FFFFFFF
         or cfg.capture.tun_route_table in (253, 254, 255, cfg.capture.route_table)
@@ -484,17 +489,10 @@ def _validate(cfg: Config) -> list[str]:
             f"не 253–255 и не route_table — используется {Capture().tun_route_table}"
         )
         cfg.capture.tun_route_table = Capture().tun_route_table
-    if cfg.capture.method.strip().lower() not in ("tproxy", "tun", "sysproxy"):
+    if cfg.capture.method.strip().lower() not in ("tproxy", "tun"):
         warnings.append(
-            f"capture.method={cfg.capture.method!r}: допустимо tproxy или tun "
-            "(в Windows — sysproxy); принято tproxy"
+            f"capture.method={cfg.capture.method!r}: допустимо tproxy или tun; принято tproxy"
         )
-    elif cfg.capture.sysproxy and os.name != "nt":
-        warnings.append(
-            "capture.method = sysproxy — системный прокси Windows, на этой системе его нет; "
-            "принято tproxy"
-        )
-        cfg.capture.method = Capture().method
     elif cfg.capture.tun and not cfg.capture.local:
         warnings.append(
             "capture.method = tun относится к трафику самой машины: при capture.local = false "

@@ -19,6 +19,15 @@ TUN (capture.method = "tun") — пакеты самой машины уходя
 его создаёт XGW), пакеты идут в него и без читающего Xray отбрасываются; если же
 интерфейса не стало, помеченные пакеты не уходят мимо VPN, а пропадают.
 
+Контейнеры Docker (capture.containers) — их пакеты, помеченные mark_containers, идут
+через ту же таблицу TUN, только без `iif lo` (они приходят с мостов Docker):
+
+    ip rule add fwmark <mark_containers> lookup <tun_route_table> pref 95
+
+Маршрут в интерфейс — когда интерфейс есть; чёрная дыра — всегда: пока Xray не
+перезапущен с inbound'ом TUN (Docker только что появился), контейнеры закрыты, а не
+выходят мимо VPN.
+
 Для IPv6 (network.ipv6 = "proxy") то же с `ip -6` и `::/0`; таблицы маршрутизации у
 семейств отдельные, номера одни и те же.
 
@@ -33,6 +42,7 @@ from .cmd import CommandError, Runner
 
 PREF = 100
 PREF_TUN = 90
+PREF_CONTAINERS = 95
 BLACKHOLE_METRIC = 4096
 ANYWHERE = {4: "0.0.0.0/0", 6: "::/0"}
 
@@ -160,14 +170,61 @@ def ensure_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> 
             "table", str(table)])
 
 
-def remove_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> None:
+def remove_tun(
+    mark: int, table: int, runner: Runner, family: int, dev: str, *, keep_routes: bool = False
+) -> None:
     """Убирает правило для TUN, маршрут в интерфейс dev и чёрную дыру; чужие маршруты в
-    таблице и отсутствующее не трогает."""
-    ip = _ip(family)
+    таблице и отсутствующее не трогает. keep_routes — таблица ещё нужна контейнерам:
+    убирается только правило."""
     _del_rules(mark, table, runner, family, "lo")
+    if not keep_routes:
+        _del_tun_routes(table, runner, family, dev)
+
+
+def _del_tun_routes(table: int, runner: Runner, family: int, dev: str) -> None:
+    ip = _ip(family)
     for route in _routes(table, runner, family):
         if _is_blackhole(route, family):
             runner([*ip, "route", "del", "blackhole", "default", "metric",
                     str(route.get("metric", BLACKHOLE_METRIC)), "table", str(table)])
         elif _is_tun(route, family, dev):
             runner([*ip, "route", "del", "default", "dev", dev, "table", str(table)])
+
+
+# --- контейнеры Docker: по метке в TUN -------------------------------------------
+
+
+def present_containers(mark: int, table: int, runner: Runner, dev: str | None) -> bool:
+    """Правило для контейнеров и чёрная дыра на месте; dev — интерфейс TUN, если он есть
+    (тогда нужен и маршрут в него)."""
+    routes = _routes(table, runner, 4)
+    return (
+        bool(_rules(mark, table, runner, 4))
+        and any(_is_blackhole(route, 4) for route in routes)
+        and (dev is None or any(_is_tun(route, 4, dev) for route in routes))
+    )
+
+
+def ensure_containers(mark: int, table: int, runner: Runner, dev: str | None) -> None:
+    """Пакеты контейнеров с меткой mark уходят в TUN-интерфейс dev, а пока его нет — в
+    чёрную дыру. Правило — по одному экземпляру."""
+    existing = _rules(mark, table, runner, 4)
+    for _extra in existing[1:]:
+        runner(["ip", "rule", "del", "fwmark", str(mark), "lookup", str(table)])
+    if not existing:
+        runner(["ip", "rule", "add", "fwmark", str(mark), "lookup", str(table),
+                "pref", str(PREF_CONTAINERS)])
+    if dev is not None:
+        runner(["ip", "route", "replace", "default", "dev", dev, "table", str(table)])
+    runner(["ip", "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
+            "table", str(table)])
+
+
+def remove_containers(
+    mark: int, table: int, runner: Runner, dev: str, *, keep_routes: bool = False
+) -> None:
+    """Убирает правило для контейнеров; маршруты таблицы — если они не нужны трафику
+    самой машины (keep_routes)."""
+    _del_rules(mark, table, runner, 4, None)
+    if not keep_routes:
+        _del_tun_routes(table, runner, 4, dev)

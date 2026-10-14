@@ -6,7 +6,7 @@ Xray не умеет перечитывать конфиг, поэтому:
 - изменились dns / burstObservatory / policy / api / основные inbounds →
   полный перезапуск: сразу в состояниях ALL_DEAD и XRAY_DOWN (urgent),
   иначе в restart_window или по force_now (xgw apply --now);
-  изменение inbound'а перехвата (tproxy-in, tproxy-in6, tun-in; в Windows — http-in,
+  изменение inbound'а перехвата (tproxy-in, tproxy-in6, tun-in,
   на который указывает системный прокси) — всегда сразу: пока Xray не перезапущен с
   ним, правила вели бы трафик в никуда (см. net/capture.py);
 - ошибка любого вызова API → полный перезапуск с новым конфигом по тем же
@@ -132,10 +132,7 @@ class Applier:
         if diff.plan is not None and self.paths.api_dirty_file.exists():
             reasons.append("ядро изменено через API частично")
 
-        sysproxy = bool(self.cfg.capture.sysproxy)
-        if capture_inbounds(current, sysproxy=sysproxy) != capture_inbounds(
-            new_config, sysproxy=sysproxy
-        ):
+        if capture_inbounds(current) != capture_inbounds(new_config):
             # Inbound перехвата появился, исчез или изменился: откладывать нельзя.
             # Правила сети следуют новым настройкам, и если ядро останется на старом
             # конфиге, перехваченный трафик уйдёт на порт или в интерфейс, которых у

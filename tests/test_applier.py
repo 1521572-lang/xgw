@@ -281,20 +281,6 @@ def test_other_inbounds_still_wait_for_the_window(env):
     assert paths.pending_config_file.exists()
 
 
-def test_sysproxy_http_inbound_change_is_not_deferred(env):
-    """Windows: системный прокси указывает на http-in. Сменили xray.http_port — прокси
-    уже смотрит на новый порт, и ждать окна нельзя: программы остались бы без сети."""
-    paths, current = env
-    new = copy.deepcopy(current)
-    next(item for item in new["inbounds"] if item["tag"] == "http-in")["port"] = 11809
-    service = StubService()
-    applier = _applier(paths, StubApi(service=service, healthy_after=1), service)
-    applier.cfg.capture.method = "sysproxy"
-    outcome = applier.apply(new)
-    assert outcome.mode == "restart" and service.restarts == 1
-    assert "изменение inbound перехвата" in " ".join(outcome.ops)
-
-
 def _with_tun_inbound(config: dict) -> dict:
     new = _needs_restart(config)
     new["inbounds"].insert(

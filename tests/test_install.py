@@ -10,7 +10,7 @@ import pytest
 from fakesys import FakeSystem
 
 from xgw import config
-from xgw.install import UNITS, Installer, Journal
+from xgw.install import UNIT_FILES, Installer, Journal
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
 from xgw.paths import Paths
@@ -63,7 +63,7 @@ class Box:
         return Installer(
             self.cfg, self.paths, runner=self.system, out=self.out.append, ask=self.ask,
             source_root=REPO, proc_sys=self.proc, download=self.download,
-            first_apply=lambda: self.xray_ok, which=lambda name: f"/usr/bin/{name}",
+            first_apply=lambda: self.xray_ok, which=self.system.which,
             chown=lambda *args: None, open_panel=self.open_panel,
         )
 
@@ -113,7 +113,8 @@ def test_plan_is_shown_and_nothing_changes_when_declined(box):
     box.answers = [False]
     assert box.installer().run() == 1
     text = box.text()
-    for expected in ("План установки XGW", "пакеты из apt: dnsmasq", "пользователь xray",
+    for expected in ("План установки XGW", "пакеты из apt: dnsmasq-base", "пользователь xray",
+                     "своя служба xgw-dhcp",
                      "профиль xgw-lan на lan0 — 192.168.50.1/24", "«Wired connection 2»",
                      "IPv6 на WAN (wan0)", "fail-closed", "sudo xgw uninstall",
                      "Отменено, в системе ничего не изменено"):
@@ -160,19 +161,17 @@ def test_failed_diag_check_blocks_install_unless_forced(box):
 
 def test_install_configures_the_system_and_records_what_was_before(box):
     system, paths = box.system, box.paths
-    conf_before_apt: list[bool] = []
-    original = system._apt_get
-
-    def apt(args, command, check):
-        conf_before_apt.append((paths.root / "etc/dnsmasq.d/xgw.conf").exists())
-        return original(args, command, check)
-
-    system._apt_get = apt
     assert box.install() == 0, box.text()
     assert "XGW установлен." in box.text()
-    # Конфиг dnsmasq (port=0) лежит до установки пакета: иначе его служба заняла бы порт 53.
-    assert conf_before_apt == [True]
-    assert "dnsmasq" in system.packages and "xray" in system.users
+    # Программа dnsmasq — из dnsmasq-base: пакет dnsmasq со штатной службой не нужен.
+    assert "dnsmasq-base" in system.packages and "dnsmasq" not in system.packages
+    assert "xray" in system.users
+    # DHCP — своя служба со своим конфигом: в /etc/dnsmasq.d XGW больше ничего не кладёт.
+    conf = (paths.etc / "dnsmasq.conf").read_text(encoding="utf-8")
+    assert "interface=lan0" in conf and "port=0" in conf and "user=dnsmasq" in conf
+    assert f"dhcp-leasefile={paths.var / 'dhcp.leases'}" in conf
+    assert not (paths.root / "etc/dnsmasq.d/xgw.conf").exists()
+    assert "dnsmasq.service" not in system.units
 
     lan_profile = system.profile(nm.PROFILE)
     assert lan_profile["device"] == "lan0" and lan_profile["ipv4.method"] == "manual"
@@ -184,11 +183,11 @@ def test_install_configures_the_system_and_records_what_was_before(box):
 
     assert box.forward() == "1"
     assert "net.ipv4.ip_forward = 1" in paths.sysctl_file.read_text(encoding="utf-8")
-    for unit in ("xgw-net.service", "xgw.service", "dnsmasq.service"):
+    for unit in ("xgw-net.service", "xgw.service", "xgw-dhcp.service"):
         assert system.units[unit] == {"active": True, "enabled": True}, unit
     # Xray запускает первая генерация конфига (в тесте подменена).
     assert system.units["xgw-xray.service"]["enabled"]
-    for unit in UNITS:
+    for unit in UNIT_FILES:
         assert (paths.systemd_dir / unit).read_text(encoding="utf-8") == (
             REPO / "packaging" / unit).read_text(encoding="utf-8")
     assert "tproxy to 127.0.0.1:12345" in system.kernel.table and system.kernel.rules
@@ -198,8 +197,8 @@ def test_install_configures_the_system_and_records_what_was_before(box):
     assert paths.xray_bin.exists()
 
     journal = Journal(paths.journal_file)
-    assert journal.get("packages") == ["dnsmasq"] and journal.get("user_created") is True
-    assert journal.get("dnsmasq") == {"package": True, "enabled": False, "active": False}
+    assert journal.get("packages") == ["dnsmasq-base"] and journal.get("user_created") is True
+    assert "dnsmasq" not in journal.data  # штатную службу dnsmasq XGW не трогает
     assert journal.get("sysctl") == {
         "net.ipv4.ip_forward": "0", "net.ipv6.conf.all.forwarding": "0"}
     assert journal.get("nm_lan")["disabled"] == [{
@@ -311,7 +310,7 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
     first = Journal(box.paths.journal_file).data
     assert box.install() == 0, box.text()
     second = Journal(box.paths.journal_file).data
-    for key in ("sysctl", "nm_lan", "nm_wan", "dnsmasq", "packages", "user_created", "sleep"):
+    for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "sleep"):
         assert second[key] == first[key], key
     # Профиль один, а не по одному на каждый запуск.
     assert sum(1 for item in box.system.profiles.values()
@@ -322,7 +321,9 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
 def test_machine_only_mode_does_not_touch_lan_things(box):
     box.cfg.network.lan_if = ""
     assert box.install() == 0, box.text()
-    assert "dnsmasq" not in box.system.packages
+    assert "dnsmasq-base" not in box.system.packages
+    assert not (box.paths.etc / "dnsmasq.conf").exists()
+    assert not box.system.units.get("xgw-dhcp.service", {}).get("enabled")
     assert not box.paths.sysctl_file.exists() and box.forward() == "0"
     assert nm.PROFILE not in [item["connection.id"] for item in box.system.profiles.values()]
     assert box.system.profile("Wired connection 2")["connection.autoconnect"] == "yes"
@@ -417,12 +418,10 @@ def test_ufw_rules_are_added_only_after_confirmation(box):
 
 
 def test_network_failure_rolls_everything_back(box):
-    box.system.refuse["systemctl restart dnsmasq.service"] = "нет"  # лишь предупреждение
     box.system.refuse["systemctl daemon-reload"] = "Failed to reload daemon"
     assert box.install() == 1
     text = box.text()
     assert "настройка сети не удалась" in text and "Возвращаю сеть" in text
-    assert "dnsmasq не запустился" in text
     assert "Сеть возвращена в состояние до установки." in text
     system = box.system
     assert nm.PROFILE not in [item["connection.id"] for item in system.profiles.values()]
@@ -430,15 +429,16 @@ def test_network_failure_rolls_everything_back(box):
     assert system.profile("Wired connection 2")["device"] == "lan0"
     assert system.profile("wan")["ipv6.method"] == "auto"
     assert box.forward() == "0" and not box.paths.sysctl_file.exists()
-    assert not any((box.paths.systemd_dir / unit).exists() for unit in UNITS)
+    assert not any((box.paths.systemd_dir / unit).exists() for unit in UNIT_FILES)
     assert not system.kernel.tables and not system.kernel.rules
+    assert not (box.paths.etc / "dnsmasq.conf").exists()
     # Код и то, что установка не откатывает, остаются — повторный запуск о них помнит.
     assert box.paths.launcher.exists() and "xray" in system.users
-    assert set(Journal(box.paths.journal_file).data) == {"packages", "user_created", "dnsmasq"}
+    assert set(Journal(box.paths.journal_file).data) == {"packages", "user_created"}
 
 
 def test_system_failure_stops_before_the_network_is_touched(box):
-    box.system.refuse["apt-get install"] = "E: Unable to locate package dnsmasq"
+    box.system.refuse["apt-get install"] = "E: Unable to locate package dnsmasq-base"
     assert box.install() == 1
     assert "установка остановлена" in box.text() and "Сеть не менялась" in box.text()
     assert not box.system.commands("nmcli", "connection", "add")
@@ -461,19 +461,17 @@ def test_uninstall_returns_everything(box):
     assert system.profile("wan")["ipv6.method"] == "auto"
     assert box.forward() == "0" and not paths.sysctl_file.exists()
     assert not system.kernel.tables and not system.kernel.rules and not system.kernel.route
-    for unit in UNITS:
+    for unit in UNIT_FILES:
         assert system.units[unit] == {"active": False, "enabled": False}
         assert not (paths.systemd_dir / unit).exists()
-    # Пакет dnsmasq остаётся, но служба выключена: с конфигом по умолчанию она
-    # спорила бы с systemd-resolved за порт 53.
-    assert system.units["dnsmasq.service"] == {"active": False, "enabled": False}
-    assert not (paths.root / "etc/dnsmasq.d/xgw.conf").exists()
+    assert not (paths.etc / "dnsmasq.conf").exists()
+    assert "dnsmasq.service" not in system.units  # штатную службу XGW не трогал
     assert "xray" not in system.users
     assert ("systemctl", "unmask", *sleep.TARGETS) in system.calls
     assert not paths.opt.exists() and not paths.var.exists() and not paths.launcher.exists()
     assert not paths.xray_config_dir.exists()
     assert paths.config_file.exists() and "Конфиг оставлен" in box.text()
-    assert "sudo apt remove dnsmasq" in box.text()
+    assert "sudo apt remove dnsmasq-base" in box.text()
     # Демон останавливается раньше, чем снимаются правила: иначе он вернул бы их.
     calls = system.calls
     assert calls.index(("systemctl", "disable", "--now", "xgw.service")) < calls.index(
@@ -488,14 +486,59 @@ def test_uninstall_purge_removes_the_config_too(box):
 
 def test_uninstall_keeps_things_that_existed_before(box):
     system = box.system
-    system.packages.add("dnsmasq")
+    system.packages.update({"dnsmasq", "dnsmasq-base"})
+    system.missing.discard("dnsmasq")
     system.users.add("xray")
     system.unit("dnsmasq.service").update(active=True, enabled=True)
     assert box.install() == 0
+    # Своя служба DHCP не мешает штатной: та как работала, так и работает.
+    assert system.units["dnsmasq.service"] == {"active": True, "enabled": True}
     assert box.uninstall() == 0
     assert "xray" in system.users  # пользователь был и до XGW
     assert system.units["dnsmasq.service"] == {"active": True, "enabled": True}
     assert "sudo apt remove" not in box.text()
+
+
+@pytest.mark.parametrize("before", [
+    {"package": True, "enabled": False, "active": False},  # пакет dnsmasq поставил XGW
+    {"package": False, "enabled": True, "active": True},  # dnsmasq работал и до XGW
+])
+def test_install_moves_an_old_setup_off_the_system_dnsmasq(box, before):
+    """Установка до 0.1.4 раздавала DHCP штатной службой dnsmasq.service по файлу
+    /etc/dnsmasq.d/xgw.conf (живая машина 14.10: пакет ubuntu-fan положил рядом
+    bind-interfaces, и после перезагрузки dnsmasq не запустился). Повторная установка
+    убирает файл, возвращает штатную службу в состояние до XGW, переносит аренды и
+    включает свою службу xgw-dhcp."""
+    system, paths = box.system, box.paths
+    system.packages.update({"dnsmasq", "dnsmasq-base"})
+    system.missing.discard("dnsmasq")
+    system.unit("dnsmasq.service").update(active=True, enabled=True)  # её включил пакет
+    legacy = paths.root / "etc/dnsmasq.d/xgw.conf"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("port=0\nbind-dynamic\n", encoding="utf-8")
+    leases = paths.root / "var/lib/misc/dnsmasq.leases"
+    leases.parent.mkdir(parents=True)
+    leases.write_text("1760000000 aa:bb:cc:dd:ee:ff 192.168.50.120 phone *\n", "utf-8")
+    paths.journal_file.parent.mkdir(parents=True)
+    paths.journal_file.write_text(
+        __import__("json").dumps({"dnsmasq": before, "packages": ["dnsmasq"]}), "utf-8")
+
+    assert box.install() == 0, box.text()
+    assert not legacy.exists()
+    if before["active"]:
+        assert system.units["dnsmasq.service"] == {"active": True, "enabled": True}
+        assert ("systemctl", "restart", "dnsmasq.service") in system.calls
+    else:
+        assert system.units["dnsmasq.service"] == {"active": False, "enabled": False}
+    assert "DHCP теперь раздаёт своя служба xgw-dhcp" in box.text()
+    assert system.units["xgw-dhcp.service"] == {"active": True, "enabled": True}
+    assert (paths.var / "dhcp.leases").read_text(encoding="utf-8") == leases.read_text("utf-8")
+    journal = Journal(paths.journal_file)
+    assert "dnsmasq" not in journal.data and journal.get("packages") == ["dnsmasq"]
+    # Повтор — штатная служба больше не трогается.
+    calls = len(system.commands("systemctl", "restart", "dnsmasq.service"))
+    assert box.install() == 0
+    assert len(system.commands("systemctl", "restart", "dnsmasq.service")) == calls
 
 
 def test_uninstall_reports_a_failed_step_and_keeps_the_journal(box):
@@ -533,7 +576,10 @@ def test_tun_method_is_announced_installed_and_removed(box):
     assert box.install() == 0, box.text()
     kernel = box.system.kernel
     assert kernel.links == {"xgwtun0": "tun"}
-    assert {(r["table"], r.get("iif")) for r in kernel.rules} == {("101", "lo"), ("100", None)}
+    # Машина — в TUN (iif lo), LAN — TPROXY (таблица 100), контейнеры — в ту же таблицу TUN
+    # по своей метке.
+    assert {(r["table"], r.get("iif"), r["fwmark"]) for r in kernel.rules} == {
+        ("101", "lo", "0x1"), ("100", None, "0x1"), ("101", None, "0x3")}
     assert "tproxy to 127.0.0.1:12345" in kernel.table  # сеть LAN — по-прежнему TPROXY
 
     assert box.uninstall() == 0, box.text()

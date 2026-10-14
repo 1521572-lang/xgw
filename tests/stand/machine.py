@@ -61,6 +61,11 @@ HOST_XGW_GLOBS = (
     "etc/NetworkManager/system-connections/xgw-lan*",
 )
 SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
+# Службы хоста, которым в контейнере не место: корень — оверлей поверх хоста, и Docker,
+# включённый на хосте, запустился бы и в контейнере — со своими правилами nftables,
+# мостом docker0 и профилем NetworkManager для него. Сверка «до установки / после
+# удаления» тогда расходилась бы сама по себе.
+HOST_SERVICES_OFF = ("docker.service", "docker.socket", "containerd.service")
 # «Заводская» система — не роутер. Сетевое пространство имён контейнера при создании
 # наследует значения хоста, а на хосте форвардинг бывает включён (Docker, установленный
 # XGW): этот файл возвращает его при каждой загрузке контейнера. Файл XGW (90-xgw.conf)
@@ -124,6 +129,18 @@ def scrub_host_xgw(root: Path) -> dict:
     return journal
 
 
+def mask_host_services(root: Path) -> None:
+    """Маскирует в корне контейнера службы хоста из HOST_SERVICES_OFF (маска — в верхнем
+    слое оверлея, хост не меняется)."""
+    units = Path(root) / "etc/systemd/system"
+    units.mkdir(parents=True, exist_ok=True)
+    for name in HOST_SERVICES_OFF:
+        unit = units / name
+        if unit.is_symlink() or unit.exists():
+            _remove(unit)
+        unit.symlink_to("/dev/null")
+
+
 def unavailable() -> str:
     """Почему машину не поднять; пусто — можно."""
     if not netns.available():
@@ -183,6 +200,7 @@ class Machine:
         if _run(["mountpoint", "-q", str(self.root)], check=False).returncode != 0:
             raise RuntimeError(f"оверлей не смонтирован в {self.root}")
         self.host_journal = scrub_host_xgw(self.root)
+        mask_host_services(self.root)
         for namespace in (INET_NS, LAN_NS):
             _run(["ip", "netns", "add", namespace])
             _run(["ip", "-n", namespace, "link", "set", "lo", "up"])

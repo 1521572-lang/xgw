@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import fetch
-from ..net.cmd import HIDDEN
 
 RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases"
 MIN_VERSION = (25, 7, 23)
@@ -30,8 +29,6 @@ MIN_VERSION = (25, 7, 23)
 _ASSETS = {
     ("linux", "x86_64"): ("xray-linux-64.zip", "x-ray-linux-64.zip"),
     ("linux", "aarch64"): ("xray-linux-arm64-v8a.zip",),
-    ("windows", "x86_64"): ("xray-windows-64.zip", "x-ray-windows-64.zip"),
-    ("windows", "aarch64"): ("xray-windows-arm64-v8a.zip",),
 }
 
 
@@ -80,7 +77,7 @@ def installed_version(
     """
     try:
         proc = subprocess.run(
-            [str(bin_path), "version"], capture_output=True, text=True, timeout=timeout, **HIDDEN
+            [str(bin_path), "version"], capture_output=True, text=True, timeout=timeout
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -114,9 +111,7 @@ def has_string(bin_path: Path | str, needle: bytes, *, chunk: int = 1 << 20) -> 
 
 
 def platform_pair() -> tuple[str, str]:
-    if sys.platform.startswith("win"):
-        goos = "windows"
-    elif sys.platform == "darwin":
+    if sys.platform == "darwin":
         goos = "darwin"
     else:
         goos = "linux"
@@ -226,7 +221,7 @@ def download_release(
         raise BinaryError("SHA-256 архива не совпал с .dgst релиза")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    binary_name = "xray.exe" if goos == "windows" else "xray"
+    binary_name = "xray"
     with tempfile.TemporaryDirectory(prefix=".xgw-xray-", dir=dest_dir) as tmp_dir:
         tmp_zip = Path(tmp_dir) / asset
         tmp_zip.write_bytes(zip_result.body)

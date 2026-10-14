@@ -1,41 +1,63 @@
-"""Конфиг dnsmasq: только DHCP на LAN-интерфейсе (раздел 6.4).
+"""DHCP на LAN-интерфейсе (раздел 6.4): свой экземпляр dnsmasq — служба xgw-dhcp.
 
 DNS в dnsmasq выключен (`port=0`): запросы устройств перехватывает и обслуживает
-Xray, а с systemd-resolved на 127.0.0.53 не возникает конфликта. Файл —
-/etc/dnsmasq.d/xgw.conf, его читает штатная служба dnsmasq.service.
+Xray, а с systemd-resolved на 127.0.0.53 не возникает конфликта.
+
+Конфиг — /etc/xgw/dnsmasq.conf, и служба читает только его (--conf-file). До 0.1.4 XGW
+клал файл в /etc/dnsmasq.d, который читает штатная служба dnsmasq.service, — и этот
+каталог делят все пакеты: пакет ubuntu-fan (ставится вместе с docker.io) кладёт туда
+bind-interfaces, с которым наш bind-dynamic несовместим, и dnsmasq после перезагрузки не
+запускался вовсе (`cannot set --bind-interfaces and --bind-dynamic`). Программа — из
+пакета dnsmasq-base (без своей службы; он же нужен NetworkManager). Старая установка
+переводится сама: файл из /etc/dnsmasq.d убирается, штатная служба возвращается в
+состояние до XGW (restore_system), аренды переезжают (migrate_leases).
 """
 
 from __future__ import annotations
 
 import ipaddress
 import re
+import shutil
 from pathlib import Path
 
 from ..config import Config
 from ..paths import Paths, atomic_write_text
-from . import lan
+from . import cmd, lan
 
-UNIT = "dnsmasq.service"
+UNIT = "xgw-dhcp.service"  # своя служба DHCP (packaging/xgw-dhcp.service)
+SYSTEM_UNIT = "dnsmasq.service"  # штатная служба пакета dnsmasq — её XGW больше не трогает
+PACKAGE = "dnsmasq-base"  # программа /usr/sbin/dnsmasq без своей службы
+LEASES = "/var/lib/xgw/dhcp.leases"
+PIDFILE = "/run/xgw-dhcp/dnsmasq.pid"  # каталог создаёт служба (RuntimeDirectory)
 
 _LEASE_TIME_RE = re.compile(r"\d+[smhdw]?|infinite")
 
 
 def conf_path(paths: Paths) -> Path:
+    return paths.etc / "dnsmasq.conf"
+
+
+def legacy_conf_path(paths: Paths) -> Path:
+    """Где конфиг лежал до 0.1.4 — в каталоге штатной службы dnsmasq."""
     return paths.root / "etc" / "dnsmasq.d" / "xgw.conf"
 
 
 def leases_path(paths: Paths) -> Path:
-    """Файл аренд службы dnsmasq в Debian и Ubuntu."""
+    return paths.var / "dhcp.leases"
+
+
+def legacy_leases_path(paths: Paths) -> Path:
+    """Файл аренд штатной службы dnsmasq в Debian и Ubuntu (до 0.1.4)."""
     return paths.root / "var" / "lib" / "misc" / "dnsmasq.leases"
 
 
 def write_conf(cfg: Config, paths: Paths) -> tuple[bool, list[str]]:
-    """Записывает xgw.conf, если он изменился. Возвращает (изменился ли, предупреждения).
+    """Записывает dnsmasq.conf, если он изменился. Возвращает (изменился ли, предупреждения).
 
     Пустой конфиг (LAN не настроен или dhcp_range не разобрать) файл убирает:
     иначе dnsmasq продолжал бы раздавать адреса по старым настройкам.
     """
-    text, warnings = render(cfg)
+    text, warnings = render(cfg, leasefile=str(leases_path(paths)))
     path = conf_path(paths)
     try:
         current = path.read_text(encoding="utf-8")
@@ -48,6 +70,34 @@ def write_conf(cfg: Config, paths: Paths) -> tuple[bool, list[str]]:
     else:
         path.unlink(missing_ok=True)
     return True, warnings
+
+
+def migrate_leases(paths: Paths) -> bool:
+    """Аренды штатной службы — в файл своей: устройства сохранят свои адреса. True —
+    перенесены."""
+    source, target = legacy_leases_path(paths), leases_path(paths)
+    if target.exists() or not source.is_file():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    return True
+
+
+def restore_system(paths: Paths, record: dict | None, runner: cmd.Runner) -> str:
+    """Убирает конфиг XGW из /etc/dnsmasq.d и возвращает штатную службу dnsmasq.service
+    в состояние до XGW (record — запись журнала установки до 0.1.4). Что сделано."""
+    conf = legacy_conf_path(paths)
+    conf.unlink(missing_ok=True)
+    if record is None:
+        return f"{conf} удалён"
+    if record.get("active"):
+        # Работала и до XGW — пусть работает дальше, уже без нашего файла.
+        runner(["systemctl", "restart", SYSTEM_UNIT], timeout=60.0, check=False)
+        return f"{SYSTEM_UNIT} перезапущен без настроек XGW"
+    runner(["systemctl", "stop", SYSTEM_UNIT], timeout=60.0, check=False)
+    if not record.get("enabled"):
+        runner(["systemctl", "disable", SYSTEM_UNIT], timeout=60.0, check=False)
+    return f"{SYSTEM_UNIT} остановлен, его конфиг XGW удалён"
 
 
 def read_leases(paths: Paths) -> list[dict]:
@@ -96,8 +146,8 @@ def _range(cfg: Config, network: ipaddress.IPv4Network) -> tuple[str, str, str] 
     return str(start), str(end), lease
 
 
-def render(cfg: Config) -> tuple[str, list[str]]:
-    """Текст xgw.conf и предупреждения. Пусто — LAN не настроен, dnsmasq не нужен."""
+def render(cfg: Config, *, leasefile: str = LEASES) -> tuple[str, list[str]]:
+    """Текст dnsmasq.conf и предупреждения. Пусто — LAN не настроен, dnsmasq не нужен."""
     lan_if = lan.lan_interface(cfg)
     if not lan_if:
         return "", []
@@ -120,8 +170,13 @@ def render(cfg: Config) -> tuple[str, list[str]]:
 
     lines = [
         "# Создано XGW — не редактируйте: файл перезаписывается.",
+        "# Его читает только служба xgw-dhcp (dnsmasq --conf-file): файлы /etc/dnsmasq.d",
+        "# и /etc/dnsmasq.conf к ней не относятся.",
         "# DNS выключен: запросы устройств перехватывает и обслуживает Xray.",
         "port=0",
+        "user=dnsmasq",  # пользователь из пакета dnsmasq-base
+        f"pid-file={PIDFILE}",
+        f"dhcp-leasefile={leasefile}",
         f"interface={lan_if}",
         # Не bind-interfaces: с ним dnsmasq завершается («unknown interface»), если
         # при старте у карты ещё нет адреса — роутер выключен или кабель не вставлен.

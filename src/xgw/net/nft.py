@@ -11,6 +11,16 @@
                      LAN → WAN с маскарадингом;
   без LAN и без перехвата — таблицы нет вовсе.
 
+Контейнеры Docker (capture.containers): их трафик приходит с мостов docker0 и br-* и
+уходит в интернет транзитом через машину — ни output, ни prerouting LAN его не видят.
+TPROXY для него не годится: Docker включает br_netfilter, цепочка prerouting для пакетов
+с моста вызывается ещё на уровне моста, и сокет, который назначил TPROXY, ядро затем
+сбрасывает (ip_rcv) — соединение не устанавливается (проверено на стенде). Поэтому своя
+цепочка containers только ставит метку mark_containers, а маршрут по метке (net/iprule.py)
+ведёт пакеты в TUN-интерфейс XGW, откуда их читает Xray; метка переживает и br_netfilter.
+Ответы опубликованных портов контейнеров (ct direction reply) и адреса самой машины
+(маршрутом их в TUN не увести — таблица local главнее) в Xray не попадают.
+
 IPv6: по умолчанию `ip6 xgw6` только запрещает форвардинг IPv6 из LAN и в LAN.
 При network.ipv6 = "proxy" в ней же перехватывается IPv6 самой машины — теми же
 цепочками, что и IPv4 (output помечает, prerouting на lo отдаёт Xray через TPROXY).
@@ -47,6 +57,9 @@ RESERVED4 = (
 RESERVED6 = ("::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
 # Служба времени идёт мимо перехвата: без точного времени не поднимется Reality.
 TIME_USERS = ("_chrony", "systemd-timesync")
+# Мосты Docker: docker0 и сети `docker network create` (br-<id>). Звёздочка — шаблон
+# имени nftables; в правилах ufw (iptables) ей соответствует «+».
+CONTAINER_IFS = ("docker0", "br-*")
 NTS_KE_PORT = 4460  # chrony с NTS сначала получает ключи по TCP
 
 
@@ -73,15 +86,24 @@ class Rules:
     # TUN-интерфейс tun_name (capture.method = "tun"); сеть LAN по-прежнему через TPROXY.
     tun: bool = False
     tun_name: str = ""
+    # Интерфейсы контейнеров (шаблоны имён), чей трафик тоже идёт в Xray; пусто — нет.
+    containers: tuple[str, ...] = ()
+    mark_containers: int = 3
 
     @property
     def capture(self) -> bool:
         return self.capture_lan or self.capture_local
 
     @property
-    def prerouting(self) -> bool:
-        """Цепочка prerouting с TPROXY нужна для LAN и для самой машины без TUN."""
+    def tproxy(self) -> bool:
+        """TPROXY (и локальная доставка помеченных пакетов) нужен для LAN и для самой
+        машины без TUN."""
         return self.capture_lan or (self.capture_local and not self.tun)
+
+    @property
+    def prerouting(self) -> bool:
+        """Цепочка prerouting нужна для TPROXY и для метки контейнеров."""
+        return self.tproxy or bool(self.containers)
 
     @property
     def prerouting6(self) -> bool:
@@ -173,9 +195,16 @@ def build_rules(
             reserved6=reserved6,
             tun=capture and cfg.capture.local and cfg.capture.tun,
             tun_name=cfg.capture.tun_name,
+            containers=CONTAINER_IFS if capture and containers_wanted(cfg) else (),
+            mark_containers=cfg.capture.mark_containers,
         ),
         warnings,
     )
+
+
+def containers_wanted(cfg: Config) -> bool:
+    """Перехват контейнеров включён в конфиге (сам перехват — тоже)."""
+    return cfg.capture.containers and (cfg.capture.lan or cfg.capture.local)
 
 
 def _dns_direct(cfg: Config) -> str:
@@ -217,27 +246,44 @@ def render(rules: Rules) -> str:
     if lan_if:
         blocks.append(_set("bypass4", rules.bypass))
 
+    tproxy = (
+        "meta l4proto { tcp, udp } counter "
+        f"tproxy to 127.0.0.1:{rules.tproxy_port} meta mark set {proxy} accept"
+    )
     if rules.prerouting:
+        if rules.containers:
+            # Обычная цепочка (без hook) — раньше prerouting, который в неё переходит.
+            blocks.append([
+                "chain containers {",
+                "    meta l4proto != { tcp, udp } return",
+                # Ответы опубликованных портов контейнеров (docker run -p) — не в Xray.
+                "    ct direction reply return",
+                "    fib daddr type local return",
+                "    ip daddr @reserved4 th dport != 53 return",
+                f"    meta l4proto {{ tcp, udp }} counter meta mark set {rules.mark_containers:#x}",
+                "}",
+            ])
         sources = ([f'"{lan_if}"'] if rules.capture_lan else []) + (
             ['"lo"'] if rules.capture_local and not rules.tun else []
         )
-        only = sources[0] if len(sources) == 1 else "{ " + ", ".join(sources) + " }"
-        prerouting = [
-            f"iifname != {only} return",  # входящие из интернета в Xray не попадают
-            "meta l4proto != { tcp, udp } return",
-        ]
-        if rules.capture_local and not rules.tun:
-            # На lo перехватывается только то, что пометила цепочка output.
-            prerouting.append(f'iifname "lo" meta mark != {proxy} return')
-        if rules.capture_lan:
-            prerouting.append("ip saddr @bypass4 return")
-        prerouting += [
-            # Сам шлюз и частные сети — мимо Xray; DNS (порт 53) перехватывается всегда.
-            "fib daddr type local th dport != 53 return",
-            "ip daddr @reserved4 th dport != 53 return",
-            "meta l4proto { tcp, udp } counter "
-            f"tproxy to 127.0.0.1:{rules.tproxy_port} meta mark set {proxy} accept",
-        ]
+        prerouting = [f'iifname "{name}" goto containers' for name in rules.containers]
+        if sources:
+            only = sources[0] if len(sources) == 1 else "{ " + ", ".join(sources) + " }"
+            prerouting += [
+                f"iifname != {only} return",  # входящие из интернета в Xray не попадают
+                "meta l4proto != { tcp, udp } return",
+            ]
+            if rules.capture_local and not rules.tun:
+                # На lo перехватывается только то, что пометила цепочка output.
+                prerouting.append(f'iifname "lo" meta mark != {proxy} return')
+            if rules.capture_lan:
+                prerouting.append("ip saddr @bypass4 return")
+            prerouting += [
+                # Сам шлюз и частные сети — мимо Xray; DNS (порт 53) перехватывается всегда.
+                "fib daddr type local th dport != 53 return",
+                "ip daddr @reserved4 th dport != 53 return",
+                tproxy,
+            ]
         blocks.append(
             _chain(
                 "prerouting",

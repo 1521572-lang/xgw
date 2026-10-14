@@ -228,6 +228,35 @@ def test_status_prefers_fresh_daemon_snapshot(gateway, capsys):
     assert "демон XGW не запущен" in capsys.readouterr().out
 
 
+def test_status_says_the_daemon_service_is_stopped(gateway, monkeypatch, capsys):
+    """Службу xgw остановили: свежий файл статуса ещё лежит, но наблюдения больше нет —
+    `xgw status` говорит это первой строкой и отвечает кодом 3, а не 0."""
+    snapshot = {
+        "updated": time.time(), "daemon": True, "state": "DEGRADED", "action": "замена",
+        "since": time.time() - 120, "xray": {"ok": True, "version": "26.3.27"},
+        "members": [], "spares": [], "selecting": [], "pin": None, "quota": {}, "budget": {},
+        "events": [],
+    }
+    gateway.paths.status_file.parent.mkdir(parents=True, exist_ok=True)
+    gateway.paths.status_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    unit = gateway.paths.systemd_dir / "xgw.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("[Service]\n", encoding="utf-8")
+    answers = {"state": "inactive\n"}
+    monkeypatch.setattr(cli.cmd, "run", lambda argv, **_kwargs: answers["state"])
+
+    assert gateway.run("status") == cli.DAEMON_DOWN_EXIT
+    out = capsys.readouterr().out
+    assert out.startswith("Состояние: СЛУЖБА xgw НЕ РАБОТАЕТ") and "DEGRADED" not in out
+    assert "sudo systemctl start xgw" in out
+    assert gateway.run("status", "--json") == cli.DAEMON_DOWN_EXIT
+    assert json.loads(capsys.readouterr().out)["daemon_down"] is True
+
+    answers["state"] = "active\n"  # служба работает — статус демона снова в силе
+    assert gateway.run("status") == 0
+    assert "Состояние: DEGRADED" in capsys.readouterr().out
+
+
 def test_status_json_and_quota(gateway, monkeypatch, capsys):
     _alive(gateway, monkeypatch)
     store = Store(gateway.paths.db_file)
@@ -530,6 +559,5 @@ def test_probe_all_points_at_the_probe_url_when_everything_fails_the_same_way(
     assert gateway.run("probe", "--all") == 0
     captured = capsys.readouterr()
     assert captured.out.count("CONNECT_FAIL") == 4
-    assert "все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url" in (
-        captured.err)
-    assert "HTTP 403 у всех 4 серверов" in captured.err and "xgw diag" in captured.err
+    assert "пробы всех серверов падают — вероятно, недоступен сам probe.url" in captured.err
+    assert "(HTTP 403)" in captured.err and "xgw diag" in captured.err

@@ -23,7 +23,6 @@ from .api import ApiError
 from .service import XrayServiceError
 
 WAIT_SECONDS = 15.0
-WINDOWS = os.name == "nt"
 
 
 def _version_text(version: tuple[int, int, int] | None) -> str:
@@ -79,11 +78,7 @@ def update_xray(
         configured = paths.xray_config_file.exists()
         shutil.rmtree(previous, ignore_errors=True)
         try:
-            if WINDOWS and configured:
-                # Windows не даёт переименовать каталог, из которого запущена программа:
-                # ядро останавливается на время замены. В Linux оно продолжает работать
-                # на прежнем файле до перезапуска.
-                service.stop()
+            # Работающее ядро продолжает работать на прежнем файле до перезапуска.
             if target.exists():
                 os.replace(target, previous)
             os.replace(staging, target)
@@ -91,11 +86,7 @@ def update_xray(
             if not target.exists() and previous.exists():
                 os.replace(previous, target)
             shutil.rmtree(staging, ignore_errors=True)
-            again = _restart(service, api, wait) if WINDOWS and configured else None
-            out(
-                f"ошибка: файлы Xray не заменены ({exc}). Установленная версия не тронута"
-                + ("" if again is None else f", но Xray после этого не отвечает: {again}")
-            )
+            out(f"ошибка: файлы Xray не заменены ({exc}). Установленная версия не тронута")
             return 1
         with contextlib.suppress(OSError):
             os.chmod(target, 0o755)

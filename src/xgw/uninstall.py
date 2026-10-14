@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import log
 from .config import Config
-from .install import UNITS, XRAY_USER, Journal
+from .install import UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
@@ -94,13 +94,15 @@ class Uninstaller:
     # --- шаги -------------------------------------------------------------------
 
     def _stop_units(self) -> str | None:
-        present = [unit for unit in UNITS if (self.paths.systemd_dir / unit).exists()]
+        present = [unit for unit in UNIT_FILES if (self.paths.systemd_dir / unit).exists()]
         if not present:
             return None
         # Демон первым: иначе он успел бы вернуть правила и перезапустить Xray.
-        for unit in reversed(UNITS):
-            self.runner(["systemctl", "disable", "--now", unit], timeout=90.0, check=False)
-        return "службы xgw, xgw-xray и xgw-net остановлены"
+        for unit in reversed(UNIT_FILES):
+            if (self.paths.systemd_dir / unit).exists():
+                self.runner(["systemctl", "disable", "--now", unit], timeout=90.0, check=False)
+        return "службы " + ", ".join(
+            unit.removesuffix(".service") for unit in reversed(present)) + " остановлены"
 
     def _rules(self) -> str | None:
         Capture(
@@ -109,21 +111,17 @@ class Uninstaller:
         return "таблицы nftables, ip rule, маршрут и интерфейс TUN убраны"
 
     def _dnsmasq(self) -> str | None:
+        """Конфиг своей службы DHCP; у установки до 0.1.4 — ещё и файл в /etc/dnsmasq.d и
+        штатная служба dnsmasq.service, которую она настраивала."""
         conf = dnsmasq.conf_path(self.paths)
         record = self.journal.get("dnsmasq")
-        if not conf.exists() and record is None:
+        legacy = dnsmasq.legacy_conf_path(self.paths).exists()
+        if not conf.exists() and record is None and not legacy:
             return None
         conf.unlink(missing_ok=True)
-        if record is None:
+        if record is None and not legacy:
             return f"{conf} удалён"
-        if record.get("active"):
-            # Работал и до XGW — пусть работает дальше, уже без нашего файла.
-            self.runner(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0, check=False)
-            return "dnsmasq перезапущен без настроек XGW"
-        self.runner(["systemctl", "stop", dnsmasq.UNIT], timeout=60.0, check=False)
-        if not record.get("enabled"):
-            self.runner(["systemctl", "disable", dnsmasq.UNIT], timeout=60.0, check=False)
-        return "dnsmasq остановлен, его конфиг XGW удалён"
+        return dnsmasq.restore_system(self.paths, record, self.runner)
 
     def _nm(self) -> str | None:
         lan_record = self.journal.get("nm_lan")
@@ -176,7 +174,7 @@ class Uninstaller:
 
     def _unit_files(self) -> str | None:
         removed = False
-        for unit in UNITS:
+        for unit in UNIT_FILES:
             path = self.paths.systemd_dir / unit
             if path.exists():
                 path.unlink()

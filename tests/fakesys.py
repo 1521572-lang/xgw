@@ -35,6 +35,8 @@ class FakeSystem:
         self._uuid = itertools.count(1)
         self.units: dict[str, dict] = {}
         self.packages: set[str] = {"nftables"}
+        # Программ нет в системе (which их не найдёт): dnsmasq даёт пакет dnsmasq-base.
+        self.missing: set[str] = {"dnsmasq"}
         self.users: set[str] = set()
         self.ufw_active = False
         self.ufw_rules: list[tuple[str, ...]] = []
@@ -208,12 +210,17 @@ class FakeSystem:
                 unit["active"] = unit["active"] and "--now" not in args
         return ""
 
+    def which(self, name: str) -> str | None:
+        return None if name in self.missing else f"/usr/bin/{name}"
+
     def _dpkg_query(self, args, command, check) -> str:
         return "install ok installed" if args[-1] in self.packages else ""
 
     def _apt_get(self, args, command, check) -> str:
         if args[0] == "install":
             self.packages.update(item for item in args[1:] if not item.startswith("-"))
+            if "dnsmasq-base" in self.packages:
+                self.missing.discard("dnsmasq")
         return ""
 
     def _getent(self, args, command, check) -> str:

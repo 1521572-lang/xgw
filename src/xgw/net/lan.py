@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import fnmatch
 import ipaddress
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config import Config
 from . import cmd
@@ -29,6 +31,16 @@ class Lease:
 def valid_interface(name: str) -> bool:
     """Имя сетевого интерфейса Linux: до 15 символов, без пробелов и кавычек."""
     return bool(_IFACE_RE.fullmatch(name)) and name not in (".", "..")
+
+
+def container_links(patterns: tuple[str, ...], sys_net: Path = Path("/sys/class/net")) -> list[str]:
+    """Интерфейсы контейнеров, которые уже есть в системе (имена по шаблонам вида
+    «docker0», «br-*»). Пусто — Docker не установлен или ещё не создал мост."""
+    try:
+        names = sorted(item.name for item in sys_net.iterdir())
+    except OSError:
+        return []  # не Linux либо /sys недоступен
+    return [name for name in names if any(fnmatch.fnmatchcase(name, p) for p in patterns)]
 
 
 def valid_hostname(name: str) -> bool:
