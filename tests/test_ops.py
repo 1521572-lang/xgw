@@ -622,6 +622,71 @@ def test_panel_open_waits_for_the_panel_and_starts_xgw_in_windows(root, capsys, 
     assert "панель не отвечает" in capsys.readouterr().err
 
 
+def test_panel_login_from_the_shortcut_asks_for_the_admin_password(root, monkeypatch):
+    """Пункт «Войти заново» у ярлыка «XGW» запускает `xgw panel --login` от человека:
+    config.toml (0600) ему не прочитать, и команда уходит в pkexec — окно пароля Ubuntu."""
+    from xgw import desktop
+
+    asked: list[list[str]] = []
+    notes: list[str] = []
+    answer = [0]
+    monkeypatch.setattr(cli, "WINDOWS", False)
+    monkeypatch.setattr(desktop, "is_root", lambda: False)
+    monkeypatch.setattr(desktop, "as_admin", lambda argv: asked.append(argv) or answer[0])
+    monkeypatch.setattr(desktop, "notify", lambda user, text: notes.append(text))
+    assert not root.config_file.exists()  # конфиг до pkexec не читается
+    assert main(["panel", "--login"]) == 0
+    assert asked == [[str(root.launcher), "panel", "--login"]] and notes == []
+    answer[0] = desktop.PKEXEC_DISMISSED
+    assert main(["panel", "--login"]) == 1 and notes == []  # окно закрыли — сообщать не о чем
+    answer[0] = desktop.PKEXEC_REFUSED
+    assert main(["panel", "--login"]) == 1 and "пароль администратора не принят" in notes[-1]
+
+    def no_pkexec(argv):
+        raise desktop.DesktopError("нет программы pkexec")
+
+    monkeypatch.setattr(desktop, "as_admin", no_pkexec)
+    assert main(["panel", "--login"]) == 1 and "pkexec" in notes[-1]
+
+
+def test_panel_login_as_root_opens_a_one_time_link_for_the_user(root, monkeypatch, capsys):
+    """От root (после pkexec) — одноразовая ссылка входа в браузере того, кто попросил."""
+    import socket
+
+    from xgw import desktop
+    from xgw.watch import panel
+
+    opened: list[tuple[str, str]] = []
+    notes: list[str] = []
+    session = [True]
+    alice = desktop.User("alice", 1000)
+    monkeypatch.setattr(cli, "WINDOWS", False)
+    monkeypatch.setattr(cli, "PANEL_WAIT", 0.6)
+    monkeypatch.setattr(desktop, "is_root", lambda: True)
+    monkeypatch.setattr(desktop, "invoking_user", lambda: alice)
+    monkeypatch.setattr(desktop, "graphical", lambda user: session[0])
+    monkeypatch.setattr(desktop, "open_url", lambda user, url: opened.append((user.name, url)))
+    monkeypatch.setattr(desktop, "notify", lambda user, text: notes.append(text))
+    root.etc.mkdir(parents=True)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        root.config_file.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
+        assert main(["panel", "--login"]) == 0, capsys.readouterr().err
+        ((name, url),) = opened
+        assert name == "alice" and url.startswith(f"http://127.0.0.1:{port}/?login=")
+        assert "token=" not in url and panel.use_login(root, url.split("login=", 1)[1])
+        assert "вход выполнен" in capsys.readouterr().out
+        session[0] = False  # вошёл только по SSH
+        assert main(["panel", "--login"]) == 1 and "нет графического сеанса" in notes[-1]
+    session[0] = True
+    assert main(["panel", "--login"]) == 1 and "панель не отвечает" in notes[-1]
+    monkeypatch.setattr(desktop, "invoking_user", lambda: None)
+    assert main(["panel", "--login"]) == 1 and "«Войти заново»" in notes[-1]
+    assert len(opened) == 1
+
+
 def test_shortcut_failures_show_a_window_when_there_is_no_console(root, monkeypatch):
     """Ярлык в меню «Пуск» запускает XGW без окна консоли: о любой ошибке — и о
     нечитаемом config.toml тоже — говорит окно с сообщением, а не строка в никуда."""

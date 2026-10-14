@@ -287,6 +287,66 @@ def test_panel_is_reachable_only_from_the_machine_itself_and_by_token(gw):
     assert _exit_ip(gw) == DIRECT
 
 
+def test_sign_in_again_opens_a_one_time_link_in_the_users_browser(gw):
+    """«Войти заново» у ярлыка «XGW»: pkexec запускает `xgw panel --login` от root, а
+    браузер открывается у человека — xdg-open в его пользовательском менеджере systemd,
+    по одноразовой ссылке. Окна пароля и браузера в контейнере нет: pkexec изображает
+    PKEXEC_UID, браузер — заглушка xdg-open, сеанс GNOME — переменная WAYLAND_DISPLAY.
+    Менеджер пользователя запускается напрямую (`systemctl start user@UID`), как это
+    делает logind при входе: `loginctl enable-linger` в контейнере отвечает «Protocol
+    driver not attached»."""
+    box = gw.box
+    box.sh(
+        r"""
+set -e
+id walker >/dev/null 2>&1 || useradd --create-home walker
+systemctl start "user@$(id -u walker).service"
+cat > /usr/local/bin/xdg-open <<'EOF'
+#!/bin/sh
+echo "user=$(id -un) url=$1" >> "$HOME/xdg-open.log"
+EOF
+chmod 755 /usr/local/bin/xdg-open
+"""
+    )
+    try:
+        uid = box.sh("id -u walker").strip()
+
+        def manager() -> bool:
+            state = box.run("systemctl", "is-active", f"user@{uid}.service", check=False)
+            return state.stdout.strip() == "active"
+
+        assert wait_for(manager, 30), box.journal(f"user@{uid}.service")
+
+        def login():
+            return box.run("env", f"PKEXEC_UID={uid}", "xgw", "panel", "--login", check=False)
+
+        # Человек вошёл только по SSH: графического сеанса нет — честный отказ.
+        refused = login()
+        assert refused.returncode == 1 and "нет графического сеанса" in refused.stderr, refused
+        box.run("systemctl", "--user", "--machine=walker@", "set-environment",
+                "WAYLAND_DISPLAY=wayland-0")
+        opened = login()
+        assert opened.returncode == 0 and "вход выполнен" in opened.stdout, opened
+
+        def logged() -> str:
+            return box.sh("cat /home/walker/xdg-open.log 2>/dev/null", check=False).strip()
+
+        assert wait_for(logged, 20), box.sh("journalctl -n 30 --no-pager", check=False)
+        line = logged().splitlines()[-1]
+        prefix = f"user=walker url=http://127.0.0.1:{PANEL_PORT}/?login="
+        assert line.startswith(prefix) and _panel_token(gw) not in line, line
+        code = line[len(prefix):]
+        first = _panel(gw, "raw", f"/?login={code}")
+        assert first["status"] == 303, first
+        assert _panel(gw, "raw", f"/?login={code}")["status"] == 403  # второй раз не годится
+        assert box.sh("stat -c '%U %a' /run/xgw/panel-login").strip() == "root 700"
+    finally:
+        box.sh(
+            'systemctl stop "user@$(id -u walker).service"; rm -f /usr/local/bin/xdg-open; '
+            "userdel -r walker 2>/dev/null; true"
+        )
+
+
 def test_subscription_added_in_the_panel_starts_xray_and_the_button_turns_vpn_on(gw):
     box, stand = gw.box, gw.stand
     added = _press(gw, "add", text=stand.subscription_url())

@@ -17,7 +17,6 @@ import json
 import os
 import shutil
 import signal
-import socket
 import sqlite3
 import sys
 import threading
@@ -25,7 +24,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import __version__, actions, config, engine, log, managed
+from . import __version__, actions, config, desktop, engine, log, managed
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, nft, tun
@@ -168,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         "panel", parents=[common], help="ссылка на панель управления (открывается в браузере)"
     )
     panel.add_argument("--open", action="store_true", help="сразу открыть панель в браузере")
+    panel.add_argument(
+        "--login", action="store_true",
+        help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
+    )
     if WINDOWS:
         subparsers.add_parser("start", parents=[common], help="запустить XGW (демон без окна)")
         subparsers.add_parser("stop", parents=[common], help="остановить XGW и Xray")
@@ -188,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "winsetup":
         _ansi_output()
     paths = Paths.from_env()
+    if args.command == "panel" and args.login and not WINDOWS and not desktop.is_root():
+        # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
+        # прочитать, — та же команда от root через pkexec.
+        return _panel_login_hop(paths)
     # Демон в Windows пишет журнал в файл: journald там нет, а у процесса без окна
     # (pythonw) нет и stderr. Остальные команды печатают в терминал.
     to_file = args.command == "run" and (args.log_file or paths.windows or sys.stderr is None)
@@ -849,6 +856,68 @@ def _cmd_update_xray(args, cfg: config.Config, paths: Paths, logger) -> int:
 PANEL_WAIT = 15.0  # сколько ждать, пока только что запущенный демон откроет панель
 
 
+def _panel_answers(port: int) -> bool:
+    from .watch import panel
+
+    return panel.wait_ready(port, PANEL_WAIT)
+
+
+def _panel_silent(port: int) -> str:
+    return (
+        f"панель не отвечает (127.0.0.1:{port}): демон XGW не запущен или порт занят другой "
+        "программой — см. xgw diag"
+    )
+
+
+def _panel_login_hop(paths: Paths) -> int:
+    """`xgw panel --login` от имени человека (пункт «Войти заново» у ярлыка «XGW»):
+    pkexec спрашивает пароль администратора окном Ubuntu и запускает эту же команду от
+    root — она и откроет панель."""
+    try:
+        code = desktop.as_admin([str(paths.launcher), "panel", "--login"])
+    except desktop.DesktopError as exc:
+        desktop.notify(None, str(exc))
+        return _fail(str(exc))
+    if code == desktop.PKEXEC_DISMISSED:
+        return 1  # окно пароля закрыли — человек передумал, сообщать не о чем
+    if code == desktop.PKEXEC_REFUSED:
+        text = "вход в панель не выполнен: пароль администратора не принят"
+        desktop.notify(None, text)
+        return _fail(text)
+    return code  # о прочих сбоях команда от root сообщила сама
+
+
+def _panel_login(cfg: config.Config, paths: Paths) -> int:
+    """`xgw panel --login` от root (через pkexec или sudo): одноразовая ссылка входа
+    открывается в браузере того, кто запустил команду, в его сеансе."""
+    from .watch import panel
+
+    user = desktop.invoking_user()
+
+    def fail(text: str) -> int:
+        desktop.notify(user, text)
+        return _fail(text)
+
+    if user is None:
+        return fail(
+            "не видно, кто запустил команду: войдите пунктом «Войти заново» у ярлыка «XGW» "
+            "или откройте ссылку, которую печатает sudo xgw panel"
+        )
+    if not _panel_answers(cfg.panel.port):
+        return fail(_panel_silent(cfg.panel.port))
+    if not desktop.graphical(user):
+        return fail(
+            f"у пользователя {user.name} нет графического сеанса — откройте ссылку, которую "
+            "печатает sudo xgw panel"
+        )
+    try:
+        desktop.open_url(user, panel.login_address(cfg, panel.new_login(paths)))
+    except (desktop.DesktopError, OSError) as exc:
+        return fail(str(exc))
+    print(f"Панель открыта в браузере пользователя {user.name}, вход выполнен.")
+    return 0
+
+
 def _open_panel(cfg: config.Config, paths: Paths, url: str) -> int:
     """`xgw panel --open` — так панель открывает ярлык. В Windows ярлык запускается
     без окна консоли, поэтому о сбое говорит окно с сообщением, а не строка в терминале;
@@ -864,18 +933,8 @@ def _open_panel(cfg: config.Config, paths: Paths, url: str) -> int:
                 return fail(f"XGW не запустился — подробности в журнале {paths.log_file}")
         except winapp.WinAppError as exc:
             return fail(str(exc))
-    deadline = time.monotonic() + PANEL_WAIT
-    while True:
-        try:
-            with socket.create_connection(("127.0.0.1", cfg.panel.port), timeout=1.0):
-                break
-        except OSError:
-            if time.monotonic() >= deadline:
-                return fail(
-                    f"панель не отвечает (127.0.0.1:{cfg.panel.port}): демон XGW не запущен "
-                    "или порт занят другой программой — см. xgw diag"
-                )
-            time.sleep(0.3)
+    if not _panel_answers(cfg.panel.port):
+        return fail(_panel_silent(cfg.panel.port))
     if not webbrowser.open(url):
         return fail(f"браузер не открылся — откройте сами: {url}")
     return 0
@@ -888,6 +947,10 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
         return _fail(
             "панель выключена: [panel] enabled = false в config.toml", 2, window=args.open
         )
+    if args.login:
+        if WINDOWS:
+            return _fail("--login — для Ubuntu; в Windows панель открывает ярлык «XGW»", 2)
+        return _panel_login(cfg, paths)
     token = panel.read_token(paths)
     if not token:
         problem = _system_root_problem(paths)

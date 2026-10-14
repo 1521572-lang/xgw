@@ -127,6 +127,7 @@ class Diag:
             ("Сон", self._sleep),
             ("IPv6", self._ipv6),
             ("Службы", self._services),
+            ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
         ]
         if self.net:
@@ -619,6 +620,25 @@ class Diag:
         return [Check(
             "IPv6", FAIL, text,
             "sudo xgw install — отключит IPv6 на WAN заново и скажет, если не сможет",
+        )]
+
+    def _panel_login(self) -> list[Check]:
+        """Пункт «Войти заново» у ярлыка «XGW» спрашивает пароль через pkexec. Без него
+        войти в панель заново можно только ссылкой из `sudo xgw panel`. Смотрится там,
+        где есть рабочий стол (xdg-open): на сервере ярлык открывать некому."""
+        if not sys.platform.startswith("linux") or not self.cfg.panel.enabled:
+            return []
+        if self.which("xdg-open") is None:
+            return []
+        if self.which("pkexec") is None:
+            return [Check(
+                "Панель", WARN,
+                "нет pkexec: «Войти заново» у ярлыка «XGW» не спросит пароль, войти в панель "
+                "заново можно будет только ссылкой из sudo xgw panel",
+                "sudo apt install pkexec",
+            )]
+        return [Check(
+            "Панель", OK, "войти заново — правая кнопка по ярлыку «XGW», «Войти заново»",
         )]
 
     # --- службы и бюджет --------------------------------------------------------

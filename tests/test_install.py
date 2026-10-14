@@ -47,6 +47,8 @@ class Box:
         self.questions: list[str] = []
         self.xray_ok = True
         self.old_lan = self.system.add_profile("Wired connection 2", "lan0", active=True)
+        # Чей браузер открыла установка (open_panel): пусто — открывать негде.
+        self.opened_for: str | Exception = ""
 
     def ask(self, question: str) -> bool:
         self.questions.append(question)
@@ -62,8 +64,13 @@ class Box:
             self.cfg, self.paths, runner=self.system, out=self.out.append, ask=self.ask,
             source_root=REPO, proc_sys=self.proc, download=self.download,
             first_apply=lambda: self.xray_ok, which=lambda name: f"/usr/bin/{name}",
-            chown=lambda *args: None,
+            chown=lambda *args: None, open_panel=self.open_panel,
         )
+
+    def open_panel(self) -> str:
+        if isinstance(self.opened_for, Exception):
+            raise self.opened_for
+        return self.opened_for
 
     def install(self, **kwargs) -> int:
         return self.installer().run(assume_yes=True, **kwargs)
@@ -620,6 +627,10 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
     entry = desktop.read_text(encoding="utf-8")
     token = panel.read_token(box.paths)
     assert "Exec=xdg-open http://127.0.0.1:8781/\n" in entry and token not in entry
+    # Браузер забыл вход — правая кнопка по ярлыку: окно пароля вместо терминала.
+    assert "Actions=login;\n" in entry and "[Desktop Action login]\n" in entry
+    assert "Name[ru]=Войти заново\n" in entry
+    assert f"Exec={box.paths.launcher.as_posix()} panel --login\n" in entry
     assert f"Icon={(box.paths.lib_dir / 'xgw' / 'ui' / 'icon.svg').as_posix()}\n" in entry
     for name in ("index.html", "login.html", "app.js", "app.css", "icon.svg"):
         assert (box.paths.lib_dir / "xgw" / "ui" / name).is_file(), name
@@ -639,6 +650,24 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
     assert box.uninstall() == 0, box.text()
     assert "ярлык панели удалён" in box.text()
     assert not desktop.exists() and not desktop.parent.exists()
+
+
+def test_install_opens_the_panel_in_the_browser_of_whoever_ran_sudo(box):
+    from xgw.desktop import DesktopError
+
+    box.opened_for = "alice"
+    assert box.install() == 0, box.text()
+    text = box.text()
+    assert "Панель уже открыта в браузере пользователя alice, вход выполнен" in text
+    assert "Откройте эту ссылку в браузере" not in text
+    assert "«Войти заново»" in text
+
+    box.out.clear()
+    box.opened_for = DesktopError("браузер пользователя alice не открылся: нет xdg-open")
+    assert box.install() == 0  # браузер — не повод считать установку неудачной
+    text = box.text()
+    assert "! панель в браузере не открылась: браузер пользователя alice" in text
+    assert "Откройте эту ссылку в браузере" in text
 
 
 def test_foreign_launchers_survive_uninstall(box):

@@ -23,7 +23,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import engine, fetch, log, managed
+from . import desktop, engine, fetch, log, managed
 from .config import Config
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
@@ -66,6 +66,12 @@ Terminal=false
 Categories=Network;
 Keywords=vpn;xray;proxy;
 StartupNotify=false
+Actions=login;
+
+[Desktop Action login]
+Name=Sign in again
+Name[ru]=Войти заново
+Exec={launcher} panel --login
 """
 
 _DEVICE_STATES = {
@@ -235,6 +241,7 @@ class Installer:
         first_apply: Callable[[], bool] | None = None,
         which: Callable[[str], str | None] = shutil.which,
         chown: Callable[..., None] = shutil.chown,
+        open_panel: Callable[[], str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = paths
@@ -249,6 +256,7 @@ class Installer:
         self.first_apply = first_apply or self._first_apply
         self.which = which
         self.chown = chown
+        self.open_panel = open_panel or self._open_panel
         self.journal = Journal(paths.journal_file)
         self.nm = nm.Nm(runner)
         self.capture = Capture(cfg, paths, runner=runner, logger=self.log, proc_sys=proc_sys)
@@ -906,7 +914,11 @@ class Installer:
         self.journal.setdefault("launcher_dir", not path.parent.exists())
         try:
             atomic_write_text(
-                path, DESKTOP_ENTRY.format(url=panel.address(self.cfg), icon=icon.as_posix()),
+                path,
+                DESKTOP_ENTRY.format(
+                    url=panel.address(self.cfg), icon=icon.as_posix(),
+                    launcher=self.paths.launcher.as_posix(),
+                ),
                 mode=0o644,
             )
         except OSError as exc:
@@ -916,6 +928,26 @@ class Installer:
         self._step(f"панель управления: {panel.address(self.cfg)}, ярлык «XGW» в меню приложений")
 
     # --- итог -------------------------------------------------------------------
+
+    def _open_panel(self) -> str:
+        """Панель — в браузере того, кто запустил установку через sudo, с одноразовым
+        кодом входа. Имя пользователя; пусто — открывать негде (не через sudo, нет
+        графического сеанса)."""
+        user = desktop.invoking_user()
+        if user is None or not desktop.graphical(user, self.runner):
+            return ""
+        if not panel.wait_ready(self.cfg.panel.port):
+            raise desktop.DesktopError("панель ещё не отвечает")
+        url = panel.login_address(self.cfg, panel.new_login(self.paths))
+        desktop.open_url(user, url, self.runner)
+        return user.name
+
+    def _browser(self) -> str:
+        try:
+            return self.open_panel()
+        except (desktop.DesktopError, OSError) as exc:
+            self._warn(f"панель в браузере не открылась: {exc}")
+            return ""
 
     def _summary(self, facts: Facts, xray_ok: bool) -> None:
         self.out("")
@@ -927,16 +959,25 @@ class Installer:
         else:
             self.out("XGW установлен. Подписок пока нет — VPN выключен, интернет идёт напрямую.")
         if self.cfg.panel.enabled:
+            opened = self._browser()
             token = panel.read_token(self.paths)
             self.out(f"Панель управления: {panel.address(self.cfg)}?token={token}")
-            self.out(
-                "  Откройте эту ссылку в браузере на этой машине (в терминале — Ctrl и щелчок)."
-            )
+            if opened:
+                self.out(
+                    f"  Панель уже открыта в браузере пользователя {opened}, вход выполнен. "
+                    "Если окна не видно — откройте ссылку выше (в терминале — Ctrl и щелчок)."
+                )
+            else:
+                self.out(
+                    "  Откройте эту ссылку в браузере на этой машине (в терминале — Ctrl и "
+                    "щелчок)."
+                )
             if not sources:
                 self.out("  Вставьте в панели адрес подписки и нажмите кнопку включения.")
             self.out(
-                "  Дальше панель открывается ярлыком «XGW» в меню приложений; ссылку заново "
-                "напечатает sudo xgw panel."
+                "  Дальше панель открывается ярлыком «XGW» в меню приложений. Если браузер "
+                "забудет вход — правая кнопка по ярлыку, «Войти заново» (спросит пароль); "
+                "ссылку заново напечатает и sudo xgw panel."
             )
         if facts.lan_if:
             address = self.cfg.network.lan_address.split("/")[0]

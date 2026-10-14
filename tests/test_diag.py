@@ -528,3 +528,16 @@ def test_dead_probe_url_is_named_by_diag(box, monkeypatch):
     replies = iter([answers["scan"], ScanResult("", "OK", 57620, 0.4)])
     monkeypatch.setattr(diag.scan, "scan_node", lambda info, cfg, **kwargs: next(replies))
     assert [check.level for check in box.diag()._probe()] == [WARN, FAIL]
+
+
+def test_panel_sign_in_again_needs_pkexec_on_a_desktop(box, monkeypatch):
+    """«Войти заново» у ярлыка спрашивает пароль через pkexec: без него — WARN с советом."""
+    monkeypatch.setattr(diag.sys, "platform", "linux")
+    ok = box.diag()._panel_login()
+    assert [check.level for check in ok] == [OK] and "«Войти заново»" in ok[0].text
+    missing = box.diag(which=lambda name: None if name == "pkexec" else "/x")._panel_login()
+    assert missing[0].level == WARN and missing[0].advice == "sudo apt install pkexec"
+    # Без рабочего стола (нет xdg-open) ярлык открывать некому — проверять нечего.
+    assert box.diag(which=lambda name: None if name == "xdg-open" else "/x")._panel_login() == []
+    box.cfg.panel.enabled = False
+    assert box.diag()._panel_login() == []

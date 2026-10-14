@@ -25,7 +25,9 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -53,6 +55,7 @@ MAX_BODY = 65536
 MAX_DRAIN = 1 << 20  # сколько лишнего дочитать, прежде чем отказать
 SELECT_TTL = 3.0  # как долго помнить ответ ядра о выбранном сервере
 EVENTS = 30
+LOGIN_TTL = 60.0  # сколько живёт одноразовый код входа, секунд
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
 _ORDER = {"member": 0, "spare": 1, "waiting": 2, "disabled": 3, "skipped": 4}
@@ -96,6 +99,67 @@ def ensure_token(paths: Paths) -> str:
 
 def address(cfg: Config) -> str:
     return f"http://127.0.0.1:{cfg.panel.port}/"
+
+
+def login_dir(paths: Paths) -> Path:
+    return paths.run / "panel-login"
+
+
+def _login_digest(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def new_login(paths: Paths, now: Callable[[], float] | None = None) -> str:
+    """Одноразовый код входа для ссылки, которую открывает сам XGW (установка, ярлык
+    «XGW» → «Войти заново»). Постоянный токен в адрес не попадает: адрес виден в списке
+    процессов и журнале, а код годится один раз и только LOGIN_TTL секунд. На диске —
+    не код, а его SHA-256, в каталоге, который читает только root."""
+    now = now or time.time
+    directory = login_dir(paths)
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(directory, 0o700)
+    for stale in directory.iterdir():
+        with contextlib.suppress(OSError):  # другой процесс мог убрать его сам
+            if now() - stale.stat().st_mtime > LOGIN_TTL:
+                stale.unlink()
+    code = secrets.token_urlsafe(24)
+    fd = os.open(directory / _login_digest(code), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    return code
+
+
+def use_login(paths: Paths, code: str, now: Callable[[], float] | None = None) -> bool:
+    """Код входа годен: есть, не старше LOGIN_TTL. Проверенный код гасится сразу."""
+    if not code or len(code) > 64:
+        return False
+    now = now or time.time
+    path = login_dir(paths) / _login_digest(code)
+    try:
+        age = now() - path.stat().st_mtime
+        path.unlink()
+    except OSError:  # кода нет: уже использован, устарел и убран либо выдуман
+        return False
+    # Время файла бывает чуть впереди time.time() (в Windows часы Python грубее, чем у
+    # NTFS): только что выданный код не должен оказаться «из будущего».
+    return -1.0 <= age <= LOGIN_TTL
+
+
+def login_address(cfg: Config, code: str) -> str:
+    return f"{address(cfg)}?login={code}"
+
+
+def wait_ready(port: int, wait: float = 15.0) -> bool:
+    """Панель принимает соединения; только что запущенному демону даётся wait секунд."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.3)
 
 
 class _Server(ThreadingHTTPServer):
@@ -806,16 +870,19 @@ class Panel:
             name, content_type = _STATIC[url.path]
             self._file(handler, name, content_type, body)
             return
-        given = (parse_qs(url.query).get("token") or [""])[0]
-        if given:
-            if not self.token or not hmac.compare_digest(
-                given.encode("utf-8"), self.token.encode("utf-8")
+        query = parse_qs(url.query)
+        given = (query.get("token") or [""])[0]
+        once = (query.get("login") or [""])[0]  # одноразовый код (new_login)
+        if given or once:
+            if not self.token or not (
+                hmac.compare_digest(given.encode("utf-8"), self.token.encode("utf-8"))
+                if given else use_login(self.paths, once)
             ):
                 time.sleep(0.5)  # перебор токена не должен быть быстрым
                 self._file(handler, "login.html", "text/html; charset=utf-8", body,
                            code=HTTPStatus.FORBIDDEN)
                 return
-            # Токен переезжает в cookie и уходит из адресной строки и истории.
+            # Вход переезжает в cookie, токен или код уходит из адресной строки и истории.
             handler.send_response(HTTPStatus.SEE_OTHER)
             handler.send_header("Location", "/")
             handler.send_header(

@@ -248,6 +248,42 @@ def test_token_moves_into_a_cookie_and_out_of_the_address(rig):
     assert rig.client.request("GET", "/api/state")[0].status == 401
 
 
+def test_one_time_login_code_works_once_and_only_for_a_minute(rig, monkeypatch):
+    """Ссылку для браузера XGW открывает сам (установка, «Войти заново» у ярлыка): в ней
+    не постоянный токен, а одноразовый код — адрес виден в списке процессов и журнале."""
+    code = panel_module.new_login(rig.paths)
+    stored = list(panel_module.login_dir(rig.paths).iterdir())
+    assert len(stored) == 1 and code not in stored[0].name  # на диске — только SHA-256
+    if os.name != "nt":
+        assert panel_module.login_dir(rig.paths).stat().st_mode & 0o777 == 0o700
+        assert stored[0].stat().st_mode & 0o777 == 0o600
+    response, _text = rig.client.request("GET", f"/?login={code}")
+    cookie = response.getheader("Set-Cookie")
+    assert response.status == 303 and response.getheader("Location") == "/"
+    assert cookie and code not in cookie and TOKEN not in cookie
+    rig.client.cookie = cookie.split(";")[0]
+    assert rig.client.request("GET", "/api/state")[0].status == 200
+    rig.client.cookie = ""
+    # Второй раз код не годится, выдуманный — тоже.
+    for value in (code, "guess", "x" * 200):
+        response, text = rig.client.request("GET", f"/?login={value}")
+        assert response.status == 403 and 'name="token"' in text
+    assert list(panel_module.login_dir(rig.paths).iterdir()) == []
+    # Через минуту код устарел; новый код убирает устаревшие.
+    stale = panel_module.new_login(rig.paths)
+    later = time.time() + panel_module.LOGIN_TTL + 1
+    monkeypatch.setattr(panel_module.time, "time", lambda: later)
+    assert rig.client.request("GET", f"/?login={stale}")[0].status == 403
+    old = panel_module.new_login(rig.paths, now=lambda: time.time() - 1000)
+    panel_module.new_login(rig.paths, now=lambda: later + 1000)
+    assert not panel_module.use_login(rig.paths, old)
+
+
+def test_login_page_points_to_the_sign_in_again_item(rig):
+    _response, text = rig.client.request("GET", "/")
+    assert "«Войти заново»" in text and "sudo xgw panel" in text
+
+
 def test_foreign_host_header_is_refused(rig, user):
     """Подмена DNS (rebinding): сайт злоумышленника указывает на 127.0.0.1."""
     for host in ("evil.example", f"evil.example:{rig.panel.port}", "127.0.0.1:1"):
