@@ -404,6 +404,21 @@ button, textarea, input { font: inherit; color: inherit; }
   background: color-mix(in srgb, var(--warn) 13%, transparent);
   font-size: .9rem;
 }
+.note.bad {
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+}
+.nodes-note { margin: -.2rem 0 .6rem; }
+/* Расход трафика на проверки серверов: под списком, заметнее — при превышении лимита. */
+.budget-note { margin-top: .8rem; padding-top: .7rem; border-top: 1px solid var(--line); }
+.budget-note.over {
+  padding: .55rem .8rem;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  color: var(--text, inherit);
+}
+.budget-note b { font-weight: 600; }
 
 /* --- серверы по подпискам -------------------------------------------------- */
 

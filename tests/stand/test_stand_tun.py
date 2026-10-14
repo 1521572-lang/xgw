@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 import netns
@@ -173,16 +174,31 @@ def test_method_can_be_switched_both_ways(tmp_path):
         assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=1), stand.xray_log(30)
         assert "tun-in" not in stand.gw_run("cat", str(stand.root / "etc/xgw/xray/config.json"))
 
-        # tproxy → tun. Inbound tun в работающем Xray ещё нет: интерфейс создан, но его
-        # никто не читает, и трафик машины блокируется, а не идёт мимо VPN.
+        # tproxy → tun. Inbound'а tun в работающем Xray ещё нет: маршрут в интерфейс увёл бы
+        # трафик машины в никуда (так машина и оставалась без интернета — отчёт о проверке
+        # на настоящей машине, дефект D1). Поэтому перехват не загружается вовсе: сеть
+        # работает напрямую, а команды и статус говорят, чего ждут.
         stand.write_config(capture=True, method="tun")
+        assert stand.xgw("net", "up").returncode == 0
+        assert _routes(stand).strip() == "" and "fwmark" not in _rules(stand)
+        table = stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert "tproxy" not in table and "masquerade" in table  # шлюз — обычный роутер
+        assert stand.exit_ip("gw") == DIRECT and stand.exit_ip("lan") == DIRECT
+        status = stand.xgw("status").stdout
+        assert "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray)" in status, status
+        assert "tun-in" in status and "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" not in status
+        refused = stand.xgw("enable")
+        assert refused.returncode == 1 and "перехват пока не включён" in refused.stderr
+        assert "xgw apply --now" in refused.stderr and stand.exit_ip("gw") == DIRECT
+        # Конфиг применён (Xray перезапущен с tun-in) — правила загружаются как обычно.
+        assert stand.xgw("apply", "--now").returncode == 0
+        assert "tun-in" in stand.gw_run("cat", str(stand.root / "etc/xgw/xray/config.json"))
         assert stand.xgw("net", "up").returncode == 0
         assert f"default dev {TUN}" in _routes(stand)
         assert 'iifname "lo"' not in stand.gw_run("nft", "list", "table", "ip", "xgw")
-        assert stand.exit_ip("gw") == "" and stand.exit_ip("lan") == VIA_VPN
-        assert stand.xgw("apply", "--now").returncode == 0
         assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=1), stand.xray_log(30)
-        assert _capture(stand)["tun"] is True
+        assert stand.exit_ip("lan") == VIA_VPN
+        assert _capture(stand)["tun"] is True and _capture(stand)["inbound_missing"] == ""
         # Интерфейс подготовлен до запуска Xray и постоянный: он переживает остановку.
         stand.xray_service().stop()
         assert TUN in _link(stand) and stand.exit_ip("gw") == ""
@@ -243,3 +259,55 @@ def test_validation_does_not_fight_the_running_xray_for_the_interface(gateway):
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert gateway.exit_ip("gw") == VIA_VPN  # и сам Xray это не задело
     assert TUN in _link(gateway) and "xgwchk" not in gateway.gw_run("ip", "-br", "link")
+
+
+def _watch_switch(stand: Stand, done, limit: float = 90.0) -> list[str]:
+    """Опрашивает, с какого адреса выходит сама машина, пока смена способа не завершится.
+    Возвращает всё, что видел: адрес VPN, адрес WAN (напрямую) или пусто (нет связи)."""
+    seen: list[str] = []
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        seen.append(stand.exit_ip("gw"))
+        if seen[-1] == VIA_VPN and done():
+            return seen
+        time.sleep(0.3)
+    raise AssertionError(f"смена способа не завершилась: {seen[-10:]}\n{stand.tail('daemon', 40)}")
+
+
+def test_daemon_switches_the_method_by_itself_and_never_lets_traffic_out_directly(tmp_path):
+    """Способ перехвата меняют в config.toml при работающем демоне: tproxy → tun → tproxy.
+    Никаких команд и никакого окна перезапуска (на стенде оно — минута после полуночи):
+    демон сам перезапускает Xray с новым inbound'ом и только после этого меняет правила.
+    Пока это происходит, машина либо ходит через VPN по прежним правилам, либо секунду
+    без связи — но не напрямую."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up(capture=True, method="tproxy")
+        assert stand.xgw("enable").returncode == 0
+        assert stand.exit_ip("gw") == VIA_VPN and _routes(stand).strip() == ""
+        stand.start_daemon()
+        assert wait_for(lambda: stand.xgw_json("status").get("state") == "HEALTHY", 40)
+        config_json = stand.root / "etc/xgw/xray/config.json"
+
+        stand.write_config(capture=True, method="tun")
+        seen = _watch_switch(stand, lambda: f"default dev {TUN}" in _routes(stand))
+        assert DIRECT not in seen, seen
+        assert "tun-in" in stand.gw_run("cat", str(config_json))
+        assert not (stand.root / "etc/xgw/xray/config.pending.json").exists()
+        capture = _capture(stand)
+        assert capture["tun"] is True and capture["inbound_missing"] == ""
+        assert stand.exit_ip("lan") == VIA_VPN
+        log = stand.tail("daemon", 200)
+        assert "изменение inbound перехвата" in log, log
+
+        stand.write_config(capture=True, method="tproxy")
+        seen = _watch_switch(
+            stand, lambda: "tun-in" not in stand.gw_run("cat", str(config_json))
+            and _routes(stand).strip() == ""
+        )
+        assert DIRECT not in seen, seen
+        assert 'iifname "lo"' in stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert stand.exit_ip("gw") == VIA_VPN and stand.exit_ip("lan") == VIA_VPN
+    finally:
+        stand.stop()

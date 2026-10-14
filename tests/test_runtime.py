@@ -207,15 +207,70 @@ def test_notifier_masks_secrets_and_survives_bad_sink(tmp_path):
 
 def test_probe_budget_matches_spec_example():
     """Раздел 6.8: 5 участников, 64 КиБ, 30 с — около 0,94 ГБ в сутки."""
-    budget = status.probe_budget(Config(), members=5, spares=0)
+    cfg = Config()
+    cfg.probe.url = "https://probe.example.net/blob?bytes=65536"
+    budget = status.probe_budget(cfg, members=5, spares=0)
     assert budget.probes == 5 * 65536 * 2880 == 943_718_400
     assert budget.total == budget.probes  # сквозная проверка считается отдельно
-    assert status.budget_warnings(Config(), budget, {}) == []
+    assert status.budget_warnings(cfg, budget, {}) == []
 
-    with_spares = status.probe_budget(Config(), members=5, spares=60)
+    with_spares = status.probe_budget(cfg, members=5, spares=60)
     assert with_spares.scans == 60 * 65536 * 24
-    warnings = status.budget_warnings(Config(), with_spares, {})
+    warnings = status.budget_warnings(cfg, with_spares, {})
     assert len(warnings) == 1 and "больше лимита 1024" in warnings[0]
+
+
+def test_probe_budget_of_the_default_url_fits_the_daily_limit():
+    """Файл пробы по умолчанию — 57 620 байт: 5 участников укладываются в 1024 МБ в
+    сутки вместе со сканом шестидесяти пяти запасных (так было на живой машине)."""
+    cfg = Config()
+    budget = status.probe_budget(cfg, members=5, spares=65)
+    assert budget.size == 57_620 and budget.measured is False
+    assert budget.probes == 5 * 57_620 * 2880 == 829_728_000
+    assert budget.scans == 65 * 57_620 * 24
+    assert budget.total / status.MB < cfg.probe.max_daily_probe_mb
+    assert status.budget_warnings(cfg, budget, {}) == []
+    assert budget.everything == budget.probes + budget.scans + budget.e2e
+
+
+def test_probe_budget_uses_the_measured_size(tmp_path):
+    """Размер тела незнакомого probe.url узнаёт сквозная проверка: от него и считается
+    расход. Запись относится к своему адресу — после смены probe.url она не годится."""
+    store = Store(tmp_path / "state.db")
+    cfg = Config()
+    cfg.probe.url = "https://files.example.net/sample.bin"
+    assert status.probe_budget(cfg, 5, 0).size == status.DEFAULT_PROBE_BYTES  # оценка
+    status.remember_probe_size(store, cfg.probe.url, 87_533)
+    size = status.measured_probe_size(store, cfg.probe.url)
+    assert size == 87_533
+    budget = status.probe_budget(cfg, 5, 0, size)
+    assert budget.measured and budget.probes == 5 * 87_533 * 2880  # ~1260 МБ в сутки
+    assert "больше лимита 1024" in status.budget_warnings(cfg, budget, {})[0]
+    assert status.measured_probe_size(store, "https://other.example.net/x") is None
+    status.remember_probe_size(store, cfg.probe.url, 0)  # пустое тело — не размер
+    assert status.measured_probe_size(store, cfg.probe.url) == 87_533
+    store.close()
+
+
+def test_budget_summary_shows_the_month_and_the_share_of_the_quota():
+    cfg = Config()
+    budget = status.probe_budget(cfg, members=5, spares=65)
+    quotas = {"main": {"upload": 0, "download": 10**9, "total": 200 * 10**9}, "free": {}}
+    summary = status.budget_summary(cfg, budget, quotas, 5, 65)
+    assert summary["total_mb"] == 919.6 and summary["over"] is False
+    assert summary["all_mb"] == round(budget.everything / 1e6, 1)
+    assert summary["month_gb"] == round(budget.everything * 30 / 1e9, 1) == 35.1
+    assert summary["quota_share"] == {"main": 17.5}  # 35,1 ГБ из 200 ГБ
+    assert summary["probe_bytes"] == 57_620 and summary["interval_s"] == 30
+    text = "\n".join(status.render_budget(summary))
+    assert "Трафик проверок: ~920 МБ/сут" in text
+    assert "~35.1 ГБ/мес" in text and "проба 57 620 Б (по оценке); участников — 5" in text
+    assert "запасных — 65, скан раз в 60 мин" in text
+    text.encode("cp1251")  # в консоли и окне установщика Windows строка читается целиком
+    assert "за месяц это ~18 % квоты подписки «main»" in text
+    cfg.probe.max_daily_probe_mb = 500
+    over = status.budget_summary(cfg, budget, quotas, 5, 65)
+    assert over["over"] is True and "больше лимита 500" in over["warnings"][0]
 
 
 def test_budget_warns_about_quota():
@@ -266,3 +321,39 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
     text = status.render_status(snapshot)
     assert "Состояние: HEALTHY" in text and "жив, 123 мс" in text and "нет данных" in text
     assert "FROZEN, 16384 Б" in text
+
+
+def test_status_line_says_capture_waits_for_the_inbound():
+    capture = {"mode": "on", "lan_if": "", "lan": False, "local": True, "bypass": [],
+               "tun": True, "loaded": True,
+               "inbound_missing": "в применённом конфиге Xray нет inbound tun-in для "
+                                  "интерфейса xgwtun0"}
+    line = status.render_capture(capture)
+    assert line.startswith("Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray) — ")
+    assert "tun-in" in line and "трафик идёт напрямую" in line and "xgw apply --now" in line
+    # Перехват снят человеком — про inbound говорить незачем.
+    assert "СНЯТ (xgw disable)" in status.render_capture({**capture, "mode": "off"})
+    assert status.render_capture({**capture, "inbound_missing": ""}) == (
+        "Перехват: включён — эта машина через TUN")
+
+
+def test_status_shows_the_node_summary_and_the_probe_url_warning():
+    assert status.render_nodes({}) == ""
+    summary = {"members": 5, "spares": 65, "dropped": 4, "duplicates": 12, "excluded": 0,
+               "dns": 2}
+    line = status.render_nodes(summary)
+    assert line.startswith(
+        "Узлов: 5 активных, 65 запасных (отброшено 4 недоступных/служебных, "
+        "схлопнуто 12 дублей)")
+    assert "из отброшенных 2 — домен не разрешается" in line
+    assert "отключено или убрано в панели: 3" in status.render_nodes({**summary, "excluded": 3})
+
+    warning = ("Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен "
+               "сам probe.url (HTTP 403)")
+    snapshot = {
+        "daemon": True, "state": "PROBE_TARGET_UNREACHABLE", "action": "…", "since": None,
+        "xray": {"ok": True, "version": "26.3.27"}, "members": [], "spares": [],
+        "nodes": summary, "probe_target": warning,
+    }
+    text = status.render_status(snapshot)
+    assert warning in text and "Узлов: 5 активных, 65 запасных" in text

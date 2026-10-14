@@ -383,3 +383,33 @@ def test_connect_rejected_by_proxy():
     )
     assert not result.ok and result.kind == "proxy" and result.status == 407
     assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+def test_probe_request_carries_the_configured_user_agent(serve):
+    """probe.user_agent доходит до сервера; без него — «xgw/<версия>». Сжатия проба не
+    просит: тело нужно целиком, по нему считается расход трафика."""
+    server = serve(HEADERS + b"x" * BODY)
+    agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+    assert _get(server, user_agent=agent).ok
+    assert f"User-Agent: {agent}\r\n".encode() in server.requests[0]
+    assert b"Accept-Encoding" not in server.requests[0]
+    assert _get(server).ok
+    assert b"User-Agent: xgw/0.1\r\n" in server.requests[1]
+    assert _get(server, user_agent="Bad\r\nX-Injected: 1").ok  # перевод строки не пролезет
+    assert b"X-Injected" not in server.requests[2]
+
+
+def test_scan_sends_probe_user_agent_and_keeps_the_failure_kind(serve):
+    from xgw.config import Config
+    from xgw.generator.builder import NodeInfo
+    from xgw.watch import scan
+
+    cfg = Config()
+    cfg.probe.url = URL
+    cfg.probe.user_agent = "ProbeAgent/9"
+    server = serve(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden")
+    node = NodeInfo("aaaaaaaa", "spare-nl-aaaa", "probe-nl-aaaa", server.port, "spare")
+    result = scan.scan_node(node, cfg, probe_pass="secret", silence=0.5)
+    assert b"User-Agent: ProbeAgent/9\r\n" in server.requests[0]
+    assert (result.verdict, result.kind, result.status, result.error) == (
+        "CONNECT_FAIL", "http", 403, "HTTP 403")

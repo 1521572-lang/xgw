@@ -740,3 +740,42 @@ def test_panel_follows_the_config(tmp_path):
     built = Panel.from_config(cfg, paths, paths.config_file)
     assert built.port == 8899 and built.token == panel_module.read_token(paths)
     assert panel_module.address(cfg) == "http://127.0.0.1:8899/"
+
+
+def test_state_carries_the_probe_budget_the_node_summary_and_the_probe_url_warning(rig, user):
+    """Расход трафика на проверки (в сутки и в месяц), сводка разбора подписок и
+    предупреждение «не отвечает сам probe.url» доходят до страницы как есть."""
+    snapshot = _snapshot()
+    cfg = config.Config()
+    budget = status.probe_budget(cfg, members=5, spares=65)
+    quotas = {"main": {"total": 200 * 10**9}}
+    snapshot["budget"] = status.budget_summary(cfg, budget, quotas, 5, 65)
+    snapshot["nodes"] = {"members": 5, "spares": 65, "dropped": 4, "duplicates": 12,
+                         "excluded": 0, "dns": 2}
+    snapshot["probe_target"] = "Внимание: все пробы падают с одинаковой ошибкой"
+    snapshot["state"] = "PROBE_TARGET_UNREACHABLE"
+    status.write_status(rig.paths, snapshot)
+    state = user.state()
+    assert state["state"] == "PROBE_TARGET_UNREACHABLE"
+    assert state["probe_target"] == snapshot["probe_target"]
+    assert state["nodes"]["dropped"] == 4 and state["nodes"]["duplicates"] == 12
+    shown = state["budget"]
+    assert shown["month_gb"] == 35.1 and shown["all_mb"] > shown["total_mb"] == 919.6
+    assert shown["over"] is False and shown["quota_share"] == {"main": 17.5}
+    assert shown["probe_bytes"] == 57_620 and shown["members"] == 5
+
+    # Страница умеет это показать: блоки есть в разметке, тексты — в сценарии.
+    page = user.request("GET", "/")[1]
+    for block in ('id="budget-note"', 'id="nodes-note"', 'id="probe-note"'):
+        assert block in page
+    script = user.request("GET", "/app.js")[1]
+    for text in ("PROBE_TARGET_UNREACHABLE", "ГБ в месяц", "Это больше лимита", "inbound_missing"):
+        assert text in script
+
+
+def test_state_tells_the_page_that_capture_waits_for_xray(rig, user):
+    fakexray.write(rig.paths, {"inbounds": [{"tag": "socks-in"}]})  # Xray без tproxy-in
+    capture = user.state()["capture"]
+    assert capture["mode"] == "on" and "tproxy-in" in capture["inbound_missing"]
+    fakexray.write(rig.paths)
+    assert user.state()["capture"]["inbound_missing"] == ""

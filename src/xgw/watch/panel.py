@@ -444,6 +444,9 @@ class Panel:
             "telegram": self.bot.info() if self.bot is not None else {"mode": "unavailable"},
             "events": events,
             "budget": snapshot.get("budget") or {},
+            # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
+            "nodes": snapshot.get("nodes") or {},
+            "probe_target": snapshot.get("probe_target") or "",
             "pending_restart": bool(snapshot.get("pending_restart")),
             "busy": {
                 "refresh": bool(daemon is not None and daemon.refresh_pending),

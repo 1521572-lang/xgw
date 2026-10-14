@@ -3,7 +3,12 @@
 какое действие выполнить (обновить подписку, переприменить правила, уведомить).
 
 Приоритет состояний (что важнее при одновременных сбоях):
-XRAY_DOWN > WAN_DOWN > LEAK > ALL_DEAD > DEGRADED > HEALTHY.
+XRAY_DOWN > WAN_DOWN > LEAK > PROBE_TARGET_UNREACHABLE > ALL_DEAD > DEGRADED > HEALTHY.
+
+PROBE_TARGET_UNREACHABLE — не отвечает сам адрес пробы (probe.url), а не серверы:
+пробы падают у всех одинаково, хотя трафик через VPN идёт (watch/target.py). Оно важнее
+ALL_DEAD и DEGRADED, потому что «мёртвыми» серверы в этот момент только выглядят:
+менять участников и внеочередно обновлять подписку незачем.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ class State(StrEnum):
     WAN_DOWN = "WAN_DOWN"
     XRAY_DOWN = "XRAY_DOWN"
     LEAK = "LEAK"
+    PROBE_TARGET_UNREACHABLE = "PROBE_TARGET_UNREACHABLE"
 
 
 @dataclass(frozen=True)
@@ -34,6 +40,7 @@ class Signals:
     e2e_ok: bool = True            # сквозная загрузка probe.url через http-in
     e2e_fail_streak: int = 0
     leak: bool = False             # trace_url вышел в home_country
+    probe_target_ok: bool = True   # False — не отвечает сам probe.url, а не серверы
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,8 @@ _ACTIONS = {
     State.XRAY_DOWN: "Xray не отвечает — перезапуск службы, после двух неудач откат на last-good",
     State.LEAK: "выход в домашнюю страну при включённом перехвате — "
     "правила nftables переприменяются",
+    State.PROBE_TARGET_UNREACHABLE: "все пробы падают с одинаковой ошибкой — вероятно, "
+    "недоступен сам probe.url; замена серверов приостановлена",
 }
 
 
@@ -68,6 +77,8 @@ class StateMachine:
             self.state = State.WAN_DOWN
         elif signals.leak:
             self.state = State.LEAK
+        elif not signals.probe_target_ok:
+            self.state = State.PROBE_TARGET_UNREACHABLE
         elif all_dead or (
             signals.e2e_fail_streak >= self.fail_threshold and not signals.e2e_ok
         ):

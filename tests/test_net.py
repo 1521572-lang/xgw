@@ -238,7 +238,12 @@ def test_enable_refuses_without_applied_tproxy_inbound(gateway):
     настоящей машине, когда правка настроек ждала окна перезапуска)."""
     fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
     assert gateway.enable() == "off"
-    assert gateway.tproxy_missing is True
+    assert "нет inbound tproxy-in на порту 12345" in gateway.held
+    assert gateway.describe()["inbound_missing"] == gateway.held
+    assert gateway.mode() == "on" and gateway.effective_mode() == "off"
+    # Загружено ровно то, что должно быть в этом положении: демон не станет
+    # перезагружать правила на каждом шаге.
+    assert gateway.loaded() is True
     kernel = gateway.kernel
     assert "tproxy" not in kernel.table  # трафик не перехвачен
     assert kernel.rules == [] and not kernel.route  # маршрут по метке тоже не нужен
@@ -246,8 +251,9 @@ def test_enable_refuses_without_applied_tproxy_inbound(gateway):
     # Желание человека запомнено: перехват включится, когда применится конфиг.
     assert json.loads(gateway.state_file.read_text())["enabled"] is True
     fakexray.write(gateway.paths)
+    assert gateway.loaded() is False  # конфиг применён — пора загружать перехват
     assert gateway.up() == "on"
-    assert gateway.tproxy_missing is False
+    assert gateway.held == "" and gateway.describe()["inbound_missing"] == ""
     assert "tproxy to 127.0.0.1:12345" in gateway.kernel.table
 
 
@@ -258,13 +264,16 @@ def test_capture_refuses_when_applied_config_is_missing_or_broken(gateway):
             gateway.paths.xray_config_file.unlink()
         else:
             gateway.paths.xray_config_file.write_text(text, encoding="utf-8")
-        assert gateway.applied_has_tproxy() is False
-        assert gateway.up() == "off" and gateway.tproxy_missing is True
+        assert gateway.inbound_problem()
+        assert gateway.up() == "off" and gateway.held
     # Другой порт перехвата — это уже не наш inbound.
     fakexray.write(
         gateway.paths, {"inbounds": [{"tag": "tproxy-in", "protocol": "tunnel", "port": 1234}]}
     )
-    assert gateway.applied_has_tproxy() is False
+    assert "на порту 12345" in gateway.inbound_problem()
+    # Перехват в конфиге выключен — и проверять нечего.
+    gateway.cfg.capture.lan = gateway.cfg.capture.local = False
+    assert gateway.inbound_problem() == ""
 
 
 def test_loaded_detects_missing_and_stale_rules(gateway):
@@ -334,7 +343,7 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "fail_mode": "closed",
-        "loaded": True, "tproxy_missing": False,
+        "loaded": True, "inbound_missing": "",
     }
 
 
@@ -360,6 +369,88 @@ def test_tun_is_created_before_the_rules_and_traffic_goes_into_it(gateway_tun):
     assert kernel.index("ip", "route", "replace") < kernel.index("nft", "-f")
     assert gateway.loaded() is True
     assert gateway.describe()["tun"] is True
+
+
+def test_tun_capture_waits_for_the_tun_inbound_in_xray(gateway_tun):
+    """Тот же предохранитель для capture.method = "tun": маршрут ведёт трафик машины в
+    интерфейс, и если Xray запущен без inbound'а tun-in (настройки ещё не применены),
+    читать из интерфейса некому — пакеты пропадают. Перехват не загружается."""
+    gateway = gateway_tun
+    kernel = gateway.kernel
+    fakexray.write(gateway.paths, fakexray.applied_config(tun=None))  # только tproxy-in
+    assert gateway.enable() == "off"
+    assert gateway.held == "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"
+    assert kernel.rules == [] and not kernel.routes(101) and "tproxy" not in kernel.table
+    assert gateway.loaded() is True and gateway.effective_mode() == "off"
+
+    # Xray слушает другой интерфейс (имя в настройках сменили, конфиг ещё прежний).
+    fakexray.write(gateway.paths, fakexray.applied_config(tun="oldtun0"))
+    assert gateway.up() == "off" and "xgwtun0" in gateway.held
+
+    fakexray.write(gateway.paths)  # конфиг с tun-in применён
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.held == ""
+    assert kernel.routes(101)[0]["dev"] == "xgwtun0" and gateway.loaded() is True
+
+
+def test_tun_needs_both_inbounds_when_the_lan_is_captured_too(gateway_tun):
+    """Сеть LAN и в режиме TUN идёт через TPROXY: без tproxy-in её трафик пропал бы."""
+    gateway = gateway_tun
+    fakexray.write(gateway.paths, {"inbounds": [
+        {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0"}},
+    ]})
+    assert gateway.enable() == "off" and "tproxy-in" in gateway.held
+
+
+def test_pure_tun_does_not_ask_for_a_tproxy_inbound(gateway_tun):
+    """Только эта машина, capture.lan = false: генератор не пишет tproxy-in вовсе, и
+    предохранитель не должен его требовать (иначе TUN не включился бы никогда)."""
+    gateway = gateway_tun
+    gateway.cfg.network.lan_if = ""
+    gateway.cfg.capture.lan = False
+    fakexray.write(gateway.paths, {"inbounds": [
+        {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0"}},
+    ]})
+    assert gateway.inbound_problem() == ""
+    assert gateway.enable() == "on" and gateway.loaded() is True
+
+
+def test_capture_is_not_loaded_when_the_tun_interface_did_not_appear(gateway_tun, monkeypatch):
+    """Команда создания прошла, а интерфейса в системе нет: маршрут в него вёл бы в
+    никуда — перехват не загружается, причина остаётся в held."""
+    from xgw.net import tun
+
+    gateway = gateway_tun
+    monkeypatch.setattr(tun, "present", lambda name, runner: False)
+    assert gateway.enable() == "off"
+    assert gateway.held == "TUN-интерфейса xgwtun0 нет в системе"
+    assert gateway.kernel.rules == [] and "tproxy" not in gateway.kernel.table
+    # Причина видна и в статусе — той же строкой, что и отсутствие inbound'а.
+    assert gateway.describe(check=False)["inbound_missing"] == gateway.held
+
+
+def test_capture_inbounds_lists_everything_the_rules_depend_on():
+    from xgw.net.capture import capture_inbounds
+
+    tproxy = {"tag": "tproxy-in", "listen": "127.0.0.1", "port": 12345, "protocol": "tunnel"}
+    tun_in = {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0", "mtu": 1500}}
+    http = {"tag": "http-in", "protocol": "http", "port": 10809}
+    probe = {"tag": "probe-nl-1243", "protocol": "http", "port": 20001}
+    config = {"inbounds": [tproxy, tun_in, http, probe]}
+    assert len(capture_inbounds(config)) == 2  # http-in и пробы правил сети не касаются
+    assert capture_inbounds({}) == [] and capture_inbounds(None) == []
+    assert capture_inbounds({"inbounds": "нет"}) == []
+    # Любой параметр inbound'а перехвата — уже другой набор.
+    renamed = {"inbounds": [tproxy, {**tun_in, "settings": {"name": "vpn7", "mtu": 1500}}]}
+    assert capture_inbounds(renamed) != capture_inbounds(config)
+    moved = {"inbounds": [{**tproxy, "port": 12346}, tun_in]}
+    assert capture_inbounds(moved) != capture_inbounds(config)
+    assert capture_inbounds({"inbounds": [tun_in, tproxy]}) == capture_inbounds(config)
+    # Windows: системный прокси указывает на http-in.
+    assert capture_inbounds(config, sysproxy=True) == capture_inbounds(
+        {"inbounds": [http]}, sysproxy=True)
+    assert capture_inbounds({"inbounds": [{**http, "port": 10819}]}, sysproxy=True) != (
+        capture_inbounds(config, sysproxy=True))
 
 
 def test_tun_machine_only_has_no_tproxy_rule_or_table(gateway_tun):
@@ -543,3 +634,103 @@ def test_ipv6_failure_to_load_is_an_error(gateway6):
     with pytest.raises(CaptureError):
         gateway6.enable()
     assert gateway6.mode() == "on"
+
+
+# --- подсеть LAN и сети других интерфейсов ---------------------------------------------
+
+
+def _ip_runner(addresses: dict[str, list[str]], gateway: str = "", dev: str = "",
+               routes: list[dict] | None = None):
+    """Подмена `ip -j -4 addr show` и `ip -j -4 route show`."""
+    import ipaddress
+
+    def run(argv, **_kwargs) -> str:
+        if list(argv) == ["ip", "-j", "-4", "addr", "show"]:
+            return json.dumps([
+                {"ifname": name, "addr_info": [
+                    {"family": "inet", "local": item.split("/")[0],
+                     "prefixlen": int(item.split("/")[1])} for item in items]}
+                for name, items in addresses.items()
+            ])
+        assert list(argv) == ["ip", "-j", "-4", "route", "show"], argv
+        found = [{"dst": "default", "gateway": gateway, "dev": dev}] if gateway else []
+        found += [
+            {"dst": str(ipaddress.IPv4Interface(item).network), "dev": name, "scope": "link"}
+            for name, items in addresses.items() for item in items
+        ]
+        return json.dumps([*found, *(routes or [])])
+
+    return run
+
+
+def _subnet_cfg(address: str = "192.168.50.1/24", lan_if: str = "enp4s0") -> Config:
+    cfg = Config()
+    cfg.network.lan_if = lan_if
+    cfg.network.lan_address = address
+    return cfg
+
+
+def test_lan_subnet_must_not_overlap_the_wan_network():
+    """Так было на живой машине: провайдерский роутер раздаёт 192.168.50.0/24 и сам
+    стоит на 192.168.50.1 — ровно то, что XGW по умолчанию назначил бы карте LAN."""
+    runner = _ip_runner(
+        {"lo": ["127.0.0.1/8"], "enp3s0f0": ["192.168.50.37/24"]},
+        gateway="192.168.50.1", dev="enp3s0f0",
+    )
+    cfg = _subnet_cfg()
+    conflicts = lan.subnet_conflicts(cfg, runner)
+    assert conflicts == [lan.Conflict("enp3s0f0", "192.168.50.0/24")]  # шлюз — в той же сети
+    assert lan.free_lan_address(cfg, runner) == "192.168.60.1/24"
+    text = lan.conflict_text(cfg, conflicts, "/etc/xgw/config.toml", "192.168.60.1/24")
+    assert text == (
+        "Конфликт подсетей: lan_address (192.168.50.1/24) пересекается с интерфейсом "
+        "enp3s0f0 (192.168.50.0/24). Измените lan_address и dhcp_range в "
+        "/etc/xgw/config.toml (например, на 192.168.60.1/24)."
+    )
+    assert lan.subnet_conflicts(_subnet_cfg("192.168.60.1/24"), runner) == []
+
+
+def test_lan_subnet_check_ignores_the_lan_card_itself_and_local_addresses():
+    """Повторная установка: на карте LAN уже стоит её собственный адрес — это не
+    конфликт. Loopback и link-local (в том числе адрес TUN-интерфейса XGW) не в счёт."""
+    runner = _ip_runner({
+        "lo": ["127.0.0.1/8"], "enp4s0": ["192.168.50.1/24"], "wan0": ["203.0.113.5/24"],
+        "xgwtun0": ["169.254.10.1/32"],
+    }, gateway="203.0.113.1", dev="wan0")
+    assert lan.subnet_conflicts(_subnet_cfg(), runner) == []
+    assert lan.subnet_conflicts(_subnet_cfg(lan_if=""), runner) == []  # LAN не настроен
+    assert lan.subnet_conflicts(_subnet_cfg("не адрес"), runner) == []
+
+
+def test_lan_subnet_conflict_with_other_networks_and_the_default_gateway():
+    # Мост Docker, сеть шире нашей: пересечение считается и так.
+    docker = _ip_runner({"wan0": ["203.0.113.5/24"], "docker0": ["172.17.0.1/16"]},
+                        gateway="203.0.113.1", dev="wan0")
+    assert lan.subnet_conflicts(_subnet_cfg("172.17.5.1/24"), docker) == [
+        lan.Conflict("docker0", "172.17.0.0/16")]
+    # PPPoE: у интерфейса адрес /32, а шлюз провайдера — внутри нашей подсети.
+    pppoe = _ip_runner({"ppp0": ["100.70.1.2/32"]}, gateway="192.168.50.1", dev="ppp0")
+    found = lan.subnet_conflicts(_subnet_cfg(), pppoe)
+    assert found == [lan.Conflict("ppp0", "192.168.50.1/32", gateway=True)]
+    assert "со шлюзом по умолчанию на интерфейсе ppp0 (192.168.50.1/32)" in lan.conflict_text(
+        _subnet_cfg(), found, "config.toml")
+    # Маршрут в сеть через другой интерфейс (VPN на работу) — тоже занятая сеть.
+    routed = _ip_runner({"wan0": ["203.0.113.5/24"]}, gateway="203.0.113.1", dev="wan0",
+                        routes=[{"dst": "192.168.48.0/21", "dev": "wg0", "gateway": "10.9.0.1"}])
+    assert lan.subnet_conflicts(_subnet_cfg(), routed) == [lan.Conflict("wg0", "192.168.48.0/21")]
+
+
+def test_free_lan_address_skips_occupied_networks():
+    runner = _ip_runner({"wan0": ["192.168.50.37/24"], "br0": ["192.168.60.1/24"],
+                         "vm0": ["192.168.64.0/20"]})
+    assert lan.free_lan_address(_subnet_cfg(), runner) == "192.168.80.1/24"
+    everything = _ip_runner({"wan0": ["192.168.0.5/16"]})
+    assert lan.free_lan_address(_subnet_cfg(), everything) == ""  # совет без примера
+
+
+def test_lan_subnet_check_survives_a_missing_ip_tool():
+    def broken(argv, **_kwargs):
+        raise cmd.CommandError("ip: программа не найдена")
+
+    assert lan.occupied_networks(broken) == []
+    assert lan.subnet_conflicts(_subnet_cfg(), broken) == []

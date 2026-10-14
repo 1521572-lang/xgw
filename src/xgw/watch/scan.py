@@ -24,6 +24,10 @@ class ScanResult:
     bytes_read: int       # байт тела до остановки
     seconds: float
     error: str = ""
+    # Этап сбоя и код ответа HTTP (см. checks.DownloadResult): по ним отличают «не
+    # отвечает сам адрес пробы» от «не работает сервер» (watch/target.py).
+    kind: str = ""
+    status: int = 0
 
 
 def classify(result: DownloadResult, seconds: float, slow: float = SLOW_SECONDS) -> str:
@@ -63,6 +67,7 @@ def scan_node(
         silence=silence,
         proxy_user=probe_user,
         proxy_pass=probe_pass,
+        user_agent=cfg.probe.user_agent,
     )
     seconds = time.monotonic() - started
     return ScanResult(
@@ -71,6 +76,8 @@ def scan_node(
         bytes_read=result.downloaded,
         seconds=round(seconds, 2),
         error=result.error,
+        kind=result.kind,
+        status=result.status,
     )
 
 

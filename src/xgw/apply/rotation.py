@@ -1,7 +1,10 @@
 """Замена «мёртвых» участников балансировщика запасными (раздел 6.7).
 
 Участник с alive = false дольше rotate_after_min меняется на лучший запасной,
-прошедший последний скан (OK, затем SLOW по возрастанию времени). Тег узла
+прошедший последний скан (OK, затем SLOW по возрастанию времени). Участник, который не
+прошёл первую собственную проверку шлюза (соединение не устанавливается либо
+«замораживается»), меняется сразу: первый состав балансировщика берётся из подписки
+наугад, и ждать rotate_after_min с заведомо негодным сервером незачем. Тег узла
 включает роль, поэтому замена — это ado нового тега, adrules и rmo старого:
 ровно то, что делает Applier через diff_configs при пересборке конфига.
 
@@ -12,6 +15,7 @@ build → Applier.apply. Состав участников хранится в �
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from ..config import Config
@@ -19,6 +23,10 @@ from ..generator.builder import NodeInfo
 from ..model import ServerNode
 
 REPLACEABLE_VERDICTS = ("OK", "SLOW")
+# Вердикты первой проверки участника, при которых он меняется без ожидания
+# rotate_after_min. Таймаут сюда не входит: он бывает разовым, и такой узел идёт
+# обычным путём — через alive = false от самого Xray.
+REPLACE_NOW_VERDICTS = ("CONNECT_FAIL", "FROZEN")
 
 
 @dataclass
@@ -35,16 +43,23 @@ def plan_rotation(
     spares: list[tuple[NodeInfo, ServerNode]],  # (тег из конфига, узел)
     cfg: Config,
     now: float,
+    urgent: Collection[str] = (),
 ) -> Rotation | None:
     """alive — только по участникам с известным состоянием: узел, которого ещё
-    нет в observatory (ядро только что запущено), мёртвым не считается."""
+    нет в observatory (ядро только что запущено), мёртвым не считается.
+
+    urgent — теги участников, не прошедших первую проверку шлюза: их меняют сразу,
+    не дожидаясь ни rotate_after_min, ни вердикта observatory."""
     rotate_after = cfg.filters.rotate_after_min * 60
     dead_members = [
         info.tag
         for info in members
-        if alive.get(info.tag) is False
-        and info.tag in dead_since
-        and (now - dead_since[info.tag]) >= rotate_after
+        if info.tag in urgent
+        or (
+            alive.get(info.tag) is False
+            and info.tag in dead_since
+            and (now - dead_since[info.tag]) >= rotate_after
+        )
     ]
     if not dead_members:
         return None

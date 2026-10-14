@@ -79,6 +79,113 @@ def gateway(cfg: Config) -> ipaddress.IPv4Interface | None:
         return None
 
 
+@dataclass(frozen=True)
+class Conflict:
+    """С чем пересекается подсеть LAN: интерфейс и его сеть (или адрес шлюза)."""
+
+    interface: str
+    subnet: str
+    gateway: bool = False  # это адрес шлюза по умолчанию, а не сеть интерфейса
+
+
+def occupied_networks(
+    runner: cmd.Runner = cmd.run, *, skip: tuple[str, ...] = ()
+) -> list[tuple[str, ipaddress.IPv4Network, bool]]:
+    """Сети IPv4, которые уже заняты на машине: адреса интерфейсов, маршруты через них
+    и шлюз по умолчанию. skip — интерфейсы, которые не в счёт (сама карта LAN и lo).
+
+    Команды `ip` только читают состояние; если их нет или вывод не разобрать, список
+    пуст — проверить нечем.
+    """
+    found: list[tuple[str, ipaddress.IPv4Network, bool]] = []
+
+    def add(device: object, text: object, gateway: bool = False) -> None:
+        if not isinstance(device, str) or not device or device == "lo" or device in skip:
+            return
+        try:
+            network = ipaddress.IPv4Network(str(text), strict=False)
+        except ValueError:
+            return
+        if network.is_loopback or network.is_link_local or network.prefixlen == 0:
+            return
+        if (device, network, gateway) not in found:
+            found.append((device, network, gateway))
+
+    try:
+        links = json.loads(runner(["ip", "-j", "-4", "addr", "show"]) or "[]")
+        routes = json.loads(runner(["ip", "-j", "-4", "route", "show"]) or "[]")
+    except (cmd.CommandError, json.JSONDecodeError):
+        return []
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict):
+            continue
+        for address in link.get("addr_info") or []:
+            if isinstance(address, dict) and address.get("family", "inet") == "inet":
+                add(link.get("ifname"), f"{address.get('local')}/{address.get('prefixlen')}")
+    for route in routes if isinstance(routes, list) else []:
+        if not isinstance(route, dict):
+            continue
+        if route.get("dst") == "default":
+            if route.get("gateway"):
+                add(route.get("dev"), f"{route['gateway']}/32", gateway=True)
+        elif route.get("type", "unicast") == "unicast":
+            add(route.get("dev"), route.get("dst"))
+    return found
+
+
+def subnet_conflicts(cfg: Config, runner: cmd.Runner = cmd.run) -> list[Conflict]:
+    """С какими сетями машины пересекается network.lan_address.
+
+    Карта LAN с адресом из сети провайдера — это два интерфейса в одной подсети и, как
+    правило, адрес, уже занятый роутером провайдера: маршрут к нему становится
+    неоднозначным, и интернет пропадает и у шлюза, и у устройств за ним.
+    """
+    lan_if = lan_interface(cfg)
+    address = gateway(cfg)
+    if not lan_if or address is None:
+        return []
+    own = address.network
+    conflicts: list[Conflict] = []
+    for device, network, is_gateway in occupied_networks(runner, skip=(lan_if,)):
+        if not own.overlaps(network):
+            continue
+        # Адрес шлюза внутри уже названной сети того же интерфейса — тот же конфликт.
+        if is_gateway and any(item.interface == device and not item.gateway for item in conflicts):
+            continue
+        conflicts.append(Conflict(device, str(network), is_gateway))
+    return conflicts
+
+
+def free_lan_address(cfg: Config, runner: cmd.Runner = cmd.run) -> str:
+    """Свободная подсеть для совета: первая из 192.168.60–250.0/24, не пересекающаяся ни
+    с одной сетью машины. Пусто — такой не нашлось."""
+    lan_if = lan_interface(cfg)
+    taken = [network for _dev, network, _gw in occupied_networks(runner, skip=(lan_if,))]
+    for third in range(60, 251, 10):
+        candidate = ipaddress.IPv4Network(f"192.168.{third}.0/24")
+        if not any(candidate.overlaps(network) for network in taken):
+            return f"192.168.{third}.1/24"
+    return ""
+
+
+def conflict_text(cfg: Config, conflicts: list[Conflict], config_file: object,
+                  suggestion: str = "") -> str:
+    """Сообщение о конфликте подсетей — одно и то же в `xgw diag` и в установке."""
+    first = conflicts[0]
+    what = (
+        f"со шлюзом по умолчанию на интерфейсе {first.interface} ({first.subnet})"
+        if first.gateway else f"с интерфейсом {first.interface} ({first.subnet})"
+    )
+    more = "" if len(conflicts) == 1 else " и ещё с " + ", ".join(
+        f"{item.interface} ({item.subnet})" for item in conflicts[1:]
+    )
+    example = f" (например, на {suggestion})" if suggestion else ""
+    return (
+        f"Конфликт подсетей: lan_address ({cfg.network.lan_address}) пересекается {what}{more}. "
+        f"Измените lan_address и dhcp_range в {config_file}{example}."
+    )
+
+
 def parse_leases(cfg: Config) -> tuple[list[Lease], list[str]]:
     """static_leases: «aa:bb:cc:dd:ee:ff,192.168.50.20,имя» (имя необязательно)."""
     leases: list[Lease] = []

@@ -767,3 +767,64 @@ def test_first_install_run_asks_about_the_router_and_goes_on(root, monkeypatch, 
     root.config_file.unlink()
     assert main(["install", "--yes"]) == 1 and len(seen) == 1
     assert 'lan_if = ""' in root.config_file.read_text(encoding="utf-8")
+
+
+def test_reload_keeps_the_old_rules_until_xray_gets_the_new_capture_inbound(
+    root, tmp_path, monkeypatch
+):
+    """Сменили способ перехвата (tproxy → tun), а Xray ещё работает с прежним конфигом.
+    Прежние правила с ним согласованы и трафик через VPN носят: при перечитывании
+    настроек их не трогают — новые загрузит демон сразу после перезапуска Xray.
+    Загрузи их сейчас, трафик машины ушёл бы в интерфейс, из которого никто не читает
+    (или, с предохранителем, пошёл бы мимо VPN)."""
+    from fakenet import FakeKernel
+
+    import xgw.daemon
+
+    kernel = FakeKernel()
+    proc = tmp_path / "proc"
+    (proc / "net/ipv4").mkdir(parents=True)
+    (proc / "net/ipv4/ip_forward").write_text("0", encoding="ascii")
+    real_capture = cli.capture_for
+    monkeypatch.setattr(
+        cli, "capture_for",
+        lambda cfg, paths, **kwargs: real_capture(
+            cfg, paths, runner=kernel, proc_sys=proc, time_uids=(), **kwargs),
+    )
+    monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
+    monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
+    config_path = tmp_path / "config.toml"
+    _write_gateway_config(config_path, 2)
+    fakexray.write(root, fakexray.applied_config(tun=None))  # Xray: только tproxy-in
+    cfg, _warnings = cli.config.load(config_path)
+    assert cli.capture_for(cfg, root).enable() == "on"  # перехват работает через TPROXY
+    before = kernel.table
+    seen: list[tuple[str, dict]] = []
+
+    class FakeDaemon:
+        def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
+            self.capture = capture
+
+        def adopt(self, previous) -> None:
+            pass
+
+        def run(self, stop: threading.Event, changed) -> None:
+            seen.append((kernel.table, dict(kernel.links)))
+            if len(seen) == 2:
+                # Демон применил конфиг (Xray перезапущен с tun-in) и проверил правила.
+                fakexray.write(root)
+                assert self.capture.loaded() is False
+                assert self.capture.up() == "on"
+                stop.set()
+                return
+            with config_path.open("a", encoding="utf-8") as handle:
+                handle.write('[capture]\nmethod = "tun"\n')
+            stamp = time.time() + 10
+            os.utime(config_path, (stamp, stamp))
+
+    monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
+    assert main(["run", "--config", str(config_path)]) == 0
+    # После правки и до применения конфига: правила прежние, интерфейса TUN ещё нет.
+    assert seen[1] == (before, {}) and "tproxy" in before
+    assert kernel.links == {"xgwtun0": "tun"}  # а после применения — новые правила
+    assert kernel.routes(101)[0]["dev"] == "xgwtun0"

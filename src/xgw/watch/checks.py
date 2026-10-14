@@ -50,6 +50,7 @@ def http_get_via_proxy(
     keep_body: int = 0,
     max_total: float = MAX_TOTAL_SECONDS,
     tls_context: ssl.SSLContext | None = None,
+    user_agent: str = "",
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -57,6 +58,7 @@ def http_get_via_proxy(
     дочитанным до Content-Length (или до закрытия, если длина не объявлена).
     Нет новых байтов `silence` секунд → stalled; вся загрузка дольше
     `max_total` секунд → timeout (защита от «капающего» сервера).
+    `user_agent` — заголовок запроса (probe.user_agent); пусто — «xgw/<версия>».
     """
     parts = urlsplit(url)
     host = parts.hostname
@@ -86,7 +88,9 @@ def http_get_via_proxy(
             path = parts.path or "/"
             if parts.query:
                 path = f"{path}?{parts.query}"
-            request = _request("GET", path, {"Host": _host_header(host, port, 443)})
+            request = _request(
+                "GET", path, {"Host": _host_header(host, port, 443)}, user_agent
+            )
         else:
             try:
                 sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
@@ -96,7 +100,7 @@ def http_get_via_proxy(
             if proxy_user:
                 token = base64.b64encode(f"{proxy_user}:{proxy_pass}".encode()).decode("ascii")
                 headers["Proxy-Authorization"] = f"Basic {token}"
-            request = _request("GET", url, headers)  # абсолютный URI для http-прокси
+            request = _request("GET", url, headers, user_agent)  # абсолютный URI
         sock.sendall(request)
         return _read_response(sock, silence=silence, deadline=deadline, keep_body=keep_body)
     except TimeoutError as exc:
@@ -114,10 +118,12 @@ def _host_header(host: str, port: int, default_port: int) -> str:
     return name if port == default_port else f"{name}:{port}"
 
 
-def _request(method: str, target: str, headers: dict[str, str]) -> bytes:
+def _request(method: str, target: str, headers: dict[str, str], user_agent: str = "") -> bytes:
     lines = [f"{method} {target} HTTP/1.1"]
     lines.extend(f"{key}: {value}" for key, value in headers.items())
-    lines.extend(["User-Agent: " + fetch.DEFAULT_UA, "Accept: */*", "Connection: close"])
+    # Без Accept-Encoding: тело нужно целиком, несжатым — по нему считается размер пробы.
+    agent = user_agent if user_agent and user_agent.isprintable() else fetch.DEFAULT_UA
+    lines.extend(["User-Agent: " + agent, "Accept: */*", "Connection: close"])
     return (fetch.CRLF.join(lines) + fetch.CRLF * 2).encode("utf-8")
 
 
@@ -249,7 +255,8 @@ def parse_trace(body: str) -> str | None:
 
 
 def trace_location(trace_url: str, *, via: tuple[str, int] | None = None,
-                   timeout: float = 10.0, mark: int | None = None) -> str | None:
+                   timeout: float = 10.0, mark: int | None = None,
+                   user_agent: str = "") -> str | None:
     """Страна выхода по trace_url; None — узнать не удалось.
 
     Проверка утечки идёт обычным сокетом без метки (via=None, mark=None), то
@@ -257,13 +264,18 @@ def trace_location(trace_url: str, *, via: tuple[str, int] | None = None,
     """
     if via is None:
         try:
-            result = fetch.fetch_url(trace_url, timeout=timeout, mark=mark, retries=0)
+            result = fetch.fetch_url(
+                trace_url, timeout=timeout, mark=mark, retries=0,
+                headers={"User-Agent": user_agent} if user_agent else None,
+            )
         except fetch.FetchError:
             return None
         if result.status != 200:
             return None
         return parse_trace(result.body.decode("utf-8", "replace"))
-    download = http_get_via_proxy(via[0], via[1], trace_url, timeout=timeout, keep_body=4096)
+    download = http_get_via_proxy(
+        via[0], via[1], trace_url, timeout=timeout, keep_body=4096, user_agent=user_agent
+    )
     if not download.ok:
         return None
     return parse_trace(download.body.decode("utf-8", "replace"))

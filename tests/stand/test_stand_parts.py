@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import socket
 import subprocess
 import sys
@@ -206,3 +207,88 @@ def test_dns_answer_shapes():
     aaaa = _dns_query("any.example.com", qtype=28)
     assert _parse_a_answers(dns_answer(aaaa, "203.0.113.9")) == []  # на AAAA — пустой ответ
     assert dns_answer(b"short", "203.0.113.9") is None
+
+
+# --- «одноразовая машина»: XGW хоста не должен быть виден в контейнере -----------------
+
+
+def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
+    """Корень контейнера — оверлей поверх корня хоста. Если на хосте стоит XGW, без
+    чистки контейнер видел бы его конфиг, код, службы и следы в настройках: проверки
+    «первого запуска» не прошли бы ни одна. Чистится только то, что оставил XGW."""
+    import json
+
+    import machine
+
+    root = tmp_path / "root"
+    files = {
+        "etc/xgw/config.toml": "# конфиг хоста\n",
+        "etc/xgw/xray/config.json": "{}",
+        "opt/xgw/lib/xgw/__init__.py": "",
+        "var/lib/xgw/state.db": "",
+        "usr/local/bin/xgw": "#!/usr/bin/python3\n",
+        "etc/systemd/system/xgw.service": "[Service]\n",
+        "etc/systemd/system/xgw-net.service": "[Service]\n",
+        "etc/systemd/system/xgw-xray.service": "[Service]\n",
+        "etc/systemd/system/multi-user.target.wants/xgw.service": "",
+        "etc/systemd/system/network-pre.target.wants/xgw-net.service": "",
+        "etc/dnsmasq.d/xgw.conf": "port=0\n",
+        "etc/sysctl.d/90-xgw.conf": "net.ipv4.ip_forward = 1\n",
+        "usr/local/share/applications/xgw-panel.desktop": "[Desktop Entry]\n",
+        "etc/NetworkManager/system-connections/xgw-lan.nmconnection": "[connection]\n",
+        # Чужое — остаётся на месте.
+        "etc/systemd/system/ssh.service": "[Service]\n",
+        "etc/systemd/system/multi-user.target.wants/ssh.service": "",
+        "etc/dnsmasq.d/home.conf": "# своё\n",
+        "etc/sysctl.d/10-local.conf": "vm.swappiness = 10\n",
+        "etc/NetworkManager/system-connections/Wired.nmconnection": "[connection]\n",
+        "usr/local/bin/xgw-helper": "",
+        "etc/ufw/before.rules": (
+            "*filter\n-A ufw-before-input -i lo -j ACCEPT\n"
+            "-A ufw-before-input -i enp4s0 -m mark --mark 0x1 -j ACCEPT\n"
+            "-A ufw-before-input -j ufw-not-local\nCOMMIT\n"
+        ),
+    }
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    journal = {"sleep": ["sleep.target", "suspend.target"], "user_created": True,
+               "ufw": [["allow", "in", "on", "enp4s0"]], "ufw_before": True}
+    (root / "var/lib/xgw/backup").mkdir(parents=True)
+    (root / "var/lib/xgw/backup/install.json").write_text(json.dumps(journal), "utf-8")
+    masks = True
+    try:
+        os.symlink("/dev/null", root / "etc/systemd/system/sleep.target")
+        os.symlink("/dev/null", root / "etc/systemd/system/suspend.target")
+        os.symlink("/dev/null", root / "etc/systemd/system/ctrl-alt-del.target")  # чужая маска
+    except OSError:
+        masks = False  # Windows без права создавать ссылки: эта часть проверяется в Linux
+
+    assert machine.scrub_host_xgw(root) == journal
+    left = sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*")
+        if path.is_file() or path.is_symlink()
+    )
+    expected = [
+        "etc/NetworkManager/system-connections/Wired.nmconnection",
+        "etc/dnsmasq.d/home.conf",
+        "etc/sysctl.d/00-xgw-stand.conf",
+        "etc/sysctl.d/10-local.conf",
+        "etc/systemd/system/multi-user.target.wants/ssh.service",
+        "etc/systemd/system/ssh.service",
+        "etc/ufw/before.rules",
+        "usr/local/bin/xgw-helper",
+    ]
+    if masks:
+        expected.append("etc/systemd/system/ctrl-alt-del.target")
+    assert left == sorted(expected)
+    assert "--mark" not in (root / "etc/ufw/before.rules").read_text(encoding="utf-8")
+    assert "ufw-not-local" in (root / "etc/ufw/before.rules").read_text(encoding="utf-8")
+    # Форвардинг контейнер не наследует от хоста: «заводская» система — не роутер.
+    assert "net.ipv4.ip_forward = 0" in (root / machine.STAND_SYSCTL).read_text("utf-8")
+
+    # Чистый хост: чистить нечего, журнала нет; повтор безвреден.
+    assert machine.scrub_host_xgw(root) == {}
+    with pytest.raises(RuntimeError, match="корень системы"):
+        machine.scrub_host_xgw(Path(root.anchor))

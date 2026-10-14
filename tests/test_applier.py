@@ -250,6 +250,51 @@ def test_tproxy_inbound_change_is_not_deferred(env):
     assert "изменение inbound перехвата" in " ".join(outcome.ops)
 
 
+def test_tun_inbound_change_is_not_deferred(env):
+    """То же для capture.method = "tun": inbound tun-in появился, сменил интерфейс или
+    исчез — Xray перезапускается сразу, а не в окне: маршрут уже ведёт трафик машины в
+    интерфейс, из которого прежний Xray не читает."""
+    paths, current = env
+    tun_in = {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0", "mtu": 1500}}
+    with_tun = copy.deepcopy(current)
+    with_tun["inbounds"].insert(0, tun_in)
+    renamed = copy.deepcopy(current)
+    renamed["inbounds"].insert(0, {**tun_in, "settings": {"name": "vpn7", "mtu": 1500}})
+    for step in (with_tun, renamed, current):  # появился → изменился → исчез
+        service = StubService()
+        outcome = _applier(paths, StubApi(service=service, healthy_after=1), service).apply(step)
+        assert outcome.mode == "restart", outcome
+        assert "изменение inbound перехвата" in " ".join(outcome.ops)
+        assert service.restarts == 1 and not paths.pending_config_file.exists()
+        assert _on_disk(paths) == step
+
+
+def test_other_inbounds_still_wait_for_the_window(env):
+    """Немедленный перезапуск — только для inbound'ов перехвата: смена порта socks-in
+    по-прежнему ждёт окна (в Linux на него не ссылается ни одно правило сети)."""
+    paths, current = env
+    new = copy.deepcopy(current)
+    next(item for item in new["inbounds"] if item["tag"] == "socks-in")["port"] = 11808
+    service = StubService()
+    outcome = _applier(paths, StubApi(service=service), service).apply(new)
+    assert outcome.mode == "restart_deferred" and service.restarts == 0
+    assert paths.pending_config_file.exists()
+
+
+def test_sysproxy_http_inbound_change_is_not_deferred(env):
+    """Windows: системный прокси указывает на http-in. Сменили xray.http_port — прокси
+    уже смотрит на новый порт, и ждать окна нельзя: программы остались бы без сети."""
+    paths, current = env
+    new = copy.deepcopy(current)
+    next(item for item in new["inbounds"] if item["tag"] == "http-in")["port"] = 11809
+    service = StubService()
+    applier = _applier(paths, StubApi(service=service, healthy_after=1), service)
+    applier.cfg.capture.method = "sysproxy"
+    outcome = applier.apply(new)
+    assert outcome.mode == "restart" and service.restarts == 1
+    assert "изменение inbound перехвата" in " ".join(outcome.ops)
+
+
 def _with_tun_inbound(config: dict) -> dict:
     new = _needs_restart(config)
     new["inbounds"].insert(

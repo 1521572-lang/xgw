@@ -484,3 +484,52 @@ def test_describe_outcomes():
     assert engine.describe(ApplyOutcome("unchanged")) == "изменений нет"
     text = engine.describe(ApplyOutcome("restart_deferred", ops=["секция dns"], detail="окно"))
     assert text == "нужен перезапуск Xray — отложен: секция dns (окно)"
+
+
+def test_enable_before_xray_has_the_capture_inbound(network, capsys):
+    """Правилам нужен inbound, которого в применённом конфиге Xray ещё нет: команда не
+    рапортует «перехват включён», сеть остаётся прямой, а статус говорит, чего ждём.
+    Когда конфиг применён, правила загружаются — выбор «включено» был запомнен."""
+    path = network.paths.xray_config_file
+    applied = path.read_text(encoding="utf-8")
+    stripped = json.loads(applied)
+    stripped["inbounds"] = [
+        item for item in stripped["inbounds"] if not item["tag"].startswith("tproxy-in")]
+    path.write_text(json.dumps(stripped), encoding="utf-8")
+
+    assert network.run("enable") == 1
+    err = capsys.readouterr().err
+    assert "перехват пока не включён: в применённом конфиге Xray нет inbound tproxy-in" in err
+    assert "перехват включится сам" in err and "sudo xgw apply --now" in err
+    assert "tproxy" not in network.kernel.table and "masquerade" in network.kernel.table
+    assert network.kernel.rules == []
+
+    assert network.run("status") == 0
+    out = capsys.readouterr().out
+    assert "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray)" in out
+    assert "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" not in out
+
+    path.write_text(applied, encoding="utf-8")  # Xray перезапущен с новым конфигом
+    assert network.run("net", "up") == 0
+    assert "Перехват: включён — сеть lan0 и эта машина" in capsys.readouterr().out
+    assert "tproxy to 127.0.0.1:12345" in network.kernel.table
+
+
+def test_probe_all_points_at_the_probe_url_when_everything_fails_the_same_way(
+    gateway, monkeypatch, capsys
+):
+    """Все серверы отвечают одной и той же ошибкой — так было с адресом пробы, который
+    отдавал 403: команда подсказывает, что дело, скорее всего, не в серверах."""
+    from xgw.watch.scan import ScanResult
+
+    monkeypatch.setattr(
+        cli.scan, "scan_node",
+        lambda info, cfg, **kwargs: ScanResult(
+            info.tag, "CONNECT_FAIL", 0, 0.2, "HTTP 403", "http", 403),
+    )
+    assert gateway.run("probe", "--all") == 0
+    captured = capsys.readouterr()
+    assert captured.out.count("CONNECT_FAIL") == 4
+    assert "все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url" in (
+        captured.err)
+    assert "HTTP 403 у всех 4 серверов" in captured.err and "xgw diag" in captured.err

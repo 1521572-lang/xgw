@@ -1,12 +1,15 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
-    python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|windows]
+    python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|windows|
+                                                      probe|budget|waiting]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
 каталоге. Сцена hostile подставляет имена сервера и устройства с HTML: в
 браузере они должны остаться текстом. Сцена windows — XGW как VPN-клиент Windows:
-системный прокси вместо перехвата, сети с устройствами нет.
+системный прокси вместо перехвата, сети с устройствами нет. Сцена probe — не отвечает
+сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
+waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from xgw import actions, config, engine
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
+from xgw.watch import status
 from xgw.watch.panel import Panel
 
 TOKEN = "demo"
@@ -63,6 +67,7 @@ SERVERS = [
     ("0d15ab1e", "", "🇰🇿 Казахстан · Алматы", "main", ""),
     ("0de1e7ed", "", "🇮🇳 Индия · Мумбаи", "main", ""),
     ("0f117e4d", "", "Осталось 35.5 ГБ трафика", "main", "filter"),
+    ("0d05dead", "", "🇸🇬 Сингапур · sg.gone.example.net", "main", "dns"),
 ]
 LIVE = {
     "a1a1a1a1": {"alive": True, "delay_ms": 84},
@@ -112,20 +117,37 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     elif scene == "trouble":
         state = "XRAY_DOWN"
         action = "Xray не отвечает — перезапуск службы, после двух неудач откат на last-good"
+    probe_target = ""
+    if scene == "probe":
+        state = "PROBE_TARGET_UNREACHABLE"
+        action = ("все пробы падают с одинаковой ошибкой — вероятно, недоступен сам "
+                  "probe.url; замена серверов приостановлена")
+        probe_target = ("Внимание: все пробы падают с одинаковой ошибкой — вероятно, "
+                        "недоступен сам probe.url (HTTP 403; напрямую, мимо VPN, ответ "
+                        "тот же — HTTP 403)")
+    quotas = {} if scene == "empty" else {
+        "main": {"upload": 3_100_000_000, "download": 61_400_000_000,
+                 "total": 100_000_000_000, "expire": int(now) + 86400 * 23},
+    }
+    probe_cfg = config.Config()
+    if scene == "budget":
+        probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
+    budget = status.probe_budget(probe_cfg, len(members), len(spares))
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
         "xray": {"ok": scene != "trouble", "version": "26.3.27"},
         "capture": {"loaded": True},
         "members": members, "spares": spares, "selecting": [], "pin": None,
-        "quota": {} if scene == "empty" else {
-            "main": {"upload": 3_100_000_000, "download": 61_400_000_000,
-                     "total": 100_000_000_000, "expire": int(now) + 86400 * 23},
-        },
+        "quota": quotas,
         "sub_errors": {} if scene == "empty" else {
             "запасная": {"error": "HTTP 403 от сервера подписки", "ts": now - 300},
         },
-        "budget": {"probes_mb": 943.5, "scans_mb": 6.3, "total_mb": 949.8, "e2e_mb": 283.1,
-                   "limit_mb": 1024, "warnings": []},
+        "budget": status.budget_summary(probe_cfg, budget, quotas, len(members), len(spares)),
+        "nodes": {} if scene == "empty" else {
+            "members": len(members), "spares": len(spares), "dropped": 2, "duplicates": 12,
+            "excluded": len(excluded), "dns": 1,
+        },
+        "probe_target": probe_target,
         "pending_restart": False, "events": [],
     }
 
@@ -135,6 +157,7 @@ class DemoCapture:
 
     mode_now = "on"
     sysproxy = False  # сцена windows: системный прокси вместо перехвата
+    inbound_missing = ""  # сцена waiting: Xray ещё без inbound'а перехвата
 
     def __init__(self, cfg, paths, **_kwargs) -> None:
         self.cfg = cfg
@@ -151,7 +174,9 @@ class DemoCapture:
                     "fail_mode": "closed", "loaded": None}
         return {"mode": DemoCapture.mode_now, "lan_if": self.lan_if, "lan": True, "local": True,
                 "bypass": lan.bypass_addresses(self.cfg)[0], "fail_mode": "closed",
-                "loaded": None}
+                "loaded": None,
+                "inbound_missing": DemoCapture.inbound_missing
+                if DemoCapture.mode_now == "on" else ""}
 
 
 class DemoDaemon:
@@ -251,7 +276,7 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         SubscriptionCache(paths.cache_dir).save("main", b"demo")
         atomic_write_json(engine.inventory_file(paths), {"saved": now, "servers": [
             {"fingerprint": fingerprint, "name": name, "source": source, "protocol": "vless",
-             "skip": role if role == "filter" else ""}
+             "skip": role if role in ("filter", "dns") else ""}
             for fingerprint, _tag, name, source, role in _servers(scene)
         ]})
         device = "<script>alert(1)</script>" if scene == "hostile" else "smart-tv"
@@ -289,6 +314,9 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     threading.Thread(target=keep_fresh, daemon=True).start()
     if scene == "empty":
         DemoCapture.mode_now = "off"
+    if scene == "waiting":
+        DemoCapture.inbound_missing = (
+            "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0")
     cfg, _warnings = config.load(config_path)
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
                       capture_factory=DemoCapture, runner=lambda *_args, **_kwargs: "")
@@ -300,7 +328,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8791)
     parser.add_argument(
-        "--scene", choices=("work", "empty", "trouble", "hostile", "windows"), default="work")
+        "--scene", default="work",
+        choices=("work", "empty", "trouble", "hostile", "windows", "probe", "budget", "waiting"))
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)

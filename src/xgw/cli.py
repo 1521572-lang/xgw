@@ -32,7 +32,7 @@ from .net import cmd, dnsmasq, nft, tun
 from .net.capture import CaptureError, capture_for
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
-from .watch import scan, status
+from .watch import scan, status, target
 from .xraycore import binary, metrics
 from .xraycore.api import ApiError
 
@@ -433,21 +433,29 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
     if not password or not view:
         return _fail("в рабочем конфиге нет probe-inbounds")
 
-    verdicts: list[str] = []
+    results: list[scan.ScanResult] = []
     with _store(paths) as store:
         for info in view:
             result = scan.scan_node(info, cfg, probe_pass=password)
             store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error
             )
-            verdicts.append(result.verdict)
+            results.append(result)
             detail = f"  {result.error}" if result.error else ""
             print(
                 f"{info.tag:<20} {result.verdict:<18} "
                 f"{result.bytes_read:>7} Б за {result.seconds:>5.1f} с{detail}"
             )
     if len(view) == 1:
-        return 0 if verdicts[0] in ("OK", "SLOW") else 1
+        return 0 if results[0].verdict in ("OK", "SLOW") else 1
+    common = target.uniform(results)
+    if common:
+        # Одна и та же ошибка у всех — чаще это адрес пробы, чем все серверы разом.
+        print(
+            f"Внимание: {target.WARNING} ({common} у всех {len(results)} серверов). "
+            "Что именно не отвечает, покажет sudo xgw diag",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -457,7 +465,10 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
 def _emit(outcome: actions.Outcome) -> int:
     """Итог действия — в терминал: текст и примечания либо ошибка с кодом возврата."""
     if not outcome.ok:
-        return _fail(outcome.text, outcome.code)
+        code = _fail(outcome.text, outcome.code)
+        for line in outcome.hints:  # что делать дальше — и при отказе тоже
+            print(line, file=sys.stderr)
+        return code
     print(outcome.text)
     for line in (*outcome.notes, *outcome.hints):
         print(line)
@@ -652,6 +663,14 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             capture = capture_for(cfg, paths)
             if not capture.configured or _root_problem(cfg):
                 capture = None  # следить не за чем либо нечем: правила меняет только root
+            elif reloaded and capture.mode() == "on" and getattr(
+                capture, "inbound_problem", lambda: ""
+            )():
+                # Новым правилам нужен inbound, которого у работающего Xray ещё нет
+                # (сменили способ перехвата, порт, имя TUN). Прежние правила и прежний
+                # Xray согласованы — их и оставляем: демон первым шагом перезапустит
+                # Xray с новым конфигом и сразу после этого загрузит новые правила.
+                logger.info("правила перехвата обновятся после перезапуска Xray")
             elif reloaded:
                 # Настройки изменились — правила (обход, исключения) загружаются заново.
                 try:

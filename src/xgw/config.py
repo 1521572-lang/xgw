@@ -18,6 +18,26 @@ class ConfigError(Exception):
     """Конфиг не читается или это битый TOML."""
 
 
+# Файл пробы по умолчанию — неизменяемая версия пакета на CDN jsDelivr, 57 620 байт.
+# Выбран шрифт WOFF, а не текст: проба самого Xray (burstObservatory) отправляет
+# `Accept-Encoding: gzip`, и текстовый файл того же размера пришёл бы сжатым втрое
+# (проверено: moment.min.js — 58 103 байта без сжатия и 18 514 со сжатием). Тело
+# короче ~20 КБ «заморозку» не ловит: соединение замирает как раз после 8–20 КБ.
+# Прежний адрес (speed.cloudflare.com/__down) отдавал 403 запросам без браузерного
+# User-Agent — проверено на живой машине, отчёт docs/TEST-REPORT-2026-10-14.md.
+DEFAULT_PROBE_URL = (
+    "https://cdn.jsdelivr.net/npm/material-design-icons@3.0.1/iconfont/MaterialIcons-Regular.woff"
+)
+DEFAULT_PROBE_SIZE = 57_620
+# User-Agent собственных проб XGW (скан, сквозная проверка, diag). Браузерный: часть
+# CDN и WAF отвечает 403 всему, что на браузер не похоже. Пробы самого Xray и так
+# ходят с заголовками Chrome — на них эта настройка не влияет.
+DEFAULT_PROBE_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
 @dataclass
 class Network:
     wan_if: str = ""
@@ -90,7 +110,8 @@ class Filters:
 
 @dataclass
 class Probe:
-    url: str = "https://speed.cloudflare.com/__down?bytes=65536"
+    url: str = DEFAULT_PROBE_URL
+    user_agent: str = DEFAULT_PROBE_UA
     url_fallback: str = ""
     trace_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
     interval: str = "30s"
@@ -330,7 +351,10 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
 
 
 def probe_bytes(url: str) -> int | None:
-    """Размер пробы в байтах, если он есть в URL (…?bytes=65536)."""
+    """Размер пробы в байтах, если он известен заранее: записан в URL (…?bytes=65536)
+    либо это файл по умолчанию. Для прочих адресов размер узнаёт сквозная проверка."""
+    if url == DEFAULT_PROBE_URL:
+        return DEFAULT_PROBE_SIZE
     values = parse_qs(urlsplit(url).query).get("bytes")
     if not values:
         return None
@@ -485,6 +509,11 @@ def _validate(cfg: Config) -> list[str]:
             f"символов, не карта LAN или WAN) — используется {Capture().tun_name}"
         )
         cfg.capture.tun_name = Capture().tun_name
+    if not cfg.probe.user_agent.strip() or not cfg.probe.user_agent.isprintable():
+        if cfg.probe.user_agent.strip():
+            warnings.append("probe.user_agent: недопустимые символы — используется значение "
+                            "по умолчанию")
+        cfg.probe.user_agent = DEFAULT_PROBE_UA
     for name in ("interval", "timeout"):
         if not re.fullmatch(r"\d+[smh]", getattr(cfg.probe, name)):
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")

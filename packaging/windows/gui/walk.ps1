@@ -4,7 +4,7 @@
 # a wrong last page or a dead "open the panel" box show up only here.
 #
 #   powershell -ExecutionPolicy Bypass -File walk.ps1 -Phase install `
-#       -Setup build\windows\XGW-Setup-0.1.0.exe -Work <empty scratch folder>
+#       -Setup build\windows\XGW-Setup-0.1.1.exe -Work <empty scratch folder>
 #   powershell -ExecutionPolicy Bypass -File walk.ps1 -Phase uninstall -Work <same> [-Purge]
 #
 # Result in <Work>: install.log / uninstall.log (page texts, UTF-8) and *.png, one

@@ -32,6 +32,25 @@ def _no_bot(monkeypatch):
     monkeypatch.setattr("xgw.cli._sync_bot", lambda bot, *args, **kwargs: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_dns(monkeypatch):
+    """Сборка конфига в тестах не ходит в настоящий DNS: резолверы «недоступны», как без
+    сети. Результат не должен зависеть от того, есть ли у машины интернет: иначе домен
+    вида *.example.com то находился бы, то объявлялся бы несуществующим. Карантин
+    доменов — память процесса; между тестами она очищается."""
+    from xgw import engine, fetch
+
+    def offline(name, bootstrap, mark):
+        raise fetch.ResolveError(f"тесты не ходят в DNS ({name})")
+
+    monkeypatch.setattr(engine, "resolve_domain", offline)
+    engine.forget_quarantine()
+    engine._hosts_cache.clear()
+    yield
+    engine.forget_quarantine()
+    engine._hosts_cache.clear()
+
+
 REGEN = os.environ.get("XGW_REGEN_GOLDEN") == "1"
 
 

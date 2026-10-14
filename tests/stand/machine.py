@@ -16,12 +16,19 @@
 
 Нужны root, systemd-nspawn (пакет systemd-container) и NetworkManager — в самой
 системе либо .deb-пакетами в каталоге XGW_MACHINE_DEBS: они ставятся только
-внутри контейнера.
+внутри контейнера. XGW_MACHINE_PREINSTALL_DNSMASQ=1 ставит в контейнер пакет dnsmasq ещё
+до установки XGW — так проверяется хост, на котором dnsmasq уже есть.
+
+XGW, установленный на самом хосте, стенду не мешает: его файлы, службы и следы в
+настройках убираются из верхнего слоя оверлея ещё до загрузки контейнера (см.
+scrub_host_xgw) — хост при этом не меняется, а контейнер получает систему, на которой
+XGW никогда не ставили.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -40,6 +47,81 @@ LAN_NS = "xgwm-lan"
 WAN_LINK = "xgwm-wan"  # концы veth на стороне хоста; в контейнере — wan0 и lan0
 LAN_LINK = "xgwm-lan"
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Что оставляет в системе `xgw install` (пути от корня).
+HOST_XGW_PATHS = (
+    "etc/xgw", "opt/xgw", "var/lib/xgw", "usr/local/bin/xgw",
+    "etc/dnsmasq.d/xgw.conf", "etc/sysctl.d/90-xgw.conf",
+    "usr/local/share/applications/xgw-panel.desktop",
+)
+HOST_XGW_GLOBS = (
+    "etc/systemd/system/xgw*.service",
+    "etc/systemd/system/*.wants/xgw*.service",
+    "etc/systemd/system/*.requires/xgw*.service",
+    "etc/NetworkManager/system-connections/xgw-lan*",
+)
+SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
+# «Заводская» система — не роутер. Сетевое пространство имён контейнера при создании
+# наследует значения хоста, а на хосте форвардинг бывает включён (Docker, установленный
+# XGW): этот файл возвращает его при каждой загрузке контейнера. Файл XGW (90-xgw.conf)
+# читается позже и для шлюза с LAN включает форвардинг обратно.
+STAND_SYSCTL = "etc/sysctl.d/00-xgw-stand.conf"
+
+
+def _remove(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def scrub_host_xgw(root: Path) -> dict:
+    """Убирает из корня контейнера XGW, установленный на хосте.
+
+    Корень контейнера — оверлей поверх корня хоста: всё, что `xgw install` оставил на
+    хосте, видно и внутри. С этим не прошла бы ни одна проверка «первого запуска»
+    (config.toml уже есть), а при загрузке контейнера стартовали бы службы xgw хоста.
+    Удаление идёт в верхнем слое оверлея и хост не затрагивает.
+
+    Журнал установки хоста (var/lib/xgw/backup/install.json) говорит, что ещё XGW менял
+    вне своих каталогов: маски целей сна убираются сразу, а правила ufw и пользователь
+    xray — после загрузки, командами внутри контейнера (см. Machine.prepare). Возвращает
+    журнал, если он был.
+    """
+    root = Path(root)
+    if root.resolve() == Path(root.anchor):
+        raise RuntimeError(f"{root} — это корень системы, а не корень контейнера")
+    journal: dict = {}
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        loaded = json.loads((root / "var/lib/xgw/backup/install.json").read_text("utf-8"))
+        if isinstance(loaded, dict):
+            journal = loaded
+    for relative in HOST_XGW_PATHS:
+        _remove(root / relative)
+    for pattern in HOST_XGW_GLOBS:
+        for path in root.glob(pattern):
+            _remove(path)
+    for target in journal.get("sleep") or []:
+        link = root / "etc/systemd/system" / str(target)
+        if str(target) in SLEEP_TARGETS and link.is_symlink() and os.readlink(link) == "/dev/null":
+            link.unlink()
+    if journal.get("ufw_before"):
+        rules = root / "etc/ufw/before.rules"
+        with contextlib.suppress(OSError):
+            lines = rules.read_text(encoding="utf-8").splitlines(keepends=True)
+            kept = [
+                line for line in lines
+                if not (line.startswith("-A ufw-before-input -i ") and "--mark" in line
+                        and line.rstrip().endswith("-j ACCEPT"))
+            ]
+            if kept != lines:
+                rules.write_text("".join(kept), encoding="utf-8")
+    sysctl = root / STAND_SYSCTL
+    sysctl.parent.mkdir(parents=True, exist_ok=True)
+    sysctl.write_text(
+        "net.ipv4.ip_forward = 0\nnet.ipv6.conf.all.forwarding = 0\n", encoding="utf-8"
+    )
+    return journal
 
 
 def unavailable() -> str:
@@ -84,6 +166,9 @@ class Machine:
         self.share = BASE / "share"  # общий каталог: в контейнере — по тому же пути
         self.leader = 0
         self._proc: subprocess.Popen | None = None
+        self.host_journal: dict = {}  # журнал установки XGW на хосте, если он там стоит
+        # Пакет dnsmasq достался контейнеру от хоста: установке XGW ставить его незачем.
+        self.dnsmasq_preinstalled = False
 
     # --- создание и удаление ----------------------------------------------------
 
@@ -95,6 +180,9 @@ class Machine:
             (BASE / name).mkdir()
         _run(["mount", "-t", "overlay", "overlay", "-o",
               f"lowerdir=/,upperdir={BASE / 'upper'},workdir={BASE / 'work'}", str(self.root)])
+        if _run(["mountpoint", "-q", str(self.root)], check=False).returncode != 0:
+            raise RuntimeError(f"оверлей не смонтирован в {self.root}")
+        self.host_journal = scrub_host_xgw(self.root)
         for namespace in (INET_NS, LAN_NS):
             _run(["ip", "netns", "add", namespace])
             _run(["ip", "-n", namespace, "link", "set", "lo", "up"])
@@ -268,6 +356,15 @@ fi
 systemctl restart NetworkManager
 """
         )
+        if os.environ.get("XGW_MACHINE_PREINSTALL_DNSMASQ") == "1":
+            # Изобразить хост, на котором пакет dnsmasq уже стоит (так было на настоящей
+            # машине после удаления XGW: пакеты удаление не трогает). Служба со своим
+            # конфигом по умолчанию может и не запуститься — порт 53 занят резолвером.
+            self.sh(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "dnsmasq >/dev/null 2>&1 || true"
+            )
+        self._forget_host_xgw()
         self._wait_nm()
         self.sh(
             f"""
@@ -284,6 +381,25 @@ nmcli --wait 20 connection up stand-wan >/dev/null
             # reload — чтобы набор правил ufw был в том же виде, что и после любой
             # его перезагрузки: по нему сверяется состояние до установки и после удаления.
             self.sh("ufw --force enable >/dev/null && ufw reload >/dev/null")
+
+    def _forget_host_xgw(self) -> None:
+        """То, что XGW хоста оставил вне своих каталогов и что убирается командами:
+        правила ufw для его карты LAN и пользователь xray. И dnsmasq: если пакет уже
+        стоит (достался от хоста), служба выключается — как на машине, где его
+        поставили, но не настраивали; установке XGW тогда ставить нечего."""
+        for rule in self.host_journal.get("ufw") or []:
+            if isinstance(rule, list) and all(isinstance(item, str) for item in rule):
+                routed = rule[:1] == ["route"]
+                args = ["route", "delete", *rule[1:]] if routed else ["delete", *rule]
+                self.run("ufw", *args, check=False, timeout=60)
+        if self.host_journal.get("user_created"):
+            self.run("userdel", "xray", check=False)
+        installed = self.run(
+            "dpkg-query", "-W", "-f=${Status}", "dnsmasq", check=False
+        ).stdout
+        self.dnsmasq_preinstalled = "ok installed" in installed
+        if self.dnsmasq_preinstalled:
+            self.run("systemctl", "disable", "--now", "dnsmasq.service", check=False)
 
     def _wait_nm(self, timeout: float = 30) -> None:
         deadline = time.monotonic() + timeout

@@ -50,6 +50,14 @@ class ResolveError(Exception):
     pass
 
 
+class NoSuchDomain(ResolveError):
+    """Резолвер ответил определённо: имени нет (NXDOMAIN) либо у него нет адреса IPv4.
+
+    В отличие от сбоя резолвера (таймаут, отказ) повтор сразу ничего не даст: сервер с
+    таким адресом недоступен, пока владелец домена его не вернёт.
+    """
+
+
 @dataclass
 class FetchResult:
     status: int
@@ -357,8 +365,15 @@ def _skip_name(payload: bytes, offset: int) -> int:
 
 
 def _parse_a_answers(payload: bytes) -> list[str]:
+    """Адреса IPv4 из ответа. Пустой список — имя есть, но A-записей у него нет."""
     if len(payload) < 12:
         raise ResolveError("битый DNS-ответ: короче заголовка")
+    rcode = payload[3] & 0x0F
+    if rcode == 3:
+        raise NoSuchDomain("такого имени нет (NXDOMAIN)")
+    if rcode:
+        # SERVFAIL, REFUSED и прочее — сбой резолвера, а не сведения о домене.
+        raise ResolveError(f"резолвер ответил ошибкой (RCODE {rcode})")
     qdcount, ancount = struct.unpack(">HH", payload[4:8])
     offset = 12
     for _ in range(qdcount):
@@ -423,8 +438,12 @@ def resolve_domain(name: str, bootstrap: list[str], *, mark: int | None = None) 
 
     Адреса возвращаются отсортированными: DNS-ротация не должна менять
     dns.hosts (и тем самым конфиг) от запуска к запуску.
+
+    NoSuchDomain — адресов нет ни у кого, и хотя бы один резолвер ответил
+    определённо (NXDOMAIN или пустой ответ); прочие сбои — ResolveError.
     """
     errors: list[str] = []
+    absent = ""
     for entry in bootstrap:
         try:
             if entry.startswith("https://"):
@@ -440,7 +459,13 @@ def resolve_domain(name: str, bootstrap: list[str], *, mark: int | None = None) 
                 continue
             if ips:
                 return sorted(set(ips), key=ipaddress.ip_address)
+            absent = absent or "у имени нет адреса IPv4"
             errors.append(f"{masking.mask_url(entry)}: пустой ответ")
+        except NoSuchDomain as exc:
+            absent = str(exc)
+            errors.append(f"{masking.mask_url(entry)}: {exc}")
         except Exception as exc:
             errors.append(f"{masking.mask_url(entry)}: {exc}")
+    if absent:
+        raise NoSuchDomain(f"домен {name} не разрешается: {absent}")
     raise ResolveError(f"не удалось разрешить {name}: {'; '.join(errors[:3])}")

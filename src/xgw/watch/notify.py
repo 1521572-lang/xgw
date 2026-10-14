@@ -33,6 +33,8 @@ TITLES = {
     "XRAY_DOWN": "Xray не отвечает",
     "LEAK": "трафик идёт мимо VPN",
     "leak": "трафик идёт мимо VPN",
+    "PROBE_TARGET_UNREACHABLE": "не отвечает адрес проверки серверов (probe.url)",
+    "probe": "адрес проверки серверов",
     "capture": "перехват трафика",
     "rotation": "замена сервера",
     "rollback": "откат конфига Xray",

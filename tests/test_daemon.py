@@ -98,6 +98,9 @@ class Harness(Daemon):
         self.default_verdict = "OK"
         self.scanned: list[str] = []
         self.e2e_checks = 0
+        self.base_ping = False  # базовый запрос через VPN (проверка «не отвечает probe.url»)
+        self.direct = ""  # probe.url напрямую: пусто — отдаётся, иначе класс сбоя
+        self.failures: dict[str, ScanResult] = {}  # probe-тег → результат пробы с ошибкой
 
     def _read_observatory(self):
         if self.observatory is None:
@@ -135,8 +138,18 @@ class Harness(Daemon):
 
     def _scan(self, info, password):
         self.scanned.append(info.tag)
+        if "*" in self.failures or info.probe_tag in self.failures:
+            failure = self.failures.get(info.probe_tag) or self.failures["*"]
+            return ScanResult(info.tag, failure.verdict, failure.bytes_read, failure.seconds,
+                              failure.error, failure.kind, failure.status)
         verdict = self.verdicts.get(info.probe_tag, self.default_verdict)
         return ScanResult(info.tag, verdict, 65536 if verdict == "OK" else 16384, 0.5)
+
+    def _base_ping(self):
+        return self.base_ping
+
+    def _direct_probe(self):
+        return self.direct
 
     # --- удобства для тестов ---
 
@@ -200,7 +213,8 @@ def test_first_tick_builds_and_starts(daemon):
 
 def test_healthy_tick_scans_spares_and_writes_status(daemon):
     daemon.tick()
-    assert sorted(daemon.scanned) == sorted(daemon.tags("spare"))  # первый скан — сразу
+    # Первый скан — сразу; вместе с запасными один раз проверяются и сами участники.
+    assert sorted(daemon.scanned) == sorted(daemon.tags("proxy") + daemon.tags("spare"))
     _started(daemon)
     assert daemon.tick() is State.HEALTHY
     assert daemon.applied == []  # подписка не изменилась — применять нечего
@@ -463,7 +477,8 @@ def test_leak_is_checked_only_with_capture(tmp_path, monkeypatch):
 
 
 def test_budget_warning_is_reported_once(daemon):
-    daemon.cfg.probe.interval = "10s"  # 2 участника × 64 КиБ × 8640 ≈ 1,1 ГБ > лимита 1024 МБ
+    daemon.cfg.probe.interval = "10s"  # 2 участника × 57 620 Б × 8640 ≈ 1 ГБ в сутки
+    daemon.cfg.probe.max_daily_probe_mb = 900
     _started(daemon)
     daemon.tick()
     daemon.tick()
@@ -541,11 +556,13 @@ class FakeCapture:
         self.is_loaded = True
         self.fail = False
         self.calls: list[str] = []
+        self.problem = ""  # какого inbound'а нет в применённом конфиге Xray
 
     def mode(self):
         return self.state
 
     def loaded(self):
+        self.calls.append("loaded?")
         return self.is_loaded
 
     def up(self):
@@ -554,6 +571,10 @@ class FakeCapture:
             raise RuntimeError("nft: программа не найдена")
         self.is_loaded = True
         return self.state
+
+    def actions(self) -> list[str]:
+        """Что демон делал с правилами (без чтений состояния)."""
+        return [call for call in self.calls if not call.endswith("?")]
 
     def open(self):
         self.calls.append("open")
@@ -567,7 +588,12 @@ class FakeCapture:
 
     def describe(self, *, check=True):
         return {"mode": self.state, "lan_if": "lan0", "lan": True, "local": True,
-                "bypass": [], "fail_mode": "closed", "loaded": None}
+                "bypass": [], "fail_mode": "closed", "loaded": None,
+                "inbound_missing": self.problem if self.state == "on" else ""}
+
+    def inbound_problem(self):
+        self.calls.append("problem?")
+        return self.problem
 
 
 @pytest.fixture()
@@ -590,14 +616,14 @@ def guarded(tmp_path, monkeypatch):
 def test_daemon_reloads_missing_rules(guarded):
     """Чужой flush ruleset или перезапуск nftables: правила пропали — демон их возвращает."""
     daemon, capture = guarded
-    assert capture.calls == [] and daemon.status()["capture"]["loaded"] is True
+    assert capture.actions() == [] and daemon.status()["capture"]["loaded"] is True
     capture.is_loaded = False
     daemon.tick()
-    assert capture.calls == ["up"]
+    assert capture.actions() == ["up"]
     assert any("загружены заново" in event for event in daemon.events())
     assert daemon.status()["capture"]["mode"] == "on"
     daemon.tick()
-    assert capture.calls == ["up"]  # правила на месте — больше ничего не делает
+    assert capture.actions() == ["up"]  # правила на месте — больше ничего не делает
 
 
 def test_rules_failure_is_reported_once(guarded):
@@ -605,7 +631,7 @@ def test_rules_failure_is_reported_once(guarded):
     capture.is_loaded, capture.fail = False, True
     for _ in range(3):
         assert daemon.tick() is State.HEALTHY  # сбой сети шаг watchdog не роняет
-    assert capture.calls == ["up"] * 3  # попытки продолжаются
+    assert capture.actions() == ["up"] * 3  # попытки продолжаются
     failures = [event for event in daemon.events() if "не загружены" in event]
     assert len(failures) == 1 and "nft" in failures[0]  # а событие — одно на причину
 
@@ -629,7 +655,7 @@ def test_fail_open_removes_capture_while_xray_is_down(guarded):
     daemon.api.down = False
     daemon.set_alive()
     daemon.tick()
-    assert capture.calls[-1] == "close" and capture.state == "on"
+    assert capture.actions()[-1] == "close" and capture.state == "on"
     events = daemon.events()
     assert any("временно снят" in event for event in events)
     assert any("перехват возвращён" in event for event in events)
@@ -641,7 +667,7 @@ def test_fail_closed_keeps_capture_while_xray_is_down(guarded):
     for _ in range(5):
         daemon.t += 60
         assert daemon.tick() is State.XRAY_DOWN
-    assert capture.calls == [] and capture.state == "on"  # трафик никуда не уходит
+    assert capture.actions() == [] and capture.state == "on"  # трафик никуда не уходит
 
 
 def test_short_xray_outage_does_not_open_capture(guarded):
@@ -664,14 +690,14 @@ def test_leak_reloads_rules_only_when_own_traffic_is_captured(guarded):
     daemon.location = "RU"
     daemon.t += 400
     assert daemon.tick() is State.LEAK
-    assert capture.calls == ["up"]
+    assert capture.actions() == ["up"]
     assert any(event.startswith("leak:") for event in daemon.events())
 
     # capture.local = false: обычный сокет шлюза ходит напрямую по праву — это не утечка.
     daemon.cfg.capture.local = False
     daemon.t += 400
     assert daemon.tick() is State.HEALTHY
-    assert capture.calls == ["up"]
+    assert capture.actions() == ["up"]
 
 
 # --- уведомления и перечитывание конфига (этап 4) ---
@@ -830,3 +856,323 @@ def test_no_subscriptions_yet_is_not_an_error(daemon):
     daemon.tick()
     assert daemon.applied == [] and daemon.events() == []
     assert daemon.status()["members"] == []
+
+
+# --- перехват ждёт inbound в Xray --------------------------------------------------
+
+
+def test_capture_waiting_for_the_inbound_is_reported_once_and_then_turns_on(guarded):
+    """Перехват включён, но Xray работает без нужного inbound'а: вместо правил перехвата
+    загружен режим «снят». Демон говорит об этом один раз и включает перехват сам, как
+    только конфиг применён."""
+    daemon, capture = guarded
+    capture.problem = "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"
+    for _ in range(3):
+        daemon.tick()
+    told = [event for event in daemon.events() if "перехват не включён" in event]
+    assert len(told) == 1 and "tun-in" in told[0] and "трафик идёт напрямую" in told[0]
+    assert capture.actions() == []  # загружено то, что и должно быть: перезагружать нечего
+    assert daemon.status()["capture"]["inbound_missing"] == capture.problem
+
+    capture.problem, capture.is_loaded = "", False  # Xray перезапущен с inbound'ом
+    daemon.tick()
+    assert capture.actions() == ["up"]
+    assert any("Xray перезапущен с inbound'ом перехвата — перехват включён" in event
+               for event in daemon.events())
+    assert not any("загружены заново" in event for event in daemon.events())
+    assert daemon.status()["capture"]["inbound_missing"] == ""
+
+
+def test_capture_that_keeps_failing_to_load_is_reported_once(guarded):
+    """Причина не уходит (интерфейс TUN так и не появился): демон пробует на каждом
+    шаге, а событие — одно, без «правила загружены заново» вдогонку."""
+    daemon, capture = guarded
+    capture.problem = "TUN-интерфейса xgwtun0 нет в системе"
+    capture.is_loaded = False
+    capture.up = lambda: capture.calls.append("up") or "off"  # загрузка не помогает
+    for _ in range(3):
+        daemon.tick()
+    assert capture.actions() == ["up"] * 3
+    told = [event for event in daemon.events() if event.startswith("capture:")]
+    assert len(told) == 1 and "перехват не включён: TUN-интерфейса" in told[0]
+
+
+def test_new_config_is_applied_before_the_rules_when_capture_waits_for_it(guarded):
+    """Настройки изменились так, что правилам нужен inbound, которого у Xray ещё нет.
+    Сначала применяется конфиг (Xray перезапускается), и только потом проверяются
+    правила: загрузи демон их первым, перехват на это время был бы снят."""
+    daemon, capture = guarded
+    order: list[str] = []
+    original_apply, original_loaded = daemon._apply, capture.loaded
+
+    def apply(config, *, urgent):
+        order.append("apply")
+        capture.problem = ""  # Xray перезапущен с новым конфигом
+        return original_apply(config, urgent=urgent)
+
+    def loaded():
+        order.append("rules")
+        return original_loaded()
+
+    daemon._apply, capture.loaded = apply, loaded
+    capture.problem = "в применённом конфиге Xray нет inbound tproxy-in на порту 12346"
+    daemon.cfg.filters.max_members = 3  # собранный конфиг отличается от применённого
+    daemon._rebuild_asked = True
+    daemon.tick()
+    assert order[:2] == ["apply", "rules"], order
+
+    # Обычный шаг: правила проверяются первыми, а после применения — ещё раз.
+    order.clear()
+    daemon.cfg.filters.max_members = 2
+    daemon._rebuild_asked = True
+    daemon.tick()
+    assert order == ["rules", "apply", "rules"], order
+    order.clear()
+    daemon.tick()
+    assert order == ["rules"]  # применять нечего — одна проверка за шаг
+
+
+def test_pending_config_with_a_new_capture_inbound_does_not_wait_for_the_window(daemon):
+    """Отложенный конфиг меняет inbound перехвата (здесь появляется tun-in): ждать окна
+    04:00–05:00 нельзя — трафик уходил бы в интерфейс, из которого Xray не читает."""
+    _started(daemon)
+    pending = engine.read_json(daemon.paths.xray_config_file)
+    pending["inbounds"].insert(
+        0, {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0", "mtu": 1500}})
+    atomic_write_json(daemon.paths.pending_config_file, pending)
+    daemon.apply_mode = "restart"
+    daemon.tick()  # 12:00 — вне окна
+    assert daemon.applied == [(pending, True)]
+    assert not daemon.paths.pending_config_file.exists()
+
+
+# --- не отвечает сам probe.url ------------------------------------------------------
+
+
+def _http_403() -> ScanResult:
+    return ScanResult("", "CONNECT_FAIL", 0, 0.3, "HTTP 403", "http", 403)
+
+
+def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
+    """Адрес пробы отвечает 403 всем: сквозная проверка не проходит, собственные пробы
+    падают у участников и запасных одинаково, напрямую — тот же ответ. Серверы при этом
+    живы: менять их и внеочередно обновлять подписку незачем."""
+    daemon.cfg.filters.rotate_after_min = 0
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    daemon.e2e = False
+    daemon.failures["*"] = _http_403()
+    daemon.direct = "HTTP 403"
+    # Ядро тоже считает всех мёртвыми: его пробы идут на тот же адрес.
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+    members = daemon.tags("proxy")
+
+    # Все участники «мертвы» — проверка сразу, не дожидаясь fail_threshold: иначе шаг
+    # ушёл бы в ALL_DEAD со сканом запасных и внеочередным обновлением подписки.
+    assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+    assert sorted(daemon.scanned) == sorted([*members, *daemon.tags("spare")])  # диагностика
+    assert daemon.applied == [] and daemon.collected == []
+    daemon.scanned.clear()
+    for _ in range(4):
+        assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+    assert daemon.applied == [] and daemon.tags("proxy") == members  # замен нет
+    assert daemon.collected == []  # подписка не обновляется внеочередно
+    assert daemon.scanned == []  # сканы и повторная диагностика — не на каждом шаге
+
+    status = daemon.status()
+    assert status["state"] == "PROBE_TARGET_UNREACHABLE"
+    warning = "Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url"
+    assert status["probe_target"].startswith(warning) and "HTTP 403" in status["probe_target"]
+    events = [event for event in daemon.events() if event.startswith("PROBE_TARGET_UNREACHABLE:")]
+    assert len(events) == 1 and warning in events[0]
+    assert "Замена серверов приостановлена" in events[0]
+    # Вердикты запасных не затёрты: после возврата адреса замены будут из кого выбирать.
+    assert {spare["verdict"] for spare in status["spares"]} == {"OK"}
+    text = __import__("xgw.watch.status", fromlist=["render_status"]).render_status(status)
+    assert warning in text
+
+    # Проверка запасных по кнопке в это время откладывается — и говорит почему.
+    daemon.request_scan()
+    daemon.tick()
+    assert daemon.scanned == [] and not daemon.scan_pending
+    assert any("проверка запасных отложена" in event for event in daemon.events())
+
+    # Раз в пять минут диагностика повторяется: адрес мог вернуться не для всех.
+    daemon.t += 301
+    daemon.tick()
+    assert len(daemon.scanned) == 5  # два участника и три запасных
+
+    daemon.e2e = True
+    daemon.failures.clear()
+    daemon.set_alive()
+    assert daemon.tick() is State.HEALTHY
+    assert daemon.status()["probe_target"] == ""
+    assert any("probe.url снова отвечает" in event for event in daemon.events())
+
+
+def test_probe_url_check_waits_for_the_threshold_while_the_core_sees_members_alive(daemon):
+    """Ядро ещё считает участников живыми (его пробы реже): один сбой сквозной
+    проверки — не повод, ждём fail_threshold шагов подряд."""
+    _started(daemon)
+    daemon.e2e = False
+    daemon.failures["*"] = _http_403()
+    daemon.direct = "HTTP 403"
+    states = [daemon.tick() for _ in range(3)]
+    assert states == [State.HEALTHY, State.HEALTHY, State.PROBE_TARGET_UNREACHABLE]
+
+
+def test_base_request_through_vpn_confirms_a_dead_probe_url(daemon):
+    """Одинаковые таймауты — ещё не довод: так выглядят и мёртвые серверы. Решает
+    базовый запрос через VPN: он проходит — значит, не отвечает именно probe.url (а
+    напрямую его может и не быть видно вовсе)."""
+    _started(daemon)
+    daemon.e2e = False
+    daemon.failures["*"] = ScanResult("", "TIMEOUT", 0, 15.0, "таймаут", "timeout", 0)
+    daemon.direct = "нет ответа"
+    daemon.base_ping = True
+    states = [daemon.tick() for _ in range(3)]
+    assert states[-1] is State.PROBE_TARGET_UNREACHABLE
+    target = daemon.status()["probe_target"]
+    assert "таймаут" in target and "через VPN другие адреса открываются" in target
+
+
+def test_dead_servers_are_not_blamed_on_the_probe_url(daemon):
+    """Те же таймауты, но через VPN не проходит ничего — это серверы."""
+    _started(daemon)
+    daemon.e2e = False
+    daemon.failures["*"] = ScanResult("", "TIMEOUT", 0, 15.0, "таймаут", "timeout", 0)
+    daemon.direct = "нет ответа"  # probe.url напрямую закрыт — на вывод это не влияет
+    daemon.base_ping = False
+    states = [daemon.tick() for _ in range(3)]
+    assert states[-1] is State.ALL_DEAD and daemon.status()["probe_target"] == ""
+
+
+def test_freeze_is_never_blamed_on_the_probe_url(daemon):
+    """Часть тела пришла, затем тишина — адрес пробы отвечает, «заморожены» серверы."""
+    _started(daemon)
+    daemon.e2e = False
+    daemon.failures["*"] = ScanResult(
+        "", "FROZEN", 19451, 5.4, "тишина 5 с после 19451 байт тела", "stall", 200)
+    daemon.base_ping = True  # мелкие запросы «замороженный» сервер пропускает
+    states = [daemon.tick() for _ in range(3)]
+    assert states[-1] is State.ALL_DEAD and daemon.status()["probe_target"] == ""
+
+
+def test_one_working_server_means_the_probe_url_is_fine(daemon):
+    _started(daemon)
+    daemon.e2e = False
+    spare = daemon.tags("spare")[0].replace("spare-", "probe-")
+    for info_tag in [*daemon.tags("proxy"), *daemon.tags("spare")]:
+        probe_tag = "probe-" + info_tag.split("-", 1)[1]
+        if probe_tag != spare:
+            daemon.failures[probe_tag] = _http_403()
+    daemon.direct, daemon.base_ping = "HTTP 403", True
+    states = [daemon.tick() for _ in range(3)]
+    assert states[-1] is State.ALL_DEAD  # ошибки не у всех — значит, дело в серверах
+
+
+# --- первая проверка участников ----------------------------------------------------
+
+
+def _fail_first_member(daemon: Harness, verdict: str = "FROZEN") -> tuple[dict, dict]:
+    """Первый же участник, которого проверит шлюз, получает этот вердикт; остальные
+    участники проходят, запасные получают вердикт из второго словаря (ключ spares)."""
+    bad: dict[str, bool] = {}
+    other = {"spares": "OK"}
+
+    def scan(info, password):
+        daemon.scanned.append(info.tag)
+        if info.role == "proxy" and (not bad or info.tag in bad):
+            bad[info.tag] = True
+            if verdict == "FROZEN":
+                return ScanResult(info.tag, verdict, 19451, 5.4,
+                                  "тишина 5 с после 19451 байт тела", "stall", 200)
+            return ScanResult(info.tag, verdict, 0, 0.4, "TLS: connection reset", "tls", 0)
+        if info.role == "spare" and other["spares"] != "OK":
+            return ScanResult(info.tag, other["spares"], 16384, 5.0)
+        return ScanResult(info.tag, "OK", 65536, 0.5)
+
+    daemon._scan = scan
+    return bad, other
+
+
+@pytest.mark.parametrize("verdict", ["FROZEN", "CONNECT_FAIL"])
+def test_member_failing_the_first_check_is_replaced_at_once(daemon, verdict):
+    """Первый состав балансировщика берётся из подписки наугад. Участник, у которого
+    собственная проба шлюза показала «заморозку» или отказ в соединении, меняется на
+    проверенный запасной сразу — без ожидания rotate_after_min (15 минут) и раньше,
+    чем ядро само объявит его мёртвым."""
+    bad, _other = _fail_first_member(daemon, verdict)
+    assert daemon.tick() is State.HEALTHY  # по ядру сведений ещё нет
+    (victim,) = bad
+    # Первый шаг: участники проверены раньше запасных, замена — в тот же шаг.
+    assert daemon.scanned[:2] == [victim, daemon.scanned[1]] and len(daemon.scanned) == 5
+    assert len(daemon.applied) == 2 and daemon.applied[1][1] is False  # через API, не срочно
+    members = daemon.tags("proxy")
+    assert victim not in members and len(members) == 2
+    assert victim.replace("proxy-", "spare-") in daemon.tags("spare")
+    rotation = [event for event in daemon.events() if event.startswith("rotation:")]
+    assert len(rotation) == 1 and f"не прошли первую проверку: {victim} — {verdict}" in rotation[0]
+
+    # Дальше — тишина: замена уже прошла скан, заново никого не проверяют и не меняют.
+    daemon.scanned.clear()
+    daemon.applied.clear()
+    daemon.set_alive()
+    for _ in range(3):
+        assert daemon.tick() is State.HEALTHY
+    assert daemon.scanned == [] and daemon.applied == []
+    # Выбывший стал запасным со своим вердиктом — обратно его не возьмут.
+    spares = {spare["tag"]: spare["verdict"] for spare in daemon.status()["spares"]}
+    assert spares[victim.replace("proxy-", "spare-")] == verdict
+
+
+def test_first_check_waits_for_a_spare_that_passed_the_scan(daemon):
+    """Менять не на кого — участник остаётся; появился проверенный запасной — меняется."""
+    bad, other = _fail_first_member(daemon)
+    other["spares"] = "FROZEN"  # все запасные «заморожены»
+    daemon.tick()
+    (victim,) = bad
+    assert len(daemon.applied) == 1 and victim in daemon.tags("proxy")
+    daemon.set_alive(**{victim.replace("-", "_"): False})  # ядро тоже видит, что он мёртв
+    assert daemon.tick() is State.DEGRADED and len(daemon.applied) == 1
+    other["spares"] = "OK"
+    daemon.t += 61  # внеочередной скан — не чаще раза в минуту
+    daemon.tick()  # заказан скан запасных
+    daemon.tick()  # скан и замена
+    assert victim not in daemon.tags("proxy")
+
+
+def test_first_check_is_forgotten_when_the_core_reports_the_member_alive(daemon):
+    """Сбой первой проверки оказался разовым: ядро считает участника живым."""
+    bad, other = _fail_first_member(daemon, "CONNECT_FAIL")
+    other["spares"] = "FROZEN"  # менять не на кого
+    daemon.tick()
+    (victim,) = bad
+    assert daemon.bad_members == {victim: "CONNECT_FAIL"}
+    daemon.set_alive()
+    daemon.tick()
+    assert daemon.bad_members == {} and victim in daemon.tags("proxy")
+
+
+def test_timeout_at_the_first_check_goes_the_usual_way(daemon):
+    """Таймаут бывает разовым: такой участник сразу не меняется — за ним следит ядро."""
+    bad, _other = _fail_first_member(daemon, "TIMEOUT")
+    daemon.tick()
+    (victim,) = bad
+    assert daemon.bad_members == {} and victim in daemon.tags("proxy")
+    assert len(daemon.applied) == 1
+
+
+def test_reloaded_settings_keep_the_first_check_results(daemon):
+    """Настройки перечитаны (новый демон на тех же серверах): участников заново не
+    проверяют."""
+    _started(daemon)
+    successor = Harness(daemon.cfg, daemon.paths)
+    try:
+        successor.adopt(daemon)
+        assert successor.vetted == daemon.vetted and len(successor.vetted) == 2
+        successor.set_alive()
+        successor.tick()
+        assert not [tag for tag in successor.scanned if tag.startswith("proxy-")]
+    finally:
+        successor.store.close()

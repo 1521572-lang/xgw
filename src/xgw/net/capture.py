@@ -34,8 +34,38 @@ class CaptureError(Exception):
     """Правила не загружены: нет прав, nft или ip, либо ядро их не приняло."""
 
 
-# Тег inbound'а перехвата в конфиге Xray (генератор, builder.py); у IPv6 — tproxy-in6.
+# Теги inbound'ов перехвата в конфиге Xray (их пишет генератор, builder.py): TPROXY для
+# IPv4 и IPv6 и TUN для трафика самой машины. В Windows роль такого inbound'а играет
+# http-in: на него указывает системный прокси.
 TPROXY_TAG = "tproxy-in"
+TPROXY6_TAG = "tproxy-in6"
+TUN_TAG = "tun-in"
+SYSPROXY_TAG = "http-in"
+CAPTURE_TAGS = (TPROXY_TAG, TPROXY6_TAG, TUN_TAG)
+
+
+def capture_inbounds(config: dict | None, *, sysproxy: bool = False) -> list[str]:
+    """Inbound'ы перехвата конфига Xray в каноническом виде — то, от чего зависят
+    правила сети.
+
+    Пока применённый конфиг и правила расходятся (правила ведут пакеты на порт или в
+    интерфейс, которых у работающего Xray нет), трафик уходит в никуда. Поэтому любое
+    отличие — inbound появился, исчез или изменился хоть один его параметр — применяется
+    перезапуском Xray сразу, а не в окне apply.restart_window.
+    """
+    inbounds = config.get("inbounds") if isinstance(config, dict) else None
+    if not isinstance(inbounds, list):
+        return []
+    tags = (SYSPROXY_TAG,) if sysproxy else CAPTURE_TAGS
+    found = []
+    for inbound in inbounds:
+        if not isinstance(inbound, dict):
+            continue
+        if str(inbound.get("tag", "")) in tags or (
+            not sysproxy and inbound.get("protocol") == "tun"
+        ):
+            found.append(json.dumps(inbound, sort_keys=True, ensure_ascii=False))
+    return sorted(found)
 
 
 def capture_for(cfg: Config, paths: Paths, **kwargs):
@@ -73,9 +103,10 @@ class Capture:
         self.state_file = paths.var / "capture.json"
         self.open_marker = paths.run / "capture-open"
         self._warned: set[str] = set()
-        # Перехват не загружен, потому что в применённом конфиге Xray нет inbound
-        # TPROXY: см. _load.
-        self.tproxy_missing = False
+        # Почему последняя загрузка вместо перехвата оставила сеть напрямую: в применённом
+        # конфиге Xray нет нужного inbound'а либо нет TUN-интерфейса (см. _load). Пусто —
+        # такого не было.
+        self.held = ""
 
     # --- что настроено ----------------------------------------------------------
 
@@ -161,10 +192,9 @@ class Capture:
         return tproxy, rules.tun and (family == 4 or rules.capture6)
 
     def _routes_up(self, rules: nft.Rules) -> None:
-        """Интерфейс, правила `ip rule` и маршруты, которые нужны текущим правилам."""
+        """Правила `ip rule` и маршруты, которые нужны текущим правилам. Интерфейс TUN к
+        этому времени уже создан: см. _prepare_tun."""
         cap = self.cfg.capture
-        if rules.tun:
-            tun.ensure(rules.tun_name, self.runner, self.proc_sys)
         for family in self._families():
             tproxy, via_tun = self._wanted(rules, family)
             if tproxy:
@@ -187,61 +217,102 @@ class Capture:
                     cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name
                 )
 
-    def applied_has_tproxy(self) -> bool:
-        """Есть ли inbound перехвата в применённом конфиге Xray.
-
-        Именно в применённом (`paths.xray_config_file`), а не в собранном: правила
-        перехвата отправляют пакеты на `capture.tproxy_port`, и слушать его будет
-        только тот Xray, который запущен с этим конфигом.
-        """
+    def _applied(self) -> dict | None:
+        """Применённый конфиг Xray — тот, с которым ядро запущено или запустится."""
         try:
             config = json.loads(self.paths.xray_config_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return False
-        inbounds = config.get("inbounds")
-        if not isinstance(inbounds, list):
-            return False
-        port = self.cfg.capture.tproxy_port
-        for inbound in inbounds:
-            if not isinstance(inbound, dict):
-                continue
+            return None
+        return config if isinstance(config, dict) else None
+
+    def inbound_problem(self) -> str:
+        """Почему перехват включать нельзя: какого inbound'а нет в применённом конфиге
+        Xray. Пусто — всё, на что ссылаются правила, в конфиге есть.
+
+        Смотрим именно применённый конфиг (`paths.xray_config_file`), а не собранный:
+        правила отправляют пакеты на `capture.tproxy_port` или в интерфейс TUN, а
+        принимает их только тот Xray, который запущен с этим конфигом. Нет inbound'а —
+        пакеты уходят в никуда, и при fail_mode = "closed" машина остаётся без интернета.
+        IPv6 (tproxy-in6) здесь не проверяется намеренно: без него закрыт только IPv6, и
+        программы переходят на IPv4, а снять из-за этого весь перехват было бы хуже.
+        """
+        rules = self.rules("on")
+        if not rules.capture:
+            return ""
+        config = self._applied()
+        if config is None:
+            return f"рабочего конфига Xray ещё нет ({self.paths.xray_config_file})"
+        listed = config.get("inbounds")
+        inbounds = [item for item in listed if isinstance(item, dict)] if isinstance(
+            listed, list) else []
+        if rules.prerouting:
             # Порт обязан совпадать: правила отправляют пакеты именно на него.
-            if inbound.get("port") != port:
-                continue
-            tag = str(inbound.get("tag", ""))
-            if tag == TPROXY_TAG or tag.startswith(TPROXY_TAG + "6"):
-                return True
-            if inbound.get("protocol") == "tunnel":
-                return True
-        return False
+            port = self.cfg.capture.tproxy_port
+            if not any(
+                item.get("tag") == TPROXY_TAG and item.get("port") == port for item in inbounds
+            ):
+                return f"в применённом конфиге Xray нет inbound {TPROXY_TAG} на порту {port}"
+        if rules.tun:
+            # Имя обязано совпадать: маршрут ведёт пакеты именно в этот интерфейс.
+            names = {
+                item["settings"].get("name")
+                for item in inbounds
+                if item.get("protocol") == "tun" and isinstance(item.get("settings"), dict)
+            }
+            if rules.tun_name not in names:
+                return (
+                    f"в применённом конфиге Xray нет inbound {TUN_TAG} "
+                    f"для интерфейса {rules.tun_name}"
+                )
+        return ""
+
+    def effective_mode(self) -> str:
+        """Режим, который на самом деле загружается: «on» без нужного inbound'а в Xray
+        становится «off» — сеть работает напрямую, пока конфиг не применён."""
+        mode = self.mode()
+        return "off" if mode == "on" and self.inbound_problem() else mode
+
+    def _prepare_tun(self) -> str:
+        """Создаёт интерфейс TUN для режима «on» и убеждается, что он есть в системе.
+        Пусто — есть (или не нужен), иначе причина: без интерфейса маршрут помеченных
+        пакетов вёл бы в никуда. Отказ самой команды создания — ошибка (CommandError):
+        её исправляет человек (нет /dev/net/tun, имя занято), сама она не пройдёт."""
+        rules = self.rules("on")
+        if not rules.tun:
+            return ""
+        tun.ensure(rules.tun_name, self.runner, self.proc_sys)
+        if tun.present(rules.tun_name, self.runner):
+            return ""
+        return f"TUN-интерфейса {rules.tun_name} нет в системе"
 
     def _load(self, mode: str) -> str:
-        if mode == "on" and not self.applied_has_tproxy():
-            # Правила перехвата отправляют пакеты на tproxy_port. Если в применённом
-            # конфиге Xray такого inbound нет (например, изменение настроек ждёт
-            # перезапуска Xray в окне apply.restart_window), то включать перехват
-            # нельзя: при fail_mode = "closed" машина осталась бы без интернета —
-            # пакеты уходили бы на порт, который никто не слушает. Загружаем режим
-            # «снят»: сеть работает напрямую, а перехват включится сам, когда
-            # конфиг с inbound перехвата применится.
-            self.tproxy_missing = True
-            self.log.error(
-                "перехват не включён: в применённом конфиге Xray (%s) нет inbound "
-                "TPROXY на порту %s — трафик ушёл бы в никуда. Перехват включится "
-                "после перезапуска Xray с новым конфигом",
-                self.paths.xray_config_file,
-                self.cfg.capture.tproxy_port,
-            )
-            mode = "off"
-        else:
-            self.tproxy_missing = False
+        self.held = ""
+        if mode == "on":
+            # Правила перехвата отправляют пакеты на tproxy_port или в TUN. Если в
+            # применённом конфиге Xray такого inbound'а нет (изменение настроек ещё не
+            # применено, откат на прежний конфиг) либо нет самого интерфейса, включать
+            # перехват нельзя: при fail_mode = "closed" машина осталась бы без интернета.
+            # Загружаем режим «снят»: сеть работает напрямую, а перехват включится сам,
+            # как только Xray перезапустится с нужным inbound'ом (за этим следит демон).
+            try:
+                reason = self.inbound_problem() or self._prepare_tun()
+            except (cmd.CommandError, OSError) as exc:
+                raise CaptureError(str(exc)) from exc
+            if reason:
+                self.held = reason
+                self.log.error(
+                    "перехват не включён: %s — трафик ушёл бы в никуда. Сеть работает "
+                    "напрямую; перехват включится после перезапуска Xray с новым конфигом",
+                    reason,
+                )
+                mode = "off"
         rules = self.rules(mode)
         try:
             if rules.lan_if:
                 self._forwarding_on()
             if rules.capture:
-                # Сначала интерфейс и маршрут для помеченных пакетов, потом правила,
-                # которые метят; ненужное убирается уже после них.
+                # Сначала маршрут для помеченных пакетов (интерфейс TUN уже подготовлен),
+                # потом правила, которые метят; ненужное убирается уже после них.
                 self._routes_up(rules)
                 warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
@@ -325,7 +396,7 @@ class Capture:
 
     def loaded(self) -> bool | None:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав)."""
-        rules = self.rules()
+        rules = self.rules(self.effective_mode())
         chains = nft.loaded_chains(self.runner)
         if chains is None:
             return None
@@ -396,7 +467,11 @@ class Capture:
             "tun": rules.tun,
             "fail_mode": self.cfg.capture.fail_mode,
             "loaded": self.loaded() if check else None,
-            # Перехват просили включить, но Xray работает без inbound'а перехвата:
-            # правила не загружены, трафик идёт напрямую (см. _load).
-            "tproxy_missing": self.tproxy_missing,
+            # Перехват включён, но Xray работает без нужного inbound'а: вместо правил
+            # перехвата загружен режим «снят», трафик идёт напрямую (см. _load). Здесь —
+            # чего не хватает; пусто — всё на месте.
+            # (или не появился интерфейс TUN — это помнит сам объект после загрузки).
+            "inbound_missing": (
+                (self.inbound_problem() or self.held) if self.mode() == "on" else ""
+            ),
         }

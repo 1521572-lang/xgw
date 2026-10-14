@@ -15,6 +15,8 @@
     WAN_DOWN: ["bad", "Нет связи с провайдером"],
     XRAY_DOWN: ["bad", "Xray не отвечает"],
     LEAK: ["bad", "Трафик идёт мимо VPN"],
+    // Серверы тут ни при чём: не отвечает сам файл, которым шлюз их проверяет.
+    PROBE_TARGET_UNREACHABLE: ["warn", "Адрес проверки недоступен"],
   };
   const VERDICTS = {
     OK: ["ok", "в порядке"],
@@ -28,13 +30,16 @@
     filter: "не используется: отсеян фильтром имён из config.toml",
     junk: "не используется: служебная запись подписки",
     ipv6: "не используется: адрес IPv6",
+    dns: "не используется: имя сервера не находится в DNS — шлюз проверит его снова через несколько часов или по кнопке «Обновить»",
   };
   const KINDS = {
     capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
     rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
+    probe: "адрес проверки",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
+    PROBE_TARGET_UNREACHABLE: "адрес проверки",
   };
   const TTL_LABELS = { "10m": "10 минут", "1h": "1 час", "6h": "6 часов", "24h": "24 часа" };
   const ICONS = {
@@ -223,15 +228,57 @@
     draw("devices", [s.devices, s.lan], () => renderDevices(s));
     draw("events", s.events, () => renderEvents(s));
     draw("telegram", [s.telegram, Math.floor(s.now / 20)], () => renderTelegram(s));
+    draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
     $("scan").hidden = !s.spares.length;
     $("refresh").hidden = !s.subscriptions.length;
     // Пока серверов нет, первое дело — добавить подписку: её блок идёт выше.
     document.body.dataset.empty = s.servers.length ? "0" : "1";
-    const budget = s.budget.total_mb ? ` · проверки серверов расходуют около ${Math.round(s.budget.total_mb)} МБ в сутки` : "";
     $("foot").textContent = `XGW ${s.version}` + (s.xray.version ? ` · Xray ${s.xray.version}` : "")
-      + budget + " · панель открывается только на этой машине";
+      + " · панель открывается только на этой машине";
+  }
+
+  const decimal = (value, digits = 1) => Number(value).toFixed(digits).replace(".", ",");
+
+  // Сводка разбора подписок, предупреждение о недоступном адресе проверки и расход
+  // трафика на проверки серверов — в сутки и в месяц.
+  function renderNotes(s) {
+    const nodes = s.nodes || {};
+    const summary = $("nodes-note");
+    summary.hidden = !(nodes.members || nodes.spares);
+    if (!summary.hidden) {
+      let text = `Узлов: ${nodes.members || 0} активных, ${nodes.spares || 0} запасных `
+        + `(отброшено ${nodes.dropped || 0} недоступных/служебных, схлопнуто ${nodes.duplicates || 0} дублей)`;
+      if (nodes.excluded) text += ` · отключено вами: ${nodes.excluded}`;
+      summary.textContent = text;
+    }
+
+    const probe = $("probe-note");
+    probe.hidden = !s.probe_target;
+    probe.textContent = s.probe_target
+      ? `${s.probe_target}. Серверы не меняются, пока адрес не ответит; задайте в config.toml другой probe.url.`
+      : "";
+
+    const budget = s.budget || {};
+    const note = $("budget-note");
+    note.hidden = !(budget.all_mb && (budget.members || budget.spares));
+    if (note.hidden) return;
+    const perDay = budget.all_mb >= 1000 ? `${decimal(budget.all_mb / 1000, 2)} ГБ` : `${Math.round(budget.all_mb)} МБ`;
+    const parts = [`проба ${decimal(budget.probe_bytes / 1000)} КБ × ${budget.members} в работе каждые ${budget.interval_s} с`];
+    if (budget.spares) parts.push(`${budget.spares} запасных раз в ${budget.scan_minutes} мин`);
+    const lead = el("span", {}, "Проверки серверов расходуют около ", el("b", { text: `${perDay} в сутки` }),
+      " и ", el("b", { text: `${decimal(budget.month_gb)} ГБ в месяц` }), ` (${parts.join(", ")}).`);
+    const lines = [lead];
+    for (const [name, share] of Object.entries(budget.quota_share || {})) {
+      lines.push(el("span", { text: ` За месяц это около ${Math.round(share)} % трафика подписки «${name}».` }));
+    }
+    note.classList.toggle("over", Boolean(budget.over));
+    if (budget.over) {
+      lines.push(el("span", { text: ` Это больше лимита ${budget.limit_mb} МБ в сутки (без сквозной проверки — ${Math.round(budget.total_mb)} МБ): `
+        + "уменьшите число серверов в работе (filters.max_members) или увеличьте интервал (probe.interval)." }));
+    }
+    note.replaceChildren(...lines);
   }
 
   function health(s, stale) {
@@ -270,7 +317,13 @@
       // Пока хотя бы один сервер жив, VPN работает — кнопка остаётся зелёной;
       // о недоступных серверах говорит отметка в шапке.
       heroTone = tone === "bad" ? "bad" : "ok";
-      if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
+      if (s.capture.inbound_missing) {
+        // Перехват включён, но Xray ещё не перезапущен с нужными настройками: правила
+        // не загружены, иначе трафик ушёл бы в никуда.
+        title = "VPN включается";
+        sub = "Xray перезапускается с новыми настройками — до этого трафик идёт напрямую";
+        heroTone = "warn";
+      } else if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
       else if (s.capture.loaded === false) {
         heroTone = "bad";
         sub = s.capture.sysproxy
@@ -300,7 +353,7 @@
     // Без перехвата трафик машины идёт напрямую — «сейчас через» было бы неправдой.
     const current = s.pin
       ? s.members.find((member) => member.tag === s.pin.tag)
-      : on && s.members.find((member) => member.selected);
+      : on && !s.capture.inbound_missing && s.members.find((member) => member.selected);
     $("current").hidden = !current;
     if (current) {
       $("current-label").textContent = s.pin ? `Закреплён до ${stamp(s.pin.until, s.now)}` : "Сейчас через";

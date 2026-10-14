@@ -8,7 +8,7 @@ import ipaddress
 import re
 import secrets
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..config import Config
@@ -40,6 +40,10 @@ class Selection:
     spares: list[ServerNode] = field(default_factory=list)
     chains: list[ServerNode] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Сводка разбора: сколько серверов пришло и почему часть из них в конфиг не попала
+    # (junk — служебные адреса, ipv6, filter — фильтр имён, dns — домен не разрешается,
+    # excluded — отключены или убраны в панели, duplicates — схлопнутые дубли).
+    stats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -67,11 +71,15 @@ def _is_ipv6(address: str) -> bool:
         return False
 
 
-def skip_reason(node: ServerNode, cfg: Config, include_re=None, exclude_re=None) -> str:
+def skip_reason(
+    node: ServerNode, cfg: Config, include_re=None, exclude_re=None,
+    dead: Collection[str] = (),
+) -> str:
     """Почему сервер не попадёт в конфиг Xray; пусто — попадёт.
 
     excluded — отключён или убран в панели; junk — служебный адрес; ipv6 —
-    IPv6-адрес при network.ipv6 = off; filter — отсеян фильтрами по имени.
+    IPv6-адрес при network.ipv6 = off; filter — отсеян фильтрами по имени; dns —
+    домен сервера не разрешается (dead — такие домены, их ведёт engine).
     """
     if node.fingerprint in cfg.managed.disabled or node.fingerprint in cfg.managed.removed:
         return "excluded"
@@ -79,6 +87,8 @@ def skip_reason(node: ServerNode, cfg: Config, include_re=None, exclude_re=None)
         return "junk"
     if not cfg.network.ipv6_proxy and _is_ipv6(node.address):
         return "ipv6"
+    if node.address in dead:
+        return "dns"
     if include_re is None and cfg.filters.include_regex:
         include_re = re.compile(cfg.filters.include_regex)
     if exclude_re is None and cfg.filters.exclude_regex:
@@ -91,7 +101,8 @@ def skip_reason(node: ServerNode, cfg: Config, include_re=None, exclude_re=None)
 
 
 def select_nodes(
-    nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = ()
+    nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = (),
+    dead: Collection[str] = (),
 ) -> Selection:
     """Фильтры по имени, отбрасывание служебных адресов, дедупликация,
     канонический порядок (стабилен при любом порядке входных ссылок).
@@ -100,8 +111,12 @@ def select_nodes(
     (лучшие первыми): текущие участники и замены из ротации. Без этого
     обновление подписки перетасовывало бы участников по сортировке отпечатков,
     а результат замены «мёртвого» участника терялся бы при следующей сборке.
+
+    dead — домены, которых нет в DNS: серверы с такими адресами в конфиг не попадают
+    и пробы на них не тратятся, пока домен не появится снова (см. engine).
     """
     warnings: list[str] = []
+    stats = dict.fromkeys(("total", "junk", "ipv6", "filter", "dns", "excluded", "duplicates"), 0)
     include_re = re.compile(cfg.filters.include_regex) if cfg.filters.include_regex else None
     exclude_re = re.compile(cfg.filters.exclude_regex) if cfg.filters.exclude_regex else None
 
@@ -114,17 +129,24 @@ def select_nodes(
                 chain_tags.add(node.keep_tag)
                 chains.append(node)
             continue
-        reason = skip_reason(node, cfg, include_re, exclude_re)
+        stats["total"] += 1
+        reason = skip_reason(node, cfg, include_re, exclude_re, dead)
         if reason == "junk":
             warnings.append(
                 f"узел «{node.name}» отброшен: служебный адрес {node.address}:{node.port}"
             )
         elif reason == "ipv6":
             warnings.append(f"узел «{node.name}» отброшен: IPv6-адрес при network.ipv6 = off")
+        elif reason == "dns":
+            warnings.append(
+                f"узел «{node.name}» отложен: домен {node.address} не разрешается"
+            )
         if reason:
+            stats[reason] += 1
             continue
         if node.fingerprint in unique:
             warnings.append(f"дубль «{node.name}» схлопнут с «{unique[node.fingerprint].name}»")
+            stats["duplicates"] += 1
             continue
         unique[node.fingerprint] = node
 
@@ -146,7 +168,9 @@ def select_nodes(
     # Звенья цепочек нужны, только пока на них ссылается хоть один оставленный узел.
     kept = [*members, *spares]
     chains = _referenced_chains(kept, chains)
-    return Selection(members=members, spares=spares, chains=chains, warnings=warnings)
+    return Selection(
+        members=members, spares=spares, chains=chains, warnings=warnings, stats=stats
+    )
 
 
 def _dialer(outbound: dict) -> str | None:
@@ -325,6 +349,39 @@ def _dns_server(entry: str) -> tuple[str, int | None]:
     return entry, None
 
 
+def _modernize(outbound: dict) -> None:
+    """Записывает outbound так, как этого ждёт Xray 26.3.27.
+
+    Имя хоста транспортов WebSocket и HTTPUpgrade — отдельное поле `host`. Прежняя
+    запись `headers.Host` (она приходит из JSON-подписок: их streamSettings переносятся
+    как есть) у WebSocket объявлена устаревшей — Xray пишет в журнал «"host" in
+    "headers" is deprecated, will be removed soon», — а у HTTPUpgrade уже отклоняется
+    («"headers" can't contain "host"»), и сервер выпадал из конфига. Проверено на
+    Xray 26.3.27. Явно заданный `host` не трогаем — он главнее.
+    """
+    stream = outbound.get("streamSettings")
+    if not isinstance(stream, dict):
+        return
+    for key in ("wsSettings", "httpupgradeSettings"):
+        settings = stream.get(key)
+        headers = settings.get("headers") if isinstance(settings, dict) else None
+        if not isinstance(headers, dict):
+            continue
+        names = [name for name in headers if isinstance(name, str) and name.lower() == "host"]
+        if not names:
+            continue
+        rest = {name: value for name, value in headers.items() if name not in names}
+        value = headers[names[0]]
+        if isinstance(value, list):  # так записывают заголовки у tcp/http-обфускации
+            value = value[0] if value else ""
+        updated = {k: v for k, v in settings.items() if k != "headers"}
+        if isinstance(value, str) and value and not updated.get("host"):
+            updated["host"] = value
+        if rest:
+            updated["headers"] = rest
+        stream[key] = updated
+
+
 def _apply_sockopt(outbound: dict, mark: int) -> None:
     stream = outbound.setdefault("streamSettings", {})
     sockopt = dict(stream.get("sockopt") or {})
@@ -377,11 +434,13 @@ def build(
     for info, node in zip(nodes, ordered, strict=True):
         outbound = copy.deepcopy(node.outbound)
         outbound["tag"] = info.tag
+        _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)
         outbound["tag"] = node.keep_tag
+        _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
         outbounds.append(outbound)
     outbounds.extend(

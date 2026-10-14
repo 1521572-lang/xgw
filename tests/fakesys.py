@@ -40,6 +40,9 @@ class FakeSystem:
         self.ufw_rules: list[tuple[str, ...]] = []
         self.ufw_reloads = 0
         self.default_dev = "wan0"
+        # Адреса IPv4 интерфейсов («адрес/префикс») — для проверки пересечения подсетей.
+        self.addresses: dict[str, list[str]] = {"wan0": ["203.0.113.5/24"]}
+        self.gateway = "203.0.113.1"
         self.ipv6_global: list[str] = []  # интерфейсы с глобальным IPv6-адресом
         self.nft_chains: list[dict] = []  # чужие цепочки для `nft -j list ruleset`
         self.time_synced = True
@@ -82,7 +85,8 @@ class FakeSystem:
             argv = [item for item in argv[1:] if "=" not in item]
         handler = getattr(self, "_" + argv[0].replace("-", "_").rsplit("/", 1)[-1], None)
         if argv[0] in ("nft", "ip") and argv[:5] != ["ip", "-j", "route", "show", "default"] \
-                and argv[:3] != ["ip", "-j", "-6"] and argv[:2] != ["nft", "-j"]:
+                and argv[:3] not in (["ip", "-j", "-6"], ["ip", "-j", "-4"]) \
+                and argv[:2] != ["nft", "-j"]:
             return self.kernel(argv, input=input, timeout=timeout)
         if handler is None:
             return ""  # python -m compileall, sysctl и прочее без последствий
@@ -97,9 +101,28 @@ class FakeSystem:
                 {"ifname": name, "addr_info": [{"local": "2001:db8::1"}]}
                 for name in self.ipv6_global
             ])
-        if not self.default_dev:
-            return "[]"
-        return json.dumps([{"dst": "default", "gateway": "203.0.113.1", "dev": self.default_dev}])
+        if args[:3] == ["-j", "-4", "addr"]:
+            return json.dumps([
+                {"ifname": name, "addr_info": [
+                    {"family": "inet", "local": item.split("/")[0],
+                     "prefixlen": int(item.split("/")[1])}
+                    for item in items
+                ]}
+                for name, items in self.addresses.items()
+            ])
+        default = [] if not self.default_dev else [
+            {"dst": "default", "gateway": self.gateway, "dev": self.default_dev}
+        ]
+        if args[:3] == ["-j", "-4", "route"]:
+            import ipaddress
+
+            connected = [
+                {"dst": str(ipaddress.IPv4Interface(item).network), "dev": name,
+                 "protocol": "kernel", "scope": "link"}
+                for name, items in self.addresses.items() for item in items
+            ]
+            return json.dumps([*default, *connected])
+        return json.dumps(default)
 
     def _nft(self, args, command, check) -> str:
         return json.dumps({"nftables": [{"chain": chain} for chain in self.nft_chains]})

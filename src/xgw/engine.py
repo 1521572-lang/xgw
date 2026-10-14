@@ -48,6 +48,7 @@ class Assembly:
     result: builder.BuildResult
     selection: builder.Selection
     verdict: bool | None  # итог xray run -test; None — проверка не выполнялась
+    invalid: int = 0  # сколько серверов отброшено: их конфиг установленный Xray не принимает
 
 
 def bypass_mark(cfg: config.Config, logger) -> int | None:
@@ -99,7 +100,7 @@ def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> No
     for node in inventory.nodes:
         if node.keep_tag:
             continue  # звенья цепочек — не самостоятельные серверы
-        reason = builder.skip_reason(node, cfg)
+        reason = builder.skip_reason(node, cfg, dead=quarantined())
         servers.append({
             "fingerprint": node.fingerprint,
             "name": node.name,
@@ -258,15 +259,30 @@ def assemble(
         prefer = builder.member_fingerprints(applied, inventory.nodes)
 
     rejected: set[str] = set()
+    dead = quarantined()
+    first = True
     while True:
         usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
-        selection = builder.select_nodes(usable, cfg, prefer=prefer)
-        if not rejected:
+        selection = builder.select_nodes(usable, cfg, prefer=prefer, dead=dead)
+        if first:
+            first = False
             for warning in selection.warnings:
                 logger.warning("%s", warning)
         if not selection.members:
+            if selection.stats.get("dns") and not any(
+                selection.stats.get(key) for key in ("junk", "ipv6", "filter", "excluded")
+            ):
+                raise EngineError(
+                    "ни один сервер не подходит: домены серверов не разрешаются "
+                    "(проверьте подписку и dns.bootstrap)"
+                )
             raise EngineError("после фильтров не осталось серверов")
-        hosts = _resolve_hosts(selection, cfg, mark, logger)
+        hosts, gone = _resolve_hosts(selection, cfg, mark, logger)
+        if gone:
+            # Домена нет в DNS — серверы с ним из конфига убираются, а на их место в
+            # балансировщике встают следующие: собираем состав заново.
+            dead = dead | gone
+            continue
         try:
             result = builder.build(
                 cfg, selection, hosts=hosts,
@@ -275,10 +291,10 @@ def assemble(
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
         if not check:
-            return Assembly(result, selection, None)
+            return Assembly(result, selection, None, len(rejected))
         verdict, output = validate.validate_config(result.config, xray_bin)
         if verdict is not False:
-            return Assembly(result, selection, verdict)
+            return Assembly(result, selection, verdict, len(rejected))
         # Конфиг не прошёл: ищем серверы, которые установленный Xray не принимает
         # (снятый транспорт, неизвестный шифр), и собираем конфиг без них.
         newly = _reject_invalid(result, xray_bin, logger) - rejected
@@ -303,12 +319,41 @@ def _reject_invalid(result: builder.BuildResult, xray_bin: Path | None, logger) 
 # сборке: держим ответы в памяти процесса (демона) четверть часа.
 _HOSTS_TTL = 900.0
 _hosts_cache: dict[str, tuple[float, list[str]]] = {}
+# Карантин: домены, про которые резолвер ответил определённо «такого имени нет».
+# Серверы с такими адресами в конфиг Xray не попадают — иначе они занимали бы места в
+# запасных и тратили пробы впустую. Повторная проверка — раз в шесть часов: владелец
+# подписки мог вернуть домен. Сбой самих резолверов (нет сети, таймаут) в карантин не
+# отправляет никого: иначе при отключении интернета из конфига пропали бы все серверы.
+_DEAD_TTL = 6 * 3600.0
+_dead_hosts: dict[str, tuple[float, str]] = {}
 
 
-def _resolve_hosts(selection: builder.Selection, cfg: config.Config, mark, logger) -> dict:
-    """Домены серверов разрешаются через bootstrap-резолверы и попадают в dns.hosts."""
+def resolve_domain(name: str, bootstrap: list[str], mark: int | None) -> list[str]:
+    """Отдельная функция, чтобы тесты не ходили в настоящий DNS."""
+    return fetch.resolve_domain(name, bootstrap, mark=mark)
+
+
+def forget_quarantine() -> None:
+    """Проверить отложенные домены заново при ближайшей сборке (кнопка «Обновить»)."""
+    _dead_hosts.clear()
+
+
+def quarantined() -> frozenset[str]:
+    """Домены в карантине на этот момент (срок не вышел)."""
+    now = time.monotonic()
+    for name in [name for name, (since, _why) in _dead_hosts.items() if now - since >= _DEAD_TTL]:
+        del _dead_hosts[name]
+    return frozenset(_dead_hosts)
+
+
+def _resolve_hosts(
+    selection: builder.Selection, cfg: config.Config, mark, logger
+) -> tuple[dict, frozenset[str]]:
+    """Домены серверов разрешаются через bootstrap-резолверы и попадают в dns.hosts.
+    Второе значение — домены, которых в DNS нет: они только что ушли в карантин."""
     hosts: dict[str, list[str]] = {}
     failed: set[str] = set()
+    gone: set[str] = set()
     now = time.monotonic()
     for node in [*selection.members, *selection.spares, *selection.chains]:
         if not node.address or node.address in hosts or node.address in failed:
@@ -323,7 +368,22 @@ def _resolve_hosts(selection: builder.Selection, cfg: config.Config, mark, logge
             hosts[node.address] = cached[1]
             continue
         try:
-            ips = fetch.resolve_domain(node.address, cfg.dns.bootstrap, mark=mark)
+            ips = resolve_domain(node.address, cfg.dns.bootstrap, mark)
+        except fetch.NoSuchDomain as exc:
+            failed.add(node.address)
+            if node.keep_tag:
+                # Звено цепочки не выбросить отдельно от серверов, которые на него
+                # ссылаются: оставляем как есть, имя попробует разрешить сам Xray.
+                logger.warning("домен %s не разрешён: %s", node.address, exc)
+                continue
+            _dead_hosts[node.address] = (now, str(exc))
+            _hosts_cache.pop(node.address, None)
+            gone.add(node.address)
+            logger.warning(
+                "%s — серверы с этим адресом отложены, повторная проверка через %d ч",
+                exc, int(_DEAD_TTL // 3600),
+            )
+            continue
         except fetch.ResolveError as exc:
             failed.add(node.address)
             if cached:  # резолверы недоступны — лучше прежний адрес, чем никакого
@@ -332,7 +392,23 @@ def _resolve_hosts(selection: builder.Selection, cfg: config.Config, mark, logge
             continue
         hosts[node.address] = ips
         _hosts_cache[node.address] = (now, ips)
-    return hosts
+    return hosts, frozenset(gone)
+
+
+def summary(assembly: Assembly) -> dict[str, int]:
+    """Сводка разбора подписок: сколько серверов в работе и сколько отброшено."""
+    stats = assembly.selection.stats
+    return {
+        "members": len(assembly.selection.members),
+        "spares": len(assembly.selection.spares),
+        # недоступные и служебные: служебные адреса, IPv6 при ipv6 = off, отсеянные
+        # фильтром имён, домены без адреса и серверы, чей конфиг Xray не принимает
+        "dropped": sum(stats.get(key, 0) for key in ("junk", "ipv6", "filter", "dns"))
+        + assembly.invalid,
+        "duplicates": stats.get("duplicates", 0),
+        "excluded": stats.get("excluded", 0),
+        "dns": stats.get("dns", 0),
+    }
 
 
 def persist(
@@ -369,6 +445,7 @@ def persist(
             store.replace_nodes(entries)
             store.prune_scans({info.probe_tag for info in result.nodes})
             store.set_meta("quota", json.dumps(quotas, ensure_ascii=False))
+            store.set_meta("nodes_summary", json.dumps(summary(assembly)))
             if record_event:
                 store.add_event(
                     "generate", f"участников: {members}, запасных: {len(entries) - members}"

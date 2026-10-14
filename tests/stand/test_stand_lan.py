@@ -307,3 +307,71 @@ def test_fail_open_removes_capture_until_xray_returns(tmp_path):
         assert any("перехват возвращён" in detail for detail in details)
     finally:
         stand.stop()
+
+
+def test_capture_enabled_in_the_config_is_applied_at_once_and_internet_survives(tmp_path):
+    """Дефект с настоящей машины (docs/TEST-REPORT-2026-10-14.md, D1). Шлюз работал без
+    перехвата — в конфиге Xray нет tproxy-in. В config.toml включают capture.lan и
+    capture.local при живом демоне. Раньше правила загружались сразу, а перезапуск Xray
+    ждал окна (до 04:00): весь трафик уходил на порт, который никто не слушает, и машина
+    оставалась без интернета. Теперь Xray перезапускается сразу, а правила загружаются
+    только после этого: связь не пропадает дольше, чем на перезапуск."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up()  # перехват в конфиге выключен: XGW только управляет Xray
+        applied = stand.root / "etc/xgw/xray/config.json"
+        assert "tproxy-in" not in stand.gw_run("cat", str(applied))
+        assert stand.exit_ip("gw") == DIRECT
+        stand.start_daemon()
+        assert wait_for(lambda: stand.xgw_json("status").get("state") == "HEALTHY", 40)
+        pid = stand.xray_pid()
+
+        stand.write_config(capture=True)
+        seen: list[str] = []
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and seen[-1:] != [VIA_VPN]:
+            seen.append(stand.exit_ip("gw"))
+            time.sleep(0.3)
+        assert seen[-1] == VIA_VPN, f"{seen[-10:]}\n{stand.tail('daemon', 60)}"
+        # Без связи — не дольше перезапуска Xray: счёт на секунды, а не до окна.
+        assert seen.count("") <= 3, seen
+        assert "tproxy-in" in stand.gw_run("cat", str(applied))
+        assert stand.xray_pid() != pid  # Xray перезапущен, хотя окно перезапуска не наступило
+        assert not (stand.root / "etc/xgw/xray/config.pending.json").exists()
+        assert "tproxy to 127.0.0.1:12345" in stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert stand.exit_ip("lan") == VIA_VPN
+        capture = _capture(stand)
+        assert capture["mode"] == "on" and capture["inbound_missing"] == ""
+        assert capture["loaded"] is True
+        log = stand.tail("daemon", 200)
+        assert "изменение inbound перехвата" in log, log
+    finally:
+        stand.stop()
+
+
+def test_capture_is_not_loaded_while_xray_runs_without_the_inbound(tmp_path):
+    """Предохранитель сам по себе, без демона: конфиг Xray собран без перехвата, а
+    человек (или xgw-net.service при загрузке) просит правила. Правила перехвата не
+    загружаются, интернет остаётся прямым, команда говорит правду."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up()  # Xray запущен без tproxy-in
+        stand.write_config(capture=True)  # настройки сменили, конфиг Xray ещё прежний
+        for command in (("net", "up"), ("enable",)):
+            result = stand.xgw(*command)
+            table = stand.gw_run("nft", "list", "table", "ip", "xgw")
+            assert "tproxy" not in table and "masquerade" in table, command
+            assert stand.exit_ip("gw") == DIRECT and stand.exit_ip("lan") == DIRECT
+        assert result.returncode == 1 and "перехват пока не включён" in result.stderr
+        assert "tproxy-in на порту 12345" in result.stderr
+        status = stand.xgw("status").stdout
+        assert "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray)" in status, status
+        # Выбор «включено» запомнен: после применения конфига правила загружаются сами.
+        assert stand.xgw("apply", "--now").returncode == 0
+        assert stand.xgw("net", "up").returncode == 0
+        assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=1), stand.xray_log(30)
+        assert stand.exit_ip("lan") == VIA_VPN
+    finally:
+        stand.stop()

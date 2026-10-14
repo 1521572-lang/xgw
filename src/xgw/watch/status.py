@@ -21,6 +21,9 @@ from ..store import Store
 
 DEFAULT_PROBE_BYTES = 65536
 MB = 1_000_000  # ТЗ считает в десятичных единицах: 5 × 64 КиБ × 2880 ≈ 0,94 ГБ
+GB = 1_000_000_000
+MONTH_DAYS = 30
+PROBE_SIZE_META = "probe_size"  # ключ в базе: размер тела probe.url по сквозной проверке
 
 
 @dataclass(frozen=True)
@@ -31,21 +34,86 @@ class Budget:
     scans: int  # сканы запасных
     e2e: int  # сквозная проверка watchdog через http-in
 
+    size: int = DEFAULT_PROBE_BYTES  # размер одной пробы, от которого всё посчитано
+    measured: bool = False  # размер измерен сквозной проверкой, а не взят по умолчанию
+
     @property
     def total(self) -> int:
         """Бюджет по формуле раздела 6.8: участники × проба × 86400 / interval плюс сканы."""
         return self.probes + self.scans
 
+    @property
+    def everything(self) -> int:
+        """Весь трафик проверок за сутки: с ним сверяют квоту подписки."""
+        return self.probes + self.scans + self.e2e
 
-def probe_budget(cfg: Config, members: int, spares: int) -> Budget:
-    size = probe_bytes(cfg.probe.url) or DEFAULT_PROBE_BYTES
+
+def remember_probe_size(store: Store, url: str, size: int) -> None:
+    """Размер тела probe.url, который только что скачала сквозная проверка."""
+    current = _load_json(store.get_meta(PROBE_SIZE_META)) or {}
+    if size > 0 and (current.get("url") != url or current.get("bytes") != size):
+        store.set_meta(PROBE_SIZE_META, json.dumps({"url": url, "bytes": size}))
+
+
+def measured_probe_size(store: Store, url: str) -> int | None:
+    """Измеренный размер пробы, если он относится к нынешнему probe.url."""
+    saved = _load_json(store.get_meta(PROBE_SIZE_META)) or {}
+    size = saved.get("bytes")
+    if saved.get("url") == url and isinstance(size, int) and size > 0:
+        return size
+    return None
+
+
+def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None) -> Budget:
+    """size — размер тела probe.url по последней сквозной проверке; без него берётся
+    размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
+    незнакомого адреса — 64 КиБ."""
+    measured = bool(size)
+    size = size or probe_bytes(cfg.probe.url) or DEFAULT_PROBE_BYTES
     interval = parse_seconds(cfg.probe.interval) or 30
     scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
     return Budget(
         probes=int(members * size * 86400 / max(1, interval)),
         scans=int(spares * size * scans_per_day),
         e2e=int(size * 86400 / max(1, cfg.watchdog.interval_s)),
+        size=size,
+        measured=measured,
     )
+
+
+def quota_share(budget: Budget, quotas: dict[str, dict[str, int]]) -> dict[str, float]:
+    """Какую долю полной квоты подписки (в процентах) проверки расходуют за месяц."""
+    share: dict[str, float] = {}
+    monthly = budget.everything * MONTH_DAYS
+    for name, quota in quotas.items():
+        total = quota.get("total", 0) if isinstance(quota, dict) else 0
+        if total > 0:
+            share[name] = round(100.0 * monthly / total, 1)
+    return share
+
+
+def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]],
+                   members: int, spares: int) -> dict:
+    """Бюджет проб для status.json, `xgw status` и панели."""
+    return {
+        "probes_mb": round(budget.probes / MB, 1),
+        "scans_mb": round(budget.scans / MB, 1),
+        "total_mb": round(budget.total / MB, 1),
+        "e2e_mb": round(budget.e2e / MB, 1),
+        "limit_mb": cfg.probe.max_daily_probe_mb,
+        # Всё вместе, со сквозной проверкой: столько уходит из квоты подписки.
+        "all_mb": round(budget.everything / MB, 1),
+        "month_gb": round(budget.everything * MONTH_DAYS / GB, 1),
+        "over": budget.total / MB > cfg.probe.max_daily_probe_mb,
+        "probe_bytes": budget.size,
+        "measured": budget.measured,
+        "members": members,
+        "spares": spares,
+        "interval_s": parse_seconds(cfg.probe.interval) or 30,
+        "scan_minutes": max(1, cfg.probe.scan_spares_minutes),
+        "quota_share": quota_share(budget, quotas),
+        "warnings": budget_warnings(cfg, budget, quotas),
+    }
 
 
 def budget_warnings(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]]) -> list[str]:
@@ -87,8 +155,10 @@ def collect_status(
     xray_version: str = "",
     daemon: bool = False,
     capture: dict | None = None,
+    probe_target: str = "",
 ) -> dict:
-    """Снимок состояния для status.json. observatory=None — метрики недоступны."""
+    """Снимок состояния для status.json. observatory=None — метрики недоступны.
+    probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает)."""
     now = time.time()
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
@@ -97,6 +167,8 @@ def collect_status(
     quotas: dict[str, dict[str, int]] = {}
     events: list[dict] = []
     pin: dict | None = None
+    summary: dict = {}
+    probe_size: int | None = None
     try:
         store = Store(paths.db_file)
         try:
@@ -107,6 +179,8 @@ def collect_status(
             scans = store.scans()
             quotas = _load_json(store.get_meta("quota")) or {}
             pin = _load_json(store.get_meta("pin")) or None
+            summary = _load_json(store.get_meta("nodes_summary")) or {}
+            probe_size = measured_probe_size(store, cfg.probe.url)
             events = store.recent_events(10)
         finally:
             store.close()
@@ -147,7 +221,7 @@ def collect_status(
                 }
             )
 
-    budget = probe_budget(cfg, len(members), len(spares))
+    budget = probe_budget(cfg, len(members), len(spares), probe_size)
     status = {
         "updated": now,
         "daemon": daemon,
@@ -167,14 +241,10 @@ def collect_status(
         "pin": pin if pin and pin.get("until", 0) > now else None,
         "quota": quotas,
         "sub_errors": sub_errors,
-        "budget": {
-            "probes_mb": round(budget.probes / MB, 1),
-            "scans_mb": round(budget.scans / MB, 1),
-            "total_mb": round(budget.total / MB, 1),
-            "e2e_mb": round(budget.e2e / MB, 1),
-            "limit_mb": cfg.probe.max_daily_probe_mb,
-            "warnings": budget_warnings(cfg, budget, quotas),
-        },
+        "budget": budget_summary(cfg, budget, quotas, len(members), len(spares)),
+        # Сводка разбора подписок: сколько серверов отброшено и сколько дублей схлопнуто.
+        "nodes": summary,
+        "probe_target": probe_target,
         "pending_restart": paths.pending_config_file.exists(),
         "events": events,
     }
@@ -287,12 +357,13 @@ def render_capture(capture: dict) -> str:
             "Перехват: ВРЕМЕННО СНЯТ — Xray недоступен, fail_mode = open; "
             "трафик идёт напрямую, мимо VPN"
         )
-    if capture.get("tproxy_missing"):
-        # Включения ждали, но Xray работает без inbound'а перехвата: правила не
-        # загружены, трафик идёт напрямую (иначе он ушёл бы в никуда).
+    if capture.get("inbound_missing"):
+        # Перехват включён, но Xray работает без нужного inbound'а: правила перехвата
+        # не загружены, трафик идёт напрямую (иначе он ушёл бы в никуда).
         return (
-            "Перехват: НЕ ВКЛЮЧЁН — Xray работает без inbound'а перехвата, "
-            "трафик идёт напрямую; включится после перезапуска Xray"
+            "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray) — "
+            f"{capture['inbound_missing']}; трафик идёт напрямую, перехват включится сам "
+            "после перезапуска Xray (сразу: sudo xgw apply --now)"
         )
     scope = [f"сеть {capture['lan_if']}"] if capture.get("lan") else []
     if capture.get("local"):
@@ -319,6 +390,50 @@ def render_xray(xray: dict) -> str:
     return f"Xray{version}: {state}"
 
 
+def _thousands(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def render_nodes(summary: dict) -> str:
+    """«Узлов: 5 активных, 65 запасных (отброшено 4 недоступных/служебных, схлопнуто
+    12 дублей)»; пусто — сводки ещё нет."""
+    if not summary:
+        return ""
+    text = (
+        f"Узлов: {summary.get('members', 0)} активных, {summary.get('spares', 0)} запасных "
+        f"(отброшено {summary.get('dropped', 0)} недоступных/служебных, "
+        f"схлопнуто {summary.get('duplicates', 0)} дублей)"
+    )
+    if summary.get("dns"):
+        text += f"; из отброшенных {summary['dns']} — домен не разрешается"
+    if summary.get("excluded"):
+        text += f"; отключено или убрано в панели: {summary['excluded']}"
+    return text
+
+
+def render_budget(budget: dict) -> list[str]:
+    """Трафик проверок: в сутки и в месяц, из чего складывается и какая это доля квоты."""
+    lines = [
+        f"Трафик проверок: ~{budget['total_mb']:.0f} МБ/сут "
+        f"(пробы {budget['probes_mb']:.0f}, сканы {budget['scans_mb']:.0f}; "
+        f"лимит {budget['limit_mb']}); сквозная проверка ещё ~{budget['e2e_mb']:.0f} МБ/сут"
+    ]
+    if "month_gb" in budget:
+        size = _thousands(int(budget.get("probe_bytes") or 0))
+        origin = "измерено" if budget.get("measured") else "по оценке"
+        # Без знаков вне кодовой страницы Windows: вывод читают и из окна установщика.
+        lines.append(
+            f"  всего ~{budget['all_mb']:.0f} МБ/сут, ~{budget['month_gb']:.1f} ГБ/мес: проба "
+            f"{size} Б ({origin}); участников — {budget.get('members', 0)}, проба раз в "
+            f"{budget.get('interval_s', 30)} с; запасных — {budget.get('spares', 0)}, скан раз в "
+            f"{budget.get('scan_minutes', 60)} мин"
+        )
+        for name, share in (budget.get("quota_share") or {}).items():
+            lines.append(f"  за месяц это ~{share:.0f} % квоты подписки «{name}»")
+    lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
+    return lines
+
+
 def render_status(status: dict) -> str:
     lines: list[str] = []
     if status.get("daemon") and status.get("state"):
@@ -328,6 +443,8 @@ def render_status(status: dict) -> str:
     else:
         lines.append("Состояние: демон XGW не запущен — показаны разовые данные")
     lines.append(render_xray(status.get("xray") or {}))
+    if status.get("probe_target"):
+        lines.append(status["probe_target"])
     if status.get("capture"):
         lines.append(render_capture(status["capture"]))
     pin = status.get("pin")
@@ -338,6 +455,9 @@ def render_status(status: dict) -> str:
         )
     if status.get("pending_restart"):
         lines.append("Ожидает окна перезапуска: новый конфиг требует перезапуска Xray")
+    nodes = render_nodes(status.get("nodes") or {})
+    if nodes:
+        lines.append(nodes)
     lines.append(render_servers(status))
     for name, quota in (status.get("quota") or {}).items():
         total = quota.get("total", 0)
@@ -350,12 +470,7 @@ def render_status(status: dict) -> str:
         lines.append(text)
     budget = status.get("budget") or {}
     if budget:
-        lines.append(
-            f"Трафик проверок: ~{budget['total_mb']:.0f} МБ/сут "
-            f"(пробы {budget['probes_mb']:.0f}, сканы {budget['scans_mb']:.0f}; "
-            f"лимит {budget['limit_mb']}); сквозная проверка ещё ~{budget['e2e_mb']:.0f} МБ/сут"
-        )
-        lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
+        lines.extend(render_budget(budget))
     events = status.get("events") or []
     if events:
         lines.append("Последние события:")

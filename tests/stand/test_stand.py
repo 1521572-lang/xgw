@@ -124,7 +124,9 @@ def test_subscription_change_applies_without_dropping_connections(stand):
         "download",
         [sys.executable, str(Path(__file__).with_name("download.py")),
          "--proxy", f"127.0.0.1:{probe['port']}", "--user", account["user"],
-         "--password", account["pass"],
+         # Через «=»: пароль проб случаен и бывает, что начинается с «-» — тогда argparse
+         # принял бы его за следующий ключ, и тест падал раз в несколько десятков прогонов.
+         f"--password={account['pass']}",
          stand.origin_url(f"/slow?bytes={size}&seconds={seconds}")],
     )
     time.sleep(2)

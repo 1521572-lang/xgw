@@ -482,6 +482,7 @@ def test_uninstall_without_config_finds_the_tun_interface_in_the_journal(box):
     box.cfg.capture.method = "tun"
     box.cfg.capture.tun_name = "vpn7"
     box.cfg.capture.tun_route_table = 177
+    fakexray.write(box.paths, fakexray.applied_config(tun="vpn7"))  # Xray слушает vpn7
     assert box.install() == 0
     kernel = box.system.kernel
     assert kernel.links == {"vpn7": "tun"} and "177" in {r["table"] for r in kernel.rules}
@@ -674,3 +675,72 @@ def test_chosen_card_is_written_into_a_fresh_config(tmp_path):
     assert set_lan_if(path, "enp5s0") is False  # строки lan_if = "" уже нет — не трогаем
     assert set_lan_if(path, 'x"; rm') is False
     assert path.read_text(encoding="utf-8") == before
+
+
+def test_install_is_refused_when_the_lan_subnet_overlaps_the_wan_network(box):
+    """Сеть провайдера — 192.168.50.0/24, как и lan_address по умолчанию: профиль
+    xgw-lan дал бы второй карте адрес роутера провайдера. Установка не начинается —
+    ни с --yes, ни с --force, — и в системе ничего не меняется."""
+    box.system.addresses["wan0"] = ["192.168.50.37/24"]
+    box.system.gateway = "192.168.50.1"
+    profiles = dict(box.system.profiles)
+    for force in (False, True):
+        box.out.clear()
+        assert box.install(force=force) == 1
+        text = box.text()
+        assert "✗ Конфликт подсетей: lan_address (192.168.50.1/24) пересекается с " \
+               "интерфейсом wan0 (192.168.50.0/24)" in text
+        assert "(например, на 192.168.60.1/24)" in text
+        assert "сначала исправьте подсеть LAN" in text and "План установки" not in text
+    assert box.system.profiles == profiles and box.system.units == {}
+    assert not box.paths.journal_file.exists() and box.system.kernel.tables == {}
+
+    box.cfg.network.lan_address = "192.168.60.1/24"
+    box.cfg.network.dhcp_range = "192.168.60.100,192.168.60.200,12h"
+    box.out.clear()
+    assert box.install() == 0, box.text()
+    assert box.system.profile("xgw-lan")["ipv4.addresses"] == "192.168.60.1/24"
+
+
+def test_conflict_reported_by_diag_is_not_printed_twice(box):
+    from xgw.diag import FAIL, Check
+
+    box.system.addresses["wan0"] = ["192.168.50.37/24"]
+    installer = box.installer()
+    installer.checks = lambda: [
+        Check("Подсеть LAN", FAIL, installer.subnet_conflict()),
+        Check("Порты", FAIL, "заняты другой программой"),
+    ]
+    assert installer.run(assume_yes=True) == 1
+    assert box.text().count("Конфликт подсетей") == 1 and "Порты: заняты" in box.text()
+
+
+def test_lan_profile_is_not_created_if_the_conflict_appears_during_install(box):
+    """Пока ставились пакеты, у машины появился адрес из подсети LAN (поднялся другой
+    интерфейс): сеть не трогается, сделанное откатывается."""
+    installer = box.installer()
+    seen = {"count": 0}
+    original = installer.subnet_conflict
+
+    def conflict() -> str:
+        seen["count"] += 1
+        if seen["count"] > 1:
+            box.system.addresses["usb0"] = ["192.168.50.9/24"]
+        return original()
+
+    installer.subnet_conflict = conflict
+    assert installer.run(assume_yes=True) == 1
+    assert "настройка сети не удалась: Конфликт подсетей" in box.text()
+    assert "xgw-lan" not in [item["connection.id"] for item in box.system.profiles.values()]
+
+
+def test_install_says_so_when_capture_waits_for_the_xray_inbound(box):
+    """Xray отвечает, но в его конфиге нет inbound'а перехвата (собран при выключенном
+    перехвате, а настройки с тех пор сменили): установка не рапортует «включён»."""
+    fakexray.write(box.paths, {"inbounds": [{"tag": "socks-in"}]})
+    assert box.install() == 0
+    text = box.text()
+    assert "правила nftables загружены, перехват снят" in text
+    assert "! перехват пока не включён: в применённом конфиге Xray нет inbound tproxy-in" in text
+    assert "tproxy" not in box.system.kernel.table and "masquerade" in box.system.kernel.table
+    assert "Предупреждений: 1" in text

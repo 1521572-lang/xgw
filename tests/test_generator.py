@@ -1,5 +1,6 @@
 """Тесты генератора: golden-конфиг и инварианты из раздела 6.6/9 ТЗ."""
 
+import json
 import re
 
 import links
@@ -399,3 +400,65 @@ def test_applied_nodes_reads_running_layout():
     assert [i.tag for i in blind] == [i.tag for i in result.nodes]
     assert all(len(i.fingerprint) == 4 for i in blind)
     assert applied_nodes(None) == [] and applied_nodes({"outbounds": [{"tag": "direct"}]}) == []
+
+
+def test_host_header_of_websocket_and_httpupgrade_becomes_the_host_field():
+    """JSON-подписки приносят streamSettings как есть — с `headers.Host`. Xray 26.3.27 у
+    WebSocket объявил такую запись устаревшей (предупреждение в журнале при каждом
+    запуске), а у HTTPUpgrade отклоняет вовсе; в конфиг идёт отдельное поле `host`."""
+    def with_stream(fingerprint: str, stream: dict) -> ServerNode:
+        node = _node(fingerprint, "ws")
+        node.outbound = {**node.outbound, "streamSettings": stream}
+        return node
+
+    nodes = [
+        with_stream("aaaa0001", {"network": "ws", "wsSettings": {
+            "path": "/ws", "headers": {"Host": "cdn.example.org"}}}),
+        with_stream("aaaa0002", {"network": "httpupgrade", "httpupgradeSettings": {
+            "path": "/up", "headers": {"host": "up.example.org", "X-Extra": "1"}}}),
+        # Явный host главнее заголовка; заголовок всё равно убирается.
+        with_stream("aaaa0003", {"network": "ws", "wsSettings": {
+            "path": "/", "host": "explicit.example.org", "headers": {"Host": "old.example.org"}}}),
+        # Список значений — так записан Host у http-обфускации tcp: берётся первое.
+        with_stream("aaaa0004", {"network": "ws", "wsSettings": {
+            "headers": {"Host": ["a.example.org"]}}}),
+        # Обфускация tcp/http — другое поле и другая запись: её не трогаем.
+        with_stream("aaaa0005", {"network": "tcp", "tcpSettings": {"header": {
+            "type": "http", "request": {"headers": {"Host": ["h.example.org"]}}}}}),
+    ]
+    cfg = Config()
+    originals = [repr(node.outbound) for node in nodes]
+    config = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32).config
+    streams = {
+        outbound["tag"].rsplit("-", 1)[1]: outbound["streamSettings"]
+        for outbound in config["outbounds"] if "streamSettings" in outbound
+        and outbound["tag"].startswith(("proxy-", "spare-"))
+    }
+    assert streams["aaaa0001"]["wsSettings"] == {"path": "/ws", "host": "cdn.example.org"}
+    assert streams["aaaa0002"]["httpupgradeSettings"] == {
+        "path": "/up", "host": "up.example.org", "headers": {"X-Extra": "1"}}
+    assert streams["aaaa0003"]["wsSettings"] == {"path": "/", "host": "explicit.example.org"}
+    assert streams["aaaa0004"]["wsSettings"] == {"host": "a.example.org"}
+    assert streams["aaaa0005"]["tcpSettings"]["header"]["request"]["headers"] == {
+        "Host": ["h.example.org"]}
+    assert [repr(node.outbound) for node in nodes] == originals  # исходные узлы не тронуты
+    assert '"Host"' not in json.dumps([streams[key] for key in ("aaaa0001", "aaaa0002")])
+
+
+def test_selection_counts_what_was_dropped():
+    cfg = Config()
+    cfg.filters.max_members = 1
+    cfg.managed.disabled = ["cccc0000"]
+    service = _node("aaaa0000", "service")
+    service.address = "127.0.0.1"
+    gone = _node("bbbb0000", "gone")
+    gone.address = "gone.example.net"
+    nodes = [service, gone, _node("cccc0000", "off"), _node("dddd0000", "expire 2026"),
+             _node("eeee0000", "A"), _node("eeee0000", "A copy"), _node("ffff0000", "B")]
+    selection = select_nodes(nodes, cfg, dead={"gone.example.net"})
+    assert selection.stats == {
+        "total": 7, "junk": 1, "ipv6": 0, "filter": 1, "dns": 1, "excluded": 1, "duplicates": 1}
+    assert [n.name for n in [*selection.members, *selection.spares]] == ["A", "B"]
+    assert any("домен gone.example.net не разрешается" in text for text in selection.warnings)
+    # Без карантина тот же сервер идёт в работу.
+    assert select_nodes(nodes, cfg).stats["dns"] == 0

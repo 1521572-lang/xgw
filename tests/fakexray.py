@@ -13,16 +13,22 @@ import json
 from xgw.config import Config
 
 
-def applied_config(port: int | None = None, *, listen: str = "127.0.0.1") -> dict:
-    """Конфиг с inbound'ами перехвата: как их собирает генератор (builder.py)."""
+def applied_config(
+    port: int | None = None, *, listen: str = "127.0.0.1", tun: str | None = "xgwtun0"
+) -> dict:
+    """Конфиг с inbound'ами перехвата: как их собирает генератор (builder.py).
+
+    tun — имя интерфейса inbound'а `tun-in` (capture.method = "tun"); None — без него.
+    """
     if port is None:
         port = Config().capture.tproxy_port
-    return {
-        "inbounds": [
-            {"tag": "tproxy-in", "listen": listen, "port": port, "protocol": "tunnel"},
-            {"tag": "tproxy-in6", "listen": "::1", "port": port, "protocol": "tunnel"},
-        ]
-    }
+    inbounds = [
+        {"tag": "tproxy-in", "listen": listen, "port": port, "protocol": "tunnel"},
+        {"tag": "tproxy-in6", "listen": "::1", "port": port, "protocol": "tunnel"},
+    ]
+    if tun:
+        inbounds.append({"tag": "tun-in", "protocol": "tun", "settings": {"name": tun}})
+    return {"inbounds": inbounds}
 
 
 def write(paths, config: dict | None = None) -> None:

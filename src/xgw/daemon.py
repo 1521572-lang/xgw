@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import datetime
 import ipaddress
 import json
@@ -22,17 +23,19 @@ import random
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import engine, fetch, log
-from .apply.applier import ApplyOutcome, in_restart_window, tproxy_inbounds
-from .apply.rotation import plan_rotation, preferred_members
+from .apply.applier import ApplyOutcome, in_restart_window
+from .apply.rotation import REPLACE_NOW_VERDICTS, plan_rotation, preferred_members
 from .config import Config
 from .generator import builder
 from .generator.builder import BALANCER_TAG, NodeInfo
+from .net.capture import capture_inbounds
 from .paths import Paths
 from .store import Store
-from .watch import checks, scan, status
+from .watch import checks, scan, status, target
 from .watch.notify import Notifier
 from .watch.states import Signals, State, StateMachine
 from .xraycore import binary, metrics
@@ -50,6 +53,8 @@ ROLLBACK_AFTER = 2  # «после двух неудач — откат на las
 FAIL_OPEN_AFTER = 60.0  # fail_mode = "open": Xray недоступен дольше — снять перехват
 WAIT_SLICE = 1.0  # как часто пауза между шагами смотрит, не пора ли проснуться
 MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
+PROBE_TARGET_RECHECK = 300.0  # как часто перепроверять, отвечает ли сам probe.url
+PROBE_WORKERS = 8  # пробы для этой перепроверки идут одновременно: шаг не должен зависать
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -92,8 +97,9 @@ class Daemon:
         self.reapply_capture = reapply_capture
         self.capture_info: dict | None = None
         self._capture_error = ""
-        # Уже сообщили, что перехват не включён из-за отсутствия inbound'а перехвата.
-        self._tproxy_missing = False
+        # О чём уже сообщили: перехват не включён, потому что Xray работает без нужного
+        # inbound'а (текст причины).
+        self._inbound_missing = ""
         self.xray_down_since: float | None = None
         self.clock = clock
         self.wall = wall
@@ -120,7 +126,15 @@ class Daemon:
         self.down_ticks = 0
         self.rolled_back = False
         self.leak = False
-        self.scan_queue: deque[str] = deque()  # probe-теги запасных, ждущих скана
+        self.scan_queue: deque[str] = deque()  # probe-теги узлов, ждущих скана
+        # Первая проверка участников собственной пробой шлюза: отпечатки уже проверенных
+        # и теги тех, кто её не прошёл (тег → вердикт) — их меняют без ожидания
+        # rotate_after_min.
+        self.vetted: set[str] = set()
+        self.bad_members: dict[str, str] = {}
+        # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
+        self.probe_target = ""
+        self.next_target_check = 0.0
         self.next_refresh = 0.0
         self.next_scan = 0.0
         self.next_leak = 0.0
@@ -164,7 +178,9 @@ class Daemon:
         self.poke.clear()
 
     def request_refresh(self) -> None:
-        """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes."""
+        """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes. Заодно заново
+        проверяются домены, отложенные как несуществующие."""
+        engine.forget_quarantine()
         self._refresh_asked = True
         self.poke.set()
 
@@ -179,6 +195,9 @@ class Daemon:
         self.inventory = previous.inventory
         self.next_refresh = previous.next_refresh
         self._rebuild_asked = True
+        # Серверы те же — заново проверять участников незачем.
+        self.vetted = set(previous.vetted)
+        self.bad_members = dict(previous.bad_members)
 
     def request_scan(self) -> None:
         """Панель: проверить запасные серверы сейчас."""
@@ -211,16 +230,20 @@ class Daemon:
         view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
         members = [info for info in view if info.role == "proxy"]
         signals, observatory = self._signals(members, now)
+        signals = self._probe_target(view, applied, signals, now)
         previous = self.machine.state
         decision = self.machine.update(signals)
         state = decision.state
         self.action = decision.action
         if state is not previous:
             self.state_since = self.wall()
+            detail = decision.action
+            if state is State.PROBE_TARGET_UNREACHABLE:
+                detail = f"{self.probe_target}. Замена серверов приостановлена: {target.ADVICE}"
             # Тип события — само состояние: уведомление об ALL_DEAD не должно
             # придерживаться из-за недавнего уведомления о DEGRADED.
             self.notifier.event(
-                str(state), f"{previous} → {state}: {decision.action}",
+                str(state), f"{previous} → {state}: {detail}",
                 notify=state is not State.HEALTHY,
             )
 
@@ -233,7 +256,14 @@ class Daemon:
             self.rolled_back = False
         if state is State.LEAK:
             self._handle_leak()
-        self._guard_capture(signals.xray_ok, now)
+        # Правила перехвата. Обычно они проверяются до применения конфига: пропавшие
+        # нужно вернуть как можно скорее. Но если правилам нужен inbound, которого у
+        # работающего Xray ещё нет (настройки только что изменились), сначала
+        # применяется конфиг: прежние правила и прежний Xray согласованы и трафик
+        # через VPN носят, а загрузка «новых» правил сейчас сняла бы перехват.
+        waiting = self._capture_waits()
+        if not waiting:
+            self._guard_capture(signals.xray_ok, now)
 
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
@@ -250,19 +280,31 @@ class Daemon:
             self._rebuild_asked = False
             self._save_inventory(self.inventory)
             changed = self._rebuild(None, urgent=urgent, reason="изменение настроек")
+        if waiting or changed:
+            # Xray перезапущен с новым конфигом (или не перезапущен — тогда вместо
+            # перехвата загрузится режим «снят»): правила доводятся сразу, а не через шаг.
+            self._guard_capture(signals.xray_ok, now)
 
-        if scan_asked:
+        # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
+        # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
+        probing = state is not State.PROBE_TARGET_UNREACHABLE
+        if scan_asked and probing:
             self._manual_scan = True
             self._queue_scan(view, now)
-        if not changed and signals.xray_ok and signals.provider_ok:
+        elif scan_asked:
+            self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
+        if not changed and probing and signals.xray_ok and signals.provider_ok:
             if now >= self.next_scan:
                 self.next_scan = now + jitter(self.cfg.probe.scan_spares_minutes * 60.0)
                 self._queue_scan(view, now)
+            self._queue_members(view)
             self._scan_step(view, applied)
-            if state in (State.DEGRADED, State.ALL_DEAD):
+            if state in (State.DEGRADED, State.ALL_DEAD) or (
+                state is State.HEALTHY and self.bad_members
+            ):
                 changed = self._rotate(view, observatory or {}, state, now)
 
-        if not self.scan_queue:
+        if not self.scan_queue or not probing:
             self._manual_scan = False
         self._check_pin()
         if changed:
@@ -312,6 +354,12 @@ class Daemon:
                 self.dead_since.pop(tag, None)
         for tag in set(self.dead_since) - set(tags):
             del self.dead_since[tag]
+        # Не прошедший первую проверку участник: ядро считает его живым — значит,
+        # сбой был разовым; вышел из участников — запись больше не нужна.
+        for tag in list(self.bad_members):
+            entry = (observatory or {}).get(tag)
+            if tag not in tags or (entry is not None and entry["alive"]):
+                del self.bad_members[tag]
 
         return (
             Signals(
@@ -333,11 +381,18 @@ class Daemon:
     def _check_e2e(self) -> bool:
         """Сквозная загрузка probe.url через http-in с детектором «тишины»."""
         result = checks.http_get_via_proxy(
-            "127.0.0.1", self.cfg.xray.http_port, self.cfg.probe.url, silence=5.0, max_total=30.0
+            "127.0.0.1", self.cfg.xray.http_port, self.cfg.probe.url, silence=5.0,
+            max_total=30.0, user_agent=self.cfg.probe.user_agent,
         )
         if not result.ok:
             self.log.info("сквозная проверка не прошла: %s", result.error)
-        return result.ok
+            return False
+        # Размер тела — мера расхода трафика на пробы (status.probe_budget).
+        try:
+            status.remember_probe_size(self.store, self.cfg.probe.url, result.downloaded)
+        except Exception as exc:  # оценка трафика не важнее самой проверки
+            self.log.debug("размер пробы не записан: %s", exc)
+        return True
 
     def _check_provider(self) -> bool:
         """TCP-подключение к wan_check напрямую, сокетом с меткой mark_bypass."""
@@ -369,7 +424,70 @@ class Daemon:
 
     def _check_leak(self) -> str | None:
         """Страна выхода обычным сокетом без метки — то есть через перехват."""
-        return checks.trace_location(self.cfg.probe.trace_url)
+        return checks.trace_location(
+            self.cfg.probe.trace_url, user_agent=self.cfg.probe.user_agent
+        )
+
+    # --- не отвечает сам probe.url -----------------------------------------------
+
+    def _probe_target(
+        self, view: list[NodeInfo], applied: dict, signals: Signals, now: float
+    ) -> Signals:
+        """Отличает «не отвечает адрес пробы» от «не работают серверы» (watch/target.py).
+
+        Повод для проверки — сквозная загрузка probe.url не проходит, и это длится
+        fail_threshold шагов либо ядро уже объявило мёртвыми всех участников (его пробы
+        идут на тот же адрес, и без этого шаг ушёл бы в ALL_DEAD: скан испортил бы
+        вердикты запасных). Тогда собственной пробой опрашиваются все участники и
+        несколько запасных; если ошибка у всех одна и контрольные запросы это
+        подтверждают, состояние — PROBE_TARGET_UNREACHABLE, и серверы остаются как есть.
+        """
+        reachable = signals.xray_ok and signals.provider_ok
+        if reachable and signals.e2e_ok:
+            if self.probe_target:
+                self.probe_target = ""
+                self.next_target_check = 0.0
+                self.next_scan = now  # вердикты запасных могли устареть — проверить заново
+                self.notifier.event(
+                    "probe", "probe.url снова отвечает — проверки серверов возобновлены",
+                    notify=True,
+                )
+            return signals
+        dead = signals.total_members - signals.alive_members - signals.unknown_members
+        suspect = reachable and not signals.e2e_ok and (
+            signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
+            or (signals.total_members > 0 and dead >= signals.total_members)
+        )
+        if suspect and now >= self.next_target_check:
+            self.next_target_check = now + PROBE_TARGET_RECHECK
+            diagnosis = self._diagnose_target(view, applied)
+            if diagnosis.down and diagnosis.text != self.probe_target:
+                self.log.warning("%s", diagnosis.text)
+                # Вердикты первой проверки сняты, пока адрес не отвечал: они ни о чём.
+                self.bad_members.clear()
+                self.vetted.clear()
+            self.probe_target = diagnosis.text if diagnosis.down else ""
+        if self.probe_target:
+            return dataclasses.replace(signals, probe_target_ok=False)
+        return signals
+
+    def _diagnose_target(self, view: list[NodeInfo], applied: dict) -> target.Diagnosis:
+        password, _ports = builder.probe_state(applied)
+        verdicts = {tag: entry["verdict"] for tag, entry in self.store.scans().items()}
+        nodes = target.sample(view, verdicts)
+        if not password or not nodes:
+            return target.Diagnosis(False)
+        with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(nodes))) as pool:
+            results = list(pool.map(lambda info: self._scan(info, password), nodes))
+        return target.diagnose(results, base_ping=self._base_ping, direct=self._direct_probe)
+
+    def _base_ping(self) -> bool:
+        """Базовый запрос через VPN: носят ли серверы трафик вообще."""
+        return target.base_ping(self.cfg)
+
+    def _direct_probe(self) -> str:
+        """probe.url напрямую, мимо VPN: пусто — отдаётся, иначе класс сбоя."""
+        return target.direct_signature(self.cfg, self.mark)
 
     # --- действия --------------------------------------------------------------
 
@@ -407,6 +525,17 @@ class Daemon:
             notify=True,
         )
 
+    def _capture_waits(self) -> bool:
+        """Перехват включён, но правилам нужен inbound, которого в применённом конфиге
+        Xray ещё нет."""
+        capture = self.capture
+        problem = getattr(capture, "inbound_problem", None)
+        try:
+            return bool(problem is not None and capture.mode() == "on" and problem())
+        except Exception as exc:  # сбой сети не должен ронять шаг watchdog
+            self.log.debug("состояние перехвата не прочитано: %s", exc)
+            return False
+
     def _guard_capture(self, xray_ok: bool, now: float) -> None:
         """Следит за правилами перехвата: возвращает пропавшие, а при
         fail_mode = "open" снимает перехват, пока Xray недоступен дольше минуты."""
@@ -437,25 +566,35 @@ class Daemon:
             elif mode == "open":
                 mode = capture.close()  # fail_mode сменили на closed, а метка осталась
             loaded = capture.loaded()
-            if loaded is False:
-                # Правила пропали (чужой flush ruleset, перезапуск nftables) или ещё не
-                # загружались: без них трафик пошёл бы мимо VPN.
+            reloaded = loaded is False
+            if reloaded:
+                # Правила пропали (чужой flush ruleset, перезапуск nftables), ещё не
+                # загружались либо не соответствуют режиму: без них трафик пошёл бы
+                # мимо VPN.
                 capture.up()
                 loaded = capture.loaded()
+            info = capture.describe(check=False)
+            self.capture_info = {**info, "loaded": loaded}
+            missing = str(info.get("inbound_missing") or "")
+            if missing:
+                if missing != self._inbound_missing:  # одно событие на причину
+                    self.notifier.event(
+                        "capture",
+                        f"перехват не включён: {missing} — трафик идёт напрямую; "
+                        "включится сам после перезапуска Xray с новым конфигом",
+                        notify=True,
+                    )
+            elif reloaded and self._inbound_missing:
+                self.notifier.event(
+                    "capture", "Xray перезапущен с inbound'ом перехвата — перехват включён",
+                    notify=True,
+                )
+            elif reloaded:
                 text = getattr(
                     capture, "reloaded_text", "правила сети не были загружены — загружены заново"
                 )
                 self.notifier.event("capture", text, notify=True)
-            self.capture_info = {**capture.describe(check=False), "loaded": loaded}
-            missing = bool(getattr(capture, "tproxy_missing", False))
-            if missing and not self._tproxy_missing:
-                self.notifier.event(
-                    "capture",
-                    "перехват не включён: Xray ещё не перезапущен с inbound перехвата — "
-                    "сеть работает напрямую",
-                    notify=True,
-                )
-            self._tproxy_missing = missing
+            self._inbound_missing = missing
             self._capture_error = ""
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
@@ -472,10 +611,13 @@ class Daemon:
             return False
         if not urgent:
             applied = engine.read_json(self.paths.xray_config_file) or {}
-            if tproxy_inbounds(pending) != tproxy_inbounds(applied):
-                # Меняется inbound перехвата: правила уже загружены по новому
-                # конфигу, и ждать окна нельзя — трафик уходил бы на порт, который
-                # Xray не слушает (fail-closed = нет интернета).
+            sysproxy = bool(self.cfg.capture.sysproxy)
+            if capture_inbounds(pending, sysproxy=sysproxy) != capture_inbounds(
+                applied, sysproxy=sysproxy
+            ):
+                # Меняется inbound перехвата: правила сети следуют новым настройкам, и
+                # ждать окна нельзя — трафик уходил бы на порт или в интерфейс, которых
+                # у работающего Xray нет (fail-closed = нет интернета).
                 self.log.warning(
                     "применяю конфиг вне окна %s: меняется inbound перехвата",
                     self.cfg.apply.restart_window,
@@ -591,15 +733,30 @@ class Daemon:
                 self.scan_queue.append(info.probe_tag)
         self.next_rescan = now + RESCAN_PAUSE
 
+    def _queue_members(self, view: list[NodeInfo]) -> None:
+        """Первая проверка участников собственной пробой шлюза — в начало очереди.
+
+        Первый состав балансировщика берётся из подписки без всяких сведений о
+        серверах; observatory ядра скажет лишь «жив или нет», и то не сразу. Своя проба
+        отличает «заморозку» и отказ в соединении, и такой участник меняется сразу.
+        Проверяется каждый участник один раз: дальше за ним следит само ядро.
+        """
+        queued = set(self.scan_queue)
+        for info in reversed([item for item in view if item.role == "proxy"]):
+            if len(info.fingerprint) < 8:
+                continue  # узел не сопоставлен с подпиской — заменить его всё равно нельзя
+            if info.fingerprint not in self.vetted and info.probe_tag not in queued:
+                self.scan_queue.appendleft(info.probe_tag)
+
     def _scan_step(self, view: list[NodeInfo], applied: dict) -> None:
-        """Сканирует запасные из очереди, пока не истёк бюджет времени шага."""
+        """Сканирует узлы из очереди, пока не истёк бюджет времени шага."""
         if not self.scan_queue:
             return
         password, _ports = builder.probe_state(applied)
-        spares = {info.probe_tag: info for info in view if info.role == "spare"}
+        nodes = {info.probe_tag: info for info in view}
         started = self.clock()
         while self.scan_queue and self.clock() - started < SCAN_BUDGET:
-            info = spares.get(self.scan_queue.popleft())
+            info = nodes.get(self.scan_queue.popleft())
             if info is None or not password:
                 continue
             result = self._scan(info, password)
@@ -607,6 +764,12 @@ class Daemon:
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
             )
+            if info.role == "proxy":
+                self.vetted.add(info.fingerprint)
+                if result.verdict in REPLACE_NOW_VERDICTS:
+                    self.bad_members[info.tag] = result.verdict
+                else:
+                    self.bad_members.pop(info.tag, None)
             self.log.info(
                 "скан %s: %s, %d байт за %.1f с", info.tag, result.verdict,
                 result.bytes_read, result.seconds,
@@ -616,8 +779,9 @@ class Daemon:
         return scan.scan_node(info, self.cfg, probe_pass=password)
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
-        """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные."""
-        if self.inventory is None or not self.dead_since:
+        """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;
+        не прошедших первую проверку (bad_members) — сразу."""
+        if self.inventory is None or not (self.dead_since or self.bad_members):
             return False
         by_fingerprint = {node.fingerprint: node for node in self.inventory.nodes}
         members = [info for info in view if info.role == "proxy"]
@@ -643,16 +807,30 @@ class Daemon:
             cfg.filters.rotate_after_min = 0
         alive = {tag: entry["alive"] for tag, entry in observatory.items()}
         rotation = plan_rotation(
-            alive, self.dead_since, verdicts, seconds, members, pairs, cfg, self.wall()
+            alive, self.dead_since, verdicts, seconds, members, pairs, cfg, self.wall(),
+            urgent=set(self.bad_members),
         )
         if rotation is None:
             overdue = cfg.filters.rotate_after_min * 60.0
-            waiting = any(self.wall() - since >= overdue for since in self.dead_since.values())
+            waiting = bool(self.bad_members) or any(
+                self.wall() - since >= overdue for since in self.dead_since.values()
+            )
             if waiting and pairs and not self.scan_queue and now >= self.next_rescan:
                 self._queue_scan(view, now)  # менять пора, а свежих сканов нет
             return False
         names = ", ".join(f"{tag} → «{node.name}»" for tag, node in rotation.replacements)
-        self.notifier.event("rotation", f"замена участников: {names}", notify=True)
+        failed = [
+            f"{tag} — {self.bad_members[tag]}"
+            for tag, _node in rotation.replacements if tag in self.bad_members
+        ]
+        text = f"замена участников: {names}"
+        if failed:
+            text += f" (не прошли первую проверку: {', '.join(failed)})"
+        self.notifier.event("rotation", text, notify=True)
+        # Замены пришли из запасных, прошедших скан, — проверять их заново незачем.
+        self.vetted.update(node.fingerprint for _tag, node in rotation.replacements)
+        for tag, _node in rotation.replacements:
+            self.bad_members.pop(tag, None)
         return self._rebuild(
             preferred_members(members, rotation),
             urgent=state is State.ALL_DEAD,
@@ -709,7 +887,7 @@ class Daemon:
             observatory=observatory, xray_ok=xray_ok, state=str(state),
             action=self.action, since=self.state_since,
             dead_since=self.dead_since, xray_version=self.xray_version, daemon=True,
-            capture=self.capture_info,
+            capture=self.capture_info, probe_target=self.probe_target,
         )
         warnings = tuple(snapshot["budget"]["warnings"])
         if warnings != self._budget_warnings:

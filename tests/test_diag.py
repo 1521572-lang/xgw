@@ -12,6 +12,8 @@ from xgw import config, diag
 from xgw.diag import FAIL, OK, WARN, Diag
 from xgw.net import nm, ufw
 from xgw.paths import Paths
+from xgw.store import Store
+from xgw.watch import status
 
 LINUX = sys.platform.startswith("linux")
 
@@ -402,18 +404,19 @@ def test_network_probes(box, monkeypatch):
     monkeypatch.setattr(diag.fetch, "fetch_url", fetch_url)
     monkeypatch.setattr(diag.engine, "healthy_http_in", lambda cfg: None)
     monkeypatch.setattr(diag.engine, "bypass_mark", lambda cfg, logger: None)
+    box.cfg.probe.url = "https://probe.example.net/blob?bytes=65536"
     assert box.diag()._probe()[0].level == OK
     replies["size"] = 100
     short = box.diag()._probe()[0]
     assert short.level == WARN and "100 Б из 65536" in short.text
-    replies["probe"] = diag.fetch.FetchError("не удалось получить speed.cloudflare.com: timeout")
+    replies["probe"] = diag.fetch.FetchError("не удалось получить probe.example.net: timeout")
     assert "напрямую не скачивается" in box.diag()._probe()[0].text
 
     answers = {"https://1.1.1.1/dns-query": True, "https://8.8.8.8/dns-query": True,
                "udp://77.88.8.8": True}
 
     def resolve(name, resolvers, mark=None):
-        assert name == "speed.cloudflare.com"
+        assert name == "probe.example.net"
         if not answers[resolvers[0]]:
             raise diag.fetch.ResolveError("таймаут")
         return ["203.0.113.5"]
@@ -436,3 +439,86 @@ def test_a_crashing_check_does_not_stop_the_rest(box, monkeypatch):
     broken = [check for check in checks if "проверка не выполнена" in check.text]
     assert len(broken) == 1 and broken[0].name == "Сон" and broken[0].level == WARN
     assert any(check.name == "Трафик проверок" for check in checks)
+
+
+def test_lan_subnet_conflict_is_a_failure_with_the_way_out(box):
+    """lan_address по умолчанию совпал с сетью провайдера (192.168.50.0/24, шлюз
+    192.168.50.1): установку с таким конфигом начинать нельзя."""
+    assert box.diag()._lan_subnet_conflict() == [diag.Check(
+        "Подсеть LAN", OK, "192.168.50.0/24 не пересекается с другими сетями машины")]
+    box.system.addresses["wan0"] = ["192.168.50.37/24"]
+    box.system.gateway = "192.168.50.1"
+    (check,) = box.diag()._lan_subnet_conflict()
+    assert check.level == FAIL and check.text == (
+        "Конфликт подсетей: lan_address (192.168.50.1/24) пересекается с интерфейсом wan0 "
+        f"(192.168.50.0/24). Измените lan_address и dhcp_range в {box.paths.config_file} "
+        "(например, на 192.168.60.1/24)."
+    )
+    box.cfg.network.lan_address = "192.168.60.1/24"
+    assert box.diag()._lan_subnet_conflict()[0].level == OK
+    box.cfg.network.lan_if = ""  # только эта машина: подсети LAN нет вовсе
+    assert box.diag()._lan_subnet_conflict() == []
+
+
+@pytest.mark.skipif(not LINUX, reason="полный прогон проверок идёт только в Linux")
+def test_lan_subnet_conflict_fails_the_whole_diag(box):
+    box.system.addresses["wan0"] = ["192.168.50.37/24"]
+    failed = [check for check in box.diag().run() if check.level == FAIL]
+    assert [check.name for check in failed] == ["Подсеть LAN"]
+
+
+def test_budget_check_shows_the_month_and_the_measured_probe(box):
+    """Расход на проверки — в сутки и в месяц, от измеренного размера пробы."""
+    (check,) = box.diag()._budget()
+    assert check.level == OK and "~830 МБ в сутки при 5 участниках" in check.text
+    assert "~32 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
+    store = Store(box.paths.db_file)
+    status.remember_probe_size(store, box.cfg.probe.url, 87_533)
+    store.set_meta("quota", json.dumps({"main": {"total": 100 * 10**9}}))
+    store.close()
+    (check,) = box.diag()._budget()
+    assert check.level == WARN and "больше лимита 1024" in check.text
+    assert "проба 87533 Б, измерено" in check.text
+    assert "% квоты подписки «main»" in check.text
+
+
+def test_dead_probe_url_is_named_by_diag(box, monkeypatch):
+    """Через Xray probe.url не скачивается: diag отличает «не отвечает сам адрес» от
+    «не работают серверы» той же проверкой, что и демон."""
+    from xgw.watch.scan import ScanResult
+
+    fakexray.write(box.paths, {
+        "inbounds": [{"tag": "probe-nl-aaaa", "protocol": "http", "port": 20001,
+                      "settings": {"accounts": [{"user": "xgw", "pass": "secret"}]}},
+                     {"tag": "probe-de-bbbb", "protocol": "http", "port": 20002,
+                      "settings": {"accounts": [{"user": "xgw", "pass": "secret"}]}}],
+        "outbounds": [{"tag": "proxy-nl-aaaa"}, {"tag": "spare-de-bbbb"}],
+    })
+    answers = {"scan": ScanResult("", "CONNECT_FAIL", 0, 0.2, "HTTP 403", "http", 403),
+               "direct": 403, "base": False}
+    monkeypatch.setattr(diag.engine, "healthy_http_in", lambda cfg: ("127.0.0.1", 10809))
+    monkeypatch.setattr(diag.engine, "bypass_mark", lambda cfg, logger: None)
+    monkeypatch.setattr(
+        diag.fetch, "fetch_url",
+        lambda url, **kwargs: diag.fetch.FetchResult(answers["direct"], {}, b"Forbidden", url))
+    monkeypatch.setattr(
+        diag.probes, "http_get_via_proxy",
+        lambda host, port, url, **kwargs: probes_result(answers, url, box.cfg))
+    monkeypatch.setattr(diag.scan, "scan_node", lambda info, cfg, **kwargs: answers["scan"])
+
+    def probes_result(state, url, cfg):
+        if url == cfg.probe.trace_url:
+            return diag.probes.DownloadResult(ok=state["base"])
+        return diag.probes.DownloadResult(ok=False, kind="http", status=403, error="HTTP 403")
+
+    found = box.diag()._probe()
+    assert [check.level for check in found] == [WARN, FAIL, FAIL]
+    assert "напрямую: HTTP 403" in found[0].text
+    assert found[2].text.startswith(
+        "Внимание: все пробы падают с одинаковой ошибкой — вероятно, недоступен сам probe.url")
+    assert "другой probe.url" in found[2].advice
+
+    # Серверы отвечают по-разному — значит, дело не в адресе пробы.
+    replies = iter([answers["scan"], ScanResult("", "OK", 57620, 0.4)])
+    monkeypatch.setattr(diag.scan, "scan_node", lambda info, cfg, **kwargs: next(replies))
+    assert [check.level for check in box.diag()._probe()] == [WARN, FAIL]

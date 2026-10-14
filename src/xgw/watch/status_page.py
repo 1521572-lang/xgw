@@ -114,6 +114,12 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
     capture = snapshot.get("capture")
     if capture:
         parts.append(f"<p>{_esc(status.render_capture(capture))}</p>")
+    if snapshot.get("probe_target"):
+        # Не отвечает сам адрес проверки серверов: «мёртвыми» они только выглядят.
+        parts.append(f'<p class="note">{_esc(snapshot["probe_target"])}</p>')
+    nodes = status.render_nodes(snapshot.get("nodes") or {})
+    if nodes:
+        parts.append(f"<p>{_esc(nodes)}</p>")
     if snapshot.get("pin"):
         pin = snapshot["pin"]
         parts.append(
@@ -177,6 +183,11 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
             f"лимит {_esc(budget.get('limit_mb'))} МБ. "
             f"Сквозная проверка — ещё ~{_esc(budget.get('e2e_mb'))} МБ.</p>"
         )
+        if budget.get("month_gb") is not None:
+            parts.append(
+                f"<p>Всего ~{_esc(budget.get('all_mb'))} МБ в сутки, "
+                f"~{_esc(budget.get('month_gb'))} ГБ в месяц.</p>"
+            )
         for warning in budget.get("warnings") or []:
             parts.append(f'<p class="note">{_esc(warning)}</p>')
     for name, quota in (snapshot.get("quota") or {}).items():

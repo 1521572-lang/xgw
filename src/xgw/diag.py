@@ -14,13 +14,14 @@ import socket
 import sys
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import engine, fetch, log
 from .config import Config, probe_bytes
-from .generator import validate
+from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .install import UNITS
 from .net import cmd, dnsmasq, lan, nft, nm, sleep, sysctl, ufw
@@ -28,7 +29,7 @@ from .net.capture import Capture
 from .paths import Paths
 from .store import Store
 from .watch import checks as probes
-from .watch import status
+from .watch import scan, status, target
 from .xraycore import binary, metrics
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
@@ -117,6 +118,7 @@ class Diag:
             ("TUN", self._tun),
             ("Файрвол", self._firewall),
             ("NetworkManager", self._nm),
+            ("Подсеть LAN", self._lan_subnet_conflict),
             ("Порты", self._ports),
             ("Xray API", self._xray_api),
             ("Время", self._time),
@@ -483,6 +485,26 @@ class Diag:
                                 f"({device.state}); профиль {nm.PROFILE} создаст установка"))
         return result
 
+    def _lan_subnet_conflict(self) -> list[Check]:
+        """network.lan_address не должен пересекаться с сетью провайдера и любой другой
+        сетью машины: иначе у шлюза два интерфейса в одной подсети."""
+        if not self.lan_if or self.which("ip") is None:
+            return []
+        conflicts = lan.subnet_conflicts(self.cfg, self.runner)
+        if not conflicts:
+            address = lan.gateway(self.cfg)
+            network = address.network if address is not None else self.cfg.network.lan_address
+            return [Check(
+                "Подсеть LAN", OK, f"{network} не пересекается с другими сетями машины"
+            )]
+        return [Check(
+            "Подсеть LAN", FAIL,
+            lan.conflict_text(
+                self.cfg, conflicts, self.paths.config_file,
+                lan.free_lan_address(self.cfg, self.runner),
+            ),
+        )]
+
     # --- порты, время, сон, IPv6 ------------------------------------------------
 
     def _ports(self) -> list[Check]:
@@ -630,12 +652,14 @@ class Diag:
     def _budget(self) -> list[Check]:
         members, spares = self.cfg.filters.max_members, 0
         quotas: dict = {}
+        size: int | None = None
         if self.paths.db_file.exists():
             try:
                 store = Store(self.paths.db_file)
                 try:
                     nodes = store.all_nodes()
                     quotas = json.loads(store.get_meta("quota") or "{}")
+                    size = status.measured_probe_size(store, self.cfg.probe.url)
                 finally:
                     store.close()
                 if nodes:
@@ -643,15 +667,21 @@ class Diag:
                     spares = len(nodes) - members
             except Exception as exc:
                 self.log.debug("состояние не прочитано: %s", exc)
-        budget = status.probe_budget(self.cfg, members, spares)
+        budget = status.probe_budget(self.cfg, members, spares, size)
+        quotas = quotas if isinstance(quotas, dict) else {}
+        month = budget.everything * status.MONTH_DAYS / status.GB
         text = (
             f"~{budget.total / status.MB:.0f} МБ в сутки при {members} участниках и "
-            f"{spares} запасных (лимит {self.cfg.probe.max_daily_probe_mb} МБ)"
+            f"{spares} запасных (лимит {self.cfg.probe.max_daily_probe_mb} МБ); вместе со "
+            f"сквозной проверкой — ~{budget.everything / status.MB:.0f} МБ в сутки, "
+            f"~{month:.0f} ГБ в месяц (проба {budget.size} Б, "
+            f"{'измерено' if budget.measured else 'по оценке'})"
         )
-        warnings = status.budget_warnings(self.cfg, budget, quotas if isinstance(quotas, dict)
-                                          else {})
+        for name, share in status.quota_share(budget, quotas).items():
+            text += f"; за месяц это ~{share:.0f} % квоты подписки «{name}»"
+        warnings = status.budget_warnings(self.cfg, budget, quotas)
         if warnings:
-            return [Check("Трафик проверок", WARN, "; ".join(warnings))]
+            return [Check("Трафик проверок", WARN, "; ".join(warnings) + f". Сейчас: {text}")]
         return [Check("Трафик проверок", OK, text)]
 
     # --- сеть -------------------------------------------------------------------
@@ -661,6 +691,7 @@ class Diag:
 
     def _probe(self) -> list[Check]:
         url = self.cfg.probe.url
+        agent = self.cfg.probe.user_agent
         expected = probe_bytes(url)
         mark = self._mark()
         result: list[Check] = []
@@ -669,6 +700,7 @@ class Diag:
             reply = fetch.fetch_url(
                 url, mark=mark, timeout=15.0, retries=0,
                 bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+                headers={"User-Agent": agent},
             )
         except fetch.FetchError as exc:
             result.append(Check(
@@ -682,14 +714,16 @@ class Diag:
                     "probe.url", WARN,
                     f"напрямую: HTTP {reply.status}, {size} Б" + (
                         f" из {expected}" if expected else ""),
-                    "задайте probe.url_fallback или другой probe.url",
+                    "не страшно, если через серверы файл скачивается целиком; иначе "
+                    + target.ADVICE,
                 ))
             else:
                 result.append(Check("probe.url", OK, f"напрямую: {size} Б за {seconds:.1f} с"))
         if engine.healthy_http_in(self.cfg) is not None:
             started = time.monotonic()
             download = probes.http_get_via_proxy(
-                "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0, max_total=30.0
+                "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0, max_total=30.0,
+                user_agent=agent,
             )
             if download.ok:
                 result.append(Check(
@@ -702,7 +736,40 @@ class Diag:
                     "probe.url", FAIL, f"через Xray не скачивается: {download.error}",
                     "sudo xgw probe --all покажет серверы по одному",
                 ))
+                result.extend(self._probe_target(mark))
         return result
+
+    def _probe_target(self, mark: int | None) -> list[Check]:
+        """Через Xray probe.url не скачивается. Серверы это или сам адрес пробы? Та же
+        проверка, что у демона (watch/target.py): участники и несколько запасных
+        опрашиваются собственной пробой; одинаковая ошибка у всех плюс контрольные
+        запросы — значит, не отвечает адрес, и серверы ни при чём."""
+        applied = engine.read_json(self.paths.xray_config_file)
+        password, _ports = builder.probe_state(applied)
+        verdicts: dict[str, str] = {}
+        try:
+            store = Store(self.paths.db_file)
+            try:
+                verdicts = {tag: entry["verdict"] for tag, entry in store.scans().items()}
+            finally:
+                store.close()
+        except Exception as exc:
+            self.log.debug("сканы не прочитаны: %s", exc)
+        nodes = target.sample(builder.applied_nodes(applied), verdicts)
+        if not password or not nodes:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as pool:
+            results = list(pool.map(
+                lambda info: scan.scan_node(info, self.cfg, probe_pass=password), nodes
+            ))
+        diagnosis = target.diagnose(
+            results,
+            base_ping=lambda: target.base_ping(self.cfg),
+            direct=lambda: target.direct_signature(self.cfg, mark),
+        )
+        if not diagnosis.down:
+            return []
+        return [Check("probe.url", FAIL, diagnosis.text, target.ADVICE)]
 
     def _bootstrap(self) -> list[Check]:
         name = _domain_to_resolve(self.cfg)

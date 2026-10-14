@@ -189,3 +189,42 @@ def test_dangerous_capture_values_are_replaced(tmp_path):
     assert "capture.mark_proxy" in text and "capture.route_table=254" in text
     assert "network.lan_if='lan 0'" in text and "wan_if" not in text
     assert "network.lan_address" in text
+
+
+def test_probe_defaults_fit_xray_and_cdn(tmp_path):
+    """Файл пробы по умолчанию — несжимаемый (проба Xray просит gzip) и известного
+    размера; собственные пробы ходят с браузерным User-Agent."""
+    from xgw import config as module
+
+    cfg = module.Config()
+    assert cfg.probe.url == module.DEFAULT_PROBE_URL and cfg.probe.url.endswith(".woff")
+    assert "speed.cloudflare.com" not in cfg.probe.url
+    assert module.probe_bytes(cfg.probe.url) == module.DEFAULT_PROBE_SIZE == 57_620
+    assert module.probe_bytes("https://probe.example.net/f?bytes=65536") == 65536
+    assert module.probe_bytes("https://probe.example.net/file.bin") is None
+    assert cfg.probe.user_agent.startswith("Mozilla/5.0 ") and "Chrome/" in cfg.probe.user_agent
+
+    path = tmp_path / "config.toml"
+    path.write_text('[probe]\nuser_agent = "MyProbe/2.0"\n', encoding="utf-8")
+    loaded, warnings = module.load(path)
+    assert loaded.probe.user_agent == "MyProbe/2.0" and warnings == []
+    path.write_text('[probe]\nuser_agent = ""\n', encoding="utf-8")
+    loaded, warnings = module.load(path)  # пусто — значение по умолчанию, без упрёка
+    assert loaded.probe.user_agent == module.DEFAULT_PROBE_UA and warnings == []
+    path.write_text('[probe]\nuser_agent = "Bad\\r\\nX-Injected: 1"\n', encoding="utf-8")
+    loaded, warnings = module.load(path)  # перевод строки в заголовке — это уже не UA
+    assert loaded.probe.user_agent == module.DEFAULT_PROBE_UA
+    assert any("probe.user_agent" in warning for warning in warnings)
+
+
+def test_example_config_matches_the_probe_defaults():
+    """config.example.toml — то, с чего начинается установка: значения в нём те же."""
+    from pathlib import Path
+
+    from xgw import config as module
+
+    example = Path(__file__).resolve().parents[1] / "config.example.toml"
+    loaded, warnings = module.load(example)
+    assert warnings == []
+    assert loaded.probe.url == module.DEFAULT_PROBE_URL
+    assert loaded.probe.user_agent == module.DEFAULT_PROBE_UA

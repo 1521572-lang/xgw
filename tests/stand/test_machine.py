@@ -210,7 +210,21 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
     result = _install(gw, "--yes")
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
-    assert "пакеты: dnsmasq" in out  # поставлен через apt-get из репозитория контейнера
+    if os.environ.get("XGW_MACHINE_PREINSTALL_DNSMASQ") == "1":
+        assert box.dnsmasq_preinstalled, "пакет dnsmasq не удалось поставить в контейнер заранее"
+    if box.dnsmasq_preinstalled:
+        # Пакет достался контейнеру от хоста (корень — оверлей поверх его корня):
+        # ставить нечего, и строки об установке быть не должно.
+        assert "пакеты: dnsmasq" not in out
+    else:
+        assert "пакеты: dnsmasq" in out  # поставлен через apt-get из репозитория контейнера
+    # Откуда бы пакет ни взялся, важно, что dnsmasq работает: конфиг XGW принят,
+    # служба слушает DHCP на карте LAN и выдаёт устройству адрес из диапазона.
+    assert box.run("dnsmasq", "--test", check=False).returncode == 0
+    assert "dnsmasq" in box.sh("ss -lunpH 'sport = :67'")
+    lease = stand.lan("dhcp", "eth0")
+    assert "error" not in lease, f"{lease}\n{box.journal('dnsmasq', 20)}"
+    assert lease["router"] == netns.GW_LAN_IP
     assert "подписок пока нет: VPN не включится" in out  # сказано ещё в плане
     assert "XGW установлен. Подписок пока нет — VPN выключен" in out
     token = _panel_token(gw)
@@ -242,8 +256,15 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
 
 def test_panel_is_reachable_only_from_the_machine_itself_and_by_token(gw):
     box, stand = gw.box, gw.stand
-    listening = box.sh(f"ss -ltnH 'sport = :{PANEL_PORT}'")
-    assert f"127.0.0.1:{PANEL_PORT}" in listening
+
+    def sockets() -> str:
+        return box.sh(f"ss -ltnH 'sport = :{PANEL_PORT}'")
+
+    # Установка заканчивается перезапуском демона, а порт панели он открывает чуть
+    # позже — на медленной машине между этими событиями проходят секунды.
+    assert wait_for(lambda: f"127.0.0.1:{PANEL_PORT}" in sockets(), 10, step=0.3), (
+        sockets(), box.journal("xgw", 40))
+    listening = sockets()
     for elsewhere in ("0.0.0.0", "*", netns.GW_LAN_IP, netns.GW_WAN_IP):
         assert f"{elsewhere}:{PANEL_PORT}" not in listening, listening
     for address in (netns.GW_LAN_IP, netns.GW_WAN_IP):

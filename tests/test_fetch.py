@@ -334,3 +334,41 @@ def test_bootstrap_udp_with_port(monkeypatch):
     fetch.resolve_domain("nl.example.com", ["udp://203.0.113.53:5353"])
     fetch.resolve_domain("nl.example.com", ["udp://77.88.8.8"])
     assert asked == [("203.0.113.53", 5353), ("77.88.8.8", 53)]
+
+
+def test_nxdomain_is_told_apart_from_a_resolver_failure(monkeypatch):
+    """«Такого имени нет» — определённый ответ: сервер с таким адресом недоступен, пока
+    домен не вернут. Таймаут или SERVFAIL — сбой резолвера, по нему судить нельзя."""
+    query = _dns_query("gone.example.com")
+    nxdomain = query[:2] + struct.pack(">H", 0x8183) + query[4:]
+    with pytest.raises(fetch.NoSuchDomain, match="NXDOMAIN"):
+        _parse_a_answers(nxdomain)
+    servfail = query[:2] + struct.pack(">H", 0x8182) + query[4:]
+    with pytest.raises(ResolveError, match="RCODE 2") as caught:
+        _parse_a_answers(servfail)
+    assert not isinstance(caught.value, fetch.NoSuchDomain)
+    assert _parse_a_answers(query[:2] + struct.pack(">H", 0x8180) + query[4:]) == []  # NODATA
+
+    replies: dict[str, object] = {}
+
+    def fake_doh(entry, name, *, mark=None, timeout=8.0):
+        reply = replies[entry]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(fetch, "doh_query", fake_doh)
+    first, second = "https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"
+    replies.update({first: OSError("timed out"), second: fetch.NoSuchDomain("NXDOMAIN")})
+    with pytest.raises(fetch.NoSuchDomain, match="домен gone"):
+        fetch.resolve_domain("gone.example.com", [first, second])
+    replies[second] = []  # имя есть, адреса IPv4 нет — серверу подключаться некуда
+    with pytest.raises(fetch.NoSuchDomain, match="нет адреса IPv4"):
+        fetch.resolve_domain("gone.example.com", [first, second])
+    replies[second] = OSError("timed out")  # не ответил никто — это не «домена нет»
+    with pytest.raises(ResolveError) as caught:
+        fetch.resolve_domain("gone.example.com", [first, second])
+    assert not isinstance(caught.value, fetch.NoSuchDomain)
+    # Один резолвер имени не знает, другой знает — имя есть.
+    replies.update({first: fetch.NoSuchDomain("NXDOMAIN"), second: ["203.0.113.9"]})
+    assert fetch.resolve_domain("gone.example.com", [first, second]) == ["203.0.113.9"]

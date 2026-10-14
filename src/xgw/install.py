@@ -293,6 +293,18 @@ class Installer:
             return binary.parse_version(wanted) == version
         return False
 
+    def subnet_conflict(self) -> str:
+        """Подсеть LAN пересекается с сетью провайдера или другой сетью машины. С таким
+        конфигом установку не начать и ключом --force: профиль xgw-lan дал бы карте
+        адрес из чужой сети, и интернет пропал бы и у шлюза, и у устройств за ним."""
+        conflicts = lan.subnet_conflicts(self.cfg, self.runner)
+        if not conflicts:
+            return ""
+        return lan.conflict_text(
+            self.cfg, conflicts, self.paths.config_file,
+            lan.free_lan_address(self.cfg, self.runner),
+        )
+
     def problems(self, facts: Facts) -> list[str]:
         """Причины, по которым установку начинать нельзя."""
         found: list[str] = []
@@ -432,13 +444,21 @@ class Installer:
     def run(self, *, assume_yes: bool = False, force: bool = False) -> int:
         facts = self.facts()
         problems = self.problems(facts)
+        conflict = self.subnet_conflict()
         if self.checks is not None:
             problems += [
-                f"{check.name}: {check.text}" for check in self.checks() if check.level == "FAIL"
+                f"{check.name}: {check.text}" for check in self.checks()
+                if check.level == "FAIL" and not (conflict and check.text == conflict)
             ]
+        if conflict:
+            problems.insert(0, conflict)
         if problems:
             for problem in problems:
                 self.out(f"✗ {problem}")
+            if conflict:
+                # Ключ --force здесь не действует: сеть машины была бы сломана наверняка.
+                self.out("Установка не начата: сначала исправьте подсеть LAN в конфиге.")
+                return 1
             if not force:
                 self.out("Установка не начата. Исправьте и повторите (или --force).")
                 return 1
@@ -624,6 +644,11 @@ class Installer:
         self.out("")
         self.out("Сеть:")
         if facts.lan_if:
+            # Последняя проверка перед тем, как менять сеть: за время установки пакетов
+            # у машины мог появиться адрес из той же подсети (поднялся другой интерфейс).
+            conflict = self.subnet_conflict()
+            if conflict:
+                raise InstallError(conflict)
             previous = sysctl.install(self.paths, self.proc_sys)
             self.journal.setdefault("sysctl", previous)
             self._step(f"sysctl — {self.paths.sysctl_file}")
@@ -830,7 +855,16 @@ class Installer:
         self.runner(["systemctl", "start", "xgw-net.service"], timeout=60.0)
         if capture.configured:
             mode = {"on": "перехват включён", "off": "перехват снят", "open": "перехват снят"}
-            self._step(f"правила nftables загружены, {mode.get(capture.mode(), 'перехвата нет')}")
+            loaded = capture.effective_mode()
+            self._step(f"правила nftables загружены, {mode.get(loaded, 'перехвата нет')}")
+            if capture.mode() == "on" and loaded != "on":
+                # Xray запущен с конфигом без нужного inbound'а: честнее сказать, чем
+                # отчитаться «включён». Демон включит перехват сам, когда конфиг применится.
+                self._warn(
+                    f"перехват пока не включён: {capture.inbound_problem()}. Интернет "
+                    "работает напрямую; перехват включится сам после перезапуска Xray "
+                    "(сразу: sudo xgw apply --now)"
+                )
 
     def _token(self) -> None:
         status_page.ensure_token(self.cfg, self.paths)

@@ -221,6 +221,25 @@ def test_page_shows_state_servers_and_devices_and_escapes_foreign_text():
     assert 'http-equiv="refresh"' in page
 
 
+def test_page_shows_the_probe_url_warning_the_node_summary_and_the_monthly_traffic():
+    """То же, что в панели и `xgw status`, видно и с телефона: не отвечает адрес проверки
+    (серверы при этом работают), сводка разбора подписок, расход на проверки за месяц."""
+    snapshot = {
+        **SNAPSHOT, "state": "PROBE_TARGET_UNREACHABLE",
+        "probe_target": "Внимание: все пробы падают с одинаковой ошибкой — вероятно, "
+                        "недоступен сам probe.url (HTTP 403 <b>)",
+        "nodes": {"members": 5, "spares": 65, "dropped": 4, "duplicates": 12},
+        "budget": {**SNAPSHOT["budget"], "all_mb": 1169.5, "month_gb": 35.1},
+    }
+    page = status_page.render_page(snapshot, DEVICES)
+    assert "недоступен сам probe.url (HTTP 403 &lt;b&gt;)" in page
+    assert "Узлов: 5 активных, 65 запасных (отброшено 4 недоступных/служебных" in page
+    assert "Всего ~1169.5 МБ в сутки, ~35.1 ГБ в месяц." in page
+    # Прежний снимок (от демона старой версии) страницу не ломает.
+    old = status_page.render_page(SNAPSHOT, DEVICES)
+    assert "ГБ в месяц" not in old and "Узлов:" not in old
+
+
 def test_page_without_status_and_with_stale_status():
     assert "ещё не записал статус" in status_page.render_page(None, [])
     stale = dict(SNAPSHOT, updated=time.time() - 3600)
