@@ -120,6 +120,57 @@ def test_wan_ipv6_failures_are_warnings_not_errors(system):
     assert record is None and "не отключён" in warnings[0]
 
 
+NETPLAN_WAN = "/run/NetworkManager/system-connections/netplan-wan0.nmconnection"
+
+
+def test_netplan_defined_profiles_are_told_apart_from_networkmanager_ones():
+    assert nm.netplan_defined(NETPLAN_WAN)
+    # Свои профили NetworkManager хранит в netplan как netplan-NM-<uuid>: их правка безопасна.
+    assert not nm.netplan_defined(
+        "/run/NetworkManager/system-connections/"
+        "netplan-NM-c0a2603a-d533-3c9f-abdd-8081dae2dd44.nmconnection")
+    assert not nm.netplan_defined("/etc/NetworkManager/system-connections/wan.nmconnection")
+    assert not nm.netplan_defined("")
+
+
+def test_netplan_wan_profile_is_left_alone_and_sysctl_does_the_job(system):
+    """Профиль WAN описан в netplan: nmcli modify переписал бы его без привязки к карте
+    (после перезагрузки на ВМ он встал на карту LAN). При ipv6.method ignore IPv6
+    выключает sysctl — профиль не трогается вовсе."""
+    profile = system.profile("wan")
+    profile.update({"filename": NETPLAN_WAN, "ipv6.method": "ignore"})
+    manager = nm.Nm(system)
+    record, warnings = nm.wan_ipv6_off(manager, "wan0")
+    assert warnings == []
+    assert record == {"device": "wan0", "uuid": system.uuid_of("wan"), "ipv6_method": "ignore",
+                      "sysctl": True}
+    assert profile["ipv6.method"] == "ignore"
+    assert not system.commands("nmcli", "connection", "modify")
+    assert not system.commands("nmcli", "device", "reapply")
+    # Удаление тоже не трогает профиль: disable_ipv6 вернёт шаг sysctl.
+    assert nm.restore_wan(manager, record) == []
+    assert not system.commands("nmcli", "connection", "modify")
+
+
+def test_netplan_wan_profile_with_ipv6_on_is_only_reported(system):
+    system.profile("wan")["filename"] = NETPLAN_WAN  # ipv6.method auto: NetworkManager включит
+    record, warnings = nm.wan_ipv6_off(nm.Nm(system), "wan0")
+    assert record is None and "описан в netplan" in warnings[0] and "dhcp6: false" in warnings[0]
+    assert system.profile("wan")["ipv6.method"] == "auto"
+    assert not system.commands("nmcli", "connection", "modify")
+
+
+def test_restore_wan_says_when_networkmanager_refuses_to_reapply(system):
+    """После перезагрузки NetworkManager 1.46 отказывал в reapply («Can't reapply changes to
+    'connection.interface-name'»): профиль возвращён, но на карте IPv6 ещё выключен."""
+    manager = nm.Nm(system)
+    record, _ = nm.wan_ipv6_off(manager, "wan0")
+    system.refuse["device reapply"] = "Can't reapply changes to 'connection.interface-name'"
+    warnings = nm.restore_wan(manager, record)
+    assert system.profile("wan")["ipv6.method"] == "auto"
+    assert len(warnings) == 1 and "включится после перезагрузки" in warnings[0]
+
+
 def test_modify_error_is_a_command_error(system):
     with pytest.raises(CommandError, match="no such connection"):
         nm.Nm(system).modify("00000000-0000-4000-8000-999999999999", "ipv6.method", "auto")

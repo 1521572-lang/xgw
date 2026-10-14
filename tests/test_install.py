@@ -108,7 +108,7 @@ def test_plan_is_shown_and_nothing_changes_when_declined(box):
     text = box.text()
     for expected in ("План установки XGW", "пакеты из apt: dnsmasq", "пользователь xray",
                      "профиль xgw-lan на lan0 — 192.168.50.1/24", "«Wired connection 2»",
-                     "IPv6 в профиле WAN (wan0)", "fail-closed", "sudo xgw uninstall",
+                     "IPv6 на WAN (wan0)", "fail-closed", "sudo xgw uninstall",
                      "Отменено, в системе ничего не изменено"):
         assert expected in text, expected
     assert box.questions == ["Продолжить?"]
@@ -241,6 +241,62 @@ def test_ipv6_off_to_proxy_gives_ipv6_back_to_wan_and_back_again(box):
     assert box.system.profile("wan")["ipv6.method"] == "disabled"
     assert Journal(box.paths.journal_file).get("nm_wan")["ipv6_method"] == "auto"
     assert box.system.kernel.rules6 == [] and "tproxy" not in box.system.kernel.table6
+
+
+def _netplan_wan(box: "Box") -> Path:
+    """Профиль WAN описан в /etc/netplan (как у серверов и cloud-init): ipv6.method ignore."""
+    box.system.profile("wan").update({
+        "filename": "/run/NetworkManager/system-connections/netplan-wan0.nmconnection",
+        "ipv6.method": "ignore",
+    })
+    key = box.proc / "net/ipv6/conf/wan0/disable_ipv6"
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_text("0\n", encoding="ascii")
+    return key
+
+
+@pytest.mark.parametrize("lan_if", ["lan0", ""])
+def test_netplan_wan_gets_ipv6_off_by_sysctl_and_back(box, lan_if):
+    """WIN-03: после nmcli modify NetworkManager 1.46 переписал профиль WAN из netplan с
+    `match: {}`, и после удаления XGW и перезагрузки он встал на карту LAN. Теперь такой
+    профиль не меняется: IPv6 на карте выключает sysctl, удаление его возвращает."""
+    box.cfg.network.lan_if = lan_if
+    key = _netplan_wan(box)
+    assert box.install() == 0, box.text()
+    system = box.system
+    assert system.profile("wan")["ipv6.method"] == "ignore"
+    assert not [call for call in system.commands("nmcli", "connection", "modify")
+                if system.uuid_of("wan") in call]
+    assert key.read_text(encoding="ascii").strip() == "1"
+    text = box.paths.sysctl_file.read_text(encoding="utf-8")
+    assert "net/ipv6/conf/wan0/disable_ipv6 = 1" in text
+    assert ("net.ipv4.ip_forward = 1" in text) == bool(lan_if)  # форвардинг — только с LAN
+    assert "IPv6 на wan0 отключён" in box.text() and "описан в netplan" in box.text()
+    journal = Journal(box.paths.journal_file)
+    assert journal.get("nm_wan")["sysctl"] is True
+    assert journal.get("sysctl")["net/ipv6/conf/wan0/disable_ipv6"] == "0"
+
+    assert box.install() == 0, box.text()  # повторная установка ничего не портит
+    assert key.read_text(encoding="ascii").strip() == "1"
+    assert Journal(box.paths.journal_file).get("sysctl")["net/ipv6/conf/wan0/disable_ipv6"] == "0"
+
+    box.out.clear()
+    assert box.uninstall() == 0, box.text()
+    assert key.read_text(encoding="ascii").strip() == "0"
+    assert not box.paths.sysctl_file.exists()
+    assert system.profile("wan")["ipv6.method"] == "ignore"
+    assert "IPv6 на wan0 — как до установки" in box.text() and "✗" not in box.text()
+
+
+def test_netplan_wan_ipv6_comes_back_when_ipv6_goes_through_xray(box):
+    key = _netplan_wan(box)
+    assert box.install() == 0
+    box.cfg.network.ipv6 = "proxy"
+    assert box.install() == 0, box.text()
+    assert key.read_text(encoding="ascii").strip() == "0"
+    assert "disable_ipv6" not in box.paths.sysctl_file.read_text(encoding="utf-8")
+    assert "nm_wan" not in Journal(box.paths.journal_file).data
+    assert "IPv6 на wan0 возвращён" in box.text()
 
 
 def test_second_install_keeps_the_original_state_in_the_journal(box):

@@ -5,7 +5,7 @@
 Запускается только по явной просьбе — нужны собранный установщик и настоящий Xray:
 
     python packaging/windows/build.py
-    set XGW_WINDOWS_SETUP=build\\windows\\XGW-Setup-0.1.1.exe
+    set XGW_WINDOWS_SETUP=build\\windows\\XGW-Setup-0.1.2.exe
     set XGW_XRAY_BIN=tools\\xray\\xray.exe
     pytest tests/stand/test_windows_installer.py
 

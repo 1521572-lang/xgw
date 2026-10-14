@@ -258,7 +258,11 @@ def test_time_sleep_and_ipv6(box, monkeypatch):
     synced = box.diag()._time()
     assert synced[0].level == OK and "_chrony" in synced[0].text and "NTS" in synced[0].text
     box.system.time_synced = False
-    assert box.diag()._time()[0].level == WARN
+    unsynced = box.diag()._time()[0]
+    assert unsynced.level == WARN and "restart chrony" in unsynced.advice
+    # Ubuntu 24.04: время синхронизирует systemd-timesyncd — подсказка о нём, не о chrony.
+    monkeypatch.setattr(diag, "_user_exists", lambda name: name == "systemd-timesync")
+    assert "restart systemd-timesyncd" in box.diag()._time()[0].advice
     monkeypatch.setattr(diag, "_user_exists", lambda name: False)
     assert "не найден пользователь службы времени" in box.diag()._time()[-1].text
 
@@ -278,7 +282,9 @@ def test_time_sleep_and_ipv6(box, monkeypatch):
     assert box.diag()._ipv6()[0].level == WARN
     box.installed()
     after = box.diag()._ipv6()[0]
-    assert after.level == FAIL and "ipv6.method disabled" in after.advice
+    # Не «nmcli connection modify»: профилю из netplan это сбросило бы привязку к карте.
+    assert after.level == FAIL and "sudo xgw install" in after.advice
+    assert "nmcli" not in after.advice
 
 
 def test_tun_needs_the_device_and_a_loose_reverse_path_filter(box, tmp_path):

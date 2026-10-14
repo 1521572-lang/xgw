@@ -184,7 +184,8 @@ def test_first_run_creates_the_config_and_changes_nothing_else(gw):
     assert box.sh("stat -c '%U:%G %a' /etc/xgw/config.toml").strip() == "root:root 600"
     example = (REPO / "config.example.toml").read_text(encoding="utf-8")
     assert (box.root / "etc/xgw/config.toml").read_text(encoding="utf-8") == example
-    assert "sudo xgw install" in first.stdout  # что делать дальше
+    # Что делать дальше: команды xgw ещё нет — повторить установку из каталога проекта.
+    assert "sudo sh packaging/install.sh" in first.stdout
     after = _snapshot(box)
     assert {key: after[key] for key in after if key != "files"} == {
         key: gw.before[key] for key in gw.before if key != "files"

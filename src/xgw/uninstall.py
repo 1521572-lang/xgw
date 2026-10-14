@@ -128,6 +128,8 @@ class Uninstaller:
     def _nm(self) -> str | None:
         lan_record = self.journal.get("nm_lan")
         wan_record = self.journal.get("nm_wan")
+        if wan_record and wan_record.get("sysctl"):
+            wan_record = None  # профиль WAN не менялся; IPv6 на WAN вернёт шаг sysctl
         if not lan_record and not wan_record:
             return None
         manager = nm.Nm(self.runner)
@@ -150,6 +152,9 @@ class Uninstaller:
         if previous is None and not self.paths.sysctl_file.exists():
             return None
         sysctl.restore(previous or {}, self.paths, self.proc_sys)
+        wan = self.journal.get("nm_wan") or {}
+        if wan.get("sysctl"):
+            return f"sysctl возвращён, IPv6 на {wan.get('device', 'WAN')} — как до установки"
         return "sysctl возвращён"
 
     def _sleep(self) -> str | None:

@@ -341,7 +341,9 @@ def test_install_without_config_creates_it_from_the_example(root, monkeypatch, c
     monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     assert main(["install"]) == 1
     out = capsys.readouterr().out
-    assert f"Создан {root.config_file}" in out and "sudo xgw install" in out
+    assert f"Создан {root.config_file}" in out
+    # Команды xgw до первой установки ещё нет — повторять ту же команду из каталога проекта.
+    assert "sudo sh packaging/install.sh" in out and "sudo xgw install" not in out
     assert root.config_file.read_text(encoding="utf-8") == (
         REPO / "config.example.toml").read_text(encoding="utf-8")
     if os.name != "nt":

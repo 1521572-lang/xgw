@@ -391,7 +391,7 @@ class Installer:
             )
         if not cfg.network.ipv6_proxy:
             lines.append(
-                f"  • IPv6 в профиле WAN ({facts.wan_if or 'не найден'}) будет отключён: "
+                f"  • IPv6 на WAN ({facts.wan_if or 'не найден'}) будет отключён: "
                 "иначе трафик уйдёт мимо VPN"
             )
         else:
@@ -649,8 +649,7 @@ class Installer:
             conflict = self.subnet_conflict()
             if conflict:
                 raise InstallError(conflict)
-            previous = sysctl.install(self.paths, self.proc_sys)
-            self.journal.setdefault("sysctl", previous)
+            self._sysctl(facts)
             self._step(f"sysctl — {self.paths.sysctl_file}")
             record, warnings = nm.setup_lan(
                 self.nm, self.cfg, self.paths.backup_dir, self.journal.get("nm_lan")
@@ -706,15 +705,43 @@ class Installer:
         record, warnings = nm.wan_ipv6_off(self.nm, facts.wan_if, self.journal.get("nm_wan"))
         if record is not None:
             self.journal.set("nm_wan", record)
-            self._step(f"IPv6 в профиле WAN ({facts.wan_if}) отключён")
+            if record.get("sysctl"):
+                self._sysctl(facts)
+                self._step(
+                    f"IPv6 на {facts.wan_if} отключён в {self.paths.sysctl_file}: профиль WAN "
+                    "описан в netplan, его XGW не меняет"
+                )
+            else:
+                self._step(f"IPv6 в профиле WAN ({facts.wan_if}) отключён")
         for warning in warnings:
             self._warn(warning)
+
+    def _sysctl(self, facts: Facts) -> None:
+        """90-xgw.conf по нынешним настройкам: форвардинг, если есть сеть LAN, и
+        disable_ipv6 карты WAN, если IPv6 на ней выключает sysctl (nm.wan_ipv6_off).
+        Значения до установки запоминаются один раз — для каждого ключа."""
+        record = self.journal.get("nm_wan") or {}
+        wan = record.get("device", "") if record.get("sysctl") else ""
+        settings = sysctl.wanted(forwarding=bool(facts.lan_if), wan_ipv6_off=wan)
+        previous = sysctl.install(self.paths, self.proc_sys, settings)
+        saved = dict(self.journal.get("sysctl") or {})
+        for name, value in previous.items():
+            saved.setdefault(name, value)
+        self.journal.set("sysctl", saved)
 
     def _wan_ipv6_back(self, facts: Facts) -> None:
         """ipv6 = proxy после ipv6 = off: IPv6 на WAN, отключённый прошлой установкой,
         возвращается. Чужие настройки профиля, которых XGW не менял, не трогаются."""
         record = self.journal.get("nm_wan")
         if not record:
+            return
+        if record.get("sysctl"):
+            # IPv6 выключал sysctl: ключ убирается из 90-xgw.conf, значение — прежнее.
+            self.journal.discard("nm_wan")
+            self._sysctl(facts)
+            key = sysctl.wan_ipv6_key(record.get("device", ""))
+            sysctl.put_back(self.journal.get("sysctl") or {}, [key], self.proc_sys)
+            self._step(f"IPv6 на {record.get('device', '')} возвращён: network.ipv6 = proxy")
             return
         if not facts.nm_running:
             self._warn(

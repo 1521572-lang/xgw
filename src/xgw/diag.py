@@ -37,6 +37,8 @@ STATUS_PAGE_PORT = 8780
 OS_RELEASE = Path("/etc/os-release")
 DEV_TUN = Path("/dev/net/tun")
 CHRONY_DIR = Path("/etc/chrony")
+# Пользователь службы времени → её юнит (chrony в 26.04, systemd-timesyncd в 24.04).
+TIME_UNITS = {"_chrony": "chrony", "systemd-timesync": "systemd-timesyncd"}
 
 
 @dataclass(frozen=True)
@@ -535,6 +537,7 @@ class Diag:
         ).strip()
         users = [name for name in nft.TIME_USERS if _user_exists(name)]
         notes = [f"служба времени — {users[0]}"] if users else []
+        unit = TIME_UNITS.get(users[0], "chrony") if users else "chrony"
         if _chrony_uses_nts():
             notes.append(f"chrony использует NTS (TCP {nft.NTS_KE_PORT} идёт мимо перехвата)")
         result: list[Check] = []
@@ -545,7 +548,7 @@ class Diag:
                 "Время", WARN,
                 "; ".join(["часы не синхронизированы: Reality не подключится при расхождении "
                            "времени", *notes]),
-                "timedatectl status; sudo systemctl restart chrony",
+                f"timedatectl status; sudo systemctl restart {unit}",
             ))
         if not users and self.cfg.capture.local:
             result.append(Check(
@@ -610,11 +613,12 @@ class Diag:
             return [Check("IPv6", OK, "глобальных IPv6-адресов нет — мимо перехвата идти нечему")]
         text = "глобальный IPv6-адрес на " + ", ".join(devices) + ": по IPv6 трафик идёт мимо VPN"
         if not self.installed:
-            return [Check("IPv6", WARN, text, "sudo xgw install отключит IPv6 в профиле WAN")]
+            return [Check("IPv6", WARN, text, "sudo xgw install отключит IPv6 на WAN")]
+        # Не «nmcli connection modify»: у профиля из netplan это сбрасывает привязку к
+        # карте (nm.netplan_defined). Установка выбирает безопасный способ сама.
         return [Check(
             "IPv6", FAIL, text,
-            "sudo nmcli connection modify <профиль> ipv6.method disabled && "
-            "sudo nmcli device reapply <интерфейс>",
+            "sudo xgw install — отключит IPv6 на WAN заново и скажет, если не сможет",
         )]
 
     # --- службы и бюджет --------------------------------------------------------

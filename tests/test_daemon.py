@@ -932,6 +932,28 @@ def test_new_config_is_applied_before_the_rules_when_capture_waits_for_it(guarde
     assert order == ["rules"]  # применять нечего — одна проверка за шаг
 
 
+def test_switched_capture_is_reported_as_turned_on_not_as_lost_rules(guarded):
+    """Смена способа перехвата на TUN на живом шлюзе (WIN-03, Ubuntu 24.04): Xray сразу
+    перезапущен с новым inbound'ом, правила нового режима загружены. Событие — «перехват
+    включён», а не «правила сети не были загружены», будто их кто-то стёр."""
+    daemon, capture = guarded
+    original_apply = daemon._apply
+
+    def apply(config, *, urgent):
+        capture.problem = ""  # Xray перезапущен с новым конфигом
+        return original_apply(config, urgent=urgent)
+
+    daemon._apply = apply
+    capture.problem = "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"
+    capture.is_loaded = False  # правила нового режима ещё не загружены
+    daemon.cfg.filters.max_members = 3  # собранный конфиг отличается от применённого
+    daemon._rebuild_asked = True
+    daemon.tick()
+    assert capture.actions() == ["up"]
+    told = [event for event in daemon.events() if event.startswith("capture:")]
+    assert told == ["capture: Xray перезапущен с inbound'ом перехвата — перехват включён"]
+
+
 def test_pending_config_with_a_new_capture_inbound_does_not_wait_for_the_window(daemon):
     """Отложенный конфиг меняет inbound перехвата (здесь появляется tun-in): ждать окна
     04:00–05:00 нельзя — трафик уходил бы в интерфейс, из которого Xray не читает."""
@@ -1176,3 +1198,71 @@ def test_reloaded_settings_keep_the_first_check_results(daemon):
         assert not [tag for tag in successor.scanned if tag.startswith("proxy-")]
     finally:
         successor.store.close()
+
+
+def test_reloaded_settings_keep_the_watchdog_state(daemon):
+    """Правка настроек посреди ALL_DEAD: новый демон продолжает с того же состояния —
+    статус не показывает на шаг HEALTHY, и повторного события ALL_DEAD нет."""
+    _started(daemon)
+    dead = {tag.replace("-", "_"): False for tag in daemon.tags("proxy")}
+    daemon.set_alive(**dead)
+    assert daemon.tick() is State.ALL_DEAD
+    since = daemon.state_since
+    successor = _second(daemon, lambda cfg: setattr(cfg.notify, "min_interval_min", 7))
+    try:
+        assert successor.machine.state is State.ALL_DEAD and successor.state_since == since
+        assert successor.dead_since == daemon.dead_since
+        successor.set_alive(**{tag.replace("-", "_"): False for tag in successor.tags("proxy")})
+        assert successor.tick() is State.ALL_DEAD
+        assert successor.collected == []  # внеочередное обновление уже было — не повторяется
+        events = [event for event in successor.events() if event.startswith("ALL_DEAD:")]
+        assert len(events) == 1 and "HEALTHY → ALL_DEAD" in events[0]
+        assert successor.status()["state"] == "ALL_DEAD"
+    finally:
+        successor.store.close()
+
+
+def test_new_probe_url_is_checked_at_once_after_reload(daemon):
+    """Не отвечал probe.url, человек вписал другой: новый демон помнит предупреждение и
+    на первом же шаге проверяет новый адрес — он отвечает, проверки возобновлены."""
+    _started(daemon)
+    daemon.e2e = False
+    daemon.failures["*"] = _http_403()
+    daemon.direct = "HTTP 403"
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+    assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+    successor = _second(daemon, lambda cfg: setattr(cfg.probe, "url", "https://example.org/a.woff"))
+    try:
+        assert successor.machine.state is State.PROBE_TARGET_UNREACHABLE
+        assert successor.probe_target == daemon.probe_target and successor.next_target_check == 0
+        successor.set_alive()
+        assert successor.tick() is State.HEALTHY
+        assert successor.probe_target == ""
+        texts = successor.events()
+        assert any("probe.url снова отвечает" in event for event in texts)
+        assert any("PROBE_TARGET_UNREACHABLE → HEALTHY" in event for event in texts)
+    finally:
+        successor.store.close()
+
+
+def test_panel_list_names_a_server_whose_domain_is_gone(daemon, monkeypatch):
+    """Подписку сохраняют для панели до сборки, а домен уходит в карантин во время неё:
+    список перезаписывается — сервер с таким доменом не значится «включённым»."""
+    from xgw import fetch
+
+    gone = (
+        "vless://11111111-2222-4333-8444-5555555555a1@gone.example.net:443?"
+        "type=tcp&security=none#ghost"
+    )
+
+    def resolve(name, bootstrap, mark):
+        if name == "gone.example.net":
+            raise fetch.NoSuchDomain(f"домен {name} не разрешается: такого имени нет (NXDOMAIN)")
+        raise fetch.ResolveError(f"тесты не ходят в DNS ({name})")
+
+    monkeypatch.setattr(engine, "resolve_domain", resolve)
+    daemon.source = _inventory([*ALL_LINKS, gone])
+    daemon.tick()
+    listed = {item["name"]: item["skip"] for item in engine.load_inventory(daemon.paths)}
+    assert listed["ghost"] == "dns"
+    assert [skip for name, skip in listed.items() if name != "ghost"] == [""] * len(ALL_LINKS)

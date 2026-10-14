@@ -255,11 +255,30 @@ def restore_lan(nm: Nm, record: dict) -> list[str]:
     return warnings
 
 
+def netplan_defined(filename: str) -> bool:
+    """Профиль описан в /etc/netplan/*.yaml (человеком или cloud-init), а не создан
+    NetworkManager.
+
+    NetworkManager в Ubuntu хранит профили в netplan: свои — как netplan-NM-<uuid>,
+    описанные в YAML — как netplan-<имя>. Любой `nmcli connection modify` такого
+    профиля переписывает его в /etc/netplan/90-NM-<uuid>.yaml, и NetworkManager 1.46
+    (Ubuntu 24.04) теряет при этом привязку к карте: match по MAC и set-name
+    превращаются в `match: {}`. После перезагрузки профиль WAN встаёт на любую карту —
+    на ВМ он занял карту LAN, и шлюз остался без интернета (проверка WIN-03).
+    """
+    name = os.path.basename(filename)
+    return name.startswith("netplan-") and not name.startswith("netplan-NM-")
+
+
 def wan_ipv6_off(
     nm: Nm, device: str, previous: dict | None = None
 ) -> tuple[dict | None, list[str]]:
     """ipv6.method disabled в профиле WAN: иначе приложения самой машины уйдут
-    мимо перехвата по IPv6. Возвращает запись для журнала (None — менять нечего)."""
+    мимо перехвата по IPv6. Возвращает запись для журнала (None — менять нечего).
+
+    Профиль из netplan (netplan_defined) не меняется: при ipv6.method ignore
+    NetworkManager IPv6 карты не трогает, и его выключает sysctl — в записи тогда
+    "sysctl": True, и disable_ipv6 ставит вызывающий."""
     uuid = nm.active_uuid(device) if device else ""
     if not uuid:
         return previous, [
@@ -269,9 +288,20 @@ def wan_ipv6_off(
     method = nm.get(uuid, "ipv6.method").get("ipv6.method", "")
     if method == "disabled":
         return previous, []
-    record = previous if previous and previous.get("uuid") == uuid else {
-        "device": device, "uuid": uuid, "ipv6_method": method or "auto",
-    }
+    if previous and previous.get("uuid") == uuid:
+        record = previous
+    else:
+        record = {"device": device, "uuid": uuid, "ipv6_method": method or "auto"}
+    profile = next((item for item in nm.profiles() if item.uuid == uuid), None)
+    if profile is not None and netplan_defined(profile.filename):
+        if method != "ignore":
+            return previous, [
+                f"IPv6 на {device} не отключён: профиль «{profile.name}» описан в netplan, а "
+                "его правка через NetworkManager сбросила бы привязку профиля к карте. Если "
+                f"у провайдера есть IPv6, выключите его в /etc/netplan для {device} "
+                "(dhcp6: false, accept-ra: false, link-local: []) и повторите установку"
+            ]
+        return {**record, "sysctl": True}, []
     warnings: list[str] = []
     try:
         nm.modify(uuid, "ipv6.method", "disabled")
@@ -287,13 +317,23 @@ def wan_ipv6_off(
 
 
 def restore_wan(nm: Nm, record: dict) -> list[str]:
+    """Возвращает ipv6.method профиля WAN. Запись с "sysctl" профиль не меняла —
+    её disable_ipv6 возвращает sysctl."""
     uuid = record.get("uuid", "")
-    if not uuid or uuid not in {profile.uuid for profile in nm.profiles()}:
+    if record.get("sysctl") or not uuid or uuid not in {item.uuid for item in nm.profiles()}:
         return []
+    method, device = record.get("ipv6_method", "auto"), record.get("device", "")
     try:
-        nm.modify(uuid, "ipv6.method", record.get("ipv6_method", "auto"))
+        nm.modify(uuid, "ipv6.method", method)
     except cmd.CommandError as exc:
         return [f"IPv6 в профиле WAN не возвращён: {exc}"]
-    with contextlib.suppress(cmd.CommandError):
-        nm.reapply(record.get("device", ""))
+    try:
+        nm.reapply(device)
+    except cmd.CommandError as exc:
+        # Так бывает после перезагрузки: NetworkManager отказывается применять профиль к
+        # уже подключённой карте («Can't reapply changes to connection.interface-name»).
+        return [
+            f"IPv6 в профиле WAN возвращён ({method}), но на {device} включится после "
+            f"перезагрузки: {exc}"
+        ]
     return []

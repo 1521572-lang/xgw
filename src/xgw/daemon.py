@@ -188,6 +188,7 @@ class Daemon:
         """Настройки перечитаны. Если источники серверов прежние, подписки заново
         не запрашиваются: конфиг пересобирается из уже полученного списка — так
         отключение сервера в панели не стоит запроса к каждой подписке."""
+        self._resume(previous)
         if previous.inventory is None or (
             engine.sources_key(previous.cfg) != engine.sources_key(self.cfg)
         ):
@@ -198,6 +199,27 @@ class Daemon:
         # Серверы те же — заново проверять участников незачем.
         self.vetted = set(previous.vetted)
         self.bad_members = dict(previous.bad_members)
+
+    def _resume(self, previous: Daemon) -> None:
+        """Состояние watchdog переходит к новому демону как есть. Иначе каждая правка
+        config.toml и каждое действие в панели молча сбрасывали бы его в HEALTHY: статус
+        на шаг показывал бы, что всё в порядке, а следующее событие начиналось бы с
+        «HEALTHY →», хотя до правки было, например, ALL_DEAD."""
+        self.machine.state = previous.machine.state
+        self.state_since = previous.state_since
+        self.action = previous.action
+        self.e2e_streak = previous.e2e_streak
+        self.dead_since = dict(previous.dead_since)
+        self.leak, self.next_leak = previous.leak, previous.next_leak
+        self.down_ticks = previous.down_ticks
+        self.rolled_back = previous.rolled_back
+        self.xray_down_since = previous.xray_down_since
+        self.next_all_dead = previous.next_all_dead
+        self._inbound_missing = previous._inbound_missing
+        self.probe_target = previous.probe_target
+        self.next_target_check = previous.next_target_check
+        if previous.cfg.probe.url != self.cfg.probe.url:
+            self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
     def request_scan(self) -> None:
         """Панель: проверить запасные серверы сейчас."""
@@ -283,7 +305,7 @@ class Daemon:
         if waiting or changed:
             # Xray перезапущен с новым конфигом (или не перезапущен — тогда вместо
             # перехвата загрузится режим «снят»): правила доводятся сразу, а не через шаг.
-            self._guard_capture(signals.xray_ok, now)
+            self._guard_capture(signals.xray_ok, now, switched=waiting)
 
         # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
@@ -536,9 +558,11 @@ class Daemon:
             self.log.debug("состояние перехвата не прочитано: %s", exc)
             return False
 
-    def _guard_capture(self, xray_ok: bool, now: float) -> None:
+    def _guard_capture(self, xray_ok: bool, now: float, *, switched: bool = False) -> None:
         """Следит за правилами перехвата: возвращает пропавшие, а при
-        fail_mode = "open" снимает перехват, пока Xray недоступен дольше минуты."""
+        fail_mode = "open" снимает перехват, пока Xray недоступен дольше минуты.
+        switched — правила ждали нового inbound'а и Xray только что перезапущен с ним:
+        их загрузка — не возврат пропавших, а включение перехвата по новым настройкам."""
         capture = self.capture
         if capture is None:
             return
@@ -584,7 +608,7 @@ class Daemon:
                         "включится сам после перезапуска Xray с новым конфигом",
                         notify=True,
                     )
-            elif reloaded and self._inbound_missing:
+            elif reloaded and (self._inbound_missing or switched):
                 self.notifier.event(
                     "capture", "Xray перезапущен с inbound'ом перехвата — перехват включён",
                     notify=True,
@@ -671,11 +695,17 @@ class Daemon:
 
     def _rebuild(self, prefer: list[str] | None, *, urgent: bool, reason: str) -> bool:
         assert self.inventory is not None
+        dead = engine.quarantined()
         try:
             assembly = self._assemble(prefer)
         except engine.EngineError as exc:
             self.notifier.event("config", f"{reason}: {exc}", notify=True)
             return False
+        finally:
+            if engine.quarantined() != dead:
+                # Сборка отложила домены, которых нет в DNS. Список для панели записан до
+                # неё — иначе там такой сервер значился бы «включён, сейчас возьмёт в работу».
+                self._save_inventory(self.inventory)
         outcome = self._apply(assembly.result.config, urgent=urgent)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)

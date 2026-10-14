@@ -145,7 +145,8 @@ class FakeSystem:
         if args[:5] == ["-t", "-f", "NAME,UUID,TYPE,DEVICE,FILENAME", "connection", "show"]:
             return "".join(
                 terse(item["connection.id"], uuid, item["type"], item["device"],
-                      f"/run/NetworkManager/system-connections/{uuid}.nmconnection") + "\n"
+                      item.get("filename")
+                      or f"/run/NetworkManager/system-connections/{uuid}.nmconnection") + "\n"
                 for uuid, item in self.profiles.items()
             )
         if args[:2] == ["-t", "-f"] and args[3:5] == ["connection", "show"]:
