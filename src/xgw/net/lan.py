@@ -33,11 +33,15 @@ def valid_interface(name: str) -> bool:
     return bool(_IFACE_RE.fullmatch(name)) and name not in (".", "..")
 
 
-def container_links(patterns: tuple[str, ...], sys_net: Path = Path("/sys/class/net")) -> list[str]:
+# Сетевые интерфейсы машины; тесты подменяют каталог, чтобы не зависеть от Docker хоста.
+SYS_NET = Path("/sys/class/net")
+
+
+def container_links(patterns: tuple[str, ...], sys_net: Path | None = None) -> list[str]:
     """Интерфейсы контейнеров, которые уже есть в системе (имена по шаблонам вида
     «docker0», «br-*»). Пусто — Docker не установлен или ещё не создал мост."""
     try:
-        names = sorted(item.name for item in sys_net.iterdir())
+        names = sorted(item.name for item in (sys_net or SYS_NET).iterdir())
     except OSError:
         return []  # не Linux либо /sys недоступен
     return [name for name in names if any(fnmatch.fnmatchcase(name, p) for p in patterns)]

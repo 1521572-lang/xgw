@@ -68,6 +68,31 @@ def present(name: str, runner: Runner) -> bool:
     return item is not None and is_tun(item)
 
 
+def ready(name: str, runner: Runner) -> bool:
+    """Интерфейс поднят и на нём адрес XGW. Интерфейс, который создал сам Xray (например,
+    после перезагрузки, раньше XGW), адреса не имеет — и ответы Xray ядро отбрасывает."""
+    try:
+        listing = runner(["ip", "-j", "addr", "show", "dev", name])
+    except CommandError as exc:
+        text = str(exc)
+        if "does not exist" in text or "Cannot find device" in text:
+            return False
+        raise
+    try:
+        items = json.loads(listing or "[]")
+    except json.JSONDecodeError as exc:
+        raise CommandError(f"ip -j addr show {name}: непонятный ответ ({exc})") from exc
+    item = items[0] if items and isinstance(items[0], dict) else None
+    if item is None or "UP" not in (item.get("flags") or []):
+        return False
+    local, _, prefix = ADDRESS.partition("/")
+    return any(
+        isinstance(addr, dict) and addr.get("family") == "inet"
+        and addr.get("local") == local and str(addr.get("prefixlen")) == prefix
+        for addr in item.get("addr_info") or []
+    )
+
+
 def ensure(name: str, runner: Runner, proc_sys: Path = sysctl.PROC_SYS) -> bool:
     """Постоянный TUN-интерфейс есть и поднят. True — создан сейчас."""
     item = info(name, runner)

@@ -9,7 +9,7 @@ import pytest
 from fakenet import FakeKernel
 
 from xgw.config import Config
-from xgw.net import cmd, dnsmasq, iprule, lan, sysctl
+from xgw.net import cmd, dnsmasq, iprule, lan, sysctl, tun
 from xgw.net.capture import Capture, CaptureError
 from xgw.paths import Paths
 
@@ -453,7 +453,9 @@ def test_tun_interface_goes_away_after_switching_back_to_tproxy(gateway_tun):
     assert kernel.links == {"xgwtun0": "tun"}  # применённый конфиг Xray ещё с tun-in
     assert gateway.tidy() == ""
     fakexray.write(gateway.paths, fakexray.applied_config(tun=None))  # Xray перезапущен
-    assert gateway.tidy() == "интерфейс xgwtun0 убран: capture.method больше не tun"
+    assert gateway.tidy() == (
+        "интерфейс xgwtun0 убран: он больше не нужен ни этой машине, ни контейнерам"
+    )
     assert kernel.links == {} and gateway.tidy() == ""
     assert gateway.loaded() is True
     # Чужой интерфейс с тем же именем (не TUN) не трогается.
@@ -469,6 +471,7 @@ def test_containers_are_marked_and_routed_into_the_tun(gateway):
     таблицу TUN. Пока интерфейса TUN нет (Xray ещё без inbound'а TUN), маршрут ведёт в
     чёрную дыру: контейнеры закрыты, а не выходят мимо VPN."""
     gateway.cfg.capture.containers = True
+    fakexray.write(gateway.paths, fakexray.applied_config(tun=None))  # Docker ещё нет
     kernel = gateway.kernel
     assert gateway.enable() == "on"
     assert "meta mark set 0x3" in kernel.table and 'iifname "docker0" goto containers' in (
@@ -479,7 +482,8 @@ def test_containers_are_marked_and_routed_into_the_tun(gateway):
     assert [route.get("type") for route in routes] == ["blackhole"]  # интерфейса ещё нет
     assert gateway.loaded() is True
     # Docker появился, Xray перезапущен с inbound'ом TUN — Applier создал интерфейс.
-    kernel("ip tuntap add dev xgwtun0 mode tun".split())
+    fakexray.write(gateway.paths)
+    tun.ensure("xgwtun0", kernel, gateway.proc)
     assert gateway.loaded() is False  # в интерфейс маршрута ещё нет
     gateway.up()
     assert {route.get("dev") for route in kernel.routes(101)} >= {"xgwtun0"}
@@ -494,6 +498,37 @@ def test_containers_are_marked_and_routed_into_the_tun(gateway):
     assert gateway.loaded() is False
     gateway.up()
     assert "0x3" not in [r["fwmark"] for r in kernel.rules] and gateway.loaded() is True
+
+
+def test_containers_tun_is_prepared_by_xgw_after_a_reboot(gateway):
+    """После перезагрузки правила загружает xgw-net.service, раньше Xray. Интерфейс TUN
+    для контейнеров создаёт XGW — с адресом: иначе его создал бы сам Xray, без адреса, и
+    ядро отбрасывало бы ответы Xray (контейнеры без интернета, отчёт 0.1.4, G7). Интерфейс
+    без адреса loaded() видит — демон загружает правила заново, и up() его чинит."""
+    gateway.cfg.capture.containers = True  # применённый конфиг — с inbound'ом TUN: Docker есть
+    kernel = gateway.kernel
+    assert gateway.up() == "on"
+    assert kernel.links == {"xgwtun0": "tun"} and "xgwtun0" in kernel.up
+    assert kernel.addresses["xgwtun0"] == {tun.ADDRESS}
+    assert {route.get("dev") for route in kernel.routes(101)} >= {"xgwtun0"}
+    assert gateway.loaded() is True and gateway.tun_problem() == ""
+    assert gateway.tidy() == ""  # интерфейс нужен контейнерам — остаётся
+
+    # Xray пересоздал интерфейс сам: адреса нет, ответы Xray не дойдут.
+    kernel("ip link del dev xgwtun0".split())
+    kernel.links["xgwtun0"] = "tun"
+    assert gateway.loaded() is False
+    assert "нет адреса 169.254.10.1/32" in gateway.tun_problem()
+    gateway.up()
+    assert kernel.addresses["xgwtun0"] == {tun.ADDRESS} and gateway.loaded() is True
+
+    # Интерфейс не создаётся (нет /dev/net/tun) — перехват не держится: машина и LAN идут
+    # через TPROXY, контейнеры закрыты чёрной дырой.
+    kernel("ip link del dev xgwtun0".split())
+    kernel.refuse = "tuntap add"
+    assert gateway.up() == "on" and gateway.held == ""
+    assert [route.get("type") for route in kernel.routes(101)] == ["blackhole"]
+    assert gateway.loaded() is True
 
 
 def test_containers_share_the_tun_table_with_the_machine(gateway_tun):

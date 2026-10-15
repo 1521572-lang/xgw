@@ -11,13 +11,16 @@
 всегда через TPROXY. Интерфейс создаётся при включении перехвата и убирается командой
 `net down`: `xgw disable` и fail_mode = open снимают лишь правило и маршрут, иначе Xray
 остался бы с оборванным интерфейсом и потребовал перезапуска. Ещё он убирается сам, когда
-стал не нужен: capture.method больше не "tun", и Xray запущен без inbound'а TUN (tidy).
+стал не нужен: capture.method больше не "tun", и Xray запущен без inbound'а TUN — то есть
+интерфейс не нужен и контейнерам (tidy).
 
 Контейнеры Docker (capture.containers) — всегда через тот же TUN-интерфейс, по своей
 метке: TPROXY с мостами Docker не работает (net/nft.py). Интерфейс для них появляется,
 только когда Docker на машине есть (engine.containers_tun): тогда в конфиге Xray есть
-inbound TUN, и интерфейс перед запуском Xray создаёт Applier. Без интерфейса маршрут
-контейнеров ведёт в чёрную дыру — они закрыты, а не идут мимо VPN.
+inbound TUN, и интерфейс создаёт XGW — Applier перед запуском Xray, а при загрузке
+xgw-net.service (_prepare_tun). Без интерфейса маршрут контейнеров ведёт в чёрную дыру —
+они закрыты, а не идут мимо VPN. Интерфейс без адреса (его создал сам Xray) — тоже
+сбой: ответы Xray ядро отбросит; loaded() это видит, и демон загружает правила заново.
 
 Выбор «включён/снят» хранится в /var/lib/xgw и переживает перезагрузку: по нему
 правила загружает xgw-net.service. Временное снятие (open) — метка в /run.
@@ -96,7 +99,7 @@ class Capture:
         self.time_uids = time_uids
         self.state_file = paths.var / "capture.json"
         self.open_marker = paths.run / "capture-open"
-        self.sys_net = Path("/sys/class/net")  # где искать мосты Docker (в тестах — свой)
+        self.sys_net: Path | None = None  # где искать мосты Docker; None — lan.SYS_NET
         self._warned: set[str] = set()
         # Почему последняя загрузка вместо перехвата оставила сеть напрямую: в применённом
         # конфиге Xray нет нужного inbound'а либо нет TUN-интерфейса (см. _load). Пусто —
@@ -286,18 +289,58 @@ class Capture:
         mode = self.mode()
         return "off" if mode == "on" and self.inbound_problem() else mode
 
+    def _containers_tun(self, rules: nft.Rules) -> bool:
+        """Интерфейс TUN нужен контейнерам: их перехват включён, и применённый конфиг Xray
+        с inbound'ом TUN (он там, только когда Docker на машине есть)."""
+        if not rules.containers:
+            return False
+        applied = self._applied()
+        return applied is not None and tun.inbound_name(applied) == rules.tun_name
+
     def _prepare_tun(self) -> str:
         """Создаёт интерфейс TUN для режима «on» и убеждается, что он есть в системе.
         Пусто — есть (или не нужен), иначе причина: без интерфейса маршрут помеченных
         пакетов вёл бы в никуда. Отказ самой команды создания — ошибка (CommandError):
         её исправляет человек (нет /dev/net/tun, имя занято), сама она не пройдёт."""
         rules = self.rules("on")
-        if not rules.tun:
+        if rules.tun:
+            tun.ensure(rules.tun_name, self.runner, self.proc_sys)
+            if tun.present(rules.tun_name, self.runner):
+                return ""
+            return f"TUN-интерфейса {rules.tun_name} нет в системе"
+        if self._containers_tun(rules):
+            # Интерфейс нужен только контейнерам. Без XGW его создал бы сам Xray — без
+            # адреса, и контейнеры остались бы без интернета (так было после перезагрузки).
+            # Неудача перехват не держит: машина и LAN идут через TPROXY, а контейнеры без
+            # интерфейса закрыты чёрной дырой.
+            try:
+                tun.ensure(rules.tun_name, self.runner, self.proc_sys)
+            except (cmd.CommandError, OSError) as exc:
+                self.log.warning("интерфейс %s для контейнеров не подготовлен: %s",
+                                 rules.tun_name, exc)
+        return ""
+
+    def _tun_problem(self, rules: nft.Rules) -> str:
+        """Что не так с интерфейсом TUN, который нужен машине или контейнерам; пусто — всё
+        в порядке либо он не нужен. Контейнерам интерфейса может и не быть: пока его нет,
+        они закрыты чёрной дырой (Xray не запущен)."""
+        name = rules.tun_name
+        if not (rules.tun or self._containers_tun(rules)):
             return ""
-        tun.ensure(rules.tun_name, self.runner, self.proc_sys)
-        if tun.present(rules.tun_name, self.runner):
+        if not tun.present(name, self.runner):
+            return f"интерфейса {name} нет" if rules.tun else ""
+        if not tun.ready(name, self.runner):
+            return (f"у интерфейса {name} нет адреса {tun.ADDRESS} или он не поднят: "
+                    "ответы Xray ядро отбрасывает")
+        return ""
+
+    def tun_problem(self) -> str:
+        """То же для текущего режима — для `xgw diag`."""
+        try:
+            return self._tun_problem(self.rules(self.effective_mode()))
+        except cmd.CommandError as exc:
+            self.log.debug("интерфейс TUN не проверен: %s", exc)
             return ""
-        return f"TUN-интерфейса {rules.tun_name} нет в системе"
 
     def _load(self, mode: str) -> str:
         self.held = ""
@@ -357,7 +400,7 @@ class Capture:
         except cmd.CommandError as exc:
             self.log.error("интерфейс %s не убран: %s", name, exc)
             return ""
-        text = f"интерфейс {name} убран: capture.method больше не tun"
+        text = f"интерфейс {name} убран: он больше не нужен ни этой машине, ни контейнерам"
         self.log.info("%s", text)
         return text
 
@@ -470,7 +513,7 @@ class Capture:
                 return False
         cap = self.cfg.capture
         with contextlib.suppress(cmd.CommandError):
-            if rules.tun and not tun.present(rules.tun_name, self.runner):
+            if self._tun_problem(rules):
                 return False
             for family in self._families():
                 tproxy, via_tun = self._wanted(rules, family)

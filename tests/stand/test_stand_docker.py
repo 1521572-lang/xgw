@@ -38,6 +38,8 @@ DIRECT = netns.GW_WAN_IP
 BRIDGE_IP = "172.17.0.1"
 CONTAINER_IP = "172.17.0.2"
 PUBLISHED = 9090
+TUN = "xgwtun0"
+TUN_ADDRESS = "169.254.10.1/32"
 
 pytestmark = [
     pytest.mark.skipif(
@@ -198,6 +200,47 @@ def test_docker_installed_after_xgw_is_picked_up_by_the_daemon(stand):
     assert "tun-in" in stand.gw_run("cat", str(applied))
     assert stand.exit_ip("lan") == VIA_VPN and stand.exit_ip("gw") == VIA_VPN
     assert "появился Docker" in stand.tail("daemon", 200)
+
+
+def test_after_a_reboot_the_tun_of_the_containers_has_its_address(stand):
+    """Перезагрузка (отчёт 0.1.4, G7). При capture.method = "tproxy" интерфейс TUN нужен
+    только контейнерам, и создаёт его теперь `xgw net up` (xgw-net.service, раньше Xray) — с
+    адресом. Интерфейс, который создал сам Xray, адреса не имеет: ядро отбрасывает ответы
+    Xray, и контейнеры без интернета. Такой интерфейс видит проверка правил, а `xgw net up`
+    (его же делает демон, заметив это) его чинит."""
+    stand.gw_run("sysctl", "-qw", "net.ipv4.conf.all.rp_filter=2",
+                 "net.ipv4.conf.default.rp_filter=2")  # умолчание Ubuntu
+    container = stand.container()
+    container.create()
+    stand.up(capture=True)
+    assert stand.xgw("enable").returncode == 0
+    assert container.exit_ip() == VIA_VPN
+    config = str(stand.root / "etc/xgw/xray/config.json")
+
+    def address() -> str:
+        return stand.gw_run("ip", "-br", "addr", "show", "dev", TUN, check=False)
+
+    # Загрузка: правила раньше Xray — интерфейс готовит XGW, Xray к нему подключается.
+    stand.xray_service().stop()
+    stand.gw_run("ip", "link", "del", "dev", TUN)
+    assert stand.xgw("net", "up").returncode == 0
+    assert TUN_ADDRESS in address()
+    xray = stand.gw_popen("xray-boot", [str(stand.xray_bin), "run", "-c", config])
+    assert wait_for(lambda: container.exit_ip() == VIA_VPN, 30, step=1), stand.xray_log(30)
+
+    # Интерфейс создал сам Xray (так было в 0.1.4 после перезагрузки): адреса нет.
+    xray.terminate()
+    xray.wait(timeout=10)
+    stand.gw_run("ip", "link", "del", "dev", TUN)
+    stand.gw_popen("xray-alone", [str(stand.xray_bin), "run", "-c", config])
+    assert wait_for(lambda: TUN in stand.gw_run("ip", "-br", "link", check=False), 20)
+    assert TUN_ADDRESS not in address()
+    assert container.exit_ip() == ""  # ни через VPN, ни мимо
+    assert stand.xgw_json("status")["capture"]["loaded"] is False  # проверка правил видит
+    assert stand.xgw("net", "up").returncode == 0
+    assert TUN_ADDRESS in address()
+    assert wait_for(lambda: container.exit_ip() == VIA_VPN, 30, step=1), stand.xray_log(30)
+    assert stand.xgw_json("status")["capture"]["loaded"] is True
 
 
 def test_containers_can_be_left_outside_the_vpn(stand):

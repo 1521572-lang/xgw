@@ -574,6 +574,7 @@ class FakeCapture:
         self.fail = False
         self.calls: list[str] = []
         self.problem = ""  # какого inbound'а нет в применённом конфиге Xray
+        self.tun_issue = ""  # что не так с интерфейсом TUN
 
     def mode(self):
         return self.state
@@ -587,7 +588,12 @@ class FakeCapture:
         if self.fail:
             raise RuntimeError("nft: программа не найдена")
         self.is_loaded = True
+        self.tun_issue = ""
         return self.state
+
+    def tun_problem(self):
+        self.calls.append("tun?")
+        return self.tun_issue
 
     def actions(self) -> list[str]:
         """Что демон делал с правилами (без чтений состояния)."""
@@ -641,6 +647,21 @@ def test_daemon_reloads_missing_rules(guarded):
     assert daemon.status()["capture"]["mode"] == "on"
     daemon.tick()
     assert capture.actions() == ["up"]  # правила на месте — больше ничего не делает
+
+
+def test_daemon_names_the_tun_without_an_address(guarded):
+    """Интерфейс TUN без адреса (его пересоздал сам Xray, отчёт 0.1.4, G7): демон загружает
+    правила заново — это готовит интерфейс — и называет причину, а не «правила пропали»."""
+    daemon, capture = guarded
+    capture.is_loaded = False
+    capture.tun_issue = "у интерфейса xgwtun0 нет адреса 169.254.10.1/32 или он не поднят"
+    daemon.tick()
+    assert capture.actions() == ["up"]
+    assert any(
+        "нет адреса 169.254.10.1/32" in event and "подготовлен заново" in event
+        for event in daemon.events()
+    )
+    assert not any("загружены заново" in event for event in daemon.events())
 
 
 def test_rules_failure_is_reported_once(guarded):

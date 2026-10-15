@@ -54,11 +54,21 @@ class Topology:
     def _ip(self, *args: str) -> None:
         subprocess.run(["ip", *args], check=True, capture_output=True, text=True, timeout=15)
 
+    def _factory(self, namespace: str) -> None:
+        """Форвардинг выключен, как в только что поставленной системе: новое пространство
+        имён наследует net.ipv4.ip_forward хоста, а на машине с XGW или Docker он включён —
+        и проверка «XGW вернул как было» сверяла бы с ним (отчёт 0.1.4, G6)."""
+        subprocess.run(
+            ["ip", "netns", "exec", namespace, "sysctl", "-qw", "net.ipv4.ip_forward=0"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+
     def create(self) -> None:
         try:
             for namespace in (self.inet, self.gw, self.lan):
                 self._ip("netns", "add", namespace)
                 self._created.append(namespace)
+                self._factory(namespace)
                 self._ip("-n", namespace, "link", "set", "lo", "up")
             self._link(self.gw, "wan0", f"{GW_WAN_IP}/24", self.inet, "eth0", f"{INET_IP}/24")
             self._link(self.gw, "lan0", f"{GW_LAN_IP}/24", self.lan, "eth0", f"{LAN_IP}/24")

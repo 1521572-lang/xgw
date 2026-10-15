@@ -236,12 +236,25 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
         "etc/sysctl.d/90-xgw.conf": "net.ipv4.ip_forward = 1\n",
         "usr/local/share/applications/xgw-panel.desktop": "[Desktop Entry]\n",
         "etc/NetworkManager/system-connections/xgw-lan.nmconnection": "[connection]\n",
+        # NetworkManager с netplan (Ubuntu 24.04): профиль — файл netplan. Профиль XGW
+        # узнаётся по uuid из журнала и, без журнала, по имени в файле.
+        "etc/netplan/90-NM-0b6.yaml": (
+            "network:\n  version: 2\n  ethernets:\n    NM-0b6:\n      renderer: NetworkManager\n"
+            '      match:\n        name: "enp4s0"\n      networkmanager:\n'
+            '        uuid: "0b6"\n        name: "xgw-lan"\n'
+        ),
+        "etc/netplan/90-NM-7c1.yaml": "network:\n  version: 2\n",
         # Чужое — остаётся на месте.
         "etc/systemd/system/ssh.service": "[Service]\n",
         "etc/systemd/system/multi-user.target.wants/ssh.service": "",
         "etc/dnsmasq.d/home.conf": "# своё\n",
         "etc/sysctl.d/10-local.conf": "vm.swappiness = 10\n",
         "etc/NetworkManager/system-connections/Wired.nmconnection": "[connection]\n",
+        "etc/netplan/90-NM-a1e.yaml": (
+            "network:\n  ethernets:\n    NM-a1e:\n      renderer: NetworkManager\n"
+            '      networkmanager:\n        uuid: "a1e"\n        name: "Проводное подключение 1"\n'
+        ),
+        "etc/netplan/50-cloud-init.yaml": "network:\n  version: 2\n",
         "usr/local/bin/xgw-helper": "",
         "etc/ufw/before.rules": (
             "*filter\n-A ufw-before-input -i lo -j ACCEPT\n"
@@ -254,7 +267,8 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     journal = {"sleep": ["sleep.target", "suspend.target"], "user_created": True,
-               "ufw": [["allow", "in", "on", "enp4s0"]], "ufw_before": True}
+               "ufw": [["allow", "in", "on", "enp4s0"]], "ufw_before": True,
+               "nm_lan": {"lan_if": "enp4s0", "profile": "7c1", "disabled": []}}
     (root / "var/lib/xgw/backup").mkdir(parents=True)
     (root / "var/lib/xgw/backup/install.json").write_text(json.dumps(journal), "utf-8")
     masks = True
@@ -273,6 +287,8 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
     expected = [
         "etc/NetworkManager/system-connections/Wired.nmconnection",
         "etc/dnsmasq.d/home.conf",
+        "etc/netplan/50-cloud-init.yaml",
+        "etc/netplan/90-NM-a1e.yaml",
         "etc/sysctl.d/00-xgw-stand.conf",
         "etc/sysctl.d/10-local.conf",
         "etc/systemd/system/multi-user.target.wants/ssh.service",

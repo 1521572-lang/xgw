@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -58,8 +59,12 @@ HOST_XGW_GLOBS = (
     "etc/systemd/system/xgw*.service",
     "etc/systemd/system/*.wants/xgw*.service",
     "etc/systemd/system/*.requires/xgw*.service",
-    "etc/NetworkManager/system-connections/xgw-lan*",
 )
+# Профиль xgw-lan: keyfile NetworkManager либо — у NetworkManager с netplan (Ubuntu 24.04 и
+# новее) — файл netplan 90-NM-<uuid>.yaml, а в system-connections тогда пусто.
+XGW_PROFILE_KEYFILES = "etc/NetworkManager/system-connections/xgw-lan*"
+NETPLAN_PROFILES = "etc/netplan/90-NM-*.yaml"
+_XGW_PROFILE_NAME = re.compile(r"""^\s*name:\s*["']?xgw-lan["']?\s*$""", re.MULTILINE)
 SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
 # Службы хоста, которым в контейнере не место: корень — оверлей поверх хоста, и Docker,
 # включённый на хосте, запустился бы и в контейнере — со своими правилами nftables,
@@ -78,6 +83,20 @@ def _remove(path: Path) -> None:
         path.unlink()
     elif path.is_dir():
         shutil.rmtree(path)
+
+
+def xgw_profile_files(root: Path, uuid: str | None = None) -> list[Path]:
+    """Файлы профиля xgw-lan в корне root; uuid — профиль из журнала установки (файл netplan
+    назван по нему), без него профиль узнаётся по имени в файле."""
+    found = sorted(root.glob(XGW_PROFILE_KEYFILES))
+    for path in sorted(root.glob(NETPLAN_PROFILES)):
+        if uuid and path.name == f"90-NM-{uuid}.yaml":
+            found.append(path)
+            continue
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            if _XGW_PROFILE_NAME.search(path.read_text(encoding="utf-8")):
+                found.append(path)
+    return found
 
 
 def scrub_host_xgw(root: Path) -> dict:
@@ -106,6 +125,12 @@ def scrub_host_xgw(root: Path) -> dict:
     for pattern in HOST_XGW_GLOBS:
         for path in root.glob(pattern):
             _remove(path)
+    # Профиль xgw-lan хоста: иначе установка в контейнере нашла бы его по имени и взяла
+    # себе, а удаление — снесло бы, и сверка «до/после» разошлась (отчёт 0.1.4, G4).
+    lan_record = journal.get("nm_lan")
+    uuid = lan_record.get("profile") if isinstance(lan_record, dict) else None
+    for path in xgw_profile_files(root, uuid if isinstance(uuid, str) else None):
+        _remove(path)
     for target in journal.get("sleep") or []:
         link = root / "etc/systemd/system" / str(target)
         if str(target) in SLEEP_TARGETS and link.is_symlink() and os.readlink(link) == "/dev/null":

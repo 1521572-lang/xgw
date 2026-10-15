@@ -3,6 +3,11 @@
 Ничего не меняет в системе. Правила nftables проверяются в отдельном сетевом
 пространстве имён (`unshare -n`): ядро принимает их по-настоящему, а сеть
 машины при этом не затрагивается. FAIL — установку начинать нельзя.
+
+Перед установкой (preinstall) состояние уже установленного XGW — службы, загруженные
+правила, интерфейс TUN — не FAIL, а WARN: это установка и исправит (перезапустит службы,
+загрузит правила заново). Иначе обновление на версию с новой службой или цепочкой правил
+требовало бы --force.
 """
 
 from __future__ import annotations
@@ -89,8 +94,10 @@ class Diag:
         port_free: Callable[[int], bool] = can_bind,
         proc_sys: Path = sysctl.PROC_SYS,
         dev_tun: Path = DEV_TUN,
+        preinstall: bool = False,
     ) -> None:
         self.proc_sys = proc_sys
+        self.preinstall = preinstall
         self.dev_tun = dev_tun
         self.cfg = cfg
         self.paths = paths
@@ -307,9 +314,12 @@ class Diag:
         return [Check("Ядро", OK, "ядро принимает правила TPROXY (tproxy, fib, ct, masquerade)")]
 
     def _tun(self) -> list[Check]:
-        """capture.method = tun: нужен /dev/net/tun, и ответы Xray не должен резать rp_filter."""
+        """Интерфейс TUN — для трафика машины (capture.method = tun) или контейнеров Docker:
+        нужен /dev/net/tun, на интерфейсе — адрес XGW, и ответы Xray не должен резать
+        rp_filter."""
         cap = self.cfg.capture
-        if not (cap.tun and cap.local):
+        machine = cap.tun and cap.local
+        if not (machine or engine.containers_tun(self.cfg)):
             return []
         result: list[Check] = []
         if not self.dev_tun.exists():
@@ -317,7 +327,18 @@ class Diag:
                 "TUN", FAIL, f"нет {self.dev_tun}: в ядре нет TUN, Xray не создаст интерфейс",
                 "sudo modprobe tun (и добавьте tun в /etc/modules-load.d/xgw.conf)",
             )]
-        result.append(Check("TUN", OK, f"{self.dev_tun} есть; интерфейс {cap.tun_name}"))
+        whom = "" if machine else " — для контейнеров Docker"
+        if self.root and self.installed:
+            capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+            problem = capture.tun_problem() if capture.mode() == "on" else ""
+            if problem:
+                result.append(Check(
+                    "TUN", WARN if self.preinstall else FAIL, problem,
+                    "установка подготовит интерфейс заново" if self.preinstall
+                    else "sudo xgw net up",
+                ))
+        if not result:
+            result.append(Check("TUN", OK, f"{self.dev_tun} есть; интерфейс {cap.tun_name}{whom}"))
         # Действует наибольшее из общего значения и значения интерфейса; своё значение XGW
         # обнуляет при создании интерфейса, так что решает общее.
         for where in ("all", cap.tun_name):
@@ -595,6 +616,9 @@ class Diag:
                 "IPv6", WARN, "перехват снят — IPv6 идёт напрямую, мимо VPN", "sudo xgw enable"
             )]
         if info["loaded"] is False or not info["ipv6"]:
+            if self.preinstall:
+                return [Check("IPv6", WARN, "IPv6 проксируется, но его правила не загружены",
+                              "установка загрузит их заново")]
             return [Check(
                 "IPv6", FAIL, "IPv6 проксируется, но его правила не загружены", "sudo xgw net up"
             )]
@@ -657,7 +681,12 @@ class Diag:
             if self.runner(["systemctl", "is-active", unit], check=False).strip() != "active"
         ]
         result: list[Check] = []
-        if down:
+        if down and self.preinstall:
+            result.append(Check(
+                "Службы", WARN, "не работают: " + ", ".join(down),
+                "установка запустит их заново",
+            ))
+        elif down:
             result.append(Check(
                 "Службы", FAIL, "не работают: " + ", ".join(down),
                 "sudo systemctl status " + " ".join(down),
@@ -668,7 +697,10 @@ class Diag:
         if self.root:
             capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
             info = capture.describe()
-            if info["mode"] == "on" and info["loaded"] is False:
+            if info["mode"] == "on" and info["loaded"] is False and self.preinstall:
+                result.append(Check("Перехват", WARN, "включён, но правила не загружены",
+                                    "установка загрузит их заново"))
+            elif info["mode"] == "on" and info["loaded"] is False:
                 result.append(Check("Перехват", FAIL, "включён, но правила не загружены",
                                     "sudo xgw net up"))
             elif info["mode"] in ("off", "open"):

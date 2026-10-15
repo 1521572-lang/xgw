@@ -32,6 +32,18 @@ def _no_bot(monkeypatch):
     monkeypatch.setattr("xgw.cli._sync_bot", lambda bot, *args, **kwargs: None)
 
 
+@pytest.fixture(scope="session")
+def _empty_sys_net(tmp_path_factory) -> Path:
+    return tmp_path_factory.mktemp("sys-class-net")
+
+
+@pytest.fixture(autouse=True)
+def _no_docker(monkeypatch, _empty_sys_net):
+    """Мостов Docker «нет»: результат тестов не должен зависеть от того, стоит ли Docker на
+    машине, где они идут (отчёт 0.1.4, G2). Тесты контейнеров задают свой каталог."""
+    monkeypatch.setattr("xgw.net.lan.SYS_NET", _empty_sys_net)
+
+
 @pytest.fixture(autouse=True)
 def _no_dns(monkeypatch):
     """Сборка конфига в тестах не ходит в настоящий DNS: резолверы «недоступны», как без

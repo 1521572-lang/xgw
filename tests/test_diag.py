@@ -378,6 +378,54 @@ def test_services_and_capture_after_install(box):
     assert off.level == WARN and off.advice == "sudo xgw enable"
 
 
+def test_before_install_the_old_state_is_not_a_failure(box):
+    """Установка поверх прежней версии (отчёт 0.1.4, G1): службы, которой у прежней версии
+    нет, и правил без новой цепочки — не FAIL, а WARN: установка их и исправит. Иначе
+    обновление шло бы только с --force."""
+    box.installed()
+    for unit in ("xgw-net.service", "xgw-xray.service", "xgw.service"):
+        box.system.unit(unit)["active"] = True  # xgw-dhcp у прежней версии нет
+    before = box.diag(preinstall=True)._services()
+    assert [check.level for check in before] == [WARN, WARN]
+    assert "xgw-dhcp.service" in before[0].text and "установка" in before[0].advice
+    assert "правила не загружены" in before[1].text and "установка" in before[1].advice
+    assert [check.level for check in box.diag()._services()] == [FAIL, FAIL]  # а в diag — FAIL
+
+
+def test_tun_of_the_containers_is_checked_with_its_address(box, tmp_path, monkeypatch):
+    """Интерфейс TUN нужен и контейнерам Docker: diag проверяет его и при capture.method =
+    "tproxy", а интерфейс без адреса — FAIL (отчёт 0.1.4, G7: после перезагрузки его создал
+    сам Xray, и контейнеры остались без интернета, а diag говорил, что всё в порядке)."""
+    from xgw.net import lan, tun
+    from xgw.net.capture import Capture
+
+    device = tmp_path / "tun"
+    device.write_text("")
+    proc = box.paths.root / "proc" / "sys"
+    (proc / "net/ipv4").mkdir(parents=True)
+    (proc / "net/ipv4/ip_forward").write_text("0\n", encoding="ascii")
+    box.kwargs.update(dev_tun=device, proc_sys=proc)
+    assert box.diag()._tun() == []  # Docker нет — интерфейс никому не нужен
+    sys_net = tmp_path / "sys-class-net"
+    (sys_net / "docker0").mkdir(parents=True)
+    monkeypatch.setattr(lan, "SYS_NET", sys_net)
+    ok = box.diag()._tun()
+    assert [c.level for c in ok] == [OK] and "для контейнеров Docker" in ok[0].text
+
+    box.installed()
+    fakexray.write(box.paths)  # Xray запущен с inbound'ом TUN
+    capture = Capture(box.cfg, box.paths, runner=box.system, proc_sys=proc)
+    assert capture.enable() == "on"
+    assert [c.level for c in box.diag()._tun()] == [OK]
+    kernel = box.system.kernel
+    kernel.addresses.pop("xgwtun0")  # интерфейс пересоздал сам Xray — без адреса
+    broken = box.diag()._tun()
+    assert [c.level for c in broken] == [FAIL] and tun.ADDRESS in broken[0].text
+    assert broken[0].advice == "sudo xgw net up"
+    assert box.diag(preinstall=True)._tun()[0].level == WARN
+    assert capture.up() == "on" and [c.level for c in box.diag()._tun()] == [OK]
+
+
 def test_budget_uses_known_nodes(box):
     assert box.diag()._budget()[0].level == OK  # 5 участников по умолчанию — ~944 МБ
     box.cfg.filters.max_members = 8

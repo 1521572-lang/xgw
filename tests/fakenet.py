@@ -20,6 +20,10 @@ class FakeKernel:
         # Маршруты таблиц перехвата: (семейство, номер таблицы) → список маршрутов.
         self.route_tables: dict[tuple[int, str], list[dict]] = {}
         self.links: dict[str, str] = {}  # интерфейс → вид (tun)
+        # Поднятые интерфейсы и их адреса. Интерфейс, записанный в links напрямую (его
+        # «создал Xray»), не поднят XGW и адреса не имеет.
+        self.up: set[str] = set()
+        self.addresses: dict[str, set[str]] = {}
         self.calls: list[tuple[str, ...]] = []
         self.refuse: str | None = None  # подстрока команды, которая «не выполняется»
         self.forbidden = False  # запуск не от root: nft ничего не показывает
@@ -58,12 +62,25 @@ class FakeKernel:
         return self._has_local(6)
 
     def _link(self, argv: list[str], command: str) -> str:
-        """ip -d -j link show / ip tuntap add / ip link set / ip addr replace / ip link del."""
+        """ip -d -j link show / ip -j addr show / ip tuntap add / ip link set /
+        ip addr replace / ip link del."""
         if argv[:5] == ["ip", "-d", "-j", "link", "show"]:
             name = argv[6]
             if name not in self.links:
                 raise CommandError(f'{command}: Device "{name}" does not exist.')
             return json.dumps([{"ifname": name, "linkinfo": {"info_kind": self.links[name]}}])
+        if argv[:4] == ["ip", "-j", "addr", "show"]:
+            name = argv[5]
+            if name not in self.links:
+                raise CommandError(f'{command}: Device "{name}" does not exist.')
+            flags = ["POINTOPOINT", "NOARP", *(["UP"] if name in self.up else [])]
+            addr_info = [
+                {"family": "inet", "local": local, "prefixlen": int(prefix)}
+                for local, _, prefix in (
+                    item.partition("/") for item in sorted(self.addresses.get(name, ()))
+                )
+            ]
+            return json.dumps([{"ifname": name, "flags": flags, "addr_info": addr_info}])
         if argv[:3] == ["ip", "tuntap", "add"]:
             name = argv[4]
             if name in self.links:
@@ -73,16 +90,21 @@ class FakeKernel:
         if argv[:3] == ["ip", "link", "set"]:
             if argv[4] not in self.links:
                 raise CommandError(f'{command}: Cannot find device "{argv[4]}"')
+            if argv[-1] == "up":
+                self.up.add(argv[4])
             return ""
         if argv[:3] == ["ip", "addr", "replace"]:
             if argv[5] not in self.links:
                 raise CommandError(f'{command}: Cannot find device "{argv[5]}"')
+            self.addresses.setdefault(argv[5], set()).add(argv[3])
             return ""
         if argv[:3] == ["ip", "link", "del"]:
             name = argv[4]
             if name not in self.links:
                 raise CommandError(f'{command}: Cannot find device "{name}"')
             del self.links[name]
+            self.up.discard(name)
+            self.addresses.pop(name, None)
             for routes in self.route_tables.values():
                 routes[:] = [route for route in routes if route.get("dev") != name]
             return ""
@@ -157,7 +179,9 @@ class FakeKernel:
             return self._route(argv, command, family)
         if argv[:2] in (["ip", "tuntap"], ["ip", "link"]) or argv[:3] == [
             "ip", "addr", "replace"
-        ] or argv[:5] == ["ip", "-d", "-j", "link", "show"]:
+        ] or argv[:5] == ["ip", "-d", "-j", "link", "show"] or argv[:4] == [
+            "ip", "-j", "addr", "show"
+        ]:
             return self._link(argv, command)
         raise AssertionError(f"неожиданная команда: {command}")
 

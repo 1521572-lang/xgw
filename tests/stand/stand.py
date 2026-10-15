@@ -41,6 +41,10 @@ from xgw.xraycore.api import parse_balancer_info  # noqa: E402
 from xgw.xraycore.service import PidfileXrayService  # noqa: E402
 
 UUID = "11111111-2222-3333-4455-666666666661"
+# Метка «мимо перехвата» шлюза стенда без перехвата. У XGW, установленного на самой машине,
+# по умолчанию та же метка (2), и его правило loopback_guard отбрасывает такие пакеты к
+# 127.0.0.0/8, а в режиме loopback узлы стенда живут именно там (отчёт 0.1.4, G5).
+STAND_BYPASS_MARK = 0x5E
 FLAGS = {"nl": "🇳🇱", "de": "🇩🇪", "fr": "🇫🇷", "us": "🇺🇸"}
 
 
@@ -294,7 +298,9 @@ containers = {"true" if containers else "false"}
 """
             direct_dns = f'["{netns.INET_DNS_IP}"]'
         else:
-            network = "\n[capture]\nlan = false\nlocal = false\n"
+            network = (
+                f"\n[capture]\nlan = false\nlocal = false\nmark_bypass = {STAND_BYPASS_MARK}\n"
+            )
             direct_dns = "[]"
         if not panel:
             extra += "\n[panel]\nenabled = false\n"

@@ -660,12 +660,15 @@ def _system_root_problem(paths: Paths) -> str | None:
     return _root_problem() if paths.root == Path("/") else None
 
 
-def _run_diag(args, cfg: config.Config, paths: Paths, logger, *, net: bool = True) -> list:
+def _run_diag(
+    args, cfg: config.Config, paths: Paths, logger, *, net: bool = True, preinstall: bool = False
+) -> list:
     from .diag import Diag
 
     return Diag(
         cfg, paths, logger=logger, net=net,
         config_error=args.config_error, config_warnings=args.config_warnings,
+        preinstall=preinstall,
     ).run()
 
 
@@ -723,7 +726,8 @@ def _cmd_install(args, cfg: config.Config, paths: Paths, logger) -> int:
             return _fail(str(exc), 2)
         args.config_error = ""
         print()
-    checks = _run_diag(args, cfg, paths, logger)
+    # Службы и правила прежней установки установка исправит сама — они не повод для --force.
+    checks = _run_diag(args, cfg, paths, logger, preinstall=True)
     print(diag.render(checks))
     print()
     return Installer(cfg, paths, logger=logger, checks=lambda: checks).run(

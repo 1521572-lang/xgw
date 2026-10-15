@@ -774,7 +774,10 @@ def test_first_install_run_asks_about_the_router_and_goes_on(root, monkeypatch, 
     monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: None)
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(xgw.install, "choose_lan", lambda: "enp4s0")
-    monkeypatch.setattr(cli, "_run_diag", lambda *args, **kwargs: [])
+    diag_options: list[dict] = []
+    monkeypatch.setattr(
+        cli, "_run_diag", lambda *args, **kwargs: diag_options.append(kwargs) or []
+    )
     seen: list[tuple] = []
 
     class FakeInstaller:
@@ -787,6 +790,8 @@ def test_first_install_run_asks_about_the_router_and_goes_on(root, monkeypatch, 
     monkeypatch.setattr(xgw.install, "Installer", FakeInstaller)
     assert main(["install"]) == 0
     assert seen == [("enp4s0", [])]
+    # Состояние прежней установки — не повод для --force: его исправит сама установка.
+    assert diag_options == [{"preinstall": True}]
     assert 'lan_if = "enp4s0"' in root.config_file.read_text(encoding="utf-8")
     assert f"Создан {root.config_file}" in capsys.readouterr().out
     # С ключом --yes вопросов нет: файл создан, установка ждёт второго запуска.

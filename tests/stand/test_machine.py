@@ -661,6 +661,11 @@ def test_install(gw):
     assert "old-lan:no" in profiles and "xgw-lan:yes" in profiles and "stand-wan:yes" in profiles
     assert box.sh("nmcli -g ipv6.method connection show stand-wan").strip() == "disabled"
     assert box.sh("nmcli -g ipv4.never-default connection show xgw-lan").strip() == "yes"
+    # Файл профиля находит та же функция, что убирает XGW хоста из корня стенда: и без
+    # журнала, по имени в файле (keyfile или файл netplan — смотря по NetworkManager).
+    assert machine_mod.xgw_profile_files(box.root), box.sh(
+        "ls /etc/netplan /etc/NetworkManager/system-connections"
+    )
     assert "default" not in box.sh("ip route show dev lan0")
     assert box.sh("cat /proc/sys/net/ipv4/ip_forward").strip() == "1"
     assert box.sh("systemctl is-enabled sleep.target suspend.target || true").split() == [

@@ -698,10 +698,13 @@ class Daemon:
                 mode = capture.close()  # fail_mode сменили на closed, а метка осталась
             loaded = capture.loaded()
             reloaded = loaded is False
+            cause = ""
             if reloaded:
                 # Правила пропали (чужой flush ruleset, перезапуск nftables), ещё не
                 # загружались либо не соответствуют режиму: без них трафик пошёл бы
-                # мимо VPN.
+                # мимо VPN. Либо интерфейс TUN без адреса — его создал сам Xray.
+                tun_problem = getattr(capture, "tun_problem", None)
+                cause = tun_problem() if tun_problem is not None else ""
                 capture.up()
                 loaded = capture.loaded()
             info = capture.describe(check=False)
@@ -724,6 +727,8 @@ class Daemon:
                 text = getattr(
                     capture, "reloaded_text", "правила сети не были загружены — загружены заново"
                 )
+                if cause:
+                    text = f"{cause} — интерфейс подготовлен заново"
                 self.notifier.event("capture", text, notify=True)
             self._inbound_missing = missing
             self._capture_error = ""

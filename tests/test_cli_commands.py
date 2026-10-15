@@ -305,7 +305,10 @@ def test_probe_all_saves_results(gateway, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert len(seen) == 4  # два участника и два запасных
     # пароль проб — из применённого конфига: у работающего Xray действует именно он
-    password = gateway.applied()["inbounds"][3]["settings"]["accounts"][0]["pass"]
+    probe_in = next(
+        item for item in gateway.applied()["inbounds"] if item["tag"].startswith("probe-")
+    )
+    password = probe_in["settings"]["accounts"][0]["pass"]
     assert {used for _tag, used in seen} == {password}
     assert "FROZEN" in out and "16384 Б" in out and out.count("OK") == 3
     store = Store(gateway.paths.db_file)
