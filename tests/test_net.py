@@ -346,7 +346,8 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
-        "docker": False, "fail_mode": "closed", "loaded": True, "inbound_missing": "",
+        "docker": False, "fail_mode": "closed", "loaded": True, "tun_problem": "",
+        "inbound_missing": "",
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
     gateway.cfg.capture.containers = True
@@ -521,6 +522,15 @@ def test_containers_tun_is_prepared_by_xgw_after_a_reboot(gateway):
     assert "нет адреса 169.254.10.1/32" in gateway.tun_problem()
     gateway.up()
     assert kernel.addresses["xgwtun0"] == {tun.ADDRESS} and gateway.loaded() is True
+
+    # Снят один адрес, маршруты и правила на месте: статус называет интерфейс, а не
+    # «правила не загружены».
+    kernel.addresses.pop("xgwtun0")
+    assert gateway.loaded() is False and gateway.loaded(tun=False) is True
+    info = gateway.describe()
+    assert info["loaded"] is False and info["tun_problem"] == gateway.tun_problem() != ""
+    gateway.up()
+    assert gateway.describe()["tun_problem"] == "" and gateway.loaded() is True
 
     # Интерфейс не создаётся (нет /dev/net/tun) — перехват не держится: машина и LAN идут
     # через TPROXY, контейнеры закрыты чёрной дырой.

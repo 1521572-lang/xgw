@@ -116,7 +116,8 @@ Xray. Возвращает адрес XGW (шаги ниже), вручную н
 
 ### REAL-22. Юнит-тесты на машине с Docker (G2)
 
-`.venv/bin/python -m pytest tests/ --ignore=tests/stand -q` (без sudo) → **0 failed**;
+`.venv/bin/python -m pytest tests/ --ignore=tests/stand` (без sudo; `-q` уже задан в
+`pyproject.toml`, второй спрятал бы итоговую строку) → **0 failed**;
 записать итоговую строку. В прошлый раз падали `test_probe_all_saves_results`,
 `test_net_up_loads_saved_choice_and_down_removes_all`, `test_status_shows_capture`,
 `test_enable_before_xray_has_the_capture_inbound`.
@@ -135,8 +136,8 @@ Xray. Возвращает адрес XGW (шаги ниже), вручную н
 
 | Прогон | Ожидание |
 |---|---|
-| `… pytest tests/stand/test_machine.py -q` | **0 failed** (23 passed); в прошлый раз 14 failed из-за профиля `xgw-lan` хоста в `/etc/netplan` |
-| `… pytest tests/stand -q --ignore=tests/stand/test_machine.py` | **0 failed**; в прошлый раз — 4 `[loopback]` («участники не ожили») и `test_gateway_own_traffic_is_captured` (`ip_forward`) |
+| `… pytest tests/stand/test_machine.py` | **0 failed** (23 passed); в прошлый раз 14 failed из-за профиля `xgw-lan` хоста в `/etc/netplan` |
+| `… pytest tests/stand --ignore=tests/stand/test_machine.py` | **0 failed**; в прошлый раз — 4 `[loopback]` («участники не ожили») и `test_gateway_own_traffic_is_captured` (`ip_forward`) |
 | `sudo nft list chain ip xgw loopback_guard` до и после прогонов | счётчик не вырос (в прошлый раз — 91 пакет от стенда) |
 
 После прогонов: состояние машины не изменилось (`HEALTHY`, перехват включён, четыре службы

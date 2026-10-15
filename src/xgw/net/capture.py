@@ -473,8 +473,9 @@ class Capture:
 
     # --- проверка ---------------------------------------------------------------
 
-    def loaded(self) -> bool | None:
-        """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав)."""
+    def loaded(self, *, tun: bool = True) -> bool | None:
+        """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
+        tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
         chains = nft.loaded_chains(self.runner)
         if chains is None:
@@ -513,7 +514,7 @@ class Capture:
                 return False
         cap = self.cfg.capture
         with contextlib.suppress(cmd.CommandError):
-            if self._tun_problem(rules):
+            if tun and self._tun_problem(rules):
                 return False
             for family in self._families():
                 tproxy, via_tun = self._wanted(rules, family)
@@ -547,6 +548,14 @@ class Capture:
     def describe(self, *, check: bool = True) -> dict:
         """Сведения для `xgw status`."""
         rules = self.rules("on")
+        loaded = self.loaded() if check else None
+        # Правила на месте, не готов только интерфейс TUN (нет адреса): это не «правила не
+        # загружены» — у `xgw diag` на это своя строка, а `xgw status` называет причину.
+        tun_only = ""
+        if loaded is False:
+            problem = self.tun_problem()
+            if problem and self.loaded(tun=False) is True:
+                tun_only = problem
         return {
             "mode": self.mode(),
             "lan_if": rules.lan_if,
@@ -560,7 +569,8 @@ class Capture:
             # стоит говорить в статусе.
             "docker": bool(lan.container_links(rules.containers, self.sys_net)),
             "fail_mode": self.cfg.capture.fail_mode,
-            "loaded": self.loaded() if check else None,
+            "loaded": loaded,
+            "tun_problem": tun_only,
             # Перехват включён, но Xray работает без нужного inbound'а: вместо правил
             # перехвата загружен режим «снят», трафик идёт напрямую (см. _load). Здесь —
             # чего не хватает; пусто — всё на месте.

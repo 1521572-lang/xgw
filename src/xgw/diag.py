@@ -615,7 +615,7 @@ class Diag:
             return [Check(
                 "IPv6", WARN, "перехват снят — IPv6 идёт напрямую, мимо VPN", "sudo xgw enable"
             )]
-        if info["loaded"] is False or not info["ipv6"]:
+        if (info["loaded"] is False and not info.get("tun_problem")) or not info["ipv6"]:
             if self.preinstall:
                 return [Check("IPv6", WARN, "IPv6 проксируется, но его правила не загружены",
                               "установка загрузит их заново")]
@@ -697,10 +697,12 @@ class Diag:
         if self.root:
             capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
             info = capture.describe()
-            if info["mode"] == "on" and info["loaded"] is False and self.preinstall:
+            # Не готов только интерфейс TUN — правила на месте: об этом строка «TUN».
+            missing = info["loaded"] is False and not info.get("tun_problem")
+            if info["mode"] == "on" and missing and self.preinstall:
                 result.append(Check("Перехват", WARN, "включён, но правила не загружены",
                                     "установка загрузит их заново"))
-            elif info["mode"] == "on" and info["loaded"] is False:
+            elif info["mode"] == "on" and missing:
                 result.append(Check("Перехват", FAIL, "включён, но правила не загружены",
                                     "sudo xgw net up"))
             elif info["mode"] in ("off", "open"):

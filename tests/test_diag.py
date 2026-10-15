@@ -422,6 +422,9 @@ def test_tun_of_the_containers_is_checked_with_its_address(box, tmp_path, monkey
     broken = box.diag()._tun()
     assert [c.level for c in broken] == [FAIL] and tun.ADDRESS in broken[0].text
     assert broken[0].advice == "sudo xgw net up"
+    # Правила при этом на месте: строка «Перехват» не говорит «правила не загружены».
+    rules = [c for c in box.diag()._services() if c.name == "Перехват"]
+    assert [(c.level, c.text) for c in rules] == [(OK, "включён, правила загружены")]
     assert box.diag(preinstall=True)._tun()[0].level == WARN
     assert capture.up() == "on" and [c.level for c in box.diag()._tun()] == [OK]
 

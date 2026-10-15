@@ -374,7 +374,9 @@ def render_capture(capture: dict) -> str:
     text = "Перехват: включён — " + join_ru(scope)
     if capture.get("bypass"):
         text += "; мимо VPN: " + ", ".join(capture["bypass"])
-    if capture.get("loaded") is False:
+    if capture.get("loaded") is False and capture.get("tun_problem"):
+        text += f" — ИНТЕРФЕЙС TUN НЕ ГОТОВ: {capture['tun_problem']} (sudo xgw net up)"
+    elif capture.get("loaded") is False:
         text += " — ПРАВИЛА НЕ ЗАГРУЖЕНЫ (sudo xgw enable)"
     return text
 

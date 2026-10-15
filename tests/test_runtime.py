@@ -156,6 +156,16 @@ def test_status_line_tells_whether_ipv6_is_captured():
     assert status.render_capture({**capture, "tun": True}).endswith("эта машина через TUN")
 
 
+def test_status_line_names_the_tun_when_only_the_interface_is_not_ready():
+    capture = {"mode": "on", "lan_if": "lan0", "lan": True, "local": True, "bypass": [],
+               "loaded": False, "tun_problem": ""}
+    assert status.render_capture(capture).endswith("ПРАВИЛА НЕ ЗАГРУЖЕНЫ (sudo xgw enable)")
+    problem = "у интерфейса xgwtun0 нет адреса 169.254.10.1/32 или он не поднят"
+    line = status.render_capture({**capture, "tun_problem": problem})
+    assert line.endswith(f"ИНТЕРФЕЙС TUN НЕ ГОТОВ: {problem} (sudo xgw net up)")
+    assert "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" not in line
+
+
 def test_pid_alive():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:

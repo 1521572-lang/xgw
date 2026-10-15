@@ -355,17 +355,17 @@ dnsmasq выдаёт один адрес самому роутеру (двойн
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"   # Windows: .venv\Scripts\python
-.venv/bin/python -m pytest tests/ -q          # юнит-тесты (без root)
+.venv/bin/python -m pytest tests/             # юнит-тесты (без root)
 .venv/bin/python -m ruff check src tests      # линтер
 ```
 
-- Golden-файлы пересоздаются `XGW_REGEN_GOLDEN=1 pytest tests/ -q`
+- Golden-файлы пересоздаются `XGW_REGEN_GOLDEN=1 pytest tests/`
   (используйте только после осознанного изменения генератора).
 - Скачивание Xray для локальной проверки: см. `xgw.xraycore.binary`
   (`download_release`), кладётся в `tools/xray` (gitignored).
 - Тесты на живом Xray — синтаксис `xray api` (`tests/test_api_integration.py`) и
   применение конфига генератор → Applier → ядро (`tests/test_apply_live.py`):
-  `XGW_XRAY_BIN=<путь к xray> pytest tests/ -q`; без переменной они пропускаются.
+  `XGW_XRAY_BIN=<путь к xray> pytest tests/`; без переменной они пропускаются.
 - Тесты https-проб через CONNECT выпускают временный самоподписанный сертификат
   командой `openssl`; без неё пропускаются.
 - Панель на выдуманных данных, без шлюза и без root:
@@ -383,7 +383,7 @@ python3 -m venv .venv
 реле с режимами `pass`, `freeze_after=N`, `drop`, `blackhole`.
 
 ```bash
-XGW_XRAY_BIN=/opt/xgw/xray/xray .venv/bin/python -m pytest tests/stand -q   # ~2,5 минуты
+XGW_XRAY_BIN=/opt/xgw/xray/xray .venv/bin/python -m pytest tests/stand   # ~2,5 минуты
 ```
 
 - Режим **loopback** — все процессы на 127.0.0.1, root не нужен, работает и на
