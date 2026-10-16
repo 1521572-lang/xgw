@@ -247,6 +247,18 @@ class Diag:
                 "Xray", FAIL, f"версия {text}, но поля httpMethod в бинарнике нет",
                 "sudo xgw update-xray",
             )]
+        wanted = self.cfg.xray.version
+        if wanted not in ("", "latest"):
+            try:
+                other = binary.parse_version(wanted) != version
+            except binary.BinaryError:
+                other = False  # о неверной записи предупреждает проверка конфига
+            if other:
+                return [Check(
+                    "Xray", WARN, f"версия {text}, а в конфиге xray.version = {wanted}",
+                    "установка поставит нужную версию" if self.preinstall
+                    else "sudo xgw update-xray",
+                )]
         return [Check("Xray", OK, f"версия {text}, GET-проверка (httpMethod) поддерживается")]
 
     def xray_up(self) -> bool:

@@ -1066,7 +1066,10 @@ def test_tun_method_on_the_installed_system(gw):
     index = box.sh("cat /sys/class/net/xgwtun0/ifindex").strip()
     box.sh("systemctl stop xgw")  # демон не должен сам поднять Xray посреди проверки
     box.sh("systemctl stop xgw-xray")
-    assert "NO-CARRIER" in box.sh("ip link show xgwtun0")
+    # 26.3.27 оставляет интерфейс поднятым (NO-CARRIER), 26.10.10 выключает его: маршрут
+    # через него пропадает, а запросы машины — в чёрную дыру, не мимо VPN. После запуска
+    # xgw-xray.service маршрут возвращает сам (xgw net tun).
+    assert "LOWER_UP" not in box.sh("ip link show xgwtun0")
     assert stand.exit_ip("gw") == ""
     box.sh("systemctl start xgw-xray")
     assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 40, step=2)

@@ -92,9 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     net = subparsers.add_parser(
         "net", parents=[common],
-        help="правила сети: загрузить (up, служба xgw-net), убрать (down), показать (show)",
+        help="правила сети: загрузить (up, служба xgw-net), убрать (down), показать (show); "
+        "tun — вернуть интерфейс TUN и маршруты в него после запуска Xray (xgw-xray.service)",
     )
-    net.add_argument("action", choices=("up", "down", "show"))
+    net.add_argument("action", choices=("up", "down", "show", "tun"))
     net.add_argument(
         "what", nargs="?", choices=("nft", "dnsmasq"), default="nft",
         help="что показать: правила nftables (по умолчанию) или конфиг dnsmasq",
@@ -497,6 +498,12 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
         return _fail(problem)
     paths.ensure()
     try:
+        if args.action == "tun":
+            done = capture.restore_tun()
+            if done:
+                print(done)
+                logger.info("%s", done)
+            return 0
         if args.action == "down":
             capture.down()
             print("правила XGW убраны: таблицы nftables, ip rule и маршрут")

@@ -442,6 +442,28 @@ def test_capture_is_not_loaded_when_the_tun_interface_did_not_appear(gateway_tun
     assert gateway.describe(check=False)["inbound_missing"] == gateway.held
 
 
+def test_tun_and_its_route_come_back_after_xray_starts_again(gateway_tun):
+    """Xray новее 26.3.27 при остановке выключает интерфейс, и ядро удаляет маршрут через
+    него. `xgw net tun` (его вызывает xgw-xray.service после запуска) возвращает и то и
+    другое, а правил nftables не трогает."""
+    gateway = gateway_tun
+    kernel = gateway.kernel
+    assert gateway.restore_tun() == ""  # перехват ещё не загружен — делать нечего
+    assert gateway.enable() == "on"
+    kernel.up.discard("xgwtun0")  # Xray остановился: интерфейс выключен,
+    kernel.routes(101)[:] = [r for r in kernel.routes(101) if r.get("dev") != "xgwtun0"]
+    assert gateway.loaded() is False  # маршрута в него нет
+    tables = dict(kernel.tables)
+    assert gateway.restore_tun() == "интерфейс xgwtun0 поднят, маршруты в него на месте"
+    assert "xgwtun0" in kernel.up
+    assert {route.get("dev") for route in kernel.routes(101)} >= {"xgwtun0"}
+    assert kernel.tables == tables and gateway.loaded() is True
+    # Перехват снят — маршруты в интерфейс не нужны.
+    assert gateway.disable() == "off"
+    assert gateway.restore_tun() == ""
+    assert "xgwtun0" not in {route.get("dev") for route in kernel.routes(101)}
+
+
 def test_tun_interface_goes_away_after_switching_back_to_tproxy(gateway_tun):
     """capture.method вернули на tproxy: интерфейс xgwtun0 больше не нужен. Пока Xray ещё
     работает с inbound'ом TUN, интерфейс остаётся (иначе Xray остался бы с оборванным

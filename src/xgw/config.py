@@ -144,9 +144,16 @@ class Dns:
     )
 
 
+# Версия Xray-core по умолчанию — та, на которой XGW проверен целиком (юнит-тесты, все
+# стенды, «одноразовая машина»). 26.10.10 — предварительный выпуск (pre-release): последний
+# стабильный на 16.10.2026 — 26.3.27, и на нём XGW тоже проверен (ASSUMPTIONS, п. 181).
+# "latest" в конфиге — последний стабильный релиз GitHub.
+XRAY_VERSION = "26.10.10"
+
+
 @dataclass
 class XraySection:
-    version: str = "latest"
+    version: str = XRAY_VERSION
     api_port: int = 10085
     metrics_port: int = 10086
     socks_port: int = 10808

@@ -136,8 +136,10 @@ direct_servers = ["77.88.8.8"]
 bootstrap = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "udp://77.88.8.8"]
 
 [xray]
-# "latest" или конкретная версия, не ниже 25.7.23.
-version = "latest"
+# Версия Xray-core, не ниже 25.7.23. По умолчанию — 26.10.10, предварительный выпуск, на
+# котором XGW проверен; "latest" — последний стабильный релиз GitHub (26.3.27 на 16.10.2026).
+# Сменили — sudo xgw update-xray.
+version = "26.10.10"
 api_port = 10085
 metrics_port = 10086
 socks_port = 10808

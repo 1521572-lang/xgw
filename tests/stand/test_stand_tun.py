@@ -121,15 +121,21 @@ def test_gateway_traffic_goes_through_tun_and_lan_stays_on_tproxy(gateway):
 def test_tun_is_fail_closed_and_recovers_when_xray_returns(gateway):
     assert gateway.exit_ip("gw") == VIA_VPN
     gateway.xray_service().stop()
-    assert TUN in _link(gateway) and "NO-CARRIER" in gateway.gw_run("ip", "link", "show", TUN)
+    # Xray 26.3.27 оставляет интерфейс поднятым (NO-CARRIER), 26.10.10 выключает его, и
+    # маршрут через него ядро удаляет: в обоих случаях — чёрная дыра, а не мимо VPN.
+    assert TUN in _link(gateway) and "LOWER_UP" not in gateway.gw_run("ip", "link", "show", TUN)
     assert gateway.exit_ip("gw") == ""  # ни через VPN, ни мимо
     assert gateway.exit_ip("lan") == ""
     assert gateway.exit_ip("gw", "--mark", "2") == DIRECT  # запросы самого XGW — напрямую
 
-    # Xray вернулся и подключился к тому же интерфейсу: никаких действий XGW не нужно.
+    # Xray вернулся и подключился к тому же интерфейсу; после запуска XGW возвращает
+    # интерфейс и маршрут (так делает xgw-xray.service — `xgw net tun`).
     config = gateway.root / "etc/xgw/xray/config.json"
     gateway.gw_popen("xray-again", [str(gateway.xray_bin), "run", "-c", str(config)])
+    restored = gateway.xgw("net", "tun")
+    assert restored.returncode == 0, restored.stdout + restored.stderr
     assert wait_for(lambda: gateway.exit_ip("gw") == VIA_VPN, 20)
+    assert f"default dev {TUN}" in _routes(gateway)
 
 
 def test_tun_follows_enable_disable_and_net_down(gateway):
@@ -256,7 +262,10 @@ def test_validation_does_not_fight_the_running_xray_for_the_interface(gateway):
     assert gateway.exit_ip("gw") == VIA_VPN
     config = gateway.root / "etc/xgw/xray/config.json"
     control = gateway.run_in("gw", str(gateway.xray_bin), "run", "-test", "-c", str(config))
-    assert control.returncode != 0, control.stdout + control.stderr  # занято работающим Xray
+    # Занято работающим Xray (26.3.27); 26.10.10 в режиме -test интерфейс не открывает, и
+    # спорить ему не о чем — одноразовое имя XGW тогда просто не нужно.
+    assert control.returncode != 0 or "Configuration OK" in control.stdout, (
+        control.stdout + control.stderr)
     applied = gateway.xgw("apply")
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert gateway.exit_ip("gw") == VIA_VPN  # и сам Xray это не задело

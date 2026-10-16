@@ -404,6 +404,32 @@ class Capture:
         self.log.info("%s", text)
         return text
 
+    def restore_tun(self) -> str:
+        """После запуска Xray: интерфейс TUN поднят, с адресом, и маршруты в него на месте.
+
+        Xray новее 26.3.27 при остановке выключает интерфейс (ip link set down), и ядро
+        удаляет маршруты через него. Запустившись снова, Xray интерфейс поднимает, а
+        маршрута уже нет: трафик машины (capture.method = "tun") и контейнеров уходил бы в
+        чёрную дыру до ближайшего шага демона. Поэтому xgw-xray.service после каждого
+        запуска вызывает `xgw net tun`. Правила nftables здесь не загружаются: перехват
+        снят или ещё не загружен — делать нечего. Возвращает, что сделано; пусто — ничего
+        не понадобилось."""
+        with self._lock():
+            if self.effective_mode() != "on":
+                return ""
+            rules = self.rules("on")
+            if not (rules.tun or self._containers_tun(rules)):
+                return ""
+            try:
+                chains = nft.loaded_chains(self.runner) or set()
+                if not chains & {"output", "containers"}:
+                    return ""
+                tun.ensure(rules.tun_name, self.runner, self.proc_sys)
+                self._routes_up(rules)
+            except (cmd.CommandError, OSError) as exc:
+                raise CaptureError(str(exc)) from exc
+            return f"интерфейс {rules.tun_name} поднят, маршруты в него на месте"
+
     def up(self) -> str:
         """Загружает правила текущего режима (после перезагрузки, после сбоя)."""
         with self._lock():

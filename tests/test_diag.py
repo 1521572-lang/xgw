@@ -133,6 +133,7 @@ def test_missing_programs(box):
 def test_xray_version_and_get_probe_support(box, monkeypatch):
     box.paths.xray_dir.mkdir(parents=True)
     box.paths.xray_bin.write_bytes(b"...httpMethod...")
+    box.cfg.xray.version = "latest"  # сверка с версией из конфига — в отдельной проверке
     instance = box.diag()
     monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 3, 27))
     assert instance._xray()[0].level == OK
@@ -144,6 +145,26 @@ def test_xray_version_and_get_probe_support(box, monkeypatch):
     monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 3, 27))
     box.paths.xray_bin.write_bytes(b"xray without the field")
     assert "httpMethod в бинарнике нет" in instance._xray()[0].text
+
+
+def test_xray_other_than_the_configured_version_is_a_warning(box, monkeypatch):
+    """В конфиге одна версия, установлена другая (обновили XGW, а Xray остался прежним):
+    WARN с советом update-xray; при "latest" подходит любая не ниже минимальной."""
+    box.paths.xray_dir.mkdir(parents=True)
+    box.paths.xray_bin.write_bytes(b"...httpMethod...")
+    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 3, 27))
+    assert box.cfg.xray.version == config.XRAY_VERSION == "26.10.10"
+    other = box.diag()._xray()[0]
+    assert other.level == WARN and "xray.version = 26.10.10" in other.text
+    assert other.advice == "sudo xgw update-xray"
+    assert box.diag(preinstall=True)._xray()[0].advice == "установка поставит нужную версию"
+    box.cfg.xray.version = "latest"
+    assert box.diag()._xray()[0].level == OK
+    box.cfg.xray.version = "26.3.27"
+    assert box.diag()._xray()[0].level == OK
+    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 10))
+    box.cfg.xray.version = config.XRAY_VERSION
+    assert box.diag()._xray()[0].level == OK
 
 
 def test_kernel_refusing_the_rules_is_a_failure(box):

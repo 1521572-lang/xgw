@@ -215,7 +215,12 @@ class Stand:
                 "listen": "127.0.0.1", "port": server.listen_port, "protocol": "vless",
                 "settings": {"clients": [{"id": UUID}], "decryption": "none"},
             }],
-            "outbounds": [{"protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}],
+            # finalRules: с 26.10.10 freedom за VLESS-inbound'ом по умолчанию не пускает к
+            # частным адресам и loopback (защита сервера), а «интернет» стенда в режиме
+            # loopback — это 127.0.0.1. Xray 26.3.27 поля не знает и пропускает.
+            "outbounds": [{"protocol": "freedom", "settings": {
+                "domainStrategy": "UseIPv4", "finalRules": [{"action": "allow"}],
+            }}],
         }
         config_path = self.workdir / f"server-{name}.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -335,6 +340,9 @@ direct_servers = {direct_dns}
 bootstrap = ["udp://{self.inet_ip}:{self.dns_port}"]
 
 [xray]
+# Стенд проверяет тот Xray, что дан в XGW_XRAY_BIN, какой бы версии он ни был: установка
+# на «одноразовой машине» его не меняет (сети там нет).
+version = "latest"
 api_port = {self.ports['api']}
 metrics_port = {self.ports['metrics']}
 socks_port = {self.ports['socks']}
