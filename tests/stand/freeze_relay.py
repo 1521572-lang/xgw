@@ -17,6 +17,9 @@ TCP-реле между шлюзом и сервером. Режим читае�
 Счётчик байтов — на каждое соединение отдельно, поэтому короткая проверка
 (HEAD, пинг) «заморозку» не замечает.
 
+Число принятых соединений реле пишет в файл «<mode-file>.count»: по нему стенд видит,
+ходит ли кто-нибудь через этот сервер (например, пробует ли его observatory ядра).
+
 Запуск: python freeze_relay.py --listen 127.0.0.1:9001 --upstream 127.0.0.1:9101 --mode-file f
 """
 
@@ -164,9 +167,14 @@ def main() -> None:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(_address(args.listen))
     server.listen(64)
+    counter = Path(args.mode_file + ".count")
+    accepted = 0
+    counter.write_text("0", encoding="ascii")
     print("READY", flush=True)
     while True:
         client, _peer = server.accept()
+        accepted += 1
+        counter.write_text(str(accepted), encoding="ascii")
         threading.Thread(target=Connection(client, upstream, mode).run, daemon=True).start()
 
 

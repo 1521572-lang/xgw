@@ -459,13 +459,23 @@ def test_budget_uses_known_nodes(box):
 
     store = Store(box.paths.db_file)
     store.replace_nodes([
-        {"fingerprint": "a", "tag": "proxy-a", "role": "proxy", "name": "A", "source": "s",
+        {"fingerprint": "a", "tag": "proxy-a", "role": "proxy", "name": "A", "source": "main",
          "address": "a.example.com", "port": 443, "updated": 1},
     ])
     store.set_meta("quota", json.dumps({"main": {"total": 10**9, "upload": 0, "download": 0}}))
     store.close()
     quota = box.diag()._budget()[0]
     assert quota.level == WARN and "10 % остатка квоты" in quota.text
+    assert "(с множителями серверов)" in quota.text
+    # Квота относится к подписке своих серверов: проверки серверов другой (безлимитной)
+    # подписки её не тратят.
+    store = Store(box.paths.db_file)
+    store.replace_nodes([
+        {"fingerprint": "a", "tag": "proxy-a", "role": "proxy", "name": "A", "source": "free",
+         "address": "a.example.com", "port": 443, "updated": 1},
+    ])
+    store.close()
+    assert box.diag()._budget()[0].level == OK
 
 
 def test_network_probes(box, monkeypatch):

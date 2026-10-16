@@ -11,7 +11,7 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
-from .. import priority
+from .. import cost
 from ..config import Config
 from ..model import ServerNode
 from ..net import sysctl
@@ -46,8 +46,12 @@ class Selection:
     # (junk — служебные адреса, ipv6, filter — фильтр имён, dns — домен не разрешается,
     # excluded — отключены или убраны в панели, duplicates — схлопнутые дубли).
     stats: dict[str, int] = field(default_factory=dict)
-    # Ранг уровня приоритета участников (priority.py): все участники — одного уровня.
-    tier: int = 1
+    # Класс участников (cost.py): приоритет и стоимость — все участники одного класса.
+    tier: cost.Klass = field(default_factory=lambda: cost.Klass(1, 0.0))
+    # Резервный выход балансировщика (fallbackTag): запасной класса хуже, чем у
+    # участников. Через него трафик идёт, только когда все участники мертвы; observatory
+    # его не пробует. None — классов хуже нет, fallbackTag — первый участник.
+    reserve: ServerNode | None = None
 
 
 @dataclass
@@ -106,7 +110,8 @@ def skip_reason(
 
 def select_nodes(
     nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = (),
-    dead: Collection[str] = (), tier: int | None = None,
+    dead: Collection[str] = (), tier: cost.Klass | None = None,
+    costs: Mapping[str, float] | None = None, reserve: str | None = None,
 ) -> Selection:
     """Фильтры по имени, отбрасывание служебных адресов, дедупликация,
     канонический порядок (стабилен при любом порядке входных ссылок).
@@ -119,10 +124,17 @@ def select_nodes(
     dead — домены, которых нет в DNS: серверы с такими адресами в конфиг не попадают
     и пробы на них не тратятся, пока домен не появится снова (см. engine).
 
-    tier — ранг уровня приоритета участников (priority.py). Участники — только серверы
-    этого уровня, даже если их меньше max_members: иначе более быстрый сервер уровня
-    ниже отбирал бы трафик у живого сервера уровня выше. Остальные — запасные. Без tier
-    (или если серверов такого уровня нет) берётся наивысший уровень из имеющихся.
+    tier — класс участников (cost.py): приоритет и стоимость. Участники — только серверы
+    этого класса, даже если их меньше max_members: иначе более быстрый сервер класса
+    хуже отбирал бы трафик у живого сервера класса лучше — например, лимитированный у
+    безлимитного. Остальные — запасные. Без tier (или если серверов такого класса нет)
+    берётся лучший класс из имеющихся.
+
+    costs — стоимость серверов по отпечаткам (cost.costs); без неё все безлимитные.
+
+    reserve — отпечаток запасного, которому быть резервным выходом (его выбирает демон
+    по дешёвой проверке). Годится только запасной класса хуже, чем у участников; без
+    него резервный — первый запасной лучшего из таких классов.
     """
     warnings: list[str] = []
     stats = dict.fromkeys(("total", "junk", "ipv6", "filter", "dns", "excluded", "duplicates"), 0)
@@ -160,9 +172,10 @@ def select_nodes(
         unique[node.fingerprint] = node
 
     levels = cfg.managed.priority
-    ranks = {fingerprint: priority.rank(levels, fingerprint) for fingerprint in unique}
+    prices = costs if costs is not None else dict.fromkeys(unique, 0.0)
+    ranks = {fingerprint: cost.klass(levels, prices, fingerprint) for fingerprint in unique}
     present = sorted(set(ranks.values()))
-    active = tier if tier in present else (present[0] if present else 1)
+    active = tier if tier in present else (present[0] if present else cost.Klass(1, 0.0))
     limit = max(1, cfg.filters.max_members)
     members: list[ServerNode] = []
     for fingerprint in prefer:
@@ -182,13 +195,20 @@ def select_nodes(
     members.extend(same)
     taken = {node.fingerprint for node in same}
     spares = [node for node in rest if node.fingerprint not in taken]
+    worse = sorted(
+        (node for node in spares if ranks[node.fingerprint] > active),
+        key=lambda node: (ranks[node.fingerprint], node.fingerprint, node.name),
+    )
+    backup = next((node for node in worse if node.fingerprint == reserve), None)
+    if backup is None and worse:
+        backup = worse[0]
 
     # Звенья цепочек нужны, только пока на них ссылается хоть один оставленный узел.
     kept = [*members, *spares]
     chains = _referenced_chains(kept, chains)
     return Selection(
         members=members, spares=spares, chains=chains, warnings=warnings, stats=stats,
-        tier=active,
+        tier=active, reserve=backup,
     )
 
 
@@ -288,6 +308,35 @@ def member_fingerprints(config: Mapping | None, nodes: Sequence[ServerNode]) -> 
         if len(set(found)) == 1 and found[0] not in result:
             result.append(found[0])
     return result
+
+
+def reserve_tag(config: Mapping | None) -> str:
+    """Тег резервного выхода из применённого конфига: fallbackTag балансировщика, если
+    это запасной (spare-*); пусто — резервного нет, fallbackTag — участник."""
+    if not isinstance(config, Mapping):
+        return ""
+    routing = config.get("routing")
+    balancers = routing.get("balancers") if isinstance(routing, Mapping) else None
+    for balancer in balancers if isinstance(balancers, list) else []:
+        if isinstance(balancer, Mapping) and balancer.get("tag") == BALANCER_TAG:
+            tag = str(balancer.get("fallbackTag") or "")
+            match = _TAG_RE.match(tag)
+            return tag if match and match.group(1) == "spare" else ""
+    return ""
+
+
+def reserve_fingerprint(config: Mapping | None, nodes: Sequence[ServerNode]) -> str | None:
+    """Отпечаток резервного выхода применённого конфига — для select_nodes(reserve=…)."""
+    match = _TAG_RE.match(reserve_tag(config))
+    if not match:
+        return None
+    country, prefix = match.group(2), match.group(3)
+    found = {
+        node.fingerprint
+        for node in nodes
+        if not node.keep_tag and node.country == country and node.fingerprint.startswith(prefix)
+    }
+    return found.pop() if len(found) == 1 else None
 
 
 def _allocate_ports(
@@ -602,7 +651,14 @@ def build(
         )
     rules.append({"type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG})
 
+    # Резервный выход — запасной класса хуже (дешёвый лимитированный): через него трафик
+    # идёт, только когда observatory считает мёртвыми всех участников. В subjectSelector
+    # он не входит, поэтому ядро его не пробует. Нет резервного — первый участник.
     fallback_tag = nodes[0].tag
+    if selection.reserve is not None:
+        fallback_tag = next(
+            info.tag for info in nodes if info.fingerprint == selection.reserve.fingerprint
+        )
     dns_servers: list[object] = []
     if cfg.routing.direct_domains:
         for address, port in direct_dns:

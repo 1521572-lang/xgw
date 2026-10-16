@@ -2,6 +2,11 @@
 
 Классы (раздел 6.8): OK, SLOW, FROZEN (часть тела, затем тишина — фиксируем
 число байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT.
+
+Запасные лимитированных подписок проверяются дешёвым запросом (cheap_url, обычно
+probe.trace_url — сотни байт вместо 57 КБ): каждый байт через такой сервер тратит квоту,
+да ещё с множителем (cost.py). «Заморозку» такой запрос не ловит — её поймает первая
+проверка сервера, когда он станет участником (daemon.Daemon._queue_members).
 """
 
 from __future__ import annotations
@@ -15,6 +20,19 @@ from ..generator.builder import PROBE_USER, NodeInfo
 from .checks import DownloadResult, http_get_via_proxy
 
 SLOW_SECONDS = 3.0  # эмпирический порог «медленно, но живо»
+# Сколько трафика уходит на одну дешёвую проверку: ответ trace_url — несколько сотен
+# байт, остальное — рукопожатие TLS (цепочка сертификатов) и заголовки. Оценка сверху.
+CHEAP_SCAN_BYTES = 8_000
+# Резервный выход балансировщика и лучшие кандидаты на его место (запасные лимитированных
+# подписок классом хуже участников) проверяются дешёвым запросом раз в RESERVE_RECHECK —
+# по RESERVE_CANDIDATES лучших (daemon.Daemon._reserve_step).
+RESERVE_RECHECK = 6 * 3600.0
+RESERVE_CANDIDATES = 3
+
+
+def cheap_url(cfg: Config) -> str:
+    """Адрес дешёвой проверки: probe.trace_url, а без него — probe.url."""
+    return cfg.probe.trace_url.strip() or cfg.probe.url
 
 
 @dataclass

@@ -336,7 +336,7 @@ def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     assert state["subscriptions"] == [{
         "name": "main", "host": "sub.example.net", "secure": True, "managed": False,
         "servers": 4, "fetched": None, "error": "",  # с отключённым, без служебной записи
-        "quota": {"upload": 1, "download": 2, "total": 10},
+        "quota": {"upload": 1, "download": 2, "total": 10}, "limited": True,
     }]
     assert state["sources"] == ["main", "manual"]
     by_name = {server["name"]: server for server in state["servers"]}
@@ -669,7 +669,7 @@ def test_server_is_disabled_removed_and_returned(rig, user):
     assert "bbbb2222" not in [s["fingerprint"] for s in state["servers"]]
     assert state["removed"] == [
         {"fingerprint": "bbbb2222", "name": "DE-1", "source": "main", "protocol": "vless",
-         "priority": "medium"}]
+         "priority": "medium", "multiplier": 1.0}]  # у подписки «main» есть лимит трафика
 
     result = user.act("servers", {"fingerprints": ["bbbb2222"], "mode": "enabled"})
     assert result["text"] == "сервер «DE-1» возвращён в список"
@@ -828,6 +828,35 @@ def test_state_carries_the_probe_budget_the_node_summary_and_the_probe_url_warni
         assert block in page
     script = user.request("GET", "/app.js")[1]
     for text in ("PROBE_TARGET_UNREACHABLE", "ГБ в месяц", "Это больше лимита", "inbound_missing"):
+        assert text in script
+
+
+def test_state_shows_multipliers_the_reserve_and_unlimited_subscriptions(rig, user):
+    """Подписка «main» — с лимитом трафика: у её серверов множитель расхода; резервный
+    выход отмечен; пока трафик идёт через него (RESERVE), страница говорит об этом."""
+    snapshot = _snapshot()
+    snapshot["spares"][0].update(reserve=True)
+    snapshot["reserve"] = {"tag": "spare-fi-cccc", "name": "FI-1", "source": "main",
+                           "multiplier": 1.0, "cost": 1.0}
+    snapshot["state"] = "RESERVE"
+    status.write_status(rig.paths, snapshot)
+    state = user.state()
+    by_name = {server["name"]: server for server in state["servers"]}
+    assert by_name["FI-1"]["reserve"] is True and by_name["FI-1"]["multiplier"] == 1.0
+    assert by_name["NL-1"]["multiplier"] == 1.0 and "reserve" not in by_name["NL-1"]
+    assert "multiplier" not in by_name["Осталось 5 ГБ"]  # служебная запись — не сервер
+    assert state["reserve"]["name"] == "FI-1" and state["state"] == "RESERVE"
+    assert state["subscriptions"][0]["limited"] is True
+    # Подписка без лимита трафика: множителей нет, подписка — безлимитная.
+    snapshot["quota"] = {"main": {"upload": 1, "download": 2, "total": 0}}
+    status.write_status(rig.paths, snapshot)
+    state = user.state()
+    assert all("multiplier" not in server for server in state["servers"])
+    assert state["subscriptions"][0]["limited"] is False
+    page = user.request("GET", "/")[1]
+    assert 'id="reserve-note"' in page
+    script = user.request("GET", "/app.js")[1]
+    for text in ("Работает резервный сервер", "резервный", "Безлимитная", "осталось"):
         assert text in script
 
 

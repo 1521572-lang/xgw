@@ -3,7 +3,13 @@
 какое действие выполнить (обновить подписку, переприменить правила, уведомить).
 
 Приоритет состояний (что важнее при одновременных сбоях):
-XRAY_DOWN > WAN_DOWN > LEAK > PROBE_TARGET_UNREACHABLE > ALL_DEAD > DEGRADED > HEALTHY.
+XRAY_DOWN > WAN_DOWN > LEAK > PROBE_TARGET_UNREACHABLE > ALL_DEAD > RESERVE > DEGRADED >
+HEALTHY.
+
+RESERVE — участники балансировщика мертвы, но трафик идёт: его несёт резервный выход
+(fallbackTag — лимитированный сервер, builder.select_nodes), и сквозная проверка через
+него проходит. Как только участник оживёт, Xray вернётся к нему сам. Если сквозная
+проверка не проходит fail_threshold шагов подряд, не работает и резервный — ALL_DEAD.
 
 PROBE_TARGET_UNREACHABLE — не отвечает сам адрес пробы (probe.url), а не серверы:
 пробы падают у всех одинаково, хотя трафик через VPN идёт (watch/target.py). Оно важнее
@@ -25,6 +31,7 @@ class State(StrEnum):
     XRAY_DOWN = "XRAY_DOWN"
     LEAK = "LEAK"
     PROBE_TARGET_UNREACHABLE = "PROBE_TARGET_UNREACHABLE"
+    RESERVE = "RESERVE"
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,7 @@ class Signals:
     e2e_fail_streak: int = 0
     leak: bool = False             # trace_url вышел в home_country
     probe_target_ok: bool = True   # False — не отвечает сам probe.url, а не серверы
+    reserve: bool = False          # у балансировщика есть резервный выход (запасной)
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,8 @@ class StateDecision:
 _ACTIONS = {
     State.HEALTHY: "вмешательство не требуется",
     State.DEGRADED: "часть серверов недоступна — замена на запасные",
+    State.RESERVE: "серверы в работе не отвечают — трафик идёт через резервный сервер; "
+    "Xray вернётся к ним сам, как только они ответят; поиск замены среди запасных",
     State.ALL_DEAD: "живых серверов нет — обновление подписки напрямую, скан запасных, замена",
     State.WAN_DOWN: "нет связи с провайдером — тишина, проверки раз в 60 с",
     State.XRAY_DOWN: "Xray не отвечает — перезапуск службы, после двух неудач откат на last-good",
@@ -79,6 +89,12 @@ class StateMachine:
             self.state = State.LEAK
         elif not signals.probe_target_ok:
             self.state = State.PROBE_TARGET_UNREACHABLE
+        elif all_dead and signals.reserve and (
+            signals.e2e_ok
+            # Разовый сбой проверки через резервный — ещё не повод для ALL_DEAD.
+            or (self.state is State.RESERVE and signals.e2e_fail_streak < self.fail_threshold)
+        ):
+            self.state = State.RESERVE
         elif all_dead or (
             signals.e2e_fail_streak >= self.fail_threshold and not signals.e2e_ok
         ):

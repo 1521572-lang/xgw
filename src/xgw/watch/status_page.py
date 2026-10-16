@@ -24,7 +24,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from .. import log
+from .. import cost, log
 from ..config import Config
 from ..net import dnsmasq, lan
 from ..paths import Paths, atomic_write_text
@@ -148,9 +148,18 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
     parts.append("<h2>Участники балансировщика</h2>")
     parts.append(_table(["Тег", "Сервер", "Состояние", "Задержка"], members, "нет участников"))
 
+    reserve = snapshot.get("reserve")
+    if reserve:
+        # Резервный выход: через него трафик идёт, только когда все участники мертвы.
+        working = " — сейчас трафик идёт через него" if state == "RESERVE" else ""
+        parts.append(
+            f'<p class="note">Резервный выход: {_esc(reserve.get("name") or reserve.get("tag"))}'
+            f' ({_esc(cost.describe(float(reserve.get("cost") or 0.0)))}){_esc(working)}</p>'
+        )
     spares = [
         [
-            _esc(spare.get("tag")), _esc(spare.get("name")),
+            _esc(spare.get("tag")) + (" (резервный)" if spare.get("reserve") else ""),
+            _esc(spare.get("name")),
             _esc(spare.get("verdict") or "не проверялся"),
             _esc(f"{spare['bytes']} Б за {spare['seconds']} с" if spare.get("verdict") else "—"),
             _esc(_clock(spare.get("scanned"))),

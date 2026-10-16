@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, fetch, log, marknet, masking, priority
+from . import config, cost, fetch, log, marknet, masking
 from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
 from .model import ServerNode, raw_to_node
@@ -253,30 +253,37 @@ def assemble(
     xray_bin: Path | None,
     check: bool = True,
     prefer: list[str] | None = None,
-    tier: int | None = None,
+    tier: cost.Klass | None = None,
+    reserve: str | None = None,
 ) -> Assembly:
     """Конфиг Xray из известных серверов.
 
-    Состав участников, порты и пароль проб берутся из применённого конфига:
-    обновление подписки не должно перетасовывать то, что уже работает в ядре.
+    Состав участников, резервный выход, порты и пароль проб берутся из применённого
+    конфига: обновление подписки не должно перетасовывать то, что уже работает в ядре.
     prefer — явный состав участников (замена «мёртвого» при ротации).
-    tier — ранг уровня приоритета участников (смена уровня демоном); по умолчанию —
-    уровень нынешних участников: обновление подписки уровень не меняет.
+    tier — класс участников (смена класса демоном, cost.py); по умолчанию — класс
+    нынешних участников: обновление подписки его не меняет.
+    reserve — отпечаток резервного выхода (его выбирает демон по дешёвой проверке).
     Сервер, конфиг которого установленный Xray не принимает, отбрасывается.
     """
     applied = read_json(paths.xray_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
+    prices = node_costs(cfg, inventory)
     if prefer is None:
         prefer = builder.member_fingerprints(applied, inventory.nodes)
     if tier is None:
-        tier = priority.best(cfg.managed.priority, prefer)
+        tier = cost.best(cfg.managed.priority, prices, prefer)
+    if reserve is None:
+        reserve = builder.reserve_fingerprint(applied, inventory.nodes)
 
     rejected: set[str] = set()
     dead = quarantined()
     first = True
     while True:
         usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
-        selection = builder.select_nodes(usable, cfg, prefer=prefer, dead=dead, tier=tier)
+        selection = builder.select_nodes(
+            usable, cfg, prefer=prefer, dead=dead, tier=tier, costs=prices, reserve=reserve,
+        )
         if first:
             first = False
             for warning in selection.warnings:
@@ -316,6 +323,11 @@ def assemble(
         if not newly:
             raise EngineError(f"конфиг не прошёл xray run -test:\n{output}")
         rejected |= newly
+
+
+def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:
+    """Стоимость серверов: 0 — безлимитная подписка, иначе множитель из имени (cost.py)."""
+    return cost.costs(inventory.nodes, inventory.quotas, cfg.filters.multiplier_regex)
 
 
 def _reject_invalid(result: builder.BuildResult, xray_bin: Path | None, logger) -> set[str]:

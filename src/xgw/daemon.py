@@ -4,9 +4,12 @@
 собирает сигналы — метрики observatory, сквозную загрузку через http-in и
 доступность провайдера, — ведёт машину состояний и делает то, что ядро само
 не умеет: обновляет подписки, применяет изменения, сканирует запасные и
-меняет «мёртвых» участников (раздел 6.8). Ещё он ведёт уровни приоритета серверов
-(priority.py): переходит на уровень ниже, когда на нынешнем живых нет, и возвращается
-выше, когда сервер того уровня снова проходит проверку.
+меняет «мёртвых» участников (раздел 6.8). Ещё он ведёт классы серверов (cost.py:
+ручной приоритет, затем стоимость — безлимитные, лимитированные x1, x10…): переходит на
+класс хуже, когда на нынешнем живых нет и пробовать тот класс не дороже, возвращается
+выше, когда сервер того класса снова проходит проверку, и подбирает балансировщику
+резервный выход — лимитированный сервер, через который трафик идёт, пока участники
+мертвы (_reserve_step).
 
 Один поток, один шаг за раз: применение конфига идёт под файловой блокировкой
 и не пересекается с командами CLI. Каждое обращение наружу — отдельный метод
@@ -28,7 +31,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import engine, fetch, log, priority
+from . import cost, engine, fetch, log, priority
 from .apply.applier import ApplyOutcome, in_restart_window
 from .apply.rotation import (
     REPLACE_NOW_VERDICTS,
@@ -45,6 +48,7 @@ from .paths import Paths
 from .store import Store
 from .watch import checks, scan, status, target
 from .watch.notify import Notifier
+from .watch.scan import RESERVE_CANDIDATES, RESERVE_RECHECK
 from .watch.states import Signals, State, StateMachine
 from .xraycore import binary, metrics
 from .xraycore.api import ApiError
@@ -63,14 +67,51 @@ WAIT_SLICE = 1.0  # как часто пауза между шагами смо�
 MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
 PROBE_TARGET_RECHECK = 300.0  # как часто перепроверять, отвечает ли сам probe.url
 PROBE_WORKERS = 8  # пробы для этой перепроверки идут одновременно: шаг не должен зависать
-# Работают серверы уровня ниже наивысшего — запасные уровней выше проверяются не реже
+# Работают серверы класса хуже лучшего — запасные классов лучше проверяются не реже
 # этого: вернуться к ним нужно скоро после того, как они снова заработают.
 TIER_RESCAN = 300.0
+# Резервный выход и кандидаты на его место проверяются дешёвым запросом раз в
+# RESERVE_RECHECK (по RESERVE_CANDIDATES лучших, см. watch/scan.py), а когда трафик не
+# идёт и через резервный (ALL_DEAD) — сразу и все. Итог перепроверки ждём не дольше
+# RESERVE_ROUND_WAIT.
+RESERVE_ROUND_WAIT = 600.0
+RESERVE_RETRY = 1800.0  # пока трафик несёт резервный, подписка опрашивается внеочередно не чаще
+# Уведомления (рабочий стол, Telegram) — только когда от человека нужно действие или
+# трафик идёт не так, как он ждёт. Остальное шлюз чинит сам: замены серверов, смена
+# уровня, «часть серверов недоступна», «снова отвечает» — это события в журнале (панель,
+# `xgw status`, /status бота), без уведомления.
+ALERT_STATES = frozenset({
+    State.ALL_DEAD, State.XRAY_DOWN, State.WAN_DOWN, State.LEAK,
+    State.PROBE_TARGET_UNREACHABLE,
+})
+# Трафик несёт лимитированный резервный дольше этого — уведомить: тратится квота, а
+# короткий переход (секунды, пока ядро не увидит, что участник ожил) повода не даёт.
+RESERVE_ALERT_AFTER = 300.0
+# Подписка не обновляется дольше этого — уведомить: разовый сбой провайдера подписки
+# повода не даёт, а долгий — значит, что-то с ней не так (истекла, сменился адрес).
+SUBSCRIPTION_ALERT_AFTER = 3600.0
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
     """Интервал со сдвигом ±20 %: строго периодические запросы заметны со стороны."""
     return seconds * random.uniform(1.0 - spread, 1.0 + spread)
+
+
+def tier_text(old: cost.Klass, new: cost.Klass, *, up: bool) -> str:
+    """Событие о смене класса участников. Классы с одной стоимостью различаются только
+    уровнем приоритета — тогда и говорится об уровнях, как в 0.1.7."""
+    if old.cost == new.cost:
+        was, now = priority.level_name(old.rank), priority.level_name(new.rank)
+        head = f"сервер уровня «{now}» снова отвечает" if up else (
+            f"на уровне «{was}» живых серверов нет"
+        )
+        return f"{head} — в работе серверы уровня «{now}» (были — «{was}»)"
+    ranked = old.rank != new.rank
+    head = "снова отвечают серверы лучшего класса" if up else "живых серверов нет"
+    return (
+        f"{head} — в работе {cost.class_name(new, ranked)} "
+        f"(были — {cost.class_name(old, ranked)})"
+    )
 
 
 class Daemon:
@@ -158,9 +199,28 @@ class Daemon:
         self.next_leak = 0.0
         self.next_all_dead = 0.0
         self.next_rescan = 0.0
-        # Когда демон последний раз сменил уровень приоритета участников (time.time()):
-        # вернуться выше можно только по скану, сделанному после этого.
+        # Когда демон последний раз сменил класс участников (time.time()): вернуться выше
+        # можно только по скану, сделанному после этого.
         self.tier_changed = 0.0
+        # Резервный выход: когда перепроверять (по self.clock), идущая перепроверка
+        # (начало — time.time(), probe-теги кандидатов), о чём уже сообщили.
+        self.next_reserve_check = 0.0
+        self.reserve_round: tuple[float, list[str]] | None = None
+        self.reserve_round_at = float("-inf")  # когда началась последняя (time.time())
+        self._urgent_round_for: float | None = None  # для какого ALL_DEAD (state_since)
+        self._reserve_note = ""
+        # Какой резервный нёс трафик, когда шлюз перешёл в RESERVE (« «имя» (x1)»): к
+        # возврату с него состав мог смениться, а сообщить нужно о том, что работал.
+        self._reserve_used = ""
+        self._price_cache: tuple | None = None
+        # На этом шаге участники мертвы и трафик несёт резервный выход: сквозная проверка
+        # идёт дешёвым запросом — через лимитированный сервер каждый байт тратит квоту.
+        self.reserve_mode = False
+        # Уведомили ли о долгой работе через резервный (на этот заход в RESERVE).
+        self._reserve_alerted = False
+        # С какого момента подписки не обновляются (time.time()) и уведомили ли об этом.
+        self._sub_failing_since: float | None = None
+        self._sub_alerted = False
         self._provider_ip: tuple[float, str] | None = None
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
@@ -243,6 +303,15 @@ class Daemon:
         self.next_target_check = previous.next_target_check
         self._urgent_rebuild = previous._urgent_rebuild
         self.tier_changed = previous.tier_changed
+        self.next_reserve_check = previous.next_reserve_check
+        self.reserve_round = previous.reserve_round
+        self.reserve_round_at = previous.reserve_round_at
+        self._urgent_round_for = previous._urgent_round_for
+        self._reserve_used = previous._reserve_used
+        self._reserve_alerted = previous._reserve_alerted
+        self._sub_failing_since = previous._sub_failing_since
+        self._sub_alerted = previous._sub_alerted
+        self._reserve_note = previous._reserve_note
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -274,24 +343,53 @@ class Daemon:
                 self._write_status([], None, False)
                 return self.machine.state
 
+        mapped = self.inventory is not None
         view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
         members = [info for info in view if info.role == "proxy"]
-        signals, observatory = self._signals(members, now)
+        reserve = builder.reserve_tag(applied)
+        signals, observatory = self._signals(members, now, reserve=bool(reserve))
         signals = self._probe_target(view, applied, signals, now)
         previous = self.machine.state
         decision = self.machine.update(signals)
         state = decision.state
         self.action = decision.action
+        if state is State.RESERVE:
+            if previous is not State.RESERVE:
+                self._reserve_used = self._reserve_label(applied)
+            self.action = self._reserve_action(self._reserve_used)
         if state is not previous:
             self.state_since = self.wall()
-            detail = decision.action
+            detail = self.action
             if state is State.PROBE_TARGET_UNREACHABLE:
                 detail = f"{self.probe_target}. Замена серверов приостановлена: {target.ADVICE}"
             # Тип события — само состояние: уведомление об ALL_DEAD не должно
-            # придерживаться из-за недавнего уведомления о DEGRADED.
+            # придерживаться из-за недавнего уведомления о другом состоянии. Уведомляют
+            # только состояния, при которых нужно действие человека (ALERT_STATES).
             self.notifier.event(
-                str(state), f"{previous} → {state}: {detail}",
-                notify=state is not State.HEALTHY,
+                str(state), f"{previous} → {state}: {detail}", notify=state in ALERT_STATES,
+            )
+            if previous is State.RESERVE and state in (State.HEALTHY, State.DEGRADED):
+                # Если о работе через резервный уведомляли — уведомить и о возврате.
+                self.notifier.event(
+                    "reserve",
+                    f"серверы в работе снова отвечают — Xray вернул на них трафик с резервного"
+                    f"{self._reserve_used}",
+                    notify=self._reserve_alerted,
+                )
+            if state is not State.RESERVE:
+                self._reserve_alerted = False
+        if (
+            state is State.RESERVE and not self._reserve_alerted
+            and self.wall() - self.state_since >= RESERVE_ALERT_AFTER
+        ):
+            self._reserve_alerted = True
+            minutes = int((self.wall() - self.state_since) // 60)
+            self.notifier.event(
+                "reserve",
+                f"уже {minutes} мин трафик идёт через резервный сервер{self._reserve_used}: "
+                "серверы в работе не отвечают. Через резервный тратится квота его подписки; "
+                "когда серверы ответят, шлюз вернётся к ним сам",
+                notify=True,
             )
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
@@ -326,6 +424,14 @@ class Daemon:
             # Внеочередное обновление подписки напрямую и скан всех запасных.
             self.next_all_dead = now + ALL_DEAD_RETRY
             changed = self._refresh(now, via_xray=False, urgent=True)
+            self._queue_scan(view, now, everything=True)
+        elif not changed and state is State.RESERVE and now >= self.next_all_dead:
+            # Трафик несёт резервный выход и тратит квоту: подписка могла сменить серверы —
+            # обновить её напрямую (через Xray запрос шёл бы через тот же резервный) и
+            # проверить запасные, чтобы поскорее заменить мёртвых участников. Лимитированные
+            # классом хуже здесь не проверяются: их дело — резервный выход (_reserve_step).
+            self.next_all_dead = now + RESERVE_RETRY
+            changed = self._refresh(now, via_xray=False, urgent=False)
             self._queue_scan(view, now)
         elif not changed and (
             refresh_asked or (state is not State.WAN_DOWN and now >= self.next_refresh)
@@ -335,6 +441,10 @@ class Daemon:
             self._rebuild_asked = False
             self._save_inventory(self.inventory)
             changed = self._rebuild(None, urgent=urgent, reason="изменение настроек")
+        if not changed and not mapped and self.inventory is not None:
+            # Подписка получена только на этом шаге (демон запущен заново): узлы ядра теперь
+            # сопоставлены с ней — без этого сканы ниже не знали бы классов и стоимости.
+            view = builder.applied_nodes(applied, self.inventory.nodes)
         if waiting or changed:
             # Xray перезапущен с новым конфигом (или не перезапущен — тогда вместо
             # перехвата загрузится режим «снят»): правила доводятся сразу, а не через шаг.
@@ -347,7 +457,7 @@ class Daemon:
         probing = not self.probe_target
         if scan_asked and probing:
             self._manual_scan = True
-            self._queue_scan(view, now)
+            self._queue_scan(view, now, everything=True)
         elif scan_asked:
             self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
         if not changed and probing and signals.xray_ok and signals.provider_ok:
@@ -356,12 +466,14 @@ class Daemon:
                 self._queue_scan(view, now)
             self._queue_members(view)
             self._scan_step(view, applied)
-            if state in (State.DEGRADED, State.ALL_DEAD) or (
+            if state in (State.DEGRADED, State.ALL_DEAD, State.RESERVE) or (
                 state is State.HEALTHY and self.bad_members
             ) or (state is State.LEAK and self._home_members(view)):
                 changed = self._rotate(view, observatory or {}, state, now)
             if not changed:
                 changed = self._switch_tier(view, state, now)
+            if not changed:
+                changed = self._reserve_step(view, applied, state, now)
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
@@ -374,7 +486,10 @@ class Daemon:
 
     # --- сигналы ---------------------------------------------------------------
 
-    def _signals(self, members: list[NodeInfo], now: float) -> tuple[Signals, dict | None]:
+    def _signals(
+        self, members: list[NodeInfo], now: float, *, reserve: bool = False
+    ) -> tuple[Signals, dict | None]:
+        """reserve — у балансировщика есть резервный выход (builder.reserve_tag)."""
         observatory: dict | None = None
         try:
             observatory = self._read_observatory()
@@ -388,6 +503,11 @@ class Daemon:
             except ApiError:
                 xray_ok = False
 
+        tags = [info.tag for info in members]
+        alive, dead, unknown = metrics.count_members(observatory or {}, tags)
+        # Все участники мертвы, а у балансировщика есть резервный выход: трафик идёт через
+        # него, и сквозная проверка — тоже (дешёвым запросом, см. _check_e2e).
+        self.reserve_mode = reserve and bool(tags) and dead >= len(tags)
         provider_ok = self._check_provider()
         e2e_ok = True
         if xray_ok and provider_ok:
@@ -405,8 +525,6 @@ class Daemon:
                 location is not None and location == self.cfg.routing.home_country.upper()
             )
 
-        tags = [info.tag for info in members]
-        alive, _dead, unknown = metrics.count_members(observatory or {}, tags)
         for tag in tags:
             entry = (observatory or {}).get(tag)
             if entry is not None and not entry["alive"]:
@@ -432,6 +550,7 @@ class Daemon:
                 e2e_ok=e2e_ok,
                 e2e_fail_streak=self.e2e_streak,
                 leak=self.leak,
+                reserve=reserve,
             ),
             observatory,
         )
@@ -440,14 +559,22 @@ class Daemon:
         return metrics.parse_observatory(metrics.fetch_metrics(self.cfg.xray.metrics_port))
 
     def _check_e2e(self) -> bool:
-        """Сквозная загрузка probe.url через http-in с детектором «тишины»."""
+        """Сквозная загрузка probe.url через http-in с детектором «тишины».
+
+        Пока трафик несёт резервный выход (reserve_mode), запрос дешёвый — scan.cheap_url:
+        каждые interval_s по 57 КБ через лимитированный сервер тратили бы его квоту, а
+        вопрос один — идёт ли через него трафик. Работает ли сам probe.url, тогда решает
+        _probe_target по пробам участников."""
+        url = scan.cheap_url(self.cfg) if self.reserve_mode else self.cfg.probe.url
         result = checks.http_get_via_proxy(
-            "127.0.0.1", self.cfg.xray.http_port, self.cfg.probe.url, silence=5.0,
+            "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0,
             max_total=30.0, user_agent=self.cfg.probe.user_agent,
         )
         if not result.ok:
             self.log.info("сквозная проверка не прошла: %s", result.error)
             return False
+        if url != self.cfg.probe.url:
+            return True
         # Размер тела — мера расхода трафика на пробы (status.probe_budget).
         try:
             status.remember_probe_size(self.store, self.cfg.probe.url, result.downloaded)
@@ -520,25 +647,23 @@ class Daemon:
         вердикты запасных). Тогда собственной пробой опрашиваются все участники и
         несколько запасных; если ошибка у всех одна и контрольные запросы это
         подтверждают, состояние — PROBE_TARGET_UNREACHABLE, и серверы остаются как есть.
+
+        Пока трафик несёт резервный выход (reserve_mode), сквозная проверка идёт дешёвым
+        запросом и о probe.url ничего не говорит: тогда участников опрашивают и без её
+        сбоев — иначе при недоступном probe.url весь трафик так и шёл бы через
+        лимитированный резервный, хотя участники живы.
         """
         reachable = signals.xray_ok and signals.provider_ok
-        if reachable and signals.e2e_ok:
-            if self.probe_target:
-                self.probe_target = ""
-                self.next_target_check = 0.0
-                self.next_scan = now  # вердикты запасных могли устареть — проверить заново
-                self.notifier.event(
-                    "probe", "probe.url снова отвечает — проверки серверов возобновлены",
-                    notify=True,
-                )
+        if reachable and signals.e2e_ok and not self.reserve_mode:
+            self._target_answers(now)
             # И после перезапуска демона: запись о запасном адресе могла остаться с прошлого раза.
             self._observatory_fallback(False)
             return signals
         dead = signals.total_members - signals.alive_members - signals.unknown_members
-        suspect = reachable and not signals.e2e_ok and (
+        suspect = reachable and (self.reserve_mode or (not signals.e2e_ok and (
             signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
             or (signals.total_members > 0 and dead >= signals.total_members)
-        )
+        )))
         if suspect and now >= self.next_target_check:
             self.next_target_check = now + PROBE_TARGET_RECHECK
             diagnosis = self._diagnose_target(view, applied)
@@ -547,11 +672,27 @@ class Daemon:
                 # Вердикты первой проверки сняты, пока адрес не отвечал: они ни о чём.
                 self.bad_members.clear()
                 self.vetted.clear()
-            self.probe_target = diagnosis.text if diagnosis.down else ""
+            if diagnosis.down:
+                self.probe_target = diagnosis.text
+            else:
+                self._target_answers(now)
             self._observatory_fallback(diagnosis.down)
         if self.probe_target:
             return dataclasses.replace(signals, probe_target_ok=False)
         return signals
+
+    def _target_answers(self, now: float) -> None:
+        """probe.url отвечает: снять предупреждение, если оно было."""
+        if not self.probe_target:
+            return
+        self.probe_target = ""
+        self.next_target_check = 0.0
+        self.next_scan = now  # вердикты запасных могли устареть — проверить заново
+        # Уведомляли о недоступном адресе — уведомить и о том, что он снова отвечает.
+        self.notifier.event(
+            "probe", "probe.url снова отвечает — проверки серверов возобновлены",
+            notify=self.machine.state is State.PROBE_TARGET_UNREACHABLE,
+        )
 
     def _observatory_fallback(self, on: bool) -> None:
         """Переводит пробы ядра на запасной адрес (on) или возвращает их на probe.url."""
@@ -570,7 +711,7 @@ class Daemon:
             )
         else:
             text = "ядро снова пробует серверы по probe.url"
-        self.notifier.event("probe", text, notify=on)
+        self.notifier.event("probe", text)  # о самой причине уведомляет PROBE_TARGET_UNREACHABLE
 
     def _containers_appeared(self, applied: dict) -> None:
         """На машине появился Docker, а Xray запущен без inbound'а TUN: контейнерам он
@@ -587,16 +728,32 @@ class Daemon:
     def _diagnose_target(self, view: list[NodeInfo], applied: dict) -> target.Diagnosis:
         password, _ports = builder.probe_state(applied)
         verdicts = {tag: entry["verdict"] for tag, entry in self.store.scans().items()}
-        nodes = target.sample(view, verdicts)
+        nodes = target.sample(view, verdicts, skip=self._costly_spares(view))
         if not password or not nodes:
             return target.Diagnosis(False)
         with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(nodes))) as pool:
             results = list(pool.map(lambda info: self._scan(info, password), nodes))
-        return target.diagnose(results, base_ping=self._base_ping, direct=self._direct_probe)
+        members = [info for info in view if info.role == "proxy"]
+        return target.diagnose(
+            results, base_ping=lambda: self._base_ping(members, password),
+            direct=self._direct_probe,
+        )
 
-    def _base_ping(self) -> bool:
-        """Базовый запрос через VPN: носят ли серверы трафик вообще."""
-        return target.base_ping(self.cfg)
+    def _costly_spares(self, view: list[NodeInfo]) -> list[str]:
+        """Теги запасных, пробовать которые дороже, чем участников: лимитированные, когда
+        участники безлимитные. Проба probe.url — 57 КБ, да ещё с множителем."""
+        prices = self._prices()
+        members = [prices.get(info.fingerprint, 1.0) for info in view if info.role == "proxy"]
+        ceiling = min(members, default=0.0)
+        return [
+            info.tag for info in view
+            if info.role == "spare" and prices.get(info.fingerprint, 1.0) > ceiling
+        ]
+
+    def _base_ping(self, members: list[NodeInfo], password: str) -> bool:
+        """Базовый запрос через VPN — через самих участников: носят ли они трафик вообще.
+        Через http-in его понёс бы резервный выход, когда пробы ядра падают у всех."""
+        return target.base_ping(self.cfg, members, password, user=builder.PROBE_USER)
 
     def _direct_probe(self) -> str:
         """probe.url напрямую, мимо VPN: пусто — отдаётся, иначе класс сбоя."""
@@ -621,7 +778,7 @@ class Daemon:
             # служба может числиться запущенной и при этом висеть — перезапускаем сами.
             try:
                 self.service.restart()
-                self.notifier.event("xray", "Xray не отвечал — служба перезапущена", notify=True)
+                self.notifier.event("xray", "Xray не отвечал — служба перезапущена")
             except XrayServiceError as exc:
                 self.notifier.event("xray", f"Xray не перезапускается: {exc}", notify=True)
             return False
@@ -707,9 +864,7 @@ class Daemon:
                     )
                 elif mode == "open" and xray_ok:
                     mode = capture.close()
-                    self.notifier.event(
-                        "capture", "Xray снова отвечает — перехват возвращён", notify=True
-                    )
+                    self.notifier.event("capture", "Xray снова отвечает — перехват возвращён")
             elif mode == "open":
                 mode = capture.close()  # fail_mode сменили на closed, а метка осталась
             loaded = capture.loaded()
@@ -737,15 +892,15 @@ class Daemon:
             elif reloaded and (self._inbound_missing or switched):
                 self.notifier.event(
                     "capture", "Xray перезапущен с inbound'ом перехвата — перехват включён",
-                    notify=True,
                 )
             elif reloaded:
+                # Правила вернулись сами: делать человеку нечего — только событие в журнале.
                 text = getattr(
                     capture, "reloaded_text", "правила сети не были загружены — загружены заново"
                 )
                 if cause:
                     text = f"{cause} — интерфейс подготовлен заново"
-                self.notifier.event("capture", text, notify=True)
+                self.notifier.event("capture", text)
             self._inbound_missing = missing
             self._capture_error = ""
             tidy = getattr(capture, "tidy", None)  # у подставного перехвата в тестах — нет
@@ -809,9 +964,7 @@ class Daemon:
         if not inventory.nodes or not (inventory.complete or first_start):
             # Неполный список применять нельзя: из ядра пропали бы серверы подписки,
             # которую сейчас не удалось получить.
-            self.notifier.event(
-                "subscription", "подписки получить не удалось — конфиг не меняется", notify=True
-            )
+            self._subscription_failed()
             if self.inventory is None and inventory.nodes:
                 self.inventory = inventory  # хотя бы сопоставить узлы с тегами
             # Повторить скорее, чем через refresh_minutes, но не на каждом шаге:
@@ -819,16 +972,19 @@ class Daemon:
             self.next_refresh = min(self.next_refresh, now + jitter(SUBSCRIPTION_RETRY))
             return False
         self.inventory = inventory
+        if inventory.complete:
+            self._sub_failing_since, self._sub_alerted = None, False
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
         return self._rebuild(None, urgent=urgent, reason="обновление подписки")
 
     def _rebuild(
-        self, prefer: list[str] | None, *, urgent: bool, reason: str, tier: int | None = None
+        self, prefer: list[str] | None, *, urgent: bool, reason: str,
+        tier: cost.Klass | None = None, reserve: str | None = None,
     ) -> bool:
         assert self.inventory is not None
         dead = engine.quarantined()
         try:
-            assembly = self._assemble(prefer, tier)
+            assembly = self._assemble(prefer, tier, reserve)
         except engine.EngineError as exc:
             self.notifier.event("config", f"{reason}: {exc}", notify=True)
             return False
@@ -853,6 +1009,21 @@ class Daemon:
             return True
         return outcome.mode == "rollback"
 
+    def _subscription_failed(self) -> None:
+        """Подписки не получены: событие в журнал; уведомление — только если это длится
+        дольше SUBSCRIPTION_ALERT_AFTER (разовый сбой провайдера повода не даёт)."""
+        now = self.wall()
+        if self._sub_failing_since is None:
+            self._sub_failing_since = now
+        alert = not self._sub_alerted and now - self._sub_failing_since >= SUBSCRIPTION_ALERT_AFTER
+        text = "подписки получить не удалось — конфиг не меняется"
+        if alert:
+            self._sub_alerted = True
+            hours = max(1, int((now - self._sub_failing_since) // 3600))
+            text = (f"подписки не обновляются уже {hours} ч — конфиг не меняется; проверьте "
+                    "адрес и срок подписки (панель, раздел «Подписки»)")
+        self.notifier.event("subscription", text, notify=alert)
+
     def _save_inventory(self, inventory: engine.Inventory) -> None:
         try:
             engine.save_inventory(self.paths, self.cfg, inventory)
@@ -875,11 +1046,14 @@ class Daemon:
             self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray
         )
 
-    def _assemble(self, prefer: list[str] | None, tier: int | None = None) -> engine.Assembly:
+    def _assemble(
+        self, prefer: list[str] | None, tier: cost.Klass | None = None,
+        reserve: str | None = None,
+    ) -> engine.Assembly:
         assert self.inventory is not None
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
-            xray_bin=self.xray_bin, prefer=prefer, tier=tier,
+            xray_bin=self.xray_bin, prefer=prefer, tier=tier, reserve=reserve,
         )
 
     def _apply(self, config: dict, *, urgent: bool) -> ApplyOutcome:
@@ -887,18 +1061,61 @@ class Daemon:
 
     # --- сканы и замена участников ---------------------------------------------
 
-    def _queue_scan(self, view: list[NodeInfo], now: float) -> None:
-        """Все запасные — в очередь скана; серверы уровня приоритета выше — первыми."""
+    def _queue_scan(self, view: list[NodeInfo], now: float, *, everything: bool = False) -> None:
+        """Запасные — в очередь скана; серверы классов лучше — первыми.
+
+        Лимитированные запасные класса хуже, чем у участников, сюда не попадают: это
+        кандидаты в резервный выход, их редко и дешёвым запросом проверяет _reserve_step.
+        everything — проверить и их: по кнопке «Проверить запасные» и когда трафик не
+        идёт вовсе (ALL_DEAD)."""
         queued = set(self.scan_queue)
-        levels = self.cfg.managed.priority
+        tier = self._tier(view)
+        prices = self._prices()
         spares = sorted(
             (info for info in view if info.role == "spare"),
-            key=lambda info: priority.rank(levels, info.fingerprint),
+            key=lambda info: self._klass(info.fingerprint),
         )
         for info in spares:
+            klass = self._klass(info.fingerprint)
+            if not everything and (
+                info.fingerprint not in prices  # не сопоставлен с подпиской: цена неизвестна
+                or (tier is not None and klass > tier and klass.cost > 0)
+            ):
+                continue
             if info.probe_tag not in queued:
                 self.scan_queue.append(info.probe_tag)
         self.next_rescan = now + RESCAN_PAUSE
+
+    def _prices(self) -> dict[str, float]:
+        """Стоимость серверов по отпечаткам (cost.py); подписки ещё нет — пусто. Считается
+        заново, только когда сменился список серверов или настройки."""
+        if self.inventory is None:
+            return {}
+        cached = self._price_cache
+        if cached is not None and cached[0] is self.inventory and cached[1] is self.cfg:
+            return cached[2]
+        prices = engine.node_costs(self.cfg, self.inventory)
+        self._price_cache = (self.inventory, self.cfg, prices)
+        return prices
+
+    def _klass(self, fingerprint: str, prices: dict[str, float] | None = None) -> cost.Klass:
+        return cost.klass(
+            self.cfg.managed.priority, self._prices() if prices is None else prices, fingerprint
+        )
+
+    def _tier(self, view: list[NodeInfo]) -> cost.Klass | None:
+        """Класс участников: лучший среди них (все участники — одного класса)."""
+        return cost.best(
+            self.cfg.managed.priority, self._prices(),
+            [info.fingerprint for info in view if info.role == "proxy"],
+        )
+
+    def _scan_url(self, info: NodeInfo) -> str | None:
+        """Чем проверять узел: запасной лимитированной подписки — дешёвым запросом
+        (scan.cheap_url), остальные — probe.url (None)."""
+        if info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0:
+            return scan.cheap_url(self.cfg)
+        return None
 
     def _queue_members(self, view: list[NodeInfo]) -> None:
         """Первая проверка участников собственной пробой шлюза — в начало очереди.
@@ -926,7 +1143,7 @@ class Daemon:
             info = nodes.get(self.scan_queue.popleft())
             if info is None or not password:
                 continue
-            result = self._scan(info, password)
+            result = self._scan(info, password, self._scan_url(info))
             self.store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
@@ -942,8 +1159,9 @@ class Daemon:
                 result.bytes_read, result.seconds,
             )
 
-    def _scan(self, info: NodeInfo, password: str) -> scan.ScanResult:
-        return scan.scan_node(info, self.cfg, probe_pass=password)
+    def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
+        """url — адрес проверки; None — probe.url."""
+        return scan.scan_node(info, self.cfg, probe_pass=password, url=url)
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
         """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;
@@ -955,23 +1173,24 @@ class Daemon:
         members = [info for info in view if info.role == "proxy"]
         if any(info.fingerprint not in by_fingerprint for info in members):
             return False  # состав ядра не сопоставлен с подпиской — менять вслепую нельзя
-        # Замена — только запасным того же уровня приоритета: на уровень ниже переходит
-        # _switch_tier, когда живых на этом не осталось.
-        levels = self.cfg.managed.priority
-        tier = priority.best(levels, [info.fingerprint for info in members])
+        # Замена — только запасным того же класса (приоритет и стоимость): на класс хуже
+        # переходит _switch_tier, когда живых на этом не осталось.
+        prices = self._prices()
+        tier = self._tier(view)
         pairs = [
             (info, by_fingerprint[info.fingerprint])
             for info in view
             if info.role == "spare" and info.fingerprint in by_fingerprint
             and info.fingerprint not in self.home_exits  # тоже выходит в домашнюю страну
-            and priority.rank(levels, info.fingerprint) == tier
+            and self._klass(info.fingerprint, prices) == tier
         ]
         scans = self._fresh_scans()
         verdicts = {i.tag: scans[i.probe_tag]["verdict"] for i, _ in pairs if i.probe_tag in scans}
         seconds = {i.tag: scans[i.probe_tag]["seconds"] for i, _ in pairs if i.probe_tag in scans}
         cfg = self.cfg
-        if state is State.ALL_DEAD:
-            # Живых нет вовсе — ждать rotate_after_min незачем.
+        if state in (State.ALL_DEAD, State.RESERVE):
+            # Живых нет вовсе (или трафик несёт резервный и тратит квоту) — ждать
+            # rotate_after_min незачем.
             cfg = copy.copy(self.cfg)
             cfg.filters = copy.copy(self.cfg.filters)
             cfg.filters.rotate_after_min = 0
@@ -1002,9 +1221,13 @@ class Daemon:
                 f" (сами выходят в {self.cfg.routing.home_country.upper()}: "
                 f"{', '.join(leaking)})"
             )
-        self.notifier.event("rotation", text, notify=True)
-        # Замены пришли из запасных, прошедших скан, — проверять их заново незачем.
-        self.vetted.update(node.fingerprint for _tag, node in rotation.replacements)
+        self.notifier.event("rotation", text)  # шлюз справился сам — уведомлять незачем
+        # Замены пришли из запасных, прошедших скан, — проверять их заново незачем. Кроме
+        # лимитированных: их проверяли дешёвым запросом, «заморозку» он не ловит.
+        self.vetted.update(
+            node.fingerprint for _tag, node in rotation.replacements
+            if prices.get(node.fingerprint, 1.0) == 0
+        )
         for tag, _node in rotation.replacements:
             self.bad_members.pop(tag, None)
         return self._rebuild(
@@ -1022,39 +1245,44 @@ class Daemon:
         }
 
     def _switch_tier(self, view: list[NodeInfo], state: State, now: float) -> bool:
-        """Уровни приоритета серверов (priority.py).
+        """Классы серверов (cost.py): ручной приоритет, затем стоимость.
 
-        Вверх: запасной уровня выше нынешнего прошёл скан (OK), сделанный уже после
-        последней смены уровня, — участниками становятся серверы того уровня. Скан
+        Вверх: запасной класса лучше нынешнего прошёл скан (OK), сделанный уже после
+        последней смены класса, — участниками становятся серверы того класса. Скан
         «после смены» не даёт вернуться к серверу по старому результату, полученному ещё
-        до того, как он перестал отвечать. Пока работают серверы уровня ниже наивысшего,
-        запасные уровней выше проверяются раз в TIER_RESCAN.
+        до того, как он перестал отвечать. Пока работают серверы класса хуже лучшего,
+        запасные классов лучше проверяются раз в TIER_RESCAN.
 
-        Вниз: живых участников нет (ALL_DEAD) и живых запасных того же уровня тоже —
-        участниками становятся проверенные запасные ближайшего уровня ниже, у которого они
-        есть. Ждать rotate_after_min незачем: трафику идти больше некуда.
+        Вниз: живых участников нет (ALL_DEAD или трафик несёт резервный выход — RESERVE)
+        и живых запасных того же класса тоже — участниками становятся проверенные
+        запасные ближайшего класса хуже, у которого они есть. Ждать rotate_after_min
+        незачем: трафику идти больше некуда. Но только если пробовать тот класс не дороже:
+        участников ядро пробует постоянно, и безлимитных на лимитированные шлюз не меняет —
+        пока безлимитные мертвы, трафик несёт резервный выход, а observatory продолжает
+        пробовать безлимитных бесплатно и вернёт трафик, как только они ответят.
 
-        Пока сервер закреплён вручную (xgw pin), уровень не меняется."""
+        Пока сервер закреплён вручную (xgw pin), класс не меняется."""
         if self.inventory is None or self._pin() is not None:
             return False
-        levels = self.cfg.managed.priority
+        prices = self._prices()
         known = {node.fingerprint for node in self.inventory.nodes}
         members = [info for info in view if info.role == "proxy"]
         if not members or any(info.fingerprint not in known for info in members):
             return False  # состав ядра не сопоставлен с подпиской — менять вслепую нельзя
-        tier = priority.best(levels, [info.fingerprint for info in members])
+        tier = self._tier(view)
         assert tier is not None
         spares = [
             info for info in view
             if info.role == "spare" and info.fingerprint in known
             and info.fingerprint not in self.home_exits
         ]
+        classes = sorted({self._klass(info.fingerprint, prices) for info in spares})
         scans = self._fresh_scans()
 
-        def ready(rank: int, verdicts: tuple[str, ...], after: float = 0.0) -> list[NodeInfo]:
+        def ready(klass: cost.Klass, verdicts: tuple[str, ...], after: float = 0.0):
             found = [
                 info for info in spares
-                if priority.rank(levels, info.fingerprint) == rank
+                if self._klass(info.fingerprint, prices) == klass
                 and info.probe_tag in scans and scans[info.probe_tag]["verdict"] in verdicts
                 and scans[info.probe_tag]["ts"] > after
             ]
@@ -1062,52 +1290,173 @@ class Daemon:
                 scans[info.probe_tag]["verdict"] != "OK", scans[info.probe_tag]["seconds"],
             ))
 
-        for rank in range(tier):
-            better = ready(rank, ("OK",), after=self.tier_changed)
+        for klass in (item for item in classes if item < tier):
+            better = ready(klass, ("OK",), after=self.tier_changed)
             if better:
                 return self._change_tier(
-                    tier, rank, better, urgent=state is State.ALL_DEAD,
-                    text=f"сервер уровня «{priority.level_name(rank)}» снова отвечает",
+                    tier, klass, better, urgent=state is State.ALL_DEAD, up=True,
                 )
         self._queue_higher(spares, tier, scans)
-        if state is not State.ALL_DEAD or ready(tier, REPLACEABLE_VERDICTS):
-            return False  # живые есть — или их заменит _rotate тем же уровнем
-        for rank in range(tier + 1, len(priority.LEVELS)):
-            lower = ready(rank, REPLACEABLE_VERDICTS)
-            if lower:
-                return self._change_tier(
-                    tier, rank, lower, urgent=True,
-                    text=f"на уровне «{priority.level_name(tier)}» живых серверов нет",
-                )
+        if state not in (State.ALL_DEAD, State.RESERVE) or ready(tier, REPLACEABLE_VERDICTS):
+            return False  # живые есть — или их заменит _rotate тем же классом
+        for klass in (item for item in classes if item > tier):
+            lower = ready(klass, REPLACEABLE_VERDICTS)
+            if not lower:
+                continue
+            if klass.cost > tier.cost:
+                return False  # дороже: трафик несёт резервный выход (_reserve_step)
+            return self._change_tier(tier, klass, lower, urgent=True, up=False)
         return False
 
-    def _queue_higher(self, spares: list[NodeInfo], tier: int, scans: dict[str, dict]) -> None:
-        """Запасные уровней выше нынешнего, давно не проверенные, — в начало очереди."""
-        levels = self.cfg.managed.priority
+    def _queue_higher(
+        self, spares: list[NodeInfo], tier: cost.Klass, scans: dict[str, dict]
+    ) -> None:
+        """Запасные классов лучше нынешнего, давно не проверенные, — в начало очереди."""
+        prices = self._prices()
         due = max(self.tier_changed, self.wall() - TIER_RESCAN)
         queued = set(self.scan_queue)
         for info in reversed(spares):
             if (
-                priority.rank(levels, info.fingerprint) < tier and info.probe_tag not in queued
+                self._klass(info.fingerprint, prices) < tier and info.probe_tag not in queued
                 and (info.probe_tag not in scans or scans[info.probe_tag]["ts"] <= due)
             ):
                 self.scan_queue.appendleft(info.probe_tag)
 
     def _change_tier(
-        self, tier: int, rank: int, ready: list[NodeInfo], *, urgent: bool, text: str
+        self, old: cost.Klass, new: cost.Klass, ready: list[NodeInfo], *, urgent: bool, up: bool
     ) -> bool:
-        name = priority.level_name(rank)
-        self.notifier.event(
-            "priority",
-            f"{text} — в работе серверы уровня «{name}» (были — «{priority.level_name(tier)}»)",
-            notify=True,
-        )
+        self.notifier.event("priority", tier_text(old, new, up=up))
         self.tier_changed = self.wall()
-        # Серверы пришли из запасных, прошедших скан, — проверять их заново незачем.
-        self.vetted.update(info.fingerprint for info in ready)
+        # Класс участников сменился — и кандидаты в резервный выход другие: перепроверить.
+        self.next_reserve_check = 0.0
+        # Серверы пришли из запасных, прошедших скан, — проверять их заново незачем (кроме
+        # лимитированных: их проверяли дешёвым запросом).
+        self.vetted.update(info.fingerprint for info in ready if new.cost == 0)
+        if new.cost == old.cost:
+            reason = f"смена уровня приоритета: «{priority.level_name(new.rank)}»"
+        else:
+            reason = f"смена класса серверов: {cost.class_name(new, new.rank != old.rank)}"
         return self._rebuild(
-            [info.fingerprint for info in ready], urgent=urgent, tier=rank,
-            reason=f"смена уровня приоритета: «{name}»",
+            [info.fingerprint for info in ready], urgent=urgent, tier=new, reason=reason,
+        )
+
+    # --- резервный выход -------------------------------------------------------
+
+    def _reserve_step(
+        self, view: list[NodeInfo], applied: dict, state: State, now: float
+    ) -> bool:
+        """Резервный выход балансировщика (fallbackTag) — запасной класса хуже участников,
+        обычно лимитированный с наименьшим множителем. Через него трафик идёт, только
+        когда observatory считает мёртвыми всех участников; сам он observatory не
+        пробуется и квоту зря не тратит.
+
+        Его и лучших кандидатов на его место демон проверяет дешёвым запросом: раз в
+        RESERVE_RECHECK по RESERVE_CANDIDATES лучших, а когда трафик не идёт и через
+        резервный (ALL_DEAD), — сразу и всех. Резервным становится лучший прошедший
+        проверку: класс лучше, затем нынешний резервный, затем OK быстрее SLOW."""
+        if self.inventory is None:
+            return False
+        prices = self._prices()
+        known = {node.fingerprint for node in self.inventory.nodes}
+        tier = self._tier(view)
+        if tier is None or any(info.fingerprint not in known for info in view):
+            return False  # состав ядра не сопоставлен с подпиской
+        current = builder.reserve_tag(applied)
+        candidates = sorted(
+            (
+                info for info in view
+                if info.role == "spare" and info.fingerprint not in self.home_exits
+                and self._klass(info.fingerprint, prices) > tier
+            ),
+            key=lambda info: (self._klass(info.fingerprint, prices), info.tag != current),
+        )
+        if not candidates:
+            self.reserve_round = None
+            return False
+        if self.reserve_round is None:
+            # Трафик не идёт и через резервный: перепроверить сразу, как только наступил
+            # ALL_DEAD, и дальше не реже ALL_DEAD_RETRY.
+            urgent = state is State.ALL_DEAD and (
+                self._urgent_round_for != self.state_since
+                or self.wall() - self.reserve_round_at >= ALL_DEAD_RETRY
+            )
+            if now < self.next_reserve_check and not urgent:
+                return False
+            self.reserve_round_at = self.wall()
+            if state is State.ALL_DEAD:
+                self._urgent_round_for = self.state_since
+            chosen = candidates if state is State.ALL_DEAD else candidates[:RESERVE_CANDIDATES]
+            tags = [info.probe_tag for info in chosen]
+            current_info = next((info for info in candidates if info.tag == current), None)
+            if current_info is not None and current_info.probe_tag not in tags:
+                tags.append(current_info.probe_tag)
+            self.reserve_round = (self.wall(), tags)
+            self.next_reserve_check = now + jitter(RESERVE_RECHECK)
+            queued = set(self.scan_queue)
+            fresh = [tag for tag in tags if tag not in queued]
+            if state is State.ALL_DEAD:
+                self.scan_queue.extendleft(reversed(fresh))
+            else:
+                self.scan_queue.extend(fresh)
+            return False
+        started, tags = self.reserve_round
+        waiting = set(tags) & set(self.scan_queue)
+        if waiting and self.wall() - started < RESERVE_ROUND_WAIT:
+            return False
+        self.reserve_round = None
+        scans = self.store.scans()
+        passed = [
+            info for info in candidates
+            if info.probe_tag in tags and info.probe_tag in scans
+            and scans[info.probe_tag]["ts"] >= started
+            and scans[info.probe_tag]["verdict"] in REPLACEABLE_VERDICTS
+        ]
+        if not passed:
+            note = "резервного сервера нет: ни один из проверенных запасных классом хуже не ответил"
+            if note != self._reserve_note:
+                self._reserve_note = note
+                self.notifier.event("reserve", note)
+            return False
+        best = min(passed, key=lambda info: (
+            self._klass(info.fingerprint, prices), info.tag != current,
+            scans[info.probe_tag]["verdict"] != "OK", scans[info.probe_tag]["seconds"],
+        ))
+        self._reserve_note = ""
+        if best.tag == current:
+            return False
+        node = next(node for node in self.inventory.nodes if node.fingerprint == best.fingerprint)
+        price = cost.describe(prices.get(best.fingerprint, 1.0))
+        self.notifier.event(
+            "reserve",
+            f"резервный сервер — «{node.name}» ({price}): через него пойдёт трафик, если "
+            "серверы в работе перестанут отвечать",
+        )
+        return self._rebuild(
+            None, urgent=state is State.ALL_DEAD, reason="смена резервного сервера",
+            reserve=best.fingerprint,
+        )
+
+    def _reserve_node(self, applied: dict | None):
+        if self.inventory is None:
+            return None
+        fingerprint = builder.reserve_fingerprint(applied, self.inventory.nodes)
+        return next(
+            (node for node in self.inventory.nodes if node.fingerprint == fingerprint), None
+        )
+
+    def _reserve_label(self, applied: dict | None) -> str:
+        """« «имя» (x1)» — для событий; резервный не опознан — пусто."""
+        node = self._reserve_node(applied)
+        if node is None:
+            return ""
+        price = self._prices().get(node.fingerprint, 1.0)
+        return f" «{node.name}» ({cost.describe(price)})"
+
+    def _reserve_action(self, label: str) -> str:
+        """Текст состояния RESERVE: через какой сервер идёт трафик (_reserve_label)."""
+        return (
+            f"серверы в работе не отвечают — трафик идёт через резервный сервер{label}; "
+            "Xray вернётся к ним сам, как только они ответят; поиск замены среди запасных"
         )
 
     # --- ручное закрепление ----------------------------------------------------

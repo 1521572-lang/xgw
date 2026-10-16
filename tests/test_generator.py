@@ -7,6 +7,7 @@ import links
 from conftest import golden
 
 from xgw.config import Config
+from xgw.cost import Klass
 from xgw.generator.builder import (
     BuildResult,
     applied_nodes,
@@ -14,6 +15,8 @@ from xgw.generator.builder import (
     build,
     member_fingerprints,
     probe_state,
+    reserve_fingerprint,
+    reserve_tag,
     select_nodes,
 )
 from xgw.model import ServerNode, raw_to_node
@@ -204,20 +207,78 @@ def test_members_are_taken_from_one_priority_level_only():
                                                   "dddd0000", "eeee0000")]
     cfg.managed.priority = {"dddd0000": "high", "eeee0000": "high", "aaaa0000": "low"}
     top = select_nodes(nodes, cfg)
-    assert top.tier == 0 and [n.fingerprint for n in top.members] == ["dddd0000", "eeee0000"]
+    assert top.tier == Klass(0, 0.0)
+    assert [n.fingerprint for n in top.members] == ["dddd0000", "eeee0000"]
     # запасные: сначала свой уровень (тут его нет), затем остальные по отпечатку
     assert [n.fingerprint for n in top.spares] == ["aaaa0000", "bbbb0000", "cccc0000"]
-    middle = select_nodes(nodes, cfg, tier=1, prefer=["cccc0000", "dddd0000"])
-    assert middle.tier == 1 and [n.fingerprint for n in middle.members] == [
+    # Резервный выход — первый запасной лучшего из классов хуже: средний, по отпечатку.
+    assert top.reserve.fingerprint == "bbbb0000"
+    middle = select_nodes(nodes, cfg, tier=Klass(1, 0.0), prefer=["cccc0000", "dddd0000"])
+    assert middle.tier == Klass(1, 0.0) and [n.fingerprint for n in middle.members] == [
         "cccc0000", "bbbb0000"]  # высокий из prefer не берётся: уровень другой
-    low = select_nodes(nodes, cfg, tier=2)
+    low = select_nodes(nodes, cfg, tier=Klass(2, 0.0))
     assert [n.fingerprint for n in low.members] == ["aaaa0000"]
+    assert low.reserve is None  # уровня ниже нет — fallbackTag остаётся первым участником
     # Уровня, которого нет среди серверов, не бывает — берётся наивысший из имеющихся.
     cfg.managed.priority = {"aaaa0000": "low"}
-    assert select_nodes(nodes, cfg, tier=0).tier == 1
+    assert select_nodes(nodes, cfg, tier=Klass(0, 0.0)).tier == Klass(1, 0.0)
     cfg.managed.priority = {}
     plain = select_nodes(nodes, cfg)
-    assert plain.tier == 1 and len(plain.members) == 3  # без приоритетов — как раньше
+    assert plain.tier == Klass(1, 0.0) and len(plain.members) == 3  # без приоритетов — как раньше
+    assert plain.reserve is None
+
+
+def _priced(nodes, cfg, prices, **kwargs):
+    return select_nodes(nodes, cfg, costs=prices, **kwargs)
+
+
+def test_unlimited_servers_work_and_the_cheapest_limited_one_is_the_reserve():
+    """Безлимитные — в балансировщике, даже если их меньше max_members; лимитированные —
+    запасные, и один из них, с наименьшим множителем, — резервный выход."""
+    cfg = Config()
+    cfg.filters.max_members = 3
+    nodes = [_node(fp, fp) for fp in ("aaaa0000", "bbbb0000", "cccc0000", "dddd0000",
+                                      "eeee0000")]
+    prices = {"aaaa0000": 10.0, "bbbb0000": 1.0, "cccc0000": 0.0, "dddd0000": 100.0,
+              "eeee0000": 1.0}
+    selection = _priced(nodes, cfg, prices)
+    assert [n.fingerprint for n in selection.members] == ["cccc0000"]
+    assert selection.tier == Klass(1, 0.0)
+    assert selection.reserve.fingerprint == "bbbb0000"  # x1, первый по отпечатку
+    # Резервным становится тот, кого выбрал демон, — если он и правда классом хуже.
+    chosen = _priced(nodes, cfg, prices, reserve="eeee0000")
+    assert chosen.reserve.fingerprint == "eeee0000"
+    assert _priced(nodes, cfg, prices, reserve="aaaa0000").reserve.fingerprint == "aaaa0000"
+    assert _priced(nodes, cfg, prices, reserve="cccc0000").reserve.fingerprint == "bbbb0000"
+    # Безлимитных нет совсем — как прежде: балансировщик из x1, резервный — x10.
+    no_free = _priced([node for node in nodes if node.fingerprint != "cccc0000"], cfg, prices)
+    assert [n.fingerprint for n in no_free.members] == ["bbbb0000", "eeee0000"]
+    assert no_free.tier == Klass(1, 1.0) and no_free.reserve.fingerprint == "aaaa0000"
+    # Ручной приоритет важнее стоимости: x100 с высоким приоритетом идёт первым.
+    cfg.managed.priority = {"dddd0000": "high"}
+    ranked = _priced(nodes, cfg, prices)
+    assert [n.fingerprint for n in ranked.members] == ["dddd0000"]
+    assert ranked.reserve.fingerprint == "cccc0000"  # безлимитный среднего уровня
+
+
+def test_reserve_is_the_fallback_tag_and_stays_out_of_the_observatory():
+    cfg = Config()
+    cfg.filters.max_members = 2
+    nodes = [_node(fp, fp) for fp in ("aaaa0000", "bbbb0000", "cccc0000")]
+    prices = {"aaaa0000": 0.0, "bbbb0000": 0.0, "cccc0000": 1.0}
+    selection = _priced(nodes, cfg, prices)
+    result = build(cfg, selection, hosts={}, probe_password="P" * 32)
+    (balancer,) = result.config["routing"]["balancers"]
+    assert balancer["fallbackTag"] == "spare-nl-cccc" == result.fallback_tag
+    assert balancer["selector"] == ["proxy-"]
+    assert result.config["burstObservatory"]["subjectSelector"] == ["proxy-"]
+    assert reserve_tag(result.config) == "spare-nl-cccc"
+    assert reserve_fingerprint(result.config, nodes) == "cccc0000"
+    # Без классов хуже fallbackTag — первый участник, резервного нет.
+    plain = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32)
+    assert plain.config["routing"]["balancers"][0]["fallbackTag"] == "proxy-nl-aaaa"
+    assert reserve_tag(plain.config) == "" and reserve_fingerprint(plain.config, nodes) is None
+    assert reserve_tag(None) == "" and reserve_tag({"routing": "битый"}) == ""
 
 
 def test_ipv6_server_dropped_when_ipv6_off():

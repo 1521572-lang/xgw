@@ -28,7 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlencode
 
-from .. import actions, engine, fetch, log, managed, masking
+from .. import actions, cost, engine, fetch, log, managed, masking
 from ..config import Config
 from ..net import dnsmasq
 from ..net.capture import Capture
@@ -450,11 +450,19 @@ class Bot:
         pin = snap.get("pin")
         if pin:
             lines.append(f"Закреплён вручную: {pin['tag']} — автопереключение отключено")
+        reserve = snap.get("reserve")
+        if reserve:
+            price = cost.describe(float(reserve.get("cost") or 0.0))
+            lines.append(f"Резервный: {reserve.get('name') or reserve['tag']} ({price})"
+                         + (" — сейчас трафик идёт через него" if snap.get("state") == "RESERVE"
+                            else ""))
         for name, quota in (snap.get("quota") or {}).items():
             used = quota.get("upload", 0) + quota.get("download", 0)
             text = f"Квота «{name}»: {used / 1e9:.1f} ГБ"
             if quota.get("total"):
                 text += f" из {quota['total'] / 1e9:.1f} ГБ"
+            else:
+                text += ", безлимитная"
             lines.append(text)
         return "\n".join(lines)
 

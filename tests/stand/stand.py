@@ -95,8 +95,16 @@ class Server:
         self.mode_file.write_text(f"{self.mode};latency={self.latency_ms}", encoding="ascii")
         time.sleep(0.3)
 
-    def link(self) -> str:
-        label = quote(f"{FLAGS[self.name]} {self.name.upper()}-stand")
+    def connections(self) -> int:
+        """Сколько соединений реле приняло с запуска (freeze_relay.py)."""
+        try:
+            return int(Path(f"{self.mode_file}.count").read_text(encoding="ascii") or 0)
+        except (OSError, ValueError):
+            return 0
+
+    def link(self, label: str | None = None) -> str:
+        """Ссылка VLESS; label — имя сервера (по умолчанию «🇳🇱 NL-stand»)."""
+        label = quote(label or f"{FLAGS[self.name]} {self.name.upper()}-stand")
         return (
             f"vless://{UUID}@{self.domain}:{self.relay_port}"
             f"?type=tcp&security=none&encryption=none#{label}"
@@ -267,7 +275,8 @@ class Stand:
         capture: bool = False, fail_mode: str = "closed", extra: str = "",
         panel: bool = False, subscription: bool = True,
         direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
-        refresh_minutes: int = 1, containers: bool = True,
+        refresh_minutes: int = 1, containers: bool = True, proxy_domains: tuple[str, ...] = (),
+        probe_host: str = "",
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -282,7 +291,17 @@ class Stand:
         refresh_minutes — как часто демон обновляет подписку. Обновление заодно чинит
         испорченный рабочий конфиг; тесту, которому нужен Xray, сломанный надолго,
         нужен и большой интервал.
+
+        proxy_domains — домены, которые идут через балансировщик (routing.proxy_domains):
+        в режиме loopback «интернет» — это 127.0.0.1, и запрос по адресу ушёл бы напрямую.
+        probe_host — имя origin в probe.url и probe.trace_url (например,
+        «origin.stand.test» вместе с proxy_domains): тогда и сквозная проверка демона идёт
+        через балансировщик в любом режиме стенда.
         """
+        origin = (
+            f"http://{probe_host}:{self.origin_port}" if probe_host
+            else f"http://{self.inet_ip}:{self.origin_port}"
+        )
         dns = f"{self.inet_ip}:{self.dns_port}" if self.dns_port != 53 else self.inet_ip
         if capture:
             network = f"""
@@ -323,8 +342,8 @@ max_members = {max_members}
 rotate_after_min = 0
 
 [probe]
-url = "{self.origin_url('/64k')}"
-trace_url = "{self.origin_url('/trace')}"
+url = "{origin}/64k"
+trace_url = "{origin}/trace"
 interval = "10s"
 sampling = 1
 timeout = "3s"
@@ -333,6 +352,7 @@ scan_spares_minutes = 1
 [routing]
 direct_domains = {json.dumps(list(direct_domains))}
 direct_ips = []
+proxy_domains = {json.dumps(list(proxy_domains))}
 
 [dns]
 proxy_servers = ["{dns}"]
@@ -399,6 +419,17 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
             )
         self._procs.append(proc)
         return proc
+
+    def via_balancer(self, path: str = "/trace") -> bool:
+        """Запрос к origin по имени (origin.stand.test) через http-in шлюза — то есть через
+        балансировщик, если домен в proxy_domains. True — ответ получен."""
+        url = f"http://origin.stand.test:{self.origin_port}{path}"
+        result = self.run_in(
+            "gw", sys.executable, str(HERE / "download.py"),
+            "--proxy", f"127.0.0.1:{self.ports['http']}", "--silence", "5", "--max-total", "15",
+            url,
+        )
+        return result.returncode == 0
 
     def xray_api(self, command: str, *args: str) -> str:
         """`xray api <command>` к ядру шлюза."""

@@ -728,6 +728,7 @@ class Diag:
         members, spares = self.cfg.filters.max_members, 0
         quotas: dict = {}
         size: int | None = None
+        nodes: list[dict] = []
         if self.paths.db_file.exists():
             try:
                 store = Store(self.paths.db_file)
@@ -742,8 +743,22 @@ class Diag:
                     spares = len(nodes) - members
             except Exception as exc:
                 self.log.debug("состояние не прочитано: %s", exc)
-        budget = status.probe_budget(self.cfg, members, spares, size)
         quotas = quotas if isinstance(quotas, dict) else {}
+        spend: dict[str, int] | None = None
+        if nodes:
+            # Как демон проверяет серверы: лимитированные запасные — коротким запросом,
+            # кандидаты в резервный выход — изредка; расход квоты — с множителями.
+            reserve = builder.reserve_tag(engine.read_json(self.paths.xray_config_file))
+            plan = status.scan_plan(
+                self.cfg, *status.node_entries(self.cfg, nodes, quotas, reserve)
+            )
+            budget = status.probe_budget(
+                self.cfg, members, len(plan.full), size,
+                cheap=len(plan.cheap), candidates=len(plan.candidates),
+            )
+            spend = status.quota_spend(self.cfg, plan, budget.size)
+        else:
+            budget = status.probe_budget(self.cfg, members, spares, size)
         month = budget.everything * status.MONTH_DAYS / status.GB
         text = (
             f"~{budget.total / status.MB:.0f} МБ в сутки при {members} участниках и "
@@ -757,9 +772,11 @@ class Diag:
                 "; размер пробы пока неизвестен — probe.url ещё не ответил ни разу, цифра "
                 "уточнится после первой удачной проверки"
             )
-        for name, share in status.quota_share(budget, quotas).items():
+        for name, share in status.quota_share(budget, quotas, spend).items():
             text += f"; за месяц это ~{share:.0f} % квоты подписки «{name}»"
-        warnings = status.budget_warnings(self.cfg, budget, quotas)
+            if spend is not None:
+                text += " (с множителями серверов)"
+        warnings = status.budget_warnings(self.cfg, budget, quotas, spend)
         if warnings:
             return [Check("Трафик проверок", WARN, "; ".join(warnings) + f". Сейчас: {text}")]
         return [Check("Трафик проверок", OK, text)]

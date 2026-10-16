@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import __version__, actions, config, engine, log, managed, masking, priority
+from .. import __version__, actions, config, cost, engine, log, managed, masking, priority
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
@@ -345,13 +345,18 @@ class Panel:
             }
         return {"can_on": True, "can_off": False, "why": ""}
 
-    def _servers(self, members: list[dict], spares: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _servers(
+        self, members: list[dict], spares: list[dict], quotas: dict | None = None
+    ) -> tuple[list[dict], list[dict]]:
         """Все серверы подписок и отдельно — убранные из списка.
 
         Список ведёт демон (inventory.json): в нём и серверы, которых в конфиге
         Xray нет, — отключённые, отсеянные фильтрами, ещё не применённые.
+        quotas — квоты подписок (subscription-userinfo): у серверов подписок с лимитом
+        трафика показывается множитель расхода (cost.py).
         """
         disabled, removed = set(self.cfg.managed.disabled), set(self.cfg.managed.removed)
+        limited = cost.limited_sources(quotas or {})
         listing = engine.load_inventory(self.paths)
         listed = {item.get("fingerprint") for item in listing}
         live: dict[str, tuple[str, dict]] = {}
@@ -389,6 +394,10 @@ class Panel:
                 "protocol": item.get("protocol") or "",
                 "priority": priority.level_of(self.cfg.managed.priority, fingerprint),
             }
+            if source in limited and not item.get("skip"):
+                # Подписка с лимитом трафика: столько байт квоты уходит на байт трафика.
+                # У служебных записей («Осталось 5 ГБ») множителя нет — это не серверы.
+                row["multiplier"] = cost.multiplier(row["name"], self.cfg.filters.multiplier_regex)
             if fingerprint in removed:
                 gone.append(row)
                 continue
@@ -404,7 +413,7 @@ class Panel:
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
-                    scanned=entry.get("scanned"),
+                    scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
                 )
             elif item.get("skip"):
                 row.update(status="skipped", skip=item["skip"])
@@ -440,10 +449,11 @@ class Panel:
         info = capture.describe(check=False)
         loaded = (snapshot.get("capture") or {}).get("loaded")
 
-        servers, gone = self._servers(members, spares)
+        quotas, errors = snapshot.get("quota") or {}, snapshot.get("sub_errors") or {}
+        servers, gone = self._servers(members, spares, quotas)
+        limited = cost.limited_sources(quotas)
         # Сколько серверов дала подписка: вместе с отключёнными, без служебных записей.
         per_source = Counter(row["source"] for row in servers if row["status"] != "skipped")
-        quotas, errors = snapshot.get("quota") or {}, snapshot.get("sub_errors") or {}
         cache = SubscriptionCache(self.paths.cache_dir)
         subscriptions = []
         for sub in cfg.subscriptions:
@@ -459,6 +469,8 @@ class Panel:
                 "fetched": cache.saved_at(sub.name) or None,
                 "error": error.get("error") or "",
                 "quota": quotas.get(sub.name),
+                # Лимит трафика есть (total в subscription-userinfo); иначе — безлимитная.
+                "limited": sub.name in limited,
             })
         links = [
             {
@@ -495,6 +507,8 @@ class Panel:
             "spares": spares,
             # Уровень приоритета серверов, что сейчас в работе (priority.py).
             "tier": snapshot.get("tier"),
+            # Резервный выход балансировщика (запасной класса хуже, cost.py).
+            "reserve": snapshot.get("reserve"),
             "servers": servers,
             "removed": gone,
             "sources": sources,

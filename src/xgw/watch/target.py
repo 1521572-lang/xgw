@@ -109,24 +109,47 @@ def dominant(results: Sequence[ScanResult]) -> str:
     return failure_text(common, count, total)
 
 
-def sample(view: Sequence[NodeInfo], verdicts: dict[str, str]) -> list[NodeInfo]:
+def sample(
+    view: Sequence[NodeInfo], verdicts: dict[str, str], skip: Iterable[str] = ()
+) -> list[NodeInfo]:
     """Кого опрашивать: все участники и несколько запасных — сначала те, что прошли
-    последний скан (их отказ весомее всего)."""
+    последний скан (их отказ весомее всего). skip — теги запасных, пробовать которые
+    дорого: лимитированные, когда участники безлимитные (cost.py)."""
+    skipped = set(skip)
     members = [info for info in view if info.role == "proxy" and info.probe_port]
-    spares = [info for info in view if info.role == "spare" and info.probe_port]
+    spares = [
+        info for info in view
+        if info.role == "spare" and info.probe_port and info.tag not in skipped
+    ]
     spares.sort(key=lambda info: 0 if verdicts.get(info.probe_tag) in _GOOD else 1)
     return [*members, *spares[:SAMPLE_SPARES]]
 
 
-def base_ping(cfg: Config) -> bool:
-    """Базовый запрос через VPN — probe.trace_url через http-in: проходит ли через
-    серверы хоть что-то. Без trace_url проверить нечем — считаем, что не проходит."""
+def base_ping(
+    cfg: Config, members: Sequence[NodeInfo] = (), password: str = "", user: str = ""
+) -> bool:
+    """Базовый запрос через VPN — probe.trace_url: проходит ли через серверы хоть что-то.
+    Без trace_url проверить нечем — считаем, что не проходит.
+
+    members (с паролем проб) — спрашивать через probe-inbound каждого участника, пока
+    не ответит хоть один. Через http-in нельзя, когда у балансировщика есть резервный
+    выход: пробы ядра падают у всех участников, и трафик http-in идёт через резервный —
+    он ответил бы, даже если участники и правда мертвы. Без members — через http-in."""
     if not cfg.probe.trace_url:
         return False
-    return checks.http_get_via_proxy(
-        "127.0.0.1", cfg.xray.http_port, cfg.probe.trace_url,
-        timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
-    ).ok
+    if not members:
+        return checks.http_get_via_proxy(
+            "127.0.0.1", cfg.xray.http_port, cfg.probe.trace_url,
+            timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
+        ).ok
+    return any(
+        checks.http_get_via_proxy(
+            "127.0.0.1", info.probe_port, cfg.probe.trace_url,
+            timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
+            proxy_user=user, proxy_pass=password,
+        ).ok
+        for info in members if info.probe_port
+    )
 
 
 def direct_signature(cfg: Config, mark: int | None) -> str:

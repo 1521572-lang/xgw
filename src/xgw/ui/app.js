@@ -17,6 +17,8 @@
     LEAK: ["bad", "Трафик идёт мимо VPN"],
     // Серверы тут ни при чём: не отвечает сам файл, которым шлюз их проверяет.
     PROBE_TARGET_UNREACHABLE: ["warn", "Адрес проверки недоступен"],
+    // Серверы в работе не отвечают, трафик несёт резервный (лимитированный) сервер.
+    RESERVE: ["warn", "Работает резервный сервер"],
   };
   const VERDICTS = {
     OK: ["ok", "в порядке"],
@@ -36,10 +38,10 @@
     capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
     rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
-    probe: "адрес проверки",
+    probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
-    PROBE_TARGET_UNREACHABLE: "адрес проверки",
+    PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
   };
   const TTL_LABELS = { "10m": "10 минут", "1h": "1 час", "6h": "6 часов", "24h": "24 часа" };
   const ICONS = {
@@ -221,7 +223,7 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve], () => renderServers(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
@@ -267,11 +269,14 @@
     const perDay = budget.all_mb >= 1000 ? `${decimal(budget.all_mb / 1000, 2)} ГБ` : `${Math.round(budget.all_mb)} МБ`;
     const parts = [`проба ${decimal(budget.probe_bytes / 1000)} КБ × ${budget.members} в работе каждые ${budget.interval_s} с`];
     if (budget.spares) parts.push(`${budget.spares} запасных раз в ${budget.scan_minutes} мин`);
+    if (budget.cheap) parts.push(`из них ${budget.cheap} лимитированных — коротким запросом`);
     const lead = el("span", {}, "Проверки серверов расходуют около ", el("b", { text: `${perDay} в сутки` }),
       " и ", el("b", { text: `${decimal(budget.month_gb)} ГБ в месяц` }), ` (${parts.join(", ")}).`);
     const lines = [lead];
     for (const [name, share] of Object.entries(budget.quota_share || {})) {
-      lines.push(el("span", { text: ` За месяц это около ${Math.round(share)} % трафика подписки «${name}».` }));
+      // Доля квоты — с множителями серверов: проба через x10 тратит вдесятеро больше.
+      const exact = share < 1 ? "меньше 1" : `около ${Math.round(share)}`;
+      lines.push(el("span", { text: ` За месяц это ${exact} % трафика подписки «${name}» (с учётом множителей серверов).` }));
     }
     note.classList.toggle("over", Boolean(budget.over));
     if (budget.over) {
@@ -394,7 +399,10 @@
       return `в работе${dead}`;
     }
     if (server.status === "spare") {
-      return "запасной" + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "");
+      const role = server.reserve
+        ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
+        : "запасной";
+      return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "");
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -439,6 +447,18 @@
     const title = el("div", { class: "row-title" }, el("span", { text: server.name, title: server.name }));
     if (pinned) title.append(el("span", { class: "tag warn", text: "закреплён" }));
     else if (server.selected) title.append(el("span", { class: "tag on", text: "выбран" }));
+    if (server.reserve) {
+      title.append(el("span", {
+        class: `tag ${s.state === "RESERVE" ? "warn" : ""}`, text: "резервный",
+        title: "Резервный выход: через него трафик идёт, только когда все серверы в работе не отвечают. Шлюз проверяет его редко и коротким запросом — он тратит квоту подписки.",
+      }));
+    }
+    if (server.multiplier !== undefined) {
+      title.append(el("span", {
+        class: "tag", text: multiplierText(server.multiplier),
+        title: "Множитель расхода: столько трафика подписки уходит на каждый байт через этот сервер",
+      }));
+    }
     const classes = [];
     if (server.selected || pinned) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
@@ -475,7 +495,26 @@
     return node;
   }
 
+  function multiplierText(value) {
+    return `x${String(Math.round(value * 100) / 100).replace(".", ",")}`;
+  }
+
+  function renderReserve(s) {
+    const note = $("reserve-note");
+    const reserve = s.reserve;
+    note.hidden = !(reserve && s.state === "RESERVE");
+    if (note.hidden) {
+      note.textContent = "";
+      return;
+    }
+    const price = reserve.cost ? ` (${multiplierText(reserve.cost)})` : "";
+    note.textContent = `Серверы в работе не отвечают — трафик идёт через резервный сервер «${reserve.name}»${price}. `
+      + (reserve.cost ? "Он тратит квоту подписки; " : "")
+      + "как только серверы в работе ответят, шлюз вернётся к ним сам.";
+  }
+
   function renderServers(s) {
+    renderReserve(s);
     const used = s.servers.filter((server) => server.status !== "skipped");
     $("members-count").textContent = used.length ? String(used.length) : "";
     const ranked = s.servers.some((server) => (server.priority || "medium") !== "medium");
@@ -532,7 +571,9 @@
     if (!quota) return null;
     const used = (quota.upload || 0) + (quota.download || 0);
     const total = quota.total || 0;
-    let text = `Израсходовано ${gigabytes(used)} ГБ` + (total ? ` из ${gigabytes(total)} ГБ` : "");
+    let text = total
+      ? `Израсходовано ${gigabytes(used)} ГБ из ${gigabytes(total)} ГБ, осталось ${gigabytes(Math.max(0, total - used))} ГБ`
+      : `Безлимитная · израсходовано ${gigabytes(used)} ГБ`;
     if (quota.expire) text += ` · до ${day(quota.expire)}.${new Date(quota.expire * 1000).getFullYear()}`;
     const box = el("div", {}, el("div", { class: "row-sub", text }));
     if (total > 0) {
@@ -554,7 +595,9 @@
       const main = el("div", { class: "row-main" }, title,
         el("div", { class: "row-sub", text: `${sub.host} · серверов: ${sub.servers} · ${fetched}` }));
       if (sub.error) main.append(el("div", { class: "row-error", text: `Не обновилась: ${sub.error}` }));
-      const quota = quotaNode(sub.quota, s.now);
+      // Подписка без заголовка о трафике — безлимитная: её серверы квоту не тратят.
+      const quota = sub.quota ? quotaNode(sub.quota, s.now)
+        : sub.fetched ? el("div", { class: "row-sub", text: "Безлимитная: лимит трафика подписка не сообщает" }) : null;
       if (quota) main.append(quota);
       return el("li", {}, main, sub.managed
         ? iconButton("remove", `Убрать подписку ${sub.name}`, () => confirmRemove(

@@ -44,6 +44,9 @@ TITLES = {
     "budget": "трафик проверок",
     "xray": "Xray",
     "pin": "закрепление сервера",
+    "priority": "серверы в работе",
+    "RESERVE": "трафик идёт через резервный сервер",
+    "reserve": "резервный сервер",
 }
 _URGENT = frozenset({"ALL_DEAD", "XRAY_DOWN", "LEAK", "leak", "capture", "rollback"})
 

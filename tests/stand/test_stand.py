@@ -198,6 +198,112 @@ def test_priority_levels_go_down_when_the_top_is_dead_and_come_back(stand):
     assert "fr" not in [entry["tag"].split("-")[1] for entry in status["members"]]
 
 
+@pytest.fixture(params=MODES)
+def priced_stand(request, tmp_path):
+    """Стенд с четырьмя серверами: nl, de — в безлимитной подписке, fr (x1) и us (x10) — в
+    подписке с лимитом трафика (заголовок subscription-userinfo в самом файле подписки)."""
+    instance = Stand(
+        tmp_path, Path(XRAY_BIN), mode=request.param, names=("nl", "de", "fr", "us")
+    )
+    try:
+        instance.start()
+        paid = tmp_path / "paid.txt"
+        lines = [
+            "# subscription-userinfo: upload=0; download=1000000000; total=100000000000",
+            instance.servers["fr"].link("🇫🇷 x1 FR-stand"),
+            instance.servers["us"].link("🇺🇸 x10 US-stand"),
+        ]
+        paid.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+        instance.set_subscription(("nl", "de"))
+        extra = ["", "[[subscriptions]]", 'name = "paid"', f'url = "{paid.as_uri()}"',
+                 "refresh_minutes = 1"]
+        # Пробы и сквозная проверка — по имени origin через балансировщик: в режиме
+        # loopback «интернет» — 127.0.0.1, и по адресу запрос ушёл бы напрямую.
+        instance.write_config(
+            max_members=2, extra="\n".join(extra) + "\n", probe_host="origin.stand.test",
+            proxy_domains=("domain:stand.test",),
+        )
+        yield instance
+    finally:
+        instance.stop()
+
+
+def test_limited_reserve_carries_the_traffic_only_while_the_unlimited_are_dead(priced_stand):
+    """0.1.8 на живом Xray. Безлимитные nl и de — участники, лимитированные fr (x1) и us
+    (x10) — запасные, fr — резервный выход балансировщика (fallbackTag). Ядро резервный не
+    пробует. Безлимитные перестали отвечать — трафик идёт через fr (RESERVE), участники
+    те же; fr тоже не отвечает — резервным становится us (через API, Xray не
+    перезапускается); безлимитные ожили — Xray сам вернул трафик на них."""
+    stand = priced_stand
+    result = stand.xgw("apply", "--now")
+    assert result.returncode == 0, result.stderr + stand.xray_log()
+    stand.start_daemon()
+    servers = stand.servers
+
+    def country(tag: str) -> str:
+        return tag.split("-")[1]
+
+    def status_when(predicate, timeout: float):
+        def check():
+            status = stand.xgw_json("status")
+            return status if status.get("daemon") and predicate(status) else None
+
+        found = wait_for(check, timeout, step=2)
+        assert found, stand.tail("daemon", 60)
+        return found
+
+    def reserve_is(name: str):
+        return lambda s: country((s.get("reserve") or {}).get("tag", "x-x-x")) == name
+
+    status = status_when(lambda s: s["state"] == "HEALTHY" and reserve_is("fr")(s) and all(
+        spare["verdict"] for spare in s["spares"]), 90)
+    assert sorted(country(member["tag"]) for member in status["members"]) == ["de", "nl"]
+    costs = {country(spare["tag"]): spare["cost"] for spare in status["spares"]}
+    assert costs == {"fr": 1.0, "us": 10.0}
+    applied = stand.applied()
+    assert applied["routing"]["balancers"][0]["fallbackTag"] == status["reserve"]["tag"]
+    assert applied["burstObservatory"]["subjectSelector"] == ["proxy-"]
+    # Ядро пробует участников, а резервный — нет: через fr за это время ни одного соединения.
+    fr_before, nl_before = servers["fr"].connections(), servers["nl"].connections()
+    time.sleep(2.5 * CYCLE)
+    assert stand.via_balancer()  # запрос через балансировщик — через участника, не через fr
+    assert servers["fr"].connections() == fr_before, stand.tail("daemon", 80)
+    assert servers["nl"].connections() > nl_before
+    pid = stand.xray_pid()
+
+    for name in ("nl", "de"):
+        servers[name].set_mode("drop")
+    status = status_when(lambda s: s["state"] == "RESERVE", 60)
+    assert sorted(country(member["tag"]) for member in status["members"]) == ["de", "nl"]
+    assert any("трафик идёт через резервный сервер «🇫🇷 x1 FR-stand» (x1)" in event["detail"]
+               for event in status["events"])
+    fr_before = servers["fr"].connections()
+    assert stand.via_balancer()  # трафик идёт — через резервный
+    assert wait_for(lambda: servers["fr"].connections() >= fr_before + 3, 30, step=1)
+
+    servers["fr"].set_mode("drop")
+    status = status_when(lambda s: reserve_is("us")(s) and s["state"] == "RESERVE", 120)
+    assert any("резервный сервер — «🇺🇸 x10 US-stand» (x10)" in event["detail"]
+               for event in status["events"])
+    assert stand.xray_pid() == pid  # fallbackTag сменился через API
+    assert sorted(country(member["tag"]) for member in status["members"]) == ["de", "nl"]
+    us_before = servers["us"].connections()
+    assert stand.via_balancer()
+    assert wait_for(lambda: servers["us"].connections() >= us_before + 3, 30, step=1)
+
+    for name in ("nl", "de"):
+        servers[name].set_mode("pass")
+    status = status_when(lambda s: s["state"] == "HEALTHY", 60)
+    assert any("серверы в работе снова отвечают" in event["detail"]
+               for event in status["events"])
+    assert stand.xray_pid() == pid
+    time.sleep(3)
+    us_before = servers["us"].connections()
+    assert stand.via_balancer()
+    time.sleep(CYCLE)
+    assert servers["us"].connections() == us_before  # трафик ушёл с резервного
+
+
 def test_daemon_replaces_frozen_member_and_expires_pin(stand):
     """«Замороженный» участник заменяется запасным; закрепление снимается по сроку."""
     members = _up(stand)

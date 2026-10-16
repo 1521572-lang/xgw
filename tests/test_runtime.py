@@ -1,13 +1,14 @@
 """Мелкие части этапа 2: разбор `xray api bi`, служба с pid-файлом, события,
 статус и оценка трафика проверок."""
 
+import json
 import subprocess
 import sys
 import time
 
 import pytest
 
-from xgw.config import Config
+from xgw.config import Config, Subscription
 from xgw.generator.builder import NodeInfo
 from xgw.paths import Paths
 from xgw.store import Store
@@ -331,7 +332,10 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         "tag": "proxy-nl-aaaa", "fingerprint": "aaaa1111", "name": "NL-1", "source": "main",
         "alive": True,
         "delay_ms": 123, "dead_since": None, "priority": "medium",
+        # Подписка «main» о лимите не сообщила — безлимитная: квоту сервер не тратит.
+        "multiplier": 1.0, "limited": False, "cost": 0.0,
     }
+    assert snapshot["reserve"] is None and snapshot["spares"][0]["reserve"] is False
     assert snapshot["tier"] == "medium"
     assert snapshot["members"][1]["alive"] is None  # ядро по узлу ещё ничего не сообщило
     assert snapshot["spares"][0]["verdict"] == "FROZEN" and snapshot["spares"][0]["bytes"] == 16384
@@ -343,6 +347,94 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
     text = status.render_status(snapshot)
     assert "Состояние: HEALTHY" in text and "жив, 123 мс" in text and "нет данных" in text
     assert "FROZEN, 16384 Б" in text
+
+
+def test_status_shows_multipliers_the_reserve_and_the_quota_spent_with_multipliers(
+    tmp_path, monkeypatch
+):
+    """Безлимитные участники, лимитированные запасные с множителями и резервный выход."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    rows = [
+        ("aaaa1111", "proxy-nl-aaaa", "proxy", "NL безлимит", "free"),
+        ("bbbb2222", "spare-de-bbbb", "spare", "x10 🛜 Германия", "paid"),
+        ("cccc3333", "spare-fi-cccc", "spare", "Финляндия", "paid"),
+        ("dddd4444", "spare-se-dddd", "spare", "Швеция", "free"),
+    ]
+    store = Store(paths.db_file)
+    store.replace_nodes([
+        {"fingerprint": fp, "tag": tag, "role": role, "name": name, "source": source,
+         "address": "203.0.113.1", "port": 443, "updated": 0}
+        for fp, tag, role, name, source in rows
+    ])
+    store.set_meta("quota", json.dumps({
+        "paid": {"upload": 0, "download": 2 * 10**12, "total": 3 * 10**12},
+        "free": {"upload": 0, "download": 10**9, "total": 0},
+    }))
+    store.close()
+    applied = {"routing": {"balancers": [{"tag": "auto", "fallbackTag": "spare-fi-cccc"}]}}
+    paths.xray_config_file.write_text(json.dumps(applied), encoding="utf-8")
+    cfg = Config()
+    cfg.subscriptions = [Subscription(name="paid", url="https://203.0.113.9/a"),
+                         Subscription(name="free", url="https://203.0.113.9/b"),
+                         Subscription(name="silent", url="https://203.0.113.9/c")]
+    view = [
+        NodeInfo(fp, tag, tag.replace(role, "probe"), 20001 + index, role)
+        for index, (fp, tag, role, _name, _source) in enumerate(rows)
+    ]
+    snapshot = status.collect_status(cfg, paths, view, observatory={}, xray_ok=True)
+    spares = {spare["tag"]: spare for spare in snapshot["spares"]}
+    assert spares["spare-de-bbbb"]["cost"] == 10.0 and spares["spare-de-bbbb"]["limited"]
+    assert spares["spare-fi-cccc"]["reserve"] and not spares["spare-de-bbbb"]["reserve"]
+    assert spares["spare-se-dddd"]["cost"] == 0.0
+    assert snapshot["reserve"] == {
+        "tag": "spare-fi-cccc", "name": "Финляндия", "source": "paid", "multiplier": 1.0,
+        "cost": 1.0,
+    }
+    assert snapshot["subscriptions"] == [
+        {"name": "paid", "limited": True}, {"name": "free", "limited": False},
+        {"name": "silent", "limited": False},
+    ]
+    budget = snapshot["budget"]
+    # Участник безлимитный: квоту «paid» тратят только редкие дешёвые проверки двух
+    # лимитированных кандидатов в резервный выход — x1 и x10.
+    expected = status.CHEAP_SCAN_BYTES * 86400 / status.RESERVE_RECHECK * (1 + 10)
+    assert budget["quota_mb"] == {"paid": round(expected / status.MB, 1)}
+    assert budget["quota_share"]["paid"] < 0.01 and budget["cheap"] == 0
+    assert budget["spares"] == 1  # по расписанию сканируется только безлимитный запасной
+
+    text = status.render_status(snapshot)
+    assert "x10 🛜 Германия [x10]" in text and "Финляндия [x1]  ← резервный выход" in text
+    assert "NL безлимит [" not in text and "Швеция [" not in text
+    assert "Резервный выход: spare-fi-cccc «Финляндия» (x1)" in text
+    assert "Квота «paid»: израсходовано 2000.0 ГБ из 3000.0 ГБ, осталось 1000.0 ГБ" in text
+    assert "Квота «free»: израсходовано 1.0 ГБ, лимита нет — безлимитная" in text
+    assert "Подписка «silent»: безлимитная" in text
+
+
+def test_quota_spend_counts_probes_through_limited_members_with_multipliers():
+    """Безлимитных нет: участники — лимитированные x10, их пробует ядро; квоту это
+    тратит вдесятеро, а 10 % остатка — повод предупредить."""
+    cfg = Config()
+    members = [{"fingerprint": f"aaaa000{i}", "source": "paid", "cost": 10.0}
+               for i in range(2)]
+    spares = [{"fingerprint": "bbbb0000", "source": "paid", "cost": 10.0, "reserve": False}]
+    plan = status.scan_plan(cfg, members, spares)
+    assert plan.cheap == spares and plan.full == [] and plan.candidates == []
+    size = 57_620
+    spend = status.quota_spend(cfg, plan, size)
+    probes = 2 * size * 86400 / 30 + size * 86400 / cfg.watchdog.interval_s
+    scans = status.CHEAP_SCAN_BYTES * 24
+    assert spend == {"paid": int((probes + scans) * 10)}
+    budget = status.probe_budget(cfg, 2, 0, size, cheap=1)
+    quotas = {"paid": {"upload": 0, "download": 0, "total": 3 * 10**12}}
+    share = status.quota_share(budget, quotas, spend)["paid"]
+    assert share == round(100.0 * spend["paid"] * 30 / (3 * 10**12), 1)
+    tight = {"paid": {"upload": 0, "download": 3 * 10**12 - 10**10, "total": 3 * 10**12}}
+    (warning,) = status.budget_warnings(cfg, budget, tight, spend)
+    assert warning.startswith("расход квоты на проверки ~") and "«paid»" in warning
+    assert status.budget_warnings(cfg, budget, quotas, spend) == []
 
 
 def test_status_line_says_capture_waits_for_the_inbound():

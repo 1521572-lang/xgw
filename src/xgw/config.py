@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from . import cost
 from . import managed as managed_file
 
 
@@ -104,6 +105,9 @@ class Filters:
     exclude_regex: str = "(?i)(истека|осталось|трафик|expire)"
     max_members: int = 5
     rotate_after_min: int = 15
+    # Множитель расхода трафика в имени сервера («x10 Германия»): первая группа — число.
+    # Пусто — множители не ищутся, все серверы x1 (cost.py).
+    multiplier_regex: str = cost.DEFAULT_MULTIPLIER_REGEX
 
 
 @dataclass
@@ -414,7 +418,7 @@ def parse_seconds(value: str) -> int | None:
 def _validate(cfg: Config) -> list[str]:
     """Проверяет значения; опасные для работы исправляет на значения по умолчанию."""
     warnings: list[str] = []
-    for name in ("include_regex", "exclude_regex"):
+    for name in ("include_regex", "exclude_regex", "multiplier_regex"):
         try:
             re.compile(getattr(cfg.filters, name))
         except re.error as exc:

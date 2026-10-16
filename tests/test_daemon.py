@@ -105,6 +105,7 @@ class Harness(Daemon):
         self.verdicts: dict[str, str] = {}  # probe-тег → вердикт скана
         self.default_verdict = "OK"
         self.scanned: list[str] = []
+        self.scan_urls: dict[str, str] = {}  # тег → адрес последней проверки
         self.e2e_checks = 0
         self.base_ping = False  # базовый запрос через VPN (проверка «не отвечает probe.url»)
         self.direct = ""  # probe.url напрямую: пусто — отдаётся, иначе класс сбоя
@@ -132,10 +133,10 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, tier=None):
+    def _assemble(self, prefer, tier=None, reserve=None):
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
-            xray_bin=None, check=False, prefer=prefer, tier=tier,
+            xray_bin=None, check=False, prefer=prefer, tier=tier, reserve=reserve,
         )
 
     def _apply(self, config, *, urgent):
@@ -147,8 +148,9 @@ class Harness(Daemon):
             self.paths.pending_config_file.unlink(missing_ok=True)
         return ApplyOutcome(self.apply_mode)
 
-    def _scan(self, info, password):
+    def _scan(self, info, password, url=None):
         self.scanned.append(info.tag)
+        self.scan_urls[info.tag] = url or self.cfg.probe.url
         if "*" in self.failures or info.probe_tag in self.failures:
             failure = self.failures.get(info.probe_tag) or self.failures["*"]
             return ScanResult(info.tag, failure.verdict, failure.bytes_read, failure.seconds,
@@ -156,7 +158,7 @@ class Harness(Daemon):
         verdict = self.verdicts.get(info.probe_tag, self.default_verdict)
         return ScanResult(info.tag, verdict, 65536 if verdict == "OK" else 16384, 0.5)
 
-    def _base_ping(self):
+    def _base_ping(self, members=(), password=""):
         return self.base_ping
 
     def _direct_probe(self):
@@ -251,9 +253,9 @@ def test_scan_does_not_block_watchdog(daemon):
     _started(daemon)
     original = daemon._scan
 
-    def slow(info, password):
+    def slow(info, password, url=None):
         daemon.t += 5.0  # каждый скан «занимает» 5 с
-        return original(info, password)
+        return original(info, password, url)
 
     daemon._scan = slow
     daemon.next_scan = 0.0  # пора сканировать заново
@@ -310,7 +312,9 @@ def test_all_dead_on_a_level_goes_down_and_comes_back_when_it_answers(daemon):
     daemon.next_refresh = daemon.t + 3600
     (member,) = daemon.tags("proxy")
     daemon.set_alive(**{member.replace("-", "_"): False})
-    assert daemon.tick() is State.ALL_DEAD
+    # Трафик сразу несёт резервный выход балансировщика — сервер среднего уровня (0.1.8):
+    # не ALL_DEAD, а RESERVE.
+    assert daemon.tick() is State.RESERVE
     # Живых высокого уровня нет — в работе средние, сразу и с правом перезапуска.
     members = daemon.tags("proxy")
     assert {_fingerprint(daemon, tag) for tag in members} <= set(others) and len(members) == 2
@@ -410,7 +414,8 @@ def test_levels_follow_the_real_machine_plan(daemon):
     assert members(d) == [dead]
     d.set_alive(**{dead_tag.replace("-", "_"): False})
     states = [step(d, dead_tag) for _ in range(3)]
-    assert State.ALL_DEAD in states and d.status()["tier"] == "medium"
+    # Трафик несёт резервный выход — сервер среднего уровня (0.1.8): RESERVE, не ALL_DEAD.
+    assert State.RESERVE in states and d.status()["tier"] == "medium"
     assert dead not in members(d) and low not in members(d)
     assert any("на уровне «высокий» живых серверов нет — в работе серверы уровня «средний»"
                in event for event in d.events())
@@ -1413,7 +1418,7 @@ def _fail_first_member(daemon: Harness, verdict: str = "FROZEN") -> tuple[dict, 
     bad: dict[str, bool] = {}
     other = {"spares": "OK"}
 
-    def scan(info, password):
+    def scan(info, password, url=None):
         daemon.scanned.append(info.tag)
         if info.role == "proxy" and (not bad or info.tag in bad):
             bad[info.tag] = True
@@ -1429,12 +1434,15 @@ def _fail_first_member(daemon: Harness, verdict: str = "FROZEN") -> tuple[dict, 
     return bad, other
 
 
+@pytest.mark.parametrize("limited", [True, False])
 @pytest.mark.parametrize("verdict", ["FROZEN", "CONNECT_FAIL"])
-def test_member_failing_the_first_check_is_replaced_at_once(daemon, verdict):
+def test_member_failing_the_first_check_is_replaced_at_once(daemon, verdict, limited):
     """Первый состав балансировщика берётся из подписки наугад. Участник, у которого
     собственная проба шлюза показала «заморозку» или отказ в соединении, меняется на
     проверенный запасной сразу — без ожидания rotate_after_min (15 минут) и раньше,
     чем ядро само объявит его мёртвым."""
+    if not limited:
+        daemon.source.quotas = {}  # подписка о лимите не сообщает — безлимитная
     bad, _other = _fail_first_member(daemon, verdict)
     assert daemon.tick() is State.HEALTHY  # по ядру сведений ещё нет
     (victim,) = bad
@@ -1448,12 +1456,15 @@ def test_member_failing_the_first_check_is_replaced_at_once(daemon, verdict):
     assert len(rotation) == 1 and f"не прошли первую проверку: {victim} — {verdict}" in rotation[0]
 
     # Дальше — тишина: замена уже прошла скан, заново никого не проверяют и не меняют.
+    # Кроме одного: у подписки с лимитом запасные проверяются дешёвым запросом, а он
+    # «заморозку» не ловит — новый участник один раз проходит первую проверку probe.url.
+    replacement = next(tag for tag in members if tag not in daemon.scanned[:2])
     daemon.scanned.clear()
     daemon.applied.clear()
     daemon.set_alive()
     for _ in range(3):
         assert daemon.tick() is State.HEALTHY
-    assert daemon.scanned == [] and daemon.applied == []
+    assert daemon.scanned == ([replacement] if limited else []) and daemon.applied == []
     # Выбывший стал запасным со своим вердиктом — обратно его не возьмут.
     spares = {spare["tag"]: spare["verdict"] for spare in daemon.status()["spares"]}
     assert spares[victim.replace("proxy-", "spare-")] == verdict
@@ -1577,3 +1588,355 @@ def test_panel_list_names_a_server_whose_domain_is_gone(daemon, monkeypatch):
     listed = {item["name"]: item["skip"] for item in engine.load_inventory(daemon.paths)}
     assert listed["ghost"] == "dns"
     assert [skip for name, skip in listed.items() if name != "ghost"] == [""] * len(ALL_LINKS)
+
+
+# --- 0.1.8: лимиты подписок, множители и резервный выход ---------------------------
+
+PAID = {"upload": 0, "download": 10**9, "total": 10**12}
+MIXED = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("paid", "x1 Финляндия"),
+         ("paid", "x10 🛜 Германия"), ("paid", "x100 LTE")]
+
+
+def _priced(layout=MIXED) -> engine.Inventory:
+    """Серверы ALL_LINKS по возрастанию отпечатка: подписка и имя — из layout. «paid» —
+    подписка с лимитом трафика, «free» — без него (заголовка subscription-userinfo нет)."""
+    raws, _, _ = parse_links_text("\n".join(ALL_LINKS), "main")
+    nodes = sorted((raw_to_node(raw, "main") for raw in raws), key=lambda node: node.fingerprint)
+    for node, (source, name) in zip(nodes, layout, strict=True):
+        node.source, node.name = source, name
+    return engine.Inventory(nodes, {"paid": dict(PAID)}, True)
+
+
+def _named(daemon: Harness) -> dict[str, str]:
+    """Имя сервера → его тег в применённом конфиге."""
+    names = {node.fingerprint: node.name for node in daemon.inventory.nodes}
+    return {names[info.fingerprint]: info.tag for info in daemon.view()}
+
+
+def _probe(tag: str) -> str:
+    return "probe-" + tag.split("-", 1)[1]
+
+
+def _fallback(daemon: Harness) -> str:
+    config = engine.read_json(daemon.paths.xray_config_file)
+    return config["routing"]["balancers"][0]["fallbackTag"]
+
+
+def _reserve_started(daemon: Harness, layout=MIXED) -> Harness:
+    """Первые шаги: конфиг собран, участники проверены, резервный выход перепроверен."""
+    daemon.source = _priced(layout)
+    _started(daemon)
+    daemon.tick()  # перепроверка резервного выхода и кандидатов — дешёвым запросом
+    daemon.applied.clear()
+    daemon.scanned.clear()
+    daemon.next_refresh = daemon.t + 3600
+    return daemon
+
+
+def test_unlimited_servers_work_and_the_cheapest_limited_one_waits_as_the_reserve(daemon):
+    daemon.source = _priced()
+    _started(daemon)
+    named = _named(daemon)
+    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит 1"], named["Безлимит 2"]])
+    # Резервный выход — лимитированный x1; observatory пробует только участников.
+    config = engine.read_json(daemon.paths.xray_config_file)
+    assert _fallback(daemon) == named["x1 Финляндия"]
+    assert config["burstObservatory"]["subjectSelector"] == ["proxy-"]
+    paid = [named[name] for name in ("x1 Финляндия", "x10 🛜 Германия", "x100 LTE")]
+    # Лимитированные запасные проверяются только как кандидаты в резервный — один раз
+    # после запуска и коротким запросом (probe.trace_url), а не загрузкой probe.url.
+    daemon.tick()
+    assert sorted(daemon.scanned) == sorted(paid)
+    assert {daemon.scan_urls[tag] for tag in paid} == {daemon.cfg.probe.trace_url}
+    assert daemon.applied == []  # резервный прошёл проверку — менять нечего
+    # По расписанию скана (scan_spares_minutes) их больше не трогают.
+    daemon.scanned.clear()
+    for _ in range(3):
+        daemon.t += daemon.cfg.probe.scan_spares_minutes * 60 * 1.3
+        daemon.next_refresh = daemon.t + 3600
+        daemon.tick()
+    assert daemon.scanned == []
+    status = daemon.status()
+    assert status["reserve"]["name"] == "x1 Финляндия" and status["reserve"]["cost"] == 1.0
+    costs = {spare["name"]: spare["cost"] for spare in status["spares"]}
+    assert costs == {"x1 Финляндия": 1.0, "x10 🛜 Германия": 10.0, "x100 LTE": 100.0}
+    assert {member["cost"] for member in status["members"]} == {0.0}
+    # Раз в RESERVE_RECHECK (6 ч) — перепроверка: снова коротким запросом.
+    daemon.t += 6 * 3600 * 1.3
+    daemon.next_refresh = daemon.t + 3600
+    daemon.tick()
+    daemon.tick()
+    assert sorted(daemon.scanned) == sorted(paid)
+
+
+def test_dead_unlimited_servers_hand_the_traffic_to_the_reserve_and_take_it_back(daemon):
+    """Безлимитные мертвы — трафик несёт резервный лимитированный x1 (Xray сам, через
+    fallbackTag): состояние RESERVE с уведомлением, безлимитных на лимитированные не
+    меняют; безлимитный ожил — Xray вернулся к нему сам, о чём тоже есть событие."""
+    _reserve_started(daemon)
+    members = daemon.tags("proxy")
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+    assert daemon.tick() is State.RESERVE
+    assert daemon.reserve_mode  # сквозная проверка — коротким запросом
+    entered = [event for event in daemon.events() if event.startswith("RESERVE:")]
+    assert len(entered) == 1 and "HEALTHY → RESERVE" in entered[0]
+    assert "трафик идёт через резервный сервер «x1 Финляндия» (x1)" in entered[0]
+    assert daemon.status()["state"] == "RESERVE"
+    assert daemon.collected == [False]  # подписка — напрямую: через Xray пошла бы через x1
+    for _ in range(10):
+        daemon.t += 20
+        assert daemon.tick() is State.RESERVE
+    assert daemon.tags("proxy") == members and daemon.applied == []
+    assert len(daemon.collected) == 1  # внеочередной опрос — не чаще RESERVE_RETRY
+    paid = {tag for name, tag in _named(daemon).items() if name.startswith("x")}
+    assert not paid & set(daemon.scanned)  # лимитированные не пробуются probe.url
+    daemon.set_alive()
+    assert daemon.tick() is State.HEALTHY and not daemon.reserve_mode
+    assert any(
+        "reserve: серверы в работе снова отвечают — Xray вернул на них трафик с резервного "
+        "«x1 Финляндия» (x1)" in event for event in daemon.events()
+    )
+
+
+def test_dead_unlimited_member_is_replaced_by_an_unlimited_spare_while_the_reserve_works(daemon):
+    """Пока трафик несёт резервный (и тратит квоту), мёртвых безлимитных меняют на живых
+    безлимитных запасных сразу, не дожидаясь rotate_after_min."""
+    layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("free", "Безлимит 3"),
+              ("paid", "x1 Финляндия"), ("paid", "x10 🛜 Германия")]
+    _reserve_started(daemon, layout)
+    members = daemon.tags("proxy")
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+    assert daemon.tick() is State.RESERVE
+    daemon.tick()
+    named = _named(daemon)
+    assert named["Безлимит 3"] in daemon.tags("proxy")
+    assert all(not tag.startswith("proxy-") for name, tag in named.items() if name.startswith("x"))
+
+
+def test_reserve_that_stops_answering_is_replaced_by_the_next_cheapest(daemon):
+    daemon.source = _priced()
+    daemon.tick()
+    named = _named(daemon)
+    x1, x10, x100 = (named[name] for name in ("x1 Финляндия", "x10 🛜 Германия", "x100 LTE"))
+    daemon.verdicts[_probe(x1)] = "CONNECT_FAIL"
+    daemon.set_alive()
+    daemon.applied.clear()
+    daemon.tick()  # перепроверка: x1 не ответил — резервным становится x10
+    assert _fallback(daemon) == x10.replace("proxy-", "spare-")
+    assert len(daemon.applied) == 1 and daemon.applied[0][1] is False  # через API, не срочно
+    assert any("резервный сервер — «x10 🛜 Германия» (x10)" in event for event in daemon.events())
+    # Безлимитные мертвы, и через резервный трафик не идёт: ALL_DEAD — сразу перепроверка
+    # всех кандидатов, x10 тоже не отвечает — резервным становится x100, срочно.
+    daemon.next_refresh = daemon.t + 3600
+    daemon.verdicts[_probe(x10)] = "TIMEOUT"
+    daemon.applied.clear()
+    daemon.e2e = False
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+    assert daemon.tick() is State.ALL_DEAD
+    daemon.t += 20
+    daemon.tick()
+    assert _fallback(daemon) == x100.replace("proxy-", "spare-")
+    assert daemon.applied[-1][1] is True
+    assert any("резервный сервер — «x100 LTE» (x100)" in event for event in daemon.events())
+    names = {node.fingerprint: node.name for node in daemon.inventory.nodes}
+    # Лимитированных в балансировщик не взяли: участники — по-прежнему безлимитные.
+    assert all(names[_fingerprint(daemon, tag)].startswith("Безлимит")
+               for tag in daemon.tags("proxy"))
+    # Через x100 трафик пошёл — RESERVE.
+    daemon.e2e = True
+    daemon.t += 20
+    assert daemon.tick() is State.RESERVE
+    # Ни один кандидат не отвечает — об этом одно событие, резервный остаётся прежним.
+    daemon.verdicts[_probe(x100)] = "CONNECT_FAIL"
+    daemon.e2e = False
+    for _ in range(4):
+        daemon.t += 20
+        daemon.tick()
+    daemon.t += 301
+    daemon.tick()
+    daemon.tick()
+    notes = [event for event in daemon.events() if "резервного сервера нет" in event]
+    assert len(notes) == 1 and _fallback(daemon) == x100.replace("proxy-", "spare-")
+
+
+def test_without_unlimited_servers_limited_ones_work_as_before(daemon):
+    """Безлимитных нет: в балансировщике x1 (как в 0.1.7), резервный — x10. Запасные x1
+    сканируются по расписанию, но коротким запросом; заменивший мёртвого участника x1
+    один раз проходит первую проверку probe.url."""
+    daemon.cfg.filters.rotate_after_min = 0
+    layout = [("paid", "x1 A"), ("paid", "x1 B"), ("paid", "x1 C"), ("paid", "x10 D"),
+              ("paid", "x10 E")]
+    _reserve_started(daemon, layout)
+    named = _named(daemon)
+    assert sorted(daemon.tags("proxy")) == sorted([named["x1 A"], named["x1 B"]])
+    assert _fallback(daemon) == named["x10 D"]
+    daemon.t += daemon.cfg.probe.scan_spares_minutes * 60 * 1.3
+    daemon.next_refresh = daemon.t + 3600
+    daemon.tick()
+    assert daemon.scanned == [named["x1 C"]]
+    assert daemon.scan_urls[named["x1 C"]] == daemon.cfg.probe.trace_url
+    victim = named["x1 A"]
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    daemon.scanned.clear()
+    assert daemon.tick() is State.DEGRADED
+    named = _named(daemon)
+    assert named["x1 C"] in daemon.tags("proxy") and named["x10 D"] not in daemon.tags("proxy")
+    daemon.set_alive()
+    daemon.tick()
+    assert daemon.scanned == [named["x1 C"]]  # первая проверка нового участника
+    assert daemon.scan_urls[named["x1 C"]] == daemon.cfg.probe.url
+
+
+def test_unlimited_servers_that_appear_take_over_from_limited_ones(daemon):
+    limited = [("paid", "x1 A"), ("paid", "x1 B"), ("paid", "x10 C"), ("paid", "x10 D"),
+               ("paid", "x10 E")]
+    _reserve_started(daemon, limited)
+    before = sorted(daemon.tags("proxy"))
+    # Подписка обновилась: D и E теперь безлимитные (другая подписка).
+    daemon.source = _priced([*limited[:3], ("free", "Безлимит D"), ("free", "Безлимит E")])
+    daemon.next_refresh = 0.0
+    daemon.tick()
+    daemon.next_refresh = daemon.t + 3600
+    for _ in range(4):
+        daemon.t += 20
+        daemon.tick()
+    assert sorted(daemon.tags("proxy")) != before
+    named = _named(daemon)
+    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит D"], named["Безлимит E"]])
+    assert any(
+        "снова отвечают серверы лучшего класса — в работе безлимитные серверы (были — "
+        "лимитированные серверы x1)" in event for event in daemon.events()
+    )
+    assert _fallback(daemon) == named["x1 A"]  # x1 — теперь резервный
+
+
+def test_dead_probe_url_is_found_while_the_reserve_carries_the_traffic(daemon):
+    """probe.url перестал отвечать: ядро считает мёртвыми всех безлимитных, и трафик
+    уходит на резервный — сквозная проверка (коротким запросом) при этом проходит. Демон
+    всё равно опрашивает участников и, узнав, что не отвечает сам адрес пробы, переводит
+    ядро на запасной адрес: трафик возвращается на безлимитные."""
+    _reserve_started(daemon)
+    daemon.failures["*"] = _http_403()
+    daemon.direct = "HTTP 403"
+    members = daemon.tags("proxy")
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+    assert daemon.tick() is State.PROBE_TARGET_UNREACHABLE
+    # Опрошены только участники: лимитированных запасных пробовать probe.url дорого.
+    assert sorted(daemon.scanned) == sorted(members)
+    probes = daemon.applied[-1][0]["burstObservatory"]["pingConfig"]["destination"]
+    assert probes == daemon.cfg.probe.trace_url and daemon.tags("proxy") == members
+
+
+def test_member_based_base_ping_ignores_the_reserve(daemon, monkeypatch):
+    """Базовый запрос «носят ли серверы трафик» идёт через probe-inbound участников, а не
+    через http-in: тот при мёртвых участниках понёс бы его через резервный."""
+    from xgw.watch import checks
+
+    _reserve_started(daemon)
+    seen: list[int] = []
+
+    def get(host, port, url, **kwargs):
+        seen.append(port)
+        return checks.DownloadResult(ok=False)
+
+    monkeypatch.setattr(checks, "http_get_via_proxy", get)
+    members = [info for info in daemon.view() if info.role == "proxy"]
+    assert Daemon._base_ping(daemon, members, "pass") is False
+    assert seen == [info.probe_port for info in members]
+    assert daemon.cfg.xray.http_port not in seen
+
+
+# --- уведомления: только когда нужно действие человека ------------------------------
+
+
+def _with_sink(tmp_path, monkeypatch) -> tuple[Harness, list[tuple[str, str]]]:
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.filters.exclude_regex = ""
+    cfg.dns.bootstrap = []
+    cfg.notify.min_interval_min = 0  # придержка по типу не мешает считать уведомления
+    sent: list[tuple[str, str]] = []
+    return Harness(cfg, paths, sinks=[lambda kind, text: sent.append((kind, text))]), sent
+
+
+def test_servers_the_gateway_fixes_itself_are_not_notified(tmp_path, monkeypatch):
+    """«Часть серверов недоступна», замена сервера, смена уровня — шлюз справляется сам:
+    это события в журнале, без уведомления. «Все серверы недоступны» — уведомление."""
+    daemon, sent = _with_sink(tmp_path, monkeypatch)
+    try:
+        daemon.cfg.filters.rotate_after_min = 0
+        _started(daemon)
+        victim = daemon.tags("proxy")[0]
+        daemon.set_alive(**{victim.replace("-", "_"): False})
+        assert daemon.tick() is State.DEGRADED
+        daemon.tick()
+        events = daemon.events()
+        assert any(event.startswith("DEGRADED:") for event in events)
+        assert any(event.startswith("rotation:") for event in events)
+        assert sent == []
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+        daemon.next_refresh = daemon.t + 3600
+        assert daemon.tick() is State.ALL_DEAD
+        assert [kind for kind, _text in sent] == ["ALL_DEAD"]
+    finally:
+        daemon.store.close()
+
+
+def test_long_work_through_the_reserve_is_notified_once_and_so_is_the_return(
+    tmp_path, monkeypatch
+):
+    daemon, sent = _with_sink(tmp_path, monkeypatch)
+    try:
+        _reserve_started(daemon)
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+        assert daemon.tick() is State.RESERVE
+        assert sent == []  # короткий переход на резервный — не повод
+        for _ in range(16):  # 5 минут с лишним
+            daemon.t += 20
+            daemon.tick()
+        reserve = [text for kind, text in sent if kind == "reserve"]
+        assert len(reserve) == 1 and "трафик идёт через резервный сервер «x1 Финляндия»" in (
+            reserve[0])
+        daemon.set_alive()
+        daemon.t += 20
+        assert daemon.tick() is State.HEALTHY
+        assert [kind for kind, _text in sent] == ["reserve", "reserve"]
+        assert "снова отвечают" in sent[-1][1]
+        # Следующий короткий заход на резервный — снова без уведомлений.
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+        daemon.tick()
+        daemon.set_alive()
+        daemon.t += 20
+        daemon.tick()
+        assert len(sent) == 2
+    finally:
+        daemon.store.close()
+
+
+def test_subscription_failure_is_notified_only_when_it_lasts(tmp_path, monkeypatch):
+    daemon, sent = _with_sink(tmp_path, monkeypatch)
+    try:
+        _started(daemon)
+        daemon.source = _inventory(complete=False)
+        for _ in range(3):
+            daemon.next_refresh = 0.0
+            daemon.t += 600
+            daemon.tick()
+        assert sent == []  # 20 минут без подписки — ещё не повод
+        assert any("подписки получить не удалось" in event for event in daemon.events())
+        for _ in range(5):
+            daemon.next_refresh = 0.0
+            daemon.t += 600
+            daemon.tick()
+        texts = [text for kind, text in sent if kind == "subscription"]
+        assert len(texts) == 1 and "не обновляются уже 1 ч" in texts[0]
+        # Подписка снова получена — следующий долгий сбой уведомит заново.
+        daemon.source = _inventory()
+        daemon.next_refresh = 0.0
+        daemon.tick()
+        assert daemon._sub_failing_since is None and not daemon._sub_alerted
+    finally:
+        daemon.store.close()

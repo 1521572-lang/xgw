@@ -13,11 +13,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import masking, priority
+from .. import cost, masking, priority
 from ..config import Config, parse_seconds, probe_bytes
-from ..generator.builder import NodeInfo
+from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
 from ..store import Store
+from .scan import CHEAP_SCAN_BYTES, RESERVE_CANDIDATES, RESERVE_RECHECK
 
 DEFAULT_PROBE_BYTES = 65536
 MB = 1_000_000  # ТЗ считает в десятичных единицах: 5 × 64 КиБ × 2880 ≈ 0,94 ГБ
@@ -68,10 +69,17 @@ def measured_probe_size(store: Store, url: str) -> int | None:
     return None
 
 
-def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None) -> Budget:
+def probe_budget(
+    cfg: Config, members: int, spares: int, size: int | None = None, *,
+    cheap: int = 0, candidates: int = 0,
+) -> Budget:
     """size — размер тела probe.url по последней сквозной проверке; без него берётся
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
-    незнакомого адреса — 64 КиБ."""
+    незнакомого адреса — 64 КиБ.
+
+    spares — запасные, которых скан проверяет загрузкой probe.url; cheap — запасные
+    лимитированных подписок, которых он проверяет дешёвым запросом (scan.cheap_url);
+    candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK."""
     measured = bool(size)
     known = size or probe_bytes(cfg.probe.url)
     size = known or DEFAULT_PROBE_BYTES
@@ -79,7 +87,10 @@ def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None
     scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
     return Budget(
         probes=int(members * size * 86400 / max(1, interval)),
-        scans=int(spares * size * scans_per_day),
+        scans=int(
+            spares * size * scans_per_day + cheap * CHEAP_SCAN_BYTES * scans_per_day
+            + candidates * CHEAP_SCAN_BYTES * 86400 / RESERVE_RECHECK
+        ),
         e2e=int(size * 86400 / max(1, cfg.watchdog.interval_s)),
         size=size,
         measured=measured,
@@ -87,20 +98,100 @@ def probe_budget(cfg: Config, members: int, spares: int, size: int | None = None
     )
 
 
-def quota_share(budget: Budget, quotas: dict[str, dict[str, int]]) -> dict[str, float]:
-    """Какую долю полной квоты подписки (в процентах) проверки расходуют за месяц."""
+@dataclass(frozen=True)
+class Plan:
+    """Кого и как проверяют (для оценки трафика): участники — пробы ядра, запасные —
+    скан probe.url или дешёвым запросом, кандидаты в резервный выход — изредка."""
+
+    members: list[dict]
+    full: list[dict]  # запасные, которых скан качает целиком (безлимитные)
+    cheap: list[dict]  # запасные лимитированных подписок: скан — дешёвым запросом
+    candidates: list[dict]  # кандидаты в резервный выход: раз в RESERVE_RECHECK
+
+
+def scan_plan(cfg: Config, members: list[dict], spares: list[dict]) -> Plan:
+    """Как демон проверяет серверы (daemon.Daemon._queue_scan, _reserve_step): записи
+    статуса с полями fingerprint и cost."""
+    levels = cfg.managed.priority
+
+    def klass(entry: dict) -> cost.Klass:
+        return cost.Klass(priority.rank(levels, entry["fingerprint"]), entry.get("cost", 0.0))
+
+    tier = min((klass(entry) for entry in members), default=None)
+    full, cheap, rest = [], [], []
+    for entry in spares:
+        price = entry.get("cost", 0.0)
+        if price == 0:
+            full.append(entry)
+        elif tier is None or klass(entry) <= tier:
+            cheap.append(entry)
+        else:
+            rest.append(entry)
+    rest.sort(key=lambda entry: (klass(entry), not entry.get("reserve")))
+    return Plan(members, full, cheap, rest[:RESERVE_CANDIDATES + 1])
+
+
+def node_entries(
+    cfg: Config, nodes: list[dict], quotas: dict, reserve: str = ""
+) -> tuple[list[dict], list[dict]]:
+    """Участники и запасные из записей базы (Store.all_nodes) с полями для scan_plan:
+    стоимость (cost.py) и отметка резервного выхода. Для оценки трафика в `xgw diag`."""
+    limited = cost.limited_sources(quotas)
+    members, spares = [], []
+    for node in nodes:
+        factor = cost.multiplier(str(node.get("name") or ""), cfg.filters.multiplier_regex)
+        price = factor if node.get("source") in limited else 0.0
+        entry = {
+            "fingerprint": str(node.get("fingerprint") or ""), "source": node.get("source"),
+            "cost": price, "reserve": node.get("tag") == reserve,
+        }
+        (members if node.get("role") == "proxy" else spares).append(entry)
+    return members, spares
+
+
+def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
+    """Сколько байт квоты в сутки проверки тратят у каждой лимитированной подписки — с
+    множителями серверов: проба 57 КБ через сервер x100 уносит 5,7 МБ квоты."""
+    interval = parse_seconds(cfg.probe.interval) or 30
+    scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
+    e2e = size * 86400 / max(1, cfg.watchdog.interval_s)
+    spend: dict[str, float] = {}
+
+    def add(entry: dict, amount: float) -> None:
+        price = entry.get("cost", 0.0)
+        if price > 0 and entry.get("source"):
+            spend[entry["source"]] = spend.get(entry["source"], 0.0) + amount * price
+
+    for entry in plan.members:
+        # Сквозная проверка идёт через выбранного балансировщиком — делим поровну.
+        add(entry, size * 86400 / max(1, interval) + e2e / len(plan.members))
+    for entry in plan.cheap:
+        add(entry, CHEAP_SCAN_BYTES * scans_per_day)
+    for entry in plan.candidates:
+        add(entry, CHEAP_SCAN_BYTES * 86400 / RESERVE_RECHECK)
+    return {name: int(value) for name, value in spend.items()}
+
+
+def quota_share(
+    budget: Budget, quotas: dict[str, dict[str, int]], spend: dict[str, int] | None = None
+) -> dict[str, float]:
+    """Какую долю полной квоты подписки (в процентах) проверки расходуют за месяц.
+    spend — расход по подпискам с множителями (quota_spend); без него — весь трафик
+    проверок относится к каждой подписке."""
     share: dict[str, float] = {}
-    monthly = budget.everything * MONTH_DAYS
     for name, quota in quotas.items():
         total = quota.get("total", 0) if isinstance(quota, dict) else 0
+        daily = budget.everything if spend is None else spend.get(name, 0)
         if total > 0:
-            share[name] = round(100.0 * monthly / total, 1)
+            share[name] = round(100.0 * daily * MONTH_DAYS / total, 1)
     return share
 
 
 def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]],
-                   members: int, spares: int) -> dict:
-    """Бюджет проб для status.json, `xgw status` и панели."""
+                   members: int, spares: int, spend: dict[str, int] | None = None,
+                   cheap: int = 0) -> dict:
+    """Бюджет проб для status.json, `xgw status` и панели. cheap — сколько из spares
+    проверяется дешёвым запросом (лимитированные подписки)."""
     return {
         "probes_mb": round(budget.probes / MB, 1),
         "scans_mb": round(budget.scans / MB, 1),
@@ -116,15 +207,24 @@ def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]
         "guessed": budget.guessed,
         "members": members,
         "spares": spares,
+        "cheap": cheap,
         "interval_s": parse_seconds(cfg.probe.interval) or 30,
         "scan_minutes": max(1, cfg.probe.scan_spares_minutes),
-        "quota_share": quota_share(budget, quotas),
-        "warnings": budget_warnings(cfg, budget, quotas),
+        "quota_share": quota_share(budget, quotas, spend),
+        # Квота подписок, которую проверки тратят за сутки (с множителями), МБ.
+        "quota_mb": {name: round(value / MB, 1) for name, value in (spend or {}).items()},
+        "warnings": budget_warnings(cfg, budget, quotas, spend),
     }
 
 
-def budget_warnings(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]]) -> list[str]:
+def budget_warnings(
+    cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]],
+    spend: dict[str, int] | None = None,
+) -> list[str]:
     """Превышение max_daily_probe_mb или 10 % остатка квоты подписки, исчерпанная квота.
+
+    spend — расход квоты по подпискам с множителями (quota_spend); без него с остатком
+    каждой подписки сравнивается весь трафик проверок.
 
     Размер пробы взят наугад (budget.guessed) — о расходе не предупреждаем: цифра ни о
     чём не говорит, а совет урезать проверки, пока probe.url не ответил, только навредил
@@ -141,11 +241,13 @@ def budget_warnings(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int
         if total <= 0:
             continue
         left = total - quota.get("upload", 0) - quota.get("download", 0)
+        daily = budget.total if spend is None else spend.get(name, 0)
         if left <= 0:
             warnings.append(f"квота подписки «{name}» исчерпана")
-        elif budget.total > left * 0.10 and not budget.guessed:
+        elif daily > left * 0.10 and not budget.guessed:
+            text = "трафик проверок" if spend is None else "расход квоты на проверки"
             warnings.append(
-                f"трафик проверок ~{daily_mb:.0f} МБ/сут — больше 10 % остатка квоты "
+                f"{text} ~{daily / MB:.0f} МБ/сут — больше 10 % остатка квоты "
                 f"подписки «{name}» ({left / MB:.0f} МБ)"
             )
     return warnings
@@ -198,6 +300,16 @@ def collect_status(
     except Exception:  # статус показываем и без базы
         pass
 
+    limited = cost.limited_sources(quotas)
+    pattern = cfg.filters.multiplier_regex
+
+    def price(tag: str) -> dict:
+        """Множитель и стоимость сервера (cost.py)."""
+        factor = cost.multiplier(names.get(tag, ""), pattern)
+        paid = origins.get(tag, "") in limited
+        return {"multiplier": factor, "limited": paid, "cost": factor if paid else 0.0}
+
+    reserve = reserve_tag(_load_json_file(paths.xray_config_file))
     members, spares = [], []
     for info in view:
         if info.role == "proxy":
@@ -209,6 +321,7 @@ def collect_status(
                     "fingerprint": info.fingerprint,
                     "name": names.get(info.tag, ""),
                     "source": origins.get(info.tag, ""),
+                    **price(info.tag),
                     # None — ядро ещё не завершило по узлу ни одной пробы
                     "alive": entry["alive"] if entry else None,
                     "delay_ms": round(entry["delay"] * 1000)
@@ -226,6 +339,10 @@ def collect_status(
                     "fingerprint": info.fingerprint,
                     "name": names.get(info.tag, ""),
                     "source": origins.get(info.tag, ""),
+                    **price(info.tag),
+                    # Резервный выход балансировщика: через него идёт трафик, когда все
+                    # участники мертвы (builder.select_nodes).
+                    "reserve": info.tag == reserve,
                     "verdict": scan["verdict"] if scan else None,
                     "bytes": scan["bytes"] if scan else None,
                     "seconds": scan["seconds"] if scan else None,
@@ -234,7 +351,13 @@ def collect_status(
                 }
             )
 
-    budget = probe_budget(cfg, len(members), len(spares), probe_size)
+    plan = scan_plan(cfg, members, spares)
+    budget = probe_budget(
+        cfg, len(members), len(plan.full), probe_size,
+        cheap=len(plan.cheap), candidates=len(plan.candidates),
+    )
+    spend = quota_spend(cfg, plan, budget.size)
+    backup = next((entry for entry in spares if entry["reserve"]), None)
     status = {
         "updated": now,
         "daemon": daemon,
@@ -252,11 +375,23 @@ def collect_status(
         "spares": spares,
         # Уровень приоритета, серверы которого сейчас в работе (priority.py).
         "tier": _tier(cfg, members),
+        # Резервный выход балансировщика (запасной класса хуже) — None, если его нет.
+        "reserve": {
+            key: backup[key] for key in ("tag", "name", "source", "multiplier", "cost")
+        } if backup else None,
+        # Подписки: с лимитом трафика или безлимитные (cost.limited_sources).
+        "subscriptions": [
+            {"name": sub.name, "limited": sub.name in limited}
+            for sub in cfg.subscriptions if sub.url
+        ],
         "selecting": list(selecting),
         "pin": pin if pin and pin.get("until", 0) > now else None,
         "quota": quotas,
         "sub_errors": sub_errors,
-        "budget": budget_summary(cfg, budget, quotas, len(members), len(spares)),
+        "budget": budget_summary(
+            cfg, budget, quotas, len(members), len(plan.full) + len(plan.cheap), spend,
+            cheap=len(plan.cheap),
+        ),
         # Сводка разбора подписок: сколько серверов отброшено и сколько дублей схлопнуто.
         "nodes": summary,
         "probe_target": probe_target,
@@ -271,6 +406,14 @@ def collect_status(
 def _tier(cfg: Config, members: list[dict]) -> str | None:
     rank = priority.best(cfg.managed.priority, [member["fingerprint"] for member in members])
     return None if rank is None else priority.LEVELS[rank]
+
+
+def _load_json_file(path: Path) -> dict | None:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def write_status(paths: Paths, status: dict) -> None:
@@ -324,6 +467,13 @@ def _level(entry: dict) -> str:
     return "" if level == priority.DEFAULT else f" [{priority.NAMES.get(level, level)}]"
 
 
+def _price(entry: dict) -> str:
+    """Отметка множителя у сервера лимитированной подписки: « [x10]»."""
+    if not entry.get("limited"):
+        return ""
+    return f" [{cost.label(float(entry.get('multiplier', 1.0)))}]"
+
+
 def render_servers(status: dict) -> str:
     lines: list[str] = []
     members = status.get("members") or []
@@ -345,7 +495,8 @@ def render_servers(status: dict) -> str:
             health = "МЁРТВ" + (f" уже {dead}" if dead else "")
         mark = "  ← выбран" if member["tag"] in (status.get("selecting") or []) else ""
         lines.append(
-            f"  {member['tag']:<20} {health:<18} {member.get('name', '')}{_level(member)}{mark}"
+            f"  {member['tag']:<20} {health:<18} {member.get('name', '')}{_level(member)}"
+            f"{_price(member)}{mark}"
         )
     lines.append(f"Запасные ({len(spares)}):")
     for spare in spares:
@@ -354,7 +505,18 @@ def render_servers(status: dict) -> str:
         else:
             scan = f"{spare['verdict']}, {spare['bytes']} Б за {spare['seconds']} с"
             scan += f" ({_clock(spare.get('scanned'))})"
-        lines.append(f"  {spare['tag']:<20} {scan:<40} {spare.get('name', '')}{_level(spare)}")
+        mark = "  ← резервный выход" if spare.get("reserve") else ""
+        lines.append(
+            f"  {spare['tag']:<20} {scan:<40} {spare.get('name', '')}{_level(spare)}"
+            f"{_price(spare)}{mark}"
+        )
+    reserve = status.get("reserve")
+    if reserve:
+        lines.append(
+            f"Резервный выход: {reserve['tag']} «{reserve.get('name', '')}» "
+            f"({cost.describe(float(reserve.get('cost', 0.0)))}) — через него идёт трафик, "
+            "только когда все участники не отвечают; ядро его не пробует"
+        )
     return "\n".join(lines)
 
 
@@ -453,8 +615,14 @@ def render_budget(budget: dict) -> list[str]:
             f"{budget.get('interval_s', 30)} с; запасных — {budget.get('spares', 0)}, скан раз в "
             f"{budget.get('scan_minutes', 60)} мин"
         )
+        if budget.get("cheap"):
+            lines.append(
+                f"  из запасных {budget['cheap']} — лимитированные: скан коротким запросом"
+            )
         for name, share in (budget.get("quota_share") or {}).items():
-            lines.append(f"  за месяц это ~{share:.0f} % квоты подписки «{name}»")
+            daily = (budget.get("quota_mb") or {}).get(name)
+            spent = f" (~{daily:.0f} МБ квоты в сутки с множителями)" if daily else ""
+            lines.append(f"  за месяц это ~{share:.0f} % квоты подписки «{name}»{spent}")
     lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
     return lines
 
@@ -490,15 +658,21 @@ def render_status(status: dict) -> str:
     if nodes:
         lines.append(nodes)
     lines.append(render_servers(status))
-    for name, quota in (status.get("quota") or {}).items():
+    quotas = status.get("quota") or {}
+    for name, quota in quotas.items():
         total = quota.get("total", 0)
         used = quota.get("upload", 0) + quota.get("download", 0)
         text = f"Квота «{name}»: израсходовано {used / 1e9:.1f} ГБ"
         if total:
-            text += f" из {total / 1e9:.1f} ГБ"
+            text += f" из {total / 1e9:.1f} ГБ, осталось {max(0, total - used) / 1e9:.1f} ГБ"
+        else:
+            text += ", лимита нет — безлимитная"
         if quota.get("expire"):
             text += f", действует до {_clock(quota['expire'])}"
         lines.append(text)
+    for sub in status.get("subscriptions") or []:
+        if sub.get("name") not in quotas and not sub.get("limited"):
+            lines.append(f"Подписка «{sub['name']}»: безлимитная (лимит трафика не сообщает)")
     budget = status.get("budget") or {}
     if budget:
         lines.extend(render_budget(budget))

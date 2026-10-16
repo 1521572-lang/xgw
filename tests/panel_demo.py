@@ -1,14 +1,15 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting]
+                                                      budget|waiting|reserve]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
 каталоге. Сцена hostile подставляет имена сервера и устройства с HTML: в
 браузере они должны остаться текстом. Сцена probe — не отвечает
 сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
-waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками.
+waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками, reserve —
+безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1).
 """
 
 from __future__ import annotations
@@ -82,9 +83,31 @@ LIVE = {
 
 
 HOSTILE = {"d4d4d4d4": "<img src=x onerror=alert(1)> Стокгольм"}
+# Сцена reserve: «запасная» и ручная ссылка — безлимитные (лимита они не сообщают), «main»
+# — с лимитом, у её серверов множители в имени; резервный выход — x1.
+RESERVE_FP = "f6f6f6f6"
+RESERVE_SERVERS = [
+    ("c3c3c3c3", "proxy-fi-c3c3", "🇫🇮 Финляндия · Хельсинки", "запасная", "member"),
+    ("e5e5e5e5", "proxy-xx-e5e5", "Trojan-1", "manual", "member"),
+    ("f6f6f6f6", "spare-pl-f6f6", "🇵🇱 x1 Польша · Варшава", "main", "spare"),
+    ("a1a1a1a1", "spare-nl-a1a1", "🇳🇱 x10📶🛜 Нидерланды 🚀🚀 | AI", "main", "spare"),
+    ("b2b2b2b2", "spare-de-b2b2", "x10 🛜 Германия 🚀🚀 АВТО", "main", "spare"),
+    ("d4d4d4d4", "spare-se-d4d4", "🇸🇪 x100 Швеция · обход белых списков", "main", "spare"),
+    ("0f117e4d", "", "Осталось 35.5 ГБ трафика", "main", "filter"),
+]
+RESERVE_LIVE = {
+    "c3c3c3c3": {"alive": False, "delay_ms": None, "dead": 420},
+    "e5e5e5e5": {"alive": False, "delay_ms": None, "dead": 420},
+    "f6f6f6f6": {"verdict": "OK", "seconds": 0.3},
+    "a1a1a1a1": {"verdict": "OK", "seconds": 0.4},
+    "b2b2b2b2": {"verdict": None, "seconds": None},
+    "d4d4d4d4": {"verdict": None, "seconds": None},
+}
 
 
 def _servers(scene: str) -> list[tuple]:
+    if scene == "reserve":
+        return RESERVE_SERVERS
     if scene != "hostile":
         return SERVERS
     return [(key, tag, HOSTILE.get(key, name), source, role)
@@ -96,7 +119,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     for fingerprint, tag, name, source, role in _servers(scene):
         if fingerprint in excluded or role not in ("member", "spare"):
             continue  # демон убрал бы отключённый сервер из ядра
-        live = LIVE[fingerprint]
+        live = (RESERVE_LIVE if scene == "reserve" else LIVE)[fingerprint]
         base = {"tag": tag, "fingerprint": fingerprint, "name": name, "source": source}
         if role == "member":
             members.append({
@@ -109,6 +132,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
                 **base, "verdict": verdict, "seconds": live["seconds"],
                 "bytes": 65536 if verdict in ("OK", "SLOW") else 16384,
                 "scanned": now - 1500 if verdict else None,
+                "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
             })
     state, action = "DEGRADED", "часть серверов недоступна — замена на запасные"
     if scene == "empty":
@@ -116,6 +140,14 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     elif scene == "trouble":
         state = "XRAY_DOWN"
         action = "Xray не отвечает — перезапуск службы, после двух неудач откат на last-good"
+    reserve = None
+    if scene == "reserve":
+        state = "RESERVE"
+        action = ("серверы в работе не отвечают — трафик идёт через резервный сервер "
+                  "«🇵🇱 x1 Польша · Варшава» (x1); Xray вернётся к ним сам, как только они "
+                  "ответят; поиск замены среди запасных")
+        reserve = {"tag": "spare-pl-f6f6", "name": "🇵🇱 x1 Польша · Варшава", "source": "main",
+                   "multiplier": 1.0, "cost": 1.0}
     probe_target = ""
     if scene == "probe":
         state = "PROBE_TARGET_UNREACHABLE"
@@ -136,6 +168,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         "xray": {"ok": scene != "trouble", "version": "26.3.27"},
         "capture": {"loaded": True},
         "members": members, "spares": spares, "selecting": [], "pin": None,
+        "reserve": reserve,
         "quota": quotas,
         "sub_errors": {} if scene == "empty" else {
             "запасная": {"error": "HTTP 403 от сервера подписки", "ts": now - 300},
@@ -309,7 +342,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8791)
     parser.add_argument(
         "--scene", default="work",
-        choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting"))
+        choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
+                 "reserve"))
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)
