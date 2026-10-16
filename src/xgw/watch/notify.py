@@ -47,6 +47,7 @@ TITLES = {
     "priority": "серверы в работе",
     "RESERVE": "трафик идёт через резервный сервер",
     "reserve": "резервный сервер",
+    "main": "основной сервер",
 }
 _URGENT = frozenset({"ALL_DEAD", "XRAY_DOWN", "LEAK", "leak", "capture", "rollback"})
 

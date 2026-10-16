@@ -31,6 +31,9 @@ class DownloadResult:
     kind: str = ""
     status: int = 0                # код ответа HTTP, если заголовки получены
     body: bytes = b""              # начало тела (не больше keep_body байт)
+    # Сколько секунд шло тело — от конца заголовков до последнего байта; по нему считается
+    # скорость (watch/speed.py): рукопожатия туннеля и TLS в замер не входят.
+    body_seconds: float = 0.0
 
     @property
     def frozen(self) -> bool:
@@ -51,6 +54,8 @@ def http_get_via_proxy(
     max_total: float = MAX_TOTAL_SECONDS,
     tls_context: ssl.SSLContext | None = None,
     user_agent: str = "",
+    max_bytes: int = 0,
+    max_body_seconds: float = 0.0,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -59,6 +64,8 @@ def http_get_via_proxy(
     Нет новых байтов `silence` секунд → stalled; вся загрузка дольше
     `max_total` секунд → timeout (защита от «капающего» сервера).
     `user_agent` — заголовок запроса (probe.user_agent); пусто — «xgw/<версия>».
+    `max_bytes` / `max_body_seconds` — замер скорости: тело дальше этого не читается, и
+    загрузка всё равно удачная (ok), хоть файл и не дочитан.
     """
     parts = urlsplit(url)
     host = parts.hostname
@@ -102,7 +109,10 @@ def http_get_via_proxy(
                 headers["Proxy-Authorization"] = f"Basic {token}"
             request = _request("GET", url, headers, user_agent)  # абсолютный URI
         sock.sendall(request)
-        return _read_response(sock, silence=silence, deadline=deadline, keep_body=keep_body)
+        return _read_response(
+            sock, silence=silence, deadline=deadline, keep_body=keep_body,
+            max_bytes=max_bytes, max_body_seconds=max_body_seconds,
+        )
     except TimeoutError as exc:
         return DownloadResult(ok=False, kind="timeout", error=f"таймаут: {exc}")
     except OSError as exc:
@@ -149,9 +159,11 @@ def _recv(sock: socket.socket, silence: float, deadline: float) -> bytes:
 
 
 def _read_response(
-    sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0
+    sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0,
+    max_bytes: int = 0, max_body_seconds: float = 0.0,
 ) -> DownloadResult:
-    """Читает ответ: заголовки, затем тело до Content-Length или закрытия."""
+    """Читает ответ: заголовки, затем тело до Content-Length или закрытия (либо до
+    max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до конца)."""
     buffer = b""
     try:
         while fetch.HEAD_END not in buffer:
@@ -178,11 +190,23 @@ def _read_response(
         kind = "proxy" if status == 407 else "http"
         return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}")
 
+    started = time.monotonic()
     downloaded = len(rest)
     body = rest[:keep_body]
     tail = rest[-5:]
+
+    def enough() -> bool:
+        return bool(max_bytes and downloaded >= max_bytes) or bool(
+            max_body_seconds and time.monotonic() - started >= max_body_seconds
+        )
+
     try:
         while not _complete(downloaded, length, chunked, tail):
+            if enough():
+                return DownloadResult(
+                    ok=True, downloaded=downloaded, status=status, body=body,
+                    body_seconds=time.monotonic() - started,
+                )
             chunk = _recv(sock, silence, deadline)
             if not chunk:
                 break
@@ -195,18 +219,24 @@ def _read_response(
         return DownloadResult(
             ok=False, downloaded=downloaded, stalled=True, kind="stall", status=status,
             body=body, error=f"тишина {silence:.0f} с {where}",
+            body_seconds=time.monotonic() - started,
         )
     except _Deadline:
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="timeout", status=status, body=body,
             error=f"загрузка не уложилась в отведённое время ({downloaded} байт тела)",
+            body_seconds=time.monotonic() - started,
         )
+    seconds = time.monotonic() - started
     if length is not None and downloaded < length:
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
             error=f"соединение закрыто после {downloaded} из {length} байт тела",
+            body_seconds=seconds,
         )
-    return DownloadResult(ok=True, downloaded=downloaded, status=status, body=body)
+    return DownloadResult(
+        ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds
+    )
 
 
 def _parse_head(head: bytes) -> tuple[int | None, int | None, bool]:

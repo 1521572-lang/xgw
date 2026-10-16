@@ -78,3 +78,23 @@ def parse_observatory(metrics: dict) -> dict[str, dict]:
                 delay = parse_duration(average, unit_ms=False)
         result[str(tag)] = {"alive": bool(entry.get("alive", False)), "delay": delay}
     return result
+
+
+def proxy_traffic(metrics: dict) -> int | None:
+    """Сколько байт прошло через серверы в работе (outbound «proxy-*») с запуска Xray.
+
+    Формат Xray 26.10.10 (проверено на живом процессе): "stats": {"outbound": {"proxy-a":
+    {"downlink": 3000205, "uplink": 102}, …}, "inbound": {…}, "user": {…}} — счётчики есть,
+    пока в конфиге включены stats и policy.system.statsOutbound*. None — счётчиков нет."""
+    section = metrics.get("stats") if isinstance(metrics, dict) else None
+    outbound = section.get("outbound") if isinstance(section, dict) else None
+    if not isinstance(outbound, dict):
+        return None
+    total = 0
+    for tag, counters in outbound.items():
+        if str(tag).startswith("proxy-") and isinstance(counters, dict):
+            total += sum(
+                value for value in counters.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
+    return total

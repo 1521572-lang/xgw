@@ -9,7 +9,9 @@
 класс хуже, когда на нынешнем живых нет и пробовать тот класс не дороже, возвращается
 выше, когда сервер того класса снова проходит проверку, и подбирает балансировщику
 резервный выход — лимитированный сервер, через который трафик идёт, пока участники
-мертвы (_reserve_step).
+мертвы (_reserve_step). С 0.1.9 он же держит «основной» сервер — самый быстрый по замеру
+скорости — и закрепляет его в ядре, чтобы выход не скакал между серверами (_main_step,
+watch/speed.py); при отказе основного трафик сразу получает другой живой участник.
 
 Один поток, один шаг за раз: применение конфига идёт под файловой блокировкой
 и не пересекается с командами CLI. Каждое обращение наружу — отдельный метод
@@ -46,7 +48,7 @@ from .net import tun
 from .net.capture import capture_inbounds
 from .paths import Paths
 from .store import Store
-from .watch import checks, scan, status, target
+from .watch import checks, scan, speed, status, target
 from .watch.notify import Notifier
 from .watch.scan import RESERVE_CANDIDATES, RESERVE_RECHECK
 from .watch.states import Signals, State, StateMachine
@@ -90,6 +92,19 @@ RESERVE_ALERT_AFTER = 300.0
 # Подписка не обновляется дольше этого — уведомить: разовый сбой провайдера подписки
 # повода не даёт, а долгий — значит, что-то с ней не так (истекла, сменился адрес).
 SUBSCRIPTION_ALERT_AFTER = 3600.0
+# Основной сервер (_main_step). С сервера, ушедшего в отказ, основной уходит сразу, и
+# снова основным он не берётся MAIN_COOLDOWN, пока есть другие живые участники.
+MAIN_COOLDOWN = 1800.0
+# Загрузка не прошла через основной, и через новый — тоже, не позже MAIN_CAROUSEL после
+# смены: дело, видимо, не в серверах (не отвечает адрес проверки, сбой у провайдера).
+# Перебирать участников по кругу незачем — закрепление снимается, сервер выбирает ядро,
+# как до 0.1.9, пока загрузка снова не пройдёт.
+MAIN_CAROUSEL = 120.0
+SPEED_FRESH = 2  # замер годен 2 × speed.every_hours
+SPEED_KEEP = 7 * 86400.0  # результаты замеров старше не хранятся
+# Канал занят: через серверы идёт больше этого (байт/с, ~2 Мбит/с) — замер отложен до
+# следующего шага: чужая загрузка исказила бы его, а замер — мешал бы ей.
+SPEED_BUSY_BPS = 250_000
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -221,6 +236,24 @@ class Daemon:
         # С какого момента подписки не обновляются (time.time()) и уведомили ли об этом.
         self._sub_failing_since: float | None = None
         self._sub_alerted = False
+        # Основной сервер (_main_step): запись {"tag", "key", "name", "since", "basis"}
+        # хранится в базе — переживает перезапуск демона. Очередь замеров скорости —
+        # probe-теги участников; speed_round — идёт раунд, по его концу — сравнение.
+        self.main: dict | None = self._load_main()
+        self.speed_queue: deque[str] = deque()
+        self.next_speed = 0.0
+        self.speed_round = False
+        self._speed_asked = False
+        self.main_cooldown: dict[str, float] = {}  # ключ сервера → до когда (time.time())
+        self._main_failed_at = float("-inf")  # последняя смена из-за непрошедшей загрузки
+        self._main_suspended = False  # «карусель»: выбор отдан ядру до удачной загрузки
+        # Закреплён ли основной в ядре нами; None — не знаем (демон только запущен).
+        self._main_pinned: bool | None = None
+        self._metrics: dict = {}  # последний ответ /debug/vars — по нему видно нагрузку
+        self._traffic: tuple[float, int] | None = None  # (clock, байт через серверы)
+        self._own_traffic = 0  # сколько из них — собственные замеры скорости
+        self._busy = False
+        self._scanned = False  # на этом шаге шёл скан: замер скорости подождёт
         self._provider_ip: tuple[float, str] | None = None
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
@@ -312,6 +345,15 @@ class Daemon:
         self._sub_failing_since = previous._sub_failing_since
         self._sub_alerted = previous._sub_alerted
         self._reserve_note = previous._reserve_note
+        self.main = previous.main
+        self.speed_queue = deque(previous.speed_queue)
+        self.next_speed = previous.next_speed
+        self.speed_round = previous.speed_round
+        self.main_cooldown = dict(previous.main_cooldown)
+        self._main_failed_at = previous._main_failed_at
+        self._main_suspended = previous._main_suspended
+        self._main_pinned = previous._main_pinned
+        self._traffic = previous._traffic
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -319,6 +361,15 @@ class Daemon:
         """Панель: проверить запасные серверы сейчас."""
         self._scan_asked = True
         self.poke.set()
+
+    def request_speed(self) -> None:
+        """Панель, бот: замерить скорость серверов в работе сейчас."""
+        self._speed_asked = True
+        self.poke.set()
+
+    @property
+    def speed_pending(self) -> bool:
+        return self._speed_asked or bool(self.speed_queue)
 
     @property
     def refresh_pending(self) -> bool:
@@ -331,6 +382,7 @@ class Daemon:
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
+        self._scanned = False
         refresh_asked, self._refresh_asked = self._refresh_asked, False
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
@@ -481,6 +533,7 @@ class Daemon:
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
+        self._main_step(view, applied, observatory or {}, state, signals, now)
         self._write_status(view, observatory, signals.xray_ok)
         return state
 
@@ -504,6 +557,7 @@ class Daemon:
                 xray_ok = False
 
         tags = [info.tag for info in members]
+        self._busy = self._traffic_busy(now)
         alive, dead, unknown = metrics.count_members(observatory or {}, tags)
         # Все участники мертвы, а у балансировщика есть резервный выход: трафик идёт через
         # него, и сквозная проверка — тоже (дешёвым запросом, см. _check_e2e).
@@ -556,7 +610,20 @@ class Daemon:
         )
 
     def _read_observatory(self) -> dict[str, dict]:
-        return metrics.parse_observatory(metrics.fetch_metrics(self.cfg.xray.metrics_port))
+        self._metrics = metrics.fetch_metrics(self.cfg.xray.metrics_port)
+        return metrics.parse_observatory(self._metrics)
+
+    def _traffic_busy(self, now: float) -> bool:
+        """Идёт ли через серверы заметный трафик (байт/с с прошлого шага > SPEED_BUSY_BPS).
+
+        Счётчики — из того же ответа /debug/vars, что и observatory. Собственный замер
+        скорости прошлого шага из них вычитается (_own_traffic)."""
+        total = metrics.proxy_traffic(self._metrics)
+        previous, self._traffic = self._traffic, (now, total) if total is not None else None
+        own, self._own_traffic = self._own_traffic, 0
+        if total is None or previous is None or now <= previous[0]:
+            return False
+        return (total - previous[1] - own) / (now - previous[0]) > SPEED_BUSY_BPS
 
     def _check_e2e(self) -> bool:
         """Сквозная загрузка probe.url через http-in с детектором «тишины».
@@ -631,7 +698,10 @@ class Daemon:
             self.log.info("выбор балансировщика не узнать: %s", exc)
             return None
         if info.override:
-            return info.override, True
+            # Закрепление основного сервера (_main_step) — не ручное: такой сервер, если он
+            # сам выходит в домашнюю страну, меняется на запасной, как и выбранный ядром.
+            main = (self.main or {}).get("tag")
+            return info.override, self._manual_pin() is not None or info.override != main
         return (info.selects[0], False) if info.selects else None
 
     # --- не отвечает сам probe.url -----------------------------------------------
@@ -1143,6 +1213,7 @@ class Daemon:
             info = nodes.get(self.scan_queue.popleft())
             if info is None or not password:
                 continue
+            self._scanned = True
             result = self._scan(info, password, self._scan_url(info))
             self.store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
@@ -1468,6 +1539,11 @@ class Daemon:
             return None
         return pin if isinstance(pin, dict) and pin.get("tag") else None
 
+    def _manual_pin(self) -> dict | None:
+        """Ручное закрепление, срок которого ещё не вышел."""
+        pin = self._pin()
+        return pin if pin is not None and pin.get("until", 0) > self.wall() else None
+
     def _check_pin(self) -> None:
         """Снимает закрепление по истечении срока (bo -r)."""
         pin = self._pin()
@@ -1497,6 +1573,299 @@ class Daemon:
             self.api.pin(BALANCER_TAG, pin["tag"])
         except ApiError as exc:
             self.log.error("закрепление %s не восстановлено: %s", pin["tag"], exc)
+
+    # --- основной сервер (watch/speed.py) -------------------------------------------
+
+    def _main_step(
+        self, view: list[NodeInfo], applied: dict | None, observatory: dict,
+        state: State, signals: Signals, now: float,
+    ) -> None:
+        """Основной сервер: выбрать, закрепить в ядре, при отказе сразу сменить, после
+        раунда замеров — сменить на заметно более быстрый.
+
+        Закрепление в ядре не смотрит на здоровье сервера, поэтому снимается во всех
+        состояниях, кроме HEALTHY и DEGRADED: без живых участников трафик должен уйти на
+        резервный выход (fallbackTag), а при XRAY_DOWN и прочем выбирать не из чего.
+        Ручное закрепление (xgw pin, /pin) главнее: пока оно действует, демон его не трогает."""
+        members = [info for info in view if info.role == "proxy"]
+        if not signals.xray_ok:
+            # Снимать нечего: перезапуск Xray закрепление сбросит сам.
+            if self.main is not None:
+                self._set_main(None)
+            self._main_pinned = None
+            return
+        if not (
+            self.cfg.speed.sticky and not self.probe_target
+            and state in (State.HEALTHY, State.DEGRADED) and members
+        ):
+            self._release_main()
+            return
+        if self._manual_pin() is not None:
+            return
+        if self._main_suspended:
+            if not signals.e2e_ok:
+                return
+            self._main_suspended = False
+            self.notifier.event(
+                "main", "загрузка снова проходит — основной сервер выбирается заново"
+            )
+        alive = [
+            info for info in members if (observatory.get(info.tag) or {}).get("alive")
+        ]
+        candidates = [self._candidate(info, observatory) for info in alive]
+        current = self._main_candidate(members, observatory, signals)
+        if current is None and self._main_suspended:
+            return
+        if current is None:
+            self._choose_main(candidates)
+        if self._speed_step(view, applied, candidates, now) and self.main is not None:
+            self._compare_main(view, observatory)
+        if self.main is not None:
+            self._pin_main(self.main["tag"])
+
+    def _main_candidate(
+        self, members: list[NodeInfo], observatory: dict, signals: Signals
+    ) -> speed.Candidate | None:
+        """Нынешний основной, если он годен; иначе запись о нём убирается (с событием).
+        Ядро ещё не пробовало сервер (только что перезапущено) — это не отказ."""
+        record = self.main
+        if record is None:
+            return None
+        member = next((info for info in members if info.tag == record["tag"]), None)
+        name = f"«{record['name']}»" if record.get("name") else record["tag"]
+        if member is None:
+            self._set_main(None)
+            self.notifier.event("main", f"основной сервер {name} больше не в работе")
+            return None
+        entry = observatory.get(member.tag)
+        dead = entry is not None and not entry.get("alive")
+        reason = ""
+        if dead:
+            reason = "не отвечает пробам ядра"
+        elif not signals.e2e_ok:
+            reason = "загрузка через него не прошла"
+        if not reason:
+            return self._candidate(member, observatory)
+        wall = self.wall()
+        self.main_cooldown[record["key"]] = wall + MAIN_COOLDOWN
+        self._set_main(None)
+        if not dead:  # пробы ядра проходят, а загрузка — нет
+            carousel = wall - self._main_failed_at < MAIN_CAROUSEL
+            self._main_failed_at = wall
+            if carousel:
+                self._main_suspended = True
+                self._release_main()
+                self.notifier.event(
+                    "main",
+                    f"загрузка не прошла и через новый основной сервер {name} — дело, похоже, "
+                    "не в серверах; пока она не пройдёт, сервер выбирает ядро",
+                )
+                return None
+        self.notifier.event("main", f"основной сервер {name} {reason} — выбираю другой")
+        return None
+
+    def _candidate(self, info: NodeInfo, observatory: dict) -> speed.Candidate:
+        key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
+        record = self._speeds().get(key) or {}
+        mbps = record.get("mbps")
+        fresh = self.cfg.speed.every_hours > 0 and (
+            self.wall() - float(record.get("ts") or 0)
+            <= SPEED_FRESH * self.cfg.speed.every_hours * 3600.0
+        )
+        delay = (observatory.get(info.tag) or {}).get("delay")
+        return speed.Candidate(
+            tag=info.tag, key=key, name=self._node_name(info),
+            mbps=float(mbps) if fresh and isinstance(mbps, (int, float)) else None,
+            delay_ms=delay * 1000.0 if isinstance(delay, (int, float)) else None,
+        )
+
+    def _node_name(self, info: NodeInfo) -> str:
+        nodes = self.inventory.nodes if self.inventory is not None else ()
+        return next((node.name for node in nodes if node.fingerprint == info.fingerprint), "")
+
+    def _choose_main(self, candidates: list[speed.Candidate]) -> None:
+        """Новый основной: лучший из живых, кроме недавно отказавших (если есть другие)."""
+        wall = self.wall()
+        rested = [item for item in candidates if self.main_cooldown.get(item.key, 0.0) <= wall]
+        pick = speed.best(rested) or speed.best(candidates)
+        if pick is None:
+            self._release_main()  # живых нет: выбирает ядро (и резервный выход)
+            return
+        self._set_main(pick)
+        basis = "по скорости" if pick.mbps is not None else "по задержке, скорость ещё не замерена"
+        self.notifier.event("main", f"основной сервер — {speed.describe(pick)}, {basis}")
+
+    def _compare_main(self, view: list[NodeInfo], observatory: dict) -> None:
+        """Раунд замеров закончен: сменить основной, если другой живой участник быстрее
+        на speed.gain_pct и основной продержался speed.hold_minutes (выбранный по задержке,
+        до первого замера, держится без этого срока)."""
+        record = self.main
+        assert record is not None
+        alive = [
+            self._candidate(info, observatory) for info in view
+            if info.role == "proxy" and (observatory.get(info.tag) or {}).get("alive")
+        ]
+        current = next((item for item in alive if item.tag == record["tag"]), None)
+        if current is None:
+            return
+        rival = speed.best([item for item in alive if item.key != current.key])
+        by_delay = record.get("basis") != "speed"
+        held = self.wall() - float(record.get("since") or 0)
+        if (
+            rival is not None and speed.faster(rival, current, self.cfg.speed.gain_pct)
+            and (by_delay or held >= self.cfg.speed.hold_minutes * 60.0)
+        ):
+            self._set_main(rival)
+            self.notifier.event(
+                "main",
+                f"основной сервер сменён: {speed.describe(rival)} быстрее, чем "
+                f"{speed.describe(current)}",
+            )
+        elif by_delay and current.mbps is not None:
+            self._set_main(current, since=float(record.get("since") or self.wall()))
+
+    def _speed_step(
+        self, view: list[NodeInfo], applied: dict | None, candidates: list[speed.Candidate],
+        now: float,
+    ) -> bool:
+        """Замеры скорости: раунд по всем безлимитным живым участникам при запуске, раз в
+        speed.every_hours и по кнопке; новый участник без свежего замера — отдельно. Один
+        замер за шаг и не в шаге со сканом. True — раунд только что закончился."""
+        if self.cfg.speed.every_hours <= 0:
+            self.speed_queue.clear()
+            self.speed_round = self._speed_asked = False
+            return False
+        prices = self._prices()
+        nodes = {info.tag: info for info in view if info.role == "proxy"}
+        # Лимитированные не замеряются: 10 МБ через сервер x10 — это 100 МБ квоты. Цена
+        # неизвестна (узел ещё не сопоставлен с подпиской) — тоже: вдруг он лимитированный.
+        free = [
+            item for item in candidates
+            if prices.get(nodes[item.tag].fingerprint, 1.0) == 0
+        ]
+        queued = set(self.speed_queue)
+        if self._speed_asked and not free:
+            self._speed_asked = False  # замерять некого: живых безлимитных в работе нет
+        hours = self.cfg.speed.every_hours
+        if free and not self.next_speed and not self._speed_asked and all(
+            self._measured(item.key, hours) for item in free
+        ):
+            # Демон перезапущен, а замеры свежие — следующий раунд по расписанию, не сразу.
+            self.next_speed = now + jitter(hours * 3600.0)
+        if free and (now >= self.next_speed or self._speed_asked):
+            # Раунд — только когда есть кого замерять: сразу после запуска ядро ещё не
+            # пробовало серверы, и раунд без участников отложил бы замер на every_hours.
+            self.next_speed = now + jitter(self.cfg.speed.every_hours * 3600.0)
+            self._speed_asked = False
+            self.speed_round = True
+            todo = free
+        else:
+            todo = [item for item in free if not self._measured(item.key)]
+        for item in todo:
+            probe_tag = nodes[item.tag].probe_tag
+            if probe_tag not in queued:
+                self.speed_queue.append(probe_tag)
+                queued.add(probe_tag)
+        if self.speed_queue and not self._scanned and not self._busy:
+            self._own_traffic += self._measure_next(view, applied)
+        if self.speed_round and not self.speed_queue:
+            self.speed_round = False
+            return True
+        return False
+
+    def _measured(self, key: str, hours: float | None = None) -> bool:
+        """Есть ли запись замера (удачного или нет) не старше hours (по умолчанию — пока
+        замер годен): повторять незачем до раунда."""
+        record = self._speeds().get(key)
+        if hours is None:
+            hours = SPEED_FRESH * self.cfg.speed.every_hours
+        return record is not None and self.wall() - float(record.get("ts") or 0) <= hours * 3600.0
+
+    def _measure_next(self, view: list[NodeInfo], applied: dict | None) -> int:
+        """Замер следующего в очереди; сколько байт он скачал."""
+        password, _ports = builder.probe_state(applied or {})
+        nodes = {info.probe_tag: info for info in view if info.role == "proxy"}
+        while self.speed_queue:
+            info = nodes.get(self.speed_queue.popleft())
+            if info is None or not password:
+                continue  # участник ушёл из работы, пока ждал замера
+            result = self._speed(info, password)
+            key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
+            records = self._speeds()
+            records[key] = {
+                "mbps": result.mbps, "bytes": result.bytes_read, "seconds": result.seconds,
+                "error": result.error, "ts": self.wall(),
+            }
+            self._save_speeds(records)
+            if result.mbps is None:
+                self.log.info("замер скорости %s не удался: %s", info.tag, result.error)
+            else:
+                self.log.info(
+                    "замер скорости %s: %s, %d байт за %.1f с", info.tag,
+                    speed.mbps_text(result.mbps), result.bytes_read, result.seconds,
+                )
+            return result.bytes_read
+        return 0
+
+    def _speed(self, info: NodeInfo, password: str) -> speed.SpeedResult:
+        return speed.measure(info, self.cfg, probe_pass=password)
+
+    def _speeds(self) -> dict[str, dict]:
+        try:
+            records = json.loads(self.store.get_meta("speed") or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return records if isinstance(records, dict) else {}
+
+    def _save_speeds(self, records: dict[str, dict]) -> None:
+        oldest = self.wall() - SPEED_KEEP
+        kept = {
+            key: value for key, value in records.items()
+            if isinstance(value, dict) and float(value.get("ts") or 0) >= oldest
+        }
+        self.store.set_meta("speed", json.dumps(kept))
+
+    def _load_main(self) -> dict | None:
+        try:
+            record = json.loads(self.store.get_meta("main") or "null")
+        except json.JSONDecodeError:
+            return None
+        return record if isinstance(record, dict) and record.get("tag") else None
+
+    def _set_main(self, pick: speed.Candidate | None, *, since: float | None = None) -> None:
+        if pick is None:
+            self.main = None
+        else:
+            self.main = {
+                "tag": pick.tag, "key": pick.key, "name": pick.name,
+                "since": self.wall() if since is None else since,
+                "basis": "speed" if pick.mbps is not None else "delay",
+            }
+        self.store.set_meta("main", json.dumps(self.main) if self.main else "")
+
+    def _pin_main(self, tag: str) -> None:
+        """Закрепляет основной в ядре, если там закреплено не оно: перезапуск Xray и adrules
+        закрепление сбрасывают."""
+        try:
+            if self.api.balancer_state(BALANCER_TAG).override != tag:
+                self.api.pin(BALANCER_TAG, tag)
+            self._main_pinned = True
+        except ApiError as exc:
+            self.log.error("основной сервер %s не закреплён: %s", tag, exc)
+
+    def _release_main(self) -> None:
+        """Снимает закрепление основного (не ручное) и забывает основной. Демон только
+        запущен — сначала узнать у ядра, не осталось ли закрепления от прошлого запуска."""
+        if self.main is not None:
+            self._set_main(None)
+        if self._main_pinned is False or self._manual_pin() is not None:
+            return
+        try:
+            if self._main_pinned or self.api.balancer_state(BALANCER_TAG).override:
+                self.api.unpin(BALANCER_TAG)
+            self._main_pinned = False
+        except ApiError as exc:
+            self.log.error("закрепление основного сервера не снято: %s", exc)
 
     # --- статус ----------------------------------------------------------------
 

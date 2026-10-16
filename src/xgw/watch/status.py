@@ -34,6 +34,7 @@ class Budget:
     probes: int  # GET-пробы ядра по участникам (burstObservatory)
     scans: int  # сканы запасных
     e2e: int  # сквозная проверка watchdog через http-in
+    speed: int = 0  # замеры скорости безлимитных участников (watch/speed.py), не больше
 
     size: int = DEFAULT_PROBE_BYTES  # размер одной пробы, от которого всё посчитано
     measured: bool = False  # размер измерен сквозной проверкой, а не взят по умолчанию
@@ -50,7 +51,7 @@ class Budget:
     @property
     def everything(self) -> int:
         """Весь трафик проверок за сутки: с ним сверяют квоту подписки."""
-        return self.probes + self.scans + self.e2e
+        return self.probes + self.scans + self.e2e + self.speed
 
 
 def remember_probe_size(store: Store, url: str, size: int) -> None:
@@ -71,7 +72,7 @@ def measured_probe_size(store: Store, url: str) -> int | None:
 
 def probe_budget(
     cfg: Config, members: int, spares: int, size: int | None = None, *,
-    cheap: int = 0, candidates: int = 0,
+    cheap: int = 0, candidates: int = 0, speed_members: int = 0,
 ) -> Budget:
     """size — размер тела probe.url по последней сквозной проверке; без него берётся
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
@@ -79,7 +80,11 @@ def probe_budget(
 
     spares — запасные, которых скан проверяет загрузкой probe.url; cheap — запасные
     лимитированных подписок, которых он проверяет дешёвым запросом (scan.cheap_url);
-    candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK."""
+    candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK;
+    speed_members — безлимитные участники, чью скорость замеряют раз в speed.every_hours
+    (оценка сверху: каждый замер — speed.max_mb целиком)."""
+    rounds = 24 / cfg.speed.every_hours if cfg.speed.sticky and cfg.speed.every_hours else 0
+    speed_bytes = int(speed_members * cfg.speed.max_mb * MB * rounds)
     measured = bool(size)
     known = size or probe_bytes(cfg.probe.url)
     size = known or DEFAULT_PROBE_BYTES
@@ -92,6 +97,7 @@ def probe_budget(
             + candidates * CHEAP_SCAN_BYTES * 86400 / RESERVE_RECHECK
         ),
         e2e=int(size * 86400 / max(1, cfg.watchdog.interval_s)),
+        speed=speed_bytes,
         size=size,
         measured=measured,
         guessed=not known,
@@ -197,6 +203,7 @@ def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]
         "scans_mb": round(budget.scans / MB, 1),
         "total_mb": round(budget.total / MB, 1),
         "e2e_mb": round(budget.e2e / MB, 1),
+        "speed_mb": round(budget.speed / MB, 1),
         "limit_mb": cfg.probe.max_daily_probe_mb,
         # Всё вместе, со сквозной проверкой: столько уходит из квоты подписки.
         "all_mb": round(budget.everything / MB, 1),
@@ -280,6 +287,8 @@ def collect_status(
     quotas: dict[str, dict[str, int]] = {}
     events: list[dict] = []
     pin: dict | None = None
+    main: dict | None = None
+    speeds: dict[str, dict] = {}
     summary: dict = {}
     probe_size: int | None = None
     try:
@@ -292,6 +301,8 @@ def collect_status(
             scans = store.scans()
             quotas = _load_json(store.get_meta("quota")) or {}
             pin = _load_json(store.get_meta("pin")) or None
+            main = _load_json(store.get_meta("main")) or None
+            speeds = _load_json(store.get_meta("speed")) or {}
             summary = _load_json(store.get_meta("nodes_summary")) or {}
             probe_size = measured_probe_size(store, cfg.probe.url)
             events = store.recent_events(10)
@@ -310,11 +321,14 @@ def collect_status(
         return {"multiplier": factor, "limited": paid, "cost": factor if paid else 0.0}
 
     reserve = reserve_tag(_load_json_file(paths.xray_config_file))
+    main_tag = (main or {}).get("tag") if cfg.speed.sticky else None
     members, spares = [], []
     for info in view:
         if info.role == "proxy":
             entry = (observatory or {}).get(info.tag)
             dead_at = (dead_since or {}).get(info.tag)
+            key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
+            measure = speeds.get(key) if isinstance(speeds.get(key), dict) else {}
             members.append(
                 {
                     "tag": info.tag,
@@ -329,6 +343,11 @@ def collect_status(
                     else None,
                     "dead_since": dead_at,
                     "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
+                    # Основной сервер (watch/speed.py) и последний замер скорости.
+                    "main": info.tag == main_tag,
+                    "speed_mbps": measure.get("mbps"),
+                    "speed_error": measure.get("error") or "",
+                    "speed_ts": measure.get("ts"),
                 }
             )
         else:
@@ -355,9 +374,11 @@ def collect_status(
     budget = probe_budget(
         cfg, len(members), len(plan.full), probe_size,
         cheap=len(plan.cheap), candidates=len(plan.candidates),
+        speed_members=sum(1 for entry in members if not entry["cost"]),
     )
     spend = quota_spend(cfg, plan, budget.size)
     backup = next((entry for entry in spares if entry["reserve"]), None)
+    chosen = next((entry for entry in members if entry["main"]), None)
     status = {
         "updated": now,
         "daemon": daemon,
@@ -386,6 +407,13 @@ def collect_status(
         ],
         "selecting": list(selecting),
         "pin": pin if pin and pin.get("until", 0) > now else None,
+        # Основной сервер: через него идёт весь трафик (speed.sticky); None — его нет
+        # (выключен, ещё не выбран или трафик сейчас ведёт ядро).
+        "sticky": cfg.speed.sticky,
+        "main": {
+            "tag": chosen["tag"], "name": chosen["name"], "mbps": chosen["speed_mbps"],
+            "since": (main or {}).get("since"), "basis": (main or {}).get("basis"),
+        } if chosen else None,
         "quota": quotas,
         "sub_errors": sub_errors,
         "budget": budget_summary(
@@ -493,9 +521,13 @@ def render_servers(status: dict) -> str:
         else:
             dead = _ago(member.get("dead_since"))
             health = "МЁРТВ" + (f" уже {dead}" if dead else "")
+        if member.get("speed_mbps") is not None:
+            health += f", {speed_text(float(member['speed_mbps']))}"
         mark = "  ← выбран" if member["tag"] in (status.get("selecting") or []) else ""
+        if member.get("main"):
+            mark = "  ← основной"
         lines.append(
-            f"  {member['tag']:<20} {health:<18} {member.get('name', '')}{_level(member)}"
+            f"  {member['tag']:<20} {health:<30} {member.get('name', '')}{_level(member)}"
             f"{_price(member)}{mark}"
         )
     lines.append(f"Запасные ({len(spares)}):")
@@ -518,6 +550,31 @@ def render_servers(status: dict) -> str:
             "только когда все участники не отвечают; ядро его не пробует"
         )
     return "\n".join(lines)
+
+
+def speed_text(value: float) -> str:
+    """85 Мбит/с; 8,5 Мбит/с (как watch/speed.mbps_text)."""
+    if value >= 10:
+        return f"{value:.0f} Мбит/с"
+    return f"{value:.1f}".replace(".", ",") + " Мбит/с"
+
+
+def render_main(status: dict) -> str:
+    """Строка об основном сервере; пусто — показывать нечего."""
+    main = status.get("main")
+    if not status.get("sticky", True):
+        return ("Основной сервер: выключен (speed.sticky = false) — сервер выбирает ядро "
+                "по задержке и меняет выбор после каждой пробы")
+    if not main:
+        return ""
+    name = f"«{main['name']}»" if main.get("name") else main["tag"]
+    speed = f" — {speed_text(float(main['mbps']))}" if main.get("mbps") is not None else ""
+    basis = "" if main.get("basis") == "speed" else (
+        " (выбран по задержке, скорость ещё не замерена)"
+    )
+    since = f", с {_clock(main['since'])}" if main.get("since") else ""
+    return (f"Основной сервер: {main['tag']} {name}{speed}{since}{basis}; весь трафик через "
+            "него, другие участники наготове")
 
 
 def join_ru(items: list[str]) -> str:
@@ -603,6 +660,8 @@ def render_budget(budget: dict) -> list[str]:
         f"Трафик проверок: ~{budget['total_mb']:.0f} МБ/сут "
         f"(пробы {budget['probes_mb']:.0f}, сканы {budget['scans_mb']:.0f}; "
         f"лимит {budget['limit_mb']}); сквозная проверка ещё ~{budget['e2e_mb']:.0f} МБ/сут"
+        + (f", замер скорости — до ~{budget['speed_mb']:.0f} МБ/сут"
+           if budget.get("speed_mb") else "")
     ]
     if "month_gb" in budget:
         size = _thousands(int(budget.get("probe_bytes") or 0))
@@ -652,6 +711,9 @@ def render_status(status: dict) -> str:
             f"Закреплён вручную: {pin['tag']} до {_clock(pin['until'])} — "
             "автопереключение на это время отключено"
         )
+    main = render_main(status)
+    if main and not pin:
+        lines.append(main)
     if status.get("pending_restart"):
         lines.append("Ожидает окна перезапуска: новый конфиг требует перезапуска Xray")
     nodes = render_nodes(status.get("nodes") or {})

@@ -52,7 +52,7 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "telegram": {"token": "", "chat_id": ""}, "priority": {},
+        "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None,
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -86,6 +86,8 @@ def load(path: Path) -> tuple[dict, str]:
         "devices": _devices(raw.get("devices")),
         "telegram": _telegram(raw.get("telegram")),
         "priority": _priority(raw.get("priority")),
+        # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
+        "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
     }, ""
 
 
@@ -258,6 +260,20 @@ def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
         return False
     # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
     data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
+    save(path, data)
+    return True
+
+
+def set_sticky(path: Path, value: bool) -> bool:
+    """Основной сервер (speed.sticky) включён или выключен; True — что-то изменилось."""
+    if not isinstance(value, bool):
+        raise ManagedError("ожидается true или false")
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    if data["sticky"] is value:
+        return False
+    data["sticky"] = value
     save(path, data)
     return True
 

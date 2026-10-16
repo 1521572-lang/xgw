@@ -334,6 +334,8 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         "delay_ms": 123, "dead_since": None, "priority": "medium",
         # Подписка «main» о лимите не сообщила — безлимитная: квоту сервер не тратит.
         "multiplier": 1.0, "limited": False, "cost": 0.0,
+        # Основным сервер ещё не выбран, скорость не замерялась (0.1.9).
+        "main": False, "speed_mbps": None, "speed_error": "", "speed_ts": None,
     }
     assert snapshot["reserve"] is None and snapshot["spares"][0]["reserve"] is False
     assert snapshot["tier"] == "medium"

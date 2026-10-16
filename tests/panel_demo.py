@@ -82,6 +82,14 @@ LIVE = {
 }
 
 
+# Основной сервер (0.1.9) и замеры скорости: у Финляндии замер не удался.
+MAIN_FP = "a1a1a1a1"
+SPEEDS = {
+    "a1a1a1a1": {"mbps": 87.3, "error": ""},
+    "b2b2b2b2": {"mbps": 41.0, "error": ""},
+    "c3c3c3c3": {"mbps": None, "error": "тишина 5 с после 1 048 576 байт тела"},
+}
+
 HOSTILE = {"d4d4d4d4": "<img src=x onerror=alert(1)> Стокгольм"}
 # Сцена reserve: «запасная» и ручная ссылка — безлимитные (лимита они не сообщают), «main»
 # — с лимитом, у её серверов множители в имени; резервный выход — x1.
@@ -122,9 +130,14 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         live = (RESERVE_LIVE if scene == "reserve" else LIVE)[fingerprint]
         base = {"tag": tag, "fingerprint": fingerprint, "name": name, "source": source}
         if role == "member":
+            measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             members.append({
                 **base, "alive": live["alive"], "delay_ms": live["delay_ms"],
                 "dead_since": now - live["dead"] if live.get("dead") else None,
+                "main": scene not in ("reserve", "trouble") and fingerprint == MAIN_FP,
+                "speed_mbps": measure["mbps"] if measure else None,
+                "speed_error": measure["error"] if measure else "",
+                "speed_ts": now - 2 * 3600 if measure else None,
             })
         else:
             verdict = live["verdict"]
@@ -159,16 +172,23 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         "main": {"upload": 3_100_000_000, "download": 61_400_000_000,
                  "total": 100_000_000_000, "expire": int(now) + 86400 * 23},
     }
+    chosen = next((member for member in members if member.get("main")), None)
     probe_cfg = config.Config()
     if scene == "budget":
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
-    budget = status.probe_budget(probe_cfg, len(members), len(spares))
+    measured = sum(1 for member in members if member["speed_mbps"] or member["speed_error"])
+    budget = status.probe_budget(probe_cfg, len(members), len(spares), speed_members=measured)
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
         "xray": {"ok": scene != "trouble", "version": "26.3.27"},
         "capture": {"loaded": True},
         "members": members, "spares": spares, "selecting": [], "pin": None,
         "reserve": reserve,
+        "sticky": True,
+        "main": {
+            "tag": chosen["tag"], "name": chosen["name"], "mbps": chosen["speed_mbps"],
+            "since": now - 5 * 3600, "basis": "speed",
+        } if chosen else None,
         "quota": quotas,
         "sub_errors": {} if scene == "empty" else {
             "запасная": {"error": "HTTP 403 от сервера подписки", "ts": now - 300},
@@ -208,7 +228,7 @@ class DemoCapture:
 class DemoDaemon:
     def __init__(self) -> None:
         self.poke = threading.Event()
-        self._until = {"refresh": 0.0, "scan": 0.0}
+        self._until = {"refresh": 0.0, "scan": 0.0, "speed": 0.0}
 
     def request_refresh(self) -> None:
         self._until["refresh"] = time.time() + 4
@@ -216,8 +236,12 @@ class DemoDaemon:
     def request_scan(self) -> None:
         self._until["scan"] = time.time() + 6
 
+    def request_speed(self) -> None:
+        self._until["speed"] = time.time() + 8
+
     refresh_pending = property(lambda self: time.time() < self._until["refresh"])
     scan_pending = property(lambda self: time.time() < self._until["scan"])
+    speed_pending = property(lambda self: time.time() < self._until["speed"])
 
 
 class DemoBot:

@@ -409,6 +409,9 @@ class Panel:
                     status="member", tag=entry.get("tag"), alive=entry.get("alive"),
                     delay_ms=entry.get("delay_ms"), dead_since=entry.get("dead_since"),
                     selected=bool(entry.get("selected")),
+                    # Основной сервер и последний замер скорости (watch/speed.py).
+                    main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
+                    speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
                 )
             elif role == "spare":
                 row.update(
@@ -439,6 +442,9 @@ class Panel:
         selected = self._selected(xray_ok, now)
         for member in members:
             member["selected"] = member.get("tag") in selected
+            # Основной сервер выключен переключателем — демон снимет его на ближайшем шаге,
+            # а панель уже не показывает его основным.
+            member["main"] = bool(member.get("main")) and self.cfg.speed.sticky
         return snapshot, xray_ok, members, spares
 
     def state(self) -> dict:
@@ -509,6 +515,15 @@ class Panel:
             "tier": snapshot.get("tier"),
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
+            # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.
+            "main": snapshot.get("main") if cfg.speed.sticky else None,
+            "sticky": {
+                "on": cfg.speed.sticky,
+                # Замеры скорости: 0 — выключены, основной выбирается по задержке.
+                "every_hours": cfg.speed.every_hours,
+                "gain_pct": cfg.speed.gain_pct,
+                "hold_minutes": cfg.speed.hold_minutes,
+            },
             "servers": servers,
             "removed": gone,
             "sources": sources,
@@ -531,6 +546,7 @@ class Panel:
             "busy": {
                 "refresh": bool(daemon is not None and daemon.refresh_pending),
                 "scan": bool(daemon is not None and daemon.scan_pending),
+                "speed": bool(daemon is not None and daemon.speed_pending),
             },
         }
         masked = masking.mask_obj(result)
@@ -831,9 +847,30 @@ class Panel:
             self._event("ссылка сервера убрана из панели")
             self._wake()
             return actions.Outcome(0, "Ссылка сервера убрана")
-        if name in ("refresh", "scan"):
+        if name == "sticky":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            if managed.set_sticky(store_path, body["on"]):
+                self._event(
+                    "основной сервер включён в панели" if body["on"]
+                    else "основной сервер выключен в панели: сервер выбирает ядро по задержке"
+                )
+                self._wake()
+            if body["on"]:
+                return actions.Outcome(
+                    0, "Основной сервер включён: весь трафик пойдёт через самый быстрый"
+                )
+            return actions.Outcome(0, "Основной сервер выключен: сервер выбирает ядро")
+        if name in ("refresh", "scan", "speed"):
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
+            if name == "speed":
+                if not cfg.speed.sticky:
+                    return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
+                if not cfg.speed.every_hours:
+                    return actions.Outcome(2, "замер скорости выключен: speed.every_hours = 0")
+                self.daemon.request_speed()
+                return actions.Outcome(0, "Замеряю скорость серверов в работе…")
             if name == "refresh":
                 if not engine.has_sources(cfg):
                     return actions.Outcome(2, "обновлять нечего: подписок нет")

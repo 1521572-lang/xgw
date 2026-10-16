@@ -44,11 +44,11 @@ BACKOFF = (5.0, 10.0, 20.0, 40.0, 60.0)
 MAX_TEXT = 3900  # лимит Telegram — 4096 знаков
 MAX_STRANGERS = 100
 DEFAULT_PIN = "1h"
-CONTROL = ("/enable", "/disable", "/pin", "/unpin", "/refresh", "/scan")
+CONTROL = ("/enable", "/disable", "/pin", "/unpin", "/refresh", "/scan", "/speed")
 READ_ONLY = ("/status", "/servers", "/devices")
 
 HELP = """XGW — шлюз с VPN. Команды:
-/status — состояние: VPN, выбранный сервер, квота
+/status — состояние: VPN, основной сервер, квота
 /servers — серверы по номерам
 /devices — устройства в Wi-Fi
 /enable — включить VPN
@@ -57,6 +57,7 @@ HELP = """XGW — шлюз с VPN. Команды:
 /unpin — снять закрепление
 /refresh — обновить подписки
 /scan — проверить запасные серверы
+/speed — замерить скорость серверов в работе
 Управление работает только в личной переписке с ботом."""
 
 PRIVATE_ONLY = "Управлять шлюзом можно только из личной переписки с ботом, не из группы."
@@ -443,10 +444,17 @@ class Bot:
         lines.append(f"Серверов в работе: {alive} из {len(members)}; запасных: "
                      f"{len(snap.get('spares') or [])}")
         for member in members:
-            if member["tag"] in selected:
+            if member["tag"] in selected or (member.get("main") and not snap.get("pin")):
                 delay = member.get("delay_ms")
-                lines.append(f"Выбран: {member.get('name') or member['tag']}"
-                             + (f" ({delay} мс)" if delay is not None else ""))
+                details = [status.speed_text(float(member["speed_mbps"]))] if (
+                    member.get("speed_mbps") is not None
+                ) else []
+                if delay is not None:
+                    details.append(f"{delay} мс")
+                head = "Основной" if member.get("main") and not snap.get("pin") else "Выбран"
+                lines.append(f"{head}: {member.get('name') or member['tag']}"
+                             + (f" ({', '.join(details)})" if details else ""))
+                break
         pin = snap.get("pin")
         if pin:
             lines.append(f"Закреплён вручную: {pin['tag']} — автопереключение отключено")
@@ -483,7 +491,11 @@ class Bot:
                 health = "жив" + (f", {member['delay_ms']} мс" if member.get("delay_ms") else "")
             else:
                 health = "НЕ ОТВЕЧАЕТ"
+            if member.get("speed_mbps") is not None:
+                health += f", {status.speed_text(float(member['speed_mbps']))}"
             mark = " ← выбран" if member["tag"] in selected else ""
+            if member.get("main") and not snap.get("pin"):
+                mark = " ← основной"
             lines.append(f"{number}. {member.get('name') or member['tag']} — {health}{mark}")
         spares = snap.get("spares") or []
         if spares:
@@ -523,6 +535,12 @@ class Bot:
                 return "Обновлять нечего: подписок нет."
             self.daemon.request_refresh()
             return "Обновляю подписки…"
+        if name == "/speed":
+            if not cfg.speed.sticky or not cfg.speed.every_hours:
+                return ("Замер скорости выключен: основной сервер выключен в панели "
+                        "или speed.every_hours = 0.")
+            self.daemon.request_speed()
+            return "Замеряю скорость серверов в работе — итог в /servers через минуту-другую."
         self.daemon.request_scan()
         return "Проверяю запасные серверы…"
 

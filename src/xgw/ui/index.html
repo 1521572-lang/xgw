@@ -96,6 +96,15 @@
         <h2 id="servers-title">Серверы <span id="members-count" class="count"></span></h2>
         <button id="scan" class="btn ghost" type="button">Проверить запасные</button>
       </div>
+      <div id="main-box" class="main-box" hidden>
+        <button id="sticky" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="sticky-title" aria-describedby="main-note"></button>
+        <div class="main-text">
+          <span id="sticky-title" class="main-title">Один основной сервер</span>
+          <span id="main-note" class="muted small"></span>
+        </div>
+        <button id="speed" class="btn ghost" type="button">Замерить скорость</button>
+      </div>
       <p id="nodes-note" class="muted small nodes-note" hidden></p>
       <p id="tier-note" class="muted small" hidden></p>
       <p id="reserve-note" class="note" role="status" hidden></p>

@@ -39,6 +39,7 @@
     rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
+    main: "основной сервер",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -223,7 +224,8 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("main", [s.main, s.sticky, s.pin, s.members.length, (s.budget || {}).speed_mb], () => renderMain(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
@@ -233,6 +235,7 @@
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
+    setBusy($("speed"), s.busy.speed);
     $("scan").hidden = !s.spares.length;
     $("refresh").hidden = !s.subscriptions.length;
     // Пока серверов нет, первое дело — добавить подписку: её блок идёт выше.
@@ -269,6 +272,7 @@
     const perDay = budget.all_mb >= 1000 ? `${decimal(budget.all_mb / 1000, 2)} ГБ` : `${Math.round(budget.all_mb)} МБ`;
     const parts = [`проба ${decimal(budget.probe_bytes / 1000)} КБ × ${budget.members} в работе каждые ${budget.interval_s} с`];
     if (budget.spares) parts.push(`${budget.spares} запасных раз в ${budget.scan_minutes} мин`);
+    if (budget.speed_mb) parts.push(`замер скорости — до ${Math.round(budget.speed_mb)} МБ в сутки`);
     if (budget.cheap) parts.push(`из них ${budget.cheap} лимитированных — коротким запросом`);
     const lead = el("span", {}, "Проверки серверов расходуют около ", el("b", { text: `${perDay} в сутки` }),
       " и ", el("b", { text: `${decimal(budget.month_gb)} ГБ в месяц` }), ` (${parts.join(", ")}).`);
@@ -363,12 +367,16 @@
     // Без перехвата трафик машины идёт напрямую — «сейчас через» было бы неправдой.
     const current = s.pin
       ? s.members.find((member) => member.tag === s.pin.tag)
-      : on && !s.capture.inbound_missing && s.members.find((member) => member.selected);
+      : on && !s.capture.inbound_missing
+        && (s.members.find((member) => member.selected) || s.members.find((member) => member.main));
     $("current").hidden = !current;
     if (current) {
-      $("current-label").textContent = s.pin ? `Закреплён до ${stamp(s.pin.until, s.now)}` : "Сейчас через";
+      const main = !s.pin && s.main && s.main.tag === current.tag;
+      $("current-label").textContent = s.pin ? `Закреплён до ${stamp(s.pin.until, s.now)}`
+        : main ? "Основной сервер" : "Сейчас через";
       const delay = current.delay_ms !== null && current.delay_ms !== undefined ? ` · ${current.delay_ms} мс` : "";
-      $("current-name").textContent = (current.name || current.tag) + delay;
+      const speed = current.speed_mbps !== null && current.speed_mbps !== undefined ? ` · ${mbps(current.speed_mbps)}` : "";
+      $("current-name").textContent = (current.name || current.tag) + speed + delay;
       $("current-name").title = current.name || current.tag;
     }
     $("unpin").hidden = !s.pin;
@@ -392,11 +400,20 @@
     return el("span", { class: "delay none", text: "—" });
   }
 
+  // Скорость: 85 Мбит/с; ниже 10 — с одним знаком после запятой.
+  const mbps = (value) => (value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`);
+
   function serverNote(server, s) {
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
-      return `в работе${dead}`;
+      let measured = "";
+      if (server.speed_mbps !== null && server.speed_mbps !== undefined) {
+        measured = ` · ${mbps(server.speed_mbps)}, замер ${stamp(server.speed_ts, s.now)}`;
+      } else if (server.speed_error) {
+        measured = ` · замер скорости не удался ${stamp(server.speed_ts, s.now)}`;
+      }
+      return `${server.main ? "основной" : "в работе"}${measured}${dead}`;
     }
     if (server.status === "spare") {
       const role = server.reserve
@@ -446,7 +463,12 @@
       : server.status === "spare" ? ((VERDICTS[server.verdict] || [""])[0]) : "";
     const title = el("div", { class: "row-title" }, el("span", { text: server.name, title: server.name }));
     if (pinned) title.append(el("span", { class: "tag warn", text: "закреплён" }));
-    else if (server.selected) title.append(el("span", { class: "tag on", text: "выбран" }));
+    else if (server.main) {
+      title.append(el("span", {
+        class: "tag on", text: "основной",
+        title: "Весь трафик идёт через этот сервер; другие серверы в работе наготове и подхватят трафик, если он перестанет отвечать",
+      }));
+    } else if (server.selected) title.append(el("span", { class: "tag on", text: "выбран" }));
     if (server.reserve) {
       title.append(el("span", {
         class: `tag ${s.state === "RESERVE" ? "warn" : ""}`, text: "резервный",
@@ -460,7 +482,7 @@
       }));
     }
     const classes = [];
-    if (server.selected || pinned) classes.push("selected");
+    if (server.selected || pinned || server.main) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
@@ -511,6 +533,34 @@
     note.textContent = `Серверы в работе не отвечают — трафик идёт через резервный сервер «${reserve.name}»${price}. `
       + (reserve.cost ? "Он тратит квоту подписки; " : "")
       + "как только серверы в работе ответят, шлюз вернётся к ним сам.";
+  }
+
+  // Основной сервер: весь трафик через самый быстрый из серверов в работе.
+  function renderMain(s) {
+    const box = $("main-box");
+    box.hidden = !s.members.length;
+    if (box.hidden) return;
+    const sticky = s.sticky || {};
+    const on = Boolean(sticky.on);
+    $("sticky").setAttribute("aria-checked", String(on));
+    $("speed").hidden = !on || !sticky.every_hours;
+    let text;
+    if (!on) {
+      text = "Выключено: шлюз сам выбирает сервер с наименьшей задержкой и может менять его каждые полминуты.";
+    } else if (s.pin) {
+      text = "Пока сервер закреплён вручную, основной сервер не выбирается.";
+    } else if (s.main) {
+      const speed = s.main.mbps !== null && s.main.mbps !== undefined ? ` — ${mbps(s.main.mbps)}` : "";
+      const basis = s.main.basis === "speed" ? "" : " (скорость ещё не замерена — выбран по задержке)";
+      text = `Весь трафик идёт через «${s.main.name || s.main.tag}»${speed}${basis}. `
+        + "Шлюз меняет его, только если он перестанет отвечать или другой окажется заметно быстрее.";
+    } else {
+      text = "Весь трафик пойдёт через самый быстрый сервер в работе — шлюз выберет его, как только серверы ответят.";
+    }
+    if (on && sticky.every_hours) {
+      text += ` Скорость замеряется раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные серверы не замеряются.`;
+    }
+    $("main-note").textContent = text;
   }
 
   function renderServers(s) {
@@ -760,6 +810,11 @@
   $("unpin").addEventListener("click", () => act("unpin", {}, $("unpin")));
   $("refresh").addEventListener("click", () => act("refresh", {}));
   $("scan").addEventListener("click", () => act("scan", {}));
+  $("speed").addEventListener("click", () => act("speed", {}));
+  $("sticky").addEventListener("click", () => {
+    const on = $("sticky").getAttribute("aria-checked") !== "true";
+    act("sticky", { on }, $("sticky"));
+  });
 
   $("add").addEventListener("submit", async (event) => {
     event.preventDefault();

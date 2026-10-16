@@ -49,13 +49,16 @@ class FakeDaemon:
     def __init__(self) -> None:
         self.poke = threading.Event()
         self.asked: list[str] = []
-        self.refresh_pending = self.scan_pending = False
+        self.refresh_pending = self.scan_pending = self.speed_pending = False
 
     def request_refresh(self) -> None:
         self.asked.append("refresh")
 
     def request_scan(self) -> None:
         self.asked.append("scan")
+
+    def request_speed(self) -> None:
+        self.asked.append("speed")
 
 
 class StubBot:
@@ -766,7 +769,7 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     assert user.act("refresh", {})["ok"] and user.act("scan", {})["ok"]
     assert rig.daemon.asked == ["refresh", "scan"]
     rig.daemon.refresh_pending = True
-    assert user.state()["busy"] == {"refresh": True, "scan": False}
+    assert user.state()["busy"] == {"refresh": True, "scan": False, "speed": False}
     rig.panel.configure(rig.panel.cfg, None)  # демон ещё не создан
     assert not user.act("refresh", {})["ok"]
 
@@ -866,3 +869,16 @@ def test_state_tells_the_page_that_capture_waits_for_xray(rig, user):
     assert capture["mode"] == "on" and "tproxy-in" in capture["inbound_missing"]
     fakexray.write(rig.paths)
     assert user.state()["capture"]["inbound_missing"] == ""
+
+
+def test_sticky_switch_and_speed_button(rig, user):
+    state = user.state()
+    assert state["sticky"]["on"] is True and state["sticky"]["every_hours"] == 6
+    assert user.act("speed", {})["ok"] and rig.daemon.asked == ["speed"]
+    reply = user.act("sticky", {"on": False})
+    assert reply["ok"] and "выключен" in reply["text"]
+    assert user.state()["sticky"]["on"] is False
+    assert managed.load(managed.path_for(rig.config_path))[0]["sticky"] is False
+    assert not user.act("speed", {})["ok"]  # без основного сервера замерять незачем
+    assert user.act("sticky", {"on": True})["ok"] and user.state()["sticky"]["on"] is True
+    assert not user.act("sticky", {"on": "да"})["ok"]

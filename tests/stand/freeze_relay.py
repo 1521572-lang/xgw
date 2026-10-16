@@ -12,7 +12,9 @@ TCP-реле между шлюзом и сервером. Режим читае�
 
 К режиму можно дописать «;latency=МС» — задержку первого ответа в каждом
 соединении. Она делает один сервер заведомо медленнее другого, и выбор
-балансировщика leastPing на стенде становится однозначным.
+балансировщика leastPing на стенде становится однозначным. «;rate=КБ/с» — полосу
+от сервера к клиенту в каждом соединении: так один сервер медленнее другого для
+замера скорости (0 — без ограничения).
 
 Счётчик байтов — на каждое соединение отдельно, поэтому короткая проверка
 (HEAD, пинг) «заморозку» не замечает.
@@ -42,6 +44,7 @@ class Mode:
         self.name = "pass"
         self.limit = 0
         self.latency = 0.0  # секунд перед первым ответом в соединении
+        self.rate = 0  # байт/с от сервера к клиенту в соединении; 0 — без ограничения
         self._load()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -50,16 +53,19 @@ class Mode:
             text = self.path.read_text(encoding="ascii").strip()
         except OSError:
             return
-        latency = 0.0
+        latency, rate = 0.0, 0
         for token in text.split(";"):
             name, _, value = token.strip().partition("=")
             if name == "latency" and value.isdigit():
                 latency = int(value) / 1000.0
+            elif name == "rate" and value.isdigit():
+                rate = int(value) * 1000
             elif name == "freeze_after" and value.isdigit():
                 self.name, self.limit = name, int(value)
             elif name in ("pass", "drop", "blackhole"):
                 self.name, self.limit = name, 0
         self.latency = latency
+        self.rate = rate
 
     def _watch(self) -> None:
         while True:
@@ -129,6 +135,8 @@ class Connection:
                 if data:
                     self.client.sendall(data)
                     self.downstream_bytes += len(data)
+                    if self.mode.rate:
+                        time.sleep(len(data) / self.mode.rate)
         except OSError:
             pass
         if not self.frozen:  # «замороженное» соединение держим открытым

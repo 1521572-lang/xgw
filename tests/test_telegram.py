@@ -81,6 +81,7 @@ class Rig:
             "poke": threading.Event(), "asked": [],
             "request_refresh": lambda s: s.asked.append("refresh"),
             "request_scan": lambda s: s.asked.append("scan"),
+            "request_speed": lambda s: s.asked.append("speed"),
         })()
         self.routes: list[str] = []  # каким путём шёл каждый запрос к Bot API
 
@@ -232,7 +233,7 @@ def test_control_works_only_in_a_private_chat(tmp_path, monkeypatch):
     rig = Rig(tmp_path, monkeypatch, chat=str(GROUP))
     try:
         assert "Состояние: HEALTHY" in rig.ask("/status", chat=GROUP, kind="supergroup")
-        for command in ("/disable", "/enable", "/pin 1", "/unpin", "/refresh", "/scan"):
+        for command in ("/disable", "/enable", "/pin 1", "/unpin", "/refresh", "/scan", "/speed"):
             assert rig.ask(command, chat=GROUP, kind="supergroup") == PRIVATE_ONLY
         assert rig.kernel.calls == [] and rig.pinned == [] and rig.daemon.asked == []
     finally:
@@ -284,7 +285,8 @@ def test_pin_by_number_with_default_and_given_term(rig):
 def test_refresh_and_scan_go_to_the_daemon(rig):
     assert "Обновляю подписки" in rig.ask("/refresh")
     assert "Проверяю запасные серверы" in rig.ask("/scan")
-    assert rig.daemon.asked == ["refresh", "scan"]
+    assert "Замеряю скорость" in rig.ask("/speed")
+    assert rig.daemon.asked == ["refresh", "scan", "speed"]
 
 
 def test_a_failing_command_is_reported_and_logged(rig, monkeypatch, caplog):

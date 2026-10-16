@@ -76,6 +76,7 @@ class Server:
     mode_file: Path
     mode: str = "pass"
     latency_ms: int = 0
+    rate_kbps: int = 0  # полоса от сервера, КБ/с; 0 — без ограничения
 
     @property
     def domain(self) -> str:
@@ -91,8 +92,15 @@ class Server:
         self.latency_ms = milliseconds
         self._write()
 
+    def set_rate(self, kbps: int) -> None:
+        """Полоса от сервера к клиенту, КБ/с: делает сервер медленнее для замера скорости."""
+        self.rate_kbps = kbps
+        self._write()
+
     def _write(self) -> None:
-        self.mode_file.write_text(f"{self.mode};latency={self.latency_ms}", encoding="ascii")
+        self.mode_file.write_text(
+            f"{self.mode};latency={self.latency_ms};rate={self.rate_kbps}", encoding="ascii"
+        )
         time.sleep(0.3)
 
     def connections(self) -> int:
@@ -276,7 +284,7 @@ class Stand:
         panel: bool = False, subscription: bool = True,
         direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
         refresh_minutes: int = 1, containers: bool = True, proxy_domains: tuple[str, ...] = (),
-        probe_host: str = "",
+        probe_host: str = "", sticky: bool = False,
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -297,6 +305,9 @@ class Stand:
         probe_host — имя origin в probe.url и probe.trace_url (например,
         «origin.stand.test» вместе с proxy_domains): тогда и сквозная проверка демона идёт
         через балансировщик в любом режиме стенда.
+
+        sticky — основной сервер (0.1.9): замер скорости — 4 МБ с origin, не дольше 4 с.
+        Без него ядро выбирает сервер само, как до 0.1.9: прежние проверки стенда — о том.
         """
         origin = (
             f"http://{probe_host}:{self.origin_port}" if probe_host
@@ -348,6 +359,13 @@ interval = "10s"
 sampling = 1
 timeout = "3s"
 scan_spares_minutes = 1
+
+[speed]
+sticky = {"true" if sticky else "false"}
+url = "{origin}/bytes?n=4000000"
+url_fallback = ""
+max_mb = 4
+max_seconds = 4
 
 [routing]
 direct_domains = {json.dumps(list(direct_domains))}

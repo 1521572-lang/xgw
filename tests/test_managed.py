@@ -30,7 +30,7 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "telegram": {"token": "", "chat_id": ""}, "priority": {}}, "")
+         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -87,6 +87,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "telegram": {"token": "", "chat_id": ""},
         # средний не хранится; неизвестный уровень и чужой отпечаток отброшены
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
+        "sticky": None,  # переключатель основного сервера в панели не трогали
     }
 
 
@@ -375,3 +376,17 @@ def test_telegram_api_trailing_slash_is_dropped(conf):
         conf.read_text(encoding="utf-8") + '[notify]\ntelegram_api = "http://127.0.0.1:8081/"\n',
         encoding="utf-8")
     assert config.load(conf)[0].notify.telegram_api == "http://127.0.0.1:8081"
+
+
+def test_sticky_switch_is_stored_and_merged_into_the_config(conf):
+    path = managed.path_for(conf)
+    assert managed.load(path)[0]["sticky"] is None
+    assert managed.set_sticky(path, False) is True
+    assert managed.set_sticky(path, False) is False  # уже так
+    assert managed.load(path)[0]["sticky"] is False
+    cfg, _warnings = config.load(conf)
+    assert cfg.speed.sticky is False and cfg.managed.sticky is False
+    assert managed.set_sticky(path, True) is True
+    assert config.load(conf)[0].speed.sticky is True
+    with pytest.raises(managed.ManagedError):
+        managed.set_sticky(path, "yes")

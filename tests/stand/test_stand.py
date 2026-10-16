@@ -348,3 +348,57 @@ def test_daemon_replaces_frozen_member_and_expires_pin(stand):
     assert wait_for(
         lambda: parse_balancer_info(stand.xray_api("bi", "auto")).override is None, 15, step=0.5
     ), stand.tail("daemon", 20)
+
+
+def test_main_server_is_the_fastest_holds_and_fails_over(stand):
+    """0.1.9 на живом Xray. Демон держит один основной сервер — самый быстрый по замеру
+    скорости — и закрепляет его в ядре: выбор не скачет, хотя задержки у серверов равные
+    (п. 49 ASSUMPTIONS — без этого leastPing прыгает). «Заморозка» основного — трафик сразу
+    получает другой живой участник."""
+    from xgw.xraycore.api import parse_balancer_info
+
+    def override() -> str | None:
+        try:
+            return parse_balancer_info(stand.xray_api("bi", "auto")).override
+        except RuntimeError:
+            return None
+
+    members = _up(
+        stand, sticky=True, probe_host="origin.stand.test", proxy_domains=("domain:stand.test",),
+    )
+    slow, fast = members[0], members[1]
+    stand.server_of(slow).set_rate(300)  # ~2,4 Мбит/с; у второго полоса не ограничена
+    stand.start_daemon()
+
+    def measured():
+        status = stand.xgw_json("status")
+        speeds = {m["tag"]: m.get("speed_mbps") for m in status["members"]}
+        main = status.get("main") or {}
+        return (
+            main.get("tag") == fast and main.get("basis") == "speed"
+            and None not in (speeds.get(slow), speeds.get(fast)) and status
+        )
+
+    status = wait_for(measured, 120, step=2)
+    assert status, stand.tail("daemon", 40)
+    by_tag = {m["tag"]: m for m in status["members"]}
+    assert by_tag[fast]["speed_mbps"] > 3 * by_tag[slow]["speed_mbps"]
+    assert by_tag[slow]["speed_mbps"] < 4
+    assert override() == fast
+
+    # Держится: три цикла проб ядра — ни одной смены.
+    deadline = time.monotonic() + 3 * CYCLE
+    while time.monotonic() < deadline:
+        assert override() == fast
+        time.sleep(1)
+
+    stand.server_of(fast).set_mode("freeze_after=16384")
+    started = time.monotonic()
+    assert wait_for(lambda: override() == slow, SWITCH_LIMIT + 10, step=0.5), (
+        stand.tail("daemon", 30)
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed <= SWITCH_LIMIT, f"переход с замороженного основного занял {elapsed:.1f} с"
+    assert stand.via_balancer()  # трафик идёт
+    events = [e["detail"] for e in stand.xgw_json("status")["events"] if e["kind"] == "main"]
+    assert any("выбираю другой" in event for event in events), events

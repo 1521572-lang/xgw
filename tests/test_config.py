@@ -228,3 +228,24 @@ def test_example_config_matches_the_probe_defaults():
     assert warnings == []
     assert loaded.probe.url == module.DEFAULT_PROBE_URL
     assert loaded.probe.user_agent == module.DEFAULT_PROBE_UA
+
+
+def test_speed_defaults_and_limits(tmp_path):
+    cfg, warnings = _load_text(tmp_path, "")
+    assert cfg.speed.sticky is True and cfg.speed.max_mb == 10 and cfg.speed.every_hours == 6
+    assert cfg.speed.url.startswith("https://speed.cloudflare.com/__down?bytes=")
+    assert cfg.speed.url_fallback.startswith("https://cdn.jsdelivr.net/npm/typescript@5.3.3/")
+    assert not [warning for warning in warnings if "speed" in warning]
+    cfg, warnings = _load_text(
+        tmp_path,
+        '[speed]\nsticky = false\nmax_mb = 500\nmax_seconds = 1\nevery_hours = 0\n'
+        'gain_pct = -5\nurl = "ftp://x"\nurl_fallback = ""\n',
+    )
+    assert cfg.speed.sticky is False and cfg.speed.every_hours == 0
+    assert (cfg.speed.max_mb, cfg.speed.max_seconds, cfg.speed.gain_pct) == (10, 8, 30)
+    assert cfg.speed.url.startswith("https://speed.cloudflare.com/")
+    assert cfg.speed.url_fallback == ""
+    assert sum("speed." in warning for warning in warnings) == 4
+    # Пустой основной адрес — берётся запасной.
+    cfg, _warnings = _load_text(tmp_path, '[speed]\nurl = ""\n')
+    assert cfg.speed.url.startswith("https://cdn.jsdelivr.net/") and cfg.speed.url_fallback == ""

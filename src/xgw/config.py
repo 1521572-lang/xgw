@@ -123,6 +123,30 @@ class Probe:
     max_daily_probe_mb: int = 1024
 
 
+# Замер скорости (watch/speed.py). Тестовый адрес Cloudflare отдаёт ровно столько байт,
+# сколько запрошено, без сжатия; запасной — неизменяемый файл на jsDelivr (тот же CDN,
+# что у probe.url), 9 020 995 байт: на случай, если Cloudflare откажет выходу сервера.
+# Оба проверены 16.10.2026 тем же стеком, что у проб XGW (Python ssl, браузерный
+# User-Agent, без Accept-Encoding): ответ 200, тело целиком (ASSUMPTIONS, п. 185).
+DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
+DEFAULT_SPEED_FALLBACK = "https://cdn.jsdelivr.net/npm/typescript@5.3.3/lib/typescript.js"
+
+
+@dataclass
+class Speed:
+    # Основной сервер: весь трафик — через один сервер в работе, самый быстрый по замеру;
+    # остальные наготове. false — как до 0.1.9: ядро само берёт сервер с наименьшей
+    # задержкой и меняет выбор после каждой пробы, если задержки близки.
+    sticky: bool = True
+    url: str = DEFAULT_SPEED_URL
+    url_fallback: str = DEFAULT_SPEED_FALLBACK
+    max_mb: int = 10  # замер качает не больше…
+    max_seconds: int = 8  # …и не дольше
+    every_hours: int = 6  # 0 — не замерять: основной выбирается по задержке
+    gain_pct: int = 30  # сменить основной, только если другой быстрее на столько процентов
+    hold_minutes: int = 60  # и основной продержался не меньше
+
+
 @dataclass
 class Routing:
     direct_domains: list[str] = field(
@@ -217,6 +241,8 @@ class Managed:
     telegram: bool = False
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
+    # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
+    sticky: bool | None = None
 
 
 @dataclass
@@ -227,6 +253,7 @@ class Config:
     manual: Manual = field(default_factory=Manual)
     filters: Filters = field(default_factory=Filters)
     probe: Probe = field(default_factory=Probe)
+    speed: Speed = field(default_factory=Speed)
     routing: Routing = field(default_factory=Routing)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
@@ -244,6 +271,7 @@ _SECTIONS = {
     "manual": Manual,
     "filters": Filters,
     "probe": Probe,
+    "speed": Speed,
     "routing": Routing,
     "dns": Dns,
     "xray": XraySection,
@@ -314,6 +342,8 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.disabled = list(data["disabled"])
     cfg.managed.removed = list(data["removed"])
     cfg.managed.priority = dict(data["priority"])
+    if data["sticky"] is not None:
+        cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
     bot = data["telegram"]
     if bot["token"]:
@@ -527,6 +557,7 @@ def _validate(cfg: Config) -> list[str]:
     for name in ("interval", "timeout"):
         if not re.fullmatch(r"\d+[smh]", getattr(cfg.probe, name)):
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
+    warnings.extend(_validate_speed(cfg.speed))
     listening = {
         "tproxy": cfg.capture.tproxy_port,
         "api": cfg.xray.api_port,
@@ -556,4 +587,36 @@ def _validate(cfg: Config) -> list[str]:
         )
         cfg.notify.telegram_api = Notify().telegram_api
     cfg.notify.telegram_api = cfg.notify.telegram_api.rstrip("/")
+    return warnings
+
+
+# Пределы настроек замера скорости: (наименьшее, наибольшее).
+_SPEED_LIMITS = {
+    "max_mb": (1, 100),
+    "max_seconds": (2, 30),
+    "every_hours": (0, 168),
+    "gain_pct": (0, 1000),
+    "hold_minutes": (0, 1440),
+}
+
+
+def _validate_speed(speed: Speed) -> list[str]:
+    warnings: list[str] = []
+    for name, (low, high) in _SPEED_LIMITS.items():
+        value = getattr(speed, name)
+        if not low <= value <= high:
+            default = getattr(Speed(), name)
+            warnings.append(
+                f"speed.{name}={value}: допустимо от {low} до {high} — используется {default}"
+            )
+            setattr(speed, name, default)
+    for name in ("url", "url_fallback"):
+        value = getattr(speed, name).strip()
+        if value and urlsplit(value).scheme not in ("http", "https"):
+            default = getattr(Speed(), name)
+            warnings.append(f"speed.{name}: ожидается http(s)://адрес — используется {default}")
+            value = default
+        setattr(speed, name, value)
+    if not speed.url:
+        speed.url, speed.url_fallback = speed.url_fallback, ""
     return warnings

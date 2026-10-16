@@ -409,6 +409,19 @@ button, textarea, input { font: inherit; color: inherit; }
   background: color-mix(in srgb, var(--bad) 12%, transparent);
 }
 .nodes-note { margin: -.2rem 0 .6rem; }
+/* Основной сервер: переключатель, пояснение и кнопка замера скорости. */
+.main-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .6rem .75rem;
+  margin-bottom: .8rem;
+  padding: .65rem .8rem;
+  border-radius: 12px;
+  background: var(--card-2);
+}
+.main-text { display: flex; flex: 1 1 14rem; flex-direction: column; min-width: 0; }
+.main-title { font-weight: 600; }
 /* Расход трафика на проверки серверов: под списком, заметнее — при превышении лимита. */
 .budget-note { margin-top: .8rem; padding-top: .7rem; border-top: 1px solid var(--line); }
 .budget-note.over {

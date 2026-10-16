@@ -20,6 +20,7 @@ from xgw.parsers.common import parse_links_text
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store
 from xgw.watch.scan import ScanResult
+from xgw.watch.speed import SpeedResult
 from xgw.watch.states import State
 from xgw.xraycore.api import ApiError, BalancerInfo
 
@@ -110,10 +111,17 @@ class Harness(Daemon):
         self.base_ping = False  # базовый запрос через VPN (проверка «не отвечает probe.url»)
         self.direct = ""  # probe.url напрямую: пусто — отдаётся, иначе класс сбоя
         self.failures: dict[str, ScanResult] = {}  # probe-тег → результат пробы с ошибкой
+        self.speeds: dict[str, float | None] = {}  # тег → скорость замера (None — не удался)
+        self.default_speed: float | None = 50.0
+        self.measured: list[str] = []
+        self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
 
     def _read_observatory(self):
         if self.observatory is None:
             raise OSError("metrics down")
+        self._metrics = {} if self.traffic is None else {
+            "stats": {"outbound": {"proxy-x": {"downlink": self.traffic, "uplink": 0}}}
+        }
         return self.observatory
 
     def _check_provider(self):
@@ -161,6 +169,13 @@ class Harness(Daemon):
     def _base_ping(self, members=(), password=""):
         return self.base_ping
 
+    def _speed(self, info, password):
+        self.measured.append(info.tag)
+        mbps = self.speeds.get(info.tag, self.default_speed)
+        if mbps is None:
+            return SpeedResult(None, 16384, 5.0, "тишина 5 с после 16384 байт тела")
+        return SpeedResult(mbps, 10_000_000, round(80.0 / mbps, 2))
+
     def _direct_probe(self):
         return self.direct
 
@@ -203,6 +218,9 @@ def daemon(tmp_path, monkeypatch):
     cfg.filters.max_members = 2
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []  # без сети: домены серверов в тестах не резолвим
+    # Основной сервер (0.1.9) проверяется отдельно (test_daemon_main.py): здесь ядро само
+    # выбирает сервер, как до него, и вызовы API в тестах прежние.
+    cfg.speed.sticky = False
     instance = Harness(cfg, paths)
     yield instance
     instance.store.close()

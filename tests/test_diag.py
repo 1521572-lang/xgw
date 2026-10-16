@@ -556,7 +556,9 @@ def test_budget_check_shows_the_month_and_the_measured_probe(box):
     """Расход на проверки — в сутки и в месяц, от измеренного размера пробы."""
     (check,) = box.diag()._budget()
     assert check.level == OK and "~830 МБ в сутки при 5 участниках" in check.text
-    assert "~32 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
+    # Замер скорости основного сервера (0.1.9) — сверху: 5 серверов × 10 МБ × 4 раза в сутки.
+    assert "сквозной проверкой и замером скорости — ~1279 МБ в сутки" in check.text
+    assert "~38 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
     store = Store(box.paths.db_file)
     status.remember_probe_size(store, box.cfg.probe.url, 87_533)
     store.set_meta("quota", json.dumps({"main": {"total": 100 * 10**9}}))

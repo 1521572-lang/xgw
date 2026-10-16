@@ -202,7 +202,9 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
     return Outcome(
         0,
         f"{tag} закреплён на {ttl_text}. Автопереключение на это время отключено: "
-        "если узел «заморозят», трафик встанет",
+        "если узел «заморозят», трафик встанет"
+        + ("; основной сервер шлюз выберет снова, когда закрепление снимется"
+           if cfg.speed.sticky else ""),
         notes,
         ("снять раньше: xgw unpin",),
     )
@@ -219,4 +221,9 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
     with open_store(paths) as store:
         store.set_meta("pin", "")
         store.add_event("pin", "закрепление снято вручную")
+    if cfg.speed.sticky:
+        return Outcome(
+            0, "закрепление снято: через минуту шлюз снова закрепит основной сервер — самый "
+            "быстрый из серверов в работе",
+        )
     return Outcome(0, "закрепление снято, выбором узла снова управляет Xray")
