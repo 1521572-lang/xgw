@@ -23,7 +23,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import __version__, actions, config, desktop, engine, log, managed
+from . import __version__, actions, config, desktop, engine, log, managed, priority
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, nft, tun
@@ -83,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     pin.add_argument("tag", help="тег участника (proxy-…)")
     pin.add_argument("--ttl", default="10m", help="срок: 30s, 10m, 2h (по умолчанию 10m)")
     subparsers.add_parser("unpin", parents=[common], help="снять ручное закрепление")
+    prio = subparsers.add_parser(
+        "priority", parents=[common],
+        help="приоритет сервера: high, medium (по умолчанию) или low; в работе — серверы "
+        "самого высокого уровня, на котором есть живые",
+    )
+    prio.add_argument("server", help="тег (proxy-…, spare-…), отпечаток или имя сервера")
+    prio.add_argument("level", choices=priority.LEVELS)
 
     subparsers.add_parser(
         "enable", parents=[common], help="включить перехват: трафик идёт через Xray"
@@ -174,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe": _cmd_probe,
         "pin": _cmd_pin,
         "unpin": _cmd_unpin,
+        "priority": _cmd_priority,
         "enable": _cmd_enable,
         "disable": _cmd_disable,
         "net": _cmd_net,
@@ -455,6 +463,43 @@ def _cmd_pin(args, cfg: config.Config, paths: Paths, logger) -> int:
 
 def _cmd_unpin(args, cfg: config.Config, paths: Paths, logger) -> int:
     return _emit(actions.unpin(cfg, paths))
+
+
+def _cmd_priority(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """Приоритет сервера — то же, что выбор в панели (panel.json); демон перечитает
+    настройки и применит их на ближайшем шаге."""
+    listing = engine.load_inventory(paths)
+    wanted = args.server.strip()
+    match = builder.TAG_RE.match(wanted)
+    if match:
+        found = [item for item in listing if str(item.get("fingerprint", "")).startswith(
+            match.group(3))]
+    else:
+        found = [item for item in listing if wanted in (item.get("fingerprint"), item.get("name"))]
+    fingerprints = {str(item.get("fingerprint")) for item in found}
+    if not fingerprints:
+        return _fail(f"сервер «{wanted}» не найден: его нет в списке серверов подписок "
+                     "(xgw servers — теги, панель — имена)", 2)
+    if len(fingerprints) > 1:
+        return _fail(f"«{wanted}» подходит нескольким серверам — укажите тег или отпечаток", 2)
+    (fingerprint,) = fingerprints
+    try:
+        changed = managed.set_priority(
+            managed.path_for(args.config_path), [fingerprint], args.level
+        )
+    except managed.ManagedError as exc:
+        return _fail(str(exc))
+    except OSError as exc:
+        return _fail(f"приоритет не записан: {exc} — запустите команду через sudo")
+    name = found[0].get("name") or fingerprint
+    word = priority.NAMES[args.level]
+    if not changed:
+        print(f"приоритет сервера «{name}» уже {word}")
+        return 0
+    logger.info("приоритет сервера «%s»: %s", name, word)
+    print(f"приоритет сервера «{name}»: {word}. Демон применит его на ближайшем шаге; в "
+          "работе — серверы самого высокого уровня, на котором есть живые")
+    return 0
 
 
 # --- enable / disable / net ----------------------------------------------------

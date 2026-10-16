@@ -4,7 +4,9 @@
 собирает сигналы — метрики observatory, сквозную загрузку через http-in и
 доступность провайдера, — ведёт машину состояний и делает то, что ядро само
 не умеет: обновляет подписки, применяет изменения, сканирует запасные и
-меняет «мёртвых» участников (раздел 6.8).
+меняет «мёртвых» участников (раздел 6.8). Ещё он ведёт уровни приоритета серверов
+(priority.py): переходит на уровень ниже, когда на нынешнем живых нет, и возвращается
+выше, когда сервер того уровня снова проходит проверку.
 
 Один поток, один шаг за раз: применение конфига идёт под файловой блокировкой
 и не пересекается с командами CLI. Каждое обращение наружу — отдельный метод
@@ -26,9 +28,14 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import engine, fetch, log
+from . import engine, fetch, log, priority
 from .apply.applier import ApplyOutcome, in_restart_window
-from .apply.rotation import REPLACE_NOW_VERDICTS, plan_rotation, preferred_members
+from .apply.rotation import (
+    REPLACE_NOW_VERDICTS,
+    REPLACEABLE_VERDICTS,
+    plan_rotation,
+    preferred_members,
+)
 from .config import Config
 from .generator import builder
 from .generator.builder import BALANCER_TAG, NodeInfo
@@ -56,6 +63,9 @@ WAIT_SLICE = 1.0  # как часто пауза между шагами смо�
 MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
 PROBE_TARGET_RECHECK = 300.0  # как часто перепроверять, отвечает ли сам probe.url
 PROBE_WORKERS = 8  # пробы для этой перепроверки идут одновременно: шаг не должен зависать
+# Работают серверы уровня ниже наивысшего — запасные уровней выше проверяются не реже
+# этого: вернуться к ним нужно скоро после того, как они снова заработают.
+TIER_RESCAN = 300.0
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -148,6 +158,9 @@ class Daemon:
         self.next_leak = 0.0
         self.next_all_dead = 0.0
         self.next_rescan = 0.0
+        # Когда демон последний раз сменил уровень приоритета участников (time.time()):
+        # вернуться выше можно только по скану, сделанному после этого.
+        self.tier_changed = 0.0
         self._provider_ip: tuple[float, str] | None = None
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
@@ -229,6 +242,7 @@ class Daemon:
         self.probe_target = previous.probe_target
         self.next_target_check = previous.next_target_check
         self._urgent_rebuild = previous._urgent_rebuild
+        self.tier_changed = previous.tier_changed
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -346,6 +360,8 @@ class Daemon:
                 state is State.HEALTHY and self.bad_members
             ) or (state is State.LEAK and self._home_members(view)):
                 changed = self._rotate(view, observatory or {}, state, now)
+            if not changed:
+                changed = self._switch_tier(view, state, now)
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
@@ -806,11 +822,13 @@ class Daemon:
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
         return self._rebuild(None, urgent=urgent, reason="обновление подписки")
 
-    def _rebuild(self, prefer: list[str] | None, *, urgent: bool, reason: str) -> bool:
+    def _rebuild(
+        self, prefer: list[str] | None, *, urgent: bool, reason: str, tier: int | None = None
+    ) -> bool:
         assert self.inventory is not None
         dead = engine.quarantined()
         try:
-            assembly = self._assemble(prefer)
+            assembly = self._assemble(prefer, tier)
         except engine.EngineError as exc:
             self.notifier.event("config", f"{reason}: {exc}", notify=True)
             return False
@@ -857,11 +875,11 @@ class Daemon:
             self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray
         )
 
-    def _assemble(self, prefer: list[str] | None) -> engine.Assembly:
+    def _assemble(self, prefer: list[str] | None, tier: int | None = None) -> engine.Assembly:
         assert self.inventory is not None
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
-            xray_bin=self.xray_bin, prefer=prefer,
+            xray_bin=self.xray_bin, prefer=prefer, tier=tier,
         )
 
     def _apply(self, config: dict, *, urgent: bool) -> ApplyOutcome:
@@ -870,9 +888,15 @@ class Daemon:
     # --- сканы и замена участников ---------------------------------------------
 
     def _queue_scan(self, view: list[NodeInfo], now: float) -> None:
+        """Все запасные — в очередь скана; серверы уровня приоритета выше — первыми."""
         queued = set(self.scan_queue)
-        for info in view:
-            if info.role == "spare" and info.probe_tag not in queued:
+        levels = self.cfg.managed.priority
+        spares = sorted(
+            (info for info in view if info.role == "spare"),
+            key=lambda info: priority.rank(levels, info.fingerprint),
+        )
+        for info in spares:
+            if info.probe_tag not in queued:
                 self.scan_queue.append(info.probe_tag)
         self.next_rescan = now + RESCAN_PAUSE
 
@@ -931,17 +955,18 @@ class Daemon:
         members = [info for info in view if info.role == "proxy"]
         if any(info.fingerprint not in by_fingerprint for info in members):
             return False  # состав ядра не сопоставлен с подпиской — менять вслепую нельзя
+        # Замена — только запасным того же уровня приоритета: на уровень ниже переходит
+        # _switch_tier, когда живых на этом не осталось.
+        levels = self.cfg.managed.priority
+        tier = priority.best(levels, [info.fingerprint for info in members])
         pairs = [
             (info, by_fingerprint[info.fingerprint])
             for info in view
             if info.role == "spare" and info.fingerprint in by_fingerprint
             and info.fingerprint not in self.home_exits  # тоже выходит в домашнюю страну
+            and priority.rank(levels, info.fingerprint) == tier
         ]
-        # «Прошедший последний скан»: результат старше двух периодов скана не в счёт.
-        fresh_after = self.wall() - self.cfg.probe.scan_spares_minutes * 120.0 - 120.0
-        scans = {
-            tag: entry for tag, entry in self.store.scans().items() if entry["ts"] >= fresh_after
-        }
+        scans = self._fresh_scans()
         verdicts = {i.tag: scans[i.probe_tag]["verdict"] for i, _ in pairs if i.probe_tag in scans}
         seconds = {i.tag: scans[i.probe_tag]["seconds"] for i, _ in pairs if i.probe_tag in scans}
         cfg = self.cfg
@@ -986,6 +1011,103 @@ class Daemon:
             preferred_members(members, rotation),
             urgent=state is State.ALL_DEAD,
             reason="замена участника",
+        )
+
+    def _fresh_scans(self) -> dict[str, dict]:
+        """Сканы по probe-тегам. «Прошедший последний скан»: результат старше двух
+        периодов скана не в счёт."""
+        fresh_after = self.wall() - self.cfg.probe.scan_spares_minutes * 120.0 - 120.0
+        return {
+            tag: entry for tag, entry in self.store.scans().items() if entry["ts"] >= fresh_after
+        }
+
+    def _switch_tier(self, view: list[NodeInfo], state: State, now: float) -> bool:
+        """Уровни приоритета серверов (priority.py).
+
+        Вверх: запасной уровня выше нынешнего прошёл скан (OK), сделанный уже после
+        последней смены уровня, — участниками становятся серверы того уровня. Скан
+        «после смены» не даёт вернуться к серверу по старому результату, полученному ещё
+        до того, как он перестал отвечать. Пока работают серверы уровня ниже наивысшего,
+        запасные уровней выше проверяются раз в TIER_RESCAN.
+
+        Вниз: живых участников нет (ALL_DEAD) и живых запасных того же уровня тоже —
+        участниками становятся проверенные запасные ближайшего уровня ниже, у которого они
+        есть. Ждать rotate_after_min незачем: трафику идти больше некуда.
+
+        Пока сервер закреплён вручную (xgw pin), уровень не меняется."""
+        if self.inventory is None or self._pin() is not None:
+            return False
+        levels = self.cfg.managed.priority
+        known = {node.fingerprint for node in self.inventory.nodes}
+        members = [info for info in view if info.role == "proxy"]
+        if not members or any(info.fingerprint not in known for info in members):
+            return False  # состав ядра не сопоставлен с подпиской — менять вслепую нельзя
+        tier = priority.best(levels, [info.fingerprint for info in members])
+        assert tier is not None
+        spares = [
+            info for info in view
+            if info.role == "spare" and info.fingerprint in known
+            and info.fingerprint not in self.home_exits
+        ]
+        scans = self._fresh_scans()
+
+        def ready(rank: int, verdicts: tuple[str, ...], after: float = 0.0) -> list[NodeInfo]:
+            found = [
+                info for info in spares
+                if priority.rank(levels, info.fingerprint) == rank
+                and info.probe_tag in scans and scans[info.probe_tag]["verdict"] in verdicts
+                and scans[info.probe_tag]["ts"] > after
+            ]
+            return sorted(found, key=lambda info: (
+                scans[info.probe_tag]["verdict"] != "OK", scans[info.probe_tag]["seconds"],
+            ))
+
+        for rank in range(tier):
+            better = ready(rank, ("OK",), after=self.tier_changed)
+            if better:
+                return self._change_tier(
+                    tier, rank, better, urgent=state is State.ALL_DEAD,
+                    text=f"сервер уровня «{priority.level_name(rank)}» снова отвечает",
+                )
+        self._queue_higher(spares, tier, scans)
+        if state is not State.ALL_DEAD or ready(tier, REPLACEABLE_VERDICTS):
+            return False  # живые есть — или их заменит _rotate тем же уровнем
+        for rank in range(tier + 1, len(priority.LEVELS)):
+            lower = ready(rank, REPLACEABLE_VERDICTS)
+            if lower:
+                return self._change_tier(
+                    tier, rank, lower, urgent=True,
+                    text=f"на уровне «{priority.level_name(tier)}» живых серверов нет",
+                )
+        return False
+
+    def _queue_higher(self, spares: list[NodeInfo], tier: int, scans: dict[str, dict]) -> None:
+        """Запасные уровней выше нынешнего, давно не проверенные, — в начало очереди."""
+        levels = self.cfg.managed.priority
+        due = max(self.tier_changed, self.wall() - TIER_RESCAN)
+        queued = set(self.scan_queue)
+        for info in reversed(spares):
+            if (
+                priority.rank(levels, info.fingerprint) < tier and info.probe_tag not in queued
+                and (info.probe_tag not in scans or scans[info.probe_tag]["ts"] <= due)
+            ):
+                self.scan_queue.appendleft(info.probe_tag)
+
+    def _change_tier(
+        self, tier: int, rank: int, ready: list[NodeInfo], *, urgent: bool, text: str
+    ) -> bool:
+        name = priority.level_name(rank)
+        self.notifier.event(
+            "priority",
+            f"{text} — в работе серверы уровня «{name}» (были — «{priority.level_name(tier)}»)",
+            notify=True,
+        )
+        self.tier_changed = self.wall()
+        # Серверы пришли из запасных, прошедших скан, — проверять их заново незачем.
+        self.vetted.update(info.fingerprint for info in ready)
+        return self._rebuild(
+            [info.fingerprint for info in ready], urgent=urgent, tier=rank,
+            reason=f"смена уровня приоритета: «{name}»",
         )
 
     # --- ручное закрепление ----------------------------------------------------

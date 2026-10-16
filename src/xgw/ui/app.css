@@ -454,6 +454,30 @@ button, textarea, input { font: inherit; color: inherit; }
 .empty-text { padding: .4rem 0; }
 
 .row-tools { display: flex; flex: none; align-items: center; gap: .15rem; }
+.prio {
+  flex: none;
+  max-width: 6.6rem;
+  margin: 0 .15rem;
+  padding: .15rem .3rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: .8rem;
+  cursor: pointer;
+}
+.prio.high { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
+.prio.low { opacity: .8; }
+.prio[data-busy] { cursor: progress; opacity: .6; }
+
+/* Узкий экран: у сервера много кнопок (закрепить, приоритет, выключатель, убрать) —
+   они уходят на вторую строку, а имя и состояние остаются читаемыми. */
+@media (max-width: 599.98px) {
+  .servers > li { flex-wrap: wrap; row-gap: .35rem; }
+  .servers > li > .row-main { flex-basis: calc(100% - 10rem); }
+  .servers > li > .row-tools { flex-basis: 100%; justify-content: flex-end; }
+}
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
 
 .switch {

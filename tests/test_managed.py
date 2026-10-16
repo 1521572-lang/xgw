@@ -30,7 +30,7 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "telegram": {"token": "", "chat_id": ""}}, "")
+         "telegram": {"token": "", "chat_id": ""}, "priority": {}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -73,6 +73,8 @@ def test_junk_inside_the_file_is_ignored(conf):
         "links": [5, "", links.VMESS],
         "disabled": ["AAAA1111", "aaaa1111", "aaaa1111", "bbbb2222", 7, "короткий"],
         "removed": ["bbbb2222"],
+        "priority": {"aaaa1111": "high", "cccc3333": "medium", "dddd4444": "срочно",
+                     "AAAA2222": "low", "eeee5555": "low", "x": "high"},
     })
     data, error = managed.load(managed.path_for(conf))
     assert error == "" and data == {
@@ -83,7 +85,27 @@ def test_junk_inside_the_file_is_ignored(conf):
         "removed": ["bbbb2222"],
         "devices": [],
         "telegram": {"token": "", "chat_id": ""},
+        # средний не хранится; неизвестный уровень и чужой отпечаток отброшены
+        "priority": {"aaaa1111": "high", "eeee5555": "low"},
     }
+
+
+def test_priority_is_kept_per_fingerprint_and_medium_is_not_stored(conf):
+    path = managed.path_for(conf)
+    assert managed.set_priority(path, ["aaaa1111", "bbbb2222"], "high") is True
+    assert managed.set_priority(path, ["aaaa1111"], "high") is False  # уже так
+    assert managed.set_priority(path, ["bbbb2222"], "low") is True
+    assert managed.load(path)[0]["priority"] == {"aaaa1111": "high", "bbbb2222": "low"}
+    assert managed.set_priority(path, ["aaaa1111"], "medium") is True
+    assert managed.load(path)[0]["priority"] == {"bbbb2222": "low"}
+    cfg, _warnings = config.load(conf)
+    assert cfg.managed.priority == {"bbbb2222": "low"}
+    # Прочее в файле не теряется.
+    managed.set_servers(path, ["cccc3333"], "disabled")
+    assert managed.load(path)[0]["priority"] == {"bbbb2222": "low"}
+    for fingerprints, level in ((["aaaa1111"], "top"), ([], "high"), (["короткий"], "low")):
+        with pytest.raises(managed.ManagedError):
+            managed.set_priority(path, fingerprints, level)
 
 
 def test_subscription_names_and_limits(conf):

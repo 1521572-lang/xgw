@@ -7,7 +7,7 @@ import links
 import pytest
 from fakenet import FakeKernel
 
-from xgw import cli, engine
+from xgw import cli, config, engine
 from xgw.apply.applier import ApplyOutcome
 from xgw.cli import main
 from xgw.paths import Paths
@@ -106,6 +106,27 @@ def _alive(gateway, monkeypatch, dead=()):
     }
     payload = {"observatory": observatory}
     monkeypatch.setattr(cli.metrics, "fetch_metrics", lambda *_args, **_kwargs: payload)
+
+
+def test_priority_is_set_by_tag_fingerprint_or_name(gateway, capsys):
+    """`xgw priority` пишет то же, что выбор в панели (panel.json); демон перечитает."""
+    cfg, _warnings = config.load(gateway.config)
+    engine.save_inventory(gateway.paths, cfg, engine.collect(
+        cfg, gateway.paths, mark=None, logger=cli.log.get_logger("test"), via_xray=False))
+    member = gateway.tags("proxy")[0]
+    assert gateway.run("priority", member, "high") == 0
+    assert "приоритет сервера" in capsys.readouterr().out
+    saved = config.load(gateway.config)[0].managed.priority
+    (fingerprint,) = saved
+    assert saved == {fingerprint: "high"} and fingerprint.startswith(member.rsplit("-", 1)[1])
+    assert gateway.run("priority", fingerprint, "high") == 0
+    assert "уже высокий" in capsys.readouterr().out
+    name = next(item["name"] for item in cli.engine.load_inventory(gateway.paths)
+                if item["fingerprint"] == fingerprint)
+    assert gateway.run("priority", name, "medium") == 0
+    assert config.load(gateway.config)[0].managed.priority == {}
+    assert gateway.run("priority", "proxy-zz-0000", "low") == 2
+    assert "не найден" in capsys.readouterr().err
 
 
 # --- apply ---------------------------------------------------------------------

@@ -346,7 +346,7 @@ def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     assert by_name["<b>KZ</b>"]["status"] == "disabled" and not by_name["<b>KZ</b>"]["pending"]
     assert by_name["Осталось 5 ГБ"] == {
         "fingerprint": "eeee5555", "name": "Осталось 5 ГБ", "source": "main",
-        "protocol": "vless", "status": "skipped", "skip": "filter",
+        "protocol": "vless", "status": "skipped", "skip": "filter", "priority": "medium",
     }
     assert [server["status"] for server in state["servers"]] == [
         "member", "member", "spare", "disabled", "skipped"]
@@ -670,13 +670,38 @@ def test_server_is_disabled_removed_and_returned(rig, user):
     state = user.state()
     assert "bbbb2222" not in [s["fingerprint"] for s in state["servers"]]
     assert state["removed"] == [
-        {"fingerprint": "bbbb2222", "name": "DE-1", "source": "main", "protocol": "vless"}]
+        {"fingerprint": "bbbb2222", "name": "DE-1", "source": "main", "protocol": "vless",
+         "priority": "medium"}]
 
     result = user.act("servers", {"fingerprints": ["bbbb2222"], "mode": "enabled"})
     assert result["text"] == "сервер «DE-1» возвращён в список"
     assert rig.saved()["removed"] == [] and user.state()["removed"] == []
     cfg, _warnings = config.load(rig.config_path)
     assert cfg.managed.disabled == [] and cfg.managed.removed == []
+
+
+def test_server_priority_is_set_from_the_panel(rig, user):
+    result = user.act("priority", {"fingerprints": ["bbbb2222"], "level": "high"})
+    assert result["ok"] and result["text"] == "Приоритет сервера «DE-1»: высокий"
+    assert "уровнем ниже" in result["notes"][0]
+    assert rig.saved()["priority"] == {"bbbb2222": "high"} and rig.daemon.poke.is_set()
+    by_print = {s["fingerprint"]: s for s in user.state()["servers"]}
+    assert by_print["bbbb2222"]["priority"] == "high"
+    assert by_print["aaaa1111"]["priority"] == "medium"
+    both = user.act("priority", {"fingerprints": ["aaaa1111", "bbbb2222"], "level": "low"})
+    assert both["text"] == "Приоритет серверов (2): низкий"
+    assert rig.saved()["priority"] == {"aaaa1111": "low", "bbbb2222": "low"}
+    assert user.act("priority", {"fingerprints": ["aaaa1111"], "level": "medium"})["ok"]
+    assert rig.saved()["priority"] == {"bbbb2222": "low"}
+    cfg, _warnings = config.load(rig.config_path)
+    assert cfg.managed.priority == {"bbbb2222": "low"}
+    again = user.act("priority", {"fingerprints": ["bbbb2222"], "level": "low"})
+    assert again["text"] == "Ничего не изменилось"
+    for body in ({"fingerprints": ["ffff0000"], "level": "high"},
+                 {"fingerprints": ["aaaa1111"], "level": "срочно"},
+                 {"fingerprints": "aaaa1111", "level": "high"}):
+        assert not user.act("priority", body)["ok"]
+    assert rig.saved()["priority"] == {"bbbb2222": "low"}
 
 
 def test_last_enabled_server_cannot_be_switched_off(rig, user):

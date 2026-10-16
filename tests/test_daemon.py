@@ -132,10 +132,10 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer):
+    def _assemble(self, prefer, tier=None):
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
-            xray_bin=None, check=False, prefer=prefer,
+            xray_bin=None, check=False, prefer=prefer, tier=tier,
         )
 
     def _apply(self, config, *, urgent):
@@ -281,6 +281,87 @@ def test_dead_member_is_replaced_after_rotate_after_min(daemon):
     assert victim not in members and survivor in members
     assert victim.replace("proxy-", "spare-") in daemon.tags("spare")
     assert any(event.startswith("rotation:") for event in daemon.events())
+
+
+def _fingerprint(daemon: Harness, tag: str) -> str:
+    return next(info.fingerprint for info in daemon.view() if info.tag == tag)
+
+
+def _by_level(daemon: Harness) -> tuple[str, list[str]]:
+    """Первый тик с одним сервером высокого уровня (обычно он был бы запасным):
+    его отпечаток и отпечатки остальных (средних) серверов."""
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    high = nodes[-1]
+    daemon.cfg.managed.priority = {high: "high"}
+    _started(daemon)
+    return high, [fp for fp in nodes if fp != high]
+
+
+def test_only_servers_of_the_highest_level_work(daemon):
+    high, _others = _by_level(daemon)
+    members = daemon.tags("proxy")
+    assert len(members) == 1 and _fingerprint(daemon, members[0]) == high  # max_members = 2
+    assert daemon.status()["tier"] == "high"
+    assert {m["priority"] for m in daemon.status()["members"]} == {"high"}
+
+
+def test_all_dead_on_a_level_goes_down_and_comes_back_when_it_answers(daemon):
+    high, others = _by_level(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    (member,) = daemon.tags("proxy")
+    daemon.set_alive(**{member.replace("-", "_"): False})
+    assert daemon.tick() is State.ALL_DEAD
+    # Живых высокого уровня нет — в работе средние, сразу и с правом перезапуска.
+    members = daemon.tags("proxy")
+    assert {_fingerprint(daemon, tag) for tag in members} <= set(others) and len(members) == 2
+    assert daemon.applied[-1][1] is True
+    assert any("на уровне «высокий» живых серверов нет — в работе серверы уровня «средний»"
+               in event for event in daemon.events())
+    assert daemon.status()["tier"] == "medium"
+
+    # Сервер высокого уровня пока не отвечает: проверяется чаще (TIER_RESCAN), но не берётся.
+    daemon.set_alive()
+    spare = member.replace("proxy-", "spare-")
+    daemon.verdicts[spare.replace("spare-", "probe-")] = "CONNECT_FAIL"
+    daemon.applied.clear()
+    daemon.scanned.clear()
+    for _ in range(3):
+        daemon.t += 301
+        daemon.tick()
+    assert spare in daemon.scanned and daemon.applied == []
+    # Ответил — возвращаемся к нему.
+    daemon.verdicts.clear()
+    daemon.t += 301
+    daemon.tick()
+    daemon.tick()
+    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
+    assert any("сервер уровня «высокий» снова отвечает — в работе серверы уровня «высокий»"
+               in event for event in daemon.events())
+
+
+def test_dead_member_is_replaced_only_by_a_spare_of_its_level(daemon):
+    """Участник умер, а живые запасные — только уровня ниже: участники разных уровней
+    вместе не работают, поэтому замены нет (живой участник того же уровня ещё есть)."""
+    daemon.cfg.filters.rotate_after_min = 0
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
+    _started(daemon)
+    victim, _survivor = daemon.tags("proxy")
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    for _ in range(3):
+        assert daemon.tick() is State.DEGRADED
+    assert daemon.applied == [] and victim in daemon.tags("proxy")
+
+
+def test_pinned_server_keeps_its_level(daemon):
+    high, _others = _by_level(daemon)
+    (member,) = daemon.tags("proxy")
+    daemon.store.set_meta("pin", json.dumps({"tag": member, "until": daemon.t + 3600}))
+    daemon.next_refresh = daemon.t + 3600
+    daemon.set_alive(**{member.replace("-", "_"): False})
+    daemon.tick()
+    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
+    assert not any("уровня" in event for event in daemon.events())
 
 
 def test_frozen_spares_are_not_promoted(daemon):

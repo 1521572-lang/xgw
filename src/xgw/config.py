@@ -212,6 +212,8 @@ class Managed:
     devices: list[str] = field(default_factory=list)
     # Токен бота и чат подключены в панели (а не вписаны в config.toml).
     telegram: bool = False
+    # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
+    priority: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -309,6 +311,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
             cfg.managed.links.append(link)
     cfg.managed.disabled = list(data["disabled"])
     cfg.managed.removed = list(data["removed"])
+    cfg.managed.priority = dict(data["priority"])
     warnings.extend(_merge_devices(cfg, data["devices"]))
     bot = data["telegram"]
     if bot["token"]:

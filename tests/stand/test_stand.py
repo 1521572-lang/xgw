@@ -155,6 +155,52 @@ def test_subscription_change_applies_without_dropping_connections(stand):
     assert stand.xray_pid() == pid  # Xray не перезапускался
 
 
+def test_priority_levels_go_down_when_the_top_is_dead_and_come_back(stand):
+    """Уровни приоритета на живом Xray: высокий (nl) работает один, хотя max_members = 2;
+    перестал отвечать — демон переходит на средний (de), низкий (fr) не трогает; ожил —
+    возвращается к высокому."""
+    _up(stand)
+    stand.start_daemon()
+
+    def by_country(status: dict) -> dict[str, dict]:
+        return {entry["tag"].split("-")[1]: entry
+                for entry in [*status["members"], *status["spares"]]}
+
+    status = wait_for(lambda: (s := stand.xgw_json("status"))["daemon"] and s, 60, step=2)
+    assert status, stand.tail("daemon", 30)
+    tags = {country: entry["tag"] for country, entry in by_country(status).items()}
+    for country, level in (("nl", "high"), ("fr", "low")):
+        result = stand.xgw("priority", tags[country], level)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def working(country: str):
+        def check():
+            status = stand.xgw_json("status")
+            members = [entry["tag"].split("-")[1] for entry in status["members"]]
+            return members == [country] and status
+
+        return check
+
+    status = wait_for(working("nl"), 120, step=2)
+    assert status, stand.tail("daemon", 60)
+    assert status["tier"] == "high"
+    assert wait_for(lambda: stand.selecting() and stand.selecting()[0].startswith("proxy-nl"),
+                    40, step=2), stand.selecting()
+
+    stand.servers["nl"].set_mode("drop")
+    status = wait_for(working("de"), 150, step=2)
+    assert status, stand.tail("daemon", 60)
+    assert status["tier"] == "medium"
+    assert any("на уровне «высокий» живых серверов нет" in event["detail"]
+               for event in status["events"])
+
+    stand.servers["nl"].set_mode("pass")
+    status = wait_for(working("nl"), 200, step=2)
+    assert status, stand.tail("daemon", 60)
+    assert any("снова отвечает" in event["detail"] for event in status["events"])
+    assert "fr" not in [entry["tag"].split("-")[1] for entry in status["members"]]
+
+
 def test_daemon_replaces_frozen_member_and_expires_pin(stand):
     """«Замороженный» участник заменяется запасным; закрепление снимается по сроку."""
     members = _up(stand)

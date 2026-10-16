@@ -195,6 +195,31 @@ def test_prefer_keeps_rotation_result():
     assert [n.fingerprint for n in gone.members] == ["cccc0000", "aaaa0000"]
 
 
+def test_members_are_taken_from_one_priority_level_only():
+    """Участники — только серверы одного уровня приоритета, даже если их меньше
+    max_members: иначе быстрый сервер уровня ниже отбирал бы трафик у живого уровня выше."""
+    cfg = Config()
+    cfg.filters.max_members = 3
+    nodes = [_node(fp, fp[:1].upper()) for fp in ("aaaa0000", "bbbb0000", "cccc0000",
+                                                  "dddd0000", "eeee0000")]
+    cfg.managed.priority = {"dddd0000": "high", "eeee0000": "high", "aaaa0000": "low"}
+    top = select_nodes(nodes, cfg)
+    assert top.tier == 0 and [n.fingerprint for n in top.members] == ["dddd0000", "eeee0000"]
+    # запасные: сначала свой уровень (тут его нет), затем остальные по отпечатку
+    assert [n.fingerprint for n in top.spares] == ["aaaa0000", "bbbb0000", "cccc0000"]
+    middle = select_nodes(nodes, cfg, tier=1, prefer=["cccc0000", "dddd0000"])
+    assert middle.tier == 1 and [n.fingerprint for n in middle.members] == [
+        "cccc0000", "bbbb0000"]  # высокий из prefer не берётся: уровень другой
+    low = select_nodes(nodes, cfg, tier=2)
+    assert [n.fingerprint for n in low.members] == ["aaaa0000"]
+    # Уровня, которого нет среди серверов, не бывает — берётся наивысший из имеющихся.
+    cfg.managed.priority = {"aaaa0000": "low"}
+    assert select_nodes(nodes, cfg, tier=0).tier == 1
+    cfg.managed.priority = {}
+    plain = select_nodes(nodes, cfg)
+    assert plain.tier == 1 and len(plain.members) == 3  # без приоритетов — как раньше
+
+
 def test_ipv6_server_dropped_when_ipv6_off():
     cfg = Config()
     node = _node("aaaa0000", "v6")

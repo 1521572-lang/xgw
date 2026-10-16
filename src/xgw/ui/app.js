@@ -209,6 +209,9 @@
   }
 
   const setServers = (fingerprints, mode) => act("servers", { fingerprints, mode });
+  // Приоритет сервера: в работе — серверы самого высокого уровня, на котором есть живые.
+  const LEVELS = [["high", "Высокий"], ["medium", "Средний"], ["low", "Низкий"]];
+  const LEVEL_NAMES = { high: "высокий", medium: "средний", low: "низкий" };
   const setDevice = (mac, bypass) => act("device", { mac, bypass });
 
   // --- отрисовка ------------------------------------------------------------
@@ -404,6 +407,19 @@
   // отключить или убрать такой сервер нельзя (это длится до первого опроса подписок).
   const editable = (server) => server.fingerprint.length === 8;
 
+  function priorityNode(server) {
+    if (server.status === "skipped" || !editable(server)) return null;
+    const level = server.priority || "medium";
+    const node = el("select", {
+      class: `prio ${level}`, "aria-label": `Приоритет ${server.name}`,
+      title: "Приоритет: шлюз берёт серверы самого высокого уровня, на котором есть живые",
+      onchange: () => act("priority", { fingerprints: [server.fingerprint], level: node.value }, node)
+        .then((ok) => { if (!ok) node.value = level; }),
+    }, ...LEVELS.map(([value, text]) => el("option", { value, text })));
+    node.value = level;
+    return node;
+  }
+
   function switchNode(server) {
     if (server.status === "skipped" || !editable(server)) return null;
     const on = server.status !== "disabled";
@@ -433,6 +449,7 @@
       el("div", { class: "row-tools" },
         server.status === "member" && !pinned
           ? iconButton("pin", `Закрепить ${server.name}`, () => openPin(server)) : null,
+        priorityNode(server),
         switchNode(server),
         editable(server) ? iconButton("remove", `Убрать ${server.name} из списка`, () => confirmRemove(
           `Убрать сервер «${server.name}» из списка?`,
@@ -461,6 +478,11 @@
   function renderServers(s) {
     const used = s.servers.filter((server) => server.status !== "skipped");
     $("members-count").textContent = used.length ? String(used.length) : "";
+    const ranked = s.servers.some((server) => (server.priority || "medium") !== "medium");
+    $("tier-note").hidden = !ranked || !s.tier;
+    $("tier-note").textContent = ranked && s.tier
+      ? `Приоритет: в работе серверы уровня «${LEVEL_NAMES[s.tier] || s.tier}». Уровнем ниже шлюз пользуется, только когда живых выше нет.`
+      : "";
     const sources = [...s.sources];
     for (const server of s.servers) if (!sources.includes(server.source)) sources.push(server.source);
     const nodes = [];

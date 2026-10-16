@@ -156,6 +156,20 @@ def test_status_line_tells_whether_ipv6_is_captured():
     assert status.render_capture({**capture, "tun": True}).endswith("эта машина через TUN")
 
 
+def test_server_list_shows_priority_levels_only_when_they_are_set():
+    member = {"tag": "proxy-nl-aaaa", "alive": True, "delay_ms": 80, "name": "NL-1",
+              "priority": "medium"}
+    spare = {"tag": "spare-de-bbbb", "verdict": None, "name": "DE-1", "priority": "medium"}
+    plain = status.render_servers({"members": [member], "spares": [spare], "tier": "medium"})
+    assert "уровень" not in plain and "[" not in plain
+    text = status.render_servers({
+        "members": [{**member, "priority": "high"}], "spares": [{**spare, "priority": "low"}],
+        "tier": "high",
+    })
+    assert "Участники балансировщика (1), уровень приоритета «высокий»:" in text
+    assert "NL-1 [высокий]" in text and "DE-1 [низкий]" in text
+
+
 def test_status_line_names_the_tun_when_only_the_interface_is_not_ready():
     capture = {"mode": "on", "lan_if": "lan0", "lan": True, "local": True, "bypass": [],
                "loaded": False, "tun_problem": ""}
@@ -340,8 +354,9 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
     assert snapshot["members"][0] == {
         "tag": "proxy-nl-aaaa", "fingerprint": "aaaa1111", "name": "NL-1", "source": "main",
         "alive": True,
-        "delay_ms": 123, "dead_since": None,
+        "delay_ms": 123, "dead_since": None, "priority": "medium",
     }
+    assert snapshot["tier"] == "medium"
     assert snapshot["members"][1]["alive"] is None  # ядро по узлу ещё ничего не сообщило
     assert snapshot["spares"][0]["verdict"] == "FROZEN" and snapshot["spares"][0]["bytes"] == 16384
     assert snapshot["budget"]["total_mb"] > 0 and snapshot["pending_restart"] is False

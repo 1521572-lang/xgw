@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, fetch, log, marknet, masking
+from . import config, fetch, log, marknet, masking, priority
 from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
 from .model import ServerNode, raw_to_node
@@ -253,25 +253,30 @@ def assemble(
     xray_bin: Path | None,
     check: bool = True,
     prefer: list[str] | None = None,
+    tier: int | None = None,
 ) -> Assembly:
     """Конфиг Xray из известных серверов.
 
     Состав участников, порты и пароль проб берутся из применённого конфига:
     обновление подписки не должно перетасовывать то, что уже работает в ядре.
     prefer — явный состав участников (замена «мёртвого» при ротации).
+    tier — ранг уровня приоритета участников (смена уровня демоном); по умолчанию —
+    уровень нынешних участников: обновление подписки уровень не меняет.
     Сервер, конфиг которого установленный Xray не принимает, отбрасывается.
     """
     applied = read_json(paths.xray_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
     if prefer is None:
         prefer = builder.member_fingerprints(applied, inventory.nodes)
+    if tier is None:
+        tier = priority.best(cfg.managed.priority, prefer)
 
     rejected: set[str] = set()
     dead = quarantined()
     first = True
     while True:
         usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
-        selection = builder.select_nodes(usable, cfg, prefer=prefer, dead=dead)
+        selection = builder.select_nodes(usable, cfg, prefer=prefer, dead=dead, tier=tier)
         if first:
             first = False
             for warning in selection.warnings:

@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import priority as priority_levels
 from .parsers.common import parse_links_text
 from .paths import atomic_write_json
 
@@ -46,11 +47,12 @@ def load(path: Path) -> tuple[dict, str]:
     """Содержимое panel.json и текст ошибки (пустой, если файла нет или он цел).
 
     Возвращается только проверенное: подписки с именем и адресом, ссылки — строки,
-    отключённые и убранные серверы — отпечатки, устройства мимо VPN — MAC и IPv4.
+    отключённые и убранные серверы — отпечатки, устройства мимо VPN — MAC и IPv4,
+    приоритеты — отпечаток → "high" или "low" (средний не хранится).
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "telegram": {"token": "", "chat_id": ""},
+        "telegram": {"token": "", "chat_id": ""}, "priority": {},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -83,7 +85,19 @@ def load(path: Path) -> tuple[dict, str]:
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
         "telegram": _telegram(raw.get("telegram")),
+        "priority": _priority(raw.get("priority")),
     }, ""
+
+
+def _priority(value: object) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for fingerprint, level in (value.items() if isinstance(value, dict) else ()):
+        if (
+            isinstance(fingerprint, str) and _FINGERPRINT_RE.fullmatch(fingerprint)
+            and level in priority_levels.LEVELS and level != priority_levels.DEFAULT
+        ):
+            result[fingerprint] = level
+    return dict(list(result.items())[-MAX_SERVERS:])
 
 
 def _fingerprints(value: object) -> list[str]:
@@ -222,6 +236,28 @@ def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:
         data[mode] = [*data[mode], *chosen][-MAX_SERVERS:]
     if (set(data["disabled"]), set(data["removed"])) == before:
         return False
+    save(path, data)
+    return True
+
+
+def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
+    """Ставит серверам приоритет: high, medium или low; True — что-то изменилось.
+    Средний — уровень по умолчанию, поэтому он не хранится: запись просто убирается."""
+    if level not in priority_levels.LEVELS or not fingerprints or not all(
+        isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) for item in fingerprints
+    ):
+        raise ManagedError("неизвестный сервер или уровень приоритета")
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    before = dict(data["priority"])
+    levels = {key: value for key, value in before.items() if key not in fingerprints}
+    if level != priority_levels.DEFAULT:
+        levels.update(dict.fromkeys(fingerprints, level))
+    if levels == before:
+        return False
+    # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
+    data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
     save(path, data)
     return True
 

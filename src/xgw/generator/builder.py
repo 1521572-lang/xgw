@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from .. import priority
 from ..config import Config
 from ..model import ServerNode
 from ..net import sysctl
@@ -19,6 +20,7 @@ from ..net.tun import MTU as tun_mtu
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
+TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
 
 
 class BuildError(Exception):
@@ -44,6 +46,8 @@ class Selection:
     # (junk — служебные адреса, ipv6, filter — фильтр имён, dns — домен не разрешается,
     # excluded — отключены или убраны в панели, duplicates — схлопнутые дубли).
     stats: dict[str, int] = field(default_factory=dict)
+    # Ранг уровня приоритета участников (priority.py): все участники — одного уровня.
+    tier: int = 1
 
 
 @dataclass
@@ -102,7 +106,7 @@ def skip_reason(
 
 def select_nodes(
     nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = (),
-    dead: Collection[str] = (),
+    dead: Collection[str] = (), tier: int | None = None,
 ) -> Selection:
     """Фильтры по имени, отбрасывание служебных адресов, дедупликация,
     канонический порядок (стабилен при любом порядке входных ссылок).
@@ -114,6 +118,11 @@ def select_nodes(
 
     dead — домены, которых нет в DNS: серверы с такими адресами в конфиг не попадают
     и пробы на них не тратятся, пока домен не появится снова (см. engine).
+
+    tier — ранг уровня приоритета участников (priority.py). Участники — только серверы
+    этого уровня, даже если их меньше max_members: иначе более быстрый сервер уровня
+    ниже отбирал бы трафик у живого сервера уровня выше. Остальные — запасные. Без tier
+    (или если серверов такого уровня нет) берётся наивысший уровень из имеющихся.
     """
     warnings: list[str] = []
     stats = dict.fromkeys(("total", "junk", "ipv6", "filter", "dns", "excluded", "duplicates"), 0)
@@ -150,26 +159,36 @@ def select_nodes(
             continue
         unique[node.fingerprint] = node
 
+    levels = cfg.managed.priority
+    ranks = {fingerprint: priority.rank(levels, fingerprint) for fingerprint in unique}
+    present = sorted(set(ranks.values()))
+    active = tier if tier in present else (present[0] if present else 1)
     limit = max(1, cfg.filters.max_members)
     members: list[ServerNode] = []
     for fingerprint in prefer:
         node = unique.get(fingerprint)
-        if node is not None and node not in members and len(members) < limit:
+        if (
+            node is not None and node not in members and len(members) < limit
+            and ranks[fingerprint] == active
+        ):
             members.append(node)
     chosen = {node.fingerprint for node in members}
     rest = sorted(
         (node for node in unique.values() if node.fingerprint not in chosen),
-        key=lambda node: (node.fingerprint, node.name),
+        key=lambda node: (ranks[node.fingerprint] != active, node.fingerprint, node.name),
     )
     free = limit - len(members)
-    members.extend(rest[:free])
-    spares = rest[free:]
+    same = [node for node in rest if ranks[node.fingerprint] == active][:free]
+    members.extend(same)
+    taken = {node.fingerprint for node in same}
+    spares = [node for node in rest if node.fingerprint not in taken]
 
     # Звенья цепочек нужны, только пока на них ссылается хоть один оставленный узел.
     kept = [*members, *spares]
     chains = _referenced_chains(kept, chains)
     return Selection(
-        members=members, spares=spares, chains=chains, warnings=warnings, stats=stats
+        members=members, spares=spares, chains=chains, warnings=warnings, stats=stats,
+        tier=active,
     )
 
 

@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import masking
+from .. import masking, priority
 from ..config import Config, parse_seconds, probe_bytes
 from ..generator.builder import NodeInfo
 from ..paths import Paths, atomic_write_json
@@ -215,6 +215,7 @@ def collect_status(
                     if entry and entry.get("delay") is not None
                     else None,
                     "dead_since": dead_at,
+                    "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
                 }
             )
         else:
@@ -229,6 +230,7 @@ def collect_status(
                     "bytes": scan["bytes"] if scan else None,
                     "seconds": scan["seconds"] if scan else None,
                     "scanned": scan["ts"] if scan else None,
+                    "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
                 }
             )
 
@@ -248,6 +250,8 @@ def collect_status(
         "capture": capture,
         "members": members,
         "spares": spares,
+        # Уровень приоритета, серверы которого сейчас в работе (priority.py).
+        "tier": _tier(cfg, members),
         "selecting": list(selecting),
         "pin": pin if pin and pin.get("until", 0) > now else None,
         "quota": quotas,
@@ -262,6 +266,11 @@ def collect_status(
     masked = masking.mask_obj(status)
     assert isinstance(masked, dict)
     return masked
+
+
+def _tier(cfg: Config, members: list[dict]) -> str | None:
+    rank = priority.best(cfg.managed.priority, [member["fingerprint"] for member in members])
+    return None if rank is None else priority.LEVELS[rank]
 
 
 def write_status(paths: Paths, status: dict) -> None:
@@ -309,10 +318,22 @@ def _ago(ts: float | None) -> str:
     return f"{minutes} мин" if minutes < 120 else f"{minutes // 60} ч"
 
 
+def _level(entry: dict) -> str:
+    """Отметка уровня приоритета у сервера; у среднего (по умолчанию) — пусто."""
+    level = entry.get("priority") or priority.DEFAULT
+    return "" if level == priority.DEFAULT else f" [{priority.NAMES.get(level, level)}]"
+
+
 def render_servers(status: dict) -> str:
     lines: list[str] = []
     members = status.get("members") or []
-    lines.append(f"Участники балансировщика ({len(members)}):")
+    spares = status.get("spares") or []
+    header = f"Участники балансировщика ({len(members)}):"
+    tier = status.get("tier")
+    if tier and any(_level(entry) for entry in [*members, *spares]):
+        header = (f"Участники балансировщика ({len(members)}), уровень приоритета "
+                  f"«{priority.NAMES.get(tier, tier)}»:")
+    lines.append(header)
     for member in members:
         if member["alive"] is None:
             health = "нет данных"
@@ -323,8 +344,9 @@ def render_servers(status: dict) -> str:
             dead = _ago(member.get("dead_since"))
             health = "МЁРТВ" + (f" уже {dead}" if dead else "")
         mark = "  ← выбран" if member["tag"] in (status.get("selecting") or []) else ""
-        lines.append(f"  {member['tag']:<20} {health:<18} {member.get('name', '')}{mark}")
-    spares = status.get("spares") or []
+        lines.append(
+            f"  {member['tag']:<20} {health:<18} {member.get('name', '')}{_level(member)}{mark}"
+        )
     lines.append(f"Запасные ({len(spares)}):")
     for spare in spares:
         if spare["verdict"] is None:
@@ -332,7 +354,7 @@ def render_servers(status: dict) -> str:
         else:
             scan = f"{spare['verdict']}, {spare['bytes']} Б за {spare['seconds']} с"
             scan += f" ({_clock(spare.get('scanned'))})"
-        lines.append(f"  {spare['tag']:<20} {scan:<40} {spare.get('name', '')}")
+        lines.append(f"  {spare['tag']:<20} {scan:<40} {spare.get('name', '')}{_level(spare)}")
     return "\n".join(lines)
 
 

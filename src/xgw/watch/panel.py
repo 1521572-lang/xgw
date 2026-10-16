@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import __version__, actions, config, engine, log, managed, masking
+from .. import __version__, actions, config, engine, log, managed, masking, priority
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
@@ -388,6 +388,7 @@ class Panel:
                 "name": item.get("name") or entry.get("name") or entry.get("tag") or fingerprint,
                 "source": source,
                 "protocol": item.get("protocol") or "",
+                "priority": priority.level_of(self.cfg.managed.priority, fingerprint),
             }
             if fingerprint in removed:
                 gone.append(row)
@@ -493,6 +494,8 @@ class Panel:
             "power": self._power(info["mode"], xray_ok, bool(members)),
             "members": members,
             "spares": spares,
+            # Уровень приоритета серверов, что сейчас в работе (priority.py).
+            "tier": snapshot.get("tier"),
             "servers": servers,
             "removed": gone,
             "sources": sources,
@@ -597,6 +600,34 @@ class Panel:
         self._event(text)
         self._wake()
         return actions.Outcome(0, text, notes)
+
+    def _set_priority(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Приоритет серверов — высокий, средний или низкий — по отпечаткам."""
+        chosen, level = body.get("fingerprints"), body.get("level")
+        if (
+            level not in priority.LEVELS or not isinstance(chosen, list) or not chosen
+            or len(chosen) > managed.MAX_SERVERS
+            or not all(isinstance(item, str) for item in chosen)
+        ):
+            return actions.Outcome(2, "ожидается список серверов и уровень: high, medium или low")
+        _snapshot, _xray_ok, members, spares = self._core(time.time())
+        rows, _gone = self._servers(members, spares)
+        names = {row["fingerprint"]: row["name"] for row in rows}
+        if any(item not in names for item in chosen):
+            return actions.Outcome(2, "такого сервера в списке нет — обновите страницу")
+        if not managed.set_priority(store_path, chosen, level):
+            return actions.Outcome(0, "Ничего не изменилось")
+        word = priority.NAMES[level]
+        if len(chosen) == 1:
+            text = f"приоритет сервера «{names[chosen[0]]}»: {word}"
+        else:
+            text = f"приоритет серверов ({len(chosen)}): {word}"
+        self._event(text)
+        self._wake()
+        return actions.Outcome(0, text[:1].upper() + text[1:], (
+            "В работе — серверы самого высокого уровня, на котором есть живые; "
+            "уровнем ниже шлюз пользуется, только когда живых выше нет",
+        ))
 
     def _set_device(self, body: dict, store_path: Path) -> actions.Outcome:
         """Пустить устройство мимо VPN (bypass: true) или вернуть в VPN (false).
@@ -761,6 +792,8 @@ class Panel:
             return self._add(body, store_path)
         if name == "servers":
             return self._set_servers(body, store_path)
+        if name == "priority":
+            return self._set_priority(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
         if name.startswith("telegram/"):
