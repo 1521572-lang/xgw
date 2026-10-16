@@ -364,6 +364,75 @@ def test_pinned_server_keeps_its_level(daemon):
     assert not any("уровня" in event for event in daemon.events())
 
 
+def test_levels_follow_the_real_machine_plan(daemon):
+    """Сценарий программы испытаний 0.1.7 (REAL-31…REAL-35): уровни меняют из панели, а
+    «мёртвый высокий уровень» — ненастоящий сервер, который проверку не проходит."""
+    daemon.tick()
+    spare_tags = daemon.tags("spare")
+    live, dead, low = (_fingerprint(daemon, tag) for tag in spare_tags)
+    verdicts = {spare_tags[1].replace("spare-", "probe-"): "CONNECT_FAIL"}
+    daemon.verdicts = dict(verdicts)
+    _started(daemon)
+
+    def levels(mapping):
+        def change(cfg):
+            cfg.managed.priority = dict(mapping)
+        return change
+
+    def members(d):
+        return sorted(_fingerprint(d, tag) for tag in d.tags("proxy"))
+
+    def step(d, dead_tag=None):
+        d.t += 20
+        state = d.tick()
+        alive = {dead_tag.replace("-", "_"): False} if dead_tag in d.tags("proxy") else {}
+        d.set_alive(**alive)
+        return state
+
+    # REAL-31: живой запасной — высокий: он один в работе.
+    d = _second(daemon, levels({live: "high"}))
+    d.tick()  # пересборка после смены настроек; уровень меняет следующий шаг
+    d.set_alive()
+    d.tick()
+    d.set_alive()
+    assert members(d) == [live] and d.status()["tier"] == "high"
+    # REAL-32, REAL-33: другой — низкий, ненастоящий — высокий: в работе живой и мёртвый.
+    d = _second(d, levels({live: "high", low: "low", dead: "high"}))
+    d.verdicts = dict(verdicts)
+    d.tick()
+    dead_tag = next(tag for tag in d.tags("proxy") if _fingerprint(d, tag) == dead)
+    d.set_alive(**{dead_tag.replace("-", "_"): False})
+    assert d.tick() is State.DEGRADED and members(d) == sorted([live, dead])
+    # REAL-34: живой — средний: высокий уровень весь мёртв — в работе средние.
+    d = _second(d, levels({low: "low", dead: "high"}))
+    d.verdicts = dict(verdicts)
+    d.tick()
+    assert members(d) == [dead]
+    d.set_alive(**{dead_tag.replace("-", "_"): False})
+    states = [step(d, dead_tag) for _ in range(3)]
+    assert State.ALL_DEAD in states and d.status()["tier"] == "medium"
+    assert dead not in members(d) and low not in members(d)
+    assert any("на уровне «высокий» живых серверов нет — в работе серверы уровня «средний»"
+               in event for event in d.events())
+    d.scanned.clear()
+    d.applied.clear()
+    for _ in range(40):  # 13 минут: мёртвый высокий проверяется, но не берётся
+        step(d)
+    assert sum(_fingerprint(d, tag) == dead for tag in d.scanned) >= 2 and d.applied == []
+    # REAL-35: пока сервер закреплён, уровень не меняется; сняли — снова высокий.
+    d.store.set_meta("pin", json.dumps({"tag": d.tags("proxy")[0], "until": d.t + 600}))
+    d = _second(d, levels({live: "high", low: "low", dead: "high"}))
+    d.verdicts = dict(verdicts)
+    for _ in range(9):
+        step(d)
+    assert d.status()["tier"] == "medium"
+    d.store.set_meta("pin", "")
+    for _ in range(3):
+        step(d)
+    assert d.status()["tier"] == "high" and members(d) == sorted([live, dead])
+    assert any("сервер уровня «высокий» снова отвечает" in event for event in d.events())
+
+
 def test_frozen_spares_are_not_promoted(daemon):
     daemon.cfg.filters.rotate_after_min = 0
     daemon.default_verdict = "FROZEN"
