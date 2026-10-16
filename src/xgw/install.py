@@ -219,8 +219,6 @@ class Facts:
 
 def _lock_down(directory: Path) -> None:
     """Каталоги 0755, файлы 0644 — без права записи для группы и остальных."""
-    if os.name == "nt":
-        return
     for path in (directory, *directory.rglob("*")):
         with contextlib.suppress(OSError):
             if path.is_symlink():
@@ -612,7 +610,7 @@ class Installer:
         for secret in (self.paths.config_file, managed.path_for(self.paths.config_file)):
             with contextlib.suppress(OSError):
                 os.chmod(secret, 0o600)
-        if os.name == "nt" or os.geteuid() != 0:
+        if os.geteuid() != 0:
             return
         os.chmod(self.paths.etc, 0o755)
         os.chmod(self.paths.var, 0o700)

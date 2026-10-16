@@ -10,7 +10,6 @@ import base64
 import contextlib
 import http.client
 import ipaddress
-import re
 import secrets
 import socket
 import ssl
@@ -163,10 +162,7 @@ def parse_userinfo(header: str) -> dict[str, int]:
 def _fetch_file(url: str) -> FetchResult:
     raw = url[len("file://") :]
     raw = raw.split("?", 1)[0].split("#", 1)[0]
-    raw = unquote(raw)
-    if re.match(r"^/[A-Za-z]:[/\\]", raw):  # file:///C:/… → C:/…
-        raw = raw[1:]
-    path = Path(raw)
+    path = Path(unquote(raw))
     try:
         body = path.read_bytes()
     except OSError as exc:

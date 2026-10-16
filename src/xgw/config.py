@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 import re
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -259,9 +258,8 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
     except FileNotFoundError as exc:
         raise ConfigError(f"конфиг не найден: {path}") from exc
     except PermissionError as exc:
-        # В конфиге подписка, поэтому его права — 0600 root (в Windows sudo нет).
-        advice = "" if os.name == "nt" else " — запустите команду через sudo"
-        raise ConfigError(f"нет доступа к {path}{advice}") from exc
+        # В конфиге подписка, поэтому его права — 0600 root.
+        raise ConfigError(f"нет доступа к {path} — запустите команду через sudo") from exc
     except OSError as exc:
         raise ConfigError(f"конфиг не читается: {path}: {exc}") from exc
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:

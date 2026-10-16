@@ -12,6 +12,12 @@ import pytest  # noqa: E402
 GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
 
 
+def pytest_configure(config):
+    # XGW — только для Ubuntu 24.04 и 26.04, и тесты с ним: на другой системе они не идут.
+    if not sys.platform.startswith("linux"):
+        pytest.exit("тесты XGW запускаются только в Linux (Ubuntu 24.04 или 26.04)", returncode=4)
+
+
 @pytest.fixture(autouse=True)
 def _no_github(monkeypatch):
     """Тесты не ходят на GitHub: забытая подмена не должна скачать релиз Xray."""
@@ -72,5 +78,5 @@ def golden(name: str, payload) -> object:
     if REGEN:
         path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-        path.write_text(text, encoding="utf-8", newline="\n")  # LF и на Windows
+        path.write_text(text, encoding="utf-8")
     return json.loads(path.read_text(encoding="utf-8"))

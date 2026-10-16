@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -50,8 +51,6 @@ def invoking_user(environ: Mapping[str, str] | None = None) -> User | None:
         value = (environ.get(key) or "").strip()
         if not value.isdigit() or int(value) == 0:
             continue
-        import pwd  # только в Linux; в Windows этих переменных и не бывает
-
         try:
             return User(pwd.getpwuid(int(value)).pw_name, int(value))
         except KeyError:

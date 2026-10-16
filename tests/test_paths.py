@@ -1,6 +1,5 @@
 """Атомарная запись и файловая блокировка."""
 
-import os
 import stat
 
 import pytest
@@ -16,7 +15,6 @@ def test_atomic_write_replaces_and_leaves_no_temp(tmp_path):
     assert [item.name for item in target.parent.iterdir()] == ["config.json"]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="права файлов POSIX")
 def test_atomic_write_sets_mode(tmp_path):
     target = tmp_path / "config.json"
     atomic_write_text(target, "secret", mode=0o640)

@@ -91,7 +91,7 @@ def test_clean_machine_before_install_has_no_failures(box):
 
 
 def test_not_linux_is_a_failure(box, monkeypatch):
-    monkeypatch.setattr(diag.sys, "platform", "win32")
+    monkeypatch.setattr(diag.sys, "platform", "freebsd14")
     checks = box.diag()._system()
     assert checks[0].level == FAIL and "только в Linux" in checks[0].text
 

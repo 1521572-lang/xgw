@@ -363,15 +363,12 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
         """Та же подписка по HTTP — как у настоящего провайдера, с токеном в адресе."""
         return self.origin_url("/sub/s3cr3t-stand-token")
 
-    def xgw(
-        self, *args: str, timeout: float = 120, encoding: str = "utf-8"
-    ) -> subprocess.CompletedProcess:
-        """Команда `xgw …` в контексте шлюза. encoding — для команд, которые сами
-        выбирают кодировку вывода (`xgw winsetup` печатает для установщика в ANSI)."""
+    def xgw(self, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
+        """Команда `xgw …` в контексте шлюза."""
         return subprocess.run(
             [*self._prefix("gw"), sys.executable, "-m", "xgw", *args,
              "--config", str(self.config_file)],
-            capture_output=True, text=True, encoding=encoding, errors="replace",
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
             env=self._env(), timeout=timeout,
         )
 

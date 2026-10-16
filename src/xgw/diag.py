@@ -187,7 +187,7 @@ class Diag:
             )]
         result: list[Check] = []
         try:
-            if os.name != "nt" and path.stat().st_mode & 0o077:
+            if path.stat().st_mode & 0o077:
                 result.append(Check(
                     "Конфиг", WARN, f"{path} доступен другим пользователям, а в нём подписка",
                     f"sudo chmod 600 {path}",

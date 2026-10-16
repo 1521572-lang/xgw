@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import time
@@ -103,7 +104,7 @@ class Paths:
 
     @property
     def xray_bin(self) -> Path:
-        return self.xray_dir / ("xray.exe" if os.name == "nt" else "xray")
+        return self.xray_dir / "xray"
 
     # --- установка (этап 4) -------------------------------------------------------
 
@@ -187,25 +188,12 @@ def atomic_write_json(path: Path, payload: object, *, mode: int = 0o640) -> None
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", mode=mode)
 
 
-if os.name == "nt":  # разработка и юнит-тесты; целевая платформа — Linux
-    import msvcrt
+def _try_lock(handle) -> None:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    def _try_lock(handle) -> None:
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
 
-    def _unlock(handle) -> None:
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-
-else:
-    import fcntl
-
-    def _try_lock(handle) -> None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def _unlock(handle) -> None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+def _unlock(handle) -> None:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class InstanceLock:

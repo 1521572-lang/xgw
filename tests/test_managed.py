@@ -116,8 +116,7 @@ def test_subscription_names_and_limits(conf):
         "sub.example.org-2")
     assert managed.add_subscription(path, "http://h.example.org/c", "Мой\tVPN", taken=set()) == (
         "Мой VPN")
-    if os.name != "nt":
-        assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_mode & 0o777 == 0o600
     for url, name in (("https://sub.example.org/a", ""), ("https://z.example.org/", "main"),
                       ("https://z.example.org/", "Мой VPN")):
         with pytest.raises(ManagedError):

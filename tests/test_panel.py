@@ -254,9 +254,8 @@ def test_one_time_login_code_works_once_and_only_for_a_minute(rig, monkeypatch):
     code = panel_module.new_login(rig.paths)
     stored = list(panel_module.login_dir(rig.paths).iterdir())
     assert len(stored) == 1 and code not in stored[0].name  # на диске — только SHA-256
-    if os.name != "nt":
-        assert panel_module.login_dir(rig.paths).stat().st_mode & 0o777 == 0o700
-        assert stored[0].stat().st_mode & 0o777 == 0o600
+    assert panel_module.login_dir(rig.paths).stat().st_mode & 0o777 == 0o700
+    assert stored[0].stat().st_mode & 0o777 == 0o600
     response, _text = rig.client.request("GET", f"/?login={code}")
     cookie = response.getheader("Set-Cookie")
     assert response.status == 303 and response.getheader("Location") == "/"
@@ -610,8 +609,7 @@ def test_subscription_is_added_shown_at_once_and_removed(rig, user):
                       "text": "Подписка «new.example.org» добавлена — получаю серверы…"}
     assert rig.saved()["subscriptions"] == [
         {"name": "new.example.org", "url": url, "user_agent": "", "refresh_minutes": 60}]
-    if os.name != "nt":
-        assert rig.store_path.stat().st_mode & 0o777 == 0o600
+    assert rig.store_path.stat().st_mode & 0o777 == 0o600
     assert rig.daemon.poke.is_set()  # демон перечитает настройки сразу
     added = user.state()["subscriptions"][1]
     assert added["name"] == "new.example.org" and added["managed"] and added["fetched"] is None
@@ -788,8 +786,7 @@ def test_token_is_created_once_and_kept_private(tmp_path):
     token = panel_module.ensure_token(paths)
     assert len(token) >= 24 and panel_module.ensure_token(paths) == token
     assert panel_module.read_token(paths) == token
-    if os.name != "nt":
-        assert panel_module.token_file(paths).stat().st_mode & 0o777 == 0o600
+    assert panel_module.token_file(paths).stat().st_mode & 0o777 == 0o600
 
 
 def test_panel_follows_the_config(tmp_path):

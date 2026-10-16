@@ -28,10 +28,9 @@ def find_xray(explicit: str | Path | None = None, paths: Paths | None = None) ->
         candidates.append(Path(env_bin))
     if paths is not None:
         candidates.append(paths.xray_bin)
-    for name in ("xray", "xray.exe"):
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
+    found = shutil.which("xray")
+    if found:
+        candidates.append(Path(found))
     for candidate in candidates:
         if candidate.exists():
             return candidate

@@ -271,13 +271,9 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
                "nm_lan": {"lan_if": "enp4s0", "profile": "7c1", "disabled": []}}
     (root / "var/lib/xgw/backup").mkdir(parents=True)
     (root / "var/lib/xgw/backup/install.json").write_text(json.dumps(journal), "utf-8")
-    masks = True
-    try:
-        os.symlink("/dev/null", root / "etc/systemd/system/sleep.target")
-        os.symlink("/dev/null", root / "etc/systemd/system/suspend.target")
-        os.symlink("/dev/null", root / "etc/systemd/system/ctrl-alt-del.target")  # чужая маска
-    except OSError:
-        masks = False  # Windows без права создавать ссылки: эта часть проверяется в Linux
+    os.symlink("/dev/null", root / "etc/systemd/system/sleep.target")
+    os.symlink("/dev/null", root / "etc/systemd/system/suspend.target")
+    os.symlink("/dev/null", root / "etc/systemd/system/ctrl-alt-del.target")  # чужая маска
 
     assert machine.scrub_host_xgw(root) == journal
     left = sorted(
@@ -295,9 +291,8 @@ def test_host_xgw_is_scrubbed_from_the_container_root(tmp_path):
         "etc/systemd/system/ssh.service",
         "etc/ufw/before.rules",
         "usr/local/bin/xgw-helper",
+        "etc/systemd/system/ctrl-alt-del.target",
     ]
-    if masks:
-        expected.append("etc/systemd/system/ctrl-alt-del.target")
     assert left == sorted(expected)
     assert "--mark" not in (root / "etc/ufw/before.rules").read_text(encoding="utf-8")
     assert "ufw-not-local" in (root / "etc/ufw/before.rules").read_text(encoding="utf-8")
@@ -318,11 +313,8 @@ def test_docker_of_the_host_is_masked_in_the_machine(tmp_path):
     root = tmp_path / "root"
     (root / "etc/systemd/system").mkdir(parents=True)
     (root / "etc/systemd/system/docker.service").write_text("[Service]\n", encoding="utf-8")
-    try:
-        machine.mask_host_services(root)
-    except OSError as exc:  # Windows без права создавать ссылки
-        pytest.skip(f"символьные ссылки недоступны: {exc}")
+    machine.mask_host_services(root)
     for name in machine.HOST_SERVICES_OFF:
-        link = os.readlink(root / "etc/systemd/system" / name).replace("\\", "/")
+        link = os.readlink(root / "etc/systemd/system" / name)
         assert link == "/dev/null", name
     machine.mask_host_services(root)  # повтор безвреден

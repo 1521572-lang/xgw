@@ -1,9 +1,6 @@
 """Тесты хранилища состояния (SQLite)."""
 
-import os
 import stat
-
-import pytest
 
 from xgw.store import Store, SubscriptionCache
 
@@ -59,7 +56,6 @@ def test_subscription_cache_roundtrip(tmp_path):
     assert len(files) == 4 and all("/" not in name and ".." not in name for name in files)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="права файлов POSIX")
 def test_subscription_cache_is_private(tmp_path):
     cache = SubscriptionCache(tmp_path / "cache")
     cache.save("main", b"secret links")

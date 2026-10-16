@@ -91,8 +91,7 @@ def test_log_export_contains_no_secrets(tmp_path):
     assert "nl.example.com" in members["xgw-logs/xray-config.json"]
     assert '"password": "***"' in members["xgw-logs/xray-config.json"]
     assert "вывод ip -br addr" in members["xgw-logs/network.txt"]
-    if os.name != "nt":
-        assert out_path.stat().st_mode & 0o777 == 0o600
+    assert out_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_log_export_survives_missing_pieces(tmp_path):
@@ -343,8 +342,7 @@ def test_install_without_config_creates_it_from_the_example(root, monkeypatch, c
     assert "sudo sh packaging/install.sh" in out and "sudo xgw install" not in out
     assert root.config_file.read_text(encoding="utf-8") == (
         REPO / "config.example.toml").read_text(encoding="utf-8")
-    if os.name != "nt":
-        assert root.config_file.stat().st_mode & 0o777 == 0o600
+    assert root.config_file.stat().st_mode & 0o777 == 0o600
     assert not root.journal_file.exists()
 
 
@@ -760,9 +758,6 @@ def test_busy_panel_port_does_not_stop_the_daemon(root, tmp_path, monkeypatch, c
                 stop.set()
 
         monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
-        if os.name == "nt":
-            # В Windows SO_REUSEADDR позволил бы занять чужой порт; целевая система — Linux.
-            monkeypatch.setattr("xgw.watch.panel._Server.allow_reuse_address", False)
         assert main(["run", "--config", str(config_path)]) == 0
     assert ran == [True] and "панель управления не запущена" in caplog.text
 

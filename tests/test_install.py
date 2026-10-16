@@ -209,9 +209,8 @@ def test_install_configures_the_system_and_records_what_was_before(box):
         "mark_proxy": 1, "route_table": 100, "tun_route_table": 101, "tun_name": "xgwtun0",
     }
     assert journal.get("finished")
-    if os.name != "nt":
-        assert paths.journal_file.stat().st_mode & 0o777 == 0o600
-        assert paths.launcher.stat().st_mode & 0o777 == 0o755
+    assert paths.journal_file.stat().st_mode & 0o777 == 0o600
+    assert paths.launcher.stat().st_mode & 0o777 == 0o755
 
 
 def test_ipv6_proxy_leaves_ipv6_on_wan_and_loads_its_rules(box):
@@ -618,7 +617,6 @@ def test_sysctl_install_and_restore(box):
     assert box.forward() == "0" and not box.paths.sysctl_file.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="символические ссылки в Windows требуют прав")
 def test_sleep_masks_only_what_was_not_masked(box):
     directory = box.paths.systemd_dir
     directory.mkdir(parents=True)
@@ -686,9 +684,8 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
     assert "sudo xgw panel" in text and "Вставьте в панели" not in text
     journal = Journal(box.paths.journal_file)
     assert journal.get("launcher") == str(desktop) and journal.get("launcher_dir") is True
-    if os.name != "nt":
-        assert panel.token_file(box.paths).stat().st_mode & 0o777 == 0o600
-        assert desktop.stat().st_mode & 0o777 == 0o644
+    assert panel.token_file(box.paths).stat().st_mode & 0o777 == 0o600
+    assert desktop.stat().st_mode & 0o777 == 0o644
 
     assert box.install() == 0  # повторная установка токен не меняет
     assert panel.read_token(box.paths) == token
@@ -800,8 +797,7 @@ def test_chosen_card_is_written_into_a_fresh_config(tmp_path):
     cfg, warnings = config.load(path)
     assert cfg.network.lan_if == "enp4s0" and warnings == []
     assert path.read_text(encoding="utf-8").count("\n# ") > 20  # комментарии примера на месте
-    if os.name != "nt":
-        assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_mode & 0o777 == 0o600
     before = path.read_text(encoding="utf-8")
     assert set_lan_if(path, "enp5s0") is False  # строки lan_if = "" уже нет — не трогаем
     assert set_lan_if(path, 'x"; rm') is False

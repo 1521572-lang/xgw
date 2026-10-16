@@ -117,8 +117,7 @@ def new_login(paths: Paths, now: Callable[[], float] | None = None) -> str:
     now = now or time.time
     directory = login_dir(paths)
     directory.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        os.chmod(directory, 0o700)
+    os.chmod(directory, 0o700)
     for stale in directory.iterdir():
         with contextlib.suppress(OSError):  # другой процесс мог убрать его сам
             if now() - stale.stat().st_mtime > LOGIN_TTL:
@@ -140,8 +139,8 @@ def use_login(paths: Paths, code: str, now: Callable[[], float] | None = None) -
         path.unlink()
     except OSError:  # кода нет: уже использован, устарел и убран либо выдуман
         return False
-    # Время файла бывает чуть впереди time.time() (в Windows часы Python грубее, чем у
-    # NTFS): только что выданный код не должен оказаться «из будущего».
+    # Часы файловой системы грубее, чем time.time(): только что выданный код не должен
+    # оказаться «из будущего».
     return -1.0 <= age <= LOGIN_TTL
 
 

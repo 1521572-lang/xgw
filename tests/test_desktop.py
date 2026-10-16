@@ -1,7 +1,6 @@
 """Рабочий стол Ubuntu: кто запустил команду от root, браузер в его сеансе, окно пароля."""
 
 import subprocess
-import sys
 import types
 
 import pytest
@@ -34,7 +33,7 @@ def test_invoking_user_comes_from_pkexec_first_then_sudo(monkeypatch):
             raise KeyError(uid)
         return types.SimpleNamespace(pw_name=names[uid], pw_uid=uid)
 
-    monkeypatch.setitem(sys.modules, "pwd", types.SimpleNamespace(getpwuid=getpwuid))
+    monkeypatch.setattr(desktop.pwd, "getpwuid", getpwuid)
     assert desktop.invoking_user({"PKEXEC_UID": "1000", "SUDO_UID": "1001"}) == ALICE
     assert desktop.invoking_user({"SUDO_UID": "1001"}) == desktop.User("bob", 1001)
     assert desktop.invoking_user({"SUDO_UID": "4242"}) is None  # такого пользователя нет
