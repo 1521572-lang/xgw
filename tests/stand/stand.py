@@ -75,6 +75,9 @@ class Server:
     relay_port: int  # порт реле — его и видит шлюз
     mode_file: Path
     mode: str = "pass"
+    # SHA-256 самоподписанного сертификата сервера VLESS+TLS; пусто — сервер без TLS.
+    # Ссылка закрепляет его параметром pcs (allowInsecure Xray 26.10.10 убрал).
+    pin: str = ""
     latency_ms: int = 0
     rate_kbps: int = 0  # полоса от сервера, КБ/с; 0 — без ограничения
 
@@ -83,7 +86,7 @@ class Server:
         return f"{self.name}.stand.test"
 
     def set_mode(self, mode: str) -> None:
-        """pass | freeze_after=N | drop | blackhole — реле подхватит за 0,1 с."""
+        """pass | freeze_after=N | drop | blackhole | sni=ИМЯ — реле подхватит за 0,1 с."""
         self.mode = mode
         self._write()
 
@@ -113,9 +116,13 @@ class Server:
     def link(self, label: str | None = None) -> str:
         """Ссылка VLESS; label — имя сервера (по умолчанию «🇳🇱 NL-stand»)."""
         label = quote(label or f"{FLAGS[self.name]} {self.name.upper()}-stand")
+        security = (
+            f"security=tls&sni={self.domain}&fp=chrome&pcs={self.pin}" if self.pin
+            else "security=none"
+        )
         return (
             f"vless://{UUID}@{self.domain}:{self.relay_port}"
-            f"?type=tcp&security=none&encryption=none#{label}"
+            f"?type=tcp&{security}&encryption=none#{label}"
         )
 
 
@@ -215,10 +222,30 @@ class Stand:
         for name in self.names:
             self.add_server(name)
 
-    def add_server(self, name: str) -> Server:
-        """Ещё один VLESS-сервер с реле перед ним (можно добавлять на ходу)."""
+    def add_server(self, name: str, *, tls: bool = False) -> Server:
+        """Ещё один VLESS-сервер с реле перед ним (можно добавлять на ходу).
+
+        tls — VLESS+TLS с самоподписанным сертификатом на имя сервера: его выпускает и
+        хеширует сам Xray (`xray tls cert`, `xray tls hash`), ссылка его закрепляет."""
         server = Server(name, free_port(), free_port(), self.workdir / f"relay-{name}.mode")
         server.mode_file.write_text("pass", encoding="ascii")
+        stream: dict = {}
+        if tls:
+            cert = self.workdir / f"cert-{name}"
+            subprocess.run(
+                [str(self.xray_bin), "tls", "cert", f"--domain={server.domain}", "--expire=48h",
+                 f"--file={cert}"], check=True, capture_output=True, timeout=30,
+            )
+            hashed = subprocess.run(
+                [str(self.xray_bin), "tls", "hash", f"--cert={cert}.crt"],
+                check=True, capture_output=True, text=True, timeout=30,
+            ).stdout
+            server.pin = next(
+                line.split(":", 1)[1].strip() for line in hashed.splitlines()
+                if line.startswith("Leaf SHA256:")
+            )
+            stream = {"streamSettings": {"security": "tls", "tlsSettings": {"certificates": [
+                {"certificateFile": f"{cert}.crt", "keyFile": f"{cert}.key"}]}}}
         stub = self.inet_ip if self.dns_port == 53 else {
             "address": self.inet_ip, "port": self.dns_port,
         }
@@ -230,6 +257,7 @@ class Stand:
             "inbounds": [{
                 "listen": "127.0.0.1", "port": server.listen_port, "protocol": "vless",
                 "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+                **stream,
             }],
             # finalRules: с 26.10.10 freedom за VLESS-inbound'ом по умолчанию не пускает к
             # частным адресам и loopback (защита сервера), а «интернет» стенда в режиме

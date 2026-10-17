@@ -84,6 +84,8 @@ LIVE = {
 
 # Основной сервер (0.1.9) и замеры скорости: у Финляндии замер не удался.
 MAIN_FP = "a1a1a1a1"
+# Запасной, которому шлюз включил дробление ClientHello (0.1.11): метка «дробление».
+FRAGMENT_FP = "f6f6f6f6"
 SPEEDS = {
     "a1a1a1a1": {"mbps": 87.3, "error": ""},
     "b2b2b2b2": {"mbps": 41.0, "error": ""},
@@ -146,6 +148,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
                 "bytes": 65536 if verdict in ("OK", "SLOW") else 16384,
                 "scanned": now - 1500 if verdict else None,
                 "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
+                "fragment": fingerprint == FRAGMENT_FP,
             })
     state, action = "DEGRADED", "часть серверов недоступна — замена на запасные"
     if scene == "empty":

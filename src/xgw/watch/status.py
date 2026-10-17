@@ -344,6 +344,8 @@ def collect_status(
                     else None,
                     "dead_since": dead_at,
                     "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
+                    # Соединение идёт через дробление ClientHello (generator/fragment.py).
+                    "fragment": info.fragment,
                     # Основной сервер (watch/speed.py) и последний замер скорости.
                     "main": info.tag == main_tag,
                     "speed_mbps": measure.get("mbps"),
@@ -368,6 +370,7 @@ def collect_status(
                     "seconds": scan["seconds"] if scan else None,
                     "scanned": scan["ts"] if scan else None,
                     "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
+                    "fragment": info.fragment,
                 }
             )
 
@@ -498,6 +501,11 @@ def _level(entry: dict) -> str:
     return "" if level == priority.DEFAULT else f" [{priority.NAMES.get(level, level)}]"
 
 
+def _fragment(entry: dict) -> str:
+    """Отметка дробления ClientHello у сервера (generator/fragment.py)."""
+    return " [дробление]" if entry.get("fragment") else ""
+
+
 def _price(entry: dict) -> str:
     """Отметка множителя у сервера лимитированной подписки: « [x10]»."""
     if not entry.get("limited"):
@@ -531,7 +539,7 @@ def render_servers(status: dict) -> str:
             mark = "  ← основной"
         lines.append(
             f"  {member['tag']:<20} {health:<30} {member.get('name', '')}{_level(member)}"
-            f"{_price(member)}{mark}"
+            f"{_price(member)}{_fragment(member)}{mark}"
         )
     lines.append(f"Запасные ({len(spares)}):")
     for spare in spares:
@@ -543,7 +551,7 @@ def render_servers(status: dict) -> str:
         mark = "  ← резервный выход" if spare.get("reserve") else ""
         lines.append(
             f"  {spare['tag']:<20} {scan:<40} {spare.get('name', '')}{_level(spare)}"
-            f"{_price(spare)}{mark}"
+            f"{_price(spare)}{_fragment(spare)}{mark}"
         )
     reserve = status.get("reserve")
     if reserve:

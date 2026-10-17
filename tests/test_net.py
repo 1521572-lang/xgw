@@ -234,6 +234,60 @@ def test_fail_open_is_temporary(gateway):
     assert gateway.enable() == "on"  # явное включение снимает и временную метку
 
 
+def _state(capture) -> dict:
+    return json.loads(capture.state_file.read_text())
+
+
+def test_bbr_is_switched_on_and_the_previous_algorithm_comes_back(gateway):
+    """network.tcp_bbr (0.1.11): xgw-net ставит BBR и помнит прежний алгоритм; повторная
+    загрузка правил его не перетирает, `xgw net down` возвращает."""
+    proc = gateway.proc
+    (proc / sysctl.TCP_CONGESTION).write_text("cubic\n")
+    gateway.enable()
+    assert sysctl.read(sysctl.TCP_CONGESTION, proc) == "bbr"
+    assert _state(gateway)["tcp_congestion_before"] == "cubic"
+    gateway.up()
+    assert _state(gateway)["tcp_congestion_before"] == "cubic"
+    gateway.down()
+    assert sysctl.read(sysctl.TCP_CONGESTION, proc) == "cubic"
+    assert "tcp_congestion_before" not in _state(gateway)
+
+
+def test_bbr_switched_off_in_the_config_gives_the_previous_algorithm_back(gateway):
+    proc = gateway.proc
+    (proc / sysctl.TCP_CONGESTION).write_text("cubic\n")
+    gateway.enable()
+    gateway.cfg.network.tcp_bbr = False
+    gateway.up()
+    assert sysctl.read(sysctl.TCP_CONGESTION, proc) == "cubic"
+    assert "tcp_congestion_before" not in _state(gateway)
+
+
+def test_bbr_set_before_xgw_is_left_alone(gateway):
+    proc = gateway.proc
+    (proc / sysctl.TCP_CONGESTION).write_text("bbr\n")
+    gateway.enable()
+    gateway.down()
+    assert sysctl.read(sysctl.TCP_CONGESTION, proc) == "bbr"
+    assert "tcp_congestion_before" not in _state(gateway)
+
+
+def test_kernel_without_bbr_keeps_its_algorithm(gateway, monkeypatch):
+    proc = gateway.proc
+    (proc / sysctl.TCP_CONGESTION).write_text("cubic\n")
+    write = sysctl.write
+
+    def refuse(key, value, root=sysctl.PROC_SYS):
+        if key == sysctl.TCP_CONGESTION and value == "bbr":
+            raise OSError(2, "No such file or directory")  # так отвечает ядро без tcp_bbr
+        write(key, value, root)
+
+    monkeypatch.setattr(sysctl, "write", refuse)
+    assert gateway.enable() == "on"  # перехват включается как обычно
+    assert sysctl.read(sysctl.TCP_CONGESTION, proc) == "cubic"
+    assert "tcp_congestion_before" not in _state(gateway)
+
+
 def test_enable_refuses_without_applied_tproxy_inbound(gateway):
     """Пока применённый конфиг Xray без inbound'а перехвата, включать его нельзя:
     правила отправили бы весь трафик на порт, который никто не слушает, и при

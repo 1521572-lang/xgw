@@ -45,6 +45,7 @@ from .apply.rotation import (
 )
 from .config import Config
 from .generator import builder
+from .generator import fragment as fragmenting
 from .generator.builder import BALANCER_TAG, NodeInfo
 from .net import tun
 from .net.capture import capture_inbounds
@@ -121,6 +122,15 @@ SPEED_KEEP = 7 * 86400.0  # результаты замеров старше н�
 # Канал занят: через серверы идёт больше этого (байт/с, ~2 Мбит/с) — замер отложен до
 # следующего шага: чужая загрузка исказила бы его, а замер — мешал бы ей.
 SPEED_BUSY_BPS = 250_000
+# Дробление ClientHello (generator/fragment.py, fragment.mode = "auto"). Запасной, который
+# не отвечает так, как не отвечают при блокировке DPI, проверяется в другом режиме: без
+# дробления — с ним, с дроблением — без него. Помогло — режим остаётся, нет — возвращается
+# прежний, а следующая попытка для этого сервера — не раньше FRAGMENT_RETRY. Сервер с
+# дроблением, который отвечает, раз в FRAGMENT_RECHECK пробуется без него: дробление
+# удлиняет рукопожатие, и, если провайдер перестал блокировать, оно лишнее.
+FRAGMENT_VERDICTS = ("CONNECT_FAIL", "TIMEOUT", "STALL_BEFORE_BODY", "FROZEN")
+FRAGMENT_RETRY = 6 * 3600.0
+FRAGMENT_RECHECK = 24 * 3600.0
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -222,6 +232,13 @@ class Daemon:
         # rotate_after_min.
         self.vetted: set[str] = set()
         self.bad_members: dict[str, str] = {}
+        # Дробление ClientHello (FRAGMENT_*): когда демон последний раз переключал режим
+        # сервера (отпечаток → time.time()), какой режим сервера сейчас проверяется
+        # (отпечаток → (с дроблением ли, probe-тег, с какого времени)) и что ждёт
+        # применения (отпечаток → (с дроблением ли, это проверка)).
+        self._fragment_switched: dict[str, float] = {}
+        self._fragment_trial: dict[str, tuple[bool, str, float]] = {}
+        self._fragment_wanted: dict[str, tuple[bool, bool]] = {}
         # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
         self.probe_target = ""
         self.next_target_check = 0.0
@@ -376,6 +393,9 @@ class Daemon:
         self._main_suspended = previous._main_suspended
         self._main_pinned = previous._main_pinned
         self._pin_recheck_at = previous._pin_recheck_at
+        self._fragment_switched = dict(previous._fragment_switched)
+        self._fragment_trial = dict(previous._fragment_trial)
+        self._fragment_wanted = dict(previous._fragment_wanted)
         self._traffic = previous._traffic
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
@@ -550,6 +570,8 @@ class Daemon:
                 changed = self._switch_tier(view, state, now)
             if not changed:
                 changed = self._reserve_step(view, applied, state, now)
+            if not changed:
+                changed = self._fragment_step(view)
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
@@ -1074,11 +1096,12 @@ class Daemon:
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
         tier: cost.Klass | None = None, reserve: str | None = None,
+        fragment: set[str] | None = None,
     ) -> bool:
         assert self.inventory is not None
         dead = engine.quarantined()
         try:
-            assembly = self._assemble(prefer, tier, reserve)
+            assembly = self._assemble(prefer, tier, reserve, fragment)
         except engine.EngineError as exc:
             self.notifier.event("config", f"{reason}: {exc}", notify=True)
             return False
@@ -1141,12 +1164,13 @@ class Daemon:
 
     def _assemble(
         self, prefer: list[str] | None, tier: cost.Klass | None = None,
-        reserve: str | None = None,
+        reserve: str | None = None, fragment: set[str] | None = None,
     ) -> engine.Assembly:
         assert self.inventory is not None
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
             xray_bin=self.xray_bin, prefer=prefer, tier=tier, reserve=reserve,
+            fragment=fragment,
         )
 
     def _apply(self, config: dict, *, urgent: bool) -> ApplyOutcome:
@@ -1242,6 +1266,7 @@ class Daemon:
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
             )
+            self._fragment_note(info, result.verdict)
             if info.role == "proxy":
                 self.vetted.add(info.fingerprint)
                 if result.verdict in REPLACE_NOW_VERDICTS:
@@ -1334,9 +1359,90 @@ class Daemon:
         """Сканы по probe-тегам. «Прошедший последний скан»: результат старше двух
         периодов скана не в счёт."""
         fresh_after = self.wall() - self.cfg.probe.scan_spares_minutes * 120.0 - 120.0
+        # Скан сервера, который сейчас проверяется в другом режиме дробления, получен ещё в
+        # прежнем режиме — по нему сервер не ставится ни участником, ни резервным выходом.
+        trial = {tag for _on, tag, _since in self._fragment_trial.values()}
         return {
-            tag: entry for tag, entry in self.store.scans().items() if entry["ts"] >= fresh_after
+            tag: entry for tag, entry in self.store.scans().items()
+            if entry["ts"] >= fresh_after and tag not in trial
         }
+
+    # --- дробление ClientHello -------------------------------------------------
+
+    def _fragment_note(self, info: NodeInfo, verdict: str) -> None:
+        """Итог скана запасного: решить, не проверить ли его в другом режиме дробления
+        ClientHello, и подвести итог такой проверки (FRAGMENT_*). Участников не трогает:
+        их трафик режимом не рискует — не прошедший проверку участник становится
+        запасным, а там до него дойдёт очередь."""
+        if self.cfg.fragment.mode != "auto" or info.role != "spare" or self.inventory is None:
+            return
+        node = next(
+            (node for node in self.inventory.nodes if node.fingerprint == info.fingerprint), None,
+        )
+        if node is None or not fragmenting.eligible(node.outbound):
+            return
+        fingerprint, now = info.fingerprint, self.wall()
+        good = verdict in REPLACEABLE_VERDICTS
+        trial = self._fragment_trial.get(fingerprint)
+        if trial is not None:
+            on, _tag, since = trial
+            if info.fragment != on:
+                # Режим ещё не применён (конфиг ждёт перезапуска): скан — о прежнем режиме.
+                if now - since >= FRAGMENT_RETRY:
+                    del self._fragment_trial[fingerprint]
+                return
+            del self._fragment_trial[fingerprint]
+            if good:
+                text = ("отвечает только с дроблением ClientHello — оно включено" if on
+                        else "отвечает и без дробления ClientHello — оно выключено")
+            else:
+                self._fragment_wanted[fingerprint] = (not on, False)
+                text = ("не отвечает и с дроблением ClientHello — оно выключено" if on
+                        else "без дробления ClientHello не отвечает — оно включено снова")
+            self.notifier.event("fragment", f"«{node.name}» {text}")
+            return
+        last = self._fragment_switched.get(fingerprint)
+        if good and info.fragment:
+            if last is None:
+                self._fragment_switched[fingerprint] = now  # отсчёт до перепроверки — с сейчас
+            elif now - last >= FRAGMENT_RECHECK:
+                self._fragment_wanted[fingerprint] = (False, True)
+        elif verdict in FRAGMENT_VERDICTS and (last is None or now - last >= FRAGMENT_RETRY):
+            self._fragment_wanted[fingerprint] = (not info.fragment, True)
+
+    def _fragment_step(self, view: list[NodeInfo]) -> bool:
+        """Применяет решения _fragment_note одной сборкой конфига: outbounds серверов
+        меняются через API, без перезапуска Xray. Проверяемые серверы — в начало очереди
+        скана."""
+        wanted, self._fragment_wanted = self._fragment_wanted, {}
+        if not wanted or self.inventory is None or self.cfg.fragment.mode != "auto":
+            return False
+        by_fingerprint = {info.fingerprint: info for info in view if info.role == "spare"}
+        wanted = {key: item for key, item in wanted.items() if key in by_fingerprint}
+        current = {info.fingerprint for info in view if info.fragment}
+        target = (current | {key for key, (on, _trial) in wanted.items() if on}) - {
+            key for key, (on, _trial) in wanted.items() if not on
+        }
+        if target == current:
+            return False
+        names = ", ".join(sorted(by_fingerprint[key].tag for key in wanted))
+        changed = self._rebuild(
+            None, urgent=False, reason=f"дробление ClientHello ({names})", fragment=target,
+        )
+        applied = engine.read_json(self.paths.xray_config_file)
+        now_mode = builder.fragmented_fingerprints(applied, self.inventory.nodes)
+        now = self.wall()
+        for key, (on, trial) in wanted.items():
+            if (key in now_mode) != on:
+                continue  # не применилось: решение примет следующий скан
+            self._fragment_switched[key] = now
+            if trial:
+                info = by_fingerprint[key]
+                self._fragment_trial[key] = (on, info.probe_tag, now)
+                if info.probe_tag in self.scan_queue:
+                    self.scan_queue.remove(info.probe_tag)
+                self.scan_queue.appendleft(info.probe_tag)
+        return changed
 
     def _switch_tier(self, view: list[NodeInfo], state: State, now: float) -> bool:
         """Классы серверов (cost.py): ручной приоритет, затем стоимость.

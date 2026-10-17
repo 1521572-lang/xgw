@@ -621,3 +621,50 @@ def test_panel_sign_in_again_needs_pkexec_on_a_desktop(box, monkeypatch):
     assert box.diag(which=lambda name: None if name == "xdg-open" else "/x")._panel_login() == []
     box.cfg.panel.enabled = False
     assert box.diag()._panel_login() == []
+
+
+def _journal_box(box, tmp_path, records, *, stream_ok=True, pid="4242"):
+    """Работающая служба xgw: /proc/PID и вывод journalctl — подставные."""
+    box.installed()
+    fd = tmp_path / "proc" / pid / "fd"
+    fd.mkdir(parents=True)
+    (fd / "2").write_text("", encoding="utf-8")
+    info = (fd / "2").stat()
+    stream = f"{info.st_dev}:{info.st_ino}" if stream_ok else "1:2"
+    (tmp_path / "proc" / pid / "environ").write_bytes(
+        b"LANG=C.UTF-8\0JOURNAL_STREAM=" + stream.encode() + b"\0INVOCATION_ID=x\0")
+
+    def runner(argv, *, input=None, timeout=15.0, check=True):
+        if argv[:2] == ["systemctl", "show"]:
+            return pid + "\n"
+        if argv[0] == "journalctl":
+            return "\n".join(json.dumps({"_TRANSPORT": "stdout", "PRIORITY": priority,
+                                         "MESSAGE": message}) for priority, message in records)
+        return ""
+
+    return box.diag(runner=runner, proc=tmp_path / "proc")
+
+
+def test_journal_levels_of_the_daemon(box, tmp_path):
+    """D1 отчёта 0.1.10: предупреждения демона должны находиться по `journalctl -p
+    warning`. Проверка смотрит условие (stderr — поток журнала) и сами записи."""
+    good = [("6", "2026-10-17 15:49:01,000 INFO xgw.daemon: скан"),
+            ("4", "2026-10-17 15:49:02,000 WARNING xgw.notify: pin: не отвечает")]
+    checks = _journal_box(box, tmp_path, good)._journal()
+    assert [(check.level, check.text) for check in checks] == [
+        (OK, "предупреждения демона — с уровнем warning (journalctl -u xgw -p warning)")]
+
+
+def test_journal_warnings_saved_as_info_are_reported(box, tmp_path):
+    bad = [("6", "2026-10-17 15:49:02,000 WARNING xgw.notify: pin: не отвечает"),
+           ("6", "2026-10-17 15:49:03,000 ERROR xgw.telegram: не доставлено")]
+    check = _journal_box(box, tmp_path, bad)._journal()[0]
+    assert check.level == WARN and check.text.startswith("2 предупреждений и ошибок демона")
+    assert "JOURNAL_STREAM=" in check.text and "stderr демона" in check.text
+
+
+def test_journal_stream_mismatch_and_stopped_daemon(box, tmp_path):
+    check = _journal_box(box, tmp_path, [], stream_ok=False)._journal()[0]
+    assert check.level == WARN and "не поток журнала" in check.text
+    stopped = box.diag(runner=lambda argv, **kwargs: "0\n", proc=tmp_path / "none")
+    assert stopped._journal() == []

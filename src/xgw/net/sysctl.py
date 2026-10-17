@@ -19,6 +19,9 @@ from ..paths import Paths, atomic_write_text
 
 PROC_SYS = Path("/proc/sys")
 IP_FORWARD = "net/ipv4/ip_forward"
+# Алгоритм управления перегрузкой TCP (network.tcp_bbr): ставит и возвращает перехват
+# (capture.Capture._congestion) — как форвардинг, по записи в /proc/sys.
+TCP_CONGESTION = "net/ipv4/tcp_congestion_control"
 SETTINGS = {"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "0"}
 _WAN_IPV6 = re.compile(r"net/ipv6/conf/[A-Za-z0-9_.@-]{1,15}/disable_ipv6")
 

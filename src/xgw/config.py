@@ -50,6 +50,10 @@ class Network:
     bypass_hosts: list[str] = field(default_factory=list)
     ipv6: str = "off"
     disable_sleep: bool = True
+    # Алгоритм управления перегрузкой TCP — BBR (net.ipv4.tcp_congestion_control): быстрее
+    # на канале с потерями и большой задержкой. Ставит xgw-net, прежний возвращает
+    # `xgw net down` и удаление; false — XGW алгоритм не трогает.
+    tcp_bbr: bool = True
 
     @property
     def ipv6_proxy(self) -> bool:
@@ -145,6 +149,19 @@ class Speed:
     every_hours: int = 6  # 0 — не замерять: основной выбирается по задержке
     gain_pct: int = 30  # сменить основной, только если другой быстрее на столько процентов
     hold_minutes: int = 60  # и основной продержался не меньше
+
+
+@dataclass
+class Fragment:
+    # Дробление ClientHello (generator/fragment.py): первая TLS-запись соединения с сервером
+    # уходит частями, и DPI, который ищет имя сайта (SNI) в одной записи, его не видит.
+    # auto — демон включает дробление серверу, который без него не отвечает, а с ним
+    # отвечает; always — всем серверам с TLS и REALITY; off — никогда.
+    mode: str = "auto"
+    # Поля freedom.fragment Xray: что дробить, длина кусков (байт) и пауза между ними (мс).
+    packets: str = "tlshello"
+    length: str = "100-200"
+    interval: str = "10-20"
 
 
 @dataclass
@@ -254,6 +271,7 @@ class Config:
     filters: Filters = field(default_factory=Filters)
     probe: Probe = field(default_factory=Probe)
     speed: Speed = field(default_factory=Speed)
+    fragment: Fragment = field(default_factory=Fragment)
     routing: Routing = field(default_factory=Routing)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
@@ -272,6 +290,7 @@ _SECTIONS = {
     "filters": Filters,
     "probe": Probe,
     "speed": Speed,
+    "fragment": Fragment,
     "routing": Routing,
     "dns": Dns,
     "xray": XraySection,
@@ -558,6 +577,7 @@ def _validate(cfg: Config) -> list[str]:
         if not re.fullmatch(r"\d+[smh]", getattr(cfg.probe, name)):
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
     warnings.extend(_validate_speed(cfg.speed))
+    warnings.extend(_validate_fragment(cfg.fragment))
     listening = {
         "tproxy": cfg.capture.tproxy_port,
         "api": cfg.xray.api_port,
@@ -625,4 +645,43 @@ def _validate_speed(speed: Speed) -> list[str]:
         setattr(speed, name, value)
     if not speed.url:
         speed.url, speed.url_fallback = speed.url_fallback, ""
+    return warnings
+
+
+FRAGMENT_MODES = ("auto", "off", "always")
+
+
+def _span(text: str, low: int) -> bool:
+    """«N» или «N-M» (N ≤ M, N ≥ low) — так Xray записывает длину кусков и паузу."""
+    match = re.fullmatch(r"(\d{1,5})(?:-(\d{1,5}))?", text)
+    if not match:
+        return False
+    first = int(match.group(1))
+    return first >= low and first <= int(match.group(2) or first)
+
+
+def _validate_fragment(fragment: Fragment) -> list[str]:
+    warnings: list[str] = []
+    mode = fragment.mode.strip().lower()
+    if mode not in FRAGMENT_MODES:
+        warnings.append(
+            f"fragment.mode={fragment.mode!r}: допустимо auto, off или always; принято auto"
+        )
+        mode = Fragment().mode
+    fragment.mode = mode
+    checks = {
+        "packets": lambda value: value == "tlshello" or _span(value, 1),
+        "length": lambda value: _span(value, 1),
+        "interval": lambda value: _span(value, 0),
+    }
+    for name, valid in checks.items():
+        value = getattr(fragment, name).strip()
+        if not valid(value):
+            default = getattr(Fragment(), name)
+            warnings.append(
+                f"fragment.{name}={getattr(fragment, name)!r}: ожидается, например, "
+                f"{default!r} — используется {default!r}"
+            )
+            value = default
+        setattr(fragment, name, value)
     return warnings

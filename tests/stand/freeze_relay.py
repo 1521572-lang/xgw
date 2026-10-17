@@ -9,6 +9,10 @@ TCP-реле между шлюзом и сервером. Режим читае�
                    проходят, дальше тишина
   drop             принять соединение и сразу сбросить
   blackhole        принять и молчать, ничего не пересылая
+  sni=ИМЯ          DPI: прочитать первую запись TLS от клиента и, если в ней целиком
+                   ClientHello с этим именем сайта (SNI), сбросить соединение. Как DPI без
+                   сборки записей TLS: ClientHello, разрезанный на несколько записей
+                   (дробление в Xray, freedom.fragment), он не узнаёт и пропускает
 
 К режиму можно дописать «;latency=МС» — задержку первого ответа в каждом
 соединении. Она делает один сервер заведомо медленнее другого, и выбор
@@ -45,6 +49,7 @@ class Mode:
         self.limit = 0
         self.latency = 0.0  # секунд перед первым ответом в соединении
         self.rate = 0  # байт/с от сервера к клиенту в соединении; 0 — без ограничения
+        self.sni = ""  # режим sni: имя сайта, по которому «DPI» сбрасывает соединение
         self._load()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -64,6 +69,8 @@ class Mode:
                 self.name, self.limit = name, int(value)
             elif name in ("pass", "drop", "blackhole"):
                 self.name, self.limit = name, 0
+            elif name == "sni" and value:
+                self.name, self.limit, self.sni = name, 0, value
         self.latency = latency
         self.rate = rate
 
@@ -90,14 +97,45 @@ class Connection:
         if self.mode.name == "blackhole":
             self._drain(self.client)
             return
+        first = b""
+        if self.mode.name == "sni":
+            first = self._first_record()
+            if first is None or _hello_name(first) == self.mode.sni:
+                self.client.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+                self.client.close()
+                return
         try:
             upstream = socket.create_connection(self.upstream_address, timeout=5)
         except OSError:
             self.client.close()
             return
         upstream.settimeout(None)
+        if first:
+            upstream.sendall(first)
         threading.Thread(target=self._up, args=(upstream,), daemon=True).start()
         self._down(upstream)
+
+    def _first_record(self) -> bytes | None:
+        """Первая запись TLS от клиента целиком (заголовок и тело); не TLS — то, что
+        пришло; None — клиент закрыл соединение раньше."""
+        self.client.settimeout(10)
+        data = b""
+        try:
+            while len(data) < 5 or (
+                data[0] == 0x16 and len(data) < 5 + int.from_bytes(data[3:5], "big")
+            ):
+                chunk = self.client.recv(65536)
+                if not chunk:
+                    return None
+                data += chunk
+                if data[0] != 0x16:
+                    break
+        except OSError:
+            return None
+        self.client.settimeout(None)
+        return data
 
     def _drain(self, sock: socket.socket) -> None:
         """Читает и выбрасывает: соединение открыто, но данные никуда не идут."""
@@ -141,6 +179,32 @@ class Connection:
             pass
         if not self.frozen:  # «замороженное» соединение держим открытым
             _close(upstream, self.client)
+
+
+def _hello_name(data: bytes) -> str:
+    """Имя сайта (SNI) из ClientHello, если он целиком в первой записи TLS; иначе пусто."""
+    if len(data) < 9 or data[0] != 0x16 or data[5] != 1:
+        return ""
+    body = data[5:5 + int.from_bytes(data[3:5], "big")]
+    if 4 + int.from_bytes(body[1:4], "big") > len(body):
+        return ""  # ClientHello продолжается в следующей записи
+    try:
+        p = 4 + 2 + 32
+        p += 1 + body[p]  # session id
+        p += 2 + int.from_bytes(body[p:p + 2], "big")  # шифры
+        p += 1 + body[p]  # сжатие
+        end = p + 2 + int.from_bytes(body[p:p + 2], "big")
+        p += 2
+        while p + 4 <= end:
+            kind = int.from_bytes(body[p:p + 2], "big")
+            size = int.from_bytes(body[p + 2:p + 4], "big")
+            if kind == 0:  # server_name: список, тип 0 — имя хоста
+                length = int.from_bytes(body[p + 7:p + 9], "big")
+                return body[p + 9:p + 9 + length].decode("ascii", "replace")
+            p += 4 + size
+    except IndexError:
+        return ""
+    return ""
 
 
 def _close(*socks: socket.socket) -> None:

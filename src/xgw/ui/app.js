@@ -39,7 +39,7 @@
     rotation: "замена", rollback: "откат", pin: "выбор сервера", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
-    main: "основной сервер",
+    main: "основной сервер", fragment: "дробление ClientHello",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -501,6 +501,12 @@
       title.append(el("span", {
         class: `tag ${s.state === "RESERVE" ? "warn" : ""}`, text: "резервный",
         title: "Резервный выход: через него трафик идёт, только когда все серверы в работе не отвечают. Шлюз проверяет его редко и коротким запросом — он тратит квоту подписки.",
+      }));
+    }
+    if (server.fragment) {
+      title.append(el("span", {
+        class: "tag", text: "дробление",
+        title: "Первая запись TLS уходит к этому серверу частями (дробление ClientHello), и фильтр провайдера не видит в ней имя сайта. Шлюз включает его сам, если без него сервер не отвечает.",
       }));
     }
     if (server.multiplier !== undefined) {

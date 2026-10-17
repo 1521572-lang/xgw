@@ -110,9 +110,26 @@ def test_trojan():
     assert raw.outbound["streamSettings"]["tlsSettings"]["serverName"] == "nl2.example.org"
 
 
-def test_trojan_allow_insecure():
+def test_trojan_allow_insecure_is_dropped_for_xray_26_10_10():
+    """Xray 26.10.10 конфиг с allowInsecure не принимает (поле убрано, замена — pcs и
+    vcn; проверено): сервер проверяется по сертификату, а не выпадает из конфига."""
     raw = parse_link(links.TROJAN_INSECURE)
-    assert raw.outbound["streamSettings"]["tlsSettings"]["allowInsecure"] is True
+    tls = raw.outbound["streamSettings"]["tlsSettings"]
+    assert "allowInsecure" not in tls
+    assert any("allowInsecure не поддерживается" in warning for warning in raw.warnings)
+
+
+def test_pinned_certificate_and_verify_name_from_the_link():
+    pin = "495b481f261d899a504576d5ffbfc8f58a6ce3d8dd757a980ca2a81a6fb55dbb"
+    raw = parse_link(
+        f"vless://11111111-2222-3333-4455-666666666661@203.0.113.30:443?security=tls"
+        f"&sni=nl.example.org&allowInsecure=1&pcs={pin}&vcn=cdn.example.org#pinned"
+    )
+    tls = raw.outbound["streamSettings"]["tlsSettings"]
+    assert tls["pinnedPeerCertSha256"] == pin
+    assert tls["verifyPeerCertByName"] == "cdn.example.org"
+    assert "allowInsecure" not in tls
+    assert raw.warnings == []
 
 
 def test_ss_sip002():

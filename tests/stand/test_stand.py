@@ -366,8 +366,10 @@ def test_chosen_spare_carries_the_traffic_hands_over_and_comes_back(priced_stand
     nl_before, de_before = servers["nl"].connections(), servers["de"].connections()
     assert stand.via_balancer()  # трафик идёт — через автовыбор
     assert servers["nl"].connections() + servers["de"].connections() > nl_before + de_before
-    assert any("не отвечает" in event["detail"] for event in status["events"]
-               if event["kind"] == "pin")
+    # Событие демон пишет после того, как снял закрепление через API, — то есть чуть
+    # позже отметки «не отвечает»: ждём его, а не берём из того же снимка статуса.
+    status_when(lambda s: any("не отвечает" in event["detail"] for event in s["events"]
+                              if event["kind"] == "pin"), 15)
 
     servers["fr"].set_mode("pass")
     status_when(lambda s: s.get("pin") and not s["pin"].get("down"), 200)
@@ -377,6 +379,54 @@ def test_chosen_spare_carries_the_traffic_hands_over_and_comes_back(priced_stand
     assert result.returncode == 0, result.stdout + result.stderr
     assert stand.xgw_json("status")["pin"] is None
     assert wait_for(lambda: override() is None, 15, step=1)
+
+
+def test_server_blocked_by_sni_gets_fragmenting_and_carries_the_traffic(stand):
+    """0.1.11 на живом Xray: перед сервером us (VLESS+TLS, сертификат закреплён в ссылке —
+    pcs) стоит «DPI», который сбрасывает соединение, увидев в первой записи TLS целый
+    ClientHello с именем us.stand.test. Шлюз сам включает этому серверу дробление
+    ClientHello — через API, без перезапуска Xray, — и сервер отвечает; выбранный
+    вручную, он несёт трафик."""
+    from xgw.xraycore.api import parse_balancer_info
+
+    us = stand.add_server("us", tls=True)
+    us.set_mode(f"sni={us.domain}")
+    stand.set_subscription((*stand.names, "us"))
+    stand.write_config(max_members=2, probe_host="origin.stand.test",
+                       proxy_domains=("domain:stand.test",))
+    result = stand.xgw("apply", "--now")
+    assert result.returncode == 0, result.stderr + stand.xray_log()
+    stand.start_daemon()
+
+    def server_us(status: dict) -> dict | None:
+        return next((entry for entry in [*status["members"], *status["spares"]]
+                     if entry["tag"].split("-")[1] == "us"), None)
+
+    def answering():
+        status = stand.xgw_json("status")
+        entry = server_us(status) if status.get("daemon") else None
+        return status if entry and entry.get("fragment") and entry.get("verdict") == "OK" else None
+
+    status = wait_for(answering, 240, step=3)
+    assert status, stand.tail("daemon", 80)
+    log = stand.tail("daemon", 400)
+    tag = server_us(status)["tag"]
+    assert f"скан {tag}: CONNECT_FAIL" in log  # без дробления «DPI» соединение сбрасывал
+    details = [event["detail"] for event in status["events"]]
+    assert any("отвечает только с дроблением ClientHello — оно включено" in text
+               for text in details), details
+    assert any("дробление ClientHello" in text and "через API без перезапуска" in text
+               for text in details), details
+
+    result = stand.xgw("pin", tag, "--ttl", "forever")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert wait_for(lambda: parse_balancer_info(stand.xray_api("bi", "auto")).override == tag,
+                    15, step=1)
+    before = us.connections()
+    assert stand.via_balancer(), stand.xray_log()
+    assert us.connections() > before  # трафик — через us, сквозь «DPI»
+    result = stand.xgw("unpin")
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_daemon_replaces_frozen_member_and_expires_pin(stand):

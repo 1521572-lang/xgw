@@ -17,8 +17,11 @@ from dataclasses import dataclass, field
 
 RESTART_SECTIONS = ("log", "api", "metrics", "stats", "policy", "burstObservatory")
 # Outbounds с этими префиксами тегов меняются на лету; остальные (direct, block,
-# dns-out) — часть каркаса: через них идёт служебный трафик самого ядра.
-API_OUTBOUND_PREFIXES = ("proxy-", "spare-", "chain-")
+# dns-out) — часть каркаса: через них идёт служебный трафик самого ядра. Outbound
+# дробления ClientHello (fragment.py) есть, только пока он нужен хоть одному серверу:
+# добавляется (ado) раньше, чем на него сошлются заменённые серверы, а снимается (rmo)
+# после них — порядок apply_plan.
+API_OUTBOUND_PREFIXES = ("proxy-", "spare-", "chain-", "fragment")
 API_INBOUND_PREFIX = "probe-"
 
 

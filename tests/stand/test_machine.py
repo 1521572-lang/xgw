@@ -819,6 +819,13 @@ chmod 755 /usr/local/bin/loginctl /usr/local/bin/notify-send
         text = shown()
         assert f"user=tester bus=unix:path=/run/user/{uid}/bus" in text
         assert "--urgency=critical XGW: Xray не отвечает" in text
+        # Уведомление — запись уровня warning: `journalctl -p warning` её находит.
+        warnings = box.sh("journalctl -u xgw -p warning -o cat --no-pager", check=False)
+        assert "Xray не отвечает" in warnings, box.sh(
+            "journalctl -u xgw -n 40 -o json --no-pager", check=False
+        )
+        # Та же проверка — строкой «Журнал» в xgw diag (D1 отчёта 0.1.10).
+        assert "OK    Журнал: предупреждения демона — с уровнем warning" in _xgw(gw, "diag").stdout
         # Демон поднял Xray сам, шлюз снова в строю.
         assert wait_for(lambda: _state(gw) == "HEALTHY", 60), _xgw(gw, "status").stdout
         assert wait_for(lambda: _exit_ip(gw) == VIA_VPN, 20)

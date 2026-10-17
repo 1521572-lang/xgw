@@ -41,6 +41,7 @@ OK, WARN, FAIL = "OK", "WARN", "FAIL"
 STATUS_PAGE_PORT = 8780
 OS_RELEASE = Path("/etc/os-release")
 DEV_TUN = Path("/dev/net/tun")
+PROC = Path("/proc")
 CHRONY_DIR = Path("/etc/chrony")
 # Пользователь службы времени → её юнит (chrony в 26.04, systemd-timesyncd в 24.04).
 TIME_UNITS = {"_chrony": "chrony", "systemd-timesync": "systemd-timesyncd"}
@@ -95,8 +96,10 @@ class Diag:
         proc_sys: Path = sysctl.PROC_SYS,
         dev_tun: Path = DEV_TUN,
         preinstall: bool = False,
+        proc: Path = PROC,
     ) -> None:
         self.proc_sys = proc_sys
+        self.proc = proc
         self.preinstall = preinstall
         self.dev_tun = dev_tun
         self.cfg = cfg
@@ -134,6 +137,7 @@ class Diag:
             ("Сон", self._sleep),
             ("IPv6", self._ipv6),
             ("Службы", self._services),
+            ("Журнал", self._journal),
             ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
         ]
@@ -720,6 +724,50 @@ class Diag:
             elif info["mode"] == "on":
                 result.append(Check("Перехват", OK, "включён, правила загружены"))
         return result
+
+    def _journal(self) -> list[Check]:
+        """Уровни записей демона в журнале systemd (log.py): предупреждения должны
+        находиться по `journalctl -u xgw -p warning`. Префикс уровня демон ставит, только
+        когда его stderr — тот самый поток журнала, чей номер systemd кладёт в
+        JOURNAL_STREAM (log.journal_stream). Проверка смотрит и это условие у работающей
+        службы, и сами записи: строки с WARNING и ERROR, сохранённые с уровнем info."""
+        if not self.installed or not self.root:
+            return []
+        pid = self.runner(["systemctl", "show", "xgw", "-p", "MainPID", "--value"],
+                          check=False).strip()
+        if not pid.isdigit() or pid == "0":
+            return []  # служба не работает — об этом строка «Службы»
+        environ = (self.proc / pid / "environ").read_bytes().split(b"\0")
+        stream = next((item.split(b"=", 1)[1].decode("ascii", "replace") for item in environ
+                       if item.startswith(b"JOURNAL_STREAM=")), "")
+        info = os.stat(self.proc / pid / "fd" / "2")
+        actual = f"{info.st_dev}:{info.st_ino}"
+        output = self.runner(["journalctl", "-u", "xgw", "-n", "500", "-o", "json", "--no-pager"],
+                             check=False)
+        wrong = 0
+        for line in output.splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            message = record.get("MESSAGE")
+            if (isinstance(message, str) and record.get("_TRANSPORT") == "stdout"
+                    and record.get("PRIORITY") == "6"
+                    and (" WARNING " in message or " ERROR " in message)):
+                wrong += 1
+        details = f"JOURNAL_STREAM={stream or 'нет'}, stderr демона {actual}"
+        if wrong:
+            return [Check(
+                "Журнал", WARN,
+                f"{wrong} предупреждений и ошибок демона записаны с уровнем info — "
+                f"`journalctl -p warning` их не найдёт ({details})",
+                "пришлите эту строку разработчику; перезапуск: sudo systemctl restart xgw",
+            )]
+        if stream != actual:
+            return [Check("Журнал", WARN, f"stderr демона — не поток журнала ({details}): "
+                                          "предупреждения запишутся с уровнем info")]
+        return [Check("Журнал", OK, "предупреждения демона — с уровнем warning "
+                                    "(journalctl -u xgw -p warning)")]
 
     def _budget(self) -> list[Check]:
         members, spares = self.cfg.filters.max_members, 0

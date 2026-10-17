@@ -190,8 +190,19 @@ def build_stream(
             tls["fingerprint"] = single(query, "fp")
         if single(query, "alpn"):
             tls["alpn"] = [item for item in single(query, "alpn").split(",") if item]
-        if _truthy(single(query, "allowInsecure")) or _truthy(single(query, "insecure")):
-            tls["allowInsecure"] = True
+        # Xray 26.10.10 убрал allowInsecure: конфиг с ним он не принимает, и сервер выпал бы.
+        # Замена — закрепить сертификат сервера (pcs, SHA-256 сертификата) или сверять его
+        # с другим именем (vcn). Без них сертификат проверяется обычным порядком.
+        if single(query, "pcs"):
+            tls["pinnedPeerCertSha256"] = single(query, "pcs")
+        if single(query, "vcn"):
+            tls["verifyPeerCertByName"] = single(query, "vcn")
+        insecure = _truthy(single(query, "allowInsecure")) or _truthy(single(query, "insecure"))
+        if insecure and not single(query, "pcs"):
+            warnings.append(
+                "allowInsecure не поддерживается Xray 26.10.10: сертификат сервера проверяется "
+                "(закрепить свой — параметр pcs)"
+            )
         stream["security"] = "tls"
         stream["tlsSettings"] = tls
     elif security == "reality":

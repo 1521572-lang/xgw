@@ -86,8 +86,12 @@ class FakeApplier:
 class Harness(Daemon):
     """Демон, у которого всё внешнее — метрики, проверки, подписки, ядро — подменено."""
 
-    def __init__(self, cfg: Config, paths: Paths, **kwargs):
+    def __init__(self, cfg: Config, paths: Paths, *, fragment: str = "off", **kwargs):
         self.t = time.time()  # и «монотонные», и настенные часы демона; двигаются вручную
+        # Дробление ClientHello (0.1.11) проверяют отдельные тесты (fragment="auto"): в
+        # остальных запасные с TLS и REALITY, которые не отвечают, иначе проверялись бы ещё
+        # и в другом режиме, и сборок конфига было бы больше, чем ждут эти тесты.
+        cfg.fragment.mode = fragment
         super().__init__(
             cfg, paths, xray_bin=Path("no-such-xray"),
             clock=lambda: self.t, wall=lambda: self.t, **kwargs,
@@ -143,10 +147,11 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, tier=None, reserve=None):
+    def _assemble(self, prefer, tier=None, reserve=None, fragment=None):
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
             xray_bin=None, check=False, prefer=prefer, tier=tier, reserve=reserve,
+            fragment=fragment,
         )
 
     def _apply(self, config, *, urgent):

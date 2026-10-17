@@ -16,6 +16,7 @@ from ..config import Config
 from ..model import ServerNode
 from ..net import sysctl
 from ..net.tun import MTU as tun_mtu
+from . import fragment as fragmenting
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
@@ -34,6 +35,7 @@ class NodeInfo:
     probe_tag: str
     probe_port: int
     role: str  # proxy | spare
+    fragment: bool = False  # соединение идёт через дробление ClientHello (fragment.py)
 
 
 @dataclass
@@ -403,9 +405,20 @@ def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> l
                 probe_tag=probe_tag,
                 probe_port=ports.get(probe_tag, 0),
                 role=role,
+                fragment=fragmenting.used(outbound),
             )
         )
     return result
+
+
+def fragmented_fingerprints(config: Mapping | None, nodes: Sequence[ServerNode]) -> set[str]:
+    """Отпечатки серверов, у которых в применённом конфиге включено дробление ClientHello
+    (fragment.py), — для build(fragment=…): режим переживает обновление подписки."""
+    known = {node.fingerprint for node in nodes}
+    return {
+        info.fingerprint for info in applied_nodes(config, nodes)
+        if info.fragment and info.fingerprint in known
+    }
 
 
 def _dns_server(entry: str) -> tuple[str, int | None]:
@@ -426,10 +439,17 @@ def _modernize(outbound: dict) -> None:
     "headers" is deprecated, will be removed soon», — а у HTTPUpgrade уже отклоняется
     («"headers" can't contain "host"»), и сервер выпадал из конфига. Проверено на
     Xray 26.3.27. Явно заданный `host` не трогаем — он главнее.
+
+    Поле `tlsSettings.allowInsecure` Xray 26.10.10 убрал и конфиг с ним не принимает
+    (проверено): из JSON-подписки оно не переносится — сервер проверяется по
+    сертификату, а не выпадает из конфига.
     """
     stream = outbound.get("streamSettings")
     if not isinstance(stream, dict):
         return
+    tls = stream.get("tlsSettings")
+    if isinstance(tls, dict) and "allowInsecure" in tls:
+        stream["tlsSettings"] = {key: value for key, value in tls.items() if key != "allowInsecure"}
     for key in ("wsSettings", "httpupgradeSettings"):
         settings = stream.get(key)
         headers = settings.get("headers") if isinstance(settings, dict) else None
@@ -468,8 +488,12 @@ def build(
     ipv6: bool | None = None,
     probe_url: str | None = None,
     containers_tun: bool = False,
+    fragment: Collection[str] = (),
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
+
+    fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
+    (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
 
     probe_url — адрес проб ядра (burstObservatory), если не probe.url: пока probe.url не
     отвечает, ядро пробует серверы по запасному адресу (watch/target.py).
@@ -507,11 +531,16 @@ def build(
         )
 
     outbounds: list[dict] = []
+    mode = cfg.fragment.mode
     for info, node in zip(nodes, ordered, strict=True):
         outbound = copy.deepcopy(node.outbound)
         outbound["tag"] = info.tag
         _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
+        wanted = mode == "always" or (mode != "off" and node.fingerprint in fragment)
+        if wanted and fragmenting.eligible(outbound):
+            fragmenting.enable(outbound)
+            info.fragment = True
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)
@@ -519,6 +548,8 @@ def build(
         _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
         outbounds.append(outbound)
+    if any(info.fragment for info in nodes):
+        outbounds.append(fragmenting.outbound(cfg))
     outbounds.extend(
         [
             {

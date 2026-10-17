@@ -255,6 +255,7 @@ def assemble(
     prefer: list[str] | None = None,
     tier: cost.Klass | None = None,
     reserve: str | None = None,
+    fragment: set[str] | None = None,
 ) -> Assembly:
     """Конфиг Xray из известных серверов.
 
@@ -264,6 +265,8 @@ def assemble(
     tier — класс участников (смена класса демоном, cost.py); по умолчанию — класс
     нынешних участников: обновление подписки его не меняет.
     reserve — отпечаток резервного выхода (его выбирает демон по дешёвой проверке).
+    fragment — отпечатки серверов с дроблением ClientHello (generator/fragment.py); по
+    умолчанию — как в применённом конфиге (включает и выключает его демон).
     Сервер, конфиг которого установленный Xray не принимает, отбрасывается.
     """
     applied = read_json(paths.xray_config_file)
@@ -275,6 +278,8 @@ def assemble(
         tier = cost.best(cfg.managed.priority, prices, prefer)
     if reserve is None:
         reserve = builder.reserve_fingerprint(applied, inventory.nodes)
+    if fragment is None:
+        fragment = builder.fragmented_fingerprints(applied, inventory.nodes)
 
     rejected: set[str] = set()
     dead = quarantined()
@@ -309,6 +314,7 @@ def assemble(
                 probe_password=probe_password, probe_ports=probe_ports,
                 probe_url=target.observatory_url(cfg, paths),
                 containers_tun=containers_tun(cfg),
+                fragment=fragment,
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc

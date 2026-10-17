@@ -367,6 +367,7 @@ class Capture:
         try:
             if rules.lan_if:
                 self._forwarding_on()
+            self._congestion()
             if rules.capture:
                 # Сначала маршрут для помеченных пакетов (интерфейс TUN уже подготовлен),
                 # потом правила, которые метят; ненужное убирается уже после них.
@@ -478,6 +479,7 @@ class Capture:
                 if remove_tun:
                     tun.remove(self.cfg.capture.tun_name, self.runner)
                 self._forwarding_restore()
+                self._congestion_restore()
             except (cmd.CommandError, OSError) as exc:
                 raise CaptureError(str(exc)) from exc
             self.open_marker.unlink(missing_ok=True)
@@ -496,6 +498,42 @@ class Capture:
             return
         sysctl.write(sysctl.IP_FORWARD, str(before), self.proc_sys)
         self._save(ip_forward_before=None)
+
+    def _congestion(self) -> None:
+        """TCP BBR (network.tcp_bbr) для соединений самой машины, в том числе с серверами
+        VPN: на канале с потерями и большой задержкой он держит скорость лучше прежнего
+        алгоритма. Прежний запоминается и возвращается в down(). Ядро без BBR — не сбой:
+        остаётся прежний алгоритм. Модуль tcp_bbr ядро подгружает само, когда процессу с
+        CAP_NET_ADMIN нужен этот алгоритм (проверено на ядре 6.18)."""
+        if not self.cfg.network.tcp_bbr:
+            self._congestion_restore()  # ключ выключили — вернуть, что было до XGW
+            return
+        current = sysctl.read(sysctl.TCP_CONGESTION, self.proc_sys)
+        if current is None or current == "bbr":
+            return  # ключа нет (не Linux) или BBR уже включён — XGW его не ставил
+        saved = "tcp_congestion_before" in self._state()
+        if not saved:
+            self._save(tcp_congestion_before=current)
+        try:
+            sysctl.write(sysctl.TCP_CONGESTION, "bbr", self.proc_sys)
+        except OSError as exc:
+            if not saved:
+                self._save(tcp_congestion_before=None)
+            if "bbr" not in self._warned:
+                self._warned.add("bbr")
+                self.log.info("TCP BBR не включён: ядро его не знает (%s) — остаётся %s",
+                              exc, current)
+
+    def _congestion_restore(self) -> None:
+        before = self._state().get("tcp_congestion_before")
+        if before is None:
+            return
+        try:
+            sysctl.write(sysctl.TCP_CONGESTION, str(before), self.proc_sys)
+        except OSError as exc:
+            self.log.warning("алгоритм TCP %s не возвращён: %s", before, exc)
+            return
+        self._save(tcp_congestion_before=None)
 
     # --- проверка ---------------------------------------------------------------
 

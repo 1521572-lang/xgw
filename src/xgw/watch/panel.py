@@ -416,11 +416,13 @@ class Panel:
                     # Основной сервер и последний замер скорости (watch/speed.py).
                     main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
                     speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
+                    fragment=bool(entry.get("fragment")),
                 )
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
+                    fragment=bool(entry.get("fragment")),
                 )
             elif item.get("skip"):
                 row.update(status="skipped", skip=item["skip"])

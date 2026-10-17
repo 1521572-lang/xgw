@@ -7,6 +7,29 @@ from xgw.config import Config, load, probe_bytes
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
 
 
+def test_fragment_and_bbr_defaults_and_bad_values(tmp_path):
+    """0.1.11: дробление ClientHello — auto, значения полей freedom.fragment проверены на
+    Xray 26.10.10; BBR включён. Неверное — значение по умолчанию с предупреждением."""
+    cfg = Config()
+    assert (cfg.fragment.mode, cfg.fragment.packets, cfg.fragment.length,
+            cfg.fragment.interval) == ("auto", "tlshello", "100-200", "10-20")
+    assert cfg.network.tcp_bbr is True
+    path = tmp_path / "config.toml"
+    path.write_text('[fragment]\nmode = "Always"\npackets = "1-3"\nlength = "50"\n'
+                    'interval = "0-5"\n', encoding="utf-8")
+    cfg, warnings = load(path)
+    assert (cfg.fragment.mode, cfg.fragment.packets, cfg.fragment.length,
+            cfg.fragment.interval) == ("always", "1-3", "50", "0-5")
+    assert not [warning for warning in warnings if "fragment" in warning]
+    path.write_text('[fragment]\nmode = "maybe"\npackets = "hello"\nlength = "0-10"\n'
+                    'interval = "20-10"\n\n[network]\ntcp_bbr = false\n', encoding="utf-8")
+    cfg, warnings = load(path)
+    assert (cfg.fragment.mode, cfg.fragment.packets, cfg.fragment.length,
+            cfg.fragment.interval) == ("auto", "tlshello", "100-200", "10-20")
+    assert len([warning for warning in warnings if "fragment." in warning]) == 4
+    assert cfg.network.tcp_bbr is False
+
+
 def test_minimal_file_gives_defaults(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("[network]\n", encoding="utf-8")
