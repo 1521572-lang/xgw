@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import sys
 import time
@@ -16,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import config, engine
+from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq
@@ -173,40 +173,58 @@ def apply_network(
 
 
 def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
+    """Ручной выбор сервера (pinning.py): участника или запасного, на срок или бессрочно
+    (ttl_text = pinning.FOREVER). Перестанет отвечать — трафик временно ведёт автовыбор, а
+    когда ответит — снова он (демон, _manual_step)."""
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is None:
         return Outcome(1, f"xray не найден (ожидается {paths.xray_bin} либо XGW_XRAY_BIN)")
-    ttl = config.parse_seconds(ttl_text)
-    if ttl is None or not 0 < ttl <= MAX_PIN_SECONDS:
-        return Outcome(2, "--ttl: ожидается срок вида 30s, 10m или 2h, не больше 24h")
-    members = [
-        info.tag
-        for info in builder.applied_nodes(engine.read_json(paths.xray_config_file))
-        if info.role == "proxy"
-    ]
-    if tag not in members:
+    forever = ttl_text == pinning.FOREVER
+    ttl = None if forever else config.parse_seconds(ttl_text)
+    if not forever and (ttl is None or not 0 < ttl <= MAX_PIN_SECONDS):
         return Outcome(
-            2, f"{tag} — не участник балансировщика; участники: {', '.join(members) or 'нет'}"
+            2, "--ttl: ожидается срок вида 30s, 10m или 2h, не больше 24h, или forever — "
+            "бессрочно",
+        )
+    view = builder.applied_nodes(engine.read_json(paths.xray_config_file))
+    if not any(info.tag == tag for info in view):
+        members = [info.tag for info in view if info.role == "proxy"]
+        return Outcome(
+            2, f"{tag} — такого сервера нет ни в работе, ни среди запасных; в работе: "
+            f"{', '.join(members) or 'нет'} (все — xgw servers)",
         )
     try:
         engine.make_api(cfg, xray_bin).pin(BALANCER_TAG, tag)
     except ApiError as exc:
         return Outcome(1, str(exc))
-    until = time.time() + ttl
+    now = time.time()
     with open_store(paths) as store:
-        store.set_meta("pin", json.dumps({"tag": tag, "until": until}))
-        store.add_event("pin", f"{tag} закреплён вручную на {ttl_text}")
+        name = next((row["name"] for row in store.all_nodes() if row["tag"] == tag), "") or tag
+        record = {
+            "tag": tag, "name": name, "until": None if forever else now + (ttl or 0),
+            "since": now, "down": None,
+        }
+        store.set_meta(pinning.META, pinning.dumps(record))
+        store.add_event(
+            "pin", f"«{name}» выбран вручную" + ("" if forever else f" на {ttl_text}")
+        )
+    daemon_up = status.read_status(paths, max(3.0 * cfg.watchdog.interval_s, 180.0)) is not None
     notes: tuple[str, ...] = ()
-    if status.read_status(paths, max(3.0 * cfg.watchdog.interval_s, 180.0)) is None:
-        notes = ("внимание: демон XGW не запущен — по истечении срока снимите закрепление сами",)
+    if not daemon_up:
+        notes = (
+            "внимание: демон XGW не запущен — если сервер перестанет отвечать, трафик встанет"
+            + ("" if forever else "; по истечении срока снимите выбор сами"),
+        )
+    head = f"«{name}» выбран вручную" + (
+        ": весь трафик идёт через него, пока не вернёте автовыбор" if forever
+        else f" на {ttl_text}: весь трафик идёт через него"
+    )
     return Outcome(
         0,
-        f"{tag} закреплён на {ttl_text}. Автопереключение на это время отключено: "
-        "если узел «заморозят», трафик встанет"
-        + ("; основной сервер шлюз выберет снова, когда закрепление снимется"
-           if cfg.speed.sticky else ""),
+        head + ". Перестанет отвечать — трафик временно поведёт автовыбор, а когда он "
+        "снова ответит, — опять он",
         notes,
-        ("снять раньше: xgw unpin",),
+        ("вернуть автовыбор: xgw unpin",),
     )
 
 
@@ -219,11 +237,11 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
     except ApiError as exc:
         return Outcome(1, str(exc))
     with open_store(paths) as store:
-        store.set_meta("pin", "")
-        store.add_event("pin", "закрепление снято вручную")
+        store.set_meta(pinning.META, "")
+        store.add_event("pin", "автовыбор: ручной выбор сервера снят")
     if cfg.speed.sticky:
         return Outcome(
-            0, "закрепление снято: через минуту шлюз снова закрепит основной сервер — самый "
-            "быстрый из серверов в работе",
+            0, "автовыбор: через минуту шлюз снова закрепит основной сервер — самый быстрый "
+            "из серверов в работе",
         )
-    return Outcome(0, "закрепление снято, выбором узла снова управляет Xray")
+    return Outcome(0, "автовыбор: сервер снова выбирает Xray")

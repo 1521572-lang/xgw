@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import cost, masking, priority
+from .. import pin as pinning
 from ..config import Config, parse_seconds, probe_bytes
 from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
@@ -300,7 +301,7 @@ def collect_status(
             sub_errors = _load_json(store.get_meta("sub_errors")) or {}
             scans = store.scans()
             quotas = _load_json(store.get_meta("quota")) or {}
-            pin = _load_json(store.get_meta("pin")) or None
+            pin = pinning.read(store.get_meta(pinning.META), now)
             main = _load_json(store.get_meta("main")) or None
             speeds = _load_json(store.get_meta("speed")) or {}
             summary = _load_json(store.get_meta("nodes_summary")) or {}
@@ -406,7 +407,9 @@ def collect_status(
             for sub in cfg.subscriptions if sub.url
         ],
         "selecting": list(selecting),
-        "pin": pin if pin and pin.get("until", 0) > now else None,
+        # Ручной выбор сервера (pin.py): until — null, если бессрочный; down — выбранный не
+        # отвечает, и трафик ведёт автовыбор.
+        "pin": pin,
         # Основной сервер: через него идёт весь трафик (speed.sticky); None — его нет
         # (выключен, ещё не выбран или трафик сейчас ведёт ядро).
         "sticky": cfg.speed.sticky,
@@ -559,6 +562,21 @@ def speed_text(value: float) -> str:
     return f"{value:.1f}".replace(".", ",") + " Мбит/с"
 
 
+def render_pin(pin: dict) -> str:
+    """Строка о ручном выборе сервера (pin.py)."""
+    name = pin.get("name") or pin["tag"]
+    if pin.get("down"):
+        return (
+            f"Выбран вручную: «{name}» ({pin['tag']}) — не отвечает, трафик ведёт автовыбор; "
+            "шлюз вернётся к нему, когда он ответит"
+        )
+    until = f" до {_clock(pin['until'])}" if pin.get("until") else ""
+    return (
+        f"Выбран вручную{until}: «{name}» ({pin['tag']}) — весь трафик через него; "
+        "автовыбор: xgw unpin"
+    )
+
+
 def render_main(status: dict) -> str:
     """Строка об основном сервере; пусто — показывать нечего."""
     main = status.get("main")
@@ -707,12 +725,9 @@ def render_status(status: dict) -> str:
         lines.append(render_capture(status["capture"]))
     pin = status.get("pin")
     if pin:
-        lines.append(
-            f"Закреплён вручную: {pin['tag']} до {_clock(pin['until'])} — "
-            "автопереключение на это время отключено"
-        )
+        lines.append(render_pin(pin))
     main = render_main(status)
-    if main and not pin:
+    if main and not (pin and not pin.get("down")):
         lines.append(main)
     if status.get("pending_restart"):
         lines.append("Ожидает окна перезапуска: новый конфиг требует перезапуска Xray")

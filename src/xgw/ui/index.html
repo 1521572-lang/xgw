@@ -39,7 +39,7 @@
           <span id="current-label" class="muted small"></span>
           <span id="current-name" class="current-name"></span>
         </div>
-        <button id="unpin" class="btn small-btn" type="button" hidden>Снять</button>
+        <button id="unpin" class="btn small-btn" type="button" title="Сервер снова выбирает шлюз" hidden>Автовыбор</button>
       </div>
     </section>
 
@@ -138,19 +138,6 @@
 </main>
 
 <footer class="foot muted small" id="foot"></footer>
-
-<dialog id="pin-dialog" class="dialog" aria-labelledby="pin-title">
-  <form method="dialog">
-    <h3 id="pin-title">Закрепить сервер</h3>
-    <p id="pin-name" class="dialog-name"></p>
-    <p class="muted">Пока сервер закреплён, автопереключение отключено: если его «заморозят»,
-      интернет встанет до конца срока. По истечении срока закрепление снимется само.</p>
-    <div id="pin-ttls" class="choices"></div>
-    <div class="dialog-actions">
-      <button class="btn ghost" value="cancel">Отмена</button>
-    </div>
-  </form>
-</dialog>
 
 <dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
   <form method="dialog">

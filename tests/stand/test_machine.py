@@ -581,7 +581,7 @@ def test_telegram_bot_is_paired_from_the_panel_and_obeys_commands(gw):
     say("/servers")
     assert wait_for(lambda: any("1. " in r for r in replies()), 20), replies()
     say("/pin 1 10m")
-    assert wait_for(lambda: any("закреплён на 10m" in r for r in replies()), 20), replies()
+    assert wait_for(lambda: any("выбран вручную на 10m" in r for r in replies()), 20), replies()
     assert _panel_state(gw)["pin"] is not None
     say("/unpin")
     assert wait_for(lambda: _panel_state(gw)["pin"] is None, 20)

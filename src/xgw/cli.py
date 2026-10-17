@@ -24,6 +24,7 @@ import webbrowser
 from pathlib import Path
 
 from . import __version__, actions, config, desktop, engine, log, managed, priority
+from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, nft, tun
@@ -78,11 +79,16 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--all", action="store_true", help="все участники и запасные")
 
     pin = subparsers.add_parser(
-        "pin", parents=[common], help="закрепить узел вручную на ограниченный срок"
+        "pin", parents=[common],
+        help="выбрать сервер вручную: весь трафик через него (как в клиентах VPN)",
     )
-    pin.add_argument("tag", help="тег участника (proxy-…)")
-    pin.add_argument("--ttl", default="10m", help="срок: 30s, 10m, 2h (по умолчанию 10m)")
-    subparsers.add_parser("unpin", parents=[common], help="снять ручное закрепление")
+    pin.add_argument("tag", help="тег сервера в работе (proxy-…) или запасного (spare-…)")
+    pin.add_argument(
+        "--ttl", default="10m",
+        help=f"срок: 30s, 10m, 2h, не больше 24h, или {pinning.FOREVER} — бессрочно "
+        "(по умолчанию 10m)",
+    )
+    subparsers.add_parser("unpin", parents=[common], help="автовыбор: снять ручной выбор сервера")
     prio = subparsers.add_parser(
         "priority", parents=[common],
         help="приоритет сервера: high, medium (по умолчанию) или low; в работе — серверы "
@@ -305,24 +311,26 @@ def _store(paths: Paths):
 def _active_pin(paths: Paths) -> dict | None:
     try:
         with _store(paths) as store:
-            raw = store.get_meta("pin")
-        pin = json.loads(raw or "null")
-    except (json.JSONDecodeError, OSError, sqlite3.Error):
+            raw = store.get_meta(pinning.META)
+    except (OSError, sqlite3.Error):
         return None  # нет доступа к состоянию (запуск без root) — статус покажем и так
-    if isinstance(pin, dict) and pin.get("tag") and pin.get("until", 0) > time.time():
-        return pin
-    return None
+    return pinning.read(raw, time.time())
 
 
 def _restore_pin(paths: Paths, api, logger) -> None:
-    """adrules и перезапуск сбрасывают закрепление в ядре — возвращаем, пока срок не вышел."""
+    """adrules и перезапуск сбрасывают закрепление в ядре — возвращаем ручной выбор, пока
+    он действует и выбранный отвечает. Тег — по новому конфигу (pin.resolve): запасной мог
+    стать участником, а закрепление на тег, которого нет, остановило бы весь трафик."""
     pin = _active_pin(paths)
-    if pin is None:
+    if pin is None or pin.get("down"):
         return
+    info = pinning.resolve(pin, builder.applied_nodes(engine.read_json(paths.xray_config_file)))
+    if info is None:
+        return  # сервера больше нет — выбор снимет демон, с уведомлением
     try:
-        api.pin(BALANCER_TAG, pin["tag"])
+        api.pin(BALANCER_TAG, info.tag)
     except ApiError as exc:
-        logger.error("закрепление %s не восстановлено: %s", pin["tag"], exc)
+        logger.error("выбранный вручную сервер %s не закреплён: %s", info.tag, exc)
 
 
 # --- status / servers ----------------------------------------------------------

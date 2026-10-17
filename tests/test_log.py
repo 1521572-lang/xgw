@@ -2,6 +2,8 @@
 
 import io
 import logging
+import os
+import sys
 
 import pytest
 
@@ -58,3 +60,43 @@ def test_setup_is_idempotent(journal):
     assert sum(isinstance(h.formatter, log.MaskingFormatter) for h in handlers) == 1
     log.get_logger("x").info("another-secret")
     assert "another-secret" not in journal.getvalue()
+
+
+def _record(level: int, message: str, exc_info=None) -> logging.LogRecord:
+    return logging.LogRecord("xgw.watch", level, __file__, 1, message, (), exc_info)
+
+
+def test_journal_prefix_sets_priority_of_every_line():
+    """journald берёт уровень из префикса «<N>» каждой строки; без него всё — info (6),
+    и `journalctl -p warning` не видит уведомлений (замечание D2 отчёта 0.1.9)."""
+    formatter = log.MaskingFormatter(log._FORMAT, journal=True)
+    assert formatter.format(_record(logging.WARNING, "reserve: уже 5 мин")).startswith("<4>")
+    assert formatter.format(_record(logging.INFO, "rotation")).startswith("<6>")
+    assert formatter.format(_record(logging.DEBUG, "metrics")).startswith("<7>")
+    try:
+        raise ValueError(f"bad link vless://{UUID}@203.0.113.10:443")
+    except ValueError:
+        text = formatter.format(_record(logging.ERROR, "разбор не удался", sys.exc_info()))
+    lines = text.split("\n")
+    assert len(lines) > 2 and all(line.startswith("<3>") for line in lines)
+    assert UUID not in text
+    plain = log.MaskingFormatter(log._FORMAT)
+    assert not plain.format(_record(logging.WARNING, "reserve")).startswith("<")
+    assert log.syslog_priority(logging.CRITICAL) == 2
+
+
+def test_journal_stream_matches_device_and_inode(tmp_path, monkeypatch):
+    """JOURNAL_STREAM — «устройство:inode» потока журнала; унаследованная переменная при
+    stderr, перенаправленном в файл или терминал, не считается."""
+    with open(tmp_path / "stderr.log", "w", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        assert not log.journal_stream(stream)
+        monkeypatch.setenv("JOURNAL_STREAM", f"{info.st_dev}:{info.st_ino}")
+        assert log.journal_stream(stream)
+        assert not log.journal_stream(io.StringIO())  # fileno() не поддерживается
+        assert not log.journal_stream(None)
+        monkeypatch.setenv("JOURNAL_STREAM", f"{info.st_dev}:{info.st_ino + 1}")
+        assert not log.journal_stream(stream)
+        monkeypatch.setenv("JOURNAL_STREAM", "garbage")
+        assert not log.journal_stream(stream)

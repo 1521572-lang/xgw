@@ -294,11 +294,18 @@ class DemoPanel(Panel):
                 store.add_event("capture", text)
             return actions.Outcome(0, text)
         if name in ("pin", "unpin"):
-            pin = {"tag": body["tag"], "until": time.time() + 3600} if name == "pin" else None
+            # Как actions.pin: панель выбирает бессрочно (pin.py), имя — из списка серверов.
+            pin = None
+            if name == "pin":
+                with actions.open_store(self.paths) as store:
+                    names = {row["tag"]: row["name"] for row in store.all_nodes()}
+                pin = {"tag": body["tag"], "name": names.get(body["tag"], body["tag"]),
+                       "until": None, "since": time.time(), "down": None}
             with actions.open_store(self.paths) as store:
-                store.set_meta("pin", json.dumps(pin) if pin else "")
+                store.set_meta("pin", json.dumps(pin, ensure_ascii=False) if pin else "")
             return actions.Outcome(
-                0, f"{body['tag']} закреплён на {body['ttl']}" if pin else "закрепление снято"
+                0, f"«{pin['name']}» выбран вручную: весь трафик идёт через него, пока не "
+                "вернёте автовыбор" if pin else "автовыбор: ручной выбор сервера снят"
             )
         return super()._act(name, body)
 

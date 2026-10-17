@@ -36,7 +36,7 @@
   };
   const KINDS = {
     capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
-    rotation: "замена", rollback: "откат", pin: "закрепление", panel: "панель", telegram: "Telegram",
+    rotation: "замена", rollback: "откат", pin: "выбор сервера", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер",
@@ -44,9 +44,7 @@
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
   };
-  const TTL_LABELS = { "10m": "10 минут", "1h": "1 час", "6h": "6 часов", "24h": "24 часа" };
   const ICONS = {
-    pin: ["M12 17v5", "M9 3h6l-1 6 3 3v2H7v-2l3-3z"],
     remove: ["M6 6l12 12", "M18 6L6 18"],
   };
 
@@ -90,6 +88,13 @@
     const button = el("button", { class: "icon-btn", type: "button", title: label, "aria-label": label, onclick });
     button.append(icon(name));
     return button;
+  }
+
+  // Один ли это сервер: роль в теге меняется (запасной стал участником: spare-nl-8763 →
+  // proxy-nl-8763), а страна и начало отпечатка — нет (pin.py).
+  function sameServer(a, b) {
+    const rest = (tag) => String(tag || "").split("-").slice(1).join("-");
+    return Boolean(a && b) && rest(a) !== "" && rest(a) === rest(b);
   }
 
   // Перерисовывает блок, только если его данные изменились: иначе раскрытые
@@ -365,14 +370,17 @@
     $("power-why").textContent = capital(why);
 
     // Без перехвата трафик машины идёт напрямую — «сейчас через» было бы неправдой.
-    const current = s.pin
-      ? s.members.find((member) => member.tag === s.pin.tag)
-      : on && !s.capture.inbound_missing
-        && (s.members.find((member) => member.selected) || s.members.find((member) => member.main));
+    // Выбранный вручную не отвечает (pin.down) — трафик ведёт автовыбор, его и показываем.
+    const chosen = s.pin && !s.pin.down
+      ? [...s.members, ...(s.servers || [])].find((server) => sameServer(server.tag, s.pin.tag))
+      : null;
+    const current = chosen || (on && !s.capture.inbound_missing
+      && (s.members.find((member) => member.selected) || s.members.find((member) => member.main)));
     $("current").hidden = !current;
     if (current) {
-      const main = !s.pin && s.main && s.main.tag === current.tag;
-      $("current-label").textContent = s.pin ? `Закреплён до ${stamp(s.pin.until, s.now)}`
+      const main = !chosen && s.main && s.main.tag === current.tag;
+      $("current-label").textContent = chosen
+        ? (s.pin.until ? `Выбран вручную до ${stamp(s.pin.until, s.now)}` : "Выбран вручную")
         : main ? "Основной сервер" : "Сейчас через";
       const delay = current.delay_ms !== null && current.delay_ms !== undefined ? ` · ${current.delay_ms} мс` : "";
       const speed = current.speed_mbps !== null && current.speed_mbps !== undefined ? ` · ${mbps(current.speed_mbps)}` : "";
@@ -403,6 +411,9 @@
   // Скорость: 85 Мбит/с; ниже 10 — с одним знаком после запятой.
   const mbps = (value) => (value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`);
 
+  // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
+  const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
+
   function serverNote(server, s) {
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
@@ -413,7 +424,7 @@
       } else if (server.speed_error) {
         measured = ` · замер скорости не удался ${stamp(server.speed_ts, s.now)}`;
       }
-      return `${server.main ? "основной" : "в работе"}${measured}${dead}`;
+      return `${mainShown(server, s) ? "основной" : "в работе"}${measured}${dead}`;
     }
     if (server.status === "spare") {
       const role = server.reserve
@@ -456,14 +467,31 @@
     });
   }
 
+  // Ручной выбор, как в клиентах VPN: весь трафик через этот сервер, пока не нажмёте
+  // «Автовыбор». Выбрать можно и запасной; перестанет отвечать — шлюз временно уведёт
+  // трафик на автовыбор и вернётся к нему, когда он ответит.
+  function chooseNode(server, pinned) {
+    if (pinned || (server.status !== "member" && server.status !== "spare")) return null;
+    return el("button", {
+      class: "btn small-btn choose", type: "button", text: "Выбрать",
+      title: `Весь трафик — через «${server.name}», пока не нажмёте «Автовыбор»`,
+      "aria-label": `Выбрать ${server.name}`,
+      onclick: (event) => act("pin", { tag: server.tag, ttl: "forever" }, event.currentTarget),
+    });
+  }
+
   function serverRow(server, s) {
-    const pinned = s.pin && s.pin.tag === server.tag;
+    const pinned = s.pin && sameServer(s.pin.tag, server.tag);
+    const main = mainShown(server, s);
     const tone = server.status === "member"
       ? (server.alive === true ? "ok" : server.alive === false ? "bad" : "")
       : server.status === "spare" ? ((VERDICTS[server.verdict] || [""])[0]) : "";
     const title = el("div", { class: "row-title" }, el("span", { text: server.name, title: server.name }));
-    if (pinned) title.append(el("span", { class: "tag warn", text: "закреплён" }));
-    else if (server.main) {
+    if (pinned) {
+      title.append(el("span", s.pin.down
+        ? { class: "tag warn", text: "выбран · не отвечает", title: "Выбран вручную, но не отвечает: пока трафик ведёт автовыбор" }
+        : { class: "tag on", text: "выбран вручную", title: "Весь трафик идёт через этот сервер, пока не нажмёте «Автовыбор»" }));
+    } else if (main) {
       title.append(el("span", {
         class: "tag on", text: "основной",
         title: "Весь трафик идёт через этот сервер; другие серверы в работе наготове и подхватят трафик, если он перестанет отвечать",
@@ -482,15 +510,14 @@
       }));
     }
     const classes = [];
-    if (server.selected || pinned || server.main) classes.push("selected");
+    if (server.selected || pinned || main) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       el("div", { class: "row-main" }, title, el("div", { class: "row-sub", text: serverNote(server, s) })),
       serverValue(server),
       el("div", { class: "row-tools" },
-        server.status === "member" && !pinned
-          ? iconButton("pin", `Закрепить ${server.name}`, () => openPin(server)) : null,
+        chooseNode(server, pinned),
         priorityNode(server),
         switchNode(server),
         editable(server) ? iconButton("remove", `Убрать ${server.name} из списка`, () => confirmRemove(
@@ -532,7 +559,7 @@
     const price = reserve.cost ? ` (${multiplierText(reserve.cost)})` : "";
     note.textContent = `Серверы в работе не отвечают — трафик идёт через резервный сервер «${reserve.name}»${price}. `
       + (reserve.cost ? "Он тратит квоту подписки; " : "")
-      + "как только серверы в работе ответят, шлюз вернётся к ним сам.";
+      + "шлюз ищет живые серверы среди запасных и вернётся к серверам в работе, как только они ответят.";
   }
 
   // Основной сервер: весь трафик через самый быстрый из серверов в работе.
@@ -547,8 +574,8 @@
     let text;
     if (!on) {
       text = "Выключено: шлюз сам выбирает сервер с наименьшей задержкой и может менять его каждые полминуты.";
-    } else if (s.pin) {
-      text = "Пока сервер закреплён вручную, основной сервер не выбирается.";
+    } else if (s.pin && !s.pin.down) {
+      text = "Пока сервер выбран вручную, основной сервер не выбирается.";
     } else if (s.main) {
       const speed = s.main.mbps !== null && s.main.mbps !== undefined ? ` — ${mbps(s.main.mbps)}` : "";
       const basis = s.main.basis === "speed" ? "" : " (скорость ещё не замерена — выбран по задержке)";
@@ -600,9 +627,12 @@
       ? "Серверы ещё не получены. Обычно это занимает до минуты; если не появятся — смотрите события ниже."
       : "Серверов пока нет. Добавьте подписку — вставьте её адрес в поле «Подписки».";
     $("pin-note").hidden = !s.pin;
-    $("pin-note").textContent = s.pin
-      ? `Сервер закреплён вручную до ${stamp(s.pin.until, s.now)} — автопереключение на это время отключено.`
-      : "";
+    const pinRow = s.pin ? s.servers.find((server) => sameServer(server.tag, s.pin.tag)) : null;
+    const pinName = s.pin ? (pinRow && pinRow.name) || s.pin.name || s.pin.tag : "";
+    $("pin-note").textContent = !s.pin ? ""
+      : s.pin.down
+        ? `Выбранный вручную «${pinName}» не отвечает — трафик идёт через серверы, выбранные автоматически. Когда он снова ответит, шлюз вернётся к нему.`
+        : `Выбран вручную «${pinName}»${s.pin.until ? ` до ${stamp(s.pin.until, s.now)}` : ""}: весь трафик идёт через него. «Автовыбор» вверху вернёт выбор шлюзу.`;
   }
 
   function renderRemoved(s) {
@@ -756,18 +786,6 @@
   }
 
   // --- окна -----------------------------------------------------------------
-
-  function openPin(server) {
-    $("pin-name").textContent = server.name || server.tag;
-    $("pin-ttls").replaceChildren(...state.pin_ttls.map((ttl) => el("button", {
-      class: "btn", type: "button", text: TTL_LABELS[ttl] || ttl,
-      onclick: () => {
-        $("pin-dialog").close();
-        act("pin", { tag: server.tag, ttl });
-      },
-    })));
-    $("pin-dialog").showModal();
-  }
 
   let confirmed = null;
 

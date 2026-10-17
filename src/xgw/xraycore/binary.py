@@ -133,16 +133,17 @@ def pick_asset(release: Release, goos: str, machine: str) -> str | None:
 
 
 def get_release(
-    version: str = "latest",
+    version: str,
     *,
     timeout: float = 20.0,
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,
 ) -> Release:
-    if version in ("", "latest"):
-        url = f"{RELEASES_API}/latest"
-    else:
-        url = f"{RELEASES_API}/tags/v{version.lstrip('vV')}"
+    """Релиз этой версии (config.XRAY_VERSION). «Последнего» нет: на GitHub это старый
+    стабильный выпуск, а XGW работает только с одной версией."""
+    if not re.fullmatch(r"[vV]?\d+(\.\d+){0,2}", version.strip()):
+        raise BinaryError(f"версия Xray — цифрами, например 26.10.10, а не «{version}»")
+    url = f"{RELEASES_API}/tags/v{version.strip().lstrip('vV')}"
     result = fetch.fetch_url(
         url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "xgw-updater"},
@@ -185,7 +186,7 @@ def verify_sha256(data: bytes, dgst_text: str) -> bool:
 
 def download_release(
     dest_dir: Path,
-    version: str = "latest",
+    version: str,
     *,
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,

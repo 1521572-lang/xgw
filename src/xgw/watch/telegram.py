@@ -53,8 +53,8 @@ HELP = """XGW — шлюз с VPN. Команды:
 /devices — устройства в Wi-Fi
 /enable — включить VPN
 /disable — выключить VPN (интернет напрямую)
-/pin НОМЕР [СРОК] — закрепить сервер (СРОК: 10m, 1h, 6h, 24h; по умолчанию 1h)
-/unpin — снять закрепление
+/pin НОМЕР [СРОК] — выбрать сервер вручную (СРОК: 10m, 1h, 6h, 24h; по умолчанию 1h)
+/unpin — вернуть автовыбор
 /refresh — обновить подписки
 /scan — проверить запасные серверы
 /speed — замерить скорость серверов в работе
@@ -457,7 +457,11 @@ class Bot:
                 break
         pin = snap.get("pin")
         if pin:
-            lines.append(f"Закреплён вручную: {pin['tag']} — автопереключение отключено")
+            name = pin.get("name") or pin["tag"]
+            lines.append(
+                f"Выбран вручную: {name} — не отвечает, сейчас автовыбор" if pin.get("down")
+                else f"Выбран вручную: {name}; вернуть автовыбор — /unpin"
+            )
         reserve = snap.get("reserve")
         if reserve:
             price = cost.describe(float(reserve.get("cost") or 0.0))

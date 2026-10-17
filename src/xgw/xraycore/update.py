@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 
 from .. import engine, fetch, log
-from ..config import Config
+from ..config import XRAY_VERSION, Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
 from ..paths import Paths, file_lock
@@ -47,20 +47,20 @@ def update_xray(
     mark = engine.bypass_mark(cfg, logger)
     route = {"mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None}
     try:
-        release = get_release(cfg.xray.version, **route)
+        release = get_release(XRAY_VERSION, **route)  # другую версию XGW не ставит
         wanted = binary.parse_version(release.tag)
     except (binary.BinaryError, fetch.FetchError) as exc:
         out(f"ошибка: не удалось узнать версию Xray на GitHub: {exc}")
         return 1
     if current == wanted:
-        out(f"Xray {_version_text(current)} — уже нужная версия ({cfg.xray.version})")
+        out(f"Xray {_version_text(current)} — уже нужная версия")
         return 0
 
     staging = target.with_name(target.name + ".new")
     previous = target.with_name(target.name + ".prev")
     shutil.rmtree(staging, ignore_errors=True)
     try:
-        tag, new_bin = download(staging, cfg.xray.version, release=release, **route)
+        tag, new_bin = download(staging, XRAY_VERSION, release=release, **route)
     except (binary.BinaryError, fetch.FetchError) as exc:
         shutil.rmtree(staging, ignore_errors=True)
         out(f"ошибка: Xray {release.tag} не загружен: {exc}")

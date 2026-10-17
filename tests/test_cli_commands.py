@@ -187,6 +187,25 @@ def test_apply_restores_active_pin(gateway):
     assert gateway.api.calls == [("pin", "auto", target)]  # adrules сбросил закрепление в ядре
 
 
+def test_apply_restores_the_choice_by_server_not_by_stale_tag(gateway):
+    """Запасной стал участником (spare-… → proxy-…), а в записи прежний тег: закрепляется
+    тот же сервер под новым тегом — закрепление на тег, которого нет, остановило бы трафик.
+    Выбранный не отвечает (down) — не закрепляется: трафик ведёт автовыбор."""
+    target = gateway.tags("proxy")[0]
+    stale = "spare-" + target.split("-", 1)[1]
+    store = Store(gateway.paths.db_file)
+    store.set_meta("pin", json.dumps({"tag": stale, "until": None}))
+    store.close()
+    assert gateway.run("apply") == 0
+    assert gateway.api.calls == [("pin", "auto", target)]
+    store = Store(gateway.paths.db_file)
+    store.set_meta("pin", json.dumps({"tag": target, "until": None, "down": time.time()}))
+    store.close()
+    gateway.api.calls.clear()
+    assert gateway.run("apply") == 0
+    assert gateway.api.calls == []
+
+
 def test_lock_timeout_is_reported(gateway, monkeypatch, capsys):
     from xgw.paths import LockTimeout
 
@@ -360,8 +379,9 @@ def test_pin_and_unpin(gateway, capsys):
     target = gateway.tags("proxy")[0]
     assert gateway.run("pin", target, "--ttl", "5m") == 0
     out = capsys.readouterr().out
-    assert "Автопереключение на это время отключено" in out
-    assert "демон XGW не запущен" in out  # срок некому отслеживать — предупреждаем
+    assert "выбран вручную на 5m: весь трафик идёт через него" in out
+    assert "трафик временно поведёт автовыбор" in out
+    assert "демон XGW не запущен" in out  # срок и отказы некому отслеживать — предупреждаем
     assert gateway.api.calls == [("pin", "auto", target)]
     store = Store(gateway.paths.db_file)
     pin = json.loads(store.get_meta("pin"))
@@ -369,7 +389,7 @@ def test_pin_and_unpin(gateway, capsys):
     assert pin["tag"] == target and 290 < pin["until"] - time.time() <= 300
 
     assert gateway.run("status") == 0
-    assert f"Закреплён вручную: {target}" in capsys.readouterr().out
+    assert "Выбран вручную до " in capsys.readouterr().out
 
     assert gateway.run("unpin") == 0
     assert gateway.api.calls[-1] == ("unpin", "auto")
@@ -379,12 +399,27 @@ def test_pin_and_unpin(gateway, capsys):
 
 
 def test_pin_validates_arguments(gateway, capsys):
-    target, spare = gateway.tags("proxy")[0], gateway.tags("spare")[0]
+    target = gateway.tags("proxy")[0]
     assert gateway.run("pin", target, "--ttl", "вечно") == 2
-    assert gateway.run("pin", target, "--ttl", "48h") == 2  # дольше суток закреплять нельзя
-    assert gateway.run("pin", spare) == 2  # запасной не в балансировщике
-    assert "не участник балансировщика" in capsys.readouterr().err
+    assert gateway.run("pin", target, "--ttl", "48h") == 2  # дольше суток — только бессрочно
+    assert gateway.run("pin", "proxy-zz-0000") == 2
+    assert "такого сервера нет ни в работе, ни среди запасных" in capsys.readouterr().err
     assert gateway.api.calls == []
+
+
+def test_any_server_can_be_chosen_for_good(gateway, capsys):
+    """Как в клиентах VPN: выбрать можно и запасной, и без срока (--ttl forever)."""
+    spare = gateway.tags("spare")[0]
+    assert gateway.run("pin", spare, "--ttl", "forever") == 0
+    assert "пока не вернёте автовыбор" in capsys.readouterr().out
+    assert gateway.api.calls == [("pin", "auto", spare)]
+    store = Store(gateway.paths.db_file)
+    pin = json.loads(store.get_meta("pin"))
+    store.close()
+    assert pin["tag"] == spare and pin["until"] is None and pin["down"] is None
+    assert gateway.run("status") == 0
+    out = capsys.readouterr().out
+    assert "Выбран вручную: «" in out and "весь трафик через него" in out
 
 
 def test_pin_api_error(gateway, capsys):

@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import engine, fetch, log
-from .config import Config, probe_bytes
+from .config import XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .install import UNITS
@@ -247,18 +247,15 @@ class Diag:
                 "Xray", FAIL, f"версия {text}, но поля httpMethod в бинарнике нет",
                 "sudo xgw update-xray",
             )]
-        wanted = self.cfg.xray.version
-        if wanted not in ("", "latest"):
-            try:
-                other = binary.parse_version(wanted) != version
-            except binary.BinaryError:
-                other = False  # о неверной записи предупреждает проверка конфига
-            if other:
-                return [Check(
-                    "Xray", WARN, f"версия {text}, а в конфиге xray.version = {wanted}",
-                    "установка поставит нужную версию" if self.preinstall
-                    else "sudo xgw update-xray",
-                )]
+        if version != binary.parse_version(XRAY_VERSION):
+            # Другую версию XGW не использует (config.XRAY_VERSION); перед установкой это
+            # не ошибка — установка поставит нужную.
+            return [Check(
+                "Xray", WARN if self.preinstall else FAIL,
+                f"версия {text}, а XGW работает только с Xray {XRAY_VERSION}",
+                "установка поставит нужную версию" if self.preinstall
+                else "sudo xgw update-xray",
+            )]
         return [Check("Xray", OK, f"версия {text}, GET-проверка (httpMethod) поддерживается")]
 
     def xray_up(self) -> bool:

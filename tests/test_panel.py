@@ -753,6 +753,10 @@ def test_pin_goes_through_the_same_code_as_the_command(rig, user, monkeypatch):
     assert result == {"ok": True, "text": "proxy-nl-aaaa закреплён на 1h", "notes": []}
     assert seen == [("proxy-nl-aaaa", "1h")]
     assert not user.act("pin", {"tag": "proxy-nl-aaaa", "ttl": "99h"})["ok"] and len(seen) == 1
+    # Кнопка «Выбрать» — бессрочно, как в клиентах VPN; без срока — тоже бессрочно.
+    assert user.act("pin", {"tag": "spare-de-bbbb", "ttl": "forever"})["ok"]
+    assert user.act("pin", {"tag": "spare-de-bbbb"})["ok"]
+    assert seen[1:] == [("spare-de-bbbb", "forever")] * 2
     assert user.act("unpin", {})["ok"]
 
 
@@ -763,6 +767,15 @@ def test_pin_from_the_store_is_shown(rig, user):
     with actions.open_store(rig.paths) as store:
         store.set_meta("pin", json.dumps({"tag": "proxy-nl-aaaa", "until": time.time() - 1}))
     assert user.state()["pin"] is None
+    # Бессрочный выбор; выбранный не отвечает — панель знает об этом (down).
+    with actions.open_store(rig.paths) as store:
+        store.set_meta("pin", json.dumps({
+            "tag": "spare-de-bbbb", "name": "Германия", "until": None, "down": time.time(),
+        }))
+    pin = user.state()["pin"]
+    assert pin["tag"] == "spare-de-bbbb" and pin["name"] == "Германия"
+    assert pin["until"] is None and pin["down"]
+    assert "pin_ttls" not in user.state()
 
 
 def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):

@@ -171,10 +171,10 @@ class Dns:
     )
 
 
-# Версия Xray-core по умолчанию — та, на которой XGW проверен целиком (юнит-тесты, все
-# стенды, «одноразовая машина»). 26.10.10 — предварительный выпуск (pre-release): последний
-# стабильный на 16.10.2026 — 26.3.27, и на нём XGW тоже проверен (ASSUMPTIONS, п. 181).
-# "latest" в конфиге — последний стабильный релиз GitHub.
+# Единственная версия Xray-core, с которой работает XGW (решение заказчика 17.10.2026,
+# ASSUMPTIONS, п. 190): её ставят установка и `xgw update-xray`, другую `xgw diag` считает
+# ошибкой. 26.10.10 — предварительный выпуск (pre-release); "latest" на GitHub — старый
+# стабильный 26.3.27, поэтому "latest" и другие версии в конфиге не учитываются.
 XRAY_VERSION = "26.10.10"
 
 
@@ -574,8 +574,14 @@ def _validate(cfg: Config) -> list[str]:
     for name, port in {**listening, "probe_port_base": cfg.xray.probe_port_base}.items():
         if not 1 <= port <= 65535:
             warnings.append(f"порт {name}={port} вне диапазона 1–65535")
-    if cfg.xray.version != "latest" and not re.fullmatch(r"\d+(\.\d+){0,2}", cfg.xray.version):
-        warnings.append('xray.version: "latest" или версия цифрами, например 25.7.23')
+    if cfg.xray.version.strip().lstrip("vV") != XRAY_VERSION:
+        # "latest" стоял в прежнем примере конфига: это не выбор версии, предупреждать не о чем.
+        if cfg.xray.version.strip() not in ("", "latest"):
+            warnings.append(
+                f'xray.version = "{cfg.xray.version}" не учитывается: XGW работает только с '
+                f"Xray {XRAY_VERSION}"
+            )
+        cfg.xray.version = XRAY_VERSION
     # Бот из панели без чата — это ожидание подключения, а не ошибка настройки.
     waiting = cfg.managed.telegram
     if cfg.notify.telegram_bot_token and not cfg.notify.telegram_chat_id and not waiting:

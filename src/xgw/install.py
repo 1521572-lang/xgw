@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import desktop, engine, fetch, log, managed
-from .config import Config
+from .config import XRAY_VERSION, Config
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
 from .net.capture import Capture, CaptureError
@@ -289,15 +289,8 @@ class Installer:
         return facts
 
     def _xray_fits(self, version: tuple[int, int, int] | None) -> bool:
-        """Подходит ли уже лежащий Xray: не ниже минимальной и той версии, что в конфиге."""
-        if version is None or version < binary.MIN_VERSION:
-            return False
-        wanted = self.cfg.xray.version
-        if wanted in ("", "latest"):
-            return True
-        with contextlib.suppress(binary.BinaryError):
-            return binary.parse_version(wanted) == version
-        return False
+        """Подходит ли уже лежащий Xray: XGW работает только с XRAY_VERSION (config.py)."""
+        return version == binary.parse_version(XRAY_VERSION)
 
     def subnet_conflict(self) -> str:
         """Подсеть LAN пересекается с сетью провайдера или другой сетью машины. С таким
@@ -365,7 +358,7 @@ class Installer:
             lines.append(f"  • Xray-core {version} уже лежит в {self.paths.xray_dir}")
         else:
             lines.append(
-                f"  • Xray-core ({cfg.xray.version}) с GitHub — в {self.paths.xray_dir}, "
+                f"  • Xray-core {XRAY_VERSION} с GitHub — в {self.paths.xray_dir}, "
                 "SHA-256 сверяется с .dgst релиза"
             )
         lines.append("  • службы systemd: xgw-net, xgw-xray, xgw — с автозапуском")
@@ -591,7 +584,7 @@ class Installer:
         mark = engine.bypass_mark(self.cfg, self.log)
         try:
             tag, _path = self.download(
-                self.paths.xray_dir, self.cfg.xray.version,
+                self.paths.xray_dir, XRAY_VERSION,
                 mark=mark, bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
             )
         except (binary.BinaryError, fetch.FetchError) as exc:

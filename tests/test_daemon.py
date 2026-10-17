@@ -51,9 +51,11 @@ class FakeApi:
 
     def pin(self, balancer, tag):
         self.calls.append(("pin", tag))
+        self.state = BalancerInfo(override=tag, selects=self.state.selects)
 
     def unpin(self, balancer):
         self.calls.append(("unpin",))
+        self.state = BalancerInfo(override=None, selects=self.state.selects)
 
 
 class FakeService:
@@ -375,15 +377,23 @@ def test_dead_member_is_replaced_only_by_a_spare_of_its_level(daemon):
     assert daemon.applied == [] and victim in daemon.tags("proxy")
 
 
-def test_pinned_server_keeps_its_level(daemon):
-    high, _others = _by_level(daemon)
+def test_chosen_server_keeps_its_level_while_it_answers(daemon):
+    """Пока трафик ведёт сервер, выбранный вручную, уровень не меняется; выбранный умер —
+    трафик на автовыборе, и уровень меняется, как обычно."""
+    high, others = _by_level(daemon)
     (member,) = daemon.tags("proxy")
-    daemon.store.set_meta("pin", json.dumps({"tag": member, "until": daemon.t + 3600}))
+    daemon.store.set_meta("pin", json.dumps({"tag": member, "until": None}))
     daemon.next_refresh = daemon.t + 3600
+    for _ in range(3):
+        daemon.t += 20
+        daemon.tick()
+    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
     daemon.set_alive(**{member.replace("-", "_"): False})
     daemon.tick()
-    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
-    assert not any("уровня" in event for event in daemon.events())
+    assert json.loads(daemon.store.get_meta("pin"))["down"]  # трафик — автовыбору
+    daemon.tick()
+    assert {_fingerprint(daemon, tag) for tag in daemon.tags("proxy")} <= set(others)
+    assert any("на уровне «высокий» живых серверов нет" in event for event in daemon.events())
 
 
 def test_levels_follow_the_real_machine_plan(daemon):
@@ -702,9 +712,9 @@ def test_pin_is_dropped_when_node_leaves_balancer(daemon):
     daemon.source = _inventory(links.FULL_LINKS)
     daemon.next_refresh = 0.0
     daemon.tick()
-    assert daemon.api.calls == []  # закреплять нечего: такого участника нет
+    assert daemon.api.calls == []  # закреплять нечего: такого сервера нет
     assert daemon.store.get_meta("pin") == ""
-    assert any("больше не участник" in event for event in daemon.events())
+    assert any("больше нет среди серверов" in event for event in daemon.events())
 
 
 def test_hung_xray_is_restarted_when_nothing_to_roll_back(daemon):
@@ -1687,33 +1697,100 @@ def test_unlimited_servers_work_and_the_cheapest_limited_one_waits_as_the_reserv
     assert sorted(daemon.scanned) == sorted(paid)
 
 
-def test_dead_unlimited_servers_hand_the_traffic_to_the_reserve_and_take_it_back(daemon):
-    """Безлимитные мертвы — трафик несёт резервный лимитированный x1 (Xray сам, через
-    fallbackTag): состояние RESERVE с уведомлением, безлимитных на лимитированные не
-    меняют; безлимитный ожил — Xray вернулся к нему сам, о чём тоже есть событие."""
+def test_dead_unlimited_servers_give_way_to_the_cheapest_limited_ones_and_come_back(daemon):
+    """Безлимитные мертвы — трафик сразу несёт резервный x1 (Xray сам, через fallbackTag),
+    а шлюз ставит в работу живые лимитированные, сначала самые дешёвые (решение
+    пользователя после испытаний 0.1.9). x10 и x100 участниками не становятся: их пробы
+    съели бы квоту (MEMBER_COST_MAX). Безлимитный снова ответил — в работе безлимитные."""
     _reserve_started(daemon)
-    members = daemon.tags("proxy")
-    daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+    unlimited = daemon.tags("proxy")
+    for tag in unlimited:
+        daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
     assert daemon.tick() is State.RESERVE
-    assert daemon.reserve_mode  # сквозная проверка — коротким запросом
     entered = [event for event in daemon.events() if event.startswith("RESERVE:")]
     assert len(entered) == 1 and "HEALTHY → RESERVE" in entered[0]
     assert "трафик идёт через резервный сервер «x1 Финляндия» (x1)" in entered[0]
-    assert daemon.status()["state"] == "RESERVE"
     assert daemon.collected == [False]  # подписка — напрямую: через Xray пошла бы через x1
-    for _ in range(10):
-        daemon.t += 20
-        assert daemon.tick() is State.RESERVE
-    assert daemon.tags("proxy") == members and daemon.applied == []
-    assert len(daemon.collected) == 1  # внеочередной опрос — не чаще RESERVE_RETRY
-    paid = {tag for name, tag in _named(daemon).items() if name.startswith("x")}
-    assert not paid & set(daemon.scanned)  # лимитированные не пробуются probe.url
-    daemon.set_alive()
-    assert daemon.tick() is State.HEALTHY and not daemon.reserve_mode
+    # Сбой может быть коротким (ядро само вернёт трафик безлимитным) — COSTLIER_AFTER ждём.
+    assert daemon.tags("proxy") == unlimited and daemon.applied == []
+    daemon.t += 130
+    assert daemon.tick() is State.RESERVE
+    named = _named(daemon)
+    assert daemon.tags("proxy") == [named["x1 Финляндия"]]
+    assert daemon.applied[-1][1] is True  # срочно: участники мертвы
     assert any(
-        "reserve: серверы в работе снова отвечают — Xray вернул на них трафик с резервного "
-        "«x1 Финляндия» (x1)" in event for event in daemon.events()
+        "живых серверов нет — в работе лимитированные серверы x1 (были — безлимитные "
+        "серверы)" in event for event in daemon.events()
     )
+    daemon.set_alive()
+    daemon.applied.clear()
+    for _ in range(3):
+        daemon.t += 120
+        assert daemon.tick() is State.HEALTHY
+    assert daemon.applied == []
+    assert named["x10 🛜 Германия"] not in daemon.tags("proxy")
+    # Безлимитные ответили на перепроверку (TIER_RESCAN) — они снова в работе.
+    daemon.verdicts.clear()
+    for _ in range(3):
+        daemon.t += 120
+        daemon.tick()
+    named = _named(daemon)
+    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит 1"], named["Безлимит 2"]])
+    # Резервным снова становится x1 — после перепроверки кандидатов дешёвым запросом.
+    for _ in range(3):
+        daemon.t += 20
+        daemon.tick()
+    assert _fallback(daemon) == _named(daemon)["x1 Финляндия"]
+
+
+def test_brief_outage_of_the_unlimited_servers_does_not_bring_in_limited_ones(daemon):
+    """Провайдер моргнул: ядро сочло безлимитных мёртвыми, трафик ненадолго понёс
+    резервный, затем безлимитные снова ответили на пробу — лимитированных в работу не
+    ставили, конфиг не менялся."""
+    _reserve_started(daemon)
+    unlimited = daemon.tags("proxy")
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
+    assert daemon.tick() is State.RESERVE
+    daemon.t += 60
+    assert daemon.tick() is State.RESERVE
+    daemon.set_alive()
+    daemon.t += 20
+    assert daemon.tick() is State.HEALTHY
+    daemon.t += 120
+    daemon.tick()
+    assert daemon.tags("proxy") == unlimited and daemon.applied == []
+
+
+def test_limited_servers_without_a_fresh_check_are_checked_cheaply_first(daemon):
+    """Свежих вердиктов у лимитированных x1 нет — шлюз сначала проверяет их дешёвым
+    запросом и только потом ставит в работу; в класс дороже по старым вердиктам не идёт."""
+    layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("paid", "x1 A"),
+              ("paid", "x1 B"), ("paid", "x10 C")]
+    _reserve_started(daemon, layout)
+    named = _named(daemon)
+    # Прошло больше двух периодов скана: вердикты x1 устарели.
+    daemon.t += daemon.cfg.probe.scan_spares_minutes * 120 + 600
+    daemon.next_refresh = daemon.t + 3600
+    daemon.tick()
+    daemon.scanned.clear()
+    daemon.applied.clear()
+    unlimited = daemon.tags("proxy")
+    for tag in unlimited:
+        daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
+    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
+    assert daemon.tick() is State.RESERVE
+    daemon.t += 130
+    daemon.tick()
+    assert daemon.applied == []  # сначала проверка
+    daemon.t += 20
+    daemon.tick()
+    x1 = {named["x1 A"], named["x1 B"]}
+    assert x1 <= set(daemon.scanned)
+    assert {daemon.scan_urls[tag] for tag in x1} == {daemon.cfg.probe.trace_url}
+    assert named["x10 C"] not in daemon.scanned
+    named = _named(daemon)
+    assert sorted(daemon.tags("proxy")) == sorted([named["x1 A"], named["x1 B"]])
 
 
 def test_dead_unlimited_member_is_replaced_by_an_unlimited_spare_while_the_reserve_works(daemon):
@@ -1903,33 +1980,50 @@ def test_servers_the_gateway_fixes_itself_are_not_notified(tmp_path, monkeypatch
         daemon.store.close()
 
 
-def test_long_work_through_the_reserve_is_notified_once_and_so_is_the_return(
+def test_limited_servers_and_long_work_through_the_reserve_are_not_notified(
     tmp_path, monkeypatch
 ):
+    """Переход на лимитированные и долгая работа через резервный — молча: интернет
+    работает, действий от человека не нужно (решение пользователя после испытаний 0.1.9).
+    О долгой работе через резервный — одно событие в журнале на заход."""
     daemon, sent = _with_sink(tmp_path, monkeypatch)
     try:
         _reserve_started(daemon)
-        daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
+        unlimited = daemon.tags("proxy")
+        for tag in unlimited:
+            daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
         assert daemon.tick() is State.RESERVE
-        assert sent == []  # короткий переход на резервный — не повод
-        for _ in range(16):  # 5 минут с лишним
-            daemon.t += 20
-            daemon.tick()
-        reserve = [text for kind, text in sent if kind == "reserve"]
-        assert len(reserve) == 1 and "трафик идёт через резервный сервер «x1 Финляндия»" in (
-            reserve[0])
+        daemon.t += 130
+        daemon.tick()
+        assert daemon.tags("proxy") == [_named(daemon)["x1 Финляндия"]]
         daemon.set_alive()
         daemon.t += 20
         assert daemon.tick() is State.HEALTHY
-        assert [kind for kind, _text in sent] == ["reserve", "reserve"]
-        assert "снова отвечают" in sent[-1][1]
-        # Следующий короткий заход на резервный — снова без уведомлений.
-        daemon.set_alive(**{tag.replace("-", "_"): False for tag in daemon.tags("proxy")})
-        daemon.tick()
+        assert sent == []
+    finally:
+        daemon.store.close()
+    # Лимитированные только дороже x1: участниками они не становятся, трафик долго несёт
+    # резервный — тоже без уведомлений.
+    daemon, sent = _with_sink(tmp_path / "expensive", monkeypatch)
+    try:
+        layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("paid", "x10 A"),
+                  ("paid", "x10 B"), ("paid", "x100 C")]
+        _reserve_started(daemon, layout)
+        members = daemon.tags("proxy")
+        daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
+        assert daemon.tick() is State.RESERVE
+        for _ in range(32):  # 10 минут с лишним
+            daemon.t += 20
+            assert daemon.tick() is State.RESERVE
+        assert daemon.tags("proxy") == members and sent == []
+        long = [event for event in daemon.events() if event.startswith("reserve: уже")]
+        assert len(long) == 1 and "«x10 A» (x10)" in long[0]
         daemon.set_alive()
         daemon.t += 20
-        daemon.tick()
-        assert len(sent) == 2
+        assert daemon.tick() is State.HEALTHY
+        assert sent == []
+        assert any("снова отвечают" in event for event in daemon.events())
     finally:
         daemon.store.close()
 
@@ -1958,3 +2052,130 @@ def test_subscription_failure_is_notified_only_when_it_lasts(tmp_path, monkeypat
         assert daemon._sub_failing_since is None and not daemon._sub_alerted
     finally:
         daemon.store.close()
+
+
+def test_xray_version_follows_binary_replacement(daemon, tmp_path, monkeypatch):
+    """`xgw update-xray` подменяет бинарник (os.replace) и перезапускает только xgw-xray:
+    статус показывает новую версию без перезапуска демона, а `xray version` не
+    запускается на каждом шаге (замечание D1 отчёта 0.1.9)."""
+    calls: list[str] = []
+
+    def installed_version(path):
+        calls.append(str(path))
+        text = Path(path).read_text(encoding="utf-8").strip()
+        return tuple(int(part) for part in text.split(".")) if text else None
+
+    monkeypatch.setattr("xgw.daemon.binary.installed_version", installed_version)
+    xray = tmp_path / "xray"
+    xray.write_text("26.3.27", encoding="utf-8")
+    daemon.xray_bin = xray
+    _started(daemon)
+    assert daemon.status()["xray"]["version"] == "26.3.27"
+    daemon.tick()
+    daemon.tick()
+    assert len(calls) == 1
+    fresh = tmp_path / "xray.new"
+    fresh.write_text("26.10.10", encoding="utf-8")
+    fresh.replace(xray)
+    daemon.tick()
+    assert daemon.status()["xray"]["version"] == "26.10.10"
+    assert len(calls) == 2
+    # Версию узнать не удалось — спрашиваем снова на следующем шаге, а не запоминаем пустую.
+    broken = tmp_path / "xray.broken"
+    broken.write_text("", encoding="utf-8")
+    broken.replace(xray)
+    daemon.tick()
+    daemon.tick()
+    assert daemon.status()["xray"]["version"] == ""
+    assert len(calls) == 4
+    xray.unlink()
+    daemon.tick()
+    assert daemon.status()["xray"]["version"] == ""
+    assert len(calls) == 4
+
+
+# --- 0.1.10: ручной выбор сервера, как в клиентах VPN --------------------------------
+
+
+def _choose(daemon: Harness, tag: str, until: float | None = None) -> None:
+    daemon.store.set_meta("pin", json.dumps(
+        {"tag": tag, "name": f"сервер {tag}", "until": until, "since": daemon.t, "down": None}
+    ))
+
+
+def test_a_spare_can_be_chosen_and_the_choice_follows_the_server(daemon):
+    """Выбрать можно и запасной: ядро закрепляется на нём, хотя его нет в selector
+    балансировщика. Бессрочный выбор не снимается сам; тег в записи сверяется по серверу —
+    закрепление на тег, которого нет, остановило бы весь трафик."""
+    _started(daemon)
+    spare = daemon.tags("spare")[0]
+    _choose(daemon, "proxy-" + spare.split("-", 1)[1])  # роль в записи устарела
+    daemon.tick()
+    assert daemon.api.state.override == spare
+    assert json.loads(daemon.store.get_meta("pin"))["tag"] == spare
+    assert daemon.status()["pin"]["tag"] == spare and daemon.status()["pin"]["until"] is None
+    daemon.t += 10 * 86400
+    daemon.api.state = BalancerInfo(override=None, selects=())  # Xray перезапустился
+    daemon.tick()
+    assert daemon.api.state.override == spare and daemon.store.get_meta("pin")
+
+
+def test_chosen_server_that_stops_answering_hands_over_to_auto_and_comes_back(
+    tmp_path, monkeypatch
+):
+    """Выбранный запасной не пропускает трафик (сквозная проверка идёт через него) —
+    закрепление снимается, трафик ведёт автовыбор; раз в PIN_RECHECK его проверяет
+    собственная проба, и когда он ответил, трафик снова через него. И то и другое —
+    уведомления: выбор делал человек. В ALL_DEAD шлюз не уходит."""
+    daemon, sent = _with_sink(tmp_path, monkeypatch)
+    try:
+        daemon.cfg.speed.sticky = False
+        _started(daemon)
+        spare = daemon.tags("spare")[0]
+        _choose(daemon, spare)
+        daemon.tick()
+        assert daemon.api.state.override == spare
+        daemon.e2e = False
+        daemon.verdicts[_probe(spare)] = "CONNECT_FAIL"
+        states = []
+        for _ in range(2):
+            daemon.t += 20
+            states.append(daemon.tick())
+        assert State.ALL_DEAD not in states
+        pin = json.loads(daemon.store.get_meta("pin"))
+        assert pin["down"] and daemon.api.state.override is None
+        assert [kind for kind, _text in sent] == ["pin"] and "не отвечает" in sent[0][1]
+        daemon.e2e = True  # автовыбор носит трафик
+        daemon.scanned.clear()
+        for _ in range(8):  # 160 с: проба раз в PIN_RECHECK, сервер всё ещё молчит
+            daemon.t += 20
+            assert daemon.tick() is State.HEALTHY
+        assert daemon.scanned.count(spare) >= 1  # Harness пишет теги серверов
+        assert daemon.api.state.override is None and len(sent) == 1
+        daemon.verdicts.clear()
+        for _ in range(8):
+            daemon.t += 20
+            daemon.tick()
+        assert daemon.api.state.override == spare
+        assert not json.loads(daemon.store.get_meta("pin"))["down"]
+        assert [kind for kind, _text in sent] == ["pin", "pin"] and "снова отвечает" in sent[1][1]
+    finally:
+        daemon.store.close()
+
+
+def test_chosen_member_that_the_core_sees_dead_hands_over_at_once(daemon):
+    """Выбранного участника пробует ядро: умер — автовыбор сразу, ожил — снова он."""
+    _started(daemon)
+    member = daemon.tags("proxy")[0]
+    _choose(daemon, member)
+    daemon.tick()
+    assert daemon.api.state.override == member
+    daemon.set_alive(**{member.replace("-", "_"): False})
+    daemon.tick()
+    assert daemon.api.state.override is None
+    assert json.loads(daemon.store.get_meta("pin"))["down"]
+    assert daemon.status()["pin"]["down"]  # статус и панель знают: трафик на автовыборе
+    daemon.set_alive()
+    daemon.tick()
+    assert daemon.api.state.override == member
+    assert not json.loads(daemon.store.get_meta("pin"))["down"]

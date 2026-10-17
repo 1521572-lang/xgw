@@ -49,6 +49,21 @@ def test_validation_warnings(tmp_path):
     assert any("interval" in warning for warning in warnings)
 
 
+def test_only_xray_26_10_10_is_used(tmp_path):
+    """XGW работает только с Xray 26.10.10: другая версия в конфиге не учитывается (с
+    предупреждением), а "latest" из прежнего примера конфига — молча."""
+    path = tmp_path / "config.toml"
+    for value, warns in (("26.10.10", False), ("v26.10.10", False), ("latest", False),
+                         ("26.3.27", True), ("27.1.1", True), ("свежая", True)):
+        path.write_text(f'[xray]\nversion = "{value}"\n', encoding="utf-8")
+        cfg, warnings = load(path)
+        assert cfg.xray.version.lstrip("v") == "26.10.10"
+        found = [warning for warning in warnings if "xray.version" in warning]
+        assert bool(found) is warns, (value, warnings)
+        if warns:
+            assert "только с Xray 26.10.10" in found[0]
+
+
 def test_ipv6_values(tmp_path):
     path = tmp_path / "config.toml"
     for value, proxied, warns in (("off", False, False), ("proxy", True, False),

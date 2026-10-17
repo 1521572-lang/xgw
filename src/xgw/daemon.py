@@ -6,8 +6,8 @@
 не умеет: обновляет подписки, применяет изменения, сканирует запасные и
 меняет «мёртвых» участников (раздел 6.8). Ещё он ведёт классы серверов (cost.py:
 ручной приоритет, затем стоимость — безлимитные, лимитированные x1, x10…): переходит на
-класс хуже, когда на нынешнем живых нет и пробовать тот класс не дороже, возвращается
-выше, когда сервер того класса снова проходит проверку, и подбирает балансировщику
+класс хуже, когда на нынешнем живых нет (на лимитированные — не дороже x1, MEMBER_COST_MAX),
+возвращается выше, когда сервер того класса снова проходит проверку, и подбирает балансировщику
 резервный выход — лимитированный сервер, через который трафик идёт, пока участники
 мертвы (_reserve_step). С 0.1.9 он же держит «основной» сервер — самый быстрый по замеру
 скорости — и закрепляет его в ядре, чтобы выход не скакал между серверами (_main_step,
@@ -26,6 +26,7 @@ import dataclasses
 import datetime
 import ipaddress
 import json
+import os
 import random
 import threading
 import time
@@ -34,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import cost, engine, fetch, log, priority
+from . import pin as pinning
 from .apply.applier import ApplyOutcome, in_restart_window
 from .apply.rotation import (
     REPLACE_NOW_VERDICTS,
@@ -72,6 +74,19 @@ PROBE_WORKERS = 8  # пробы для этой перепроверки иду�
 # Работают серверы класса хуже лучшего — запасные классов лучше проверяются не реже
 # этого: вернуться к ним нужно скоро после того, как они снова заработают.
 TIER_RESCAN = 300.0
+# Дороже этого множителя лимитированные участниками не становятся, когда безлимитные
+# мертвы (_switch_tier): участников ядро пробует probe.url каждые probe.interval, и проба
+# 57 КБ раз в 30 с через x100 — ~16 ГБ квоты в сутки на сервер. Такие остаются резервным
+# выходом: через него идёт только сам трафик.
+MEMBER_COST_MAX = 1.0
+# Выбранный вручную запасной перестал отвечать — собственная проба не чаще этого: трафик
+# тем временем ведёт автовыбор (_manual_step). Участника пробует само ядро.
+PIN_RECHECK = 120.0
+# В класс дороже нынешнего (с безлимитных на лимитированные) — не раньше, чем трафик
+# столько несёт резервный: после короткого сбоя (провайдер моргнул) ядро само вернёт
+# трафик безлимитным за один цикл проб, а с лимитированных назад — только перепроверка
+# безлимитных (TIER_RESCAN). Трафик не идёт вовсе (ALL_DEAD) — без ожидания.
+COSTLIER_AFTER = 120.0
 # Резервный выход и кандидаты на его место проверяются дешёвым запросом раз в
 # RESERVE_RECHECK (по RESERVE_CANDIDATES лучших, см. watch/scan.py), а когда трафик не
 # идёт и через резервный (ALL_DEAD) — сразу и все. Итог перепроверки ждём не дольше
@@ -86,9 +101,10 @@ ALERT_STATES = frozenset({
     State.ALL_DEAD, State.XRAY_DOWN, State.WAN_DOWN, State.LEAK,
     State.PROBE_TARGET_UNREACHABLE,
 })
-# Трафик несёт лимитированный резервный дольше этого — уведомить: тратится квота, а
-# короткий переход (секунды, пока ядро не увидит, что участник ожил) повода не даёт.
-RESERVE_ALERT_AFTER = 300.0
+# Трафик несёт резервный дольше этого — событие в журнале (без уведомления: интернет
+# работает, действий от человека не нужно); короткий переход (секунды, пока ядро не
+# увидит, что участник ожил) не стоит и события.
+RESERVE_NOTE_AFTER = 300.0
 # Подписка не обновляется дольше этого — уведомить: разовый сбой провайдера подписки
 # повода не даёт, а долгий — значит, что-то с ней не так (истекла, сменился адрес).
 SUBSCRIPTION_ALERT_AFTER = 3600.0
@@ -180,7 +196,11 @@ class Daemon:
             paths.db_file, cfg.notify.min_interval_min, sinks=sinks, logger=self.log
         )
         self.store = Store(paths.db_file)
-        self.xray_version = ".".join(map(str, binary.installed_version(xray_bin) or ()))
+        # Версия Xray для статуса. `xgw update-xray` меняет бинарник и перезапускает только
+        # xgw-xray, поэтому версия перечитывается, когда меняется файл (_xray_version).
+        self.xray_version = ""
+        self._xray_stamp: tuple[int, int, int] | None = None
+        self._xray_version()
 
         self.inventory: engine.Inventory | None = None
         self.action = ""
@@ -231,8 +251,8 @@ class Daemon:
         # На этом шаге участники мертвы и трафик несёт резервный выход: сквозная проверка
         # идёт дешёвым запросом — через лимитированный сервер каждый байт тратит квоту.
         self.reserve_mode = False
-        # Уведомили ли о долгой работе через резервный (на этот заход в RESERVE).
-        self._reserve_alerted = False
+        # Записано ли событие о долгой работе через резервный (на этот заход в RESERVE).
+        self._reserve_noted = False
         # С какого момента подписки не обновляются (time.time()) и уведомили ли об этом.
         self._sub_failing_since: float | None = None
         self._sub_alerted = False
@@ -249,6 +269,8 @@ class Daemon:
         self._main_suspended = False  # «карусель»: выбор отдан ядру до удачной загрузки
         # Закреплён ли основной в ядре нами; None — не знаем (демон только запущен).
         self._main_pinned: bool | None = None
+        # Когда снова пробовать выбранный вручную запасной, который перестал отвечать.
+        self._pin_recheck_at = 0.0
         self._metrics: dict = {}  # последний ответ /debug/vars — по нему видно нагрузку
         self._traffic: tuple[float, int] | None = None  # (clock, байт через серверы)
         self._own_traffic = 0  # сколько из них — собственные замеры скорости
@@ -341,7 +363,7 @@ class Daemon:
         self.reserve_round_at = previous.reserve_round_at
         self._urgent_round_for = previous._urgent_round_for
         self._reserve_used = previous._reserve_used
-        self._reserve_alerted = previous._reserve_alerted
+        self._reserve_noted = previous._reserve_noted
         self._sub_failing_since = previous._sub_failing_since
         self._sub_alerted = previous._sub_alerted
         self._reserve_note = previous._reserve_note
@@ -353,6 +375,7 @@ class Daemon:
         self._main_failed_at = previous._main_failed_at
         self._main_suspended = previous._main_suspended
         self._main_pinned = previous._main_pinned
+        self._pin_recheck_at = previous._pin_recheck_at
         self._traffic = previous._traffic
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
@@ -421,27 +444,27 @@ class Daemon:
                 str(state), f"{previous} → {state}: {detail}", notify=state in ALERT_STATES,
             )
             if previous is State.RESERVE and state in (State.HEALTHY, State.DEGRADED):
-                # Если о работе через резервный уведомляли — уведомить и о возврате.
                 self.notifier.event(
                     "reserve",
                     f"серверы в работе снова отвечают — Xray вернул на них трафик с резервного"
                     f"{self._reserve_used}",
-                    notify=self._reserve_alerted,
                 )
             if state is not State.RESERVE:
-                self._reserve_alerted = False
+                self._reserve_noted = False
         if (
-            state is State.RESERVE and not self._reserve_alerted
-            and self.wall() - self.state_since >= RESERVE_ALERT_AFTER
+            state is State.RESERVE and not self._reserve_noted
+            and self.wall() - self.state_since >= RESERVE_NOTE_AFTER
         ):
-            self._reserve_alerted = True
+            # Без уведомления: интернет работает, а лимитированные серверы — не беда
+            # (решение пользователя после испытаний 0.1.9). Шлюз сам ставит в работу живые
+            # лимитированные (_switch_tier) и вернётся к безлимитным, когда они ответят.
+            self._reserve_noted = True
             minutes = int((self.wall() - self.state_since) // 60)
             self.notifier.event(
                 "reserve",
                 f"уже {minutes} мин трафик идёт через резервный сервер{self._reserve_used}: "
-                "серверы в работе не отвечают. Через резервный тратится квота его подписки; "
-                "когда серверы ответят, шлюз вернётся к ним сам",
-                notify=True,
+                "серверы в работе не отвечают; шлюз ищет живые серверы среди запасных, "
+                "в том числе лимитированных",
             )
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
@@ -480,8 +503,9 @@ class Daemon:
         elif not changed and state is State.RESERVE and now >= self.next_all_dead:
             # Трафик несёт резервный выход и тратит квоту: подписка могла сменить серверы —
             # обновить её напрямую (через Xray запрос шёл бы через тот же резервный) и
-            # проверить запасные, чтобы поскорее заменить мёртвых участников. Лимитированные
-            # классом хуже здесь не проверяются: их дело — резервный выход (_reserve_step).
+            # проверить запасные, чтобы поскорее заменить мёртвых участников. Запасные
+            # классом хуже (лимитированные) проверяет _switch_tier — когда живых этого
+            # класса не осталось и пора переходить на них.
             self.next_all_dead = now + RESERVE_RETRY
             changed = self._refresh(now, via_xray=False, urgent=False)
             self._queue_scan(view, now)
@@ -529,10 +553,10 @@ class Daemon:
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
-        self._check_pin()
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
+        self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
         self._write_status(view, observatory, signals.xray_ok)
         return state
@@ -701,7 +725,7 @@ class Daemon:
             # Закрепление основного сервера (_main_step) — не ручное: такой сервер, если он
             # сам выходит в домашнюю страну, меняется на запасной, как и выбранный ядром.
             main = (self.main or {}).get("tag")
-            return info.override, self._manual_pin() is not None or info.override != main
+            return info.override, self._manual_active() or info.override != main
         return (info.selects[0], False) if info.selects else None
 
     # --- не отвечает сам probe.url -----------------------------------------------
@@ -867,8 +891,8 @@ class Daemon:
             member = self._member_by_tag(tag)
             if pinned:
                 text = (
-                    f"выход в {home}: закреплённый вручную сервер {tag} сам выходит в {home} — "
-                    "снимите закрепление: xgw unpin"
+                    f"выход в {home}: выбранный вручную сервер {tag} сам выходит в {home} — "
+                    "выберите другой или верните автовыбор: xgw unpin"
                 )
             elif member is not None and len(member.fingerprint) >= 8:
                 self.home_exits.add(member.fingerprint)
@@ -1075,8 +1099,7 @@ class Daemon:
         bad = outcome.mode in ("rejected", "rollback", "failed")
         self.notifier.event("apply", f"{reason}: {engine.describe(outcome)}", notify=bad)
         if outcome.mode in ("api", "restart"):
-            self._repin()
-            return True
+            return True  # ручной выбор ядро забыло — вернёт _manual_step на этом же шаге
         return outcome.mode == "rollback"
 
     def _subscription_failed(self) -> None:
@@ -1326,14 +1349,21 @@ class Daemon:
 
         Вниз: живых участников нет (ALL_DEAD или трафик несёт резервный выход — RESERVE)
         и живых запасных того же класса тоже — участниками становятся проверенные
-        запасные ближайшего класса хуже, у которого они есть. Ждать rotate_after_min
-        незачем: трафику идти больше некуда. Но только если пробовать тот класс не дороже:
-        участников ядро пробует постоянно, и безлимитных на лимитированные шлюз не меняет —
-        пока безлимитные мертвы, трафик несёт резервный выход, а observatory продолжает
-        пробовать безлимитных бесплатно и вернёт трафик, как только они ответят.
+        запасные ближайшего класса хуже, у которого они есть, в том числе лимитированные:
+        безлимитные в приоритете, но когда они мертвы, работают лимитированные, сначала
+        самые дешёвые (решение пользователя после испытаний 0.1.9; до того трафик в таком
+        случае нёс один резервный выход). Классы дороже MEMBER_COST_MAX (и дороже нынешнего)
+        пропускаются: их постоянные пробы съели бы квоту, трафик через них несёт резервный
+        выход. Ждать rotate_after_min незачем: трафику идти больше некуда; только в класс
+        дороже — не раньше COSTLIER_AFTER работы через резервный.
+        Если у ближайшего класса хуже есть запасные без свежего скана, они
+        сначала проверяются (лимитированные — дешёвым запросом, _scan_url): иначе шлюз
+        ушёл бы в класс дороже по старым вердиктам. Назад — как вверх: безлимитные
+        запасные проверяются раз в TIER_RESCAN, ответивший возвращает безлимитных в работу.
 
-        Пока сервер закреплён вручную (xgw pin), класс не меняется."""
-        if self.inventory is None or self._pin() is not None:
+        Пока трафик ведёт сервер, выбранный вручную (xgw pin, панель), класс не меняется;
+        выбранный не отвечает — меняется, как обычно: трафик тогда на автовыборе."""
+        if self.inventory is None or self._manual_active():
             return False
         prices = self._prices()
         known = {node.fingerprint for node in self.inventory.nodes}
@@ -1371,12 +1401,24 @@ class Daemon:
         if state not in (State.ALL_DEAD, State.RESERVE) or ready(tier, REPLACEABLE_VERDICTS):
             return False  # живые есть — или их заменит _rotate тем же классом
         for klass in (item for item in classes if item > tier):
+            if klass.cost > max(tier.cost, MEMBER_COST_MAX):
+                continue  # дорого пробовать постоянно: трафик несёт резервный (_reserve_step)
+            if (
+                klass.cost > tier.cost and state is State.RESERVE
+                and self.wall() - self.state_since < COSTLIER_AFTER
+            ):
+                return False  # пока трафик несёт резервный: сбой может быть коротким
             lower = ready(klass, REPLACEABLE_VERDICTS)
-            if not lower:
-                continue
-            if klass.cost > tier.cost:
-                return False  # дороже: трафик несёт резервный выход (_reserve_step)
-            return self._change_tier(tier, klass, lower, urgent=True, up=False)
+            if lower:
+                return self._change_tier(tier, klass, lower, urgent=True, up=False)
+            unchecked = [
+                info.probe_tag for info in spares
+                if self._klass(info.fingerprint, prices) == klass and info.probe_tag not in scans
+            ]
+            if unchecked:
+                queued = set(self.scan_queue)
+                self.scan_queue.extend(tag for tag in unchecked if tag not in queued)
+                return False  # класс дороже — только когда в этом живых точно нет
         return False
 
     def _queue_higher(
@@ -1530,49 +1572,135 @@ class Daemon:
             "Xray вернётся к ним сам, как только они ответят; поиск замены среди запасных"
         )
 
-    # --- ручное закрепление ----------------------------------------------------
+    # --- ручной выбор сервера (pin.py) ------------------------------------------
 
     def _pin(self) -> dict | None:
-        try:
-            pin = json.loads(self.store.get_meta("pin") or "null")
-        except json.JSONDecodeError:
-            return None
-        return pin if isinstance(pin, dict) and pin.get("tag") else None
+        """Запись ручного выбора — действующая или с вышедшим сроком."""
+        return pinning.parse(self.store.get_meta(pinning.META))
 
     def _manual_pin(self) -> dict | None:
-        """Ручное закрепление, срок которого ещё не вышел."""
+        """Ручной выбор, срок которого не вышел (бессрочный — всегда); выбранный сервер при
+        этом может и не отвечать — тогда трафик ведёт автовыбор (_manual_active)."""
         pin = self._pin()
-        return pin if pin is not None and pin.get("until", 0) > self.wall() else None
+        return pin if pinning.active(pin, self.wall()) else None
 
-    def _check_pin(self) -> None:
-        """Снимает закрепление по истечении срока (bo -r)."""
-        pin = self._pin()
-        if pin is None or pin.get("until", 0) > self.wall():
-            return
-        try:
-            self.api.unpin(BALANCER_TAG)
-        except ApiError as exc:
-            self.log.error("закрепление %s не снято: %s", pin["tag"], exc)
-            return
-        self.store.set_meta("pin", "")
-        self.notifier.event("pin", f"закрепление {pin['tag']} снято по истечении срока")
+    def _manual_active(self) -> bool:
+        """Трафик сейчас ведёт ручной выбор: он действует, и выбранный сервер отвечает."""
+        pin = self._manual_pin()
+        return pin is not None and not pin.get("down")
 
-    def _repin(self) -> None:
-        """adrules и перезапуск сбрасывают закрепление в ядре — возвращаем, пока срок не вышел."""
+    def _save_pin(self, pin: dict | None) -> None:
+        self.store.set_meta(pinning.META, pinning.dumps(pin) if pin else "")
+
+    def _manual_step(
+        self, view: list[NodeInfo], applied: dict | None, observatory: dict, signals: Signals,
+    ) -> None:
+        """Ручной выбор сервера — как в клиентах VPN, но так, чтобы интернет не пропал.
+
+        Пока выбранный отвечает, он закреплён в ядре (`xray api bo`; перезапуск Xray и
+        adrules закрепление сбрасывают — оно сверяется на каждом шаге). Тег сверяется по
+        серверу (pin.resolve): запасной, ставший участником, меняет `spare-…` на `proxy-…`,
+        а закрепление на тег, которого в конфиге нет, остановило бы весь трафик.
+
+        Перестал отвечать (ядро сочло участника мёртвым или подряд не прошли сквозные
+        проверки, а они идут через него) — закрепление снимается, трафик ведёт автовыбор, а
+        выбор ждёт (`down`): участника снова оживит ядро, запасного раз в PIN_RECHECK
+        проверяет собственная проба. Ответил — трафик снова через него. Об уходе и
+        возврате уведомляем: выбор делал человек. Сервера больше нет в конфиге (убран из
+        подписки, отключён) — выбор снимается, тоже с уведомлением."""
         pin = self._pin()
-        if pin is None or pin.get("until", 0) <= self.wall():
+        if pin is None:
             return
-        view = builder.applied_nodes(engine.read_json(self.paths.xray_config_file))
-        if pin["tag"] not in [info.tag for info in view if info.role == "proxy"]:
-            self.store.set_meta("pin", "")
+        name = pin.get("name") or pin["tag"]
+        if not pinning.active(pin, self.wall()):
+            if self._release_pin(pin["tag"]):
+                self._save_pin(None)
+                self.notifier.event("pin", f"ручной выбор «{name}» снят по истечении срока")
+            return
+        if not signals.xray_ok:
+            return  # перезапуск Xray закрепление сбросит сам — вернём, когда ядро ответит
+        info = pinning.resolve(pin, view)
+        if info is None:
+            if self._release_pin(pin["tag"]):
+                self._save_pin(None)
+                self.notifier.event(
+                    "pin",
+                    f"выбранного вручную сервера «{name}» больше нет среди серверов (убран из "
+                    "подписки или отключён) — сервер снова выбирает шлюз",
+                    notify=True,
+                )
+            return
+        if info.tag != pin["tag"]:
+            pin["tag"] = info.tag
+            self._save_pin(pin)
+        if pin.get("down"):
+            if self._manual_answers(info, applied, observatory):
+                pin["down"] = None
+                self._save_pin(pin)
+                self._hold_pin(info.tag)
+                self.notifier.event(
+                    "pin", f"выбранный вручную сервер «{name}» снова отвечает — трафик опять "
+                    "идёт через него", notify=True,
+                )
+            return
+        entry = observatory.get(info.tag)
+        failed_e2e = not signals.e2e_ok and not self.probe_target and (
+            signals.e2e_fail_streak >= max(1, min(2, self.cfg.watchdog.fail_threshold - 1))
+        )
+        if (entry is not None and entry["alive"] is False) or failed_e2e:
+            pin["down"] = self.wall()
+            self._save_pin(pin)
+            self._pin_recheck_at = self.clock() + PIN_RECHECK
+            self._release_pin(info.tag)
             self.notifier.event(
-                "pin", f"закрепление {pin['tag']} снято: узел больше не участник балансировщика"
+                "pin",
+                f"выбранный вручную сервер «{name}» не отвечает — трафик идёт через серверы, "
+                "выбранные автоматически; когда он снова ответит, шлюз вернётся к нему",
+                notify=True,
             )
             return
+        self._hold_pin(info.tag)
+
+    def _manual_answers(
+        self, info: NodeInfo, applied: dict | None, observatory: dict
+    ) -> bool:
+        """Снова ли отвечает выбранный: участника пробует ядро, запасного — раз в
+        PIN_RECHECK собственная проба (лимитированного — дешёвым запросом, _scan_url)."""
+        entry = observatory.get(info.tag)
+        if info.role == "proxy" and entry is not None:
+            return bool(entry["alive"])
+        if self.clock() < self._pin_recheck_at:
+            return False
+        self._pin_recheck_at = self.clock() + PIN_RECHECK
+        password, _ports = builder.probe_state(applied)
+        if not password or not info.probe_port:
+            return False
+        self._scanned = True
+        result = self._scan(info, password, self._scan_url(info))
+        self.store.save_scan(
+            info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
+            ts=self.wall(),
+        )
+        return result.verdict in REPLACEABLE_VERDICTS
+
+    def _hold_pin(self, tag: str) -> None:
+        """Закрепляет выбранный в ядре, если закрепление сбросилось или указывает не на него."""
         try:
-            self.api.pin(BALANCER_TAG, pin["tag"])
+            if self.api.balancer_state(BALANCER_TAG).override != tag:
+                self.api.pin(BALANCER_TAG, tag)
         except ApiError as exc:
-            self.log.error("закрепление %s не восстановлено: %s", pin["tag"], exc)
+            self.log.error("выбранный вручную сервер %s не закреплён: %s", tag, exc)
+
+    def _release_pin(self, tag: str) -> bool:
+        """Снимает закрепление ядра, если оно — на этом сервере; False — ядро не ответило."""
+        try:
+            override = self.api.balancer_state(BALANCER_TAG).override
+            if override and pinning.same_server(override, tag):
+                self.api.unpin(BALANCER_TAG)
+        except ApiError as exc:
+            self.log.error("закрепление сервера %s не снято: %s", tag, exc)
+            return False
+        return True
 
     # --- основной сервер (watch/speed.py) -------------------------------------------
 
@@ -1600,7 +1728,7 @@ class Daemon:
         ):
             self._release_main()
             return
-        if self._manual_pin() is not None:
+        if self._manual_active():
             return
         if self._main_suspended:
             if not signals.e2e_ok:
@@ -1858,7 +1986,7 @@ class Daemon:
         запущен — сначала узнать у ядра, не осталось ли закрепления от прошлого запуска."""
         if self.main is not None:
             self._set_main(None)
-        if self._main_pinned is False or self._manual_pin() is not None:
+        if self._main_pinned is False or self._manual_active():
             return
         try:
             if self._main_pinned or self.api.balancer_state(BALANCER_TAG).override:
@@ -1869,10 +1997,30 @@ class Daemon:
 
     # --- статус ----------------------------------------------------------------
 
+    def _xray_version(self) -> None:
+        """Перечитывает версию Xray, если файл бинарника сменился (inode, mtime, размер).
+
+        `xray version` запускается только после смены файла, а не на каждом шаге. Версию
+        узнать не удалось — отпечаток не запоминается, и на следующем шаге спросим снова."""
+        try:
+            info = os.stat(self.xray_bin)
+        except OSError as exc:
+            if self._xray_stamp is not None or self.xray_version:
+                self.log.info("бинарник Xray недоступен: %s", exc)
+            self.xray_version, self._xray_stamp = "", None
+            return
+        stamp = (info.st_ino, info.st_mtime_ns, info.st_size)
+        if stamp == self._xray_stamp:
+            return
+        version = binary.installed_version(self.xray_bin)
+        self.xray_version = ".".join(map(str, version or ()))
+        self._xray_stamp = stamp if version else None
+
     def _write_status(
         self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool
     ) -> None:
         state = self.machine.state
+        self._xray_version()
         snapshot = status.collect_status(
             self.cfg, self.paths, view,
             observatory=observatory, xray_ok=xray_ok, state=str(state),

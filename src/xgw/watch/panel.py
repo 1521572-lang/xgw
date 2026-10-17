@@ -39,6 +39,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .. import __version__, actions, config, cost, engine, log, managed, masking, priority
+from .. import pin as pinning
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
@@ -286,14 +287,17 @@ class Panel:
             conn.close()
 
     def _pin(self, now: float) -> dict | None:
-        rows = self._db("SELECT value FROM meta WHERE key = 'pin'")
-        try:
-            pin = json.loads(rows[0]["value"] or "null") if rows else None
-        except json.JSONDecodeError:
+        """Ручной выбор сервера (pin.py): until — null, если бессрочный; down — выбранный
+        не отвечает, трафик ведёт автовыбор."""
+        rows = self._db("SELECT value FROM meta WHERE key = ?", (pinning.META,))
+        pin = pinning.read(rows[0]["value"] if rows else None, now)
+        if pin is None:
             return None
-        if isinstance(pin, dict) and pin.get("tag") and pin.get("until", 0) > now:
-            return {"tag": str(pin["tag"]), "until": float(pin["until"])}
-        return None
+        return {
+            "tag": str(pin["tag"]), "name": str(pin.get("name") or ""),
+            "until": None if pin.get("until") is None else float(pin["until"]),
+            "down": pin.get("down") or None,
+        }
 
     def _selected(self, xray_ok: bool, now: float) -> list[str]:
         """Какой сервер сейчас выбран ядром (или закреплён)."""
@@ -528,7 +532,6 @@ class Panel:
             "removed": gone,
             "sources": sources,
             "pin": self._pin(now),
-            "pin_ttls": list(PIN_TTLS),
             "subscriptions": subscriptions,
             "links": links,
             "lan": {
@@ -811,9 +814,12 @@ class Panel:
                 return actions.disable(cfg, paths, self._capture())
             return actions.Outcome(2, "ожидается on: true или false")
         if name == "pin":
-            tag, ttl = body.get("tag"), body.get("ttl")
-            if not isinstance(tag, str) or ttl not in PIN_TTLS:
-                return actions.Outcome(2, "ожидается тег сервера и срок: " + ", ".join(PIN_TTLS))
+            # Панель выбирает сервер бессрочно, как клиенты VPN; срок — для совместимости.
+            tag, ttl = body.get("tag"), body.get("ttl", pinning.FOREVER)
+            if not isinstance(tag, str) or ttl not in (pinning.FOREVER, *PIN_TTLS):
+                return actions.Outcome(
+                    2, "ожидается тег сервера и срок: " + ", ".join((pinning.FOREVER, *PIN_TTLS)),
+                )
             return actions.pin(cfg, paths, tag, ttl)
         if name == "unpin":
             return actions.unpin(cfg, paths)

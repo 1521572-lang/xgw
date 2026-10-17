@@ -551,8 +551,6 @@ button, textarea, input { font: inherit; color: inherit; }
 
 .dialog::backdrop { background: rgb(0 0 0 / 55%); }
 .dialog h3 { margin-bottom: .5rem; font-size: 1.1rem; }
-.dialog-name { margin-bottom: .5rem; font-weight: 600; overflow-wrap: anywhere; }
-.choices { display: grid; grid-template-columns: repeat(2, 1fr); gap: .5rem; margin-top: .9rem; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
 
 .toasts {
