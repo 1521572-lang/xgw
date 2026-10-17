@@ -483,6 +483,8 @@ class Panel:
                 "quota": quotas.get(sub.name),
                 # Лимит трафика есть (total в subscription-userinfo); иначе — безлимитная.
                 "limited": sub.name in limited,
+                "user_agent": sub.user_agent,
+                "headers": sub.headers,
             })
         links = [
             {
@@ -846,6 +848,27 @@ class Panel:
             self._event(f"подписка «{sub}» убрана из панели")
             self._wake()
             return actions.Outcome(0, f"Подписка «{sub}» убрана")
+        if name == "subscription/edit":
+            sub = body.get("name")
+            if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:
+                return actions.Outcome(
+                    2, "эту подписку панель изменить не может: она вписана в config.toml"
+                )
+            user_agent = body.get("user_agent")
+            headers = body.get("headers")
+            if user_agent is not None and not isinstance(user_agent, str):
+                return actions.Outcome(2, "user_agent должен быть строкой")
+            if headers is not None and not isinstance(headers, dict):
+                return actions.Outcome(2, "headers должен быть объектом")
+            managed.update_subscription(
+                store_path, sub,
+                user_agent=user_agent if user_agent is not None else None,
+                headers=headers if headers is not None else None,
+            )
+            SubscriptionCache(paths.cache_dir).forget(sub)
+            self._event(f"подписка «{sub}» изменена в панели")
+            self._wake()
+            return actions.Outcome(0, f"Подписка «{sub}» изменена — получаю серверы…")
         if name == "link/remove":
             identifier = body.get("id")
             if not isinstance(identifier, str) or not managed.remove_link(store_path, identifier):
@@ -896,8 +919,11 @@ class Panel:
             return actions.Outcome(2, "вставьте адрес подписки или ссылку сервера")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if len(lines) == 1 and lines[0].lower().startswith(("http://", "https://")):
+            user_agent = body.get("user_agent") if isinstance(body.get("user_agent"), str) else ""
+            headers = body.get("headers") if isinstance(body.get("headers"), dict) else {}
             added = managed.add_subscription(
-                store_path, lines[0], name, taken=self._config_names()
+                store_path, lines[0], name, taken=self._config_names(),
+                user_agent=user_agent, headers=headers,
             )
             self._event(f"подписка «{added}» добавлена из панели")
             self._wake()

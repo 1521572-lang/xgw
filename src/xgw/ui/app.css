@@ -360,6 +360,20 @@ button, textarea, input { font: inherit; color: inherit; }
 .row-title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-sub { overflow: hidden; color: var(--muted); font-size: .87rem; text-overflow: ellipsis; }
 .row-error { color: var(--bad); font-size: .87rem; overflow-wrap: anywhere; }
+.row-actions { display: flex; align-items: center; gap: .25rem; flex: none; }
+
+.edit-sub { display: flex; flex-direction: column; gap: .4rem; margin-top: .5rem; }
+.edit-sub label { color: var(--muted); font-size: .87rem; }
+.edit-sub input,
+.edit-sub textarea {
+  width: 100%;
+  padding: .5rem .7rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card-2);
+  color: var(--text);
+  font: inherit;
+}
 
 .tag {
   flex: none;

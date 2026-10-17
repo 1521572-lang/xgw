@@ -79,7 +79,7 @@ def test_junk_inside_the_file_is_ignored(conf):
     data, error = managed.load(managed.path_for(conf))
     assert error == "" and data == {
         "subscriptions": [{"name": "good", "url": "https://g.example.org/s", "user_agent": "",
-                           "refresh_minutes": 60}],
+                           "headers": {}, "refresh_minutes": 60}],
         "links": [links.VMESS],
         "disabled": ["aaaa1111"],  # убранный сервер отключённым уже не считается
         "removed": ["bbbb2222"],
@@ -131,6 +131,43 @@ def test_subscription_names_and_limits(conf):
         managed.add_subscription(path, f"https://n{number}.example.org/s", taken=set())
     with pytest.raises(ManagedError, match="больше нельзя"):
         managed.add_subscription(path, "https://one-more.example.org/s", taken=set())
+
+
+def test_subscription_user_agent_and_headers(conf):
+    path = managed.path_for(conf)
+    name = managed.add_subscription(
+        path, "https://sub.example.org/x", taken=set(),
+        user_agent="Happ/1.0", headers={"X-Custom": "value", "Bad\nHeader": "x"},
+    )
+    data = managed.load(path)[0]
+    assert data["subscriptions"][0] == {
+        "name": name,
+        "url": "https://sub.example.org/x",
+        "user_agent": "Happ/1.0",
+        "headers": {"X-Custom": "value"},
+        "refresh_minutes": 60,
+    }
+    assert managed.update_subscription(path, name, user_agent="New/2.0") is True
+    assert managed.update_subscription(path, "missing", user_agent="x") is False
+    data = managed.load(path)[0]
+    assert data["subscriptions"][0]["user_agent"] == "New/2.0"
+    assert data["subscriptions"][0]["headers"] == {"X-Custom": "value"}
+    assert managed.update_subscription(path, name, headers={"A": "b"}) is True
+    data = managed.load(path)[0]
+    assert data["subscriptions"][0]["headers"] == {"A": "b"}
+
+
+def test_subscription_headers_are_loaded_by_config(conf):
+    _save(conf, {
+        "subscriptions": [
+            {"name": "second", "url": "https://b.example.com/s", "user_agent": "UA/1",
+             "headers": {"X-H": "v"}},
+        ],
+    })
+    cfg, _warnings = config.load(conf)
+    sub = [s for s in cfg.subscriptions if s.name == "second"][0]
+    assert sub.user_agent == "UA/1"
+    assert sub.headers == {"X-H": "v"}
 
 
 def test_links_are_checked_before_saving(conf):

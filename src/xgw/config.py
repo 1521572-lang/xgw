@@ -351,6 +351,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         names.add(item["name"])
         cfg.subscriptions.append(Subscription(
             name=item["name"], url=item["url"], user_agent=item["user_agent"],
+            headers=item.get("headers") or {},
             refresh_minutes=item["refresh_minutes"],
         ))
         cfg.managed.subscriptions.append(item["name"])

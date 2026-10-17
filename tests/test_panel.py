@@ -340,6 +340,7 @@ def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
         "name": "main", "host": "sub.example.net", "secure": True, "managed": False,
         "servers": 4, "fetched": None, "error": "",  # с отключённым, без служебной записи
         "quota": {"upload": 1, "download": 2, "total": 10}, "limited": True,
+        "user_agent": "", "headers": {},
     }]
     assert state["sources"] == ["main", "manual"]
     by_name = {server["name"]: server for server in state["servers"]}
@@ -611,7 +612,8 @@ def test_subscription_is_added_shown_at_once_and_removed(rig, user):
     assert result == {"ok": True, "notes": [],
                       "text": "Подписка «new.example.org» добавлена — получаю серверы…"}
     assert rig.saved()["subscriptions"] == [
-        {"name": "new.example.org", "url": url, "user_agent": "", "refresh_minutes": 60}]
+        {"name": "new.example.org", "url": url, "user_agent": "", "headers": {},
+         "refresh_minutes": 60}]
     assert rig.store_path.stat().st_mode & 0o777 == 0o600
     assert rig.daemon.poke.is_set()  # демон перечитает настройки сразу
     added = user.state()["subscriptions"][1]
@@ -626,6 +628,25 @@ def test_subscription_is_added_shown_at_once_and_removed(rig, user):
     assert rig.saved()["subscriptions"] == []
     assert SubscriptionCache(rig.paths.cache_dir).load("new.example.org") is None
     result = user.act("subscription/remove", {"name": "main"})  # вписана в config.toml
+    assert not result["ok"] and "config.toml" in result["text"]
+
+
+def test_subscription_user_agent_and_headers_are_editable(rig, user):
+    url = "https://new.example.org/sub/ANOTHER-S3CR3T"
+    user.act("add", {"text": url})
+    result = user.act("subscription/edit", {
+        "name": "new.example.org",
+        "user_agent": "Happ/1.0",
+        "headers": {"X-Custom": "value"},
+    })
+    assert result["ok"] and "изменена" in result["text"]
+    assert rig.saved()["subscriptions"][0]["user_agent"] == "Happ/1.0"
+    assert rig.saved()["subscriptions"][0]["headers"] == {"X-Custom": "value"}
+    assert SubscriptionCache(rig.paths.cache_dir).load("new.example.org") is None
+    added = user.state()["subscriptions"][1]
+    assert added["user_agent"] == "Happ/1.0"
+    assert added["headers"] == {"X-Custom": "value"}
+    result = user.act("subscription/edit", {"name": "main", "user_agent": "x"})
     assert not result["ok"] and "config.toml" in result["text"]
 
 

@@ -46,6 +46,7 @@
   };
   const ICONS = {
     remove: ["M6 6l12 12", "M18 6L6 18"],
+    edit: ["M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7", "M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"],
   };
 
   let state = null;
@@ -685,14 +686,67 @@
       const quota = sub.quota ? quotaNode(sub.quota, s.now)
         : sub.fetched ? el("div", { class: "row-sub", text: "Безлимитная: лимит трафика подписка не сообщает" }) : null;
       if (quota) main.append(quota);
-      return el("li", {}, main, sub.managed
-        ? iconButton("remove", `Убрать подписку ${sub.name}`, () => confirmRemove(
+      const actions = el("div", { class: "row-actions" });
+      if (sub.managed) {
+        actions.append(iconButton("edit", `Изменить подписку ${sub.name}`, () => editSubscription(sub)));
+        actions.append(iconButton("remove", `Убрать подписку ${sub.name}`, () => confirmRemove(
           `Убрать подписку «${sub.name}»?`,
           "Её серверы пропадут из списка при следующем обновлении.",
-          () => act("subscription/remove", { name: sub.name })))
-        : null);
+          () => act("subscription/remove", { name: sub.name }))));
+      }
+      return el("li", {}, main, actions);
     });
     fill($("subs"), rows, s.links.length ? "" : "Подписок пока нет. Вставьте адрес подписки в поле выше и нажмите «Добавить».");
+  }
+
+  function editSubscription(sub) {
+    const uaId = "edit-sub-ua";
+    const headersId = "edit-sub-headers";
+    const ua = el("input", {
+      id: uaId,
+      type: "text",
+      spellcheck: false,
+      autocomplete: "off",
+      value: sub.user_agent || "",
+      placeholder: "User-Agent (пусто — по умолчанию xgw/0.1)",
+    });
+    const headers = el("textarea", {
+      id: headersId,
+      rows: 3,
+      spellcheck: false,
+      autocomplete: "off",
+      placeholder: "Дополнительные заголовки, по одному в строке: Name: Value",
+    });
+    try {
+      headers.value = Object.entries(sub.headers || {}).map(([k, v]) => `${k}: ${v}`).join("\n");
+    } catch (error) {
+      headers.value = "";
+    }
+    const body = el("div", { class: "edit-sub" },
+      el("label", { for: uaId, text: "User-Agent" }),
+      ua,
+      el("label", { for: headersId, text: "Заголовки" }),
+      headers
+    );
+    $("edit-sub-title").textContent = `Изменить подписку «${sub.name}»`;
+    $("edit-sub-body").replaceChildren(body);
+    editSubCallback = async () => {
+      const headerObj = {};
+      for (const line of headers.value.split("\n")) {
+        const idx = line.indexOf(":");
+        if (idx > 0) {
+          const key = line.slice(0, idx).trim();
+          const val = line.slice(idx + 1).trim();
+          if (key) headerObj[key] = val;
+        }
+      }
+      return act("subscription/edit", {
+        name: sub.name,
+        user_agent: ua.value.trim(),
+        headers: headerObj,
+      });
+    };
+    $("edit-sub-dialog").showModal();
   }
 
   function renderLinks(s) {
@@ -794,6 +848,7 @@
   // --- окна -----------------------------------------------------------------
 
   let confirmed = null;
+  let editSubCallback = null;
 
   function confirmRemove(title, text, action, yes = "Убрать") {
     $("confirm-title").textContent = title;
@@ -809,6 +864,14 @@
     const action = confirmed;
     confirmed = null;
     if ($("confirm-dialog").returnValue === "yes" && action) action();
+  });
+
+  $("edit-sub-dialog").addEventListener("close", async () => {
+    const cb = editSubCallback;
+    editSubCallback = null;
+    if ($("edit-sub-dialog").returnValue === "save" && cb) {
+      await cb();
+    }
   });
 
   $("power").addEventListener("click", () => {

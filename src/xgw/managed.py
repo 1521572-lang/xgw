@@ -70,10 +70,19 @@ def load(path: Path) -> tuple[dict, str]:
         if not isinstance(name, str) or not isinstance(url, str) or not name or not url:
             continue
         agent, refresh = item.get("user_agent"), item.get("refresh_minutes")
+        headers = item.get("headers")
+        if not isinstance(headers, dict):
+            headers = {}
+        else:
+            headers = {
+                str(k): str(v) for k, v in headers.items()
+                if isinstance(k, (str, int, float)) and isinstance(v, (str, int, float))
+            }
         subscriptions.append({
             "name": name,
             "url": url,
             "user_agent": agent if isinstance(agent, str) else "",
+            "headers": headers,
             "refresh_minutes": refresh
             if isinstance(refresh, int) and not isinstance(refresh, bool) and refresh > 0
             else DEFAULT_REFRESH,
@@ -307,6 +316,30 @@ def _clean_name(name: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f]+", " ", name).strip()[:MAX_NAME].strip()
 
 
+def _clean_header_value(value: str) -> str:
+    value = str(value).strip()
+    # Убираем управляющие символы и обрезаем до разумного размера.
+    value = re.sub(r"[\x00-\x1f\x7f]+", "", value)
+    return value[:512]
+
+
+def _clean_headers(headers: dict[str, str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if not isinstance(headers, dict):
+        return result
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        # Заголовки с управляющими символами (в т. ч. переносом строки) недопустимы в HTTP.
+        if re.search(r"[\x00-\x1f\x7f]", key) or re.search(r"[\x00-\x1f\x7f]", value):
+            continue
+        key = key.strip()[:128]
+        value = value.strip()[:2048]
+        if key and value:
+            result[key] = value
+    return result
+
+
 def _free_name(wanted: str, taken: set[str]) -> str:
     if wanted not in taken:
         return wanted
@@ -318,7 +351,15 @@ def _free_name(wanted: str, taken: set[str]) -> str:
     raise ManagedError("не удалось подобрать имя подписки")
 
 
-def add_subscription(path: Path, url: str, name: str = "", *, taken: set[str]) -> str:
+def add_subscription(
+    path: Path,
+    url: str,
+    name: str = "",
+    *,
+    taken: set[str],
+    user_agent: str = "",
+    headers: dict[str, str] | None = None,
+) -> str:
     """Добавляет подписку и возвращает её имя. taken — имена, занятые в config.toml."""
     url = check_url(url)
     data, error = load(path)
@@ -335,10 +376,38 @@ def add_subscription(path: Path, url: str, name: str = "", *, taken: set[str]) -
     if not name:
         name = _free_name((urlsplit(url).hostname or "sub")[:MAX_NAME], used)
     data["subscriptions"].append(
-        {"name": name, "url": url, "user_agent": "", "refresh_minutes": DEFAULT_REFRESH}
+        {
+            "name": name,
+            "url": url,
+            "user_agent": _clean_header_value(user_agent),
+            "headers": _clean_headers(headers or {}),
+            "refresh_minutes": DEFAULT_REFRESH,
+        }
     )
     save(path, data)
     return name
+
+
+def update_subscription(
+    path: Path,
+    name: str,
+    *,
+    user_agent: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> bool:
+    """Обновляет User-Agent и заголовки управляемой подписки. False — нет такой подписки."""
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    for item in data["subscriptions"]:
+        if item["name"] == name:
+            if user_agent is not None:
+                item["user_agent"] = _clean_header_value(user_agent)
+            if headers is not None:
+                item["headers"] = _clean_headers(headers)
+            save(path, data)
+            return True
+    return False
 
 
 def remove_subscription(path: Path, name: str) -> bool:
