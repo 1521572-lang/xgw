@@ -1,5 +1,6 @@
 """Сборка конфига: карантин доменов, которых нет в DNS, и сводка разбора подписок."""
 
+import base64
 import json
 import logging
 
@@ -7,11 +8,11 @@ import links
 import pytest
 
 from xgw import engine, fetch
-from xgw.config import Config
+from xgw.config import Config, Subscription
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
 from xgw.paths import Paths
-from xgw.store import Store
+from xgw.store import Store, SubscriptionCache
 
 LOG = logging.getLogger("test")
 
@@ -164,3 +165,67 @@ def test_server_list_for_the_panel_names_the_dns_reason(paths, dns):
     engine.save_inventory(paths, Config(), inventory)
     listed = {item["name"]: item["skip"] for item in engine.load_inventory(paths)}
     assert listed == {"🇳🇱 NL-1": "", "FR gone": "dns"}
+
+
+# --- заглушки подписок: служебные адреса не считаются серверами ---------------------
+
+STUB = "vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1?type=tcp#stub"
+
+
+def _subscription_body(*link_list: str) -> bytes:
+    return base64.b64encode("\n".join(link_list).encode("utf-8"))
+
+
+def _stub_fetch(monkeypatch, body: bytes | Exception) -> None:
+    """Подставной запрос подписки: заданное тело ответа или исключение."""
+    def fake(url, **_kwargs):
+        if isinstance(body, Exception):
+            raise body
+        return fetch.FetchResult(status=200, headers={}, body=body, url=url)
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+
+
+def _load_subscription(cache: SubscriptionCache) -> tuple[list, str]:
+    sub = Subscription(name="main", url="https://subs.example.org/token")
+    raws, _userinfo, error = engine._load_subscription(sub, Config(), cache, None, None, LOG)
+    return raws, error
+
+
+def test_subscription_stub_counts_as_failure_and_is_not_cached(tmp_path, monkeypatch):
+    """Заглушка провайдера («сервер» 0.0.0.0:1) — сбой: в кэш не попадает."""
+    cache = SubscriptionCache(tmp_path / "cache")
+    _stub_fetch(monkeypatch, _subscription_body(STUB))
+    raws, error = _load_subscription(cache)
+    assert raws == [] and error
+    assert cache.load("main") is None
+
+
+def test_subscription_stub_keeps_the_last_good_cache(tmp_path, monkeypatch):
+    """После удачной выборки заглушка не затирает кэш: серверы берутся из него."""
+    cache = SubscriptionCache(tmp_path / "cache")
+    _stub_fetch(monkeypatch, _subscription_body(ALIVE))
+    raws, error = _load_subscription(cache)
+    assert [raw.address for raw in raws] == ["alive.example.net"] and error == ""
+
+    _stub_fetch(monkeypatch, _subscription_body(STUB))
+    raws, error = _load_subscription(cache)
+    assert [raw.address for raw in raws] == ["alive.example.net"] and error
+    assert cache.load("main").body == _subscription_body(ALIVE)
+
+
+def test_subscription_with_junk_and_real_servers_keeps_only_real(tmp_path, monkeypatch):
+    """В смешанном ответе служебные адреса отброшены, настоящие серверы остаются."""
+    cache = SubscriptionCache(tmp_path / "cache")
+    _stub_fetch(monkeypatch, _subscription_body(STUB, ALIVE, SERVICE))
+    raws, error = _load_subscription(cache)
+    assert [raw.address for raw in raws] == ["alive.example.net"] and error == ""
+
+
+def test_junk_only_cache_is_a_plain_failure(tmp_path, monkeypatch):
+    """Старый кэш из одной заглушки серверами не считается: честный сбой."""
+    cache = SubscriptionCache(tmp_path / "cache")
+    cache.save("main", _subscription_body(STUB))
+    _stub_fetch(monkeypatch, fetch.FetchError("сеть недоступна"))
+    raws, error = _load_subscription(cache)
+    assert raws == [] and error

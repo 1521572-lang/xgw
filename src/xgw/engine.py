@@ -166,6 +166,14 @@ def collect(
     return inventory
 
 
+def _drop_junk(raws: list[RawServer]) -> list[RawServer]:
+    """Без служебных адресов (0.0.0.0, loopback, порт вне диапазона).
+
+    Провайдеры отмечают заглушку («Приложение не поддерживается!») сервером
+    0.0.0.0:1: без отсева такой ответ выглядит удачным и затирает кэш."""
+    return [raw for raw in raws if not builder.is_junk(raw.address, raw.port)]
+
+
 def _load_subscription(
     sub: config.Subscription,
     cfg: config.Config,
@@ -175,8 +183,8 @@ def _load_subscription(
     logger,
 ) -> tuple[list[RawServer], dict[str, int], str]:
     """Серверы подписки, её квота и причина сбоя (пустая, если запрос удался).
-    Ответ без серверов считается сбоем: тогда берётся последняя удачная версия из
-    кэша, а кэш не перезаписывается."""
+    Ответ без серверов считается сбоем — в том числе заглушка из одних служебных
+    адресов: тогда берётся последняя удачная версия из кэша, а кэш не перезаписывается."""
     label = f"{sub.name} ({masking.mask_url(sub.url)})"
     error = ""
     routes: list[tuple[str, tuple[str, int] | None]] = [("напрямую", None)]
@@ -194,6 +202,7 @@ def _load_subscription(
                 retries=1 if via else 3,
             )
             raws, meta, sub_warnings = parse_body(result.body, sub.name)
+            raws = _drop_junk(raws)
             if not raws:
                 raise ParseError("в ответе нет серверов")
         except (fetch.FetchError, ParseError) as exc:
@@ -220,6 +229,10 @@ def _load_subscription(
         raws, _meta, _warnings = parse_body(cached.body, sub.name)
     except ParseError as exc:
         logger.error("подписка %s: кэш не читается: %s", label, exc)
+        return [], {}, error
+    raws = _drop_junk(raws)
+    if not raws:
+        logger.error("подписка %s: в кэше только служебные адреса", label)
         return [], {}, error
     age_min = max(0, int((time.time() - cached.saved_at) // 60)) if cached.saved_at else 0
     logger.warning(

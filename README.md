@@ -293,7 +293,9 @@ dnsmasq выдаёт один адрес самому роутеру (двойн
   может быть сколько угодно. Туда же вставляются отдельные ссылки серверов
   (`vless://`, `vmess://`, `trojan://`, `ss://`). Видны квота и срок действия,
   когда подписка обновлялась и почему не обновилась. «Обновить» запрашивает все
-  подписки сейчас.
+  подписки сейчас. В «Изменить подписку» задаются User-Agent и заголовки — они
+  нужны провайдерам, которые отдают серверы только «своим» клиентам, например по
+  заголовку `X-HWID` с идентификатором устройства (`docs/HWID-SUBSCRIPTIONS.md`).
 - **Серверы** сгруппированы по подпискам: кто в работе и с какой задержкой, кто
   запасной и чем закончилась его проверка. У каждого сервера:
   - выключатель — **отключить**: сервер остаётся в списке, но шлюз к нему больше
@@ -1102,6 +1104,7 @@ docs/         TEST-REPORT-2026-10-14.md TEST-REPORT-REAL-MACHINE-2026-10-14.md  
               TEST-PLAN-REAL-MACHINE-0.1.4.md   # программа испытаний 0.1.4
               TEST-REPORT-REAL-MACHINE-0.1.4-2026-10-15.md   # её результаты (G1–G7)
               TEST-PLAN-REAL-MACHINE-0.1.5.md   # программа испытаний 0.1.5
+              HWID-SUBSCRIPTIONS.md   # подписки с привязкой к устройству (X-HWID)
 tests/        fixtures/golden/ fakenet.py fakesys.py fakexray.py panel_demo.py test_*.py
 tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
               lan_client.py panel_client.py test_stand.py test_stand_lan.py
@@ -1197,7 +1200,9 @@ tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
   сам, но с ошибкой в TOML продолжает работать на прежних настройках:
   `sudo xgw logs -n 20`.
 - **Подписка отдаёт не то** — панели выбирают формат по User-Agent; задайте
-  `user_agent` в `[[subscriptions]]` (например, `v2rayN/6.0`).
+  `user_agent` в `[[subscriptions]]` (например, `v2rayN/6.0`). Если на месте
+  списка серверов приходит «Приложение не поддерживается!» — провайдер требует
+  идентификатор устройства: `docs/HWID-SUBSCRIPTIONS.md`.
 - **Clash/sing-box подписки не поддерживаются** — это ограничение по ТЗ
   (проверка «заморозки» — только Xray GET-пробами).
 - **hysteria2-ссылки пропускаются с предупреждением** — поля
