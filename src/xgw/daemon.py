@@ -133,6 +133,10 @@ SPEED_BUSY_BPS = 250_000
 # перестал блокировать, они лишние.
 PROFILE_RETRY = 6 * 3600.0
 PROFILE_RECHECK = 24 * 3600.0
+# Незавершённые пробы профилей и время последней смены профиля — в базе (ключ meta), а не только
+# в памяти: иначе после перезапуска демона посреди пробы пробный профиль принимался за выученный
+# (отчёт 0.1.13, наблюдения 2–3), а отсчёт PROFILE_RETRY и PROFILE_RECHECK начинался заново.
+TRIALS_META = "profile_trials"
 SINGBOX_RETRY = 1800.0  # sing-box не поднялся и серверы ушли на Xray — пробовать снова так часто
 
 
@@ -299,6 +303,11 @@ class Daemon:
         self._profile_switched: dict[str, float] = {}
         self._profile_trial: dict[str, ProfileTrial] = {}
         self._profile_wanted: dict[str, ProfileWish] = {}
+        # Пробы, записанные в базе (TRIALS_META): отпечаток → {"profile", "rest", "prev",
+        # "recheck"}. Запись живёт, пока сервер на пробном профиле: её снимает итог пробы, когда
+        # он применён, — а если демон перезапущен раньше, проба продолжается (_resume_trials).
+        self._trial_saved: dict[str, dict] = {}
+        self._load_profiles()
         # sing-box: сколько шагов подряд не отвечает, откатывали ли его на last-good, и
         # ушли ли серверы на Xray, потому что он не поднимается (когда пробовать снова).
         self._singbox_down = 0
@@ -464,6 +473,7 @@ class Daemon:
         self._profile_switched = dict(previous._profile_switched)
         self._profile_trial = dict(previous._profile_trial)
         self._profile_wanted = dict(previous._profile_wanted)
+        self._trial_saved = dict(previous._trial_saved)
         self._singbox_down = previous._singbox_down
         self._singbox_rolled_back = previous._singbox_rolled_back
         self._singbox_failed = previous._singbox_failed
@@ -625,6 +635,9 @@ class Daemon:
             # Xray перезапущен с новым конфигом (или не перезапущен — тогда вместо
             # перехвата загрузится режим «снят»): правила доводятся сразу, а не через шаг.
             self._guard_capture(signals.xray_ok, now, switched=waiting)
+        # Проба профиля, которую прервал перезапуск демона (или итог которой не применился), —
+        # снова в памяти до сканов: иначе скан принял бы пробный профиль за выученный.
+        self._resume_trials()
 
         # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
@@ -1516,11 +1529,15 @@ class Daemon:
                 # Профиль ещё не применён (конфиг ждёт перезапуска): скан — о прежнем.
                 if now - trial.since >= PROFILE_RETRY:
                     del self._profile_trial[fingerprint]
+                    self._forget_trial(fingerprint)
                 return
             if good:
                 del self._profile_trial[fingerprint]
+                self._forget_trial(fingerprint)
                 self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
                 return
+            # Следующая ступень и возврат меняют конфиг: запись о пробе в базе остаётся до их
+            # применения (_profile_step) — перезапуск демона до него продолжит эту же пробу.
             if trial.rest:
                 following = trial.rest[0]
                 self._profile_wanted[fingerprint] = ProfileWish(
@@ -1542,6 +1559,7 @@ class Daemon:
         if good and heavy:
             if last is None:
                 self._profile_switched[fingerprint] = now  # отсчёт до перепроверки — с сейчас
+                self._save_profiles()
             elif now - last >= PROFILE_RECHECK:
                 self._profile_wanted[fingerprint] = ProfileWish(
                     default, True, [], info.profile, recheck=True,
@@ -1585,17 +1603,123 @@ class Daemon:
         now = self.wall()
         for key, wish in wanted.items():
             if now_profiles.get(key) != wish.profile:
-                continue  # не применилось: решение примет следующий скан
+                # Не применилось: решение примет следующий скан. Сервер, который так и остался
+                # на пробном профиле, снова на пробе (_resume_trials) — запись о ней в базе.
+                continue
             self._profile_switched[key] = now
             if wish.trial:
                 info = by_fingerprint[key]
                 self._profile_trial[key] = ProfileTrial(
                     wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
                 )
-                if info.probe_tag in self.scan_queue:
-                    self.scan_queue.remove(info.probe_tag)
-                self.scan_queue.appendleft(info.probe_tag)
+                self._trial_saved[key] = {
+                    "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
+                    "recheck": wish.recheck,
+                }
+                self._queue_first(info.probe_tag)
+            else:
+                self._trial_saved.pop(key, None)  # возврат применён — проба окончена
+        self._save_profiles()
         return changed
+
+    def _queue_first(self, probe_tag: str) -> None:
+        if probe_tag in self.scan_queue:
+            self.scan_queue.remove(probe_tag)
+        self.scan_queue.appendleft(probe_tag)
+
+    def _load_profiles(self) -> None:
+        """Пробы профилей и время смены профиля из базы (TRIALS_META): прошлый запуск демона
+        оставил их там. Записи, которые не разобрать, пропускаются."""
+        raw = self.store.get_meta(TRIALS_META)
+        try:
+            saved = json.loads(raw) if raw else {}
+        except ValueError:
+            self.log.warning("записи о пробах профилей в базе не разобраны — пропущены")
+            return
+        if not isinstance(saved, dict):
+            self.log.warning("записи о пробах профилей в базе не разобраны — пропущены")
+            return
+        skipped = 0
+        trials = saved.get("trials")
+        for key, record in (trials.items() if isinstance(trials, dict) else ()):
+            rest = record.get("rest") if isinstance(record, dict) else None
+            if not isinstance(rest, list) or not all(
+                step in profiling.ALL for step in (record.get("profile"), record.get("prev"), *rest)
+            ):
+                skipped += 1
+                continue
+            self._trial_saved[str(key)] = {
+                "profile": record["profile"], "rest": list(rest), "prev": record["prev"],
+                "recheck": bool(record.get("recheck")),
+            }
+        switched = saved.get("switched")
+        for key, when in (switched.items() if isinstance(switched, dict) else ()):
+            if isinstance(when, (int, float)) and not isinstance(when, bool):
+                self._profile_switched[str(key)] = float(when)
+            else:
+                skipped += 1
+        if skipped:
+            self.log.warning("записей о пробах профилей в базе не разобрано: %d — пропущены",
+                             skipped)
+
+    def _save_profiles(self) -> None:
+        """Записывает пробы и время смены профиля в базу. Серверов, которых нет в подписке,
+        время смены не держит: с подпиской уходят и они."""
+        switched = self._profile_switched
+        if self.inventory is not None:
+            known = {node.fingerprint for node in self.inventory.nodes}
+            switched = {key: when for key, when in switched.items() if key in known}
+            self._profile_switched = dict(switched)
+        self.store.set_meta(
+            TRIALS_META, json.dumps({"trials": self._trial_saved, "switched": switched}),
+        )
+
+    def _forget_trial(self, fingerprint: str) -> None:
+        if self._trial_saved.pop(fingerprint, None) is not None:
+            self._save_profiles()
+
+    def _resume_trials(self) -> None:
+        """Пробы из базы, которых нет в памяти: демон перезапущен посреди пробы или итог пробы
+        не применился. Сервер всё ещё на пробном профиле — проба продолжается с той же ступени
+        (отсчёт заново, скан — первым); ушёл с него (настройки ядра сменились, пока демон
+        стоял, сервер пропал из конфига) — запись снимается."""
+        waiting = [
+            key for key in self._trial_saved
+            if key not in self._profile_trial and key not in self._profile_wanted
+        ]
+        if not waiting or self.inventory is None or self.cfg.fragment.mode != "auto":
+            return
+        applied = engine.read_json(self.paths.xray_config_file)
+        if applied is None:
+            return
+        spares = {
+            info.fingerprint: info for info in builder.applied_nodes(applied, self.inventory.nodes)
+            if info.role == "spare"
+        }
+        names = {node.fingerprint: node.name for node in self.inventory.nodes}
+        now, dropped = self.wall(), False
+        for key in waiting:
+            record, info = self._trial_saved[key], spares.get(key)
+            if info is None or info.profile != record["profile"]:
+                del self._trial_saved[key]
+                dropped = True
+                self.log.info(
+                    "проба профиля «%s» сервера «%s» снята: сервер уже не на нём",
+                    profiling.NAMES[record["profile"]], names.get(key, key[:12]),
+                )
+                continue
+            self._profile_trial[key] = ProfileTrial(
+                record["profile"], list(record["rest"]), record["prev"], info.probe_tag, now,
+                record["recheck"],
+            )
+            self._queue_first(info.probe_tag)
+            self.log.info(
+                "проба профиля «%s» сервера «%s» продолжается (до неё был «%s»)",
+                profiling.NAMES[record["profile"]], names.get(key, info.tag),
+                profiling.NAMES[record["prev"]],
+            )
+        if dropped:
+            self._save_profiles()
 
     # --- sing-box --------------------------------------------------------------
 

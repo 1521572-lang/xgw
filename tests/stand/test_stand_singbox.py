@@ -365,3 +365,60 @@ def test_dual_server_only_singbox_reaches_moves_to_plain_singbox_and_stays(stand
     before = us.connections()
     _pin_and_fetch(stand, "us")
     assert us.connections() > before, "трафик не прошёл через сервер us"
+
+
+def _events(stand: Stand) -> list[str]:
+    """Все события журнала — из базы шлюза (статус показывает только последние 10)."""
+    from xgw.paths import Paths
+    from xgw.store import Store
+
+    store = Store(Paths(stand.root).db_file)
+    try:
+        return [event["detail"] for event in store.recent_events(500)]
+    finally:
+        store.close()
+
+
+def test_daemon_restart_in_the_middle_of_the_ladder_continues_it(stand):
+    """0.1.14 (отчёт 0.1.13, наблюдения 2–3). Демон перезапущен, пока сервер на пробном профиле
+    лестницы: проба записана в базе, и новый демон продолжает её с той же ступени. Сервер обоих
+    ядер со stale_pin (Xray не подключается ни в каком профиле, sing-box — да) закрепляется на
+    обычном sing-box «(был «Xray»)»: пробный профиль Xray с дроблением не принят за выученный, и
+    лестница не начата с него заново. Ядра при перезапуске демона не перезапускаются."""
+    stand.add_server("us", tls=True, stale_pin=True)
+    # Шаг watchdog 10 с: проба нового профиля сканируется на следующем шаге после перевода, и за
+    # этот шаг демон успевает остановиться посреди пробы.
+    _config(stand, (*stand.names, "us"), max_members=2, watchdog_s=10)
+    result = stand.xgw("apply", "--now")
+    assert result.returncode == 0, result.stdout + result.stderr + stand.xray_log()
+    xray_pid, singbox_pid = stand.xray_pid(), stand.singbox_pid()
+    daemon = stand.start_daemon()
+
+    def on_trial():
+        status = stand.xgw_json("status")
+        entry = _entry(status, "us") if status.get("daemon") else None
+        return entry if entry and entry["profile"] == "xray:fragment" else None
+
+    entry = wait_for(on_trial, 360, step=1)
+    assert entry, stand.tail("daemon", 120)
+    daemon.terminate()
+    daemon.wait(timeout=30)
+    assert not any("закреплён" in text for text in _events(stand)), (
+        "проба закончилась до перезапуска демона", _events(stand)[:20])
+    first_log = stand.tail("daemon", 400)
+    stand.start_daemon()
+
+    def kept():
+        found = [text for text in _events(stand) if "закреплён" in text]
+        return found or None
+
+    found = wait_for(kept, 240, step=2)
+    assert found, stand.tail("daemon", 120)
+    assert any("отвечает на профиле «sing-box» — он закреплён (был «Xray»)" in text
+               for text in found), found
+    assert not any("был «Xray с дроблением ClientHello»" in text for text in found), found
+    log = stand.tail("daemon", 400)
+    resumed = r"проба профиля «Xray с дроблением ClientHello» сервера .* продолжается"
+    assert re.search(resumed, log), first_log + "\n----\n" + log
+    assert _entry(stand.xgw_json("status"), "us")["profile"] == "singbox:default"
+    assert stand.xray_pid() == xray_pid and stand.singbox_pid() == singbox_pid

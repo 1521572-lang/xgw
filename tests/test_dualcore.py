@@ -10,7 +10,7 @@ from test_daemon import Harness
 
 from xgw import engine, managed
 from xgw.config import Config
-from xgw.daemon import PROFILE_RECHECK, PROFILE_RETRY, SINGBOX_RETRY
+from xgw.daemon import PROFILE_RECHECK, PROFILE_RETRY, SINGBOX_RETRY, TRIALS_META
 from xgw.generator import builder, profiles
 from xgw.generator import fragment as fragmenting
 from xgw.generator import singbox as singboxing
@@ -117,6 +117,20 @@ Dual._profile_trial_tags = lambda self: {t.probe_tag for t in self._profile_tria
 def _has(daemon: Dual, text: str) -> bool:
     """Есть ли среди событий журнала такое (события хранятся как «вид: текст»)."""
     return any(text in event for event in daemon.events())
+
+
+def _restart(daemon: Dual) -> Dual:
+    """Демон перезапущен: память пуста, остались база, конфиги ядер и подписка. Первый шаг
+    нового демона получает подписку и собирает конфиг заново."""
+    again = Dual(daemon.cfg, daemon.paths)
+    again.t = daemon.t
+    again.table = daemon.table
+    return again
+
+
+def _saved(daemon: Dual) -> dict:
+    """Записи о пробах профилей и времени смены профиля в базе."""
+    return json.loads(daemon.store.get_meta(TRIALS_META) or "{}")
 
 
 # --- сборка ------------------------------------------------------------------------------
@@ -454,6 +468,152 @@ def test_without_the_core_snapshot_plain_singbox_is_not_taken_for_learned(dual):
     dual.store.set_meta(profiles.CORE_META, "")
     engine.persist(dual.paths, assembly, {}, applied=False)
     assert dual.store.get_meta(profiles.CORE_META) == ""
+
+
+# --- перезапуск демона посреди пробы (отчёт 0.1.13) ---------------------------------------
+
+
+def _to_plain_singbox_trial(daemon: Dual):
+    """Запасной обоих ядер не отвечает ни на одном профиле; два шага — и он на пробе обычного
+    sing-box (после «пробую «sing-box»»)."""
+    _start(daemon)
+    spare = daemon.spares(capability="dual", tls=True)[0]
+    daemon.table[spare.probe_tag] = {"*": "TIMEOUT"}
+    _rescan(daemon)
+    daemon.tick()
+    daemon.tick()
+    assert daemon.profile(spare) == "singbox:default"
+    assert spare.probe_tag in daemon._profile_trial_tags()
+    return spare
+
+
+def test_a_restart_in_the_middle_of_a_trial_continues_the_ladder(dual):
+    """Отчёт 0.1.13, наблюдения 2–3: проба профиля жила только в памяти демона. После перезапуска
+    посреди лестницы пробный профиль принимался за выученный: сервер оставался на неработающем
+    [sb], следующая лестница начиналась с него и при провале «возвращала» сервер на sing-box.
+    Теперь проба записана в базе: новый демон доводит лестницу до конца — сервер на Xray."""
+    spare = _to_plain_singbox_trial(dual)
+    record = _saved(dual)["trials"][spare.fingerprint]
+    assert record == {"profile": "singbox:default", "rest": ["singbox:tls_fragment"],
+                      "prev": "xray:default", "recheck": False}
+    again = _restart(dual)
+    third = None
+    try:
+        # Первый шаг: подписка и сборка (профиль тот же), проба продолжается — скан той же
+        # ступени идёт первым и может уже перевести сервер на следующую.
+        again.tick()
+        assert again.profile(spare) in ("singbox:default", "singbox:tls_fragment")
+        again.set_alive()
+        seen = _walk(again, spare, until="xray:default")
+        assert seen[-1] == "xray:default", seen
+        probed = [profile for tag, profile in again.seen if tag == spare.probe_tag]
+        assert probed[:2] == ["singbox:default", "singbox:tls_fragment"], probed
+        assert "xray:default" not in probed[:2]  # лестница не начиналась заново с [sb]
+        assert _has(again, "не отвечает на профиле «sing-box» — пробую «sing-box с дроблением TLS»")
+        assert _has(again, "не отвечает ни на одном профиле — возвращён «Xray»")
+        assert not _has(again, "возвращён «sing-box»")
+        assert not again._profile_trial and _saved(again)["trials"] == {}
+        # Следующая попытка — через 6 ч и после ещё одного перезапуска: время смены профиля
+        # тоже в базе.
+        third = _restart(again)
+        third.tick()
+        third.set_alive()
+        _rescan(third)
+        third.tick()
+        assert third.profile(spare) == "xray:default"
+        third.t += PROFILE_RETRY
+        _rescan(third)
+        third.tick()
+        assert third.profile(spare) == "xray:fragment"
+    finally:
+        again.store.close()
+        if third is not None:
+            third.store.close()
+
+
+def test_a_trial_record_is_dropped_when_the_server_left_the_trial_profile(dual):
+    """Пока демон стоял, ядро сервера закрепили (`xgw core … xray`): сборка нового демона ставит
+    его на Xray, и запись о пробе обычного sing-box снимается — лестница не продолжается."""
+    spare = _to_plain_singbox_trial(dual)
+    dual.cfg.managed.core[spare.fingerprint] = "xray"
+    again = _restart(dual)
+    try:
+        again.tick()
+        again.set_alive()
+        assert again.profile(spare) == "xray:default"
+        assert spare.fingerprint not in again._profile_trial
+        assert _saved(again)["trials"] == {}
+        again.tick()
+        assert again.profile(spare) == "xray:default"
+    finally:
+        again.store.close()
+
+
+def test_a_trial_survives_a_step_that_did_not_apply(dual):
+    """Следующая ступень не применилась (Xray отверг конфиг): сервер остался на пробном профиле,
+    и проба продолжается — а не застревает на нём как на выученном до PROFILE_RETRY."""
+    _start(dual)
+    spare = dual.spares(capability="dual", tls=True)[0]
+    dual.table[spare.probe_tag] = {"*": "TIMEOUT"}
+    _rescan(dual)
+    dual.tick()
+    assert dual.profile(spare) == "xray:fragment"
+    dual.apply_mode = "rejected"
+    dual.tick()
+    assert dual.profile(spare) == "xray:fragment"
+    assert _saved(dual)["trials"][spare.fingerprint]["profile"] == "xray:fragment"
+    dual.apply_mode = "api"
+    seen = _walk(dual, spare, until="xray:default")
+    assert seen[-1] == "xray:default" and "singbox:default" in seen, seen
+    assert _has(dual, "не отвечает ни на одном профиле — возвращён «Xray»")
+    assert not _has(dual, "возвращён «Xray с дроблением ClientHello»")
+    assert _saved(dual)["trials"] == {}
+
+
+def test_a_restart_during_the_daily_recheck_returns_the_learned_profile(dual):
+    """Суточная проверка сервера на базе прервана перезапуском: проба продолжается, и, если база
+    не отвечает, сервер возвращается на выученный профиль, а не остаётся на базе."""
+    _start(dual)
+    spare = dual.spares(capability="dual", tls=True)[0]
+    dual.table[spare.probe_tag] = {"xray:default": "FROZEN"}
+    _rescan(dual)
+    dual.tick()
+    dual.tick()
+    assert dual.profile(spare) == "xray:fragment" and not dual._profile_trial
+    dual.t += PROFILE_RECHECK
+    _rescan(dual)
+    dual.tick()
+    assert dual.profile(spare) == "xray:default"
+    assert _saved(dual)["trials"][spare.fingerprint]["recheck"] is True
+    again = _restart(dual)
+    try:
+        again.tick()
+        again.set_alive()
+        again.tick()
+        assert again.profile(spare) == "xray:fragment"
+        assert _has(again, "без дробления ClientHello не отвечает — оно включено снова")
+        assert _saved(again)["trials"] == {}
+    finally:
+        again.store.close()
+
+
+def test_broken_trial_records_are_skipped(dual):
+    """Запись в базе испорчена (ручная правка, другая версия): демон пропускает то, что не
+    разобрать, и работает."""
+    good = {"profile": "singbox:default", "rest": [], "prev": "xray:default", "recheck": 0}
+    raw = json.dumps({"trials": {"a": good, "b": {"profile": "mihomo", "rest": [], "prev": "x"},
+                                 "c": "сломано", "d": {**good, "rest": "не список"}},
+                      "switched": {"a": 5, "b": "вчера", "c": True}})
+    cases = [(raw, {"a": {**good, "recheck": False}}, {"a": 5.0})] + [
+        (broken, {}, {}) for broken in ("не json", "[]", "")
+    ]
+    for text, trials, switched in cases:
+        dual.store.set_meta(TRIALS_META, text)
+        again = _restart(dual)
+        try:
+            assert again._trial_saved == trials and again._profile_switched == switched, text
+        finally:
+            again.store.close()
 
 
 # --- sing-box занят трафиком --------------------------------------------------------------
