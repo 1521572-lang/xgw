@@ -219,17 +219,19 @@ def test_frozen_spare_climbs_the_ladder_to_the_first_profile_that_answers(dual):
     spare = dual.spares(capability="dual", tls=True)[0]
     dual.table[spare.probe_tag] = {
         "xray:default": "FROZEN", "xray:fragment": "STALL_BEFORE_BODY",
-        "singbox:tls_fragment": "FROZEN", "singbox:mux_padded": "OK",
+        "singbox:default": "FROZEN", "singbox:tls_fragment": "FROZEN",
+        "singbox:mux_padded": "OK",
     }
     _rescan(dual)
-    seen = [dual.tick() and dual.profile(spare) for _ in range(5)]
-    assert seen[:4] == ["xray:fragment", "singbox:tls_fragment", "singbox:mux_padded",
-                        "singbox:mux_padded"]
+    seen = [dual.tick() and dual.profile(spare) for _ in range(6)]
+    assert seen[:5] == ["xray:fragment", "singbox:default", "singbox:tls_fragment",
+                        "singbox:mux_padded", "singbox:mux_padded"]
     probed = [profile for tag, profile in dual.seen if tag == spare.probe_tag]
-    assert probed[:4] == ["xray:default", "xray:fragment", "singbox:tls_fragment",
-                          "singbox:mux_padded"]
+    assert probed[:5] == ["xray:default", "xray:fragment", "singbox:default",
+                          "singbox:tls_fragment", "singbox:mux_padded"]
     assert _has(dual, "не отвечает на профиле «Xray с дроблением ClientHello» — пробую "
-                      "«sing-box с дроблением TLS»")
+                      "«sing-box»")
+    assert _has(dual, "не отвечает на профиле «sing-box» — пробую «sing-box с дроблением TLS»")
     assert _has(dual, "отвечает на профиле «sing-box с мультиплексированием и паддингом» — "
                       "он закреплён")
     # Всё прошло заменами outbound'ов в Xray: конфиг sing-box записан один раз (при запуске).
@@ -243,10 +245,12 @@ def test_a_refused_connection_gets_one_try_per_core_then_waits_six_hours(dual):
     spare = dual.spares(capability="dual", tls=True)[0]
     dual.table[spare.probe_tag] = {"*": "CONNECT_FAIL"}
     _rescan(dual)
-    profiles_seen = [dual.tick() and dual.profile(spare) for _ in range(4)]
-    assert profiles_seen[:3] == ["xray:fragment", "singbox:tls_fragment", "xray:default"]
+    profiles_seen = [dual.tick() and dual.profile(spare) for _ in range(5)]
+    assert profiles_seen[:4] == ["xray:fragment", "singbox:default", "singbox:tls_fragment",
+                                 "xray:default"]
     probed = [profile for tag, profile in dual.seen if tag == spare.probe_tag]
-    assert probed == ["xray:default", "xray:fragment", "singbox:tls_fragment"]  # без mux
+    assert probed == ["xray:default", "xray:fragment", "singbox:default",
+                      "singbox:tls_fragment"]  # без mux
     assert _has(dual, "не отвечает ни на одном профиле — возвращён «Xray»")
     applied = len(dual.applied)
     dual.t += 3600
@@ -331,9 +335,9 @@ def test_a_learned_profile_survives_a_rebuild_and_a_restart(dual):
     _start(dual)
     spare = dual.spares(capability="dual", tls=True)[0]
     dual.table[spare.probe_tag] = {"xray:default": "FROZEN", "xray:fragment": "FROZEN",
-                                   "singbox:tls_fragment": "OK"}
+                                   "singbox:default": "FROZEN", "singbox:tls_fragment": "OK"}
     _rescan(dual)
-    for _ in range(4):
+    for _ in range(5):
         dual.tick()
     assert dual.profile(spare) == "singbox:tls_fragment"
     dual._rebuild(None, urgent=False, reason="обновление подписки")
@@ -341,6 +345,115 @@ def test_a_learned_profile_survives_a_rebuild_and_a_restart(dual):
     again = Dual(dual.cfg, dual.paths)
     again.inventory = dual.inventory
     assert again.profile(spare) == "singbox:tls_fragment"
+
+
+def test_a_dual_spare_that_answers_only_on_plain_singbox_moves_there_and_stays(dual):
+    """Отчёт 0.1.12: часть серверов, которые на Xray не отвечали, ответили на обычном sing-box.
+    Шлюз сам переводит такой сервер на sing-box — ступень между дроблением Xray и дроблением
+    sing-box, — и профиль переживает пересборку и перезапуск демона."""
+    from xgw.watch import status
+
+    _start(dual)
+    spare = dual.spares(capability="dual", tls=True)[0]
+    dual.table[spare.probe_tag] = {"xray:default": "TIMEOUT", "xray:fragment": "TIMEOUT"}
+    _rescan(dual)
+    seen = _walk(dual, spare, until="singbox:default")
+    assert seen[-1] == "singbox:default" and "singbox:tls_fragment" not in seen, seen
+    assert not dual._profile_trial
+    assert _has(dual, "не отвечает на профиле «Xray с дроблением ClientHello» — пробую "
+                      "«sing-box»")
+    assert _has(dual, "отвечает на профиле «sing-box» — он закреплён (был «Xray»)")
+    # Сборка по обновлению подписки и сборка после перезапуска демона его не сбрасывают.
+    dual._rebuild(None, urgent=False, reason="обновление подписки")
+    assert dual.profile(spare) == "singbox:default"
+    again = Dual(dual.cfg, dual.paths)
+    try:
+        again.inventory = dual.inventory
+        again._rebuild(None, urgent=True, reason="перезапуск")
+        assert again.profile(spare) == "singbox:default"
+    finally:
+        again.store.close()
+    # Метки: [sb] в `xgw servers`; профиль и ядро — в статусе, откуда их берёт и панель.
+    snapshot = dual.status()
+    entry = next(item for item in snapshot["spares"] if item["tag"] == spare.tag)
+    assert entry["profile"] == "singbox:default" and entry["core"] == "sing-box"
+    line = next(text for text in status.render_servers(snapshot).splitlines()
+                if spare.tag in text)
+    assert "[sb]" in line, line
+
+
+def test_plain_singbox_is_checked_on_the_base_daily_like_the_other_learned(dual):
+    _start(dual)
+    spare = dual.spares(capability="dual", tls=True)[0]
+    dual.table[spare.probe_tag] = {"xray:default": "CONNECT_FAIL", "xray:fragment": "CONNECT_FAIL"}
+    _rescan(dual)
+    _walk(dual, spare, until="singbox:default")
+    assert dual.profile(spare) == "singbox:default" and not dual._profile_trial
+    dual.t += 12 * 3600
+    _rescan(dual)
+    dual.tick()
+    assert dual.profile(spare) == "singbox:default"  # до суток не трогается
+    # Сутки — проверка на базе. Xray по-прежнему не отвечает: сервер возвращается на sing-box.
+    dual.t += PROFILE_RECHECK
+    _rescan(dual)
+    dual.tick()
+    assert dual.profile(spare) == "xray:default"
+    dual.tick()
+    assert dual.profile(spare) == "singbox:default"
+    assert _has(dual, "на профиле «Xray» не отвечает — возвращён «sing-box»")
+    # Блокировка ушла: на следующей суточной проверке сервер остаётся на Xray.
+    dual.table[spare.probe_tag] = {}
+    dual.t += PROFILE_RECHECK
+    _rescan(dual)
+    dual.tick()
+    dual.tick()
+    assert dual.profile(spare) == "xray:default"
+    assert _has(dual, "отвечает и на профиле «Xray» — он возвращён (был «sing-box»)")
+
+
+def test_plain_singbox_from_a_pin_or_the_mode_is_not_kept_once_the_gateway_chooses(dual):
+    """Обычный sing-box дают и настройки: `xgw core … sing-box` и [core] mode = "sing-box". После
+    `xgw core … auto` и возврата mode = "auto" сервер — снова на базе, а не «выученный»."""
+    _start(dual)
+    spare = dual.spares(capability="dual")[0]
+    dual.cfg.managed.core[spare.fingerprint] = "sing-box"
+    dual._rebuild_asked = True
+    dual.tick()
+    assert dual.profile(spare) == "singbox:default"
+    del dual.cfg.managed.core[spare.fingerprint]  # xgw core … auto
+    dual._rebuild_asked = True
+    dual.tick()
+    assert dual.profile(spare) == "xray:default"
+    duals = [info for info in dual.view() if dual.node(info).capability == "dual"]
+    dual.cfg.core.mode = "sing-box"
+    dual._rebuild_asked = True
+    dual.tick()
+    assert duals and all(dual.profile(info) == "singbox:default" for info in duals)
+    dual.cfg.core.mode = "auto"
+    dual._rebuild_asked = True
+    dual.tick()
+    assert all(dual.profile(info) == "xray:default" for info in duals)
+
+
+def test_without_the_core_snapshot_plain_singbox_is_not_taken_for_learned(dual):
+    """Обновление с 0.1.12: снимка настроек ядра в базе нет — обычный sing-box у сервера с базой
+    Xray считается следом настроек, как в 0.1.12. Снимок пишет только применённая сборка."""
+    _start(dual)
+    spare = dual.spares(capability="dual", tls=True)[0]
+    dual.table[spare.probe_tag] = {"xray:default": "TIMEOUT", "xray:fragment": "TIMEOUT"}
+    _rescan(dual)
+    _walk(dual, spare, until="singbox:default")
+    assert dual.profile(spare) == "singbox:default"
+    assert json.loads(dual.store.get_meta(profiles.CORE_META)) == {"mode": "auto", "pins": {}}
+    dual.store.set_meta(profiles.CORE_META, "")
+    dual._rebuild(None, urgent=False, reason="обновление подписки")
+    assert dual.profile(spare) == "xray:default"
+    assert dual.store.get_meta(profiles.CORE_META)  # записан заново
+    # `xgw generate` пишет конфиг в отдельный файл — снимок он не трогает.
+    assembly = dual._assemble(None)
+    dual.store.set_meta(profiles.CORE_META, "")
+    engine.persist(dual.paths, assembly, {}, applied=False)
+    assert dual.store.get_meta(profiles.CORE_META) == ""
 
 
 # --- sing-box занят трафиком --------------------------------------------------------------
@@ -547,8 +660,14 @@ def test_profile_rules_for_the_five_profiles():
         profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT]
     # Обученный профиль сохраняется, пока он допустим; настроечный (база) следует за настройками.
     assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_MUX) == profiles.SB_MUX
+    # Обычный sing-box у сервера с базой Xray (0.1.13) — выученный, пока ядро сервера в
+    # настройках то же, что при прошлой сборке; иначе его дало закрепление — сервер на базу.
     assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_DEFAULT) == (
-        profiles.XRAY_DEFAULT)
+        profiles.SB_DEFAULT)
+    assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_DEFAULT,
+                            same_pin=False) == profiles.XRAY_DEFAULT
+    assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_MUX,
+                            same_pin=False) == profiles.SB_MUX  # прочие выученные — как в 0.1.12
     cfg.core.mode = "xray"
     cfg.managed.core[dual_node.fingerprint] = "xray"
     assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_MUX) == (
@@ -569,6 +688,38 @@ def test_ladder_orders_and_filters_the_steps():
         profiles.XRAY_DEFAULT, profiles.SB_FRAGMENT, profiles.SB_MUX]
     assert profiles.ladder("FROZEN", profiles.SB_MUX, base, avail) == [profiles.XRAY_DEFAULT]
     assert profiles.ladder("TIMEOUT", base, base, [profiles.XRAY_DEFAULT]) == []
+    # 0.1.13: обычный sing-box — между дроблением Xray и дроблением sing-box, для обоих вердиктов.
+    full = [profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT, profiles.SB_DEFAULT,
+            profiles.SB_FRAGMENT, profiles.SB_MUX]
+    assert profiles.ladder("STALL_BEFORE_BODY", base, base, full) == [
+        profiles.XRAY_FRAGMENT, profiles.SB_DEFAULT, profiles.SB_FRAGMENT, profiles.SB_MUX]
+    assert profiles.ladder("TIMEOUT", base, base, full) == [
+        profiles.XRAY_FRAGMENT, profiles.SB_DEFAULT, profiles.SB_FRAGMENT]
+    # На обычном sing-box перестал отвечать: сначала база, потом дальше по лестнице.
+    assert profiles.ladder("CONNECT_FAIL", profiles.SB_DEFAULT, base, full) == [
+        profiles.XRAY_DEFAULT, profiles.SB_FRAGMENT]
+    # У сервера только для sing-box обычный sing-box — база: лестница с неё не начинается заново.
+    only_sb = [profiles.SB_DEFAULT, profiles.SB_FRAGMENT]
+    assert profiles.ladder("FROZEN", profiles.SB_DEFAULT, profiles.SB_DEFAULT, only_sb) == [
+        profiles.SB_FRAGMENT]
+
+
+def test_core_settings_snapshot_tells_a_pin_from_learning():
+    cfg = Config()
+    fingerprint = "aaaa1111bbbb2222"
+    saved = profiles.core_settings(cfg)
+    assert saved == {"mode": "auto", "pins": {}}
+    assert profiles.pin_unchanged(cfg, saved, fingerprint)
+    assert not profiles.pin_unchanged(cfg, None, fingerprint)  # снимка нет — как в 0.1.12
+    cfg.managed.core[fingerprint] = "sing-box"
+    assert not profiles.pin_unchanged(cfg, saved, fingerprint)
+    assert profiles.pin_unchanged(cfg, saved, "cccc3333dddd4444")  # чужое закрепление не в счёт
+    pinned = profiles.core_settings(cfg)
+    cfg.managed.core.clear()
+    cfg.core.mode = "sing-box"
+    assert profiles.pin_unchanged(cfg, pinned, fingerprint)  # и так, и так — sing-box
+    assert not profiles.pin_unchanged(cfg, saved, "cccc3333dddd4444")
+    assert not profiles.pin_unchanged(cfg, {"mode": "auto", "pins": "сломано"}, fingerprint)
 
 
 def test_builder_info_reads_the_profile_from_the_outbound(dual):

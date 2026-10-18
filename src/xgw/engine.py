@@ -67,6 +67,9 @@ class Assembly:
     verdict: bool | None  # итог xray run -test; None — проверка не выполнялась
     invalid: int = 0  # сколько серверов отброшено: их конфиг установленный Xray не принимает
     singbox: SingboxChange | None = None
+    # Настройки ядра, по которым собран конфиг (profiles.core_settings): persist пишет их в
+    # базу, следующая сборка по ним отличает выученный обычный sing-box от закреплённого.
+    core: dict = field(default_factory=dict)
 
 
 def bypass_mark(cfg: config.Config, logger) -> int | None:
@@ -308,7 +311,8 @@ def assemble(
     reserve — отпечаток резервного выхода (его выбирает демон по дешёвой проверке).
     profiles — решения демона о профилях обхода (generator/profiles.py): отпечаток →
     профиль. У остальных серверов профиль — как в применённом конфиге, если сервер обучен
-    блокировкой (дробление, sing-box), иначе по настройкам. fragment — то же для дробления
+    блокировкой (дробление, sing-box; обычный sing-box у сервера с базой Xray — если его ядро
+    в настройках не менялось с прошлой сборки), иначе по настройкам. fragment — то же для дробления
     ClientHello (xray:fragment) в прежней записи: набор отпечатков.
     singbox_ok — доступен ли sing-box (по умолчанию: включён в [core] и установлен).
     reload_singbox — перечитать ли конфиг sing-box сейчас. Перечитывание рвёт все
@@ -328,6 +332,7 @@ def assemble(
     if reserve is None:
         reserve = builder.reserve_fingerprint(applied, inventory.nodes)
     current = builder.applied_profiles(applied, inventory.nodes)
+    saved_core = _saved_core(paths)
     decided = dict(profiles or {})
     for fingerprint in fragment or ():
         decided.setdefault(fingerprint, profiling.XRAY_FRAGMENT)
@@ -411,6 +416,7 @@ def assemble(
             node.fingerprint: profiling.resolve(
                 node, cfg, effective.letters(node.fingerprint) if effective else (),
                 current=current.get(node.fingerprint), override=decided.get(node.fingerprint),
+                same_pin=profiling.pin_unchanged(cfg, saved_core, node.fingerprint),
             )
             for node in ordered
         }
@@ -430,8 +436,9 @@ def assemble(
                 1 for info in result.nodes if profiling.core_of(info.profile) == "sing-box"
             ),
         )
+        core = profiling.core_settings(cfg)
         if not check:
-            return Assembly(result, selection, None, len(rejected), change)
+            return Assembly(result, selection, None, len(rejected), change, core)
         if plan is not None and sb_bin is not None:
             change.verdict, sb_output = singboxing.validate_config(plan.config, sb_bin)
             if change.verdict is False:
@@ -454,7 +461,7 @@ def assemble(
                 continue
         verdict, output = validate.validate_config(result.config, xray_bin)
         if verdict is not False:
-            return Assembly(result, selection, verdict, len(rejected), change)
+            return Assembly(result, selection, verdict, len(rejected), change, core)
         # Конфиг не прошёл: ищем серверы, которые установленный Xray не принимает
         # (снятый транспорт, неизвестный шифр), и собираем конфиг без них.
         newly = _reject_invalid(result, xray_bin, logger) - rejected
@@ -488,6 +495,23 @@ def _carrying_tags(paths: Paths, applied: dict | None) -> set[str]:
             and pinning.same_server(str(outbound.get("tag") or ""), str(chosen.get("tag") or ""))
         )
     return {tag for tag in tags if tag}
+
+
+def _saved_core(paths: Paths) -> dict | None:
+    """Настройки ядра, по которым собран применённый конфиг (persist); None — их нет."""
+    try:
+        store = Store(paths.db_file)
+        try:
+            raw = store.get_meta(profiling.CORE_META)
+        finally:
+            store.close()
+    except Exception:  # базы нет или она не читается — считаем, что настройки сменились
+        return None
+    try:
+        saved = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return saved if isinstance(saved, dict) else None
 
 
 def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:
@@ -609,8 +633,11 @@ def persist(
     quotas: dict[str, dict[str, int]],
     *,
     record_event: bool = True,
+    applied: bool = True,
 ) -> None:
-    """Записывает в SQLite состав узлов последней сборки и квоты подписок."""
+    """Записывает в SQLite состав узлов последней сборки и квоты подписок. applied — конфиг
+    стал рабочим: тогда и снимок настроек ядра, по которым он собран (`xgw generate` пишет
+    конфиг в отдельный файл — снимок у него не пишется)."""
     result = assembly.result
     nodes = [*assembly.selection.members, *assembly.selection.spares]
     by_fingerprint = {node.fingerprint: node for node in nodes}
@@ -638,6 +665,8 @@ def persist(
             store.prune_scans({info.probe_tag for info in result.nodes})
             store.set_meta("quota", json.dumps(quotas, ensure_ascii=False))
             store.set_meta("nodes_summary", json.dumps(summary(assembly)))
+            if applied and assembly.core:
+                store.set_meta(profiling.CORE_META, json.dumps(assembly.core))
             if record_event:
                 store.add_event(
                     "generate", f"участников: {members}, запасных: {len(entries) - members}"

@@ -895,6 +895,14 @@ def test_diag_after_install_and_log_export_without_secrets(gw):
 
     exported = _xgw(gw, "logs", "--export", "--out", "/var/local/xgw-logs.tar.gz")
     assert exported.returncode == 0, exported.stderr
+    # Под sudo (SUDO_UID/SUDO_GID) архив отдаётся вызвавшему: открыть его можно без sudo.
+    owner = box.sh(
+        "SUDO_UID=4321 SUDO_GID=4322 /usr/local/bin/xgw logs --export "
+        "--out /var/local/xgw-sudo.tar.gz >/dev/null && "
+        "stat -c '%u:%g %a' /var/local/xgw-sudo.tar.gz && rm -f /var/local/xgw-sudo.tar.gz",
+        timeout=180,
+    )
+    assert owner.strip() == "4321:4322 600", owner
     data = (box.root / "var/local/xgw-logs.tar.gz").read_bytes()
     members: dict[str, str] = {}
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:

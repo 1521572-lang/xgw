@@ -563,6 +563,49 @@ def test_archive_members_are_private(tmp_path):
     assert io.BytesIO(path.read_bytes()).read(2) == b"\x1f\x8b"
 
 
+def test_sudo_owner_comes_from_sudo_uid_and_gid_only_for_root(monkeypatch):
+    monkeypatch.setattr(logs.os, "geteuid", lambda: 0)
+    assert logs.sudo_owner({"SUDO_UID": "1000", "SUDO_GID": "1001"}) == (1000, 1001)
+    assert logs.sudo_owner({"SUDO_UID": "1000"}) == (1000, -1)  # группа не меняется
+    assert logs.sudo_owner({}) is None  # root без sudo
+    assert logs.sudo_owner({"SUDO_UID": "0", "SUDO_GID": "0"}) is None  # sudo от root
+    assert logs.sudo_owner({"SUDO_UID": "user", "SUDO_GID": "1"}) is None
+    monkeypatch.setattr(logs.os, "geteuid", lambda: 1000)
+    assert logs.sudo_owner({"SUDO_UID": "1000", "SUDO_GID": "1000"}) is None
+
+
+def test_archive_goes_to_the_sudo_user_with_its_members(tmp_path, monkeypatch):
+    """`sudo xgw logs --export`: архив и файлы в нём — того, кто вызвал sudo, права 0600."""
+    calls = []
+    monkeypatch.setattr(logs.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    path = tmp_path / "a.tar.gz"
+    logs.write_archive(path, [("a.txt", "текст"), ("b.txt", "ещё")], owner=(1000, 1001))
+    assert calls == [(1000, 1001)]
+    assert path.stat().st_mode & 0o777 == 0o600
+    with tarfile.open(path, mode="r:gz") as archive:
+        members = archive.getmembers()
+    assert {(m.uid, m.gid, m.mode) for m in members} == {(1000, 1001, 0o600)}
+    calls.clear()
+    logs.write_archive(path, [("a.txt", "текст")])
+    assert calls == []  # без sudo владелец не меняется
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="нужен root")
+def test_logs_export_command_under_sudo_hands_the_archive_over(root, tmp_path, capsys,
+                                                               monkeypatch):
+    root.etc.mkdir(parents=True)
+    root.config_file.write_text(f'[[subscriptions]]\nurl = "{SUB_URL}"\n', encoding="utf-8")
+    monkeypatch.setenv("SUDO_UID", "4321")
+    monkeypatch.setenv("SUDO_GID", "4322")
+    out_path = tmp_path / "export.tar.gz"
+    assert main(["logs", "--export", "--out", str(out_path)]) == 0
+    stat = out_path.stat()
+    assert (stat.st_uid, stat.st_gid, stat.st_mode & 0o777) == (4321, 4322, 0o600)
+    with tarfile.open(out_path, mode="r:gz") as archive:
+        assert {(m.uid, m.gid) for m in archive.getmembers()} == {(4321, 4322)}
+    assert "архив без секретов" in capsys.readouterr().out
+
+
 # --- панель: команда, запуск вместе с демоном, первый запуск установки ---------------
 
 

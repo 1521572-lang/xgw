@@ -276,9 +276,10 @@ def test_reload_of_singbox_waits_while_a_member_goes_through_it(stand):
 def test_blocked_dual_server_leaves_xray_for_singbox_on_its_own(stand):
     """Приёмка 0.1.12, пункт 4: сервер VLESS+TLS, который умеют оба ядра, за «ТСПУ», узнающим и
     целый ClientHello, и мелкие записи Xray (sni_freeze_strict): на обычном профиле и с
-    дроблением Xray он «замерзает» (FROZEN после 16 КБ). Шлюз сам перебирает профили и
-    переводит сервер на sing-box с дроблением TLS — заменой outbound'а через API: ни Xray, ни
-    sing-box не перезапускаются, конфиг sing-box не меняется."""
+    дроблением Xray он «замерзает» (FROZEN после 16 КБ), на обычном sing-box (0.1.13) — тоже:
+    ClientHello целиком. Шлюз сам перебирает профили и переводит сервер на sing-box с дроблением
+    TLS — заменой outbound'а через API: ни Xray, ни sing-box не перезапускаются, конфиг sing-box
+    не меняется."""
     us = stand.add_server("us", tls=True)
     us.set_mode(f"sni_freeze_strict={us.domain}")
     _config(stand, (*stand.names, "us"), max_members=2)
@@ -294,16 +295,73 @@ def test_blocked_dual_server_leaves_xray_for_singbox_on_its_own(stand):
         ok = entry and entry["profile"] == "singbox:tls_fragment" and entry.get("verdict") == "OK"
         return status if ok else None
 
-    status = wait_for(moved, 300, step=3)
+    status = wait_for(moved, 420, step=3)
     assert status, stand.tail("daemon", 120)
     details = [event["detail"] for event in status["events"]]
-    assert any("не отвечает на профиле «Xray с дроблением ClientHello» — пробую «sing-box с "
-               "дроблением TLS»" in text for text in details), details
+    assert any("не отвечает на профиле «Xray с дроблением ClientHello» — пробую «sing-box»"
+               in text for text in details), details
+    assert any("не отвечает на профиле «sing-box» — пробую «sing-box с дроблением TLS»" in text
+               for text in details), details
     assert any("отвечает на профиле «sing-box с дроблением TLS» — он закреплён" in text
                for text in details), details
     assert stand.xray_pid() == xray_pid and stand.singbox_pid() == singbox_pid
     assert (stand.root / "etc/xgw/sing-box/config.json").read_text(
         encoding="utf-8") == config_before
+    before = us.connections()
+    _pin_and_fetch(stand, "us")
+    assert us.connections() > before, "трафик не прошёл через сервер us"
+
+
+def test_dual_server_only_singbox_reaches_moves_to_plain_singbox_and_stays(stand):
+    """0.1.13 (отчёт 0.1.12: часть серверов ответила только на обычном sing-box). Сервер VLESS+TLS
+    умеют оба ядра, но сертификат его перевыпущен, а в ссылке остался хеш прежнего (pcs) при
+    верном хеше ключа (pks): Xray не подключается ни обычным, ни с дроблением, sing-box сверяет
+    ключ и подключается. Шлюз сам переводит сервер на обычный sing-box — до дробления sing-box
+    дело не доходит, — заменой outbound'а через API, без перезапусков; `xgw apply` (новая
+    сборка, как при обновлении подписки) профиль не сбрасывает, в `xgw servers` метка [sb].
+
+    Моделью «ТСПУ» такой сервер не сделать: ClientHello Xray 26.10.10 (fp=chrome) и sing-box
+    1.14.3 (utls chrome) совпадают — те же шифры, расширения, группы и длины записей (замер,
+    ASSUMPTIONS п. 208)."""
+    us = stand.add_server("us", tls=True, stale_pin=True)
+    _config(stand, (*stand.names, "us"), max_members=2)
+    result = stand.xgw("apply", "--now")
+    assert result.returncode == 0, result.stdout + result.stderr + stand.xray_log()
+    xray_pid, singbox_pid = stand.xray_pid(), stand.singbox_pid()
+    config_before = (stand.root / "etc/xgw/sing-box/config.json").read_text(encoding="utf-8")
+    stand.start_daemon()
+
+    def moved():
+        status = stand.xgw_json("status")
+        entry = _entry(status, "us") if status.get("daemon") else None
+        ok = entry and entry["profile"] == "singbox:default" and entry.get("verdict") == "OK"
+        kept = any("отвечает на профиле «sing-box» — он закреплён" in event["detail"]
+                   for event in status["events"])
+        return status if ok and kept else None
+
+    status = wait_for(moved, 300, step=3)
+    assert status, stand.tail("daemon", 120)
+    log = stand.tail("daemon", 400)
+    fingerprint = _entry(status, "us")["tag"].split("-", 1)[1]
+    assert re.search(rf"скан \w+-{re.escape(fingerprint)}: (CONNECT_FAIL|STALL_BEFORE_BODY)",
+                     log), log
+    details = [event["detail"] for event in status["events"]]
+    assert any("не отвечает на профиле «Xray с дроблением ClientHello» — пробую «sing-box»"
+               in text for text in details), details
+    assert any("отвечает на профиле «sing-box» — он закреплён (был «Xray»)" in text
+               for text in details), details
+    assert not any("«sing-box с дроблением TLS»" in text for text in details), details
+    assert stand.xray_pid() == xray_pid and stand.singbox_pid() == singbox_pid
+    assert (stand.root / "etc/xgw/sing-box/config.json").read_text(
+        encoding="utf-8") == config_before
+    # Новая сборка помнит выученный профиль.
+    result = stand.xgw("apply")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _entry(stand.xgw_json("servers"), "us")["profile"] == "singbox:default"
+    tag = _entry(stand.xgw_json("status"), "us")["tag"]
+    servers = stand.xgw("servers").stdout
+    line = next((text for text in servers.splitlines() if tag in text), "")
+    assert "[sb]" in line, servers
     before = us.connections()
     _pin_and_fetch(stand, "us")
     assert us.connections() > before, "трафик не прошёл через сервер us"

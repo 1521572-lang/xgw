@@ -175,6 +175,43 @@ def test_profile_letters_and_tags_agree():
     assert singbox.tag_out("0123abcd", "m") == "sb-out-0123abcd-m"
 
 
+def test_dual_server_ladder_tries_plain_singbox_before_its_fragmenting():
+    """0.1.13: у сервера, которого умеют оба ядра, обычный sing-box (вариант «d», заведён в
+    sing-box заранее) — ступень лестницы и выученный профиль, а не только база серверов sing-box."""
+    cfg = Config()
+    node = _nodes(links.TROJAN)[0]
+    letters = singbox.variant_letters(node.singbox, cfg)
+    assert "d" in letters
+    avail = profiles.available(node, cfg, letters)
+    base = profiles.base(cfg, avail)
+    assert base == profiles.XRAY_DEFAULT
+    for verdict in profiles.TRIGGER_VERDICTS:
+        steps = profiles.ladder(verdict, base, base, avail)
+        assert steps.index(profiles.SB_DEFAULT) == steps.index(profiles.XRAY_FRAGMENT) + 1
+        assert steps.index(profiles.SB_FRAGMENT) == steps.index(profiles.SB_DEFAULT) + 1
+    learned = profiles.resolve(node, cfg, letters, current=profiles.SB_DEFAULT)
+    assert learned == profiles.SB_DEFAULT
+    # Без варианта «d» в работающем sing-box профиль недоступен — сервер на базе.
+    assert profiles.resolve(node, cfg, {"f"}, current=profiles.SB_DEFAULT) == base
+    # Закреплён Xray — sing-box недоступен вовсе.
+    cfg.managed.core[node.fingerprint] = "xray"
+    assert profiles.resolve(node, cfg, letters, current=profiles.SB_DEFAULT) == base
+
+
+def test_plain_singbox_is_labelled_sb_everywhere():
+    """Выученный обычный sing-box показывается так же, как у серверов только для sing-box:
+    «[sb]» в `xgw servers`, «sb» на странице статуса и в Telegram, «sing-box» в панели."""
+    from xgw.watch import status, status_page, telegram
+
+    entry = {"tag": "spare-de-0123abcd", "profile": profiles.SB_DEFAULT, "protocol": "trojan"}
+    assert status._fragment(entry) == " [sb]"
+    assert status_page._core(entry) == "trojan · sb"
+    assert telegram._core_note(entry) == " [trojan, sb]"
+    app = (Path(__file__).resolve().parents[1] / "src/xgw/ui/app.js").read_text(encoding="utf-8")
+    hint = app.split('"singbox:default": ["sing-box", "', 1)[1].split('"]', 1)[0]
+    assert "умеют оба ядра" in hint and "сам" in hint
+
+
 # --- применение конфига --------------------------------------------------------------------
 
 

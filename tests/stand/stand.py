@@ -246,28 +246,22 @@ class Stand:
         for name in self.names:
             self.add_server(name)
 
-    def add_server(self, name: str, *, tls: bool = False) -> Server:
+    def add_server(self, name: str, *, tls: bool = False, stale_pin: bool = False) -> Server:
         """Ещё один VLESS-сервер с реле перед ним (можно добавлять на ходу).
 
         tls — VLESS+TLS с самоподписанным сертификатом на имя сервера: его выпускает и
-        хеширует сам Xray (`xray tls cert`, `xray tls hash`), ссылка его закрепляет."""
+        хеширует сам Xray (`xray tls cert`, `xray tls hash`), ссылка его закрепляет.
+        stale_pin — сертификат перевыпущен, а в ссылке остался хеш прежнего (pcs) при верном
+        хеше ключа (pks): Xray к такому серверу не подключится ни в каком профиле, а sing-box,
+        который сверяет ключ, — подключится."""
         server = Server(name, free_port(), free_port(), self.workdir / f"relay-{name}.mode")
         server.mode_file.write_text("pass", encoding="ascii")
         stream: dict = {}
         if tls:
             cert = self.workdir / f"cert-{name}"
-            subprocess.run(
-                [str(self.xray_bin), "tls", "cert", f"--domain={server.domain}", "--expire=48h",
-                 f"--file={cert}"], check=True, capture_output=True, timeout=30,
-            )
-            hashed = subprocess.run(
-                [str(self.xray_bin), "tls", "hash", f"--cert={cert}.crt"],
-                check=True, capture_output=True, text=True, timeout=30,
-            ).stdout
-            server.pin = next(
-                line.split(":", 1)[1].strip() for line in hashed.splitlines()
-                if line.startswith("Leaf SHA256:")
-            )
+            server.pin = self._leaf_hash(server.domain, cert)
+            if stale_pin:
+                server.pin = self._leaf_hash(server.domain, self.workdir / f"cert-{name}-old")
             server.pks = spki_pin(Path(f"{cert}.crt").read_text(encoding="ascii"))
             stream = {"streamSettings": {"security": "tls", "tlsSettings": {"certificates": [
                 {"certificateFile": f"{cert}.crt", "keyFile": f"{cert}.key"}]}}}
@@ -305,6 +299,22 @@ class Stand:
         )
         self.servers[name] = server
         return server
+
+    def _leaf_hash(self, domain: str, cert: Path) -> str:
+        """Выпускает самоподписанный сертификат (cert.crt, cert.key) и возвращает его SHA-256
+        так, как его закрепляет ссылка (pcs)."""
+        subprocess.run(
+            [str(self.xray_bin), "tls", "cert", f"--domain={domain}", "--expire=48h",
+             f"--file={cert}"], check=True, capture_output=True, timeout=30,
+        )
+        hashed = subprocess.run(
+            [str(self.xray_bin), "tls", "hash", f"--cert={cert}.crt"],
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout
+        return next(
+            line.split(":", 1)[1].strip() for line in hashed.splitlines()
+            if line.startswith("Leaf SHA256:")
+        )
 
     def add_singbox_server(self, name: str, kind: str = "anytls") -> Server:
         """Сервер, которого Xray не умеет, — его ведёт sing-box (anytls, hysteria2, tuic).

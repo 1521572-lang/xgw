@@ -15,9 +15,19 @@ outbound — прямой, через дробление или мост к sing
 демона и обновление подписки, как состав участников (generator/builder.py).
 
 Лестница при блокировке (ступень выбирает вердикт скана, daemon.py):
-  «заморозка» (FROZEN, STALL_BEFORE_BODY): xray:fragment → singbox:tls_fragment →
-  singbox:mux_padded;
-  отказ в соединении (CONNECT_FAIL, TIMEOUT): по одной попытке xray:fragment и singbox:tls_fragment.
+  «заморозка» (FROZEN, STALL_BEFORE_BODY): xray:fragment → singbox:default →
+  singbox:tls_fragment → singbox:mux_padded;
+  отказ в соединении (CONNECT_FAIL, TIMEOUT): по одной попытке xray:fragment, singbox:default и
+  singbox:tls_fragment.
+У серверов, которые умеет только sing-box, singbox:default — база, и лестница начинается с
+singbox:tls_fragment.
+
+Обычный sing-box у сервера с базой Xray (0.1.13) — тоже выученный профиль, но тот же профиль
+дают и настройки: закрепление ядра sing-box (`xgw core`) и [core] mode = "sing-box". По конфигу
+Xray их не различить, поэтому при каждой применённой сборке в базу пишется снимок настроек ядра
+(core_settings, engine.persist): singbox:default сохраняется, только если ядро сервера в
+настройках с прошлой сборки не менялось. После `xgw core … auto` и возврата mode = "auto"
+сервер возвращается на базу, а не остаётся на sing-box.
 """
 
 from __future__ import annotations
@@ -52,8 +62,11 @@ NAMES = {
     SB_MUX: "sing-box с мультиплексированием и паддингом",
 }
 # Профили, которым сервер обучается блокировкой: они сохраняются между сборками. Остальные —
-# выбор настроек (база), поэтому следуют за настройками.
+# выбор настроек (база), поэтому следуют за настройками. Обычный sing-box у сервера с базой
+# Xray — тоже выученный, но с условием (resolve, pin_unchanged).
 LEARNED = (XRAY_FRAGMENT, SB_FRAGMENT, SB_MUX)
+# Снимок настроек ядра, по которым собран применённый конфиг (ключ meta в базе состояния).
+CORE_META = "core_settings"
 
 FROZEN_VERDICTS = ("FROZEN", "STALL_BEFORE_BODY")
 REFUSED_VERDICTS = ("CONNECT_FAIL", "TIMEOUT")
@@ -68,12 +81,29 @@ def label(profile: str) -> str:
     return LABELS.get(profile, profile)
 
 
+def _pin(mode: object, pins: object, fingerprint: str) -> str:
+    pinned = pins.get(fingerprint) if isinstance(pins, dict) else None
+    if pinned in ("xray", "sing-box"):
+        return pinned  # type: ignore[return-value]
+    return "sing-box" if mode == "sing-box" else "auto"
+
+
 def pin_of(cfg: Config, fingerprint: str) -> str:
     """Ядро, закреплённое за сервером: xray, sing-box или auto (выбирает шлюз)."""
-    pinned = cfg.managed.core.get(fingerprint)
-    if pinned in ("xray", "sing-box"):
-        return pinned
-    return "sing-box" if cfg.core.mode == "sing-box" else "auto"
+    return _pin(cfg.core.mode, cfg.managed.core, fingerprint)
+
+
+def core_settings(cfg: Config) -> dict:
+    """Снимок настроек ядра для базы состояния (CORE_META)."""
+    return {"mode": cfg.core.mode, "pins": dict(cfg.managed.core)}
+
+
+def pin_unchanged(cfg: Config, saved: object, fingerprint: str) -> bool:
+    """Ядро сервера в настройках то же, что при сборке применённого конфига. saved — снимок
+    core_settings из базы; нет его (первая сборка, обновление с 0.1.12) — False."""
+    if not isinstance(saved, dict):
+        return False
+    return _pin(saved.get("mode"), saved.get("pins"), fingerprint) == pin_of(cfg, fingerprint)
 
 
 def available(node: ServerNode, cfg: Config, bridged: Collection[str]) -> list[str]:
@@ -112,17 +142,22 @@ def base(cfg: Config, avail: list[str]) -> str:
 
 def resolve(
     node: ServerNode, cfg: Config, bridged: Collection[str],
-    current: str | None = None, override: str | None = None,
+    current: str | None = None, override: str | None = None, same_pin: bool = True,
 ) -> str:
     """Профиль, в котором сервер будет в новом конфиге.
 
     override — решение демона (проба профиля, возврат); current — профиль в применённом
-    конфиге: обученный блокировкой сохраняется, пока он допустим настройками."""
+    конфиге: обученный блокировкой сохраняется, пока он допустим настройками. Обычный sing-box
+    у сервера с базой Xray — только при same_pin: ядро сервера в настройках не менялось с
+    прошлой сборки (иначе этот профиль дало закрепление, а не блокировка)."""
     avail = available(node, cfg, bridged)
     default = base(cfg, avail)
     if override is not None:
         return override if override in avail else default
-    if current in LEARNED and current in avail:
+    if current in avail and (
+        current in LEARNED
+        or (current == SB_DEFAULT and same_pin and core_of(default) == "xray")
+    ):
         return current  # type: ignore[return-value]
     return default
 
@@ -131,9 +166,10 @@ def ladder(verdict: str, current: str, default: str, avail: list[str]) -> list[s
     """Профили, которые стоит проверить серверу с таким вердиктом, по порядку.
 
     Сначала возврат на базу (если сервер на обученном профиле и перестал отвечать — может,
-    сломал его самый профиль), затем ступени лестницы после нынешней."""
+    сломал его самый профиль), затем ступени лестницы после нынешней. Обычный sing-box стоит
+    раньше дробления в sing-box: тот же TLS, но без лишней задержки рукопожатия."""
     frozen = verdict in FROZEN_VERDICTS
-    order = [XRAY_FRAGMENT, SB_FRAGMENT] + ([SB_MUX] if frozen else [])
+    order = [XRAY_FRAGMENT, SB_DEFAULT, SB_FRAGMENT] + ([SB_MUX] if frozen else [])
     steps: list[str] = []
     if current != default and default in avail:
         steps.append(default)

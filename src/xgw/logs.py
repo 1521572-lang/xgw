@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 from . import __version__, engine, masking
@@ -69,6 +69,18 @@ def known_secrets(cfg: Config | None, paths: Paths) -> set[str]:
     return {secret for secret in secrets if len(secret) >= 4}
 
 
+def sudo_owner(environ: Mapping[str, str] | None = None) -> tuple[int, int] | None:
+    """Кто запустил команду через sudo: (uid, gid) из SUDO_UID и SUDO_GID. None — запуск не
+    от root или не через sudo. Без SUDO_GID группа не меняется (-1)."""
+    environ = os.environ if environ is None else environ
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    uid, gid = environ.get("SUDO_UID", ""), environ.get("SUDO_GID", "")
+    if not uid.isdigit() or int(uid) == 0:
+        return None
+    return int(uid), int(gid) if gid.isdigit() else -1
+
+
 def export(
     cfg: Config | None,
     paths: Paths,
@@ -78,8 +90,11 @@ def export(
     runner: cmd.Runner = cmd.run,
     diag_text: Callable[[], str] | None = None,
     lines: int = EXPORT_LINES,
+    owner: tuple[int, int] | None = None,
 ) -> list[str]:
-    """Собирает архив; возвращает имена вложенных файлов."""
+    """Собирает архив; возвращает имена вложенных файлов. owner — (uid, gid) пользователя,
+    которому отдать архив (sudo_owner): иначе под sudo он root'овский, с правами 0600, и
+    пользователь без sudo его не прочитает."""
     secrets = known_secrets(cfg, paths)
 
     def clean(text: str) -> str:
@@ -146,7 +161,7 @@ def export(
         except Exception as exc:
             members["diag.txt"] = f"# diag не выполнен: {exc}\n"
 
-    write_archive(out_path, members.items())
+    write_archive(out_path, members.items(), owner=owner)
     return sorted(members)
 
 
@@ -164,16 +179,27 @@ def _mask_secret_fields(obj: object) -> object:
     return obj
 
 
-def write_archive(out_path: Path, members: Iterable[tuple[str, str]]) -> None:
-    """tar.gz с правами 0600: в журнале остаются адреса серверов и имена устройств."""
+def write_archive(
+    out_path: Path, members: Iterable[tuple[str, str]], *, owner: tuple[int, int] | None = None,
+) -> None:
+    """tar.gz с правами 0600: в журнале остаются адреса серверов и имена устройств.
+
+    owner — (uid, gid): архив отдаётся этому пользователю, и файлы в нём записаны на него же
+    (распакованные root'ом, они тоже достанутся ему); права остаются 0600."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
     fd = os.open(out_path, flags, 0o600)
-    with os.fdopen(fd, "wb") as handle, tarfile.open(fileobj=handle, mode="w:gz") as archive:
-        now = time.time()
-        for name, text in members:
-            data = text.encode("utf-8")
-            info = tarfile.TarInfo(f"xgw-logs/{name}")
-            info.size = len(data)
-            info.mtime = now
-            info.mode = 0o600
-            archive.addfile(info, io.BytesIO(data))
+    with os.fdopen(fd, "wb") as handle:
+        if owner is not None:
+            os.fchown(handle.fileno(), *owner)
+        with tarfile.open(fileobj=handle, mode="w:gz") as archive:
+            now = time.time()
+            for name, text in members:
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(f"xgw-logs/{name}")
+                info.size = len(data)
+                info.mtime = now
+                info.mode = 0o600
+                if owner is not None:
+                    info.uid = owner[0]
+                    info.gid = max(owner[1], 0)
+                archive.addfile(info, io.BytesIO(data))
