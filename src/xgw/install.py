@@ -24,11 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import desktop, engine, fetch, log, managed
-from .config import XRAY_VERSION, Config
+from .config import SINGBOX_VERSION, XRAY_VERSION, Config
+from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
 from .net.capture import Capture, CaptureError
 from .paths import Paths, atomic_write_json, atomic_write_text
+from .sbcore import binary as sbbinary
 from .watch import panel, status_page
 from .watch.status import join_ru
 from .xraycore import binary
@@ -37,10 +39,13 @@ from .xraycore.service import XrayServiceError
 
 # Корень дистрибутива: репозиторий при запуске из исходников, /opt/xgw после установки.
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
-UNITS = ("xgw-net.service", "xgw-xray.service", "xgw.service")
+SINGBOX_UNIT = "xgw-singbox.service"
+UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 # Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
 # LAN настроен. Порядок — порядок запуска; останавливаются в обратном.
-UNIT_FILES = ("xgw-net.service", "xgw-xray.service", dnsmasq.UNIT, "xgw.service")
+UNIT_FILES = (
+    "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service",
+)
 XRAY_USER = "xray"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
 EXAMPLE_URL = "example.com/sub/TOKEN"  # подписка из config.example.toml
@@ -212,6 +217,7 @@ class Facts:
     packages: list[str] = field(default_factory=list)  # чего не хватает
     user_exists: bool = False
     xray_version: tuple[int, int, int] | None = None
+    singbox_version: tuple[int, int, int] | None = None
     nm_running: bool = False
     lan_profiles: list[str] = field(default_factory=list)  # профили, которые будут отключены
     ufw_active: bool = False
@@ -239,6 +245,7 @@ class Installer:
         source_root: Path = SOURCE_ROOT,
         proc_sys: Path = sysctl.PROC_SYS,
         download=binary.download_release,
+        download_singbox=sbbinary.download_release,
         checks: Callable[[], list] | None = None,
         first_apply: Callable[[], bool] | None = None,
         which: Callable[[str], str | None] = shutil.which,
@@ -254,6 +261,7 @@ class Installer:
         self.source_root = source_root
         self.proc_sys = proc_sys
         self.download = download
+        self.download_singbox = download_singbox
         self.checks = checks
         self.first_apply = first_apply or self._first_apply
         self.which = which
@@ -278,6 +286,8 @@ class Installer:
         )
         if self.paths.xray_bin.exists():
             facts.xray_version = binary.installed_version(self.paths.xray_bin)
+        if self.paths.singbox_bin.exists():
+            facts.singbox_version = singboxing.installed_version(self.paths.singbox_bin)
         facts.nm_running = self.which("nmcli") is not None and self.nm.running()
         if facts.lan_if and facts.nm_running:
             facts.lan_profiles = [
@@ -291,6 +301,10 @@ class Installer:
     def _xray_fits(self, version: tuple[int, int, int] | None) -> bool:
         """Подходит ли уже лежащий Xray: XGW работает только с XRAY_VERSION (config.py)."""
         return version == binary.parse_version(XRAY_VERSION)
+
+    def _singbox_fits(self, version: tuple[int, int, int] | None) -> bool:
+        """Подходит ли уже лежащий sing-box: XGW работает только с SINGBOX_VERSION."""
+        return version == sbbinary.parse_version(SINGBOX_VERSION)
 
     def subnet_conflict(self) -> str:
         """Подсеть LAN пересекается с сетью провайдера или другой сетью машины. С таким
@@ -361,7 +375,17 @@ class Installer:
                 f"  • Xray-core {XRAY_VERSION} с GitHub — в {self.paths.xray_dir}, "
                 "SHA-256 сверяется с .dgst релиза"
             )
-        lines.append("  • службы systemd: xgw-net, xgw-xray, xgw — с автозапуском")
+        if self.cfg.core.mode != "xray":
+            if self._singbox_fits(facts.singbox_version):
+                version = ".".join(map(str, facts.singbox_version or ()))
+                lines.append(f"  • sing-box {version} уже лежит в {self.paths.singbox_dir}")
+            else:
+                lines.append(
+                    f"  • sing-box {SINGBOX_VERSION} с GitHub (второе ядро: hysteria2, TUIC, "
+                    f"AnyTLS, WireGuard и обход блокировок) — в {self.paths.singbox_dir}, "
+                    "SHA-256 сверяется"
+                )
+        lines.append("  • службы systemd: xgw-net, xgw-xray, xgw-singbox, xgw — с автозапуском")
         if cfg.panel.enabled:
             lines.append(
                 f"  • панель управления — {panel.address(cfg)} (только с этой машины, "
@@ -514,6 +538,7 @@ class Installer:
         self._user(facts)
         self._code()
         self._xray(facts)
+        self._singbox(facts)
         self._permissions()
 
     def _packages(self, facts: Facts) -> None:
@@ -594,6 +619,26 @@ class Installer:
             ) from exc
         self._step(f"Xray-core {tag} — {self.paths.xray_dir}")
 
+    def _singbox(self, facts: Facts) -> None:
+        """sing-box — второе ядро. Не загрузился — не беда: установка идёт дальше, серверы,
+        которые умеет только он, пропускаются, а повторить можно `sudo xgw update-singbox`."""
+        if self.cfg.core.mode == "xray" or self._singbox_fits(facts.singbox_version):
+            return
+        mark = engine.bypass_mark(self.cfg, self.log)
+        try:
+            tag, _path = self.download_singbox(
+                self.paths.singbox_dir, SINGBOX_VERSION,
+                mark=mark, bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+            )
+        except (binary.BinaryError, fetch.FetchError, OSError) as exc:
+            self._warn(
+                f"sing-box не загружен: {exc}. Серверы hysteria2, TUIC, AnyTLS и WireGuard "
+                "пропускаются; повторить: sudo xgw update-singbox"
+            )
+            return
+        self.journal.set("singbox", {"version": tag, "dir": str(self.paths.singbox_dir)})
+        self._step(f"sing-box {tag} — {self.paths.singbox_dir}")
+
     def _permissions(self) -> None:
         """/etc/xgw/config.toml — 0600; конфиг Xray — 0640 root:xray.
 
@@ -607,17 +652,19 @@ class Installer:
             return
         os.chmod(self.paths.etc, 0o755)
         os.chmod(self.paths.var, 0o700)
-        directory = self.paths.xray_config_dir
         try:
-            self.chown(directory, "root", XRAY_USER)
-            os.chmod(directory, 0o2750)
-            for item in directory.iterdir():
-                if item.is_file():
-                    self.chown(item, "root", XRAY_USER)
-                    os.chmod(item, 0o640)
+            # Конфиги ядер читает пользователь xray: root:xray, каталог с setgid.
+            for directory in (self.paths.xray_config_dir, self.paths.singbox_config_dir):
+                self.chown(directory, "root", XRAY_USER)
+                os.chmod(directory, 0o2750)
+                for item in directory.iterdir():
+                    if item.is_file():
+                        self.chown(item, "root", XRAY_USER)
+                        os.chmod(item, 0o640)
         except LookupError as exc:
             raise InstallError(f"пользователь {XRAY_USER} не создан: {exc}") from exc
-        for item in (self.paths.opt, self.paths.xray_dir, self.paths.lib_dir):
+        for item in (self.paths.opt, self.paths.xray_dir, self.paths.singbox_dir,
+                     self.paths.lib_dir):
             with contextlib.suppress(OSError):
                 os.chmod(item, 0o755)
 
@@ -835,7 +882,14 @@ class Installer:
         except engine.EngineError as exc:
             self._warn(f"конфиг Xray не собран: {exc}")
             return self._xray_answers(applier, 0.0)
-        outcome = applier.apply(assembly.result.config, force_now=True)
+        outcome, singbox_outcome = engine.apply_all(
+            self.cfg, self.paths, assembly, applier, force_now=True,
+        )
+        if singbox_outcome is not None and singbox_outcome.mode != "unchanged":
+            self._step(engine.describe_singbox(singbox_outcome))
+        if outcome is None:
+            self._warn(engine.describe_singbox(singbox_outcome))  # type: ignore[arg-type]
+            return self._xray_answers(applier, 0.0)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, inventory.quotas)
         if outcome.mode == "unchanged" and not self._xray_answers(applier, 0.0):

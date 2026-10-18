@@ -16,8 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, cost, fetch, log, marknet, masking
+from . import pin as pinning
+from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
+from .generator import profiles as profiling
+from .generator import singbox as singboxing
 from .model import ServerNode, raw_to_node
 from .net import lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
@@ -46,11 +50,23 @@ class Inventory:
 
 
 @dataclass
+class SingboxChange:
+    """Что сборка требует от sing-box (apply/singbox.py)."""
+
+    config: dict | None  # желаемый конфиг; None — вести через sing-box некого
+    reload: bool  # применить сейчас; иначе отложить: через sing-box идёт трафик (перечитывание
+    # конфига рвёт его соединения), пока не наступит окно перезапуска или не станет срочно
+    bridged: int = 0  # сколько серверов в новом конфиге Xray ведёт sing-box
+    verdict: bool | None = None  # итог sing-box check; None — проверка не выполнялась
+
+
+@dataclass
 class Assembly:
     result: builder.BuildResult
     selection: builder.Selection
     verdict: bool | None  # итог xray run -test; None — проверка не выполнялась
     invalid: int = 0  # сколько серверов отброшено: их конфиг установленный Xray не принимает
+    singbox: SingboxChange | None = None
 
 
 def bypass_mark(cfg: config.Config, logger) -> int | None:
@@ -89,6 +105,11 @@ def sources_key(cfg: config.Config) -> tuple:
     return subs, tuple(cfg.manual.links)
 
 
+def singbox_available(cfg: config.Config, paths: Paths) -> bool:
+    """Можно ли вести серверы через sing-box: он включён настройками и установлен."""
+    return cfg.core.mode != "xray" and singboxing.find_binary(None, paths) is not None
+
+
 def inventory_file(paths: Paths) -> Path:
     return paths.var / "inventory.json"
 
@@ -99,15 +120,19 @@ def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> No
     В нём только то, что видно и так (имя, протокол, источник); ключей нет.
     """
     servers = []
+    served = {node.fingerprint for node in inventory.nodes if node.singbox is not None}
+    if not singbox_available(cfg, paths):
+        served = set()
     for node in inventory.nodes:
         if node.keep_tag:
             continue  # звенья цепочек — не самостоятельные серверы
-        reason = builder.skip_reason(node, cfg, dead=quarantined())
+        reason = builder.skip_reason(node, cfg, dead=quarantined(), served=served)
         servers.append({
             "fingerprint": node.fingerprint,
             "name": node.name,
             "source": node.source,
             "protocol": node.protocol,
+            "core": node.capability,
             "skip": "" if reason == "excluded" else reason,
         })
     atomic_write_json(
@@ -269,8 +294,11 @@ def assemble(
     tier: cost.Klass | None = None,
     reserve: str | None = None,
     fragment: set[str] | None = None,
+    profiles: dict[str, str] | None = None,
+    singbox_ok: bool | None = None,
+    reload_singbox: bool | None = None,
 ) -> Assembly:
-    """Конфиг Xray из известных серверов.
+    """Конфиг Xray и конфиг sing-box из известных серверов.
 
     Состав участников, резервный выход, порты и пароль проб берутся из применённого
     конфига: обновление подписки не должно перетасовывать то, что уже работает в ядре.
@@ -278,11 +306,19 @@ def assemble(
     tier — класс участников (смена класса демоном, cost.py); по умолчанию — класс
     нынешних участников: обновление подписки его не меняет.
     reserve — отпечаток резервного выхода (его выбирает демон по дешёвой проверке).
-    fragment — отпечатки серверов с дроблением ClientHello (generator/fragment.py); по
-    умолчанию — как в применённом конфиге (включает и выключает его демон).
-    Сервер, конфиг которого установленный Xray не принимает, отбрасывается.
+    profiles — решения демона о профилях обхода (generator/profiles.py): отпечаток →
+    профиль. У остальных серверов профиль — как в применённом конфиге, если сервер обучен
+    блокировкой (дробление, sing-box), иначе по настройкам. fragment — то же для дробления
+    ClientHello (xray:fragment) в прежней записи: набор отпечатков.
+    singbox_ok — доступен ли sing-box (по умолчанию: включён в [core] и установлен).
+    reload_singbox — перечитать ли конфиг sing-box сейчас. Перечитывание рвёт все
+    соединения через sing-box, поэтому по умолчанию (None) оно сейчас, только если через
+    него никто не идёт; иначе конфиг откладывается (SingboxChange.reload = False), а Xray
+    собирается по тому, что sing-box уже ведёт.
+    Сервер, конфиг которого установленный Xray или sing-box не принимает, отбрасывается.
     """
     applied = read_json(paths.xray_config_file)
+    applied_sb = read_json(paths.singbox_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
     prices = node_costs(cfg, inventory)
     if prefer is None:
@@ -291,21 +327,51 @@ def assemble(
         tier = cost.best(cfg.managed.priority, prices, prefer)
     if reserve is None:
         reserve = builder.reserve_fingerprint(applied, inventory.nodes)
-    if fragment is None:
-        fragment = builder.fragmented_fingerprints(applied, inventory.nodes)
+    current = builder.applied_profiles(applied, inventory.nodes)
+    decided = dict(profiles or {})
+    for fingerprint in fragment or ():
+        decided.setdefault(fingerprint, profiling.XRAY_FRAGMENT)
+
+    enabled = singbox_available(cfg, paths) if singbox_ok is None else (
+        singbox_ok and cfg.core.mode != "xray"
+    )
+    sb_bin = singboxing.find_binary(None, paths) if check and enabled else None
+    applied_ports = singboxing.bridge_ports(applied_sb)
+    carried = _carrying_tags(paths, applied)
+    bridged_now = any(
+        singboxing.bridge_variant(outbound)
+        for outbound in (applied or {}).get("outbounds") or []
+        if isinstance(outbound, dict) and outbound.get("tag") in carried
+    )
+    reload_now = (not bridged_now) if reload_singbox is None else reload_singbox
+    if not enabled:
+        served: set[str] = set()
+    elif reload_now:
+        served = {node.fingerprint for node in inventory.nodes if node.singbox is not None}
+    else:
+        served = {fingerprint for fingerprint, _letter in applied_ports}
 
     rejected: set[str] = set()
+    nosb: set[str] = set()
     dead = quarantined()
     first = True
     while True:
         usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
         selection = builder.select_nodes(
             usable, cfg, prefer=prefer, dead=dead, tier=tier, costs=prices, reserve=reserve,
+            served=served,
         )
         if first:
             first = False
             for warning in selection.warnings:
                 logger.warning("%s", warning)
+            if selection.stats.get("core"):
+                logger.warning(
+                    "серверов, которые умеет только sing-box, отложено: %d — %s",
+                    selection.stats["core"],
+                    "sing-box выключен или не установлен" if not enabled
+                    else "они ещё не заведены в работающий sing-box",
+                )
         if not selection.members:
             if selection.stats.get("dns") and not any(
                 selection.stats.get(key) for key in ("junk", "ipv6", "filter", "excluded")
@@ -321,27 +387,107 @@ def assemble(
             # балансировщике встают следующие: собираем состав заново.
             dead = dead | gone
             continue
+        ordered = [*selection.members, *selection.spares]
+        plan = None
+        if enabled:
+            try:
+                plan = singboxing.build(
+                    cfg, ordered, hosts, previous=applied_sb, skip=nosb,
+                    avoid=set(probe_ports.values()),
+                )
+            except ValueError as exc:
+                raise EngineError(str(exc)) from exc
+        # Xray ссылается только на то, что sing-box уже ведёт: пока новый конфиг отложен, это
+        # варианты из работающего sing-box.
+        effective = None
+        if plan is not None and reload_now:
+            effective = plan
+        elif plan is not None and applied_ports:
+            effective = singboxing.Plan(
+                config=applied_sb or {}, ports=applied_ports,
+                password=singboxing.bridge_password(applied_sb),
+            )
+        profile_of = {
+            node.fingerprint: profiling.resolve(
+                node, cfg, effective.letters(node.fingerprint) if effective else (),
+                current=current.get(node.fingerprint), override=decided.get(node.fingerprint),
+            )
+            for node in ordered
+        }
         try:
             result = builder.build(
                 cfg, selection, hosts=hosts,
                 probe_password=probe_password, probe_ports=probe_ports,
                 probe_url=target.observatory_url(cfg, paths),
                 containers_tun=containers_tun(cfg),
-                fragment=fragment,
+                profile_of=profile_of, bridge=effective,
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
+        change = SingboxChange(
+            config=plan.config if plan is not None else None, reload=reload_now,
+            bridged=sum(
+                1 for info in result.nodes if profiling.core_of(info.profile) == "sing-box"
+            ),
+        )
         if not check:
-            return Assembly(result, selection, None, len(rejected))
+            return Assembly(result, selection, None, len(rejected), change)
+        if plan is not None and sb_bin is not None:
+            change.verdict, sb_output = singboxing.validate_config(plan.config, sb_bin)
+            if change.verdict is False:
+                # Конфиг sing-box не прошёл: ищем серверы, которые он не принимает, и
+                # собираем без них. Умеющие Xray остаются в нём, остальные отбрасываются.
+                bad = singboxing.find_invalid(ordered, cfg, sb_bin)
+                newly_bad = set(bad) - nosb - rejected
+                if not newly_bad:
+                    raise EngineError(f"конфиг не прошёл sing-box check:\n{sb_output}")
+                by_fingerprint = {node.fingerprint: node for node in ordered}
+                for fingerprint in newly_bad:
+                    logger.warning(
+                        "узел %s отброшен: sing-box не принимает его конфиг (%s)",
+                        by_fingerprint[fingerprint].name, bad[fingerprint],
+                    )
+                    if by_fingerprint[fingerprint].outbound:
+                        nosb.add(fingerprint)
+                    else:
+                        rejected.add(fingerprint)
+                continue
         verdict, output = validate.validate_config(result.config, xray_bin)
         if verdict is not False:
-            return Assembly(result, selection, verdict, len(rejected))
+            return Assembly(result, selection, verdict, len(rejected), change)
         # Конфиг не прошёл: ищем серверы, которые установленный Xray не принимает
         # (снятый транспорт, неизвестный шифр), и собираем конфиг без них.
         newly = _reject_invalid(result, xray_bin, logger) - rejected
         if not newly:
             raise EngineError(f"конфиг не прошёл xray run -test:\n{output}")
         rejected |= newly
+
+
+def _carrying_tags(paths: Paths, applied: dict | None) -> set[str]:
+    """Теги серверов, через которые сейчас идёт настоящий трафик: участники балансировщика,
+    резервный выход и выбранный вручную сервер. Запасные его не несут (только короткие пробы),
+    поэтому перечитывание sing-box им не мешает."""
+    tags = {
+        str(outbound.get("tag")) for outbound in (applied or {}).get("outbounds") or []
+        if isinstance(outbound, dict) and str(outbound.get("tag", "")).startswith("proxy-")
+    }
+    tags.add(builder.reserve_tag(applied))
+    try:
+        store = Store(paths.db_file)
+        try:
+            chosen = pinning.read(store.get_meta(pinning.META), time.time())
+        finally:
+            store.close()
+    except Exception:  # базы нет или она не читается — выбор вручную неизвестен
+        chosen = None
+    if chosen:
+        # Роль в теге меняется (запасной стал участником), страна и отпечаток — нет.
+        tags.update(
+            str(outbound.get("tag")) for outbound in (applied or {}).get("outbounds") or []
+            if isinstance(outbound, dict)
+            and pinning.same_server(str(outbound.get("tag") or ""), str(chosen.get("tag") or ""))
+        )
+    return {tag for tag in tags if tag}
 
 
 def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:
@@ -449,7 +595,7 @@ def summary(assembly: Assembly) -> dict[str, int]:
         "spares": len(assembly.selection.spares),
         # недоступные и служебные: служебные адреса, IPv6 при ipv6 = off, отсеянные
         # фильтром имён, домены без адреса и серверы, чей конфиг Xray не принимает
-        "dropped": sum(stats.get(key, 0) for key in ("junk", "ipv6", "filter", "dns"))
+        "dropped": sum(stats.get(key, 0) for key in ("junk", "ipv6", "filter", "dns", "core"))
         + assembly.invalid,
         "duplicates": stats.get("duplicates", 0),
         "excluded": stats.get("excluded", 0),
@@ -523,6 +669,48 @@ def make_applier(cfg: config.Config, paths: Paths, xray_bin: Path) -> Applier:
     return Applier(
         cfg, paths, make_api(cfg, xray_bin), make_service(paths, xray_bin), xray_bin=xray_bin
     )
+
+
+def make_singbox(cfg: config.Config, paths: Paths) -> singbox_apply.SingboxCore:
+    """Применение и слежение за sing-box (второе ядро, apply/singbox.py)."""
+    bin_path = singboxing.find_binary(None, paths)
+    return singbox_apply.SingboxCore(
+        cfg, paths, singbox_apply.make_service(paths, bin_path), bin_path=bin_path,
+    )
+
+
+def describe_singbox(outcome: singbox_apply.SingboxOutcome) -> str:
+    """Итог применения конфига sing-box одной строкой — для вывода команд."""
+    text = {
+        "unchanged": "sing-box: изменений нет",
+        "deferred": "sing-box: перечитывание отложено — через него идёт трафик, и оно оборвало "
+                    "бы соединения (применить сейчас: xgw apply --now)",
+        "started": "sing-box запущен",
+        "reloaded": "конфиг sing-box перечитан",
+        "removed": "sing-box остановлен: серверов для него нет",
+        "rejected": "конфиг sing-box отклонён, sing-box работает на прежнем",
+        "rollback": "sing-box не принял новый конфиг — выполнен откат на last-good",
+        "failed": "sing-box не поднялся, откат на last-good не помог",
+    }.get(outcome.mode, outcome.mode)
+    if outcome.detail and outcome.mode not in ("unchanged", "deferred"):
+        text += f" ({outcome.detail})"
+    return text
+
+
+def apply_all(
+    cfg: config.Config, paths: Paths, assembly: Assembly, applier: Applier, *,
+    force_now: bool = False,
+) -> tuple[ApplyOutcome | None, singbox_apply.SingboxOutcome | None]:
+    """Применяет сборку: сначала sing-box (мосты должны слушать), затем Xray. Если sing-box
+    конфиг не принял, Xray не применяется (он собран под него): вернётся только итог sing-box."""
+    outcome = None
+    if assembly.singbox is not None:
+        outcome = make_singbox(cfg, paths).apply(
+            assembly.singbox.config, reload=assembly.singbox.reload,
+        )
+        if outcome.mode in ("rejected", "rollback", "failed"):
+            return None, outcome
+    return applier.apply(assembly.result.config, force_now=force_now), outcome
 
 
 def describe(outcome: ApplyOutcome) -> str:

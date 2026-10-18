@@ -210,7 +210,10 @@ class Uninstaller:
 
     def _files(self, purge: bool) -> None:
         """Последний шаг: удаляется и код, из которого идёт выполнение."""
-        targets = [self.paths.opt, self.paths.var, self.paths.run, self.paths.xray_config_dir]
+        targets = [
+            self.paths.opt, self.paths.var, self.paths.run, self.paths.xray_config_dir,
+            self.paths.singbox_config_dir,
+        ]
         if purge:
             targets.append(self.paths.etc)
         self.paths.launcher.unlink(missing_ok=True)

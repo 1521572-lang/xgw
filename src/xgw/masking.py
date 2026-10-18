@@ -20,7 +20,8 @@ _LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9+/_=-]{40,}\b")
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 # Ссылки серверов целиком секретны: в userinfo лежит UUID или пароль.
 _LINK_RE = re.compile(
-    r"\b(vless|vmess|trojan|ss|ssr|socks5?|hysteria2?|hy2|tuic|wireguard)://[^\s\"'<>]+",
+    r"\b(vless|vmess|trojan|ss|ssr|socks5?|hysteria2?|hy2|tuic|wireguard|wg|anytls|shadowtls)"
+    r"://[^\s\"'<>]+",
     re.IGNORECASE,
 )
 # Токен Telegram-бота: <id>:<35 символов> — короче порога _LONG_TOKEN_RE.
@@ -31,6 +32,9 @@ _SECRET_KEYS = frozenset(
     {
         "id", "password", "pass", "publicKey", "privateKey", "secretKey", "preSharedKey",
         "shortId", "seed", "mldsa65Verify", "auth",
+        # sing-box (generator/singbox.py): пароли obfs лежат в поле password, остальное — здесь.
+        "private_key", "pre_shared_key", "public_key", "short_id", "auth_str", "secret",
+        "plugin_opts",
     }
 )
 

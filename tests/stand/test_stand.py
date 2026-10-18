@@ -415,7 +415,7 @@ def test_server_blocked_by_sni_gets_fragmenting_and_carries_the_traffic(stand):
     details = [event["detail"] for event in status["events"]]
     assert any("отвечает только с дроблением ClientHello — оно включено" in text
                for text in details), details
-    assert any("дробление ClientHello" in text and "через API без перезапуска" in text
+    assert any("профиль обхода" in text and "через API без перезапуска" in text
                for text in details), details
 
     result = stand.xgw("pin", tag, "--ttl", "forever")

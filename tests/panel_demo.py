@@ -92,6 +92,16 @@ SPEEDS = {
     "c3c3c3c3": {"mbps": None, "error": "тишина 5 с после 1 048 576 байт тела"},
 }
 
+# Профиль обхода и протокол сервера (0.1.12): ядро, которое ведёт сервер. Остальные — Xray.
+PROFILES = {
+    "b2b2b2b2": ("singbox:default", "vless"),       # закреплён за sing-box
+    "d4d4d4d4": ("singbox:default", "hysteria2"),   # только sing-box
+    "f6f6f6f6": ("xray:fragment", "vless"),
+    "a7a7a7a7": ("singbox:tls_fragment", "trojan"),  # шлюз перевёл сам при блокировке
+    "b8b8b8b8": ("singbox:mux_padded", "vmess"),
+}
+# Что умеет сервер: оба ядра («dual») по умолчанию.
+CAPABILITY = {"d4d4d4d4": "singbox", "c3c3c3c3": "xray", "a7a7a7a7": "dual"}
 HOSTILE = {"d4d4d4d4": "<img src=x onerror=alert(1)> Стокгольм"}
 # Сцена reserve: «запасная» и ручная ссылка — безлимитные (лимита они не сообщают), «main»
 # — с лимитом, у её серверов множители в имени; резервный выход — x1.
@@ -130,7 +140,12 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         if fingerprint in excluded or role not in ("member", "spare"):
             continue  # демон убрал бы отключённый сервер из ядра
         live = (RESERVE_LIVE if scene == "reserve" else LIVE)[fingerprint]
-        base = {"tag": tag, "fingerprint": fingerprint, "name": name, "source": source}
+        profile, protocol = PROFILES.get(fingerprint, ("xray:default", "vless"))
+        base = {
+            "tag": tag, "fingerprint": fingerprint, "name": name, "source": source,
+            "profile": profile, "core": "sing-box" if profile.startswith("singbox") else "xray",
+            "protocol": protocol,
+        }
         if role == "member":
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             members.append({
@@ -203,6 +218,11 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         },
         "probe_target": probe_target,
         "pending_restart": False, "events": [],
+        "singbox": {"mode": "auto", "installed": True, "version": "1.14.3", "expected": True,
+                    "alive": True, "failed": False,
+                    "bridged": sum(
+                        1 for item in (*members, *spares) if item["core"] == "sing-box")},
+        "singbox_pending": False,
     }
 
 
@@ -326,7 +346,9 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         atomic_write_json(config_path.with_name("panel.json"), MANAGED, mode=0o600)
         SubscriptionCache(paths.cache_dir).save("main", b"demo")
         atomic_write_json(engine.inventory_file(paths), {"saved": now, "servers": [
-            {"fingerprint": fingerprint, "name": name, "source": source, "protocol": "vless",
+            {"fingerprint": fingerprint, "name": name, "source": source,
+             "protocol": PROFILES.get(fingerprint, ("", "vless"))[1],
+             "core": CAPABILITY.get(fingerprint, "dual"),
              "skip": role if role in ("filter", "dns") else ""}
             for fingerprint, _tag, name, source, role in _servers(scene)
         ]})

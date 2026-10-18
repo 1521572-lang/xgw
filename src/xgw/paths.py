@@ -106,6 +106,33 @@ class Paths:
     def xray_bin(self) -> Path:
         return self.xray_dir / "xray"
 
+    # --- второе ядро: sing-box (generator/singbox.py) ----------------------------
+
+    @property
+    def singbox_dir(self) -> Path:
+        return self.opt / "sing-box"
+
+    @property
+    def singbox_bin(self) -> Path:
+        return self.singbox_dir / "sing-box"
+
+    @property
+    def singbox_config_dir(self) -> Path:
+        return self.etc / "sing-box"
+
+    @property
+    def singbox_config_file(self) -> Path:
+        return self.singbox_config_dir / "config.json"
+
+    @property
+    def singbox_pending_file(self) -> Path:
+        """Конфиг sing-box, ждущий окна перезапуска: перечитывание рвёт его соединения."""
+        return self.singbox_config_dir / "config.pending.json"
+
+    @property
+    def singbox_last_good_file(self) -> Path:
+        return self.var / "sing-box.last-good.json"
+
     # --- установка (этап 4) -------------------------------------------------------
 
     @property
@@ -149,6 +176,7 @@ class Paths:
         for directory in (
             self.etc,
             self.xray_config_dir,
+            self.singbox_config_dir,
             self.var,
             self.cache_dir,
             self.backup_dir,

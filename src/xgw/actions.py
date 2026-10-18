@@ -245,3 +245,62 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
             "из серверов в работе",
         )
     return Outcome(0, "автовыбор: сервер снова выбирает Xray")
+
+
+# --- ядро сервера ----------------------------------------------------------------------
+
+
+def pick_server(paths: Paths, wanted: str) -> tuple[dict | None, str]:
+    """Сервер из списка серверов подписок по тегу (proxy-…, spare-…), отпечатку или имени.
+    Возвращает (запись списка, пусто) либо (None, что не так)."""
+    listing = engine.load_inventory(paths)
+    wanted = wanted.strip()
+    match = builder.TAG_RE.match(wanted)
+    if match:
+        found = [item for item in listing if str(item.get("fingerprint", "")).startswith(
+            match.group(3))]
+    else:
+        found = [item for item in listing if wanted in (item.get("fingerprint"), item.get("name"))]
+    fingerprints = {str(item.get("fingerprint")) for item in found}
+    if not fingerprints:
+        return None, (
+            f"сервер «{wanted}» не найден: его нет в списке серверов подписок "
+            "(xgw servers — теги, панель — имена)"
+        )
+    if len(fingerprints) > 1:
+        return None, f"«{wanted}» подходит нескольким серверам — укажите тег или отпечаток"
+    return found[0], ""
+
+
+CORE_NAMES = {"auto": "выбирает шлюз", "xray": "только Xray", "sing-box": "только sing-box"}
+
+
+def set_core(paths: Paths, store_path, wanted: str, core: str) -> Outcome:
+    """Закрепляет за сервером ядро: xray, sing-box или auto (panel.json; демон применит на
+    ближайшем шаге). Сервер, который умеет одно ядро, на другое не закрепляется."""
+    from . import managed
+
+    if core not in ("auto", "xray", "sing-box"):
+        return Outcome(2, "ядро — auto, xray или sing-box")
+    item, problem = pick_server(paths, wanted)
+    if item is None:
+        return Outcome(2, problem)
+    fingerprint, name = str(item["fingerprint"]), item.get("name") or str(item["fingerprint"])
+    capability = str(item.get("core") or "dual")
+    if core == "xray" and capability == "singbox":
+        return Outcome(2, f"«{name}» умеет только sing-box ({item.get('protocol') or '?'}) — "
+                          "на Xray его не перевести")
+    if core == "sing-box" and capability == "xray":
+        return Outcome(2, f"«{name}» умеет только Xray — на sing-box его не перевести")
+    try:
+        changed = managed.set_core(store_path, [fingerprint], core)
+    except managed.ManagedError as exc:
+        return Outcome(1, str(exc))
+    except OSError as exc:
+        return Outcome(1, f"ядро не записано: {exc} — запустите команду через sudo")
+    word = CORE_NAMES[core]
+    if not changed:
+        return Outcome(0, f"ядро сервера «{name}» уже: {word}")
+    with open_store(paths) as store:
+        store.add_event("core", f"ядро сервера «{name}»: {word}")
+    return Outcome(0, f"ядро сервера «{name}»: {word}. Демон применит его на ближайшем шаге")

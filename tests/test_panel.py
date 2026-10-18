@@ -350,6 +350,7 @@ def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     assert by_name["Осталось 5 ГБ"] == {
         "fingerprint": "eeee5555", "name": "Осталось 5 ГБ", "source": "main",
         "protocol": "vless", "status": "skipped", "skip": "filter", "priority": "medium",
+        "capability": "dual", "core_pin": "auto",
     }
     assert [server["status"] for server in state["servers"]] == [
         "member", "member", "spare", "disabled", "skipped"]
@@ -693,7 +694,8 @@ def test_server_is_disabled_removed_and_returned(rig, user):
     assert "bbbb2222" not in [s["fingerprint"] for s in state["servers"]]
     assert state["removed"] == [
         {"fingerprint": "bbbb2222", "name": "DE-1", "source": "main", "protocol": "vless",
-         "priority": "medium", "multiplier": 1.0}]  # у подписки «main» есть лимит трафика
+         "priority": "medium", "capability": "dual", "core_pin": "auto",
+         "multiplier": 1.0}]  # у подписки «main» есть лимит трафика
 
     result = user.act("servers", {"fingerprints": ["bbbb2222"], "mode": "enabled"})
     assert result["text"] == "сервер «DE-1» возвращён в список"
@@ -916,3 +918,19 @@ def test_sticky_switch_and_speed_button(rig, user):
     assert not user.act("speed", {})["ok"]  # без основного сервера замерять незачем
     assert user.act("sticky", {"on": True})["ok"] and user.state()["sticky"]["on"] is True
     assert not user.act("sticky", {"on": "да"})["ok"]
+
+
+def test_server_core_is_set_from_the_panel(rig, user):
+    result = user.act("core", {"fingerprint": "bbbb2222", "core": "sing-box"})
+    assert result["ok"], result
+    assert rig.saved()["core"] == {"bbbb2222": "sing-box"} and rig.daemon.poke.is_set()
+    by_print = {row["fingerprint"]: row for row in user.state()["servers"]}
+    assert by_print["bbbb2222"]["core_pin"] == "sing-box"
+    assert by_print["aaaa1111"]["core_pin"] == "auto"
+    assert by_print["aaaa1111"]["capability"] == "dual"
+    assert user.act("core", {"fingerprint": "bbbb2222", "core": "auto"})["ok"]
+    assert rig.saved()["core"] == {}
+    assert not user.act("core", {"fingerprint": "bbbb2222", "core": "mihomo"})["ok"]
+    assert not user.act("core", {"fingerprint": "zzzz9999", "core": "xray"})["ok"]
+    cfg, _warnings = config.load(rig.config_path)
+    assert cfg.managed.core == {}

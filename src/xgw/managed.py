@@ -28,6 +28,8 @@ MAX_URL = 2048
 MAX_NAME = 40
 DEFAULT_REFRESH = 60
 SERVER_MODES = ("enabled", "disabled", "removed")
+# Ядро, закреплённое за сервером вручную (`xgw core`, переключатель в панели); «auto» не хранится.
+CORE_PINS = ("xray", "sing-box")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
@@ -52,7 +54,7 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None,
+        "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -95,6 +97,7 @@ def load(path: Path) -> tuple[dict, str]:
         "devices": _devices(raw.get("devices")),
         "telegram": _telegram(raw.get("telegram")),
         "priority": _priority(raw.get("priority")),
+        "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
         "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
     }, ""
@@ -108,6 +111,17 @@ def _priority(value: object) -> dict[str, str]:
             and level in priority_levels.LEVELS and level != priority_levels.DEFAULT
         ):
             result[fingerprint] = level
+    return dict(list(result.items())[-MAX_SERVERS:])
+
+
+def _core(value: object) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for fingerprint, core in (value.items() if isinstance(value, dict) else ()):
+        if (
+            isinstance(fingerprint, str) and _FINGERPRINT_RE.fullmatch(fingerprint)
+            and core in CORE_PINS
+        ):
+            result[fingerprint] = core
     return dict(list(result.items())[-MAX_SERVERS:])
 
 
@@ -269,6 +283,27 @@ def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
         return False
     # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
     data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
+    save(path, data)
+    return True
+
+
+def set_core(path: Path, fingerprints: list[str], core: str) -> bool:
+    """Закрепляет за серверами ядро: xray, sing-box или auto (выбор шлюза — не хранится);
+    True — что-то изменилось. Запись — по отпечатку, как у приоритета."""
+    if (core != "auto" and core not in CORE_PINS) or not fingerprints or not all(
+        isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) for item in fingerprints
+    ):
+        raise ManagedError("неизвестный сервер или ядро")
+    data, error = load(path)
+    if error:
+        raise ManagedError(error)
+    before = dict(data["core"])
+    cores = {key: value for key, value in before.items() if key not in fingerprints}
+    if core != "auto":
+        cores.update(dict.fromkeys(fingerprints, core))
+    if cores == before:
+        return False
+    data["core"] = dict(list(cores.items())[-MAX_SERVERS:])
     save(path, data)
     return True
 

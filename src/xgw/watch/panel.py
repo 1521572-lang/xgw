@@ -397,6 +397,9 @@ class Panel:
                 "source": source,
                 "protocol": item.get("protocol") or "",
                 "priority": priority.level_of(self.cfg.managed.priority, fingerprint),
+                # Какое ядро умеет сервер (dual, xray, singbox) и что закреплено вручную.
+                "capability": item.get("core") or "dual",
+                "core_pin": self.cfg.managed.core.get(fingerprint, "auto"),
             }
             if source in limited and not item.get("skip"):
                 # Подписка с лимитом трафика: столько байт квоты уходит на байт трафика.
@@ -417,12 +420,14 @@ class Panel:
                     main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
                     speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
                     fragment=bool(entry.get("fragment")),
+                    profile=entry.get("profile") or "", core=entry.get("core") or "",
                 )
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
                     fragment=bool(entry.get("fragment")),
+                    profile=entry.get("profile") or "", core=entry.get("core") or "",
                 )
             elif item.get("skip"):
                 row.update(status="skipped", skip=item["skip"])
@@ -550,6 +555,10 @@ class Panel:
             "nodes": snapshot.get("nodes") or {},
             "probe_target": snapshot.get("probe_target") or "",
             "pending_restart": bool(snapshot.get("pending_restart")),
+            # Второе ядро (sing-box): режим [core], установлен ли, отвечает ли, сколько
+            # серверов ведёт; singbox_pending — конфиг ждёт окна перезапуска.
+            "singbox": snapshot.get("singbox") or {},
+            "singbox_pending": bool(snapshot.get("singbox_pending")),
             "busy": {
                 "refresh": bool(daemon is not None and daemon.refresh_pending),
                 "scan": bool(daemon is not None and daemon.scan_pending),
@@ -636,6 +645,17 @@ class Panel:
         self._event(text)
         self._wake()
         return actions.Outcome(0, text, notes)
+
+    def _set_core(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Ядро сервера: Авто, только Xray или только sing-box — по отпечатку."""
+        fingerprint, core = body.get("fingerprint"), body.get("core")
+        if not isinstance(fingerprint, str) or core not in ("auto", "xray", "sing-box"):
+            return actions.Outcome(2, "ожидается сервер и ядро: auto, xray или sing-box")
+        outcome = actions.set_core(self.paths, store_path, fingerprint, core)
+        if outcome.ok:
+            self._event(outcome.text.split(". ")[0])
+            self._wake()
+        return outcome
 
     def _set_priority(self, body: dict, store_path: Path) -> actions.Outcome:
         """Приоритет серверов — высокий, средний или низкий — по отпечаткам."""
@@ -833,6 +853,8 @@ class Panel:
             return self._set_servers(body, store_path)
         if name == "priority":
             return self._set_priority(body, store_path)
+        if name == "core":
+            return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
         if name.startswith("telegram/"):

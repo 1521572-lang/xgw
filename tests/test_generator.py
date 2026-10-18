@@ -560,7 +560,8 @@ def test_selection_counts_what_was_dropped():
              _node("eeee0000", "A"), _node("eeee0000", "A copy"), _node("ffff0000", "B")]
     selection = select_nodes(nodes, cfg, dead={"gone.example.net"})
     assert selection.stats == {
-        "total": 7, "junk": 1, "ipv6": 0, "filter": 1, "dns": 1, "excluded": 1, "duplicates": 1}
+        "total": 7, "junk": 1, "ipv6": 0, "filter": 1, "dns": 1, "excluded": 1, "duplicates": 1,
+        "core": 0}
     assert [n.name for n in [*selection.members, *selection.spares]] == ["A", "B"]
     assert any("домен gone.example.net не разрешается" in text for text in selection.warnings)
     # Без карантина тот же сервер идёт в работу.

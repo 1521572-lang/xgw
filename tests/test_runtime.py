@@ -138,7 +138,8 @@ def test_server_list_shows_priority_levels_only_when_they_are_set():
               "priority": "medium"}
     spare = {"tag": "spare-de-bbbb", "verdict": None, "name": "DE-1", "priority": "medium"}
     plain = status.render_servers({"members": [member], "spares": [spare], "tier": "medium"})
-    assert "уровень" not in plain and "[" not in plain
+    assert "уровень" not in plain and "[средний]" not in plain
+    assert "NL-1 [xray]" in plain  # ядро и профиль обхода показываются всегда (0.1.12)
     text = status.render_servers({
         "members": [{**member, "priority": "high"}], "spares": [{**spare, "priority": "low"}],
         "tier": "high",
@@ -337,6 +338,8 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         # Основным сервер ещё не выбран, скорость не замерялась (0.1.9).
         "main": False, "speed_mbps": None, "speed_error": "", "speed_ts": None,
         "fragment": False,  # без дробления ClientHello (0.1.11)
+        "profile": "xray:default", "core": "xray",  # профиль обхода и ядро (0.1.12)
+        "protocol": "",
     }
     assert snapshot["reserve"] is None and snapshot["spares"][0]["reserve"] is False
     assert snapshot["tier"] == "medium"
@@ -408,8 +411,9 @@ def test_status_shows_multipliers_the_reserve_and_the_quota_spent_with_multiplie
     assert budget["spares"] == 1  # по расписанию сканируется только безлимитный запасной
 
     text = status.render_status(snapshot)
-    assert "x10 🛜 Германия [x10]" in text and "Финляндия [x1]  ← резервный выход" in text
-    assert "NL безлимит [" not in text and "Швеция [" not in text
+    assert "x10 🛜 Германия [x10]" in text and "Финляндия [x1] [xray]  ← резервный выход" in text
+    assert "NL безлимит [x" not in text.replace("[xray]", "") and "Швеция [x" not in text.replace(
+        "[xray]", "")
     assert "Резервный выход: spare-fi-cccc «Финляндия» (x1)" in text
     assert "Квота «paid»: израсходовано 2000.0 ГБ из 3000.0 ГБ, осталось 1000.0 ГБ" in text
     assert "Квота «free»: израсходовано 1.0 ГБ, лимита нет — безлимитная" in text

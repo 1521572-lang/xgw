@@ -35,8 +35,10 @@ for _path in (str(HERE), str(SRC)):
 sys.path.insert(0, str(HERE.parent))  # tests/ports.py
 
 import netns  # noqa: E402
+from pins import spki_pin  # noqa: E402
 from ports import free_port  # noqa: E402
 
+from xgw.apply.singbox import PidfileSingboxService  # noqa: E402
 from xgw.xraycore.api import parse_balancer_info  # noqa: E402
 from xgw.xraycore.service import PidfileXrayService  # noqa: E402
 
@@ -45,7 +47,11 @@ UUID = "11111111-2222-3333-4455-666666666661"
 # по умолчанию та же метка (2), и его правило loopback_guard отбрасывает такие пакеты к
 # 127.0.0.0/8, а в режиме loopback узлы стенда живут именно там (отчёт 0.1.4, G5).
 STAND_BYPASS_MARK = 0x5E
-FLAGS = {"nl": "🇳🇱", "de": "🇩🇪", "fr": "🇫🇷", "us": "🇺🇸"}
+FLAGS = {
+    "nl": "🇳🇱", "de": "🇩🇪", "fr": "🇫🇷", "us": "🇺🇸", "hk": "🇭🇰", "jp": "🇯🇵", "se": "🇸🇪",
+    "fi": "🇫🇮",
+}
+SB_PASSWORD = "stand-secret-password"
 
 
 def free_block(count: int = 16) -> int:
@@ -78,6 +84,10 @@ class Server:
     # SHA-256 самоподписанного сертификата сервера VLESS+TLS; пусто — сервер без TLS.
     # Ссылка закрепляет его параметром pcs (allowInsecure Xray 26.10.10 убрал).
     pin: str = ""
+    # SHA-256 открытого ключа сервера (base64): ссылка закрепляет его параметром pks, и сервер
+    # подключается и через sing-box (у Xray закрепляется хеш всего сертификата — pcs).
+    pks: str = ""
+    kind: str = "vless"  # vless | anytls | hysteria2 | tuic (последние три ведёт sing-box)
     latency_ms: int = 0
     rate_kbps: int = 0  # полоса от сервера, КБ/с; 0 — без ограничения
 
@@ -116,8 +126,17 @@ class Server:
     def link(self, label: str | None = None) -> str:
         """Ссылка VLESS; label — имя сервера (по умолчанию «🇳🇱 NL-stand»)."""
         label = quote(label or f"{FLAGS[self.name]} {self.name.upper()}-stand")
+        pin = f"&pks={quote(self.pks, safe='')}" if self.pks else ""
+        if self.kind != "vless":
+            secret = SB_PASSWORD if self.kind != "tuic" else f"{UUID}:{SB_PASSWORD}"
+            tail = f"sni={self.domain}{pin}"
+            if self.kind == "hysteria2":
+                return f"hysteria2://{secret}@{self.domain}:{self.relay_port}/?{tail}#{label}"
+            if self.kind == "tuic":
+                return f"tuic://{secret}@{self.domain}:{self.relay_port}?{tail}&alpn=h3#{label}"
+            return f"anytls://{secret}@{self.domain}:{self.relay_port}?{tail}#{label}"
         security = (
-            f"security=tls&sni={self.domain}&fp=chrome&pcs={self.pin}" if self.pin
+            f"security=tls&sni={self.domain}&fp=chrome&pcs={self.pin}{pin}" if self.pin
             else "security=none"
         )
         return (
@@ -139,6 +158,7 @@ class Stand:
     _topology: netns.Topology | None = None
     _own_topology: bool = False
     ipv6: bool = False  # netns: IPv6 на стыке шлюза и «интернета», origin слушает и по IPv6
+    singbox_bin: Path | None = None  # второе ядро (0.1.12); без него sing-box на стенде нет
 
     def __post_init__(self) -> None:
         self.logs = self.workdir / "logs"
@@ -152,8 +172,11 @@ class Stand:
         else:
             self.inet_ip = "127.0.0.1"
             self.origin_port, self.dns_port = free_port(), free_port()
-        self.ports = {name: free_port() for name in ("api", "metrics", "socks", "http")}
+        self.ports = {
+            name: free_port() for name in ("api", "metrics", "socks", "http", "singbox_api")
+        }
         self.ports["probe_base"] = free_block()
+        self.ports["singbox_base"] = free_block(128)
 
     # --- запуск процессов ------------------------------------------------------
 
@@ -192,6 +215,7 @@ class Stand:
             XGW_ROOT=str(self.root),
             XGW_XRAY_BIN=str(self.xray_bin),
             XGW_XRAY_SERVICE="process",  # systemd-юнита на стенде нет
+            **({"XGW_SINGBOX_BIN": str(self.singbox_bin)} if self.singbox_bin else {}),
             PYTHONPATH=str(SRC),
             PYTHONIOENCODING="utf-8",
         )
@@ -244,6 +268,7 @@ class Stand:
                 line.split(":", 1)[1].strip() for line in hashed.splitlines()
                 if line.startswith("Leaf SHA256:")
             )
+            server.pks = spki_pin(Path(f"{cert}.crt").read_text(encoding="ascii"))
             stream = {"streamSettings": {"security": "tls", "tlsSettings": {"certificates": [
                 {"certificateFile": f"{cert}.crt", "keyFile": f"{cert}.key"}]}}}
         stub = self.inet_ip if self.dns_port == 53 else {
@@ -281,7 +306,91 @@ class Stand:
         self.servers[name] = server
         return server
 
+    def add_singbox_server(self, name: str, kind: str = "anytls") -> Server:
+        """Сервер, которого Xray не умеет, — его ведёт sing-box (anytls, hysteria2, tuic).
+
+        anytls идёт по TCP, поэтому перед ним то же реле-«ТСПУ», что и перед серверами Xray.
+        hysteria2 и tuic — по UDP: реле для них нет, сервер слушает на адресе «интернета»
+        сам. Сертификат самоподписанный; ссылка закрепляет его открытый ключ (pks)."""
+        assert self.singbox_bin is not None, "нужен XGW_SINGBOX_BIN"
+        server = Server(name, free_port(), free_port(), self.workdir / f"relay-{name}.mode",
+                        kind=kind)
+        server.mode_file.write_text("pass", encoding="ascii")
+        pair = subprocess.run(
+            [str(self.singbox_bin), "generate", "tls-keypair", server.domain],
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout
+        def block(kind: str) -> str:
+            first = pair.index(f"-----BEGIN {kind}")
+            return pair[first:pair.index(f"-----END {kind}-----") + len(f"-----END {kind}-----")]
+
+        key, cert = block("PRIVATE KEY"), block("CERTIFICATE")
+        cert_path, key_path = self.workdir / f"sb-{name}.crt", self.workdir / f"sb-{name}.key"
+        cert_path.write_text(cert + "\n", encoding="ascii")
+        key_path.write_text(key + "\n", encoding="ascii")
+        server.pks = spki_pin(cert)
+        tls = {"enabled": True, "certificate_path": str(cert_path), "key_path": str(key_path)}
+        tcp = kind == "anytls"
+        listen_port = server.listen_port if tcp else server.relay_port
+        if not tcp:
+            server.listen_port = server.relay_port
+        users = {
+            "anytls": [{"password": SB_PASSWORD}],
+            "hysteria2": [{"password": SB_PASSWORD}],
+            "tuic": [{"uuid": UUID, "password": SB_PASSWORD}],
+        }[kind]
+        inbound = {
+            "type": kind, "tag": "in", "listen": "127.0.0.1" if tcp else self.inet_ip,
+            "listen_port": listen_port, "users": users,
+            "tls": tls if tcp else {**tls, "alpn": ["h3"]},
+        }
+        # Сниффинг на шлюзе подставляет домен вместо IP: сервер разрешает его сам, и его
+        # резолвер на стенде — DNS-заглушка origin (как у серверов Xray выше).
+        config = {
+            "log": {"level": "info"},
+            "dns": {"servers": [{
+                "type": "udp", "tag": "stub", "server": self.inet_ip,
+                "server_port": self.dns_port,
+            }]},
+            "inbounds": [inbound],
+            "outbounds": [{"type": "direct", "tag": "out"}],
+            "route": {"default_domain_resolver": "stub"},
+        }
+        config_path = self.workdir / f"server-{name}.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self._spawn(f"server-{name}", "inet",
+                    [str(self.singbox_bin), "--disable-color", "run", "-c", str(config_path)],
+                    "started")
+        if tcp:
+            self._spawn(
+                f"relay-{name}", "inet",
+                [sys.executable, str(HERE / "freeze_relay.py"),
+                 "--listen", f"{self.inet_ip}:{server.relay_port}",
+                 "--upstream", f"127.0.0.1:{server.listen_port}",
+                 "--mode-file", str(server.mode_file)],
+                "READY",
+            )
+        self.servers[name] = server
+        return server
+
+    def singbox_service(self) -> PidfileSingboxService:
+        assert self.singbox_bin is not None
+        return PidfileSingboxService(
+            self.singbox_bin, self.root / "etc/xgw/sing-box/config.json",
+            self.root / "run/xgw/singbox.pid",
+        )
+
+    def singbox_pid(self) -> int:
+        return int((self.root / "run/xgw/singbox.pid").read_text(encoding="ascii").strip())
+
     def stop(self) -> None:
+        # sing-box мог запуститься и сам (XGW_SINGBOX_BIN в окружении, [core] mode = "auto"):
+        # останавливаем по pid-файлу при любой настройке стенда.
+        with contextlib.suppress(Exception):
+            PidfileSingboxService(
+                self.singbox_bin or Path("sing-box"), self.root / "etc/xgw/sing-box/config.json",
+                self.root / "run/xgw/singbox.pid",
+            ).stop()
         with contextlib.suppress(Exception):
             self.xray_service().stop()
         for proc in reversed(self._procs):
@@ -414,6 +523,12 @@ metrics_port = {self.ports['metrics']}
 socks_port = {self.ports['socks']}
 http_port = {self.ports['http']}
 probe_port_base = {self.ports['probe_base']}
+
+[core]
+# Без sing-box на стенде второе ядро выключено: проверки прежних этапов идут, как до 0.1.12.
+mode = "{'auto' if self.singbox_bin else 'xray'}"
+port_base = {self.ports['singbox_base']}
+api_port = {self.ports['singbox_api']}
 
 [apply]
 restart_window = "00:00-00:01"

@@ -17,6 +17,8 @@ from ..model import ServerNode
 from ..net import sysctl
 from ..net.tun import MTU as tun_mtu
 from . import fragment as fragmenting
+from . import profiles as profiling
+from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
@@ -36,6 +38,8 @@ class NodeInfo:
     probe_port: int
     role: str  # proxy | spare
     fragment: bool = False  # соединение идёт через дробление ClientHello (fragment.py)
+    # Профиль обхода (profiles.py): каким ядром и как ведётся сервер.
+    profile: str = profiling.XRAY_DEFAULT
 
 
 @dataclass
@@ -83,16 +87,24 @@ def _is_ipv6(address: str) -> bool:
 
 def skip_reason(
     node: ServerNode, cfg: Config, include_re=None, exclude_re=None,
-    dead: Collection[str] = (),
+    dead: Collection[str] = (), served: Collection[str] | None = None,
 ) -> str:
     """Почему сервер не попадёт в конфиг Xray; пусто — попадёт.
 
     excluded — отключён или убран в панели; junk — служебный адрес; ipv6 —
     IPv6-адрес при network.ipv6 = off; filter — отсеян фильтрами по имени; dns —
-    домен сервера не разрешается (dead — такие домены, их ведёт engine).
+    домен сервера не разрешается (dead — такие домены, их ведёт engine); core — сервер
+    умеет только sing-box, а он не ведёт этот сервер (отключён `core.mode = "xray"` или
+    сервер закреплён за Xray, нет sing-box, а при served — сервера нет среди тех, что
+    sing-box сейчас ведёт).
     """
     if node.fingerprint in cfg.managed.disabled or node.fingerprint in cfg.managed.removed:
         return "excluded"
+    if node.capability == "singbox" and (
+        cfg.core.mode == "xray" or cfg.managed.core.get(node.fingerprint) == "xray"
+        or (served is not None and node.fingerprint not in served)
+    ):
+        return "core"
     if is_junk(node.address, node.port):
         return "junk"
     if not cfg.network.ipv6_proxy and _is_ipv6(node.address):
@@ -114,6 +126,7 @@ def select_nodes(
     nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = (),
     dead: Collection[str] = (), tier: cost.Klass | None = None,
     costs: Mapping[str, float] | None = None, reserve: str | None = None,
+    served: Collection[str] | None = None,
 ) -> Selection:
     """Фильтры по имени, отбрасывание служебных адресов, дедупликация,
     канонический порядок (стабилен при любом порядке входных ссылок).
@@ -137,9 +150,14 @@ def select_nodes(
     reserve — отпечаток запасного, которому быть резервным выходом (его выбирает демон
     по дешёвой проверке). Годится только запасной класса хуже, чем у участников; без
     него резервный — первый запасной лучшего из таких классов.
+
+    served — отпечатки серверов, которые sing-box сейчас ведёт; без него (None) серверы,
+    которые умеет только sing-box, отсеиваются лишь по настройкам (skip_reason).
     """
     warnings: list[str] = []
-    stats = dict.fromkeys(("total", "junk", "ipv6", "filter", "dns", "excluded", "duplicates"), 0)
+    stats = dict.fromkeys(
+        ("total", "junk", "ipv6", "filter", "dns", "excluded", "duplicates", "core"), 0,
+    )
     include_re = re.compile(cfg.filters.include_regex) if cfg.filters.include_regex else None
     exclude_re = re.compile(cfg.filters.exclude_regex) if cfg.filters.exclude_regex else None
 
@@ -153,7 +171,7 @@ def select_nodes(
                 chains.append(node)
             continue
         stats["total"] += 1
-        reason = skip_reason(node, cfg, include_re, exclude_re, dead)
+        reason = skip_reason(node, cfg, include_re, exclude_re, dead, served)
         if reason == "junk":
             warnings.append(
                 f"узел «{node.name}» отброшен: служебный адрес {node.address}:{node.port}"
@@ -406,9 +424,28 @@ def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> l
                 probe_port=ports.get(probe_tag, 0),
                 role=role,
                 fragment=fragmenting.used(outbound),
+                profile=outbound_profile(outbound),
             )
         )
     return result
+
+
+def outbound_profile(outbound: Mapping) -> str:
+    """Профиль обхода (profiles.py), в котором сервер заведён в Xray: мост к sing-box,
+    дробление ClientHello или обычное соединение."""
+    letter = singboxing.bridge_variant(outbound)
+    if letter:
+        return profiling.PROFILE_OF_LETTER[letter]
+    return profiling.XRAY_FRAGMENT if fragmenting.used(outbound) else profiling.XRAY_DEFAULT
+
+
+def applied_profiles(config: Mapping | None, nodes: Sequence[ServerNode]) -> dict[str, str]:
+    """Отпечаток → профиль сервера в применённом конфиге Xray."""
+    known = {node.fingerprint for node in nodes}
+    return {
+        info.fingerprint: info.profile for info in applied_nodes(config, nodes)
+        if info.fingerprint in known
+    }
 
 
 def fragmented_fingerprints(config: Mapping | None, nodes: Sequence[ServerNode]) -> set[str]:
@@ -448,8 +485,10 @@ def _modernize(outbound: dict) -> None:
     if not isinstance(stream, dict):
         return
     tls = stream.get("tlsSettings")
-    if isinstance(tls, dict) and "allowInsecure" in tls:
-        stream["tlsSettings"] = {key: value for key, value in tls.items() if key != "allowInsecure"}
+    # allowInsecure Xray не принимает, xgwSingboxPin — поле XGW для sing-box (parsers/common.py).
+    if isinstance(tls, dict) and ("allowInsecure" in tls or "xgwSingboxPin" in tls):
+        dropped = ("allowInsecure", "xgwSingboxPin")
+        stream["tlsSettings"] = {key: value for key, value in tls.items() if key not in dropped}
     for key in ("wsSettings", "httpupgradeSettings"):
         settings = stream.get(key)
         headers = settings.get("headers") if isinstance(settings, dict) else None
@@ -489,11 +528,18 @@ def build(
     probe_url: str | None = None,
     containers_tun: bool = False,
     fragment: Collection[str] = (),
+    profile_of: Mapping[str, str] | None = None,
+    bridge: singboxing.Plan | None = None,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
+
+    profile_of — профиль каждого сервера (profiles.py; отпечаток → профиль), уже выбранный
+    engine.assemble; у серверов, которых в нём нет, профиль — по fragment и настройкам.
+    bridge — желаемое состояние sing-box (singbox.Plan): порты и пароль мостов для серверов,
+    которых ведёт он.
 
     probe_url — адрес проб ядра (burstObservatory), если не probe.url: пока probe.url не
     отвечает, ядро пробует серверы по запасному адресу (watch/target.py).
@@ -533,14 +579,32 @@ def build(
     outbounds: list[dict] = []
     mode = cfg.fragment.mode
     for info, node in zip(nodes, ordered, strict=True):
+        profile = (profile_of or {}).get(node.fingerprint)
+        if profile is None:
+            wanted = mode == "always" or (mode != "off" and node.fingerprint in fragment)
+            profile = profiling.XRAY_FRAGMENT if wanted else profiling.XRAY_DEFAULT
+        letter = profiling.LETTERS.get(profile, "")
+        if letter:
+            port = bridge.ports.get((node.fingerprint, letter)) if bridge is not None else None
+            if port is not None:
+                outbound = singboxing.bridge_outbound(port, letter, bridge.password)  # type: ignore[union-attr]
+                outbound["tag"] = info.tag
+                info.profile = profile
+                outbounds.append(outbound)
+                continue
+            if not node.outbound:
+                raise BuildError(f"для «{node.name}» нет входа sing-box — сервер ведёт только он")
+            profile = profiling.XRAY_DEFAULT
+        if not node.outbound:
+            raise BuildError(f"«{node.name}» умеет только sing-box, а профиль {profile} — Xray")
         outbound = copy.deepcopy(node.outbound)
         outbound["tag"] = info.tag
         _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
-        wanted = mode == "always" or (mode != "off" and node.fingerprint in fragment)
-        if wanted and fragmenting.eligible(outbound):
+        if profile == profiling.XRAY_FRAGMENT and fragmenting.eligible(outbound):
             fragmenting.enable(outbound)
             info.fragment = True
+            info.profile = profiling.XRAY_FRAGMENT
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)

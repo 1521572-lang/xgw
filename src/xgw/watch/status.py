@@ -16,6 +16,7 @@ from pathlib import Path
 from .. import cost, masking, priority
 from .. import pin as pinning
 from ..config import Config, parse_seconds, probe_bytes
+from ..generator import profiles as profiling
 from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
 from ..store import Store
@@ -277,9 +278,11 @@ def collect_status(
     daemon: bool = False,
     capture: dict | None = None,
     probe_target: str = "",
+    singbox: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
-    probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает)."""
+    probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает).
+    singbox — состояние второго ядра (daemon._singbox_status)."""
     now = time.time()
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
@@ -290,6 +293,7 @@ def collect_status(
     pin: dict | None = None
     main: dict | None = None
     speeds: dict[str, dict] = {}
+    protocols = _protocols(paths)
     summary: dict = {}
     probe_size: int | None = None
     try:
@@ -346,6 +350,10 @@ def collect_status(
                     "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
                     # Соединение идёт через дробление ClientHello (generator/fragment.py).
                     "fragment": info.fragment,
+                    # Профиль обхода и ядро, которое ведёт сервер (generator/profiles.py).
+                    "profile": info.profile,
+                    "core": profiling.core_of(info.profile),
+                    "protocol": protocols.get(info.fingerprint, ""),
                     # Основной сервер (watch/speed.py) и последний замер скорости.
                     "main": info.tag == main_tag,
                     "speed_mbps": measure.get("mbps"),
@@ -371,6 +379,9 @@ def collect_status(
                     "scanned": scan["ts"] if scan else None,
                     "priority": priority.level_of(cfg.managed.priority, info.fingerprint),
                     "fragment": info.fragment,
+                    "profile": info.profile,
+                    "core": profiling.core_of(info.profile),
+                    "protocol": protocols.get(info.fingerprint, ""),
                 }
             )
 
@@ -430,11 +441,26 @@ def collect_status(
         "nodes": summary,
         "probe_target": probe_target,
         "pending_restart": paths.pending_config_file.exists(),
+        # Второе ядро: режим [core], установлен ли sing-box, отвечает ли, сколько серверов он
+        # ведёт; singbox_pending — его конфиг ждёт окна перезапуска (перечитывание рвёт
+        # соединения через него).
+        "singbox": singbox or {},
+        "singbox_pending": paths.singbox_pending_file.exists(),
         "events": events,
     }
     masked = masking.mask_obj(status)
     assert isinstance(masked, dict)
     return masked
+
+
+def _protocols(paths: Paths) -> dict[str, str]:
+    """Отпечаток → протокол сервера из списка серверов подписок (engine.save_inventory)."""
+    loaded = _load_json_file(paths.var / "inventory.json") or {}
+    servers = loaded.get("servers")
+    return {
+        str(item.get("fingerprint")): str(item.get("protocol") or "")
+        for item in servers if isinstance(item, dict)
+    } if isinstance(servers, list) else {}
 
 
 def _tier(cfg: Config, members: list[dict]) -> str | None:
@@ -502,8 +528,11 @@ def _level(entry: dict) -> str:
 
 
 def _fragment(entry: dict) -> str:
-    """Отметка дробления ClientHello у сервера (generator/fragment.py)."""
-    return " [дробление]" if entry.get("fragment") else ""
+    """Ядро и профиль обхода сервера: [xray], [xray+frag], [sb], [sb+frag], [sb+mux]."""
+    profile = entry.get("profile")
+    if not profile:  # статус старого демона
+        profile = profiling.XRAY_FRAGMENT if entry.get("fragment") else profiling.XRAY_DEFAULT
+    return f" [{profiling.label(profile)}]"
 
 
 def _price(entry: dict) -> str:
@@ -659,6 +688,30 @@ def render_xray(xray: dict) -> str:
     return f"Xray{version}: {state}"
 
 
+def render_singbox(info: dict, *, pending: bool = False) -> str:
+    """Строка о втором ядре («sing-box 1.14.3: работает, серверов через него: 3»); пусто — о
+    нём сказать нечего (статус снят без демона либо ядро выключено и не нужно)."""
+    if not info:
+        return ""
+    if info.get("mode") == "xray":
+        return "sing-box: выключен ([core] mode = xray)"
+    if not info.get("installed"):
+        return ("sing-box: не установлен — серверы hysteria2, TUIC и т. п. пропускаются "
+                "(sudo xgw update-singbox)")
+    version = f" {info['version']}" if info.get("version") else ""
+    if info.get("failed"):
+        text = "НЕ ОТВЕЧАЕТ — серверы, которые умеет и Xray, переведены на него"
+    elif not info.get("expected"):
+        text = "установлен, серверов для него пока нет"
+    elif info.get("alive") is False:
+        text = "НЕ ОТВЕЧАЕТ — демон перезапускает службу"
+    else:
+        text = f"работает, серверов через него: {info.get('bridged', 0)}"
+    if pending:
+        text += "; новый конфиг ждёт окна перезапуска (перечитывание рвёт соединения через него)"
+    return f"sing-box{version}: {text}"
+
+
 def _thousands(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -727,6 +780,11 @@ def render_status(status: dict) -> str:
     else:
         lines.append("Состояние: демон XGW не запущен — показаны разовые данные")
     lines.append(render_xray(status.get("xray") or {}))
+    singbox_line = render_singbox(
+        status.get("singbox") or {}, pending=bool(status.get("singbox_pending")),
+    )
+    if singbox_line:
+        lines.append(singbox_line)
     if status.get("probe_target"):
         lines.append(status["probe_target"])
     if status.get("capture"):

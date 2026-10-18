@@ -668,3 +668,61 @@ def test_journal_stream_mismatch_and_stopped_daemon(box, tmp_path):
     assert check.level == WARN and "не поток журнала" in check.text
     stopped = box.diag(runner=lambda argv, **kwargs: "0\n", proc=tmp_path / "none")
     assert stopped._journal() == []
+
+
+# --- sing-box (второе ядро) --------------------------------------------------------------
+
+FAKE_SINGBOX = """#!/bin/sh
+case "$1" in version) echo "sing-box version {version}"; exit 0;; esac
+for last in "$@"; do :; done
+if grep -q BROKEN "$last"; then echo "FATAL decode config: unknown field" >&2; exit 1; fi
+exit 0
+"""
+
+
+def _singbox(box, version="1.14.3"):
+    box.paths.singbox_bin.parent.mkdir(parents=True, exist_ok=True)
+    box.paths.singbox_bin.write_text(FAKE_SINGBOX.format(version=version), encoding="utf-8")
+    box.paths.singbox_bin.chmod(0o755)
+
+
+@pytest.mark.skipif(not LINUX, reason="проверки идут только в Linux")
+def test_singbox_states_in_diag(box):
+    checks = box.diag()._singbox()
+    assert checks[0].level == WARN and "xgw update-singbox" in checks[0].advice
+    box.cfg.core.mode = "xray"
+    assert box.diag()._singbox()[0].level == OK and "выключен" in box.diag()._singbox()[0].text
+    box.cfg.core.mode = "auto"
+    _singbox(box, "1.13.0")
+    wrong = box.diag()._singbox()[0]
+    assert wrong.level == FAIL and "только с sing-box 1.14.3" in wrong.text
+    assert box.diag(preinstall=True)._singbox()[0].level == WARN
+    _singbox(box)
+    ok = box.diag()._singbox()
+    assert [(check.name, check.level) for check in ok] == [("sing-box", OK)]  # конфига ещё нет
+    assert "версия 1.14.3" in ok[0].text
+
+
+@pytest.mark.skipif(not LINUX, reason="проверки идут только в Linux")
+def test_singbox_config_is_checked_by_the_binary_and_its_journal_is_read(box):
+    _singbox(box)
+    box.installed()
+    box.paths.singbox_config_dir.mkdir(parents=True, exist_ok=True)
+    box.paths.singbox_config_file.write_text(json.dumps({"inbounds": []}), encoding="utf-8")
+    checks = _by_name(box.diag()._singbox())
+    assert checks["sing-box: конфиг"][0].level == OK
+    box.paths.singbox_config_file.write_text('{"x": "BROKEN"}', encoding="utf-8")
+    broken = _by_name(box.diag()._singbox())["sing-box: конфиг"][0]
+    assert broken.level == FAIL and "unknown field" in broken.text
+    box.paths.singbox_config_file.write_text("не JSON", encoding="utf-8")
+    unreadable = _by_name(box.diag()._singbox())["sing-box: конфиг"][0]
+    assert unreadable.level == FAIL and "не читается" in unreadable.text
+    box.paths.singbox_config_file.write_text(json.dumps({"inbounds": []}), encoding="utf-8")
+    # Службы: sing-box в списке только когда у него есть конфиг.
+    box.system.units["xgw-singbox.service"] = {"active": False, "enabled": True}
+    for unit in ("xgw-net.service", "xgw-xray.service", "xgw.service", "xgw-dhcp.service"):
+        box.system.units[unit] = {"active": True, "enabled": True}
+    services = box.diag()._services()
+    assert services[0].level == FAIL and "xgw-singbox.service" in services[0].text
+    box.paths.singbox_config_file.unlink()
+    assert box.diag()._services()[0].level == OK

@@ -45,7 +45,8 @@ from .apply.rotation import (
 )
 from .config import Config
 from .generator import builder
-from .generator import fragment as fragmenting
+from .generator import profiles as profiling
+from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, NodeInfo
 from .net import tun
 from .net.capture import capture_inbounds
@@ -122,15 +123,73 @@ SPEED_KEEP = 7 * 86400.0  # результаты замеров старше н�
 # Канал занят: через серверы идёт больше этого (байт/с, ~2 Мбит/с) — замер отложен до
 # следующего шага: чужая загрузка исказила бы его, а замер — мешал бы ей.
 SPEED_BUSY_BPS = 250_000
-# Дробление ClientHello (generator/fragment.py, fragment.mode = "auto"). Запасной, который
-# не отвечает так, как не отвечают при блокировке DPI, проверяется в другом режиме: без
-# дробления — с ним, с дроблением — без него. Помогло — режим остаётся, нет — возвращается
-# прежний, а следующая попытка для этого сервера — не раньше FRAGMENT_RETRY. Сервер с
-# дроблением, который отвечает, раз в FRAGMENT_RECHECK пробуется без него: дробление
-# удлиняет рукопожатие, и, если провайдер перестал блокировать, оно лишнее.
-FRAGMENT_VERDICTS = ("CONNECT_FAIL", "TIMEOUT", "STALL_BEFORE_BODY", "FROZEN")
-FRAGMENT_RETRY = 6 * 3600.0
-FRAGMENT_RECHECK = 24 * 3600.0
+# Профили обхода (generator/profiles.py, fragment.mode = "auto"). Запасной, который не отвечает
+# так, как не отвечают при блокировке ТСПУ, проверяется в других профилях по лестнице: Xray с
+# дроблением ClientHello, sing-box с дроблением TLS, sing-box с мультиплексированием и
+# паддингом (при «заморозке»). Помогло — профиль закрепляется, нет — возвращается прежний, а
+# следующая попытка для этого сервера — не раньше PROFILE_RETRY. Сервер на обученном профиле,
+# который отвечает, раз в PROFILE_RECHECK пробуется на базовом: профили тяжелее (дробление
+# удлиняет рукопожатие), и, если провайдер перестал блокировать, они лишние.
+PROFILE_RETRY = 6 * 3600.0
+PROFILE_RECHECK = 24 * 3600.0
+SINGBOX_RETRY = 1800.0  # sing-box не поднялся и серверы ушли на Xray — пробовать снова так часто
+
+
+@dataclasses.dataclass
+class ProfileTrial:
+    """Профиль, в котором сервер проверяется сейчас."""
+
+    profile: str
+    rest: list[str]  # ступени лестницы, которые проверятся, если эта не поможет
+    prev: str  # профиль до проверки: если не помог ни один, сервер возвращается в него
+    probe_tag: str
+    since: float
+    recheck: bool = False  # возврат на базовый профиль, а не проба новой ступени
+
+
+@dataclasses.dataclass
+class ProfileWish:
+    """Решение о профиле сервера, ждущее применения (_profile_step)."""
+
+    profile: str
+    trial: bool
+    rest: list[str]
+    prev: str
+    recheck: bool = False
+
+
+UDP_PROTOCOLS = ("hysteria2", "hysteria", "tuic", "wireguard")
+
+
+def _transport(node) -> str:
+    """tcp или udp: по чему сервер связывается с клиентом (QUIC и WireGuard — по UDP)."""
+    return "udp" if node.protocol in UDP_PROTOCOLS else "tcp"
+
+
+def _keep_text(trial: ProfileTrial) -> str:
+    new, old = trial.profile, trial.prev
+    if new == profiling.XRAY_FRAGMENT and old == profiling.XRAY_DEFAULT:
+        return "отвечает только с дроблением ClientHello — оно включено"
+    if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_FRAGMENT:
+        return "отвечает и без дробления ClientHello — оно выключено"
+    if trial.recheck:
+        return (f"отвечает и на профиле «{profiling.NAMES[new]}» — он возвращён "
+                f"(был «{profiling.NAMES[old]}»)")
+    return (f"отвечает на профиле «{profiling.NAMES[new]}» — он закреплён "
+            f"(был «{profiling.NAMES[old]}»)")
+
+
+def _fail_text(trial: ProfileTrial) -> str:
+    new, old = trial.profile, trial.prev
+    if new == profiling.XRAY_FRAGMENT and old == profiling.XRAY_DEFAULT:
+        return "не отвечает и с дроблением ClientHello — оно выключено"
+    if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_FRAGMENT:
+        return "без дробления ClientHello не отвечает — оно включено снова"
+    if trial.recheck:
+        return (f"на профиле «{profiling.NAMES[new]}» не отвечает — возвращён "
+                f"«{profiling.NAMES[old]}»")
+    return (f"не отвечает ни на одном профиле — возвращён «{profiling.NAMES[old]}», следующая "
+            "попытка через 6 ч")
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -198,6 +257,7 @@ class Daemon:
         self.applier = engine.make_applier(cfg, paths, xray_bin)
         self.api = self.applier.api
         self.service = self.applier.service
+        self.singbox = engine.make_singbox(cfg, paths)
         self.mark = engine.bypass_mark(cfg, self.log)
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
         # sinks — куда доставлять уведомления (рабочий стол, Telegram); их собирает
@@ -232,13 +292,20 @@ class Daemon:
         # rotate_after_min.
         self.vetted: set[str] = set()
         self.bad_members: dict[str, str] = {}
-        # Дробление ClientHello (FRAGMENT_*): когда демон последний раз переключал режим
-        # сервера (отпечаток → time.time()), какой режим сервера сейчас проверяется
-        # (отпечаток → (с дроблением ли, probe-тег, с какого времени)) и что ждёт
-        # применения (отпечаток → (с дроблением ли, это проверка)).
-        self._fragment_switched: dict[str, float] = {}
-        self._fragment_trial: dict[str, tuple[bool, str, float]] = {}
-        self._fragment_wanted: dict[str, tuple[bool, bool]] = {}
+        # Профили обхода (PROFILE_*): когда демон последний раз переключал профиль сервера
+        # (отпечаток → time.time()), какой профиль сервера сейчас проверяется и что ждёт
+        # применения (отпечаток → решение).
+        self._profile_switched: dict[str, float] = {}
+        self._profile_trial: dict[str, ProfileTrial] = {}
+        self._profile_wanted: dict[str, ProfileWish] = {}
+        # sing-box: сколько шагов подряд не отвечает, откатывали ли его на last-good, и
+        # ушли ли серверы на Xray, потому что он не поднимается (когда пробовать снова).
+        self._singbox_down = 0
+        self._singbox_rolled_back = False
+        self._singbox_failed = False
+        self._singbox_retry_at = 0.0
+        self._singbox_alive = True
+        self._singbox_version_cache: tuple[float, str] | None = None
         # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
         self.probe_target = ""
         self.next_target_check = 0.0
@@ -393,9 +460,13 @@ class Daemon:
         self._main_suspended = previous._main_suspended
         self._main_pinned = previous._main_pinned
         self._pin_recheck_at = previous._pin_recheck_at
-        self._fragment_switched = dict(previous._fragment_switched)
-        self._fragment_trial = dict(previous._fragment_trial)
-        self._fragment_wanted = dict(previous._fragment_wanted)
+        self._profile_switched = dict(previous._profile_switched)
+        self._profile_trial = dict(previous._profile_trial)
+        self._profile_wanted = dict(previous._profile_wanted)
+        self._singbox_down = previous._singbox_down
+        self._singbox_rolled_back = previous._singbox_rolled_back
+        self._singbox_failed = previous._singbox_failed
+        self._singbox_retry_at = previous._singbox_retry_at
         self._traffic = previous._traffic
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
@@ -507,6 +578,14 @@ class Daemon:
         if not waiting:
             self._guard_capture(signals.xray_ok, now)
 
+        if not changed and state is not State.XRAY_DOWN:
+            changed = self._singbox_step(now)
+        if (
+            not changed and self.inventory is not None and not self._singbox_failed
+            and self.paths.singbox_pending_file.exists() and self._singbox_window()
+        ):
+            # Конфиг sing-box ждал окна: перечитывание рвёт соединения через него.
+            changed = self._rebuild(None, urgent=False, reason="конфиг sing-box (окно перезапуска)")
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
         self._containers_appeared(applied)
@@ -571,7 +650,7 @@ class Daemon:
             if not changed:
                 changed = self._reserve_step(view, applied, state, now)
             if not changed:
-                changed = self._fragment_step(view)
+                changed = self._profile_step(view)
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
@@ -1096,12 +1175,15 @@ class Daemon:
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
         tier: cost.Klass | None = None, reserve: str | None = None,
-        fragment: set[str] | None = None,
+        profiles: dict[str, str] | None = None,
     ) -> bool:
         assert self.inventory is not None
         dead = engine.quarantined()
+        # Перечитывание sing-box рвёт соединения через него: сразу — при аварии и в окне
+        # перезапуска, иначе — только если через него никто не идёт (engine.assemble).
+        reload = True if urgent or self._singbox_window() else None
         try:
-            assembly = self._assemble(prefer, tier, reserve, fragment)
+            assembly = self._assemble(prefer, tier, reserve, profiles, reload)
         except engine.EngineError as exc:
             self.notifier.event("config", f"{reason}: {exc}", notify=True)
             return False
@@ -1110,7 +1192,7 @@ class Daemon:
                 # Сборка отложила домены, которых нет в DNS. Список для панели записан до
                 # неё — иначе там такой сервер значился бы «включён, сейчас возьмёт в работу».
                 self._save_inventory(self.inventory)
-        outcome = self._apply(assembly.result.config, urgent=urgent)
+        outcome = self._apply(assembly.result.config, urgent=urgent, singbox=assembly.singbox)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)
         return self._report(outcome, reason)
@@ -1164,16 +1246,24 @@ class Daemon:
 
     def _assemble(
         self, prefer: list[str] | None, tier: cost.Klass | None = None,
-        reserve: str | None = None, fragment: set[str] | None = None,
+        reserve: str | None = None, profiles: dict[str, str] | None = None,
+        reload_singbox: bool | None = None,
     ) -> engine.Assembly:
         assert self.inventory is not None
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
             xray_bin=self.xray_bin, prefer=prefer, tier=tier, reserve=reserve,
-            fragment=fragment,
+            profiles=profiles, reload_singbox=reload_singbox,
+            singbox_ok=False if self._singbox_failed else None,
         )
 
-    def _apply(self, config: dict, *, urgent: bool) -> ApplyOutcome:
+    def _apply(
+        self, config: dict, *, urgent: bool, singbox: engine.SingboxChange | None = None,
+    ) -> ApplyOutcome:
+        """Сначала sing-box (мосты должны слушать), затем Xray."""
+        rejected = self._apply_singbox(singbox)
+        if rejected is not None:
+            return rejected
         return self.applier.apply(config, urgent=urgent)
 
     # --- сканы и замена участников ---------------------------------------------
@@ -1188,9 +1278,14 @@ class Daemon:
         queued = set(self.scan_queue)
         tier = self._tier(view)
         prices = self._prices()
+        # Трафик не идёт (ALL_DEAD, RESERVE): внутри класса первыми проверяются серверы на другом
+        # ядре и другом транспорте, чем у упавших участников, — блокировка, которая срезала TCP
+        # через Xray, может пропустить QUIC через sing-box, и наоборот.
+        other = self._alternatives(view) if self.machine.state in (
+            State.ALL_DEAD, State.RESERVE) else set()
         spares = sorted(
             (info for info in view if info.role == "spare"),
-            key=lambda info: self._klass(info.fingerprint),
+            key=lambda info: (self._klass(info.fingerprint), info.fingerprint not in other),
         )
         for info in spares:
             klass = self._klass(info.fingerprint)
@@ -1202,6 +1297,23 @@ class Daemon:
             if info.probe_tag not in queued:
                 self.scan_queue.append(info.probe_tag)
         self.next_rescan = now + RESCAN_PAUSE
+
+    def _alternatives(self, view: list[NodeInfo]) -> set[str]:
+        """Отпечатки запасных, чьи ядро или транспорт отличаются от всех участников: при
+        массовой блокировке они проверяются первыми."""
+        if self.inventory is None:
+            return set()
+        nodes = {node.fingerprint: node for node in self.inventory.nodes}
+        members = [info for info in view if info.role == "proxy" and info.fingerprint in nodes]
+        if not members:
+            return set()
+        used = {(profiling.core_of(info.profile), _transport(nodes[info.fingerprint]))
+                for info in members}
+        return {
+            info.fingerprint for info in view
+            if info.role == "spare" and info.fingerprint in nodes
+            and (profiling.core_of(info.profile), _transport(nodes[info.fingerprint])) not in used
+        }
 
     def _prices(self) -> dict[str, float]:
         """Стоимость серверов по отпечаткам (cost.py); подписки ещё нет — пусто. Считается
@@ -1266,7 +1378,7 @@ class Daemon:
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
             )
-            self._fragment_note(info, result.verdict)
+            self._profile_note(info, result.verdict)
             if info.role == "proxy":
                 self.vetted.add(info.fingerprint)
                 if result.verdict in REPLACE_NOW_VERDICTS:
@@ -1359,90 +1471,260 @@ class Daemon:
         """Сканы по probe-тегам. «Прошедший последний скан»: результат старше двух
         периодов скана не в счёт."""
         fresh_after = self.wall() - self.cfg.probe.scan_spares_minutes * 120.0 - 120.0
-        # Скан сервера, который сейчас проверяется в другом режиме дробления, получен ещё в
-        # прежнем режиме — по нему сервер не ставится ни участником, ни резервным выходом.
-        trial = {tag for _on, tag, _since in self._fragment_trial.values()}
+        # Скан сервера, который сейчас проверяется в другом профиле обхода, получен ещё в
+        # прежнем профиле — по нему сервер не ставится ни участником, ни резервным выходом.
+        trial = {item.probe_tag for item in self._profile_trial.values()}
         return {
             tag: entry for tag, entry in self.store.scans().items()
             if entry["ts"] >= fresh_after and tag not in trial
         }
 
-    # --- дробление ClientHello -------------------------------------------------
+    # --- профили обхода --------------------------------------------------------
 
-    def _fragment_note(self, info: NodeInfo, verdict: str) -> None:
-        """Итог скана запасного: решить, не проверить ли его в другом режиме дробления
-        ClientHello, и подвести итог такой проверки (FRAGMENT_*). Участников не трогает:
-        их трафик режимом не рискует — не прошедший проверку участник становится
-        запасным, а там до него дойдёт очередь."""
+    def _bridged_letters(self, fingerprint: str) -> set[str]:
+        """Варианты sing-box, заведённые серверу в работающем sing-box."""
+        ports = singboxing.bridge_ports(self.singbox.read())
+        return {letter for fp, letter in ports if fp == fingerprint}
+
+    def _profile_event(self, old: str, new: str, text: str) -> None:
+        # События про дробление в Xray (0.1.11) — прежнего вида; остальные — «профиль».
+        xray_only = {old, new} <= {profiling.XRAY_DEFAULT, profiling.XRAY_FRAGMENT}
+        self.notifier.event("fragment" if xray_only else "profile", text)
+
+    def _profile_note(self, info: NodeInfo, verdict: str) -> None:
+        """Итог скана запасного: решить, не проверить ли его в другом профиле обхода
+        (generator/profiles.py), и подвести итог такой проверки. Участников не трогает:
+        их трафик профилем не рискует — не прошедший проверку участник становится запасным,
+        а там до него дойдёт очередь. Работает при fragment.mode = "auto"."""
         if self.cfg.fragment.mode != "auto" or info.role != "spare" or self.inventory is None:
             return
         node = next(
             (node for node in self.inventory.nodes if node.fingerprint == info.fingerprint), None,
         )
-        if node is None or not fragmenting.eligible(node.outbound):
+        if node is None:
             return
         fingerprint, now = info.fingerprint, self.wall()
+        limited = self._prices().get(fingerprint, 1.0) > 0
+        avail = profiling.available(node, self.cfg, self._bridged_letters(fingerprint))
+        default = profiling.base(self.cfg, avail)
         good = verdict in REPLACEABLE_VERDICTS
-        trial = self._fragment_trial.get(fingerprint)
+        name = f"«{node.name}»"
+        trial = self._profile_trial.get(fingerprint)
         if trial is not None:
-            on, _tag, since = trial
-            if info.fragment != on:
-                # Режим ещё не применён (конфиг ждёт перезапуска): скан — о прежнем режиме.
-                if now - since >= FRAGMENT_RETRY:
-                    del self._fragment_trial[fingerprint]
+            if info.profile != trial.profile:
+                # Профиль ещё не применён (конфиг ждёт перезапуска): скан — о прежнем.
+                if now - trial.since >= PROFILE_RETRY:
+                    del self._profile_trial[fingerprint]
                 return
-            del self._fragment_trial[fingerprint]
             if good:
-                text = ("отвечает только с дроблением ClientHello — оно включено" if on
-                        else "отвечает и без дробления ClientHello — оно выключено")
-            else:
-                self._fragment_wanted[fingerprint] = (not on, False)
-                text = ("не отвечает и с дроблением ClientHello — оно выключено" if on
-                        else "без дробления ClientHello не отвечает — оно включено снова")
-            self.notifier.event("fragment", f"«{node.name}» {text}")
+                del self._profile_trial[fingerprint]
+                self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
+                return
+            if trial.rest:
+                following = trial.rest[0]
+                self._profile_wanted[fingerprint] = ProfileWish(
+                    following, True, trial.rest[1:], trial.prev,
+                )
+                self._profile_event(
+                    trial.profile, following,
+                    f"{name} не отвечает на профиле «{profiling.NAMES[trial.profile]}» — пробую "
+                    f"«{profiling.NAMES[following]}»",
+                )
+                del self._profile_trial[fingerprint]
+                return
+            del self._profile_trial[fingerprint]
+            self._profile_wanted[fingerprint] = ProfileWish(trial.prev, False, [], trial.prev)
+            self._profile_event(trial.prev, trial.profile, f"{name} {_fail_text(trial)}")
             return
-        last = self._fragment_switched.get(fingerprint)
-        if good and info.fragment:
+        last = self._profile_switched.get(fingerprint)
+        heavy = info.profile != default
+        if good and heavy:
             if last is None:
-                self._fragment_switched[fingerprint] = now  # отсчёт до перепроверки — с сейчас
-            elif now - last >= FRAGMENT_RECHECK:
-                self._fragment_wanted[fingerprint] = (False, True)
-        elif verdict in FRAGMENT_VERDICTS and (last is None or now - last >= FRAGMENT_RETRY):
-            self._fragment_wanted[fingerprint] = (not info.fragment, True)
+                self._profile_switched[fingerprint] = now  # отсчёт до перепроверки — с сейчас
+            elif now - last >= PROFILE_RECHECK:
+                self._profile_wanted[fingerprint] = ProfileWish(
+                    default, True, [], info.profile, recheck=True,
+                )
+        elif verdict in profiling.TRIGGER_VERDICTS and (
+            last is None or now - last >= PROFILE_RETRY
+        ):
+            steps = profiling.ladder(verdict, info.profile, default, avail)
+            if limited:
+                # Квота подписки: на другое ядро сервер в фоне не переводится — каждая проба
+                # тратит квоту, а перебор ядер без нужды — пустая трата (дробление в том же
+                # ядре остаётся, как в 0.1.11).
+                steps = [step for step in steps
+                         if profiling.core_of(step) == profiling.core_of(default)]
+            if steps:
+                self._profile_wanted[fingerprint] = ProfileWish(
+                    steps[0], True, steps[1:], info.profile,
+                )
 
-    def _fragment_step(self, view: list[NodeInfo]) -> bool:
-        """Применяет решения _fragment_note одной сборкой конфига: outbounds серверов
-        меняются через API, без перезапуска Xray. Проверяемые серверы — в начало очереди
-        скана."""
-        wanted, self._fragment_wanted = self._fragment_wanted, {}
+    def _profile_step(self, view: list[NodeInfo]) -> bool:
+        """Применяет решения _profile_note одной сборкой конфига: outbounds серверов меняются
+        через API Xray (профили sing-box заведены в нём заранее), без перезапуска Xray и без
+        перечитывания sing-box. Проверяемые серверы — в начало очереди скана."""
+        wanted, self._profile_wanted = self._profile_wanted, {}
         if not wanted or self.inventory is None or self.cfg.fragment.mode != "auto":
             return False
         by_fingerprint = {info.fingerprint: info for info in view if info.role == "spare"}
-        wanted = {key: item for key, item in wanted.items() if key in by_fingerprint}
-        current = {info.fingerprint for info in view if info.fragment}
-        target = (current | {key for key, (on, _trial) in wanted.items() if on}) - {
-            key for key, (on, _trial) in wanted.items() if not on
+        wanted = {key: wish for key, wish in wanted.items() if key in by_fingerprint}
+        changes = {
+            key: wish.profile for key, wish in wanted.items()
+            if by_fingerprint[key].profile != wish.profile
         }
-        if target == current:
+        if not changes:
             return False
         names = ", ".join(sorted(by_fingerprint[key].tag for key in wanted))
         changed = self._rebuild(
-            None, urgent=False, reason=f"дробление ClientHello ({names})", fragment=target,
+            None, urgent=False, reason=f"профиль обхода ({names})", profiles=changes,
         )
         applied = engine.read_json(self.paths.xray_config_file)
-        now_mode = builder.fragmented_fingerprints(applied, self.inventory.nodes)
+        now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
         now = self.wall()
-        for key, (on, trial) in wanted.items():
-            if (key in now_mode) != on:
+        for key, wish in wanted.items():
+            if now_profiles.get(key) != wish.profile:
                 continue  # не применилось: решение примет следующий скан
-            self._fragment_switched[key] = now
-            if trial:
+            self._profile_switched[key] = now
+            if wish.trial:
                 info = by_fingerprint[key]
-                self._fragment_trial[key] = (on, info.probe_tag, now)
+                self._profile_trial[key] = ProfileTrial(
+                    wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
+                )
                 if info.probe_tag in self.scan_queue:
                     self.scan_queue.remove(info.probe_tag)
                 self.scan_queue.appendleft(info.probe_tag)
         return changed
+
+    # --- sing-box --------------------------------------------------------------
+
+    def _singbox_step(self, now: float) -> bool:
+        """Слежение за sing-box (ТЗ 5.3): не отвечает — перезапуск, после двух неудач — откат
+        на last-good, дальше — серверы переводятся на Xray. True — конфиг Xray пересобран."""
+        if self._singbox_failed:
+            return self._singbox_recover(now)
+        if not self.singbox.expected():
+            self._singbox_down = 0
+            self._singbox_alive = True
+            return False
+        self._singbox_alive = self.singbox.alive()
+        if self._singbox_alive:
+            self._singbox_down = 0
+            self._singbox_rolled_back = False
+            return False
+        self._singbox_down += 1
+        self.log.warning("sing-box не отвечает (шаг %d)", self._singbox_down)
+        error = self.singbox.restart()
+        if error is None and self.singbox.alive():
+            self.notifier.event("singbox", "sing-box не отвечал — служба перезапущена")
+            self._singbox_down = 0
+            return False
+        if self._singbox_down < ROLLBACK_AFTER:
+            return False
+        if not self._singbox_rolled_back:
+            self._singbox_rolled_back = True
+            outcome = self.singbox.rollback("sing-box не отвечает после перезапуска")
+            if outcome.mode == "rollback":
+                self.notifier.event(
+                    "singbox", f"sing-box откатил конфиг на last-good: {outcome.detail}",
+                    notify=True,
+                )
+                return False
+        # Не поднимается ни с новым, ни с прежним конфигом: серверы, которые умеет и Xray,
+        # переводятся на него — интернет важнее профиля.
+        self._singbox_failed = True
+        self._singbox_retry_at = now + SINGBOX_RETRY
+        self.notifier.event(
+            "singbox",
+            "sing-box не поднимается — серверы переведены на Xray; серверы только для sing-box "
+            "(hysteria2, TUIC…) недоступны, пока он не заработает",
+            notify=True,
+        )
+        if self.inventory is None:
+            return False
+        return self._rebuild(None, urgent=True, reason="sing-box не поднимается")
+
+    def _singbox_recover(self, now: float) -> bool:
+        """sing-box отказал и серверы ушли на Xray: раз в SINGBOX_RETRY пробуем его поднять."""
+        if now < self._singbox_retry_at:
+            return False
+        self._singbox_retry_at = now + SINGBOX_RETRY
+        if not self.singbox.expected():
+            self._singbox_failed = False
+            return False
+        if self.singbox.restart() is not None or not self.singbox.alive():
+            return False
+        self._singbox_failed = False
+        self._singbox_down = 0
+        self._singbox_rolled_back = False
+        self.notifier.event("singbox", "sing-box снова работает — серверы возвращаются на него")
+        if self.inventory is None:
+            return False
+        return self._rebuild(None, urgent=False, reason="sing-box снова работает")
+
+    def _singbox_status(self, view: list[NodeInfo]) -> dict:
+        """Второе ядро для статуса: режим, установлен ли, отвечает ли, сколько серверов ведёт."""
+        installed = singboxing.find_binary(None, self.paths) is not None
+        bridged = sum(1 for info in view if profiling.core_of(info.profile) == "sing-box")
+        expected = installed and self.singbox.expected()
+        return {
+            "mode": self.cfg.core.mode,
+            "installed": installed,
+            "version": self._singbox_version() if installed else "",
+            "expected": expected,
+            "alive": (not self._singbox_failed and self._singbox_alive) if expected else None,
+            "failed": self._singbox_failed,
+            "bridged": bridged,
+        }
+
+    def _singbox_version(self) -> str:
+        """Версия sing-box; перечитывается, когда меняется файл (`xgw update-singbox`)."""
+        binary_path = singboxing.find_binary(None, self.paths)
+        if binary_path is None:
+            return ""
+        try:
+            stamp = binary_path.stat().st_mtime
+        except OSError:
+            return ""
+        cached = self._singbox_version_cache
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        version = singboxing.installed_version(binary_path)
+        text = ".".join(map(str, version)) if version else ""
+        self._singbox_version_cache = (stamp, text)
+        return text
+
+    def _singbox_window(self) -> bool:
+        return in_restart_window(self.cfg.apply.restart_window, self.now_time())
+
+    def _apply_singbox(self, change: engine.SingboxChange | None) -> ApplyOutcome | None:
+        """Применяет конфиг sing-box раньше конфига Xray (мосты должны слушать до того, как
+        Xray на них сошлётся). None — всё в порядке, можно применять Xray."""
+        if change is None or self._singbox_failed:
+            return None
+        outcome = self.singbox.apply(change.config, reload=change.reload)
+        if outcome.mode in ("started", "reloaded", "removed"):
+            count = 0 if change.config is None else len(change.config.get("inbounds") or [])
+            self.notifier.event("singbox", {
+                "started": f"sing-box запущен: мостов {count}",
+                "reloaded": f"конфиг sing-box перечитан: мостов {count}",
+                "removed": "sing-box больше не нужен — остановлен",
+            }[outcome.mode])
+            return None
+        if outcome.mode == "rejected":
+            self.notifier.event(
+                "config", f"конфиг sing-box отклонён: {outcome.detail}", notify=True,
+            )
+            return ApplyOutcome("rejected", detail=f"sing-box check: {outcome.detail}")
+        if outcome.mode in ("rollback", "failed"):
+            self.notifier.event(
+                "singbox", f"sing-box не принял новый конфиг ({outcome.mode}): {outcome.detail}",
+                notify=True,
+            )
+            # Xray собран под отвергнутый конфиг: применять его нельзя, соберётся заново.
+            self._rebuild_asked = True
+            return ApplyOutcome("rejected", detail=f"sing-box: {outcome.detail}")
+        return None  # unchanged, deferred
 
     def _switch_tier(self, view: list[NodeInfo], state: State, now: float) -> bool:
         """Классы серверов (cost.py): ручной приоритет, затем стоимость.
@@ -2133,6 +2415,7 @@ class Daemon:
             action=self.action, since=self.state_since,
             dead_since=self.dead_since, xray_version=self.xray_version, daemon=True,
             capture=self.capture_info, probe_target=self.probe_target,
+            singbox=self._singbox_status(view),
         )
         warnings = tuple(snapshot["budget"]["warnings"])
         if warnings != self._budget_warnings:

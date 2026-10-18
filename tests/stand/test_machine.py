@@ -41,6 +41,9 @@ from stand import UUID, Stand, wait_for
 # там указывал бы не туда.
 _XRAY_ENV = os.environ.get("XGW_XRAY_BIN", "")
 XRAY_BIN = str(Path(_XRAY_ENV).resolve()) if _XRAY_ENV else ""
+_SINGBOX_ENV = os.environ.get("XGW_SINGBOX_BIN", "")
+# sing-box (0.1.12) на «машине» необязателен: без него второе ядро выключено, как до 0.1.12.
+SINGBOX_BIN = str(Path(_SINGBOX_ENV).resolve()) if _SINGBOX_ENV else ""
 REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PANEL_PORT = "8781"
@@ -91,7 +94,8 @@ def _snapshot(box: Machine) -> dict[str, str]:
         "files": box.sh(
             "ls -d /opt/xgw /usr/local/bin/xgw /etc/dnsmasq.d/xgw.conf /etc/xgw/dnsmasq.conf "
             "/etc/sysctl.d/90-xgw.conf "
-            f"/var/lib/xgw /etc/xgw/xray {LAUNCHER} /usr/local/share/applications "
+            f"/var/lib/xgw /etc/xgw/xray /etc/xgw/sing-box {LAUNCHER} "
+            "/usr/local/share/applications "
             "2>/dev/null || true"
         ),
     }
@@ -103,7 +107,8 @@ def gw():
     box = Machine()
     box.create()
     stand = Stand(box.share / "stand", Path(XRAY_BIN), mode="netns",
-                  _topology=MachineTopology(box))
+                  _topology=MachineTopology(box),
+                  singbox_bin=Path(SINGBOX_BIN) if SINGBOX_BIN else None)
     # Команды шлюза — установленный `xgw` внутри контейнера, файлы — в его корне.
     stand.root = box.root
     stand.xgw = lambda *args, timeout=180: box.run("xgw", *args, check=False, timeout=timeout)
@@ -157,10 +162,18 @@ def _put_xray(box: Machine) -> None:
            "/opt/xgw/xray/")
 
 
+def _put_singbox(box: Machine) -> None:
+    """sing-box — в /opt/xgw/sing-box, по той же причине, что и Xray: сети в контейнере нет."""
+    if SINGBOX_BIN:
+        box.sh(f"mkdir -p /opt/xgw/sing-box && cp --remove-destination "
+               f"{Path(SINGBOX_BIN).parent}/* /opt/xgw/sing-box/")
+
+
 def _put_config(gw) -> None:
-    """Конфиг стенда — на место /etc/xgw/config.toml, Xray — на своё место."""
+    """Конфиг стенда — на место /etc/xgw/config.toml, Xray и sing-box — на свои места."""
     shutil.copyfile(gw.stand.config_file, gw.box.root / "etc/xgw/config.toml")
     _put_xray(gw.box)
+    _put_singbox(gw.box)
     gw.box.sh("chmod 600 /etc/xgw/config.toml")
 
 
@@ -719,6 +732,41 @@ def test_lan_device_works_through_the_installed_gateway(gw):
     assert stand.lan("dhcp", "eth0", "--mac", netns.LAN_BYPASS_MAC)["ip"] == netns.LAN_BYPASS_IP
 
 
+@pytest.mark.skipif(not SINGBOX_BIN, reason="нет XGW_SINGBOX_BIN — проверка sing-box пропущена")
+def test_singbox_runs_under_systemd_as_the_service_user(gw):
+    """Второе ядро (0.1.12) на настоящем systemd: служба xgw-singbox от пользователя xray с
+    двумя возможностями, конфиг читается группой xray, перечитывание (systemctl reload) не
+    перезапускает процесс, `xgw diag` видит ядро, ошибок в журнале службы нет."""
+    box = gw.box
+    assert box.run("systemctl", "is-active", "xgw-singbox", check=False).stdout.strip() == "active"
+    assert box.sh("ps -o user= -C sing-box").split() == ["xray"]
+    caps = box.sh("grep CapEff /proc/$(pgrep -x sing-box)/status").split()[1]
+    assert int(caps, 16) == (1 << 12) | (1 << 10)  # CAP_NET_ADMIN, CAP_NET_BIND_SERVICE
+    rights = box.sh("stat -c '%U:%G %a' /etc/xgw/sing-box /etc/xgw/sing-box/config.json")
+    assert rights.splitlines() == ["root:xray 2750", "root:xray 640"]
+    assert box.sh("stat -c '%U:%G %a' /var/lib/xgw/sing-box.last-good.json 2>/dev/null || true"
+                  ).strip() in ("", "root:root 640", "root:root 600")
+    config = json.loads((box.root / "etc/xgw/sing-box/config.json").read_text(encoding="utf-8"))
+    assert config["inbounds"] and "secret" in json.dumps(config)
+    assert _active(gw)["xgw-xray"] == "active"  # Xray и sing-box работают рядом
+
+    pid = box.sh("pgrep -x sing-box").strip()
+    reload = box.run("systemctl", "reload", "xgw-singbox", check=False)
+    assert reload.returncode == 0, reload.stdout + reload.stderr
+    time.sleep(1.5)
+    assert box.sh("pgrep -x sing-box").strip() == pid  # перечитан, а не перезапущен
+    assert _exit_ip(gw) == VIA_VPN  # и интернет через шлюз работает
+
+    result = _xgw(gw, "diag")
+    assert "sing-box: версия 1.14.3" in result.stdout, result.stdout
+    assert "sing-box: конфиг: принят sing-box check" in result.stdout, result.stdout
+    errors = box.sh("journalctl -u xgw-singbox -p err --no-pager -o cat | head -5 || true")
+    assert errors.strip() == "", errors
+    servers = _xgw(gw, "servers").stdout
+    assert "[xray]" in servers, servers
+    assert box.sh("journalctl -u xgw -n 300 --no-pager -o cat").count("Traceback") == 0
+
+
 def test_disable_gives_direct_internet_and_enable_returns_vpn(gw):
     started = time.monotonic()
     assert _xgw(gw, "disable").returncode == 0
@@ -837,7 +885,9 @@ def test_diag_after_install_and_log_export_without_secrets(gw):
     box = gw.box
     result = _xgw(gw, "diag")
     assert result.returncode == 0, result.stdout
-    for text in ("xgw-net, xgw-xray, xgw, xgw-dhcp работают",
+    services = ("xgw-net, xgw-xray, xgw-singbox, xgw, xgw-dhcp работают" if SINGBOX_BIN
+                else "xgw-net, xgw-xray, xgw, xgw-dhcp работают")
+    for text in (services,
                  "Перехват: включён, правила загружены",
                  "ufw: включён, правила для lan0 есть", "профиль xgw-lan активен",
                  "цели сна замаскированы", "через Xray: 65536 Б"):
@@ -858,6 +908,13 @@ def test_diag_after_install_and_log_export_without_secrets(gw):
     assert "****6661" in members["xgw-logs/xray-config.json"]
     assert "table ip xgw" in members["xgw-logs/network.txt"]
     assert "Итог: OK" in members["xgw-logs/diag.txt"]
+    if SINGBOX_BIN:
+        # Конфиг второго ядра в архиве есть, но пароли, ключи и секрет Clash API скрыты.
+        singbox = members["xgw-logs/singbox-config.json"]
+        assert '"secret": "***"' in singbox and "password" in singbox
+        assert '"password": "***"' in singbox
+        assert not re.search(r'"password": "[^*]', singbox)
+        assert UUID not in singbox
 
 
 def test_everything_comes_up_after_reboot_rules_before_network(gw):
@@ -870,6 +927,9 @@ def test_everything_comes_up_after_reboot_rules_before_network(gw):
     try:
         box.reboot()
         assert wait_for(lambda: _active(gw) == dict.fromkeys(UNITS, "active"), 60), _active(gw)
+        if SINGBOX_BIN:  # второе ядро поднимается само, как и Xray
+            assert wait_for(lambda: box.run("systemctl", "is-active", "xgw-singbox",
+                                            check=False).stdout.strip() == "active", 60)
         assert "cannot set" not in box.journal("xgw-dhcp", 50)
         _came_up_after_reboot(gw)
     finally:

@@ -205,6 +205,29 @@ class XraySection:
     probe_port_base: int = 20001
 
 
+# Единственная версия sing-box, с которой работает XGW (ASSUMPTIONS, п. 197): её ставят
+# установка и `xgw update-singbox`, другую `xgw diag` считает ошибкой. Поля конфига проверены
+# на этом выпуске.
+SINGBOX_VERSION = "1.14.3"
+CORE_MODES = ("auto", "xray", "sing-box")
+
+
+@dataclass
+class CoreSection:
+    # Второе ядро — sing-box (generator/singbox.py): Xray остаётся точкой входа всего трафика,
+    # а серверы, которые ведёт sing-box, подключены к Xray через его локальные входы.
+    # auto — ядро и профиль обхода выбираются сами (generator/profiles.py); xray — только Xray
+    # (серверы, которые умеет только sing-box, пропускаются); sing-box — sing-box для всех
+    # серверов, которые он умеет.
+    mode: str = "auto"
+    # Пробовать мультиплексирование с паддингом (multiplex h2mux) серверу, который «замерзает».
+    mux_padding: bool = True
+    # Первый порт локальных входов sing-box на 127.0.0.1 — по одному на вариант сервера.
+    port_base: int = 22001
+    # Clash API sing-box на 127.0.0.1 (с паролем): по нему демон проверяет, что ядро живо.
+    api_port: int = 10087
+
+
 @dataclass
 class Apply:
     restart_window: str = "04:00-05:00"
@@ -258,6 +281,8 @@ class Managed:
     telegram: bool = False
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
+    # Ядро, закреплённое за сервером: отпечаток → "xray" или "sing-box"; остальные — auto.
+    core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
 
@@ -275,6 +300,7 @@ class Config:
     routing: Routing = field(default_factory=Routing)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
+    core: CoreSection = field(default_factory=CoreSection)
     apply: Apply = field(default_factory=Apply)
     watchdog: Watchdog = field(default_factory=Watchdog)
     status: StatusConf = field(default_factory=StatusConf)
@@ -294,6 +320,7 @@ _SECTIONS = {
     "routing": Routing,
     "dns": Dns,
     "xray": XraySection,
+    "core": CoreSection,
     "apply": Apply,
     "watchdog": Watchdog,
     "status": StatusConf,
@@ -362,6 +389,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.disabled = list(data["disabled"])
     cfg.managed.removed = list(data["removed"])
     cfg.managed.priority = dict(data["priority"])
+    cfg.managed.core = dict(data["core"])
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
@@ -463,6 +491,31 @@ def parse_seconds(value: str) -> int | None:
     if not match:
         return None
     return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+def _validate_core(core: CoreSection) -> list[str]:
+    """[core]: неизвестный режим — auto; порты — в своих пределах (иначе по умолчанию)."""
+    warnings: list[str] = []
+    defaults = CoreSection()
+    mode = core.mode.strip().lower()
+    if mode not in CORE_MODES:
+        warnings.append(
+            f'core.mode = "{core.mode}": ожидается auto, xray или sing-box — используется auto'
+        )
+        mode = defaults.mode
+    core.mode = mode
+    if not 1024 <= core.port_base <= 60000:
+        warnings.append(
+            f"core.port_base={core.port_base}: ожидается 1024–60000 — используется "
+            f"{defaults.port_base}"
+        )
+        core.port_base = defaults.port_base
+    if not 1 <= core.api_port <= 65535:
+        warnings.append(
+            f"core.api_port={core.api_port} вне диапазона — используется {defaults.api_port}"
+        )
+        core.api_port = defaults.api_port
+    return warnings
 
 
 def _validate(cfg: Config) -> list[str]:
@@ -579,6 +632,7 @@ def _validate(cfg: Config) -> list[str]:
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
     warnings.extend(_validate_speed(cfg.speed))
     warnings.extend(_validate_fragment(cfg.fragment))
+    warnings.extend(_validate_core(cfg.core))
     listening = {
         "tproxy": cfg.capture.tproxy_port,
         "api": cfg.xray.api_port,
@@ -587,6 +641,7 @@ def _validate(cfg: Config) -> list[str]:
         "http": cfg.xray.http_port,
         "panel": cfg.panel.port,
     }
+    listening["core.api_port"] = cfg.core.api_port
     ports = list(listening.values()) + [
         cfg.xray.probe_port_base + i for i in range(cfg.filters.max_members + 8)
     ]

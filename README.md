@@ -4,6 +4,11 @@ XGW превращает машину с Ubuntu 26.04 в шлюз для все�
 (TPROXY) перехватывает трафик устройств и самой машины и отдаёт его Xray-core,
 а Xray сам выбирает живой сервер.
 
+С 0.1.12 у шлюза **два ядра, как у Happ**: Xray ведёт перехват и выбор сервера, а
+[sing-box](#два-ядра-xray-и-sing-box) подключён к нему как вторая «сеть» — он умеет то,
+чего нет в Xray (hysteria2, TUIC, AnyTLS, WireGuard, Shadowsocks с плагинами, подписки в
+формате sing-box), и даёт запасной путь, когда провайдер глушит соединения Xray.
+
 Управлять им можно из [панели в браузере](#панель-управления) — кнопка включения
 VPN, подписки, список серверов — или командами `xgw …` в терминале: и то и
 другое делает одно и то же.
@@ -57,6 +62,7 @@ TCP-рукопожатие и HTTP HEAD проходят, поэтому кли�
 | 4 | `install`/`uninstall`, службы systemd, профиль NetworkManager, сон, ufw, `diag`, `update-xray`, `logs`, уведомления, страница статуса | код готов и проверен на «одноразовой машине» — загруженная Ubuntu 26.04.1 в контейнере (systemd 259, NetworkManager 1.54.3, ufw 0.36.2, dnsmasq 2.92). На настоящей машине (Ubuntu 24.04.5, две карты, настоящие подписки) проверены установка, перехват, DNS, `disable`/`enable`, порядок загрузки и удаление — `docs/TEST-REPORT-2026-10-14.md`; найденные там дефекты исправлены (ASSUMPTIONS, пп. 150–163), но **повторно на той машине исправления не проверялись**, как и устройство в Wi-Fi через настоящий роутер |
 | 5 | IPv6, TUN-inbound, Telegram-бот, правила per-device | опционально; сделаны **правила для устройств** (мимо VPN кнопкой в панели), **бот Telegram с командами** и **проксирование IPv6 самой машины** (`network.ipv6 = "proxy"`; проверено на стенде в netns и на «одноразовой машине», на настоящей сети с IPv6 — нет) и **режим TUN** для трафика самой машины (`capture.method = "tun"`; проверено на Xray 26.10.10 на стенде и на «машине», см. ASSUMPTIONS, пп. 134–139 и 181) |
 | сверх ТЗ (0.1.11) | Обход блокировок провайдера: дробление ClientHello (само включается серверу, который без него не отвечает), BBR, закрепление сертификата сервера (`pcs`) | код готов; проверено юнит-тестами и на стенде на живом Xray 26.10.10 в обоих режимах (модель DPI, который сбрасывает соединение по имени сайта); **на настоящем провайдере не проверялось** |
+| сверх ТЗ (0.1.12) | Второе ядро — sing-box: серверы hysteria2, TUIC, AnyTLS, WireGuard, Shadowsocks с плагинами и подписки sing-box; профили обхода блокировок (Xray → Xray с дроблением → sing-box с дроблением → sing-box с мультиплексированием), закрепление ядра за сервером | код готов; проверено юнит-тестами и на стенде на живых Xray 26.10.10 и sing-box 1.14.3 в обоих режимах (в том числе из LAN с включённым перехватом); **на настоящем провайдере и машине не проверялось** |
 | сверх ТЗ | Панель управления в браузере: включение VPN, подписки, серверы каждой подписки с отключением и удалением, выбор сервера вручную; установка без правки файлов | код готов; сервер панели и её действия проверены юнит-тестами и на «одноразовой машине», страница — в браузере на выдуманных данных; **на настоящей машине и в Firefox Ubuntu не открывалась** |
 
 Что проверено на стенде (раздел 9 ТЗ, проверки этапа 2):
@@ -149,6 +155,10 @@ GitHub во время установки (в контейнере нет инт
   `[xray] version` не учитывается (с предупреждением; `"latest"` прежнего примера
   конфига — молча, «последний» на GitHub — старый стабильный 26.3.27). Установлена
   другая версия — `xgw diag` показывает FAIL с советом `sudo xgw update-xray`.
+- sing-box **только 1.14.3** (официальный бинарник с GitHub; SHA-256 сверяется, для
+  linux/amd64 хеш зашит в код). Его ставит установка или `sudo xgw update-singbox`; не
+  загрузился — установка идёт дальше, а серверы, которые умеет только sing-box, пропускаются.
+  Выключить второе ядро совсем: `[core] mode = "xray"`.
 
 ## Установка
 
@@ -442,6 +452,18 @@ XGW_XRAY_BIN=/opt/xgw/xray/xray .venv/bin/python -m pytest tests/stand   # ~2,5 
 - Проверки TUN (`tests/stand/test_stand_tun.py`, этап 5) — тоже только netns, на
   настоящем ядре и Xray: трафик машины через интерфейс, fail-closed и возвращение Xray,
   переключение способа в обе стороны, IPv6 через TUN, строгий rp_filter.
+- Проверки второго ядра (`tests/stand/test_stand_singbox.py`, 0.1.12) идут в loopback и netns
+  и требуют оба ядра и root:
+  `sudo -E XGW_XRAY_BIN=<xray> XGW_SINGBOX_BIN=<sing-box> pytest tests/stand/test_stand_singbox.py`.
+  Серверы hysteria2, TUIC и AnyTLS (sing-box) и VLESS+TLS (оба ядра) несут трафик через мост;
+  заблокированный AnyTLS-сервер перед «ТСПУ» (режим реле `sni_freeze=ИМЯ`) сам уходит на
+  профиль `singbox:tls_fragment` без перезапуска ядер и без изменения конфига sing-box; сервер
+  VLESS+TLS обоих ядер за «строгим ТСПУ» (`sni_freeze_strict=ИМЯ`: узнаёт и целый
+  ClientHello, и мелкие записи Xray) сам проходит лестницу «обычное соединение → дробление
+  Xray → дробление sing-box» и остаётся на sing-box; убитый
+  sing-box демон поднимает заново; новый конфиг sing-box ждёт, пока через него идёт трафик;
+  при включённом перехвате устройство в LAN выходит через сервер hysteria2. Живые проверки
+  перевода серверов Xray → sing-box и поведения SIGHUP — `tests/test_singbox_live.py`.
 - Проверки контейнеров Docker (`tests/stand/test_stand_docker.py`) — тоже только netns:
   мост `docker0`, «контейнер» в своём пространстве имён, маскарадинг и опубликованный
   порт — как их ставит Docker. Сам Docker не нужен; если на машине загружен
@@ -526,6 +548,8 @@ xray run -test -c /tmp/config.json
 | `sudo xgw install [--yes] [--force]` | Установить XGW: проверки `diag`, план, подтверждение, пакеты, пользователь `xray`, Xray, профиль LAN, службы, первый конфиг |
 | `sudo xgw uninstall [--yes] [--purge]` | Вернуть систему в состояние до установки по журналу; `--purge` удаляет и `/etc/xgw` с вашим конфигом |
 | `sudo xgw update-xray` | Обновить Xray до версии из `xray.version`: SHA-256, `xray run -test` рабочим конфигом, перезапуск; если новая версия не поднялась — возврат прежней |
+| `sudo xgw update-singbox` | Установить или обновить sing-box до проверенной версии 1.14.3: SHA-256, `sing-box check` рабочим конфигом, перезапуск; не поднялся — возврат прежней |
+| `sudo xgw core <сервер> auto\|xray\|sing-box` | Закрепить за сервером ядро (то же, что переключатель в панели); сервер, который умеет одно ядро, на другое не закрепляется |
 | `sudo xgw logs [-n N] [-f]` | Журнал служб `xgw`, `xgw-xray`, `xgw-net` |
 | `sudo xgw logs --export [--out F]` | Архив для разбора без секретов: журнал, конфиги, статус, правила, `diag` |
 | `sudo xgw panel` | Напечатать ссылку на панель управления вместе с токеном |
@@ -839,6 +863,106 @@ Mux поверх XTLS Vision не нужен (Vision его не использ�
 требует регистрации учётной записи Cloudflare. DNS устройств и самой машины и так идёт
 через туннель.
 
+## Два ядра: Xray и sing-box
+
+**Зачем.** Xray не умеет часть того, что отдают провайдеры: hysteria2, TUIC, AnyTLS,
+WireGuard, Shadowsocks с плагинами, подписки в формате sing-box. А когда провайдер глушит
+соединения Xray, у sing-box другая реализация TLS и транспорта, и они могут пройти. Поэтому, как
+в Happ, у шлюза два ядра.
+
+**Как устроено.** Xray остаётся единственной точкой входа: перехват (TPROXY, TUN), DNS,
+балансировщик, проверки, основной сервер и закрепление работают как раньше. Сервер, который
+ведёт sing-box, в Xray выглядит обычным участником или запасным, но ведёт к локальному входу
+sing-box на `127.0.0.1`:
+
+```
+Xray (proxy-… / spare-…) ──socks──► 127.0.0.1:22001+ ──► sing-box ──► сервер (метка mark_bypass)
+```
+
+Поэтому участниками (до `filters.max_members`) могут одновременно быть серверы на разных ядрах —
+например, VLESS+REALITY через Xray и hysteria2 через sing-box, — а проверки и замер скорости
+выбирают из них самый быстрый. TCP и UDP через такой мост идут одинаково (проверено).
+
+**Какое ядро умеет сервер.** В `xgw servers`, панели и боте у каждого сервера метка:
+
+| Метка | Профиль | Что это |
+|---|---|---|
+| `[xray]` | `xray:default` | Xray, обычное соединение |
+| `[xray+frag]` | `xray:fragment` | Xray, ClientHello режется на части (раздел «Обход блокировок») |
+| `[sb]` | `singbox:default` | sing-box, обычное соединение |
+| `[sb+frag]` | `singbox:tls_fragment` | sing-box режет ClientHello на сегменты TCP и записи TLS |
+| `[sb+mux]` | `singbox:mux_padded` | sing-box, мультиплексирование h2mux с паддингом |
+
+Серверы бывают трёх видов: **оба ядра** (vless, vmess, trojan, shadowsocks, socks поверх tcp, ws,
+grpc, httpupgrade с tls или REALITY — обычные ссылки), **только Xray** (xhttp, mKCP, цепочки
+`dialerProxy`, REALITY со `spiderX` и `flow`, закреплённый сертификат `pcs`) и **только
+sing-box** (hysteria2 и hy2, TUIC, AnyTLS, WireGuard, Shadowsocks с плагином obfs-local,
+v2ray-plugin или shadow-tls). Ядро в отпечаток сервера не входит: смена ядра не сбрасывает его
+приоритет, замеры и отключение.
+
+**Ссылки и подписки.** Поддержаны `hysteria2://` и `hy2://` (obfs salamander, смена портов
+`mport` и «443,20000-30000», `upmbps`/`downmbps`), `tuic://`, `anytls://`, `wireguard://` и
+`wg://` (параметры AmneziaWG sing-box не знает — такая ссылка пропускается с пояснением),
+`ss://` с плагином, а также подписки в формате sing-box (JSON с `outbounds` и `endpoints`):
+из них берутся прокси-серверы, служебные выходы отбрасываются, цепочки `detour` переносятся
+только для shadowtls. Серверы по адресам вроде 0.0.0.0 отбрасываются, как и раньше; имена
+серверов разрешаются своими резолверами шлюза и записываются в конфиг sing-box готовыми
+адресами (DNS-утечек нет).
+
+**Проверка сертификата не отключается.** `insecure`, `allowInsecure`, `skip-cert-verify` из
+ссылок и подписок не переносятся (с предупреждением). Закрепить самоподписанный сертификат
+можно параметром ссылки `pks` — SHA-256 **открытого ключа** сервера в base64 или hex
+(`openssl x509 -in c.pem -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst
+-sha256 -binary | base64`). `pcs` — хеш всего сертификата, для Xray; ссылка с `pcs` и `pks`
+годится обоим ядрам. `pinSHA256` из ссылок hysteria2 перевести нельзя (это другой хеш).
+
+**Профили заведены заранее.** Для каждого сервера в конфиге sing-box сразу есть входы всех
+подходящих вариантов (обычный, с дроблением, с мультиплексированием). Поэтому смена профиля —
+это замена одного выхода в Xray через API: ни Xray, ни sing-box не перезапускаются и
+соединения не рвутся. Это важно: **перечитывание конфига sing-box (SIGHUP) рвёт все его
+соединения** (проверено). Конфиг sing-box меняется, только когда меняется состав серверов;
+если в этот момент через него идёт трафик (участник, резервный выход или сервер, выбранный
+вручную), шлюз откладывает конфиг до окна `apply.restart_window` — `xgw apply` пишет «перечитывание
+отложено», `xgw apply --now` применяет сразу, а при аварии (все серверы недоступны) шлюз
+не ждёт. Пока конфиг ждёт, Xray ссылается только на то, что sing-box уже ведёт.
+
+**Лестница при блокировке.** При `fragment.mode = "auto"` запасной сервер без лимита трафика,
+который не отвечает так, как не отвечают при блокировке, проверяется в других профилях (сервер
+в работе не трогается: его заменит запасной, и до него дойдёт очередь):
+
+- **«заморозка»** (`FROZEN`, `STALL_BEFORE_BODY`): `xray:fragment` → `singbox:tls_fragment` →
+  `singbox:mux_padded`; ждать 6 часов не нужно;
+- **отказ в соединении** (`CONNECT_FAIL`, `TIMEOUT`): по одной попытке `xray:fragment` и
+  `singbox:tls_fragment`;
+- первый профиль, на котором сервер ответил, закрепляется (событие «отвечает на профиле …»);
+  не помог ни один — возвращается прежний, следующая попытка через 6 часов;
+- раз в сутки сервер на тяжёлом профиле пробуется на базовом — вдруг блокировку сняли;
+- серверам только для sing-box перебирать нечего, кроме AnyTLS и Shadowsocks через shadow-tls
+  (у них есть TLS поверх TCP): QUIC (hysteria2, TUIC) и WireGuard не дробятся;
+- серверы подписок **с лимитом трафика** на другое ядро в фоне не переводятся: каждая проба
+  тратит квоту (дробление в своём ядре, как в 0.1.11, остаётся);
+- при массовой блокировке (`ALL_DEAD`, `RESERVE`) запасные на другом ядре и другом
+  транспорте (QUIC против TCP) проверяются первыми: блокировка, срезавшая TCP через Xray,
+  может пропустить QUIC через sing-box, и наоборот.
+
+Серверам Xray профиль `singbox:mux_padded` не помогает: они мультиплексирование sing-box не
+понимают (проверено) — ступень работает только с серверами sing-box. Она остаётся в лестнице
+по решению заказчика; отключить: `core.mux_padding = false`.
+
+**Закрепить ядро.** В панели у сервера (оба ядра) — выбор «Авто» / «Только Xray» / «Только
+sing-box», в терминале — `sudo xgw core <сервер> auto|xray|sing-box` (тег, отпечаток или имя).
+Закрепление хранится в `panel.json`. `[core] mode = "sing-box"` ведёт через sing-box все
+серверы, которые он умеет; `"xray"` выключает второе ядро.
+
+**Если sing-box отказал.** Каждый шаг watchdog проверяются его служба и Clash API
+(`127.0.0.1:10087`, с паролем). Нет ответа — перезапуск; не помогло дважды — откат конфига на
+последний рабочий; всё ещё не поднимается — серверы, которые умеет и Xray, переводятся на него
+(интернет остаётся), серверы только для sing-box выпадают из конфига, приходит уведомление;
+раз в 30 минут шлюз пробует снова и возвращает серверы, когда sing-box заработает.
+
+**Проверки.** `sudo xgw diag` показывает версию sing-box, принимает ли он рабочий конфиг
+(`sing-box check`), работает ли служба и нет ли ошибок в её журнале.
+
 ## Основной сервер и замер скорости
 
 **Зачем.** Ядро Xray (стратегия `leastPing`) отправляет новые соединения через сервер с
@@ -985,6 +1109,7 @@ x1, пустой шаблон — множители не ищутся. У се�
 |---|---|
 | `xgw-net.service` | Загружает правила nftables и `ip rule` раньше, чем поднимается сеть (`Before=network-pre.target`). Остановка службы правил не снимает — для этого `xgw disable` и `xgw net down` |
 | `xgw-xray.service` | Xray от пользователя `xray` с `CAP_NET_ADMIN` и `CAP_NET_BIND_SERVICE`; перед запуском — `xray run -test`, после запуска — `xgw net tun` от root (интерфейс TUN и маршруты в него, если они нужны); `Restart=always` |
+| `xgw-singbox.service` | sing-box — второе ядро, от пользователя `xray` с `CAP_NET_ADMIN`; запускается, только когда есть его конфиг (`ConditionPathExists`), перед запуском и перечитыванием — `sing-box check`; перечитывание (`systemctl reload`) рвёт соединения через него, поэтому XGW делает его редко (раздел «Два ядра») |
 | `xgw.service` | Демон XGW и панель управления: root с `ProtectSystem=strict`, запись только в `/etc/xgw`, `/var/lib/xgw`, `/run/xgw`; возможности — `CAP_NET_ADMIN`, `CAP_SETUID`, `CAP_SETGID` |
 | `xgw-dhcp.service` | DHCP для сети Wi-Fi: свой экземпляр dnsmasq (программа из `dnsmasq-base`) со своим конфигом `/etc/xgw/dnsmasq.conf` — только DHCP, `port=0`. Файлы `/etc/dnsmasq.d` и штатную службу `dnsmasq.service` XGW не трогает. Работает, только когда настроен LAN |
 
@@ -993,10 +1118,11 @@ x1, пустой шаблон — множители не ищутся. У се�
 | `/etc/xgw/config.toml` | Ваши настройки (0600) |
 | `/etc/xgw/panel.json` | То, что сделано в панели: подписки, ссылки, отключённые и убранные серверы, устройства мимо VPN, бот Telegram — токен и чат (0600) |
 | `/etc/xgw/xray/config.json` | Рабочий конфиг Xray (0640 root:xray) |
+| `/etc/xgw/sing-box/config.json` | Рабочий конфиг sing-box (0640 root:xray); ждущий окна — `config.pending.json` рядом |
 | `/etc/xgw/dnsmasq.conf` | Конфиг службы DHCP; его пишет XGW (аренды — `/var/lib/xgw/dhcp.leases`) |
 | `/var/lib/xgw` | Состояние: SQLite, кэш подписок, список серверов для панели, last-good, токены панели и страницы статуса, журнал установки и резервные копии (`backup/`) |
 | `/run/xgw/status.json` | Статус, который пишет демон |
-| `/opt/xgw` | Код (`lib/`), Xray и geo-файлы (`xray/`) |
+| `/opt/xgw` | Код (`lib/`), Xray и geo-файлы (`xray/`), sing-box (`sing-box/`) |
 | `/usr/local/bin/xgw` | Команда |
 | `/usr/local/share/applications/xgw-panel.desktop` | Ярлык панели в меню приложений |
 
@@ -1088,10 +1214,16 @@ src/xgw/
   priority.py                    # уровни приоритета серверов (высокий/средний/низкий)
   config.py paths.py log.py masking.py model.py store.py
   fetch.py marknet.py            # HTTP- и DoH-клиент с SO_MARK
-  parsers/    common.py vless.py vmess.py trojan.py ss.py hysteria2.py xray_json.py
+  parsers/    common.py vless.py vmess.py trojan.py ss.py xray_json.py
+              hysteria2.py tuic.py anytls.py wireguard.py sblink.py   # серверы только для sing-box
+              sbjson.py                   # подписки в формате sing-box
+              convert.py                  # перевод сервера Xray ↔ sing-box
   xraycore/   binary.py api.py metrics.py service.py
-  generator/  builder.py validate.py diff.py
-  apply/      applier.py rotation.py
+  generator/  builder.py validate.py diff.py fragment.py
+              singbox.py                  # конфиг sing-box, мосты к Xray, проверка
+              profiles.py                 # профили обхода и лестница
+  sbcore/     binary.py update.py         # загрузка и обновление sing-box
+  apply/      applier.py rotation.py singbox.py   # применение и слежение за sing-box
   net/        capture.py nft.py iprule.py dnsmasq.py sysctl.py lan.py cmd.py
               nm.py sleep.py ufw.py tun.py
   watch/      checks.py states.py scan.py notify.py status.py status_page.py panel.py telegram.py
@@ -1099,17 +1231,19 @@ src/xgw/
               speed.py                    # замер скорости и выбор основного сервера
   ui/         index.html login.html app.css app.js icon.svg   # страница панели
   diag.py install.py uninstall.py logs.py desktop.py
-packaging/    xgw-net.service xgw-xray.service xgw-dhcp.service xgw.service install.sh
+packaging/    xgw-net.service xgw-xray.service xgw-singbox.service xgw-dhcp.service xgw.service
+              install.sh
 docs/         TEST-REPORT-2026-10-14.md TEST-REPORT-REAL-MACHINE-2026-10-14.md   # отчёты
               TEST-PLAN-REAL-MACHINE-0.1.4.md   # программа испытаний 0.1.4
               TEST-REPORT-REAL-MACHINE-0.1.4-2026-10-15.md   # её результаты (G1–G7)
               TEST-PLAN-REAL-MACHINE-0.1.5.md   # программа испытаний 0.1.5
               HWID-SUBSCRIPTIONS.md   # подписки с привязкой к устройству (X-HWID)
+              TEST-PLAN-REAL-MACHINE-0.1.12.md   # программа испытаний 0.1.12 (второе ядро)
 tests/        fixtures/golden/ fakenet.py fakesys.py fakexray.py panel_demo.py test_*.py
 tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
               lan_client.py panel_client.py test_stand.py test_stand_lan.py
               test_stand_parts.py test_machine.py test_stand_ipv6.py test_stand_tun.py
-              test_stand_docker.py
+              test_stand_docker.py test_stand_singbox.py
 ```
 
 ## Безопасность
@@ -1125,7 +1259,8 @@ tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
   экспорт: всё проходит через `xgw.masking` (UUID → последние 4 символа,
   секреты → `***`, URL подписок → только домен).
 - Служебные порты слушают только 127.0.0.1 (кроме DHCP на LAN и, по желанию,
-  страницы статуса). Телеметрии нет; внешние запросы — только к URL из
+  страницы статуса); мосты к sing-box (22001+) и его Clash API (10087) — тоже, вход в
+  мост — с логином и паролем. Телеметрии нет; внешние запросы — только к URL из
   конфигурации и к GitHub за Xray.
 - Панель управления слушает только 127.0.0.1 и пускает по токену
   (`/var/lib/xgw/panel-token`, 0600; в браузере хранится не он, а производная
@@ -1203,13 +1338,17 @@ tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
   `user_agent` в `[[subscriptions]]` (например, `v2rayN/6.0`). Если на месте
   списка серверов приходит «Приложение не поддерживается!» — провайдер требует
   идентификатор устройства: `docs/HWID-SUBSCRIPTIONS.md`.
-- **Clash/sing-box подписки не поддерживаются** — это ограничение по ТЗ
-  (проверка «заморозки» — только Xray GET-пробами).
-- **hysteria2-ссылки пропускаются с предупреждением** — поля
-  hysteria2-outbound не описаны в документации; включается после проверки
-  установленной версии (см. ASSUMPTIONS.md).
-- **ss-ссылки с плагином (simple-obfs, v2ray-plugin) пропускаются** — у
-  shadowsocks-outbound Xray-core плагинов нет.
+- **Подписки Clash не поддерживаются** (формат sing-box — поддерживается с 0.1.12).
+- **Серверы hysteria2, TUIC, AnyTLS, WireGuard и Shadowsocks с плагином не появляются** —
+  их ведёт sing-box: он не установлен или выключен (`xgw diag`, строка «sing-box»;
+  `sudo xgw update-singbox`; `[core] mode`). Без него такие серверы в панели помечены
+  «не используется».
+- **Сервер hysteria2 с самоподписанным сертификатом не подключается** — проверка сертификата
+  не отключается ни в одном ядре; закрепите свой сертификат параметром `pks` (раздел «Два
+  ядра»).
+- **`xgw apply` пишет «перечитывание отложено»** — через sing-box идёт трафик, а перечитывание
+  его конфига оборвало бы соединения. Применить сейчас: `sudo xgw apply --now`; иначе шлюз
+  применит конфиг сам в окно `apply.restart_window`.
 - **«установлен Xray X, нужен не ниже 25.7.23»** — старый бинарник конфиг
   примет, но проверять серверы будет HEAD-запросом и «заморозку» не увидит;
   поэтому XGW отказывается с ним работать.

@@ -15,6 +15,7 @@ from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
 from xgw.paths import Paths
 from xgw.uninstall import Uninstaller
+from xgw.xraycore.binary import BinaryError
 
 REPO = Path(__file__).resolve().parents[1]
 BEFORE_RULES = """*filter
@@ -46,6 +47,7 @@ class Box:
         self.answers: list[bool] = []
         self.questions: list[str] = []
         self.xray_ok = True
+        self.singbox_error = ""  # не пусто — загрузка sing-box не удаётся
         self.old_lan = self.system.add_profile("Wired connection 2", "lan0", active=True)
         # Чей браузер открыла установка (open_panel): пусто — открывать негде.
         self.opened_for: str | Exception = ""
@@ -59,10 +61,18 @@ class Box:
         (dest_dir / self.paths.xray_bin.name).write_bytes(b"xray")
         return "v26.3.27", dest_dir / self.paths.xray_bin.name
 
+    def download_singbox(self, dest_dir: Path, version: str, **_route) -> tuple[str, Path]:
+        if self.singbox_error:
+            raise BinaryError(self.singbox_error)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / "sing-box").write_bytes(b"sing-box")
+        return "v1.14.3", dest_dir / "sing-box"
+
     def installer(self) -> Installer:
         return Installer(
             self.cfg, self.paths, runner=self.system, out=self.out.append, ask=self.ask,
             source_root=REPO, proc_sys=self.proc, download=self.download,
+            download_singbox=self.download_singbox,
             first_apply=lambda: self.xray_ok, which=self.system.which,
             chown=lambda *args: None, open_panel=self.open_panel,
         )
@@ -871,3 +881,48 @@ def test_install_says_so_when_capture_waits_for_the_xray_inbound(box):
     assert "! перехват пока не включён: в применённом конфиге Xray нет inbound tproxy-in" in text
     assert "tproxy" not in box.system.kernel.table and "masquerade" in box.system.kernel.table
     assert "Предупреждений: 1" in text
+
+
+# --- второе ядро (sing-box) --------------------------------------------------------------
+
+
+def test_install_puts_sing_box_next_to_xray_with_its_own_service(box):
+    box.answers = [False]
+    assert box.installer().run() == 1
+    assert "sing-box 1.14.3 с GitHub" in box.text() and "xgw-singbox" in box.text()
+    box.out.clear()
+    assert box.install() == 0, box.text()
+    paths = box.paths
+    assert paths.singbox_bin.read_bytes() == b"sing-box"
+    assert box.system.units["xgw-singbox.service"]["enabled"]
+    assert (paths.systemd_dir / "xgw-singbox.service").read_text(encoding="utf-8") == (
+        REPO / "packaging" / "xgw-singbox.service").read_text(encoding="utf-8")
+    assert "sing-box v1.14.3" in box.text()
+    assert paths.singbox_config_dir.exists()
+
+
+def test_install_goes_on_when_sing_box_cannot_be_downloaded(box):
+    box.singbox_error = "нет сети"
+    assert box.install() == 0, box.text()
+    assert not box.paths.singbox_bin.exists()
+    assert "sing-box не загружен: нет сети" in box.text() and "xgw update-singbox" in box.text()
+
+
+def test_install_skips_sing_box_when_the_core_is_switched_off(box):
+    box.cfg.core.mode = "xray"
+    box.answers = [False]
+    box.installer().run()
+    assert "sing-box 1.14.3 с GitHub" not in box.text()
+    box.singbox_error = "не должен вызываться"
+    assert box.install() == 0, box.text()
+    assert not box.paths.singbox_bin.exists() and "sing-box не загружен" not in box.text()
+
+
+def test_uninstall_removes_sing_box_files_and_service(box):
+    assert box.install() == 0, box.text()
+    box.paths.singbox_config_file.write_text("{}", encoding="utf-8")
+    assert box.uninstall() == 0, box.text()
+    assert not box.paths.singbox_bin.exists() and not box.paths.singbox_config_dir.exists()
+    assert not (box.paths.systemd_dir / "xgw-singbox.service").exists()
+    assert "xgw-singbox.service" not in box.system.units or not box.system.units[
+        "xgw-singbox.service"].get("enabled")

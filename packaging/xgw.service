@@ -2,8 +2,8 @@
 [Unit]
 Description=XGW: демон (подписки, watchdog, замена серверов)
 Documentation=https://github.com/1521572-lang/xgw
-After=network.target xgw-net.service xgw-xray.service
-Wants=xgw-net.service xgw-xray.service
+After=network.target xgw-net.service xgw-xray.service xgw-singbox.service
+Wants=xgw-net.service xgw-xray.service xgw-singbox.service
 ConditionPathExists=/etc/xgw/config.toml
 
 [Service]

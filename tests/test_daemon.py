@@ -12,6 +12,7 @@ import pytest
 
 from xgw import engine
 from xgw.apply.applier import ApplyOutcome
+from xgw.apply.singbox import SingboxOutcome
 from xgw.config import Config
 from xgw.daemon import Daemon
 from xgw.generator import builder
@@ -83,6 +84,63 @@ class FakeApplier:
         return ApplyOutcome(self.rollback_mode, detail=reason)
 
 
+class FakeSingbox:
+    """Второе ядро без процесса: конфиг лежит в файле, служба — флаги."""
+
+    def __init__(self, paths: Paths):
+        self.paths = paths
+        self.is_alive = True
+        self.restart_error: str | None = None
+        self.restarts = 0
+        self.rollbacks: list[str] = []
+        self.rollback_mode = "rollback"
+        self.reject = ""
+        self.applied: list[tuple[dict | None, bool]] = []
+
+    def read(self):
+        return engine.read_json(self.paths.singbox_config_file)
+
+    def expected(self):
+        return self.read() is not None
+
+    def alive(self):
+        return self.is_alive
+
+    def restart(self):
+        self.restarts += 1
+        if self.restart_error is None:
+            self.is_alive = True
+        return self.restart_error
+
+    def rollback(self, reason):
+        self.rollbacks.append(reason)
+        return SingboxOutcome(self.rollback_mode, reason)
+
+    def apply(self, config, *, reload):
+        self.applied.append((config, reload))
+        current = self.read()
+        if config is None:
+            if current is None:
+                return SingboxOutcome("unchanged")
+            if not reload:
+                return SingboxOutcome("deferred")
+            self.paths.singbox_config_file.unlink()
+            return SingboxOutcome("removed")
+        if config == current:
+            self.paths.singbox_pending_file.unlink(missing_ok=True)
+            return SingboxOutcome("unchanged")
+        if not reload:
+            self.paths.singbox_config_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(self.paths.singbox_pending_file, config)
+            return SingboxOutcome("deferred")
+        if self.reject:
+            return SingboxOutcome("rejected", self.reject)
+        self.paths.singbox_config_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.paths.singbox_config_file, config)
+        self.paths.singbox_pending_file.unlink(missing_ok=True)
+        return SingboxOutcome("started" if current is None else "reloaded")
+
+
 class Harness(Daemon):
     """Демон, у которого всё внешнее — метрики, проверки, подписки, ядро — подменено."""
 
@@ -99,6 +157,8 @@ class Harness(Daemon):
         self.api = FakeApi()
         self.service = FakeService()
         self.applier = FakeApplier()
+        self.singbox = FakeSingbox(paths)
+        self.singbox_ok = False  # sing-box в тестах включают отдельные тесты (dual-core)
         self.now_time = lambda: datetime.time(12, 0)
         self.observatory: dict | None = {}  # None — метрики недоступны
         self.provider = True
@@ -147,14 +207,18 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, tier=None, reserve=None, fragment=None):
+    def _assemble(self, prefer, tier=None, reserve=None, profiles=None, reload_singbox=None):
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
             xray_bin=None, check=False, prefer=prefer, tier=tier, reserve=reserve,
-            fragment=fragment,
+            profiles=profiles, reload_singbox=reload_singbox,
+            singbox_ok=self.singbox_ok and not self._singbox_failed,
         )
 
-    def _apply(self, config, *, urgent):
+    def _apply(self, config, *, urgent, singbox=None):
+        rejected = self._apply_singbox(singbox)
+        if rejected is not None:
+            return rejected
         if config == engine.read_json(self.paths.xray_config_file):
             return ApplyOutcome("unchanged")
         self.applied.append((config, urgent))
@@ -1004,7 +1068,7 @@ def test_server_list_is_saved_for_the_panel_without_keys(daemon):
     servers = engine.load_inventory(daemon.paths)
     assert len(servers) == len(ALL_LINKS)
     assert {server["source"] for server in servers} == {"main"}
-    assert all(set(server) == {"fingerprint", "name", "source", "protocol", "skip"}
+    assert all(set(server) == {"fingerprint", "name", "source", "protocol", "core", "skip"}
                for server in servers)
     text = engine.inventory_file(daemon.paths).read_text(encoding="utf-8")
     assert links.FAKE_PBK not in text and "203.0.113." not in text  # ни ключей, ни адресов
@@ -1131,10 +1195,10 @@ def test_new_config_is_applied_before_the_rules_when_capture_waits_for_it(guarde
     order: list[str] = []
     original_apply, original_loaded = daemon._apply, capture.loaded
 
-    def apply(config, *, urgent):
+    def apply(config, *, urgent, singbox=None):
         order.append("apply")
         capture.problem = ""  # Xray перезапущен с новым конфигом
-        return original_apply(config, urgent=urgent)
+        return original_apply(config, urgent=urgent, singbox=singbox)
 
     def loaded():
         order.append("rules")
@@ -1165,9 +1229,9 @@ def test_switched_capture_is_reported_as_turned_on_not_as_lost_rules(guarded):
     daemon, capture = guarded
     original_apply = daemon._apply
 
-    def apply(config, *, urgent):
+    def apply(config, *, urgent, singbox=None):
         capture.problem = ""  # Xray перезапущен с новым конфигом
-        return original_apply(config, urgent=urgent)
+        return original_apply(config, urgent=urgent, singbox=singbox)
 
     daemon._apply = apply
     capture.problem = "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"

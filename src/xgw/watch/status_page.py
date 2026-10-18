@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .. import cost, log
 from ..config import Config
+from ..generator import profiles as profiling
 from ..net import dnsmasq, lan
 from ..paths import Paths, atomic_write_text
 from . import status
@@ -70,6 +71,15 @@ th{font-weight:600;color:#555}
 
 def _esc(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def _core(entry: dict) -> str:
+    """Протокол, ядро и профиль обхода сервера: «vless · xray», «hysteria2 · sb»."""
+    profile = entry.get("profile")
+    if not profile:
+        return "—"
+    protocol = entry.get("protocol")
+    return (f"{protocol} · " if protocol else "") + profiling.label(profile)
 
 
 def _clock(ts: float | None) -> str:
@@ -143,10 +153,11 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
         members.append([
             _esc(member.get("tag")) + (" ←" if member.get("tag") in selecting else ""),
             _esc(member.get("name")), health,
-            _esc(f"{delay} мс" if delay is not None else "—"),
+            _esc(f"{delay} мс" if delay is not None else "—"), _esc(_core(member)),
         ])
     parts.append("<h2>Участники балансировщика</h2>")
-    parts.append(_table(["Тег", "Сервер", "Состояние", "Задержка"], members, "нет участников"))
+    parts.append(_table(["Тег", "Сервер", "Состояние", "Задержка", "Ядро"], members,
+                        "нет участников"))
 
     reserve = snapshot.get("reserve")
     if reserve:
@@ -162,12 +173,12 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
             _esc(spare.get("name")),
             _esc(spare.get("verdict") or "не проверялся"),
             _esc(f"{spare['bytes']} Б за {spare['seconds']} с" if spare.get("verdict") else "—"),
-            _esc(_clock(spare.get("scanned"))),
+            _esc(_clock(spare.get("scanned"))), _esc(_core(spare)),
         ]
         for spare in snapshot.get("spares") or []
     ]
     parts.append("<h2>Запасные</h2>")
-    parts.append(_table(["Тег", "Сервер", "Проверка", "Загрузка", "Когда"], spares,
+    parts.append(_table(["Тег", "Сервер", "Проверка", "Загрузка", "Когда", "Ядро"], spares,
                         "запасных нет"))
 
     bypass = set((capture or {}).get("bypass") or [])

@@ -14,6 +14,20 @@ TCP-реле между шлюзом и сервером. Режим читае�
                    сборки записей TLS: ClientHello, разрезанный на несколько записей
                    (дробление в Xray, freedom.fragment), он не узнаёт и пропускает
 
+  sni_freeze=ИМЯ   то же узнавание ClientHello, но вместо сброса — «заморозка»: соединение
+                   с таким ClientHello пропускается, а после FREEZE_AT байт от сервера к
+                   клиенту замирает (так ТСПУ и «замораживает»). ClientHello, разрезанный на
+                   записи, не узнаётся — и соединение идёт без заморозки
+
+  sni_freeze_strict=ИМЯ
+                   «ТСПУ», который знает приёмы обхода: как sni_freeze, но узнаёт ещё и
+                   ClientHello, разрезанный на мелкие записи (две первые записи TLS короче
+                   MIN_RECORD байт) — так режет Xray (freedom.fragment: ~13 записей по
+                   100–200 байт). Дробление sing-box (fragment + record_fragment) он не
+                   узнаёт: записей всегда две, а первая случайной длины (от ~120 до ~1800
+                   байт) и вторая — не мелкая. Измерено на Xray 26.10.10 и sing-box 1.14.3
+                   (60 соединений на вариант)
+
 К режиму можно дописать «;latency=МС» — задержку первого ответа в каждом
 соединении. Она делает один сервер заведомо медленнее другого, и выбор
 балансировщика leastPing на стенде становится однозначным. «;rate=КБ/с» — полосу
@@ -38,6 +52,9 @@ import struct
 import threading
 import time
 from pathlib import Path
+
+FREEZE_AT = 16384  # sni_freeze: после стольких байт от сервера соединение замирает
+MIN_RECORD = 200  # sni_freeze_strict: две первые записи ClientHello короче этого — дробление Xray
 
 
 class Mode:
@@ -69,7 +86,7 @@ class Mode:
                 self.name, self.limit = name, int(value)
             elif name in ("pass", "drop", "blackhole"):
                 self.name, self.limit = name, 0
-            elif name == "sni" and value:
+            elif name in ("sni", "sni_freeze", "sni_freeze_strict") and value:
                 self.name, self.limit, self.sni = name, 0, value
         self.latency = latency
         self.rate = rate
@@ -87,6 +104,7 @@ class Connection:
         self.mode = mode
         self.downstream_bytes = 0  # сколько уже ушло от сервера к клиенту
         self.frozen = False
+        self.freeze_at = 0
 
     def run(self) -> None:
         if self.mode.name == "drop":
@@ -98,14 +116,21 @@ class Connection:
             self._drain(self.client)
             return
         first = b""
-        if self.mode.name == "sni":
-            first = self._first_record()
-            if first is None or _hello_name(first) == self.mode.sni:
+        self.freeze_at = 0  # sni_freeze: распознанному соединению — предел байт от сервера
+        if self.mode.name in ("sni", "sni_freeze", "sni_freeze_strict"):
+            first = self._first_record(strict=self.mode.name == "sni_freeze_strict")
+            known = first is not None and (
+                _hello_name(first) == self.mode.sni
+                or (self.mode.name == "sni_freeze_strict" and _tiny_hello(first))
+            )
+            if first is None or (known and self.mode.name == "sni"):
                 self.client.setsockopt(
                     socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
                 )
                 self.client.close()
                 return
+            if known:
+                self.freeze_at = FREEZE_AT
         try:
             upstream = socket.create_connection(self.upstream_address, timeout=5)
         except OSError:
@@ -117,9 +142,11 @@ class Connection:
         threading.Thread(target=self._up, args=(upstream,), daemon=True).start()
         self._down(upstream)
 
-    def _first_record(self) -> bytes | None:
+    def _first_record(self, strict: bool = False) -> bytes | None:
         """Первая запись TLS от клиента целиком (заголовок и тело); не TLS — то, что
-        пришло; None — клиент закрыл соединение раньше."""
+        пришло; None — клиент закрыл соединение раньше. Строгий режим: если ClientHello
+        начат мелкой записью, дочитывается и вторая — по двум записям видно, режет ли его Xray
+        (обе мелкие) или sing-box (вторая большая)."""
         self.client.settimeout(10)
         data = b""
         try:
@@ -132,6 +159,11 @@ class Connection:
                 data += chunk
                 if data[0] != 0x16:
                     break
+            while strict and _starts_small_hello(data) and not _has_records(data, 2):
+                chunk = self.client.recv(65536)
+                if not chunk:
+                    return None
+                data += chunk
         except OSError:
             return None
         self.client.settimeout(None)
@@ -162,8 +194,9 @@ class Connection:
                     continue
                 if not self.downstream_bytes and self.mode.latency:
                     time.sleep(self.mode.latency)
-                if self.mode.name == "freeze_after":
-                    allowed = self.mode.limit - self.downstream_bytes
+                limit = self.mode.limit if self.mode.name == "freeze_after" else self.freeze_at
+                if limit:
+                    allowed = limit - self.downstream_bytes
                     if allowed < len(data):
                         self.frozen = True
                         data = data[: max(0, allowed)]
@@ -179,6 +212,36 @@ class Connection:
             pass
         if not self.frozen:  # «замороженное» соединение держим открытым
             _close(upstream, self.client)
+
+
+def _starts_small_hello(data: bytes) -> bool:
+    """Первая запись TLS начинает ClientHello, короче MIN_RECORD и не вмещает его целиком:
+    ClientHello разрезан, продолжение — в следующей записи."""
+    if len(data) < 9 or data[0] != 0x16 or data[5] != 1:
+        return False
+    record = int.from_bytes(data[3:5], "big")
+    return record < MIN_RECORD and 4 + int.from_bytes(data[6:9], "big") > record
+
+
+def _has_records(data: bytes, count: int) -> bool:
+    """В data есть count записей TLS целиком."""
+    position = 0
+    for _ in range(count):
+        if position + 5 > len(data):
+            return False
+        position += 5 + int.from_bytes(data[position + 3:position + 5], "big")
+        if position > len(data):
+            return False
+    return True
+
+
+def _tiny_hello(data: bytes) -> bool:
+    """ClientHello разрезан на мелкие записи: обе первые короче MIN_RECORD (Xray режет на
+    записи по 100–200 байт). У sing-box записей две, и вторая большая."""
+    if not _starts_small_hello(data):
+        return False
+    first = int.from_bytes(data[3:5], "big")
+    return _has_records(data, 2) and int.from_bytes(data[8 + first:10 + first], "big") < MIN_RECORD
 
 
 def _hello_name(data: bytes) -> str:

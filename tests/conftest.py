@@ -27,6 +27,14 @@ def _no_github(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_singbox_from_env(monkeypatch):
+    """Настоящий sing-box из окружения нужен только живым тестам и стендам: они читают
+    XGW_SINGBOX_BIN при импорте модуля и передают его сами. Остальные тесты не должны
+    находить его через find_binary и пытаться запустить службу xgw-singbox."""
+    monkeypatch.delenv("XGW_SINGBOX_BIN", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_panel(monkeypatch):
     """`xgw run` в тестах не открывает порт панели; сама панель проверяется в test_panel."""
     monkeypatch.setattr("xgw.cli._sync_panel", lambda panel, *args, **kwargs: None)

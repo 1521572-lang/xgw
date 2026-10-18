@@ -10,7 +10,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
-from .parsers.common import RawServer
+from .parsers.common import RawServer, SingboxSpec
 
 _COUNTRIES = set(
     """
@@ -66,6 +66,16 @@ class ServerNode:
     # переносятся целиком и обязаны сохранить тег, иначе связь порвётся).
     keep_tag: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Описание для sing-box (None — сервер умеет только Xray). outbound пуст у серверов,
+    # которые умеет только sing-box.
+    singbox: SingboxSpec | None = None
+
+    @property
+    def capability(self) -> str:
+        """Какое ядро умеет этот сервер: dual — оба, xray или singbox — только одно."""
+        if self.outbound and self.singbox is not None:
+            return "dual"
+        return "xray" if self.outbound else "singbox"
 
 
 def raw_to_node(raw: RawServer, source: str) -> ServerNode:
@@ -83,4 +93,5 @@ def raw_to_node(raw: RawServer, source: str) -> ServerNode:
         source=source,
         keep_tag=raw.keep_tag,
         warnings=list(raw.warnings),
+        singbox=raw.singbox,
     )

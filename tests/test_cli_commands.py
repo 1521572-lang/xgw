@@ -620,3 +620,40 @@ def test_probe_all_points_at_the_probe_url_when_everything_fails_the_same_way(
     assert captured.out.count("CONNECT_FAIL") == 4
     assert "пробы всех серверов падают — вероятно, недоступен сам probe.url" in captured.err
     assert "(HTTP 403)" in captured.err and "xgw diag" in captured.err
+
+
+def test_core_is_pinned_by_tag_and_set_back_to_auto(gateway, capsys):
+    """`xgw core` пишет то же, что переключатель ядра в панели (panel.json)."""
+    cfg, _warnings = config.load(gateway.config)
+    engine.save_inventory(gateway.paths, cfg, engine.collect(
+        cfg, gateway.paths, mark=None, logger=cli.log.get_logger("test"), via_xray=False))
+    member = gateway.tags("proxy")[0]
+    assert gateway.run("core", member, "sing-box") == 0
+    assert "только sing-box" in capsys.readouterr().out
+    (fingerprint,) = config.load(gateway.config)[0].managed.core
+    assert fingerprint.startswith(member.rsplit("-", 1)[1])
+    assert gateway.run("core", member, "sing-box") == 0
+    assert "уже" in capsys.readouterr().out
+    assert gateway.run("core", member, "auto") == 0
+    assert config.load(gateway.config)[0].managed.core == {}
+    assert gateway.run("core", "proxy-zz-0000", "xray") == 2
+    assert "не найден" in capsys.readouterr().err
+
+
+def test_core_refuses_a_core_the_server_cannot_run_on(gateway, capsys):
+    from xgw import actions
+    from xgw.model import raw_to_node
+    from xgw.parsers.common import parse_links_text
+
+    raws, _meta, _warnings = parse_links_text(
+        "\n".join([links.VLESS_XHTTP, "hysteria2://pw@203.0.113.9:443/?sni=h.example#HY"]), "t")
+    inventory = engine.Inventory([raw_to_node(raw, "t") for raw in raws])
+    cfg, _warnings = config.load(gateway.config)
+    engine.save_inventory(gateway.paths, cfg, inventory)
+    store = cli.managed.path_for(gateway.config)
+    xhttp, hysteria = (raw_to_node(raw, "t").fingerprint for raw in raws)
+    only_xray = actions.set_core(gateway.paths, store, xhttp, "sing-box")
+    assert only_xray.code == 2 and "умеет только Xray" in only_xray.text
+    only_singbox = actions.set_core(gateway.paths, store, hysteria, "xray")
+    assert only_singbox.code == 2 and "умеет только sing-box" in only_singbox.text
+    assert actions.set_core(gateway.paths, store, hysteria, "sing-box").ok

@@ -1,0 +1,33 @@
+# XGW: sing-box — второе ядро (hysteria2, TUIC, AnyTLS, WireGuard и обход блокировок). Xray
+# остаётся точкой входа всего трафика и ведёт к sing-box через его локальные входы на 127.0.0.1.
+# Конфиг пишет XGW; служба запускается, только когда он есть (серверов для sing-box нет — её нет).
+# Перечитывание конфига (systemctl reload) рвёт соединения через sing-box, поэтому XGW делает его
+# редко и откладывает, пока через sing-box идёт трафик.
+[Unit]
+Description=XGW: sing-box
+Documentation=https://github.com/SagerNet/sing-box
+After=network.target nss-lookup.target xgw-net.service
+Wants=xgw-net.service
+ConditionPathExists=/etc/xgw/sing-box/config.json
+
+[Service]
+User=xray
+Group=xray
+# CAP_NET_ADMIN — метка на сокетах к серверам (routing_mark = mark_bypass: мимо перехвата),
+# CAP_NET_BIND_SERVICE — на случай портов ниже 1024 в конфиге.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStartPre=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json
+ExecStart=/opt/xgw/sing-box/sing-box --disable-color run -c /etc/xgw/sing-box/config.json
+ExecReload=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

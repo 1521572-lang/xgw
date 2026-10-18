@@ -112,7 +112,7 @@ def test_journal_command_covers_all_units():
     args = logs.journal_args(50, follow=True)
     assert args[:2] == ["journalctl", "--no-pager"] and args[-1] == "-f"
     assert [args[i + 1] for i, item in enumerate(args) if item == "-u"] == [
-        "xgw-net.service", "xgw-xray.service", "xgw.service"]
+        "xgw-net.service", "xgw-xray.service", "xgw-singbox.service", "xgw.service"]
 
 
 # --- обновление Xray ----------------------------------------------------------------

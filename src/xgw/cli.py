@@ -143,6 +143,16 @@ def main(argv: list[str] | None = None) -> int:
         "update-xray", parents=[common],
         help="обновить Xray с проверкой SHA-256 и xray run -test",
     )
+    subparsers.add_parser(
+        "update-singbox", parents=[common],
+        help="установить или обновить sing-box (проверенная версия, SHA-256, sing-box check)",
+    )
+    core = subparsers.add_parser(
+        "core", parents=[common],
+        help="закрепить за сервером ядро: xray, sing-box или auto (выбирает шлюз)",
+    )
+    core.add_argument("server", help="тег (proxy-…, spare-…), отпечаток или имя сервера")
+    core.add_argument("core", choices=("auto", "xray", "sing-box"))
     logs = subparsers.add_parser("logs", parents=[common], help="журнал служб XGW")
     logs.add_argument("-n", "--lines", type=int, default=200, help="сколько строк показать")
     logs.add_argument("-f", "--follow", action="store_true", help="следить за журналом")
@@ -196,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         "uninstall": _cmd_uninstall,
         "diag": _cmd_diag,
         "update-xray": _cmd_update_xray,
+        "update-singbox": _cmd_update_singbox,
+        "core": _cmd_core,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
     }[args.command]
@@ -250,6 +262,15 @@ def _cmd_generate(args, cfg: config.Config, paths: Paths, logger) -> int:
         f"участники: {members}; запасные: {spares}; цепочки: {len(result.chain_tags)}; "
         f"конфиг: {out_path}; проверка xray run -test: {verdict_text}"
     )
+    change = assembly.singbox
+    if change is not None and change.config is not None:
+        sb_path = out_path.with_name(out_path.stem + ".singbox.json")
+        atomic_write_json(sb_path, change.config)
+        sb_verdict = {True: "пройдена", False: "не пройдена", None: "пропущена"}[change.verdict]
+        print(
+            f"sing-box: серверов с мостами {change.bridged} в работе Xray; конфиг: {sb_path}; "
+            f"проверка sing-box check: {sb_verdict}"
+        )
     return 0
 
 
@@ -265,12 +286,21 @@ def _cmd_apply(args, cfg: config.Config, paths: Paths, logger) -> int:
         return _fail("не все подписки получены — рабочий конфиг не меняется")
     try:
         assembly = engine.assemble(
-            cfg, paths, inventory, mark=mark, logger=logger, xray_bin=xray_bin
+            cfg, paths, inventory, mark=mark, logger=logger, xray_bin=xray_bin,
+            reload_singbox=True if args.now else None,
         )
     except engine.EngineError as exc:
         return _fail(str(exc))
     applier = engine.make_applier(cfg, paths, xray_bin)
-    outcome = applier.apply(assembly.result.config, force_now=args.now)
+    outcome, singbox_outcome = engine.apply_all(
+        cfg, paths, assembly, applier, force_now=args.now,
+    )
+    if singbox_outcome is not None and singbox_outcome.mode != "unchanged":
+        with _store(paths) as store:
+            store.add_event("singbox", engine.describe_singbox(singbox_outcome))
+        print(engine.describe_singbox(singbox_outcome))
+    if outcome is None:
+        return 1  # sing-box конфиг не принял — Xray не менялся
     if outcome.mode in ("api", "restart", "unchanged"):
         engine.persist(paths, assembly, inventory.quotas, record_event=False)
     if outcome.mode in ("api", "restart"):
@@ -819,6 +849,25 @@ def _cmd_update_xray(args, cfg: config.Config, paths: Paths, logger) -> int:
     if problem:
         return _fail(problem)
     return update_xray(cfg, paths, logger=logger)
+
+
+def _cmd_update_singbox(args, cfg: config.Config, paths: Paths, logger) -> int:
+    from .sbcore.update import update_singbox
+
+    problem = _system_root_problem(paths)
+    if problem:
+        return _fail(problem)
+    return update_singbox(cfg, paths, logger=logger)
+
+
+def _cmd_core(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """Ядро сервера — то же, что переключатель в панели (panel.json)."""
+    outcome = actions.set_core(paths, managed.path_for(args.config_path), args.server, args.core)
+    if not outcome.ok:
+        return _fail(outcome.text, outcome.code)
+    logger.info("%s", outcome.text)
+    print(outcome.text)
+    return 0
 
 
 PANEL_WAIT = 15.0  # сколько ждать, пока только что запущенный демон откроет панель

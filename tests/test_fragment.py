@@ -325,7 +325,7 @@ def test_members_are_not_switched_and_mode_off_switches_nobody(dpi):
     assert dpi.mode(spare.fingerprint) is False
     assert all(fragmented_fingerprints(config, dpi.inventory.nodes) == set()
                for config, _urgent in dpi.applied[applied:])
-    assert dpi._fragment_wanted == {} and dpi._fragment_trial == {}
+    assert dpi._profile_wanted == {} and dpi._profile_trial == {}
 
 
 def test_engine_keeps_fragmenting_from_the_applied_config(dpi):

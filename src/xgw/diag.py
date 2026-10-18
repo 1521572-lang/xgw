@@ -24,14 +24,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import engine, fetch, log
-from .config import XRAY_VERSION, Config, probe_bytes
+from . import engine, fetch, log, masking
+from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
+from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
-from .install import UNITS
+from .install import SINGBOX_UNIT, UNITS
 from .net import cmd, dnsmasq, lan, nft, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
+from .sbcore import binary as sbbinary
 from .store import Store
 from .watch import checks as probes
 from .watch import scan, status, target
@@ -133,6 +135,7 @@ class Diag:
             ("Подсеть LAN", self._lan_subnet_conflict),
             ("Порты", self._ports),
             ("Xray API", self._xray_api),
+            ("sing-box", self._singbox),
             ("Время", self._time),
             ("Сон", self._sleep),
             ("IPv6", self._ipv6),
@@ -261,6 +264,71 @@ class Diag:
                 else "sudo xgw update-xray",
             )]
         return [Check("Xray", OK, f"версия {text}, GET-проверка (httpMethod) поддерживается")]
+
+    # --- sing-box (второе ядро) ---------------------------------------------------
+
+    def _singbox(self) -> list[Check]:
+        """Бинарник нужной версии, конфиг, который он принимает, и отсутствие ошибок в его
+        журнале. Выключенный (`core.mode = "xray"`) или не нужный подпискам — не ошибка."""
+        if self.cfg.core.mode == "xray":
+            return [Check("sing-box", OK, "выключен в [core] (mode = xray)")]
+        path = singboxing.find_binary(None, self.paths)
+        if path is None:
+            return [Check(
+                "sing-box", WARN,
+                f"не установлен ({self.paths.singbox_bin}): серверы hysteria2, TUIC, AnyTLS и "
+                "WireGuard пропускаются",
+                "sudo xgw install или sudo xgw update-singbox",
+            )]
+        version = singboxing.installed_version(path)
+        if version is None:
+            return [Check("sing-box", FAIL, f"{path} не запускается", "sudo xgw update-singbox")]
+        text = ".".join(map(str, version))
+        if version != sbbinary.parse_version(SINGBOX_VERSION):
+            return [Check(
+                "sing-box", WARN if self.preinstall else FAIL,
+                f"версия {text}, а XGW работает только с sing-box {SINGBOX_VERSION}",
+                "установка поставит нужную версию" if self.preinstall
+                else "sudo xgw update-singbox",
+            )]
+        result = [Check("sing-box", OK, f"версия {text}")]
+        if not self.paths.singbox_config_file.exists():
+            return result  # серверов для sing-box нет: служба не запущена, и это нормально
+        applied = engine.read_json(self.paths.singbox_config_file)
+        if applied is None:
+            result.append(Check(
+                "sing-box: конфиг", FAIL, f"{self.paths.singbox_config_file} не читается",
+                "sudo xgw apply --now (конфиг соберётся заново)",
+            ))
+            return result
+        ok, output = singboxing.validate_config(applied, path)
+        lines = [line for line in output.splitlines() if line.strip()]
+        if ok is False:
+            result.append(Check(
+                "sing-box: конфиг", FAIL,
+                f"sing-box check не принял {self.paths.singbox_config_file}: "
+                + (lines[-1] if lines else "ошибка"),
+                "sudo xgw apply --now (конфиг соберётся заново)",
+            ))
+        else:
+            bridges = len(singboxing.bridge_ports(applied))
+            result.append(Check(
+                "sing-box: конфиг", OK, f"принят sing-box check, мостов: {bridges}",
+            ))
+        if self.installed and self.root:
+            errors = self.runner(
+                ["journalctl", "-u", "xgw-singbox", "-p", "err", "-n", "20", "--no-pager",
+                 "-o", "cat"], check=False,
+            ).strip().splitlines()
+            errors = [line for line in errors if line.strip() and not line.startswith("--")]
+            if errors:
+                result.append(Check(
+                    "sing-box: журнал", WARN,
+                    f"в журнале службы есть ошибки ({len(errors)}), последняя: "
+                    + masking.mask_text(errors[-1])[:200],
+                    "sudo journalctl -u xgw-singbox -p err -n 20",
+                ))
+        return result
 
     def xray_up(self) -> bool:
         if self._xray_up is None:
@@ -688,7 +756,11 @@ class Diag:
     def _services(self) -> list[Check]:
         if not self.installed:
             return []
-        units = list(UNITS) + ([dnsmasq.UNIT] if self.lan_if else [])
+        # Служба sing-box запускается, только когда есть его конфиг (ConditionPathExists).
+        units = [
+            unit for unit in UNITS
+            if unit != SINGBOX_UNIT or self.paths.singbox_config_file.exists()
+        ] + ([dnsmasq.UNIT] if self.lan_if else [])
         down = [
             unit for unit in units
             if self.runner(["systemctl", "is-active", unit], check=False).strip() != "active"

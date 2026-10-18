@@ -20,6 +20,20 @@ class UnsupportedLink(ParseError):
 
 
 @dataclass
+class SingboxSpec:
+    """Сервер так, как его описывает sing-box (generator/singbox.py).
+
+    main — outbound без тега: type, server, server_port и остальные поля sing-box. У WireGuard
+    это endpoint (endpoint = True), а не outbound. extra — вспомогательные звенья цепочки
+    (shadowtls для Shadowsocks), у каждого локальный «tag»; main["detour"] ссылается на него.
+    """
+
+    main: dict
+    endpoint: bool = False
+    extra: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class RawServer:
     name: str
     protocol: str
@@ -27,12 +41,15 @@ class RawServer:
     port: int
     credential: str
     transport: str
+    # Описание для Xray; пустое — сервер умеет только sing-box (hysteria2, TUIC, AnyTLS…).
     outbound: dict
     warnings: list[str] = field(default_factory=list)
-    # False — узел распознан, но не включается в конфиг (например, hysteria2
-    # без подтверждённой поддержки установленного Xray).
+    # False — узел распознан, но не включается в конфиг (например, ссылка без поддержки
+    # ни в Xray, ни в sing-box).
     supported: bool = True
     keep_tag: str | None = None
+    # Описание для sing-box; None — сервер умеет только Xray (xhttp, цепочки dialerProxy…).
+    singbox: SingboxSpec | None = None
 
 
 def b64_decode(data: str) -> bytes:
@@ -74,6 +91,21 @@ def split_link(link: str, label: str) -> tuple[SplitResult, str, int | None]:
     if not host:
         raise ParseError(f"{label}: нет адреса")
     return parts, host, port
+
+
+def normalize_pin(text: str) -> str:
+    """SHA-256 открытого ключа сервера (параметр pks) в записи sing-box — base64; пусто, если
+    это не хеш. Принимается hex (64 символа) и base64 (обычный или URL-safe, с «=» или без).
+    «+» из base64, не закодированный в ссылке как %2B, разбор запроса превращает в пробел —
+    внутри значения пробел возвращается в «+»."""
+    text = text.replace(" ", "+").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", text):
+        return base64.b64encode(bytes.fromhex(text)).decode("ascii")
+    try:
+        raw = b64_decode(text)
+    except (binascii.Error, ValueError):
+        return ""
+    return base64.b64encode(raw).decode("ascii") if len(raw) == 32 else ""
 
 
 def single(query: dict[str, list[str]], key: str, default: str = "") -> str:
@@ -197,6 +229,15 @@ def build_stream(
             tls["pinnedPeerCertSha256"] = single(query, "pcs")
         if single(query, "vcn"):
             tls["verifyPeerCertByName"] = single(query, "vcn")
+        # pks — SHA-256 открытого ключа сервера для sing-box (у Xray закрепляется хеш всего
+        # сертификата, pcs; друг в друга они не переводятся). Xray поле не видит: builder
+        # убирает его из конфига; без pks сервер с pcs остаётся только у Xray (convert.py).
+        if single(query, "pks"):
+            pin = normalize_pin(single(query, "pks"))
+            if pin:
+                tls["xgwSingboxPin"] = pin
+            else:
+                warnings.append("pks — не SHA-256 (hex или base64): параметр пропущен")
         insecure = _truthy(single(query, "allowInsecure")) or _truthy(single(query, "insecure"))
         if insecure and not single(query, "pcs"):
             warnings.append(
@@ -243,13 +284,23 @@ def parse_link(link: str) -> RawServer:
         from .ss import parse
     elif scheme in ("hysteria2", "hy2"):
         from .hysteria2 import parse
+    elif scheme == "tuic":
+        from .tuic import parse
+    elif scheme == "anytls":
+        from .anytls import parse
+    elif scheme in ("wireguard", "wg"):
+        from .wireguard import parse
     elif scheme == "socks":
-        return _parse_socks(link)
-    elif scheme == "wireguard":
-        raise UnsupportedLink("wireguard:// — поля outbound не описаны, ссылка пропущена")
+        parse = _parse_socks
     else:
         raise UnsupportedLink(f"схема {scheme}:// не поддерживается")
-    return parse(link)
+    raw = parse(link)
+    if raw.singbox is None and raw.outbound:
+        # Сервер, который умеют оба ядра, получает и описание для sing-box (convert.py).
+        from . import convert
+
+        raw.singbox = convert.to_singbox(raw.outbound)
+    return raw
 
 
 def _parse_socks(link: str) -> RawServer:
@@ -352,11 +403,20 @@ def _parse_json_body(text: str, source: str) -> tuple[list[RawServer], dict, lis
     servers: list[RawServer] = []
     warnings: list[str] = []
     for config in configs:
-        from . import xray_json
+        from . import sbjson, xray_json
 
+        if sbjson.looks_like_singbox(config) or (
+            "outbounds" not in config and sbjson.is_singbox_item(config)
+        ):
+            got, got_warnings = sbjson.parse_config(config, source)
+            servers.extend(got)
+            warnings.extend(got_warnings)
+            continue
         outbounds = config.get("outbounds")
         if not isinstance(outbounds, list):
-            raise ParseError(f"{source}: JSON без outbounds — не похоже на конфиг Xray")
+            raise ParseError(
+                f"{source}: JSON без outbounds — не похоже на конфиг Xray или sing-box"
+            )
         remarks = config.get("remarks")
         got, got_warnings = xray_json.parse_outbounds(
             outbounds, source, remarks=remarks if isinstance(remarks, str) else ""

@@ -30,6 +30,7 @@ from urllib.parse import urlencode
 
 from .. import actions, cost, engine, fetch, log, managed, masking
 from ..config import Config
+from ..generator import profiles as profiling
 from ..net import dnsmasq
 from ..net.capture import Capture
 from ..paths import Paths
@@ -78,6 +79,15 @@ def parse_command(text: str, username: str = "") -> tuple[str, str] | None:
     if addressee and username and addressee.lower() != username.lower():
         return None
     return name.lower()[:32], rest.strip()[:100]
+
+
+def _core_note(entry: dict) -> str:
+    """Протокол, ядро и профиль обхода сервера: « [vless, sb+frag]»."""
+    profile = entry.get("profile")
+    if not profile:
+        return ""
+    protocol = entry.get("protocol")
+    return f" [{protocol + ', ' if protocol else ''}{profiling.label(profile)}]"
 
 
 class Bot:
@@ -453,7 +463,8 @@ class Bot:
                     details.append(f"{delay} мс")
                 head = "Основной" if member.get("main") and not snap.get("pin") else "Выбран"
                 lines.append(f"{head}: {member.get('name') or member['tag']}"
-                             + (f" ({', '.join(details)})" if details else ""))
+                             + (f" ({', '.join(details)})" if details else "")
+                             + _core_note(member))
                 break
         pin = snap.get("pin")
         if pin:
@@ -500,10 +511,17 @@ class Bot:
             mark = " ← выбран" if member["tag"] in selected else ""
             if member.get("main") and not snap.get("pin"):
                 mark = " ← основной"
-            lines.append(f"{number}. {member.get('name') or member['tag']} — {health}{mark}")
+            lines.append(
+                f"{number}. {member.get('name') or member['tag']} — {health}{mark}"
+                f"{_core_note(member)}"
+            )
         spares = snap.get("spares") or []
         if spares:
-            lines.append(f"Запасных: {len(spares)} (подменят участника, если он откажет)")
+            on_singbox = sum(1 for spare in spares if spare.get("core") == "sing-box")
+            lines.append(
+                f"Запасных: {len(spares)} (подменят участника, если он откажет)"
+                + (f"; из них через sing-box: {on_singbox}" if on_singbox else "")
+            )
         return "\n".join(lines)
 
     def _devices(self, cfg: Config) -> str:

@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, unquote
 from .common import ParseError, RawServer, build_stream, single, split_link
 
 KNOWN = {
-    "type", "security", "sni", "fp", "alpn", "allowInsecure", "insecure", "pcs", "vcn",
+    "type", "security", "sni", "fp", "alpn", "allowInsecure", "insecure", "pcs", "vcn", "pks",
     "host", "path", "serviceName", "mode", "authority", "pbk", "sid", "spx",
     "headerType", "flow", "extra", "seed",
 }

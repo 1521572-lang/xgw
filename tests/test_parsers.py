@@ -143,15 +143,16 @@ def test_ss_sip002():
     }
 
 
-def test_ss_plugin_is_skipped():
-    """У shadowsocks-outbound Xray нет плагинов: узел с obfs пропускается, а не
-    попадает в конфиг с полями, которые ядро молча проигнорирует."""
+def test_ss_plugin_goes_to_singbox_not_to_xray():
+    """У shadowsocks-outbound Xray нет плагинов: узел с obfs не попадает в конфиг Xray с
+    полями, которые ядро молча проигнорирует, а описан для sing-box (у него obfs встроен)."""
     raw = parse_link(links.SS_SIP002)
-    assert not raw.supported
-    assert "plugin" not in raw.outbound["settings"]["servers"][0]
+    assert raw.supported and raw.outbound == {}
+    assert raw.singbox is not None
+    assert raw.singbox.main["plugin"] == "obfs-local"
+    assert raw.singbox.main["plugin_opts"].startswith("obfs=")
     servers, _, warnings = parse_links_text(links.SS_SIP002, "test")
-    assert servers == []
-    assert any("simple-obfs" in warning for warning in warnings)
+    assert len(servers) == 1 and not warnings
 
 
 def test_ss_2022_percent_encoded_userinfo():
@@ -189,13 +190,15 @@ def test_socks():
     assert server["address"] == "203.0.113.30"
 
 
-def test_hysteria2_skipped_with_warning():
-    servers, _, warnings = parse_links_text(links.HY2, "test")
-    assert servers == []
-    assert any("hysteria2" in warning for warning in warnings)
+def test_hysteria2_is_a_singbox_only_server():
+    servers, _, _warnings = parse_links_text(links.HY2, "test")
+    assert len(servers) == 1 and servers[0].outbound == {}
+    body = servers[0].singbox.main
+    assert body["type"] == "hysteria2" and body["server_port"] == 443
+    assert body["tls"]["enabled"] and "insecure" not in body["tls"]
 
 
-def test_wireguard_skipped():
+def test_wireguard_with_a_broken_key_is_skipped_with_a_reason():
     servers, _, warnings = parse_links_text(
         "wireguard://eyJhIjoxfQ@203.0.113.60:51820#wg", "test"
     )
@@ -238,10 +241,15 @@ def test_subscription_clash_unsupported():
         parse_body("proxies:\n  - name: x\n    type: ss", "sub")
 
 
-def test_subscription_singbox_unsupported():
-    body = json.dumps({"outbounds": [{"type": "vmess", "server": "203.0.113.9", "tag": "sb"}]})
-    with pytest.raises(ParseError, match="sing-box"):
-        parse_body(body, "sub")
+def test_subscription_in_singbox_format_is_parsed():
+    uuid = "2dd61d93-75d8-4da4-ac0e-6aece7eac365"
+    body = json.dumps({"outbounds": [
+        {"type": "direct", "tag": "direct"},
+        {"type": "vmess", "server": "203.0.113.9", "server_port": 443, "uuid": uuid, "tag": "sb"},
+    ]})
+    servers, _, warnings = parse_body(body, "sub")
+    assert [server.name for server in servers] == ["sb"] and not warnings
+    assert servers[0].outbound["protocol"] == "vmess" and servers[0].singbox is not None
 
 
 def test_broken_link_does_not_stop_parsing():

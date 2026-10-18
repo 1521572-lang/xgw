@@ -58,7 +58,8 @@ def known_secrets(cfg: Config | None, paths: Paths) -> set[str]:
     if cfg is not None:
         secrets.update(engine.config_secrets(cfg))
     for path in (paths.xray_config_file, paths.last_good_file, paths.pending_config_file,
-                 paths.generated_config_file):
+                 paths.generated_config_file, paths.singbox_config_file,
+                 paths.singbox_last_good_file, paths.singbox_pending_file):
         loaded = engine.read_json(path)
         if loaded is not None:
             secrets.update(masking.collect_secrets(loaded))
@@ -116,6 +117,10 @@ def export(
     if applied is not None:
         masked = masking.mask_obj(_mask_secret_fields(applied), secrets)
         members["xray-config.json"] = json.dumps(masked, ensure_ascii=False, indent=2) + "\n"
+    applied_singbox = engine.read_json(paths.singbox_config_file)
+    if applied_singbox is not None:
+        masked = masking.mask_obj(_mask_secret_fields(applied_singbox), secrets)
+        members["singbox-config.json"] = json.dumps(masked, ensure_ascii=False, indent=2) + "\n"
     if paths.db_file.exists():
         try:
             store = Store(paths.db_file)

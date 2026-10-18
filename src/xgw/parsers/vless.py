@@ -9,7 +9,7 @@ from .common import ParseError, RawServer, build_stream, single, split_link
 KNOWN = {
     "type", "security", "encryption", "flow", "headerType", "host", "path",
     "serviceName", "mode", "authority", "sni", "fp", "alpn", "pbk", "sid", "spx",
-    "allowInsecure", "insecure", "pcs", "vcn", "extra", "seed",
+    "allowInsecure", "insecure", "pcs", "vcn", "pks", "extra", "seed",
 }
 
 

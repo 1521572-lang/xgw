@@ -16,7 +16,8 @@ import copy
 import hashlib
 import json
 
-from .common import ParseError, RawServer
+from . import convert
+from .common import RawServer
 
 DROP_PROTOCOLS = {"freedom", "blackhole", "dns", "loopback"}
 # freedom в роли звена цепочки допустим (fragment/noises); остальные служебные — нет.
@@ -24,21 +25,11 @@ _CHAIN_FORBIDDEN = DROP_PROTOCOLS - {"freedom"}
 CHAIN_PREFIX = "chain-"
 
 
-def looks_like_singbox(outbounds: list) -> bool:
-    """У sing-box outbounds описываются полем type вместо protocol."""
-    return any(
-        isinstance(item, dict) and "type" in item and "protocol" not in item
-        for item in outbounds
-    )
-
-
 def parse_outbounds(
     outbounds: list, source: str, remarks: str = ""
 ) -> tuple[list[RawServer], list[str]]:
     """Серверы одного конфига Xray. remarks — имя конфига в подписке: у таких
     подписок основной outbound обычно зовётся просто «proxy»."""
-    if looks_like_singbox(outbounds):
-        raise ParseError(f"{source}: формат sing-box не поддерживается")
     warnings: list[str] = []
     items = [item for item in outbounds if isinstance(item, dict)]
     by_tag = {str(item["tag"]): item for item in items if item.get("tag")}
@@ -94,7 +85,7 @@ def parse_outbounds(
         if tag and tag in dialer_targets:
             continue  # звено цепочки: переносится вместе с тем, кто на него ссылается
         if protocol == "hysteria2":
-            warnings.append(f"{source}: outbound «{tag}» пропущен (hysteria2 не подтверждён)")
+            warnings.append(f"{source}: outbound «{tag}» пропущен (в Xray 26.10.10 нет hysteria2)")
             continue
         address, port, credential = _endpoint(item)
         if not address or not port:
@@ -124,6 +115,8 @@ def parse_outbounds(
                     credential=credential,
                     transport=transport,
                     outbound=outbound,
+                    # Цепочка dialerProxy в sing-box не переводится (convert.to_singbox → None).
+                    singbox=convert.to_singbox(item),
                 ),
             )
         )

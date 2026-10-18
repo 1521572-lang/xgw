@@ -33,13 +33,15 @@
     junk: "не используется: служебная запись подписки",
     ipv6: "не используется: адрес IPv6",
     dns: "не используется: имя сервера не находится в DNS — шлюз проверит его снова через несколько часов или по кнопке «Обновить»",
+    core: "не используется: сервер умеет только sing-box (hysteria2, TUIC, AnyTLS…), а он выключен, не установлен или ещё не заведён — установить: sudo xgw update-singbox",
   };
   const KINDS = {
     capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
     rotation: "замена", rollback: "откат", pin: "выбор сервера", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
-    main: "основной сервер", fragment: "дробление ClientHello",
+    main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
+    singbox: "sing-box", core: "ядро сервера",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -444,6 +446,43 @@
   // отключить или убрать такой сервер нельзя (это длится до первого опроса подписок).
   const editable = (server) => server.fingerprint.length === 8;
 
+  // Ядро, которое ведёт сервер, и профиль обхода (generator/profiles.py): «Xray» — обычное
+  // соединение, остальное — то, до чего сервер довела блокировка провайдера.
+  const PROFILES = {
+    "xray:default": ["Xray", ""],
+    "xray:fragment": ["Xray · дробление", "Первая запись TLS уходит к серверу частями (дробление ClientHello), и фильтр провайдера не видит в ней имя сайта. Шлюз включает дробление сам, если без него сервер не отвечает."],
+    "singbox:default": ["sing-box", "Сервер ведёт второе ядро — sing-box: оно умеет протоколы, которых нет в Xray (hysteria2, TUIC, AnyTLS, WireGuard), и по-своему устанавливает TLS."],
+    "singbox:tls_fragment": ["sing-box · дробление", "Сервер ведёт sing-box, а начало TLS режется на части (дробление TCP и записей TLS). Шлюз перевёл сервер сюда сам, когда на Xray он «замерзал»."],
+    "singbox:mux_padded": ["sing-box · mux", "Сервер ведёт sing-box с мультиплексированием и паддингом: меняются размеры пакетов и тайминги внутри туннеля. Шлюз перевёл сервер сюда сам, когда он «замерзал» на прежних профилях."],
+  };
+  function coreBadge(server) {
+    const profile = server.profile || (server.fragment ? "xray:fragment" : "");
+    if (!profile || !PROFILES[profile]) return null;
+    const [text, hint] = PROFILES[profile];
+    const heavy = profile !== "xray:default";
+    return el("span", {
+      class: `tag ${profile.startsWith("singbox") ? "on" : ""}`, text,
+      title: hint || "Сервер ведёт Xray, соединение обычное",
+      ...(heavy ? {} : { "data-plain": "1" }),
+    });
+  }
+
+  const CORE_CHOICES = [["auto", "Авто"], ["xray", "Только Xray"], ["sing-box", "Только sing-box"]];
+
+  function coreNode(server) {
+    // Переключать есть что, только если сервер умеет оба ядра.
+    if (server.status === "skipped" || !editable(server) || (server.capability || "dual") !== "dual") return null;
+    const pin = server.core_pin || "auto";
+    const node = el("select", {
+      class: "prio", "aria-label": `Ядро ${server.name}`,
+      title: "Ядро сервера: «Авто» — шлюз выбирает сам (Xray, а при блокировке — sing-box)",
+      onchange: () => act("core", { fingerprint: server.fingerprint, core: node.value }, node)
+        .then((ok) => { if (!ok) node.value = pin; }),
+    }, ...CORE_CHOICES.map(([value, text]) => el("option", { value, text })));
+    node.value = pin;
+    return node;
+  }
+
   function priorityNode(server) {
     if (server.status === "skipped" || !editable(server)) return null;
     const level = server.priority || "medium";
@@ -504,12 +543,8 @@
         title: "Резервный выход: через него трафик идёт, только когда все серверы в работе не отвечают. Шлюз проверяет его редко и коротким запросом — он тратит квоту подписки.",
       }));
     }
-    if (server.fragment) {
-      title.append(el("span", {
-        class: "tag", text: "дробление",
-        title: "Первая запись TLS уходит к этому серверу частями (дробление ClientHello), и фильтр провайдера не видит в ней имя сайта. Шлюз включает его сам, если без него сервер не отвечает.",
-      }));
-    }
+    const badge = coreBadge(server);
+    if (badge) title.append(badge);
     if (server.multiplier !== undefined) {
       title.append(el("span", {
         class: "tag", text: multiplierText(server.multiplier),
@@ -525,6 +560,7 @@
       serverValue(server),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
+        coreNode(server),
         priorityNode(server),
         switchNode(server),
         editable(server) ? iconButton("remove", `Убрать ${server.name} из списка`, () => confirmRemove(
