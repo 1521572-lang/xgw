@@ -181,6 +181,71 @@ def test_manual_pin_wins_and_the_main_returns_after_it(daemon):
     assert ("unpin",) in daemon.api.calls[calls:]
 
 
+def test_speed_is_measured_while_a_server_is_pinned_by_hand(daemon):
+    """Ручной выбор бессрочный (кнопка «Выбрать»): основной не выбирается, но участники
+    замеряются по расписанию и по кнопке — иначе строки серверов остались бы без скорости."""
+    first, second = _start(daemon)
+    daemon.speeds = {first: 30.0, second: 90.0}
+    daemon.store.set_meta("pin", json.dumps({"tag": first, "until": None}))
+    daemon.api.state = BalancerInfo(override=first, selects=())
+    for _ in range(3):
+        _step(daemon)
+    assert sorted(daemon.measured) == sorted([first, second])
+    assert daemon.main is None and daemon.api.state.override == first
+    assert ("pin", second) not in daemon.api.calls  # закрепление ручное, его не трогают
+    daemon.request_speed()
+    for _ in range(3):
+        _step(daemon)
+    assert len(daemon.measured) == 4 and not daemon.speed_pending
+    # Выбор сняли — основной сразу по замерам, сделанным при выборе, а не по задержке.
+    daemon.store.set_meta("pin", "")
+    daemon.api.unpin("balancer")
+    _step(daemon)
+    assert daemon.main["tag"] == second and daemon.main["basis"] == "speed"
+    assert daemon.api.state.override == second and len(daemon.measured) == 4
+
+
+def test_round_finished_during_a_pin_moves_the_main_when_the_pin_ends(daemon):
+    """Раунд прошёл при ручном выборе и другой оказался заметно быстрее — основной меняется
+    на первом же шаге после снятия выбора, а не через speed.every_hours."""
+    first, second = _start(daemon)
+    daemon.speeds = {first: 90.0, second: 30.0}
+    for _ in range(3):
+        _step(daemon)
+    assert daemon.main["tag"] == first
+    until = daemon.t + 7200  # дольше speed.hold_minutes
+    daemon.store.set_meta("pin", json.dumps({"tag": second, "until": until}))
+    daemon.api.state = BalancerInfo(override=second, selects=())
+    daemon.speeds = {first: 30.0, second: 90.0}
+    daemon.request_speed()
+    for _ in range(3):
+        _step(daemon)
+    assert len(daemon.measured) == 4 and not daemon.speed_pending
+    assert daemon.main["tag"] == first and daemon.api.state.override == second
+    daemon.t = until + 1
+    daemon.tick()
+    assert daemon.main["tag"] == second and daemon.api.state.override == second
+    assert len(daemon.measured) == 4
+    assert any("сменён" in event and "90 Мбит/с" in event for event in _main_events(daemon))
+
+
+def test_x100_servers_are_not_measured_while_pinned(paths):
+    """При ручном выборе цена загрузки та же: x100 не замеряются и по кнопке."""
+    daemon = _make(paths, source=_inventory())
+    try:
+        first, _second = _start(daemon)
+        prices = daemon._prices()
+        daemon._prices = lambda: dict.fromkeys(prices, 100.0)
+        daemon.store.set_meta("pin", json.dumps({"tag": first, "until": None}))
+        daemon.api.state = BalancerInfo(override=first, selects=())
+        daemon.request_speed()
+        for _ in range(3):
+            _step(daemon)
+        assert daemon.measured == [] and not daemon.speed_pending
+    finally:
+        daemon.store.close()
+
+
 def test_main_is_released_when_no_member_answers(daemon):
     """Без живых участников закрепление снимается: иначе трафик стоял бы на мёртвом сервере,
     а резервный выход (fallbackTag) не сработал бы — закрепление обходит здоровье."""

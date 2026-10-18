@@ -637,11 +637,12 @@
     const on = Boolean(sticky.on);
     $("sticky").setAttribute("aria-checked", String(on));
     $("speed").hidden = !on || !sticky.every_hours;
+    const pinned = Boolean(s.pin && !s.pin.down);
     let text;
     if (!on) {
       text = "Выключено: шлюз сам выбирает сервер с наименьшей задержкой и может менять его каждые полминуты.";
-    } else if (s.pin && !s.pin.down) {
-      text = "Пока сервер выбран вручную, основной сервер не выбирается.";
+    } else if (pinned) {
+      text = "Пока сервер выбран вручную, основной сервер не выбирается — шлюз выберет его, когда выбор снимут.";
     } else if (s.main) {
       const speed = s.main.mbps !== null && s.main.mbps !== undefined ? ` — ${mbps(s.main.mbps)}` : "";
       const basis = s.main.basis === "speed" ? "" : " (скорость ещё не замерена — выбран по задержке)";
@@ -651,7 +652,7 @@
       text = "Весь трафик пойдёт через самый быстрый сервер в работе — шлюз выберет его, как только серверы ответят.";
     }
     if (on && sticky.every_hours) {
-      text += ` Скорость замеряется раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные — меньшей загрузкой, чтобы не тратить квоту, x100 — не замеряются.`;
+      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется"} раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные — меньшей загрузкой, чтобы не тратить квоту, x100 — не замеряются.`;
     }
     $("main-note").textContent = text;
   }

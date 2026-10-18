@@ -352,11 +352,13 @@ class Daemon:
         self._sub_alerted = False
         # Основной сервер (_main_step): запись {"tag", "key", "name", "since", "basis"}
         # хранится в базе — переживает перезапуск демона. Очередь замеров скорости —
-        # probe-теги участников; speed_round — идёт раунд, по его концу — сравнение.
+        # probe-теги участников; speed_round — идёт раунд, по его концу — сравнение;
+        # _compare_due — раунд кончился при ручном выборе, сравнить, когда его снимут.
         self.main: dict | None = self._load_main()
         self.speed_queue: deque[str] = deque()
         self.next_speed = 0.0
         self.speed_round = False
+        self._compare_due = False
         self._speed_asked = False
         self.main_cooldown: dict[str, float] = {}  # ключ сервера → до когда (time.time())
         self._main_failed_at = float("-inf")  # последняя смена из-за непрошедшей загрузки
@@ -465,6 +467,7 @@ class Daemon:
         self.speed_queue = deque(previous.speed_queue)
         self.next_speed = previous.next_speed
         self.speed_round = previous.speed_round
+        self._compare_due = previous._compare_due
         self.main_cooldown = dict(previous.main_cooldown)
         self._main_failed_at = previous._main_failed_at
         self._main_suspended = previous._main_suspended
@@ -2227,7 +2230,9 @@ class Daemon:
         Закрепление в ядре не смотрит на здоровье сервера, поэтому снимается во всех
         состояниях, кроме HEALTHY и DEGRADED: без живых участников трафик должен уйти на
         резервный выход (fallbackTag), а при XRAY_DOWN и прочем выбирать не из чего.
-        Ручное закрепление (xgw pin, /pin) главнее: пока оно действует, демон его не трогает."""
+        Ручное закрепление (xgw pin, /pin) главнее: пока оно действует, демон его не трогает
+        и основной не выбирает, но серверы в работе замеряет, как обычно, — скорость видна в
+        панели, а итоги раунда основной сверит, когда выбор снимут."""
         members = [info for info in view if info.role == "proxy"]
         if not signals.xray_ok:
             # Снимать нечего: перезапуск Xray закрепление сбросит сам.
@@ -2241,7 +2246,13 @@ class Daemon:
         ):
             self._release_main()
             return
+        alive = [
+            info for info in members if (observatory.get(info.tag) or {}).get("alive")
+        ]
+        candidates = [self._candidate(info, observatory) for info in alive]
         if self._manual_active():
+            if self._speed_step(view, applied, candidates, now):
+                self._compare_due = True
             return
         if self._main_suspended:
             if not signals.e2e_ok:
@@ -2250,17 +2261,15 @@ class Daemon:
             self.notifier.event(
                 "main", "загрузка снова проходит — основной сервер выбирается заново"
             )
-        alive = [
-            info for info in members if (observatory.get(info.tag) or {}).get("alive")
-        ]
-        candidates = [self._candidate(info, observatory) for info in alive]
         current = self._main_candidate(members, observatory, signals)
         if current is None and self._main_suspended:
             return
         if current is None:
             self._choose_main(candidates)
-        if self._speed_step(view, applied, candidates, now) and self.main is not None:
-            self._compare_main(view, observatory)
+        if self._speed_step(view, applied, candidates, now) or self._compare_due:
+            self._compare_due = False
+            if self.main is not None:
+                self._compare_main(view, observatory)
         if self.main is not None:
             self._pin_main(self.main["tag"])
 
