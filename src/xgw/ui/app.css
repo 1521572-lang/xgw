@@ -498,12 +498,38 @@ button, textarea, input { font: inherit; color: inherit; }
 .prio.low { opacity: .8; }
 .prio[data-busy] { cursor: progress; opacity: .6; }
 
-/* Узкий экран: у сервера много кнопок (закрепить, приоритет, выключатель, убрать) —
-   они уходят на вторую строку, а имя и состояние остаются читаемыми. */
+/* Сервер — в две строки: сверху имя с метками и задержка, снизу состояние и кнопки (выбрать,
+   ядро, приоритет, выключатель, убрать). В одну строку с кнопками имени не оставалось места. */
+/* Четыре колонки: кнопки во второй строке шире задержки, и в общей с ней колонке они отняли бы
+   место у имени. */
+.servers > li.server {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "dot title title value" ". sub tools tools";
+  align-items: center;
+  gap: .3rem .75rem;
+}
+.server > .dot { grid-area: dot; }
+/* Метки, которым не хватает места, уходят под имя, а не сжимают его. */
+.server > .row-title { grid-area: title; flex-wrap: wrap; row-gap: .2rem; }
+.server > .delay { grid-area: value; }
+.server > .row-sub { grid-area: sub; }
+.server > .row-tools {
+  grid-area: tools;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  justify-self: end;
+  row-gap: .3rem;
+}
+/* Узкий экран: состояние — во всю ширину, кнопки — третьей строкой от края до края. */
 @media (max-width: 599.98px) {
-  .servers > li { flex-wrap: wrap; row-gap: .35rem; }
-  .servers > li > .row-main { flex-basis: calc(100% - 10rem); }
-  .servers > li > .row-tools { flex-basis: 100%; justify-content: flex-end; }
+  .servers > li.server {
+    grid-template-areas: "dot title title value" ". sub sub sub" "tools tools tools tools";
+  }
+  .server > .row-tools { justify-self: stretch; }
+  /* Чтобы кнопки сервера уместились в одну строку и на экране телефона. */
+  .server .prio { margin: 0; padding-right: .2rem; padding-left: .25rem; }
+  .server .choose { padding-right: .55rem; padding-left: .55rem; }
 }
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
 

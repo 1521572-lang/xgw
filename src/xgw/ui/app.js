@@ -467,7 +467,9 @@
     });
   }
 
-  const CORE_CHOICES = [["auto", "Авто"], ["xray", "Только Xray"], ["sing-box", "Только sing-box"]];
+  // Подписи короткие: длинная («Только sing-box») задавала ширину списка, и в строке сервера
+  // не хватало места. Что значит выбор — в подсказке.
+  const CORE_CHOICES = [["auto", "Авто"], ["xray", "Xray"], ["sing-box", "sing-box"]];
 
   function coreNode(server) {
     // Переключать есть что, только если сервер умеет оба ядра.
@@ -475,7 +477,7 @@
     const pin = server.core_pin || "auto";
     const node = el("select", {
       class: "prio", "aria-label": `Ядро ${server.name}`,
-      title: "Ядро сервера: «Авто» — шлюз выбирает сам (Xray, а при блокировке — sing-box)",
+      title: "Ядро сервера: «Авто» — шлюз выбирает сам (Xray, а при блокировке — sing-box); «Xray» или «sing-box» — только это ядро",
       onchange: () => act("core", { fingerprint: server.fingerprint, core: node.value }, node)
         .then((ok) => { if (!ok) node.value = pin; }),
     }, ...CORE_CHOICES.map(([value, text]) => el("option", { value, text })));
@@ -551,13 +553,16 @@
         title: "Множитель расхода: столько трафика подписки уходит на каждый байт через этот сервер",
       }));
     }
-    const classes = [];
+    const classes = ["server"];
     if (server.selected || pinned || main) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
+    // Две строки (app.css, «.server»): имя с метками и задержка, под ними — состояние и
+    // кнопки. В одной строке с кнопками имени места не оставалось.
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
-      el("div", { class: "row-main" }, title, el("div", { class: "row-sub", text: serverNote(server, s) })),
+      title,
       serverValue(server),
+      el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
         coreNode(server),
