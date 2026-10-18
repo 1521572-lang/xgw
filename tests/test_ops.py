@@ -586,8 +586,66 @@ def test_archive_goes_to_the_sudo_user_with_its_members(tmp_path, monkeypatch):
         members = archive.getmembers()
     assert {(m.uid, m.gid, m.mode) for m in members} == {(1000, 1001, 0o600)}
     calls.clear()
-    logs.write_archive(path, [("a.txt", "текст")])
+    logs.write_archive(tmp_path / "b.tar.gz", [("a.txt", "текст")])
     assert calls == []  # без sudo владелец не меняется
+
+
+def test_archive_never_overwrites_an_existing_file(tmp_path, monkeypatch):
+    """Под sudo опечатка в --out не должна затереть чужой файл и отдать его пользователю."""
+    calls = []
+    monkeypatch.setattr(logs.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    target = tmp_path / "config.toml"
+    target.write_text("секретный конфиг\n", encoding="utf-8")
+    target.chmod(0o640)
+    with pytest.raises(FileExistsError):
+        logs.write_archive(target, [("a.txt", "текст")], owner=(1000, 1001))
+    assert target.read_text(encoding="utf-8") == "секретный конфиг\n"
+    assert target.stat().st_mode & 0o777 == 0o640 and calls == []
+
+
+def test_archive_does_not_follow_a_symlink(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(logs.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    target = tmp_path / "config.toml"
+    target.write_text("секретный конфиг\n", encoding="utf-8")
+    link = tmp_path / "logs.tar.gz"
+    link.symlink_to(target)
+    with pytest.raises(FileExistsError):
+        logs.write_archive(link, [("a.txt", "текст")], owner=(1000, 1001))
+    assert target.read_text(encoding="utf-8") == "секретный конфиг\n" and calls == []
+    dangling = tmp_path / "new.tar.gz"
+    dangling.symlink_to(tmp_path / "created-by-root")
+    with pytest.raises(FileExistsError):
+        logs.write_archive(dangling, [("a.txt", "текст")])
+    assert not (tmp_path / "created-by-root").exists()
+
+
+def test_unfinished_archive_is_removed(tmp_path):
+    def members():
+        yield "a.txt", "текст"
+        raise OSError("диск переполнен")
+
+    path = tmp_path / "a.tar.gz"
+    with pytest.raises(OSError, match="переполнен"):
+        logs.write_archive(path, members())
+    assert not path.exists()  # повтор с тем же именем не упрётся в «уже существует»
+
+
+def test_logs_export_command_refuses_an_existing_out(root, tmp_path, capsys, monkeypatch):
+    root.etc.mkdir(parents=True)
+    root.config_file.write_text(f'[[subscriptions]]\nurl = "{SUB_URL}"\n', encoding="utf-8")
+    collected = []
+    monkeypatch.setattr(logs, "known_secrets", lambda *args: collected.append(args) or set())
+    target = tmp_path / "notes.txt"
+    target.write_text("мои заметки\n", encoding="utf-8")
+    link = tmp_path / "link.tar.gz"
+    link.symlink_to(target)
+    for out_path in (target, link):
+        assert main(["logs", "--export", "--out", str(out_path)]) == 1
+        err = capsys.readouterr().err
+        assert f"файл {out_path} уже существует — укажите другое имя" in err, err
+    assert target.read_text(encoding="utf-8") == "мои заметки\n"
+    assert collected == []  # отказ — до сбора журнала и diag
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="нужен root")

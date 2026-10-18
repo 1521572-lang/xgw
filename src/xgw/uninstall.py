@@ -13,7 +13,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from . import log
+from . import log, managed
 from .config import Config
 from .install import UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
@@ -217,6 +217,9 @@ class Uninstaller:
         if purge:
             targets.append(self.paths.etc)
         self.paths.launcher.unlink(missing_ok=True)
+        # Блокировка panel.json — служебный файл, не настройка: рядом с конфигом не остаётся.
+        with contextlib.suppress(OSError):
+            managed.lock_path(managed.path_for(self.paths.config_file)).unlink(missing_ok=True)
         for target in targets:
             shutil.rmtree(target, ignore_errors=True)
         self.out("  ✓ файлы XGW удалены")

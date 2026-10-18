@@ -982,6 +982,8 @@ def _cmd_logs(args, cfg: config.Config, paths: Paths, logger) -> int:
             diag_text=lambda: diag.render(_run_diag(args, cfg, paths, logger, net=False)),
             owner=logs.sudo_owner(),  # под sudo архив — тому, кто вызвал, а не root
         )
+    except FileExistsError:
+        return _fail(f"архив не записан: файл {out_path} уже существует — укажите другое имя")
     except OSError as exc:
         return _fail(f"архив не записан: {exc}")
     print(f"архив без секретов: {out_path}")

@@ -8,6 +8,7 @@ URL подписок остаётся домен, от ссылок сервер
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -94,7 +95,10 @@ def export(
 ) -> list[str]:
     """Собирает архив; возвращает имена вложенных файлов. owner — (uid, gid) пользователя,
     которому отдать архив (sudo_owner): иначе под sudo он root'овский, с правами 0600, и
-    пользователь без sudo его не прочитает."""
+    пользователь без sudo его не прочитает. Существующий out_path — FileExistsError ещё до
+    сбора: журнал и diag собираются не мгновенно (окончательно путь проверяет write_archive)."""
+    if os.path.lexists(out_path):
+        raise FileExistsError(errno.EEXIST, "файл уже существует", str(out_path))
     secrets = known_secrets(cfg, paths)
 
     def clean(text: str) -> str:
@@ -185,21 +189,30 @@ def write_archive(
     """tar.gz с правами 0600: в журнале остаются адреса серверов и имена устройств.
 
     owner — (uid, gid): архив отдаётся этому пользователю, и файлы в нём записаны на него же
-    (распакованные root'ом, они тоже достанутся ему); права остаются 0600."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    (распакованные root'ом, они тоже достанутся ему); права остаются 0600.
+
+    Файл всегда создаётся новый: существующий путь или символическая ссылка — FileExistsError,
+    и тот файл не меняется. Под sudo опечатка в --out иначе молча затёрла бы чужой файл, хоть
+    /etc/xgw/config.toml, и отдала бы его пользователю. Недописанный архив удаляется."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
     fd = os.open(out_path, flags, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        if owner is not None:
-            os.fchown(handle.fileno(), *owner)
-        with tarfile.open(fileobj=handle, mode="w:gz") as archive:
-            now = time.time()
-            for name, text in members:
-                data = text.encode("utf-8")
-                info = tarfile.TarInfo(f"xgw-logs/{name}")
-                info.size = len(data)
-                info.mtime = now
-                info.mode = 0o600
-                if owner is not None:
-                    info.uid = owner[0]
-                    info.gid = max(owner[1], 0)
-                archive.addfile(info, io.BytesIO(data))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            if owner is not None:
+                os.fchown(handle.fileno(), *owner)
+            with tarfile.open(fileobj=handle, mode="w:gz") as archive:
+                now = time.time()
+                for name, text in members:
+                    data = text.encode("utf-8")
+                    info = tarfile.TarInfo(f"xgw-logs/{name}")
+                    info.size = len(data)
+                    info.mtime = now
+                    info.mode = 0o600
+                    if owner is not None:
+                        info.uid = owner[0]
+                        info.gid = max(owner[1], 0)
+                    archive.addfile(info, io.BytesIO(data))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)  # создан здесь же (O_EXCL): чужого файла это не тронет
+        raise

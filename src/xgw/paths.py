@@ -10,6 +10,7 @@ import contextlib
 import fcntl
 import json
 import os
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -186,13 +187,16 @@ class Paths:
 
 
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o640) -> None:
-    """Атомарная запись: временный файл рядом, fsync, os.replace.
+    """Атомарная запись: временный файл рядом, fsync, os.replace, fsync каталога.
 
     Файл сразу создаётся с нужными правами — содержимое с секретами ни на
-    мгновение не оказывается доступным на чтение остальным.
+    мгновение не оказывается доступным на чтение остальным. Временный файл у каждого
+    потока свой: два потока демона, пишущие один файл, иначе писали бы в общий
+    временный и могли оставить смесь обеих записей. fsync каталога — чтобы после
+    сбоя питания на месте файла не оказалось прежнего содержимого.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), mode)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -206,6 +210,17 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o640) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Запись о переименовании — на диск; где каталог так не открыть, обходимся без этого."""
+    with contextlib.suppress(OSError):
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def atomic_write_text(path: Path, text: str, *, mode: int = 0o640) -> None:
@@ -256,11 +271,16 @@ class InstanceLock:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path, *, timeout: float = 60.0, poll: float = 0.1) -> Iterator[None]:
-    """Межпроцессная блокировка: применение конфига и вызовы API не пересекаются."""
+def file_lock(
+    path: Path, *, timeout: float = 60.0, poll: float = 0.1, mode: int = 0o666,
+) -> Iterator[None]:
+    """Межпроцессная блокировка: применение конфига и вызовы API не пересекаются.
+    Потоки одного процесса она тоже разводит: каждый вызов открывает файл заново.
+    mode — права файла блокировки, если его ещё нет (минус umask)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
-    with open(path, "a+b") as handle:
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, mode)
+    with os.fdopen(fd, "a+b") as handle:
         while True:
             try:
                 _try_lock(handle)

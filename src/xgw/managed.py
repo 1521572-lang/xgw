@@ -12,14 +12,19 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlsplit
 
 from . import priority as priority_levels
 from .parsers.common import parse_links_text
-from .paths import atomic_write_json
+from .paths import LockTimeout, atomic_write_json, file_lock
+
+T = TypeVar("T")
 
 FILE_NAME = "panel.json"
+LOCK_TIMEOUT = 10.0  # правка panel.json — доли секунды; дольше — что-то зависло
 MAX_SUBSCRIPTIONS = 16
 MAX_LINKS = 200
 MAX_SERVERS = 2000  # сколько отключённых и убранных серверов помнить
@@ -43,6 +48,34 @@ class ManagedError(Exception):
 
 def path_for(config_path: Path) -> Path:
     return Path(config_path).with_name(FILE_NAME)
+
+
+def lock_path(path: Path) -> Path:
+    """Файл блокировки рядом с panel.json. Сам panel.json для неё не годится: атомарная
+    запись подменяет файл, и блокировка осталась бы на прежнем."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.lock")
+
+
+def _update(path: Path, change: Callable[[dict], T]) -> T:
+    """load → change → save под блокировкой. У panel.json три писателя: панель и бот
+    Telegram (потоки демона) и команды `xgw priority`, `xgw core`; без блокировки правка,
+    сделанная между чтением и записью другого писателя, терялась.
+
+    change правит data на месте и возвращает итог; ложный итог — ничего не изменилось,
+    файл не переписывается."""
+    path = Path(path)
+    try:
+        with file_lock(lock_path(path), timeout=LOCK_TIMEOUT, poll=0.02, mode=0o600):
+            data, error = load(path)
+            if error:
+                raise ManagedError(error)
+            result = change(data)
+            if result:
+                save(path, data)
+            return result
+    except LockTimeout as exc:
+        raise ManagedError(f"{exc}: настройки меняет другой процесс XGW — повторите") from exc
 
 
 def load(path: Path) -> tuple[dict, str]:
@@ -189,15 +222,16 @@ def check_bot_token(text: object) -> str:
 
 def set_telegram(path: Path, token: str, chat_id: str = "") -> None:
     """Запоминает бота; chat_id пуст, пока чат не подключён. Пустой токен убирает бота."""
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
     if token:
         token = check_bot_token(token)
         if chat_id and not _CHAT_ID_RE.fullmatch(chat_id):
             raise ManagedError("неверный идентификатор чата")
-    data["telegram"] = {"token": token, "chat_id": chat_id if token else ""}
-    save(path, data)
+
+    def change(data: dict) -> bool:
+        data["telegram"] = {"token": token, "chat_id": chat_id if token else ""}
+        return True
+
+    _update(path, change)
 
 
 def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -> bool:
@@ -207,35 +241,36 @@ def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -
     mac_ok = normalize_mac(mac)
     if mac_ok is None:
         raise ManagedError("неверный MAC устройства")
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    devices = [item for item in data["devices"] if item["mac"] != mac_ok]
-    if bypass:
-        try:
-            address = str(ipaddress.IPv4Address(ip))
-        except ValueError as exc:
-            raise ManagedError("неверный адрес устройства") from exc
-        if any(item["ip"] == address for item in devices):
-            raise ManagedError("этот адрес уже закреплён за другим устройством")
-        if len(devices) >= MAX_DEVICES:
-            raise ManagedError(f"устройств мимо VPN уже {MAX_DEVICES} — больше нельзя")
-        clean = name if _NAME_RE.fullmatch(name) else ""
-        devices.append({"mac": mac_ok, "ip": address, "name": clean})
-    if devices == data["devices"]:
-        return False
-    data["devices"] = devices
-    save(path, data)
-    return True
+
+    def change(data: dict) -> bool:
+        devices = [item for item in data["devices"] if item["mac"] != mac_ok]
+        if bypass:
+            try:
+                address = str(ipaddress.IPv4Address(ip))
+            except ValueError as exc:
+                raise ManagedError("неверный адрес устройства") from exc
+            if any(item["ip"] == address for item in devices):
+                raise ManagedError("этот адрес уже закреплён за другим устройством")
+            if len(devices) >= MAX_DEVICES:
+                raise ManagedError(f"устройств мимо VPN уже {MAX_DEVICES} — больше нельзя")
+            clean = name if _NAME_RE.fullmatch(name) else ""
+            devices.append({"mac": mac_ok, "ip": address, "name": clean})
+        if devices == data["devices"]:
+            return False
+        data["devices"] = devices
+        return True
+
+    return _update(path, change)
 
 
 def replace_devices(path: Path, devices: list[dict]) -> None:
     """Возвращает прежний список устройств — откат, если сеть изменение не приняла."""
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    data["devices"] = _devices(devices)
-    save(path, data)
+
+    def change(data: dict) -> bool:
+        data["devices"] = _devices(devices)
+        return True
+
+    _update(path, change)
 
 
 def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:
@@ -249,20 +284,18 @@ def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:
         isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) for item in fingerprints
     ):
         raise ManagedError("неизвестный сервер или действие")
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    before = (set(data["disabled"]), set(data["removed"]))
     chosen = list(dict.fromkeys(fingerprints))
-    for key in ("disabled", "removed"):
-        data[key] = [item for item in data[key] if item not in chosen]
-    if mode != "enabled":
-        # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
-        data[mode] = [*data[mode], *chosen][-MAX_SERVERS:]
-    if (set(data["disabled"]), set(data["removed"])) == before:
-        return False
-    save(path, data)
-    return True
+
+    def change(data: dict) -> bool:
+        before = (set(data["disabled"]), set(data["removed"]))
+        for key in ("disabled", "removed"):
+            data[key] = [item for item in data[key] if item not in chosen]
+        if mode != "enabled":
+            # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
+            data[mode] = [*data[mode], *chosen][-MAX_SERVERS:]
+        return (set(data["disabled"]), set(data["removed"])) != before
+
+    return _update(path, change)
 
 
 def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
@@ -272,19 +305,19 @@ def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
         isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) for item in fingerprints
     ):
         raise ManagedError("неизвестный сервер или уровень приоритета")
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    before = dict(data["priority"])
-    levels = {key: value for key, value in before.items() if key not in fingerprints}
-    if level != priority_levels.DEFAULT:
-        levels.update(dict.fromkeys(fingerprints, level))
-    if levels == before:
-        return False
-    # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
-    data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
-    save(path, data)
-    return True
+
+    def change(data: dict) -> bool:
+        before = dict(data["priority"])
+        levels = {key: value for key, value in before.items() if key not in fingerprints}
+        if level != priority_levels.DEFAULT:
+            levels.update(dict.fromkeys(fingerprints, level))
+        if levels == before:
+            return False
+        # Самые старые записи вытесняются: серверы, которых давно нет в подписке.
+        data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
+        return True
+
+    return _update(path, change)
 
 
 def set_core(path: Path, fingerprints: list[str], core: str) -> bool:
@@ -294,32 +327,32 @@ def set_core(path: Path, fingerprints: list[str], core: str) -> bool:
         isinstance(item, str) and _FINGERPRINT_RE.fullmatch(item) for item in fingerprints
     ):
         raise ManagedError("неизвестный сервер или ядро")
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    before = dict(data["core"])
-    cores = {key: value for key, value in before.items() if key not in fingerprints}
-    if core != "auto":
-        cores.update(dict.fromkeys(fingerprints, core))
-    if cores == before:
-        return False
-    data["core"] = dict(list(cores.items())[-MAX_SERVERS:])
-    save(path, data)
-    return True
+
+    def change(data: dict) -> bool:
+        before = dict(data["core"])
+        cores = {key: value for key, value in before.items() if key not in fingerprints}
+        if core != "auto":
+            cores.update(dict.fromkeys(fingerprints, core))
+        if cores == before:
+            return False
+        data["core"] = dict(list(cores.items())[-MAX_SERVERS:])
+        return True
+
+    return _update(path, change)
 
 
 def set_sticky(path: Path, value: bool) -> bool:
     """Основной сервер (speed.sticky) включён или выключен; True — что-то изменилось."""
     if not isinstance(value, bool):
         raise ManagedError("ожидается true или false")
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    if data["sticky"] is value:
-        return False
-    data["sticky"] = value
-    save(path, data)
-    return True
+
+    def change(data: dict) -> bool:
+        if data["sticky"] is value:
+            return False
+        data["sticky"] = value
+        return True
+
+    return _update(path, change)
 
 
 def save(path: Path, data: dict) -> None:
@@ -397,30 +430,29 @@ def add_subscription(
 ) -> str:
     """Добавляет подписку и возвращает её имя. taken — имена, занятые в config.toml."""
     url = check_url(url)
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    if len(data["subscriptions"]) >= MAX_SUBSCRIPTIONS:
-        raise ManagedError(f"подписок из панели уже {MAX_SUBSCRIPTIONS} — больше нельзя")
-    if any(item["url"] == url for item in data["subscriptions"]):
-        raise ManagedError("такая подписка уже добавлена")
-    used = set(taken) | {item["name"] for item in data["subscriptions"]}
-    name = _clean_name(name)
-    if name and name in used:
-        raise ManagedError(f"подписка с именем «{name}» уже есть")
-    if not name:
-        name = _free_name((urlsplit(url).hostname or "sub")[:MAX_NAME], used)
-    data["subscriptions"].append(
-        {
-            "name": name,
-            "url": url,
-            "user_agent": _clean_header_value(user_agent),
-            "headers": _clean_headers(headers or {}),
-            "refresh_minutes": DEFAULT_REFRESH,
-        }
-    )
-    save(path, data)
-    return name
+    wanted = _clean_name(name)
+
+    def change(data: dict) -> str:
+        if len(data["subscriptions"]) >= MAX_SUBSCRIPTIONS:
+            raise ManagedError(f"подписок из панели уже {MAX_SUBSCRIPTIONS} — больше нельзя")
+        if any(item["url"] == url for item in data["subscriptions"]):
+            raise ManagedError("такая подписка уже добавлена")
+        used = set(taken) | {item["name"] for item in data["subscriptions"]}
+        if wanted and wanted in used:
+            raise ManagedError(f"подписка с именем «{wanted}» уже есть")
+        chosen = wanted or _free_name((urlsplit(url).hostname or "sub")[:MAX_NAME], used)
+        data["subscriptions"].append(
+            {
+                "name": chosen,
+                "url": url,
+                "user_agent": _clean_header_value(user_agent),
+                "headers": _clean_headers(headers or {}),
+                "refresh_minutes": DEFAULT_REFRESH,
+            }
+        )
+        return chosen
+
+    return _update(path, change)
 
 
 def update_subscription(
@@ -431,30 +463,29 @@ def update_subscription(
     headers: dict[str, str] | None = None,
 ) -> bool:
     """Обновляет User-Agent и заголовки управляемой подписки. False — нет такой подписки."""
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    for item in data["subscriptions"]:
-        if item["name"] == name:
-            if user_agent is not None:
-                item["user_agent"] = _clean_header_value(user_agent)
-            if headers is not None:
-                item["headers"] = _clean_headers(headers)
-            save(path, data)
-            return True
-    return False
+
+    def change(data: dict) -> bool:
+        for item in data["subscriptions"]:
+            if item["name"] == name:
+                if user_agent is not None:
+                    item["user_agent"] = _clean_header_value(user_agent)
+                if headers is not None:
+                    item["headers"] = _clean_headers(headers)
+                return True
+        return False
+
+    return _update(path, change)
 
 
 def remove_subscription(path: Path, name: str) -> bool:
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    kept = [item for item in data["subscriptions"] if item["name"] != name]
-    if len(kept) == len(data["subscriptions"]):
-        return False
-    data["subscriptions"] = kept
-    save(path, data)
-    return True
+    def change(data: dict) -> bool:
+        kept = [item for item in data["subscriptions"] if item["name"] != name]
+        if len(kept) == len(data["subscriptions"]):
+            return False
+        data["subscriptions"] = kept
+        return True
+
+    return _update(path, change)
 
 
 def split_links(text: str) -> list[str]:
@@ -465,35 +496,33 @@ def split_links(text: str) -> list[str]:
 def add_links(path: Path, text: str, *, taken: set[str]) -> int:
     """Добавляет ссылки серверов (vless://, vmess://, trojan://, ss://); возвращает,
     сколько добавлено. Ссылка, которую XGW не разбирает, не принимается."""
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    known = set(taken) | set(data["links"])
-    added = 0
-    for link in split_links(text):
-        if link in known:
-            continue
-        raws, _meta, warnings = parse_links_text(link, "manual")
-        if not raws:
-            reason = warnings[0] if warnings else "формат не распознан"
-            raise ManagedError(f"ссылку сервера разобрать не удалось: {reason}")
-        if len(data["links"]) >= MAX_LINKS:
-            raise ManagedError(f"ссылок из панели уже {MAX_LINKS} — больше нельзя")
-        data["links"].append(link)
-        known.add(link)
-        added += 1
-    if added:
-        save(path, data)
-    return added
+
+    def change(data: dict) -> int:
+        known = set(taken) | set(data["links"])
+        added = 0
+        for link in split_links(text):
+            if link in known:
+                continue
+            raws, _meta, warnings = parse_links_text(link, "manual")
+            if not raws:
+                reason = warnings[0] if warnings else "формат не распознан"
+                raise ManagedError(f"ссылку сервера разобрать не удалось: {reason}")
+            if len(data["links"]) >= MAX_LINKS:
+                raise ManagedError(f"ссылок из панели уже {MAX_LINKS} — больше нельзя")
+            data["links"].append(link)
+            known.add(link)
+            added += 1
+        return added
+
+    return _update(path, change)
 
 
 def remove_link(path: Path, identifier: str) -> bool:
-    data, error = load(path)
-    if error:
-        raise ManagedError(error)
-    kept = [link for link in data["links"] if link_id(link) != identifier]
-    if len(kept) == len(data["links"]):
-        return False
-    data["links"] = kept
-    save(path, data)
-    return True
+    def change(data: dict) -> bool:
+        kept = [link for link in data["links"] if link_id(link) != identifier]
+        if len(kept) == len(data["links"]):
+            return False
+        data["links"] = kept
+        return True
+
+    return _update(path, change)

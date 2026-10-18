@@ -9,7 +9,7 @@ import fakexray
 import pytest
 from fakesys import FakeSystem
 
-from xgw import config
+from xgw import config, managed
 from xgw.install import UNIT_FILES, Installer, Journal
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
@@ -485,6 +485,15 @@ def test_uninstall_returns_everything(box):
     calls = system.calls
     assert calls.index(("systemctl", "disable", "--now", "xgw.service")) < calls.index(
         ("nft", "-f", "-"), calls.index(("systemctl", "disable", "--now", "xgw.service")))
+
+
+def test_uninstall_keeps_panel_settings_but_not_their_lock_file(box):
+    assert box.install() == 0
+    store = managed.path_for(box.paths.config_file)
+    assert managed.set_sticky(store, False)
+    assert managed.lock_path(store).exists()
+    assert box.uninstall() == 0, box.text()
+    assert store.exists() and not managed.lock_path(store).exists()
 
 
 def test_uninstall_purge_removes_the_config_too(box):

@@ -3,6 +3,8 @@
 
 import json
 import os
+import stat
+import threading
 
 import links
 import pytest
@@ -12,6 +14,7 @@ from xgw.generator.builder import select_nodes, skip_reason
 from xgw.managed import ManagedError
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
+from xgw.paths import file_lock
 
 
 @pytest.fixture()
@@ -428,3 +431,65 @@ def test_sticky_switch_is_stored_and_merged_into_the_config(conf):
     assert config.load(conf)[0].speed.sticky is True
     with pytest.raises(managed.ManagedError):
         managed.set_sticky(path, "yes")
+
+
+# --- несколько писателей: панель, бот Telegram и команды xgw ---------------------------
+
+
+def test_concurrent_writers_keep_each_others_changes(conf):
+    """Панель отключает серверы, бот тем временем запоминает чат: обе правки остаются."""
+    path = managed.path_for(conf)
+    rounds = 40
+    barrier, errors = threading.Barrier(2), []
+
+    def servers() -> None:
+        for number in range(rounds):
+            managed.set_servers(path, [f"{number:08x}"], "disabled")
+
+    def bot() -> None:
+        for number in range(rounds):
+            managed.set_telegram(path, BOT_TOKEN, str(number))
+
+    def run(job) -> None:
+        barrier.wait()
+        try:
+            job()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(job,)) for job in (servers, bot)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    data = managed.load(path)[0]
+    assert data["disabled"] == [f"{number:08x}" for number in range(rounds)]
+    assert data["telegram"] == {"token": BOT_TOKEN, "chat_id": str(rounds - 1)}
+
+
+def test_writer_waits_while_another_process_holds_the_lock(conf):
+    path = managed.path_for(conf)
+    assert managed.set_sticky(path, True)
+    assert stat.S_IMODE(managed.lock_path(path).stat().st_mode) == 0o600
+    done = threading.Event()
+
+    def write() -> None:
+        managed.set_sticky(path, False)
+        done.set()
+
+    worker = threading.Thread(target=write)
+    with file_lock(managed.lock_path(path)):  # так её держит, например, `xgw priority`
+        worker.start()
+        assert not done.wait(0.3)
+        assert managed.load(path)[0]["sticky"] is True
+    worker.join(5)
+    assert done.is_set() and managed.load(path)[0]["sticky"] is False
+
+
+def test_lock_held_too_long_is_a_message_not_a_crash(conf, monkeypatch):
+    path = managed.path_for(conf)
+    monkeypatch.setattr(managed, "LOCK_TIMEOUT", 0.1)
+    with file_lock(managed.lock_path(path)), pytest.raises(ManagedError, match="другой процесс"):
+        managed.set_priority(path, ["aaaa1111"], "high")
+    assert not path.exists()

@@ -1,10 +1,20 @@
 """Атомарная запись и файловая блокировка."""
 
+import os
 import stat
+import threading
 
 import pytest
 
-from xgw.paths import LockTimeout, Paths, atomic_write_json, atomic_write_text, file_lock
+from xgw import paths
+from xgw.paths import (
+    LockTimeout,
+    Paths,
+    atomic_write_bytes,
+    atomic_write_json,
+    atomic_write_text,
+    file_lock,
+)
 
 
 def test_atomic_write_replaces_and_leaves_no_temp(tmp_path):
@@ -21,6 +31,51 @@ def test_atomic_write_sets_mode(tmp_path):
     assert stat.S_IMODE(target.stat().st_mode) == 0o640
     atomic_write_text(target, "secret", mode=0o600)
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_atomic_write_fsyncs_the_directory(tmp_path, monkeypatch):
+    """После os.replace — fsync каталога: иначе после сбоя питания мог вернуться прежний файл."""
+    synced = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        real_fsync(fd)
+
+    monkeypatch.setattr(paths.os, "fsync", fsync)
+    atomic_write_text(tmp_path / "a.txt", "текст")
+    assert synced == [False, True]  # сам файл, затем каталог
+
+
+def test_threads_writing_one_file_do_not_share_a_temp_file(tmp_path):
+    """Два потока демона пишут один файл: каждый целиком, без смеси и без сбоев."""
+    target = tmp_path / "panel.json"
+    payloads = [letter * 300_000 for letter in (b"a", b"b")]
+    barrier, errors = threading.Barrier(len(payloads)), []
+
+    def writer(data: bytes) -> None:
+        barrier.wait()
+        try:
+            for _ in range(30):
+                atomic_write_bytes(target, data)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(data,)) for data in payloads]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert target.read_bytes() in payloads
+    assert [item.name for item in tmp_path.iterdir()] == ["panel.json"]
+
+
+def test_file_lock_creates_the_file_with_the_given_mode(tmp_path):
+    lock = tmp_path / ".panel.json.lock"
+    with file_lock(lock, mode=0o600):
+        pass
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
 
 
 def test_file_lock_is_exclusive(tmp_path):
