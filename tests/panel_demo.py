@@ -58,7 +58,7 @@ SERVERS = [
     ("a1a1a1a1", "proxy-nl-a1a1", "🇳🇱 Нидерланды · Амстердам 1", "main", "member"),
     ("b2b2b2b2", "proxy-de-b2b2", "🇩🇪 Германия · Франкфурт", "main", "member"),
     ("c3c3c3c3", "proxy-fi-c3c3", "🇫🇮 Финляндия · Хельсинки", "запасная", "member"),
-    ("d4d4d4d4", "proxy-se-d4d4", "🇸🇪 Швеция · Стокгольм", "main", "member"),
+    ("d4d4d4d4", "proxy-se-d4d4", "🇸🇪 x100 Швеция · Стокгольм", "main", "member"),
     ("e5e5e5e5", "proxy-xx-e5e5", "Trojan-1", "manual", "member"),
     ("f6f6f6f6", "spare-pl-f6f6", "🇵🇱 Польша · Варшава", "main", "spare"),
     ("a7a7a7a7", "spare-lv-a7a7", "🇱🇻 Латвия · Рига", "main", "spare"),
@@ -90,6 +90,8 @@ SPEEDS = {
     "a1a1a1a1": {"mbps": 87.3, "error": ""},
     "b2b2b2b2": {"mbps": 41.0, "error": ""},
     "c3c3c3c3": {"mbps": None, "error": "тишина 5 с после 1 048 576 байт тела"},
+    # Запасной, который раньше был в работе: замер сохранился.
+    "f6f6f6f6": {"mbps": 63.4, "error": ""},
 }
 
 # Профиль обхода и протокол сервера (0.1.12): ядро, которое ведёт сервер. Остальные — Xray.
@@ -158,12 +160,15 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             })
         else:
             verdict = live["verdict"]
+            measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             spares.append({
                 **base, "verdict": verdict, "seconds": live["seconds"],
                 "bytes": 65536 if verdict in ("OK", "SLOW") else 16384,
                 "scanned": now - 1500 if verdict else None,
                 "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
                 "fragment": fingerprint == FRAGMENT_FP,
+                "speed_mbps": measure["mbps"] if measure else None,
+                "speed_ts": now - 26 * 3600 if measure else None,
             })
     state, action = "DEGRADED", "часть серверов недоступна — замена на запасные"
     if scene == "empty":
@@ -194,8 +199,10 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     probe_cfg = config.Config()
     if scene == "budget":
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
-    measured = sum(1 for member in members if member["speed_mbps"] or member["speed_error"])
-    budget = status.probe_budget(probe_cfg, len(members), len(spares), speed_members=measured)
+    budget = status.probe_budget(
+        probe_cfg, len(members), len(spares),
+        speed_round_mb=status.speed_round_mb(probe_cfg, members),
+    )
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
         "xray": {"ok": scene != "trouble", "version": "26.3.27"},

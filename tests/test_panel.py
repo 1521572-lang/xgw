@@ -870,6 +870,19 @@ def test_state_carries_the_probe_budget_the_node_summary_and_the_probe_url_warni
         assert text in script
 
 
+def test_state_shows_speeds_of_members_and_spares(rig, user):
+    """Скорость — у серверов в работе и у запасных, которых замерили, пока они были в
+    работе."""
+    snapshot = _snapshot()
+    snapshot["members"][0].update(speed_mbps=87.3, speed_ts=1000.0)
+    snapshot["spares"][0].update(speed_mbps=63.4, speed_ts=900.0)
+    status.write_status(rig.paths, snapshot)
+    by_name = {server["name"]: server for server in user.state()["servers"]}
+    assert by_name["NL-1"]["speed_mbps"] == 87.3 and by_name["NL-1"]["speed_ts"] == 1000.0
+    assert by_name["DE-1"]["speed_mbps"] is None
+    assert by_name["FI-1"]["speed_mbps"] == 63.4 and by_name["FI-1"]["speed_ts"] == 900.0
+
+
 def test_state_shows_multipliers_the_reserve_and_unlimited_subscriptions(rig, user):
     """Подписка «main» — с лимитом трафика: у её серверов множитель расхода; резервный
     выход отмечен; пока трафик идёт через него (RESERVE), страница говорит об этом."""

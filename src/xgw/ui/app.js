@@ -413,6 +413,20 @@
 
   // Скорость: 85 Мбит/с; ниже 10 — с одним знаком после запятой.
   const mbps = (value) => (value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`);
+  const hasSpeed = (server) => server.speed_mbps !== null && server.speed_mbps !== undefined;
+
+  // Скорость по последнему замеру — рядом с задержкой. У запасного замер сделан, пока он
+  // был в работе, поэтому он бледнее.
+  function speedValue(server, s) {
+    if (!hasSpeed(server) || (server.status !== "member" && server.status !== "spare")) return null;
+    const old = server.status === "spare";
+    return el("span", {
+      class: `speed${old ? " old" : ""}`, text: mbps(server.speed_mbps),
+      title: old
+        ? `Скорость по замеру ${stamp(server.speed_ts, s.now)}, когда сервер был в работе`
+        : `Скорость по замеру ${stamp(server.speed_ts, s.now)}`,
+    });
+  }
 
   // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
   const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
@@ -421,11 +435,14 @@
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
+      const sticky = s.sticky || {};
       let measured = "";
-      if (server.speed_mbps !== null && server.speed_mbps !== undefined) {
-        measured = ` · ${mbps(server.speed_mbps)}, замер ${stamp(server.speed_ts, s.now)}`;
+      if (hasSpeed(server)) {
+        measured = ` · замер скорости ${stamp(server.speed_ts, s.now)}`;
       } else if (server.speed_error) {
         measured = ` · замер скорости не удался ${stamp(server.speed_ts, s.now)}`;
+      } else if (server.multiplier >= 100 && sticky.on && sticky.every_hours) {
+        measured = " · скорость серверов x100 не замеряется";
       }
       return `${mainShown(server, s) ? "основной" : "в работе"}${measured}${dead}`;
     }
@@ -433,7 +450,8 @@
       const role = server.reserve
         ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
         : "запасной";
-      return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "");
+      return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "")
+        + (hasSpeed(server) ? ` · замер скорости ${stamp(server.speed_ts, s.now)}, когда был в работе` : "");
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -556,12 +574,12 @@
     const classes = ["server"];
     if (server.selected || pinned || main) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
-    // Две строки (app.css, «.server»): имя с метками и задержка, под ними — состояние и
-    // кнопки. В одной строке с кнопками имени места не оставалось.
+    // Две строки (app.css, «.server»): имя с метками, скорость и задержка, под ними —
+    // состояние и кнопки. В одной строке с кнопками имени места не оставалось.
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      serverValue(server),
+      el("div", { class: "values" }, speedValue(server, s), serverValue(server)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -633,7 +651,7 @@
       text = "Весь трафик пойдёт через самый быстрый сервер в работе — шлюз выберет его, как только серверы ответят.";
     }
     if (on && sticky.every_hours) {
-      text += ` Скорость замеряется раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные серверы не замеряются.`;
+      text += ` Скорость замеряется раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные — меньшей загрузкой, чтобы не тратить квоту, x100 — не замеряются.`;
     }
     $("main-note").textContent = text;
   }

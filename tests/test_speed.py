@@ -115,6 +115,22 @@ def test_measure_counts_body_throughput(origin):
     assert result.mbps == pytest.approx(result.bytes_read * 8 / result.seconds / MB, rel=0.05)
 
 
+def test_measure_stops_at_the_given_size(origin):
+    server = origin(10 * MB, chunk=65536)
+    node = SimpleNamespace(probe_port=server.port)
+    result = speed.measure(node, _cfg("http://speed.example/file"), probe_pass="x", max_mb=1)
+    assert result.mbps is not None and MB <= result.bytes_read < 2 * MB
+
+
+def test_limited_servers_download_less():
+    """Квоты на замер лимитированного — не больше speed.max_mb, загрузка — не меньше 1 МБ."""
+    cfg = Config()  # max_mb = 10
+    assert speed.size_mb(cfg, 0.0) == speed.size_mb(cfg, 1.0) == 10
+    assert speed.size_mb(cfg, 2.0) == 5 and speed.size_mb(cfg, 10.0) == 1
+    assert speed.size_mb(cfg, 50.0) == 1
+    assert speed.size_mb(cfg, 100.0) == 0  # x100 — серверы для LTE, не замеряются
+
+
 def test_measure_falls_back_when_the_main_address_refuses(origin):
     server = origin(3 * MB)
     node = SimpleNamespace(probe_port=server.port)

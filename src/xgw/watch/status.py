@@ -21,6 +21,7 @@ from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
 from ..store import Store
 from .scan import CHEAP_SCAN_BYTES, RESERVE_CANDIDATES, RESERVE_RECHECK
+from .speed import size_mb
 
 DEFAULT_PROBE_BYTES = 65536
 MB = 1_000_000  # ТЗ считает в десятичных единицах: 5 × 64 КиБ × 2880 ≈ 0,94 ГБ
@@ -74,7 +75,7 @@ def measured_probe_size(store: Store, url: str) -> int | None:
 
 def probe_budget(
     cfg: Config, members: int, spares: int, size: int | None = None, *,
-    cheap: int = 0, candidates: int = 0, speed_members: int = 0,
+    cheap: int = 0, candidates: int = 0, speed_round_mb: float = 0.0,
 ) -> Budget:
     """size — размер тела probe.url по последней сквозной проверке; без него берётся
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
@@ -83,10 +84,9 @@ def probe_budget(
     spares — запасные, которых скан проверяет загрузкой probe.url; cheap — запасные
     лимитированных подписок, которых он проверяет дешёвым запросом (scan.cheap_url);
     candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK;
-    speed_members — безлимитные участники, чью скорость замеряют раз в speed.every_hours
-    (оценка сверху: каждый замер — speed.max_mb целиком)."""
-    rounds = 24 / cfg.speed.every_hours if cfg.speed.sticky and cfg.speed.every_hours else 0
-    speed_bytes = int(speed_members * cfg.speed.max_mb * MB * rounds)
+    speed_round_mb — МБ одного раунда замеров скорости (speed_round_mb()); раунд — раз в
+    speed.every_hours (оценка сверху: каждый замер качается целиком)."""
+    speed_bytes = int(speed_round_mb * MB * speed_rounds(cfg))
     measured = bool(size)
     known = size or probe_bytes(cfg.probe.url)
     size = known or DEFAULT_PROBE_BYTES
@@ -157,6 +157,16 @@ def node_entries(
     return members, spares
 
 
+def speed_rounds(cfg: Config) -> float:
+    """Раундов замера скорости в сутки."""
+    return 24 / cfg.speed.every_hours if cfg.speed.sticky and cfg.speed.every_hours else 0
+
+
+def speed_round_mb(cfg: Config, members: list[dict]) -> float:
+    """МБ одного раунда замеров по участникам: у лимитированных загрузка меньше."""
+    return sum(size_mb(cfg, entry.get("cost", 0.0)) for entry in members)
+
+
 def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
     """Сколько байт квоты в сутки проверки тратят у каждой лимитированной подписки — с
     множителями серверов: проба 57 КБ через сервер x100 уносит 5,7 МБ квоты."""
@@ -170,9 +180,11 @@ def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
         if price > 0 and entry.get("source"):
             spend[entry["source"]] = spend.get(entry["source"], 0.0) + amount * price
 
+    rounds = speed_rounds(cfg)
     for entry in plan.members:
         # Сквозная проверка идёт через выбранного балансировщиком — делим поровну.
-        add(entry, size * 86400 / max(1, interval) + e2e / len(plan.members))
+        add(entry, size * 86400 / max(1, interval) + e2e / len(plan.members)
+            + rounds * size_mb(cfg, entry.get("cost", 0.0)) * MB)
     for entry in plan.cheap:
         add(entry, CHEAP_SCAN_BYTES * scans_per_day)
     for entry in plan.candidates:
@@ -325,15 +337,20 @@ def collect_status(
         paid = origins.get(tag, "") in limited
         return {"multiplier": factor, "limited": paid, "cost": factor if paid else 0.0}
 
+    def measured(info: NodeInfo) -> dict:
+        """Последний замер скорости сервера (watch/speed.py), ключ — как у демона."""
+        key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
+        record = speeds.get(key)
+        return record if isinstance(record, dict) else {}
+
     reserve = reserve_tag(_load_json_file(paths.xray_config_file))
     main_tag = (main or {}).get("tag") if cfg.speed.sticky else None
     members, spares = [], []
     for info in view:
+        measure = measured(info)
         if info.role == "proxy":
             entry = (observatory or {}).get(info.tag)
             dead_at = (dead_since or {}).get(info.tag)
-            key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
-            measure = speeds.get(key) if isinstance(speeds.get(key), dict) else {}
             members.append(
                 {
                     "tag": info.tag,
@@ -382,6 +399,10 @@ def collect_status(
                     "profile": info.profile,
                     "core": profiling.core_of(info.profile),
                     "protocol": protocols.get(info.fingerprint, ""),
+                    # Замер, сделанный, пока сервер был в работе: запасные не замеряются,
+                    # а результат хранится неделю (daemon.SPEED_KEEP).
+                    "speed_mbps": measure.get("mbps"),
+                    "speed_ts": measure.get("ts"),
                 }
             )
 
@@ -389,7 +410,7 @@ def collect_status(
     budget = probe_budget(
         cfg, len(members), len(plan.full), probe_size,
         cheap=len(plan.cheap), candidates=len(plan.candidates),
-        speed_members=sum(1 for entry in members if not entry["cost"]),
+        speed_round_mb=speed_round_mb(cfg, members),
     )
     spend = quota_spend(cfg, plan, budget.size)
     backup = next((entry for entry in spares if entry["reserve"]), None)

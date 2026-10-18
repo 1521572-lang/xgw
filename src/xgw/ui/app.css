@@ -512,7 +512,15 @@ button, textarea, input { font: inherit; color: inherit; }
 .server > .dot { grid-area: dot; }
 /* Метки, которым не хватает места, уходят под имя, а не сжимают его. */
 .server > .row-title { grid-area: title; flex-wrap: wrap; row-gap: .2rem; }
-.server > .delay { grid-area: value; }
+.server > .values {
+  grid-area: value;
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: .6rem;
+}
+.speed { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
+.speed.old { color: var(--muted); font-weight: 400; }
 .server > .row-sub { grid-area: sub; }
 .server > .row-tools {
   grid-area: tools;
@@ -527,6 +535,8 @@ button, textarea, input { font: inherit; color: inherit; }
     grid-template-areas: "dot title title value" ". sub sub sub" "tools tools tools tools";
   }
   .server > .row-tools { justify-self: stretch; }
+  /* Скорость — над задержкой: в одну строку они отнимали у имени половину ширины. */
+  .server > .values { flex-direction: column; align-items: flex-end; gap: 0; }
   /* Чтобы кнопки сервера уместились в одну строку и на экране телефона. */
   .server .prio { margin: 0; padding-right: .2rem; padding-left: .25rem; }
   .server .choose { padding-right: .55rem; padding-left: .55rem; }

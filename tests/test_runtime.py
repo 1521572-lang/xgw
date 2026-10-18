@@ -318,6 +318,8 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
          "source": "main", "address": "203.0.113.1", "port": 443, "updated": 0},
     ])
     store.save_scan("probe-de-bbbb", "FROZEN", 16384, 5.2, "тишина 5 с после 16384 байт тела")
+    # Запасной был в работе, и тогда его замерили.
+    store.set_meta("speed", json.dumps({"bbbb2222": {"mbps": 63.4, "error": "", "ts": 1000.0}}))
     store.close()
     view = [
         NodeInfo("aaaa1111", "proxy-nl-aaaa", "probe-nl-aaaa", 20001, "proxy"),
@@ -345,6 +347,8 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
     assert snapshot["tier"] == "medium"
     assert snapshot["members"][1]["alive"] is None  # ядро по узлу ещё ничего не сообщило
     assert snapshot["spares"][0]["verdict"] == "FROZEN" and snapshot["spares"][0]["bytes"] == 16384
+    spare = snapshot["spares"][0]
+    assert spare["speed_mbps"] == 63.4 and spare["speed_ts"] == 1000.0  # замер, пока был в работе
     assert snapshot["budget"]["total_mb"] > 0 and snapshot["pending_restart"] is False
 
     status.write_status(paths, snapshot)
@@ -421,8 +425,8 @@ def test_status_shows_multipliers_the_reserve_and_the_quota_spent_with_multiplie
 
 
 def test_quota_spend_counts_probes_through_limited_members_with_multipliers():
-    """Безлимитных нет: участники — лимитированные x10, их пробует ядро; квоту это
-    тратит вдесятеро, а 10 % остатка — повод предупредить."""
+    """Безлимитных нет: участники — лимитированные x10, их пробует ядро и замеряет демон
+    (загрузкой 1 МБ); квоту это тратит вдесятеро, а 10 % остатка — повод предупредить."""
     cfg = Config()
     members = [{"fingerprint": f"aaaa000{i}", "source": "paid", "cost": 10.0}
                for i in range(2)]
@@ -433,7 +437,8 @@ def test_quota_spend_counts_probes_through_limited_members_with_multipliers():
     spend = status.quota_spend(cfg, plan, size)
     probes = 2 * size * 86400 / 30 + size * 86400 / cfg.watchdog.interval_s
     scans = status.CHEAP_SCAN_BYTES * 24
-    assert spend == {"paid": int((probes + scans) * 10)}
+    measures = 2 * status.speed_rounds(cfg) * 1 * status.MB
+    assert spend == {"paid": int((probes + scans + measures) * 10)}
     budget = status.probe_budget(cfg, 2, 0, size, cheap=1)
     quotas = {"paid": {"upload": 0, "download": 0, "total": 3 * 10**12}}
     share = status.quota_share(budget, quotas, spend)["paid"]

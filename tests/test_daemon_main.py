@@ -193,11 +193,27 @@ def test_main_is_released_when_no_member_answers(daemon):
     assert daemon.api.state.override is None and daemon.main is None
 
 
-def test_limited_servers_are_not_measured(paths):
-    """10 МБ через лимитированный сервер — это квота: основной выбирается по задержке."""
+def test_limited_servers_are_measured(paths):
+    """Лимитированные x1 замеряются, как безлимитные: основной — по скорости."""
     daemon = _make(paths, source=_inventory())  # подписка с лимитом трафика
     try:
         first, second = _start(daemon)
+        daemon.speeds = {first: 30.0, second: 90.0}
+        for _ in range(4):
+            _step(daemon)
+        assert sorted(daemon.measured) == sorted([first, second])
+        assert daemon.main["tag"] == second and daemon.main["basis"] == "speed"
+    finally:
+        daemon.store.close()
+
+
+def test_x100_servers_are_not_measured(paths):
+    """x100 — серверы для LTE: замер стоил бы 100 МБ квоты, основной — по задержке."""
+    daemon = _make(paths, source=_inventory())
+    try:
+        first, second = _start(daemon)
+        prices = daemon._prices()
+        daemon._prices = lambda: dict.fromkeys(prices, 100.0)
         daemon.observatory[first]["delay"] = 0.3
         for _ in range(4):
             _step(daemon)

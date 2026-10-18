@@ -426,6 +426,7 @@ class Panel:
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
+                    speed_mbps=entry.get("speed_mbps"), speed_ts=entry.get("speed_ts"),
                     fragment=bool(entry.get("fragment")),
                     profile=entry.get("profile") or "", core=entry.get("core") or "",
                 )

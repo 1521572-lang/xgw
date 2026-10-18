@@ -2369,7 +2369,7 @@ class Daemon:
         self, view: list[NodeInfo], applied: dict | None, candidates: list[speed.Candidate],
         now: float,
     ) -> bool:
-        """Замеры скорости: раунд по всем безлимитным живым участникам при запуске, раз в
+        """Замеры скорости: раунд по всем живым участникам при запуске, раз в
         speed.every_hours и по кнопке; новый участник без свежего замера — отдельно. Один
         замер за шаг и не в шаге со сканом. True — раунд только что закончился."""
         if self.cfg.speed.every_hours <= 0:
@@ -2378,30 +2378,31 @@ class Daemon:
             return False
         prices = self._prices()
         nodes = {info.tag: info for info in view if info.role == "proxy"}
-        # Лимитированные не замеряются: 10 МБ через сервер x10 — это 100 МБ квоты. Цена
-        # неизвестна (узел ещё не сопоставлен с подпиской) — тоже: вдруг он лимитированный.
-        free = [
+        # Лимитированные замеряются меньшей загрузкой, x100 — нет (speed.size_mb). Цена
+        # неизвестна (узел ещё не сопоставлен с подпиской) — замера нет: не из чего выбрать
+        # размер загрузки.
+        measurable = [
             item for item in candidates
-            if prices.get(nodes[item.tag].fingerprint, 1.0) == 0
+            if speed.size_mb(self.cfg, prices.get(nodes[item.tag].fingerprint, speed.SKIP_PRICE))
         ]
         queued = set(self.speed_queue)
-        if self._speed_asked and not free:
-            self._speed_asked = False  # замерять некого: живых безлимитных в работе нет
+        if self._speed_asked and not measurable:
+            self._speed_asked = False  # замерять некого: в работе нет живых, кого замеряют
         hours = self.cfg.speed.every_hours
-        if free and not self.next_speed and not self._speed_asked and all(
-            self._measured(item.key, hours) for item in free
+        if measurable and not self.next_speed and not self._speed_asked and all(
+            self._measured(item.key, hours) for item in measurable
         ):
             # Демон перезапущен, а замеры свежие — следующий раунд по расписанию, не сразу.
             self.next_speed = now + jitter(hours * 3600.0)
-        if free and (now >= self.next_speed or self._speed_asked):
+        if measurable and (now >= self.next_speed or self._speed_asked):
             # Раунд — только когда есть кого замерять: сразу после запуска ядро ещё не
             # пробовало серверы, и раунд без участников отложил бы замер на every_hours.
             self.next_speed = now + jitter(self.cfg.speed.every_hours * 3600.0)
             self._speed_asked = False
             self.speed_round = True
-            todo = free
+            todo = measurable
         else:
-            todo = [item for item in free if not self._measured(item.key)]
+            todo = [item for item in measurable if not self._measured(item.key)]
         for item in todo:
             probe_tag = nodes[item.tag].probe_tag
             if probe_tag not in queued:
@@ -2449,7 +2450,10 @@ class Daemon:
         return 0
 
     def _speed(self, info: NodeInfo, password: str) -> speed.SpeedResult:
-        return speed.measure(info, self.cfg, probe_pass=password)
+        price = self._prices().get(info.fingerprint, 1.0)
+        return speed.measure(
+            info, self.cfg, probe_pass=password, max_mb=speed.size_mb(self.cfg, price)
+        )
 
     def _speeds(self) -> dict[str, dict]:
         try:

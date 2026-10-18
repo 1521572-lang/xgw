@@ -872,11 +872,13 @@ class Diag:
             budget = status.probe_budget(
                 self.cfg, members, len(plan.full), size,
                 cheap=len(plan.cheap), candidates=len(plan.candidates),
-                speed_members=sum(1 for entry in plan.members if not entry["cost"]),
+                speed_round_mb=status.speed_round_mb(self.cfg, plan.members),
             )
             spend = status.quota_spend(self.cfg, plan, budget.size)
         else:
-            budget = status.probe_budget(self.cfg, members, spares, size, speed_members=members)
+            budget = status.probe_budget(
+                self.cfg, members, spares, size, speed_round_mb=members * self.cfg.speed.max_mb
+            )
         month = budget.everything * status.MONTH_DAYS / status.GB
         text = (
             f"~{budget.total / status.MB:.0f} МБ в сутки при {members} участниках и "

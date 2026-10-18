@@ -12,7 +12,8 @@
 
 Замер — загрузка speed.url через probe-inbound сервера, не больше speed.max_mb и не дольше
 speed.max_seconds; скорость считается по телу ответа, без рукопожатий туннеля и TLS.
-Лимитированные серверы не замеряются: 10 МБ через сервер x10 — это 100 МБ квоты.
+Лимитированные серверы замеряются меньшей загрузкой (size_mb): 10 МБ через сервер x10 —
+это 100 МБ квоты.
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ from .checks import http_get_via_proxy
 MB = 1_000_000
 # Тело короче этого (файл замера мал) скорость не показывает: TCP не успевает разогнаться.
 MIN_BYTES = 256 * 1024
+# Загрузка через лимитированный сервер не короче этого: на меньшей скорость занижена.
+LIMITED_MIN_MB = 1.0
+# Серверы x100 и дороже не замеряются: это серверы для LTE (обход белых списков), их
+# скорость для выбора основного не нужна, а замер стоил бы 100 МБ квоты.
+SKIP_PRICE = 100.0
 
 
 @dataclass(frozen=True)
@@ -36,11 +42,25 @@ class SpeedResult:
     error: str = ""
 
 
+def size_mb(cfg: Config, price: float) -> float:
+    """Сколько МБ качать при замере сервера стоимостью price (cost.py: 0 — безлимитный).
+    Квоты на замер лимитированного уходит не больше speed.max_mb: x10 — 1 МБ загрузки
+    (10 МБ квоты), но загрузка не короче LIMITED_MIN_MB. 0 — сервер не замеряется."""
+    if price >= SKIP_PRICE:
+        return 0.0
+    if price <= 1.0:
+        return float(cfg.speed.max_mb)
+    return max(min(LIMITED_MIN_MB, cfg.speed.max_mb), cfg.speed.max_mb / price)
+
+
 def measure(
-    node: NodeInfo, cfg: Config, *, probe_pass: str, probe_user: str = PROBE_USER
+    node: NodeInfo, cfg: Config, *, probe_pass: str, probe_user: str = PROBE_USER,
+    max_mb: float | None = None,
 ) -> SpeedResult:
     """Замер через probe-inbound узла. Основной адрес ответил ошибкой HTTP (например, 403
-    выходу этого сервера) — пробуется запасной speed.url_fallback."""
+    выходу этого сервера) — пробуется запасной speed.url_fallback. max_mb — предел загрузки
+    (size_mb); по умолчанию speed.max_mb."""
+    limit = cfg.speed.max_mb if max_mb is None else max_mb
     urls = [url for url in (cfg.speed.url, cfg.speed.url_fallback) if url]
     result = None
     for index, url in enumerate(urls):
@@ -48,7 +68,7 @@ def measure(
             "127.0.0.1", node.probe_port, url,
             timeout=15.0, silence=5.0, proxy_user=probe_user, proxy_pass=probe_pass,
             max_total=cfg.speed.max_seconds + 20.0, user_agent=cfg.probe.user_agent,
-            max_bytes=cfg.speed.max_mb * MB, max_body_seconds=float(cfg.speed.max_seconds),
+            max_bytes=int(limit * MB), max_body_seconds=float(cfg.speed.max_seconds),
         )
         if result.ok or result.kind != "http" or index == len(urls) - 1:
             break
