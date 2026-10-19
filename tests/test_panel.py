@@ -920,6 +920,18 @@ def test_state_tells_the_page_that_capture_waits_for_xray(rig, user):
     assert user.state()["capture"]["inbound_missing"] == ""
 
 
+def test_state_shows_the_capture_lifecycle_written_by_the_daemon(rig, user):
+    """Строку «Перехват: …» панель берёт из status.json: жизненный цикл считает демон."""
+    assert user.state()["capture"]["lifecycle"] == ""  # демон его ещё не писал
+    snapshot = _snapshot()
+    snapshot["capture"] = {"loaded": True, "lifecycle": "blocked",
+                           "lifecycle_reason": "Xray не отвечает"}
+    status.write_status(rig.paths, snapshot)
+    capture = user.state()["capture"]
+    assert capture["lifecycle"] == "blocked" and capture["lifecycle_reason"] == "Xray не отвечает"
+    assert capture["mode"] == "on"  # остальное — как прежде, на момент запроса
+
+
 def test_sticky_switch_and_speed_button(rig, user):
     state = user.state()
     assert state["sticky"]["on"] is True and state["sticky"]["every_hours"] == 6

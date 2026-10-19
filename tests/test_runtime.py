@@ -482,3 +482,17 @@ def test_status_shows_the_node_summary_and_the_probe_url_warning():
     }
     text = status.render_status(snapshot)
     assert warning in text and "Узлов: 5 активных, 65 запасных" in text
+
+
+def test_status_shows_the_capture_lifecycle_from_the_daemon():
+    capture = {"mode": "on", "lan_if": "lan0", "lan": True, "local": True, "bypass": [],
+               "loaded": True}
+    assert status.render_lifecycle(capture) == ""  # демон её не писал
+    assert status.render_lifecycle({**capture, "lifecycle": "connected"}) == (
+        "Сейчас: перехват работает — трафик идёт через VPN"
+    )
+    assert status.render_lifecycle(
+        {**capture, "lifecycle": "blocked", "lifecycle_reason": "Xray не отвечает"}
+    ) == "Сейчас: перехват заблокирован — Xray не отвечает; мимо VPN ничего не уходит"
+    text = status.render_status({"capture": {**capture, "lifecycle": "connecting"}, "xray": {}})
+    assert "Сейчас: перехват подключается" in text

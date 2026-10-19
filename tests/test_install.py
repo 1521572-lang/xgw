@@ -1005,3 +1005,31 @@ def test_uninstall_removes_sing_box_files_and_service(box):
     assert not (box.paths.systemd_dir / "xgw-singbox.service").exists()
     assert "xgw-singbox.service" not in box.system.units or not box.system.units[
         "xgw-singbox.service"].get("enabled")
+
+
+@pytest.mark.parametrize("unit, writable, caps", [
+    ("xgw-net.service", "/var/lib/xgw /run/xgw", "CAP_NET_ADMIN CAP_NET_RAW"),
+    ("xgw-dhcp.service", "/var/lib/xgw",
+     "CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL"),
+])
+def test_network_units_are_sandboxed(unit, writable, caps):
+    """Правила и DHCP — службы от root: файловая система для них только для чтения, кроме
+    своего состояния, и права — только сетевые (Ф2, оценку проверяет стенд машины)."""
+    text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
+    settings = dict(
+        line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
+    )
+    assert settings["ProtectSystem"] == "strict" and settings["ProtectHome"] == "yes"
+    assert settings["PrivateTmp"] == "yes" and settings["NoNewPrivileges"] == "yes"
+    assert settings["ReadWritePaths"] == writable
+    assert settings["CapabilityBoundingSet"] == caps
+    assert "ProtectKernelTunables" not in settings  # xgw net up пишет в /proc/sys/net
+    assert "ProcSubset" not in settings  # и /proc/sys должен быть виден
+    for key in ("ProtectKernelModules", "ProtectControlGroups", "RestrictNamespaces",
+                "RestrictSUIDSGID", "LockPersonality"):
+        assert settings[key] == "yes", key
+    assert settings["SystemCallFilter"] == "@system-service"
+    families = settings["RestrictAddressFamilies"].split()
+    assert {"AF_NETLINK", "AF_INET", "AF_INET6", "AF_UNIX"} <= set(families)
+    # TUN (capture.method = "tun") открывает /dev/net/tun — у правил устройства не скрыты.
+    assert ("PrivateDevices" in settings) == (unit == "xgw-dhcp.service")

@@ -248,6 +248,11 @@ class Watchdog:
     interval_s: int = 20
     fail_threshold: int = 3
     wan_check: str = "ya.ru:443"
+    # Проверка с учётом трафика: сквозная проба не прошла, а через выбранный сервер за
+    # busy_window_s пришло не меньше busy_bytes — проба опоздала в очереди забитого канала,
+    # провал не засчитывается (VPN_IMPROVEMENT_PLAN §2.3).
+    busy_window_s: int = 10
+    busy_bytes: int = 1048576
 
 
 @dataclass
@@ -541,6 +546,12 @@ def _validate(cfg: Config) -> list[str]:
     if cfg.filters.max_members < 1:
         warnings.append("filters.max_members должен быть не меньше 1 — используется 1")
         cfg.filters.max_members = 1
+    if cfg.watchdog.busy_window_s < 1:
+        warnings.append("watchdog.busy_window_s должен быть не меньше 1 — используется 10")
+        cfg.watchdog.busy_window_s = Watchdog().busy_window_s
+    if cfg.watchdog.busy_bytes < 1:
+        warnings.append("watchdog.busy_bytes должен быть не меньше 1 — используется 1048576")
+        cfg.watchdog.busy_bytes = Watchdog().busy_bytes
     if cfg.probe.sampling < 1:
         warnings.append("probe.sampling должен быть не меньше 1 — используется 2")
         cfg.probe.sampling = Probe().sampling

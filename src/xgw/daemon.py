@@ -32,6 +32,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from enum import StrEnum
 from pathlib import Path
 
 from . import cost, engine, fetch, log, priority
@@ -69,7 +70,12 @@ SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок пос�
 PROVIDER_DNS_TTL = 600.0
 ROLLBACK_AFTER = 2  # «после двух неудач — откат на last-good»
 FAIL_OPEN_AFTER = 60.0  # fail_mode = "open": Xray недоступен дольше — снять перехват
-WAIT_SLICE = 1.0  # как часто пауза между шагами смотрит, не пора ли проснуться
+WAIT_SLICE = 0.25  # как часто пауза между шагами смотрит, не пора ли проснуться
+# Событие сети (watch/events.py) будит полный шаг не чаще этого: смена Wi-Fi или
+# переподключение WAN дают десятки строк `ip monitor` за несколько секунд, а у шага есть
+# сквозная проба. Ранние события не теряются — шаг лишь ждёт конца паузы. Дольше нельзя:
+# WAN вернулся через секунды после падения — шаг нужен сразу, а не через паузу.
+NET_WAKE_PAUSE = 2.0
 MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
 PROBE_TARGET_RECHECK = 300.0  # как часто перепроверять, отвечает ли сам probe.url
 PROBE_WORKERS = 8  # пробы для этой перепроверки идут одновременно: шаг не должен зависать
@@ -217,6 +223,23 @@ def tier_text(old: cost.Klass, new: cost.Klass, *, up: bool) -> str:
         f"{head} — в работе {cost.class_name(new, ranked)} "
         f"(были — {cost.class_name(old, ranked)})"
     )
+
+
+class Lifecycle(StrEnum):
+    """Жизненный цикл перехвата (VPN_IMPROVEMENT_PLAN §2.3) — поверх State: State говорит о
+    здоровье выходов, Lifecycle — о том, что сейчас с трафиком LAN и машины."""
+
+    OFF = "off"                # xgw disable либо перехват не настроен: сеть напрямую
+    CONNECTING = "connecting"  # правила on, Xray запущен, но ещё не проверил ни одного сервера
+    CONNECTED = "connected"    # правила on, Xray отвечает: трафик через VPN
+    BLOCKED = "blocked"        # мимо VPN ничего: Xray не отвечает либо ждёт inbound (hold)
+    OPEN = "open"              # временно напрямую: fail_mode = open, hold = direct, сбой правил
+
+
+# Переходы, которые попадают в журнал событий (панель, /status бота). Остальные — только в
+# журнал демона: «подключается → работает» бывает при каждом перезапуске Xray.
+LIFECYCLE_EVENTS = frozenset({Lifecycle.BLOCKED, Lifecycle.OPEN, Lifecycle.OFF})
+LIFECYCLE_TEXT = {life: status.LIFECYCLE_WORDS[str(life)][0] for life in Lifecycle}
 
 
 class Daemon:
@@ -376,6 +399,22 @@ class Daemon:
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
+        # События сети, сна и правил (watch/events.py, другой поток): причины ждут шага
+        # watchdog в _wakes, _woken прерывает паузу. wake_reason — последняя причина.
+        self._woken = threading.Event()
+        self._wakes: set[str] = set()
+        self._wake_lock = threading.Lock()
+        self.wake_reason = ""
+        self._net_tick_at = float("-inf")  # когда был последний шаг по событию сети
+        self._resumed = False  # машина проснулась после сна: шаг доделает своё (_after_sleep)
+        self._net_event = False  # шаг по событию сети: поднять TUN и маршруты в него
+        self._marks: tuple[float, float] | None = None  # (clock, wall) прошлого шага
+        self.lifecycle: Lifecycle | None = None
+        # Проверка с учётом трафика: downlink серверов в работе на прошлом шаге
+        # (тег → (clock, байт)) и сколько скачала сама сквозная проба этого шага.
+        self._downlinks: dict[str, tuple[float, int]] = {}
+        self._e2e_bytes = 0
+        self._last_status: tuple | None = None  # (view, observatory, xray_ok) прошлой записи
         # Остановка демона (SIGTERM): её выставляет run. Шаг, который она застала, не
         # доделывается: сканы и замеры прерываются, новое применение конфига не начинается —
         # systemd ждёт остановки не дольше TimeoutStopSec, а установка — перезапуска демона.
@@ -413,13 +452,89 @@ class Daemon:
         return self._stop.is_set()
 
     def _sleep(self, stop: threading.Event, changed, seconds: float) -> None:
-        """Пауза между шагами. Её прерывают остановка, правка настроек и запрос из панели."""
+        """Пауза между шагами. Её прерывают остановка, правка настроек, запрос из панели и
+        события (wake): чужое изменение правил сверяется сразу, не прерывая паузу, а
+        событие сети и пробуждение после сна начинают шаг раньше."""
         deadline = time.monotonic() + seconds
         while not self.poke.is_set() and not changed():
+            if self._woken.is_set():
+                deadline = self._on_wake(deadline)
             left = deadline - time.monotonic()
             if left <= 0 or stop.wait(min(left, WAIT_SLICE)):
                 break
         self.poke.clear()
+
+    def wake(self, reason: str) -> None:
+        """NetEvents (другой поток): «net» — событие сети, «sleep» — машина проснулась,
+        «rules» — кто-то убрал правила XGW. Здесь только отметка: всё делает шаг watchdog."""
+        with self._wake_lock:
+            self._wakes.add(reason)
+            self.wake_reason = reason
+        self._woken.set()
+
+    def _on_wake(self, deadline: float) -> float:
+        """Разбирает причины пробуждения во время паузы; возвращает новый её конец."""
+        with self._wake_lock:
+            self._woken.clear()
+            reasons, self._wakes = self._wakes, set()
+        if "rules" in reasons:
+            self._guard_now()
+        now = time.monotonic()
+        if "sleep" in reasons:
+            self._resumed = True
+            self.log.info("внеочередной шаг: машина проснулась после сна")
+            return now
+        if "net" in reasons:
+            self._net_event = True
+            at = max(now, self._net_tick_at + NET_WAKE_PAUSE)
+            if at < deadline:
+                self.log.info("внеочередной шаг: событие сети")
+                return at
+        return deadline
+
+    def _guard_now(self) -> None:
+        """Событие `nft monitor`: из таблиц XGW что-то убрали (чужой flush ruleset, flush
+        table, delete chain). Правила сверяются сразу — без проб и остального шага: окно,
+        пока трафик мог уйти мимо VPN, — доли секунды, а не interval_s."""
+        if self.capture is None or self.stopping:
+            return
+        self.log.info("внеочередная проверка правил перехвата: изменились таблицы nftables")
+        self._guard_capture(self.xray_down_since is None, self.clock())
+        if self._last_status is not None:
+            # status.json — с итогом сверки (правила, жизненный цикл, событие о возврате):
+            # его читают панель и `xgw status`, а до очередного шага может быть минута.
+            self._write_status(*self._last_status)
+
+    def _after_sleep(self, now: float) -> None:
+        """Машина проснулась после сна. Монотонные часы демона во сне стоят, а настенные
+        идут: сроки, которые прошли во сне (опрос подписок), наступают на этом шаге. Правила
+        и маршруты TUN загружаются заново — сеть после сна поднималась без XGW, — а утечка
+        проверяется сразу. Запасные проверяет сам шаг (tick)."""
+        if self._marks is not None:
+            slept = (self.wall() - self._marks[1]) - (now - self._marks[0])
+            if slept > 0:
+                self.next_refresh -= slept
+        self.next_leak = now
+        if self.capture is None or self._capture_waits():
+            return
+        try:
+            self.capture.up()
+        except Exception as exc:  # сбой сети не должен ронять шаг watchdog
+            self.log.error("правила перехвата после сна не загружены: %s", exc)
+
+    def _restore_tun(self) -> None:
+        """Событие сети: интерфейс TUN и маршруты в него на месте (ядро убирает маршруты
+        через интерфейс, который опускали). Правила сверяет сам шаг (_guard_capture)."""
+        restore = getattr(self.capture, "restore_tun", None)
+        if restore is None:
+            return
+        try:
+            done = restore()
+        except Exception as exc:  # сбой сети не должен ронять шаг watchdog
+            self.log.error("интерфейс TUN после события сети не проверен: %s", exc)
+            return
+        if done:
+            self.log.info("%s", done)
 
     def request_refresh(self) -> None:
         """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes. Заодно заново
@@ -494,6 +609,9 @@ class Daemon:
         self._singbox_failed = previous._singbox_failed
         self._singbox_retry_at = previous._singbox_retry_at
         self._traffic = previous._traffic
+        self.lifecycle = previous.lifecycle
+        self._downlinks = dict(previous._downlinks)
+        self._marks = previous._marks
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -523,6 +641,15 @@ class Daemon:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
         self._scanned = False
+        resumed, self._resumed = self._resumed, False
+        net_event, self._net_event = self._net_event, False
+        if resumed or net_event:
+            self._net_tick_at = time.monotonic()
+        if resumed:
+            self._after_sleep(now)
+        elif net_event:
+            self._restore_tun()
+        self._marks = (now, self.wall())
         refresh_asked, self._refresh_asked = self._refresh_asked, False
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
@@ -667,6 +794,12 @@ class Daemon:
         if scan_asked and probing:
             self._manual_scan = True
             self._queue_scan(view, now, everything=True)
+        elif resumed and probing:
+            # После сна вердикты запасных устарели: проверить их сейчас, не дожидаясь
+            # scan_spares_minutes. Лимитированные класса хуже — как обычно, только когда
+            # трафик не идёт (их проверка тратит квоту).
+            self.next_scan = now + jitter(self.cfg.probe.scan_spares_minutes * 60.0)
+            self._queue_scan(view, now)
         elif scan_asked:
             self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
         if not changed and probing and signals.xray_ok and signals.provider_ok:
@@ -724,15 +857,37 @@ class Daemon:
 
         tags = [info.tag for info in members]
         self._busy = self._traffic_busy(now)
+        provider_ok = self._check_provider()
+        if provider_ok and observatory and self.machine.state is State.WAN_DOWN:
+            # WAN только что вернулся (шаг по событию сети идёт сразу): «мёртвых» ядро
+            # насчитало, пока связи не было, а повторить пробы ещё не успело. На этом шаге
+            # они не мертвы, а неизвестны, и отсчёт rotate_after_min начинается заново —
+            # иначе шлюз менял бы исправные серверы после каждого обрыва провайдера.
+            observatory = {tag: entry for tag, entry in observatory.items() if entry["alive"]}
+            self.dead_since.clear()
         alive, dead, unknown = metrics.count_members(observatory or {}, tags)
+        downlinks = {
+            tag: (now, value)
+            for tag, value in metrics.outbound_downlinks(self._metrics).items()
+        }
+        # Участник, через который сейчас идёт трафик, ядро сочло мёртвым, а трафик через него
+        # идёт (его проба опоздала в очереди): он жив.
+        spared = self._dead_but_busy(observatory or {}, tags, downlinks) if dead else None
+        if spared is not None:
+            alive, dead = alive + 1, dead - 1
         # Все участники мертвы, а у балансировщика есть резервный выход: трафик идёт через
         # него, и сквозная проверка — тоже (дешёвым запросом, см. _check_e2e).
         self.reserve_mode = reserve and bool(tags) and dead >= len(tags)
-        provider_ok = self._check_provider()
         e2e_ok = True
         if xray_ok and provider_ok:
+            self._e2e_bytes = 0
             e2e_ok = self._check_e2e()
-            self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
+            if not e2e_ok and not self.reserve_mode and self._late_under_load(now, downlinks):
+                # Туннель заведомо жив: провал не засчитывается, но и счётчик не обнуляется.
+                e2e_ok = True
+            else:
+                self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
+        self._downlinks = downlinks
 
         self.leak_fresh = False
         if not self.capture_active():
@@ -747,7 +902,7 @@ class Daemon:
 
         for tag in tags:
             entry = (observatory or {}).get(tag)
-            if entry is not None and not entry["alive"]:
+            if entry is not None and not entry["alive"] and tag != spared:
                 self.dead_since.setdefault(tag, self.wall())
             else:
                 self.dead_since.pop(tag, None)
@@ -791,6 +946,73 @@ class Daemon:
             return False
         return (total - previous[1] - own) / (now - previous[0]) > SPEED_BUSY_BPS
 
+    # --- проверка с учётом трафика ---------------------------------------------------
+
+    def _downlink_now(self, tag: str) -> int | None:
+        """Счётчик downlink сервера сейчас (свежий ответ /debug/vars, без сброса)."""
+        try:
+            fresh = metrics.fetch_metrics(self.cfg.xray.metrics_port)
+        except Exception as exc:
+            self.log.debug("счётчики трафика недоступны: %s", exc)
+            return None
+        return metrics.outbound_downlinks(fresh).get(tag)
+
+    def _carried(
+        self, earlier: tuple[float, int] | None, later: tuple[float, int] | None, own: int = 0
+    ) -> float | None:
+        """Сколько байт пришло через сервер между двумя отсчётами downlink, в пересчёте на
+        watchdog.busy_window_s, если это не меньше busy_bytes; иначе None. Отсчёты ближе
+        секунды друг к другу ничего не говорят. own — байты самой пробы: её трафик идёт
+        через тот же сервер."""
+        if earlier is None or later is None or later[0] - earlier[0] < 1.0:
+            return None
+        window = float(self.cfg.watchdog.busy_window_s)
+        got = max(0, later[1] - earlier[1] - own) * window / (later[0] - earlier[0])
+        return got if got >= self.cfg.watchdog.busy_bytes else None
+
+    def _late_under_load(self, now: float, downlinks: dict[str, tuple[float, int]]) -> bool:
+        """Сквозная проба не прошла, а через сервер, выбранный сейчас, идёт трафик LAN —
+        не меньше busy_bytes за busy_window_s. Канал забит, проба опоздала в очереди, а
+        туннель жив: провал не засчитывается (VPN_IMPROVEMENT_PLAN §2.3)."""
+        selected = self._selected()
+        if selected is None:
+            return False
+        tag = selected[0]
+        start = downlinks.get(tag)
+        after = self._downlink_now(tag)
+        later = (self.clock(), after) if after is not None else None
+        got = self._carried(start, later, self._e2e_bytes)
+        if got is None:
+            got = self._carried(self._downlinks.get(tag), start)
+        if got is None:
+            return False
+        self.log.debug(
+            "проба опоздала под нагрузкой: %.1f МБ за %d с через %s",
+            got / 1e6, self.cfg.watchdog.busy_window_s, tag,
+        )
+        return True
+
+    def _dead_but_busy(
+        self, observatory: dict, tags: list[str], downlinks: dict[str, tuple[float, int]]
+    ) -> str | None:
+        """Тег выбранного сейчас участника, которого observatory считает мёртвым, хотя
+        через него с прошлого шага идёт трафик (не меньше busy_bytes за busy_window_s)."""
+        selected = self._selected()
+        if selected is None:
+            return None
+        tag = selected[0]
+        entry = observatory.get(tag)
+        if tag not in tags or entry is None or entry["alive"]:
+            return None
+        got = self._carried(self._downlinks.get(tag), downlinks.get(tag))
+        if got is None:
+            return None
+        self.log.debug(
+            "проба ядра опоздала под нагрузкой: %.1f МБ за %d с через %s — участник жив",
+            got / 1e6, self.cfg.watchdog.busy_window_s, tag,
+        )
+        return tag
+
     def _check_e2e(self) -> bool:
         """Сквозная загрузка probe.url через http-in с детектором «тишины».
 
@@ -804,6 +1026,7 @@ class Daemon:
             max_total=30.0, user_agent=self.cfg.probe.user_agent,
         )
         if not result.ok:
+            self._e2e_bytes = result.downloaded  # их не считать трафиком LAN (_late_under_load)
             self.log.info("сквозная проверка не прошла: %s", result.error)
             return False
         if url != self.cfg.probe.url:
@@ -2606,17 +2829,65 @@ class Daemon:
         self.xray_version = ".".join(map(str, version or ()))
         self._xray_stamp = stamp if version else None
 
+    def _lifecycle(
+        self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool
+    ) -> tuple[Lifecycle, str] | None:
+        """Жизненный цикл перехвата по итогам шага и почему он такой (пусто — причина не
+        нужна). None — перехвата нет (не root, не настроен) либо правила ещё не сверялись."""
+        info = self.capture_info
+        if self.capture is None or info is None:
+            return None
+        mode = info.get("mode")
+        if mode in ("none", "off"):
+            return Lifecycle.OFF, ""
+        if mode == "open":
+            return Lifecycle.OPEN, "Xray недоступен дольше минуты (capture.fail_mode = open)"
+        missing = str(info.get("inbound_missing") or "")
+        if missing:
+            return (Lifecycle.BLOCKED if info.get("blocked") else Lifecycle.OPEN), missing
+        if info.get("loaded") is False:
+            return Lifecycle.OPEN, "правила сети не загружены — трафик может идти мимо VPN"
+        if not xray_ok:
+            return Lifecycle.BLOCKED, "Xray не отвечает"
+        tags = [info.tag for info in view if info.role == "proxy"]
+        _alive, _dead, unknown = metrics.count_members(observatory or {}, tags)
+        if tags and unknown >= len(tags):
+            return Lifecycle.CONNECTING, "Xray ещё не проверил ни одного сервера"
+        return Lifecycle.CONNECTED, ""
+
+    def _lifecycle_changed(self, life: Lifecycle, why: str) -> None:
+        """Переход — в журнал демона, а в журнал событий — когда трафик перестаёт идти
+        через VPN или снова идёт (LIFECYCLE_EVENTS). Уведомлений здесь нет: о причине
+        (Xray не отвечает, перехват снят, нет inbound'а) уведомляет её собственное событие."""
+        previous, self.lifecycle = self.lifecycle, life
+        if previous is None or previous is life:
+            return
+        text = f"перехват: {LIFECYCLE_TEXT[previous]} → {LIFECYCLE_TEXT[life]}"
+        if why:
+            text += f" ({why})"
+        if previous in LIFECYCLE_EVENTS or life in LIFECYCLE_EVENTS:
+            self.notifier.event("lifecycle", text)
+        else:
+            self.log.info("%s", text)
+
     def _write_status(
         self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool
     ) -> None:
+        self._last_status = (view, observatory, xray_ok)
         state = self.machine.state
         self._xray_version()
+        capture = self.capture_info
+        current = self._lifecycle(view, observatory, xray_ok)
+        if current is not None and capture is not None:
+            life, why = current
+            self._lifecycle_changed(life, why)
+            capture = {**capture, "lifecycle": str(life), "lifecycle_reason": why}
         snapshot = status.collect_status(
             self.cfg, self.paths, view,
             observatory=observatory, xray_ok=xray_ok, state=str(state),
             action=self.action, since=self.state_since,
             dead_since=self.dead_since, xray_version=self.xray_version, daemon=True,
-            capture=self.capture_info, probe_target=self.probe_target,
+            capture=capture, probe_target=self.probe_target,
             singbox=self._singbox_status(view),
         )
         warnings = tuple(snapshot["budget"]["warnings"])
