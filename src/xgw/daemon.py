@@ -1200,7 +1200,13 @@ class Daemon:
     def _refresh_now(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
         minutes = min((sub.refresh_minutes for sub in self.cfg.subscriptions), default=60)
         self.next_refresh = now + jitter(max(1, minutes) * 60.0)
-        inventory = self._collect(via_xray)
+        try:
+            inventory = self._collect(via_xray)
+        except fetch.Cancelled:
+            # Остановка прервала опрос: о подписках он ничего не говорит — ни сбоя, ни
+            # ошибок для панели, ни неполного списка серверов.
+            self.log.info("опрос подписок прерван: демон останавливается")
+            return False
         self._save_errors(inventory)
         if inventory.nodes:
             self._save_inventory(inventory)
@@ -1300,7 +1306,8 @@ class Daemon:
 
     def _collect(self, via_xray: bool) -> engine.Inventory:
         return engine.collect(
-            self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray
+            self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray,
+            cancel=self._stop,
         )
 
     def _assemble(

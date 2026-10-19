@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import http.client
+import io
 import ipaddress
+import os
 import secrets
+import select
 import socket
 import ssl
 import struct
@@ -67,6 +71,35 @@ def wait_io(sock: socket.socket, op, timeout: float, cancel: threading.Event | N
             continue
 
 
+def wait_connect(
+    sock: socket.socket, address: tuple[str, int], timeout: float,
+    cancel: threading.Event | None = None,
+) -> None:
+    """sock.connect(address) с таймаутом timeout. С cancel соединение ждётся кусками по
+    CANCEL_SLICE, как в wait_io: событие выставлено — Cancelled."""
+    if cancel is None:
+        sock.settimeout(timeout)
+        sock.connect(address)
+        return
+    if cancel.is_set():
+        raise Cancelled
+    deadline = time.monotonic() + timeout
+    sock.setblocking(False)
+    code = sock.connect_ex(address)
+    while code in (errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK):
+        if cancel.is_set():
+            raise Cancelled
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("timed out")
+        _readable, writable, _failed = select.select([], [sock], [], min(left, CANCEL_SLICE))
+        if writable:
+            code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    if code:
+        raise OSError(code, os.strerror(code))
+    sock.settimeout(timeout)
+
+
 class ProxyError(FetchError):
     """http-inbound Xray не открыл туннель (нет связи, 407, 5xx)."""
 
@@ -106,6 +139,7 @@ def fetch_url(
     bootstrap: Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
+    cancel: threading.Event | None = None,
 ) -> FetchResult:
     """GET (или POST, если задано тело `data`): первая попытка и до `retries`
     повторов с паузами 2, 4 и 8 с.
@@ -116,6 +150,9 @@ def fetch_url(
     `proxy` — http-inbound Xray (127.0.0.1:<http_port>): запрос идёт CONNECT-туннелем
     через балансировщик, метка и bootstrap тогда не нужны.
     file:// читается с диска без повторов.
+    `cancel` — демон останавливается: новая попытка не начинается, пауза перед ней и
+    ожидание сети (разрешение имени, соединение, CONNECT, TLS, ответ) прерываются —
+    Cancelled. Такой итог ничего не говорит ни о подписке, ни о сервере.
     """
     if url.startswith("file://"):
         return _fetch_file(url)
@@ -123,9 +160,11 @@ def fetch_url(
     last_error: Exception | None = None
     result: FetchResult | None = None
     for attempt in range(attempts):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled
         try:
             result = _request_with_redirects(
-                url, headers or {}, timeout, mark, bootstrap, proxy, data
+                url, headers or {}, timeout, mark, bootstrap, proxy, data, cancel
             )
         except (
             FetchError,
@@ -142,10 +181,18 @@ def fetch_url(
             if result.status not in _RETRY_STATUSES:
                 return result
         if attempt < attempts - 1:
-            _sleep(backoffs[min(attempt, len(backoffs) - 1)] if backoffs else 0.0)
+            _pause(backoffs[min(attempt, len(backoffs) - 1)] if backoffs else 0.0, cancel)
     if result is not None:
         return result  # 429/5xx после всех повторов — код проверит вызывающий
     raise FetchError(f"не удалось получить {masking.mask_url(url)}: {last_error}") from last_error
+
+
+def _pause(seconds: float, cancel: threading.Event | None) -> None:
+    """Пауза перед повтором; остановка демона её прерывает (Cancelled)."""
+    if cancel is None:
+        _sleep(seconds)
+    elif cancel.wait(seconds):
+        raise Cancelled
 
 
 def fetch_subscription(
@@ -158,14 +205,16 @@ def fetch_subscription(
     bootstrap: Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
     retries: int = 3,
+    cancel: threading.Event | None = None,
 ) -> FetchResult:
-    """Подписка: таймаут 15 с, до 3 повторов. Ответ не 200 — ошибка, а не «пустая подписка»."""
+    """Подписка: таймаут 15 с, до 3 повторов. Ответ не 200 — ошибка, а не «пустая подписка».
+    cancel — см. fetch_url."""
     merged = dict(headers or {})
     if user_agent:
         merged["User-Agent"] = user_agent
     result = fetch_url(
         url, headers=merged, mark=mark, timeout=timeout, bootstrap=bootstrap, proxy=proxy,
-        retries=retries,
+        retries=retries, cancel=cancel,
     )
     if result.status != 200:
         raise FetchError(f"{masking.mask_url(url)}: HTTP {result.status}")
@@ -208,10 +257,11 @@ def _request_with_redirects(
     bootstrap: Sequence[str] | None,
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
+    cancel: threading.Event | None = None,
 ) -> FetchResult:
     current = url
     for _ in range(5):
-        result = _request_once(current, headers, timeout, mark, bootstrap, proxy, data)
+        result = _request_once(current, headers, timeout, mark, bootstrap, proxy, data, cancel)
         # Тело за перенаправлением не отправляется: POST у XGW один — в Telegram.
         if data is None and result.status in (301, 302, 303, 307, 308):
             location = result.headers.get("location", "")
@@ -232,14 +282,20 @@ def _is_ip(host: str) -> bool:
 
 
 def _connect(
-    host: str, port: int, timeout: float, mark: int | None, bootstrap: Sequence[str] | None
+    host: str, port: int, timeout: float, mark: int | None, bootstrap: Sequence[str] | None,
+    cancel: threading.Event | None = None,
 ) -> socket.socket:
+    def connect(sock: socket.socket, address: tuple[str, int]) -> None:
+        wait_connect(sock, address, timeout, cancel)
+
     if not bootstrap or _is_ip(host):
-        return marknet.connect_marked(host, port, timeout=timeout, mark=mark)
+        return marknet.connect_marked(host, port, timeout=timeout, mark=mark, connect=connect)
     last_error: OSError | None = None
-    for address in resolve_domain(host, list(bootstrap), mark=mark):
+    for address in resolve_domain(host, list(bootstrap), mark=mark, cancel=cancel):
         try:
-            return marknet.connect_marked(address, port, timeout=timeout, mark=mark)
+            return marknet.connect_marked(
+                address, port, timeout=timeout, mark=mark, connect=connect
+            )
         except OSError as exc:
             last_error = exc
     raise last_error or OSError(f"нет адресов для {host}")
@@ -301,6 +357,7 @@ def _request_once(
     bootstrap: Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
+    cancel: threading.Event | None = None,
 ) -> FetchResult:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -310,16 +367,19 @@ def _request_once(
         raise FetchError("в URL нет хоста")
     default_port = 443 if parts.scheme == "https" else 80
     port = parts.port or default_port
+    if cancel is not None and cancel.is_set():
+        raise Cancelled
     if proxy is not None:
-        sock = open_tunnel(proxy, host, port, timeout=timeout)
+        sock = open_tunnel(proxy, host, port, timeout=timeout, cancel=cancel)
     else:
-        sock = _connect(host, port, timeout, mark, bootstrap)
+        sock = _connect(host, port, timeout, mark, bootstrap, cancel)
     try:
         if parts.scheme == "https":
             context = ssl.create_default_context()
-            sock = context.wrap_socket(sock, server_hostname=host)
+            sock = context.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+            wait_io(sock, sock.do_handshake, timeout, cancel)
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.sock = sock
+        conn.sock = _WaitingSocket(sock, timeout, cancel)
         path = parts.path or "/"
         if parts.query:
             path = f"{path}?{parts.query}"
@@ -350,6 +410,42 @@ def _request_once(
     finally:
         with contextlib.suppress(OSError):
             sock.close()
+
+
+class _WaitingSocket:
+    """Сокет для http.client: ответ читается через wait_io, и остановка демона (cancel)
+    прерывает ожидание заголовков и тела."""
+
+    def __init__(self, sock: socket.socket, timeout: float, cancel: threading.Event | None):
+        self._sock = sock
+        self._timeout = timeout
+        self._cancel = cancel
+
+    def sendall(self, data) -> None:
+        self._sock.settimeout(self._timeout)
+        self._sock.sendall(data)
+
+    def makefile(self, *_args, **_kwargs) -> io.BufferedReader:
+        return io.BufferedReader(_WaitingReader(self._sock, self._timeout, self._cancel))
+
+    def close(self) -> None:
+        """Ничего не делает: http.client закрывает соединение, ещё не прочитав тело
+        (Connection: close), а сокет закрывает _request_once, когда ответ прочитан."""
+
+
+class _WaitingReader(io.RawIOBase):
+    def __init__(self, sock: socket.socket, timeout: float, cancel: threading.Event | None):
+        super().__init__()
+        self._sock = sock
+        self._timeout = timeout
+        self._cancel = cancel
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        sock = self._sock
+        return wait_io(sock, lambda: sock.recv_into(buffer), self._timeout, self._cancel)
 
 
 # --- DNS: wire-формат, DoH и обычный UDP --------------------------------------
@@ -421,7 +517,8 @@ def _parse_a_answers(payload: bytes) -> list[str]:
 
 
 def doh_query(
-    bootstrap_url: str, name: str, *, timeout: float = 8.0, mark: int | None = None
+    bootstrap_url: str, name: str, *, timeout: float = 8.0, mark: int | None = None,
+    cancel: threading.Event | None = None,
 ) -> list[str]:
     parts = urlsplit(bootstrap_url)
     path = parts.path or "/dns-query"
@@ -434,6 +531,7 @@ def doh_query(
         timeout=timeout,
         mark=mark,
         retries=0,
+        cancel=cancel,
     )
     if result.status != 200:
         raise ResolveError(f"DoH {masking.mask_url(bootstrap_url)}: HTTP {result.status}")
@@ -441,7 +539,8 @@ def doh_query(
 
 
 def plain_dns(
-    server: str, name: str, *, timeout: float = 5.0, mark: int | None = None, port: int = 53
+    server: str, name: str, *, timeout: float = 5.0, mark: int | None = None, port: int = 53,
+    cancel: threading.Event | None = None,
 ) -> list[str]:
     wire = _dns_query(name)
     sock = marknet.marked_udp(mark)
@@ -452,8 +551,7 @@ def plain_dns(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("нет ответа DNS")
-            sock.settimeout(remaining)
-            data, peer = sock.recvfrom(4096)
+            data, peer = wait_io(sock, lambda: sock.recvfrom(4096), remaining, cancel)
             # Чужие и подложенные датаграммы пропускаем: сверяем отправителя и ID запроса.
             if peer[0] == server and data[:2] == wire[:2]:
                 return _parse_a_answers(data)
@@ -461,27 +559,32 @@ def plain_dns(
         sock.close()
 
 
-def resolve_domain(name: str, bootstrap: list[str], *, mark: int | None = None) -> list[str]:
+def resolve_domain(
+    name: str, bootstrap: list[str], *, mark: int | None = None,
+    cancel: threading.Event | None = None,
+) -> list[str]:
     """Разрешение домена через bootstrap-резолверы (DoH по IP, затем UDP).
 
     Адреса возвращаются отсортированными: DNS-ротация не должна менять
     dns.hosts (и тем самым конфиг) от запуска к запуску.
 
     NoSuchDomain — адресов нет ни у кого, и хотя бы один резолвер ответил
-    определённо (NXDOMAIN или пустой ответ); прочие сбои — ResolveError.
+    определённо (NXDOMAIN или пустой ответ); прочие сбои — ResolveError. cancel — см. fetch_url.
     """
     errors: list[str] = []
     absent = ""
     for entry in bootstrap:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled
         try:
             if entry.startswith("https://"):
-                ips = doh_query(entry, name, mark=mark)
+                ips = doh_query(entry, name, mark=mark, cancel=cancel)
             elif entry.startswith("udp://"):
                 server, sep, port = entry[len("udp://") :].rpartition(":")
                 if sep and port.isdigit():
-                    ips = plain_dns(server, name, mark=mark, port=int(port))
+                    ips = plain_dns(server, name, mark=mark, port=int(port), cancel=cancel)
                 else:
-                    ips = plain_dns(entry[len("udp://") :], name, mark=mark)
+                    ips = plain_dns(entry[len("udp://") :], name, mark=mark, cancel=cancel)
             else:
                 errors.append(f"неизвестный bootstrap: {entry}")
                 continue
@@ -492,6 +595,8 @@ def resolve_domain(name: str, bootstrap: list[str], *, mark: int | None = None) 
         except NoSuchDomain as exc:
             absent = str(exc)
             errors.append(f"{masking.mask_url(entry)}: {exc}")
+        except Cancelled:
+            raise
         except Exception as exc:
             errors.append(f"{masking.mask_url(entry)}: {exc}")
     if absent:

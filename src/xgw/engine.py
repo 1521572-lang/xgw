@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -164,11 +165,15 @@ def collect(
     mark: int | None,
     logger,
     via_xray: bool = True,
+    cancel: threading.Event | None = None,
 ) -> Inventory:
     """Опрос всех подписок и ручных ссылок.
 
     via_xray=False — запрашивать только напрямую (внеочередное обновление в
     ALL_DEAD: через мёртвые серверы подписку не получить).
+    cancel — демон останавливается: опрос прерывается (fetch.Cancelled) перед следующей
+    подпиской, маршрутом и попыткой и посреди ожидания сети. Кэш подписок прерванный
+    опрос не трогает, а неполного списка вызывающий не получает.
     """
     remote = any(sub.url and not sub.url.startswith("file://") for sub in cfg.subscriptions)
     proxy = healthy_http_in(cfg) if via_xray and remote else None
@@ -177,7 +182,9 @@ def collect(
     for sub in cfg.subscriptions:
         if not sub.url:
             continue
-        raws, userinfo, error = _load_subscription(sub, cfg, cache, mark, proxy, logger)
+        if cancel is not None and cancel.is_set():
+            raise fetch.Cancelled
+        raws, userinfo, error = _load_subscription(sub, cfg, cache, mark, proxy, logger, cancel)
         if not raws:
             inventory.complete = False
         if error:
@@ -209,6 +216,7 @@ def _load_subscription(
     mark: int | None,
     proxy: tuple[str, int] | None,
     logger,
+    cancel: threading.Event | None = None,
 ) -> tuple[list[RawServer], dict[str, int], str]:
     """Серверы подписки, её квота и причина сбоя (пустая, если запрос удался).
     Ответ без серверов считается сбоем — в том числе заглушка из одних служебных
@@ -219,6 +227,8 @@ def _load_subscription(
     if proxy is not None and not sub.url.startswith("file://"):
         routes.insert(0, ("через Xray", proxy))
     for route, via in routes:
+        if cancel is not None and cancel.is_set():
+            raise fetch.Cancelled
         try:
             result = fetch.fetch_subscription(
                 sub.url, user_agent=sub.user_agent, headers=sub.headers, proxy=via,
@@ -228,6 +238,7 @@ def _load_subscription(
                 mark=None if via else mark,
                 bootstrap=None if via or mark is None else cfg.dns.bootstrap,
                 retries=1 if via else 3,
+                cancel=cancel,
             )
             raws, meta, sub_warnings = parse_body(result.body, sub.name)
             raws = _drop_junk(raws)

@@ -10,10 +10,10 @@ from pathlib import Path
 import links
 import pytest
 
-from xgw import engine
+from xgw import engine, fetch
 from xgw.apply.applier import ApplyOutcome
 from xgw.apply.singbox import SingboxOutcome
-from xgw.config import Config
+from xgw.config import Config, Subscription
 from xgw.daemon import Daemon
 from xgw.generator import builder
 from xgw.model import raw_to_node
@@ -1112,6 +1112,39 @@ def test_stop_during_a_refresh_does_not_start_an_apply(daemon):
     assert _run_once(daemon, stop) == [1]
     assert daemon.collected == [True] and daemon.applied == []
     assert engine.read_json(daemon.paths.xray_config_file) == before
+
+
+def test_stop_during_a_subscription_poll_ends_it_at_once(daemon, monkeypatch):
+    """SIGTERM, пока подписка ждёт ответа: ожидание прерывается, следующая подписка не
+    запрашивается, и прерванный опрос — не сбой подписки (ни события, ни ошибки в панели,
+    ни нового списка серверов). На машине такая остановка ждала таймаутов запроса."""
+    _started(daemon)
+    daemon.cfg.subscriptions = [Subscription(name="main", url="https://subs.example.org/a"),
+                                Subscription(name="second", url="https://subs.example.org/b")]
+    daemon._collect = lambda via_xray: Daemon._collect(daemon, via_xray)
+    monkeypatch.setattr(engine, "healthy_http_in", lambda _cfg: None)
+    stop = threading.Event()
+    asked: list[str] = []
+
+    def fake(url, **kwargs):
+        asked.append(url)
+        stop.set()  # SIGTERM пришёл, пока ждали ответа
+        cancel = kwargs.get("cancel")
+        if cancel is not None and cancel.wait(5):
+            raise fetch.Cancelled
+        raise fetch.FetchError("timed out")
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+    inventory_before = engine.inventory_file(daemon.paths).read_bytes()
+    daemon.next_refresh = 0.0
+    started = time.monotonic()
+    assert _run_once(daemon, stop) == [1]
+    assert time.monotonic() - started < 2
+    assert asked == ["https://subs.example.org/a"]
+    assert daemon.applied == [] and daemon._sub_failing_since is None
+    assert daemon.store.get_meta("sub_errors") in (None, "", "{}")
+    assert not any(event.startswith("subscription") for event in daemon.events())
+    assert engine.inventory_file(daemon.paths).read_bytes() == inventory_before
 
 
 def test_stop_leaves_a_pending_config_for_the_next_start(daemon):
