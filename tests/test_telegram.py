@@ -1,6 +1,7 @@
 """Бот Telegram: команды из своего чата, защита от чужих и старых сообщений,
 подключение чата кодом. Telegram подменён локальным сервером (fake_telegram)."""
 
+import socket
 import threading
 import time
 
@@ -490,6 +491,34 @@ def test_thread_answers_survives_errors_and_recovers(rig, monkeypatch):
         assert rig.bot.info()["error"] == "" and rig.bot.info()["username"] == BOT_NAME
     finally:
         rig.bot.stop()
+
+
+def test_stop_interrupts_the_long_poll(rig):
+    """Остановка демона не ждёт long-poll getUpdates: Telegram, который молчит, не
+    держит остановку (раньше join ждал потока 2 с), и поток бота выходит сам."""
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(8)  # соединения принимает ядро, ответа нет никогда
+    try:
+        url = f"http://127.0.0.1:{silent.getsockname()[1]}"
+        rig.config_path.write_text(
+            rig.config_path.read_text(encoding="utf-8").replace(rig.fake.url, url),
+            encoding="utf-8",
+        )
+        rig.reload()
+        rig.bot.username = BOT_NAME  # сразу к getUpdates
+        rig.bot.long_poll = telegram_module.LONG_POLL
+        rig.bot.start()
+        thread = rig.bot._thread
+        time.sleep(0.3)  # запрос отправлен, бот ждёт ответа
+        assert thread is not None and thread.is_alive()
+        started = time.monotonic()
+        rig.bot.stop()
+        assert time.monotonic() - started < 1.0
+        assert not thread.is_alive() and rig.bot.error == ""
+    finally:
+        rig.bot.stop()
+        silent.close()
 
 
 def test_requests_go_through_xray_first_and_directly_when_it_fails(rig):

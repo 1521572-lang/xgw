@@ -59,6 +59,9 @@ EVENTS = 30
 LOGIN_TTL = 60.0  # сколько живёт одноразовый код входа, секунд
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
+# Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
+# остановка демона (по умолчанию в http.server — 0,5 с).
+SHUTDOWN_POLL = 0.1
 _ORDER = {"member": 0, "spare": 1, "waiting": 2, "disabled": 3, "skipped": 4}
 _VERDICTS = {"OK": 0, "SLOW": 1, None: 2}  # запасные: сначала пригодные к замене
 _SERVER_WORDS = {
@@ -251,7 +254,8 @@ class Panel:
         self._server.log = self.log
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
-            target=self._server.serve_forever, name="xgw-panel", daemon=True
+            target=self._server.serve_forever, name="xgw-panel", daemon=True,
+            kwargs={"poll_interval": SHUTDOWN_POLL},
         )
         self._thread.start()
         self.log.info("панель управления слушает 127.0.0.1, порт %d (по токену)", self.port)

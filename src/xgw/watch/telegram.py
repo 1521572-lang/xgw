@@ -198,7 +198,9 @@ class Bot:
         self._stop.set()
         self._wake.set()
         if self._thread is not None:
-            self._thread.join(timeout=2)  # опрос в пути не ждём: поток фоновый
+            # Опрос Telegram (getMe, getUpdates) прерывается событием остановки за доли
+            # секунды; дольше ждать нечего — поток фоновый.
+            self._thread.join(timeout=2)
             self._thread = None
 
     def _active(self, cfg: Config) -> bool:
@@ -223,6 +225,8 @@ class Bot:
                 self.poll_once(cfg)
                 failures = 0
                 self._set_error("")
+            except fetch.Cancelled:  # демон останавливается: опрос прерван, это не сбой
+                return
             except (TelegramError, fetch.FetchError, OSError, ValueError) as exc:
                 failures += 1
                 self._set_error(str(exc))
@@ -248,7 +252,7 @@ class Bot:
         """Один круг: узнать имя бота (первый раз), получить сообщения, обработать."""
         token = cfg.notify.telegram_bot_token
         if not self.username:
-            me = self._call(cfg, "getMe", {}, timeout=15.0)
+            me = self._call(cfg, "getMe", {}, timeout=15.0, cancel=self._stop)
             username = me.get("username") if isinstance(me, dict) else None
             if not isinstance(username, str) or not username:
                 raise TelegramError("Telegram не назвал имя бота")
@@ -257,7 +261,7 @@ class Bot:
             cfg, "getUpdates",
             {"offset": self._offset, "timeout": self.long_poll,
              "allowed_updates": json.dumps(["message"])},
-            timeout=self.long_poll + REQUEST_SLACK,
+            timeout=self.long_poll + REQUEST_SLACK, cancel=self._stop,
         )
         if not isinstance(updates, list):
             raise TelegramError("Telegram вернул не список сообщений")
@@ -281,8 +285,15 @@ class Bot:
         })
         return routes
 
-    def _call(self, cfg: Config, method: str, params: dict, *, timeout: float):
-        """Метод Bot API → поле result. Сначала через Xray, затем напрямую."""
+    def _call(
+        self, cfg: Config, method: str, params: dict, *, timeout: float,
+        cancel: threading.Event | None = None,
+    ):
+        """Метод Bot API → поле result. Сначала через Xray, затем напрямую.
+
+        cancel — событие остановки бота: ожидание ответа прерывается (fetch.Cancelled).
+        Передаётся только для опроса (getMe, getUpdates): ответ на команду, уже
+        выполненную, отправляется до конца."""
         url = f"{cfg.notify.telegram_api}/bot{cfg.notify.telegram_bot_token}/{method}"
         data = urlencode(params).encode("ascii")
         error: Exception | None = None
@@ -290,7 +301,8 @@ class Bot:
             try:
                 reply = self.post(
                     url, data=data, timeout=timeout, retries=0,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}, **route,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    cancel=cancel, **route,
                 )
             except fetch.FetchError as exc:
                 error = exc
