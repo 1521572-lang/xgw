@@ -454,6 +454,73 @@ def test_system_failure_stops_before_the_network_is_touched(box):
     assert not box.system.kernel.tables and box.forward() == "0"
 
 
+# --- повторная установка на работающем шлюзе (отчёт 0.1.15, Д1 и Д2) ----------------
+
+
+def _gateway_works(box: Box) -> None:
+    system = box.system
+    assert system.profile(nm.PROFILE)["device"] == "lan0"
+    assert (box.paths.etc / "dnsmasq.conf").exists()
+    for unit in ("xgw-net.service", "xgw-dhcp.service"):
+        assert system.units[unit]["active"], unit
+    assert all((box.paths.systemd_dir / unit).exists() for unit in UNIT_FILES)
+    assert system.kernel.tables and system.kernel.rules and box.forward() == "1"
+
+
+def test_slow_daemon_stop_does_not_undo_the_install(box):
+    """Демон, занятый шагом, останавливался 79 с; установка ждала перезапуска 60 с, сочла
+    это сбоем сети и откатила всё — дом почти 11 минут был без шлюза."""
+    assert box.install() == 0
+    box.out.clear()
+    box.system.slow["systemctl restart xgw.service"] = 79.0
+    assert box.install() == 0
+    text = box.text()
+    assert "Возвращаю сеть" not in text and "демон xgw запущен" in text
+    _gateway_works(box)
+
+
+def test_installer_waits_longer_than_systemd_stops_the_daemon():
+    from xgw.install import DAEMON_STOP_TIMEOUT, DAEMON_STOP_WAIT
+
+    unit = (REPO / "packaging" / "xgw.service").read_text(encoding="utf-8")
+    stop = [line.split("=", 1)[1] for line in unit.splitlines()
+            if line.startswith("TimeoutStopSec=")]
+    assert stop == [f"{DAEMON_STOP_TIMEOUT:.0f}"]
+    assert DAEMON_STOP_WAIT >= DAEMON_STOP_TIMEOUT + 20
+
+
+@pytest.mark.parametrize("reinstall", [False, True], ids=["first", "reinstall"])
+def test_daemon_that_does_not_start_leaves_the_network_working(box, reinstall):
+    """Сеть, DHCP и правила к запуску демона уже на месте и работают без него: его сбой —
+    предупреждение, а не откат (systemd с Restart=always запустит его сам)."""
+    if reinstall:
+        assert box.install() == 0
+        box.out.clear()
+    box.system.refuse["restart xgw.service"] = "Job for xgw.service failed"
+    assert box.install() == 0
+    text = box.text()
+    assert "Возвращаю сеть" not in text and "демон xgw пока не запущен" in text
+    assert "Job for xgw.service failed" in text and "Предупреждений:" in text
+    _gateway_works(box)
+    assert "finished" in Journal(box.paths.journal_file)
+
+
+def test_failed_reinstall_keeps_the_working_gateway(box):
+    """Откат к состоянию до XGW уместен после неудачной первой установки, но не поверх
+    работающей: он убрал бы адрес LAN и DHCP, и устройства остались бы без интернета."""
+    assert box.install() == 0
+    box.out.clear()
+    box.system.refuse["systemctl daemon-reload"] = "Failed to reload daemon"
+    assert box.install() == 1
+    text = box.text()
+    assert "настройка сети не удалась" in text and "сеть не откатываю" in text
+    assert "Возвращаю сеть" not in text and "sudo xgw disable" in text
+    _gateway_works(box)
+    assert box.system.units["xgw.service"]["active"]
+    # Журнал помнит прошлую установку: следующий сбой тоже не откатит сеть.
+    assert "finished" in Journal(box.paths.journal_file)
+
+
 # --- удаление ---------------------------------------------------------------------
 
 

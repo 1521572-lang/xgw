@@ -26,6 +26,8 @@ class FakeSystem:
         self.kernel = FakeKernel()
         self.calls: list[tuple[str, ...]] = []
         self.refuse: dict[str, str] = {}  # подстрока команды → текст ошибки
+        # Подстрока команды → сколько секунд она идёт (вызов с меньшим timeout — таймаут).
+        self.slow: dict[str, float] = {}
         self.nm_running = True
         self.devices: dict[str, dict] = {
             "wan0": {"type": "ethernet", "state": "connected"},
@@ -83,6 +85,13 @@ class FakeSystem:
                 if not check:
                     return ""
                 raise CommandError(f"{command}: {error}")
+        result = self._dispatch(argv, input, timeout, command, check)
+        if any(needle in command and timeout < took for needle, took in self.slow.items()):
+            # Клиент не дождался ответа, а само задание (systemd) дошло до конца.
+            raise CommandError(f"{command}: таймаут {timeout:.0f} с")
+        return result
+
+    def _dispatch(self, argv, input, timeout, command, check) -> str:
         if argv[0] == "env":
             argv = [item for item in argv[1:] if "=" not in item]
         handler = getattr(self, "_" + argv[0].replace("-", "_").rsplit("/", 1)[-1], None)

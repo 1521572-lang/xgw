@@ -2,6 +2,7 @@
 его в ядре и держит, пока он работает; при отказе сразу передаёт трафик живому."""
 
 import json
+import threading
 
 import pytest
 from test_daemon import FakeApi, Harness, _inventory
@@ -10,6 +11,7 @@ from xgw import engine
 from xgw.config import Config
 from xgw.paths import Paths
 from xgw.store import Store
+from xgw.watch.speed import SpeedResult
 from xgw.watch.states import State
 from xgw.xraycore.api import BalancerInfo
 
@@ -351,6 +353,26 @@ def test_failed_measurement_is_shown_and_not_repeated_until_the_round(daemon):
     assert daemon.main["tag"] == second  # у первого замер не удался
     member = next(m for m in daemon.status()["members"] if m["tag"] == first)
     assert member["speed_mbps"] is None and "тишина" in member["speed_error"]
+
+
+def test_measurement_cut_by_a_stop_is_not_recorded(daemon):
+    """Отчёт 0.1.15, Д2: остановка демона прерывает замер скорости. Прерванный замер — не
+    неудача сервера: в базу он не попадает, сервер снова в очереди."""
+    first, _second = _start(daemon)
+    stop = threading.Event()
+
+    def cut(info, password):
+        daemon.measured.append(info.tag)
+        stop.set()
+        return SpeedResult(None, 4096, 0.4, "проверка прервана: демон останавливается")
+
+    daemon._speed = cut
+    daemon.t += 20
+    daemon.run(stop)
+    daemon.store = Store(daemon.paths.db_file)
+    assert daemon.measured == [first]
+    assert json.loads(daemon.store.get_meta("speed") or "{}") == {}
+    assert next(i.probe_tag for i in daemon.view() if i.tag == first) in daemon.speed_queue
 
 
 def test_sticky_off_removes_a_leftover_main_pin(paths):

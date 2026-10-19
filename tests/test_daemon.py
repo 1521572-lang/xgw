@@ -1065,6 +1065,90 @@ def test_pause_between_ticks_ends_on_a_request_a_change_or_a_stop(daemon):
     assert time.monotonic() - started < 5
 
 
+# --- остановка посреди шага (отчёт 0.1.15, Д2) ---------------------------------------
+
+
+def _run_once(daemon: Harness, stop: threading.Event) -> list[int]:
+    """run до остановки; сколько шагов он успел. Хранилище run закрывает — открыть снова."""
+    ticks: list[int] = []
+    tick = daemon.tick
+    daemon.tick = lambda: ticks.append(1) or tick()
+    daemon.run(stop)
+    daemon.store = Store(daemon.paths.db_file)
+    return ticks
+
+
+def test_stop_during_scans_ends_the_step_at_once(daemon):
+    """SIGTERM посреди сканов: прерванный скан не записывается, следующие не начинаются,
+    run возвращается сразу после этого шага (на машине шаг доделывался 79 с)."""
+    _started(daemon)
+    stop = threading.Event()
+    original = daemon._scan
+
+    def scan(info, password, url=None):
+        if not daemon.scanned:
+            return original(info, password, url)
+        stop.set()  # остановка приходит во время второго скана
+        daemon.scanned.append(info.tag)
+        return ScanResult(info.tag, "CANCELLED", 0, 0.3, "прервано", "cancelled")
+
+    daemon._scan = scan
+    daemon.next_scan = 0.0
+    assert _run_once(daemon, stop) == [1]
+    assert len(daemon.scanned) == 2  # третий запасной не сканировался
+    assert "CANCELLED" not in {entry["verdict"] for entry in daemon.store.scans().values()}
+
+
+def test_stop_during_a_refresh_does_not_start_an_apply(daemon):
+    """Остановка пришла, пока опрашивались подписки: новый конфиг не применяется — начатое
+    применение не прерывается, а systemd ждать его не обязан."""
+    _started(daemon)
+    stop = threading.Event()
+    before = engine.read_json(daemon.paths.xray_config_file)
+    daemon.source = _inventory(links.FULL_LINKS)  # один сервер пропал из подписки
+    collect = daemon._collect
+    daemon._collect = lambda via_xray: stop.set() or collect(via_xray)
+    daemon.next_refresh = 0.0
+    assert _run_once(daemon, stop) == [1]
+    assert daemon.collected == [True] and daemon.applied == []
+    assert engine.read_json(daemon.paths.xray_config_file) == before
+
+
+def test_stop_leaves_a_pending_config_for_the_next_start(daemon):
+    """Отложенный конфиг в окне перезапуска, а демон останавливается: Xray не
+    перезапускается, файл ждёт следующего запуска."""
+    _started(daemon)
+    pending = engine.read_json(daemon.paths.xray_config_file)
+    pending["policy"]["levels"]["0"]["connIdle"] = 999
+    atomic_write_json(daemon.paths.pending_config_file, pending)
+    daemon.apply_mode = "restart"
+    daemon.now_time = lambda: datetime.time(4, 30)
+    stop = threading.Event()
+    daemon.tick = lambda tick=daemon.tick: stop.set() or tick()  # SIGTERM в начале шага
+    daemon.run(stop)
+    daemon.store = Store(daemon.paths.db_file)
+    assert daemon.applied == [] and daemon.paths.pending_config_file.exists()
+
+
+def test_probes_get_the_stop_event(daemon, monkeypatch):
+    """Сканы и замеры скорости получают событие остановки: их ожидание сети прерывается
+    (watch/checks.py), а не тянется до таймаута."""
+    from xgw.watch import scan, speed
+
+    _started(daemon)
+    info = daemon.view()[0]
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(scan, "scan_node", lambda *_a, **kw: seen.setdefault("scan", kw["cancel"]))
+    monkeypatch.setattr(speed, "measure", lambda *_a, **kw: seen.setdefault("speed", kw["cancel"]))
+    stop = threading.Event()
+    daemon.tick = lambda: stop.set() or State.HEALTHY
+    daemon.run(stop)
+    daemon.store = Store(daemon.paths.db_file)
+    Daemon._scan(daemon, info, "secret")
+    Daemon._speed(daemon, info, "secret")
+    assert seen == {"scan": stop, "speed": stop}
+
+
 def test_server_list_is_saved_for_the_panel_without_keys(daemon):
     _started(daemon)
     servers = engine.load_inventory(daemon.paths)

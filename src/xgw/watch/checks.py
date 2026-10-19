@@ -11,6 +11,7 @@ import base64
 import contextlib
 import socket
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -56,6 +57,7 @@ def http_get_via_proxy(
     user_agent: str = "",
     max_bytes: int = 0,
     max_body_seconds: float = 0.0,
+    cancel: threading.Event | None = None,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -66,6 +68,9 @@ def http_get_via_proxy(
     `user_agent` — заголовок запроса (probe.user_agent); пусто — «xgw/<версия>».
     `max_bytes` / `max_body_seconds` — замер скорости: тело дальше этого не читается, и
     загрузка всё равно удачная (ok), хоть файл и не дочитан.
+    `cancel` — демон останавливается: ожидание сети на любом этапе (ответ на CONNECT,
+    рукопожатие TLS, заголовки, тело) прерывается за доли секунды, итог — kind
+    "cancelled". О сервере такой итог ничего не говорит, записывать его нельзя.
     """
     parts = urlsplit(url)
     host = parts.hostname
@@ -75,11 +80,13 @@ def http_get_via_proxy(
     deadline = time.monotonic() + max_total
     sock: socket.socket | None = None
     try:
+        if cancel is not None and cancel.is_set():
+            raise fetch.Cancelled
         if parts.scheme == "https":
             try:
                 sock = fetch.open_tunnel(
                     (proxy_host, proxy_port), host, port,
-                    timeout=timeout, user=proxy_user, password=proxy_pass,
+                    timeout=timeout, user=proxy_user, password=proxy_pass, cancel=cancel,
                 )
             except fetch.ProxyError as exc:
                 return DownloadResult(ok=False, kind="proxy", status=exc.status, error=str(exc))
@@ -87,11 +94,15 @@ def http_get_via_proxy(
                 return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}")
             context = tls_context or ssl.create_default_context()
             try:
-                sock = context.wrap_socket(sock, server_hostname=host)
+                sock = context.wrap_socket(
+                    sock, server_hostname=host, do_handshake_on_connect=False
+                )
+                fetch.wait_io(sock, sock.do_handshake, timeout, cancel)
             except TimeoutError as exc:
                 return DownloadResult(ok=False, kind="timeout", error=f"таймаут TLS: {exc}")
             except (ssl.SSLError, OSError) as exc:
                 return DownloadResult(ok=False, kind="tls", error=f"TLS: {exc}")
+            sock.settimeout(timeout)
             path = parts.path or "/"
             if parts.query:
                 path = f"{path}?{parts.query}"
@@ -111,7 +122,11 @@ def http_get_via_proxy(
         sock.sendall(request)
         return _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
-            max_bytes=max_bytes, max_body_seconds=max_body_seconds,
+            max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
+        )
+    except fetch.Cancelled:
+        return DownloadResult(
+            ok=False, kind="cancelled", error="проверка прервана: демон останавливается"
         )
     except TimeoutError as exc:
         return DownloadResult(ok=False, kind="timeout", error=f"таймаут: {exc}")
@@ -145,13 +160,14 @@ class _Deadline(Exception):
     """Исчерпан общий бюджет времени загрузки."""
 
 
-def _recv(sock: socket.socket, silence: float, deadline: float) -> bytes:
+def _recv(
+    sock: socket.socket, silence: float, deadline: float, cancel: threading.Event | None = None
+) -> bytes:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise _Deadline
-    sock.settimeout(min(silence, remaining))
     try:
-        return sock.recv(65536)
+        return fetch.wait_io(sock, lambda: sock.recv(65536), min(silence, remaining), cancel)
     except TimeoutError:
         if time.monotonic() >= deadline:
             raise _Deadline from None
@@ -160,7 +176,7 @@ def _recv(sock: socket.socket, silence: float, deadline: float) -> bytes:
 
 def _read_response(
     sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0,
-    max_bytes: int = 0, max_body_seconds: float = 0.0,
+    max_bytes: int = 0, max_body_seconds: float = 0.0, cancel: threading.Event | None = None,
 ) -> DownloadResult:
     """Читает ответ: заголовки, затем тело до Content-Length или закрытия (либо до
     max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до конца)."""
@@ -169,7 +185,7 @@ def _read_response(
         while fetch.HEAD_END not in buffer:
             if len(buffer) > HEAD_LIMIT:
                 return DownloadResult(ok=False, kind="http", error="ответ не похож на HTTP")
-            chunk = _recv(sock, silence, deadline)
+            chunk = _recv(sock, silence, deadline, cancel)
             if not chunk:
                 return DownloadResult(
                     ok=False, kind="truncated", error="соединение закрыто до заголовков ответа"
@@ -207,7 +223,7 @@ def _read_response(
                     ok=True, downloaded=downloaded, status=status, body=body,
                     body_seconds=time.monotonic() - started,
                 )
-            chunk = _recv(sock, silence, deadline)
+            chunk = _recv(sock, silence, deadline, cancel)
             if not chunk:
                 break
             downloaded += len(chunk)

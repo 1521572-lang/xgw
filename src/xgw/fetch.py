@@ -14,6 +14,7 @@ import secrets
 import socket
 import ssl
 import struct
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -29,12 +30,41 @@ MAX_BODY = 128 * 1024 * 1024  # потолок ответа: архив Xray ~30
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 CRLF = "\r\n"
 HEAD_END = b"\r\n\r\n"  # конец заголовков HTTP
+# Ожидание, которое можно прервать (wait_io), идёт кусками такой длины: столько демон самое
+# большее ждёт сеть после команды остановки.
+CANCEL_SLICE = 0.5
 
 _sleep = time.sleep  # подменяется в тестах
 
 
 class FetchError(Exception):
     pass
+
+
+class Cancelled(Exception):
+    """Ожидание сети прервано (cancel): демон останавливается."""
+
+
+def wait_io(sock: socket.socket, op, timeout: float, cancel: threading.Event | None = None):
+    """op() — одна операция с сокетом (recv, рукопожатие TLS) с таймаутом timeout, как при
+    sock.settimeout(timeout). С cancel ожидание идёт кусками по CANCEL_SLICE: событие
+    выставлено — Cancelled. Повторять op после таймаута можно: recv ещё ничего не забрал,
+    рукопожатие TLS продолжается с того места, где ждало данных."""
+    if cancel is None:
+        sock.settimeout(timeout)
+        return op()
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel.is_set():
+            raise Cancelled
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("timed out")
+        sock.settimeout(min(left, CANCEL_SLICE))
+        try:
+            return op()
+        except TimeoutError:
+            continue
 
 
 class ProxyError(FetchError):
@@ -223,11 +253,13 @@ def open_tunnel(
     timeout: float,
     user: str = "",
     password: str = "",
+    cancel: threading.Event | None = None,
 ) -> socket.socket:
     """CONNECT-туннель через http-inbound Xray к host:port.
 
     Ответ прокси читается ровно до пустой строки: следом идут данные туннеля
     (TLS-рукопожатие), и ни один лишний байт забрать или оставить нельзя.
+    cancel — прервать ожидание ответа (Cancelled), см. wait_io.
     """
     try:
         host = host if ":" in host else host.encode("idna").decode("ascii")
@@ -243,7 +275,7 @@ def open_tunnel(
         sock.sendall((CRLF.join(lines) + CRLF * 2).encode("ascii"))
         head = b""
         while not head.endswith(HEAD_END):
-            chunk = sock.recv(1)
+            chunk = wait_io(sock, lambda: sock.recv(1), timeout, cancel)
             if not chunk:
                 raise ProxyError("прокси закрыл соединение, не ответив на CONNECT")
             head += chunk

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import log, managed
 from .config import Config
-from .install import UNIT_FILES, XRAY_USER, Journal
+from .install import DAEMON_STOP_WAIT, UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
@@ -100,7 +100,9 @@ class Uninstaller:
         # Демон первым: иначе он успел бы вернуть правила и перезапустить Xray.
         for unit in reversed(UNIT_FILES):
             if (self.paths.systemd_dir / unit).exists():
-                self.runner(["systemctl", "disable", "--now", unit], timeout=90.0, check=False)
+                self.runner(
+                    ["systemctl", "disable", "--now", unit], timeout=DAEMON_STOP_WAIT, check=False
+                )
         return "службы " + ", ".join(
             unit.removesuffix(".service") for unit in reversed(present)) + " остановлены"
 

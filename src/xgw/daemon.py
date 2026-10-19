@@ -376,6 +376,10 @@ class Daemon:
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
+        # Остановка демона (SIGTERM): её выставляет run. Шаг, который она застала, не
+        # доделывается: сканы и замеры прерываются, новое применение конфига не начинается —
+        # systemd ждёт остановки не дольше TimeoutStopSec, а установка — перезапуска демона.
+        self._stop = threading.Event()
         self._refresh_asked = False
         self._scan_asked = False
         self._manual_scan = False
@@ -387,6 +391,7 @@ class Daemon:
     def run(self, stop: threading.Event, changed=lambda: False) -> None:
         """Цикл watchdog до остановки либо до изменения config.toml (changed)."""
         self.log.info("демон XGW запущен, шаг watchdog %d с", self.cfg.watchdog.interval_s)
+        self._stop = stop
         while not stop.is_set() and not changed():
             try:
                 state = self.tick()
@@ -399,6 +404,13 @@ class Daemon:
             self._sleep(stop, changed, jitter(pause))
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+
+    @property
+    def stopping(self) -> bool:
+        """Демон останавливается: новой работы не начинать. Применение конфига, которое
+        уже идёт, доводится до конца — Xray, sing-box и правила не остаются наполовину
+        переключёнными."""
+        return self._stop.is_set()
 
     def _sleep(self, stop: threading.Event, changed, seconds: float) -> None:
         """Пауза между шагами. Её прерывают остановка, правка настроек и запрос из панели."""
@@ -591,6 +603,11 @@ class Daemon:
         waiting = self._capture_waits()
         if not waiting:
             self._guard_capture(signals.xray_ok, now)
+        if self.stopping:
+            # Правила и Xray согласованы: правила, которым нужен новый inbound, загрузятся
+            # после применения конфига, а его начнёт уже следующий запуск демона.
+            self._write_status(view, observatory, signals.xray_ok)
+            return state
 
         if not changed and state is not State.XRAY_DOWN:
             changed = self._singbox_step(now)
@@ -658,6 +675,10 @@ class Daemon:
                 self._queue_scan(view, now)
             self._queue_members(view)
             self._scan_step(view, applied)
+            if self.stopping:
+                # Остановка пришла во время сканов: замены и смены класса не начинаем.
+                self._write_status(view, observatory, signals.xray_ok)
+                return state
             if state in (State.DEGRADED, State.ALL_DEAD, State.RESERVE) or (
                 state is State.HEALTHY and self.bad_members
             ) or (state is State.LEAK and self._home_members(view)):
@@ -674,6 +695,9 @@ class Daemon:
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
+        if self.stopping:
+            self._write_status(view, observatory, signals.xray_ok)
+            return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
         self._write_status(view, observatory, signals.xray_ok)
@@ -876,9 +900,14 @@ class Daemon:
             signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
             or (signals.total_members > 0 and dead >= signals.total_members)
         )))
-        if suspect and now >= self.next_target_check:
+        if suspect and now >= self.next_target_check and not self.stopping:
             self.next_target_check = now + PROBE_TARGET_RECHECK
             diagnosis = self._diagnose_target(view, applied)
+            if self.stopping:
+                # Пробы прерваны остановкой: ошибка у всех одна, но о probe.url она ничего
+                # не говорит.
+                self.next_target_check = 0.0
+                return signals
             if diagnosis.down and diagnosis.text != self.probe_target:
                 self.log.warning("%s", diagnosis.text)
                 # Вердикты первой проверки сняты, пока адрес не отвечал: они ни о чём.
@@ -1132,6 +1161,8 @@ class Daemon:
 
     def _apply_pending(self, urgent: bool) -> bool:
         """Конфиг, ждущий перезапуска: в окне restart_window либо срочно."""
+        if self.stopping:
+            return False  # файл остаётся: применит следующий запуск демона
         pending = engine.read_json(self.paths.pending_config_file)
         if pending is None:
             self.paths.pending_config_file.unlink(missing_ok=True)
@@ -1158,6 +1189,8 @@ class Daemon:
 
     def _refresh(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
         """Опрос подписок и применение изменений."""
+        if self.stopping:
+            return False
         self._refreshing = True
         try:
             return self._refresh_now(now, via_xray=via_xray, urgent=urgent)
@@ -1199,6 +1232,11 @@ class Daemon:
         profiles: dict[str, str] | None = None,
     ) -> bool:
         assert self.inventory is not None
+        if self.stopping:
+            # Остановка пришла, пока шёл опрос подписок или сканы: новое применение не
+            # начинаем — прерывать его на середине нельзя, а ждать его systemd не обязан.
+            self.log.info("%s: не применяется — демон останавливается", reason)
+            return False
         dead = engine.quarantined()
         # Перечитывание sing-box рвёт соединения через него: сразу — при аварии и в окне
         # перезапуска, иначе — только если через него никто не идёт (engine.assemble).
@@ -1389,12 +1427,16 @@ class Daemon:
         password, _ports = builder.probe_state(applied)
         nodes = {info.probe_tag: info for info in view}
         started = self.clock()
-        while self.scan_queue and self.clock() - started < SCAN_BUDGET:
-            info = nodes.get(self.scan_queue.popleft())
+        while self.scan_queue and self.clock() - started < SCAN_BUDGET and not self.stopping:
+            probe_tag = self.scan_queue.popleft()
+            info = nodes.get(probe_tag)
             if info is None or not password:
                 continue
             self._scanned = True
             result = self._scan(info, password, self._scan_url(info))
+            if result.kind == "cancelled":
+                self.scan_queue.appendleft(probe_tag)  # скан не состоялся
+                break
             self.store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
@@ -1413,7 +1455,7 @@ class Daemon:
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
         """url — адрес проверки; None — probe.url."""
-        return scan.scan_node(info, self.cfg, probe_pass=password, url=url)
+        return scan.scan_node(info, self.cfg, probe_pass=password, url=url, cancel=self._stop)
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
         """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;
@@ -1733,6 +1775,8 @@ class Daemon:
     def _singbox_step(self, now: float) -> bool:
         """Слежение за sing-box (ТЗ 5.3): не отвечает — перезапуск, после двух неудач — откат
         на last-good, дальше — серверы переводятся на Xray. True — конфиг Xray пересобран."""
+        if self.stopping:
+            return False
         if self._singbox_failed:
             return self._singbox_recover(now)
         if not self.singbox.expected():
@@ -2197,6 +2241,9 @@ class Daemon:
             return False
         self._scanned = True
         result = self._scan(info, password, self._scan_url(info))
+        if result.kind == "cancelled":
+            self._pin_recheck_at = 0.0  # проверка не состоялась — повторить сразу
+            return False
         self.store.save_scan(
             info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
             ts=self.wall(),
@@ -2421,7 +2468,7 @@ class Daemon:
             if probe_tag not in queued:
                 self.speed_queue.append(probe_tag)
                 queued.add(probe_tag)
-        if self.speed_queue and not self._scanned and not self._busy:
+        if self.speed_queue and not self._scanned and not self._busy and not self.stopping:
             self._own_traffic += self._measure_next(view, applied)
         if self.speed_round and not self.speed_queue:
             self.speed_round = False
@@ -2441,10 +2488,15 @@ class Daemon:
         password, _ports = builder.probe_state(applied or {})
         nodes = {info.probe_tag: info for info in view if info.role == "proxy"}
         while self.speed_queue:
-            info = nodes.get(self.speed_queue.popleft())
+            probe_tag = self.speed_queue.popleft()
+            info = nodes.get(probe_tag)
             if info is None or not password:
                 continue  # участник ушёл из работы, пока ждал замера
             result = self._speed(info, password)
+            if result.mbps is None and self.stopping:
+                # Замер прервала остановка демона: это не неудача сервера.
+                self.speed_queue.appendleft(probe_tag)
+                return result.bytes_read
             key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
             records = self._speeds()
             records[key] = {
@@ -2465,7 +2517,8 @@ class Daemon:
     def _speed(self, info: NodeInfo, password: str) -> speed.SpeedResult:
         price = self._prices().get(info.fingerprint, 1.0)
         return speed.measure(
-            info, self.cfg, probe_pass=password, max_mb=speed.size_mb(self.cfg, price)
+            info, self.cfg, probe_pass=password, max_mb=speed.size_mb(self.cfg, price),
+            cancel=self._stop,
         )
 
     def _speeds(self) -> dict[str, dict]:
