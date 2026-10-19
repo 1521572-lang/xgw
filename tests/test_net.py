@@ -1,5 +1,6 @@
 """Сеть шлюза без ядра: ip rule, sysctl, dnsmasq и управление перехватом (Capture)."""
 
+import dataclasses
 import json
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import pytest
 from fakenet import FakeKernel
 
 from xgw.config import Config
-from xgw.net import cmd, dnsmasq, iprule, lan, sysctl, tun
+from xgw.net import cmd, dnsmasq, iprule, lan, nft, sysctl, tun
 from xgw.net.capture import Capture, CaptureError
 from xgw.paths import Paths
 
@@ -292,7 +293,9 @@ def test_enable_refuses_without_applied_tproxy_inbound(gateway):
     """Пока применённый конфиг Xray без inbound'а перехвата, включать его нельзя:
     правила отправили бы весь трафик на порт, который никто не слушает, и при
     fail_mode = "closed" машина осталась бы без интернета (так и случилось на
-    настоящей машине, когда правка настроек ждала окна перезапуска)."""
+    настоящей машине, когда правка настроек ждала окна перезапуска).
+    capture.hold = "direct" — прежнее поведение: до перезапуска Xray сеть идёт напрямую."""
+    gateway.cfg.capture.hold = "direct"
     fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
     assert gateway.enable() == "off"
     assert "нет inbound tproxy-in на порту 12345" in gateway.held
@@ -315,14 +318,17 @@ def test_enable_refuses_without_applied_tproxy_inbound(gateway):
 
 
 def test_capture_refuses_when_applied_config_is_missing_or_broken(gateway):
-    """Файла нет или он битый — это тоже «Xray ещё не с inbound'ом перехвата»."""
-    for text in (None, "{не json", '{"inbounds": "нет"}'):
+    """Файла нет или он битый — это тоже «Xray ещё не с inbound'ом перехвата». Рабочего
+    конфига нет вовсе (первая установка, подписки ещё нет) — VPN ещё нечем включать, и сеть
+    идёт напрямую даже при hold = "block"; конфиг есть, но без inbound'а — blocked."""
+    for text, mode in ((None, "off"), ("{не json", "off"), ('{"inbounds": "нет"}', "blocked")):
         if text is None:
             gateway.paths.xray_config_file.unlink()
         else:
             gateway.paths.xray_config_file.write_text(text, encoding="utf-8")
         assert gateway.inbound_problem()
-        assert gateway.up() == "off" and gateway.held
+        assert gateway.up() == mode and gateway.held
+        assert gateway.effective_mode() == mode
     # Другой порт перехвата — это уже не наш inbound.
     fakexray.write(
         gateway.paths, {"inbounds": [{"tag": "tproxy-in", "protocol": "tunnel", "port": 1234}]}
@@ -331,6 +337,56 @@ def test_capture_refuses_when_applied_config_is_missing_or_broken(gateway):
     # Перехват в конфиге выключен — и проверять нечего.
     gateway.cfg.capture.lan = gateway.cfg.capture.local = False
     assert gateway.inbound_problem() == ""
+
+
+def test_missing_inbound_blocks_when_hold_is_block(gateway):
+    """capture.hold = "block" (по умолчанию): Xray запущен с конфигом без inbound'а
+    перехвата — мимо VPN не уходит ничего; включится сам, когда конфиг применится."""
+    assert gateway.cfg.capture.hold == "block"
+    fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
+    assert gateway.enable() == "blocked"
+    assert gateway.mode() == "on" and gateway.effective_mode() == "blocked"
+    info = gateway.describe()
+    assert info["blocked"] is True and "tproxy-in" in info["inbound_missing"]
+    kernel = gateway.kernel
+    assert "tproxy" not in kernel.table and "chain block_output" in kernel.table
+    assert "chain v6_guard" not in kernel.table6  # IPv6 в «ядре» фикстуры нет
+    assert kernel.rules == [] and not kernel.route
+    assert gateway.loaded() is True  # демон не станет перезагружать правила каждый шаг
+    fakexray.write(gateway.paths)
+    assert gateway.loaded() is False and gateway.up() == "on"
+    assert gateway.describe()["blocked"] is False
+    assert "tproxy to 127.0.0.1:12345" in gateway.kernel.table
+
+
+def test_fail_mode_open_never_blocks(gateway):
+    """fail_mode = "open" — человек выбрал связь важнее VPN: hold не действует."""
+    gateway.cfg.capture.fail_mode = "open"
+    fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
+    assert gateway.enable() == "off" and gateway.describe()["blocked"] is False
+
+
+def test_blocked_rules_are_reloaded_when_missing(gateway):
+    fakexray.write(gateway.paths, {"inbounds": [{"tag": "socks-in"}]})
+    gateway.enable()
+    del gateway.kernel.tables[("ip", "xgw")]  # чужой flush ruleset
+    assert gateway.loaded() is False
+    assert gateway.up() == "blocked" and gateway.loaded() is True
+    gateway.kernel.tables[("ip", "xgw")] = nft.render(gateway.rules("off"))  # «не тот» режим
+    assert gateway.loaded() is False
+
+
+def test_v6_guard_is_loaded_and_checked_when_ipv6_works(gateway):
+    (gateway.proc / "net/ipv6/conf/all").mkdir(parents=True)  # IPv6 в ядре есть
+    (gateway.proc / "net/ipv6/conf/all/disable_ipv6").write_text("0\n")
+    assert gateway.ipv6_usable()
+    assert gateway.enable() == "on"
+    assert "chain v6_guard" in gateway.kernel.table6 and gateway.loaded() is True
+    gateway.kernel.tables[("ip6", "xgw6")] = nft.render6(
+        dataclasses.replace(gateway.rules("on"), v6_guard=False)
+    )
+    assert gateway.loaded() is False  # IPv6 машины без защиты — правила загружаются заново
+    assert gateway.disable() == "off" and "chain v6_guard" in gateway.kernel.table6
 
 
 def test_loaded_detects_missing_and_stale_rules(gateway):
@@ -400,8 +456,8 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
-        "docker": False, "fail_mode": "closed", "loaded": True, "tun_problem": "",
-        "inbound_missing": "",
+        "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
+        "tun_problem": "", "inbound_missing": "", "blocked": False,
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
     gateway.cfg.capture.containers = True
@@ -442,14 +498,14 @@ def test_tun_capture_waits_for_the_tun_inbound_in_xray(gateway_tun):
     gateway = gateway_tun
     kernel = gateway.kernel
     fakexray.write(gateway.paths, fakexray.applied_config(tun=None))  # только tproxy-in
-    assert gateway.enable() == "off"
+    assert gateway.enable() == "blocked"  # capture.hold = "block": мимо VPN ничего
     assert gateway.held == "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"
     assert kernel.rules == [] and not kernel.routes(101) and "tproxy" not in kernel.table
-    assert gateway.loaded() is True and gateway.effective_mode() == "off"
+    assert gateway.loaded() is True and gateway.effective_mode() == "blocked"
 
     # Xray слушает другой интерфейс (имя в настройках сменили, конфиг ещё прежний).
     fakexray.write(gateway.paths, fakexray.applied_config(tun="oldtun0"))
-    assert gateway.up() == "off" and "xgwtun0" in gateway.held
+    assert gateway.up() == "blocked" and "xgwtun0" in gateway.held
 
     fakexray.write(gateway.paths)  # конфиг с tun-in применён
     assert gateway.loaded() is False
@@ -463,7 +519,7 @@ def test_tun_needs_both_inbounds_when_the_lan_is_captured_too(gateway_tun):
     fakexray.write(gateway.paths, {"inbounds": [
         {"tag": "tun-in", "protocol": "tun", "settings": {"name": "xgwtun0"}},
     ]})
-    assert gateway.enable() == "off" and "tproxy-in" in gateway.held
+    assert gateway.enable() == "blocked" and "tproxy-in" in gateway.held
 
 
 def test_pure_tun_does_not_ask_for_a_tproxy_inbound(gateway_tun):
@@ -489,7 +545,7 @@ def test_capture_is_not_loaded_when_the_tun_interface_did_not_appear(gateway_tun
 
     gateway = gateway_tun
     monkeypatch.setattr(tun, "present", lambda name, runner: False)
-    assert gateway.enable() == "off"
+    assert gateway.enable() == "blocked"
     assert gateway.held == "TUN-интерфейса xgwtun0 нет в системе"
     assert gateway.kernel.rules == [] and "tproxy" not in gateway.kernel.table
     # Причина видна и в статусе — той же строкой, что и отсутствие inbound'а.

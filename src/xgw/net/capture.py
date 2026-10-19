@@ -5,6 +5,9 @@
   off  — снят командой `xgw disable`: сеть работает напрямую, шлюз остаётся роутером;
   open — снят демоном на время: Xray недоступен, а в конфиге fail_mode = "open";
   none — в конфиге перехват выключен (capture.lan = capture.local = false).
+Пока в применённом конфиге Xray нет inbound'а перехвата, «on» загружается как blocked
+(capture.hold = "block": перехвата нет, и мимо VPN не уходит ничего) или как «off»
+(hold = "direct"); см. effective_mode и hold_mode.
 
 Трафик самой машины попадает в Xray либо через TPROXY на lo (по умолчанию), либо
 через постоянный TUN-интерфейс (capture.method = "tun", см. net/tun.py); сеть LAN
@@ -161,14 +164,17 @@ class Capture:
 
     def rules(self, mode: str | None = None) -> nft.Rules:
         """Параметры правил для режима (по умолчанию — текущего)."""
+        mode = mode or self.mode()
         rules, warnings = nft.build_rules(
-            self.cfg, capture=(mode or self.mode()) == "on", time_uids=self.time_uids
+            self.cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=self.time_uids
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
             # и таблица ip6 в таком ядре не работают и сломали бы загрузку IPv4.
             rules = dataclasses.replace(rules, capture6=False)
             warnings.append("network.ipv6 = proxy, но IPv6 в ядре выключен: проксировать нечего")
+        if rules.v6_guard and not self.ipv6_usable():
+            rules = dataclasses.replace(rules, v6_guard=False)  # закрывать нечего
         for warning in warnings:
             if warning not in self._warned:  # демон собирает правила на каждом шаге
                 self._warned.add(warning)
@@ -285,9 +291,20 @@ class Capture:
 
     def effective_mode(self) -> str:
         """Режим, который на самом деле загружается: «on» без нужного inbound'а в Xray
-        становится «off» — сеть работает напрямую, пока конфиг не применён."""
+        становится «blocked» (capture.hold = "block": мимо VPN ничего, пока конфиг не
+        применён) или «off» (hold = "direct": сеть напрямую)."""
         mode = self.mode()
-        return "off" if mode == "on" and self.inbound_problem() else mode
+        return self.hold_mode() if mode == "on" and self.inbound_problem() else mode
+
+    def hold_mode(self) -> str:
+        """Чем заменить «on», пока перехват включить нельзя. Рабочего конфига Xray нет вовсе
+        (первая установка, подписки ещё нет) — VPN ещё нечем включать, и закрыть сеть значило
+        бы оставить машину без интернета, пока человек ищет подписку: тогда «off» и при
+        hold = "block". Конфиг есть, но без нужного inbound'а — это минуты до перезапуска
+        Xray, и тогда hold решает."""
+        if self.cfg.capture.hold_blocks and self._applied() is not None:
+            return "blocked"
+        return "off"
 
     def _containers_tun(self, rules: nft.Rules) -> bool:
         """Интерфейс TUN нужен контейнерам: их перехват включён, и применённый конфиг Xray
@@ -348,21 +365,24 @@ class Capture:
             # Правила перехвата отправляют пакеты на tproxy_port или в TUN. Если в
             # применённом конфиге Xray такого inbound'а нет (изменение настроек ещё не
             # применено, откат на прежний конфиг) либо нет самого интерфейса, включать
-            # перехват нельзя: при fail_mode = "closed" машина осталась бы без интернета.
-            # Загружаем режим «снят»: сеть работает напрямую, а перехват включится сам,
-            # как только Xray перезапустится с нужным inbound'ом (за этим следит демон).
+            # перехват нельзя: трафик ушёл бы в никуда. Загружаем режим blocked (мимо VPN
+            # ничего, capture.hold = "block") или «снят» (напрямую, hold = "direct"), а
+            # перехват включится сам, как только Xray перезапустится с нужным inbound'ом
+            # (за этим следит демон).
             try:
                 reason = self.inbound_problem() or self._prepare_tun()
             except (cmd.CommandError, OSError) as exc:
                 raise CaptureError(str(exc)) from exc
             if reason:
                 self.held = reason
+                mode = self.hold_mode()
                 self.log.error(
-                    "перехват не включён: %s — трафик ушёл бы в никуда. Сеть работает "
-                    "напрямую; перехват включится после перезапуска Xray с новым конфигом",
+                    "перехват не включён: %s — трафик ушёл бы в никуда. %s; перехват "
+                    "включится после перезапуска Xray с новым конфигом",
                     reason,
+                    "Трафик заблокирован, мимо VPN ничего не уходит" if mode == "blocked"
+                    else "Сеть работает напрямую",
                 )
-                mode = "off"
         rules = self.rules(mode)
         try:
             if rules.lan_if:
@@ -544,6 +564,21 @@ class Capture:
         chains = nft.loaded_chains(self.runner)
         if chains is None:
             return None
+        guard = self._v6_guard_loaded(rules)
+        if guard is not True:
+            return guard
+        if rules.blocked:
+            wanted: set[str] = set()
+            if rules.block_local:
+                wanted.add("block_output")
+            if rules.lan_if or rules.block_containers:
+                wanted.add("forward")
+            if rules.lan_if:
+                wanted.add("postrouting")
+            return wanted <= chains and not chains & {
+                "prerouting", "output", "loopback_guard", "containers"}
+        if "block_output" in chains:
+            return False  # осталась блокировка, а inbound в Xray уже есть
         expected: set[str] = set()
         if rules.capture:
             expected.add("loopback_guard")
@@ -609,6 +644,15 @@ class Capture:
             )
         return None
 
+    def _v6_guard_loaded(self, rules: nft.Rules) -> bool | None:
+        """v6_guard в ядре ровно тогда, когда нужен; None — узнать нельзя."""
+        if not self.ipv6_usable():
+            return True  # таблицы ip6 в таком ядре нет, закрывать нечего
+        chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
+        if chains6 is None:
+            return None
+        return ("v6_guard" in chains6) == rules.v6_guard
+
     def describe(self, *, check: bool = True) -> dict:
         """Сведения для `xgw status`."""
         rules = self.rules("on")
@@ -620,6 +664,7 @@ class Capture:
             problem = self.tun_problem()
             if problem and self.loaded(tun=False) is True:
                 tun_only = problem
+        missing = (self.inbound_problem() or self.held) if self.mode() == "on" else ""
         return {
             "mode": self.mode(),
             "lan_if": rules.lan_if,
@@ -633,13 +678,14 @@ class Capture:
             # стоит говорить в статусе.
             "docker": bool(lan.container_links(rules.containers, self.sys_net)),
             "fail_mode": self.cfg.capture.fail_mode,
+            "hold": "block" if self.cfg.capture.hold_blocks else "direct",
             "loaded": loaded,
             "tun_problem": tun_only,
             # Перехват включён, но Xray работает без нужного inbound'а: вместо правил
-            # перехвата загружен режим «снят», трафик идёт напрямую (см. _load). Здесь —
-            # чего не хватает; пусто — всё на месте.
+            # перехвата загружен режим blocked или «снят» (см. _load). Здесь — чего не
+            # хватает; пусто — всё на месте.
             # (или не появился интерфейс TUN — это помнит сам объект после загрузки).
-            "inbound_missing": (
-                (self.inbound_problem() or self.held) if self.mode() == "on" else ""
-            ),
+            "inbound_missing": missing,
+            # При этом трафик закрыт (hold = "block"), а не идёт напрямую.
+            "blocked": bool(missing) and self.hold_mode() == "blocked",
         }

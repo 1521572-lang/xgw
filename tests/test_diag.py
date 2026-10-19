@@ -390,6 +390,7 @@ def test_services_and_capture_after_install(box):
     (proc / "net/ipv4").mkdir(parents=True)
     (proc / "net/ipv4/ip_forward").write_text("0\n", encoding="ascii")
     capture = Capture(box.cfg, box.paths, runner=box.system, proc_sys=proc)
+    box.kwargs.update(proc_sys=proc)  # diag смотрит то же «ядро»: IPv6 в нём нет
     fakexray.write(box.paths)  # Xray запущен с inbound'ом перехвата
     capture.enable()
     assert box.diag()._services()[1].level == OK

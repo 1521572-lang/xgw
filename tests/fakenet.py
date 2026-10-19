@@ -28,6 +28,7 @@ class FakeKernel:
         self.refuse: str | None = None  # подстрока команды, которая «не выполняется»
         self.forbidden = False  # запуск не от root: nft ничего не показывает
         self.refuse_ip6 = False  # таблицу ip6 ядро не принимает (IPv6 в ядре нет)
+        self.loads: list[str] = []  # тексты принятых транзакций `nft -f -`
 
     def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         argv = list(argv)
@@ -199,13 +200,24 @@ class FakeKernel:
         if argv[1:] == ["-c", "-f", "-"]:
             return ""
         if argv[1:] == ["-f", "-"]:
-            if self.refuse_ip6 and text.startswith("table ip6 "):
+            # Одна транзакция может заменять несколько таблиц («table X / delete table X /
+            # table X {…}» подряд); отказ любой из них — отказ всей транзакции.
+            segments: list[list[str]] = []
+            for line in text.splitlines():
+                if line.startswith("table ") and "{" not in line:
+                    segments.append([line])
+                elif segments:
+                    segments[-1].append(line)
+            if self.refuse_ip6 and any(seg[0].startswith("table ip6 ") for seg in segments):
                 raise CommandError("nft: Operation not supported")
-            _table, family, name = text.splitlines()[0].split()
-            if "{" in text:
-                self.tables[(family, name)] = text
-            else:
-                self.tables.pop((family, name), None)
+            self.loads.append(text)
+            for segment in segments:
+                _table, family, name = segment[0].split()
+                body = "\n".join(segment) + "\n"
+                if "{" in body:
+                    self.tables[(family, name)] = body
+                else:
+                    self.tables.pop((family, name), None)
             return ""
         raise AssertionError(f"неожиданная команда: {' '.join(argv)}")
 

@@ -936,16 +936,20 @@ class Installer:
         # Служба нужна после перезагрузки; сейчас правила уже загружены.
         self.runner(["systemctl", "start", "xgw-net.service"], timeout=60.0)
         if capture.configured:
-            mode = {"on": "перехват включён", "off": "перехват снят", "open": "перехват снят"}
+            mode = {"on": "перехват включён", "off": "перехват снят", "open": "перехват снят",
+                    "blocked": "трафик заблокирован до перезапуска Xray"}
             loaded = capture.effective_mode()
             self._step(f"правила nftables загружены, {mode.get(loaded, 'перехвата нет')}")
             if capture.mode() == "on" and loaded != "on":
                 # Xray запущен с конфигом без нужного inbound'а: честнее сказать, чем
                 # отчитаться «включён». Демон включит перехват сам, когда конфиг применится.
+                held = (
+                    "Интернет закрыт, мимо VPN ничего не уходит (capture.hold = block)"
+                    if loaded == "blocked" else "Интернет работает напрямую"
+                )
                 self._warn(
-                    f"перехват пока не включён: {capture.inbound_problem()}. Интернет "
-                    "работает напрямую; перехват включится сам после перезапуска Xray "
-                    "(сразу: sudo xgw apply --now)"
+                    f"перехват пока не включён: {capture.inbound_problem()}. {held}; "
+                    "перехват включится сам после перезапуска Xray (сразу: sudo xgw apply --now)"
                 )
 
     def _token(self) -> None:

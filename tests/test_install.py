@@ -882,13 +882,16 @@ def test_lan_profile_is_not_created_if_the_conflict_appears_during_install(box):
 
 def test_install_says_so_when_capture_waits_for_the_xray_inbound(box):
     """Xray отвечает, но в его конфиге нет inbound'а перехвата (собран при выключенном
-    перехвате, а настройки с тех пор сменили): установка не рапортует «включён»."""
+    перехвате, а настройки с тех пор сменили): установка не рапортует «включён».
+    capture.hold = "block" (по умолчанию): до перезапуска Xray мимо VPN ничего не уходит."""
     fakexray.write(box.paths, {"inbounds": [{"tag": "socks-in"}]})
     assert box.install() == 0
     text = box.text()
-    assert "правила nftables загружены, перехват снят" in text
+    assert "правила nftables загружены, трафик заблокирован до перезапуска Xray" in text
     assert "! перехват пока не включён: в применённом конфиге Xray нет inbound tproxy-in" in text
-    assert "tproxy" not in box.system.kernel.table and "masquerade" in box.system.kernel.table
+    assert "Интернет закрыт, мимо VPN ничего не уходит" in text
+    table = box.system.kernel.table
+    assert "tproxy" not in table and "chain block_output" in table and "masquerade" in table
     assert "Предупреждений: 1" in text
 
 

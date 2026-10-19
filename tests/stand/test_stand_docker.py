@@ -255,3 +255,20 @@ def test_containers_can_be_left_outside_the_vpn(stand):
     assert container.exit_ip() == DIRECT
     assert stand.exit_ip("gw") == VIA_VPN
     assert container.published() == "DE"
+
+
+def test_containers_do_not_leak_in_blocked_mode(stand):
+    """capture.hold = "block": Xray запущен без inbound'а перехвата — контейнеры не уходят
+    в интернет напрямую (без цепочки containers их пропустил бы «чужой форвардинг»), а
+    опубликованный порт по-прежнему отвечает."""
+    container = stand.container()
+    container.create()
+    stand.up()  # Xray без tproxy-in и tun-in
+    stand.write_config(capture=True)  # настройки сменили, конфиг Xray ещё прежний
+    stand.xgw("net", "up")
+    assert "chain block_output" in stand.gw_run("nft", "list", "table", "ip", "xgw")
+    assert container.exit_ip() == ""
+    assert container.published() == "DE"
+    assert stand.xgw("apply", "--now").returncode == 0
+    assert stand.xgw("net", "up").returncode == 0
+    assert wait_for(lambda: container.exit_ip() == VIA_VPN, 30, step=1), stand.xray_log(30)

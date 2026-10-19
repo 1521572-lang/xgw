@@ -67,6 +67,9 @@ class Capture:
     lan: bool = True
     local: bool = True
     fail_mode: str = "closed"
+    # Что делать, пока в применённом конфиге Xray нет inbound'а перехвата (настройки ещё
+    # не применены, откат): "block" — мимо VPN не уходит ничего; "direct" — сеть напрямую.
+    hold: str = "block"
     forward_icmp: bool = True
     exclude_cidrs: list[str] = field(default_factory=list)
     tproxy_port: int = 12345
@@ -86,6 +89,13 @@ class Capture:
     def tun(self) -> bool:
         """Трафик самой машины идёт в Xray через TUN. Неизвестное слово — tproxy."""
         return self.method.strip().lower() == "tun"
+
+    @property
+    def hold_blocks(self) -> bool:
+        """Без inbound'а перехвата трафик закрыт (hold = "block"). При fail_mode = "open"
+        человек выбрал связь важнее VPN — тогда всегда напрямую. Неизвестное слово — block:
+        опечатка не должна молча пускать трафик мимо VPN."""
+        return self.fail_mode != "open" and self.hold.strip().lower() != "direct"
 
 
 
@@ -559,6 +569,10 @@ def _validate(cfg: Config) -> list[str]:
         )
     if cfg.capture.fail_mode not in ("closed", "open"):
         warnings.append(f"capture.fail_mode={cfg.capture.fail_mode}: допустимо closed или open")
+    if cfg.capture.hold.strip().lower() not in ("block", "direct"):
+        warnings.append(
+            f"capture.hold={cfg.capture.hold!r}: допустимо block или direct; принято block"
+        )
     for name in ("lan_if", "wan_if"):
         value = getattr(cfg.network, name)
         if value and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", value):

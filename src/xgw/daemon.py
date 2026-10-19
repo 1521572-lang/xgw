@@ -1095,9 +1095,13 @@ class Daemon:
             missing = str(info.get("inbound_missing") or "")
             if missing:
                 if missing != self._inbound_missing:  # одно событие на причину
+                    held = (
+                        "трафик заблокирован, мимо VPN ничего не уходит (capture.hold = block)"
+                        if info.get("blocked") else "трафик идёт напрямую"
+                    )
                     self.notifier.event(
                         "capture",
-                        f"перехват не включён: {missing} — трафик идёт напрямую; "
+                        f"перехват не включён: {missing} — {held}; "
                         "включится сам после перезапуска Xray с новым конфигом",
                         notify=True,
                     )

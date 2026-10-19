@@ -826,6 +826,7 @@ class FakeCapture:
         self.fail = False
         self.calls: list[str] = []
         self.problem = ""  # какого inbound'а нет в применённом конфиге Xray
+        self.blocked = False  # при problem: hold = "block" — трафик заблокирован
         self.tun_issue = ""  # что не так с интерфейсом TUN
 
     def mode(self):
@@ -864,7 +865,8 @@ class FakeCapture:
     def describe(self, *, check=True):
         return {"mode": self.state, "lan_if": "lan0", "lan": True, "local": True,
                 "bypass": [], "fail_mode": "closed", "loaded": None,
-                "inbound_missing": self.problem if self.state == "on" else ""}
+                "inbound_missing": self.problem if self.state == "on" else "",
+                "blocked": bool(self.problem) and self.blocked and self.state == "on"}
 
     def inbound_problem(self):
         self.calls.append("problem?")
@@ -1171,6 +1173,20 @@ def test_capture_waiting_for_the_inbound_is_reported_once_and_then_turns_on(guar
                for event in daemon.events())
     assert not any("загружены заново" in event for event in daemon.events())
     assert daemon.status()["capture"]["inbound_missing"] == ""
+
+
+def test_blocked_notification_is_sent(guarded):
+    """capture.hold = "block": об этом уведомление (оно уходит и в blocked — через http-in
+    Xray либо напрямую с меткой 2), и текст честный: трафик не идёт напрямую, он закрыт."""
+    daemon, capture = guarded
+    capture.problem = "в применённом конфиге Xray нет inbound tproxy-in на порту 12345"
+    capture.blocked = True
+    daemon.tick()
+    daemon.tick()
+    told = [event for event in daemon.events() if "перехват не включён" in event]
+    assert len(told) == 1 and "tproxy-in" in told[0]
+    assert "трафик заблокирован" in told[0] and "напрямую" not in told[0]
+    assert daemon.status()["capture"]["blocked"] is True
 
 
 def test_capture_that_keeps_failing_to_load_is_reported_once(guarded):

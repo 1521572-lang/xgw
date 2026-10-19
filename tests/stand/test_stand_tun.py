@@ -184,20 +184,20 @@ def test_method_can_be_switched_both_ways(tmp_path):
 
         # tproxy → tun. Inbound'а tun в работающем Xray ещё нет: маршрут в интерфейс увёл бы
         # трафик машины в никуда (так машина и оставалась без интернета — отчёт о проверке
-        # на настоящей машине, дефект D1). Поэтому перехват не загружается вовсе: сеть
-        # работает напрямую, а команды и статус говорят, чего ждут.
+        # на настоящей машине, дефект D1). Поэтому перехват не загружается вовсе: трафик
+        # заблокирован (capture.hold = "block"), а команды и статус говорят, чего ждут.
         stand.write_config(capture=True, method="tun", containers=False)
         assert stand.xgw("net", "up").returncode == 0
         assert _routes(stand).strip() == "" and "fwmark" not in _rules(stand)
         table = stand.gw_run("nft", "list", "table", "ip", "xgw")
-        assert "tproxy" not in table and "masquerade" in table  # шлюз — обычный роутер
-        assert stand.exit_ip("gw") == DIRECT and stand.exit_ip("lan") == DIRECT
+        assert "tproxy" not in table and "chain block_output" in table
+        assert stand.exit_ip("gw") == "" and stand.exit_ip("lan") == ""  # и мимо VPN — нет
         status = stand.xgw("status").stdout
         assert "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray)" in status, status
         assert "tun-in" in status and "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" not in status
         refused = stand.xgw("enable")
         assert refused.returncode == 1 and "перехват пока не включён" in refused.stderr
-        assert "xgw apply --now" in refused.stderr and stand.exit_ip("gw") == DIRECT
+        assert "xgw apply --now" in refused.stderr and stand.exit_ip("gw") == ""
         # Конфиг применён (Xray перезапущен с tun-in) — правила загружаются как обычно.
         assert stand.xgw("apply", "--now").returncode == 0
         assert "tun-in" in stand.gw_run("cat", str(stand.root / "etc/xgw/xray/config.json"))

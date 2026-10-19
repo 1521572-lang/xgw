@@ -674,10 +674,14 @@ def render_capture(capture: dict) -> str:
         )
     if capture.get("inbound_missing"):
         # Перехват включён, но Xray работает без нужного inbound'а: правила перехвата
-        # не загружены, трафик идёт напрямую (иначе он ушёл бы в никуда).
+        # не загружены (иначе трафик ушёл бы в никуда) — он заблокирован или идёт напрямую.
+        held = (
+            "трафик заблокирован, мимо VPN ничего не уходит (capture.hold = block)"
+            if capture.get("blocked") else "трафик идёт напрямую"
+        )
         return (
             "Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray) — "
-            f"{capture['inbound_missing']}; трафик идёт напрямую, перехват включится сам "
+            f"{capture['inbound_missing']}; {held}, перехват включится сам "
             "после перезапуска Xray (сразу: sudo xgw apply --now)"
         )
     scope = [f"сеть {capture['lan_if']}"] if capture.get("lan") else []

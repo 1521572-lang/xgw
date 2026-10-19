@@ -410,7 +410,9 @@ class Diag:
             )]
         whom = "" if machine else " — для контейнеров Docker"
         if self.root and self.installed:
-            capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+            capture = Capture(
+                self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
+            )
             problem = capture.tun_problem() if capture.mode() == "on" else ""
             if problem:
                 result.append(Check(
@@ -691,7 +693,9 @@ class Diag:
             return [Check("IPv6", OK, "IPv6 в ядре выключен — проксировать нечего")]
         if not self.installed or not self.root:
             return [Check("IPv6", OK, "IPv6 машины пойдёт через Xray (network.ipv6 = proxy)")]
-        info = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log).describe()
+        info = Capture(
+            self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
+        ).describe()
         if info["mode"] != "on":
             return [Check(
                 "IPv6", WARN, "перехват снят — IPv6 идёт напрямую, мимо VPN", "sudo xgw enable"
@@ -722,9 +726,21 @@ class Diag:
         } - {""})
         if not devices:
             return [Check("IPv6", OK, "глобальных IPv6-адресов нет — мимо перехвата идти нечему")]
-        text = "глобальный IPv6-адрес на " + ", ".join(devices) + ": по IPv6 трафик идёт мимо VPN"
+        where = "глобальный IPv6-адрес на " + ", ".join(devices)
+        text = where + ": по IPv6 трафик идёт мимо VPN"
         if not self.installed:
             return [Check("IPv6", WARN, text, "sudo xgw install отключит IPv6 на WAN")]
+        if self.cfg.capture.local and self.root:
+            # IPv6 машины держит фаервол (v6_guard), а не только настройка NetworkManager.
+            chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
+            if chains6 is not None and "v6_guard" in chains6:
+                return [Check("IPv6", OK, where + ": наружу IPv6 машины не выпускает фаервол "
+                              "(v6_guard)")]
+            if chains6 is not None:
+                return [Check(
+                    "IPv6", FAIL, text + " — защита IPv6 (v6_guard) не загружена",
+                    "sudo xgw net up — загрузит её; отключить IPv6 на WAN заново: sudo xgw install",
+                )]
         # Не «nmcli connection modify»: у профиля из netplan это сбрасывает привязку к
         # карте (nm.netplan_defined). Установка выбирает безопасный способ сама.
         return [Check(
@@ -780,7 +796,9 @@ class Diag:
             result.append(Check("Службы", OK, ", ".join(
                 unit.removesuffix(".service") for unit in units) + " работают"))
         if self.root:
-            capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+            capture = Capture(
+                self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
+            )
             info = capture.describe()
             # Не готов только интерфейс TUN — правила на месте: об этом строка «TUN».
             missing = info["loaded"] is False and not info.get("tun_problem")
@@ -793,6 +811,14 @@ class Diag:
             elif info["mode"] in ("off", "open"):
                 result.append(Check("Перехват", WARN, "снят — трафик идёт напрямую, мимо VPN",
                                     "sudo xgw enable"))
+            elif info["mode"] == "on" and info.get("inbound_missing"):
+                held = ("трафик заблокирован, мимо VPN ничего не уходит" if info.get("blocked")
+                        else "трафик идёт напрямую, мимо VPN")
+                result.append(Check(
+                    "Перехват", WARN,
+                    f"включён, но ждёт inbound в Xray: {info['inbound_missing']} — {held}",
+                    "sudo xgw apply --now",
+                ))
             elif info["mode"] == "on":
                 result.append(Check("Перехват", OK, "включён, правила загружены"))
         return result

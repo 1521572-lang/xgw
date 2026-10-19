@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -24,6 +26,7 @@ import pytest
 from stand import Stand, wait_for
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
+HERE = Path(__file__).resolve().parent
 VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
 SWITCH_LIMIT = 25.0
@@ -353,12 +356,13 @@ def test_capture_enabled_in_the_config_is_applied_at_once_and_internet_survives(
 def test_capture_is_not_loaded_while_xray_runs_without_the_inbound(tmp_path):
     """Предохранитель сам по себе, без демона: конфиг Xray собран без перехвата, а
     человек (или xgw-net.service при загрузке) просит правила. Правила перехвата не
-    загружаются, интернет остаётся прямым, команда говорит правду."""
+    загружаются, интернет остаётся прямым (capture.hold = "direct"), команда говорит правду."""
     stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
     try:
         stand.start()
         stand.up()  # Xray запущен без tproxy-in
-        stand.write_config(capture=True)  # настройки сменили, конфиг Xray ещё прежний
+        # Настройки сменили, конфиг Xray ещё прежний.
+        stand.write_config(capture=True, hold="direct")
         for command in (("net", "up"), ("enable",)):
             result = stand.xgw(*command)
             table = stand.gw_run("nft", "list", "table", "ip", "xgw")
@@ -373,5 +377,67 @@ def test_capture_is_not_loaded_while_xray_runs_without_the_inbound(tmp_path):
         assert stand.xgw("net", "up").returncode == 0
         assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=1), stand.xray_log(30)
         assert stand.exit_ip("lan") == VIA_VPN
+    finally:
+        stand.stop()
+
+
+def test_lan_is_blocked_without_capture_inbound(tmp_path):
+    """capture.hold = "block" (по умолчанию): Xray запущен с конфигом без tproxy-in, а
+    правила просят. Мимо VPN не уходит ничего — ни из LAN, ни с самой машины; проходят
+    устройства в обход, сокеты самого XGW (метка mark_bypass) и связь LAN со шлюзом."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up()  # Xray запущен без tproxy-in
+        stand.write_config(capture=True)  # настройки сменили, конфиг Xray ещё прежний
+        result = stand.xgw("net", "up")
+        table = stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert "tproxy" not in table and "chain block_output" in table, table
+        assert stand.exit_ip("lan") == "" and stand.exit_ip("gw") == ""
+        assert stand.exit_ip("lan", "--bind", netns.LAN_BYPASS_IP) == DIRECT
+        assert stand.exit_ip("gw", "--mark", "2") == DIRECT
+        assert "error" in stand.lan("dns", "8.8.8.8", "example.org", "--timeout", "3")
+        # Отбой, а не таймаут: соединение отклоняется сразу.
+        started = time.monotonic()
+        refused = stand.lan("get", stand.origin_url("/trace"), "--timeout", "8")
+        assert "error" in refused and time.monotonic() - started < 4.0, refused
+        assert "трафик заблокирован" in (result.stderr + result.stdout).lower()
+        status = stand.xgw("status").stdout
+        assert "трафик заблокирован, мимо VPN ничего не уходит" in status, status
+        # Конфиг применён — перехват включается, трафик идёт через VPN.
+        assert stand.xgw("apply", "--now").returncode == 0
+        assert stand.xgw("net", "up").returncode == 0
+        assert wait_for(lambda: stand.exit_ip("gw") == VIA_VPN, 30, step=1), stand.xray_log(30)
+        assert stand.exit_ip("lan") == VIA_VPN
+        assert "chain block_output" not in stand.gw_run("nft", "list", "table", "ip", "xgw")
+    finally:
+        stand.stop()
+
+
+def test_direct_session_is_cut_when_blocked(tmp_path):
+    """Сессия, открытая при снятом перехвате, после перехода в blocked не доживает по
+    записи conntrack: соединение обрывается, остаток тела не приходит."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up()  # Xray запущен без tproxy-in
+        stand.write_config(capture=True)
+        assert stand.xgw("disable").returncode == 0
+        assert stand.exit_ip("lan") == DIRECT
+        url = stand.origin_url("/slow?bytes=2000000&seconds=12")
+        download = subprocess.Popen(
+            [*stand._prefix("lan"), sys.executable, str(HERE / "lan_client.py"), "get", url,
+             "--timeout", "4"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        time.sleep(2.5)  # загрузка идёт напрямую
+        assert download.poll() is None
+        enabled = stand.xgw("enable")  # перехват включить нельзя — blocked
+        assert "трафик заблокирован" in (enabled.stdout + enabled.stderr).lower(), enabled
+        cut = time.monotonic()
+        out, _ = download.communicate(timeout=20)
+        reply = json.loads(out.strip().splitlines()[-1])
+        assert "error" in reply, reply  # тело целиком не пришло
+        assert time.monotonic() - cut < 6.0  # оборвалась сразу, а не дождалась 12 с
     finally:
         stand.stop()

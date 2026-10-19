@@ -1,5 +1,6 @@
 """Правила nftables: генерация текста и проверка `nft -c -f` (без root — пропуск)."""
 
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -158,7 +159,8 @@ def test_only_this_machine():
     for absent in ("bypass4", "chain forward", "chain postrouting", "chain dns_direct", "lan"):
         assert absent not in text
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
-    assert nft.render6(rules) == ""
+    text6 = nft.render6(rules)  # IPv6 машины закрыт (v6_guard), форвардинга IPv6 нет
+    assert "chain v6_guard {" in text6 and "chain forward" not in text6
 
 
 def test_lan_without_local_capture():
@@ -186,8 +188,13 @@ def test_capture_removed_leaves_plain_router():
 
 
 def test_nothing_to_load_without_lan_and_capture():
-    rules, _ = nft.build_rules(Config(), capture=False, time_uids=())
+    cfg = Config()
+    cfg.capture.local = False  # режим none: перехватывать нечего
+    rules, _ = nft.build_rules(cfg, capture=False, time_uids=())
     assert rules.empty and nft.render(rules) == "" and nft.render6(rules) == ""
+    # Перехват машины снят (xgw disable): IPv4 напрямую, а IPv6 (network.ipv6 = off) закрыт.
+    off, _ = nft.build_rules(Config(), capture=False, time_uids=())
+    assert off.empty and nft.render(off) == "" and "chain v6_guard {" in nft.render6(off)
     kernel = FakeKernel()
     kernel.tables[("ip", "xgw")] = "table ip xgw {\n}\n"
     assert nft.apply(rules, kernel) == []
@@ -277,9 +284,10 @@ def test_ip6_capture_follows_the_capture_mode_and_local_flag():
     cfg.capture.local = False
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
     assert not rules.capture6  # устройствам IPv6 не выдаётся — перехватывать нечего
-    # Без LAN таблица нужна только для IPv6 самой машины.
+    # Без LAN таблица нужна только для IPv6 самой машины: при «off» — закрыть его.
     rules, _ = nft.build_rules(Config(), capture=True, time_uids=())
-    assert nft.render6(rules) == ""
+    text6 = nft.render6(rules)
+    assert "chain v6_guard {" in text6 and "chain prerouting" not in text6
     only = Config()
     only.network.ipv6 = "proxy"
     rules, _ = nft.build_rules(only, capture=True, time_uids=())
@@ -313,6 +321,8 @@ def test_apply_fails_when_proxied_ipv6_rules_cannot_be_loaded():
     with pytest.raises(CommandError):
         nft.apply(rules, kernel)
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    # IPv6 в ядре нет: Capture.rules снимает v6_guard (закрывать нечего).
+    rules = dataclasses.replace(rules, v6_guard=False)
     assert len(nft.apply(rules, kernel)) == 1  # без proxy — только предупреждение
 
 
@@ -381,7 +391,8 @@ def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     kernel = FakeKernel()
     assert nft.apply(rules, kernel) == []
-    assert [call[1:] for call in kernel.calls] == [("-c", "-f", "-"), ("-f", "-"), ("-f", "-")]
+    # Обе таблицы — одной транзакцией: между ними правила семей не расходятся.
+    assert [call[1:] for call in kernel.calls] == [("-c", "-f", "-"), ("-f", "-")]
     assert nft.loaded_chains(kernel) == {
         "prerouting", "containers", "output", "loopback_guard", "dns_direct", "forward",
         "postrouting",
@@ -393,8 +404,140 @@ def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
                 raise CommandError("nft: Operation not supported")
             return super()._nft(argv, text)
 
-    warnings = nft.apply(rules, NoIpv6())
+    no_ipv6 = NoIpv6()
+    warnings = nft.apply(dataclasses.replace(rules, v6_guard=False), no_ipv6)
     assert len(warnings) == 1 and "ip6 xgw6" in warnings[0]
+    assert "tproxy" in no_ipv6.table  # IPv4 загружен отдельно, без таблицы IPv6
+
+
+def _blocked(cfg: Config, uids=()) -> nft.Rules:
+    rules, _warnings = nft.build_rules(cfg, capture=False, blocked=True, time_uids=uids)
+    return rules
+
+
+def test_blocked_mode_lets_only_xray_and_service_traffic_out():
+    """Нет нужного inbound'а в Xray, hold = "block": мимо VPN не уходит ничего, кроме
+    сокетов Xray (метка 2), служебного (DHCP, время) и связи с самим шлюзом и LAN."""
+    rules = _blocked(_cfg(), uids=(104,))
+    text = nft.render(rules)
+    assert text.startswith("table ip xgw\ndelete table ip xgw\ntable ip xgw {\n")
+    for chain in ("prerouting", "output", "loopback_guard", "containers"):
+        assert f"chain {chain} {{" not in text  # перехвата нет — и TPROXY тоже
+    assert "tproxy" not in text and "meta mark set" not in text
+    assert _chain(text, "block_output") == [
+        'oifname "lo" accept',
+        "meta mark 0x2 accept",
+        "ct direction reply accept",
+        "fib daddr type local accept",
+        "ip daddr @reserved4 meta l4proto != { tcp, udp } accept",
+        "ip daddr @reserved4 th dport != 53 accept",
+        "udp sport 68 udp dport 67 accept",
+        "meta skuid 104 udp dport 123 accept",
+        "meta skuid 104 tcp dport 4460 accept",
+        "meta l4proto tcp counter reject with tcp reset",
+        "counter reject with icmp type admin-prohibited",
+    ]
+    forward = _chain(text, "forward")
+    assert "type filter hook forward priority filter; policy drop;" in text
+    assert forward[-1] == 'iifname "lan0" counter reject with icmp type admin-prohibited'
+    assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
+    assert forward[-2] == 'iifname "lan0" meta l4proto tcp counter reject with tcp reset'
+    assert "masquerade" in _chain(text, "postrouting")[-1]  # обход VPN по-прежнему работает
+
+
+def test_blocked_keeps_established_only_for_bypass_devices():
+    """Сессии, открытые в режиме «снят», в blocked не доживают по записи conntrack."""
+    forward = _chain(nft.render(_blocked(_cfg())), "forward")
+    assert "ct state established,related accept" not in forward
+    assert 'iifname "lan0" ip saddr @bypass4 ct state established,related accept' in forward
+    assert 'oifname "lan0" ip daddr @bypass4 ct state established,related accept' in forward
+
+
+def test_blocked_rejects_containers_except_bypass_subnets():
+    """Без цепочки containers мосты Docker прошли бы правилом «чужой форвардинг»."""
+    text = nft.render(_blocked(_cfg()))
+    forward = _chain(text, "forward")
+    rejects = [rule for rule in forward if rule.startswith('iifname "docker0"')
+               or rule.startswith('iifname "br-*"')]
+    assert len(rejects) == 2
+    for rule in rejects:
+        assert 'oifname != "docker0" oifname != "br-*"' in rule  # между мостами — можно
+        assert "ct direction original" in rule  # ответы опубликованных портов идут
+        assert "ip daddr != @reserved4" in rule and "ip saddr != @bypass_containers" in rule
+        assert rule.endswith("counter reject with icmp type admin-prohibited")
+    # Отказ — раньше, чем «чужой форвардинг» успел бы их пропустить.
+    assert forward.index(rejects[-1]) < forward.index('iifname != "lan0" oifname != "lan0" accept')
+    assert "set bypass_containers {" in text
+    cfg = _cfg()
+    cfg.capture.containers = False  # контейнеры и в режиме on идут напрямую — не трогаем
+    assert 'iifname "docker0"' not in nft.render(_blocked(cfg))
+
+
+def test_blocked_without_lan_closes_the_machine_only():
+    rules = _blocked(Config())
+    assert not rules.empty
+    text = nft.render(rules)
+    assert "chain block_output {" in text and "chain forward {" in text  # контейнеры
+    assert "lan0" not in text and "chain postrouting {" not in text
+
+
+def test_v6_guard_with_ipv6_off_regardless_of_networkmanager():
+    """network.ipv6 = off: IPv6 машины держит фаервол, а не только настройка NetworkManager
+    (её нет, если WAN не под NetworkManager)."""
+    for capture in (True, False):  # и при включённом перехвате, и при снятом
+        rules, _ = nft.build_rules(_cfg(), capture=capture, time_uids=())
+        assert rules.v6_guard
+        guard = _chain(nft.render6(rules), "v6_guard")
+        assert guard[-2:] == ["meta l4proto tcp counter reject with tcp reset",
+                              "counter reject with icmpv6 type admin-prohibited"]
+    only_machine, _ = nft.build_rules(Config(), capture=True, time_uids=())
+    assert "chain v6_guard {" in nft.render6(only_machine)  # таблица нужна и без LAN
+    rules, _ = nft.build_rules(_proxy6(), capture=True, time_uids=())
+    assert not rules.v6_guard and "v6_guard" not in nft.render6(rules)  # IPv6 через Xray
+    rules, _ = nft.build_rules(_proxy6(), capture=False, blocked=True, time_uids=())
+    assert rules.v6_guard  # proxy, но перехват невозможен — IPv6 закрыт
+    lan_only = _cfg()
+    lan_only.capture.local = False  # машина не перехватывается — её IPv6 не наше дело
+    assert not nft.build_rules(lan_only, capture=True, time_uids=())[0].v6_guard
+
+
+def test_v6_guard_lets_xray_sockets_out():
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    guard = _chain(nft.render6(rules), "v6_guard")
+    assert guard[:2] == ['oifname "lo" accept', "meta mark 0x2 accept"]
+    assert "ip6 daddr { fe80::/10, ff00::/8 } accept" in guard
+    assert "ct direction reply accept" in guard
+
+
+def test_v6_guard_keeps_kernel_icmpv6():
+    """ND и ошибки ICMPv6 шлёт само ядро: без метки и бывает на глобальный адрес."""
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    guard = _chain(nft.render6(rules), "v6_guard")
+    icmp = [rule for rule in guard if rule.startswith("icmpv6 type")]
+    assert len(icmp) == 1 and icmp[0].endswith(" accept")
+    for kind in ("packet-too-big", "destination-unreachable", "nd-neighbor-solicit",
+                 "nd-neighbor-advert", "nd-router-advert"):
+        assert kind in icmp[0]
+    assert guard.index(icmp[0]) < guard.index("meta l4proto tcp counter reject with tcp reset")
+
+
+def test_both_families_load_in_one_transaction():
+    rules = _blocked(_cfg())
+    kernel = FakeKernel()
+    assert nft.apply(rules, kernel) == []
+    assert len(kernel.commands("nft", "-f", "-")) == 1
+    assert "block_output" in kernel.table and "v6_guard" in kernel.table6
+    assert kernel.loads[0].index("table ip xgw") < kernel.loads[0].index("table ip6 xgw6")
+
+
+def test_v6_guard_that_cannot_be_loaded_is_an_error():
+    """Без v6_guard IPv6 машины ушёл бы мимо VPN: ошибка, а не предупреждение."""
+    kernel = FakeKernel()
+    kernel.refuse_ip6 = True
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    with pytest.raises(CommandError):
+        nft.apply(rules, kernel)
+    assert kernel.tables == {}  # и таблица IPv4 не загружена: транзакция одна
 
 
 def test_rejected_rules_are_not_loaded():
@@ -459,3 +602,27 @@ def test_real_nft_accepts_rules(name):
             ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, timeout=30
         )
         assert done.returncode == 0, f"{done.stderr}\n{text}"
+
+
+def _blocked_variants():
+    full = _cfg(wan_if="wan0", bypass_hosts=["192.168.50.64/28"])
+    lan_only = _cfg()
+    lan_only.capture.local = False
+    return {
+        "blocked: шлюз": _cfg(),
+        "blocked: всё сразу": full,
+        "blocked: только эта машина": Config(),
+        "blocked: LAN без своей машины": lan_only,
+        "blocked: IPv6 машины": _proxy6(),
+    }
+
+
+@pytest.mark.skipif(not (_NFT and _ROOT), reason="нужны nft и root")
+@pytest.mark.parametrize("name", list(_blocked_variants()))
+def test_real_nft_accepts_blocked_rules_in_one_transaction(name):
+    rules = _blocked(_blocked_variants()[name], uids=(0,))
+    text = nft.render(rules) + nft.render6(rules)
+    done = subprocess.run(
+        ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, timeout=30
+    )
+    assert done.returncode == 0, f"{done.stderr}\n{text}"

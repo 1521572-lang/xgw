@@ -91,3 +91,21 @@ def test_paths_layout():
     assert paths.generated_config_file.parent == paths.xray_config_file.parent
     assert paths.generated_config_file != paths.xray_config_file
     assert paths.lock_file.parent == paths.run and paths.api_dirty_file.parent == paths.run
+
+
+def test_no_system_resolver_calls_in_xgw():
+    """XGW разрешает имена своим резолвером с меткой мимо VPN или через DNS Xray, а не
+    системным: в режиме blocked запросы resolved наружу отбиваются, и getaddrinfo оставил бы
+    демон без адресов подписок и серверов (VPN_IMPROVEMENT_PLAN.md, §2.1)."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "xgw"
+    pattern = re.compile(r"\b(getaddrinfo|gethostbyname(_ex)?|gethostbyaddr)\s*\(")
+    found = [
+        f"{path.relative_to(src)}:{number}"
+        for path in sorted(src.rglob("*.py"))
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line.split("#", 1)[0])
+    ]
+    assert found == []

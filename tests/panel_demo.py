@@ -252,7 +252,9 @@ class DemoCapture:
                 "bypass": lan.bypass_addresses(self.cfg)[0], "fail_mode": "closed",
                 "loaded": None,
                 "inbound_missing": DemoCapture.inbound_missing
-                if DemoCapture.mode_now == "on" else ""}
+                if DemoCapture.mode_now == "on" else "",
+                # capture.hold = "block" (по умолчанию): пока ждём inbound, трафик закрыт.
+                "blocked": bool(DemoCapture.inbound_missing) and DemoCapture.mode_now == "on"}
 
 
 class DemoDaemon:

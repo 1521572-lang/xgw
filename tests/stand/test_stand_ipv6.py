@@ -100,16 +100,17 @@ def test_gateway_ipv6_goes_through_vpn_and_dns_is_answered_by_xray(gateway):
     assert gateway.xgw("probe", "--all").returncode == 0  # пробы XGW с перехватом работают
 
 
-def test_ipv6_is_not_touched_when_it_is_not_proxied(tmp_path):
-    """ipv6 = off: правил перехвата IPv6 нет, трафик идёт напрямую — поэтому установка
-    и отключает IPv6 в профиле WAN. Тест фиксирует именно это положение дел."""
+def test_ipv6_is_not_captured_but_closed_when_it_is_not_proxied(tmp_path):
+    """ipv6 = off: правил перехвата IPv6 нет, а наружу IPv6 машины не выпускает v6_guard
+    (раньше он шёл напрямую, и держала его только установка, отключая IPv6 в профиле WAN)."""
     stand = _stand(tmp_path)
     try:
-        assert stand.exit_ip6("gw") == DIRECT6
+        assert stand.exit_ip6("gw") == ""
+        assert stand.exit_ip6("gw", "--mark", "2") == DIRECT6  # сам IPv6 на стенде работает
         assert stand.exit_ip("gw") == VIA_VPN
         assert _capture(stand)["ipv6"] is False
         table = _table6(stand)
-        assert "tproxy" not in table and "reserved6" not in table
+        assert "tproxy" not in table and "reserved6" not in table and "v6_guard" in table
         assert "fwmark" not in _v6_rules(stand)
         assert "tproxy-in6" not in stand.xray_log(60)
     finally:
@@ -195,7 +196,7 @@ def test_switching_to_proxy_blocks_ipv6_until_xray_listens_and_never_leaks(tmp_p
     слушателя), а не идёт мимо VPN; после `xgw apply --now` — через VPN."""
     stand = _stand(tmp_path)  # ipv6 = off
     try:
-        assert stand.exit_ip6("gw") == DIRECT6
+        assert stand.exit_ip6("gw") == ""  # закрыт v6_guard
         stand.write_config(capture=True, ipv6="proxy")
         assert stand.xgw("net", "up").returncode == 0
         assert "tproxy to [::1]:12345" in _table6(stand)
@@ -208,10 +209,28 @@ def test_switching_to_proxy_blocks_ipv6_until_xray_listens_and_never_leaks(tmp_p
         assert applied.returncode == 0, applied.stderr
         assert wait_for(lambda: stand.exit_ip6("gw") == VIA_VPN6, 30, step=1), stand.xray_log(30)
 
-        # И обратно: правила IPv6 исчезают, IPv6 снова идёт напрямую.
+        # И обратно: правила перехвата IPv6 исчезают, IPv6 снова закрыт (v6_guard).
         stand.write_config(capture=True, ipv6="off")
         assert stand.xgw("net", "up").returncode == 0
-        assert stand.exit_ip6("gw") == DIRECT6
+        assert stand.exit_ip6("gw") == "" and "v6_guard" in _table6(stand)
         assert "fwmark" not in _v6_rules(stand) and "tproxy" not in _table6(stand)
     finally:
         stand.stop()
+
+
+def test_host_ipv6_never_leaks_with_ipv6_off(tmp_path):
+    """network.ipv6 = "off", а глобальный IPv6 на WAN есть (на стенде его не выключает
+    NetworkManager — его там нет): IPv6 машины наружу не выпускает фаервол (v6_guard).
+    Сокеты Xray (метка mark_bypass) проходят; при снятом перехвате IPv6 тоже закрыт."""
+    stand = None
+    try:
+        stand = _stand(tmp_path, ipv6="off")
+        assert stand.exit_ip6("gw", "--mark", "2") == DIRECT6  # IPv6 на стенде работает
+        assert stand.exit_ip6("gw") == ""  # а без метки — нет: ни через VPN, ни напрямую
+        assert "chain v6_guard" in _table6(stand)
+        assert stand.exit_ip("gw") == VIA_VPN  # IPv4 машины — как всегда, через VPN
+        assert stand.xgw("disable").returncode == 0
+        assert stand.exit_ip6("gw") == "" and "chain v6_guard" in _table6(stand)
+    finally:
+        if stand is not None:
+            stand.stop()

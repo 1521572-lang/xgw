@@ -431,7 +431,7 @@ class Stand:
         panel: bool = False, subscription: bool = True,
         direct_domains: tuple[str, ...] = (), ipv6: str = "off", method: str = "tproxy",
         refresh_minutes: int = 1, containers: bool = True, proxy_domains: tuple[str, ...] = (),
-        probe_host: str = "", sticky: bool = False,
+        probe_host: str = "", sticky: bool = False, hold: str = "block",
     ) -> None:
         """Конфиг шлюза: подписка из файла, пробы на origin, interval 10 с, sampling 1.
 
@@ -476,6 +476,7 @@ lan = true
 local = true
 method = "{method}"
 fail_mode = "{fail_mode}"
+hold = "{hold}"
 containers = {"true" if containers else "false"}
 """
             direct_dns = f'["{netns.INET_DNS_IP}"]'

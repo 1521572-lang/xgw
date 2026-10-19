@@ -9,6 +9,9 @@
                      ходит к службам шлюза), forward только для обхода и ICMP;
   перехват снят    — xgw disable или fail_mode = open: обычный роутер, форвардинг
                      LAN → WAN с маскарадингом;
+  blocked          — перехват включить нельзя (в применённом конфиге Xray нет его
+                     inbound'а), capture.hold = "block": перехвата нет, и мимо VPN не
+                     уходит ничего, кроме сокетов Xray, служебного и обхода (bypass_hosts);
   без LAN и без перехвата — таблицы нет вовсе.
 
 Контейнеры Docker (capture.containers): их трафик приходит с мостов docker0 и br-* и
@@ -21,9 +24,10 @@ TPROXY для него не годится: Docker включает br_netfilter
 Ответы опубликованных портов контейнеров (ct direction reply) и адреса самой машины
 (маршрутом их в TUN не увести — таблица local главнее) в Xray не попадают.
 
-IPv6: по умолчанию `ip6 xgw6` только запрещает форвардинг IPv6 из LAN и в LAN.
-При network.ipv6 = "proxy" в ней же перехватывается IPv6 самой машины — теми же
-цепочками, что и IPv4 (output помечает, prerouting на lo отдаёт Xray через TPROXY).
+IPv6: `ip6 xgw6` запрещает форвардинг IPv6 из LAN и в LAN. При network.ipv6 = "proxy"
+в ней же перехватывается IPv6 самой машины — теми же цепочками, что и IPv4 (output
+помечает, prerouting на lo отдаёт Xray через TPROXY); при "off" цепочка v6_guard не
+выпускает IPv6 машины наружу. Обе таблицы загружаются одной транзакцией (apply).
 """
 
 from __future__ import annotations
@@ -89,6 +93,15 @@ class Rules:
     # Интерфейсы контейнеров (шаблоны имён), чей трафик тоже идёт в Xray; пусто — нет.
     containers: tuple[str, ...] = ()
     mark_containers: int = 3
+    # Режим blocked (capture.hold = "block", а перехват включить нельзя): перехвата нет,
+    # и мимо VPN не уходит ничего — ни из LAN, ни с машины, ни из контейнеров.
+    blocked: bool = False
+    block_lan: bool = False
+    block_local: bool = False
+    block_containers: tuple[str, ...] = ()
+    # IPv6 машины закрыт фаерволом (network.ipv6 = "off" или перехват невозможен), а не
+    # только настройкой NetworkManager, которой может и не быть.
+    v6_guard: bool = False
 
     @property
     def capture(self) -> bool:
@@ -111,8 +124,11 @@ class Rules:
 
     @property
     def empty(self) -> bool:
-        """Правил нет: ни LAN (форвардинг), ни перехвата."""
-        return not self.lan_if and not self.capture
+        """Правил нет: ни LAN (форвардинг), ни перехвата, ни блокировки."""
+        return (
+            not self.lan_if and not self.capture
+            and not self.block_local and not self.block_containers
+        )
 
 
 def time_service_uids() -> tuple[int, ...]:
@@ -132,9 +148,12 @@ def time_service_uids() -> tuple[int, ...]:
 
 
 def build_rules(
-    cfg: Config, *, capture: bool, time_uids: tuple[int, ...] | None = None
+    cfg: Config, *, capture: bool, blocked: bool = False,
+    time_uids: tuple[int, ...] | None = None,
 ) -> tuple[Rules, list[str]]:
-    """Параметры правил из конфига. capture=False — перехват снят (обычный роутер)."""
+    """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
+    blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked)."""
+    capture = capture and not blocked
     warnings: list[str] = []
     name = cfg.network.lan_if.strip()
     lan_if = lan.lan_interface(cfg)
@@ -197,6 +216,11 @@ def build_rules(
             tun_name=cfg.capture.tun_name,
             containers=CONTAINER_IFS if capture and containers_wanted(cfg) else (),
             mark_containers=cfg.capture.mark_containers,
+            blocked=blocked,
+            block_lan=blocked and cfg.capture.lan and bool(lan_if),
+            block_local=blocked and cfg.capture.local,
+            block_containers=CONTAINER_IFS if blocked and containers_wanted(cfg) else (),
+            v6_guard=cfg.capture.local and (blocked or not proxy6),
         ),
         warnings,
     )
@@ -240,6 +264,8 @@ def render(rules: Rules) -> str:
     """Текст для `nft -f`: полная замена таблицы `ip xgw`. Пусто — таблица не нужна."""
     if rules.empty:
         return ""
+    if rules.blocked:
+        return _table("ip", TABLE, _blocked_blocks(rules))
     lan_if, proxy, bypass = rules.lan_if, f"{rules.mark_proxy:#x}", f"{rules.mark_bypass:#x}"
     out = f'oifname "{rules.wan_if}"' if rules.wan_if else f'oifname != "{lan_if}"'
     blocks: list[list[str]] = [_set("reserved4", rules.reserved)]
@@ -360,7 +386,12 @@ def render(rules: Rules) -> str:
             )
         )
 
-    lines = [f"table ip {TABLE}", f"delete table ip {TABLE}", f"table ip {TABLE} {{"]
+    return _table("ip", TABLE, blocks)
+
+
+def _table(family: str, name: str, blocks: list[list[str]]) -> str:
+    """Полная замена таблицы одной транзакцией: «создать, удалить, создать»."""
+    lines = [f"table {family} {name}", f"delete table {family} {name}", f"table {family} {name} {{"]
     for index, block in enumerate(blocks):
         if index:
             lines.append("")
@@ -369,10 +400,94 @@ def render(rules: Rules) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _blocked_blocks(rules: Rules) -> list[list[str]]:
+    """`ip xgw` в режиме blocked: перехвата нет, и мимо VPN уходит только то, что ушло бы
+    мимо него и при включённом перехвате, — сокеты Xray (метка mark_bypass), служебное
+    машины (DHCP-клиент, время), связь с самим шлюзом и LAN, устройства из bypass_hosts.
+    Остальное отбивается сразу (reject), а не висит до таймаута."""
+    lan_if, bypass = rules.lan_if, f"{rules.mark_bypass:#x}"
+    out = f'oifname "{rules.wan_if}"' if rules.wan_if else f'oifname != "{lan_if}"'
+    reject = "counter reject with icmp type admin-prohibited"
+    blocks: list[list[str]] = [_set("reserved4", rules.reserved)]
+    if lan_if:
+        blocks.append(_set("bypass4", rules.bypass))
+    if rules.block_containers:
+        blocks.append(_set("bypass_containers", ()))  # [capture] containers_bypass — Ф4
+    if rules.block_local:
+        output = [
+            'oifname "lo" accept',
+            f"meta mark {bypass} accept",  # сокеты Xray/sing-box и прямые запросы XGW
+            "ct direction reply accept",  # ответы на входящие (SSH на шлюз, панель)
+            "fib daddr type local accept",
+            "ip daddr @reserved4 meta l4proto != { tcp, udp } accept",  # ping в LAN и т. п.
+            "ip daddr @reserved4 th dport != 53 accept",  # LAN, link-local, multicast
+            "udp sport 68 udp dport 67 accept",  # DHCP-клиент WAN
+        ]
+        for uid in rules.time_uids:
+            output.append(f"meta skuid {uid} udp dport 123 accept")
+            output.append(f"meta skuid {uid} tcp dport {NTS_KE_PORT} accept")
+        output += ["meta l4proto tcp counter reject with tcp reset", reject]
+        blocks.append(_chain(
+            "block_output", "type filter hook output priority filter; policy accept;", output
+        ))
+    forward: list[str] = []
+    # Контейнеры: в режиме on их уводит в TUN цепочка containers, а здесь её нет — без этих
+    # правил мост → WAN прошёл бы правилом «чужой форвардинг» ниже. Между мостами, в частные
+    # сети (как и в режиме on) и ответы опубликованных портов (ct reply) — можно.
+    bridges = " ".join(f'oifname != "{name}"' for name in rules.block_containers)
+    for name in rules.block_containers:
+        forward.append(
+            f'iifname "{name}" {bridges} ct direction original ip daddr != @reserved4 '
+            f"ip saddr != @bypass_containers {reject}"
+        )
+    if lan_if:
+        forward += [
+            f'iifname != "{lan_if}" oifname != "{lan_if}" accept',  # libvirt и т. п.
+            "tcp flags syn tcp option maxseg size set rt mtu",
+        ]
+        if rules.block_lan:
+            forward += [
+                # Установленные соединения — только у тех, кому обход разрешён: сессии,
+                # открытые при снятом перехвате, по записи conntrack не доживают.
+                f'iifname "{lan_if}" ip saddr @bypass4 ct state established,related accept',
+                f'oifname "{lan_if}" ip daddr @bypass4 ct state established,related accept',
+                f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept',
+                # TCP — сбросом: и открытая раньше сессия обрывается сразу, а не висит.
+                f'iifname "{lan_if}" meta l4proto tcp counter reject with tcp reset',
+                f'iifname "{lan_if}" {reject}',
+            ]
+        else:  # LAN в конфиге не перехватывается — и в режиме on он ходит напрямую
+            forward += [
+                "ct state established,related accept",
+                f'iifname "{lan_if}" {out} counter accept',
+            ]
+    if forward:
+        policy = "drop" if lan_if else "accept"
+        blocks.append(_chain(
+            "forward", f"type filter hook forward priority filter; policy {policy};", forward
+        ))
+    if lan_if:
+        if rules.dns_direct:
+            who = "ip saddr @bypass4 " if rules.block_lan else ""
+            blocks.append(_chain(
+                "dns_direct",
+                "type nat hook prerouting priority dstnat; policy accept;",
+                [f'iifname "{lan_if}" {who}meta l4proto {{ tcp, udp }} th dport 53 '
+                 f"fib daddr type local counter dnat to {rules.dns_direct}"],
+            ))
+        blocks.append(_chain(
+            "postrouting",
+            "type nat hook postrouting priority srcnat; policy accept;",
+            [f'iifname "{lan_if}" {out} counter masquerade'],
+        ))
+    return blocks
+
+
 def render6(rules: Rules) -> str:
     """`ip6 xgw6`: IPv6 из LAN и в LAN не форвардится; при ipv6 = "proxy" ещё и
-    перехват IPv6 самой машины. Пусто — без LAN и без перехвата IPv6."""
-    if not rules.lan_if and not rules.capture6:
+    перехват IPv6 самой машины, при ipv6 = "off" — v6_guard: IPv6 машины наружу закрыт.
+    Пусто — без LAN, без перехвата IPv6 и без v6_guard."""
+    if not rules.lan_if and not rules.capture6 and not rules.v6_guard:
         return ""
     blocks: list[list[str]] = []
     if rules.capture6:
@@ -418,6 +533,28 @@ def render6(rules: Rules) -> str:
                 [f"meta mark {bypass} ip6 daddr ::1 counter reject"],
             )
         )
+    if rules.v6_guard:
+        # IPv6 машины наружу закрыт: при network.ipv6 = "off" его иначе держала бы только
+        # настройка NetworkManager, а WAN может быть и не под ним. Сокеты Xray (метка),
+        # служебный ICMPv6 самого ядра (ответы ND, ошибки — без метки и бывает на
+        # глобальный адрес), link-local и multicast (ND, RA, DHCPv6-клиент) — можно.
+        blocks.append(
+            _chain(
+                "v6_guard",
+                "type filter hook output priority filter; policy accept;",
+                [
+                    'oifname "lo" accept',
+                    f"meta mark {rules.mark_bypass:#x} accept",
+                    "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, "
+                    "parameter-problem, nd-router-solicit, nd-router-advert, "
+                    "nd-neighbor-solicit, nd-neighbor-advert } accept",
+                    "ip6 daddr { fe80::/10, ff00::/8 } accept",
+                    "ct direction reply accept",
+                    "meta l4proto tcp counter reject with tcp reset",
+                    "counter reject with icmpv6 type admin-prohibited",
+                ],
+            )
+        )
     if rules.lan_if:
         blocks.append(
             _chain(
@@ -426,13 +563,7 @@ def render6(rules: Rules) -> str:
                 [f'iifname "{rules.lan_if}" drop', f'oifname "{rules.lan_if}" drop'],
             )
         )
-    lines = [f"table ip6 {TABLE6}", f"delete table ip6 {TABLE6}", f"table ip6 {TABLE6} {{"]
-    for index, block in enumerate(blocks):
-        if index:
-            lines.append("")
-        lines.extend(f"    {line}" for line in block)
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+    return _table("ip6", TABLE6, blocks)
 
 
 def _delete_text(family: str, table: str) -> str:
@@ -449,19 +580,20 @@ def check(text: str, runner: Runner) -> None:
 
 
 def apply(rules: Rules, runner: Runner) -> list[str]:
-    """Загружает правила (или убирает таблицы, если правил нет). Возвращает
-    предупреждения: таблица IPv6 не обязательна — IPv6 в ядре может быть выключен."""
-    warnings: list[str] = []
+    """Загружает правила (или убирает таблицы, если правил нет) — обе таблицы одной
+    транзакцией: между ними правила IPv4 и IPv6 не расходятся. Возвращает предупреждения:
+    таблица IPv6 не обязательна — IPv6 в ядре может быть выключен; тогда IPv4 загружается
+    отдельно. Обязательна она, когда IPv6 машины проксируется или закрыт (v6_guard)."""
     text = render(rules) or _delete_text("ip", TABLE)
     check(text, runner)
-    runner(["nft", "-f", "-"], input=text)
     try:
-        runner(["nft", "-f", "-"], input=render6(rules) or _delete_text("ip6", TABLE6))
+        runner(["nft", "-f", "-"], input=text + (render6(rules) or _delete_text("ip6", TABLE6)))
     except CommandError as exc:
-        if rules.capture6:
-            raise  # IPv6 проксируется: без этих правил он ушёл бы мимо перехвата
-        warnings.append(f"таблица ip6 {TABLE6} не загружена: {exc}")
-    return warnings
+        if rules.capture6 or rules.v6_guard:
+            raise  # без этих правил IPv6 машины ушёл бы мимо VPN
+        runner(["nft", "-f", "-"], input=text)
+        return [f"таблица ip6 {TABLE6} не загружена: {exc}"]
+    return []
 
 
 def delete(runner: Runner) -> None:
