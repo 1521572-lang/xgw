@@ -48,6 +48,12 @@ UNIT_FILES = (
 )
 XRAY_USER = "xray"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
+# Сколько systemd ждёт остановки демона (TimeoutStopSec в packaging/xgw.service), и сколько
+# ждут его перезапуска установка и удаление: дольше, с запасом на запуск. Демон, занятый
+# шагом, останавливается не мгновенно, и медленная, но нормальная остановка не должна
+# выглядеть как сбой (отчёт 0.1.15, Д2: 79 с при прежнем ожидании 60 с).
+DAEMON_STOP_TIMEOUT = 90.0
+DAEMON_STOP_WAIT = DAEMON_STOP_TIMEOUT + 30.0
 EXAMPLE_URL = "example.com/sub/TOKEN"  # подписка из config.example.toml
 
 LAUNCHER = '''#!/usr/bin/python3 -I
@@ -493,6 +499,9 @@ class Installer:
             self.out("Отменено, в системе ничего не изменено.")
             return 1
 
+        # Установка поверх работающей (прошлая дошла до конца и не откатывалась): дом уже
+        # ходит в интернет через этот шлюз, и откат к состоянию до XGW оставил бы его без сети.
+        reinstall = "finished" in self.journal
         self.paths.ensure()
         self.journal.setdefault("started", time.time())
         # Метки и таблица — чтобы удаление нашло правила и без config.toml.
@@ -512,6 +521,15 @@ class Installer:
             xray_ok = self._network(facts, assume_yes)
         except (InstallError, cmd.CommandError, CaptureError, OSError) as exc:
             self.out(f"✗ настройка сети не удалась: {exc}")
+            if reinstall:
+                self.out(
+                    "XGW уже был установлен и работал, поэтому сеть не откатываю: откат убрал "
+                    "бы шлюз, и устройства остались бы без интернета. Профиль LAN, DHCP и "
+                    "правила остаются как есть. Исправьте причину и запустите установку "
+                    "снова; вернуть прямой интернет — sudo xgw disable, убрать XGW — "
+                    "sudo xgw uninstall."
+                )
+                return 1
             self.out("Возвращаю сеть в исходное состояние…")
             from .uninstall import Uninstaller
 
@@ -708,12 +726,27 @@ class Installer:
         self._capture(xray_ok)
         if self.cfg.panel.enabled:
             self._panel()
-        self.runner(["systemctl", "restart", "xgw.service"], timeout=60.0)
-        self._step("демон xgw запущен")
+        self._daemon()
         if self.cfg.status.lan_page and facts.lan_if:
             self._token()
         self.journal.set("finished", time.time())
         return xray_ok
+
+    def _daemon(self) -> None:
+        """Запуск (при повторной установке — перезапуск) демона. Сеть LAN, DHCP, правила и
+        Xray к этому времени на месте и без демона работают, поэтому его сбой —
+        предупреждение, а не повод откатывать установку (отчёт 0.1.15, Д1): клиент
+        systemctl не дождался — задание systemd идёт дальше, служба не запустилась —
+        systemd (Restart=always) попробует снова."""
+        try:
+            self.runner(["systemctl", "restart", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+        except cmd.CommandError as exc:
+            self._warn(
+                f"демон xgw пока не запущен ({exc}). Сеть, DHCP и перехват работают и без "
+                "него, systemd запустит его сам; проверка — sudo xgw status через минуту"
+            )
+            return
+        self._step("демон xgw запущен")
 
     def _sleep_back(self) -> None:
         """Роутера больше нет или disable_sleep = false: маска, поставленная прошлой

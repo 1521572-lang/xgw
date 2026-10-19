@@ -1,7 +1,8 @@
 """Скан запасных серверов: probe.url через probe-inbound каждого spare-*.
 
 Классы (раздел 6.8): OK, SLOW, FROZEN (часть тела, затем тишина — фиксируем
-число байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT.
+число байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT. Служебный CANCELLED — проба
+прервана остановкой демона; в базу он не попадает.
 
 Запасные лимитированных подписок проверяются дешёвым запросом (cheap_url, обычно
 probe.trace_url — сотни байт вместо 57 КБ): каждый байт через такой сервер тратит квоту,
@@ -12,6 +13,7 @@ probe.trace_url — сотни байт вместо 57 КБ): каждый ба
 from __future__ import annotations
 
 import random
+import threading
 import time
 from dataclasses import dataclass
 
@@ -49,6 +51,8 @@ class ScanResult:
 
 
 def classify(result: DownloadResult, seconds: float, slow: float = SLOW_SECONDS) -> str:
+    if result.kind == "cancelled":
+        return "CANCELLED"
     if result.ok:
         return "SLOW" if seconds > slow else "OK"
     if result.frozen:
@@ -70,11 +74,13 @@ def scan_node(
     probe_user: str = PROBE_USER,
     url: str | None = None,
     silence: float = 5.0,
+    cancel: threading.Event | None = None,
 ) -> ScanResult:
     """Проба одного узла через его probe-inbound (127.0.0.1:<probe_port>).
 
     probe_pass — пароль из применённого конфига (builder.probe_state): у
-    работающего Xray действует именно он.
+    работающего Xray действует именно он. cancel — демон останавливается: проба
+    прерывается, вердикт CANCELLED (о сервере он ничего не говорит, не записывается).
     """
     started = time.monotonic()
     result = http_get_via_proxy(
@@ -86,6 +92,7 @@ def scan_node(
         proxy_user=probe_user,
         proxy_pass=probe_pass,
         user_agent=cfg.probe.user_agent,
+        cancel=cancel,
     )
     seconds = time.monotonic() - started
     return ScanResult(

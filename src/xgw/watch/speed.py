@@ -18,6 +18,7 @@ speed.max_seconds; скорость считается по телу ответ�
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 from ..config import Config
@@ -55,11 +56,12 @@ def size_mb(cfg: Config, price: float) -> float:
 
 def measure(
     node: NodeInfo, cfg: Config, *, probe_pass: str, probe_user: str = PROBE_USER,
-    max_mb: float | None = None,
+    max_mb: float | None = None, cancel: threading.Event | None = None,
 ) -> SpeedResult:
     """Замер через probe-inbound узла. Основной адрес ответил ошибкой HTTP (например, 403
     выходу этого сервера) — пробуется запасной speed.url_fallback. max_mb — предел загрузки
-    (size_mb); по умолчанию speed.max_mb."""
+    (size_mb); по умолчанию speed.max_mb. cancel — демон останавливается: замер прерывается
+    (ошибка, mbps None), записывать его не нужно."""
     limit = cfg.speed.max_mb if max_mb is None else max_mb
     urls = [url for url in (cfg.speed.url, cfg.speed.url_fallback) if url]
     result = None
@@ -69,6 +71,7 @@ def measure(
             timeout=15.0, silence=5.0, proxy_user=probe_user, proxy_pass=probe_pass,
             max_total=cfg.speed.max_seconds + 20.0, user_agent=cfg.probe.user_agent,
             max_bytes=int(limit * MB), max_body_seconds=float(cfg.speed.max_seconds),
+            cancel=cancel,
         )
         if result.ok or result.kind != "http" or index == len(urls) - 1:
             break

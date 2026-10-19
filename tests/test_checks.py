@@ -289,8 +289,9 @@ def tls_files(tmp_path_factory):
 
 
 class TlsOrigin(threading.Thread):
-    def __init__(self, cert, key, script: list):
+    def __init__(self, cert, key, script: list, delay: float = 0.0):
         super().__init__(daemon=True)
+        self.delay = delay  # пауза перед рукопожатием TLS
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(str(cert), str(key))
         self.script = script
@@ -310,6 +311,7 @@ class TlsOrigin(threading.Thread):
 
     def _serve(self, conn: socket.socket):
         try:
+            time.sleep(self.delay)
             tls = self.context.wrap_socket(conn, server_side=True)
             tls.recv(65536)
             for step in self.script:
@@ -413,3 +415,68 @@ def test_scan_sends_probe_user_agent_and_keeps_the_failure_kind(serve):
     assert b"User-Agent: ProbeAgent/9\r\n" in server.requests[0]
     assert (result.verdict, result.kind, result.status, result.error) == (
         "CONNECT_FAIL", "http", 403, "HTTP 403")
+
+
+# --- прерывание остановкой демона (отчёт 0.1.15, Д2) ------------------------------
+
+
+def _cancel_after(seconds: float) -> threading.Event:
+    cancel = threading.Event()
+    timer = threading.Timer(seconds, cancel.set)
+    timer.daemon = True
+    timer.start()
+    return cancel
+
+
+@pytest.mark.parametrize(
+    ("script", "url"),
+    [
+        ([5.0], "https://origin.example.com/"),  # прокси молчит в ответ на CONNECT
+        # Туннель открыт, а сервер не отвечает на ClientHello: так на машине скан ждал 15 с.
+        ([ConnectProxy.REPLY, 5.0], "https://origin.example.com/"),
+        ([5.0], URL),  # нет заголовков ответа
+        ([HEADERS + b"x" * 1024, 5.0], URL),  # тело остановилось
+    ],
+    ids=["connect", "tls", "headers", "body"],
+)
+def test_cancel_interrupts_every_wait(serve, script, url):
+    server = serve(*script)
+    started = time.monotonic()
+    result = http_get_via_proxy(
+        "127.0.0.1", server.port, url, timeout=4, silence=4, cancel=_cancel_after(0.3)
+    )
+    assert time.monotonic() - started < 2
+    assert not result.ok and result.kind == "cancelled" and not result.stalled
+    assert classify(result, 0.3) == "CANCELLED"
+
+
+def test_cancelled_probe_does_not_even_connect(serve):
+    server = serve(HEADERS + b"x" * BODY)
+    cancel = threading.Event()
+    cancel.set()
+    result = _get(server, cancel=cancel)
+    assert result.kind == "cancelled"
+    time.sleep(0.2)
+    assert server.requests == []
+
+
+def test_cancel_that_never_comes_changes_nothing(serve):
+    """Ожидание кусками не ломает детектор тишины."""
+    result = _get(serve(HEADERS, 3.0), cancel=threading.Event())
+    assert result.stalled and result.kind == "stall"
+    assert classify(result, 5.0) == "STALL_BEFORE_BODY"
+
+
+def test_https_waits_longer_than_a_slice_with_a_cancel_event(tls_files):
+    """Рукопожатие TLS и тело, которые ждут дольше куска ожидания (CANCEL_SLICE),
+    продолжаются с того места, где ждали данных."""
+    cert, key = tls_files
+    origin = TlsOrigin(cert, key, [HEADERS + b"x" * 1024, 1.2, b"x" * (BODY - 1024)], delay=1.2)
+    proxy = ConnectProxy(origin.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big",
+        timeout=5, silence=3, tls_context=ssl.create_default_context(cafile=str(cert)),
+        cancel=threading.Event(),
+    )
+    assert result.ok, result.error
+    assert result.downloaded == BODY

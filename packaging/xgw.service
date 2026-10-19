@@ -10,6 +10,9 @@ ConditionPathExists=/etc/xgw/config.toml
 ExecStart=/usr/local/bin/xgw run
 Restart=always
 RestartSec=5
+# Остановка прерывает текущий шаг демона, но уже начатое применение конфига доводится до
+# конца. Установка ждёт перезапуска дольше (install.DAEMON_STOP_WAIT).
+TimeoutStopSec=90
 RuntimeDirectory=xgw
 RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
