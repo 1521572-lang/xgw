@@ -91,6 +91,10 @@ table ip xgw {
         type ipv4_addr
         flags interval
     }
+    set bypass_containers {                       # [capture] containers_bypass (Ф4)
+        type ipv4_addr
+        flags interval
+    }
 
     # Машина: наружу — только Xray (метка 2) и служебное; остальное отбивается.
     chain block_output {
@@ -108,12 +112,20 @@ table ip xgw {
         counter reject with icmp type admin-prohibited
     }
 
-    # LAN: мимо VPN — только устройства из bypass4, как в режиме on.
+    # LAN и контейнеры: мимо VPN — только bypass4 и bypass_containers, как в режиме on.
     chain forward {
         type filter hook forward priority filter; policy drop;
-        iifname != "lan0" oifname != "lan0" accept      # чужой форвардинг (Docker, libvirt)
+        # Контейнеры: в режиме on их уводит в TUN цепочка containers (метка 3), а здесь её нет —
+        # без этих правил docker0 → WAN прошёл бы правилом «чужой форвардинг» ниже. Между
+        # мостами и внутри моста — можно. Список мостов — nft.CONTAINER_IFS (nft.py:62).
+        iifname "docker0" oifname != "docker0" oifname != "br-*" ip saddr != @bypass_containers counter reject with icmp type admin-prohibited
+        iifname "br-*" oifname != "docker0" oifname != "br-*" ip saddr != @bypass_containers counter reject with icmp type admin-prohibited
+        iifname != "lan0" oifname != "lan0" accept      # чужой форвардинг (libvirt, контейнеры между собой)
         tcp flags syn tcp option maxseg size set rt mtu
-        ct state established,related accept
+        # Установленные соединения — только у тех, кому обход разрешён: сессии, открытые в
+        # режиме off/open, в blocked не доживают по записи conntrack.
+        iifname "lan0" ip saddr @bypass4 ct state established,related accept
+        oifname "lan0" ip daddr @bypass4 ct state established,related accept
         iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept
         iifname "lan0" counter reject with icmp type admin-prohibited
     }
@@ -137,6 +149,7 @@ table ip6 xgw6 {
     chain v6_guard {
         type filter hook output priority filter; policy accept;
         oifname "lo" accept
+        meta mark 0x2 accept                        # сокеты Xray к серверам с адресом IPv6
         ip6 daddr { fe80::/10, ff00::/8 } accept   # ND, RA, DHCPv6-клиент (ff02::1:2)
         ct direction reply accept
         meta l4proto tcp counter reject with tcp reset
@@ -156,6 +169,18 @@ table ip6 xgw6 {
   `ff00::/8`, а ULA `fc00::/7` перехватывается, если не указан в `capture.exclude_cidrs`.
 - В режиме blocked нет ни `prerouting`, ни `output` с меткой 1: маршрут `fwmark 1 → table 100`
   остаётся (`iprule.py:127-135`) и вреда не делает.
+- DNS в blocked: самому XGW он не нужен. Адреса серверов Xray разрешает своим DNS
+  (`sockopt.domainStrategy = "UseIPv4"`, `builder.py:516`), служебные запросы XGW — свой
+  резолвер с меткой 2, `getaddrinfo` в коде нет. Остальные программы машины в blocked остаются
+  без DNS: запросы resolved наружу идут без метки и отбиваются. Так и задумано — это утечка, а
+  не служебный трафик. Инвариант для Ф1 — юнит-тест, который ищет по исходникам `src/xgw`
+  вызовы `getaddrinfo`/`gethostbyname` и падает, если они появились.
+- Сессии, открытые до перехода: в forward установленные соединения пропускаются только для
+  `@bypass4` (шаблон выше), у машины — только ответы (`ct direction reply`). Поэтому после
+  перехода из off/open в blocked старые соединения обрываются с ICMP admin-prohibited. В
+  режиме on этого не нужно: TPROXY в prerouting стоит раньше forward и уводит пакеты старых
+  соединений в Xray. Сброс conntrack не используется: утилиты `conntrack` в Ubuntu по умолчанию
+  нет.
 - Проверка шаблона без ядра хоста: `unshare -n nft -c -f blocked.nft`. Тест — `nft.check` в
   `tests/test_nft.py` на FakeKernel и стенд (§3, Ф1).
 
@@ -204,6 +229,10 @@ def available(runner: Runner) -> bool:
   `_load("on")` при `rules.tun` — `bind_link`; `_load("off"|"blocked")` и `down()` —
   `revert_link` (ошибки глушатся: линка может уже не быть).
 - Если resolved не запущен (`available` = False) — ничего не делается: остаётся перехват порта 53.
+- В режиме TUN в цепочку `output` (`nft.py:295`) первым правилом ставится
+  `oifname "<tun_name>" return`. Тогда запрос, который resolved уже отправил в TUN
+  (`SO_BINDTOIFINDEX`), не получает метку 1 и не маршрутизируется второй раз по таблице 100.
+  Доставку это не меняет (таблица 100 ведёт в тот же TUN), а лишний проход убирает.
 - Ни `/etc/resolv.conf`, ни `/etc/systemd/resolved.conf` не меняются.
 
 ### 2.3 Жизненный цикл перехвата и события
@@ -248,27 +277,39 @@ class NetEvents:
     def stop(self) -> None: ...
 
 SOURCES = {
-    "net":   ["ip", "-j", "-o", "monitor", "link", "address", "route"],
+    "net":   ["ip", "-o", "monitor", "link", "address", "route"],   # текст: -j здесь не действует
     "sleep": ["busctl", "--system", "monitor", "--json=short",
               "--match=type='signal',interface='org.freedesktop.login1.Manager',"
               "member='PrepareForSleep'"],
-    "rules": ["nft", "monitor", "tables"],
+    "rules": ["nft", "monitor"],   # без фильтра: `monitor tables` не видит flush table и правил
 }
 ```
 
+- Чтение — обычный пайп (`stdout=subprocess.PIPE`, построчно). Проверено в одноразовой netns на
+  Ubuntu 26.04 (nftables 1.1.6, iproute2, systemd `busctl`): все три программы отдают каждое
+  событие сразу, без буферизации, так что псевдотерминал и `stdbuf` не нужны. Тест Ф2 закрепляет
+  это: событие доходит до читателя ≤ 1 с, пока подпроцесс ещё работает.
 - `wake(reason)` выставляет `Daemon.wake_reason` и `poke.set()`. Повторы гасятся окном 2 с
   (debounce: смена Wi-Fi даёт десятки строк `ip monitor`).
+- `ip -o monitor` печатает по строке на событие. В разбор идут строки с `Deleted`, `state DOWN`,
+  `state UP`, а также добавление и удаление маршрута `default`. Строки по `lo`, `xgwtun0` и мостам
+  контейнеров не учитываются.
 - **net** — внеочередной шаг: `_check_provider`, `_guard_capture`, `restore_tun`. При выходе из
   WAN_DOWN — сразу e2e, а не через 60 с.
 - **sleep** — `PrepareForSleep false` (пробуждение): внеочередной шаг. На нём — `capture.up()`
   (правила и маршруты TUN), e2e, затем скан запасных (`scan_queue` целиком — auto-reconnect после
   сна) и обновление подписок, если `refresh_minutes` прошли во сне.
-- **rules** — строка `delete table ip xgw` или `delete table ip6 xgw6`, которую выполнил не
-  XGW: внеочередной `_guard_capture`. Окно утечки после чужого `flush ruleset` сжимается с
-  `interval_s` до долей секунды. Свои загрузки XGW помечает флагом в `Capture`: на них события не
-  реагируют.
-- Если программы нет (`busctl` и `nft` есть всегда; `ip -j` есть в iproute2 ≥ 4.13), источник
-  пропускается с предупреждением в журнале.
+- **rules** — строка `nft monitor`, которая начинается с `delete` или `flush` и касается таблиц
+  `ip xgw` / `ip6 xgw6`: `delete table`, `flush table`, `delete chain`, `delete rule`, а также
+  `flush ruleset`. На неё — внеочередной `_guard_capture`. Окно утечки после чужого
+  `flush ruleset` сжимается с `interval_s` до долей секунды.
+  Свои загрузки не должны будить демон зря. Булев флаг не годится: события netlink приходят
+  асинхронно, уже после того как `nft -f` вернулся, и флаг успеет сброситься. Поэтому
+  `Capture` после каждого `nft.apply` ставит `ignore_rules_until = time.monotonic() + 1.0`.
+  Событие в этом окне пропускается, а вне окна перед перезагрузкой всё равно проверяется
+  `capture.loaded()`: если правила на месте, ничего не делается.
+- Если программы нет (`busctl`, `nft` и `ip` есть в любой установке), источник пропускается с
+  предупреждением в журнале.
 
 **Ф2б (можно отложить): канал CLI → демон.** `/run/xgw/control.sock` (`AF_UNIX`, `SOCK_STREAM`,
 права 0600, проверка `SO_PEERCRED`: uid 0), по строке JSON на запрос:
@@ -291,10 +332,10 @@ def run(cfg: Config, paths: Paths, runner: Runner = cmd.run) -> list[diag.Check]
 
 | Проверка | Как | FAIL / WARN |
 |---|---|---|
-| PMTU до сервера | `ping -M do -m 0x2 -c 1 -W 2 -s N <адрес основного сервера>` для N = 1472, 1464, 1452, 1412 (`-m` — метка мимо VPN) | WARN, если 1472 не проходит: «путь до сервера меньше 1500 (PPPoE?) — mtu на TUN …» |
+| PMTU до сервера | Сначала контрольный `ping -m 0x2 -c 2 -W 2 -s 56 <адрес основного сервера>`: не прошёл — сервер не отвечает на ICMP, проверка пропускается (OK «ICMP на сервере закрыт, PMTU не проверен»). Прошёл — `ping -M do -m 0x2 -c 1 -W 2 -s N` для N = 1472, 1464, 1452, 1412 (`-m` — метка мимо VPN) | WARN, только если контрольный прошёл, а 1472 — нет: «путь до сервера меньше 1500 (PPPoE?) — …» |
 | UDP напрямую | STUN Binding Request на `stun.l.google.com:19302` из сокета с `SO_MARK = mark_bypass` | WARN: «провайдер режет UDP — hysteria2 и TUIC работать не будут» |
 | UDP через VPN | тот же запрос без метки, если `capture.local`; иначе через `socks-in` (UDP ASSOCIATE) | FAIL при on/connected |
-| Утечка DNS | TXT `o-o.myaddr.l.google.com` к 8.8.8.8: без метки (должен уйти в туннель) и с `mark_bypass` (напрямую); сравнить адреса резолверов в ответах | FAIL, если без метки ответил тот же резолвер, что напрямую |
+| Утечка DNS | A-запрос `example.com` без метки на заведомо недостижимый адрес `192.0.2.53:53` (TEST-NET-1). Перехват порта 53 уводит его в Xray `dns-out`, и тот отвечает своим DNS; ушедший мимо запрос до TEST-NET не дойдёт. Только тип A: TXT-проверки вроде `o-o.myaddr.l.google.com` не годятся — `dns-out` по умолчанию отбрасывает запросы не A/AAAA (`nonIPQuery`; на Xray 26.10.10 проверить до кода) | ответ пришёл — OK; тайм-аут при connected — FAIL «DNS машины уходит мимо Xray» |
 | Утечка IPv6 | при `network.ipv6 = "off"` — TCP-connect к `[2606:4700:4700::1111]:443` без метки | FAIL, если соединение установилось |
 | Чужие правила | `nft -j list ruleset`: таблицы с `policy drop` в forward (Docker без `DOCKER-USER`), включённый `nftables.service` с `flush ruleset` в `/etc/nftables.conf`, цепочки ufw | WARN с готовой командой |
 | rp_filter | `net.ipv4.conf.{all,<wan>,<tun>}.rp_filter` | перенести из `diag.py:425-433` |
@@ -324,9 +365,30 @@ Watchdog ничего из этого не запускает: это разов
      → systemd-run --scope --slice=xgwdirect.slice --uid=$SUDO_UID --gid=$SUDO_GID --same-dir --collect -- …
    ```
 
-   nft переводит путь cgroup в inode при загрузке: если slice нет, вся транзакция падает. Поэтому
-   `Capture._load` перед загрузкой вызывает `systemctl start xgwdirect.slice`, а если slice так и не
-   появился (`/sys/fs/cgroup/xgwdirect.slice` нет) — правило не ставится, с предупреждением.
+   nft переводит путь cgroup в inode при загрузке: если slice нет, вся транзакция падает. Отсюда
+   три правила.
+   - **Правило только при существующем slice.** `Rules.direct_slice` заполняется, лишь когда
+     есть `/sys/fs/cgroup/xgwdirect.slice`; иначе правила нет, и программы из `direct-run` идут
+     через VPN. Это безопасная сторона.
+   - **Slice запускает демон, а не `xgw-net`.** `xgw-net.service` работает до `network-pre.target`
+     и slice не запускает вовсе. Запуск — в `xgw.service` при старте:
+     `systemctl start --no-block xgwdirect.slice`; затем внеочередной `capture.up()` добавляет
+     правило. Значит, при загрузке машины правило появляется через секунды после `xgw-net`.
+   - **Unit `packaging/xgwdirect.slice`:**
+
+     ```ini
+     [Unit]
+     Description=XGW: программы мимо VPN (xgw direct-run)
+     DefaultDependencies=no
+     Before=shutdown.target
+     Conflicts=shutdown.target
+     ```
+
+     У slice-юнитов и с зависимостями по умолчанию ожидания `sysinit`/`basic` нет, поэтому
+     взаимоблокировки с ранней загрузкой не возникает. `DefaultDependencies=no` здесь —
+     страховка. Запущенный slice systemd не выгружает ни пустым, ни после `daemon-reload`.
+     Создавать каталог в `/sys/fs/cgroup` напрямую (`os.mkdir`) нельзя: этим деревом владеет
+     systemd.
    Выражение `socket cgroupv2` требует модуля ядра `nft_socket`. В штатных ядрах Ubuntu он есть,
    но в урезанных ядрах встречается его отсутствие: `nft` тогда отвечает «Could not process
    rule: No such file or directory», хотя путь существует. Поэтому `_ensure_slice` сначала
@@ -362,15 +424,34 @@ BACKENDS: tuple[CoreBackend, ...] = (XrayBackend(), SingboxBackend(), AwgBackend
   `parsers/wireguard.py:16-19`), а также `awg://` и конфиг `[Interface]` с теми же ключами.
   `RawServer.awg = AwgSpec(private_key, address, peer_key, endpoint, jc, jmin, jmax, s1, s2, h1..h4,
   mtu, psk)`.
-- Ядро: интерфейс `awg-<fp6>` на каждый сервер (не больше 16), через `ip link add … type amneziawg`
-  (модуль DKMS) и `awg setconf` с `FwMark = mark_bypass`. Тогда UDP самого AmneziaWG не попадает
-  под перехват.
+- Ядро: интерфейс `awg-<fp6>` на каждый сервер (не больше 16). Два способа, выбирается при
+  установке:
+  - **модуль ядра** (DKMS): `ip link add awg-<fp6> type amneziawg`;
+  - **userspace `amneziawg-go`**: создаёт обычный TUN-интерфейс с тем же именем; модуль и его
+    подпись не нужны.
+  Дальше в обоих случаях `awg setconf awg-<fp6> <файл>` с `FwMark = mark_bypass`: UDP самого
+  AmneziaWG не попадает под перехват.
+- **Secure Boot.** На Ubuntu 24.04 с включённым UEFI Secure Boot модуль DKMS соберётся, но
+  `modprobe amneziawg` откажет («Key was rejected by service»), пока ключ MOK не записан при
+  перезагрузке. Поэтому `xgw install-awg` и `xgw diag` смотрят `mokutil --sb-state` и пробуют
+  `modprobe amneziawg`. При отказе используется `amneziawg-go` — заказчику не нужно подписывать
+  модуль из консоли. Diag пишет, какой способ работает и почему.
 - Xray выходит в него outbound'ом `freedom` с `streamSettings.sockopt.interface = "awg-<fp6>"`
-  (SO_BINDTODEVICE). Пробы и сканы идут через существующие probe-inbound'ы сервера без изменений.
-- Пакеты `amneziawg` / `amneziawg-tools` (PPA Amnezia для Ubuntu) ставятся **только с согласия
-  заказчика**, отдельной командой `sudo xgw install-awg`, как `update-singbox`. Без них ссылки
-  по-прежнему пропускаются с пояснением. Перед Ф5 проверить: имя PPA и пакетов для 24.04 и 26.04,
-  тип линка (`amneziawg`), сборку модуля на ядре 6.8.
+  (SO_BINDTODEVICE) и `settings.domainStrategy = "UseIPv4"`, как у outbound `direct`
+  (`builder.py:622`): имена назначения разрешает DNS Xray, а не системный резолвер.
+  Пробы и сканы идут через существующие probe-inbound'ы сервера без изменений.
+- **Маршрут для привязанного сокета.** `awg setconf` настраивает только AllowedIPs внутри
+  WireGuard, маршрутов в ядре не создаёт. Когда для интерфейса, к которому привязан сокет,
+  маршрута нет, ядро считает адрес назначения доступным напрямую через этот интерфейс — поэтому
+  маршрут не нужен (ожидание, проверяется первым тестом стенда Ф5). Если стенд покажет
+  ENETUNREACH, маршрут ставится **в отдельной таблице** (`ip route replace default dev
+  awg-<fp6> table <200+idx>` плюс `ip rule oif awg-<fp6> lookup <200+idx>`), но **не** в main с
+  высокой метрикой: туда при пропавшем WAN ушёл бы весь трафик машины.
+- Пакеты (PPA Amnezia для Ubuntu: модуль и `awg`; либо бинарь `amneziawg-go` с проверкой
+  SHA-256, как в `xraycore/binary.py`) ставятся **только с согласия заказчика**, отдельной
+  командой `sudo xgw install-awg`, как `update-singbox`. Без них ссылки по-прежнему
+  пропускаются с пояснением. Перед Ф5 проверить: имя PPA и пакетов для 24.04 и 26.04, тип линка
+  (`amneziawg`), сборку модуля на ядре 6.8, откуда брать `amneziawg-go` для amd64.
 - Лестница профилей к AWG не применяется (это UDP со своей обфускацией): `profiles()` возвращает
   `("awg:default",)`.
 
@@ -400,7 +481,7 @@ XGW_XRAY_BIN=/path/xray XGW_SINGBOX_BIN=/path/sing-box .venv/bin/python -m pytes
 | Файл | Что |
 |---|---|
 | `src/xgw/config.py` | `CaptureConfig.hold: Literal["block", "direct"] = "block"`; при `fail_mode = "open"` — всегда `"direct"` |
-| `src/xgw/net/nft.py` | `Rules.blocked: bool`, `Rules.v6_guard: bool`; `render_blocked(rules) -> str`; блок `v6_guard` в `render6`; `apply(rules, runner)` — один `nft -f` с текстом обеих таблиц, при `not ipv6_available()` — только v4 |
+| `src/xgw/net/nft.py` | `Rules.blocked: bool`, `Rules.v6_guard: bool`; `render_blocked(rules) -> str` — `block_output`, forward с отказом для мостов контейнеров (`CONTAINER_IFS`, кроме `bypass_containers`) и установленными соединениями только для `@bypass4`; блок `v6_guard` (с `meta mark 0x2 accept`) в `render6`; `apply(rules, runner)` — один `nft -f` с текстом обеих таблиц, при `not ipv6_available()` — только v4 |
 | `src/xgw/net/capture.py` | `_load("on")` при `reason` → `mode = "blocked" if self.cfg.capture.hold == "block" else "off"` (`capture.py:358-365`); `effective_mode()` возвращает `"blocked"`; `loaded()` и `describe()` знают о blocked |
 | `src/xgw/daemon.py` | `_guard_capture` при XRAY_DOWN и `fail_mode = "closed"`, `hold = "block"`, если Xray недоступен дольше `FAIL_OPEN_AFTER` — `capture.block()`; возврат в on — после `xray_ok` |
 | `src/xgw/diag.py` | группа «IPv6»: FAIL вместо WARN, если `v6_guard` не загружен при `ipv6 = "off"` |
@@ -409,40 +490,57 @@ XGW_XRAY_BIN=/path/xray XGW_SINGBOX_BIN=/path/sing-box .venv/bin/python -m pytes
 - `tests/test_nft.py::test_blocked_mode_lets_only_xray_and_service_traffic_out`;
 - `::test_both_families_load_in_one_transaction` — один вызов `nft -f`;
 - `::test_v6_guard_with_ipv6_off_regardless_of_networkmanager`;
+- `::test_blocked_rejects_containers_except_bypass_subnets`;
+- `::test_blocked_keeps_established_only_for_bypass_devices`;
+- `::test_v6_guard_lets_xray_sockets_out` (метка 2);
 - `tests/test_net.py::test_missing_inbound_blocks_when_hold_is_block` (там же, где тесты
   `Capture`); `test_enable_refuses_without_applied_tproxy_inbound` (`test_net.py:291`) проверяет
-  прежнее «напрямую» — перевести его на `hold = "direct"`.
+  прежнее «напрямую» — перевести его на `hold = "direct"`;
+- `tests/test_paths.py::test_no_system_resolver_calls_in_xgw` — поиск `getaddrinfo` /
+  `gethostbyname` по `src/xgw`.
 
 Стенд, `tests/stand/test_stand.py`:
 - `test_lan_is_blocked_without_capture_inbound` — конфиг Xray без `tproxy-in`, `ip netns exec lan
   curl -m 5 http://5.5.5.1:8080/` не проходит, `curl http://192.168.50.1:<порт панели>` из ns gw
   проходит;
 - `test_host_ipv6_never_leaks_with_ipv6_off` — `ip netns exec gw curl -6 -m 5
-  http://[2001:db8:5::1]:8080/` → отказ, при `ipv6 = "proxy"` — через Xray.
+  http://[2001:db8:5::1]:8080/` → отказ, при `ipv6 = "proxy"` — через Xray;
+- `test_containers_do_not_leak_in_blocked_mode` — мост контейнеров стенда (netns-режим): curl
+  из контейнера к 5.5.5.1 в blocked не проходит;
+- `test_direct_session_is_cut_when_blocked` — `xgw disable`, из ns lan открыть долгое соединение
+  к `5.5.5.1:8080/slow`, перевести шлюз в blocked → соединение рвётся ≤ 2 с, origin не получает
+  остаток.
 
 ### Ф2. События и жизненный цикл (§2.3) + защита служб
 
 | Файл | Что |
 |---|---|
-| `src/xgw/watch/events.py` (новый) | `class NetEvents` (выше), разбор строк `ip -j monitor`, `busctl monitor --json=short`, `nft monitor` — функции `parse_net(line) -> str \| None`, `parse_sleep(line) -> bool \| None`, `parse_rules(line) -> bool` |
+| `src/xgw/watch/events.py` (новый) | `class NetEvents` (выше), разбор строк `ip -o monitor` (текст), `busctl monitor --json=short`, `nft monitor` (без фильтра) — функции `parse_net(line) -> str \| None`, `parse_sleep(line) -> bool \| None`, `parse_rules(line) -> bool` (delete/flush по `xgw`, `xgw6` и `flush ruleset`) |
+| `src/xgw/net/capture.py` | `ignore_rules_until: float` — ставится после каждого `nft.apply`; `NetEvents` пропускает события rules в этом окне, вне окна демон всё равно сверяет `loaded()` |
 | `src/xgw/daemon.py` | `Lifecycle(StrEnum)`: OFF, CONNECTING, CONNECTED, BLOCKED, OPEN; `_lifecycle() -> Lifecycle`; `wake(reason: str)`; ветки `wake_reason` в `tick()`; поле `capture.lifecycle` в status.json |
 | `src/xgw/cli.py` | `_cmd_run` запускает `NetEvents(daemon.wake)` рядом с панелью и ботом (`_cmd_run`, `cli.py:662`) |
 | `src/xgw/watch/panel.py`, `src/xgw/ui/app.js` | строка «Перехват: работает / подключается / заблокирован — …» |
 | `packaging/xgw-net.service` | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/xgw /run/xgw`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW` (запись в `/proc/sys/net` — нужен `ProtectKernelTunables=no`, по умолчанию так и есть) |
-| `packaging/xgw-dhcp.service` | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/xgw`, `ProtectHome=yes`, `PrivateTmp=yes`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN` |
+| `packaging/xgw-dhcp.service` | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/xgw` (аренды уже в `/var/lib/xgw/dhcp.leases`, `dnsmasq.py:30` — `/var/lib/misc` не нужен), `ProtectHome=yes`, `PrivateTmp=yes`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN` |
 
 Ф2б (отдельный коммит, можно позже): `src/xgw/control.py` — `serve(daemon, path)` и
 `request(path, payload, timeout=2.0) -> dict | None`; `xgw priority/core/pin` шлют `poke`.
 
 Тесты:
-- `tests/test_events.py` — разбор строк каждого источника, debounce, перезапуск подпроцесса;
+- `tests/test_events.py` — разбор строк каждого источника (образцы — настоящий вывод `ip -o
+  monitor`, `nft monitor`, `busctl monitor --json=short`), debounce, перезапуск подпроцесса,
+  окно `ignore_rules_until`;
+- `tests/test_events.py::test_monitor_events_arrive_while_process_runs` (под root, в
+  `unshare -n`): событие `nft add table` и `ip link add dummy` доходит до читателя ≤ 1 с —
+  страховка от буферизации пайпа в будущих версиях программ;
 - `tests/test_daemon.py::test_wake_after_resume_reloads_rules_and_scans`.
 
 Стенд:
 - `test_wan_flap_wakes_daemon` — `ip netns exec gw ip link set <wan> down; sleep 3; … up` →
   внеочередной шаг ≤ 2 с после `up` (по журналу);
-- `test_foreign_flush_is_restored_quickly` — `ip netns exec gw nft flush ruleset` → `ip xgw`
-  снова на месте ≤ 2 с.
+- `test_foreign_flush_is_restored_quickly` — по очереди `nft flush ruleset`,
+  `nft flush table ip xgw`, `nft delete chain ip xgw output` в ns gw → правила снова на месте
+  ≤ 2 с, а своя загрузка XGW внеочередного шага не вызывает.
 
 Машинный стенд (`tests/stand/test_machine.py`): `systemd-analyze security xgw-net.service
 xgw-dhcp.service` — оценка не хуже 6.0, после установки обе службы активны.
@@ -451,14 +549,18 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 
 | Файл | Что |
 |---|---|
-| `src/xgw/netcheck.py` (новый) | `run(cfg, paths, runner) -> list[diag.Check]`; `pmtu(host, mark) -> int \| None`; `stun(addr, mark: int \| None) -> str \| None`; `resolver_seen(mark: int \| None) -> str \| None`; `v6_connect(addr) -> bool` |
+| `src/xgw/netcheck.py` (новый) | `run(cfg, paths, runner) -> list[diag.Check]`; `pmtu(host, mark) -> int \| None` (None — ICMP закрыт, контрольный ping не прошёл); `stun(addr, mark: int \| None) -> str \| None`; `dns_captured(timeout=3.0) -> bool` (A-запрос на `192.0.2.53:53` без метки); `v6_connect(addr) -> bool` |
 | `src/xgw/diag.py`, `src/xgw/cli.py` | флаг `--netcheck` (`cli.py:138-140`), группа «Сеть» в `Diag.run` |
 | `src/xgw/net/resolved.py` (новый) | `available`, `bind_link`, `revert_link` |
-| `src/xgw/net/capture.py` | вызовы `bind_link`/`revert_link` (§2.2) |
+| `src/xgw/net/capture.py`, `src/xgw/net/nft.py` | вызовы `bind_link`/`revert_link` (§2.2); в режиме TUN первое правило `output` — `oifname "<tun_name>" return` |
 | `src/xgw/watch/panel.py`, `src/xgw/ui/` | действие `diag/netcheck` и кнопка |
 
 Тесты:
-- `tests/test_netcheck.py` — каждая проверка на подменённом раннере и сокетах;
+- `tests/test_netcheck.py` — каждая проверка на подменённом раннере и сокетах; отдельно —
+  `test_pmtu_skipped_when_server_drops_icmp` (контрольный ping не прошёл → OK «не проверен», а
+  не WARN);
+- до кода Ф3 — проверить на Xray 26.10.10, что `dns-out` отвечает на A-запрос к `192.0.2.53` и
+  отбрасывает TXT (`nonIPQuery`); итог записать в ASSUMPTIONS;
 - `tests/test_resolved.py` — точные argv `busctl` (сигнатуры `ia(iay)`, `ia(sb)`, `ib`, `is`, `i`).
 
 Стенд:
@@ -474,21 +576,28 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 |---|---|
 | `src/xgw/config.py` | `CaptureConfig.direct_slice: bool = False`, `containers_bypass: list[str]` |
 | `src/xgw/net/nft.py` | `Rules.direct_slice: str` ("" — нет), `Rules.containers_bypass`; правило cgroup в `output`; set `bypass_containers` |
-| `src/xgw/net/capture.py` | `_ensure_slice() -> bool` перед `nft.apply` |
-| `packaging/xgwdirect.slice` (новый), `src/xgw/install.py`, `src/xgw/uninstall.py` | установка, удаление, `UNIT_FILES` |
+| `src/xgw/net/capture.py` | `direct_slice_ready() -> bool`: каталог `/sys/fs/cgroup/xgwdirect.slice` есть и правило проходит `unshare -n nft -c -f` (модуль `nft_socket`); только тогда `Rules.direct_slice` заполняется. Сам slice здесь не запускается |
+| `src/xgw/cli.py` (`_cmd_run`), `src/xgw/daemon.py` | при старте `xgw.service`: `systemctl start --no-block xgwdirect.slice`, затем внеочередной `capture.up()` |
+| `packaging/xgwdirect.slice` (новый, `DefaultDependencies=no`), `src/xgw/install.py`, `src/xgw/uninstall.py` | установка, удаление, `UNIT_FILES` |
 | `src/xgw/cli.py` | `xgw direct-run -- …` → `os.execvp("systemd-run", […])` |
 
 Тесты:
 - `tests/test_nft.py::test_direct_slice_rule_only_when_slice_exists`;
+- `tests/test_net.py::test_xgw_net_up_never_starts_the_slice` (ранняя загрузка: только проверка
+  наличия);
 - `tests/test_cli_commands.py::test_direct_run_builds_systemd_run_argv`.
 
 Стенд:
-- `test_cgroup_bypass_goes_direct` — в ns gw `mkdir /sys/fs/cgroup/xgwdirect.slice`, процесс
-  curl переносится туда (`echo $$ > …/cgroup.procs`) и доходит до `5.5.5.1` напрямую (лог origin:
-  адрес источника — gw, а не сервер Xray); curl вне cgroup — через Xray;
+- `test_cgroup_bypass_goes_direct` — `systemd-run --scope --slice=xgwdirect.slice ip netns exec
+  gw curl http://5.5.5.1:8080/trace` доходит напрямую (лог origin: адрес источника — gw, а не
+  сервер Xray); тот же curl без `systemd-run` — через Xray. Каталог cgroup создаёт systemd, не
+  тест. Если ядро без `nft_socket`, тест пропускается;
 - `test_container_subnet_bypass` (netns + мост `br-test`).
 
-Машинный стенд: `xgw direct-run -- curl …` — в обход, под тем же стендом.
+Машинный стенд:
+- `xgw direct-run -- curl …` идёт в обход;
+- после перезагрузки контейнера правило cgroup появляется через секунды после старта
+  `xgw.service`, а `xgw-net` отрабатывает без ожидания slice.
 
 ### Ф5. Интерфейс ядер и AmneziaWG (§2.4в)
 
@@ -497,18 +606,25 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 | `src/xgw/generator/backends.py` (новый) | `CoreBackend`, `XrayBackend`, `SingboxBackend`, `AwgBackend`, `SidecarPlan` |
 | `src/xgw/generator/builder.py`, `singbox.py`, `profiles.py` | перевод на `BACKENDS` без изменения выдаваемых конфигов (golden-тесты `tests/fixtures/golden` не меняются — проверка рефакторинга) |
 | `src/xgw/parsers/wireguard.py`, `parsers/common.py` | `AwgSpec`; ссылка с параметрами awg больше не `UnsupportedLink`, если `AwgBackend` доступен |
-| `src/xgw/net/awg.py` (новый) | `ensure(spec, ifname, mark, runner)`, `remove(ifname, runner)`, `present(ifname, runner)` |
-| `src/xgw/awgcore/install.py` (новый), `src/xgw/cli.py` | `xgw install-awg`: PPA, пакеты, проверка `modprobe amneziawg` |
+| `src/xgw/net/awg.py` (новый) | `ensure(spec, ifname, mark, runner, *, method: Literal["kernel","go"])`, `remove(ifname, runner)`, `present(ifname, runner)`, `kernel_usable(runner) -> tuple[bool, str]` (`mokutil --sb-state` и `modprobe amneziawg`; причина отказа — текстом) |
+| `src/xgw/awgcore/install.py` (новый), `src/xgw/cli.py` | `xgw install-awg`: модуль из PPA, а при Secure Boot без ключа — `amneziawg-go` (SHA-256); выбранный способ — в `/var/lib/xgw` |
+| `src/xgw/generator/builder.py` | outbound AWG: `freedom` с `sockopt.interface` и `domainStrategy = "UseIPv4"` |
+| `src/xgw/diag.py` | группа «AmneziaWG»: способ, Secure Boot, модуль |
 
 Тесты:
 - golden-тесты генератора без изменений;
 - `tests/test_parsers.py::test_amnezia_link_parses_into_awg_spec`;
-- `tests/test_awg.py` — argv `ip link` / `awg setconf`.
+- `tests/test_awg.py` — argv `ip link` / `awg setconf` для обоих способов, выбор `go` при отказе
+  `modprobe` («Key was rejected by service»), отсутствие маршрута в main.
 
-Стенд (только где установлен модуль):
-- `tests/stand/test_stand_awg.py` — сервер AmneziaWG в ns inet (`awg-quick` с теми же `jc/s1/h1`),
-  LAN → curl → 5.5.5.1 через `awg-<fp6>`;
-- контроль: сервер с другим `h1` — CONNECT_FAIL, лестница не запускается.
+Стенд (только где есть модуль или `amneziawg-go`):
+- `tests/stand/test_stand_awg.py::test_bound_socket_reaches_server_without_routes` — первым:
+  сокет Xray с `sockopt.interface` доходит до сервера без маршрутов через `awg-<fp6>`. Если
+  ENETUNREACH — переход на отдельную таблицу (§2.4в), не на main;
+- сервер AmneziaWG в ns inet (`awg-quick` с теми же `jc/s1/h1`), LAN → curl → 5.5.5.1 через
+  `awg-<fp6>`;
+- контроль: сервер с другим `h1` — CONNECT_FAIL, лестница не запускается;
+- при пропавшем WAN (`ip link set wan down` в ns gw) трафик машины не уходит в `awg-<fp6>`.
 
 ---
 
@@ -520,3 +636,28 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 - **Ф3** и **Ф4** не зависят друг от друга. Обе требуют Ф1: `v6_guard` нужен проверке утечки IPv6,
   а правило cgroup не должно действовать в режиме blocked.
 - **Ф5** — независима от Ф2–Ф4. AmneziaWG ставит сторонние пакеты — только с согласия заказчика.
+
+---
+
+## 5. Учтённые замечания рецензии
+
+План пересмотрен по внешней рецензии. Каждое замечание перед правкой проверено по коду, а
+спорные — опытом в одноразовой netns.
+
+| Замечание | Итог | Где в плане |
+|---|---|---|
+| Контейнеры выходят наружу в режиме blocked (нет цепочки `containers`, правило «чужой форвардинг» их пропускает) | принято | §2.1 forward, Ф1 тесты |
+| Сессии, открытые в off/open, переживают переход в blocked через `ct state established` | принято (сужение до `@bypass4`; `conntrack` в Ubuntu по умолчанию нет) | §2.1, Ф1 стенд |
+| DNS демона в blocked заблокирован | частично: XGW системный резолвер не использует (`builder.py:516`, свой резолвер с меткой 2); добавлен тест-инвариант. В `v6_guard` добавлено `meta mark 0x2 accept` | §2.1, Ф1 |
+| `nft monitor tables` не видит `flush table` / `delete chain` | принято (проверено: `flush table` событий таблиц не даёт) | §2.3, Ф2 |
+| Булев флаг своей загрузки сбросится раньше события | принято: `ignore_rules_until` и сверка `loaded()` | §2.3, Ф2 |
+| Буфер пайпа 4 КБ у `nft`/`ip`/`busctl monitor` | отклонено: проверено, все три отдают события сразу; добавлен тест-страховка | §2.3, Ф2 |
+| PMTU: сервер без ICMP даёт ложный WARN | принято: контрольный ping | §2.4а, Ф3 |
+| Утечка DNS через `o-o.myaddr`: совпадение пулов Google | довод отклонён (имя отдаёт адрес спросившего), но проверка всё равно заменена: `dns-out` отбрасывает TXT — теперь A-запрос на `192.0.2.53` | §2.4а, Ф3 |
+| Двойная маршрутизация DNS resolved в TUN | принято как оптимизация: `oifname "<tun>" return` | §2.2, Ф3 |
+| slice: взаимоблокировка при загрузке и выгрузка пустого slice | взаимоблокировки нет (у slice нет ожидания `sysinit`), запущенный slice не выгружается. Принято другое: `xgw-net` slice не трогает, его запускает `xgw.service` (`--no-block`), unit с `DefaultDependencies=no`. `os.mkdir` в `/sys/fs/cgroup` отклонён | §2.4б, Ф4 |
+| `SO_BINDTODEVICE` без маршрута → ENETUNREACH | не принято как факт: ядро для привязанного сокета без маршрута считает адрес доступным напрямую через интерфейс. Проверяется первым тестом Ф5; маршрут в main с высокой метрикой отклонён (при пропавшем WAN туда ушёл бы трафик машины) — если нужен, то в отдельной таблице | §2.4в, Ф5 |
+| `freedom` без `domainStrategy` | принято: `UseIPv4`, как у `direct` | §2.4в, Ф5 |
+| Secure Boot ломает модуль DKMS | принято: `mokutil --sb-state`, запасной способ `amneziawg-go` | §2.4в, Ф5 |
+| `xgw-dhcp` и `/var/lib/misc/dnsmasq.leases` | уже не нужно: аренды в `/var/lib/xgw/dhcp.leases` (`dnsmasq.py:30`) | Ф2 |
+| `ip -j monitor` (ошибка самого плана) | исправлено: `ip monitor` с `-j` печатает текст | §2.3, Ф2 |
