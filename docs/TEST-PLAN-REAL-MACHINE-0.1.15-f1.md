@@ -30,9 +30,19 @@ blocked. Через 90 секунд скрипт сам загружает пр�
 `/etc/xgw` при этом не меняется.
 
 **Важно для исполнителя.** На время окна (шаг 4.2) интернет пропадёт и у этой машины — значит,
-и у тебя самого не будет связи. Поэтому окно — одна команда, которую запускает systemd: она всё
-делает сама и сама всё возвращает, даже если твой сеанс оборвётся. Все вопросы заказчику —
-**до** окна (шаг 4.1) и **после** него (шаг 4.3).
+и у тебя самого не будет связи, а у заказчика — удалённого доступа к машине. Поэтому возврат
+сети не зависит от тебя и держится на трёх уровнях:
+
+1. Окно — одна команда, которую запускает systemd: через 90 секунд она сама загружает правила
+   по настоящему конфигу и запускает демон, даже если твой сеанс оборвётся. Каждый шаг возврата
+   — сам по себе; если правила всё равно остались blocked — `xgw disable` (интернет напрямую).
+2. **Страховка** — отдельный таймер systemd, его ставит та же команда шага 4.2 **до** окна. Через
+   4 минуты он проверяет правила и демон и, если окно их не вернуло, возвращает сам (так же, с
+   `xgw disable` в крайнем случае).
+3. Программа не меняет `/etc/xgw`, поэтому выключение и включение питания шлюза всегда
+   возвращает обычный режим: после загрузки правила берутся из настоящего конфига.
+
+Все вопросы заказчику — **до** окна (шаг 4.1) и **после** него (шаг 4.3).
 
 Цели:
 
@@ -64,8 +74,11 @@ blocked. Через 90 секунд скрипт сам загружает пр�
 окажется без нужных настроек, интернет дома закроется, а не пойдёт мимо VPN. (1) Демон XGW при
 установке перезапустится сам: интернет не пропадёт, панель и бот секунд на десять станут
 недоступны. (2) Потом я на 90 секунд включу этот режим нарочно: **интернет пропадёт у всего
-дома** (кроме устройств «мимо VPN», если они есть), панель и бот будут недоступны около двух
-минут; через 90 секунд всё вернётся само. (3) В эти 90 секунд прошу вас открыть на телефоне в
+дома и у самого шлюза** (кроме устройств «мимо VPN», если они есть) — удалённо на шлюз в эти
+две минуты не зайти, панель и бот недоступны; через 90 секунд всё вернётся само. Если не
+вернётся, через 4 минуты шлюз вернёт сеть сам — в худшем случае интернет пойдёт напрямую,
+мимо VPN, пока перехват не включат снова; а если и это не поможет — достаточно выключить и
+включить питание шлюза: он загрузится в обычном режиме (кто-то должен быть дома или рядом). (3) В эти 90 секунд прошу вас открыть на телефоне в
 домашнем Wi-Fi любой сайт — он не должен открыться; если есть устройство «мимо VPN» — на нём
 сайт должен открыться. После окна спрошу, что вы видели. (4) Две короткие проверки команд
 XGW — на работу сети не влияют. Можно?» Дождись ответа. Записать в отчёт, на что заказчик
@@ -107,12 +120,15 @@ cat > ~/xgw-f1-test/f1check.py <<'EOF'
 sudo python3 f1check.py pre                 установленный код, режим, цепочки, IPv6, Docker
 sudo python3 f1check.py net --expect on     связь с машины: обычный сокет, метка, через Xray, IPv6
 sudo python3 f1check.py window DIR          окно blocked (вызывать только через systemd-run!)
+sudo python3 f1check.py rescue FILE         страховка: вернуть правила, если окно не вернуло
 sudo python3 f1check.py audit DIR           logs --export не затирает файл; блокировка panel.json
 
 Код XGW скрипт берёт установленный (/opt/xgw/lib) и ничего в /etc/xgw не правит: окно blocked
 загружает правила по копии config.toml в DIR, где изменён только capture.tproxy_port, — в
 работающем Xray такого inbound'а нет, и шлюз сам выбирает blocked. Окно всегда кончается
-возвратом: `xgw net up` по настоящему конфигу и запуск демона.
+возвратом: `xgw net up` по настоящему конфигу и запуск демона; если правила и после этого
+blocked — `xgw disable` (интернет напрямую). Страховка rescue (её ставит таймер systemd до
+окна) делает то же сама, если окно по какой-то причине не вернуло правила.
 """
 
 from __future__ import annotations
@@ -142,6 +158,7 @@ _HOST4, _, _PORT4 = os.environ.get("XGW_F1_TARGET4", "1.1.1.1:443").rpartition("
 TARGET4 = (_HOST4, int(_PORT4))
 TARGET6 = ("2606:4700:4700::1111", 443)
 WINDOW = int(os.environ.get("XGW_F1_WINDOW", "90"))  # секунд blocked: заказчик проверяет телефон
+STEP_TIMEOUT = int(os.environ.get("XGW_F1_STEP_TIMEOUT", "90"))  # шаг возврата — не дольше
 
 
 def run(argv: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
@@ -358,11 +375,15 @@ def cmd_window(directory: Path) -> int:
         lines, code = report(probes(cfg), "blocked")
         for line in lines:
             note(line)
-        diag = run([*XGW, "diag", "--no-net", "--config", str(target)], timeout=180)
-        for line in diag.stdout.splitlines():
-            if line.strip().startswith(("[", "OK", "WARN", "FAIL")) and (
-                    "Перехват" in line or "IPv6" in line):
-                note("diag: " + line.strip())
+        try:
+            diag = run([*XGW, "diag", "--no-net", "--config", str(target)], timeout=40)
+        except subprocess.TimeoutExpired:
+            note("diag: не уложился в 40 с — пропущен (окно не затягиваем)")
+        else:
+            for line in diag.stdout.splitlines():
+                if line.strip().startswith(("OK", "WARN", "FAIL")) and (
+                        "Перехват" in line or "IPv6" in line):
+                    note("diag: " + line.strip())
         if mode_of(v4) != "blocked":
             code = 1
         left = WINDOW - (time.monotonic() - started)
@@ -370,14 +391,56 @@ def cmd_window(directory: Path) -> int:
         if left > 0:
             time.sleep(left)
     finally:
-        back = run([*XGW, "net", "up", "--config", str(CONFIG)])
-        note(f"возврат: net up по настоящему конфигу — код {back.returncode}")
-        started_daemon = run(["systemctl", "start", DAEMON], timeout=60)
-        note(f"возврат: запуск демона — код {started_daemon.returncode}")
-        note(f"режим правил после возврата: {mode_of(chains('ip', 'xgw'))}; "
-             f"конец окна: {time.strftime('%T')}")
+        if not restore(note):
+            code = 1
+        note(f"конец окна: {time.strftime('%T')}")
         (directory / "window.txt").write_text("\n".join(out) + "\n", encoding="utf-8")
     return code
+
+
+def restore(note) -> bool:
+    """Возврат: правила по настоящему конфигу и демон. Каждый шаг — сам по себе: сбой или
+    зависание одного не мешают следующему. Если правила так и остались blocked —
+    `xgw disable`: интернет пойдёт напрямую, но связь с машиной будет."""
+
+    def step(label: str, argv: list[str]) -> None:
+        try:
+            done = run(argv, timeout=STEP_TIMEOUT)
+            note(f"{label} — код {done.returncode}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            note(f"{label} — сбой: {type(exc).__name__}")
+
+    step("возврат: net up по настоящему конфигу", [*XGW, "net", "up", "--config", str(CONFIG)])
+    step("возврат: запуск демона", ["systemctl", "start", DAEMON])
+    mode = mode_of(chains("ip", "xgw"))
+    if mode == "blocked":
+        step("АВАРИЙНО: xgw disable — интернет напрямую",
+             [*XGW, "disable", "--config", str(CONFIG)])
+        mode = mode_of(chains("ip", "xgw"))
+    note(f"режим правил после возврата: {mode}")
+    return mode != "blocked"
+
+
+def cmd_rescue(log: Path) -> int:
+    """Страховка, независимая от окна (таймер systemd через 4 минуты после его начала): если
+    правила всё ещё blocked или демон не работает — возврат, как в конце окна."""
+    out: list[str] = []
+
+    def note(text: str) -> None:
+        out.append(text)
+        print(text, flush=True)
+
+    mode = mode_of(chains("ip", "xgw"))
+    active = run(["systemctl", "is-active", DAEMON]).stdout.strip()
+    note(f"страховка {time.strftime('%T')}: режим правил {mode}, демон {active}")
+    if mode != "blocked" and active == "active":
+        note("всё в порядке — страховка ничего не делала")
+        ok = True
+    else:
+        ok = restore(note)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return 0 if ok else 1
 
 
 def sha(path: Path) -> str:
@@ -430,6 +493,8 @@ def main(argv: list[str]) -> int:
         return cmd_net(argv[2] if len(argv) > 2 and argv[1] == "--expect" else "on")
     if argv[0] == "window" and len(argv) == 2:
         return cmd_window(Path(argv[1]))
+    if argv[0] == "rescue" and len(argv) == 2:
+        return cmd_rescue(Path(argv[1]))
     if argv[0] == "audit" and len(argv) == 2:
         return cmd_audit(Path(argv[1]))
     print(__doc__)
@@ -442,7 +507,7 @@ EOF
 sha256sum ~/xgw-f1-test/f1check.py
 ```
 
-Ожидается: `589d42358dd9206ed182702762993a2eedfe576d79ca6e9681e4806f2c28147c` в начале строки.
+Ожидается: `d3a10b780fa43ba6d08f47ad163e511833b5e1827ff7710e1cbd61350e6544f9` в начале строки.
 Если хеш другой: файл скопирован не целиком — повторить шаг 1.3 один раз; если снова другой —
 **стоп**, сообщить заказчику.
 
@@ -517,11 +582,13 @@ VPN“ — откройте сайт и на нём: там он должен о
 у тебя не будет связи — это нормально:
 
 ```bash
-sudo systemd-run --wait --collect --pipe --quiet --unit=xgw-f1-window /usr/bin/python3 "$HOME/xgw-f1-test/f1check.py" window "$HOME/xgw-f1-test/blk" | tee after/window.txt; echo "код ${PIPESTATUS[0]}"
+sudo systemctl stop xgw-f1-rescue.timer xgw-f1-rescue.service 2>/dev/null; sudo systemctl reset-failed xgw-f1-rescue.timer xgw-f1-rescue.service 2>/dev/null; sudo systemd-run --quiet --collect --unit=xgw-f1-rescue --on-active=4min --timer-property=AccuracySec=1s /usr/bin/python3 "$HOME/xgw-f1-test/f1check.py" rescue "$HOME/xgw-f1-test/after/rescue.txt" && echo "страховка поставлена, сработает в $(date -d '+4 min' +%T)" && sudo systemd-run --wait --collect --pipe --quiet --unit=xgw-f1-window /usr/bin/python3 "$HOME/xgw-f1-test/f1check.py" window "$HOME/xgw-f1-test/blk" | tee after/window.txt; echo "код ${PIPESTATUS[0]}"
 ```
 
 Ожидается, по порядку:
 
+- «страховка поставлена, сработает в ЧЧ:ММ:СС» — **первой строкой**; без неё окно не
+  запускается (так и задумано): записать ошибку и перейти к шагу 5;
 - «окно blocked: ЧЧ:ММ:СС, копия конфига: tproxy_port 12399» (число может быть другим);
 - «net up по копии: код 0» и строка «Перехват: НЕ ВКЛЮЧЁН (ожидание применения inbound в Xray) —
   … трафик заблокирован, мимо VPN ничего не уходит (capture.hold = block) …»;
@@ -533,7 +600,7 @@ sudo systemd-run --wait --collect --pipe --quiet --unit=xgw-f1-window /usr/bin/p
   «diag: … IPv6: …»;
 - «ждём N с: заказчик проверяет телефон»;
 - «возврат: net up по настоящему конфигу — код 0», «возврат: запуск демона — код 0»,
-  «режим правил после возврата: on»;
+  «режим правил после возврата: on», «конец окна: ЧЧ:ММ:СС»;
 - «код 0».
 
 Если не так:
@@ -543,16 +610,25 @@ sudo systemd-run --wait --collect --pipe --quiet --unit=xgw-f1-window /usr/bin/p
   идёт напрямую»**: записать вывод целиком.
 - «a обычный: соединилось» в блоке blocked — **дефект «в blocked машина выходит мимо VPN»**.
 - «b с меткой» или «c через Xray» не «соединилось» — дефект «blocked закрыл и Xray»: записать.
+- Строка «АВАРИЙНО: xgw disable — интернет напрямую» — возврат не удался, сработал аварийный
+  путь: интернет есть, но идёт мимо VPN. **Дефект «окно не вернуло перехват»**: записать вывод
+  целиком, сообщить заказчику, шаг 7.
 - «режим правил после возврата» не `on` или любой «возврат: … код» не 0 — сразу шаг 7.
-- Вывод оборвался, команды нет дольше 4 минут — сразу шаг 7.
+- Твоя команда оборвалась сама (у тебя кончилось время на команду) — окно от этого **не**
+  прерывается: оно идёт в systemd. Ничего не запускай повторно; подожди 3 минуты от первой
+  строки и переходи к шагу 4.3 — полный вывод окна сохранится там из файла.
+- Вывод оборвался, команды нет дольше 4 минут — ничего не делать до срабатывания страховки
+  (время — в первой строке), затем шаг 7.
 
 Шаг 4.3. После окна — проверка возврата и уборка копии конфига (в ней адреса подписок):
 
 ```bash
-sleep 20; systemctl is-active xgw xgw-xray; sudo python3 f1check.py net --expect on | tee after/net-after.txt; sudo xgw status | grep -E '^Перехват|^Состояние'; sudo rm -rf ~/xgw-f1-test/blk && echo "копия конфига удалена"
+sleep 20; systemctl is-active xgw xgw-xray; sudo python3 f1check.py net --expect on | tee after/net-after.txt; sudo xgw status | grep -E '^Перехват|^Состояние'; sudo cat ~/xgw-f1-test/blk/window.txt > after/window-file.txt; sudo rm -rf ~/xgw-f1-test/blk && echo "копия конфига удалена"
 ```
 
 Ожидается: два `active`; «ИТОГ: ПРОЙДЕН»; «Перехват: включён …»; «копия конфига удалена».
+Файл `after/window-file.txt` — полный вывод окна (в отчёт берётся он, если `after/window.txt`
+оборвался).
 Если не так: «ИТОГ: ДЕФЕКТ» или демон не `active` — сразу шаг 7.
 
 **Спроси заказчика** (если он согласился на пункт 3) и запиши ответы:
@@ -584,11 +660,19 @@ sudo python3 f1check.py audit "$HOME/xgw-f1-test/audit" | tee after/audit.txt
 Шаг 6.1:
 
 ```bash
-systemctl is-active xgw-net xgw-xray xgw-singbox xgw xgw-dhcp; sudo xgw diag > after/diag-end.txt; tail -1 after/diag-end.txt; sudo xgw status | head -8; sudo python3 f1check.py pre | grep -E 'режим правил|v6_guard'
+timeout 330 bash -c 'until sudo test -s "$HOME/xgw-f1-test/after/rescue.txt"; do sleep 10; done'; sudo cat after/rescue.txt; systemctl is-active xgw-net xgw-xray xgw-singbox xgw xgw-dhcp; sudo xgw diag > after/diag-end.txt; tail -1 after/diag-end.txt; sudo xgw status | head -8; sudo python3 f1check.py pre | grep -E 'режим правил|v6_guard'
 ```
 
-Ожидается: пять `active`, «FAIL — 0», «режим правил: on», «v6_guard: есть» (как в шаге 3.1).
-Если FAIL не 0: записать строки с FAIL (`grep FAIL after/diag-end.txt`).
+Ожидается: строки страховки «страховка ЧЧ:ММ:СС: режим правил on, демон active» и «всё в
+порядке — страховка ничего не делала» (если шаг 4 пропущен — `cat` скажет, что файла нет, так
+и должно быть); пять `active`, «FAIL — 0», «режим правил: on», «v6_guard: есть» (как в шаге
+3.1).
+
+Если не так:
+
+- Страховка что-то делала («возврат: …» в её выводе) — **дефект «окно не вернуло правила
+  само»**: записать её вывод целиком.
+- FAIL не 0: записать строки с FAIL (`grep FAIL after/diag-end.txt`).
 
 ## 7. Если что-то пошло не так
 
@@ -601,6 +685,12 @@ systemctl is-active xgw-net xgw-xray xgw-singbox xgw xgw-dhcp; sudo xgw diag > a
   Если и после этого «ИТОГ» не «ПРОЙДЕН» и у заказчика нет интернета — `sudo xgw disable`
   (интернет пойдёт напрямую, мимо VPN), сообщить заказчику. `sudo rm -rf ~/xgw-f1-test/blk` —
   в любом случае.
+- Сработал аварийный путь (`xgw disable` — в выводе окна или страховки): интернет идёт мимо
+  VPN. Перехват **не** включать самому: сообщить заказчику; `sudo xgw enable` — только с его
+  согласия и после того, как записан вывод `sudo xgw status` и
+  `sudo journalctl -u xgw -n 80 --no-pager > after/xgw-fail.txt`.
+- Связи с машиной нет совсем (ни у тебя, ни у заказчика) — это вне твоих сил: заказчик
+  выключает и включает питание шлюза; после загрузки шлюз в обычном режиме.
 - Демон не `active` — **не** перезапускать его повторно; журнал
   `sudo journalctl -u xgw -n 80 --no-pager > after/xgw-fail.txt` и сообщить заказчику.
 - Команда `xgw` пишет «ошибка» — сохранить вывод в `after/`, записать в отчёт, перейти к
@@ -629,7 +719,8 @@ systemctl is-active xgw-net xgw-xray xgw-singbox xgw xgw-dhcp; sudo xgw diag > a
 | 3.2 связь в режиме on | пройден / дефект | <ИТОГ net-on; строки diag IPv6 и Перехват> |
 | 4.2 окно blocked: правила | пройден / дефект / не проводилось | <режим; v6_guard; отбой контейнеров N> |
 | 4.2 окно blocked: связь с машины | пройден / дефект / не проводилось | <a, b, c, d кратко> |
-| 4.2 возврат | пройден / нет / не проводилось | <режим после возврата; коды> |
+| 4.2 возврат | пройден / нет / не проводилось | <режим после возврата; коды; был ли АВАРИЙНО> |
+| 6 страховка | ничего не делала / вернула / не ставилась | <вывод after/rescue.txt кратко> |
 | 4.3 телефон (В1–В4) | пройден / дефект / не задавались | <ответы кратко> |
 | 5.1 logs --export и блокировка | пройден / дефект / пропущен | |
 | 6 итоговое состояние | пройден / нет | <FAIL — …> |
