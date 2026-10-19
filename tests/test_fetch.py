@@ -1,8 +1,12 @@
 """Тесты fetch: file://, повторы, коды ответа, CONNECT-туннель, DNS (без внешней сети)."""
 
+import shutil
 import socket
+import ssl
 import struct
+import subprocess
 import threading
+import time
 
 import pytest
 
@@ -166,7 +170,7 @@ def test_hostname_resolved_through_bootstrap(monkeypatch, no_sleep):
     server = HttpServer(_response(200, b"ok"))
     asked: list[tuple] = []
 
-    def fake_resolve(name, bootstrap, *, mark=None):
+    def fake_resolve(name, bootstrap, *, mark=None, cancel=None):
         asked.append((name, tuple(bootstrap), mark))
         return ["127.0.0.1"]
 
@@ -304,11 +308,11 @@ def test_plain_dns_ignores_mismatched_reply():
 def test_resolve_domain_sorted_and_falls_through(monkeypatch):
     calls: list[str] = []
 
-    def fake_doh(entry, name, *, mark=None, timeout=8.0):
+    def fake_doh(entry, name, *, mark=None, timeout=8.0, cancel=None):
         calls.append(entry)
         raise OSError("blocked")
 
-    def fake_plain(server, name, *, mark=None, timeout=5.0, port=53):
+    def fake_plain(server, name, *, mark=None, timeout=5.0, port=53, cancel=None):
         calls.append(server)
         return ["203.0.113.20", "203.0.113.3", "203.0.113.20"]
 
@@ -324,7 +328,7 @@ def test_resolve_domain_sorted_and_falls_through(monkeypatch):
 def test_bootstrap_udp_with_port(monkeypatch):
     asked: list[tuple[str, int]] = []
 
-    def fake_plain(server, name, *, mark=None, timeout=5.0, port=53):
+    def fake_plain(server, name, *, mark=None, timeout=5.0, port=53, cancel=None):
         asked.append((server, port))
         return ["203.0.113.5"]
 
@@ -349,7 +353,7 @@ def test_nxdomain_is_told_apart_from_a_resolver_failure(monkeypatch):
 
     replies: dict[str, object] = {}
 
-    def fake_doh(entry, name, *, mark=None, timeout=8.0):
+    def fake_doh(entry, name, *, mark=None, timeout=8.0, cancel=None):
         reply = replies[entry]
         if isinstance(reply, Exception):
             raise reply
@@ -370,3 +374,226 @@ def test_nxdomain_is_told_apart_from_a_resolver_failure(monkeypatch):
     # Один резолвер имени не знает, другой знает — имя есть.
     replies.update({first: fetch.NoSuchDomain("NXDOMAIN"), second: ["203.0.113.9"]})
     assert fetch.resolve_domain("gone.example.com", [first, second]) == ["203.0.113.9"]
+
+
+# --- прерывание остановкой демона (наблюдение Н1 отчёта о Д1/Д2) ------------------
+
+
+def _cancel_after(seconds: float) -> threading.Event:
+    cancel = threading.Event()
+    timer = threading.Timer(seconds, cancel.set)
+    timer.daemon = True
+    timer.start()
+    return cancel
+
+
+class SilentServer(threading.Thread):
+    """Принимает соединение, читает запрос, отдаёт `prefix` и замолкает, не закрывая его."""
+
+    def __init__(self, prefix: bytes = b""):
+        super().__init__(daemon=True)
+        self.prefix = prefix
+        self.conns: list[socket.socket] = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.start()
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+                self.conns.append(conn)
+                conn.recv(65536)
+                conn.sendall(self.prefix)
+            except OSError:
+                return
+
+
+@pytest.mark.parametrize(
+    ("prefix", "via_proxy"),
+    [
+        (b"", True),  # http-in Xray не отвечает на CONNECT
+        (b"", False),  # нет заголовков ответа
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + b"x" * 10, False),  # тело встало
+    ],
+    ids=["connect", "headers", "body"],
+)
+def test_cancel_interrupts_the_wait_for_the_network(prefix, via_proxy):
+    """Остановка демона прерывает ожидание сети за доли секунды, а не по таймауту (15 с
+    на каждую из до 4 попыток) — systemd ждёт остановки не дольше 90 с."""
+    server = SilentServer(prefix)
+    url = "http://panel.example.com/sub" if via_proxy else f"http://127.0.0.1:{server.port}/s"
+    started = time.monotonic()
+    with pytest.raises(fetch.Cancelled):
+        fetch_url(
+            url, timeout=5, proxy=("127.0.0.1", server.port) if via_proxy else None,
+            cancel=_cancel_after(0.3),
+        )
+    assert time.monotonic() - started < 2
+    assert len(server.conns) == 1  # и повторов после остановки нет
+
+
+def test_cancel_interrupts_a_hanging_connect():
+    """Соединение, на которое никто не отвечает (очередь слушателя занята — SYN теряется,
+    как у недоступного сервера при прямом запросе), тоже прерывается."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(0)
+    port = listener.getsockname()[1]
+    filler = socket.create_connection(("127.0.0.1", port), timeout=3)  # занял очередь
+    try:
+        started = time.monotonic()
+        with pytest.raises(fetch.Cancelled):
+            fetch_url(f"http://127.0.0.1:{port}/sub", timeout=5, cancel=_cancel_after(0.3))
+        assert time.monotonic() - started < 2
+    finally:
+        filler.close()
+        listener.close()
+
+
+def test_cancel_interrupts_the_pause_before_a_retry():
+    """Паузы между попытками (2, 4, 8 с) остановка тоже прерывает, а новой попытки нет."""
+    server = HttpServer(_response(503))
+    started = time.monotonic()
+    with pytest.raises(fetch.Cancelled):
+        fetch_subscription(server.url(), cancel=_cancel_after(0.3))
+    assert time.monotonic() - started < 1.5  # первая пауза — 2 с
+    assert len(server.requests) == 1
+
+
+def test_cancelled_fetch_does_not_even_connect():
+    server = HttpServer(_response(200, b"ok"))
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(fetch.Cancelled):
+        fetch_url(server.url(), cancel=cancel)
+    time.sleep(0.2)
+    assert server.requests == []
+
+
+def test_cancel_that_never_comes_changes_nothing():
+    """С событием, которое не выставлено, запрос — как прежде: повтор после 503,
+    перенаправление, тело целиком."""
+    target = HttpServer(_response(200, b"x" * 300_000))
+    redirect = _response(302, extra=f"Location: {target.url('/new')}\r\n")
+    server = HttpServer(_response(503), redirect)
+    result = fetch_url(server.url(), backoffs=(0.1,), cancel=threading.Event())
+    assert result.status == 200 and result.body == b"x" * 300_000
+    assert len(server.requests) == 2
+
+
+@pytest.fixture(scope="module")
+def tls_files(tmp_path_factory):
+    """Самоподписанный сертификат на localhost — только для этих тестов."""
+    openssl = shutil.which("openssl")
+    if not openssl:
+        pytest.skip("нет openssl — тесты https пропущены")
+    directory = tmp_path_factory.mktemp("tls")
+    cert, key = directory / "cert.pem", directory / "key.pem"
+    proc = subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-keyout", str(key), "-out", str(cert), "-subj", "/CN=localhost",
+         "-addext", "subjectAltName=DNS:localhost"],
+        capture_output=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        pytest.skip("openssl не выпустил тестовый сертификат")
+    return cert, key
+
+
+class TlsServer(threading.Thread):
+    """https на localhost: пауза перед рукопожатием, затем ответ по шагам (байты или паузы)."""
+
+    def __init__(self, cert, key, script: list, delay: float = 0.0):
+        super().__init__(daemon=True)
+        self.delay = delay
+        self.script = script
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(str(cert), str(key))
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.start()
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket):
+        try:
+            time.sleep(self.delay)
+            tls = self.context.wrap_socket(conn, server_side=True)
+            tls.recv(65536)
+            for step in self.script:
+                if isinstance(step, bytes):
+                    tls.sendall(step)
+                else:
+                    time.sleep(step)
+            tls.close()
+        except (OSError, ssl.SSLError):
+            conn.close()
+
+
+@pytest.fixture()
+def trust(tls_files, monkeypatch):
+    """Подписка по https доверяет тестовому сертификату."""
+    cert, _key = tls_files
+    create = ssl.create_default_context
+    monkeypatch.setattr(fetch.ssl, "create_default_context", lambda: create(cafile=str(cert)))
+    return tls_files
+
+
+@pytest.mark.parametrize("cancel", [None, threading.Event()], ids=["without", "with"])
+def test_https_waits_longer_than_a_slice(trust, cancel):
+    """Рукопожатие и тело, которые ждут дольше куска ожидания (CANCEL_SLICE), продолжаются
+    с того места, где ждали данных."""
+    body = b"x" * 200_000
+    head = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+    server = TlsServer(*trust, [head + body[:1000], 1.2, body[1000:]], delay=1.2)
+    result = fetch_url(f"https://localhost:{server.port}/sub", timeout=5, cancel=cancel)
+    assert result.status == 200 and result.body == body
+
+
+def test_cancel_interrupts_the_tls_handshake(trust):
+    server = TlsServer(*trust, [_response(200, b"ok")], delay=5.0)
+    started = time.monotonic()
+    with pytest.raises(fetch.Cancelled):
+        fetch_url(f"https://localhost:{server.port}/sub", timeout=5, cancel=_cancel_after(0.3))
+    assert time.monotonic() - started < 2
+
+
+def test_cancel_interrupts_dns_and_is_not_a_resolver_failure(monkeypatch):
+    """Ожидание ответа DNS прерывается, а прерванный опрос резолвера не превращается в
+    «резолвер не ответил» и не переходит к следующему."""
+    silent = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    silent.bind(("127.0.0.1", 0))
+    try:
+        port = silent.getsockname()[1]
+        started = time.monotonic()
+        with pytest.raises(fetch.Cancelled):
+            plain_dns("127.0.0.1", "nl.example.com", timeout=5, port=port,
+                      cancel=_cancel_after(0.3))
+        assert time.monotonic() - started < 2
+    finally:
+        silent.close()
+
+    asked: list[str] = []
+
+    def fake_doh(entry, name, *, mark=None, timeout=8.0, cancel=None):
+        asked.append(entry)
+        raise fetch.Cancelled
+
+    monkeypatch.setattr(fetch, "doh_query", fake_doh)
+    with pytest.raises(fetch.Cancelled):
+        fetch.resolve_domain(
+            "nl.example.com", ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+            cancel=threading.Event(),
+        )
+    assert asked == ["https://1.1.1.1/dns-query"]

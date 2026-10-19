@@ -14,6 +14,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import sys
+from collections.abc import Callable
 
 # asm-generic/socket.h: SO_MARK = 36 (Linux)
 SO_MARK = 36
@@ -48,17 +49,25 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def connect_marked(host: str, port: int, *, timeout: float, mark: int | None) -> socket.socket:
+def connect_marked(
+    host: str, port: int, *, timeout: float, mark: int | None,
+    connect: Callable[[socket.socket, tuple[str, int]], None] | None = None,
+) -> socket.socket:
     """К loopback метка не ставится: он не перехватывается, а правило loopback_guard
-    (net/nft.py) отказывает помеченным пакетам к 127.0.0.0/8 — их шлёт только Xray."""
+    (net/nft.py) отказывает помеченным пакетам к 127.0.0.0/8 — их шлёт только Xray.
+    connect(sock, address) — своё соединение вместо sock.connect с таймаутом timeout
+    (прерываемое: fetch.wait_connect)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         if mark is not None and not is_loopback(host):
             if not is_mark_supported():
                 raise MarkUnavailable("SO_MARK доступен только в Linux")
             sock.setsockopt(socket.SOL_SOCKET, SO_MARK, mark)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
+        if connect is not None:
+            connect(sock, (host, port))
+        else:
+            sock.settimeout(timeout)
+            sock.connect((host, port))
     except Exception:
         sock.close()
         raise

@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import threading
 
 import links
 import pytest
@@ -229,3 +230,59 @@ def test_junk_only_cache_is_a_plain_failure(tmp_path, monkeypatch):
     _stub_fetch(monkeypatch, fetch.FetchError("сеть недоступна"))
     raws, error = _load_subscription(cache)
     assert raws == [] and error
+
+
+# --- остановка демона посреди опроса (наблюдение Н1 отчёта о Д1/Д2) ----------------
+
+FIRST, SECOND = "https://subs.example.org/first", "https://subs.example.org/second"
+
+
+def _two_subscriptions() -> Config:
+    cfg = Config()
+    cfg.subscriptions = [Subscription(name="main", url=FIRST),
+                         Subscription(name="second", url=SECOND)]
+    return cfg
+
+
+def test_stop_during_a_poll_skips_the_direct_route_and_the_cache(paths, monkeypatch, caplog):
+    """SIGTERM, пока подписка шла через Xray: прямого запроса (до 4 попыток с паузами) и
+    следующей подписки нет, кэш не подставляется и не меняется — опрос просто прерван."""
+    cache = SubscriptionCache(paths.cache_dir)
+    cache.save("main", _subscription_body(ALIVE))
+    saved = cache.saved_at("main")
+    monkeypatch.setattr(engine, "healthy_http_in", lambda _cfg: ("127.0.0.1", 10809))
+    cancel = threading.Event()
+    asked: list[tuple[str, object]] = []
+
+    def fake(url, **kwargs):
+        asked.append((url, kwargs["proxy"]))
+        kwargs["cancel"].set()  # остановка пришла, а попытка через Xray не удалась
+        raise fetch.FetchError("timed out")
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+    with caplog.at_level(logging.INFO), pytest.raises(fetch.Cancelled):
+        engine.collect(_two_subscriptions(), paths, mark=None, logger=LOG, cancel=cancel)
+    assert asked == [(FIRST, ("127.0.0.1", 10809))]
+    assert cache.load("main").body == _subscription_body(ALIVE)
+    assert cache.saved_at("main") == saved
+    assert cache.load("second") is None
+    assert "используется кэш" not in caplog.text
+
+
+def test_stop_after_one_subscription_does_not_ask_the_next(paths, monkeypatch):
+    """Остановка между подписками: следующая не запрашивается. Полученная до остановки
+    подписка — обычный удачный ответ, её кэш обновлён."""
+    monkeypatch.setattr(engine, "healthy_http_in", lambda _cfg: None)
+    cancel = threading.Event()
+    asked: list[str] = []
+
+    def fake(url, **kwargs):
+        asked.append(url)
+        kwargs["cancel"].set()
+        return fetch.FetchResult(status=200, headers={}, body=_subscription_body(ALIVE), url=url)
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+    with pytest.raises(fetch.Cancelled):
+        engine.collect(_two_subscriptions(), paths, mark=None, logger=LOG, cancel=cancel)
+    assert asked == [FIRST]
+    assert SubscriptionCache(paths.cache_dir).load("main").body == _subscription_body(ALIVE)
