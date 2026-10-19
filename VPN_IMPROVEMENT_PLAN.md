@@ -150,6 +150,9 @@ table ip6 xgw6 {
         type filter hook output priority filter; policy accept;
         oifname "lo" accept
         meta mark 0x2 accept                        # сокеты Xray к серверам с адресом IPv6
+        # Служебный ICMPv6, который шлёт само ядро (без метки и бывает на глобальный адрес):
+        # ответы ND соседу, ошибки (packet-too-big и др.) — без них ломаются ND и PMTU.
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
         ip6 daddr { fe80::/10, ff00::/8 } accept   # ND, RA, DHCPv6-клиент (ff02::1:2)
         ct direction reply accept
         meta l4proto tcp counter reject with tcp reset
@@ -175,6 +178,10 @@ table ip6 xgw6 {
   без DNS: запросы resolved наружу идут без метки и отбиваются. Так и задумано — это утечка, а
   не служебный трафик. Инвариант для Ф1 — юнит-тест, который ищет по исходникам `src/xgw`
   вызовы `getaddrinfo`/`gethostbyname` и падает, если они появились.
+- Уведомления в blocked доходят. Бот Telegram и уведомления ходят через `http-in` Xray, если тот
+  жив, иначе напрямую с меткой 2 и своим резолвером (`watch/telegram.py:276-280`). Оба пути
+  `block_output` пропускает: loopback и `meta mark 0x2`. Ф1 закрепляет это тестом: уведомление
+  «перехват заблокирован» уходит в режиме blocked.
 - Сессии, открытые до перехода: в forward установленные соединения пропускаются только для
   `@bypass4` (шаблон выше), у машины — только ответы (`ct direction reply`). Поэтому после
   перехода из off/open в blocked старые соединения обрываются с ICMP admin-prohibited. В
@@ -311,6 +318,24 @@ SOURCES = {
 - Если программы нет (`busctl`, `nft` и `ip` есть в любой установке), источник пропускается с
   предупреждением в журнале.
 
+**Проверка с учётом трафика (ложные падения под нагрузкой).** Когда LAN качает на всю ширину
+канала, очередь растёт, и сквозная проба (`_check_e2e`, `daemon.py:770`) может опоздать. Демон
+тогда засчитывает провал работающему туннелю. XRAY_DOWN это не касается: он ставится по API и
+метрикам, а не по пробам (`daemon.py:686-760`). Но DEGRADED и ALL_DEAD при этом возможны.
+- Счётчики уже есть: в конфиге Xray включены `statsOutboundUplink`/`statsOutboundDownlink`
+  (`builder.py:779-782`).
+- Перед тем как засчитать провал e2e (`e2e_fail_streak += 1`) или «мёртвого» по observatory
+  **выбранному сейчас** участнику, демон берёт `outbound>>><tag>>>>traffic>>>downlink` этого
+  участника через API (`statsquery`, без сброса) и сравнивает с прошлым шагом.
+- Если за последние `watchdog.busy_window_s = 10` секунд через него пришло
+  ≥ `watchdog.busy_bytes = 1 MiB`, провал не засчитывается: туннель заведомо жив. Пишется DEBUG
+  «проба опоздала под нагрузкой: N МБ за 10 с». Счётчик провалов не растёт, но и не
+  обнуляется.
+- Запасных и скан это не касается: у них нет пользовательского трафика. Не касается и
+  «заморозки» (FROZEN), когда трафика нет вовсе.
+- Код: `Daemon._busy(tag) -> bool` (API `xraycore/api.py`), вызов в `_check_e2e` и при подсчёте
+  мёртвых в `_signals`.
+
 **Ф2б (можно отложить): канал CLI → демон.** `/run/xgw/control.sock` (`AF_UNIX`, `SOCK_STREAM`,
 права 0600, проверка `SO_PEERCRED`: uid 0), по строке JSON на запрос:
 `{"cmd": "state"} | {"cmd": "poke", "why": "priority"} | {"cmd": "refresh"}`. `xgw priority`,
@@ -397,7 +422,41 @@ Watchdog ничего из этого не запускает: это разов
    тест.
    Конфиг: `[capture] direct_slice = true` (по умолчанию false).
 3. **По назначению** — уже есть: `routing.direct_domains`, `direct_ips`, `proxy_domains`
-   (`builder.py:712-747`). Не меняется.
+   (`builder.py:712-747`). Разгрузка этого трафика в ядро — §2.6.
+4. **Устройство LAN → свой сервер** (как профили Firewalla и Keenetic). TPROXY сохраняет адрес
+   источника, поэтому nftables менять не нужно — достаточно правила маршрутизации Xray.
+   - `panel.json`: `device_routes: {"<IPv4 устройства>": "<отпечаток сервера>"}`. Устройство,
+     как и для обхода, нужно со статической арендой — иначе адрес достанется другому.
+   - `builder.py`: для каждого устройства — balancer `dev-<ip>` с `selector = [тег сервера]` и
+     `fallbackTag` = основной балансировщик. Если выбранный сервер мёртв, устройство не
+     остаётся без сети.
+   - Правило `{"type": "field", "source": ["<ip>"], "balancerTag": "dev-<ip>"}` ставится
+     **после** правил DNS, `geoip:private` и `direct_*`: российские сайты у устройства по-прежнему
+     идут напрямую. Ставится **до** общего балансировщика.
+   - Панель: в строке устройства — «Сервер: авто / <сервер>».
+   - После Ф5 тем же способом устройство привязывается к серверу AmneziaWG (UDP для игровой
+     приставки).
+   - Устройство из `bypass_hosts` в Xray не попадает вовсе, поэтому вместе с маршрутом его
+     держать нельзя — панель не даёт поставить то и другое.
+5. **DoT и QUIC из LAN** — две опции, обе по умолчанию выключены, в панели переключатели.
+   Правила стоят в `prerouting` раньше `tproxy` (`nft.py:281-285`); `reject` в prerouting
+   загружается — проверено (nftables 1.1.6), на 6.8 проверить стендом.
+   - `[capture] reject_dot = false`. При `true` —
+     `iifname "<lan>" meta l4proto { tcp, udp } th dport 853 counter reject`: телефоны с
+     «Частным DNS» в автоматическом режиме возвращаются на порт 53, а его DNS решает шлюз
+     (`direct_domains` разрешаются российскими резолверами).
+     Утечки сейчас нет и так: порт 853 уходит в туннель как обычный TCP. Поэтому опция — ради
+     единого DNS, а не ради безопасности.
+     Минус: в **строгом** режиме («имя провайдера DNS») устройство на 53 не вернётся и
+     останется без DNS. Об этом панель пишет рядом с переключателем.
+   - `[capture] block_quic = "off" | "on" | "auto"`. Правило —
+     `iifname "<lan>" udp dport 443 counter reject with icmp type port-unreachable`: браузер
+     сразу переходит на TCP/443, без UDP поверх TCP-туннеля (VLESS-TCP/REALITY), и Xray меньше
+     нагружает процессор.
+     `"auto"` — правило стоит, только когда трафик LAN идёт через сервер без своего UDP: не
+     hysteria2, не TUIC, не WireGuard и не AWG. Демон перегружает правила при смене основного
+     сервера — это одна атомарная транзакция. Сначала делается `"on"`, `"auto"` — вторым
+     шагом.
 
 #### (в) Anti-DPI: интерфейс ядра и AmneziaWG
 
@@ -442,9 +501,13 @@ BACKENDS: tuple[CoreBackend, ...] = (XrayBackend(), SingboxBackend(), AwgBackend
   Пробы и сканы идут через существующие probe-inbound'ы сервера без изменений.
 - **Маршрут для привязанного сокета.** `awg setconf` настраивает только AllowedIPs внутри
   WireGuard, маршрутов в ядре не создаёт. Когда для интерфейса, к которому привязан сокет,
-  маршрута нет, ядро считает адрес назначения доступным напрямую через этот интерфейс — поэтому
-  маршрут не нужен (ожидание, проверяется первым тестом стенда Ф5). Если стенд покажет
-  ENETUNREACH, маршрут ставится **в отдельной таблице** (`ip route replace default dev
+  маршрута нет, ядро считает адрес назначения доступным напрямую через этот интерфейс, поэтому
+  маршрут не нужен.
+  Проверено опытом в одноразовой netns: в main только `default via … dev veth0`, интерфейс TUN
+  `awgt` с адресом `10.8.1.2/32` и без маршрутов. Сокет с `SO_BINDTODEVICE = awgt` к
+  `203.0.113.7:443` подключается: UDP — сразу, TCP — начинает соединение. ENETUNREACH нет,
+  источник `10.8.1.2`. Опыт шёл на ядре новее 6.8, так что первый тест стенда Ф5 перепроверяет
+  это на 6.8. Если всё же будет ENETUNREACH, маршрут ставится **в отдельной таблице** (`ip route replace default dev
   awg-<fp6> table <200+idx>` плюс `ip rule oif awg-<fp6> lookup <200+idx>`), но **не** в main с
   высокой метрикой: туда при пропавшем WAN ушёл бы весь трафик машины.
 - Пакеты (PPA Amnezia для Ubuntu: модуль и `awg`; либо бинарь `amneziawg-go` с проверкой
@@ -462,9 +525,62 @@ BACKENDS: tuple[CoreBackend, ...] = (XrayBackend(), SingboxBackend(), AwgBackend
 - `freedom.settings.noises` для UDP-протоколов через Xray — ступень `xray:noise` в лестнице для
   серверов с verdict CONNECT_FAIL/TIMEOUT на UDP-транспортах (mKCP, QUIC-xhttp).
 
+### 2.5 Чего не добавляем: уже есть
+
+- **Порог «заморозки» ТСПУ (16–32 КБ).** Сквозная проба по умолчанию качает 57 620 байт
+  (`config.py:31`, файл шрифта с jsDelivr). Детектор тишины 5 с отмечает соединение,
+  замолчавшее посреди тела (`watch/checks.py:44-240`). Скан выносит вердикты FROZEN и
+  STALL_BEFORE_BODY, и они запускают лестницу профилей (`generator/profiles.py`, ступени до
+  `singbox:mux_padded`). На стенде это проверено моделью ТСПУ `freeze_relay.py` с
+  `freeze_after=16384` (README, раздел проверок стенда). Отдельная проверка «64 КБ» в
+  netcheck продублировала бы e2e.
+- **Гистерезис смены сервера.** Основной сервер меняется по замеру скорости, только если
+  другой быстрее на `speed.gain_pct = 30` % (`config.py:150`, `watch/speed.py:109-116`).
+  Между раундами выбор закреплён (`xray api bo`), а не прыгает за задержкой, как у leastPing.
+
+### 2.6 Разгрузка прямого трафика в ядро (Ф6)
+
+Сейчас трафик из LAN на `routing.direct_ips` (по умолчанию `geoip:ru`) проходит TPROXY →
+Xray → outbound `direct`: процессор и сокеты тратятся на трафик, которому VPN не нужен.
+
+- Схема с `dnsmasq --nftset` к XGW не подходит: dnsmasq здесь только раздаёт адреса
+  (`port=0`), DNS отвечает Xray.
+- **Доменов в ядре нет — только IP-списки.** Set `direct4` (`type ipv4_addr; flags interval`)
+  собирается из CIDR в `direct_ips` и из `geoip:ru`. Последний разворачивается из `geoip.dat`
+  самого Xray (`/opt/xgw/xray/geoip.dat`) небольшим читателем protobuf — новый модуль
+  `src/xgw/geodat.py`, `cidrs(path, code) -> list[str]`, без зависимостей. Это порядка 10–15
+  тыс. сетей; set с `flags interval` это выдерживает.
+- Правила:
+  - prerouting: `ip daddr @direct4 return` (после `@bypass4`, до `tproxy`);
+  - forward: `iifname "<lan>" {out} ip daddr @direct4 accept`;
+  - postrouting: masquerade для `ip daddr @direct4`;
+  - output машины: `ip daddr @direct4 return`.
+  DNS (порт 53) по-прежнему перехватывается: правило про `direct4` стоит после правил DNS.
+- **Где смысл меняется.** В Xray доменные правила проверяются раньше IP
+  (`domainStrategy = "IPIfNonMatch"`, `builder.py:794`). Поэтому домен из `proxy_domains` с
+  российским адресом сейчас идёт через VPN, а в ядре пошёл бы напрямую. Отсюда: при
+  непустом `proxy_domains` разгрузка не включается, `xgw diag` объясняет почему. С
+  `device_routes` (§2.4б, п. 4) противоречия нет: правило устройства стоит после `direct_*`,
+  так что прямой трафик устройства и сейчас идёт напрямую. Опция `[routing] kernel_direct = false` по умолчанию.
+- Обновление: set пересобирается при смене `geoip.dat` (`update-xray`) и `direct_ips` — тем же
+  атомарным `nft -f`.
+
+### 2.7 Очередь на WAN: sch_cake (Ф7, по желанию)
+
+Без шейпера тяжёлая загрузка у одного клиента поднимает задержку туннеля у всех.
+- `tc qdisc replace dev <wan> root cake bandwidth <N>mbit nat diffserv4`. **Без `bandwidth`
+  cake не помогает**: очередь копится в модеме провайдера, а не на шлюзе. Поэтому опция —
+  `[network] sqm_up_mbit = 0` (0 — выключено), задаётся вручную: 90–95 % скорости отдачи
+  тарифа.
+- Входящее направление (через `ifb`) — не в этой фазе.
+- `xgw diag`: есть ли модуль `sch_cake` (`modinfo sch_cake`). В урезанных ядрах его нет — в
+  одноразовой netns проверки его не нашлось. Для 24.04 до кода выяснить, в каком пакете он
+  лежит: `linux-modules` или `linux-modules-extra`.
+- Снимается при `xgw net down` и удалении; прежний qdisc запоминается в журнале установки.
+
 ---
 
-## 3. Roadmap: пять атомарных фаз
+## 3. Roadmap: семь атомарных фаз (Ф6 и Ф7 — по желанию)
 
 У каждой фазы — свой коммит. Пункт ASSUMPTIONS (следующий номер после 213); README — только где
 поведение видно пользователю. Юнит-тесты — на `tests/fakenet.py` и `tests/fakesys.py`. Стенд —
@@ -492,7 +608,10 @@ XGW_XRAY_BIN=/path/xray XGW_SINGBOX_BIN=/path/sing-box .venv/bin/python -m pytes
 - `::test_v6_guard_with_ipv6_off_regardless_of_networkmanager`;
 - `::test_blocked_rejects_containers_except_bypass_subnets`;
 - `::test_blocked_keeps_established_only_for_bypass_devices`;
-- `::test_v6_guard_lets_xray_sockets_out` (метка 2);
+- `::test_v6_guard_lets_xray_sockets_out` (метка 2) и
+  `::test_v6_guard_keeps_kernel_icmpv6` (ND и packet-too-big на глобальный адрес);
+- `tests/test_daemon.py::test_blocked_notification_is_sent` — уведомление уходит через
+  `http-in` или напрямую с меткой 2;
 - `tests/test_net.py::test_missing_inbound_blocks_when_hold_is_block` (там же, где тесты
   `Capture`); `test_enable_refuses_without_applied_tproxy_inbound` (`test_net.py:291`) проверяет
   прежнее «напрямую» — перевести его на `hold = "direct"`;
@@ -519,6 +638,7 @@ XGW_XRAY_BIN=/path/xray XGW_SINGBOX_BIN=/path/sing-box .venv/bin/python -m pytes
 | `src/xgw/net/capture.py` | `ignore_rules_until: float` — ставится после каждого `nft.apply`; `NetEvents` пропускает события rules в этом окне, вне окна демон всё равно сверяет `loaded()` |
 | `src/xgw/daemon.py` | `Lifecycle(StrEnum)`: OFF, CONNECTING, CONNECTED, BLOCKED, OPEN; `_lifecycle() -> Lifecycle`; `wake(reason: str)`; ветки `wake_reason` в `tick()`; поле `capture.lifecycle` в status.json |
 | `src/xgw/cli.py` | `_cmd_run` запускает `NetEvents(daemon.wake)` рядом с панелью и ботом (`_cmd_run`, `cli.py:662`) |
+| `src/xgw/daemon.py`, `src/xgw/config.py` | проверка с учётом трафика: `Daemon._busy(tag) -> bool`, `watchdog.busy_window_s = 10`, `watchdog.busy_bytes = 1048576`; вызов в `_check_e2e` и при подсчёте мёртвых участников (§2.3) |
 | `src/xgw/watch/panel.py`, `src/xgw/ui/app.js` | строка «Перехват: работает / подключается / заблокирован — …» |
 | `packaging/xgw-net.service` | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/xgw /run/xgw`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW` (запись в `/proc/sys/net` — нужен `ProtectKernelTunables=no`, по умолчанию так и есть) |
 | `packaging/xgw-dhcp.service` | `ProtectSystem=strict`, `ReadWritePaths=/var/lib/xgw` (аренды уже в `/var/lib/xgw/dhcp.leases`, `dnsmasq.py:30` — `/var/lib/misc` не нужен), `ProtectHome=yes`, `PrivateTmp=yes`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN` |
@@ -533,7 +653,10 @@ XGW_XRAY_BIN=/path/xray XGW_SINGBOX_BIN=/path/sing-box .venv/bin/python -m pytes
 - `tests/test_events.py::test_monitor_events_arrive_while_process_runs` (под root, в
   `unshare -n`): событие `nft add table` и `ip link add dummy` доходит до читателя ≤ 1 с —
   страховка от буферизации пайпа в будущих версиях программ;
-- `tests/test_daemon.py::test_wake_after_resume_reloads_rules_and_scans`.
+- `tests/test_daemon.py::test_wake_after_resume_reloads_rules_and_scans`;
+- `tests/test_daemon.py::test_late_probe_under_load_is_not_a_failure` (счётчик downlink выбранного
+  растёт на 5 МБ за окно → `e2e_fail_streak` не растёт) и
+  `::test_late_probe_without_traffic_still_counts`.
 
 Стенд:
 - `test_wan_flap_wakes_daemon` — `ip netns exec gw ip link set <wan> down; sleep 3; … up` →
@@ -579,20 +702,32 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 | `src/xgw/net/capture.py` | `direct_slice_ready() -> bool`: каталог `/sys/fs/cgroup/xgwdirect.slice` есть и правило проходит `unshare -n nft -c -f` (модуль `nft_socket`); только тогда `Rules.direct_slice` заполняется. Сам slice здесь не запускается |
 | `src/xgw/cli.py` (`_cmd_run`), `src/xgw/daemon.py` | при старте `xgw.service`: `systemctl start --no-block xgwdirect.slice`, затем внеочередной `capture.up()` |
 | `packaging/xgwdirect.slice` (новый, `DefaultDependencies=no`), `src/xgw/install.py`, `src/xgw/uninstall.py` | установка, удаление, `UNIT_FILES` |
+| `src/xgw/managed.py` | `set_device_route(path, ip, fingerprint \| None)` через `_update` (как остальные правки `panel.json`); проверка, что устройство не в обходе |
+| `src/xgw/generator/builder.py` | balancer `dev-<ip>` (selector — тег сервера, `fallbackTag` — основной) и правило `source` после `direct_*` (§2.4б, п. 4) |
+| `src/xgw/net/nft.py`, `src/xgw/config.py` | `reject_dot`, `block_quic` — правила в `prerouting` до `tproxy` (§2.4б, п. 5); `"auto"` — вторым коммитом |
+| `src/xgw/watch/panel.py`, `src/xgw/ui/` | «Сервер устройства»; переключатели DoT/QUIC с предупреждением про строгий «Частный DNS» |
 | `src/xgw/cli.py` | `xgw direct-run -- …` → `os.execvp("systemd-run", […])` |
 
 Тесты:
 - `tests/test_nft.py::test_direct_slice_rule_only_when_slice_exists`;
 - `tests/test_net.py::test_xgw_net_up_never_starts_the_slice` (ранняя загрузка: только проверка
   наличия);
-- `tests/test_cli_commands.py::test_direct_run_builds_systemd_run_argv`.
+- `tests/test_cli_commands.py::test_direct_run_builds_systemd_run_argv`;
+- `tests/test_generator.py::test_device_route_goes_after_direct_rules_with_fallback`;
+- `tests/test_managed.py::test_device_route_refused_for_bypassed_device`;
+- `tests/test_nft.py::test_dot_and_quic_rules_precede_tproxy`.
 
 Стенд:
 - `test_cgroup_bypass_goes_direct` — `systemd-run --scope --slice=xgwdirect.slice ip netns exec
   gw curl http://5.5.5.1:8080/trace` доходит напрямую (лог origin: адрес источника — gw, а не
   сервер Xray); тот же curl без `systemd-run` — через Xray. Каталог cgroup создаёт systemd, не
   тест. Если ядро без `nft_socket`, тест пропускается;
-- `test_container_subnet_bypass` (netns + мост `br-test`).
+- `test_container_subnet_bypass` (netns + мост `br-test`);
+- `test_device_route_uses_its_server` — в стенде два сервера; `192.168.50.100` привязан ко
+  второму. Лог origin показывает выход второго сервера, второй LAN-адрес стенда идёт через
+  основной. При «замороженном» втором трафик устройства уходит на основной (`fallbackTag`);
+- `test_quic_rejected_and_tcp_works` — `block_quic = "on"`: UDP/443 из ns lan получает ICMP
+  port-unreachable, TCP/443 проходит.
 
 Машинный стенд:
 - `xgw direct-run -- curl …` идёт в обход;
@@ -626,6 +761,37 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 - контроль: сервер с другим `h1` — CONNECT_FAIL, лестница не запускается;
 - при пропавшем WAN (`ip link set wan down` в ns gw) трафик машины не уходит в `awg-<fp6>`.
 
+### Ф6. Разгрузка прямого трафика в ядро (§2.6, по желанию)
+
+| Файл | Что |
+|---|---|
+| `src/xgw/geodat.py` (новый) | `cidrs(path: Path, code: str) -> list[str]` — читатель `geoip.dat` (protobuf: `GeoIPList → GeoIP{country_code, cidr[]}`), только IPv4 |
+| `src/xgw/config.py` | `[routing] kernel_direct = false` |
+| `src/xgw/net/nft.py` | set `direct4`; правила в prerouting, forward, postrouting, output; `Rules.direct4` |
+| `src/xgw/net/capture.py`, `src/xgw/xraycore/update.py` | пересборка set при `update-xray` и смене `direct_ips` |
+| `src/xgw/diag.py` | «разгрузка выключена: есть proxy_domains» и число сетей в set |
+
+Тесты:
+- `tests/test_geodat.py` — разбор маленького `geoip.dat`, собранного в тесте; сверка с выводом
+  `xray`, где он есть;
+- `tests/test_nft.py::test_kernel_direct_off_with_proxy_domains`.
+
+Стенд:
+- `test_kernel_direct_bypasses_xray` — сеть origin внесена в `direct_ips`. curl из ns lan
+  доходит до неё, счётчик правила `direct4` растёт, а счётчик правила `tproxy` — нет; лог origin
+  показывает адрес шлюза, а не сервера.
+
+### Ф7. sch_cake на WAN (§2.7, по желанию)
+
+| Файл | Что |
+|---|---|
+| `src/xgw/net/sqm.py` (новый) | `apply(wan, up_mbit, runner)`, `remove(wan, runner)`, `available(runner) -> bool` |
+| `src/xgw/config.py`, `src/xgw/net/capture.py`, `src/xgw/uninstall.py` | `[network] sqm_up_mbit = 0`; применение в `net up`, снятие в `net down` и при удалении |
+| `src/xgw/diag.py` | модуль `sch_cake` и текущий qdisc на WAN |
+
+Тесты: argv `tc` на FakeKernel. Стенд — где модуль есть: при загрузке канала стенда
+задержка ping через туннель растёт меньше, чем без cake (порог с запасом).
+
 ---
 
 ## 4. Порядок и зависимости
@@ -636,6 +802,9 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 - **Ф3** и **Ф4** не зависят друг от друга. Обе требуют Ф1: `v6_guard` нужен проверке утечки IPv6,
   а правило cgroup не должно действовать в режиме blocked.
 - **Ф5** — независима от Ф2–Ф4. AmneziaWG ставит сторонние пакеты — только с согласия заказчика.
+  Привязка устройства к серверу AWG — после Ф4 и Ф5.
+- **Ф6** — после Ф1 (новый set входит в ту же транзакцию). **Ф7** — независима. Обе по
+  желанию заказчика.
 
 ---
 
@@ -661,3 +830,18 @@ xgw-dhcp.service` — оценка не хуже 6.0, после установ�
 | Secure Boot ломает модуль DKMS | принято: `mokutil --sb-state`, запасной способ `amneziawg-go` | §2.4в, Ф5 |
 | `xgw-dhcp` и `/var/lib/misc/dnsmasq.leases` | уже не нужно: аренды в `/var/lib/xgw/dhcp.leases` (`dnsmasq.py:30`) | Ф2 |
 | `ip -j monitor` (ошибка самого плана) | исправлено: `ip monitor` с `-j` печатает текст | §2.3, Ф2 |
+
+Вторая рецензия:
+
+| Предложение | Итог | Где в плане |
+|---|---|---|
+| ICMPv6 ядра (ND, packet-too-big) в `v6_guard` | принято; правило загружается | §2.1, Ф1 |
+| `SO_BINDTODEVICE` к `awg-*` без маршрута → ENETUNREACH | отклонено опытом: в netns сокет, привязанный к TUN с `/32` и без маршрутов, подключается (UDP и TCP), источник — адрес TUN. Первый тест стенда Ф5 перепроверяет на 6.8; запасной путь — отдельная таблица | §2.4в, Ф5 |
+| Бот и уведомления в blocked без метки 2 | уже так: `http-in` либо прямой путь с меткой 2 (`watch/telegram.py:276-280`); добавлен тест | §2.1, Ф1 |
+| Проба не засчитывается, если туннель качает (Traffic-Aware Healthcheck) | принято; счётчики Xray уже включены (`builder.py:779-782`) | §2.3, Ф2 |
+| Детект «16 КБ»-блокировки ТСПУ | уже есть: проба 57 620 байт, детектор тишины, FROZEN, лестница профилей, стенд `freeze_after=16384` | §2.5 |
+| Отбой DoT (853) и QUIC (UDP/443) из LAN | принято как опции, по умолчанию выключены. DoT — с предупреждением про строгий «Частный DNS»; утечки и сейчас нет. QUIC: сначала `on`, потом `auto` | §2.4б п. 5, Ф4 |
+| Разгрузка `direct_domains` в ядро через `dnsmasq --nftset` | в таком виде неприменимо: dnsmasq у XGW без DNS (`port=0`). Принято для IP-списков (`direct_ips`, `geoip:ru` из `geoip.dat`); не включается при `proxy_domains` | §2.6, Ф6 |
+| Устройство LAN → свой сервер | принято: правило `source` в Xray с balancer и `fallbackTag`, после `direct_*` | §2.4б п. 4, Ф4 |
+| Гистерезис смены сервера | уже есть: `speed.gain_pct = 30`, закрепление основного | §2.5 |
+| `sch_cake` на WAN | принято по желанию: без `bandwidth` пользы нет, поэтому скорость задаётся вручную | §2.7, Ф7 |
