@@ -30,6 +30,7 @@ from ..generator import profiles as profiling
 from ..net import dnsmasq, lan
 from ..paths import Paths, atomic_write_text
 from . import status
+from .panel import SHUTDOWN_POLL
 
 PORT = 8780
 COOKIE = "xgw_token"
@@ -299,7 +300,8 @@ class StatusPage:
         self._server.log = self.log
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
-            target=self._server.serve_forever, name="xgw-status-page", daemon=True
+            target=self._server.serve_forever, name="xgw-status-page", daemon=True,
+            kwargs={"poll_interval": SHUTDOWN_POLL},
         )
         self._thread.start()
         self.log.info("страница статуса слушает %s, порт %d (по токену)", self.address, self.port)
