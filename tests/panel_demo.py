@@ -206,7 +206,15 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
         "xray": {"ok": scene != "trouble", "version": "26.3.27"},
-        "capture": {"loaded": True},
+        # Жизненный цикл перехвата пишет демон (daemon.Lifecycle); панель — строкой под кнопкой.
+        "capture": {
+            "loaded": True,
+            "lifecycle": {"trouble": "blocked", "waiting": "blocked"}.get(scene, "connected"),
+            "lifecycle_reason": {
+                "trouble": "Xray не отвечает",
+                "waiting": "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0",
+            }.get(scene, ""),
+        },
         "members": members, "spares": spares, "selecting": [], "pin": None,
         "reserve": reserve,
         "sticky": True,

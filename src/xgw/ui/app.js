@@ -36,7 +36,7 @@
     core: "не используется: сервер умеет только sing-box (hysteria2, TUIC, AnyTLS…), а он выключен, не установлен или ещё не заведён — установить: sudo xgw update-singbox",
   };
   const KINDS = {
-    capture: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
+    capture: "перехват", lifecycle: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
     rotation: "замена", rollback: "откат", pin: "выбор сервера", panel: "панель", telegram: "Telegram",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
@@ -326,6 +326,29 @@
     return docker ? "Эта машина и контейнеры Docker выходят через VPN" : "Эта машина выходит через VPN";
   }
 
+  // Жизненный цикл перехвата (daemon.Lifecycle): тон строки и слово после «Перехват:».
+  const LIFECYCLE = {
+    connected: ["ok", "работает", "трафик идёт через VPN"],
+    connecting: ["warn", "подключается", "трафик ждёт, мимо VPN ничего не уходит"],
+    blocked: ["bad", "заблокирован", "мимо VPN ничего не уходит"],
+    open: ["warn", "временно напрямую", "трафик идёт мимо VPN"],
+    off: ["off", "снят", "трафик идёт напрямую"],
+  };
+
+  function renderLifecycle(s, stale) {
+    const line = $("lifecycle");
+    const known = LIFECYCLE[s.capture.lifecycle];
+    // Строку пишет демон: не отвечает он — она устарела.
+    line.hidden = !known || stale;
+    if (!known) return;
+    const [tone, word, tail] = known;
+    const reason = s.capture.lifecycle_reason;
+    let text = `Перехват: ${word} — ${reason || tail}`;
+    if (reason && s.capture.lifecycle === "blocked") text += `; ${tail}`;
+    line.dataset.tone = tone;
+    line.textContent = text;
+  }
+
   function renderHero(s, stale) {
     $("brand-note").textContent = "шлюз";
     const mode = s.capture.mode;
@@ -363,6 +386,7 @@
       sub = "XGW только управляет Xray: в config.toml перехват выключен";
     }
     $("hero").dataset.tone = heroTone;
+    renderLifecycle(s, stale);
     $("power-title").textContent = title;
     $("power-sub").textContent = sub;
     const pressed = on || mode === "open";

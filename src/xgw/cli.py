@@ -28,7 +28,7 @@ from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, nft, tun
-from .net.capture import CaptureError, capture_for
+from .net.capture import Capture, CaptureError, capture_for
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
 from .watch import scan, status, target
@@ -412,7 +412,13 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
     snapshot["pin"] = _active_pin(paths)
     capture = capture_for(cfg, paths)
     if capture.configured:
+        written = snapshot.get("capture") or {}
         snapshot["capture"] = capture.describe()
+        if not down:
+            # Жизненный цикл перехвата знает только демон (по итогам своего шага).
+            for key in ("lifecycle", "lifecycle_reason"):
+                if written.get(key):
+                    snapshot["capture"][key] = written[key]
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is not None and snapshot["xray"]["ok"]:
         with contextlib.suppress(ApiError):
@@ -579,7 +585,11 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
     problem = _root_problem()
     if problem:
         return _fail(problem)
-    paths.ensure()
+    # Правилам нужны только /var/lib/xgw (capture.json) и /run/xgw (блокировка). Больше
+    # xgw-net.service писать и не может (ProtectSystem=strict): каталог в /etc, которого
+    # ещё нет, paths.ensure не создал бы, и правила не загрузились бы.
+    for directory in (paths.var, paths.run):
+        directory.mkdir(parents=True, exist_ok=True)
     try:
         if args.action == "tun":
             done = capture.restore_tun()
@@ -662,6 +672,7 @@ def _sync_bot(bot, cfg: config.Config, paths: Paths, config_path: Path, daemon, 
 def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .daemon import Daemon
     from .watch import notify
+    from .watch.events import NetEvents
     from .watch.status_page import StatusPage
 
     xray_bin = _require_xray(paths)
@@ -677,6 +688,8 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     previous = None
     panel = None
     bot = None
+    events = None
+    current: list = [None]  # демон, которого будят события (после перечитывания — новый)
     try:
         while True:
             stamp = _stamp(args.config_path)
@@ -706,6 +719,16 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             if previous is not None:
                 daemon.adopt(previous)
             previous = daemon
+            current[0] = daemon
+            if events is None and capture is not None:
+                # События сети, сна и правил будят демон раньше очередного шага
+                # (watch/events.py). Только от root: nft monitor без прав не работает, а
+                # без перехвата следить не за чем.
+                events = NetEvents(
+                    lambda reason: current[0].wake(reason), quiet_rules=Capture.rules_quiet,
+                    tun_name=cfg.capture.tun_name, logger=log.get_logger("events"),
+                )
+                events.start()
             bot = _sync_bot(bot, cfg, paths, args.config_path, daemon, logger)
             panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger, bot)
             page = None
@@ -736,6 +759,8 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             logger.info("настройки перечитаны из %s", args.config_path)
             reloaded = True
     finally:
+        if events is not None:
+            events.stop()
         if panel is not None:
             panel.stop()
         if bot is not None:

@@ -181,14 +181,19 @@ class Harness(Daemon):
         self.default_speed: float | None = 50.0
         self.measured: list[str] = []
         self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
+        self.downlinks: dict[str, int] = {}  # downlink участников (тег → байт, счётчик Xray)
 
     def _read_observatory(self):
         if self.observatory is None:
             raise OSError("metrics down")
-        self._metrics = {} if self.traffic is None else {
-            "stats": {"outbound": {"proxy-x": {"downlink": self.traffic, "uplink": 0}}}
-        }
+        outbound = {tag: {"downlink": value, "uplink": 0} for tag, value in self.downlinks.items()}
+        if self.traffic is not None:
+            outbound["proxy-x"] = {"downlink": self.traffic, "uplink": 0}
+        self._metrics = {"stats": {"outbound": outbound}} if outbound else {}
         return self.observatory
+
+    def _downlink_now(self, tag):
+        return self.downlinks.get(tag)
 
     def _check_provider(self):
         return self.provider
@@ -2381,3 +2386,169 @@ def test_chosen_member_that_the_core_sees_dead_hands_over_at_once(daemon):
     daemon.tick()
     assert daemon.api.state.override == member
     assert not json.loads(daemon.store.get_meta("pin"))["down"]
+
+
+# --- события и жизненный цикл перехвата (Ф2) -------------------------------------------
+
+
+def test_rules_event_restores_rules_right_away(guarded):
+    """Чужой flush (событие nft monitor): правила сверяются сразу, посреди паузы — без
+    сквозной пробы и прочего шага, а пауза не прерывается."""
+    daemon, capture = guarded
+    checks = daemon.e2e_checks
+    capture.calls.clear()
+    capture.is_loaded = False
+    daemon.wake("rules")
+    began = time.monotonic()
+    daemon._sleep(threading.Event(), lambda: False, 0.6)
+    assert time.monotonic() - began >= 0.55
+    assert capture.actions() == ["up"] and daemon.e2e_checks == checks
+    assert any("загружены заново" in event for event in daemon.events())
+    # status.json — сразу с итогом: панель и `xgw status` не ждут очередного шага.
+    assert any("загружены заново" in row["detail"] for row in daemon.status()["events"])
+
+
+def test_net_event_starts_the_step_early_but_not_too_often(daemon):
+    _started(daemon)
+    stop = threading.Event()
+    daemon.wake("net")
+    began = time.monotonic()
+    daemon._sleep(stop, lambda: False, 30)
+    assert time.monotonic() - began < 1.0
+    daemon.tick()
+    daemon.wake("net")  # следующее — не раньше NET_WAKE_PAUSE после шага по событию
+    began = time.monotonic()
+    daemon._sleep(stop, lambda: False, 30)
+    assert 1.5 <= time.monotonic() - began < 5.0
+
+
+def test_wake_after_resume_reloads_rules_and_scans(guarded):
+    """Пробуждение после сна: правила и маршруты загружаются заново, запасные
+    проверяются сразу, а опрос подписки, срок которого прошёл во сне, — на этом же шаге
+    (монотонные часы во сне стоят)."""
+    daemon, capture = guarded
+    capture.calls.clear()
+    daemon.scanned.clear()
+    daemon.collected.clear()
+    slept = 3 * 3600
+    daemon.wall = lambda: daemon.t + slept
+    daemon.wake("sleep")
+    began = time.monotonic()
+    daemon._sleep(threading.Event(), lambda: False, 30)
+    assert time.monotonic() - began < 1.0
+    daemon.tick()
+    assert "up" in capture.actions()
+    assert daemon.scanned  # запасные — без ожидания scan_spares_minutes
+    assert daemon.collected == [True]  # подписка — через Xray, как в обычный срок
+
+
+def test_late_probe_under_load_is_not_a_failure(daemon):
+    """Канал забит: проба не успела, а через выбранный сервер за 10 с прошло 5 МБ —
+    провал не засчитывается, счётчик не растёт."""
+    _started(daemon)
+    tag = daemon.tags("proxy")[0]
+    daemon.api.state = BalancerInfo(override=None, selects=(tag,))
+    daemon.downlinks[tag] = 10_000_000
+
+    def late():
+        daemon.e2e_checks += 1
+        daemon.t += 10  # проба ждала ответа 10 с…
+        daemon.downlinks[tag] += 5_000_000  # …а трафик LAN через сервер шёл
+        return False
+
+    daemon._check_e2e = late
+    for _ in range(4):
+        assert daemon.tick() is State.HEALTHY
+        daemon.t += 20
+    assert daemon.e2e_streak == 0 and daemon.e2e_checks == 5
+
+
+def test_late_probe_without_traffic_still_counts(daemon):
+    _started(daemon)
+    tag = daemon.tags("proxy")[0]
+    daemon.api.state = BalancerInfo(override=None, selects=(tag,))
+    daemon.downlinks[tag] = 10_000_000
+
+    def late():
+        daemon.t += 10
+        daemon.downlinks[tag] += 100_000  # меньше busy_bytes за окно
+        return False
+
+    daemon._check_e2e = late
+    for _ in range(3):
+        daemon.tick()
+        daemon.t += 20
+    assert daemon.e2e_streak == 3 and daemon.machine.state is State.ALL_DEAD
+
+
+def test_dead_member_carrying_traffic_is_not_counted_dead(daemon):
+    """Ядро сочло выбранного участника мёртвым (его проба опоздала в очереди), а через
+    него с прошлого шага идёт трафик: он жив, DEGRADED не ставится."""
+    _started(daemon)
+    tag = daemon.tags("proxy")[0]
+    daemon.api.state = BalancerInfo(override=None, selects=(tag,))
+    daemon.downlinks[tag] = 1_000_000
+    daemon.tick()
+    daemon.t += 20
+    daemon.downlinks[tag] += 20_000_000
+    daemon.set_alive(**{tag.replace("-", "_"): False})
+    assert daemon.tick() is State.HEALTHY
+    assert tag not in daemon.dead_since
+    daemon.t += 20  # трафик кончился — мёртв как мёртв
+    assert daemon.tick() is State.DEGRADED
+
+
+def test_lifecycle_follows_capture_and_xray(guarded):
+    daemon, capture = guarded
+    life = lambda: daemon.status()["capture"]["lifecycle"]  # noqa: E731
+    assert life() == "connecting"  # первый шаг: ядро ещё не проверило ни одного сервера
+    daemon.tick()
+    assert life() == "connected"
+
+    daemon.observatory, daemon.api.down = None, True  # Xray не отвечает: fail_mode = closed
+    daemon.tick()
+    written = daemon.status()["capture"]
+    assert written["lifecycle"] == "blocked" and written["lifecycle_reason"] == "Xray не отвечает"
+    assert any(
+        event.startswith("lifecycle: перехват: работает → заблокирован")
+        for event in daemon.events()
+    )
+
+    daemon.api.down = False
+    daemon.observatory = {}  # Xray перезапущен и ещё не проверил ни одного сервера
+    daemon.tick()
+    assert life() == "connecting"
+    daemon.set_alive()
+    daemon.tick()
+    assert life() == "connected"
+
+    capture.problem, capture.blocked = "в применённом конфиге Xray нет inbound tproxy-in", True
+    daemon.tick()
+    written = daemon.status()["capture"]
+    assert written["lifecycle"] == "blocked" and "tproxy-in" in written["lifecycle_reason"]
+    capture.problem = ""
+    capture.state = "off"  # xgw disable
+    daemon.tick()
+    assert life() == "off"
+    kinds = [event.split(":")[0] for event in daemon.events()]
+    # В журнал событий — только когда трафик перестаёт или снова начинает идти через VPN:
+    # «подключается → работает» после перезапуска Xray туда не пишется.
+    assert not any("подключается → работает" in event for event in daemon.events())
+    assert kinds.count("lifecycle") == 4
+
+
+def test_members_dead_during_the_outage_are_unknown_right_after_wan_returns(daemon):
+    """Шаг по событию сети идёт сразу, как WAN вернулся, а ядро ещё помнит пробы, которые
+    не прошли без связи: исправные серверы не меняются, отсчёт смерти начинается заново."""
+    _started(daemon)
+    daemon.cfg.filters.rotate_after_min = 0
+    tag = daemon.tags("proxy")[0]
+    daemon.provider = False
+    daemon.set_alive(**{tag.replace("-", "_"): False})
+    assert daemon.tick() is State.WAN_DOWN
+    daemon.t += 600
+    daemon.provider = True  # WAN вернулся, ядро ещё не повторило пробу
+    assert daemon.tick() is State.HEALTHY
+    assert daemon.applied == [] and tag not in daemon.dead_since
+    daemon.t += 20
+    assert daemon.tick() is State.DEGRADED  # мёртв и после возврата — уже по-настоящему

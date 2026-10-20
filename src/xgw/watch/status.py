@@ -660,6 +660,31 @@ def join_ru(items: list[str]) -> str:
     return ", ".join(items[:-1]) + " и " + items[-1]
 
 
+# Жизненный цикл перехвата (daemon.Lifecycle): слово после «Перехват:» и что это значит,
+# когда причины нет.
+LIFECYCLE_WORDS = {
+    "connected": ("работает", "трафик идёт через VPN"),
+    "connecting": ("подключается", "трафик ждёт, мимо VPN ничего не уходит"),
+    "blocked": ("заблокирован", "мимо VPN ничего не уходит"),
+    "open": ("временно напрямую", "трафик идёт мимо VPN"),
+    "off": ("снят", "трафик идёт напрямую"),
+}
+
+
+def render_lifecycle(capture: dict) -> str:
+    """Строка «Сейчас: перехват работает — …» по итогам последнего шага демона; пусто —
+    демон её не писал."""
+    known = LIFECYCLE_WORDS.get(str(capture.get("lifecycle") or ""))
+    if known is None:
+        return ""
+    word, tail = known
+    reason = str(capture.get("lifecycle_reason") or "")
+    text = f"Сейчас: перехват {word} — {reason or tail}"
+    if reason and capture.get("lifecycle") == "blocked":
+        text += f"; {tail}"
+    return text
+
+
 def render_capture(capture: dict) -> str:
     """Строка о перехвате: что через Xray, что мимо, загружены ли правила."""
     mode = capture.get("mode")
@@ -814,6 +839,9 @@ def render_status(status: dict) -> str:
         lines.append(status["probe_target"])
     if status.get("capture"):
         lines.append(render_capture(status["capture"]))
+        lifecycle = render_lifecycle(status["capture"])
+        if lifecycle:
+            lines.append(lifecycle)
     pin = status.get("pin")
     if pin:
         lines.append(render_pin(pin))

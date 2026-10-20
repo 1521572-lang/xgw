@@ -469,7 +469,14 @@ class Panel:
         xray = snapshot.get("xray") or {}
         capture = self._capture()
         info = capture.describe(check=False)
-        loaded = (snapshot.get("capture") or {}).get("loaded")
+        written = snapshot.get("capture") or {}
+        loaded = written.get("loaded")
+        # Жизненный цикл перехвата считает демон (daemon.Lifecycle): панель его только
+        # показывает строкой «Перехват: …». Демона нет — строки нет.
+        lifecycle = {
+            "lifecycle": written.get("lifecycle") or "",
+            "lifecycle_reason": written.get("lifecycle_reason") or "",
+        }
 
         quotas, errors = snapshot.get("quota") or {}, snapshot.get("sub_errors") or {}
         servers, gone = self._servers(members, spares, quotas)
@@ -525,7 +532,7 @@ class Panel:
             "action": snapshot.get("action") or "",
             "since": snapshot.get("since"),
             "xray": {"ok": xray_ok, "version": xray.get("version") or ""},
-            "capture": {**info, "loaded": loaded},
+            "capture": {**info, "loaded": loaded, **lifecycle},
             "power": self._power(info["mode"], xray_ok, bool(members)),
             "members": members,
             "spares": spares,

@@ -21,6 +21,34 @@ ExecReload=/usr/local/bin/xgw net up
 RuntimeDirectory=xgw
 RuntimeDirectoryPreserve=yes
 TimeoutStartSec=60
+# Защита службы: писать она может только своё состояние (capture.json) и блокировку;
+# /proc/sys/net (форвардинг, BBR) остаётся доступен — ProtectKernelTunables не включён.
+# CAP_NET_ADMIN — nft, ip rule, ip route, TUN и sysctl сети; CAP_NET_RAW — запас для
+# iproute2 и nft, которым он бывает нужен на сырых сокетах netlink.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/xgw /run/xgw
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Остальное — то, что службе не нужно вовсе: модули, журнал ядра, часы, cgroup, свои
+# пространства имён, realtime, setuid-файлы и системные вызовы вне @system-service.
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Сокеты: netlink (nft, ip), UNIX и IP. /dev/net/tun (capture.method = "tun") открыт:
+# PrivateDevices не включён.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
 [Install]
 WantedBy=sysinit.target

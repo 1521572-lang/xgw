@@ -441,3 +441,128 @@ def test_direct_session_is_cut_when_blocked(tmp_path):
         assert time.monotonic() - cut < 6.0  # оборвалась сразу, а не дождалась 12 с
     finally:
         stand.stop()
+
+
+# --- события (Ф2): шаг watchdog — минута, всё, что быстрее, сделано по событию -----------
+
+
+@pytest.fixture()
+def watched(tmp_path):
+    """Шлюз с перехватом и демоном, у которого шаг watchdog — минута: всё, что случается
+    быстрее, сделано по событию (watch/events.py), а не очередным шагом."""
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up(capture=True, watchdog_s=60)
+        enabled = stand.xgw("enable")
+        assert enabled.returncode == 0, enabled.stderr
+        stand.start_daemon()
+        assert wait_for(
+            lambda: (s := stand.xgw_json("status"))["daemon"] and s["state"] == "HEALTHY",
+            60, step=1,
+        ), stand.tail("daemon", 30)
+        time.sleep(1.5)  # мониторы событий подписались на netlink
+        yield stand
+    finally:
+        stand.stop()
+
+
+def _rules_back(stand: Stand) -> bool:
+    """Таблица ip xgw на месте и её цепочки не пустые (не только имена после flush)."""
+    import re
+
+    listing = stand.run_in("gw", "nft", "list", "table", "ip", "xgw")
+    if listing.returncode != 0:
+        return False
+    chains = {
+        name: any(line.strip() and not line.strip().startswith("type ")
+                  for line in body.splitlines())
+        for name, body in re.findall(
+            r"^\s*chain (\w+) \{\n(.*?)^\s*\}", listing.stdout, flags=re.MULTILINE | re.DOTALL
+        )
+    }
+    return {"output", "forward", "prerouting"} <= set(chains) and all(chains.values())
+
+
+def _log_times(stand: Stand, needle: str) -> list[float]:
+    """Время (time.time()) строк журнала демона с needle."""
+    import datetime
+
+    times = []
+    for line in (stand.logs / "daemon.log").read_text(encoding="utf-8").splitlines():
+        if needle in line:
+            stamp = datetime.datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f")
+            times.append(stamp.timestamp())
+    return times
+
+
+def test_foreign_flush_is_restored_quickly(watched):
+    """Чужие flush ruleset, flush table и delete chain: правила снова на месте ≤ 2 с (шаг
+    watchdog — минута), а своя загрузка XGW внеочередной проверки не вызывает."""
+    stand = watched
+    check = "внеочередная проверка правил перехвата"
+    assert _log_times(stand, check) == []
+    for count, argv in enumerate((
+        ("nft", "flush", "ruleset"),
+        ("nft", "flush", "table", "ip", "xgw"),
+        ("nft", "delete", "chain", "ip", "xgw", "output"),
+    ), start=1):
+        assert _rules_back(stand)
+        began = time.monotonic()
+        stand.gw_run(*argv)
+        assert not _rules_back(stand), argv
+        assert wait_for(lambda: _rules_back(stand), 2.0, step=0.05), (
+            argv, stand.tail("daemon", 30))
+        assert time.monotonic() - began <= 2.0
+        time.sleep(3.0)  # окно debounce прошло: свои загрузки не будят демон
+        assert len(_log_times(stand, check)) == count, (argv, stand.tail("daemon", 30))
+    assert gateway_exit(stand) == VIA_VPN
+
+
+def gateway_exit(stand: Stand) -> str:
+    return stand.exit_ip("lan")
+
+
+def test_wan_flap_wakes_daemon(watched):
+    """WAN пропал и вернулся: внеочередной шаг — не позже 2 с после подъёма (по журналу),
+    а не через минуту, и шлюз снова HEALTHY."""
+    stand = watched
+    step = "внеочередной шаг: событие сети"
+    members = set(stand.members())
+    stand.gw_run("ip", "link", "set", "wan0", "down")
+    assert wait_for(lambda: stand.xgw_json("status")["state"] == "WAN_DOWN", 10, step=0.5), (
+        stand.tail("daemon", 30))
+    time.sleep(3)
+    up_at = time.time()
+    stand.gw_run("ip", "link", "set", "wan0", "up")
+    assert wait_for(lambda: [t for t in _log_times(stand, step) if t >= up_at - 0.05], 5, 0.1), (
+        stand.tail("daemon", 30))
+    first = min(t for t in _log_times(stand, step) if t >= up_at - 0.05)
+    assert first - up_at <= 2.0
+    assert wait_for(lambda: stand.xgw_json("status")["state"] == "HEALTHY", 15, step=0.5), (
+        stand.tail("daemon", 30))
+    assert stand.exit_ip("lan") == VIA_VPN
+    # Пробы, не прошедшие без связи, — не повод менять исправные серверы.
+    assert set(stand.members()) == members, stand.tail("daemon", 30)
+    assert "замена участников" not in (stand.logs / "daemon.log").read_text(encoding="utf-8")
+
+
+def test_daemon_with_event_monitors_stops_quickly(watched):
+    """Мониторы событий (ip, busctl, nft monitor) не задерживают остановку демона:
+    `systemctl restart xgw` занимал ~0,5 с (ASSUMPTIONS 215–217) и должен таким остаться."""
+    import signal
+
+    stand = watched
+    daemon = next(
+        proc for proc in stand._procs if "xgw" in proc.args and "run" in proc.args
+    )
+    monitors = stand.run_in("gw", "pgrep", "-f", "-a", "nft monitor|ip -o monitor").stdout
+    assert "nft monitor" in monitors and "ip -o monitor" in monitors, monitors
+    began = time.monotonic()
+    daemon.send_signal(signal.SIGTERM)
+    daemon.wait(timeout=10)
+    took = time.monotonic() - began
+    print(f"остановка демона: {took:.2f} с")
+    assert took < 1.5, (took, stand.tail("daemon", 20))
+    left = stand.run_in("gw", "pgrep", "-f", "nft monitor|ip -o monitor")
+    assert left.returncode == 1, left.stdout  # мониторы не пережили демон

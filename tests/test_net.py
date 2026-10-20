@@ -991,3 +991,55 @@ def test_lan_subnet_check_survives_a_missing_ip_tool():
 
     assert lan.occupied_networks(broken) == []
     assert lan.subnet_conflicts(_subnet_cfg(), broken) == []
+
+
+def _flush_table(text: str) -> str:
+    """Таблица после чужого `nft flush table`: цепочки и их заголовки остались, правил нет."""
+    kept, chain = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("chain "):
+            chain = True
+        elif chain and stripped == "}":
+            chain = False
+        elif chain and not stripped.startswith("type "):
+            continue
+        kept.append(line)
+    return "\n".join(kept) + "\n"
+
+
+def test_flushed_table_is_not_taken_for_loaded(gateway):
+    """`nft flush table ip xgw` оставляет цепочки пустыми: имена на месте, а перехвата и
+    маскарадинга нет. Раньше loaded() смотрел только на имена и считал правила на месте."""
+    gateway.enable()
+    key = ("ip", "xgw")
+    gateway.kernel.tables[key] = _flush_table(gateway.kernel.tables[key])
+    assert "chain output {" in gateway.kernel.tables[key]
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+
+
+def test_own_rule_loads_open_the_quiet_window(gateway, monkeypatch):
+    """Свои загрузки правил демон по событиям nft monitor не будит: окно открыто, пока идёт
+    nft -f, и ещё секунду после (события netlink приходят асинхронно)."""
+    from xgw.net import capture as capture_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(capture_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(Capture, "ignore_rules_until", 0.0)
+    seen: list[bool] = []
+    kernel = gateway.kernel
+    original = kernel.__call__
+
+    def watching(argv, **kwargs):
+        if list(argv[:2]) == ["nft", "-f"]:
+            seen.append(Capture.rules_quiet())
+        return original(argv, **kwargs)
+
+    gateway.runner = watching
+    assert not Capture.rules_quiet()
+    gateway.enable()
+    assert seen and all(seen)  # во время самой загрузки
+    assert Capture.rules_quiet()
+    clock[0] += 1.1
+    assert not Capture.rules_quiet()

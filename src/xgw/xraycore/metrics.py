@@ -98,3 +98,20 @@ def proxy_traffic(metrics: dict) -> int | None:
                 if isinstance(value, int) and not isinstance(value, bool)
             )
     return total
+
+
+def outbound_downlinks(metrics: dict) -> dict[str, int]:
+    """Счётчики downlink серверов в работе (outbound «proxy-*»): тег → байт с запуска Xray.
+    Нет счётчиков — пустой словарь (формат — как у proxy_traffic)."""
+    section = metrics.get("stats") if isinstance(metrics, dict) else None
+    outbound = section.get("outbound") if isinstance(section, dict) else None
+    if not isinstance(outbound, dict):
+        return {}
+    result: dict[str, int] = {}
+    for tag, counters in outbound.items():
+        value = counters.get("downlink") if isinstance(counters, dict) else None
+        if str(tag).startswith("proxy-") and isinstance(value, int) and not isinstance(
+            value, bool
+        ):
+            result[str(tag)] = value
+    return result

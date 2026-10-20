@@ -191,3 +191,14 @@ def test_proxy_traffic_sums_only_servers_in_work():
     assert proxy_traffic(metrics) == 3_000_317
     assert proxy_traffic({"observatory": {}}) is None
     assert proxy_traffic({"stats": {"outbound": {}}}) == 0
+
+
+def test_outbound_downlinks_are_per_server_in_work():
+    from xgw.xraycore.metrics import outbound_downlinks
+
+    metrics = {"stats": {"outbound": {
+        "proxy-a": {"downlink": 3000205, "uplink": 102}, "proxy-b": {"uplink": 5},
+        "spare-c": {"downlink": 7}, "direct": {"downlink": 9}, "proxy-d": {"downlink": True},
+    }}}
+    assert outbound_downlinks(metrics) == {"proxy-a": 3000205}
+    assert outbound_downlinks({}) == {} and outbound_downlinks({"stats": None}) == {}

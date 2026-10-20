@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import time
 from pathlib import Path
 
 from .. import log
@@ -83,6 +84,13 @@ def capture_for(cfg: Config, paths: Paths, **kwargs) -> Capture:
 
 class Capture:
     reloaded_text = "правила сети не были загружены — загружены заново"
+    # До этого момента (time.monotonic()) события `nft monitor` о таблицах XGW вызваны
+    # своей загрузкой, и демон по ним не просыпается (watch/events.py). Общее для всех
+    # экземпляров процесса: панель включает и снимает перехват своим экземпляром, а
+    # события слушает демон. Пока идёт `nft -f`, окно открыто (inf): события netlink
+    # приходят асинхронно и могут опередить возврат из nft.
+    ignore_rules_until: float = 0.0
+    RULES_QUIET = 1.0  # сколько ещё ждать своих событий после загрузки
 
     def __init__(
         self,
@@ -185,6 +193,20 @@ class Capture:
 
     def _lock(self):
         return file_lock(self.paths.run / "net.lock", timeout=30.0)
+
+    @contextlib.contextmanager
+    def _own_rules(self):
+        """Загрузка своих правил: события о них демона не будят (ignore_rules_until)."""
+        Capture.ignore_rules_until = float("inf")
+        try:
+            yield
+        finally:
+            Capture.ignore_rules_until = time.monotonic() + self.RULES_QUIET
+
+    @staticmethod
+    def rules_quiet() -> bool:
+        """Сейчас события правил — от своей загрузки."""
+        return time.monotonic() < Capture.ignore_rules_until
 
     def _families(self) -> tuple[int, ...]:
         return (4, 6) if self.ipv6_usable() else (4,)
@@ -392,10 +414,12 @@ class Capture:
                 # Сначала маршрут для помеченных пакетов (интерфейс TUN уже подготовлен),
                 # потом правила, которые метят; ненужное убирается уже после них.
                 self._routes_up(rules)
-                warnings = nft.apply(rules, self.runner)
+                with self._own_rules():
+                    warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
             else:
-                warnings = nft.apply(rules, self.runner)
+                with self._own_rules():
+                    warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
         except (cmd.CommandError, OSError) as exc:
             raise CaptureError(str(exc)) from exc
@@ -494,7 +518,8 @@ class Capture:
         (`xgw uninstall`) вызывает это уже после остановки служб."""
         with self._lock():
             try:
-                nft.delete(self.runner)
+                with self._own_rules():
+                    nft.delete(self.runner)
                 self._routes_down(self.rules("off"))  # перехвата нет: убирается всё
                 if remove_tun:
                     tun.remove(self.cfg.capture.tun_name, self.runner)
@@ -561,9 +586,13 @@ class Capture:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
-        chains = nft.loaded_chains(self.runner)
-        if chains is None:
+        listed = nft.chain_rules(self.runner)
+        if listed is None:
             return None
+        chains = set(listed)
+        # Цепочка на месте, а правил в ней нет — её опустошил чужой flush table / flush
+        # chain: нужная такая цепочка — всё равно что пропавшая.
+        empty = {name for name, filled in listed.items() if not filled}
         guard = self._v6_guard_loaded(rules)
         if guard is not True:
             return guard
@@ -575,7 +604,7 @@ class Capture:
                 wanted.add("forward")
             if rules.lan_if:
                 wanted.add("postrouting")
-            return wanted <= chains and not chains & {
+            return wanted <= chains - empty and not chains & {
                 "prerouting", "output", "loopback_guard", "containers"}
         if "block_output" in chains:
             return False  # осталась блокировка, а inbound в Xray уже есть
@@ -590,7 +619,7 @@ class Capture:
             expected.add("output")
         if rules.lan_if:
             expected |= {"forward", "postrouting"}
-        if not expected <= chains:
+        if not expected <= chains - empty:
             return False
         if not rules.capture:
             return not chains & {"prerouting", "output", "loopback_guard"}
@@ -599,13 +628,15 @@ class Capture:
         if not rules.containers and "containers" in chains:
             return False  # capture.containers выключили
         if rules.capture6 or self.ipv6_usable():
-            chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
-            if chains6 is None:
+            listed6 = nft.chain_rules(self.runner, "ip6", nft.TABLE6)
+            if listed6 is None:
                 return None
+            chains6 = set(listed6)
             captured6 = {"output", "loopback_guard"}
             if rules.prerouting6:
                 captured6.add("prerouting")
-            if rules.capture6 and not captured6 <= chains6:
+            filled6 = {name for name, filled in listed6.items() if filled}
+            if rules.capture6 and not captured6 <= filled6:
                 return False
             if not rules.capture6 and chains6 & {"prerouting", "output", "loopback_guard"}:
                 return False  # остались правила от ipv6 = proxy
@@ -648,10 +679,12 @@ class Capture:
         """v6_guard в ядре ровно тогда, когда нужен; None — узнать нельзя."""
         if not self.ipv6_usable():
             return True  # таблицы ip6 в таком ядре нет, закрывать нечего
-        chains6 = nft.loaded_chains(self.runner, "ip6", nft.TABLE6)
-        if chains6 is None:
+        listed6 = nft.chain_rules(self.runner, "ip6", nft.TABLE6)
+        if listed6 is None:
             return None
-        return ("v6_guard" in chains6) == rules.v6_guard
+        if rules.v6_guard:
+            return bool(listed6.get("v6_guard"))  # и пустой (flush) — не загружен
+        return "v6_guard" not in listed6
 
     def describe(self, *, check: bool = True) -> dict:
         """Сведения для `xgw status`."""

@@ -626,3 +626,53 @@ def test_real_nft_accepts_blocked_rules_in_one_transaction(name):
         ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, timeout=30
     )
     assert done.returncode == 0, f"{done.stderr}\n{text}"
+
+
+# Чужой `nft flush table ip xgw`: цепочки на месте, правил нет (вывод `nft list table`).
+FLUSHED = """table ip xgw {
+	set bypass4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 100.64.0.0/10,
+				127.0.0.0/8 }
+	}
+
+	chain output {
+		type route hook output priority mangle; policy accept;
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+	}
+}
+"""
+
+
+def test_flushed_chains_are_told_from_loaded():
+    chains = nft.chain_rules(lambda argv, **kwargs: FLUSHED)
+    assert chains == {"output": False, "forward": True}
+    assert nft.loaded_chains(lambda argv, **kwargs: FLUSHED) == {"output", "forward"}
+
+
+@pytest.mark.parametrize("method", ["tproxy", "tun"])
+@pytest.mark.parametrize("ipv6", ["off", "proxy", "direct"])
+@pytest.mark.parametrize("mode", ["on", "off", "blocked"])
+def test_rendered_chains_are_never_empty(method, ipv6, mode):
+    """Пустую цепочку Capture.loaded() принимает за опустошённую чужим flush и загружает
+    правила заново — значит, своих пустых цепочек быть не должно, иначе загрузка шла бы на
+    каждом шаге демона."""
+    for local, lan, containers in ((True, True, True), (True, False, False), (False, True, False)):
+        cfg = _cfg(ipv6=ipv6)
+        cfg.capture.method, cfg.capture.local, cfg.capture.lan = method, local, lan
+        cfg.capture.containers = containers
+        rules, _warnings = nft.build_rules(
+            cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=(123,)
+        )
+        for text, family, table in (
+            (nft.render(rules), "ip", nft.TABLE), (nft.render6(rules), "ip6", nft.TABLE6)
+        ):
+            if not text:
+                continue
+            chains = nft.chain_rules(lambda argv, text=text, **kwargs: text, family, table)
+            assert chains and all(chains.values()), (local, lan, containers, family, chains)

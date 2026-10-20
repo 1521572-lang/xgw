@@ -608,11 +608,36 @@ def loaded_chains(
 ) -> set[str] | None:
     """Имена цепочек загруженной таблицы (`ip xgw` или `ip6 xgw6`); пустое множество —
     таблицы нет, None — узнать не удалось (нет прав или nft)."""
+    chains = chain_rules(runner, family, table)
+    return None if chains is None else set(chains)
+
+
+def chain_rules(
+    runner: Runner, family: str = "ip", table: str = TABLE
+) -> dict[str, bool] | None:
+    """Цепочки загруженной таблицы: имя → есть ли в ней хоть одно правило. Пустыми свои
+    цепочки XGW не бывают (test_rendered_chains_are_never_empty) — такую оставляет чужой
+    `nft flush table ip xgw` или `flush chain`: имена на месте, а перехвата нет. {} —
+    таблицы нет, None — узнать не удалось (нет прав или nft)."""
     try:
         listing = runner(["nft", "list", "table", family, table])
     except CommandError as exc:
         text = str(exc)
         if "No such file or directory" in text or "does not exist" in text:
-            return set()
+            return {}
         return None
-    return set(re.findall(r"^\s*chain (\w+) \{", listing, flags=re.MULTILINE))
+    chains: dict[str, bool] = {}
+    for name, body in re.findall(
+        r"^\s*chain (\w+) \{\n(.*?)^\s*\}", listing, flags=re.MULTILINE | re.DOTALL
+    ):
+        chains[name] = chains.get(name, False) or _has_rules(body)
+    return chains
+
+
+def _has_rules(body: str) -> bool:
+    """Есть ли в теле цепочки (вывод `nft list`) хоть одно правило, кроме строки hook."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith(("type ", "policy ", "comment ", "#")):
+            return True
+    return False
