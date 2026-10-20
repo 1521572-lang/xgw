@@ -98,6 +98,13 @@ class Capture:
         return self.fail_mode != "open" and self.hold.strip().lower() != "direct"
 
 
+@dataclass
+class TailscaleConf:
+    # Как ходят соединения самого tailscaled (WireGuard, DERP, управление), если он стоит
+    # на машине: "direct" — напрямую, мимо Xray, всегда; "vpn" — через Xray, пока он
+    # отвечает, а когда не отвечает или правила в режиме blocked — напрямую.
+    route: str = "direct"
+
 
 @dataclass
 class Subscription:
@@ -321,6 +328,7 @@ class Config:
     status: StatusConf = field(default_factory=StatusConf)
     notify: Notify = field(default_factory=Notify)
     panel: PanelConf = field(default_factory=PanelConf)
+    tailscale: TailscaleConf = field(default_factory=TailscaleConf)
     managed: Managed = field(default_factory=Managed)
 
 
@@ -341,6 +349,7 @@ _SECTIONS = {
     "status": StatusConf,
     "notify": Notify,
     "panel": PanelConf,
+    "tailscale": TailscaleConf,
 }
 
 
@@ -584,6 +593,13 @@ def _validate(cfg: Config) -> list[str]:
         warnings.append(
             f"capture.hold={cfg.capture.hold!r}: допустимо block или direct; принято block"
         )
+    route = cfg.tailscale.route.strip().lower()
+    if route not in ("direct", "vpn"):
+        warnings.append(
+            f"tailscale.route={cfg.tailscale.route!r}: допустимо direct или vpn; принято direct"
+        )
+        route = TailscaleConf().route
+    cfg.tailscale.route = route
     for name in ("lan_if", "wan_if"):
         value = getattr(cfg.network, name)
         if value and not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", value):

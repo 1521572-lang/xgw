@@ -25,6 +25,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import engine, fetch, log, masking
+from . import tailscale as ts
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
 from .generator import singbox as singboxing
@@ -143,6 +144,7 @@ class Diag:
             ("Журнал", self._journal),
             ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
+            ("Tailscale", self._tailscale),
         ]
         if self.net:
             groups += [("probe.url", self._probe), ("bootstrap DNS", self._bootstrap)]
@@ -450,6 +452,8 @@ class Diag:
             chain = item.get("chain") if isinstance(item, dict) else None
             if not chain or chain.get("table") in (nft.TABLE, nft.TABLE6):
                 continue
+            if str(chain.get("name", "")).startswith("ts-"):
+                continue  # цепочки Tailscale: с ним XGW уживается сам (раздел «Tailscale»)
             if str(chain.get("name", "")).startswith("DOCKER"):
                 docker = True
             if chain.get("hook") in dropping and chain.get("policy") == "drop":
@@ -929,6 +933,134 @@ class Diag:
         return [Check("Трафик проверок", OK, text)]
 
     # --- сеть -------------------------------------------------------------------
+
+    # --- Tailscale (Т1) ----------------------------------------------------------
+
+    def _tailscale(self) -> list[Check]:
+        """Tailscale рядом с XGW: служба, исключения в правилах (К1–К4), как он выходит в
+        интернет и две ловушки, которые XGW исправить не может, — адрес провайдера из
+        100.64.0.0/10 (К5) и «Override local DNS» в tailnet (К6)."""
+        name = "Tailscale"
+        cli = self.which("tailscale") is not None
+        if not ts.present(self.paths):
+            text = "установлен, но tailscaled не запущен" if cli else "не установлен"
+            return [Check(name, OK, text + " — не используется")]
+        result: list[Check] = []
+        state = ts.status(self.runner) if cli else None
+        if state is None:
+            result.append(Check(name, WARN, "tailscaled работает, но tailscale status не ответил",
+                                "sudo tailscale status"))
+        elif state.backend == "Running":
+            result.append(Check(name, OK, "tailscaled работает, вход выполнен"))
+        elif state.backend == "NeedsLogin":
+            result.append(Check(
+                name, WARN, "tailscaled работает, но нужен вход в tailnet",
+                f"откройте ссылку входа: {state.auth_url}" if state.auth_url
+                else "sudo tailscale up",
+            ))
+        else:
+            result.append(Check(
+                name, WARN, f"tailscaled работает, состояние — {state.backend or 'неизвестно'}",
+                "sudo tailscale up",
+            ))
+        result += self._tailscale_rules()
+        if self.net and state is not None and state.backend == "Running":
+            result += self._tailscale_path()
+        result += self._tailscale_cgnat()
+        result += self._tailscale_dns()
+        return result
+
+    def _tailscale_rules(self) -> list[Check]:
+        """Исключения Tailscale в правилах XGW загружены (как v6_guard в Ф1)."""
+        name = "Tailscale: правила"
+        if not (self.installed and self.root and self.cfg.capture.local):
+            return []
+        loaded = Capture(
+            self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
+        ).tailscale_loaded()
+        if loaded is None:
+            return []
+        if not loaded:
+            text = ("Tailscale работает, а исключений для него в правилах XGW нет: его "
+                    "соединения уходят в Xray, имена MagicDNS не разрешаются, в режиме "
+                    "blocked и по IPv6 он отрезан")
+            if self.preinstall:
+                return [Check(name, WARN, text, "установка загрузит правила заново")]
+            return [Check(name, FAIL, text, "sudo xgw net up")]
+        route = ("напрямую, мимо Xray" if self.cfg.tailscale.route == "direct"
+                 else "через Xray, пока он отвечает (tailscale.route = vpn)")
+        return [Check(name, OK, "tailnet, MagicDNS и tailscale0 — мимо перехвата и блокировок; "
+                      f"сам Tailscale ходит {route}")]
+
+    def _tailscale_path(self) -> list[Check]:
+        """`tailscale netcheck`: есть ли UDP (прямые соединения) и ближайший DERP."""
+        name = "Tailscale: связь"
+        found = ts.netcheck(self.runner)
+        if found is None or found.udp is None:
+            return [Check(name, WARN, "tailscale netcheck не ответил", "sudo tailscale netcheck")]
+        derp = found.derp or "неизвестен"
+        if found.latency_ms is not None:
+            derp += f", {found.latency_ms:g} мс"
+        if not found.udp:
+            return [Check(
+                name, WARN, f"нет UDP — соединения только через ретранслятор DERP ({derp})",
+                "провайдер или роутер режет UDP; Tailscale работает, но медленнее",
+            )]
+        return [Check(name, OK, f"UDP есть; ближайший DERP: {derp}")]
+
+    def _tailscale_cgnat(self) -> list[Check]:
+        """К5: Tailscale (ts-input) отбрасывает пакеты с адресов 100.64.0.0/10, пришедшие не
+        через tailscale0. Если провайдер выдаёт адрес, шлюз или DNS оттуда (CGNAT), сеть
+        провайдера у машины ломается."""
+        if self.which("nft") is None or not self.root:
+            return []
+        try:
+            ruleset = json.loads(self.runner(["nft", "-j", "list", "ruleset"], timeout=30.0))
+        except (cmd.CommandError, json.JSONDecodeError):
+            return []
+        items = ruleset.get("nftables", []) if isinstance(ruleset, dict) else []
+        if not any(
+            isinstance(item, dict) and isinstance(item.get("chain"), dict)
+            and item["chain"].get("name") == "ts-input" for item in items
+        ):
+            return []  # фаервол Tailscale выключен (netfilter-mode=off) — отбрасывать некому
+        wan = lan.effective_wan(self.cfg, self.runner)
+        found: list[str] = []
+        for device, network, gateway in lan.occupied_networks(
+            self.runner, skip=(self.lan_if, ts.INTERFACE)
+        ):
+            if (not wan or device == wan) and network.overlaps(ts.CGNAT):
+                what = "шлюз" if gateway else "адрес"
+                found.append(f"{what} {network.network_address if gateway else network}")
+        if wan:
+            text = self.runner(["resolvectl", "dns", wan], timeout=10.0, check=False)
+            servers = text.partition(":")[2].split() if ":" in text else []
+            found += [f"DNS {address}" for address in ts.cgnat(servers)]
+        if not found:
+            return [Check("Tailscale: CGNAT", OK, "адреса провайдера вне 100.64.0.0/10")]
+        return [Check(
+            "Tailscale: CGNAT", WARN,
+            "провайдер выдаёт адреса CGNAT (" + ", ".join(found) + "): Tailscale отбросит "
+            "его пакеты",
+            "sudo tailscale set --netfilter-mode=off — фаервол держит XGW",
+        )]
+
+    def _tailscale_dns(self) -> list[Check]:
+        """К6: «Override local DNS» в консоли tailnet делает tailscale0 DNS по умолчанию, и
+        tailscaled пересылает запросы машины сам, своей меткой — мимо VPN."""
+        if self.which("resolvectl") is None:
+            return []
+        text = self.runner(["resolvectl", "status", ts.INTERFACE], timeout=10.0, check=False)
+        default = ts.default_route_dns(text)
+        if default is None:
+            return []
+        if default:
+            return [Check(
+                "Tailscale: DNS", WARN,
+                "Override local DNS включён: DNS-запросы шлюза идут через Tailscale мимо VPN",
+                "выключите его в консоли tailnet (DNS) или sudo tailscale set --accept-dns=false",
+            )]
+        return [Check("Tailscale: DNS", OK, "через tailscale0 — только имена tailnet")]
 
     def _mark(self) -> int | None:
         return engine.bypass_mark(self.cfg, self.log)

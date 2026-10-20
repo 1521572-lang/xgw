@@ -2017,3 +2017,80 @@ Happ»), затем дополнен редактированием списка
      проверке на каждое и ни одной на свои загрузки; WAN down/up — внеочередной шаг не позже
      2 с после подъёма, участники не меняются. На машине это проверяет
      `docs/TEST-PLAN-REAL-MACHINE-0.1.16-f2.md`.
+219. **Tailscale рядом с XGW: исключения в правилах (0.1.17, Т1 `TAILSCALE_MINIAPP_PLAN.md`).**
+     Снимок Т0 на машине (`docs/TEST-REPORT-REAL-MACHINE-0.1.16-tailscale-t0-2026-10-20.md` в
+     `main`, tailscaled 1.104.1, NetfilterMode 2) подтвердил К1 (`meta mark set 1` в `output`
+     затирает метку tailscaled 0x80000/0xff0000 — WireGuard, DERP и вход уходят в Xray), К2
+     (DNS к 100.100.100.100:53 перехватывается в Xray, имена tailnet не разрешаются) и К4
+     (`v6_guard` отбивает fd7a:115c:a1e0::/48 и IPv6-сокеты tailscaled); К3 (`block_output`
+     режет tailscaled и tailscale0) — по коду. Решение заказчика: `[tailscale] route`, по
+     умолчанию `"direct"`; `"vpn"` — настройкой.
+     (а) **Правила.** Пока tailscaled работает (`tailscale.present`), в `ip xgw` (режим on,
+     TPROXY и TUN) перед `meta mark set` стоят `meta mark and 0xff0000 @ts_direct return` и
+     `oifname "tailscale0" return`; второе пропускает и DNS к MagicDNS — маршрут к
+     100.100.100.100 у Tailscale ведёт в tailscale0. В `block_output` — `meta mark and
+     0xff0000 == 0x80000 accept` и `oifname "tailscale0" accept` до reject, всегда, а не по
+     набору: при `route = "vpn"` и здоровом Xray перехвата в blocked нет. В `v6_guard` —
+     `oifname "tailscale0" accept` и метка из набора `ts_direct`; при `network.ipv6 =
+     "proxy"` в `output` таблицы `ip6 xgw6` — то же, что в IPv4. Набор `ts_direct` (`type
+     mark`) — в `ip xgw` в режиме on и в `ip6 xgw6`, где есть `v6_guard` или перехват IPv6.
+     Синтаксис проверен загрузкой в `nft` 1.1.6 в отдельном сетевом пространстве во всех
+     режимах; `nft list` показывает поиск в наборе как `meta mark & 0x00ff0000 ==
+     @ts_direct`.
+     (б) **route.** `"direct"` — метка в наборе всегда, она записана в тексте таблицы.
+     `"vpn"` — набор пуст, пока Xray отвечает; шаг демона (`_guard_capture`) зовёт
+     `Capture.tailscale_direct(not xray_ok)`: Xray не отвечает — `add element … { 0x80000 }`,
+     отвечает — `flush set`, одной транзакцией для обеих таблиц, без перезагрузки таблиц
+     (соединения не рвутся). Сразу с первого шага без Xray, а не через минуту, как
+     `fail_mode = "open"`: правила при этом не снимаются, обычный трафик по-прежнему закрыт.
+     Отметка `/run/xgw/tailscale-direct` нужна, чтобы и загрузка правил заново (flush, сон,
+     xgw-net) собрала набор таким же; `net down` её убирает. В blocked, при снятом
+     перехвате (`disable`, `open`) метка в наборе есть всегда: через Xray tailscaled идти
+     некуда. Перекладка — событие `capture` в журнале, без уведомления.
+     (в) **Отступления от плана.** Признак «tailscaled работает» — интерфейс `tailscale0` в
+     `/sys/class/net` или сокет `/run/tailscale/tailscaled.sock`, а не `systemctl
+     is-active tailscaled`: правила собираются на каждом шаге демона, подпроцесс на каждый
+     шаг ни к чему; сокет лежит в RuntimeDirectory службы и исчезает с её остановкой, а
+     tailscale0 убирает `tailscaled --cleanup`. Сокет нужен для режима userspace-networking
+     (без интерфейса). `v6_guard` пропускает IPv6-сокеты tailscaled по набору, а не всегда:
+     при `route = "vpn"` и здоровом Xray IPv6 мимо VPN не уходит, tailscaled идёт по IPv4
+     через Xray; при `"direct"`, в blocked и при снятом перехвате — проходят, как в плане.
+     Исключений нет при `capture.local = false`: трафик машины тогда и так не
+     перехватывается. Отдельное правило для 100.64.0.0/10 не понадобилось: сеть уже в
+     `reserved4` (мимо перехвата и в blocked, кроме порта 53 — его закрывает `oifname
+     "tailscale0"`), а fd7a:115c:a1e0::/48 — в `fc00::/7` из `reserved6`.
+     (г) **Запуск и остановка tailscaled.** `Capture.loaded()` сверяет и исключения
+     Tailscale: есть ли правила с tailscale0 ровно тогда, когда tailscaled работает, и та ли
+     метка в наборе. tailscaled запустился позже XGW, остановился или набор поменяли мимо
+     XGW — правила загружаются заново. Создание tailscale0 (`state DOWN`) и его удаление —
+     события сети Ф2, демон просыпается сразу; маршруты tailnet в таблице 52 шаг не будят.
+     (д) **`xgw diag`, раздел «Tailscale».** Служба: не установлен или tailscaled не
+     запущен — OK «не используется»; `BackendState` из `tailscale status --json` (поля
+     читаются осторожно, нет поля — пусто): Running — OK, NeedsLogin — WARN со ссылкой
+     входа (`AuthURL`). «Tailscale: правила» — `Capture.tailscale_loaded()`: FAIL, если
+     Tailscale работает, а исключений нет (до установки — WARN). «Tailscale: связь» —
+     `tailscale netcheck` (текстовый отчёт, как в Т0): UDP и ближайший DERP с задержкой;
+     нет UDP — WARN; только вместе с сетевыми проверками. «Tailscale: CGNAT» (К5) — только
+     когда фаервол Tailscale включён (есть цепочка `ts-input`): адрес или шлюз WAN и DNS
+     провайдера (`resolvectl dns <WAN>`) из 100.64.0.0/10, адреса tailscale0 не в счёт;
+     совет — `tailscale set --netfilter-mode=off`. «Tailscale: DNS» (К6) — `+DefaultRoute`
+     у tailscale0 в `resolvectl status`: «Override local DNS» включён, DNS машины идёт через
+     Tailscale мимо VPN. Цепочки `ts-*` в проверке чужих правил («Файрвол») не считаются.
+     К7 (устройства LAN в tailnet через шлюз не попадают) остаётся как есть — README.
+     (е) **Проверено.** Юнит-тесты `tests/test_tailscale.py` и
+     `test_tailscale_goes_direct_while_xray_is_down`: на коде до Т1 (с одним только новым
+     модулем `tailscale.py`) падают 24 из 31 и тест демона; семь страховочных проходят и
+     там — правила без Tailscale прежние, `capture.local = false`, события сети Ф2, разбор
+     вывода CLI. Подменное ядро понимает `add element` и `flush set`. Стенд `tests/stand/test_stand_tailscale.py` в netns: tailscale0 — veth в
+     «интернет», за ним устройство tailnet и MagicDNS, таблица 52 и правила 5210/5270 как у
+     Tailscale, tailscaled — сокет с `SO_MARK 0x80000`. Режим on: заглушка напрямую (сервер
+     видит адрес WAN), обычный сокет — через Xray, DNS к 100.100.100.100 отвечает MagicDNS, а
+     не Xray; blocked (route direct и vpn): заглушка соединяется, обычный сокет отбит;
+     `ipv6 = "off"`: IPv6 в tailscale0 проходит, обычный IPv6 наружу отбит, IPv6-сокет
+     tailscaled — напрямую; `route = "vpn"` с демоном: при живом Xray заглушка идёт через
+     Xray, при остановленном — напрямую, Xray вернулся — снова через Xray. На коде до Т1
+     стенд падает. Прежние стенды правил (LAN, IPv6, TUN, Docker) проходят. На машине это
+     проверяет `docs/TEST-PLAN-REAL-MACHINE-0.1.17-tailscale-t1.md`; его скрипт `t1check.py`
+     (снимок, окно blocked на минуту со страховкой, маскировка — в том числе адреса
+     провайдера в строках portmap `Got PMP response`, который пропустила маскировка Т0)
+     прогнан на том же стенде с поддельным CLI `tailscale`.

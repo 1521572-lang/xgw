@@ -982,6 +982,35 @@ def test_short_xray_outage_does_not_open_capture(guarded):
     assert "open" not in capture.calls
 
 
+def test_tailscale_goes_direct_while_xray_is_down(guarded):
+    """tailscale.route = "vpn" (Т1): шаг сообщает перехвату, отвечает ли Xray, — с первого
+    же шага без Xray, не дожидаясь минуты fail_mode; перекладка — событие в журнале."""
+    daemon, capture = guarded
+    moves: list[bool] = []
+
+    def tailscale_direct(xray_down: bool) -> str:
+        changed = bool(moves) and moves[-1] != xray_down
+        moves.append(xray_down)
+        if not changed:
+            return ""
+        return ("Xray не отвечает — Tailscale идёт напрямую, мимо VPN" if xray_down
+                else "Xray отвечает — Tailscale снова идёт через VPN")
+
+    capture.tailscale_direct = tailscale_direct
+    daemon.tick()
+    assert moves == [False]
+    daemon.observatory, daemon.api.down = None, True
+    daemon.tick()
+    assert moves == [False, True] and capture.actions() == []  # правила не перезагружались
+    daemon.api.down = False
+    daemon.set_alive()
+    daemon.tick()
+    assert moves[-1] is False
+    events = daemon.events()
+    assert any("Tailscale идёт напрямую" in event for event in events)
+    assert any("Tailscale снова идёт через VPN" in event for event in events)
+
+
 def test_leak_reloads_rules_only_when_own_traffic_is_captured(guarded):
     daemon, capture = guarded
     daemon.location = "RU"

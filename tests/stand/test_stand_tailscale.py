@@ -1,0 +1,212 @@
+"""Проверки стенда: Tailscale рядом с XGW (Т1 `TAILSCALE_MINIAPP_PLAN.md`, раздел 2.5).
+
+Только режим netns, на настоящем ядре и настоящем Xray; нужны Linux, root, nft:
+
+    sudo -E XGW_XRAY_BIN=<путь к xray> pytest tests/stand/test_stand_tailscale.py -q
+
+Tailscale на шлюзе изображён так, как его видит ядро: интерфейс tailscale0 (veth в
+«интернет», за ним — «tailnet»: устройство 100.64.0.2 и MagicDNS 100.100.100.100),
+таблица 52 с маршрутами tailnet и правила `ip rule` 5210/5270, как ставит tailscaled.
+Сам tailscaled — процесс-заглушка: сокет с меткой 0x80000 (SO_MARK) к адресу в «интернете».
+Как отличить путь трафика — как в test_stand_lan.py: origin на /trace отдаёт адрес, с
+которого пришёл запрос: 5.5.5.1 — через VPN-сервер, 5.5.5.2 — напрямую с WAN шлюза.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import netns
+import pytest
+from stand import HERE, Stand, wait_for
+
+XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
+VIA_VPN = netns.INET_IP
+DIRECT = netns.GW_WAN_IP
+DIRECT6 = netns.GW_WAN_IP6
+TS_MARK = str(0x80000)  # метка сокетов tailscaled
+GW_TS_IP, PEER_IP, MAGIC_DNS = "100.64.0.1", "100.64.0.2", "100.100.100.100"
+GW_TS_IP6, PEER_IP6 = "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2"
+TS_ANSWER = "100.64.0.77"  # так отвечает MagicDNS «tailnet»; Xray ответил бы адресом «интернета»
+
+pytestmark = [
+    pytest.mark.skipif(
+        not XRAY_BIN or not Path(XRAY_BIN).exists(), reason="нет XGW_XRAY_BIN — стенд пропущен"
+    ),
+    pytest.mark.skipif(
+        not netns.available() or shutil.which("nft") is None,
+        reason="проверки Tailscale: нужны Linux, root и nft",
+    ),
+]
+
+
+def _ip(*args: str) -> None:
+    subprocess.run(["ip", *args], check=True, capture_output=True, text=True, timeout=15)
+
+
+def _tailscale(stand: Stand) -> None:
+    """tailscale0 шлюза, маршруты и правила Tailscale, «tailnet» и MagicDNS за ним."""
+    topo = stand._topology
+    gw, inet = topo.gw, topo.inet
+    _ip("link", "add", "tailscale0", "netns", gw, "type", "veth", "peer", "name", "tsnet0",
+        "netns", inet)
+    for namespace, device, addresses in (
+        (gw, "tailscale0", (f"{GW_TS_IP}/32", f"{GW_TS_IP6}/128")),
+        (inet, "tsnet0", (f"{PEER_IP}/32", f"{MAGIC_DNS}/32", f"{PEER_IP6}/128")),
+    ):
+        for address in addresses:
+            _ip("-n", namespace, "addr", "add", address, "dev", device, "nodad")
+        _ip("-n", namespace, "link", "set", device, "up")
+    _ip("-n", inet, "route", "add", GW_TS_IP, "dev", "tsnet0")
+    _ip("-n", inet, "-6", "route", "add", GW_TS_IP6, "dev", "tsnet0")
+    # Как у tailscaled: адреса tailnet — в таблице 52, помеченные им сокеты — в main.
+    _ip("-n", gw, "route", "add", "100.64.0.0/10", "dev", "tailscale0", "table", "52")
+    _ip("-n", gw, "route", "add", MAGIC_DNS, "dev", "tailscale0", "table", "52")
+    _ip("-n", gw, "-6", "route", "add", "fd7a:115c:a1e0::/48", "dev", "tailscale0",
+        "table", "52")
+    for family in ("-4", "-6"):
+        _ip("-n", gw, family, "rule", "add", "pref", "5210", "fwmark", "0x80000/0xff0000",
+            "lookup", "main")
+        _ip("-n", gw, family, "rule", "add", "pref", "5270", "lookup", "52")
+    stand._spawn(
+        "tailnet", "inet",
+        [sys.executable, str(HERE / "origin.py"), "--host", PEER_IP, "--port", "8080",
+         "--dns-port", "53", "--answer", TS_ANSWER, "--dns-also", MAGIC_DNS],
+        "READY",
+    )
+    stand._spawn(
+        "tailnet6", "inet",
+        [sys.executable, str(HERE / "origin.py"), "--host", PEER_IP6, "--port", "8080"],
+        "READY",
+    )
+
+
+def _stand(tmp_path: Path, xray: Path | None = None, *, v6: bool = False, capture=True,
+           **config) -> Stand:
+    stand = Stand(tmp_path, xray or Path(XRAY_BIN), mode="netns", ipv6=v6)
+    try:
+        stand.start()
+        _tailscale(stand)
+        stand.up(capture=capture, **config)
+        if capture:
+            enabled = stand.xgw("enable")
+            assert enabled.returncode == 0, enabled.stderr
+    except BaseException:
+        stand.stop()
+        raise
+    return stand
+
+
+def _magic_dns(stand: Stand) -> list[str] | None:
+    """Ответ на запрос шлюза к MagicDNS; None — ответа нет."""
+    reply = stand.client("gw", "dns", MAGIC_DNS, "peer.tailnet.test", "--timeout", "3")
+    return reply.get("answers")
+
+
+def _tailnet(stand: Stand, host: str) -> str:
+    """С какого адреса запрос шлюза дошёл до устройства в tailnet; пусто — не дошёл."""
+    url = f"http://[{host}]:8080/trace" if ":" in host else f"http://{host}:8080/trace"
+    reply = stand.client("gw", "get", url, "--timeout", "4")
+    for line in reply.get("body", "").splitlines():
+        if line.startswith("ip="):
+            return line[3:]
+    return ""
+
+
+def _route(route: str) -> str:
+    return f'\n[tailscale]\nroute = "{route}"\n'
+
+
+def test_tailscaled_goes_direct_and_magic_dns_is_not_captured(tmp_path):
+    """Режим on, route = "direct" (К1, К2): сокет tailscaled выходит напрямую, обычный —
+    через Xray; DNS к 100.100.100.100 уходит в tailscale0, а не в Xray."""
+    stand = _stand(tmp_path)
+    try:
+        assert stand.exit_ip("gw") == VIA_VPN
+        assert stand.exit_ip("gw", "--mark", TS_MARK) == DIRECT
+        assert _magic_dns(stand) == [TS_ANSWER]
+        assert _tailnet(stand, PEER_IP) == GW_TS_IP
+        assert stand.client("gw", "dns", "8.8.8.8", "example.org").get("answers") == [VIA_VPN]
+        table = stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert 'oifname "tailscale0" return' in table and "@ts_direct" in table
+        assert stand.xgw_json("status")["capture"]["loaded"] is True
+    finally:
+        stand.stop()
+
+
+@pytest.mark.parametrize("route", ["direct", "vpn"])
+def test_blocked_keeps_tailscale(tmp_path, route):
+    """Режим blocked (К3): Xray запущен без inbound'а перехвата. Обычный сокет отбит, а
+    tailscaled соединяется (при любом route), MagicDNS и tailnet отвечают."""
+    stand = _stand(tmp_path, capture=False)
+    try:
+        stand.write_config(capture=True, extra=_route(route))
+        stand.xgw("net", "up")
+        assert "chain block_output" in stand.gw_run("nft", "list", "table", "ip", "xgw")
+        assert stand.exit_ip("gw") == ""
+        assert stand.exit_ip("gw", "--mark", TS_MARK) == DIRECT
+        assert _magic_dns(stand) == [TS_ANSWER]
+        assert _tailnet(stand, PEER_IP) == GW_TS_IP
+    finally:
+        stand.stop()
+
+
+def test_ipv6_off_closes_ipv6_but_not_the_tailnet(tmp_path):
+    """network.ipv6 = "off" (К4): обычный IPv6 машины наружу отбит, IPv6 в tailscale0
+    проходит, IPv6-сокет tailscaled выходит напрямую."""
+    stand = _stand(tmp_path, v6=True, ipv6="off")
+    try:
+        assert stand.exit_ip6("gw", "--mark", "2") == DIRECT6  # IPv6 на стенде работает
+        assert stand.exit_ip6("gw") == ""
+        assert _tailnet(stand, PEER_IP6) == GW_TS_IP6
+        assert stand.exit_ip6("gw", "--mark", TS_MARK) == DIRECT6
+    finally:
+        stand.stop()
+
+
+def test_route_vpn_follows_xray(tmp_path):
+    """route = "vpn": пока Xray отвечает, tailscaled идёт через Xray; Xray остановлен (и не
+    запускается) — демон кладёт метку в набор, и tailscaled выходит напрямую; Xray вернулся —
+    снова через Xray. Обычный трафик всё это время закрыт (fail-closed)."""
+    switch = tmp_path / "xray-off"
+    wrapper = tmp_path / "xray-wrapper.sh"  # Xray, который можно «сломать»: не запускается
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'if [ -e "{switch}" ] && [ "$1" = run ]; then\n'
+        '    echo "xray отключён тестом" >&2\n'
+        "    exit 1\n"
+        "fi\n"
+        f'exec "{XRAY_BIN}" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    stand = _stand(tmp_path / "stand", wrapper, extra=_route("vpn"))
+    try:
+        stand.start_daemon()
+        assert wait_for(
+            lambda: (s := stand.xgw_json("status"))["daemon"] and s["state"] == "HEALTHY",
+            60, step=2,
+        ), stand.tail("daemon", 30)
+        assert stand.exit_ip("gw", "--mark", TS_MARK) == VIA_VPN
+
+        switch.touch()
+        stand.xray_service().stop()
+        started = time.monotonic()
+        assert wait_for(lambda: stand.exit_ip("gw", "--mark", TS_MARK) == DIRECT, 30, step=1), (
+            stand.tail("daemon", 30))
+        assert time.monotonic() - started < 30
+        assert stand.exit_ip("gw") == ""  # обычный трафик — никуда
+        details = [event["detail"] for event in stand.xgw_json("status")["events"]]
+        assert any("Tailscale идёт напрямую" in detail for detail in details)
+
+        switch.unlink()
+        assert wait_for(lambda: stand.exit_ip("gw", "--mark", TS_MARK) == VIA_VPN, 60, step=2), (
+            stand.tail("daemon", 30))
+        assert stand.exit_ip("gw") == VIA_VPN
+    finally:
+        stand.stop()
