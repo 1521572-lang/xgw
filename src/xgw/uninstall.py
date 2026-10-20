@@ -203,24 +203,37 @@ class Uninstaller:
         return "ярлык панели удалён"
 
     def _tailscale(self) -> str | None:
-        """Serve панели по tailnet, если его включил XGW (флаг в panel.json). Сам tailscaled,
-        вход в tailnet и Tailscale SSH XGW не ставил — они остаются как есть."""
+        """Serve панели по tailnet и Funnel для приложения на телефоне, если их включил XGW
+        (флаги в panel.json). Сам tailscaled, вход в tailnet и Tailscale SSH XGW не ставил —
+        они остаются как есть."""
         path = managed.path_for(self.paths.config_file)
         data, _error = managed.load(path)
-        if not data["tailscale"]["serve"]:
+        flags = data["tailscale"]
+        steps = [
+            (kind, off, setter, what) for kind, off, setter, what in (
+                ("serve", ts.serve_off, managed.set_tailscale_serve,
+                 f"панель по tailnet (Tailscale Serve, порт {ts.SERVE_PORT})"),
+                ("funnel", ts.funnel_off, managed.set_tailscale_funnel,
+                 f"адрес для приложения на телефоне (Tailscale Funnel, порт {ts.FUNNEL_PORT})"),
+            ) if flags[kind]
+        ]
+        if not steps:
             return None
         if self.which("tailscale") is None:
-            return "Tailscale не установлен — снимать Serve нечего"
-        try:
-            ts.serve_off(self.runner)
-        except cmd.CommandError as exc:
-            raise RuntimeError(
-                f"Serve не снят ({exc}); снимите сами: sudo tailscale serve "
-                f"--https={ts.SERVE_PORT} off") from exc
-        with contextlib.suppress(managed.ManagedError, OSError):
-            managed.set_tailscale_serve(path, "")
-        return (f"панель по tailnet (Tailscale Serve, порт {ts.SERVE_PORT}) снята; tailscaled, "
-                "вход в tailnet и SSH не тронуты")
+            return "Tailscale не установлен — снимать Serve и Funnel нечего"
+        done = []
+        for kind, off, setter, what in steps:
+            try:
+                off(self.runner)
+            except cmd.CommandError as exc:
+                port = ts.SERVE_PORT if kind == "serve" else ts.FUNNEL_PORT
+                raise RuntimeError(
+                    f"{what}: не снят ({exc}); снимите сами: sudo tailscale {kind} "
+                    f"--https={port} off") from exc
+            with contextlib.suppress(managed.ManagedError, OSError):
+                setter(path, "")
+            done.append(what)
+        return "; ".join(done) + " — сняты; tailscaled, вход в tailnet и SSH не тронуты"
 
     def _user(self) -> str | None:
         if not self.journal.get("user_created"):

@@ -12,7 +12,8 @@ waiting — VPN включён, но Xray ещё не перезапущен с 
 безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1),
 tailscale — шлюз ещё не в tailnet (вход через 12 секунд после нажатия), провайдер выдаёт
 адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
-10 секунд. В остальных сценах Tailscale работает, в empty — не установлен.
+10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
+не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
 """
 
 from __future__ import annotations
@@ -353,12 +354,22 @@ class DemoPanel(Panel):
                 0, f"«{pin['name']}» выбран вручную: весь трафик идёт через него, пока не "
                 "вернёте автовыбор" if pin else "автовыбор: ручной выбор сервера снят"
             )
-        if name in ("tailscale/login", "tailscale/serve"):
-            # Как человек по ту сторону ссылки: входит, разрешает HTTPS в консоли tailnet.
+        if name in ("tailscale/login", "tailscale/serve", "tailscale/funnel", "phones/pair"):
+            # Как человек по ту сторону ссылки: входит, разрешает HTTPS и Funnel в консоли
+            # tailnet, наводит камеру телефона на QR-код.
             fake = self.runner
-            later = fake.complete_login if name == "tailscale/login" else fake.enable_https
+            later = {"tailscale/login": fake.complete_login, "tailscale/serve": fake.enable_https,
+                     "tailscale/funnel": fake.allow_funnel, "phones/pair": fake.allow_funnel}[name]
             threading.Timer(12 if name == "tailscale/login" else 10, later).start()
-        return super()._act(name, body)
+        outcome = super()._act(name, body)
+        if name == "phones/pair" and outcome.ok:
+            threading.Timer(20, self._demo_phone).start()
+        return outcome
+
+    def _demo_phone(self) -> None:
+        code = self.phones.pairing()["code"]
+        if code:
+            self.phones.pair(code, "Galaxy S25 Ultra")
 
 
 def build(root: Path, port: int, scene: str) -> DemoPanel:
@@ -418,6 +429,7 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     if scene == "tailscale":
         fake.cgnat_wan = fake.override_dns = True
         fake.https_enabled = False
+        fake.funnel_allowed = False
     socket = tailscale.socket_path(paths)
     socket.parent.mkdir(parents=True, exist_ok=True)
     socket.write_text("", encoding="ascii")
@@ -425,7 +437,7 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
                       capture_factory=DemoCapture, runner=fake,
                       which=lambda name: None if scene == "empty" else f"/usr/bin/{name}",
-                      spawn=fake.spawn, sys_net=root / "sys-class-net")
+                      spawn=fake.spawn, sys_net=root / "sys-class-net", app_port=0)
     panel.ts_wait = 1.0
     panel.configure(cfg, DemoDaemon(), DemoBot())
     return panel

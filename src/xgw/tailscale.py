@@ -44,6 +44,7 @@ MAGIC_DNS = "100.100.100.100"
 SOCKET = Path("run/tailscale/tailscaled.sock")  # от корня машины (paths.root)
 ROUTES = ("direct", "vpn")
 SERVE_PORT = 8443  # панель по tailnet: https://<шлюз>.<tailnet>.ts.net:8443/ (Serve, не Funnel)
+FUNNEL_PORT = 443  # API приложения XGW для Android: https://<шлюз>.<tailnet>.ts.net/ (Funnel)
 LOGIN_WAIT = "15m"  # столько `tailscale login` ждёт входа в браузере, потом выходит сам
 COMMAND_TIMEOUT = 20.0
 NETFILTER_OFF = 0  # prefs NetfilterMode: 0 — off, 1 — nodivert, 2 — on
@@ -235,10 +236,13 @@ def backend(port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def parse_serve(text: str, port: int) -> bool | None:
-    """`tailscale serve status --json`: ведёт ли Serve порт SERVE_PORT на панель (port).
-    Конфиг Serve: {"TCP": {"8443": {"HTTPS": true}}, "Web": {"имя:8443": {"Handlers":
-    {"/": {"Proxy": "http://127.0.0.1:8781"}}}}}; пусто — Serve выключен. None — не JSON."""
+def parse_serve(text: str, port: int, *, public: int = SERVE_PORT, funnel: bool = False
+                ) -> bool | None:
+    """`tailscale serve status --json`: ведёт ли порт public (по умолчанию SERVE_PORT) на
+    port — панель или API приложения. Конфиг Serve: {"TCP": {"8443": {"HTTPS": true}},
+    "Web": {"имя:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8781"}}}},
+    "AllowFunnel": {"имя:443": true}}; пусто — выключено. funnel — ещё и открыт ли порт в
+    интернет (AllowFunnel). None — не JSON."""
     try:
         data = json.loads(text) if text.strip() else {}
     except (json.JSONDecodeError, TypeError):
@@ -248,14 +252,15 @@ def parse_serve(text: str, port: int) -> bool | None:
     if not isinstance(data, dict):
         return None
     web = data.get("Web") if isinstance(data.get("Web"), dict) else {}
+    allowed = data.get("AllowFunnel") if isinstance(data.get("AllowFunnel"), dict) else {}
     target = backend(port)
     for host, conf in web.items():
-        if not str(host).endswith(f":{SERVE_PORT}") or not isinstance(conf, dict):
+        if not str(host).endswith(f":{public}") or not isinstance(conf, dict):
             continue
         handlers = conf.get("Handlers") if isinstance(conf.get("Handlers"), dict) else {}
         root = handlers.get("/") if isinstance(handlers.get("/"), dict) else {}
         if str(root.get("Proxy") or "").rstrip("/") == target:
-            return True
+            return allowed.get(host) is True if funnel else True
     return False
 
 
@@ -266,6 +271,15 @@ def serve_status(port: int, runner: cmd.Runner = cmd.run) -> bool | None:
         return None
 
 
+def funnel_status(port: int, runner: cmd.Runner = cmd.run) -> bool | None:
+    """Funnel ведёт порт FUNNEL_PORT из интернета на API приложения (port)."""
+    try:
+        text = runner(["tailscale", "serve", "status", "--json"], timeout=10.0)
+    except cmd.CommandError:
+        return None
+    return parse_serve(text, port, public=FUNNEL_PORT, funnel=True)
+
+
 def login_command() -> list[str]:
     """Вход: CLI печатает ссылку и ждёт, AuthURL появляется и в `status --json`."""
     return ["tailscale", "login", f"--timeout={LOGIN_WAIT}"]
@@ -274,6 +288,16 @@ def login_command() -> list[str]:
 def serve_command(port: int) -> list[str]:
     """Панель по tailnet: --bg — Serve переживает перезапуск tailscaled и машины."""
     return ["tailscale", "serve", "--bg", f"--https={SERVE_PORT}", backend(port)]
+
+
+def funnel_command(port: int) -> list[str]:
+    """API приложения в интернет: --bg — Funnel переживает перезапуск. Если в правилах
+    tailnet Funnel не разрешён, CLI печатает ссылку и ждёт, как serve с HTTPS."""
+    return ["tailscale", "funnel", "--bg", f"--https={FUNNEL_PORT}", backend(port)]
+
+
+def funnel_off(runner: cmd.Runner = cmd.run) -> None:
+    runner(["tailscale", "funnel", f"--https={FUNNEL_PORT}", "off"], timeout=COMMAND_TIMEOUT)
 
 
 def serve_off(runner: cmd.Runner = cmd.run) -> None:

@@ -1,6 +1,7 @@
 """CLI `tailscale` для стенда — без tailscaled: состояние узла в файле XGW_FAKE_TAILSCALE
 (JSON). Умеет то, что вызывает карточка «Tailscale» панели: `status --json`, `debug prefs`,
-`serve status --json`, `serve --bg --https=8443 URL`, `serve --https=8443 off`, `set …`.
+`serve status --json`, `serve --bg --https=8443 URL`, `serve --https=8443 off`, `set …`,
+`funnel --bg --https=443 URL`, `funnel --https=443 off`.
 Каждый вызов дописывается в поле "calls".
 """
 
@@ -29,14 +30,23 @@ def main() -> int:
         print(json.dumps({"RunSSH": state.get("ssh", False), "NetfilterMode": 2,
                           "CorpDNS": True}))
     elif args == ["serve", "status", "--json"]:
-        target = state.get("serve", "")
-        print(json.dumps({"Web": {f"{name}:8443": {"Handlers": {"/": {"Proxy": target}}}}}
-                         if target else {}))
+        web, allow = {}, {}
+        for port, key in (("8443", "serve"), ("443", "funnel")):
+            if state.get(key):
+                web[f"{name}:{port}"] = {"Handlers": {"/": {"Proxy": state[key]}}}
+        if state.get("funnel"):
+            allow[f"{name}:443"] = True
+        print(json.dumps({"Web": web, "AllowFunnel": allow} if web else {}))
     elif args[:3] == ["serve", "--bg", "--https=8443"] and len(args) == 4:
         state["serve"] = args[3]
         print(f"Available within your tailnet:\n\nhttps://{name}:8443/\n|-- proxy {args[3]}")
     elif args == ["serve", "--https=8443", "off"]:
         state["serve"] = ""
+    elif args[:3] == ["funnel", "--bg", "--https=443"] and len(args) == 4:
+        state["funnel"] = args[3]
+        print(f"Available on the internet:\n\nhttps://{name}/\n|-- proxy {args[3]}")
+    elif args == ["funnel", "--https=443", "off"]:
+        state["funnel"] = ""
     elif args[:1] == ["set"]:
         for flag in args[1:]:
             if flag in ("--ssh", "--ssh=false"):

@@ -352,3 +352,86 @@ def test_service_sandbox_reaches_the_tailscaled_socket():
             Path("/run/tailscale/xgw-write-probe").unlink(missing_ok=True)
             if made_dir:
                 directory.rmdir()
+
+
+# --- А1 (ANDROID_APP_PLAN.md): приложение на телефоне через Funnel -----------------------
+
+
+def test_phone_pairs_through_the_panel_button_and_gets_a_valid_xray_config(tmp_path, monkeypatch):
+    """Настоящий демон: кнопка «Привязать телефон» включает Funnel (CLI-заглушка) и даёт
+    ссылку из QR; эталонный клиент phone_client.py привязывается, читает состояние, нажимает
+    «Проверить запасные» и получает конфиг Xray для телефона — его принимает сам Xray."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "tailscale"
+    cli.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{HERE / "fake_tailscale_cli.py"}" "$@"\n',
+        encoding="utf-8")
+    cli.chmod(0o755)
+    fake = tmp_path / "tailscale.json"
+    fake.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("XGW_FAKE_TAILSCALE", str(fake))
+    stand = Stand(tmp_path / "stand", Path(XRAY_BIN), mode="netns")
+    client = [sys.executable, str(HERE.parent / "phone_client.py")]
+    url, host = "http://127.0.0.1:8782", "gw.example.ts.net"
+    keyfile = tmp_path / "phone.key"
+    try:
+        stand.start()
+        stand.up(panel=True)
+        socket = stand.root / "run/tailscale/tailscaled.sock"
+        socket.parent.mkdir(parents=True, exist_ok=True)
+        socket.touch()
+        stand.start_daemon()
+        assert wait_for(lambda: _panel(stand, "raw", "/").get("status") == 200, 60), (
+            stand.tail("daemon", 30))
+        token = (stand.root / "var/lib/xgw/panel-token").read_text(encoding="ascii").strip()
+
+        def phone(*args: str) -> dict:
+            done = stand.run_in("gw", *client, "--host", host, url, *args)
+            return json.loads(done.stdout.strip().splitlines()[-1])
+
+        assert phone("hello")["status"] == 421  # Funnel ещё не включён — API закрыт
+        result = _panel(stand, "act", token, "phones/pair", "{}")
+        assert result.get("ok") and "Наведите камеру" in result["text"], result
+        assert json.loads(fake.read_text(encoding="utf-8"))["funnel"] == url
+        link = _panel(stand, "state", token)["phones"]["pairing"]["link"]
+        assert link.startswith(f"xgw://pair?u=https://{host}&c=")
+        assert phone("hello") == {"status": 200, "app": "XGW"}
+
+        paired = phone("pair", link.split("&c=")[1], str(keyfile))
+        assert paired["paired"] is True, paired
+        state = phone("state", str(keyfile))
+        assert state["status"] == 200 and state["state"] and state["members"] >= 1, state
+        acted = phone("act", str(keyfile), json.dumps({"name": "scan"}))
+        assert acted["status"] == 200 and acted["ok"] is True, acted
+        refused = phone("act", str(keyfile), json.dumps({"name": "add", "text": "x"}))
+        assert refused["status"] == 403
+        replay = phone("replay", str(keyfile))
+        assert replay == {"first": 200, "replay": 403}
+
+        # Конфиг для телефона — из настоящего применённого конфига; Xray его принимает.
+        status = stand.run_in(
+            "gw", sys.executable, "-c",
+            "import json,sys; sys.path.insert(0, sys.argv[1]); from phone_client import "
+            "PhoneClient, _load; c = PhoneClient(sys.argv[2], host=sys.argv[3]); "
+            "c.phone, c.key = _load(sys.argv[4]); s, p = c.signed('GET', '/api/phone-config'); "
+            "print(json.dumps({'status': s, 'config': p.get('config')}))",
+            str(HERE.parent), url, host, str(keyfile),
+        )
+        reply = json.loads(status.stdout.strip().splitlines()[-1])
+        assert reply["status"] == 200, reply
+        phone_config = tmp_path / "phone.json"
+        phone_config.write_text(json.dumps(reply["config"]), encoding="utf-8")
+        checked = subprocess.run([XRAY_BIN, "run", "-test", "-c", str(phone_config)],
+                                 capture_output=True, text=True, timeout=60)
+        assert checked.returncode == 0, checked.stdout + checked.stderr
+
+        state = _panel(stand, "state", token)
+        assert [item["name"] for item in state["phones"]["list"]] == ["Тестовый телефон"]
+        assert state["tailscale"]["funnel"]["on"] is True
+        result = _panel(stand, "act", token, "tailscale/funnel", json.dumps({"on": False}))
+        assert result.get("ok"), result
+        assert phone("hello")["status"] == 421
+    finally:
+        stand.stop()

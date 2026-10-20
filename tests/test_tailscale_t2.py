@@ -220,7 +220,7 @@ def test_tailnet_host_is_accepted_only_while_serve_is_on_from_the_panel(ts_rig):
     result = _ts_act(ts_rig, "serve", {"on": True})
     assert result["ok"] and "Панель по tailnet включена" in result["text"]
     assert ts_rig.fake.serve == f"http://127.0.0.1:{ts_rig.panel.port}"
-    assert ts_rig.saved()["tailscale"] == {"serve": NAME, "route": None}
+    assert ts_rig.saved()["tailscale"] == {"serve": NAME, "route": None, "funnel": ""}
     response, text = client.request("GET", "/api/state", host=HOST)
     assert response.status == 200 and json.loads(text)["tailscale"]["serve"]["live"] is True
     # Изменения — со страницы, открытой по https://имя:8443, а не по http.
@@ -385,11 +385,11 @@ def test_panel_command_only_in_a_private_chat(tmp_path, monkeypatch):
 def test_store_keeps_only_valid_tailscale_settings(tmp_path):
     path = tmp_path / "panel.json"
     path.write_text(json.dumps({"tailscale": {"serve": "Bad Name!", "route": "exit"}}), "utf-8")
-    assert managed.load(path)[0]["tailscale"] == {"serve": "", "route": None}
+    assert managed.load(path)[0]["tailscale"] == {"serve": "", "route": None, "funnel": ""}
     assert managed.set_tailscale_serve(path, "GW.Tailnet-1.ts.net.")
     assert not managed.set_tailscale_serve(path, NAME)  # то же имя
     assert managed.set_tailscale_route(path, "vpn")
-    assert managed.load(path)[0]["tailscale"] == {"serve": NAME, "route": "vpn"}
+    assert managed.load(path)[0]["tailscale"] == {"serve": NAME, "route": "vpn", "funnel": ""}
     with pytest.raises(managed.ManagedError):
         managed.set_tailscale_serve(path, "evil.example/x")
     with pytest.raises(managed.ManagedError):

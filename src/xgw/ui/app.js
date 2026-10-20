@@ -241,6 +241,7 @@
     draw("events", s.events, () => renderEvents(s));
     draw("telegram", [s.telegram, Math.floor(s.now / 20)], () => renderTelegram(s));
     draw("tailscale", s.tailscale, () => renderTailscale(s));
+    draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
@@ -1005,6 +1006,18 @@
     $("ts-enable").hidden = !(serve.pending && enable);
     if (enable) $("ts-enable").href = enable;
 
+    const funnel = t.funnel || {};
+    $("ts-funnel-row").hidden = !running;
+    $("ts-funnel").setAttribute("aria-checked", String(Boolean(funnel.on)));
+    $("ts-funnel-note").textContent = !funnel.on
+      ? "Адрес шлюза для приложения XGW на телефоне — из любой сети, без Tailscale на телефоне. Включается и кнопкой «Привязать телефон»."
+      : funnel.pending ? "Осталось разрешить Funnel в tailnet: нажмите кнопку и подтвердите в консоли Tailscale."
+        : funnel.live === false ? "Tailscale сейчас не ведёт адрес на шлюз — выключите и включите переключатель."
+          : "Адрес открыт в интернет, но войти можно только с привязанного телефона (карточка «Телефоны»).";
+    const funnelEnable = httpsLink(funnel.enable_url);
+    $("ts-funnel-enable").hidden = !(funnel.pending && funnelEnable);
+    if (funnelEnable) $("ts-funnel-enable").href = funnelEnable;
+
     $("ts-route-row").hidden = t.state === "absent";
     $("ts-route").value = t.route === "vpn" ? "vpn" : "direct";
     $("ts-route-note").textContent = t.route === "vpn"
@@ -1015,6 +1028,51 @@
     $("ts-k5").hidden = !cgnat.length || t.netfilter_off === true;
     $("ts-k5-text").textContent = `Провайдер выдаёт адреса из 100.64.0.0/10 (${cgnat.join(", ")}): фаервол Tailscale отбрасывает их пакеты, и сеть провайдера у шлюза может пропасть.`;
     $("ts-k6").hidden = t.override_dns !== true;
+  }
+
+  // Телефоны с приложением XGW: «Привязать телефон» → QR-код → камера приложения.
+  let qrWasShown = false; // QR был на экране — привязку стоит показать сообщением
+
+  function renderPhones(s) {
+    const p = s.phones || { list: [], pairing: {} };
+    const list = p.list || [];
+    const pairing = p.pairing || {};
+    $("phones-count").textContent = list.length ? String(list.length) : "";
+    $("phones-text").textContent = p.available === false
+      ? "API приложения не запущен — подробности в журнале XGW."
+      : list.length
+        ? "Приложение XGW на этих телефонах управляет шлюзом из любой сети и берёт у него серверы для VPN телефона."
+        : "Поставьте на телефон приложение XGW, нажмите «Привязать телефон» и наведите камеру приложения на QR-код. Больше ничего вводить не нужно.";
+    const qrShown = Boolean(pairing.qr && pairing.qr.length);
+    const waiting = Boolean(p.waiting);
+    $("phones-pair").hidden = !(qrShown || waiting);
+    $("phones-qr").toggleAttribute("hidden", !qrShown);
+    if (qrShown) drawQr($("phones-qr"), pairing.qr);
+    $("phones-pair-text").textContent = waiting
+      ? "Осталось разрешить Funnel в tailnet: нажмите кнопку и подтвердите в консоли Tailscale — QR-код появится сам."
+      : "Откройте приложение XGW на телефоне и наведите камеру на этот код.";
+    $("phones-until").textContent = qrShown && pairing.until ? `Код действует до ${clock(pairing.until)} и подходит один раз.` : "";
+    const enable = httpsLink(p.enable_url);
+    $("phones-enable").hidden = !(waiting && enable);
+    if (enable) $("phones-enable").href = enable;
+    $("phones-add").hidden = qrShown || waiting || p.available === false;
+    if (pairing.paired && qrWasShown && !qrShown) toast(`Телефон «${pairing.paired}» привязан`, []);
+    qrWasShown = qrShown;
+    fill($("phones"), list.map((phone) => el("li", {},
+      el("div", { class: "row-main" },
+        el("div", { class: "row-title" }, el("span", { text: phone.name })),
+        el("div", { class: "row-sub", text: `привязан ${stamp(phone.paired, s.now)}`
+          + (phone.seen ? ` · на связи ${ago(phone.seen, s.now)}` : " · ещё не заходил") })),
+      el("div", { class: "row-actions" },
+        iconButton("edit", `Переименовать ${phone.name}`, () => {
+          const name = window.prompt("Имя телефона", phone.name);
+          if (name && name.trim() && name.trim() !== phone.name) act("phones/rename", { id: phone.id, name: name.trim() });
+        }),
+        iconButton("remove", `Отвязать ${phone.name}`, () => confirmRemove(
+          `Отвязать «${phone.name}»?`,
+          "Приложение на этом телефоне больше не сможет управлять шлюзом и получать серверы. VPN телефона продолжит работать на последних полученных серверах.",
+          () => act("phones/revoke", { id: phone.id }), "Отвязать"))))),
+    "");
   }
 
   function renderEvents(s) {
@@ -1093,6 +1151,16 @@
         : "С устройств tailnet панель перестанет открываться. На самом шлюзе она останется.",
       () => act("tailscale/serve", { on: false }, $("ts-serve")), "Выключить");
   });
+  $("ts-funnel").addEventListener("click", () => {
+    const on = $("ts-funnel").getAttribute("aria-checked") !== "true";
+    if (on) act("tailscale/funnel", { on }, $("ts-funnel"));
+    else confirmRemove(
+      "Выключить адрес для приложения?",
+      "Приложение XGW на телефоне не сможет управлять шлюзом и обновлять серверы, пока адрес не включить снова. VPN телефона продолжит работать.",
+      () => act("tailscale/funnel", { on: false }, $("ts-funnel")), "Выключить");
+  });
+  $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
+  $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";
     act("tailscale/route", { route: $("ts-route").value }, $("ts-route"))

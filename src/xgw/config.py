@@ -284,6 +284,8 @@ class Notify:
 class PanelConf:
     enabled: bool = True
     port: int = 8781
+    # API приложения XGW для Android (watch/appapi.py): на 127.0.0.1, наружу — через Funnel.
+    app_port: int = 8782
 
 
 @dataclass
@@ -312,6 +314,8 @@ class Managed:
     tailscale_serve: str = ""
     # Маршрут Tailscale выбран в панели (tailscale.route); None — как в config.toml.
     tailscale_route: str | None = None
+    # Имя шлюза, для которого панель включила Funnel (API приложения, А1); пусто — нет.
+    tailscale_funnel: str = ""
 
 
 @dataclass
@@ -422,6 +426,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
+    cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     if data["tailscale"]["route"] is not None:
         cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))

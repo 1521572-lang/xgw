@@ -93,7 +93,7 @@ def load(path: Path) -> tuple[dict, str]:
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {},
-        "tailscale": {"serve": "", "route": None},
+        "tailscale": {"serve": "", "route": None, "funnel": ""},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -146,15 +146,17 @@ def load(path: Path) -> tuple[dict, str]:
 def _tailscale(value: object) -> dict:
     """Tailscale из панели: serve — имя шлюза в tailnet, для которого XGW включил Serve
     (панель по tailnet; пусто — не включал); route — маршрут tailscaled, None — как в
-    config.toml."""
-    serve, route = "", None
+    config.toml; funnel — имя, для которого XGW включил Funnel (API приложения)."""
+    serve, route, funnel = "", None, ""
     if isinstance(value, dict):
-        name, way = value.get("serve"), value.get("route")
+        name, way, public = value.get("serve"), value.get("route"), value.get("funnel")
         if isinstance(name, str) and _TS_NAME_RE.fullmatch(name):
             serve = name
         if way in TS_ROUTES:
             route = way
-    return {"serve": serve, "route": route}
+        if isinstance(public, str) and _TS_NAME_RE.fullmatch(public):
+            funnel = public
+    return {"serve": serve, "route": route, "funnel": funnel}
 
 
 def _priority(value: object) -> dict[str, str]:
@@ -387,6 +389,22 @@ def set_tailscale_serve(path: Path, name: str) -> bool:
         if data["tailscale"]["serve"] == name:
             return False
         data["tailscale"] = {**data["tailscale"], "serve": name}
+        return True
+
+    return _update(path, change)
+
+
+def set_tailscale_funnel(path: Path, name: str) -> bool:
+    """Запоминает, что XGW включил Funnel для этого имени (API приложения); пусто —
+    выключил. True — что-то изменилось."""
+    name = name.strip().lower().rstrip(".")
+    if name and not _TS_NAME_RE.fullmatch(name):
+        raise ManagedError("неверное имя шлюза в tailnet")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["funnel"] == name:
+            return False
+        data["tailscale"] = {**data["tailscale"], "funnel": name}
         return True
 
     return _update(path, change)

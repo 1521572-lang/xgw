@@ -1,5 +1,6 @@
 """CLI `tailscale` для панели — в памяти: что печатают `status --json`, `debug prefs`,
-`serve status --json`, что делают `set`, `serve … off`, и фоновые `login`, `serve --bg`.
+`serve status --json`, что делают `set`, `serve … off`, `funnel … off`, и фоновые `login`,
+`serve --bg`, `funnel --bg`.
 
 Вывод — как у настоящего 1.104.1 (снимок Т0): лишние поля есть, нужные — в тех же местах.
 """
@@ -11,6 +12,7 @@ from pathlib import Path
 
 AUTH_URL = "https://login.tailscale.com/a/1a2b3c4d5e6f7"
 ENABLE_URL = "https://login.tailscale.com/f/serve?node=nFake123CNTRL"
+FUNNEL_URL = "https://login.tailscale.com/f/funnel?node=nFake123CNTRL"
 
 
 class FakeProc:
@@ -38,11 +40,14 @@ class FakeTailscale:
         self.cgnat_wan = False  # провайдер выдаёт адрес из 100.64.0.0/10 (К5)
         self.https_enabled = True  # в tailnet включены сертификаты HTTPS (для Serve)
         self.serve: str = ""  # куда Serve ведёт порт 8443
+        self.funnel: str = ""  # куда Funnel ведёт порт 443 (из интернета)
+        self.funnel_allowed = True  # в правилах tailnet есть атрибут funnel
         self.fail: dict[str, str] = {}  # команда («set», «serve») → текст ошибки
         self.calls: list[tuple[str, ...]] = []
         self.auth_url = ""
         self._login: FakeProc | None = None
         self._serving: tuple[FakeProc, str, Path] | None = None
+        self._funneling: tuple[FakeProc, str] | None = None
 
     # --- runner ---------------------------------------------------------------------
 
@@ -94,12 +99,17 @@ class FakeTailscale:
                 "ShieldsUp": False, "NetfilterMode": self.netfilter, "AutoUpdate": {},
             }, indent=2)
         if args == ["serve", "status", "--json"]:
-            if not self.serve:
+            if not self.serve and not self.funnel:
                 return "{}\n"
-            return json.dumps({
-                "TCP": {"8443": {"HTTPS": True}},
-                "Web": {f"{self.name}:8443": {"Handlers": {"/": {"Proxy": self.serve}}}},
-            }, indent=2)
+            tcp, web, allow = {}, {}, {}
+            for port, target in (("8443", self.serve), ("443", self.funnel)):
+                if target:
+                    tcp[port] = {"HTTPS": True}
+                    web[f"{self.name}:{port}"] = {"Handlers": {"/": {"Proxy": target}}}
+            if self.funnel:
+                allow[f"{self.name}:443"] = True
+            return json.dumps({"TCP": tcp, "Web": web, **({"AllowFunnel": allow} if allow
+                                                           else {})}, indent=2)
         command = " ".join(["tailscale", *args])
         if args[:1] == ["set"]:
             if "set" in self.fail:
@@ -116,6 +126,11 @@ class FakeTailscale:
                     self.override_dns = False
                 else:
                     raise CommandError(f"{command}: flag provided but not defined: {flag}")
+            return ""
+        if args == ["funnel", "--https=443", "off"]:
+            if "funnel" in self.fail:
+                raise CommandError(f"{command}: {self.fail['funnel']}")
+            self.funnel = ""
             return ""
         if args == ["serve", "--https=8443", "off"]:
             if "serve" in self.fail:
@@ -151,9 +166,32 @@ class FakeTailscale:
                     "\nServe is not enabled on your tailnet.\nTo enable, visit:\n\n"
                     f"         {ENABLE_URL}\n", encoding="utf-8")
                 self._serving = (proc, argv[-1], output)
+        elif argv[:3] == ["tailscale", "funnel", "--bg"]:
+            if "funnel" in self.fail:
+                output.write_text(self.fail["funnel"] + "\n", encoding="utf-8")
+                proc.returncode = 1
+            elif self.funnel_allowed:
+                self.funnel = argv[-1]
+                output.write_text(
+                    f"Available on the internet:\n\nhttps://{self.name}/\n"
+                    f"|-- proxy {argv[-1]}\n\nFunnel started and running in the background.\n",
+                    encoding="utf-8")
+                proc.returncode = 0
+            else:
+                output.write_text(
+                    "\nFunnel is not enabled on your tailnet.\nTo enable, visit:\n\n"
+                    f"         {FUNNEL_URL}\n", encoding="utf-8")
+                self._funneling = (proc, argv[-1])
         else:
             raise AssertionError(f"неожиданная фоновая команда: {argv}")
         return proc
+
+    def allow_funnel(self) -> None:
+        """В консоли tailnet разрешили Funnel: ждавший `funnel --bg` доделал своё."""
+        self.funnel_allowed = True
+        if self._funneling is not None:
+            proc, target = self._funneling
+            self.funnel, proc.returncode, self._funneling = target, 0, None
 
     def complete_login(self) -> None:
         """Человек вошёл по ссылке: узел в tailnet, `tailscale login` вышел."""
