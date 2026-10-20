@@ -200,13 +200,12 @@ def test_dual_server_ladder_tries_plain_singbox_before_its_fragmenting():
 
 def test_plain_singbox_is_labelled_sb_everywhere():
     """Выученный обычный sing-box показывается так же, как у серверов только для sing-box:
-    «[sb]» в `xgw servers`, «sb» на странице статуса и в Telegram, «sing-box» в панели."""
-    from xgw.watch import status, status_page, telegram
+    «[sb]» в `xgw servers`, «sb» на странице статуса, «sing-box» в панели."""
+    from xgw.watch import status, status_page
 
     entry = {"tag": "spare-de-0123abcd", "profile": profiles.SB_DEFAULT, "protocol": "trojan"}
     assert status._fragment(entry) == " [sb]"
     assert status_page._core(entry) == "trojan · sb"
-    assert telegram._core_note(entry) == " [trojan, sb]"
     app = (Path(__file__).resolve().parents[1] / "src/xgw/ui/app.js").read_text(encoding="utf-8")
     hint = app.split('"singbox:default": ["sing-box", "', 1)[1].split('"]', 1)[0]
     assert "умеют оба ядра" in hint and "сам" in hint

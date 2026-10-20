@@ -2,7 +2,6 @@
 убранные серверы. Файл дополняет config.toml, а не заменяет его."""
 
 import json
-import os
 import stat
 import threading
 
@@ -33,7 +32,8 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {}}, "")
+         "priority": {}, "sticky": None, "core": {},
+         "tailscale": {"serve": "", "route": None, "funnel": ""}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -87,11 +87,11 @@ def test_junk_inside_the_file_is_ignored(conf):
         "disabled": ["aaaa1111"],  # убранный сервер отключённым уже не считается
         "removed": ["bbbb2222"],
         "devices": [],
-        "telegram": {"token": "", "chat_id": ""},
         # средний не хранится; неизвестный уровень и чужой отпечаток отброшены
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
         "sticky": None,  # переключатель основного сервера в панели не трогали
         "core": {},  # ядро за серверами не закрепляли
+        "tailscale": {"serve": "", "route": None, "funnel": ""},  # панель по tailnet не включали
     }
 
 
@@ -338,85 +338,37 @@ def test_config_toml_wins_over_panel_devices(conf):
         "уже заняты в network.static_leases"]
 
 
-# --- бот Telegram из панели ------------------------------------------------------------------
+# --- Telegram прежних версий ------------------------------------------------------------
 
 BOT_TOKEN = "123456789:AAFakeTokenForTestsOnly_0123456789abc"
 
 
-def test_bot_token_is_checked_before_it_is_saved(conf):
+def test_old_panel_bot_is_ignored_and_wiped(conf):
+    """Telegram в XGW больше нет: бот из panel.json не читается, а drop_telegram стирает его
+    токен с диска, оставляя всё остальное."""
+    _save(conf, {"telegram": {"token": BOT_TOKEN, "chat_id": "1001"}, "sticky": False})
     path = managed.path_for(conf)
-    for bad in ("", "  ", "не токен", "123:short", "abc:" + "A" * 35, None, 5):
-        with pytest.raises(ManagedError, match="токен бота"):
-            managed.check_bot_token(bad)
-    assert managed.check_bot_token(f"  {BOT_TOKEN}\n") == BOT_TOKEN
-    with pytest.raises(ManagedError):
-        managed.set_telegram(path, "не токен")
-    with pytest.raises(ManagedError, match="чата"):
-        managed.set_telegram(path, BOT_TOKEN, "не число")
-    assert not path.exists()
-
-    managed.set_telegram(path, BOT_TOKEN)
-    assert managed.load(path)[0]["telegram"] == {"token": BOT_TOKEN, "chat_id": ""}
-    managed.set_telegram(path, BOT_TOKEN, "-100123")
-    assert managed.load(path)[0]["telegram"] == {"token": BOT_TOKEN, "chat_id": "-100123"}
-    assert oct(os.stat(path).st_mode & 0o777) in ("0o600", "0o666")  # токен — как пароль
-    managed.set_telegram(path, "")
-    assert managed.load(path)[0]["telegram"] == {"token": "", "chat_id": ""}
-
-
-def test_junk_telegram_entries_are_dropped(conf):
-    for value in ("строка", 5, [], {"token": 5}, {"token": "123:short", "chat_id": "1"},
-                  {"token": BOT_TOKEN, "chat_id": "abc"}):
-        _save(conf, {"telegram": value})
-        data = managed.load(managed.path_for(conf))[0]["telegram"]
-        assert data == {"token": BOT_TOKEN if isinstance(value, dict) and value.get("token")
-                        == BOT_TOKEN else "", "chat_id": ""}, value
-
-
-def test_panel_bot_fills_the_notify_settings(conf):
-    managed.set_telegram(managed.path_for(conf), BOT_TOKEN)
+    assert "telegram" not in managed.load(path)[0]
     cfg, warnings = config.load(conf)
-    assert warnings == []  # бот без чата — ожидание подключения, а не ошибка
-    assert cfg.notify.telegram_bot_token == BOT_TOKEN and cfg.notify.telegram_chat_id == ""
-    assert cfg.managed.telegram is True
-    managed.set_telegram(managed.path_for(conf), BOT_TOKEN, "1001")
-    cfg, warnings = config.load(conf)
-    assert (cfg.notify.telegram_chat_id, warnings) == ("1001", [])
+    assert warnings == [] and cfg.speed.sticky is False
+    assert managed.drop_telegram(path) is True
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "telegram" not in raw and raw["sticky"] is False and BOT_TOKEN not in path.read_text()
+    assert managed.drop_telegram(path) is False  # убирать уже нечего
 
 
-def test_bot_in_config_toml_wins_over_the_panel(conf):
+def test_old_telegram_keys_in_config_toml_are_explained(conf):
     conf.write_text(
         conf.read_text(encoding="utf-8")
-        + f'[notify]\ntelegram_bot_token = "999999999:{"Z" * 35}"\ntelegram_chat_id = "7"\n',
+        + f'[notify]\ntelegram_bot_token = "{BOT_TOKEN}"\ntelegram_chat_id = "7"\n'
+        + 'commands = true\ntelegram_api = "https://api.telegram.org"\n',
         encoding="utf-8")
-    managed.set_telegram(managed.path_for(conf), BOT_TOKEN, "1001")
     cfg, warnings = config.load(conf)
-    assert cfg.notify.telegram_chat_id == "7" and cfg.managed.telegram is False
-    assert warnings == ["бот Telegram из панели пропущен: бот уже задан в config.toml"]
-
-
-def test_toml_token_without_chat_is_still_a_warning(conf):
-    conf.write_text(
-        conf.read_text(encoding="utf-8") + f'[notify]\ntelegram_bot_token = "{BOT_TOKEN}"\n',
-        encoding="utf-8")
-    _cfg, warnings = config.load(conf)
-    assert warnings == ["задан telegram_bot_token, но не задан telegram_chat_id"]
-
-
-@pytest.mark.parametrize("api", ["ftp://x", "api.telegram.org", "http://", "https://a b"])
-def test_telegram_api_must_be_an_http_address(conf, api):
-    conf.write_text(
-        conf.read_text(encoding="utf-8") + f'[notify]\ntelegram_api = "{api}"\n', encoding="utf-8")
-    cfg, warnings = config.load(conf)
-    assert cfg.notify.telegram_api == "https://api.telegram.org"
-    assert any("notify.telegram_api" in warning for warning in warnings)
-
-
-def test_telegram_api_trailing_slash_is_dropped(conf):
-    conf.write_text(
-        conf.read_text(encoding="utf-8") + '[notify]\ntelegram_api = "http://127.0.0.1:8081/"\n',
-        encoding="utf-8")
-    assert config.load(conf)[0].notify.telegram_api == "http://127.0.0.1:8081"
+    assert warnings == [
+        f"notify.{key}: Telegram в XGW больше нет — строку можно удалить"
+        for key in ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api")
+    ]
+    assert not hasattr(cfg.notify, "telegram_bot_token")
 
 
 def test_sticky_switch_is_stored_and_merged_into_the_config(conf):
@@ -433,11 +385,12 @@ def test_sticky_switch_is_stored_and_merged_into_the_config(conf):
         managed.set_sticky(path, "yes")
 
 
-# --- несколько писателей: панель, бот Telegram и команды xgw ---------------------------
+# --- несколько писателей: панель и команды xgw ------------------------------------------
 
 
 def test_concurrent_writers_keep_each_others_changes(conf):
-    """Панель отключает серверы, бот тем временем запоминает чат: обе правки остаются."""
+    """Панель отключает серверы, `xgw priority` тем временем меняет приоритеты: обе правки
+    остаются."""
     path = managed.path_for(conf)
     rounds = 40
     barrier, errors = threading.Barrier(2), []
@@ -446,9 +399,9 @@ def test_concurrent_writers_keep_each_others_changes(conf):
         for number in range(rounds):
             managed.set_servers(path, [f"{number:08x}"], "disabled")
 
-    def bot() -> None:
+    def priorities() -> None:
         for number in range(rounds):
-            managed.set_telegram(path, BOT_TOKEN, str(number))
+            managed.set_priority(path, [f"{number + 1000:08x}"], "high")
 
     def run(job) -> None:
         barrier.wait()
@@ -457,7 +410,7 @@ def test_concurrent_writers_keep_each_others_changes(conf):
         except Exception as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=run, args=(job,)) for job in (servers, bot)]
+    threads = [threading.Thread(target=run, args=(job,)) for job in (servers, priorities)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -465,7 +418,7 @@ def test_concurrent_writers_keep_each_others_changes(conf):
     assert errors == []
     data = managed.load(path)[0]
     assert data["disabled"] == [f"{number:08x}" for number in range(rounds)]
-    assert data["telegram"] == {"token": BOT_TOKEN, "chat_id": str(rounds - 1)}
+    assert data["priority"] == {f"{number + 1000:08x}": "high" for number in range(rounds)}
 
 
 def test_writer_waits_while_another_process_holds_the_lock(conf):

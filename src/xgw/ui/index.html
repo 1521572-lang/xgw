@@ -62,31 +62,85 @@
       <ul id="links" class="list"></ul>
     </section>
 
-    <section class="card tg-card" id="tg-card" aria-labelledby="tg-title">
+    <section class="card ts-card" id="ts-card" aria-labelledby="ts-title">
       <div class="card-head">
-        <h2 id="tg-title">Telegram</h2>
-        <span id="tg-chip" class="tag" hidden></span>
+        <h2 id="ts-title">Tailscale</h2>
+        <span id="ts-chip" class="tag" hidden></span>
       </div>
-      <p id="tg-text" class="muted small"></p>
-      <p id="tg-error" class="why" hidden></p>
-      <form id="tg-form" class="add" autocomplete="off" hidden>
-        <label class="visually-hidden" for="tg-token">Токен бота</label>
-        <input id="tg-token" type="password" spellcheck="false" autocomplete="off"
-               placeholder="Токен бота от @BotFather">
-        <div class="add-actions">
-          <button id="tg-submit" class="btn primary" type="submit">Подключить</button>
+      <p id="ts-text" class="muted small"></p>
+      <p id="ts-addr" class="ts-addr small" hidden></p>
+      <div id="ts-login" class="pair" hidden>
+        <p id="ts-login-text" class="small"></p>
+        <div class="add-actions ts-start">
+          <button id="ts-login-btn" class="btn primary" type="button">Войти в Tailscale</button>
+          <a id="ts-auth" class="btn primary" target="_blank" rel="noopener noreferrer" hidden>Открыть ссылку входа</a>
         </div>
-      </form>
-      <div id="tg-pair" class="pair" hidden>
-        <p id="tg-pair-text" class="small"></p>
-        <code id="tg-cmd" class="pair-code"></code>
-        <p id="tg-until" class="muted small"></p>
-        <div class="add-actions">
-          <button id="tg-newcode" class="btn ghost" type="button">Новый код</button>
+        <svg id="ts-qr" class="qr" role="img" aria-label="QR-код ссылки входа" hidden></svg>
+      </div>
+      <div id="ts-ssh-row" class="ts-row" hidden>
+        <button id="ts-ssh" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-ssh-title" aria-describedby="ts-ssh-note"></button>
+        <div class="main-text">
+          <span id="ts-ssh-title" class="main-title">SSH через Tailscale</span>
+          <span id="ts-ssh-note" class="muted small"></span>
         </div>
       </div>
-      <div id="tg-actions" class="add-actions" hidden>
-        <button id="tg-off" class="btn ghost" type="button">Отключить бота</button>
+      <div id="ts-serve-row" class="ts-row" hidden>
+        <button id="ts-serve" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-serve-title" aria-describedby="ts-serve-note"></button>
+        <div class="main-text">
+          <span id="ts-serve-title" class="main-title">Панель по tailnet</span>
+          <span id="ts-serve-note" class="muted small"></span>
+          <a id="ts-serve-url" class="ts-link small" target="_blank" rel="noopener noreferrer" hidden></a>
+          <a id="ts-enable" class="btn ghost ts-enable" target="_blank" rel="noopener noreferrer" hidden>Разрешить HTTPS в tailnet</a>
+        </div>
+      </div>
+      <div id="ts-funnel-row" class="ts-row" hidden>
+        <button id="ts-funnel" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-funnel-title" aria-describedby="ts-funnel-note"></button>
+        <div class="main-text">
+          <span id="ts-funnel-title" class="main-title">Приложение на телефоне (Funnel)</span>
+          <span id="ts-funnel-note" class="muted small"></span>
+          <a id="ts-funnel-enable" class="btn ghost ts-enable" target="_blank" rel="noopener noreferrer" hidden>Разрешить Funnel в tailnet</a>
+        </div>
+      </div>
+      <div id="ts-route-row" class="ts-row" hidden>
+        <div class="main-text">
+          <label id="ts-route-title" class="main-title" for="ts-route">Маршрут Tailscale</label>
+          <span id="ts-route-note" class="muted small"></span>
+        </div>
+        <select id="ts-route" class="prio" aria-describedby="ts-route-note">
+          <option value="direct">Напрямую</option>
+          <option value="vpn">Через VPN</option>
+        </select>
+      </div>
+      <div id="ts-k5" class="note ts-note" role="status" hidden>
+        <span id="ts-k5-text"></span>
+        <button id="ts-k5-fix" class="btn small-btn" type="button">Выключить фаервол Tailscale</button>
+      </div>
+      <div id="ts-k6" class="note ts-note" role="status" hidden>
+        <span>В консоли tailnet включено «Override local DNS»: DNS-запросы шлюза идут через Tailscale мимо VPN.</span>
+        <button id="ts-k6-fix" class="btn small-btn" type="button">Не принимать DNS из tailnet</button>
+      </div>
+    </section>
+
+    <section class="card phones-card" id="phones-card" aria-labelledby="phones-title">
+      <div class="card-head">
+        <h2 id="phones-title">Телефоны <span id="phones-count" class="count"></span></h2>
+      </div>
+      <p id="phones-text" class="muted small"></p>
+      <div id="phones-pair" class="pair" hidden>
+        <p id="phones-pair-text" class="small"></p>
+        <svg id="phones-qr" class="qr" role="img" aria-label="QR-код для привязки телефона" hidden></svg>
+        <p id="phones-until" class="muted small"></p>
+        <a id="phones-enable" class="btn ghost" target="_blank" rel="noopener noreferrer" hidden>Разрешить Funnel в tailnet</a>
+        <div class="add-actions">
+          <button id="phones-cancel" class="btn ghost" type="button">Убрать QR-код</button>
+        </div>
+      </div>
+      <ul id="phones" class="list"></ul>
+      <div class="add-actions">
+        <button id="phones-add" class="btn primary" type="button">Привязать телефон</button>
       </div>
     </section>
   </div>

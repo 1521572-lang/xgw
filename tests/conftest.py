@@ -40,12 +40,6 @@ def _no_panel(monkeypatch):
     monkeypatch.setattr("xgw.cli._sync_panel", lambda panel, *args, **kwargs: None)
 
 
-@pytest.fixture(autouse=True)
-def _no_bot(monkeypatch):
-    """`xgw run` в тестах не запускает бота Telegram; бот проверяется в test_telegram."""
-    monkeypatch.setattr("xgw.cli._sync_bot", lambda bot, *args, **kwargs: None)
-
-
 @pytest.fixture(scope="session")
 def _empty_sys_net(tmp_path_factory) -> Path:
     return tmp_path_factory.mktemp("sys-class-net")

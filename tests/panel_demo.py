@@ -1,7 +1,7 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting|reserve]
+                                                      budget|waiting|reserve|tailscale]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -9,7 +9,11 @@
 браузере они должны остаться текстом. Сцена probe — не отвечает
 сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
 waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками, reserve —
-безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1).
+безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1),
+tailscale — шлюз ещё не в tailnet (вход через 12 секунд после нажатия), провайдер выдаёт
+адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
+10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
+не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
 """
 
 from __future__ import annotations
@@ -23,8 +27,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xgw import actions, config, engine
+from fake_tailscale import FakeTailscale
+
+from xgw import actions, config, engine, tailscale
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -284,44 +291,7 @@ class DemoDaemon:
     speed_pending = property(lambda self: time.time() < self._until["speed"])
 
 
-class DemoBot:
-    """Бот, который ничего не отправляет: токен → код → через 12 секунд «чат подключён»."""
-
-    mark = None
-
-    def __init__(self) -> None:
-        self.mode, self.code, self.since = "off", "", 0.0
-
-    def info(self) -> dict:
-        if self.mode == "pairing" and time.time() - self.since > 12:
-            self.mode, self.code = "connected", ""  # «пользователь отправил /start КОД»
-        return {"mode": self.mode, "managed": True, "username": "xgw_demo_bot", "error": "",
-                "code": self.code, "until": self.since + 900 if self.code else None,
-                "commands": True}
-
-    def new_code(self) -> str:
-        self.mode, self.code, self.since = "pairing", "482915", time.time()
-        return self.code
-
-    def drop_code(self) -> None:
-        self.mode, self.code = "off", ""
-
-    def configure(self, *_args, **_kwargs) -> None:
-        pass
-
-
 class DemoPanel(Panel):
-    def _telegram(self, step: str, body: dict, store_path) -> actions.Outcome:
-        bot = self.bot
-        if step == "connect":
-            bot.new_code()
-            return actions.Outcome(0, "Токен сохранён. Откройте бота в Telegram и отправьте код")
-        if step == "code":
-            bot.new_code()
-            return actions.Outcome(0, "Новый код готов")
-        bot.drop_code()
-        return actions.Outcome(0, "Бот отключён")
-
     def _selected(self, xray_ok: bool, now: float) -> list[str]:
         return ["proxy-nl-a1a1"] if xray_ok else []
 
@@ -347,7 +317,22 @@ class DemoPanel(Panel):
                 0, f"«{pin['name']}» выбран вручную: весь трафик идёт через него, пока не "
                 "вернёте автовыбор" if pin else "автовыбор: ручной выбор сервера снят"
             )
-        return super()._act(name, body)
+        if name in ("tailscale/login", "tailscale/serve", "tailscale/funnel", "phones/pair"):
+            # Как человек по ту сторону ссылки: входит, разрешает HTTPS и Funnel в консоли
+            # tailnet, наводит камеру телефона на QR-код.
+            fake = self.runner
+            later = {"tailscale/login": fake.complete_login, "tailscale/serve": fake.enable_https,
+                     "tailscale/funnel": fake.allow_funnel, "phones/pair": fake.allow_funnel}[name]
+            threading.Timer(12 if name == "tailscale/login" else 10, later).start()
+        outcome = super()._act(name, body)
+        if name == "phones/pair" and outcome.ok:
+            threading.Timer(20, self._demo_phone).start()
+        return outcome
+
+    def _demo_phone(self) -> None:
+        code = self.phones.pairing()["code"]
+        if code:
+            self.phones.pair(code, "Galaxy S25 Ultra")
 
 
 def build(root: Path, port: int, scene: str) -> DemoPanel:
@@ -403,10 +388,21 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     if scene == "waiting":
         DemoCapture.inbound_missing = (
             "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0")
+    fake = FakeTailscale(backend="NeedsLogin" if scene == "tailscale" else "Running")
+    if scene == "tailscale":
+        fake.cgnat_wan = fake.override_dns = True
+        fake.https_enabled = False
+        fake.funnel_allowed = False
+    socket = tailscale.socket_path(paths)
+    socket.parent.mkdir(parents=True, exist_ok=True)
+    socket.write_text("", encoding="ascii")
     cfg, _warnings = config.load(config_path)
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
-                      capture_factory=DemoCapture, runner=lambda *_args, **_kwargs: "")
-    panel.configure(cfg, DemoDaemon(), DemoBot())
+                      capture_factory=DemoCapture, runner=fake,
+                      which=lambda name: None if scene == "empty" else f"/usr/bin/{name}",
+                      spawn=fake.spawn, sys_net=root / "sys-class-net", app_port=0)
+    panel.ts_wait = 1.0
+    panel.configure(cfg, DemoDaemon())
     return panel
 
 
@@ -416,7 +412,7 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve"))
+                 "reserve", "tailscale"))
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)

@@ -1,4 +1,4 @@
-"""Подписки, ссылки, устройства и бот Telegram, добавленные из панели: /etc/xgw/panel.json.
+"""Подписки, ссылки, устройства и Tailscale, добавленные из панели: /etc/xgw/panel.json.
 
 config.toml пишет человек — с комментариями и в своём порядке; программа его не
 переписывает. То, что добавлено кнопкой в панели, лежит отдельным файлом рядом
@@ -38,8 +38,10 @@ CORE_PINS = ("xray", "sing-box")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
-_BOT_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")  # «123456789:AA…», как выдаёт @BotFather
-_CHAT_ID_RE = re.compile(r"-?\d{1,20}")
+# Имя шлюза в tailnet (Self.DNSName без точки): «gw.tail1234.ts.net».
+_TS_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_TS_NAME_RE = re.compile(rf"(?=.{{1,253}}$){_TS_LABEL}(\.{_TS_LABEL})+")
+TS_ROUTES = ("direct", "vpn")
 
 
 class ManagedError(Exception):
@@ -58,9 +60,9 @@ def lock_path(path: Path) -> Path:
 
 
 def _update(path: Path, change: Callable[[dict], T]) -> T:
-    """load → change → save под блокировкой. У panel.json три писателя: панель и бот
-    Telegram (потоки демона) и команды `xgw priority`, `xgw core`; без блокировки правка,
-    сделанная между чтением и записью другого писателя, терялась.
+    """load → change → save под блокировкой. У panel.json несколько писателей: панель
+    (поток демона) и команды `xgw priority`, `xgw core`; без блокировки правка, сделанная
+    между чтением и записью другого писателя, терялась.
 
     change правит data на месте и возвращает итог; ложный итог — ничего не изменилось,
     файл не переписывается."""
@@ -87,7 +89,8 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {},
+        "priority": {}, "sticky": None, "core": {},
+        "tailscale": {"serve": "", "route": None, "funnel": ""},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -128,12 +131,28 @@ def load(path: Path) -> tuple[dict, str]:
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
-        "telegram": _telegram(raw.get("telegram")),
         "priority": _priority(raw.get("priority")),
         "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
         "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
+        "tailscale": _tailscale(raw.get("tailscale")),
     }, ""
+
+
+def _tailscale(value: object) -> dict:
+    """Tailscale из панели: serve — имя шлюза в tailnet, для которого XGW включил Serve
+    (панель по tailnet; пусто — не включал); route — маршрут tailscaled, None — как в
+    config.toml; funnel — имя, для которого XGW включил Funnel (API приложения)."""
+    serve, route, funnel = "", None, ""
+    if isinstance(value, dict):
+        name, way, public = value.get("serve"), value.get("route"), value.get("funnel")
+        if isinstance(name, str) and _TS_NAME_RE.fullmatch(name):
+            serve = name
+        if way in TS_ROUTES:
+            route = way
+        if isinstance(public, str) and _TS_NAME_RE.fullmatch(public):
+            funnel = public
+    return {"serve": serve, "route": route, "funnel": funnel}
 
 
 def _priority(value: object) -> dict[str, str]:
@@ -195,43 +214,6 @@ def _devices(value: object) -> list[dict]:
             "name": name if isinstance(name, str) and _NAME_RE.fullmatch(name) else "",
         })
     return result[:MAX_DEVICES]
-
-
-def _telegram(value: object) -> dict:
-    """Бот из панели: токен и chat_id (пусто, пока чат не подключён). Токен без
-    настоящего вида не принимается — раньше, чем уйдёт в запрос."""
-    token = chat = ""
-    if isinstance(value, dict):
-        raw_token, raw_chat = value.get("token"), value.get("chat_id")
-        if isinstance(raw_token, str) and _BOT_TOKEN_RE.fullmatch(raw_token):
-            token = raw_token
-            if isinstance(raw_chat, str) and _CHAT_ID_RE.fullmatch(raw_chat):
-                chat = raw_chat
-    return {"token": token, "chat_id": chat}
-
-
-def check_bot_token(text: object) -> str:
-    """Токен бота из вставленного текста; иначе ManagedError."""
-    token = text.strip() if isinstance(text, str) else ""
-    if not _BOT_TOKEN_RE.fullmatch(token):
-        raise ManagedError(
-            "это не похоже на токен бота: он выглядит как 123456789:AAH… и выдаётся @BotFather"
-        )
-    return token
-
-
-def set_telegram(path: Path, token: str, chat_id: str = "") -> None:
-    """Запоминает бота; chat_id пуст, пока чат не подключён. Пустой токен убирает бота."""
-    if token:
-        token = check_bot_token(token)
-        if chat_id and not _CHAT_ID_RE.fullmatch(chat_id):
-            raise ManagedError("неверный идентификатор чата")
-
-    def change(data: dict) -> bool:
-        data["telegram"] = {"token": token, "chat_id": chat_id if token else ""}
-        return True
-
-    _update(path, change)
 
 
 def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -> bool:
@@ -353,6 +335,65 @@ def set_sticky(path: Path, value: bool) -> bool:
         return True
 
     return _update(path, change)
+
+
+def set_tailscale_serve(path: Path, name: str) -> bool:
+    """Запоминает, что XGW включил Serve для этого имени в tailnet; пусто — выключил.
+    True — что-то изменилось."""
+    name = name.strip().lower().rstrip(".")
+    if name and not _TS_NAME_RE.fullmatch(name):
+        raise ManagedError("неверное имя шлюза в tailnet")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["serve"] == name:
+            return False
+        data["tailscale"] = {**data["tailscale"], "serve": name}
+        return True
+
+    return _update(path, change)
+
+
+def set_tailscale_funnel(path: Path, name: str) -> bool:
+    """Запоминает, что XGW включил Funnel для этого имени (API приложения); пусто —
+    выключил. True — что-то изменилось."""
+    name = name.strip().lower().rstrip(".")
+    if name and not _TS_NAME_RE.fullmatch(name):
+        raise ManagedError("неверное имя шлюза в tailnet")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["funnel"] == name:
+            return False
+        data["tailscale"] = {**data["tailscale"], "funnel": name}
+        return True
+
+    return _update(path, change)
+
+
+def set_tailscale_route(path: Path, route: str) -> bool:
+    """Маршрут tailscaled: direct или vpn (как tailscale.route в config.toml)."""
+    if route not in TS_ROUTES:
+        raise ManagedError("маршрут Tailscale: direct или vpn")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["route"] == route:
+            return False
+        data["tailscale"] = {**data["tailscale"], "route": route}
+        return True
+
+    return _update(path, change)
+
+
+def drop_telegram(path: Path) -> bool:
+    """Прежние версии хранили в panel.json бота Telegram (токен и чат). Telegram в XGW больше
+    нет — токен, секрет, не должен лежать на диске: файл переписывается без него. True —
+    было что убрать."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict) or "telegram" not in raw:
+        return False
+    return _update(path, lambda data: True)  # load() поля telegram уже не знает
 
 
 def save(path: Path, data: dict) -> None:

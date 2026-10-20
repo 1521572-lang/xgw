@@ -4,10 +4,15 @@
 показать серверы каждой подписки с задержками, закрепить один из них, отключить
 сервер или убрать его из списка, добавить и убрать подписку или ссылку сервера,
 обновить подписки и проверить запасные серверы, пустить устройство из Wi-Fi-сети
-мимо VPN и вернуть его обратно.
+мимо VPN и вернуть его обратно. Карточка «Tailscale» (Т2): вход в tailnet, Tailscale SSH,
+панель по tailnet (Serve) и маршрут самого Tailscale. Карточка «Телефоны» (А1
+`ANDROID_APP_PLAN.md`): привязка приложения XGW для Android по QR-коду, список телефонов;
+рядом с панелью работает API приложения (appapi.py), наружу — через Tailscale Funnel.
 
 Безопасность:
-  * слушает только 127.0.0.1 — из сети панель не открыть;
+  * слушает только 127.0.0.1 — из сети панель не открыть; по tailnet её открывает
+    Tailscale Serve (https://<шлюз>.<tailnet>.ts.net:8443/, только устройства tailnet), и
+    этот адрес принимается, только пока Serve включён из панели;
   * без токена не отдаёт ничего, кроме страницы входа; токен из ссылки сразу
     переезжает в cookie (HttpOnly, SameSite=Strict);
   * запрос с чужим заголовком Host отклоняется — это защита от подмены DNS
@@ -27,6 +32,7 @@ import ipaddress
 import json
 import os
 import secrets
+import shutil
 import socket
 import sqlite3
 import threading
@@ -38,8 +44,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import __version__, actions, config, cost, engine, log, managed, masking, priority
+from .. import __version__, actions, config, cost, engine, log, managed, masking, priority, qr
 from .. import pin as pinning
+from .. import tailscale as ts
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
@@ -47,8 +54,10 @@ from ..net import cmd, dnsmasq, lan
 from ..net.capture import Capture
 from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
+from ..phones import Phones
 from ..store import SubscriptionCache
 from . import status
+from .appapi import AppApi
 
 COOKIE = "xgw_panel"
 HEADER = "X-XGW-Panel"
@@ -57,6 +66,8 @@ MAX_DRAIN = 1 << 20  # сколько лишнего дочитать, преж�
 SELECT_TTL = 3.0  # как долго помнить ответ ядра о выбранном сервере
 EVENTS = 30
 LOGIN_TTL = 60.0  # сколько живёт одноразовый код входа, секунд
+TS_TTL = 10.0  # как долго помнить, что ответил CLI tailscale (страница опрашивает часто)
+TS_WAIT = 10.0  # сколько действие карточки ждёт ссылку входа или итог Serve
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
@@ -152,6 +163,11 @@ def login_address(cfg: Config, code: str) -> str:
     return f"{address(cfg)}?login={code}"
 
 
+def tailnet_address(name: str) -> str:
+    """Панель по tailnet (Tailscale Serve): имя шлюза в tailnet и порт SERVE_PORT."""
+    return f"https://{name}:{ts.SERVE_PORT}/"
+
+
 def wait_ready(port: int, wait: float = 15.0) -> bool:
     """Панель принимает соединения; только что запущенному демону даётся wait секунд."""
     deadline = time.monotonic() + wait
@@ -195,6 +211,10 @@ class Panel:
         root_problem: Callable[[], str | None] = actions.root_problem,
         capture_factory: Callable[..., Capture] = Capture,
         runner: Callable[..., str] = cmd.run,
+        which: Callable[[str], str | None] = shutil.which,
+        spawn: ts.Spawn = ts.spawn,
+        sys_net: Path | None = None,
+        app_port: int | None = None,
     ) -> None:
         self.paths = paths
         self.config_path = Path(config_path)
@@ -204,29 +224,37 @@ class Panel:
         self.root_problem = root_problem
         self.capture_factory = capture_factory
         self.runner = runner
+        self.which = which
+        self.spawn = spawn
+        self.sys_net = sys_net
+        self.ts_wait = TS_WAIT
         self.cfg = Config()
         self.daemon = None
-        self.bot = None
         self._lock = threading.Lock()  # одно действие за раз
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
+        self._ts_card: tuple[float, dict | None] = (0.0, None)
+        self._ts_jobs: dict[str, ts.Job] = {}  # «login», «serve», «funnel» — фоновые команды
+        self.phones = Phones(paths)
+        self.app_port = app_port  # None — API приложения не запускается (тесты панели)
+        self.app_api: AppApi | None = None
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
         """Панель по config.toml; None — она выключена ([panel] enabled = false)."""
         if not cfg.panel.enabled:
             return None
+        kwargs.setdefault("app_port", cfg.panel.app_port)
         panel = cls(paths, config_path, ensure_token(paths), port=cfg.panel.port, **kwargs)
         panel.configure(cfg)
         return panel
 
-    def configure(self, cfg: Config, daemon=None, bot=None) -> None:
-        """Новые настройки, новый демон и бот Telegram после перечитывания конфига."""
+    def configure(self, cfg: Config, daemon=None) -> None:
+        """Новые настройки и новый демон после перечитывания конфига."""
         self.cfg = cfg
         self.daemon = daemon
-        self.bot = bot
 
     # --- запуск ------------------------------------------------------------------
 
@@ -259,8 +287,19 @@ class Panel:
         )
         self._thread.start()
         self.log.info("панель управления слушает 127.0.0.1, порт %d (по токену)", self.port)
+        if self.app_port is not None:
+            api = AppApi(self, self.phones, port=self.app_port, logger=self.log)
+            try:
+                api.start()
+            except OSError as exc:  # панель работает и без API приложения
+                self.log.error("API приложения не запущен (порт %d): %s", self.app_port, exc)
+            else:
+                self.app_api = api
 
     def stop(self) -> None:
+        if self.app_api is not None:
+            self.app_api.stop()
+            self.app_api = None
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -560,7 +599,6 @@ class Panel:
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
             "devices": devices,
-            "telegram": self.bot.info() if self.bot is not None else {"mode": "unavailable"},
             "events": events,
             "budget": snapshot.get("budget") or {},
             # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
@@ -579,6 +617,11 @@ class Panel:
         }
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
+        # Карточка — мимо маскирования: ссылка входа в Tailscale нужна целиком, а имя и
+        # адрес шлюза в tailnet — не секреты для того, кто вошёл в панель.
+        masked["tailscale"] = self._tailscale_card()
+        # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
+        masked["phones"] = self._phones_card()
         return masked
 
     def _devices(self, info: dict) -> list[dict]:
@@ -602,6 +645,355 @@ class Panel:
                     "bypass": lease.ip in bypass, "managed": True, "offline": True,
                 })
         return devices
+
+    # --- Tailscale (Т2) --------------------------------------------------------------
+
+    def _tailscale_card(self, *, fresh: bool = False) -> dict:
+        """Карточка «Tailscale». Ответ CLI помнится TS_TTL секунд: страница спрашивает
+        состояние каждые несколько секунд, а это пять команд. Фоновые задания (вход, Serve)
+        проверяются каждый раз — они дешёвые."""
+        stamp, card = self._ts_card
+        if fresh or card is None or time.monotonic() - stamp >= TS_TTL:
+            card = self._tailscale_read()
+            self._ts_card = (time.monotonic(), card)
+        card = dict(card)
+        login = self._ts_job("login")
+        card["login_pending"] = login is not None and login.code() is None
+        if card["state"] == "login" and not card["auth_url"] and card["login_pending"]:
+            card["auth_url"] = ts.find_url(login.text())  # status ещё не обновился
+        card["auth_qr"] = qr.encode(card["auth_url"]) if card["auth_url"] else []
+        for kind in ("serve", "funnel"):
+            job = self._ts_job(kind)
+            pending = job is not None and job.code() is None
+            card[kind] = {
+                **card[kind], "pending": pending,
+                # Serve ждёт, пока в tailnet включат HTTPS, Funnel — пока его разрешат в
+                # правилах tailnet: CLI напечатал, где это сделать.
+                "enable_url": ts.find_url(job.text()) if pending and job is not None else "",
+            }
+        return card
+
+    def _ts_job(self, name: str) -> ts.Job | None:
+        return self._ts_jobs.get(name)
+
+    def _tailscale_read(self) -> dict:
+        cfg = self.cfg
+        serving = cfg.managed.tailscale_serve
+        public = cfg.managed.tailscale_funnel
+        card: dict = {
+            "state": "absent", "backend": "", "name": "", "address": "", "auth_url": "",
+            "ssh": None, "route": cfg.tailscale.route,
+            "route_panel": cfg.managed.tailscale_route is not None,
+            "serve": {"on": bool(serving), "live": None, "url": ""},
+            "funnel": {"on": bool(public), "live": None, "url": ""},
+            "cgnat": [], "netfilter_off": None, "override_dns": None,
+        }
+        if self.which("tailscale") is None:
+            return card
+        if not ts.present(self.paths, self.sys_net):
+            card["state"] = "stopped"
+            return card
+        state = ts.status(self.runner)
+        if state is None:
+            card["state"] = "unknown"
+            return card
+        card["backend"] = state.backend
+        card["state"] = {"Running": "running", "NeedsLogin": "login"}.get(state.backend, "other")
+        card["name"] = state.dns_name
+        card["address"] = next((item for item in state.addresses if ":" not in item), "")
+        if state.backend != "Running" and state.auth_url.startswith("https://"):
+            card["auth_url"] = state.auth_url
+        prefs = ts.prefs(self.runner)
+        if prefs is not None:
+            card["ssh"] = prefs.ssh
+            card["netfilter_off"] = (
+                None if prefs.netfilter is None else prefs.netfilter == ts.NETFILTER_OFF)
+        if state.backend == "Running":
+            card["serve"]["live"] = ts.serve_status(self.port, self.runner)
+            if self.app_api is not None:
+                card["funnel"]["live"] = ts.funnel_status(self.app_api.port, self.runner)
+            if public and state.dns_name and state.dns_name != public:
+                with contextlib.suppress(managed.ManagedError, OSError):
+                    managed.set_tailscale_funnel(
+                        managed.path_for(self.config_path), state.dns_name)
+                    self._wake()
+                public = state.dns_name
+            if serving and state.dns_name and state.dns_name != serving:
+                # Шлюз переименовали в консоли tailnet: Serve отвечает уже по новому имени.
+                with contextlib.suppress(managed.ManagedError, OSError):
+                    managed.set_tailscale_serve(managed.path_for(self.config_path), state.dns_name)
+                    self._wake()
+                serving = state.dns_name
+        if serving:
+            card["serve"]["url"] = tailnet_address(serving)
+        elif state.dns_name:
+            card["serve"]["url"] = tailnet_address(state.dns_name)
+        if public or state.dns_name:
+            card["funnel"]["url"] = f"https://{public or state.dns_name}/"
+        if card["netfilter_off"] is not True:
+            card["cgnat"] = ts.provider_cgnat(cfg, self.runner, skip=(lan.lan_interface(cfg),))
+        card["override_dns"] = ts.override_dns(self.runner)
+        return card
+
+    def _tailscale(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
+        """Кнопки карточки «Tailscale»: каждая меняет одну настройку и только по нажатию."""
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        if step == "route":
+            # Маршрут — настройка XGW, а не Tailscale: правила перезагрузит демон.
+            route = body.get("route")
+            if route not in ts.ROUTES:
+                return actions.Outcome(2, "ожидается route: direct или vpn")
+            if managed.set_tailscale_route(store_path, route):
+                way = "напрямую" if route == "direct" else "через VPN"
+                self._event(f"маршрут Tailscale: {way}")
+                self._wake()
+            self._ts_card = (0.0, None)
+            if route == "direct":
+                return actions.Outcome(0, "Tailscale идёт напрямую, мимо VPN", (
+                    "Провайдер видит, что на шлюзе работает Tailscale, но не видит, что внутри",))
+            return actions.Outcome(0, "Tailscale идёт через VPN, пока Xray отвечает", (
+                "Когда Xray не отвечает или VPN заблокирован — напрямую, чтобы шлюз остался "
+                "доступен",))
+        if self.which("tailscale") is None:
+            return actions.Outcome(2, "Tailscale не установлен")
+        if not ts.present(self.paths, self.sys_net):
+            return actions.Outcome(2, "tailscaled не запущен: sudo systemctl start tailscaled")
+        try:
+            outcome = self._tailscale_step(step, body, store_path)
+        except cmd.CommandError as exc:
+            outcome = actions.Outcome(1, f"Tailscale не принял команду: {exc}")
+        self._ts_card = (0.0, None)
+        return outcome
+
+    def _tailscale_step(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
+        if step == "login":
+            return self._tailscale_login()
+        if step == "fix":
+            name = body.get("name")
+            if name not in ts.FIXES:
+                return actions.Outcome(2, "ожидается name: netfilter или dns")
+            ts.fix(name, self.runner)
+            if name == "netfilter":
+                self._event("Tailscale: фаервол Tailscale выключен (netfilter-mode=off)")
+                return actions.Outcome(0, "Фаервол Tailscale выключен: правила держит XGW", (
+                    "Адреса провайдера из 100.64.0.0/10 больше не отбрасываются",))
+            self._event("Tailscale: DNS из tailnet не принимается (accept-dns=false)")
+            return actions.Outcome(0, "DNS шлюза снова идёт через VPN", (
+                "Имена MagicDNS на самом шлюзе больше не разрешаются; на других устройствах "
+                "tailnet всё по-прежнему",))
+        state = ts.status(self.runner)
+        if state is None or state.backend != "Running":
+            return actions.Outcome(2, "сначала войдите в Tailscale")
+        if step == "ssh":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            ts.set_ssh(body["on"], self.runner)
+            self._event("Tailscale SSH " + ("включён" if body["on"] else "выключен"))
+            if body["on"]:
+                return actions.Outcome(0, "SSH через Tailscale включён", (
+                    "Вход — по учётной записи tailnet, кто и под каким пользователем — правила "
+                    "в консоли tailnet. Порт SSH в интернет не открывается",))
+            return actions.Outcome(0, "SSH через Tailscale выключен")
+        if step == "serve":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            return self._tailscale_serve(body["on"], state.dns_name, store_path)
+        if step == "funnel":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            return self._tailscale_funnel(body["on"], state.dns_name, store_path)
+        return actions.Outcome(2, "нет такого действия")
+
+    def _wait_job(self, job: ts.Job, done: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + self.ts_wait
+        while job.code() is None and not done() and time.monotonic() < deadline:
+            time.sleep(0.3)
+
+    def _tailscale_login(self) -> actions.Outcome:
+        """`tailscale login` в фоне: CLI ждёт входа в браузере, а ссылка (AuthURL) уже в
+        `status --json` — её карточка показывает кнопкой и QR-кодом."""
+        state = ts.status(self.runner)
+        if state is not None and state.backend == "Running":
+            # `tailscale login` начал бы вход в новый, пустой профиль — с другими настройками.
+            return actions.Outcome(0, "Шлюз уже в tailnet")
+        job = self._ts_job("login")
+        if job is not None and job.code() is None:
+            return actions.Outcome(0, "Вход уже начат: откройте ссылку в карточке")
+        job = ts.Job(ts.login_command(), self.paths.run / "tailscale-login.log", self.spawn)
+        self._ts_jobs["login"] = job
+        self._event("Tailscale: вход начат из панели")
+
+        def ready() -> bool:
+            state = ts.status(self.runner)
+            return state is not None and (bool(state.auth_url) or state.backend == "Running")
+
+        self._wait_job(job, ready)
+        code, state = job.code(), ts.status(self.runner)
+        if state is not None and state.backend == "Running":
+            return actions.Outcome(0, "Шлюз в tailnet")
+        if code not in (None, 0):
+            lines = [line for line in job.text().splitlines() if line.strip()]
+            return actions.Outcome(
+                1, "tailscale login: " + (lines[-1] if lines else f"код {code}"))
+        return actions.Outcome(0, "Откройте ссылку входа — кнопка и QR-код в карточке", (
+            "Войдите в учётную запись tailnet; карточка обновится сама",))
+
+    def _tailscale_serve(self, on: bool, name: str, store_path: Path) -> actions.Outcome:
+        """Панель по tailnet: `tailscale serve --bg --https=8443 http://127.0.0.1:ПОРТ`.
+        Флаг в panel.json — что Serve включил XGW: только тогда панель принимает Host
+        «имя:8443», и только такой Serve снимает `xgw uninstall`."""
+        job = self._ts_job("serve")
+        if not on:
+            if job is not None:
+                job.stop()
+            failed = ""
+            try:
+                ts.serve_off(self.runner)
+            except cmd.CommandError as exc:
+                failed = str(exc)
+            managed.set_tailscale_serve(store_path, "")
+            self._wake()
+            self._event("Tailscale: панель по tailnet выключена")
+            if failed:
+                return actions.Outcome(1, f"панель по tailnet больше не принимается, но Serve "
+                                          f"не снят: {failed}")
+            return actions.Outcome(0, "Панель по tailnet выключена")
+        if not name:
+            return actions.Outcome(1, "Tailscale не назвал имя шлюза в tailnet — повторите")
+        if job is not None and job.code() is None:
+            return actions.Outcome(0, "Serve уже ждёт: разрешите HTTPS в tailnet по кнопке")
+        job = ts.Job(ts.serve_command(self.port), self.paths.run / "tailscale-serve.log",
+                     self.spawn)
+        self._ts_jobs["serve"] = job
+        self._wait_job(job, lambda: False)
+        code = job.code()
+        if code not in (None, 0):
+            lines = [line for line in job.text().splitlines() if line.strip()]
+            return actions.Outcome(1, "tailscale serve: " + (lines[-1] if lines else f"код {code}"))
+        managed.set_tailscale_serve(store_path, name)
+        self._wake()
+        self._event("Tailscale: панель по tailnet включена")
+        if code is None:
+            return actions.Outcome(0, "Осталось разрешить HTTPS в tailnet", (
+                "Нажмите «Разрешить HTTPS в tailnet» и подтвердите в консоли Tailscale — "
+                "панель по tailnet заработает сама",))
+        return actions.Outcome(0, "Панель по tailnet включена — адрес в карточке", (
+            "Открывается только на устройствах, где включён Tailscale",))
+
+    def _tailscale_funnel(self, on: bool, name: str, store_path: Path) -> actions.Outcome:
+        """API приложения в интернет: `tailscale funnel --bg --https=443 http://127.0.0.1:
+        <порт API>`. Флаг в panel.json — что Funnel включил XGW: только тогда API
+        принимает Host с именем шлюза, и только такой Funnel снимает `xgw uninstall`."""
+        job = self._ts_job("funnel")
+        if not on:
+            if job is not None:
+                job.stop()
+            self.phones.cancel()
+            failed = ""
+            try:
+                ts.funnel_off(self.runner)
+            except cmd.CommandError as exc:
+                failed = str(exc)
+            managed.set_tailscale_funnel(store_path, "")
+            self._wake()
+            self._event("Tailscale: приложение на телефоне — Funnel выключен")
+            if failed:
+                return actions.Outcome(1, f"приложение больше не принимается, но Funnel не "
+                                          f"снят: {failed}")
+            return actions.Outcome(0, "Funnel выключен: приложение на телефоне до шлюза не "
+                                      "достучится, пока его не включить")
+        if self.app_api is None:
+            return actions.Outcome(1, "API приложения не запущен — подробности в журнале XGW")
+        if not name:
+            return actions.Outcome(1, "Tailscale не назвал имя шлюза в tailnet — повторите")
+        if job is not None and job.code() is None:
+            return actions.Outcome(0, "Funnel уже ждёт: разрешите его в tailnet по кнопке")
+        job = ts.Job(ts.funnel_command(self.app_api.port), self.paths.run / "tailscale-funnel.log",
+                     self.spawn)
+        self._ts_jobs["funnel"] = job
+        self._wait_job(job, lambda: False)
+        code = job.code()
+        if code not in (None, 0):
+            lines = [line for line in job.text().splitlines() if line.strip()]
+            return actions.Outcome(
+                1, "tailscale funnel: " + (lines[-1] if lines else f"код {code}"))
+        managed.set_tailscale_funnel(store_path, name)
+        self._wake()
+        self._event("Tailscale: приложение на телефоне — Funnel включён")
+        if code is None:
+            return actions.Outcome(0, "Осталось разрешить Funnel в tailnet", (
+                "Нажмите «Разрешить Funnel в tailnet» и подтвердите в консоли Tailscale — "
+                "дальше всё заработает само",))
+        return actions.Outcome(0, "Funnel включён: приложение на телефоне достучится до шлюза", (
+            "Адрес открыт в интернет, но войти можно только с привязанного телефона",))
+
+    # --- телефоны (А1) --------------------------------------------------------------
+
+    def _phones_card(self) -> dict:
+        public = self.cfg.managed.tailscale_funnel
+        pairing = self.phones.pairing()
+        listing = self.phones.listing()
+        names = {phone.id: phone.name for phone in listing}
+        job = self._ts_job("funnel")
+        waiting = job is not None and job.code() is None
+        link = (f"xgw://pair?u=https://{public}&c={pairing['code']}"
+                if pairing["code"] and public and not waiting else "")
+        return {
+            "funnel": bool(public), "waiting": waiting,
+            "enable_url": ts.find_url(job.text()) if waiting and job is not None else "",
+            "available": self.app_api is not None,
+            "pairing": {
+                # Ссылка — та же, что в QR: её же берут стенд и программа испытаний.
+                "link": link, "qr": qr.encode(link) if link else [],
+                "until": pairing["until"] if link else None,
+                "paired": names.get(pairing["paired"], ""),
+            },
+            "list": [
+                {"id": phone.id, "name": phone.name, "paired": phone.paired, "seen": phone.seen}
+                for phone in listing
+            ],
+        }
+
+    def _phone_action(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
+        if step == "pair":
+            if self.app_api is None:
+                return actions.Outcome(1, "API приложения не запущен — подробности в журнале XGW")
+            if not self.cfg.managed.tailscale_funnel:
+                # Одна кнопка для заказчика: Funnel включается тут же.
+                outcome = self._tailscale("funnel", {"on": True}, store_path)
+                if not outcome.ok:
+                    return outcome
+            self.phones.new_code()
+            job = self._ts_job("funnel")
+            if job is not None and job.code() is None:
+                return actions.Outcome(0, "Осталось разрешить Funnel в tailnet", (
+                    "Нажмите «Разрешить Funnel в tailnet» и подтвердите в консоли Tailscale — "
+                    "QR-код появится сам",))
+            return actions.Outcome(0, "Наведите камеру приложения XGW на QR-код", (
+                "Код действует 10 минут и подходит один раз",))
+        if step == "cancel":
+            self.phones.cancel()
+            return actions.Outcome(0, "QR-код убран")
+        identifier = body.get("id")
+        if not isinstance(identifier, str):
+            return actions.Outcome(2, "ожидается id телефона")
+        names = {phone.id: phone.name for phone in self.phones.listing()}
+        if identifier not in names:
+            return actions.Outcome(2, "такого телефона нет — обновите страницу")
+        if step == "rename":
+            name = body.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return actions.Outcome(2, "ожидается имя телефона")
+            self.phones.rename(identifier, name)
+            return actions.Outcome(0, "Телефон переименован")
+        if step == "revoke":
+            self.phones.revoke(identifier)
+            self._event(f"телефон «{names[identifier]}» отвязан")
+            return actions.Outcome(0, f"Телефон «{names[identifier]}» отвязан", (
+                "Приложение на нём больше не войдёт: привяжите заново, если нужно",))
+        return actions.Outcome(2, "нет такого действия")
 
     # --- действия -----------------------------------------------------------------
 
@@ -784,38 +1176,6 @@ class Panel:
         self._wake()
         return actions.Outcome(0, done, notes)
 
-    def _telegram(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
-        """Подключение бота: токен → код → «/start КОД» в Telegram; отключение."""
-        bot, cfg = self.bot, self.cfg
-        if bot is None:
-            return actions.Outcome(1, "бот Telegram ещё не запущен — повторите через минуту")
-        if cfg.notify.telegram_bot_token and not cfg.managed.telegram:
-            return actions.Outcome(
-                2, "Бот задан в config.toml: менять его можно только там "
-                   "(notify.telegram_bot_token)",
-            )
-        if step == "connect":
-            token = managed.check_bot_token(body.get("token"))
-            managed.set_telegram(store_path, token)  # прежний чат при смене бота не нужен
-            self._wake()
-            bot.configure(self.cfg, self.daemon, bot.mark)
-            bot.new_code(token)
-            self._event("бот Telegram: токен сохранён, жду подключения чата")
-            return actions.Outcome(0, "Токен сохранён. Откройте бота в Telegram и отправьте код")
-        if step == "code":
-            if not cfg.managed.telegram or cfg.notify.telegram_chat_id:
-                return actions.Outcome(2, "чат уже подключён — сначала отключите бота")
-            bot.new_code(cfg.notify.telegram_bot_token)
-            return actions.Outcome(0, "Новый код готов")
-        if step == "disconnect":
-            managed.set_telegram(store_path, "")
-            bot.forget()
-            self._wake()
-            bot.configure(self.cfg, self.daemon, bot.mark)
-            self._event("бот Telegram отключён")
-            return actions.Outcome(0, "Бот отключён")
-        return actions.Outcome(2, "нет такого действия")
-
     def _config_names(self) -> set[str]:
         """Имена подписок, вписанных в config.toml: панель их не трогает."""
         mine = set(self.cfg.managed.subscriptions)
@@ -869,8 +1229,10 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
-        if name.startswith("telegram/"):
-            return self._telegram(name.removeprefix("telegram/"), body, store_path)
+        if name.startswith("tailscale/"):
+            return self._tailscale(name.removeprefix("tailscale/"), body, store_path)
+        if name.startswith("phones/"):
+            return self._phone_action(name.removeprefix("phones/"), body, store_path)
         if name == "subscription/remove":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:
@@ -988,8 +1350,18 @@ class Panel:
     def _cookie(self) -> str:
         return hmac.new(self.token.encode("utf-8"), b"xgw-panel", hashlib.sha256).hexdigest()
 
+    def _tailnet_host(self) -> str:
+        """Host панели по tailnet: только пока Serve включён из панели (флаг в panel.json).
+        Serve приходит на 127.0.0.1 и передаёт Host, с которым открыта страница."""
+        name = self.cfg.managed.tailscale_serve
+        return f"{name}:{ts.SERVE_PORT}" if name else ""
+
     def _hosts(self) -> set[str]:
-        return {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
+        hosts = {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
+        tailnet = self._tailnet_host()
+        if tailnet:
+            hosts.add(tailnet)
+        return hosts
 
     def _authorized(self, handler: BaseHTTPRequestHandler) -> bool:
         expected = self._cookie().encode("ascii")
@@ -1034,11 +1406,14 @@ class Panel:
                            code=HTTPStatus.FORBIDDEN)
                 return
             # Вход переезжает в cookie, токен или код уходит из адресной строки и истории.
+            # По tailnet страница открыта по https — cookie туда же и только по https.
+            secure = "; Secure" if host == self._tailnet_host() else ""
             handler.send_response(HTTPStatus.SEE_OTHER)
             handler.send_header("Location", "/")
             handler.send_header(
                 "Set-Cookie",
-                f"{COOKIE}={self._cookie()}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000",
+                f"{COOKIE}={self._cookie()}; Path=/; HttpOnly; SameSite=Strict; "
+                f"Max-Age=31536000{secure}",
             )
             handler.send_header("Cache-Control", "no-store")
             handler.send_header("Content-Length", "0")
@@ -1089,9 +1464,10 @@ class Panel:
         # формы на чужом сайте быть не может, и источник — тот же адрес.
         origin = handler.headers.get("Origin")
         site = handler.headers.get("Sec-Fetch-Site")
+        scheme = "https" if host == self._tailnet_host() else "http"
         if (
             handler.headers.get(HEADER) != "1"
-            or (origin is not None and origin.lower() != f"http://{host}")
+            or (origin is not None and origin.lower() != f"{scheme}://{host}")
             or (site is not None and site.lower() != "same-origin")
         ):
             raise Refused(HTTPStatus.FORBIDDEN, "Запрос не со страницы панели")

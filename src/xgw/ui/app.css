@@ -141,7 +141,8 @@ button, textarea, input { font: inherit; color: inherit; }
   .subs-card { order: 3; }
   .devices-card { order: 4; }
   .events-card { order: 5; }
-  .tg-card { order: 6; }
+  .ts-card { order: 6; }
+  .phones-card { order: 7; }
   body[data-empty="1"] .subs-card { order: 2; }
   body[data-empty="1"] .servers-card { order: 3; }
 }
@@ -325,9 +326,8 @@ button, textarea, input { font: inherit; color: inherit; }
 .add input { min-height: 2.6rem; }
 .add textarea::placeholder, .add input::placeholder { color: var(--muted); font-family: system-ui, sans-serif; }
 
-/* --- подключение бота Telegram ---------------------------------------------- */
+/* --- QR-код и код для ввода (вход в Tailscale, привязка телефона) ---------------- */
 
-.tg-card .muted + .add, .tg-card .why + .add { margin-top: .8rem; }
 .pair { margin-top: .8rem; }
 .pair-code {
   display: block;
@@ -343,6 +343,37 @@ button, textarea, input { font: inherit; color: inherit; }
   user-select: all;
 }
 .add-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .55rem; }
+
+/* --- Tailscale ------------------------------------------------------------- */
+
+.ts-addr { margin-top: .35rem; font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.ts-start { justify-content: flex-start; flex-wrap: wrap; }
+.ts-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .6rem .75rem;
+  margin-top: .8rem;
+  padding: .65rem .8rem;
+  border-radius: 12px;
+  background: var(--card-2);
+}
+.ts-link { margin-top: .2rem; color: var(--info); overflow-wrap: anywhere; }
+.ts-enable { align-self: flex-start; margin-top: .45rem; }
+.ts-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
+.ts-note > span { flex: 1 1 14rem; }
+a.btn { display: inline-flex; align-items: center; color: inherit; text-decoration: none; }
+a.btn.primary { color: var(--accent-ink); }
+/* QR-код — тёмные модули на белом в любой теме: так его читает камера телефона. */
+.qr {
+  display: block;
+  width: min(14rem, 100%);
+  height: auto;
+  margin: .8rem auto 0;
+  border-radius: 10px;
+  background: #fff;
+}
+.qr path { fill: #000; }
 
 /* --- списки --------------------------------------------------------------- */
 

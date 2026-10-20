@@ -271,19 +271,15 @@ class StatusConf:
 @dataclass
 class Notify:
     desktop: bool = True
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
     min_interval_min: int = 10
-    # Бот отвечает на команды из своего чата (/status, /enable…); false — только
-    # уведомления. Адрес API меняют для собственного сервера Bot API.
-    commands: bool = True
-    telegram_api: str = "https://api.telegram.org"
 
 
 @dataclass
 class PanelConf:
     enabled: bool = True
     port: int = 8781
+    # API приложения XGW для Android (watch/appapi.py): на 127.0.0.1, наружу — через Funnel.
+    app_port: int = 8782
 
 
 @dataclass
@@ -299,14 +295,19 @@ class Managed:
     # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
     # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
     devices: list[str] = field(default_factory=list)
-    # Токен бота и чат подключены в панели (а не вписаны в config.toml).
-    telegram: bool = False
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
     # Ядро, закреплённое за сервером: отпечаток → "xray" или "sing-box"; остальные — auto.
     core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
+    # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
+    # пусто — не включала. Только тогда панель принимает Host «имя:8443».
+    tailscale_serve: str = ""
+    # Маршрут Tailscale выбран в панели (tailscale.route); None — как в config.toml.
+    tailscale_route: str | None = None
+    # Имя шлюза, для которого панель включила Funnel (API приложения, А1); пусто — нет.
+    tailscale_funnel: str = ""
 
 
 @dataclass
@@ -416,15 +417,11 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.core = dict(data["core"])
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
+    cfg.managed.tailscale_serve = data["tailscale"]["serve"]
+    cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
+    if data["tailscale"]["route"] is not None:
+        cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
-    bot = data["telegram"]
-    if bot["token"]:
-        if cfg.notify.telegram_bot_token:
-            warnings.append("бот Telegram из панели пропущен: бот уже задан в config.toml")
-        else:
-            cfg.notify.telegram_bot_token = bot["token"]
-            cfg.notify.telegram_chat_id = bot["chat_id"]
-            cfg.managed.telegram = True
     return warnings
 
 
@@ -477,6 +474,13 @@ def probe_bytes(url: str) -> int | None:
         return None
 
 
+# Ключи прежних версий, которые больше ничего не значат: в config.toml у заказчика они
+# остаются, предупреждение объясняет почему, а не называет их «неизвестными».
+_DROPPED = {
+    "notify": ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api"),
+}
+
+
 def _build_section(cls, data: object, section: str, warnings: list[str]):
     if not isinstance(data, dict):
         warnings.append(f"секция [{section}] не является таблицей — значения по умолчанию")
@@ -485,6 +489,9 @@ def _build_section(cls, data: object, section: str, warnings: list[str]):
     known = {f.name for f in fields(cls)}
     values: dict[str, object] = {}
     for name, value in data.items():
+        if name in _DROPPED.get(section, ()):
+            warnings.append(f"{section}.{name}: Telegram в XGW больше нет — строку можно удалить")
+            continue
         if name not in known:
             warnings.append(f"неизвестный ключ {section}.{name} проигнорирован")
             continue
@@ -699,17 +706,6 @@ def _validate(cfg: Config) -> list[str]:
                 f"Xray {XRAY_VERSION}"
             )
         cfg.xray.version = XRAY_VERSION
-    # Бот из панели без чата — это ожидание подключения, а не ошибка настройки.
-    waiting = cfg.managed.telegram
-    if cfg.notify.telegram_bot_token and not cfg.notify.telegram_chat_id and not waiting:
-        warnings.append("задан telegram_bot_token, но не задан telegram_chat_id")
-    if not re.fullmatch(r"https?://[^\s/]+/?", cfg.notify.telegram_api):
-        warnings.append(
-            f"notify.telegram_api={cfg.notify.telegram_api}: ожидается http(s)://адрес — "
-            f"используется {Notify().telegram_api}"
-        )
-        cfg.notify.telegram_api = Notify().telegram_api
-    cfg.notify.telegram_api = cfg.notify.telegram_api.rstrip("/")
     return warnings
 
 

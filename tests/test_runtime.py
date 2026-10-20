@@ -193,7 +193,7 @@ def test_notifier_rate_limits_per_kind(tmp_path):
 
 def test_notifier_masks_secrets_and_survives_bad_sink(tmp_path):
     def broken(_kind, _text):
-        raise RuntimeError("telegram недоступен")
+        raise RuntimeError("получатель недоступен")
 
     notifier = Notifier(tmp_path / "state.db", 0, sinks=[broken])
     uuid = "11111111-2222-3333-4455-666666666661"

@@ -1,10 +1,9 @@
 """События и уведомления демона.
 
 Каждое событие пишется в журнал и в SQLite (его видно в `xgw status`).
-Уведомление наружу — одно на тип события не чаще min_interval_min. Каналы
-доставки — получатели `sinks`: рабочий стол активного пользователя и, если
-задан бот, Telegram. Без получателей уведомление — запись в журнале уровня
-WARNING.
+Уведомление наружу — одно на тип события не чаще min_interval_min. Канал
+доставки — получатели `sinks`: рабочий стол активного пользователя. Без
+получателей уведомление — запись в журнале уровня WARNING.
 """
 
 from __future__ import annotations
@@ -13,16 +12,14 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from urllib.parse import urlencode
 
-from .. import engine, fetch, log, masking
+from .. import log, masking
 from ..config import Config
 from ..net import cmd
 from ..store import Store
 
 Sink = Callable[[str, str], None]  # (тип события, текст)
 
-TELEGRAM_API = "https://api.telegram.org"
 RUN_USER = Path("/run/user")
 _GRAPHICAL = ("wayland", "x11", "mir")
 # Заголовок уведомления по типу события.
@@ -114,48 +111,10 @@ def desktop_sink(runner: cmd.Runner = cmd.run, run_user: Path = RUN_USER) -> Sin
     return send
 
 
-def telegram_sink(cfg: Config, *, mark: int | None, post=fetch.fetch_url) -> Sink:
-    """Сообщение боту: через http-in Xray, а если он не отвечает — напрямую с
-    меткой мимо перехвата (без VPN Telegram может быть недоступен)."""
-    token, chat = cfg.notify.telegram_bot_token, cfg.notify.telegram_chat_id
-
-    def send(kind: str, text: str) -> None:
-        data = urlencode({
-            "chat_id": chat, "text": f"{title(kind)}\n{text}",
-            "disable_web_page_preview": "true",
-        }).encode("ascii")
-        routes: list[dict] = []
-        proxy = engine.healthy_http_in(cfg)
-        if proxy is not None:
-            routes.append({"proxy": proxy})
-        routes.append({
-            "mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None,
-        })
-        error: Exception | None = None
-        for route in routes:
-            try:
-                reply = post(
-                    f"{cfg.notify.telegram_api}/bot{token}/sendMessage", data=data,
-                    timeout=10.0, retries=0,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}, **route,
-                )
-            except fetch.FetchError as exc:
-                error = exc
-                continue
-            if reply.status == 200:
-                return
-            error = RuntimeError(f"Telegram ответил HTTP {reply.status}")
-        raise error or RuntimeError("Telegram недоступен")
-
-    return send
-
-
 def build_sinks(cfg: Config, *, mark: int | None, runner: cmd.Runner = cmd.run) -> list[Sink]:
     sinks: list[Sink] = []
     if cfg.notify.desktop:
         sinks.append(desktop_sink(runner))
-    if cfg.notify.telegram_bot_token and cfg.notify.telegram_chat_id:
-        sinks.append(telegram_sink(cfg, mark=mark))
     return sinks
 
 
