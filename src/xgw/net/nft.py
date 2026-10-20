@@ -28,6 +28,12 @@ IPv6: `ip6 xgw6` запрещает форвардинг IPv6 из LAN и в LAN
 в ней же перехватывается IPv6 самой машины — теми же цепочками, что и IPv4 (output
 помечает, prerouting на lo отдаёт Xray через TPROXY); при "off" цепочка v6_guard не
 выпускает IPv6 машины наружу. Обе таблицы загружаются одной транзакцией (apply).
+
+Tailscale (Т1, tailscale.py): когда tailscaled работает, его помеченные сокеты (метка
+0x80000 в маске 0xff0000) и всё, что уходит в интерфейс tailscale0, обходят перехват (К1,
+К2), blocked (К3) и v6_guard (К4). Набор ts_direct решает, идут ли сокеты tailscaled мимо
+Xray в режиме on: при tailscale.route = "direct" метка в нём всегда, при "vpn" — только
+пока Xray не отвечает (её кладёт и убирает демон, `nft add element` / `flush set`).
 """
 
 from __future__ import annotations
@@ -37,12 +43,16 @@ import ipaddress
 import re
 from dataclasses import dataclass
 
+from .. import tailscale as ts
 from ..config import Config
 from . import lan
 from .cmd import CommandError, Runner
 
 TABLE = "xgw"
 TABLE6 = "xgw6"
+TS_SET = "ts_direct"  # метка tailscaled, которая идёт мимо Xray (Т1)
+TS_MARK = f"{ts.MARK:#x}"
+TS_MASK = f"{ts.MARK_MASK:#x}"
 
 # Диапазоны из инструкции Xray: частные, служебные и широковещательные адреса.
 RESERVED4 = (
@@ -102,6 +112,21 @@ class Rules:
     # IPv6 машины закрыт фаерволом (network.ipv6 = "off" или перехват невозможен), а не
     # только настройкой NetworkManager, которой может и не быть.
     v6_guard: bool = False
+    # tailscaled работает: его сокеты и интерфейс tailscale0 — мимо перехвата и блокировок
+    # (Т1). ts_direct — метка tailscaled лежит в наборе ts_direct: сокеты идут мимо Xray и
+    # в режиме on (tailscale.route = "direct" либо Xray не отвечает).
+    tailscale: bool = False
+    ts_direct: bool = True
+
+    @property
+    def ts4(self) -> bool:
+        """В `ip xgw` есть исключения Tailscale: цепочка output или block_output."""
+        return self.tailscale and (self.capture_local or self.block_local)
+
+    @property
+    def ts6(self) -> bool:
+        """В `ip6 xgw6` есть исключения Tailscale (и набор ts_direct): output или v6_guard."""
+        return self.tailscale and (self.capture6 or self.v6_guard)
 
     @property
     def capture(self) -> bool:
@@ -150,9 +175,11 @@ def time_service_uids() -> tuple[int, ...]:
 def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
+    tailscale: bool = False, xray_down: bool = False,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
-    blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked)."""
+    blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
+    tailscale — tailscaled работает; xray_down — Xray не отвечает (для route = "vpn")."""
     capture = capture and not blocked
     warnings: list[str] = []
     name = cfg.network.lan_if.strip()
@@ -221,6 +248,9 @@ def build_rules(
             block_local=blocked and cfg.capture.local,
             block_containers=CONTAINER_IFS if blocked and containers_wanted(cfg) else (),
             v6_guard=cfg.capture.local and (blocked or not proxy6),
+            tailscale=tailscale,
+            # Без перехвата (снят, blocked) через Xray tailscaled идти некуда.
+            ts_direct=cfg.tailscale.route != "vpn" or xray_down or not capture,
         ),
         warnings,
     )
@@ -256,6 +286,24 @@ def _set(name: str, elements: tuple[str, ...], kind: str = "ipv4_addr") -> list[
     return lines
 
 
+def _ts_set(rules: Rules) -> list[str]:
+    """Набор ts_direct: метка tailscaled в нём — его сокеты идут мимо Xray."""
+    lines = [f"set {TS_SET} {{", "    type mark"]
+    if rules.ts_direct:
+        lines.append(f"    elements = {{ {TS_MARK} }}")
+    lines.append("}")
+    return lines
+
+
+def _ts_skip(verdict: str) -> list[str]:
+    """Сокеты tailscaled из набора ts_direct (К1) и всё, что уходит в tailscale0, — в том
+    числе DNS к MagicDNS 100.100.100.100 (К2): мимо перехвата."""
+    return [
+        f"meta mark and {TS_MASK} @{TS_SET} {verdict}",
+        f'oifname "{ts.INTERFACE}" {verdict}',
+    ]
+
+
 def _chain(name: str, header: str, rules: list[str]) -> list[str]:
     return [f"chain {name} {{", f"    {header}", *(f"    {rule}" for rule in rules), "}"]
 
@@ -271,6 +319,8 @@ def render(rules: Rules) -> str:
     blocks: list[list[str]] = [_set("reserved4", rules.reserved)]
     if lan_if:
         blocks.append(_set("bypass4", rules.bypass))
+    if rules.ts4:
+        blocks.append(_ts_set(rules))
 
     tproxy = (
         "meta l4proto { tcp, udp } counter "
@@ -320,6 +370,7 @@ def render(rules: Rules) -> str:
     if rules.capture_local:
         output = [
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
+            *(_ts_skip("return") if rules.ts4 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
@@ -417,6 +468,10 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         output = [
             'oifname "lo" accept',
             f"meta mark {bypass} accept",  # сокеты Xray/sing-box и прямые запросы XGW
+            # tailscaled — всегда, а не по набору ts_direct (К3): при route = "vpn" и
+            # здоровом Xray перехвата в blocked нет, и Tailscale не ходил бы никуда.
+            *([f"meta mark and {TS_MASK} == {TS_MARK} accept",
+               f'oifname "{ts.INTERFACE}" accept'] if rules.ts4 else []),
             "ct direction reply accept",  # ответы на входящие (SSH на шлюз, панель)
             "fib daddr type local accept",
             "ip daddr @reserved4 meta l4proto != { tcp, udp } accept",  # ping в LAN и т. п.
@@ -490,6 +545,8 @@ def render6(rules: Rules) -> str:
     if not rules.lan_if and not rules.capture6 and not rules.v6_guard:
         return ""
     blocks: list[list[str]] = []
+    if rules.ts6:
+        blocks.append(_ts_set(rules))
     if rules.capture6:
         proxy, bypass = f"{rules.mark_proxy:#x}", f"{rules.mark_bypass:#x}"
         blocks.append(_set("reserved6", rules.reserved6, "ipv6_addr"))
@@ -511,6 +568,7 @@ def render6(rules: Rules) -> str:
             )
         output = [
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
+            *(_ts_skip("return") if rules.ts6 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
@@ -538,6 +596,8 @@ def render6(rules: Rules) -> str:
         # настройка NetworkManager, а WAN может быть и не под ним. Сокеты Xray (метка),
         # служебный ICMPv6 самого ядра (ответы ND, ошибки — без метки и бывает на
         # глобальный адрес), link-local и multicast (ND, RA, DHCPv6-клиент) — можно.
+        # Tailscale (К4): tailnet через tailscale0 — всегда, сокеты tailscaled — по набору
+        # ts_direct: при route = "vpn" и здоровом Xray они идут по IPv4 через Xray.
         blocks.append(
             _chain(
                 "v6_guard",
@@ -545,6 +605,7 @@ def render6(rules: Rules) -> str:
                 [
                     'oifname "lo" accept',
                     f"meta mark {rules.mark_bypass:#x} accept",
+                    *(_ts_skip("accept") if rules.ts6 else []),
                     "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, "
                     "parameter-problem, nd-router-solicit, nd-router-advert, "
                     "nd-neighbor-solicit, nd-neighbor-advert } accept",
@@ -603,6 +664,42 @@ def delete(runner: Runner) -> None:
         runner(["nft", "-f", "-"], input=_delete_text("ip6", TABLE6))
 
 
+def ts_elements(rules: Rules) -> str:
+    """Команды для `nft -f`: положить метку tailscaled в наборы ts_direct загруженных таблиц
+    или убрать её (`flush set` не падает, если набор уже пуст)."""
+    lines = []
+    for family, table, wanted in (("ip", TABLE, rules.ts4 and rules.capture_local),
+                                  ("ip6", TABLE6, rules.ts6)):
+        if not wanted:
+            continue
+        if rules.ts_direct:
+            lines.append(f"add element {family} {table} {TS_SET} {{ {TS_MARK} }}")
+        else:
+            lines.append(f"flush set {family} {table} {TS_SET}")
+    return "".join(line + "\n" for line in lines)
+
+
+def listing(runner: Runner, family: str = "ip", table: str = TABLE) -> str | None:
+    """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft)."""
+    try:
+        return runner(["nft", "list", "table", family, table])
+    except CommandError as exc:
+        text = str(exc)
+        if "No such file or directory" in text or "does not exist" in text:
+            return ""
+        return None
+
+
+def ts_state(text: str) -> tuple[bool, bool | None]:
+    """Исключения Tailscale в загруженной таблице: (есть ли правила с tailscale0, лежит ли
+    метка в наборе ts_direct — None, если набора нет)."""
+    has = f'"{ts.INTERFACE}"' in text
+    match = re.search(
+        rf"^\s*set {TS_SET} \{{\n(.*?)^\s*\}}", text, flags=re.MULTILINE | re.DOTALL
+    )
+    return has, None if match is None else "elements" in match.group(1)
+
+
 def loaded_chains(
     runner: Runner, family: str = "ip", table: str = TABLE
 ) -> set[str] | None:
@@ -619,16 +716,15 @@ def chain_rules(
     цепочки XGW не бывают (test_rendered_chains_are_never_empty) — такую оставляет чужой
     `nft flush table ip xgw` или `flush chain`: имена на месте, а перехвата нет. {} —
     таблицы нет, None — узнать не удалось (нет прав или nft)."""
-    try:
-        listing = runner(["nft", "list", "table", family, table])
-    except CommandError as exc:
-        text = str(exc)
-        if "No such file or directory" in text or "does not exist" in text:
-            return {}
-        return None
+    text = listing(runner, family, table)
+    return None if text is None else parse_chains(text)
+
+
+def parse_chains(text: str) -> dict[str, bool]:
+    """Цепочки из текста `nft list table`: имя → есть ли в ней правила."""
     chains: dict[str, bool] = {}
     for name, body in re.findall(
-        r"^\s*chain (\w+) \{\n(.*?)^\s*\}", listing, flags=re.MULTILINE | re.DOTALL
+        r"^\s*chain (\w+) \{\n(.*?)^\s*\}", text, flags=re.MULTILINE | re.DOTALL
     ):
         chains[name] = chains.get(name, False) or _has_rules(body)
     return chains

@@ -50,6 +50,10 @@ class FakeSystem:
         self.ipv6_global: list[str] = []  # интерфейсы с глобальным IPv6-адресом
         self.nft_chains: list[dict] = []  # чужие цепочки для `nft -j list ruleset`
         self.time_synced = True
+        self.tailscale_status = ""  # вывод `tailscale status --json`
+        self.tailscale_netcheck = ""  # вывод `tailscale netcheck`
+        self.resolved: dict[str, str] = {}  # интерфейс → `resolvectl status ИНТЕРФЕЙС`
+        self.resolved_dns: dict[str, str] = {}  # интерфейс → `resolvectl dns ИНТЕРФЕЙС`
         self.sessions: list[dict] = []  # loginctl list-sessions
         self.session_props: dict[str, str] = {}
         self.add_profile("wan", "wan0", active=True, **{"ipv6.method": "auto"})
@@ -140,6 +144,20 @@ class FakeSystem:
 
     def _unshare(self, args, command, check) -> str:
         return ""
+
+    def _tailscale(self, args, command, check) -> str:
+        if args == ["status", "--json"]:
+            return self.tailscale_status
+        if args == ["netcheck"]:
+            return self.tailscale_netcheck
+        raise AssertionError(f"неожиданная команда: {command}")
+
+    def _resolvectl(self, args, command, check) -> str:
+        if args[0] == "status":
+            return self.resolved.get(args[1], "")
+        if args[0] == "dns":
+            return self.resolved_dns.get(args[1], "")
+        raise AssertionError(f"неожиданная команда: {command}")
 
     def _nmcli(self, args, command, check) -> str:
         if not self.nm_running:

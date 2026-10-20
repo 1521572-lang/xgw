@@ -28,6 +28,11 @@ xgw-net.service (_prepare_tun). Без интерфейса маршрут ко�
 Выбор «включён/снят» хранится в /var/lib/xgw и переживает перезагрузку: по нему
 правила загружает xgw-net.service. Временное снятие (open) — метка в /run.
 Все операции идемпотентны и идут под файловой блокировкой.
+
+Tailscale (Т1): исключения для tailscaled в правилах есть, только пока он работает
+(tailscale.present). Он запустился или остановился — правила уже не те (loaded), и демон
+загружает их заново. При tailscale.route = "vpn" демон отмечает в /run, что Xray не
+отвечает (tailscale_direct): тогда сокеты tailscaled идут мимо Xray.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ import time
 from pathlib import Path
 
 from .. import log
+from .. import tailscale as ts
 from ..config import Config
 from ..paths import Paths, atomic_write_json, file_lock
 from . import cmd, iprule, lan, nft, sysctl, tun
@@ -110,6 +116,8 @@ class Capture:
         self.time_uids = time_uids
         self.state_file = paths.var / "capture.json"
         self.open_marker = paths.run / "capture-open"
+        # tailscale.route = "vpn", а Xray не отвечает: сокеты tailscaled — мимо Xray.
+        self.ts_marker = paths.run / "tailscale-direct"
         self.sys_net: Path | None = None  # где искать мосты Docker; None — lan.SYS_NET
         self._warned: set[str] = set()
         # Почему последняя загрузка вместо перехвата оставила сеть напрямую: в применённом
@@ -174,7 +182,9 @@ class Capture:
         """Параметры правил для режима (по умолчанию — текущего)."""
         mode = mode or self.mode()
         rules, warnings = nft.build_rules(
-            self.cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=self.time_uids
+            self.cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=self.time_uids,
+            tailscale=self.cfg.capture.local and ts.present(self.paths, self.sys_net),
+            xray_down=self.ts_marker.exists(),
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -475,6 +485,40 @@ class Capture:
                 raise CaptureError(str(exc)) from exc
             return f"интерфейс {rules.tun_name} поднят, маршруты в него на месте"
 
+    def tailscale_direct(self, xray_down: bool) -> str:
+        """tailscale.route = "vpn": пока Xray не отвечает, сокеты tailscaled идут напрямую —
+        иначе удалённый доступ пропал бы вместе с VPN. Метка в наборе ts_direct меняется
+        без перезагрузки таблиц (соединения не рвутся), а отметка в /run нужна, чтобы и
+        загрузка правил заново (loaded, xgw-net) собрала набор таким же. Возвращает, что
+        сделано; пусто — менять нечего."""
+        vpn = self.cfg.tailscale.route == "vpn"
+        wanted = xray_down and vpn
+        if wanted == self.ts_marker.exists():
+            return ""
+        if not vpn:
+            # route сменили на "direct": отметка не нужна, набор соберёт загрузка правил.
+            self.ts_marker.unlink(missing_ok=True)
+            return ""
+        with self._lock():
+            if wanted:
+                self.ts_marker.parent.mkdir(parents=True, exist_ok=True)
+                self.ts_marker.touch()
+            else:
+                self.ts_marker.unlink(missing_ok=True)
+            rules = self.rules(self.effective_mode())
+            text = nft.ts_elements(rules) if rules.capture else ""
+            if text:
+                try:
+                    with self._own_rules():
+                        self.runner(["nft", "-f", "-"], input=text)
+                except (cmd.CommandError, OSError) as exc:
+                    # Правила сверит loaded() на этом же шаге и загрузит заново.
+                    self.log.warning("набор %s не изменён: %s", nft.TS_SET, exc)
+        if not text:
+            return ""
+        return ("Xray не отвечает — Tailscale идёт напрямую, мимо VPN" if wanted
+                else "Xray отвечает — Tailscale снова идёт через VPN")
+
     def up(self) -> str:
         """Загружает правила текущего режима (после перезагрузки, после сбоя)."""
         with self._lock():
@@ -523,6 +567,7 @@ class Capture:
                 self._routes_down(self.rules("off"))  # перехвата нет: убирается всё
                 if remove_tun:
                     tun.remove(self.cfg.capture.tun_name, self.runner)
+                self.ts_marker.unlink(missing_ok=True)
                 self._forwarding_restore()
                 self._congestion_restore()
             except (cmd.CommandError, OSError) as exc:
@@ -586,9 +631,10 @@ class Capture:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
-        listed = nft.chain_rules(self.runner)
-        if listed is None:
+        text = nft.listing(self.runner)
+        if text is None:
             return None
+        listed = nft.parse_chains(text)
         chains = set(listed)
         # Цепочка на месте, а правил в ней нет — её опустошил чужой flush table / flush
         # chain: нужная такая цепочка — всё равно что пропавшая.
@@ -596,6 +642,8 @@ class Capture:
         guard = self._v6_guard_loaded(rules)
         if guard is not True:
             return guard
+        if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
+            return False  # tailscaled запустился или остановился, набор не тот
         if rules.blocked:
             wanted: set[str] = set()
             if rules.block_local:
@@ -676,15 +724,44 @@ class Capture:
         return None
 
     def _v6_guard_loaded(self, rules: nft.Rules) -> bool | None:
-        """v6_guard в ядре ровно тогда, когда нужен; None — узнать нельзя."""
+        """v6_guard (и исключения Tailscale в `ip6 xgw6`) в ядре ровно тогда, когда нужны;
+        None — узнать нельзя."""
         if not self.ipv6_usable():
             return True  # таблицы ip6 в таком ядре нет, закрывать нечего
-        listed6 = nft.chain_rules(self.runner, "ip6", nft.TABLE6)
-        if listed6 is None:
+        text6 = nft.listing(self.runner, "ip6", nft.TABLE6)
+        if text6 is None:
             return None
+        listed6 = nft.parse_chains(text6)
+        if not self._ts_loaded(rules, text6, rules.ts6, rules.ts6):
+            return False
         if rules.v6_guard:
             return bool(listed6.get("v6_guard"))  # и пустой (flush) — не загружен
         return "v6_guard" not in listed6
+
+    @staticmethod
+    def _ts_loaded(rules: nft.Rules, text: str, wanted: bool, with_set: bool) -> bool:
+        """Исключения Tailscale в таблице есть ровно тогда, когда нужны, а метка в наборе
+        ts_direct — та, что нужна сейчас."""
+        has, direct = nft.ts_state(text)
+        if has != wanted:
+            return False
+        return direct == rules.ts_direct if with_set else direct is None
+
+    def tailscale_loaded(self) -> bool | None:
+        """Для `xgw diag`: исключения Tailscale загружены (или не нужны); None — узнать
+        нельзя."""
+        rules = self.rules(self.effective_mode())
+        text = nft.listing(self.runner)
+        if text is None:
+            return None
+        if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
+            return False
+        if not self.ipv6_usable():
+            return True
+        text6 = nft.listing(self.runner, "ip6", nft.TABLE6)
+        if text6 is None:
+            return None
+        return self._ts_loaded(rules, text6, rules.ts6, rules.ts6)
 
     def describe(self, *, check: bool = True) -> dict:
         """Сведения для `xgw status`."""

@@ -199,6 +199,8 @@ class FakeKernel:
             return self.tables[key]
         if argv[1:] == ["-c", "-f", "-"]:
             return ""
+        if argv[1:] == ["-f", "-"] and text.startswith(("add element ", "flush set ")):
+            return self._elements(text)
         if argv[1:] == ["-f", "-"]:
             # Одна транзакция может заменять несколько таблиц («table X / delete table X /
             # table X {…}» подряд); отказ любой из них — отказ всей транзакции.
@@ -220,6 +222,30 @@ class FakeKernel:
                     self.tables.pop((family, name), None)
             return ""
         raise AssertionError(f"неожиданная команда: {' '.join(argv)}")
+
+    def _elements(self, text: str) -> str:
+        """`add element СЕМЕЙСТВО ТАБЛИЦА НАБОР { X }` и `flush set СЕМЕЙСТВО ТАБЛИЦА НАБОР`
+        одной транзакцией: нет таблицы или набора — отказ всей транзакции."""
+        tables = dict(self.tables)
+        for line in text.splitlines():
+            words = line.split()
+            if not words:
+                continue
+            verb, (family, name, set_name) = " ".join(words[:2]), words[2:5]
+            body = tables.get((family, name), "")
+            head = f"    set {set_name} {{\n"
+            if head not in body:
+                raise CommandError(f"nft: Error: No such file or directory: {line}")
+            start = body.index(head) + len(head)
+            end = body.index("    }\n", start)
+            lines = [item for item in body[start:end].splitlines(keepends=True)
+                     if "elements" not in item]
+            if verb == "add element":
+                lines.append(f"        elements = {line[line.index('{'):]}\n")
+            tables[(family, name)] = body[:start] + "".join(lines) + body[end:]
+        self.loads.append(text)
+        self.tables = tables
+        return ""
 
     # --- удобства для проверок ---
 

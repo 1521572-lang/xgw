@@ -805,6 +805,39 @@ inbound требует его перезапуска). Одна правка con
 `xgw status` показывает режим перехвата и предупреждает, если он включён в
 настройках, а правила в ядро не загружены.
 
+### Tailscale
+
+Если на машине стоит и запущен Tailscale (`tailscaled`), XGW с ним уживается сам:
+Tailscale работает во всех режимах — когда VPN включён, когда трафик заблокирован
+(`blocked`), при остановленном Xray и по IPv6. XGW Tailscale не ставит, не удаляет и не
+настраивает; поставить его — по инструкции с tailscale.com, войти — `sudo tailscale up`.
+
+- Адреса tailnet (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), MagicDNS (`100.100.100.100`,
+  имена `*.ts.net`) и всё, что идёт через интерфейс `tailscale0`, — мимо Xray и
+  блокировок. SSH к шлюзу по адресу в tailnet (в том числе Tailscale SSH) не рвётся и в
+  режиме `blocked`.
+- Соединения самого Tailscale (WireGuard, ретрансляторы DERP, вход) задаёт `[tailscale]
+  route`: `"direct"` (по умолчанию) — напрямую, мимо Xray, так быстрее и работают прямые
+  соединения; провайдер видит, что на машине Tailscale, но не видит, что внутри.
+  `"vpn"` — через Xray, пока он отвечает (если провайдер Tailscale режет); когда Xray не
+  отвечает или трафик заблокирован — напрямую, чтобы удалённый доступ не пропал вместе
+  с VPN. Переключение — событие в журнале (`xgw status`, «Последние события»).
+- Исключения появляются в правилах, только пока `tailscaled` работает: запустился он
+  позже XGW — демон загружает правила заново за секунды.
+- Устройства в Wi-Fi шлюза в tailnet через шлюз не попадают (шлюз не работает как subnet
+  router Tailscale): чтобы телефон или ноутбук был в tailnet, Tailscale ставится на нём.
+
+`sudo xgw diag`, раздел «Tailscale»: служба (нужен ли вход — со ссылкой), исключения в
+правилах (FAIL, если Tailscale работает, а их нет — тогда `sudo xgw net up`), прямой UDP и
+ближайший DERP (`tailscale netcheck`) и две настройки, которые XGW исправить не может:
+
+- провайдер выдаёт адрес, шлюз или DNS из `100.64.0.0/10` (CGNAT) — фаервол Tailscale
+  отбрасывает такие пакеты, и у машины пропадает сеть провайдера. Выход:
+  `sudo tailscale set --netfilter-mode=off` (фаервол держит XGW);
+- в консоли tailnet включено «Override local DNS» — все DNS-запросы машины идут через
+  Tailscale мимо VPN. Выход: выключить его в консоли или
+  `sudo tailscale set --accept-dns=false`.
+
 ## Проверки серверов
 
 Сервер считается живым, только если через него скачивается целиком файл `probe.url` —
@@ -1294,6 +1327,7 @@ src/xgw/
               speed.py                    # замер скорости и выбор основного сервера
   ui/         index.html login.html app.css app.js icon.svg   # страница панели
   diag.py install.py uninstall.py logs.py desktop.py
+  tailscale.py                   # Tailscale рядом с XGW: признаки tailscaled, его CLI
 packaging/    xgw-net.service xgw-xray.service xgw-singbox.service xgw-dhcp.service xgw.service
               install.sh
 docs/         TEST-REPORT-2026-10-14.md TEST-REPORT-REAL-MACHINE-2026-10-14.md   # отчёты
@@ -1306,7 +1340,7 @@ tests/        fixtures/golden/ fakenet.py fakesys.py fakexray.py panel_demo.py t
 tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
               lan_client.py panel_client.py test_stand.py test_stand_lan.py
               test_stand_parts.py test_machine.py test_stand_ipv6.py test_stand_tun.py
-              test_stand_docker.py test_stand_singbox.py
+              test_stand_docker.py test_stand_singbox.py test_stand_tailscale.py
 ```
 
 ## Безопасность
@@ -1339,6 +1373,10 @@ tests/stand/  stand.py netns.py machine.py origin.py freeze_relay.py download.py
 
 ## Частые проблемы
 
+- **Tailscale на шлюзе не подключается или не разрешает имена `*.ts.net`** —
+  `sudo xgw diag`, раздел «Tailscale»: если «Tailscale: правила» — FAIL, исключения для
+  него не загружены, выполните `sudo xgw net up`. Остальные строки раздела говорят, что
+  ещё не так и что сделать.
 - **После `xgw enable` пропал интернет** — Xray не запущен или не отвечает, а
   при `fail_mode = "closed"` перехваченный трафик без него никуда не уходит.
   Посмотреть: `xgw status`; вернуть прямой интернет: `sudo xgw disable`.

@@ -1331,6 +1331,12 @@ class Daemon:
                     self.notifier.event("capture", "Xray снова отвечает — перехват возвращён")
             elif mode == "open":
                 mode = capture.close()  # fail_mode сменили на closed, а метка осталась
+            # tailscale.route = "vpn": пока Xray не отвечает, Tailscale идёт напрямую — иначе
+            # удалённый доступ к шлюзу пропал бы вместе с VPN (Т1).
+            tailscale_direct = getattr(capture, "tailscale_direct", None)
+            moved = tailscale_direct(not xray_ok) if tailscale_direct is not None else ""
+            if moved:
+                self.notifier.event("capture", moved)
             loaded = capture.loaded()
             reloaded = loaded is False
             cause = ""
