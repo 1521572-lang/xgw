@@ -2,8 +2,9 @@
 
 Возвращает систему в исходное состояние по журналу установки: службы, таблицы
 nftables и правила маршрутизации, dnsmasq, профили NetworkManager, sysctl, сон,
-правила ufw. Каждый шаг выполняется независимо от остальных: сбой одного не
-мешает вернуть остальное, а журнал при сбое остаётся — удаление можно повторить.
+правила ufw, панель по tailnet (Tailscale Serve), если её включил XGW. Каждый шаг
+выполняется независимо от остальных: сбой одного не мешает вернуть остальное, а журнал
+при сбое остаётся — удаление можно повторить.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import log, managed
+from . import tailscale as ts
 from .config import Config
 from .install import DAEMON_STOP_WAIT, UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
@@ -35,9 +37,11 @@ class Uninstaller:
         out: Callable[[str], None] = print,
         proc_sys: Path = sysctl.PROC_SYS,
         logger=None,
+        which: Callable[[str], str | None] = shutil.which,
     ) -> None:
         self.paths = paths
         self.runner = runner
+        self.which = which
         self.out = out
         self.proc_sys = proc_sys
         self.log = logger or log.get_logger("uninstall")
@@ -70,6 +74,8 @@ class Uninstaller:
             ("ярлык панели", self._launcher),
         ]
         if not keep_files:
+            # Откат неудачной переустановки панель по tailnet не снимает: она нужна дальше.
+            steps.append(("Tailscale Serve", self._tailscale))
             steps.append(("пользователь", self._user))
         for name, step in steps:
             try:
@@ -195,6 +201,26 @@ class Uninstaller:
             with contextlib.suppress(OSError):
                 path.parent.rmdir()  # только пустой: чужие ярлыки не трогаются
         return "ярлык панели удалён"
+
+    def _tailscale(self) -> str | None:
+        """Serve панели по tailnet, если его включил XGW (флаг в panel.json). Сам tailscaled,
+        вход в tailnet и Tailscale SSH XGW не ставил — они остаются как есть."""
+        path = managed.path_for(self.paths.config_file)
+        data, _error = managed.load(path)
+        if not data["tailscale"]["serve"]:
+            return None
+        if self.which("tailscale") is None:
+            return "Tailscale не установлен — снимать Serve нечего"
+        try:
+            ts.serve_off(self.runner)
+        except cmd.CommandError as exc:
+            raise RuntimeError(
+                f"Serve не снят ({exc}); снимите сами: sudo tailscale serve "
+                f"--https={ts.SERVE_PORT} off") from exc
+        with contextlib.suppress(managed.ManagedError, OSError):
+            managed.set_tailscale_serve(path, "")
+        return (f"панель по tailnet (Tailscale Serve, порт {ts.SERVE_PORT}) снята; tailscaled, "
+                "вход в tailnet и SSH не тронуты")
 
     def _user(self) -> str | None:
         if not self.journal.get("user_created"):

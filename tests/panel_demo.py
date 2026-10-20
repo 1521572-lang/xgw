@@ -1,7 +1,7 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting|reserve]
+                                                      budget|waiting|reserve|tailscale]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -9,7 +9,10 @@
 браузере они должны остаться текстом. Сцена probe — не отвечает
 сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
 waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками, reserve —
-безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1).
+безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1),
+tailscale — шлюз ещё не в tailnet (вход через 12 секунд после нажатия), провайдер выдаёт
+адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
+10 секунд. В остальных сценах Tailscale работает, в empty — не установлен.
 """
 
 from __future__ import annotations
@@ -23,8 +26,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xgw import actions, config, engine
+from fake_tailscale import FakeTailscale
+
+from xgw import actions, config, engine, tailscale
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -347,6 +353,11 @@ class DemoPanel(Panel):
                 0, f"«{pin['name']}» выбран вручную: весь трафик идёт через него, пока не "
                 "вернёте автовыбор" if pin else "автовыбор: ручной выбор сервера снят"
             )
+        if name in ("tailscale/login", "tailscale/serve"):
+            # Как человек по ту сторону ссылки: входит, разрешает HTTPS в консоли tailnet.
+            fake = self.runner
+            later = fake.complete_login if name == "tailscale/login" else fake.enable_https
+            threading.Timer(12 if name == "tailscale/login" else 10, later).start()
         return super()._act(name, body)
 
 
@@ -403,9 +414,19 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     if scene == "waiting":
         DemoCapture.inbound_missing = (
             "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0")
+    fake = FakeTailscale(backend="NeedsLogin" if scene == "tailscale" else "Running")
+    if scene == "tailscale":
+        fake.cgnat_wan = fake.override_dns = True
+        fake.https_enabled = False
+    socket = tailscale.socket_path(paths)
+    socket.parent.mkdir(parents=True, exist_ok=True)
+    socket.write_text("", encoding="ascii")
     cfg, _warnings = config.load(config_path)
     panel = DemoPanel(paths, config_path, TOKEN, port=port, root_problem=lambda: None,
-                      capture_factory=DemoCapture, runner=lambda *_args, **_kwargs: "")
+                      capture_factory=DemoCapture, runner=fake,
+                      which=lambda name: None if scene == "empty" else f"/usr/bin/{name}",
+                      spawn=fake.spawn, sys_net=root / "sys-class-net")
+    panel.ts_wait = 1.0
     panel.configure(cfg, DemoDaemon(), DemoBot())
     return panel
 
@@ -416,7 +437,7 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve"))
+                 "reserve", "tailscale"))
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)

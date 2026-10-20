@@ -240,6 +240,7 @@
     draw("devices", [s.devices, s.lan], () => renderDevices(s));
     draw("events", s.events, () => renderEvents(s));
     draw("telegram", [s.telegram, Math.floor(s.now / 20)], () => renderTelegram(s));
+    draw("tailscale", s.tailscale, () => renderTailscale(s));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
@@ -248,8 +249,10 @@
     $("refresh").hidden = !s.subscriptions.length;
     // Пока серверов нет, первое дело — добавить подписку: её блок идёт выше.
     document.body.dataset.empty = s.servers.length ? "0" : "1";
+    const tailnet = Boolean(s.tailscale && s.tailscale.serve && s.tailscale.serve.on);
     $("foot").textContent = `XGW ${s.version}` + (s.xray.version ? ` · Xray ${s.xray.version}` : "")
-      + " · панель открывается только на этой машине";
+      + (tailnet ? " · панель открывается на этой машине и с устройств tailnet"
+        : " · панель открывается только на этой машине");
   }
 
   const decimal = (value, digits = 1) => Number(value).toFixed(digits).replace(".", ",");
@@ -923,6 +926,97 @@
     $("tg-actions").hidden = !(t.managed && ["pairing", "connected", "notify"].includes(t.mode));
   }
 
+  // Tailscale: вход в tailnet, SSH, панель по tailnet и маршрут. Каждый переключатель —
+  // одна команда tailscale на шлюзе, и только по нажатию.
+  const TS_TEXT = {
+    absent: "Tailscale не установлен. XGW работает и без него; чтобы заходить на шлюз с телефона и ноутбука, установите Tailscale по инструкции tailscale.com/download/linux — карточка оживёт сама.",
+    stopped: "Tailscale установлен, но служба tailscaled не запущена: sudo systemctl enable --now tailscaled",
+    unknown: "tailscaled работает, но не ответил — проверю снова.",
+    login: "Шлюз ещё не в tailnet. Нажмите «Войти в Tailscale», откройте ссылку (или QR-код камерой телефона) и войдите в свою учётную запись Tailscale.",
+    running: "Шлюз в tailnet: к нему можно зайти с телефона и ноутбука, где включён Tailscale.",
+  };
+
+  const httpsLink = (url) => (typeof url === "string" && url.startsWith("https://") ? url : "");
+
+  function drawQr(svg, rows) {
+    const NS = "http://www.w3.org/2000/svg";
+    const size = rows.length + 8; // рамка в четыре модуля — так требует стандарт
+    svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+    let d = "";
+    rows.forEach((row, y) => {
+      for (let x = 0; x < row.length; x++) if (row[x] === "1") d += `M${x + 4} ${y + 4}h1v1h-1z`;
+    });
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", d);
+    path.setAttribute("shape-rendering", "crispEdges");
+    svg.replaceChildren(path);
+  }
+
+  function renderTailscale(s) {
+    const t = s.tailscale || { state: "absent" };
+    const running = t.state === "running";
+    $("ts-text").textContent = TS_TEXT[t.state] || `Tailscale: состояние ${t.backend || "неизвестно"}.`;
+    const chip = $("ts-chip");
+    chip.hidden = !["running", "login"].includes(t.state);
+    chip.className = running ? "tag on" : "tag warn";
+    chip.textContent = running ? "в tailnet" : "нужен вход";
+    $("ts-addr").hidden = !running || !(t.name || t.address);
+    $("ts-addr").textContent = [t.name, t.address].filter(Boolean).join(" · ");
+
+    $("ts-login").hidden = t.state !== "login";
+    const auth = httpsLink(t.auth_url);
+    $("ts-login-text").textContent = auth
+      ? "Ссылка входа готова: откройте её здесь или наведите камеру телефона на QR-код."
+      : t.login_pending ? "Жду ссылку входа от Tailscale…" : "";
+    $("ts-login-text").hidden = !$("ts-login-text").textContent;
+    $("ts-login-btn").hidden = Boolean(auth);
+    setBusy($("ts-login-btn"), Boolean(t.login_pending && !auth));
+    $("ts-auth").hidden = !auth;
+    if (auth) $("ts-auth").href = auth;
+    else $("ts-auth").removeAttribute("href");
+    // У <svg> нет свойства hidden — только атрибут.
+    const qrShown = Boolean(auth && t.auth_qr && t.auth_qr.length);
+    $("ts-qr").toggleAttribute("hidden", !qrShown);
+    if (qrShown) drawQr($("ts-qr"), t.auth_qr);
+
+    $("ts-ssh-row").hidden = !running;
+    $("ts-ssh").setAttribute("aria-checked", String(t.ssh === true));
+    $("ts-ssh").disabled = t.ssh === null || t.ssh === undefined;
+    $("ts-ssh-note").textContent = t.ssh === true
+      ? `Вход — по учётной записи tailnet: ssh ПОЛЬЗОВАТЕЛЬ@${(t.name || "шлюз").split(".")[0]}. Кто и под каким пользователем — правила в консоли tailnet.`
+      : t.ssh === false
+        ? "Порт SSH в интернет не открывается: войти можно только с устройств вашего tailnet."
+        : "Состояние SSH неизвестно: Tailscale не ответил.";
+
+    const serve = t.serve || {};
+    $("ts-serve-row").hidden = !running;
+    $("ts-serve").setAttribute("aria-checked", String(Boolean(serve.on)));
+    const url = httpsLink(serve.url);
+    let note;
+    if (!serve.on) note = "Панель откроется с устройств tailnet по https и порту 8443 — из интернета этот адрес недоступен.";
+    else if (serve.pending) note = "Осталось разрешить HTTPS в tailnet: нажмите кнопку и подтвердите в консоли Tailscale.";
+    else if (serve.live === false) note = "Tailscale сейчас не ведёт порт 8443 на панель — выключите и включите переключатель.";
+    else note = "Открывается только на устройствах с включённым Tailscale. Ссылку на телефон пришлёт бот: /panel.";
+    $("ts-serve-note").textContent = note;
+    $("ts-serve-url").hidden = !(serve.on && url && !serve.pending);
+    $("ts-serve-url").textContent = url;
+    if (url) $("ts-serve-url").href = url;
+    const enable = httpsLink(serve.enable_url);
+    $("ts-enable").hidden = !(serve.pending && enable);
+    if (enable) $("ts-enable").href = enable;
+
+    $("ts-route-row").hidden = t.state === "absent";
+    $("ts-route").value = t.route === "vpn" ? "vpn" : "direct";
+    $("ts-route-note").textContent = t.route === "vpn"
+      ? "Через VPN, пока Xray отвечает; когда не отвечает или VPN заблокирован — напрямую, чтобы шлюз остался доступен."
+      : "Напрямую, мимо VPN: так работают прямые соединения. Провайдер видит, что это Tailscale, но не содержимое.";
+
+    const cgnat = t.cgnat || [];
+    $("ts-k5").hidden = !cgnat.length || t.netfilter_off === true;
+    $("ts-k5-text").textContent = `Провайдер выдаёт адреса из 100.64.0.0/10 (${cgnat.join(", ")}): фаервол Tailscale отбрасывает их пакеты, и сеть провайдера у шлюза может пропасть.`;
+    $("ts-k6").hidden = t.override_dns !== true;
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -979,6 +1073,39 @@
   $("tg-off").addEventListener("click", () => confirmRemove(
     "Отключить бота?", "Шлюз перестанет присылать уведомления в Telegram и отвечать на команды. Токен будет забыт.",
     () => act("telegram/disconnect", {}), "Отключить"));
+
+  $("ts-login-btn").addEventListener("click", () => act("tailscale/login", {}, $("ts-login-btn")));
+  $("ts-ssh").addEventListener("click", () => {
+    const on = $("ts-ssh").getAttribute("aria-checked") !== "true";
+    if (on) act("tailscale/ssh", { on }, $("ts-ssh"));
+    else confirmRemove(
+      "Выключить SSH через Tailscale?",
+      "Открытые сеансы Tailscale SSH оборвутся, новые не откроются. OpenSSH, если он стоит на шлюзе, не затрагивается.",
+      () => act("tailscale/ssh", { on: false }, $("ts-ssh")), "Выключить");
+  });
+  $("ts-serve").addEventListener("click", () => {
+    const on = $("ts-serve").getAttribute("aria-checked") !== "true";
+    if (on) act("tailscale/serve", { on }, $("ts-serve"));
+    else confirmRemove(
+      "Выключить панель по tailnet?",
+      location.hostname.endsWith(".ts.net")
+        ? "Вы открыли панель по tailnet: эта страница перестанет открываться. На самом шлюзе панель останется."
+        : "С устройств tailnet панель перестанет открываться. На самом шлюзе она останется.",
+      () => act("tailscale/serve", { on: false }, $("ts-serve")), "Выключить");
+  });
+  $("ts-route").addEventListener("change", () => {
+    const before = state && state.tailscale ? state.tailscale.route : "direct";
+    act("tailscale/route", { route: $("ts-route").value }, $("ts-route"))
+      .then((ok) => { if (!ok) $("ts-route").value = before; });
+  });
+  $("ts-k5-fix").addEventListener("click", () => confirmRemove(
+    "Выключить фаервол Tailscale?",
+    "Tailscale перестанет ставить свои правила (ts-input и другие) — фаервол шлюза держит XGW. Это нужно, когда провайдер выдаёт адреса из 100.64.0.0/10.",
+    () => act("tailscale/fix", { name: "netfilter" }, $("ts-k5-fix")), "Выключить"));
+  $("ts-k6-fix").addEventListener("click", () => confirmRemove(
+    "Не принимать DNS из tailnet?",
+    "DNS-запросы шлюза снова пойдут через VPN. Имена MagicDNS (*.ts.net) на самом шлюзе перестанут разрешаться; на других устройствах всё останется.",
+    () => act("tailscale/fix", { name: "dns" }, $("ts-k6-fix")), "Не принимать"));
 
   $("unpin").addEventListener("click", () => act("unpin", {}, $("unpin")));
   $("refresh").addEventListener("click", () => act("refresh", {}));

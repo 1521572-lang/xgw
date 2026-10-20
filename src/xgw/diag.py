@@ -1024,18 +1024,7 @@ class Diag:
             and item["chain"].get("name") == "ts-input" for item in items
         ):
             return []  # фаервол Tailscale выключен (netfilter-mode=off) — отбрасывать некому
-        wan = lan.effective_wan(self.cfg, self.runner)
-        found: list[str] = []
-        for device, network, gateway in lan.occupied_networks(
-            self.runner, skip=(self.lan_if, ts.INTERFACE)
-        ):
-            if (not wan or device == wan) and network.overlaps(ts.CGNAT):
-                what = "шлюз" if gateway else "адрес"
-                found.append(f"{what} {network.network_address if gateway else network}")
-        if wan:
-            text = self.runner(["resolvectl", "dns", wan], timeout=10.0, check=False)
-            servers = text.partition(":")[2].split() if ":" in text else []
-            found += [f"DNS {address}" for address in ts.cgnat(servers)]
+        found = ts.provider_cgnat(self.cfg, self.runner, skip=(self.lan_if,))
         if not found:
             return [Check("Tailscale: CGNAT", OK, "адреса провайдера вне 100.64.0.0/10")]
         return [Check(
@@ -1050,8 +1039,7 @@ class Diag:
         tailscaled пересылает запросы машины сам, своей меткой — мимо VPN."""
         if self.which("resolvectl") is None:
             return []
-        text = self.runner(["resolvectl", "status", ts.INTERFACE], timeout=10.0, check=False)
-        default = ts.default_route_dns(text)
+        default = ts.override_dns(self.runner)
         if default is None:
             return []
         if default:

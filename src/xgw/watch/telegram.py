@@ -14,6 +14,8 @@
     сутки, и «/disable» трёхчасовой давности не должен сработать после перезагрузки.
   * Чат подключается из панели: пользователь вставляет токен, панель показывает
     одноразовый код, и бот запоминает чат, из которого пришло «/start КОД».
+  * /panel (только личный чат) присылает одноразовую ссылку в панель по tailnet: код
+    входа на 15 минут и один вход, адрес открывается только на устройстве с Tailscale.
 """
 
 from __future__ import annotations
@@ -29,12 +31,13 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from .. import actions, cost, engine, fetch, log, managed, masking
+from .. import tailscale as ts
 from ..config import Config
 from ..generator import profiles as profiling
 from ..net import dnsmasq
 from ..net.capture import Capture
 from ..paths import Paths
-from . import status
+from . import panel, status
 
 LONG_POLL = 25  # сколько секунд Telegram держит запрос, если сообщений нет
 REQUEST_SLACK = 10.0  # запас на сеть сверх времени опроса
@@ -59,9 +62,14 @@ HELP = """XGW — шлюз с VPN. Команды:
 /refresh — обновить подписки
 /scan — проверить запасные серверы
 /speed — замерить скорость серверов в работе
+/panel — ссылка в панель XGW по tailnet (15 минут, один вход)
 Управление работает только в личной переписке с ботом."""
 
 PRIVATE_ONLY = "Управлять шлюзом можно только из личной переписки с ботом, не из группы."
+
+
+class Unmasked(str):
+    """Ответ, который нельзя маскировать: в нём ссылка входа в панель целиком."""
 
 
 class TelegramError(Exception):
@@ -321,7 +329,8 @@ class Bot:
         raise error or TelegramError("Telegram недоступен")
 
     def _send(self, cfg: Config, chat_id: int, text: str) -> None:
-        text = masking.mask_text(text)
+        if not isinstance(text, Unmasked):
+            text = masking.mask_text(text)
         chunks = [text[i : i + MAX_TEXT] for i in range(0, len(text), MAX_TEXT)] or [""]
         for chunk in chunks:
             self._call(
@@ -438,6 +447,8 @@ class Bot:
             return self._servers(cfg)
         if name == "/devices":
             return self._devices(cfg)
+        if name == "/panel":
+            return self._panel(cfg, private)
         if name not in CONTROL:
             return "Не знаю такой команды. Список: /help"
         if not private:
@@ -447,6 +458,29 @@ class Bot:
             return f"Не получилось: {problem}"
         self._event(f"Telegram: команда {name}" + (f" {argument}" if argument else ""))
         return self._control(cfg, name, argument)
+
+    def _panel(self, cfg: Config, private: bool) -> str:
+        """Одноразовая ссылка в панель по tailnet: код входа (panel.new_login) на LINK_TTL
+        и один вход. В группе ссылку увидели бы все её участники — только личный чат."""
+        if not private:
+            return PRIVATE_ONLY
+        name = cfg.managed.tailscale_serve
+        if not cfg.panel.enabled or not name:
+            return ("Панель по tailnet выключена. Включите её в панели XGW: карточка "
+                    "«Tailscale» → «Панель по tailnet».")
+        try:
+            code = panel.new_login(self.paths, ttl=panel.LINK_TTL)
+        except OSError as exc:
+            return f"Не получилось выдать код входа: {exc}"
+        self._event("Telegram: выдана ссылка в панель по tailnet")
+        minutes = int(panel.LINK_TTL // 60)
+        return Unmasked(
+            f"Панель XGW по tailnet — ссылка на {minutes} минут и один вход:\n"
+            f"{panel.tailnet_address(name)}?login={code}\n\n"
+            "Откроется только на устройстве, где включён Tailscale "
+            f"(порт {ts.SERVE_PORT}, сертификат выдаёт Tailscale). Пока Tailscale на "
+            "телефоне включён, другой VPN на нём не работает."
+        )
 
     def _snapshot(self, cfg: Config) -> dict | None:
         return status.read_status(self.paths, max(3.0 * cfg.watchdog.interval_s, 180.0))

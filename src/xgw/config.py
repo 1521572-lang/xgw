@@ -307,6 +307,11 @@ class Managed:
     core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
+    # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
+    # пусто — не включала. Только тогда панель принимает Host «имя:8443».
+    tailscale_serve: str = ""
+    # Маршрут Tailscale выбран в панели (tailscale.route); None — как в config.toml.
+    tailscale_route: str | None = None
 
 
 @dataclass
@@ -416,6 +421,9 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.core = dict(data["core"])
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
+    cfg.managed.tailscale_serve = data["tailscale"]["serve"]
+    if data["tailscale"]["route"] is not None:
+        cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
     bot = data["telegram"]
     if bot["token"]:

@@ -89,6 +89,59 @@
         <button id="tg-off" class="btn ghost" type="button">Отключить бота</button>
       </div>
     </section>
+
+    <section class="card ts-card" id="ts-card" aria-labelledby="ts-title">
+      <div class="card-head">
+        <h2 id="ts-title">Tailscale</h2>
+        <span id="ts-chip" class="tag" hidden></span>
+      </div>
+      <p id="ts-text" class="muted small"></p>
+      <p id="ts-addr" class="ts-addr small" hidden></p>
+      <div id="ts-login" class="pair" hidden>
+        <p id="ts-login-text" class="small"></p>
+        <div class="add-actions ts-start">
+          <button id="ts-login-btn" class="btn primary" type="button">Войти в Tailscale</button>
+          <a id="ts-auth" class="btn primary" target="_blank" rel="noopener noreferrer" hidden>Открыть ссылку входа</a>
+        </div>
+        <svg id="ts-qr" class="qr" role="img" aria-label="QR-код ссылки входа" hidden></svg>
+      </div>
+      <div id="ts-ssh-row" class="ts-row" hidden>
+        <button id="ts-ssh" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-ssh-title" aria-describedby="ts-ssh-note"></button>
+        <div class="main-text">
+          <span id="ts-ssh-title" class="main-title">SSH через Tailscale</span>
+          <span id="ts-ssh-note" class="muted small"></span>
+        </div>
+      </div>
+      <div id="ts-serve-row" class="ts-row" hidden>
+        <button id="ts-serve" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-serve-title" aria-describedby="ts-serve-note"></button>
+        <div class="main-text">
+          <span id="ts-serve-title" class="main-title">Панель по tailnet</span>
+          <span id="ts-serve-note" class="muted small"></span>
+          <a id="ts-serve-url" class="ts-link small" target="_blank" rel="noopener noreferrer" hidden></a>
+          <a id="ts-enable" class="btn ghost ts-enable" target="_blank" rel="noopener noreferrer" hidden>Разрешить HTTPS в tailnet</a>
+        </div>
+      </div>
+      <div id="ts-route-row" class="ts-row" hidden>
+        <div class="main-text">
+          <label id="ts-route-title" class="main-title" for="ts-route">Маршрут Tailscale</label>
+          <span id="ts-route-note" class="muted small"></span>
+        </div>
+        <select id="ts-route" class="prio" aria-describedby="ts-route-note">
+          <option value="direct">Напрямую</option>
+          <option value="vpn">Через VPN</option>
+        </select>
+      </div>
+      <div id="ts-k5" class="note ts-note" role="status" hidden>
+        <span id="ts-k5-text"></span>
+        <button id="ts-k5-fix" class="btn small-btn" type="button">Выключить фаервол Tailscale</button>
+      </div>
+      <div id="ts-k6" class="note ts-note" role="status" hidden>
+        <span>В консоли tailnet включено «Override local DNS»: DNS-запросы шлюза идут через Tailscale мимо VPN.</span>
+        <button id="ts-k6-fix" class="btn small-btn" type="button">Не принимать DNS из tailnet</button>
+      </div>
+    </section>
   </div>
 
   <div class="col main">

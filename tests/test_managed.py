@@ -33,7 +33,8 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {}}, "")
+         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {},
+         "tailscale": {"serve": "", "route": None}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -92,6 +93,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
         "sticky": None,  # переключатель основного сервера в панели не трогали
         "core": {},  # ядро за серверами не закрепляли
+        "tailscale": {"serve": "", "route": None},  # панель по tailnet не включали
     }
 
 

@@ -1,4 +1,5 @@
-"""Подписки, ссылки, устройства и бот Telegram, добавленные из панели: /etc/xgw/panel.json.
+"""Подписки, ссылки, устройства, бот Telegram и Tailscale, добавленные из панели:
+/etc/xgw/panel.json.
 
 config.toml пишет человек — с комментариями и в своём порядке; программа его не
 переписывает. То, что добавлено кнопкой в панели, лежит отдельным файлом рядом
@@ -40,6 +41,10 @@ _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 _BOT_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")  # «123456789:AA…», как выдаёт @BotFather
 _CHAT_ID_RE = re.compile(r"-?\d{1,20}")
+# Имя шлюза в tailnet (Self.DNSName без точки): «gw.tail1234.ts.net».
+_TS_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_TS_NAME_RE = re.compile(rf"(?=.{{1,253}}$){_TS_LABEL}(\.{_TS_LABEL})+")
+TS_ROUTES = ("direct", "vpn")
 
 
 class ManagedError(Exception):
@@ -88,6 +93,7 @@ def load(path: Path) -> tuple[dict, str]:
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
         "telegram": {"token": "", "chat_id": ""}, "priority": {}, "sticky": None, "core": {},
+        "tailscale": {"serve": "", "route": None},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -133,7 +139,22 @@ def load(path: Path) -> tuple[dict, str]:
         "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
         "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
+        "tailscale": _tailscale(raw.get("tailscale")),
     }, ""
+
+
+def _tailscale(value: object) -> dict:
+    """Tailscale из панели: serve — имя шлюза в tailnet, для которого XGW включил Serve
+    (панель по tailnet; пусто — не включал); route — маршрут tailscaled, None — как в
+    config.toml."""
+    serve, route = "", None
+    if isinstance(value, dict):
+        name, way = value.get("serve"), value.get("route")
+        if isinstance(name, str) and _TS_NAME_RE.fullmatch(name):
+            serve = name
+        if way in TS_ROUTES:
+            route = way
+    return {"serve": serve, "route": route}
 
 
 def _priority(value: object) -> dict[str, str]:
@@ -350,6 +371,36 @@ def set_sticky(path: Path, value: bool) -> bool:
         if data["sticky"] is value:
             return False
         data["sticky"] = value
+        return True
+
+    return _update(path, change)
+
+
+def set_tailscale_serve(path: Path, name: str) -> bool:
+    """Запоминает, что XGW включил Serve для этого имени в tailnet; пусто — выключил.
+    True — что-то изменилось."""
+    name = name.strip().lower().rstrip(".")
+    if name and not _TS_NAME_RE.fullmatch(name):
+        raise ManagedError("неверное имя шлюза в tailnet")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["serve"] == name:
+            return False
+        data["tailscale"] = {**data["tailscale"], "serve": name}
+        return True
+
+    return _update(path, change)
+
+
+def set_tailscale_route(path: Path, route: str) -> bool:
+    """Маршрут tailscaled: direct или vpn (как tailscale.route в config.toml)."""
+    if route not in TS_ROUTES:
+        raise ManagedError("маршрут Tailscale: direct или vpn")
+
+    def change(data: dict) -> bool:
+        if data["tailscale"]["route"] == route:
+            return False
+        data["tailscale"] = {**data["tailscale"], "route": route}
         return True
 
     return _update(path, change)

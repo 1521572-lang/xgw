@@ -10,10 +10,15 @@ Tailscale на шлюзе изображён так, как его видит я
 Сам tailscaled — процесс-заглушка: сокет с меткой 0x80000 (SO_MARK) к адресу в «интернете».
 Как отличить путь трафика — как в test_stand_lan.py: origin на /trace отдаёт адрес, с
 которого пришёл запрос: 5.5.5.1 — через VPN-сервер, 5.5.5.2 — напрямую с WAN шлюза.
+
+Т2 (раздел 3.4): панель по tailnet — настоящий демон с CLI-заглушкой fake_tailscale_cli.py
+принимает Host «gw.example.ts.net:8443», только пока Serve включён кнопкой панели; песочница
+xgw.service (systemd-run) подключается к сокету tailscaled.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -210,3 +215,140 @@ def test_route_vpn_follows_xray(tmp_path):
         assert stand.exit_ip("gw") == VIA_VPN
     finally:
         stand.stop()
+
+
+# --- Т2: панель по tailnet и доступ к tailscaled из службы ---------------------------
+
+TAILNET_HOST = "gw.example.ts.net:8443"
+
+
+def _panel(stand: Stand, *args: str) -> dict:
+    result = stand.run_in("gw", sys.executable, str(HERE / "panel_client.py"), "8781", *args)
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_panel_answers_the_tailnet_host_only_while_serve_is_on(tmp_path, monkeypatch):
+    """Т2 (3.4): настоящий демон и панель; Host «gw.example.ts.net:8443» (так приходит
+    Tailscale Serve) принимается, только пока Serve включён кнопкой панели. Вместо
+    tailscaled — CLI-заглушка fake_tailscale_cli.py и пустой файл сокета."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "tailscale"
+    cli.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "{HERE / "fake_tailscale_cli.py"}" "$@"\n',
+        encoding="utf-8")
+    cli.chmod(0o755)
+    fake = tmp_path / "tailscale.json"
+    fake.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("XGW_FAKE_TAILSCALE", str(fake))
+    stand = Stand(tmp_path / "stand", Path(XRAY_BIN), mode="netns")
+    try:
+        stand.start()
+        stand.up(panel=True)
+        socket = stand.root / "run/tailscale/tailscaled.sock"
+        socket.parent.mkdir(parents=True, exist_ok=True)
+        socket.touch()
+        stand.start_daemon()
+        assert wait_for(lambda: _panel(stand, "raw", "/").get("status") == 200, 60), (
+            stand.tail("daemon", 30))
+        token = (stand.root / "var/lib/xgw/panel-token").read_text(encoding="ascii").strip()
+        assert _panel(stand, "host", TAILNET_HOST, token)["status"] == 403
+        card = _panel(stand, "state", token)["tailscale"]
+        assert card["state"] == "running" and card["name"] == "gw.example.ts.net"
+
+        result = _panel(stand, "act", token, "tailscale/serve", json.dumps({"on": True}))
+        assert result.get("ok"), result
+        assert json.loads(fake.read_text(encoding="utf-8"))["serve"] == "http://127.0.0.1:8781"
+        assert _panel(stand, "host", TAILNET_HOST, token)["status"] == 200
+        for host in ("other.example.ts.net:8443", "gw.example.ts.net"):
+            assert _panel(stand, "host", host, token)["status"] == 403
+
+        result = _panel(stand, "act", token, "tailscale/serve", json.dumps({"on": False}))
+        assert result.get("ok"), result
+        assert json.loads(fake.read_text(encoding="utf-8"))["serve"] == ""
+        assert _panel(stand, "host", TAILNET_HOST, token)["status"] == 403
+    finally:
+        stand.stop()
+
+
+def _service_sandbox() -> list[str]:
+    """Свойства песочницы из packaging/xgw.service — для systemd-run. Каталоги из
+    ReadWritePaths — с «-»: на стенде /etc/xgw и /var/lib/xgw может не быть."""
+    unit = (HERE.parents[1] / "packaging/xgw.service").read_text(encoding="utf-8")
+    section = unit.split("[Service]", 1)[1].split("\n[", 1)[0]
+    options: list[str] = []
+    for line in section.splitlines():
+        key, _, value = line.strip().partition("=")
+        if key in ("ProtectSystem", "PrivateTmp", "NoNewPrivileges", "CapabilityBoundingSet"):
+            options += ["-p", f"{key}={value}"]
+        elif key == "ReadWritePaths":
+            options += ["-p", "ReadWritePaths=" + " ".join(f"-{item}" for item in value.split())]
+    assert any(item == "ProtectSystem=strict" for item in options)
+    return options
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-run") is None or not Path("/run/systemd/system").is_dir(),
+    reason="нужен systemd (systemd-run)",
+)
+def test_service_sandbox_reaches_the_tailscaled_socket():
+    """3.3: демон XGW обращается к tailscaled через CLI, то есть подключается к сокету
+    /run/tailscale/tailscaled.sock. Под ProtectSystem=strict /run только для чтения — а
+    подключиться к сокету можно и так, ReadWritePaths=/run/tailscale не нужен. Если
+    tailscaled на машине есть, проверка идёт с его настоящим сокетом."""
+    import socket as sockets
+    import threading
+
+    directory, path = Path("/run/tailscale"), Path("/run/tailscale/tailscaled.sock")
+    made_dir, server = False, None
+    if not path.exists():
+        made_dir = not directory.exists()
+        directory.mkdir(mode=0o755, exist_ok=True)
+        server = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(4)
+
+        def answer() -> None:
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                with conn:
+                    conn.recv(4096)
+                    conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+        threading.Thread(target=answer, daemon=True).start()
+    # Проба — строкой (-c): у службы свой /tmp (PrivateTmp), файла из tmp_path она не видит.
+    probe = (
+        "import socket\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "s.settimeout(10)\n"
+        f"s.connect({str(path)!r})\n"
+        "s.sendall(b'GET /localapi/v0/status HTTP/1.0\\r\\nHost: local-tailscaled.sock"
+        "\\r\\n\\r\\n')\n"
+        "print(s.recv(64)[:12].decode('ascii', 'replace'))\n"
+        "try:\n"
+        "    open('/run/tailscale/xgw-write-probe', 'w')\n"
+        "    print('WRITABLE')\n"
+        "except OSError as exc:\n"
+        "    print('READONLY', exc.errno)\n"
+    )
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--wait", "--pipe", "--quiet", "--collect", *_service_sandbox(),
+             sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        lines = result.stdout.split()
+        assert lines[0].startswith("HTTP/"), result.stdout
+        assert "READONLY" in lines and "WRITABLE" not in lines  # /run — только чтение
+    finally:
+        if server is not None:
+            server.close()
+            path.unlink(missing_ok=True)
+            Path("/run/tailscale/xgw-write-probe").unlink(missing_ok=True)
+            if made_dir:
+                directory.rmdir()

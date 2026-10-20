@@ -4,6 +4,8 @@
   panel_client.py <порт> raw <путь>                     — запрос без входа
   panel_client.py <порт> state <токен>                  — состояние панели
   panel_client.py <порт> act <токен> <действие> <JSON>  — нажатие кнопки
+  panel_client.py <порт> host <Host> <токен>            — состояние с другим Host (так
+                                                          приходит Tailscale Serve)
 
 Печатает одну строку JSON; при сбое в ней есть поле "error".
 """
@@ -15,9 +17,12 @@ import json
 import sys
 
 
-def request(port: int, method: str, path: str, *, cookie: str = "", body: bytes | None = None):
+def request(
+    port: int, method: str, path: str, *, cookie: str = "", body: bytes | None = None,
+    host: str = "",
+):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
-    headers = {"Host": f"127.0.0.1:{port}"}
+    headers = {"Host": host or f"127.0.0.1:{port}"}
     if cookie:
         headers["Cookie"] = cookie
     if body is not None:
@@ -50,6 +55,11 @@ def main() -> None:
             cookie = login(int(port), rest[0])
             response, text = request(int(port), "GET", "/api/state", cookie=cookie)
             result = json.loads(text) if response.status == 200 else {"error": text}
+        elif command == "host":
+            host, token = rest
+            response, text = request(
+                int(port), "GET", "/api/state", cookie=login(int(port), token), host=host)
+            result = {"status": response.status, "body": text[:300]}
         elif command == "act":
             token, name, body = rest
             response, text = request(
