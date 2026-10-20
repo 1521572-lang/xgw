@@ -262,7 +262,8 @@ def _request_with_redirects(
     current = url
     for _ in range(5):
         result = _request_once(current, headers, timeout, mark, bootstrap, proxy, data, cancel)
-        # Тело за перенаправлением не отправляется: POST у XGW один — в Telegram.
+        # Тело за перенаправлением не отправляется: запрос с телом не повторяется по чужому
+        # адресу.
         if data is None and result.status in (301, 302, 303, 307, 308):
             location = result.headers.get("location", "")
             if not location:

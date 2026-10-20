@@ -72,8 +72,9 @@
 Шаг 1.1. **Спроси заказчика** (дословно):
 
 «Ставлю на шлюз всё, что нужно будущему приложению XGW на телефоне. По пунктам:
-(1) Установка: демон XGW перезапустится сам, интернет не пропадает, панель и бот секунд на
-десять недоступны.
+(1) Установка: демон XGW перезапустится сам, интернет не пропадает, панель секунд на десять
+недоступна. Бота Telegram в новой версии нет совсем — шлюзом управляют панель и (скоро)
+приложение; бот перестанет отвечать, его можно удалить у @BotFather.
 (2) Включу „Приложение на телефоне (Funnel)“ (вы так решили): у шлюза появится публичный
 адрес https://…ts.net/. Войти туда может только привязанный телефон; без привязки адрес
 отвечает лишь „XGW“. Если в вашем tailnet Funnel ещё не разрешён, понадобится один раз
@@ -586,12 +587,15 @@ cd ~/zcod/xgw && date '+%F %T' | tee "$HOME/xgw-a1-test/install-time.txt" && sud
 Шаг 2.3. Установленный код:
 
 ```bash
-sleep 20; sudo xgw --version; systemctl is-active xgw xgw-xray xgw-net xgw-dhcp xgw-singbox tailscaled; sudo python3 "$HOME/xgw-a1-test/a1check.py" pre | tee "$HOME/xgw-a1-test/after/pre.txt"; sudo python3 "$HOME/xgw-a1-test/a1check.py" card | tee "$HOME/xgw-a1-test/after/card.txt"
+sleep 20; sudo xgw --version; systemctl is-active xgw xgw-xray xgw-net xgw-dhcp xgw-singbox tailscaled; sudo python3 "$HOME/xgw-a1-test/a1check.py" pre | tee "$HOME/xgw-a1-test/after/pre.txt"; sudo python3 "$HOME/xgw-a1-test/a1check.py" card | tee "$HOME/xgw-a1-test/after/card.txt"; sudo python3 -c "import json; print('бот Telegram в panel.json:', 'ЕСТЬ' if 'telegram' in json.load(open('/etc/xgw/panel.json')) else 'нет')" | tee -a "$HOME/xgw-a1-test/after/pre.txt"; sudo xgw status 2>&1 | grep -c 'Telegram в XGW больше нет' | sed 's/^/предупреждений о строках Telegram в config.toml: /' | tee -a "$HOME/xgw-a1-test/after/pre.txt"
 ```
 
 Ожидается:
 
 - `xgw 0.1.17`; службы — как в шаге 1.3;
+- «бот Telegram в panel.json: нет» — новый демон при запуске стёр токен бота (Telegram в XGW
+  больше нет); число предупреждений о строках Telegram — 0, если в `[notify]` config.toml их
+  не было, иначе — сколько строк (записать; ничего не править);
 - «А1 в установленном коде: есть»; «BackendState: Running»;
 - «Serve 8443 (панель по tailnet): ведёт на XGW; открыт в интернет: нет»;
 - «Funnel 443 (приложение): нет»;

@@ -66,7 +66,6 @@ MAX_DRAIN = 1 << 20  # сколько лишнего дочитать, преж�
 SELECT_TTL = 3.0  # как долго помнить ответ ядра о выбранном сервере
 EVENTS = 30
 LOGIN_TTL = 60.0  # сколько живёт одноразовый код входа, секунд
-LINK_TTL = 900.0  # код в ссылке бота (/panel): человеку нужно время дойти до устройства
 TS_TTL = 10.0  # как долго помнить, что ответил CLI tailscale (страница опрашивает часто)
 TS_WAIT = 10.0  # сколько действие карточки ждёт ссылку входа или итог Serve
 PIN_TTLS = ("10m", "1h", "6h", "24h")
@@ -125,56 +124,39 @@ def _login_digest(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
-def _login_ttl(path: Path) -> float:
-    """Срок кода: записан в файле (LINK_TTL у ссылки бота); пусто — LOGIN_TTL."""
-    try:
-        ttl = float(path.read_text(encoding="ascii").strip() or LOGIN_TTL)
-    except (OSError, ValueError):
-        return LOGIN_TTL
-    return min(max(ttl, 0.0), LINK_TTL)
-
-
-def new_login(
-    paths: Paths, now: Callable[[], float] | None = None, *, ttl: float = LOGIN_TTL
-) -> str:
+def new_login(paths: Paths, now: Callable[[], float] | None = None) -> str:
     """Одноразовый код входа для ссылки, которую открывает сам XGW (установка, ярлык
-    «XGW» → «Войти заново») или присылает бот (/panel, ttl = LINK_TTL). Постоянный токен в
-    адрес не попадает: адрес виден в списке процессов, журнале и переписке, а код годится
-    один раз и только ttl секунд. На диске — не код, а его SHA-256 (и срок), в каталоге,
-    который читает только root."""
+    «XGW» → «Войти заново»). Постоянный токен в адрес не попадает: адрес виден в списке
+    процессов и журнале, а код годится один раз и только LOGIN_TTL секунд. На диске —
+    не код, а его SHA-256, в каталоге, который читает только root."""
     now = now or time.time
     directory = login_dir(paths)
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
     for stale in directory.iterdir():
         with contextlib.suppress(OSError):  # другой процесс мог убрать его сам
-            if now() - stale.stat().st_mtime > _login_ttl(stale):
+            if now() - stale.stat().st_mtime > LOGIN_TTL:
                 stale.unlink()
     code = secrets.token_urlsafe(24)
     fd = os.open(directory / _login_digest(code), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        if ttl != LOGIN_TTL:
-            os.write(fd, f"{min(ttl, LINK_TTL):g}\n".encode("ascii"))
-    finally:
-        os.close(fd)
+    os.close(fd)
     return code
 
 
 def use_login(paths: Paths, code: str, now: Callable[[], float] | None = None) -> bool:
-    """Код входа годен: есть, не старше своего срока. Проверенный код гасится сразу."""
+    """Код входа годен: есть, не старше LOGIN_TTL. Проверенный код гасится сразу."""
     if not code or len(code) > 64:
         return False
     now = now or time.time
     path = login_dir(paths) / _login_digest(code)
     try:
         age = now() - path.stat().st_mtime
-        ttl = _login_ttl(path)
         path.unlink()
     except OSError:  # кода нет: уже использован, устарел и убран либо выдуман
         return False
     # Часы файловой системы грубее, чем time.time(): только что выданный код не должен
     # оказаться «из будущего».
-    return -1.0 <= age <= ttl
+    return -1.0 <= age <= LOGIN_TTL
 
 
 def login_address(cfg: Config, code: str) -> str:
@@ -248,7 +230,6 @@ class Panel:
         self.ts_wait = TS_WAIT
         self.cfg = Config()
         self.daemon = None
-        self.bot = None
         self._lock = threading.Lock()  # одно действие за раз
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
@@ -270,11 +251,10 @@ class Panel:
         panel.configure(cfg)
         return panel
 
-    def configure(self, cfg: Config, daemon=None, bot=None) -> None:
-        """Новые настройки, новый демон и бот Telegram после перечитывания конфига."""
+    def configure(self, cfg: Config, daemon=None) -> None:
+        """Новые настройки и новый демон после перечитывания конфига."""
         self.cfg = cfg
         self.daemon = daemon
-        self.bot = bot
 
     # --- запуск ------------------------------------------------------------------
 
@@ -619,7 +599,6 @@ class Panel:
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
             "devices": devices,
-            "telegram": self.bot.info() if self.bot is not None else {"mode": "unavailable"},
             "events": events,
             "budget": snapshot.get("budget") or {},
             # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
@@ -1197,38 +1176,6 @@ class Panel:
         self._wake()
         return actions.Outcome(0, done, notes)
 
-    def _telegram(self, step: str, body: dict, store_path: Path) -> actions.Outcome:
-        """Подключение бота: токен → код → «/start КОД» в Telegram; отключение."""
-        bot, cfg = self.bot, self.cfg
-        if bot is None:
-            return actions.Outcome(1, "бот Telegram ещё не запущен — повторите через минуту")
-        if cfg.notify.telegram_bot_token and not cfg.managed.telegram:
-            return actions.Outcome(
-                2, "Бот задан в config.toml: менять его можно только там "
-                   "(notify.telegram_bot_token)",
-            )
-        if step == "connect":
-            token = managed.check_bot_token(body.get("token"))
-            managed.set_telegram(store_path, token)  # прежний чат при смене бота не нужен
-            self._wake()
-            bot.configure(self.cfg, self.daemon, bot.mark)
-            bot.new_code(token)
-            self._event("бот Telegram: токен сохранён, жду подключения чата")
-            return actions.Outcome(0, "Токен сохранён. Откройте бота в Telegram и отправьте код")
-        if step == "code":
-            if not cfg.managed.telegram or cfg.notify.telegram_chat_id:
-                return actions.Outcome(2, "чат уже подключён — сначала отключите бота")
-            bot.new_code(cfg.notify.telegram_bot_token)
-            return actions.Outcome(0, "Новый код готов")
-        if step == "disconnect":
-            managed.set_telegram(store_path, "")
-            bot.forget()
-            self._wake()
-            bot.configure(self.cfg, self.daemon, bot.mark)
-            self._event("бот Telegram отключён")
-            return actions.Outcome(0, "Бот отключён")
-        return actions.Outcome(2, "нет такого действия")
-
     def _config_names(self) -> set[str]:
         """Имена подписок, вписанных в config.toml: панель их не трогает."""
         mine = set(self.cfg.managed.subscriptions)
@@ -1282,8 +1229,6 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
-        if name.startswith("telegram/"):
-            return self._telegram(name.removeprefix("telegram/"), body, store_path)
         if name.startswith("tailscale/"):
             return self._tailscale(name.removeprefix("tailscale/"), body, store_path)
         if name.startswith("phones/"):

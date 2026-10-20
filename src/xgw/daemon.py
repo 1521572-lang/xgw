@@ -101,7 +101,7 @@ COSTLIER_AFTER = 120.0
 # RESERVE_ROUND_WAIT.
 RESERVE_ROUND_WAIT = 600.0
 RESERVE_RETRY = 1800.0  # пока трафик несёт резервный, подписка опрашивается внеочередно не чаще
-# Уведомления (рабочий стол, Telegram) — только когда от человека нужно действие или
+# Уведомления (рабочий стол) — только когда от человека нужно действие или
 # трафик идёт не так, как он ждёт. Остальное шлюз чинит сам: замены серверов, смена
 # уровня, «часть серверов недоступна», «снова отвечает» — это события в журнале (панель,
 # `xgw status`, /status бота), без уведомления.
@@ -288,7 +288,7 @@ class Daemon:
         self.singbox = engine.make_singbox(cfg, paths)
         self.mark = engine.bypass_mark(cfg, self.log)
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
-        # sinks — куда доставлять уведомления (рабочий стол, Telegram); их собирает
+        # sinks — куда доставлять уведомления (рабочий стол); их собирает
         # `xgw run`, в тестах и на стенде получателей нет.
         self.notifier = Notifier(
             paths.db_file, cfg.notify.min_interval_min, sinks=sinks, logger=self.log

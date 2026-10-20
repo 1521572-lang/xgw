@@ -630,9 +630,7 @@ def _stamp(config_path: Path) -> tuple[float, float]:
     return _mtime(config_path), _mtime(managed.path_for(config_path))
 
 
-def _sync_panel(
-    panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger, bot=None
-):
+def _sync_panel(panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
     """Панель живёт дольше одного демона: перечитывание настроек её не перезапускает."""
     from .watch.panel import Panel
 
@@ -651,22 +649,8 @@ def _sync_panel(
             logger.error("панель управления не запущена (порт %d): %s", cfg.panel.port, exc)
             return None
     if panel is not None:
-        panel.configure(cfg, daemon, bot)
+        panel.configure(cfg, daemon)
     return panel
-
-
-def _sync_bot(bot, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
-    """Бот Telegram, как и панель, живёт дольше одного демона. Он создаётся всегда, но
-    пока токена нет, молчит: токен можно вставить в панели уже после запуска."""
-    from .watch.telegram import Bot
-
-    if bot is None:
-        bot = Bot(paths, config_path, logger=logger,
-                  capture_factory=lambda *args, **kwargs: capture_for(*args, **kwargs))
-        bot.root_problem = lambda bot=bot: _root_problem(bot.cfg)
-        bot.start()
-    bot.configure(cfg, daemon, engine.bypass_mark(cfg, logger))
-    return bot
 
 
 def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
@@ -684,10 +668,12 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
         with contextlib.suppress(ValueError, AttributeError):  # не главный поток / нет сигнала
             signal.signal(getattr(signal, name), lambda *_args: stop.set())
 
+    with contextlib.suppress(managed.ManagedError, OSError):
+        if managed.drop_telegram(managed.path_for(args.config_path)):
+            logger.info("бот Telegram убран из panel.json: Telegram в XGW больше нет")
     reloaded = False
     previous = None
     panel = None
-    bot = None
     events = None
     current: list = [None]  # демон, которого будят события (после перечитывания — новый)
     try:
@@ -729,8 +715,7 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
                     tun_name=cfg.capture.tun_name, logger=log.get_logger("events"),
                 )
                 events.start()
-            bot = _sync_bot(bot, cfg, paths, args.config_path, daemon, logger)
-            panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger, bot)
+            panel = _sync_panel(panel, cfg, paths, args.config_path, daemon, logger)
             page = None
             try:
                 page = StatusPage.from_config(cfg, paths)
@@ -763,8 +748,6 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             events.stop()
         if panel is not None:
             panel.stop()
-        if bot is not None:
-            bot.stop()
 
 
 # --- install / uninstall / diag / update-xray / logs ----------------------------

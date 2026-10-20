@@ -24,7 +24,9 @@ _LINK_RE = re.compile(
     r"://[^\s\"'<>]+",
     re.IGNORECASE,
 )
-# Токен Telegram-бота: <id>:<35 символов> — короче порога _LONG_TOKEN_RE.
+# Токен Telegram-бота: <id>:<35 символов> — короче порога _LONG_TOKEN_RE. Telegram в XGW
+# больше нет, но прежние версии держали токен в config.toml: в журнал и экспорт он попасть
+# не должен.
 _BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}")
 
 # Поля outbound, значения которых — секреты (UUID маскируются регуляркой отдельно).

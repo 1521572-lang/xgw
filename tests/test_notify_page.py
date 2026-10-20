@@ -1,9 +1,8 @@
-"""Уведомления (рабочий стол, Telegram) и страница статуса для домашней сети."""
+"""Уведомления на рабочий стол и страница статуса для домашней сети."""
 
 import http.client
 import json
 import time
-from urllib.parse import parse_qs
 
 import pytest
 from fakesys import FakeSystem
@@ -13,9 +12,6 @@ from xgw.net.cmd import CommandError
 from xgw.paths import Paths
 from xgw.watch import notify, status_page
 from xgw.watch.notify import Notifier
-
-BOT_TOKEN = "123456789:AAFakeFakeFakeFakeFakeFakeFakeFakeFake"
-
 
 # --- рабочий стол -----------------------------------------------------------------
 
@@ -80,63 +76,11 @@ def test_desktop_sink_is_silent_when_nobody_is_logged_in(desktop):
     assert not system.commands("runuser")
 
 
-# --- Telegram ---------------------------------------------------------------------
-
-
-def _telegram_cfg() -> config.Config:
-    cfg = config.Config()
-    cfg.notify.telegram_bot_token = BOT_TOKEN
-    cfg.notify.telegram_chat_id = "-100200300"
-    return cfg
-
-
-def test_telegram_goes_through_xray_and_falls_back_to_a_direct_marked_request(monkeypatch):
-    cfg = _telegram_cfg()
-    calls: list[dict] = []
-
-    def post(url, **kwargs):
-        calls.append({"url": url, **kwargs})
-        if "proxy" in kwargs:
-            raise fetch.FetchError("не удалось получить api.telegram.org: прокси не отвечает")
-        return fetch.FetchResult(200, {}, b'{"ok":true}', url)
-
-    monkeypatch.setattr(notify.engine, "healthy_http_in", lambda cfg: ("127.0.0.1", 10809))
-    notify.telegram_sink(cfg, mark=2, post=post)("ALL_DEAD", "нет живых участников")
-    assert [("proxy" in call) for call in calls] == [True, False]
-    assert calls[0]["proxy"] == ("127.0.0.1", 10809)
-    assert calls[1]["mark"] == 2 and calls[1]["bootstrap"] == cfg.dns.bootstrap
-    assert calls[0]["url"] == f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    body = parse_qs(calls[0]["data"].decode("ascii"))
-    assert body["chat_id"] == ["-100200300"]
-    assert body["text"] == ["XGW: все серверы недоступны\nнет живых участников"]
-
-
-def test_telegram_failure_is_reported_without_the_token(monkeypatch, tmp_path):
-    cfg = _telegram_cfg()
-    monkeypatch.setattr(notify.engine, "healthy_http_in", lambda cfg: None)
-
-    def post(url, **kwargs):
-        return fetch.FetchResult(401, {}, b"{}", url)
-
-    sink = notify.telegram_sink(cfg, mark=None, post=post)
-    with pytest.raises(RuntimeError, match="HTTP 401") as error:
-        sink("LEAK", "текст")
-    assert BOT_TOKEN not in str(error.value)
-
-    # Notifier ошибку получателя не пробрасывает: событие записано, демон жив.
-    notifier = Notifier(tmp_path / "state.db", 10, sinks=[sink])
-    assert notifier.event("LEAK", "выход в RU", notify=True) is True
-
-
 def test_sinks_follow_the_config():
     cfg = config.Config()
     assert len(notify.build_sinks(cfg, mark=None)) == 1  # рабочий стол включён по умолчанию
     cfg.notify.desktop = False
     assert notify.build_sinks(cfg, mark=None) == []
-    cfg.notify.telegram_bot_token = BOT_TOKEN
-    assert notify.build_sinks(cfg, mark=None) == []  # без chat_id отправлять некуда
-    cfg.notify.telegram_chat_id = "1"
-    assert len(notify.build_sinks(cfg, mark=None)) == 1
 
 
 def test_broken_sink_does_not_break_the_others(tmp_path):

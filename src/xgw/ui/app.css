@@ -141,7 +141,8 @@ button, textarea, input { font: inherit; color: inherit; }
   .subs-card { order: 3; }
   .devices-card { order: 4; }
   .events-card { order: 5; }
-  .tg-card { order: 6; }
+  .ts-card { order: 6; }
+  .phones-card { order: 7; }
   body[data-empty="1"] .subs-card { order: 2; }
   body[data-empty="1"] .servers-card { order: 3; }
 }
@@ -325,9 +326,8 @@ button, textarea, input { font: inherit; color: inherit; }
 .add input { min-height: 2.6rem; }
 .add textarea::placeholder, .add input::placeholder { color: var(--muted); font-family: system-ui, sans-serif; }
 
-/* --- подключение бота Telegram ---------------------------------------------- */
+/* --- QR-код и код для ввода (вход в Tailscale, привязка телефона) ---------------- */
 
-.tg-card .muted + .add, .tg-card .why + .add { margin-top: .8rem; }
 .pair { margin-top: .8rem; }
 .pair-code {
   display: block;

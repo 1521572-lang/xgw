@@ -1,6 +1,6 @@
 """Удалённый доступ к шлюзу через Tailscale (Т2 `TAILSCALE_MINIAPP_PLAN.md`, раздел 3.4):
 разбор вывода CLI, команды карточки «Tailscale» (подставной CLI, fake_tailscale), Host панели
-по tailnet только при Serve, включённом из панели, ссылка /panel бота, `xgw uninstall`.
+по tailnet только при Serve, включённом из панели, `xgw uninstall`.
 """
 
 import json
@@ -10,8 +10,6 @@ from pathlib import Path
 import pytest
 from fake_tailscale import AUTH_URL, ENABLE_URL, FakeTailscale
 from test_panel import TOKEN, Rig
-from test_telegram import GROUP
-from test_telegram import Rig as BotRig
 
 from xgw import config, managed, qr, tailscale
 from xgw.config import Config
@@ -19,7 +17,6 @@ from xgw.net.cmd import CommandError
 from xgw.paths import Paths
 from xgw.uninstall import Uninstaller
 from xgw.watch import panel as panel_module
-from xgw.watch.telegram import PRIVATE_ONLY
 
 NAME = "gw.tailnet-1.ts.net"
 HOST = f"{NAME}:8443"
@@ -321,62 +318,6 @@ def test_card_needs_root_and_a_running_tailscaled(ts_rig):
     ts_rig.panel.which = lambda name: None
     assert _ts_act(ts_rig, "login")["text"] == "Tailscale не установлен"
     assert ts_rig.fake.ssh is False and ts_rig.fake.serve == ""
-
-
-# --- код входа на 15 минут ----------------------------------------------------------
-
-
-def test_link_code_lives_fifteen_minutes_and_once(tmp_path):
-    paths = Paths(root=tmp_path)
-    paths.ensure()
-    now = 1_800_000_000.0
-    code = panel_module.new_login(paths, ttl=panel_module.LINK_TTL)
-    stored = next(panel_module.login_dir(paths).iterdir())
-    assert code not in stored.read_text(encoding="ascii")  # на диске — только срок
-    stamp = stored.stat().st_mtime
-    assert panel_module.use_login(paths, code, now=lambda: stamp + 14 * 60)
-    assert not panel_module.use_login(paths, code, now=lambda: stamp + 14 * 60)  # один вход
-    late = panel_module.new_login(paths, ttl=panel_module.LINK_TTL)
-    assert not panel_module.use_login(paths, late, now=lambda: now + 10**6)
-    short = panel_module.new_login(paths)  # обычный код — по-прежнему минута
-    stamp = next(panel_module.login_dir(paths).iterdir()).stat().st_mtime
-    assert not panel_module.use_login(paths, short, now=lambda: stamp + 120)
-
-
-# --- бот: /panel ------------------------------------------------------------------
-
-
-@pytest.fixture()
-def bot_rig(tmp_path, monkeypatch):
-    rig = BotRig(tmp_path, monkeypatch)
-    yield rig
-    rig.fake.stop()
-
-
-def test_panel_command_sends_a_one_time_tailnet_link(bot_rig):
-    off = bot_rig.ask("/panel")
-    assert "Панель по tailnet выключена" in off and "«Tailscale»" in off
-    managed.set_tailscale_serve(managed.path_for(bot_rig.config_path), NAME)
-    bot_rig.reload()
-    text = bot_rig.ask("/panel")
-    prefix = f"https://{NAME}:8443/?login="
-    assert prefix in text and "15 минут" in text and "один вход" in text
-    code = text.split(prefix)[1].split()[0]
-    assert panel_module.use_login(bot_rig.paths, code)  # ссылка целиком, не замаскирована
-    assert not panel_module.use_login(bot_rig.paths, code)
-    assert "/panel" in bot_rig.ask("/help")
-
-
-def test_panel_command_only_in_a_private_chat(tmp_path, monkeypatch):
-    rig = BotRig(tmp_path, monkeypatch, chat=str(GROUP))
-    try:
-        managed.set_tailscale_serve(managed.path_for(rig.config_path), NAME)
-        rig.reload()
-        assert rig.ask("/panel", chat=GROUP, kind="supergroup") == PRIVATE_ONLY
-        assert not panel_module.login_dir(rig.paths).exists() or not any(
-            panel_module.login_dir(rig.paths).iterdir())
-    finally:
-        rig.fake.stop()
 
 
 # --- panel.json и xgw uninstall ------------------------------------------------------

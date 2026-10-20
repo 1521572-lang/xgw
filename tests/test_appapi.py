@@ -218,7 +218,7 @@ def test_paired_phone_reads_the_state_without_secrets(api):
     assert state["power"]["can_off"] is True and state["spares"] == 1
     text = json.dumps(state, ensure_ascii=False)
     assert "S3CR3T" not in text and "sub.example.net" not in text and "trojan://" not in text
-    assert "subscriptions" not in state and "links" not in state and "telegram" not in state
+    assert "subscriptions" not in state and "links" not in state and "events" not in state
     events = [row["detail"] for row in api.panel.state()["events"]]
     assert "телефон «Galaxy S25 Ultra» привязан" in events
 
@@ -227,7 +227,7 @@ def test_actions_are_a_white_list(api):
     phone = _pair(api)
     status, result = phone.signed("POST", "/api/act", {"name": "scan"})
     assert status == 200 and result["ok"] and api.daemon.asked == ["scan"]
-    for name in ("add", "subscription/remove", "telegram/disconnect", "tailscale/ssh",
+    for name in ("add", "subscription/remove", "tailscale/route", "tailscale/ssh",
                  "phones/revoke", "servers", "core"):
         status, result = phone.signed("POST", "/api/act", {"name": name, "text": "x"})
         assert status == 403, name

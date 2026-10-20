@@ -658,7 +658,7 @@ def test_journal_levels_of_the_daemon(box, tmp_path):
 
 def test_journal_warnings_saved_as_info_are_reported(box, tmp_path):
     bad = [("6", "2026-10-17 15:49:02,000 WARNING xgw.notify: pin: не отвечает"),
-           ("6", "2026-10-17 15:49:03,000 ERROR xgw.telegram: не доставлено")]
+           ("6", "2026-10-17 15:49:03,000 ERROR xgw.notify: не доставлено")]
     check = _journal_box(box, tmp_path, bad)._journal()[0]
     assert check.level == WARN and check.text.startswith("2 предупреждений и ошибок демона")
     assert "JOURNAL_STREAM=" in check.text and "stderr демона" in check.text

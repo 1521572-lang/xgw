@@ -45,8 +45,8 @@ def test_log_export_contains_no_secrets(tmp_path):
     paths.ensure()
     cfg = config.Config()
     cfg.subscriptions = [config.Subscription(url=SUB_URL, headers={"x-hwid": "hw-1d-77"})]
-    cfg.notify.telegram_bot_token = BOT_TOKEN
     cfg.status.token = "page-token-12345"
+    # Токен бота Telegram — строка из config.toml прежних версий: в экспорт он не попадает.
     config_text = (
         f'[[subscriptions]]\nurl = "{SUB_URL}"\nheaders = {{ "x-hwid" = "hw-1d-77" }}\n'
         f'[manual]\nlinks = ["{links.FULL_LINKS[0]}"]\n'
@@ -548,9 +548,8 @@ def test_apply_on_installed_gateway_syncs_rules_and_dhcp(root, tmp_path, monkeyp
 def test_engine_config_secrets_cover_tokens_and_headers():
     cfg = config.Config()
     cfg.subscriptions = [config.Subscription(url=SUB_URL, headers={"x-hwid": "hw-1d-77"})]
-    cfg.notify.telegram_bot_token = BOT_TOKEN
     cfg.status.token = "page-token"
-    assert set(engine.config_secrets(cfg)) == {BOT_TOKEN, "page-token", "hw-1d-77"}
+    assert set(engine.config_secrets(cfg)) == {"page-token", "hw-1d-77"}
 
 
 def test_archive_members_are_private(tmp_path):

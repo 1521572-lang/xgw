@@ -152,7 +152,7 @@ def load_inventory(paths: Paths) -> list[dict]:
 
 def config_secrets(cfg: config.Config) -> list[str]:
     """Секреты из config.toml, которые регулярками не распознать."""
-    values = [cfg.notify.telegram_bot_token, cfg.status.token]
+    values = [cfg.status.token]
     for sub in cfg.subscriptions:
         values.extend(sub.headers.values())
     return [value for value in values if value]
