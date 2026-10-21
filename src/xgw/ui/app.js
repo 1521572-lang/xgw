@@ -49,7 +49,11 @@
   const ICONS = {
     remove: ["M6 6l12 12", "M18 6L6 18"],
     edit: ["M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7", "M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"],
+    record: ["M12 6a6 6 0 1 0 0 12a6 6 0 1 0 0-12z"],
+    stop: ["M7 7h10v10H7z"],
+    download: ["M12 3v12", "M7 10l5 5 5-5", "M5 21h14"],
   };
+  const RECORD_SECONDS = 300; // запись трафика устройства — 5 минут, остановить можно раньше
 
   let state = null;
   let acting = false;
@@ -237,7 +241,12 @@
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
-    draw("devices", [s.devices, s.lan], () => renderDevices(s));
+    // Идущая запись трафика: строки перерисовываются, только когда она началась или кончилась,
+    // а время и размер меняются в метке — иначе кнопка «Остановить» уплывала бы из-под мыши.
+    const recording = (s.records || {}).active;
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : ""], () => renderDevices(s));
+    const recTag = $("devices").querySelector(".tag.rec");
+    if (recTag && recording) recTag.textContent = recordText(recording, s.now);
     draw("events", s.events, () => renderEvents(s));
     draw("tailscale", s.tailscale, () => renderTailscale(s));
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
@@ -863,15 +872,60 @@
     $("devices-card").hidden = !s.lan.interface;
     $("devices-count").textContent = s.devices.length ? String(s.devices.length) : "";
     $("devices-note").textContent = s.lan.gateway ? `сеть ${s.lan.interface}, шлюз ${s.lan.gateway}` : "";
-    fill($("devices"), s.devices.map(deviceRow),
+    const records = s.records || { files: [] };
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
+    $("records-block").hidden = !records.files.length;
+    fill($("records"), records.files.map(recordRow));
+  }
+
+  const megabytes = (bytes) => (bytes >= 1048576
+    ? `${(bytes / 1048576).toFixed(1).replace(".", ",")} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`);
+  const minsec = (seconds) => `${Math.floor(seconds / 60)}:${two(Math.floor(seconds % 60))}`;
+  const recordText = (active, now) =>
+    `запись ${minsec(Math.max(0, now - active.started))} · ${megabytes(active.bytes)}`;
+
+  // Запись трафика устройства (record.py): файл .pcap для Wireshark.
+  function recordTool(device, active, now) {
+    const name = device.name || device.mac;
+    if (active && active.mac === device.mac) {
+      return iconButton("stop", `Остановить запись трафика «${name}»`, () => act("record/stop", {}));
+    }
+    const button = iconButton("record", `Записать трафик «${name}»`, () => confirmRemove(
+      `Записать трафик «${name}»?`,
+      `Шлюз ${RECORD_SECONDS / 60} минут пишет все пакеты этого устройства в сети дома в файл для Wireshark (не больше 100 МБ). В файле видно, куда и сколько устройство отправляет; содержимое сайтов обычно зашифровано (HTTPS). Файл хранится на шлюзе — последние три записи; остановить можно раньше.`,
+      () => act("record/start", { mac: device.mac, seconds: RECORD_SECONDS }), "Записать"));
+    button.classList.add("rec-btn");
+    if (active) {
+      button.disabled = true;
+      button.title = `Идёт запись трафика «${active.label}»`;
+    }
+    return button;
+  }
+
+  function recordRow(file) {
+    const when = new Date(file.ended * 1000);
+    const link = el("a", { class: "icon-btn", href: `/records/${encodeURIComponent(file.name)}`,
+      download: `xgw-${file.name}`, title: "Скачать запись (.pcap)", "aria-label": "Скачать запись" });
+    link.append(icon("download"));
+    return el("li", {},
+      el("div", { class: "row-main" },
+        el("div", { class: "row-title" }, el("span", { text: file.label || file.mac })),
+        el("div", { class: "row-sub", text: `${when.toLocaleString("ru-RU")} · ${megabytes(file.bytes)} · пакетов ${file.packets}${file.why ? ` · ${file.why}` : ""}` })),
+      el("div", { class: "row-tools" }, link,
+        iconButton("remove", "Удалить запись", () => confirmRemove(
+          "Удалить запись трафика?", `${file.label || file.mac}, ${when.toLocaleString("ru-RU")}`,
+          () => act("record/remove", { name: file.name })))));
   }
 
   // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
-  function deviceRow(device) {
+  function deviceRow(device, active, now) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
+    if (active && active.mac === device.mac) {
+      title.append(el("span", { class: "tag rec", text: recordText(active, now) }));
+    }
     const name = device.name || device.mac;
     const locked = device.bypass && !device.managed;
     let control = null;
@@ -898,7 +952,7 @@
         text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN") : "через VPN",
         title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
       }),
-      control ? el("div", { class: "row-tools" }, control) : null);
+      el("div", { class: "row-tools" }, recordTool(device, active, now), control));
   }
 
   // Tailscale: вход в tailnet, SSH, панель по tailnet и маршрут. Каждый переключатель —

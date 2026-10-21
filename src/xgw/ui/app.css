@@ -423,6 +423,11 @@ a.btn.primary { color: var(--accent-ink); }
 
 .tag.on { border-color: transparent; background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }
 .tag.warn { border-color: transparent; background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.tag.rec { border-color: transparent; background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+.sub-title { margin: 1rem 0 .2rem; font-size: .95rem; }
+a.icon-btn { text-decoration: none; }
+.rec-btn svg { fill: var(--bad); stroke: none; transform: scale(.75); }
+.icon-btn:disabled { cursor: not-allowed; opacity: .35; }
 
 .dot { flex: none; width: .6rem; height: .6rem; border-radius: 50%; background: var(--muted); }
 .dot.ok { background: var(--accent); box-shadow: 0 0 0 .2rem color-mix(in srgb, var(--accent) 18%, transparent); }

@@ -473,8 +473,27 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
                       which=lambda name: None if scene == "empty" else f"/usr/bin/{name}",
                       spawn=fake.spawn, sys_net=root / "sys-class-net", app_port=0)
     panel.ts_wait = 1.0
+    panel.recorder.opener = DemoSniffer  # «Записать трафик»: кадры выдумывает демо
     panel.configure(cfg, DemoDaemon())
     return panel
+
+
+class DemoSniffer:
+    """Сокет записи трафика без root: кадр устройства раз в 0,05 с (watch/record.py)."""
+
+    def __init__(self, _interface: str, mac: str) -> None:
+        self.frame = bytes.fromhex(mac.replace(":", "")) + bytes(6) + b"\x08\x00" + bytes(200)
+
+    def settimeout(self, _value) -> None:
+        pass
+
+    def recv_into(self, buffer, size, _flags) -> int:
+        time.sleep(0.05)
+        buffer[:len(self.frame)] = self.frame
+        return len(self.frame)
+
+    def close(self) -> None:
+        pass
 
 
 def phone_gateway(spec: str) -> dict:

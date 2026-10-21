@@ -169,6 +169,11 @@ class Paths:
         return self.var / "panel-token"
 
     @property
+    def records_dir(self) -> Path:
+        """Записи трафика устройств (watch/record.py), 0700."""
+        return self.var / "records"
+
+    @property
     def desktop_file(self) -> Path:
         """Ярлык панели в меню приложений (каталог локально установленных программ)."""
         return self.root / "usr" / "local" / "share" / "applications" / "xgw-panel.desktop"

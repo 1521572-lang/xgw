@@ -58,6 +58,7 @@ from ..phones import Phones
 from ..store import SubscriptionCache
 from . import status
 from .appapi import AppApi
+from .record import MAX_SECONDS, Recorder, RecordError
 
 COOKIE = "xgw_panel"
 HEADER = "X-XGW-Panel"
@@ -240,6 +241,8 @@ class Panel:
         self.phones = Phones(paths)
         self.app_port = app_port  # None — API приложения не запускается (тесты панели)
         self.app_api: AppApi | None = None
+        # Запись трафика устройства: кнопка в строке устройства (record.py).
+        self.recorder = Recorder(paths.records_dir, on_done=self._event)
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -297,6 +300,7 @@ class Panel:
                 self.app_api = api
 
     def stop(self) -> None:
+        self.recorder.stop()
         if self.app_api is not None:
             self.app_api.stop()
             self.app_api = None
@@ -607,6 +611,7 @@ class Panel:
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
             "devices": devices,
+            "records": self.recorder.state(),
             "events": events,
             "budget": snapshot.get("budget") or {},
             # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
@@ -1099,6 +1104,40 @@ class Panel:
             "уровнем ниже шлюз пользуется, только когда живых выше нет",
         ))
 
+    def _record(self, what: str, body: dict) -> actions.Outcome:
+        """Запись трафика устройства: start {mac, seconds}, stop, remove {name}."""
+        if what == "stop":
+            if self.recorder.stop():
+                return actions.Outcome(0, "Запись остановлена — файл сохраняется")
+            return actions.Outcome(0, "Записи сейчас нет")
+        if what == "remove":
+            if self.recorder.remove(str(body.get("name") or "")):
+                return actions.Outcome(0, "Запись удалена")
+            return actions.Outcome(2, "такой записи нет — обновите страницу")
+        if what != "start":
+            return actions.Outcome(2, f"неизвестное действие записи: {what}")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        mac, seconds = managed.normalize_mac(body.get("mac")), body.get("seconds", 120)
+        if mac is None or not isinstance(seconds, int) or isinstance(seconds, bool):
+            return actions.Outcome(2, "ожидается устройство и длительность в секундах")
+        interface = lan.lan_interface(self.cfg)
+        if not interface:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        label = (found or {}).get("name") or mac
+        try:
+            self.recorder.start(interface, mac, label, seconds)
+        except RecordError as exc:
+            return actions.Outcome(1, str(exc))
+        minutes = f"{seconds // 60} мин" if seconds % 60 == 0 else f"{seconds} с"
+        self._event(f"запись трафика «{label}» начата ({minutes})")
+        return actions.Outcome(
+            0, f"Записываю трафик «{label}» — {minutes}",
+            [f"Не дольше {MAX_SECONDS // 60} минут; готовый файл — в карточке «Устройства»"],
+        )
+
     def _set_device(self, body: dict, store_path: Path) -> actions.Outcome:
         """Пустить устройство мимо VPN (bypass: true) или вернуть в VPN (false).
 
@@ -1239,6 +1278,8 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
+        if name.startswith("record/"):
+            return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):
             return self._tailscale(name.removeprefix("tailscale/"), body, store_path)
         if name.startswith("phones/"):
@@ -1443,6 +1484,10 @@ class Panel:
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
             self._json(handler, HTTPStatus.OK, self.state(), body)
+        elif url.path.startswith("/records/"):
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._record_file(handler, url.path.removeprefix("/records/"), body)
         else:
             raise Refused(HTTPStatus.NOT_FOUND, "Нет такой страницы")
 
@@ -1508,6 +1553,23 @@ class Panel:
         except OSError as exc:
             raise Refused(HTTPStatus.INTERNAL_SERVER_ERROR, f"нет файла панели {name}") from exc
         self._send(handler, code, content_type, data, body)
+
+    def _record_file(self, handler, name: str, body: bool) -> None:
+        """Файл записи трафика — скачать (Wireshark открывает .pcap)."""
+        path = self.recorder.path(name)
+        if path is None:
+            raise Refused(HTTPStatus.NOT_FOUND, "Нет такой записи")
+        data = path.read_bytes()
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+        handler.send_header("Content-Disposition", f'attachment; filename="xgw-{name}"')
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("Content-Security-Policy", _CSP)
+        handler.end_headers()
+        if body:
+            handler.wfile.write(data)
 
     def _text(self, handler, code: HTTPStatus, text: str, body: bool) -> None:
         self._send(handler, code, "text/plain; charset=utf-8", text.encode("utf-8"), body)
