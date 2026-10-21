@@ -460,6 +460,11 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         DemoCapture.inbound_missing = (
             "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0")
     fake = FakeTailscale(backend="NeedsLogin" if scene == "tailscale" else "Running")
+    fake.peers = [  # «Устройства tailnet» в карточке (выходной узел)
+        {"HostName": "galaxy-s25-ultra", "TailscaleIPs": ["100.101.2.3"], "OS": "android",
+         "Online": True},
+        {"HostName": "laptop", "TailscaleIPs": ["100.101.2.9"], "OS": "windows", "Online": False},
+    ]
     if scene == "tailscale":
         fake.cgnat_wan = fake.override_dns = True
         fake.https_enabled = False

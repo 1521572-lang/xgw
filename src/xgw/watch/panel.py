@@ -672,6 +672,11 @@ class Panel:
             card = self._tailscale_read()
             self._ts_card = (time.monotonic(), card)
         card = dict(card)
+        # «Напрямую» — из panel.json, а не из ответа CLI в памяти и не из конфига демона:
+        # переключатель в строке меняется сразу, а не через шаг демона или TS_TTL.
+        direct = {item["ip"] for item in managed.load(
+            managed.path_for(self.config_path))[0]["tailscale"]["direct"]}
+        card["peers"] = [{**peer, "direct": peer["ip"] in direct} for peer in card["peers"]]
         login = self._ts_job("login")
         card["login_pending"] = login is not None and login.code() is None
         if card["state"] == "login" and not card["auth_url"] and card["login_pending"]:
@@ -720,10 +725,9 @@ class Panel:
         card["address"] = next((item for item in state.addresses if ":" not in item), "")
         if state.backend != "Running" and state.auth_url.startswith("https://"):
             card["auth_url"] = state.auth_url
-        direct = set(cfg.managed.tailscale_direct)
         card["peers"] = [
             {"name": peer.name, "ip": peer.address, "os": peer.os, "online": peer.online,
-             "direct": peer.address in direct}
+             "direct": False}  # отмечается в _tailscale_card
             for peer in state.peers
         ]
         card["exit"]["approved"] = state.exit_approved
