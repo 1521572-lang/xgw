@@ -22,6 +22,7 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
 
@@ -726,6 +727,10 @@ def build(
             }
         )
     rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
+    # Адреса Tailscale Funnel (*.ts.net) — напрямую: через VPN-сервер Funnel не открывается
+    # (испытания А1 и А3), а телефон в домашнем Wi-Fi ходит к API приложения на самом шлюзе
+    # именно по публичному адресу Funnel (ASSUMPTIONS п. 229).
+    rules.append({"type": "field", "domain": [TS_NET], "outboundTag": "direct"})
     if cfg.routing.direct_domains:
         rules.append(
             {

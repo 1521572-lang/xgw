@@ -188,10 +188,11 @@ class Capture:
     def rules(self, mode: str | None = None) -> nft.Rules:
         """Параметры правил для режима (по умолчанию — текущего)."""
         mode = mode or self.mode()
+        tailnet = ts.present(self.paths, self.sys_net)
         rules, warnings = nft.build_rules(
             self.cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=self.time_uids,
-            tailscale=self.cfg.capture.local and ts.present(self.paths, self.sys_net),
-            xray_down=self.ts_marker.exists(),
+            tailscale=self.cfg.capture.local and tailnet,
+            xray_down=self.ts_marker.exists(), tailnet=tailnet,
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -230,11 +231,17 @@ class Capture:
 
     def _throws(self, rules: nft.Rules, family: int) -> tuple[str, ...]:
         """Подсети, для которых в таблице TPROXY нужен маршрут throw: подсеть LAN, пока её
-        трафик перехватывается (iprule.py: проверка источника с учётом метки)."""
-        gateway = lan.gateway(self.cfg)
-        if family != 4 or not (rules.capture_lan and rules.lan_if) or gateway is None:
+        трафик перехватывается, и tailnet, пока шлюз — выходной узел (iprule.py: проверка
+        источника с учётом метки; tailscaled сам ставит src_valid_mark = 1)."""
+        if family != 4:
             return ()
-        return (str(gateway.network),)
+        throws: list[str] = []
+        gateway = lan.gateway(self.cfg)
+        if rules.capture_lan and rules.lan_if and gateway is not None:
+            throws.append(str(gateway.network))
+        if rules.ts_exit:
+            throws.append(str(ts.CGNAT))
+        return tuple(throws)
 
     @staticmethod
     def _wanted(rules: nft.Rules, family: int) -> tuple[bool, bool]:
@@ -662,6 +669,11 @@ class Capture:
             return guard
         if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
             return False  # tailscaled запустился или остановился, набор не тот
+        if nft.ts_exit_state(text) != rules.ts_forward:
+            return False  # выходной узел: tailscaled запустился или остановился
+        if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
+                rules.ts_exit_direct):
+            return False  # устройство tailnet пустили напрямую или вернули в Xray
         if rules.blocked:
             wanted: set[str] = set()
             if rules.block_local:

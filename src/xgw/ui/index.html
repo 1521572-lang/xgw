@@ -104,6 +104,19 @@
           <a id="ts-funnel-enable" class="btn ghost ts-enable" target="_blank" rel="noopener noreferrer" hidden>Разрешить Funnel в tailnet</a>
         </div>
       </div>
+      <div id="ts-exit-row" class="ts-row" hidden>
+        <button id="ts-exit" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-exit-title" aria-describedby="ts-exit-note"></button>
+        <div class="main-text">
+          <span id="ts-exit-title" class="main-title">Выход в интернет через шлюз</span>
+          <span id="ts-exit-note" class="muted small"></span>
+        </div>
+      </div>
+      <div id="ts-peers-block" hidden>
+        <h3 class="sub-title">Устройства tailnet</h3>
+        <p class="muted small">Если устройство выбрало шлюз выходным узлом, его интернет идёт через Xray; «напрямую» — мимо VPN.</p>
+        <ul id="ts-peers" class="list"></ul>
+      </div>
       <div id="ts-route-row" class="ts-row" hidden>
         <div class="main-text">
           <label id="ts-route-title" class="main-title" for="ts-route">Маршрут Tailscale</label>

@@ -1046,6 +1046,19 @@
     $("ts-funnel-enable").hidden = !(funnel.pending && funnelEnable);
     if (funnelEnable) $("ts-funnel-enable").href = funnelEnable;
 
+    const exit = t.exit || {};
+    $("ts-exit-row").hidden = !running;
+    $("ts-exit").setAttribute("aria-checked", String(exit.advertised === true));
+    $("ts-exit").disabled = exit.advertised === null || exit.advertised === undefined;
+    $("ts-exit-note").textContent = exit.advertised !== true
+      ? "Телефон и ноутбук с Tailscale смогут выходить в интернет через шлюз и его VPN — без второго VPN на телефоне: Android держит один VPN, и это будет Tailscale."
+      : exit.approved === false
+        ? "Осталось одобрить один раз в консоли Tailscale: Machines → шлюз → Edit route settings → Use as exit node."
+        : "На устройстве: Tailscale → Exit node → шлюз. Его интернет пойдёт через Xray шлюза; IPv6 через шлюз закрыт, чтобы не уйти мимо VPN.";
+    const peers = t.peers || [];
+    $("ts-peers-block").hidden = !running || !peers.length;
+    fill($("ts-peers"), peers.map(peerRow));
+
     $("ts-route-row").hidden = t.state === "absent";
     $("ts-route").value = t.route === "vpn" ? "vpn" : "direct";
     $("ts-route-note").textContent = t.route === "vpn"
@@ -1056,6 +1069,30 @@
     $("ts-k5").hidden = !cgnat.length || t.netfilter_off === true;
     $("ts-k5-text").textContent = `Провайдер выдаёт адреса из 100.64.0.0/10 (${cgnat.join(", ")}): фаервол Tailscale отбрасывает их пакеты, и сеть провайдера у шлюза может пропасть.`;
     $("ts-k6").hidden = t.override_dns !== true;
+  }
+
+  // Устройство tailnet: через шлюз — через Xray или напрямую (выходной узел).
+  function peerRow(peer) {
+    const title = el("div", { class: "row-title" }, el("span", { text: peer.name || peer.ip }));
+    if (!peer.online) title.append(el("span", { class: "tag", text: "не в сети" }));
+    const vpn = !peer.direct;
+    const control = el("button", {
+      class: "switch", type: "button", role: "switch", "aria-checked": String(vpn),
+      "aria-label": `Через VPN для устройства tailnet ${peer.name || peer.ip}`,
+      title: vpn ? "Выпускать это устройство напрямую, мимо VPN" : "Вернуть это устройство в VPN",
+      onclick: () => {
+        const body = { ip: peer.ip, name: peer.name, direct: vpn };
+        if (!vpn) return act("tailscale/direct", body);
+        confirmRemove(`Выпускать «${peer.name || peer.ip}» напрямую?`,
+          "Когда это устройство выходит в интернет через шлюз, его трафик пойдёт мимо Xray, без защиты VPN.",
+          () => act("tailscale/direct", body), "Напрямую");
+      },
+    });
+    return el("li", {},
+      el("div", { class: "row-main" }, title,
+        el("div", { class: "row-sub mono", text: [peer.ip, peer.os].filter(Boolean).join(" · ") })),
+      el("span", { class: peer.direct ? "tag warn" : "tag on", text: peer.direct ? "напрямую" : "через VPN" }),
+      el("div", { class: "row-tools" }, control));
   }
 
   // Телефоны с приложением XGW: «Привязать телефон» → QR-код → камера приложения.
@@ -1147,6 +1184,14 @@
   });
 
   $("ts-login-btn").addEventListener("click", () => act("tailscale/login", {}, $("ts-login-btn")));
+  $("ts-exit").addEventListener("click", () => {
+    const on = $("ts-exit").getAttribute("aria-checked") !== "true";
+    if (on) act("tailscale/exit", { on }, $("ts-exit"));
+    else confirmRemove(
+      "Шлюз больше не выходной узел?",
+      "Устройства tailnet, что выходят в интернет через шлюз, останутся без интернета, пока на них не выберут другой выходной узел или не выключат его.",
+      () => act("tailscale/exit", { on: false }, $("ts-exit")), "Выключить");
+  });
   $("ts-ssh").addEventListener("click", () => {
     const on = $("ts-ssh").getAttribute("aria-checked") !== "true";
     if (on) act("tailscale/ssh", { on }, $("ts-ssh"));

@@ -318,6 +318,9 @@ class Managed:
     tailscale_route: str | None = None
     # Имя шлюза, для которого панель включила Funnel (API приложения, А1); пусто — нет.
     tailscale_funnel: str = ""
+    # Устройства tailnet (адреса 100.x), что выходят в интернет через шлюз напрямую, мимо
+    # Xray (выходной узел, ASSUMPTIONS п. 230); остальные — через Xray.
+    tailscale_direct: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -429,6 +432,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
+    cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
     if data["tailscale"]["route"] is not None:
         cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))

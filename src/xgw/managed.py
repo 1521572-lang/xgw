@@ -42,6 +42,7 @@ _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 _TS_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
 _TS_NAME_RE = re.compile(rf"(?=.{{1,253}}$){_TS_LABEL}(\.{_TS_LABEL})+")
 TS_ROUTES = ("direct", "vpn")
+_TAILNET = ipaddress.IPv4Network("100.64.0.0/10")
 
 
 class ManagedError(Exception):
@@ -90,7 +91,7 @@ def load(path: Path) -> tuple[dict, str]:
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
         "priority": {}, "sticky": None, "core": {},
-        "tailscale": {"serve": "", "route": None, "funnel": ""},
+        "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -142,8 +143,10 @@ def load(path: Path) -> tuple[dict, str]:
 def _tailscale(value: object) -> dict:
     """Tailscale из панели: serve — имя шлюза в tailnet, для которого XGW включил Serve
     (панель по tailnet; пусто — не включал); route — маршрут tailscaled, None — как в
-    config.toml; funnel — имя, для которого XGW включил Funnel (API приложения)."""
+    config.toml; funnel — имя, для которого XGW включил Funnel (API приложения); direct —
+    устройства tailnet, что выходят в интернет через шлюз напрямую, мимо Xray ({ip, name})."""
     serve, route, funnel = "", None, ""
+    direct = _tailnet_devices(value.get("direct") if isinstance(value, dict) else None)
     if isinstance(value, dict):
         name, way, public = value.get("serve"), value.get("route"), value.get("funnel")
         if isinstance(name, str) and _TS_NAME_RE.fullmatch(name):
@@ -152,7 +155,56 @@ def _tailscale(value: object) -> dict:
             route = way
         if isinstance(public, str) and _TS_NAME_RE.fullmatch(public):
             funnel = public
-    return {"serve": serve, "route": route, "funnel": funnel}
+    return {"serve": serve, "route": route, "funnel": funnel, "direct": direct}
+
+
+def tailnet_address(text: object) -> str | None:
+    """Адрес IPv4 устройства tailnet (100.64.0.0/10) или None."""
+    try:
+        address = ipaddress.IPv4Address(str(text).strip())
+    except ValueError:
+        return None
+    return str(address) if address in _TAILNET else None
+
+
+def _tailnet_devices(value: object) -> list[dict]:
+    result: list[dict] = []
+    for item in value if isinstance(value, list) else ():
+        if not isinstance(item, dict):
+            continue
+        address = tailnet_address(item.get("ip"))
+        name = item.get("name")
+        if address and all(known["ip"] != address for known in result):
+            result.append({"ip": address, "name": name[:63] if isinstance(name, str) else ""})
+    return result[:MAX_DEVICES]
+
+
+def set_tailscale_direct(path: Path, ip: str, name: str, *, direct: bool) -> bool:
+    """Устройство tailnet выходит через шлюз напрямую (direct) или снова через Xray."""
+    address = tailnet_address(ip)
+    if address is None:
+        raise ManagedError("ожидается адрес устройства tailnet 100.64.0.0/10")
+
+    def change(data: dict) -> bool:
+        listed = [item for item in data["tailscale"]["direct"] if item["ip"] != address]
+        if direct:
+            listed.append({"ip": address, "name": name[:63]})
+        if listed == data["tailscale"]["direct"]:
+            return False
+        data["tailscale"] = {**data["tailscale"], "direct": listed}
+        return True
+
+    return _update(path, change)
+
+
+def replace_tailscale_direct(path: Path, devices: list[dict]) -> None:
+    """Вернуть прежний список (сеть не приняла изменение)."""
+
+    def change(data: dict) -> bool:
+        data["tailscale"] = {**data["tailscale"], "direct": _tailnet_devices(devices)}
+        return True
+
+    _update(path, change)
 
 
 def _priority(value: object) -> dict[str, str]:

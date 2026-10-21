@@ -138,8 +138,14 @@ def test_phone_limit_and_rename(book):
 
 def test_phone_config_is_the_gateway_set_for_a_tun_inbound():
     config_ = phoning.build(GOLDEN)
-    assert [inbound["protocol"] for inbound in config_["inbounds"]] == ["tun"]
+    assert [inbound["protocol"] for inbound in config_["inbounds"]] == ["tun", "http"]
     assert config_["inbounds"][0]["settings"] == {"name": phoning.TUN_NAME, "mtu": 1500}
+    # Запасной путь пульта: вход только на 127.0.0.1 и первым правилом — в балансировщик,
+    # раньше правила «*.ts.net напрямую».
+    pult = config_["inbounds"][1]
+    assert (pult["listen"], pult["port"]) == ("127.0.0.1", phoning.PULT_PORT)
+    assert config_["routing"]["rules"][0] == {
+        "type": "field", "inboundTag": ["pult-in"], "balancerTag": "auto"}
     tags = [outbound["tag"] for outbound in config_["outbounds"]]
     assert tags == ["proxy-nl-1243", "proxy-de-1f80", "direct", "block", "dns-out"]
     assert phoning.servers(config_) == ["proxy-nl-1243", "proxy-de-1f80"]

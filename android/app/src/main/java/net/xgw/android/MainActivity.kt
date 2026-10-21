@@ -3,6 +3,7 @@ package net.xgw.android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -39,6 +40,7 @@ class MainActivity : Activity() {
     @Volatile private var pendingLink = ""
     private var loaded = false
     private var vpnRequest = 0 // номер ответа странице, пока Android спрашивает разрешение на VPN
+    private var notesRequest = 0 // то же — пока спрашивает разрешение на уведомления
 
     private companion object {
         const val ASK_VPN = 1
@@ -143,15 +145,43 @@ class MainActivity : Activity() {
         Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME)?.takeIf { it.isNotBlank() }
             ?: "${Build.MANUFACTURER} ${Build.MODEL}"
 
-    /** Разрешение на VPN есть: служба VPN, затем — разрешение на уведомление (Android 13+). */
+    /** Разрешение на VPN есть — служба VPN. */
     private fun startVpn(id: Int) {
         XgwVpn.send(this, XgwVpn.START)
         done(id, JSONObject().put("ok", true))
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), ASK_NOTES)
+    }
+
+    /** Разрешение Android на VPN: спросит один раз, дальше prepare() возвращает null. */
+    private fun askVpn(id: Int) {
+        val consent = VpnService.prepare(this)
+        if (consent == null) {
+            startVpn(id)
+        } else {
+            vpnRequest = id
+            @Suppress("DEPRECATION")
+            startActivityForResult(consent, ASK_VPN)
         }
+    }
+
+    /** Спросить о уведомлениях — один раз: отказ запоминает Android, дальше — кнопка в карточке. */
+    private fun shouldAskNotes(): Boolean {
+        val prefs = getSharedPreferences("xgw", MODE_PRIVATE)
+        if (prefs.getBoolean("notes-asked", false)) return false
+        prefs.edit().putBoolean("notes-asked", true).apply()
+        return true
+    }
+
+    private fun notesAllowed(): Boolean = Build.VERSION.SDK_INT < 33 ||
+        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+    /** Испытание А3: окно уведомлений после окна VPN не появлялось — теперь оно первое, а
+     * ответ на него (любой) ведёт к разрешению на VPN. */
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != ASK_NOTES) return
+        val id = notesRequest
+        notesRequest = 0
+        if (id != 0) askVpn(id)
     }
 
     /** Список серверов для VPN телефона со шлюза: проверить и сохранить; VPN включён — перезапустить Xray. */
@@ -278,7 +308,18 @@ class MainActivity : Activity() {
 
         /** VPN телефона: состояние службы и сохранённого списка серверов. */
         @JavascriptInterface
-        fun vpnInfo(): String = XgwVpn.snapshot().put("config", xray.info() ?: JSONObject.NULL).toString()
+        fun vpnInfo(): String = XgwVpn.snapshot()
+            .put("config", xray.info() ?: JSONObject.NULL)
+            .put("notes", notesAllowed() && getSystemService(NotificationManager::class.java).areNotificationsEnabled())
+            .put("path", Gateway.path)
+            .toString()
+
+        /** Настройки уведомлений XGW: включить скрытое уведомление «VPN XGW». */
+        @JavascriptInterface
+        fun notesSettings() = runOnUiThread {
+            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        }
 
         /** Включить VPN телефона: нет списка серверов — сначала со шлюза, затем разрешение Android. */
         @JavascriptInterface
@@ -292,13 +333,11 @@ class MainActivity : Activity() {
                     }
                 }
                 runOnUiThread {
-                    val consent = VpnService.prepare(this@MainActivity)
-                    if (consent == null) {
-                        startVpn(id)
+                    if (notesAllowed() || !shouldAskNotes()) {
+                        askVpn(id)
                     } else {
-                        vpnRequest = id
-                        @Suppress("DEPRECATION")
-                        startActivityForResult(consent, ASK_VPN)
+                        notesRequest = id
+                        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), ASK_NOTES)
                     }
                 }
             }

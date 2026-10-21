@@ -396,7 +396,12 @@
     const list = v.config ? `Серверов: ${v.config.servers || 0} · список от ${when(v.config.time)}`
       : "Списка серверов ещё нет — приложение возьмёт его у шлюза";
     let [tone, title, sub] = ["off", "VPN телефона выключен", list];
-    if (v.state === "on") [tone, title] = ["ok", "VPN телефона включён"];
+    if (v.state === "off" && v.detail) sub = `${v.detail}. ${list}`;
+    if (v.state === "on") {
+      [tone, title] = ["ok", "VPN телефона включён"];
+      sub = `${list}. Tailscale на телефоне в это время не работает: Android держит один VPN`
+        + (v.path === "vpn" ? ". Пульт ходит к шлюзу через VPN телефона" : "");
+    }
     else if (v.state === "starting") [tone, title, sub] = ["warn", "VPN телефона включается…", v.detail || list];
     const running = v.state === "on" || v.state === "starting";
     $("vpn").dataset.tone = tone;
@@ -409,6 +414,7 @@
     button.dataset.on = String(running);
     button.disabled = vpnBusy;
     $("vpn-fetch").disabled = vpnBusy;
+    $("vpn-notes").hidden = !running || v.notes;
   }
 
   function watchVpn() {
@@ -488,11 +494,14 @@
   $("scan-spares").addEventListener("click", () => act("scan", {}));
   $("speed").addEventListener("click", () => act("speed", {}));
   $("vpn-power").addEventListener("click", vpnPower);
+  $("vpn-notes").addEventListener("click", () => window.XGW.notesSettings());
   $("vpn-fetch").addEventListener("click", () => vpnFetch(false));
   $("vpn-always").addEventListener("click", () => ask(
     "VPN всегда",
     "В настройках Android выберите XGW и включите «Постоянная VPN»: телефон сам включит VPN "
-      + "после перезагрузки. «Блокировать соединения без VPN» — интернет только через VPN.",
+      + "после перезагрузки. Но Android держит один VPN: пока включён VPN XGW, Tailscale на "
+      + "телефоне не работает, а с «Постоянной VPN» Android будет сам возвращать VPN XGW. "
+      + "Если пользуетесь Tailscale на телефоне, «Постоянную VPN» для XGW не включайте.",
     "Открыть настройки", () => window.XGW.vpnSettings(),
   ));
   $("forget").addEventListener("click", () => ask(

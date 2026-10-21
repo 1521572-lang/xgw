@@ -2,6 +2,8 @@ package net.xgw.android
 
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
@@ -82,6 +84,13 @@ class Gateway(private val url: String) {
         /** Насколько часы шлюза впереди часов телефона, мс (из заголовка Date ответов):
          * подпись принимается при расхождении не больше минуты, а часы телефона могут уйти. */
         @Volatile var skewMs = 0L
+
+        /** Запасной путь к шлюзу — вход pult-in Xray телефона (generator/phone.py): пока VPN
+         * телефона включён, а напрямую Funnel не открывается (провайдер, домашний Wi-Fi). */
+        private val viaVpn = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 17821))
+
+        /** Каким путём шлюз ответил последним: "direct", "vpn" или "" — ещё не отвечал. */
+        @Volatile var path = ""
     }
 
     fun hello(): Reply = send("GET", "/api/hello", ByteArray(0), emptyMap())
@@ -104,8 +113,28 @@ class Gateway(private val url: String) {
         ))
     }
 
+    /** Напрямую; не вышло, а VPN телефона включён — через него. Сработавший путь пробуется первым. */
     private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
-        val connection = URL(url + path).openConnection() as HttpURLConnection
+        if (XgwVpn.state != "on") return attempt(null, method, path, body, headers).also { remember(it, "direct") }
+        val order = if (Gateway.path == "vpn") listOf(viaVpn, null) else listOf(null, viaVpn)
+        var reply = Reply(0, "", "")
+        for (proxy in order) {
+            reply = attempt(proxy, method, path, body, headers)
+            if (reply.status != 0) {
+                remember(reply, if (proxy == null) "direct" else "vpn")
+                return reply
+            }
+        }
+        return reply
+    }
+
+    private fun remember(reply: Reply, how: String) {
+        if (reply.status != 0) Gateway.path = how
+    }
+
+    private fun attempt(proxy: Proxy?, method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
+        val address = URL(url + path)
+        val connection = (if (proxy == null) address.openConnection() else address.openConnection(proxy)) as HttpURLConnection
         return try {
             connection.requestMethod = method
             connection.connectTimeout = TIMEOUT_MS

@@ -702,6 +702,8 @@ class Panel:
             "serve": {"on": bool(serving), "live": None, "url": ""},
             "funnel": {"on": bool(public), "live": None, "url": ""},
             "cgnat": [], "netfilter_off": None, "override_dns": None,
+            # Выходной узел (ASSUMPTIONS п. 230): объявлен ли (prefs), одобрен ли (status).
+            "exit": {"advertised": None, "approved": None}, "peers": [],
         }
         if self.which("tailscale") is None:
             return card
@@ -718,8 +720,16 @@ class Panel:
         card["address"] = next((item for item in state.addresses if ":" not in item), "")
         if state.backend != "Running" and state.auth_url.startswith("https://"):
             card["auth_url"] = state.auth_url
+        direct = set(cfg.managed.tailscale_direct)
+        card["peers"] = [
+            {"name": peer.name, "ip": peer.address, "os": peer.os, "online": peer.online,
+             "direct": peer.address in direct}
+            for peer in state.peers
+        ]
+        card["exit"]["approved"] = state.exit_approved
         prefs = ts.prefs(self.runner)
         if prefs is not None:
+            card["exit"]["advertised"] = prefs.exit_node
             card["ssh"] = prefs.ssh
             card["netfilter_off"] = (
                 None if prefs.netfilter is None else prefs.netfilter == ts.NETFILTER_OFF)
@@ -771,6 +781,8 @@ class Panel:
             return actions.Outcome(0, "Tailscale идёт через VPN, пока Xray отвечает", (
                 "Когда Xray не отвечает или VPN заблокирован — напрямую, чтобы шлюз остался "
                 "доступен",))
+        if step == "direct":
+            return self._tailnet_direct(body, store_path)
         if self.which("tailscale") is None:
             return actions.Outcome(2, "Tailscale не установлен")
         if not ts.present(self.paths, self.sys_net):
@@ -819,7 +831,55 @@ class Panel:
             if not isinstance(body.get("on"), bool):
                 return actions.Outcome(2, "ожидается on: true или false")
             return self._tailscale_funnel(body["on"], state.dns_name, store_path)
+        if step == "exit":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            ts.set_exit_node(body["on"], self.runner)
+            self._event("Tailscale: шлюз — выходной узел" if body["on"]
+                        else "Tailscale: шлюз больше не выходной узел")
+            if not body["on"]:
+                return actions.Outcome(0, "Шлюз больше не выходной узел tailnet")
+            return actions.Outcome(0, "Шлюз объявлен выходным узлом tailnet", (
+                "Одобрите его один раз в консоли Tailscale: Machines → шлюз → Edit route "
+                "settings → Use as exit node",
+                "Затем на телефоне в приложении Tailscale: Exit node → шлюз. Интернет телефона "
+                "пойдёт через Xray шлюза",
+            ))
         return actions.Outcome(2, "нет такого действия")
+
+    def _tailnet_direct(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Устройство tailnet выходит через шлюз напрямую (direct: true) или через Xray."""
+        address, direct = managed.tailnet_address(body.get("ip")), body.get("direct")
+        name = body.get("name") if isinstance(body.get("name"), str) else ""
+        if address is None or not isinstance(direct, bool):
+            return actions.Outcome(2, "ожидается адрес устройства tailnet и direct: true или false")
+        previous = managed.load(store_path)[0]["tailscale"]["direct"]
+        if not managed.set_tailscale_direct(store_path, address, name, direct=direct):
+            return actions.Outcome(0, "Ничего не изменилось")
+        problems: list[str] = []
+        try:
+            new_cfg, _warnings = config.load(self.config_path)
+        except config.ConfigError as exc:
+            new_cfg, problems = None, [str(exc)]
+        if new_cfg is not None:
+            _done, problems = actions.apply_network(
+                new_cfg, self.paths, self.capture_factory(new_cfg, self.paths, logger=self.log),
+                logger=self.log, runner=self.runner,
+            )
+        if problems:
+            managed.replace_tailscale_direct(store_path, previous)
+            return actions.Outcome(
+                1, "Сеть не приняла изменение, прежние настройки возвращены: " + "; ".join(problems)
+            )
+        label = name or address
+        self._ts_card = (0.0, None)
+        self._wake()
+        if direct:
+            self._event(f"устройство tailnet «{label}» выходит через шлюз напрямую")
+            return actions.Outcome(0, f"«{label}» выходит в интернет через шлюз напрямую", (
+                "Мимо Xray: провайдер шлюза видит, куда оно ходит",))
+        self._event(f"устройство tailnet «{label}» выходит через шлюз через VPN")
+        return actions.Outcome(0, f"«{label}» выходит в интернет через Xray шлюза")
 
     def _wait_job(self, job: ts.Job, done: Callable[[], bool]) -> None:
         deadline = time.monotonic() + self.ts_wait

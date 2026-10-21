@@ -32,6 +32,8 @@ class XgwVpn : VpnService() {
         private const val DNS = "10.233.233.2"
         private const val ADDRESS6 = "fd00:7867:7767::1"
         private const val RESTARTS = 3
+        const val REVOKED = "Android отдал VPN другому приложению (например, Tailscale) или его " +
+            "выключили в настройках Android"
 
         /** Состояние для экрана: off, starting, on, error. */
         @Volatile var state: String = "off"
@@ -80,6 +82,7 @@ class XgwVpn : VpnService() {
         }
         // START из приложения или запуск системой («VPN всегда», после перезагрузки).
         foreground("Включаю VPN…")
+        clearError()
         if (runner?.isAlive == true) return START_STICKY
         if (xray.info() == null) {
             shutdown("error", "Нет списка серверов: откройте приложение, пока есть связь со шлюзом")
@@ -102,8 +105,10 @@ class XgwVpn : VpnService() {
     }
 
     override fun onRevoke() {
-        // Разрешение отозвано: включён другой VPN или выключено в настройках Android.
-        shutdown("off", "VPN выключен в Android или включён другой VPN")
+        // Android держит один VPN: его забрало другое приложение (чаще всего Tailscale — он сам
+        // переподключается при смене сети) или VPN выключили в настройках Android.
+        shutdown("off", REVOKED)
+        notifyError(REVOKED)
     }
 
     override fun onDestroy() {
@@ -241,5 +246,10 @@ class XgwVpn : VpnService() {
 
     private fun notifyError(text: String) {
         channel().notify(NOTE + 1, note("VPN выключен: $text", false))
+    }
+
+    /** Новое включение — прежнее «VPN выключен: …» больше не нужно. */
+    private fun clearError() {
+        channel().cancel(NOTE + 1)
     }
 }
