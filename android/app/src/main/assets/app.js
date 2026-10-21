@@ -5,6 +5,8 @@
   "use strict";
 
   const POLL_MS = 6000; // API шлюза принимает до 30 запросов в минуту с телефона
+  const VPN_MS = 1500; // состояние VPN телефона — из самого приложения, без сети
+  const FRESH_MS = 3600 * 1000; // список серверов старше часа — обновить при открытии
   const $ = (id) => document.getElementById(id);
 
   const STATES = {
@@ -25,6 +27,8 @@
   let timer = 0;
   let toastTimer = 0;
   let dialogYes = null;
+  let vpnTimer = 0;
+  let vpnBusy = false;
 
   // --- мост к MainActivity ---------------------------------------------------
 
@@ -377,6 +381,71 @@
     for (const button of list.querySelectorAll("button")) button.disabled = acting;
   }
 
+  // --- VPN телефона (А3) ------------------------------------------------------------
+
+  const when = (ms) => {
+    const date = new Date(ms);
+    const today = new Date().toDateString() === date.toDateString();
+    const time = date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+    return today ? `сегодня ${time}` : `${date.toLocaleDateString("ru-RU")} ${time}`;
+  };
+  const vpnInfo = () => JSON.parse(window.XGW.vpnInfo());
+
+  function renderVpn() {
+    const v = vpnInfo();
+    const list = v.config ? `Серверов: ${v.config.servers || 0} · список от ${when(v.config.time)}`
+      : "Списка серверов ещё нет — приложение возьмёт его у шлюза";
+    let [tone, title, sub] = ["off", "VPN телефона выключен", list];
+    if (v.state === "on") [tone, title] = ["ok", "VPN телефона включён"];
+    else if (v.state === "starting") [tone, title, sub] = ["warn", "VPN телефона включается…", v.detail || list];
+    const running = v.state === "on" || v.state === "starting";
+    $("vpn").dataset.tone = tone;
+    $("vpn-title").textContent = title;
+    $("vpn-sub").textContent = sub;
+    say("vpn-error", v.state === "error" ? v.detail : "");
+    const button = $("vpn-power");
+    button.textContent = vpnBusy ? "Подождите…" : running ? "Выключить VPN телефона" : "Включить VPN телефона";
+    button.className = `btn wide ${running ? "danger-line" : "primary"}`;
+    button.dataset.on = String(running);
+    button.disabled = vpnBusy;
+    $("vpn-fetch").disabled = vpnBusy;
+  }
+
+  function watchVpn() {
+    clearInterval(vpnTimer);
+    vpnTimer = 0;
+    renderVpn();
+    if (!document.hidden && !$("gateway").hidden) vpnTimer = setInterval(renderVpn, VPN_MS);
+  }
+
+  async function vpnPower() {
+    if ($("vpn-power").dataset.on === "true") {
+      window.XGW.vpnStop();
+      setTimeout(renderVpn, 300);
+      return;
+    }
+    vpnBusy = true;
+    renderVpn();
+    const result = await bridge("vpnStart");
+    vpnBusy = false;
+    renderVpn();
+    if (!result.ok) toast(result.status === 200 || !("status" in result) ? result.error : problem(result, false), true);
+  }
+
+  async function vpnFetch(quiet) {
+    if (vpnBusy) return;
+    vpnBusy = true;
+    renderVpn();
+    const result = await bridge("vpnFetch");
+    vpnBusy = false;
+    renderVpn();
+    if (result.ok) {
+      if (!quiet) toast(`Список серверов обновлён: ${result.servers}`);
+    } else if (!quiet) {
+      toast(result.status === 200 ? result.error : problem(result, false), true);
+    }
+  }
+
   // --- запуск ----------------------------------------------------------------------
 
   function start() {
@@ -392,6 +461,9 @@
     $("about-version").textContent = info.version;
     show("gateway");
     load();
+    watchVpn();
+    const v = vpnInfo();
+    if (!v.config || Date.now() - v.config.time > FRESH_MS) vpnFetch(true);
   }
 
   $("scan").addEventListener("click", scan);
@@ -415,6 +487,14 @@
   $("refresh").addEventListener("click", () => act("refresh", {}));
   $("scan-spares").addEventListener("click", () => act("scan", {}));
   $("speed").addEventListener("click", () => act("speed", {}));
+  $("vpn-power").addEventListener("click", vpnPower);
+  $("vpn-fetch").addEventListener("click", () => vpnFetch(false));
+  $("vpn-always").addEventListener("click", () => ask(
+    "VPN всегда",
+    "В настройках Android выберите XGW и включите «Постоянная VPN»: телефон сам включит VPN "
+      + "после перезагрузки. «Блокировать соединения без VPN» — интернет только через VPN.",
+    "Открыть настройки", () => window.XGW.vpnSettings(),
+  ));
   $("forget").addEventListener("click", () => ask(
     "Отвязать телефон?",
     "Приложение забудет ключ и больше не войдёт на шлюз. В панели шлюза телефон останется в "
@@ -422,8 +502,13 @@
     "Отвязать", () => { window.XGW.forget(); state = null; start(); }, true,
   ));
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stop();
-    else if (!$("gateway").hidden) load();
+    if (document.hidden) {
+      stop();
+      clearInterval(vpnTimer);
+    } else if (!$("gateway").hidden) {
+      load();
+      watchVpn();
+    }
   });
 
   start();

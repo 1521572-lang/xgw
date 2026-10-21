@@ -1,9 +1,12 @@
 package net.xgw.android
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -31,14 +34,22 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
     private lateinit var web: WebView
     private lateinit var keys: Keys
+    private lateinit var xray: PhoneXray
     private val worker = Executors.newSingleThreadExecutor()
     @Volatile private var pendingLink = ""
     private var loaded = false
+    private var vpnRequest = 0 // номер ответа странице, пока Android спрашивает разрешение на VPN
+
+    private companion object {
+        const val ASK_VPN = 1
+        const val ASK_NOTES = 2
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         keys = Keys(this)
+        xray = PhoneXray(this)
         web = WebView(this)
         web.settings.apply {
             javaScriptEnabled = true
@@ -87,6 +98,20 @@ class MainActivity : Activity() {
         lightBars()
     }
 
+    @Deprecated("startActivityForResult: у Activity без AndroidX другого способа нет")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != ASK_VPN) return
+        val id = vpnRequest
+        vpnRequest = 0
+        if (resultCode == RESULT_OK) {
+            startVpn(id)
+        } else {
+            done(id, JSONObject().put("ok", false).put("error",
+                "Android не разрешил VPN. Нажмите «Включить VPN телефона» ещё раз и выберите «ОК»."))
+        }
+    }
+
     @Deprecated("Android до 13: системная кнопка «Назад»")
     override fun onBackPressed() = back()
 
@@ -117,6 +142,34 @@ class MainActivity : Activity() {
     private fun deviceName(): String =
         Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME)?.takeIf { it.isNotBlank() }
             ?: "${Build.MANUFACTURER} ${Build.MODEL}"
+
+    /** Разрешение на VPN есть: служба VPN, затем — разрешение на уведомление (Android 13+). */
+    private fun startVpn(id: Int) {
+        XgwVpn.send(this, XgwVpn.START)
+        done(id, JSONObject().put("ok", true))
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), ASK_NOTES)
+        }
+    }
+
+    /** Список серверов для VPN телефона со шлюза: проверить и сохранить; VPN включён — перезапустить Xray. */
+    private fun fetchConfig(): JSONObject {
+        val binding = keys.binding() ?: return JSONObject().put("ok", false).put("status", 0)
+            .put("error", "телефон не привязан")
+        val answer = Gateway(binding.url).signed(binding.phone, keys.signer(), "GET", "/api/phone-config", null)
+        val out = reply(answer)
+        if (answer.status != 200) return out.put("ok", false)
+        val problem = try {
+            xray.save(out.getJSONObject("body"))
+        } catch (exc: Exception) {
+            "список серверов не сохранён: ${exc.message ?: exc.javaClass.simpleName}"
+        }
+        if (problem.isNotEmpty()) return JSONObject().put("ok", false).put("status", 200).put("error", problem)
+        if (XgwVpn.state == "on") XgwVpn.send(this, XgwVpn.RELOAD)
+        return JSONObject().put("ok", true).put("status", 200).put("servers", xray.info()?.optInt("servers") ?: 0)
+    }
 
     private fun done(id: Int, result: JSONObject) {
         val text = JSONObject.quote(result.toString())
@@ -222,5 +275,45 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun forget() = keys.forget()
+
+        /** VPN телефона: состояние службы и сохранённого списка серверов. */
+        @JavascriptInterface
+        fun vpnInfo(): String = XgwVpn.snapshot().put("config", xray.info() ?: JSONObject.NULL).toString()
+
+        /** Включить VPN телефона: нет списка серверов — сначала со шлюза, затем разрешение Android. */
+        @JavascriptInterface
+        fun vpnStart(id: Int) {
+            worker.execute {
+                if (xray.info() == null) {
+                    val fetched = fetchConfig()
+                    if (!fetched.optBoolean("ok")) {
+                        done(id, fetched)
+                        return@execute
+                    }
+                }
+                runOnUiThread {
+                    val consent = VpnService.prepare(this@MainActivity)
+                    if (consent == null) {
+                        startVpn(id)
+                    } else {
+                        vpnRequest = id
+                        @Suppress("DEPRECATION")
+                        startActivityForResult(consent, ASK_VPN)
+                    }
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun vpnStop() = XgwVpn.send(this@MainActivity, XgwVpn.STOP)
+
+        @JavascriptInterface
+        fun vpnFetch(id: Int) {
+            worker.execute { done(id, fetchConfig()) }
+        }
+
+        /** Настройки VPN Android: «Постоянная VPN» и «Блокировать соединения без VPN». */
+        @JavascriptInterface
+        fun vpnSettings() = runOnUiThread { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
     }
 }

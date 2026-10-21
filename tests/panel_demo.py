@@ -2,7 +2,7 @@
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
                                                       budget|waiting|reserve|tailscale]
-                               [--app-port 8792]
+                               [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -20,6 +20,11 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
 не привязывается: на каждый новый код печатается ссылка для эмулятора
 xgw://pair?u=http://10.0.2.2:ПОРТ&c=КОД (adb shell am start -a android.intent.action.VIEW -d …).
+
+--phone-server — для VPN приложения на эмуляторе (А3): «применённый конфиг шлюза» — эталонный
+(tests/fixtures/golden/full_config.json) с одним сервером VLESS без TLS на ХОСТ:ПОРТ (для
+эмулятора — 10.0.2.2), и /api/phone-config собирает из него конфиг телефона настоящим кодом
+(generator/phone.py).
 """
 
 from __future__ import annotations
@@ -472,6 +477,22 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
     return panel
 
 
+def phone_gateway(spec: str) -> dict:
+    """Применённый конфиг «шлюза» с одним сервером VLESS ХОСТ:ПОРТ:UUID (--phone-server)."""
+    host, port, uuid = spec.rsplit(":", 2)
+    golden = Path(__file__).resolve().parent / "fixtures/golden/full_config.json"
+    applied = json.loads(golden.read_text(encoding="utf-8"))
+    members = [item for item in applied["outbounds"]
+               if item["tag"].startswith(("proxy-", "spare-"))]
+    keep = members[0]
+    keep.update(protocol="vless", settings={"vnext": [{
+        "address": host, "port": int(port), "users": [{"id": uuid, "encryption": "none"}],
+    }]}, streamSettings={"network": "tcp", "sockopt": {"mark": 2}})
+    applied["outbounds"] = [item for item in applied["outbounds"] if item not in members[1:]]
+    applied["dns"].pop("hosts", None)
+    return applied
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8791)
@@ -480,10 +501,13 @@ def main() -> None:
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
                  "reserve", "tailscale"))
     parser.add_argument("--app-port", type=int, default=0)
+    parser.add_argument("--phone-server", default="")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)
         panel.demo_phone = not args.app_port
+        if args.phone_server:
+            atomic_write_json(panel.paths.xray_config_file, phone_gateway(args.phone_server))
         panel.start()
         print(f"Панель: http://127.0.0.1:{panel.port}/?token={TOKEN}", flush=True)
         if args.app_port:

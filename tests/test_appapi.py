@@ -4,6 +4,7 @@
 
 import base64
 import json
+import os
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from test_panel import Rig
 from xgw import config, managed, phones, qr, tailscale
 from xgw.config import Config
 from xgw.generator import phone as phoning
+from xgw.generator import validate
 from xgw.paths import Paths
 from xgw.uninstall import Uninstaller
 from xgw.watch import appapi
@@ -170,6 +172,28 @@ def test_phone_config_drops_sing_box_bridges_and_keeps_chains():
         phoning.build({"outbounds": [bridge, {"tag": "direct", "protocol": "freedom"}]})
     with pytest.raises(phoning.PhoneConfigError):
         phoning.build(None)
+
+
+@pytest.mark.skipif(not os.environ.get("XGW_XRAY_BIN"),
+                    reason="нет XGW_XRAY_BIN — проверка живым Xray пропущена")
+def test_phone_config_passes_live_xray_test():
+    """Конфиг телефона принимает Xray той же версии, что в приложении (А3; на Linux вход tun
+    в режиме -test интерфейс не открывает). Приложение проверяет его так же перед сохранением."""
+    xray = Path(os.environ["XGW_XRAY_BIN"])
+    verdict, output = validate.validate_config(phoning.build(GOLDEN), xray)
+    assert verdict is True, output
+
+
+def test_demo_phone_server_for_the_emulator():
+    """panel_demo --phone-server: «шлюз» с одним VLESS без TLS — для VPN приложения на эмуляторе."""
+    import panel_demo
+
+    applied = panel_demo.phone_gateway("10.0.2.2:18443:6f1c2a8e-3b7d-4c55-9a10-2f4e8d7b1c33")
+    config_ = phoning.build(applied)
+    assert phoning.servers(config_) == ["proxy-nl-1243"]
+    vnext = config_["outbounds"][0]["settings"]["vnext"][0]
+    assert (vnext["address"], vnext["port"]) == ("10.0.2.2", 18443)
+    assert "hosts" not in config_["dns"]
 
 
 # --- API приложения ----------------------------------------------------------------

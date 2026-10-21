@@ -109,7 +109,9 @@ h2 { font-size: 1.05rem; margin-bottom: 6px; }
 .hero[data-tone="warn"] .title { color: var(--warn); }
 .hero[data-tone="bad"] .title { color: var(--bad); }
 /* Нет связи со шлюзом: показано последнее известное состояние, кнопки не работают. */
-main.stale .card:not(:last-child) { opacity: .55; pointer-events: none; }
+/* Нет связи со шлюзом: его карточки — бледные и не нажимаются; VPN телефона работает
+   и без шлюза (на сохранённом списке серверов). */
+main.stale .card:not(:last-child):not(#vpn) { opacity: .55; pointer-events: none; }
 .current { padding: 8px 12px; border-radius: 12px; background: var(--card-2); overflow-wrap: anywhere; }
 
 .rows { display: grid; gap: 6px; }
