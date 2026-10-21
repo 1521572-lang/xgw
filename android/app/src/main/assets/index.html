@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src data:">
+  <meta name="color-scheme" content="dark light">
+  <title>XGW</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- Телефон не привязан: одна кнопка — камера на QR-код панели. -->
+  <main id="welcome" class="screen center" hidden>
+    <div class="logo" aria-hidden="true"></div>
+    <h1>XGW</h1>
+    <p class="lead">Пульт шлюза XGW</p>
+    <ol class="steps">
+      <li>Откройте панель XGW на шлюзе.</li>
+      <li>В карточке «Телефоны» нажмите «Привязать телефон».</li>
+      <li>Нажмите кнопку ниже и наведите камеру на QR-код.</li>
+    </ol>
+    <button id="scan" class="btn primary wide" type="button">Сканировать QR-код</button>
+    <p id="welcome-error" class="error" role="alert" hidden></p>
+  </main>
+
+  <!-- QR-код прочитан: что и к какому шлюзу привязывается. -->
+  <main id="confirm" class="screen center" hidden>
+    <div class="logo" aria-hidden="true"></div>
+    <h1>Привязать телефон?</h1>
+    <p class="lead">Шлюз <b id="confirm-host"></b></p>
+    <p class="muted small">Телефон появится в панели как «<span id="confirm-device"></span>».
+      Привязку можно отменить в панели шлюза.</p>
+    <p id="confirm-replace" class="warn-note small" hidden></p>
+    <button id="confirm-yes" class="btn primary wide" type="button">Привязать</button>
+    <button id="confirm-no" class="btn wide" type="button">Отмена</button>
+    <p id="confirm-error" class="error" role="alert" hidden></p>
+  </main>
+
+  <!-- Пульт: состояние шлюза и его кнопки. -->
+  <main id="gateway" class="screen" hidden>
+    <header class="top">
+      <div>
+        <h1>XGW</h1>
+        <p id="host" class="muted small"></p>
+      </div>
+      <span id="chip" class="chip" data-tone="off">Нет данных</span>
+    </header>
+
+    <p id="link-error" class="error" role="alert" hidden></p>
+    <button id="relink" class="btn primary wide" type="button" hidden>Привязать заново</button>
+
+    <section class="card hero" id="hero" data-tone="off">
+      <p id="power-title" class="title">VPN шлюза</p>
+      <p id="power-sub" class="muted small"></p>
+      <p id="current" class="current small" hidden></p>
+      <button id="power" class="btn wide" type="button" disabled>VPN шлюза</button>
+      <p id="power-why" class="muted small" hidden></p>
+    </section>
+
+    <section class="card">
+      <h2>Серверы в работе</h2>
+      <p id="pin-note" class="small" hidden></p>
+      <button id="unpin" class="btn wide" type="button" hidden>Вернуть автовыбор</button>
+      <ul id="members" class="rows"></ul>
+      <p id="spares" class="muted small"></p>
+      <div class="buttons">
+        <button id="refresh" class="btn" type="button">Обновить подписки</button>
+        <button id="scan-spares" class="btn" type="button">Проверить запасные</button>
+        <button id="speed" class="btn" type="button" hidden>Замерить скорость</button>
+      </div>
+    </section>
+
+    <section class="card" id="devices-card" hidden>
+      <h2>Устройства дома</h2>
+      <p class="muted small">Устройство «мимо VPN» ходит в интернет напрямую.</p>
+      <ul id="devices" class="rows"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Этот телефон</h2>
+      <p class="small"><span class="muted">Шлюз:</span> <span id="about-host"></span></p>
+      <p class="small"><span class="muted">В панели:</span> <span id="about-name"></span></p>
+      <p class="small"><span class="muted">Версия:</span> <span id="about-version"></span>
+        <span class="muted">· шлюз</span> <span id="about-gw"></span></p>
+      <p id="updated" class="muted small"></p>
+      <button id="forget" class="btn danger-line wide" type="button">Отвязать телефон</button>
+    </section>
+  </main>
+
+  <!-- Вопрос перед действием («Выключить VPN шлюза?»). -->
+  <div id="dialog" class="overlay" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <h2 id="dialog-title"></h2>
+      <p id="dialog-text" class="muted"></p>
+      <div class="buttons end">
+        <button id="dialog-no" class="btn" type="button">Отмена</button>
+        <button id="dialog-yes" class="btn primary" type="button"></button>
+      </div>
+    </div>
+  </div>
+
+  <p id="toast" class="toast" role="status" hidden></p>
+  <script src="app.js"></script>
+</body>
+</html>

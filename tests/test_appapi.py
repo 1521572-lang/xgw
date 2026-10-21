@@ -216,6 +216,8 @@ def test_paired_phone_reads_the_state_without_secrets(api):
     assert status == 200 and state["state"] == "HEALTHY"
     assert [member["tag"] for member in state["members"]] == ["proxy-nl-aaaa", "proxy-de-bbbb"]
     assert state["power"]["can_off"] is True and state["spares"] == 1
+    # Приложение показывает «нет интернета в сети» и прогресс замеров, как панель.
+    assert "lan_problem" in state["capture"] and set(state["speed_progress"]) == {"total", "done"}
     text = json.dumps(state, ensure_ascii=False)
     assert "S3CR3T" not in text and "sub.example.net" not in text and "trojan://" not in text
     assert "subscriptions" not in state and "links" not in state and "events" not in state
