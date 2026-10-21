@@ -87,6 +87,9 @@ def phone_state(state: dict) -> dict:
         "members": members, "spares": len(state.get("spares") or []),
         "sticky": {"on": (state.get("sticky") or {}).get("on")},
         "devices": devices, "busy": state.get("busy"),
+        # Замеры скорости: сколько серверов в заходе и сколько уже замерено.
+        "speed_progress": {key: (state.get("speed_progress") or {}).get(key)
+                           for key in ("total", "done")},
     }
 
 

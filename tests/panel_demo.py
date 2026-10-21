@@ -2,6 +2,7 @@
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
                                                       budget|waiting|reserve|tailscale]
+                               [--app-port 8792]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -14,16 +15,23 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
 10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
 не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
+
+--app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
+0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
+не привязывается: на каждый новый код печатается ссылка для эмулятора
+xgw://pair?u=http://10.0.2.2:ПОРТ&c=КОД (adb shell am start -a android.intent.action.VIEW -d …).
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -301,6 +309,8 @@ class DemoDaemon:
 
 
 class DemoPanel(Panel):
+    demo_phone = True  # «телефон» привязывается сам; с --app-port — настоящее приложение
+
     def _selected(self, xray_ok: bool, now: float) -> list[str]:
         return ["proxy-nl-a1a1"] if xray_ok else []
 
@@ -334,7 +344,7 @@ class DemoPanel(Panel):
                      "tailscale/funnel": fake.allow_funnel, "phones/pair": fake.allow_funnel}[name]
             threading.Timer(12 if name == "tailscale/login" else 10, later).start()
         outcome = super()._act(name, body)
-        if name == "phones/pair" and outcome.ok:
+        if name == "phones/pair" and outcome.ok and self.demo_phone:
             threading.Timer(20, self._demo_phone).start()
         return outcome
 
@@ -342,6 +352,53 @@ class DemoPanel(Panel):
         code = self.phones.pairing()["code"]
         if code:
             self.phones.pair(code, "Galaxy S25 Ultra")
+
+
+def app_forwarder(panel: DemoPanel, port: int) -> ThreadingHTTPServer:
+    """Как Funnel: снаружи (эмулятор, 10.0.2.2) — на API приложения, Host — имя шлюза."""
+
+    class Forward(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def _forward(self) -> None:
+            length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(length) if length else b""
+            headers = {name: value for name, value in self.headers.items()
+                       if name.lower() not in ("host", "connection")}
+            headers["Host"] = panel.cfg.managed.tailscale_funnel or "funnel-off"
+            upstream = http.client.HTTPConnection("127.0.0.1", panel.app_api.port, timeout=20)
+            try:
+                upstream.request(self.command, self.path, body=body or None, headers=headers)
+                response = upstream.getresponse()
+                data = response.read()
+            finally:
+                upstream.close()
+            self.send_response_only(response.status)
+            for name, value in response.getheaders():
+                if name.lower() not in ("connection", "transfer-encoding", "server"):
+                    self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = _forward
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Forward)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def links() -> None:
+        shown = ""
+        while True:
+            code = panel.phones.pairing()["code"] or ""
+            if code and code != shown and panel.cfg.managed.tailscale_funnel:
+                print(f"Приложение (эмулятор): xgw://pair?u=http://10.0.2.2:{port}&c={code}",
+                      flush=True)
+                shown = code
+            time.sleep(1)
+
+    threading.Thread(target=links, daemon=True).start()
+    return server
 
 
 def build(root: Path, port: int, scene: str) -> DemoPanel:
@@ -422,11 +479,16 @@ def main() -> None:
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
                  "reserve", "tailscale"))
+    parser.add_argument("--app-port", type=int, default=0)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)
+        panel.demo_phone = not args.app_port
         panel.start()
         print(f"Панель: http://127.0.0.1:{panel.port}/?token={TOKEN}", flush=True)
+        if args.app_port:
+            app_forwarder(panel, args.app_port)
+            print(f"API приложения для эмулятора: http://10.0.2.2:{args.app_port}", flush=True)
         try:
             threading.Event().wait()
         except KeyboardInterrupt:
