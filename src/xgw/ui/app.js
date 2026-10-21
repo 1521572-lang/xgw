@@ -36,7 +36,7 @@
     core: "не используется: сервер умеет только sing-box (hysteria2, TUIC, AnyTLS…), а он выключен, не установлен или ещё не заведён — установить: sudo xgw update-singbox",
   };
   const KINDS = {
-    capture: "перехват", lifecycle: "перехват", apply: "конфиг", config: "конфиг", generate: "сборка",
+    capture: "перехват", lifecycle: "перехват", lan: "сеть устройств", apply: "конфиг", config: "конфиг", generate: "сборка",
     rotation: "замена", rollback: "откат", pin: "выбор сервера", panel: "панель",
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
@@ -245,6 +245,10 @@
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
     setBusy($("speed"), s.busy.speed);
+    // Прогресс замеров: «Замер скорости 12 из 74» — пока идёт заход.
+    const progress = s.speed_progress || {};
+    $("speed").textContent = s.busy.speed && progress.total
+      ? `Замер скорости ${progress.done || 0} из ${progress.total}` : "Замерить скорость";
     $("scan").hidden = !s.spares.length;
     $("refresh").hidden = !s.subscriptions.length;
     // Пока серверов нет, первое дело — добавить подписку: её блок идёт выше.
@@ -305,6 +309,8 @@
     if (!s.updated) return ["off", "Запускается…"];
     if (stale) return ["bad", "Демон XGW не отвечает"];
     if (!s.members.length) return ["off", "Серверов нет"];
+    // Серверы в порядке ещё не значит, что у устройств сети есть интернет.
+    if (s.capture.mode === "on" && s.capture.lan_problem) return ["bad", "Нет интернета в сети"];
     return STATES[s.state] || ["off", s.state || "Нет данных"];
   }
 
@@ -375,6 +381,9 @@
           ? "Xray перезапускается с новыми настройками — до этого интернет закрыт, мимо VPN ничего не уходит"
           : "Xray перезапускается с новыми настройками — до этого трафик идёт напрямую";
         heroTone = "warn";
+      } else if (s.capture.lan_problem) {
+        heroTone = "bad";
+        sub = `Устройства сети без интернета: ${s.capture.lan_problem}`;
       } else if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
       else if (s.capture.loaded === false) {
         heroTone = "bad";
@@ -444,18 +453,25 @@
   const mbps = (value) => (value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`);
   const hasSpeed = (server) => server.speed_mbps !== null && server.speed_mbps !== undefined;
 
-  // Скорость по последнему замеру — рядом с задержкой. У запасного замер сделан, пока он
-  // был в работе, поэтому он бледнее.
+  // Скорость по последнему замеру — рядом с задержкой; у запасных тоже (меньшей загрузкой).
+  // Замер при занятом канале бледнее: чужая загрузка могла занизить цифру.
   function speedValue(server, s) {
     if (!hasSpeed(server) || (server.status !== "member" && server.status !== "spare")) return null;
-    const old = server.status === "spare";
+    const busy = Boolean(server.speed_busy);
     return el("span", {
-      class: `speed${old ? " old" : ""}`, text: mbps(server.speed_mbps),
-      title: old
-        ? `Скорость по замеру ${stamp(server.speed_ts, s.now)}, когда сервер был в работе`
-        : `Скорость по замеру ${stamp(server.speed_ts, s.now)}`,
+      class: `speed${busy ? " old" : ""}`, text: mbps(server.speed_mbps),
+      title: `Скорость по замеру ${stamp(server.speed_ts, s.now)}`
+        + (busy ? " — канал был занят, цифра может быть занижена" : ""),
     });
   }
+
+  // Когда цифры скорости нет — почему (issue #1: пустое место ничего не объясняло).
+  const speedNote = (server, s) => {
+    if (hasSpeed(server)) return ` · замер скорости ${stamp(server.speed_ts, s.now)}`;
+    // Участник не отвечает — это и так сказано в той же строке.
+    if (server.status === "member" && server.alive === false && !server.speed_error) return "";
+    return server.speed_note ? ` · ${server.speed_note}` : "";
+  };
 
   // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
   const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
@@ -464,23 +480,14 @@
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
-      const sticky = s.sticky || {};
-      let measured = "";
-      if (hasSpeed(server)) {
-        measured = ` · замер скорости ${stamp(server.speed_ts, s.now)}`;
-      } else if (server.speed_error) {
-        measured = ` · замер скорости не удался ${stamp(server.speed_ts, s.now)}`;
-      } else if (server.multiplier >= 100 && sticky.on && sticky.every_hours) {
-        measured = " · скорость серверов x100 не замеряется";
-      }
-      return `${mainShown(server, s) ? "основной" : "в работе"}${measured}${dead}`;
+      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`;
     }
     if (server.status === "spare") {
       const role = server.reserve
         ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
         : "запасной";
       return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "")
-        + (hasSpeed(server) ? ` · замер скорости ${stamp(server.speed_ts, s.now)}, когда был в работе` : "");
+        + speedNote(server, s);
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -665,7 +672,8 @@
     const sticky = s.sticky || {};
     const on = Boolean(sticky.on);
     $("sticky").setAttribute("aria-checked", String(on));
-    $("speed").hidden = !on || !sticky.every_hours;
+    const measuring = Boolean(sticky.unlimited_hours || sticky.limited_hours);
+    $("speed").hidden = !on || !measuring;
     const pinned = Boolean(s.pin && !s.pin.down);
     let text;
     if (!on) {
@@ -676,12 +684,14 @@
       const speed = s.main.mbps !== null && s.main.mbps !== undefined ? ` — ${mbps(s.main.mbps)}` : "";
       const basis = s.main.basis === "speed" ? "" : " (скорость ещё не замерена — выбран по задержке)";
       text = `Весь трафик идёт через «${s.main.name || s.main.tag}»${speed}${basis}. `
-        + "Шлюз меняет его, только если он перестанет отвечать или другой окажется заметно быстрее.";
+        + "Шлюз меняет его, если он перестанет отвечать (на сервер той же страны, если такой есть) "
+        + "или если другой сервер — и запасной тоже — окажется заметно быстрее.";
     } else {
       text = "Весь трафик пойдёт через самый быстрый сервер в работе — шлюз выберет его, как только серверы ответят.";
     }
-    if (on && sticky.every_hours) {
-      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется"} раз в ${sticky.every_hours} ч, до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки; лимитированные — меньшей загрузкой, чтобы не тратить квоту, x100 — не замеряются.`;
+    if (on && measuring) {
+      const every = (hours) => (hours ? `раз в ${hours} ч` : "не замеряются");
+      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется у всех живых серверов:"} безлимитных — ${every(sticky.unlimited_hours)}, лимитированных — ${every(sticky.limited_hours)} и меньшей загрузкой, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`;
     }
     $("main-note").textContent = text;
   }

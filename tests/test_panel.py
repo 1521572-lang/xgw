@@ -837,7 +837,8 @@ def test_state_shows_the_capture_lifecycle_written_by_the_daemon(rig, user):
 
 def test_sticky_switch_and_speed_button(rig, user):
     state = user.state()
-    assert state["sticky"]["on"] is True and state["sticky"]["every_hours"] == 6
+    assert state["sticky"]["on"] is True
+    assert (state["sticky"]["unlimited_hours"], state["sticky"]["limited_hours"]) == (1, 6)
     assert user.act("speed", {})["ok"] and rig.daemon.asked == ["speed"]
     reply = user.act("sticky", {"on": False})
     assert reply["ok"] and "выключен" in reply["text"]

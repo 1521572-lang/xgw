@@ -207,6 +207,53 @@ def test_enable_loads_rules_route_and_forwarding(gateway):
     assert json.loads(gateway.state_file.read_text())["enabled"] is True
 
 
+def test_lan_subnet_throw_keeps_lan_alive_with_src_valid_mark(gateway):
+    """Issue #1: при net.ipv4.conf.all.src_valid_mark = 1 (его ставит tailscaled) ядро
+    проверяет источник пакета LAN с меткой по таблице TPROXY, видит там local и молча
+    отбрасывает пакет. Маршрут throw для подсети LAN отправляет проверку в main."""
+    kernel, proc = gateway.kernel, gateway.proc
+    (proc / "net/ipv4/conf/all").mkdir(parents=True)
+    (proc / sysctl.SRC_VALID_MARK).write_text("1\n")
+    kernel.src_valid_mark = True
+    kernel.lan_links["lan0"] = True
+    gateway.enable()
+    assert {"type": "throw", "dst": "192.168.50.0/24"} in kernel.routes(100)
+    assert gateway.loaded() is True and gateway.lan_path() == ""
+    # Маршрут пропал (чужой flush): пакеты LAN гибнут, правила «не те» — демон загрузит.
+    kernel.routes(100).remove({"type": "throw", "dst": "192.168.50.0/24"})
+    problem = gateway.lan_path()
+    assert "не доходят до Xray" in problem and "src_valid_mark = 1" in problem
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.lan_path() == "" and gateway.loaded() is True
+    # Подсеть LAN сменили: старый throw уходит, новый появляется.
+    gateway.cfg.network.lan_address = "10.9.0.1/24"
+    assert gateway.loaded() is False
+    gateway.up()
+    throws = [route for route in kernel.routes(100) if route.get("type") == "throw"]
+    assert throws == [{"type": "throw", "dst": "10.9.0.0/24"}] and gateway.lan_path() == ""
+    # Интерфейс LAN выключен — проверять нечего, это не сбой перехвата.
+    kernel.lan_links["lan0"] = False
+    assert gateway.lan_path() == ""
+    # Перехват снят: таблица TPROXY не нужна вовсе, throw уходит вместе с ней.
+    gateway.disable()
+    assert kernel.routes(100) == [] and gateway.lan_path() == ""
+
+
+def test_iprule_throw_routes():
+    kernel = FakeKernel()
+    iprule.ensure(1, 100, kernel, throws=("192.168.60.0/24",))
+    assert iprule.present(1, 100, kernel, throws=("192.168.60.0/24",))
+    assert not iprule.present(1, 100, kernel)  # лишний throw — правила «не те»
+    iprule.ensure(1, 100, kernel, throws=("192.168.60.0/24",))
+    assert len(kernel.commands("ip", "route", "replace", "throw")) == 1  # уже есть
+    iprule.ensure(1, 100, kernel)
+    assert not [route for route in kernel.routes(100) if route.get("type") == "throw"]
+    iprule.ensure(1, 100, kernel, throws=("192.168.60.0/24",))
+    iprule.remove(1, 100, kernel)
+    assert kernel.routes(100) == [] and kernel.rules == []
+
+
 def test_disable_keeps_router_and_survives_restart(gateway):
     gateway.enable()
     gateway.kernel.calls.clear()

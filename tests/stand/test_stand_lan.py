@@ -91,6 +91,24 @@ def test_lan_device_goes_through_vpn_and_dns_is_answered_by_xray(gateway):
     assert "ConnectionRefused" in tproxy.get("error", ""), tproxy
 
 
+def test_lan_survives_src_valid_mark(gateway):
+    """Issue #1: с net.ipv4.conf.all.src_valid_mark = 1 (его ставит tailscaled) ядро
+    проверяет источник пакета LAN с меткой по таблице TPROXY — без маршрута throw для
+    подсети LAN пакет отбрасывается молча, и устройства остаются без интернета. С ним —
+    идут через VPN; пропажу маршрута видит `xgw status`, `xgw net up` его возвращает."""
+    subnet = f"{netns.GW_LAN_IP.rsplit('.', 1)[0]}.0/24"
+    gateway.gw_run("sysctl", "-qw", "net.ipv4.conf.all.src_valid_mark=1")
+    assert f"throw {subnet}" in gateway.gw_run("ip", "route", "show", "table", "100")
+    assert gateway.exit_ip("lan") == VIA_VPN
+    gateway.gw_run("ip", "route", "del", "throw", subnet, "table", "100")
+    assert gateway.exit_ip("lan") == ""  # так было до исправления: пакеты гибнут молча
+    capture = _capture(gateway)
+    assert "src_valid_mark = 1" in capture["lan_problem"], capture
+    restored = gateway.xgw("net", "up")
+    assert restored.returncode == 0, restored.stderr
+    assert gateway.exit_ip("lan") == VIA_VPN and _capture(gateway)["lan_problem"] == ""
+
+
 def test_bypass_host_goes_direct(gateway):
     """Устройство из bypass_hosts (MAC → IP через статическую аренду) ходит мимо VPN,
     а DNS-запрос к шлюзу от него уходит на прямой резолвер."""
@@ -202,8 +220,11 @@ def test_daemon_restores_rules_and_dhcp_serves_leases(gateway):
 
     gateway.gw_run("nft", "delete", "table", "ip", "xgw")  # «чужой» сбой правил
     assert wait_for(lambda: gateway.exit_ip("lan") == VIA_VPN, 30, step=1), gateway.tail("daemon")
-    events = [event["detail"] for event in gateway.xgw_json("status")["events"]]
-    assert any("загружены заново" in detail for detail in events), events
+    # Событие — в status.json по итогам шага: шаг мог ещё идти (замер скорости).
+    assert wait_for(lambda: any(
+        "загружены заново" in event["detail"]
+        for event in gateway.xgw_json("status")["events"]
+    ), 30, step=1), gateway.xgw_json("status")["events"]
     assert gateway.exit_ip("lan", "--bind", netns.LAN_BYPASS_IP) == DIRECT
 
     if shutil.which("dnsmasq") is None:

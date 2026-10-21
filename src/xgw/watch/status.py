@@ -21,7 +21,7 @@ from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
 from ..store import Store
 from .scan import CHEAP_SCAN_BYTES, RESERVE_CANDIDATES, RESERVE_RECHECK
-from .speed import size_mb
+from .speed import SKIP_PRICE, every_hours, size_mb
 
 DEFAULT_PROBE_BYTES = 65536
 MB = 1_000_000  # ТЗ считает в десятичных единицах: 5 × 64 КиБ × 2880 ≈ 0,94 ГБ
@@ -37,7 +37,7 @@ class Budget:
     probes: int  # GET-пробы ядра по участникам (burstObservatory)
     scans: int  # сканы запасных
     e2e: int  # сквозная проверка watchdog через http-in
-    speed: int = 0  # замеры скорости безлимитных участников (watch/speed.py), не больше
+    speed: int = 0  # замеры скорости живых серверов (watch/speed.py), не больше
 
     size: int = DEFAULT_PROBE_BYTES  # размер одной пробы, от которого всё посчитано
     measured: bool = False  # размер измерен сквозной проверкой, а не взят по умолчанию
@@ -75,7 +75,7 @@ def measured_probe_size(store: Store, url: str) -> int | None:
 
 def probe_budget(
     cfg: Config, members: int, spares: int, size: int | None = None, *,
-    cheap: int = 0, candidates: int = 0, speed_round_mb: float = 0.0,
+    cheap: int = 0, candidates: int = 0, speed_mb: float = 0.0,
 ) -> Budget:
     """size — размер тела probe.url по последней сквозной проверке; без него берётся
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
@@ -84,9 +84,9 @@ def probe_budget(
     spares — запасные, которых скан проверяет загрузкой probe.url; cheap — запасные
     лимитированных подписок, которых он проверяет дешёвым запросом (scan.cheap_url);
     candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK;
-    speed_round_mb — МБ одного раунда замеров скорости (speed_round_mb()); раунд — раз в
-    speed.every_hours (оценка сверху: каждый замер качается целиком)."""
-    speed_bytes = int(speed_round_mb * MB * speed_rounds(cfg))
+    speed_mb — МБ замеров скорости в сутки (speed_daily_mb(); оценка сверху: каждый замер
+    качается целиком, все серверы живы)."""
+    speed_bytes = int(speed_mb * MB)
     measured = bool(size)
     known = size or probe_bytes(cfg.probe.url)
     size = known or DEFAULT_PROBE_BYTES
@@ -157,14 +157,52 @@ def node_entries(
     return members, spares
 
 
-def speed_rounds(cfg: Config) -> float:
-    """Раундов замера скорости в сутки."""
-    return 24 / cfg.speed.every_hours if cfg.speed.sticky and cfg.speed.every_hours else 0
+def speed_note(
+    cfg: Config, *, price: float | None, spare: bool, alive: bool | None,
+    verdict: str | None, record: dict, waiting: bool, deferred: bool,
+) -> str:
+    """Почему у сервера нет цифры скорости — вместо пустого места в панели (issue #1).
+    Пусто — цифра есть. alive — участник отвечает ядру (None — ядро его ещё не
+    проверило), verdict — вердикт последнего скана запасного; waiting — сервер в очереди
+    замера."""
+    if isinstance(record.get("mbps"), (int, float)):
+        return ""
+    if not cfg.speed.sticky:
+        return "скорость не замеряется: основной сервер выключен"
+    if price is not None and price >= SKIP_PRICE:
+        return "скорость серверов x100 не замеряется: они для LTE"
+    if price is not None and not every_hours(cfg, price):
+        key = "unlimited_hours" if price <= 0 else "limited_hours"
+        return f"замер выключен: speed.{key} = 0"
+    if waiting:
+        return "замер отложен: канал занят" if deferred else "в очереди замера"
+    if record.get("error"):
+        return f"замер не удался: {record['error']}"
+    if not spare and alive is False:
+        return "скорость не замеряется: сервер не отвечает"
+    if spare and verdict not in ("OK", "SLOW"):
+        return (
+            "скорость не замеряется: запасной ещё не проверен" if verdict is None
+            else "скорость не замеряется: запасной не прошёл последнюю проверку"
+        )
+    return "ждёт замера"
 
 
-def speed_round_mb(cfg: Config, members: list[dict]) -> float:
-    """МБ одного раунда замеров по участникам: у лимитированных загрузка меньше."""
-    return sum(size_mb(cfg, entry.get("cost", 0.0)) for entry in members)
+def speed_entry_mb(cfg: Config, entry: dict, *, spare: bool = False) -> float:
+    """МБ замеров сервера в сутки: загрузка (у лимитированных и запасных — меньше) раз в
+    срок его класса (speed.every_hours)."""
+    price = entry.get("cost", 0.0)
+    hours = every_hours(cfg, price)
+    if not (cfg.speed.sticky and hours):
+        return 0.0
+    return size_mb(cfg, price, spare=spare) * 24 / hours
+
+
+def speed_daily_mb(cfg: Config, members: list[dict], spares: list[dict]) -> float:
+    """МБ замеров скорости в сутки по участникам и запасным (оценка сверху)."""
+    return sum(speed_entry_mb(cfg, entry) for entry in members) + sum(
+        speed_entry_mb(cfg, entry, spare=True) for entry in spares
+    )
 
 
 def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
@@ -180,15 +218,15 @@ def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
         if price > 0 and entry.get("source"):
             spend[entry["source"]] = spend.get(entry["source"], 0.0) + amount * price
 
-    rounds = speed_rounds(cfg)
     for entry in plan.members:
         # Сквозная проверка идёт через выбранного балансировщиком — делим поровну.
         add(entry, size * 86400 / max(1, interval) + e2e / len(plan.members)
-            + rounds * size_mb(cfg, entry.get("cost", 0.0)) * MB)
+            + speed_entry_mb(cfg, entry) * MB)
     for entry in plan.cheap:
-        add(entry, CHEAP_SCAN_BYTES * scans_per_day)
+        add(entry, CHEAP_SCAN_BYTES * scans_per_day + speed_entry_mb(cfg, entry, spare=True) * MB)
     for entry in plan.candidates:
-        add(entry, CHEAP_SCAN_BYTES * 86400 / RESERVE_RECHECK)
+        add(entry, CHEAP_SCAN_BYTES * 86400 / RESERVE_RECHECK
+            + speed_entry_mb(cfg, entry, spare=True) * MB)
     return {name: int(value) for name, value in spend.items()}
 
 
@@ -291,10 +329,12 @@ def collect_status(
     capture: dict | None = None,
     probe_target: str = "",
     singbox: dict | None = None,
+    speeding: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
     probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает).
-    singbox — состояние второго ядра (daemon._singbox_status)."""
+    singbox — состояние второго ядра (daemon._singbox_status); speeding — очередь и
+    прогресс замеров скорости (daemon.Daemon.speed_progress)."""
     now = time.time()
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
@@ -345,6 +385,16 @@ def collect_status(
 
     reserve = reserve_tag(_load_json_file(paths.xray_config_file))
     main_tag = (main or {}).get("tag") if cfg.speed.sticky else None
+    speeding = speeding or {}
+    speed_queue = set(speeding.get("queue") or ())
+
+    def note(info: NodeInfo, measure: dict, alive: bool | None, verdict: str | None) -> str:
+        return speed_note(
+            cfg, price=price(info.tag)["cost"], spare=info.role == "spare", alive=alive,
+            verdict=verdict, record=measure, waiting=info.probe_tag in speed_queue,
+            deferred=bool(speeding.get("deferred")),
+        )
+
     members, spares = [], []
     for info in view:
         measure = measured(info)
@@ -376,6 +426,8 @@ def collect_status(
                     "speed_mbps": measure.get("mbps"),
                     "speed_error": measure.get("error") or "",
                     "speed_ts": measure.get("ts"),
+                    "speed_busy": bool(measure.get("busy")),
+                    "speed_note": note(info, measure, entry["alive"] if entry else None, None),
                 }
             )
         else:
@@ -399,10 +451,13 @@ def collect_status(
                     "profile": info.profile,
                     "core": profiling.core_of(info.profile),
                     "protocol": protocols.get(info.fingerprint, ""),
-                    # Замер, сделанный, пока сервер был в работе: запасные не замеряются,
-                    # а результат хранится неделю (daemon.SPEED_KEEP).
+                    # Запасные замеряются, как и участники (меньшей загрузкой); результат
+                    # хранится неделю (daemon.SPEED_KEEP).
                     "speed_mbps": measure.get("mbps"),
+                    "speed_error": measure.get("error") or "",
                     "speed_ts": measure.get("ts"),
+                    "speed_busy": bool(measure.get("busy")),
+                    "speed_note": note(info, measure, None, scan["verdict"] if scan else None),
                 }
             )
 
@@ -410,7 +465,7 @@ def collect_status(
     budget = probe_budget(
         cfg, len(members), len(plan.full), probe_size,
         cheap=len(plan.cheap), candidates=len(plan.candidates),
-        speed_round_mb=speed_round_mb(cfg, members),
+        speed_mb=speed_daily_mb(cfg, members, spares),
     )
     spend = quota_spend(cfg, plan, budget.size)
     backup = next((entry for entry in spares if entry["reserve"]), None)
@@ -466,6 +521,8 @@ def collect_status(
         # ведёт; singbox_pending — его конфиг ждёт окна перезапуска (перечитывание рвёт
         # соединения через него).
         "singbox": singbox or {},
+        # Замеры скорости: сколько серверов в этом заходе и сколько уже замерено.
+        "speed": {key: speeding.get(key) for key in ("total", "done", "deferred")},
         "singbox_pending": paths.singbox_pending_file.exists(),
         "events": events,
     }
@@ -724,6 +781,8 @@ def render_capture(capture: dict) -> str:
         text += f" — ИНТЕРФЕЙС TUN НЕ ГОТОВ: {capture['tun_problem']} (sudo xgw net up)"
     elif capture.get("loaded") is False:
         text += " — ПРАВИЛА НЕ ЗАГРУЖЕНЫ (sudo xgw enable)"
+    elif capture.get("lan_problem"):
+        text += f" — НЕТ ИНТЕРНЕТА У УСТРОЙСТВ СЕТИ: {capture['lan_problem']} (sudo xgw diag)"
     return text
 
 

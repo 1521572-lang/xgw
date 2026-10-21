@@ -81,7 +81,8 @@ def phone_state(state: dict) -> dict:
     return {
         "version": state.get("version"), "now": state.get("now"), "state": state.get("state"),
         "action": state.get("action"), "xray": state.get("xray"),
-        "capture": {key: capture.get(key) for key in ("mode", "lifecycle", "lifecycle_reason")},
+        "capture": {key: capture.get(key) for key in (
+            "mode", "lifecycle", "lifecycle_reason", "lan_problem")},
         "power": state.get("power"), "main": state.get("main"), "pin": state.get("pin"),
         "members": members, "spares": len(state.get("spares") or []),
         "sticky": {"on": (state.get("sticky") or {}).get("on")},

@@ -270,16 +270,19 @@ def test_example_config_matches_the_probe_defaults():
 
 def test_speed_defaults_and_limits(tmp_path):
     cfg, warnings = _load_text(tmp_path, "")
-    assert cfg.speed.sticky is True and cfg.speed.max_mb == 10 and cfg.speed.every_hours == 6
+    assert cfg.speed.sticky is True and cfg.speed.max_mb == 10
+    # Безлимитные — раз в час, лимитированные — раз в 6 часов, запасные — по 3 МБ (issue #1,
+    # решение заказчика 21.10.2026).
+    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours, cfg.speed.spare_mb) == (1, 6, 3)
     assert cfg.speed.url.startswith("https://speed.cloudflare.com/__down?bytes=")
     assert cfg.speed.url_fallback.startswith("https://cdn.jsdelivr.net/npm/typescript@5.3.3/")
     assert not [warning for warning in warnings if "speed" in warning]
     cfg, warnings = _load_text(
         tmp_path,
-        '[speed]\nsticky = false\nmax_mb = 500\nmax_seconds = 1\nevery_hours = 0\n'
+        '[speed]\nsticky = false\nmax_mb = 500\nmax_seconds = 1\nunlimited_hours = 0\n'
         'gain_pct = -5\nurl = "ftp://x"\nurl_fallback = ""\n',
     )
-    assert cfg.speed.sticky is False and cfg.speed.every_hours == 0
+    assert cfg.speed.sticky is False and cfg.speed.unlimited_hours == 0
     assert (cfg.speed.max_mb, cfg.speed.max_seconds, cfg.speed.gain_pct) == (10, 8, 30)
     assert cfg.speed.url.startswith("https://speed.cloudflare.com/")
     assert cfg.speed.url_fallback == ""
@@ -287,3 +290,15 @@ def test_speed_defaults_and_limits(tmp_path):
     # Пустой основной адрес — берётся запасной.
     cfg, _warnings = _load_text(tmp_path, '[speed]\nurl = ""\n')
     assert cfg.speed.url.startswith("https://cdn.jsdelivr.net/") and cfg.speed.url_fallback == ""
+
+
+def test_old_speed_every_hours(tmp_path):
+    """speed.every_hours (до 0.1.18) — один срок для серверов в работе. 0 по-прежнему
+    выключает замеры; другое значение больше не действует, и предупреждение это объясняет:
+    в config.toml заказчика стоит every_hours = 6 из прежнего примера."""
+    cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 6\n")
+    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (1, 6)
+    assert any("every_hours = 6 больше не действует" in warning for warning in warnings)
+    cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 0\n")
+    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (0, 0)
+    assert any("замеры скорости выключены" in warning for warning in warnings)

@@ -163,7 +163,15 @@ class Speed:
     url_fallback: str = DEFAULT_SPEED_FALLBACK
     max_mb: int = 10  # замер качает не больше…
     max_seconds: int = 8  # …и не дольше
-    every_hours: int = 6  # 0 — не замерять: основной выбирается по задержке
+    # Как часто замерять каждый живой сервер — в работе и запасной (ASSUMPTIONS п. 224):
+    # безлимитные — раз в unlimited_hours, лимитированные — раз в limited_hours (меньшей
+    # загрузкой, speed.size_mb); 0 — не замерять (основной выбирается по задержке).
+    unlimited_hours: int = 1
+    limited_hours: int = 6
+    spare_mb: int = 3  # запасные качают не больше: их десятки, замер — каждый час
+    # Прежний ключ (до 0.1.18), один срок для серверов в работе: 0 по-прежнему выключает
+    # замеры, другие значения не действуют (-1 — ключа нет).
+    every_hours: int = -1
     gain_pct: int = 30  # сменить основной, только если другой быстрее на столько процентов
     hold_minutes: int = 60  # и основной продержался не меньше
 
@@ -713,7 +721,9 @@ def _validate(cfg: Config) -> list[str]:
 _SPEED_LIMITS = {
     "max_mb": (1, 100),
     "max_seconds": (2, 30),
-    "every_hours": (0, 168),
+    "unlimited_hours": (0, 168),
+    "limited_hours": (0, 168),
+    "spare_mb": (1, 100),
     "gain_pct": (0, 1000),
     "hold_minutes": (0, 1440),
 }
@@ -738,6 +748,19 @@ def _validate_speed(speed: Speed) -> list[str]:
         setattr(speed, name, value)
     if not speed.url:
         speed.url, speed.url_fallback = speed.url_fallback, ""
+    if speed.every_hours == 0:
+        speed.unlimited_hours = speed.limited_hours = 0
+        warnings.append(
+            "speed.every_hours = 0: замеры скорости выключены; теперь это ключи "
+            "speed.unlimited_hours и speed.limited_hours"
+        )
+    elif speed.every_hours != -1:
+        warnings.append(
+            f"speed.every_hours = {speed.every_hours} больше не действует: безлимитные серверы "
+            f"замеряются раз в speed.unlimited_hours ({speed.unlimited_hours} ч), "
+            f"лимитированные — раз в speed.limited_hours ({speed.limited_hours} ч); строку "
+            "можно удалить"
+        )
     return warnings
 
 

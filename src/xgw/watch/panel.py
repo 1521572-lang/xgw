@@ -462,6 +462,8 @@ class Panel:
                     # Основной сервер и последний замер скорости (watch/speed.py).
                     main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
                     speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
+                    speed_busy=bool(entry.get("speed_busy")),
+                    speed_note=entry.get("speed_note") or "",
                     fragment=bool(entry.get("fragment")),
                     profile=entry.get("profile") or "", core=entry.get("core") or "",
                 )
@@ -470,6 +472,9 @@ class Panel:
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
                     speed_mbps=entry.get("speed_mbps"), speed_ts=entry.get("speed_ts"),
+                    speed_error=entry.get("speed_error") or "",
+                    speed_busy=bool(entry.get("speed_busy")),
+                    speed_note=entry.get("speed_note") or "",
                     fragment=bool(entry.get("fragment")),
                     profile=entry.get("profile") or "", core=entry.get("core") or "",
                 )
@@ -515,6 +520,8 @@ class Panel:
         lifecycle = {
             "lifecycle": written.get("lifecycle") or "",
             "lifecycle_reason": written.get("lifecycle_reason") or "",
+            # Пакеты устройств сети не доходят до Xray (Capture.lan_path) — причина.
+            "lan_problem": written.get("lan_problem") or "",
         }
 
         quotas, errors = snapshot.get("quota") or {}, snapshot.get("sub_errors") or {}
@@ -584,7 +591,8 @@ class Panel:
             "sticky": {
                 "on": cfg.speed.sticky,
                 # Замеры скорости: 0 — выключены, основной выбирается по задержке.
-                "every_hours": cfg.speed.every_hours,
+                "unlimited_hours": cfg.speed.unlimited_hours,
+                "limited_hours": cfg.speed.limited_hours,
                 "gain_pct": cfg.speed.gain_pct,
                 "hold_minutes": cfg.speed.hold_minutes,
             },
@@ -614,6 +622,8 @@ class Panel:
                 "scan": bool(daemon is not None and daemon.scan_pending),
                 "speed": bool(daemon is not None and daemon.speed_pending),
             },
+            # Прогресс замеров скорости: сколько из скольких (демон пишет в status.json).
+            "speed_progress": snapshot.get("speed") or {},
         }
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
@@ -1294,10 +1304,14 @@ class Panel:
             if name == "speed":
                 if not cfg.speed.sticky:
                     return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
-                if not cfg.speed.every_hours:
-                    return actions.Outcome(2, "замер скорости выключен: speed.every_hours = 0")
+                if not (cfg.speed.unlimited_hours or cfg.speed.limited_hours):
+                    return actions.Outcome(
+                        2, "замер скорости выключен: speed.unlimited_hours и limited_hours = 0"
+                    )
                 self.daemon.request_speed()
-                return actions.Outcome(0, "Замеряю скорость серверов в работе…")
+                return actions.Outcome(
+                    0, "Замеряю скорость всех живых серверов — в работе и запасных…"
+                )
             if name == "refresh":
                 if not engine.has_sources(cfg):
                     return actions.Outcome(2, "обновлять нечего: подписок нет")

@@ -131,6 +131,7 @@ class Diag:
             ("Xray", self._xray),
             ("Ядро", self._kernel),
             ("TUN", self._tun),
+            ("Путь LAN", self._lan_path),
             ("Файрвол", self._firewall),
             ("NetworkManager", self._nm),
             ("Подсеть LAN", self._lan_subnet_conflict),
@@ -437,6 +438,29 @@ class Diag:
                 ))
                 break
         return result
+
+    def _lan_path(self) -> list[Check]:
+        """Помеченный пакет клиента LAN доставляется в TPROXY: `ip route get <внешний адрес>
+        from <адрес LAN> iif <LAN> mark <mark_proxy>` должен дать local. Ловит весь класс
+        «пакеты LAN гибнут после перехвата» — и когда в сети ещё нет ни одного клиента."""
+        if not self.installed:
+            return []
+        capture = Capture(
+            self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
+        )
+        rules = capture.rules("on")
+        if capture.mode() != "on" or not (rules.capture_lan and rules.lan_if):
+            return []
+        problem = capture.lan_path()
+        if problem:
+            return [Check(
+                "Путь LAN", FAIL, problem,
+                "sudo xgw net up — загрузит маршрут throw для подсети LAN; не помогло — "
+                "sudo sysctl -w net.ipv4.conf.all.src_valid_mark=0 и пришлите вывод xgw diag",
+            )]
+        return [Check(
+            "Путь LAN", OK, f"пакеты устройств сети {rules.lan_if} доходят до Xray (TPROXY)"
+        )]
 
     def _firewall(self) -> list[Check]:
         if not self.root or self.which("nft") is None:
@@ -902,12 +926,15 @@ class Diag:
             budget = status.probe_budget(
                 self.cfg, members, len(plan.full), size,
                 cheap=len(plan.cheap), candidates=len(plan.candidates),
-                speed_round_mb=status.speed_round_mb(self.cfg, plan.members),
+                speed_mb=status.speed_daily_mb(
+                    self.cfg, plan.members, [*plan.full, *plan.cheap, *plan.candidates]
+                ),
             )
             spend = status.quota_spend(self.cfg, plan, budget.size)
         else:
             budget = status.probe_budget(
-                self.cfg, members, spares, size, speed_round_mb=members * self.cfg.speed.max_mb
+                self.cfg, members, spares, size,
+                speed_mb=status.speed_daily_mb(self.cfg, [{}] * members, [{}] * spares),
             )
         month = budget.everything * status.MONTH_DAYS / status.GB
         text = (

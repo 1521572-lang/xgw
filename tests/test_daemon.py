@@ -833,6 +833,8 @@ class FakeCapture:
         self.problem = ""  # какого inbound'а нет в применённом конфиге Xray
         self.blocked = False  # при problem: hold = "block" — трафик заблокирован
         self.tun_issue = ""  # что не так с интерфейсом TUN
+        self.lan_issue = ""  # пакеты устройств сети не доходят до Xray (Capture.lan_path)
+        self.lan_fixed_by_up = True  # загрузка правил заново это чинит
 
     def mode(self):
         return self.state
@@ -847,6 +849,8 @@ class FakeCapture:
             raise RuntimeError("nft: программа не найдена")
         self.is_loaded = True
         self.tun_issue = ""
+        if self.lan_fixed_by_up:
+            self.lan_issue = ""
         return self.state
 
     def tun_problem(self):
@@ -876,6 +880,10 @@ class FakeCapture:
     def inbound_problem(self):
         self.calls.append("problem?")
         return self.problem
+
+    def lan_path(self):
+        self.calls.append("lan?")
+        return self.lan_issue
 
 
 @pytest.fixture()
@@ -921,6 +929,37 @@ def test_daemon_names_the_tun_without_an_address(guarded):
         for event in daemon.events()
     )
     assert not any("загружены заново" in event for event in daemon.events())
+
+
+def test_daemon_repairs_lan_path(guarded):
+    """Issue #1: правила на месте, а пакеты устройств сети гибнут до Xray — демон загружает
+    правила заново (маршрут throw) в том же шаге и пишет событие без уведомления."""
+    daemon, capture = guarded
+    capture.lan_issue = "пакеты устройств сети lan0 не доходят до Xray"
+    daemon.tick()
+    assert capture.actions() == ["up"]
+    assert any("интернет в сети снова есть" in event for event in daemon.events())
+    assert daemon.status()["capture"]["lan_problem"] == ""
+    assert daemon.status()["capture"]["lifecycle"] == "connected"
+
+
+def test_daemon_reports_dead_lan_path(guarded):
+    """Загрузка заново не помогла: событие с уведомлением — одно на причину, причина в
+    статусе (панель и `xgw status` не показывают «всё в порядке»), перехват — «закрыт»."""
+    daemon, capture = guarded
+    problem = "пакеты устройств сети lan0 не доходят до Xray: ядро их отбрасывает"
+    capture.lan_issue, capture.lan_fixed_by_up = problem, False
+    for _ in range(3):
+        daemon.tick()
+    alerts = [event for event in daemon.events() if "нет интернета у устройств сети" in event]
+    assert len(alerts) == 1 and problem in alerts[0]
+    snapshot = daemon.status()["capture"]
+    assert snapshot["lan_problem"] == problem
+    assert snapshot["lifecycle"] == "blocked" and snapshot["lifecycle_reason"] == problem
+    capture.lan_issue = ""
+    daemon.tick()
+    assert any("снова выходят в интернет" in event for event in daemon.events())
+    assert daemon.status()["capture"]["lan_problem"] == ""
 
 
 def test_rules_failure_is_reported_once(guarded):
