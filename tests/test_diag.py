@@ -450,6 +450,32 @@ def test_tun_of_the_containers_is_checked_with_its_address(box, tmp_path, monkey
     assert capture.up() == "on" and [c.level for c in box.diag()._tun()] == [OK]
 
 
+def test_lan_path_fails_when_lan_packets_die(box):
+    """Issue #1: пакеты устройств сети гибли до Xray (src_valid_mark = 1), а diag и панель
+    говорили, что всё в порядке. Строка «Путь LAN» ловит это и без клиентов в сети."""
+    from xgw.net import sysctl
+    from xgw.net.capture import Capture
+
+    proc = box.paths.root / "proc" / "sys"
+    (proc / "net/ipv4/conf/all").mkdir(parents=True)
+    (proc / "net/ipv4/ip_forward").write_text("0\n", encoding="ascii")
+    (proc / sysctl.SRC_VALID_MARK).write_text("1\n", encoding="ascii")
+    box.kwargs.update(proc_sys=proc)
+    assert box.diag()._lan_path() == []  # не установлен — проверять нечего
+    box.installed()
+    fakexray.write(box.paths)
+    kernel = box.system.kernel
+    kernel.lan_links["lan0"], kernel.src_valid_mark = True, True
+    capture = Capture(box.cfg, box.paths, runner=box.system, proc_sys=proc)
+    assert capture.enable() == "on"
+    ok = box.diag()._lan_path()
+    assert [c.level for c in ok] == [OK] and "доходят до Xray" in ok[0].text
+    kernel.routes(100)[:] = [r for r in kernel.routes(100) if r.get("type") != "throw"]
+    broken = box.diag()._lan_path()
+    assert [c.level for c in broken] == [FAIL] and "src_valid_mark = 1" in broken[0].text
+    assert broken[0].advice.startswith("sudo xgw net up")
+
+
 def test_budget_uses_known_nodes(box):
     assert box.diag()._budget()[0].level == OK  # 5 участников по умолчанию — ~944 МБ
     box.cfg.filters.max_members = 8
@@ -556,9 +582,9 @@ def test_budget_check_shows_the_month_and_the_measured_probe(box):
     """Расход на проверки — в сутки и в месяц, от измеренного размера пробы."""
     (check,) = box.diag()._budget()
     assert check.level == OK and "~830 МБ в сутки при 5 участниках" in check.text
-    # Замер скорости основного сервера (0.1.9) — сверху: 5 серверов × 10 МБ × 4 раза в сутки.
-    assert "сквозной проверкой и замером скорости — ~1279 МБ в сутки" in check.text
-    assert "~38 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
+    # Замеры скорости — сверху: 5 безлимитных серверов × 10 МБ × 24 раза в сутки (issue #1).
+    assert "сквозной проверкой и замером скорости — ~2279 МБ в сутки" in check.text
+    assert "~68 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
     store = Store(box.paths.db_file)
     status.remember_probe_size(store, box.cfg.probe.url, 87_533)
     store.set_meta("quota", json.dumps({"main": {"total": 100 * 10**9}}))

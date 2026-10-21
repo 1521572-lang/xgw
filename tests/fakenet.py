@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 
 from xgw.net.cmd import CommandError
@@ -29,6 +30,11 @@ class FakeKernel:
         self.forbidden = False  # запуск не от root: nft ничего не показывает
         self.refuse_ip6 = False  # таблицу ip6 ядро не принимает (IPv6 в ядре нет)
         self.loads: list[str] = []  # тексты принятых транзакций `nft -f -`
+        # Интерфейсы LAN (имя → поднят ли) для `ip -j link show dev`; и включена ли
+        # проверка источника с учётом метки (net.ipv4.conf.all.src_valid_mark): тогда
+        # `ip route get … iif LAN mark …` без маршрута throw для подсети отвечает ошибкой.
+        self.lan_links: dict[str, bool] = {}
+        self.src_valid_mark = False
 
     def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         argv = list(argv)
@@ -120,6 +126,15 @@ class FakeKernel:
             return json.dumps(routes)
         verb, body = body[0], body[1:]
         metric = int(body[body.index("metric") + 1]) if "metric" in body else 0
+        if body[0] == "throw":
+            route = {"type": "throw", "dst": body[1]}
+            if verb == "del":
+                if route not in routes:
+                    raise CommandError(f"{command}: RTNETLINK answers: No such process")
+                routes.remove(route)
+            elif route not in routes:
+                routes.append(route)
+            return ""
         if body[0] == "local":
             assert ("::/0" if family == 6 else "0.0.0.0/0") in body, f"не то семейство: {command}"
             route = {"type": "local", "dst": "default", "dev": "lo", "scope": "host"}
@@ -142,7 +157,9 @@ class FakeKernel:
             return ""
         # replace: ключ маршрута в таблице — приемник (везде default) и метрика, а тип в ключ
         # не входит; поэтому local-маршрут и маршрут в TUN с метрикой 0 заменяют друг друга.
-        routes[:] = [r for r in routes if r.get("metric", 0) != metric]
+        routes[:] = [
+            r for r in routes if r.get("metric", 0) != metric or r.get("type") == "throw"
+        ]
         routes.append(route)
         return ""
 
@@ -166,8 +183,35 @@ class FakeKernel:
                 return ""
         raise CommandError(f"{command}: RTNETLINK answers: No such file or directory")
 
+    def _route_get(self, argv: list[str], command: str) -> str:
+        """ip -j route get АДРЕС from ИСТОЧНИК iif LAN mark M: local (в TPROXY), если
+        проверка источника не мешает."""
+        words = argv[4:]
+        source = words[words.index("from") + 1]
+        iif = words[words.index("iif") + 1]
+        if iif not in self.lan_links:
+            raise CommandError(f'{command}: Cannot find device "{iif}"')
+        throws = [
+            route["dst"] for routes in self.route_tables.values() for route in routes
+            if route.get("type") == "throw"
+        ]
+        covered = any(
+            ipaddress.ip_address(source) in ipaddress.ip_network(net) for net in throws
+        )
+        if not self.lan_links[iif] or (self.src_valid_mark and not covered):
+            raise CommandError(f"{command}: RTNETLINK answers: Invalid argument")
+        return json.dumps([{"type": "local", "dst": words[0], "dev": "lo", "table": "100"}])
+
     def _ip(self, argv: list[str], command: str, family: int) -> str:
         rules = self.rules6 if family == 6 else self.rules
+        if argv[:4] == ["ip", "-j", "route", "get"]:
+            return self._route_get(argv, command)
+        if argv[:5] == ["ip", "-j", "link", "show", "dev"]:
+            name = argv[5]
+            if name not in self.lan_links:
+                raise CommandError(f'{command}: Device "{name}" does not exist.')
+            flags = ["BROADCAST", "MULTICAST", *(["UP"] if self.lan_links[name] else [])]
+            return json.dumps([{"ifname": name, "flags": flags}])
         if argv[:3] == ["ip", "-j", "rule"]:
             system = [{"priority": 0, "src": "all", "table": "local"},
                       {"priority": 32766, "src": "all", "table": "main"}]

@@ -5,6 +5,16 @@ TPROXY — пакеты доставляются локально, чтобы и
 
     ip rule add fwmark <mark_proxy> lookup <route_table> pref 100
     ip route add local 0.0.0.0/0 dev lo table <route_table>
+    ip route add throw <подсеть LAN> table <route_table>
+
+Маршрут throw для подсети LAN нужен проверке источника. Когда включён
+net.ipv4.conf.all.src_valid_mark (его ставит, например, tailscaled), ядро проверяет
+адрес источника входящего пакета с учётом метки: ищет обратный маршрут к клиенту LAN в
+той же таблице, а там — только local 0.0.0.0/0. Источник выглядит «своим» адресом, пришедшим
+не с lo, и пакет молча отбрасывается до TPROXY: устройства LAN без интернета, а машина и
+контейнеры (у них другие пути) работают (ASSUMPTIONS, п. 223). throw отправляет поиск
+дальше по правилам — в main, где клиент LAN за своим интерфейсом. Пакеты к самой подсети
+LAN перехват не помечает (частные сети идут мимо Xray), так что прямой путь он не меняет.
 
 TUN (capture.method = "tun") — пакеты самой машины уходят в TUN-интерфейс, который
 читает Xray. Нужна отдельная таблица: помеченные пакеты LAN по-прежнему должны
@@ -88,6 +98,11 @@ def _is_local(route: dict, family: int) -> bool:
     return route.get("type") == "local" and _default(route, family) and route.get("dev") == "lo"
 
 
+def _throws(routes: list[dict]) -> set[str]:
+    """Подсети маршрутов throw в таблице."""
+    return {str(route.get("dst")) for route in routes if route.get("type") == "throw"}
+
+
 def _is_blackhole(route: dict, family: int) -> bool:
     return route.get("type") == "blackhole" and _default(route, family)
 
@@ -118,14 +133,23 @@ def has_rule(
 # --- TPROXY: локальная доставка ------------------------------------------------
 
 
-def present(mark: int, table: int, runner: Runner, family: int = 4) -> bool:
-    return bool(_rules(mark, table, runner, family)) and any(
-        _is_local(route, family) for route in _routes(table, runner, family)
+def present(
+    mark: int, table: int, runner: Runner, family: int = 4, throws: tuple[str, ...] = ()
+) -> bool:
+    """Правило, локальный маршрут и ровно те маршруты throw, что нужны (throws)."""
+    routes = _routes(table, runner, family)
+    return (
+        bool(_rules(mark, table, runner, family))
+        and any(_is_local(route, family) for route in routes)
+        and _throws(routes) == set(throws)
     )
 
 
-def ensure(mark: int, table: int, runner: Runner, family: int = 4) -> None:
-    """Правило и маршрут есть ровно в одном экземпляре."""
+def ensure(
+    mark: int, table: int, runner: Runner, family: int = 4, throws: tuple[str, ...] = ()
+) -> None:
+    """Правило и маршрут есть ровно в одном экземпляре; маршруты throw — ровно для
+    подсетей throws (лишние убираются: подсеть LAN сменили)."""
     ip = _ip(family)
     existing = _rules(mark, table, runner, family)
     for _extra in existing[1:]:
@@ -133,14 +157,24 @@ def ensure(mark: int, table: int, runner: Runner, family: int = 4) -> None:
     if not existing:
         runner([*ip, "rule", "add", "fwmark", str(mark), "lookup", str(table), "pref", str(PREF)])
     runner([*ip, "route", "replace", "local", ANYWHERE[family], "dev", "lo", "table", str(table)])
+    have = _throws(_routes(table, runner, family))
+    for network in throws:
+        if network not in have:
+            runner([*ip, "route", "replace", "throw", network, "table", str(table)])
+    for network in sorted(have - set(throws)):
+        runner([*ip, "route", "del", "throw", network, "table", str(table)])
 
 
 def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
-    """Убирает правило (все экземпляры) и маршрут; отсутствующее — не ошибка."""
+    """Убирает правило (все экземпляры), локальный маршрут и маршруты throw;
+    отсутствующее — не ошибка."""
     ip = _ip(family)
     _del_rules(mark, table, runner, family, None)
-    if any(_is_local(route, family) for route in _routes(table, runner, family)):
+    routes = _routes(table, runner, family)
+    if any(_is_local(route, family) for route in routes):
         runner([*ip, "route", "del", "local", ANYWHERE[family], "dev", "lo", "table", str(table)])
+    for network in sorted(_throws(routes)):
+        runner([*ip, "route", "del", "throw", network, "table", str(table)])
 
 
 # --- TUN: маршрут в интерфейс --------------------------------------------------

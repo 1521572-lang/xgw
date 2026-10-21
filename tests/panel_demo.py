@@ -164,6 +164,11 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
                 "speed_mbps": measure["mbps"] if measure else None,
                 "speed_error": measure["error"] if measure else "",
                 "speed_ts": now - 2 * 3600 if measure else None,
+                # Почему цифры нет — как status.speed_note.
+                "speed_note": "" if measure and measure["mbps"] is not None else (
+                    f"замер не удался: {measure['error']}" if measure
+                    else "скорость не замеряется: сервер не отвечает" if not live["alive"]
+                    else "в очереди замера"),
             })
         else:
             verdict = live["verdict"]
@@ -175,7 +180,11 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
                 "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
                 "fragment": fingerprint == FRAGMENT_FP,
                 "speed_mbps": measure["mbps"] if measure else None,
-                "speed_ts": now - 26 * 3600 if measure else None,
+                "speed_ts": now - 40 * 60 if measure else None,
+                "speed_note": "" if measure else (
+                    "в очереди замера" if verdict in ("OK", "SLOW")
+                    else "скорость не замеряется: запасной ещё не проверен" if verdict is None
+                    else "скорость не замеряется: запасной не прошёл последнюю проверку"),
             })
     state, action = "DEGRADED", "часть серверов недоступна — замена на запасные"
     if scene == "empty":
@@ -208,7 +217,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
     budget = status.probe_budget(
         probe_cfg, len(members), len(spares),
-        speed_round_mb=status.speed_round_mb(probe_cfg, members),
+        speed_mb=status.speed_daily_mb(probe_cfg, members, spares),
     )
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,

@@ -33,6 +33,7 @@ TITLES = {
     "PROBE_TARGET_UNREACHABLE": "не отвечает адрес проверки серверов (probe.url)",
     "probe": "адрес проверки серверов",
     "capture": "перехват трафика",
+    "lan": "нет интернета у устройств сети",
     "rotation": "замена сервера",
     "rollback": "откат конфига Xray",
     "apply": "применение конфига",
@@ -46,7 +47,7 @@ TITLES = {
     "reserve": "резервный сервер",
     "main": "основной сервер",
 }
-_URGENT = frozenset({"ALL_DEAD", "XRAY_DOWN", "LEAK", "leak", "capture", "rollback"})
+_URGENT = frozenset({"ALL_DEAD", "XRAY_DOWN", "LEAK", "leak", "capture", "lan", "rollback"})
 
 
 def title(kind: str) -> str:

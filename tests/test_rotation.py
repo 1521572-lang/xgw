@@ -133,3 +133,30 @@ def test_rotation_survives_rebuild():
                        probe_password="p" * 32,
                        probe_ports={i.probe_tag: i.probe_port for i in first.nodes}).nodes
     }
+
+
+def test_rotation_keeps_the_country_and_takes_the_faster():
+    """Замена мёртвому участнику — той же страны из другой подписки (подписку целиком могли
+    заблокировать), потом той же страны; среди равных — быстрее по замеру скорости."""
+    cfg = Config()
+    members = [_info("proxy-de-1111", "a")]
+    spares = [(_info("spare-nl-3333", "c", "spare"), _node("33333333", "NL")),
+              (_info("spare-de-4444", "d", "spare"), _node("44444444", "DE-1")),
+              (_info("spare-de-5555", "e", "spare"), _node("55555555", "DE-2")),
+              (_info("spare-de-6666", "f", "spare"), _node("66666666", "DE-3"))]
+    for _spare, node in spares:
+        node.country = "NL" if node.name == "NL" else "DE"
+        node.source = "b" if node.name in ("DE-2", "DE-3") else "a"
+    common = dict(
+        alive={"proxy-de-1111": False}, dead_since={"proxy-de-1111": 1000.0},
+        scans={tag: "OK" for tag in ("spare-nl-3333", "spare-de-4444", "spare-de-5555",
+                                     "spare-de-6666")},
+        scan_seconds={"spare-nl-3333": 0.5, "spare-de-4444": 1.0, "spare-de-5555": 2.0,
+                      "spare-de-6666": 3.0},
+        members=members, spares=spares, cfg=cfg, now=1000.0 + 16 * 60,
+        origins={"a": ("DE", "a")},
+    )
+    rotation = plan_rotation(**common, speeds={"55555555": 20.0, "66666666": 80.0})
+    assert rotation is not None and rotation.replacements[0][1].name == "DE-3"
+    # Без замеров — по времени скана, но страна та же и подписка другая.
+    assert plan_rotation(**common).replacements[0][1].name == "DE-2"

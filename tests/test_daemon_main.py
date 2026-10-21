@@ -46,6 +46,9 @@ def _make(paths: Paths, source=None) -> Harness:
     instance = Harness(_config(), paths)
     instance.api = StickyApi()
     instance.source = source or _free_inventory()
+    # Запасные (и участники без своей цифры) медленные: основной выбирается из участников.
+    # Перевод быстрого запасного в работу — в своих тестах.
+    instance.default_speed = 5.0
     return instance
 
 
@@ -77,54 +80,68 @@ def _step(daemon: Harness, seconds: float = 20.0) -> State:
     return daemon.tick()
 
 
+def _settle(daemon: Harness, seconds: float = 20.0) -> None:
+    """Шаги, пока очередь замеров не опустеет: фоновый замер — один сервер за шаг."""
+    for _ in range(30):
+        _step(daemon, seconds)
+        if not daemon.speed_queue:
+            return
+    raise AssertionError(f"очередь замеров не опустела: {list(daemon.speed_queue)}")
+
+
 def _main_events(daemon: Harness) -> list[str]:
     return [event for event in daemon.events() if event.startswith("main:")]
 
 
-def test_main_is_pinned_and_switched_to_the_fastest_after_the_first_round(daemon):
-    """Сначала основной — по задержке (замеров ещё нет), после раунда замеров — самый
-    быстрый; выбор по задержке держится без срока удержания."""
+def test_main_is_the_fastest_and_every_live_server_is_measured_hourly(daemon):
+    """Issue #1: замеряются все живые серверы — участники и запасные, каждый раз в
+    speed.unlimited_hours, а не раунд по участникам раз в 6 часов. Основной — самый быстрый
+    по замеру, сразу; между замерами смен нет."""
     first, second = _start(daemon)
     daemon.speeds = {first: 30.0, second: 90.0}
     daemon.observatory[second]["delay"] = 0.2  # по задержке лучше первый
     _step(daemon)
+    # Фоновый замер — один сервер за шаг (шаг watchdog не затягивается), участники первыми.
+    # Пока второй не замерен, выбор основного предварительный.
+    assert daemon.measured == [first]
     assert daemon.main["tag"] == first and daemon.main["basis"] == "delay"
-    assert daemon.api.state.override == first
-    assert daemon.measured == [first]  # один замер за шаг
     _step(daemon)
-    assert sorted(daemon.measured) == sorted([first, second])
+    assert daemon.measured == [first, second]
     assert daemon.main["tag"] == second and daemon.main["basis"] == "speed"
     assert daemon.api.state.override == second
-    events = _main_events(daemon)
-    assert any("по задержке" in event for event in events)
-    assert any("сменён" in event and "90 Мбит/с" in event and "30 Мбит/с" in event
-               for event in events)
-    # Дальше — ни замеров, ни смен: следующий раунд через speed.every_hours.
+    _settle(daemon)
+    spares = daemon.tags("spare")
+    assert spares and set(spares) <= set(daemon.measured)  # и запасные
+    assert any("остальные ещё замеряются" in event for event in _main_events(daemon))
+    measured = len(daemon.measured)
     for _ in range(10):
         _step(daemon)
-    assert len(daemon.measured) == 2 and daemon.api.state.override == second
+    assert len(daemon.measured) == measured  # замеры свежие — до срока не повторяются
+    daemon.t += 3600
+    _settle(daemon)
+    assert {first, second, *spares} <= set(daemon.measured[measured:])
     assert daemon.api.calls.count(("pin", second)) == 1  # закреплено один раз
 
 
 def test_main_is_not_changed_for_a_small_gain_or_before_the_hold(daemon):
     first, second = _start(daemon)
-    daemon.observatory[second]["delay"] = 0.2  # по задержке лучше первый
-    daemon.speeds = {first: 50.0, second: 60.0}  # быстрее на 20 % — меньше gain_pct
-    for _ in range(3):
-        _step(daemon)
+    daemon.speeds = {first: 60.0, second: 50.0}
+    _settle(daemon)
     assert daemon.main["tag"] == first and daemon.main["basis"] == "speed"
-    # Через 10 минут второй стал быстрее вдвое, но основной держится меньше hold_minutes.
-    daemon.speeds = {first: 50.0, second: 100.0}
+    # Через 10 минут второй быстрее на 17 % — меньше gain_pct.
+    daemon.speeds = {first: 60.0, second: 70.0}
     daemon.t += 600
     daemon.request_speed()
-    for _ in range(3):
-        _step(daemon)
+    _step(daemon)
     assert daemon.main["tag"] == first
-    # Через час — уже можно.
-    daemon.t += 3600
+    # Второй стал быстрее вдвое, но основной держится меньше hold_minutes.
+    daemon.speeds = {first: 60.0, second: 120.0}
     daemon.request_speed()
-    for _ in range(3):
-        _step(daemon)
+    _step(daemon)
+    assert daemon.main["tag"] == first
+    # Через час — уже можно (замер по расписанию, без кнопки).
+    daemon.t += 3600
+    _settle(daemon)
     assert daemon.main["tag"] == second and daemon.api.state.override == second
 
 
@@ -184,7 +201,7 @@ def test_manual_pin_wins_and_the_main_returns_after_it(daemon):
 
 
 def test_speed_is_measured_while_a_server_is_pinned_by_hand(daemon):
-    """Ручной выбор бессрочный (кнопка «Выбрать»): основной не выбирается, но участники
+    """Ручной выбор бессрочный (кнопка «Выбрать»): основной не выбирается, но серверы
     замеряются по расписанию и по кнопке — иначе строки серверов остались бы без скорости."""
     first, second = _start(daemon)
     daemon.speeds = {first: 30.0, second: 90.0}
@@ -192,24 +209,25 @@ def test_speed_is_measured_while_a_server_is_pinned_by_hand(daemon):
     daemon.api.state = BalancerInfo(override=first, selects=())
     for _ in range(3):
         _step(daemon)
-    assert sorted(daemon.measured) == sorted([first, second])
+    assert {first, second} <= set(daemon.measured)
     assert daemon.main is None and daemon.api.state.override == first
     assert ("pin", second) not in daemon.api.calls  # закрепление ручное, его не трогают
+    measured = len(daemon.measured)
     daemon.request_speed()
-    for _ in range(3):
-        _step(daemon)
-    assert len(daemon.measured) == 4 and not daemon.speed_pending
+    _step(daemon)
+    assert {first, second} <= set(daemon.measured[measured:]) and not daemon.speed_pending
+    measured = len(daemon.measured)
     # Выбор сняли — основной сразу по замерам, сделанным при выборе, а не по задержке.
     daemon.store.set_meta("pin", "")
     daemon.api.unpin("balancer")
     _step(daemon)
     assert daemon.main["tag"] == second and daemon.main["basis"] == "speed"
-    assert daemon.api.state.override == second and len(daemon.measured) == 4
+    assert daemon.api.state.override == second and len(daemon.measured) == measured
 
 
 def test_round_finished_during_a_pin_moves_the_main_when_the_pin_ends(daemon):
-    """Раунд прошёл при ручном выборе и другой оказался заметно быстрее — основной меняется
-    на первом же шаге после снятия выбора, а не через speed.every_hours."""
+    """Замеры прошли при ручном выборе и другой оказался заметно быстрее — основной
+    меняется на первом же шаге после снятия выбора."""
     first, second = _start(daemon)
     daemon.speeds = {first: 90.0, second: 30.0}
     for _ in range(3):
@@ -220,14 +238,12 @@ def test_round_finished_during_a_pin_moves_the_main_when_the_pin_ends(daemon):
     daemon.api.state = BalancerInfo(override=second, selects=())
     daemon.speeds = {first: 30.0, second: 90.0}
     daemon.request_speed()
-    for _ in range(3):
-        _step(daemon)
-    assert len(daemon.measured) == 4 and not daemon.speed_pending
+    _step(daemon)
+    assert not daemon.speed_pending
     assert daemon.main["tag"] == first and daemon.api.state.override == second
     daemon.t = until + 1
     daemon.tick()
     assert daemon.main["tag"] == second and daemon.api.state.override == second
-    assert len(daemon.measured) == 4
     assert any("сменён" in event and "90 Мбит/с" in event for event in _main_events(daemon))
 
 
@@ -261,15 +277,22 @@ def test_main_is_released_when_no_member_answers(daemon):
 
 
 def test_limited_servers_are_measured(paths):
-    """Лимитированные x1 замеряются, как безлимитные: основной — по скорости."""
+    """Лимитированные x1 замеряются, как безлимитные, но раз в speed.limited_hours."""
     daemon = _make(paths, source=_inventory())  # подписка с лимитом трафика
     try:
         first, second = _start(daemon)
         daemon.speeds = {first: 30.0, second: 90.0}
-        for _ in range(4):
-            _step(daemon)
-        assert sorted(daemon.measured) == sorted([first, second])
+        _settle(daemon)
+        assert {first, second} <= set(daemon.measured)
         assert daemon.main["tag"] == second and daemon.main["basis"] == "speed"
+        measured = len(daemon.measured)
+        daemon.t += 3600 * 2  # безлимитных было бы пора замерить, лимитированных — нет
+        _step(daemon)
+        _step(daemon)
+        assert len(daemon.measured) == measured
+        daemon.t += 3600 * 4
+        _settle(daemon)
+        assert {first, second} <= set(daemon.measured[measured:])
     finally:
         daemon.store.close()
 
@@ -293,14 +316,53 @@ def test_x100_servers_are_not_measured(paths):
         daemon.store.close()
 
 
-def test_speed_test_waits_while_the_channel_is_busy(daemon):
+def _busy_step(daemon: Harness, seconds: float = 20.0) -> None:
+    """Шаг, за который через серверы прошло ~1 МБ/с чужого трафика: канал занят."""
+    daemon.traffic += int(seconds * 1_000_000)
+    _step(daemon, seconds)
+
+
+def test_speed_test_waits_while_the_channel_is_busy_but_not_for_ever(daemon):
+    """Issue #1: на домашнем шлюзе канал занят почти всегда, и замеры не проходили вовсе.
+    Фоновый замер ждёт свободного канала не дольше SPEED_FORCE_AFTER (час), а потом
+    проходит с пометкой «канал был занят»."""
     daemon.traffic = 0
-    _start(daemon)
-    daemon.traffic += 10_000_000  # 10 МБ за шаг — через серверы кто-то качает
-    _step(daemon)
+    first, second = _start(daemon)
+    _busy_step(daemon)
     assert daemon.measured == [] and daemon.main is not None  # основной есть и без замера
+    for _ in range(10):
+        _busy_step(daemon, 300)  # 50 минут занятого канала
+    assert daemon.measured == []
+    assert daemon.status()["speed"]["deferred"] is True
+    member = next(m for m in daemon.status()["members"] if m["tag"] == first)
+    assert member["speed_note"] == "замер отложен: канал занят"
+    _busy_step(daemon, 900)
+    for _ in range(5):  # по одному серверу за шаг; шаг скана запасных замер пропускает
+        if {first, second} <= set(daemon.measured):
+            break
+        _busy_step(daemon)
+    assert {first, second} <= set(daemon.measured)
+    record = daemon._speeds()[next(i.fingerprint for i in daemon.view() if i.tag == first)]
+    assert record["busy"] is True
+
+
+def test_speed_button_does_not_wait_for_the_channel(daemon):
+    """Замер по кнопке — сразу, и при занятом канале; прогресс «N из M» виден в статусе."""
+    daemon.traffic = 0
+    first, second = _start(daemon)
+    _busy_step(daemon)
+    assert daemon.measured == []
+    daemon.request_speed()
+    _busy_step(daemon)
+    everyone = {first, second, *daemon.tags("spare")}
+    assert everyone <= set(daemon.measured) and not daemon.speed_pending
+
+
+def test_free_channel_is_measured_at_once(daemon):
+    daemon.traffic = 0
+    first, _second = _start(daemon)
     _step(daemon)  # канал свободен
-    assert len(daemon.measured) == 1
+    assert daemon.measured[0] == first
 
 
 def test_main_survives_a_daemon_restart(paths):
@@ -360,6 +422,7 @@ def test_measurement_cut_by_a_stop_is_not_recorded(daemon):
     неудача сервера: в базу он не попадает, сервер снова в очереди."""
     first, _second = _start(daemon)
     stop = threading.Event()
+    before = json.loads(daemon.store.get_meta("speed") or "{}")
 
     def cut(info, password):
         daemon.measured.append(info.tag)
@@ -371,7 +434,7 @@ def test_measurement_cut_by_a_stop_is_not_recorded(daemon):
     daemon.run(stop)
     daemon.store = Store(daemon.paths.db_file)
     assert daemon.measured == [first]
-    assert json.loads(daemon.store.get_meta("speed") or "{}") == {}
+    assert json.loads(daemon.store.get_meta("speed") or "{}") == before
     assert next(i.probe_tag for i in daemon.view() if i.tag == first) in daemon.speed_queue
 
 
@@ -416,3 +479,47 @@ def test_servers_of_unknown_price_are_not_measured(daemon):
     for _ in range(3):
         _step(daemon)
     assert daemon.measured == [] and daemon.main is not None
+
+
+def test_faster_spare_is_promoted_and_becomes_the_main(daemon):
+    """Самый живой сервер может лежать в запасных (issue #1): запасной быстрее основного на
+    gain_pct — после hold_minutes он встаёт в работу вместо слабейшего участника (не
+    основного) и, проверенный ядром, становится основным."""
+    first, second = _start(daemon)
+    fast = daemon.tags("spare")[0]
+    fingerprint = next(i.fingerprint for i in daemon.view() if i.tag == fast)
+    daemon.speeds = {first: 60.0, second: 30.0, fast: 200.0}
+    _settle(daemon)
+    assert daemon.main["tag"] == first  # основной держится hold_minutes
+    daemon.t += 3600
+    for _ in range(30):
+        _step(daemon)
+        if fingerprint in {i.fingerprint for i in daemon.view() if i.role == "proxy"}:
+            break
+    members = {i.fingerprint: i.tag for i in daemon.view() if i.role == "proxy"}
+    assert fingerprint in members and second not in daemon.tags("proxy")
+    assert daemon.main["tag"] == first  # ядро новый участник ещё не проверило
+    assert any("встаёт в работу вместо" in event for event in _main_events(daemon))
+    daemon.set_alive()
+    daemon.speeds[members[fingerprint]] = 200.0
+    _step(daemon)
+    assert daemon.main["tag"] == members[fingerprint]
+    assert daemon.api.state.override == members[fingerprint]
+    assert any("из запасных быстрее" in event for event in _main_events(daemon))
+
+
+def test_main_is_replaced_by_the_same_country(daemon):
+    """Основной отказал: замена ищется той же страны (страна и подписка отказавшего — в
+    записи об основном), и событие это называет."""
+    first, second = _start(daemon)
+    daemon.speeds = {first: 90.0, second: 30.0}
+    _step(daemon)
+    assert daemon.main["tag"] == first
+    country = daemon._node(next(i for i in daemon.view() if i.tag == second)).country
+    assert country
+    daemon._set_main(daemon._candidate(next(i for i in daemon.view() if i.tag == first), {}))
+    daemon.main = {**daemon.main, "country": country, "source": "другая"}
+    daemon.set_alive(**{first.replace("-", "_"): False})
+    _step(daemon)
+    assert daemon.main["tag"] == second
+    assert any("той же страны" in event for event in _main_events(daemon))

@@ -414,6 +414,7 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
     if capture.configured:
         written = snapshot.get("capture") or {}
         snapshot["capture"] = capture.describe()
+        snapshot["capture"]["lan_problem"] = capture.lan_path()
         if not down:
             # Жизненный цикл перехвата знает только демон (по итогам своего шага).
             for key in ("lifecycle", "lifecycle_reason"):

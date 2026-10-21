@@ -1,4 +1,4 @@
-"""Замер скорости серверов в работе и выбор основного сервера (0.1.9).
+"""Замер скорости серверов и выбор основного сервера (0.1.9; все серверы — 0.1.18).
 
 Ядро само (leastPing) берёт сервер с наименьшей задержкой и меняет выбор после каждой
 пробы, если задержки близки (ASSUMPTIONS, п. 49): адрес выхода скачет каждые 30 с, сайты
@@ -14,6 +14,12 @@
 speed.max_seconds; скорость считается по телу ответа, без рукопожатий туннеля и TLS.
 Лимитированные серверы замеряются меньшей загрузкой (size_mb): 10 МБ через сервер x10 —
 это 100 МБ квоты.
+
+Замеряются все живые серверы, не только в работе (ASSUMPTIONS п. 224): безлимитные — раз в
+speed.unlimited_hours, лимитированные — раз в speed.limited_hours (every_hours). Иначе
+самый живой сервер мог годами лежать в запасных, а основной выбирался бы из нескольких
+участников, которых ТСПУ может отрезать в любой момент. Запасные качают меньше
+(speed.spare_mb): их десятки.
 """
 
 from __future__ import annotations
@@ -43,15 +49,26 @@ class SpeedResult:
     error: str = ""
 
 
-def size_mb(cfg: Config, price: float) -> float:
+def size_mb(cfg: Config, price: float, *, spare: bool = False) -> float:
     """Сколько МБ качать при замере сервера стоимостью price (cost.py: 0 — безлимитный).
     Квоты на замер лимитированного уходит не больше speed.max_mb: x10 — 1 МБ загрузки
-    (10 МБ квоты), но загрузка не короче LIMITED_MIN_MB. 0 — сервер не замеряется."""
+    (10 МБ квоты), но загрузка не короче LIMITED_MIN_MB. Запасной качает не больше
+    speed.spare_mb. 0 — сервер не замеряется."""
     if price >= SKIP_PRICE:
         return 0.0
+    base = float(min(cfg.speed.max_mb, cfg.speed.spare_mb) if spare else cfg.speed.max_mb)
     if price <= 1.0:
-        return float(cfg.speed.max_mb)
-    return max(min(LIMITED_MIN_MB, cfg.speed.max_mb), cfg.speed.max_mb / price)
+        return base
+    return max(min(LIMITED_MIN_MB, base), base / price)
+
+
+def every_hours(cfg: Config, price: float) -> int:
+    """Как часто замерять сервер стоимостью price: безлимитный — раз в
+    speed.unlimited_hours, лимитированный — раз в speed.limited_hours; 0 — не замерять
+    (x100 и дороже либо замеры выключены)."""
+    if price >= SKIP_PRICE:
+        return 0
+    return cfg.speed.unlimited_hours if price <= 0 else cfg.speed.limited_hours
 
 
 def measure(
@@ -97,6 +114,9 @@ class Candidate:
     name: str = ""
     mbps: float | None = None  # свежий удачный замер; None — замера нет или он не удался
     delay_ms: float | None = None  # задержка по пробам ядра
+    country: str = ""  # страна сервера (по подписке) и подписка — для замены без прыжков
+    source: str = ""
+    spare: bool = False  # запасной: основным станет, только встав в работу
 
 
 def best(candidates: list[Candidate]) -> Candidate | None:
@@ -107,6 +127,19 @@ def best(candidates: list[Candidate]) -> Candidate | None:
         item.mbps is None, -(item.mbps or 0.0),
         item.delay_ms is None, item.delay_ms or 0.0, item.tag,
     ))
+
+
+def best_like(candidates: list[Candidate], country: str, source: str) -> Candidate | None:
+    """Замена отказавшему основному: лучший той же страны из другой подписки, иначе той
+    же страны, иначе просто лучший — чтобы адрес выхода не прыгал по странам (подписка
+    отказавшего могла попасть под блокировку целиком)."""
+    if country:
+        same = [item for item in candidates if item.country == country]
+        other = [item for item in same if item.source != source]
+        for group in (other, same):
+            if group:
+                return best(group)
+    return best(candidates)
 
 
 def faster(rival: Candidate, main: Candidate, gain_pct: int) -> bool:

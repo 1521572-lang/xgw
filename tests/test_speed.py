@@ -131,6 +131,18 @@ def test_limited_servers_download_less():
     assert speed.size_mb(cfg, 100.0) == 0  # x100 — серверы для LTE, не замеряются
 
 
+def test_spares_download_less_and_classes_have_their_own_period():
+    """Issue #1: запасные замеряются тоже — меньшей загрузкой (speed.spare_mb, их десятки);
+    безлимитные — раз в speed.unlimited_hours, лимитированные — раз в limited_hours."""
+    cfg = Config()  # max_mb = 10, spare_mb = 3
+    assert speed.size_mb(cfg, 0.0, spare=True) == 3 and speed.size_mb(cfg, 10.0, spare=True) == 1
+    assert speed.size_mb(cfg, 100.0, spare=True) == 0
+    assert speed.every_hours(cfg, 0.0) == 1 and speed.every_hours(cfg, 1.0) == 6
+    assert speed.every_hours(cfg, 100.0) == 0
+    cfg.speed.unlimited_hours = 0
+    assert speed.every_hours(cfg, 0.0) == 0 and speed.every_hours(cfg, 10.0) == 6
+
+
 def test_measure_falls_back_when_the_main_address_refuses(origin):
     server = origin(3 * MB)
     node = SimpleNamespace(probe_port=server.port)
@@ -202,3 +214,16 @@ def test_outbound_downlinks_are_per_server_in_work():
     }}}
     assert outbound_downlinks(metrics) == {"proxy-a": 3000205}
     assert outbound_downlinks({}) == {} and outbound_downlinks({"stats": None}) == {}
+
+
+def test_replacement_keeps_the_country():
+    """Замена отказавшему основному: той же страны из другой подписки, потом той же страны
+    (даже медленнее), и только потом — лучший вообще."""
+    def item(tag, mbps, country, source):
+        return speed.Candidate(tag=tag, key=tag, mbps=mbps, country=country, source=source)
+
+    pool = [item("nl", 200, "NL", "a"), item("de-a", 40, "DE", "a"), item("de-b", 30, "DE", "b")]
+    assert speed.best_like(pool, "DE", "a").tag == "de-b"
+    assert speed.best_like(pool[:2], "DE", "a").tag == "de-a"
+    assert speed.best_like(pool, "FR", "a").tag == "nl"
+    assert speed.best_like(pool, "", "").tag == "nl"

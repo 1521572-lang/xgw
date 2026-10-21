@@ -29,6 +29,11 @@ xgw-net.service (_prepare_tun). Без интерфейса маршрут ко�
 правила загружает xgw-net.service. Временное снятие (open) — метка в /run.
 Все операции идемпотентны и идут под файловой блокировкой.
 
+Путь LAN (lan_path): помеченный пакет клиента LAN должен доставляться локально, в TPROXY.
+Так бывает не всегда — например, при net.ipv4.conf.all.src_valid_mark = 1 без маршрута throw
+для подсети LAN (iprule.py) ядро молча отбрасывает такие пакеты, а машина и контейнеры при
+этом работают. Демон проверяет это на каждом шаге (`ip route get … iif <LAN> mark …`).
+
 Tailscale (Т1): исключения для tailscaled в правилах есть, только пока он работает
 (tailscale.present). Он запустился или остановился — правила уже не те (loaded), и демон
 загружает их заново. При tailscale.route = "vpn" демон отмечает в /run, что Xray не
@@ -58,6 +63,8 @@ class CaptureError(Exception):
 # IPv4 и IPv6 и TUN для трафика самой машины.
 TPROXY_TAG = "tproxy-in"
 TPROXY6_TAG = "tproxy-in6"
+# Куда «идёт» пакет проверки пути LAN: любой внешний адрес (ip route get его не трогает).
+LAN_PROBE_TARGET = "1.1.1.1"
 TUN_TAG = "tun-in"
 CAPTURE_TAGS = (TPROXY_TAG, TPROXY6_TAG, TUN_TAG)
 
@@ -221,6 +228,14 @@ class Capture:
     def _families(self) -> tuple[int, ...]:
         return (4, 6) if self.ipv6_usable() else (4,)
 
+    def _throws(self, rules: nft.Rules, family: int) -> tuple[str, ...]:
+        """Подсети, для которых в таблице TPROXY нужен маршрут throw: подсеть LAN, пока её
+        трафик перехватывается (iprule.py: проверка источника с учётом метки)."""
+        gateway = lan.gateway(self.cfg)
+        if family != 4 or not (rules.capture_lan and rules.lan_if) or gateway is None:
+            return ()
+        return (str(gateway.network),)
+
     @staticmethod
     def _wanted(rules: nft.Rules, family: int) -> tuple[bool, bool]:
         """(локальная доставка для TPROXY, маршрут в TUN) для семейства адресов."""
@@ -242,7 +257,10 @@ class Capture:
         for family in self._families():
             tproxy, via_tun = self._wanted(rules, family)
             if tproxy:
-                iprule.ensure(cap.mark_proxy, cap.route_table, self.runner, family)
+                iprule.ensure(
+                    cap.mark_proxy, cap.route_table, self.runner, family,
+                    self._throws(rules, family),
+                )
             if via_tun:
                 iprule.ensure_tun(
                     cap.mark_proxy, cap.tun_route_table, self.runner, family, rules.tun_name
@@ -697,7 +715,8 @@ class Capture:
             for family in self._families():
                 tproxy, via_tun = self._wanted(rules, family)
                 if tproxy and not iprule.present(
-                    cap.mark_proxy, cap.route_table, self.runner, family
+                    cap.mark_proxy, cap.route_table, self.runner, family,
+                    self._throws(rules, family),
                 ):
                     return False
                 if via_tun and not iprule.present_tun(
@@ -762,6 +781,52 @@ class Capture:
         if text6 is None:
             return None
         return self._ts_loaded(rules, text6, rules.ts6, rules.ts6)
+
+    def lan_path(self) -> str:
+        """Доходит ли помеченный пакет клиента LAN до TPROXY: '' — да (или проверять нечего:
+        LAN не перехватывается, перехват не включён, интерфейс LAN выключен); иначе —
+        причина для журнала, панели и `xgw diag`."""
+        if self.mode() != "on":
+            return ""
+        rules = self.rules("on")
+        gateway = lan.gateway(self.cfg)
+        if not (rules.capture_lan and rules.lan_if and rules.tproxy) or gateway is None:
+            return ""
+        try:
+            links = json.loads(self.runner(["ip", "-j", "link", "show", "dev", rules.lan_if]))
+        except (cmd.CommandError, json.JSONDecodeError):
+            return ""  # интерфейса нет — об этом говорят другие проверки
+        if not links or "UP" not in (links[0].get("flags") or []):
+            return ""  # интерфейс выключен: ядро отвечает на проверку ошибкой и без сбоя
+        host = next(
+            (str(item) for item in gateway.network.hosts() if item != gateway.ip), ""
+        )
+        if not host:
+            return ""
+        argv = ["ip", "-j", "route", "get", LAN_PROBE_TARGET, "from", host,
+                "iif", rules.lan_if, "mark", str(self.cfg.capture.mark_proxy)]
+        try:
+            routes = json.loads(self.runner(argv) or "[]")
+        except cmd.CommandError as exc:
+            mark = sysctl.read(sysctl.SRC_VALID_MARK, self.proc_sys)
+            why = (
+                f" (net.ipv4.conf.all.src_valid_mark = {mark}: ядро проверяет источник с "
+                "учётом метки)" if mark == "1" else ""
+            )
+            return (
+                f"пакеты устройств сети {rules.lan_if} не доходят до Xray: ядро их "
+                f"отбрасывает{why} — {str(exc).strip().splitlines()[-1]}"
+            )
+        except json.JSONDecodeError:
+            return ""
+        route = routes[0] if routes and isinstance(routes[0], dict) else {}
+        if route.get("type") == "local":
+            return ""
+        where = route.get("dev") or "?"
+        return (
+            f"пакеты устройств сети {rules.lan_if} не доходят до Xray: ядро ведёт их "
+            f"{route.get('type') or 'unicast'} через {where}, а не в TPROXY"
+        )
 
     def describe(self, *, check: bool = True) -> dict:
         """Сведения для `xgw status`."""
