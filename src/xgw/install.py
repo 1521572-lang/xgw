@@ -277,6 +277,8 @@ class Installer:
         self.nm = nm.Nm(runner)
         self.capture = Capture(cfg, paths, runner=runner, logger=self.log, proc_sys=proc_sys)
         self.warnings: list[str] = []
+        # Файл Xray заменён поверх прежнего: работающее ядро — ещё на старом (п. 226).
+        self.xray_replaced = False
 
     # --- что известно о машине --------------------------------------------------
 
@@ -635,6 +637,7 @@ class Installer:
                 f"Xray не загружен: {exc}. Можно положить xray, geoip.dat и geosite.dat в "
                 f"{self.paths.xray_dir} вручную и запустить установку снова"
             ) from exc
+        self.xray_replaced = facts.xray_version is not None
         self._step(f"Xray-core {tag} — {self.paths.xray_dir}")
 
     def _singbox(self, facts: Facts) -> None:
@@ -925,7 +928,14 @@ class Installer:
             return self._xray_answers(applier, 0.0)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, inventory.quotas)
-        if outcome.mode == "unchanged" and not self._xray_answers(applier, 0.0):
+        if self.xray_replaced and outcome.mode in ("api", "unchanged"):
+            # Установка поверх работающего шлюза положила новую версию Xray (os.replace), а
+            # процесс работает на прежнем файле: без перезапуска шлюз остался бы на старой
+            # версии до перезагрузки машины (п. 226).
+            with contextlib.suppress(XrayServiceError):
+                applier.service.restart()
+            self._step("Xray перезапущен на новой версии")
+        elif outcome.mode == "unchanged" and not self._xray_answers(applier, 0.0):
             with contextlib.suppress(XrayServiceError):
                 applier.service.restart()
         members = sum(1 for info in assembly.result.nodes if info.role == "proxy")

@@ -526,9 +526,9 @@ direct_servers = {direct_dns}
 bootstrap = ["udp://{self.inet_ip}:{self.dns_port}"]
 
 [xray]
-# Стенд проверяет тот Xray, что дан в XGW_XRAY_BIN (XGW работает только с 26.10.10):
+# Стенд проверяет тот Xray, что дан в XGW_XRAY_BIN (XGW работает только с 26.10.21):
 # установка на «одноразовой машине» его не меняет (сети там нет).
-version = "26.10.10"
+version = "26.10.21"
 api_port = {self.ports['api']}
 metrics_port = {self.ports['metrics']}
 socks_port = {self.ports['socks']}

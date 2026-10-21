@@ -92,7 +92,7 @@ def test_download_release_verifies_and_installs(tmp_path, monkeypatch):
         bundle.writestr("geoip.dat", b"geo")
     payload = archive.getvalue()
     release = {
-        "tag_name": "v26.10.10",
+        "tag_name": "v26.10.21",
         "assets": [
             {"name": name, "browser_download_url": f"https://github.example/{name}"}
             for name in ("Xray-linux-64.zip", "Xray-linux-64.zip.dgst")
@@ -101,7 +101,7 @@ def test_download_release_verifies_and_installs(tmp_path, monkeypatch):
     digest = {"value": hashlib.sha256(payload).hexdigest()}
 
     def fake_fetch(url, **_kwargs):
-        if url.endswith("/tags/v26.10.10"):  # RELEASES_API в тестах подменён (conftest)
+        if url.endswith("/tags/v26.10.21"):  # RELEASES_API в тестах подменён (conftest)
             body = json.dumps(release).encode()
         elif url.endswith(".dgst"):
             body = f"SHA2-256= {digest['value']}\n".encode()
@@ -114,8 +114,8 @@ def test_download_release_verifies_and_installs(tmp_path, monkeypatch):
     dest = tmp_path / "xray"
     dest.mkdir()
     (dest / "xray").write_bytes(b"old-binary")
-    tag, path = binary.download_release(dest, "26.10.10")
-    assert tag == "v26.10.10" and path == dest / "xray"
+    tag, path = binary.download_release(dest, "26.10.21")
+    assert tag == "v26.10.21" and path == dest / "xray"
     assert path.read_bytes() == b"#!new-binary"
     # временных каталогов и архива после установки не остаётся
     assert sorted(item.name for item in dest.iterdir()) == ["geoip.dat", "xray"]
@@ -123,29 +123,29 @@ def test_download_release_verifies_and_installs(tmp_path, monkeypatch):
     digest["value"] = "0" * 64  # .dgst не сходится — рабочий бинарник остаётся на месте
     path.write_bytes(b"current")
     with pytest.raises(binary.BinaryError, match="SHA-256"):
-        binary.download_release(dest, "26.10.10")
+        binary.download_release(dest, "26.10.21")
     assert path.read_bytes() == b"current"
 
     release["tag_name"] = "v25.6.8"  # в этой версии ещё нет httpMethod
     with pytest.raises(binary.BinaryError, match="ниже требуемой"):
-        binary.download_release(dest, "26.10.10")
+        binary.download_release(dest, "26.10.21")
 
 
 def test_release_is_asked_by_its_version_never_as_latest(monkeypatch):
     """«Последний» релиз на GitHub — старый стабильный 26.3.27, а XGW работает только с
-    26.10.10: запрос — всегда по тегу версии, «latest» не принимается."""
+    26.10.21: запрос — всегда по тегу версии, «latest» не принимается."""
     asked: list[str] = []
 
     def fake_fetch(url, **_kwargs):
         asked.append(url)
-        body = json.dumps({"tag_name": "v26.10.10", "assets": [
+        body = json.dumps({"tag_name": "v26.10.21", "assets": [
             {"name": "Xray-linux-64.zip", "browser_download_url": "https://github.example/x"},
         ]}).encode()
         return fetch.FetchResult(status=200, headers={}, body=body, url=url)
 
     monkeypatch.setattr(binary.fetch, "fetch_url", fake_fetch)
-    assert binary.get_release("26.10.10").tag == "v26.10.10"
-    assert asked == [f"{binary.RELEASES_API}/tags/v26.10.10"]
+    assert binary.get_release("26.10.21").tag == "v26.10.21"
+    assert asked == [f"{binary.RELEASES_API}/tags/v26.10.21"]
     for wrong in ("latest", "", "новая"):
         with pytest.raises(binary.BinaryError, match="цифрами"):
             binary.get_release(wrong)
