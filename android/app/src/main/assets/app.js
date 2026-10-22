@@ -7,6 +7,7 @@
   const POLL_MS = 6000; // API шлюза принимает до 30 запросов в минуту с телефона
   const VPN_MS = 1500; // состояние VPN телефона — из самого приложения, без сети
   const FRESH_MS = 3600 * 1000; // список серверов старше часа — обновить при открытии
+  const RETRY_MS = 60 * 1000; // список старого вида при включённом VPN — пробовать раз в минуту
   const $ = (id) => document.getElementById(id);
 
   const STATES = {
@@ -29,6 +30,9 @@
   let dialogYes = null;
   let vpnTimer = 0;
   let vpnBusy = false;
+  let fetching = null; // обновление списка серверов, которое идёт сейчас (Promise)
+  let fetchProblem = ""; // почему список не обновился в последний раз
+  let fetchTried = 0;
 
   // --- мост к MainActivity ---------------------------------------------------
 
@@ -50,8 +54,17 @@
   function problem(reply, pairing) {
     if (reply.status === 200) return "";
     if (reply.status === 0) {
-      return `Нет связи со шлюзом${reply.error ? ` (${reply.error})` : ""}. Если на телефоне включён `
-        + "другой VPN, выключите его: через VPN шлюз недоступен.";
+      const error = reply.error ? ` (${reply.error})` : "";
+      // VPN XGW включён: приложение пробовало напрямую и через свой Xray — совет выключить
+      // «другой VPN» тут ложный (испытание А3.1).
+      const v = vpnInfo();
+      if (v.state === "on") {
+        return `Нет связи со шлюзом${error}.` + (v.config && v.config.outdated
+          ? " В списке серверов VPN телефона ещё нет запасного пути пульта: приложение обновит "
+            + "список, как только шлюз ответит (например, по мобильной сети)." : "");
+      }
+      return `Нет связи со шлюзом${error}. Если на телефоне включён другой VPN, выключите его: `
+        + "через VPN шлюз недоступен.";
     }
     if (reply.status === 403 && pairing) {
       return "Код не подошёл: он действует 10 минут и один раз. Нажмите «Привязать телефон» в "
@@ -400,7 +413,8 @@
     if (v.state === "on") {
       [tone, title] = ["ok", "VPN телефона включён"];
       sub = `${list}. Tailscale на телефоне в это время не работает: Android держит один VPN`
-        + (v.path === "vpn" ? ". Пульт ходит к шлюзу через VPN телефона" : "");
+        + (v.path === "vpn" ? `. Пульт ходит к шлюзу через VPN телефона${v.direct_error
+          ? ` (напрямую не вышло: ${v.direct_error})` : ""}` : "");
     }
     else if (v.state === "starting") [tone, title, sub] = ["warn", "VPN телефона включается…", v.detail || list];
     const running = v.state === "on" || v.state === "starting";
@@ -408,20 +422,36 @@
     $("vpn-title").textContent = title;
     $("vpn-sub").textContent = sub;
     say("vpn-error", v.state === "error" ? v.detail : "");
+    // Список, полученный до А3.1, — без входа пульта: VPN на нём работает, пульт по Wi-Fi — нет.
+    say("vpn-old", v.config && v.config.outdated
+      ? "Список серверов старого вида: в нём нет запасного пути пульта через VPN телефона. "
+        + (fetching ? "Обновляю…"
+          : `Приложение обновит его, как только шлюз ответит${fetchProblem ? ` (сейчас: ${fetchProblem})` : ""}.`)
+      : "");
     const button = $("vpn-power");
     button.textContent = vpnBusy ? "Подождите…" : running ? "Выключить VPN телефона" : "Включить VPN телефона";
     button.className = `btn wide ${running ? "danger-line" : "primary"}`;
     button.dataset.on = String(running);
     button.disabled = vpnBusy;
-    $("vpn-fetch").disabled = vpnBusy;
+    $("vpn-fetch").disabled = vpnBusy || Boolean(fetching);
+    $("vpn-fetch").textContent = fetching ? "Обновляю…" : "Обновить серверы";
     $("vpn-notes").hidden = !running || v.notes;
+    return v;
+  }
+
+  // Пока VPN включён на списке старого вида — раз в минуту пробовать взять новый: по мобильной
+  // сети шлюз отвечает и напрямую, а новый список сам перезапускает Xray телефона.
+  function vpnTick() {
+    const v = renderVpn();
+    if (v.state === "on" && v.config && v.config.outdated && !fetching
+      && Date.now() - fetchTried > RETRY_MS) fetchServers();
   }
 
   function watchVpn() {
     clearInterval(vpnTimer);
     vpnTimer = 0;
     renderVpn();
-    if (!document.hidden && !$("gateway").hidden) vpnTimer = setInterval(renderVpn, VPN_MS);
+    if (!document.hidden && !$("gateway").hidden) vpnTimer = setInterval(vpnTick, VPN_MS);
   }
 
   async function vpnPower() {
@@ -432,24 +462,43 @@
     }
     vpnBusy = true;
     renderVpn();
+    // Список старого вида — сначала обновить: пока VPN XGW не включён, Tailscale телефона ещё
+    // работает, и шлюз обычно отвечает. Не вышло — VPN включается на прежнем списке.
+    if (fetching) await fetching;
+    const saved = vpnInfo().config;
+    let old = "";
+    if (saved && saved.outdated && !(await fetchServers()).ok) old = fetchProblem;
     const result = await bridge("vpnStart");
     vpnBusy = false;
     renderVpn();
     if (!result.ok) toast(result.status === 200 || !("status" in result) ? result.error : problem(result, false), true);
+    else if (old) {
+      toast(`VPN включается на прежнем списке серверов, без запасного пути пульта: обновить не удалось (${old})`, true);
+    }
   }
 
-  async function vpnFetch(quiet) {
-    if (vpnBusy) return;
-    vpnBusy = true;
-    renderVpn();
-    const result = await bridge("vpnFetch");
-    vpnBusy = false;
-    renderVpn();
-    if (result.ok) {
-      if (!quiet) toast(`Список серверов обновлён: ${result.servers}`);
-    } else if (!quiet) {
-      toast(result.status === 200 ? result.error : problem(result, false), true);
+  // Список серверов со шлюза — в фоне: кнопку VPN не занимает (в испытании А3.1 нажатие
+  // пришлось на «Подождите…» тихого обновления при открытии). Обновление идёт одно за раз.
+  function fetchServers() {
+    if (!fetching) {
+      fetchTried = Date.now();
+      fetching = bridge("vpnFetch").then((result) => {
+        fetching = null;
+        fetchProblem = result.ok ? "" : result.status === 200 ? result.error
+          : result.status === 0 ? `нет связи со шлюзом${result.error ? `: ${result.error}` : ""}`
+            : problem(result, false);
+        renderVpn();
+        return result;
+      });
+      renderVpn();
     }
+    return fetching;
+  }
+
+  async function vpnFetch() {
+    const result = await fetchServers();
+    if (result.ok) toast(`Список серверов обновлён: ${result.servers}`);
+    else toast(result.status === 200 ? result.error : problem(result, false), true);
   }
 
   // --- запуск ----------------------------------------------------------------------
@@ -469,7 +518,7 @@
     load();
     watchVpn();
     const v = vpnInfo();
-    if (!v.config || Date.now() - v.config.time > FRESH_MS) vpnFetch(true);
+    if (!v.config || v.config.outdated || Date.now() - v.config.time > FRESH_MS) fetchServers();
   }
 
   $("scan").addEventListener("click", scan);
@@ -495,7 +544,7 @@
   $("speed").addEventListener("click", () => act("speed", {}));
   $("vpn-power").addEventListener("click", vpnPower);
   $("vpn-notes").addEventListener("click", () => window.XGW.notesSettings());
-  $("vpn-fetch").addEventListener("click", () => vpnFetch(false));
+  $("vpn-fetch").addEventListener("click", vpnFetch);
   $("vpn-always").addEventListener("click", () => ask(
     "VPN всегда",
     "В настройках Android выберите XGW и включите «Постоянная VPN»: телефон сам включит VPN "

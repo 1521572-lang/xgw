@@ -1,6 +1,7 @@
 package net.xgw.android
 
 import java.io.IOException
+import java.net.ConnectException
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -91,6 +92,9 @@ class Gateway(private val url: String) {
 
         /** Каким путём шлюз ответил последним: "direct", "vpn" или "" — ещё не отвечал. */
         @Volatile var path = ""
+
+        /** Почему не открылся прямой путь, когда шлюз ответил через VPN телефона, — для карточки. */
+        @Volatile var directError = ""
     }
 
     fun hello(): Reply = send("GET", "/api/hello", ByteArray(0), emptyMap())
@@ -113,19 +117,22 @@ class Gateway(private val url: String) {
         ))
     }
 
-    /** Напрямую; не вышло, а VPN телефона включён — через него. Сработавший путь пробуется первым. */
+    /** Напрямую; не вышло, а VPN телефона включён — через него. Сработавший путь пробуется первым.
+     * Не ответил ни один — в ошибке оба пути: в испытании А3.1 была видна только последняя. */
     private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
         if (XgwVpn.state != "on") return attempt(null, method, path, body, headers).also { remember(it, "direct") }
         val order = if (Gateway.path == "vpn") listOf(viaVpn, null) else listOf(null, viaVpn)
-        var reply = Reply(0, "", "")
+        val errors = HashMap<Proxy?, String>()
         for (proxy in order) {
-            reply = attempt(proxy, method, path, body, headers)
+            val reply = attempt(proxy, method, path, body, headers)
             if (reply.status != 0) {
                 remember(reply, if (proxy == null) "direct" else "vpn")
+                if (proxy == null) directError = "" else errors[null]?.let { directError = it }
                 return reply
             }
+            errors[proxy] = reply.error
         }
-        return reply
+        return Reply(0, "", "напрямую — ${errors[null]}; через VPN телефона — ${errors[viaVpn]}")
     }
 
     private fun remember(reply: Reply, how: String) {
@@ -155,7 +162,9 @@ class Gateway(private val url: String) {
             val text = stream?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
             Reply(status, text)
         } catch (exc: IOException) {
-            Reply(0, "", exc.message ?: exc.javaClass.simpleName)
+            // Не открылся сам вход pult-in: Xray телефона не запущен или конфиг без этого входа.
+            val text = if (proxy != null && exc is ConnectException) "вход пульта в Xray телефона не отвечает" else null
+            Reply(0, "", text ?: exc.message ?: exc.javaClass.simpleName)
         } finally {
             connection.disconnect()
         }

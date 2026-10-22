@@ -312,6 +312,7 @@ class MainActivity : Activity() {
             .put("config", xray.info() ?: JSONObject.NULL)
             .put("notes", notesAllowed() && getSystemService(NotificationManager::class.java).areNotificationsEnabled())
             .put("path", Gateway.path)
+            .put("direct_error", Gateway.directError)
             .toString()
 
         /** Настройки уведомлений XGW: включить скрытое уведомление «VPN XGW». */

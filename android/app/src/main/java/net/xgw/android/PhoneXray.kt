@@ -27,11 +27,16 @@ class PhoneXray(private val context: Context) {
         "TMPDIR=${context.cacheDir.path}",
     )
 
-    /** Сведения о сохранённом конфиге: время получения, серверы; null — конфига нет. */
-    fun info(): JSONObject? = if (!config.isFile) null else try {
-        JSONObject(meta.readText())
-    } catch (exc: Exception) {
-        JSONObject()
+    /** Сведения о сохранённом конфиге: время получения, серверы, `outdated` — конфиг старого
+     * вида, без входа pult-in; null — конфига нет. */
+    fun info(): JSONObject? {
+        if (!config.isFile) return null
+        val info = try {
+            JSONObject(meta.readText())
+        } catch (exc: Exception) {
+            JSONObject()
+        }
+        return info.put("outdated", !info.optBoolean("pult"))
     }
 
     /** geoip.dat и geosite.dat из APK — рядом с конфигом (правила «geoip:private», «geoip:ru»…);
@@ -67,8 +72,16 @@ class PhoneXray(private val context: Context) {
         if (!part.renameTo(config)) return "конфиг не сохранён"
         val servers = body.optJSONArray("servers")?.length() ?: 0
         meta.writeText(JSONObject().put("time", System.currentTimeMillis()).put("servers", servers)
-            .put("gateway", body.optString("version")).toString())
+            .put("gateway", body.optString("version")).put("pult", hasPult(text)).toString())
         return ""
+    }
+
+    /** Есть ли в конфиге вход pult-in — запасной путь пульта через VPN телефона (ASSUMPTIONS
+     * п. 229). В конфиге, полученном до А3.1, его нет: в испытании А3.1 VPN включился на таком,
+     * и пульт по Wi-Fi остался без связи («Failed to connect to /127.0.0.1:17821»). */
+    private fun hasPult(text: String): Boolean {
+        val inbounds = JSONObject(text).optJSONArray("inbounds") ?: return false
+        return (0 until inbounds.length()).any { inbounds.optJSONObject(it)?.optString("tag") == PULT_TAG }
     }
 
     /** `xray run -test`: дескриптор TUN проверке не нужен — ProcessBuilder годится. */
@@ -98,6 +111,7 @@ class PhoneXray(private val context: Context) {
     }
 
     private companion object {
+        const val PULT_TAG = "pult-in" // generator/phone.py
         val ERROR_MARKS = listOf("[Error]", "panic:", "fatal error", "failed to start")
         val STAMP = Regex("""^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(\.\d+)? """)
     }
