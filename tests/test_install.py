@@ -10,7 +10,7 @@ import pytest
 from fakesys import FakeSystem
 
 from xgw import config, managed
-from xgw.install import UNIT_FILES, Installer, Journal
+from xgw.install import UNIT_FILES, Facts, Installer, Journal
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
 from xgw.paths import Paths
@@ -1033,3 +1033,48 @@ def test_network_units_are_sandboxed(unit, writable, caps):
     assert {"AF_NETLINK", "AF_INET", "AF_INET6", "AF_UNIX"} <= set(families)
     # TUN (capture.method = "tun") открывает /dev/net/tun — у правил устройства не скрыты.
     assert ("PrivateDevices" in settings) == (unit == "xgw-dhcp.service")
+
+
+@pytest.mark.parametrize(("replaced", "mode", "restarts"), [
+    (True, "unchanged", 1), (True, "api", 1), (True, "restart", 0),
+    (False, "unchanged", 0), (False, "api", 0),
+])
+def test_reinstall_restarts_xray_when_its_file_was_replaced(
+    box, monkeypatch, replaced, mode, restarts,
+):
+    """Установка поверх работающего шлюза кладёт новую версию Xray переименованием, и
+    процесс остаётся на прежнем файле. Конфиг не поменялся (или поменялся через API) —
+    Xray перезапускается, иначе шлюз работал бы на старой версии (п. 226). Перезапуск
+    ради нового конфига уже был — второго нет."""
+    from types import SimpleNamespace
+
+    from xgw.install import engine as install_engine
+
+    restarted: list[bool] = []
+    applier = SimpleNamespace(
+        service=SimpleNamespace(restart=lambda: restarted.append(True)),
+        api=SimpleNamespace(balancer_info=lambda tag: {}),
+    )
+    assembly = SimpleNamespace(result=SimpleNamespace(nodes=[]))
+    monkeypatch.setattr(install_engine, "bypass_mark", lambda cfg, log: None)
+    monkeypatch.setattr(install_engine, "make_applier", lambda *args: applier)
+    monkeypatch.setattr(install_engine, "collect", lambda *args, **kwargs: SimpleNamespace(
+        quotas={}))
+    monkeypatch.setattr(install_engine, "assemble", lambda *args, **kwargs: assembly)
+    monkeypatch.setattr(install_engine, "apply_all", lambda *args, **kwargs: (
+        SimpleNamespace(mode=mode), None))
+    monkeypatch.setattr(install_engine, "persist", lambda *args: None)
+    installer = box.installer()
+    installer.xray_replaced = replaced
+    assert installer._first_apply() is True
+    assert len(restarted) == restarts
+    assert ("Xray перезапущен на новой версии" in box.text()) is bool(restarts)
+
+
+def test_xray_counts_as_replaced_only_over_an_installed_one(box):
+    """Первая установка: прежнего Xray нет — и перезапускать нечего."""
+    installer = box.installer()
+    installer._xray(Facts())
+    assert installer.xray_replaced is False
+    installer._xray(Facts(xray_version=(26, 10, 10)))
+    assert installer.xray_replaced is True

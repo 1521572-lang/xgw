@@ -9,7 +9,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
 
 def test_fragment_and_bbr_defaults_and_bad_values(tmp_path):
     """0.1.11: дробление ClientHello — auto, значения полей freedom.fragment проверены на
-    Xray 26.10.10; BBR включён. Неверное — значение по умолчанию с предупреждением."""
+    Xray 26.10.21; BBR включён. Неверное — значение по умолчанию с предупреждением."""
     cfg = Config()
     assert (cfg.fragment.mode, cfg.fragment.packets, cfg.fragment.length,
             cfg.fragment.interval) == ("auto", "tlshello", "100-200", "10-20")
@@ -72,19 +72,20 @@ def test_validation_warnings(tmp_path):
     assert any("interval" in warning for warning in warnings)
 
 
-def test_only_xray_26_10_10_is_used(tmp_path):
-    """XGW работает только с Xray 26.10.10: другая версия в конфиге не учитывается (с
-    предупреждением), а "latest" из прежнего примера конфига — молча."""
+def test_only_xray_26_10_21_is_used(tmp_path):
+    """XGW работает только с Xray 26.10.21: другая версия в конфиге, в том числе отозванная
+    26.10.10, не учитывается (с предупреждением), а "latest" из прежнего примера — молча."""
     path = tmp_path / "config.toml"
-    for value, warns in (("26.10.10", False), ("v26.10.10", False), ("latest", False),
-                         ("26.3.27", True), ("27.1.1", True), ("свежая", True)):
+    for value, warns in (("26.10.21", False), ("v26.10.21", False), ("latest", False),
+                         ("26.10.10", True), ("26.3.27", True), ("27.1.1", True),
+                         ("свежая", True)):
         path.write_text(f'[xray]\nversion = "{value}"\n', encoding="utf-8")
         cfg, warnings = load(path)
-        assert cfg.xray.version.lstrip("v") == "26.10.10"
+        assert cfg.xray.version.lstrip("v") == "26.10.21"
         found = [warning for warning in warnings if "xray.version" in warning]
         assert bool(found) is warns, (value, warnings)
         if warns:
-            assert "только с Xray 26.10.10" in found[0]
+            assert "только с Xray 26.10.21" in found[0]
 
 
 def test_ipv6_values(tmp_path):

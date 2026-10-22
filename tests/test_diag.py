@@ -134,35 +134,36 @@ def test_xray_version_and_get_probe_support(box, monkeypatch):
     box.paths.xray_dir.mkdir(parents=True)
     box.paths.xray_bin.write_bytes(b"...httpMethod...")
     instance = box.diag()
-    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 10))
+    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 21))
     assert instance._xray()[0].level == OK
     monkeypatch.setattr(diag.binary, "installed_version", lambda path: (25, 6, 8))
     old = instance._xray()[0]
     assert old.level == FAIL and "ниже 25.7.23" in old.text and "update-xray" in old.advice
     monkeypatch.setattr(diag.binary, "installed_version", lambda path: None)
     assert "не запускается" in instance._xray()[0].text
-    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 10))
+    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 21))
     box.paths.xray_bin.write_bytes(b"xray without the field")
     assert "httpMethod в бинарнике нет" in instance._xray()[0].text
 
 
-@pytest.mark.parametrize("version", [(26, 3, 27), (26, 11, 1)])
-def test_xray_other_than_26_10_10_is_a_failure(box, monkeypatch, version):
-    """XGW работает только с Xray 26.10.10 (решение заказчика 17.10.2026): другая версия,
-    старше или новее, — FAIL с советом update-xray; перед установкой — WARN: установка
-    поставит нужную. Что записано в xray.version, не важно."""
+@pytest.mark.parametrize("version", [(26, 3, 27), (26, 10, 10), (26, 11, 1)])
+def test_xray_other_than_26_10_21_is_a_failure(box, monkeypatch, version):
+    """XGW работает только с Xray 26.10.21 (решения заказчика 17.10 и 21.10.2026): другая
+    версия, старше (в том числе отозванная 26.10.10) или новее, — FAIL с советом
+    update-xray; перед установкой — WARN: установка поставит нужную. Что записано в
+    xray.version, не важно."""
     box.paths.xray_dir.mkdir(parents=True)
     box.paths.xray_bin.write_bytes(b"...httpMethod...")
     monkeypatch.setattr(diag.binary, "installed_version", lambda path: version)
-    assert config.XRAY_VERSION == "26.10.10"
+    assert config.XRAY_VERSION == "26.10.21"
     other = box.diag()._xray()[0]
-    assert other.level == FAIL and "XGW работает только с Xray 26.10.10" in other.text
+    assert other.level == FAIL and "XGW работает только с Xray 26.10.21" in other.text
     assert other.advice == "sudo xgw update-xray"
     before = box.diag(preinstall=True)._xray()[0]
     assert before.level == WARN and before.advice == "установка поставит нужную версию"
     box.cfg.xray.version = "latest"
     assert box.diag()._xray()[0].level == FAIL
-    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 10))
+    monkeypatch.setattr(diag.binary, "installed_version", lambda path: (26, 10, 21))
     assert box.diag()._xray()[0].level == OK
 
 
