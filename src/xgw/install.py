@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
+import pwd
 import re
 import shutil
 import sys
@@ -23,7 +25,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import cores, desktop, engine, fetch, log, managed
+from . import cores, desktop, engine, fetch, log, managed, tray
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
@@ -230,6 +232,11 @@ class Facts:
     ufw_active: bool = False
 
 
+def _has_qt() -> bool:
+    """Есть ли у системного Python графический фреймворк значка (PyQt6 или PyQt5)."""
+    return any(importlib.util.find_spec(name) is not None for name in ("PyQt6", "PyQt5"))
+
+
 def _lock_down(directory: Path) -> None:
     """Каталоги 0755, файлы 0644 — без права записи для группы и остальных."""
     for path in (directory, *directory.rglob("*")):
@@ -258,6 +265,7 @@ class Installer:
         which: Callable[[str], str | None] = shutil.which,
         chown: Callable[..., None] = shutil.chown,
         open_panel: Callable[[], str] | None = None,
+        has_qt: Callable[[], bool] | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = paths
@@ -274,6 +282,7 @@ class Installer:
         self.which = which
         self.chown = chown
         self.open_panel = open_panel or self._open_panel
+        self.has_qt = has_qt or _has_qt
         self.journal = Journal(paths.journal_file)
         self.nm = nm.Nm(runner)
         self.capture = Capture(cfg, paths, runner=runner, logger=self.log, proc_sys=proc_sys)
@@ -632,7 +641,7 @@ class Installer:
         try:
             tag, _path = self.download(
                 self.paths.xray_dir, XRAY_VERSION,
-                mark=mark, bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+                mark=mark, bootstrap=self.cfg.dns.resolvers if mark is not None else None,
             )
         except (binary.BinaryError, fetch.FetchError) as exc:
             raise InstallError(
@@ -652,7 +661,7 @@ class Installer:
         try:
             tag, _path = self.download_singbox(
                 self.paths.singbox_dir, SINGBOX_VERSION,
-                mark=mark, bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+                mark=mark, bootstrap=self.cfg.dns.resolvers if mark is not None else None,
             )
         except (binary.BinaryError, fetch.FetchError, OSError) as exc:
             self._warn(
@@ -734,6 +743,7 @@ class Installer:
         if self.cfg.panel.enabled:
             self._panel()
         self._daemon()
+        self._tray()
         if self.cfg.status.lan_page and facts.lan_if:
             self._token()
         self.journal.set("finished", time.time())
@@ -1024,6 +1034,62 @@ class Installer:
             return
         self.journal.set("launcher", str(path))
         self._step(f"панель управления: {panel.address(self.cfg)}, ярлык «XGW» в меню приложений")
+
+    def _tray(self) -> None:
+        """Значок в трее (ТЗ R9): PyQt из пакетов Ubuntu, автозапуск при входе в сеанс, файл с
+        портом панели и токеном трея — тому, кто запустил установку, и запуск значка сейчас.
+        Значок — удобство: что-то не вышло — предупреждение, установка идёт дальше.
+        tray.enabled = false — автозапуск убирается."""
+        autostart = self.paths.root / tray.AUTOSTART
+        if not (self.cfg.tray.enabled and self.cfg.panel.enabled):
+            if autostart.exists():
+                autostart.unlink()
+                self._step("значок в трее выключен (tray.enabled = false) — автозапуск убран")
+            return
+        if not self.has_qt():
+            apt = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+                   "--no-install-recommends", tray.QT_PACKAGE]
+            try:
+                self.runner(apt, timeout=600.0)
+            except cmd.CommandError as exc:
+                self._warn(f"значок в трее не поставлен: пакет {tray.QT_PACKAGE} не "
+                           f"установился ({exc}); панель работает и без него")
+                return
+            self.journal.extend("packages", [tray.QT_PACKAGE])
+            self._step(f"пакеты: {tray.QT_PACKAGE} (значок в трее)")
+        self.journal.setdefault("tray_autostart_dir", not autostart.parent.exists())
+        autostart.parent.mkdir(parents=True, exist_ok=True)
+        icon = self.paths.lib_dir / "xgw" / "ui" / "icon.svg"
+        atomic_write_text(autostart, tray.desktop_entry(self.paths.launcher, icon), mode=0o644)
+        self.journal.set("tray_autostart", str(autostart))
+        token = tray.ensure_token(self.paths)
+        user = desktop.invoking_user()
+        if user is None:
+            self._step("значок в трее: автозапуск при входе в сеанс (токен — sudo xgw install "
+                       "от имени человека)")
+            return
+        try:
+            entry = pwd.getpwuid(user.uid)
+            path = tray.write_user_file(
+                Path(entry.pw_dir), user.uid, entry.pw_gid, self.cfg.panel.port, token,
+            )
+        except (KeyError, OSError) as exc:
+            self._warn(f"значок в трее: файл для {user.name} не записан ({exc})")
+            return
+        self.journal.set("tray_user_file", str(path))
+        started = ""
+        if desktop.graphical(user, self.runner):
+            try:
+                self.runner(
+                    ["systemd-run", "--user", f"--machine={user.name}@", "--quiet", "--collect",
+                     "--description=XGW: значок в трее", "--", str(self.paths.launcher), "tray"],
+                    timeout=20.0,
+                )
+                started = ", запущен"
+            except cmd.CommandError as exc:
+                self._warn(f"значок в трее не запущен сейчас ({exc}): он появится при "
+                           "следующем входе в сеанс")
+        self._step(f"значок в трее для {user.name}: автозапуск при входе{started}")
 
     # --- итог -------------------------------------------------------------------
 

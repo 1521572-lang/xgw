@@ -23,7 +23,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import __version__, actions, config, desktop, engine, log, managed, priority
+from . import __version__, actions, config, desktop, engine, log, managed, priority, tray
 from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
@@ -184,8 +184,16 @@ def main(argv: list[str] | None = None) -> int:
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
     )
+    tray_parser = subparsers.add_parser(
+        "tray", help="значок XGW в трее рабочего стола (запускается при входе в сеанс)",
+    )
+    tray_parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
+    if args.command == "tray":
+        # От имени человека, в его графическом сеансе: ни config.toml (0600 root), ни журнал
+        # XGW значку не нужны — порт панели и токен трея лежат в его ~/.config/xgw.
+        return tray.main(["--run"] if args.run else [])
     paths = Paths.from_env()
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не

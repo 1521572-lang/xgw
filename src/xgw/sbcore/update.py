@@ -48,7 +48,7 @@ def update_singbox(
         out(f"sing-box {_version_text(current)} — уже нужная версия")
         return 0
     mark = engine.bypass_mark(cfg, logger)
-    route = {"mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None}
+    route = {"mark": mark, "bootstrap": cfg.dns.resolvers if mark is not None else None}
     try:
         release = get_release(SINGBOX_VERSION, **route)
     except (BinaryError, fetch.FetchError) as exc:

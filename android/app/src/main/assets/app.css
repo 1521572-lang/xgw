@@ -232,6 +232,12 @@ main.stale .gw { opacity: .55; pointer-events: none; }
 .delay.none { color: var(--muted); font-weight: 400; }
 .speed { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; font-size: .9rem; }
 .speed.old { color: var(--muted); font-weight: 400; }
+/* Иконка замера одного сервера — рядом с цифрой скорости. */
+.server .icon-btn.speed-btn { width: 32px; height: 32px; align-self: center; }
+.icon-btn.speed-btn svg { width: 16px; height: 16px; }
+.icon-btn.speed-btn[data-busy="1"] svg { animation: spin 1s linear infinite; }
+.icon-btn.speed-btn:disabled { opacity: .7; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* Сервер — в три строки: имя с метками и цифры; состояние; кнопки от края до края. */
 .servers > li.server {
@@ -241,7 +247,17 @@ main.stale .gw { opacity: .55; pointer-events: none; }
 }
 .server > .dot { grid-area: dot; }
 .server > .row-title { grid-area: title; }
-.server > .values { grid-area: value; display: flex; flex-direction: column; align-items: flex-end; }
+/* Цифры — столбцом у правого края; иконка замера — слева от скорости, а не строкой над ней. */
+.server > .values {
+  grid-area: value;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  justify-items: end;
+  column-gap: 2px;
+}
+.server > .values > * { grid-column: 2; }
+.server > .values > .speed-btn { grid-column: 1; grid-row: 1; }
 .server > .row-sub { grid-area: sub; }
 .server > .row-tools { grid-area: tools; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .servers > li.selected {

@@ -41,7 +41,8 @@
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
-    singbox: "sing-box", core: "ядро сервера", cores: "обновление ядер",
+    singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
+    guard: "контроль скорости", cores: "обновление ядер",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -52,6 +53,7 @@
     record: ["M12 6a6 6 0 1 0 0 12a6 6 0 1 0 0-12z"],
     stop: ["M7 7h10v10H7z"],
     download: ["M12 3v12", "M7 10l5 5 5-5", "M5 21h14"],
+    remeasure: ["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"],
   };
   const RECORD_SECONDS = 300; // запись трафика устройства — 5 минут, остановить можно раньше
 
@@ -236,8 +238,9 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, s.sticky, (s.busy || {}).speed_one, Math.floor(s.now / 60)], () => renderServers(s));
     draw("main", [s.main, s.sticky, s.pin, s.members.length, (s.budget || {}).speed_mb], () => renderMain(s));
+    draw("guard", [s.guard, Math.floor(s.now / 60)], () => renderGuard(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
@@ -252,7 +255,7 @@
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
     draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
     setBusy($("cores-check"), s.busy.cores);
-    draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
+    draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
     setBusy($("speed"), s.busy.speed);
@@ -284,6 +287,28 @@
       if (nodes.excluded) text += ` · отключено вами: ${nodes.excluded}`;
       summary.textContent = text;
     }
+
+    // Проверочные хосты (ТЗ R3), bootstrap-DNS (R4a), Tailscale через VPN (R4b).
+    const net = $("network-note");
+    const netLines = [];
+    const hosts = (s.probe_hosts || {}).hosts || [];
+    if (hosts.length > 1) {
+      const current = (s.probe_hosts || {}).current;
+      netLines.push("Проверочные хосты: " + hosts.map((host) => host.host
+        + (host.url === current ? " (активный)" : "")
+        + (host.errors ? ` — ошибок ${host.errors}` : "")
+        + (host.paused_until && host.paused_until > s.now ? `, пропускается до ${clock(host.paused_until)}` : "")).join("; ") + ".");
+    }
+    const resolvers = (s.resolvers || {}).results || [];
+    const dead = resolvers.filter((item) => !item.ok);
+    if (dead.length) {
+      netLines.push(`bootstrap-DNS: не отвечают ${dead.length} из ${resolvers.length} (${dead.map((item) => item.entry).join(", ")}) — резолвер пробует их последними.`);
+    }
+    if (s.tailscale_via_vpn) {
+      netLines.push("Tailscale временно идёт через VPN: серверы DERP напрямую не отвечают; когда ответят, он вернётся напрямую сам.");
+    }
+    net.hidden = !netLines.length;
+    net.textContent = netLines.join(" ");
 
     const probe = $("probe-note");
     probe.hidden = !s.probe_target;
@@ -469,11 +494,36 @@
   function speedValue(server, s) {
     if (!hasSpeed(server) || (server.status !== "member" && server.status !== "spare")) return null;
     const busy = Boolean(server.speed_busy);
+    // Сумма (0.1.18): сам замер и трафик клиентов через этот сервер за время замера.
+    const parts = server.speed_bg_mbps
+      ? ` (замер ${mbps(server.speed_test_mbps)} + трафик клиентов ${mbps(server.speed_bg_mbps)})` : "";
     return el("span", {
       class: `speed${busy ? " old" : ""}`, text: mbps(server.speed_mbps),
-      title: `Скорость по замеру ${stamp(server.speed_ts, s.now)}`
+      title: `Скорость по замеру ${stamp(server.speed_ts, s.now)}${parts}`
         + (busy ? " — канал был занят, цифра может быть занижена" : ""),
     });
+  }
+
+  // Иконка у скорости (пожелание заказчика 24.10.2026): замер только этого сервера, без общего
+  // замера всех. Крутится, пока сервер ждёт замера или замеряется. У x100 замеров нет вовсе.
+  const probeTag = (tag) => `probe-${String(tag || "").split("-").slice(1).join("-")}`;
+  function speedTool(server, s) {
+    if (server.status !== "member" && server.status !== "spare") return null;
+    const sticky = s.sticky || {};
+    if (!sticky.on || !(sticky.unlimited_hours || sticky.limited_hours)) return null;
+    if ((server.multiplier || 0) >= 100) return null;
+    const asked = (s.busy && s.busy.speed_one) || [];
+    const busy = Boolean(server.speed_queued)
+      || [server.tag, server.fingerprint, probeTag(server.tag)].some((key) => asked.includes(key));
+    const button = iconButton("remeasure", `Замерить скорость «${server.name}»`,
+      (event) => act("speed/one", { tag: server.tag }, event.currentTarget));
+    button.classList.add("speed-btn");
+    button.title = busy ? "Скорость этого сервера замеряется…" : "Замерить скорость только этого сервера";
+    if (busy) {
+      button.dataset.busy = "1";
+      button.disabled = true;
+    }
+    return button;
   }
 
   // Когда цифры скорости нет — почему (issue #1: пустое место ничего не объясняло).
@@ -487,18 +537,38 @@
   // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
   const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
 
+  // 0.1.18: выученный обход блокировки («обход: xray+frag после STALL_BEFORE_BODY»), отметка
+  // «нестабилен по ТСПУ» и скорость по реальному трафику через сервер («из трафика»).
+  function extraNote(server, s) {
+    let text = "";
+    const esc = server.escalation;
+    if (esc) {
+      text += ` · обход: ${esc.label}${esc.verdict ? ` после ${esc.verdict}` : ""}`
+        + (esc.ts ? `, ${stamp(esc.ts, s.now)}` : "");
+    }
+    if (server.unstable_until && server.unstable_until > s.now) {
+      text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
+    }
+    if (server.speed_passive_mbps !== null && server.speed_passive_mbps !== undefined
+        && server.speed_passive_mbps >= 1) {
+      text += ` · из трафика ${mbps(server.speed_passive_mbps)}`;
+    }
+    return text;
+  }
+
   function serverNote(server, s) {
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
-      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`;
+      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`
+        + extraNote(server, s);
     }
     if (server.status === "spare") {
       const role = server.reserve
         ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
         : "запасной";
       return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "")
-        + speedNote(server, s);
+        + speedNote(server, s) + extraNote(server, s);
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -516,6 +586,7 @@
   const PROFILES = {
     "xray:default": ["Xray", ""],
     "xray:fragment": ["Xray · дробление", "Первая запись TLS уходит к серверу частями (дробление ClientHello), и фильтр провайдера не видит в ней имя сайта. Шлюз включает дробление сам, если без него сервер не отвечает."],
+    "xray:split": ["Xray · нарезка", "Первые пакеты соединения уходят к серверу TCP-сегментами случайной длины: фильтр провайдера, который собирает ClientHello из частей, его не собирает. Шлюз переводит сервер сюда сам, если без этого он не отвечает."],
     "singbox:default": ["sing-box", "Сервер ведёт второе ядро — sing-box: оно умеет протоколы, которых нет в Xray (hysteria2, TUIC, AnyTLS, WireGuard), и по-своему устанавливает TLS. Сервер, который умеют оба ядра, шлюз переводит сюда сам, если на Xray он не отвечал."],
     "singbox:tls_fragment": ["sing-box · дробление", "Сервер ведёт sing-box, а начало TLS режется на части (дробление TCP и записей TLS). Шлюз перевёл сервер сюда сам, когда на Xray он «замерзал»."],
     "singbox:mux_padded": ["sing-box · mux", "Сервер ведёт sing-box с мультиплексированием и паддингом: меняются размеры пакетов и тайминги внутри туннеля. Шлюз перевёл сервер сюда сам, когда он «замерзал» на прежних профилях."],
@@ -626,7 +697,7 @@
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, speedValue(server, s), serverValue(server)),
+      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -675,6 +746,23 @@
       + "шлюз ищет живые серверы среди запасных и вернётся к серверам в работе, как только они ответят.";
   }
 
+  // Контроль скорости (ТЗ R6–R7): идёт поиск замены придушенному или пауза после глобальной
+  // просадки канала.
+  function renderGuard(s) {
+    const guard = s.guard || {};
+    const note = $("guard-note");
+    let text = "";
+    if (guard.episode) {
+      text = `Сервер «${guard.episode.name}» придушен (${mbps(guard.episode.mbps || 0)}): ищу замену — `
+        + `замерено ${guard.episode.tried || 0} из ${guard.episode.total || 0} кандидатов, по одному.`;
+    } else if (guard.cooldown_until && guard.cooldown_until > s.now) {
+      text = "Глобальная просадка канала: ни один кандидат не был заметно быстрее — шлюз остаётся "
+        + `на прежнем сервере, новые поиски — после ${clock(guard.cooldown_until)}.`;
+    }
+    note.hidden = !text;
+    note.textContent = text;
+  }
+
   // Основной сервер: весь трафик через самый быстрый из серверов в работе.
   function renderMain(s) {
     const box = $("main-box");
@@ -702,7 +790,11 @@
     }
     if (on && measuring) {
       const every = (hours) => (hours ? `раз в ${hours} ч` : "не замеряются");
-      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется у всех живых серверов:"} безлимитных — ${every(sticky.unlimited_hours)}, лимитированных — ${every(sticky.limited_hours)} и меньшей загрузкой, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`;
+      // 0.1.18: фоном — редко; основной — по своему трафику, при падении или «придушивании» —
+      // поиск замены среди кандидатов (решение заказчика 24.10.2026).
+      const spareEvery = sticky.spare_hours ? every(Math.max(sticky.spare_hours, sticky.unlimited_hours || 0)) : every(sticky.unlimited_hours);
+      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
+        + (sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
     }
     $("main-note").textContent = text;
   }

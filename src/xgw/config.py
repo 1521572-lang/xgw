@@ -29,6 +29,22 @@ DEFAULT_PROBE_URL = (
     "https://cdn.jsdelivr.net/npm/material-design-icons@3.0.1/iconfont/MaterialIcons-Regular.woff"
 )
 DEFAULT_PROBE_SIZE = 57_620
+# Ещё три проверочных хоста (0.1.18, ТЗ R3): разные домены и разные CDN — Fastly, Akamai,
+# Google; probe.url (jsDelivr, через Cloudflare или Fastly) остаётся первым. Файлы 45–70 КБ,
+# неизменяемые (версия в пути), отдаются без входа; ответ 200 и размер проверены 24.10.2026.
+# ТСПУ, «придушивающий» соединение после 16–32 КБ, на них заметен так же, как на 57 КБ.
+DEFAULT_PROBE_HOSTS = (
+    "https://code.jquery.com/jquery-3.7.1.slim.min.js",
+    "https://ajax.aspnetcdn.com/ajax/bootstrap/3.4.1/fonts/glyphicons-halflings-regular.ttf",
+    "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.slim.min.js",
+)
+# Известные размеры файлов проверок: без них размер узнаёт сквозная проверка.
+KNOWN_PROBE_SIZES = {
+    DEFAULT_PROBE_URL: DEFAULT_PROBE_SIZE,
+    DEFAULT_PROBE_HOSTS[0]: 70_264,
+    DEFAULT_PROBE_HOSTS[1]: 45_404,
+    DEFAULT_PROBE_HOSTS[2]: 70_264,
+}
 # User-Agent собственных проб XGW (скан, сквозная проверка, diag). Браузерный: часть
 # CDN и WAF отвечает 403 всему, что на браузер не похоже. Пробы самого Xray и так
 # ходят с заголовками Chrome — на них эта настройка не влияет.
@@ -54,6 +70,11 @@ class Network:
     # на канале с потерями и большой задержкой. Ставит xgw-net, прежний возвращает
     # `xgw net down` и удаление; false — XGW алгоритм не трогает.
     tcp_bbr: bool = True
+    # QUIC (HTTP/3, UDP/443) устройств сети и самой машины отбивается сразу (ICMP «порт
+    # недоступен»): браузеры уходят на TCP/443, где действует дробление ClientHello, а QUIC
+    # дробление не берёт (0.1.18, ТЗ R2). Собственные соединения шлюза с серверами VPN,
+    # Tailscale и локальные сети не затрагиваются. false — правило не ставится.
+    block_quic: bool = True
 
     @property
     def ipv6_proxy(self) -> bool:
@@ -104,6 +125,18 @@ class TailscaleConf:
     # на машине: "direct" — напрямую, мимо Xray, всегда; "vpn" — через Xray, пока он
     # отвечает, а когда не отвечает или правила в режиме blocked — напрямую.
     route: str = "direct"
+    # При route = "direct": сервер DERP напрямую не отвечает derp_fails проверок подряд —
+    # tailscaled временно идёт через VPN (как при "vpn"), а когда DERP снова отвечает
+    # напрямую — обратно (0.1.18, ТЗ R4b). false — не переключать.
+    derp_fallback: bool = True
+    derp_fails: int = 3
+
+
+@dataclass
+class TrayConf:
+    # Значок XGW в трее рабочего стола (0.1.18, ТЗ R9): ставится установкой и запускается при
+    # входе в сеанс. false — установка его не ставит (и убирает поставленный).
+    enabled: bool = True
 
 
 @dataclass
@@ -136,6 +169,11 @@ class Probe:
     url: str = DEFAULT_PROBE_URL
     user_agent: str = DEFAULT_PROBE_UA
     url_fallback: str = ""
+    # Ещё проверочные хосты (0.1.18, ТЗ R3): собственные пробы шлюза ходят по кругу —
+    # probe.url, затем эти. Хост, который не ответил, когда другой ответил, пропускается
+    # host_pause_minutes; «не отвечает адрес проверки» — только когда не отвечают все.
+    urls: list[str] = field(default_factory=lambda: list(DEFAULT_PROBE_HOSTS))
+    host_pause_minutes: int = 30
     trace_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
     interval: str = "30s"
     sampling: int = 2
@@ -163,17 +201,42 @@ class Speed:
     url_fallback: str = DEFAULT_SPEED_FALLBACK
     max_mb: int = 10  # замер качает не больше…
     max_seconds: int = 8  # …и не дольше
-    # Как часто замерять каждый живой сервер — в работе и запасной (ASSUMPTIONS п. 224):
-    # безлимитные — раз в unlimited_hours, лимитированные — раз в limited_hours (меньшей
-    # загрузкой, speed.size_mb); 0 — не замерять (основной выбирается по задержке).
-    unlimited_hours: int = 1
+    # Как часто замерять фоном каждый живой сервер (ASSUMPTIONS п. 224; с 0.1.18 — реже, решение
+    # заказчика 24.10.2026): безлимитные — раз в unlimited_hours, лимитированные — раз в
+    # limited_hours (меньшей загрузкой, speed.size_mb); запасные — не чаще раза в spare_hours
+    # (0 — как серверы в работе). 0 в unlimited_hours и limited_hours — не замерять (основной
+    # выбирается по задержке). Основной между замерами оценивается по своему трафику, а при его
+    # падении или «придушивании» замеряются кандидаты на замену (watch/guard.py).
+    unlimited_hours: int = 6
     limited_hours: int = 6
-    spare_mb: int = 3  # запасные качают не больше: их десятки, замер — каждый час
+    spare_hours: int = 24
+    spare_mb: int = 3  # запасные качают не больше: их десятки
     # Прежний ключ (до 0.1.18), один срок для серверов в работе: 0 по-прежнему выключает
     # замеры, другие значения не действуют (-1 — ключа нет).
     every_hours: int = -1
     gain_pct: int = 30  # сменить основной, только если другой быстрее на столько процентов
     hold_minutes: int = 60  # и основной продержался не меньше
+    # Контроль скорости участников (0.1.18, ТЗ R5–R8; watch/guard.py). Раз в passive_seconds
+    # демон считает скорость реального трафика каждого участника по счётчикам Xray; не меньше
+    # passive_mbps — участник исправен, активный замер не нужен.
+    guard: bool = True
+    passive_seconds: int = 90
+    passive_mbps: int = 10
+    # «Придушен»: low_count суммарных оценок подряд (замер плюс трафик клиентов через тот же
+    # сервер) ниже low_mbps за low_minutes минут.
+    low_mbps: int = 10
+    low_count: int = 3
+    low_minutes: int = 10
+    # Уход с придушенного: до candidates кандидатов по одному; первый не медленнее switch_mbps —
+    # сразу, иначе лучший, если он быстрее на gain_pct и не медленнее min_mbps. Не лучше никто —
+    # «глобальная просадка», новых поисков cooldown_minutes. На поиск — не больше episode_mb,
+    # на все поиски за сутки — не больше guard_daily_mb.
+    candidates: int = 5
+    switch_mbps: int = 25
+    min_mbps: int = 12
+    cooldown_minutes: int = 40
+    episode_mb: int = 15
+    guard_daily_mb: int = 300
 
 
 @dataclass
@@ -184,9 +247,25 @@ class Fragment:
     # отвечает; always — всем серверам с TLS и REALITY; off — никогда.
     mode: str = "auto"
     # Поля freedom.fragment Xray: что дробить, длина кусков (байт) и пауза между ними (мс).
+    # Длина и пауза — диапазоны: Xray берёт случайное значение для каждого куска.
     packets: str = "tlshello"
     length: str = "100-200"
     interval: str = "10-20"
+    # Вторая ступень дробления в Xray (0.1.18, ТЗ R1): первые TCP-пакеты соединения режутся на
+    # сегменты случайной длины (а не на записи TLS) — если ТСПУ собирает ClientHello из записей,
+    # из сегментов он может его и не собрать. split = false — без этой ступени.
+    split: bool = True
+    split_packets: str = "1-3"
+    split_length: str = "20-60"
+    split_interval: str = "5-10"
+    # Сервер на дроблении, который calm_probes проверок подряд отвечает и пробыл на нём не
+    # меньше calm_hours, пробуется без дробления (до 0.1.18 — раз в сутки).
+    calm_probes: int = 20
+    calm_hours: int = 12
+    # Больше escalations переводов на тяжёлый профиль за escalation_hours — сервер
+    # «нестабилен по ТСПУ»: в работу его шлюз сам не ставит, пока эти часы не пройдут.
+    escalations: int = 2
+    escalation_hours: int = 6
 
 
 @dataclass
@@ -200,6 +279,16 @@ class Routing:
     home_country: str = "RU"
 
 
+# Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a): другие операторы и адреса,
+# а Quad9 — на нестандартном порту 5053. Проверены 24.10.2026 по IP: AdGuard и DNS.SB отвечают;
+# порт 5053 из сети разработки не ответил — его проверит монитор на самом шлюзе.
+DEFAULT_BOOTSTRAP_EXTRA = (
+    "https://94.140.14.140/dns-query",
+    "https://185.222.222.222/dns-query",
+    "https://9.9.9.9:5053/dns-query",
+)
+
+
 @dataclass
 class Dns:
     proxy_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
@@ -211,6 +300,16 @@ class Dns:
             "udp://77.88.8.8",
         ]
     )
+    # Дополнительные резолверы — после bootstrap; монитор проверяет все раз в
+    # bootstrap_check_minutes (итог — в diag и событиях), а отказавшие резолвер пробует
+    # последними.
+    bootstrap_extra: list[str] = field(default_factory=lambda: list(DEFAULT_BOOTSTRAP_EXTRA))
+    bootstrap_check_minutes: int = 30
+
+    @property
+    def resolvers(self) -> list[str]:
+        """bootstrap и bootstrap_extra без повторов — все резолверы, по порядку."""
+        return list(dict.fromkeys([*self.bootstrap, *self.bootstrap_extra]))
 
 
 # Единственная версия Xray-core, с которой работает XGW (решение заказчика 17.10.2026,
@@ -265,6 +364,9 @@ class Watchdog:
     interval_s: int = 20
     fail_threshold: int = 3
     wan_check: str = "ya.ru:443"
+    # Ещё адреса проверки провайдера (0.1.18, ТЗ R3): «нет провайдера» (WAN_DOWN) — только
+    # когда не отвечает ни один из wan_check и этих.
+    wan_checks: list[str] = field(default_factory=lambda: ["vk.com:443", "mail.ru:443"])
     # Проверка с учётом трафика: сквозная проба не прошла, а через выбранный сервер за
     # busy_window_s пришло не меньше busy_bytes — проба опоздала в очереди забитого канала,
     # провал не засчитывается (VPN_IMPROVEMENT_PLAN §2.3).
@@ -343,6 +445,7 @@ class Config:
     notify: Notify = field(default_factory=Notify)
     panel: PanelConf = field(default_factory=PanelConf)
     tailscale: TailscaleConf = field(default_factory=TailscaleConf)
+    tray: TrayConf = field(default_factory=TrayConf)
     managed: Managed = field(default_factory=Managed)
 
 
@@ -364,6 +467,7 @@ _SECTIONS = {
     "notify": Notify,
     "panel": PanelConf,
     "tailscale": TailscaleConf,
+    "tray": TrayConf,
 }
 
 
@@ -477,8 +581,8 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
 def probe_bytes(url: str) -> int | None:
     """Размер пробы в байтах, если он известен заранее: записан в URL (…?bytes=65536)
     либо это файл по умолчанию. Для прочих адресов размер узнаёт сквозная проверка."""
-    if url == DEFAULT_PROBE_URL:
-        return DEFAULT_PROBE_SIZE
+    if url in KNOWN_PROBE_SIZES:
+        return KNOWN_PROBE_SIZES[url]
     values = parse_qs(urlsplit(url).query).get("bytes")
     if not values:
         return None
@@ -695,6 +799,7 @@ def _validate(cfg: Config) -> list[str]:
     warnings.extend(_validate_speed(cfg.speed))
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))
+    warnings.extend(_validate_hosts(cfg))
     listening = {
         "tproxy": cfg.capture.tproxy_port,
         "api": cfg.xray.api_port,
@@ -729,9 +834,21 @@ _SPEED_LIMITS = {
     "max_seconds": (2, 30),
     "unlimited_hours": (0, 168),
     "limited_hours": (0, 168),
+    "spare_hours": (0, 168),
     "spare_mb": (1, 100),
     "gain_pct": (0, 1000),
     "hold_minutes": (0, 1440),
+    "passive_seconds": (30, 600),
+    "passive_mbps": (1, 1000),
+    "low_mbps": (1, 1000),
+    "low_count": (1, 10),
+    "low_minutes": (1, 120),
+    "candidates": (1, 20),
+    "switch_mbps": (1, 1000),
+    "min_mbps": (1, 1000),
+    "cooldown_minutes": (1, 1440),
+    "episode_mb": (1, 200),
+    "guard_daily_mb": (0, 10000),
 }
 
 
@@ -795,6 +912,9 @@ def _validate_fragment(fragment: Fragment) -> list[str]:
         "packets": lambda value: value == "tlshello" or _span(value, 1),
         "length": lambda value: _span(value, 1),
         "interval": lambda value: _span(value, 0),
+        "split_packets": lambda value: _span(value, 1),
+        "split_length": lambda value: _span(value, 1),
+        "split_interval": lambda value: _span(value, 0),
     }
     for name, valid in checks.items():
         value = getattr(fragment, name).strip()
@@ -806,4 +926,76 @@ def _validate_fragment(fragment: Fragment) -> list[str]:
             )
             value = default
         setattr(fragment, name, value)
+    for name, (low, high) in _FRAGMENT_LIMITS.items():
+        value = getattr(fragment, name)
+        if not low <= value <= high:
+            default = getattr(Fragment(), name)
+            warnings.append(
+                f"fragment.{name}={value}: допустимо от {low} до {high} — используется {default}"
+            )
+            setattr(fragment, name, default)
+    return warnings
+
+
+_FRAGMENT_LIMITS = {
+    "calm_probes": (1, 1000),
+    "calm_hours": (1, 168),
+    "escalations": (1, 50),
+    "escalation_hours": (1, 168),
+}
+
+
+def _host_port(entry: str) -> bool:
+    host, sep, port = entry.strip().rpartition(":")
+    return bool(sep and host and port.isdigit() and 0 < int(port) < 65536)
+
+
+def _validate_hosts(cfg: Config) -> list[str]:
+    """probe.urls, watchdog.wan_checks, dns.bootstrap_extra и пределы других ключей 0.1.18:
+    негодная запись пропускается с предупреждением, а не ломает остальные."""
+    warnings: list[str] = []
+    urls: list[str] = []
+    for url in cfg.probe.urls:
+        url = url.strip()
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            warnings.append(f"probe.urls: «{url}» — не http(s)://адрес; пропущен")
+        elif url != cfg.probe.url and url not in urls:
+            urls.append(url)
+    cfg.probe.urls = urls
+    if not 1 <= cfg.probe.host_pause_minutes <= 1440:
+        warnings.append(
+            f"probe.host_pause_minutes={cfg.probe.host_pause_minutes}: допустимо от 1 до 1440 "
+            f"— используется {Probe().host_pause_minutes}"
+        )
+        cfg.probe.host_pause_minutes = Probe().host_pause_minutes
+    checks: list[str] = []
+    for entry in cfg.watchdog.wan_checks:
+        if not _host_port(entry):
+            warnings.append(f"watchdog.wan_checks: «{entry}» — ожидается хост:порт; пропущен")
+        elif entry.strip() not in checks and entry.strip() != cfg.watchdog.wan_check.strip():
+            checks.append(entry.strip())
+    cfg.watchdog.wan_checks = checks
+    extra: list[str] = []
+    for entry in cfg.dns.bootstrap_extra:
+        entry = entry.strip()
+        if not entry.startswith(("https://", "udp://")):
+            warnings.append(
+                f"dns.bootstrap_extra: «{entry}» — ожидается https://… или udp://…; пропущен"
+            )
+        elif entry not in extra:
+            extra.append(entry)
+    cfg.dns.bootstrap_extra = extra
+    if not 5 <= cfg.dns.bootstrap_check_minutes <= 1440:
+        warnings.append(
+            f"dns.bootstrap_check_minutes={cfg.dns.bootstrap_check_minutes}: допустимо от 5 до "
+            f"1440 — используется {Dns().bootstrap_check_minutes}"
+        )
+        cfg.dns.bootstrap_check_minutes = Dns().bootstrap_check_minutes
+    if not 1 <= cfg.tailscale.derp_fails <= 100:
+        warnings.append(
+            f"tailscale.derp_fails={cfg.tailscale.derp_fails}: допустимо от 1 до 100 — "
+            f"используется {TailscaleConf().derp_fails}"
+        )
+        cfg.tailscale.derp_fails = TailscaleConf().derp_fails
     return warnings

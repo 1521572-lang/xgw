@@ -144,12 +144,18 @@ class FakeSingbox:
 class Harness(Daemon):
     """Демон, у которого всё внешнее — метрики, проверки, подписки, ядро — подменено."""
 
-    def __init__(self, cfg: Config, paths: Paths, *, fragment: str = "off", **kwargs):
+    def __init__(
+        self, cfg: Config, paths: Paths, *, fragment: str = "off",
+        hosts: list[str] | None = None, **kwargs,
+    ):
         self.t = time.time()  # и «монотонные», и настенные часы демона; двигаются вручную
         # Дробление ClientHello (0.1.11) проверяют отдельные тесты (fragment="auto"): в
         # остальных запасные с TLS и REALITY, которые не отвечают, иначе проверялись бы ещё
         # и в другом режиме, и сборок конфига было бы больше, чем ждут эти тесты.
         cfg.fragment.mode = fragment
+        # Проверочные хосты по кругу (0.1.18) — в своих тестах; в остальных пробы, как прежде,
+        # качают один probe.url.
+        cfg.probe.urls = list(hosts or [])
         super().__init__(
             cfg, paths, xray_bin=Path("no-such-xray"),
             clock=lambda: self.t, wall=lambda: self.t, **kwargs,
@@ -162,6 +168,8 @@ class Harness(Daemon):
         self.now_time = lambda: datetime.time(12, 0)
         self.observatory: dict | None = {}  # None — метрики недоступны
         self.provider = True
+        self.resolver_results: list[dict] = []  # итог проверки резолверов (ТЗ R4a)
+        self.derp_error: str | None = None  # DERP напрямую: "" — отвечает, None — нечем проверять
         self.e2e = True
         self.location: str | None = None
         self.via_location: str | None = None  # страна выхода явно через http-in Xray
@@ -180,6 +188,10 @@ class Harness(Daemon):
         self.speeds: dict[str, float | None] = {}  # тег → скорость замера (None — не удался)
         self.default_speed: float | None = 50.0
         self.measured: list[str] = []
+        self.small: list[bool] = []  # короткий ли был замер (ТЗ R6)
+        self.totals: dict[str, int] = {}  # счётчики трафика участников (uplink + downlink)
+        self.during_speed: dict[str, int] = {}
+        self._before: set[str] = set()
         self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
         self.downlinks: dict[str, int] = {}  # downlink участников (тег → байт, счётчик Xray)
 
@@ -195,11 +207,34 @@ class Harness(Daemon):
     def _downlink_now(self, tag):
         return self.downlinks.get(tag)
 
+    def _traffic_now(self, tag):
+        # Счётчик трафика сервера (uplink + downlink) до и после замера (ТЗ R5.3): второй вызов
+        # видит ещё и трафик клиентов за время замера (during_speed: тег → байт).
+        value = self.totals.get(tag)
+        if value is None:
+            return None
+        if tag in self._before:
+            self._before.discard(tag)
+            self.totals[tag] = value + self.during_speed.get(tag, 0)
+            return self.totals[tag]
+        self._before.add(tag)
+        return value
+
     def _check_provider(self):
         return self.provider
 
+    def _check_resolvers(self):
+        return list(self.resolver_results)  # тесты не ходят в DNS (ТЗ R4a — в своих тестах)
+
+    def _check_derp(self):
+        return self.derp_error
+
     def _check_e2e(self):
         self.e2e_checks += 1
+        if self.e2e:
+            # Сквозная проверка прошла — проверочный хост ответил (watch/hosts.py): так ядро
+            # возвращается на probe.url, когда он снова отвечает.
+            self.hosts.answered(self.cfg.probe.url)
         return self.e2e
 
     def _check_leak(self):
@@ -245,8 +280,9 @@ class Harness(Daemon):
     def _base_ping(self, members=(), password=""):
         return self.base_ping
 
-    def _speed(self, info, password):
+    def _speed(self, info, password, *, small=False):
         self.measured.append(info.tag)
+        self.small.append(small)
         mbps = self.speeds.get(info.tag, self.default_speed)
         if mbps is None:
             return SpeedResult(None, 16384, 5.0, "тишина 5 с после 16384 байт тела")
@@ -1672,7 +1708,10 @@ def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
 
     status = daemon.status()
     assert status["state"] == "PROBE_TARGET_UNREACHABLE"
-    warning = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url"
+    warning = (
+        "Внимание: пробы всех серверов падают — вероятно, недоступны сами проверочные "
+        "хосты (probe.url и probe.urls)"
+    )
     assert status["probe_target"].startswith(warning) and "HTTP 403" in status["probe_target"]
     events = [event for event in daemon.events() if event.startswith("PROBE_TARGET_UNREACHABLE:")]
     assert len(events) == 1 and warning in events[0]

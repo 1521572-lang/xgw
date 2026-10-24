@@ -63,6 +63,12 @@ class FakeDaemon:
     def request_speed(self) -> None:
         self.asked.append("speed")
 
+    def request_speed_one(self, key: str) -> None:
+        self.asked.append(f"speed:{key}")
+
+    def speed_one_pending(self) -> list[str]:
+        return [item.removeprefix("speed:") for item in self.asked if item.startswith("speed:")]
+
 
 class Client:
     """Браузер в миниатюре: помнит cookie и шлёт то же, что страница панели."""
@@ -712,7 +718,9 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     assert user.act("refresh", {})["ok"] and user.act("scan", {})["ok"]
     assert rig.daemon.asked == ["refresh", "scan"]
     rig.daemon.refresh_pending = True
-    assert user.state()["busy"] == {"refresh": True, "scan": False, "speed": False, "cores": False}
+    assert user.state()["busy"] == {
+        "refresh": True, "scan": False, "speed": False, "speed_one": [], "cores": False,
+    }
     rig.panel.configure(rig.panel.cfg, None)  # демон ещё не создан
     assert not user.act("refresh", {})["ok"]
 
@@ -860,7 +868,10 @@ def test_state_shows_the_capture_lifecycle_written_by_the_daemon(rig, user):
 def test_sticky_switch_and_speed_button(rig, user):
     state = user.state()
     assert state["sticky"]["on"] is True
-    assert (state["sticky"]["unlimited_hours"], state["sticky"]["limited_hours"]) == (1, 6)
+    # 0.1.18: фоном — редко (решение заказчика 24.10.2026), запасные — раз в сутки.
+    sticky = state["sticky"]
+    assert (sticky["unlimited_hours"], sticky["limited_hours"], sticky["spare_hours"]) == (6, 6, 24)
+    assert sticky["guard"] is True
     assert user.act("speed", {})["ok"] and rig.daemon.asked == ["speed"]
     reply = user.act("sticky", {"on": False})
     assert reply["ok"] and "выключен" in reply["text"]
@@ -885,3 +896,32 @@ def test_server_core_is_set_from_the_panel(rig, user):
     assert not user.act("core", {"fingerprint": "zzzz9999", "core": "xray"})["ok"]
     cfg, _warnings = config.load(rig.config_path)
     assert cfg.managed.core == {}
+
+
+def test_one_server_speed_button(rig, user):
+    """Иконка у скорости сервера (отчёт cores 24.10.2026): замер одного сервера — участника
+    или запасного; демон получает его отпечаток, а пока замер ждёт — сервер в busy.speed_one.
+    Сервер x100, неизвестный тег и выключенные замеры — отказ."""
+    reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
+    assert reply["ok"] and "FI-1" in reply["text"]
+    assert rig.daemon.asked == ["speed:cccc3333"]
+    assert user.state()["busy"]["speed_one"] == ["cccc3333"]
+    assert user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
+    assert rig.daemon.asked[-1] == "speed:bbbb2222"
+    # Запасной стал участником: тег сменил роль — сервер тот же.
+    assert user.act("speed/one", {"tag": "proxy-fi-cccc"})["ok"]
+    assert not user.act("speed/one", {"tag": "spare-zz-0000"})["ok"]
+    assert not user.act("speed/one", {})["ok"]
+    snapshot = _snapshot()
+    snapshot["spares"][0]["cost"] = 100.0
+    status.write_status(rig.paths, snapshot)
+    reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
+    assert not reply["ok"] and "x100" in reply["text"]
+    assert user.act("sticky", {"on": False})["ok"]
+    assert not user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
+
+
+def test_page_has_the_one_server_speed_icon(rig, user):
+    response, text = user.request("GET", "/app.js")
+    assert response.status == 200
+    assert 'act("speed/one", { tag: server.tag }' in text and "speed_queued" in text

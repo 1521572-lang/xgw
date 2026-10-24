@@ -236,7 +236,7 @@ def _load_subscription(
                 # DNS при упавшем Xray не отвечает. Через Xray хватит одного повтора:
                 # если серверы мертвы, быстрее перейти к прямому запросу.
                 mark=None if via else mark,
-                bootstrap=None if via or mark is None else cfg.dns.bootstrap,
+                bootstrap=None if via or mark is None else cfg.dns.resolvers,
                 retries=1 if via else 3,
                 cancel=cancel,
             )
@@ -595,7 +595,7 @@ def _resolve_hosts(
             hosts[node.address] = cached[1]
             continue
         try:
-            ips = resolve_domain(node.address, cfg.dns.bootstrap, mark)
+            ips = resolve_domain(node.address, cfg.dns.resolvers, mark)
         except fetch.NoSuchDomain as exc:
             failed.add(node.address)
             if node.keep_tag:

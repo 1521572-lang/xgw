@@ -437,6 +437,8 @@ def outbound_profile(outbound: Mapping) -> str:
     letter = singboxing.bridge_variant(outbound)
     if letter:
         return profiling.PROFILE_OF_LETTER[letter]
+    if fragmenting.split_used(outbound):
+        return profiling.XRAY_SPLIT
     return profiling.XRAY_FRAGMENT if fragmenting.used(outbound) else profiling.XRAY_DEFAULT
 
 
@@ -606,6 +608,9 @@ def build(
             fragmenting.enable(outbound)
             info.fragment = True
             info.profile = profiling.XRAY_FRAGMENT
+        elif profile == profiling.XRAY_SPLIT and fragmenting.eligible(outbound):
+            fragmenting.enable(outbound, fragmenting.SPLIT_TAG)
+            info.profile = profiling.XRAY_SPLIT
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)
@@ -615,6 +620,8 @@ def build(
         outbounds.append(outbound)
     if any(info.fragment for info in nodes):
         outbounds.append(fragmenting.outbound(cfg))
+    if any(info.profile == profiling.XRAY_SPLIT for info in nodes):
+        outbounds.append(fragmenting.split_outbound(cfg))
     outbounds.extend(
         [
             {

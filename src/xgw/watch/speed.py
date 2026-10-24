@@ -62,13 +62,16 @@ def size_mb(cfg: Config, price: float, *, spare: bool = False) -> float:
     return max(min(LIMITED_MIN_MB, base), base / price)
 
 
-def every_hours(cfg: Config, price: float) -> int:
-    """Как часто замерять сервер стоимостью price: безлимитный — раз в
-    speed.unlimited_hours, лимитированный — раз в speed.limited_hours; 0 — не замерять
-    (x100 и дороже либо замеры выключены)."""
+def every_hours(cfg: Config, price: float, *, spare: bool = False) -> int:
+    """Как часто замерять фоном сервер стоимостью price: безлимитный — раз в
+    speed.unlimited_hours, лимитированный — раз в speed.limited_hours, запасной — не чаще раза
+    в speed.spare_hours (0.1.18); 0 — не замерять (x100 и дороже либо замеры выключены)."""
     if price >= SKIP_PRICE:
         return 0
-    return cfg.speed.unlimited_hours if price <= 0 else cfg.speed.limited_hours
+    hours = cfg.speed.unlimited_hours if price <= 0 else cfg.speed.limited_hours
+    if spare and hours and cfg.speed.spare_hours:
+        return max(hours, cfg.speed.spare_hours)
+    return hours
 
 
 def measure(

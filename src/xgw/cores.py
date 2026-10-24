@@ -252,7 +252,7 @@ def _api(core: str) -> str:
 def routes(cfg: Config, mark: int | None) -> list[dict]:
     """Как ходить на GitHub: напрямую (сокетом с меткой мимо перехвата, как `xgw update-xray`),
     а если не вышло — через http-вход Xray, то есть через серверы VPN."""
-    direct = {"mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None}
+    direct = {"mark": mark, "bootstrap": cfg.dns.resolvers if mark is not None else None}
     return [direct, {"proxy": ("127.0.0.1", cfg.xray.http_port)}]
 
 

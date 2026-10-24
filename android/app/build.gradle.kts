@@ -77,8 +77,8 @@ android {
         applicationId = "net.xgw.android"
         minSdk = 30
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.1.17-a3"
+        versionCode = 7
+        versionName = "0.1.18"
     }
     buildTypes {
         getByName("debug") {

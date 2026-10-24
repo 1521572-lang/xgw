@@ -21,6 +21,9 @@ from ..generator import profiles as profiling
 from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
 from ..store import Store
+from . import guard as speedguard
+from . import hosts as probehosts
+from . import resolvers as resolving
 from .scan import CHEAP_SCAN_BYTES, RESERVE_CANDIDATES, RESERVE_RECHECK
 from .speed import SKIP_PRICE, every_hours, size_mb
 
@@ -172,7 +175,7 @@ def speed_note(
         return "скорость не замеряется: основной сервер выключен"
     if price is not None and price >= SKIP_PRICE:
         return "скорость серверов x100 не замеряется: они для LTE"
-    if price is not None and not every_hours(cfg, price):
+    if price is not None and not every_hours(cfg, price, spare=spare):
         key = "unlimited_hours" if price <= 0 else "limited_hours"
         return f"замер выключен: speed.{key} = 0"
     if waiting:
@@ -193,7 +196,7 @@ def speed_entry_mb(cfg: Config, entry: dict, *, spare: bool = False) -> float:
     """МБ замеров сервера в сутки: загрузка (у лимитированных и запасных — меньше) раз в
     срок его класса (speed.every_hours)."""
     price = entry.get("cost", 0.0)
-    hours = every_hours(cfg, price)
+    hours = every_hours(cfg, price, spare=spare)
     if not (cfg.speed.sticky and hours):
         return 0.0
     return size_mb(cfg, price, spare=spare) * 24 / hours
@@ -377,12 +380,17 @@ def collect_status(
     singbox: dict | None = None,
     speeding: dict | None = None,
     stranded: str = "",
+    probe_hosts: dict | None = None,
+    tailscale_via_vpn: bool = False,
+    guard: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
     probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает).
     singbox — состояние второго ядра (daemon._singbox_status); speeding — очередь и
     прогресс замеров скорости (daemon.Daemon.speed_progress); stranded — мёртвого участника
-    заменить некем (daemon.stranded_note), пусто — есть кем."""
+    заменить некем (daemon.stranded_note), пусто — есть кем. probe_hosts — проверочные хосты
+    и их счётчики (watch/hosts.py); tailscale_via_vpn — tailscaled идёт через VPN по
+    аварийному маршруту (DERP напрямую не отвечает)."""
     now = time.time()
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
@@ -396,6 +404,9 @@ def collect_status(
     protocols = _protocols(paths)
     summary: dict = {}
     probe_size: int | None = None
+    resolver_check: dict = {}
+    passive: dict[str, dict] = {}
+    trials: dict = {}
     try:
         store = Store(paths.db_file)
         try:
@@ -410,6 +421,9 @@ def collect_status(
             speeds = _load_json(store.get_meta("speed")) or {}
             summary = _load_json(store.get_meta("nodes_summary")) or {}
             probe_size = measured_probe_size(store, cfg.probe.url)
+            resolver_check = resolving.loads(store.get_meta(resolving.META))
+            passive = _load_json(store.get_meta(speedguard.META_PASSIVE)) or {}
+            trials = _load_json(store.get_meta(profiling.TRIALS_META)) or {}
             events = store.recent_events(10)
         finally:
             store.close()
@@ -430,6 +444,30 @@ def collect_status(
         key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
         record = speeds.get(key)
         return record if isinstance(record, dict) else {}
+
+    learned = trials.get("escalated") if isinstance(trials.get("escalated"), dict) else {}
+    unstable = trials.get("unstable") if isinstance(trials.get("unstable"), dict) else {}
+
+    def extra(info: NodeInfo, measure: dict) -> dict:
+        """Поля 0.1.18: пассивная оценка скорости (ТЗ R5, «из трафика»), сумма замера (сам
+        замер и трафик клиентов), выученный обход (ТЗ R1: «xray+frag после
+        STALL_BEFORE_BODY») и отметка «нестабилен по ТСПУ»."""
+        key = info.fingerprint if len(info.fingerprint) >= 8 else info.tag
+        seen = passive.get(key) if isinstance(passive.get(key), dict) else {}
+        record = learned.get(info.fingerprint)
+        escalation = None
+        if isinstance(record, dict) and record.get("profile") == info.profile:
+            escalation = {
+                "profile": info.profile, "label": profiling.label(info.profile),
+                "verdict": record.get("verdict") or "", "ts": record.get("ts"),
+            }
+        until = unstable.get(info.fingerprint)
+        return {
+            "speed_passive_mbps": seen.get("mbps"), "speed_passive_ts": seen.get("ts"),
+            "speed_test_mbps": measure.get("test_mbps"), "speed_bg_mbps": measure.get("bg_mbps"),
+            "escalation": escalation,
+            "unstable_until": until if isinstance(until, (int, float)) and until > now else None,
+        }
 
     reserve = reserve_tag(_load_json_file(paths.xray_config_file))
     main_tag = (main or {}).get("tag") if cfg.speed.sticky else None
@@ -476,6 +514,9 @@ def collect_status(
                     "speed_ts": measure.get("ts"),
                     "speed_busy": bool(measure.get("busy")),
                     "speed_note": note(info, measure, entry["alive"] if entry else None, None),
+                    # Сервер ждёт замера (кнопка у его строки в панели занята).
+                    "speed_queued": info.probe_tag in speed_queue,
+                    **extra(info, measure),
                 }
             )
         else:
@@ -506,6 +547,8 @@ def collect_status(
                     "speed_ts": measure.get("ts"),
                     "speed_busy": bool(measure.get("busy")),
                     "speed_note": note(info, measure, None, scan["verdict"] if scan else None),
+                    "speed_queued": info.probe_tag in speed_queue,
+                    **extra(info, measure),
                 }
             )
 
@@ -568,6 +611,14 @@ def collect_status(
         # Сводка разбора подписок: сколько серверов отброшено и сколько дублей схлопнуто.
         "nodes": summary,
         "probe_target": probe_target,
+        # Проверочные хосты (ТЗ R3): активный и счётчики удач и ошибок по каждому.
+        "probe_hosts": probe_hosts or {},
+        # Итог последней проверки резолверов bootstrap-DNS (ТЗ R4a): {"ts", "results"}.
+        "resolvers": resolver_check,
+        "tailscale_via_vpn": tailscale_via_vpn,
+        # Контроль скорости участников (ТЗ R5–R8, watch/guard.py): подозрения, идущий поиск
+        # замены, пауза после «глобальной просадки», трафик поисков за сутки.
+        "guard": guard or {},
         "pending_restart": paths.pending_config_file.exists(),
         # Второе ядро: режим [core], установлен ли sing-box, отвечает ли, сколько серверов он
         # ведёт; singbox_pending — его конфиг ждёт окна перезапуска (перечитывание рвёт
@@ -581,6 +632,39 @@ def collect_status(
     masked = masking.mask_obj(status)
     assert isinstance(masked, dict)
     return masked
+
+
+def render_tspu(status: dict) -> list[str]:
+    """Строки 0.1.18 для `xgw status`: поиск замены придушенному и пауза после глобальной
+    просадки (ТЗ R6–R7), Tailscale через VPN (R4b), отказавшие резолверы (R4a), проверочные
+    хосты с ошибками (R3)."""
+    lines: list[str] = []
+    guard = status.get("guard") or {}
+    episode = guard.get("episode")
+    if episode:
+        lines.append(
+            f"Контроль скорости: «{episode.get('name')}» придушен — ищу замену, замерено "
+            f"{episode.get('tried', 0)} из {episode.get('total', 0)} кандидатов"
+        )
+    elif guard.get("cooldown_until"):
+        lines.append(
+            "Контроль скорости: глобальная просадка канала — новые поиски замены после "
+            f"{_clock(guard['cooldown_until'])}"
+        )
+    if status.get("tailscale_via_vpn"):
+        lines.append("Tailscale: временно через VPN — серверы DERP напрямую не отвечают")
+    results = (status.get("resolvers") or {}).get("results") or []
+    dead = [item for item in results if not item.get("ok")]
+    if dead:
+        lines.append(
+            f"bootstrap-DNS: не отвечают {len(dead)} из {len(results)}: "
+            + ", ".join(str(item.get("entry")) for item in dead)
+        )
+    hosts = (status.get("probe_hosts") or {}).get("hosts") or []
+    if any(item.get("errors") for item in hosts):
+        lines.append("Проверочные хосты:")
+        lines.extend(f"  {line}" for line in probehosts.describe(status.get("probe_hosts")))
+    return lines
 
 
 def _protocols(paths: Paths) -> dict[str, str]:
@@ -963,6 +1047,7 @@ def render_status(status: dict) -> str:
         lines.append("Ожидает окна перезапуска: новый конфиг требует перезапуска Xray")
     if status.get("class_warning"):
         lines.append(f"Внимание: {status['class_warning']}")
+    lines.extend(render_tspu(status))
     nodes = render_nodes(status.get("nodes") or {})
     if nodes:
         lines.append(nodes)

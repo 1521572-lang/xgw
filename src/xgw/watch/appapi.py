@@ -49,7 +49,7 @@ FAIL_PAUSE = 0.5
 GZIP_FROM = 2048
 SHUTDOWN_POLL = 0.1
 ACTIONS = (
-    "power", "pin", "unpin", "refresh", "scan", "speed", "sticky",
+    "power", "pin", "unpin", "refresh", "scan", "speed", "speed/one", "sticky",
     "add", "servers", "priority", "core", "subscription/edit", "subscription/remove", "link/remove",
     "device", "record/start", "record/stop", "record/remove",
     "tailscale/exit", "tailscale/direct", "tailscale/route",

@@ -1,7 +1,8 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting|reserve|tailscale|stranded]
+                                                      budget|waiting|reserve|tailscale|stranded|
+                                                      cores|tspu]
                                [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
@@ -19,6 +20,10 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
 Сцена stranded — мёртвого участника заменить некем, а «высокий» стоит у лимитированных x10,
 хотя безлимитные живы (пояснения под «Серверами», ASSUMPTIONS п. 235).
+Сцена tspu (0.1.18) — выученный обход у Германии («xray+split после STALL_BEFORE_BODY»),
+Латвия «нестабильна по ТСПУ», скорость основного «из трафика», идёт поиск замены придушенному
+серверу, один проверочный хост на паузе, один резолвер bootstrap-DNS не отвечает, Tailscale
+временно через VPN. Иконка ↻ у скорости — замер одного сервера (5 секунд) — во всех сценах.
 
 --app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
@@ -165,6 +170,24 @@ def _servers(scene: str) -> list[tuple]:
             for key, tag, name, source, role in SERVERS]
 
 
+def _tspu_fields(scene: str, fingerprint: str, now: float) -> dict:
+    """Сцена tspu: выученный обход, «нестабилен по ТСПУ», скорость из трафика и сумма замера
+    (сам замер + трафик клиентов) — поля, которые 0.1.18 добавила в строку сервера."""
+    if scene != "tspu":
+        return {}
+    fields: dict = {}
+    if fingerprint == MAIN_FP:
+        fields.update(speed_passive_mbps=54.2, speed_passive_ts=now - 120,
+                      speed_test_mbps=61.0, speed_bg_mbps=26.3)
+    if fingerprint == "b2b2b2b2":
+        fields.update(profile="xray:split", core="xray", escalation={
+            "profile": "xray:split", "label": "xray+split", "verdict": "STALL_BEFORE_BODY",
+            "ts": now - 3 * 3600})
+    if fingerprint == "a7a7a7a7":
+        fields["unstable_until"] = now + 4 * 3600
+    return fields
+
+
 def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     members, spares = [], []
     for fingerprint, tag, name, source, role in _servers(scene):
@@ -180,7 +203,8 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         if role == "member":
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             members.append({
-                **base, "alive": live["alive"], "delay_ms": live["delay_ms"],
+                **base, **_tspu_fields(scene, fingerprint, now),
+                "alive": live["alive"], "delay_ms": live["delay_ms"],
                 "dead_since": now - live["dead"] if live.get("dead") else None,
                 "main": scene not in ("reserve", "trouble") and fingerprint == MAIN_FP,
                 "speed_mbps": measure["mbps"] if measure else None,
@@ -196,7 +220,8 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             verdict = live["verdict"]
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             spares.append({
-                **base, "verdict": verdict, "seconds": live["seconds"],
+                **base, **_tspu_fields(scene, fingerprint, now),
+                "verdict": verdict, "seconds": live["seconds"],
                 "bytes": 65536 if verdict in ("OK", "SLOW") else 16384,
                 "scanned": now - 1500 if verdict else None,
                 "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
@@ -283,6 +308,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         },
         "probe_target": probe_target,
         "stranded": stranded, "class_warning": class_note,
+        **_tspu_status(scene, now),
         "pending_restart": False, "events": [],
         "singbox": {"mode": "auto", "installed": True, "version": VERSIONS["sing-box"],
                     "expected": True,
@@ -290,6 +316,35 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
                     "bridged": sum(
                         1 for item in (*members, *spares) if item["core"] == "sing-box")},
         "singbox_pending": False,
+    }
+
+
+def _tspu_status(scene: str, now: float) -> dict:
+    """Сцена tspu: проверочные хосты (R3), bootstrap-DNS (R4a), Tailscale через VPN (R4b) и
+    поиск замены придушенному серверу (R6)."""
+    if scene != "tspu":
+        return {}
+    hosts = [
+        {"host": "cdn.jsdelivr.net", "url": "https://cdn.jsdelivr.net/a.woff", "ok": 812,
+         "errors": 0},
+        {"host": "code.jquery.com", "url": "https://code.jquery.com/b.js", "ok": 40,
+         "errors": 3, "paused_until": now + 22 * 60, "last_error": "STALL_BEFORE_BODY"},
+        {"host": "ajax.aspnetcdn.com", "url": "https://ajax.aspnetcdn.com/c.ttf", "ok": 77,
+         "errors": 0},
+    ]
+    resolvers = [
+        {"entry": "https://1.1.1.1", "ok": True, "ms": 41, "error": ""},
+        {"entry": "https://8.8.8.8", "ok": True, "ms": 41, "error": ""},
+        {"entry": "https://9.9.9.9:5053", "ok": False, "ms": 5000, "error": "тайм-аут"},
+    ]
+    return {
+        "probe_hosts": {"current": hosts[0]["url"], "hosts": hosts},
+        "resolvers": {"ts": now - 600, "results": resolvers},
+        "tailscale_via_vpn": True,
+        "guard": {"on": True, "throttled": ["c3c3c3c3"], "suspects": [],
+                  "episode": {"name": "🇫🇮 Финляндия · Хельсинки", "role": "member",
+                              "mbps": 6.4, "tried": 2, "total": 5},
+                  "cooldown_until": None, "spent_mb": 34.0, "daily_mb": 300},
     }
 
 
@@ -321,6 +376,7 @@ class DemoDaemon:
     def __init__(self) -> None:
         self.poke = threading.Event()
         self._until = {"refresh": 0.0, "scan": 0.0, "speed": 0.0}
+        self._one: dict[str, float] = {}
 
     def request_refresh(self) -> None:
         self._until["refresh"] = time.time() + 4
@@ -333,6 +389,12 @@ class DemoDaemon:
 
     def request_core_check(self) -> None:
         self._until["cores"] = time.time() + 3
+
+    def request_speed_one(self, key: str) -> None:
+        self._one[key] = time.time() + 5  # «замер» одного сервера идёт 5 с
+
+    def speed_one_pending(self) -> list[str]:
+        return sorted(key for key, until in self._one.items() if time.time() < until)
 
     refresh_pending = property(lambda self: time.time() < self._until["refresh"])
     scan_pending = property(lambda self: time.time() < self._until["scan"])
@@ -631,7 +693,7 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve", "tailscale", "cores", "stranded"))
+                 "reserve", "tailscale", "cores", "stranded", "tspu"))
     parser.add_argument("--app-port", type=int, default=0)
     parser.add_argument("--phone-server", default="")
     args = parser.parse_args()

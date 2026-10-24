@@ -33,7 +33,19 @@ Tailscale (Т1, tailscale.py): когда tailscaled работает, его п
 0x80000 в маске 0xff0000) и всё, что уходит в интерфейс tailscale0, обходят перехват (К1,
 К2), blocked (К3) и v6_guard (К4). Набор ts_direct решает, идут ли сокеты tailscaled мимо
 Xray в режиме on: при tailscale.route = "direct" метка в нём всегда, при "vpn" — только
-пока Xray не отвечает (её кладёт и убирает демон, `nft add element` / `flush set`).
+пока Xray не отвечает (её кладёт и убирает демон, `nft add element` / `flush set`). При
+"direct" демон убирает метку и тогда, когда серверы DERP напрямую не отвечают (0.1.18, ТЗ
+R4b): управление и DERP Tailscale временно идут через Xray. Петли «VPN внутри VPN» нет по
+построению: сокеты Xray помечены mark_bypass и в перехват не попадают, а tailnet (tailscale0)
+перехватом не трогается вовсе.
+
+QUIC (0.1.18, ТЗ R2, network.block_quic): UDP/443 в интернет устройств сети и самой машины
+отбивается сразу — ICMP «порт недоступен», и браузер уходит на TCP/443, где действует
+дробление ClientHello. Устройства сети: prerouting не отдаёт такие пакеты в TPROXY, forward
+их отбивает. Сама машина: цепочка loopback_guard отбивает UDP/443 с меткой перехвата
+(mark_proxy) — её ставит цепочка output только трафику, который иначе ушёл бы в Xray, так что
+соединения Xray и sing-box с серверами (mark_bypass), tailscaled и служба времени мимо неё.
+Частные сети, tailnet и сам шлюз (fib local) не затрагиваются.
 
 Шлюз — выходной узел tailnet (exit node, ASSUMPTIONS п. 230): интернет-трафик устройств
 tailnet приходит из tailscale0 с адресов 100.64.0.0/10 и в режиме on идёт в Xray тем же
@@ -130,6 +142,8 @@ class Rules:
     ts_exit: bool = False
     ts_block: bool = False
     ts_exit_direct: tuple[str, ...] = ()
+    # QUIC (UDP/443) в интернет отбивается (network.block_quic): браузер уходит на TCP.
+    block_quic: bool = False
 
     @property
     def ts4(self) -> bool:
@@ -144,6 +158,11 @@ class Rules:
     @property
     def capture(self) -> bool:
         return self.capture_lan or self.capture_local
+
+    @property
+    def quic(self) -> bool:
+        """В таблице есть правило против QUIC: для машины, для LAN или для выходного узла."""
+        return self.block_quic and (self.capture_local or self.capture_lan or self.ts_exit)
 
     @property
     def tproxy(self) -> bool:
@@ -194,12 +213,14 @@ def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
+    ts_fallback: bool = False,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
     tailscale — исключения Т1 для tailscaled (он работает, а машина перехватывается);
     xray_down — Xray не отвечает (для route = "vpn"); tailnet — tailscaled работает
-    (выходной узел)."""
+    (выходной узел); ts_fallback — DERP напрямую не отвечает, и tailscaled идёт через Xray
+    и при route = "direct" (ТЗ R4b)."""
     capture = capture and not blocked
     warnings: list[str] = []
     name = cfg.network.lan_if.strip()
@@ -270,10 +291,12 @@ def build_rules(
             v6_guard=cfg.capture.local and (blocked or not proxy6),
             tailscale=tailscale,
             # Без перехвата (снят, blocked) через Xray tailscaled идти некуда.
-            ts_direct=cfg.tailscale.route != "vpn" or xray_down or not capture,
+            ts_direct=(cfg.tailscale.route != "vpn" and not ts_fallback) or xray_down
+            or not capture,
             ts_exit=tailnet and capture,
             ts_block=tailnet and blocked,
             ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
+            block_quic=capture and cfg.network.block_quic,
         ),
         warnings,
     )
@@ -352,6 +375,17 @@ def _ts_exit_masquerade() -> str:
             "ip daddr != @reserved4 counter masquerade")
 
 
+# QUIC (HTTP/3) в интернет: UDP на порт 443 не в частные сети. Правило отбивает его ICMP «порт
+# недоступен» (ТЗ R2: icmpx port-unreachable; в таблице семейства ip — icmp).
+QUIC_MATCH = "udp dport 443 ip daddr != @reserved4"
+QUIC_REJECT = "counter reject with icmp type port-unreachable"
+
+
+def quic_loaded(text: str) -> bool:
+    """В загруженной таблице есть правило против QUIC (вывод `nft list table`)."""
+    return "udp dport 443" in text and "port-unreachable" in text
+
+
 def _chain(name: str, header: str, rules: list[str]) -> list[str]:
     return [f"chain {name} {{", f"    {header}", *(f"    {rule}" for rule in rules), "}"]
 
@@ -414,8 +448,12 @@ def render(rules: Rules) -> str:
                 # Сам шлюз и частные сети — мимо Xray; DNS (порт 53) перехватывается всегда.
                 "fib daddr type local th dport != 53 return",
                 "ip daddr @reserved4 th dport != 53 return",
-                tproxy,
             ]
+            if rules.block_quic and (rules.capture_lan or rules.ts_exit):
+                # QUIC устройств — не в Xray: его отобьёт forward (reject в prerouting нельзя).
+                # QUIC самой машины сюда не доходит: его отбивает loopback_guard ещё на выходе.
+                prerouting.append(f"{QUIC_MATCH} return")
+            prerouting.append(tproxy)
         blocks.append(
             _chain(
                 "prerouting",
@@ -447,19 +485,27 @@ def render(rules: Rules) -> str:
         # бы Xray к службам самого шлюза. Сокеты direct помечены mark_bypass —
         # к loopback с этой меткой не пускаем. Свои запросы к loopback XGW шлёт без
         # метки (marknet.connect_marked), остальные сокеты Xray к нему не ходят.
+        guard = [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"]
+        if rules.block_quic and rules.capture_local:
+            # QUIC самой машины: метку перехвата цепочка output ставит только тому, что ушло
+            # бы в Xray, — соединения Xray, sing-box и tailscaled здесь не встречаются.
+            guard.append(f"meta mark {proxy} {QUIC_MATCH} {QUIC_REJECT}")
         blocks.append(
             _chain(
                 "loopback_guard",
                 "type filter hook output priority filter; policy accept;",
-                [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"],
+                guard,
             )
         )
 
     ts_reject = "counter reject with icmp type admin-prohibited"
     if rules.ts_exit and not lan_if:
+        quic = [
+            f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
+        ] if rules.block_quic else []
         blocks.append(_chain(
             "forward", "type filter hook forward priority filter; policy accept;",
-            _ts_exit_forward(rules, ts_reject),
+            [*quic, *_ts_exit_forward(rules, ts_reject)],
         ))
         blocks.append(_chain(
             "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
@@ -480,7 +526,15 @@ def render(rules: Rules) -> str:
                     ],
                 )
             )
+        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}'] if (
+            rules.block_quic and rules.capture_lan) else []
+        if rules.block_quic and rules.ts_exit:
+            quic.append(
+                f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
+            )
         forward = [
+            # QUIC устройств сети и tailnet — отбить сразу: браузер уйдёт на TCP/443.
+            *quic,
             # Выходной узел tailnet — раньше «чужого форвардинга» (tailscale0 — не LAN).
             *(_ts_exit_forward(rules, ts_reject) if rules.ts_exit else []),
             # Чужой форвардинг (Docker, libvirt) — не наше дело.
@@ -663,12 +717,18 @@ def render6(rules: Rules) -> str:
             _chain("output", "type route hook output priority mangle; policy accept;", output)
         )
         # То же, что loopback_guard в `ip xgw`: прямой запрос Xray не должен попасть
-        # на службы самого шлюза, если имя разрешилось в ::1.
+        # на службы самого шлюза, если имя разрешилось в ::1. И QUIC машины по IPv6.
+        guard6 = [f"meta mark {bypass} ip6 daddr ::1 counter reject"]
+        if rules.block_quic:
+            guard6.append(
+                f"meta mark {proxy} udp dport 443 ip6 daddr != @reserved6 "
+                "counter reject with icmpv6 type port-unreachable"
+            )
         blocks.append(
             _chain(
                 "loopback_guard",
                 "type filter hook output priority filter; policy accept;",
-                [f"meta mark {bypass} ip6 daddr ::1 counter reject"],
+                guard6,
             )
         )
     if rules.v6_guard:

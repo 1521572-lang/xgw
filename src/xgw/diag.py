@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, engine, fetch, log, masking
+from . import cores, engine, fetch, log, masking, tray
 from . import tailscale as ts
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
@@ -37,6 +38,8 @@ from .paths import Paths
 from .sbcore import binary as sbbinary
 from .store import Store
 from .watch import checks as probes
+from .watch import hosts as probehosts
+from .watch import resolvers as resolving
 from .watch import scan, status, target
 from .xraycore import binary, metrics
 
@@ -146,6 +149,11 @@ class Diag:
             ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
             ("Tailscale", self._tailscale),
+        ]
+        groups += [
+            ("QUIC", self._quic),
+            ("Проверочные хосты", self._probe_hosts),
+            ("Значок в трее", self._tray),
         ]
         if self.net:
             groups += [("probe.url", self._probe), ("bootstrap DNS", self._bootstrap)]
@@ -1088,6 +1096,66 @@ class Diag:
             )]
         return [Check("Tailscale: DNS", OK, "через tailscale0 — только имена tailnet")]
 
+    # --- 0.1.18 --------------------------------------------------------------------
+
+    def _meta(self, key: str) -> str | None:
+        """Запись демона из базы состояния (только чтение); None — базы или записи нет."""
+        try:
+            store = Store(self.paths.db_file)
+        except Exception as exc:
+            self.log.debug("база состояния не открыта: %s", exc)
+            return None
+        try:
+            return store.get_meta(key)
+        finally:
+            store.close()
+
+    def _quic(self) -> list[Check]:
+        """ТЗ R2: правило против QUIC (UDP/443) загружено ровно тогда, когда оно нужно."""
+        capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+        if capture.mode() != "on":
+            return []
+        rules = capture.rules("on")
+        text = nft.listing(self.runner)
+        if text is None:
+            return [Check("QUIC", WARN, "правила не прочитать — запустите через sudo")]
+        loaded = nft.quic_loaded(text)
+        if not self.cfg.network.block_quic:
+            return [Check("QUIC", OK, "не отбивается (network.block_quic = false)")]
+        if not rules.quic:
+            return []
+        if loaded:
+            return [Check("QUIC", OK, "UDP/443 устройств и машины отбивается — браузеры идут по "
+                                      "TCP, где действует дробление ClientHello")]
+        return [Check("QUIC", WARN, "правило против QUIC не загружено",
+                      "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+
+    def _probe_hosts(self) -> list[Check]:
+        """ТЗ R3: активный проверочный хост и ошибки по каждому — со слов демона."""
+        try:
+            saved = json.loads(self._meta(probehosts.META) or "{}")
+        except ValueError:
+            saved = {}
+        lines = probehosts.describe(saved if isinstance(saved, dict) else {})
+        if not lines:
+            return [Check("Проверочные хосты", OK,
+                          f"{len(probehosts.all_urls(self.cfg))}: демон их ещё не пробовал")]
+        level = WARN if any("пропускается" in line for line in lines) else OK
+        return [Check("Проверочные хосты", level, "; ".join(lines))]
+
+    def _tray(self) -> list[Check]:
+        """ТЗ R9: автозапуск значка и графический фреймворк для него."""
+        autostart = self.paths.root / tray.AUTOSTART
+        if not self.cfg.tray.enabled:
+            return [Check("Значок в трее", OK, "выключен (tray.enabled = false)")]
+        if not autostart.exists():
+            return [Check("Значок в трее", WARN, "автозапуск не установлен",
+                          "переустановите XGW из графического сеанса: sudo xgw install")]
+        if not any(importlib.util.find_spec(name) for name in ("PyQt6", "PyQt5")):
+            return [Check("Значок в трее", WARN, "нет PyQt6 и PyQt5 — значок не запустится",
+                          f"sudo apt install {tray.QT_PACKAGE}")]
+        return [Check("Значок в трее", OK, "запускается при входе в сеанс")]
+
     def _mark(self) -> int | None:
         return engine.bypass_mark(self.cfg, self.log)
 
@@ -1101,7 +1169,7 @@ class Diag:
         try:
             reply = fetch.fetch_url(
                 url, mark=mark, timeout=15.0, retries=0,
-                bootstrap=self.cfg.dns.bootstrap if mark is not None else None,
+                bootstrap=self.cfg.dns.resolvers if mark is not None else None,
                 headers={"User-Agent": agent},
             )
         except fetch.FetchError as exc:
@@ -1180,23 +1248,38 @@ class Diag:
         mark = self._mark()
         good: list[str] = []
         bad: list[str] = []
-        for resolver in self.cfg.dns.bootstrap:
+        for resolver in self.cfg.dns.resolvers:
             try:
                 fetch.resolve_domain(name, [resolver], mark=mark)
                 good.append(resolver)
             except Exception as exc:
                 bad.append(f"{resolver} ({exc})")
-        total = len(self.cfg.dns.bootstrap)
+        total = len(self.cfg.dns.resolvers)
+        watched = resolving.loads(self._meta(resolving.META))
+        if watched.get("results"):
+            dead = [item["entry"] for item in watched["results"] if not item.get("ok")]
+            note = (f"демон проверял {_ago_text(watched.get('ts'))}: "
+                    + (f"не отвечали {', '.join(dead)}" if dead else "отвечали все"))
+        else:
+            note = ""
         if not good:
             return [Check(
                 "bootstrap DNS", FAIL,
                 "ни один резолвер не отвечает: домены серверов не разрешить — " + "; ".join(bad),
                 "проверьте dns.bootstrap; обычный DNS провайдера: udp://<адрес>",
             )]
+        tail = f" ({note})" if note else ""
         if bad:
-            return [Check("bootstrap DNS", WARN,
-                          f"отвечают {len(good)} из {total}; не отвечают: " + "; ".join(bad))]
-        return [Check("bootstrap DNS", OK, f"отвечают все {total}")]
+            text = f"отвечают {len(good)} из {total}; не отвечают: " + "; ".join(bad) + tail
+            return [Check("bootstrap DNS", WARN, text)]
+        return [Check("bootstrap DNS", OK, f"отвечают все {total}{tail}")]
+
+
+def _ago_text(ts: object) -> str:
+    if not isinstance(ts, (int, float)):
+        return "недавно"
+    minutes = max(0, int((time.time() - ts) // 60))
+    return f"{minutes} мин назад" if minutes < 120 else f"{minutes // 60} ч назад"
 
 
 def _first_line(exc: Exception) -> str:

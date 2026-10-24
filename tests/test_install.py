@@ -51,6 +51,7 @@ class Box:
         self.old_lan = self.system.add_profile("Wired connection 2", "lan0", active=True)
         # Чей браузер открыла установка (open_panel): пусто — открывать негде.
         self.opened_for: str | Exception = ""
+        self.has_qt = True  # PyQt для значка в трее уже есть (0.1.18) — в своих тестах
 
     def ask(self, question: str) -> bool:
         self.questions.append(question)
@@ -75,6 +76,7 @@ class Box:
             download_singbox=self.download_singbox,
             first_apply=lambda: self.xray_ok, which=self.system.which,
             chown=lambda *args: None, open_panel=self.open_panel,
+            has_qt=lambda: self.has_qt,
         )
 
     def open_panel(self) -> str:

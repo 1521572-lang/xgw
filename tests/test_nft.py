@@ -53,6 +53,8 @@ def test_gateway_with_lan_and_local_capture():
         "ip saddr @bypass4 return",
         "fib daddr type local th dport != 53 return",
         "ip daddr @reserved4 th dport != 53 return",
+        # QUIC устройств — не в Xray: его отбивает forward.
+        "udp dport 443 ip daddr != @reserved4 return",
         "meta l4proto { tcp, udp } counter tproxy to 127.0.0.1:12345 meta mark set 0x1 accept",
     ]
 
@@ -65,7 +67,11 @@ def test_gateway_with_lan_and_local_capture():
 
     forward = _chain(text, "forward")
     assert "policy drop" in text.split("chain forward {")[1].splitlines()[1]
-    assert forward[0] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
+    assert forward[0] == (  # QUIC устройств — сразу ICMP «порт недоступен»
+        'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
+        "counter reject with icmp type port-unreachable"
+    )
+    assert forward[1] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
     assert "tcp flags syn tcp option maxseg size set rt mtu" in forward
     assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
     assert 'iifname "lan0" oifname != "lan0" meta l4proto icmp counter accept' in forward
@@ -110,9 +116,15 @@ def test_loopback_guard_refuses_marked_packets_to_loopback():
     на 127.0.0.1, не должно привести их к службам самого шлюза (ASSUMPTIONS, п. 119)."""
     text = _render(_cfg())
     assert "hook output priority filter" in text.split("chain loopback_guard {")[1].splitlines()[1]
-    assert _chain(text, "loopback_guard") == ["meta mark 0x2 ip daddr 127.0.0.0/8 counter reject"]
+    assert _chain(text, "loopback_guard") == [
+        "meta mark 0x2 ip daddr 127.0.0.0/8 counter reject",
+        # QUIC самой машины (0.1.18): только помеченное для Xray, не сокеты Xray.
+        "meta mark 0x1 udp dport 443 ip daddr != @reserved4 counter reject with icmp type "
+        "port-unreachable",
+    ]
     cfg = _cfg()
     cfg.capture.mark_bypass = 255
+    cfg.network.block_quic = False
     assert _chain(_render(cfg), "loopback_guard") == [
         "meta mark 0xff ip daddr 127.0.0.0/8 counter reject"
     ]
@@ -270,8 +282,13 @@ def test_ip6_table_captures_the_machine_when_ipv6_is_proxied():
     assert "udp sport 546 return" in output  # DHCPv6-клиент
     assert "meta skuid 100 udp dport 123 return" in output  # служба времени мимо перехвата
     assert output[-1] == "meta l4proto { tcp, udp } counter meta mark set 0x1"
-    # Прямой запрос Xray не должен попасть на службы шлюза через ::1 (как в ip xgw).
-    assert _chain(text, "loopback_guard") == ["meta mark 0x2 ip6 daddr ::1 counter reject"]
+    # Прямой запрос Xray не должен попасть на службы шлюза через ::1 (как в ip xgw); QUIC машины
+    # по IPv6 отбивается так же, как по IPv4.
+    assert _chain(text, "loopback_guard") == [
+        "meta mark 0x2 ip6 daddr ::1 counter reject",
+        "meta mark 0x1 udp dport 443 ip6 daddr != @reserved6 counter reject with icmpv6 type "
+        "port-unreachable",
+    ]
     # Запрет форвардинга IPv6 из LAN остаётся: устройства IPv6 не получают.
     assert _chain(text, "forward") == ['iifname "lan0" drop', 'oifname "lan0" drop']
     assert "elements = { ::/127, fc00::/7, fe80::/10, ff00::/8 }" in text
@@ -345,6 +362,7 @@ def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
         "ip saddr @bypass4 return",
         "fib daddr type local th dport != 53 return",
         "ip daddr @reserved4 th dport != 53 return",
+        "udp dport 443 ip daddr != @reserved4 return",
         "meta l4proto { tcp, udp } counter tproxy to 127.0.0.1:12345 meta mark set 0x1 accept",
     ]
     # Метит трафик машины та же цепочка output: дальше его ведёт маршрут, а не lo.
@@ -676,3 +694,48 @@ def test_rendered_chains_are_never_empty(method, ipv6, mode):
                 continue
             chains = nft.chain_rules(lambda argv, text=text, **kwargs: text, family, table)
             assert chains and all(chains.values()), (local, lan, containers, family, chains)
+
+
+def test_quic_is_refused_for_the_network_and_the_machine_but_not_for_servers():
+    """ТЗ R2 (0.1.18): QUIC (UDP/443) устройств сети и самой машины отбивается ICMP «порт
+    недоступен» — браузер сразу уходит на TCP/443, где действует дробление. Не трогаются:
+    сокеты Xray и sing-box (mark_bypass, в том числе серверы hysteria2 на UDP/443), устройства
+    мимо VPN (bypass4), частные сети и tailnet, сам шлюз. network.block_quic = false — правил
+    нет."""
+    text = _render(_cfg())
+    guard = _chain(text, "loopback_guard")
+    assert any("meta mark 0x1 udp dport 443" in rule for rule in guard)
+    assert not any("meta mark 0x2 udp" in rule for rule in guard)  # сокеты Xray — мимо
+    forward = _chain(text, "forward")
+    quic = [rule for rule in forward if "udp dport 443" in rule]
+    assert quic == [
+        'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
+        "counter reject with icmp type port-unreachable"
+    ]
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    assert rules.quic and nft.quic_loaded(text)
+    cfg = _cfg()
+    cfg.network.block_quic = False
+    off = _render(cfg)
+    assert "udp dport 443" not in off and not nft.quic_loaded(off)
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    assert not rules.quic
+    # Перехват снят — снимается и запрет QUIC: сеть работает как обычный роутер.
+    assert "udp dport 443" not in _render(_cfg(), capture=False)
+
+
+def test_quic_rules_pass_nft_check(tmp_path):
+    """Текст с правилами QUIC (и без них) принимает сам nft (`nft -c`, нужен root)."""
+    if shutil.which("nft") is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        pytest.skip("nft -c нужен root и nftables")
+    for block in (True, False):
+        cfg = _cfg()
+        cfg.network.block_quic = block
+        rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+        for text in (nft.render(rules), nft.render6(dataclasses.replace(rules, capture6=True))):
+            if not text:
+                continue
+            result = subprocess.run(
+                ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, check=False,
+            )
+            assert result.returncode == 0, result.stderr

@@ -19,11 +19,13 @@
 VPN — тоже не сюда: так выглядят мёртвые серверы.
 
 Пока probe.url не отвечает, ядро (burstObservatory) пробует серверы по запасному адресу
-(probe.url_fallback, без него — probe.trace_url): иначе оно считало бы мёртвыми всех
+(проверочный хост, который только что открылся через серверы, — 0.1.18; затем
+probe.url_fallback, другие probe.urls и probe.trace_url): иначе оно считало бы мёртвыми всех
 участников, и весь трафик ушёл бы на один fallbackTag балансировщика — живой он или нет.
-Сквозная проверка демона по-прежнему качает сам probe.url: по ней видно, что он ожил, и
-ядро возвращается к нему. Выбор хранится в /var/lib/xgw (переживает перезагрузку) и
-действует, только пока probe.url в конфиге тот же.
+Проверочные хосты демон пробует по кругу (watch/hosts.py) и сам probe.url тоже: когда он
+снова отвечает, ядро возвращается к нему. Выбор хранится в /var/lib/xgw (переживает
+перезагрузку) и действует, только пока probe.url в конфиге тот же. Состояние «не отвечает
+адрес проверки» — только когда через серверы не открывается ни один проверочный хост.
 """
 
 from __future__ import annotations
@@ -46,7 +48,10 @@ SAMPLE_SPARES = 3  # сколько запасных опрашивать вме
 # `xgw probe --all`: столько серверов с одной ошибкой и ни одного удачного — уже повод
 # сказать, что дело, скорее всего, в адресе пробы (решение — за `xgw diag`).
 DOMINANT_SHARE = 0.8
-WARNING = "пробы всех серверов падают — вероятно, недоступен сам probe.url"
+WARNING = (
+    "пробы всех серверов падают — вероятно, недоступны сами проверочные хосты (probe.url и "
+    "probe.urls)"
+)
 ADVICE = "задайте в config.toml другой probe.url — файл 50–65 КБ, который отдаётся без входа"
 
 _GOOD = ("OK", "SLOW")
@@ -158,7 +163,7 @@ def direct_signature(cfg: Config, mark: int | None) -> str:
     try:
         reply = fetch.fetch_url(
             cfg.probe.url, mark=mark, timeout=10.0, retries=0,
-            bootstrap=cfg.dns.bootstrap if mark is not None else None,
+            bootstrap=cfg.dns.resolvers if mark is not None else None,
             headers={"User-Agent": cfg.probe.user_agent},
         )
     except fetch.FetchError:
@@ -206,13 +211,20 @@ def _fallback_file(paths: Paths) -> Path:
 
 
 def fallback_target(cfg: Config) -> str:
-    """Куда пробовать ядру, пока probe.url не отвечает: probe.url_fallback, а без него —
-    probe.trace_url (что он через серверы отвечает, только что показал базовый запрос).
-    Пусто — подменять нечем."""
-    for url in (cfg.probe.url_fallback.strip(), cfg.probe.trace_url.strip()):
+    """Куда пробовать ядру, пока probe.url не отвечает, если другой хост не проверен:
+    probe.url_fallback, затем probe.urls, затем probe.trace_url (что он через серверы
+    отвечает, только что показал базовый запрос). Пусто — подменять нечем."""
+    for url in (cfg.probe.url_fallback.strip(), *cfg.probe.urls, cfg.probe.trace_url.strip()):
         if url.startswith(("http://", "https://")) and url != cfg.probe.url:
             return url
     return ""
+
+
+def _usable(cfg: Config, url: object) -> bool:
+    """Адрес из записи о запасном — ещё из конфига (его не убрали из probe.urls)."""
+    return isinstance(url, str) and bool(url) and url != cfg.probe.url and url in (
+        cfg.probe.url_fallback.strip(), *cfg.probe.urls, cfg.probe.trace_url.strip(),
+    )
 
 
 def _fallback_state(paths: Paths) -> dict:
@@ -227,21 +239,49 @@ def observatory_url(cfg: Config, paths: Paths) -> str:
     """Адрес проб ядра (pingConfig.destination): probe.url, а пока он не отвечает —
     запасной (fallback_target). Запись о запасном относится к своему probe.url: адрес в
     конфиге сменили — она не действует."""
-    if _fallback_state(paths).get("url") == cfg.probe.url:
+    state = _fallback_state(paths)
+    if state.get("url") == cfg.probe.url:
+        if _usable(cfg, state.get("use")):
+            return str(state["use"])
         fallback = fallback_target(cfg)
         if fallback:
             return fallback
     return cfg.probe.url
 
 
-def use_fallback(cfg: Config, paths: Paths, on: bool) -> bool:
-    """Включает (on) или снимает запасной адрес проб ядра. True — адрес проб изменился,
-    конфиг Xray нужно собрать заново."""
+def fallback_since(paths: Paths) -> float | None:
+    """С какого момента ядро на запасном адресе (time.time()); None — на probe.url."""
+    since = _fallback_state(paths).get("since")
+    return float(since) if isinstance(since, (int, float)) and _fallback_file(
+        paths).exists() else None
+
+
+def use_fallback(cfg: Config, paths: Paths, on: bool, url: str = "") -> bool:
+    """Включает (on) или снимает запасной адрес проб ядра. url — проверочный хост, который
+    только что открылся через серверы (без него — fallback_target). True — адрес проб
+    изменился, конфиг Xray нужно собрать заново."""
     before = observatory_url(cfg, paths)
-    if on and fallback_target(cfg):
-        atomic_write_json(
-            _fallback_file(paths), {"url": cfg.probe.url, "since": time.time()}, mode=0o644
-        )
+    if on and (_usable(cfg, url) or fallback_target(cfg)):
+        if before != cfg.probe.url and (not url or url == before):
+            return False  # уже на запасном — отсчёт «с какого момента» не сбрасывать
+        record: dict = {"url": cfg.probe.url, "since": time.time()}
+        if _usable(cfg, url):
+            record["use"] = url
+        atomic_write_json(_fallback_file(paths), record, mode=0o644)
     else:
         _fallback_file(paths).unlink(missing_ok=True)
     return observatory_url(cfg, paths) != before
+
+
+def answers_via(
+    cfg: Config, members: Sequence[NodeInfo], password: str, url: str, user: str = "",
+) -> bool:
+    """Открывается ли url через серверы в работе (probe-inbound каждого, пока не ответит
+    хоть один) — так демон ищет другой проверочный хост, когда не отвечает probe.url."""
+    return any(
+        checks.http_get_via_proxy(
+            "127.0.0.1", info.probe_port, url, timeout=10.0, silence=5.0, max_total=15.0,
+            user_agent=cfg.probe.user_agent, proxy_user=user, proxy_pass=password,
+        ).ok
+        for info in members if info.probe_port
+    )

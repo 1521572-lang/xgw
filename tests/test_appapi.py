@@ -353,7 +353,9 @@ def test_big_state_goes_gzipped_when_the_phone_asks(api):
     headers = _headers(phone.phone, phone.key, "GET", "/api/state", b"", float(stamp), nonce)
     conn = phone._conn()
     try:
-        conn.request("GET", "/api/state", headers={"Host": NAME, "Accept-Encoding": "gzip", **headers})
+        conn.request(
+            "GET", "/api/state", headers={"Host": NAME, "Accept-Encoding": "gzip", **headers},
+        )
         response = conn.getresponse()
         data = response.read()
     finally:

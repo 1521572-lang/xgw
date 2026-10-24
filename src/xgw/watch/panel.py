@@ -56,6 +56,7 @@ from .. import (
     masking,
     priority,
     qr,
+    tray,
 )
 from .. import pin as pinning
 from .. import tailscale as ts
@@ -71,6 +72,7 @@ from ..store import SubscriptionCache
 from . import status
 from .appapi import AppApi
 from .record import MAX_SECONDS, Recorder, RecordError
+from .speed import SKIP_PRICE
 
 COOKIE = "xgw_panel"
 HEADER = "X-XGW-Panel"
@@ -192,6 +194,28 @@ def wait_ready(port: int, wait: float = 15.0) -> bool:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.3)
+
+
+def _shared(entry: dict) -> dict:
+    """Поля строки сервера, общие для участника и запасного: последний замер скорости
+    (watch/speed.py), ждёт ли сервер замера, профиль обхода и ядро."""
+    return {
+        "speed_mbps": entry.get("speed_mbps"), "speed_ts": entry.get("speed_ts"),
+        "speed_error": entry.get("speed_error") or "",
+        "speed_busy": bool(entry.get("speed_busy")),
+        "speed_note": entry.get("speed_note") or "",
+        "speed_queued": bool(entry.get("speed_queued")),
+        # 0.1.18: скорость «из трафика» (ТЗ R5), части суммарного замера, выученный обход и
+        # «нестабилен по ТСПУ» (ТЗ R1).
+        "speed_passive_mbps": entry.get("speed_passive_mbps"),
+        "speed_passive_ts": entry.get("speed_passive_ts"),
+        "speed_test_mbps": entry.get("speed_test_mbps"),
+        "speed_bg_mbps": entry.get("speed_bg_mbps"),
+        "escalation": entry.get("escalation"),
+        "unstable_until": entry.get("unstable_until"),
+        "fragment": bool(entry.get("fragment")),
+        "profile": entry.get("profile") or "", "core": entry.get("core") or "",
+    }
 
 
 class _Server(ThreadingHTTPServer):
@@ -477,24 +501,14 @@ class Panel:
                     status="member", tag=entry.get("tag"), alive=entry.get("alive"),
                     delay_ms=entry.get("delay_ms"), dead_since=entry.get("dead_since"),
                     selected=bool(entry.get("selected")),
-                    # Основной сервер и последний замер скорости (watch/speed.py).
-                    main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
-                    speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
-                    speed_busy=bool(entry.get("speed_busy")),
-                    speed_note=entry.get("speed_note") or "",
-                    fragment=bool(entry.get("fragment")),
-                    profile=entry.get("profile") or "", core=entry.get("core") or "",
+                    # Основной сервер (watch/speed.py).
+                    main=bool(entry.get("main")), **_shared(entry),
                 )
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
-                    speed_mbps=entry.get("speed_mbps"), speed_ts=entry.get("speed_ts"),
-                    speed_error=entry.get("speed_error") or "",
-                    speed_busy=bool(entry.get("speed_busy")),
-                    speed_note=entry.get("speed_note") or "",
-                    fragment=bool(entry.get("fragment")),
-                    profile=entry.get("profile") or "", core=entry.get("core") or "",
+                    **_shared(entry),
                 )
             elif item.get("skip"):
                 row.update(status="skipped", skip=item["skip"])
@@ -615,6 +629,8 @@ class Panel:
                 # Замеры скорости: 0 — выключены, основной выбирается по задержке.
                 "unlimited_hours": cfg.speed.unlimited_hours,
                 "limited_hours": cfg.speed.limited_hours,
+                "spare_hours": cfg.speed.spare_hours,
+                "guard": cfg.speed.guard,
                 "gain_pct": cfg.speed.gain_pct,
                 "hold_minutes": cfg.speed.hold_minutes,
             },
@@ -635,6 +651,12 @@ class Panel:
             # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
             "nodes": snapshot.get("nodes") or {},
             "probe_target": snapshot.get("probe_target") or "",
+            # 0.1.18: проверочные хосты (ТЗ R3), проверка резолверов (R4a), Tailscale через VPN
+            # по аварийному маршруту (R4b), контроль скорости (R5–R8).
+            "probe_hosts": snapshot.get("probe_hosts") or {},
+            "resolvers": snapshot.get("resolvers") or {},
+            "tailscale_via_vpn": bool(snapshot.get("tailscale_via_vpn")),
+            "guard": snapshot.get("guard") or {},
             "pending_restart": bool(snapshot.get("pending_restart")),
             # Второе ядро (sing-box): режим [core], установлен ли, отвечает ли, сколько
             # серверов ведёт; singbox_pending — конфиг ждёт окна перезапуска.
@@ -644,6 +666,9 @@ class Panel:
                 "refresh": bool(daemon is not None and daemon.refresh_pending),
                 "scan": bool(daemon is not None and daemon.scan_pending),
                 "speed": bool(daemon is not None and daemon.speed_pending),
+                # Замер одного сервера (иконка у его скорости): теги, отпечатки и probe-теги,
+                # которые ещё ждут замера, — до того, как демон запишет status.json.
+                "speed_one": daemon.speed_one_pending() if daemon is not None else [],
                 "cores": bool(daemon is not None and daemon.cores_pending),
             },
             # Карточка «Ядра»: выпуски Xray и sing-box на GitHub, обновление и возврат
@@ -1490,6 +1515,8 @@ class Panel:
                     0, "Основной сервер включён: весь трафик пойдёт через самый быстрый"
                 )
             return actions.Outcome(0, "Основной сервер выключен: сервер выбирает ядро")
+        if name == "speed/one":
+            return self._speed_one(body)
         if name in ("refresh", "scan", "speed"):
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
@@ -1512,6 +1539,37 @@ class Panel:
             self.daemon.request_scan()
             return actions.Outcome(0, "Проверяю запасные серверы…")
         return actions.Outcome(2, "нет такого действия")
+
+    def _speed_one(self, body: dict) -> actions.Outcome:
+        """Иконка у скорости сервера (пожелание заказчика 24.10.2026): замер одного этого
+        сервера, а не общий замер всех. Тег — из строки сервера (участник или запасной)."""
+        tag = body.get("tag")
+        if not isinstance(tag, str) or not tag:
+            return actions.Outcome(2, "ожидается тег сервера")
+        if self.daemon is None:
+            return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
+        cfg = self.cfg
+        if not cfg.speed.sticky:
+            return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
+        if not (cfg.speed.unlimited_hours or cfg.speed.limited_hours):
+            return actions.Outcome(
+                2, "замер скорости выключен: speed.unlimited_hours и limited_hours = 0"
+            )
+        _snapshot, _xray_ok, members, spares = self._core(time.time())
+        entry = next(
+            (item for item in (*members, *spares)
+             if pinning.same_server(str(item.get("tag") or ""), tag)),
+            None,
+        )
+        if entry is None:
+            return actions.Outcome(2, "такого сервера сейчас нет ни в работе, ни среди запасных")
+        name = entry.get("name") or entry.get("tag") or tag
+        if float(entry.get("cost") or 0.0) >= SKIP_PRICE:
+            return actions.Outcome(
+                2, f"скорость «{name}» не замеряется: серверы x100 — для LTE"
+            )
+        self.daemon.request_speed_one(str(entry.get("fingerprint") or entry.get("tag")))
+        return actions.Outcome(0, f"Замеряю скорость «{name}»…")
 
     def _add(self, body: dict, store_path: Path) -> actions.Outcome:
         """Вставленный текст: адрес подписки либо ссылки серверов."""
@@ -1595,6 +1653,9 @@ class Panel:
                 f"Панель открывается только по адресу http://127.0.0.1:{self.port}/",
             )
         url = urlsplit(handler.path)
+        if url.path == "/api/tray" or url.path.startswith("/api/tray/"):
+            self._tray(handler, method, url.path, host, body)
+            return
         if method == "POST":
             self._post(handler, url.path, host)
             return
@@ -1644,6 +1705,71 @@ class Panel:
             self._record_file(handler, url.path.removeprefix("/records/"), body)
         else:
             raise Refused(HTTPStatus.NOT_FOUND, "Нет такой страницы")
+
+    def _tray(
+        self, handler: BaseHTTPRequestHandler, method: str, path: str, host: str, body: bool,
+    ) -> None:
+        """Значок в трее (tray.py, ТЗ R9): состояние и два действия — «проверить выпуски
+        ядер» и «замерить скорость» — по своему токену трея и только с этой машины (не по
+        tailnet). Больше этот токен не открывает ничего."""
+        if method == "POST":
+            self._read_body(handler)  # дочитать запрос до ответа (см. _read_body)
+        if host == self._tailnet_host():
+            raise Refused(HTTPStatus.FORBIDDEN, "Значок трея — только на самой машине")
+        if not tray.check(self.paths, handler.headers.get(tray.HEADER) or ""):
+            time.sleep(0.5)  # перебор токена не должен быть быстрым
+            raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен токен трея")
+        if method in ("GET", "HEAD") and path == "/api/tray":
+            self._json(handler, HTTPStatus.OK, self.tray_state(), body)
+            return
+        action = path.removeprefix("/api/tray/")
+        if method != "POST" or action not in tray.ACTIONS:
+            raise Refused(HTTPStatus.NOT_FOUND, "Нет такого действия")
+        self._json(handler, HTTPStatus.OK, self.act(action, {}, origin="значок в трее"), True)
+
+    def tray_state(self) -> dict:
+        """Сводка для значка: состояние шлюза, версии ядер, через какой сервер идёт трафик
+        (страна и скорость), идёт ли задание ядра, заняты ли кнопки."""
+        cfg, now = self.cfg, time.time()
+        snapshot, _xray_ok, members, spares = self._core(now)
+        pin = self._pin(now)
+        chosen = next((member for member in members if member.get("main")), None)
+        pinned = False
+        if pin and not pin.get("down"):
+            found = next(
+                (entry for entry in (*members, *spares)
+                 if pinning.same_server(str(entry.get("tag") or ""), str(pin.get("tag") or ""))),
+                None,
+            )
+            if found is not None:
+                chosen, pinned = found, True
+        main = None
+        if chosen is not None:
+            parts = str(chosen.get("tag") or "").split("-")
+            main = {
+                "name": chosen.get("name") or chosen.get("tag"),
+                "country": parts[1].upper() if len(parts) > 2 else "",
+                "mbps": chosen.get("speed_mbps"), "pinned": pinned,
+            }
+        daemon = self.daemon
+        return {
+            "enabled": cfg.tray.enabled,
+            "version": __version__,
+            "state": snapshot.get("state"),
+            "action": snapshot.get("action") or "",
+            "xray": (snapshot.get("xray") or {}).get("version") or "",
+            "singbox": (snapshot.get("singbox") or {}).get("version") or "",
+            "core_job": cores.job_active(self.paths, now),
+            "main": main,
+            "speed_on": bool(
+                cfg.speed.sticky and (cfg.speed.unlimited_hours or cfg.speed.limited_hours)
+            ),
+            "busy": {
+                "cores": bool(daemon is not None and daemon.cores_pending),
+                "speed": bool(daemon is not None and daemon.speed_pending),
+            },
+            "panel": address(cfg),
+        }
 
     @staticmethod
     def _read_body(handler: BaseHTTPRequestHandler) -> bytes | None:

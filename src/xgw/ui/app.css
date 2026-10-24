@@ -567,6 +567,11 @@ a.icon-btn { text-decoration: none; }
   gap: .6rem;
 }
 .speed { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
+/* Иконка замера одного сервера — маленькая, рядом с цифрой скорости. */
+.icon-btn.speed-btn { width: 1.6rem; height: 1.6rem; align-self: center; }
+.icon-btn.speed-btn svg { width: .9rem; height: .9rem; }
+.icon-btn.speed-btn[data-busy="1"] svg { animation: spin 1s linear infinite; }
+.icon-btn.speed-btn:disabled { cursor: progress; opacity: .7; }
 .speed.old { color: var(--muted); font-weight: 400; }
 .server > .row-sub { grid-area: sub; }
 .server > .row-tools {
@@ -582,8 +587,17 @@ a.icon-btn { text-decoration: none; }
     grid-template-areas: "dot title title value" ". sub sub sub" "tools tools tools tools";
   }
   .server > .row-tools { justify-self: stretch; }
-  /* Скорость — над задержкой: в одну строку они отнимали у имени половину ширины. */
-  .server > .values { flex-direction: column; align-items: flex-end; gap: 0; }
+  /* Скорость — над задержкой: в одну строку они отнимали у имени половину ширины. Иконка
+     замера — слева от скорости, а не отдельной строкой над ней. */
+  .server > .values {
+    display: grid;
+    grid-template-columns: auto auto;
+    align-items: center;
+    justify-items: end;
+    column-gap: .2rem;
+  }
+  .server > .values > * { grid-column: 2; }
+  .server > .values > .speed-btn { grid-column: 1; grid-row: 1; }
   /* Чтобы кнопки сервера уместились в одну строку и на экране телефона. */
   .server .prio { margin: 0; padding-right: .2rem; padding-left: .25rem; }
   .server .choose { padding-right: .55rem; padding-left: .55rem; }

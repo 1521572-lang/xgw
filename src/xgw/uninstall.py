@@ -14,7 +14,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from . import log, managed
+from . import log, managed, tray
 from . import tailscale as ts
 from .config import Config
 from .install import DAEMON_STOP_WAIT, UNIT_FILES, XRAY_USER, Journal
@@ -72,6 +72,7 @@ class Uninstaller:
             ("ufw", self._ufw),
             ("файлы служб", self._unit_files),
             ("ярлык панели", self._launcher),
+            ("значок в трее", self._tray),
         ]
         if not keep_files:
             # Откат неудачной переустановки панель по tailnet не снимает: она нужна дальше.
@@ -201,6 +202,26 @@ class Uninstaller:
             with contextlib.suppress(OSError):
                 path.parent.rmdir()  # только пустой: чужие ярлыки не трогаются
         return "ярлык панели удалён"
+
+    def _tray(self) -> str | None:
+        """Значок в трее (ТЗ R9): автозапуск, файл человека, токен; запущенный значок
+        закрывается (его сторож увидит, что XGW больше нет, и закончит)."""
+        done = False
+        autostart = self.paths.root / tray.AUTOSTART
+        if autostart.exists():
+            autostart.unlink()
+            done = True
+            if self.journal.get("tray_autostart_dir"):
+                with contextlib.suppress(OSError):
+                    autostart.parent.rmdir()
+        user_file = self.journal.get("tray_user_file")
+        if user_file:
+            with contextlib.suppress(FileNotFoundError):
+                Path(user_file).unlink()
+                done = True
+        tray.token_file(self.paths).unlink(missing_ok=True)
+        self.runner(["pkill", "-f", f"{self.paths.launcher} tray"], timeout=10.0, check=False)
+        return "значок в трее убран" if done else None
 
     def _tailscale(self) -> str | None:
         """Serve панели по tailnet и Funnel для приложения на телефоне, если их включил XGW

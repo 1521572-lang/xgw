@@ -49,7 +49,7 @@ def update_xray(
     target = paths.xray_dir
     current = binary.installed_version(paths.xray_bin) if paths.xray_bin.exists() else None
     mark = engine.bypass_mark(cfg, logger)
-    route = {"mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None}
+    route = {"mark": mark, "bootstrap": cfg.dns.resolvers if mark is not None else None}
     try:
         release = get_release(XRAY_VERSION, **route)  # другую версию XGW не ставит
         wanted = binary.parse_version(release.tag)

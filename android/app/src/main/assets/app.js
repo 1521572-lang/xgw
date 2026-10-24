@@ -46,7 +46,8 @@
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
-    singbox: "sing-box", core: "ядро сервера",
+    singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
+    guard: "контроль скорости",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -57,6 +58,7 @@
     record: ["M12 6a6 6 0 1 0 0 12a6 6 0 1 0 0-12z"],
     stop: ["M7 7h10v10H7z"],
     download: ["M12 3v12", "M7 10l5 5 5-5", "M5 21h14"],
+    remeasure: ["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"],
   };
   const TABS = ["home", "servers", "subs", "devices", "events"];
 
@@ -421,7 +423,7 @@
     $("chip").dataset.tone = tone;
     $("chip").textContent = label;
     renderPower(s, tone);
-    draw("servers", [s.servers, s.sources, s.pin, (s.subscriptions || []).length, (s.links || []).length, s.state, s.reserve, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, (s.subscriptions || []).length, (s.links || []).length, s.state, s.reserve, s.sticky, (s.busy || {}).speed_one, Math.floor(s.now / 60)], () => renderServers(s));
     draw("main", [s.main, s.sticky, s.pin, (s.members || []).length, (s.budget || {}).speed_mb], () => renderMain(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("notes", [s.nodes, s.budget, s.probe_target], () => renderNotes(s));
@@ -624,6 +626,28 @@
     return el("span", { class: `speed${server.speed_busy ? " old" : ""}`, text: mbps(server.speed_mbps) });
   }
 
+  // Иконка у скорости (пожелание заказчика 24.10.2026): замер только этого сервера, без общего
+  // замера всех; крутится, пока сервер ждёт замера. Шлюз без такого действия (до 0.1.18) не
+  // присылает busy.speed_one — тогда иконки нет. У x100 замеров нет вовсе.
+  const probeTag = (tag) => `probe-${String(tag || "").split("-").slice(1).join("-")}`;
+  function speedTool(server, s) {
+    const asked = (s.busy || {}).speed_one;
+    if (!Array.isArray(asked) || (server.status !== "member" && server.status !== "spare")) return null;
+    const sticky = s.sticky || {};
+    if (!sticky.on || !(sticky.unlimited_hours || sticky.limited_hours)) return null;
+    if ((server.multiplier || 0) >= 100) return null;
+    const busy = Boolean(server.speed_queued)
+      || [server.tag, server.fingerprint, probeTag(server.tag)].some((key) => asked.includes(key));
+    const button = iconButton("remeasure", `Замерить скорость «${server.name}»`,
+      (event) => act("speed/one", { tag: server.tag }, event.currentTarget));
+    button.classList.add("speed-btn");
+    if (busy) {
+      button.dataset.busy = "1";
+      button.disabled = true;
+    }
+    return button;
+  }
+
   // Когда цифры скорости нет — почему.
   const speedNote = (server, s) => {
     if (hasSpeed(server)) {
@@ -637,18 +661,38 @@
   // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
   const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
 
+  // 0.1.18: выученный обход блокировки («обход: xray+frag после STALL_BEFORE_BODY»), отметка
+  // «нестабилен по ТСПУ» и скорость по реальному трафику через сервер («из трафика»).
+  function extraNote(server, s) {
+    let text = "";
+    const esc = server.escalation;
+    if (esc) {
+      text += ` · обход: ${esc.label}${esc.verdict ? ` после ${esc.verdict}` : ""}`
+        + (esc.ts ? `, ${stamp(esc.ts, s.now)}` : "");
+    }
+    if (server.unstable_until && server.unstable_until > s.now) {
+      text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
+    }
+    if (server.speed_passive_mbps !== null && server.speed_passive_mbps !== undefined
+        && server.speed_passive_mbps >= 1) {
+      text += ` · из трафика ${mbps(server.speed_passive_mbps)}`;
+    }
+    return text;
+  }
+
   function serverNote(server, s) {
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
-      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`;
+      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`
+        + extraNote(server, s);
     }
     if (server.status === "spare") {
       const role = server.reserve
         ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
         : "запасной";
       return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "")
-        + speedNote(server, s);
+        + speedNote(server, s) + extraNote(server, s);
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -665,6 +709,7 @@
   const PROFILES = {
     "xray:default": "Xray",
     "xray:fragment": "Xray · дробление",
+    "xray:split": "Xray · нарезка",
     "singbox:default": "sing-box",
     "singbox:tls_fragment": "sing-box · дробление",
     "singbox:mux_padded": "sing-box · mux",
@@ -752,7 +797,7 @@
     return el("li", { class: classes.join(" "), "data-fingerprint": server.fingerprint },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, speedValue(server), serverValue(server)),
+      el("div", { class: "values" }, speedTool(server, s), speedValue(server), serverValue(server)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -821,7 +866,11 @@
     }
     if (on && measuring) {
       const every = (hours) => (hours ? `раз в ${hours} ч` : "не замеряются");
-      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется у всех живых серверов:"} безлимитных — ${every(sticky.unlimited_hours)}, лимитированных — ${every(sticky.limited_hours)} и меньшей загрузкой, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`;
+      // 0.1.18: фоном — редко; основной — по своему трафику, при падении или «придушивании» —
+      // поиск замены среди кандидатов (решение заказчика 24.10.2026).
+      const spareEvery = sticky.spare_hours ? every(Math.max(sticky.spare_hours, sticky.unlimited_hours || 0)) : every(sticky.unlimited_hours);
+      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
+        + (sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
     }
     $("main-note").textContent = text;
   }

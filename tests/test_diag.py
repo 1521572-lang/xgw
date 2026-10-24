@@ -526,6 +526,7 @@ def test_network_probes(box, monkeypatch):
 
     answers = {"https://1.1.1.1/dns-query": True, "https://8.8.8.8/dns-query": True,
                "udp://77.88.8.8": True}
+    box.cfg.dns.bootstrap_extra = []  # дополнительные резолверы (0.1.18) — в своём тесте
 
     def resolve(name, resolvers, mark=None):
         assert name == "probe.example.net"
@@ -583,9 +584,10 @@ def test_budget_check_shows_the_month_and_the_measured_probe(box):
     """Расход на проверки — в сутки и в месяц, от измеренного размера пробы."""
     (check,) = box.diag()._budget()
     assert check.level == OK and "~830 МБ в сутки при 5 участниках" in check.text
-    # Замеры скорости — сверху: 5 безлимитных серверов × 10 МБ × 24 раза в сутки (issue #1).
-    assert "сквозной проверкой и замером скорости — ~2279 МБ в сутки" in check.text
-    assert "~68 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
+    # Замеры скорости — сверху: 5 безлимитных серверов × 10 МБ × 4 раза в сутки (раз в 6 ч,
+    # 0.1.18; до неё — раз в час, issue #1).
+    assert "сквозной проверкой и замером скорости — ~1279 МБ в сутки" in check.text
+    assert "~38 ГБ в месяц (проба 57620 Б, по оценке)" in check.text
     store = Store(box.paths.db_file)
     status.remember_probe_size(store, box.cfg.probe.url, 87_533)
     store.set_meta("quota", json.dumps({"main": {"total": 100 * 10**9}}))
@@ -629,7 +631,7 @@ def test_dead_probe_url_is_named_by_diag(box, monkeypatch):
     assert [check.level for check in found] == [WARN, FAIL, FAIL]
     assert "напрямую: HTTP 403" in found[0].text
     assert found[2].text.startswith(
-        "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url")
+        "Внимание: пробы всех серверов падают — вероятно, недоступны сами проверочные хосты")
     assert "другой probe.url" in found[2].advice
 
     # Один из серверов файл получил — значит, дело не в адресе пробы.

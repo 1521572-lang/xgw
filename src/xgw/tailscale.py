@@ -88,6 +88,7 @@ class Status:
     peers: tuple[Peer, ...] = ()
     # Шлюз одобрен выходным узлом: 0.0.0.0/0 в Self.AllowedIPs; None — поля нет.
     exit_approved: bool | None = None
+    relay: str = ""  # Self.Relay — код домашнего региона DERP («fra»); пусто — не известен
 
 
 def parse_status(text: str) -> Status | None:
@@ -111,6 +112,7 @@ def parse_status(text: str) -> Status | None:
         magic_dns=magic if isinstance(magic, bool) else None,
         peers=_peers(data.get("Peer")),
         exit_approved="0.0.0.0/0" in allowed if isinstance(allowed, list) else None,
+        relay=str(me.get("Relay") or ""),
     )
 
 
@@ -177,6 +179,40 @@ def netcheck(runner: cmd.Runner = cmd.run) -> Netcheck | None:
         return parse_netcheck(runner(["tailscale", "netcheck"], timeout=30.0))
     except cmd.CommandError:
         return None
+
+
+def parse_derp_hosts(text: str, region: str) -> list[str]:
+    """Имена серверов DERP региона region из `tailscale debug derp-map` (JSON: Regions →
+    {RegionCode, Nodes: [{HostName}]}); нет региона — серверы всех регионов по порядку
+    номеров. Пусто — не JSON или карта пустая."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    regions = data.get("Regions") if isinstance(data, dict) else None
+    if not isinstance(regions, dict):
+        return []
+    picked: list[str] = []
+    others: list[str] = []
+    for key in sorted(regions, key=lambda item: int(item) if str(item).isdigit() else 10**6):
+        item = regions[key]
+        if not isinstance(item, dict) or not isinstance(item.get("Nodes"), list):
+            continue
+        names = [str(node.get("HostName") or "") for node in item["Nodes"]
+                 if isinstance(node, dict) and node.get("HostName")]
+        (picked if region and item.get("RegionCode") == region else others).extend(names)
+    return picked or others
+
+
+def derp_hosts(runner: cmd.Runner = cmd.run) -> list[str]:
+    """Серверы DERP домашнего региона шлюза (Self.Relay), а не известен он — всех регионов.
+    Пусто — CLI нет или он не ответил (проверять нечего)."""
+    me = status(runner)
+    try:
+        text = runner(["tailscale", "debug", "derp-map"], timeout=COMMAND_TIMEOUT)
+    except cmd.CommandError:
+        return []
+    return parse_derp_hosts(text, me.relay if me is not None else "")
 
 
 def default_route_dns(text: str) -> bool | None:

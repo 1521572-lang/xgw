@@ -81,6 +81,8 @@ def dual(tmp_path, monkeypatch):
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []
     cfg.speed.sticky = False
+    # Вторая ступень дробления в Xray (0.1.18) — в своих тестах: здесь лестница, как до неё.
+    cfg.fragment.split = False
     instance = Dual(cfg, paths)
     yield instance
     instance.store.close()
@@ -303,7 +305,9 @@ def test_hysteria2_has_no_ladder_because_quic_cannot_be_fragmented(dual):
     assert len(dual.applied) == applied and dual.profile(spare) == "singbox:default"
 
 
-def test_heavy_profile_is_checked_on_the_base_once_a_day(dual):
+def test_heavy_profile_is_checked_on_the_base_after_a_calm_streak(dual):
+    """Дробление в Xray (0.1.18, ТЗ R1.3): на базе сервер пробуется после
+    fragment.calm_probes проверок подряд без сбоя и не раньше fragment.calm_hours."""
     _start(dual)
     spare = dual.spares(capability="dual", tls=True)[0]
     dual.table[spare.probe_tag] = {"xray:default": "FROZEN"}
@@ -315,8 +319,8 @@ def test_heavy_profile_is_checked_on_the_base_once_a_day(dual):
     dual.t += 12 * 3600
     _rescan(dual)
     dual.tick()
-    assert dual.profile(spare) == "xray:fragment"
-    dual.t += PROFILE_RECHECK
+    assert dual.profile(spare) == "xray:fragment"  # время есть, проверок — одна
+    dual._calm[spare.fingerprint] = dual.cfg.fragment.calm_probes - 1
     _rescan(dual)
     dual.tick()
     assert dual.profile(spare) == "xray:default"
@@ -324,14 +328,24 @@ def test_heavy_profile_is_checked_on_the_base_once_a_day(dual):
     assert _has(dual, "отвечает и без дробления ClientHello — оно выключено")
 
 
-def test_members_are_not_moved_between_profiles(dual):
+def test_members_try_only_xray_fragmenting_in_place(dual):
+    """ТЗ R1 (0.1.18): участника, который «заморозился», не меняют сразу — его проверяют с
+    дроблением в Xray на месте; на sing-box в работе его не переводят (ядро у сервера, через
+    который идёт трафик, на ходу не меняется). Не помогло — его меняют на запасной."""
     _start(dual)
-    member = next(info for info in dual.view() if info.role == "proxy")
+    member = next(info for info in dual.view() if info.role == "proxy"
+                  and info.profile == "xray:default"
+                  and fragmenting.eligible(dual.node(info).outbound or {}))
     dual.table[member.probe_tag] = {"*": "FROZEN"}
     dual.vetted.clear()
     _rescan(dual)
     dual.tick()
-    assert dual.profile(member) == member.profile and dual._profile_wanted == {}
+    assert dual.profile(member) == "xray:fragment"
+    assert dual._profile_trial[member.fingerprint].escalate is True
+    dual.tick()  # и с дроблением не отвечает — замена, на sing-box его не переводили
+    assert all(profile.startswith("xray") for tag, profile in dual.seen
+               if tag == member.probe_tag)
+    assert _has(dual, "в работе не отвечает ни на одной ступени дробления в Xray")
 
 
 def test_fragment_off_removes_every_fragmenting_profile(dual):
@@ -495,7 +509,9 @@ def test_a_restart_in_the_middle_of_a_trial_continues_the_ladder(dual):
     spare = _to_plain_singbox_trial(dual)
     record = _saved(dual)["trials"][spare.fingerprint]
     assert record == {"profile": "singbox:default", "rest": ["singbox:tls_fragment"],
-                      "prev": "xray:default", "recheck": False}
+                      "prev": "xray:default", "recheck": False,
+                      # 0.1.18: из-за какого вердикта лестница; эскалация участника — нет.
+                      "verdict": "TIMEOUT", "escalate": False}
     again = _restart(dual)
     third = None
     try:
@@ -581,6 +597,7 @@ def test_a_restart_during_the_daily_recheck_returns_the_learned_profile(dual):
     dual.tick()
     assert dual.profile(spare) == "xray:fragment" and not dual._profile_trial
     dual.t += PROFILE_RECHECK
+    dual._calm[spare.fingerprint] = dual.cfg.fragment.calm_probes  # проверок подряд хватает
     _rescan(dual)
     dual.tick()
     assert dual.profile(spare) == "xray:default"
@@ -603,8 +620,14 @@ def test_broken_trial_records_are_skipped(dual):
     good = {"profile": "singbox:default", "rest": [], "prev": "xray:default", "recheck": 0}
     raw = json.dumps({"trials": {"a": good, "b": {"profile": "mihomo", "rest": [], "prev": "x"},
                                  "c": "сломано", "d": {**good, "rest": "не список"}},
-                      "switched": {"a": 5, "b": "вчера", "c": True}})
-    cases = [(raw, {"a": {**good, "recheck": False}}, {"a": 5.0})] + [
+                      "switched": {"a": 5, "b": "вчера", "c": True},
+                      # 0.1.18: эскалации, выученный обход, «нестабилен по ТСПУ».
+                      "escalations": {"a": [1.0, 2.0], "b": "часто"},
+                      "escalated": {"a": {"profile": "xray:fragment", "verdict": "FROZEN",
+                                          "ts": 3.0}, "b": {"profile": "mihomo"}},
+                      "unstable": {"a": 4.0, "b": None}})
+    loaded = {"a": {**good, "recheck": False, "verdict": "", "escalate": False}}
+    cases = [(raw, loaded, {"a": 5.0})] + [
         (broken, {}, {}) for broken in ("не json", "[]", "")
     ]
     for text, trials, switched in cases:
@@ -612,6 +635,11 @@ def test_broken_trial_records_are_skipped(dual):
         again = _restart(dual)
         try:
             assert again._trial_saved == trials and again._profile_switched == switched, text
+            if trials:
+                assert again._escalations == {"a": [1.0, 2.0]}
+                assert again._escalated == {
+                    "a": {"profile": "xray:fragment", "verdict": "FROZEN", "ts": 3.0}}
+                assert again._unstable == {"a": 4.0}
         finally:
             again.store.close()
 
@@ -828,8 +856,8 @@ def test_profile_rules_for_the_five_profiles():
     dual_node = raw_to_node(parse_links_text(links.VLESS_WS, "t")[0][0], "t")
     letters = {"d", "f", "m"}
     avail = profiles.available(dual_node, cfg, letters)
-    assert avail == [profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT, profiles.SB_DEFAULT,
-                     profiles.SB_FRAGMENT, profiles.SB_MUX]
+    assert avail == [profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT, profiles.XRAY_SPLIT,
+                     profiles.SB_DEFAULT, profiles.SB_FRAGMENT, profiles.SB_MUX]
     assert profiles.base(cfg, avail) == profiles.XRAY_DEFAULT
     cfg.fragment.mode = "always"
     assert profiles.base(cfg, avail) == profiles.XRAY_FRAGMENT
@@ -840,11 +868,14 @@ def test_profile_rules_for_the_five_profiles():
     assert profiles.base(cfg, avail) == profiles.SB_DEFAULT
     cfg.managed.core[dual_node.fingerprint] = "xray"
     assert profiles.available(dual_node, cfg, letters) == [
-        profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT]
-    # Без заведённых вариантов sing-box остаются только профили Xray.
+        profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT, profiles.XRAY_SPLIT]
+    # Без заведённых вариантов sing-box остаются только профили Xray; split = false — без
+    # второй ступени дробления.
     cfg.managed.core.clear()
+    cfg.fragment.split = False
     assert profiles.available(dual_node, cfg, set()) == [
         profiles.XRAY_DEFAULT, profiles.XRAY_FRAGMENT]
+    cfg.fragment.split = True
     # Обученный профиль сохраняется, пока он допустим; настроечный (база) следует за настройками.
     assert profiles.resolve(dual_node, cfg, letters, current=profiles.SB_MUX) == profiles.SB_MUX
     # Обычный sing-box у сервера с базой Xray (0.1.13) — выученный, пока ядро сервера в
