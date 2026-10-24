@@ -8,9 +8,9 @@ import links
 import pytest
 from test_daemon import Harness
 
-from xgw import engine, managed
+from xgw import cores, engine, managed
 from xgw.config import Config
-from xgw.daemon import PROFILE_RECHECK, PROFILE_RETRY, SINGBOX_RETRY, TRIALS_META
+from xgw.daemon import CORE_RECOVER, PROFILE_RECHECK, PROFILE_RETRY, SINGBOX_RETRY, TRIALS_META
 from xgw.generator import builder, profiles
 from xgw.generator import fragment as fragmenting
 from xgw.generator import singbox as singboxing
@@ -745,6 +745,33 @@ def test_a_good_rollback_ends_the_incident(dual):
         dual.t += 20
         dual.tick()
     assert not dual._singbox_failed and _has(dual, "откатил конфиг на last-good")
+
+
+def test_singbox_that_dies_during_the_watch_gets_its_previous_version_back(dual):
+    """Сутки после обновления sing-box из панели (cores.py): он не поднимается ни с новым, ни с
+    прежним конфигом — серверы уходят на Xray, как обычно, и служба xgw-core возвращает прежнюю
+    версию; поднять sing-box демон пробует снова через CORE_RECOVER, а не через SINGBOX_RETRY."""
+    asked = []
+    dual._start_core_job = lambda core, action, *, reason: asked.append((core, action)) or ""
+    prev = cores.prev_dir(dual.paths, "sing-box")
+    prev.mkdir(parents=True)
+    (prev / "sing-box").write_text("1.14.3", encoding="utf-8")
+    cores.save_state(dual.paths, {"sing-box": {
+        "accepted": "1.14.4", "previous": "1.14.3", "watch_until": dual.t + 3600}})
+    _start(dual)
+    dual.singbox.is_alive = False
+    dual.singbox.restart_error = "не запустился"
+    dual.singbox.rollback_mode = "unchanged"
+    for _ in range(2):
+        dual.t += 20
+        dual.tick()
+    assert dual._singbox_failed and asked == [("sing-box", "rollback")]
+    assert _has(dual, "sing-box не поднимается — серверы переведены на Xray")
+    assert _has(dual, "шлюз возвращает прежнюю версию 1.14.3")
+    dual.singbox.restart_error = None  # прежняя версия на месте
+    dual.t += CORE_RECOVER
+    dual.tick()
+    assert not dual._singbox_failed and _has(dual, "sing-box снова работает")
 
 
 def test_status_shows_core_profile_and_protocol(dual):

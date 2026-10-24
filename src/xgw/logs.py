@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
-from . import __version__, engine, masking
+from . import __version__, cores, engine, masking
 from .config import Config
 from .generator import validate
 from .install import UNITS
@@ -35,7 +35,8 @@ TAIL_BYTES = 4 * 1024 * 1024  # сколько читать с конца фай
 
 def journal_args(lines: int, *, follow: bool = False) -> list[str]:
     args = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines)]
-    for unit in UNITS:
+    # И служба обновления ядер из панели: её итог и сбои — тоже в журнале.
+    for unit in (*UNITS, cores.UNIT):
         args += ["-u", unit]
     if follow:
         args.append("-f")
@@ -127,7 +128,12 @@ def export(
         )
     except OSError as exc:
         members["config.toml"] = f"# не прочитан: {exc}\n"
-    for name, path in (("status.json", paths.status_file),):
+    for name, path in (
+        ("status.json", paths.status_file),
+        # Обновление ядер из панели: принятые версии, итог задания, что нашлось на GitHub.
+        ("cores.json", paths.cores_state_file),
+        ("cores-check.json", paths.cores_check_file),
+    ):
         try:
             members[name] = clean(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:

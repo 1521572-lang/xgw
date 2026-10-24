@@ -11,6 +11,8 @@
 сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
 waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками, reserve —
 безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1),
+cores — на GitHub есть новые Xray и sing-box (карточка «Ядра»: «Обновить» и «Вернуть …» идут
+по этапам за несколько секунд, обновление sing-box «не проходит проверку»),
 tailscale — шлюз ещё не в tailnet (вход через 12 секунд после нажатия), провайдер выдаёт
 адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
 10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
@@ -44,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_tailscale import FakeTailscale
 
-from xgw import actions, config, engine, tailscale
+from xgw import actions, config, cores, engine, tailscale
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -147,6 +149,10 @@ RESERVE_LIVE = {
 }
 
 
+# Версии ядер «на шлюзе»: их меняют кнопки карточки «Ядра» (DemoPanel._core_demo).
+VERSIONS = {"xray": "26.3.27", "sing-box": "1.14.3"}
+
+
 def _servers(scene: str) -> list[tuple]:
     if scene == "reserve":
         return RESERVE_SERVERS
@@ -234,7 +240,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     )
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
-        "xray": {"ok": scene != "trouble", "version": "26.3.27"},
+        "xray": {"ok": scene != "trouble", "version": VERSIONS["xray"]},
         # Жизненный цикл перехвата пишет демон (daemon.Lifecycle); панель — строкой под кнопкой.
         "capture": {
             "loaded": True,
@@ -262,7 +268,8 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         },
         "probe_target": probe_target,
         "pending_restart": False, "events": [],
-        "singbox": {"mode": "auto", "installed": True, "version": "1.14.3", "expected": True,
+        "singbox": {"mode": "auto", "installed": True, "version": VERSIONS["sing-box"],
+                    "expected": True,
                     "alive": True, "failed": False,
                     "bridged": sum(
                         1 for item in (*members, *spares) if item["core"] == "sing-box")},
@@ -308,9 +315,13 @@ class DemoDaemon:
     def request_speed(self) -> None:
         self._until["speed"] = time.time() + 8
 
+    def request_core_check(self) -> None:
+        self._until["cores"] = time.time() + 3
+
     refresh_pending = property(lambda self: time.time() < self._until["refresh"])
     scan_pending = property(lambda self: time.time() < self._until["scan"])
     speed_pending = property(lambda self: time.time() < self._until["speed"])
+    cores_pending = property(lambda self: time.time() < self._until.get("cores", 0.0))
 
 
 class DemoPanel(Panel):
@@ -348,10 +359,82 @@ class DemoPanel(Panel):
             later = {"tailscale/login": fake.complete_login, "tailscale/serve": fake.enable_https,
                      "tailscale/funnel": fake.allow_funnel, "phones/pair": fake.allow_funnel}[name]
             threading.Timer(12 if name == "tailscale/login" else 10, later).start()
+        if name in ("cores/update", "cores/rollback"):
+            return self._core_demo(name.removeprefix("cores/"), body)
         outcome = super()._act(name, body)
         if name == "phones/pair" and outcome.ok and self.demo_phone:
             threading.Timer(20, self._demo_phone).start()
         return outcome
+
+    def _core_demo(self, action: str, body: dict) -> actions.Outcome:
+        """Как служба xgw-core, но за секунды: этапы в cores.json, затем итог и событие. Обновление
+        sing-box «не проходит» сквозную проверку — видно, как шлюз возвращает прежний."""
+        core = body.get("core")
+        if core not in cores.CORES:
+            return actions.Outcome(2, "ожидается ядро: xray или sing-box")
+        title, paths = cores.TITLES[core], self.paths
+        old = VERSIONS[core]
+        target = body.get("version") if action == "update" else cores.previous(paths, core)
+        if not target:
+            return actions.Outcome(2, f"прежней версии {title} нет — возвращаться не к чему")
+
+        def stage(step: str, **job) -> None:
+            state = cores.load_state(paths)
+            state["job"] = {**(state.get("job") or {}), "stage": step, **job}
+            cores.save_state(paths, state)
+
+        def run() -> None:
+            now = time.time()
+            stage("", core=core, action=action, version=target, state="running", started=now,
+                  text="", finished=None)
+            steps = [f"скачиваю {title} {target} с GitHub", f"проверяю {title} {target} на рабочем "
+                     "конфиге", f"ставлю {title} {target} и перезапускаю",
+                     f"проверяю запрос через серверы с {title} {target}"]
+            if action == "rollback":
+                steps = [f"проверяю прежний {title} {target} на рабочем конфиге",
+                         f"возвращаю {title} {target}"]
+            for text in steps:
+                stage(text)
+                time.sleep(2)
+            state = cores.load_state(paths)
+            if action == "update" and core == "sing-box":
+                reason = "ни один из серверов, что отвечали через прежнюю версию, не отвечает 45 с"
+                state[core] = {**(state.get(core) or {}),
+                               "rejected": {"version": target, "reason": reason,
+                                            "at": time.time(), "kind": "check"}}
+                text, result = (f"{title} {target} не прошёл проверку: {reason} — возвращён "
+                                f"прежний {old}", "failed")
+            elif action == "update":
+                VERSIONS[core] = target
+                prev = cores.prev_dir(paths, core)
+                prev.mkdir(parents=True, exist_ok=True)
+                (prev / cores.core_bin(paths, core).name).write_text(old, encoding="utf-8")
+                state[core] = {"accepted": target, "previous": old, "updated": time.time(),
+                               "watch_until": time.time() + cores.WATCH_SECONDS, "rejected": None}
+                text = (f"{title} обновлён: {old} → {target}, проверки пройдены. Сутки шлюз "
+                        f"следит за ним и вернёт {old} сам, если ядро перестанет отвечать. "
+                        f"Вернуть {old} — кнопка «Вернуть {old}» в панели")
+                result = "ok"
+            else:
+                VERSIONS[core] = target
+                cores.forget(paths, core)
+                state = cores.load_state(paths)
+                state[core] = {"accepted": target, "previous": "", "watch_until": 0,
+                               "rejected": {"version": old, "reason": "возвращена прежняя версия",
+                                            "kind": "rollback",
+                                            "at": time.time()}}
+                text, result = f"{title} {old} убран, возвращён прежний {target}", "ok"
+            state["job"] = {**state["job"], "state": result, "stage": "", "text": text,
+                            "finished": time.time()}
+            cores.save_state(paths, state)
+            with actions.open_store(paths) as store:
+                store.add_event("cores", text)
+
+        threading.Thread(target=run, daemon=True).start()
+        if action == "update":
+            return actions.Outcome(0, f"Обновляю {title} до {target}: скачиваю и проверяю — итог "
+                                      "появится в карточке «Ядра» и в событиях")
+        return actions.Outcome(0, f"Возвращаю {title} {target}…")
 
     def _demo_phone(self) -> None:
         code = self.phones.pairing()["code"]
@@ -443,6 +526,15 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         store.add_event("rotation", "замена участников: proxy-tr-0000 → «🇫🇮 Финляндия · Хельсинки»")
     store.add_event("capture", "перехват включён: сеть enp4s0 и эта машина — через Xray")
     store.close()
+    if scene == "cores":
+        VERSIONS["xray"] = "26.10.21"
+        atomic_write_json(paths.cores_check_file, {
+            "at": now - 2 * 3600, "error": "",
+            "xray": {"installed": "26.10.21", "withdrawn": False, "error": "", "latest": {
+                "version": "26.10.30", "prerelease": True, "published": "2026-10-23T09:12:00Z"}},
+            "sing-box": {"installed": "1.14.3", "withdrawn": False, "error": "", "latest": {
+                "version": "1.14.4", "prerelease": False, "published": "2026-10-22T18:40:00Z"}},
+        }, mode=0o644)
 
     def keep_fresh() -> None:  # как демон: статус переписывается на каждом шаге
         while True:
@@ -523,7 +615,7 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve", "tailscale"))
+                 "reserve", "tailscale", "cores"))
     parser.add_argument("--app-port", type=int, default=0)
     parser.add_argument("--phone-server", default="")
     args = parser.parse_args()

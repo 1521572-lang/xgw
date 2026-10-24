@@ -44,7 +44,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import __version__, actions, config, cost, engine, log, managed, masking, priority, qr
+from .. import (
+    __version__,
+    actions,
+    config,
+    cores,
+    cost,
+    engine,
+    log,
+    managed,
+    masking,
+    priority,
+    qr,
+)
 from .. import pin as pinning
 from .. import tailscale as ts
 from ..config import Config
@@ -628,7 +640,11 @@ class Panel:
                 "refresh": bool(daemon is not None and daemon.refresh_pending),
                 "scan": bool(daemon is not None and daemon.scan_pending),
                 "speed": bool(daemon is not None and daemon.speed_pending),
+                "cores": bool(daemon is not None and daemon.cores_pending),
             },
+            # Карточка «Ядра»: выпуски Xray и sing-box на GitHub, обновление и возврат
+            # прежней версии (cores.py).
+            "cores": self._cores_card(snapshot, now),
             # Прогресс замеров скорости: сколько из скольких (демон пишет в status.json).
             "speed_progress": snapshot.get("speed") or {},
         }
@@ -640,6 +656,51 @@ class Panel:
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
         return masked
+
+    def _cores_card(self, snapshot: dict, now: float) -> dict:
+        singbox = snapshot.get("singbox") or {}
+        installed = {
+            "xray": str((snapshot.get("xray") or {}).get("version") or ""),
+            "sing-box": str(singbox.get("version") or ""),
+        }
+        # sing-box — только установленный: ставит его установка, а не обновление из панели.
+        shown = bool(singbox.get("installed"))
+        return cores.panel_state(self.paths, installed, singbox_shown=shown, now=now)
+
+    def _core_job(self, action: str, body: dict) -> actions.Outcome:
+        """Кнопки «Обновить» и «Вернуть …» карточки «Ядра»: задание службе xgw-core."""
+        core = body.get("core")
+        if core not in cores.CORES:
+            return actions.Outcome(2, "ожидается ядро: xray или sing-box")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        title = cores.TITLES[core]
+        if action == "update":
+            version = body.get("version")
+            found = cores.load_check(self.paths).get(core)
+            latest = (found.get("latest") if isinstance(found, dict) else None) or {}
+            if not isinstance(version, str) or not version or version != latest.get("version"):
+                # Ставится только выпуск, найденный проверкой: его тег, файлы и хеш смотрели.
+                return actions.Outcome(
+                    2, f"на GitHub не найден {title} {version} — нажмите «Проверить сейчас»",
+                )
+            error = cores.start(self.paths, core, "update", version=version, runner=self.runner)
+            if error:
+                return actions.Outcome(1, error)
+            self._event(f"обновление {title} до {version} запущено из панели")
+            return actions.Outcome(
+                0, f"Обновляю {title} до {version}: скачиваю и проверяю — итог появится в "
+                   "карточке «Ядра» и в событиях",
+            )
+        previous = cores.previous(self.paths, core)
+        if not previous:
+            return actions.Outcome(2, f"прежней версии {title} нет — возвращаться не к чему")
+        error = cores.start(self.paths, core, "rollback", runner=self.runner)
+        if error:
+            return actions.Outcome(1, error)
+        self._event(f"возврат прежнего {title} {previous} запущен из панели")
+        return actions.Outcome(0, f"Возвращаю {title} {previous}…")
 
     def _devices(self, info: dict) -> list[dict]:
         """Устройства сети: аренды dnsmasq плюс пущенные мимо VPN в панели, которых
@@ -1363,6 +1424,13 @@ class Panel:
             return self._tailscale(name.removeprefix("tailscale/"), body, store_path)
         if name.startswith("phones/"):
             return self._phone_action(name.removeprefix("phones/"), body, store_path)
+        if name == "cores/check":
+            if self.daemon is None:
+                return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
+            self.daemon.request_core_check()
+            return actions.Outcome(0, "Проверяю выпуски Xray и sing-box на GitHub…")
+        if name in ("cores/update", "cores/rollback"):
+            return self._core_job(name.removeprefix("cores/"), body)
         if name == "subscription/remove":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:

@@ -1,0 +1,22 @@
+# XGW: обновление и возврат ядер Xray и sing-box по кнопке в панели (cores.py). Демону каталоги
+# ядер в /opt/xgw только для чтения (ProtectSystem=strict в xgw.service), поэтому замену делает
+# эта служба: демон кладёт задание в /run/xgw/core-request.json и запускает её. Включать её не
+# нужно — она работает только по заданию и сама завершается; итог пишет в /var/lib/xgw/cores.json
+# и в события панели.
+[Unit]
+Description=XGW: обновление и возврат ядер (по кнопке в панели)
+Documentation=https://github.com/1521572-lang/xgw
+After=network.target xgw-net.service
+ConditionPathExists=/run/xgw/core-request.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xgw cores run-job
+# Загрузка архива (sing-box — до 5 минут), проверки, перезапуск и возврат — с запасом.
+TimeoutStartSec=900
+ProtectSystem=strict
+ReadWritePaths=/opt/xgw /var/lib/xgw -/run/xgw
+PrivateTmp=true
+NoNewPrivileges=true
+# CAP_NET_ADMIN — метка SO_MARK: на GitHub напрямую, мимо перехвата (как xgw update-xray).
+CapabilityBoundingSet=CAP_NET_ADMIN

@@ -41,7 +41,7 @@
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
-    singbox: "sing-box", core: "ядро сервера",
+    singbox: "sing-box", core: "ядро сервера", cores: "обновление ядер",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -250,6 +250,8 @@
     draw("events", s.events, () => renderEvents(s));
     draw("tailscale", s.tailscale, () => renderTailscale(s));
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
+    draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
+    setBusy($("cores-check"), s.busy.cores);
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
@@ -1140,6 +1142,86 @@
     "");
   }
 
+  // Ядра Xray и sing-box: новый выпуск на GitHub ставится кнопкой, шлюз проверяет его и при
+  // сбое сам возвращает прежний; прежний лежит рядом — для кнопки «Вернуть …».
+  function renderCores(s) {
+    const c = s.cores || { rows: [] };
+    const rows = c.rows || [];
+    $("cores-card").hidden = !rows.length;
+    const job = c.job || null;
+    const running = Boolean(c.active);
+    // «sing-box» пишется со строчной и в начале фразы.
+    const sentence = (value) => (value.startsWith("sing-box") ? value : capital(value));
+    let text = "";
+    let bad = false;
+    if (running) {
+      text = job && job.state === "running" && job.stage ? sentence(job.stage) + "…" : "Ядро сейчас обновляется — подождите…";
+    } else if (job && job.finished && s.now - job.finished < 86400) {
+      text = sentence(job.text || "");
+      bad = job.state === "failed";
+    }
+    $("cores-job").textContent = text;
+    $("cores-job").hidden = !text;
+    $("cores-job").className = bad ? "note bad" : "note";
+    $("cores-job").setAttribute("role", bad ? "alert" : "status");
+    fill($("cores"), rows.map((row) => coreRow(row, s, running)), "");
+    $("cores-checked").textContent = c.checked
+      ? `Выпуски на GitHub проверены ${stamp(c.checked, s.now)}` + (c.error ? ` — не всё удалось: ${c.error}` : "") + ". Шлюз проверяет их раз в сутки."
+      : "Выпуски на GitHub ещё не проверялись — шлюз проверяет их раз в сутки.";
+    $("cores-check").disabled = running;
+  }
+
+  function coreRow(row, s, running) {
+    const title = el("div", { class: "row-title" }, el("span", { text: row.title }));
+    if (row.withdrawn) title.append(el("span", { class: "tag rec", text: "убрана с GitHub" }));
+    if (row.watch_until) title.append(el("span", { class: "tag warn", text: `наблюдение до ${stamp(row.watch_until, s.now)}` }));
+    const origin = !row.installed ? "не установлен"
+      : row.accepted ? `${row.installed} · обновлён из панели и проверен шлюзом`
+        : row.installed === row.baseline ? `${row.installed} · проверен разработчиком XGW`
+          : `${row.installed} · XGW проверен на ${row.baseline}`;
+    const main = el("div", { class: "row-main" }, title, el("div", { class: "row-sub", text: origin }));
+    const latest = row.latest;
+    if (latest) {
+      const published = Date.parse(latest.published || "");
+      main.append(el("div", { class: "row-sub", text: `На GitHub есть ${latest.version}`
+        + (latest.prerelease ? " (предварительный выпуск)" : "")
+        + (Number.isFinite(published) ? ` от ${day(published / 1000)}` : "") }));
+    }
+    if (row.withdrawn) main.append(el("div", { class: "row-error", text: "Разработчики убрали эту версию с GitHub — так бывает, когда в ней находят опасную ошибку. Обновите ядро." }));
+    const rejected = row.rejected;
+    if (rejected && rejected.version && rejected.version !== row.installed) {
+      main.append(el("div", { class: "row-error", text: rejected.kind === "rollback"
+        ? `${rejected.version} убран: ${rejected.reason}`
+        : `${rejected.version} не прошёл проверку на этом шлюзе: ${rejected.reason}` }));
+    }
+    if (row.watch_until && row.previous) {
+      main.append(el("div", { class: "row-sub", text: `Если ядро перестанет отвечать, шлюз сам вернёт ${row.previous}.` }));
+    }
+    const tools = el("div", { class: "row-actions" });
+    if (latest) {
+      const again = rejected && rejected.version === latest.version && rejected.kind !== "rollback";
+      tools.append(el("button", {
+        class: "btn primary small-btn", type: "button", disabled: running,
+        text: again ? "Попробовать снова" : `Обновить до ${latest.version}`,
+        onclick: () => confirmRemove(
+          `Обновить ${row.title} до ${latest.version}?`,
+          `Шлюз скачает ${row.title} ${latest.version} с GitHub, сверит SHA-256 и проверит его на рабочем конфиге. На несколько секунд соединения оборвутся. Если новое ядро не запустится или запрос в интернет через серверы не пройдёт, шлюз сам вернёт ${row.installed}. Ещё сутки он следит за ядром.`,
+          () => act("cores/update", { core: row.core, version: latest.version }), "Обновить", "primary"),
+      }));
+    }
+    if (row.previous) {
+      tools.append(el("button", {
+        class: "btn ghost small-btn", type: "button", disabled: running,
+        text: `Вернуть ${row.previous}`,
+        onclick: () => confirmRemove(
+          `Вернуть ${row.title} ${row.previous}?`,
+          `Шлюз поставит прежнюю версию ${row.previous} вместо ${row.installed} и перезапустит ядро — на несколько секунд соединения оборвутся.`,
+          () => act("cores/rollback", { core: row.core }), "Вернуть", "primary"),
+      }));
+    }
+    return el("li", { class: "core-row", "data-core": row.core }, main, tools);
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -1153,10 +1235,11 @@
   let confirmed = null;
   let editSubCallback = null;
 
-  function confirmRemove(title, text, action, yes = "Убрать") {
+  function confirmRemove(title, text, action, yes = "Убрать", tone = "danger") {
     $("confirm-title").textContent = title;
     $("confirm-text").textContent = text;
     $("confirm-yes").textContent = yes;
+    $("confirm-yes").className = `btn ${tone === "primary" ? "primary" : "danger"}`;
     confirmed = action;
     $("confirm-dialog").showModal();
   }
@@ -1219,6 +1302,7 @@
       () => act("tailscale/funnel", { on: false }, $("ts-funnel")), "Выключить");
   });
   $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
+  $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";

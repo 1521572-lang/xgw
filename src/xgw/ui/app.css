@@ -143,6 +143,7 @@ button, textarea, input { font: inherit; color: inherit; }
   .events-card { order: 5; }
   .ts-card { order: 6; }
   .phones-card { order: 7; }
+  .cores-card { order: 8; }
   body[data-empty="1"] .subs-card { order: 2; }
   body[data-empty="1"] .servers-card { order: 3; }
 }
@@ -396,6 +397,12 @@ a.btn.primary { color: var(--accent-ink); }
 .row-sub { overflow: hidden; color: var(--muted); font-size: .87rem; text-overflow: ellipsis; }
 .row-error { color: var(--bad); font-size: .87rem; overflow-wrap: anywhere; }
 .row-actions { display: flex; align-items: center; gap: .25rem; flex: none; }
+
+/* Карточка «Ядра»: тексты переносятся, кнопки «Обновить» и «Вернуть …» уходят под них на узком экране. */
+.cores .core-row { flex-wrap: wrap; align-items: flex-start; }
+.cores .core-row .row-main { flex-basis: 14rem; }
+.cores .core-row .row-sub { overflow-wrap: anywhere; }
+.cores .core-row .row-actions { flex-wrap: wrap; gap: .4rem; }
 
 .edit-sub { display: flex; flex-direction: column; gap: .4rem; margin-top: .5rem; }
 .edit-sub label { color: var(--muted); font-size: .87rem; }

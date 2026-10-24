@@ -20,10 +20,20 @@ def pytest_configure(config):
 
 @pytest.fixture(autouse=True)
 def _no_github(monkeypatch):
-    """Тесты не ходят на GitHub: забытая подмена не должна скачать релиз Xray."""
+    """Тесты не ходят на GitHub: забытая подмена не должна скачать релиз Xray или sing-box."""
     monkeypatch.setattr(
         "xgw.xraycore.binary.RELEASES_API", "http://127.0.0.1:9/tests-must-not-reach-github"
     )
+    monkeypatch.setattr(
+        "xgw.sbcore.binary.RELEASES_API", "http://127.0.0.1:9/tests-must-not-reach-github"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_core_check(monkeypatch):
+    """Демон в тестах сам не проверяет выпуски ядер на GitHub (фоновый поток): её включают
+    тесты обновления ядер (test_cores.py)."""
+    monkeypatch.setattr("xgw.daemon.CORES_FIRST_CHECK", float("inf"))
 
 
 @pytest.fixture(autouse=True)

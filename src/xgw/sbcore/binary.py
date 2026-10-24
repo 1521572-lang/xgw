@@ -2,9 +2,10 @@
 
 XGW работает с одной проверенной версией — config.SINGBOX_VERSION (1.14.3): поля конфига,
 которые строит generator/singbox.py, проверены именно на ней, а у другой выпуск мог что-то
-переименовать. Для linux/amd64 хеш архива зашит в код (PINNED_SHA256) и сверяется независимо от
-того, что скажет GitHub; для остальных платформ берётся хеш (`digest`) из ответа API GitHub для
-этого же файла. Из архива извлекается только сам бинарник `sing-box`.
+переименовать. Для linux/amd64 хеш архива этой версии зашит в код (PINNED_SHA256) и сверяется
+независимо от того, что скажет GitHub; для остальных платформ и для более новых выпусков, которые
+предлагает проверка обновлений (cores.py), берётся хеш (`digest`) из ответа API GitHub для этого
+же файла. Из архива извлекается только сам бинарник `sing-box`.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from .. import fetch
 from ..xraycore.binary import BinaryError, platform_pair
 
 RELEASES_API = "https://api.github.com/repos/SagerNet/sing-box/releases"
+PINNED_VERSION = "1.14.3"  # к какой версии относятся зашитые хеши (config.SINGBOX_VERSION)
 PINNED_SHA256 = {
     ("linux", "x86_64"): "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee",
 }
@@ -56,15 +58,17 @@ def get_release(
     timeout: float = 20.0,
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,
+    proxy: tuple[str, int] | None = None,
 ) -> Release:
-    """Релиз этой версии (config.SINGBOX_VERSION); «последнего» нет — см. docstring модуля."""
+    """Релиз этой версии: config.SINGBOX_VERSION либо выпуск, который предложила проверка
+    обновлений (cores.py); «последнего» нет — см. docstring модуля."""
     if not re.fullmatch(r"[vV]?\d+\.\d+\.\d+", version.strip()):
         raise BinaryError(f"версия sing-box — цифрами, например 1.14.3, а не «{version}»")
     url = f"{RELEASES_API}/tags/v{version.strip().lstrip('vV')}"
     result = fetch.fetch_url(
         url,
         headers={"Accept": "application/vnd.github+json", "User-Agent": "xgw-updater"},
-        timeout=timeout, retries=1, mark=mark, bootstrap=bootstrap,
+        timeout=timeout, retries=1, mark=mark, bootstrap=bootstrap, proxy=proxy,
     )
     if result.status != 200:
         raise BinaryError(f"GitHub API вернул HTTP {result.status}")
@@ -74,6 +78,11 @@ def get_release(
         raise BinaryError("GitHub API вернул не JSON") from exc
     if not isinstance(data, dict):
         raise BinaryError("GitHub API вернул неожиданный ответ")
+    return release_from_api(data)
+
+
+def release_from_api(data: dict) -> Release:
+    """Release из одного выпуска в ответе API GitHub (и /tags/…, и списка /releases)."""
     tag = str(data.get("tag_name") or "")
     assets: dict[str, tuple[str, str]] = {}
     for asset in data.get("assets") or []:
@@ -88,9 +97,12 @@ def get_release(
 
 
 def expected_sha256(release: Release, name: str, goos: str, machine: str) -> str:
-    """Хеш архива, с которым сверяется загрузка: зашитый в код, а для прочих платформ — из API.
-    Если зашитый и тот, что сообщает GitHub, расходятся, загрузка отвергается."""
-    pinned = PINNED_SHA256.get((goos, machine), "")
+    """Хеш архива, с которым сверяется загрузка: зашитый в код (только для PINNED_VERSION), а
+    для прочих платформ и версий — из API. Если зашитый и тот, что сообщает GitHub, расходятся,
+    загрузка отвергается."""
+    pinned = ""
+    if release.tag.strip().lstrip("vV") == PINNED_VERSION:
+        pinned = PINNED_SHA256.get((goos, machine), "")
     published = release.assets.get(name, ("", ""))[1]
     if pinned and published and pinned != published:
         raise BinaryError(
@@ -109,6 +121,7 @@ def download_release(
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,
     release: Release | None = None,
+    proxy: tuple[str, int] | None = None,
 ) -> tuple[str, Path]:
     """Скачивает архив, сверяет SHA-256 и кладёт бинарник в dest_dir/sing-box.
 
@@ -116,7 +129,7 @@ def download_release(
     файловой системы: работающий sing-box при этом не мешает (запись поверх исполняемого файла
     дала бы ETXTBSY)."""
     if release is None:
-        release = get_release(version, mark=mark, bootstrap=bootstrap)
+        release = get_release(version, mark=mark, bootstrap=bootstrap, proxy=proxy)
     goos, machine = platform_pair()
     name = asset_name(release.tag, goos, machine)
     if name is None or name not in release.assets:
@@ -124,6 +137,7 @@ def download_release(
     wanted = expected_sha256(release, name, goos, machine)
     result = fetch.fetch_url(
         release.assets[name][0], mark=mark, bootstrap=bootstrap, timeout=300, retries=1,
+        proxy=proxy,
     )
     if result.status != 200:
         raise BinaryError(f"GitHub не отдал файл релиза (HTTP {result.status})")

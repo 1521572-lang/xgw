@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from pathlib import Path
 
-from . import cost, engine, fetch, log, priority
+from . import cores, cost, engine, fetch, log, priority
 from . import pin as pinning
 from .apply.applier import ApplyOutcome, in_restart_window
 from .apply.rotation import (
@@ -155,6 +155,15 @@ PROFILE_RECHECK = 24 * 3600.0
 # (отчёт 0.1.13, наблюдения 2–3), а отсчёт PROFILE_RETRY и PROFILE_RECHECK начинался заново.
 TRIALS_META = "profile_trials"
 SINGBOX_RETRY = 1800.0  # sing-box не поднялся и серверы ушли на Xray — пробовать снова так часто
+# Обновление ядер из панели (cores.py): первая проверка выпусков на GitHub — через 5 минут после
+# запуска демона (сам срок, раз в сутки, хранится в cores-check.json и переживает перезапуски),
+# дальше демон сверяется с ним раз в 10 минут. В сутки наблюдения после обновления ядро,
+# которое не отвечает и после отката конфига на last-good ещё CORE_BACK_AFTER шагов, заменяется
+# прежним; sing-box после такого возврата демон пробует поднять через CORE_RECOVER секунд.
+CORES_FIRST_CHECK = 300.0
+CORES_RECHECK = 600.0
+CORE_BACK_AFTER = 2
+CORE_RECOVER = 120.0
 
 
 @dataclasses.dataclass
@@ -352,6 +361,14 @@ class Daemon:
         self._singbox_retry_at = 0.0
         self._singbox_alive = True
         self._singbox_version_cache: tuple[float, str] | None = None
+        # Обновление ядер (cores.py): фоновая проверка выпусков на GitHub, когда смотреть
+        # снова, просьба панели «проверить сейчас», для каких ядер уже запущен возврат в сутки
+        # наблюдения (один раз на запуск демона) и меняет ли ядро сейчас служба xgw-core.
+        self._cores_thread: threading.Thread | None = None
+        self._cores_next = clock() + CORES_FIRST_CHECK
+        self._cores_asked = False
+        self._core_back_asked: set[str] = set()
+        self.core_job = False
         # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
         self.probe_target = ""
         self.next_target_check = 0.0
@@ -635,6 +652,10 @@ class Daemon:
         self._singbox_rolled_back = previous._singbox_rolled_back
         self._singbox_failed = previous._singbox_failed
         self._singbox_retry_at = previous._singbox_retry_at
+        self._cores_thread = previous._cores_thread
+        self._cores_next = previous._cores_next
+        self._cores_asked = previous._cores_asked
+        self._core_back_asked = set(previous._core_back_asked)
         self._traffic = previous._traffic
         self.lifecycle = previous.lifecycle
         self._downlinks = dict(previous._downlinks)
@@ -651,6 +672,16 @@ class Daemon:
         """Панель, приложение: замерить скорость всех живых серверов сейчас."""
         self._speed_asked = True
         self.poke.set()
+
+    def request_core_check(self) -> None:
+        """Панель: проверить выпуски ядер на GitHub сейчас."""
+        self._cores_asked = True
+        self.poke.set()
+
+    @property
+    def cores_pending(self) -> bool:
+        thread = self._cores_thread
+        return self._cores_asked or (thread is not None and thread.is_alive())
 
     @property
     def speed_pending(self) -> bool:
@@ -740,9 +771,12 @@ class Daemon:
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False
-        if state is State.XRAY_DOWN:
+        # Служба xgw-core меняет ядро и сама его перезапускает (и при сбое возвращает
+        # прежнее): откат конфига и перезапуски watchdog ей бы только помешали.
+        self.core_job = cores.job_active(self.paths, self.wall())
+        if state is State.XRAY_DOWN and not self.core_job:
             changed = self._handle_xray_down()
-        else:
+        elif state is not State.XRAY_DOWN:
             self.down_ticks = 0
             self.rolled_back = False
         if not self.leak:
@@ -763,7 +797,7 @@ class Daemon:
             self._write_status(view, observatory, signals.xray_ok)
             return state
 
-        if not changed and state is not State.XRAY_DOWN:
+        if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._singbox_step(now)
         if (
             not changed and self.inventory is not None and not self._singbox_failed
@@ -860,6 +894,8 @@ class Daemon:
             return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
+        if state is not State.WAN_DOWN:
+            self._cores_step()
         self._write_status(view, observatory, signals.xray_ok)
         return state
 
@@ -1253,13 +1289,17 @@ class Daemon:
     # --- действия --------------------------------------------------------------
 
     def _handle_xray_down(self) -> bool:
-        """systemd перезапускает службу сам; после двух неудач — откат на last-good."""
+        """systemd перезапускает службу сам; после двух неудач — откат на last-good. Идут
+        сутки наблюдения после обновления Xray, а он не отвечает и после отката — возврат
+        прежней версии (cores.py)."""
         self.down_ticks += 1
         if not self.service.is_active():
             try:
                 self.service.start()
             except XrayServiceError as exc:
                 self.log.error("Xray не запускается: %s", exc)
+        if self.rolled_back and self.down_ticks >= ROLLBACK_AFTER + CORE_BACK_AFTER:
+            self._core_back("xray", "Xray не отвечает и после отката конфига на last-good")
         if self.down_ticks < ROLLBACK_AFTER or self.rolled_back:
             return False
         self.rolled_back = True
@@ -2108,6 +2148,10 @@ class Daemon:
         # переводятся на него — интернет важнее профиля.
         self._singbox_failed = True
         self._singbox_retry_at = now + SINGBOX_RETRY
+        if self._core_back("sing-box", "sing-box не поднимается ни с новым, ни с прежним конфигом"):
+            # Прежняя версия скоро встанет на место: поднять sing-box снова, не дожидаясь
+            # SINGBOX_RETRY.
+            self._singbox_retry_at = now + CORE_RECOVER
         self.notifier.event(
             "singbox",
             "sing-box не поднимается — серверы переведены на Xray; серверы только для sing-box "
@@ -2117,6 +2161,63 @@ class Daemon:
         if self.inventory is None:
             return False
         return self._rebuild(None, urgent=True, reason="sing-box не поднимается")
+
+    # --- обновление ядер (cores.py) ----------------------------------------------
+
+    def _core_back(self, core: str, why: str) -> bool:
+        """Сутки наблюдения после обновления ядра: оно перестало работать — служба xgw-core
+        возвращает прежнюю версию. Один раз на запуск демона; True — возврат запущен."""
+        if core in self._core_back_asked or not cores.watching(self.paths, core, self.wall()):
+            return False
+        self._core_back_asked.add(core)
+        title, previous = cores.TITLES[core], cores.previous(self.paths, core)
+        error = self._start_core_job(core, "rollback", reason="watch")
+        if error:
+            self.notifier.event(
+                "cores", f"{why}, но вернуть прежний {title} {previous} не удалось: {error}",
+                notify=True,
+            )
+            return False
+        self.notifier.event(
+            "cores",
+            f"{why} — идут сутки наблюдения после обновления {title}: шлюз возвращает прежнюю "
+            f"версию {previous}",
+            notify=True,
+        )
+        return True
+
+    def _start_core_job(self, core: str, action: str, *, reason: str) -> str:
+        return cores.start(self.paths, core, action, reason=reason)
+
+    def _cores_step(self) -> None:
+        """Раз в сутки (и по кнопке «Проверить сейчас») — выпуски ядер на GitHub. Запросы идут
+        в отдельном потоке: шаг watchdog не должен ждать GitHub."""
+        thread = self._cores_thread
+        if thread is not None and thread.is_alive():
+            return
+        asked, self._cores_asked = self._cores_asked, False
+        now = self.clock()
+        if not asked and (now < self._cores_next or not cores.check_due(self.paths, self.wall())):
+            return
+        self._cores_next = now + CORES_RECHECK
+        singbox = self._singbox_version()
+        installed = {
+            "xray": cores.parse(self.xray_version) if self.xray_version else None,
+            "sing-box": cores.parse(singbox) if singbox else None,
+        }
+        self._cores_thread = threading.Thread(
+            target=self._check_cores, args=(installed,), name="xgw-cores", daemon=True,
+        )
+        self._cores_thread.start()
+
+    def _check_cores(self, installed: dict) -> None:
+        try:
+            _record, events = cores.check(self.cfg, self.paths, installed, mark=self.mark)
+        except Exception as exc:  # проверка обновлений не должна ронять демон
+            self.log.error("выпуски ядер на GitHub не проверены: %s", exc)
+            return
+        for text, notify in events:
+            self.notifier.event("cores", text, notify=notify)
 
     def _singbox_recover(self, now: float) -> bool:
         """sing-box отказал и серверы ушли на Xray: раз в SINGBOX_RETRY пробуем его поднять."""

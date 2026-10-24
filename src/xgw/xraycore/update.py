@@ -3,6 +3,10 @@
 Новая версия скачивается в соседний каталог и проверяется рабочим конфигом ещё
 до замены; прежняя остаётся рядом, пока новая не поднимется. Если Xray после
 замены не отвечает — возвращается прежний бинарник.
+
+Ставит только проверенную версию (config.XRAY_VERSION) — в том числе поверх более
+новой, принятой шлюзом после обновления из панели (cores.py): после этого принятая и
+прежняя версии забываются.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import shutil
 import time
 from collections.abc import Callable
 
-from .. import engine, fetch, log
+from .. import cores, engine, fetch, log
 from ..config import XRAY_VERSION, Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
@@ -66,7 +70,7 @@ def update_xray(
         out(f"ошибка: Xray {release.tag} не загружен: {exc}")
         return 1
 
-    problem = _check_new(new_bin, engine.read_json(paths.xray_config_file))
+    problem = check_new(new_bin, engine.read_json(paths.xray_config_file))
     if problem:
         shutil.rmtree(staging, ignore_errors=True)
         out(f"ошибка: Xray {tag} не подходит — {problem}. Установленная версия не тронута.")
@@ -92,11 +96,13 @@ def update_xray(
             os.chmod(target, 0o755)
         if not configured:
             shutil.rmtree(previous, ignore_errors=True)
+            cores.forget(paths, "xray")
             out(f"Xray обновлён: {_version_text(current)} → {tag.lstrip('v')}")
             return 0
-        error = _restart(service, api, wait)
+        error = restart_and_wait(service, api, wait)
         if error is None:
             shutil.rmtree(previous, ignore_errors=True)
+            cores.forget(paths, "xray")
             out(f"Xray обновлён и перезапущен: {_version_text(current)} → {tag.lstrip('v')}")
             return 0
         # Новая версия не поднялась — возвращаем прежнюю.
@@ -106,7 +112,7 @@ def update_xray(
             os.replace(target, staging)
             os.replace(previous, target)
             shutil.rmtree(staging, ignore_errors=True)
-            again = _restart(service, api, wait)
+            again = restart_and_wait(service, api, wait)
             out(
                 f"ошибка: Xray {tag} не поднялся ({error}) — возвращена версия "
                 f"{_version_text(current)}"
@@ -117,7 +123,7 @@ def update_xray(
         return 1
 
 
-def _check_new(new_bin, applied: dict | None) -> str:
+def check_new(new_bin, applied: dict | None) -> str:
     """Почему новый бинарник нельзя ставить; пусто — можно."""
     version = binary.installed_version(new_bin)
     if version is None:
@@ -133,7 +139,7 @@ def _check_new(new_bin, applied: dict | None) -> str:
     return ""
 
 
-def _restart(service, api, wait: float) -> str | None:
+def restart_and_wait(service, api, wait: float) -> str | None:
     try:
         service.restart()
     except XrayServiceError as exc:

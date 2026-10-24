@@ -49,9 +49,13 @@ class FakeDaemon:
         self.poke = threading.Event()
         self.asked: list[str] = []
         self.refresh_pending = self.scan_pending = self.speed_pending = False
+        self.cores_pending = False
 
     def request_refresh(self) -> None:
         self.asked.append("refresh")
+
+    def request_core_check(self) -> None:
+        self.asked.append("cores")
 
     def request_scan(self) -> None:
         self.asked.append("scan")
@@ -708,7 +712,7 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     assert user.act("refresh", {})["ok"] and user.act("scan", {})["ok"]
     assert rig.daemon.asked == ["refresh", "scan"]
     rig.daemon.refresh_pending = True
-    assert user.state()["busy"] == {"refresh": True, "scan": False, "speed": False}
+    assert user.state()["busy"] == {"refresh": True, "scan": False, "speed": False, "cores": False}
     rig.panel.configure(rig.panel.cfg, None)  # демон ещё не создан
     assert not user.act("refresh", {})["ok"]
 

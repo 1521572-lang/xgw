@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import engine, fetch, log, masking
+from . import cores, engine, fetch, log, masking
 from . import tailscale as ts
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
@@ -258,11 +258,18 @@ class Diag:
                 "sudo xgw update-xray",
             )]
         if version != binary.parse_version(XRAY_VERSION):
+            if cores.allowed(self.paths, "xray", version):
+                # Новее проверенной, но обновлена из панели и прошла проверку на этом шлюзе.
+                return [Check("Xray", OK, (
+                    f"версия {text} — обновлена из панели и проверена шлюзом (XGW проверен на "
+                    f"{XRAY_VERSION}), GET-проверка (httpMethod) поддерживается"
+                ))]
             # Другую версию XGW не использует (config.XRAY_VERSION); перед установкой это
             # не ошибка — установка поставит нужную.
             return [Check(
                 "Xray", WARN if self.preinstall else FAIL,
-                f"версия {text}, а XGW работает только с Xray {XRAY_VERSION}",
+                f"версия {text}, а XGW работает только с Xray {XRAY_VERSION} или с версией, "
+                "принятой шлюзом после обновления из панели",
                 "установка поставит нужную версию" if self.preinstall
                 else "sudo xgw update-xray",
             )]
@@ -287,14 +294,18 @@ class Diag:
         if version is None:
             return [Check("sing-box", FAIL, f"{path} не запускается", "sudo xgw update-singbox")]
         text = ".".join(map(str, version))
+        note = ""
         if version != sbbinary.parse_version(SINGBOX_VERSION):
-            return [Check(
-                "sing-box", WARN if self.preinstall else FAIL,
-                f"версия {text}, а XGW работает только с sing-box {SINGBOX_VERSION}",
-                "установка поставит нужную версию" if self.preinstall
-                else "sudo xgw update-singbox",
-            )]
-        result = [Check("sing-box", OK, f"версия {text}")]
+            if not cores.allowed(self.paths, "sing-box", version):
+                return [Check(
+                    "sing-box", WARN if self.preinstall else FAIL,
+                    f"версия {text}, а XGW работает только с sing-box {SINGBOX_VERSION} или с "
+                    "версией, принятой шлюзом после обновления из панели",
+                    "установка поставит нужную версию" if self.preinstall
+                    else "sudo xgw update-singbox",
+                )]
+            note = f" — обновлена из панели и проверена шлюзом (XGW проверен на {SINGBOX_VERSION})"
+        result = [Check("sing-box", OK, f"версия {text}{note}")]
         if not self.paths.singbox_config_file.exists():
             return result  # серверов для sing-box нет: служба не запущена, и это нормально
         applied = engine.read_json(self.paths.singbox_config_file)

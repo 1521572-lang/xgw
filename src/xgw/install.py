@@ -23,7 +23,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import desktop, engine, fetch, log, managed
+from . import cores, desktop, engine, fetch, log, managed
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
@@ -42,9 +42,10 @@ SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SINGBOX_UNIT = "xgw-singbox.service"
 UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 # Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
-# LAN настроен. Порядок — порядок запуска; останавливаются в обратном.
+# LAN настроен, — и обновление ядер из панели (cores.UNIT): её не включают вовсе, она
+# работает только по заданию демона. Порядок — порядок запуска; останавливаются в обратном.
 UNIT_FILES = (
-    "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service",
+    "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service", cores.UNIT,
 )
 XRAY_USER = "xray"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
@@ -307,12 +308,13 @@ class Installer:
         return facts
 
     def _xray_fits(self, version: tuple[int, int, int] | None) -> bool:
-        """Подходит ли уже лежащий Xray: XGW работает только с XRAY_VERSION (config.py)."""
-        return version == binary.parse_version(XRAY_VERSION)
+        """Подходит ли уже лежащий Xray: проверенная XGW версия (XRAY_VERSION, config.py) либо
+        более новая, принятая шлюзом после обновления из панели (cores.py)."""
+        return cores.keeps(self.paths, "xray", version)
 
     def _singbox_fits(self, version: tuple[int, int, int] | None) -> bool:
-        """Подходит ли уже лежащий sing-box: XGW работает только с SINGBOX_VERSION."""
-        return version == sbbinary.parse_version(SINGBOX_VERSION)
+        """Подходит ли уже лежащий sing-box: SINGBOX_VERSION либо принятая шлюзом новее."""
+        return cores.keeps(self.paths, "sing-box", version)
 
     def subnet_conflict(self) -> str:
         """Подсеть LAN пересекается с сетью провайдера или другой сетью машины. С таким
@@ -638,6 +640,7 @@ class Installer:
                 f"{self.paths.xray_dir} вручную и запустить установку снова"
             ) from exc
         self.xray_replaced = facts.xray_version is not None
+        cores.forget(self.paths, "xray")  # принятая из панели версия заменена проверенной
         self._step(f"Xray-core {tag} — {self.paths.xray_dir}")
 
     def _singbox(self, facts: Facts) -> None:
@@ -657,6 +660,7 @@ class Installer:
                 "пропускаются; повторить: sudo xgw update-singbox"
             )
             return
+        cores.forget(self.paths, "sing-box")
         self.journal.set("singbox", {"version": tag, "dir": str(self.paths.singbox_dir)})
         self._step(f"sing-box {tag} — {self.paths.singbox_dir}")
 
