@@ -3,6 +3,7 @@
 `xgw uninstall`. Сервер настоящий (127.0.0.1, свободный порт), «телефон» — phone_client.py."""
 
 import base64
+import gzip
 import json
 import os
 import time
@@ -245,28 +246,109 @@ def test_paired_phone_reads_the_state_without_secrets(api):
     status, state = phone.signed("GET", "/api/state")
     assert status == 200 and state["state"] == "HEALTHY"
     assert [member["tag"] for member in state["members"]] == ["proxy-nl-aaaa", "proxy-de-bbbb"]
-    assert state["power"]["can_off"] is True and state["spares"] == 1
+    assert state["power"]["can_off"] is True and len(state["spares"]) == 1
     # Приложение показывает «нет интернета в сети» и прогресс замеров, как панель.
-    assert "lan_problem" in state["capture"] and set(state["speed_progress"]) == {"total", "done"}
+    assert "lan_problem" in state["capture"] and "speed_progress" in state
+    # Пульт — как панель (ASSUMPTIONS п. 232): серверы по подпискам, подписки, ссылки, события.
+    panel = api.panel.state()
+    for key in ("servers", "removed", "sources", "subscriptions", "links", "events", "sticky",
+                "devices", "records", "budget", "nodes"):
+        assert key in state, key
+    assert [sub["name"] for sub in state["subscriptions"]] == [
+        sub["name"] for sub in panel["subscriptions"]]
+    assert len(state["servers"]) == len(panel["servers"])
     text = json.dumps(state, ensure_ascii=False)
-    assert "S3CR3T" not in text and "sub.example.net" not in text and "trojan://" not in text
-    assert "subscriptions" not in state and "links" not in state and "events" not in state
-    events = [row["detail"] for row in api.panel.state()["events"]]
+    assert "S3CR3T" not in text and "trojan://" not in text
+    # Карточки доступа к шлюзу — не телефону: ни телефонов, ни ссылки входа, ни Funnel.
+    assert "phones" not in state
+    assert set(state["tailscale"]) == set(appapi.TAILSCALE_KEYS)
+    events = [row["detail"] for row in panel["events"]]
     assert "телефон «Galaxy S25 Ultra» привязан" in events
 
 
-def test_actions_are_a_white_list(api):
+def test_actions_are_the_panel_buttons_without_gateway_access(api):
     phone = _pair(api)
     status, result = phone.signed("POST", "/api/act", {"name": "scan"})
     assert status == 200 and result["ok"] and api.daemon.asked == ["scan"]
-    for name in ("add", "subscription/remove", "tailscale/route", "tailscale/ssh",
-                 "phones/revoke", "servers", "core"):
-        status, result = phone.signed("POST", "/api/act", {"name": name, "text": "x"})
+    # Доступ к самому шлюзу и привязка телефонов — только из панели.
+    for name in ("tailscale/login", "tailscale/ssh", "tailscale/serve", "tailscale/funnel",
+                 "tailscale/fix", "phones/pair", "phones/revoke", "phones/rename", "nothing"):
+        status, result = phone.signed("POST", "/api/act", {"name": name, "on": False})
         assert status == 403, name
     status, result = phone.signed("POST", "/api/act", {"name": "power", "on": False})
     assert status == 200 and result["ok"], result
     assert "tproxy" not in api.kernel.table  # то же, что кнопка панели
     assert api.panel.state()["capture"]["mode"] == "off"
+
+
+def test_phone_manages_subscriptions_and_servers_like_the_panel(api):
+    phone = _pair(api)
+    url = "https://phone.example.org/sub/T0KENT0KENT0KEN"
+    # Поля действия — в body: у подписки своё поле name (имя подписки).
+    status, result = phone.signed("POST", "/api/act", {
+        "name": "add", "body": {"text": url, "name": "с телефона"}})
+    assert status == 200 and result["ok"], result
+    assert [sub["url"] for sub in api.saved()["subscriptions"]
+            if sub["name"] == "с телефона"] == [url]
+    api.panel._wake()
+    status, state = phone.signed("GET", "/api/state")
+    assert "T0KENT0KENT0KEN" not in json.dumps(state, ensure_ascii=False)
+    status, result = phone.signed("POST", "/api/act", {"name": "subscription/edit", "body": {
+        "name": "с телефона", "user_agent": "Happ/1.0", "headers": {"X-Device": "s25"}}})
+    assert status == 200 and result["ok"], result
+    sub = next(sub for sub in api.saved()["subscriptions"] if sub["name"] == "с телефона")
+    assert sub["user_agent"] == "Happ/1.0" and sub["headers"] == {"X-Device": "s25"}
+    api.panel._wake()
+    status, result = phone.signed("POST", "/api/act", {
+        "name": "subscription/remove", "body": {"name": "с телефона"}})
+    assert status == 200 and result["ok"], result
+    assert all(sub["name"] != "с телефона" for sub in api.saved()["subscriptions"])
+    status, result = phone.signed("POST", "/api/act", {"name": "sticky", "body": {"on": False}})
+    assert status == 200 and result["ok"] and api.saved()["sticky"] is False
+    server = next(row for row in api.panel.state()["servers"] if len(row["fingerprint"]) == 8)
+    status, result = phone.signed("POST", "/api/act", {"name": "servers", "body": {
+        "fingerprints": [server["fingerprint"]], "mode": "disabled"}})
+    assert status == 200 and result["ok"], result
+    api.panel._wake()
+    status, state = phone.signed("GET", "/api/state")
+    row = next(row for row in state["servers"] if row["fingerprint"] == server["fingerprint"])
+    assert row["status"] == "disabled"
+    events = [row["detail"] for row in api.panel.state()["events"]]
+    assert any(detail.startswith("с телефона «Galaxy S25 Ultra»: Подписка «с телефона»")
+               for detail in events)
+    # Прежний вид запроса (приложение до А3.2) — поля рядом с name — по-прежнему принимается.
+    status, result = phone.signed("POST", "/api/act", {"name": "sticky", "on": True})
+    assert status == 200 and result["ok"] and api.saved()["sticky"] is True
+
+
+def test_big_state_goes_gzipped_when_the_phone_asks(api):
+    phone = _pair(api)
+    status, plain = phone.signed("GET", "/api/state")
+    assert status == 200
+    stamp, nonce = str(int(time.time())), "gzip-nonce-0123456789"
+    headers = _headers(phone.phone, phone.key, "GET", "/api/state", b"", float(stamp), nonce)
+    conn = phone._conn()
+    try:
+        conn.request("GET", "/api/state", headers={"Host": NAME, "Accept-Encoding": "gzip", **headers})
+        response = conn.getresponse()
+        data = response.read()
+    finally:
+        conn.close()
+    assert response.status == 200 and response.getheader("Content-Encoding") == "gzip"
+    state = json.loads(gzip.decompress(data))
+    assert state["version"] == plain["version"] and len(data) < len(json.dumps(plain)) / 3
+
+
+def test_phone_downloads_a_traffic_record(api):
+    phone = _pair(api)
+    api.paths.records_dir.mkdir(parents=True, exist_ok=True)
+    name = "aabbcc001122-20261024-101500.pcap"
+    (api.paths.records_dir / name).write_bytes(b"pcap-bytes")
+    status, payload = phone.signed("GET", f"/api/records/{name}")
+    assert status == 200 and payload["raw"] == "pcap-bytes"
+    for bad in ("../phones.json", "nothing.pcap", "aabbcc001122-20261024-101500.json"):
+        assert phone.signed("GET", f"/api/records/{bad}")[0] == 404, bad
+    assert api.phone.raw("GET", f"/api/records/{name}")[0] == 403  # без подписи — нет
 
 
 def test_bad_requests_are_refused_and_lock_the_door(api, monkeypatch):

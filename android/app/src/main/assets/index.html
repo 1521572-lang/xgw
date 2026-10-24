@@ -36,76 +36,181 @@
     <p id="confirm-error" class="error" role="alert" hidden></p>
   </main>
 
-  <!-- Пульт: состояние шлюза и его кнопки. -->
+  <!-- Пульт: то же, что панель шлюза (ASSUMPTIONS п. 232), по вкладкам. Карточки .gw — со
+       шлюза: без связи с ним они бледные и не нажимаются. -->
   <main id="gateway" class="screen" hidden>
-    <header class="top">
-      <div>
+    <header class="head">
+      <div class="top">
         <h1>XGW</h1>
-        <p id="host" class="muted small"></p>
+        <span id="chip" class="chip" data-tone="off">Нет данных</span>
       </div>
-      <span id="chip" class="chip" data-tone="off">Нет данных</span>
+      <p class="muted small"><span id="host"></span> <span id="updated"></span></p>
     </header>
 
     <p id="link-error" class="error" role="alert" hidden></p>
     <button id="relink" class="btn primary wide" type="button" hidden>Привязать заново</button>
 
-    <!-- VPN самого телефона (А3): Xray в приложении, серверы — со шлюза. -->
-    <section class="card hero" id="vpn" data-tone="off">
-      <p id="vpn-title" class="title">VPN телефона</p>
-      <p id="vpn-sub" class="muted small"></p>
-      <p id="vpn-old" class="warn-note small" hidden></p>
-      <button id="vpn-power" class="btn wide primary" type="button">Включить VPN телефона</button>
-      <p id="vpn-error" class="error" role="alert" hidden></p>
-      <button id="vpn-notes" class="btn wide" type="button" hidden>Уведомление «VPN XGW» скрыто — разрешить</button>
-      <div class="buttons">
-        <button id="vpn-fetch" class="btn" type="button">Обновить серверы</button>
-        <button id="vpn-always" class="btn" type="button">VPN всегда</button>
-      </div>
-    </section>
+    <!-- Главная: VPN телефона, VPN шлюза и сервер, через который он идёт сейчас. -->
+    <div id="tab-home" class="tab">
+      <!-- VPN самого телефона (А3): Xray в приложении, серверы — со шлюза. -->
+      <section class="card hero" id="vpn" data-tone="off">
+        <p id="vpn-title" class="title">VPN телефона</p>
+        <p id="vpn-sub" class="muted small"></p>
+        <p id="vpn-old" class="warn-note small" hidden></p>
+        <button id="vpn-power" class="btn wide primary" type="button">Включить VPN телефона</button>
+        <p id="vpn-error" class="error" role="alert" hidden></p>
+        <button id="vpn-notes" class="btn wide" type="button" hidden>Уведомление «VPN XGW» скрыто — разрешить</button>
+        <div class="buttons">
+          <button id="vpn-fetch" class="btn" type="button">Обновить серверы</button>
+          <button id="vpn-always" class="btn" type="button">VPN всегда</button>
+        </div>
+      </section>
 
-    <section class="card hero" id="hero" data-tone="off">
-      <p id="power-title" class="title">VPN шлюза</p>
-      <p id="power-sub" class="muted small"></p>
-      <p id="current" class="current small" hidden></p>
-      <button id="power" class="btn wide" type="button" disabled>VPN шлюза</button>
-      <p id="power-why" class="muted small" hidden></p>
-    </section>
+      <section class="card hero gw" id="hero" data-tone="off">
+        <p id="power-title" class="title">VPN шлюза</p>
+        <p id="power-sub" class="muted small"></p>
+        <p id="lifecycle" class="lifecycle small" data-tone="off" hidden></p>
+        <div id="current" class="current" hidden>
+          <div class="current-text">
+            <span id="current-label" class="muted small"></span>
+            <span id="current-name" class="current-name"></span>
+          </div>
+          <button id="unpin" class="btn small-btn" type="button" hidden>Автовыбор</button>
+        </div>
+        <button id="power" class="btn wide" type="button" disabled>VPN шлюза</button>
+        <p id="power-why" class="muted small" hidden></p>
+      </section>
 
-    <section class="card">
-      <h2>Серверы в работе</h2>
-      <p id="pin-note" class="small" hidden></p>
-      <button id="unpin" class="btn wide" type="button" hidden>Вернуть автовыбор</button>
-      <ul id="members" class="rows"></ul>
-      <p id="spares" class="muted small"></p>
-      <div class="buttons">
-        <button id="refresh" class="btn" type="button">Обновить подписки</button>
-        <button id="scan-spares" class="btn" type="button">Проверить запасные</button>
-        <button id="speed" class="btn" type="button" hidden>Замерить скорость</button>
-      </div>
-    </section>
+      <section class="card">
+        <h2>Этот телефон</h2>
+        <p class="small"><span class="muted">Шлюз:</span> <span id="about-host"></span></p>
+        <p class="small"><span class="muted">В панели:</span> <span id="about-name"></span></p>
+        <p class="small"><span class="muted">Версия:</span> <span id="about-version"></span>
+          <span class="muted">· шлюз</span> <span id="about-gw"></span></p>
+        <button id="forget" class="btn danger-line wide" type="button">Отвязать телефон</button>
+      </section>
+    </div>
 
-    <section class="card" id="devices-card" hidden>
-      <h2>Устройства дома</h2>
-      <p class="muted small">Устройство «мимо VPN» ходит в интернет напрямую.</p>
-      <ul id="devices" class="rows"></ul>
-    </section>
+    <!-- Серверы — по подпискам, как в панели: выбрать, ядро, приоритет, выключатель, убрать. -->
+    <div id="tab-servers" class="tab" hidden>
+      <section class="card gw" aria-labelledby="servers-title">
+        <div class="card-head">
+          <h2 id="servers-title">Серверы <span id="members-count" class="count"></span></h2>
+        </div>
+        <div id="main-box" class="main-box" hidden>
+          <button id="sticky" class="switch" type="button" role="switch" aria-checked="false"
+                  aria-labelledby="sticky-title" aria-describedby="main-note"></button>
+          <div class="main-text">
+            <span id="sticky-title" class="main-title">Один основной сервер</span>
+            <span id="main-note" class="muted small"></span>
+          </div>
+        </div>
+        <div class="buttons">
+          <button id="refresh" class="btn" type="button">Обновить подписки</button>
+          <button id="scan-spares" class="btn" type="button">Проверить запасные</button>
+          <button id="speed" class="btn" type="button" hidden>Замерить скорость</button>
+        </div>
+        <p id="nodes-note" class="muted small" hidden></p>
+        <p id="tier-note" class="muted small" hidden></p>
+        <p id="reserve-note" class="note" role="status" hidden></p>
+        <p id="probe-note" class="note bad" role="alert" hidden></p>
+        <p id="pin-note" class="note" hidden></p>
+        <div id="groups"></div>
+        <p id="servers-empty" class="muted small" hidden></p>
+        <details id="removed-box" class="group removed" hidden>
+          <summary><span class="group-name">Убранные</span>
+            <span id="removed-count" class="group-count muted small"></span></summary>
+          <ul id="removed" class="list servers"></ul>
+        </details>
+        <p id="budget-note" class="budget-note muted small" hidden></p>
+      </section>
+    </div>
 
-    <section class="card">
-      <h2>Этот телефон</h2>
-      <p class="small"><span class="muted">Шлюз:</span> <span id="about-host"></span></p>
-      <p class="small"><span class="muted">В панели:</span> <span id="about-name"></span></p>
-      <p class="small"><span class="muted">Версия:</span> <span id="about-version"></span>
-        <span class="muted">· шлюз</span> <span id="about-gw"></span></p>
-      <p id="updated" class="muted small"></p>
-      <button id="forget" class="btn danger-line wide" type="button">Отвязать телефон</button>
-    </section>
+    <!-- Подписки и отдельные ссылки серверов. -->
+    <div id="tab-subs" class="tab" hidden>
+      <section class="card gw" aria-labelledby="subs-title">
+        <h2 id="subs-title">Подписки</h2>
+        <div class="add">
+          <label class="visually-hidden" for="add-text">Адрес подписки или ссылка сервера</label>
+          <textarea id="add-text" rows="3" spellcheck="false" autocomplete="off" autocapitalize="off"
+                    placeholder="Адрес подписки (https://…) или ссылки серверов (vless://…), по одной в строке"></textarea>
+          <div class="buttons">
+            <button id="paste" class="btn" type="button">Вставить</button>
+            <button id="add-scan" class="btn" type="button">QR-код</button>
+            <button id="add-submit" class="btn primary" type="button">Добавить</button>
+          </div>
+        </div>
+        <ul id="subs" class="list"></ul>
+        <ul id="links" class="list"></ul>
+      </section>
+    </div>
+
+    <!-- Устройства дома, записи их трафика и устройства tailnet. -->
+    <div id="tab-devices" class="tab" hidden>
+      <section class="card gw" id="devices-card" aria-labelledby="devices-title">
+        <div class="card-head">
+          <h2 id="devices-title">Устройства дома <span id="devices-count" class="count"></span></h2>
+        </div>
+        <p id="devices-note" class="muted small"></p>
+        <ul id="devices" class="list"></ul>
+        <div id="records-block" hidden>
+          <h3 class="sub-title">Записи трафика</h3>
+          <p class="muted small">Файлы .pcap открываются в Wireshark. На шлюзе хранятся последние три; «Скачать» кладёт файл в «Загрузки/XGW».</p>
+          <ul id="records" class="list"></ul>
+        </div>
+      </section>
+
+      <section class="card gw" id="ts-card" aria-labelledby="ts-title" hidden>
+        <h2 id="ts-title">Tailscale</h2>
+        <div id="ts-exit-row" class="ts-row" hidden>
+          <button id="ts-exit" class="switch" type="button" role="switch" aria-checked="false"
+                  aria-labelledby="ts-exit-title" aria-describedby="ts-exit-note"></button>
+          <div class="main-text">
+            <span id="ts-exit-title" class="main-title">Выход в интернет через шлюз</span>
+            <span id="ts-exit-note" class="muted small"></span>
+          </div>
+        </div>
+        <div id="ts-peers-block" hidden>
+          <h3 class="sub-title">Устройства tailnet</h3>
+          <p class="muted small">Если устройство выбрало шлюз выходным узлом, его интернет идёт через Xray; «напрямую» — мимо VPN.</p>
+          <ul id="ts-peers" class="list"></ul>
+        </div>
+        <div id="ts-route-row" class="ts-row" hidden>
+          <div class="main-text">
+            <label id="ts-route-title" class="main-title" for="ts-route">Маршрут Tailscale</label>
+            <span id="ts-route-note" class="muted small"></span>
+          </div>
+          <select id="ts-route" class="prio" aria-describedby="ts-route-note">
+            <option value="direct">Напрямую</option>
+            <option value="vpn">Через VPN</option>
+          </select>
+        </div>
+        <p class="muted small">Вход в Tailscale, SSH, панель по tailnet, Funnel и телефоны — в панели на шлюзе: это доступ к самому шлюзу.</p>
+      </section>
+    </div>
+
+    <div id="tab-events" class="tab" hidden>
+      <section class="card gw" aria-labelledby="events-title">
+        <h2 id="events-title">События</h2>
+        <ul id="events" class="list events"></ul>
+      </section>
+    </div>
   </main>
 
-  <!-- Вопрос перед действием («Выключить VPN шлюза?»). -->
+  <nav id="tabs" class="tabbar" aria-label="Разделы" hidden>
+    <button id="go-home" class="tab-btn" type="button" data-tab="home" aria-current="page">Главная</button>
+    <button id="go-servers" class="tab-btn" type="button" data-tab="servers">Серверы</button>
+    <button id="go-subs" class="tab-btn" type="button" data-tab="subs">Подписки</button>
+    <button id="go-devices" class="tab-btn" type="button" data-tab="devices">Устройства</button>
+    <button id="go-events" class="tab-btn" type="button" data-tab="events">События</button>
+  </nav>
+
+  <!-- Вопрос перед действием («Выключить VPN шлюза?») и окно правки подписки. -->
   <div id="dialog" class="overlay" hidden>
     <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <h2 id="dialog-title"></h2>
       <p id="dialog-text" class="muted"></p>
+      <div id="dialog-body"></div>
       <div class="buttons end">
         <button id="dialog-no" class="btn" type="button">Отмена</button>
         <button id="dialog-yes" class="btn primary" type="button"></button>

@@ -3,9 +3,10 @@
 
     GET  /api/hello          без входа: «XGW» — проверка, что Funnel доходит до шлюза
     POST /api/pair           код из QR панели → id телефона и ключ (phones.py)
-    GET  /api/state          подписано: состояние шлюза для экрана «Шлюз»
-    POST /api/act            подписано: действие из белого списка (то же, что кнопки панели)
+    GET  /api/state          подписано: состояние шлюза — то же, что видит панель (phone_state)
+    POST /api/act            подписано: действие — то же, что кнопки панели (белый список ACTIONS)
     GET  /api/phone-config   подписано: конфиг Xray для VPN телефона (generator/phone.py)
+    GET  /api/records/<имя>  подписано: файл записи трафика устройства (.pcap)
 
 Защита:
   * слушает только 127.0.0.1; Host должен быть именем шлюза в Funnel — и только пока
@@ -14,15 +15,19 @@
     случайное число один раз); неудачи — общий ответ, пауза 0,5 с, не больше FAILS_MAX в
     минуту на весь шлюз (дальше 429 на минуту);
   * не больше RATE запросов в минуту с телефона; тело запроса — до MAX_BODY, только JSON;
-  * действия — белый список ACTIONS: подписки, ссылки, удаление серверов,
-    установка, логи и настройки Tailscale через приложение недоступны;
-  * адреса подписок и ссылки серверов в ответах не бывают; серверы с ключами уходят только в
+  * действия — белый список ACTIONS: всё, чем панель управляет серверами, подписками,
+    устройствами и выходом в интернет через шлюз (ASSUMPTIONS п. 232). Недоступны доступ к
+    самому шлюзу — вход в Tailscale, SSH, панель по tailnet, Funnel (выключив его, телефон
+    отрезал бы себя), правила Tailscale на шлюзе — и привязка телефонов;
+  * в состоянии — то же, что видит панель, уже маскированное: подписки — только именем
+    сервера, ссылки — подписью, без ключей; серверы с ключами уходят только в
     /api/phone-config — привязанному телефону, которому они и нужны для VPN.
 """
 
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import threading
 import time
@@ -34,13 +39,24 @@ from .. import __version__, engine, log, masking
 from ..generator import phone as phoning
 from ..phones import Phone, PhoneError, Phones
 
-MAX_BODY = 8192
-RATE = 30  # запросов в минуту с одного телефона
+MAX_BODY = 65536  # вставленные ссылки серверов — десятки строк по полкилобайта
+RATE = 60  # запросов в минуту с одного телефона: опрос раз в 6 с и кнопки
 FAILS_MAX = 10  # неудачных входов в минуту на весь шлюз
 LOCKOUT = 60.0
 FAIL_PAUSE = 0.5
+# Состояние — как у панели, десятки килобайт раз в 6 с: по мобильной сети — сжатым. Android
+# сам просит gzip (Accept-Encoding) и сам распаковывает.
+GZIP_FROM = 2048
 SHUTDOWN_POLL = 0.1
-ACTIONS = ("power", "pin", "unpin", "refresh", "scan", "speed", "device")
+ACTIONS = (
+    "power", "pin", "unpin", "refresh", "scan", "speed", "sticky",
+    "add", "servers", "priority", "core", "subscription/edit", "subscription/remove", "link/remove",
+    "device", "record/start", "record/stop", "record/remove",
+    "tailscale/exit", "tailscale/direct", "tailscale/route",
+)
+# Из карточки «Tailscale» телефону — выход в интернет через шлюз, устройства tailnet и маршрут.
+TAILSCALE_KEYS = ("state", "route", "exit", "peers")
+RECORDS = "/api/records/"
 _HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -59,6 +75,10 @@ class _Server(ThreadingHTTPServer):
             self.log.exception("API приложения: запрос не обработан")
 
 
+class _Done(Exception):
+    """Ответ уже отправлен (файл записи)."""
+
+
 class _Reply(Exception):
     def __init__(self, code: HTTPStatus, payload: dict) -> None:
         super().__init__(code)
@@ -67,30 +87,12 @@ class _Reply(Exception):
 
 
 def phone_state(state: dict) -> dict:
-    """Что из состояния панели (уже маскированного) нужно экрану «Шлюз» приложения."""
-    members = [
-        {key: member.get(key) for key in (
-            "tag", "name", "alive", "delay_ms", "speed_mbps", "main", "selected", "profile")}
-        for member in state.get("members") or []
-    ]
-    devices = [
-        {key: device.get(key) for key in ("mac", "ip", "name", "bypass", "managed", "offline")}
-        for device in state.get("devices") or []
-    ]
-    capture = state.get("capture") or {}
-    return {
-        "version": state.get("version"), "now": state.get("now"), "state": state.get("state"),
-        "action": state.get("action"), "xray": state.get("xray"),
-        "capture": {key: capture.get(key) for key in (
-            "mode", "lifecycle", "lifecycle_reason", "lan_problem")},
-        "power": state.get("power"), "main": state.get("main"), "pin": state.get("pin"),
-        "members": members, "spares": len(state.get("spares") or []),
-        "sticky": {"on": (state.get("sticky") or {}).get("on")},
-        "devices": devices, "busy": state.get("busy"),
-        # Замеры скорости: сколько серверов в заходе и сколько уже замерено.
-        "speed_progress": {key: (state.get("speed_progress") or {}).get(key)
-                           for key in ("total", "done")},
-    }
+    """Состояние для приложения — то же, что у панели (уже маскированное), кроме карточек
+    доступа к шлюзу: из «Tailscale» — только TAILSCALE_KEYS, «Телефонов» нет вовсе."""
+    result = {key: value for key, value in state.items() if key not in ("tailscale", "phones")}
+    card = state.get("tailscale") or {}
+    result["tailscale"] = {key: card.get(key) for key in TAILSCALE_KEYS}
+    return result
 
 
 class AppApi:
@@ -158,6 +160,8 @@ class AppApi:
             self._route(handler, method)
         except _Reply as reply:
             self._send(handler, reply.code, reply.payload)
+        except _Done:
+            pass
 
     def _route(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         host = (handler.headers.get("Host") or "").strip().lower()
@@ -181,6 +185,8 @@ class AppApi:
             raise _Reply(HTTPStatus.OK, phone_state(self.panel.state()))
         if method == "GET" and path == "/api/phone-config":
             self._phone_config()
+        if method == "GET" and path.startswith(RECORDS):
+            self._record_file(handler, path.removeprefix(RECORDS))
         if method == "POST" and path == "/api/act":
             self._act(phone, self._json(body))
         raise _Reply(HTTPStatus.NOT_FOUND, {"error": "нет такого запроса"})
@@ -264,19 +270,45 @@ class AppApi:
         })
 
     def _act(self, phone: Phone, payload: dict):
+        """{"name": действие, "body": {поля}} — поля отдельно: у подписки своё поле name.
+        Приложение до А3.2 присылало поля рядом с name — так тоже можно."""
         name = payload.pop("name", None)
         if name not in ACTIONS:
             raise _Reply(HTTPStatus.FORBIDDEN, {"error": "это действие в приложении недоступно"})
-        result = self.panel.act(name, payload)
+        body = payload.get("body", payload)
+        if not isinstance(body, dict):
+            raise _Reply(HTTPStatus.BAD_REQUEST, {"error": "ожидается объект body"})
+        result = self.panel.act(name, body)
         if result.get("ok"):
             self.panel._event(f"с телефона «{phone.name}»: {masking.mask_text(result['text'])}")
         raise _Reply(HTTPStatus.OK, result)
 
+    def _record_file(self, handler: BaseHTTPRequestHandler, name: str):
+        """Запись трафика устройства — как «Скачать» в панели (record.py проверяет имя)."""
+        path = self.panel.recorder.path(name)
+        if path is None:
+            raise _Reply(HTTPStatus.NOT_FOUND, {"error": "такой записи нет"})
+        data = path.read_bytes()
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+        handler.send_header("Content-Length", str(len(data)))
+        for header, value in _HEADERS.items():
+            handler.send_header(header, value)
+        handler.end_headers()
+        handler.wfile.write(data)
+        raise _Done
+
     @staticmethod
     def _send(handler, code: HTTPStatus, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        packed = len(data) >= GZIP_FROM and "gzip" in (handler.headers.get("Accept-Encoding") or "")
+        if packed:
+            data = gzip.compress(data, compresslevel=6)
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
+        if packed:
+            handler.send_header("Content-Encoding", "gzip")
+            handler.send_header("Vary", "Accept-Encoding")
         handler.send_header("Content-Length", str(len(data)))
         for name, value in _HEADERS.items():
             handler.send_header(name, value)

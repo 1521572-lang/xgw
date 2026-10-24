@@ -4,12 +4,16 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.NotificationManager
+import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -45,6 +49,8 @@ class MainActivity : Activity() {
     private companion object {
         const val ASK_VPN = 1
         const val ASK_NOTES = 2
+        /** Имя файла записи трафика — как record._NAME на шлюзе. */
+        val RECORD = Regex("[0-9a-f]{12}-[0-9]{8}-[0-9]{6}[.]pcap")
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -201,6 +207,34 @@ class MainActivity : Activity() {
         return JSONObject().put("ok", true).put("status", 200).put("servers", xray.info()?.optInt("servers") ?: 0)
     }
 
+    /** Запись трафика устройства со шлюза — в «Загрузки/XGW» (MediaStore: разрешений не нужно). */
+    private fun saveRecord(name: String): JSONObject {
+        val binding = keys.binding() ?: return JSONObject().put("status", 0).put("error", "телефон не привязан")
+        if (!RECORD.matches(name)) return JSONObject().put("status", 0).put("error", "неверное имя записи")
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, "xgw-$name")
+            put(MediaStore.Downloads.MIME_TYPE, "application/vnd.tcpdump.pcap")
+            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/XGW")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: return JSONObject().put("status", 0).put("error", "Android не дал создать файл в «Загрузках»")
+        val answer = try {
+            // Не дошёл прямой путь посреди файла — запасной пишет его заново («wt»).
+            Gateway(binding.url).signed(binding.phone, keys.signer(), "GET", "/api/records/$name", null) { stream ->
+                contentResolver.openOutputStream(uri, "wt").use { out -> stream.copyTo(out!!) }
+            }
+        } catch (exc: Exception) {
+            Reply(0, "", exc.message ?: exc.javaClass.simpleName)
+        }
+        if (answer.status != 200) {
+            contentResolver.delete(uri, null, null)
+            return reply(answer)
+        }
+        contentResolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+        return JSONObject().put("status", 200).put("ok", true).put("file", "Загрузки/XGW/xgw-$name")
+    }
+
     private fun done(id: Int, result: JSONObject) {
         val text = JSONObject.quote(result.toString())
         runOnUiThread { if (!isDestroyed) web.evaluateJavascript("xgwDone($id, $text)", null) }
@@ -305,6 +339,19 @@ class MainActivity : Activity() {
 
         @JavascriptInterface
         fun forget() = keys.forget()
+
+        /** Текст из буфера обмена — для поля «Подписки»: Android отдаёт его только окну в фокусе. */
+        @JavascriptInterface
+        fun paste(id: Int) = runOnUiThread {
+            val clip = getSystemService(ClipboardManager::class.java).primaryClip
+            val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this@MainActivity).toString() else ""
+            done(id, JSONObject().put("ok", text.isNotBlank()).put("text", text))
+        }
+
+        @JavascriptInterface
+        fun download(name: String, id: Int) {
+            worker.execute { done(id, saveRecord(name)) }
+        }
 
         /** VPN телефона: состояние службы и сохранённого списка серверов. */
         @JavascriptInterface

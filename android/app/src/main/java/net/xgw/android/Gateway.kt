@@ -1,6 +1,7 @@
 package net.xgw.android
 
 import java.io.IOException
+import java.io.InputStream
 import java.net.ConnectException
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
@@ -104,7 +105,9 @@ class Gateway(private val url: String) {
         return send("POST", "/api/pair", body.toByteArray(Charsets.UTF_8), emptyMap())
     }
 
-    fun signed(phone: String, signer: Signer, method: String, path: String, body: String?): Reply {
+    /** [sink] — ответ 200 не текстом, а потоком (файл записи трафика): тело в Reply пустое. */
+    fun signed(phone: String, signer: Signer, method: String, path: String, body: String?,
+               sink: ((InputStream) -> Unit)? = null): Reply {
         val data = (body ?: "").toByteArray(Charsets.UTF_8)
         val stamp = ((System.currentTimeMillis() + skewMs) / 1000).toString()
         val nonce = ByteArray(18).also { random.nextBytes(it) }
@@ -114,17 +117,18 @@ class Gateway(private val url: String) {
         return send(method, path, data, mapOf(
             "X-XGW-Phone" to phone, "X-XGW-Time" to stamp, "X-XGW-Nonce" to nonce,
             "X-XGW-Signature" to signature,
-        ))
+        ), sink)
     }
 
     /** Напрямую; не вышло, а VPN телефона включён — через него. Сработавший путь пробуется первым.
      * Не ответил ни один — в ошибке оба пути: в испытании А3.1 была видна только последняя. */
-    private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
-        if (XgwVpn.state != "on") return attempt(null, method, path, body, headers).also { remember(it, "direct") }
+    private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>,
+                     sink: ((InputStream) -> Unit)? = null): Reply {
+        if (XgwVpn.state != "on") return attempt(null, method, path, body, headers, sink).also { remember(it, "direct") }
         val order = if (Gateway.path == "vpn") listOf(viaVpn, null) else listOf(null, viaVpn)
         val errors = HashMap<Proxy?, String>()
         for (proxy in order) {
-            val reply = attempt(proxy, method, path, body, headers)
+            val reply = attempt(proxy, method, path, body, headers, sink)
             if (reply.status != 0) {
                 remember(reply, if (proxy == null) "direct" else "vpn")
                 if (proxy == null) directError = "" else errors[null]?.let { directError = it }
@@ -139,7 +143,8 @@ class Gateway(private val url: String) {
         if (reply.status != 0) Gateway.path = how
     }
 
-    private fun attempt(proxy: Proxy?, method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
+    private fun attempt(proxy: Proxy?, method: String, path: String, body: ByteArray, headers: Map<String, String>,
+                        sink: ((InputStream) -> Unit)?): Reply {
         val address = URL(url + path)
         val connection = (if (proxy == null) address.openConnection() else address.openConnection(proxy)) as HttpURLConnection
         return try {
@@ -158,6 +163,10 @@ class Gateway(private val url: String) {
             }
             val status = connection.responseCode
             noteDate(connection.getHeaderField("Date"))
+            if (status == 200 && sink != null) {
+                connection.inputStream.use(sink)
+                return Reply(status, "")
+            }
             val stream = if (status >= 400) connection.errorStream else connection.inputStream
             val text = stream?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
             Reply(status, text)
