@@ -35,7 +35,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .. import __version__, engine, log, masking
+from .. import __version__, engine, log
 from ..generator import phone as phoning
 from ..phones import Phone, PhoneError, Phones
 
@@ -278,9 +278,8 @@ class AppApi:
         body = payload.get("body", payload)
         if not isinstance(body, dict):
             raise _Reply(HTTPStatus.BAD_REQUEST, {"error": "ожидается объект body"})
-        result = self.panel.act(name, body)
-        if result.get("ok"):
-            self.panel._event(f"с телефона «{phone.name}»: {masking.mask_text(result['text'])}")
+        # Событие о действии — одно, «с телефона «…»: итог» (его пишет panel.act).
+        result = self.panel.act(name, body, origin=f"с телефона «{phone.name}»")
         raise _Reply(HTTPStatus.OK, result)
 
     def _record_file(self, handler: BaseHTTPRequestHandler, name: str):

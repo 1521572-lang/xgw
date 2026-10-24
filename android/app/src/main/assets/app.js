@@ -386,7 +386,21 @@
     return ok;
   }
 
-  const setServers = (fingerprints, mode) => act("servers", { fingerprints, mode });
+  // Один сервер (выключатель) — после ответа прокрутить к его строке: отключённый уходит
+  // в конец группы, за все запасные, и терялся из виду (отчёт А3.2).
+  async function setServers(fingerprints, mode) {
+    const ok = await act("servers", { fingerprints, mode });
+    const row = ok && fingerprints.length === 1
+      ? $("groups").querySelector(`li[data-fingerprint="${CSS.escape(fingerprints[0])}"]`) : null;
+    if (row) {
+      row.scrollIntoView({ block: "center" });
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 2000);
+      const toggle = row.querySelector(".switch");
+      if (toggle) toggle.focus({ preventScroll: true });
+    }
+    return ok;
+  }
   // Приоритет сервера: в работе — серверы самого высокого уровня, на котором есть живые.
   const LEVELS = [["high", "Высокий"], ["medium", "Средний"], ["low", "Низкий"]];
   const LEVEL_NAMES = { high: "высокий", medium: "средний", low: "низкий" };
@@ -735,7 +749,7 @@
     const classes = ["server"];
     if (server.selected || pinned || main) classes.push("selected");
     if (server.status === "disabled" || server.status === "skipped") classes.push("off");
-    return el("li", { class: classes.join(" ") },
+    return el("li", { class: classes.join(" "), "data-fingerprint": server.fingerprint },
       el("span", { class: `dot ${tone}` }),
       title,
       el("div", { class: "values" }, speedValue(server), serverValue(server)),

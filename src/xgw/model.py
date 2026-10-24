@@ -82,10 +82,13 @@ def raw_to_node(raw: RawServer, source: str) -> ServerNode:
     fingerprint = make_fingerprint(
         raw.protocol, raw.address, raw.port, raw.credential, raw.transport
     )
+    # Пробелы по краям имени из подписки («🇹🇷 Турция ») в списке серверов и событиях
+    # не видны, а поиск по имени ломают (отчёт А3.2).
+    name = raw.name.strip() or f"{raw.address}:{raw.port}"
     return ServerNode(
         fingerprint=fingerprint,
-        name=raw.name,
-        country=country_from_name(raw.name),
+        name=name,
+        country=country_from_name(name),
         protocol=raw.protocol,
         address=raw.address,
         port=raw.port,

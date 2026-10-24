@@ -250,6 +250,12 @@ main.stale .gw { opacity: .55; pointer-events: none; }
 }
 .servers > li.selected + li { border-top-color: transparent; }
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
+/* Сервер, к которому прокрутили после выключателя: подсветка гаснет за две секунды. */
+.servers > li.flash {
+  margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 12px;
+  animation: flash 2s ease-out;
+}
+@keyframes flash { from { background: color-mix(in srgb, var(--warn) 24%, transparent); } }
 .prio {
   min-height: 36px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 10px;
   background: var(--card-2); color: var(--muted); font: inherit; font-size: .88rem;

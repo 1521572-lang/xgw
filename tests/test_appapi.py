@@ -321,6 +321,30 @@ def test_phone_manages_subscriptions_and_servers_like_the_panel(api):
     assert status == 200 and result["ok"] and api.saved()["sticky"] is True
 
 
+def test_a_phone_action_leaves_one_event(api):
+    # Событие о действии с телефона — одно, «с телефона «…»: итог»; без второго
+    # «… из панели» (30 последних событий кончались вдвое быстрее, отчёт А3.2).
+    phone = _pair(api)
+    server = next(row for row in api.panel.state()["servers"] if len(row["fingerprint"]) == 8)
+
+    def act(name, body):
+        before = {(row["ts"], row["detail"]) for row in api.panel.state()["events"]}
+        status, result = phone.signed("POST", "/api/act", {"name": name, "body": body})
+        assert status == 200 and result["ok"], result
+        fresh = [row["detail"] for row in api.panel.state()["events"]
+                 if (row["ts"], row["detail"]) not in before]
+        assert fresh == [f"с телефона «Galaxy S25 Ultra»: {result['text']}"]
+
+    act("servers", {"fingerprints": [server["fingerprint"]], "mode": "disabled"})
+    act("priority", {"fingerprints": [server["fingerprint"]], "level": "low"})
+    act("add", {"text": "https://phone.example.org/sub/one", "name": "с телефона"})
+    # Из панели — как было: событие панели, без «с телефона».
+    result = api.panel.act("servers", {"fingerprints": [server["fingerprint"]], "mode": "enabled"})
+    assert result["ok"], result
+    latest = api.panel.state()["events"][0]["detail"]
+    assert latest.startswith("сервер «") and "с телефона" not in latest
+
+
 def test_big_state_goes_gzipped_when_the_phone_asks(api):
     phone = _pair(api)
     status, plain = phone.signed("GET", "/api/state")

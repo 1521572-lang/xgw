@@ -232,6 +232,8 @@ class Panel:
         self.cfg = Config()
         self.daemon = None
         self._lock = threading.Lock()  # одно действие за раз
+        # Кто действует в этом потоке, если не панель (act(origin=…)), и события действия.
+        self._acting = threading.local()
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
         self._server: _Server | None = None
@@ -1294,21 +1296,34 @@ class Panel:
         mine = set(self.cfg.managed.subscriptions)
         return {sub.name for sub in self.cfg.subscriptions if sub.name not in mine}
 
-    def act(self, name: str, body: dict) -> dict:
-        """Выполняет действие и возвращает {"ok", "text", "notes"}."""
-        with self._lock:
-            try:
-                outcome = self._act(name, body)
-            except managed.ManagedError as exc:
-                outcome = actions.Outcome(2, str(exc))
-            except OSError as exc:
-                outcome = actions.Outcome(1, f"не удалось записать настройки: {exc}")
+    def act(self, name: str, body: dict, origin: str = "") -> dict:
+        """Выполняет действие и возвращает {"ok", "text", "notes"}.
+
+        origin — кто действует, если не панель («с телефона «…»», appapi.py). Тогда о
+        действии одно событие «origin: итог» вместо событий панели («… из панели»)."""
+        self._acting.origin, self._acting.texts = origin, []
+        try:
+            with self._lock:
+                try:
+                    outcome = self._act(name, body)
+                except managed.ManagedError as exc:
+                    outcome = actions.Outcome(2, str(exc))
+                except OSError as exc:
+                    outcome = actions.Outcome(1, f"не удалось записать настройки: {exc}")
+        finally:
+            self._acting.origin = ""
         self._selecting = (0.0, [])
-        return {
+        result = {
             "ok": outcome.ok,
             "text": masking.mask_text(outcome.text),
             "notes": [masking.mask_text(note) for note in outcome.notes],
         }
+        if origin:
+            # Не вышло — события панели о том, что успело случиться (обычно их нет).
+            texts = [result["text"]] if outcome.ok else self._acting.texts
+            for text in texts:
+                self._event(f"{origin}: {masking.mask_text(text)}")
+        return result
 
     def _act(self, name: str, body: dict) -> actions.Outcome:
         cfg, paths = self.cfg, self.paths
@@ -1458,6 +1473,9 @@ class Panel:
         )
 
     def _event(self, text: str) -> None:
+        if getattr(self._acting, "origin", ""):
+            self._acting.texts.append(text)  # событие действия напишет act — одно
+            return
         try:
             with actions.open_store(self.paths) as store:
                 store.add_event("panel", text)

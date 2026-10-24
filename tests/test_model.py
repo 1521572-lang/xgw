@@ -29,3 +29,11 @@ def test_raw_to_node_carries_fields():
         "vless", "203.0.113.10", 443,
         "11111111-2222-3333-4455-666666666661", "tcp/reality",
     )
+
+
+def test_raw_to_node_trims_the_name():
+    raw = parse_link(links.VLESS_REALITY)
+    raw.name = "\u00a0🇹🇷 Турция \t"
+    assert raw_to_node(raw, "main").name == "🇹🇷 Турция"
+    raw.name = "   "
+    assert raw_to_node(raw, "main").name == "203.0.113.10:443"
