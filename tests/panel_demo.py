@@ -1,7 +1,7 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting|reserve|tailscale]
+                                                      budget|waiting|reserve|tailscale|stranded]
                                [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
@@ -17,6 +17,8 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
 10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
 не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
+Сцена stranded — мёртвого участника заменить некем, а «высокий» стоит у лимитированных x10,
+хотя безлимитные живы (пояснения под «Серверами», ASSUMPTIONS п. 235).
 
 --app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
@@ -46,7 +48,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_tailscale import FakeTailscale
 
-from xgw import actions, config, cores, engine, tailscale
+from xgw import actions, config, cores, cost, engine, tailscale
+from xgw.daemon import stranded_action, stranded_note
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -234,6 +237,18 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     probe_cfg = config.Config()
     if scene == "budget":
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
+    stranded = class_note = ""
+    if scene == "stranded":
+        # Как на шлюзе 24.10.2026: четыре сервера «высокий» x10 в работе, один мёртв, живые
+        # безлимитные — «средние», сервер выбран вручную. Тексты — из кода шлюза.
+        tier = cost.Klass(0, 10.0)
+        action = stranded_action(tier, True)
+        stranded = stranded_note(["🇹🇷 x10 Турция"], tier, True)
+        unlimited = {"priority": "medium", "cost": 0.0, "verdict": "OK", "scanned": now}
+        class_note = status.class_warning(
+            probe_cfg, [{"priority": "high", "cost": 10.0}], [unlimited] * 34,
+            {"tag": "proxy-pl-0000"}, now,
+        )
     budget = status.probe_budget(
         probe_cfg, len(members), len(spares),
         speed_mb=status.speed_daily_mb(probe_cfg, members, spares),
@@ -267,6 +282,7 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             "excluded": len(excluded), "dns": 1,
         },
         "probe_target": probe_target,
+        "stranded": stranded, "class_warning": class_note,
         "pending_restart": False, "events": [],
         "singbox": {"mode": "auto", "installed": True, "version": VERSIONS["sing-box"],
                     "expected": True,
@@ -615,7 +631,7 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve", "tailscale", "cores"))
+                 "reserve", "tailscale", "cores", "stranded"))
     parser.add_argument("--app-port", type=int, default=0)
     parser.add_argument("--phone-server", default="")
     args = parser.parse_args()

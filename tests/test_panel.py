@@ -819,6 +819,24 @@ def test_state_shows_multipliers_the_reserve_and_unlimited_subscriptions(rig, us
         assert text in script
 
 
+def test_state_carries_the_stranded_note_and_the_class_warning(rig, user):
+    """Тексты пишет шлюз (daemon.stranded_note, status.class_warning); страница их только
+    показывает — под заголовком «Серверы»."""
+    snapshot = _snapshot()
+    state = user.state()
+    assert state["stranded"] == "" and state["class_warning"] == ""
+    snapshot.update(stranded="не отвечает сервер в работе «NL-1», а заменить некем: …",
+                    class_warning="в работе — лимитированные серверы x10 уровня «высокий» …")
+    status.write_status(rig.paths, snapshot)
+    state = user.state()
+    assert state["stranded"].startswith("не отвечает сервер в работе «NL-1»")
+    assert state["class_warning"].startswith("в работе — лимитированные серверы x10")
+    page = user.request("GET", "/")[1]
+    assert 'id="stranded-note"' in page and 'id="class-note"' in page
+    script = user.request("GET", "/app.js")[1]
+    assert "s.stranded" in script and "s.class_warning" in script
+
+
 def test_state_tells_the_page_that_capture_waits_for_xray(rig, user):
     fakexray.write(rig.paths, {"inbounds": [{"tag": "socks-in"}]})  # Xray без tproxy-in
     capture = user.state()["capture"]

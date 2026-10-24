@@ -236,7 +236,7 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, Math.floor(s.now / 60)], () => renderServers(s));
     draw("main", [s.main, s.sticky, s.pin, s.members.length, (s.budget || {}).speed_mb], () => renderMain(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
@@ -716,6 +716,11 @@
     $("tier-note").textContent = ranked && s.tier
       ? `Приоритет: в работе серверы уровня «${LEVEL_NAMES[s.tier] || s.tier}». Уровнем ниже шлюз пользуется, только когда живых выше нет.`
       : "";
+    // Тексты пишет шлюз: мёртвого заменить некем; лимитированные в работе из-за приоритета.
+    $("stranded-note").hidden = !s.stranded;
+    $("stranded-note").textContent = capital(s.stranded || "");
+    $("class-note").hidden = !s.class_warning;
+    $("class-note").textContent = capital(s.class_warning || "");
     const sources = [...s.sources];
     for (const server of s.servers) if (!sources.includes(server.source)) sources.push(server.source);
     const nodes = [];

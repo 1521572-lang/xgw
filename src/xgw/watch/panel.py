@@ -602,6 +602,10 @@ class Panel:
             "spares": spares,
             # Уровень приоритета серверов, что сейчас в работе (priority.py).
             "tier": snapshot.get("tier"),
+            # Мёртвого участника заменить некем; лимитированные в работе из-за приоритета,
+            # хотя живы безлимитные (status.class_warning). Пусто — всё в порядке.
+            "stranded": snapshot.get("stranded") or "",
+            "class_warning": snapshot.get("class_warning") or "",
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.

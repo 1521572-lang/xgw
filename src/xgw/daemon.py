@@ -57,7 +57,7 @@ from .store import Store
 from .watch import checks, scan, speed, status, target
 from .watch.notify import Notifier
 from .watch.scan import RESERVE_CANDIDATES, RESERVE_RECHECK
-from .watch.states import Signals, State, StateMachine
+from .watch.states import Signals, State, StateMachine, action_text
 from .xraycore import binary, metrics
 from .xraycore.api import ApiError
 from .xraycore.service import XrayServiceError
@@ -245,6 +245,37 @@ def tier_text(old: cost.Klass, new: cost.Klass, *, up: bool) -> str:
     )
 
 
+def stranded_action(tier: cost.Klass, ranked: bool) -> str:
+    """Текст DEGRADED, когда мёртвого участника заменить некем (Daemon._stranded): «замена на
+    запасные» была бы неправдой (разбор 24.10.2026, ASSUMPTIONS п. 235)."""
+    return (
+        "часть серверов недоступна, а заменить их некем: среди запасных нет серверов того же "
+        f"класса ({cost.class_name(tier, ranked)}); серверы другого класса шлюз ставит в "
+        "работу, только когда не отвечает ни один из работающих"
+    )
+
+
+def stranded_note(dead: list[str], tier: cost.Klass, ranked: bool) -> str:
+    """Событие и пояснение в панели: кто не отвечает, почему его не меняют и что делать."""
+    who = ", ".join(f"«{name}»" for name in dead)
+    head = f"не отвечает сервер в работе {who}" if len(dead) == 1 else (
+        f"не отвечают серверы в работе {who}"
+    )
+    if tier.rank != priority.LEVELS.index(priority.DEFAULT):
+        level = priority.level_name(tier.rank)
+        advice = (
+            f"поставьте уровень «{level}» ещё нескольким серверам (лучше той же страны) или "
+            "верните серверам в работе уровень «средний»"
+        )
+    else:
+        advice = "включите отключённые серверы этого класса или добавьте подписку"
+    return (
+        f"{head}, а заменить некем: среди запасных нет серверов того же класса "
+        f"({cost.class_name(tier, ranked)}); серверы другого класса шлюз ставит в работу, "
+        f"только когда не отвечает ни один из работающих. Чтобы было из кого менять, {advice}."
+    )
+
+
 class Lifecycle(StrEnum):
     """Жизненный цикл перехвата (VPN_IMPROVEMENT_PLAN §2.3) — поверх State: State говорит о
     здоровье выходов, Lifecycle — о том, что сейчас с трафиком LAN и машины."""
@@ -391,6 +422,11 @@ class Daemon:
         self.reserve_round_at = float("-inf")  # когда началась последняя (time.time())
         self._urgent_round_for: float | None = None  # для какого ALL_DEAD (state_since)
         self._reserve_note = ""
+        # DEGRADED, а заменить мёртвого участника некем (_stranded): о каком классе и каких
+        # участниках уже записано событие. Предупреждение «лимитированные в работе из-за
+        # приоритета» (status.class_warning): записано ли событие.
+        self._stranded_for = ""
+        self._class_warning = ""
         # Какой резервный нёс трафик, когда шлюз перешёл в RESERVE (« «имя» (x1)»): к
         # возврату с него состав мог смениться, а сообщить нужно о том, что работал.
         self._reserve_used = ""
@@ -631,6 +667,8 @@ class Daemon:
         self._sub_failing_since = previous._sub_failing_since
         self._sub_alerted = previous._sub_alerted
         self._reserve_note = previous._reserve_note
+        self._stranded_for = previous._stranded_for
+        self._class_warning = previous._class_warning
         self.main = previous.main
         self.speed_queue = deque(previous.speed_queue)
         self._speed_forced = set(previous._speed_forced)
@@ -730,6 +768,8 @@ class Daemon:
         decision = self.machine.update(signals)
         state = decision.state
         self.action = decision.action
+        if state is State.DEGRADED:
+            self.action = self._degraded_action(self._stranded(view))
         if state is State.RESERVE:
             if previous is not State.RESERVE:
                 self._reserve_used = self._reserve_label(applied)
@@ -1879,6 +1919,67 @@ class Daemon:
             tag: entry for tag, entry in self.store.scans().items()
             if entry["ts"] >= fresh_after and tag not in trial
         }
+
+    def _stranded(self, view: list[NodeInfo]) -> cost.Klass | None:
+        """Класс участников, если мёртвого участника заменить некем: среди запасных нет ни
+        одного сервера этого класса. _rotate меняет только внутри класса, а на класс хуже
+        _switch_tier переходит, лишь когда живых участников нет, — так что DEGRADED держится,
+        пока мёртвый не оживёт (испытание 24.10.2026: четыре сервера «высокий» x10, все в
+        работе). None — есть кем, мёртвых нет или состав не сопоставлен с подпиской."""
+        members = [info for info in view if info.role == "proxy"]
+        if self.inventory is None or not members or not set(self.dead_since) & {
+            info.tag for info in members
+        }:
+            return None
+        known = {node.fingerprint for node in self.inventory.nodes}
+        if any(info.fingerprint not in known for info in members):
+            return None
+        prices = self._prices()
+        tier = self._tier(view)
+        if any(
+            info.role == "spare" and info.fingerprint in known
+            and info.fingerprint not in self.home_exits
+            and self._klass(info.fingerprint, prices) == tier
+            for info in view
+        ):
+            return None
+        return tier
+
+    def _degraded_action(self, tier: cost.Klass | None) -> str:
+        """Текст DEGRADED; tier — класс, который нашёл _stranded (None — заменить есть кем)."""
+        if tier is not None:
+            return stranded_action(tier, bool(self.cfg.managed.priority))
+        if self.inventory is None:
+            # Демон только запущен, подписка ещё не получена: есть ли кем заменить, не
+            # известно — «замена на запасные» могла бы оказаться неправдой.
+            return "часть серверов недоступна"
+        return action_text(State.DEGRADED)
+
+    def _stranded_step(self, view: list[NodeInfo], state: State) -> str:
+        """Текст DEGRADED — по составу на конец шага (подписка могла обновиться), и одно
+        событие на каждый новый набор мёртвых, которых заменить некем. Возвращает пояснение
+        для панели; пусто — замена возможна или состояние другое."""
+        if not view:
+            return ""  # конфига ещё нет: судить не по чему, отметку не трогаем
+        tier = self._stranded(view) if state is State.DEGRADED else None
+        if state is State.DEGRADED:
+            self.action = self._degraded_action(tier)
+        if tier is None:
+            self._stranded_for = ""
+            return ""
+        dead = sorted(
+            info.tag for info in view if info.role == "proxy" and info.tag in self.dead_since
+        )
+        names = [
+            node.name if (node := self._node(info)) is not None else info.tag
+            for info in view if info.tag in dead
+        ]
+        note = stranded_note(names, tier, bool(self.cfg.managed.priority))
+        key = f"{tier.rank}:{tier.cost}:{','.join(dead)}"
+        if key != self._stranded_for:
+            self._stranded_for = key
+            self.notifier.event("rotation", note)
+        return note
 
     # --- профили обхода --------------------------------------------------------
 
@@ -3229,6 +3330,7 @@ class Daemon:
     ) -> None:
         self._last_status = (view, observatory, xray_ok)
         state = self.machine.state
+        stranded = self._stranded_step(view, state)
         self._xray_version()
         capture = self.capture_info
         current = self._lifecycle(view, observatory, xray_ok)
@@ -3244,12 +3346,19 @@ class Daemon:
             capture=capture, probe_target=self.probe_target,
             singbox=self._singbox_status(view),
             speeding=self.speed_progress(),
+            stranded=stranded,
         )
         warnings = tuple(snapshot["budget"]["warnings"])
         if warnings != self._budget_warnings:
             self._budget_warnings = warnings
             for warning in warnings:
                 self.notifier.event("budget", warning, notify=True)
+        # Без уведомления: интернет работает, а решать, нарочно ли так стоят приоритеты, —
+        # человеку; предупреждение висит в панели, пока его причина не уйдёт.
+        warning = snapshot.get("class_warning") or ""
+        if warning and not self._class_warning:
+            self.notifier.event("priority", warning)
+        self._class_warning = warning
         try:
             status.write_status(self.paths, snapshot)
         except OSError as exc:

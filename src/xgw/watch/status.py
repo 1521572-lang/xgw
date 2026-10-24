@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .. import cost, masking, priority
 from .. import pin as pinning
+from ..apply.rotation import REPLACEABLE_VERDICTS
 from ..config import Config, parse_seconds, probe_bytes
 from ..generator import profiles as profiling
 from ..generator.builder import NodeInfo, reserve_tag
@@ -312,6 +313,51 @@ def budget_warnings(
     return warnings
 
 
+def class_warning(
+    cfg: Config, members: list[dict], spares: list[dict], pin: dict | None, now: float,
+) -> str:
+    """Лимитированные серверы в работе только из-за ручного приоритета: живые безлимитные
+    стоят уровнем ниже, а приоритет важнее стоимости (cost.py) — трафик тратит квоту, хотя
+    мог бы не тратить. Испытание 24.10.2026: «высокий» стоял у четырёх серверов x10, живых
+    безлимитных «средних» было 34 (ASSUMPTIONS п. 235). Живой запасной — со свежим сканом OK
+    или SLOW, как у замены участников (daemon._fresh_scans)."""
+    if not members:
+        return ""
+
+    def klass(entry: dict) -> cost.Klass:
+        level = entry.get("priority") or priority.DEFAULT
+        rank = priority.LEVELS.index(level) if level in priority.LEVELS else 1
+        return cost.Klass(rank, float(entry.get("cost") or 0.0))
+
+    tier = min(klass(entry) for entry in members)
+    if tier.cost == 0:
+        return ""
+    fresh_after = now - max(1, cfg.probe.scan_spares_minutes) * 120.0 - 120.0
+    alive = [
+        entry for entry in spares
+        if not entry.get("cost") and entry.get("verdict") in REPLACEABLE_VERDICTS
+        and (entry.get("scanned") or 0) >= fresh_after and klass(entry).rank > tier.rank
+    ]
+    if not alive:
+        return ""
+    lower = priority.level_name(min(klass(entry).rank for entry in alive))
+    advice = (
+        "верните серверам в работе уровень «средний»" if tier.rank == 0
+        else f"поставьте безлимитным уровень «{priority.level_name(tier.rank)}»"
+    )
+    text = (
+        f"в работе — {cost.class_name(tier, True)}, а живые безлимитные серверы "
+        f"({len(alive)}) стоят уровнем ниже, «{lower}»: приоритет важнее стоимости, и трафик "
+        f"тратит квоту подписки ({cost.label(tier.cost)}). Если так не задумано, {advice}"
+    )
+    if pin and not pin.get("down"):
+        text += (
+            " и нажмите «Автовыбор»: пока сервер выбран вручную, шлюз серверы в работе на "
+            "другой класс не меняет"
+        )
+    return text + "."
+
+
 def collect_status(
     cfg: Config,
     paths: Paths,
@@ -330,11 +376,13 @@ def collect_status(
     probe_target: str = "",
     singbox: dict | None = None,
     speeding: dict | None = None,
+    stranded: str = "",
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
     probe_target — предупреждение «не отвечает сам probe.url» (пусто — отвечает).
     singbox — состояние второго ядра (daemon._singbox_status); speeding — очередь и
-    прогресс замеров скорости (daemon.Daemon.speed_progress)."""
+    прогресс замеров скорости (daemon.Daemon.speed_progress); stranded — мёртвого участника
+    заменить некем (daemon.stranded_note), пусто — есть кем."""
     now = time.time()
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
@@ -487,6 +535,10 @@ def collect_status(
         "spares": spares,
         # Уровень приоритета, серверы которого сейчас в работе (priority.py).
         "tier": _tier(cfg, members),
+        # Мёртвого участника заменить некем (daemon.stranded_note) и «лимитированные в работе
+        # из-за приоритета, хотя живы безлимитные» (class_warning); пусто — всё в порядке.
+        "stranded": stranded,
+        "class_warning": class_warning(cfg, members, spares, pin, now),
         # Резервный выход балансировщика (запасной класса хуже) — None, если его нет.
         "reserve": {
             key: backup[key] for key in ("tag", "name", "source", "multiplier", "cost")
@@ -909,6 +961,8 @@ def render_status(status: dict) -> str:
         lines.append(main)
     if status.get("pending_restart"):
         lines.append("Ожидает окна перезапуска: новый конфиг требует перезапуска Xray")
+    if status.get("class_warning"):
+        lines.append(f"Внимание: {status['class_warning']}")
     nodes = render_nodes(status.get("nodes") or {})
     if nodes:
         lines.append(nodes)
