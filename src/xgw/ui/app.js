@@ -170,7 +170,12 @@
 
   async function load() {
     try {
-      const response = await fetch("/api/state", { cache: "no-store", credentials: "same-origin" });
+      // Фокус — для ярлыка и значка в трее: вкладку в фокусе они выводят вперёд, а не
+      // открывают новую (tray.open_panel).
+      const response = await fetch("/api/state", {
+        cache: "no-store", credentials: "same-origin",
+        headers: { "X-XGW-Focus": document.hasFocus() ? "1" : "0" },
+      });
       if (response.status === 401) {
         location.reload();
         return;
@@ -1472,24 +1477,42 @@
     });
   }
 
+  // Шлюзу: вкладка скрылась (окно свёрнуто, открыта другая вкладка) или закрылась. По этому
+  // ярлык решает: вывести вперёд свёрнутое окно или сразу открыть новую вкладку.
+  function tell(how) {
+    fetch("/api/state", {
+      cache: "no-store", credentials: "same-origin", keepalive: true,
+      headers: { "X-XGW-Focus": how },
+    }).catch(() => {});
+  }
+
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) clearTimeout(timer);
-    else if (!gone) load().then(schedule);
+    if (document.hidden) {
+      clearTimeout(timer);
+      if (!gone) tell("hidden");
+    } else if (!gone) load().then(schedule);
+  });
+  window.addEventListener("pagehide", () => tell("closed"));
+  // Окно вывели вперёд (ярлык, значок в трее) — данные сразу свежие, и шлюз узнаёт о фокусе.
+  window.addEventListener("focus", () => {
+    if (!gone && !document.hidden) load().then(schedule);
   });
 
   // --- одна вкладка панели ----------------------------------------------------
-  // Ярлык «XGW» и значок в трее открывают панель через xdg-open — браузер каждый раз даёт
-  // новую вкладку. Новая (она уже впереди и со свежими данными) закрывает прежние, и вкладка
-  // XGW всегда одна: вывести вперёд прежнюю браузер странице не даёт. Закрыть себя страница
-  // может, только если в истории вкладки одна запись (так её и открывают ярлык и значок);
-  // иначе она гаснет и просит закрыть её вручную. Из двух открытых разом остаётся новейшая.
+  // Вкладку на экране ярлык «XGW» и значок в трее выводят вперёд (KWin), а когда её не
+  // видно — открывают панель через xdg-open, и браузер даёт новую вкладку. Новая (она уже
+  // впереди и со свежими данными) закрывает прежние, и вкладка XGW всегда одна: вывести
+  // вперёд скрытую вкладку браузер не даёт. Закрыть себя страница может, только если в
+  // истории вкладки одна запись (так её и открывают ярлык и значок); иначе она гаснет и
+  // просит закрыть её вручную. Из двух открытых разом остаётся новейшая.
 
   function leave() {
     gone = true;
     clearTimeout(timer);
     window.close();
     setTimeout(() => { // закрыть не дали
-      document.title = "XGW — открыта в другой вкладке";
+      // Не «XGW …» в начале: окно с таким заголовком ярлык выводил бы вперёд (tray.KWIN_SCRIPT).
+      document.title = "Панель XGW открыта в другой вкладке";
       document.body.className = "login";
       document.body.replaceChildren(el("main", { class: "card login-card" },
         el("img", { src: "/icon.svg", alt: "", width: 56, height: 56 }),

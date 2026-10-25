@@ -758,7 +758,8 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
     desktop = box.paths.desktop_file
     entry = desktop.read_text(encoding="utf-8")
     token = panel.read_token(box.paths)
-    assert "Exec=xdg-open http://127.0.0.1:8781/\n" in entry and token not in entry
+    launcher = box.paths.launcher.as_posix()
+    assert f"Exec={launcher} tray --open http://127.0.0.1:8781/\n" in entry and token not in entry
     # Браузер забыл вход — правая кнопка по ярлыку: окно пароля вместо терминала.
     assert "Actions=login;\n" in entry and "[Desktop Action login]\n" in entry
     assert "Name[ru]=Войти заново\n" in entry

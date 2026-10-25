@@ -272,7 +272,7 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
 
     # Ярлык в меню приложений: открывает панель, токена в нём нет.
     entry = box.sh(f"cat {LAUNCHER}")
-    assert f"Exec=xdg-open http://127.0.0.1:{PANEL_PORT}/" in entry and token not in entry
+    assert f"tray --open http://127.0.0.1:{PANEL_PORT}/" in entry and token not in entry
     assert "Icon=/opt/xgw/lib/xgw/ui/icon.svg" in entry
     assert box.sh("test -f /opt/xgw/lib/xgw/ui/icon.svg && echo есть").strip() == "есть"
     check = box.sh(

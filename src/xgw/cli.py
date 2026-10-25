@@ -196,11 +196,17 @@ def main(argv: list[str] | None = None) -> int:
         "--replace", action="store_true",
         help="закрыть уже запущенный значок и встать на его место (так запускает установка)",
     )
+    tray_parser.add_argument(
+        "--open", metavar="АДРЕС", default=None,
+        help="открыть панель: вкладку на экране — вывести вперёд, иначе новой (ярлык «XGW»)",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "tray":
         # От имени человека, в его графическом сеансе: ни config.toml (0600 root), ни журнал
         # XGW значку не нужны — порт панели и токен трея лежат в его ~/.config/xgw.
+        if args.open:
+            return tray.open_main(args.open)
         return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
     paths = Paths.from_env()
     if args.command == "panel" and args.login and not desktop.is_root():

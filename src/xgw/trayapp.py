@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -130,11 +131,19 @@ class TrayApp:
             self.app.exit(0)  # закрывается только значок; шлюз работает
         elif action == "open":
             url = (self.state or {}).get("panel") or f"http://127.0.0.1:{self.client.port}/"
-            self.QtGui.QDesktopServices.openUrl(self.QtCore.QUrl(url))
+            # Вывести вперёд вкладку на экране ждёт до 2 с — не в потоке Qt, чтобы меню не
+            # замирало; open_panel окна Qt не трогает.
+            threading.Thread(target=self._open, args=(url,), daemon=True).start()
         elif action == "about":
             self.QtWidgets.QMessageBox.information(None, "XGW", tray.about(self.state))
         else:
             self._act(action)
+
+    def _open(self, url: str) -> None:
+        try:
+            tray.open_panel(url, self.client)
+        except OSError as exc:
+            print(f"значок XGW: браузер не открылся: {exc}", file=sys.stderr)
 
     def _act(self, action: str) -> None:
         """Запрос к панели: она только ставит отметку демону и отвечает сразу (таймаут 5 с),

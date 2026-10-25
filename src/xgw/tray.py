@@ -17,6 +17,10 @@ autostart, /etc/xdg/autostart/xgw-tray.desktop ставит установка, 
 из трёх установок добавляла свой значок, и в трее их стало три. Вход в сеанс — тоже с
 `--replace`: сторож прошлого сеанса может пережить выход и держать блокировку со старым
 окружением сеанса (XAUTHORITY), а его значок в новый сеанс уже не встанет.
+
+Панель из ярлыка «XGW» и из значка открывает open_panel: вкладку XGW, которая на экране,
+KWin выводит вперёд — без новой вкладки (заказчик: «можно сделать незаметным открытие второй
+вкладки?»); не на экране или не KDE — xdg-open, как раньше.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import http.client
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -392,6 +397,8 @@ def other_instances(
         words = [arg.decode("utf-8", "replace") for arg in raw.split(b"\0") if arg]
         if not words or "tray" not in words or Path(words[0]).name == "systemd-run":
             continue
+        if "--open" in words:  # ярлык открывает панель (open_main) — это не значок
+            continue
         if "xgw" in words or any(Path(word).name == "xgw" for word in words):
             found.append(("--run" in words, int(entry.name)))
     return [pid for _icon, pid in sorted(found)]
@@ -411,3 +418,123 @@ def replace(
 
 def desktop_entry(launcher: Path, icon: Path) -> str:
     return DESKTOP_ENTRY.format(launcher=launcher.as_posix(), icon=icon.as_posix())
+
+
+# --- открыть панель без лишней вкладки ---------------------------------------------------
+
+PAGE_FRESH = 5.0  # вкладка опрашивала панель (раз в 3 с) не раньше — значит, она на экране
+RAISE_WAIT = 2.0  # столько ждать, пока выведенная вперёд вкладка скажет панели о фокусе
+# Вкладка скрылась: окно свёрнуто (KWin его выведет) или открыта другая вкладка (выводить
+# нечего, и это ожидание — задержка перед новой вкладкой), поэтому ждать меньше.
+HIDDEN_WAIT = 1.0
+KWIN_NAME = "xgw-raise"
+# Заголовок окна с вкладкой панели: «XGW - Chromium», «XGW — Mozilla Firefox» (или «XGW —
+# вход»). Погасшая вкладка (app.js) называется иначе — её окно не выводится.
+KWIN_SCRIPT = """\
+const all = workspace.windowList ? workspace.windowList() : workspace.clientList();
+for (const item of all) {
+  if (/^XGW( [-–—] .+)?$/.test(item.caption)) {
+    if ("activeWindow" in workspace) workspace.activeWindow = item;
+    else workspace.activeClient = item;
+    break;
+  }
+}
+"""
+
+
+def raise_window(
+    environ: dict[str, str] | None = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Просит KWin вывести вперёд окно с вкладкой панели (скрипт KWin через dbus-send).
+    False — не KDE, нет dbus-send или KWin скрипт не принял. Нашлось ли окно, KWin не
+    сообщает — это видно по фокусу вкладки (open_panel)."""
+    environ = dict(os.environ) if environ is None else environ
+    desktops = (environ.get("XDG_CURRENT_DESKTOP") or "").upper().split(":")
+    if "KDE" not in desktops or shutil.which("dbus-send") is None:
+        return False
+    script = lock_path(environ=environ).with_name(f"{KWIN_NAME}.js")
+
+    def kwin(method: str, *args: str) -> subprocess.CompletedProcess:
+        return run(["dbus-send", "--session", "--print-reply", "--dest=org.kde.KWin",
+                    "/Scripting", f"org.kde.kwin.Scripting.{method}", *args],
+                   capture_output=True, text=True, timeout=3)
+
+    try:
+        atomic_write_text(script, KWIN_SCRIPT, mode=0o600)
+        # Скрипт прошлого раза ещё загружен (KWin запускает его не сразу, выгружать сразу
+        # нельзя) — выгрузить, иначе loadScript с тем же именем вернёт -1.
+        kwin("unloadScript", f"string:{KWIN_NAME}")
+        loaded = kwin("loadScript", f"string:{script}", f"string:{KWIN_NAME}")
+        if loaded.returncode != 0 or "int32 -1" in loaded.stdout:
+            return False
+        return kwin("start").returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def xdg_open(url: str) -> None:
+    subprocess.Popen(
+        ["xdg-open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def _page(client: Client) -> dict:
+    try:
+        page = client.state().get("page")
+    except TrayError:
+        return {}
+    return page if isinstance(page, dict) else {}
+
+
+def _age(page: dict, name: str) -> float | None:
+    value = page.get(name)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def open_panel(
+    url: str, client: Client | None = None, *,
+    raise_it: Callable[[], bool] = raise_window, launch: Callable[[str], None] = xdg_open,
+    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+) -> str:
+    """Панель в браузере без лишней вкладки. Вкладка XGW на экране (опрашивала панель не
+    раньше PAGE_FRESH) или скрылась позже последнего опроса и не закрыта (свёрнутое окно) —
+    KWin выводит её окно вперёд, и она сама обновляется. Если вкладка не сказала панели о
+    фокусе (за RAISE_WAIT, у скрытой — за HIDDEN_WAIT), её закрыли или вывести нечем —
+    xdg-open (новая вкладка закрывает прежнюю сама, app.js). "raised" или "opened"."""
+    page = _page(client) if client is not None else {}
+    seen, focused, hidden, closed = (
+        _age(page, name) for name in ("seen", "focused", "hidden", "closed"))
+    wait = 0.0  # возраст: меньше — позже
+    if seen is not None and seen <= PAGE_FRESH:
+        wait = RAISE_WAIT
+    elif (hidden is not None and (seen is None or hidden <= seen)
+          and (closed is None or closed > hidden)):
+        wait = HIDDEN_WAIT
+    if wait and raise_it():
+        if wait == RAISE_WAIT and focused is not None and focused <= seen + 0.5:
+            return "raised"  # вкладка уже в фокусе — окно впереди
+        started = clock()
+        while clock() - started < wait:
+            sleep(0.2)
+            focused = _age(_page(client), "focused")
+            if focused is not None and focused <= clock() - started:
+                return "raised"
+    launch(url)
+    return "opened"
+
+
+def open_main(url: str) -> int:
+    """`xgw tray --open <адрес>` — ярлык «XGW» в меню и на панели задач. Без файла значка
+    (~/.config/xgw/tray.json) — просто xdg-open."""
+    client = None
+    with contextlib.suppress(TrayError):
+        port, token = read_user_file(Path.home())
+        client = Client(port, token, timeout=2.0)
+    try:
+        open_panel(url, client)
+    except OSError as exc:
+        print(f"XGW: браузер не открылся: {exc}", file=sys.stderr)
+        return 1
+    return 0

@@ -107,6 +107,7 @@ _CSP = (
     "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
 _LINK_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+PAGE_SIGNALS = ("seen", "focused", "hidden", "closed")  # вкладка панели — для tray.open_panel
 
 
 def token_file(paths: Paths) -> Path:
@@ -283,6 +284,11 @@ class Panel:
         # Запись трафика устройства: кнопка в строке устройства (record.py).
         self.recorder = Recorder(paths.records_dir, on_done=self._event)
         self._netcheck: threading.Thread | None = None  # кнопка «Проверить сеть»
+        # Вкладка панели на этой машине (time.monotonic, 0 — не было): seen — опрашивала шлюз
+        # (она на экране), focused — опрашивала, будучи в фокусе, hidden — скрылась (окно
+        # свёрнуто или открыта другая вкладка), closed — закрылась. Ярлык и значок по ним
+        # выводят её окно вперёд вместо новой вкладки (tray.open_panel).
+        self._page = dict.fromkeys(PAGE_SIGNALS, 0.0)
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -1739,6 +1745,8 @@ class Panel:
         elif url.path == "/api/state":
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            if host != self._tailnet_host():
+                self._page_signal(handler.headers.get("X-XGW-Focus") or "")
             self._json(handler, HTTPStatus.OK, self.state(), body)
         elif url.path.startswith("/records/"):
             if not authorized:
@@ -1770,7 +1778,8 @@ class Panel:
 
     def tray_state(self) -> dict:
         """Сводка для значка: состояние шлюза, версии ядер, через какой сервер идёт трафик
-        (страна и скорость), идёт ли задание ядра, заняты ли кнопки."""
+        (страна и скорость), идёт ли задание ядра, заняты ли кнопки, сколько секунд назад
+        вкладка панели опрашивала шлюз, была в фокусе, скрылась и закрылась (None — ни разу)."""
         cfg, now = self.cfg, time.time()
         snapshot, _xray_ok, members, spares = self._core(now)
         pin = self._pin(now)
@@ -1810,7 +1819,21 @@ class Panel:
                 "speed": bool(daemon is not None and daemon.speed_pending),
             },
             "panel": address(cfg),
+            "page": {
+                name: round(time.monotonic() - moment, 1) if moment else None
+                for name, moment in self._page.items()
+            },
         }
+
+    def _page_signal(self, how: str) -> None:
+        """Опрос вкладки (X-XGW-Focus: 1 или 0) или её «скрылась» / «закрылась» (app.js)."""
+        now = time.monotonic()
+        if how in ("hidden", "closed"):
+            self._page[how] = now
+            return
+        self._page["seen"] = now
+        if how == "1":
+            self._page["focused"] = now
 
     @staticmethod
     def _read_body(handler: BaseHTTPRequestHandler) -> bytes | None:

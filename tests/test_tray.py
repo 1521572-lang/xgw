@@ -83,6 +83,47 @@ def test_the_watchdog_restarts_a_crashed_icon_and_stops_on_quit():
     assert pauses == [2.0, 4.0]
 
 
+class PageClient:
+    """Клиент панели: «page» из /api/tray по очереди (последнее повторяется)."""
+
+    def __init__(self, *pages: dict) -> None:
+        self.pages = list(pages)
+
+    def state(self) -> dict:
+        return {**STATE, "page": self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]}
+
+
+def test_open_panel_raises_a_visible_tab_instead_of_a_new_one():
+    """Заказчик: «можно сделать незаметным открытие второй вкладки?» Вкладка на экране —
+    её окно выводит KWin; новая вкладка — только если вывести некого или нечем."""
+    opened: list[str] = []
+    asked: list[bool] = []  # просили ли KWin вывести окно
+    ticks = iter(range(200))
+
+    def run(client, raised=True):
+        opened.clear()
+        asked.clear()
+        return tray.open_panel("http://p/", client, raise_it=lambda: asked.append(True) or raised,
+                               launch=opened.append, sleep=lambda _s: None,
+                               clock=lambda: next(ticks) * 0.3)
+
+    assert run(PageClient({"seen": 1.0, "focused": 1.0})) == "raised" and opened == []
+    # Не в фокусе — ждать, пока выведенная вкладка скажет о фокусе.
+    assert run(PageClient({"seen": 1.0, "focused": 40.0}, {"seen": 0.1, "focused": 0.1})) == (
+        "raised")
+    assert run(PageClient({"seen": 1.0, "focused": None})) == "opened"  # окно не нашлось
+    assert opened == ["http://p/"]
+    assert run(PageClient({"seen": 30.0, "focused": 30.0})) == "opened"  # вкладку не видно
+    assert asked == []
+    # Окно свёрнуто: вкладка скрылась после опроса — выводится, и вкладка говорит о фокусе.
+    minimized = {"seen": 60.0, "focused": 60.0, "hidden": 59.0, "closed": None}
+    assert run(PageClient(minimized, {**minimized, "seen": 0.1, "focused": 0.1})) == "raised"
+    # Вкладку закрыли — новая сразу, без попытки вывести окно.
+    assert run(PageClient({**minimized, "closed": 58.0})) == "opened" and asked == []
+    assert run(PageClient({"seen": 1.0, "focused": 1.0}), raised=False) == "opened"  # не KDE
+    assert run(None) == "opened"  # нет файла значка
+
+
 # --- один значок на человека (испытания 25.10.2026: три установки — три значка) ---------------
 
 
@@ -125,6 +166,7 @@ def test_replace_closes_every_old_icon_watchdogs_first(tmp_path):
         "105": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "status"],
         "106": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--replace"],  # сам
         "107": [],
+        "108": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--open", "http://x/"],
     })
     (proc / "self").mkdir()
     assert tray.other_instances(proc, me=106) == [101, 100, 102]
