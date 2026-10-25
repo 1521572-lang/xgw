@@ -1082,7 +1082,8 @@ class Installer:
             try:
                 self.runner(
                     ["systemd-run", "--user", f"--machine={user.name}@", "--quiet", "--collect",
-                     "--description=XGW: значок в трее", "--", str(self.paths.launcher), "tray"],
+                     "--description=XGW: значок в трее", "--", str(self.paths.launcher), "tray",
+                     "--replace"],  # прежний значок (прошлой установки) уступает место новому
                     timeout=20.0,
                 )
                 started = ", запущен"

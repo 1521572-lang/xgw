@@ -4,6 +4,7 @@
 import json
 import os
 import types
+from pathlib import Path
 
 import pytest
 from test_install import Box
@@ -82,6 +83,82 @@ def test_the_watchdog_restarts_a_crashed_icon_and_stops_on_quit():
     assert pauses == [2.0, 4.0]
 
 
+# --- один значок на человека (испытания 25.10.2026: три установки — три значка) ---------------
+
+
+def test_a_second_icon_does_not_start(tmp_path):
+    runtime = tmp_path / "run-user"
+    runtime.mkdir()
+    path = tray.lock_path(tmp_path / "home", {"XDG_RUNTIME_DIR": str(runtime)})
+    assert path == runtime / tray.LOCK_NAME
+    first = tray.take_lock(path)
+    assert first is not None and path.read_text(encoding="ascii").strip() == str(os.getpid())
+    assert tray.take_lock(path) is None  # значок уже запущен
+    first.close()
+    again = tray.take_lock(path)
+    assert again is not None
+    again.close()
+    # Без XDG_RUNTIME_DIR (и /run/user/UID) — рядом с файлом значка.
+    home = tmp_path / "home"
+    fallback = tray.lock_path(home, {"XDG_RUNTIME_DIR": str(tmp_path / "нет")})
+    assert fallback in (home / ".config/xgw" / tray.LOCK_NAME,
+                        Path(f"/run/user/{os.getuid()}") / tray.LOCK_NAME)
+
+
+def _proc(tmp_path, processes: dict[str, list[str]]):
+    proc = tmp_path / "proc"
+    for pid, words in processes.items():
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "cmdline").write_bytes(b"".join(w.encode() + b"\0" for w in words))
+    return proc
+
+
+def test_replace_closes_every_old_icon_watchdogs_first(tmp_path):
+    """--replace находит прежние значки по /proc — и те, что запущены до блокировки: сначала
+    сторожа (сторож до этой версии поднял бы свой значок снова), потом сами значки."""
+    proc = _proc(tmp_path, {
+        "100": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--run"],
+        "101": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray"],
+        "102": ["/usr/bin/python3", "-m", "xgw", "tray", "--run"],
+        "103": ["systemd-run", "--user", "--", "/usr/local/bin/xgw", "tray", "--replace"],
+        "104": ["bash", "-c", "/usr/local/bin/xgw tray"],
+        "105": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "status"],
+        "106": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--replace"],  # сам
+        "107": [],
+    })
+    (proc / "self").mkdir()
+    assert tray.other_instances(proc, me=106) == [101, 100, 102]
+    assert tray.other_instances(proc, uid=os.getuid() + 1, me=106) == []  # чужие — не трогать
+    killed: list[tuple[int, int]] = []
+    closed = tray.replace(proc, kill=lambda pid, sig: killed.append((pid, sig)), me=106)
+    assert closed == [101, 100, 102] and [pid for pid, _sig in killed] == closed
+    assert {sig for _pid, sig in killed} == {tray.signal.SIGTERM}
+
+
+def test_tray_command_starts_only_one_icon(tmp_path, monkeypatch):
+    path = tmp_path / tray.LOCK_NAME
+    monkeypatch.setattr(tray, "lock_path", lambda home=None, environ=None: path)
+    monkeypatch.setattr(tray.signal, "signal", lambda *args: None)
+    started: list[list[str]] = []
+    monkeypatch.setattr(tray, "supervise",
+                        lambda argv, spawn=None: started.append(argv) or 7)
+    held = tray.take_lock(path)
+    assert tray.main([]) == 0 and started == []  # уже запущен — второй не встаёт
+
+    def release(proc=None, kill=None, me=None):
+        held.close()  # прежний значок закрылся
+        return [101]
+
+    monkeypatch.setattr(tray, "replace", release)
+    assert tray.main(["--replace"]) == 7 and len(started) == 1
+    assert started[0][-2:] == ["tray", "--run"]
+    seen: list[list[str]] = []
+    monkeypatch.setattr(tray, "main", lambda argv: seen.append(argv) or 0)
+    from xgw import cli
+
+    assert cli.main(["tray", "--replace"]) == 0 and seen == [["--replace"]]
+
+
 def test_user_file_round_trip(tmp_path):
     home = tmp_path / "home"
     with pytest.raises(tray.TrayError, match="sudo xgw install"):
@@ -151,7 +228,8 @@ def test_install_sets_up_the_tray_for_the_person_and_uninstall_removes_it(box, t
     assert f"Exec={box.paths.launcher} tray" in text and "X-KDE-autostart-after=panel" in text
     port, token = tray.read_user_file(home)
     assert port == box.cfg.panel.port and token == tray.read_token(box.paths)
-    assert any(call[:2] == ("systemd-run", "--user") and call[-1] == "tray"
+    # --replace: значок прошлой установки уступает место новому (иначе их по одному на установку).
+    assert any(call[:2] == ("systemd-run", "--user") and call[-2:] == ("tray", "--replace")
                for call in box.system.calls)
     assert "значок в трее для anna" in box.text()
     box.out.clear()

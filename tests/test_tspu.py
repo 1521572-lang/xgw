@@ -118,11 +118,12 @@ def test_escalations_are_limited_and_an_unstable_server_is_not_chosen(tspu):
     _start(tspu)
     spares = [info for info in tspu.view() if info.role == "spare"]
     first, *others = spares
-    assert tspu._may_escalate(first.fingerprint, "Сервер") is True
-    assert tspu._may_escalate(first.fingerprint, "Сервер") is True
-    assert tspu._may_escalate(first.fingerprint, "Сервер") is False
+    server = f"«Сервер» ({first.tag})"
+    assert tspu._may_escalate(first.fingerprint, server) is True
+    assert tspu._may_escalate(first.fingerprint, server) is True
+    assert tspu._may_escalate(first.fingerprint, server) is False
     assert tspu._is_unstable(first.fingerprint)
-    assert _has(tspu, "«Сервер» нестабилен по ТСПУ: 2 перевода на обход за 6 ч")
+    assert _has(tspu, f"{server} нестабилен по ТСПУ: 2 перевода на обход за 6 ч")
     tspu.tick()  # статус пишет шаг
     assert _entry(tspu, first.tag)["unstable_until"] is not None
     # Замену мёртвому участнику берут из остальных запасных.

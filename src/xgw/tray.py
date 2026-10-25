@@ -10,6 +10,11 @@ autostart, /etc/xdg/autostart/xgw-tray.desktop ставит установка, 
 отдельный от токена панели и даёт только эти два запроса: состояние и «проверить выпуски
 ядер» / «замерить скорость». Установка кладёт его человеку, который её запустил,
 в ~/.config/xgw/tray.json (0600, его файл), а панель держит копию в /var/lib/xgw (0600 root).
+
+Значок у человека один: сторож держит блокировку (lock_path), второй `xgw tray` сразу
+выходит. Установка запускает `xgw tray --replace` — он закрывает прежние значки (и те, что
+запущены до этой блокировки) и встаёт на их место с новым кодом. Испытания 25.10.2026: каждая
+из трёх установок добавляла свой значок, и в трее их стало три.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import http.client
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -44,6 +50,8 @@ STABLE_AFTER = 300.0
 NO_TRAY = 3
 NOT_SET = 4
 QT_PACKAGE = "python3-pyqt6"
+LOCK_NAME = "xgw-tray.lock"
+REPLACE_WAIT = 5.0  # сколько --replace ждёт, пока прежний значок отпустит блокировку
 
 DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
@@ -283,18 +291,120 @@ def supervise(
 
 
 def main(argv: list[str]) -> int:
-    """`xgw tray` — сторож; `xgw tray --run` — сам значок (trayapp.py)."""
+    """`xgw tray` — сторож; `xgw tray --run` — сам значок (trayapp.py); `xgw tray --replace` —
+    закрыть прежние значки и встать на их место (так запускает установка)."""
     if "--run" in argv:
         from . import trayapp
 
         return trayapp.run()
+    replacing = "--replace" in argv
+    if replacing:
+        replace()
+    deadline = time.monotonic() + REPLACE_WAIT
+    lock = take_lock(lock_path())
+    while lock is None and replacing and time.monotonic() < deadline:
+        time.sleep(0.2)
+        lock = take_lock(lock_path())
+    if lock is None:
+        print("значок XGW уже запущен", file=sys.stderr)
+        return 0
     # Значок — тем же путём, каким запущен сторож: команда xgw сама находит код XGW.
     launcher = Path(sys.argv[0])
     child = (
         [str(launcher), "tray", "--run"] if launcher.name == "xgw"
         else [sys.executable, "-m", "xgw", "tray", "--run"]
     )
-    return supervise(child)
+    current: list[subprocess.Popen] = []
+
+    def spawn(command: list[str]) -> int:
+        process = subprocess.Popen(command)
+        current[:] = [process]
+        try:
+            return process.wait()
+        finally:
+            current.clear()
+
+    def stop(_signum, _frame) -> None:
+        # Закрывают сторож (--replace, удаление XGW) — значок уходит вместе с ним.
+        for process in current:
+            with contextlib.suppress(OSError):
+                process.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    with lock:
+        return supervise(child, spawn=spawn)
+
+
+# --- один значок на человека ------------------------------------------------------------
+
+
+def lock_path(home: Path | None = None, environ: dict[str, str] | None = None) -> Path:
+    """Файл блокировки значка: в XDG_RUNTIME_DIR (/run/user/UID), а без него — рядом с файлом
+    значка в ~/.config/xgw."""
+    environ = dict(os.environ) if environ is None else environ
+    runtime = environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if os.path.isdir(runtime):
+        return Path(runtime) / LOCK_NAME
+    return (home or Path.home()) / USER_FILE.parent / LOCK_NAME
+
+
+def take_lock(path: Path):
+    """Занять блокировку значка (открытый файл; закрытие — освобождение). None — её держит
+    другой запущенный значок."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="ascii")  # noqa: SIM115 — держится, пока жив сторож
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
+def other_instances(
+    proc: Path = Path("/proc"), *, uid: int | None = None, me: int | None = None,
+) -> list[int]:
+    """Другие значки XGW этого человека по /proc: процессы с его uid, в командной строке
+    которых команда xgw (или `-m xgw`) и `tray`. Сначала сторожа, потом сами значки (`--run`):
+    сторож до этой версии, переживший свой значок, поднял бы его снова. Находит и значки,
+    запущенные до блокировки."""
+    uid = os.getuid() if uid is None else uid
+    me = os.getpid() if me is None else me
+    found: list[tuple[bool, int]] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        words = [arg.decode("utf-8", "replace") for arg in raw.split(b"\0") if arg]
+        if not words or "tray" not in words or Path(words[0]).name == "systemd-run":
+            continue
+        if "xgw" in words or any(Path(word).name == "xgw" for word in words):
+            found.append(("--run" in words, int(entry.name)))
+    return [pid for _icon, pid in sorted(found)]
+
+
+def replace(
+    proc: Path = Path("/proc"), *, kill: Callable[[int, int], None] = os.kill,
+    me: int | None = None,
+) -> list[int]:
+    """Закрывает прежние значки человека (SIGTERM); какие закрыты."""
+    pids = other_instances(proc, me=me)
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            kill(pid, signal.SIGTERM)
+    return pids
 
 
 def desktop_entry(launcher: Path, icon: Path) -> str:

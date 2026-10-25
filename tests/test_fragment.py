@@ -234,8 +234,10 @@ def test_spare_that_answers_only_with_fragmenting_gets_it_and_keeps_it(dpi):
     assert dpi._fresh_scans()[spare.probe_tag]["verdict"] == "OK"
     name = next(node.name for node in dpi.inventory.nodes
                 if node.fingerprint == spare.fingerprint)
-    assert f"fragment: «{name}» отвечает только с дроблением ClientHello — оно включено" in (
-        dpi.events())
+    assert (
+        f"fragment: «{name}» ({spare.tag}) отвечает только с дроблением ClientHello — оно включено"
+        in dpi.events()
+    )
     assert next(entry for entry in dpi.status()["spares"]
                 if entry["tag"] == spare.tag)["fragment"] is True
     # Обновление подписки и новый демон (перезапуск службы) режим не сбрасывают.
@@ -244,6 +246,26 @@ def test_spare_that_answers_only_with_fragmenting_gets_it_and_keeps_it(dpi):
     again = Dpi(dpi.cfg, dpi.paths)
     again.inventory = dpi.inventory
     assert again.mode(spare.fingerprint) is True
+
+
+def test_spares_with_one_name_are_told_apart_by_tag_in_events(dpi):
+    """Перепроверка 0.1.18 (25.10.2026): двенадцать серверов «🚀Авто | Лучший сервер» одной
+    подписки в событиях обхода выглядели как один сервер, эскалация которого идёт каждую
+    минуту. В событии после имени — тег сервера."""
+    _started(dpi)
+    first, second = dpi.spare(0), dpi.spare(1)
+    for node in dpi.inventory.nodes:
+        if node.fingerprint in (first.fingerprint, second.fingerprint):
+            node.name = "🚀Авто | Лучший сервер"
+    dpi.blocked.update((first.probe_tag, second.probe_tag))
+    _rescan(dpi)
+    dpi.tick()  # без дробления не ответили — обоим включено дробление
+    dpi.tick()  # с дроблением ответили
+    for spare in (first, second):
+        assert (
+            f"fragment: «🚀Авто | Лучший сервер» ({spare.tag}) отвечает только с дроблением "
+            "ClientHello — оно включено" in dpi.events()
+        ), spare.tag
 
 
 def test_fragmenting_that_does_not_help_is_undone_and_retried_after_six_hours(dpi):

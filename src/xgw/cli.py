@@ -188,12 +188,16 @@ def main(argv: list[str] | None = None) -> int:
         "tray", help="значок XGW в трее рабочего стола (запускается при входе в сеанс)",
     )
     tray_parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
+    tray_parser.add_argument(
+        "--replace", action="store_true",
+        help="закрыть уже запущенный значок и встать на его место (так запускает установка)",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "tray":
         # От имени человека, в его графическом сеансе: ни config.toml (0600 root), ни журнал
         # XGW значку не нужны — порт панели и токен трея лежат в его ~/.config/xgw.
-        return tray.main(["--run"] if args.run else [])
+        return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
     paths = Paths.from_env()
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не

@@ -218,6 +218,13 @@ def _transport(node) -> str:
     return "udp" if node.protocol in UDP_PROTOCOLS else "tcp"
 
 
+def _server_text(name: str, tag: str) -> str:
+    """Сервер в событиях обхода — имя и тег. Имя бывает одним на десяток серверов подписки, а
+    его хвост маскируется: перепроверка 0.1.18 (25.10.2026) — двенадцать «🚀Авто | Лучший
+    сервер» по очереди выглядели как один сервер, эскалация которого идёт каждую минуту."""
+    return f"«{name}» ({tag})"
+
+
 def _keep_text(trial: ProfileTrial) -> str:
     new, old = trial.profile, trial.prev
     if new == profiling.XRAY_FRAGMENT and old == profiling.XRAY_DEFAULT:
@@ -2246,7 +2253,7 @@ class Daemon:
         avail = profiling.available(node, self.cfg, self._bridged_letters(fingerprint))
         default = profiling.base(self.cfg, avail)
         good = verdict in REPLACEABLE_VERDICTS
-        name = f"«{node.name}»"
+        name = _server_text(node.name, info.tag)
         trial = self._profile_trial.get(fingerprint)
         if trial is not None:
             if info.profile != trial.profile:
@@ -2300,7 +2307,7 @@ class Daemon:
                 # ядре остаётся, как в 0.1.11).
                 steps = [step for step in steps
                          if profiling.core_of(step) == profiling.core_of(default)]
-            if steps and self._may_escalate(fingerprint, node.name):
+            if steps and self._may_escalate(fingerprint, name):
                 self._profile_wanted[fingerprint] = ProfileWish(
                     steps[0], True, steps[1:], info.profile, verdict=verdict,
                 )
@@ -2385,10 +2392,11 @@ class Daemon:
     def _is_unstable(self, fingerprint: str) -> bool:
         return self._unstable.get(fingerprint, 0.0) > self.wall()
 
-    def _may_escalate(self, fingerprint: str, name: str) -> bool:
+    def _may_escalate(self, fingerprint: str, server: str) -> bool:
         """Можно ли перевести сервер на тяжёлый профиль ещё раз: не больше
         fragment.escalations переводов за fragment.escalation_hours. Иначе он «нестабилен по
-        ТСПУ» до конца этого окна — в работу шлюз его сам не ставит (событие одно на отметку)."""
+        ТСПУ» до конца этого окна — в работу шлюз его сам не ставит (событие одно на отметку).
+        server — сервер в тексте события (_server_text)."""
         now = self.wall()
         window = self.cfg.fragment.escalation_hours * 3600.0
         times = [when for when in self._escalations.get(fingerprint, []) if now - when < window]
@@ -2403,7 +2411,7 @@ class Daemon:
             clock = datetime.datetime.fromtimestamp(until).strftime("%H:%M")
             self.notifier.event(
                 "profile",
-                f"«{name}» нестабилен по ТСПУ: {len(times)} перевода на обход за "
+                f"{server} нестабилен по ТСПУ: {len(times)} перевода на обход за "
                 f"{self.cfg.fragment.escalation_hours} ч — в работу шлюз его сам не ставит до "
                 f"{clock}",
             )
@@ -2441,7 +2449,7 @@ class Daemon:
         node = self._node(info)
         if self.cfg.fragment.mode != "auto" or node is None:
             return False
-        fingerprint, name = info.fingerprint, f"«{node.name}»"
+        fingerprint, name = info.fingerprint, _server_text(node.name, info.tag)
         good = verdict in REPLACEABLE_VERDICTS
         self._calm[fingerprint] = self._calm.get(fingerprint, 0) + 1 if good else 0
         trial = self._profile_trial.get(fingerprint)
@@ -2469,7 +2477,7 @@ class Daemon:
             self._profile_wanted[fingerprint] = ProfileWish(trial.prev, False, [], trial.prev)
             if trial.recheck:
                 # Без дробления не отвечает — снова на нём, сразу (это тоже перевод на обход).
-                self._may_escalate(fingerprint, node.name)
+                self._may_escalate(fingerprint, name)
                 self._profile_event(trial.prev, trial.profile, f"{name} {_fail_text(trial)}")
                 return True
             self.bad_members[info.tag] = verdict
@@ -2484,7 +2492,7 @@ class Daemon:
         steps = self._escalation_steps(info, verdict)
         if not steps:
             return False
-        if not self._may_escalate(fingerprint, node.name):
+        if not self._may_escalate(fingerprint, name):
             self.bad_members[info.tag] = verdict  # «нестабилен по ТСПУ» — на замену
             return False
         self._profile_wanted[fingerprint] = ProfileWish(
