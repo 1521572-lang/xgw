@@ -481,6 +481,10 @@ class Diag:
             "Путь LAN", OK, f"пакеты устройств сети {rules.lan_if} доходят до Xray (TPROXY)"
         )]
 
+    def firewall(self) -> list[Check]:
+        """Чужие правила фаервола — и для проверки сети (netcheck.py)."""
+        return self._firewall()
+
     def _firewall(self) -> list[Check]:
         if not self.root or self.which("nft") is None:
             return []

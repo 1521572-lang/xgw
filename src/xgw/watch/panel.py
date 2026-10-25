@@ -8,6 +8,7 @@
 панель по tailnet (Serve) и маршрут самого Tailscale. Карточка «Телефоны» (А1
 `ANDROID_APP_PLAN.md`): привязка приложения XGW для Android по QR-коду, список телефонов;
 рядом с панелью работает API приложения (appapi.py), наружу — через Tailscale Funnel.
+Карточка «Проверка сети» (Ф3 `VPN_IMPROVEMENT_PLAN.md`): разовые проверки netcheck.py.
 
 Безопасность:
   * слушает только 127.0.0.1 — из сети панель не открыть; по tailnet её открывает
@@ -281,6 +282,7 @@ class Panel:
         self.app_api: AppApi | None = None
         # Запись трафика устройства: кнопка в строке устройства (record.py).
         self.recorder = Recorder(paths.records_dir, on_done=self._event)
+        self._netcheck: threading.Thread | None = None  # кнопка «Проверить сеть»
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -676,6 +678,8 @@ class Panel:
             "cores": self._cores_card(snapshot, now),
             # Прогресс замеров скорости: сколько из скольких (демон пишет в status.json).
             "speed_progress": snapshot.get("speed") or {},
+            # Карточка «Проверка сети»: идёт ли проверка и итог последней.
+            "netcheck": self._netcheck_card(),
         }
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
@@ -685,6 +689,41 @@ class Panel:
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
         return masked
+
+    def _netcheck_card(self) -> dict:
+        from .. import netcheck  # он тянет diag → install → эту панель: только здесь
+
+        rows = self._db("SELECT value FROM meta WHERE key = ?", (netcheck.META,))
+        last = netcheck.loads(rows[0]["value"] if rows else None)
+        return {"running": self._netcheck is not None and self._netcheck.is_alive(), **last}
+
+    def _netcheck_start(self) -> actions.Outcome:
+        """Кнопка «Проверить сеть»: проверки идут в своём потоке (до ~15 с), итог — в базе
+        состояния и событием; страница видит его в очередном опросе."""
+        if self._netcheck is not None and self._netcheck.is_alive():
+            return actions.Outcome(0, "Проверка сети уже идёт…")
+        self._netcheck = threading.Thread(target=self._netcheck_run, name="xgw-netcheck",
+                                          daemon=True)
+        self._netcheck.start()
+        return actions.Outcome(0, "Проверяю сеть — это займёт до 15 секунд…")
+
+    def _netcheck_run(self) -> None:
+        from .. import netcheck
+
+        started = time.time()
+        try:
+            checks = netcheck.Netcheck(self.cfg, self.paths, runner=self.runner, logger=self.log,
+                                       capture=self._capture()).run()
+        except Exception as exc:  # итог должен появиться и тогда
+            self.log.error("проверка сети: %s", exc)
+            checks = [netcheck.Check("Проверка сети", netcheck.WARN, f"не выполнена: {exc}")]
+        try:
+            with actions.open_store(self.paths) as store:
+                store.set_meta(netcheck.META,
+                               netcheck.dumps(checks, started, time.time() - started))
+                store.add_event("netcheck", "проверка сети: " + netcheck.summary(checks))
+        except (OSError, sqlite3.Error) as exc:
+            self.log.error("итог проверки сети не записан: %s", exc)
 
     def _cores_card(self, snapshot: dict, now: float) -> dict:
         singbox = snapshot.get("singbox") or {}
@@ -1517,6 +1556,8 @@ class Panel:
             return actions.Outcome(0, "Основной сервер выключен: сервер выбирает ядро")
         if name == "speed/one":
             return self._speed_one(body)
+        if name == "netcheck":
+            return self._netcheck_start()
         if name in ("refresh", "scan", "speed"):
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")

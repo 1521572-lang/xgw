@@ -24,6 +24,7 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 Латвия «нестабильна по ТСПУ», скорость основного «из трафика», идёт поиск замены придушенному
 серверу, один проверочный хост на паузе, один резолвер bootstrap-DNS не отвечает, Tailscale
 временно через VPN. Иконка ↻ у скорости — замер одного сервера (5 секунд) — во всех сценах.
+Кнопка «Проверить сеть» — тоже во всех: проверки выдуманные, без пакетов наружу, за 4 секунды.
 
 --app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
@@ -53,8 +54,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_tailscale import FakeTailscale
 
-from xgw import actions, config, cores, cost, engine, tailscale
+from xgw import actions, config, cores, cost, engine, netcheck, tailscale
 from xgw.daemon import stranded_action, stranded_note
+from xgw.diag import OK, WARN, Check
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -687,6 +689,27 @@ def phone_gateway(spec: str) -> dict:
     return applied
 
 
+def demo_netcheck(_self) -> list[Check]:
+    """Проверка сети без настоящих пакетов: один WARN — чтобы был виден совет."""
+    time.sleep(4)
+    return [
+        Check("MTU до сервера", OK,
+              "до сервера «🇳🇱 Нидерланды · Амстердам 1» проходят пакеты 1500 байт"),
+        Check("UDP напрямую", WARN,
+              "STUN-серверы не ответили напрямую: похоже, провайдер не пропускает UDP",
+              "серверы hysteria2 и TUIC работать не будут (у вас их 4); VLESS, Trojan и "
+              "Shadowsocks по TCP это не затрагивает"),
+        Check("UDP через VPN", OK,
+              "UDP идёт через сервер «🇳🇱 Нидерланды · Амстердам 1»: STUN-сервер ответил "
+              "через Xray"),
+        Check("Утечка DNS", OK,
+              "DNS машины идёт через Xray: на запрос к недоступному адресу ответил перехват, "
+              "а мимо VPN — никто"),
+        Check("Утечка IPv6", OK, "IPv6 машины мимо VPN закрыт фаерволом XGW"),
+        Check("Файрвол", OK, "ufw и Docker перехвату не мешают; контейнеры Docker — через VPN"),
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8791)
@@ -697,6 +720,7 @@ def main() -> None:
     parser.add_argument("--app-port", type=int, default=0)
     parser.add_argument("--phone-server", default="")
     args = parser.parse_args()
+    netcheck.Netcheck.run = demo_netcheck
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)
         panel.demo_phone = not args.app_port

@@ -139,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
     diag.add_argument(
         "--no-net", action="store_true", help="без запросов наружу (probe.url, bootstrap DNS)"
     )
+    diag.add_argument(
+        "--netcheck", action="store_true",
+        help="и проверка сети: размер пакетов до сервера, UDP, утечки DNS и IPv6",
+    )
     subparsers.add_parser(
         "update-xray", parents=[common],
         help="обновить Xray с проверкой SHA-256 и xray run -test",
@@ -806,6 +810,11 @@ def _cmd_diag(args, cfg: config.Config, paths: Paths, logger) -> int:
     from . import diag
 
     checks = _run_diag(args, cfg, paths, logger, net=not args.no_net)
+    if args.netcheck:
+        from . import netcheck
+
+        # Чужие правила фаервола diag уже проверил — второй раз их не показываем.
+        checks += netcheck.Netcheck(cfg, paths, logger=logger, firewall=False).run()
     if args.json:
         print(json.dumps([dataclasses.asdict(check) for check in checks],
                          ensure_ascii=False, indent=2))

@@ -144,6 +144,7 @@ button, textarea, input { font: inherit; color: inherit; }
   .ts-card { order: 6; }
   .phones-card { order: 7; }
   .cores-card { order: 8; }
+  .netcheck-card { order: 9; }
   body[data-empty="1"] .subs-card { order: 2; }
   body[data-empty="1"] .servers-card { order: 3; }
 }
@@ -403,6 +404,11 @@ a.btn.primary { color: var(--accent-ink); }
 .cores .core-row .row-main { flex-basis: 14rem; }
 .cores .core-row .row-sub { overflow-wrap: anywhere; }
 .cores .core-row .row-actions { flex-wrap: wrap; gap: .4rem; }
+
+/* Карточка «Проверка сети»: вердикт рядом с названием, вывод и совет — целиком, с переносом. */
+.netcheck .check-row { align-items: flex-start; }
+.netcheck .check-row .row-title { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.netcheck .check-row .row-sub { overflow-wrap: anywhere; }
 
 .edit-sub { display: flex; flex-direction: column; gap: .4rem; margin-top: .5rem; }
 .edit-sub label { color: var(--muted); font-size: .87rem; }

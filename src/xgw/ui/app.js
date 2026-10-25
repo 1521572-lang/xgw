@@ -42,7 +42,7 @@
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
     singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
-    guard: "контроль скорости", cores: "обновление ядер",
+    guard: "контроль скорости", cores: "обновление ядер", netcheck: "проверка сети",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -255,6 +255,8 @@
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
     draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
     setBusy($("cores-check"), s.busy.cores);
+    draw("netcheck", [s.netcheck, Math.floor(s.now / 60)], () => renderNetcheck(s));
+    setBusy($("netcheck-run"), Boolean((s.netcheck || {}).running));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
@@ -1319,6 +1321,26 @@
     return el("li", { class: "core-row", "data-core": row.core }, main, tools);
   }
 
+  // Проверка сети (кнопка «Проверить сеть»): размер пакетов до сервера, UDP напрямую и через
+  // VPN, утечки DNS и IPv6, чужие правила фаервола. Демон сам её не запускает.
+  const CHECK_LEVELS = { OK: ["on", "в порядке"], WARN: ["warn", "внимание"], FAIL: ["rec", "ошибка"] };
+
+  function renderNetcheck(s) {
+    const n = s.netcheck || {};
+    fill($("netcheck"), (n.checks || []).map((check) => {
+      const [kind, label] = CHECK_LEVELS[check.level] || ["", check.level];
+      const main = el("div", { class: "row-main" },
+        el("div", { class: "row-title" }, el("span", { text: check.name }), el("span", { class: `tag ${kind}`, text: label })),
+        // «ufw …», «nftables.service …» — имена программ пишутся со строчной и в начале фразы.
+        el("div", { class: "row-sub", text: /^[a-z]/.test(check.text) ? check.text : capital(check.text) }));
+      if (check.advice) main.append(el("div", { class: "row-sub", text: "→ " + check.advice }));
+      return el("li", { class: "check-row", "data-level": check.level }, main);
+    }), "");
+    $("netcheck-when").textContent = n.running ? "Проверяю сеть — это займёт до 15 секунд…"
+      : n.at ? `Проверено ${stamp(n.at, s.now)} за ${Math.max(1, Math.round(n.took || 0))} с.`
+        : "Ещё не проверялась. Проверка займёт до 15 секунд: размер пакетов до сервера, пропускает ли провайдер UDP, идёт ли UDP через сервер, не уходят ли DNS и IPv6 мимо VPN, чужие правила фаервола.";
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -1400,6 +1422,7 @@
   });
   $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
   $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
+  $("netcheck-run").addEventListener("click", () => act("netcheck", {}, $("netcheck-run")));
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";
