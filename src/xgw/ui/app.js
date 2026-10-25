@@ -258,7 +258,7 @@
     // Выбор сервера устройства — из включённых: строки перерисовываются, когда их набор меняется.
     const routable = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
       .map((row) => [row.fingerprint, row.name, row.multiplier || 0]);
-    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable], () => renderDevices(s));
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable, (s.kernel_direct || {}).reason], () => renderDevices(s));
     draw("direct", s.kernel_direct, () => renderDirect(s));
     const recTag = $("devices").querySelector(".tag.rec");
     if (recTag && recording) recTag.textContent = recordText(recording, s.now);
@@ -483,17 +483,27 @@
 
   // --- серверы по подпискам -------------------------------------------------
 
-  function serverValue(server) {
+  const hasDelay = (server) => server.delay_ms !== null && server.delay_ms !== undefined;
+  const delayTone = (ms) => (ms < 250 ? "ok" : ms < 700 ? "warn" : "bad");
+
+  function serverValue(server, s) {
     if (server.status === "member") {
       if (server.alive === false) return el("span", { class: "delay bad", text: "нет ответа" });
-      if (server.delay_ms === null || server.delay_ms === undefined) {
+      if (!hasDelay(server)) {
         return el("span", { class: "delay none", text: server.alive ? "жив" : "проверяется" });
       }
-      const tone = server.delay_ms < 250 ? "ok" : server.delay_ms < 700 ? "warn" : "bad";
-      return el("span", { class: `delay ${tone}`, text: `${server.delay_ms} мс` });
+      return el("span", { class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс` });
     }
     if (server.status === "spare") {
       const [tone, text] = VERDICTS[server.verdict] || ["none", server.verdict || "не проверялся"];
+      // Задержка запасного — по его последней проверке (ядро его не пробует): после замера
+      // по кнопке она свежая, как и скорость.
+      if (hasDelay(server)) {
+        return el("span", {
+          class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс`,
+          title: `${capital(text)} — по проверке ${stamp(server.scanned, s.now)}`,
+        });
+      }
       return el("span", { class: `delay ${tone}`, text });
     }
     return el("span", { class: "delay none", text: "—" });
@@ -711,7 +721,7 @@
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server)),
+      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server, s)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -992,22 +1002,46 @@
         fingerprint: row.fingerprint,
         label: row.multiplier ? `${row.name} · лимит ×${row.multiplier}` : row.name,
       }));
-    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices)),
+    const direct = s.kernel_direct || {};
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices, direct)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
     $("records-block").hidden = !records.files.length;
     fill($("records"), records.files.map(recordRow));
   }
 
-  // Российские адреса ядром мимо Xray (Ф6): переключатель и пояснение под ним.
+  // Российские адреса ядром мимо Xray (Ф6) у этого компьютера и контейнеров: переключатель и
+  // пояснение под ним. У устройств сети — свой выбор в их строках (directSelect).
   function renderDirect(s) {
     const direct = s.kernel_direct || {};
     $("kernel-direct").setAttribute("aria-checked", String(Boolean(direct.on)));
-    let text = "Выключено: российские сайты идут напрямую через Xray. Включите — и ядро будет "
-      + "пропускать их само, мимо Xray: меньше нагрузка, соединения не рвутся при его перезапуске.";
-    if (direct.on && direct.reason) text = `Включено, но не действует: ${direct.reason}.`;
+    let text = "Выключено: российские сайты этого компьютера идут напрямую через Xray. Включите — и "
+      + "ядро будет пропускать их само, мимо Xray: меньше нагрузка, соединения не рвутся при его "
+      + "перезапуске. У устройств сети — свой выбор в их строках.";
+    if (direct.reason) text = `${direct.on ? "Включено, но не действует" : "Включить нельзя"}: ${direct.reason}.`;
     else if (direct.on && !direct.networks) text = "Включено, но сетей нет: geoip.dat не прочитан — российские сайты идут через Xray.";
-    else if (direct.on) text = `Включено: ${direct.networks} российских сетей — напрямую ядром, мимо Xray. DNS — по-прежнему через Xray.`;
+    else if (direct.on) text = `Включено: ${direct.networks} российских сетей — напрямую ядром, мимо Xray. DNS — по-прежнему через Xray. У устройств сети — свой выбор в их строках.`;
     $("direct-note").textContent = text;
+  }
+
+  // Российские адреса устройства — мимо Xray (Ф6, пожелание заказчика из отчёта 25.10.2026:
+  // у каждого устройства свой выбор). «Через Xray» — как у всех.
+  function directSelect(device, direct) {
+    const name = device.name || device.mac;
+    const select = el("select", { class: "prio route", "aria-label": `Российские адреса устройства ${name}`,
+      title: "Российские сайты этого устройства: через Xray (его выход «напрямую») или ядром шлюза, мимо Xray — меньше нагрузка, соединения не рвутся при перезапуске Xray" });
+    select.append(el("option", { value: "", text: "Российские: через Xray" }));
+    select.append(el("option", { value: "on", text: "Российские: мимо Xray" }));
+    const before = device.kernel ? "on" : "";
+    select.value = before;
+    if (direct.reason && !device.kernel) {
+      select.disabled = true;
+      select.title = `Мимо Xray нельзя: ${direct.reason}`;
+    }
+    select.addEventListener("change", () => {
+      act("device/direct", { mac: device.mac, on: select.value === "on" }, select)
+        .then((ok) => { if (!ok) select.value = before; });
+    });
+    return select;
   }
 
   const megabytes = (bytes) => (bytes >= 1048576
@@ -1072,7 +1106,7 @@
     return select;
   }
 
-  function deviceRow(device, active, now, choices) {
+  function deviceRow(device, active, now, choices, direct) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
     if (active && active.mac === device.mac) {
@@ -1099,7 +1133,8 @@
     return el("li", {},
       el("div", { class: "row-main" }, title,
         el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` }),
-        device.bypass ? null : routeSelect(device, choices)),
+        device.bypass ? null
+          : el("div", { class: "picks" }, routeSelect(device, choices), directSelect(device, direct))),
       el("span", {
         class: device.bypass ? "tag warn" : "tag on",
         text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")

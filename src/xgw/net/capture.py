@@ -462,7 +462,7 @@ class Capture:
                     warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
             # Какой набор direct4 загружен (Ф6): loaded() сверяет отпечаток, а не тысячи сетей.
-            digest = nft.direct_digest(rules.direct4) if rules.direct4 else None
+            digest = nft.direct_digest(rules.direct4, rules.direct_local) if rules.direct4 else None
             if self._state().get("direct4") != digest:
                 self._save(direct4=digest)
         except (cmd.CommandError, OSError) as exc:
@@ -716,9 +716,13 @@ class Capture:
         if not rules.blocked and nft.quic_loaded(text) != rules.quic:
             return False  # network.block_quic переключили
         if nft.has_set(text, nft.DIRECT_SET) != bool(rules.direct4) or (
-                rules.direct4
-                and self._state().get("direct4") != nft.direct_digest(rules.direct4)):
+                rules.direct4 and self._state().get("direct4")
+                != nft.direct_digest(rules.direct4, rules.direct_local)):
             return False  # разгрузку переключили, сменились geoip.dat или direct_ips
+        if nft.has_set(text, nft.DIRECT_LAN_SET) != bool(rules.direct_lan) or (
+                rules.direct_lan
+                and nft.set_elements(text, nft.DIRECT_LAN_SET) != set(rules.direct_lan)):
+            return False  # разгрузку устройства включили или выключили
         if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
                 rules.ts_exit_direct):
             return False  # устройство tailnet пустили напрямую или вернули в Xray

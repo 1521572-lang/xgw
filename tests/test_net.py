@@ -551,6 +551,18 @@ def test_russian_addresses_set_is_reloaded_only_when_it_changes(gateway):
     assert gateway.loaded() is False
     gateway.up()
     assert gateway.loaded() is True and "direct4" not in gateway.kernel.table
+    # По устройству (пожелание заказчика): набор их адресов сверяется по элементам.
+    gateway.cfg.managed.kernel_devices = ["192.168.50.20"]
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.loaded() is True and "direct_lan4" in gateway.kernel.table
+    gateway.cfg.managed.kernel_devices = ["192.168.50.21"]
+    assert gateway.loaded() is False  # другое устройство
+    gateway.up()
+    gateway.cfg.routing.kernel_direct = True
+    assert gateway.loaded() is False  # и машине: отпечаток другой, хотя набор сетей тот же
+    gateway.up()
+    assert gateway.loaded() is True
 
 
 # --- TUN (capture.method = tun) -----------------------------------------------------

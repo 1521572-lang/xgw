@@ -54,10 +54,11 @@ TPROXY, что и LAN; устройства из набора ts_exit_direct (п
 отбивается, кроме ts_exit_direct. IPv6 через выходной узел закрыт (LAN IPv6 тоже не
 получает): иначе он ушёл бы мимо VPN.
 
-Российские адреса мимо Xray (Ф6, routing.kernel_direct): сети из routing.direct_ips
-(geoip:ru — из geoip.dat самого Xray) лежат в наборе direct4, и TCP/UDP устройств сети, самой
-машины и контейнеров к ним идёт напрямую ядром — как через обычный роутер, с QUIC, — а не
-через Xray и его выход direct. DNS (порт 53) по-прежнему перехватывается. В Xray доменные
+Российские адреса мимо Xray (Ф6): сети из routing.direct_ips (geoip:ru — из geoip.dat самого
+Xray) лежат в наборе direct4, и TCP/UDP к ним идёт напрямую ядром — как через обычный роутер, с
+QUIC, — а не через Xray и его выход direct. Включается отдельно у самой машины с контейнерами
+(routing.kernel_direct) и у каждого устройства сети (панель; их адреса — в наборе
+direct_lan4). DNS (порт 53) по-прежнему перехватывается. В Xray доменные
 правила проверяются раньше IP, поэтому при непустом proxy_domains разгрузка не включается:
 домен из него с российским адресом ушёл бы мимо VPN. Режим blocked её не знает (DNS там
 закрыт, и пользы нет), устройства tailnet идут через Xray, как раньше.
@@ -108,6 +109,7 @@ TIME_USERS = ("_chrony", "systemd-timesync")
 CONTAINER_IFS = ("docker0", "br-*")
 NTS_KE_PORT = 4460  # chrony с NTS сначала получает ключи по TCP
 DIRECT_SET = "direct4"  # сети, куда трафик идёт ядром мимо Xray (Ф6)
+DIRECT_LAN_SET = "direct_lan4"  # устройства сети, чьи соединения с ними идут ядром
 # Больше этого (четверть IPv4) «напрямую» не бывает: geoip.dat испорчен или в direct_ips
 # вписано лишнее — разгрузка не включается, иначе мимо VPN ушла бы большая часть интернета.
 DIRECT_MAX = 1 << 30
@@ -160,8 +162,11 @@ class Rules:
     ts_exit_direct: tuple[str, ...] = ()
     # QUIC (UDP/443) в интернет отбивается (network.block_quic): браузер уходит на TCP.
     block_quic: bool = False
-    # Сети, куда LAN, машина и контейнеры ходят ядром мимо Xray (routing.kernel_direct, Ф6).
+    # Сети, куда ходят ядром мимо Xray (Ф6): устройства сети из direct_lan и (direct_local,
+    # routing.kernel_direct) сама машина с контейнерами. Пусто — разгрузки нет ни у кого.
     direct4: tuple[str, ...] = ()
+    direct_lan: tuple[str, ...] = ()
+    direct_local: bool = False
 
     @property
     def ts4(self) -> bool:
@@ -242,12 +247,20 @@ def build_rules(
     без разгрузки)."""
     capture = capture and not blocked
     warnings: list[str] = []
-    direct: tuple[str, ...] = ()
-    if capture and geoip is not None and not kernel_direct_reason(cfg):
-        direct, direct_warnings = direct_networks(cfg, geoip)
-        warnings.extend(direct_warnings)
     name = cfg.network.lan_if.strip()
     lan_if = lan.lan_interface(cfg)
+    direct: tuple[str, ...] = ()
+    direct_lan: tuple[str, ...] = ()
+    direct_local = False
+    if capture and geoip is not None and not kernel_direct_reason(cfg):
+        direct_lan = tuple(cfg.managed.kernel_devices) if lan_if and cfg.capture.lan else ()
+        direct_local = cfg.routing.kernel_direct and (
+            cfg.capture.local or containers_wanted(cfg))
+        if direct_lan or direct_local:
+            direct, direct_warnings = direct_networks(cfg, geoip)
+            warnings.extend(direct_warnings)
+        if not direct:
+            direct_lan, direct_local = (), False
     if name and not lan_if:
         warnings.append(f"network.lan_if={name!r}: недопустимое имя интерфейса — LAN не настроен")
     wan_name = cfg.network.wan_if.strip()
@@ -321,15 +334,24 @@ def build_rules(
             ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
             block_quic=capture and cfg.network.block_quic,
             direct4=direct,
+            direct_lan=direct_lan,
+            direct_local=direct_local,
         ),
         warnings,
     )
 
 
 def kernel_direct_reason(cfg: Config) -> str:
-    """Почему российские адреса не идут ядром мимо Xray; пусто — идут."""
-    if not cfg.routing.kernel_direct:
+    """Почему российские адреса не идут ядром мимо Xray ни у кого; пусто — у кого включено,
+    у того идут."""
+    if not cfg.routing.kernel_direct and not cfg.managed.kernel_devices:
         return "выключено"
+    return kernel_direct_blocker(cfg)
+
+
+def kernel_direct_blocker(cfg: Config) -> str:
+    """Что мешает разгрузке, даже если её включить (панель отказывает с этим текстом);
+    пусто — ничего."""
     if cfg.routing.proxy_domains:
         return ("в routing.proxy_domains есть домены — с российским адресом они ушли бы мимо "
                 "VPN")
@@ -392,10 +414,12 @@ def _direct_networks(
     return tuple(str(network) for network in collapsed), tuple(warnings)
 
 
-def direct_digest(networks: tuple[str, ...]) -> str:
-    """Отпечаток набора direct4: по нему сверка (Capture.loaded) видит, что загружен не тот
-    набор (сменился geoip.dat или direct_ips), не разбирая тысячи сетей вывода nft."""
-    return hashlib.sha256("\n".join(networks).encode("ascii")).hexdigest()[:16]
+def direct_digest(networks: tuple[str, ...], local: bool = False) -> str:
+    """Отпечаток набора direct4 и разгрузки самой машины (local): по нему сверка
+    (Capture.loaded) видит, что загружено не то (сменились geoip.dat или direct_ips,
+    переключили машину), не разбирая тысячи сетей вывода nft."""
+    text = "\n".join(networks) + ("\nlocal" if local else "")
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
 
 
 def has_set(text: str, name: str) -> bool:
@@ -515,8 +539,12 @@ def render(rules: Rules) -> str:
         blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
     if rules.direct4:
         blocks.append(_set(DIRECT_SET, rules.direct4))
+    if rules.direct_lan:
+        blocks.append(_set(DIRECT_LAN_SET, rules.direct_lan, interval=False))
     # Российские адреса (Ф6) — мимо Xray; DNS к ним перехватывается, как всякий.
-    direct = [f"ip daddr @{DIRECT_SET} th dport != 53 return"] if rules.direct4 else []
+    to_direct = f"ip daddr @{DIRECT_SET} th dport != 53 return"
+    direct = [to_direct] if rules.direct_local else []
+    from_direct = f"ip saddr @{DIRECT_LAN_SET} ip daddr @{DIRECT_SET}"
 
     tproxy = (
         "meta l4proto { tcp, udp } counter "
@@ -562,10 +590,10 @@ def render(rules: Rules) -> str:
                 "fib daddr type local th dport != 53 return",
                 "ip daddr @reserved4 th dport != 53 return",
             ]
-            if rules.capture_lan:
-                # Устройства сети — к российским адресам напрямую: их пропустит forward.
+            if rules.capture_lan and rules.direct_lan:
+                # Устройства с разгрузкой — к российским адресам напрямую: их пропустит forward.
                 # Машина сюда с ними не доходит (output их не метит), tailnet — через Xray.
-                prerouting += [f'iifname "{lan_if}" {rule}' for rule in direct]
+                prerouting.append(f'iifname "{lan_if}" ip saddr @{DIRECT_LAN_SET} {to_direct}')
             if rules.block_quic and (rules.capture_lan or rules.ts_exit):
                 # QUIC устройств — не в Xray: его отобьёт forward (reject в prerouting нельзя).
                 # QUIC самой машины сюда не доходит: его отбивает loopback_guard ещё на выходе.
@@ -644,11 +672,14 @@ def render(rules: Rules) -> str:
                     ],
                 )
             )
-        # QUIC к российским адресам (Ф6) идёт напрямую, как через обычный роутер: отбой QUIC
-        # нужен только трафику через Xray (дробление ClientHello).
-        keep = f" ip daddr != @{DIRECT_SET}" if rules.direct4 else ""
-        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4{keep} {QUIC_REJECT}'] if (
-            rules.block_quic and rules.capture_lan) else []
+        quic: list[str] = []
+        if rules.block_quic and rules.capture_lan:
+            if rules.direct_lan:
+                # QUIC устройств с разгрузкой к российским адресам (Ф6) идёт напрямую, как
+                # через обычный роутер: отбой нужен только трафику через Xray (дробление
+                # ClientHello). Одним правилом отбоя «кроме устройства и сети» не сказать.
+                quic.append(f'iifname "{lan_if}" {out} {from_direct} udp dport 443 counter accept')
+            quic.append(f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}')
         if rules.block_quic and rules.ts_exit:
             quic.append(
                 f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
@@ -665,8 +696,8 @@ def render(rules: Rules) -> str:
         ]
         if rules.capture_lan:
             forward.append(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept')
-            if rules.direct4:
-                forward.append(f'iifname "{lan_if}" {out} ip daddr @{DIRECT_SET} counter accept')
+            if rules.direct_lan:
+                forward.append(f'iifname "{lan_if}" {out} {from_direct} counter accept')
             if rules.forward_icmp:
                 forward.append(f'iifname "{lan_if}" {out} meta l4proto icmp counter accept')
         else:

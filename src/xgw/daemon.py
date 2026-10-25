@@ -718,6 +718,11 @@ class Daemon:
         self.inventory = previous.inventory
         self.next_refresh = previous.next_refresh
         self._rebuild_asked = True
+        if previous.cfg.managed.routes != self.cfg.managed.routes:
+            # Свой сервер устройства (Ф4) выбран в панели — его ждут сразу. Выход to-main у
+            # первого такого устройства и проба запасного сервера в burstObservatory без
+            # перезапуска Xray не применяются: окна перезапуска (ночью) это не ждёт.
+            self._urgent_rebuild = "свой сервер устройства"
         # Серверы те же — заново проверять участников незачем.
         self.vetted = set(previous.vetted)
         self.bad_members = dict(previous.bad_members)
@@ -975,6 +980,9 @@ class Daemon:
             # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
             # считает мёртвыми всех участников; без inbound TUN контейнеры без интернета.
             reason, self._urgent_rebuild = self._urgent_rebuild, ""
+            if self._rebuild_asked:  # сборка ниже уже учитывает новые настройки
+                self._rebuild_asked = False
+                self._save_inventory(self.inventory)
             changed = self._rebuild(None, urgent=True, reason=reason)
         if not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
             # Внеочередное обновление подписки напрямую и скан всех запасных.
@@ -3855,6 +3863,8 @@ class Daemon:
                 # Замер прервала остановка демона: это не неудача сервера.
                 self.speed_queue.appendleft(probe_tag)
                 break
+            if info.role == "spare" and probe_tag in self._speed_any:
+                self._ping_spare(info, password)
             background = 0.0
             span = max(elapsed, result.seconds)
             if before is not None and result.mbps is not None and span > 0:
@@ -3887,6 +3897,22 @@ class Daemon:
                     speed.mbps_text(result.mbps), result.bytes_read, result.seconds,
                 )
         return count
+
+    def _ping_spare(self, info: NodeInfo, password: str) -> None:
+        """Кнопка замера у запасного: заодно его проверка. Задержку участника панель берёт у
+        проб ядра, а запасного ядро не пробует — его задержка в панели по этой проверке
+        (status.py), и без неё после замера в строке была только скорость."""
+        result = self._probe_scan(info, password)
+        if result.kind == "cancelled":
+            return
+        self.store.save_scan(
+            info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
+            ts=self.wall(),
+        )
+        self.log.info(
+            "скан %s: %s, %d байт за %.1f с", info.tag, result.verdict, result.bytes_read,
+            result.seconds,
+        )
 
     def _speed(self, info: NodeInfo, password: str, *, small: bool = False) -> speed.SpeedResult:
         """Замер сервера; small — короткий (не больше speed.spare_mb): повторные замеры

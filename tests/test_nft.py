@@ -765,8 +765,9 @@ def test_quic_rules_pass_nft_check(tmp_path):
 
 
 def test_russian_addresses_go_past_xray_in_the_kernel(tmp_path):
-    """Ф6 (routing.kernel_direct): сети direct_ips — в наборе direct4; устройства сети, машина и
-    контейнеры к ним идут ядром мимо Xray, с QUIC, а DNS — по-прежнему в Xray. Ядру уходит
+    """Ф6: сети direct_ips — в наборе direct4; к ним идут ядром мимо Xray, с QUIC, устройства
+    сети, у которых это включено (набор direct_lan4: пожелание заказчика — по устройству), и
+    сама машина с контейнерами (routing.kernel_direct); DNS — по-прежнему в Xray. Ядру уходит
     только то, что Xray и так отправил бы напрямую. Не действует при proxy_domains, без
     перехвата и в blocked."""
     from test_geodat import write_geoip
@@ -780,22 +781,38 @@ def test_russian_addresses_go_past_xray_in_the_kernel(tmp_path):
         return nft.build_rules(cfg, **{"capture": True, "time_uids": (), "geoip": geoip, **kwargs})
 
     assert build()[0].direct4 == ()  # выключено по умолчанию
-    cfg.routing.kernel_direct = True
+    cfg.managed.kernel_devices = ["192.168.50.20"]
     rules, warnings = build()
     assert rules.direct4 == ("5.8.0.0/13", "5.16.0.0/14", "203.0.113.0/24")
+    assert rules.direct_lan == ("192.168.50.20",) and not rules.direct_local
     assert len(warnings) == 1 and "geoip:!ru" in warnings[0]  # остаётся в Xray
     text = nft.render(rules)
     assert "elements = { 5.8.0.0/13, 5.16.0.0/14, 203.0.113.0/24 }" in text
+    assert nft.set_elements(text, nft.DIRECT_LAN_SET) == {"192.168.50.20"}
     direct = "ip daddr @direct4 th dport != 53 return"
-    assert f'iifname "lan0" {direct}' in _chain(text, "prerouting")
-    assert direct in _chain(text, "output") and direct in _chain(text, "containers")
+    assert f'iifname "lan0" ip saddr @direct_lan4 {direct}' in _chain(text, "prerouting")
+    assert direct not in _chain(text, "output") and direct not in _chain(text, "containers")
     forward = _chain(text, "forward")
-    assert 'iifname "lan0" oifname "wan0" ip daddr @direct4 counter accept' in forward
-    assert forward[0] == (  # QUIC к российским адресам не отбивается
+    device = 'iifname "lan0" oifname "wan0" ip saddr @direct_lan4 ip daddr @direct4'
+    assert f"{device} counter accept" in forward
+    assert forward[:2] == [  # QUIC устройства к российским адресам не отбивается, прочий — да
+        f"{device} udp dport 443 counter accept",
         'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
-        "ip daddr != @direct4 counter reject with icmp type port-unreachable")
+        "counter reject with icmp type port-unreachable",
+    ]
+    # Сама машина с контейнерами — своим переключателем.
+    cfg.managed.kernel_devices = []
+    cfg.routing.kernel_direct = True
+    local = build()[0]
+    assert local.direct4 == rules.direct4 and local.direct_lan == () and local.direct_local
+    text_local = nft.render(local)
+    assert direct in _chain(text_local, "output") and direct in _chain(text_local, "containers")
+    assert "@direct_lan4" not in text_local and not nft.has_set(text_local, nft.DIRECT_LAN_SET)
     assert nft.has_set(text, nft.DIRECT_SET) and not nft.has_set(_render(_cfg()), nft.DIRECT_SET)
+    assert nft.direct_digest(rules.direct4) != nft.direct_digest(rules.direct4, local=True)
     assert nft.direct_digest(rules.direct4) != nft.direct_digest(rules.direct4[:2])
+    cfg.managed.kernel_devices = ["192.168.50.20"]
+    text = nft.render(build()[0])  # и то и другое — его проверяет nft -c ниже
     # Домен из proxy_domains с российским адресом ушёл бы мимо VPN — разгрузки нет.
     cfg.routing.proxy_domains = ["domain:example.ru"]
     assert nft.kernel_direct_reason(cfg) and build()[0].direct4 == ()

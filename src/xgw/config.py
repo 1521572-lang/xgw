@@ -275,8 +275,10 @@ class Routing:
     )
     direct_ips: list[str] = field(default_factory=lambda: ["geoip:ru"])
     proxy_domains: list[str] = field(default_factory=list)
-    # Адреса из direct_ips (geoip:ru и сети) — напрямую ядром, мимо Xray (Ф6, net/nft.py).
-    # При непустом proxy_domains не действует: домен с российским адресом ушёл бы мимо VPN.
+    # Адреса из direct_ips (geoip:ru и сети) — напрямую ядром, мимо Xray (Ф6, net/nft.py): у
+    # самой машины и контейнеров; устройства сети включаются по одному в панели
+    # (managed.kernel_devices). При непустом proxy_domains не действует: домен с российским
+    # адресом ушёл бы мимо VPN.
     kernel_direct: bool = False
     conn_idle_s: int = 120
     home_country: str = "RU"
@@ -413,14 +415,17 @@ class Managed:
     # Устройства со своим сервером (Ф4): адрес IPv4 → отпечаток сервера. Аренда добавлена из
     # panel.json; остальные устройства — через основной сервер.
     routes: dict[str, str] = field(default_factory=dict)
+    # Устройства, чьи соединения с российскими адресами идут ядром мимо Xray (Ф6): адреса
+    # IPv4, аренда добавлена из panel.json.
+    kernel_devices: list[str] = field(default_factory=list)
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
     # Ядро, закреплённое за сервером: отпечаток → "xray" или "sing-box"; остальные — auto.
     core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
-    # Российские адреса мимо Xray включены или выключены в панели (routing.kernel_direct);
-    # None — как в config.toml.
+    # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
+    # (routing.kernel_direct); None — как в config.toml.
     kernel_direct: bool | None = None
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
@@ -552,12 +557,16 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
     warnings.extend(_merge_devices(cfg, data["routes"], routes=True))
+    warnings.extend(_merge_devices(cfg, data["kernel_devices"], kernel=True))
     return warnings
 
 
-def _merge_devices(cfg: Config, devices: list[dict], *, routes: bool = False) -> list[str]:
-    """Устройства из панели: статическая аренда и запись в bypass_hosts (мимо VPN) либо в
-    managed.routes (routes — свой сервер; устройство мимо VPN своего сервера не получает).
+def _merge_devices(
+    cfg: Config, devices: list[dict], *, routes: bool = False, kernel: bool = False,
+) -> list[str]:
+    """Устройства из панели: статическая аренда и запись в bypass_hosts (мимо VPN), в
+    managed.routes (routes — свой сервер) либо в managed.kernel_devices (kernel — российские
+    адреса мимо Xray). Устройству мимо VPN ни то, ни другое не нужно: в Xray оно не попадает.
 
     То, что уже есть в config.toml, главнее: совпадающую аренду не дублируем, а
     конфликтующую (тот же MAC с другим адресом или тот же адрес у другого MAC)
@@ -572,7 +581,7 @@ def _merge_devices(cfg: Config, devices: list[dict], *, routes: bool = False) ->
     listed = {host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts}
     for device in devices:
         mac, ip, name = device["mac"], device["ip"], device["name"]
-        if mac in listed or (routes and ip in listed):
+        if mac in listed or ((routes or kernel) and ip in listed):
             continue  # уже мимо VPN (MAC или адрес в bypass_hosts) — в Xray не попадает
         if lease_ip.get(mac, ip) != ip or any(
             other != mac and taken == ip for other, taken in lease_ip.items()
@@ -587,6 +596,9 @@ def _merge_devices(cfg: Config, devices: list[dict], *, routes: bool = False) ->
             lease_ip[mac] = ip
         if routes:
             cfg.managed.routes[ip] = device["server"]
+            continue
+        if kernel:
+            cfg.managed.kernel_devices.append(ip)
             continue
         cfg.network.bypass_hosts.append(mac)
         listed.add(mac)

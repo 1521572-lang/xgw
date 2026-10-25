@@ -1511,6 +1511,32 @@ def test_disabled_server_leaves_the_core_without_asking_subscriptions_again(daem
         second.store.close()
 
 
+def test_device_server_is_applied_at_once(daemon):
+    """Свой сервер устройства (Ф4): новый выход to-main требует перезапуска Xray — сборка
+    срочная и окна перезапуска не ждёт (отчёт Ф4: выбор записан, а конфиг Xray прежний)."""
+    _started(daemon)
+    from xgw.generator import builder
+
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    member = next(
+        info for info in builder.applied_nodes(applied, daemon.inventory.nodes)
+        if info.role == "proxy"
+    )
+    second = _second(
+        daemon, lambda cfg: cfg.managed.routes.update({"192.168.50.20": member.fingerprint}))
+    try:
+        second.tick()
+        ((config, urgent),) = second.applied
+        assert urgent
+        assert [balancer["fallbackTag"] for balancer in config["routing"]["balancers"]
+                if balancer["tag"] == "dev-192.168.50.20"] == [builder.TO_MAIN]
+        assert any("свой сервер устройства" in event for event in second.events())
+        second.tick()
+        assert len(second.applied) == 1  # второй раз пересобирать нечего
+    finally:
+        second.store.close()
+
+
 def test_new_subscription_is_fetched_at_once(daemon):
     _started(daemon)
     second = _second(daemon, lambda cfg: cfg.manual.links.append(links.SS_PLAIN))

@@ -353,7 +353,7 @@ def test_devices_and_events_are_listed(rig, user):
     state = user.state()
     assert state["devices"] == [{"expires": 1791600000, "mac": "aa:bb:cc:00:11:22",
                                  "ip": "192.168.50.101", "name": "phone", "bypass": False,
-                                 "managed": False, "route": ""}]
+                                 "managed": False, "route": "", "kernel": False}]
     assert state["events"][0]["kind"] == "apply" and "S3CR3T" not in state["events"][0]["detail"]
 
 
@@ -400,6 +400,36 @@ def test_device_goes_around_the_vpn_and_back(rig, user):
     assert "192.168.50.101" not in _bypass_set(rig)
     assert "dhcp-host" not in dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
     assert user.state()["devices"][0]["bypass"] is False
+
+
+def test_russian_addresses_of_one_device_go_past_xray(rig, user):
+    """Ф6 по устройству (пожелание заказчика из отчёта): адрес закрепляется арендой, правила
+    загружаются сразу; машина — своим переключателем. При proxy_domains — отказ."""
+    from test_geodat import write_geoip
+
+    rig.paths.xray_dir.mkdir(parents=True, exist_ok=True)
+    write_geoip(rig.paths.xray_dir / "geoip.dat", {"RU": [("5.8.0.0", 13)]})
+    rig.lease()
+    assert user.act("power", {"on": True})["ok"]
+    result = user.act("device/direct", {"mac": PHONE, "on": True})
+    assert result["ok"] and "«phone» российские адреса идут напрямую" in result["text"]
+    assert rig.saved()["kernel_devices"] == [
+        {"mac": PHONE, "ip": "192.168.50.101", "name": "phone"}]
+    assert f"dhcp-host={PHONE},192.168.50.101,phone" in dnsmasq.conf_path(rig.paths).read_text(
+        encoding="utf-8")
+    assert "ip saddr @direct_lan4 ip daddr @direct4" in rig.kernel.table
+    state = user.state()
+    assert state["devices"][0]["kernel"] is True and state["kernel_direct"]["on"] is False
+    assert user.act("device/direct", {"mac": PHONE, "on": False})["ok"]
+    assert rig.saved()["kernel_devices"] == [] and "direct4" not in rig.kernel.table
+    assert not user.act("device/direct", {"mac": PHONE})["ok"]
+
+    rig.config_path.write_text(
+        CONFIG + '[routing]\nproxy_domains = ["domain:example.ru"]\n', encoding="utf-8")
+    rig.panel.configure(config.load(rig.config_path)[0], rig.daemon)
+    result = user.act("device/direct", {"mac": PHONE, "on": True})
+    assert not result["ok"] and "proxy_domains" in result["text"]
+    assert user.state()["kernel_direct"]["reason"]
 
 
 def test_bypassed_device_stays_in_the_list_when_it_is_offline(rig, user):

@@ -32,7 +32,8 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None, "core": {},
+         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
+         "kernel_devices": [], "core": {},
          "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
@@ -92,6 +93,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
         "sticky": None,  # переключатель основного сервера в панели не трогали
         "kernel_direct": None,  # и российские адреса мимо Xray — тоже
+        "kernel_devices": [],
         "core": {},  # ядро за серверами не закрепляли
         # панель по tailnet не включали
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
@@ -335,6 +337,35 @@ def test_device_with_its_own_server_gets_a_lease_and_never_goes_with_bypass(conf
     assert "aa:bb:cc:00:11:22" not in cfg.network.bypass_hosts
     assert managed.set_route(path, "aa:bb:cc:00:11:22", "", "", "")  # «авто»
     assert config.load(conf)[0].managed.routes == {}
+
+
+def test_russian_addresses_past_xray_are_chosen_per_device(conf):
+    """Ф6 по устройству (пожелание заказчика): аренда и managed.kernel_devices, вместе со своим
+    сервером тоже; адрес другого устройства не занять. Прежний общий переключатель, включённый
+    в panel.json, переходит к этой машине и к устройствам, что сейчас в сети, — один раз."""
+    path = managed.path_for(conf)
+    assert managed.set_route(path, "aa:bb:cc:00:11:22", "192.168.50.120", "tv", "ab12cd34")
+    assert managed.set_kernel_device(path, "AA-BB-CC-00-11-22", "192.168.50.120", "tv", on=True)
+    assert not managed.set_kernel_device(path, "aa:bb:cc:00:11:22", "192.168.50.120", "tv", on=True)
+    with pytest.raises(ManagedError, match="закреплён"):
+        managed.set_kernel_device(path, "aa:bb:cc:00:11:33", "192.168.50.120", on=True)
+    cfg, warnings = config.load(conf)
+    assert warnings == [] and cfg.managed.kernel_devices == ["192.168.50.120"]
+    assert cfg.network.static_leases == ["aa:bb:cc:00:11:22,192.168.50.120,tv"]
+    assert not cfg.routing.kernel_direct  # машина — своим переключателем
+    assert managed.set_kernel_device(path, "aa:bb:cc:00:11:22", "", on=False)
+    assert config.load(conf)[0].managed.kernel_devices == []
+
+    online = [{"mac": "aa:bb:cc:00:11:44", "ip": "192.168.50.140", "name": "phone"},
+              {"mac": "aa:bb:cc:00:11:55", "ip": "192.168.50.120", "name": ""}]  # адрес tv
+    _save(conf, {"kernel_direct": True, "routes": [
+        {"mac": "aa:bb:cc:00:11:22", "ip": "192.168.50.120", "name": "tv", "server": "ab12cd34"}]})
+    assert managed.split_kernel_direct(path, online)
+    cfg = config.load(conf)[0]
+    assert cfg.routing.kernel_direct and cfg.managed.kernel_devices == ["192.168.50.140"]
+    assert not managed.split_kernel_direct(path, online)  # один раз
+    _save(conf, {"kernel_direct": False})
+    assert not managed.split_kernel_direct(path, online)
 
 
 def test_config_toml_wins_over_panel_devices(conf):

@@ -532,6 +532,11 @@ def collect_status(
                     # участники мертвы (builder.select_nodes).
                     "reserve": info.tag == reserve,
                     "verdict": scan["verdict"] if scan else None,
+                    # Задержка по последней проверке: запасного ядро не пробует, а проверка —
+                    # та же загрузка файла пробы через сервер, что и у проб ядра.
+                    "delay_ms": round(scan["seconds"] * 1000)
+                    if scan and scan["verdict"] in ("OK", "SLOW") and scan["seconds"] is not None
+                    else None,
                     "bytes": scan["bytes"] if scan else None,
                     "seconds": scan["seconds"] if scan else None,
                     "scanned": scan["ts"] if scan else None,

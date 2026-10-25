@@ -540,12 +540,18 @@ def test_one_server_is_measured_by_its_own_button(daemon):
     assert daemon.measured == []  # фоновый замер ждёт свободного канала
     spare = daemon.tags("spare")[0]
     spare_fp = next(info.fingerprint for info in daemon.view() if info.tag == spare)
+    probe = spare.replace("spare-", "probe-")
+    daemon.store.save_scan(probe, "OK", 65536, 2.0, ts=daemon.t - 3600)
     daemon.request_speed_one(spare_fp)
     assert daemon.speed_one_pending() == [spare_fp]
     _busy_step(daemon)
     assert daemon.measured == [spare]
     assert daemon.speed_one_pending() == []
     assert spare_fp in daemon._speeds()
+    # Заодно свежая проверка запасного: по ней панель показывает его задержку (пинг).
+    assert daemon.store.scans()[probe]["ts"] == daemon.t
+    entry = next(item for item in daemon.status()["spares"] if item["tag"] == spare)
+    assert entry["delay_ms"] == 500
     # По тегу участника — тоже он один (шаг со сканом запасных замер пропускает).
     daemon.request_speed_one(second)
     for _ in range(3):

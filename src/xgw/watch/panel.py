@@ -86,6 +86,9 @@ TS_TTL = 10.0  # как долго помнить, что ответил CLI tai
 TS_WAIT = 10.0  # сколько действие карточки ждёт ссылку входа или итог Serve
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
+# Свой сервер устройства демон применяет сразу, не дожидаясь окна перезапуска (отчёт Ф4).
+ROUTE_RESTART = ("Применяется сразу; если для этого нужен перезапуск Xray, соединения всех "
+                 "устройств прервутся на пару секунд")
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
 # остановка демона (по умолчанию в http.server — 0,5 с).
 SHUTDOWN_POLL = 0.1
@@ -515,6 +518,7 @@ class Panel:
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
+                    delay_ms=entry.get("delay_ms"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
                     **_shared(entry),
                 )
@@ -652,11 +656,11 @@ class Panel:
                 "interface": info["lan_if"],
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
-            # Российские адреса ядром мимо Xray (Ф6): включено ли, почему не действует, сколько
-            # сетей в наборе direct4.
+            # Российские адреса ядром мимо Xray (Ф6): у этого компьютера с контейнерами (on; у
+            # устройств — «kernel» в их строках), что мешает включить, сколько сетей в direct4.
             "kernel_direct": {
                 "on": cfg.routing.kernel_direct,
-                "reason": nft.kernel_direct_reason(cfg) if cfg.routing.kernel_direct else "",
+                "reason": nft.kernel_direct_blocker(cfg),
                 "networks": info.get("direct4") or 0,
             },
             "devices": devices,
@@ -792,19 +796,21 @@ class Panel:
         bypass = set(info["bypass"])
         mine = set(self.cfg.managed.devices)
         routes = self.cfg.managed.routes  # свой сервер устройства (Ф4): адрес → отпечаток
+        kernel = set(self.cfg.managed.kernel_devices)  # российские адреса мимо Xray (Ф6)
         devices = [
             {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine,
-             "route": routes.get(str(device.get("ip")), "")}
+             "route": routes.get(str(device.get("ip")), ""), "kernel": device.get("ip") in kernel}
             for device in dnsmasq.read_leases(self.paths)
         ]
         online = {device["mac"] for device in devices}
         leases, _warnings = lan.parse_leases(self.cfg)
         for lease in leases:
-            if (lease.mac in mine or lease.ip in routes) and lease.mac not in online:
+            if (lease.mac in mine or lease.ip in routes or lease.ip in kernel) and (
+                    lease.mac not in online):
                 devices.append({
                     "mac": lease.mac, "ip": lease.ip, "name": lease.name, "expires": 0,
                     "bypass": lease.ip in bypass, "managed": lease.mac in mine, "offline": True,
-                    "route": routes.get(lease.ip, ""),
+                    "route": routes.get(lease.ip, ""), "kernel": lease.ip in kernel,
                 })
         return devices
 
@@ -1423,7 +1429,7 @@ class Panel:
         if not server:
             return self._apply_devices(
                 store_path, lambda: managed.set_route(store_path, mac, "", "", ""),
-                f"Устройство «{label}» снова идёт через основной сервер", (),
+                f"Устройство «{label}» снова идёт через основной сервер", (ROUTE_RESTART,),
             )
         ip = (found or {}).get("ip") or (lease.ip if lease else "")
         listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
@@ -1450,40 +1456,95 @@ class Panel:
                 store_path, mac, str(address), name if lan.valid_hostname(name) else "", server),
             f"Устройство «{label}» идёт через сервер «{row['name']}»",
             ("Если этот сервер станет недоступен, устройство временно пойдёт через основной. "
-             "Российские сайты — напрямую, как у всех. Адрес устройства закрепится за ним",),
+             "Российские сайты — напрямую, как у всех. Адрес устройства закрепится за ним",
+             ROUTE_RESTART),
         )
 
     def _apply_devices(
         self, store_path: Path, change: Callable[[], bool], done: str, notes: tuple[str, ...]
     ) -> actions.Outcome:
         stored = managed.load(store_path)[0]
-        previous, routes = stored["devices"], stored["routes"]
+        previous, routes, kernel = stored["devices"], stored["routes"], stored["kernel_devices"]
         return self._apply_network(
-            change, lambda: managed.replace_devices(store_path, previous, routes), done, notes,
+            change, lambda: managed.replace_devices(store_path, previous, routes, kernel), done,
+            notes,
+        )
+
+    def _kernel_refusal(self) -> str:
+        """Почему разгрузку Ф6 не включить (для отказа панели); пусто — можно."""
+        if self.cfg.routing.proxy_domains:
+            return ("В routing.proxy_domains есть домены: с российским адресом они ушли бы мимо "
+                    "VPN. Уберите их из config.toml или оставьте разгрузку выключенной")
+        blocker = nft.kernel_direct_blocker(self.cfg)
+        return f"Разгрузка не действует: {blocker}" if blocker else ""
+
+    def _set_kernel_device(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Российские адреса устройства — ядром мимо Xray (Ф6, пожелание заказчика из отчёта:
+        у каждого устройства свой переключатель) либо снова через Xray. Адрес закрепляется
+        статической арендой; правила nftables загружаются сразу."""
+        mac, on = managed.normalize_mac(body.get("mac")), body.get("on")
+        if mac is None or not isinstance(on, bool):
+            return actions.Outcome(2, "ожидается устройство и on: true или false")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        cfg = self.cfg
+        gateway = lan.gateway(cfg)
+        if not lan.lan_interface(cfg) or gateway is None:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        lease = {item.mac: item for item in lan.parse_leases(cfg)[0]}.get(mac)
+        label = (found or {}).get("name") or (lease.name if lease else "") or mac
+        if not on:
+            return self._apply_devices(
+                store_path, lambda: managed.set_kernel_device(store_path, mac, "", on=False),
+                f"У устройства «{label}» российские адреса снова идут через Xray", (),
+            )
+        refusal = self._kernel_refusal()
+        if refusal:
+            return actions.Outcome(2, refusal)
+        ip = (found or {}).get("ip") or (lease.ip if lease else "")
+        listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
+        if mac in listed or ip in lan.bypass_addresses(cfg)[0]:
+            return actions.Outcome(2, "Устройство и так идёт мимо VPN — разгрузка ему не нужна")
+        try:
+            address = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
+        if address not in gateway.network or address == gateway.ip:
+            return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        return self._apply_devices(
+            store_path,
+            lambda: managed.set_kernel_device(
+                store_path, mac, str(address), name if lan.valid_hostname(name) else "", on=True),
+            f"У устройства «{label}» российские адреса идут напрямую, мимо Xray",
+            ("Его соединения с ними не зависят от Xray и не рвутся при его перезапуске. DNS — "
+             "по-прежнему через Xray. Адрес устройства закрепится за ним",),
         )
 
     def _set_kernel_direct(self, body: dict, store_path: Path) -> actions.Outcome:
-        """Российские адреса ядром мимо Xray (Ф6, routing.kernel_direct): переключатель в
-        карточке «Устройства». Правила nftables загружаются сразу, как при `xgw apply`."""
+        """Российские адреса самой машины и контейнеров ядром мимо Xray (Ф6,
+        routing.kernel_direct): переключатель «Этот компьютер» в карточке «Устройства».
+        Правила nftables загружаются сразу, как при `xgw apply`."""
         on = body.get("on")
         if not isinstance(on, bool):
             return actions.Outcome(2, "ожидается on: true или false")
         problem = self.root_problem()
         if problem:
             return actions.Outcome(1, problem)
-        if on and self.cfg.routing.proxy_domains:
-            return actions.Outcome(
-                2, "В routing.proxy_domains есть домены: с российским адресом они ушли бы мимо "
-                   "VPN. Уберите их из config.toml или оставьте разгрузку выключенной",
-            )
+        refusal = self._kernel_refusal() if on else ""
+        if refusal:
+            return actions.Outcome(2, refusal)
         previous = managed.load(store_path)[0]["kernel_direct"]
         if on:
-            done = "Российские адреса идут напрямую, мимо Xray"
+            done = "Российские адреса этого компьютера и контейнеров идут напрямую, мимо Xray"
             notes: tuple[str, ...] = (
                 "Соединения с ними не зависят от Xray и не рвутся при его перезапуске. DNS — "
                 "по-прежнему через Xray",)
         else:
-            done, notes = "Российские адреса снова идут через Xray", ()
+            done = "Российские адреса этого компьютера и контейнеров снова идут через Xray"
+            notes = ()
         return self._apply_network(
             lambda: managed.set_kernel_direct(store_path, on),
             lambda: managed.set_kernel_direct(store_path, previous), done, notes,
@@ -1593,6 +1654,8 @@ class Panel:
             return self._set_route(body, store_path)
         if name == "direct":
             return self._set_kernel_direct(body, store_path)
+        if name == "device/direct":
+            return self._set_kernel_device(body, store_path)
         if name.startswith("record/"):
             return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):

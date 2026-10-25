@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import ipaddress
 import json
 import os
 import shutil
@@ -27,7 +28,7 @@ from . import __version__, actions, config, desktop, engine, log, managed, prior
 from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
-from .net import cmd, dnsmasq, nft, tun
+from .net import cmd, dnsmasq, lan, nft, tun
 from .net.capture import Capture, CaptureError, capture_for
 from .paths import LockTimeout, Paths, atomic_write_json
 from .store import Store
@@ -672,6 +673,21 @@ def _stamp(config_path: Path) -> tuple[float, float]:
     return _mtime(config_path), _mtime(managed.path_for(config_path))
 
 
+def _lan_devices(cfg: config.Config, paths: Paths) -> list[dict]:
+    """Устройства, что сейчас в сети шлюза (аренды dnsmasq): {mac, ip, name}."""
+    gateway = lan.gateway(cfg)
+    if gateway is None:
+        return []
+    found = []
+    for device in dnsmasq.read_leases(paths):
+        with contextlib.suppress(ValueError):
+            address = ipaddress.IPv4Address(device["ip"])
+            if address in gateway.network and address != gateway.ip:
+                name = device["name"] if lan.valid_hostname(device["name"]) else ""
+                found.append({"mac": device["mac"], "ip": device["ip"], "name": name})
+    return found
+
+
 def _sync_panel(panel, cfg: config.Config, paths: Paths, config_path: Path, daemon, logger):
     """Панель живёт дольше одного демона: перечитывание настроек её не перезапускает."""
     from .watch.panel import Panel
@@ -713,6 +729,12 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     with contextlib.suppress(managed.ManagedError, OSError):
         if managed.drop_telegram(managed.path_for(args.config_path)):
             logger.info("бот Telegram убран из panel.json: Telegram в XGW больше нет")
+    with contextlib.suppress(managed.ManagedError, OSError, config.ConfigError):
+        panel_file = managed.path_for(args.config_path)
+        if managed.split_kernel_direct(panel_file, _lan_devices(cfg, paths)):
+            logger.info("российские адреса мимо Xray: общий переключатель разделён — включён у "
+                        "этого компьютера и у устройств, что сейчас в сети")
+            cfg, _warnings = config.load(args.config_path)
     reloaded = False
     previous = None
     panel = None
