@@ -14,7 +14,9 @@ autostart, /etc/xdg/autostart/xgw-tray.desktop ставит установка, 
 Значок у человека один: сторож держит блокировку (lock_path), второй `xgw tray` сразу
 выходит. Установка запускает `xgw tray --replace` — он закрывает прежние значки (и те, что
 запущены до этой блокировки) и встаёт на их место с новым кодом. Испытания 25.10.2026: каждая
-из трёх установок добавляла свой значок, и в трее их стало три.
+из трёх установок добавляла свой значок, и в трее их стало три. Вход в сеанс — тоже с
+`--replace`: сторож прошлого сеанса может пережить выход и держать блокировку со старым
+окружением сеанса (XAUTHORITY), а его значок в новый сеанс уже не встанет.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ Name=XGW tray
 Name[ru]=XGW — значок в трее
 Comment=XGW gateway state in the system tray
 Comment[ru]=Состояние шлюза XGW в системном трее
-Exec={launcher} tray
+Exec={launcher} tray --replace
 Icon={icon}
 Terminal=false
 NoDisplay=true

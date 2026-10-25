@@ -159,6 +159,32 @@ def test_tray_command_starts_only_one_icon(tmp_path, monkeypatch):
     assert cli.main(["tray", "--replace"]) == 0 and seen == [["--replace"]]
 
 
+def test_login_autostart_replaces_an_icon_left_from_the_last_session(tmp_path, monkeypatch):
+    """Сторож прошлого сеанса может пережить выход (Ubuntu не закрывает процессы человека) и
+    держать блокировку со старым XAUTHORITY — его значок в новый сеанс не встанет. Вход в сеанс
+    запускает `xgw tray --replace`, как установка: значок нового сеанса главнее."""
+    entry = tray.desktop_entry(Path("/usr/local/bin/xgw"), Path("/opt/xgw/xgw.svg"))
+    command = next(line for line in entry.splitlines() if line.startswith("Exec="))
+    assert command == "Exec=/usr/local/bin/xgw tray --replace"
+    path = tmp_path / tray.LOCK_NAME
+    monkeypatch.setattr(tray, "lock_path", lambda home=None, environ=None: path)
+    monkeypatch.setattr(tray.signal, "signal", lambda *args: None)
+    started: list[list[str]] = []
+    monkeypatch.setattr(tray, "supervise",
+                        lambda argv, spawn=None: started.append(argv) or 0)
+    stale = tray.take_lock(path)  # сторож прошлого сеанса
+    closed: list[int] = []
+
+    def close_stale(proc=None, kill=None, me=None):
+        stale.close()
+        closed.append(101)
+        return [101]
+
+    monkeypatch.setattr(tray, "replace", close_stale)
+    assert tray.main(command.split()[2:]) == 0
+    assert closed == [101] and len(started) == 1
+
+
 def test_user_file_round_trip(tmp_path):
     home = tmp_path / "home"
     with pytest.raises(tray.TrayError, match="sudo xgw install"):
@@ -225,7 +251,8 @@ def test_install_sets_up_the_tray_for_the_person_and_uninstall_removes_it(box, t
     assert "python3-pyqt6" in box.system.packages
     autostart = box.paths.root / tray.AUTOSTART
     text = autostart.read_text(encoding="utf-8")
-    assert f"Exec={box.paths.launcher} tray" in text and "X-KDE-autostart-after=panel" in text
+    assert f"Exec={box.paths.launcher} tray --replace\n" in text
+    assert "X-KDE-autostart-after=panel" in text
     port, token = tray.read_user_file(home)
     assert port == box.cfg.panel.port and token == tray.read_token(box.paths)
     # --replace: значок прошлой установки уступает место новому (иначе их по одному на установку).
