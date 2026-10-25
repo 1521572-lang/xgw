@@ -64,7 +64,7 @@ from .. import tailscale as ts
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
-from ..net import cmd, dnsmasq, lan
+from ..net import cmd, dnsmasq, lan, nft
 from ..net.capture import Capture
 from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
@@ -651,6 +651,13 @@ class Panel:
             "lan": {
                 "interface": info["lan_if"],
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
+            },
+            # Российские адреса ядром мимо Xray (Ф6): включено ли, почему не действует, сколько
+            # сетей в наборе direct4.
+            "kernel_direct": {
+                "on": cfg.routing.kernel_direct,
+                "reason": nft.kernel_direct_reason(cfg) if cfg.routing.kernel_direct else "",
+                "networks": info.get("direct4") or 0,
             },
             "devices": devices,
             "records": self.recorder.state(),
@@ -1451,6 +1458,43 @@ class Panel:
     ) -> actions.Outcome:
         stored = managed.load(store_path)[0]
         previous, routes = stored["devices"], stored["routes"]
+        return self._apply_network(
+            change, lambda: managed.replace_devices(store_path, previous, routes), done, notes,
+        )
+
+    def _set_kernel_direct(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Российские адреса ядром мимо Xray (Ф6, routing.kernel_direct): переключатель в
+        карточке «Устройства». Правила nftables загружаются сразу, как при `xgw apply`."""
+        on = body.get("on")
+        if not isinstance(on, bool):
+            return actions.Outcome(2, "ожидается on: true или false")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        if on and self.cfg.routing.proxy_domains:
+            return actions.Outcome(
+                2, "В routing.proxy_domains есть домены: с российским адресом они ушли бы мимо "
+                   "VPN. Уберите их из config.toml или оставьте разгрузку выключенной",
+            )
+        previous = managed.load(store_path)[0]["kernel_direct"]
+        if on:
+            done = "Российские адреса идут напрямую, мимо Xray"
+            notes: tuple[str, ...] = (
+                "Соединения с ними не зависят от Xray и не рвутся при его перезапуске. DNS — "
+                "по-прежнему через Xray",)
+        else:
+            done, notes = "Российские адреса снова идут через Xray", ()
+        return self._apply_network(
+            lambda: managed.set_kernel_direct(store_path, on),
+            lambda: managed.set_kernel_direct(store_path, previous), done, notes,
+        )
+
+    def _apply_network(
+        self, change: Callable[[], bool], revert: Callable[[], object], done: str,
+        notes: tuple[str, ...],
+    ) -> actions.Outcome:
+        """Правка panel.json, которую сеть применяет сразу (правила nftables, DHCP); не
+        приняла — revert возвращает прежнее, и сеть применяет его."""
         if not change():
             return actions.Outcome(0, "Ничего не изменилось")
         problems: list[str] = []
@@ -1464,7 +1508,7 @@ class Panel:
                 logger=self.log, runner=self.runner,
             )
         if problems:
-            managed.replace_devices(store_path, previous, routes)
+            revert()
             with contextlib.suppress(config.ConfigError):
                 old_cfg, _warnings = config.load(self.config_path)
                 actions.apply_network(
@@ -1547,6 +1591,8 @@ class Panel:
             return self._set_device(body, store_path)
         if name == "device/route":
             return self._set_route(body, store_path)
+        if name == "direct":
+            return self._set_kernel_direct(body, store_path)
         if name.startswith("record/"):
             return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):

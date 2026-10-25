@@ -259,6 +259,7 @@
     const routable = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
       .map((row) => [row.fingerprint, row.name, row.multiplier || 0]);
     draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable], () => renderDevices(s));
+    draw("direct", s.kernel_direct, () => renderDirect(s));
     const recTag = $("devices").querySelector(".tag.rec");
     if (recTag && recording) recTag.textContent = recordText(recording, s.now);
     draw("events", s.events, () => renderEvents(s));
@@ -997,6 +998,18 @@
     fill($("records"), records.files.map(recordRow));
   }
 
+  // Российские адреса ядром мимо Xray (Ф6): переключатель и пояснение под ним.
+  function renderDirect(s) {
+    const direct = s.kernel_direct || {};
+    $("kernel-direct").setAttribute("aria-checked", String(Boolean(direct.on)));
+    let text = "Выключено: российские сайты идут напрямую через Xray. Включите — и ядро будет "
+      + "пропускать их само, мимо Xray: меньше нагрузка, соединения не рвутся при его перезапуске.";
+    if (direct.on && direct.reason) text = `Включено, но не действует: ${direct.reason}.`;
+    else if (direct.on && !direct.networks) text = "Включено, но сетей нет: geoip.dat не прочитан — российские сайты идут через Xray.";
+    else if (direct.on) text = `Включено: ${direct.networks} российских сетей — напрямую ядром, мимо Xray. DNS — по-прежнему через Xray.`;
+    $("direct-note").textContent = text;
+  }
+
   const megabytes = (bytes) => (bytes >= 1048576
     ? `${(bytes / 1048576).toFixed(1).replace(".", ",")} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`);
   const minsec = (seconds) => `${Math.floor(seconds / 60)}:${two(Math.floor(seconds % 60))}`;
@@ -1482,6 +1495,10 @@
   $("refresh").addEventListener("click", () => act("refresh", {}));
   $("scan").addEventListener("click", () => act("scan", {}));
   $("speed").addEventListener("click", () => act("speed", {}));
+  $("kernel-direct").addEventListener("click", () => {
+    const on = $("kernel-direct").getAttribute("aria-checked") !== "true";
+    act("direct", { on }, $("kernel-direct"));
+  });
   $("sticky").addEventListener("click", () => {
     const on = $("sticky").getAttribute("aria-checked") !== "true";
     act("sticky", { on }, $("sticky"));

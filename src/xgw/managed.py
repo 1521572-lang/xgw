@@ -90,7 +90,7 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "routes": [], "priority": {}, "sticky": None, "core": {},
+        "routes": [], "priority": {}, "sticky": None, "kernel_direct": None, "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
     }
     try:
@@ -137,6 +137,9 @@ def load(path: Path) -> tuple[dict, str]:
         "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
         "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
+        # Российские адреса мимо Xray (routing.kernel_direct) — переключатель в панели.
+        "kernel_direct": raw["kernel_direct"] if isinstance(raw.get("kernel_direct"), bool)
+        else None,
         "tailscale": _tailscale(raw.get("tailscale")),
     }, ""
 
@@ -435,6 +438,21 @@ def set_sticky(path: Path, value: bool) -> bool:
         if data["sticky"] is value:
             return False
         data["sticky"] = value
+        return True
+
+    return _update(path, change)
+
+
+def set_kernel_direct(path: Path, value: bool | None) -> bool:
+    """Российские адреса мимо Xray (routing.kernel_direct) включены, выключены или (None) —
+    как в config.toml; True — что-то изменилось."""
+    if value is not None and not isinstance(value, bool):
+        raise ManagedError("ожидается true или false")
+
+    def change(data: dict) -> bool:
+        if data["kernel_direct"] is value:
+            return False
+        data["kernel_direct"] = value
         return True
 
     return _update(path, change)

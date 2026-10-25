@@ -32,7 +32,7 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "routes": [], "priority": {}, "sticky": None, "core": {},
+         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None, "core": {},
          "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
@@ -91,6 +91,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         # средний не хранится; неизвестный уровень и чужой отпечаток отброшены
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
         "sticky": None,  # переключатель основного сервера в панели не трогали
+        "kernel_direct": None,  # и российские адреса мимо Xray — тоже
         "core": {},  # ядро за серверами не закрепляли
         # панель по tailnet не включали
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},

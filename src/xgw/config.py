@@ -275,6 +275,9 @@ class Routing:
     )
     direct_ips: list[str] = field(default_factory=lambda: ["geoip:ru"])
     proxy_domains: list[str] = field(default_factory=list)
+    # Адреса из direct_ips (geoip:ru и сети) — напрямую ядром, мимо Xray (Ф6, net/nft.py).
+    # При непустом proxy_domains не действует: домен с российским адресом ушёл бы мимо VPN.
+    kernel_direct: bool = False
     conn_idle_s: int = 120
     home_country: str = "RU"
 
@@ -416,6 +419,9 @@ class Managed:
     core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
+    # Российские адреса мимо Xray включены или выключены в панели (routing.kernel_direct);
+    # None — как в config.toml.
+    kernel_direct: bool | None = None
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -537,6 +543,8 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.core = dict(data["core"])
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
+    if data["kernel_direct"] is not None:
+        cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]

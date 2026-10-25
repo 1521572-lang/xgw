@@ -197,6 +197,7 @@ class Capture:
             tailscale=self.cfg.capture.local and tailnet,
             xray_down=self.ts_marker.exists(), tailnet=tailnet,
             ts_fallback=self.ts_fallback_marker.exists(),
+            geoip=self.paths.xray_dir / "geoip.dat",
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -460,6 +461,10 @@ class Capture:
                 with self._own_rules():
                     warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
+            # Какой набор direct4 загружен (Ф6): loaded() сверяет отпечаток, а не тысячи сетей.
+            digest = nft.direct_digest(rules.direct4) if rules.direct4 else None
+            if self._state().get("direct4") != digest:
+                self._save(direct4=digest)
         except (cmd.CommandError, OSError) as exc:
             raise CaptureError(str(exc)) from exc
         for warning in warnings:
@@ -710,6 +715,10 @@ class Capture:
             return False  # выходной узел: tailscaled запустился или остановился
         if not rules.blocked and nft.quic_loaded(text) != rules.quic:
             return False  # network.block_quic переключили
+        if nft.has_set(text, nft.DIRECT_SET) != bool(rules.direct4) or (
+                rules.direct4
+                and self._state().get("direct4") != nft.direct_digest(rules.direct4)):
+            return False  # разгрузку переключили, сменились geoip.dat или direct_ips
         if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
                 rules.ts_exit_direct):
             return False  # устройство tailnet пустили напрямую или вернули в Xray
@@ -900,6 +909,8 @@ class Capture:
             "ipv6": rules.capture6,
             "tun": rules.tun,
             "containers": bool(rules.containers),
+            # Сколько сетей идёт ядром мимо Xray (routing.kernel_direct, Ф6); 0 — нисколько.
+            "direct4": len(rules.direct4),
             # Docker на машине есть (его мост уже создан): только тогда о контейнерах
             # стоит говорить в статусе.
             "docker": bool(lan.container_links(rules.containers, self.sys_net)),

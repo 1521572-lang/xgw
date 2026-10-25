@@ -152,6 +152,7 @@ class Diag:
         ]
         groups += [
             ("QUIC", self._quic),
+            ("Мимо Xray", self._kernel_direct),
             ("Проверочные хосты", self._probe_hosts),
             ("Значок в трее", self._tray),
         ]
@@ -1133,6 +1134,33 @@ class Diag:
                                       "TCP, где действует дробление ClientHello")]
         return [Check("QUIC", WARN, "правило против QUIC не загружено",
                       "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+
+    def _kernel_direct(self) -> list[Check]:
+        """Ф6: российские адреса ядром мимо Xray — включено ли, сколько сетей, загружен ли
+        набор direct4."""
+        name = "Российские адреса мимо Xray"
+        if not self.cfg.routing.kernel_direct:
+            return [Check(name, OK, "выключено: они идут через Xray (выход direct)")]
+        reason = nft.kernel_direct_reason(self.cfg)
+        if reason:
+            return [Check(name, WARN, f"включено, но не действует: {reason}",
+                          "уберите домены из routing.proxy_domains или выключите разгрузку "
+                          "в панели")]
+        capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+        if capture.mode() != "on":
+            return []
+        rules = capture.rules("on")
+        if not rules.direct4:
+            return [Check(name, WARN, "сетей нет: geoip.dat не прочитан или в direct_ips нечего "
+                                      "передать ядру — идут через Xray",
+                          "sudo journalctl -u xgw | grep 'мимо Xray'")]
+        text = nft.listing(self.runner)
+        if text is None:
+            return [Check(name, WARN, "правила не прочитать — запустите через sudo")]
+        if not nft.has_set(text, nft.DIRECT_SET):
+            return [Check(name, WARN, "набор direct4 не загружен",
+                          "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+        return [Check(name, OK, f"{len(rules.direct4)} сетей — напрямую ядром; DNS — через Xray")]
 
     def _probe_hosts(self) -> list[Check]:
         """ТЗ R3: активный проверочный хост и ошибки по каждому — со слов демона."""

@@ -53,15 +53,27 @@ TPROXY, что и LAN; устройства из набора ts_exit_direct (п
 форвардингом с маскарадингом, остальное в форвардинг не пускается. В blocked такой трафик
 отбивается, кроме ts_exit_direct. IPv6 через выходной узел закрыт (LAN IPv6 тоже не
 получает): иначе он ушёл бы мимо VPN.
+
+Российские адреса мимо Xray (Ф6, routing.kernel_direct): сети из routing.direct_ips
+(geoip:ru — из geoip.dat самого Xray) лежат в наборе direct4, и TCP/UDP устройств сети, самой
+машины и контейнеров к ним идёт напрямую ядром — как через обычный роутер, с QUIC, — а не
+через Xray и его выход direct. DNS (порт 53) по-прежнему перехватывается. В Xray доменные
+правила проверяются раньше IP, поэтому при непустом proxy_domains разгрузка не включается:
+домен из него с российским адресом ушёл бы мимо VPN. Режим blocked её не знает (DNS там
+закрыт, и пользы нет), устройства tailnet идут через Xray, как раньше.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
+import hashlib
 import ipaddress
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
+from .. import geodat
 from .. import tailscale as ts
 from ..config import Config
 from . import lan
@@ -95,6 +107,10 @@ TIME_USERS = ("_chrony", "systemd-timesync")
 # имени nftables; в правилах ufw (iptables) ей соответствует «+».
 CONTAINER_IFS = ("docker0", "br-*")
 NTS_KE_PORT = 4460  # chrony с NTS сначала получает ключи по TCP
+DIRECT_SET = "direct4"  # сети, куда трафик идёт ядром мимо Xray (Ф6)
+# Больше этого (четверть IPv4) «напрямую» не бывает: geoip.dat испорчен или в direct_ips
+# вписано лишнее — разгрузка не включается, иначе мимо VPN ушла бы большая часть интернета.
+DIRECT_MAX = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -144,6 +160,8 @@ class Rules:
     ts_exit_direct: tuple[str, ...] = ()
     # QUIC (UDP/443) в интернет отбивается (network.block_quic): браузер уходит на TCP.
     block_quic: bool = False
+    # Сети, куда LAN, машина и контейнеры ходят ядром мимо Xray (routing.kernel_direct, Ф6).
+    direct4: tuple[str, ...] = ()
 
     @property
     def ts4(self) -> bool:
@@ -213,16 +231,21 @@ def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
-    ts_fallback: bool = False,
+    ts_fallback: bool = False, geoip: Path | None = None,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
     tailscale — исключения Т1 для tailscaled (он работает, а машина перехватывается);
     xray_down — Xray не отвечает (для route = "vpn"); tailnet — tailscaled работает
     (выходной узел); ts_fallback — DERP напрямую не отвечает, и tailscaled идёт через Xray
-    и при route = "direct" (ТЗ R4b)."""
+    и при route = "direct" (ТЗ R4b); geoip — geoip.dat Xray для набора direct4 (Ф6; None —
+    без разгрузки)."""
     capture = capture and not blocked
     warnings: list[str] = []
+    direct: tuple[str, ...] = ()
+    if capture and geoip is not None and not kernel_direct_reason(cfg):
+        direct, direct_warnings = direct_networks(cfg, geoip)
+        warnings.extend(direct_warnings)
     name = cfg.network.lan_if.strip()
     lan_if = lan.lan_interface(cfg)
     if name and not lan_if:
@@ -297,9 +320,87 @@ def build_rules(
             ts_block=tailnet and blocked,
             ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
             block_quic=capture and cfg.network.block_quic,
+            direct4=direct,
         ),
         warnings,
     )
+
+
+def kernel_direct_reason(cfg: Config) -> str:
+    """Почему российские адреса не идут ядром мимо Xray; пусто — идут."""
+    if not cfg.routing.kernel_direct:
+        return "выключено"
+    if cfg.routing.proxy_domains:
+        return ("в routing.proxy_domains есть домены — с российским адресом они ушли бы мимо "
+                "VPN")
+    if not cfg.routing.direct_ips:
+        return "routing.direct_ips пуст"
+    return ""
+
+
+def direct_networks(cfg: Config, geoip: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Сети IPv4 из routing.direct_ips для набора direct4 и предупреждения. geoip:<страна> —
+    из geoip.dat Xray, адреса и сети — как есть. Чего ядру не передать (geoip:private —
+    частные сети и так мимо Xray; IPv6; geoip:!…, ext:…), остаётся в Xray: в ядро идёт только
+    то, что Xray и так отправил бы напрямую. Правила собираются на каждом шаге демона, а
+    geoip.dat меняется редко — итог помнится до смены файла или списка."""
+    try:
+        info = geoip.stat()
+        stamp: tuple[int, int] | None = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        stamp = None
+    return _direct_networks(tuple(cfg.routing.direct_ips), str(geoip), stamp)
+
+
+@functools.lru_cache(maxsize=4)
+def _direct_networks(
+    entries: tuple[str, ...], geoip: str, _stamp: tuple[int, int] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    networks: list[ipaddress.IPv4Network] = []
+    warnings: list[str] = []
+    for entry in entries:
+        item = entry.strip()
+        kept = f"«{item}» остаётся в Xray"
+        if item.lower().startswith("geoip:"):
+            code = item[len("geoip:"):]
+            if code.lower() == "private":
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", code):
+                warnings.append(f"routing.direct_ips: ядру не передать — {kept}")
+                continue
+            try:
+                found = geodat.cidrs(Path(geoip), code)
+            except geodat.GeoError as exc:
+                warnings.append(f"российские адреса мимо Xray: {exc} — {kept}")
+                continue
+            if not found:
+                warnings.append(f"routing.direct_ips: такой страны в geoip.dat нет — {kept}")
+            networks.extend(found)
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            warnings.append(f"routing.direct_ips: ядру не передать — {kept}")
+            continue
+        if isinstance(network, ipaddress.IPv4Network):
+            networks.append(network)
+    collapsed = list(ipaddress.collapse_addresses(networks))
+    total = sum(network.num_addresses for network in collapsed)
+    if total > DIRECT_MAX:
+        return (), (f"российские адреса мимо Xray не включены: в routing.direct_ips {total} "
+                    "адресов — больше четверти IPv4",)
+    return tuple(str(network) for network in collapsed), tuple(warnings)
+
+
+def direct_digest(networks: tuple[str, ...]) -> str:
+    """Отпечаток набора direct4: по нему сверка (Capture.loaded) видит, что загружен не тот
+    набор (сменился geoip.dat или direct_ips), не разбирая тысячи сетей вывода nft."""
+    return hashlib.sha256("\n".join(networks).encode("ascii")).hexdigest()[:16]
+
+
+def has_set(text: str, name: str) -> bool:
+    """В тексте `nft list table` есть набор name."""
+    return re.search(rf"^\s*set {name} \{{", text, flags=re.MULTILINE) is not None
 
 
 def containers_wanted(cfg: Config) -> bool:
@@ -412,6 +513,10 @@ def render(rules: Rules) -> str:
         blocks.append(_ts_set(rules))
     if rules.ts_forward:
         blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
+    if rules.direct4:
+        blocks.append(_set(DIRECT_SET, rules.direct4))
+    # Российские адреса (Ф6) — мимо Xray; DNS к ним перехватывается, как всякий.
+    direct = [f"ip daddr @{DIRECT_SET} th dport != 53 return"] if rules.direct4 else []
 
     tproxy = (
         "meta l4proto { tcp, udp } counter "
@@ -427,6 +532,7 @@ def render(rules: Rules) -> str:
                 "    ct direction reply return",
                 "    fib daddr type local return",
                 "    ip daddr @reserved4 th dport != 53 return",
+                *(f"    {rule}" for rule in direct),
                 f"    meta l4proto {{ tcp, udp }} counter meta mark set {rules.mark_containers:#x}",
                 "}",
             ])
@@ -456,6 +562,10 @@ def render(rules: Rules) -> str:
                 "fib daddr type local th dport != 53 return",
                 "ip daddr @reserved4 th dport != 53 return",
             ]
+            if rules.capture_lan:
+                # Устройства сети — к российским адресам напрямую: их пропустит forward.
+                # Машина сюда с ними не доходит (output их не метит), tailnet — через Xray.
+                prerouting += [f'iifname "{lan_if}" {rule}' for rule in direct]
             if rules.block_quic and (rules.capture_lan or rules.ts_exit):
                 # QUIC устройств — не в Xray: его отобьёт forward (reject в prerouting нельзя).
                 # QUIC самой машины сюда не доходит: его отбивает loopback_guard ещё на выходе.
@@ -476,6 +586,7 @@ def render(rules: Rules) -> str:
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
             "ip daddr @reserved4 th dport != 53 return",
+            *direct,
             "udp sport 68 return",  # DHCP-клиент WAN
         ]
         for uid in rules.time_uids:
@@ -533,7 +644,10 @@ def render(rules: Rules) -> str:
                     ],
                 )
             )
-        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}'] if (
+        # QUIC к российским адресам (Ф6) идёт напрямую, как через обычный роутер: отбой QUIC
+        # нужен только трафику через Xray (дробление ClientHello).
+        keep = f" ip daddr != @{DIRECT_SET}" if rules.direct4 else ""
+        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4{keep} {QUIC_REJECT}'] if (
             rules.block_quic and rules.capture_lan) else []
         if rules.block_quic and rules.ts_exit:
             quic.append(
@@ -551,6 +665,8 @@ def render(rules: Rules) -> str:
         ]
         if rules.capture_lan:
             forward.append(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept')
+            if rules.direct4:
+                forward.append(f'iifname "{lan_if}" {out} ip daddr @{DIRECT_SET} counter accept')
             if rules.forward_icmp:
                 forward.append(f'iifname "{lan_if}" {out} meta l4proto icmp counter accept')
         else:

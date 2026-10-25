@@ -517,7 +517,7 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
-        "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
+        "direct4": 0, "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
         "tun_problem": "", "inbound_missing": "", "blocked": False,
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
@@ -526,6 +526,31 @@ def test_describe(gateway):
     gateway.sys_net.mkdir()
     (gateway.sys_net / "docker0").mkdir()
     assert gateway.describe(check=False)["docker"] is True
+
+
+def test_russian_addresses_set_is_reloaded_only_when_it_changes(gateway):
+    """Ф6: набор direct4 сверяется по отпечатку. Правила загружаются заново, когда разгрузку
+    включили или выключили, сменились geoip.dat или direct_ips, — а не на каждом шаге
+    (испытание 25.10.2026 с QUIC: неверная сверка — перезагрузка каждые 30–40 с)."""
+    from test_geodat import write_geoip
+
+    gateway.paths.xray_dir.mkdir(parents=True, exist_ok=True)
+    write_geoip(gateway.paths.xray_dir / "geoip.dat", {"RU": [("5.8.0.0", 13)]})
+    gateway.enable()
+    assert gateway.loaded() is True
+    gateway.cfg.routing.kernel_direct = True
+    assert gateway.loaded() is False  # включили — набора ещё нет
+    gateway.up()
+    assert gateway.loaded() is True and "5.8.0.0/13" in gateway.kernel.table
+    assert gateway.describe(check=False)["direct4"] == 1
+    gateway.cfg.routing.direct_ips = ["geoip:ru", "203.0.113.0/24"]
+    assert gateway.loaded() is False  # набор другой
+    gateway.up()
+    assert gateway.loaded() is True
+    gateway.cfg.routing.kernel_direct = False
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.loaded() is True and "direct4" not in gateway.kernel.table
 
 
 # --- TUN (capture.method = tun) -----------------------------------------------------
