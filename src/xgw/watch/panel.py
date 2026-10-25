@@ -784,17 +784,20 @@ class Panel:
             return []
         bypass = set(info["bypass"])
         mine = set(self.cfg.managed.devices)
+        routes = self.cfg.managed.routes  # свой сервер устройства (Ф4): адрес → отпечаток
         devices = [
-            {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine}
+            {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine,
+             "route": routes.get(str(device.get("ip")), "")}
             for device in dnsmasq.read_leases(self.paths)
         ]
         online = {device["mac"] for device in devices}
         leases, _warnings = lan.parse_leases(self.cfg)
         for lease in leases:
-            if lease.mac in mine and lease.mac not in online:
+            if (lease.mac in mine or lease.ip in routes) and lease.mac not in online:
                 devices.append({
                     "mac": lease.mac, "ip": lease.ip, "name": lease.name, "expires": 0,
-                    "bypass": lease.ip in bypass, "managed": True, "offline": True,
+                    "bypass": lease.ip in bypass, "managed": lease.mac in mine, "offline": True,
+                    "route": routes.get(lease.ip, ""),
                 })
         return devices
 
@@ -1394,10 +1397,60 @@ class Panel:
              "интернет напрямую",),
         )
 
+    def _set_route(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Свой сервер устройства (Ф4) или «авто» (server пуст). Адрес закрепляется
+        статической арендой, как у устройств мимо VPN; правило Xray собирает демон."""
+        mac, server = managed.normalize_mac(body.get("mac")), body.get("server")
+        if mac is None or not isinstance(server, str):
+            return actions.Outcome(2, "ожидается устройство и сервер (пусто — авто)")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        cfg = self.cfg
+        gateway = lan.gateway(cfg)
+        if not lan.lan_interface(cfg) or gateway is None:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        lease = {item.mac: item for item in lan.parse_leases(cfg)[0]}.get(mac)
+        label = (found or {}).get("name") or (lease.name if lease else "") or mac
+        if not server:
+            return self._apply_devices(
+                store_path, lambda: managed.set_route(store_path, mac, "", "", ""),
+                f"Устройство «{label}» снова идёт через основной сервер", (),
+            )
+        ip = (found or {}).get("ip") or (lease.ip if lease else "")
+        listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
+        if mac in listed or ip in lan.bypass_addresses(cfg)[0]:
+            return actions.Outcome(
+                2, "Устройство идёт мимо VPN — свой сервер ему не нужен. Сначала верните его в VPN",
+            )
+        try:
+            address = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
+        if address not in gateway.network or address == gateway.ip:
+            return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        _snapshot, _xray_ok, members, spares = self._core(time.time())
+        rows, _gone = self._servers(members, spares)
+        row = next((row for row in rows if row["fingerprint"] == server
+                    and row["status"] in ("member", "spare", "waiting")), None)
+        if row is None:
+            return actions.Outcome(2, "этого сервера нет среди включённых — обновите страницу")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        return self._apply_devices(
+            store_path,
+            lambda: managed.set_route(
+                store_path, mac, str(address), name if lan.valid_hostname(name) else "", server),
+            f"Устройство «{label}» идёт через сервер «{row['name']}»",
+            ("Если этот сервер станет недоступен, устройство временно пойдёт через основной. "
+             "Российские сайты — напрямую, как у всех. Адрес устройства закрепится за ним",),
+        )
+
     def _apply_devices(
         self, store_path: Path, change: Callable[[], bool], done: str, notes: tuple[str, ...]
     ) -> actions.Outcome:
-        previous = managed.load(store_path)[0]["devices"]
+        stored = managed.load(store_path)[0]
+        previous, routes = stored["devices"], stored["routes"]
         if not change():
             return actions.Outcome(0, "Ничего не изменилось")
         problems: list[str] = []
@@ -1411,7 +1464,7 @@ class Panel:
                 logger=self.log, runner=self.runner,
             )
         if problems:
-            managed.replace_devices(store_path, previous)
+            managed.replace_devices(store_path, previous, routes)
             with contextlib.suppress(config.ConfigError):
                 old_cfg, _warnings = config.load(self.config_path)
                 actions.apply_network(
@@ -1492,6 +1545,8 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
+        if name == "device/route":
+            return self._set_route(body, store_path)
         if name.startswith("record/"):
             return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):

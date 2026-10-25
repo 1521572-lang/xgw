@@ -43,6 +43,44 @@ def test_full_config_golden():
     assert result.config == expected
 
 
+def test_device_with_its_own_server_falls_back_to_the_main_balancer():
+    """Ф4: устройство со своим сервером — балансировщик из одного этого сервера (запасной тоже
+    годится: его тогда пробует ядро), правило по адресу источника после direct_* и до общего
+    балансировщика. Сервер мёртв — loopback возвращает соединение к общему балансировщику.
+    Сервера нет в конфиге — устройство идёт как все."""
+    raws, _meta, _warnings = parse_links_text("\n".join(links.FULL_LINKS), "test")
+    nodes = [raw_to_node(raw, "test") for raw in raws]
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.routing.direct_ips = ["198.51.100.0/24"]
+    selection = select_nodes(nodes, cfg)
+    spare = selection.spares[0].fingerprint
+    cfg.managed.routes = {"192.168.50.120": spare, "192.168.50.130": "00000000"}
+    result = build(cfg, selection, hosts={"de.example.com": ["203.0.113.11"],
+                                          "fr.example.com": ["203.0.113.12"]})
+    config = result.config
+    tag = next(info.tag for info in result.nodes if info.fingerprint == spare)
+    assert tag.startswith("spare-")
+    assert config["routing"]["balancers"][1:] == [{
+        "tag": "dev-192.168.50.120", "selector": [tag], "strategy": {"type": "leastPing"},
+        "fallbackTag": "to-main",
+    }]
+    assert config["burstObservatory"]["subjectSelector"] == ["proxy-", tag]
+    assert {"tag": "to-main", "protocol": "loopback",
+            "settings": {"inboundTag": "from-device"}} in config["outbounds"]
+    rules = config["routing"]["rules"]
+    where = {json.dumps(rule, sort_keys=True): index for index, rule in enumerate(rules)}
+
+    def at(rule: dict) -> int:
+        return where[json.dumps({"type": "field", **rule}, sort_keys=True)]
+
+    device = at({"source": ["192.168.50.120"], "balancerTag": "dev-192.168.50.120"})
+    assert at({"ip": ["198.51.100.0/24"], "outboundTag": "direct"}) < device
+    assert at({"inboundTag": ["from-device"], "balancerTag": "auto"}) < device
+    assert device < at({"network": "tcp,udp", "balancerTag": "auto"})
+    assert not any("192.168.50.130" in json.dumps(rule) for rule in rules)
+
+
 def test_invariants():
     result, cfg, _selection = _build()
     config = result.config

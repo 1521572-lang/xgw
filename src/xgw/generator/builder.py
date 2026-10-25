@@ -22,6 +22,13 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+# Устройство со своим сервером (Ф4): балансировщик «dev-<адрес>» из одного этого сервера.
+# Сервер недоступен — запасной выход балансировщика (fallbackTag может быть только выходом)
+# loopback возвращает соединение в маршрутизацию со входом TO_MAIN_IN, а оттуда — в общий
+# балансировщик с выбранным основным: устройство без сети не остаётся.
+DEVICE_PREFIX = "dev-"
+TO_MAIN = "to-main"
+TO_MAIN_IN = "from-device"
 TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
@@ -461,6 +468,22 @@ def fragmented_fingerprints(config: Mapping | None, nodes: Sequence[ServerNode])
     }
 
 
+def device_balancers(cfg: Config, nodes: Sequence[NodeInfo]) -> list[dict]:
+    """Балансировщики устройств со своим сервером (cfg.managed.routes, Ф4). Сервера нет в
+    конфиге (отключён, убран, отсеян) — устройство идёт через основной, как все."""
+    tags = {info.fingerprint: info.tag for info in nodes}
+    return [
+        {
+            "tag": f"{DEVICE_PREFIX}{ip}",
+            "selector": [tags[fingerprint]],
+            "strategy": {"type": "leastPing"},
+            "fallbackTag": TO_MAIN,
+        }
+        for ip, fingerprint in sorted(cfg.managed.routes.items())
+        if fingerprint in tags
+    ]
+
+
 def _dns_server(entry: str) -> tuple[str, int | None]:
     """«1.1.1.1» или «1.1.1.1:5353» → (адрес, порт). Порт не 53 Xray принимает
     только объектом {"address", "port"}."""
@@ -748,6 +771,19 @@ def build(
         )
     if cfg.routing.direct_ips:
         rules.append({"type": "field", "ip": list(cfg.routing.direct_ips), "outboundTag": "direct"})
+    # Свой сервер устройства — после DNS, частных сетей и direct_*: российские сайты у
+    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника.
+    devices = device_balancers(cfg, nodes)
+    if devices:
+        rules.append({"type": "field", "inboundTag": [TO_MAIN_IN], "balancerTag": BALANCER_TAG})
+        rules.extend(
+            {"type": "field", "source": [balancer["tag"].removeprefix(DEVICE_PREFIX)],
+             "balancerTag": balancer["tag"]}
+            for balancer in devices
+        )
+        outbounds.append(
+            {"tag": TO_MAIN, "protocol": "loopback", "settings": {"inboundTag": TO_MAIN_IN}}
+        )
     if cfg.routing.proxy_domains:
         rules.append(
             {
@@ -811,11 +847,17 @@ def build(
                     "selector": ["proxy-"],
                     "strategy": {"type": "leastPing"},
                     "fallbackTag": fallback_tag,
-                }
+                },
+                *devices,
             ],
         },
         "burstObservatory": {
-            "subjectSelector": ["proxy-"],
+            # Запасной сервер устройства ядро тоже пробует: иначе leastPing не знал бы, жив
+            # ли он, и устройство всегда уходило бы к основному.
+            "subjectSelector": ["proxy-", *sorted({
+                tag for balancer in devices for tag in balancer["selector"]
+                if not tag.startswith("proxy-")
+            })],
             "pingConfig": {
                 "destination": probe_url or cfg.probe.url,
                 "connectivity": "",

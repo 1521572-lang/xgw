@@ -407,6 +407,9 @@ class Managed:
     # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
     # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
     devices: list[str] = field(default_factory=list)
+    # Устройства со своим сервером (Ф4): адрес IPv4 → отпечаток сервера. Аренда добавлена из
+    # panel.json; остальные устройства — через основной сервер.
+    routes: dict[str, str] = field(default_factory=dict)
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
     # Ядро, закреплённое за сервером: отпечаток → "xray" или "sing-box"; остальные — auto.
@@ -540,11 +543,13 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     if data["tailscale"]["route"] is not None:
         cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
+    warnings.extend(_merge_devices(cfg, data["routes"], routes=True))
     return warnings
 
 
-def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
-    """Устройства мимо VPN из панели: статическая аренда и запись в bypass_hosts.
+def _merge_devices(cfg: Config, devices: list[dict], *, routes: bool = False) -> list[str]:
+    """Устройства из панели: статическая аренда и запись в bypass_hosts (мимо VPN) либо в
+    managed.routes (routes — свой сервер; устройство мимо VPN своего сервера не получает).
 
     То, что уже есть в config.toml, главнее: совпадающую аренду не дублируем, а
     конфликтующую (тот же MAC с другим адресом или тот же адрес у другого MAC)
@@ -559,8 +564,8 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
     listed = {host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts}
     for device in devices:
         mac, ip, name = device["mac"], device["ip"], device["name"]
-        if mac in listed:
-            continue  # уже мимо VPN по config.toml — панель этим не управляет
+        if mac in listed or (routes and ip in listed):
+            continue  # уже мимо VPN (MAC или адрес в bypass_hosts) — в Xray не попадает
         if lease_ip.get(mac, ip) != ip or any(
             other != mac and taken == ip for other, taken in lease_ip.items()
         ):
@@ -572,6 +577,9 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
         if mac not in lease_ip:
             cfg.network.static_leases.append(f"{mac},{ip}" + (f",{name}" if name else ""))
             lease_ip[mac] = ip
+        if routes:
+            cfg.managed.routes[ip] = device["server"]
+            continue
         cfg.network.bypass_hosts.append(mac)
         listed.add(mac)
         cfg.managed.devices.append(mac)

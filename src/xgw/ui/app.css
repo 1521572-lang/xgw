@@ -361,6 +361,8 @@ button, textarea, input { font: inherit; color: inherit; }
   background: var(--card-2);
 }
 .ts-link { margin-top: .2rem; color: var(--info); overflow-wrap: anywhere; }
+/* Свой сервер устройства (Ф4): список под адресом в строке устройства. */
+.devices-card .route { display: block; max-width: 100%; margin-top: .35rem; }
 .ts-enable { align-self: flex-start; margin-top: .45rem; }
 .ts-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
 .ts-note > span { flex: 1 1 14rem; }

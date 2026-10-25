@@ -90,7 +90,7 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "priority": {}, "sticky": None, "core": {},
+        "routes": [], "priority": {}, "sticky": None, "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
     }
     try:
@@ -132,6 +132,7 @@ def load(path: Path) -> tuple[dict, str]:
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
+        "routes": _routes(raw.get("routes")),
         "priority": _priority(raw.get("priority")),
         "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
@@ -279,6 +280,8 @@ def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -
     def change(data: dict) -> bool:
         devices = [item for item in data["devices"] if item["mac"] != mac_ok]
         if bypass:
+            if any(item["mac"] == mac_ok for item in data["routes"]):
+                raise ManagedError("у устройства выбран свой сервер — сначала поставьте «авто»")
             try:
                 address = str(ipaddress.IPv4Address(ip))
             except ValueError as exc:
@@ -297,14 +300,62 @@ def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -
     return _update(path, change)
 
 
-def replace_devices(path: Path, devices: list[dict]) -> None:
-    """Возвращает прежний список устройств — откат, если сеть изменение не приняла."""
+def replace_devices(path: Path, devices: list[dict], routes: list[dict] | None = None) -> None:
+    """Возвращает прежние списки устройств (мимо VPN и со своим сервером) — откат, если сеть
+    изменение не приняла."""
 
     def change(data: dict) -> bool:
         data["devices"] = _devices(devices)
+        if routes is not None:
+            data["routes"] = _routes(routes)
         return True
 
     _update(path, change)
+
+
+def _routes(value: object) -> list[dict]:
+    """Устройства со своим сервером (Ф4): {"mac", "ip", "name", "server"} — server — отпечаток
+    сервера; адрес закрепляется статической арендой, как у устройств мимо VPN."""
+    servers: dict[str, str] = {}
+    for entry in value if isinstance(value, list) else []:
+        server = entry.get("server") if isinstance(entry, dict) else None
+        mac = normalize_mac(entry.get("mac")) if isinstance(entry, dict) else None
+        if mac and isinstance(server, str) and _FINGERPRINT_RE.fullmatch(server):
+            servers.setdefault(mac, server)
+    return [{**item, "server": servers[item["mac"]]} for item in _devices(value)
+            if item["mac"] in servers]
+
+
+def set_route(path: Path, mac: str, ip: str, name: str, server: str) -> bool:
+    """Свой сервер устройства (отпечаток) либо «авто» (server пуст); True — что-то изменилось.
+    Устройство мимо VPN своего сервера иметь не может: в Xray его трафик не попадает."""
+    mac_ok = normalize_mac(mac)
+    if mac_ok is None:
+        raise ManagedError("неверный MAC устройства")
+    if server and not _FINGERPRINT_RE.fullmatch(server):
+        raise ManagedError("неверный сервер")
+
+    def change(data: dict) -> bool:
+        routes = [item for item in data["routes"] if item["mac"] != mac_ok]
+        if server:
+            if any(item["mac"] == mac_ok for item in data["devices"]):
+                raise ManagedError("устройство идёт мимо VPN — сначала верните его в VPN")
+            try:
+                address = str(ipaddress.IPv4Address(ip))
+            except ValueError as exc:
+                raise ManagedError("неверный адрес устройства") from exc
+            if any(item["ip"] == address for item in [*routes, *data["devices"]]):
+                raise ManagedError("этот адрес уже закреплён за другим устройством")
+            if len(routes) >= MAX_DEVICES:
+                raise ManagedError(f"устройств со своим сервером уже {MAX_DEVICES} — больше нельзя")
+            clean = name if _NAME_RE.fullmatch(name) else ""
+            routes.append({"mac": mac_ok, "ip": address, "name": clean, "server": server})
+        if routes == data["routes"]:
+            return False
+        data["routes"] = routes
+        return True
+
+    return _update(path, change)
 
 
 def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:

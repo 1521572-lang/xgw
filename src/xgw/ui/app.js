@@ -255,7 +255,10 @@
     // Идущая запись трафика: строки перерисовываются, только когда она началась или кончилась,
     // а время и размер меняются в метке — иначе кнопка «Остановить» уплывала бы из-под мыши.
     const recording = (s.records || {}).active;
-    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : ""], () => renderDevices(s));
+    // Выбор сервера устройства — из включённых: строки перерисовываются, когда их набор меняется.
+    const routable = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
+      .map((row) => [row.fingerprint, row.name, row.multiplier || 0]);
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable], () => renderDevices(s));
     const recTag = $("devices").querySelector(".tag.rec");
     if (recTag && recording) recTag.textContent = recordText(recording, s.now);
     draw("events", s.events, () => renderEvents(s));
@@ -982,7 +985,13 @@
     $("devices-count").textContent = s.devices.length ? String(s.devices.length) : "";
     $("devices-note").textContent = s.lan.gateway ? `сеть ${s.lan.interface}, шлюз ${s.lan.gateway}` : "";
     const records = s.records || { files: [] };
-    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now)),
+    // Свой сервер устройства (Ф4): из включённых серверов; лимитированные — с пометкой.
+    const choices = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
+      .map((row) => ({
+        fingerprint: row.fingerprint,
+        label: row.multiplier ? `${row.name} · лимит ×${row.multiplier}` : row.name,
+      }));
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
     $("records-block").hidden = !records.files.length;
     fill($("records"), records.files.map(recordRow));
@@ -1029,7 +1038,28 @@
 
   // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
-  function deviceRow(device, active, now) {
+  // Свой сервер устройства (Ф4): «Авто» — как у всех, через основной сервер.
+  function routeSelect(device, choices) {
+    const name = device.name || device.mac;
+    const select = el("select", { class: "prio route", "aria-label": `Сервер для устройства ${name}`,
+      title: "Через какой сервер идёт это устройство. Недоступен — временно через основной" });
+    select.append(el("option", { value: "", text: "Сервер: авто" }));
+    let known = !device.route;
+    for (const choice of choices) {
+      known = known || choice.fingerprint === device.route;
+      select.append(el("option", { value: choice.fingerprint, text: choice.label }));
+    }
+    if (!known) select.append(el("option", { value: device.route, text: "выбранный сервер выключен" }));
+    select.value = device.route || "";
+    select.addEventListener("change", () => {
+      const before = device.route || "";
+      act("device/route", { mac: device.mac, server: select.value }, select)
+        .then((ok) => { if (!ok) select.value = before; });
+    });
+    return select;
+  }
+
+  function deviceRow(device, active, now, choices) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
     if (active && active.mac === device.mac) {
@@ -1055,10 +1085,12 @@
     }
     return el("li", {},
       el("div", { class: "row-main" }, title,
-        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` })),
+        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` }),
+        device.bypass ? null : routeSelect(device, choices)),
       el("span", {
         class: device.bypass ? "tag warn" : "tag on",
-        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN") : "через VPN",
+        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")
+          : (device.route ? "свой сервер" : "через VPN"),
         title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
       }),
       el("div", { class: "row-tools" }, recordTool(device, active, now), control));

@@ -353,7 +353,7 @@ def test_devices_and_events_are_listed(rig, user):
     state = user.state()
     assert state["devices"] == [{"expires": 1791600000, "mac": "aa:bb:cc:00:11:22",
                                  "ip": "192.168.50.101", "name": "phone", "bypass": False,
-                                 "managed": False}]
+                                 "managed": False, "route": ""}]
     assert state["events"][0]["kind"] == "apply" and "S3CR3T" not in state["events"][0]["detail"]
 
 

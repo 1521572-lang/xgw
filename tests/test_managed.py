@@ -32,7 +32,7 @@ def _save(conf, data) -> None:
 def test_no_file_means_nothing_added(conf):
     assert managed.load(managed.path_for(conf)) == (
         {"subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-         "priority": {}, "sticky": None, "core": {},
+         "routes": [], "priority": {}, "sticky": None, "core": {},
          "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []}}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
@@ -87,6 +87,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "disabled": ["aaaa1111"],  # убранный сервер отключённым уже не считается
         "removed": ["bbbb2222"],
         "devices": [],
+        "routes": [],  # своих серверов устройствам не выбирали
         # средний не хранится; неизвестный уровень и чужой отпечаток отброшены
         "priority": {"aaaa1111": "high", "eeee5555": "low"},
         "sticky": None,  # переключатель основного сервера в панели не трогали
@@ -313,6 +314,26 @@ def test_panel_devices_become_a_static_lease_and_a_bypass_host(conf):
     assert cfg.managed.devices == ["aa:bb:cc:00:11:22"]
     from xgw.net import lan
     assert lan.bypass_addresses(cfg) == (["192.168.50.101"], [])  # арендой MAC стал адресом
+
+
+def test_device_with_its_own_server_gets_a_lease_and_never_goes_with_bypass(conf):
+    """Ф4: свой сервер устройства — статическая аренда и managed.routes (адрес → отпечаток);
+    устройство мимо VPN своего сервера получить не может, и наоборот; «авто» убирает маршрут."""
+    path = managed.path_for(conf)
+    assert managed.set_route(path, "AA-BB-CC-00-11-22", "192.168.50.120", "tv", "ab12cd34")
+    assert not managed.set_route(path, "aa:bb:cc:00:11:22", "192.168.50.120", "tv", "ab12cd34")
+    with pytest.raises(ManagedError, match="свой сервер"):
+        managed.set_device(path, "aa:bb:cc:00:11:22", "192.168.50.120", "tv", bypass=True)
+    managed.set_device(path, "aa:bb:cc:00:11:33", "192.168.50.130", "", bypass=True)
+    with pytest.raises(ManagedError, match="мимо VPN"):
+        managed.set_route(path, "aa:bb:cc:00:11:33", "192.168.50.130", "", "ab12cd34")
+    cfg, warnings = config.load(conf)
+    assert warnings == []
+    assert "aa:bb:cc:00:11:22,192.168.50.120,tv" in cfg.network.static_leases
+    assert cfg.managed.routes == {"192.168.50.120": "ab12cd34"}
+    assert "aa:bb:cc:00:11:22" not in cfg.network.bypass_hosts
+    assert managed.set_route(path, "aa:bb:cc:00:11:22", "", "", "")  # «авто»
+    assert config.load(conf)[0].managed.routes == {}
 
 
 def test_config_toml_wins_over_panel_devices(conf):
