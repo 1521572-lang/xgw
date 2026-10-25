@@ -120,6 +120,9 @@ def test_open_panel_raises_a_visible_tab_instead_of_a_new_one():
     assert run(PageClient(minimized, {**minimized, "seen": 0.1, "focused": 0.1})) == "raised"
     # Вкладку закрыли — новая сразу, без попытки вывести окно.
     assert run(PageClient({**minimized, "closed": 58.0})) == "opened" and asked == []
+    # «Скрылась» дошла на 0,2 с позже «закрылась» (испытания 25.10.2026) — тоже закрыта.
+    assert run(PageClient({**minimized, "hidden": 3.2, "closed": 3.4})) == "opened"
+    assert asked == []
     assert run(PageClient({"seen": 1.0, "focused": 1.0}), raised=False) == "opened"  # не KDE
     assert run(None) == "opened"  # нет файла значка
 

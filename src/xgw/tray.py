@@ -427,6 +427,9 @@ RAISE_WAIT = 2.0  # столько ждать, пока выведенная в�
 # Вкладка скрылась: окно свёрнуто (KWin его выведет) или открыта другая вкладка (выводить
 # нечего, и это ожидание — задержка перед новой вкладкой), поэтому ждать меньше.
 HIDDEN_WAIT = 1.0
+# При закрытии вкладка шлёт «скрылась» и «закрылась» почти разом, и «скрылась» может дойти
+# позже (на испытаниях — на 0,2 с): сигналы ближе этого — закрытие, а не свёрнутое окно.
+CLOSED_GAP = 1.0
 KWIN_NAME = "xgw-raise"
 # Заголовок окна с вкладкой панели: «XGW - Chromium», «XGW — Mozilla Firefox» (или «XGW —
 # вход»). Погасшая вкладка (app.js) называется иначе — её окно не выводится.
@@ -510,7 +513,7 @@ def open_panel(
     if seen is not None and seen <= PAGE_FRESH:
         wait = RAISE_WAIT
     elif (hidden is not None and (seen is None or hidden <= seen)
-          and (closed is None or closed > hidden)):
+          and (closed is None or closed > hidden + CLOSED_GAP)):
         wait = HIDDEN_WAIT
     if wait and raise_it():
         if wait == RAISE_WAIT and focused is not None and focused <= seen + 0.5:
