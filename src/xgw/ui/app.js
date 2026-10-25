@@ -60,6 +60,7 @@
   let state = null;
   let acting = false;
   let timer = 0;
+  let gone = false; // панель открыли в другой вкладке — эта больше ничего не делает
   const drawn = {};
   const groups = new Map(); // источник → его раскрывающийся блок; живёт между перерисовками
 
@@ -176,9 +177,11 @@
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       state = await response.json();
+      if (gone) return;
       $("banner").hidden = true;
       render();
     } catch (error) {
+      if (gone) return;
       $("banner").textContent =
         "Нет связи с демоном XGW — пробую снова. Если так продолжается: sudo systemctl status xgw";
       $("banner").hidden = false;
@@ -187,7 +190,7 @@
 
   function schedule() {
     clearTimeout(timer);
-    if (document.hidden) return;
+    if (document.hidden || gone) return;
     timer = setTimeout(async () => {
       await load();
       schedule();
@@ -1471,8 +1474,45 @@
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) clearTimeout(timer);
-    else load().then(schedule);
+    else if (!gone) load().then(schedule);
   });
+
+  // --- одна вкладка панели ----------------------------------------------------
+  // Ярлык «XGW» и значок в трее открывают панель через xdg-open — браузер каждый раз даёт
+  // новую вкладку. Новая (она уже впереди и со свежими данными) закрывает прежние, и вкладка
+  // XGW всегда одна: вывести вперёд прежнюю браузер странице не даёт. Закрыть себя страница
+  // может, только если в истории вкладки одна запись (так её и открывают ярлык и значок);
+  // иначе она гаснет и просит закрыть её вручную. Из двух открытых разом остаётся новейшая.
+
+  function leave() {
+    gone = true;
+    clearTimeout(timer);
+    window.close();
+    setTimeout(() => { // закрыть не дали
+      document.title = "XGW — открыта в другой вкладке";
+      document.body.className = "login";
+      document.body.replaceChildren(el("main", { class: "card login-card" },
+        el("img", { src: "/icon.svg", alt: "", width: 56, height: 56 }),
+        el("h1", { text: "Панель открыта в другой вкладке" }),
+        el("p", { class: "muted", text: "Её открыли заново — ярлыком «XGW», значком в трее или по ссылке. Эту вкладку можно закрыть." })));
+    }, 300);
+  }
+
+  if ("BroadcastChannel" in window) {
+    const channel = new BroadcastChannel("xgw-panel");
+    const me = { at: Date.now(), id: Math.random() };
+    channel.onmessage = (event) => {
+      const other = event.data || {};
+      if (gone || typeof other.at !== "number") return;
+      if (other.at > me.at || (other.at === me.at && other.id > me.id)) leave();
+    };
+    channel.postMessage(me);
+    window.addEventListener("pageshow", (event) => { // вернули из кэша «назад»
+      if (!event.persisted || gone) return;
+      me.at = Date.now();
+      channel.postMessage(me);
+    });
+  }
 
   load().then(schedule);
 })();

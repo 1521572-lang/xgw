@@ -2,8 +2,8 @@
 
 Один графический фреймворк — PyQt6 из пакета Ubuntu python3-pyqt6 (его ставит установка);
 нет его — PyQt5 (python3-pyqt5), тот же код. QSystemTrayIcon в KDE Plasma показывается через
-StatusNotifierItem рядом с часами. Значок рисуется здесь же: круг цвета состояния с буквой X —
-файлов картинок не нужно.
+StatusNotifierItem рядом с часами. Значок рисуется здесь же: роутер цвета состояния (корпус с
+огоньками и три антенны, по рисунку заказчика) — файлов картинок не нужно.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ COLORS = {
     "ok": "#2e9d57", "warn": "#d99a14", "down": "#d23f31", "job": "#2f74c0", "off": "#8a8f98",
 }
 WAIT_TRAY = 60.0  # столько ждать, пока у сеанса появится трей (панель KDE поднимается позже)
+SIZES = (16, 22, 24, 32, 48, 64)  # трей KDE берёт ближайший размер — на 22 точках не мылится
 
 
 def _qt():
@@ -41,22 +42,41 @@ def _enum(owner, group: str, name: str):
 
 
 def icon(QtGui, QtCore, kind: str):
-    """Круг цвета состояния с белой буквой X (64×64, Qt масштабирует сам)."""
-    pixmap = QtGui.QPixmap(64, 64)
-    pixmap.fill(_enum(QtCore.Qt, "GlobalColor", "transparent"))
-    painter = QtGui.QPainter(pixmap)
-    painter.setRenderHint(_enum(QtGui.QPainter, "RenderHint", "Antialiasing"))
-    painter.setBrush(QtGui.QColor(COLORS.get(kind, COLORS["off"])))
-    painter.setPen(_enum(QtCore.Qt, "PenStyle", "NoPen"))
-    painter.drawEllipse(2, 2, 60, 60)
-    font = QtGui.QFont()
-    font.setBold(True)
-    font.setPixelSize(38)
-    painter.setFont(font)
-    painter.setPen(QtGui.QColor("#ffffff"))
-    painter.drawText(pixmap.rect(), _enum(QtCore.Qt, "AlignmentFlag", "AlignCenter"), "X")
-    painter.end()
-    return QtGui.QIcon(pixmap)
+    """Роутер цвета состояния на прозрачном фоне: корпус с тремя огоньками и три антенны с
+    шариками. Рисунок задан в клетке 64×64 и рисуется заново под каждый размер из SIZES."""
+    color = QtGui.QColor(COLORS.get(kind, COLORS["off"]))
+    result = QtGui.QIcon()
+    for size in SIZES:
+        pixmap = QtGui.QPixmap(size, size)
+        pixmap.fill(_enum(QtCore.Qt, "GlobalColor", "transparent"))
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(_enum(QtGui.QPainter, "RenderHint", "Antialiasing"))
+        painter.scale(size / 64, size / 64)
+        pen = QtGui.QPen(color)
+        pen.setWidthF(6.0)
+        pen.setCapStyle(_enum(QtCore.Qt, "PenCapStyle", "RoundCap"))
+        painter.setPen(pen)
+        painter.setBrush(_enum(QtCore.Qt, "BrushStyle", "NoBrush"))
+        antennas = QtGui.QPainterPath()
+        antennas.moveTo(32, 38)
+        antennas.lineTo(32, 14)
+        for side in (14, 50):  # боковые: от корпуса в сторону и вверх
+            antennas.moveTo(32, 36)
+            antennas.quadTo(side, 35, side, 22)
+        painter.drawPath(antennas)
+        # Корпус и шарики — одной заливкой; огоньки — дыры в корпусе (правило чёт-нечет).
+        solid = QtGui.QPainterPath()
+        solid.addRoundedRect(QtCore.QRectF(6, 38, 52, 20), 6, 6)
+        for x in (16, 24, 32):
+            solid.addEllipse(QtCore.QPointF(x, 48), 3, 3)
+        for x, y, radius in ((32, 9, 6), (14, 17, 5.5), (50, 17, 5.5)):
+            solid.addEllipse(QtCore.QPointF(x, y), radius, radius)
+        painter.setPen(_enum(QtCore.Qt, "PenStyle", "NoPen"))
+        painter.setBrush(color)
+        painter.drawPath(solid)
+        painter.end()
+        result.addPixmap(pixmap)
+    return result
 
 
 class TrayApp:
