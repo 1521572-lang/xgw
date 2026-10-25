@@ -452,6 +452,20 @@ def test_loaded_detects_missing_and_stale_rules(gateway):
     assert gateway.describe()["loaded"] is None
 
 
+def test_quic_rule_as_nft_prints_it_counts_as_loaded(gateway):
+    """Отчёт 0.1.18 (25.10.2026), дефект 1: nft печатает «reject with icmp type
+    port-unreachable» просто как «reject», а проверка искала «port-unreachable» — правила
+    считались незагруженными, и демон загружал их заново каждые 30–40 с."""
+    assert gateway.enable() == "on"
+    printed = gateway.kernel(["nft", "list", "table", "ip", "xgw"])
+    assert "udp dport 443" in printed and "port-unreachable" not in printed
+    assert gateway.loaded() is True
+    gateway.cfg.network.block_quic = False  # ключ выключили — правило лишнее
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+    assert "udp dport 443" not in gateway.kernel.table
+
+
 def test_down_removes_everything_and_restores_forwarding(gateway):
     gateway.enable()
     gateway.open()

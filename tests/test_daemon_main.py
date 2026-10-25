@@ -429,7 +429,7 @@ def test_measurement_cut_by_a_stop_is_not_recorded(daemon):
     stop = threading.Event()
     before = json.loads(daemon.store.get_meta("speed") or "{}")
 
-    def cut(info, password):
+    def cut(info, password, *, small=False):
         daemon.measured.append(info.tag)
         stop.set()
         return SpeedResult(None, 4096, 0.4, "проверка прервана: демон останавливается")
@@ -553,6 +553,46 @@ def test_one_server_is_measured_by_its_own_button(daemon):
         if second in daemon.measured:
             break
     assert daemon.measured == [spare, second]
+
+
+def _scan_every_step(daemon: Harness, spare: str) -> None:
+    """Шаг со сканом — как непрерывные пробы профилей у запасных на шлюзе 25.10.2026."""
+    daemon.scan_queue.append(spare.replace("spare-", "probe-"))
+    _step(daemon)
+
+
+def test_the_button_works_while_every_step_scans(daemon):
+    """Отчёт 0.1.18, дефект 2: сканы шли на каждом шаге, а замер ждал шага без скана —
+    кнопка ↻ «крутилась, но не обновляла». Заказанный замер идёт и в шаге со сканом, один."""
+    _start(daemon)
+    _settle(daemon)
+    first, second = daemon.tags("spare")[:2]
+    daemon.measured.clear()
+    daemon.request_speed_one(first)
+    daemon.request_speed_one(second)
+    _scan_every_step(daemon, second)
+    assert len(daemon.measured) == 1  # в шаге со сканом — один
+    _scan_every_step(daemon, first)
+    assert sorted(daemon.measured) == sorted([first, second])
+    assert daemon.speed_one_pending() == []
+
+
+def test_background_waits_for_a_scan_free_step_but_not_for_ever(daemon):
+    """Фоновый замер ждёт шага без скана не дольше SPEED_SCAN_WAIT, потом идёт — по одному."""
+    from xgw.daemon import SPEED_SCAN_WAIT
+
+    _start(daemon)
+    _settle(daemon)
+    spare = daemon.tags("spare")[0]
+    daemon.speed_queue.append(spare.replace("spare-", "probe-"))  # фоновый замер подошёл
+    daemon.measured.clear()
+    steps = int(SPEED_SCAN_WAIT // 20)
+    for _ in range(steps - 1):
+        _scan_every_step(daemon, spare)
+    assert daemon.measured == []
+    for _ in range(3):
+        _scan_every_step(daemon, spare)
+    assert daemon.measured == [spare]
 
 
 def test_the_button_measures_a_server_the_background_would_skip(daemon):

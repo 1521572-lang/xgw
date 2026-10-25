@@ -141,6 +141,11 @@ SPEED_FORCE_AFTER = 3600.0
 # замечают отказы), а круг по 70 серверам и так укладывается в полчаса. По кнопке — подряд,
 # пока шаг не займёт столько секунд (один — всегда).
 SPEED_STEP_SECONDS = 10.0
+# Шаг, в котором уже шёл скан, берёт не больше одного замера: заказанный (кнопкой, контролем
+# скорости) — сразу, фоновый — если шага без скана не было столько секунд. Пробы профилей
+# бывают на каждом шаге: испытание 0.1.18 (25.10.2026) — кнопка ↻ «крутится, но не
+# обновляется», фоновых замеров не было вовсе.
+SPEED_SCAN_WAIT = 600.0
 # Запасной, который быстрее основного, переводится в работу и становится основным; если
 # за это время он так и не встал в работу (конфиг ждёт окна перезапуска и т. п.) — отбой.
 PROMOTE_WAIT = 3600.0
@@ -528,6 +533,8 @@ class Daemon:
         # опустевшей очереди), и ждала ли она на этом шаге.
         self._speed_deferred_since: float | None = None
         self._speed_waiting = False
+        # С какого момента фоновый замер ждёт шага без скана (SPEED_SCAN_WAIT).
+        self._speed_scanned_since: float | None = None
         # Запасной, переведённый в работу, чтобы стать основным: {"key", "name", "since",
         # "was"}; _lost_main — страна и подписка отказавшего основного, для замены.
         self._promoted: dict | None = None
@@ -749,6 +756,7 @@ class Daemon:
         self.speed_total, self.speed_done = previous.speed_total, previous.speed_done
         self._speed_deferred_since = previous._speed_deferred_since
         self._speed_waiting = previous._speed_waiting
+        self._speed_scanned_since = previous._speed_scanned_since
         self._promoted, self._lost_main = previous._promoted, previous._lost_main
         self._compare_due = previous._compare_due
         self.guard = previous.guard
@@ -3739,7 +3747,7 @@ class Daemon:
         self._speed_waiting = False
         if not self.speed_queue:
             self.speed_total = self.speed_done = 0
-            self._speed_deferred_since = None
+            self._speed_deferred_since = self._speed_scanned_since = None
             return False
         # Кнопка у сервера — первой, затем участники: по ним выбирают основной (порядок внутри
         # групп сохраняется).
@@ -3750,9 +3758,19 @@ class Daemon:
                 tag not in self._speed_any, tag not in self._speed_small, tag not in members,
             ),
         ))
-        if self._scanned or self.stopping:
+        if self.stopping:
             return False
         forced = self.speed_queue[0] in self._speed_forced
+        single = self._scanned
+        if not self._scanned:
+            self._speed_scanned_since = None
+        elif not forced:
+            # Шаг уже занят сканом: фоновый замер ждёт шага без скана, но не дольше
+            # SPEED_SCAN_WAIT; заказанный идёт и в таком шаге (SPEED_SCAN_WAIT).
+            if self._speed_scanned_since is None:
+                self._speed_scanned_since = now
+            if now - self._speed_scanned_since < SPEED_SCAN_WAIT:
+                return False
         if self._busy and not forced:
             # Ждать — с первого занятого шага и до конца очереди: прождав час, очередь
             # дорабатывает и при занятом канале, а не ждёт снова после каждого сервера.
@@ -3761,7 +3779,8 @@ class Daemon:
             if now - self._speed_deferred_since < SPEED_FORCE_AFTER:
                 self._speed_waiting = True
                 return False
-        return self._measure_queue(targets, applied, busy=self._busy) > 0
+        self._speed_scanned_since = None
+        return self._measure_queue(targets, applied, busy=self._busy, single=single) > 0
 
     def _speed_one_step(self, view: list[NodeInfo], targets: list[NodeInfo]) -> None:
         """Кнопка у одного сервера: он — первым в очередь, замер не ждёт свободного канала.
@@ -3794,16 +3813,18 @@ class Daemon:
             self._speed_forced.add(info.probe_tag)
             self._speed_any.add(info.probe_tag)
 
-    def _measure_queue(self, targets: list[NodeInfo], applied: dict | None, *, busy: bool) -> int:
+    def _measure_queue(
+        self, targets: list[NodeInfo], applied: dict | None, *, busy: bool, single: bool = False,
+    ) -> int:
         """Замеры из очереди: фоновый — один за шаг, по кнопке — подряд, пока шаг не занял
-        SPEED_STEP_SECONDS; сколько серверов замерено."""
+        SPEED_STEP_SECONDS (single — один: в шаге уже шёл скан); сколько серверов замерено."""
         password, _ports = builder.probe_state(applied or {})
         by_probe = {info.probe_tag: info for info in targets}
         started = time.monotonic()
         count = 0
         while self.speed_queue and not self.stopping:
             if count and (
-                self.speed_queue[0] not in self._speed_forced
+                single or self.speed_queue[0] not in self._speed_forced
                 or time.monotonic() - started >= SPEED_STEP_SECONDS
             ):
                 break
@@ -4040,8 +4061,10 @@ class Daemon:
         if current is None:
             self.guard.episode = None  # придушенный ушёл из работы сам (замена, отказ)
             return
-        if self._scanned or self.stopping:
-            return  # не в шаге со сканом: шаг watchdog не должен затягиваться
+        if self.stopping:
+            return
+        # И в шаге со сканом: кандидат — один за шаг, а сервер придушен сейчас (сканы бывают на
+        # каждом шаге, SPEED_SCAN_WAIT).
         by_probe = {info.probe_tag: info for info in view}
         size = int(self.cfg.speed.spare_mb * speedguard.MB)
         password, _ports = builder.probe_state(applied or {})

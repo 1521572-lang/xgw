@@ -724,6 +724,29 @@ def test_quic_is_refused_for_the_network_and_the_machine_but_not_for_servers():
     assert "udp dport 443" not in _render(_cfg(), capture=False)
 
 
+def test_quic_rule_is_found_in_what_nft_prints():
+    """Вывод `nft list table` (испытание 25.10.2026): отказ по умолчанию — просто «reject», со
+    счётчиками. Правило prerouting с return и отказ для 127.0.0.0/8 — не правило против QUIC."""
+    listed = (
+        "table ip xgw {\n"
+        "\tchain prerouting {\n"
+        "\t\tudp dport 443 ip daddr != @reserved4 return\n"
+        "\t}\n"
+        "\tchain loopback_guard {\n"
+        "\t\ttype filter hook output priority filter; policy accept;\n"
+        "\t\tmeta mark 0x00000002 ip daddr 127.0.0.0/8 counter packets 0 bytes 0 reject\n"
+        "\t\tmeta mark 0x00000001 udp dport 443 ip daddr != @reserved4 counter packets 0 "
+        "bytes 0 reject\n"
+        "\t}\n"
+        "}\n"
+    )
+    assert nft.quic_loaded(listed)
+    without = "\n".join(line for line in listed.splitlines() if "mark 0x00000001" not in line)
+    assert not nft.quic_loaded(without)
+    # В ip6 nft так же сокращает «reject with icmpv6 type port-unreachable».
+    assert nft.quic_loaded("meta mark 0x00000001 udp dport 443 ip6 daddr != @reserved6 reject")
+
+
 def test_quic_rules_pass_nft_check(tmp_path):
     """Текст с правилами QUIC (и без них) принимает сам nft (`nft -c`, нужен root)."""
     if shutil.which("nft") is None or not hasattr(os, "geteuid") or os.geteuid() != 0:

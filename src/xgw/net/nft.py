@@ -382,8 +382,15 @@ QUIC_REJECT = "counter reject with icmp type port-unreachable"
 
 
 def quic_loaded(text: str) -> bool:
-    """В загруженной таблице есть правило против QUIC (вывод `nft list table`)."""
-    return "udp dport 443" in text and "port-unreachable" in text
+    """В загруженной таблице есть правило против QUIC (вывод `nft list table`): строка, где
+    UDP/443 отбивается. nft печатает отказ, принятый для семейства по умолчанию, коротко —
+    «reject with icmp type port-unreachable» в таблице ip (и «…icmpv6…» в ip6) выводится как
+    «reject». Испытание 25.10.2026: проверка искала «port-unreachable», не находила его, и
+    демон перезагружал правила каждые 30–40 с."""
+    return any(
+        "udp dport 443" in line and re.search(r"\breject\b", line)
+        for line in text.splitlines()
+    )
 
 
 def _chain(name: str, header: str, rules: list[str]) -> list[str]:
