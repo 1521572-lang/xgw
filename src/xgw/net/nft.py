@@ -33,7 +33,26 @@ Tailscale (Т1, tailscale.py): когда tailscaled работает, его п
 0x80000 в маске 0xff0000) и всё, что уходит в интерфейс tailscale0, обходят перехват (К1,
 К2), blocked (К3) и v6_guard (К4). Набор ts_direct решает, идут ли сокеты tailscaled мимо
 Xray в режиме on: при tailscale.route = "direct" метка в нём всегда, при "vpn" — только
-пока Xray не отвечает (её кладёт и убирает демон, `nft add element` / `flush set`).
+пока Xray не отвечает (её кладёт и убирает демон, `nft add element` / `flush set`). При
+"direct" демон убирает метку и тогда, когда серверы DERP напрямую не отвечают (0.1.18, ТЗ
+R4b): управление и DERP Tailscale временно идут через Xray. Петли «VPN внутри VPN» нет по
+построению: сокеты Xray помечены mark_bypass и в перехват не попадают, а tailnet (tailscale0)
+перехватом не трогается вовсе.
+
+QUIC (0.1.18, ТЗ R2, network.block_quic): UDP/443 в интернет устройств сети и самой машины
+отбивается сразу — ICMP «порт недоступен», и браузер уходит на TCP/443, где действует
+дробление ClientHello. Устройства сети: prerouting не отдаёт такие пакеты в TPROXY, forward
+их отбивает. Сама машина: цепочка loopback_guard отбивает UDP/443 с меткой перехвата
+(mark_proxy) — её ставит цепочка output только трафику, который иначе ушёл бы в Xray, так что
+соединения Xray и sing-box с серверами (mark_bypass), tailscaled и служба времени мимо неё.
+Частные сети, tailnet и сам шлюз (fib local) не затрагиваются.
+
+Шлюз — выходной узел tailnet (exit node, ASSUMPTIONS п. 230): интернет-трафик устройств
+tailnet приходит из tailscale0 с адресов 100.64.0.0/10 и в режиме on идёт в Xray тем же
+TPROXY, что и LAN; устройства из набора ts_exit_direct (панель, «напрямую») и ICMP —
+форвардингом с маскарадингом, остальное в форвардинг не пускается. В blocked такой трафик
+отбивается, кроме ts_exit_direct. IPv6 через выходной узел закрыт (LAN IPv6 тоже не
+получает): иначе он ушёл бы мимо VPN.
 """
 
 from __future__ import annotations
@@ -51,6 +70,7 @@ from .cmd import CommandError, Runner
 TABLE = "xgw"
 TABLE6 = "xgw6"
 TS_SET = "ts_direct"  # метка tailscaled, которая идёт мимо Xray (Т1)
+TS_EXIT_SET = "ts_exit_direct"  # устройства tailnet, выходящие через шлюз напрямую
 TS_MARK = f"{ts.MARK:#x}"
 TS_MASK = f"{ts.MARK_MASK:#x}"
 
@@ -117,6 +137,13 @@ class Rules:
     # в режиме on (tailscale.route = "direct" либо Xray не отвечает).
     tailscale: bool = False
     ts_direct: bool = True
+    # Выходной узел: трафик устройств tailnet из tailscale0 — в Xray (ts_exit, режим on) или
+    # отбивается (ts_block, blocked); ts_exit_direct — их адреса 100.x, что идут напрямую.
+    ts_exit: bool = False
+    ts_block: bool = False
+    ts_exit_direct: tuple[str, ...] = ()
+    # QUIC (UDP/443) в интернет отбивается (network.block_quic): браузер уходит на TCP.
+    block_quic: bool = False
 
     @property
     def ts4(self) -> bool:
@@ -133,10 +160,20 @@ class Rules:
         return self.capture_lan or self.capture_local
 
     @property
+    def quic(self) -> bool:
+        """В таблице есть правило против QUIC: для машины, для LAN или для выходного узла."""
+        return self.block_quic and (self.capture_local or self.capture_lan or self.ts_exit)
+
+    @property
     def tproxy(self) -> bool:
-        """TPROXY (и локальная доставка помеченных пакетов) нужен для LAN и для самой
-        машины без TUN."""
-        return self.capture_lan or (self.capture_local and not self.tun)
+        """TPROXY (и локальная доставка помеченных пакетов) нужен для LAN, для самой
+        машины без TUN и для устройств tailnet, выходящих в интернет через шлюз."""
+        return self.capture_lan or (self.capture_local and not self.tun) or self.ts_exit
+
+    @property
+    def ts_forward(self) -> bool:
+        """Правила форвардинга выходного узла (tailscale0 → интернет)."""
+        return self.ts_exit or self.ts_block
 
     @property
     def prerouting(self) -> bool:
@@ -152,7 +189,7 @@ class Rules:
         """Правил нет: ни LAN (форвардинг), ни перехвата, ни блокировки."""
         return (
             not self.lan_if and not self.capture
-            and not self.block_local and not self.block_containers
+            and not self.block_local and not self.block_containers and not self.ts_forward
         )
 
 
@@ -175,11 +212,15 @@ def time_service_uids() -> tuple[int, ...]:
 def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
-    tailscale: bool = False, xray_down: bool = False,
+    tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
+    ts_fallback: bool = False,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
-    tailscale — tailscaled работает; xray_down — Xray не отвечает (для route = "vpn")."""
+    tailscale — исключения Т1 для tailscaled (он работает, а машина перехватывается);
+    xray_down — Xray не отвечает (для route = "vpn"); tailnet — tailscaled работает
+    (выходной узел); ts_fallback — DERP напрямую не отвечает, и tailscaled идёт через Xray
+    и при route = "direct" (ТЗ R4b)."""
     capture = capture and not blocked
     warnings: list[str] = []
     name = cfg.network.lan_if.strip()
@@ -250,7 +291,12 @@ def build_rules(
             v6_guard=cfg.capture.local and (blocked or not proxy6),
             tailscale=tailscale,
             # Без перехвата (снят, blocked) через Xray tailscaled идти некуда.
-            ts_direct=cfg.tailscale.route != "vpn" or xray_down or not capture,
+            ts_direct=(cfg.tailscale.route != "vpn" and not ts_fallback) or xray_down
+            or not capture,
+            ts_exit=tailnet and capture,
+            ts_block=tailnet and blocked,
+            ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
+            block_quic=capture and cfg.network.block_quic,
         ),
         warnings,
     )
@@ -278,8 +324,12 @@ def _dns_direct(cfg: Config) -> str:
 # --- текст правил ---------------------------------------------------------------
 
 
-def _set(name: str, elements: tuple[str, ...], kind: str = "ipv4_addr") -> list[str]:
-    lines = [f"set {name} {{", f"    type {kind}", "    flags interval"]
+def _set(
+    name: str, elements: tuple[str, ...], kind: str = "ipv4_addr", *, interval: bool = True,
+) -> list[str]:
+    """Набор адресов. interval — для сетей; набор отдельных адресов — без него: nft склеил бы
+    соседние адреса в диапазон, и сверка с загруженным (set_elements) не сошлась бы."""
+    lines = [f"set {name} {{", f"    type {kind}", *(["    flags interval"] if interval else [])]
     if elements:
         lines.append("    elements = { " + ", ".join(elements) + " }")
     lines.append("}")
@@ -304,6 +354,45 @@ def _ts_skip(verdict: str) -> list[str]:
     ]
 
 
+def _ts_exit_forward(rules: Rules, reject: str) -> list[str]:
+    """Форвардинг выходного узла: в частные сети (LAN по маршрутам подсети) и устройства
+    «напрямую» — можно, ICMP — как у LAN; остальное (в режиме on сюда доходит только то, что
+    не TCP и не UDP; в blocked — всё) — отбивается."""
+    lines = [
+        f'iifname "{ts.INTERFACE}" ip daddr @reserved4 accept',
+        f'iifname "{ts.INTERFACE}" ip saddr @{TS_EXIT_SET} counter accept',
+    ]
+    if rules.forward_icmp and rules.ts_exit:
+        lines.append(f'iifname "{ts.INTERFACE}" meta l4proto icmp counter accept')
+    lines.append(f'iifname "{ts.INTERFACE}" {reject}')
+    return lines
+
+
+def _ts_exit_masquerade() -> str:
+    """Устройства «напрямую» выходят адресом шлюза: маскарадинг tailscaled (netfilter) может
+    быть выключен кнопкой К5."""
+    return (f'iifname "{ts.INTERFACE}" oifname != "{ts.INTERFACE}" ip saddr @{TS_EXIT_SET} '
+            "ip daddr != @reserved4 counter masquerade")
+
+
+# QUIC (HTTP/3) в интернет: UDP на порт 443 не в частные сети. Правило отбивает его ICMP «порт
+# недоступен» (ТЗ R2: icmpx port-unreachable; в таблице семейства ip — icmp).
+QUIC_MATCH = "udp dport 443 ip daddr != @reserved4"
+QUIC_REJECT = "counter reject with icmp type port-unreachable"
+
+
+def quic_loaded(text: str) -> bool:
+    """В загруженной таблице есть правило против QUIC (вывод `nft list table`): строка, где
+    UDP/443 отбивается. nft печатает отказ, принятый для семейства по умолчанию, коротко —
+    «reject with icmp type port-unreachable» в таблице ip (и «…icmpv6…» в ip6) выводится как
+    «reject». Испытание 25.10.2026: проверка искала «port-unreachable», не находила его, и
+    демон перезагружал правила каждые 30–40 с."""
+    return any(
+        "udp dport 443" in line and re.search(r"\breject\b", line)
+        for line in text.splitlines()
+    )
+
+
 def _chain(name: str, header: str, rules: list[str]) -> list[str]:
     return [f"chain {name} {{", f"    {header}", *(f"    {rule}" for rule in rules), "}"]
 
@@ -321,6 +410,8 @@ def render(rules: Rules) -> str:
         blocks.append(_set("bypass4", rules.bypass))
     if rules.ts4:
         blocks.append(_ts_set(rules))
+    if rules.ts_forward:
+        blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
 
     tproxy = (
         "meta l4proto { tcp, udp } counter "
@@ -341,7 +432,7 @@ def render(rules: Rules) -> str:
             ])
         sources = ([f'"{lan_if}"'] if rules.capture_lan else []) + (
             ['"lo"'] if rules.capture_local and not rules.tun else []
-        )
+        ) + ([f'"{ts.INTERFACE}"'] if rules.ts_exit else [])
         prerouting = [f'iifname "{name}" goto containers' for name in rules.containers]
         if sources:
             only = sources[0] if len(sources) == 1 else "{ " + ", ".join(sources) + " }"
@@ -354,12 +445,22 @@ def render(rules: Rules) -> str:
                 prerouting.append(f'iifname "lo" meta mark != {proxy} return')
             if rules.capture_lan:
                 prerouting.append("ip saddr @bypass4 return")
+            if rules.ts_exit:
+                # Из tailnet — только интернет-трафик устройств, выбравших шлюз выходным узлом.
+                prerouting += [
+                    f'iifname "{ts.INTERFACE}" ip saddr != {ts.CGNAT} return',
+                    f'iifname "{ts.INTERFACE}" ip saddr @{TS_EXIT_SET} return',
+                ]
             prerouting += [
                 # Сам шлюз и частные сети — мимо Xray; DNS (порт 53) перехватывается всегда.
                 "fib daddr type local th dport != 53 return",
                 "ip daddr @reserved4 th dport != 53 return",
-                tproxy,
             ]
+            if rules.block_quic and (rules.capture_lan or rules.ts_exit):
+                # QUIC устройств — не в Xray: его отобьёт forward (reject в prerouting нельзя).
+                # QUIC самой машины сюда не доходит: его отбивает loopback_guard ещё на выходе.
+                prerouting.append(f"{QUIC_MATCH} return")
+            prerouting.append(tproxy)
         blocks.append(
             _chain(
                 "prerouting",
@@ -391,14 +492,32 @@ def render(rules: Rules) -> str:
         # бы Xray к службам самого шлюза. Сокеты direct помечены mark_bypass —
         # к loopback с этой меткой не пускаем. Свои запросы к loopback XGW шлёт без
         # метки (marknet.connect_marked), остальные сокеты Xray к нему не ходят.
+        guard = [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"]
+        if rules.block_quic and rules.capture_local:
+            # QUIC самой машины: метку перехвата цепочка output ставит только тому, что ушло
+            # бы в Xray, — соединения Xray, sing-box и tailscaled здесь не встречаются.
+            guard.append(f"meta mark {proxy} {QUIC_MATCH} {QUIC_REJECT}")
         blocks.append(
             _chain(
                 "loopback_guard",
                 "type filter hook output priority filter; policy accept;",
-                [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"],
+                guard,
             )
         )
 
+    ts_reject = "counter reject with icmp type admin-prohibited"
+    if rules.ts_exit and not lan_if:
+        quic = [
+            f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
+        ] if rules.block_quic else []
+        blocks.append(_chain(
+            "forward", "type filter hook forward priority filter; policy accept;",
+            [*quic, *_ts_exit_forward(rules, ts_reject)],
+        ))
+        blocks.append(_chain(
+            "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
+            [_ts_exit_masquerade()],
+        ))
     if lan_if:
         if rules.dns_direct:
             # DNS-запрос к самому шлюзу от тех, кого Xray не обслуживает, уходит на
@@ -414,7 +533,17 @@ def render(rules: Rules) -> str:
                     ],
                 )
             )
+        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}'] if (
+            rules.block_quic and rules.capture_lan) else []
+        if rules.block_quic and rules.ts_exit:
+            quic.append(
+                f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
+            )
         forward = [
+            # QUIC устройств сети и tailnet — отбить сразу: браузер уйдёт на TCP/443.
+            *quic,
+            # Выходной узел tailnet — раньше «чужого форвардинга» (tailscale0 — не LAN).
+            *(_ts_exit_forward(rules, ts_reject) if rules.ts_exit else []),
             # Чужой форвардинг (Docker, libvirt) — не наше дело.
             f'iifname != "{lan_if}" oifname != "{lan_if}" accept',
             "tcp flags syn tcp option maxseg size set rt mtu",  # PPPoE у провайдера
@@ -433,7 +562,8 @@ def render(rules: Rules) -> str:
             _chain(
                 "postrouting",
                 "type nat hook postrouting priority srcnat; policy accept;",
-                [f'iifname "{lan_if}" {out} counter masquerade'],
+                [f'iifname "{lan_if}" {out} counter masquerade',
+                 *([_ts_exit_masquerade()] if rules.ts_exit else [])],
             )
         )
 
@@ -464,6 +594,8 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_set("bypass4", rules.bypass))
     if rules.block_containers:
         blocks.append(_set("bypass_containers", ()))  # [capture] containers_bypass — Ф4
+    if rules.ts_block:
+        blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
     if rules.block_local:
         output = [
             'oifname "lo" accept',
@@ -486,6 +618,9 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
             "block_output", "type filter hook output priority filter; policy accept;", output
         ))
     forward: list[str] = []
+    if rules.ts_block:
+        # Выходной узел: перехвата нет — в интернет только устройства «напрямую».
+        forward += _ts_exit_forward(rules, reject)
     # Контейнеры: в режиме on их уводит в TUN цепочка containers, а здесь её нет — без этих
     # правил мост → WAN прошёл бы правилом «чужой форвардинг» ниже. Между мостами, в частные
     # сети (как и в режиме on) и ответы опубликованных портов (ct reply) — можно.
@@ -521,6 +656,11 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_chain(
             "forward", f"type filter hook forward priority filter; policy {policy};", forward
         ))
+    if rules.ts_block and not lan_if:
+        blocks.append(_chain(
+            "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
+            [_ts_exit_masquerade()],
+        ))
     if lan_if:
         if rules.dns_direct:
             who = "ip saddr @bypass4 " if rules.block_lan else ""
@@ -533,7 +673,8 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_chain(
             "postrouting",
             "type nat hook postrouting priority srcnat; policy accept;",
-            [f'iifname "{lan_if}" {out} counter masquerade'],
+            [f'iifname "{lan_if}" {out} counter masquerade',
+             *([_ts_exit_masquerade()] if rules.ts_block else [])],
         ))
     return blocks
 
@@ -542,7 +683,7 @@ def render6(rules: Rules) -> str:
     """`ip6 xgw6`: IPv6 из LAN и в LAN не форвардится; при ipv6 = "proxy" ещё и
     перехват IPv6 самой машины, при ipv6 = "off" — v6_guard: IPv6 машины наружу закрыт.
     Пусто — без LAN, без перехвата IPv6 и без v6_guard."""
-    if not rules.lan_if and not rules.capture6 and not rules.v6_guard:
+    if not rules.lan_if and not rules.capture6 and not rules.v6_guard and not rules.ts_forward:
         return ""
     blocks: list[list[str]] = []
     if rules.ts6:
@@ -583,12 +724,18 @@ def render6(rules: Rules) -> str:
             _chain("output", "type route hook output priority mangle; policy accept;", output)
         )
         # То же, что loopback_guard в `ip xgw`: прямой запрос Xray не должен попасть
-        # на службы самого шлюза, если имя разрешилось в ::1.
+        # на службы самого шлюза, если имя разрешилось в ::1. И QUIC машины по IPv6.
+        guard6 = [f"meta mark {bypass} ip6 daddr ::1 counter reject"]
+        if rules.block_quic:
+            guard6.append(
+                f"meta mark {proxy} udp dport 443 ip6 daddr != @reserved6 "
+                "counter reject with icmpv6 type port-unreachable"
+            )
         blocks.append(
             _chain(
                 "loopback_guard",
                 "type filter hook output priority filter; policy accept;",
-                [f"meta mark {bypass} ip6 daddr ::1 counter reject"],
+                guard6,
             )
         )
     if rules.v6_guard:
@@ -616,13 +763,18 @@ def render6(rules: Rules) -> str:
                 ],
             )
         )
-    if rules.lan_if:
+    forward6 = [f'iifname "{rules.lan_if}" drop', f'oifname "{rules.lan_if}" drop'] if (
+        rules.lan_if) else []
+    if rules.ts_forward:
+        # Выходной узел и IPv6: перехвата IPv6 для чужих устройств нет — отбить сразу, чтобы
+        # устройство tailnet ушло на IPv4 (через Xray), а не мимо VPN.
+        forward6.append(
+            f'iifname "{ts.INTERFACE}" ip6 daddr != {ts.TAILNET6} '
+            "counter reject with icmpv6 type admin-prohibited"
+        )
+    if forward6:
         blocks.append(
-            _chain(
-                "forward",
-                "type filter hook forward priority filter; policy accept;",
-                [f'iifname "{rules.lan_if}" drop', f'oifname "{rules.lan_if}" drop'],
-            )
+            _chain("forward", "type filter hook forward priority filter; policy accept;", forward6)
         )
     return _table("ip6", TABLE6, blocks)
 
@@ -693,11 +845,27 @@ def listing(runner: Runner, family: str = "ip", table: str = TABLE) -> str | Non
 def ts_state(text: str) -> tuple[bool, bool | None]:
     """Исключения Tailscale в загруженной таблице: (есть ли правила с tailscale0, лежит ли
     метка в наборе ts_direct — None, если набора нет)."""
-    has = f'"{ts.INTERFACE}"' in text
+    has = f'oifname "{ts.INTERFACE}"' in text  # исключения Т1; iifname — выходной узел
     match = re.search(
         rf"^\s*set {TS_SET} \{{\n(.*?)^\s*\}}", text, flags=re.MULTILINE | re.DOTALL
     )
     return has, None if match is None else "elements" in match.group(1)
+
+
+def set_elements(text: str, name: str) -> set[str]:
+    """Элементы набора из текста `nft list table` (адреса, без масок /32)."""
+    match = re.search(rf"^\s*set {name} \{{\n(.*?)^\s*\}}", text, flags=re.MULTILINE | re.DOTALL)
+    if match is None:
+        return set()
+    found = re.search(r"elements\s*=\s*\{(.*?)\}", match.group(1), flags=re.DOTALL)
+    if found is None:
+        return set()
+    return {item.strip().removesuffix("/32") for item in found.group(1).split(",") if item.strip()}
+
+
+def ts_exit_state(text: str) -> bool:
+    """В загруженной таблице есть правила выходного узла (tailscale0 на входе)."""
+    return f'iifname "{ts.INTERFACE}"' in text
 
 
 def loaded_chains(

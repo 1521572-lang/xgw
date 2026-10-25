@@ -42,6 +42,9 @@ class FakeTailscale:
         self.serve: str = ""  # куда Serve ведёт порт 8443
         self.funnel: str = ""  # куда Funnel ведёт порт 443 (из интернета)
         self.funnel_allowed = True  # в правилах tailnet есть атрибут funnel
+        self.exit_node = False  # --advertise-exit-node
+        self.exit_approved = False  # одобрен в консоли tailnet (AllowedIPs с 0.0.0.0/0)
+        self.peers: list[dict] = []  # Peer: HostName, TailscaleIPs, OS, Online
         self.fail: dict[str, str] = {}  # команда («set», «serve») → текст ошибки
         self.calls: list[tuple[str, ...]] = []
         self.auth_url = ""
@@ -85,11 +88,16 @@ class FakeTailscale:
                     "DNSName": self.name + "." if self.backend == "Running" else "",
                     "OS": "linux", "TailscaleIPs": self.addresses if self.backend == "Running"
                     else None, "Online": self.backend == "Running",
+                    "AllowedIPs": [f"{ip}/32" if ":" not in ip else f"{ip}/128"
+                                   for ip in self.addresses]
+                    + (["0.0.0.0/0", "::/0"] if self.exit_node and self.exit_approved else []),
                 },
                 "MagicDNSSuffix": "tailnet-1.ts.net",
                 "CurrentTailnet": {"Name": "user@example.com", "MagicDNSSuffix":
                                    "tailnet-1.ts.net", "MagicDNSEnabled": True},
-                "Peer": {}, "User": {}, "ClientVersion": None,
+                "Peer": {f"nodekey:{index}": {"ID": f"n{index}", "ExitNodeOption": False,
+                                              **peer} for index, peer in enumerate(self.peers)},
+                "User": {}, "ClientVersion": None,
             })
         if args == ["debug", "prefs"]:
             return json.dumps({
@@ -97,6 +105,7 @@ class FakeTailscale:
                 "ExitNodeID": "", "CorpDNS": self.accept_dns, "RunSSH": self.ssh,
                 "WantRunning": True, "LoggedOut": self.backend != "Running",
                 "ShieldsUp": False, "NetfilterMode": self.netfilter, "AutoUpdate": {},
+                "AdvertiseRoutes": ["0.0.0.0/0", "::/0"] if self.exit_node else None,
             }, indent=2)
         if args == ["serve", "status", "--json"]:
             if not self.serve and not self.funnel:
@@ -124,6 +133,8 @@ class FakeTailscale:
                 elif flag == "--accept-dns=false":
                     self.accept_dns = False
                     self.override_dns = False
+                elif flag in ("--advertise-exit-node=true", "--advertise-exit-node=false"):
+                    self.exit_node = flag.endswith("true")
                 else:
                     raise CommandError(f"{command}: flag provided but not defined: {flag}")
             return ""

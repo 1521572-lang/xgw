@@ -125,6 +125,9 @@ class Capture:
         self.open_marker = paths.run / "capture-open"
         # tailscale.route = "vpn", а Xray не отвечает: сокеты tailscaled — мимо Xray.
         self.ts_marker = paths.run / "tailscale-direct"
+        # tailscale.route = "direct", а DERP напрямую не отвечает (ТЗ R4b): tailscaled временно
+        # идёт через Xray.
+        self.ts_fallback_marker = paths.run / "tailscale-via-vpn"
         self.sys_net: Path | None = None  # где искать мосты Docker; None — lan.SYS_NET
         self._warned: set[str] = set()
         # Почему последняя загрузка вместо перехвата оставила сеть напрямую: в применённом
@@ -188,10 +191,12 @@ class Capture:
     def rules(self, mode: str | None = None) -> nft.Rules:
         """Параметры правил для режима (по умолчанию — текущего)."""
         mode = mode or self.mode()
+        tailnet = ts.present(self.paths, self.sys_net)
         rules, warnings = nft.build_rules(
             self.cfg, capture=mode == "on", blocked=mode == "blocked", time_uids=self.time_uids,
-            tailscale=self.cfg.capture.local and ts.present(self.paths, self.sys_net),
-            xray_down=self.ts_marker.exists(),
+            tailscale=self.cfg.capture.local and tailnet,
+            xray_down=self.ts_marker.exists(), tailnet=tailnet,
+            ts_fallback=self.ts_fallback_marker.exists(),
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -230,11 +235,17 @@ class Capture:
 
     def _throws(self, rules: nft.Rules, family: int) -> tuple[str, ...]:
         """Подсети, для которых в таблице TPROXY нужен маршрут throw: подсеть LAN, пока её
-        трафик перехватывается (iprule.py: проверка источника с учётом метки)."""
-        gateway = lan.gateway(self.cfg)
-        if family != 4 or not (rules.capture_lan and rules.lan_if) or gateway is None:
+        трафик перехватывается, и tailnet, пока шлюз — выходной узел (iprule.py: проверка
+        источника с учётом метки; tailscaled сам ставит src_valid_mark = 1)."""
+        if family != 4:
             return ()
-        return (str(gateway.network),)
+        throws: list[str] = []
+        gateway = lan.gateway(self.cfg)
+        if rules.capture_lan and rules.lan_if and gateway is not None:
+            throws.append(str(gateway.network))
+        if rules.ts_exit:
+            throws.append(str(ts.CGNAT))
+        return tuple(throws)
 
     @staticmethod
     def _wanted(rules: nft.Rules, family: int) -> tuple[bool, bool]:
@@ -509,7 +520,7 @@ class Capture:
         без перезагрузки таблиц (соединения не рвутся), а отметка в /run нужна, чтобы и
         загрузка правил заново (loaded, xgw-net) собрала набор таким же. Возвращает, что
         сделано; пусто — менять нечего."""
-        vpn = self.cfg.tailscale.route == "vpn"
+        vpn = self.cfg.tailscale.route == "vpn" or self.ts_fallback_marker.exists()
         wanted = xray_down and vpn
         if wanted == self.ts_marker.exists():
             return ""
@@ -536,6 +547,38 @@ class Capture:
             return ""
         return ("Xray не отвечает — Tailscale идёт напрямую, мимо VPN" if wanted
                 else "Xray отвечает — Tailscale снова идёт через VPN")
+
+    def tailscale_fallback(self, on: bool) -> str:
+        """tailscale.route = "direct", а серверы DERP напрямую не отвечают (ТЗ R4b): сокеты
+        tailscaled временно идут через Xray (on) — или снова напрямую. Как tailscale_direct:
+        набор ts_direct меняется без перезагрузки таблиц, отметка в /run — для xgw-net.
+        Возвращает, что сделано; пусто — менять нечего."""
+        wanted = on and self.cfg.tailscale.route == "direct"
+        if wanted == self.ts_fallback_marker.exists():
+            return ""
+        with self._lock():
+            if wanted:
+                self.ts_fallback_marker.parent.mkdir(parents=True, exist_ok=True)
+                self.ts_fallback_marker.touch()
+            else:
+                self.ts_fallback_marker.unlink(missing_ok=True)
+            rules = self.rules(self.effective_mode())
+            text = nft.ts_elements(rules) if rules.capture else ""
+            if text:
+                try:
+                    with self._own_rules():
+                        self.runner(["nft", "-f", "-"], input=text)
+                except (cmd.CommandError, OSError) as exc:
+                    # Правила сверит loaded() на этом же шаге и загрузит заново.
+                    self.log.warning("набор %s не изменён: %s", nft.TS_SET, exc)
+        if wanted:
+            return ("серверы DERP Tailscale напрямую не отвечают — tailscaled временно идёт "
+                    "через VPN")
+        return "серверы DERP Tailscale снова отвечают напрямую — tailscaled идёт напрямую"
+
+    def tailscale_via_vpn(self) -> bool:
+        """tailscaled сейчас идёт через VPN по аварийному маршруту (ТЗ R4b)."""
+        return self.ts_fallback_marker.exists()
 
     def up(self) -> str:
         """Загружает правила текущего режима (после перезагрузки, после сбоя)."""
@@ -586,6 +629,7 @@ class Capture:
                 if remove_tun:
                     tun.remove(self.cfg.capture.tun_name, self.runner)
                 self.ts_marker.unlink(missing_ok=True)
+                self.ts_fallback_marker.unlink(missing_ok=True)
                 self._forwarding_restore()
                 self._congestion_restore()
             except (cmd.CommandError, OSError) as exc:
@@ -662,6 +706,13 @@ class Capture:
             return guard
         if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
             return False  # tailscaled запустился или остановился, набор не тот
+        if nft.ts_exit_state(text) != rules.ts_forward:
+            return False  # выходной узел: tailscaled запустился или остановился
+        if not rules.blocked and nft.quic_loaded(text) != rules.quic:
+            return False  # network.block_quic переключили
+        if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
+                rules.ts_exit_direct):
+            return False  # устройство tailnet пустили напрямую или вернули в Xray
         if rules.blocked:
             wanted: set[str] = set()
             if rules.block_local:

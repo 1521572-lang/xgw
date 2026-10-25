@@ -2,7 +2,8 @@
 
 По образцу `xgw update-xray`: новая версия скачивается в соседний каталог и проверяется рабочим
 конфигом до замены; если после замены sing-box не отвечает — возвращается прежний бинарник.
-Версия одна — config.SINGBOX_VERSION: другую XGW не ставит.
+Версия одна — config.SINGBOX_VERSION: другую эта команда не ставит, в том числе поверх более
+новой, принятой шлюзом после обновления из панели (cores.py) — та после этого забывается.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import os
 import shutil
 from collections.abc import Callable
 
-from .. import engine, fetch, log
+from .. import cores, engine, fetch, log
 from ..apply import singbox as singbox_apply
 from ..config import SINGBOX_VERSION, Config
 from ..generator import singbox as singboxing
@@ -47,7 +48,7 @@ def update_singbox(
         out(f"sing-box {_version_text(current)} — уже нужная версия")
         return 0
     mark = engine.bypass_mark(cfg, logger)
-    route = {"mark": mark, "bootstrap": cfg.dns.bootstrap if mark is not None else None}
+    route = {"mark": mark, "bootstrap": cfg.dns.resolvers if mark is not None else None}
     try:
         release = get_release(SINGBOX_VERSION, **route)
     except (BinaryError, fetch.FetchError) as exc:
@@ -94,11 +95,13 @@ def update_singbox(
             os.chmod(paths.singbox_bin, 0o755)
         if applied is None:
             shutil.rmtree(previous, ignore_errors=True)
+            cores.forget(paths, "sing-box")
             out(f"sing-box установлен: {_version_text(current)} → {tag.lstrip('v')}")
             return 0
-        error = _restart(core)
+        error = restart_and_check(core)
         if error is None:
             shutil.rmtree(previous, ignore_errors=True)
+            cores.forget(paths, "sing-box")
             out(f"sing-box обновлён и перезапущен: {_version_text(current)} → {tag.lstrip('v')}")
             return 0
         logger.error("sing-box %s после обновления не поднялся: %s", tag, error)
@@ -107,7 +110,7 @@ def update_singbox(
             os.replace(target, staging)
             os.replace(previous, target)
             shutil.rmtree(staging, ignore_errors=True)
-            again = _restart(core)
+            again = restart_and_check(core)
             out(
                 f"ошибка: sing-box {tag} не поднялся ({error}) — возвращена версия "
                 f"{_version_text(current)}"
@@ -118,7 +121,7 @@ def update_singbox(
         return 1
 
 
-def _restart(core: singbox_apply.SingboxCore) -> str | None:
+def restart_and_check(core: singbox_apply.SingboxCore) -> str | None:
     try:
         error = core.restart()
     except XrayServiceError as exc:

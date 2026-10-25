@@ -219,7 +219,8 @@ def test_capture_local_off_needs_no_exceptions(gateway):
     gateway.cfg.capture.local = False
     _start_tailscaled(gateway)
     gateway.enable()
-    assert "tailscale0" not in gateway.kernel.table and gateway.loaded() is True
+    assert SKIP_TS0 not in gateway.kernel.table and "ts_direct" not in gateway.kernel.table
+    assert gateway.loaded() is True
 
 
 def test_blocked_and_v6_guard_follow_tailscaled(gateway):

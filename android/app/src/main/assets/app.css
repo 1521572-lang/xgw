@@ -88,7 +88,9 @@ h2 { font-size: 1.05rem; margin-bottom: 6px; }
 }
 
 .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.top p { overflow-wrap: anywhere; }
+.head { display: grid; gap: 2px; }
+.head p { overflow-wrap: anywhere; }
+#updated { white-space: nowrap; }
 
 .chip {
   display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
@@ -108,9 +110,23 @@ h2 { font-size: 1.05rem; margin-bottom: 6px; }
 .hero[data-tone="ok"] .title { color: var(--accent); }
 .hero[data-tone="warn"] .title { color: var(--warn); }
 .hero[data-tone="bad"] .title { color: var(--bad); }
-/* Нет связи со шлюзом: показано последнее известное состояние, кнопки не работают. */
-main.stale .card:not(:last-child) { opacity: .55; pointer-events: none; }
-.current { padding: 8px 12px; border-radius: 12px; background: var(--card-2); overflow-wrap: anywhere; }
+/* Нет связи со шлюзом: его карточки (.gw) — бледные и не нажимаются; VPN телефона работает
+   и без шлюза (на сохранённом списке серверов). */
+main.stale .gw { opacity: .55; pointer-events: none; }
+.current {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 12px; border-radius: 12px; background: var(--card-2);
+}
+.current-text { display: flex; flex-direction: column; min-width: 0; }
+.current-name { overflow-wrap: anywhere; font-weight: 600; }
+.lifecycle { padding-left: 14px; position: relative; }
+.lifecycle::before {
+  content: ""; position: absolute; left: 0; top: .55em; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--muted);
+}
+.lifecycle[data-tone="ok"]::before { background: var(--accent); }
+.lifecycle[data-tone="warn"]::before { background: var(--warn); }
+.lifecycle[data-tone="bad"]::before { background: var(--bad); }
 
 .rows { display: grid; gap: 6px; }
 .row {
@@ -130,7 +146,6 @@ main.stale .card:not(:last-child) { opacity: .55; pointer-events: none; }
 .tag.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
 .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, var(--line)); }
 .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, var(--line)); }
-.switch { min-height: 40px; padding: 6px 12px; font-size: .85rem; }
 
 .overlay {
   position: fixed; inset: 0; background: rgb(0 0 0 / 55%);
@@ -148,3 +163,183 @@ main.stale .card:not(:last-child) { opacity: .55; pointer-events: none; }
   box-shadow: 0 8px 24px rgb(0 0 0 / 30%);
 }
 .toast[data-tone="bad"] { background: var(--bad); color: #2b0606; }
+
+/* --- вкладки: нижняя панель, как у приложений VPN ------------------------------------ */
+
+.tab { display: grid; gap: 14px; }
+#gateway { padding-bottom: 84px; }
+.tabbar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 4;
+  display: grid; grid-template-columns: repeat(5, 1fr);
+  background: var(--card); border-top: 1px solid var(--line);
+}
+.tab-btn {
+  min-height: 56px; padding: 6px 2px; border: 0; background: transparent;
+  color: var(--muted); font-size: .78rem; cursor: pointer;
+}
+.tab-btn::before {
+  content: ""; display: block; width: 22px; height: 4px; margin: 0 auto 6px;
+  border-radius: 999px; background: transparent;
+}
+.tab-btn[aria-current="page"] { color: var(--text); font-weight: 600; }
+.tab-btn[aria-current="page"]::before { background: var(--accent); }
+.toast { bottom: 76px; }
+.toast-note { display: block; opacity: .8; font-size: .85rem; margin-top: 4px; }
+#dialog { z-index: 7; }
+
+/* --- карточки пульта: те же строки, что в панели шлюза (src/xgw/ui/app.css) ----------- */
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.count { color: var(--muted); font-weight: 400; }
+.sub-title { margin: 10px 0 2px; font-size: .95rem; }
+.btn.small-btn { min-height: 36px; padding: 4px 12px; border-radius: 10px; font-size: .88rem; }
+.btn[data-busy], .prio[data-busy] { opacity: .6; }
+
+.list > li {
+  display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line);
+}
+.list > li:first-child { border-top: 0; }
+.list > li.empty { display: block; padding: 8px 0 2px; border-top: 0; color: var(--muted); font-size: .9rem; }
+.row-main { flex: 1; min-width: 0; display: grid; gap: 2px; justify-items: start; }
+.row-title { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; font-weight: 600; }
+.row-title > span:first-child { overflow-wrap: anywhere; }
+.row-sub { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.row-error { color: var(--bad); font-size: .85rem; overflow-wrap: anywhere; }
+.row-actions, .row-tools { display: flex; flex: none; align-items: center; gap: 4px; }
+.mono { font-family: ui-monospace, "Roboto Mono", monospace; font-size: .8rem; }
+
+.icon-btn {
+  display: inline-grid; place-items: center; width: 40px; height: 40px; padding: 0;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card-2);
+  color: var(--muted); cursor: pointer;
+}
+.icon-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.icon-btn:disabled { opacity: .35; }
+.rec-btn svg { fill: var(--bad); stroke: none; transform: scale(.75); }
+.tag.rec { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, var(--line)); }
+
+.dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--accent); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+.delay { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; font-size: .9rem; }
+.delay.ok { color: var(--accent); }
+.delay.warn { color: var(--warn); }
+.delay.bad { color: var(--bad); }
+.delay.none { color: var(--muted); font-weight: 400; }
+.speed { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; font-size: .9rem; }
+.speed.old { color: var(--muted); font-weight: 400; }
+/* Иконка замера одного сервера — рядом с цифрой скорости. */
+.server .icon-btn.speed-btn { width: 32px; height: 32px; align-self: center; }
+.icon-btn.speed-btn svg { width: 16px; height: 16px; }
+.icon-btn.speed-btn[data-busy="1"] svg { animation: spin 1s linear infinite; }
+.icon-btn.speed-btn:disabled { opacity: .7; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Сервер — в три строки: имя с метками и цифры; состояние; кнопки от края до края. */
+.servers > li.server {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "dot title value" ". sub sub" "tools tools tools";
+  align-items: center; gap: 4px 10px;
+}
+.server > .dot { grid-area: dot; }
+.server > .row-title { grid-area: title; }
+/* Цифры — столбцом у правого края; иконка замера — слева от скорости, а не строкой над ней. */
+.server > .values {
+  grid-area: value;
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  justify-items: end;
+  column-gap: 2px;
+}
+.server > .values > * { grid-column: 2; }
+.server > .values > .speed-btn { grid-column: 1; grid-row: 1; }
+.server > .row-sub { grid-area: sub; }
+.server > .row-tools { grid-area: tools; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.servers > li.selected {
+  margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 12px; border-top-color: transparent;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.servers > li.selected + li { border-top-color: transparent; }
+.servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
+/* Сервер, к которому прокрутили после выключателя: подсветка гаснет за две секунды. */
+.servers > li.flash {
+  margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 12px;
+  animation: flash 2s ease-out;
+}
+@keyframes flash { from { background: color-mix(in srgb, var(--warn) 24%, transparent); } }
+.prio {
+  min-height: 36px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--card-2); color: var(--muted); font: inherit; font-size: .88rem;
+}
+.prio.high { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
+/* Кнопки сервера — в одну строку на экране телефона: выбрать, ядро, приоритет, выключатель, убрать. */
+/* Не влезают — выключатель и «Убрать» уходят второй строкой вправо, списки не сжимаются. */
+.server .prio { flex: 1 1 88px; max-width: 130px; padding: 4px 0 4px 6px; }
+.server .choose { padding: 4px 10px; }
+.server .icon-btn { width: 36px; height: 36px; }
+
+.switch {
+  position: relative; flex: none; width: 46px; height: 28px; margin: 0 4px; padding: 0;
+  border: 0; border-radius: 999px; cursor: pointer;
+  background: color-mix(in srgb, var(--muted) 45%, var(--card-2)); transition: background .15s ease;
+}
+.switch::after {
+  content: ""; position: absolute; top: 4px; left: 4px; width: 20px; height: 20px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgb(0 0 0 / 35%); transition: transform .15s ease;
+}
+.switch[aria-checked="true"] { background: var(--accent); }
+.switch[aria-checked="true"]::after { transform: translateX(18px); }
+.switch:disabled { opacity: .4; }
+
+.group { border-top: 1px solid var(--line); }
+#groups > .group:first-child { border-top: 0; }
+.group > summary {
+  display: flex; align-items: baseline; gap: 8px; padding: 12px 0 6px; cursor: pointer; list-style: none;
+}
+.group > summary::-webkit-details-marker { display: none; }
+.group > summary::before {
+  content: ""; flex: none; align-self: center; width: 7px; height: 7px;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+  transform: rotate(-45deg); transition: transform .15s ease;
+}
+.group[open] > summary::before { transform: rotate(45deg) translate(-2px, -2px); }
+.group-name { overflow-wrap: anywhere; font-weight: 650; }
+.group-count { flex: none; margin-left: auto; }
+.group-tools { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+
+.main-box, .ts-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px;
+  padding: 10px 12px; border-radius: 12px; background: var(--card-2);
+}
+.main-text { display: flex; flex: 1 1 200px; flex-direction: column; min-width: 0; }
+.main-title { font-weight: 600; }
+.note { padding: 8px 12px; border-radius: 10px; background: color-mix(in srgb, var(--warn) 13%, transparent); font-size: .9rem; }
+.note.bad { border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.budget-note { padding-top: 10px; border-top: 1px solid var(--line); }
+.budget-note.over { padding: 8px 12px; border: 0; border-radius: 10px; background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--text); }
+.budget-note b { font-weight: 600; }
+.quota { height: 5px; margin-top: 6px; border-radius: 999px; background: var(--card-2); overflow: hidden; }
+.quota > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.quota.warn > span { background: var(--warn); }
+.quota.bad > span { background: var(--bad); }
+.row-main > div { justify-self: stretch; }
+
+.add { display: grid; gap: 4px; }
+.add textarea, .edit-sub input, .edit-sub textarea {
+  display: block; width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--card-2); color: var(--text); font-family: ui-monospace, "Roboto Mono", monospace; font-size: .85rem;
+}
+.add textarea { min-height: 84px; resize: vertical; }
+.add textarea::placeholder { color: var(--muted); font-family: system-ui, sans-serif; }
+.edit-sub { display: grid; gap: 6px; margin-top: 4px; }
+.edit-sub label { color: var(--muted); font-size: .88rem; }
+
+.events > li { align-items: baseline; font-size: .9rem; }
+.events time { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 3.2em; }
+.events .row-main { display: block; overflow-wrap: anywhere; }
+.events .tag { margin-right: 2px; }

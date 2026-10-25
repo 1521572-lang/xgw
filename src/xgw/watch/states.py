@@ -73,6 +73,11 @@ _ACTIONS = {
 }
 
 
+def action_text(state: State) -> str:
+    """Текст состояния по умолчанию; демон его уточняет (daemon.stranded_action)."""
+    return _ACTIONS[state]
+
+
 class StateMachine:
     def __init__(self, fail_threshold: int = 3) -> None:
         self.fail_threshold = max(1, fail_threshold)

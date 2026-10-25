@@ -39,6 +39,35 @@ HEAD_END = b"\r\n\r\n"  # конец заголовков HTTP
 CANCEL_SLICE = 0.5
 
 _sleep = time.sleep  # подменяется в тестах
+# Резолвер bootstrap, который не ответил, пробуется последним столько секунд (0.1.18, ТЗ R4a):
+# DoH-запрос к недоступному адресу ждёт таймаута, и каждый такой резолвер в начале списка
+# задерживал бы разрешение имён на секунды. Память — на процесс (демон, установка, служба
+# ядер); итог проверки всех резолверов демон пишет в журнал событий и diag (bootstrap.py).
+RESOLVER_PAUSE = 600.0
+_resolver_down: dict[str, float] = {}
+_resolver_lock = threading.Lock()
+
+
+def resolver_order(entries: Sequence[str], now: float | None = None) -> list[str]:
+    """Резолверы в порядке попыток: недавно не ответившие — в конце (порядок внутри групп
+    сохраняется)."""
+    now = time.monotonic() if now is None else now
+    with _resolver_lock:
+        down = {entry for entry, until in _resolver_down.items() if until > now}
+    return [entry for entry in entries if entry not in down] + [
+        entry for entry in entries if entry in down
+    ]
+
+
+def resolver_failed(entry: str, now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    with _resolver_lock:
+        _resolver_down[entry] = now + RESOLVER_PAUSE
+
+
+def resolver_answered(entry: str) -> None:
+    with _resolver_lock:
+        _resolver_down.pop(entry, None)
 
 
 class FetchError(Exception):
@@ -574,7 +603,7 @@ def resolve_domain(
     """
     errors: list[str] = []
     absent = ""
-    for entry in bootstrap:
+    for entry in resolver_order(bootstrap):
         if cancel is not None and cancel.is_set():
             raise Cancelled
         try:
@@ -589,16 +618,19 @@ def resolve_domain(
             else:
                 errors.append(f"неизвестный bootstrap: {entry}")
                 continue
+            resolver_answered(entry)
             if ips:
                 return sorted(set(ips), key=ipaddress.ip_address)
             absent = absent or "у имени нет адреса IPv4"
             errors.append(f"{masking.mask_url(entry)}: пустой ответ")
         except NoSuchDomain as exc:
+            resolver_answered(entry)  # ответил — определённо, а не сбой
             absent = str(exc)
             errors.append(f"{masking.mask_url(entry)}: {exc}")
         except Cancelled:
             raise
         except Exception as exc:
+            resolver_failed(entry)
             errors.append(f"{masking.mask_url(entry)}: {exc}")
     if absent:
         raise NoSuchDomain(f"домен {name} не разрешается: {absent}")

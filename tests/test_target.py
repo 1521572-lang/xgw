@@ -9,7 +9,10 @@ from xgw.paths import Paths
 from xgw.watch import checks, target
 from xgw.watch.scan import ScanResult
 
-WARNING = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url"
+WARNING = (
+    "Внимание: пробы всех серверов падают — вероятно, недоступны сами проверочные хосты "
+    "(probe.url и probe.urls)"
+)
 
 
 def _result(verdict: str, *, bytes_read: int = 0, error: str = "", kind: str = "",
@@ -125,10 +128,12 @@ def test_an_answer_from_anyone_asks_nothing_and_blames_nobody():
 
 def test_core_probes_use_the_fallback_address_while_the_probe_url_is_down(tmp_path):
     """Пока probe.url не отвечает, ядро пробует серверы по запасному адресу: по
-    probe.url_fallback, а без него — по probe.trace_url. Запись о запасном относится к
-    своему probe.url и переживает перезапуск (лежит в /var/lib/xgw)."""
+    probe.url_fallback, а без него — по probe.trace_url (другие проверочные хосты — в своём
+    тесте). Запись о запасном относится к своему probe.url и переживает перезапуск (лежит в
+    /var/lib/xgw)."""
     paths = Paths(root=tmp_path)
     cfg = Config()
+    cfg.probe.urls = []
     primary = cfg.probe.url
     assert target.fallback_target(cfg) == cfg.probe.trace_url
     assert target.observatory_url(cfg, paths) == primary
@@ -165,7 +170,8 @@ def test_direct_request_goes_around_the_vpn_with_the_probe_user_agent(monkeypatc
     assert target.direct_signature(cfg, mark=2) == ""
     assert seen["url"] == cfg.probe.url and seen["mark"] == 2 and seen["retries"] == 0
     assert seen["headers"] == {"User-Agent": "Mozilla/5.0 Test"}
-    assert seen["bootstrap"] == cfg.dns.bootstrap  # с меткой — свой резолвер, мимо перехвата
+    # С меткой — свои резолверы (и дополнительные, 0.1.18), мимо перехвата.
+    assert seen["bootstrap"] == cfg.dns.resolvers
     seen["answer"] = 403
     assert target.direct_signature(cfg, mark=None) == "HTTP 403"
     assert seen["bootstrap"] is None
@@ -193,3 +199,26 @@ def test_base_request_goes_through_the_balancer(monkeypatch, ok):
     assert seen["user_agent"] == cfg.probe.user_agent
     cfg.probe.trace_url = ""
     assert target.base_ping(cfg) is False  # проверить нечем — подтверждения нет
+
+
+def test_the_core_probes_another_probe_host_that_answered(tmp_path):
+    """0.1.18 (ТЗ R3): не отвечает только probe.url — ядро пробует серверы по проверочному
+    хосту, который демон только что открыл через серверы; без такого — по первому из
+    probe.urls. Хост, которого в конфиге больше нет, не используется."""
+    paths = Paths(root=tmp_path)
+    cfg = Config()
+    first, second = cfg.probe.urls[0], cfg.probe.urls[1]
+    assert target.fallback_target(cfg) == first
+    assert target.fallback_since(paths) is None
+    assert target.use_fallback(cfg, paths, True, second) is True
+    assert target.observatory_url(cfg, paths) == second
+    since = target.fallback_since(paths)
+    assert since is not None
+    # Повторно с тем же хостом — ничего не меняется, отсчёт «с какого момента» тоже.
+    assert target.use_fallback(cfg, paths, True, second) is False
+    assert target.use_fallback(cfg, paths, True) is False
+    assert target.fallback_since(paths) == since
+    cfg.probe.urls = [first]
+    assert target.observatory_url(cfg, paths) == first  # второго в конфиге больше нет
+    assert target.use_fallback(cfg, paths, False) is True
+    assert target.observatory_url(cfg, paths) == cfg.probe.url

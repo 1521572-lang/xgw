@@ -35,8 +35,9 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from pathlib import Path
 
-from . import cost, engine, fetch, log, priority
+from . import cores, cost, engine, fetch, log, priority
 from . import pin as pinning
+from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
 from .apply.rotation import (
     REPLACE_NOW_VERDICTS,
@@ -45,7 +46,7 @@ from .apply.rotation import (
     plan_rotation,
     preferred_members,
 )
-from .config import Config
+from .config import Config, parse_seconds
 from .generator import builder
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
@@ -55,9 +56,12 @@ from .net.capture import capture_inbounds
 from .paths import Paths
 from .store import Store
 from .watch import checks, scan, speed, status, target
+from .watch import guard as speedguard
+from .watch import hosts as probehosts
+from .watch import resolvers as resolving
 from .watch.notify import Notifier
 from .watch.scan import RESERVE_CANDIDATES, RESERVE_RECHECK
-from .watch.states import Signals, State, StateMachine
+from .watch.states import Signals, State, StateMachine, action_text
 from .xraycore import binary, metrics
 from .xraycore.api import ApiError
 from .xraycore.service import XrayServiceError
@@ -137,6 +141,11 @@ SPEED_FORCE_AFTER = 3600.0
 # замечают отказы), а круг по 70 серверам и так укладывается в полчаса. По кнопке — подряд,
 # пока шаг не займёт столько секунд (один — всегда).
 SPEED_STEP_SECONDS = 10.0
+# Шаг, в котором уже шёл скан, берёт не больше одного замера: заказанный (кнопкой, контролем
+# скорости) — сразу, фоновый — если шага без скана не было столько секунд. Пробы профилей
+# бывают на каждом шаге: испытание 0.1.18 (25.10.2026) — кнопка ↻ «крутится, но не
+# обновляется», фоновых замеров не было вовсе.
+SPEED_SCAN_WAIT = 600.0
 # Запасной, который быстрее основного, переводится в работу и становится основным; если
 # за это время он так и не встал в работу (конфиг ждёт окна перезапуска и т. п.) — отбой.
 PROMOTE_WAIT = 3600.0
@@ -153,8 +162,23 @@ PROFILE_RECHECK = 24 * 3600.0
 # Незавершённые пробы профилей и время последней смены профиля — в базе (ключ meta), а не только
 # в памяти: иначе после перезапуска демона посреди пробы пробный профиль принимался за выученный
 # (отчёт 0.1.13, наблюдения 2–3), а отсчёт PROFILE_RETRY и PROFILE_RECHECK начинался заново.
-TRIALS_META = "profile_trials"
+TRIALS_META = profiling.TRIALS_META
 SINGBOX_RETRY = 1800.0  # sing-box не поднялся и серверы ушли на Xray — пробовать снова так часто
+# Обновление ядер из панели (cores.py): первая проверка выпусков на GitHub — через 5 минут после
+# запуска демона (сам срок, раз в сутки, хранится в cores-check.json и переживает перезапуски),
+# дальше демон сверяется с ним раз в 10 минут. В сутки наблюдения после обновления ядро,
+# которое не отвечает и после отката конфига на last-good ещё CORE_BACK_AFTER шагов, заменяется
+# прежним; sing-box после такого возврата демон пробует поднять через CORE_RECOVER секунд.
+CORES_FIRST_CHECK = 300.0
+CORES_RECHECK = 600.0
+# Фоновые проверки сети (0.1.18, ТЗ R4): bootstrap-DNS — раз в dns.bootstrap_check_minutes
+# (первая — через NETMON_FIRST после запуска), серверы DERP Tailscale напрямую — раз в
+# DERP_CHECK. Обратно на прямой путь tailscaled идёт после DERP_BACK удачных проверок подряд.
+NETMON_FIRST = 120.0
+DERP_CHECK = 300.0
+DERP_BACK = 2
+CORE_BACK_AFTER = 2
+CORE_RECOVER = 120.0
 
 
 @dataclasses.dataclass
@@ -167,6 +191,10 @@ class ProfileTrial:
     probe_tag: str
     since: float
     recheck: bool = False  # возврат на базовый профиль, а не проба новой ступени
+    verdict: str = ""  # вердикт скана, из-за которого сервер перевели (для события и панели)
+    # Сервер в работе проверяется на ступенях дробления на месте, без замены (ТЗ R1): пока
+    # проба идёт, замена его ждёт; не ответил ни на одной — заменяется.
+    escalate: bool = False
 
 
 @dataclasses.dataclass
@@ -178,6 +206,8 @@ class ProfileWish:
     rest: list[str]
     prev: str
     recheck: bool = False
+    verdict: str = ""
+    escalate: bool = False
 
 
 UDP_PROTOCOLS = ("hysteria2", "hysteria", "tuic", "wireguard")
@@ -188,12 +218,23 @@ def _transport(node) -> str:
     return "udp" if node.protocol in UDP_PROTOCOLS else "tcp"
 
 
+def _server_text(name: str, tag: str) -> str:
+    """Сервер в событиях обхода — имя и тег. Имя бывает одним на десяток серверов подписки, а
+    его хвост маскируется: перепроверка 0.1.18 (25.10.2026) — двенадцать «🚀Авто | Лучший
+    сервер» по очереди выглядели как один сервер, эскалация которого идёт каждую минуту."""
+    return f"«{name}» ({tag})"
+
+
 def _keep_text(trial: ProfileTrial) -> str:
     new, old = trial.profile, trial.prev
     if new == profiling.XRAY_FRAGMENT and old == profiling.XRAY_DEFAULT:
         return "отвечает только с дроблением ClientHello — оно включено"
+    if new == profiling.XRAY_SPLIT and old == profiling.XRAY_DEFAULT:
+        return "отвечает только с нарезкой первых пакетов — она включена"
     if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_FRAGMENT:
         return "отвечает и без дробления ClientHello — оно выключено"
+    if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_SPLIT:
+        return "отвечает и без нарезки первых пакетов — она выключена"
     if trial.recheck:
         return (f"отвечает и на профиле «{profiling.NAMES[new]}» — он возвращён "
                 f"(был «{profiling.NAMES[old]}»)")
@@ -203,15 +244,22 @@ def _keep_text(trial: ProfileTrial) -> str:
 
 def _fail_text(trial: ProfileTrial) -> str:
     new, old = trial.profile, trial.prev
-    if new == profiling.XRAY_FRAGMENT and old == profiling.XRAY_DEFAULT:
+    if new in profiling.XRAY_FRAGMENTS and old == profiling.XRAY_DEFAULT:
         return "не отвечает и с дроблением ClientHello — оно выключено"
     if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_FRAGMENT:
         return "без дробления ClientHello не отвечает — оно включено снова"
+    if new == profiling.XRAY_DEFAULT and old == profiling.XRAY_SPLIT:
+        return "без нарезки первых пакетов не отвечает — она включена снова"
     if trial.recheck:
         return (f"на профиле «{profiling.NAMES[new]}» не отвечает — возвращён "
                 f"«{profiling.NAMES[old]}»")
     return (f"не отвечает ни на одном профиле — возвращён «{profiling.NAMES[old]}», следующая "
             "попытка через 6 ч")
+
+
+def checks_interval(cfg: Config) -> int:
+    """probe.interval в секундах (как часто ядро пробует участников); не разобрать — 30."""
+    return parse_seconds(cfg.probe.interval) or 30
 
 
 def jitter(seconds: float, spread: float = 0.2) -> float:
@@ -233,6 +281,37 @@ def tier_text(old: cost.Klass, new: cost.Klass, *, up: bool) -> str:
     return (
         f"{head} — в работе {cost.class_name(new, ranked)} "
         f"(были — {cost.class_name(old, ranked)})"
+    )
+
+
+def stranded_action(tier: cost.Klass, ranked: bool) -> str:
+    """Текст DEGRADED, когда мёртвого участника заменить некем (Daemon._stranded): «замена на
+    запасные» была бы неправдой (разбор 24.10.2026, ASSUMPTIONS п. 235)."""
+    return (
+        "часть серверов недоступна, а заменить их некем: среди запасных нет серверов того же "
+        f"класса ({cost.class_name(tier, ranked)}); серверы другого класса шлюз ставит в "
+        "работу, только когда не отвечает ни один из работающих"
+    )
+
+
+def stranded_note(dead: list[str], tier: cost.Klass, ranked: bool) -> str:
+    """Событие и пояснение в панели: кто не отвечает, почему его не меняют и что делать."""
+    who = ", ".join(f"«{name}»" for name in dead)
+    head = f"не отвечает сервер в работе {who}" if len(dead) == 1 else (
+        f"не отвечают серверы в работе {who}"
+    )
+    if tier.rank != priority.LEVELS.index(priority.DEFAULT):
+        level = priority.level_name(tier.rank)
+        advice = (
+            f"поставьте уровень «{level}» ещё нескольким серверам (лучше той же страны) или "
+            "верните серверам в работе уровень «средний»"
+        )
+    else:
+        advice = "включите отключённые серверы этого класса или добавьте подписку"
+    return (
+        f"{head}, а заменить некем: среди запасных нет серверов того же класса "
+        f"({cost.class_name(tier, ranked)}); серверы другого класса шлюз ставит в работу, "
+        f"только когда не отвечает ни один из работающих. Чтобы было из кого менять, {advice}."
     )
 
 
@@ -307,6 +386,14 @@ class Daemon:
             paths.db_file, cfg.notify.min_interval_min, sinks=sinks, logger=self.log
         )
         self.store = Store(paths.db_file)
+        # Проверочные хосты (0.1.18, ТЗ R3): собственные пробы шлюза ходят по кругу —
+        # probe.url и probe.urls; счётчики и паузы переживают перезапуск демона (META).
+        self.hosts = probehosts.ProbeHosts(cfg, clock=wall)
+        broken = self.hosts.load(self.store.get_meta(probehosts.META))
+        if broken:
+            self.log.warning("записей о проверочных хостах в базе не разобрано: %d — пропущены",
+                             broken)
+        self._hosts_saved = ""
         # Версия Xray для статуса. `xgw update-xray` меняет бинарник и перезапускает только
         # xgw-xray, поэтому версия перечитывается, когда меняется файл (_xray_version).
         self.xray_version = ""
@@ -343,6 +430,19 @@ class Daemon:
         # "recheck"}. Запись живёт, пока сервер на пробном профиле: её снимает итог пробы, когда
         # он применён, — а если демон перезапущен раньше, проба продолжается (_resume_trials).
         self._trial_saved: dict[str, dict] = {}
+        # Обход блокировок у серверов (0.1.18, ТЗ R1), в базе вместе с пробами: когда сервер
+        # переводили на тяжёлый профиль из-за сбоя (отпечаток → [time.time()]), какой обход он
+        # выучил и после какого вердикта (отпечаток → {"profile", "verdict", "ts"}) и до каких
+        # пор он «нестабилен по ТСПУ» (отпечаток → time.time()). Сколько проверок подряд сервер
+        # на дроблении прошёл (для возврата без него) — только в памяти.
+        self._escalations: dict[str, list[float]] = {}
+        self._escalated: dict[str, dict] = {}
+        self._unstable: dict[str, float] = {}
+        self._calm: dict[str, int] = {}
+        self._calm_seen: dict[str, float] = {}
+        # Мёртвый участник проверяется собственной пробой раз за «смерть» (тег → dead_since,
+        # для которого проверка уже была): по вердикту решают, переводить ли его на дробление.
+        self._dead_scanned: dict[str, float] = {}
         self._load_profiles()
         # sing-box: сколько шагов подряд не отвечает, откатывали ли его на last-good, и
         # ушли ли серверы на Xray, потому что он не поднимается (когда пробовать снова).
@@ -352,6 +452,23 @@ class Daemon:
         self._singbox_retry_at = 0.0
         self._singbox_alive = True
         self._singbox_version_cache: tuple[float, str] | None = None
+        # Обновление ядер (cores.py): фоновая проверка выпусков на GitHub, когда смотреть
+        # снова, просьба панели «проверить сейчас», для каких ядер уже запущен возврат в сутки
+        # наблюдения (один раз на запуск демона) и меняет ли ядро сейчас служба xgw-core.
+        self._cores_thread: threading.Thread | None = None
+        # Фоновые проверки сети (ТЗ R4): поток, когда проверять резолверы и DERP, итоги потока
+        # (их забирает шаг watchdog: база и события — из его потока) и счётчики DERP.
+        self._netmon_thread: threading.Thread | None = None
+        self._resolvers_next = clock() + NETMON_FIRST
+        self._derp_next = clock() + NETMON_FIRST
+        self._netmon_result: dict = {}
+        self._derp_fails = 0
+        self._derp_oks = 0
+        self._derp_note = ""
+        self._cores_next = clock() + CORES_FIRST_CHECK
+        self._cores_asked = False
+        self._core_back_asked: set[str] = set()
+        self.core_job = False
         # Не отвечает сам probe.url (текст предупреждения); пусто — отвечает.
         self.probe_target = ""
         self.next_target_check = 0.0
@@ -374,6 +491,11 @@ class Daemon:
         self.reserve_round_at = float("-inf")  # когда началась последняя (time.time())
         self._urgent_round_for: float | None = None  # для какого ALL_DEAD (state_since)
         self._reserve_note = ""
+        # DEGRADED, а заменить мёртвого участника некем (_stranded): о каком классе и каких
+        # участниках уже записано событие. Предупреждение «лимитированные в работе из-за
+        # приоритета» (status.class_warning): записано ли событие.
+        self._stranded_for = ""
+        self._class_warning = ""
         # Какой резервный нёс трафик, когда шлюз перешёл в RESERVE (« «имя» (x1)»): к
         # возврату с него состав мог смениться, а сообщить нужно о том, что работал.
         self._reserve_used = ""
@@ -393,16 +515,33 @@ class Daemon:
         self.main: dict | None = self._load_main()
         self.speed_queue: deque[str] = deque()
         self._compare_due = False
+        # Контроль скорости участников (0.1.18, ТЗ R5–R8; watch/guard.py): пассивные оценки,
+        # подозрения, идущий поиск замены, пауза после «глобальной просадки», трафик поисков
+        # за сутки. Собственный трафик шлюза через участников (замеры, пробы) с прошлой
+        # пассивной оценки — его не считать трафиком клиентов. Короткие (повторные) замеры.
+        self.guard = speedguard.Guard(cfg, wall)
+        self.guard.load_spent(self.store.get_meta(speedguard.META_SPENT))
+        self._own_by_tag: dict[str, int] = {}
+        self._speed_small: set[str] = set()
+        self._passive_saved = ""
+        self._guard_note = ""
         self._speed_asked = False
         # Замер по кнопке: эти probe-теги замеряются и при занятом канале; total/done —
         # сколько серверов в этом заходе и сколько уже замерено (прогресс в панели).
         self._speed_forced: set[str] = set()
+        # Кнопка у одного сервера (пожелание заказчика 24.10.2026): теги или отпечатки,
+        # ждущие шага watchdog, и probe-теги, которые замеряются, даже если сервер в фоновый
+        # замер не попал бы (запасной без свежего скана, участник, которого ядро сочло мёртвым).
+        self._speed_one: set[str] = set()
+        self._speed_any: set[str] = set()
         self.speed_total = 0
         self.speed_done = 0
         # С какого момента очередь замеров ждёт, пока канал освободится (monotonic; до
         # опустевшей очереди), и ждала ли она на этом шаге.
         self._speed_deferred_since: float | None = None
         self._speed_waiting = False
+        # С какого момента фоновый замер ждёт шага без скана (SPEED_SCAN_WAIT).
+        self._speed_scanned_since: float | None = None
         # Запасной, переведённый в работу, чтобы стать основным: {"key", "name", "since",
         # "was"}; _lost_main — страна и подписка отказавшего основного, для замены.
         self._promoted: dict | None = None
@@ -419,7 +558,7 @@ class Daemon:
         self._own_traffic = 0  # сколько из них — собственные замеры скорости
         self._busy = False
         self._scanned = False  # на этом шаге шёл скан: замер скорости подождёт
-        self._provider_ip: tuple[float, str] | None = None
+        self._provider_ips: dict[str, tuple[float, str]] = {}  # хост wan_check → (clock, адрес)
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
@@ -614,14 +753,25 @@ class Daemon:
         self._sub_failing_since = previous._sub_failing_since
         self._sub_alerted = previous._sub_alerted
         self._reserve_note = previous._reserve_note
+        self._stranded_for = previous._stranded_for
+        self._class_warning = previous._class_warning
         self.main = previous.main
         self.speed_queue = deque(previous.speed_queue)
         self._speed_forced = set(previous._speed_forced)
+        self._speed_one = set(previous._speed_one)
+        self._speed_any = set(previous._speed_any)
         self.speed_total, self.speed_done = previous.speed_total, previous.speed_done
         self._speed_deferred_since = previous._speed_deferred_since
         self._speed_waiting = previous._speed_waiting
+        self._speed_scanned_since = previous._speed_scanned_since
         self._promoted, self._lost_main = previous._promoted, previous._lost_main
         self._compare_due = previous._compare_due
+        self.guard = previous.guard
+        self.guard.cfg = self.cfg
+        self._own_by_tag = dict(previous._own_by_tag)
+        self._speed_small = set(previous._speed_small)
+        self._passive_saved = previous._passive_saved
+        self._guard_note = previous._guard_note
         self.main_cooldown = dict(previous.main_cooldown)
         self._main_failed_at = previous._main_failed_at
         self._main_suspended = previous._main_suspended
@@ -631,14 +781,33 @@ class Daemon:
         self._profile_trial = dict(previous._profile_trial)
         self._profile_wanted = dict(previous._profile_wanted)
         self._trial_saved = dict(previous._trial_saved)
+        self._escalations = {key: list(value) for key, value in previous._escalations.items()}
+        self._escalated = dict(previous._escalated)
+        self._unstable = dict(previous._unstable)
+        self._calm = dict(previous._calm)
+        self._calm_seen = dict(previous._calm_seen)
+        self._dead_scanned = dict(previous._dead_scanned)
         self._singbox_down = previous._singbox_down
         self._singbox_rolled_back = previous._singbox_rolled_back
         self._singbox_failed = previous._singbox_failed
         self._singbox_retry_at = previous._singbox_retry_at
+        self._cores_thread = previous._cores_thread
+        self._netmon_thread = previous._netmon_thread
+        self._resolvers_next = previous._resolvers_next
+        self._derp_next = previous._derp_next
+        self._netmon_result = previous._netmon_result
+        self._derp_fails, self._derp_oks = previous._derp_fails, previous._derp_oks
+        self._derp_note = previous._derp_note
+        self._cores_next = previous._cores_next
+        self._cores_asked = previous._cores_asked
+        self._core_back_asked = set(previous._core_back_asked)
         self._traffic = previous._traffic
         self.lifecycle = previous.lifecycle
         self._downlinks = dict(previous._downlinks)
         self._marks = previous._marks
+        for url, state in previous.hosts.states.items():
+            if url in self.hosts.states:
+                self.hosts.states[url] = state
         if previous.cfg.probe.url != self.cfg.probe.url:
             self.next_target_check = 0.0  # адрес пробы сменили — проверить новый сразу
 
@@ -652,9 +821,32 @@ class Daemon:
         self._speed_asked = True
         self.poke.set()
 
+    def request_speed_one(self, key: str) -> None:
+        """Панель, приложение: замерить скорость одного сервера сейчас (тег или отпечаток),
+        без общего замера всех. Сервер встаёт первым в очередь замеров."""
+        self._speed_one.add(key)
+        self.poke.set()
+
+    def request_core_check(self) -> None:
+        """Панель: проверить выпуски ядер на GitHub сейчас."""
+        self._cores_asked = True
+        self.poke.set()
+
+    @property
+    def cores_pending(self) -> bool:
+        thread = self._cores_thread
+        return self._cores_asked or (thread is not None and thread.is_alive())
+
     @property
     def speed_pending(self) -> bool:
-        return self._speed_asked or bool(self.speed_queue)
+        """Идёт общий замер (кнопка «Замерить скорость») — без замеров одного сервера: они
+        видны у своих строк, а кнопка общего замера из-за них занятой не выглядит."""
+        return self._speed_asked or bool(set(self.speed_queue) - self._speed_any)
+
+    def speed_one_pending(self) -> list[str]:
+        """Кнопки у серверов: что ещё ждёт замера (теги и отпечатки из запроса и probe-теги
+        в очереди)."""
+        return sorted(self._speed_one | (set(self.speed_queue) & self._speed_any))
 
     @property
     def refresh_pending(self) -> bool:
@@ -699,6 +891,8 @@ class Daemon:
         decision = self.machine.update(signals)
         state = decision.state
         self.action = decision.action
+        if state is State.DEGRADED:
+            self.action = self._degraded_action(self._stranded(view))
         if state is State.RESERVE:
             if previous is not State.RESERVE:
                 self._reserve_used = self._reserve_label(applied)
@@ -740,9 +934,12 @@ class Daemon:
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False
-        if state is State.XRAY_DOWN:
+        # Служба xgw-core меняет ядро и сама его перезапускает (и при сбое возвращает
+        # прежнее): откат конфига и перезапуски watchdog ей бы только помешали.
+        self.core_job = cores.job_active(self.paths, self.wall())
+        if state is State.XRAY_DOWN and not self.core_job:
             changed = self._handle_xray_down()
-        else:
+        elif state is not State.XRAY_DOWN:
             self.down_ticks = 0
             self.rolled_back = False
         if not self.leak:
@@ -763,7 +960,7 @@ class Daemon:
             self._write_status(view, observatory, signals.xray_ok)
             return state
 
-        if not changed and state is not State.XRAY_DOWN:
+        if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._singbox_step(now)
         if (
             not changed and self.inventory is not None and not self._singbox_failed
@@ -848,6 +1045,7 @@ class Daemon:
             if not changed:
                 changed = self._reserve_step(view, applied, state, now)
             if not changed:
+                self._member_profiles(view, observatory or {})
                 changed = self._profile_step(view)
 
         if not self.scan_queue or not probing:
@@ -860,6 +1058,9 @@ class Daemon:
             return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
+        if state is not State.WAN_DOWN:
+            self._cores_step()
+            self._netmon_step(signals.xray_ok)
         self._write_status(view, observatory, signals.xray_ok)
         return state
 
@@ -1041,39 +1242,71 @@ class Daemon:
         return tag
 
     def _check_e2e(self) -> bool:
-        """Сквозная загрузка probe.url через http-in с детектором «тишины».
+        """Сквозная загрузка проверочного хоста через http-in с детектором «тишины».
+
+        Хосты — по кругу (watch/hosts.py). Хост не ответил — та же загрузка другим хостом:
+        ответил он — значит, не отвечает хост, а туннель жив; хост уходит на паузу (событие),
+        проверка засчитана. Не ответили оба — проверка не прошла.
 
         Пока трафик несёт резервный выход (reserve_mode), запрос дешёвый — scan.cheap_url:
         каждые interval_s по 57 КБ через лимитированный сервер тратили бы его квоту, а
         вопрос один — идёт ли через него трафик. Работает ли сам probe.url, тогда решает
         _probe_target по пробам участников."""
-        url = scan.cheap_url(self.cfg) if self.reserve_mode else self.cfg.probe.url
-        result = checks.http_get_via_proxy(
+        if self.reserve_mode:
+            result = self._e2e_get(scan.cheap_url(self.cfg))
+            if not result.ok:
+                self._e2e_bytes = result.downloaded
+                self.log.info("сквозная проверка не прошла: %s", result.error)
+            return result.ok
+        url = self.hosts.next(stream="e2e")
+        result = self._e2e_get(url)
+        if not result.ok:
+            other = self.hosts.next(avoid=url, stream="e2e")
+            second = self._e2e_get(other) if other != url else None
+            if second is None or not second.ok:
+                downloaded = result.downloaded + (second.downloaded if second else 0)
+                self._e2e_bytes = downloaded  # их не считать трафиком LAN (_late_under_load)
+                self.log.info("сквозная проверка не прошла: %s", result.error)
+                return False
+            self._host_failed(url, result.error)
+            url, result = other, second
+        self.hosts.answered(url)
+        if url == self.cfg.probe.url:
+            # Размер тела — мера расхода трафика на пробы (status.probe_budget).
+            try:
+                status.remember_probe_size(self.store, self.cfg.probe.url, result.downloaded)
+            except Exception as exc:  # оценка трафика не важнее самой проверки
+                self.log.debug("размер пробы не записан: %s", exc)
+        return True
+
+    def _e2e_get(self, url: str) -> checks.DownloadResult:
+        return checks.http_get_via_proxy(
             "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0,
             max_total=30.0, user_agent=self.cfg.probe.user_agent,
         )
-        if not result.ok:
-            self._e2e_bytes = result.downloaded  # их не считать трафиком LAN (_late_under_load)
-            self.log.info("сквозная проверка не прошла: %s", result.error)
-            return False
-        if url != self.cfg.probe.url:
-            return True
-        # Размер тела — мера расхода трафика на пробы (status.probe_budget).
-        try:
-            status.remember_probe_size(self.store, self.cfg.probe.url, result.downloaded)
-        except Exception as exc:  # оценка трафика не важнее самой проверки
-            self.log.debug("размер пробы не записан: %s", exc)
-        return True
+
+    def _host_failed(self, url: str, why: str) -> None:
+        """Проверочный хост не ответил, а другой ответил: пауза и событие (одно на паузу)."""
+        text = self.hosts.failed(url, why)
+        if text:
+            self.notifier.event("probe", text)
 
     def _check_provider(self) -> bool:
-        """TCP-подключение к wan_check напрямую, сокетом с меткой mark_bypass."""
-        host, _, port_text = self.cfg.watchdog.wan_check.rpartition(":")
-        if not host or not port_text.isdigit():
+        """TCP-подключение напрямую, сокетом с меткой mark_bypass, к wan_check, а не ответил
+        он — к адресам watchdog.wan_checks по очереди (0.1.18, ТЗ R3): «нет провайдера» —
+        только когда не отвечает ни один."""
+        targets = [
+            entry for entry in (self.cfg.watchdog.wan_check, *self.cfg.watchdog.wan_checks)
+            if entry.rpartition(":")[0] and entry.rpartition(":")[2].isdigit()
+        ]
+        if not targets:
             return True  # проверять нечем — провайдера считаем доступным
-        address = self._provider_address(host)
-        if address is None:
-            return False
-        return checks.tcp_check(address, int(port_text), mark=self.mark)
+        for entry in targets:
+            host, _, port_text = entry.rpartition(":")
+            address = self._provider_address(host)
+            if address is not None and checks.tcp_check(address, int(port_text), mark=self.mark):
+                return True
+        return False
 
     def _provider_address(self, host: str) -> str | None:
         with contextlib.suppress(ValueError):
@@ -1082,15 +1315,16 @@ class Daemon:
         if self.mark is None:
             return host  # без метки системный резолвер и так ходит напрямую
         now = self.clock()
-        if self._provider_ip and now - self._provider_ip[0] < PROVIDER_DNS_TTL:
-            return self._provider_ip[1]
+        cached = self._provider_ips.get(host)
+        if cached and now - cached[0] < PROVIDER_DNS_TTL:
+            return cached[1]
         try:
             # Свой резолвер с меткой: системный ходит через перехват и при
             # упавшем Xray не ответит — WAN_DOWN получился бы вместо XRAY_DOWN.
-            address = fetch.resolve_domain(host, self.cfg.dns.bootstrap, mark=self.mark)[0]
+            address = fetch.resolve_domain(host, self.cfg.dns.resolvers, mark=self.mark)[0]
         except fetch.ResolveError:
-            return self._provider_ip[1] if self._provider_ip else None
-        self._provider_ip = (now, address)
+            return cached[1] if cached else None
+        self._provider_ips[host] = (now, address)
         return address
 
     def _check_leak(self) -> str | None:
@@ -1140,16 +1374,21 @@ class Daemon:
         лимитированный резервный, хотя участники живы.
         """
         reachable = signals.xray_ok and signals.provider_ok
-        if reachable and signals.e2e_ok and not self.reserve_mode:
-            self._target_answers(now)
-            # И после перезапуска демона: запись о запасном адресе могла остаться с прошлого раза.
-            self._observatory_fallback(False)
-            return signals
         dead = signals.total_members - signals.alive_members - signals.unknown_members
-        suspect = reachable and (self.reserve_mode or (not signals.e2e_ok and (
-            signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
-            or (signals.total_members > 0 and dead >= signals.total_members)
-        )))
+        all_dead = signals.total_members > 0 and dead >= signals.total_members
+        # Сквозная проверка ходит по разным хостам (0.1.18) и может пройти, когда ядро, которое
+        # пробует один probe.url, сочло мёртвыми всех участников: это тоже повод проверить адрес.
+        if reachable and signals.e2e_ok and not self.reserve_mode and not all_dead:
+            self._target_answers(now)
+            # И после перезапуска демона: запись о запасном адресе могла остаться с прошлого
+            # раза. Сквозная проверка проходит и через другие хосты (0.1.18) — ядро возвращается
+            # на probe.url, только когда он сам снова ответил.
+            if self._probe_url_answers():
+                self._observatory_fallback(False)
+            return signals
+        suspect = reachable and (self.reserve_mode or all_dead or (
+            not signals.e2e_ok and signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
+        ))
         if suspect and now >= self.next_target_check and not self.stopping:
             self.next_target_check = now + PROBE_TARGET_RECHECK
             diagnosis = self._diagnose_target(view, applied)
@@ -1158,6 +1397,21 @@ class Daemon:
                 # не говорит.
                 self.next_target_check = 0.0
                 return signals
+            alternate = self._alternate_host(view, applied) if diagnosis.down else ""
+            if alternate:
+                # Не отвечает только probe.url, а другой проверочный хост через те же серверы
+                # открывается: это наблюдение, а не состояние (ТЗ R3) — ядро пробует серверы по
+                # этому хосту, замена серверов идёт как обычно.
+                self._host_failed(self.cfg.probe.url, diagnosis.signature or "не отвечает")
+                self._target_answers(now)
+                self._observatory_fallback(True, alternate)
+                # «Мёртвыми» участников сделали пробы ядра по неотвечающему probe.url: на этом
+                # шаге их состояние не известно (ядро сейчас перейдёт на другой хост), и ни
+                # ALL_DEAD, ни отсчёта rotate_after_min из-за адреса проверки быть не должно.
+                self.dead_since.clear()
+                return dataclasses.replace(
+                    signals, alive_members=0, unknown_members=signals.total_members,
+                )
             if diagnosis.down and diagnosis.text != self.probe_target:
                 self.log.warning("%s", diagnosis.text)
                 # Вердикты первой проверки сняты, пока адрес не отвечал: они ни о чём.
@@ -1185,10 +1439,11 @@ class Daemon:
             notify=self.machine.state is State.PROBE_TARGET_UNREACHABLE,
         )
 
-    def _observatory_fallback(self, on: bool) -> None:
-        """Переводит пробы ядра на запасной адрес (on) или возвращает их на probe.url."""
+    def _observatory_fallback(self, on: bool, url: str = "") -> None:
+        """Переводит пробы ядра на запасной адрес (on; url — проверочный хост, который только
+        что ответил через серверы) или возвращает их на probe.url."""
         try:
-            switched = target.use_fallback(self.cfg, self.paths, on)
+            switched = target.use_fallback(self.cfg, self.paths, on, url)
         except OSError as exc:
             self.log.error("адрес проб ядра не переключён: %s", exc)
             return
@@ -1197,12 +1452,38 @@ class Daemon:
         self._urgent_rebuild = "смена адреса проб ядра"
         if on:
             text = (
-                f"ядро пробует серверы по {target.fallback_target(self.cfg)}, пока probe.url "
-                "не ответит: иначе оно сочло бы мёртвыми всех участников"
+                f"ядро пробует серверы по {target.observatory_url(self.cfg, self.paths)}, пока "
+                "probe.url не ответит: иначе оно сочло бы мёртвыми всех участников"
             )
         else:
             text = "ядро снова пробует серверы по probe.url"
         self.notifier.event("probe", text)  # о самой причине уведомляет PROBE_TARGET_UNREACHABLE
+
+    def _probe_url_answers(self) -> bool:
+        """probe.url сам отвечал после того, как ядро перевели на запасной адрес (или
+        запасного нет вовсе)."""
+        since = target.fallback_since(self.paths)
+        if since is None:
+            return True
+        return self.hosts.states[self.cfg.probe.url].last_ok >= since
+
+    def _alternate_host(self, view: list[NodeInfo], applied: dict) -> str:
+        """Другой проверочный хост, который открывается через серверы в работе, пока probe.url
+        не отвечает; пусто — не открывается ни один (тогда не отвечают все хосты)."""
+        others = [url for url in probehosts.all_urls(self.cfg) if url != self.cfg.probe.url]
+        if not others:
+            return ""
+        password, _ports = builder.probe_state(applied)
+        members = [info for info in view if info.role == "proxy" and info.probe_port]
+        if not password or not members:
+            return ""
+        for url in others:
+            if self.stopping:
+                return ""
+            if target.answers_via(self.cfg, members, password, url, user=builder.PROBE_USER):
+                self.hosts.answered(url)
+                return url
+        return ""
 
     def _containers_appeared(self, applied: dict) -> None:
         """На машине появился Docker, а Xray запущен без inbound'а TUN: контейнерам он
@@ -1253,13 +1534,17 @@ class Daemon:
     # --- действия --------------------------------------------------------------
 
     def _handle_xray_down(self) -> bool:
-        """systemd перезапускает службу сам; после двух неудач — откат на last-good."""
+        """systemd перезапускает службу сам; после двух неудач — откат на last-good. Идут
+        сутки наблюдения после обновления Xray, а он не отвечает и после отката — возврат
+        прежней версии (cores.py)."""
         self.down_ticks += 1
         if not self.service.is_active():
             try:
                 self.service.start()
             except XrayServiceError as exc:
                 self.log.error("Xray не запускается: %s", exc)
+        if self.rolled_back and self.down_ticks >= ROLLBACK_AFTER + CORE_BACK_AFTER:
+            self._core_back("xray", "Xray не отвечает и после отката конфига на last-good")
         if self.down_ticks < ROLLBACK_AFTER or self.rolled_back:
             return False
         self.rolled_back = True
@@ -1690,10 +1975,34 @@ class Daemon:
 
     def _scan_url(self, info: NodeInfo) -> str | None:
         """Чем проверять узел: запасной лимитированной подписки — дешёвым запросом
-        (scan.cheap_url), остальные — probe.url (None)."""
+        (scan.cheap_url), остальные — проверочным хостом (None: _probe_scan берёт его по
+        кругу)."""
         if info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0:
             return scan.cheap_url(self.cfg)
         return None
+
+    def _probe_scan(self, info: NodeInfo, password: str) -> scan.ScanResult:
+        """Собственная проба сервера. Хост — по кругу (watch/hosts.py); хост ответил ошибкой
+        HTTP (403, 404, 5xx) — та же проба другим хостом: ответил тот — пауза хосту, вердикт
+        по второй пробе. Обрыв и «заморозку» хост не объясняет — это вердикт о сервере."""
+        cheap = self._scan_url(info)
+        if cheap is not None:
+            return self._scan(info, password, cheap)
+        url = self.hosts.next(stream="scan")
+        result = self._scan(info, password, url)
+        if result.verdict in REPLACEABLE_VERDICTS:
+            self.hosts.answered(url)
+            return result
+        if result.kind == "cancelled" or not probehosts.host_specific(result.kind, result.status):
+            return result
+        other = self.hosts.next(avoid=url, stream="scan")
+        if other == url:
+            return result
+        second = self._scan(info, password, other)
+        if second.verdict in REPLACEABLE_VERDICTS:
+            self._host_failed(url, result.error)
+            self.hosts.answered(other)
+        return second
 
     def _queue_members(self, view: list[NodeInfo]) -> None:
         """Первая проверка участников собственной пробой шлюза — в начало очереди.
@@ -1707,7 +2016,14 @@ class Daemon:
         for info in reversed([item for item in view if item.role == "proxy"]):
             if len(info.fingerprint) < 8:
                 continue  # узел не сопоставлен с подпиской — заменить его всё равно нельзя
-            if info.fingerprint not in self.vetted and info.probe_tag not in queued:
+            dead_at = self.dead_since.get(info.tag)
+            # Ядро сочло участника мёртвым — своя проба скажет, «заморозка» это или отказ: тогда
+            # его сначала проверяют с дроблением, а не меняют (ТЗ R1). Раз за «смерть».
+            recheck = (
+                dead_at is not None and self._dead_scanned.get(info.tag) != dead_at
+                and bool(self._escalation_steps(info, "STALL_BEFORE_BODY"))
+            )
+            if (info.fingerprint not in self.vetted or recheck) and info.probe_tag not in queued:
                 self.scan_queue.appendleft(info.probe_tag)
 
     def _scan_step(self, view: list[NodeInfo], applied: dict) -> None:
@@ -1723,7 +2039,7 @@ class Daemon:
             if info is None or not password:
                 continue
             self._scanned = True
-            result = self._scan(info, password, self._scan_url(info))
+            result = self._probe_scan(info, password)
             if result.kind == "cancelled":
                 self.scan_queue.appendleft(probe_tag)  # скан не состоялся
                 break
@@ -1734,9 +2050,12 @@ class Daemon:
             self._profile_note(info, result.verdict)
             if info.role == "proxy":
                 self.vetted.add(info.fingerprint)
-                if result.verdict in REPLACE_NOW_VERDICTS:
+                if info.tag in self.dead_since:
+                    self._dead_scanned[info.tag] = self.dead_since[info.tag]
+                held = self._member_note(info, result.verdict)
+                if result.verdict in REPLACE_NOW_VERDICTS and not held:
                     self.bad_members[info.tag] = result.verdict
-                else:
+                elif result.verdict in REPLACEABLE_VERDICTS or held:
                     self.bad_members.pop(info.tag, None)
             self.log.info(
                 "скан %s: %s, %d байт за %.1f с", info.tag, result.verdict,
@@ -1767,7 +2086,11 @@ class Daemon:
             if info.role == "spare" and info.fingerprint in by_fingerprint
             and info.fingerprint not in self.home_exits  # тоже выходит в домашнюю страну
             and self._klass(info.fingerprint, prices) == tier
+            and not self._is_unstable(info.fingerprint)
         ]
+        # Участник на пробе дробления (ТЗ R1) не меняется, пока проба не кончится.
+        held = {info.tag for info in members if self._escalating(info.fingerprint)}
+        dead_since = {tag: since for tag, since in self.dead_since.items() if tag not in held}
         scans = self._fresh_scans()
         verdicts = {i.tag: scans[i.probe_tag]["verdict"] for i, _ in pairs if i.probe_tag in scans}
         seconds = {i.tag: scans[i.probe_tag]["seconds"] for i, _ in pairs if i.probe_tag in scans}
@@ -1788,13 +2111,13 @@ class Daemon:
             if (candidate := self._candidate(info, {})).mbps is not None
         }
         rotation = plan_rotation(
-            alive, self.dead_since, verdicts, seconds, members, pairs, cfg, self.wall(),
-            urgent=set(self.bad_members) | set(home), origins=origins, speeds=speeds,
+            alive, dead_since, verdicts, seconds, members, pairs, cfg, self.wall(),
+            urgent=(set(self.bad_members) | set(home)) - held, origins=origins, speeds=speeds,
         )
         if rotation is None:
             overdue = cfg.filters.rotate_after_min * 60.0
-            waiting = bool(self.bad_members or home) or any(
-                self.wall() - since >= overdue for since in self.dead_since.values()
+            waiting = bool(set(self.bad_members) - held or home) or any(
+                self.wall() - since >= overdue for since in dead_since.values()
             )
             if waiting and pairs and not self.scan_queue and now >= self.next_rescan:
                 self._queue_scan(view, now)  # менять пора, а свежих сканов нет
@@ -1840,6 +2163,67 @@ class Daemon:
             if entry["ts"] >= fresh_after and tag not in trial
         }
 
+    def _stranded(self, view: list[NodeInfo]) -> cost.Klass | None:
+        """Класс участников, если мёртвого участника заменить некем: среди запасных нет ни
+        одного сервера этого класса. _rotate меняет только внутри класса, а на класс хуже
+        _switch_tier переходит, лишь когда живых участников нет, — так что DEGRADED держится,
+        пока мёртвый не оживёт (испытание 24.10.2026: четыре сервера «высокий» x10, все в
+        работе). None — есть кем, мёртвых нет или состав не сопоставлен с подпиской."""
+        members = [info for info in view if info.role == "proxy"]
+        if self.inventory is None or not members or not set(self.dead_since) & {
+            info.tag for info in members
+        }:
+            return None
+        known = {node.fingerprint for node in self.inventory.nodes}
+        if any(info.fingerprint not in known for info in members):
+            return None
+        prices = self._prices()
+        tier = self._tier(view)
+        if any(
+            info.role == "spare" and info.fingerprint in known
+            and info.fingerprint not in self.home_exits
+            and self._klass(info.fingerprint, prices) == tier
+            for info in view
+        ):
+            return None
+        return tier
+
+    def _degraded_action(self, tier: cost.Klass | None) -> str:
+        """Текст DEGRADED; tier — класс, который нашёл _stranded (None — заменить есть кем)."""
+        if tier is not None:
+            return stranded_action(tier, bool(self.cfg.managed.priority))
+        if self.inventory is None:
+            # Демон только запущен, подписка ещё не получена: есть ли кем заменить, не
+            # известно — «замена на запасные» могла бы оказаться неправдой.
+            return "часть серверов недоступна"
+        return action_text(State.DEGRADED)
+
+    def _stranded_step(self, view: list[NodeInfo], state: State) -> str:
+        """Текст DEGRADED — по составу на конец шага (подписка могла обновиться), и одно
+        событие на каждый новый набор мёртвых, которых заменить некем. Возвращает пояснение
+        для панели; пусто — замена возможна или состояние другое."""
+        if not view:
+            return ""  # конфига ещё нет: судить не по чему, отметку не трогаем
+        tier = self._stranded(view) if state is State.DEGRADED else None
+        if state is State.DEGRADED:
+            self.action = self._degraded_action(tier)
+        if tier is None:
+            self._stranded_for = ""
+            return ""
+        dead = sorted(
+            info.tag for info in view if info.role == "proxy" and info.tag in self.dead_since
+        )
+        names = [
+            node.name if (node := self._node(info)) is not None else info.tag
+            for info in view if info.tag in dead
+        ]
+        note = stranded_note(names, tier, bool(self.cfg.managed.priority))
+        key = f"{tier.rank}:{tier.cost}:{','.join(dead)}"
+        if key != self._stranded_for:
+            self._stranded_for = key
+            self.notifier.event("rotation", note)
+        return note
+
     # --- профили обхода --------------------------------------------------------
 
     def _bridged_letters(self, fingerprint: str) -> set[str]:
@@ -1849,7 +2233,7 @@ class Daemon:
 
     def _profile_event(self, old: str, new: str, text: str) -> None:
         # События про дробление в Xray (0.1.11) — прежнего вида; остальные — «профиль».
-        xray_only = {old, new} <= {profiling.XRAY_DEFAULT, profiling.XRAY_FRAGMENT}
+        xray_only = {old, new} <= {profiling.XRAY_DEFAULT, *profiling.XRAY_FRAGMENTS}
         self.notifier.event("fragment" if xray_only else "profile", text)
 
     def _profile_note(self, info: NodeInfo, verdict: str) -> None:
@@ -1869,7 +2253,7 @@ class Daemon:
         avail = profiling.available(node, self.cfg, self._bridged_letters(fingerprint))
         default = profiling.base(self.cfg, avail)
         good = verdict in REPLACEABLE_VERDICTS
-        name = f"«{node.name}»"
+        name = _server_text(node.name, info.tag)
         trial = self._profile_trial.get(fingerprint)
         if trial is not None:
             if info.profile != trial.profile:
@@ -1881,6 +2265,7 @@ class Daemon:
             if good:
                 del self._profile_trial[fingerprint]
                 self._forget_trial(fingerprint)
+                self._learned(fingerprint, trial)
                 self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
                 return
             # Следующая ступень и возврат меняют конфиг: запись о пробе в базе остаётся до их
@@ -1888,7 +2273,7 @@ class Daemon:
             if trial.rest:
                 following = trial.rest[0]
                 self._profile_wanted[fingerprint] = ProfileWish(
-                    following, True, trial.rest[1:], trial.prev,
+                    following, True, trial.rest[1:], trial.prev, verdict=trial.verdict,
                 )
                 self._profile_event(
                     trial.profile, following,
@@ -1903,11 +2288,12 @@ class Daemon:
             return
         last = self._profile_switched.get(fingerprint)
         heavy = info.profile != default
+        self._calm[fingerprint] = self._calm.get(fingerprint, 0) + 1 if good else 0
         if good and heavy:
             if last is None:
                 self._profile_switched[fingerprint] = now  # отсчёт до перепроверки — с сейчас
                 self._save_profiles()
-            elif now - last >= PROFILE_RECHECK:
+            elif self._calm_due(fingerprint, info.profile, last):
                 self._profile_wanted[fingerprint] = ProfileWish(
                     default, True, [], info.profile, recheck=True,
                 )
@@ -1921,9 +2307,9 @@ class Daemon:
                 # ядре остаётся, как в 0.1.11).
                 steps = [step for step in steps
                          if profiling.core_of(step) == profiling.core_of(default)]
-            if steps:
+            if steps and self._may_escalate(fingerprint, name):
                 self._profile_wanted[fingerprint] = ProfileWish(
-                    steps[0], True, steps[1:], info.profile,
+                    steps[0], True, steps[1:], info.profile, verdict=verdict,
                 )
 
     def _profile_step(self, view: list[NodeInfo]) -> bool:
@@ -1933,7 +2319,10 @@ class Daemon:
         wanted, self._profile_wanted = self._profile_wanted, {}
         if not wanted or self.inventory is None or self.cfg.fragment.mode != "auto":
             return False
-        by_fingerprint = {info.fingerprint: info for info in view if info.role == "spare"}
+        # Запасные и — для проб дробления на месте (ТЗ R1) — участники.
+        by_fingerprint = {
+            info.fingerprint: info for info in view if info.role in ("spare", "proxy")
+        }
         wanted = {key: wish for key, wish in wanted.items() if key in by_fingerprint}
         changes = {
             key: wish.profile for key, wish in wanted.items()
@@ -1942,8 +2331,11 @@ class Daemon:
         if not changes:
             return False
         names = ", ".join(sorted(by_fingerprint[key].tag for key in wanted))
+        # Проба дробления у участника — сразу: он не отвечает, и трафик ждёт (через API ядра,
+        # без перезапуска Xray).
+        urgent = any(wish.escalate for wish in wanted.values())
         changed = self._rebuild(
-            None, urgent=False, reason=f"профиль обхода ({names})", profiles=changes,
+            None, urgent=urgent, reason=f"профиль обхода ({names})", profiles=changes,
         )
         applied = engine.read_json(self.paths.xray_config_file)
         now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
@@ -1958,16 +2350,200 @@ class Daemon:
                 info = by_fingerprint[key]
                 self._profile_trial[key] = ProfileTrial(
                     wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
+                    wish.verdict, wish.escalate,
                 )
                 self._trial_saved[key] = {
                     "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
-                    "recheck": wish.recheck,
+                    "recheck": wish.recheck, "verdict": wish.verdict, "escalate": wish.escalate,
                 }
                 self._queue_first(info.probe_tag)
             else:
                 self._trial_saved.pop(key, None)  # возврат применён — проба окончена
         self._save_profiles()
         return changed
+
+    # --- эскалация у серверов в работе (ТЗ R1) -------------------------------------
+
+    def _escalation_steps(self, info: NodeInfo, verdict: str) -> list[str]:
+        """Ступени дробления в Xray, которые стоит проверить участнику с таким вердиктом
+        (лестница profiles.ladder без sing-box: ядро у сервера в работе на ходу не меняется).
+        Пусто — пробовать нечего: дробление выключено, сервер не на Xray, не TLS/REALITY."""
+        if self.cfg.fragment.mode != "auto" or self.inventory is None:
+            return []
+        if profiling.core_of(info.profile) != "xray":
+            return []
+        node = self._node(info)
+        if node is None:
+            return []
+        avail = profiling.available(node, self.cfg, ())
+        default = profiling.base(self.cfg, avail)
+        return [
+            step for step in profiling.ladder(verdict, info.profile, default, avail)
+            if profiling.core_of(step) == "xray" and step != info.profile
+            and (step in profiling.XRAY_FRAGMENTS or info.profile in profiling.XRAY_FRAGMENTS)
+        ]
+
+    def _escalating(self, fingerprint: str) -> bool:
+        """Сервер в работе сейчас на пробе дробления (или её ждёт) — замена подождёт."""
+        trial = self._profile_trial.get(fingerprint)
+        wish = self._profile_wanted.get(fingerprint)
+        return bool((trial is not None and trial.escalate) or (wish is not None and wish.escalate))
+
+    def _is_unstable(self, fingerprint: str) -> bool:
+        return self._unstable.get(fingerprint, 0.0) > self.wall()
+
+    def _may_escalate(self, fingerprint: str, server: str) -> bool:
+        """Можно ли перевести сервер на тяжёлый профиль ещё раз: не больше
+        fragment.escalations переводов за fragment.escalation_hours. Иначе он «нестабилен по
+        ТСПУ» до конца этого окна — в работу шлюз его сам не ставит (событие одно на отметку).
+        server — сервер в тексте события (_server_text)."""
+        now = self.wall()
+        window = self.cfg.fragment.escalation_hours * 3600.0
+        times = [when for when in self._escalations.get(fingerprint, []) if now - when < window]
+        if len(times) < self.cfg.fragment.escalations:
+            self._escalations[fingerprint] = [*times, now]
+            self._save_profiles()
+            return True
+        if not self._is_unstable(fingerprint):
+            until = min(times) + window
+            self._unstable[fingerprint] = until
+            self._save_profiles()
+            clock = datetime.datetime.fromtimestamp(until).strftime("%H:%M")
+            self.notifier.event(
+                "profile",
+                f"{server} нестабилен по ТСПУ: {len(times)} перевода на обход за "
+                f"{self.cfg.fragment.escalation_hours} ч — в работу шлюз его сам не ставит до "
+                f"{clock}",
+            )
+        return False
+
+    def _learned(self, fingerprint: str, trial: ProfileTrial) -> None:
+        """Проба помогла: сервер выучил обход — для панели «обход: … после …» (ТЗ R1.2).
+        Вернулся на базовый профиль — отметка снимается."""
+        if trial.recheck:
+            if self._escalated.pop(fingerprint, None) is not None:
+                self._save_profiles()
+            return
+        self._escalated[fingerprint] = {
+            "profile": trial.profile, "verdict": trial.verdict, "ts": self.wall(),
+        }
+        self._save_profiles()
+
+    def _calm_due(self, fingerprint: str, profile: str, since: float) -> bool:
+        """Пора ли пробовать сервер на базовом профиле. Дробление в Xray — после
+        fragment.calm_probes проверок подряд без сбоя и не раньше fragment.calm_hours (ТЗ R1.3:
+        дробление тратит процессор сервера и чуть скорости, держим его только по
+        необходимости); профили sing-box — раз в PROFILE_RECHECK, как до 0.1.18."""
+        elapsed = self.wall() - since
+        if profile in profiling.XRAY_FRAGMENTS:
+            return (
+                self._calm.get(fingerprint, 0) >= self.cfg.fragment.calm_probes
+                and elapsed >= self.cfg.fragment.calm_hours * 3600.0
+            )
+        return elapsed >= PROFILE_RECHECK
+
+    def _member_note(self, info: NodeInfo, verdict: str) -> bool:
+        """Итог собственной пробы участника (ТЗ R1). «Заморозка» или отказ — не повод сразу
+        менять сервер: он проверяется на ступенях дробления в Xray на месте; заменяют его,
+        только если не ответил и там. True — участник на пробе дробления (замена ждёт)."""
+        node = self._node(info)
+        if self.cfg.fragment.mode != "auto" or node is None:
+            return False
+        fingerprint, name = info.fingerprint, _server_text(node.name, info.tag)
+        good = verdict in REPLACEABLE_VERDICTS
+        self._calm[fingerprint] = self._calm.get(fingerprint, 0) + 1 if good else 0
+        trial = self._profile_trial.get(fingerprint)
+        if trial is not None:
+            if info.profile != trial.profile:
+                return trial.escalate  # профиль ещё не применён — проба впереди
+            del self._profile_trial[fingerprint]
+            if good:
+                self._forget_trial(fingerprint)
+                self._learned(fingerprint, trial)
+                self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
+                return False
+            if trial.rest:
+                following = trial.rest[0]
+                self._profile_wanted[fingerprint] = ProfileWish(
+                    following, True, trial.rest[1:], trial.prev, verdict=trial.verdict,
+                    escalate=True,
+                )
+                self._profile_event(
+                    trial.profile, following,
+                    f"{name} в работе не отвечает и на профиле «{profiling.NAMES[trial.profile]}» "
+                    f"— пробую «{profiling.NAMES[following]}»",
+                )
+                return True
+            self._profile_wanted[fingerprint] = ProfileWish(trial.prev, False, [], trial.prev)
+            if trial.recheck:
+                # Без дробления не отвечает — снова на нём, сразу (это тоже перевод на обход).
+                self._may_escalate(fingerprint, name)
+                self._profile_event(trial.prev, trial.profile, f"{name} {_fail_text(trial)}")
+                return True
+            self.bad_members[info.tag] = verdict
+            self._profile_event(
+                trial.prev, trial.profile,
+                f"{name} в работе не отвечает ни на одной ступени дробления в Xray ({verdict}) — "
+                "меняю его на запасной",
+            )
+            return False
+        if good or verdict not in profiling.ESCALATE_VERDICTS:
+            return False
+        steps = self._escalation_steps(info, verdict)
+        if not steps:
+            return False
+        if not self._may_escalate(fingerprint, name):
+            self.bad_members[info.tag] = verdict  # «нестабилен по ТСПУ» — на замену
+            return False
+        self._profile_wanted[fingerprint] = ProfileWish(
+            steps[0], True, steps[1:], info.profile, verdict=verdict, escalate=True,
+        )
+        self._profile_event(
+            info.profile, steps[0],
+            f"{name} в работе не отвечает ({verdict}) — не меняю его, а пробую "
+            f"«{profiling.NAMES[steps[0]]}»",
+        )
+        return True
+
+    def _member_profiles(self, view: list[NodeInfo], observatory: dict) -> None:
+        """Участники на дроблении (ТЗ R1.3): каждая проба ядра без сбоя — плюс к счёту
+        проверок подряд (не чаще probe.interval), сбой — счёт заново. Набрал fragment.calm_probes
+        за fragment.calm_hours — проба без дробления, на месте. Основной и выбранный вручную так
+        не проверяются: неудача оборвала бы весь трафик (их проверят, когда они уступят место)."""
+        if self.cfg.fragment.mode != "auto" or self.inventory is None:
+            return
+        now = self.wall()
+        every = float(max(checks_interval(self.cfg), self.cfg.watchdog.interval_s))
+        main = (self.main or {}).get("tag")
+        pin = self._manual_pin()
+        for info in view:
+            if info.role != "proxy" or info.profile not in profiling.XRAY_FRAGMENTS:
+                continue
+            key = info.fingerprint
+            entry = observatory.get(info.tag)
+            if entry is None:
+                continue
+            if not entry.get("alive"):
+                self._calm[key] = 0
+                continue
+            if now - self._calm_seen.get(key, 0.0) >= every:
+                self._calm_seen[key] = now
+                self._calm[key] = self._calm.get(key, 0) + 1
+            if (
+                info.tag == main or (pin is not None and pinning.same_server(pin["tag"], info.tag))
+                or key in self._profile_trial or key in self._profile_wanted
+            ):
+                continue
+            node = self._node(info)
+            last = self._profile_switched.get(key)
+            if node is None or last is None or not self._calm_due(key, info.profile, last):
+                continue
+            avail = profiling.available(node, self.cfg, ())
+            default = profiling.base(self.cfg, avail)
+            if default != info.profile:
+                self._profile_wanted[key] = ProfileWish(
+                    default, True, [], info.profile, recheck=True,
+                )
 
     def _queue_first(self, probe_tag: str) -> None:
         if probe_tag in self.scan_queue:
@@ -1998,11 +2574,39 @@ class Daemon:
             self._trial_saved[str(key)] = {
                 "profile": record["profile"], "rest": list(rest), "prev": record["prev"],
                 "recheck": bool(record.get("recheck")),
+                "verdict": str(record.get("verdict") or ""),
+                "escalate": bool(record.get("escalate")),
             }
         switched = saved.get("switched")
         for key, when in (switched.items() if isinstance(switched, dict) else ()):
             if isinstance(when, (int, float)) and not isinstance(when, bool):
                 self._profile_switched[str(key)] = float(when)
+            else:
+                skipped += 1
+        escalations = saved.get("escalations")
+        for key, times in (escalations.items() if isinstance(escalations, dict) else ()):
+            if isinstance(times, list) and all(
+                isinstance(item, (int, float)) and not isinstance(item, bool) for item in times
+            ):
+                self._escalations[str(key)] = [float(item) for item in times]
+            else:
+                skipped += 1
+        learned = saved.get("escalated")
+        for key, record in (learned.items() if isinstance(learned, dict) else ()):
+            if (
+                isinstance(record, dict) and record.get("profile") in profiling.ALL
+                and isinstance(record.get("ts"), (int, float))
+            ):
+                self._escalated[str(key)] = {
+                    "profile": record["profile"], "verdict": str(record.get("verdict") or ""),
+                    "ts": float(record["ts"]),
+                }
+            else:
+                skipped += 1
+        unstable = saved.get("unstable")
+        for key, until in (unstable.items() if isinstance(unstable, dict) else ()):
+            if isinstance(until, (int, float)) and not isinstance(until, bool):
+                self._unstable[str(key)] = float(until)
             else:
                 skipped += 1
         if skipped:
@@ -2013,12 +2617,27 @@ class Daemon:
         """Записывает пробы и время смены профиля в базу. Серверов, которых нет в подписке,
         время смены не держит: с подпиской уходят и они."""
         switched = self._profile_switched
+        now = self.wall()
+        window = self.cfg.fragment.escalation_hours * 3600.0
+        self._escalations = {
+            key: [when for when in times if now - when < window]
+            for key, times in self._escalations.items()
+        }
+        self._escalations = {key: times for key, times in self._escalations.items() if times}
+        self._unstable = {key: until for key, until in self._unstable.items() if until > now}
         if self.inventory is not None:
             known = {node.fingerprint for node in self.inventory.nodes}
             switched = {key: when for key, when in switched.items() if key in known}
             self._profile_switched = dict(switched)
+            self._escalated = {
+                key: value for key, value in self._escalated.items() if key in known
+            }
         self.store.set_meta(
-            TRIALS_META, json.dumps({"trials": self._trial_saved, "switched": switched}),
+            TRIALS_META, json.dumps({
+                "trials": self._trial_saved, "switched": switched,
+                "escalations": self._escalations, "escalated": self._escalated,
+                "unstable": self._unstable,
+            }),
         )
 
     def _forget_trial(self, fingerprint: str) -> None:
@@ -2041,7 +2660,7 @@ class Daemon:
             return
         spares = {
             info.fingerprint: info for info in builder.applied_nodes(applied, self.inventory.nodes)
-            if info.role == "spare"
+            if info.role in ("spare", "proxy")
         }
         names = {node.fingerprint: node.name for node in self.inventory.nodes}
         now, dropped = self.wall(), False
@@ -2057,7 +2676,7 @@ class Daemon:
                 continue
             self._profile_trial[key] = ProfileTrial(
                 record["profile"], list(record["rest"]), record["prev"], info.probe_tag, now,
-                record["recheck"],
+                record["recheck"], record.get("verdict", ""), record.get("escalate", False),
             )
             self._queue_first(info.probe_tag)
             self.log.info(
@@ -2108,6 +2727,10 @@ class Daemon:
         # переводятся на него — интернет важнее профиля.
         self._singbox_failed = True
         self._singbox_retry_at = now + SINGBOX_RETRY
+        if self._core_back("sing-box", "sing-box не поднимается ни с новым, ни с прежним конфигом"):
+            # Прежняя версия скоро встанет на место: поднять sing-box снова, не дожидаясь
+            # SINGBOX_RETRY.
+            self._singbox_retry_at = now + CORE_RECOVER
         self.notifier.event(
             "singbox",
             "sing-box не поднимается — серверы переведены на Xray; серверы только для sing-box "
@@ -2117,6 +2740,187 @@ class Daemon:
         if self.inventory is None:
             return False
         return self._rebuild(None, urgent=True, reason="sing-box не поднимается")
+
+    # --- обновление ядер (cores.py) ----------------------------------------------
+
+    def _core_back(self, core: str, why: str) -> bool:
+        """Сутки наблюдения после обновления ядра: оно перестало работать — служба xgw-core
+        возвращает прежнюю версию. Один раз на запуск демона; True — возврат запущен."""
+        if core in self._core_back_asked or not cores.watching(self.paths, core, self.wall()):
+            return False
+        self._core_back_asked.add(core)
+        title, previous = cores.TITLES[core], cores.previous(self.paths, core)
+        error = self._start_core_job(core, "rollback", reason="watch")
+        if error:
+            self.notifier.event(
+                "cores", f"{why}, но вернуть прежний {title} {previous} не удалось: {error}",
+                notify=True,
+            )
+            return False
+        self.notifier.event(
+            "cores",
+            f"{why} — идут сутки наблюдения после обновления {title}: шлюз возвращает прежнюю "
+            f"версию {previous}",
+            notify=True,
+        )
+        return True
+
+    def _start_core_job(self, core: str, action: str, *, reason: str) -> str:
+        return cores.start(self.paths, core, action, reason=reason)
+
+    def _cores_step(self) -> None:
+        """Раз в сутки (и по кнопке «Проверить сейчас») — выпуски ядер на GitHub. Запросы идут
+        в отдельном потоке: шаг watchdog не должен ждать GitHub."""
+        thread = self._cores_thread
+        if thread is not None and thread.is_alive():
+            return
+        asked, self._cores_asked = self._cores_asked, False
+        now = self.clock()
+        if not asked and (now < self._cores_next or not cores.check_due(self.paths, self.wall())):
+            return
+        self._cores_next = now + CORES_RECHECK
+        singbox = self._singbox_version()
+        installed = {
+            "xray": cores.parse(self.xray_version) if self.xray_version else None,
+            "sing-box": cores.parse(singbox) if singbox else None,
+        }
+        self._cores_thread = threading.Thread(
+            target=self._check_cores, args=(installed,), name="xgw-cores", daemon=True,
+        )
+        self._cores_thread.start()
+
+    def _check_cores(self, installed: dict) -> None:
+        try:
+            _record, events = cores.check(self.cfg, self.paths, installed, mark=self.mark)
+        except Exception as exc:  # проверка обновлений не должна ронять демон
+            self.log.error("выпуски ядер на GitHub не проверены: %s", exc)
+            return
+        for text, notify in events:
+            self.notifier.event("cores", text, notify=notify)
+
+    # --- фоновые проверки сети (ТЗ R4) ---------------------------------------------
+
+    def _netmon_step(self, xray_ok: bool) -> None:
+        """Итоги фоновых проверок — в базу и события; пора — новая проверка в своём потоке:
+        мёртвый резолвер или сервер DERP отвечает таймаутом, и шаг watchdog его ждать не
+        должен."""
+        result, self._netmon_result = self._netmon_result, {}
+        if "resolvers" in result:
+            self._resolvers_done(*result["resolvers"])
+        if "derp" in result:
+            self._derp_done(result["derp"], xray_ok)
+        thread = self._netmon_thread
+        if thread is not None and thread.is_alive():
+            return
+        now = self.clock()
+        jobs: list[str] = []
+        if now >= self._resolvers_next:
+            self._resolvers_next = now + jitter(self.cfg.dns.bootstrap_check_minutes * 60.0)
+            jobs.append("resolvers")
+        if now >= self._derp_next and self._derp_wanted():
+            self._derp_next = now + jitter(DERP_CHECK)
+            jobs.append("derp")
+        if not jobs:
+            return
+        self._netmon_thread = threading.Thread(
+            target=self._netmon_run, args=(jobs,), name="xgw-netmon", daemon=True,
+        )
+        self._netmon_thread.start()
+
+    def _netmon_run(self, jobs: list[str]) -> None:
+        """Поток проверок: только сеть, без базы (её соединение принадлежит шагу watchdog)."""
+        result: dict = {}
+        try:
+            if "resolvers" in jobs:
+                result["resolvers"] = (self.wall(), self._check_resolvers())
+            if "derp" in jobs:
+                result["derp"] = self._check_derp()
+        except Exception as exc:  # проверка сети не должна ронять демон
+            self.log.error("фоновая проверка сети не выполнена: %s", exc)
+        self._netmon_result = result
+
+    def _check_resolvers(self) -> list[dict]:
+        return resolving.check_all(self.cfg, mark=self.mark, cancel=self._stop)
+
+    def _resolvers_done(self, when: float, results: list[dict]) -> None:
+        """Итог проверки резолверов: в базу; изменился (все → часть → ни один) — событие."""
+        if not results:
+            return
+        before = resolving.verdict(
+            resolving.loads(self.store.get_meta(resolving.META)).get("results") or []
+        )
+        self.store.set_meta(resolving.META, resolving.dumps(results, when))
+        now = resolving.verdict(results)
+        if now == before or (now == "ok" and not before):
+            return
+        self.notifier.event("dns", resolving.event_text(results), notify=now == "down")
+
+    def _derp_wanted(self) -> bool:
+        """Проверять DERP есть смысл: tailscaled работает, его сокеты по настройке идут
+        напрямую (route = "direct"), аварийный маршрут разрешён, машина перехватывается."""
+        return (
+            self.capture is not None and self.cfg.capture.local
+            and self.cfg.tailscale.route == "direct" and self.cfg.tailscale.derp_fallback
+            and ts.present(self.paths)
+        )
+
+    def _check_derp(self) -> str | None:
+        """Сервер DERP домашнего региона напрямую, сокетом мимо VPN: пусто — отвечает, иначе
+        причина; None — проверять нечем (карту DERP не получить)."""
+        hosts = ts.derp_hosts()
+        if not hosts:
+            return None
+        errors: list[str] = []
+        for host in hosts[:2]:
+            if self.stopping:
+                return None
+            try:
+                reply = fetch.fetch_url(
+                    f"https://{host}/derp/probe", mark=self.mark, timeout=10.0, retries=0,
+                    bootstrap=self.cfg.dns.resolvers if self.mark is not None else None,
+                    cancel=self._stop,
+                )
+            except fetch.Cancelled:
+                return None
+            except fetch.FetchError as exc:
+                errors.append(f"{host}: {exc}")
+                continue
+            if reply.status == 200:
+                return ""
+            errors.append(f"{host}: HTTP {reply.status}")
+        return "; ".join(errors)
+
+    def _derp_done(self, error: str | None, xray_ok: bool) -> None:
+        """DERP напрямую не отвечает derp_fails проверок подряд, а Xray жив — tailscaled
+        временно через VPN; отвечает DERP_BACK раз подряд — снова напрямую. Петли нет:
+        Xray ходит к серверам сокетами mark_bypass, мимо перехвата (net/nft.py)."""
+        capture = self.capture
+        if error is None or capture is None:
+            return
+        via_vpn = capture.tailscale_via_vpn()
+        if error:
+            self._derp_oks = 0
+            self._derp_fails += 1
+            self.log.info("DERP напрямую не отвечает (%d): %s", self._derp_fails, error)
+            if via_vpn or self._derp_fails < self.cfg.tailscale.derp_fails or not xray_ok:
+                return
+            text = capture.tailscale_fallback(True)
+            if text:
+                self.notifier.event(
+                    "tailscale", f"{text} (не отвечает: {error}); вернётся напрямую сам, "
+                    "когда DERP снова ответит", notify=True,
+                )
+            return
+        self._derp_fails = 0
+        if not via_vpn:
+            return
+        self._derp_oks += 1
+        if self._derp_oks < DERP_BACK:
+            return
+        self._derp_oks = 0
+        text = capture.tailscale_fallback(False)
+        if text:
+            self.notifier.event("tailscale", text)
 
     def _singbox_recover(self, now: float) -> bool:
         """sing-box отказал и серверы ушли на Xray: раз в SINGBOX_RETRY пробуем его поднять."""
@@ -2238,6 +3042,7 @@ class Daemon:
             info for info in view
             if info.role == "spare" and info.fingerprint in known
             and info.fingerprint not in self.home_exits
+            and not self._is_unstable(info.fingerprint)
         ]
         classes = sorted({self._klass(info.fingerprint, prices) for info in spares})
         scans = self._fresh_scans()
@@ -2342,6 +3147,7 @@ class Daemon:
                 info for info in view
                 if info.role == "spare" and info.fingerprint not in self.home_exits
                 and self._klass(info.fingerprint, prices) > tier
+                and not self._is_unstable(info.fingerprint)
             ),
             key=lambda info: (self._klass(info.fingerprint, prices), info.tag != current),
         )
@@ -2538,7 +3344,7 @@ class Daemon:
         if not password or not info.probe_port:
             return False
         self._scanned = True
-        result = self._scan(info, password, self._scan_url(info))
+        result = self._probe_scan(info, password)
         if result.kind == "cancelled":
             self._pin_recheck_at = 0.0  # проверка не состоялась — повторить сразу
             return False
@@ -2596,7 +3402,12 @@ class Daemon:
         ):
             self._release_main()
             return
+        if self.cfg.speed.guard:
+            # Пассивная оценка — до замеров: участнику, через которого и так качают, замер не
+            # нужен (ТЗ R5.2).
+            self._passive_step(view)
         measured = self._speed_step(view, applied, observatory, now)
+        self._guard_step(view, applied, observatory)
         alive = [
             info for info in members if (observatory.get(info.tag) or {}).get("alive")
         ]
@@ -2685,15 +3496,21 @@ class Daemon:
         key = self._speed_key(info)
         record = self._speeds().get(key) or {}
         mbps = record.get("mbps")
-        hours = speed.every_hours(self.cfg, self._prices().get(info.fingerprint, 1.0))
+        hours = speed.every_hours(
+            self.cfg, self._prices().get(info.fingerprint, 1.0), spare=info.role == "spare",
+        )
         fresh = hours > 0 and (
             self.wall() - float(record.get("ts") or 0) <= SPEED_FRESH * hours * 3600.0
         )
+        value = float(mbps) if fresh and isinstance(mbps, (int, float)) else None
+        if value is None and hours > 0 and self.cfg.speed.guard:
+            # Замер устарел, но трафик клиентов через сервер сам показал полосу (ТЗ R5).
+            value = self.guard.healthy(key, SPEED_FRESH * hours * 3600.0)
         delay = (observatory.get(info.tag) or {}).get("delay")
         node = self._node(info)
         return speed.Candidate(
             tag=info.tag, key=key, name=node.name if node is not None else "",
-            mbps=float(mbps) if fresh and isinstance(mbps, (int, float)) else None,
+            mbps=value,
             delay_ms=delay * 1000.0 if isinstance(delay, (int, float)) else None,
             country=node.country if node is not None else "",
             source=node.source if node is not None else "",
@@ -2741,6 +3558,7 @@ class Daemon:
                 info.role != "spare" or info.fingerprint in self.home_exits
                 or self._klass(info.fingerprint, prices) != tier
                 or (scans.get(info.probe_tag) or {}).get("verdict") not in REPLACEABLE_VERDICTS
+                or self._is_unstable(info.fingerprint)
             ):
                 continue
             candidate = self._candidate(info, {})
@@ -2882,9 +3700,18 @@ class Daemon:
         return sorted(targets, key=lambda info: info.role != "proxy")
 
     def _speed_due(self, info: NodeInfo, prices: dict[str, float]) -> bool:
-        """Замер сервера устарел: старше срока его класса (speed.every_hours)."""
-        hours = speed.every_hours(self.cfg, prices.get(info.fingerprint, 1.0))
-        record = self._speeds().get(self._speed_key(info))
+        """Замер сервера устарел: старше срока его класса (speed.every_hours). Участник, через
+        который клиенты качают не меньше speed.passive_mbps, исправен и без замера (ТЗ R5)."""
+        hours = speed.every_hours(
+            self.cfg, prices.get(info.fingerprint, 1.0), spare=info.role == "spare",
+        )
+        key = self._speed_key(info)
+        if (
+            info.role == "proxy" and self.cfg.speed.guard
+            and self.guard.healthy(key, hours * 3600.0) is not None
+        ):
+            return False
+        record = self._speeds().get(key)
         return record is None or self.wall() - float(record.get("ts") or 0) >= hours * 3600.0
 
     def _speed_step(
@@ -2897,18 +3724,25 @@ class Daemon:
         if not (self.cfg.speed.unlimited_hours or self.cfg.speed.limited_hours):
             self.speed_queue.clear()
             self._speed_forced.clear()
+            self._speed_one.clear()
+            self._speed_any.clear()
             self._speed_asked = False
             self.speed_total = self.speed_done = 0
             return False
         targets = self._speed_targets(view, observatory)
+        self._speed_one_step(view, targets)
         live = {info.probe_tag for info in targets}
         # Сервер перестал отвечать или ушёл из списка, пока ждал замера.
         self.speed_queue = deque(tag for tag in self.speed_queue if tag in live)
         self._speed_forced &= set(self.speed_queue)
+        self._speed_any &= set(self.speed_queue)
         queued = set(self.speed_queue)
         if self._speed_asked:
             self._speed_asked = False
-            self.speed_queue = deque(info.probe_tag for info in targets)
+            single = [tag for tag in self.speed_queue if tag in self._speed_any]
+            self.speed_queue = deque(
+                single + [info.probe_tag for info in targets if info.probe_tag not in single]
+            )
             self._speed_forced = set(self.speed_queue)
             self.speed_total, self.speed_done = len(self.speed_queue), 0
         else:
@@ -2917,17 +3751,34 @@ class Daemon:
                 if info.probe_tag not in queued and self._speed_due(info, prices):
                     self.speed_queue.append(info.probe_tag)
                     self.speed_total += 1
+        self._guard_queue(targets)
         self._speed_waiting = False
         if not self.speed_queue:
             self.speed_total = self.speed_done = 0
-            self._speed_deferred_since = None
+            self._speed_deferred_since = self._speed_scanned_since = None
             return False
-        # Участники — первыми: по ним выбирают основной (порядок внутри групп сохраняется).
+        # Кнопка у сервера — первой, затем участники: по ним выбирают основной (порядок внутри
+        # групп сохраняется).
         members = {info.probe_tag for info in targets if info.role == "proxy"}
-        self.speed_queue = deque(sorted(self.speed_queue, key=lambda tag: tag not in members))
-        if self._scanned or self.stopping:
+        self.speed_queue = deque(sorted(
+            self.speed_queue,
+            key=lambda tag: (
+                tag not in self._speed_any, tag not in self._speed_small, tag not in members,
+            ),
+        ))
+        if self.stopping:
             return False
         forced = self.speed_queue[0] in self._speed_forced
+        single = self._scanned
+        if not self._scanned:
+            self._speed_scanned_since = None
+        elif not forced:
+            # Шаг уже занят сканом: фоновый замер ждёт шага без скана, но не дольше
+            # SPEED_SCAN_WAIT; заказанный идёт и в таком шаге (SPEED_SCAN_WAIT).
+            if self._speed_scanned_since is None:
+                self._speed_scanned_since = now
+            if now - self._speed_scanned_since < SPEED_SCAN_WAIT:
+                return False
         if self._busy and not forced:
             # Ждать — с первого занятого шага и до конца очереди: прождав час, очередь
             # дорабатывает и при занятом канале, а не ждёт снова после каждого сервера.
@@ -2936,18 +3787,52 @@ class Daemon:
             if now - self._speed_deferred_since < SPEED_FORCE_AFTER:
                 self._speed_waiting = True
                 return False
-        return self._measure_queue(targets, applied, busy=self._busy) > 0
+        self._speed_scanned_since = None
+        return self._measure_queue(targets, applied, busy=self._busy, single=single) > 0
 
-    def _measure_queue(self, targets: list[NodeInfo], applied: dict | None, *, busy: bool) -> int:
+    def _speed_one_step(self, view: list[NodeInfo], targets: list[NodeInfo]) -> None:
+        """Кнопка у одного сервера: он — первым в очередь, замер не ждёт свободного канала.
+        Сервер, которого фоновый замер не взял бы (запасной без свежего скана, участник,
+        которого ядро сочло мёртвым), всё равно замеряется — его просил человек; x100 и
+        дороже — нет (панель такую кнопку не показывает). Запрос на сервер, которого уже
+        нет в конфиге, снимается."""
+        asked, self._speed_one = self._speed_one, set()
+        if not asked and not self._speed_any:
+            return
+        prices = self._prices()
+        present = {info.probe_tag for info in targets}
+        for info in view:
+            wanted = bool({info.tag, info.fingerprint} & asked)
+            if not (wanted or info.probe_tag in self._speed_any) or not info.probe_port:
+                continue
+            if prices.get(info.fingerprint, 1.0) >= speed.SKIP_PRICE:
+                continue
+            if info.probe_tag not in present:
+                # И на следующих шагах, пока замер ждёт своей очереди (шаг со сканом).
+                targets.append(info)
+                present.add(info.probe_tag)
+            if not wanted:
+                continue
+            if info.probe_tag in self.speed_queue:
+                self.speed_queue.remove(info.probe_tag)
+            else:
+                self.speed_total += 1
+            self.speed_queue.appendleft(info.probe_tag)
+            self._speed_forced.add(info.probe_tag)
+            self._speed_any.add(info.probe_tag)
+
+    def _measure_queue(
+        self, targets: list[NodeInfo], applied: dict | None, *, busy: bool, single: bool = False,
+    ) -> int:
         """Замеры из очереди: фоновый — один за шаг, по кнопке — подряд, пока шаг не занял
-        SPEED_STEP_SECONDS; сколько серверов замерено."""
+        SPEED_STEP_SECONDS (single — один: в шаге уже шёл скан); сколько серверов замерено."""
         password, _ports = builder.probe_state(applied or {})
         by_probe = {info.probe_tag: info for info in targets}
         started = time.monotonic()
         count = 0
         while self.speed_queue and not self.stopping:
             if count and (
-                self.speed_queue[0] not in self._speed_forced
+                single or self.speed_queue[0] not in self._speed_forced
                 or time.monotonic() - started >= SPEED_STEP_SECONDS
             ):
                 break
@@ -2956,21 +3841,42 @@ class Daemon:
             info = by_probe.get(probe_tag)
             if info is None or not password:
                 continue
-            result = self._speed(info, password)
+            small = probe_tag in self._speed_small
+            self._speed_small.discard(probe_tag)
+            before = self._traffic_now(info.tag) if info.role == "proxy" else None
+            clock = time.monotonic()
+            result = self._speed(info, password, small=small)
+            elapsed = time.monotonic() - clock
             self._own_traffic += result.bytes_read
+            self._own_by_tag[info.tag] = self._own_by_tag.get(info.tag, 0) + result.bytes_read
+            if small:
+                self.guard.spend(result.bytes_read)
             if result.mbps is None and self.stopping:
                 # Замер прервала остановка демона: это не неудача сервера.
                 self.speed_queue.appendleft(probe_tag)
                 break
+            background = 0.0
+            span = max(elapsed, result.seconds)
+            if before is not None and result.mbps is not None and span > 0:
+                after = self._traffic_now(info.tag)
+                if after is not None and after >= before:
+                    # Трафик клиентов через этот же сервер за время замера (ТЗ R5.3).
+                    extra = max(0, after - before - result.bytes_read)
+                    background = round(extra * 8 / span / speedguard.MB, 1)
+            total = result.mbps if result.mbps is None else round(result.mbps + background, 1)
             records = self._speeds()
             records[self._speed_key(info)] = {
-                "mbps": result.mbps, "bytes": result.bytes_read, "seconds": result.seconds,
+                "mbps": total, "bytes": result.bytes_read, "seconds": result.seconds,
                 "error": result.error, "ts": self.wall(),
                 # Замер при занятом канале (фоновый ждал дольше SPEED_FORCE_AFTER либо по
                 # кнопке): цифра может быть занижена чужой загрузкой.
                 **({"busy": True} if busy else {}),
+                # Сумма (ТЗ R5.3): сам замер и трафик клиентов через сервер за это время.
+                **({"test_mbps": result.mbps, "bg_mbps": background} if background else {}),
             }
             self._save_speeds(records)
+            if info.role == "proxy" and self.cfg.speed.guard:
+                self.guard.note_total(self._speed_key(info), total)
             self.speed_done += 1
             count += 1
             if result.mbps is None:
@@ -2982,13 +3888,310 @@ class Daemon:
                 )
         return count
 
-    def _speed(self, info: NodeInfo, password: str) -> speed.SpeedResult:
+    def _speed(self, info: NodeInfo, password: str, *, small: bool = False) -> speed.SpeedResult:
+        """Замер сервера; small — короткий (не больше speed.spare_mb): повторные замеры
+        подозрительного участника и замеры кандидатов на его место (ТЗ R6)."""
         price = self._prices().get(info.fingerprint, 1.0)
+        size = speed.size_mb(self.cfg, price, spare=small or info.role == "spare")
         return speed.measure(
-            info, self.cfg, probe_pass=password,
-            max_mb=speed.size_mb(self.cfg, price, spare=info.role == "spare"),
-            cancel=self._stop,
+            info, self.cfg, probe_pass=password, max_mb=size, cancel=self._stop,
         )
+
+    def _traffic_now(self, tag: str) -> int | None:
+        """Счётчик трафика сервера сейчас (uplink + downlink, свежий /debug/vars)."""
+        try:
+            fresh = metrics.fetch_metrics(self.cfg.xray.metrics_port)
+        except Exception as exc:
+            self.log.debug("счётчики трафика недоступны: %s", exc)
+            return None
+        return metrics.outbound_totals(fresh).get(tag)
+
+    # --- контроль скорости участников (ТЗ R5–R8, watch/guard.py) ----------------------
+
+    def _guard_queue(self, targets: list[NodeInfo]) -> None:
+        """Подозрительных участников (низкая оценка, трафик через них идёт медленно) —
+        замерить снова, коротко и не дожидаясь свободного канала: сумма с трафиком клиентов
+        и так учитывает занятый канал."""
+        if not self.cfg.speed.guard:
+            return
+        due = set(self.guard.due())
+        if not due:
+            return
+        window = self.cfg.speed.low_minutes * 60.0 / self.cfg.speed.low_count
+        for info in targets:
+            key = self._speed_key(info)
+            if info.role != "proxy" or key not in due:
+                continue
+            # Следующий раз — после этого замера (guard.note_total), а пока не ставить снова.
+            self.guard.recheck_at[key] = self.wall() + window
+            if info.probe_tag in self.speed_queue:
+                continue
+            if not self.guard.can_spend(int(self.cfg.speed.spare_mb * speedguard.MB)):
+                continue
+            self.speed_queue.appendleft(info.probe_tag)
+            self._speed_forced.add(info.probe_tag)
+            self._speed_small.add(info.probe_tag)
+            self.speed_total += 1
+
+    def _passive_step(self, view: list[NodeInfo]) -> None:
+        """Пассивная оценка (ТЗ R5): скорость реального трафика каждого участника по
+        счётчикам ядра — раз в speed.passive_seconds, без лишнего трафика."""
+        members = {info.tag: self._speed_key(info) for info in view if info.role == "proxy"}
+        counters = {
+            tag: value for tag, value in metrics.outbound_totals(self._metrics).items()
+            if tag in members
+        }
+        if not counters:
+            return
+        sampled = self.guard.sample(counters, self._own_by_tag, members)
+        if sampled is None:
+            return
+        self._own_by_tag = {}
+        records = self.guard.passive_records()
+        text = json.dumps(records, sort_keys=True)
+        if text != self._passive_saved:
+            self._passive_saved = text
+            self.store.set_meta(speedguard.META_PASSIVE, text)
+
+    def _guard_step(self, view: list[NodeInfo], applied: dict | None, observatory: dict) -> None:
+        """Уход с «придушенного» участника (ТЗ R6–R8): поиск замены среди кандидатов —
+        по одному замеру за шаг, ранняя остановка, гистерезис, пауза после глобальной
+        просадки, бюджет трафика."""
+        if not self.cfg.speed.guard:
+            self.guard.episode = None
+            return
+        if self.guard.episode is not None:
+            self._guard_episode(view, applied, observatory)
+            return
+        if not self.guard.throttled:
+            return
+        if self.guard.cooling():
+            self.guard.throttled.clear()  # после паузы замеры покажут заново, если не прошло
+            return
+        members = {
+            self._speed_key(info): info for info in view
+            if info.role == "proxy" and (observatory.get(info.tag) or {}).get("alive")
+        }
+        key = next((item for item in sorted(self.guard.throttled) if item in members), None)
+        if key is None:
+            self.guard.throttled.clear()  # придушенный уже не в работе (замена, отказ)
+            return
+        mbps = self.guard.throttled.pop(key)
+        current = members[key]
+        name = self._node_name(current) or current.tag
+        role = self._guard_role(current)
+        candidates = self._guard_candidates(view, observatory, current, role)
+        low = (f"{self.cfg.speed.low_count} оценки подряд ниже {self.cfg.speed.low_mbps} Мбит/с "
+               f"за {self.cfg.speed.low_minutes} мин (последняя — {speed.mbps_text(mbps)})")
+        if not candidates:
+            self._guard_event(f"«{name}» придушен: {low}, а заменить некем — нет живых "
+                              "кандидатов со свежей проверкой")
+            self.guard.cool_down()
+            return
+        size = int(self.cfg.speed.spare_mb * speedguard.MB)
+        if not self.guard.can_spend(size):
+            self._guard_event(
+                f"«{name}» придушен: {low}, но суточный лимит трафика на поиск замены "
+                f"(speed.guard_daily_mb = {self.cfg.speed.guard_daily_mb} МБ) исчерпан"
+            )
+            return
+        self.guard.episode = {
+            "key": key, "tag": current.tag, "name": name, "role": role, "mbps": mbps,
+            "queue": [info.probe_tag for info in candidates], "results": {}, "spent": 0,
+            "tried": 0, "total": len(candidates),
+        }
+        self._guard_event(
+            f"«{name}» придушен: {low} — ищу замену среди {len(candidates)} кандидатов, "
+            "замеряю по одному"
+        )
+
+    def _guard_role(self, info: NodeInfo) -> str:
+        """Чем был придушенный: выбранный вручную (pin), основной (main) или участник."""
+        pin = self._manual_pin()
+        if pin is not None and not pin.get("down") and pinning.same_server(pin["tag"], info.tag):
+            return "pin"
+        if self.main is not None and self.main.get("tag") == info.tag:
+            return "main"
+        return "member"
+
+    def _guard_candidates(
+        self, view: list[NodeInfo], observatory: dict, current: NodeInfo, role: str,
+    ) -> list[NodeInfo]:
+        """Кандидаты на место придушенного (ТЗ R6.2): живые участники (для основного и
+        выбранного вручную — переход без перестройки конфига) и запасные со свежей проверкой
+        OK — того же класса, что участники (общий пул всех подписок — issue #2), не x100, не
+        из подписки с исчерпанной квотой, не «нестабильные по ТСПУ», не выходящие в домашнюю
+        страну. Сначала — быстрые по прошлым замерам; не больше speed.candidates."""
+        if self.inventory is None:
+            return []
+        prices = self._prices()
+        tier = self._tier(view)
+        scans = self._fresh_scans()
+        exhausted = {
+            name for name, quota in (self.inventory.quotas or {}).items()
+            if isinstance(quota, dict) and quota.get("total", 0) > 0
+            and quota.get("total", 0) - quota.get("upload", 0) - quota.get("download", 0) <= 0
+        }
+        wall = self.wall()
+        found: list[tuple[NodeInfo, float | None]] = []
+        for info in view:
+            node = self._node(info)
+            key = self._speed_key(info)
+            if info.fingerprint == current.fingerprint or node is None:
+                continue
+            if (
+                prices.get(info.fingerprint, 1.0) >= speed.SKIP_PRICE
+                or node.source in exhausted or self._is_unstable(info.fingerprint)
+                or info.fingerprint in self.home_exits
+                or self._klass(info.fingerprint, prices) != tier
+                or self.main_cooldown.get(key, 0.0) > wall
+                or key in self.guard.throttled
+            ):
+                continue
+            if info.role == "proxy":
+                if role == "member" or not (observatory.get(info.tag) or {}).get("alive"):
+                    continue
+            elif (scans.get(info.probe_tag) or {}).get("verdict") != "OK":
+                continue
+            found.append((info, self._candidate(info, observatory).mbps))
+        found.sort(key=lambda item: (item[1] is None, -(item[1] or 0.0), item[0].role != "proxy"))
+        return [info for info, _mbps in found[: self.cfg.speed.candidates]]
+
+    def _guard_episode(self, view: list[NodeInfo], applied: dict | None, observatory: dict) -> None:
+        """Шаг поиска: один кандидат за шаг (параллельные замеры положили бы домашний канал).
+        Первый не медленнее speed.switch_mbps — переход сразу; кандидаты кончились — лучший,
+        если он стоит перехода, иначе «глобальная просадка»."""
+        episode = self.guard.episode
+        assert episode is not None
+        current = next(
+            (info for info in view if info.role == "proxy" and info.tag == episode["tag"]), None,
+        )
+        if current is None:
+            self.guard.episode = None  # придушенный ушёл из работы сам (замена, отказ)
+            return
+        if self.stopping:
+            return
+        # И в шаге со сканом: кандидат — один за шаг, а сервер придушен сейчас (сканы бывают на
+        # каждом шаге, SPEED_SCAN_WAIT).
+        by_probe = {info.probe_tag: info for info in view}
+        size = int(self.cfg.speed.spare_mb * speedguard.MB)
+        password, _ports = builder.probe_state(applied or {})
+        while episode["queue"]:
+            if (
+                episode["spent"] + size > self.cfg.speed.episode_mb * speedguard.MB
+                or not self.guard.can_spend(size)
+            ):
+                episode["queue"].clear()  # бюджет поиска исчерпан — решаем по тому, что есть
+                break
+            info = by_probe.get(episode["queue"].pop(0))
+            if info is None or not password:
+                continue
+            if info.role == "spare" and not self._guard_fresh(info, password):
+                continue
+            result = self._speed(info, password, small=True)
+            episode["spent"] += result.bytes_read
+            episode["tried"] += 1
+            self.guard.spend(result.bytes_read)
+            self._own_traffic += result.bytes_read
+            self._own_by_tag[info.tag] = self._own_by_tag.get(info.tag, 0) + result.bytes_read
+            records = self._speeds()
+            records[self._speed_key(info)] = {
+                "mbps": result.mbps, "bytes": result.bytes_read, "seconds": result.seconds,
+                "error": result.error, "ts": self.wall(),
+            }
+            self._save_speeds(records)
+            episode["results"][info.probe_tag] = result.mbps
+            if self.guard.early(result.mbps, episode["mbps"]):
+                self._guard_switch(view, observatory, current, info, result.mbps)
+                return
+            return  # следующий кандидат — на следующем шаге
+        best = max(
+            (
+                (tag, mbps) for tag, mbps in episode["results"].items()
+                if self.guard.better(mbps, episode["mbps"]) and tag in by_probe
+            ),
+            key=lambda item: item[1], default=None,
+        )
+        if best is not None:
+            self._guard_switch(view, observatory, current, by_probe[best[0]], best[1])
+            return
+        self.guard.episode = None
+        until = datetime.datetime.fromtimestamp(self.guard.cool_down()).strftime("%H:%M")
+        self._guard_event(
+            f"глобальная просадка канала: ни один из {episode['tried']} кандидатов не быстрее "
+            f"«{episode['name']}» ({speed.mbps_text(episode['mbps'])}) на "
+            f"{self.cfg.speed.gain_pct} % — остаюсь на нём; новых поисков до {until}"
+        )
+
+    def _guard_fresh(self, info: NodeInfo, password: str) -> bool:
+        """Свежая быстрая GET-проба кандидата (57 КБ): старше одного периода сканов —
+        проверить сейчас (ТЗ R6.2)."""
+        scan_entry = self.store.scans().get(info.probe_tag) or {}
+        if (
+            scan_entry.get("verdict") == "OK"
+            and self.wall() - float(scan_entry.get("ts") or 0)
+            <= self.cfg.probe.scan_spares_minutes * 60.0
+        ):
+            return True
+        self._scanned = True
+        result = self._probe_scan(info, password)
+        if result.kind == "cancelled":
+            return False
+        self.store.save_scan(
+            info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
+            ts=self.wall(),
+        )
+        return result.verdict == "OK"
+
+    def _guard_switch(
+        self, view: list[NodeInfo], observatory: dict, current: NodeInfo, chosen: NodeInfo,
+        mbps: float | None,
+    ) -> None:
+        """Переход (ТЗ R8): основной — на кандидата (запасной сначала встаёт в работу);
+        выбранный вручную — «лучший пин» с пометкой, что он автоматический; другой участник
+        выводится из работы тихо, с подстановкой кандидата."""
+        episode = self.guard.episode or {}
+        self.guard.episode = None
+        node = self._node(chosen)
+        name = node.name if node is not None else chosen.tag
+        was = f"«{episode.get('name')}» ({speed.mbps_text(float(episode.get('mbps') or 0))})"
+        now_text = f"«{name}» ({speed.mbps_text(mbps)})" if mbps is not None else f"«{name}»"
+        role = episode.get("role")
+        if role == "pin":
+            pin = self._pin() or {}
+            self._save_pin({
+                **pin, "tag": chosen.tag, "name": name, "since": self.wall(), "down": None,
+                "auto": True, "was": episode.get("name") or "",
+            })
+            self._hold_pin(chosen.tag)
+            self.notifier.event(
+                "pin", f"выбранный вручную {was} придушен — выбор перенесён на {now_text} "
+                "автоматически («лучший пин»); вернуть прежний можно в панели", notify=True,
+            )
+            return
+        if role == "main":
+            rival = self._candidate(chosen, observatory)
+            rival = dataclasses.replace(rival, mbps=mbps)
+            if chosen.role == "spare":
+                self._promote(view, observatory, rival, self._candidate(current, observatory))
+                return
+            self._set_main(rival)
+            self.notifier.event(
+                "main", f"основной сервер {was} придушен — основной теперь {now_text}",
+            )
+            return
+        if chosen.role != "spare" or node is None or self.inventory is None:
+            return
+        members = [info for info in view if info.role == "proxy"]
+        prefer = preferred_members(members, Rotation(replacements=[(current.tag, node)]))
+        self.notifier.event("guard", f"участник {was} придушен — вместо него в работе {now_text}")
+        self._rebuild(prefer, urgent=False, reason="замена придушенного участника")
+
+    def _guard_event(self, text: str) -> None:
+        """Событие контроля скорости — одно на текст: шаги поиска не плодят дублей."""
+        if text != self._guard_note:
+            self._guard_note = text
+            self.notifier.event("guard", text)
 
     def speed_progress(self) -> dict:
         """Для статуса и панели: кто ждёт замера, сколько замерено из скольких и ждёт ли
@@ -3128,6 +4331,7 @@ class Daemon:
     ) -> None:
         self._last_status = (view, observatory, xray_ok)
         state = self.machine.state
+        stranded = self._stranded_step(view, state)
         self._xray_version()
         capture = self.capture_info
         current = self._lifecycle(view, observatory, xray_ok)
@@ -3143,12 +4347,33 @@ class Daemon:
             capture=capture, probe_target=self.probe_target,
             singbox=self._singbox_status(view),
             speeding=self.speed_progress(),
+            stranded=stranded,
+            probe_hosts=self.hosts.snapshot(),
+            guard=self.guard.snapshot(),
+            tailscale_via_vpn=bool(
+                self.capture is not None
+                and getattr(self.capture, "tailscale_via_vpn", lambda: False)()
+            ),
         )
+        spent = json.dumps(self.guard.spent, sort_keys=True)
+        if spent != self.store.get_meta(speedguard.META_SPENT):
+            self.store.set_meta(speedguard.META_SPENT, spent)
+        hosts_text = self.hosts.dumps()
+        if hosts_text != self._hosts_saved:
+            # Счётчики проверочных хостов — для diag и следующего запуска демона.
+            self._hosts_saved = hosts_text
+            self.store.set_meta(probehosts.META, hosts_text)
         warnings = tuple(snapshot["budget"]["warnings"])
         if warnings != self._budget_warnings:
             self._budget_warnings = warnings
             for warning in warnings:
                 self.notifier.event("budget", warning, notify=True)
+        # Без уведомления: интернет работает, а решать, нарочно ли так стоят приоритеты, —
+        # человеку; предупреждение висит в панели, пока его причина не уйдёт.
+        warning = snapshot.get("class_warning") or ""
+        if warning and not self._class_warning:
+            self.notifier.event("priority", warning)
+        self._class_warning = warning
         try:
             status.write_status(self.paths, snapshot)
         except OSError as exc:

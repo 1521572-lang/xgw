@@ -44,7 +44,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import __version__, actions, config, cost, engine, log, managed, masking, priority, qr
+from .. import (
+    __version__,
+    actions,
+    config,
+    cores,
+    cost,
+    engine,
+    log,
+    managed,
+    masking,
+    priority,
+    qr,
+    tray,
+)
 from .. import pin as pinning
 from .. import tailscale as ts
 from ..config import Config
@@ -58,6 +71,8 @@ from ..phones import Phones
 from ..store import SubscriptionCache
 from . import status
 from .appapi import AppApi
+from .record import MAX_SECONDS, Recorder, RecordError
+from .speed import SKIP_PRICE
 
 COOKIE = "xgw_panel"
 HEADER = "X-XGW-Panel"
@@ -181,6 +196,28 @@ def wait_ready(port: int, wait: float = 15.0) -> bool:
             time.sleep(0.3)
 
 
+def _shared(entry: dict) -> dict:
+    """Поля строки сервера, общие для участника и запасного: последний замер скорости
+    (watch/speed.py), ждёт ли сервер замера, профиль обхода и ядро."""
+    return {
+        "speed_mbps": entry.get("speed_mbps"), "speed_ts": entry.get("speed_ts"),
+        "speed_error": entry.get("speed_error") or "",
+        "speed_busy": bool(entry.get("speed_busy")),
+        "speed_note": entry.get("speed_note") or "",
+        "speed_queued": bool(entry.get("speed_queued")),
+        # 0.1.18: скорость «из трафика» (ТЗ R5), части суммарного замера, выученный обход и
+        # «нестабилен по ТСПУ» (ТЗ R1).
+        "speed_passive_mbps": entry.get("speed_passive_mbps"),
+        "speed_passive_ts": entry.get("speed_passive_ts"),
+        "speed_test_mbps": entry.get("speed_test_mbps"),
+        "speed_bg_mbps": entry.get("speed_bg_mbps"),
+        "escalation": entry.get("escalation"),
+        "unstable_until": entry.get("unstable_until"),
+        "fragment": bool(entry.get("fragment")),
+        "profile": entry.get("profile") or "", "core": entry.get("core") or "",
+    }
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -231,6 +268,8 @@ class Panel:
         self.cfg = Config()
         self.daemon = None
         self._lock = threading.Lock()  # одно действие за раз
+        # Кто действует в этом потоке, если не панель (act(origin=…)), и события действия.
+        self._acting = threading.local()
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
         self._server: _Server | None = None
@@ -240,6 +279,8 @@ class Panel:
         self.phones = Phones(paths)
         self.app_port = app_port  # None — API приложения не запускается (тесты панели)
         self.app_api: AppApi | None = None
+        # Запись трафика устройства: кнопка в строке устройства (record.py).
+        self.recorder = Recorder(paths.records_dir, on_done=self._event)
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -297,6 +338,7 @@ class Panel:
                 self.app_api = api
 
     def stop(self) -> None:
+        self.recorder.stop()
         if self.app_api is not None:
             self.app_api.stop()
             self.app_api = None
@@ -459,24 +501,14 @@ class Panel:
                     status="member", tag=entry.get("tag"), alive=entry.get("alive"),
                     delay_ms=entry.get("delay_ms"), dead_since=entry.get("dead_since"),
                     selected=bool(entry.get("selected")),
-                    # Основной сервер и последний замер скорости (watch/speed.py).
-                    main=bool(entry.get("main")), speed_mbps=entry.get("speed_mbps"),
-                    speed_error=entry.get("speed_error") or "", speed_ts=entry.get("speed_ts"),
-                    speed_busy=bool(entry.get("speed_busy")),
-                    speed_note=entry.get("speed_note") or "",
-                    fragment=bool(entry.get("fragment")),
-                    profile=entry.get("profile") or "", core=entry.get("core") or "",
+                    # Основной сервер (watch/speed.py).
+                    main=bool(entry.get("main")), **_shared(entry),
                 )
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
-                    speed_mbps=entry.get("speed_mbps"), speed_ts=entry.get("speed_ts"),
-                    speed_error=entry.get("speed_error") or "",
-                    speed_busy=bool(entry.get("speed_busy")),
-                    speed_note=entry.get("speed_note") or "",
-                    fragment=bool(entry.get("fragment")),
-                    profile=entry.get("profile") or "", core=entry.get("core") or "",
+                    **_shared(entry),
                 )
             elif item.get("skip"):
                 row.update(status="skipped", skip=item["skip"])
@@ -584,6 +616,10 @@ class Panel:
             "spares": spares,
             # Уровень приоритета серверов, что сейчас в работе (priority.py).
             "tier": snapshot.get("tier"),
+            # Мёртвого участника заменить некем; лимитированные в работе из-за приоритета,
+            # хотя живы безлимитные (status.class_warning). Пусто — всё в порядке.
+            "stranded": snapshot.get("stranded") or "",
+            "class_warning": snapshot.get("class_warning") or "",
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.
@@ -593,6 +629,8 @@ class Panel:
                 # Замеры скорости: 0 — выключены, основной выбирается по задержке.
                 "unlimited_hours": cfg.speed.unlimited_hours,
                 "limited_hours": cfg.speed.limited_hours,
+                "spare_hours": cfg.speed.spare_hours,
+                "guard": cfg.speed.guard,
                 "gain_pct": cfg.speed.gain_pct,
                 "hold_minutes": cfg.speed.hold_minutes,
             },
@@ -607,11 +645,18 @@ class Panel:
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
             "devices": devices,
+            "records": self.recorder.state(),
             "events": events,
             "budget": snapshot.get("budget") or {},
             # Сводка разбора подписок и предупреждение «не отвечает сам probe.url».
             "nodes": snapshot.get("nodes") or {},
             "probe_target": snapshot.get("probe_target") or "",
+            # 0.1.18: проверочные хосты (ТЗ R3), проверка резолверов (R4a), Tailscale через VPN
+            # по аварийному маршруту (R4b), контроль скорости (R5–R8).
+            "probe_hosts": snapshot.get("probe_hosts") or {},
+            "resolvers": snapshot.get("resolvers") or {},
+            "tailscale_via_vpn": bool(snapshot.get("tailscale_via_vpn")),
+            "guard": snapshot.get("guard") or {},
             "pending_restart": bool(snapshot.get("pending_restart")),
             # Второе ядро (sing-box): режим [core], установлен ли, отвечает ли, сколько
             # серверов ведёт; singbox_pending — конфиг ждёт окна перезапуска.
@@ -621,7 +666,14 @@ class Panel:
                 "refresh": bool(daemon is not None and daemon.refresh_pending),
                 "scan": bool(daemon is not None and daemon.scan_pending),
                 "speed": bool(daemon is not None and daemon.speed_pending),
+                # Замер одного сервера (иконка у его скорости): теги, отпечатки и probe-теги,
+                # которые ещё ждут замера, — до того, как демон запишет status.json.
+                "speed_one": daemon.speed_one_pending() if daemon is not None else [],
+                "cores": bool(daemon is not None and daemon.cores_pending),
             },
+            # Карточка «Ядра»: выпуски Xray и sing-box на GitHub, обновление и возврат
+            # прежней версии (cores.py).
+            "cores": self._cores_card(snapshot, now),
             # Прогресс замеров скорости: сколько из скольких (демон пишет в status.json).
             "speed_progress": snapshot.get("speed") or {},
         }
@@ -633,6 +685,51 @@ class Panel:
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
         return masked
+
+    def _cores_card(self, snapshot: dict, now: float) -> dict:
+        singbox = snapshot.get("singbox") or {}
+        installed = {
+            "xray": str((snapshot.get("xray") or {}).get("version") or ""),
+            "sing-box": str(singbox.get("version") or ""),
+        }
+        # sing-box — только установленный: ставит его установка, а не обновление из панели.
+        shown = bool(singbox.get("installed"))
+        return cores.panel_state(self.paths, installed, singbox_shown=shown, now=now)
+
+    def _core_job(self, action: str, body: dict) -> actions.Outcome:
+        """Кнопки «Обновить» и «Вернуть …» карточки «Ядра»: задание службе xgw-core."""
+        core = body.get("core")
+        if core not in cores.CORES:
+            return actions.Outcome(2, "ожидается ядро: xray или sing-box")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        title = cores.TITLES[core]
+        if action == "update":
+            version = body.get("version")
+            found = cores.load_check(self.paths).get(core)
+            latest = (found.get("latest") if isinstance(found, dict) else None) or {}
+            if not isinstance(version, str) or not version or version != latest.get("version"):
+                # Ставится только выпуск, найденный проверкой: его тег, файлы и хеш смотрели.
+                return actions.Outcome(
+                    2, f"на GitHub не найден {title} {version} — нажмите «Проверить сейчас»",
+                )
+            error = cores.start(self.paths, core, "update", version=version, runner=self.runner)
+            if error:
+                return actions.Outcome(1, error)
+            self._event(f"обновление {title} до {version} запущено из панели")
+            return actions.Outcome(
+                0, f"Обновляю {title} до {version}: скачиваю и проверяю — итог появится в "
+                   "карточке «Ядра» и в событиях",
+            )
+        previous = cores.previous(self.paths, core)
+        if not previous:
+            return actions.Outcome(2, f"прежней версии {title} нет — возвращаться не к чему")
+        error = cores.start(self.paths, core, "rollback", runner=self.runner)
+        if error:
+            return actions.Outcome(1, error)
+        self._event(f"возврат прежнего {title} {previous} запущен из панели")
+        return actions.Outcome(0, f"Возвращаю {title} {previous}…")
 
     def _devices(self, info: dict) -> list[dict]:
         """Устройства сети: аренды dnsmasq плюс пущенные мимо VPN в панели, которых
@@ -667,6 +764,11 @@ class Panel:
             card = self._tailscale_read()
             self._ts_card = (time.monotonic(), card)
         card = dict(card)
+        # «Напрямую» — из panel.json, а не из ответа CLI в памяти и не из конфига демона:
+        # переключатель в строке меняется сразу, а не через шаг демона или TS_TTL.
+        direct = {item["ip"] for item in managed.load(
+            managed.path_for(self.config_path))[0]["tailscale"]["direct"]}
+        card["peers"] = [{**peer, "direct": peer["ip"] in direct} for peer in card["peers"]]
         login = self._ts_job("login")
         card["login_pending"] = login is not None and login.code() is None
         if card["state"] == "login" and not card["auth_url"] and card["login_pending"]:
@@ -697,6 +799,8 @@ class Panel:
             "serve": {"on": bool(serving), "live": None, "url": ""},
             "funnel": {"on": bool(public), "live": None, "url": ""},
             "cgnat": [], "netfilter_off": None, "override_dns": None,
+            # Выходной узел (ASSUMPTIONS п. 230): объявлен ли (prefs), одобрен ли (status).
+            "exit": {"advertised": None, "approved": None}, "peers": [],
         }
         if self.which("tailscale") is None:
             return card
@@ -713,8 +817,15 @@ class Panel:
         card["address"] = next((item for item in state.addresses if ":" not in item), "")
         if state.backend != "Running" and state.auth_url.startswith("https://"):
             card["auth_url"] = state.auth_url
+        card["peers"] = [
+            {"name": peer.name, "ip": peer.address, "os": peer.os, "online": peer.online,
+             "direct": False}  # отмечается в _tailscale_card
+            for peer in state.peers
+        ]
+        card["exit"]["approved"] = state.exit_approved
         prefs = ts.prefs(self.runner)
         if prefs is not None:
+            card["exit"]["advertised"] = prefs.exit_node
             card["ssh"] = prefs.ssh
             card["netfilter_off"] = (
                 None if prefs.netfilter is None else prefs.netfilter == ts.NETFILTER_OFF)
@@ -766,6 +877,8 @@ class Panel:
             return actions.Outcome(0, "Tailscale идёт через VPN, пока Xray отвечает", (
                 "Когда Xray не отвечает или VPN заблокирован — напрямую, чтобы шлюз остался "
                 "доступен",))
+        if step == "direct":
+            return self._tailnet_direct(body, store_path)
         if self.which("tailscale") is None:
             return actions.Outcome(2, "Tailscale не установлен")
         if not ts.present(self.paths, self.sys_net):
@@ -814,7 +927,55 @@ class Panel:
             if not isinstance(body.get("on"), bool):
                 return actions.Outcome(2, "ожидается on: true или false")
             return self._tailscale_funnel(body["on"], state.dns_name, store_path)
+        if step == "exit":
+            if not isinstance(body.get("on"), bool):
+                return actions.Outcome(2, "ожидается on: true или false")
+            ts.set_exit_node(body["on"], self.runner)
+            self._event("Tailscale: шлюз — выходной узел" if body["on"]
+                        else "Tailscale: шлюз больше не выходной узел")
+            if not body["on"]:
+                return actions.Outcome(0, "Шлюз больше не выходной узел tailnet")
+            return actions.Outcome(0, "Шлюз объявлен выходным узлом tailnet", (
+                "Одобрите его один раз в консоли Tailscale: Machines → шлюз → Edit route "
+                "settings → Use as exit node",
+                "Затем на телефоне в приложении Tailscale: Exit node → шлюз. Интернет телефона "
+                "пойдёт через Xray шлюза",
+            ))
         return actions.Outcome(2, "нет такого действия")
+
+    def _tailnet_direct(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Устройство tailnet выходит через шлюз напрямую (direct: true) или через Xray."""
+        address, direct = managed.tailnet_address(body.get("ip")), body.get("direct")
+        name = body.get("name") if isinstance(body.get("name"), str) else ""
+        if address is None or not isinstance(direct, bool):
+            return actions.Outcome(2, "ожидается адрес устройства tailnet и direct: true или false")
+        previous = managed.load(store_path)[0]["tailscale"]["direct"]
+        if not managed.set_tailscale_direct(store_path, address, name, direct=direct):
+            return actions.Outcome(0, "Ничего не изменилось")
+        problems: list[str] = []
+        try:
+            new_cfg, _warnings = config.load(self.config_path)
+        except config.ConfigError as exc:
+            new_cfg, problems = None, [str(exc)]
+        if new_cfg is not None:
+            _done, problems = actions.apply_network(
+                new_cfg, self.paths, self.capture_factory(new_cfg, self.paths, logger=self.log),
+                logger=self.log, runner=self.runner,
+            )
+        if problems:
+            managed.replace_tailscale_direct(store_path, previous)
+            return actions.Outcome(
+                1, "Сеть не приняла изменение, прежние настройки возвращены: " + "; ".join(problems)
+            )
+        label = name or address
+        self._ts_card = (0.0, None)
+        self._wake()
+        if direct:
+            self._event(f"устройство tailnet «{label}» выходит через шлюз напрямую")
+            return actions.Outcome(0, f"«{label}» выходит в интернет через шлюз напрямую", (
+                "Мимо Xray: провайдер шлюза видит, куда оно ходит",))
+        self._event(f"устройство tailnet «{label}» выходит через шлюз через VPN")
+        return actions.Outcome(0, f"«{label}» выходит в интернет через Xray шлюза")
 
     def _wait_job(self, job: ts.Job, done: Callable[[], bool]) -> None:
         deadline = time.monotonic() + self.ts_wait
@@ -1099,6 +1260,40 @@ class Panel:
             "уровнем ниже шлюз пользуется, только когда живых выше нет",
         ))
 
+    def _record(self, what: str, body: dict) -> actions.Outcome:
+        """Запись трафика устройства: start {mac, seconds}, stop, remove {name}."""
+        if what == "stop":
+            if self.recorder.stop():
+                return actions.Outcome(0, "Запись остановлена — файл сохраняется")
+            return actions.Outcome(0, "Записи сейчас нет")
+        if what == "remove":
+            if self.recorder.remove(str(body.get("name") or "")):
+                return actions.Outcome(0, "Запись удалена")
+            return actions.Outcome(2, "такой записи нет — обновите страницу")
+        if what != "start":
+            return actions.Outcome(2, f"неизвестное действие записи: {what}")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        mac, seconds = managed.normalize_mac(body.get("mac")), body.get("seconds", 120)
+        if mac is None or not isinstance(seconds, int) or isinstance(seconds, bool):
+            return actions.Outcome(2, "ожидается устройство и длительность в секундах")
+        interface = lan.lan_interface(self.cfg)
+        if not interface:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        label = (found or {}).get("name") or mac
+        try:
+            self.recorder.start(interface, mac, label, seconds)
+        except RecordError as exc:
+            return actions.Outcome(1, str(exc))
+        minutes = f"{seconds // 60} мин" if seconds % 60 == 0 else f"{seconds} с"
+        self._event(f"запись трафика «{label}» начата ({minutes})")
+        return actions.Outcome(
+            0, f"Записываю трафик «{label}» — {minutes}",
+            [f"Не дольше {MAX_SECONDS // 60} минут; готовый файл — в карточке «Устройства»"],
+        )
+
     def _set_device(self, body: dict, store_path: Path) -> actions.Outcome:
         """Пустить устройство мимо VPN (bypass: true) или вернуть в VPN (false).
 
@@ -1191,21 +1386,34 @@ class Panel:
         mine = set(self.cfg.managed.subscriptions)
         return {sub.name for sub in self.cfg.subscriptions if sub.name not in mine}
 
-    def act(self, name: str, body: dict) -> dict:
-        """Выполняет действие и возвращает {"ok", "text", "notes"}."""
-        with self._lock:
-            try:
-                outcome = self._act(name, body)
-            except managed.ManagedError as exc:
-                outcome = actions.Outcome(2, str(exc))
-            except OSError as exc:
-                outcome = actions.Outcome(1, f"не удалось записать настройки: {exc}")
+    def act(self, name: str, body: dict, origin: str = "") -> dict:
+        """Выполняет действие и возвращает {"ok", "text", "notes"}.
+
+        origin — кто действует, если не панель («с телефона «…»», appapi.py). Тогда о
+        действии одно событие «origin: итог» вместо событий панели («… из панели»)."""
+        self._acting.origin, self._acting.texts = origin, []
+        try:
+            with self._lock:
+                try:
+                    outcome = self._act(name, body)
+                except managed.ManagedError as exc:
+                    outcome = actions.Outcome(2, str(exc))
+                except OSError as exc:
+                    outcome = actions.Outcome(1, f"не удалось записать настройки: {exc}")
+        finally:
+            self._acting.origin = ""
         self._selecting = (0.0, [])
-        return {
+        result = {
             "ok": outcome.ok,
             "text": masking.mask_text(outcome.text),
             "notes": [masking.mask_text(note) for note in outcome.notes],
         }
+        if origin:
+            # Не вышло — события панели о том, что успело случиться (обычно их нет).
+            texts = [result["text"]] if outcome.ok else self._acting.texts
+            for text in texts:
+                self._event(f"{origin}: {masking.mask_text(text)}")
+        return result
 
     def _act(self, name: str, body: dict) -> actions.Outcome:
         cfg, paths = self.cfg, self.paths
@@ -1239,10 +1447,19 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
+        if name.startswith("record/"):
+            return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):
             return self._tailscale(name.removeprefix("tailscale/"), body, store_path)
         if name.startswith("phones/"):
             return self._phone_action(name.removeprefix("phones/"), body, store_path)
+        if name == "cores/check":
+            if self.daemon is None:
+                return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
+            self.daemon.request_core_check()
+            return actions.Outcome(0, "Проверяю выпуски Xray и sing-box на GitHub…")
+        if name in ("cores/update", "cores/rollback"):
+            return self._core_job(name.removeprefix("cores/"), body)
         if name == "subscription/remove":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:
@@ -1298,6 +1515,8 @@ class Panel:
                     0, "Основной сервер включён: весь трафик пойдёт через самый быстрый"
                 )
             return actions.Outcome(0, "Основной сервер выключен: сервер выбирает ядро")
+        if name == "speed/one":
+            return self._speed_one(body)
         if name in ("refresh", "scan", "speed"):
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
@@ -1320,6 +1539,37 @@ class Panel:
             self.daemon.request_scan()
             return actions.Outcome(0, "Проверяю запасные серверы…")
         return actions.Outcome(2, "нет такого действия")
+
+    def _speed_one(self, body: dict) -> actions.Outcome:
+        """Иконка у скорости сервера (пожелание заказчика 24.10.2026): замер одного этого
+        сервера, а не общий замер всех. Тег — из строки сервера (участник или запасной)."""
+        tag = body.get("tag")
+        if not isinstance(tag, str) or not tag:
+            return actions.Outcome(2, "ожидается тег сервера")
+        if self.daemon is None:
+            return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
+        cfg = self.cfg
+        if not cfg.speed.sticky:
+            return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
+        if not (cfg.speed.unlimited_hours or cfg.speed.limited_hours):
+            return actions.Outcome(
+                2, "замер скорости выключен: speed.unlimited_hours и limited_hours = 0"
+            )
+        _snapshot, _xray_ok, members, spares = self._core(time.time())
+        entry = next(
+            (item for item in (*members, *spares)
+             if pinning.same_server(str(item.get("tag") or ""), tag)),
+            None,
+        )
+        if entry is None:
+            return actions.Outcome(2, "такого сервера сейчас нет ни в работе, ни среди запасных")
+        name = entry.get("name") or entry.get("tag") or tag
+        if float(entry.get("cost") or 0.0) >= SKIP_PRICE:
+            return actions.Outcome(
+                2, f"скорость «{name}» не замеряется: серверы x100 — для LTE"
+            )
+        self.daemon.request_speed_one(str(entry.get("fingerprint") or entry.get("tag")))
+        return actions.Outcome(0, f"Замеряю скорость «{name}»…")
 
     def _add(self, body: dict, store_path: Path) -> actions.Outcome:
         """Вставленный текст: адрес подписки либо ссылки серверов."""
@@ -1353,6 +1603,9 @@ class Panel:
         )
 
     def _event(self, text: str) -> None:
+        if getattr(self._acting, "origin", ""):
+            self._acting.texts.append(text)  # событие действия напишет act — одно
+            return
         try:
             with actions.open_store(self.paths) as store:
                 store.add_event("panel", text)
@@ -1400,6 +1653,9 @@ class Panel:
                 f"Панель открывается только по адресу http://127.0.0.1:{self.port}/",
             )
         url = urlsplit(handler.path)
+        if url.path == "/api/tray" or url.path.startswith("/api/tray/"):
+            self._tray(handler, method, url.path, host, body)
+            return
         if method == "POST":
             self._post(handler, url.path, host)
             return
@@ -1443,8 +1699,77 @@ class Panel:
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
             self._json(handler, HTTPStatus.OK, self.state(), body)
+        elif url.path.startswith("/records/"):
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._record_file(handler, url.path.removeprefix("/records/"), body)
         else:
             raise Refused(HTTPStatus.NOT_FOUND, "Нет такой страницы")
+
+    def _tray(
+        self, handler: BaseHTTPRequestHandler, method: str, path: str, host: str, body: bool,
+    ) -> None:
+        """Значок в трее (tray.py, ТЗ R9): состояние и два действия — «проверить выпуски
+        ядер» и «замерить скорость» — по своему токену трея и только с этой машины (не по
+        tailnet). Больше этот токен не открывает ничего."""
+        if method == "POST":
+            self._read_body(handler)  # дочитать запрос до ответа (см. _read_body)
+        if host == self._tailnet_host():
+            raise Refused(HTTPStatus.FORBIDDEN, "Значок трея — только на самой машине")
+        if not tray.check(self.paths, handler.headers.get(tray.HEADER) or ""):
+            time.sleep(0.5)  # перебор токена не должен быть быстрым
+            raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен токен трея")
+        if method in ("GET", "HEAD") and path == "/api/tray":
+            self._json(handler, HTTPStatus.OK, self.tray_state(), body)
+            return
+        action = path.removeprefix("/api/tray/")
+        if method != "POST" or action not in tray.ACTIONS:
+            raise Refused(HTTPStatus.NOT_FOUND, "Нет такого действия")
+        self._json(handler, HTTPStatus.OK, self.act(action, {}, origin="значок в трее"), True)
+
+    def tray_state(self) -> dict:
+        """Сводка для значка: состояние шлюза, версии ядер, через какой сервер идёт трафик
+        (страна и скорость), идёт ли задание ядра, заняты ли кнопки."""
+        cfg, now = self.cfg, time.time()
+        snapshot, _xray_ok, members, spares = self._core(now)
+        pin = self._pin(now)
+        chosen = next((member for member in members if member.get("main")), None)
+        pinned = False
+        if pin and not pin.get("down"):
+            found = next(
+                (entry for entry in (*members, *spares)
+                 if pinning.same_server(str(entry.get("tag") or ""), str(pin.get("tag") or ""))),
+                None,
+            )
+            if found is not None:
+                chosen, pinned = found, True
+        main = None
+        if chosen is not None:
+            parts = str(chosen.get("tag") or "").split("-")
+            main = {
+                "name": chosen.get("name") or chosen.get("tag"),
+                "country": parts[1].upper() if len(parts) > 2 else "",
+                "mbps": chosen.get("speed_mbps"), "pinned": pinned,
+            }
+        daemon = self.daemon
+        return {
+            "enabled": cfg.tray.enabled,
+            "version": __version__,
+            "state": snapshot.get("state"),
+            "action": snapshot.get("action") or "",
+            "xray": (snapshot.get("xray") or {}).get("version") or "",
+            "singbox": (snapshot.get("singbox") or {}).get("version") or "",
+            "core_job": cores.job_active(self.paths, now),
+            "main": main,
+            "speed_on": bool(
+                cfg.speed.sticky and (cfg.speed.unlimited_hours or cfg.speed.limited_hours)
+            ),
+            "busy": {
+                "cores": bool(daemon is not None and daemon.cores_pending),
+                "speed": bool(daemon is not None and daemon.speed_pending),
+            },
+            "panel": address(cfg),
+        }
 
     @staticmethod
     def _read_body(handler: BaseHTTPRequestHandler) -> bytes | None:
@@ -1508,6 +1833,23 @@ class Panel:
         except OSError as exc:
             raise Refused(HTTPStatus.INTERNAL_SERVER_ERROR, f"нет файла панели {name}") from exc
         self._send(handler, code, content_type, data, body)
+
+    def _record_file(self, handler, name: str, body: bool) -> None:
+        """Файл записи трафика — скачать (Wireshark открывает .pcap)."""
+        path = self.recorder.path(name)
+        if path is None:
+            raise Refused(HTTPStatus.NOT_FOUND, "Нет такой записи")
+        data = path.read_bytes()
+        handler.send_response(HTTPStatus.OK)
+        handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+        handler.send_header("Content-Disposition", f'attachment; filename="xgw-{name}"')
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("Content-Security-Policy", _CSP)
+        handler.end_headers()
+        if body:
+            handler.wfile.write(data)
 
     def _text(self, handler, code: HTTPStatus, text: str, body: bool) -> None:
         self._send(handler, code, "text/plain; charset=utf-8", text.encode("utf-8"), body)

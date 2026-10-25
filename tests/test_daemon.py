@@ -144,12 +144,18 @@ class FakeSingbox:
 class Harness(Daemon):
     """Демон, у которого всё внешнее — метрики, проверки, подписки, ядро — подменено."""
 
-    def __init__(self, cfg: Config, paths: Paths, *, fragment: str = "off", **kwargs):
+    def __init__(
+        self, cfg: Config, paths: Paths, *, fragment: str = "off",
+        hosts: list[str] | None = None, **kwargs,
+    ):
         self.t = time.time()  # и «монотонные», и настенные часы демона; двигаются вручную
         # Дробление ClientHello (0.1.11) проверяют отдельные тесты (fragment="auto"): в
         # остальных запасные с TLS и REALITY, которые не отвечают, иначе проверялись бы ещё
         # и в другом режиме, и сборок конфига было бы больше, чем ждут эти тесты.
         cfg.fragment.mode = fragment
+        # Проверочные хосты по кругу (0.1.18) — в своих тестах; в остальных пробы, как прежде,
+        # качают один probe.url.
+        cfg.probe.urls = list(hosts or [])
         super().__init__(
             cfg, paths, xray_bin=Path("no-such-xray"),
             clock=lambda: self.t, wall=lambda: self.t, **kwargs,
@@ -162,6 +168,8 @@ class Harness(Daemon):
         self.now_time = lambda: datetime.time(12, 0)
         self.observatory: dict | None = {}  # None — метрики недоступны
         self.provider = True
+        self.resolver_results: list[dict] = []  # итог проверки резолверов (ТЗ R4a)
+        self.derp_error: str | None = None  # DERP напрямую: "" — отвечает, None — нечем проверять
         self.e2e = True
         self.location: str | None = None
         self.via_location: str | None = None  # страна выхода явно через http-in Xray
@@ -180,6 +188,10 @@ class Harness(Daemon):
         self.speeds: dict[str, float | None] = {}  # тег → скорость замера (None — не удался)
         self.default_speed: float | None = 50.0
         self.measured: list[str] = []
+        self.small: list[bool] = []  # короткий ли был замер (ТЗ R6)
+        self.totals: dict[str, int] = {}  # счётчики трафика участников (uplink + downlink)
+        self.during_speed: dict[str, int] = {}
+        self._before: set[str] = set()
         self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
         self.downlinks: dict[str, int] = {}  # downlink участников (тег → байт, счётчик Xray)
 
@@ -195,11 +207,34 @@ class Harness(Daemon):
     def _downlink_now(self, tag):
         return self.downlinks.get(tag)
 
+    def _traffic_now(self, tag):
+        # Счётчик трафика сервера (uplink + downlink) до и после замера (ТЗ R5.3): второй вызов
+        # видит ещё и трафик клиентов за время замера (during_speed: тег → байт).
+        value = self.totals.get(tag)
+        if value is None:
+            return None
+        if tag in self._before:
+            self._before.discard(tag)
+            self.totals[tag] = value + self.during_speed.get(tag, 0)
+            return self.totals[tag]
+        self._before.add(tag)
+        return value
+
     def _check_provider(self):
         return self.provider
 
+    def _check_resolvers(self):
+        return list(self.resolver_results)  # тесты не ходят в DNS (ТЗ R4a — в своих тестах)
+
+    def _check_derp(self):
+        return self.derp_error
+
     def _check_e2e(self):
         self.e2e_checks += 1
+        if self.e2e:
+            # Сквозная проверка прошла — проверочный хост ответил (watch/hosts.py): так ядро
+            # возвращается на probe.url, когда он снова отвечает.
+            self.hosts.answered(self.cfg.probe.url)
         return self.e2e
 
     def _check_leak(self):
@@ -245,8 +280,9 @@ class Harness(Daemon):
     def _base_ping(self, members=(), password=""):
         return self.base_ping
 
-    def _speed(self, info, password):
+    def _speed(self, info, password, *, small=False):
         self.measured.append(info.tag)
+        self.small.append(small)
         mbps = self.speeds.get(info.tag, self.default_speed)
         if mbps is None:
             return SpeedResult(None, 16384, 5.0, "тишина 5 с после 16384 байт тела")
@@ -449,6 +485,173 @@ def test_dead_member_is_replaced_only_by_a_spare_of_its_level(daemon):
     for _ in range(3):
         assert daemon.tick() is State.DEGRADED
     assert daemon.applied == [] and victim in daemon.tags("proxy")
+
+
+def _stranded_events(daemon: Harness) -> list[str]:
+    return [e for e in daemon.events() if e.startswith("rotation:") and "заменить некем" in e]
+
+
+def test_degraded_says_so_when_there_is_no_spare_of_the_members_class(daemon):
+    """Запасные — только уровня ниже, мёртвого заменить некем: состояние так и говорит
+    вместо «замена на запасные», событие с советом — одно на этих мёртвых и после
+    перечитывания настроек не повторяется. Появился запасной того же класса — прежний текст
+    (разбор DEGRADED 24.10.2026)."""
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    victim, _survivor = daemon.tags("proxy")
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    assert daemon.tick() is State.DEGRADED
+    status = daemon.status()
+    assert status["action"] == (
+        "часть серверов недоступна, а заменить их некем: среди запасных нет серверов того же "
+        "класса (лимитированные серверы x1 уровня «средний»); серверы другого класса шлюз "
+        "ставит в работу, только когда не отвечает ни один из работающих"
+    )
+    assert status["stranded"].startswith("не отвечает сервер в работе «")
+    assert status["stranded"].endswith(
+        "Чтобы было из кого менять, включите отключённые серверы этого класса или добавьте "
+        "подписку."
+    )
+    assert status["class_warning"] == ""  # безлимитных нет — квоту тратить больше не на чем
+    assert any(e.startswith("DEGRADED:") and "заменить их некем" in e for e in daemon.events())
+    daemon.tick()
+    daemon.tick()
+    assert len(_stranded_events(daemon)) == 1
+    second = _second(daemon, lambda cfg: None)
+    try:
+        second.observatory = daemon.observatory
+        second.tick()
+        second.tick()
+        assert len(_stranded_events(second)) == 1
+        assert second.status()["action"].startswith("часть серверов недоступна, а заменить")
+        # Серверу nodes[2] вернули средний уровень: заменить есть кем — текст прежний.
+        second.cfg.managed.priority = dict.fromkeys(nodes[3:], "low")
+        assert second.tick() is State.DEGRADED
+        status = second.status()
+        assert status["action"] == "часть серверов недоступна — замена на запасные"
+        assert status["stranded"] == ""
+    finally:
+        second.store.close()
+
+
+def test_restarted_daemon_does_not_promise_a_replacement_before_it_knows(daemon):
+    """Демон перезапущен (установка), конфиг ядра есть, подписка ещё не получена: событие
+    перехода не обещает «замену на запасные»; к концу шага список серверов получен — статус и
+    событие «замена» говорят, что заменить некем."""
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
+    _started(daemon)
+    victim = daemon.tags("proxy")[0]
+    restarted = Harness(daemon.cfg, daemon.paths)
+    try:
+        restarted.t = daemon.t
+        restarted.set_alive(**{victim.replace("-", "_"): False})
+        assert restarted.tick() is State.DEGRADED
+        assert "DEGRADED: HEALTHY → DEGRADED: часть серверов недоступна" in restarted.events()
+        assert restarted.status()["action"].startswith("часть серверов недоступна, а заменить")
+        assert len(_stranded_events(restarted)) == 1
+    finally:
+        restarted.store.close()
+
+
+def test_high_level_stranded_advice_names_the_level(daemon):
+    """В работе все серверы уровня «высокий», запасных этого уровня нет: совет — поставить
+    «высокий» ещё нескольким серверам или вернуть «средний»."""
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.filters.max_members = 3
+    daemon.cfg.managed.priority = dict.fromkeys(nodes[:2], "high")
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    victim = daemon.tags("proxy")[0]
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    daemon.tick()
+    status = daemon.status()
+    assert "(лимитированные серверы x1 уровня «высокий»)" in status["action"]
+    assert status["stranded"].endswith(
+        "поставьте уровень «высокий» ещё нескольким серверам (лучше той же страны) или "
+        "верните серверам в работе уровень «средний»."
+    )
+
+
+def test_dead_member_with_a_spare_of_its_class_keeps_the_usual_text(daemon):
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    victim = daemon.tags("proxy")[0]
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    assert daemon.tick() is State.DEGRADED
+    status = daemon.status()
+    assert status["action"] == "часть серверов недоступна — замена на запасные"
+    assert status["stranded"] == "" and not _stranded_events(daemon)
+
+
+def _mixed_inventory() -> engine.Inventory:
+    """Первые два сервера — подписки «main» с лимитом трафика, остальные — безлимитной «free»."""
+    raws, _, _ = parse_links_text("\n".join(ALL_LINKS), "main")
+    nodes = [raw_to_node(raw, "main" if index < 2 else "free") for index, raw in enumerate(raws)]
+    quotas = {"main": {"upload": 0, "download": 10**9, "total": 10**12}}
+    return engine.Inventory(nodes, quotas, True)
+
+
+def test_limited_servers_kept_in_work_by_priority_are_warned_about(daemon):
+    """«Высокий» стоит у лимитированных серверов, а безлимитные живы, но уровнем ниже:
+    трафик тратит квоту только из-за приоритета (испытание 24.10.2026: четыре сервера x10
+    «высокий», 34 живых безлимитных). Предупреждение — в статусе и одно событие; сервер
+    выбран вручную — совет и про «Автовыбор»."""
+    daemon.source = _mixed_inventory()
+    limited = [
+        node.fingerprint for node in daemon.source.nodes
+        if node.source == "main" and not node.keep_tag
+    ]
+    daemon.cfg.managed.priority = dict.fromkeys(limited, "high")
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    assert {_fingerprint(daemon, tag) for tag in daemon.tags("proxy")} == set(limited)
+    daemon.tick()
+    unlimited = len(daemon.tags("spare"))
+    warning = daemon.status()["class_warning"]
+    assert warning == (
+        "в работе — лимитированные серверы x1 уровня «высокий», а живые безлимитные серверы "
+        f"({unlimited}) стоят уровнем ниже, «средний»: приоритет важнее стоимости, и трафик "
+        "тратит квоту подписки (x1). Если так не задумано, верните серверам в работе уровень "
+        "«средний»."
+    )
+    daemon.tick()
+    assert [e for e in daemon.events() if e.startswith("priority: в работе — лимитированные")] \
+        == [f"priority: {warning}"]
+    text = __import__("xgw.watch.status", fromlist=["render_status"]).render_status(
+        daemon.status()
+    )
+    assert f"Внимание: {warning}" in text
+    daemon.store.set_meta("pin", json.dumps({"tag": daemon.tags("proxy")[0], "until": None}))
+    daemon.tick()
+    assert daemon.status()["class_warning"].endswith(
+        "верните серверам в работе уровень «средний» и нажмите «Автовыбор»: пока сервер выбран "
+        "вручную, шлюз серверы в работе на другой класс не меняет."
+    )
+    assert len([e for e in daemon.events() if e.startswith("priority: в работе")]) == 1
+
+
+def test_class_warning_needs_fresh_live_unlimited_servers_of_a_lower_level():
+    from xgw.watch.status import class_warning
+
+    cfg = Config()
+    now = 2_000_000_000.0
+    members = [{"priority": "medium", "cost": 10.0}]
+    spares = [{"priority": "low", "cost": 0.0, "verdict": "OK", "scanned": now - 60}]
+    text = class_warning(cfg, members, spares, None, now)
+    assert text.startswith("в работе — лимитированные серверы x10 уровня «средний»")
+    assert text.endswith("Если так не задумано, поставьте безлимитным уровень «средний».")
+    assert class_warning(cfg, members, [{**spares[0], "verdict": "TIMEOUT"}], None, now) == ""
+    # Скан старше двух периодов scan_spares_minutes — не в счёт, как и у замены участников.
+    stale = {**spares[0], "scanned": now - 3 * 3600}
+    assert class_warning(cfg, members, [stale], None, now) == ""
+    # В работе безлимитные — квоту не тратят, предупреждать не о чем.
+    assert class_warning(cfg, [{"priority": "high", "cost": 0.0}], spares, None, now) == ""
+    # Безлимитный того же уровня — класс лучше: на него шлюз перейдёт сам.
+    same = {**spares[0], "priority": "medium"}
+    assert class_warning(cfg, members, [same], None, now) == ""
 
 
 def test_chosen_server_keeps_its_level_while_it_answers(daemon):
@@ -1505,7 +1708,10 @@ def test_dead_probe_url_is_told_apart_from_dead_servers(daemon):
 
     status = daemon.status()
     assert status["state"] == "PROBE_TARGET_UNREACHABLE"
-    warning = "Внимание: пробы всех серверов падают — вероятно, недоступен сам probe.url"
+    warning = (
+        "Внимание: пробы всех серверов падают — вероятно, недоступны сами проверочные "
+        "хосты (probe.url и probe.urls)"
+    )
     assert status["probe_target"].startswith(warning) and "HTTP 403" in status["probe_target"]
     events = [event for event in daemon.events() if event.startswith("PROBE_TARGET_UNREACHABLE:")]
     assert len(events) == 1 and warning in events[0]

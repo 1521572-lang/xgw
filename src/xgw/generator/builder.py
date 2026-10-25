@@ -22,6 +22,7 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
 
@@ -436,6 +437,8 @@ def outbound_profile(outbound: Mapping) -> str:
     letter = singboxing.bridge_variant(outbound)
     if letter:
         return profiling.PROFILE_OF_LETTER[letter]
+    if fragmenting.split_used(outbound):
+        return profiling.XRAY_SPLIT
     return profiling.XRAY_FRAGMENT if fragmenting.used(outbound) else profiling.XRAY_DEFAULT
 
 
@@ -605,6 +608,9 @@ def build(
             fragmenting.enable(outbound)
             info.fragment = True
             info.profile = profiling.XRAY_FRAGMENT
+        elif profile == profiling.XRAY_SPLIT and fragmenting.eligible(outbound):
+            fragmenting.enable(outbound, fragmenting.SPLIT_TAG)
+            info.profile = profiling.XRAY_SPLIT
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)
@@ -614,6 +620,8 @@ def build(
         outbounds.append(outbound)
     if any(info.fragment for info in nodes):
         outbounds.append(fragmenting.outbound(cfg))
+    if any(info.profile == profiling.XRAY_SPLIT for info in nodes):
+        outbounds.append(fragmenting.split_outbound(cfg))
     outbounds.extend(
         [
             {
@@ -726,6 +734,10 @@ def build(
             }
         )
     rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
+    # Адреса Tailscale Funnel (*.ts.net) — напрямую: через VPN-сервер Funnel не открывается
+    # (испытания А1 и А3), а телефон в домашнем Wi-Fi ходит к API приложения на самом шлюзе
+    # именно по публичному адресу Funnel (ASSUMPTIONS п. 229).
+    rules.append({"type": "field", "domain": [TS_NET], "outboundTag": "direct"})
     if cfg.routing.direct_domains:
         rules.append(
             {

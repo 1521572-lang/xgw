@@ -1,7 +1,11 @@
 package net.xgw.android
 
 import java.io.IOException
+import java.io.InputStream
+import java.net.ConnectException
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
@@ -82,6 +86,16 @@ class Gateway(private val url: String) {
         /** Насколько часы шлюза впереди часов телефона, мс (из заголовка Date ответов):
          * подпись принимается при расхождении не больше минуты, а часы телефона могут уйти. */
         @Volatile var skewMs = 0L
+
+        /** Запасной путь к шлюзу — вход pult-in Xray телефона (generator/phone.py): пока VPN
+         * телефона включён, а напрямую Funnel не открывается (провайдер, домашний Wi-Fi). */
+        private val viaVpn = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 17821))
+
+        /** Каким путём шлюз ответил последним: "direct", "vpn" или "" — ещё не отвечал. */
+        @Volatile var path = ""
+
+        /** Почему не открылся прямой путь, когда шлюз ответил через VPN телефона, — для карточки. */
+        @Volatile var directError = ""
     }
 
     fun hello(): Reply = send("GET", "/api/hello", ByteArray(0), emptyMap())
@@ -91,7 +105,9 @@ class Gateway(private val url: String) {
         return send("POST", "/api/pair", body.toByteArray(Charsets.UTF_8), emptyMap())
     }
 
-    fun signed(phone: String, signer: Signer, method: String, path: String, body: String?): Reply {
+    /** [sink] — ответ 200 не текстом, а потоком (файл записи трафика): тело в Reply пустое. */
+    fun signed(phone: String, signer: Signer, method: String, path: String, body: String?,
+               sink: ((InputStream) -> Unit)? = null): Reply {
         val data = (body ?: "").toByteArray(Charsets.UTF_8)
         val stamp = ((System.currentTimeMillis() + skewMs) / 1000).toString()
         val nonce = ByteArray(18).also { random.nextBytes(it) }
@@ -101,11 +117,36 @@ class Gateway(private val url: String) {
         return send(method, path, data, mapOf(
             "X-XGW-Phone" to phone, "X-XGW-Time" to stamp, "X-XGW-Nonce" to nonce,
             "X-XGW-Signature" to signature,
-        ))
+        ), sink)
     }
 
-    private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>): Reply {
-        val connection = URL(url + path).openConnection() as HttpURLConnection
+    /** Напрямую; не вышло, а VPN телефона включён — через него. Сработавший путь пробуется первым.
+     * Не ответил ни один — в ошибке оба пути: в испытании А3.1 была видна только последняя. */
+    private fun send(method: String, path: String, body: ByteArray, headers: Map<String, String>,
+                     sink: ((InputStream) -> Unit)? = null): Reply {
+        if (XgwVpn.state != "on") return attempt(null, method, path, body, headers, sink).also { remember(it, "direct") }
+        val order = if (Gateway.path == "vpn") listOf(viaVpn, null) else listOf(null, viaVpn)
+        val errors = HashMap<Proxy?, String>()
+        for (proxy in order) {
+            val reply = attempt(proxy, method, path, body, headers, sink)
+            if (reply.status != 0) {
+                remember(reply, if (proxy == null) "direct" else "vpn")
+                if (proxy == null) directError = "" else errors[null]?.let { directError = it }
+                return reply
+            }
+            errors[proxy] = reply.error
+        }
+        return Reply(0, "", "напрямую — ${errors[null]}; через VPN телефона — ${errors[viaVpn]}")
+    }
+
+    private fun remember(reply: Reply, how: String) {
+        if (reply.status != 0) Gateway.path = how
+    }
+
+    private fun attempt(proxy: Proxy?, method: String, path: String, body: ByteArray, headers: Map<String, String>,
+                        sink: ((InputStream) -> Unit)?): Reply {
+        val address = URL(url + path)
+        val connection = (if (proxy == null) address.openConnection() else address.openConnection(proxy)) as HttpURLConnection
         return try {
             connection.requestMethod = method
             connection.connectTimeout = TIMEOUT_MS
@@ -122,11 +163,17 @@ class Gateway(private val url: String) {
             }
             val status = connection.responseCode
             noteDate(connection.getHeaderField("Date"))
+            if (status == 200 && sink != null) {
+                connection.inputStream.use(sink)
+                return Reply(status, "")
+            }
             val stream = if (status >= 400) connection.errorStream else connection.inputStream
             val text = stream?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
             Reply(status, text)
         } catch (exc: IOException) {
-            Reply(0, "", exc.message ?: exc.javaClass.simpleName)
+            // Не открылся сам вход pult-in: Xray телефона не запущен или конфиг без этого входа.
+            val text = if (proxy != null && exc is ConnectException) "вход пульта в Xray телефона не отвечает" else null
+            Reply(0, "", text ?: exc.message ?: exc.javaClass.simpleName)
         } finally {
             connection.disconnect()
         }

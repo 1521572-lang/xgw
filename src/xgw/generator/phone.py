@@ -13,7 +13,12 @@
   не попадают: sing-box в приложении нет;
 - проверка серверов — лёгкая: HEAD к generate_204 раз в 3 минуты, а не скачивание файла
   каждые 30 с, как на шлюзе (на мобильной сети это сотни мегабайт в сутки);
-- API, статистики и метрик нет.
+- API, статистики и метрик нет;
+- вход `pult-in` — HTTP-прокси на 127.0.0.1:PULT_PORT только для самого приложения: оно
+  исключено из своего VPN и ходит к шлюзу напрямую, а если прямой путь к Funnel закрыт
+  (провайдер, домашний Wi-Fi через VPN шлюза), пробует через этот вход — через серверы
+  VPN телефона (ASSUMPTIONS п. 229). Другим приложениям он ничего не даёт: их трафик и так
+  идёт через Xray.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ from .builder import BALANCER_TAG
 TUN_TAG = "tun-in"
 TUN_NAME = "xgw0"
 TUN_MTU = 1500
+PULT_TAG = "pult-in"
+PULT_PORT = 17821
 PROBE_URL = "https://www.gstatic.com/generate_204"
 PROBE_INTERVAL = "3m"
 _GATEWAY_INBOUNDS = ("tproxy-in", "tproxy-in6", "tun-in")
@@ -91,7 +98,7 @@ def build(applied: Mapping | None) -> dict:
         outbounds.append(outbound)
     known = {outbound["tag"] for outbound in outbounds}
 
-    rules = []
+    rules = [{"type": "field", "inboundTag": [PULT_TAG], "balancerTag": BALANCER_TAG}]
     for rule in ((applied.get("routing") or {}).get("rules") or []):
         if not isinstance(rule, Mapping):
             continue
@@ -119,6 +126,8 @@ def build(applied: Mapping | None) -> dict:
             "tag": TUN_TAG, "port": 0, "protocol": "tun",
             "settings": {"name": TUN_NAME, "mtu": TUN_MTU},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+        }, {
+            "tag": PULT_TAG, "listen": "127.0.0.1", "port": PULT_PORT, "protocol": "http",
         }],
         "outbounds": outbounds,
         "routing": routing,

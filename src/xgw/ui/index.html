@@ -104,6 +104,19 @@
           <a id="ts-funnel-enable" class="btn ghost ts-enable" target="_blank" rel="noopener noreferrer" hidden>Разрешить Funnel в tailnet</a>
         </div>
       </div>
+      <div id="ts-exit-row" class="ts-row" hidden>
+        <button id="ts-exit" class="switch" type="button" role="switch" aria-checked="false"
+                aria-labelledby="ts-exit-title" aria-describedby="ts-exit-note"></button>
+        <div class="main-text">
+          <span id="ts-exit-title" class="main-title">Выход в интернет через шлюз</span>
+          <span id="ts-exit-note" class="muted small"></span>
+        </div>
+      </div>
+      <div id="ts-peers-block" hidden>
+        <h3 class="sub-title">Устройства tailnet</h3>
+        <p class="muted small">Если устройство выбрало шлюз выходным узлом, его интернет идёт через Xray; «напрямую» — мимо VPN.</p>
+        <ul id="ts-peers" class="list"></ul>
+      </div>
       <div id="ts-route-row" class="ts-row" hidden>
         <div class="main-text">
           <label id="ts-route-title" class="main-title" for="ts-route">Маршрут Tailscale</label>
@@ -143,6 +156,16 @@
         <button id="phones-add" class="btn primary" type="button">Привязать телефон</button>
       </div>
     </section>
+
+    <section class="card cores-card" id="cores-card" aria-labelledby="cores-title" hidden>
+      <div class="card-head">
+        <h2 id="cores-title">Ядра</h2>
+        <button id="cores-check" class="btn ghost" type="button">Проверить сейчас</button>
+      </div>
+      <p id="cores-job" class="note" role="status" hidden></p>
+      <ul id="cores" class="list cores"></ul>
+      <p id="cores-checked" class="muted small"></p>
+    </section>
   </div>
 
   <div class="col main">
@@ -162,12 +185,16 @@
       </div>
       <p id="nodes-note" class="muted small nodes-note" hidden></p>
       <p id="tier-note" class="muted small" hidden></p>
+      <p id="stranded-note" class="note" role="status" hidden></p>
+      <p id="class-note" class="note" role="status" hidden></p>
       <p id="reserve-note" class="note" role="status" hidden></p>
+      <p id="guard-note" class="note" role="status" hidden></p>
       <p id="probe-note" class="note bad" role="alert" hidden></p>
       <p id="pin-note" class="note" hidden></p>
       <div id="groups"></div>
       <p id="servers-empty" class="muted empty-text" hidden></p>
       <p id="budget-note" class="budget-note muted small" hidden></p>
+      <p id="network-note" class="muted small" hidden></p>
       <details id="removed-box" class="group removed" hidden>
         <summary><span class="group-name">Убранные</span>
           <span id="removed-count" class="group-count muted small"></span></summary>
@@ -181,6 +208,11 @@
         <span id="devices-note" class="muted small"></span>
       </div>
       <ul id="devices" class="list"></ul>
+      <div id="records-block" hidden>
+        <h3 class="sub-title">Записи трафика</h3>
+        <p class="muted small">Файлы .pcap открываются в Wireshark. Хранятся последние три.</p>
+        <ul id="records" class="list"></ul>
+      </div>
     </section>
 
     <section class="card events-card" aria-labelledby="events-title">

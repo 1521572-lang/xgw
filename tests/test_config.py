@@ -272,9 +272,10 @@ def test_example_config_matches_the_probe_defaults():
 def test_speed_defaults_and_limits(tmp_path):
     cfg, warnings = _load_text(tmp_path, "")
     assert cfg.speed.sticky is True and cfg.speed.max_mb == 10
-    # Безлимитные — раз в час, лимитированные — раз в 6 часов, запасные — по 3 МБ (issue #1,
-    # решение заказчика 21.10.2026).
-    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours, cfg.speed.spare_mb) == (1, 6, 3)
+    # Серверы в работе — раз в 6 часов, запасные — раз в сутки по 3 МБ (0.1.18, решение
+    # заказчика 24.10.2026: основной между замерами оценивается по своему трафику).
+    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours, cfg.speed.spare_mb) == (6, 6, 3)
+    assert cfg.speed.spare_hours == 24
     assert cfg.speed.url.startswith("https://speed.cloudflare.com/__down?bytes=")
     assert cfg.speed.url_fallback.startswith("https://cdn.jsdelivr.net/npm/typescript@5.3.3/")
     assert not [warning for warning in warnings if "speed" in warning]
@@ -298,7 +299,7 @@ def test_old_speed_every_hours(tmp_path):
     выключает замеры; другое значение больше не действует, и предупреждение это объясняет:
     в config.toml заказчика стоит every_hours = 6 из прежнего примера."""
     cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 6\n")
-    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (1, 6)
+    assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (6, 6)
     assert any("every_hours = 6 больше не действует" in warning for warning in warnings)
     cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 0\n")
     assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (0, 0)

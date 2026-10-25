@@ -50,7 +50,8 @@ def test_status_without_the_cli_is_unknown_not_a_failure():
 
 def test_prefs_are_read_carefully():
     fake = FakeTailscale()
-    assert tailscale.prefs(fake) == tailscale.Prefs(ssh=False, netfilter=2, accept_dns=True)
+    assert tailscale.prefs(fake) == tailscale.Prefs(
+        ssh=False, netfilter=2, accept_dns=True, exit_node=False)
     assert tailscale.parse_prefs('{"RunSSH": "yes", "NetfilterMode": true}') == tailscale.Prefs()
     assert tailscale.parse_prefs("не JSON") is None
     assert tailscale.parse_prefs("[1]") is None
@@ -217,7 +218,7 @@ def test_tailnet_host_is_accepted_only_while_serve_is_on_from_the_panel(ts_rig):
     result = _ts_act(ts_rig, "serve", {"on": True})
     assert result["ok"] and "Панель по tailnet включена" in result["text"]
     assert ts_rig.fake.serve == f"http://127.0.0.1:{ts_rig.panel.port}"
-    assert ts_rig.saved()["tailscale"] == {"serve": NAME, "route": None, "funnel": ""}
+    assert ts_rig.saved()["tailscale"] == {"serve": NAME, "route": None, "funnel": "", "direct": []}
     response, text = client.request("GET", "/api/state", host=HOST)
     assert response.status == 200 and json.loads(text)["tailscale"]["serve"]["live"] is True
     # Изменения — со страницы, открытой по https://имя:8443, а не по http.
@@ -326,11 +327,13 @@ def test_card_needs_root_and_a_running_tailscaled(ts_rig):
 def test_store_keeps_only_valid_tailscale_settings(tmp_path):
     path = tmp_path / "panel.json"
     path.write_text(json.dumps({"tailscale": {"serve": "Bad Name!", "route": "exit"}}), "utf-8")
-    assert managed.load(path)[0]["tailscale"] == {"serve": "", "route": None, "funnel": ""}
+    assert managed.load(path)[0]["tailscale"] == {
+        "serve": "", "route": None, "funnel": "", "direct": []}
     assert managed.set_tailscale_serve(path, "GW.Tailnet-1.ts.net.")
     assert not managed.set_tailscale_serve(path, NAME)  # то же имя
     assert managed.set_tailscale_route(path, "vpn")
-    assert managed.load(path)[0]["tailscale"] == {"serve": NAME, "route": "vpn", "funnel": ""}
+    assert managed.load(path)[0]["tailscale"] == {
+        "serve": NAME, "route": "vpn", "funnel": "", "direct": []}
     with pytest.raises(managed.ManagedError):
         managed.set_tailscale_serve(path, "evil.example/x")
     with pytest.raises(managed.ManagedError):

@@ -100,6 +100,23 @@ def proxy_traffic(metrics: dict) -> int | None:
     return total
 
 
+def outbound_totals(metrics: dict) -> dict[str, int]:
+    """Счётчики серверов в работе (outbound «proxy-*»): тег → байт uplink + downlink с запуска
+    Xray. По ним демон считает скорость реального трафика каждого участника (0.1.18, ТЗ R5)."""
+    section = metrics.get("stats") if isinstance(metrics, dict) else None
+    outbound = section.get("outbound") if isinstance(section, dict) else None
+    if not isinstance(outbound, dict):
+        return {}
+    result: dict[str, int] = {}
+    for tag, counters in outbound.items():
+        if str(tag).startswith("proxy-") and isinstance(counters, dict):
+            result[str(tag)] = sum(
+                value for value in counters.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
+    return result
+
+
 def outbound_downlinks(metrics: dict) -> dict[str, int]:
     """Счётчики downlink серверов в работе (outbound «proxy-*»): тег → байт с запуска Xray.
     Нет счётчиков — пустой словарь (формат — как у proxy_traffic)."""

@@ -49,15 +49,25 @@ class FakeDaemon:
         self.poke = threading.Event()
         self.asked: list[str] = []
         self.refresh_pending = self.scan_pending = self.speed_pending = False
+        self.cores_pending = False
 
     def request_refresh(self) -> None:
         self.asked.append("refresh")
+
+    def request_core_check(self) -> None:
+        self.asked.append("cores")
 
     def request_scan(self) -> None:
         self.asked.append("scan")
 
     def request_speed(self) -> None:
         self.asked.append("speed")
+
+    def request_speed_one(self, key: str) -> None:
+        self.asked.append(f"speed:{key}")
+
+    def speed_one_pending(self) -> list[str]:
+        return [item.removeprefix("speed:") for item in self.asked if item.startswith("speed:")]
 
 
 class Client:
@@ -708,7 +718,9 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     assert user.act("refresh", {})["ok"] and user.act("scan", {})["ok"]
     assert rig.daemon.asked == ["refresh", "scan"]
     rig.daemon.refresh_pending = True
-    assert user.state()["busy"] == {"refresh": True, "scan": False, "speed": False}
+    assert user.state()["busy"] == {
+        "refresh": True, "scan": False, "speed": False, "speed_one": [], "cores": False,
+    }
     rig.panel.configure(rig.panel.cfg, None)  # демон ещё не создан
     assert not user.act("refresh", {})["ok"]
 
@@ -815,6 +827,24 @@ def test_state_shows_multipliers_the_reserve_and_unlimited_subscriptions(rig, us
         assert text in script
 
 
+def test_state_carries_the_stranded_note_and_the_class_warning(rig, user):
+    """Тексты пишет шлюз (daemon.stranded_note, status.class_warning); страница их только
+    показывает — под заголовком «Серверы»."""
+    snapshot = _snapshot()
+    state = user.state()
+    assert state["stranded"] == "" and state["class_warning"] == ""
+    snapshot.update(stranded="не отвечает сервер в работе «NL-1», а заменить некем: …",
+                    class_warning="в работе — лимитированные серверы x10 уровня «высокий» …")
+    status.write_status(rig.paths, snapshot)
+    state = user.state()
+    assert state["stranded"].startswith("не отвечает сервер в работе «NL-1»")
+    assert state["class_warning"].startswith("в работе — лимитированные серверы x10")
+    page = user.request("GET", "/")[1]
+    assert 'id="stranded-note"' in page and 'id="class-note"' in page
+    script = user.request("GET", "/app.js")[1]
+    assert "s.stranded" in script and "s.class_warning" in script
+
+
 def test_state_tells_the_page_that_capture_waits_for_xray(rig, user):
     fakexray.write(rig.paths, {"inbounds": [{"tag": "socks-in"}]})  # Xray без tproxy-in
     capture = user.state()["capture"]
@@ -838,7 +868,10 @@ def test_state_shows_the_capture_lifecycle_written_by_the_daemon(rig, user):
 def test_sticky_switch_and_speed_button(rig, user):
     state = user.state()
     assert state["sticky"]["on"] is True
-    assert (state["sticky"]["unlimited_hours"], state["sticky"]["limited_hours"]) == (1, 6)
+    # 0.1.18: фоном — редко (решение заказчика 24.10.2026), запасные — раз в сутки.
+    sticky = state["sticky"]
+    assert (sticky["unlimited_hours"], sticky["limited_hours"], sticky["spare_hours"]) == (6, 6, 24)
+    assert sticky["guard"] is True
     assert user.act("speed", {})["ok"] and rig.daemon.asked == ["speed"]
     reply = user.act("sticky", {"on": False})
     assert reply["ok"] and "выключен" in reply["text"]
@@ -863,3 +896,32 @@ def test_server_core_is_set_from_the_panel(rig, user):
     assert not user.act("core", {"fingerprint": "zzzz9999", "core": "xray"})["ok"]
     cfg, _warnings = config.load(rig.config_path)
     assert cfg.managed.core == {}
+
+
+def test_one_server_speed_button(rig, user):
+    """Иконка у скорости сервера (отчёт cores 24.10.2026): замер одного сервера — участника
+    или запасного; демон получает его отпечаток, а пока замер ждёт — сервер в busy.speed_one.
+    Сервер x100, неизвестный тег и выключенные замеры — отказ."""
+    reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
+    assert reply["ok"] and "FI-1" in reply["text"]
+    assert rig.daemon.asked == ["speed:cccc3333"]
+    assert user.state()["busy"]["speed_one"] == ["cccc3333"]
+    assert user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
+    assert rig.daemon.asked[-1] == "speed:bbbb2222"
+    # Запасной стал участником: тег сменил роль — сервер тот же.
+    assert user.act("speed/one", {"tag": "proxy-fi-cccc"})["ok"]
+    assert not user.act("speed/one", {"tag": "spare-zz-0000"})["ok"]
+    assert not user.act("speed/one", {})["ok"]
+    snapshot = _snapshot()
+    snapshot["spares"][0]["cost"] = 100.0
+    status.write_status(rig.paths, snapshot)
+    reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
+    assert not reply["ok"] and "x100" in reply["text"]
+    assert user.act("sticky", {"on": False})["ok"]
+    assert not user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
+
+
+def test_page_has_the_one_server_speed_icon(rig, user):
+    response, text = user.request("GET", "/app.js")
+    assert response.status == 200
+    assert 'act("speed/one", { tag: server.tag }' in text and "speed_queued" in text

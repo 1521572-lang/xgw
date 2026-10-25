@@ -39,6 +39,11 @@ def _config() -> Config:
     cfg.filters.max_members = 2
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []
+    # Расписание issue #1 (все живые — раз в час): эти тесты — про него. Реже, как с 0.1.18 по
+    # умолчанию, и контроль скорости — в своих тестах.
+    cfg.speed.unlimited_hours = 1
+    cfg.speed.spare_hours = 0
+    cfg.speed.guard = False
     return cfg
 
 
@@ -424,7 +429,7 @@ def test_measurement_cut_by_a_stop_is_not_recorded(daemon):
     stop = threading.Event()
     before = json.loads(daemon.store.get_meta("speed") or "{}")
 
-    def cut(info, password):
+    def cut(info, password, *, small=False):
         daemon.measured.append(info.tag)
         stop.set()
         return SpeedResult(None, 4096, 0.4, "проверка прервана: демон останавливается")
@@ -523,3 +528,93 @@ def test_main_is_replaced_by_the_same_country(daemon):
     _step(daemon)
     assert daemon.main["tag"] == second
     assert any("той же страны" in event for event in _main_events(daemon))
+
+
+def test_one_server_is_measured_by_its_own_button(daemon):
+    """Пожелание заказчика (отчёт cores 24.10.2026): иконка у скорости сервера замеряет только
+    его — сразу, и при занятом канале, без общего замера всех: фоновые замеры по-прежнему
+    ждут свободного канала."""
+    daemon.traffic = 0
+    _first, second = _start(daemon)
+    _busy_step(daemon)
+    assert daemon.measured == []  # фоновый замер ждёт свободного канала
+    spare = daemon.tags("spare")[0]
+    spare_fp = next(info.fingerprint for info in daemon.view() if info.tag == spare)
+    daemon.request_speed_one(spare_fp)
+    assert daemon.speed_one_pending() == [spare_fp]
+    _busy_step(daemon)
+    assert daemon.measured == [spare]
+    assert daemon.speed_one_pending() == []
+    assert spare_fp in daemon._speeds()
+    # По тегу участника — тоже он один (шаг со сканом запасных замер пропускает).
+    daemon.request_speed_one(second)
+    for _ in range(3):
+        _busy_step(daemon)
+        if second in daemon.measured:
+            break
+    assert daemon.measured == [spare, second]
+
+
+def _scan_every_step(daemon: Harness, spare: str) -> None:
+    """Шаг со сканом — как непрерывные пробы профилей у запасных на шлюзе 25.10.2026."""
+    daemon.scan_queue.append(spare.replace("spare-", "probe-"))
+    _step(daemon)
+
+
+def test_the_button_works_while_every_step_scans(daemon):
+    """Отчёт 0.1.18, дефект 2: сканы шли на каждом шаге, а замер ждал шага без скана —
+    кнопка ↻ «крутилась, но не обновляла». Заказанный замер идёт и в шаге со сканом, один."""
+    _start(daemon)
+    _settle(daemon)
+    first, second = daemon.tags("spare")[:2]
+    daemon.measured.clear()
+    daemon.request_speed_one(first)
+    daemon.request_speed_one(second)
+    _scan_every_step(daemon, second)
+    assert len(daemon.measured) == 1  # в шаге со сканом — один
+    _scan_every_step(daemon, first)
+    assert sorted(daemon.measured) == sorted([first, second])
+    assert daemon.speed_one_pending() == []
+
+
+def test_background_waits_for_a_scan_free_step_but_not_for_ever(daemon):
+    """Фоновый замер ждёт шага без скана не дольше SPEED_SCAN_WAIT, потом идёт — по одному."""
+    from xgw.daemon import SPEED_SCAN_WAIT
+
+    _start(daemon)
+    _settle(daemon)
+    spare = daemon.tags("spare")[0]
+    daemon.speed_queue.append(spare.replace("spare-", "probe-"))  # фоновый замер подошёл
+    daemon.measured.clear()
+    steps = int(SPEED_SCAN_WAIT // 20)
+    for _ in range(steps - 1):
+        _scan_every_step(daemon, spare)
+    assert daemon.measured == []
+    for _ in range(3):
+        _scan_every_step(daemon, spare)
+    assert daemon.measured == [spare]
+
+
+def test_the_button_measures_a_server_the_background_would_skip(daemon):
+    """Запасной не прошёл последний скан, участник не отвечает ядру — фоновый замер их не
+    берёт, а кнопку человек нажал нарочно: замер идёт (и честно записывает неудачу)."""
+    first, _second = _start(daemon)
+    _settle(daemon)
+    measured = len(daemon.measured)
+    spare = daemon.tags("spare")[0]
+    probe = spare.replace("spare-", "probe-")
+    daemon.store.save_scan(probe, "FROZEN", 16384, 5.0, "заморозка", ts=daemon.t)
+    daemon.speeds[spare] = None
+    daemon.request_speed_one(spare)
+    _step(daemon)
+    assert daemon.measured[measured:] == [spare]
+    record = daemon._speeds()[next(i.fingerprint for i in daemon.view() if i.tag == spare)]
+    assert record["mbps"] is None and "тишина" in record["error"]
+    daemon.set_alive(**{first.replace("-", "_"): False})
+    daemon.request_speed_one(first)
+    _step(daemon)
+    assert daemon.measured[-1] == first
+    # Сервера уже нет в конфиге — запрос снимается, ничего не замеряется.
+    daemon.request_speed_one("spare-zz-0000")
+    _step(daemon)
+    assert daemon.measured[-1] == first and daemon.speed_one_pending() == []

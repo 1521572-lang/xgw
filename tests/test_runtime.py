@@ -344,6 +344,11 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         "fragment": False,  # без дробления ClientHello (0.1.11)
         "profile": "xray:default", "core": "xray",  # профиль обхода и ядро (0.1.12)
         "protocol": "",
+        # 0.1.18: замер не ждёт кнопки, пассивной оценки и суммы замера ещё нет, обход не
+        # выучен, «нестабильным по ТСПУ» сервер не отмечен.
+        "speed_queued": False, "speed_passive_mbps": None, "speed_passive_ts": None,
+        "speed_test_mbps": None, "speed_bg_mbps": None, "escalation": None,
+        "unstable_until": None,
     }
     assert snapshot["reserve"] is None and snapshot["spares"][0]["reserve"] is False
     assert snapshot["tier"] == "medium"
@@ -412,11 +417,11 @@ def test_status_shows_multipliers_the_reserve_and_the_quota_spent_with_multiplie
     # Участник безлимитный: квоту «paid» тратят только редкие дешёвые проверки двух
     # лимитированных кандидатов в резервный выход — x1 и x10.
     expected = status.CHEAP_SCAN_BYTES * 86400 / status.RESERVE_RECHECK * (1 + 10)
-    # И замеры скорости кандидатов раз в speed.limited_hours (6 ч): x1 качает 3 МБ
+    # И замеры скорости кандидатов раз в сутки (speed.spare_hours, 0.1.18): x1 качает 3 МБ
     # (speed.spare_mb), x10 — 1 МБ, это 10 МБ квоты.
-    expected += 4 * (3 * 1 + 1 * 10) * status.MB
+    expected += 1 * (3 * 1 + 1 * 10) * status.MB
     assert budget["quota_mb"] == {"paid": round(expected / status.MB, 1)}
-    assert budget["quota_share"]["paid"] < 0.2 and budget["cheap"] == 0  # 52 МБ в сутки
+    assert budget["quota_share"]["paid"] < 0.2 and budget["cheap"] == 0  # 13 МБ в сутки
     assert budget["spares"] == 1  # по расписанию сканируется только безлимитный запасной
 
     text = status.render_status(snapshot)
@@ -442,9 +447,10 @@ def test_quota_spend_counts_probes_through_limited_members_with_multipliers():
     spend = status.quota_spend(cfg, plan, size)
     probes = 2 * size * 86400 / 30 + size * 86400 / cfg.watchdog.interval_s
     scans = status.CHEAP_SCAN_BYTES * 24
-    # Замеры раз в speed.limited_hours (6 ч, 4 раза в сутки) по 1 МБ: два участника и
-    # запасной (запасные лимитированных подписок тоже замеряются, issue #1).
-    measures = (2 + 1) * 4 * 1 * status.MB
+    # Замеры по 1 МБ: два участника — раз в speed.limited_hours (6 ч, 4 раза в сутки),
+    # запасной — раз в speed.spare_hours (сутки; запасные лимитированных подписок тоже
+    # замеряются, issue #1).
+    measures = (2 * 4 + 1) * 1 * status.MB
     assert spend == {"paid": int((probes + scans + measures) * 10)}
     budget = status.probe_budget(cfg, 2, 0, size, cheap=1)
     quotas = {"paid": {"upload": 0, "download": 0, "total": 3 * 10**12}}

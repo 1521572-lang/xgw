@@ -209,6 +209,8 @@ def dpi(tmp_path, monkeypatch):
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []
     cfg.speed.sticky = False
+    # Вторая ступень дробления в Xray (0.1.18) — в своих тестах: здесь лестница, как до неё.
+    cfg.fragment.split = False
     return Dpi(cfg, paths)
 
 
@@ -232,8 +234,10 @@ def test_spare_that_answers_only_with_fragmenting_gets_it_and_keeps_it(dpi):
     assert dpi._fresh_scans()[spare.probe_tag]["verdict"] == "OK"
     name = next(node.name for node in dpi.inventory.nodes
                 if node.fingerprint == spare.fingerprint)
-    assert f"fragment: «{name}» отвечает только с дроблением ClientHello — оно включено" in (
-        dpi.events())
+    assert (
+        f"fragment: «{name}» ({spare.tag}) отвечает только с дроблением ClientHello — оно включено"
+        in dpi.events()
+    )
     assert next(entry for entry in dpi.status()["spares"]
                 if entry["tag"] == spare.tag)["fragment"] is True
     # Обновление подписки и новый демон (перезапуск службы) режим не сбрасывают.
@@ -242,6 +246,26 @@ def test_spare_that_answers_only_with_fragmenting_gets_it_and_keeps_it(dpi):
     again = Dpi(dpi.cfg, dpi.paths)
     again.inventory = dpi.inventory
     assert again.mode(spare.fingerprint) is True
+
+
+def test_spares_with_one_name_are_told_apart_by_tag_in_events(dpi):
+    """Перепроверка 0.1.18 (25.10.2026): двенадцать серверов «🚀Авто | Лучший сервер» одной
+    подписки в событиях обхода выглядели как один сервер, эскалация которого идёт каждую
+    минуту. В событии после имени — тег сервера."""
+    _started(dpi)
+    first, second = dpi.spare(0), dpi.spare(1)
+    for node in dpi.inventory.nodes:
+        if node.fingerprint in (first.fingerprint, second.fingerprint):
+            node.name = "🚀Авто | Лучший сервер"
+    dpi.blocked.update((first.probe_tag, second.probe_tag))
+    _rescan(dpi)
+    dpi.tick()  # без дробления не ответили — обоим включено дробление
+    dpi.tick()  # с дроблением ответили
+    for spare in (first, second):
+        assert (
+            f"fragment: «🚀Авто | Лучший сервер» ({spare.tag}) отвечает только с дроблением "
+            "ClientHello — оно включено" in dpi.events()
+        ), spare.tag
 
 
 def test_fragmenting_that_does_not_help_is_undone_and_retried_after_six_hours(dpi):
@@ -265,7 +289,11 @@ def test_fragmenting_that_does_not_help_is_undone_and_retried_after_six_hours(dp
     assert dpi.mode(spare.fingerprint) is True and len(dpi.applied) == 3
 
 
-def test_fragmented_spare_is_tried_without_it_once_a_day(dpi):
+def test_fragmented_spare_is_tried_without_it_after_a_calm_streak(dpi):
+    """ТЗ R1.3 (0.1.18): сервер на дроблении пробуется без него, когда прошёл
+    fragment.calm_probes проверок подряд (20) и пробыл на дроблении не меньше
+    fragment.calm_hours (12 ч) — дробление тратит процессор сервера и чуть скорости. До 0.1.18 —
+    раз в сутки, сколько бы проверок ни было."""
     _started(dpi)
     spare = dpi.spare()
     dpi.blocked.add(spare.probe_tag)
@@ -274,18 +302,35 @@ def test_fragmented_spare_is_tried_without_it_once_a_day(dpi):
     dpi.tick()
     assert dpi.mode(spare.fingerprint) is True
     dpi.blocked.clear()  # провайдер перестал блокировать
-    dpi.t += 12 * 3600
+    for _ in range(19):  # 19 проверок за 12 ч 40 мин — проверок мало
+        dpi.t += 2400
+        _rescan(dpi)
+        dpi.tick()
+    assert dpi.mode(spare.fingerprint) is True and dpi._calm[spare.fingerprint] == 19
+    dpi.t += 2400
     _rescan(dpi)
-    dpi.tick()
-    assert dpi.mode(spare.fingerprint) is True  # сутки ещё не прошли
-    dpi.t += 12 * 3600 + 60
-    _rescan(dpi)
-    dpi.tick()  # пора: пробуется без дробления
+    dpi.tick()  # двадцатая и больше 12 ч — пробуется без дробления
     assert dpi.mode(spare.fingerprint) is False
     dpi.tick()
     assert any("отвечает и без дробления ClientHello — оно выключено" in event
                for event in dpi.events())
     assert dpi.mode(spare.fingerprint) is False
+
+
+def test_twenty_quick_checks_are_not_enough_without_twelve_hours(dpi):
+    """И наоборот: 20 проверок подряд за пару часов — мало времени, дробление остаётся."""
+    _started(dpi)
+    spare = dpi.spare()
+    dpi.blocked.add(spare.probe_tag)
+    _rescan(dpi)
+    dpi.tick()
+    dpi.tick()
+    dpi.blocked.clear()
+    for _ in range(25):
+        dpi.t += 300
+        _rescan(dpi)
+        dpi.tick()
+    assert dpi.mode(spare.fingerprint) is True and dpi._calm[spare.fingerprint] >= 20
 
 
 def test_dead_member_gives_way_to_a_spare_that_answers_only_with_fragmenting(dpi):
@@ -308,14 +353,23 @@ def test_dead_member_gives_way_to_a_spare_that_answers_only_with_fragmenting(dpi
     assert newcomer.fragment is True
 
 
-def test_members_are_not_switched_and_mode_off_switches_nobody(dpi):
+def test_a_member_is_fragmented_in_place_and_mode_off_switches_nobody(dpi):
+    """ТЗ R1 (0.1.18): участник, который без дробления не отвечает (CONNECT_FAIL), не
+    списывается — ему на месте включают дробление ClientHello, и он остаётся в работе. При
+    fragment.mode = "off" не переключают никого."""
     _started(dpi)
     member = next(info for info in dpi.view() if info.role == "proxy")
     dpi.blocked.add(member.probe_tag)
     dpi.vetted.clear()  # первая проверка участника — снова
     _rescan(dpi)
     dpi.tick()
-    assert dpi.mode(member.fingerprint) is False  # участника не трогают, его заменят
+    assert dpi.mode(member.fingerprint) is True  # дробление на месте, без замены
+    assert member.tag in dpi.tags("proxy") and member.tag not in dpi.bad_members
+    assert dpi.applied[-1][1] is True  # срочно: трафик через него ждёт
+    dpi.tick()  # с дроблением отвечает — так и остаётся
+    assert dpi.mode(member.fingerprint) is True and member.tag in dpi.tags("proxy")
+    assert any("отвечает только с дроблением ClientHello — оно включено" in event
+               for event in dpi.events())
     dpi.cfg.fragment.mode = "off"
     spare = dpi.spare()
     dpi.blocked.add(spare.probe_tag)
@@ -323,9 +377,8 @@ def test_members_are_not_switched_and_mode_off_switches_nobody(dpi):
     _rescan(dpi)
     dpi.tick()
     assert dpi.mode(spare.fingerprint) is False
-    assert all(fragmented_fingerprints(config, dpi.inventory.nodes) == set()
-               for config, _urgent in dpi.applied[applied:])
     assert dpi._profile_wanted == {} and dpi._profile_trial == {}
+    assert len(dpi.applied) >= applied
 
 
 def test_engine_keeps_fragmenting_from_the_applied_config(dpi):

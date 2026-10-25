@@ -138,9 +138,10 @@ def get_release(
     timeout: float = 20.0,
     mark: int | None = None,
     bootstrap: Sequence[str] | None = None,
+    proxy: tuple[str, int] | None = None,
 ) -> Release:
-    """Релиз этой версии (config.XRAY_VERSION). «Последнего» нет: на GitHub это старый
-    стабильный выпуск, а XGW работает только с одной версией."""
+    """Релиз этой версии: config.XRAY_VERSION либо выпуск, который предложила проверка
+    обновлений (cores.py). «Последнего» нет: на GitHub это старый стабильный выпуск."""
     if not re.fullmatch(r"[vV]?\d+(\.\d+){0,2}", version.strip()):
         raise BinaryError(f"версия Xray — цифрами, например 26.10.10, а не «{version}»")
     url = f"{RELEASES_API}/tags/v{version.strip().lstrip('vV')}"
@@ -151,6 +152,7 @@ def get_release(
         retries=1,
         mark=mark,
         bootstrap=bootstrap,
+        proxy=proxy,
     )
     if result.status != 200:
         raise BinaryError(f"GitHub API вернул HTTP {result.status}")
@@ -160,6 +162,11 @@ def get_release(
         raise BinaryError("GitHub API вернул не JSON") from exc
     if not isinstance(data, dict):
         raise BinaryError("GitHub API вернул неожиданный ответ")
+    return release_from_api(data)
+
+
+def release_from_api(data: dict) -> Release:
+    """Release из одного выпуска в ответе API GitHub (и /tags/…, и списка /releases)."""
     tag = str(data.get("tag_name") or "")
     assets = {
         str(asset.get("name")): str(asset.get("browser_download_url"))
@@ -192,6 +199,7 @@ def download_release(
     bootstrap: Sequence[str] | None = None,
     enforce_min: bool = True,
     release: Release | None = None,
+    proxy: tuple[str, int] | None = None,
 ) -> tuple[str, Path]:
     """Скачивает zip + .dgst, проверяет SHA-256, распаковывает в dest_dir.
 
@@ -201,7 +209,7 @@ def download_release(
     бинарник на месте рабочего не окажется.
     """
     if release is None:
-        release = get_release(version, mark=mark, bootstrap=bootstrap)
+        release = get_release(version, mark=mark, bootstrap=bootstrap, proxy=proxy)
     if enforce_min and not version_ok(release.tag):
         raise BinaryError(f"версия {release.tag} ниже требуемой v{min_version_text()}")
     goos, machine = platform_pair()
@@ -211,9 +219,11 @@ def download_release(
     dgst_url = release.assets.get(asset + ".dgst") or release.assets[asset] + ".dgst"
 
     zip_result = fetch.fetch_url(
-        release.assets[asset], mark=mark, bootstrap=bootstrap, timeout=180, retries=1
+        release.assets[asset], mark=mark, bootstrap=bootstrap, timeout=180, retries=1, proxy=proxy
     )
-    dgst_result = fetch.fetch_url(dgst_url, mark=mark, bootstrap=bootstrap, timeout=30, retries=1)
+    dgst_result = fetch.fetch_url(
+        dgst_url, mark=mark, bootstrap=bootstrap, timeout=30, retries=1, proxy=proxy
+    )
     if zip_result.status != 200 or dgst_result.status != 200:
         raise BinaryError(
             f"GitHub не отдал файлы релиза (HTTP {zip_result.status}/{dgst_result.status})"

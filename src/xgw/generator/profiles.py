@@ -1,9 +1,10 @@
 """Профили обхода блокировок: каким ядром и как шлюз ведёт сервер.
 
-Пять профилей, от лёгкого к тяжёлому:
+Шесть профилей, от лёгкого к тяжёлому:
 
     xray:default           Xray, обычное соединение (ClientHello как у Chrome)
     xray:fragment          Xray, ClientHello режется на части (generator/fragment.py)
+    xray:split             Xray, первые пакеты соединения режутся на TCP-сегменты (0.1.18)
     singbox:default        sing-box, обычное соединение (другая реализация TLS и UDP)
     singbox:tls_fragment   sing-box, ClientHello режется на TCP-сегменты и записи TLS
     singbox:mux_padded     sing-box, мультиплексирование h2mux с паддингом поверх записей TLS
@@ -17,10 +18,13 @@ outbound — прямой, через дробление или мост к sing
 базе (daemon.TRIALS_META, 0.1.14) и после перезапуска продолжает.
 
 Лестница при блокировке (ступень выбирает вердикт скана, daemon.py):
-  «заморозка» (FROZEN, STALL_BEFORE_BODY): xray:fragment → singbox:default →
+  «заморозка» (FROZEN, STALL_BEFORE_BODY): xray:fragment → xray:split → singbox:default →
   singbox:tls_fragment → singbox:mux_padded;
-  отказ в соединении (CONNECT_FAIL, TIMEOUT): по одной попытке xray:fragment, singbox:default и
-  singbox:tls_fragment.
+  отказ в соединении (CONNECT_FAIL, TIMEOUT): по одной попытке xray:fragment, xray:split,
+  singbox:default и singbox:tls_fragment.
+Сервер в работе (0.1.18, ТЗ R1) при «заморозке» или отказе не списывается сразу: он
+проверяется на ступенях дробления в Xray (xray:fragment, xray:split) — на месте, без замены;
+мёртвым он считается, только если не ответил и там.
 У серверов, которые умеет только sing-box, singbox:default — база, и лестница начинается с
 singbox:tls_fragment.
 
@@ -42,10 +46,13 @@ from . import fragment as fragmenting
 
 XRAY_DEFAULT = "xray:default"
 XRAY_FRAGMENT = "xray:fragment"
+XRAY_SPLIT = "xray:split"
 SB_DEFAULT = "singbox:default"
 SB_FRAGMENT = "singbox:tls_fragment"
 SB_MUX = "singbox:mux_padded"
-ALL = (XRAY_DEFAULT, XRAY_FRAGMENT, SB_DEFAULT, SB_FRAGMENT, SB_MUX)
+ALL = (XRAY_DEFAULT, XRAY_FRAGMENT, XRAY_SPLIT, SB_DEFAULT, SB_FRAGMENT, SB_MUX)
+# Ступени дробления в Xray — их проходит сервер в работе, прежде чем его признают мёртвым.
+XRAY_FRAGMENTS = (XRAY_FRAGMENT, XRAY_SPLIT)
 
 # Буква варианта в тегах и логине моста (generator/singbox.py).
 LETTERS = {SB_DEFAULT: "d", SB_FRAGMENT: "f", SB_MUX: "m"}
@@ -53,12 +60,13 @@ PROFILE_OF_LETTER = {letter: profile for profile, letter in LETTERS.items()}
 
 # Короткая отметка в `xgw servers` и панели.
 LABELS = {
-    XRAY_DEFAULT: "xray", XRAY_FRAGMENT: "xray+frag", SB_DEFAULT: "sb",
-    SB_FRAGMENT: "sb+frag", SB_MUX: "sb+mux",
+    XRAY_DEFAULT: "xray", XRAY_FRAGMENT: "xray+frag", XRAY_SPLIT: "xray+split",
+    SB_DEFAULT: "sb", SB_FRAGMENT: "sb+frag", SB_MUX: "sb+mux",
 }
 NAMES = {
     XRAY_DEFAULT: "Xray",
     XRAY_FRAGMENT: "Xray с дроблением ClientHello",
+    XRAY_SPLIT: "Xray с нарезкой первых пакетов",
     SB_DEFAULT: "sing-box",
     SB_FRAGMENT: "sing-box с дроблением TLS",
     SB_MUX: "sing-box с мультиплексированием и паддингом",
@@ -66,13 +74,17 @@ NAMES = {
 # Профили, которым сервер обучается блокировкой: они сохраняются между сборками. Остальные —
 # выбор настроек (база), поэтому следуют за настройками. Обычный sing-box у сервера с базой
 # Xray — тоже выученный, но с условием (resolve, pin_unchanged).
-LEARNED = (XRAY_FRAGMENT, SB_FRAGMENT, SB_MUX)
+LEARNED = (XRAY_FRAGMENT, XRAY_SPLIT, SB_FRAGMENT, SB_MUX)
 # Снимок настроек ядра, по которым собран применённый конфиг (ключ meta в базе состояния).
 CORE_META = "core_settings"
+# Пробы профилей, время смены профиля и выученный обход серверов (daemon.py, 0.1.14/0.1.18).
+TRIALS_META = "profile_trials"
 
 FROZEN_VERDICTS = ("FROZEN", "STALL_BEFORE_BODY")
 REFUSED_VERDICTS = ("CONNECT_FAIL", "TIMEOUT")
 TRIGGER_VERDICTS = FROZEN_VERDICTS + REFUSED_VERDICTS
+# Вердикты, при которых сервер в работе переводится на дробление, а не списывается (ТЗ R1).
+ESCALATE_VERDICTS = ("STALL_BEFORE_BODY", "FROZEN", "CONNECT_FAIL")
 
 
 def core_of(profile: str) -> str:
@@ -121,7 +133,7 @@ def available(node: ServerNode, cfg: Config, bridged: Collection[str]) -> list[s
     if node.outbound:
         xr.append(XRAY_DEFAULT)
         if cfg.fragment.mode != "off" and fragmenting.eligible(node.outbound):
-            xr.append(XRAY_FRAGMENT)
+            xr += [XRAY_FRAGMENT, *([XRAY_SPLIT] if cfg.fragment.split else [])]
     if pin == "sing-box" and sb:
         xr = []
     elif pin == "xray" and xr:
@@ -171,7 +183,7 @@ def ladder(verdict: str, current: str, default: str, avail: list[str]) -> list[s
     сломал его самый профиль), затем ступени лестницы после нынешней. Обычный sing-box стоит
     раньше дробления в sing-box: тот же TLS, но без лишней задержки рукопожатия."""
     frozen = verdict in FROZEN_VERDICTS
-    order = [XRAY_FRAGMENT, SB_DEFAULT, SB_FRAGMENT] + ([SB_MUX] if frozen else [])
+    order = [XRAY_FRAGMENT, XRAY_SPLIT, SB_DEFAULT, SB_FRAGMENT] + ([SB_MUX] if frozen else [])
     steps: list[str] = []
     if current != default and default in avail:
         steps.append(default)

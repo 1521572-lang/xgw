@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 
 from xgw.net.cmd import CommandError
 
@@ -240,7 +241,10 @@ class FakeKernel:
                     f"{' '.join(argv)}: Error: No such file or directory\n"
                     f"list table {argv[3]} {argv[4]}"
                 )
-            return self.tables[key]
+            # Как настоящий nft: отказ по умолчанию для семейства печатается одним «reject».
+            return re.sub(
+                r"reject with icmp(?:v6)? type port-unreachable", "reject", self.tables[key]
+            )
         if argv[1:] == ["-c", "-f", "-"]:
             return ""
         if argv[1:] == ["-f", "-"] and text.startswith(("add element ", "flush set ")):

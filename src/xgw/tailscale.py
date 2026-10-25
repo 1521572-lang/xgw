@@ -67,6 +67,16 @@ def present(paths: Paths, sys_net: Path | None = None) -> bool:
 
 
 @dataclass(frozen=True)
+class Peer:
+    """Устройство tailnet из `status --json` (Peer): имя, адрес IPv4, система, в сети ли."""
+
+    name: str
+    address: str
+    os: str = ""
+    online: bool = False
+
+
+@dataclass(frozen=True)
 class Status:
     """Нужное из `tailscale status --json`; пусто — поля нет."""
 
@@ -75,6 +85,10 @@ class Status:
     dns_name: str = ""  # Self.DNSName без точки в конце
     addresses: tuple[str, ...] = ()  # Self.TailscaleIPs
     magic_dns: bool | None = None  # CurrentTailnet.MagicDNSEnabled
+    peers: tuple[Peer, ...] = ()
+    # Шлюз одобрен выходным узлом: 0.0.0.0/0 в Self.AllowedIPs; None — поля нет.
+    exit_approved: bool | None = None
+    relay: str = ""  # Self.Relay — код домашнего региона DERP («fra»); пусто — не известен
 
 
 def parse_status(text: str) -> Status | None:
@@ -89,13 +103,33 @@ def parse_status(text: str) -> Status | None:
     tailnet = data.get("CurrentTailnet") if isinstance(data.get("CurrentTailnet"), dict) else {}
     addresses = me.get("TailscaleIPs")
     magic = tailnet.get("MagicDNSEnabled")
+    allowed = me.get("AllowedIPs")
     return Status(
         backend=str(data.get("BackendState") or ""),
         auth_url=str(data.get("AuthURL") or ""),
         dns_name=str(me.get("DNSName") or "").rstrip("."),
         addresses=tuple(str(item) for item in addresses) if isinstance(addresses, list) else (),
         magic_dns=magic if isinstance(magic, bool) else None,
+        peers=_peers(data.get("Peer")),
+        exit_approved="0.0.0.0/0" in allowed if isinstance(allowed, list) else None,
+        relay=str(me.get("Relay") or ""),
     )
+
+
+def _peers(value: object) -> tuple[Peer, ...]:
+    found: list[Peer] = []
+    for item in value.values() if isinstance(value, dict) else ():
+        if not isinstance(item, dict):
+            continue
+        ips = item.get("TailscaleIPs")
+        address = next((str(ip) for ip in ips if ":" not in str(ip)), "") if isinstance(
+            ips, list) else ""
+        if not address:
+            continue
+        name = str(item.get("HostName") or "") or str(item.get("DNSName") or "").split(".")[0]
+        found.append(Peer(name=name or address, address=address, os=str(item.get("OS") or ""),
+                          online=item.get("Online") is True))
+    return tuple(sorted(found, key=lambda peer: (not peer.online, peer.name.lower())))
 
 
 def status(runner: cmd.Runner = cmd.run) -> Status | None:
@@ -145,6 +179,40 @@ def netcheck(runner: cmd.Runner = cmd.run) -> Netcheck | None:
         return parse_netcheck(runner(["tailscale", "netcheck"], timeout=30.0))
     except cmd.CommandError:
         return None
+
+
+def parse_derp_hosts(text: str, region: str) -> list[str]:
+    """Имена серверов DERP региона region из `tailscale debug derp-map` (JSON: Regions →
+    {RegionCode, Nodes: [{HostName}]}); нет региона — серверы всех регионов по порядку
+    номеров. Пусто — не JSON или карта пустая."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    regions = data.get("Regions") if isinstance(data, dict) else None
+    if not isinstance(regions, dict):
+        return []
+    picked: list[str] = []
+    others: list[str] = []
+    for key in sorted(regions, key=lambda item: int(item) if str(item).isdigit() else 10**6):
+        item = regions[key]
+        if not isinstance(item, dict) or not isinstance(item.get("Nodes"), list):
+            continue
+        names = [str(node.get("HostName") or "") for node in item["Nodes"]
+                 if isinstance(node, dict) and node.get("HostName")]
+        (picked if region and item.get("RegionCode") == region else others).extend(names)
+    return picked or others
+
+
+def derp_hosts(runner: cmd.Runner = cmd.run) -> list[str]:
+    """Серверы DERP домашнего региона шлюза (Self.Relay), а не известен он — всех регионов.
+    Пусто — CLI нет или он не ответил (проверять нечего)."""
+    me = status(runner)
+    try:
+        text = runner(["tailscale", "debug", "derp-map"], timeout=COMMAND_TIMEOUT)
+    except cmd.CommandError:
+        return []
+    return parse_derp_hosts(text, me.relay if me is not None else "")
 
 
 def default_route_dns(text: str) -> bool | None:
@@ -205,6 +273,7 @@ class Prefs:
     ssh: bool | None = None  # RunSSH: Tailscale SSH включён
     netfilter: int | None = None  # NetfilterMode
     accept_dns: bool | None = None  # CorpDNS: --accept-dns
+    exit_node: bool | None = None  # AdvertiseRoutes с 0.0.0.0/0: --advertise-exit-node
 
 
 def parse_prefs(text: str) -> Prefs | None:
@@ -215,11 +284,14 @@ def parse_prefs(text: str) -> Prefs | None:
     if not isinstance(data, dict):
         return None
     ssh, netfilter, dns = data.get("RunSSH"), data.get("NetfilterMode"), data.get("CorpDNS")
+    routes = data.get("AdvertiseRoutes")
     return Prefs(
         ssh=ssh if isinstance(ssh, bool) else None,
         netfilter=netfilter if isinstance(netfilter, int) and not isinstance(netfilter, bool)
         else None,
         accept_dns=dns if isinstance(dns, bool) else None,
+        exit_node=("0.0.0.0/0" in routes) if isinstance(routes, list) else (
+            False if routes is None and "AdvertiseRoutes" in data else None),
     )
 
 
@@ -308,6 +380,13 @@ def serve_off(runner: cmd.Runner = cmd.run) -> None:
 def set_ssh(on: bool, runner: cmd.Runner = cmd.run) -> None:
     """Tailscale SSH: `set` меняет только названную настройку (в отличие от `up`)."""
     runner(["tailscale", "set", "--ssh" if on else "--ssh=false"], timeout=COMMAND_TIMEOUT)
+
+
+def set_exit_node(on: bool, runner: cmd.Runner = cmd.run) -> None:
+    """Шлюз — выходной узел tailnet (ASSUMPTIONS п. 230); `set` меняет только эту настройку.
+    Одобряет его владелец tailnet в консоли (или правило autoApprovers)."""
+    runner(["tailscale", "set", f"--advertise-exit-node={'true' if on else 'false'}"],
+           timeout=COMMAND_TIMEOUT)
 
 
 FIXES = {

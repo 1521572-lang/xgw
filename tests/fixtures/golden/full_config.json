@@ -361,6 +361,13 @@
       {
         "type": "field",
         "domain": [
+          "domain:ts.net"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
           "domain:ru",
           "domain:su",
           "domain:xn--p1ai"

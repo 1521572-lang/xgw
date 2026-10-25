@@ -1,8 +1,9 @@
 """Панель XGW на выдуманных данных — чтобы посмотреть на неё без шлюза и без root.
 
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
-                                                      budget|waiting|reserve|tailscale]
-                               [--app-port 8792]
+                                                      budget|waiting|reserve|tailscale|stranded|
+                                                      cores|tspu]
+                               [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -11,15 +12,28 @@
 сам адрес проверки (probe.url), budget — проверки расходуют больше суточного лимита,
 waiting — VPN включён, но Xray ещё не перезапущен с новыми настройками, reserve —
 безлимитные серверы не отвечают, и трафик несёт резервный лимитированный (x1),
+cores — на GitHub есть новые Xray и sing-box (карточка «Ядра»: «Обновить» и «Вернуть …» идут
+по этапам за несколько секунд, обновление sing-box «не проходит проверку»),
 tailscale — шлюз ещё не в tailnet (вход через 12 секунд после нажатия), провайдер выдаёт
 адрес CGNAT (К5), включён Override local DNS (К6), HTTPS в tailnet разрешается через
 10 секунд, Funnel — тоже через 10 секунд. В остальных сценах Tailscale работает, в empty —
 не установлен. «Привязать телефон»: через 10 секунд после QR-кода «телефон» привязывается сам.
+Сцена stranded — мёртвого участника заменить некем, а «высокий» стоит у лимитированных x10,
+хотя безлимитные живы (пояснения под «Серверами», ASSUMPTIONS п. 235).
+Сцена tspu (0.1.18) — выученный обход у Германии («xray+split после STALL_BEFORE_BODY»),
+Латвия «нестабильна по ТСПУ», скорость основного «из трафика», идёт поиск замены придушенному
+серверу, один проверочный хост на паузе, один резолвер bootstrap-DNS не отвечает, Tailscale
+временно через VPN. Иконка ↻ у скорости — замер одного сервера (5 секунд) — во всех сценах.
 
 --app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
 не привязывается: на каждый новый код печатается ссылка для эмулятора
 xgw://pair?u=http://10.0.2.2:ПОРТ&c=КОД (adb shell am start -a android.intent.action.VIEW -d …).
+
+--phone-server — для VPN приложения на эмуляторе (А3): «применённый конфиг шлюза» — эталонный
+(tests/fixtures/golden/full_config.json) с одним сервером VLESS без TLS на ХОСТ:ПОРТ (для
+эмулятора — 10.0.2.2), и /api/phone-config собирает из него конфиг телефона настоящим кодом
+(generator/phone.py).
 """
 
 from __future__ import annotations
@@ -39,7 +53,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_tailscale import FakeTailscale
 
-from xgw import actions, config, engine, tailscale
+from xgw import actions, config, cores, cost, engine, tailscale
+from xgw.daemon import stranded_action, stranded_note
 from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
@@ -142,6 +157,10 @@ RESERVE_LIVE = {
 }
 
 
+# Версии ядер «на шлюзе»: их меняют кнопки карточки «Ядра» (DemoPanel._core_demo).
+VERSIONS = {"xray": "26.3.27", "sing-box": "1.14.3"}
+
+
 def _servers(scene: str) -> list[tuple]:
     if scene == "reserve":
         return RESERVE_SERVERS
@@ -149,6 +168,24 @@ def _servers(scene: str) -> list[tuple]:
         return SERVERS
     return [(key, tag, HOSTILE.get(key, name), source, role)
             for key, tag, name, source, role in SERVERS]
+
+
+def _tspu_fields(scene: str, fingerprint: str, now: float) -> dict:
+    """Сцена tspu: выученный обход, «нестабилен по ТСПУ», скорость из трафика и сумма замера
+    (сам замер + трафик клиентов) — поля, которые 0.1.18 добавила в строку сервера."""
+    if scene != "tspu":
+        return {}
+    fields: dict = {}
+    if fingerprint == MAIN_FP:
+        fields.update(speed_passive_mbps=54.2, speed_passive_ts=now - 120,
+                      speed_test_mbps=61.0, speed_bg_mbps=26.3)
+    if fingerprint == "b2b2b2b2":
+        fields.update(profile="xray:split", core="xray", escalation={
+            "profile": "xray:split", "label": "xray+split", "verdict": "STALL_BEFORE_BODY",
+            "ts": now - 3 * 3600})
+    if fingerprint == "a7a7a7a7":
+        fields["unstable_until"] = now + 4 * 3600
+    return fields
 
 
 def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
@@ -166,7 +203,8 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         if role == "member":
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             members.append({
-                **base, "alive": live["alive"], "delay_ms": live["delay_ms"],
+                **base, **_tspu_fields(scene, fingerprint, now),
+                "alive": live["alive"], "delay_ms": live["delay_ms"],
                 "dead_since": now - live["dead"] if live.get("dead") else None,
                 "main": scene not in ("reserve", "trouble") and fingerprint == MAIN_FP,
                 "speed_mbps": measure["mbps"] if measure else None,
@@ -182,7 +220,8 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             verdict = live["verdict"]
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
             spares.append({
-                **base, "verdict": verdict, "seconds": live["seconds"],
+                **base, **_tspu_fields(scene, fingerprint, now),
+                "verdict": verdict, "seconds": live["seconds"],
                 "bytes": 65536 if verdict in ("OK", "SLOW") else 16384,
                 "scanned": now - 1500 if verdict else None,
                 "reserve": scene == "reserve" and fingerprint == RESERVE_FP,
@@ -223,13 +262,25 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
     probe_cfg = config.Config()
     if scene == "budget":
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
+    stranded = class_note = ""
+    if scene == "stranded":
+        # Как на шлюзе 24.10.2026: четыре сервера «высокий» x10 в работе, один мёртв, живые
+        # безлимитные — «средние», сервер выбран вручную. Тексты — из кода шлюза.
+        tier = cost.Klass(0, 10.0)
+        action = stranded_action(tier, True)
+        stranded = stranded_note(["🇹🇷 x10 Турция"], tier, True)
+        unlimited = {"priority": "medium", "cost": 0.0, "verdict": "OK", "scanned": now}
+        class_note = status.class_warning(
+            probe_cfg, [{"priority": "high", "cost": 10.0}], [unlimited] * 34,
+            {"tag": "proxy-pl-0000"}, now,
+        )
     budget = status.probe_budget(
         probe_cfg, len(members), len(spares),
         speed_mb=status.speed_daily_mb(probe_cfg, members, spares),
     )
     return {
         "updated": now, "daemon": True, "state": state, "action": action, "since": now - 900,
-        "xray": {"ok": scene != "trouble", "version": "26.3.27"},
+        "xray": {"ok": scene != "trouble", "version": VERSIONS["xray"]},
         # Жизненный цикл перехвата пишет демон (daemon.Lifecycle); панель — строкой под кнопкой.
         "capture": {
             "loaded": True,
@@ -256,12 +307,44 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             "excluded": len(excluded), "dns": 1,
         },
         "probe_target": probe_target,
+        "stranded": stranded, "class_warning": class_note,
+        **_tspu_status(scene, now),
         "pending_restart": False, "events": [],
-        "singbox": {"mode": "auto", "installed": True, "version": "1.14.3", "expected": True,
+        "singbox": {"mode": "auto", "installed": True, "version": VERSIONS["sing-box"],
+                    "expected": True,
                     "alive": True, "failed": False,
                     "bridged": sum(
                         1 for item in (*members, *spares) if item["core"] == "sing-box")},
         "singbox_pending": False,
+    }
+
+
+def _tspu_status(scene: str, now: float) -> dict:
+    """Сцена tspu: проверочные хосты (R3), bootstrap-DNS (R4a), Tailscale через VPN (R4b) и
+    поиск замены придушенному серверу (R6)."""
+    if scene != "tspu":
+        return {}
+    hosts = [
+        {"host": "cdn.jsdelivr.net", "url": "https://cdn.jsdelivr.net/a.woff", "ok": 812,
+         "errors": 0},
+        {"host": "code.jquery.com", "url": "https://code.jquery.com/b.js", "ok": 40,
+         "errors": 3, "paused_until": now + 22 * 60, "last_error": "STALL_BEFORE_BODY"},
+        {"host": "ajax.aspnetcdn.com", "url": "https://ajax.aspnetcdn.com/c.ttf", "ok": 77,
+         "errors": 0},
+    ]
+    resolvers = [
+        {"entry": "https://1.1.1.1", "ok": True, "ms": 41, "error": ""},
+        {"entry": "https://8.8.8.8", "ok": True, "ms": 41, "error": ""},
+        {"entry": "https://9.9.9.9:5053", "ok": False, "ms": 5000, "error": "тайм-аут"},
+    ]
+    return {
+        "probe_hosts": {"current": hosts[0]["url"], "hosts": hosts},
+        "resolvers": {"ts": now - 600, "results": resolvers},
+        "tailscale_via_vpn": True,
+        "guard": {"on": True, "throttled": ["c3c3c3c3"], "suspects": [],
+                  "episode": {"name": "🇫🇮 Финляндия · Хельсинки", "role": "member",
+                              "mbps": 6.4, "tried": 2, "total": 5},
+                  "cooldown_until": None, "spent_mb": 34.0, "daily_mb": 300},
     }
 
 
@@ -293,6 +376,7 @@ class DemoDaemon:
     def __init__(self) -> None:
         self.poke = threading.Event()
         self._until = {"refresh": 0.0, "scan": 0.0, "speed": 0.0}
+        self._one: dict[str, float] = {}
 
     def request_refresh(self) -> None:
         self._until["refresh"] = time.time() + 4
@@ -303,9 +387,19 @@ class DemoDaemon:
     def request_speed(self) -> None:
         self._until["speed"] = time.time() + 8
 
+    def request_core_check(self) -> None:
+        self._until["cores"] = time.time() + 3
+
+    def request_speed_one(self, key: str) -> None:
+        self._one[key] = time.time() + 5  # «замер» одного сервера идёт 5 с
+
+    def speed_one_pending(self) -> list[str]:
+        return sorted(key for key, until in self._one.items() if time.time() < until)
+
     refresh_pending = property(lambda self: time.time() < self._until["refresh"])
     scan_pending = property(lambda self: time.time() < self._until["scan"])
     speed_pending = property(lambda self: time.time() < self._until["speed"])
+    cores_pending = property(lambda self: time.time() < self._until.get("cores", 0.0))
 
 
 class DemoPanel(Panel):
@@ -343,10 +437,82 @@ class DemoPanel(Panel):
             later = {"tailscale/login": fake.complete_login, "tailscale/serve": fake.enable_https,
                      "tailscale/funnel": fake.allow_funnel, "phones/pair": fake.allow_funnel}[name]
             threading.Timer(12 if name == "tailscale/login" else 10, later).start()
+        if name in ("cores/update", "cores/rollback"):
+            return self._core_demo(name.removeprefix("cores/"), body)
         outcome = super()._act(name, body)
         if name == "phones/pair" and outcome.ok and self.demo_phone:
             threading.Timer(20, self._demo_phone).start()
         return outcome
+
+    def _core_demo(self, action: str, body: dict) -> actions.Outcome:
+        """Как служба xgw-core, но за секунды: этапы в cores.json, затем итог и событие. Обновление
+        sing-box «не проходит» сквозную проверку — видно, как шлюз возвращает прежний."""
+        core = body.get("core")
+        if core not in cores.CORES:
+            return actions.Outcome(2, "ожидается ядро: xray или sing-box")
+        title, paths = cores.TITLES[core], self.paths
+        old = VERSIONS[core]
+        target = body.get("version") if action == "update" else cores.previous(paths, core)
+        if not target:
+            return actions.Outcome(2, f"прежней версии {title} нет — возвращаться не к чему")
+
+        def stage(step: str, **job) -> None:
+            state = cores.load_state(paths)
+            state["job"] = {**(state.get("job") or {}), "stage": step, **job}
+            cores.save_state(paths, state)
+
+        def run() -> None:
+            now = time.time()
+            stage("", core=core, action=action, version=target, state="running", started=now,
+                  text="", finished=None)
+            steps = [f"скачиваю {title} {target} с GitHub", f"проверяю {title} {target} на рабочем "
+                     "конфиге", f"ставлю {title} {target} и перезапускаю",
+                     f"проверяю запрос через серверы с {title} {target}"]
+            if action == "rollback":
+                steps = [f"проверяю прежний {title} {target} на рабочем конфиге",
+                         f"возвращаю {title} {target}"]
+            for text in steps:
+                stage(text)
+                time.sleep(2)
+            state = cores.load_state(paths)
+            if action == "update" and core == "sing-box":
+                reason = "ни один из серверов, что отвечали через прежнюю версию, не отвечает 45 с"
+                state[core] = {**(state.get(core) or {}),
+                               "rejected": {"version": target, "reason": reason,
+                                            "at": time.time(), "kind": "check"}}
+                text, result = (f"{title} {target} не прошёл проверку: {reason} — возвращён "
+                                f"прежний {old}", "failed")
+            elif action == "update":
+                VERSIONS[core] = target
+                prev = cores.prev_dir(paths, core)
+                prev.mkdir(parents=True, exist_ok=True)
+                (prev / cores.core_bin(paths, core).name).write_text(old, encoding="utf-8")
+                state[core] = {"accepted": target, "previous": old, "updated": time.time(),
+                               "watch_until": time.time() + cores.WATCH_SECONDS, "rejected": None}
+                text = (f"{title} обновлён: {old} → {target}, проверки пройдены. Сутки шлюз "
+                        f"следит за ним и вернёт {old} сам, если ядро перестанет отвечать. "
+                        f"Вернуть {old} — кнопка «Вернуть {old}» в панели")
+                result = "ok"
+            else:
+                VERSIONS[core] = target
+                cores.forget(paths, core)
+                state = cores.load_state(paths)
+                state[core] = {"accepted": target, "previous": "", "watch_until": 0,
+                               "rejected": {"version": old, "reason": "возвращена прежняя версия",
+                                            "kind": "rollback",
+                                            "at": time.time()}}
+                text, result = f"{title} {old} убран, возвращён прежний {target}", "ok"
+            state["job"] = {**state["job"], "state": result, "stage": "", "text": text,
+                            "finished": time.time()}
+            cores.save_state(paths, state)
+            with actions.open_store(paths) as store:
+                store.add_event("cores", text)
+
+        threading.Thread(target=run, daemon=True).start()
+        if action == "update":
+            return actions.Outcome(0, f"Обновляю {title} до {target}: скачиваю и проверяю — итог "
+                                      "появится в карточке «Ядра» и в событиях")
+        return actions.Outcome(0, f"Возвращаю {title} {target}…")
 
     def _demo_phone(self) -> None:
         code = self.phones.pairing()["code"]
@@ -438,6 +604,15 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         store.add_event("rotation", "замена участников: proxy-tr-0000 → «🇫🇮 Финляндия · Хельсинки»")
     store.add_event("capture", "перехват включён: сеть enp4s0 и эта машина — через Xray")
     store.close()
+    if scene == "cores":
+        VERSIONS["xray"] = "26.10.21"
+        atomic_write_json(paths.cores_check_file, {
+            "at": now - 2 * 3600, "error": "",
+            "xray": {"installed": "26.10.21", "withdrawn": False, "error": "", "latest": {
+                "version": "26.10.30", "prerelease": True, "published": "2026-10-23T09:12:00Z"}},
+            "sing-box": {"installed": "1.14.3", "withdrawn": False, "error": "", "latest": {
+                "version": "1.14.4", "prerelease": False, "published": "2026-10-22T18:40:00Z"}},
+        }, mode=0o644)
 
     def keep_fresh() -> None:  # как демон: статус переписывается на каждом шаге
         while True:
@@ -455,6 +630,11 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
         DemoCapture.inbound_missing = (
             "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0")
     fake = FakeTailscale(backend="NeedsLogin" if scene == "tailscale" else "Running")
+    fake.peers = [  # «Устройства tailnet» в карточке (выходной узел)
+        {"HostName": "galaxy-s25-ultra", "TailscaleIPs": ["100.101.2.3"], "OS": "android",
+         "Online": True},
+        {"HostName": "laptop", "TailscaleIPs": ["100.101.2.9"], "OS": "windows", "Online": False},
+    ]
     if scene == "tailscale":
         fake.cgnat_wan = fake.override_dns = True
         fake.https_enabled = False
@@ -468,8 +648,43 @@ def build(root: Path, port: int, scene: str) -> DemoPanel:
                       which=lambda name: None if scene == "empty" else f"/usr/bin/{name}",
                       spawn=fake.spawn, sys_net=root / "sys-class-net", app_port=0)
     panel.ts_wait = 1.0
+    panel.recorder.opener = DemoSniffer  # «Записать трафик»: кадры выдумывает демо
     panel.configure(cfg, DemoDaemon())
     return panel
+
+
+class DemoSniffer:
+    """Сокет записи трафика без root: кадр устройства раз в 0,05 с (watch/record.py)."""
+
+    def __init__(self, _interface: str, mac: str) -> None:
+        self.frame = bytes.fromhex(mac.replace(":", "")) + bytes(6) + b"\x08\x00" + bytes(200)
+
+    def settimeout(self, _value) -> None:
+        pass
+
+    def recv_into(self, buffer, size, _flags) -> int:
+        time.sleep(0.05)
+        buffer[:len(self.frame)] = self.frame
+        return len(self.frame)
+
+    def close(self) -> None:
+        pass
+
+
+def phone_gateway(spec: str) -> dict:
+    """Применённый конфиг «шлюза» с одним сервером VLESS ХОСТ:ПОРТ:UUID (--phone-server)."""
+    host, port, uuid = spec.rsplit(":", 2)
+    golden = Path(__file__).resolve().parent / "fixtures/golden/full_config.json"
+    applied = json.loads(golden.read_text(encoding="utf-8"))
+    members = [item for item in applied["outbounds"]
+               if item["tag"].startswith(("proxy-", "spare-"))]
+    keep = members[0]
+    keep.update(protocol="vless", settings={"vnext": [{
+        "address": host, "port": int(port), "users": [{"id": uuid, "encryption": "none"}],
+    }]}, streamSettings={"network": "tcp", "sockopt": {"mark": 2}})
+    applied["outbounds"] = [item for item in applied["outbounds"] if item not in members[1:]]
+    applied["dns"].pop("hosts", None)
+    return applied
 
 
 def main() -> None:
@@ -478,12 +693,15 @@ def main() -> None:
     parser.add_argument(
         "--scene", default="work",
         choices=("work", "empty", "trouble", "hostile", "probe", "budget", "waiting",
-                 "reserve", "tailscale"))
+                 "reserve", "tailscale", "cores", "stranded", "tspu"))
     parser.add_argument("--app-port", type=int, default=0)
+    parser.add_argument("--phone-server", default="")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
         panel = build(Path(root), args.port, args.scene)
         panel.demo_phone = not args.app_port
+        if args.phone_server:
+            atomic_write_json(panel.paths.xray_config_file, phone_gateway(args.phone_server))
         panel.start()
         print(f"Панель: http://127.0.0.1:{panel.port}/?token={TOKEN}", flush=True)
         if args.app_port:

@@ -618,7 +618,8 @@ def test_probe_all_points_at_the_probe_url_when_everything_fails_the_same_way(
     assert gateway.run("probe", "--all") == 0
     captured = capsys.readouterr()
     assert captured.out.count("CONNECT_FAIL") == 4
-    assert "пробы всех серверов падают — вероятно, недоступен сам probe.url" in captured.err
+    assert "пробы всех серверов падают — вероятно, недоступны сами проверочные хосты" in (
+        captured.err)
     assert "(HTTP 403)" in captured.err and "xgw diag" in captured.err
 
 

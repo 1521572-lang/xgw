@@ -134,6 +134,24 @@ class Paths:
     def singbox_last_good_file(self) -> Path:
         return self.var / "sing-box.last-good.json"
 
+    # --- обновление ядер из панели (cores.py) ------------------------------------
+
+    @property
+    def cores_state_file(self) -> Path:
+        """Принятые шлюзом версии ядер, прежние версии для отката, наблюдение и итог задания.
+        Пишет только задание (служба xgw-core): у демона /opt/xgw только для чтения."""
+        return self.var / "cores.json"
+
+    @property
+    def cores_check_file(self) -> Path:
+        """Что нашлось на GitHub при последней проверке выпусков (пишет демон)."""
+        return self.var / "cores-check.json"
+
+    @property
+    def cores_request_file(self) -> Path:
+        """Задание для службы xgw-core: какое ядро обновить или откатить."""
+        return self.run / "core-request.json"
+
     # --- установка (этап 4) -------------------------------------------------------
 
     @property
@@ -167,6 +185,11 @@ class Paths:
     def panel_token_file(self) -> Path:
         """Токен панели управления."""
         return self.var / "panel-token"
+
+    @property
+    def records_dir(self) -> Path:
+        """Записи трафика устройств (watch/record.py), 0700."""
+        return self.var / "records"
 
     @property
     def desktop_file(self) -> Path:

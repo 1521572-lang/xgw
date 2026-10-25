@@ -23,7 +23,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import __version__, actions, config, desktop, engine, log, managed, priority
+from . import __version__, actions, config, desktop, engine, log, managed, priority, tray
 from . import pin as pinning
 from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
@@ -147,6 +147,24 @@ def main(argv: list[str] | None = None) -> int:
         "update-singbox", parents=[common],
         help="установить или обновить sing-box (проверенная версия, SHA-256, sing-box check)",
     )
+    cores_parser = subparsers.add_parser(
+        "cores", parents=[common],
+        help="ядра Xray и sing-box: выпуски на GitHub, обновление с проверкой, возврат прежней",
+    )
+    cores_sub = cores_parser.add_subparsers(dest="cores_action")
+    cores_sub.add_parser("status", help="что стоит, что есть на GitHub, к чему можно вернуться")
+    cores_sub.add_parser("check", help="проверить выпуски на GitHub сейчас")
+    cores_update = cores_sub.add_parser(
+        "update", help="обновить ядро: проверка на рабочем конфиге, при сбое — возврат прежнего",
+    )
+    cores_update.add_argument("core", choices=("xray", "sing-box"))
+    cores_update.add_argument(
+        "--version", default="", help="какую версию (по умолчанию — новейшую с GitHub)",
+    )
+    cores_back = cores_sub.add_parser("rollback", help="вернуть прежнюю рабочую версию ядра")
+    cores_back.add_argument("core", choices=("xray", "sing-box"))
+    # Задание от панели — его выполняет служба xgw-core.service.
+    cores_sub.add_parser("run-job", help=argparse.SUPPRESS)
     core = subparsers.add_parser(
         "core", parents=[common],
         help="закрепить за сервером ядро: xray, sing-box или auto (выбирает шлюз)",
@@ -166,8 +184,20 @@ def main(argv: list[str] | None = None) -> int:
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
     )
+    tray_parser = subparsers.add_parser(
+        "tray", help="значок XGW в трее рабочего стола (запускается при входе в сеанс)",
+    )
+    tray_parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
+    tray_parser.add_argument(
+        "--replace", action="store_true",
+        help="закрыть уже запущенный значок и встать на его место (так запускает установка)",
+    )
 
     args = parser.parse_args(argv)
+    if args.command == "tray":
+        # От имени человека, в его графическом сеансе: ни config.toml (0600 root), ни журнал
+        # XGW значку не нужны — порт панели и токен трея лежат в его ~/.config/xgw.
+        return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
     paths = Paths.from_env()
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
@@ -207,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         "diag": _cmd_diag,
         "update-xray": _cmd_update_xray,
         "update-singbox": _cmd_update_singbox,
+        "cores": _cmd_cores,
         "core": _cmd_core,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
@@ -867,6 +898,94 @@ def _cmd_update_singbox(args, cfg: config.Config, paths: Paths, logger) -> int:
     if problem:
         return _fail(problem)
     return update_singbox(cfg, paths, logger=logger)
+
+
+def _cmd_cores(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """`xgw cores` — то же, что карточка «Ядра» в панели (cores.py)."""
+    from . import cores
+
+    action = args.cores_action or "status"
+    if action == "status":
+        print(_cores_text(paths))
+        return 0
+    problem = _system_root_problem(paths)
+    if problem:
+        return _fail(problem)
+    if action == "run-job":
+        return cores.run_request(cfg, paths, logger=logger)
+    installed = {
+        core: cores.read_version(core, cores.core_bin(paths, core)) for core in cores.CORES
+    }
+    if action == "check" or (action == "update" and not args.version):
+        record, events = cores.check(cfg, paths, installed, mark=engine.bypass_mark(cfg, logger))
+        from .watch.notify import Notifier
+
+        notifier = Notifier(paths.db_file, cfg.notify.min_interval_min, logger=logger)
+        for text, notify in events:
+            notifier.event("cores", text, notify=notify)
+        if action == "check":
+            print(_cores_text(paths))
+            return 1 if record.get("error") else 0
+        latest = (record.get(args.core) or {}).get("latest") or {}
+        if not latest.get("version"):
+            error = (record.get(args.core) or {}).get("error")
+            return _fail(f"не удалось узнать выпуски на GitHub: {error}" if error
+                         else f"на GitHub нет {cores.TITLES[args.core]} новее установленного")
+        args.version = latest["version"]
+    if cores.job_active(paths, time.time()):
+        return _fail("уже идёт обновление или возврат ядра — дождитесь итога (xgw cores)")
+    job = cores.Job(cfg, paths, logger=logger)
+    if action == "update":
+        return job.run(args.core, "update", args.version, reason="cli")
+    return job.run(args.core, "rollback", reason="cli")
+
+
+def _cores_text(paths: Paths) -> str:
+    from . import cores
+
+    installed = {
+        core: cores.version_text(cores.read_version(core, cores.core_bin(paths, core)))
+        for core in cores.CORES
+    }
+    card = cores.panel_state(paths, installed, singbox_shown=True, now=time.time())
+    lines = []
+    for row in card["rows"]:
+        title, core = row["title"], row["core"]
+        if not row["installed"]:
+            lines.append(f"{title}: не установлен")
+            continue
+        origin = ("принята шлюзом после обновления из панели" if row["accepted"]
+                  else "проверена XGW" if row["installed"] == row["baseline"]
+                  else f"не та версия: XGW проверен на {row['baseline']}")
+        lines.append(f"{title} {row['installed']} — {origin}")
+        if row["withdrawn"]:
+            lines.append("  убрана с GitHub разработчиками — обновите ядро")
+        latest = row["latest"]
+        if latest:
+            kind = ", предварительный выпуск" if latest.get("prerelease") else ""
+            lines.append(f"  на GitHub: {latest['version']}{kind} — sudo xgw cores update {core}")
+        if row["previous"]:
+            lines.append(f"  прежняя версия {row['previous']} — sudo xgw cores rollback {core}")
+        if row["watch_until"]:
+            lines.append("  наблюдение до " + time.strftime(
+                "%d.%m %H:%M", time.localtime(float(row["watch_until"]))))
+        rejected = row["rejected"]
+        if rejected:
+            lines.append(
+                f"  не прошла проверку: {rejected.get('version')} — {rejected.get('reason')}"
+            )
+    if card["checked"]:
+        when = time.strftime("%d.%m.%Y %H:%M", time.localtime(float(card["checked"])))
+        lines.append(f"Выпуски на GitHub проверены {when}"
+                     + (f", ошибка: {card['error']}" if card["error"] else ""))
+    else:
+        lines.append("Выпуски на GitHub ещё не проверялись: sudo xgw cores check")
+    job = card["job"]
+    if job:
+        words = {"running": "идёт", "ok": "готово", "failed": "не удалось"}
+        state = words.get(job.get("state"), "")
+        lines.append(f"Последнее задание ({state}): {job.get('text') or job.get('stage') or ''}")
+    return "\n".join(lines)
 
 
 def _cmd_core(args, cfg: config.Config, paths: Paths, logger) -> int:

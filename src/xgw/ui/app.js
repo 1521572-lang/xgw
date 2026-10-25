@@ -41,7 +41,8 @@
     subscription: "подписка", xray: "Xray", budget: "трафик проверок", leak: "утечка",
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
-    singbox: "sing-box", core: "ядро сервера",
+    singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
+    guard: "контроль скорости", cores: "обновление ядер",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -49,7 +50,12 @@
   const ICONS = {
     remove: ["M6 6l12 12", "M18 6L6 18"],
     edit: ["M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7", "M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"],
+    record: ["M12 6a6 6 0 1 0 0 12a6 6 0 1 0 0-12z"],
+    stop: ["M7 7h10v10H7z"],
+    download: ["M12 3v12", "M7 10l5 5 5-5", "M5 21h14"],
+    remeasure: ["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"],
   };
+  const RECORD_SECONDS = 300; // запись трафика устройства — 5 минут, остановить можно раньше
 
   let state = null;
   let acting = false;
@@ -232,16 +238,24 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, s.sticky, (s.busy || {}).speed_one, Math.floor(s.now / 60)], () => renderServers(s));
     draw("main", [s.main, s.sticky, s.pin, s.members.length, (s.budget || {}).speed_mb], () => renderMain(s));
+    draw("guard", [s.guard, Math.floor(s.now / 60)], () => renderGuard(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
-    draw("devices", [s.devices, s.lan], () => renderDevices(s));
+    // Идущая запись трафика: строки перерисовываются, только когда она началась или кончилась,
+    // а время и размер меняются в метке — иначе кнопка «Остановить» уплывала бы из-под мыши.
+    const recording = (s.records || {}).active;
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : ""], () => renderDevices(s));
+    const recTag = $("devices").querySelector(".tag.rec");
+    if (recTag && recording) recTag.textContent = recordText(recording, s.now);
     draw("events", s.events, () => renderEvents(s));
     draw("tailscale", s.tailscale, () => renderTailscale(s));
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
-    draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name)], () => renderNotes(s));
+    draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
+    setBusy($("cores-check"), s.busy.cores);
+    draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
     setBusy($("speed"), s.busy.speed);
@@ -273,6 +287,28 @@
       if (nodes.excluded) text += ` · отключено вами: ${nodes.excluded}`;
       summary.textContent = text;
     }
+
+    // Проверочные хосты (ТЗ R3), bootstrap-DNS (R4a), Tailscale через VPN (R4b).
+    const net = $("network-note");
+    const netLines = [];
+    const hosts = (s.probe_hosts || {}).hosts || [];
+    if (hosts.length > 1) {
+      const current = (s.probe_hosts || {}).current;
+      netLines.push("Проверочные хосты: " + hosts.map((host) => host.host
+        + (host.url === current ? " (активный)" : "")
+        + (host.errors ? ` — ошибок ${host.errors}` : "")
+        + (host.paused_until && host.paused_until > s.now ? `, пропускается до ${clock(host.paused_until)}` : "")).join("; ") + ".");
+    }
+    const resolvers = (s.resolvers || {}).results || [];
+    const dead = resolvers.filter((item) => !item.ok);
+    if (dead.length) {
+      netLines.push(`bootstrap-DNS: не отвечают ${dead.length} из ${resolvers.length} (${dead.map((item) => item.entry).join(", ")}) — резолвер пробует их последними.`);
+    }
+    if (s.tailscale_via_vpn) {
+      netLines.push("Tailscale временно идёт через VPN: серверы DERP напрямую не отвечают; когда ответят, он вернётся напрямую сам.");
+    }
+    net.hidden = !netLines.length;
+    net.textContent = netLines.join(" ");
 
     const probe = $("probe-note");
     probe.hidden = !s.probe_target;
@@ -458,11 +494,36 @@
   function speedValue(server, s) {
     if (!hasSpeed(server) || (server.status !== "member" && server.status !== "spare")) return null;
     const busy = Boolean(server.speed_busy);
+    // Сумма (0.1.18): сам замер и трафик клиентов через этот сервер за время замера.
+    const parts = server.speed_bg_mbps
+      ? ` (замер ${mbps(server.speed_test_mbps)} + трафик клиентов ${mbps(server.speed_bg_mbps)})` : "";
     return el("span", {
       class: `speed${busy ? " old" : ""}`, text: mbps(server.speed_mbps),
-      title: `Скорость по замеру ${stamp(server.speed_ts, s.now)}`
+      title: `Скорость по замеру ${stamp(server.speed_ts, s.now)}${parts}`
         + (busy ? " — канал был занят, цифра может быть занижена" : ""),
     });
+  }
+
+  // Иконка у скорости (пожелание заказчика 24.10.2026): замер только этого сервера, без общего
+  // замера всех. Крутится, пока сервер ждёт замера или замеряется. У x100 замеров нет вовсе.
+  const probeTag = (tag) => `probe-${String(tag || "").split("-").slice(1).join("-")}`;
+  function speedTool(server, s) {
+    if (server.status !== "member" && server.status !== "spare") return null;
+    const sticky = s.sticky || {};
+    if (!sticky.on || !(sticky.unlimited_hours || sticky.limited_hours)) return null;
+    if ((server.multiplier || 0) >= 100) return null;
+    const asked = (s.busy && s.busy.speed_one) || [];
+    const busy = Boolean(server.speed_queued)
+      || [server.tag, server.fingerprint, probeTag(server.tag)].some((key) => asked.includes(key));
+    const button = iconButton("remeasure", `Замерить скорость «${server.name}»`,
+      (event) => act("speed/one", { tag: server.tag }, event.currentTarget));
+    button.classList.add("speed-btn");
+    button.title = busy ? "Скорость этого сервера замеряется…" : "Замерить скорость только этого сервера";
+    if (busy) {
+      button.dataset.busy = "1";
+      button.disabled = true;
+    }
+    return button;
   }
 
   // Когда цифры скорости нет — почему (issue #1: пустое место ничего не объясняло).
@@ -476,18 +537,38 @@
   // Пока трафик ведёт сервер, выбранный вручную, основной — только запасной план.
   const mainShown = (server, s) => Boolean(server.main) && !(s.pin && !s.pin.down);
 
+  // 0.1.18: выученный обход блокировки («обход: xray+frag после STALL_BEFORE_BODY»), отметка
+  // «нестабилен по ТСПУ» и скорость по реальному трафику через сервер («из трафика»).
+  function extraNote(server, s) {
+    let text = "";
+    const esc = server.escalation;
+    if (esc) {
+      text += ` · обход: ${esc.label}${esc.verdict ? ` после ${esc.verdict}` : ""}`
+        + (esc.ts ? `, ${stamp(esc.ts, s.now)}` : "");
+    }
+    if (server.unstable_until && server.unstable_until > s.now) {
+      text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
+    }
+    if (server.speed_passive_mbps !== null && server.speed_passive_mbps !== undefined
+        && server.speed_passive_mbps >= 1) {
+      text += ` · из трафика ${mbps(server.speed_passive_mbps)}`;
+    }
+    return text;
+  }
+
   function serverNote(server, s) {
     if (server.status === "member") {
       const dead = server.alive === false && server.dead_since
         ? ` · не отвечает ${ago(server.dead_since, s.now).replace(" назад", "")}` : "";
-      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`;
+      return `${mainShown(server, s) ? "основной" : "в работе"}${speedNote(server, s)}${dead}`
+        + extraNote(server, s);
     }
     if (server.status === "spare") {
       const role = server.reserve
         ? "резервный: через него пойдёт трафик, если серверы в работе перестанут отвечать"
         : "запасной";
       return role + (server.scanned ? ` · проверен ${stamp(server.scanned, s.now)}` : "")
-        + speedNote(server, s);
+        + speedNote(server, s) + extraNote(server, s);
     }
     if (server.status === "disabled") {
       return server.pending ? "отключён — шлюз сейчас уберёт его из работы" : "отключён: шлюз к нему не обращается";
@@ -505,6 +586,7 @@
   const PROFILES = {
     "xray:default": ["Xray", ""],
     "xray:fragment": ["Xray · дробление", "Первая запись TLS уходит к серверу частями (дробление ClientHello), и фильтр провайдера не видит в ней имя сайта. Шлюз включает дробление сам, если без него сервер не отвечает."],
+    "xray:split": ["Xray · нарезка", "Первые пакеты соединения уходят к серверу TCP-сегментами случайной длины: фильтр провайдера, который собирает ClientHello из частей, его не собирает. Шлюз переводит сервер сюда сам, если без этого он не отвечает."],
     "singbox:default": ["sing-box", "Сервер ведёт второе ядро — sing-box: оно умеет протоколы, которых нет в Xray (hysteria2, TUIC, AnyTLS, WireGuard), и по-своему устанавливает TLS. Сервер, который умеют оба ядра, шлюз переводит сюда сам, если на Xray он не отвечал."],
     "singbox:tls_fragment": ["sing-box · дробление", "Сервер ведёт sing-box, а начало TLS режется на части (дробление TCP и записей TLS). Шлюз перевёл сервер сюда сам, когда на Xray он «замерзал»."],
     "singbox:mux_padded": ["sing-box · mux", "Сервер ведёт sing-box с мультиплексированием и паддингом: меняются размеры пакетов и тайминги внутри туннеля. Шлюз перевёл сервер сюда сам, когда он «замерзал» на прежних профилях."],
@@ -615,7 +697,7 @@
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, speedValue(server, s), serverValue(server)),
+      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -664,6 +746,23 @@
       + "шлюз ищет живые серверы среди запасных и вернётся к серверам в работе, как только они ответят.";
   }
 
+  // Контроль скорости (ТЗ R6–R7): идёт поиск замены придушенному или пауза после глобальной
+  // просадки канала.
+  function renderGuard(s) {
+    const guard = s.guard || {};
+    const note = $("guard-note");
+    let text = "";
+    if (guard.episode) {
+      text = `Сервер «${guard.episode.name}» придушен (${mbps(guard.episode.mbps || 0)}): ищу замену — `
+        + `замерено ${guard.episode.tried || 0} из ${guard.episode.total || 0} кандидатов, по одному.`;
+    } else if (guard.cooldown_until && guard.cooldown_until > s.now) {
+      text = "Глобальная просадка канала: ни один кандидат не был заметно быстрее — шлюз остаётся "
+        + `на прежнем сервере, новые поиски — после ${clock(guard.cooldown_until)}.`;
+    }
+    note.hidden = !text;
+    note.textContent = text;
+  }
+
   // Основной сервер: весь трафик через самый быстрый из серверов в работе.
   function renderMain(s) {
     const box = $("main-box");
@@ -691,7 +790,11 @@
     }
     if (on && measuring) {
       const every = (hours) => (hours ? `раз в ${hours} ч` : "не замеряются");
-      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется у всех живых серверов:"} безлимитных — ${every(sticky.unlimited_hours)}, лимитированных — ${every(sticky.limited_hours)} и меньшей загрузкой, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`;
+      // 0.1.18: фоном — редко; основной — по своему трафику, при падении или «придушивании» —
+      // поиск замены среди кандидатов (решение заказчика 24.10.2026).
+      const spareEvery = sticky.spare_hours ? every(Math.max(sticky.spare_hours, sticky.unlimited_hours || 0)) : every(sticky.unlimited_hours);
+      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
+        + (sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
     }
     $("main-note").textContent = text;
   }
@@ -705,6 +808,11 @@
     $("tier-note").textContent = ranked && s.tier
       ? `Приоритет: в работе серверы уровня «${LEVEL_NAMES[s.tier] || s.tier}». Уровнем ниже шлюз пользуется, только когда живых выше нет.`
       : "";
+    // Тексты пишет шлюз: мёртвого заменить некем; лимитированные в работе из-за приоритета.
+    $("stranded-note").hidden = !s.stranded;
+    $("stranded-note").textContent = capital(s.stranded || "");
+    $("class-note").hidden = !s.class_warning;
+    $("class-note").textContent = capital(s.class_warning || "");
     const sources = [...s.sources];
     for (const server of s.servers) if (!sources.includes(server.source)) sources.push(server.source);
     const nodes = [];
@@ -863,15 +971,60 @@
     $("devices-card").hidden = !s.lan.interface;
     $("devices-count").textContent = s.devices.length ? String(s.devices.length) : "";
     $("devices-note").textContent = s.lan.gateway ? `сеть ${s.lan.interface}, шлюз ${s.lan.gateway}` : "";
-    fill($("devices"), s.devices.map(deviceRow),
+    const records = s.records || { files: [] };
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
+    $("records-block").hidden = !records.files.length;
+    fill($("records"), records.files.map(recordRow));
+  }
+
+  const megabytes = (bytes) => (bytes >= 1048576
+    ? `${(bytes / 1048576).toFixed(1).replace(".", ",")} МБ` : `${Math.max(1, Math.round(bytes / 1024))} КБ`);
+  const minsec = (seconds) => `${Math.floor(seconds / 60)}:${two(Math.floor(seconds % 60))}`;
+  const recordText = (active, now) =>
+    `запись ${minsec(Math.max(0, now - active.started))} · ${megabytes(active.bytes)}`;
+
+  // Запись трафика устройства (record.py): файл .pcap для Wireshark.
+  function recordTool(device, active, now) {
+    const name = device.name || device.mac;
+    if (active && active.mac === device.mac) {
+      return iconButton("stop", `Остановить запись трафика «${name}»`, () => act("record/stop", {}));
+    }
+    const button = iconButton("record", `Записать трафик «${name}»`, () => confirmRemove(
+      `Записать трафик «${name}»?`,
+      `Шлюз ${RECORD_SECONDS / 60} минут пишет все пакеты этого устройства в сети дома в файл для Wireshark (не больше 100 МБ). В файле видно, куда и сколько устройство отправляет; содержимое сайтов обычно зашифровано (HTTPS). Файл хранится на шлюзе — последние три записи; остановить можно раньше.`,
+      () => act("record/start", { mac: device.mac, seconds: RECORD_SECONDS }), "Записать"));
+    button.classList.add("rec-btn");
+    if (active) {
+      button.disabled = true;
+      button.title = `Идёт запись трафика «${active.label}»`;
+    }
+    return button;
+  }
+
+  function recordRow(file) {
+    const when = new Date(file.ended * 1000);
+    const link = el("a", { class: "icon-btn", href: `/records/${encodeURIComponent(file.name)}`,
+      download: `xgw-${file.name}`, title: "Скачать запись (.pcap)", "aria-label": "Скачать запись" });
+    link.append(icon("download"));
+    return el("li", {},
+      el("div", { class: "row-main" },
+        el("div", { class: "row-title" }, el("span", { text: file.label || file.mac })),
+        el("div", { class: "row-sub", text: `${when.toLocaleString("ru-RU")} · ${megabytes(file.bytes)} · пакетов ${file.packets}${file.why ? ` · ${file.why}` : ""}` })),
+      el("div", { class: "row-tools" }, link,
+        iconButton("remove", "Удалить запись", () => confirmRemove(
+          "Удалить запись трафика?", `${file.label || file.mac}, ${when.toLocaleString("ru-RU")}`,
+          () => act("record/remove", { name: file.name })))));
   }
 
   // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
-  function deviceRow(device) {
+  function deviceRow(device, active, now) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
+    if (active && active.mac === device.mac) {
+      title.append(el("span", { class: "tag rec", text: recordText(active, now) }));
+    }
     const name = device.name || device.mac;
     const locked = device.bypass && !device.managed;
     let control = null;
@@ -898,7 +1051,7 @@
         text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN") : "через VPN",
         title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
       }),
-      control ? el("div", { class: "row-tools" }, control) : null);
+      el("div", { class: "row-tools" }, recordTool(device, active, now), control));
   }
 
   // Tailscale: вход в tailnet, SSH, панель по tailnet и маршрут. Каждый переключатель —
@@ -992,6 +1145,19 @@
     $("ts-funnel-enable").hidden = !(funnel.pending && funnelEnable);
     if (funnelEnable) $("ts-funnel-enable").href = funnelEnable;
 
+    const exit = t.exit || {};
+    $("ts-exit-row").hidden = !running;
+    $("ts-exit").setAttribute("aria-checked", String(exit.advertised === true));
+    $("ts-exit").disabled = exit.advertised === null || exit.advertised === undefined;
+    $("ts-exit-note").textContent = exit.advertised !== true
+      ? "Телефон и ноутбук с Tailscale смогут выходить в интернет через шлюз и его VPN — без второго VPN на телефоне: Android держит один VPN, и это будет Tailscale."
+      : exit.approved === false
+        ? "Осталось одобрить один раз в консоли Tailscale: Machines → шлюз → Edit route settings → Use as exit node."
+        : "На устройстве: Tailscale → Exit node → шлюз. Его интернет пойдёт через Xray шлюза; IPv6 через шлюз закрыт, чтобы не уйти мимо VPN.";
+    const peers = t.peers || [];
+    $("ts-peers-block").hidden = !running || !peers.length;
+    fill($("ts-peers"), peers.map(peerRow));
+
     $("ts-route-row").hidden = t.state === "absent";
     $("ts-route").value = t.route === "vpn" ? "vpn" : "direct";
     $("ts-route-note").textContent = t.route === "vpn"
@@ -1002,6 +1168,30 @@
     $("ts-k5").hidden = !cgnat.length || t.netfilter_off === true;
     $("ts-k5-text").textContent = `Провайдер выдаёт адреса из 100.64.0.0/10 (${cgnat.join(", ")}): фаервол Tailscale отбрасывает их пакеты, и сеть провайдера у шлюза может пропасть.`;
     $("ts-k6").hidden = t.override_dns !== true;
+  }
+
+  // Устройство tailnet: через шлюз — через Xray или напрямую (выходной узел).
+  function peerRow(peer) {
+    const title = el("div", { class: "row-title" }, el("span", { text: peer.name || peer.ip }));
+    if (!peer.online) title.append(el("span", { class: "tag", text: "не в сети" }));
+    const vpn = !peer.direct;
+    const control = el("button", {
+      class: "switch", type: "button", role: "switch", "aria-checked": String(vpn),
+      "aria-label": `Через VPN для устройства tailnet ${peer.name || peer.ip}`,
+      title: vpn ? "Выпускать это устройство напрямую, мимо VPN" : "Вернуть это устройство в VPN",
+      onclick: () => {
+        const body = { ip: peer.ip, name: peer.name, direct: vpn };
+        if (!vpn) return act("tailscale/direct", body);
+        confirmRemove(`Выпускать «${peer.name || peer.ip}» напрямую?`,
+          "Когда это устройство выходит в интернет через шлюз, его трафик пойдёт мимо Xray, без защиты VPN.",
+          () => act("tailscale/direct", body), "Напрямую");
+      },
+    });
+    return el("li", {},
+      el("div", { class: "row-main" }, title,
+        el("div", { class: "row-sub mono", text: [peer.ip, peer.os].filter(Boolean).join(" · ") })),
+      el("span", { class: peer.direct ? "tag warn" : "tag on", text: peer.direct ? "напрямую" : "через VPN" }),
+      el("div", { class: "row-tools" }, control));
   }
 
   // Телефоны с приложением XGW: «Привязать телефон» → QR-код → камера приложения.
@@ -1049,6 +1239,86 @@
     "");
   }
 
+  // Ядра Xray и sing-box: новый выпуск на GitHub ставится кнопкой, шлюз проверяет его и при
+  // сбое сам возвращает прежний; прежний лежит рядом — для кнопки «Вернуть …».
+  function renderCores(s) {
+    const c = s.cores || { rows: [] };
+    const rows = c.rows || [];
+    $("cores-card").hidden = !rows.length;
+    const job = c.job || null;
+    const running = Boolean(c.active);
+    // «sing-box» пишется со строчной и в начале фразы.
+    const sentence = (value) => (value.startsWith("sing-box") ? value : capital(value));
+    let text = "";
+    let bad = false;
+    if (running) {
+      text = job && job.state === "running" && job.stage ? sentence(job.stage) + "…" : "Ядро сейчас обновляется — подождите…";
+    } else if (job && job.finished && s.now - job.finished < 86400) {
+      text = sentence(job.text || "");
+      bad = job.state === "failed";
+    }
+    $("cores-job").textContent = text;
+    $("cores-job").hidden = !text;
+    $("cores-job").className = bad ? "note bad" : "note";
+    $("cores-job").setAttribute("role", bad ? "alert" : "status");
+    fill($("cores"), rows.map((row) => coreRow(row, s, running)), "");
+    $("cores-checked").textContent = c.checked
+      ? `Выпуски на GitHub проверены ${stamp(c.checked, s.now)}` + (c.error ? ` — не всё удалось: ${c.error}` : "") + ". Шлюз проверяет их раз в сутки."
+      : "Выпуски на GitHub ещё не проверялись — шлюз проверяет их раз в сутки.";
+    $("cores-check").disabled = running;
+  }
+
+  function coreRow(row, s, running) {
+    const title = el("div", { class: "row-title" }, el("span", { text: row.title }));
+    if (row.withdrawn) title.append(el("span", { class: "tag rec", text: "убрана с GitHub" }));
+    if (row.watch_until) title.append(el("span", { class: "tag warn", text: `наблюдение до ${stamp(row.watch_until, s.now)}` }));
+    const origin = !row.installed ? "не установлен"
+      : row.accepted ? `${row.installed} · обновлён из панели и проверен шлюзом`
+        : row.installed === row.baseline ? `${row.installed} · проверен разработчиком XGW`
+          : `${row.installed} · XGW проверен на ${row.baseline}`;
+    const main = el("div", { class: "row-main" }, title, el("div", { class: "row-sub", text: origin }));
+    const latest = row.latest;
+    if (latest) {
+      const published = Date.parse(latest.published || "");
+      main.append(el("div", { class: "row-sub", text: `На GitHub есть ${latest.version}`
+        + (latest.prerelease ? " (предварительный выпуск)" : "")
+        + (Number.isFinite(published) ? ` от ${day(published / 1000)}` : "") }));
+    }
+    if (row.withdrawn) main.append(el("div", { class: "row-error", text: "Разработчики убрали эту версию с GitHub — так бывает, когда в ней находят опасную ошибку. Обновите ядро." }));
+    const rejected = row.rejected;
+    if (rejected && rejected.version && rejected.version !== row.installed) {
+      main.append(el("div", { class: "row-error", text: rejected.kind === "rollback"
+        ? `${rejected.version} убран: ${rejected.reason}`
+        : `${rejected.version} не прошёл проверку на этом шлюзе: ${rejected.reason}` }));
+    }
+    if (row.watch_until && row.previous) {
+      main.append(el("div", { class: "row-sub", text: `Если ядро перестанет отвечать, шлюз сам вернёт ${row.previous}.` }));
+    }
+    const tools = el("div", { class: "row-actions" });
+    if (latest) {
+      const again = rejected && rejected.version === latest.version && rejected.kind !== "rollback";
+      tools.append(el("button", {
+        class: "btn primary small-btn", type: "button", disabled: running,
+        text: again ? "Попробовать снова" : `Обновить до ${latest.version}`,
+        onclick: () => confirmRemove(
+          `Обновить ${row.title} до ${latest.version}?`,
+          `Шлюз скачает ${row.title} ${latest.version} с GitHub, сверит SHA-256 и проверит его на рабочем конфиге. На несколько секунд соединения оборвутся. Если новое ядро не запустится или запрос в интернет через серверы не пройдёт, шлюз сам вернёт ${row.installed}. Ещё сутки он следит за ядром.`,
+          () => act("cores/update", { core: row.core, version: latest.version }), "Обновить", "primary"),
+      }));
+    }
+    if (row.previous) {
+      tools.append(el("button", {
+        class: "btn ghost small-btn", type: "button", disabled: running,
+        text: `Вернуть ${row.previous}`,
+        onclick: () => confirmRemove(
+          `Вернуть ${row.title} ${row.previous}?`,
+          `Шлюз поставит прежнюю версию ${row.previous} вместо ${row.installed} и перезапустит ядро — на несколько секунд соединения оборвутся.`,
+          () => act("cores/rollback", { core: row.core }), "Вернуть", "primary"),
+      }));
+    }
+    return el("li", { class: "core-row", "data-core": row.core }, main, tools);
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -1062,10 +1332,11 @@
   let confirmed = null;
   let editSubCallback = null;
 
-  function confirmRemove(title, text, action, yes = "Убрать") {
+  function confirmRemove(title, text, action, yes = "Убрать", tone = "danger") {
     $("confirm-title").textContent = title;
     $("confirm-text").textContent = text;
     $("confirm-yes").textContent = yes;
+    $("confirm-yes").className = `btn ${tone === "primary" ? "primary" : "danger"}`;
     confirmed = action;
     $("confirm-dialog").showModal();
   }
@@ -1093,6 +1364,14 @@
   });
 
   $("ts-login-btn").addEventListener("click", () => act("tailscale/login", {}, $("ts-login-btn")));
+  $("ts-exit").addEventListener("click", () => {
+    const on = $("ts-exit").getAttribute("aria-checked") !== "true";
+    if (on) act("tailscale/exit", { on }, $("ts-exit"));
+    else confirmRemove(
+      "Шлюз больше не выходной узел?",
+      "Устройства tailnet, что выходят в интернет через шлюз, останутся без интернета, пока на них не выберут другой выходной узел или не выключат его.",
+      () => act("tailscale/exit", { on: false }, $("ts-exit")), "Выключить");
+  });
   $("ts-ssh").addEventListener("click", () => {
     const on = $("ts-ssh").getAttribute("aria-checked") !== "true";
     if (on) act("tailscale/ssh", { on }, $("ts-ssh"));
@@ -1120,6 +1399,7 @@
       () => act("tailscale/funnel", { on: false }, $("ts-funnel")), "Выключить");
   });
   $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
+  $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";
