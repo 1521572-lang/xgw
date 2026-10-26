@@ -347,3 +347,35 @@ def test_kwin_calls_are_short_and_a_hung_kwin_means_a_new_tab(tmp_path, monkeypa
     environ = {"XDG_CURRENT_DESKTOP": "KDE", "XDG_RUNTIME_DIR": str(tmp_path)}
     assert tray.raise_window(environ, run=hung) is False
     assert calls and all(value == tray.KWIN_TIMEOUT == 1.5 for value in calls)
+
+
+def test_quick_second_click_waits_for_the_tab_it_launched(tmp_path):
+    """Отчёт 0.2.0, шаг 10.1: два быстрых щелчка открывали две вкладки — вторая приходила, пока
+    первая грузилась. Теперь LAUNCH_HOLD с после запуска новая вкладка не открывается: щелчок
+    ждёт ту и выводит её, а закрытая после запуска вкладка удержание снимает."""
+    stamp = tmp_path / tray.OPEN_STAMP
+    opened: list[str] = []
+    now = [100.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def click(client, raised=True):
+        return tray.open_panel("http://p/", client, raise_it=lambda: raised,
+                               launch=opened.append, sleep=sleep, clock=lambda: now[0],
+                               stamp=stamp)
+
+    assert click(None) == "opened" and opened == ["http://p/"]  # вкладок не было
+    now[0] += 0.3
+    # Вкладка ещё грузится: щелчок ждёт её и, не дождавшись к концу удержания, вторую не
+    # открывает.
+    assert click(PageClient({"seen": 300.0})) == "opening" and len(opened) == 1
+    now[0] = 100.5
+    loaded = {"seen": 0.1, "focused": 0.1}
+    assert click(PageClient({"seen": 300.0}, loaded)) == "raised" and len(opened) == 1
+    now[0] = 101.0
+    assert click(PageClient(loaded), raised=False) == "opening"  # не KDE: та вкладка впереди
+    now[0] = 102.0
+    assert click(PageClient({"seen": 1.0, "closed": 0.5})) == "opened"  # её закрыли
+    now[0] += tray.LAUNCH_HOLD + 1
+    assert click(PageClient({"seen": 300.0})) == "opened" and len(opened) == 3

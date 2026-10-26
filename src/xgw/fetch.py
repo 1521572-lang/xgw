@@ -385,6 +385,9 @@ def _connect(
     spare = [ip for ip in dns.fallback.get(host, []) if _is_ip(ip)]
     entries = encrypted(dns.bootstrap) if dns.strict else list(dns.bootstrap)
     try:
+        if not entries:
+            raise ResolveError(
+                "нет шифрованных резолверов: в dns.resolvers нужен хотя бы один https:// или tls://")
         addresses = resolve_domain(
             host, entries, mark=mark, cancel=cancel, public_only=dns.strict,
         )
@@ -407,6 +410,39 @@ def _connect(
             continue
         return sock, address not in addresses
     raise last_error or OSError(f"нет адресов для {host}")
+
+
+DIRECT_CHECK_TIMEOUT = 5.0
+
+
+def check_direct(
+    host: str,
+    port: int = 443,
+    *,
+    bootstrap: Sequence[str],
+    mark: int | None,
+    timeout: float = DIRECT_CHECK_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> str:
+    """Прямой путь к серверу подписки, которая пришла через Xray: имя — только у шифрованных
+    резолверов без служебных адресов (как у прямого запроса подписки), соединение с меткой
+    мимо перехвата и рукопожатие TLS с проверкой сертификата по имени. Запроса HTTP нет:
+    адрес подписки с её ключом напрямую не уходит, провайдер видит только имя сервера в
+    рукопожатии — как и при прямом запросе, когда Xray не отвечает. Возвращает адрес, с
+    которым рукопожатие прошло (для store.HostCache).
+
+    ResolveError, OSError (в т. ч. ssl.SSLError: чужой сертификат) — путь не проверен;
+    Cancelled — демон останавливается."""
+    sock, _spare = _connect(host, port, timeout, mark, _Dns(bootstrap, strict=True), cancel)
+    try:
+        address = str(sock.getpeername()[0])
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+        wait_io(sock, sock.do_handshake, timeout, cancel)
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+    return address
 
 
 def open_tunnel(

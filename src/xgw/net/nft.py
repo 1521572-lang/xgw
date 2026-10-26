@@ -71,6 +71,10 @@ import functools
 import hashlib
 import ipaddress
 import re
+import socket
+import struct
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1000,12 +1004,14 @@ def listing(
 ) -> str | None:
     """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft).
 
-    terse — без элементов именованных наборов (`nft -t`, есть и в nft 1.0.9 Ubuntu 24.04): в
-    direct4 их десятки тысяч, и полный вывод — около 0,9 МБ текста и 0,8 с процессора на
-    каждой проверке демона (п. 2.1 рекомендаций к аудиту 0.1.18). Цепочки, правила и
-    безымянные наборы внутри правил (`iifname { "docker0", "br-*" }`) вывод сохраняет —
-    проверено на nft 1.1.6. sets — наборы, чьи элементы всё же нужны: их `nft list set`
-    ставится перед текстом таблицы, и set_elements и ts_state находят полный набор первым."""
+    terse — без элементов именованных наборов (`nft -t`): в direct4 их десятки тысяч, и
+    полный вывод — около 0,9 МБ текста (п. 2.1 рекомендаций к аудиту 0.1.18). Цепочки, правила
+    и безымянные наборы внутри правил (`iifname { "docker0", "br-*" }`) вывод сохраняет —
+    проверено на nft 1.1.6. Время это экономит только с nft 1.1.x (11 мс против 156 на 20 000
+    сетей): nft 1.0.9 из Ubuntu 24.04 элементы из ядра всё равно забирает — 765 мс против 901
+    (отчёт 0.2.0), — поэтому проверки демона ходят через Listings. sets — наборы, чьи элементы
+    всё же нужны: их `nft list set` ставится перед текстом таблицы, и set_elements и ts_state
+    находят полный набор первым."""
     argv = ["nft", *(["-t"] if terse else []), "list", "table", family, table]
     try:
         text = runner(argv)
@@ -1046,6 +1052,111 @@ def set_elements(text: str, name: str) -> set[str]:
     if found is None:
         return set()
     return {item.strip().removesuffix("/32") for item in found.group(1).split(",") if item.strip()}
+
+
+# --- поколение правил ядра -------------------------------------------------------------
+
+NETLINK_NETFILTER = 12
+NFNL_SUBSYS_NFTABLES = 10
+NFT_MSG_NEWGEN = 15
+NFT_MSG_GETGEN = 16
+NFTA_GEN_ID = 1
+NLMSG_ERROR = 2
+NLM_F_REQUEST = 1
+_NLMSG = struct.Struct("=IHHII")  # nlmsghdr: длина, тип, флаги, номер, порт
+_NFGEN = struct.Struct("=BBH")  # nfgenmsg: семейство, версия, res_id
+
+
+def generation(*, timeout: float = 1.0) -> int | None:
+    """Номер поколения правил nftables своего сетевого пространства (NFT_MSG_GETGEN по
+    netlink, как `nft list ruleset` спрашивает его сам). Ядро увеличивает его на каждой
+    принятой правке — своей, Docker, Tailscale, ufw, чужом `flush ruleset`, добавлении или
+    удалении элемента набора, — а чтение (`nft list`) его не меняет (проверено на ядре WSL
+    6.x и nft 1.1.6, 26.10.2026). Это один короткий запрос (~0,1 мс), а не запуск nft.
+    None — узнать нельзя: нет CAP_NET_ADMIN (EPERM), нет netlink или ответ не разобрать;
+    тогда Listings запускает nft каждый раз, как раньше."""
+    kind = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETGEN
+    body = _NFGEN.pack(socket.AF_UNSPEC, 0, 0)
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER) as sock:
+            sock.settimeout(timeout)
+            sock.bind((0, 0))
+            sock.send(_NLMSG.pack(_NLMSG.size + len(body), kind, NLM_F_REQUEST, 1, 0) + body)
+            data = sock.recv(65536)
+    except (OSError, AttributeError):  # AttributeError: нет AF_NETLINK (не Linux)
+        return None
+    return parse_generation(data)
+
+
+def parse_generation(data: bytes) -> int | None:
+    """NFTA_GEN_ID из ответа NFT_MSG_NEWGEN; None — ошибка netlink или чужой ответ."""
+    if len(data) < _NLMSG.size + _NFGEN.size:
+        return None
+    length, kind, _flags, _seq, _port = _NLMSG.unpack_from(data)
+    if kind != (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN:
+        return None  # NLMSG_ERROR (нет прав) или не тот ответ
+    offset = _NLMSG.size + _NFGEN.size
+    end = min(length, len(data))
+    while offset + 4 <= end:
+        size, attr = struct.unpack_from("=HH", data, offset)
+        if size < 4:
+            return None
+        if attr & 0x3FFF == NFTA_GEN_ID and size >= 8:
+            return int(struct.unpack_from(">I", data, offset + 4)[0])
+        offset += (size + 3) & ~3
+    return None
+
+
+def _is_listing(argv: Sequence[str]) -> bool:
+    """`nft list …` или `nft -t list …` — чтение правил."""
+    words = list(argv)
+    if not words or words[0] != "nft":
+        return False
+    rest = words[1:]
+    if rest[:1] == ["-t"]:
+        rest = rest[1:]
+    return rest[:1] == ["list"]
+
+
+class Listings:
+    """Runner для проверок правил (Capture.loaded): тексты `nft list …` запоминаются вместе с
+    поколением правил ядра (generation) и, пока оно то же, отдаются без нового запуска nft —
+    правила с тех пор никто не менял, и текст был бы тем же. Остальные команды идут в runner
+    как есть.
+
+    Отчёт 0.2.0 (Ubuntu 24.04, nft 1.0.9): каждая проверка демона — раз в шаг watchdog (20 с)
+    — запускала nft несколько раз и шла 3,5 с, а `nft -t` там времени не экономит (listing).
+    Событийная проверка (тезис А3 аудита 0.1.18) без постоянного `nft monitor`: правила
+    перечитываются только после правки. Поколение читается до запуска nft: правка между
+    чтением и запуском даёт текст новее поколения, и следующая проверка перечитает его снова;
+    наоборот было бы опасно — устаревший текст под новым поколением."""
+
+    def __init__(self, runner: Runner, generation: Callable[[], int | None]) -> None:
+        self.runner = runner
+        self.generation = generation
+        self._lock = threading.Lock()
+        self._gen: int | None = None
+        self._texts: dict[tuple[str, ...], str] = {}
+        self.runs = 0  # сколько раз nft запускался на самом деле (для проверок и ТЗ)
+
+    def __call__(self, argv: Sequence[str], **kwargs) -> str:
+        if kwargs or not _is_listing(argv):
+            return self.runner(argv, **kwargs)
+        key = tuple(argv)
+        gen = self.generation()
+        with self._lock:
+            if gen is None or gen != self._gen:
+                self._texts.clear()
+                self._gen = gen
+            elif key in self._texts:
+                return self._texts[key]
+        with self._lock:
+            self.runs += 1
+        text = self.runner(list(argv))  # CommandError не запоминается: проверка повторится
+        with self._lock:
+            if gen is not None and gen == self._gen:
+                self._texts[key] = text
+        return text
 
 
 def ts_exit_state(text: str) -> bool:

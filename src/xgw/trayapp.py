@@ -101,7 +101,8 @@ class TrayApp:
         self.icon.setContextMenu(self.menu)
         self.icon.activated.connect(self.clicked)
         # Открытие панели идёт в своём потоке; пока оно не кончилось (KWin не ответил и т. п.),
-        # повторный щелчок новый поток не заводит (ДОП-2).
+        # повторный щелчок новый поток не заводит (ДОП-2). Щелчок вскоре после запуска браузера
+        # вторую вкладку не открывает — это tray.LAUNCH_HOLD (отчёт 0.2.0).
         self._opening = threading.Lock()
         self.timer = self.QtCore.QTimer()
         self.timer.timeout.connect(self.refresh)
@@ -145,7 +146,7 @@ class TrayApp:
 
     def _open(self, url: str) -> None:
         try:
-            tray.open_panel(url, self.client)
+            tray.open_panel(url, self.client, stamp=tray.launch_stamp())
         except OSError as exc:
             print(f"значок XGW: браузер не открылся: {exc}", file=sys.stderr)
         finally:

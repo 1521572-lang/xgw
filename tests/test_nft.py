@@ -829,3 +829,48 @@ def test_russian_addresses_go_past_xray_in_the_kernel(tmp_path):
             ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, check=False,
         )
         assert result.returncode == 0, result.stderr
+
+
+# --- поколение правил ядра (отчёт 0.2.0) -------------------------------------------------------
+
+
+def test_generation_is_parsed_from_a_netlink_reply():
+    import struct
+
+    kind = (nft.NFNL_SUBSYS_NFTABLES << 8) | nft.NFT_MSG_NEWGEN
+    attrs = struct.pack("=HH", 8, nft.NFTA_GEN_ID) + struct.pack(">I", 42)
+    attrs += struct.pack("=HH", 8, 2) + struct.pack(">I", 1234)  # NFTA_GEN_PROC_PID
+    body = struct.pack("=BBH", 0, 0, 0) + attrs
+    reply = struct.pack("=IHHII", 16 + len(body), kind, 0, 1, 0) + body
+    assert nft.parse_generation(reply) == 42
+    error = struct.pack("=IHHII", 36, nft.NLMSG_ERROR, 0, 1, 0) + struct.pack("=i", -1) + bytes(16)
+    assert nft.parse_generation(error) is None  # EPERM: нет CAP_NET_ADMIN
+    assert nft.parse_generation(reply[:10]) is None
+
+
+def test_listings_run_nft_again_only_when_the_generation_changes():
+    gen: list[int | None] = [7]
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[-1] == "missing":
+            raise CommandError("Error: No such file or directory")
+        return f"text {len(calls)}"
+
+    lister = nft.Listings(runner, lambda: gen[0])
+    table = ["nft", "-t", "list", "table", "ip", "xgw"]
+    first = lister(table)
+    assert lister(table) == first and len(calls) == 1
+    assert lister(["nft", "list", "set", "ip", "xgw", "ts_direct"]) == "text 2"
+    assert lister(["nft", "-f", "-"], input="table ip xgw {}") == "text 3"  # не чтение
+    assert lister(table) == first and len(calls) == 3
+    gen[0] = 8  # правку приняло ядро
+    assert lister(table) == "text 4"
+    for _ in range(2):  # ошибка не запоминается
+        with pytest.raises(CommandError):
+            lister(["nft", "list", "table", "ip", "missing"])
+    assert len(calls) == 6
+    gen[0] = None  # поколение не узнать — nft каждый раз, как раньше
+    assert lister(table) == "text 7" and lister(table) == "text 8"
+    assert lister.runs == 7  # запусков nft для чтения, с неудачными; nft -f сюда не входит

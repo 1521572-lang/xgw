@@ -1141,3 +1141,32 @@ def test_own_rule_loads_open_the_quiet_window(gateway, monkeypatch):
     assert Capture.rules_quiet()
     clock[0] += 1.1
     assert not Capture.rules_quiet()
+
+
+# --- проверка правил по поколению nft (отчёт 0.2.0: 3,5 с на каждом шаге с nft 1.0.9) ---------
+
+
+def test_loaded_reads_tables_again_only_after_a_rule_change(gateway, monkeypatch):
+    """Пока поколение правил ядра то же, loaded() nft не запускает; правка (своя загрузка или
+    чужой flush) меняет поколение, и правила перечитываются — пропажа замечается сразу."""
+    kernel = gateway.kernel
+    gen = [1]
+    checked = Capture(gateway.cfg, gateway.paths, runner=kernel, proc_sys=gateway.proc,
+                      time_uids=(), generation=lambda: gen[0])
+    checked.sys_net = gateway.sys_net
+    assert Capture(gateway.cfg, gateway.paths, runner=kernel).lister is kernel  # без кэша
+
+    def listings() -> int:
+        return sum(1 for call in kernel.calls if call[:1] == ("nft",) and "list" in call[1:3])
+
+    gateway.enable()
+    gen[0] += 1  # nft -f загрузил правила
+    assert checked.loaded() is True
+    before = listings()
+    assert checked.loaded() is True and checked.loaded() is True
+    assert listings() == before  # ничего не менялось — nft не запускался
+    key = ("ip", "xgw")
+    kernel.tables[key] = _flush_table(kernel.tables[key])
+    assert checked.loaded() is True  # поколение то же — правка ядру неизвестна (не бывает)
+    gen[0] += 1  # чужой flush table меняет поколение
+    assert checked.loaded() is False and listings() > before

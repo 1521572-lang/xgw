@@ -15,6 +15,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import config, cost, fetch, log, marknet, masking, rating
 from . import pin as pinning
@@ -27,7 +28,7 @@ from .model import ServerNode, raw_to_node
 from .net import lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
-from .store import HostCache, Store, SubscriptionCache
+from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
 from .watch import target
 from .xraycore.api import ApiClient
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
@@ -204,6 +205,77 @@ def collect(
     return inventory
 
 
+# Имя сервера подписки → когда (time.time()) его прямой адрес не удалось проверить: следующая
+# попытка — не раньше HOST_CHECK_RETRY (в памяти процесса; новый демон пробует сразу).
+_direct_failed: dict[str, float] = {}
+
+
+def _check_direct(
+    url: str,
+    result: fetch.FetchResult,
+    cfg: config.Config,
+    hosts: HostCache,
+    mark: int,
+    label: str,
+    logger,
+    cancel: threading.Event | None,
+) -> None:
+    """Прямой адрес сервера подписки — в кэш адресов (store.HostCache), если подписка пришла
+    без прямого соединения с ним: через Xray (при живом Xray так всегда, и без этого кэш не
+    появился бы никогда — отчёт 0.2.0, дефект 1) или через перенаправление с другого имени.
+    Не чаще раза в сутки на имя; без метки (не root) прямой путь не проверить — соединение
+    ушло бы в перехват, и такой проверки нет вовсе."""
+    now = time.time()
+    names: list[tuple[str, int]] = []
+    for address in (url, result.url):
+        parts = urlsplit(address)
+        host = parts.hostname or ""
+        if parts.scheme != "https" or not host or _is_ip(host):
+            continue
+        if host == result.host and result.address:
+            continue  # только что подтверждён прямым запросом
+        if (host, parts.port or 443) not in names:
+            names.append((host, parts.port or 443))
+    for host, port in names:
+        age = hosts.age(host)
+        if age is not None and age < HOST_CHECK_EVERY:
+            continue
+        if now - _direct_failed.get(host, -HOST_CHECK_RETRY) < HOST_CHECK_RETRY:
+            continue
+        try:
+            address = fetch.check_direct(
+                host, port, bootstrap=cfg.dns.resolvers, mark=mark, cancel=cancel)
+        except fetch.Cancelled:
+            raise
+        except (fetch.ResolveError, OSError, ValueError) as exc:
+            _direct_failed[host] = now
+            logger.warning(
+                "подписка %s: прямой путь к её серверу не проверен (%s) — если Xray перестанет "
+                "отвечать, а шифрованные резолверы будут недоступны, подписку напрямую получить "
+                "не удастся; следующая проверка — через %d ч",
+                label, masking.mask_text(str(exc))[:200], int(HOST_CHECK_RETRY // 3600),
+            )
+            continue
+        _direct_failed.pop(host, None)
+        try:
+            hosts.remember(host, address)
+        except OSError as exc:
+            logger.error("подписка %s: адрес не записан в %s: %s", label, hosts.path, exc)
+            continue
+        logger.info(
+            "подписка %s: прямой адрес её сервера проверен (TLS) и записан в кэш адресов",
+            label,
+        )
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 def _drop_junk(raws: list[RawServer]) -> list[RawServer]:
     """Без служебных адресов (0.0.0.0, loopback, порт вне диапазона).
 
@@ -268,6 +340,8 @@ def _load_subscription(
                 hosts.remember(result.host, result.address)
             except OSError as exc:
                 logger.error("подписка %s: адрес не записан в %s: %s", label, hosts.path, exc)
+        if hosts is not None and mark is not None:
+            _check_direct(sub.url, result, cfg, hosts, mark, label, logger, cancel)
         for warning in sub_warnings:
             logger.warning("%s", warning)
         userinfo = fetch.parse_userinfo(
