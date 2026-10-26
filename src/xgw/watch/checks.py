@@ -35,6 +35,11 @@ class DownloadResult:
     # Сколько секунд шло тело — от конца заголовков до последнего байта; по нему считается
     # скорость (watch/speed.py): рукопожатия туннеля и TLS в замер не входят.
     body_seconds: float = 0.0
+    # Сетевая задержка (RTT), мс: второй, короткий запрос (HEAD) в том же, уже открытом
+    # соединении — без рукопожатий TCP и TLS и без загрузки файла (http_get_via_proxy, rtt).
+    # None — не замерялась или сервер закрыл соединение после первого ответа.
+    rtt_ms: float | None = None
+    reusable: bool = False  # соединение после ответа годится для следующего запроса
 
     @property
     def frozen(self) -> bool:
@@ -58,6 +63,7 @@ def http_get_via_proxy(
     max_bytes: int = 0,
     max_body_seconds: float = 0.0,
     cancel: threading.Event | None = None,
+    rtt: bool = False,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -71,6 +77,10 @@ def http_get_via_proxy(
     `cancel` — демон останавливается: ожидание сети на любом этапе (ответ на CONNECT,
     рукопожатие TLS, заголовки, тело) прерывается за доли секунды, итог — kind
     "cancelled". О сервере такой итог ничего не говорит, записывать его нельзя.
+    `rtt` — после удачной загрузки по https тем же соединением (keep-alive) уходит HEAD, и
+    время до его заголовков — сетевая задержка rtt_ms (п. 2.3 рекомендаций к аудиту 0.1.18):
+    время пробы целиком (рукопожатия TCP и TLS через сервер, загрузка файла) больше её в
+    разы — у «польша 2» 340–470 мс при RTT 40–60.
     """
     parts = urlsplit(url)
     host = parts.hostname
@@ -107,7 +117,8 @@ def http_get_via_proxy(
             if parts.query:
                 path = f"{path}?{parts.query}"
             request = _request(
-                "GET", path, {"Host": _host_header(host, port, 443)}, user_agent
+                "GET", path, {"Host": _host_header(host, port, 443)}, user_agent,
+                keep_alive=rtt,
             )
         else:
             try:
@@ -120,10 +131,14 @@ def http_get_via_proxy(
                 headers["Proxy-Authorization"] = f"Basic {token}"
             request = _request("GET", url, headers, user_agent)  # абсолютный URI
         sock.sendall(request)
-        return _read_response(
+        result = _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
             max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
         )
+        if rtt and parts.scheme == "https" and result.ok and result.reusable:
+            head = _request("HEAD", path, {"Host": _host_header(host, port, 443)}, user_agent)
+            result.rtt_ms = _head_rtt(sock, head, silence, deadline, cancel)
+        return result
     except fetch.Cancelled:
         return DownloadResult(
             ok=False, kind="cancelled", error="проверка прервана: демон останавливается"
@@ -138,17 +153,43 @@ def http_get_via_proxy(
                 sock.close()
 
 
+def _head_rtt(
+    sock: socket.socket, request: bytes, silence: float, deadline: float,
+    cancel: threading.Event | None,
+) -> float | None:
+    """Время от отправки HEAD до конца его заголовков, мс; None — ответа нет (сервер закрыл
+    соединение или замолчал). Ошибка здесь пробу не портит: файл уже скачан."""
+    started = time.monotonic()
+    buffer = b""
+    try:
+        sock.sendall(request)
+        while fetch.HEAD_END not in buffer and len(buffer) <= HEAD_LIMIT:
+            chunk = _recv(sock, silence, deadline, cancel)
+            if not chunk:
+                return None
+            buffer += chunk
+    except (OSError, _Silence, _Deadline):
+        return None
+    if not buffer.startswith(b"HTTP/"):
+        return None
+    return round((time.monotonic() - started) * 1000.0, 1)
+
+
 def _host_header(host: str, port: int, default_port: int) -> str:
     name = f"[{host}]" if ":" in host else host
     return name if port == default_port else f"{name}:{port}"
 
 
-def _request(method: str, target: str, headers: dict[str, str], user_agent: str = "") -> bytes:
+def _request(
+    method: str, target: str, headers: dict[str, str], user_agent: str = "", *,
+    keep_alive: bool = False,
+) -> bytes:
     lines = [f"{method} {target} HTTP/1.1"]
     lines.extend(f"{key}: {value}" for key, value in headers.items())
     # Без Accept-Encoding: тело нужно целиком, несжатым — по нему считается размер пробы.
     agent = user_agent if user_agent and user_agent.isprintable() else fetch.DEFAULT_UA
-    lines.extend(["User-Agent: " + agent, "Accept: */*", "Connection: close"])
+    connection = "keep-alive" if keep_alive else "close"
+    lines.extend(["User-Agent: " + agent, "Accept: */*", f"Connection: {connection}"])
     return (fetch.CRLF.join(lines) + fetch.CRLF * 2).encode("utf-8")
 
 
@@ -250,9 +291,14 @@ def _read_response(
             error=f"соединение закрыто после {downloaded} из {length} байт тела",
             body_seconds=seconds,
         )
-    return DownloadResult(
+    result = DownloadResult(
         ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds
     )
+    # Тело дочитано по длине или по кадрам, а сервер не обещал закрыть соединение — им можно
+    # отправить следующий запрос (замер RTT).
+    result.reusable = (length is not None or chunked) and b"connection: close" not in (
+        head.lower())
+    return result
 
 
 def _parse_head(head: bytes) -> tuple[int | None, int | None, bool]:

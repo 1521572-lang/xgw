@@ -304,3 +304,22 @@ def test_old_speed_every_hours(tmp_path):
     cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 0\n")
     assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (0, 0)
     assert any("замеры скорости выключены" in warning for warning in warnings)
+
+
+def test_old_default_dns_lists_become_encrypted(tmp_path):
+    """Списки DNS из прежнего примера конфига (с udp://77.88.8.8 и обычным 77.88.8.8 для
+    direct_domains) заменяются нынешними умолчаниями; свои списки остаются как есть."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[dns]\n"
+        'bootstrap = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", '
+        '"udp://77.88.8.8"]\n'
+        'direct_servers = ["77.88.8.8"]\n',
+        encoding="utf-8",
+    )
+    cfg, _warnings = load(path)
+    assert "udp://77.88.8.8" not in cfg.dns.resolvers and "tls://77.88.8.8" in cfg.dns.resolvers
+    assert cfg.dns.direct_servers == ["https://77.88.8.8/dns-query"]
+    path.write_text('[dns]\nbootstrap = ["udp://192.0.2.53"]\n', encoding="utf-8")
+    cfg, _warnings = load(path)
+    assert cfg.dns.bootstrap == ["udp://192.0.2.53"]

@@ -8,6 +8,9 @@
 
 Файл — `/var/lib/xgw/records/<mac>-<время>.pcap`, 0600, открывается в Wireshark. Запись
 одна за раз, не дольше MAX_SECONDS и не больше MAX_BYTES; хранятся последние KEEP файлов.
+С 0.2.0 (ДОП-1 рекомендаций к аудиту 0.1.18) — 5 минут и 50 МБ вместо 10 минут и 100 МБ, и
+запись не начинается и останавливается, когда на диске с /var/lib/xgw остаётся меньше
+MIN_FREE: забытая запись на 80 Мбит/с не должна съесть место, нужное базе state.db.
 """
 
 from __future__ import annotations
@@ -24,9 +27,11 @@ from collections.abc import Callable
 from pathlib import Path
 
 DEFAULT_SECONDS = 120
-MAX_SECONDS = 600
-MAX_BYTES = 100 * 1024 * 1024
+MAX_SECONDS = 300
+MAX_BYTES = 50 * 1024 * 1024
 KEEP = 3
+MIN_FREE = 512 * 1024 * 1024  # свободного места на диске — не меньше, иначе запись не идёт
+FREE_CHECK = 2.0  # как часто проверять свободное место во время записи, с
 SNAPLEN = 65535
 
 ETH_P_ALL = 0x0003
@@ -100,10 +105,12 @@ class Recorder:
         opener: Callable[[str, str], socket.socket] = open_socket,
         clock: Callable[[], float] = time.time,
         on_done: Callable[[str], None] | None = None,
+        free: Callable[[Path], int] | None = None,
     ) -> None:
         self.directory = Path(directory)
         self.opener = opener
         self.clock = clock
+        self.free = free or _free_bytes
         self.on_done = on_done
         self._lock = threading.Lock()
         self._active: dict | None = None
@@ -129,6 +136,12 @@ class Recorder:
             except OSError as exc:
                 raise RecordError(f"интерфейс {interface} недоступен для записи: {exc}") from exc
             self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            left = self.free(self.directory)
+            if left < MIN_FREE + MAX_BYTES:
+                sock.close()
+                raise RecordError(
+                    f"на диске мало места ({_size(left)} свободно): запись трафика нужна "
+                    f"{_size(MIN_FREE + MAX_BYTES)} — удалите старые записи или освободите место")
             started = self.clock()
             stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(started))
             name = f"{mac.replace(':', '')}-{stamp}.pcap"
@@ -159,6 +172,7 @@ class Recorder:
         buffer = bytearray(SNAPLEN)
         deadline = job["started"] + job["seconds"]
         why, packets = "время вышло", 0
+        checked = self.clock()
         try:
             sock.settimeout(0.5)
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -178,6 +192,11 @@ class Recorder:
                     if written + len(record) > MAX_BYTES:
                         why = f"файл дошёл до {MAX_BYTES // (1024 * 1024)} МБ"
                         break
+                    if self.clock() - checked >= FREE_CHECK:
+                        checked = self.clock()
+                        if self.free(self.directory) < MIN_FREE:
+                            why = "на диске кончается место"
+                            break
                     out.write(record)
                     written += len(record)
                     packets += 1
@@ -238,6 +257,12 @@ class Recorder:
                 "ended": meta.get("ended", path.stat().st_mtime), "why": meta.get("why", ""),
             })
         return {"active": active, "files": files}
+
+
+def _free_bytes(directory: Path) -> int:
+    """Свободно на диске каталога, байт (для обычного процесса, без резерва root)."""
+    stats = os.statvfs(directory)
+    return stats.f_bavail * stats.f_frsize
 
 
 def _size(value: int) -> str:

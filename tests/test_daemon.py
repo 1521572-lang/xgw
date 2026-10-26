@@ -178,6 +178,8 @@ class Harness(Daemon):
         self.applied: list[tuple[dict, bool]] = []
         self.apply_mode = "api"
         self.verdicts: dict[str, str] = {}  # probe-тег → вердикт скана
+        self.rtt_on = False  # RTT участников (Daemon._rtt_step) — только в своём тесте
+        self.shadow: dict[str, str] | None = None  # тег → вердикт теневой пробы (ДОП-3)
         self.default_verdict = "OK"
         self.scanned: list[str] = []
         self.scan_urls: dict[str, str] = {}  # тег → адрес последней проверки
@@ -226,6 +228,15 @@ class Harness(Daemon):
     def _check_resolvers(self):
         return list(self.resolver_results)  # тесты не ходят в DNS (ТЗ R4a — в своих тестах)
 
+    def _shadow_verdict(self, info):
+        """Теневая проба (ДОП-3): по умолчанию её нет — как до 0.2.0, проба на месте."""
+        return self.shadow.get(info.tag) if self.shadow is not None else None
+
+    def _rtt_step(self, view, applied, observatory):
+        """RTT участников (0.2.0) — в своём тесте: иначе их проверки попадали бы в scanned."""
+        if self.rtt_on:
+            super()._rtt_step(view, applied, observatory)
+
     def _check_derp(self):
         return self.derp_error
 
@@ -247,10 +258,11 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, tier=None, reserve=None, profiles=None, reload_singbox=None):
+    def _assemble(self, prefer, reserve=None, profiles=None, reload_singbox=None):
         return engine.assemble(
             self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
-            xray_bin=None, check=False, prefer=prefer, tier=tier, reserve=reserve,
+            xray_bin=None, check=False, prefer=prefer, scores=self._scores_now(),
+            reserve=reserve,
             profiles=profiles, reload_singbox=reload_singbox,
             singbox_ok=self.singbox_ok and not self._singbox_failed,
         )
@@ -429,150 +441,8 @@ def _by_level(daemon: Harness) -> tuple[str, list[str]]:
     return high, [fp for fp in nodes if fp != high]
 
 
-def test_only_servers_of_the_highest_level_work(daemon):
-    high, _others = _by_level(daemon)
-    members = daemon.tags("proxy")
-    assert len(members) == 1 and _fingerprint(daemon, members[0]) == high  # max_members = 2
-    assert daemon.status()["tier"] == "high"
-    assert {m["priority"] for m in daemon.status()["members"]} == {"high"}
-
-
-def test_all_dead_on_a_level_goes_down_and_comes_back_when_it_answers(daemon):
-    high, others = _by_level(daemon)
-    daemon.next_refresh = daemon.t + 3600
-    (member,) = daemon.tags("proxy")
-    daemon.set_alive(**{member.replace("-", "_"): False})
-    # Трафик сразу несёт резервный выход балансировщика — сервер среднего уровня (0.1.8):
-    # не ALL_DEAD, а RESERVE.
-    assert daemon.tick() is State.RESERVE
-    # Живых высокого уровня нет — в работе средние, сразу и с правом перезапуска.
-    members = daemon.tags("proxy")
-    assert {_fingerprint(daemon, tag) for tag in members} <= set(others) and len(members) == 2
-    assert daemon.applied[-1][1] is True
-    assert any("на уровне «высокий» живых серверов нет — в работе серверы уровня «средний»"
-               in event for event in daemon.events())
-    assert daemon.status()["tier"] == "medium"
-
-    # Сервер высокого уровня пока не отвечает: проверяется чаще (TIER_RESCAN), но не берётся.
-    daemon.set_alive()
-    spare = member.replace("proxy-", "spare-")
-    daemon.verdicts[spare.replace("spare-", "probe-")] = "CONNECT_FAIL"
-    daemon.applied.clear()
-    daemon.scanned.clear()
-    for _ in range(3):
-        daemon.t += 301
-        daemon.tick()
-    assert spare in daemon.scanned and daemon.applied == []
-    # Ответил — возвращаемся к нему.
-    daemon.verdicts.clear()
-    daemon.t += 301
-    daemon.tick()
-    daemon.tick()
-    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
-    assert any("сервер уровня «высокий» снова отвечает — в работе серверы уровня «высокий»"
-               in event for event in daemon.events())
-
-
-def test_dead_member_is_replaced_only_by_a_spare_of_its_level(daemon):
-    """Участник умер, а живые запасные — только уровня ниже: участники разных уровней
-    вместе не работают, поэтому замены нет (живой участник того же уровня ещё есть)."""
-    daemon.cfg.filters.rotate_after_min = 0
-    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
-    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
-    _started(daemon)
-    victim, _survivor = daemon.tags("proxy")
-    daemon.set_alive(**{victim.replace("-", "_"): False})
-    for _ in range(3):
-        assert daemon.tick() is State.DEGRADED
-    assert daemon.applied == [] and victim in daemon.tags("proxy")
-
-
 def _stranded_events(daemon: Harness) -> list[str]:
     return [e for e in daemon.events() if e.startswith("rotation:") and "заменить некем" in e]
-
-
-def test_degraded_says_so_when_there_is_no_spare_of_the_members_class(daemon):
-    """Запасные — только уровня ниже, мёртвого заменить некем: состояние так и говорит
-    вместо «замена на запасные», событие с советом — одно на этих мёртвых и после
-    перечитывания настроек не повторяется. Появился запасной того же класса — прежний текст
-    (разбор DEGRADED 24.10.2026)."""
-    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
-    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
-    _started(daemon)
-    daemon.next_refresh = daemon.t + 3600
-    victim, _survivor = daemon.tags("proxy")
-    daemon.set_alive(**{victim.replace("-", "_"): False})
-    assert daemon.tick() is State.DEGRADED
-    status = daemon.status()
-    assert status["action"] == (
-        "часть серверов недоступна, а заменить их некем: среди запасных нет серверов того же "
-        "класса (лимитированные серверы x1 уровня «средний»); серверы другого класса шлюз "
-        "ставит в работу, только когда не отвечает ни один из работающих"
-    )
-    assert status["stranded"].startswith("не отвечает сервер в работе «")
-    assert status["stranded"].endswith(
-        "Чтобы было из кого менять, включите отключённые серверы этого класса или добавьте "
-        "подписку."
-    )
-    assert status["class_warning"] == ""  # безлимитных нет — квоту тратить больше не на чем
-    assert any(e.startswith("DEGRADED:") and "заменить их некем" in e for e in daemon.events())
-    daemon.tick()
-    daemon.tick()
-    assert len(_stranded_events(daemon)) == 1
-    second = _second(daemon, lambda cfg: None)
-    try:
-        second.observatory = daemon.observatory
-        second.tick()
-        second.tick()
-        assert len(_stranded_events(second)) == 1
-        assert second.status()["action"].startswith("часть серверов недоступна, а заменить")
-        # Серверу nodes[2] вернули средний уровень: заменить есть кем — текст прежний.
-        second.cfg.managed.priority = dict.fromkeys(nodes[3:], "low")
-        assert second.tick() is State.DEGRADED
-        status = second.status()
-        assert status["action"] == "часть серверов недоступна — замена на запасные"
-        assert status["stranded"] == ""
-    finally:
-        second.store.close()
-
-
-def test_restarted_daemon_does_not_promise_a_replacement_before_it_knows(daemon):
-    """Демон перезапущен (установка), конфиг ядра есть, подписка ещё не получена: событие
-    перехода не обещает «замену на запасные»; к концу шага список серверов получен — статус и
-    событие «замена» говорят, что заменить некем."""
-    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
-    daemon.cfg.managed.priority = dict.fromkeys(nodes[2:], "low")
-    _started(daemon)
-    victim = daemon.tags("proxy")[0]
-    restarted = Harness(daemon.cfg, daemon.paths)
-    try:
-        restarted.t = daemon.t
-        restarted.set_alive(**{victim.replace("-", "_"): False})
-        assert restarted.tick() is State.DEGRADED
-        assert "DEGRADED: HEALTHY → DEGRADED: часть серверов недоступна" in restarted.events()
-        assert restarted.status()["action"].startswith("часть серверов недоступна, а заменить")
-        assert len(_stranded_events(restarted)) == 1
-    finally:
-        restarted.store.close()
-
-
-def test_high_level_stranded_advice_names_the_level(daemon):
-    """В работе все серверы уровня «высокий», запасных этого уровня нет: совет — поставить
-    «высокий» ещё нескольким серверам или вернуть «средний»."""
-    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
-    daemon.cfg.filters.max_members = 3
-    daemon.cfg.managed.priority = dict.fromkeys(nodes[:2], "high")
-    _started(daemon)
-    daemon.next_refresh = daemon.t + 3600
-    victim = daemon.tags("proxy")[0]
-    daemon.set_alive(**{victim.replace("-", "_"): False})
-    daemon.tick()
-    status = daemon.status()
-    assert "(лимитированные серверы x1 уровня «высокий»)" in status["action"]
-    assert status["stranded"].endswith(
-        "поставьте уровень «высокий» ещё нескольким серверам (лучше той же страны) или "
-        "верните серверам в работе уровень «средний»."
-    )
 
 
 def test_dead_member_with_a_spare_of_its_class_keeps_the_usual_text(daemon):
@@ -652,95 +522,6 @@ def test_class_warning_needs_fresh_live_unlimited_servers_of_a_lower_level():
     # Безлимитный того же уровня — класс лучше: на него шлюз перейдёт сам.
     same = {**spares[0], "priority": "medium"}
     assert class_warning(cfg, members, [same], None, now) == ""
-
-
-def test_chosen_server_keeps_its_level_while_it_answers(daemon):
-    """Пока трафик ведёт сервер, выбранный вручную, уровень не меняется; выбранный умер —
-    трафик на автовыборе, и уровень меняется, как обычно."""
-    high, others = _by_level(daemon)
-    (member,) = daemon.tags("proxy")
-    daemon.store.set_meta("pin", json.dumps({"tag": member, "until": None}))
-    daemon.next_refresh = daemon.t + 3600
-    for _ in range(3):
-        daemon.t += 20
-        daemon.tick()
-    assert [_fingerprint(daemon, tag) for tag in daemon.tags("proxy")] == [high]
-    daemon.set_alive(**{member.replace("-", "_"): False})
-    daemon.tick()
-    assert json.loads(daemon.store.get_meta("pin"))["down"]  # трафик — автовыбору
-    daemon.tick()
-    assert {_fingerprint(daemon, tag) for tag in daemon.tags("proxy")} <= set(others)
-    assert any("на уровне «высокий» живых серверов нет" in event for event in daemon.events())
-
-
-def test_levels_follow_the_real_machine_plan(daemon):
-    """Сценарий программы испытаний 0.1.7 (REAL-31…REAL-35): уровни меняют из панели, а
-    «мёртвый высокий уровень» — ненастоящий сервер, который проверку не проходит."""
-    daemon.tick()
-    spare_tags = daemon.tags("spare")
-    live, dead, low = (_fingerprint(daemon, tag) for tag in spare_tags)
-    verdicts = {spare_tags[1].replace("spare-", "probe-"): "CONNECT_FAIL"}
-    daemon.verdicts = dict(verdicts)
-    _started(daemon)
-
-    def levels(mapping):
-        def change(cfg):
-            cfg.managed.priority = dict(mapping)
-        return change
-
-    def members(d):
-        return sorted(_fingerprint(d, tag) for tag in d.tags("proxy"))
-
-    def step(d, dead_tag=None):
-        d.t += 20
-        state = d.tick()
-        alive = {dead_tag.replace("-", "_"): False} if dead_tag in d.tags("proxy") else {}
-        d.set_alive(**alive)
-        return state
-
-    # REAL-31: живой запасной — высокий: он один в работе.
-    d = _second(daemon, levels({live: "high"}))
-    d.tick()  # пересборка после смены настроек; уровень меняет следующий шаг
-    d.set_alive()
-    d.tick()
-    d.set_alive()
-    assert members(d) == [live] and d.status()["tier"] == "high"
-    # REAL-32, REAL-33: другой — низкий, ненастоящий — высокий: в работе живой и мёртвый.
-    d = _second(d, levels({live: "high", low: "low", dead: "high"}))
-    d.verdicts = dict(verdicts)
-    d.tick()
-    dead_tag = next(tag for tag in d.tags("proxy") if _fingerprint(d, tag) == dead)
-    d.set_alive(**{dead_tag.replace("-", "_"): False})
-    assert d.tick() is State.DEGRADED and members(d) == sorted([live, dead])
-    # REAL-34: живой — средний: высокий уровень весь мёртв — в работе средние.
-    d = _second(d, levels({low: "low", dead: "high"}))
-    d.verdicts = dict(verdicts)
-    d.tick()
-    assert members(d) == [dead]
-    d.set_alive(**{dead_tag.replace("-", "_"): False})
-    states = [step(d, dead_tag) for _ in range(3)]
-    # Трафик несёт резервный выход — сервер среднего уровня (0.1.8): RESERVE, не ALL_DEAD.
-    assert State.RESERVE in states and d.status()["tier"] == "medium"
-    assert dead not in members(d) and low not in members(d)
-    assert any("на уровне «высокий» живых серверов нет — в работе серверы уровня «средний»"
-               in event for event in d.events())
-    d.scanned.clear()
-    d.applied.clear()
-    for _ in range(40):  # 13 минут: мёртвый высокий проверяется, но не берётся
-        step(d)
-    assert sum(_fingerprint(d, tag) == dead for tag in d.scanned) >= 2 and d.applied == []
-    # REAL-35: пока сервер закреплён, уровень не меняется; сняли — снова высокий.
-    d.store.set_meta("pin", json.dumps({"tag": d.tags("proxy")[0], "until": d.t + 600}))
-    d = _second(d, levels({live: "high", low: "low", dead: "high"}))
-    d.verdicts = dict(verdicts)
-    for _ in range(9):
-        step(d)
-    assert d.status()["tier"] == "medium"
-    d.store.set_meta("pin", "")
-    for _ in range(3):
-        step(d)
-    assert d.status()["tier"] == "high" and members(d) == sorted([live, dead])
-    assert any("сервер уровня «высокий» снова отвечает" in event for event in d.events())
 
 
 def test_frozen_spares_are_not_promoted(daemon):
@@ -959,8 +740,9 @@ def test_budget_warning_is_reported_once(daemon):
     _started(daemon)
     daemon.tick()
     daemon.tick()
-    budget_events = [event for event in daemon.events() if event.startswith("budget:")]
-    assert len(budget_events) == 1 and "лимита" in budget_events[0]
+    budget_events = [event for event in daemon.events()
+                     if event.startswith("budget:") and "лимита" in event]
+    assert len(budget_events) == 1
     assert daemon.status()["budget"]["warnings"]
 
 
@@ -1512,8 +1294,8 @@ def test_disabled_server_leaves_the_core_without_asking_subscriptions_again(daem
 
 
 def test_device_server_is_applied_at_once(daemon):
-    """Свой сервер устройства (Ф4): новый выход to-main требует перезапуска Xray — сборка
-    срочная и окна перезапуска не ждёт (отчёт Ф4: выбор записан, а конфиг Xray прежний)."""
+    """Свой сервер устройства (Ф4): сборка срочная и окна перезапуска не ждёт (отчёт Ф4: выбор
+    записан, а конфиг Xray прежний); с 0.2.0 это одно правило routing — через API ядра."""
     _started(daemon)
     from xgw.generator import builder
 
@@ -1528,8 +1310,9 @@ def test_device_server_is_applied_at_once(daemon):
         second.tick()
         ((config, urgent),) = second.applied
         assert urgent
-        assert [balancer["fallbackTag"] for balancer in config["routing"]["balancers"]
-                if balancer["tag"] == "dev-192.168.50.20"] == [builder.TO_MAIN]
+        assert {"type": "field", "source": ["192.168.50.20"], "outboundTag": member.tag} in (
+            config["routing"]["rules"])
+        assert config["burstObservatory"]["subjectSelector"] == ["proxy-"]
         assert any("свой сервер устройства" in event for event in second.events())
         second.tick()
         assert len(second.applied) == 1  # второй раз пересобирать нечего
@@ -2168,153 +1951,6 @@ def _reserve_started(daemon: Harness, layout=MIXED) -> Harness:
     return daemon
 
 
-def test_unlimited_servers_work_and_the_cheapest_limited_one_waits_as_the_reserve(daemon):
-    daemon.source = _priced()
-    _started(daemon)
-    named = _named(daemon)
-    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит 1"], named["Безлимит 2"]])
-    # Резервный выход — лимитированный x1; observatory пробует только участников.
-    config = engine.read_json(daemon.paths.xray_config_file)
-    assert _fallback(daemon) == named["x1 Финляндия"]
-    assert config["burstObservatory"]["subjectSelector"] == ["proxy-"]
-    paid = [named[name] for name in ("x1 Финляндия", "x10 🛜 Германия", "x100 LTE")]
-    # Лимитированные запасные проверяются только как кандидаты в резервный — один раз
-    # после запуска и коротким запросом (probe.trace_url), а не загрузкой probe.url.
-    daemon.tick()
-    assert sorted(daemon.scanned) == sorted(paid)
-    assert {daemon.scan_urls[tag] for tag in paid} == {daemon.cfg.probe.trace_url}
-    assert daemon.applied == []  # резервный прошёл проверку — менять нечего
-    # По расписанию скана (scan_spares_minutes) их больше не трогают.
-    daemon.scanned.clear()
-    for _ in range(3):
-        daemon.t += daemon.cfg.probe.scan_spares_minutes * 60 * 1.3
-        daemon.next_refresh = daemon.t + 3600
-        daemon.tick()
-    assert daemon.scanned == []
-    status = daemon.status()
-    assert status["reserve"]["name"] == "x1 Финляндия" and status["reserve"]["cost"] == 1.0
-    costs = {spare["name"]: spare["cost"] for spare in status["spares"]}
-    assert costs == {"x1 Финляндия": 1.0, "x10 🛜 Германия": 10.0, "x100 LTE": 100.0}
-    assert {member["cost"] for member in status["members"]} == {0.0}
-    # Раз в RESERVE_RECHECK (6 ч) — перепроверка: снова коротким запросом.
-    daemon.t += 6 * 3600 * 1.3
-    daemon.next_refresh = daemon.t + 3600
-    daemon.tick()
-    daemon.tick()
-    assert sorted(daemon.scanned) == sorted(paid)
-
-
-def test_dead_unlimited_servers_give_way_to_the_cheapest_limited_ones_and_come_back(daemon):
-    """Безлимитные мертвы — трафик сразу несёт резервный x1 (Xray сам, через fallbackTag),
-    а шлюз ставит в работу живые лимитированные, сначала самые дешёвые (решение
-    пользователя после испытаний 0.1.9). x10 и x100 участниками не становятся: их пробы
-    съели бы квоту (MEMBER_COST_MAX). Безлимитный снова ответил — в работе безлимитные."""
-    _reserve_started(daemon)
-    unlimited = daemon.tags("proxy")
-    for tag in unlimited:
-        daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
-    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
-    assert daemon.tick() is State.RESERVE
-    entered = [event for event in daemon.events() if event.startswith("RESERVE:")]
-    assert len(entered) == 1 and "HEALTHY → RESERVE" in entered[0]
-    assert "трафик идёт через резервный сервер «x1 Финляндия» (x1)" in entered[0]
-    assert daemon.collected == [False]  # подписка — напрямую: через Xray пошла бы через x1
-    # Сбой может быть коротким (ядро само вернёт трафик безлимитным) — COSTLIER_AFTER ждём.
-    assert daemon.tags("proxy") == unlimited and daemon.applied == []
-    daemon.t += 130
-    assert daemon.tick() is State.RESERVE
-    named = _named(daemon)
-    assert daemon.tags("proxy") == [named["x1 Финляндия"]]
-    assert daemon.applied[-1][1] is True  # срочно: участники мертвы
-    assert any(
-        "живых серверов нет — в работе лимитированные серверы x1 (были — безлимитные "
-        "серверы)" in event for event in daemon.events()
-    )
-    daemon.set_alive()
-    daemon.applied.clear()
-    for _ in range(3):
-        daemon.t += 120
-        assert daemon.tick() is State.HEALTHY
-    assert daemon.applied == []
-    assert named["x10 🛜 Германия"] not in daemon.tags("proxy")
-    # Безлимитные ответили на перепроверку (TIER_RESCAN) — они снова в работе.
-    daemon.verdicts.clear()
-    for _ in range(3):
-        daemon.t += 120
-        daemon.tick()
-    named = _named(daemon)
-    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит 1"], named["Безлимит 2"]])
-    # Резервным снова становится x1 — после перепроверки кандидатов дешёвым запросом.
-    for _ in range(3):
-        daemon.t += 20
-        daemon.tick()
-    assert _fallback(daemon) == _named(daemon)["x1 Финляндия"]
-
-
-def test_brief_outage_of_the_unlimited_servers_does_not_bring_in_limited_ones(daemon):
-    """Провайдер моргнул: ядро сочло безлимитных мёртвыми, трафик ненадолго понёс
-    резервный, затем безлимитные снова ответили на пробу — лимитированных в работу не
-    ставили, конфиг не менялся."""
-    _reserve_started(daemon)
-    unlimited = daemon.tags("proxy")
-    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
-    assert daemon.tick() is State.RESERVE
-    daemon.t += 60
-    assert daemon.tick() is State.RESERVE
-    daemon.set_alive()
-    daemon.t += 20
-    assert daemon.tick() is State.HEALTHY
-    daemon.t += 120
-    daemon.tick()
-    assert daemon.tags("proxy") == unlimited and daemon.applied == []
-
-
-def test_limited_servers_without_a_fresh_check_are_checked_cheaply_first(daemon):
-    """Свежих вердиктов у лимитированных x1 нет — шлюз сначала проверяет их дешёвым
-    запросом и только потом ставит в работу; в класс дороже по старым вердиктам не идёт."""
-    layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("paid", "x1 A"),
-              ("paid", "x1 B"), ("paid", "x10 C")]
-    _reserve_started(daemon, layout)
-    named = _named(daemon)
-    # Прошло больше двух периодов скана: вердикты x1 устарели.
-    daemon.t += daemon.cfg.probe.scan_spares_minutes * 120 + 600
-    daemon.next_refresh = daemon.t + 3600
-    daemon.tick()
-    daemon.scanned.clear()
-    daemon.applied.clear()
-    unlimited = daemon.tags("proxy")
-    for tag in unlimited:
-        daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
-    daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
-    assert daemon.tick() is State.RESERVE
-    daemon.t += 130
-    daemon.tick()
-    assert daemon.applied == []  # сначала проверка
-    daemon.t += 20
-    daemon.tick()
-    x1 = {named["x1 A"], named["x1 B"]}
-    assert x1 <= set(daemon.scanned)
-    assert {daemon.scan_urls[tag] for tag in x1} == {daemon.cfg.probe.trace_url}
-    assert named["x10 C"] not in daemon.scanned
-    named = _named(daemon)
-    assert sorted(daemon.tags("proxy")) == sorted([named["x1 A"], named["x1 B"]])
-
-
-def test_dead_unlimited_member_is_replaced_by_an_unlimited_spare_while_the_reserve_works(daemon):
-    """Пока трафик несёт резервный (и тратит квоту), мёртвых безлимитных меняют на живых
-    безлимитных запасных сразу, не дожидаясь rotate_after_min."""
-    layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("free", "Безлимит 3"),
-              ("paid", "x1 Финляндия"), ("paid", "x10 🛜 Германия")]
-    _reserve_started(daemon, layout)
-    members = daemon.tags("proxy")
-    daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
-    assert daemon.tick() is State.RESERVE
-    daemon.tick()
-    named = _named(daemon)
-    assert named["Безлимит 3"] in daemon.tags("proxy")
-    assert all(not tag.startswith("proxy-") for name, tag in named.items() if name.startswith("x"))
-
-
 def test_reserve_that_stops_answering_is_replaced_by_the_next_cheapest(daemon):
     daemon.source = _priced()
     daemon.tick()
@@ -2359,57 +1995,6 @@ def test_reserve_that_stops_answering_is_replaced_by_the_next_cheapest(daemon):
     daemon.tick()
     notes = [event for event in daemon.events() if "резервного сервера нет" in event]
     assert len(notes) == 1 and _fallback(daemon) == x100.replace("proxy-", "spare-")
-
-
-def test_without_unlimited_servers_limited_ones_work_as_before(daemon):
-    """Безлимитных нет: в балансировщике x1 (как в 0.1.7), резервный — x10. Запасные x1
-    сканируются по расписанию, но коротким запросом; заменивший мёртвого участника x1
-    один раз проходит первую проверку probe.url."""
-    daemon.cfg.filters.rotate_after_min = 0
-    layout = [("paid", "x1 A"), ("paid", "x1 B"), ("paid", "x1 C"), ("paid", "x10 D"),
-              ("paid", "x10 E")]
-    _reserve_started(daemon, layout)
-    named = _named(daemon)
-    assert sorted(daemon.tags("proxy")) == sorted([named["x1 A"], named["x1 B"]])
-    assert _fallback(daemon) == named["x10 D"]
-    daemon.t += daemon.cfg.probe.scan_spares_minutes * 60 * 1.3
-    daemon.next_refresh = daemon.t + 3600
-    daemon.tick()
-    assert daemon.scanned == [named["x1 C"]]
-    assert daemon.scan_urls[named["x1 C"]] == daemon.cfg.probe.trace_url
-    victim = named["x1 A"]
-    daemon.set_alive(**{victim.replace("-", "_"): False})
-    daemon.scanned.clear()
-    assert daemon.tick() is State.DEGRADED
-    named = _named(daemon)
-    assert named["x1 C"] in daemon.tags("proxy") and named["x10 D"] not in daemon.tags("proxy")
-    daemon.set_alive()
-    daemon.tick()
-    assert daemon.scanned == [named["x1 C"]]  # первая проверка нового участника
-    assert daemon.scan_urls[named["x1 C"]] == daemon.cfg.probe.url
-
-
-def test_unlimited_servers_that_appear_take_over_from_limited_ones(daemon):
-    limited = [("paid", "x1 A"), ("paid", "x1 B"), ("paid", "x10 C"), ("paid", "x10 D"),
-               ("paid", "x10 E")]
-    _reserve_started(daemon, limited)
-    before = sorted(daemon.tags("proxy"))
-    # Подписка обновилась: D и E теперь безлимитные (другая подписка).
-    daemon.source = _priced([*limited[:3], ("free", "Безлимит D"), ("free", "Безлимит E")])
-    daemon.next_refresh = 0.0
-    daemon.tick()
-    daemon.next_refresh = daemon.t + 3600
-    for _ in range(4):
-        daemon.t += 20
-        daemon.tick()
-    assert sorted(daemon.tags("proxy")) != before
-    named = _named(daemon)
-    assert sorted(daemon.tags("proxy")) == sorted([named["Безлимит D"], named["Безлимит E"]])
-    assert any(
-        "снова отвечают серверы лучшего класса — в работе безлимитные серверы (были — "
-        "лимитированные серверы x1)" in event for event in daemon.events()
-    )
-    assert _fallback(daemon) == named["x1 A"]  # x1 — теперь резервный
 
 
 def test_dead_probe_url_is_found_while_the_reserve_carries_the_traffic(daemon):
@@ -2483,54 +2068,6 @@ def test_servers_the_gateway_fixes_itself_are_not_notified(tmp_path, monkeypatch
         daemon.next_refresh = daemon.t + 3600
         assert daemon.tick() is State.ALL_DEAD
         assert [kind for kind, _text in sent] == ["ALL_DEAD"]
-    finally:
-        daemon.store.close()
-
-
-def test_limited_servers_and_long_work_through_the_reserve_are_not_notified(
-    tmp_path, monkeypatch
-):
-    """Переход на лимитированные и долгая работа через резервный — молча: интернет
-    работает, действий от человека не нужно (решение пользователя после испытаний 0.1.9).
-    О долгой работе через резервный — одно событие в журнале на заход."""
-    daemon, sent = _with_sink(tmp_path, monkeypatch)
-    try:
-        _reserve_started(daemon)
-        unlimited = daemon.tags("proxy")
-        for tag in unlimited:
-            daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
-        daemon.set_alive(**{tag.replace("-", "_"): False for tag in unlimited})
-        assert daemon.tick() is State.RESERVE
-        daemon.t += 130
-        daemon.tick()
-        assert daemon.tags("proxy") == [_named(daemon)["x1 Финляндия"]]
-        daemon.set_alive()
-        daemon.t += 20
-        assert daemon.tick() is State.HEALTHY
-        assert sent == []
-    finally:
-        daemon.store.close()
-    # Лимитированные только дороже x1: участниками они не становятся, трафик долго несёт
-    # резервный — тоже без уведомлений.
-    daemon, sent = _with_sink(tmp_path / "expensive", monkeypatch)
-    try:
-        layout = [("free", "Безлимит 1"), ("free", "Безлимит 2"), ("paid", "x10 A"),
-                  ("paid", "x10 B"), ("paid", "x100 C")]
-        _reserve_started(daemon, layout)
-        members = daemon.tags("proxy")
-        daemon.set_alive(**{tag.replace("-", "_"): False for tag in members})
-        assert daemon.tick() is State.RESERVE
-        for _ in range(32):  # 10 минут с лишним
-            daemon.t += 20
-            assert daemon.tick() is State.RESERVE
-        assert daemon.tags("proxy") == members and sent == []
-        long = [event for event in daemon.events() if event.startswith("reserve: уже")]
-        assert len(long) == 1 and "«x10 A» (x10)" in long[0]
-        daemon.set_alive()
-        daemon.t += 20
-        assert daemon.tick() is State.HEALTHY
-        assert sent == []
-        assert any("снова отвечают" in event for event in daemon.events())
     finally:
         daemon.store.close()
 
@@ -2852,3 +2389,153 @@ def test_members_dead_during_the_outage_are_unknown_right_after_wan_returns(daem
     assert daemon.applied == [] and tag not in daemon.dead_since
     daemon.t += 20
     assert daemon.tick() is State.DEGRADED  # мёртв и после возврата — уже по-настоящему
+
+
+def test_dead_device_server_sends_the_device_through_the_main_one(daemon):
+    """0.2.0, п. 2.2: свой сервер устройства — запасной — проверяется дешёвым запросом раз в
+    DEVICE_CHECK. Две неудачи подряд — правило устройства убирается (идёт основной), адрес — в
+    devices-down.json, событие; две удачи — правило возвращается."""
+    from xgw import daemon as daemon_module
+    from xgw.generator import builder
+
+    _started(daemon)
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    spare = next(
+        info for info in builder.applied_nodes(applied, daemon.inventory.nodes)
+        if info.role == "spare"
+    )
+    second = _second(
+        daemon, lambda cfg: cfg.managed.routes.update({"192.168.50.20": spare.fingerprint}))
+    rule = {"type": "field", "source": ["192.168.50.20"], "outboundTag": spare.tag}
+    try:
+        second.tick()
+        assert rule in second.applied[-1][0]["routing"]["rules"]
+        second.verdicts[spare.probe_tag] = "CONNECT_FAIL"
+        for _ in range(daemon_module.DEVICE_STREAK):
+            second.t += daemon_module.DEVICE_CHECK
+            second.tick()
+        assert engine.devices_down(second.paths) == {"192.168.50.20"}
+        assert rule not in engine.read_json(second.paths.xray_config_file)["routing"]["rules"]
+        assert any("не отвечает: устройство идёт через основной" in event
+                   for event in second.events())
+        second.verdicts[spare.probe_tag] = "OK"
+        for _ in range(daemon_module.DEVICE_STREAK):
+            second.t += daemon_module.DEVICE_CHECK
+            second.tick()
+        assert engine.devices_down(second.paths) == frozenset()
+        assert rule in engine.read_json(second.paths.xray_config_file)["routing"]["rules"]
+    finally:
+        second.store.close()
+
+
+# --- 0.2.0: рейтинг вместо классов (issue #2) ---------------------------------------------
+
+
+def _rated(daemon: Harness, *, high: int = 2, members: int = 3) -> list[str]:
+    """Приоритет «высокий» у первых high серверов (по отпечатку); max_members = members.
+    Возвращает отпечатки «высоких»."""
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.filters.max_members = members
+    daemon.cfg.managed.priority = dict.fromkeys(nodes[:high], "high")
+    return nodes[:high]
+
+
+def test_dead_high_member_is_replaced_by_a_medium_spare(daemon):
+    """Issue #2, критерий 1: «высоких» двое при max_members = 3 — третий участник «средний»
+    (приоритет не фильтр). Мёртвого «высокого» через rotate_after_min меняет «средний»
+    запасной, состояние HEALTHY, «заменить некем» нет."""
+    high = _rated(daemon)
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    members = daemon.view()
+    proxies = [info for info in members if info.role == "proxy"]
+    assert len(proxies) == 3 and {info.fingerprint for info in proxies} >= set(high)
+    victim = next(info.tag for info in proxies if info.fingerprint == high[0])
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    assert daemon.tick() is State.DEGRADED
+    assert not daemon._stranded(daemon.view())
+    daemon.t += daemon.cfg.filters.rotate_after_min * 60 + 1
+    daemon.tick()
+    assert victim not in daemon.tags("proxy") and len(daemon.tags("proxy")) == 3
+    daemon.set_alive()
+    assert daemon.tick() is State.HEALTHY
+    assert any(event.startswith("rotation: замена участников") for event in daemon.events())
+
+
+def test_no_eligible_spare_is_the_only_stranded_case(daemon):
+    """«Заменить некем» — только когда ни один запасной не годен (все не прошли скан)."""
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    victim = daemon.tags("proxy")[0]
+    for tag in daemon.tags("spare"):
+        daemon.verdicts[_probe(tag)] = "CONNECT_FAIL"
+    daemon.t += daemon.cfg.probe.scan_spares_minutes * 60 * 1.3
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    daemon.tick()
+    assert daemon.tick() is State.DEGRADED
+    assert daemon._stranded(daemon.view())
+    assert daemon.status()["action"].startswith("часть серверов недоступна, а заменить")
+
+
+def test_pin_does_not_stop_replacing_dead_members(daemon):
+    """Issue #2, критерий 5: ручной выбор держит трафик на выбранном и не мешает заменить
+    мёртвого участника."""
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    chosen, victim = daemon.tags("proxy")[:2]
+    daemon.store.set_meta("pin", json.dumps({"tag": chosen, "until": None}))
+    daemon.set_alive(**{victim.replace("-", "_"): False})
+    daemon.tick()
+    daemon.t += daemon.cfg.filters.rotate_after_min * 60 + 1
+    daemon.tick()
+    assert chosen in daemon.tags("proxy") and victim not in daemon.tags("proxy")
+
+
+def test_high_spare_that_answers_again_returns_by_rating(daemon):
+    """Перестановка по рейтингу: «высокий» запасной, снова прошедший скан OK, через
+    REBALANCE_EVERY встаёт на место слабейшего «среднего» участника (не основного)."""
+    from xgw import daemon as daemon_module
+
+    nodes = sorted(node.fingerprint for node in _inventory().nodes if not node.keep_tag)
+    daemon.cfg.filters.max_members = 2
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    spare = next(info for info in daemon.view() if info.role == "spare")
+    assert spare.fingerprint in nodes
+    daemon.cfg.managed.priority = {spare.fingerprint: "high"}
+    daemon.t += daemon_module.REBALANCE_EVERY + 1
+    daemon.tick()
+    members = {info.fingerprint for info in daemon.view() if info.role == "proxy"}
+    assert spare.fingerprint in members
+    assert any("рейтинг" in event and event.startswith("rotation: в работу")
+               for event in daemon.events())
+
+
+def test_brief_reserve_does_not_bring_in_new_members(daemon):
+    """RESERVE короче RESERVE_GRACE — участников не меняют: ядро само вернёт им трафик."""
+    from xgw import daemon as daemon_module
+
+    _started(daemon)
+    daemon.next_refresh = daemon.t + 3600
+    daemon.state_since = daemon.wall()
+    assert not daemon._rotate(daemon.view(), {}, State.RESERVE, daemon.t)
+    assert daemon_module.RESERVE_GRACE > 0
+
+
+def test_scans_are_stretched_to_fit_the_daily_limit():
+    """ДОП-4: пробы ядра и дешёвые проверки — первыми в probe.max_daily_probe_mb, скан
+    запасных — в остатке: не помещается в scan_spares_minutes — реже, и итог в лимите."""
+    from xgw.watch import status
+
+    cfg = Config()
+    cfg.probe.max_daily_probe_mb = 1024
+    size = 57_620
+    checks = status.checks_bytes(1, 5)
+    relaxed = status.scan_minutes(cfg, 5, 2, 0, size, checks)
+    assert relaxed == cfg.probe.scan_spares_minutes
+    minutes = status.scan_minutes(cfg, 5, 300, 10, size, checks)
+    assert minutes > cfg.probe.scan_spares_minutes
+    budget = status.probe_budget(cfg, 5, 300, size, cheap=10, checks=checks)
+    assert budget.scan_minutes == minutes and budget.total <= 1024 * status.MB
+    cfg.probe.max_daily_probe_mb = 100  # одни пробы ядра больше лимита
+    assert status.scan_minutes(cfg, 5, 300, 10, size, checks) == status.MAX_SCAN_MINUTES

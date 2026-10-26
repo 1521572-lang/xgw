@@ -13,8 +13,10 @@ Xray 26.3.27: inbound `tun` подключается к существующем
 до их отправителя, и обратная проверка пути (rp_filter, на Ubuntu по умолчанию «мягкая»,
 2) пропускает такой пакет, только если на интерфейсе есть IPv4-адрес. Проверено на
 стенде: без адреса ядро считает `TcpExtIPReversePathFilter` и соединение не
-устанавливается. Строгий rp_filter (1) ответы всё равно отбросит — `xgw diag` об этом
-предупреждает.
+устанавливается. Строгий rp_filter (1) ответы отбросил бы и с адресом. Ядро берёт
+наибольшее из общего значения (conf.all) и значения интерфейса, поэтому XGW ставит самому
+интерфейсу мягкую проверку (2): тогда она мягкая и при строгом conf.all (0.2.0; до того
+интерфейсу ставился 0, и решало общее значение).
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from .cmd import CommandError, Runner
 
 MTU = 1500
 ADDRESS = "169.254.10.1/32"
+LOOSE = "2"  # rp_filter интерфейса: мягкая проверка обратного пути
 
 
 def inbound_name(config: dict) -> str | None:
@@ -104,7 +107,7 @@ def ensure(name: str, runner: Runner, proc_sys: Path = sysctl.PROC_SYS) -> bool:
     runner(["ip", "link", "set", "dev", name, "mtu", str(MTU), "up"])
     runner(["ip", "addr", "replace", ADDRESS, "dev", name])
     with contextlib.suppress(OSError):  # каталога интерфейса нет в подставном /proc
-        sysctl.write(f"net/ipv4/conf/{name}/rp_filter", "0", proc_sys)
+        sysctl.write(f"net/ipv4/conf/{name}/rp_filter", LOOSE, proc_sys)
     return created
 
 

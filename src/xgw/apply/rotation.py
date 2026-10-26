@@ -1,9 +1,10 @@
 """Замена «мёртвых» участников балансировщика запасными (раздел 6.7).
 
-Участник с alive = false дольше rotate_after_min меняется на лучший запасной,
-прошедший последний скан: той же страны (сначала — из другой подписки: подписку целиком
-могли заблокировать), затем OK раньше SLOW, затем быстрее по замеру скорости, затем по
-времени скана (ASSUMPTIONS п. 224) — чтобы адрес выхода не прыгал по странам. Участник, который не
+Участник с alive = false дольше rotate_after_min меняется на лучший по рейтингу запасной
+(rating.py, 0.2.0), прошедший последний скан, из всех подписок: той же страны (сначала — из
+другой подписки: подписку целиком могли заблокировать), если его рейтинг не ниже
+SAME_COUNTRY доли лучшего, — чтобы адрес выхода не прыгал по странам (ASSUMPTIONS п. 224);
+затем OK раньше SLOW, затем по времени скана. Участник, который не
 прошёл первую собственную проверку шлюза (соединение не устанавливается либо
 «замораживается»), меняется сразу: первый состав балансировщика берётся из подписки
 наугад, и ждать rotate_after_min с заведомо негодным сервером незачем. Тег узла
@@ -25,6 +26,9 @@ from ..generator.builder import NodeInfo
 from ..model import ServerNode
 
 REPLACEABLE_VERDICTS = ("OK", "SLOW")
+# Замена той же страны берётся, пока её рейтинг не ниже этой доли лучшего из годных: иначе
+# медленный сервер той же страны вытеснил бы втрое лучший соседней.
+SAME_COUNTRY = 0.7
 # Вердикты первой проверки участника, при которых он меняется без ожидания
 # rotate_after_min. Таймаут сюда не входит: он бывает разовым, и такой узел идёт
 # обычным путём — через alive = false от самого Xray.
@@ -47,15 +51,14 @@ def plan_rotation(
     now: float,
     urgent: Collection[str] = (),
     origins: dict[str, tuple[str, str]] | None = None,
-    speeds: dict[str, float] | None = None,
+    scores: dict[str, float] | None = None,
 ) -> Rotation | None:
     """alive — только по участникам с известным состоянием: узел, которого ещё
     нет в observatory (ядро только что запущено), мёртвым не считается.
 
     urgent — теги участников, не прошедших первую проверку шлюза: их меняют сразу,
     не дожидаясь ни rotate_after_min, ни вердикта observatory. origins — отпечаток →
-    (страна, подписка) участников и запасных; speeds — отпечаток → Мбит/с по свежему
-    замеру."""
+    (страна, подписка) участников и запасных; scores — отпечаток → рейтинг (rating.py)."""
     rotate_after = cfg.filters.rotate_after_min * 60
     dead_members = [
         info.tag
@@ -70,7 +73,7 @@ def plan_rotation(
     if not dead_members:
         return None
     origins = origins or {}
-    speeds = speeds or {}
+    scores = scores or {}
     candidates = [
         (info, node) for info, node in spares if scans.get(info.tag) in REPLACEABLE_VERDICTS
     ]
@@ -80,17 +83,18 @@ def plan_rotation(
         if not candidates:
             break
         country, source = origins.get(fingerprints.get(dead_tag, ""), ("", ""))
+        top = max((scores.get(node.fingerprint, 0.0) for _info, node in candidates), default=0.0)
 
-        def rank(pair, country=country, source=source):
+        def rank(pair, country=country, source=source, top=top):
             info, node = pair
-            mbps = speeds.get(node.fingerprint)
-            if country and node.country == country:
+            score = scores.get(node.fingerprint, 0.0)
+            if country and node.country == country and score >= top * SAME_COUNTRY:
                 place = 0 if node.source != source else 1
             else:
                 place = 2
             return (
-                place, 0 if scans[info.tag] == "OK" else 1,
-                mbps is None, -(mbps or 0.0), scan_seconds.get(info.tag, float("inf")),
+                place, -score, 0 if scans[info.tag] == "OK" else 1,
+                scan_seconds.get(info.tag, float("inf")),
             )
 
         chosen = min(candidates, key=rank)

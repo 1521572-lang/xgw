@@ -157,6 +157,69 @@ class CachedSubscription:
     saved_at: float = 0.0
 
 
+# Сколько хранится адрес домена подписки (HostCache): неделю — дольше владелец подписки мог
+# переехать, а сертификат прежнего адреса уже никто не продлевает.
+HOST_CACHE_TTL = 7 * 86400.0
+HOST_CACHE_FILE = "dns-cache.json"
+HOST_CACHE_MAX = 4  # адресов на имя: последние удачные
+
+
+class HostCache:
+    """Адреса доменов подписок, с которыми запрос уже удался: `cache/dns-cache.json`.
+
+    Запись появляется только после удачного прямого запроса — рукопожатие TLS с проверкой
+    сертификата по имени прошло, а из ответа разобрались серверы (engine._load_subscription),
+    — и только для адреса, с которым соединение и было. Служебные адреса (fetch.is_bogon) не
+    записываются. Нужен кэш, когда шифрованные резолверы недоступны: подписка всё равно
+    получается по прежнему адресу, а подменить его DNS провайдера не может — запись делается
+    не по ответу DNS, а по проверенному соединению (п. 1.1 рекомендаций к аудиту 0.1.18)."""
+
+    def __init__(self, directory: Path, *, clock=time.time) -> None:
+        self.path = directory / HOST_CACHE_FILE
+        self.clock = clock
+
+    def _load(self) -> dict[str, dict]:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(loaded, dict):
+            return {}
+        return {
+            str(host): entry for host, entry in loaded.items()
+            if isinstance(entry, dict) and isinstance(entry.get("ips"), list)
+        }
+
+    def addresses(self) -> dict[str, list[str]]:
+        """Имя → адреса, записанные не раньше HOST_CACHE_TTL назад (новые первыми)."""
+        now = self.clock()
+        result: dict[str, list[str]] = {}
+        for host, entry in self._load().items():
+            stamp = entry.get("ts")
+            if not isinstance(stamp, (int, float)) or now - stamp > HOST_CACHE_TTL:
+                continue
+            ips = [str(ip) for ip in entry["ips"] if isinstance(ip, str)]
+            if ips:
+                result[host] = ips
+        return result
+
+    def remember(self, host: str, address: str) -> None:
+        """Адрес, с которым запрос к host только что удался."""
+        from .fetch import is_bogon
+
+        if not host or not address or is_bogon(address):
+            return
+        entries = self._load()
+        now = self.clock()
+        known = [ip for ip in (entries.get(host) or {}).get("ips", []) if ip != address]
+        entries[host] = {"ips": [address, *known][:HOST_CACHE_MAX], "ts": now}
+        fresh = {
+            name: entry for name, entry in entries.items()
+            if isinstance(entry.get("ts"), (int, float)) and now - entry["ts"] <= HOST_CACHE_TTL
+        }
+        atomic_write_json(self.path, fresh, mode=0o600)
+
+
 class SubscriptionCache:
     """Последняя удачная версия каждой подписки в /var/lib/xgw/cache.
 

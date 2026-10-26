@@ -44,8 +44,8 @@ def label(entry: str) -> str:
     parts = urlsplit(entry)
     if parts.scheme == "https" and parts.netloc:
         return f"https://{parts.netloc}"
-    if parts.scheme == "udp":
-        return entry  # адрес и порт обычного DNS — ничего личного
+    if parts.scheme in ("udp", "tls"):
+        return entry  # адрес и порт обычного DNS и DoT — ничего личного
     return masking.mask_url(entry)
 
 

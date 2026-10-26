@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import cost, masking, priority
+from .. import cost, masking, priority, rating
 from .. import pin as pinning
 from ..apply.rotation import REPLACEABLE_VERDICTS
 from ..config import Config, parse_seconds, probe_bytes
@@ -24,7 +25,7 @@ from ..store import Store
 from . import guard as speedguard
 from . import hosts as probehosts
 from . import resolvers as resolving
-from .scan import CHEAP_SCAN_BYTES, RESERVE_CANDIDATES, RESERVE_RECHECK
+from .scan import CHEAP_SCAN_BYTES, DEVICE_CHECK, RESERVE_CANDIDATES, RESERVE_RECHECK, RTT_EVERY
 from .speed import SKIP_PRICE, every_hours, size_mb
 
 DEFAULT_PROBE_BYTES = 65536
@@ -42,6 +43,10 @@ class Budget:
     scans: int  # сканы запасных
     e2e: int  # сквозная проверка watchdog через http-in
     speed: int = 0  # замеры скорости живых серверов (watch/speed.py), не больше
+    # Дешёвые проверки своих серверов устройств и RTT участников (0.2.0).
+    checks: int = 0
+    # Период скана запасных, по которому посчитано scans, мин (scan_minutes, ДОП-4).
+    scan_minutes: int = 60
 
     size: int = DEFAULT_PROBE_BYTES  # размер одной пробы, от которого всё посчитано
     measured: bool = False  # размер измерен сквозной проверкой, а не взят по умолчанию
@@ -52,13 +57,14 @@ class Budget:
 
     @property
     def total(self) -> int:
-        """Бюджет по формуле раздела 6.8: участники × проба × 86400 / interval плюс сканы."""
-        return self.probes + self.scans
+        """Бюджет по формуле раздела 6.8: участники × проба × 86400 / interval плюс сканы и
+        (0.2.0) проверки своих серверов устройств и RTT."""
+        return self.probes + self.scans + self.checks
 
     @property
     def everything(self) -> int:
         """Весь трафик проверок за сутки: с ним сверяют квоту подписки."""
-        return self.probes + self.scans + self.e2e + self.speed
+        return self.probes + self.scans + self.checks + self.e2e + self.speed
 
 
 def remember_probe_size(store: Store, url: str, size: int) -> None:
@@ -77,9 +83,42 @@ def measured_probe_size(store: Store, url: str) -> int | None:
     return None
 
 
+MAX_SCAN_MINUTES = 1440  # скан запасных растягивается не дальше раза в сутки
+
+
+def checks_bytes(devices: int, members: int) -> int:
+    """Байт в сутки на дешёвые проверки: свои серверы устройств (запасные) — раз в
+    DEVICE_CHECK, RTT участников — раз в RTT_EVERY."""
+    return int(CHEAP_SCAN_BYTES * 86400 * (devices / DEVICE_CHECK + members / RTT_EVERY))
+
+
+def scan_minutes(
+    cfg: Config, members: int, full: int, cheap: int, size: int, checks: int = 0, *,
+    guessed: bool = False,
+) -> int:
+    """Период скана запасных, мин (ДОП-4 рекомендаций к аудиту 0.1.18): пробы ядра по
+    участникам (members × size × 86400 / interval) и дешёвые проверки checks — первыми в
+    лимите probe.max_daily_probe_mb, а скан full запасных загрузкой probe.url и cheap
+    дешёвым запросом — в остатке. Помещается — probe.scan_spares_minutes; нет — реже, но не
+    реже MAX_SCAN_MINUTES (остатка нет вовсе — тоже он: об этом предупредит budget_warnings).
+    guessed — размер пробы взят наугад (probe.url не ответил ни разу): по такой цифре скан не
+    растягивается, как и советов урезать проверки по ней нет."""
+    base = max(1, cfg.probe.scan_spares_minutes)
+    per_round = full * size + cheap * CHEAP_SCAN_BYTES
+    if per_round <= 0 or guessed:
+        return base
+    interval = parse_seconds(cfg.probe.interval) or 30
+    fixed = members * size * 86400 / max(1, interval) + checks
+    room = cfg.probe.max_daily_probe_mb * MB - fixed
+    if room <= per_round:
+        return MAX_SCAN_MINUTES
+    need = math.ceil(1440 * per_round / room)
+    return min(MAX_SCAN_MINUTES, max(base, need))
+
+
 def probe_budget(
     cfg: Config, members: int, spares: int, size: int | None = None, *,
-    cheap: int = 0, candidates: int = 0, speed_mb: float = 0.0,
+    cheap: int = 0, candidates: int = 0, speed_mb: float = 0.0, checks: int = 0,
 ) -> Budget:
     """size — размер тела probe.url по последней сквозной проверке; без него берётся
     размер из URL (…?bytes=…) или известный размер файла по умолчанию, а для
@@ -89,13 +128,15 @@ def probe_budget(
     лимитированных подписок, которых он проверяет дешёвым запросом (scan.cheap_url);
     candidates — кандидаты в резервный выход: их проверяют только раз в RESERVE_RECHECK;
     speed_mb — МБ замеров скорости в сутки (speed_daily_mb(); оценка сверху: каждый замер
-    качается целиком, все серверы живы)."""
+    качается целиком, все серверы живы); checks — байт дешёвых проверок (checks_bytes).
+    Скан — с периодом scan_minutes: он растягивается, чтобы всё уложилось в лимит."""
     speed_bytes = int(speed_mb * MB)
     measured = bool(size)
     known = size or probe_bytes(cfg.probe.url)
     size = known or DEFAULT_PROBE_BYTES
     interval = parse_seconds(cfg.probe.interval) or 30
-    scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
+    minutes = scan_minutes(cfg, members, spares, cheap, size, checks, guessed=not known)
+    scans_per_day = 1440 / minutes
     return Budget(
         probes=int(members * size * 86400 / max(1, interval)),
         scans=int(
@@ -104,6 +145,8 @@ def probe_budget(
         ),
         e2e=int(size * 86400 / max(1, cfg.watchdog.interval_s)),
         speed=speed_bytes,
+        checks=checks,
+        scan_minutes=minutes,
         size=size,
         measured=measured,
         guessed=not known,
@@ -123,23 +166,19 @@ class Plan:
 
 def scan_plan(cfg: Config, members: list[dict], spares: list[dict]) -> Plan:
     """Как демон проверяет серверы (daemon.Daemon._queue_scan, _reserve_step): записи
-    статуса с полями fingerprint и cost."""
-    levels = cfg.managed.priority
-
-    def klass(entry: dict) -> cost.Klass:
-        return cost.Klass(priority.rank(levels, entry["fingerprint"]), entry.get("cost", 0.0))
-
-    tier = min((klass(entry) for entry in members), default=None)
+    статуса с полями fingerprint и cost. С 0.2.0 классов нет: безлимитные запасные
+    сканируются загрузкой probe.url, лимитированные дешевле x100 — дешёвым запросом (они тоже
+    могут встать в работу), x100 и дороже — только как кандидаты в резервный выход."""
     full, cheap, rest = [], [], []
     for entry in spares:
         price = entry.get("cost", 0.0)
         if price == 0:
             full.append(entry)
-        elif tier is None or klass(entry) <= tier:
+        elif price < rating.COST_SKIP:
             cheap.append(entry)
         else:
             rest.append(entry)
-    rest.sort(key=lambda entry: (klass(entry), not entry.get("reserve")))
+    rest.sort(key=lambda entry: (entry.get("cost", 0.0), not entry.get("reserve")))
     return Plan(members, full, cheap, rest[:RESERVE_CANDIDATES + 1])
 
 
@@ -209,11 +248,14 @@ def speed_daily_mb(cfg: Config, members: list[dict], spares: list[dict]) -> floa
     )
 
 
-def quota_spend(cfg: Config, plan: Plan, size: int) -> dict[str, int]:
+def quota_spend(
+    cfg: Config, plan: Plan, size: int, scan_period: int | None = None,
+) -> dict[str, int]:
     """Сколько байт квоты в сутки проверки тратят у каждой лимитированной подписки — с
-    множителями серверов: проба 57 КБ через сервер x100 уносит 5,7 МБ квоты."""
+    множителями серверов: проба 57 КБ через сервер x100 уносит 5,7 МБ квоты. scan_period —
+    период скана запасных, мин (Budget.scan_minutes); по умолчанию — из настроек."""
     interval = parse_seconds(cfg.probe.interval) or 30
-    scans_per_day = 1440 / max(1, cfg.probe.scan_spares_minutes)
+    scans_per_day = 1440 / max(1, scan_period or cfg.probe.scan_spares_minutes)
     e2e = size * 86400 / max(1, cfg.watchdog.interval_s)
     spend: dict[str, float] = {}
 
@@ -272,7 +314,8 @@ def budget_summary(cfg: Config, budget: Budget, quotas: dict[str, dict[str, int]
         "spares": spares,
         "cheap": cheap,
         "interval_s": parse_seconds(cfg.probe.interval) or 30,
-        "scan_minutes": max(1, cfg.probe.scan_spares_minutes),
+        "scan_minutes": budget.scan_minutes,
+        "checks_mb": round(budget.checks / MB, 1),
         "quota_share": quota_share(budget, quotas, spend),
         # Квота подписок, которую проверки тратят за сутки (с множителями), МБ.
         "quota_mb": {name: round(value / MB, 1) for name, value in (spend or {}).items()},
@@ -407,6 +450,8 @@ def collect_status(
     resolver_check: dict = {}
     passive: dict[str, dict] = {}
     trials: dict = {}
+    rtts: dict = {}
+    scores: dict = {}
     try:
         store = Store(paths.db_file)
         try:
@@ -424,6 +469,8 @@ def collect_status(
             resolver_check = resolving.loads(store.get_meta(resolving.META))
             passive = _load_json(store.get_meta(speedguard.META_PASSIVE)) or {}
             trials = _load_json(store.get_meta(profiling.TRIALS_META)) or {}
+            rtts = _load_json(store.get_meta("rtt")) or {}
+            scores = _load_json(store.get_meta("rating")) or {}
             events = store.recent_events(10)
         finally:
             store.close()
@@ -462,7 +509,16 @@ def collect_status(
                 "verdict": record.get("verdict") or "", "ts": record.get("ts"),
             }
         until = unstable.get(info.fingerprint)
+        rtt = rtts.get(info.fingerprint) if isinstance(rtts.get(info.fingerprint), dict) else {}
+        fresh_rtt = isinstance(rtt.get("ts"), (int, float)) and now - rtt["ts"] <= 86400
         return {
+            # Сетевая задержка (RTT, п. 2.3): HEAD в открытом соединении — без рукопожатий и
+            # загрузки файла; delay_ms — время пробы целиком.
+            "rtt_ms": rtt.get("ms") if fresh_rtt else None,
+            "rtt_ts": rtt.get("ts") if fresh_rtt else None,
+            # Рейтинг (rating.py) по последнему шагу демона; None — демон его ещё не считал.
+            "score": scores.get(info.fingerprint)
+            if isinstance(scores.get(info.fingerprint), (int, float)) else None,
             "speed_passive_mbps": seen.get("mbps"), "speed_passive_ts": seen.get("ts"),
             "speed_test_mbps": measure.get("test_mbps"), "speed_bg_mbps": measure.get("bg_mbps"),
             "escalation": escalation,
@@ -558,12 +614,15 @@ def collect_status(
             )
 
     plan = scan_plan(cfg, members, spares)
+    servers = set(cfg.managed.routes.values())
+    devices = sum(1 for entry in spares if entry.get("fingerprint") in servers)
     budget = probe_budget(
         cfg, len(members), len(plan.full), probe_size,
         cheap=len(plan.cheap), candidates=len(plan.candidates),
         speed_mb=speed_daily_mb(cfg, members, spares),
+        checks=checks_bytes(devices, len(members)),
     )
-    spend = quota_spend(cfg, plan, budget.size)
+    spend = quota_spend(cfg, plan, budget.size, budget.scan_minutes)
     backup = next((entry for entry in spares if entry["reserve"]), None)
     chosen = next((entry for entry in members if entry["main"]), None)
     status = {
@@ -766,10 +825,9 @@ def render_servers(status: dict) -> str:
     members = status.get("members") or []
     spares = status.get("spares") or []
     header = f"Участники балансировщика ({len(members)}):"
-    tier = status.get("tier")
-    if tier and any(_level(entry) for entry in [*members, *spares]):
-        header = (f"Участники балансировщика ({len(members)}), уровень приоритета "
-                  f"«{priority.NAMES.get(tier, tier)}»:")
+    if any(_level(entry) for entry in [*members, *spares]):
+        header = (f"Участники балансировщика ({len(members)}) — лучшие по рейтингу, приоритет "
+                  "в нём — вес:")
     lines.append(header)
     for member in members:
         if member["alive"] is None:

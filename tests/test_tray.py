@@ -330,3 +330,20 @@ def test_paths_root_keeps_the_autostart_inside_the_test_root(tmp_path):
     paths = Paths(root=tmp_path)
     assert str(paths.root / tray.AUTOSTART).startswith(str(tmp_path))
     assert json.loads(json.dumps(STATE))["main"]["country"] == "DE"
+
+
+def test_kwin_calls_are_short_and_a_hung_kwin_means_a_new_tab(tmp_path, monkeypatch):
+    """ДОП-2: каждый вызов KWin по D-Bus — не дольше tray.KWIN_TIMEOUT (1,5 с); KWin завис —
+    raise_window отвечает False, и панель открывается новой вкладкой."""
+    import subprocess
+
+    monkeypatch.setattr(tray.shutil, "which", lambda name: "/usr/bin/" + name)
+    calls: list[float] = []
+
+    def hung(argv, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    environ = {"XDG_CURRENT_DESKTOP": "KDE", "XDG_RUNTIME_DIR": str(tmp_path)}
+    assert tray.raise_window(environ, run=hung) is False
+    assert calls and all(value == tray.KWIN_TIMEOUT == 1.5 for value in calls)

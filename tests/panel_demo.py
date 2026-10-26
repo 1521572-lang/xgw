@@ -54,7 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_tailscale import FakeTailscale
 
-from xgw import actions, config, cores, cost, engine, netcheck, tailscale
+from xgw import actions, config, cores, engine, netcheck, tailscale
 from xgw.daemon import stranded_action, stranded_note
 from xgw.diag import OK, WARN, Check
 from xgw.net import dnsmasq, lan
@@ -101,6 +101,8 @@ SERVERS = [
     ("0f117e4d", "", "Осталось 35.5 ГБ трафика", "main", "filter"),
     ("0d05dead", "", "🇸🇬 Сингапур · sg.gone.example.net", "main", "dns"),
 ]
+# Рейтинг серверов (0.2.0, rating.py) — как его посчитал бы демон.
+DEMO_SCORES = {"a1a1a1a1": 0.62, "b2b2b2b2": 0.48, "c3c3c3c3": 0.21, "d4d4d4d4": 0.0}
 LIVE = {
     "a1a1a1a1": {"alive": True, "delay_ms": 84},
     "b2b2b2b2": {"alive": True, "delay_ms": 131},
@@ -201,6 +203,10 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
             "tag": tag, "fingerprint": fingerprint, "name": name, "source": source,
             "profile": profile, "core": "sing-box" if profile.startswith("singbox") else "xray",
             "protocol": protocol,
+            # 0.2.0: сетевая задержка (RTT) — меньше времени пробы — и рейтинг сервера.
+            "rtt_ms": round(live["delay_ms"] * 0.35) if live.get("delay_ms") else None,
+            "rtt_ts": now - 300 if live.get("delay_ms") else None,
+            "score": DEMO_SCORES.get(fingerprint),
         }
         if role == "member":
             measure = SPEEDS.get(fingerprint) if scene != "reserve" else None
@@ -266,11 +272,10 @@ def snapshot(scene: str, now: float, excluded: set[str]) -> dict:
         probe_cfg.probe.interval = "10s"  # пробы втрое чаще — заведомо больше лимита
     stranded = class_note = ""
     if scene == "stranded":
-        # Как на шлюзе 24.10.2026: четыре сервера «высокий» x10 в работе, один мёртв, живые
-        # безлимитные — «средние», сервер выбран вручную. Тексты — из кода шлюза.
-        tier = cost.Klass(0, 10.0)
-        action = stranded_action(tier, True)
-        stranded = stranded_note(["🇹🇷 x10 Турция"], tier, True)
+        # Мёртвого заменить некем: ни один запасной не прошёл проверку (с 0.2.0 — только
+        # так; классов нет). Тексты — из кода шлюза.
+        action = stranded_action()
+        stranded = stranded_note(["🇹🇷 x10 Турция"])
         unlimited = {"priority": "medium", "cost": 0.0, "verdict": "OK", "scanned": now}
         class_note = status.class_warning(
             probe_cfg, [{"priority": "high", "cost": 10.0}], [unlimited] * 34,

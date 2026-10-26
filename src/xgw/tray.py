@@ -431,6 +431,9 @@ HIDDEN_WAIT = 1.0
 # позже (на испытаниях — на 0,2 с): сигналы ближе этого — закрытие, а не свёрнутое окно.
 CLOSED_GAP = 1.0
 KWIN_NAME = "xgw-raise"
+# Каждый вызов KWin по D-Bus — не дольше этого (ДОП-2 рекомендаций к аудиту 0.1.18): зависший
+# за недели работы композитор не держит открытие панели; не ответил — новая вкладка.
+KWIN_TIMEOUT = 1.5
 # Заголовок окна с вкладкой панели: «XGW - Chromium», «XGW — Mozilla Firefox» (или «XGW —
 # вход»). Погасшая вкладка (app.js) называется иначе — её окно не выводится.
 KWIN_SCRIPT = """\
@@ -461,7 +464,7 @@ def raise_window(
     def kwin(method: str, *args: str) -> subprocess.CompletedProcess:
         return run(["dbus-send", "--session", "--print-reply", "--dest=org.kde.KWin",
                     "/Scripting", f"org.kde.kwin.Scripting.{method}", *args],
-                   capture_output=True, text=True, timeout=3)
+                   capture_output=True, text=True, timeout=KWIN_TIMEOUT)
 
     try:
         atomic_write_text(script, KWIN_SCRIPT, mode=0o600)

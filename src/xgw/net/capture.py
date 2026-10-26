@@ -698,7 +698,7 @@ class Capture:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
-        text = nft.listing(self.runner)
+        text = nft.listing(self.runner, terse=True, sets=nft.CHECKED_SETS)
         if text is None:
             return None
         listed = nft.parse_chains(text)
@@ -834,14 +834,14 @@ class Capture:
         """Для `xgw diag`: исключения Tailscale загружены (или не нужны); None — узнать
         нельзя."""
         rules = self.rules(self.effective_mode())
-        text = nft.listing(self.runner)
+        text = nft.listing(self.runner, terse=True, sets=(nft.TS_SET,))
         if text is None:
             return None
         if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
             return False
         if not self.ipv6_usable():
             return True
-        text6 = nft.listing(self.runner, "ip6", nft.TABLE6)
+        text6 = nft.listing(self.runner, "ip6", nft.TABLE6, terse=True, sets=(nft.TS_SET,))
         if text6 is None:
             return None
         return self._ts_loaded(rules, text6, rules.ts6, rules.ts6)

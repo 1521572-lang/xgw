@@ -100,6 +100,9 @@ class TrayApp:
                 self.menu.addSeparator()
         self.icon.setContextMenu(self.menu)
         self.icon.activated.connect(self.clicked)
+        # Открытие панели идёт в своём потоке; пока оно не кончилось (KWin не ответил и т. п.),
+        # повторный щелчок новый поток не заводит (ДОП-2).
+        self._opening = threading.Lock()
         self.timer = self.QtCore.QTimer()
         self.timer.timeout.connect(self.refresh)
         self.timer.start(int(tray.POLL_SECONDS * 1000))
@@ -132,8 +135,9 @@ class TrayApp:
         elif action == "open":
             url = (self.state or {}).get("panel") or f"http://127.0.0.1:{self.client.port}/"
             # Вывести вперёд вкладку на экране ждёт до 2 с — не в потоке Qt, чтобы меню не
-            # замирало; open_panel окна Qt не трогает.
-            threading.Thread(target=self._open, args=(url,), daemon=True).start()
+            # замирало; open_panel окна Qt не трогает. Одно открытие за раз.
+            if self._opening.acquire(blocking=False):
+                threading.Thread(target=self._open, args=(url,), daemon=True).start()
         elif action == "about":
             self.QtWidgets.QMessageBox.information(None, "XGW", tray.about(self.state))
         else:
@@ -144,6 +148,8 @@ class TrayApp:
             tray.open_panel(url, self.client)
         except OSError as exc:
             print(f"значок XGW: браузер не открылся: {exc}", file=sys.stderr)
+        finally:
+            self._opening.release()
 
     def _act(self, action: str) -> None:
         """Запрос к панели: она только ставит отметку демону и отвечает сразу (таймаут 5 с),

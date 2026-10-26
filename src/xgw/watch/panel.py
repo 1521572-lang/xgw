@@ -36,6 +36,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from collections import Counter
@@ -220,6 +221,10 @@ def _shared(entry: dict) -> dict:
         "unstable_until": entry.get("unstable_until"),
         "fragment": bool(entry.get("fragment")),
         "profile": entry.get("profile") or "", "core": entry.get("core") or "",
+        # Сетевая задержка (RTT, 0.2.0) — отдельно от времени пробы целиком (delay_ms) — и
+        # рейтинг сервера (rating.py).
+        "rtt_ms": entry.get("rtt_ms"), "rtt_ts": entry.get("rtt_ts"),
+        "score": entry.get("score"),
     }
 
 
@@ -229,8 +234,15 @@ class _Server(ThreadingHTTPServer):
     log = None
 
     def handle_error(self, request, client_address) -> None:
-        if self.log is not None:
-            self.log.exception("панель: запрос не обработан")
+        if self.log is None:
+            return
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            # Браузер закрыл соединение, не дочитав ответ (отчёт f6b, наблюдение 3): это не
+            # сбой панели — одной строкой, без трассировки.
+            self.log.info("панель: клиент %s закрыл соединение раньше ответа", client_address[0])
+            return
+        self.log.exception("панель: запрос не обработан")
 
 
 class Refused(Exception):
@@ -797,9 +809,11 @@ class Panel:
         mine = set(self.cfg.managed.devices)
         routes = self.cfg.managed.routes  # свой сервер устройства (Ф4): адрес → отпечаток
         kernel = set(self.cfg.managed.kernel_devices)  # российские адреса мимо Xray (Ф6)
+        down = engine.devices_down(self.paths)  # свой сервер не отвечает — идёт основной
         devices = [
             {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine,
-             "route": routes.get(str(device.get("ip")), ""), "kernel": device.get("ip") in kernel}
+             "route": routes.get(str(device.get("ip")), ""), "kernel": device.get("ip") in kernel,
+             "route_down": device.get("ip") in down}
             for device in dnsmasq.read_leases(self.paths)
         ]
         online = {device["mac"] for device in devices}

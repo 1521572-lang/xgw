@@ -46,6 +46,7 @@ TITLES = {
     "RESERVE": "трафик идёт через резервный сервер",
     "reserve": "резервный сервер",
     "main": "основной сервер",
+    "device": "свой сервер устройства",
 }
 _URGENT = frozenset({"ALL_DEAD", "XRAY_DOWN", "LEAK", "leak", "capture", "lan", "rollback"})
 

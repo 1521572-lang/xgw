@@ -77,3 +77,19 @@ def test_scans_are_keyed_by_probe_tag(tmp_path):
     assert store.last_event_time("rotation") is not None
     assert store.last_event_time("нет такого") is None
     store.close()
+
+
+def test_host_cache_keeps_checked_addresses_for_a_week(tmp_path):
+    """dns-cache.json: адрес записывается после удачного запроса, служебные — нет, через
+    неделю запись не используется."""
+    from xgw.store import HOST_CACHE_TTL, HostCache
+
+    now = [1000.0]
+    cache = HostCache(tmp_path, clock=lambda: now[0])
+    cache.remember("sub.example.com", "203.0.113.8")
+    cache.remember("sub.example.com", "127.0.0.1")  # подмена — не записывается
+    cache.remember("sub.example.com", "203.0.113.9")
+    assert cache.addresses() == {"sub.example.com": ["203.0.113.9", "203.0.113.8"]}
+    assert (tmp_path / "dns-cache.json").stat().st_mode & 0o777 == 0o600
+    now[0] += HOST_CACHE_TTL + 1
+    assert cache.addresses() == {}

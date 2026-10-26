@@ -73,6 +73,7 @@ import ipaddress
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .. import geodat
 from .. import tailscale as ts
@@ -433,9 +434,14 @@ def containers_wanted(cfg: Config) -> bool:
 
 
 def _dns_direct(cfg: Config) -> str:
-    """Первый из direct_servers, записанный адресом IPv4 (с портом или без)."""
+    """Первый из direct_servers, записанный адресом IPv4 (с портом или без). Запись DoH
+    («https://77.88.8.8/dns-query») даёт его адрес и порт 53: правило DNAT шлёт туда обычный
+    DNS тех, кого Xray не обслуживает (bypass_hosts, сеть после xgw disable)."""
     for entry in cfg.dns.direct_servers:
-        address, sep, port = entry.strip().rpartition(":")
+        entry = entry.strip()
+        if "://" in entry:
+            entry = urlsplit(entry).hostname or ""
+        address, sep, port = entry.rpartition(":")
         if not (sep and port.isdigit()):
             address, port = entry.strip(), ""
         try:
@@ -689,6 +695,11 @@ def render(rules: Rules) -> str:
             *quic,
             # Выходной узел tailnet — раньше «чужого форвардинга» (tailscale0 — не LAN).
             *(_ts_exit_forward(rules, ts_reject) if rules.ts_exit else []),
+            # Контейнеры → TUN: MSS по MTU маршрута в TUN — до правила «чужой форвардинг»,
+            # иначе их SYN туда не дошёл бы (п. 1.3 рекомендаций к аудиту 0.1.18). При MTU TUN
+            # 1500 (net/tun.py) MSS не меняется; правило — на случай другого MTU.
+            *([f'oifname "{rules.tun_name}" tcp flags syn tcp option maxseg size set rt mtu']
+              if rules.containers and rules.tun_name else []),
             # Чужой форвардинг (Docker, libvirt) — не наше дело.
             f'iifname != "{lan_if}" oifname != "{lan_if}" accept',
             "tcp flags syn tcp option maxseg size set rt mtu",  # PPPoE у провайдера
@@ -978,15 +989,42 @@ def ts_elements(rules: Rules) -> str:
     return "".join(line + "\n" for line in lines)
 
 
-def listing(runner: Runner, family: str = "ip", table: str = TABLE) -> str | None:
-    """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft)."""
+# Наборы, элементы которых сверяет проверка правил (capture.loaded, tailscale_loaded): в них
+# единицы адресов, и читаются они отдельно — таблица целиком читается коротко (listing terse).
+CHECKED_SETS = (DIRECT_LAN_SET, TS_EXIT_SET, TS_SET)
+
+
+def listing(
+    runner: Runner, family: str = "ip", table: str = TABLE, *, terse: bool = False,
+    sets: tuple[str, ...] = (),
+) -> str | None:
+    """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft).
+
+    terse — без элементов именованных наборов (`nft -t`, есть и в nft 1.0.9 Ubuntu 24.04): в
+    direct4 их десятки тысяч, и полный вывод — около 0,9 МБ текста и 0,8 с процессора на
+    каждой проверке демона (п. 2.1 рекомендаций к аудиту 0.1.18). Цепочки, правила и
+    безымянные наборы внутри правил (`iifname { "docker0", "br-*" }`) вывод сохраняет —
+    проверено на nft 1.1.6. sets — наборы, чьи элементы всё же нужны: их `nft list set`
+    ставится перед текстом таблицы, и set_elements и ts_state находят полный набор первым."""
+    argv = ["nft", *(["-t"] if terse else []), "list", "table", family, table]
     try:
-        return runner(["nft", "list", "table", family, table])
+        text = runner(argv)
     except CommandError as exc:
-        text = str(exc)
-        if "No such file or directory" in text or "does not exist" in text:
+        message = str(exc)
+        if "No such file or directory" in message or "does not exist" in message:
             return ""
         return None
+    if not (terse and text):
+        return text
+    full: list[str] = []
+    for name in sets:
+        if not has_set(text, name):
+            continue
+        try:
+            full.append(runner(["nft", "list", "set", family, table, name]))
+        except CommandError:
+            return None  # набор пропал между двумя вызовами — проверка повторится
+    return "".join(part if part.endswith("\n") else part + "\n" for part in full) + text
 
 
 def ts_state(text: str) -> tuple[bool, bool | None]:
@@ -1031,7 +1069,7 @@ def chain_rules(
     цепочки XGW не бывают (test_rendered_chains_are_never_empty) — такую оставляет чужой
     `nft flush table ip xgw` или `flush chain`: имена на месте, а перехвата нет. {} —
     таблицы нет, None — узнать не удалось (нет прав или nft)."""
-    text = listing(runner, family, table)
+    text = listing(runner, family, table, terse=True)
     return None if text is None else parse_chains(text)
 
 

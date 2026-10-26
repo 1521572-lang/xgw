@@ -144,7 +144,7 @@ def test_server_list_shows_priority_levels_only_when_they_are_set():
         "members": [{**member, "priority": "high"}], "spares": [{**spare, "priority": "low"}],
         "tier": "high",
     })
-    assert "Участники балансировщика (1), уровень приоритета «высокий»:" in text
+    assert "Участники балансировщика (1) — лучшие по рейтингу, приоритет в нём — вес:" in text
     assert "NL-1 [высокий]" in text and "DE-1 [низкий]" in text
 
 
@@ -216,9 +216,15 @@ def test_probe_budget_matches_spec_example():
     assert budget.total == budget.probes  # сквозная проверка считается отдельно
     assert status.budget_warnings(cfg, budget, {}) == []
 
+    # 60 запасных раз в час — ~1038 МБ, больше лимита: с 0.2.0 (ДОП-4) скан реже — пробы
+    # ядра первыми, а скан запасных в остатке лимита.
     with_spares = status.probe_budget(cfg, members=5, spares=60)
-    assert with_spares.scans == 60 * 65536 * 24
-    warnings = status.budget_warnings(cfg, with_spares, {})
+    assert with_spares.scan_minutes > 60
+    assert with_spares.scans == int(60 * 65536 * 1440 / with_spares.scan_minutes)
+    assert with_spares.total <= cfg.probe.max_daily_probe_mb * status.MB
+    assert status.budget_warnings(cfg, with_spares, {}) == []
+    cfg.probe.interval = "10s"  # одни пробы ядра — ~2,8 ГБ: тут уже предупреждение
+    warnings = status.budget_warnings(cfg, status.probe_budget(cfg, members=5, spares=60), {})
     assert len(warnings) == 1 and "больше лимита 1024" in warnings[0]
 
 
@@ -271,9 +277,10 @@ def test_budget_does_not_advise_cuts_while_the_probe_size_is_a_guess():
     assert summary["guessed"] is True
     text = "\n".join(status.render_budget(summary))
     assert "наугад: probe.url ещё не ответил ни разу" in text
-    # Размер измерен — предупреждение снова по делу.
+    # Размер измерен — по нему и решают: с 0.2.0 (ДОП-4) скан запасных реже, а не совет урезать.
     measured = status.probe_budget(cfg, members=5, spares=63, size=65_536)
-    assert not measured.guessed and status.budget_warnings(cfg, measured, {})
+    assert not measured.guessed and measured.scan_minutes > budget.scan_minutes == 60
+    assert status.budget_warnings(cfg, measured, {}) == []
 
 
 def test_budget_summary_shows_the_month_and_the_share_of_the_quota():
@@ -349,6 +356,8 @@ def test_collect_status_and_freshness(tmp_path, monkeypatch):
         "speed_queued": False, "speed_passive_mbps": None, "speed_passive_ts": None,
         "speed_test_mbps": None, "speed_bg_mbps": None, "escalation": None,
         "unstable_until": None,
+        # 0.2.0: сетевая задержка (RTT) и рейтинг ещё не посчитаны демоном.
+        "rtt_ms": None, "rtt_ts": None, "score": None,
     }
     assert snapshot["reserve"] is None and snapshot["spares"][0]["reserve"] is False
     assert snapshot["tier"] == "medium"
@@ -414,15 +423,15 @@ def test_status_shows_multipliers_the_reserve_and_the_quota_spent_with_multiplie
         {"name": "silent", "limited": False},
     ]
     budget = snapshot["budget"]
-    # Участник безлимитный: квоту «paid» тратят только редкие дешёвые проверки двух
-    # лимитированных кандидатов в резервный выход — x1 и x10.
-    expected = status.CHEAP_SCAN_BYTES * 86400 / status.RESERVE_RECHECK * (1 + 10)
+    # Участник безлимитный: квоту «paid» тратят дешёвые проверки двух лимитированных
+    # запасных — x1 и x10 — по расписанию скана (с 0.2.0 они тоже могут встать в работу).
+    expected = status.CHEAP_SCAN_BYTES * 24 * (1 + 10)
     # И замеры скорости кандидатов раз в сутки (speed.spare_hours, 0.1.18): x1 качает 3 МБ
     # (speed.spare_mb), x10 — 1 МБ, это 10 МБ квоты.
     expected += 1 * (3 * 1 + 1 * 10) * status.MB
     assert budget["quota_mb"] == {"paid": round(expected / status.MB, 1)}
-    assert budget["quota_share"]["paid"] < 0.2 and budget["cheap"] == 0  # 13 МБ в сутки
-    assert budget["spares"] == 1  # по расписанию сканируется только безлимитный запасной
+    assert budget["quota_share"]["paid"] < 0.2 and budget["cheap"] == 2  # 15 МБ в сутки
+    assert budget["spares"] == 3  # по расписанию — все три: безлимитный и два дешёвым запросом
 
     text = status.render_status(snapshot)
     assert "x10 🛜 Германия [x10]" in text and "Финляндия [x1] [xray]  ← резервный выход" in text

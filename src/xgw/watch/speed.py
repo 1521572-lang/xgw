@@ -120,14 +120,19 @@ class Candidate:
     country: str = ""  # страна сервера (по подписке) и подписка — для замены без прыжков
     source: str = ""
     spare: bool = False  # запасной: основным станет, только встав в работу
+    # Рейтинг (rating.py, 0.2.0): скорость, задержка, стабильность, стоимость и приоритет
+    # вместе. None — не посчитан (тогда сравнение — по скорости, как до 0.2.0).
+    score: float | None = None
 
 
 def best(candidates: list[Candidate]) -> Candidate | None:
-    """Лучший кандидат: с замером — самый быстрый; без замеров — с наименьшей задержкой."""
+    """Лучший кандидат: замеренные раньше незамеренных (основным по одним априорным цифрам
+    рейтинга сервер не становится), среди них — с наибольшим рейтингом (0.2.0), при равном —
+    самый быстрый; без замеров — по рейтингу, затем с наименьшей задержкой."""
     if not candidates:
         return None
     return min(candidates, key=lambda item: (
-        item.mbps is None, -(item.mbps or 0.0),
+        item.mbps is None, item.score is None, -(item.score or 0.0), -(item.mbps or 0.0),
         item.delay_ms is None, item.delay_ms or 0.0, item.tag,
     ))
 
@@ -146,10 +151,15 @@ def best_like(candidates: list[Candidate], country: str, source: str) -> Candida
 
 
 def faster(rival: Candidate, main: Candidate, gain_pct: int) -> bool:
-    """rival быстрее основного хотя бы на gain_pct процентов. У основного нет удачного
-    замера (файл не скачался, «заморозка» посреди тела) — любой замеренный быстрее."""
+    """rival лучше основного хотя бы на gain_pct процентов: по рейтингу, если он посчитан у
+    обоих (0.2.0 — в нём и скорость, и приоритет, и стоимость), иначе по скорости. Рейтинг
+    сравнивается, только когда у rival есть замер: незамеренный основным по одним
+    априорным цифрам не становится. У основного нет удачного замера (файл не скачался,
+    «заморозка» посреди тела) — любой замеренный быстрее."""
     if rival.mbps is None:
         return False
+    if rival.score is not None and main.score is not None and main.mbps is not None:
+        return rival.score >= main.score * (1.0 + gain_pct / 100.0) and rival.score > main.score
     if main.mbps is None:
         return True
     return rival.mbps >= main.mbps * (1.0 + gain_pct / 100.0) and rival.mbps > main.mbps

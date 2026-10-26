@@ -473,7 +473,8 @@
       $("current-label").textContent = chosen
         ? (s.pin.until ? `Выбран вручную до ${stamp(s.pin.until, s.now)}` : "Выбран вручную")
         : main ? "Основной сервер" : "Сейчас через";
-      const delay = current.delay_ms !== null && current.delay_ms !== undefined ? ` · ${current.delay_ms} мс` : "";
+      const shown = hasRtt(current) ? current.rtt_ms : current.delay_ms;
+      const delay = shown !== null && shown !== undefined ? ` · ${shown} мс` : "";
       const speed = current.speed_mbps !== null && current.speed_mbps !== undefined ? ` · ${mbps(current.speed_mbps)}` : "";
       $("current-name").textContent = (current.name || current.tag) + speed + delay;
       $("current-name").title = current.name || current.tag;
@@ -485,24 +486,39 @@
 
   const hasDelay = (server) => server.delay_ms !== null && server.delay_ms !== undefined;
   const delayTone = (ms) => (ms < 250 ? "ok" : ms < 700 ? "warn" : "bad");
+  const hasRtt = (server) => server.rtt_ms !== null && server.rtt_ms !== undefined;
+  const rttTone = (ms) => (ms < 120 ? "ok" : ms < 300 ? "warn" : "bad");
+  // Сетевая задержка (RTT) — короткий запрос в уже открытом соединении; время пробы целиком
+  // (рукопожатия и файл) — в подсказке. Без RTT — как раньше, время пробы.
+  function delayBadge(server, s, extra) {
+    const probe = hasDelay(server) ? `проба целиком — ${server.delay_ms} мс` : "";
+    if (hasRtt(server)) {
+      const when = server.rtt_ts ? ` по замеру ${stamp(server.rtt_ts, s.now)}` : "";
+      return el("span", {
+        class: `delay ${rttTone(server.rtt_ms)}`, text: `${server.rtt_ms} мс`,
+        title: [`Сетевая задержка (RTT)${when}`, probe, extra].filter(Boolean).join("; "),
+      });
+    }
+    return el("span", {
+      class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс`,
+      title: [probe ? "Время пробы целиком" : "", extra].filter(Boolean).join("; "),
+    });
+  }
 
   function serverValue(server, s) {
     if (server.status === "member") {
       if (server.alive === false) return el("span", { class: "delay bad", text: "нет ответа" });
-      if (!hasDelay(server)) {
+      if (!hasDelay(server) && !hasRtt(server)) {
         return el("span", { class: "delay none", text: server.alive ? "жив" : "проверяется" });
       }
-      return el("span", { class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс` });
+      return delayBadge(server, s, "");
     }
     if (server.status === "spare") {
       const [tone, text] = VERDICTS[server.verdict] || ["none", server.verdict || "не проверялся"];
       // Задержка запасного — по его последней проверке (ядро его не пробует): после замера
       // по кнопке она свежая, как и скорость.
-      if (hasDelay(server)) {
-        return el("span", {
-          class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс`,
-          title: `${capital(text)} — по проверке ${stamp(server.scanned, s.now)}`,
-        });
+      if (hasDelay(server) || hasRtt(server)) {
+        return delayBadge(server, s, `${capital(text)} — по проверке ${stamp(server.scanned, s.now)}`);
       }
       return el("span", { class: `delay ${tone}`, text });
     }
@@ -563,12 +579,18 @@
 
   // 0.1.18: выученный обход блокировки («обход: xray+frag после STALL_BEFORE_BODY»), отметка
   // «нестабилен по ТСПУ» и скорость по реальному трафику через сервер («из трафика»).
+  // 0.2.0: рейтинг сервера (скорость, задержка, стабильность, стоимость и приоритет вместе).
   function extraNote(server, s) {
     let text = "";
+    if (typeof server.score === "number") {
+      text += ` · рейтинг ${server.score.toFixed(2).replace(".", ",")}`;
+    }
     const esc = server.escalation;
     if (esc) {
-      text += ` · обход: ${esc.label}${esc.verdict ? ` после ${esc.verdict}` : ""}`
-        + (esc.ts ? `, ${stamp(esc.ts, s.now)}` : "");
+      // Дата — с какого времени сервер на обходе (отчёт f6b: без «с» её принимали за
+      // время последней проверки).
+      text += ` · обход${esc.ts ? ` с ${stamp(esc.ts, s.now)}` : ""}: ${esc.label}`
+        + (esc.verdict ? ` (после ${esc.verdict})` : "");
     }
     if (server.unstable_until && server.unstable_until > s.now) {
       text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
@@ -828,9 +850,10 @@
     const used = s.servers.filter((server) => server.status !== "skipped");
     $("members-count").textContent = used.length ? String(used.length) : "";
     const ranked = s.servers.some((server) => (server.priority || "medium") !== "medium");
-    $("tier-note").hidden = !ranked || !s.tier;
-    $("tier-note").textContent = ranked && s.tier
-      ? `Приоритет: в работе серверы уровня «${LEVEL_NAMES[s.tier] || s.tier}». Уровнем ниже шлюз пользуется, только когда живых выше нет.`
+    // С 0.2.0 приоритет — вес в рейтинге, а не фильтр (issue #2).
+    $("tier-note").hidden = !ranked;
+    $("tier-note").textContent = ranked
+      ? "Приоритет — вес в рейтинге сервера: «высокий» ×1,45, «низкий» ×0,65. В работе — лучшие по рейтингу из всех подписок; сервер уровня ниже встаёт в работу, если он заметно быстрее или если лучших не хватает."
       : "";
     // Тексты пишет шлюз: мёртвого заменить некем; лимитированные в работе из-за приоритета.
     $("stranded-note").hidden = !s.stranded;
@@ -1138,8 +1161,10 @@
       el("span", {
         class: device.bypass ? "tag warn" : "tag on",
         text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")
-          : (device.route ? "свой сервер" : "через VPN"),
-        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
+          : (device.route ? (device.route_down ? "свой сервер молчит · через основной"
+            : "свой сервер") : "через VPN"),
+        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml"
+          : (device.route_down ? "Свой сервер устройства не отвечает проверкам шлюза — пока он молчит, устройство идёт через основной; вернётся само" : ""),
       }),
       el("div", { class: "row-tools" }, recordTool(device, active, now), control));
   }

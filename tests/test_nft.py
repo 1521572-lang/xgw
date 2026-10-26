@@ -71,7 +71,9 @@ def test_gateway_with_lan_and_local_capture():
         'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
         "counter reject with icmp type port-unreachable"
     )
-    assert forward[1] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
+    # MSS контейнеров в TUN — раньше «чужого форвардинга», иначе их SYN туда не дойдёт.
+    assert forward[1] == 'oifname "xgwtun0" tcp flags syn tcp option maxseg size set rt mtu'
+    assert forward[2] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
     assert "tcp flags syn tcp option maxseg size set rt mtu" in forward
     assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
     assert 'iifname "lan0" oifname != "lan0" meta l4proto icmp counter accept' in forward

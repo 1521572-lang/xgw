@@ -284,27 +284,43 @@ class Routing:
     home_country: str = "RU"
 
 
-# Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a): другие операторы и адреса,
-# а Quad9 — на нестандартном порту 5053. Проверены 24.10.2026 по IP: AdGuard и DNS.SB отвечают;
-# порт 5053 из сети разработки не ответил — его проверит монитор на самом шлюзе.
+# Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a; 0.2.0): другие операторы и
+# адреса. Яндекс и Quad9 — по DNS-over-TLS (tls://, порт 853): по IP их DoH отвечает только по
+# HTTP/2, а клиент XGW (стандартная библиотека) говорит HTTP/1.1 — проверено 26.10.2026, как и
+# сертификаты по IP у всех четырёх. Яндекс здесь и в bootstrap: у конфига со своим списком
+# bootstrap (из прежнего примера, с udp://77.88.8.8) шифрованный российский резолвер тоже есть.
+DEFAULT_BOOTSTRAP = (
+    "https://1.1.1.1/dns-query",
+    "https://8.8.8.8/dns-query",
+    "tls://77.88.8.8",
+)
 DEFAULT_BOOTSTRAP_EXTRA = (
+    "tls://77.88.8.8",
+    "https://94.140.14.140/dns-query",
+    "https://185.222.222.222/dns-query",
+    "tls://9.9.9.11",
+)
+# Прежние умолчания (до 0.2.0): такой список в конфиге — копия примера, а не выбор человека, и
+# заменяется нынешним умолчанием (_modernize_dns). Обычный UDP к 77.88.8.8 провайдер
+# перехватывает и подменяет ответ на имя из реестра блокировок.
+OLD_DEFAULT_BOOTSTRAP = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "udp://77.88.8.8"]
+OLD_DEFAULT_BOOTSTRAP_EXTRA = [
     "https://94.140.14.140/dns-query",
     "https://185.222.222.222/dns-query",
     "https://9.9.9.9:5053/dns-query",
-)
+]
+# DNS для direct_domains в конфиге Xray: DoH Яндекса по IP — запрос идёт выходом direct, как
+# и обычный UDP раньше, но провайдер его не подменит (Xray говорит DoH по HTTP/2; проверено
+# на Xray 26.10.21). До 0.2.0 — обычный UDP к тому же адресу.
+DEFAULT_DIRECT_DNS = "https://77.88.8.8/dns-query"
+OLD_DEFAULT_DIRECT_SERVERS = ["77.88.8.8"]
 
 
 @dataclass
 class Dns:
     proxy_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
-    direct_servers: list[str] = field(default_factory=lambda: ["77.88.8.8"])
-    bootstrap: list[str] = field(
-        default_factory=lambda: [
-            "https://1.1.1.1/dns-query",
-            "https://8.8.8.8/dns-query",
-            "udp://77.88.8.8",
-        ]
-    )
+    direct_servers: list[str] = field(default_factory=lambda: [DEFAULT_DIRECT_DNS])
+    bootstrap: list[str] = field(default_factory=lambda: list(DEFAULT_BOOTSTRAP))
     # Дополнительные резолверы — после bootstrap; монитор проверяет все раз в
     # bootstrap_check_minutes (итог — в diag и событиях), а отказавшие резолвер пробует
     # последними.
@@ -978,6 +994,18 @@ def _host_port(entry: str) -> bool:
     return bool(sep and host and port.isdigit() and 0 < int(port) < 65536)
 
 
+def _modernize_dns(dns: Dns) -> None:
+    """Списки DNS, совпадающие с прежними умолчаниями (до 0.2.0), — на нынешние: их не
+    выбирали, а скопировали из примера конфига. Свои списки человека не трогаются; udp:// в
+    них для доменов подписок всё равно не спрашивается (fetch.fetch_subscription)."""
+    if [entry.strip() for entry in dns.bootstrap] == OLD_DEFAULT_BOOTSTRAP:
+        dns.bootstrap = list(DEFAULT_BOOTSTRAP)
+    if [entry.strip() for entry in dns.bootstrap_extra] == OLD_DEFAULT_BOOTSTRAP_EXTRA:
+        dns.bootstrap_extra = list(DEFAULT_BOOTSTRAP_EXTRA)
+    if [entry.strip() for entry in dns.direct_servers] == OLD_DEFAULT_DIRECT_SERVERS:
+        dns.direct_servers = [DEFAULT_DIRECT_DNS]
+
+
 def _validate_hosts(cfg: Config) -> list[str]:
     """probe.urls, watchdog.wan_checks, dns.bootstrap_extra и пределы других ключей 0.1.18:
     негодная запись пропускается с предупреждением, а не ломает остальные."""
@@ -1004,12 +1032,14 @@ def _validate_hosts(cfg: Config) -> list[str]:
         elif entry.strip() not in checks and entry.strip() != cfg.watchdog.wan_check.strip():
             checks.append(entry.strip())
     cfg.watchdog.wan_checks = checks
+    _modernize_dns(cfg.dns)
     extra: list[str] = []
     for entry in cfg.dns.bootstrap_extra:
         entry = entry.strip()
-        if not entry.startswith(("https://", "udp://")):
+        if not entry.startswith(("https://", "tls://", "udp://")):
             warnings.append(
-                f"dns.bootstrap_extra: «{entry}» — ожидается https://… или udp://…; пропущен"
+                f"dns.bootstrap_extra: «{entry}» — ожидается https://…, tls://… или udp://…; "
+                "пропущен"
             )
         elif entry not in extra:
             extra.append(entry)

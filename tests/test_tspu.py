@@ -149,6 +149,9 @@ def test_a_calm_member_goes_back_to_plain_xray(tspu):
     12 ч, пробуется без дробления — на месте; ответил — дробление снято, отметка «обход»
     тоже."""
     _start(tspu)
+    # Перестановка по рейтингу (0.2.0) вывела бы участника на дроблении из работы — она в
+    # своих тестах.
+    tspu._rebalance_at = float("inf")
     member = _member(tspu)
     tspu.table[member.probe_tag] = {"xray:default": "FROZEN"}
     tspu.vetted.clear()
@@ -329,7 +332,7 @@ def test_wan_is_down_only_when_every_check_host_is_down(hosted, monkeypatch):
 
 def test_resolver_check_tells_each_resolver(monkeypatch):
     cfg = Config()
-    down = {"https://9.9.9.9:5053/dns-query"}
+    down = {"tls://9.9.9.11"}
 
     def resolve(name, entries, mark=None, cancel=None):
         assert name == "cdn.jsdelivr.net"
@@ -340,13 +343,14 @@ def test_resolver_check_tells_each_resolver(monkeypatch):
     monkeypatch.setattr(resolving.fetch, "resolve_domain", resolve)
     results = resolving.check_all(cfg, mark=None)
     assert [item["entry"] for item in results] == [
-        "https://1.1.1.1", "https://8.8.8.8", "udp://77.88.8.8", "https://94.140.14.140",
-        "https://185.222.222.222", "https://9.9.9.9:5053",
+        "https://1.1.1.1", "https://8.8.8.8", "tls://77.88.8.8", "https://94.140.14.140",
+        "https://185.222.222.222", "tls://9.9.9.11",
     ]
-    assert len(cfg.dns.resolvers) == 6  # три из dns.bootstrap и три из bootstrap_extra
+    # три из dns.bootstrap и три из bootstrap_extra (Яндекс — в обоих, повтор не считается)
+    assert len(cfg.dns.resolvers) == 6
     assert resolving.verdict(results) == "partial"
     text = resolving.event_text(results)
-    assert "отвечают 5 из 6" in text and "9.9.9.9:5053" in text
+    assert "отвечают 5 из 6" in text and "tls://9.9.9.11" in text
     down.update(cfg.dns.resolvers)
     assert resolving.verdict(resolving.check_all(cfg, mark=None)) == "down"
     assert resolving.verdict([]) == ""
@@ -498,3 +502,34 @@ def test_new_keys_have_defaults_and_bad_values_are_dropped(tmp_path):
     assert defaults.network.block_quic and defaults.tray.enabled and defaults.speed.guard
     assert defaults.speed.unlimited_hours == 6 and defaults.speed.spare_hours == 24
     assert config.probe_bytes(config.DEFAULT_PROBE_HOSTS[1]) == 45_404
+
+
+def test_shadow_probe_returns_the_base_profile_without_touching_traffic(tspu):
+    """ДОП-3: пора проверить участника на дроблении без него — сначала теневая проба
+    отдельным Xray. Ответил — профиль сразу базовый, без пробы на рабочем выходе; не ответил —
+    дробление остаётся, следующая перепроверка позже. Основной тоже проверяется так."""
+    _start(tspu)
+    tspu._rebalance_at = float("inf")
+    member = _member(tspu)
+    tspu.table[member.probe_tag] = {"xray:default": "FROZEN"}
+    tspu.vetted.clear()
+    _rescan(tspu)
+    tspu.tick()
+    tspu.tick()
+    assert tspu.profile(member) == "xray:fragment"
+    tspu.table[member.probe_tag] = {}
+    tspu.shadow = {member.tag: "STALL_BEFORE_BODY"}  # блокировка ещё держится
+    for _ in range(26):
+        tspu.t += 1800
+        tspu.set_alive()
+        tspu.tick()
+    assert tspu.profile(member) == "xray:fragment" and not tspu._profile_trial
+    tspu.shadow = {member.tag: "OK"}
+    for _ in range(26):
+        tspu.t += 1800
+        tspu.set_alive()
+        tspu.tick()
+        if tspu.profile(member) == "xray:default":
+            break
+    assert tspu.profile(member) == "xray:default" and not tspu._profile_trial
+    assert _has(tspu, "теневая проба отдельным Xray")

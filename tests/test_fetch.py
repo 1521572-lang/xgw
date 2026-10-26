@@ -170,7 +170,7 @@ def test_hostname_resolved_through_bootstrap(monkeypatch, no_sleep):
     server = HttpServer(_response(200, b"ok"))
     asked: list[tuple] = []
 
-    def fake_resolve(name, bootstrap, *, mark=None, cancel=None):
+    def fake_resolve(name, bootstrap, *, mark=None, cancel=None, public_only=False):
         asked.append((name, tuple(bootstrap), mark))
         return ["127.0.0.1"]
 
@@ -597,3 +597,69 @@ def test_cancel_interrupts_dns_and_is_not_a_resolver_failure(monkeypatch):
             cancel=threading.Event(),
         )
     assert asked == ["https://1.1.1.1/dns-query"]
+
+
+# --- 0.2.0: DoT, подменённые ответы, запасные адреса подписки -----------------------------
+
+
+def test_dot_resolver_entry_and_encrypted_only(monkeypatch):
+    """tls://адрес[:порт] — DNS-over-TLS (порт 853 по умолчанию); для доменов подписок
+    спрашиваются только шифрованные резолверы."""
+    asked: list[tuple] = []
+
+    def fake_dot(server, name, *, port=853, timeout=8.0, mark=None, cancel=None):
+        asked.append((server, port))
+        return ["203.0.113.7"]
+
+    monkeypatch.setattr(fetch, "dot_query", fake_dot)
+    assert fetch.resolve_domain("sub.example.com", ["tls://77.88.8.8"]) == ["203.0.113.7"]
+    assert fetch.resolve_domain("sub.example.com", ["tls://9.9.9.11:8853"]) == ["203.0.113.7"]
+    assert asked == [("77.88.8.8", 853), ("9.9.9.11", 8853)]
+    entries = ["https://1.1.1.1/dns-query", "udp://77.88.8.8", "tls://77.88.8.8"]
+    assert fetch.encrypted(entries) == ["https://1.1.1.1/dns-query", "tls://77.88.8.8"]
+
+
+def test_spoofed_answer_is_skipped_for_subscription_hosts(monkeypatch):
+    """Ответ из одних служебных адресов (заглушка провайдера) — подмена: резолвер считается
+    отказавшим, адрес даёт следующий. Без public_only ответ берётся как есть."""
+    fetch._resolver_down.clear()
+    replies = {"udp://203.0.113.53": ["127.0.0.1"], "https://1.1.1.1/dns-query": ["203.0.113.8"]}
+
+    def fake_plain(server, name, *, timeout=5.0, mark=None, port=53, cancel=None):
+        return replies[f"udp://{server}"]
+
+    def fake_doh(url, name, *, timeout=8.0, mark=None, cancel=None):
+        return replies[url]
+
+    monkeypatch.setattr(fetch, "plain_dns", fake_plain)
+    monkeypatch.setattr(fetch, "doh_query", fake_doh)
+    entries = ["udp://203.0.113.53", "https://1.1.1.1/dns-query"]
+    assert fetch.resolve_domain("sub.example.com", entries) == ["127.0.0.1"]
+    assert fetch.resolve_domain("sub.example.com", entries, public_only=True) == ["203.0.113.8"]
+    assert fetch.is_bogon("10.1.2.3") and fetch.is_bogon("0.0.0.0") and fetch.is_bogon("x")
+    assert not fetch.is_bogon("77.88.55.242")
+    fetch._resolver_down.clear()
+
+
+def test_subscription_falls_back_to_the_known_address(monkeypatch, no_sleep):
+    """Резолверы не ответили — подписка идёт по адресу из кэша (fallback); удачный запрос
+    сообщает имя и адрес, с которым соединился. udp:// для подписки не спрашивается."""
+    server = HttpServer(_response(200, b"vless://x"))
+    asked: list[tuple] = []
+
+    def no_dns(name, bootstrap, *, mark=None, cancel=None, public_only=False):
+        asked.append((tuple(bootstrap), public_only))
+        raise fetch.ResolveError("резолверы молчат")
+
+    monkeypatch.setattr(fetch, "resolve_domain", no_dns)
+    url = f"http://sub.example.com:{server.port}/s"
+    with pytest.raises(FetchError):
+        fetch_subscription(url, bootstrap=["udp://203.0.113.53"], retries=0)
+    result = fetch_subscription(
+        url, bootstrap=["udp://203.0.113.53", "tls://77.88.8.8"], retries=0,
+        fallback={"sub.example.com": ["127.0.0.1"]},
+    )
+    assert result.body == b"vless://x"
+    assert (result.host, result.address, result.from_fallback) == (
+        "sub.example.com", "127.0.0.1", True)
+    assert asked[-1] == (("tls://77.88.8.8",), True)

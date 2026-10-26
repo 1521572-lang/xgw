@@ -94,6 +94,13 @@ class Paths:
         return self.run / "status.json"
 
     @property
+    def devices_down_file(self) -> Path:
+        """Устройства, чей свой сервер (Ф4) сейчас не отвечает: их ведёт основной. Пишет
+        демон (Daemon._device_step), читает сборка конфига (engine.devices_down); после
+        перезагрузки файла нет — все свои серверы считаются живыми, пока проверка не скажет."""
+        return self.run / "devices-down.json"
+
+    @property
     def api_dirty_file(self) -> Path:
         """Метка «ядро изменено через API лишь частично» — живёт до перезапуска Xray
         (каталог /run очищается при перезагрузке вместе с состоянием ядра)."""

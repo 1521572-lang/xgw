@@ -137,7 +137,8 @@ def test_rotation_survives_rebuild():
 
 def test_rotation_keeps_the_country_and_takes_the_faster():
     """Замена мёртвому участнику — той же страны из другой подписки (подписку целиком могли
-    заблокировать), потом той же страны; среди равных — быстрее по замеру скорости."""
+    заблокировать), потом той же страны; среди равных — лучше по рейтингу (0.2.0). Сервер
+    той же страны намного хуже лучшего (меньше SAME_COUNTRY) — берётся лучший."""
     cfg = Config()
     members = [_info("proxy-de-1111", "a")]
     spares = [(_info("spare-nl-3333", "c", "spare"), _node("33333333", "NL")),
@@ -156,7 +157,11 @@ def test_rotation_keeps_the_country_and_takes_the_faster():
         members=members, spares=spares, cfg=cfg, now=1000.0 + 16 * 60,
         origins={"a": ("DE", "a")},
     )
-    rotation = plan_rotation(**common, speeds={"55555555": 20.0, "66666666": 80.0})
+    scores = {"33333333": 0.5, "44444444": 0.5, "55555555": 0.4, "66666666": 0.6}
+    rotation = plan_rotation(**common, scores=scores)
     assert rotation is not None and rotation.replacements[0][1].name == "DE-3"
-    # Без замеров — по времени скана, но страна та же и подписка другая.
+    # Без рейтинга — по времени скана, но страна та же и подписка другая.
     assert plan_rotation(**common).replacements[0][1].name == "DE-2"
+    # Своя страна втрое хуже соседней — берётся лучший по рейтингу.
+    far = {"33333333": 0.9, "44444444": 0.2, "55555555": 0.2, "66666666": 0.2}
+    assert plan_rotation(**common, scores=far).replacements[0][1].name == "NL"
