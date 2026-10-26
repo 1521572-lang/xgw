@@ -220,6 +220,21 @@ def test_probe_ports_skip_service_ports():
     assert [info.probe_port for info in result.nodes] == [10810, 10811]
 
 
+def test_probe_ports_skip_panel_core_and_sing_box_ports():
+    """Проверки Xray не занимают порты панели, API sing-box и входов sing-box — ни
+    работающего (bridge), ни новой сборки, чей перезапуск отложен (avoid_ports): аудит, F-04."""
+    from xgw.generator import singbox as singboxing
+
+    cfg = Config()
+    cfg.xray.probe_port_base = cfg.panel.port  # 8781, следом app_port 8782
+    cfg.core.api_port = 8784
+    nodes = [_node("11112222", "A"), _node("33334444", "B"), _node("55556666", "C")]
+    bridge = singboxing.Plan(config={}, ports={("ffff0000", "d"): 8783})
+    result = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32,
+                   bridge=bridge, avoid_ports={8786})
+    assert [info.probe_port for info in result.nodes] == [8785, 8787, 8788]
+
+
 def test_prefer_keeps_rotation_result():
     """select_nodes(prefer=…) закрепляет состав участников — замена не откатывается."""
     cfg = Config()

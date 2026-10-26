@@ -637,10 +637,74 @@ def probe_bytes(url: str) -> int | None:
 
 
 # Ключи прежних версий, которые больше ничего не значат: в config.toml у заказчика они
-# остаются, предупреждение объясняет почему, а не называет их «неизвестными».
+# остаются, предупреждение объясняет почему, а не называет их «неизвестными». Установка
+# выключает такие строки сама (retire_obsolete).
 _DROPPED = {
     "notify": ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api"),
 }
+_TABLE = re.compile(r"^[ \t]*\[[ \t]*([A-Za-z0-9_.-]+)[ \t]*\][ \t]*(#.*)?$")
+_ARRAY_TABLE = re.compile(r"^[ \t]*\[\[")
+_BARE_KEY = re.compile(r"^[ \t]*([A-Za-z0-9_-]+)[ \t]*=")
+
+
+def _version_ignored(value: str) -> bool:
+    """xray.version, о котором предупреждает _validate: «не учитывается»."""
+    return value.strip().lstrip("vV") != XRAY_VERSION and value.strip() not in ("", "latest")
+
+
+def retire_obsolete(text: str) -> tuple[str, list[str]]:
+    """Выключает (комментирует) в тексте config.toml строки, о которых XGW предупреждает при
+    каждом запуске, хотя они ничего не значат: Telegram (_DROPPED) и xray.version другой
+    версии. Заказчик файлы не правит, а предупреждения в каждом `xgw status` мешают (отчёт
+    перепроверки 0.2.0, наблюдение 3). Значения остаются в комментарии — ничего не теряется.
+
+    Возвращает новый текст и имена выключенных ключей. Трогаются только строки `ключ = …` в
+    своей таблице; итог проверяется разбором TOML — он должен совпасть с прежним без этих
+    ключей. Не совпал (значение в несколько строк, ключ в кавычках, таблица в строку) — текст
+    остаётся как был, предупреждение — тоже."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return text, []
+    wanted: set[tuple[str, str]] = set()
+    for section, names in _DROPPED.items():
+        table = data.get(section)
+        if isinstance(table, dict):
+            wanted.update((section, name) for name in names if name in table)
+    xray = data.get("xray")
+    if isinstance(xray, dict) and isinstance(xray.get("version"), str) and _version_ignored(
+            xray["version"]):
+        wanted.add(("xray", "version"))
+    if not wanted:
+        return text, []
+    section: str | None = ""
+    retired: list[tuple[str, str]] = []
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        header = _TABLE.match(line.rstrip("\r\n"))
+        if _ARRAY_TABLE.match(line):
+            section = None
+        elif header:
+            section = header.group(1)
+        else:
+            key = _BARE_KEY.match(line)
+            if key and section is not None and (section, key.group(1)) in wanted:
+                stripped = line.lstrip(" \t")
+                lines.append(f"# не используется: {stripped}")
+                retired.append((section, key.group(1)))
+                continue
+        lines.append(line)
+    changed = "".join(lines)
+    expected = {name: dict(value) if isinstance(value, dict) else value
+                for name, value in data.items()}
+    for section_name, name in retired:
+        expected[section_name].pop(name, None)
+    try:
+        if tomllib.loads(changed) != expected or len(retired) != len(wanted):
+            return text, []
+    except tomllib.TOMLDecodeError:
+        return text, []
+    return changed, [f"{section_name}.{name}" for section_name, name in retired]
 
 
 def _build_section(cls, data: object, section: str, warnings: list[str]):
@@ -709,6 +773,22 @@ def _validate_core(core: CoreSection) -> list[str]:
         )
         core.api_port = defaults.api_port
     return warnings
+
+
+def service_ports(cfg: Config) -> dict[str, int]:
+    """Порты на 127.0.0.1, которые слушают сам XGW и его ядра (кроме проверок Xray и мостов
+    sing-box — они раздаются по порядку). Их не занимают ни probe-inbounds Xray, ни входы
+    sing-box: иначе ядро не запустилось бы с «address already in use» (аудит, F-04)."""
+    return {
+        "capture.tproxy_port": cfg.capture.tproxy_port,
+        "xray.api_port": cfg.xray.api_port,
+        "xray.metrics_port": cfg.xray.metrics_port,
+        "xray.socks_port": cfg.xray.socks_port,
+        "xray.http_port": cfg.xray.http_port,
+        "panel.port": cfg.panel.port,
+        "panel.app_port": cfg.panel.app_port,
+        "core.api_port": cfg.core.api_port,
+    }
 
 
 def _validate(cfg: Config) -> list[str]:
@@ -844,15 +924,7 @@ def _validate(cfg: Config) -> list[str]:
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))
     warnings.extend(_validate_hosts(cfg))
-    listening = {
-        "tproxy": cfg.capture.tproxy_port,
-        "api": cfg.xray.api_port,
-        "metrics": cfg.xray.metrics_port,
-        "socks": cfg.xray.socks_port,
-        "http": cfg.xray.http_port,
-        "panel": cfg.panel.port,
-    }
-    listening["core.api_port"] = cfg.core.api_port
+    listening = service_ports(cfg)
     ports = list(listening.values()) + [
         cfg.xray.probe_port_base + i for i in range(cfg.filters.max_members + 8)
     ]

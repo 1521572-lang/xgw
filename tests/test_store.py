@@ -93,3 +93,18 @@ def test_host_cache_keeps_checked_addresses_for_a_week(tmp_path):
     assert (tmp_path / "dns-cache.json").stat().st_mode & 0o777 == 0o600
     now[0] += HOST_CACHE_TTL + 1
     assert cache.addresses() == {}
+
+
+def test_host_cache_says_when_an_address_is_new(tmp_path):
+    """remember: True — адреса в записи не было (о нём строка в журнале), тот же адрес каждый
+    час — False (молча)."""
+    from xgw.store import HOST_CACHE_TTL, HostCache
+
+    now = [1000.0]
+    cache = HostCache(tmp_path, clock=lambda: now[0])
+    assert cache.remember("sub.example.com", "203.0.113.8") is True
+    assert cache.remember("sub.example.com", "203.0.113.8") is False
+    assert cache.remember("sub.example.com", "203.0.113.9") is True
+    assert cache.remember("sub.example.com", "127.0.0.1") is False
+    now[0] += HOST_CACHE_TTL + 1
+    assert cache.remember("sub.example.com", "203.0.113.9") is True  # запись устарела

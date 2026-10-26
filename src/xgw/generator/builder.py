@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 from .. import priority, rating
-from ..config import Config
+from ..config import Config, service_ports
 from ..model import ServerNode
 from ..net import sysctl
 from ..net.tun import MTU as tun_mtu
@@ -395,17 +395,13 @@ def reserve_fingerprint(config: Mapping | None, nodes: Sequence[ServerNode]) -> 
 
 
 def _allocate_ports(
-    probe_tags: Sequence[str], previous: Mapping[str, int], cfg: Config
+    probe_tags: Sequence[str], previous: Mapping[str, int], cfg: Config,
+    avoid: Collection[int] = (),
 ) -> dict[str, int]:
     """Порт закрепляется за probe-тегом: существующие сохраняются, новые
-    получают первый свободный, начиная с probe_port_base."""
-    reserved = {
-        cfg.capture.tproxy_port,
-        cfg.xray.api_port,
-        cfg.xray.metrics_port,
-        cfg.xray.socks_port,
-        cfg.xray.http_port,
-    }
+    получают первый свободный, начиная с probe_port_base. Мимо служебных портов XGW и
+    ядер (config.service_ports) и avoid — входов sing-box (аудит, F-04)."""
+    reserved = set(service_ports(cfg).values()) | set(avoid)
     ports: dict[str, int] = {}
     used: set[int] = set()
     for tag in probe_tags:
@@ -598,11 +594,15 @@ def build(
     profile_of: Mapping[str, str] | None = None,
     bridge: singboxing.Plan | None = None,
     devices_down: Collection[str] = (),
+    avoid_ports: Collection[int] = (),
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
     devices_down — адреса устройств, чей свой сервер (Ф4) сейчас не отвечает: их правила в
     конфиг не попадают, и устройство идёт через основной (device_routes).
+
+    avoid_ports — порты, которых не занимать проверкам Xray (входы новой сборки sing-box,
+    если её перезапуск отложен); входы bridge обходятся и так.
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -630,7 +630,8 @@ def build(
     ordered = list(selection.members) + list(selection.spares)
     suffixes = assign_suffixes(ordered)
     ports = _allocate_ports(
-        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg
+        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg,
+        avoid={*avoid_ports, *(bridge.ports.values() if bridge is not None else ())},
     )
 
     nodes: list[NodeInfo] = []

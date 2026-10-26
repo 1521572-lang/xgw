@@ -217,21 +217,27 @@ class HostCache:
             return None
         return max(0.0, self.clock() - stamp)
 
-    def remember(self, host: str, address: str) -> None:
-        """Адрес, с которым запрос к host только что удался."""
+    def remember(self, host: str, address: str) -> bool:
+        """Адрес, с которым запрос к host только что удался. True — адреса в записи не было
+        (новое имя, новый адрес или запись устарела): об этом стоит строка в журнале."""
         from .fetch import is_bogon
 
         if not host or not address or is_bogon(address):
-            return
+            return False
         entries = self._load()
         now = self.clock()
-        known = [ip for ip in (entries.get(host) or {}).get("ips", []) if ip != address]
+        before = entries.get(host) or {}
+        stamp = before.get("ts")
+        fresh_entry = isinstance(stamp, (int, float)) and now - stamp <= HOST_CACHE_TTL
+        new = not fresh_entry or address not in before.get("ips", [])
+        known = [ip for ip in before.get("ips", []) if ip != address]
         entries[host] = {"ips": [address, *known][:HOST_CACHE_MAX], "ts": now}
         fresh = {
             name: entry for name, entry in entries.items()
             if isinstance(entry.get("ts"), (int, float)) and now - entry["ts"] <= HOST_CACHE_TTL
         }
         atomic_write_json(self.path, fresh, mode=0o600)
+        return new
 
 
 class SubscriptionCache:

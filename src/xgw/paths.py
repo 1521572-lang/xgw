@@ -216,6 +216,20 @@ class Paths:
             directory.mkdir(parents=True, exist_ok=True)
 
 
+def secret_tempdir() -> str | None:
+    """Каталог для временных файлов с ключами серверов (проверка конфига ядром, запросы к API
+    Xray): /run/xgw — он в памяти (tmpfs), а /tmp в Ubuntu — на диске, и стёртый файл
+    остался бы в его блоках. Нет каталога или нет прав (не root) — None: системный каталог
+    временных файлов (аудит, F-03)."""
+    run = Paths.from_env().run
+    try:
+        if run.is_dir() and not run.is_symlink() and os.access(run, os.W_OK | os.X_OK):
+            return str(run)
+    except OSError:
+        pass
+    return None
+
+
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o640) -> None:
     """Атомарная запись: временный файл рядом, fsync, os.replace, fsync каталога.
 

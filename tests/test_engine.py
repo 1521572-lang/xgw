@@ -339,3 +339,28 @@ def test_subscription_via_xray_checks_its_direct_address_once_a_day(tmp_path, mo
     assert len(checked) == 3
     assert hosts.addresses() == {"subs.example.org": ["203.0.113.9", "203.0.113.8"]}
     engine._direct_failed.clear()
+
+
+def test_direct_fetch_logs_a_new_cache_address_once(tmp_path, monkeypatch, caplog):
+    """Прямой запрос подписки записывает адрес её сервера в кэш: новый адрес — одна строка в
+    журнале, тот же адрес на следующих обновлениях — молча (перепроверка 0.2.0, наблюдение 1)."""
+    from xgw.store import HostCache
+
+    def fake(url, **_kwargs):
+        return fetch.FetchResult(status=200, headers={}, body=_subscription_body(ALIVE), url=url,
+                                 host="subs.example.org", address="203.0.113.8")
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+    cache = SubscriptionCache(tmp_path / "cache")
+    hosts = HostCache(tmp_path / "cache")
+    sub = Subscription(name="main", url="https://subs.example.org/token")
+    caplog.set_level(logging.INFO, logger="test")
+    for _ in range(3):
+        raws, _userinfo, error = engine._load_subscription(
+            sub, Config(), cache, None, None, LOG, hosts=hosts)
+        assert raws and not error
+    lines = [r.getMessage() for r in caplog.records if "записан в кэш адресов" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].startswith("подписка main (subs.example.org): получена "
+                                                   "напрямую, адрес её сервера записан")
+    assert "203.0.113.8" not in lines[0]  # адреса подписок в журнал не пишутся
+    assert hosts.addresses() == {"subs.example.org": ["203.0.113.8"]}

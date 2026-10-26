@@ -337,7 +337,12 @@ def _load_subscription(
             )
         if hosts is not None and result.host and result.address:
             try:
-                hosts.remember(result.host, result.address)
+                if hosts.remember(result.host, result.address):
+                    # Новый адрес (или имя) — одна строка; тот же адрес каждый час — молча.
+                    logger.info(
+                        "подписка %s: получена напрямую, адрес её сервера записан в кэш адресов",
+                        label,
+                    )
             except OSError as exc:
                 logger.error("подписка %s: адрес не записан в %s: %s", label, hosts.path, exc)
         if hosts is not None and mark is not None:
@@ -543,6 +548,9 @@ def assemble(
                 containers_tun=containers_tun(cfg),
                 profile_of=profile_of, bridge=effective,
                 devices_down=devices_down(paths),
+                # Входы sing-box — и работающего, и новой сборки, если её перезапуск отложен.
+                avoid_ports={*(plan.ports.values() if plan is not None else ()),
+                             *(applied_ports or {}).values()},
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
