@@ -856,6 +856,8 @@ def test_loaded_notices_a_lost_interface_route_or_tproxy(gateway_tun):
     assert gateway.loaded() is False
     gateway.up()
     kernel.tables[("ip", "xgw")] += "    chain prerouting {\n    }\n"
+    assert gateway.loaded() is False  # чужая правка таблицы: отпечаток не тот (4-й аудит)
+    gateway._save(tables=gateway._tables_digest())  # будто цепочку загрузил сам XGW
     assert gateway.loaded() is True  # prerouting для LAN в TUN-режиме нужен
     gateway.cfg.network.lan_if = ""
     assert gateway.loaded() is False  # без LAN TPROXY остался бы лишним
@@ -1113,6 +1115,23 @@ def test_flushed_table_is_not_taken_for_loaded(gateway):
     gateway.enable()
     key = ("ip", "xgw")
     gateway.kernel.tables[key] = _flush_table(gateway.kernel.tables[key])
+    assert "chain output {" in gateway.kernel.tables[key]
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+
+
+def test_one_removed_mark_rule_is_not_taken_for_loaded(gateway):
+    """Четвёртый аудит 0.2.0: из output убрали одно правило метки, а другие остались — цепочка
+    не пуста, но loaded() сверяет отпечаток таблицы и видит пропажу. Счётчики отпечаток не
+    меняют, а заново загруженные правила дают новый."""
+    gateway.enable()
+    key = ("ip", "xgw")
+    table = gateway.kernel.tables[key]
+    gateway.kernel.tables[key] = table.replace("counter", "counter packets 42 bytes 4200")
+    assert gateway.loaded() is True  # счётчики идут — правила те же
+    mark = next(line for line in table.splitlines()
+                if "meta mark set" in line and "tproxy" not in line)
+    gateway.kernel.tables[key] = table.replace(mark + "\n", "", 1)
     assert "chain output {" in gateway.kernel.tables[key]
     assert gateway.loaded() is False
     assert gateway.up() == "on" and gateway.loaded() is True

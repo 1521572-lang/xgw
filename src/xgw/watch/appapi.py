@@ -27,8 +27,10 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
 import json
+import socket
 import threading
 import time
 from collections import deque
@@ -41,9 +43,20 @@ from ..phones import Phone, PhoneError, Phones
 
 MAX_BODY = 65536  # вставленные ссылки серверов — десятки строк по полкилобайта
 RATE = 60  # запросов в минуту с одного телефона: опрос раз в 6 с и кнопки
-FAILS_MAX = 10  # неудачных входов в минуту на весь шлюз
+# Неудачных входов в минуту на весь шлюз — после них на минуту закрыты привязка и запросы без
+# верной подписи. Запросы привязанных телефонов идут и тогда: подпись HMAC не подобрать, а
+# код привязки — 32 случайных символа и PAIR_TRIES попыток. Иначе десяток чужих запросов
+# через Funnel (адрес *.ts.net публичен) раз в минуту закрывал бы вход владельцу (четвёртый
+# аудит 0.2.0, ASSUMPTIONS п. 253).
+FAILS_MAX = 10
 LOCKOUT = 60.0
 FAIL_PAUSE = 0.5
+# Funnel открыт всему интернету: одновременных соединений — не больше MAX_CONNECTIONS (лишние
+# закрываются сразу), а на весь запрос — заголовки и тело — READ_DEADLINE секунд, а не
+# Handler.timeout на каждое чтение (медленный отправитель держал бы поток сколько угодно).
+MAX_CONNECTIONS = 16
+READ_DEADLINE = 20.0
+BUSY = "слишком много неудач, подождите"
 # Состояние — как у панели, десятки килобайт раз в 6 с: по мобильной сети — сжатым. Android
 # сам просит gzip (Accept-Encoding) и сам распаковывает.
 GZIP_FROM = 2048
@@ -69,6 +82,26 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     log = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)  # заняты все MAX_CONNECTIONS — сразу закрыть
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def handle_error(self, request, client_address) -> None:
         if self.log is not None:
@@ -123,6 +156,23 @@ class AppApi:
             def log_message(self, *_args) -> None:
                 """Запросы не журналируются."""
 
+            def setup(self) -> None:
+                super().setup()
+                # Срок на чтение всего запроса: истёк — соединение закрывается (AppApi._route
+                # отменяет его, когда тело прочитано; ответ им не ограничен — запись трафика
+                # по мобильной сети может идти дольше).
+                self.deadline = threading.Timer(READ_DEADLINE, self._cut)
+                self.deadline.daemon = True
+                self.deadline.start()
+
+            def _cut(self) -> None:
+                with contextlib.suppress(OSError):
+                    self.connection.shutdown(socket.SHUT_RDWR)
+
+            def finish(self) -> None:
+                self.deadline.cancel()
+                super().finish()
+
             def do_GET(self) -> None:
                 api.handle(self, "GET")
 
@@ -166,18 +216,23 @@ class AppApi:
     def _route(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         host = (handler.headers.get("Host") or "").strip().lower()
         body = self._read_body(handler)
+        deadline = getattr(handler, "deadline", None)
+        if deadline is not None:
+            deadline.cancel()  # запрос прочитан целиком
         if host not in self.hosts():
             raise _Reply(HTTPStatus.MISDIRECTED_REQUEST, {"error": "не тот адрес"})
         path = handler.path.split("?", 1)[0]
         if method == "GET" and path == "/api/hello":
             raise _Reply(HTTPStatus.OK, {"app": "XGW"})
-        if self._locked():
-            raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "слишком много неудач, подождите"})
         if method == "POST" and path == "/api/pair":
+            if self._locked():
+                raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": BUSY})
             self._pair(body)
         try:
             phone = self.phones.verify(handler.headers, method, handler.path, body)
         except PhoneError as exc:
+            if self._locked():  # без паузы: поток не держится, пока дверь закрыта
+                raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": BUSY}) from exc
             self._fail(f"запрос отклонён: {exc}")
         if not self._rate_ok(phone.id):
             raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "слишком часто"})
@@ -230,7 +285,7 @@ class AppApi:
                 self._locked_until = now + LOCKOUT
                 self._fails.clear()
                 self.panel._event(f"приложение: {FAILS_MAX} неудачных входов за минуту — "
-                                  "вход закрыт на минуту")
+                                  "привязка закрыта на минуту, привязанные телефоны работают")
         time.sleep(FAIL_PAUSE)
         raise _Reply(HTTPStatus.FORBIDDEN, {"error": "не принято"})
 

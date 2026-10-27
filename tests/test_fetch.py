@@ -663,3 +663,19 @@ def test_subscription_falls_back_to_the_known_address(monkeypatch, no_sleep):
     assert (result.host, result.address, result.from_fallback) == (
         "sub.example.com", "127.0.0.1", True)
     assert asked[-1] == (("tls://77.88.8.8",), True)
+
+
+def test_redirect_keeps_credentials_on_the_same_origin_only():
+    """Четвёртый аудит 0.2.0: Authorization и Cookie не уходят на другой адрес (как у curl и
+    requests), остальные заголовки подписки — уходят; с https на http — отказ."""
+    sent = {"Authorization": "Bearer t", "Cookie": "a=b", "X-Hwid": "h1"}
+    home = "https://sub.example.net/a"
+    assert fetch.redirect_headers(home, "https://sub.example.net:443/b", sent) == sent
+    assert fetch.redirect_headers(home, "https://cdn.example.org/b", sent) == {"X-Hwid": "h1"}
+    port = fetch.redirect_headers(home, "https://sub.example.net:8443/", sent)
+    assert "Authorization" not in port
+    with pytest.raises(fetch.FetchError, match="с https на http"):
+        fetch.redirect_headers(home, "http://sub.example.net/a", sent)
+    # http → https того же хоста — уже другой адрес (порт и схема): без учётных заголовков.
+    assert fetch.redirect_headers("http://a.example.net/", "https://a.example.net/", sent) == {
+        "X-Hwid": "h1"}

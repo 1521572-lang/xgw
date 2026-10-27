@@ -263,10 +263,11 @@ def test_network_manager_checks(box):
 
 def test_ports_busy_by_another_program(box, monkeypatch):
     monkeypatch.setattr(diag.sys, "platform", "linux")
-    instance = box.diag(port_free=lambda port: port != 10085)
+    instance = box.diag(port_free=lambda port: port != 10086)
     instance._xray_up = False
     check = instance._ports()[0]
-    assert check.level == FAIL and "api 10085" in check.text and "ss -ltnp" in check.advice
+    assert check.level == FAIL and "metrics 10086" in check.text and "ss -ltnp" in check.advice
+    assert "api" not in check.text  # API Xray — сокет, порта у него нет
     instance._xray_up = True
     assert instance._ports()[0].level == OK  # заняты самим Xray
 

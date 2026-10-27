@@ -187,7 +187,12 @@ def test_dual_server_ladder_tries_plain_singbox_before_its_fragmenting():
     assert base == profiles.XRAY_DEFAULT
     for verdict in profiles.TRIGGER_VERDICTS:
         steps = profiles.ladder(verdict, base, base, avail)
-        assert steps.index(profiles.SB_DEFAULT) == steps.index(profiles.XRAY_FRAGMENT) + 1
+        # Сначала ступени Xray (с 0.1.18 после дробления — ещё split), затем обычный sing-box и
+        # только потом его дробление.
+        before = steps[: steps.index(profiles.SB_DEFAULT)]
+        assert profiles.XRAY_FRAGMENT in before
+        assert all(step.startswith("xray:") for step in before), steps
+        assert steps.index(profiles.SB_DEFAULT) < steps.index(profiles.SB_FRAGMENT)
         assert steps.index(profiles.SB_FRAGMENT) == steps.index(profiles.SB_DEFAULT) + 1
     learned = profiles.resolve(node, cfg, letters, current=profiles.SB_DEFAULT)
     assert learned == profiles.SB_DEFAULT

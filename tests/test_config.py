@@ -206,11 +206,11 @@ def test_list_and_table_items_must_be_strings(tmp_path):
 
 def test_subscription_without_url_and_bad_ports_warn(tmp_path):
     _cfg, warnings = _load_text(
-        tmp_path, '[[subscriptions]]\nname = "empty"\n\n[xray]\napi_port = 70000\n'
+        tmp_path, '[[subscriptions]]\nname = "empty"\n\n[xray]\nmetrics_port = 70000\n'
     )
     assert any("empty" in warning and "url" in warning for warning in warnings)
     # Порт назван ключом config.toml, как его искать в файле.
-    assert any("порт xray.api_port=70000" in warning for warning in warnings)
+    assert any("порт xray.metrics_port=70000" in warning for warning in warnings)
 
 
 def test_dangerous_capture_values_are_replaced(tmp_path):
@@ -345,18 +345,20 @@ url = "https://sub.example.net/x"
 
 
 def test_lines_that_mean_nothing_are_commented_out_and_the_rest_stays(tmp_path):
-    """Telegram и xray.version другой версии: предупреждения в каждом xgw status, а заказчик
-    файлы не правит — установка выключает строки сама, значения остаются в комментарии."""
+    """Telegram, xray.version другой версии и xray.api_port (API Xray — сокет, четвёртый аудит
+    0.2.0): предупреждения в каждом xgw status, а заказчик файлы не правит — установка
+    выключает строки сама, значения остаются в комментарии."""
     changed, retired = retire_obsolete(OLD_CONFIG)
-    assert retired == ["xray.version", "notify.telegram_bot_token", "notify.telegram_chat_id",
-                       "notify.commands"]
+    assert retired == ["xray.version", "xray.api_port", "notify.telegram_bot_token",
+                       "notify.telegram_chat_id", "notify.commands"]
     assert '# не используется: telegram_bot_token = "123:abc"' in changed
     assert '# не используется: version = "26.10.10"   # из прежнего примера' in changed
+    assert "# не используется: api_port = 10085" in changed
     path = tmp_path / "config.toml"
     path.write_text(changed, encoding="utf-8")
     cfg, warnings = load(path)
-    assert not [w for w in warnings if "Telegram" in w or "xray.version" in w], warnings
-    assert cfg.xray.api_port == 10085 and cfg.notify.desktop is True
+    assert not [w for w in warnings if "Telegram" in w or "xray." in w], warnings
+    assert cfg.xray.metrics_port == 10086 and cfg.notify.desktop is True
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
     assert retire_obsolete(changed) == (changed, [])  # второй раз — нечего
 

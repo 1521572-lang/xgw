@@ -44,6 +44,12 @@ class Paths:
         return self.root / "run" / "xgw"
 
     @property
+    def xray_api_socket(self) -> Path:
+        """Сокет API Xray (xgw-xray.service, RuntimeDirectory): подключаться к нему могут только
+        пользователь и группа xray — в ней демон (ASSUMPTIONS п. 253)."""
+        return self.root / "run" / "xgw-xray" / "api.sock"
+
+    @property
     def opt(self) -> Path:
         return self.root / "opt" / "xgw"
 

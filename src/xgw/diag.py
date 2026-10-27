@@ -377,8 +377,15 @@ class Diag:
                 "Xray API", FAIL, f"метрики не отвечают: {exc}",
                 "sudo systemctl status xgw-xray; sudo journalctl -u xgw-xray -n 30",
             )]
+        if not self.root:
+            # Сокет API Xray открыт только группе xray (ASSUMPTIONS п. 253): без sudo отказ —
+            # не неисправность.
+            return [Check(
+                "Xray API", WARN, "метрики отвечают; API проверяется только с sudo",
+                "sudo xgw diag",
+            )]
         try:
-            engine.make_api(self.cfg, self.xray_bin).balancer_info(BALANCER_TAG)
+            engine.make_api(self.paths, self.xray_bin).balancer_info(BALANCER_TAG)
         except Exception as exc:
             return [Check("Xray API", FAIL, f"API не отвечает: {exc}",
                           "sudo journalctl -u xgw-xray -n 30")]
@@ -697,7 +704,7 @@ class Diag:
         if not sys.platform.startswith("linux"):
             return []
         ports = {
-            "tproxy": self.cfg.capture.tproxy_port, "api": self.cfg.xray.api_port,
+            "tproxy": self.cfg.capture.tproxy_port,
             "metrics": self.cfg.xray.metrics_port, "socks": self.cfg.xray.socks_port,
             "http": self.cfg.xray.http_port,
         }

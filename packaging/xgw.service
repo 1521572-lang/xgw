@@ -25,6 +25,9 @@ NoNewPrivileges=true
 # CAP_SETUID и CAP_SETGID — runuser для уведомления на рабочий стол пользователя;
 # CAP_NET_RAW — запись трафика устройства из панели (сокет AF_PACKET, watch/record.py).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
+# Группа xray — подключение к сокету API Xray (/run/xgw-xray/api.sock, только пользователь и
+# группа xray): без CAP_DAC_OVERRIDE root подключается к нему как обычный член группы.
+SupplementaryGroups=xray
 # Остальное демону не нужно (третий аудит 0.2.0, ASSUMPTIONS п. 252): модули и журнал ядра,
 # часы, имя машины, свои пространства имён, realtime, setuid-файлы; домашние каталоги и
 # /run/user — только чтение (уведомление идёт через сокет /run/user/<uid>/bus, подключаться к

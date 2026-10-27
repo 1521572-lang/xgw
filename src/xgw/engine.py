@@ -30,7 +30,7 @@ from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
 from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
 from .watch import target
-from .xraycore.api import ApiClient
+from .xraycore.api import ApiClient, server_address
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
 
 
@@ -551,6 +551,7 @@ def assemble(
                 # Входы sing-box — и работающего, и новой сборки, если её перезапуск отложен.
                 avoid_ports={*(plan.ports.values() if plan is not None else ()),
                              *(applied_ports or {}).values()},
+                api_listen=str(paths.xray_api_socket),
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
@@ -834,8 +835,13 @@ def persist(
 # --- доступ к работающему ядру -------------------------------------------------
 
 
-def make_api(cfg: config.Config, xray_bin: Path) -> ApiClient:
-    return ApiClient(xray_bin, server=f"127.0.0.1:{cfg.xray.api_port}")
+def make_api(paths: Paths, xray_bin: Path) -> ApiClient:
+    """Клиент API Xray: адрес — из применённого конфига (ApiClient.address), до первого конфига —
+    сокет paths.xray_api_socket."""
+    return ApiClient(
+        xray_bin, server=server_address(str(paths.xray_api_socket)),
+        config_file=paths.xray_config_file,
+    )
 
 
 def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
@@ -850,7 +856,7 @@ def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
 
 def make_applier(cfg: config.Config, paths: Paths, xray_bin: Path) -> Applier:
     return Applier(
-        cfg, paths, make_api(cfg, xray_bin), make_service(paths, xray_bin), xray_bin=xray_bin
+        cfg, paths, make_api(paths, xray_bin), make_service(paths, xray_bin), xray_bin=xray_bin
     )
 
 

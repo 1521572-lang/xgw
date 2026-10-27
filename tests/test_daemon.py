@@ -560,12 +560,14 @@ def test_stale_scans_trigger_rescan_before_rotation(daemon):
 def test_all_dead_refreshes_directly_and_rotates_at_once(daemon):
     _started(daemon)
     daemon.next_refresh = daemon.t + 3600
-    old_members = daemon.tags("proxy")
+    old_members, spares = daemon.tags("proxy"), daemon.tags("spare")
     daemon.set_alive(**{tag.replace("-", "_"): False for tag in old_members})
 
     assert daemon.tick() is State.ALL_DEAD
     assert daemon.collected == [False]  # внеочередное обновление — напрямую, мимо Xray
-    assert len(daemon.scanned) == 3  # и внеочередной скан запасных
+    # и внеочередной скан: каждый запасной проверен на этом же шаге (вместе с упавшими
+    # участниками; запасные — до смены состояния и ещё раз сканом ALL_DEAD)
+    assert set(spares) <= set(daemon.scanned)
     # замена сразу, без ожидания rotate_after_min (15 мин); перезапуск разрешён
     assert len(daemon.applied) == 1 and daemon.applied[0][1] is True
     daemon.tick()

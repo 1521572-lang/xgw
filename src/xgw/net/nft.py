@@ -1032,6 +1032,23 @@ def listing(
     return "".join(part if part.endswith("\n") else part + "\n" for part in full) + text
 
 
+_COUNTER = re.compile(r"counter packets \d+ bytes \d+")
+
+
+def structure(text: str, family: str, table: str) -> str:
+    """Таблица из `nft -t list table` без того, что меняется само: значений счётчиков (элементов
+    наборов в кратком выводе нет) и полных наборов, которые listing(sets=…) ставит перед ней."""
+    start = text.rfind(f"table {family} {table} {{")
+    return _COUNTER.sub("counter", text[start:] if start >= 0 else text)
+
+
+def tables_digest(*structures: str) -> str:
+    """Отпечаток цепочек и правил таблиц XGW (structure каждой): Capture запоминает его после
+    загрузки, а loaded() сверяет — так видна пропажа и одного правила, например метки в
+    output, хотя цепочка не пуста (четвёртый аудит 0.2.0, ASSUMPTIONS п. 253)."""
+    return hashlib.sha256("\n\0".join(structures).encode("utf-8")).hexdigest()[:24]
+
+
 def ts_state(text: str) -> tuple[bool, bool | None]:
     """Исключения Tailscale в загруженной таблице: (есть ли правила с tailscale0, лежит ли
     метка в наборе ts_direct — None, если набора нет)."""

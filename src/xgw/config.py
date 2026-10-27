@@ -345,7 +345,6 @@ XRAY_VERSION = "26.10.21"
 @dataclass
 class XraySection:
     version: str = XRAY_VERSION
-    api_port: int = 10085
     metrics_port: int = 10086
     socks_port: int = 10808
     http_port: int = 10809
@@ -639,8 +638,14 @@ def probe_bytes(url: str) -> int | None:
 # Ключи прежних версий, которые больше ничего не значат: в config.toml у заказчика они
 # остаются, предупреждение объясняет почему, а не называет их «неизвестными». Установка
 # выключает такие строки сама (retire_obsolete).
-_DROPPED = {
-    "notify": ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api"),
+_DROPPED: dict[str, dict[str, str]] = {
+    "notify": dict.fromkeys(
+        ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api"),
+        "Telegram в XGW больше нет",
+    ),
+    # Четвёртый аудит 0.2.0 (ASSUMPTIONS п. 253): API Xray — сокет, к порту мог подключиться
+    # любой процесс машины.
+    "xray": {"api_port": "API Xray слушает сокет /run/xgw-xray/api.sock, а не порт"},
 }
 _TABLE = re.compile(r"^[ \t]*\[[ \t]*([A-Za-z0-9_.-]+)[ \t]*\][ \t]*(#.*)?$")
 _ARRAY_TABLE = re.compile(r"^[ \t]*\[\[")
@@ -654,9 +659,10 @@ def _version_ignored(value: str) -> bool:
 
 def retire_obsolete(text: str) -> tuple[str, list[str]]:
     """Выключает (комментирует) в тексте config.toml строки, о которых XGW предупреждает при
-    каждом запуске, хотя они ничего не значат: Telegram (_DROPPED) и xray.version другой
-    версии. Заказчик файлы не правит, а предупреждения в каждом `xgw status` мешают (отчёт
-    перепроверки 0.2.0, наблюдение 3). Значения остаются в комментарии — ничего не теряется.
+    каждом запуске, хотя они ничего не значат: Telegram и xray.api_port (_DROPPED) и
+    xray.version другой версии. Заказчик файлы не правит, а предупреждения в каждом
+    `xgw status` мешают (отчёт перепроверки 0.2.0, наблюдение 3). Значения остаются в
+    комментарии — ничего не теряется.
 
     Возвращает новый текст и имена выключенных ключей. Трогаются только строки `ключ = …` в
     своей таблице; итог проверяется разбором TOML — он должен совпасть с прежним без этих
@@ -716,7 +722,8 @@ def _build_section(cls, data: object, section: str, warnings: list[str]):
     values: dict[str, object] = {}
     for name, value in data.items():
         if name in _DROPPED.get(section, ()):
-            warnings.append(f"{section}.{name}: Telegram в XGW больше нет — строку можно удалить")
+            reason = _DROPPED[section][name]
+            warnings.append(f"{section}.{name}: {reason} — строку можно удалить")
             continue
         if name not in known:
             warnings.append(f"неизвестный ключ {section}.{name} проигнорирован")
@@ -781,7 +788,6 @@ def service_ports(cfg: Config) -> dict[str, int]:
     sing-box: иначе ядро не запустилось бы с «address already in use» (аудит, F-04)."""
     return {
         "capture.tproxy_port": cfg.capture.tproxy_port,
-        "xray.api_port": cfg.xray.api_port,
         "xray.metrics_port": cfg.xray.metrics_port,
         "xray.socks_port": cfg.xray.socks_port,
         "xray.http_port": cfg.xray.http_port,

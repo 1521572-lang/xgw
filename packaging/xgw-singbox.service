@@ -32,8 +32,10 @@ PrivateTmp=true
 # сокетах и всеми протоколами sing-box — поведение то же, что без этих строк: параметры и
 # модули ядра, его журнал, часы, свои пространства имён, realtime, setuid-файлы; сокеты —
 # только IP, netlink и UNIX. /dev не скрыт: Xray открывает /dev/net/tun. ProtectControlGroups
-# нет: в systemd 259 вместе с ProtectSystem=strict он открывает /run на запись (ASSUMPTIONS
-# п. 252).
+# нет. /run — только чтение явной строкой: ProtectKernelTunables (как и ProtectProc и
+# ProtectControlGroups) вместе с ProtectSystem=strict открывает его на запись — и в systemd 255
+# (Ubuntu 24.04), и в 259 (ASSUMPTIONS п. 252, 253).
+ReadOnlyPaths=/run
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

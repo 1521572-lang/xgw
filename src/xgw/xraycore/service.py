@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from .. import log, masking
+from .api import applied_listen
 
 MAX_LOG_BYTES = 2 * 1024 * 1024
 
@@ -229,6 +230,15 @@ class PidfileXrayService(XrayService):
         if self.is_active():
             return
         self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # Каталог сокета API: у службы его создаёт (и убирает при любой остановке) systemd —
+        # RuntimeDirectory, здесь — сами. Ядро не работает (is_active выше), а сокет остался —
+        # процесс убили без уборки: новый Xray с ним не запустится (address already in use).
+        listen = applied_listen(Path(self.config_path))
+        if listen.startswith("/"):
+            socket_path = Path(listen)
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            if socket_path.is_socket():
+                socket_path.unlink(missing_ok=True)
         self._trim_log()
         try:
             with open(self.log_file, "ab") as output:

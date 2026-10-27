@@ -523,7 +523,7 @@ class XrayAdapter(Adapter):
         from .xraycore import update
 
         service = engine.make_service(self.paths, self.paths.xray_bin)
-        api = engine.make_api(self.cfg, self.paths.xray_bin)
+        api = engine.make_api(self.paths, self.paths.xray_bin)
         return update.restart_and_wait(service, api, update.WAIT_SECONDS)
 
     def _e2e(self) -> bool:

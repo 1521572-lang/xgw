@@ -465,7 +465,7 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is not None and snapshot["xray"]["ok"]:
         with contextlib.suppress(ApiError):
-            info = engine.make_api(cfg, xray_bin).balancer_state(BALANCER_TAG)
+            info = engine.make_api(paths, xray_bin).balancer_state(BALANCER_TAG)
             snapshot["selecting"] = [info.override] if info.override else list(info.selects)
     return snapshot
 
