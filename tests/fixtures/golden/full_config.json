@@ -38,7 +38,7 @@
     },
     "servers": [
       {
-        "address": "77.88.8.8",
+        "address": "https://77.88.8.8/dns-query",
         "domains": [
           "domain:ru",
           "domain:su",

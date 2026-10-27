@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from xgw.config import Config, load, probe_bytes
+from xgw.config import Config, load, probe_bytes, retire_obsolete
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
 
@@ -209,7 +209,8 @@ def test_subscription_without_url_and_bad_ports_warn(tmp_path):
         tmp_path, '[[subscriptions]]\nname = "empty"\n\n[xray]\napi_port = 70000\n'
     )
     assert any("empty" in warning and "url" in warning for warning in warnings)
-    assert any("api=70000" in warning for warning in warnings)
+    # Порт назван ключом config.toml, как его искать в файле.
+    assert any("порт xray.api_port=70000" in warning for warning in warnings)
 
 
 def test_dangerous_capture_values_are_replaced(tmp_path):
@@ -304,3 +305,70 @@ def test_old_speed_every_hours(tmp_path):
     cfg, warnings = _load_text(tmp_path, "[speed]\nevery_hours = 0\n")
     assert (cfg.speed.unlimited_hours, cfg.speed.limited_hours) == (0, 0)
     assert any("замеры скорости выключены" in warning for warning in warnings)
+
+
+def test_old_default_dns_lists_become_encrypted(tmp_path):
+    """Списки DNS из прежнего примера конфига (с udp://77.88.8.8 и обычным 77.88.8.8 для
+    direct_domains) заменяются нынешними умолчаниями; свои списки остаются как есть."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[dns]\n"
+        'bootstrap = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", '
+        '"udp://77.88.8.8"]\n'
+        'direct_servers = ["77.88.8.8"]\n',
+        encoding="utf-8",
+    )
+    cfg, _warnings = load(path)
+    assert "udp://77.88.8.8" not in cfg.dns.resolvers and "tls://77.88.8.8" in cfg.dns.resolvers
+    assert cfg.dns.direct_servers == ["https://77.88.8.8/dns-query"]
+    path.write_text('[dns]\nbootstrap = ["udp://192.0.2.53"]\n', encoding="utf-8")
+    cfg, _warnings = load(path)
+    assert cfg.dns.bootstrap == ["udp://192.0.2.53"]
+
+
+OLD_CONFIG = """
+[xray]
+version = "26.10.10"   # из прежнего примера
+api_port = 10085
+
+[notify]
+desktop = true
+# Бот Telegram: токен от @BotFather и идентификатор чата.
+telegram_bot_token = "123:abc"
+telegram_chat_id = ""
+commands = true
+
+[[subscriptions]]
+name = "main"
+url = "https://sub.example.net/x"
+"""
+
+
+def test_lines_that_mean_nothing_are_commented_out_and_the_rest_stays(tmp_path):
+    """Telegram и xray.version другой версии: предупреждения в каждом xgw status, а заказчик
+    файлы не правит — установка выключает строки сама, значения остаются в комментарии."""
+    changed, retired = retire_obsolete(OLD_CONFIG)
+    assert retired == ["xray.version", "notify.telegram_bot_token", "notify.telegram_chat_id",
+                       "notify.commands"]
+    assert '# не используется: telegram_bot_token = "123:abc"' in changed
+    assert '# не используется: version = "26.10.10"   # из прежнего примера' in changed
+    path = tmp_path / "config.toml"
+    path.write_text(changed, encoding="utf-8")
+    cfg, warnings = load(path)
+    assert not [w for w in warnings if "Telegram" in w or "xray.version" in w], warnings
+    assert cfg.xray.api_port == 10085 and cfg.notify.desktop is True
+    assert [sub.name for sub in cfg.subscriptions] == ["main"]
+    assert retire_obsolete(changed) == (changed, [])  # второй раз — нечего
+
+
+def test_lines_stay_when_they_cannot_be_cut_cleanly():
+    """Значение в несколько строк, таблица в строку, текущая версия Xray, «latest» и битый
+    файл — текст не меняется."""
+    for text in (
+        '[notify]\ncommands = [\n  "a",\n]\n',
+        'notify = { telegram_chat_id = "1" }\n',
+        '[xray]\nversion = "26.10.21"\n',
+        '[xray]\nversion = "latest"\n',
+        '[notify\ntelegram_chat_id = "1"\n',
+    ):
+        assert retire_obsolete(text) == (text, []), text

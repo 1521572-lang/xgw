@@ -517,7 +517,7 @@ def test_describe(gateway):
     assert gateway.describe() == {
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
-        "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
+        "direct4": 0, "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
         "tun_problem": "", "inbound_missing": "", "blocked": False,
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
@@ -526,6 +526,43 @@ def test_describe(gateway):
     gateway.sys_net.mkdir()
     (gateway.sys_net / "docker0").mkdir()
     assert gateway.describe(check=False)["docker"] is True
+
+
+def test_russian_addresses_set_is_reloaded_only_when_it_changes(gateway):
+    """Ф6: набор direct4 сверяется по отпечатку. Правила загружаются заново, когда разгрузку
+    включили или выключили, сменились geoip.dat или direct_ips, — а не на каждом шаге
+    (испытание 25.10.2026 с QUIC: неверная сверка — перезагрузка каждые 30–40 с)."""
+    from test_geodat import write_geoip
+
+    gateway.paths.xray_dir.mkdir(parents=True, exist_ok=True)
+    write_geoip(gateway.paths.xray_dir / "geoip.dat", {"RU": [("5.8.0.0", 13)]})
+    gateway.enable()
+    assert gateway.loaded() is True
+    gateway.cfg.routing.kernel_direct = True
+    assert gateway.loaded() is False  # включили — набора ещё нет
+    gateway.up()
+    assert gateway.loaded() is True and "5.8.0.0/13" in gateway.kernel.table
+    assert gateway.describe(check=False)["direct4"] == 1
+    gateway.cfg.routing.direct_ips = ["geoip:ru", "203.0.113.0/24"]
+    assert gateway.loaded() is False  # набор другой
+    gateway.up()
+    assert gateway.loaded() is True
+    gateway.cfg.routing.kernel_direct = False
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.loaded() is True and "direct4" not in gateway.kernel.table
+    # По устройству (пожелание заказчика): набор их адресов сверяется по элементам.
+    gateway.cfg.managed.kernel_devices = ["192.168.50.20"]
+    assert gateway.loaded() is False
+    gateway.up()
+    assert gateway.loaded() is True and "direct_lan4" in gateway.kernel.table
+    gateway.cfg.managed.kernel_devices = ["192.168.50.21"]
+    assert gateway.loaded() is False  # другое устройство
+    gateway.up()
+    gateway.cfg.routing.kernel_direct = True
+    assert gateway.loaded() is False  # и машине: отпечаток другой, хотя набор сетей тот же
+    gateway.up()
+    assert gateway.loaded() is True
 
 
 # --- TUN (capture.method = tun) -----------------------------------------------------
@@ -1104,3 +1141,32 @@ def test_own_rule_loads_open_the_quiet_window(gateway, monkeypatch):
     assert Capture.rules_quiet()
     clock[0] += 1.1
     assert not Capture.rules_quiet()
+
+
+# --- проверка правил по поколению nft (отчёт 0.2.0: 3,5 с на каждом шаге с nft 1.0.9) ---------
+
+
+def test_loaded_reads_tables_again_only_after_a_rule_change(gateway, monkeypatch):
+    """Пока поколение правил ядра то же, loaded() nft не запускает; правка (своя загрузка или
+    чужой flush) меняет поколение, и правила перечитываются — пропажа замечается сразу."""
+    kernel = gateway.kernel
+    gen = [1]
+    checked = Capture(gateway.cfg, gateway.paths, runner=kernel, proc_sys=gateway.proc,
+                      time_uids=(), generation=lambda: gen[0])
+    checked.sys_net = gateway.sys_net
+    assert Capture(gateway.cfg, gateway.paths, runner=kernel).lister is kernel  # без кэша
+
+    def listings() -> int:
+        return sum(1 for call in kernel.calls if call[:1] == ("nft",) and "list" in call[1:3])
+
+    gateway.enable()
+    gen[0] += 1  # nft -f загрузил правила
+    assert checked.loaded() is True
+    before = listings()
+    assert checked.loaded() is True and checked.loaded() is True
+    assert listings() == before  # ничего не менялось — nft не запускался
+    key = ("ip", "xgw")
+    kernel.tables[key] = _flush_table(kernel.tables[key])
+    assert checked.loaded() is True  # поколение то же — правка ядру неизвестна (не бывает)
+    gen[0] += 1  # чужой flush table меняет поколение
+    assert checked.loaded() is False and listings() > before

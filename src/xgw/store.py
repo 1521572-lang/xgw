@@ -157,6 +157,89 @@ class CachedSubscription:
     saved_at: float = 0.0
 
 
+# Сколько хранится адрес домена подписки (HostCache): неделю — дольше владелец подписки мог
+# переехать, а сертификат прежнего адреса уже никто не продлевает.
+HOST_CACHE_TTL = 7 * 86400.0
+HOST_CACHE_FILE = "dns-cache.json"
+HOST_CACHE_MAX = 4  # адресов на имя: последние удачные
+# Подписка пришла через Xray (прямого запроса не было): прямой адрес её сервера проверяется не
+# чаще раза в сутки (engine._check_direct), неудачная проверка повторяется через 6 часов.
+HOST_CHECK_EVERY = 86400.0
+HOST_CHECK_RETRY = 6 * 3600.0
+
+
+class HostCache:
+    """Адреса доменов подписок, с которыми запрос уже удался: `cache/dns-cache.json`.
+
+    Запись появляется только после удачного прямого соединения — рукопожатие TLS с
+    проверкой сертификата по имени прошло — и только для адреса, с которым оно и было: либо
+    прямой запрос подписки, из ответа которого разобрались серверы (engine._load_subscription),
+    либо (подписка пришла через Xray, а прямого запроса при живом Xray не бывает — отчёт 0.2.0:
+    файла не было вовсе) раз в сутки отдельное рукопожатие без запроса HTTP
+    (fetch.check_direct). Служебные адреса (fetch.is_bogon) не записываются. Нужен кэш, когда
+    шифрованные резолверы недоступны: подписка всё равно получается по прежнему адресу, а
+    подменить его DNS провайдера не может — запись делается
+    не по ответу DNS, а по проверенному соединению (п. 1.1 рекомендаций к аудиту 0.1.18)."""
+
+    def __init__(self, directory: Path, *, clock=time.time) -> None:
+        self.path = directory / HOST_CACHE_FILE
+        self.clock = clock
+
+    def _load(self) -> dict[str, dict]:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(loaded, dict):
+            return {}
+        return {
+            str(host): entry for host, entry in loaded.items()
+            if isinstance(entry, dict) and isinstance(entry.get("ips"), list)
+        }
+
+    def addresses(self) -> dict[str, list[str]]:
+        """Имя → адреса, записанные не раньше HOST_CACHE_TTL назад (новые первыми)."""
+        now = self.clock()
+        result: dict[str, list[str]] = {}
+        for host, entry in self._load().items():
+            stamp = entry.get("ts")
+            if not isinstance(stamp, (int, float)) or now - stamp > HOST_CACHE_TTL:
+                continue
+            ips = [str(ip) for ip in entry["ips"] if isinstance(ip, str)]
+            if ips:
+                result[host] = ips
+        return result
+
+    def age(self, host: str) -> float | None:
+        """Сколько секунд назад адрес host последний раз подтвердился; None — записи нет."""
+        stamp = (self._load().get(host) or {}).get("ts")
+        if not isinstance(stamp, (int, float)):
+            return None
+        return max(0.0, self.clock() - stamp)
+
+    def remember(self, host: str, address: str) -> bool:
+        """Адрес, с которым запрос к host только что удался. True — адреса в записи не было
+        (новое имя, новый адрес или запись устарела): об этом стоит строка в журнале."""
+        from .fetch import is_bogon
+
+        if not host or not address or is_bogon(address):
+            return False
+        entries = self._load()
+        now = self.clock()
+        before = entries.get(host) or {}
+        stamp = before.get("ts")
+        fresh_entry = isinstance(stamp, (int, float)) and now - stamp <= HOST_CACHE_TTL
+        new = not fresh_entry or address not in before.get("ips", [])
+        known = [ip for ip in before.get("ips", []) if ip != address]
+        entries[host] = {"ips": [address, *known][:HOST_CACHE_MAX], "ts": now}
+        fresh = {
+            name: entry for name, entry in entries.items()
+            if isinstance(entry.get("ts"), (int, float)) and now - entry["ts"] <= HOST_CACHE_TTL
+        }
+        atomic_write_json(self.path, fresh, mode=0o600)
+        return new
+
+
 class SubscriptionCache:
     """Последняя удачная версия каждой подписки в /var/lib/xgw/cache.
 

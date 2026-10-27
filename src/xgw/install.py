@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import cores, desktop, engine, fetch, log, managed, tray
-from .config import SINGBOX_VERSION, XRAY_VERSION, Config
+from .config import SINGBOX_VERSION, XRAY_VERSION, Config, retire_obsolete
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
@@ -78,7 +78,7 @@ GenericName=VPN gateway
 GenericName[ru]=VPN-шлюз
 Comment=Control panel of the XGW gateway
 Comment[ru]=Панель управления шлюзом XGW
-Exec=xdg-open {url}
+Exec={launcher} tray --open {url}
 Icon={icon}
 Terminal=false
 Categories=Network;
@@ -289,6 +289,9 @@ class Installer:
         self.warnings: list[str] = []
         # Файл Xray заменён поверх прежнего: работающее ядро — ещё на старом (п. 226).
         self.xray_replaced = False
+        # Файлы служб, которые эта установка поменяла: работающий процесс живёт по прежнему
+        # (ограничения systemd — с запуска), поэтому ядра перезапускаются (_first_apply).
+        self.units_changed: set[str] = set()
 
     # --- что известно о машине --------------------------------------------------
 
@@ -570,6 +573,7 @@ class Installer:
         self._code()
         self._xray(facts)
         self._singbox(facts)
+        self._tidy_config()
         self._permissions()
 
     def _packages(self, facts: Facts) -> None:
@@ -672,6 +676,22 @@ class Installer:
         cores.forget(self.paths, "sing-box")
         self.journal.set("singbox", {"version": tag, "dir": str(self.paths.singbox_dir)})
         self._step(f"sing-box {tag} — {self.paths.singbox_dir}")
+
+    def _tidy_config(self) -> None:
+        """Строки config.toml, которые ничего не значат (Telegram, xray.version другой
+        версии), — в комментарий: иначе о них предупреждает каждый запуск xgw
+        (config.retire_obsolete). Файл не читается или разбор не сошёлся — не трогаем."""
+        path = self.paths.config_file
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        changed, retired = retire_obsolete(text)
+        if not retired:
+            return
+        atomic_write_text(path, changed, mode=0o600)
+        self._step(f"{path}: выключены строки, которые больше ничего не значат — "
+                   f"{', '.join(retired)} (значения остались в комментарии)")
 
     def _permissions(self) -> None:
         """/etc/xgw/config.toml — 0600; конфиг Xray — 0640 root:xray.
@@ -913,7 +933,13 @@ class Installer:
                 text = (source / unit).read_text(encoding="utf-8")
             except OSError as exc:
                 raise InstallError(f"нет файла службы {source / unit}: {exc}") from exc
-            atomic_write_text(self.paths.systemd_dir / unit, text, mode=0o644)
+            target = self.paths.systemd_dir / unit
+            try:
+                if target.read_text(encoding="utf-8") != text:
+                    self.units_changed.add(unit)
+            except OSError:
+                pass  # файла не было — служба ещё не запускалась
+            atomic_write_text(target, text, mode=0o644)
         self.journal.set("units", list(UNIT_FILES))
         self.runner(["systemctl", "daemon-reload"], timeout=60.0)
         self.runner(["systemctl", "enable", *UNITS], timeout=60.0)
@@ -937,18 +963,34 @@ class Installer:
         )
         if singbox_outcome is not None and singbox_outcome.mode != "unchanged":
             self._step(engine.describe_singbox(singbox_outcome))
+        if SINGBOX_UNIT in self.units_changed and (
+                singbox_outcome is None or singbox_outcome.mode not in ("started", "removed")):
+            # Новые ограничения службы действуют с запуска процесса; перечитывание конфига
+            # (SIGHUP) их не применяет. Не работает — и перезапускать нечего (try-restart).
+            running = self.runner(
+                ["systemctl", "is-active", SINGBOX_UNIT], check=False).strip() == "active"
+            if running:
+                try:
+                    self.runner(["systemctl", "try-restart", SINGBOX_UNIT], timeout=60.0)
+                    self._step("sing-box перезапущен: файл его службы изменился")
+                except cmd.CommandError as exc:
+                    self._warn(f"sing-box не перезапущен ({exc}): новые ограничения службы "
+                               "вступят в силу при следующем запуске")
         if outcome is None:
             self._warn(engine.describe_singbox(singbox_outcome))  # type: ignore[arg-type]
             return self._xray_answers(applier, 0.0)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, inventory.quotas)
-        if self.xray_replaced and outcome.mode in ("api", "unchanged"):
+        unit_changed = "xgw-xray.service" in self.units_changed
+        if (self.xray_replaced or unit_changed) and outcome.mode in ("api", "unchanged"):
             # Установка поверх работающего шлюза положила новую версию Xray (os.replace), а
             # процесс работает на прежнем файле: без перезапуска шлюз остался бы на старой
-            # версии до перезагрузки машины (п. 226).
+            # версии до перезагрузки машины (п. 226). То же с файлом службы: её ограничения
+            # действуют с запуска процесса.
             with contextlib.suppress(XrayServiceError):
                 applier.service.restart()
-            self._step("Xray перезапущен на новой версии")
+            self._step("Xray перезапущен на новой версии" if self.xray_replaced
+                       else "Xray перезапущен: файл его службы изменился")
         elif outcome.mode == "unchanged" and not self._xray_answers(applier, 0.0):
             with contextlib.suppress(XrayServiceError):
                 applier.service.restart()

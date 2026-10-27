@@ -1,6 +1,6 @@
 """HTTP- и DoH-клиент XGW на сокетах с SO_MARK.
 
-Подписки, bootstrap-DNS (DoH по IP и обычный UDP-DNS) и проверки провайдера.
+Подписки, bootstrap-DNS (DoH и DoT по IP, обычный UDP-DNS) и проверки провайдера.
 Только стандартная библиотека: http.client, ssl, socket.
 """
 
@@ -21,7 +21,7 @@ import struct
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -46,6 +46,36 @@ _sleep = time.sleep  # подменяется в тестах
 RESOLVER_PAUSE = 600.0
 _resolver_down: dict[str, float] = {}
 _resolver_lock = threading.Lock()
+# Шифрованные резолверы: ответ DoH (https://) и DoT (tls://) подписан сертификатом резолвера,
+# и провайдер его не подменит. Обычный udp:// провайдер перехватывает на порту 53 и на имя
+# из реестра блокировок отвечает адресом заглушки — для доменов подписок такие резолверы не
+# спрашиваются вовсе (0.2.0, п. 1.1 рекомендаций к аудиту).
+ENCRYPTED_SCHEMES = ("https://", "tls://")
+DOT_PORT = 853
+# Адреса, которых у сервера подписки в интернете быть не может: так отвечает подменённый DNS
+# («0.0.0.0», «127.0.0.1», адрес из частной сети провайдера). Документационные сети
+# (192.0.2.0/24 и др.) сюда не входят: заглушки ими не пользуются.
+_BOGONS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+        "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+    )
+)
+
+
+def encrypted(entries: Sequence[str]) -> list[str]:
+    """Только шифрованные резолверы — DoH и DoT, без udp://."""
+    return [entry for entry in entries if entry.startswith(ENCRYPTED_SCHEMES)]
+
+
+def is_bogon(address: str) -> bool:
+    """Адрес, которым подменённый DNS отвечает вместо настоящего (_BOGONS)."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    return ip.version != 4 or any(ip in net for net in _BOGONS)
 
 
 def resolver_order(entries: Sequence[str], now: float | None = None) -> list[str]:
@@ -155,6 +185,11 @@ class FetchResult:
     headers: dict[str, str]
     body: bytes
     url: str = ""
+    # Прямой запрос к имени хоста: имя (последнего адреса после перенаправлений), IP-адрес, с
+    # которым прошло рукопожатие TLS, и взят ли он из запасных (fallback), а не от резолвера.
+    host: str = ""
+    address: str = ""
+    from_fallback: bool = False
 
 
 def fetch_url(
@@ -169,6 +204,8 @@ def fetch_url(
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
     cancel: threading.Event | None = None,
+    strict_dns: bool = False,
+    fallback: dict[str, list[str]] | None = None,
 ) -> FetchResult:
     """GET (или POST, если задано тело `data`): первая попытка и до `retries`
     повторов с паузами 2, 4 и 8 с.
@@ -182,9 +219,15 @@ def fetch_url(
     `cancel` — демон останавливается: новая попытка не начинается, пауза перед ней и
     ожидание сети (разрешение имени, соединение, CONNECT, TLS, ответ) прерываются —
     Cancelled. Такой итог ничего не говорит ни о подписке, ни о сервере.
+    `strict_dns` — имя спрашивается только у шифрованных резолверов (encrypted), а адреса
+    служебных сетей в ответе (is_bogon) считаются подменой; так разрешаются домены
+    подписок. `fallback` — имя хоста → адреса, с которыми запрос уже удавался (кэш
+    store.HostCache): по ним идёт соединение, если резолверы не ответили или ни один из
+    их адресов не соединился. Сертификат TLS проверяется по имени хоста и тогда.
     """
     if url.startswith("file://"):
         return _fetch_file(url)
+    dns = _Dns(bootstrap, strict_dns, fallback or {})
     attempts = max(0, retries) + 1
     last_error: Exception | None = None
     result: FetchResult | None = None
@@ -193,7 +236,7 @@ def fetch_url(
             raise Cancelled
         try:
             result = _request_with_redirects(
-                url, headers or {}, timeout, mark, bootstrap, proxy, data, cancel
+                url, headers or {}, timeout, mark, dns, proxy, data, cancel
             )
         except (
             FetchError,
@@ -235,15 +278,17 @@ def fetch_subscription(
     proxy: tuple[str, int] | None = None,
     retries: int = 3,
     cancel: threading.Event | None = None,
+    fallback: dict[str, list[str]] | None = None,
 ) -> FetchResult:
     """Подписка: таймаут 15 с, до 3 повторов. Ответ не 200 — ошибка, а не «пустая подписка».
+    Имя хоста — только через шифрованные резолверы (strict_dns в fetch_url); fallback и
     cancel — см. fetch_url."""
     merged = dict(headers or {})
     if user_agent:
         merged["User-Agent"] = user_agent
     result = fetch_url(
         url, headers=merged, mark=mark, timeout=timeout, bootstrap=bootstrap, proxy=proxy,
-        retries=retries, cancel=cancel,
+        retries=retries, cancel=cancel, strict_dns=True, fallback=fallback,
     )
     if result.status != 200:
         raise FetchError(f"{masking.mask_url(url)}: HTTP {result.status}")
@@ -278,19 +323,31 @@ def _fetch_file(url: str) -> FetchResult:
     return FetchResult(status=200, headers={}, body=body, url=url)
 
 
+@dataclass
+class _Dns:
+    """Как разрешать имя хоста при прямом запросе (fetch_url): резолверы, строгий режим
+    (только шифрованные, без служебных адресов) и запасные адреса по именам."""
+
+    bootstrap: Sequence[str] | None
+    strict: bool = False
+    fallback: dict[str, list[str]] = field(default_factory=dict)
+
+
 def _request_with_redirects(
     url: str,
     headers: dict[str, str],
     timeout: float,
     mark: int | None,
-    bootstrap: Sequence[str] | None,
+    dns: _Dns | Sequence[str] | None,
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
     cancel: threading.Event | None = None,
 ) -> FetchResult:
+    if not isinstance(dns, _Dns):
+        dns = _Dns(dns)
     current = url
     for _ in range(5):
-        result = _request_once(current, headers, timeout, mark, bootstrap, proxy, data, cancel)
+        result = _request_once(current, headers, timeout, mark, dns, proxy, data, cancel)
         # Тело за перенаправлением не отправляется: запрос с телом не повторяется по чужому
         # адресу.
         if data is None and result.status in (301, 302, 303, 307, 308):
@@ -312,23 +369,80 @@ def _is_ip(host: str) -> bool:
 
 
 def _connect(
-    host: str, port: int, timeout: float, mark: int | None, bootstrap: Sequence[str] | None,
+    host: str, port: int, timeout: float, mark: int | None, dns: _Dns | Sequence[str] | None,
     cancel: threading.Event | None = None,
-) -> socket.socket:
+) -> tuple[socket.socket, bool]:
+    """Соединение с host:port; второе значение — адрес взят из запасных (dns.fallback)."""
+    if not isinstance(dns, _Dns):
+        dns = _Dns(dns)
+
     def connect(sock: socket.socket, address: tuple[str, int]) -> None:
         wait_connect(sock, address, timeout, cancel)
 
-    if not bootstrap or _is_ip(host):
-        return marknet.connect_marked(host, port, timeout=timeout, mark=mark, connect=connect)
+    if not dns.bootstrap or _is_ip(host):
+        sock = marknet.connect_marked(host, port, timeout=timeout, mark=mark, connect=connect)
+        return sock, False
+    spare = [ip for ip in dns.fallback.get(host, []) if _is_ip(ip)]
+    entries = encrypted(dns.bootstrap) if dns.strict else list(dns.bootstrap)
+    try:
+        if not entries:
+            raise ResolveError(
+                "нет шифрованных резолверов: в dns.resolvers нужен хотя бы один https:// или tls://")
+        addresses = resolve_domain(
+            host, entries, mark=mark, cancel=cancel, public_only=dns.strict,
+        )
+    except ResolveError:
+        if not spare:
+            raise
+        addresses = []
     last_error: OSError | None = None
-    for address in resolve_domain(host, list(bootstrap), mark=mark, cancel=cancel):
+    tried: set[str] = set()
+    for address in [*addresses, *spare]:
+        if address in tried:
+            continue
+        tried.add(address)
         try:
-            return marknet.connect_marked(
+            sock = marknet.connect_marked(
                 address, port, timeout=timeout, mark=mark, connect=connect
             )
         except OSError as exc:
             last_error = exc
+            continue
+        return sock, address not in addresses
     raise last_error or OSError(f"нет адресов для {host}")
+
+
+DIRECT_CHECK_TIMEOUT = 5.0
+
+
+def check_direct(
+    host: str,
+    port: int = 443,
+    *,
+    bootstrap: Sequence[str],
+    mark: int | None,
+    timeout: float = DIRECT_CHECK_TIMEOUT,
+    cancel: threading.Event | None = None,
+) -> str:
+    """Прямой путь к серверу подписки, которая пришла через Xray: имя — только у шифрованных
+    резолверов без служебных адресов (как у прямого запроса подписки), соединение с меткой
+    мимо перехвата и рукопожатие TLS с проверкой сертификата по имени. Запроса HTTP нет:
+    адрес подписки с её ключом напрямую не уходит, провайдер видит только имя сервера в
+    рукопожатии — как и при прямом запросе, когда Xray не отвечает. Возвращает адрес, с
+    которым рукопожатие прошло (для store.HostCache).
+
+    ResolveError, OSError (в т. ч. ssl.SSLError: чужой сертификат) — путь не проверен;
+    Cancelled — демон останавливается."""
+    sock, _spare = _connect(host, port, timeout, mark, _Dns(bootstrap, strict=True), cancel)
+    try:
+        address = str(sock.getpeername()[0])
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+        wait_io(sock, sock.do_handshake, timeout, cancel)
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+    return address
 
 
 def open_tunnel(
@@ -384,7 +498,7 @@ def _request_once(
     headers: dict[str, str],
     timeout: float,
     mark: int | None,
-    bootstrap: Sequence[str] | None = None,
+    dns: _Dns | Sequence[str] | None = None,
     proxy: tuple[str, int] | None = None,
     data: bytes | None = None,
     cancel: threading.Event | None = None,
@@ -399,10 +513,15 @@ def _request_once(
     port = parts.port or default_port
     if cancel is not None and cancel.is_set():
         raise Cancelled
+    address, from_fallback = "", False
     if proxy is not None:
         sock = open_tunnel(proxy, host, port, timeout=timeout, cancel=cancel)
     else:
-        sock = _connect(host, port, timeout, mark, bootstrap, cancel)
+        sock, from_fallback = _connect(host, port, timeout, mark, dns, cancel)
+        # Адрес соединения — для кэша адресов подписок (store.HostCache); подставной сокет
+        # тестов getpeername может не знать — тогда адреса нет, и кэш не пишется.
+        with contextlib.suppress(OSError, AttributeError):
+            address = str(sock.getpeername()[0])
     try:
         if parts.scheme == "https":
             context = ssl.create_default_context()
@@ -436,6 +555,9 @@ def _request_once(
             headers={k.lower(): v for k, v in response.getheaders()},
             body=body,
             url=url,
+            host=host if address and not _is_ip(host) else "",
+            address=address,
+            from_fallback=from_fallback,
         )
     finally:
         with contextlib.suppress(OSError):
@@ -589,14 +711,71 @@ def plain_dns(
         sock.close()
 
 
+def _read_exact(
+    sock: socket.socket, size: int, timeout: float, cancel: threading.Event | None
+) -> bytes:
+    data = b""
+    while len(data) < size:
+        want = size - len(data)
+        chunk = wait_io(sock, lambda want=want: sock.recv(want), timeout, cancel)
+        if not chunk:
+            raise ResolveError("резолвер закрыл соединение, не ответив")
+        data += chunk
+    return data
+
+
+def dot_query(
+    server: str, name: str, *, port: int = DOT_PORT, timeout: float = 8.0,
+    mark: int | None = None, cancel: threading.Event | None = None,
+) -> list[str]:
+    """DNS-over-TLS (RFC 7858): запрос DNS с двухбайтовой длиной в соединении TLS к адресу
+    резолвера. Сертификат проверяется по самому IP — так у Яндекса, Quad9, AdGuard,
+    Cloudflare и Google (проверено 26.10.2026); чужой сертификат — ssl.SSLError."""
+
+    def connect(sock: socket.socket, address: tuple[str, int]) -> None:
+        wait_connect(sock, address, timeout, cancel)
+
+    wire = _dns_query(name)
+    raw = marknet.connect_marked(server, port, timeout=timeout, mark=mark, connect=connect)
+    try:
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(raw, server_hostname=server, do_handshake_on_connect=False)
+    except BaseException:
+        raw.close()
+        raise
+    try:
+        wait_io(sock, sock.do_handshake, timeout, cancel)
+        sock.settimeout(timeout)
+        sock.sendall(struct.pack(">H", len(wire)) + wire)
+        (length,) = struct.unpack(">H", _read_exact(sock, 2, timeout, cancel))
+        payload = _read_exact(sock, length, timeout, cancel)
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+    if payload[:2] != wire[:2]:
+        raise ResolveError("ответ DoT на чужой запрос")
+    return _parse_a_answers(payload)
+
+
+def _host_port(text: str, default: int) -> tuple[str, int]:
+    """«адрес» или «адрес:порт» → (адрес, порт)."""
+    server, sep, port = text.rpartition(":")
+    if sep and port.isdigit():
+        return server, int(port)
+    return text, default
+
+
 def resolve_domain(
     name: str, bootstrap: list[str], *, mark: int | None = None,
-    cancel: threading.Event | None = None,
+    cancel: threading.Event | None = None, public_only: bool = False,
 ) -> list[str]:
-    """Разрешение домена через bootstrap-резолверы (DoH по IP, затем UDP).
+    """Разрешение домена через bootstrap-резолверы (DoH и DoT по IP, обычный UDP).
 
     Адреса возвращаются отсортированными: DNS-ротация не должна менять
     dns.hosts (и тем самым конфиг) от запуска к запуску.
+
+    public_only — адреса служебных сетей (is_bogon) отбрасываются: ответ из одних таких —
+    подмена, резолвер считается отказавшим, и спрашивается следующий.
 
     NoSuchDomain — адресов нет ни у кого, и хотя бы один резолвер ответил
     определённо (NXDOMAIN или пустой ответ); прочие сбои — ResolveError. cancel — см. fetch_url.
@@ -609,15 +788,24 @@ def resolve_domain(
         try:
             if entry.startswith("https://"):
                 ips = doh_query(entry, name, mark=mark, cancel=cancel)
+            elif entry.startswith("tls://"):
+                server, port = _host_port(entry[len("tls://") :].rstrip("/"), DOT_PORT)
+                ips = dot_query(server, name, port=port, mark=mark, cancel=cancel)
             elif entry.startswith("udp://"):
-                server, sep, port = entry[len("udp://") :].rpartition(":")
-                if sep and port.isdigit():
-                    ips = plain_dns(server, name, mark=mark, port=int(port), cancel=cancel)
-                else:
-                    ips = plain_dns(entry[len("udp://") :], name, mark=mark, cancel=cancel)
+                server, port = _host_port(entry[len("udp://") :], 53)
+                ips = plain_dns(server, name, mark=mark, port=port, cancel=cancel)
             else:
                 errors.append(f"неизвестный bootstrap: {entry}")
                 continue
+            if public_only and ips:
+                public = [ip for ip in ips if not is_bogon(ip)]
+                if not public:
+                    resolver_failed(entry)
+                    errors.append(
+                        f"{masking.mask_url(entry)}: подменённый ответ ({', '.join(ips[:3])})"
+                    )
+                    continue
+                ips = public
             resolver_answered(entry)
             if ips:
                 return sorted(set(ips), key=ipaddress.ip_address)

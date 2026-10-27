@@ -34,9 +34,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import masking
-from ..config import Config
+from ..config import Config, service_ports
 from ..model import ServerNode
-from ..paths import Paths
+from ..paths import Paths, secret_tempdir
+from . import validate as checks
 
 BRIDGE_USER = "xgw"
 FRAGMENT_DELAY = "30ms"  # пауза между сегментами ClientHello (tls.fragment_fallback_delay)
@@ -204,10 +205,7 @@ def bridge_outbound(port: int, letter: str, password: str) -> dict:
 
 
 def _reserved_ports(cfg: Config) -> set[int]:
-    return {
-        cfg.capture.tproxy_port, cfg.xray.api_port, cfg.xray.metrics_port, cfg.xray.socks_port,
-        cfg.xray.http_port, cfg.panel.port, cfg.core.api_port,
-    }
+    return set(service_ports(cfg).values())
 
 
 def build(
@@ -337,9 +335,16 @@ def installed_version(
 
 
 def _run_check(config: dict, bin_path: Path) -> tuple[bool, str]:
+    verdict, output = _check_once(config, bin_path)
+    return verdict is True, output
+
+
+def _check_once(config: dict, bin_path: Path) -> tuple[bool | None, str]:
+    """Вердикт `sing-box check`; None — вердикта нет (не запустился или завис)."""
     import json
 
-    fd, tmp_name = tempfile.mkstemp(prefix="xgw-sbcheck-", suffix=".json")  # права 0600
+    # Права 0600; в /run/xgw (в памяти), а не в /tmp на диске: в конфиге — ключи серверов.
+    fd, tmp_name = tempfile.mkstemp(prefix="xgw-sbcheck-", suffix=".json", dir=secret_tempdir())
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -350,9 +355,9 @@ def _run_check(config: dict, bin_path: Path) -> tuple[bool, str]:
                 capture_output=True, text=True, timeout=60,
             )
         except subprocess.TimeoutExpired:
-            return False, "sing-box check: таймаут 60 с"
+            return None, "sing-box check: таймаут 60 с"
         except OSError as exc:
-            return False, f"sing-box check не запустился: {exc}"
+            return None, f"sing-box check не запустился: {exc}"
         output = masking.mask_text(
             (proc.stdout or "") + (proc.stderr or ""), masking.collect_secrets(config),
         )
@@ -373,23 +378,44 @@ def find_invalid(
 ) -> dict[str, str]:
     """Отпечаток → причина для серверов, чей конфиг установленный sing-box не принимает.
 
-    Каждый сервер проверяется отдельным минимальным конфигом (обычный вариант: остальные
-    отличаются полями, которые проверены), чтобы один битый сервер не лишал sing-box всей
-    подписки."""
+    Проверяется обычный вариант каждого сервера (остальные отличаются полями, которые
+    проверены) — чтобы один битый сервер не лишал sing-box всей подписки. Отвергнутые раньше
+    этим же sing-box не проверяются снова, остальные — делением пополам (validate.narrow)."""
+    core = checks.binary_id(bin_path)
     invalid: dict[str, str] = {}
+    unknown: list[tuple[str, list[dict], bool, str]] = []
     for node in nodes:
         if node.singbox is None:
             continue
         items, endpoint = _variant(node.singbox, "d", node.fingerprint, cfg.capture.mark_bypass)
-        config: dict = {"log": {"level": "warn"}}
-        if endpoint:
-            config["endpoints"] = [items[0]]
-            config["outbounds"] = [{"type": "block", "tag": "block"}, *items[1:]]
+        key = checks.rejected_key(items, core)
+        reason = checks.known_rejection(key)
+        if reason is None:
+            unknown.append((node.fingerprint, items, endpoint, key))
         else:
-            config["outbounds"] = items
-        ok, output = _run_check(config, bin_path)
-        if not ok:
-            lines = [line for line in output.splitlines() if line.strip()]
-            reason = lines[-1].rsplit(": ", 1)[-1] if lines else "ошибка проверки"
             invalid[node.fingerprint] = reason
+
+    def check(chunk: list[tuple[str, list[dict], bool, str]]) -> tuple[bool | None, str]:
+        endpoints: list[dict] = []
+        outbounds: list[dict] = []
+        for _fingerprint, items, endpoint, _key in chunk:
+            if endpoint:
+                endpoints.append(items[0])
+                outbounds.extend(items[1:])
+            else:
+                outbounds.extend(items)
+        config: dict = {"log": {"level": "warn"}}
+        if endpoints:
+            config["endpoints"] = endpoints
+            config["outbounds"] = [{"type": "block", "tag": "block"}, *outbounds]
+        else:
+            config["outbounds"] = outbounds
+        return _check_once(config, bin_path)
+
+    for index, output in checks.narrow(unknown, check).items():
+        fingerprint, _items, _endpoint, key = unknown[index]
+        lines = [line for line in output.splitlines() if line.strip()]
+        reason = lines[-1].rsplit(": ", 1)[-1] if lines else "ошибка проверки"
+        invalid[fingerprint] = reason
+        checks.remember_rejection(key, reason)
     return invalid

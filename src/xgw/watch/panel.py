@@ -8,6 +8,7 @@
 панель по tailnet (Serve) и маршрут самого Tailscale. Карточка «Телефоны» (А1
 `ANDROID_APP_PLAN.md`): привязка приложения XGW для Android по QR-коду, список телефонов;
 рядом с панелью работает API приложения (appapi.py), наружу — через Tailscale Funnel.
+Карточка «Проверка сети» (Ф3 `VPN_IMPROVEMENT_PLAN.md`): разовые проверки netcheck.py.
 
 Безопасность:
   * слушает только 127.0.0.1 — из сети панель не открыть; по tailnet её открывает
@@ -35,6 +36,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from collections import Counter
@@ -63,7 +65,7 @@ from .. import tailscale as ts
 from ..config import Config
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
-from ..net import cmd, dnsmasq, lan
+from ..net import cmd, dnsmasq, lan, nft
 from ..net.capture import Capture
 from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
@@ -85,6 +87,9 @@ TS_TTL = 10.0  # как долго помнить, что ответил CLI tai
 TS_WAIT = 10.0  # сколько действие карточки ждёт ссылку входа или итог Serve
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
+# Свой сервер устройства демон применяет сразу, не дожидаясь окна перезапуска (отчёт Ф4).
+ROUTE_RESTART = ("Применяется сразу; если для этого нужен перезапуск Xray, соединения всех "
+                 "устройств прервутся на пару секунд")
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
 # остановка демона (по умолчанию в http.server — 0,5 с).
 SHUTDOWN_POLL = 0.1
@@ -106,6 +111,7 @@ _CSP = (
     "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
 _LINK_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+PAGE_SIGNALS = ("seen", "focused", "hidden", "closed")  # вкладка панели — для tray.open_panel
 
 
 def token_file(paths: Paths) -> Path:
@@ -215,6 +221,10 @@ def _shared(entry: dict) -> dict:
         "unstable_until": entry.get("unstable_until"),
         "fragment": bool(entry.get("fragment")),
         "profile": entry.get("profile") or "", "core": entry.get("core") or "",
+        # Сетевая задержка (RTT, 0.2.0) — отдельно от времени пробы целиком (delay_ms) — и
+        # рейтинг сервера (rating.py).
+        "rtt_ms": entry.get("rtt_ms"), "rtt_ts": entry.get("rtt_ts"),
+        "score": entry.get("score"),
     }
 
 
@@ -224,8 +234,15 @@ class _Server(ThreadingHTTPServer):
     log = None
 
     def handle_error(self, request, client_address) -> None:
-        if self.log is not None:
-            self.log.exception("панель: запрос не обработан")
+        if self.log is None:
+            return
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            # Браузер закрыл соединение, не дочитав ответ (отчёт f6b, наблюдение 3): это не
+            # сбой панели — одной строкой, без трассировки.
+            self.log.info("панель: клиент %s закрыл соединение раньше ответа", client_address[0])
+            return
+        self.log.exception("панель: запрос не обработан")
 
 
 class Refused(Exception):
@@ -281,6 +298,12 @@ class Panel:
         self.app_api: AppApi | None = None
         # Запись трафика устройства: кнопка в строке устройства (record.py).
         self.recorder = Recorder(paths.records_dir, on_done=self._event)
+        self._netcheck: threading.Thread | None = None  # кнопка «Проверить сеть»
+        # Вкладка панели на этой машине (time.monotonic, 0 — не было): seen — опрашивала шлюз
+        # (она на экране), focused — опрашивала, будучи в фокусе, hidden — скрылась (окно
+        # свёрнуто или открыта другая вкладка), closed — закрылась. Ярлык и значок по ним
+        # выводят её окно вперёд вместо новой вкладки (tray.open_panel).
+        self._page = dict.fromkeys(PAGE_SIGNALS, 0.0)
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -507,6 +530,7 @@ class Panel:
             elif role == "spare":
                 row.update(
                     status="spare", tag=entry.get("tag"), verdict=entry.get("verdict"),
+                    delay_ms=entry.get("delay_ms"),
                     scanned=entry.get("scanned"), reserve=bool(entry.get("reserve")),
                     **_shared(entry),
                 )
@@ -644,6 +668,13 @@ class Panel:
                 "interface": info["lan_if"],
                 "gateway": str(gateway.ip) if gateway and info["lan_if"] else "",
             },
+            # Российские адреса ядром мимо Xray (Ф6): у этого компьютера с контейнерами (on; у
+            # устройств — «kernel» в их строках), что мешает включить, сколько сетей в direct4.
+            "kernel_direct": {
+                "on": cfg.routing.kernel_direct,
+                "reason": nft.kernel_direct_blocker(cfg),
+                "networks": info.get("direct4") or 0,
+            },
             "devices": devices,
             "records": self.recorder.state(),
             "events": events,
@@ -676,6 +707,8 @@ class Panel:
             "cores": self._cores_card(snapshot, now),
             # Прогресс замеров скорости: сколько из скольких (демон пишет в status.json).
             "speed_progress": snapshot.get("speed") or {},
+            # Карточка «Проверка сети»: идёт ли проверка и итог последней.
+            "netcheck": self._netcheck_card(),
         }
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
@@ -685,6 +718,41 @@ class Panel:
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
         return masked
+
+    def _netcheck_card(self) -> dict:
+        from .. import netcheck  # он тянет diag → install → эту панель: только здесь
+
+        rows = self._db("SELECT value FROM meta WHERE key = ?", (netcheck.META,))
+        last = netcheck.loads(rows[0]["value"] if rows else None)
+        return {"running": self._netcheck is not None and self._netcheck.is_alive(), **last}
+
+    def _netcheck_start(self) -> actions.Outcome:
+        """Кнопка «Проверить сеть»: проверки идут в своём потоке (до ~15 с), итог — в базе
+        состояния и событием; страница видит его в очередном опросе."""
+        if self._netcheck is not None and self._netcheck.is_alive():
+            return actions.Outcome(0, "Проверка сети уже идёт…")
+        self._netcheck = threading.Thread(target=self._netcheck_run, name="xgw-netcheck",
+                                          daemon=True)
+        self._netcheck.start()
+        return actions.Outcome(0, "Проверяю сеть — это займёт до 15 секунд…")
+
+    def _netcheck_run(self) -> None:
+        from .. import netcheck
+
+        started = time.time()
+        try:
+            checks = netcheck.Netcheck(self.cfg, self.paths, runner=self.runner, logger=self.log,
+                                       capture=self._capture()).run()
+        except Exception as exc:  # итог должен появиться и тогда
+            self.log.error("проверка сети: %s", exc)
+            checks = [netcheck.Check("Проверка сети", netcheck.WARN, f"не выполнена: {exc}")]
+        try:
+            with actions.open_store(self.paths) as store:
+                store.set_meta(netcheck.META,
+                               netcheck.dumps(checks, started, time.time() - started))
+                store.add_event("netcheck", "проверка сети: " + netcheck.summary(checks))
+        except (OSError, sqlite3.Error) as exc:
+            self.log.error("итог проверки сети не записан: %s", exc)
 
     def _cores_card(self, snapshot: dict, now: float) -> dict:
         singbox = snapshot.get("singbox") or {}
@@ -739,17 +807,24 @@ class Panel:
             return []
         bypass = set(info["bypass"])
         mine = set(self.cfg.managed.devices)
+        routes = self.cfg.managed.routes  # свой сервер устройства (Ф4): адрес → отпечаток
+        kernel = set(self.cfg.managed.kernel_devices)  # российские адреса мимо Xray (Ф6)
+        down = engine.devices_down(self.paths)  # свой сервер не отвечает — идёт основной
         devices = [
-            {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine}
+            {**device, "bypass": device.get("ip") in bypass, "managed": device["mac"] in mine,
+             "route": routes.get(str(device.get("ip")), ""), "kernel": device.get("ip") in kernel,
+             "route_down": device.get("ip") in down}
             for device in dnsmasq.read_leases(self.paths)
         ]
         online = {device["mac"] for device in devices}
         leases, _warnings = lan.parse_leases(self.cfg)
         for lease in leases:
-            if lease.mac in mine and lease.mac not in online:
+            if (lease.mac in mine or lease.ip in routes or lease.ip in kernel) and (
+                    lease.mac not in online):
                 devices.append({
                     "mac": lease.mac, "ip": lease.ip, "name": lease.name, "expires": 0,
-                    "bypass": lease.ip in bypass, "managed": True, "offline": True,
+                    "bypass": lease.ip in bypass, "managed": lease.mac in mine, "offline": True,
+                    "route": routes.get(lease.ip, ""), "kernel": lease.ip in kernel,
                 })
         return devices
 
@@ -1349,10 +1424,152 @@ class Panel:
              "интернет напрямую",),
         )
 
+    def _set_route(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Свой сервер устройства (Ф4) или «авто» (server пуст). Адрес закрепляется
+        статической арендой, как у устройств мимо VPN; правило Xray собирает демон."""
+        mac, server = managed.normalize_mac(body.get("mac")), body.get("server")
+        if mac is None or not isinstance(server, str):
+            return actions.Outcome(2, "ожидается устройство и сервер (пусто — авто)")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        cfg = self.cfg
+        gateway = lan.gateway(cfg)
+        if not lan.lan_interface(cfg) or gateway is None:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        lease = {item.mac: item for item in lan.parse_leases(cfg)[0]}.get(mac)
+        label = (found or {}).get("name") or (lease.name if lease else "") or mac
+        if not server:
+            return self._apply_devices(
+                store_path, lambda: managed.set_route(store_path, mac, "", "", ""),
+                f"Устройство «{label}» снова идёт через основной сервер", (ROUTE_RESTART,),
+            )
+        ip = (found or {}).get("ip") or (lease.ip if lease else "")
+        listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
+        if mac in listed or ip in lan.bypass_addresses(cfg)[0]:
+            return actions.Outcome(
+                2, "Устройство идёт мимо VPN — свой сервер ему не нужен. Сначала верните его в VPN",
+            )
+        try:
+            address = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
+        if address not in gateway.network or address == gateway.ip:
+            return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        _snapshot, _xray_ok, members, spares = self._core(time.time())
+        rows, _gone = self._servers(members, spares)
+        row = next((row for row in rows if row["fingerprint"] == server
+                    and row["status"] in ("member", "spare", "waiting")), None)
+        if row is None:
+            return actions.Outcome(2, "этого сервера нет среди включённых — обновите страницу")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        return self._apply_devices(
+            store_path,
+            lambda: managed.set_route(
+                store_path, mac, str(address), name if lan.valid_hostname(name) else "", server),
+            f"Устройство «{label}» идёт через сервер «{row['name']}»",
+            ("Если этот сервер станет недоступен, устройство временно пойдёт через основной. "
+             "Российские сайты — напрямую, как у всех. Адрес устройства закрепится за ним",
+             ROUTE_RESTART),
+        )
+
     def _apply_devices(
         self, store_path: Path, change: Callable[[], bool], done: str, notes: tuple[str, ...]
     ) -> actions.Outcome:
-        previous = managed.load(store_path)[0]["devices"]
+        stored = managed.load(store_path)[0]
+        previous, routes, kernel = stored["devices"], stored["routes"], stored["kernel_devices"]
+        return self._apply_network(
+            change, lambda: managed.replace_devices(store_path, previous, routes, kernel), done,
+            notes,
+        )
+
+    def _kernel_refusal(self) -> str:
+        """Почему разгрузку Ф6 не включить (для отказа панели); пусто — можно."""
+        if self.cfg.routing.proxy_domains:
+            return ("В routing.proxy_domains есть домены: с российским адресом они ушли бы мимо "
+                    "VPN. Уберите их из config.toml или оставьте разгрузку выключенной")
+        blocker = nft.kernel_direct_blocker(self.cfg)
+        return f"Разгрузка не действует: {blocker}" if blocker else ""
+
+    def _set_kernel_device(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Российские адреса устройства — ядром мимо Xray (Ф6, пожелание заказчика из отчёта:
+        у каждого устройства свой переключатель) либо снова через Xray. Адрес закрепляется
+        статической арендой; правила nftables загружаются сразу."""
+        mac, on = managed.normalize_mac(body.get("mac")), body.get("on")
+        if mac is None or not isinstance(on, bool):
+            return actions.Outcome(2, "ожидается устройство и on: true или false")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        cfg = self.cfg
+        gateway = lan.gateway(cfg)
+        if not lan.lan_interface(cfg) or gateway is None:
+            return actions.Outcome(2, "сеть для устройств не настроена (network.lan_if)")
+        found = {device["mac"]: device for device in dnsmasq.read_leases(self.paths)}.get(mac)
+        lease = {item.mac: item for item in lan.parse_leases(cfg)[0]}.get(mac)
+        label = (found or {}).get("name") or (lease.name if lease else "") or mac
+        if not on:
+            return self._apply_devices(
+                store_path, lambda: managed.set_kernel_device(store_path, mac, "", on=False),
+                f"У устройства «{label}» российские адреса снова идут через Xray", (),
+            )
+        refusal = self._kernel_refusal()
+        if refusal:
+            return actions.Outcome(2, refusal)
+        ip = (found or {}).get("ip") or (lease.ip if lease else "")
+        listed = [host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts]
+        if mac in listed or ip in lan.bypass_addresses(cfg)[0]:
+            return actions.Outcome(2, "Устройство и так идёт мимо VPN — разгрузка ему не нужна")
+        try:
+            address = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
+        if address not in gateway.network or address == gateway.ip:
+            return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        return self._apply_devices(
+            store_path,
+            lambda: managed.set_kernel_device(
+                store_path, mac, str(address), name if lan.valid_hostname(name) else "", on=True),
+            f"У устройства «{label}» российские адреса идут напрямую, мимо Xray",
+            ("Его соединения с ними не зависят от Xray и не рвутся при его перезапуске. DNS — "
+             "по-прежнему через Xray. Адрес устройства закрепится за ним",),
+        )
+
+    def _set_kernel_direct(self, body: dict, store_path: Path) -> actions.Outcome:
+        """Российские адреса самой машины и контейнеров ядром мимо Xray (Ф6,
+        routing.kernel_direct): переключатель «Этот компьютер» в карточке «Устройства».
+        Правила nftables загружаются сразу, как при `xgw apply`."""
+        on = body.get("on")
+        if not isinstance(on, bool):
+            return actions.Outcome(2, "ожидается on: true или false")
+        problem = self.root_problem()
+        if problem:
+            return actions.Outcome(1, problem)
+        refusal = self._kernel_refusal() if on else ""
+        if refusal:
+            return actions.Outcome(2, refusal)
+        previous = managed.load(store_path)[0]["kernel_direct"]
+        if on:
+            done = "Российские адреса этого компьютера и контейнеров идут напрямую, мимо Xray"
+            notes: tuple[str, ...] = (
+                "Соединения с ними не зависят от Xray и не рвутся при его перезапуске. DNS — "
+                "по-прежнему через Xray",)
+        else:
+            done = "Российские адреса этого компьютера и контейнеров снова идут через Xray"
+            notes = ()
+        return self._apply_network(
+            lambda: managed.set_kernel_direct(store_path, on),
+            lambda: managed.set_kernel_direct(store_path, previous), done, notes,
+        )
+
+    def _apply_network(
+        self, change: Callable[[], bool], revert: Callable[[], object], done: str,
+        notes: tuple[str, ...],
+    ) -> actions.Outcome:
+        """Правка panel.json, которую сеть применяет сразу (правила nftables, DHCP); не
+        приняла — revert возвращает прежнее, и сеть применяет его."""
         if not change():
             return actions.Outcome(0, "Ничего не изменилось")
         problems: list[str] = []
@@ -1366,7 +1583,7 @@ class Panel:
                 logger=self.log, runner=self.runner,
             )
         if problems:
-            managed.replace_devices(store_path, previous)
+            revert()
             with contextlib.suppress(config.ConfigError):
                 old_cfg, _warnings = config.load(self.config_path)
                 actions.apply_network(
@@ -1447,6 +1664,12 @@ class Panel:
             return self._set_core(body, store_path)
         if name == "device":
             return self._set_device(body, store_path)
+        if name == "device/route":
+            return self._set_route(body, store_path)
+        if name == "direct":
+            return self._set_kernel_direct(body, store_path)
+        if name == "device/direct":
+            return self._set_kernel_device(body, store_path)
         if name.startswith("record/"):
             return self._record(name.removeprefix("record/"), body)
         if name.startswith("tailscale/"):
@@ -1517,6 +1740,8 @@ class Panel:
             return actions.Outcome(0, "Основной сервер выключен: сервер выбирает ядро")
         if name == "speed/one":
             return self._speed_one(body)
+        if name == "netcheck":
+            return self._netcheck_start()
         if name in ("refresh", "scan", "speed"):
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
@@ -1698,6 +1923,8 @@ class Panel:
         elif url.path == "/api/state":
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            if host != self._tailnet_host():
+                self._page_signal(handler.headers.get("X-XGW-Focus") or "")
             self._json(handler, HTTPStatus.OK, self.state(), body)
         elif url.path.startswith("/records/"):
             if not authorized:
@@ -1729,7 +1956,8 @@ class Panel:
 
     def tray_state(self) -> dict:
         """Сводка для значка: состояние шлюза, версии ядер, через какой сервер идёт трафик
-        (страна и скорость), идёт ли задание ядра, заняты ли кнопки."""
+        (страна и скорость), идёт ли задание ядра, заняты ли кнопки, сколько секунд назад
+        вкладка панели опрашивала шлюз, была в фокусе, скрылась и закрылась (None — ни разу)."""
         cfg, now = self.cfg, time.time()
         snapshot, _xray_ok, members, spares = self._core(now)
         pin = self._pin(now)
@@ -1769,7 +1997,21 @@ class Panel:
                 "speed": bool(daemon is not None and daemon.speed_pending),
             },
             "panel": address(cfg),
+            "page": {
+                name: round(time.monotonic() - moment, 1) if moment else None
+                for name, moment in self._page.items()
+            },
         }
+
+    def _page_signal(self, how: str) -> None:
+        """Опрос вкладки (X-XGW-Focus: 1 или 0) или её «скрылась» / «закрылась» (app.js)."""
+        now = time.monotonic()
+        if how in ("hidden", "closed"):
+            self._page[how] = now
+            return
+        self._page["seen"] = now
+        if how == "1":
+            self._page["focused"] = now
 
     @staticmethod
     def _read_body(handler: BaseHTTPRequestHandler) -> bytes | None:

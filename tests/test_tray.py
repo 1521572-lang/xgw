@@ -83,6 +83,50 @@ def test_the_watchdog_restarts_a_crashed_icon_and_stops_on_quit():
     assert pauses == [2.0, 4.0]
 
 
+class PageClient:
+    """Клиент панели: «page» из /api/tray по очереди (последнее повторяется)."""
+
+    def __init__(self, *pages: dict) -> None:
+        self.pages = list(pages)
+
+    def state(self) -> dict:
+        return {**STATE, "page": self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]}
+
+
+def test_open_panel_raises_a_visible_tab_instead_of_a_new_one():
+    """Заказчик: «можно сделать незаметным открытие второй вкладки?» Вкладка на экране —
+    её окно выводит KWin; новая вкладка — только если вывести некого или нечем."""
+    opened: list[str] = []
+    asked: list[bool] = []  # просили ли KWin вывести окно
+    ticks = iter(range(200))
+
+    def run(client, raised=True):
+        opened.clear()
+        asked.clear()
+        return tray.open_panel("http://p/", client, raise_it=lambda: asked.append(True) or raised,
+                               launch=opened.append, sleep=lambda _s: None,
+                               clock=lambda: next(ticks) * 0.3)
+
+    assert run(PageClient({"seen": 1.0, "focused": 1.0})) == "raised" and opened == []
+    # Не в фокусе — ждать, пока выведенная вкладка скажет о фокусе.
+    assert run(PageClient({"seen": 1.0, "focused": 40.0}, {"seen": 0.1, "focused": 0.1})) == (
+        "raised")
+    assert run(PageClient({"seen": 1.0, "focused": None})) == "opened"  # окно не нашлось
+    assert opened == ["http://p/"]
+    assert run(PageClient({"seen": 30.0, "focused": 30.0})) == "opened"  # вкладку не видно
+    assert asked == []
+    # Окно свёрнуто: вкладка скрылась после опроса — выводится, и вкладка говорит о фокусе.
+    minimized = {"seen": 60.0, "focused": 60.0, "hidden": 59.0, "closed": None}
+    assert run(PageClient(minimized, {**minimized, "seen": 0.1, "focused": 0.1})) == "raised"
+    # Вкладку закрыли — новая сразу, без попытки вывести окно.
+    assert run(PageClient({**minimized, "closed": 58.0})) == "opened" and asked == []
+    # «Скрылась» дошла на 0,2 с позже «закрылась» (испытания 25.10.2026) — тоже закрыта.
+    assert run(PageClient({**minimized, "hidden": 3.2, "closed": 3.4})) == "opened"
+    assert asked == []
+    assert run(PageClient({"seen": 1.0, "focused": 1.0}), raised=False) == "opened"  # не KDE
+    assert run(None) == "opened"  # нет файла значка
+
+
 # --- один значок на человека (испытания 25.10.2026: три установки — три значка) ---------------
 
 
@@ -125,6 +169,7 @@ def test_replace_closes_every_old_icon_watchdogs_first(tmp_path):
         "105": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "status"],
         "106": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--replace"],  # сам
         "107": [],
+        "108": ["/usr/bin/python3", "-I", "/usr/local/bin/xgw", "tray", "--open", "http://x/"],
     })
     (proc / "self").mkdir()
     assert tray.other_instances(proc, me=106) == [101, 100, 102]
@@ -285,3 +330,52 @@ def test_paths_root_keeps_the_autostart_inside_the_test_root(tmp_path):
     paths = Paths(root=tmp_path)
     assert str(paths.root / tray.AUTOSTART).startswith(str(tmp_path))
     assert json.loads(json.dumps(STATE))["main"]["country"] == "DE"
+
+
+def test_kwin_calls_are_short_and_a_hung_kwin_means_a_new_tab(tmp_path, monkeypatch):
+    """ДОП-2: каждый вызов KWin по D-Bus — не дольше tray.KWIN_TIMEOUT (1,5 с); KWin завис —
+    raise_window отвечает False, и панель открывается новой вкладкой."""
+    import subprocess
+
+    monkeypatch.setattr(tray.shutil, "which", lambda name: "/usr/bin/" + name)
+    calls: list[float] = []
+
+    def hung(argv, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    environ = {"XDG_CURRENT_DESKTOP": "KDE", "XDG_RUNTIME_DIR": str(tmp_path)}
+    assert tray.raise_window(environ, run=hung) is False
+    assert calls and all(value == tray.KWIN_TIMEOUT == 1.5 for value in calls)
+
+
+def test_quick_second_click_waits_for_the_tab_it_launched(tmp_path):
+    """Отчёт 0.2.0, шаг 10.1: два быстрых щелчка открывали две вкладки — вторая приходила, пока
+    первая грузилась. Теперь LAUNCH_HOLD с после запуска новая вкладка не открывается: щелчок
+    ждёт ту и выводит её, а закрытая после запуска вкладка удержание снимает."""
+    stamp = tmp_path / tray.OPEN_STAMP
+    opened: list[str] = []
+    now = [100.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def click(client, raised=True):
+        return tray.open_panel("http://p/", client, raise_it=lambda: raised,
+                               launch=opened.append, sleep=sleep, clock=lambda: now[0],
+                               stamp=stamp)
+
+    assert click(None) == "opened" and opened == ["http://p/"]  # вкладок не было
+    now[0] += 0.3
+    # Вкладка ещё грузится: щелчок ждёт её и, не дождавшись к концу удержания, вторую не
+    # открывает.
+    assert click(PageClient({"seen": 300.0})) == "opening" and len(opened) == 1
+    now[0] = 100.5
+    loaded = {"seen": 0.1, "focused": 0.1}
+    assert click(PageClient({"seen": 300.0}, loaded)) == "raised" and len(opened) == 1
+    now[0] = 101.0
+    assert click(PageClient(loaded), raised=False) == "opening"  # не KDE: та вкладка впереди
+    now[0] = 102.0
+    assert click(PageClient({"seen": 1.0, "closed": 0.5})) == "opened"  # её закрыли
+    now[0] += tray.LAUNCH_HOLD + 1
+    assert click(PageClient({"seen": 300.0})) == "opened" and len(opened) == 3

@@ -758,7 +758,8 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
     desktop = box.paths.desktop_file
     entry = desktop.read_text(encoding="utf-8")
     token = panel.read_token(box.paths)
-    assert "Exec=xdg-open http://127.0.0.1:8781/\n" in entry and token not in entry
+    launcher = box.paths.launcher.as_posix()
+    assert f"Exec={launcher} tray --open http://127.0.0.1:8781/\n" in entry and token not in entry
     # Браузер забыл вход — правая кнопка по ярлыку: окно пароля вместо терминала.
     assert "Actions=login;\n" in entry and "[Desktop Action login]\n" in entry
     assert "Name[ru]=Войти заново\n" in entry
@@ -1080,3 +1081,94 @@ def test_xray_counts_as_replaced_only_over_an_installed_one(box):
     assert installer.xray_replaced is False
     installer._xray(Facts(xray_version=(26, 10, 10)))
     assert installer.xray_replaced is True
+
+
+# --- доработки по аудиту и перепроверке 0.2.0 ----------------------------------------------
+
+
+def test_install_comments_out_config_lines_that_mean_nothing(box):
+    box.paths.config_file.write_text(
+        '[notify]\ndesktop = true\ntelegram_bot_token = "1:x"\n', encoding="utf-8")
+    assert box.install() == 0, box.text()
+    text = box.paths.config_file.read_text(encoding="utf-8")
+    assert '# не используется: telegram_bot_token = "1:x"' in text and "desktop = true" in text
+    assert "выключены строки" in box.text() and "notify.telegram_bot_token" in box.text()
+    assert box.paths.config_file.stat().st_mode & 0o777 == 0o600
+    box.out.clear()
+    assert box.install() == 0, box.text()
+    assert "выключены строки" not in box.text()
+
+
+@pytest.mark.parametrize("unit", ["xgw-xray.service", "xgw-singbox.service"])
+def test_core_units_are_sandboxed(unit):
+    """Ядра работают от xray; модули и параметры ядра, его журнал, часы, cgroup, свои
+    пространства имён и лишние семейства сокетов им не нужны (аудит, F-11; поведение под
+    systemd с TUN, TPROXY и всеми протоколами sing-box проверено то же)."""
+    text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
+    settings = dict(
+        line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
+    )
+    assert settings["User"] == "xray" and settings["NoNewPrivileges"] == "true"
+    for key in ("ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
+                "ProtectControlGroups", "ProtectClock", "ProtectHostname", "RestrictNamespaces",
+                "RestrictRealtime", "RestrictSUIDSGID", "LockPersonality"):
+        assert settings[key] == "yes", key
+    assert set(settings["RestrictAddressFamilies"].split()) == {
+        "AF_UNIX", "AF_NETLINK", "AF_INET", "AF_INET6"}
+    assert "PrivateDevices" not in settings  # Xray открывает /dev/net/tun
+
+
+def test_reinstall_notices_changed_service_files(box):
+    assert box.install() == 0, box.text()
+    installer = box.installer()
+    installer._units()
+    assert installer.units_changed == set()  # те же файлы — перезапускать нечего
+    for unit in ("xgw-xray.service", "xgw-singbox.service"):
+        path = box.paths.systemd_dir / unit
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "ProtectKernelTunables=yes\n", ""), encoding="utf-8")
+    installer = box.installer()
+    installer._units()
+    assert installer.units_changed == {"xgw-xray.service", "xgw-singbox.service"}
+
+
+@pytest.mark.parametrize(("changed", "mode", "restarts", "singbox"), [
+    ({"xgw-xray.service"}, "unchanged", 1, False),
+    ({"xgw-xray.service"}, "restart", 0, False),
+    ({"xgw-singbox.service"}, "unchanged", 0, True),
+    ({"xgw-singbox.service"}, "unchanged", 0, None),  # sing-box не работает
+    (set(), "unchanged", 0, False),
+])
+def test_reinstall_restarts_cores_whose_service_files_changed(
+    box, monkeypatch, changed, mode, restarts, singbox,
+):
+    """Ограничения службы действуют с запуска процесса: изменился файл службы — ядро
+    перезапускается (Xray — если его не перезапустило само применение конфига, sing-box —
+    systemctl try-restart, только если он работает)."""
+    box.system.unit("xgw-singbox.service")["active"] = singbox is not None
+    from types import SimpleNamespace
+
+    from xgw.install import engine as install_engine
+
+    restarted: list[bool] = []
+    applier = SimpleNamespace(
+        service=SimpleNamespace(restart=lambda: restarted.append(True)),
+        api=SimpleNamespace(balancer_info=lambda tag: {}),
+    )
+    assembly = SimpleNamespace(result=SimpleNamespace(nodes=[]))
+    monkeypatch.setattr(install_engine, "bypass_mark", lambda cfg, log: None)
+    monkeypatch.setattr(install_engine, "make_applier", lambda *args: applier)
+    monkeypatch.setattr(install_engine, "collect", lambda *args, **kwargs: SimpleNamespace(
+        quotas={}))
+    monkeypatch.setattr(install_engine, "assemble", lambda *args, **kwargs: assembly)
+    monkeypatch.setattr(install_engine, "apply_all", lambda *args, **kwargs: (
+        SimpleNamespace(mode=mode), None))
+    monkeypatch.setattr(install_engine, "persist", lambda *args: None)
+    installer = box.installer()
+    installer.units_changed = set(changed)
+    assert installer._first_apply() is True
+    assert len(restarted) == restarts
+    assert ("Xray перезапущен: файл его службы изменился" in box.text()) is bool(restarts)
+    tried = box.system.commands("systemctl", "try-restart", "xgw-singbox.service")
+    assert bool(tried) is bool(singbox)
+    assert ("sing-box перезапущен: файл его службы изменился" in box.text()) is bool(singbox)

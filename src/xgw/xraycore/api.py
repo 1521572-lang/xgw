@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import masking
+from ..paths import secret_tempdir
 
 
 class ApiError(Exception):
@@ -85,7 +86,8 @@ class ApiClient:
             argv.extend(["-s", self.server, "-t", str(int(self.timeout))])
             argv.extend(positionals)
             if payload is not None:
-                fd, name = tempfile.mkstemp(prefix="xgw-api-", suffix=".json")
+                fd, name = tempfile.mkstemp(prefix="xgw-api-", suffix=".json",
+                                            dir=secret_tempdir())  # в памяти: там ключи
                 tmp = Path(name)
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle, ensure_ascii=False)

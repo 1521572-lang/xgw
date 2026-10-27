@@ -71,7 +71,9 @@ def test_gateway_with_lan_and_local_capture():
         'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
         "counter reject with icmp type port-unreachable"
     )
-    assert forward[1] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
+    # MSS контейнеров в TUN — раньше «чужого форвардинга», иначе их SYN туда не дойдёт.
+    assert forward[1] == 'oifname "xgwtun0" tcp flags syn tcp option maxseg size set rt mtu'
+    assert forward[2] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
     assert "tcp flags syn tcp option maxseg size set rt mtu" in forward
     assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
     assert 'iifname "lan0" oifname != "lan0" meta l4proto icmp counter accept' in forward
@@ -762,3 +764,113 @@ def test_quic_rules_pass_nft_check(tmp_path):
                 ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, check=False,
             )
             assert result.returncode == 0, result.stderr
+
+
+def test_russian_addresses_go_past_xray_in_the_kernel(tmp_path):
+    """Ф6: сети direct_ips — в наборе direct4; к ним идут ядром мимо Xray, с QUIC, устройства
+    сети, у которых это включено (набор direct_lan4: пожелание заказчика — по устройству), и
+    сама машина с контейнерами (routing.kernel_direct); DNS — по-прежнему в Xray. Ядру уходит
+    только то, что Xray и так отправил бы напрямую. Не действует при proxy_domains, без
+    перехвата и в blocked."""
+    from test_geodat import write_geoip
+
+    geoip = write_geoip(tmp_path / "geoip.dat", {"RU": [("5.8.0.0", 13), ("5.16.0.0", 14)]})
+    cfg = _cfg(wan_if="wan0")
+    cfg.routing.direct_ips = [
+        "geoip:ru", "203.0.113.0/24", "2001:db8::/32", "geoip:!ru", "geoip:private"]
+
+    def build(**kwargs):
+        return nft.build_rules(cfg, **{"capture": True, "time_uids": (), "geoip": geoip, **kwargs})
+
+    assert build()[0].direct4 == ()  # выключено по умолчанию
+    cfg.managed.kernel_devices = ["192.168.50.20"]
+    rules, warnings = build()
+    assert rules.direct4 == ("5.8.0.0/13", "5.16.0.0/14", "203.0.113.0/24")
+    assert rules.direct_lan == ("192.168.50.20",) and not rules.direct_local
+    assert len(warnings) == 1 and "geoip:!ru" in warnings[0]  # остаётся в Xray
+    text = nft.render(rules)
+    assert "elements = { 5.8.0.0/13, 5.16.0.0/14, 203.0.113.0/24 }" in text
+    assert nft.set_elements(text, nft.DIRECT_LAN_SET) == {"192.168.50.20"}
+    direct = "ip daddr @direct4 th dport != 53 return"
+    assert f'iifname "lan0" ip saddr @direct_lan4 {direct}' in _chain(text, "prerouting")
+    assert direct not in _chain(text, "output") and direct not in _chain(text, "containers")
+    forward = _chain(text, "forward")
+    device = 'iifname "lan0" oifname "wan0" ip saddr @direct_lan4 ip daddr @direct4'
+    assert f"{device} counter accept" in forward
+    assert forward[:2] == [  # QUIC устройства к российским адресам не отбивается, прочий — да
+        f"{device} udp dport 443 counter accept",
+        'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
+        "counter reject with icmp type port-unreachable",
+    ]
+    # Сама машина с контейнерами — своим переключателем.
+    cfg.managed.kernel_devices = []
+    cfg.routing.kernel_direct = True
+    local = build()[0]
+    assert local.direct4 == rules.direct4 and local.direct_lan == () and local.direct_local
+    text_local = nft.render(local)
+    assert direct in _chain(text_local, "output") and direct in _chain(text_local, "containers")
+    assert "@direct_lan4" not in text_local and not nft.has_set(text_local, nft.DIRECT_LAN_SET)
+    assert nft.has_set(text, nft.DIRECT_SET) and not nft.has_set(_render(_cfg()), nft.DIRECT_SET)
+    assert nft.direct_digest(rules.direct4) != nft.direct_digest(rules.direct4, local=True)
+    assert nft.direct_digest(rules.direct4) != nft.direct_digest(rules.direct4[:2])
+    cfg.managed.kernel_devices = ["192.168.50.20"]
+    text = nft.render(build()[0])  # и то и другое — его проверяет nft -c ниже
+    # Домен из proxy_domains с российским адресом ушёл бы мимо VPN — разгрузки нет.
+    cfg.routing.proxy_domains = ["domain:example.ru"]
+    assert nft.kernel_direct_reason(cfg) and build()[0].direct4 == ()
+    cfg.routing.proxy_domains = []
+    assert build(capture=False)[0].direct4 == () and build(blocked=True)[0].direct4 == ()
+    # Полинтернета «напрямую» не бывает: geoip.dat испорчен или вписано лишнее.
+    cfg.routing.direct_ips = ["0.0.0.0/1"]
+    rules_all, warnings = build()
+    assert rules_all.direct4 == () and "четверти" in warnings[0]
+    if shutil.which("nft") is not None and hasattr(os, "geteuid") and os.geteuid() == 0:
+        result = subprocess.run(
+            ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+# --- поколение правил ядра (отчёт 0.2.0) -------------------------------------------------------
+
+
+def test_generation_is_parsed_from_a_netlink_reply():
+    import struct
+
+    kind = (nft.NFNL_SUBSYS_NFTABLES << 8) | nft.NFT_MSG_NEWGEN
+    attrs = struct.pack("=HH", 8, nft.NFTA_GEN_ID) + struct.pack(">I", 42)
+    attrs += struct.pack("=HH", 8, 2) + struct.pack(">I", 1234)  # NFTA_GEN_PROC_PID
+    body = struct.pack("=BBH", 0, 0, 0) + attrs
+    reply = struct.pack("=IHHII", 16 + len(body), kind, 0, 1, 0) + body
+    assert nft.parse_generation(reply) == 42
+    error = struct.pack("=IHHII", 36, nft.NLMSG_ERROR, 0, 1, 0) + struct.pack("=i", -1) + bytes(16)
+    assert nft.parse_generation(error) is None  # EPERM: нет CAP_NET_ADMIN
+    assert nft.parse_generation(reply[:10]) is None
+
+
+def test_listings_run_nft_again_only_when_the_generation_changes():
+    gen: list[int | None] = [7]
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[-1] == "missing":
+            raise CommandError("Error: No such file or directory")
+        return f"text {len(calls)}"
+
+    lister = nft.Listings(runner, lambda: gen[0])
+    table = ["nft", "-t", "list", "table", "ip", "xgw"]
+    first = lister(table)
+    assert lister(table) == first and len(calls) == 1
+    assert lister(["nft", "list", "set", "ip", "xgw", "ts_direct"]) == "text 2"
+    assert lister(["nft", "-f", "-"], input="table ip xgw {}") == "text 3"  # не чтение
+    assert lister(table) == first and len(calls) == 3
+    gen[0] = 8  # правку приняло ядро
+    assert lister(table) == "text 4"
+    for _ in range(2):  # ошибка не запоминается
+        with pytest.raises(CommandError):
+            lister(["nft", "list", "table", "ip", "missing"])
+    assert len(calls) == 6
+    gen[0] = None  # поколение не узнать — nft каждый раз, как раньше
+    assert lister(table) == "text 7" and lister(table) == "text 8"
+    assert lister.runs == 7  # запусков nft для чтения, с неудачными; nft -f сюда не входит

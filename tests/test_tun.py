@@ -33,7 +33,7 @@ def test_ensure_creates_a_persistent_interface_with_an_address(tmp_path):
     assert ("ip", "link", "set", "dev", NAME, "mtu", "1500", "up") in kernel.calls
     # Без адреса ядро отбрасывает ответы Xray (rp_filter), поэтому адрес обязателен.
     assert ("ip", "addr", "replace", "169.254.10.1/32", "dev", NAME) in kernel.calls
-    assert (conf / "rp_filter").read_text().strip() == "0"
+    assert (conf / "rp_filter").read_text().strip() == "2"  # мягкая и при строгом conf.all
     # Повторно: интерфейс не пересоздаётся (его держит открытым Xray).
     assert tun.ensure(NAME, kernel, tmp_path) is False
     assert len(kernel.commands("ip", "tuntap", "add")) == 1

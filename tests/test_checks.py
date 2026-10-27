@@ -317,6 +317,8 @@ class TlsOrigin(threading.Thread):
             for step in self.script:
                 if isinstance(step, bytes):
                     tls.sendall(step)
+                elif step == "read":  # следующий запрос в том же соединении
+                    self.second = tls.recv(65536)
                 else:
                     time.sleep(step)
             tls.close()
@@ -480,3 +482,28 @@ def test_https_waits_longer_than_a_slice_with_a_cancel_event(tls_files):
     )
     assert result.ok, result.error
     assert result.downloaded == BODY
+
+
+def test_rtt_is_a_second_request_on_the_open_connection(tls_files):
+    """0.2.0, п. 2.3: после загрузки по https тем же соединением уходит HEAD — его время и
+    есть сетевая задержка (rtt_ms), без рукопожатий и файла. Сервер закрыл соединение после
+    первого ответа — RTT нет, а проба всё равно удачная."""
+    cert, key = tls_files
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    keep = HEADERS.replace(b"Connection: close\r\n", b"")
+    origin = TlsOrigin(cert, key, [keep + b"x" * BODY, "read", 0.05, head])
+    proxy = ConnectProxy(origin.port)
+    context = ssl.create_default_context(cafile=str(cert))
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{origin.port}/big",
+        timeout=5, silence=2, tls_context=context, rtt=True,
+    )
+    assert result.ok and result.rtt_ms is not None and 40 <= result.rtt_ms < 2000
+    assert origin.second.startswith(b"HEAD /big HTTP/1.1")
+    closing = TlsOrigin(cert, key, [HEADERS + b"x" * BODY])
+    proxy = ConnectProxy(closing.port)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, f"https://localhost:{closing.port}/big",
+        timeout=5, silence=2, tls_context=context, rtt=True,
+    )
+    assert result.ok and result.rtt_ms is None

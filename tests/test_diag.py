@@ -324,9 +324,15 @@ def test_tun_needs_the_device_and_a_loose_reverse_path_filter(box, tmp_path):
     strict = box.diag()._tun()
     assert [c.level for c in strict] == [OK, WARN]
     assert "rp_filter" in strict[1].text and "rp_filter=2" in strict[1].advice
-    (proc / "net/ipv4/conf/all/rp_filter").write_text("2\n")
-    (proc / "net/ipv4/conf/xgwtun0/rp_filter").write_text("1\n")  # строгий и на самом интерфейсе
+    # Ядро берёт наибольшее из conf.all и значения интерфейса: 2 у TUN (его ставит XGW)
+    # делает проверку мягкой и при строгом conf.all.
+    (proc / "net/ipv4/conf/xgwtun0/rp_filter").write_text("2\n")
+    assert [c.level for c in box.diag()._tun()] == [OK]
+    (proc / "net/ipv4/conf/all/rp_filter").write_text("0\n")
+    (proc / "net/ipv4/conf/xgwtun0/rp_filter").write_text("1\n")  # строгий у самого интерфейса
     assert [c.level for c in box.diag()._tun()] == [OK, WARN]
+    (proc / "net/ipv4/conf/all/rp_filter").write_text("2\n")
+    assert [c.level for c in box.diag()._tun()] == [OK]  # max(2, 1) = 2 — мягкая
 
     box.cfg.capture.method = "tproxy"  # не TUN — проверок нет
     assert box.diag()._tun() == []
@@ -525,7 +531,7 @@ def test_network_probes(box, monkeypatch):
     assert "напрямую не скачивается" in box.diag()._probe()[0].text
 
     answers = {"https://1.1.1.1/dns-query": True, "https://8.8.8.8/dns-query": True,
-               "udp://77.88.8.8": True}
+               "tls://77.88.8.8": True}
     box.cfg.dns.bootstrap_extra = []  # дополнительные резолверы (0.1.18) — в своём тесте
 
     def resolve(name, resolvers, mark=None):

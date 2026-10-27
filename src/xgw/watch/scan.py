@@ -30,6 +30,11 @@ CHEAP_SCAN_BYTES = 8_000
 # по RESERVE_CANDIDATES лучших (daemon.Daemon._reserve_step).
 RESERVE_RECHECK = 6 * 3600.0
 RESERVE_CANDIDATES = 3
+# Свой сервер устройства — запасной — проверяется дешёвым запросом раз в DEVICE_CHECK, а RTT
+# участников — раз в RTT_EVERY (daemon.Daemon._device_step, _rtt_step; 0.2.0). Здесь — чтобы
+# их учитывал и бюджет проверок (status.probe_budget).
+DEVICE_CHECK = 30.0
+RTT_EVERY = 600.0
 
 
 def cheap_url(cfg: Config) -> str:
@@ -48,6 +53,7 @@ class ScanResult:
     # отвечает сам адрес пробы» от «не работает сервер» (watch/target.py).
     kind: str = ""
     status: int = 0
+    rtt_ms: float | None = None  # сетевая задержка (checks.DownloadResult.rtt_ms)
 
 
 def classify(result: DownloadResult, seconds: float, slow: float = SLOW_SECONDS) -> str:
@@ -93,6 +99,7 @@ def scan_node(
         proxy_pass=probe_pass,
         user_agent=cfg.probe.user_agent,
         cancel=cancel,
+        rtt=True,
     )
     seconds = time.monotonic() - started
     return ScanResult(
@@ -103,6 +110,7 @@ def scan_node(
         error=result.error,
         kind=result.kind,
         status=result.status,
+        rtt_ms=result.rtt_ms,
     )
 
 

@@ -275,31 +275,52 @@ class Routing:
     )
     direct_ips: list[str] = field(default_factory=lambda: ["geoip:ru"])
     proxy_domains: list[str] = field(default_factory=list)
+    # Адреса из direct_ips (geoip:ru и сети) — напрямую ядром, мимо Xray (Ф6, net/nft.py): у
+    # самой машины и контейнеров; устройства сети включаются по одному в панели
+    # (managed.kernel_devices). При непустом proxy_domains не действует: домен с российским
+    # адресом ушёл бы мимо VPN.
+    kernel_direct: bool = False
     conn_idle_s: int = 120
     home_country: str = "RU"
 
 
-# Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a): другие операторы и адреса,
-# а Quad9 — на нестандартном порту 5053. Проверены 24.10.2026 по IP: AdGuard и DNS.SB отвечают;
-# порт 5053 из сети разработки не ответил — его проверит монитор на самом шлюзе.
+# Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a; 0.2.0): другие операторы и
+# адреса. Яндекс и Quad9 — по DNS-over-TLS (tls://, порт 853): по IP их DoH отвечает только по
+# HTTP/2, а клиент XGW (стандартная библиотека) говорит HTTP/1.1 — проверено 26.10.2026, как и
+# сертификаты по IP у всех четырёх. Яндекс здесь и в bootstrap: у конфига со своим списком
+# bootstrap (из прежнего примера, с udp://77.88.8.8) шифрованный российский резолвер тоже есть.
+DEFAULT_BOOTSTRAP = (
+    "https://1.1.1.1/dns-query",
+    "https://8.8.8.8/dns-query",
+    "tls://77.88.8.8",
+)
 DEFAULT_BOOTSTRAP_EXTRA = (
+    "tls://77.88.8.8",
+    "https://94.140.14.140/dns-query",
+    "https://185.222.222.222/dns-query",
+    "tls://9.9.9.11",
+)
+# Прежние умолчания (до 0.2.0): такой список в конфиге — копия примера, а не выбор человека, и
+# заменяется нынешним умолчанием (_modernize_dns). Обычный UDP к 77.88.8.8 провайдер
+# перехватывает и подменяет ответ на имя из реестра блокировок.
+OLD_DEFAULT_BOOTSTRAP = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "udp://77.88.8.8"]
+OLD_DEFAULT_BOOTSTRAP_EXTRA = [
     "https://94.140.14.140/dns-query",
     "https://185.222.222.222/dns-query",
     "https://9.9.9.9:5053/dns-query",
-)
+]
+# DNS для direct_domains в конфиге Xray: DoH Яндекса по IP — запрос идёт выходом direct, как
+# и обычный UDP раньше, но провайдер его не подменит (Xray говорит DoH по HTTP/2; проверено
+# на Xray 26.10.21). До 0.2.0 — обычный UDP к тому же адресу.
+DEFAULT_DIRECT_DNS = "https://77.88.8.8/dns-query"
+OLD_DEFAULT_DIRECT_SERVERS = ["77.88.8.8"]
 
 
 @dataclass
 class Dns:
     proxy_servers: list[str] = field(default_factory=lambda: ["1.1.1.1", "8.8.8.8"])
-    direct_servers: list[str] = field(default_factory=lambda: ["77.88.8.8"])
-    bootstrap: list[str] = field(
-        default_factory=lambda: [
-            "https://1.1.1.1/dns-query",
-            "https://8.8.8.8/dns-query",
-            "udp://77.88.8.8",
-        ]
-    )
+    direct_servers: list[str] = field(default_factory=lambda: [DEFAULT_DIRECT_DNS])
+    bootstrap: list[str] = field(default_factory=lambda: list(DEFAULT_BOOTSTRAP))
     # Дополнительные резолверы — после bootstrap; монитор проверяет все раз в
     # bootstrap_check_minutes (итог — в diag и событиях), а отказавшие резолвер пробует
     # последними.
@@ -407,12 +428,21 @@ class Managed:
     # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
     # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
     devices: list[str] = field(default_factory=list)
+    # Устройства со своим сервером (Ф4): адрес IPv4 → отпечаток сервера. Аренда добавлена из
+    # panel.json; остальные устройства — через основной сервер.
+    routes: dict[str, str] = field(default_factory=dict)
+    # Устройства, чьи соединения с российскими адресами идут ядром мимо Xray (Ф6): адреса
+    # IPv4, аренда добавлена из panel.json.
+    kernel_devices: list[str] = field(default_factory=list)
     # Приоритет серверов: отпечаток → "high" или "low"; остальные — средние (priority.py).
     priority: dict[str, str] = field(default_factory=dict)
     # Ядро, закреплённое за сервером: отпечаток → "xray" или "sing-box"; остальные — auto.
     core: dict[str, str] = field(default_factory=dict)
     # Основной сервер включён или выключен в панели (speed.sticky); None — как в config.toml.
     sticky: bool | None = None
+    # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
+    # (routing.kernel_direct); None — как в config.toml.
+    kernel_direct: bool | None = None
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -534,17 +564,25 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.core = dict(data["core"])
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
+    if data["kernel_direct"] is not None:
+        cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
     if data["tailscale"]["route"] is not None:
         cfg.tailscale.route = cfg.managed.tailscale_route = data["tailscale"]["route"]
     warnings.extend(_merge_devices(cfg, data["devices"]))
+    warnings.extend(_merge_devices(cfg, data["routes"], routes=True))
+    warnings.extend(_merge_devices(cfg, data["kernel_devices"], kernel=True))
     return warnings
 
 
-def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
-    """Устройства мимо VPN из панели: статическая аренда и запись в bypass_hosts.
+def _merge_devices(
+    cfg: Config, devices: list[dict], *, routes: bool = False, kernel: bool = False,
+) -> list[str]:
+    """Устройства из панели: статическая аренда и запись в bypass_hosts (мимо VPN), в
+    managed.routes (routes — свой сервер) либо в managed.kernel_devices (kernel — российские
+    адреса мимо Xray). Устройству мимо VPN ни то, ни другое не нужно: в Xray оно не попадает.
 
     То, что уже есть в config.toml, главнее: совпадающую аренду не дублируем, а
     конфликтующую (тот же MAC с другим адресом или тот же адрес у другого MAC)
@@ -559,8 +597,8 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
     listed = {host.strip().lower().replace("-", ":") for host in cfg.network.bypass_hosts}
     for device in devices:
         mac, ip, name = device["mac"], device["ip"], device["name"]
-        if mac in listed:
-            continue  # уже мимо VPN по config.toml — панель этим не управляет
+        if mac in listed or ((routes or kernel) and ip in listed):
+            continue  # уже мимо VPN (MAC или адрес в bypass_hosts) — в Xray не попадает
         if lease_ip.get(mac, ip) != ip or any(
             other != mac and taken == ip for other, taken in lease_ip.items()
         ):
@@ -572,6 +610,12 @@ def _merge_devices(cfg: Config, devices: list[dict]) -> list[str]:
         if mac not in lease_ip:
             cfg.network.static_leases.append(f"{mac},{ip}" + (f",{name}" if name else ""))
             lease_ip[mac] = ip
+        if routes:
+            cfg.managed.routes[ip] = device["server"]
+            continue
+        if kernel:
+            cfg.managed.kernel_devices.append(ip)
+            continue
         cfg.network.bypass_hosts.append(mac)
         listed.add(mac)
         cfg.managed.devices.append(mac)
@@ -593,10 +637,74 @@ def probe_bytes(url: str) -> int | None:
 
 
 # Ключи прежних версий, которые больше ничего не значат: в config.toml у заказчика они
-# остаются, предупреждение объясняет почему, а не называет их «неизвестными».
+# остаются, предупреждение объясняет почему, а не называет их «неизвестными». Установка
+# выключает такие строки сама (retire_obsolete).
 _DROPPED = {
     "notify": ("telegram_bot_token", "telegram_chat_id", "commands", "telegram_api"),
 }
+_TABLE = re.compile(r"^[ \t]*\[[ \t]*([A-Za-z0-9_.-]+)[ \t]*\][ \t]*(#.*)?$")
+_ARRAY_TABLE = re.compile(r"^[ \t]*\[\[")
+_BARE_KEY = re.compile(r"^[ \t]*([A-Za-z0-9_-]+)[ \t]*=")
+
+
+def _version_ignored(value: str) -> bool:
+    """xray.version, о котором предупреждает _validate: «не учитывается»."""
+    return value.strip().lstrip("vV") != XRAY_VERSION and value.strip() not in ("", "latest")
+
+
+def retire_obsolete(text: str) -> tuple[str, list[str]]:
+    """Выключает (комментирует) в тексте config.toml строки, о которых XGW предупреждает при
+    каждом запуске, хотя они ничего не значат: Telegram (_DROPPED) и xray.version другой
+    версии. Заказчик файлы не правит, а предупреждения в каждом `xgw status` мешают (отчёт
+    перепроверки 0.2.0, наблюдение 3). Значения остаются в комментарии — ничего не теряется.
+
+    Возвращает новый текст и имена выключенных ключей. Трогаются только строки `ключ = …` в
+    своей таблице; итог проверяется разбором TOML — он должен совпасть с прежним без этих
+    ключей. Не совпал (значение в несколько строк, ключ в кавычках, таблица в строку) — текст
+    остаётся как был, предупреждение — тоже."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return text, []
+    wanted: set[tuple[str, str]] = set()
+    for section, names in _DROPPED.items():
+        table = data.get(section)
+        if isinstance(table, dict):
+            wanted.update((section, name) for name in names if name in table)
+    xray = data.get("xray")
+    if isinstance(xray, dict) and isinstance(xray.get("version"), str) and _version_ignored(
+            xray["version"]):
+        wanted.add(("xray", "version"))
+    if not wanted:
+        return text, []
+    section: str | None = ""
+    retired: list[tuple[str, str]] = []
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        header = _TABLE.match(line.rstrip("\r\n"))
+        if _ARRAY_TABLE.match(line):
+            section = None
+        elif header:
+            section = header.group(1)
+        else:
+            key = _BARE_KEY.match(line)
+            if key and section is not None and (section, key.group(1)) in wanted:
+                stripped = line.lstrip(" \t")
+                lines.append(f"# не используется: {stripped}")
+                retired.append((section, key.group(1)))
+                continue
+        lines.append(line)
+    changed = "".join(lines)
+    expected = {name: dict(value) if isinstance(value, dict) else value
+                for name, value in data.items()}
+    for section_name, name in retired:
+        expected[section_name].pop(name, None)
+    try:
+        if tomllib.loads(changed) != expected or len(retired) != len(wanted):
+            return text, []
+    except tomllib.TOMLDecodeError:
+        return text, []
+    return changed, [f"{section_name}.{name}" for section_name, name in retired]
 
 
 def _build_section(cls, data: object, section: str, warnings: list[str]):
@@ -665,6 +773,22 @@ def _validate_core(core: CoreSection) -> list[str]:
         )
         core.api_port = defaults.api_port
     return warnings
+
+
+def service_ports(cfg: Config) -> dict[str, int]:
+    """Порты на 127.0.0.1, которые слушают сам XGW и его ядра (кроме проверок Xray и мостов
+    sing-box — они раздаются по порядку). Их не занимают ни probe-inbounds Xray, ни входы
+    sing-box: иначе ядро не запустилось бы с «address already in use» (аудит, F-04)."""
+    return {
+        "capture.tproxy_port": cfg.capture.tproxy_port,
+        "xray.api_port": cfg.xray.api_port,
+        "xray.metrics_port": cfg.xray.metrics_port,
+        "xray.socks_port": cfg.xray.socks_port,
+        "xray.http_port": cfg.xray.http_port,
+        "panel.port": cfg.panel.port,
+        "panel.app_port": cfg.panel.app_port,
+        "core.api_port": cfg.core.api_port,
+    }
 
 
 def _validate(cfg: Config) -> list[str]:
@@ -800,15 +924,7 @@ def _validate(cfg: Config) -> list[str]:
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))
     warnings.extend(_validate_hosts(cfg))
-    listening = {
-        "tproxy": cfg.capture.tproxy_port,
-        "api": cfg.xray.api_port,
-        "metrics": cfg.xray.metrics_port,
-        "socks": cfg.xray.socks_port,
-        "http": cfg.xray.http_port,
-        "panel": cfg.panel.port,
-    }
-    listening["core.api_port"] = cfg.core.api_port
+    listening = service_ports(cfg)
     ports = list(listening.values()) + [
         cfg.xray.probe_port_base + i for i in range(cfg.filters.max_members + 8)
     ]
@@ -950,6 +1066,18 @@ def _host_port(entry: str) -> bool:
     return bool(sep and host and port.isdigit() and 0 < int(port) < 65536)
 
 
+def _modernize_dns(dns: Dns) -> None:
+    """Списки DNS, совпадающие с прежними умолчаниями (до 0.2.0), — на нынешние: их не
+    выбирали, а скопировали из примера конфига. Свои списки человека не трогаются; udp:// в
+    них для доменов подписок всё равно не спрашивается (fetch.fetch_subscription)."""
+    if [entry.strip() for entry in dns.bootstrap] == OLD_DEFAULT_BOOTSTRAP:
+        dns.bootstrap = list(DEFAULT_BOOTSTRAP)
+    if [entry.strip() for entry in dns.bootstrap_extra] == OLD_DEFAULT_BOOTSTRAP_EXTRA:
+        dns.bootstrap_extra = list(DEFAULT_BOOTSTRAP_EXTRA)
+    if [entry.strip() for entry in dns.direct_servers] == OLD_DEFAULT_DIRECT_SERVERS:
+        dns.direct_servers = [DEFAULT_DIRECT_DNS]
+
+
 def _validate_hosts(cfg: Config) -> list[str]:
     """probe.urls, watchdog.wan_checks, dns.bootstrap_extra и пределы других ключей 0.1.18:
     негодная запись пропускается с предупреждением, а не ломает остальные."""
@@ -976,12 +1104,14 @@ def _validate_hosts(cfg: Config) -> list[str]:
         elif entry.strip() not in checks and entry.strip() != cfg.watchdog.wan_check.strip():
             checks.append(entry.strip())
     cfg.watchdog.wan_checks = checks
+    _modernize_dns(cfg.dns)
     extra: list[str] = []
     for entry in cfg.dns.bootstrap_extra:
         entry = entry.strip()
-        if not entry.startswith(("https://", "udp://")):
+        if not entry.startswith(("https://", "tls://", "udp://")):
             warnings.append(
-                f"dns.bootstrap_extra: «{entry}» — ожидается https://… или udp://…; пропущен"
+                f"dns.bootstrap_extra: «{entry}» — ожидается https://…, tls://… или udp://…; "
+                "пропущен"
             )
         elif entry not in extra:
             extra.append(entry)

@@ -53,15 +53,33 @@ TPROXY, что и LAN; устройства из набора ts_exit_direct (п
 форвардингом с маскарадингом, остальное в форвардинг не пускается. В blocked такой трафик
 отбивается, кроме ts_exit_direct. IPv6 через выходной узел закрыт (LAN IPv6 тоже не
 получает): иначе он ушёл бы мимо VPN.
+
+Российские адреса мимо Xray (Ф6): сети из routing.direct_ips (geoip:ru — из geoip.dat самого
+Xray) лежат в наборе direct4, и TCP/UDP к ним идёт напрямую ядром — как через обычный роутер, с
+QUIC, — а не через Xray и его выход direct. Включается отдельно у самой машины с контейнерами
+(routing.kernel_direct) и у каждого устройства сети (панель; их адреса — в наборе
+direct_lan4). DNS (порт 53) по-прежнему перехватывается. В Xray доменные
+правила проверяются раньше IP, поэтому при непустом proxy_domains разгрузка не включается:
+домен из него с российским адресом ушёл бы мимо VPN. Режим blocked её не знает (DNS там
+закрыт, и пользы нет), устройства tailnet идут через Xray, как раньше.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
+import hashlib
 import ipaddress
 import re
+import socket
+import struct
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
 
+from .. import geodat
 from .. import tailscale as ts
 from ..config import Config
 from . import lan
@@ -95,6 +113,11 @@ TIME_USERS = ("_chrony", "systemd-timesync")
 # имени nftables; в правилах ufw (iptables) ей соответствует «+».
 CONTAINER_IFS = ("docker0", "br-*")
 NTS_KE_PORT = 4460  # chrony с NTS сначала получает ключи по TCP
+DIRECT_SET = "direct4"  # сети, куда трафик идёт ядром мимо Xray (Ф6)
+DIRECT_LAN_SET = "direct_lan4"  # устройства сети, чьи соединения с ними идут ядром
+# Больше этого (четверть IPv4) «напрямую» не бывает: geoip.dat испорчен или в direct_ips
+# вписано лишнее — разгрузка не включается, иначе мимо VPN ушла бы большая часть интернета.
+DIRECT_MAX = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -144,6 +167,11 @@ class Rules:
     ts_exit_direct: tuple[str, ...] = ()
     # QUIC (UDP/443) в интернет отбивается (network.block_quic): браузер уходит на TCP.
     block_quic: bool = False
+    # Сети, куда ходят ядром мимо Xray (Ф6): устройства сети из direct_lan и (direct_local,
+    # routing.kernel_direct) сама машина с контейнерами. Пусто — разгрузки нет ни у кого.
+    direct4: tuple[str, ...] = ()
+    direct_lan: tuple[str, ...] = ()
+    direct_local: bool = False
 
     @property
     def ts4(self) -> bool:
@@ -213,18 +241,31 @@ def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
-    ts_fallback: bool = False,
+    ts_fallback: bool = False, geoip: Path | None = None,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
     tailscale — исключения Т1 для tailscaled (он работает, а машина перехватывается);
     xray_down — Xray не отвечает (для route = "vpn"); tailnet — tailscaled работает
     (выходной узел); ts_fallback — DERP напрямую не отвечает, и tailscaled идёт через Xray
-    и при route = "direct" (ТЗ R4b)."""
+    и при route = "direct" (ТЗ R4b); geoip — geoip.dat Xray для набора direct4 (Ф6; None —
+    без разгрузки)."""
     capture = capture and not blocked
     warnings: list[str] = []
     name = cfg.network.lan_if.strip()
     lan_if = lan.lan_interface(cfg)
+    direct: tuple[str, ...] = ()
+    direct_lan: tuple[str, ...] = ()
+    direct_local = False
+    if capture and geoip is not None and not kernel_direct_reason(cfg):
+        direct_lan = tuple(cfg.managed.kernel_devices) if lan_if and cfg.capture.lan else ()
+        direct_local = cfg.routing.kernel_direct and (
+            cfg.capture.local or containers_wanted(cfg))
+        if direct_lan or direct_local:
+            direct, direct_warnings = direct_networks(cfg, geoip)
+            warnings.extend(direct_warnings)
+        if not direct:
+            direct_lan, direct_local = (), False
     if name and not lan_if:
         warnings.append(f"network.lan_if={name!r}: недопустимое имя интерфейса — LAN не настроен")
     wan_name = cfg.network.wan_if.strip()
@@ -297,9 +338,98 @@ def build_rules(
             ts_block=tailnet and blocked,
             ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
             block_quic=capture and cfg.network.block_quic,
+            direct4=direct,
+            direct_lan=direct_lan,
+            direct_local=direct_local,
         ),
         warnings,
     )
+
+
+def kernel_direct_reason(cfg: Config) -> str:
+    """Почему российские адреса не идут ядром мимо Xray ни у кого; пусто — у кого включено,
+    у того идут."""
+    if not cfg.routing.kernel_direct and not cfg.managed.kernel_devices:
+        return "выключено"
+    return kernel_direct_blocker(cfg)
+
+
+def kernel_direct_blocker(cfg: Config) -> str:
+    """Что мешает разгрузке, даже если её включить (панель отказывает с этим текстом);
+    пусто — ничего."""
+    if cfg.routing.proxy_domains:
+        return ("в routing.proxy_domains есть домены — с российским адресом они ушли бы мимо "
+                "VPN")
+    if not cfg.routing.direct_ips:
+        return "routing.direct_ips пуст"
+    return ""
+
+
+def direct_networks(cfg: Config, geoip: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Сети IPv4 из routing.direct_ips для набора direct4 и предупреждения. geoip:<страна> —
+    из geoip.dat Xray, адреса и сети — как есть. Чего ядру не передать (geoip:private —
+    частные сети и так мимо Xray; IPv6; geoip:!…, ext:…), остаётся в Xray: в ядро идёт только
+    то, что Xray и так отправил бы напрямую. Правила собираются на каждом шаге демона, а
+    geoip.dat меняется редко — итог помнится до смены файла или списка."""
+    try:
+        info = geoip.stat()
+        stamp: tuple[int, int] | None = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        stamp = None
+    return _direct_networks(tuple(cfg.routing.direct_ips), str(geoip), stamp)
+
+
+@functools.lru_cache(maxsize=4)
+def _direct_networks(
+    entries: tuple[str, ...], geoip: str, _stamp: tuple[int, int] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    networks: list[ipaddress.IPv4Network] = []
+    warnings: list[str] = []
+    for entry in entries:
+        item = entry.strip()
+        kept = f"«{item}» остаётся в Xray"
+        if item.lower().startswith("geoip:"):
+            code = item[len("geoip:"):]
+            if code.lower() == "private":
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", code):
+                warnings.append(f"routing.direct_ips: ядру не передать — {kept}")
+                continue
+            try:
+                found = geodat.cidrs(Path(geoip), code)
+            except geodat.GeoError as exc:
+                warnings.append(f"российские адреса мимо Xray: {exc} — {kept}")
+                continue
+            if not found:
+                warnings.append(f"routing.direct_ips: такой страны в geoip.dat нет — {kept}")
+            networks.extend(found)
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            warnings.append(f"routing.direct_ips: ядру не передать — {kept}")
+            continue
+        if isinstance(network, ipaddress.IPv4Network):
+            networks.append(network)
+    collapsed = list(ipaddress.collapse_addresses(networks))
+    total = sum(network.num_addresses for network in collapsed)
+    if total > DIRECT_MAX:
+        return (), (f"российские адреса мимо Xray не включены: в routing.direct_ips {total} "
+                    "адресов — больше четверти IPv4",)
+    return tuple(str(network) for network in collapsed), tuple(warnings)
+
+
+def direct_digest(networks: tuple[str, ...], local: bool = False) -> str:
+    """Отпечаток набора direct4 и разгрузки самой машины (local): по нему сверка
+    (Capture.loaded) видит, что загружено не то (сменились geoip.dat или direct_ips,
+    переключили машину), не разбирая тысячи сетей вывода nft."""
+    text = "\n".join(networks) + ("\nlocal" if local else "")
+    return hashlib.sha256(text.encode("ascii")).hexdigest()[:16]
+
+
+def has_set(text: str, name: str) -> bool:
+    """В тексте `nft list table` есть набор name."""
+    return re.search(rf"^\s*set {name} \{{", text, flags=re.MULTILINE) is not None
 
 
 def containers_wanted(cfg: Config) -> bool:
@@ -308,9 +438,14 @@ def containers_wanted(cfg: Config) -> bool:
 
 
 def _dns_direct(cfg: Config) -> str:
-    """Первый из direct_servers, записанный адресом IPv4 (с портом или без)."""
+    """Первый из direct_servers, записанный адресом IPv4 (с портом или без). Запись DoH
+    («https://77.88.8.8/dns-query») даёт его адрес и порт 53: правило DNAT шлёт туда обычный
+    DNS тех, кого Xray не обслуживает (bypass_hosts, сеть после xgw disable)."""
     for entry in cfg.dns.direct_servers:
-        address, sep, port = entry.strip().rpartition(":")
+        entry = entry.strip()
+        if "://" in entry:
+            entry = urlsplit(entry).hostname or ""
+        address, sep, port = entry.rpartition(":")
         if not (sep and port.isdigit()):
             address, port = entry.strip(), ""
         try:
@@ -412,6 +547,14 @@ def render(rules: Rules) -> str:
         blocks.append(_ts_set(rules))
     if rules.ts_forward:
         blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
+    if rules.direct4:
+        blocks.append(_set(DIRECT_SET, rules.direct4))
+    if rules.direct_lan:
+        blocks.append(_set(DIRECT_LAN_SET, rules.direct_lan, interval=False))
+    # Российские адреса (Ф6) — мимо Xray; DNS к ним перехватывается, как всякий.
+    to_direct = f"ip daddr @{DIRECT_SET} th dport != 53 return"
+    direct = [to_direct] if rules.direct_local else []
+    from_direct = f"ip saddr @{DIRECT_LAN_SET} ip daddr @{DIRECT_SET}"
 
     tproxy = (
         "meta l4proto { tcp, udp } counter "
@@ -427,6 +570,7 @@ def render(rules: Rules) -> str:
                 "    ct direction reply return",
                 "    fib daddr type local return",
                 "    ip daddr @reserved4 th dport != 53 return",
+                *(f"    {rule}" for rule in direct),
                 f"    meta l4proto {{ tcp, udp }} counter meta mark set {rules.mark_containers:#x}",
                 "}",
             ])
@@ -456,6 +600,10 @@ def render(rules: Rules) -> str:
                 "fib daddr type local th dport != 53 return",
                 "ip daddr @reserved4 th dport != 53 return",
             ]
+            if rules.capture_lan and rules.direct_lan:
+                # Устройства с разгрузкой — к российским адресам напрямую: их пропустит forward.
+                # Машина сюда с ними не доходит (output их не метит), tailnet — через Xray.
+                prerouting.append(f'iifname "{lan_if}" ip saddr @{DIRECT_LAN_SET} {to_direct}')
             if rules.block_quic and (rules.capture_lan or rules.ts_exit):
                 # QUIC устройств — не в Xray: его отобьёт forward (reject в prerouting нельзя).
                 # QUIC самой машины сюда не доходит: его отбивает loopback_guard ещё на выходе.
@@ -476,6 +624,7 @@ def render(rules: Rules) -> str:
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
             "ip daddr @reserved4 th dport != 53 return",
+            *direct,
             "udp sport 68 return",  # DHCP-клиент WAN
         ]
         for uid in rules.time_uids:
@@ -533,8 +682,14 @@ def render(rules: Rules) -> str:
                     ],
                 )
             )
-        quic = [f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}'] if (
-            rules.block_quic and rules.capture_lan) else []
+        quic: list[str] = []
+        if rules.block_quic and rules.capture_lan:
+            if rules.direct_lan:
+                # QUIC устройств с разгрузкой к российским адресам (Ф6) идёт напрямую, как
+                # через обычный роутер: отбой нужен только трафику через Xray (дробление
+                # ClientHello). Одним правилом отбоя «кроме устройства и сети» не сказать.
+                quic.append(f'iifname "{lan_if}" {out} {from_direct} udp dport 443 counter accept')
+            quic.append(f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}')
         if rules.block_quic and rules.ts_exit:
             quic.append(
                 f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
@@ -544,6 +699,11 @@ def render(rules: Rules) -> str:
             *quic,
             # Выходной узел tailnet — раньше «чужого форвардинга» (tailscale0 — не LAN).
             *(_ts_exit_forward(rules, ts_reject) if rules.ts_exit else []),
+            # Контейнеры → TUN: MSS по MTU маршрута в TUN — до правила «чужой форвардинг»,
+            # иначе их SYN туда не дошёл бы (п. 1.3 рекомендаций к аудиту 0.1.18). При MTU TUN
+            # 1500 (net/tun.py) MSS не меняется; правило — на случай другого MTU.
+            *([f'oifname "{rules.tun_name}" tcp flags syn tcp option maxseg size set rt mtu']
+              if rules.containers and rules.tun_name else []),
             # Чужой форвардинг (Docker, libvirt) — не наше дело.
             f'iifname != "{lan_if}" oifname != "{lan_if}" accept',
             "tcp flags syn tcp option maxseg size set rt mtu",  # PPPoE у провайдера
@@ -551,6 +711,8 @@ def render(rules: Rules) -> str:
         ]
         if rules.capture_lan:
             forward.append(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept')
+            if rules.direct_lan:
+                forward.append(f'iifname "{lan_if}" {out} {from_direct} counter accept')
             if rules.forward_icmp:
                 forward.append(f'iifname "{lan_if}" {out} meta l4proto icmp counter accept')
         else:
@@ -831,15 +993,44 @@ def ts_elements(rules: Rules) -> str:
     return "".join(line + "\n" for line in lines)
 
 
-def listing(runner: Runner, family: str = "ip", table: str = TABLE) -> str | None:
-    """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft)."""
+# Наборы, элементы которых сверяет проверка правил (capture.loaded, tailscale_loaded): в них
+# единицы адресов, и читаются они отдельно — таблица целиком читается коротко (listing terse).
+CHECKED_SETS = (DIRECT_LAN_SET, TS_EXIT_SET, TS_SET)
+
+
+def listing(
+    runner: Runner, family: str = "ip", table: str = TABLE, *, terse: bool = False,
+    sets: tuple[str, ...] = (),
+) -> str | None:
+    """Текст `nft list table`; "" — таблицы нет, None — узнать не удалось (нет прав или nft).
+
+    terse — без элементов именованных наборов (`nft -t`): в direct4 их десятки тысяч, и
+    полный вывод — около 0,9 МБ текста (п. 2.1 рекомендаций к аудиту 0.1.18). Цепочки, правила
+    и безымянные наборы внутри правил (`iifname { "docker0", "br-*" }`) вывод сохраняет —
+    проверено на nft 1.1.6. Время это экономит только с nft 1.1.x (11 мс против 156 на 20 000
+    сетей): nft 1.0.9 из Ubuntu 24.04 элементы из ядра всё равно забирает — 765 мс против 901
+    (отчёт 0.2.0), — поэтому проверки демона ходят через Listings. sets — наборы, чьи элементы
+    всё же нужны: их `nft list set` ставится перед текстом таблицы, и set_elements и ts_state
+    находят полный набор первым."""
+    argv = ["nft", *(["-t"] if terse else []), "list", "table", family, table]
     try:
-        return runner(["nft", "list", "table", family, table])
+        text = runner(argv)
     except CommandError as exc:
-        text = str(exc)
-        if "No such file or directory" in text or "does not exist" in text:
+        message = str(exc)
+        if "No such file or directory" in message or "does not exist" in message:
             return ""
         return None
+    if not (terse and text):
+        return text
+    full: list[str] = []
+    for name in sets:
+        if not has_set(text, name):
+            continue
+        try:
+            full.append(runner(["nft", "list", "set", family, table, name]))
+        except CommandError:
+            return None  # набор пропал между двумя вызовами — проверка повторится
+    return "".join(part if part.endswith("\n") else part + "\n" for part in full) + text
 
 
 def ts_state(text: str) -> tuple[bool, bool | None]:
@@ -863,6 +1054,111 @@ def set_elements(text: str, name: str) -> set[str]:
     return {item.strip().removesuffix("/32") for item in found.group(1).split(",") if item.strip()}
 
 
+# --- поколение правил ядра -------------------------------------------------------------
+
+NETLINK_NETFILTER = 12
+NFNL_SUBSYS_NFTABLES = 10
+NFT_MSG_NEWGEN = 15
+NFT_MSG_GETGEN = 16
+NFTA_GEN_ID = 1
+NLMSG_ERROR = 2
+NLM_F_REQUEST = 1
+_NLMSG = struct.Struct("=IHHII")  # nlmsghdr: длина, тип, флаги, номер, порт
+_NFGEN = struct.Struct("=BBH")  # nfgenmsg: семейство, версия, res_id
+
+
+def generation(*, timeout: float = 1.0) -> int | None:
+    """Номер поколения правил nftables своего сетевого пространства (NFT_MSG_GETGEN по
+    netlink, как `nft list ruleset` спрашивает его сам). Ядро увеличивает его на каждой
+    принятой правке — своей, Docker, Tailscale, ufw, чужом `flush ruleset`, добавлении или
+    удалении элемента набора, — а чтение (`nft list`) его не меняет (проверено на Ubuntu 26.04:
+    ядро 6.x, nft 1.1.6, 26.10.2026). Это один короткий запрос (~0,1 мс), а не запуск nft.
+    None — узнать нельзя: нет CAP_NET_ADMIN (EPERM), нет netlink или ответ не разобрать;
+    тогда Listings запускает nft каждый раз, как раньше."""
+    kind = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETGEN
+    body = _NFGEN.pack(socket.AF_UNSPEC, 0, 0)
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER) as sock:
+            sock.settimeout(timeout)
+            sock.bind((0, 0))
+            sock.send(_NLMSG.pack(_NLMSG.size + len(body), kind, NLM_F_REQUEST, 1, 0) + body)
+            data = sock.recv(65536)
+    except (OSError, AttributeError):  # AttributeError: нет AF_NETLINK (не Linux)
+        return None
+    return parse_generation(data)
+
+
+def parse_generation(data: bytes) -> int | None:
+    """NFTA_GEN_ID из ответа NFT_MSG_NEWGEN; None — ошибка netlink или чужой ответ."""
+    if len(data) < _NLMSG.size + _NFGEN.size:
+        return None
+    length, kind, _flags, _seq, _port = _NLMSG.unpack_from(data)
+    if kind != (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN:
+        return None  # NLMSG_ERROR (нет прав) или не тот ответ
+    offset = _NLMSG.size + _NFGEN.size
+    end = min(length, len(data))
+    while offset + 4 <= end:
+        size, attr = struct.unpack_from("=HH", data, offset)
+        if size < 4:
+            return None
+        if attr & 0x3FFF == NFTA_GEN_ID and size >= 8:
+            return int(struct.unpack_from(">I", data, offset + 4)[0])
+        offset += (size + 3) & ~3
+    return None
+
+
+def _is_listing(argv: Sequence[str]) -> bool:
+    """`nft list …` или `nft -t list …` — чтение правил."""
+    words = list(argv)
+    if not words or words[0] != "nft":
+        return False
+    rest = words[1:]
+    if rest[:1] == ["-t"]:
+        rest = rest[1:]
+    return rest[:1] == ["list"]
+
+
+class Listings:
+    """Runner для проверок правил (Capture.loaded): тексты `nft list …` запоминаются вместе с
+    поколением правил ядра (generation) и, пока оно то же, отдаются без нового запуска nft —
+    правила с тех пор никто не менял, и текст был бы тем же. Остальные команды идут в runner
+    как есть.
+
+    Отчёт 0.2.0 (Ubuntu 24.04, nft 1.0.9): каждая проверка демона — раз в шаг watchdog (20 с)
+    — запускала nft несколько раз и шла 3,5 с, а `nft -t` там времени не экономит (listing).
+    Событийная проверка (тезис А3 аудита 0.1.18) без постоянного `nft monitor`: правила
+    перечитываются только после правки. Поколение читается до запуска nft: правка между
+    чтением и запуском даёт текст новее поколения, и следующая проверка перечитает его снова;
+    наоборот было бы опасно — устаревший текст под новым поколением."""
+
+    def __init__(self, runner: Runner, generation: Callable[[], int | None]) -> None:
+        self.runner = runner
+        self.generation = generation
+        self._lock = threading.Lock()
+        self._gen: int | None = None
+        self._texts: dict[tuple[str, ...], str] = {}
+        self.runs = 0  # сколько раз nft запускался на самом деле (для проверок и ТЗ)
+
+    def __call__(self, argv: Sequence[str], **kwargs) -> str:
+        if kwargs or not _is_listing(argv):
+            return self.runner(argv, **kwargs)
+        key = tuple(argv)
+        gen = self.generation()
+        with self._lock:
+            if gen is None or gen != self._gen:
+                self._texts.clear()
+                self._gen = gen
+            elif key in self._texts:
+                return self._texts[key]
+        with self._lock:
+            self.runs += 1
+        text = self.runner(list(argv))  # CommandError не запоминается: проверка повторится
+        with self._lock:
+            if gen is not None and gen == self._gen:
+                self._texts[key] = text
+        return text
+
+
 def ts_exit_state(text: str) -> bool:
     """В загруженной таблице есть правила выходного узла (tailscale0 на входе)."""
     return f'iifname "{ts.INTERFACE}"' in text
@@ -884,7 +1180,7 @@ def chain_rules(
     цепочки XGW не бывают (test_rendered_chains_are_never_empty) — такую оставляет чужой
     `nft flush table ip xgw` или `flush chain`: имена на месте, а перехвата нет. {} —
     таблицы нет, None — узнать не удалось (нет прав или nft)."""
-    text = listing(runner, family, table)
+    text = listing(runner, family, table, terse=True)
     return None if text is None else parse_chains(text)
 
 

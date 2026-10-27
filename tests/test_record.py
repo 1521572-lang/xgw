@@ -147,7 +147,7 @@ def test_start_is_refused_with_a_reason(tmp_path):
 
     with pytest.raises(RecordError, match="CAP_NET_RAW"):
         Recorder(tmp_path, opener=denied).start("enp4s0", PHONE, "phone", seconds=60)
-    with pytest.raises(RecordError, match="от 10 до 600"):
+    with pytest.raises(RecordError, match="от 10 до 300"):
         Recorder(tmp_path).start("enp4s0", PHONE, "phone", seconds=5)
 
 
@@ -192,3 +192,22 @@ def test_panel_record_requests_are_checked(rig):
     assert not rig.client.act("record/start", {"mac": PHONE, "seconds": "60"})["ok"]
     assert not rig.client.act("record/remove", {"name": "../panel-token"})["ok"]
     assert rig.client.act("record/stop", {})["text"] == "Записи сейчас нет"
+
+
+def test_recording_needs_free_disk_space_and_stops_when_it_runs_out(tmp_path):
+    """ДОП-1: на диске меньше MIN_FREE + MAX_BYTES — запись не начинается; место кончается во
+    время записи — она останавливается, файл остаётся."""
+    sock = FakeSocket([])
+    small = Recorder(tmp_path, opener=lambda interface, mac: sock,
+                     free=lambda _path: record.MIN_FREE)
+    with pytest.raises(RecordError, match="на диске мало места"):
+        small.start("enp4s0", PHONE, "phone", seconds=60)
+    assert sock.closed
+    left = [record.MIN_FREE + record.MAX_BYTES, 0]
+    clock = Clock(1.0)
+    recorder = Recorder(tmp_path, opener=lambda interface, mac: FakeSocket([FRAME] * 50),
+                        clock=clock, free=lambda _path: left.pop(0) if len(left) > 1 else left[0])
+    name = recorder.start("enp4s0", PHONE, "phone", seconds=60)
+    _finish(recorder)
+    meta = json.loads((tmp_path / name).with_suffix(".json").read_text(encoding="utf-8"))
+    assert meta["why"] == "на диске кончается место" and record.MAX_SECONDS == 300

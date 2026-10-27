@@ -234,7 +234,10 @@ class FakeKernel:
     def _nft(self, argv: list[str], text: str) -> str:
         if self.forbidden:
             raise CommandError("nft: Operation not permitted (you must be root)")
-        if argv[1:3] == ["list", "table"]:
+        terse = argv[1:2] == ["-t"]  # как nft -t: без элементов именованных наборов
+        if terse:
+            argv = [argv[0], *argv[2:]]
+        if argv[1:3] in (["list", "table"], ["list", "set"]):
             key = (argv[3], argv[4])
             if key not in self.tables:
                 raise CommandError(
@@ -242,9 +245,21 @@ class FakeKernel:
                     f"list table {argv[3]} {argv[4]}"
                 )
             # Как настоящий nft: отказ по умолчанию для семейства печатается одним «reject».
-            return re.sub(
+            body = re.sub(
                 r"reject with icmp(?:v6)? type port-unreachable", "reject", self.tables[key]
             )
+            if argv[2] == "set":
+                found = re.search(
+                    rf"^\s*set {re.escape(argv[5])} \{{\n.*?^\s*\}}\n", body,
+                    flags=re.MULTILINE | re.DOTALL,
+                )
+                if found is None:
+                    raise CommandError(f"{' '.join(argv)}: Error: No such file or directory")
+                return f"table {argv[3]} {argv[4]} {{\n{found.group(0)}}}\n"
+            if terse:
+                body = re.sub(r"^\s*elements = \{.*?\}\n", "", body,
+                              flags=re.MULTILINE | re.DOTALL)
+            return body
         if argv[1:] == ["-c", "-f", "-"]:
             return ""
         if argv[1:] == ["-f", "-"] and text.startswith(("add element ", "flush set ")):

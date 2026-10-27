@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+from pathlib import Path
 
 from xgw.generator import validate
 from xgw.xraycore import binary
@@ -108,3 +109,72 @@ def test_tun_inbound_is_renamed_for_the_check_and_dropped_without_root(monkeypat
     plain = {"inbounds": [{"tag": "http-in", "protocol": "http"}]}
     assert validate._for_test(plain) is plain  # без tun конфиг не копируется
     assert validate._for_test({"outbounds": []}) == {"outbounds": []}
+
+
+# --- поиск битых серверов половинами, память отвергнутых (аудит, F-07) ------------------
+
+
+def _runs(calls):
+    return [argv for argv in calls if argv[1] == "run"]
+
+
+def test_bad_outbound_is_found_by_halves_and_remembered(monkeypatch, tmp_path):
+    """Один битый сервер из 16 — 9 запусков Xray вместо 16. При следующей сборке (тег мог
+    смениться) он отбрасывается без запуска, остальные проверяются одним. Другой бинарник
+    Xray (обновление) — всё заново."""
+    monkeypatch.setattr(validate, "_REJECTED", {})
+    calls = _fake_xray(monkeypatch, version="26.10.21", reject="h2")
+    xray = tmp_path / "xray"
+    xray.write_bytes(b"xray")
+    outbounds = [{"tag": f"proxy-nl-{i:04x}", "streamSettings": {"network": "tcp"}}
+                 for i in range(16)]
+    outbounds[11]["streamSettings"]["network"] = "h2"
+    invalid = validate.find_invalid_outbounds(outbounds, xray)
+    assert list(invalid) == ["proxy-nl-000b"] and "unknown transport" in invalid["proxy-nl-000b"]
+    assert UUID not in invalid["proxy-nl-000b"]
+    assert len(_runs(calls)) == 9
+    calls.clear()
+    outbounds[11]["tag"] = "spare-nl-000b"
+    assert list(validate.find_invalid_outbounds(outbounds, xray)) == ["spare-nl-000b"]
+    assert len(_runs(calls)) == 1
+    calls.clear()
+    xray.write_bytes(b"xray 26.10.22")
+    assert list(validate.find_invalid_outbounds(outbounds, xray)) == ["spare-nl-000b"]
+    assert len(_runs(calls)) == 9
+
+
+def test_all_good_outbounds_cost_one_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(validate, "_REJECTED", {})
+    calls = _fake_xray(monkeypatch, version="26.10.21", reject="h2")
+    outbounds = [{"tag": f"proxy-nl-{i:04x}"} for i in range(40)]
+    assert validate.find_invalid_outbounds(outbounds, tmp_path / "xray") == {}
+    assert len(_runs(calls)) == 1
+
+
+def test_no_verdict_stops_the_search_and_is_not_remembered(monkeypatch, tmp_path):
+    """Xray завис или не запустился — каждый следующий запуск ждал бы того же: поиск
+    прекращается, и в отвергнутые никто не записан."""
+    monkeypatch.setattr(validate, "_REJECTED", {})
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 60)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    outbounds = [{"tag": f"proxy-nl-{i:04x}"} for i in range(8)]
+    assert validate.find_invalid_outbounds(outbounds, tmp_path / "xray") == {}
+    assert len(calls) == 1 and validate._REJECTED == {}
+
+
+def test_temp_config_with_keys_goes_to_run_xgw(monkeypatch, tmp_path):
+    """Конфиг с ключами — в /run/xgw (в памяти), а не в /tmp на диске; каталога нет (CLI не от
+    root) — в системный (аудит, F-03)."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    calls = _fake_xray(monkeypatch, version="26.10.21")
+    run_dir = tmp_path / "run" / "xgw"
+    validate.validate_config({"outbounds": []}, tmp_path / "xray")
+    assert Path(calls[-1][-1]).parent != run_dir
+    run_dir.mkdir(parents=True)
+    validate.validate_config({"outbounds": []}, tmp_path / "xray")
+    assert Path(calls[-1][-1]).parent == run_dir and list(run_dir.iterdir()) == []

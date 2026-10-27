@@ -26,7 +26,15 @@ TCP_CONGESTION = "net/ipv4/tcp_congestion_control"
 # tailscaled): перехват LAN работает при любом значении (iprule.py, маршрут throw), а
 # проверка пути LAN называет её в причине сбоя.
 SRC_VALID_MARK = "net/ipv4/conf/all/src_valid_mark"
-SETTINGS = {"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "0"}
+# Обратная проверка пути — мягкая (2, как по умолчанию в Ubuntu), и в conf.all, и в
+# conf.default: ядро берёт наибольшее из conf.all и значения интерфейса, а мосты Docker
+# (br-*), создаваемые позже, получают значение conf.default. Строгая (1) на мосту при
+# src_valid_mark = 1 (его ставит tailscaled) отбрасывает пакеты контейнеров: обратный маршрут
+# с меткой контейнеров ведёт в TUN, а не в мост (п. 1.3 рекомендаций к аудиту 0.1.18).
+# src_valid_mark XGW не ставит: перехват LAN работает при любом его значении (маршрут throw,
+# iprule.py), а значение 1 само было причиной отказа LAN в issue #1.
+RP_FILTER = {"net.ipv4.conf.all.rp_filter": "2", "net.ipv4.conf.default.rp_filter": "2"}
+SETTINGS = {"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "0", **RP_FILTER}
 _WAN_IPV6 = re.compile(r"net/ipv6/conf/[A-Za-z0-9_.@-]{1,15}/disable_ipv6")
 
 
@@ -55,7 +63,8 @@ def _path(name: str) -> str:
 def file_text(settings: dict[str, str] | None = None) -> str:
     """Содержимое /etc/sysctl.d/90-xgw.conf."""
     settings = SETTINGS if settings is None else settings
-    lines = ["# Создано XGW: форвардинг для устройств в обход VPN и ICMP; IPv6 на WAN."]
+    lines = ["# Создано XGW: форвардинг для устройств в обход VPN и ICMP; IPv6 на WAN;",
+             "# мягкая обратная проверка пути (rp_filter = 2, как по умолчанию в Ubuntu)."]
     lines.extend(f"{key} = {value}" for key, value in settings.items())
     return "\n".join(lines) + "\n"
 

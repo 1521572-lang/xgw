@@ -510,3 +510,38 @@ def test_update_singbox_refuses_another_version_and_a_failed_download(tmp_path, 
     assert update.update_singbox(Config(), paths, out=lines.append,
                                  get_release=lambda *a, **kw: _release(b""), download=other) == 1
     assert "а нужен 1.14.3" in lines[-1] and not paths.singbox_bin.exists()
+
+
+# --- поиск серверов, которых sing-box не принимает (аудит, F-07) ---------------------------
+
+
+def test_servers_sing_box_refuses_are_found_by_halves_and_remembered(monkeypatch, tmp_path):
+    """Как у Xray (validate.narrow): плохой сервер ищется делением пополам, а при следующей
+    сборке отбрасывается без запуска sing-box."""
+    from xgw.generator import validate
+
+    monkeypatch.setattr(validate, "_REJECTED", {})
+    nodes = _nodes(HY2, ANYTLS, WG, STLS)
+    bad = _by_name(nodes, "AnyTLS")
+    bad.singbox.main["no_such_field"] = 1
+    seen: list[dict] = []
+
+    def check(config, _bin):
+        seen.append(config)
+        if "no_such_field" in json.dumps(config):
+            return False, ('FATAL[0000] decode config at <config>: outbounds[1]: json: '
+                           'unknown field "no_such_field"')
+        return True, ""
+
+    monkeypatch.setattr(singbox, "_check_once", check)
+    binary = tmp_path / "sing-box"
+    binary.write_bytes(b"sing-box")
+    invalid = singbox.find_invalid(nodes, Config(), binary)
+    assert invalid == {bad.fingerprint: 'unknown field "no_such_field"'}
+    assert len(seen) == 5  # вместо 4 по одному — но и при 100 серверах около 15
+    # WireGuard — endpoint: в общем конфиге он в endpoints, первым outbound'ом — block.
+    mixed = next(config for config in seen if config.get("endpoints"))
+    assert mixed["outbounds"][0] == {"type": "block", "tag": "block"}
+    seen.clear()
+    assert singbox.find_invalid(nodes, Config(), binary) == invalid
+    assert len(seen) == 1

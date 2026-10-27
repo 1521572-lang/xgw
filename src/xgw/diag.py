@@ -152,6 +152,7 @@ class Diag:
         ]
         groups += [
             ("QUIC", self._quic),
+            ("Мимо Xray", self._kernel_direct),
             ("Проверочные хосты", self._probe_hosts),
             ("Значок в трее", self._tray),
         ]
@@ -444,18 +445,37 @@ class Diag:
                 ))
         if not result:
             result.append(Check("TUN", OK, f"{self.dev_tun} есть; интерфейс {cap.tun_name}{whom}"))
-        # Действует наибольшее из общего значения и значения интерфейса; своё значение XGW
-        # обнуляет при создании интерфейса, так что решает общее.
-        for where in ("all", cap.tun_name):
-            if sysctl.read(f"net/ipv4/conf/{where}/rp_filter", self.proc_sys) == "1":
+        # Действует наибольшее из общего значения (conf.all) и значения интерфейса; самому
+        # TUN XGW ставит 2 (net/tun.py), мостам Docker, созданным позже, достаётся
+        # conf.default. Строгая проверка — когда наибольшее из двух равно 1.
+        def value(where: str) -> int:
+            text = sysctl.read(f"net/ipv4/conf/{where}/rp_filter", self.proc_sys) or "0"
+            return int(text) if text.isdigit() else 0
+
+        common = value("all")
+        if max(common, value(cap.tun_name)) == 1:
+            result.append(Check(
+                "TUN", WARN,
+                f"обратная проверка пути (rp_filter) у {cap.tun_name} строгая: ядро отбросит "
+                "ответы Xray из TUN, и трафик зависнет",
+                "sudo xgw net up — XGW поставит интерфейсу мягкую проверку (rp_filter=2); "
+                "умолчание Ubuntu — 2",
+            ))
+        if engine.containers_tun(self.cfg):
+            bridges = [*lan.container_links(nft.CONTAINER_IFS), "default"]
+            strict = [name for name in bridges if max(common, value(name)) == 1]
+            if strict:
+                where = ", ".join(
+                    "новых мостов (conf.default)" if name == "default" else name
+                    for name in strict
+                )
                 result.append(Check(
                     "TUN", WARN,
-                    f"net.ipv4.conf.{where}.rp_filter = 1 (строгий): ядро отбросит ответы Xray "
-                    "из TUN, и трафик машины зависнет",
-                    "sudo sysctl -w net.ipv4.conf.all.rp_filter=2 (и то же в /etc/sysctl.d/); "
-                    "умолчание Ubuntu — 2",
+                    f"строгая обратная проверка пути (rp_filter) у {where}: при "
+                    "src_valid_mark = 1 (его ставит Tailscale) ядро отбросит пакеты контейнеров",
+                    "sudo xgw install — поставит net.ipv4.conf.all и default.rp_filter = 2 "
+                    "(умолчание Ubuntu)",
                 ))
-                break
         return result
 
     def _lan_path(self) -> list[Check]:
@@ -480,6 +500,10 @@ class Diag:
         return [Check(
             "Путь LAN", OK, f"пакеты устройств сети {rules.lan_if} доходят до Xray (TPROXY)"
         )]
+
+    def firewall(self) -> list[Check]:
+        """Чужие правила фаервола — и для проверки сети (netcheck.py)."""
+        return self._firewall()
 
     def _firewall(self) -> list[Check]:
         if not self.root or self.which("nft") is None:
@@ -949,7 +973,7 @@ class Diag:
                     self.cfg, plan.members, [*plan.full, *plan.cheap, *plan.candidates]
                 ),
             )
-            spend = status.quota_spend(self.cfg, plan, budget.size)
+            spend = status.quota_spend(self.cfg, plan, budget.size, budget.scan_minutes)
         else:
             budget = status.probe_budget(
                 self.cfg, members, spares, size,
@@ -1116,7 +1140,7 @@ class Diag:
         if capture.mode() != "on":
             return []
         rules = capture.rules("on")
-        text = nft.listing(self.runner)
+        text = nft.listing(self.runner, terse=True)
         if text is None:
             return [Check("QUIC", WARN, "правила не прочитать — запустите через sudo")]
         loaded = nft.quic_loaded(text)
@@ -1129,6 +1153,38 @@ class Diag:
                                       "TCP, где действует дробление ClientHello")]
         return [Check("QUIC", WARN, "правило против QUIC не загружено",
                       "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+
+    def _kernel_direct(self) -> list[Check]:
+        """Ф6: российские адреса ядром мимо Xray — у кого включено, сколько сетей, загружен ли
+        набор direct4."""
+        name = "Российские адреса мимо Xray"
+        devices = len(self.cfg.managed.kernel_devices)
+        if not self.cfg.routing.kernel_direct and not devices:
+            return [Check(name, OK, "выключено: они идут через Xray (выход direct)")]
+        reason = nft.kernel_direct_reason(self.cfg)
+        if reason:
+            return [Check(name, WARN, f"включено, но не действует: {reason}",
+                          "уберите домены из routing.proxy_domains или выключите разгрузку "
+                          "в панели")]
+        who = ", ".join(
+            (["этот компьютер и контейнеры"] if self.cfg.routing.kernel_direct else [])
+            + ([f"устройств сети: {devices}"] if devices else []))
+        capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log)
+        if capture.mode() != "on":
+            return []
+        rules = capture.rules("on")
+        if not rules.direct4:
+            return [Check(name, WARN, "сетей нет: geoip.dat не прочитан или в direct_ips нечего "
+                                      "передать ядру — идут через Xray",
+                          "sudo journalctl -u xgw | grep 'мимо Xray'")]
+        text = nft.listing(self.runner, terse=True)
+        if text is None:
+            return [Check(name, WARN, "правила не прочитать — запустите через sudo")]
+        if not nft.has_set(text, nft.DIRECT_SET):
+            return [Check(name, WARN, "набор direct4 не загружен",
+                          "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+        return [Check(name, OK, f"{len(rules.direct4)} сетей — напрямую ядром ({who}); DNS — "
+                                "через Xray")]
 
     def _probe_hosts(self) -> list[Check]:
         """ТЗ R3: активный проверочный хост и ошибки по каждому — со слов демона."""
@@ -1266,7 +1322,8 @@ class Diag:
             return [Check(
                 "bootstrap DNS", FAIL,
                 "ни один резолвер не отвечает: домены серверов не разрешить — " + "; ".join(bad),
-                "проверьте dns.bootstrap; обычный DNS провайдера: udp://<адрес>",
+                "проверьте dns.bootstrap: DoH (https://<IP>/dns-query) или DoT (tls://<IP>); "
+                "обычный DNS провайдера (udp://<адрес>) домены подписок не разрешает",
             )]
         tail = f" ({note})" if note else ""
         if bad:

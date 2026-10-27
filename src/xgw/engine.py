@@ -15,8 +15,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from . import config, cost, fetch, log, marknet, masking
+from . import config, cost, fetch, log, marknet, masking, rating
 from . import pin as pinning
 from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
@@ -27,7 +28,7 @@ from .model import ServerNode, raw_to_node
 from .net import lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
-from .store import Store, SubscriptionCache
+from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
 from .watch import target
 from .xraycore.api import ApiClient
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
@@ -178,13 +179,16 @@ def collect(
     remote = any(sub.url and not sub.url.startswith("file://") for sub in cfg.subscriptions)
     proxy = healthy_http_in(cfg) if via_xray and remote else None
     cache = SubscriptionCache(paths.cache_dir)
+    hosts = HostCache(paths.cache_dir)
     inventory = Inventory()
     for sub in cfg.subscriptions:
         if not sub.url:
             continue
         if cancel is not None and cancel.is_set():
             raise fetch.Cancelled
-        raws, userinfo, error = _load_subscription(sub, cfg, cache, mark, proxy, logger, cancel)
+        raws, userinfo, error = _load_subscription(
+            sub, cfg, cache, mark, proxy, logger, cancel, hosts=hosts,
+        )
         if not raws:
             inventory.complete = False
         if error:
@@ -199,6 +203,77 @@ def collect(
         inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
     log.add_secrets(masking.collect_secrets([node.outbound for node in inventory.nodes]))
     return inventory
+
+
+# Имя сервера подписки → когда (time.time()) его прямой адрес не удалось проверить: следующая
+# попытка — не раньше HOST_CHECK_RETRY (в памяти процесса; новый демон пробует сразу).
+_direct_failed: dict[str, float] = {}
+
+
+def _check_direct(
+    url: str,
+    result: fetch.FetchResult,
+    cfg: config.Config,
+    hosts: HostCache,
+    mark: int,
+    label: str,
+    logger,
+    cancel: threading.Event | None,
+) -> None:
+    """Прямой адрес сервера подписки — в кэш адресов (store.HostCache), если подписка пришла
+    без прямого соединения с ним: через Xray (при живом Xray так всегда, и без этого кэш не
+    появился бы никогда — отчёт 0.2.0, дефект 1) или через перенаправление с другого имени.
+    Не чаще раза в сутки на имя; без метки (не root) прямой путь не проверить — соединение
+    ушло бы в перехват, и такой проверки нет вовсе."""
+    now = time.time()
+    names: list[tuple[str, int]] = []
+    for address in (url, result.url):
+        parts = urlsplit(address)
+        host = parts.hostname or ""
+        if parts.scheme != "https" or not host or _is_ip(host):
+            continue
+        if host == result.host and result.address:
+            continue  # только что подтверждён прямым запросом
+        if (host, parts.port or 443) not in names:
+            names.append((host, parts.port or 443))
+    for host, port in names:
+        age = hosts.age(host)
+        if age is not None and age < HOST_CHECK_EVERY:
+            continue
+        if now - _direct_failed.get(host, -HOST_CHECK_RETRY) < HOST_CHECK_RETRY:
+            continue
+        try:
+            address = fetch.check_direct(
+                host, port, bootstrap=cfg.dns.resolvers, mark=mark, cancel=cancel)
+        except fetch.Cancelled:
+            raise
+        except (fetch.ResolveError, OSError, ValueError) as exc:
+            _direct_failed[host] = now
+            logger.warning(
+                "подписка %s: прямой путь к её серверу не проверен (%s) — если Xray перестанет "
+                "отвечать, а шифрованные резолверы будут недоступны, подписку напрямую получить "
+                "не удастся; следующая проверка — через %d ч",
+                label, masking.mask_text(str(exc))[:200], int(HOST_CHECK_RETRY // 3600),
+            )
+            continue
+        _direct_failed.pop(host, None)
+        try:
+            hosts.remember(host, address)
+        except OSError as exc:
+            logger.error("подписка %s: адрес не записан в %s: %s", label, hosts.path, exc)
+            continue
+        logger.info(
+            "подписка %s: прямой адрес её сервера проверен (TLS) и записан в кэш адресов",
+            label,
+        )
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def _drop_junk(raws: list[RawServer]) -> list[RawServer]:
@@ -217,10 +292,16 @@ def _load_subscription(
     proxy: tuple[str, int] | None,
     logger,
     cancel: threading.Event | None = None,
+    *,
+    hosts: HostCache | None = None,
 ) -> tuple[list[RawServer], dict[str, int], str]:
     """Серверы подписки, её квота и причина сбоя (пустая, если запрос удался).
     Ответ без серверов считается сбоем — в том числе заглушка из одних служебных
-    адресов: тогда берётся последняя удачная версия из кэша, а кэш не перезаписывается."""
+    адресов: тогда берётся последняя удачная версия из кэша, а кэш не перезаписывается.
+
+    hosts — адреса доменов подписок (store.HostCache): прямой запрос, не дождавшийся
+    шифрованных резолверов, идёт по прежнему проверенному адресу, а удачный — записывает
+    свой адрес туда."""
     label = f"{sub.name} ({masking.mask_url(sub.url)})"
     error = ""
     routes: list[tuple[str, tuple[str, int] | None]] = [("напрямую", None)]
@@ -239,6 +320,7 @@ def _load_subscription(
                 bootstrap=None if via or mark is None else cfg.dns.resolvers,
                 retries=1 if via else 3,
                 cancel=cancel,
+                fallback=hosts.addresses() if hosts is not None and via is None else None,
             )
             raws, meta, sub_warnings = parse_body(result.body, sub.name)
             raws = _drop_junk(raws)
@@ -248,6 +330,23 @@ def _load_subscription(
             logger.error("подписка %s, запрос %s: %s", label, route, exc)
             error = masking.mask_text(str(exc))[:300]
             continue
+        if result.from_fallback:
+            logger.warning(
+                "подписка %s: резолверы не ответили — получена по прежнему адресу %s",
+                label, result.address,
+            )
+        if hosts is not None and result.host and result.address:
+            try:
+                if hosts.remember(result.host, result.address):
+                    # Новый адрес (или имя) — одна строка; тот же адрес каждый час — молча.
+                    logger.info(
+                        "подписка %s: получена напрямую, адрес её сервера записан в кэш адресов",
+                        label,
+                    )
+            except OSError as exc:
+                logger.error("подписка %s: адрес не записан в %s: %s", label, hosts.path, exc)
+        if hosts is not None and mark is not None:
+            _check_direct(sub.url, result, cfg, hosts, mark, label, logger, cancel)
         for warning in sub_warnings:
             logger.warning("%s", warning)
         userinfo = fetch.parse_userinfo(
@@ -287,6 +386,14 @@ def containers_tun(cfg: config.Config) -> bool:
     return nft.containers_wanted(cfg) and bool(lan.container_links(nft.CONTAINER_IFS))
 
 
+def devices_down(paths: Paths) -> frozenset[str]:
+    """Адреса устройств, чей свой сервер сейчас не отвечает (Daemon._device_step): их ведёт
+    основной. Файла нет или он битый — таких нет."""
+    loaded = read_json(paths.devices_down_file) or {}
+    ips = loaded.get("ips")
+    return frozenset(str(ip) for ip in ips) if isinstance(ips, list) else frozenset()
+
+
 def read_json(path: Path) -> dict | None:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -305,7 +412,7 @@ def assemble(
     xray_bin: Path | None,
     check: bool = True,
     prefer: list[str] | None = None,
-    tier: cost.Klass | None = None,
+    scores: dict[str, float] | None = None,
     reserve: str | None = None,
     fragment: set[str] | None = None,
     profiles: dict[str, str] | None = None,
@@ -317,8 +424,9 @@ def assemble(
     Состав участников, резервный выход, порты и пароль проб берутся из применённого
     конфига: обновление подписки не должно перетасовывать то, что уже работает в ядре.
     prefer — явный состав участников (замена «мёртвого» при ротации).
-    tier — класс участников (смена класса демоном, cost.py); по умолчанию — класс
-    нынешних участников: обновление подписки его не меняет.
+    scores — рейтинг серверов (rating.py); по умолчанию — последний, что записал демон
+    (meta «rating», load_scores): обновление подписки и `xgw generate` отбирают участников
+    так же, как демон.
     reserve — отпечаток резервного выхода (его выбирает демон по дешёвой проверке).
     profiles — решения демона о профилях обхода (generator/profiles.py): отпечаток →
     профиль. У остальных серверов профиль — как в применённом конфиге, если сервер обучен
@@ -338,8 +446,9 @@ def assemble(
     prices = node_costs(cfg, inventory)
     if prefer is None:
         prefer = builder.member_fingerprints(applied, inventory.nodes)
-    if tier is None:
-        tier = cost.best(cfg.managed.priority, prices, prefer)
+    if scores is None:
+        scores = load_scores(paths)
+    low = low_quota(inventory)
     if reserve is None:
         reserve = builder.reserve_fingerprint(applied, inventory.nodes)
     current = builder.applied_profiles(applied, inventory.nodes)
@@ -374,8 +483,8 @@ def assemble(
     while True:
         usable = [node for node in inventory.nodes if node.fingerprint not in rejected]
         selection = builder.select_nodes(
-            usable, cfg, prefer=prefer, dead=dead, tier=tier, costs=prices, reserve=reserve,
-            served=served,
+            usable, cfg, prefer=prefer, dead=dead, scores=scores, costs=prices,
+            reserve=reserve, served=served, quota_low=low,
         )
         if first:
             first = False
@@ -438,6 +547,10 @@ def assemble(
                 probe_url=target.observatory_url(cfg, paths),
                 containers_tun=containers_tun(cfg),
                 profile_of=profile_of, bridge=effective,
+                devices_down=devices_down(paths),
+                # Входы sing-box — и работающего, и новой сборки, если её перезапуск отложен.
+                avoid_ports={*(plan.ports.values() if plan is not None else ()),
+                             *(applied_ports or {}).values()},
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
@@ -523,6 +636,36 @@ def _saved_core(paths: Paths) -> dict | None:
     except ValueError:
         return None
     return saved if isinstance(saved, dict) else None
+
+
+RATING_META = "rating"  # рейтинг серверов (rating.py): отпечаток → число; пишет демон
+
+
+def load_scores(paths: Paths) -> dict[str, float]:
+    """Последний рейтинг серверов, что записал демон; базы нет — пусто (тогда рейтинг —
+    по приоритету и стоимости, rating.static)."""
+    if not paths.db_file.exists():
+        return {}
+    try:
+        store = Store(paths.db_file)
+    except Exception:  # без базы рейтинг — по приоритету и стоимости (rating.static)
+        return {}
+    try:
+        loaded = json.loads(store.get_meta(RATING_META) or "{}")
+    except ValueError:
+        return {}
+    finally:
+        store.close()
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): float(value) for key, value in loaded.items()
+            if isinstance(value, (int, float))}
+
+
+def low_quota(inventory: Inventory) -> set[str]:
+    """Отпечатки серверов подписок, чья квота на исходе (rating.quota_low)."""
+    low = {name for name, quota in inventory.quotas.items() if rating.quota_low(quota)}
+    return {node.fingerprint for node in inventory.nodes if node.source in low}
 
 
 def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:

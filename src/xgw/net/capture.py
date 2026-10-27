@@ -46,6 +46,7 @@ import contextlib
 import dataclasses
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .. import log
@@ -114,10 +115,20 @@ class Capture:
         logger=None,
         proc_sys: Path = sysctl.PROC_SYS,
         time_uids: tuple[int, ...] | None = None,
+        generation: Callable[[], int | None] | None = None,
     ) -> None:
         self.cfg = cfg
         self.paths = paths
         self.runner = runner
+        # Проверки правил (loaded, tailscale_loaded) читают таблицы через кэш по поколению
+        # правил ядра (nft.Listings): пока правила никто не менял, nft не запускается (отчёт
+        # 0.2.0: 3,5 с на каждом шаге демона с nft 1.0.9). Поколение говорит о настоящем nft,
+        # поэтому кэш — только у cmd.run; у подставного runner тестов свои правила, и кэш у
+        # него — только если тест передал generation сам.
+        if generation is None and runner is cmd.run:
+            generation = nft.generation
+        self.lister: cmd.Runner = (
+            nft.Listings(runner, generation) if generation is not None else runner)
         self.log = logger or log.get_logger("net")
         self.proc_sys = proc_sys
         self.time_uids = time_uids
@@ -197,6 +208,7 @@ class Capture:
             tailscale=self.cfg.capture.local and tailnet,
             xray_down=self.ts_marker.exists(), tailnet=tailnet,
             ts_fallback=self.ts_fallback_marker.exists(),
+            geoip=self.paths.xray_dir / "geoip.dat",
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -460,6 +472,10 @@ class Capture:
                 with self._own_rules():
                     warnings = nft.apply(rules, self.runner)
                 self._routes_down(rules)
+            # Какой набор direct4 загружен (Ф6): loaded() сверяет отпечаток, а не тысячи сетей.
+            digest = nft.direct_digest(rules.direct4, rules.direct_local) if rules.direct4 else None
+            if self._state().get("direct4") != digest:
+                self._save(direct4=digest)
         except (cmd.CommandError, OSError) as exc:
             raise CaptureError(str(exc)) from exc
         for warning in warnings:
@@ -693,7 +709,7 @@ class Capture:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
-        text = nft.listing(self.runner)
+        text = nft.listing(self.lister, terse=True, sets=nft.CHECKED_SETS)
         if text is None:
             return None
         listed = nft.parse_chains(text)
@@ -710,6 +726,14 @@ class Capture:
             return False  # выходной узел: tailscaled запустился или остановился
         if not rules.blocked and nft.quic_loaded(text) != rules.quic:
             return False  # network.block_quic переключили
+        if nft.has_set(text, nft.DIRECT_SET) != bool(rules.direct4) or (
+                rules.direct4 and self._state().get("direct4")
+                != nft.direct_digest(rules.direct4, rules.direct_local)):
+            return False  # разгрузку переключили, сменились geoip.dat или direct_ips
+        if nft.has_set(text, nft.DIRECT_LAN_SET) != bool(rules.direct_lan) or (
+                rules.direct_lan
+                and nft.set_elements(text, nft.DIRECT_LAN_SET) != set(rules.direct_lan)):
+            return False  # разгрузку устройства включили или выключили
         if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
                 rules.ts_exit_direct):
             return False  # устройство tailnet пустили напрямую или вернули в Xray
@@ -745,7 +769,7 @@ class Capture:
         if not rules.containers and "containers" in chains:
             return False  # capture.containers выключили
         if rules.capture6 or self.ipv6_usable():
-            listed6 = nft.chain_rules(self.runner, "ip6", nft.TABLE6)
+            listed6 = nft.chain_rules(self.lister, "ip6", nft.TABLE6)
             if listed6 is None:
                 return None
             chains6 = set(listed6)
@@ -798,7 +822,7 @@ class Capture:
         None — узнать нельзя."""
         if not self.ipv6_usable():
             return True  # таблицы ip6 в таком ядре нет, закрывать нечего
-        text6 = nft.listing(self.runner, "ip6", nft.TABLE6)
+        text6 = nft.listing(self.lister, "ip6", nft.TABLE6)
         if text6 is None:
             return None
         listed6 = nft.parse_chains(text6)
@@ -821,14 +845,14 @@ class Capture:
         """Для `xgw diag`: исключения Tailscale загружены (или не нужны); None — узнать
         нельзя."""
         rules = self.rules(self.effective_mode())
-        text = nft.listing(self.runner)
+        text = nft.listing(self.lister, terse=True, sets=(nft.TS_SET,))
         if text is None:
             return None
         if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
             return False
         if not self.ipv6_usable():
             return True
-        text6 = nft.listing(self.runner, "ip6", nft.TABLE6)
+        text6 = nft.listing(self.lister, "ip6", nft.TABLE6, terse=True, sets=(nft.TS_SET,))
         if text6 is None:
             return None
         return self._ts_loaded(rules, text6, rules.ts6, rules.ts6)
@@ -900,6 +924,8 @@ class Capture:
             "ipv6": rules.capture6,
             "tun": rules.tun,
             "containers": bool(rules.containers),
+            # Сколько сетей идёт ядром мимо Xray (routing.kernel_direct, Ф6); 0 — нисколько.
+            "direct4": len(rules.direct4),
             # Docker на машине есть (его мост уже создан): только тогда о контейнерах
             # стоит говорить в статусе.
             "docker": bool(lan.container_links(rules.containers, self.sys_net)),

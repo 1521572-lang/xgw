@@ -6,8 +6,8 @@ import re
 import links
 from conftest import golden
 
+from xgw import rating
 from xgw.config import Config
-from xgw.cost import Klass
 from xgw.generator.builder import (
     BuildResult,
     applied_nodes,
@@ -41,6 +41,43 @@ def test_full_config_golden():
     result, _cfg, _selection = _build()
     expected = golden("full_config.json", result.config)
     assert result.config == expected
+
+
+def test_device_with_its_own_server_falls_back_to_the_main_balancer():
+    """Ф4, 0.2.0: устройство со своим сервером — правило по адресу источника прямо на выход
+    сервера (запасной тоже годится), после direct_* и до общего балансировщика. Без
+    балансировщика, loopback и пробы в burstObservatory: их появление требовало перезапуска
+    Xray. Сервер мёртв (devices_down) или его нет в конфиге — устройство идёт как все."""
+    raws, _meta, _warnings = parse_links_text("\n".join(links.FULL_LINKS), "test")
+    nodes = [raw_to_node(raw, "test") for raw in raws]
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.routing.direct_ips = ["198.51.100.0/24"]
+    selection = select_nodes(nodes, cfg)
+    spare = selection.spares[0].fingerprint
+    cfg.managed.routes = {"192.168.50.120": spare, "192.168.50.130": "00000000"}
+    result = build(cfg, selection, hosts={"de.example.com": ["203.0.113.11"],
+                                          "fr.example.com": ["203.0.113.12"]})
+    config = result.config
+    tag = next(info.tag for info in result.nodes if info.fingerprint == spare)
+    assert tag.startswith("spare-")
+    assert [balancer["tag"] for balancer in config["routing"]["balancers"]] == ["auto"]
+    assert config["burstObservatory"]["subjectSelector"] == ["proxy-"]
+    assert not any(outbound["protocol"] == "loopback" for outbound in config["outbounds"])
+    rules = config["routing"]["rules"]
+    where = {json.dumps(rule, sort_keys=True): index for index, rule in enumerate(rules)}
+
+    def at(rule: dict) -> int:
+        return where[json.dumps({"type": "field", **rule}, sort_keys=True)]
+
+    device = at({"source": ["192.168.50.120"], "outboundTag": tag})
+    assert at({"ip": ["198.51.100.0/24"], "outboundTag": "direct"}) < device
+    assert device < at({"network": "tcp,udp", "balancerTag": "auto"})
+    assert not any("192.168.50.130" in json.dumps(rule) for rule in rules)
+    down = build(cfg, selection, hosts={"de.example.com": ["203.0.113.11"],
+                                        "fr.example.com": ["203.0.113.12"]},
+                 devices_down={"192.168.50.120"}).config
+    assert not any("192.168.50.120" in json.dumps(rule) for rule in down["routing"]["rules"])
 
 
 def test_invariants():
@@ -183,6 +220,21 @@ def test_probe_ports_skip_service_ports():
     assert [info.probe_port for info in result.nodes] == [10810, 10811]
 
 
+def test_probe_ports_skip_panel_core_and_sing_box_ports():
+    """Проверки Xray не занимают порты панели, API sing-box и входов sing-box — ни
+    работающего (bridge), ни новой сборки, чей перезапуск отложен (avoid_ports): аудит, F-04."""
+    from xgw.generator import singbox as singboxing
+
+    cfg = Config()
+    cfg.xray.probe_port_base = cfg.panel.port  # 8781, следом app_port 8782
+    cfg.core.api_port = 8784
+    nodes = [_node("11112222", "A"), _node("33334444", "B"), _node("55556666", "C")]
+    bridge = singboxing.Plan(config={}, ports={("ffff0000", "d"): 8783})
+    result = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32,
+                   bridge=bridge, avoid_ports={8786})
+    assert [info.probe_port for info in result.nodes] == [8785, 8787, 8788]
+
+
 def test_prefer_keeps_rotation_result():
     """select_nodes(prefer=…) закрепляет состав участников — замена не откатывается."""
     cfg = Config()
@@ -198,67 +250,8 @@ def test_prefer_keeps_rotation_result():
     assert [n.fingerprint for n in gone.members] == ["cccc0000", "aaaa0000"]
 
 
-def test_members_are_taken_from_one_priority_level_only():
-    """Участники — только серверы одного уровня приоритета, даже если их меньше
-    max_members: иначе быстрый сервер уровня ниже отбирал бы трафик у живого уровня выше."""
-    cfg = Config()
-    cfg.filters.max_members = 3
-    nodes = [_node(fp, fp[:1].upper()) for fp in ("aaaa0000", "bbbb0000", "cccc0000",
-                                                  "dddd0000", "eeee0000")]
-    cfg.managed.priority = {"dddd0000": "high", "eeee0000": "high", "aaaa0000": "low"}
-    top = select_nodes(nodes, cfg)
-    assert top.tier == Klass(0, 0.0)
-    assert [n.fingerprint for n in top.members] == ["dddd0000", "eeee0000"]
-    # запасные: сначала свой уровень (тут его нет), затем остальные по отпечатку
-    assert [n.fingerprint for n in top.spares] == ["aaaa0000", "bbbb0000", "cccc0000"]
-    # Резервный выход — первый запасной лучшего из классов хуже: средний, по отпечатку.
-    assert top.reserve.fingerprint == "bbbb0000"
-    middle = select_nodes(nodes, cfg, tier=Klass(1, 0.0), prefer=["cccc0000", "dddd0000"])
-    assert middle.tier == Klass(1, 0.0) and [n.fingerprint for n in middle.members] == [
-        "cccc0000", "bbbb0000"]  # высокий из prefer не берётся: уровень другой
-    low = select_nodes(nodes, cfg, tier=Klass(2, 0.0))
-    assert [n.fingerprint for n in low.members] == ["aaaa0000"]
-    assert low.reserve is None  # уровня ниже нет — fallbackTag остаётся первым участником
-    # Уровня, которого нет среди серверов, не бывает — берётся наивысший из имеющихся.
-    cfg.managed.priority = {"aaaa0000": "low"}
-    assert select_nodes(nodes, cfg, tier=Klass(0, 0.0)).tier == Klass(1, 0.0)
-    cfg.managed.priority = {}
-    plain = select_nodes(nodes, cfg)
-    assert plain.tier == Klass(1, 0.0) and len(plain.members) == 3  # без приоритетов — как раньше
-    assert plain.reserve is None
-
-
 def _priced(nodes, cfg, prices, **kwargs):
     return select_nodes(nodes, cfg, costs=prices, **kwargs)
-
-
-def test_unlimited_servers_work_and_the_cheapest_limited_one_is_the_reserve():
-    """Безлимитные — в балансировщике, даже если их меньше max_members; лимитированные —
-    запасные, и один из них, с наименьшим множителем, — резервный выход."""
-    cfg = Config()
-    cfg.filters.max_members = 3
-    nodes = [_node(fp, fp) for fp in ("aaaa0000", "bbbb0000", "cccc0000", "dddd0000",
-                                      "eeee0000")]
-    prices = {"aaaa0000": 10.0, "bbbb0000": 1.0, "cccc0000": 0.0, "dddd0000": 100.0,
-              "eeee0000": 1.0}
-    selection = _priced(nodes, cfg, prices)
-    assert [n.fingerprint for n in selection.members] == ["cccc0000"]
-    assert selection.tier == Klass(1, 0.0)
-    assert selection.reserve.fingerprint == "bbbb0000"  # x1, первый по отпечатку
-    # Резервным становится тот, кого выбрал демон, — если он и правда классом хуже.
-    chosen = _priced(nodes, cfg, prices, reserve="eeee0000")
-    assert chosen.reserve.fingerprint == "eeee0000"
-    assert _priced(nodes, cfg, prices, reserve="aaaa0000").reserve.fingerprint == "aaaa0000"
-    assert _priced(nodes, cfg, prices, reserve="cccc0000").reserve.fingerprint == "bbbb0000"
-    # Безлимитных нет совсем — как прежде: балансировщик из x1, резервный — x10.
-    no_free = _priced([node for node in nodes if node.fingerprint != "cccc0000"], cfg, prices)
-    assert [n.fingerprint for n in no_free.members] == ["bbbb0000", "eeee0000"]
-    assert no_free.tier == Klass(1, 1.0) and no_free.reserve.fingerprint == "aaaa0000"
-    # Ручной приоритет важнее стоимости: x100 с высоким приоритетом идёт первым.
-    cfg.managed.priority = {"dddd0000": "high"}
-    ranked = _priced(nodes, cfg, prices)
-    assert [n.fingerprint for n in ranked.members] == ["dddd0000"]
-    assert ranked.reserve.fingerprint == "cccc0000"  # безлимитный среднего уровня
 
 
 def test_reserve_is_the_fallback_tag_and_stays_out_of_the_observatory():
@@ -566,3 +559,52 @@ def test_selection_counts_what_was_dropped():
     assert any("домен gone.example.net не разрешается" in text for text in selection.warnings)
     # Без карантина тот же сервер идёт в работу.
     assert select_nodes(nodes, cfg).stats["dns"] == 0
+
+
+def test_members_are_the_best_rated_from_every_subscription():
+    """Issue #2 и раздел 3 рекомендаций: участники — лучшие по рейтингу из всех подписок.
+    «Средний» намного быстрее «высокого» — в участниках «средний»; чуть медленнее —
+    предпочитается «высокий». x100 и подписка с исчерпанной квотой в участники не попадают;
+    резервный — самый дешёвый лимитированный дороже самого дешёвого участника."""
+    raws, _meta, _warnings = parse_links_text("\n".join(links.FULL_LINKS), "test")
+    nodes = [raw_to_node(raw, "test") for raw in raws if raw.name]
+    unique = sorted({node.fingerprint for node in nodes})
+    high, medium, x10, x100 = unique[:4]
+    cfg = Config()
+    cfg.filters.max_members = 1
+    cfg.managed.priority = {high: "high"}
+    costs = dict.fromkeys(unique, 0.0)
+    costs.update({x10: 10.0, x100: 100.0})
+
+    def facts(fingerprint, mbps):
+        return rating.score(rating.Facts(
+            level="high" if fingerprint == high else "medium", price=costs[fingerprint],
+            mbps=mbps, rtt_ms=60.0))
+
+    scores = {fingerprint: facts(fingerprint, 20.0) for fingerprint in unique}
+    scores[high] = facts(high, 40.0)
+    scores[medium] = facts(medium, 100.0)  # в 2,5 раза быстрее — больше 1,86
+    chosen = select_nodes(nodes, cfg, scores=scores, costs=costs)
+    assert [node.fingerprint for node in chosen.members] == [medium]
+    scores[medium] = facts(medium, 60.0)  # в 1,5 раза — «высокий» лучше
+    chosen = select_nodes(nodes, cfg, scores=scores, costs=costs)
+    assert [node.fingerprint for node in chosen.members] == [high]
+    assert chosen.reserve is not None and chosen.reserve.fingerprint == x10
+    cfg.filters.max_members = len(unique)
+    chosen = select_nodes(nodes, cfg, scores=scores, costs=costs)
+    assert x100 not in {node.fingerprint for node in chosen.members}
+    chosen = select_nodes(nodes, cfg, scores=scores, costs=costs, quota_low={x10})
+    assert x10 not in {node.fingerprint for node in chosen.members}
+
+
+def test_rating_balance_matches_the_recommendations():
+    """Раздел 3: «высокий × x10» опережает «средний × безлимит», незамеренный живой сервер —
+    не ноль, задержка до 50 мс не штрафуется, x100 и квота на исходе — ноль."""
+    assert rating.priority_factor("high") * rating.cost_factor(10.0) > 1.0
+    assert rating.cost_factor(1.0) == 0.95 and abs(rating.cost_factor(10.0) - 0.75) < 1e-9
+    assert rating.cost_factor(100.0) == 0 and rating.cost_factor(1.0, quota_low=True) == 0
+    assert rating.score(rating.Facts()) > 0
+    assert rating.latency_factor(40.0) == rating.latency_factor(50.0) == 1.0
+    assert abs(rating.health_factor(1.0, 1.0) - 0.15) < 1e-9  # 1 − 0,6 − 0,25
+    assert rating.quota_low({"total": 100, "upload": 0, "download": 96})
+    assert not rating.quota_low({"total": 0})

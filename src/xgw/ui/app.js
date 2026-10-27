@@ -42,7 +42,7 @@
     probe: "адрес проверки", priority: "серверы в работе", reserve: "резервный сервер",
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
     singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
-    guard: "контроль скорости", cores: "обновление ядер",
+    guard: "контроль скорости", cores: "обновление ядер", netcheck: "проверка сети",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -60,6 +60,7 @@
   let state = null;
   let acting = false;
   let timer = 0;
+  let gone = false; // панель открыли в другой вкладке — эта больше ничего не делает
   const drawn = {};
   const groups = new Map(); // источник → его раскрывающийся блок; живёт между перерисовками
 
@@ -169,16 +170,23 @@
 
   async function load() {
     try {
-      const response = await fetch("/api/state", { cache: "no-store", credentials: "same-origin" });
+      // Фокус — для ярлыка и значка в трее: вкладку в фокусе они выводят вперёд, а не
+      // открывают новую (tray.open_panel).
+      const response = await fetch("/api/state", {
+        cache: "no-store", credentials: "same-origin",
+        headers: { "X-XGW-Focus": document.hasFocus() ? "1" : "0" },
+      });
       if (response.status === 401) {
         location.reload();
         return;
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       state = await response.json();
+      if (gone) return;
       $("banner").hidden = true;
       render();
     } catch (error) {
+      if (gone) return;
       $("banner").textContent =
         "Нет связи с демоном XGW — пробую снова. Если так продолжается: sudo systemctl status xgw";
       $("banner").hidden = false;
@@ -187,7 +195,7 @@
 
   function schedule() {
     clearTimeout(timer);
-    if (document.hidden) return;
+    if (document.hidden || gone) return;
     timer = setTimeout(async () => {
       await load();
       schedule();
@@ -247,7 +255,11 @@
     // Идущая запись трафика: строки перерисовываются, только когда она началась или кончилась,
     // а время и размер меняются в метке — иначе кнопка «Остановить» уплывала бы из-под мыши.
     const recording = (s.records || {}).active;
-    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : ""], () => renderDevices(s));
+    // Выбор сервера устройства — из включённых: строки перерисовываются, когда их набор меняется.
+    const routable = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
+      .map((row) => [row.fingerprint, row.name, row.multiplier || 0]);
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable, (s.kernel_direct || {}).reason], () => renderDevices(s));
+    draw("direct", s.kernel_direct, () => renderDirect(s));
     const recTag = $("devices").querySelector(".tag.rec");
     if (recTag && recording) recTag.textContent = recordText(recording, s.now);
     draw("events", s.events, () => renderEvents(s));
@@ -255,6 +267,8 @@
     draw("phones", [s.phones, Math.floor(s.now / 60)], () => renderPhones(s));
     draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
     setBusy($("cores-check"), s.busy.cores);
+    draw("netcheck", [s.netcheck, Math.floor(s.now / 60)], () => renderNetcheck(s));
+    setBusy($("netcheck-run"), Boolean((s.netcheck || {}).running));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
     setBusy($("scan"), s.busy.scan);
@@ -459,7 +473,8 @@
       $("current-label").textContent = chosen
         ? (s.pin.until ? `Выбран вручную до ${stamp(s.pin.until, s.now)}` : "Выбран вручную")
         : main ? "Основной сервер" : "Сейчас через";
-      const delay = current.delay_ms !== null && current.delay_ms !== undefined ? ` · ${current.delay_ms} мс` : "";
+      const shown = hasRtt(current) ? current.rtt_ms : current.delay_ms;
+      const delay = shown !== null && shown !== undefined ? ` · ${shown} мс` : "";
       const speed = current.speed_mbps !== null && current.speed_mbps !== undefined ? ` · ${mbps(current.speed_mbps)}` : "";
       $("current-name").textContent = (current.name || current.tag) + speed + delay;
       $("current-name").title = current.name || current.tag;
@@ -469,17 +484,42 @@
 
   // --- серверы по подпискам -------------------------------------------------
 
-  function serverValue(server) {
+  const hasDelay = (server) => server.delay_ms !== null && server.delay_ms !== undefined;
+  const delayTone = (ms) => (ms < 250 ? "ok" : ms < 700 ? "warn" : "bad");
+  const hasRtt = (server) => server.rtt_ms !== null && server.rtt_ms !== undefined;
+  const rttTone = (ms) => (ms < 120 ? "ok" : ms < 300 ? "warn" : "bad");
+  // Сетевая задержка (RTT) — короткий запрос в уже открытом соединении; время пробы целиком
+  // (рукопожатия и файл) — в подсказке. Без RTT — как раньше, время пробы.
+  function delayBadge(server, s, extra) {
+    const probe = hasDelay(server) ? `проба целиком — ${server.delay_ms} мс` : "";
+    if (hasRtt(server)) {
+      const when = server.rtt_ts ? ` по замеру ${stamp(server.rtt_ts, s.now)}` : "";
+      return el("span", {
+        class: `delay ${rttTone(server.rtt_ms)}`, text: `${server.rtt_ms} мс`,
+        title: [`Сетевая задержка (RTT)${when}`, probe, extra].filter(Boolean).join("; "),
+      });
+    }
+    return el("span", {
+      class: `delay ${delayTone(server.delay_ms)}`, text: `${server.delay_ms} мс`,
+      title: [probe ? "Время пробы целиком" : "", extra].filter(Boolean).join("; "),
+    });
+  }
+
+  function serverValue(server, s) {
     if (server.status === "member") {
       if (server.alive === false) return el("span", { class: "delay bad", text: "нет ответа" });
-      if (server.delay_ms === null || server.delay_ms === undefined) {
+      if (!hasDelay(server) && !hasRtt(server)) {
         return el("span", { class: "delay none", text: server.alive ? "жив" : "проверяется" });
       }
-      const tone = server.delay_ms < 250 ? "ok" : server.delay_ms < 700 ? "warn" : "bad";
-      return el("span", { class: `delay ${tone}`, text: `${server.delay_ms} мс` });
+      return delayBadge(server, s, "");
     }
     if (server.status === "spare") {
       const [tone, text] = VERDICTS[server.verdict] || ["none", server.verdict || "не проверялся"];
+      // Задержка запасного — по его последней проверке (ядро его не пробует): после замера
+      // по кнопке она свежая, как и скорость.
+      if (hasDelay(server) || hasRtt(server)) {
+        return delayBadge(server, s, `${capital(text)} — по проверке ${stamp(server.scanned, s.now)}`);
+      }
       return el("span", { class: `delay ${tone}`, text });
     }
     return el("span", { class: "delay none", text: "—" });
@@ -539,12 +579,18 @@
 
   // 0.1.18: выученный обход блокировки («обход: xray+frag после STALL_BEFORE_BODY»), отметка
   // «нестабилен по ТСПУ» и скорость по реальному трафику через сервер («из трафика»).
+  // 0.2.0: рейтинг сервера (скорость, задержка, стабильность, стоимость и приоритет вместе).
   function extraNote(server, s) {
     let text = "";
+    if (typeof server.score === "number") {
+      text += ` · рейтинг ${server.score.toFixed(2).replace(".", ",")}`;
+    }
     const esc = server.escalation;
     if (esc) {
-      text += ` · обход: ${esc.label}${esc.verdict ? ` после ${esc.verdict}` : ""}`
-        + (esc.ts ? `, ${stamp(esc.ts, s.now)}` : "");
+      // Дата — с какого времени сервер на обходе (отчёт f6b: без «с» её принимали за
+      // время последней проверки).
+      text += ` · обход${esc.ts ? ` с ${stamp(esc.ts, s.now)}` : ""}: ${esc.label}`
+        + (esc.verdict ? ` (после ${esc.verdict})` : "");
     }
     if (server.unstable_until && server.unstable_until > s.now) {
       text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
@@ -697,7 +743,7 @@
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server)),
+      el("div", { class: "values" }, speedTool(server, s), speedValue(server, s), serverValue(server, s)),
       el("div", { class: "row-sub", text: serverNote(server, s) }),
       el("div", { class: "row-tools" },
         chooseNode(server, pinned),
@@ -804,9 +850,10 @@
     const used = s.servers.filter((server) => server.status !== "skipped");
     $("members-count").textContent = used.length ? String(used.length) : "";
     const ranked = s.servers.some((server) => (server.priority || "medium") !== "medium");
-    $("tier-note").hidden = !ranked || !s.tier;
-    $("tier-note").textContent = ranked && s.tier
-      ? `Приоритет: в работе серверы уровня «${LEVEL_NAMES[s.tier] || s.tier}». Уровнем ниже шлюз пользуется, только когда живых выше нет.`
+    // С 0.2.0 приоритет — вес в рейтинге, а не фильтр (issue #2).
+    $("tier-note").hidden = !ranked;
+    $("tier-note").textContent = ranked
+      ? "Приоритет — вес в рейтинге сервера: «высокий» ×1,45, «низкий» ×0,65. В работе — лучшие по рейтингу из всех подписок; сервер уровня ниже встаёт в работу, если он заметно быстрее или если лучших не хватает."
       : "";
     // Тексты пишет шлюз: мёртвого заменить некем; лимитированные в работе из-за приоритета.
     $("stranded-note").hidden = !s.stranded;
@@ -972,10 +1019,52 @@
     $("devices-count").textContent = s.devices.length ? String(s.devices.length) : "";
     $("devices-note").textContent = s.lan.gateway ? `сеть ${s.lan.interface}, шлюз ${s.lan.gateway}` : "";
     const records = s.records || { files: [] };
-    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now)),
+    // Свой сервер устройства (Ф4): из включённых серверов; лимитированные — с пометкой.
+    const choices = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
+      .map((row) => ({
+        fingerprint: row.fingerprint,
+        label: row.multiplier ? `${row.name} · лимит ×${row.multiplier}` : row.name,
+      }));
+    const direct = s.kernel_direct || {};
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices, direct)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
     $("records-block").hidden = !records.files.length;
     fill($("records"), records.files.map(recordRow));
+  }
+
+  // Российские адреса ядром мимо Xray (Ф6) у этого компьютера и контейнеров: переключатель и
+  // пояснение под ним. У устройств сети — свой выбор в их строках (directSelect).
+  function renderDirect(s) {
+    const direct = s.kernel_direct || {};
+    $("kernel-direct").setAttribute("aria-checked", String(Boolean(direct.on)));
+    let text = "Выключено: российские сайты этого компьютера идут напрямую через Xray. Включите — и "
+      + "ядро будет пропускать их само, мимо Xray: меньше нагрузка, соединения не рвутся при его "
+      + "перезапуске. У устройств сети — свой выбор в их строках.";
+    if (direct.reason) text = `${direct.on ? "Включено, но не действует" : "Включить нельзя"}: ${direct.reason}.`;
+    else if (direct.on && !direct.networks) text = "Включено, но сетей нет: geoip.dat не прочитан — российские сайты идут через Xray.";
+    else if (direct.on) text = `Включено: ${direct.networks} российских сетей — напрямую ядром, мимо Xray. DNS — по-прежнему через Xray. У устройств сети — свой выбор в их строках.`;
+    $("direct-note").textContent = text;
+  }
+
+  // Российские адреса устройства — мимо Xray (Ф6, пожелание заказчика из отчёта 25.10.2026:
+  // у каждого устройства свой выбор). «Через Xray» — как у всех.
+  function directSelect(device, direct) {
+    const name = device.name || device.mac;
+    const select = el("select", { class: "prio route", "aria-label": `Российские адреса устройства ${name}`,
+      title: "Российские сайты этого устройства: через Xray (его выход «напрямую») или ядром шлюза, мимо Xray — меньше нагрузка, соединения не рвутся при перезапуске Xray" });
+    select.append(el("option", { value: "", text: "Российские: через Xray" }));
+    select.append(el("option", { value: "on", text: "Российские: мимо Xray" }));
+    const before = device.kernel ? "on" : "";
+    select.value = before;
+    if (direct.reason && !device.kernel) {
+      select.disabled = true;
+      select.title = `Мимо Xray нельзя: ${direct.reason}`;
+    }
+    select.addEventListener("change", () => {
+      act("device/direct", { mac: device.mac, on: select.value === "on" }, select)
+        .then((ok) => { if (!ok) select.value = before; });
+    });
+    return select;
   }
 
   const megabytes = (bytes) => (bytes >= 1048576
@@ -1019,7 +1108,28 @@
 
   // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
-  function deviceRow(device, active, now) {
+  // Свой сервер устройства (Ф4): «Авто» — как у всех, через основной сервер.
+  function routeSelect(device, choices) {
+    const name = device.name || device.mac;
+    const select = el("select", { class: "prio route", "aria-label": `Сервер для устройства ${name}`,
+      title: "Через какой сервер идёт это устройство. Недоступен — временно через основной" });
+    select.append(el("option", { value: "", text: "Сервер: авто" }));
+    let known = !device.route;
+    for (const choice of choices) {
+      known = known || choice.fingerprint === device.route;
+      select.append(el("option", { value: choice.fingerprint, text: choice.label }));
+    }
+    if (!known) select.append(el("option", { value: device.route, text: "выбранный сервер выключен" }));
+    select.value = device.route || "";
+    select.addEventListener("change", () => {
+      const before = device.route || "";
+      act("device/route", { mac: device.mac, server: select.value }, select)
+        .then((ok) => { if (!ok) select.value = before; });
+    });
+    return select;
+  }
+
+  function deviceRow(device, active, now, choices, direct) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
     if (active && active.mac === device.mac) {
@@ -1045,11 +1155,16 @@
     }
     return el("li", {},
       el("div", { class: "row-main" }, title,
-        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` })),
+        el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` }),
+        device.bypass ? null
+          : el("div", { class: "picks" }, routeSelect(device, choices), directSelect(device, direct))),
       el("span", {
         class: device.bypass ? "tag warn" : "tag on",
-        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN") : "через VPN",
-        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml" : "",
+        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")
+          : (device.route ? (device.route_down ? "свой сервер молчит · через основной"
+            : "свой сервер") : "через VPN"),
+        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml"
+          : (device.route_down ? "Свой сервер устройства не отвечает проверкам шлюза — пока он молчит, устройство идёт через основной; вернётся само" : ""),
       }),
       el("div", { class: "row-tools" }, recordTool(device, active, now), control));
   }
@@ -1319,6 +1434,26 @@
     return el("li", { class: "core-row", "data-core": row.core }, main, tools);
   }
 
+  // Проверка сети (кнопка «Проверить сеть»): размер пакетов до сервера, UDP напрямую и через
+  // VPN, утечки DNS и IPv6, чужие правила фаервола. Демон сам её не запускает.
+  const CHECK_LEVELS = { OK: ["on", "в порядке"], WARN: ["warn", "внимание"], FAIL: ["rec", "ошибка"] };
+
+  function renderNetcheck(s) {
+    const n = s.netcheck || {};
+    fill($("netcheck"), (n.checks || []).map((check) => {
+      const [kind, label] = CHECK_LEVELS[check.level] || ["", check.level];
+      const main = el("div", { class: "row-main" },
+        el("div", { class: "row-title" }, el("span", { text: check.name }), el("span", { class: `tag ${kind}`, text: label })),
+        // «ufw …», «nftables.service …» — имена программ пишутся со строчной и в начале фразы.
+        el("div", { class: "row-sub", text: /^[a-z]/.test(check.text) ? check.text : capital(check.text) }));
+      if (check.advice) main.append(el("div", { class: "row-sub", text: "→ " + check.advice }));
+      return el("li", { class: "check-row", "data-level": check.level }, main);
+    }), "");
+    $("netcheck-when").textContent = n.running ? "Проверяю сеть — это займёт до 15 секунд…"
+      : n.at ? `Проверено ${stamp(n.at, s.now)} за ${Math.max(1, Math.round(n.took || 0))} с.`
+        : "Ещё не проверялась. Проверка займёт до 15 секунд: размер пакетов до сервера, пропускает ли провайдер UDP, идёт ли UDP через сервер, не уходят ли DNS и IPv6 мимо VPN, чужие правила фаервола.";
+  }
+
   function renderEvents(s) {
     fill($("events"), s.events.map((event) => el("li", {},
       el("time", { text: stamp(event.ts, s.now) }),
@@ -1400,6 +1535,7 @@
   });
   $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
   $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
+  $("netcheck-run").addEventListener("click", () => act("netcheck", {}, $("netcheck-run")));
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";
@@ -1419,6 +1555,10 @@
   $("refresh").addEventListener("click", () => act("refresh", {}));
   $("scan").addEventListener("click", () => act("scan", {}));
   $("speed").addEventListener("click", () => act("speed", {}));
+  $("kernel-direct").addEventListener("click", () => {
+    const on = $("kernel-direct").getAttribute("aria-checked") !== "true";
+    act("direct", { on }, $("kernel-direct"));
+  });
   $("sticky").addEventListener("click", () => {
     const on = $("sticky").getAttribute("aria-checked") !== "true";
     act("sticky", { on }, $("sticky"));
@@ -1446,10 +1586,65 @@
     });
   }
 
+  // Шлюзу: вкладка скрылась (окно свёрнуто, открыта другая вкладка) или закрылась. По этому
+  // ярлык решает: вывести вперёд свёрнутое окно или сразу открыть новую вкладку.
+  function tell(how) {
+    fetch("/api/state", {
+      cache: "no-store", credentials: "same-origin", keepalive: true,
+      headers: { "X-XGW-Focus": how },
+    }).catch(() => {});
+  }
+
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) clearTimeout(timer);
-    else load().then(schedule);
+    if (document.hidden) {
+      clearTimeout(timer);
+      if (!gone) tell("hidden");
+    } else if (!gone) load().then(schedule);
   });
+  window.addEventListener("pagehide", () => tell("closed"));
+  // Окно вывели вперёд (ярлык, значок в трее) — данные сразу свежие, и шлюз узнаёт о фокусе.
+  window.addEventListener("focus", () => {
+    if (!gone && !document.hidden) load().then(schedule);
+  });
+
+  // --- одна вкладка панели ----------------------------------------------------
+  // Вкладку на экране ярлык «XGW» и значок в трее выводят вперёд (KWin), а когда её не
+  // видно — открывают панель через xdg-open, и браузер даёт новую вкладку. Новая (она уже
+  // впереди и со свежими данными) закрывает прежние, и вкладка XGW всегда одна: вывести
+  // вперёд скрытую вкладку браузер не даёт. Закрыть себя страница может, только если в
+  // истории вкладки одна запись (так её и открывают ярлык и значок); иначе она гаснет и
+  // просит закрыть её вручную. Из двух открытых разом остаётся новейшая.
+
+  function leave() {
+    gone = true;
+    clearTimeout(timer);
+    window.close();
+    setTimeout(() => { // закрыть не дали
+      // Не «XGW …» в начале: окно с таким заголовком ярлык выводил бы вперёд (tray.KWIN_SCRIPT).
+      document.title = "Панель XGW открыта в другой вкладке";
+      document.body.className = "login";
+      document.body.replaceChildren(el("main", { class: "card login-card" },
+        el("img", { src: "/icon.svg", alt: "", width: 56, height: 56 }),
+        el("h1", { text: "Панель открыта в другой вкладке" }),
+        el("p", { class: "muted", text: "Её открыли заново — ярлыком «XGW», значком в трее или по ссылке. Эту вкладку можно закрыть." })));
+    }, 300);
+  }
+
+  if ("BroadcastChannel" in window) {
+    const channel = new BroadcastChannel("xgw-panel");
+    const me = { at: Date.now(), id: Math.random() };
+    channel.onmessage = (event) => {
+      const other = event.data || {};
+      if (gone || typeof other.at !== "number") return;
+      if (other.at > me.at || (other.at === me.at && other.id > me.id)) leave();
+    };
+    channel.postMessage(me);
+    window.addEventListener("pageshow", (event) => { // вернули из кэша «назад»
+      if (!event.persisted || gone) return;
+      me.at = Date.now();
+      channel.postMessage(me);
+    });
+  }
 
   load().then(schedule);
 })();

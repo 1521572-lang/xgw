@@ -90,7 +90,8 @@ def load(path: Path) -> tuple[dict, str]:
     """
     empty: dict = {
         "subscriptions": [], "links": [], "disabled": [], "removed": [], "devices": [],
-        "priority": {}, "sticky": None, "core": {},
+        "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
+        "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
     }
     try:
@@ -132,10 +133,16 @@ def load(path: Path) -> tuple[dict, str]:
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
+        "routes": _routes(raw.get("routes")),
         "priority": _priority(raw.get("priority")),
         "core": _core(raw.get("core")),
         # Основной сервер (speed.sticky) включён или выключен переключателем в панели.
         "sticky": raw["sticky"] if isinstance(raw.get("sticky"), bool) else None,
+        # Российские адреса мимо Xray: у самой машины и контейнеров (routing.kernel_direct) и
+        # у устройств сети ({mac, ip, name}, адрес закрепляется арендой) — переключатели в панели.
+        "kernel_direct": raw["kernel_direct"] if isinstance(raw.get("kernel_direct"), bool)
+        else None,
+        "kernel_devices": _devices(raw.get("kernel_devices")),
         "tailscale": _tailscale(raw.get("tailscale")),
     }, ""
 
@@ -279,6 +286,8 @@ def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -
     def change(data: dict) -> bool:
         devices = [item for item in data["devices"] if item["mac"] != mac_ok]
         if bypass:
+            if any(item["mac"] == mac_ok for item in data["routes"]):
+                raise ManagedError("у устройства выбран свой сервер — сначала поставьте «авто»")
             try:
                 address = str(ipaddress.IPv4Address(ip))
             except ValueError as exc:
@@ -297,14 +306,121 @@ def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -
     return _update(path, change)
 
 
-def replace_devices(path: Path, devices: list[dict]) -> None:
-    """Возвращает прежний список устройств — откат, если сеть изменение не приняла."""
+def replace_devices(
+    path: Path, devices: list[dict], routes: list[dict] | None = None,
+    kernel: list[dict] | None = None,
+) -> None:
+    """Возвращает прежние списки устройств (мимо VPN, со своим сервером и с российскими
+    адресами мимо Xray) — откат, если сеть изменение не приняла."""
 
     def change(data: dict) -> bool:
         data["devices"] = _devices(devices)
+        if routes is not None:
+            data["routes"] = _routes(routes)
+        if kernel is not None:
+            data["kernel_devices"] = _devices(kernel)
         return True
 
     _update(path, change)
+
+
+def set_kernel_device(path: Path, mac: str, ip: str, name: str = "", *, on: bool) -> bool:
+    """Российские адреса устройства — ядром мимо Xray (on) либо снова через Xray; True —
+    что-то изменилось. Правило ядра узнаёт устройство по адресу: он закрепляется арендой."""
+    mac_ok = normalize_mac(mac)
+    if mac_ok is None:
+        raise ManagedError("неверный MAC устройства")
+
+    def change(data: dict) -> bool:
+        kernel = [item for item in data["kernel_devices"] if item["mac"] != mac_ok]
+        if on:
+            try:
+                address = str(ipaddress.IPv4Address(ip))
+            except ValueError as exc:
+                raise ManagedError("неверный адрес устройства") from exc
+            others = [*kernel, *data["devices"], *data["routes"]]
+            if any(item["ip"] == address and item["mac"] != mac_ok for item in others):
+                raise ManagedError("этот адрес уже закреплён за другим устройством")
+            if len(kernel) >= MAX_DEVICES:
+                raise ManagedError(f"устройств с российскими адресами мимо Xray уже {MAX_DEVICES}")
+            clean = name if _NAME_RE.fullmatch(name) else ""
+            kernel.append({"mac": mac_ok, "ip": address, "name": clean})
+        if kernel == data["kernel_devices"]:
+            return False
+        data["kernel_devices"] = kernel
+        return True
+
+    return _update(path, change)
+
+
+def split_kernel_direct(path: Path, online: list[dict]) -> bool:
+    """До разгрузки по устройствам переключатель «российские адреса мимо Xray» был один на
+    всю сеть. Включённый в panel.json, он остаётся переключателем самой машины, а устройства,
+    что сейчас в сети (online: {mac, ip, name}), получают свой — разгрузка, которую оставили
+    включённой, не пропадает. Один раз: потом в panel.json есть kernel_devices. True —
+    файл переписан."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict) or "kernel_devices" in raw or raw.get("kernel_direct") is not True:
+        return False
+
+    def change(data: dict) -> bool:
+        # Адрес, закреплённый за другим устройством, не берётся: аренды разошлись бы.
+        taken = {item["ip"]: item["mac"] for item in [*data["devices"], *data["routes"]]}
+        data["kernel_devices"] = _devices([
+            item for item in online
+            if taken.get(item.get("ip")) in (None, normalize_mac(item.get("mac")))
+        ])
+        return True
+
+    return _update(path, change)
+
+
+def _routes(value: object) -> list[dict]:
+    """Устройства со своим сервером (Ф4): {"mac", "ip", "name", "server"} — server — отпечаток
+    сервера; адрес закрепляется статической арендой, как у устройств мимо VPN."""
+    servers: dict[str, str] = {}
+    for entry in value if isinstance(value, list) else []:
+        server = entry.get("server") if isinstance(entry, dict) else None
+        mac = normalize_mac(entry.get("mac")) if isinstance(entry, dict) else None
+        if mac and isinstance(server, str) and _FINGERPRINT_RE.fullmatch(server):
+            servers.setdefault(mac, server)
+    return [{**item, "server": servers[item["mac"]]} for item in _devices(value)
+            if item["mac"] in servers]
+
+
+def set_route(path: Path, mac: str, ip: str, name: str, server: str) -> bool:
+    """Свой сервер устройства (отпечаток) либо «авто» (server пуст); True — что-то изменилось.
+    Устройство мимо VPN своего сервера иметь не может: в Xray его трафик не попадает."""
+    mac_ok = normalize_mac(mac)
+    if mac_ok is None:
+        raise ManagedError("неверный MAC устройства")
+    if server and not _FINGERPRINT_RE.fullmatch(server):
+        raise ManagedError("неверный сервер")
+
+    def change(data: dict) -> bool:
+        routes = [item for item in data["routes"] if item["mac"] != mac_ok]
+        if server:
+            if any(item["mac"] == mac_ok for item in data["devices"]):
+                raise ManagedError("устройство идёт мимо VPN — сначала верните его в VPN")
+            try:
+                address = str(ipaddress.IPv4Address(ip))
+            except ValueError as exc:
+                raise ManagedError("неверный адрес устройства") from exc
+            if any(item["ip"] == address for item in [*routes, *data["devices"]]):
+                raise ManagedError("этот адрес уже закреплён за другим устройством")
+            if len(routes) >= MAX_DEVICES:
+                raise ManagedError(f"устройств со своим сервером уже {MAX_DEVICES} — больше нельзя")
+            clean = name if _NAME_RE.fullmatch(name) else ""
+            routes.append({"mac": mac_ok, "ip": address, "name": clean, "server": server})
+        if routes == data["routes"]:
+            return False
+        data["routes"] = routes
+        return True
+
+    return _update(path, change)
 
 
 def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:
@@ -384,6 +500,21 @@ def set_sticky(path: Path, value: bool) -> bool:
         if data["sticky"] is value:
             return False
         data["sticky"] = value
+        return True
+
+    return _update(path, change)
+
+
+def set_kernel_direct(path: Path, value: bool | None) -> bool:
+    """Российские адреса самой машины и контейнеров мимо Xray (routing.kernel_direct)
+    включены, выключены или (None) — как в config.toml; True — что-то изменилось."""
+    if value is not None and not isinstance(value, bool):
+        raise ManagedError("ожидается true или false")
+
+    def change(data: dict) -> bool:
+        if data["kernel_direct"] is value:
+            return False
+        data["kernel_direct"] = value
         return True
 
     return _update(path, change)

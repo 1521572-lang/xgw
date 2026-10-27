@@ -10,9 +10,10 @@ import secrets
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
-from .. import cost
-from ..config import Config
+from .. import priority, rating
+from ..config import Config, service_ports
 from ..model import ServerNode
 from ..net import sysctl
 from ..net.tun import MTU as tun_mtu
@@ -22,6 +23,11 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+# Устройство со своим сервером (Ф4): правило по адресу источника прямо на выход этого сервера.
+# С 0.2.0 без балансировщика «dev-<адрес>», loopback-выхода to-main и пробы сервера в
+# burstObservatory: их появление требовало перезапуска Xray (отчёт f6b — три перезапуска за
+# минуту). Жив ли сервер, проверяет демон (Daemon._device_step), и мёртвого он убирает из
+# правил (devices_down) — через API ядра, как любое изменение routing.
 TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
@@ -53,12 +59,12 @@ class Selection:
     # (junk — служебные адреса, ipv6, filter — фильтр имён, dns — домен не разрешается,
     # excluded — отключены или убраны в панели, duplicates — схлопнутые дубли).
     stats: dict[str, int] = field(default_factory=dict)
-    # Класс участников (cost.py): приоритет и стоимость — все участники одного класса.
-    tier: cost.Klass = field(default_factory=lambda: cost.Klass(1, 0.0))
-    # Резервный выход балансировщика (fallbackTag): запасной класса хуже, чем у
-    # участников. Через него трафик идёт, только когда все участники мертвы; observatory
-    # его не пробует. None — классов хуже нет, fallbackTag — первый участник.
+    # Резервный выход балансировщика (fallbackTag): лимитированный запасной. Через него
+    # трафик идёт, только когда все участники мертвы; observatory его не пробует. None —
+    # лимитированных запасных нет, fallbackTag — первый участник.
     reserve: ServerNode | None = None
+    # Рейтинг серверов (rating.py), по которому отобраны участники: отпечаток → число.
+    scores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -123,11 +129,18 @@ def skip_reason(
     return ""
 
 
+def reserve_price(price: float, floor: float) -> bool:
+    """Годится ли сервер такой стоимости в резервный выход при самом дешёвом участнике floor:
+    лимитированный и дороже floor — резервный «хуже» участников и в работу без нужды не
+    встаёт."""
+    return price > 0 and price > floor
+
+
 def select_nodes(
     nodes: Sequence[ServerNode], cfg: Config, *, prefer: Sequence[str] = (),
-    dead: Collection[str] = (), tier: cost.Klass | None = None,
+    dead: Collection[str] = (), scores: Mapping[str, float] | None = None,
     costs: Mapping[str, float] | None = None, reserve: str | None = None,
-    served: Collection[str] | None = None,
+    served: Collection[str] | None = None, quota_low: Collection[str] = (),
 ) -> Selection:
     """Фильтры по имени, отбрасывание служебных адресов, дедупликация,
     канонический порядок (стабилен при любом порядке входных ссылок).
@@ -140,17 +153,20 @@ def select_nodes(
     dead — домены, которых нет в DNS: серверы с такими адресами в конфиг не попадают
     и пробы на них не тратятся, пока домен не появится снова (см. engine).
 
-    tier — класс участников (cost.py): приоритет и стоимость. Участники — только серверы
-    этого класса, даже если их меньше max_members: иначе более быстрый сервер класса
-    хуже отбирал бы трафик у живого сервера класса лучше — например, лимитированный у
-    безлимитного. Остальные — запасные. Без tier (или если серверов такого класса нет)
-    берётся лучший класс из имеющихся.
+    scores — рейтинг серверов (rating.py, считает демон по замерам); у сервера без него —
+    рейтинг по одним приоритету и стоимости (rating.static). Участники — лучшие по рейтингу
+    из всех подписок, до max_members (0.2.0, issue #2): приоритет и стоимость — веса, а не
+    фильтр. Сервер с рейтингом 0 (x100, квота подписки на исходе — quota_low: отпечатки) в
+    участники не попадает. prefer сохраняет нынешних участников и замены из ротации, если
+    они годны.
 
     costs — стоимость серверов по отпечаткам (cost.costs); без неё все безлимитные.
 
     reserve — отпечаток запасного, которому быть резервным выходом (его выбирает демон
-    по дешёвой проверке). Годится только запасной класса хуже, чем у участников; без
-    него резервный — первый запасной лучшего из таких классов.
+    по дешёвой проверке). Годится лимитированный запасной дороже самого дешёвого участника
+    (reserve_price): при безлимитных участниках — любой лимитированный, а когда в работе одни
+    x1, резервного нет, как и до 0.2.0. Без reserve резервный — самый дешёвый из годных,
+    при равной цене — с лучшим рейтингом.
 
     served — отпечатки серверов, которые sing-box сейчас ведёт; без него (None) серверы,
     которые умеет только sing-box, отсеиваются лишь по настройкам (skip_reason).
@@ -194,42 +210,60 @@ def select_nodes(
 
     levels = cfg.managed.priority
     prices = costs if costs is not None else dict.fromkeys(unique, 0.0)
-    ranks = {fingerprint: cost.klass(levels, prices, fingerprint) for fingerprint in unique}
-    present = sorted(set(ranks.values()))
-    active = tier if tier in present else (present[0] if present else cost.Klass(1, 0.0))
+    low = set(quota_low)
+    rated: dict[str, float] = {}
+    for fingerprint in unique:
+        price = prices.get(fingerprint, 1.0)
+        if scores is not None and fingerprint in scores:
+            value = float(scores[fingerprint])
+            if rating.cost_factor(price, fingerprint in low) == 0:
+                value = 0.0  # квота кончилась после замера — всё равно не в работу
+        else:
+            value = rating.static(
+                priority.level_of(levels, fingerprint), price, fingerprint in low)
+        rated[fingerprint] = value
     limit = max(1, cfg.filters.max_members)
     members: list[ServerNode] = []
     for fingerprint in prefer:
         node = unique.get(fingerprint)
         if (
             node is not None and node not in members and len(members) < limit
-            and ranks[fingerprint] == active
+            and rated[fingerprint] > 0
         ):
             members.append(node)
     chosen = {node.fingerprint for node in members}
+    # Запасные — в каноническом порядке (по отпечатку): рейтинг меняется с каждым замером, и
+    # порядок по нему пересобирал бы конфиг без всякой перемены состава.
     rest = sorted(
         (node for node in unique.values() if node.fingerprint not in chosen),
-        key=lambda node: (ranks[node.fingerprint] != active, node.fingerprint, node.name),
+        key=lambda node: (node.fingerprint, node.name),
     )
     free = limit - len(members)
-    same = [node for node in rest if ranks[node.fingerprint] == active][:free]
-    members.extend(same)
-    taken = {node.fingerprint for node in same}
+    best = sorted(
+        (node for node in rest if rated[node.fingerprint] > 0),
+        key=lambda node: (-rated[node.fingerprint], node.fingerprint, node.name),
+    )[:free]
+    members.extend(best)
+    taken = {node.fingerprint for node in best}
     spares = [node for node in rest if node.fingerprint not in taken]
-    worse = sorted(
-        (node for node in spares if ranks[node.fingerprint] > active),
-        key=lambda node: (ranks[node.fingerprint], node.fingerprint, node.name),
+    floor = min((prices.get(node.fingerprint, 1.0) for node in members), default=0.0)
+    limited = sorted(
+        (node for node in spares if reserve_price(prices.get(node.fingerprint, 1.0), floor)),
+        key=lambda node: (
+            node.fingerprint in low, prices.get(node.fingerprint, 1.0),
+            -rated[node.fingerprint], node.fingerprint, node.name,
+        ),
     )
-    backup = next((node for node in worse if node.fingerprint == reserve), None)
-    if backup is None and worse:
-        backup = worse[0]
+    backup = next((node for node in limited if node.fingerprint == reserve), None)
+    if backup is None and limited:
+        backup = limited[0]
 
     # Звенья цепочек нужны, только пока на них ссылается хоть один оставленный узел.
     kept = [*members, *spares]
     chains = _referenced_chains(kept, chains)
     return Selection(
         members=members, spares=spares, chains=chains, warnings=warnings, stats=stats,
-        tier=active, reserve=backup,
+        reserve=backup, scores=rated,
     )
 
 
@@ -361,17 +395,13 @@ def reserve_fingerprint(config: Mapping | None, nodes: Sequence[ServerNode]) -> 
 
 
 def _allocate_ports(
-    probe_tags: Sequence[str], previous: Mapping[str, int], cfg: Config
+    probe_tags: Sequence[str], previous: Mapping[str, int], cfg: Config,
+    avoid: Collection[int] = (),
 ) -> dict[str, int]:
     """Порт закрепляется за probe-тегом: существующие сохраняются, новые
-    получают первый свободный, начиная с probe_port_base."""
-    reserved = {
-        cfg.capture.tproxy_port,
-        cfg.xray.api_port,
-        cfg.xray.metrics_port,
-        cfg.xray.socks_port,
-        cfg.xray.http_port,
-    }
+    получают первый свободный, начиная с probe_port_base. Мимо служебных портов XGW и
+    ядер (config.service_ports) и avoid — входов sing-box (аудит, F-04)."""
+    reserved = set(service_ports(cfg).values()) | set(avoid)
     ports: dict[str, int] = {}
     used: set[int] = set()
     for tag in probe_tags:
@@ -461,13 +491,43 @@ def fragmented_fingerprints(config: Mapping | None, nodes: Sequence[ServerNode])
     }
 
 
+def device_routes(
+    cfg: Config, nodes: Sequence[NodeInfo], down: Collection[str] = (),
+) -> list[tuple[str, str]]:
+    """(адрес устройства, тег его сервера) для устройств со своим сервером
+    (cfg.managed.routes, Ф4). Сервера нет в конфиге (отключён, убран, отсеян) или демон счёл
+    его мёртвым (down — адреса устройств) — устройство идёт через основной, как все."""
+    tags = {info.fingerprint: info.tag for info in nodes}
+    return [
+        (ip, tags[fingerprint])
+        for ip, fingerprint in sorted(cfg.managed.routes.items())
+        if fingerprint in tags and ip not in down
+    ]
+
+
 def _dns_server(entry: str) -> tuple[str, int | None]:
     """«1.1.1.1» или «1.1.1.1:5353» → (адрес, порт). Порт не 53 Xray принимает
-    только объектом {"address", "port"}."""
+    только объектом {"address", "port"}. Адрес DoH («https://77.88.8.8/dns-query») — как
+    есть: порт в нём самом."""
+    if "://" in entry:
+        return entry, None
     address, sep, port = entry.rpartition(":")
     if sep and port.isdigit() and address.count(".") == 3:
         return address, int(port)
     return entry, None
+
+
+def dns_server_ip(entry: str) -> str:
+    """IP сервера DNS из записи dns.*_servers («77.88.8.8», «77.88.8.8:5353»,
+    «https://77.88.8.8/dns-query»); пусто — записан именем."""
+    address = _dns_server(entry)[0]
+    if "://" in address:
+        address = urlsplit(address).hostname or ""
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    return address
 
 
 def _modernize(outbound: dict) -> None:
@@ -533,8 +593,16 @@ def build(
     fragment: Collection[str] = (),
     profile_of: Mapping[str, str] | None = None,
     bridge: singboxing.Plan | None = None,
+    devices_down: Collection[str] = (),
+    avoid_ports: Collection[int] = (),
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
+
+    devices_down — адреса устройств, чей свой сервер (Ф4) сейчас не отвечает: их правила в
+    конфиг не попадают, и устройство идёт через основной (device_routes).
+
+    avoid_ports — порты, которых не занимать проверкам Xray (входы новой сборки sing-box,
+    если её перезапуск отложен); входы bridge обходятся и так.
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -562,7 +630,8 @@ def build(
     ordered = list(selection.members) + list(selection.spares)
     suffixes = assign_suffixes(ordered)
     ports = _allocate_ports(
-        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg
+        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg,
+        avoid={*avoid_ports, *(bridge.ports.values() if bridge is not None else ())},
     )
 
     nodes: list[NodeInfo] = []
@@ -725,14 +794,10 @@ def build(
         rules.append(
             {"type": "field", "inboundTag": capture_tags, "port": "53", "outboundTag": "dns-out"}
         )
-    if direct_dns:
-        rules.append(
-            {
-                "type": "field",
-                "ip": [address for address, _port in direct_dns],
-                "outboundTag": "direct",
-            }
-        )
+    # Запросы к прямым серверам DNS (и DoH к ним) — выходом direct, мимо VPN.
+    direct_ips = [ip for ip in map(dns_server_ip, cfg.dns.direct_servers) if ip]
+    if direct_ips:
+        rules.append({"type": "field", "ip": direct_ips, "outboundTag": "direct"})
     rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
     # Адреса Tailscale Funnel (*.ts.net) — напрямую: через VPN-сервер Funnel не открывается
     # (испытания А1 и А3), а телефон в домашнем Wi-Fi ходит к API приложения на самом шлюзе
@@ -748,6 +813,12 @@ def build(
         )
     if cfg.routing.direct_ips:
         rules.append({"type": "field", "ip": list(cfg.routing.direct_ips), "outboundTag": "direct"})
+    # Свой сервер устройства — после DNS, частных сетей и direct_*: российские сайты у
+    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника.
+    rules.extend(
+        {"type": "field", "source": [ip], "outboundTag": tag}
+        for ip, tag in device_routes(cfg, nodes, devices_down)
+    )
     if cfg.routing.proxy_domains:
         rules.append(
             {
@@ -758,9 +829,9 @@ def build(
         )
     rules.append({"type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG})
 
-    # Резервный выход — запасной класса хуже (дешёвый лимитированный): через него трафик
-    # идёт, только когда observatory считает мёртвыми всех участников. В subjectSelector
-    # он не входит, поэтому ядро его не пробует. Нет резервного — первый участник.
+    # Резервный выход — дешёвый лимитированный запасной: через него трафик идёт, только
+    # когда observatory считает мёртвыми всех участников. В subjectSelector он не входит,
+    # поэтому ядро его не пробует. Нет резервного — первый участник.
     fallback_tag = nodes[0].tag
     if selection.reserve is not None:
         fallback_tag = next(
@@ -811,7 +882,7 @@ def build(
                     "selector": ["proxy-"],
                     "strategy": {"type": "leastPing"},
                     "fallbackTag": fallback_tag,
-                }
+                },
             ],
         },
         "burstObservatory": {
