@@ -137,7 +137,8 @@ def test_spares_download_less_and_classes_have_their_own_period():
     cfg = Config()  # max_mb = 10, spare_mb = 3
     assert speed.size_mb(cfg, 0.0, spare=True) == 3 and speed.size_mb(cfg, 10.0, spare=True) == 1
     assert speed.size_mb(cfg, 100.0, spare=True) == 0
-    assert speed.every_hours(cfg, 0.0) == 1 and speed.every_hours(cfg, 1.0) == 6
+    # С 0.1.18 безлимитные тоже раз в 6 ч (решение заказчика 24.10.2026, config.Speed).
+    assert speed.every_hours(cfg, 0.0) == 6 and speed.every_hours(cfg, 1.0) == 6
     assert speed.every_hours(cfg, 100.0) == 0
     cfg.speed.unlimited_hours = 0
     assert speed.every_hours(cfg, 0.0) == 0 and speed.every_hours(cfg, 10.0) == 6

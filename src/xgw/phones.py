@@ -34,6 +34,10 @@ SKEW = 60.0  # насколько время в запросе может рас
 MAX_PHONES = 10
 MAX_NAME = 40
 SEEN_EVERY = 60.0  # «последний запрос» записывается на диск не чаще
+# Принятые случайные числа запросов — и в файле в /run/xgw (память, не диск): после
+# перезапуска демона тот же подписанный запрос в пределах SKEW принят бы снова (четвёртый аудит
+# 0.2.0, ASSUMPTIONS п. 253).
+NONCES_FILE = "phone-nonces.json"
 _ID_RE = re.compile(r"[0-9a-f]{12}")
 _NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 _CODE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
@@ -83,6 +87,7 @@ class Phones:
         self._pair: dict | None = None  # {"code", "until"} — код из QR, один
         self._paired_last: str = ""  # id телефона, привязанного по последнему коду
         self._nonces: dict[str, float] = {}  # «телефон:случайное число» → когда пришло
+        self._nonces_read = False
         self._seen_saved: dict[str, float] = {}
 
     # --- файл ---------------------------------------------------------------------
@@ -114,6 +119,20 @@ class Phones:
 
     def _save(self, phones: dict[str, dict]) -> None:
         atomic_write_json(store_file(self.paths), {"phones": phones}, mode=0o600)
+
+    def _read_nonces(self) -> None:
+        """Числа, принятые до перезапуска (один раз за жизнь объекта; файла нет — их нет)."""
+        if self._nonces_read:
+            return
+        self._nonces_read = True
+        try:
+            raw = json.loads((self.paths.run / NONCES_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(raw, dict):
+            for marker, when in raw.items():
+                if isinstance(marker, str) and isinstance(when, (int, float)):
+                    self._nonces.setdefault(marker, float(when))
 
     # --- для панели ---------------------------------------------------------------
 
@@ -222,6 +241,7 @@ class Phones:
             expected = sign(key, phone_id, method, path, stamp, nonce, body)
             if not hmac.compare_digest(expected, signature):
                 raise PhoneError("подпись не сходится")
+            self._read_nonces()
             for seen_nonce, when in list(self._nonces.items()):
                 if now - when > 2 * SKEW:
                     del self._nonces[seen_nonce]
@@ -229,6 +249,8 @@ class Phones:
             if marker in self._nonces:
                 raise PhoneError("повтор запроса")
             self._nonces[marker] = now
+            with contextlib.suppress(OSError):
+                atomic_write_json(self.paths.run / NONCES_FILE, self._nonces, mode=0o600)
             if now - self._seen_saved.get(phone_id, 0.0) >= SEEN_EVERY:
                 item["seen"] = now
                 with contextlib.suppress(OSError):

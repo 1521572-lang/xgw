@@ -425,7 +425,7 @@ class Panel:
         xray_bin = validate.find_xray(None, self.paths)
         if xray_bin is not None:
             with contextlib.suppress(Exception):
-                info = engine.make_api(self.cfg, xray_bin).balancer_state(BALANCER_TAG)
+                info = engine.make_api(self.paths, xray_bin).balancer_state(BALANCER_TAG)
                 tags = [info.override] if info.override else list(info.selects)
         self._selecting = (now, tags)
         return tags

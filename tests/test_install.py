@@ -10,6 +10,7 @@ import pytest
 from fakesys import FakeSystem
 
 from xgw import config, managed
+from xgw.generator import builder
 from xgw.install import UNIT_FILES, Facts, Installer, Journal
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
@@ -1144,11 +1145,36 @@ def test_daemon_unit_is_sandboxed():
 @pytest.mark.parametrize(
     "unit", sorted(path.name for path in (REPO / "packaging").glob("*.service")))
 def test_no_unit_opens_run_for_writing(unit):
-    """systemd 259 (Ubuntu 26.04): ProtectControlGroups вместе с ProtectSystem=strict делает
-    /run доступным на запись (третий аудит 0.2.0, ASSUMPTIONS п. 252) — его нет ни у одной
-    службы XGW."""
+    """ProtectControlGroups, ProtectKernelTunables и ProtectProc вместе с ProtectSystem=strict
+    делают /run доступным на запись — и в systemd 255 (Ubuntu 24.04), и в 259 (третий и
+    четвёртый аудит 0.2.0, ASSUMPTIONS п. 252, 253). ProtectControlGroups нет ни у одной
+    службы; у службы с ProtectKernelTunables или ProtectProc /run закрыт явной строкой."""
     text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
-    assert not any(line.startswith("ProtectControlGroups") for line in text.splitlines())
+    lines = [line for line in text.splitlines() if line and line[0] != "#"]
+    assert not any(line.startswith("ProtectControlGroups") for line in lines)
+    if "ProtectSystem=strict" in lines and any(
+            line.startswith(("ProtectKernelTunables=", "ProtectProc=")) for line in lines):
+        assert "ReadOnlyPaths=/run" in lines
+
+
+def test_xray_api_socket_is_open_only_to_the_xray_group():
+    """Четвёртый аудит 0.2.0: API Xray — сокет в каталоге службы ядра; каталог и сокет —
+    пользователя и группы xray (UMask), в группе — демон и задание обновления ядер (без
+    CAP_DAC_OVERRIDE root подключается к сокету только как член группы)."""
+    def settings(unit: str) -> dict[str, str]:
+        text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
+        return dict(
+            line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
+        )
+
+    core = settings("xgw-xray.service")
+    assert core["User"] == core["Group"] == "xray"
+    assert core["RuntimeDirectory"] == "xgw-xray" and core["RuntimeDirectoryMode"] == "0750"
+    assert core["UMask"] == "0007"
+    assert "RuntimeDirectoryPreserve" not in core  # каталог со старым сокетом убирается
+    for unit in ("xgw.service", "xgw-core.service"):
+        assert settings(unit)["SupplementaryGroups"] == "xray", unit
+    assert Path(builder.API_SOCKET).parent.name == core["RuntimeDirectory"]
 
 
 def test_reinstall_notices_changed_service_files(box):

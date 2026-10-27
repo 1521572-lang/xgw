@@ -19,7 +19,7 @@ from ports import free_port
 from xgw.apply.applier import Applier
 from xgw.config import Config
 from xgw.generator import validate
-from xgw.generator.builder import build, select_nodes
+from xgw.generator.builder import API_SOCKET, build, select_nodes
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
 from xgw.paths import Paths
@@ -35,12 +35,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _live_config(cfg: Config) -> dict:
+def _live_config(cfg: Config, api_listen: str = API_SOCKET) -> dict:
     """Конфиг генератора без того, чего нет вне шлюза: TPROXY-inbound требует
     Linux и CAP_NET_ADMIN, правила geoip — файла geoip.dat рядом с бинарником."""
     raws, _, _ = parse_links_text("\n".join(links.FULL_LINKS), "test")
     nodes = [raw_to_node(raw, "test") for raw in raws]
-    config = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32).config
+    config = build(cfg, select_nodes(nodes, cfg), hosts={}, probe_password="P" * 32,
+                   api_listen=api_listen).config
     config["inbounds"] = [i for i in config["inbounds"] if i["tag"] != "tproxy-in"]
     config["routing"]["rules"] = [
         rule
@@ -61,13 +62,15 @@ def live(tmp_path, monkeypatch):
     cfg = Config()
     cfg.filters.max_members = 2
     cfg.apply.restart_window = "00:00-00:01"
-    cfg.xray.api_port, cfg.xray.metrics_port = free_port(), free_port()
+    cfg.xray.metrics_port = free_port()
     cfg.xray.socks_port, cfg.xray.http_port = free_port(), free_port()
     cfg.xray.probe_port_base = free_port()
-    base = _live_config(cfg)
+    # API — сокет, как на шлюзе (ASSUMPTIONS п. 253); каталог у службы создаёт systemd.
+    paths.xray_api_socket.parent.mkdir(parents=True, exist_ok=True)
+    base = _live_config(cfg, str(paths.xray_api_socket))
     paths.xray_config_file.write_text(json.dumps(base), encoding="utf-8")
     service = ProcessXrayService(Path(XRAY_BIN), paths.xray_config_file)
-    api = ApiClient(Path(XRAY_BIN), server=f"127.0.0.1:{cfg.xray.api_port}", timeout=5)
+    api = ApiClient(Path(XRAY_BIN), server=f"unix://{paths.xray_api_socket}", timeout=5)
     service.start()
     deadline = time.monotonic() + 15
     while True:

@@ -346,18 +346,47 @@ def _request_with_redirects(
     if not isinstance(dns, _Dns):
         dns = _Dns(dns)
     current = url
+    sent = dict(headers)
     for _ in range(5):
-        result = _request_once(current, headers, timeout, mark, dns, proxy, data, cancel)
+        result = _request_once(current, sent, timeout, mark, dns, proxy, data, cancel)
         # Тело за перенаправлением не отправляется: запрос с телом не повторяется по чужому
         # адресу.
         if data is None and result.status in (301, 302, 303, 307, 308):
             location = result.headers.get("location", "")
             if not location:
                 return result
-            current = urljoin(current, location)
+            target = urljoin(current, location)
+            sent = redirect_headers(current, target, sent)
+            current = target
             continue
         return result
     raise FetchError(f"слишком много перенаправлений: {masking.mask_url(url)}")
+
+
+# Заголовки с учётными данными: на другой адрес (схема, хост или порт) они не уходят — как у
+# curl и requests (четвёртый аудит 0.2.0, ASSUMPTIONS п. 253). Остальные заголовки подписки
+# (X-Hwid, модель устройства) идут дальше: провайдеры перенаправляют на свои же зеркала.
+CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urlsplit(url)
+    default = 443 if parts.scheme == "https" else 80
+    return parts.scheme, (parts.hostname or "").lower(), parts.port or default
+
+
+def redirect_headers(current: str, target: str, headers: dict[str, str]) -> dict[str, str]:
+    """Заголовки для запроса по перенаправлению current → target. С https на http — отказ:
+    подписку (в ней ключи серверов) и заголовки увидел бы любой по дороге, в том числе ТСПУ."""
+    if urlsplit(current).scheme == "https" and urlsplit(target).scheme != "https":
+        raise FetchError(
+            f"подписка перенаправила с https на {urlsplit(target).scheme or '(нет схемы)'}: "
+            f"{masking.mask_url(target)} — без шифрования не запрашиваю"
+        )
+    if _origin(current) == _origin(target):
+        return headers
+    return {name: value for name, value in headers.items()
+            if name.lower() not in CREDENTIAL_HEADERS}
 
 
 def _is_ip(host: str) -> bool:

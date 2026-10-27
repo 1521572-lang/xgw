@@ -23,6 +23,10 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+# API Xray — Unix-сокет в каталоге службы xgw-xray (RuntimeDirectory), а не порт на 127.0.0.1:
+# к порту мог подключиться любой процесс машины (ASSUMPTIONS п. 253). Стенд и тесты под
+# XGW_ROOT передают свой путь (engine.assemble — paths.xray_api_socket).
+API_SOCKET = "/run/xgw-xray/api.sock"
 # Устройство со своим сервером (Ф4): правило по адресу источника прямо на выход этого сервера.
 # С 0.2.0 без балансировщика «dev-<адрес>», loopback-выхода to-main и пробы сервера в
 # burstObservatory: их появление требовало перезапуска Xray (отчёт f6b — три перезапуска за
@@ -595,6 +599,7 @@ def build(
     bridge: singboxing.Plan | None = None,
     devices_down: Collection[str] = (),
     avoid_ports: Collection[int] = (),
+    api_listen: str = API_SOCKET,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
@@ -603,6 +608,8 @@ def build(
 
     avoid_ports — порты, которых не занимать проверкам Xray (входы новой сборки sing-box,
     если её перезапуск отложен); входы bridge обходятся и так.
+
+    api_listen — где слушает API Xray: путь сокета (API_SOCKET) или «адрес:порт».
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -855,7 +862,7 @@ def build(
         "log": {"loglevel": "warning"},
         "api": {
             "tag": "api",
-            "listen": f"127.0.0.1:{cfg.xray.api_port}",
+            "listen": api_listen,
             "services": ["HandlerService", "RoutingService", "StatsService"],
         },
         "metrics": {"tag": "metrics", "listen": f"127.0.0.1:{cfg.xray.metrics_port}"},

@@ -6,6 +6,7 @@ import base64
 import gzip
 import json
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -55,6 +56,23 @@ def _headers(phone_id: str, key: bytes, method: str, path: str, body: bytes, sta
         "X-XGW-Phone": phone_id, "X-XGW-Time": stamp_text, "X-XGW-Nonce": nonce,
         "X-XGW-Signature": phones.sign(key, phone_id, method, path, stamp_text, nonce, body),
     }
+
+
+def test_signed_request_is_not_accepted_twice_even_after_restart(book):
+    """Четвёртый аудит 0.2.0: принятые случайные числа — в /run/xgw, и новый экземпляр
+    (перезапуск демона) тот же подписанный запрос не принимает."""
+    store, clock, paths = book
+    phone_id, key = store.pair(store.new_code(), "Galaxy")
+    headers = _headers(phone_id, key, "GET", "/api/state", b"", clock())
+    assert store.verify(headers, "GET", "/api/state", b"").id == phone_id
+    again = phones.Phones(paths, clock=clock)
+    with pytest.raises(phones.PhoneError, match="повтор"):
+        again.verify(headers, "GET", "/api/state", b"")
+    clock.now += 3 * phones.SKEW  # старые числа отбрасываются, файл не растёт
+    fresh = _headers(phone_id, key, "GET", "/api/state", b"", clock(), nonce="nonce-fresh-0123456")
+    assert again.verify(fresh, "GET", "/api/state", b"").id == phone_id
+    saved = json.loads((paths.run / phones.NONCES_FILE).read_text(encoding="utf-8"))
+    assert list(saved) == [f"{phone_id}:nonce-fresh-0123456"]
 
 
 def test_pairing_code_works_once_and_for_ten_minutes(book):
@@ -387,10 +405,38 @@ def test_bad_requests_are_refused_and_lock_the_door(api, monkeypatch):
         status, _payload = stranger.signed("GET", "/api/state")
     assert status in (403, 429)
     assert stranger.signed("GET", "/api/state")[0] == 429
-    assert phone.signed("GET", "/api/state")[0] == 429  # дверь закрыта для всех на минуту
+    # Четвёртый аудит 0.2.0: чужие неудачи не закрывают вход привязанному телефону — подпись
+    # не подобрать; закрыты на минуту привязка и запросы без верной подписи.
+    assert phone.signed("GET", "/api/state")[0] == 200
+    assert phone.pair("x" * 32, "Чужой")[0] == 429
     assert phone.raw("GET", "/api/hello")[0] == 200  # проверка Funnel — по-прежнему
     events = [row["detail"] for row in api.panel.state()["events"]]
     assert any("неудачных входов за минуту" in detail for detail in events)
+
+
+def test_connections_are_capped_and_a_slow_request_is_cut(tmp_path, monkeypatch):
+    """Funnel открыт всему интернету: лишние соединения закрываются сразу, а запрос, который
+    шлют по байту, — по сроку READ_DEADLINE, а не по таймауту каждого чтения."""
+    monkeypatch.setattr(appapi, "MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(appapi, "READ_DEADLINE", 1.0)
+    rig = Rig(tmp_path, monkeypatch)
+    server = AppApi(rig.panel, rig.panel.phones, port=0)
+    server.start()
+    try:
+        slow = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        slow.sendall(b"GET /api/hello HTTP/1.1\r\n")  # заголовки не дописаны
+        time.sleep(0.2)
+        extra = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        extra.sendall(b"GET /api/hello HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert extra.recv(100) == b""  # единственное место занято — закрыто без ответа
+        extra.close()
+        started = time.monotonic()
+        assert slow.recv(100) == b""  # срок истёк — соединение закрыто сервером
+        assert time.monotonic() - started < 3
+        slow.close()
+    finally:
+        server.stop()
+        rig.panel.stop()
 
 
 def test_rate_limit_per_phone(api, monkeypatch):

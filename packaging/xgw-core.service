@@ -20,3 +20,5 @@ PrivateTmp=true
 NoNewPrivileges=true
 # CAP_NET_ADMIN — метка SO_MARK: на GitHub напрямую, мимо перехвата (как xgw update-xray).
 CapabilityBoundingSet=CAP_NET_ADMIN
+# Группа xray — сокет API Xray: после обновления задание ждёт ответа ядра (как xgw.service).
+SupplementaryGroups=xray

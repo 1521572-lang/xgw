@@ -293,7 +293,7 @@ bootstrap_check_minutes = 30
 # проверен. Другое значение не учитывается (xgw предупредит); установлена другая версия —
 # sudo xgw update-xray поставит 26.10.21.
 version = "26.10.21"
-api_port = 10085
+# API Xray — Unix-сокет /run/xgw-xray/api.sock (только для XGW), порт ему не нужен.
 metrics_port = 10086
 socks_port = 10808
 http_port = 10809

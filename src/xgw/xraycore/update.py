@@ -78,7 +78,7 @@ def update_xray(
 
     with file_lock(paths.lock_file):
         service = engine.make_service(paths, paths.xray_bin)
-        api = engine.make_api(cfg, paths.xray_bin)
+        api = engine.make_api(paths, paths.xray_bin)
         configured = paths.xray_config_file.exists()
         shutil.rmtree(previous, ignore_errors=True)
         try:

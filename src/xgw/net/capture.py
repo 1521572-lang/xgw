@@ -481,7 +481,25 @@ class Capture:
         for warning in warnings:
             self.log.warning("%s", warning)
         self.tidy()
+        # Отпечаток только что загруженных таблиц — для loaded(). Прочитать нельзя — отпечатка
+        # нет, и loaded() сверяет как раньше (по цепочкам), а не загружает правила по кругу.
+        self._save(tables=self._tables_digest())
         return mode
+
+    def _tables_digest(self, text: str | None = None) -> str | None:
+        """Отпечаток таблиц `ip xgw` и `ip6 xgw6` (nft.tables_digest); text — уже прочитанный
+        краткий вывод `ip xgw`. None — прочитать нельзя."""
+        if text is None:
+            text = nft.listing(self.lister, terse=True)
+            if text is None:
+                return None
+        text6 = ""
+        if self.ipv6_usable():
+            text6 = nft.listing(self.lister, "ip6", nft.TABLE6, terse=True)
+            if text6 is None:
+                return None
+        return nft.tables_digest(
+            nft.structure(text, "ip", nft.TABLE), nft.structure(text6, "ip6", nft.TABLE6))
 
     def tidy(self) -> str:
         """Убирает интерфейс TUN, который больше не нужен: в конфиге не capture.method =
@@ -641,6 +659,7 @@ class Capture:
             try:
                 with self._own_rules():
                     nft.delete(self.runner)
+                self._save(tables=None)  # таблиц нет — сверять loaded() не с чем
                 self._routes_down(self.rules("off"))  # перехвата нет: убирается всё
                 if remove_tun:
                     tun.remove(self.cfg.capture.tun_name, self.runner)
@@ -720,6 +739,13 @@ class Capture:
         guard = self._v6_guard_loaded(rules)
         if guard is not True:
             return guard
+        loaded_digest = self._state().get("tables")
+        if loaded_digest is not None:
+            current = self._tables_digest(text)
+            if current is None:
+                return None
+            if current != loaded_digest:
+                return False  # правило убрали или изменили, хотя цепочки на месте
         if not self._ts_loaded(rules, text, rules.ts4, rules.ts4 and rules.capture_local):
             return False  # tailscaled запустился или остановился, набор не тот
         if nft.ts_exit_state(text) != rules.ts_forward:

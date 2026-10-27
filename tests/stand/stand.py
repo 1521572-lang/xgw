@@ -173,7 +173,7 @@ class Stand:
             self.inet_ip = "127.0.0.1"
             self.origin_port, self.dns_port = free_port(), free_port()
         self.ports = {
-            name: free_port() for name in ("api", "metrics", "socks", "http", "singbox_api")
+            name: free_port() for name in ("metrics", "socks", "http", "singbox_api")
         }
         self.ports["probe_base"] = free_block()
         self.ports["singbox_base"] = free_block(128)
@@ -529,7 +529,6 @@ bootstrap = ["udp://{self.inet_ip}:{self.dns_port}"]
 # Стенд проверяет тот Xray, что дан в XGW_XRAY_BIN (XGW работает только с 26.10.21):
 # установка на «одноразовой машине» его не меняет (сети там нет).
 version = "26.10.21"
-api_port = {self.ports['api']}
 metrics_port = {self.ports['metrics']}
 socks_port = {self.ports['socks']}
 http_port = {self.ports['http']}
@@ -607,7 +606,7 @@ wan_check = "{self.inet_ip}:{self.origin_port}"
         """`xray api <command>` к ядру шлюза."""
         result = subprocess.run(
             [*self._prefix("gw"), str(self.xray_bin), "api", command,
-             "-s", f"127.0.0.1:{self.ports['api']}", "-t", "5", *args],
+             "-s", f"unix://{self.root / 'run/xgw-xray/api.sock'}", "-t", "5", *args],
             capture_output=True, text=True, timeout=20,
         )
         if result.returncode != 0:

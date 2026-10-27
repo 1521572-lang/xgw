@@ -197,7 +197,7 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
             f"{', '.join(members) or 'нет'} (все — xgw servers)",
         )
     try:
-        engine.make_api(cfg, xray_bin).pin(BALANCER_TAG, tag)
+        engine.make_api(paths, xray_bin).pin(BALANCER_TAG, tag)
     except ApiError as exc:
         return Outcome(1, str(exc))
     now = time.time()
@@ -236,7 +236,7 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
     if xray_bin is None:
         return Outcome(1, f"xray не найден (ожидается {paths.xray_bin} либо XGW_XRAY_BIN)")
     try:
-        engine.make_api(cfg, xray_bin).unpin(BALANCER_TAG)
+        engine.make_api(paths, xray_bin).unpin(BALANCER_TAG)
     except ApiError as exc:
         return Outcome(1, str(exc))
     with open_store(paths) as store:

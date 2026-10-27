@@ -33,8 +33,10 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 # Остальное — то, что службе не нужно вовсе: модули, журнал ядра, часы, свои пространства
 # имён, realtime, setuid-файлы и системные вызовы вне @system-service. ProtectControlGroups
-# нет: в systemd 259 вместе с ProtectSystem=strict он открывает /run на запись (ASSUMPTIONS
-# п. 252).
+# нет. /run — только чтение явной строкой (свой каталог из RuntimeDirectory остаётся
+# доступным): ProtectProc вместе с ProtectSystem=strict открывает его на запись — и в systemd
+# 255 (Ubuntu 24.04), и в 259 (ASSUMPTIONS п. 252, 253).
+ReadOnlyPaths=/run
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectClock=yes
