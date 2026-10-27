@@ -385,6 +385,10 @@ def test_phone_pairs_through_the_panel_button_and_gets_a_valid_xray_config(tmp_p
         stand.start_daemon()
         assert wait_for(lambda: _panel(stand, "raw", "/").get("status") == 200, 60), (
             stand.tail("daemon", 30))
+        # Панель отвечает раньше, чем демон закончит первый шаг: телефону нужны состояние и
+        # участники, как в остальных стендах — ждать HEALTHY.
+        assert wait_for(lambda: stand.xgw_json("status").get("state") == "HEALTHY", 60), (
+            stand.tail("daemon", 30))
         token = (stand.root / "var/lib/xgw/panel-token").read_text(encoding="ascii").strip()
 
         def phone(*args: str) -> dict:
@@ -405,8 +409,11 @@ def test_phone_pairs_through_the_panel_button_and_gets_a_valid_xray_config(tmp_p
         assert state["status"] == 200 and state["state"] and state["members"] >= 1, state
         acted = phone("act", str(keyfile), json.dumps({"name": "scan"}))
         assert acted["status"] == 200 and acted["ok"] is True, acted
-        refused = phone("act", str(keyfile), json.dumps({"name": "add", "text": "x"}))
+        # Серверы телефону можно (пульт А3.2), а доступ к самому шлюзу — нет: выключив Funnel,
+        # телефон отрезал бы себя.
+        refused = phone("act", str(keyfile), json.dumps({"name": "tailscale/funnel", "on": False}))
         assert refused["status"] == 403
+        assert json.loads(fake.read_text(encoding="utf-8"))["funnel"] == url
         replay = phone("replay", str(keyfile))
         assert replay == {"first": 200, "replay": 403}
 
