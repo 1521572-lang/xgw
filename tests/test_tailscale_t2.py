@@ -387,3 +387,61 @@ def test_uninstall_reports_a_serve_it_could_not_remove(tmp_path):
     gone = _uninstaller(tmp_path / "2", FakeTailscale(), out, which=lambda name: None)
     managed.set_tailscale_serve(managed.path_for(gone.paths.config_file), NAME)
     assert gone.run() == 0 and any("Tailscale не установлен" in line for line in out)
+
+
+# --- отчёт 0.2.0: CLI tailscale реже, пока вкладка открыта -----------------------
+
+
+def _cli_runs(fake) -> list[tuple[str, ...]]:
+    return [call for call in fake.calls if call[0] == "tailscale"]
+
+
+def test_serve_and_funnel_come_from_one_cli_run():
+    fake = FakeTailscale()
+    fake.serve, fake.funnel = "http://127.0.0.1:8781", "http://127.0.0.1:8790"
+    assert tailscale.serve_live(8781, 8790, fake) == (True, True)
+    assert fake.calls == [("tailscale", "serve", "status", "--json")]
+    assert tailscale.serve_live(8781, None, fake) == (True, None)  # API приложения нет
+    assert tailscale.serve_live(9999, 8790, fake) == (False, True)
+
+    def missing(argv, **_kwargs):
+        raise CommandError("tailscale: программа не найдена")
+
+    assert tailscale.serve_live(8781, 8790, missing) == (None, None)
+
+
+def test_quiet_card_asks_the_cli_once_a_minute(ts_rig):
+    fake, panel = ts_rig.fake, ts_rig.panel
+    assert _card(ts_rig)["state"] == "running"
+    assert _cli_runs(fake).count(("tailscale", "serve", "status", "--json")) == 1
+    fake.calls.clear()
+    ts_rig.client.state()
+    stamp, card = panel._ts_card
+    panel._ts_card = (stamp - panel_module.TS_TTL_BUSY - 1, card)  # прежний срок — 10 с
+    ts_rig.client.state()
+    assert _cli_runs(fake) == []
+    panel._ts_card = (stamp - panel_module.TS_TTL - 1, card)
+    ts_rig.client.state()
+    assert ("tailscale", "status", "--json") in _cli_runs(fake)
+
+
+def test_card_waiting_for_login_is_reread_every_10_s(ts_rig):
+    fake, panel = ts_rig.fake, ts_rig.panel
+    fake.backend, fake.auth_url = "NeedsLogin", AUTH_URL
+    assert _card(ts_rig)["state"] == "login"
+    fake.calls.clear()
+    stamp, card = panel._ts_card
+    panel._ts_card = (stamp - panel_module.TS_TTL_BUSY - 1, card)
+    ts_rig.client.state()
+    assert ("tailscale", "status", "--json") in _cli_runs(fake)
+
+
+def test_finished_background_job_rereads_the_card_at_once(ts_rig):
+    fake = ts_rig.fake
+    fake.https_enabled = False  # Serve ждёт, пока в tailnet включат HTTPS
+    _ts_act(ts_rig, "serve", {"on": True})
+    card = ts_rig.client.state()["tailscale"]
+    assert card["serve"]["pending"] and card["serve"]["live"] is False
+    fake.enable_https()  # `serve --bg` вышел — ждать минуту не нужно
+    card = ts_rig.client.state()["tailscale"]
+    assert not card["serve"]["pending"] and card["serve"]["live"] is True

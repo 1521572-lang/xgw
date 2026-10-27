@@ -101,9 +101,21 @@ def test_other_system_and_no_root_are_warnings(box, monkeypatch):
     box.release.write_text('PRETTY_NAME="Debian 13"\nID=debian\nVERSION_ID="13"\n')
     checks = box.diag(is_root=False)._system()
     assert [check.level for check in checks] == [WARN, WARN]
-    assert "проверялся только на Ubuntu 26.04" in checks[0].text
+    assert "проверялся только на Ubuntu 24.04 и 26.04" in checks[0].text
     assert checks[1].advice == "sudo xgw diag"
     assert box.diag(is_root=False)._kernel() == []
+
+
+@pytest.mark.parametrize("version", ["24.04", "26.04"])
+def test_tested_ubuntu_releases_are_ok(box, monkeypatch, version):
+    # Отчёты с настоящей машины (Ubuntu 24.04.5) шли с лишним WARN с 0.1.4.
+    monkeypatch.setattr(diag.sys, "platform", "linux")
+    box.release.write_text(
+        f'PRETTY_NAME="Ubuntu {version}.5 LTS"\nID=ubuntu\nVERSION_ID="{version}"\n')
+    check = box.diag()._system()[0]
+    assert check.level == OK and check.text.startswith(f"Ubuntu {version}.5 LTS, Python")
+    box.release.write_text('PRETTY_NAME="Ubuntu 22.04"\nID=ubuntu\nVERSION_ID="22.04"\n')
+    assert box.diag()._system()[0].level == WARN
 
 
 def test_config_problems(box):

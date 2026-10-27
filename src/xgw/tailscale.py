@@ -336,20 +336,22 @@ def parse_serve(text: str, port: int, *, public: int = SERVE_PORT, funnel: bool 
     return False
 
 
-def serve_status(port: int, runner: cmd.Runner = cmd.run) -> bool | None:
-    try:
-        return parse_serve(runner(["tailscale", "serve", "status", "--json"], timeout=10.0), port)
-    except cmd.CommandError:
-        return None
-
-
-def funnel_status(port: int, runner: cmd.Runner = cmd.run) -> bool | None:
-    """Funnel ведёт порт FUNNEL_PORT из интернета на API приложения (port)."""
+def serve_live(port: int, app_port: int | None = None, runner: cmd.Runner = cmd.run
+               ) -> tuple[bool | None, bool | None]:
+    """Serve панели (port) и Funnel — порт FUNNEL_PORT из интернета на API приложения
+    (app_port) — по одному запуску `tailscale serve status --json`: в его ответе оба. None —
+    не узнать: CLI не ответил, ответ не JSON или API приложения нет (app_port None)."""
     try:
         text = runner(["tailscale", "serve", "status", "--json"], timeout=10.0)
     except cmd.CommandError:
-        return None
-    return parse_serve(text, port, public=FUNNEL_PORT, funnel=True)
+        return None, None
+    funnel = None if app_port is None else parse_serve(
+        text, app_port, public=FUNNEL_PORT, funnel=True)
+    return parse_serve(text, port), funnel
+
+
+def serve_status(port: int, runner: cmd.Runner = cmd.run) -> bool | None:
+    return serve_live(port, None, runner)[0]
 
 
 def login_command() -> list[str]:
