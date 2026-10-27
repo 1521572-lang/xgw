@@ -1028,9 +1028,10 @@ def test_network_units_are_sandboxed(unit, writable, caps):
     assert settings["CapabilityBoundingSet"] == caps
     assert "ProtectKernelTunables" not in settings  # xgw net up пишет в /proc/sys/net
     assert "ProcSubset" not in settings  # и /proc/sys должен быть виден
-    for key in ("ProtectKernelModules", "ProtectControlGroups", "RestrictNamespaces",
-                "RestrictSUIDSGID", "LockPersonality"):
+    for key in ("ProtectKernelModules", "RestrictNamespaces", "RestrictSUIDSGID",
+                "LockPersonality"):
         assert settings[key] == "yes", key
+    assert "ProtectControlGroups" not in settings  # systemd 259: открыл бы /run на запись
     assert settings["SystemCallFilter"] == "@system-service"
     families = settings["RestrictAddressFamilies"].split()
     assert {"AF_NETLINK", "AF_INET", "AF_INET6", "AF_UNIX"} <= set(families)
@@ -1101,21 +1102,53 @@ def test_install_comments_out_config_lines_that_mean_nothing(box):
 
 @pytest.mark.parametrize("unit", ["xgw-xray.service", "xgw-singbox.service"])
 def test_core_units_are_sandboxed(unit):
-    """Ядра работают от xray; модули и параметры ядра, его журнал, часы, cgroup, свои
-    пространства имён и лишние семейства сокетов им не нужны (аудит, F-11; поведение под
-    systemd с TUN, TPROXY и всеми протоколами sing-box проверено то же)."""
+    """Ядра работают от xray; модули и параметры ядра, его журнал, часы, свои пространства
+    имён и лишние семейства сокетов им не нужны (аудит, F-11; поведение под systemd с TUN,
+    TPROXY и всеми протоколами sing-box проверено то же)."""
     text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
     settings = dict(
         line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
     )
     assert settings["User"] == "xray" and settings["NoNewPrivileges"] == "true"
     for key in ("ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
-                "ProtectControlGroups", "ProtectClock", "ProtectHostname", "RestrictNamespaces",
+                "ProtectClock", "ProtectHostname", "RestrictNamespaces",
                 "RestrictRealtime", "RestrictSUIDSGID", "LockPersonality"):
         assert settings[key] == "yes", key
+    assert "ProtectControlGroups" not in settings  # systemd 259: открыл бы /run на запись
     assert set(settings["RestrictAddressFamilies"].split()) == {
         "AF_UNIX", "AF_NETLINK", "AF_INET", "AF_INET6"}
     assert "PrivateDevices" not in settings  # Xray открывает /dev/net/tun
+
+
+def test_daemon_unit_is_sandboxed():
+    """Третий аудит 0.2.0: демону — те же ограничения, что ядрам, кроме параметров ядра (он
+    пишет /proc/sys: форвардинг, rp_filter, BBR) и /dev (TUN); домашние каталоги — только
+    чтение, сокеты — ещё и AF_PACKET (запись трафика). Что под ними работает всё, что делает
+    демон, проверяет стенд (test_service_sandbox_allows_what_the_daemon_does)."""
+    text = (REPO / "packaging" / "xgw.service").read_text(encoding="utf-8")
+    settings = dict(
+        line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
+    )
+    assert settings["ProtectSystem"] == "strict" and settings["ProtectHome"] == "read-only"
+    assert settings["NoNewPrivileges"] == "true" and settings["PrivateTmp"] == "true"
+    for key in ("ProtectKernelModules", "ProtectKernelLogs", "ProtectClock", "ProtectHostname",
+                "RestrictNamespaces", "RestrictRealtime", "RestrictSUIDSGID", "LockPersonality"):
+        assert settings[key] == "yes", key
+    assert settings["SystemCallArchitectures"] == "native"
+    assert set(settings["RestrictAddressFamilies"].split()) == {
+        "AF_UNIX", "AF_NETLINK", "AF_INET", "AF_INET6", "AF_PACKET"}
+    for key in ("ProtectKernelTunables", "PrivateDevices", "ProtectControlGroups"):
+        assert key not in settings, key
+
+
+@pytest.mark.parametrize(
+    "unit", sorted(path.name for path in (REPO / "packaging").glob("*.service")))
+def test_no_unit_opens_run_for_writing(unit):
+    """systemd 259 (Ubuntu 26.04): ProtectControlGroups вместе с ProtectSystem=strict делает
+    /run доступным на запись (третий аудит 0.2.0, ASSUMPTIONS п. 252) — его нет ни у одной
+    службы XGW."""
+    text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
+    assert not any(line.startswith("ProtectControlGroups") for line in text.splitlines())
 
 
 def test_reinstall_notices_changed_service_files(box):

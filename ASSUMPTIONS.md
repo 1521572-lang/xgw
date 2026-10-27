@@ -3551,3 +3551,56 @@ Happ»), затем дополнен редактированием списка
      участников 0), — теперь ждёт HEALTHY, как остальные стенды. И проверял отказ телефону в
      «добавить сервер», хотя с пульта А3.2 (e809bdf) это разрешено, — теперь отказ в
      выключении Funnel (доступ к самому шлюзу) и что Funnel остался. Стенд Tailscale — 8 из 8.
+
+252. **0.2.0: третий внешний аудит (27.10.2026).** Пункты сверены с кодом, спорные проверены на
+     стенде в изолированной сети (Ubuntu 26.04, systemd 259).
+     (а) **Не подтвердилось.** Из WAN в LAN новое соединение не проходит (таймаут): правило
+     «чужой форвардинг» требует, чтобы ни вход, ни выход не были LAN, остальное отбрасывает
+     policy drop. `tcp option maxseg size set rt mtu` MSS только уменьшает: 1200 при MTU 1500
+     остался 1200, 1460 при MTU 1400 стал 1360. rp_filter = 2 — умолчание самой Ubuntu (на
+     26.04 — /usr/lib/sysctl.d), а подмену адреса соседа по LAN не остановил бы и строгий.
+     Поднятый TUN получает fe80, и ядро шлёт RS IPv6 — в сам TUN (Xray), не наружу.
+     (б) **Уже было.** К адресу из кэша подписок XGW подключается с проверкой сертификата по
+     имени подписки (create_default_context, server_hostname). Код привязки телефона — 192 бита,
+     только по кнопке панели, 10 минут, 5 неверных попыток, 10 неудач в минуту закрывают вход.
+     Возврат прежнего ядра — раз за запуск демона (_core_back_asked). Listings читает поколение
+     до `nft list`. Политику drop Docker в FORWARD показывает diag с командой DOCKER-USER: чужие
+     правила XGW не трогает. fail_mode = open — только когда не отвечает Xray; у ALL_DEAD своя
+     реакция, а блокировать всё при ALL_DEAD нельзя: он бывает и от сбоя проверочного адреса.
+     (в) **Ограничения xgw.service** — как у ядер (п. 250, (е)), кроме ProtectKernelTunables
+     (демон пишет /proc/sys) и PrivateDevices (TUN): ProtectHome=read-only (уведомление идёт
+     через сокет /run/user/<uid>/bus — подключаться к нему можно и так), ProtectKernelModules,
+     ProtectKernelLogs, ProtectClock, ProtectHostname, RestrictNamespaces, RestrictRealtime,
+     RestrictSUIDSGID, LockPersonality, SystemCallArchitectures=native, RestrictAddressFamilies с
+     AF_PACKET (запись трафика). systemd-analyze security: 6.9 → 4.9. Проверено: проба под этой
+     песочницей в своём netns (AF_PACKET, netlink, nft, TUN, ip_forward, runuser, сокет шины —
+     можно; vsock, запись в /root и /run, unshare — нельзя; стенд
+     test_service_sandbox_allows_what_the_daemon_does) и демон стенда LAN под systemd-run с
+     прежней и новой песочницей — одни и те же проверки (правила и DHCP, чужой flush ≤ 2 с,
+     пропажа WAN). SystemCallFilter демону не ставится: он и его дочерние программы (nft, ip,
+     tailscale, xray, sing-box, runuser) без проверки каждой.
+     (г) **ProtectControlGroups убран у всех служб XGW.** На systemd 259 любое его значение
+     (yes, private, strict) вместе с ProtectSystem=strict делает /run и /run/lock доступными на
+     запись (/etc, /var, /usr остаются только для чтения; проверено systemd-run). Нашёл это
+     прежний стенд-тест: запись в /run/tailscale из песочницы демона. Службам от root
+     (xgw-net, xgw-dhcp, демон) это лишняя запись в /run, Xray и sing-box (пользователь xray) —
+     почти ничего, но и пользы им эта строка не даёт. Как на systemd 255 (Ubuntu 24.04) — ТЗ
+     смотрит /run в mountinfo служб до установки.
+     (д) **Порядок и мелочи.** iprule.ensure, ensure_tun, ensure_containers: сначала маршруты
+     (чёрная дыра первой), правило — последним. Утечки и раньше не было: Capture._load ставит
+     маршруты до правил nft, которые метят, — но так помеченный пакет не уходит по main и при
+     восстановлении. XrayService.restart_pending: демон не делает `systemctl start`, пока systemd
+     сам ждёт RestartSec (auto-restart), — иначе при падении сразу после старта он добавлял бы
+     запуски к StartLimitBurst (5 за 10 с). nft.apply без `nft -c`: транзакция `nft -f`
+     проверяется ядром целиком, а проверка разбирала 43 тысячи сетей direct4 второй раз и только
+     IPv4.
+     (е) **На потом.** Поиск в @direct4 на каждом пакете (решение в ct mark), таблица целиком при
+     каждой загрузке правил, кэш /api/state. Готовый код аудита как есть не годится: жёсткие
+     интерфейс, подсеть и порт 12345, tailscale0 в TPROXY вопреки К1–К4, flowtable с одним
+     устройством, disable_ipv6 на TUN ломает перехват IPv6, закрепление отпечатка сертификата
+     ломается при плановой смене сертификата.
+     (ж) **Проверено** здесь: юнит-тесты net, nft, panel, tun, install, cli_commands, ops, daemon
+     (474; давнее падение test_all_dead… — и до правки), ruff, стенды выше. На машине (Ubuntu
+     24.04) — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-panel.md`: §4 — службы до и после установки
+     (/run, Seccomp, оценки), проба с уведомлением, «Проверить сеть» до и после; §6 — счётчики
+     ошибок доступа в журнале до и после.

@@ -272,20 +272,126 @@ def test_panel_answers_the_tailnet_host_only_while_serve_is_on(tmp_path, monkeyp
         stand.stop()
 
 
+# Песочница xgw.service целиком, кроме запуска и перезапуска (третий аудит 0.2.0: ограничения,
+# как у служб ядер, кроме ProtectKernelTunables и PrivateDevices; ProtectControlGroups нет ни у
+# кого — в systemd 259 он открывает /run на запись).
+SANDBOX_KEYS = (
+    "ProtectSystem", "PrivateTmp", "NoNewPrivileges", "CapabilityBoundingSet", "ProtectHome",
+    "ProtectKernelModules", "ProtectKernelLogs", "ProtectClock",
+    "ProtectHostname", "RestrictNamespaces", "RestrictRealtime", "RestrictSUIDSGID",
+    "LockPersonality", "SystemCallArchitectures", "RestrictAddressFamilies",
+)
+
+
 def _service_sandbox() -> list[str]:
     """Свойства песочницы из packaging/xgw.service — для systemd-run. Каталоги из
     ReadWritePaths — с «-»: на стенде /etc/xgw и /var/lib/xgw может не быть."""
     unit = (HERE.parents[1] / "packaging/xgw.service").read_text(encoding="utf-8")
     section = unit.split("[Service]", 1)[1].split("\n[", 1)[0]
     options: list[str] = []
+    found: set[str] = set()
     for line in section.splitlines():
         key, _, value = line.strip().partition("=")
-        if key in ("ProtectSystem", "PrivateTmp", "NoNewPrivileges", "CapabilityBoundingSet"):
+        if key in SANDBOX_KEYS:
             options += ["-p", f"{key}={value}"]
+            found.add(key)
         elif key == "ReadWritePaths":
             options += ["-p", "ReadWritePaths=" + " ".join(f"-{item}" for item in value.split())]
-    assert any(item == "ProtectSystem=strict" for item in options)
+    assert found == set(SANDBOX_KEYS), set(SANDBOX_KEYS) - found
+    assert "ProtectKernelTunables" not in section  # демон пишет /proc/sys
     return options
+
+
+# Что демон делает сам (и что его песочница должна пропускать): запись трафика (AF_PACKET),
+# правила и маршруты (netlink, nft), сокеты IPv4/IPv6, форвардинг (/proc/sys), TUN
+# (/dev/net/tun), уведомление (runuser и сокет шины в /run/user). И чего не должна: чужие
+# семейства сокетов, свои пространства имён, запись в домашние каталоги.
+SANDBOX_PROBE = r"""
+import json, os, socket, subprocess, sys
+result = {}
+def attempt(name, action):
+    try:
+        action()
+        result[name] = "ok"
+    except OSError as exc:
+        result[name] = f"errno {exc.errno}"
+attempt("packet", lambda: socket.socket(socket.AF_PACKET, socket.SOCK_RAW).close())
+attempt("netlink", lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0).close())
+attempt("inet6", lambda: socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close())
+attempt("vsock", lambda: socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM).close())
+def forward():
+    with open("/proc/sys/net/ipv4/ip_forward", "w") as handle:
+        handle.write("1\n")
+attempt("ip_forward", forward)
+def run(*argv):
+    done = subprocess.run(list(argv), capture_output=True, text=True, timeout=30)
+    if done.returncode:
+        raise OSError(done.returncode, done.stderr.strip())
+attempt("tuntap", lambda: run("ip", "tuntap", "add", "dev", "xgwsbx0", "mode", "tun"))
+attempt("nft", lambda: run("nft", "list", "ruleset"))
+attempt("runuser", lambda: run("runuser", "-u", "nobody", "--", "true"))
+def bus():
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5)
+    client.connect(sys.argv[1])
+    client.close()
+attempt("bus", bus)
+def home():
+    with open("/root/.xgw-sandbox-probe", "w") as handle:
+        handle.write("x")
+attempt("home_write", home)
+def run_dir():
+    with open("/run/.xgw-sandbox-probe", "w") as handle:
+        handle.write("x")
+attempt("run_write", run_dir)
+attempt("unshare", lambda: os.unshare(os.CLONE_NEWNET))
+print(json.dumps(result))
+"""
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-run") is None or not Path("/run/systemd/system").is_dir()
+    or not netns.available(),
+    reason="нужны systemd (systemd-run), root и ip netns",
+)
+def test_service_sandbox_allows_what_the_daemon_does(tmp_path):
+    """Третий аудит 0.2.0: новые ограничения xgw.service не мешают тому, что делает демон, —
+    проба под той же песочницей в отдельном сетевом пространстве (сеть машины не трогается)."""
+    import socket as sockets
+
+    namespace = "xgwsandbox"
+    subprocess.run(["ip", "netns", "del", namespace], capture_output=True)
+    subprocess.run(["ip", "netns", "add", namespace], check=True)
+    run_user = Path("/run/user/65534")
+    made = not run_user.exists()
+    run_user.mkdir(parents=True, exist_ok=True)
+    path = run_user / "xgw-sandbox-probe.sock"
+    path.unlink(missing_ok=True)
+    server = sockets.socket(sockets.AF_UNIX, sockets.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(4)
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--wait", "--pipe", "--quiet", "--collect", *_service_sandbox(),
+             "-p", f"NetworkNamespacePath=/run/netns/{namespace}",
+             sys.executable, "-c", SANDBOX_PROBE, str(path)],
+            capture_output=True, text=True, timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        probe = json.loads(result.stdout.strip().splitlines()[-1])
+        allowed = ("packet", "netlink", "inet6", "ip_forward", "tuntap", "nft", "runuser", "bus")
+        assert {name: probe[name] for name in allowed} == dict.fromkeys(allowed, "ok"), probe
+        assert probe["vsock"] != "ok" and probe["home_write"] != "ok", probe
+        assert probe["run_write"] != "ok", probe  # /run — только чтение (ProtectSystem=strict)
+        assert probe["unshare"] != "ok", probe
+    finally:
+        server.close()
+        path.unlink(missing_ok=True)
+        if made:
+            run_user.rmdir()
+        Path("/root/.xgw-sandbox-probe").unlink(missing_ok=True)
+        Path("/run/.xgw-sandbox-probe").unlink(missing_ok=True)
+        subprocess.run(["ip", "netns", "del", namespace], capture_output=True)
 
 
 @pytest.mark.skipif(

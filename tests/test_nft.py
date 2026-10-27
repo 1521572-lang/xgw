@@ -407,12 +407,13 @@ def test_tun_is_ignored_without_local_capture_or_while_capture_is_off():
     assert not nft.build_rules(cfg, capture=True, time_uids=())[0].tun
 
 
-def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
+def test_apply_is_one_transaction_and_tolerates_missing_ipv6():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     kernel = FakeKernel()
     assert nft.apply(rules, kernel) == []
-    # Обе таблицы — одной транзакцией: между ними правила семей не расходятся.
-    assert [call[1:] for call in kernel.calls] == [("-c", "-f", "-"), ("-f", "-")]
+    # Обе таблицы — одной транзакцией: между ними правила семей не расходятся. Отдельной
+    # проверки `nft -c` нет: ядро проверяет транзакцию само (третий аудит 0.2.0).
+    assert [call[1:] for call in kernel.calls] == [("-f", "-")]
     assert nft.loaded_chains(kernel) == {
         "prerouting", "containers", "output", "loopback_guard", "dns_direct", "forward",
         "postrouting",
@@ -428,6 +429,17 @@ def test_apply_checks_before_loading_and_tolerates_missing_ipv6():
     warnings = nft.apply(dataclasses.replace(rules, v6_guard=False), no_ipv6)
     assert len(warnings) == 1 and "ip6 xgw6" in warnings[0]
     assert "tproxy" in no_ipv6.table  # IPv4 загружен отдельно, без таблицы IPv6
+
+    class BadIpv4(FakeKernel):
+        def _nft(self, argv, text):
+            if "table ip xgw {" in text:
+                raise CommandError("nft: Error: syntax error")
+            return super()._nft(argv, text)
+
+    broken = BadIpv4()
+    with pytest.raises(CommandError, match="syntax error"):
+        nft.apply(dataclasses.replace(rules, v6_guard=False), broken)
+    assert "tproxy" not in broken.table  # ошибка в IPv4 — ничего не загружено
 
 
 def _blocked(cfg: Config, uids=()) -> nft.Rules:
@@ -563,7 +575,7 @@ def test_v6_guard_that_cannot_be_loaded_is_an_error():
 def test_rejected_rules_are_not_loaded():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     kernel = FakeKernel()
-    kernel.refuse = "nft -c"
+    kernel.refuse = "nft -f"
     with pytest.raises(CommandError):
         nft.apply(rules, kernel)
     assert kernel.tables == {}

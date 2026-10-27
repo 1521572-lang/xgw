@@ -503,10 +503,10 @@ def test_capture_switched_off_in_config(gateway):
 def test_failure_is_reported_and_keeps_previous_rules(gateway):
     gateway.enable()
     before = gateway.kernel.table
-    gateway.kernel.refuse = "nft -c"
+    gateway.kernel.refuse = "nft -f"
     with pytest.raises(CaptureError, match="отказано"):
         gateway.disable()
-    assert gateway.kernel.table == before  # правила не тронуты: проверка была до загрузки
+    assert gateway.kernel.table == before  # правила не тронуты: транзакция не прошла целиком
     assert gateway.wanted() is True and gateway.mode() == "on"  # выбор не запомнен
 
 
@@ -581,7 +581,7 @@ def test_tun_is_created_before_the_rules_and_traffic_goes_into_it(gateway_tun):
     assert kernel.links == {"xgwtun0": "tun"}
     # Машина — в TUN (iif lo, table 101), сеть LAN — локальная доставка TPROXY (table 100).
     assert {(r["table"], r.get("iif")) for r in kernel.rules} == {("101", "lo"), ("100", None)}
-    assert kernel.routes(101)[0] == {"dst": "default", "dev": "xgwtun0", "scope": "link"}
+    assert {"dst": "default", "dev": "xgwtun0", "scope": "link"} in kernel.routes(101)
     assert kernel.route and "iifname \"lo\"" not in kernel.table
     assert kernel.index("ip", "tuntap", "add") < kernel.index("ip", "rule", "add")
     assert kernel.index("ip", "route", "replace") < kernel.index("nft", "-f")
@@ -608,7 +608,8 @@ def test_tun_capture_waits_for_the_tun_inbound_in_xray(gateway_tun):
     fakexray.write(gateway.paths)  # конфиг с tun-in применён
     assert gateway.loaded() is False
     assert gateway.up() == "on" and gateway.held == ""
-    assert kernel.routes(101)[0]["dev"] == "xgwtun0" and gateway.loaded() is True
+    assert any(route.get("dev") == "xgwtun0" for route in kernel.routes(101))
+    assert gateway.loaded() is True
 
 
 def test_tun_needs_both_inbounds_when_the_lan_is_captured_too(gateway_tun):
@@ -884,7 +885,7 @@ def test_tun_carries_ipv6_of_the_machine_without_a_tproxy_chain(gateway_tun):
     assert gateway_tun.enable() == "on"
     kernel = gateway_tun.kernel
     assert {(r["table"], r.get("iif")) for r in kernel.rules6} == {("101", "lo")}
-    assert kernel.routes(101, 6)[0]["dev"] == "xgwtun0"
+    assert any(route.get("dev") == "xgwtun0" for route in kernel.routes(101, 6))
     assert "chain output" in kernel.table6 and "chain prerouting" not in kernel.table6
     assert gateway_tun.loaded() is True and gateway_tun.describe()["ipv6"] is True
     gateway_tun.cfg.network.ipv6 = "off"

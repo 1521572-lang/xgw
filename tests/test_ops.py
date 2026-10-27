@@ -954,4 +954,4 @@ def test_reload_keeps_the_old_rules_until_xray_gets_the_new_capture_inbound(
     # После правки и до применения конфига: правила прежние, интерфейса TUN ещё нет.
     assert seen[1] == (before, {}) and "tproxy" in before
     assert kernel.links == {"xgwtun0": "tun"}  # а после применения — новые правила
-    assert kernel.routes(101)[0]["dev"] == "xgwtun0"
+    assert any(route.get("dev") == "xgwtun0" for route in kernel.routes(101))

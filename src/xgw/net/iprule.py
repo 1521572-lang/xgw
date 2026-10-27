@@ -149,13 +149,10 @@ def ensure(
     mark: int, table: int, runner: Runner, family: int = 4, throws: tuple[str, ...] = ()
 ) -> None:
     """Правило и маршрут есть ровно в одном экземпляре; маршруты throw — ровно для
-    подсетей throws (лишние убираются: подсеть LAN сменили)."""
+    подсетей throws (лишние убираются: подсеть LAN сменили). Сначала маршруты, правило —
+    последним: без них помеченный пакет самой машины ушёл бы по main мимо VPN (третий аудит
+    0.2.0)."""
     ip = _ip(family)
-    existing = _rules(mark, table, runner, family)
-    for _extra in existing[1:]:
-        runner([*ip, "rule", "del", "fwmark", str(mark), "lookup", str(table)])
-    if not existing:
-        runner([*ip, "rule", "add", "fwmark", str(mark), "lookup", str(table), "pref", str(PREF)])
     runner([*ip, "route", "replace", "local", ANYWHERE[family], "dev", "lo", "table", str(table)])
     have = _throws(_routes(table, runner, family))
     for network in throws:
@@ -163,6 +160,11 @@ def ensure(
             runner([*ip, "route", "replace", "throw", network, "table", str(table)])
     for network in sorted(have - set(throws)):
         runner([*ip, "route", "del", "throw", network, "table", str(table)])
+    existing = _rules(mark, table, runner, family)
+    for _extra in existing[1:]:
+        runner([*ip, "rule", "del", "fwmark", str(mark), "lookup", str(table)])
+    if not existing:
+        runner([*ip, "rule", "add", "fwmark", str(mark), "lookup", str(table), "pref", str(PREF)])
 
 
 def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
@@ -191,17 +193,19 @@ def present_tun(mark: int, table: int, runner: Runner, family: int, dev: str) ->
 
 def ensure_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> None:
     """Пакеты с меткой, созданные на самой машине, уходят в интерфейс dev (он уже должен
-    существовать); правило, интерфейсный маршрут и чёрная дыра — по одному экземпляру."""
+    существовать); правило, интерфейсный маршрут и чёрная дыра — по одному экземпляру.
+    Сначала таблица (чёрная дыра, затем интерфейс), правило — последним: без маршрутов в
+    таблице помеченный пакет ушёл бы по main мимо VPN (третий аудит 0.2.0)."""
     ip = _ip(family)
+    runner([*ip, "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
+            "table", str(table)])
+    runner([*ip, "route", "replace", "default", "dev", dev, "table", str(table)])
     existing = _rules(mark, table, runner, family, "lo")
     for _extra in existing[1:]:
         runner([*ip, "rule", "del", "fwmark", str(mark), "iif", "lo", "lookup", str(table)])
     if not existing:
         runner([*ip, "rule", "add", "fwmark", str(mark), "iif", "lo", "lookup", str(table),
                 "pref", str(PREF_TUN)])
-    runner([*ip, "route", "replace", "default", "dev", dev, "table", str(table)])
-    runner([*ip, "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
-            "table", str(table)])
 
 
 def remove_tun(
@@ -241,17 +245,17 @@ def present_containers(mark: int, table: int, runner: Runner, dev: str | None) -
 
 def ensure_containers(mark: int, table: int, runner: Runner, dev: str | None) -> None:
     """Пакеты контейнеров с меткой mark уходят в TUN-интерфейс dev, а пока его нет — в
-    чёрную дыру. Правило — по одному экземпляру."""
+    чёрную дыру. Правило — по одному экземпляру и последним, после маршрутов (как ensure_tun)."""
+    runner(["ip", "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
+            "table", str(table)])
+    if dev is not None:
+        runner(["ip", "route", "replace", "default", "dev", dev, "table", str(table)])
     existing = _rules(mark, table, runner, 4)
     for _extra in existing[1:]:
         runner(["ip", "rule", "del", "fwmark", str(mark), "lookup", str(table)])
     if not existing:
         runner(["ip", "rule", "add", "fwmark", str(mark), "lookup", str(table),
                 "pref", str(PREF_CONTAINERS)])
-    if dev is not None:
-        runner(["ip", "route", "replace", "default", "dev", dev, "table", str(table)])
-    runner(["ip", "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
-            "table", str(table)])
 
 
 def remove_containers(
