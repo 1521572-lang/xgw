@@ -34,6 +34,7 @@ import json
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -130,31 +131,55 @@ def sample(
     return [*members, *spares[:SAMPLE_SPARES]]
 
 
+# Одновременных запросов base_ping через участников (участники × проверочные хосты).
+BASE_PING_WORKERS = 16
+
+
 def base_ping(
-    cfg: Config, members: Sequence[NodeInfo] = (), password: str = "", user: str = ""
+    cfg: Config, members: Sequence[NodeInfo] = (), password: str = "", user: str = "",
+    extra_urls: Sequence[str] = (),
 ) -> bool:
     """Базовый запрос через VPN — probe.trace_url: проходит ли через серверы хоть что-то.
-    Без trace_url проверить нечем — считаем, что не проходит.
+    Без trace_url и extra_urls проверить нечем — считаем, что не проходит.
+
+    extra_urls — другие проверочные хосты (probe.urls): открываются через участников они, а
+    не trace_url — серверы трафик носят. probe.url (jsDelivr) и trace_url оба бывают у
+    Cloudflare, и его отказ выходным адресам VPN выглядел бы смертью всех серверов (пятый
+    аудит, Q1). Запросы через участников идут одновременно: не дольше одного запроса (15 с),
+    а не по 15 с на каждого участника.
 
     members (с паролем проб) — спрашивать через probe-inbound каждого участника, пока
     не ответит хоть один. Через http-in нельзя, когда у балансировщика есть резервный
     выход: пробы ядра падают у всех участников, и трафик http-in идёт через резервный —
     он ответил бы, даже если участники и правда мертвы. Без members — через http-in."""
-    if not cfg.probe.trace_url:
-        return False
     if not members:
+        if not cfg.probe.trace_url:
+            return False
         return checks.http_get_via_proxy(
             "127.0.0.1", cfg.xray.http_port, cfg.probe.trace_url,
             timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
         ).ok
-    return any(
-        checks.http_get_via_proxy(
-            "127.0.0.1", info.probe_port, cfg.probe.trace_url,
+    urls = list(dict.fromkeys(url for url in [cfg.probe.trace_url, *extra_urls] if url))
+    pairs = [(info, url) for url in urls for info in members if info.probe_port]
+    if not pairs:
+        return False
+
+    def attempt(pair: tuple[NodeInfo, str]) -> bool:
+        info, url = pair
+        return checks.http_get_via_proxy(
+            "127.0.0.1", info.probe_port, url,
             timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
             proxy_user=user, proxy_pass=password,
         ).ok
-        for info in members if info.probe_port
+
+    pool = ThreadPoolExecutor(
+        max_workers=min(BASE_PING_WORKERS, len(pairs)), thread_name_prefix="xgw-base-ping",
     )
+    try:
+        futures = [pool.submit(attempt, pair) for pair in pairs]
+        return any(future.result() for future in as_completed(futures))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def direct_signature(cfg: Config, mark: int | None) -> str:

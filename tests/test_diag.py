@@ -775,3 +775,27 @@ def test_singbox_config_is_checked_by_the_binary_and_its_journal_is_read(box):
     assert services[0].level == FAIL and "xgw-singbox.service" in services[0].text
     box.paths.singbox_config_file.unlink()
     assert box.diag()._services()[0].level == OK
+
+
+def test_foreign_flowtable_is_reported(box):
+    """Пятый аудит: разгрузка (flow offload) пропускает пакеты установленных соединений мимо
+    цепочек перехвата XGW — об этом WARN."""
+    box.system.nft_flowtables = [
+        {"family": "inet", "table": "fw", "name": "ft", "hook": "ingress", "dev": ["lan0"]},
+    ]
+    found = [check for check in box.diag()._firewall() if "flowtable" in check.text]
+    assert len(found) == 1 and found[0].level == WARN and "inet fw ft" in found[0].text
+
+
+def test_open_fail_mode_and_plain_http_subscription_are_warned(box):
+    """capture.fail_mode = open и подписка по http на чужой адрес — WARN в «Конфиг»; http к
+    своему конвертеру в LAN — нет."""
+    box.cfg.capture.fail_mode = "open"
+    box.cfg.subscriptions = [
+        config.Subscription(name="far", url="http://sub.example.com/s"),
+        config.Subscription(name="near", url="http://192.168.1.5:25500/s"),
+    ]
+    texts = [check.text for check in box.diag()._config() if check.level == WARN]
+    assert any("fail_mode = open" in text for text in texts)
+    plain = [text for text in texts if "подписка по http" in text]
+    assert len(plain) == 1 and "far" in plain[0] and "near" not in plain[0]

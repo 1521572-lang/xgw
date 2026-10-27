@@ -886,3 +886,18 @@ def test_listings_run_nft_again_only_when_the_generation_changes():
     gen[0] = None  # поколение не узнать — nft каждый раз, как раньше
     assert lister(table) == "text 7" and lister(table) == "text 8"
     assert lister.runs == 7  # запусков nft для чтения, с неудачными; nft -f сюда не входит
+
+
+def test_generation_reply_cut_or_not_ours_is_none():
+    """Пятый аудит: атрибут длиннее ответа (обрезан) или чужой номер запроса — None, а не
+    struct.error: проверка правил тогда запускает nft, как без поколения."""
+    import struct
+
+    kind = (nft.NFNL_SUBSYS_NFTABLES << 8) | nft.NFT_MSG_NEWGEN
+    cut = struct.pack("=BBH", 0, 0, 0) + struct.pack("=HH", 8, nft.NFTA_GEN_ID)
+    assert nft.parse_generation(struct.pack("=IHHII", 16 + len(cut), kind, 0, 1, 0) + cut) is None
+    body = cut + struct.pack(">I", 42)
+    reply = struct.pack("=IHHII", 16 + len(body), kind, 0, 7, 0) + body
+    assert nft.parse_generation(reply) == 42
+    assert nft.parse_generation(reply, seq=7) == 42
+    assert nft.parse_generation(reply, seq=1) is None

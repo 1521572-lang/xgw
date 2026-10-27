@@ -197,15 +197,29 @@ class HostCache:
             if isinstance(entry, dict) and isinstance(entry.get("ips"), list)
         }
 
+    @staticmethod
+    def _fresh_ips(entry: dict, now: float) -> list[str]:
+        """Адреса записи, каждый из которых сам подтверждался не раньше HOST_CACHE_TTL назад
+        (seen — время по адресу; у записи прежней версии его нет — время всей записи). Раньше
+        удачный запрос по новому адресу продлевал срок и старым, не проверенным месяцами
+        (пятый аудит, D2)."""
+        stamp = entry.get("ts")
+        seen = entry.get("seen") if isinstance(entry.get("seen"), dict) else {}
+        result = []
+        for ip in entry.get("ips", []):
+            if not isinstance(ip, str):
+                continue
+            when = seen.get(ip, stamp)
+            if isinstance(when, (int, float)) and now - when <= HOST_CACHE_TTL:
+                result.append(ip)
+        return result
+
     def addresses(self) -> dict[str, list[str]]:
-        """Имя → адреса, записанные не раньше HOST_CACHE_TTL назад (новые первыми)."""
+        """Имя → адреса, подтверждённые не раньше HOST_CACHE_TTL назад (новые первыми)."""
         now = self.clock()
         result: dict[str, list[str]] = {}
         for host, entry in self._load().items():
-            stamp = entry.get("ts")
-            if not isinstance(stamp, (int, float)) or now - stamp > HOST_CACHE_TTL:
-                continue
-            ips = [str(ip) for ip in entry["ips"] if isinstance(ip, str)]
+            ips = self._fresh_ips(entry, now)
             if ips:
                 result[host] = ips
         return result
@@ -227,15 +241,21 @@ class HostCache:
         entries = self._load()
         now = self.clock()
         before = entries.get(host) or {}
-        stamp = before.get("ts")
-        fresh_entry = isinstance(stamp, (int, float)) and now - stamp <= HOST_CACHE_TTL
-        new = not fresh_entry or address not in before.get("ips", [])
-        known = [ip for ip in before.get("ips", []) if ip != address]
-        entries[host] = {"ips": [address, *known][:HOST_CACHE_MAX], "ts": now}
-        fresh = {
-            name: entry for name, entry in entries.items()
-            if isinstance(entry.get("ts"), (int, float)) and now - entry["ts"] <= HOST_CACHE_TTL
-        }
+        alive = self._fresh_ips(before, now)
+        new = address not in alive
+        old_seen = before.get("seen") if isinstance(before.get("seen"), dict) else {}
+        known = [ip for ip in alive if ip != address]
+        ips = [address, *known][:HOST_CACHE_MAX]
+        seen = {ip: old_seen.get(ip, before.get("ts")) for ip in known}
+        seen[address] = now
+        entries[host] = {"ips": ips, "ts": now, "seen": {ip: seen[ip] for ip in ips}}
+        fresh: dict[str, dict] = {}
+        for name, entry in entries.items():
+            kept = self._fresh_ips(entry, now)
+            if kept:
+                times = entry.get("seen") if isinstance(entry.get("seen"), dict) else {}
+                fresh[name] = {"ips": kept, "ts": entry.get("ts"),
+                               "seen": {ip: times.get(ip, entry.get("ts")) for ip in kept}}
         atomic_write_json(self.path, fresh, mode=0o600)
         return new
 

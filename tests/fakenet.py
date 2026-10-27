@@ -178,8 +178,10 @@ class FakeKernel:
                 rule["iif"] = iif
             rules.append(rule)
             return ""
+        pref = int(words[words.index("pref") + 1]) if "pref" in words else None
         for rule in rules:
-            if rule["fwmark"] == mark and rule["table"] == table and rule.get("iif") == iif:
+            if (rule["fwmark"] == mark and rule["table"] == table and rule.get("iif") == iif
+                    and (pref is None or rule["priority"] == pref)):
                 rules.remove(rule)
                 return ""
         raise CommandError(f"{command}: RTNETLINK answers: No such file or directory")

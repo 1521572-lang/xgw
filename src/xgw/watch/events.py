@@ -44,6 +44,10 @@ BURST = 0.25
 RESTART_PAUSE = 1.0  # подпроцесс вышел — запустить снова через столько…
 RESTART_PAUSE_MAX = 30.0  # …удваивая паузу, пока он падает сразу, но не дольше этого
 STABLE_RUN = 10.0  # проработал дольше — пауза снова короткая
+# Очередь пробуждений с пределом: при буре событий в ней и так есть что разбудить (пятый аудит).
+QUEUE_MAX = 256
+# Как часто диспетчер смотрит, закончилась ли своя загрузка правил, если в её окне были события.
+QUIET_POLL = 0.5
 # Интерфейсы, события которых шаг демона не ускоряют: loopback, TUN самого Xray (он
 # опускает его при каждом перезапуске) и контейнеры Docker (мосты, veth).
 IGNORED_IFS = ("lo", "docker*", "br-*", "veth*")
@@ -135,7 +139,10 @@ class NetEvents:
         self.log = logger or log.get_logger("events")
         self.which = which
         self._stop = threading.Event()
-        self._queue: queue.Queue[str] = queue.Queue()
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=QUEUE_MAX)
+        # События правил пришли в окне своей загрузки (quiet_rules): среди них могли быть и
+        # чужие — когда окно закроется, одна проверка (пятый аудит).
+        self._quiet_seen = threading.Event()
         self._procs: dict[str, subprocess.Popen] = {}
         self._lock = threading.Lock()
         self._threads: list[threading.Thread] = []
@@ -160,7 +167,7 @@ class NetEvents:
         """Останавливает подпроцессы и не ждёт их дольше долей секунды: остановка демона
         (systemctl restart xgw) не должна из-за событий затягиваться."""
         self._stop.set()
-        self._queue.put("")  # разбудить диспетчер
+        self._put("")  # разбудить диспетчер
         with self._lock:
             procs = list(self._procs.values())
         for proc in procs:
@@ -194,6 +201,10 @@ class NetEvents:
                 proc = None
             if proc is not None:
                 self.started[name] = self.started.get(name, 0) + 1
+                if self.started[name] > 1 and name in ("rules", "net"):
+                    # Подпроцесс перезапущен: события, что пришли без него, потеряны — одна
+                    # проверка (пятый аудит).
+                    self._put(name)
                 with self._lock:
                     self._procs[name] = proc
                 if self._stop.is_set():  # остановка пришла между запуском и записью
@@ -222,16 +233,23 @@ class NetEvents:
             device = parse_net(line, self.ignored)
             if device:
                 self.log.debug("событие сети: %s", line.strip()[:160])
-                self._queue.put("net")
+                self._put("net")
         elif name == "sleep":
             if parse_sleep(line) is False:
                 self.log.info("машина проснулась после сна")
-                self._queue.put("sleep")
+                self._put("sleep")
         elif name == "rules" and parse_rules(line):
             if self.quiet_rules():
-                return  # своя загрузка правил: события netlink приходят уже после nft -f
+                # Своя загрузка правил: события netlink приходят уже после nft -f. Не будить
+                # сейчас, но проверить, когда окно закроется.
+                self._quiet_seen.set()
+                return
             self.log.debug("событие правил: %s", line.strip()[:160])
-            self._queue.put("rules")
+            self._put("rules")
+
+    def _put(self, reason: str) -> None:
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(reason)
 
     def _dispatch(self) -> None:
         """Повторы одной причины внутри окна debounce — одно пробуждение. Первое событие
@@ -246,12 +264,17 @@ class NetEvents:
             now = time.monotonic()
             due = [fired[reason] + self.debounce - now for reason in pending]
             timeout = max(0.0, min(due)) if due else None
+            if self._quiet_seen.is_set():
+                timeout = QUIET_POLL if timeout is None else min(timeout, QUIET_POLL)
             try:
                 reason = self._queue.get(timeout=timeout)
             except queue.Empty:
                 reason = ""
             if self._stop.is_set():
                 return
+            if self._quiet_seen.is_set() and not self.quiet_rules():
+                self._quiet_seen.clear()
+                self._put("rules")  # окно своей загрузки закрылось: проверить правила
             now = time.monotonic()
             if reason:
                 same_burst = now - last.get(reason, float("-inf")) < BURST

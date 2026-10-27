@@ -49,6 +49,7 @@ class FakeSystem:
         self.gateway = "203.0.113.1"
         self.ipv6_global: list[str] = []  # интерфейсы с глобальным IPv6-адресом
         self.nft_chains: list[dict] = []  # чужие цепочки для `nft -j list ruleset`
+        self.nft_flowtables: list[dict] = []  # и flowtable
         self.time_synced = True
         self.tailscale_status = ""  # вывод `tailscale status --json`
         self.tailscale_netcheck = ""  # вывод `tailscale netcheck`
@@ -140,7 +141,10 @@ class FakeSystem:
         return json.dumps(default)
 
     def _nft(self, args, command, check) -> str:
-        return json.dumps({"nftables": [{"chain": chain} for chain in self.nft_chains]})
+        return json.dumps({"nftables": [
+            *({"flowtable": flow} for flow in self.nft_flowtables),
+            *({"chain": chain} for chain in self.nft_chains),
+        ]})
 
     def _unshare(self, args, command, check) -> str:
         return ""

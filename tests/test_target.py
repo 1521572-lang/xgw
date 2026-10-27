@@ -222,3 +222,27 @@ def test_the_core_probes_another_probe_host_that_answered(tmp_path):
     assert target.observatory_url(cfg, paths) == first  # второго в конфиге больше нет
     assert target.use_fallback(cfg, paths, False) is True
     assert target.observatory_url(cfg, paths) == cfg.probe.url
+
+
+def test_base_ping_counts_other_probe_hosts_and_asks_at_once(monkeypatch):
+    """Пятый аудит, Q1: trace_url через серверы не открывается (Cloudflare не пускает выходные
+    адреса VPN), а другой проверочный хост открывается — серверы трафик носят. Запросы через
+    участников идут одновременно: шесть по 0,3 с — меньше секунды."""
+    import time
+
+    cfg = Config()
+    members = [NodeInfo(f"{name}" * 8, f"proxy-nl-{name * 4}", f"probe-nl-{name * 4}", port,
+                        "proxy") for name, port in (("a", 20001), ("b", 20002), ("c", 20003))]
+    asked: list[tuple[int, str]] = []
+
+    def get(host, port, url, **kwargs):
+        asked.append((port, url))
+        time.sleep(0.3)
+        return checks.DownloadResult(ok=url == "https://other.example/x.js")
+
+    monkeypatch.setattr(target.checks, "http_get_via_proxy", get)
+    started = time.monotonic()
+    assert target.base_ping(cfg, members, "pass", extra_urls=["https://other.example/x.js"])
+    assert time.monotonic() - started < 1.0
+    assert not target.base_ping(cfg, members, "pass", extra_urls=["https://dead.example/x"])
+    assert len({url for _port, url in asked}) == 3

@@ -108,3 +108,25 @@ def test_host_cache_says_when_an_address_is_new(tmp_path):
     assert cache.remember("sub.example.com", "127.0.0.1") is False
     now[0] += HOST_CACHE_TTL + 1
     assert cache.remember("sub.example.com", "203.0.113.9") is True  # запись устарела
+
+
+def test_host_cache_addresses_expire_one_by_one(tmp_path):
+    """Пятый аудит, D2: у каждого адреса свой срок — удачный запрос по новому адресу не
+    продлевает старый, не проверенный неделю. Запись прежней версии (без seen) — по времени
+    всей записи."""
+    import json
+
+    from xgw.store import HOST_CACHE_TTL, HostCache
+
+    now = [1000.0]
+    cache = HostCache(tmp_path, clock=lambda: now[0])
+    cache.remember("sub.example.com", "203.0.113.8")
+    now[0] += HOST_CACHE_TTL - 10
+    cache.remember("sub.example.com", "203.0.113.9")
+    assert cache.addresses() == {"sub.example.com": ["203.0.113.9", "203.0.113.8"]}
+    now[0] += 20
+    assert cache.addresses() == {"sub.example.com": ["203.0.113.9"]}
+    assert cache.remember("sub.example.com", "203.0.113.8") is True  # снова новый
+    old = {"old.example.com": {"ips": ["198.51.100.1"], "ts": now[0]}}
+    (tmp_path / "dns-cache.json").write_text(json.dumps(old), encoding="utf-8")
+    assert cache.addresses() == {"old.example.com": ["198.51.100.1"]}

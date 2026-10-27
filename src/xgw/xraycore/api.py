@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -81,6 +82,60 @@ def applied_listen(config_file: Path) -> str:
     return listen if isinstance(listen, str) else ""
 
 
+
+# Вывод `xray api` — список outbound'ов, статистика: больше не бывает. Ответ приходит от процесса
+# ядра, и демон с правами root не копит его в памяти без меры (пятый аудит, A7).
+MAX_OUTPUT = 4 * 1024 * 1024
+
+
+def bounded_run(
+    argv: list[str], timeout: float, limit: int = MAX_OUTPUT,
+) -> tuple[int, str, str]:
+    """Как subprocess.run(capture_output=True, text=True, timeout=…), но вывод больше limit —
+    процесс убивается, ApiError. TimeoutExpired — как у subprocess.run."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    parts: dict[str, list[bytes]] = {"out": [], "err": []}
+    total = [0]
+    over = threading.Event()
+    lock = threading.Lock()
+
+    def pump(stream, key: str) -> None:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            with lock:
+                total[0] += len(chunk)
+                if total[0] > limit:
+                    over.set()
+            if over.is_set():
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                return
+            parts[key].append(chunk)
+
+    readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+        for stream in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError):
+                stream.close()
+    if over.is_set():
+        raise ApiError(f"ответ xray api больше {limit // (1024 * 1024)} МиБ")
+    return (proc.returncode, b"".join(parts["out"]).decode("utf-8", "replace"),
+            b"".join(parts["err"]).decode("utf-8", "replace"))
+
 @dataclass(frozen=True)
 class ApiClient:
     bin_path: Path
@@ -133,14 +188,12 @@ class ApiClient:
                     os.chmod(tmp, 0o600)
                 argv.append(str(tmp))
             try:
-                proc = subprocess.run(
-                    argv, capture_output=True, text=True, timeout=self.timeout + 5
-                )
+                returncode, stdout, stderr = bounded_run(argv, self.timeout + 5)
             except subprocess.TimeoutExpired as exc:
                 raise ApiError(f"таймаут xray api {command}") from exc
-            output = masking.mask_text((proc.stdout or "") + (proc.stderr or "")).strip()
-            if proc.returncode != 0:
-                detail = output or f"код {proc.returncode}"
+            output = masking.mask_text(stdout + stderr).strip()
+            if returncode != 0:
+                detail = output or f"код {returncode}"
                 raise ApiError(f"xray api {command}: {detail}")
             return output
         finally:

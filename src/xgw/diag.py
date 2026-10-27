@@ -218,6 +218,22 @@ class Diag:
             pass
         if self.config_warnings:
             result.append(Check("Конфиг", WARN, "; ".join(self.config_warnings)))
+        if self.cfg.capture.fail_mode == "open":
+            result.append(Check(
+                "Конфиг", WARN,
+                "capture.fail_mode = open: когда API Xray не отвечает, через минуту перехват "
+                "снимается и трафик идёт напрямую, мимо VPN",
+                'fail_mode = "closed" в [capture] — без Xray интернета нет, но и утечки нет',
+            ))
+        plain = [sub.name for sub in self.cfg.subscriptions
+                 if sub.url.startswith("http://") and not _local_url(sub.url)]
+        if plain:
+            result.append(Check(
+                "Конфиг", WARN,
+                f"подписка по http ({', '.join(plain)}): по дороге её ответ можно подменить "
+                "своими серверами",
+                "адрес подписки с https:// — его даёт провайдер",
+            ))
         if not result:
             mode = f"сеть {self.lan_if} и эта машина" if self.lan_if else "только эта машина"
             result.append(Check("Конфиг", OK, f"{path} читается; режим — {mode}"))
@@ -525,7 +541,11 @@ class Diag:
             return [Check("Файрвол", WARN, f"правила nftables не прочитаны: {_first_line(exc)}")]
         dropping: dict[str, list[str]] = {"forward": [], "input": []}
         docker = False
+        flowtables: list[str] = []
         for item in ruleset.get("nftables", []) if isinstance(ruleset, dict) else []:
+            flow = item.get("flowtable") if isinstance(item, dict) else None
+            if isinstance(flow, dict) and flow.get("table") not in (nft.TABLE, nft.TABLE6):
+                flowtables.append(f"{flow.get('family')} {flow.get('table')} {flow.get('name')}")
             chain = item.get("chain") if isinstance(item, dict) else None
             if not chain or chain.get("table") in (nft.TABLE, nft.TABLE6):
                 continue
@@ -535,6 +555,15 @@ class Diag:
                 docker = True
             if chain.get("hook") in dropping and chain.get("policy") == "drop":
                 dropping[chain["hook"]].append(f"{chain.get('family')} {chain.get('table')}")
+        if flowtables:
+            # Разгрузка (flow offload) пропускает пакеты уже установленных соединений мимо
+            # цепочек — и мимо перехвата XGW (пятый аудит; kernel.org nf_flowtable).
+            result.append(Check(
+                "Файрвол", WARN,
+                f"чужая flowtable ({', '.join(sorted(set(flowtables)))}): соединения из неё идут "
+                "мимо цепочек перехвата XGW — трафик может уйти мимо VPN",
+                "уберите разгрузку (flow add) для интерфейсов, трафик которых идёт через XGW",
+            ))
         ufw_on = self.which("ufw") is not None and ufw.active(self.runner)
         wan_if = lan.effective_wan(self.cfg, self.runner)
         if ufw_on and self.lan_if:
@@ -1348,6 +1377,20 @@ def _ago_text(ts: object) -> str:
     minutes = max(0, int((time.time() - ts) // 60))
     return f"{minutes} мин назад" if minutes < 120 else f"{minutes // 60} ч назад"
 
+
+
+def _local_url(url: str) -> bool:
+    """Адрес подписки в своей сети (локальный конвертер, NAS): http там допустим."""
+    import ipaddress
+
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost" or host.endswith((".local", ".lan", ".home.arpa", ".internal")):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback
 
 def _first_line(exc: Exception) -> str:
     lines = [line for line in str(exc).splitlines() if line.strip()]

@@ -208,8 +208,7 @@ def test_exited_monitor_is_started_again():
     watcher = _events(launcher, wakes, restart_pause=0.05)
     watcher.start()
     try:
-        assert _wait(lambda: wakes == ["rules"], 3.0)
-        assert watcher.started["rules"] == 3
+        assert _wait(lambda: watcher.started.get("rules") == 3 and "rules" in wakes, 3.0)
     finally:
         watcher.stop()
 
@@ -312,3 +311,50 @@ def test_monitor_events_arrive_while_process_runs():
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_events_in_the_own_load_window_are_checked_once_it_closes():
+    """Пятый аудит: события правил в окне своей загрузки не будят сразу, но среди них могли быть
+    и чужие — когда окно закроется, одно пробуждение «rules»."""
+    wakes: list[str] = []
+    quiet = [True]
+    lines = ["delete rule ip xgw output handle 7", "add rule ip xgw output handle 9"]
+    watcher = _events(
+        Launcher(lambda: FakeProc(lines, hold=5)), wakes, debounce=0.1,
+        quiet_rules=lambda: quiet[0],
+    )
+    watcher.start()
+    try:
+        time.sleep(0.3)
+        assert wakes == []
+        quiet[0] = False
+        assert _wait(lambda: wakes == ["rules"], 3.0)
+        time.sleep(0.8)
+        assert wakes == ["rules"]
+    finally:
+        watcher.stop()
+
+
+def test_restarted_monitor_triggers_one_check():
+    """nft monitor вышел и запущен снова: события без него потеряны — одна проверка, хотя
+    строк не было."""
+    wakes: list[str] = []
+    launcher = Launcher(lambda: FakeProc([]), lambda: FakeProc([], hold=5))
+    watcher = _events(launcher, wakes, restart_pause=0.05, debounce=0.1)
+    watcher.start()
+    try:
+        assert _wait(lambda: wakes == ["rules"], 3.0)
+        assert watcher.started["rules"] == 2
+    finally:
+        watcher.stop()
+
+
+def test_wake_queue_is_bounded(monkeypatch):
+    """Буря событий не растит очередь без меры: сверх предела пробуждения не копятся."""
+    from xgw.watch import events as events_module
+
+    monkeypatch.setattr(events_module, "QUEUE_MAX", 4)
+    watcher = _events(Launcher(lambda: FakeProc([])), [])
+    for _ in range(100):
+        watcher._put("rules")
+    assert watcher._queue.qsize() == 4

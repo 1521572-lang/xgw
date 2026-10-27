@@ -37,3 +37,24 @@ def test_raw_to_node_trims_the_name():
     assert raw_to_node(raw, "main").name == "🇹🇷 Турция"
     raw.name = "   "
     assert raw_to_node(raw, "main").name == "203.0.113.10:443"
+
+
+def test_variants_of_one_server_are_not_duplicates():
+    """Пятый аудит, T2: одни протокол, адрес, порт, ключ и транспорт, но разные путь и режим
+    XHTTP — разные серверы (CDN с путём на каждый выход), а не дубль: им отпечаток с этими
+    полями. Настоящий дубль (поля те же) — тот же отпечаток; у прочих он прежний."""
+    from xgw.model import split_variants
+
+    base = ("vless://11111111-2222-3333-4455-666666666661@edge.example.com:443"
+            "?type=xhttp&security=tls&sni=edge.example.com&path=")
+    first = raw_to_node(parse_link(base + "/a&mode=packet-up#A"), "main")
+    twin = raw_to_node(parse_link(base + "/a&mode=packet-up#A2"), "other")
+    second = raw_to_node(parse_link(base + "/b&mode=stream-up#B"), "main")
+    alone = raw_to_node(parse_link(links.VLESS_REALITY), "main")
+    shared, kept = first.fingerprint, alone.fingerprint
+    assert first.fingerprint == second.fingerprint == twin.fingerprint
+    assert split_variants([first, twin, second, alone]) == 3
+    assert first.fingerprint == twin.fingerprint != second.fingerprint
+    assert shared not in (first.fingerprint, second.fingerprint)
+    assert alone.fingerprint == kept
+    assert len(first.fingerprint) == 8

@@ -238,13 +238,20 @@ def fetch_url(
             result = _request_with_redirects(
                 url, headers or {}, timeout, mark, dns, proxy, data, cancel
             )
+        except ssl.SSLCertVerificationError as exc:
+            if not dns.untried():
+                # Повтор не поможет: сертификат не тот у всех адресов имени.
+                raise FetchError(f"не удалось получить {masking.mask_url(url)}: {exc}") from exc
+            # У этого адреса сертификат чужой (заглушка по дороге), а у имени есть ещё не
+            # испробованные адреса: следующая попытка — на другой. Проверка не отключается.
+            last_error = exc
+            result = None
         except (
             FetchError,
             marknet.MarkUnavailable,
-            ssl.SSLCertVerificationError,
             ValueError,  # в т. ч. UnicodeError: URL или имя хоста не разобрать
         ) as exc:
-            # Повтор не поможет: неверный URL, нет SO_MARK, недоверенный сертификат.
+            # Повтор не поможет: неверный URL, нет SO_MARK.
             raise FetchError(f"не удалось получить {masking.mask_url(url)}: {exc}") from exc
         except (OSError, http.client.HTTPException, ResolveError) as exc:
             last_error = exc
@@ -331,6 +338,16 @@ class _Dns:
     bootstrap: Sequence[str] | None
     strict: bool = False
     fallback: dict[str, list[str]] = field(default_factory=dict)
+    # Адреса имени, с которыми соединение было, а рукопожатие TLS или ответ не прошли: в
+    # следующей попытке того же запроса они идут последними. ТСПУ душит отдельные адреса
+    # хостинга (соединение есть, данные замирают), другой адрес того же имени может отвечать
+    # (пятый аудит, D1). seen — все адреса, что были в выборе.
+    failed: set[str] = field(default_factory=set)
+    seen: set[str] = field(default_factory=set)
+
+    def untried(self) -> bool:
+        """Есть адрес, на котором рукопожатие и ответ ещё не срывались."""
+        return bool(self.seen - self.failed)
 
 
 def _request_with_redirects(
@@ -425,11 +442,10 @@ def _connect(
             raise
         addresses = []
     last_error: OSError | None = None
-    tried: set[str] = set()
-    for address in [*addresses, *spare]:
-        if address in tried:
-            continue
-        tried.add(address)
+    candidates = list(dict.fromkeys([*addresses, *spare]))
+    dns.seen.update(candidates)
+    candidates.sort(key=lambda address: address in dns.failed)  # сорвавшиеся — последними
+    for address in candidates:
         try:
             sock = marknet.connect_marked(
                 address, port, timeout=timeout, mark=mark, connect=connect
@@ -588,6 +604,10 @@ def _request_once(
             address=address,
             from_fallback=from_fallback,
         )
+    except (OSError, http.client.HTTPException):
+        if address and isinstance(dns, _Dns):
+            dns.failed.add(address)  # соединение было, а рукопожатие или ответ — нет
+        raise
     finally:
         with contextlib.suppress(OSError):
             sock.close()

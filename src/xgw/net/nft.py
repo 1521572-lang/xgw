@@ -1098,25 +1098,32 @@ def generation(*, timeout: float = 1.0) -> int | None:
             sock.settimeout(timeout)
             sock.bind((0, 0))
             sock.send(_NLMSG.pack(_NLMSG.size + len(body), kind, NLM_F_REQUEST, 1, 0) + body)
-            data = sock.recv(65536)
+            data, sender = sock.recvfrom(65536)
     except (OSError, AttributeError):  # AttributeError: нет AF_NETLINK (не Linux)
         return None
-    return parse_generation(data)
+    if not isinstance(sender, tuple) or not sender or sender[0] != 0:
+        return None  # ответ не от ядра (порт отправителя ядра — 0)
+    return parse_generation(data, seq=1)
 
 
-def parse_generation(data: bytes) -> int | None:
-    """NFTA_GEN_ID из ответа NFT_MSG_NEWGEN; None — ошибка netlink или чужой ответ."""
+def parse_generation(data: bytes, seq: int | None = None) -> int | None:
+    """NFTA_GEN_ID из ответа NFT_MSG_NEWGEN; None — ошибка netlink, чужой ответ (seq — номер
+    своего запроса) или обрезанный ответ (пятый аудит)."""
     if len(data) < _NLMSG.size + _NFGEN.size:
         return None
-    length, kind, _flags, _seq, _port = _NLMSG.unpack_from(data)
+    length, kind, _flags, number, _port = _NLMSG.unpack_from(data)
     if kind != (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWGEN:
         return None  # NLMSG_ERROR (нет прав) или не тот ответ
+    if seq is not None and number != seq:
+        return None
     offset = _NLMSG.size + _NFGEN.size
     end = min(length, len(data))
     while offset + 4 <= end:
         size, attr = struct.unpack_from("=HH", data, offset)
         if size < 4:
             return None
+        if offset + size > end:
+            return None  # атрибут длиннее сообщения — ответ обрезан
         if attr & 0x3FFF == NFTA_GEN_ID and size >= 8:
             return int(struct.unpack_from(">I", data, offset + 4)[0])
         offset += (size + 3) & ~3

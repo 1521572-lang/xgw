@@ -1190,3 +1190,35 @@ def test_loaded_reads_tables_again_only_after_a_rule_change(gateway, monkeypatch
     assert checked.loaded() is True  # поколение то же — правка ядру неизвестна (не бывает)
     gen[0] += 1  # чужой flush table меняет поколение
     assert checked.loaded() is False and listings() > before
+
+
+def test_mark_rule_moved_behind_main_is_not_taken_for_loaded(gateway):
+    """Пятый аудит: правило метки переставили за main (pref 32767) — метка ставится, а пакет
+    уходит по main мимо VPN. loaded() это видит, up() ставит правило на место и убирает
+    сдвинутое."""
+    gateway.enable()
+    rules = gateway.kernel.rules
+    ours = [rule for rule in rules if rule["fwmark"] == "0x1"]
+    assert [rule["priority"] for rule in ours] == [100]
+    ours[0]["priority"] = 32767
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+    assert [rule["priority"] for rule in rules if rule["fwmark"] == "0x1"] == [100]
+
+
+def test_ensure_keeps_a_foreign_rule_with_other_selectors():
+    """Правило с той же меткой и таблицей, но своим условием (src) — чужое: ensure ставит своё
+    рядом и чужое не удаляет; сдвинутое своё (те же условия, другой приоритет) — удаляет."""
+    from fakenet import FakeKernel
+
+    from xgw.net import iprule
+
+    kernel = FakeKernel()
+    foreign = {"priority": 50, "src": "10.9.0.0/16", "fwmark": "0x1", "table": "100"}
+    moved = {"priority": 32767, "src": "all", "fwmark": "0x1", "table": "100"}
+    kernel.rules.extend([foreign, moved])
+    assert iprule.present(1, 100, kernel) is False
+    iprule.ensure(1, 100, kernel)
+    assert iprule.present(1, 100, kernel) is True
+    assert foreign in kernel.rules and moved not in kernel.rules
+    assert sorted(rule["priority"] for rule in kernel.rules) == [50, 100]
