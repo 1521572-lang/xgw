@@ -62,10 +62,14 @@ class FakeApi:
 class FakeService:
     def __init__(self):
         self.active = True
+        self.pending = False  # systemd сам ждёт RestartSec
         self.starts = 0
 
     def is_active(self):
         return self.active
+
+    def restart_pending(self):
+        return self.pending
 
     def start(self):
         self.starts += 1
@@ -580,6 +584,21 @@ def test_e2e_failures_lead_to_all_dead(daemon):
     assert states == [State.HEALTHY, State.HEALTHY, State.ALL_DEAD]  # fail_threshold = 3
     daemon.e2e = True
     assert daemon.tick() is State.HEALTHY
+
+
+def test_xray_down_waits_for_systemd_restart(daemon):
+    """Третий аудит 0.2.0: пока systemd сам ждёт RestartSec, демон не добавляет свой start
+    (StartLimitBurst), а откат на last-good идёт как обычно."""
+    _started(daemon)
+    daemon.observatory = None
+    daemon.api.down = True
+    daemon.service.active, daemon.service.pending = False, True
+    assert daemon.tick() is State.XRAY_DOWN
+    assert daemon.tick() is State.XRAY_DOWN
+    assert daemon.service.starts == 0 and len(daemon.applier.rollbacks) == 1
+    daemon.service.pending = False  # systemd сдался (или служба остановлена) — поднять самим
+    daemon.tick()
+    assert daemon.service.starts == 1
 
 
 def test_xray_down_restarts_then_rolls_back_once(daemon):

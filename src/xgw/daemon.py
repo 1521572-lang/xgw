@@ -1559,7 +1559,8 @@ class Daemon:
         сутки наблюдения после обновления Xray, а он не отвечает и после отката — возврат
         прежней версии (cores.py)."""
         self.down_ticks += 1
-        if not self.service.is_active():
+        # Упавший Xray systemd поднимет сам через RestartSec — не мешать ему лишним start.
+        if not self.service.is_active() and not self.service.restart_pending():
             try:
                 self.service.start()
             except XrayServiceError as exc:

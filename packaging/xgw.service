@@ -25,6 +25,24 @@ NoNewPrivileges=true
 # CAP_SETUID и CAP_SETGID — runuser для уведомления на рабочий стол пользователя;
 # CAP_NET_RAW — запись трафика устройства из панели (сокет AF_PACKET, watch/record.py).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
+# Остальное демону не нужно (третий аудит 0.2.0, ASSUMPTIONS п. 252): модули и журнал ядра,
+# часы, имя машины, свои пространства имён, realtime, setuid-файлы; домашние каталоги и
+# /run/user — только чтение (уведомление идёт через сокет /run/user/<uid>/bus, подключаться к
+# нему можно и так); сокеты — IP, netlink, UNIX и AF_PACKET (запись трафика). Параметры ядра
+# (/proc/sys) открыты: демон ставит форвардинг, rp_filter и BBR; /dev — тоже: TUN.
+# ProtectControlGroups нет: в systemd 259 вместе с ProtectSystem=strict он открывает /run на
+# запись.
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
 
 [Install]
 WantedBy=multi-user.target

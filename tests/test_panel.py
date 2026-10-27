@@ -383,7 +383,7 @@ def test_device_goes_around_the_vpn_and_back(rig, user):
     conf = dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
     assert f"dhcp-host={PHONE},192.168.50.101,phone" in conf
     assert rig.system_calls == [("systemctl", "restart", "xgw-dhcp.service")]
-    assert ("nft", "-c", "-f", "-") in rig.kernel.calls  # правила проверены до загрузки
+    assert ("nft", "-f", "-") in rig.kernel.calls  # правила загружены (одной транзакцией)
 
     row = user.state()["devices"][0]
     assert row["bypass"] is True and row["managed"] is True
@@ -456,7 +456,7 @@ def test_network_failure_rolls_the_device_back(rig, user):
     assert user.state()["devices"][0]["bypass"] is False
 
     rig.dnsmasq_fails = False
-    rig.kernel.refuse = "nft -c"  # ядро не принимает правила
+    rig.kernel.refuse = "nft -f"  # ядро не принимает правила
     result = user.act("device", {"mac": PHONE, "bypass": True})
     assert not result["ok"] and "правила сети не обновлены" in result["text"]
     assert rig.saved()["devices"] == []

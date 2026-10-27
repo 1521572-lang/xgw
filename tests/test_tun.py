@@ -85,9 +85,9 @@ def test_tun_rule_picks_only_local_packets_and_leaves_tproxy_alone(tmp_path):
         {"priority": 90, "src": "all", "fwmark": "0x1", "table": "101", "iif": "lo"},
     ]
     assert len(kernel.commands("ip", "rule", "add")) == 2  # повтор дубликатов не плодит
-    assert kernel.routes(101) == [
-        {"dst": "default", "dev": NAME, "scope": "link"},
+    assert kernel.routes(101) == [  # чёрная дыра — раньше маршрута в интерфейс
         {"type": "blackhole", "dst": "default", "metric": 4096},
+        {"dst": "default", "dev": NAME, "scope": "link"},
     ]
     assert kernel.routes(100) == [
         {"type": "local", "dst": "default", "dev": "lo", "scope": "host"}
@@ -113,3 +113,21 @@ def test_blackhole_keeps_the_machine_closed_when_the_interface_is_gone(tmp_path)
     tun.ensure(NAME, kernel, tmp_path)
     iprule.ensure_tun(1, 101, kernel, 4, NAME)
     assert iprule.present_tun(1, 101, kernel, 4, NAME)
+
+
+def test_rule_is_added_after_the_routes_of_its_table(tmp_path):
+    """Третий аудит 0.2.0: правило по метке — последним, когда маршруты таблицы (TPROXY,
+    TUN, контейнеры) уже есть: помеченный пакет ни на миг не уходит по main мимо VPN."""
+    kernel = FakeKernel()
+    tun.ensure(NAME, kernel, tmp_path)
+    for setup in (
+        lambda: iprule.ensure(1, 100, kernel, 4, ("192.168.60.0/24",)),
+        lambda: iprule.ensure_tun(2, 101, kernel, 4, NAME),
+        lambda: iprule.ensure_containers(3, 102, kernel, NAME),
+    ):
+        start = len(kernel.calls)
+        setup()
+        calls = [" ".join(call) for call in kernel.calls[start:]]
+        added = [index for index, call in enumerate(calls) if call.startswith("ip rule add")]
+        assert len(added) == 1, calls
+        assert not any(call.startswith("ip route") for call in calls[added[0]:]), calls

@@ -46,6 +46,8 @@ from .xraycore import binary, metrics
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 STATUS_PAGE_PORT = 8780
 OS_RELEASE = Path("/etc/os-release")
+# Где XGW проверен: 24.04 — настоящая машина (все отчёты с неё), 26.04 — стенды.
+TESTED_UBUNTU = ("24.04", "26.04")
 DEV_TUN = Path("/dev/net/tun")
 PROC = Path("/proc")
 CHRONY_DIR = Path("/etc/chrony")
@@ -171,7 +173,7 @@ class Diag:
 
     def _system(self) -> list[Check]:
         if not sys.platform.startswith("linux"):
-            return [Check("Система", FAIL, "XGW работает только в Linux (Ubuntu 26.04)")]
+            return [Check("Система", FAIL, "XGW работает только в Linux (Ubuntu 24.04 или 26.04)")]
         release: dict[str, str] = {}
         try:
             for line in self.os_release.read_text(encoding="utf-8").splitlines():
@@ -183,11 +185,12 @@ class Diag:
         name = release.get("PRETTY_NAME") or "неизвестная система"
         python = f"Python {sys.version_info.major}.{sys.version_info.minor}"
         result: list[Check] = []
-        if release.get("ID") == "ubuntu" and release.get("VERSION_ID") == "26.04":
+        if release.get("ID") == "ubuntu" and release.get("VERSION_ID") in TESTED_UBUNTU:
             result.append(Check("Система", OK, f"{name}, {python}"))
         else:
             result.append(Check(
-                "Система", WARN, f"{name}, {python} — XGW проверялся только на Ubuntu 26.04"
+                "Система", WARN,
+                f"{name}, {python} — XGW проверялся только на Ubuntu 24.04 и 26.04",
             ))
         if not self.root:
             result.append(Check(

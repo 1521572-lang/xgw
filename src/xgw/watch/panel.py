@@ -83,7 +83,13 @@ MAX_DRAIN = 1 << 20  # сколько лишнего дочитать, преж�
 SELECT_TTL = 3.0  # как долго помнить ответ ядра о выбранном сервере
 EVENTS = 30
 LOGIN_TTL = 60.0  # сколько живёт одноразовый код входа, секунд
-TS_TTL = 10.0  # как долго помнить, что ответил CLI tailscale (страница опрашивает часто)
+# Как долго помнить, что ответил CLI tailscale (страница опрашивает каждые 3 с): минуту, пока
+# Tailscale работает и ничего не идёт; 10 с — пока идут вход, Serve или Funnel или Tailscale
+# не в работе (ждём входа). Отчёт 0.2.0: открытая вкладка стоила ~4 % ядра, из них ~2,5 % —
+# запущенные программы, в основном эти (раньше — раз в 10 с всегда).
+TS_TTL = 60.0
+TS_TTL_BUSY = 10.0
+TS_JOBS = ("login", "serve", "funnel")  # фоновые команды карточки (_ts_jobs)
 TS_WAIT = 10.0  # сколько действие карточки ждёт ссылку входа или итог Serve
 PIN_TTLS = ("10m", "1h", "6h", "24h")
 MANUAL = "manual"  # источник серверов, заданных отдельными ссылками
@@ -293,6 +299,7 @@ class Panel:
         self._thread: threading.Thread | None = None
         self._ts_card: tuple[float, dict | None] = (0.0, None)
         self._ts_jobs: dict[str, ts.Job] = {}  # «login», «serve», «funnel» — фоновые команды
+        self._ts_running: frozenset[str] = frozenset()  # какие из них шли при прошлом опросе
         self.phones = Phones(paths)
         self.app_port = app_port  # None — API приложения не запускается (тесты панели)
         self.app_api: AppApi | None = None
@@ -831,13 +838,20 @@ class Panel:
     # --- Tailscale (Т2) --------------------------------------------------------------
 
     def _tailscale_card(self, *, fresh: bool = False) -> dict:
-        """Карточка «Tailscale». Ответ CLI помнится TS_TTL секунд: страница спрашивает
-        состояние каждые несколько секунд, а это пять команд. Фоновые задания (вход, Serve)
-        проверяются каждый раз — они дешёвые."""
+        """Карточка «Tailscale». Ответ CLI помнится TS_TTL секунд, пока Tailscale работает и
+        фоновых заданий нет, иначе TS_TTL_BUSY: страница спрашивает состояние каждые 3 с, а
+        это до восьми запусков программ. Кнопки карточки сбрасывают ответ (_ts_card), а
+        закончившееся фоновое задание (вход, Serve, Funnel) — читает его заново сразу. Сами
+        задания проверяются каждый раз — это дешёво."""
+        running = frozenset(name for name in TS_JOBS
+                            if (job := self._ts_job(name)) is not None and job.code() is None)
         stamp, card = self._ts_card
-        if fresh or card is None or time.monotonic() - stamp >= TS_TTL:
+        quiet = card is not None and card["state"] == "running" and not running
+        if (fresh or card is None or running != self._ts_running
+                or time.monotonic() - stamp >= (TS_TTL if quiet else TS_TTL_BUSY)):
             card = self._tailscale_read()
             self._ts_card = (time.monotonic(), card)
+        self._ts_running = running
         card = dict(card)
         # «Напрямую» — из panel.json, а не из ответа CLI в памяти и не из конфига демона:
         # переключатель в строке меняется сразу, а не через шаг демона или TS_TTL.
@@ -905,9 +919,8 @@ class Panel:
             card["netfilter_off"] = (
                 None if prefs.netfilter is None else prefs.netfilter == ts.NETFILTER_OFF)
         if state.backend == "Running":
-            card["serve"]["live"] = ts.serve_status(self.port, self.runner)
-            if self.app_api is not None:
-                card["funnel"]["live"] = ts.funnel_status(self.app_api.port, self.runner)
+            card["serve"]["live"], card["funnel"]["live"] = ts.serve_live(
+                self.port, self.app_api.port if self.app_api is not None else None, self.runner)
             if public and state.dns_name and state.dns_name != public:
                 with contextlib.suppress(managed.ManagedError, OSError):
                     managed.set_tailscale_funnel(

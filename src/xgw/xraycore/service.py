@@ -39,6 +39,11 @@ class XrayService(ABC):
     @abstractmethod
     def is_active(self) -> bool: ...
 
+    def restart_pending(self) -> bool:
+        """Служба упала, и её вот-вот поднимет сам systemd (Restart=always). Без systemd —
+        некому."""
+        return False
+
 
 class SystemdXrayService(XrayService):
     """systemctl для юнита xgw-xray.service."""
@@ -77,6 +82,19 @@ class SystemdXrayService(XrayService):
         except (OSError, subprocess.TimeoutExpired):
             return False
         return proc.returncode == 0
+
+    def restart_pending(self) -> bool:
+        """systemd ждёт RestartSec, чтобы поднять упавший Xray сам. `systemctl start` в это
+        время только добавил бы запуск к StartLimitBurst (5 за 10 с): при падении сразу после
+        старта systemd перестал бы поднимать службу раньше времени (третий аудит 0.2.0)."""
+        try:
+            proc = subprocess.run(
+                ["systemctl", "show", "-p", "SubState", "--value", self.unit],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.stdout.strip() == "auto-restart"
 
 
 class ProcessXrayService(XrayService):

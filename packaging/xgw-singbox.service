@@ -30,12 +30,13 @@ ProtectHome=true
 PrivateTmp=true
 # Остальное ядру не нужно вовсе (аудит, F-11). Проверено под systemd с TUN, TPROXY, меткой на
 # сокетах и всеми протоколами sing-box — поведение то же, что без этих строк: параметры и
-# модули ядра, его журнал, часы, cgroup, свои пространства имён, realtime, setuid-файлы;
-# сокеты — только IP, netlink и UNIX. /dev не скрыт: Xray открывает /dev/net/tun.
+# модули ядра, его журнал, часы, свои пространства имён, realtime, setuid-файлы; сокеты —
+# только IP, netlink и UNIX. /dev не скрыт: Xray открывает /dev/net/tun. ProtectControlGroups
+# нет: в systemd 259 вместе с ProtectSystem=strict он открывает /run на запись (ASSUMPTIONS
+# п. 252).
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictNamespaces=yes

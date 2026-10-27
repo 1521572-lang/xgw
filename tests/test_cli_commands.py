@@ -487,7 +487,7 @@ def test_enable_with_nothing_to_capture(network, capsys):
 
 
 def test_enable_failure_is_reported(network, capsys):
-    network.kernel.refuse = "nft -c"
+    network.kernel.refuse = "nft -f"
     assert network.run("enable") == 1
     assert "перехват не включён" in capsys.readouterr().err
     assert network.kernel.table == ""
