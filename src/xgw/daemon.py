@@ -797,7 +797,8 @@ class Daemon:
                 if self._freepool_summary is None:  # после запуска — сразу то, что сохранено
                     self._freepool_summary = self.freepool.summary()
                 self.freepool.refresh_due(via=via, mark=self.mark, force=force)
-                self.freepool.check_some(mark=self.mark, xray_bin=xray_bin)
+                self.freepool.check_some(mark=self.mark, xray_bin=xray_bin, via=via,
+                                         cancel=self._stop)
                 self._freepool_summary = self.freepool.summary()
             except Exception:  # опытный режим не должен останавливать шлюз — в журнал целиком
                 self.log.exception("бесплатный пул: шаг не выполнен")

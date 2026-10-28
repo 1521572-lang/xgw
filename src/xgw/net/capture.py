@@ -96,6 +96,13 @@ def capture_for(cfg: Config, paths: Paths, **kwargs) -> Capture:
     return Capture(cfg, paths, **kwargs)
 
 
+def _fp_peers(paths: Paths) -> tuple[str, ...]:
+    """Серверы бесплатного пула, к которым сейчас есть поколения (freepool/backend.py)."""
+    from ..freepool.backend import peer_elements
+
+    return peer_elements(paths)
+
+
 class Capture:
     reloaded_text = "правила сети не были загружены — загружены заново"
     # До этого момента (time.monotonic()) события `nft monitor` о таблицах XGW вызваны
@@ -209,6 +216,7 @@ class Capture:
             xray_down=self.ts_marker.exists(), tailnet=tailnet,
             ts_fallback=self.ts_fallback_marker.exists(),
             geoip=self.paths.xray_dir / "geoip.dat",
+            fp_peers=_fp_peers(self.paths),
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6
@@ -763,6 +771,8 @@ class Capture:
         if rules.ts_forward and nft.set_elements(text, nft.TS_EXIT_SET) != set(
                 rules.ts_exit_direct):
             return False  # устройство tailnet пустили напрямую или вернули в Xray
+        if nft.has_set(text, nft.FP_SET) != (rules.free_pool and not rules.empty):
+            return False  # бесплатный пул включили или выключили (free_pool.mode)
         if rules.blocked:
             wanted: set[str] = set()
             if rules.block_local:

@@ -2,7 +2,8 @@
 
     snapshots/<источник>.json      последний принятый снимок каталога (варианты, итог опроса)
     snapshots/<источник>.<n>.json  три прежних (R13)
-    secrets.json (0600)            общие учётки источников (VPNBook) и импортированные
+    secrets.json (0600)            общие учётки источников (VPNBook)
+    profiles/<вариант>.ovpn        профили VPNBook, скачанные кнопкой «Download» (М2а)
     candidates.json                состояние проверок вариантов (по variant_id)
 
 Снимок принимается атомарно (запись во временный файл и переименование). Итог опроса с ошибкой
@@ -16,7 +17,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from ..paths import Paths, atomic_write_json
+from ..paths import Paths, atomic_write_json, atomic_write_text
 from .models import ProviderResult, Status, Variant
 from .ovpn import OvpnProfile, Remote
 
@@ -68,6 +69,7 @@ def variant_from_dict(data: dict) -> Variant | None:
                 legacy_crypto=bool(profile.get("legacy_crypto")),
                 managed=tuple(profile.get("managed", ())),
                 tuning=tuple(tuple(item) for item in profile.get("tuning", ())),
+                fallback_cipher=str(profile.get("fallback_cipher") or ""),
             )
         else:
             profile = None
@@ -126,7 +128,6 @@ class PoolStore:
             **status, "complete_response": result.complete_response,
             "authoritative": result.authoritative, "last_attempt": status,
             "variants": [variant_to_dict(variant) for variant in result.variants],
-            "endpoints": result.endpoints[:2000],
         }
         atomic_write_json(current, snapshot, mode=0o600)
         if result.credentials:
@@ -142,6 +143,16 @@ class PoolStore:
         items = self.snapshot(provider).get("variants") or []
         return [variant for variant in map(variant_from_dict, items) if variant is not None]
 
+    def prune(self, keep: tuple[str, ...]) -> list[str]:
+        """Удалить снимки источников не из keep (убранных из XGW); их имена."""
+        removed: set[str] = set()
+        for path in sorted((self.dir / "snapshots").glob("*.json")):
+            provider = path.name.split(".", 1)[0]
+            if provider not in keep:
+                path.unlink()
+                removed.add(provider)
+        return sorted(removed)
+
     # --- секреты и состояние проверок -----------------------------------------------------
 
     def secrets(self) -> dict:
@@ -154,3 +165,19 @@ class PoolStore:
     def save_candidates(self, data: dict[str, dict]) -> None:
         self._ensure()
         atomic_write_json(self.dir / "candidates.json", data, mode=0o600)
+
+    # --- профили, скачанные отдельно (VPNBook) ----------------------------------------------
+
+    def profile(self, key: str) -> tuple[str, float]:
+        """Сохранённый текст профиля и когда скачан; ("", 0) — нет."""
+        path = self.dir / "profiles" / f"{key}.ovpn"
+        try:
+            return path.read_text(encoding="utf-8"), path.stat().st_mtime
+        except OSError:
+            return "", 0.0
+
+    def save_profile(self, key: str, text: str) -> None:
+        self._ensure()
+        directory = self.dir / "profiles"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        atomic_write_text(directory / f"{key}.ovpn", text, mode=0o600)

@@ -46,10 +46,16 @@ UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 # Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
 # LAN настроен, — и обновление ядер из панели (cores.UNIT): её не включают вовсе, она
 # работает только по заданию демона. Порядок — порядок запуска; останавливаются в обратном.
+# Бесплатный пул: служба одного поколения OpenVPN (шаблон; её запускает только демон).
+FP_UNIT = "xgw-fp@.service"
 UNIT_FILES = (
     "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service", cores.UNIT,
+    FP_UNIT,
 )
 XRAY_USER = "xray"
+# Работники бесплатного пула (freepool/agent.py): OpenVPN и SOCKS — каждый от своего
+# пользователя, без входа и без возможностей.
+FP_USERS = ("xgw-ovpn", "xgw-fps")
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
 # Сколько systemd ждёт остановки демона (TimeoutStopSec в packaging/xgw.service), и сколько
 # ждут его перезапуска установка и удаление: дольше, с запасом на запуск. Демон, занятый
@@ -225,6 +231,7 @@ class Facts:
     wan_if: str = ""
     packages: list[str] = field(default_factory=list)  # чего не хватает
     user_exists: bool = False
+    fp_users_missing: list[str] = field(default_factory=list)
     xray_version: tuple[int, int, int] | None = None
     singbox_version: tuple[int, int, int] | None = None
     nm_running: bool = False
@@ -302,9 +309,15 @@ class Installer:
             facts.packages.append("nftables")
         if facts.lan_if and self.which("dnsmasq") is None:
             facts.packages.append(dnsmasq.PACKAGE)
+        if self.which("openvpn") is None:
+            facts.packages.append("openvpn")  # бесплатный пул: работник OpenVPN (М2а)
         facts.user_exists = bool(
             self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
         )
+        facts.fp_users_missing = [
+            name for name in FP_USERS
+            if not self.runner(["getent", "passwd", name], check=False).strip()
+        ]
         if self.paths.xray_bin.exists():
             facts.xray_version = binary.installed_version(self.paths.xray_bin)
         if self.paths.singbox_bin.exists():
@@ -387,6 +400,11 @@ class Installer:
         if not facts.user_exists:
             lines.append(
                 f"  • системный пользователь {XRAY_USER} (без входа) — от него работает Xray"
+            )
+        if facts.fp_users_missing:
+            lines.append(
+                f"  • системные пользователи {', '.join(facts.fp_users_missing)} (без входа) — "
+                "работники бесплатных серверов OpenVPN"
             )
         lines.append(f"  • код — {self.paths.lib_dir}, команда — {self.paths.launcher}")
         if self._xray_fits(facts.xray_version):
@@ -597,6 +615,13 @@ class Installer:
 
     def _user(self, facts: Facts) -> None:
         self.journal.setdefault("user_created", not facts.user_exists)
+        for name in facts.fp_users_missing:
+            self.runner([
+                "useradd", "--system", "--user-group", "--no-create-home",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", name,
+            ])
+            self.journal.extend("fp_users_created", [name])
+            self._step(f"пользователь {name}")
         if facts.user_exists:
             return
         self.runner([

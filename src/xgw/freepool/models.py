@@ -25,7 +25,6 @@ class Status(StrEnum):
     RATE_LIMITED = "RATE_LIMITED"
     UNAVAILABLE = "UNAVAILABLE"
     SCHEMA_CHANGED = "SCHEMA_CHANGED"
-    NEEDS_USER_ACTION = "NEEDS_USER_ACTION"
     DISABLED = "DISABLED"
     RESOURCE_LIMIT = "RESOURCE_LIMIT"
 
@@ -58,8 +57,8 @@ class Variant:
     # Показатели источника (ping, speed, score, sessions…) — подсказки порядка проверки, не
     # измерения шлюза (R23 шаг 2).
     hints: tuple[tuple[str, str], ...] = ()
-    # Чего не хватает до подключения: "" — ничего, "credentials" — логина и пароля источника
-    # (VPNBook — общие со страницы, VPNJantit — выдаёт форма), "profile" — профиля.
+    # Чего не хватает до подключения: "" — ничего, "profile" — профиля (VPNBook: скачивается
+    # отдельно официальной кнопкой страницы; учётка — общая со страницы).
     needs: str = ""
     credential_scope: str = ""
     usage_policy: tuple[str, ...] = ()  # например ("no-torrent",)
@@ -103,6 +102,3 @@ class ProviderResult:
     # Общие учётки источника (VPNBook: одна пара на все серверы): область → {username,
     # password, updated}. Секрет: в журнал и панель не попадает.
     credentials: dict[str, dict[str, str]] = field(default_factory=dict)
-    # Найденные серверы без данных для подключения (VPNJantit: учётку выдаёт форма сайта —
-    # NEEDS_USER_ACTION, R03): название, страна, онлайн ли, загрузка.
-    endpoints: list[dict] = field(default_factory=list)

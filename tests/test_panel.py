@@ -759,25 +759,16 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     assert not user.act("refresh", {})["ok"]
 
 
-def test_free_pool_card_switches_observation_and_hides_link_secrets(rig, user):
+def test_free_pool_card_switches_observation(rig, user):
     """Карточка «Бесплатные серверы»: наблюдение включается и выключается (трафик через пул —
-    не в этой версии), выданные ссылки хранятся в panel.json, панель видит только схему, хост
-    и имя; «Опросить источники» — только при включённом наблюдении."""
-    assert user.state()["free_pool"] == {"mode": "off", "summary": None, "links": []}
+    не в этой версии); «Опросить источники» — только при включённом наблюдении."""
+    assert user.state()["free_pool"] == {"mode": "off", "summary": None}
     assert not user.act("freepool/mode", {"mode": "on"})["ok"]
     assert not user.act("freepool/refresh", {})["ok"]
     assert user.act("freepool/mode", {"mode": "observe"})["ok"]
     assert rig.saved()["free_pool_mode"] == "observe"
     assert user.state()["free_pool"]["mode"] == "observe"
-    assert user.act("freepool/import", {"text": f"{links.VLESS_REALITY}\nне ссылка\n"})["ok"]
-    assert not user.act("freepool/import", {"text": links.VLESS_REALITY})["ok"]  # уже есть
-    pool = user.state()["free_pool"]
-    assert pool["links"] == [{"scheme": "vless", "host": "203.0.113.10", "name": "🇳🇱 NL-1"}]
-    assert links.FAKE_PBK not in json.dumps(pool) and "666666666661" not in json.dumps(pool)
     assert user.act("freepool/refresh", {})["ok"] and rig.daemon.asked == ["freepool"]
-    assert user.act("freepool/forget", {"index": 0})["ok"]
-    assert rig.saved()["free_pool_links"] == []
-    assert not user.act("freepool/forget", {"index": 0})["ok"]
     assert user.act("freepool/mode", {"mode": "off"})["ok"]
     assert rig.saved()["free_pool_mode"] == "off"
 

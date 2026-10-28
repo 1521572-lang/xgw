@@ -6,8 +6,11 @@ mark_bypass (мимо перехвата). Через него — обычна�
 таймаут…) и, если она прошла, страна выхода по Cloudflare trace (ТЗ R15: страна — по
 наблюдаемому выходу, а не по каталогу).
 
-Сервер OpenVPN до бэкенда (веха М2) — только прямое TCP-соединение с его адресом, мимо VPN:
-закрыт ли адрес целиком. Через туннель он здесь не проверяется; UDP — «не проверено».
+Сервер OpenVPN (веха М2а) — настоящим туннелем: поколение бэкенда (backend.py, agent.py) в своём
+пространстве имён, затем та же проба, что у Xray, только выход временного Xray — SOCKS-работник
+поколения. Трафик — по счётчикам veth (внешние байты с рукопожатием). Бэкенда нет (OpenVPN не
+установлен, перехват не загружен) — как в М1: прямое TCP-соединение с адресом сервера мимо VPN,
+закрыт ли адрес целиком; UDP — «не проверено».
 """
 
 from __future__ import annotations
@@ -20,13 +23,18 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..config import Config
 from ..watch import checks, shadow
 from ..watch.scan import ScanResult, scan_node
+from . import agent as agenting
+from . import ovpnconf
+from .backend import Backend as Runtime
+from .backend import BackendError
 from .models import Backend, Variant
+from .ovpn import OvpnProfile, OvpnRejected
 
 START_WAIT = 5.0
 STOP_WAIT = 3.0
@@ -44,6 +52,10 @@ class Outcome:
     bytes_used: int = 0
     egress_country: str = ""
     error: str = ""
+    connect_seconds: float = 0.0  # OpenVPN: от запуска поколения до поднятого туннеля
+    # OpenVPN: туннель поднимался (дальше проба могла и не пройти). Код итога этого не
+    # говорит: TIMEOUT бывает и у агента (туннель не поднялся), и у пробы через туннель.
+    tunnel_up: bool = False
 
 
 @dataclass
@@ -136,3 +148,63 @@ def check_openvpn_reach(
             return Outcome("REACHABLE", round(time.monotonic() - started, 2))
     return Outcome("CLOSED", round(time.monotonic() - started, 2),
                    error="TCP к адресу напрямую не открывается")
+
+
+def openvpn_peer(variant: Variant, profile: OvpnProfile) -> str:
+    """Адрес сервера для туннеля: публичный IPv4 из каталога или из remote профиля с тем же
+    портом. Имя здесь не резолвится (R45: один закреплённый адрес); нет — пусто."""
+    candidates = [variant.address, variant.host,
+                  *(remote.host for remote in profile.remotes if remote.port == variant.port)]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return ovpnconf.peer_address(candidate)
+        except OvpnRejected:
+            continue
+    return ""
+
+
+def check_openvpn(
+    variant: Variant, profile: OvpnProfile, *, runtime: Runtime, cfg: Config, xray_bin: Path,
+    run_dir: Path, auth: str = "", lan: tuple[str, ...] = (), cancel=None,
+    spawn: Callable[..., subprocess.Popen] = subprocess.Popen,
+) -> Outcome:
+    """Поколение бэкенда для варианта → туннель поднялся → проба и страна выхода через его
+    SOCKS-работника → поколение убрано (всегда, и при сбое)."""
+    peer = openvpn_peer(variant, profile)
+    if not peer:
+        return Outcome("UNTESTED", error="у сервера нет публичного IPv4")
+    try:
+        conf = ovpnconf.client_config(
+            profile, remote_ip=peer, proto=variant.transport, port=variant.port,
+            with_auth=bool(auth), mgmt_port=agenting.MGMT_PORT,
+        )
+    except OvpnRejected as exc:
+        return Outcome("CONFIG_REJECTED", error=str(exc)[:160])
+    started = time.monotonic()
+    try:
+        lease = runtime.prepare(peer=peer, proto=variant.transport, port=variant.port,
+                                openvpn_conf=conf, auth=auth, lan=lan, xray_bin=xray_bin)
+    except BackendError as exc:
+        return Outcome(exc.code, round(time.monotonic() - started, 2), error=str(exc)[:160])
+    try:
+        state = runtime.wait(lease, cancel=cancel)
+        if state.get("phase") != "up":
+            return Outcome(
+                str(state.get("reason") or "TUNNEL_FAILED"), round(time.monotonic() - started, 2),
+                runtime.counters(lease), error=str(state.get("detail") or "")[:160],
+            )
+        connected = round(time.monotonic() - started, 2)
+        outbound = {"tag": "pool", "protocol": "socks", "settings": {"servers": [{
+            "address": agenting.inner_address(lease.index), "port": agenting.SOCKS_PORT,
+            "users": [{"user": agenting.SOCKS_USER_NAME, "pass": lease.socks_pass}],
+        }]}}
+        outcome = check_xray(replace(variant, outbound=outbound), cfg, xray_bin, run_dir,
+                             spawn=spawn)
+        outcome.bytes_used = max(outcome.bytes_used, runtime.counters(lease))
+        outcome.connect_seconds = connected
+        outcome.tunnel_up = True
+        return outcome
+    finally:
+        runtime.stop(lease)

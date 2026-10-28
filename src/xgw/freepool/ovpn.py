@@ -90,6 +90,9 @@ class OvpnProfile:
     legacy_crypto: bool = False
     managed: tuple[str, ...] = ()
     tuning: tuple[tuple[str, str], ...] = field(default=())
+    # Шифр на случай сервера без согласования (NCP): data-ciphers-fallback или cipher профиля.
+    # Сервер VPN Gate (SoftEther) шифр не согласует — без него клиент 2.6 не договорится.
+    fallback_cipher: str = ""
 
     def digest(self) -> str:
         """Отпечаток содержимого (без учёта пометок): для идентичности варианта."""
@@ -239,6 +242,7 @@ def parse(text: str) -> OvpnProfile:
     bad = [cipher for cipher in ciphers if cipher not in CIPHERS]
     if bad:
         raise OvpnRejected(f"шифр {bad[0]} не поддерживается")
+    fallback = (values.get("data-ciphers-fallback") or values.get("cipher") or [""])[0].upper()
     auth = (values.get("auth") or ["SHA256"])[0].upper()
     if auth not in AUTHS:
         raise OvpnRejected(f"auth {auth} не поддерживается")
@@ -262,4 +266,5 @@ def parse(text: str) -> OvpnProfile:
         legacy_crypto=all(cipher.endswith("-CBC") for cipher in ciphers) or auth == "SHA1",
         managed=tuple(dict.fromkeys(managed)),
         tuning=tuple(tuning),
+        fallback_cipher=fallback if fallback in CIPHERS else "",
     )

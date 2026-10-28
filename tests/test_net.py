@@ -452,6 +452,21 @@ def test_loaded_detects_missing_and_stale_rules(gateway):
     assert gateway.describe()["loaded"] is None
 
 
+def test_free_pool_switch_reloads_the_rules(gateway):
+    """Наблюдение за бесплатным пулом включили (panel.json) — правил пула (набор fp_peers,
+    форвардинг из fpv*) в ядре ещё нет: правила не те, демон загружает их заново; выключили —
+    так же. Элементы набора кладёт бэкенд, и на «загружено» они не влияют."""
+    assert gateway.enable() == "on" and gateway.loaded() is True
+    gateway.cfg.free_pool.mode = "observe"
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+    assert "set fp_peers {" in gateway.kernel.table
+    gateway.cfg.free_pool.mode = "off"
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+    assert "fp_peers" not in gateway.kernel.table
+
+
 def test_quic_rule_as_nft_prints_it_counts_as_loaded(gateway):
     """Отчёт 0.1.18 (25.10.2026), дефект 1: nft печатает «reject with icmp type
     port-unreachable» просто как «reject», а проверка искала «port-unreachable» — правила

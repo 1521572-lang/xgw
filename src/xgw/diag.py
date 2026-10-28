@@ -151,6 +151,7 @@ class Diag:
             ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
             ("Tailscale", self._tailscale),
+            ("Бесплатный пул", self._free_pool),
         ]
         groups += [
             ("QUIC", self._quic),
@@ -1192,6 +1193,35 @@ class Diag:
                                       "TCP, где действует дробление ClientHello")]
         return [Check("QUIC", WARN, "правило против QUIC не загружено",
                       "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+
+    def _free_pool(self) -> list[Check]:
+        """Бесплатный пул (docs/FREEPOOL-PLAN.md): режим и годится ли бэкенд OpenVPN — без
+        него серверы OpenVPN проверяются только доступностью адреса; при включённом ufw — есть
+        ли правило для veth поколений (fpv+), иначе ufw отбросит их соединения."""
+        from .freepool import backend as fpbackend
+
+        name = "Бесплатный пул"
+        mode = self.cfg.free_pool.mode
+        if mode == "off":
+            return [Check(name, OK, "выключен — режим подписок")]
+        if not self.root:
+            return [Check(name, WARN, f"режим {mode}; бэкенд OpenVPN без sudo не проверить",
+                          "sudo xgw diag")]
+        problem = fpbackend.unavailable(self.paths, self.runner, proc_sys=self.proc_sys)
+        if problem:
+            return [Check(name, WARN, f"режим {mode}; серверы OpenVPN проверяются только "
+                                      f"доступностью адреса: {problem}")]
+        result = [Check(name, OK, f"режим {mode}; бэкенд OpenVPN готов (openvpn, пользователи "
+                                  "xgw-ovpn и xgw-fps, служба xgw-fp@, набор fp_peers)")]
+        if self.which("ufw") is not None and ufw.active(self.runner):
+            listed = self.runner(["ufw", "status"], timeout=20.0, check=False)
+            if "fpv+" not in listed:
+                wan = lan.effective_wan(self.cfg, self.runner)
+                rule = ufw.wanted(self.lan_if or "lan", wan)[-1]  # правило пула — последнее
+                result.append(Check(
+                    name, FAIL, "ufw включён, а правила для туннелей OpenVPN (fpv+) нет: их "
+                                "соединения ufw отбросит", "sudo ufw " + " ".join(rule)))
+        return result
 
     def _kernel_direct(self) -> list[Check]:
         """Ф6: российские адреса ядром мимо Xray — у кого включено, сколько сетей, загружен ли

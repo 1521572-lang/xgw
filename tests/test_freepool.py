@@ -182,32 +182,6 @@ def test_vpnbook_page_without_data_is_schema_changed():
         is Status.SCHEMA_CHANGED
 
 
-# --- VPNJantit --------------------------------------------------------------------------------
-
-
-def test_vpnjantit_status_tells_online_paid_and_country():
-    servers = providers.parse_vpnjantit_status(_fixture("vpnjantit-status.html"))
-    by_name = {server["name"]: server for server in servers}
-    assert by_name["Argentina 1"]["online"] is False and by_name["Argentina 2"]["online"]
-    assert by_name["Argentina 1"]["country"] == "AR"
-    assert by_name["Premium UK"]["access"] == "paid"
-    assert all(server["slug"].startswith("free-") for server in servers)
-
-
-def test_vpnjantit_country_cards():
-    """Карточки страны: хост, порты, срок учётки, провайдер, запрет торрентов, ссылка на
-    профиль; учётку выдаёт форма (NEEDS_USER_ACTION), а не шлюз."""
-    cards = providers.parse_vpnjantit_country(_fixture("vpnjantit-openvpn-nl.html"))
-    assert len(cards) == 2
-    card = cards[0]
-    assert card["type"] == "OpenVPN" and card["host"].endswith(".vpnjantit.example")
-    assert card["ports"] and card["active_days"] in (2, 7) and card["no_torrent"]
-    assert card["profile_path"].startswith("/download-openvpn.php?server=")
-    reality = providers.parse_vpnjantit_country(_fixture("vpnjantit-reality-nl.html"))
-    assert {card["type"] for card in reality} == {"XrayVless"}
-    assert all(card["profile_path"] == "" for card in reality)
-
-
 # --- сбор через несущий канал и сводка (pool.py) ---------------------------------------------
 
 
@@ -251,24 +225,23 @@ def _pages():
         providers.VPNGATE_URL: (200, _fixture("vpngate.csv")),
         providers.VPNBOOK_OPENVPN_URL: (200, _fixture("vpnbook-openvpn.html")),
         providers.VPNBOOK_OUTLINE_URL: (200, _fixture("vpnbook-outline.html")),
-        providers.VPNJANTIT_STATUS_URL: (200, _fixture("vpnjantit-status.html")),
     }
 
 
 def test_catalogs_go_through_the_carrier_and_land_in_snapshots(tmp_path):
     """Каталоги — через несущий канал (http-in Xray подписки): proxy у каждого запроса; снимки
-    трёх источников; VPNJantit — найденные серверы, учётка — действие пользователя."""
+    обоих источников."""
     pool, fetcher, _clock = _pool(tmp_path, _pages())
     via = ("127.0.0.1", 10809)
     results = pool.refresh_due(via=via, mark=2)
-    assert [result.status for result in results] == [Status.SUCCESS] * 3
+    assert [result.status for result in results] == [Status.SUCCESS] * 2
     assert {proxy for _url, proxy in fetcher.calls} == {via}
     assert len(pool.store.variants("vpngate")) == 5
     book = pool.store.variants("vpnbook")
     assert {variant.backend for variant in book} == {Backend.OPENVPN, Backend.XRAY}
     assert pool.store.secrets()["shared"]["vpnbook"]["username"] == "vpnbook"
     summary = pool.summary()
-    assert summary["found"] == len(pool.variants()) and summary["needs_user_action"] >= 1
+    assert summary["found"] == len(pool.variants())
     assert {source["status"] for source in summary["sources"]} == {"SUCCESS"}
     assert "FakePass9" not in str(summary)  # секреты в сводку не попадают
     assert pool.refresh_due(via=via, mark=2) == []  # рано: интервал не прошёл
@@ -320,24 +293,44 @@ def test_checks_prefer_the_wanted_region_and_respect_the_budget(tmp_path, monkey
 # --- режим и ссылки: config.toml, panel.json, xgw pool -----------------------------------------
 
 
-def test_panel_mode_and_links_lie_over_config_toml(tmp_path):
-    """Режим из панели (panel.json) сильнее config.toml; ссылки — только поддерживаемых схем,
-    без повторов; неизвестный режим не записывается."""
+def test_panel_mode_lies_over_config_toml(tmp_path):
+    """Режим из панели (panel.json) сильнее config.toml; неизвестный режим не записывается;
+    ссылки VPNJantit, вставленные в панель вехи М1, при загрузке отбрасываются."""
     path = tmp_path / "config.toml"
     path.write_text('[free_pool]\nmode = "off"\nregion = "US"\n', encoding="utf-8")
     store = managed.path_for(path)
+    store.write_text(json.dumps({"free_pool_links": [links.TROJAN]}), encoding="utf-8")
     assert managed.set_free_pool_mode(store, "observe") is True
     assert managed.set_free_pool_mode(store, "observe") is False
-    text = f"{links.VLESS_REALITY}\nhttps://example.org/\n{links.VLESS_REALITY}\n{links.TROJAN}"
-    assert managed.add_pool_links(store, text) == 2
-    cfg, _warnings = config.load(path)
-    assert (cfg.free_pool.mode, cfg.free_pool.region) == ("observe", "US")
-    assert cfg.managed.free_pool_links == [links.VLESS_REALITY, links.TROJAN]
-    assert managed.remove_pool_link(store, 5) is False
-    assert managed.remove_pool_link(store, 0) is True
-    assert config.load(path)[0].managed.free_pool_links == [links.TROJAN]
+    cfg, warnings = config.load(path)
+    assert (cfg.free_pool.mode, cfg.free_pool.region) == ("observe", "US") and warnings == []
+    assert "free_pool_links" not in json.loads(store.read_text(encoding="utf-8"))
     with pytest.raises(managed.ManagedError):
         managed.set_free_pool_mode(store, "turbo")
+
+
+def test_vpnjantit_settings_are_retired(tmp_path):
+    """VPNJantit убран (28.10.2026): его ключ и имя в providers — не «неизвестные», а убранные;
+    снимки его списков, оставшиеся с вехи М1, удаляются с диска."""
+    from xgw.freepool.pool import FreePool
+    from xgw.freepool.store import root
+    from xgw.paths import Paths
+
+    path = tmp_path / "config.toml"
+    path.write_text('[free_pool]\nproviders = ["vpngate", "vpnjantit"]\n'
+                    "vpnjantit_refresh_min = 60\n", encoding="utf-8")
+    cfg, warnings = config.load(path)
+    assert cfg.free_pool.providers == ["vpngate"]
+    assert len(warnings) == 2 and all("VPNJantit из бесплатного пула убран" in item
+                                      for item in warnings)
+    paths = Paths(root=tmp_path / "root")
+    paths.ensure()
+    snapshots = root(paths) / "snapshots"
+    snapshots.mkdir(parents=True)
+    for name in ("vpnjantit.json", "vpnjantit.1.json", "vpngate.json"):
+        (snapshots / name).write_text("{}", encoding="utf-8")
+    FreePool(cfg, paths)
+    assert sorted(item.name for item in snapshots.iterdir()) == ["vpngate.json"]
 
 
 def test_bad_free_pool_settings_fall_back_with_warnings(tmp_path):
@@ -354,19 +347,6 @@ def test_bad_free_pool_settings_fall_back_with_warnings(tmp_path):
     assert len([item for item in warnings if item.startswith("free_pool.")]) == 6
     path.write_text("", encoding="utf-8")
     assert config.load(path)[0].free_pool.mode == "off"  # без раздела — выключен
-
-
-def test_issued_links_are_variants_of_their_source(tmp_path):
-    """Ссылка с хоста VPNJantit — вариант VPNJantit, прочие — «import»; страна по имени —
-    только подсказка; неразборчивая ссылка пропускается."""
-    pool, _fetcher, _clock = _pool(tmp_path, {})
-    jantit = links.VLESS_REALITY.replace("203.0.113.10", "nl1.vpnjantit.com")
-    pool.cfg.managed.free_pool_links = [jantit, links.TROJAN, "vless://broken"]
-    found = pool.imported()
-    assert [(item.provider, item.backend) for item in found] == [
-        ("vpnjantit", Backend.XRAY), ("import", Backend.XRAY)]
-    assert found[0].country_hint == "NL" and found[0].outbound
-    assert len({item.variant_id for item in found}) == 2
 
 
 def test_pool_command_shows_the_summary_and_switches_the_mode(tmp_path, monkeypatch, capsys):
@@ -401,18 +381,15 @@ def test_shared_password_is_masked_in_the_journal(tmp_path):
     assert "FakePass9" in log._secrets
 
 
-def test_issued_links_go_first_and_regions_count_only_the_wanted(tmp_path, monkeypatch):
-    """Вставленную в панель ссылку проверяют первой, даже без подсказки страны; пригодный
-    сервер на Кипре (EU и ASIA) в строгом EU считается только в EU."""
+def test_regions_count_only_the_wanted(tmp_path, monkeypatch):
+    """Пригодный сервер на Кипре (EU и ASIA) в строгом EU считается только в EU."""
     from xgw.freepool import pool as pool_module
     from xgw.freepool.probe import Outcome
 
-    pool, _fetcher, _clock = _pool(tmp_path, _pages(), checks_per_step=1)
+    pool, _fetcher, _clock = _pool(tmp_path, _pages(), checks_per_step=1, providers=["vpnbook"])
     pool.refresh_due(via=None, mark=2)
-    nameless = links.VLESS_REALITY.split("#")[0] + "#server"
-    pool.cfg.managed.free_pool_links = [nameless]
     [first] = pool.next_checks(1)
-    assert first.source_url == "panel" and first.country_hint == ""
+    assert first.backend == Backend.XRAY  # Outline: OpenVPN VPNBook без профиля — только туннелем
     monkeypatch.setattr(pool_module.probing, "check_xray",
                         lambda variant, cfg, xray_bin, run: Outcome("OK", 0.4, 600_000, "CY"))
     assert pool.check_some(mark=2, xray_bin=Path("/opt/xgw/xray/xray")) == 1

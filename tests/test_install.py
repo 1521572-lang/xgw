@@ -11,7 +11,7 @@ from fakesys import FakeSystem
 
 from xgw import config, managed
 from xgw.generator import builder
-from xgw.install import UNIT_FILES, Facts, Installer, Journal
+from xgw.install import FP_UNIT, FP_USERS, UNIT_FILES, Facts, Installer, Journal
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
 from xgw.paths import Paths
@@ -322,12 +322,15 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
     first = Journal(box.paths.journal_file).data
     assert box.install() == 0, box.text()
     second = Journal(box.paths.journal_file).data
-    for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "sleep"):
+    for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "fp_users_created",
+                "sleep"):
         assert second[key] == first[key], key
     # Профиль один, а не по одному на каждый запуск.
     assert sum(1 for item in box.system.profiles.values()
                if item["connection.id"] == nm.PROFILE) == 1
-    assert len(box.system.commands("useradd")) == 1
+    # xray и два работника бесплатного пула — каждый по одному разу.
+    assert [call[-1] for call in box.system.commands("useradd")] == ["xgw-ovpn", "xgw-fps",
+                                                                     "xray"]
 
 
 def test_machine_only_mode_does_not_touch_lan_things(box):
@@ -416,6 +419,7 @@ def test_ufw_rules_are_added_only_after_confirmation(box):
     assert box.system.ufw_rules == [
         ("allow", "in", "on", "lan0"),
         ("route", "allow", "in", "on", "lan0", "out", "on", "wan0"),
+        ("route", "allow", "in", "on", "fpv+", "out", "on", "wan0"),
     ]
     lines = before.read_text(encoding="utf-8").splitlines()
     rule = "-A ufw-before-input -i lan0 -m mark --mark 0x1 -j ACCEPT"
@@ -541,8 +545,11 @@ def test_uninstall_returns_everything(box):
     assert box.forward() == "0" and not paths.sysctl_file.exists()
     assert not system.kernel.tables and not system.kernel.rules and not system.kernel.route
     for unit in UNIT_FILES:
-        assert system.units[unit] == {"active": False, "enabled": False}
         assert not (paths.systemd_dir / unit).exists()
+        if unit != FP_UNIT:  # шаблон не включают; останавливаются его поколения
+            assert system.units[unit] == {"active": False, "enabled": False}
+    assert ("systemctl", "stop", "xgw-fp@*.service") in system.calls
+    assert not set(FP_USERS) & set(system.users)
     assert not (paths.etc / "dnsmasq.conf").exists()
     assert "dnsmasq.service" not in system.units  # штатную службу XGW не трогал
     assert "xray" not in system.users
@@ -746,7 +753,8 @@ def test_ufw_before_rules_follow_interface_and_mark(tmp_path):
 
 def test_ufw_rules_without_known_wan():
     assert ufw.wanted("lan0", "") == [
-        ["allow", "in", "on", "lan0"], ["route", "allow", "in", "on", "lan0"]]
+        ["allow", "in", "on", "lan0"], ["route", "allow", "in", "on", "lan0"],
+        ["route", "allow", "in", "on", "fpv+"]]
 
 
 # --- панель: ярлык, токен, установка без подписки ------------------------------------

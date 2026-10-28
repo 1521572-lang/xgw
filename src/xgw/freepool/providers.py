@@ -12,12 +12,6 @@ OpenVPN: массив `"servers":[{id, name, hostname, ipAddress, countryCode, c
 учётка на все серверы («Username … Password … Last updated: …»), профиль — официальная кнопка
 «Download» страницы: /api/openvpn?hostname=…&protocol=…&ip=… (протоколы tcp443, tcp80, udp53,
 udp25000 — из скрипта страницы). Outline: «connectionString»: ss://…@хост:443/?outline=1.
-
-VPNJantit — HTML. Страница состояния: таблица «Server | Server Status | Account Status»;
-строки «Premium …» — платные. Страница страны: карточки с хостом, портами, сроком «Active N Days»,
-провайдером, «NO TORRENT», ссылкой на профиль (/download-openvpn.php?server=…) и формой учётки
-(/create-free-account?server=…&type=…). Учётку выдаёт форма — это NEEDS_USER_ACTION (R03): шлюз
-только импортирует выданное.
 """
 
 from __future__ import annotations
@@ -25,7 +19,6 @@ from __future__ import annotations
 import base64
 import binascii
 import csv
-import html
 import io
 import json
 import re
@@ -36,22 +29,18 @@ from .models import Access, Backend, ProviderResult, Status, Variant
 
 VPNGATE = "vpngate"
 VPNBOOK = "vpnbook"
-VPNJANTIT = "vpnjantit"
-PROVIDERS = (VPNGATE, VPNBOOK, VPNJANTIT)
+PROVIDERS = (VPNGATE, VPNBOOK)
 
 VPNGATE_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = "https://www.vpnbook.com/freevpn/openvpn"
 VPNBOOK_OUTLINE_URL = "https://www.vpnbook.com/freevpn/outline-vpn"
 VPNBOOK_PROFILE_URL = "https://www.vpnbook.com/api/openvpn"
 VPNBOOK_PROTOCOLS = ("tcp443", "tcp80", "udp53", "udp25000")
-VPNJANTIT_STATUS_URL = "https://www.vpnjantit.com/free-openvpn-server-status"
-VPNJANTIT_BASE = "https://www.vpnjantit.com"
 
 # Доверенные хосты каждого источника (R09): каталог, профили и перенаправления — только сюда.
 ORIGINS = {
     VPNGATE: frozenset(("www.vpngate.net",)),
     VPNBOOK: frozenset(("www.vpnbook.com",)),
-    VPNJANTIT: frozenset(("www.vpnjantit.com",)),
 }
 
 MAX_ROWS = 2000
@@ -63,24 +52,6 @@ VPNGATE_REQUIRED = (
 _FLIGHT = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
 _IPV4 = re.compile(r"(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}")
-
-# Названия стран VPNJantit → ISO 3166-1 alpha-2 (список со страницы состояния, 28.10.2026).
-JANTIT_COUNTRIES = {
-    "argentina": "AR", "armenia": "AM", "australia": "AU", "austria": "AT", "azerbaijan": "AZ",
-    "bahrain": "BH", "bangladesh": "BD", "belgium": "BE", "brazil": "BR", "bulgaria": "BG",
-    "cambodia": "KH", "canada": "CA", "chile": "CL", "china": "CN", "czech republic": "CZ",
-    "denmark": "DK", "estonia": "EE", "finland": "FI", "france": "FR", "germany": "DE",
-    "greece": "GR", "hong kong": "HK", "hungary": "HU", "india": "IN", "indonesia": "ID",
-    "ireland": "IE", "israel": "IL", "italy": "IT", "japan": "JP", "kazakhstan": "KZ",
-    "latvia": "LV", "lithuania": "LT", "luxembourg": "LU", "malaysia": "MY", "mexico": "MX",
-    "moldova": "MD", "netherlands": "NL", "pakistan": "PK", "philippines": "PH", "poland": "PL",
-    "portugal": "PT", "romania": "RO", "russia": "RU", "saudi arabia": "SA", "singapore": "SG",
-    "slovakia": "SK", "south africa": "ZA", "south korea": "KR", "spain": "ES", "sweden": "SE",
-    "switzerland": "CH", "thailand": "TH", "turkey": "TR", "uae": "AE", "usa": "US",
-    "ukraine": "UA", "united arab emirates": "AE", "united kingdom": "GB", "united states": "US",
-    "vietnam": "VN",
-}
-
 
 def _host(value: str) -> str:
     value = (value or "").strip().lower()
@@ -316,70 +287,3 @@ def parse_vpnbook_outline(page: str, *, now: float) -> ProviderResult:
     result.authoritative = True
     result.status = Status.SUCCESS
     return result
-
-
-# --- VPNJantit --------------------------------------------------------------------------------
-
-
-def _cells(chunk: str) -> list[str]:
-    parts = re.split(r"<td[^>]*>", chunk)[1:]
-    return [re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", part))).strip()
-            for part in parts]
-
-
-def parse_vpnjantit_status(page: str) -> list[dict]:
-    """Страница состояния VPNJantit → [{name, country, number, location, online, used,
-    slug, access}]: платные («Premium …») — access=paid, неизвестная страна — unknown."""
-    servers: list[dict] = []
-    for chunk in page.split("<tr>"):
-        cells = _cells(chunk)
-        link = re.search(r"href=['\"]?/(free-[a-z0-9-]+)", chunk)
-        if len(cells) < 4 or not link:
-            continue
-        name = cells[0]
-        match = re.fullmatch(r"(.+?) (\d+)", name)
-        title, number = (match.group(1), int(match.group(2))) if match else (name, 0)
-        country = JANTIT_COUNTRIES.get(title.lower(), "")
-        access = Access.PAID if title.lower().startswith("premium") else (
-            Access.FREE if country else Access.UNKNOWN)
-        used = re.match(r"(\d+)%", cells[3])
-        servers.append({
-            "name": name, "country": country, "number": number, "location": cells[1],
-            "online": cells[2].lower() == "online", "used": int(used.group(1)) if used else None,
-            "slug": link.group(1), "access": str(access),
-        })
-    return servers
-
-
-def parse_vpnjantit_country(page: str) -> list[dict]:
-    """Страница страны VPNJantit → карточки серверов: {server_id, type, title, host, ports,
-    v2_ports, active_days, provider, no_torrent, profile_path, location}."""
-    cards: list[dict] = []
-    for block in re.split(r'<div class="col-lg-3 col-md-6">', page)[1:]:
-        account = re.search(r"create-free-account\?server=([a-z0-9]+)&(?:amp;)?type=([A-Za-z]+)",
-                            block)
-        if not account:
-            continue
-        text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " | ", block)))
-        title = re.search(r"FREE [^|]+? (?:[A-Z][a-z]+ ?)+\d+", text)
-        host = re.search(r"host-to-ip\?host=([a-z0-9.-]+)", block)
-        ports = re.search(r"Port ([\d,]+)(?: \(([A-Z/]+)\))?", text)
-        v2 = re.search(r"Port V2 ([a-z0-9,-]+)", text)
-        days = re.search(r"Active (\d+) Days?", text)
-        provider = re.search(r"Provider ([A-Za-z0-9 ._-]+?) \|", text)
-        location = re.search(r"Location ([^|]+?) \|", text)
-        profile = re.search(r"href=['\"]?(/download-openvpn\.php\?server=[a-z0-9]+)", block)
-        cards.append({
-            "server_id": account.group(1), "type": account.group(2),
-            "title": title.group(0).strip() if title else "",
-            "host": host.group(1) if host else "",
-            "ports": [int(item) for item in ports.group(1).split(",") if item] if ports else [],
-            "port_proto": ports.group(2) or "" if ports else "",
-            "v2_ports": v2.group(1) if v2 else "",
-            "active_days": int(days.group(1)) if days else None,
-            "provider": provider.group(1).strip() if provider else "",
-            "no_torrent": "NO TORRENT" in text,
-            "profile_path": profile.group(1) if profile else "",
-            "location": location.group(1).strip() if location else "",
-        })
-    return cards

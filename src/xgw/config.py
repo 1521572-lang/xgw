@@ -145,7 +145,10 @@ class TrayConf:
 # каталогов: сайты со списками доступны только через VPN.
 FREE_POOL_MODES = ("off", "observe", "on")
 FREE_POOL_REGIONS = ("EU", "US", "ASIA", "auto")
-FREE_POOL_PROVIDERS = ("vpngate", "vpnbook", "vpnjantit")
+FREE_POOL_PROVIDERS = ("vpngate", "vpnbook")
+# Источники, убранные из пула: VPNJantit — 28.10.2026 по отчёту вехи М1 (учётку выдаёт форма
+# сайта на 7 дней, без неё ни одного рабочего сервера).
+RETIRED_POOL_PROVIDERS = ("vpnjantit",)
 
 
 @dataclass
@@ -160,7 +163,6 @@ class FreePoolConf:
     # Как часто опрашивать источники, минут (ТЗ R12: стартовые значения, не квоты сервисов).
     vpngate_refresh_min: int = 15
     vpnbook_refresh_min: int = 60
-    vpnjantit_refresh_min: int = 60
     # Проверок кандидатов за шаг демона (наблюдение): по одной теневой пробе или TCP-проверке.
     checks_per_step: int = 2
     # Бюджет трафика проверок пула за сутки, МБ (ТЗ R28): routine, из него защищённый резерв
@@ -169,6 +171,11 @@ class FreePoolConf:
     health_reserved_mb: int = 128
     emergency_mb: int = 64
     max_instances: int = 4  # работников OpenVPN сразу (веха М2)
+    # Новых подключений OpenVPN (рукопожатий) — не больше (ТЗ R29: защита серверов от нагрузки
+    # и от перебора, не их квоты): в час всего, в сутки всего и в час на один источник.
+    handshakes_per_hour: int = 12
+    handshakes_per_day: int = 60
+    provider_handshakes_per_hour: int = 2
 
 
 @dataclass
@@ -474,9 +481,8 @@ class Managed:
     # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
     # (routing.kernel_direct); None — как в config.toml.
     kernel_direct: bool | None = None
-    # Бесплатный пул из панели: режим (None — как в config.toml) и выданные источником ссылки.
+    # Бесплатный пул из панели: режим (None — как в config.toml).
     free_pool_mode: str | None = None
-    free_pool_links: list[str] = field(default_factory=list)
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -604,7 +610,6 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
     if data["free_pool_mode"] is not None:
         cfg.free_pool.mode = cfg.managed.free_pool_mode = data["free_pool_mode"]
-    cfg.managed.free_pool_links = list(data["free_pool_links"])
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
@@ -686,6 +691,7 @@ _DROPPED: dict[str, dict[str, str]] = {
     # Четвёртый аудит 0.2.0 (ASSUMPTIONS п. 253): API Xray — сокет, к порту мог подключиться
     # любой процесс машины.
     "xray": {"api_port": "API Xray слушает сокет /run/xgw-xray/api.sock, а не порт"},
+    "free_pool": {"vpnjantit_refresh_min": "VPNJantit из бесплатного пула убран"},
 }
 _TABLE = re.compile(r"^[ \t]*\[[ \t]*([A-Za-z0-9_.-]+)[ \t]*\][ \t]*(#.*)?$")
 _ARRAY_TABLE = re.compile(r"^[ \t]*\[\[")
@@ -857,15 +863,21 @@ def _validate_free_pool(pool: FreePoolConf) -> list[str]:
     if bad:
         warnings.append(f"free_pool.fallback_regions: {', '.join(bad)} пропущены")
         pool.fallback_regions = [item for item in pool.fallback_regions if item not in bad]
-    unknown = [item for item in pool.providers if item not in FREE_POOL_PROVIDERS]
+    retired = [item for item in pool.providers if item in RETIRED_POOL_PROVIDERS]
+    if retired:
+        warnings.append("free_pool.providers: VPNJantit из бесплатного пула убран — "
+                        "из списка его можно удалить")
+    unknown = [item for item in pool.providers
+               if item not in FREE_POOL_PROVIDERS and item not in RETIRED_POOL_PROVIDERS]
     if unknown:
         warnings.append(f"free_pool.providers: неизвестные {', '.join(unknown)} пропущены")
-        pool.providers = [item for item in pool.providers if item in FREE_POOL_PROVIDERS]
+    pool.providers = [item for item in pool.providers if item in FREE_POOL_PROVIDERS]
     for name, low, high in (
         ("vpngate_refresh_min", 5, 1440), ("vpnbook_refresh_min", 15, 1440),
-        ("vpnjantit_refresh_min", 15, 1440), ("checks_per_step", 1, 8),
+        ("checks_per_step", 1, 8),
         ("budget_mb", 64, 10240), ("health_reserved_mb", 16, 10240), ("emergency_mb", 0, 1024),
-        ("max_instances", 1, 8),
+        ("max_instances", 1, 8), ("handshakes_per_hour", 0, 60), ("handshakes_per_day", 0, 500),
+        ("provider_handshakes_per_hour", 0, 30),
     ):
         value = getattr(pool, name)
         if not low <= value <= high:

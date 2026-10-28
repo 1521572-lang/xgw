@@ -172,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     cores_sub.add_parser("run-job", help=argparse.SUPPRESS)
     pool_parser = subparsers.add_parser(
         "pool", parents=[common],
-        help="бесплатный пул (VPN Gate, VPNBook, VPNJantit): сводка наблюдения и режим",
+        help="бесплатный пул (VPN Gate, VPNBook): сводка наблюдения и режим",
     )
     pool_sub = pool_parser.add_subparsers(dest="pool_action")
     pool_status = pool_sub.add_parser(
@@ -183,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
         "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку)",
     )
     pool_mode.add_argument("mode", choices=("off", "observe"))
+    # Агент поколения OpenVPN — его запускает служба xgw-fp@<gen> (freepool/agent.py).
+    pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
+    pool_agent.add_argument("gen")
     core = subparsers.add_parser(
         "core", parents=[common],
         help="закрепить за сервером ядро: xray, sing-box или auto (выбирает шлюз)",
@@ -223,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
             return tray.open_main(args.open)
         return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
     paths = Paths.from_env()
+    if args.command == "pool" and args.pool_action == "agent":
+        # Служба xgw-fp@<gen>: config.toml агенту не нужен — только задание демона.
+        from .freepool import agent as agenting
+
+        return agenting.main(args.gen, paths)
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
         # прочитать, — та же команда от root через pkexec.

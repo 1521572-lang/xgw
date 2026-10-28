@@ -172,6 +172,11 @@ class Rules:
     direct4: tuple[str, ...] = ()
     direct_lan: tuple[str, ...] = ()
     direct_local: bool = False
+    # Бесплатный пул (free_pool.mode не off, docs/FREEPOOL-PLAN.md): из пространств имён
+    # агентов OpenVPN (veth fpv*) в интернет — только к серверам из fp_peers («адрес . протокол
+    # . порт»), с маскарадингом; остальное из fpv* и в fpv* закрыто.
+    free_pool: bool = False
+    fp_peers: tuple[str, ...] = ()
 
     @property
     def ts4(self) -> bool:
@@ -241,7 +246,7 @@ def build_rules(
     cfg: Config, *, capture: bool, blocked: bool = False,
     time_uids: tuple[int, ...] | None = None,
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
-    ts_fallback: bool = False, geoip: Path | None = None,
+    ts_fallback: bool = False, geoip: Path | None = None, fp_peers: tuple[str, ...] = (),
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
@@ -341,6 +346,8 @@ def build_rules(
             direct4=direct,
             direct_lan=direct_lan,
             direct_local=direct_local,
+            free_pool=cfg.free_pool.mode != "off",
+            fp_peers=fp_peers if cfg.free_pool.mode != "off" else (),
         ),
         warnings,
     )
@@ -471,6 +478,37 @@ def _set(
     return lines
 
 
+FP_SET = "fp_peers"
+FP_IFS = "fpv*"
+FP_NET = "10.250.0.0/16"
+
+
+def _fp_set(rules: Rules) -> list[str]:
+    """Набор серверов бесплатного пула: «адрес . протокол . порт» (элементы кладёт демон —
+    `nft add element`, и они же — из /run/xgw/fp/peers.json при полной перезагрузке)."""
+    lines = [f"set {FP_SET} {{", "    type ipv4_addr . inet_proto . inet_service"]
+    if rules.fp_peers:
+        lines.append("    elements = { " + ", ".join(rules.fp_peers) + " }")
+    lines.append("}")
+    return lines
+
+
+def _fp_forward() -> list[str]:
+    """Форвардинг из пространств имён агентов OpenVPN — первым в цепочке, раньше правила
+    «чужой форвардинг» (иначе fpv* → WAN прошёл бы им): только к серверу из fp_peers и ответы
+    обратно; остальное из fpv* и в fpv* — сброс."""
+    return [
+        f'iifname "{FP_IFS}" ip daddr . meta l4proto . th dport @{FP_SET} counter accept',
+        f'iifname "{FP_IFS}" counter drop',
+        f'oifname "{FP_IFS}" ct state established,related accept',
+        f'oifname "{FP_IFS}" counter drop',
+    ]
+
+
+def _fp_masquerade() -> str:
+    return f'ip saddr {FP_NET} oifname != "{FP_IFS}" counter masquerade'
+
+
 def _ts_set(rules: Rules) -> list[str]:
     """Набор ts_direct: метка tailscaled в нём — его сокеты идут мимо Xray."""
     lines = [f"set {TS_SET} {{", "    type mark"]
@@ -551,6 +589,8 @@ def render(rules: Rules) -> str:
         blocks.append(_set(DIRECT_SET, rules.direct4))
     if rules.direct_lan:
         blocks.append(_set(DIRECT_LAN_SET, rules.direct_lan, interval=False))
+    if rules.free_pool:
+        blocks.append(_fp_set(rules))
     # Российские адреса (Ф6) — мимо Xray; DNS к ним перехватывается, как всякий.
     to_direct = f"ip daddr @{DIRECT_SET} th dport != 53 return"
     direct = [to_direct] if rules.direct_local else []
@@ -661,11 +701,22 @@ def render(rules: Rules) -> str:
         ] if rules.block_quic else []
         blocks.append(_chain(
             "forward", "type filter hook forward priority filter; policy accept;",
-            [*quic, *_ts_exit_forward(rules, ts_reject)],
+            [*(_fp_forward() if rules.free_pool else []), *quic,
+             *_ts_exit_forward(rules, ts_reject)],
         ))
         blocks.append(_chain(
             "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
-            [_ts_exit_masquerade()],
+            [_ts_exit_masquerade(), *([_fp_masquerade()] if rules.free_pool else [])],
+        ))
+    elif rules.free_pool and not lan_if:
+        # Только эта машина, без выходного узла: своей цепочки форвардинга иначе нет.
+        blocks.append(_chain(
+            "forward", "type filter hook forward priority filter; policy accept;",
+            _fp_forward(),
+        ))
+        blocks.append(_chain(
+            "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
+            [_fp_masquerade()],
         ))
     if lan_if:
         if rules.dns_direct:
@@ -695,6 +746,8 @@ def render(rules: Rules) -> str:
                 f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
             )
         forward = [
+            # Бесплатный пул: агенты OpenVPN — только к своим серверам (раньше «чужого»).
+            *(_fp_forward() if rules.free_pool else []),
             # QUIC устройств сети и tailnet — отбить сразу: браузер уйдёт на TCP/443.
             *quic,
             # Выходной узел tailnet — раньше «чужого форвардинга» (tailscale0 — не LAN).
@@ -725,7 +778,8 @@ def render(rules: Rules) -> str:
                 "postrouting",
                 "type nat hook postrouting priority srcnat; policy accept;",
                 [f'iifname "{lan_if}" {out} counter masquerade',
-                 *([_ts_exit_masquerade()] if rules.ts_exit else [])],
+                 *([_ts_exit_masquerade()] if rules.ts_exit else []),
+                 *([_fp_masquerade()] if rules.free_pool else [])],
             )
         )
 
@@ -758,6 +812,8 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_set("bypass_containers", ()))  # [capture] containers_bypass — Ф4
     if rules.ts_block:
         blocks.append(_set(TS_EXIT_SET, rules.ts_exit_direct, interval=False))
+    if rules.free_pool:
+        blocks.append(_fp_set(rules))
     if rules.block_local:
         output = [
             'oifname "lo" accept',
@@ -779,7 +835,7 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_chain(
             "block_output", "type filter hook output priority filter; policy accept;", output
         ))
-    forward: list[str] = []
+    forward: list[str] = _fp_forward() if rules.free_pool else []
     if rules.ts_block:
         # Выходной узел: перехвата нет — в интернет только устройства «напрямую».
         forward += _ts_exit_forward(rules, reject)
@@ -818,10 +874,11 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_chain(
             "forward", f"type filter hook forward priority filter; policy {policy};", forward
         ))
-    if rules.ts_block and not lan_if:
+    if (rules.ts_block or rules.free_pool) and not lan_if:
         blocks.append(_chain(
             "postrouting", "type nat hook postrouting priority srcnat; policy accept;",
-            [_ts_exit_masquerade()],
+            [*([_ts_exit_masquerade()] if rules.ts_block else []),
+             *([_fp_masquerade()] if rules.free_pool else [])],
         ))
     if lan_if:
         if rules.dns_direct:
@@ -836,7 +893,8 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
             "postrouting",
             "type nat hook postrouting priority srcnat; policy accept;",
             [f'iifname "{lan_if}" {out} counter masquerade',
-             *([_ts_exit_masquerade()] if rules.ts_block else [])],
+             *([_ts_exit_masquerade()] if rules.ts_block else []),
+             *([_fp_masquerade()] if rules.free_pool else [])],
         ))
     return blocks
 

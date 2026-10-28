@@ -239,15 +239,6 @@ def _shared(entry: dict) -> dict:
     }
 
 
-def _pool_link_label(link: str) -> dict:
-    """Ссылка пула для панели без секрета: схема, хост и имя (после #)."""
-    from urllib.parse import unquote, urlsplit
-
-    parts = urlsplit(link)
-    host = parts.hostname or ""
-    return {"scheme": parts.scheme, "host": host, "name": unquote(parts.fragment)[:60]}
-
-
 class Refused(Exception):
     """Запрос отклонён; code — статус HTTP, текст — для человека."""
 
@@ -655,12 +646,8 @@ class Panel:
             "class_warning": snapshot.get("class_warning") or "",
             # Белые списки (анти-ТСПУ 2.0): предупреждение и сервер, который можно включить.
             "whitelist": snapshot.get("whitelist"),
-            # Бесплатный пул: режим, сводка наблюдения, вставленные ссылки (без секретов —
-            # только схема и хост).
-            "free_pool": {
-                "mode": cfg.free_pool.mode, "summary": snapshot.get("free_pool"),
-                "links": [_pool_link_label(link) for link in cfg.managed.free_pool_links],
-            },
+            # Бесплатный пул: режим и сводка наблюдения.
+            "free_pool": {"mode": cfg.free_pool.mode, "summary": snapshot.get("free_pool")},
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.
@@ -1752,20 +1739,6 @@ class Panel:
             if outcome.ok:
                 self._wake()
             return outcome
-        if name == "freepool/import":
-            added = managed.add_pool_links(store_path, str(body.get("text") or ""))
-            if not added:
-                return actions.Outcome(2, "ссылок vless://, trojan://, ss:// или vmess:// не "
-                                          "найдено (или они уже добавлены)")
-            self._event(f"бесплатный пул: добавлено ссылок — {added}")
-            self._wake()
-            return actions.Outcome(0, f"Добавлено ссылок: {added} — проверю их в ближайшие минуты")
-        if name == "freepool/forget":
-            index = body.get("index")
-            if not isinstance(index, int) or not managed.remove_pool_link(store_path, index):
-                return actions.Outcome(2, "такой ссылки нет")
-            self._wake()
-            return actions.Outcome(0, "Ссылка убрана")
         if name == "freepool/refresh":
             if self.daemon is None or cfg.free_pool.mode == "off":
                 return actions.Outcome(2, "сначала включите наблюдение за бесплатным пулом")

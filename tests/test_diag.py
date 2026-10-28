@@ -799,3 +799,27 @@ def test_open_fail_mode_and_plain_http_subscription_are_warned(box):
     assert any("fail_mode = open" in text for text in texts)
     plain = [text for text in texts if "подписка по http" in text]
     assert len(plain) == 1 and "far" in plain[0] and "near" not in plain[0]
+
+
+def test_free_pool_backend_and_its_ufw_rule(box, monkeypatch):
+    """«Бесплатный пул»: выключен — OK; бэкенд OpenVPN не годится — WARN с причиной (серверы
+    OpenVPN тогда проверяются только доступностью адреса); при включённом ufw без правила для
+    fpv+ — FAIL с готовой командой."""
+    from xgw.freepool import backend as fpbackend
+
+    assert box.diag()._free_pool() == [diag.Check("Бесплатный пул", OK,
+                                                  "выключен — режим подписок")]
+    box.cfg.free_pool.mode = "observe"
+    assert box.diag(is_root=False)._free_pool()[0].level == WARN
+    monkeypatch.setattr(fpbackend, "unavailable",
+                        lambda *args, **kwargs: "нет OpenVPN (пакет openvpn — ставит xgw install)")
+    [check] = box.diag()._free_pool()
+    assert check.level == WARN and "только доступностью адреса: нет OpenVPN" in check.text
+    monkeypatch.setattr(fpbackend, "unavailable", lambda *args, **kwargs: "")
+    assert [check.level for check in box.diag()._free_pool()] == [OK]
+    box.system.ufw_active = True
+    checks = box.diag()._free_pool()
+    assert [check.level for check in checks] == [OK, FAIL]
+    assert checks[1].advice.startswith("sudo ufw route allow in on fpv+")
+    box.system.ufw_rules.append(("route", "allow", "in", "on", "fpv+"))
+    assert [check.level for check in box.diag()._free_pool()] == [OK]
