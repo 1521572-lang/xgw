@@ -425,6 +425,7 @@ def collect_status(
     stranded: str = "",
     probe_hosts: dict | None = None,
     tailscale_via_vpn: bool = False,
+    whitelist: dict | None = None,
     guard: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
@@ -494,6 +495,7 @@ def collect_status(
 
     learned = trials.get("escalated") if isinstance(trials.get("escalated"), dict) else {}
     unstable = trials.get("unstable") if isinstance(trials.get("unstable"), dict) else {}
+    closed = trials.get("closed") if isinstance(trials.get("closed"), dict) else {}
 
     def extra(info: NodeInfo, measure: dict) -> dict:
         """Поля 0.1.18: пассивная оценка скорости (ТЗ R5, «из трафика»), сумма замера (сам
@@ -523,6 +525,9 @@ def collect_status(
             "speed_test_mbps": measure.get("test_mbps"), "speed_bg_mbps": measure.get("bg_mbps"),
             "escalation": escalation,
             "unstable_until": until if isinstance(until, (int, float)) and until > now else None,
+            # Адрес закрыт целиком: TCP к нему напрямую не открылся (анти-ТСПУ 2.0) — когда.
+            "closed_ts": closed.get(info.fingerprint)
+            if isinstance(closed.get(info.fingerprint), (int, float)) else None,
         }
 
     reserve = reserve_tag(_load_json_file(paths.xray_config_file))
@@ -680,6 +685,9 @@ def collect_status(
         # Итог последней проверки резолверов bootstrap-DNS (ТЗ R4a): {"ts", "results"}.
         "resolvers": resolver_check,
         "tailscale_via_vpn": tailscale_via_vpn,
+        # Белые списки (анти-ТСПУ 2.0): {"since", "offer": {"tag", "name", "multiplier",
+        # "answered"} | None}; None — их нет. Шлюз сам ничего не меняет.
+        "whitelist": whitelist,
         # Контроль скорости участников (ТЗ R5–R8, watch/guard.py): подозрения, идущий поиск
         # замены, пауза после «глобальной просадки», трафик поисков за сутки.
         "guard": guard or {},
@@ -1095,6 +1103,14 @@ def render_status(status: dict) -> str:
         lines.append(singbox_line)
     if status.get("probe_target"):
         lines.append(status["probe_target"])
+    whitelist = status.get("whitelist")
+    if isinstance(whitelist, dict):
+        offer = whitelist.get("offer") if isinstance(whitelist.get("offer"), dict) else None
+        lines.append(
+            "Белые списки: российские адреса открываются, зарубежные — нет; шлюз сам ничего не "
+            "меняет" + (f" — сервер для белых списков «{offer.get('name')}» можно включить в "
+                        "панели" if offer else " (серверов для белых списков нет)")
+        )
     if status.get("capture"):
         lines.append(render_capture(status["capture"]))
         lifecycle = render_lifecycle(status["capture"])

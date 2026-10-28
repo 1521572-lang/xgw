@@ -246,7 +246,7 @@
     const stale = !s.updated || s.now - s.updated > STALE_S;
     renderChip(s, stale);
     renderHero(s, stale);
-    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, s.sticky, (s.busy || {}).speed_one, Math.floor(s.now / 60)], () => renderServers(s));
+    draw("servers", [s.servers, s.sources, s.pin, s.subscriptions.length, s.links.length, s.state, s.reserve, s.stranded, s.class_warning, s.whitelist, s.sticky, (s.busy || {}).speed_one, Math.floor(s.now / 60)], () => renderServers(s));
     draw("main", [s.main, s.sticky, s.pin, s.members.length, (s.budget || {}).speed_mb], () => renderMain(s));
     draw("guard", [s.guard, Math.floor(s.now / 60)], () => renderGuard(s));
     draw("removed", s.removed, () => renderRemoved(s));
@@ -595,6 +595,10 @@
     if (server.unstable_until && server.unstable_until > s.now) {
       text += ` · нестабилен по ТСПУ: шлюз сам его в работу не ставит до ${stamp(server.unstable_until, s.now)}`;
     }
+    if (server.closed_ts) {
+      // Анти-ТСПУ 2.0: адрес закрыт целиком — обход (дробление, другое ядро) его не оживит.
+      text += ` · адрес закрыт: напрямую не открывается (проверено ${stamp(server.closed_ts, s.now)}), обход не поможет`;
+    }
     if (server.speed_passive_mbps !== null && server.speed_passive_mbps !== undefined
         && server.speed_passive_mbps >= 1) {
       text += ` · из трафика ${mbps(server.speed_passive_mbps)}`;
@@ -860,6 +864,21 @@
     $("stranded-note").textContent = capital(s.stranded || "");
     $("class-note").hidden = !s.class_warning;
     $("class-note").textContent = capital(s.class_warning || "");
+    // Белые списки (анти-ТСПУ 2.0): шлюз сам ничего не меняет — сервер включает заказчик.
+    const wl = s.whitelist;
+    $("whitelist-note").hidden = !wl;
+    if (wl) {
+      const offer = wl.offer;
+      $("whitelist-text").textContent = `Похоже, провайдер включил белые списки (с ${stamp(wl.since, s.now)}): российские адреса открываются напрямую, а зарубежные — нет. Шлюз сам ничего не меняет.`
+        + (offer ? ` Сервер для белых списков «${offer.name}» тратит квоту в ${offer.multiplier} раз быстрее${offer.answered ? "" : "; он пока не проверен"}.` : " Серверов для белых списков (x100) в подписках нет.");
+      const button = $("whitelist-pin");
+      // Уже выбран вручную — кнопка не нужна (вернуть автовыбор — кнопкой «Автовыбор»).
+      button.hidden = !offer || Boolean(s.pin && sameServer(offer.tag, s.pin.tag));
+      if (offer) {
+        button.textContent = `Включить «${offer.name}»`;
+        button.onclick = (event) => act("pin", { tag: offer.tag, ttl: "forever" }, event.currentTarget);
+      }
+    }
     const sources = [...s.sources];
     for (const server of s.servers) if (!sources.includes(server.source)) sources.push(server.source);
     const nodes = [];

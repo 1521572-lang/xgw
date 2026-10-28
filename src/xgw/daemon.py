@@ -33,6 +33,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import cores, cost, engine, fetch, log, priority, rating
 from . import pin as pinning
@@ -50,6 +51,7 @@ from .generator import builder
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, NodeInfo
+from .model import ServerNode
 from .net import tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
@@ -162,6 +164,29 @@ PROMOTE_WAIT = 3600.0
 # перестал блокировать, они лишние.
 PROFILE_RETRY = 6 * 3600.0
 PROFILE_RECHECK = 24 * 3600.0
+# Фаза отказа (анти-ТСПУ 2.0). Через Xray проба не отличает «адрес сервера закрыт» (SYN без
+# ответа, отказ) от «рукопожатие режет DPI»: CONNECT открывается локально сразу, а дальше —
+# сброс или тишина на TLS (стенд phase_lab, Xray 26.10.21). Прямое TCP-соединение с адресом
+# сервера, мимо VPN, их различает: не открылось — у всех профилей тот же адрес и порт, ни
+# дробление, ни другое ядро не помогут; лестница не запускается, а сервер в работе меняется
+# сразу. Отметка «адрес закрыт» держится CLOSED_RECHECK или до первого ответа сервера.
+CLOSED_RECHECK = PROFILE_RETRY
+# Белые списки (анти-ТСПУ 2.0): провайдер пускает только на российские адреса. Признак: VPN не
+# работает (ALL_DEAD, RESERVE), российские адреса напрямую открываются (watchdog.wan_check и
+# wan_checks — provider_ok), а из зарубежных проверочных хостов (probe.url, probe.urls) напрямую
+# не открывается ни один — WHITELIST_CONFIRM раз подряд, с паузой WHITELIST_EVERY. Сам шлюз
+# ничего не меняет (решение заказчика 28.10.2026): событие и предупреждение в панели, где можно
+# включить сервер для белых списков (x100 — «для LTE»). Пока режим держится — проверка раз в
+# WHITELIST_EVERY; открылся зарубежный хост — событие «сняты».
+WHITELIST_EVERY = 120.0
+WHITELIST_CONFIRM = 2
+WHITELIST_MULTIPLIER = 100.0  # серверы x100 и дороже — для LTE и белых списков (rating.py)
+REACH_TIMEOUT = 4.0
+# Протоколы и транспорты поверх TCP: у UDP (hysteria2, TUIC, WireGuard, mKCP, QUIC, XHTTP по
+# HTTP/3) прямое TCP-соединение ничего не говорит.
+TCP_PROTOCOLS = frozenset(("vless", "vmess", "trojan", "shadowsocks", "anytls"))
+TCP_NETWORKS = frozenset(("tcp", "raw", "ws", "grpc", "httpupgrade", "xhttp", "splithttp", "h2",
+                          "http"))
 # Незавершённые пробы профилей и время последней смены профиля — в базе (ключ meta), а не только
 # в памяти: иначе после перезапуска демона посреди пробы пробный профиль принимался за выученный
 # (отчёт 0.1.13, наблюдения 2–3), а отсчёт PROFILE_RETRY и PROFILE_RECHECK начинался заново.
@@ -232,6 +257,30 @@ UDP_PROTOCOLS = ("hysteria2", "hysteria", "tuic", "wireguard")
 def _transport(node) -> str:
     """tcp или udp: по чему сервер связывается с клиентом (QUIC и WireGuard — по UDP)."""
     return "udp" if node.protocol in UDP_PROTOCOLS else "tcp"
+
+
+def _ipv4(text: str) -> bool:
+    try:
+        return ipaddress.ip_address(text).version == 4
+    except ValueError:
+        return False
+
+
+def _over_tcp(node: ServerNode) -> bool:
+    """Сервер работает поверх TCP и напрямую (не цепочкой через другой сервер)."""
+    if node.protocol not in TCP_PROTOCOLS or node.keep_tag:
+        return False
+    stream = node.outbound.get("streamSettings") if node.outbound else None
+    if not isinstance(stream, dict):
+        return True  # только sing-box (AnyTLS) или без streamSettings — обычный TCP
+    if str(stream.get("network") or "tcp") not in TCP_NETWORKS:
+        return False
+    sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
+    if sockopt.get("dialerProxy"):
+        return False
+    tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+    alpn = tls.get("alpn")
+    return not (isinstance(alpn, list) and "h3" in alpn)
 
 
 def _server_text(name: str, tag: str) -> str:
@@ -428,6 +477,8 @@ class Daemon:
         self._escalations: dict[str, list[float]] = {}
         self._escalated: dict[str, dict] = {}
         self._unstable: dict[str, float] = {}
+        # Адрес сервера закрыт целиком (TCP напрямую не открылся): отпечаток → когда проверено.
+        self._closed: dict[str, float] = {}
         self._calm: dict[str, int] = {}
         self._calm_seen: dict[str, float] = {}
         # Мёртвый участник проверяется собственной пробой раз за «смерть» (тег → dead_since,
@@ -510,6 +561,11 @@ class Daemon:
         self.reserve_mode = False
         # Записано ли событие о долгой работе через резервный (на этот заход в RESERVE).
         self._reserve_noted = False
+        # Белые списки: с какого момента (time.time()); сколько проверок подряд их показали и
+        # когда следующая (часы демона).
+        self.whitelist_since: float | None = None
+        self._whitelist_hits = 0
+        self._whitelist_next = 0.0
         # С какого момента подписки не обновляются (time.time()) и уведомили ли об этом.
         self._sub_failing_since: float | None = None
         self._sub_alerted = False
@@ -765,6 +821,9 @@ class Daemon:
         self._urgent_round_for = previous._urgent_round_for
         self._reserve_used = previous._reserve_used
         self._reserve_noted = previous._reserve_noted
+        self.whitelist_since = previous.whitelist_since
+        self._whitelist_hits = previous._whitelist_hits
+        self._whitelist_next = previous._whitelist_next
         self._sub_failing_since = previous._sub_failing_since
         self._sub_alerted = previous._sub_alerted
         self._reserve_note = previous._reserve_note
@@ -799,6 +858,7 @@ class Daemon:
         self._escalations = {key: list(value) for key, value in previous._escalations.items()}
         self._escalated = dict(previous._escalated)
         self._unstable = dict(previous._unstable)
+        self._closed = dict(previous._closed)
         self._calm = dict(previous._calm)
         self._calm_seen = dict(previous._calm_seen)
         self._dead_scanned = dict(previous._dead_scanned)
@@ -947,6 +1007,7 @@ class Daemon:
                 "серверы в работе не отвечают; шлюз ищет живые серверы среди запасных, "
                 "в том числе лимитированных",
             )
+        self._whitelist_step(view, signals, state, now)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False
@@ -2207,6 +2268,9 @@ class Daemon:
                 self.scan_queue.appendleft(probe_tag)  # скан не состоялся
                 break
             self._note_health(info.fingerprint, result.verdict in REPLACEABLE_VERDICTS)
+            if result.verdict in REPLACEABLE_VERDICTS and self._closed.pop(
+                    info.fingerprint, None) is not None:
+                self._save_profiles()
             self.store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error,
                 ts=self.wall(),
@@ -2217,7 +2281,7 @@ class Daemon:
                 self.vetted.add(info.fingerprint)
                 if info.tag in self.dead_since:
                     self._dead_scanned[info.tag] = self.dead_since[info.tag]
-                held = self._member_note(info, result.verdict)
+                held = self._member_note(info, result.verdict, view)
                 if result.verdict in REPLACE_NOW_VERDICTS and not held:
                     self.bad_members[info.tag] = result.verdict
                 elif result.verdict in REPLACEABLE_VERDICTS or held:
@@ -2229,7 +2293,9 @@ class Daemon:
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
         """url — адрес проверки; None — probe.url."""
-        return scan.scan_node(info, self.cfg, probe_pass=password, url=url, cancel=self._stop)
+        return scan.scan_node(
+            info, self.cfg, probe_pass=password, url=url, cancel=self._stop, random_size=True,
+        )
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
         """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;
@@ -2612,6 +2678,8 @@ class Daemon:
             last is None or now - last >= PROFILE_RETRY
         ):
             steps = profiling.ladder(verdict, info.profile, default, avail)
+            if steps and verdict in profiling.REFUSED_VERDICTS and self._address_closed(node, name):
+                return  # адрес закрыт целиком — обход не поможет (CLOSED_RECHECK)
             if limited:
                 # Квота подписки: на другое ядро сервер в фоне не переводится — каждая проба
                 # тратит квоту, а перебор ядер без нужды — пустая трата (дробление в том же
@@ -2753,10 +2821,17 @@ class Daemon:
             )
         return elapsed >= PROFILE_RECHECK
 
-    def _member_note(self, info: NodeInfo, verdict: str) -> bool:
-        """Итог собственной пробы участника (ТЗ R1). «Заморозка» или отказ — не повод сразу
-        менять сервер: он проверяется на ступенях дробления в Xray на месте; заменяют его,
-        только если не ответил и там. True — участник на пробе дробления (замена ждёт)."""
+    def _member_note(
+        self, info: NodeInfo, verdict: str, view: list[NodeInfo] | None = None,
+    ) -> bool:
+        """Итог собственной пробы участника. True — участник на пробе дробления (замена ждёт).
+
+        Отказал он один, а другие участники работают, и есть проверенный запасной — замена
+        сразу (анти-ТСПУ 2.0): трафик не ждёт ступеней дробления, а обход проверяется на нём,
+        когда он станет запасным (_profile_note). Отказали больше половины участников —
+        глушение по всей сети, замена не поможет: участник проверяется на ступенях дробления в
+        Xray на месте (ТЗ R1, 0.1.18), заменяют его, только если не ответил и там. Отказ при
+        закрытом адресе (TCP напрямую не открывается) — замена сразу: обход не поможет."""
         node = self._node(info)
         if self.cfg.fragment.mode != "auto" or node is None:
             return False
@@ -2800,6 +2875,17 @@ class Daemon:
             return False
         if good or verdict not in profiling.ESCALATE_VERDICTS:
             return False
+        if verdict in profiling.REFUSED_VERDICTS and self._address_closed(node, name):
+            self.bad_members[info.tag] = verdict
+            return False
+        if view is not None and self._isolated_failure(info, view):
+            self.bad_members[info.tag] = verdict
+            self.log.info(
+                "%s в работе не отвечает (%s), а другие участники работают — меняю его на "
+                "проверенный запасной сразу; обход проверю на нём, когда он станет запасным",
+                name, verdict,
+            )
+            return False
         steps = self._escalation_steps(info, verdict)
         if not steps:
             return False
@@ -2815,6 +2901,167 @@ class Daemon:
             f"«{profiling.NAMES[steps[0]]}»",
         )
         return True
+
+    # --- белые списки (анти-ТСПУ 2.0) ----------------------------------------------------
+
+    def _whitelist_step(
+        self, view: list[NodeInfo], signals: Signals, state: State, now: float,
+    ) -> None:
+        """Распознаёт белые списки и их снятие; сам ничего не переключает."""
+        broken = state in (State.ALL_DEAD, State.RESERVE)
+        if self.whitelist_since is None and not (broken and signals.provider_ok):
+            self._whitelist_hits = 0
+            return
+        if now < self._whitelist_next:
+            return
+        self._whitelist_next = now + WHITELIST_EVERY
+        closed = self._foreign_closed()
+        if closed is None:
+            return
+        if not closed:
+            self._whitelist_hits = 0
+            if self.whitelist_since is not None:
+                self.whitelist_since = None
+                back = " — можно вернуть автовыбор" if self._manual_pin() is not None else ""
+                self.notifier.event(
+                    "whitelist", "белые списки сняты: зарубежные адреса снова открываются "
+                    f"напрямую{back}", notify=True,
+                )
+            return
+        if self.whitelist_since is not None or not signals.provider_ok:
+            return
+        self._whitelist_hits += 1
+        if self._whitelist_hits < WHITELIST_CONFIRM:
+            return
+        self.whitelist_since = self.wall()
+        offer = self._whitelist_offer(view)
+        for info in self._whitelist_servers(view):
+            self._queue_first(info.probe_tag)  # проверить их первыми — для предложения
+        hint = (f" Можно включить сервер для белых списков «{offer['name']}» в панели — он "
+                f"тратит квоту в {offer['multiplier']:g} раз быстрее." if offer else
+                " Серверов для белых списков (x100) в подписках нет.")
+        self.notifier.event(
+            "whitelist",
+            "похоже, провайдер включил белые списки: российские адреса открываются напрямую, "
+            "а зарубежные — нет, и серверы VPN не отвечают. Шлюз сам ничего не меняет." + hint,
+            notify=True,
+        )
+
+    def _foreign_closed(self) -> bool | None:
+        """True — ни один зарубежный проверочный хост (probe.url, probe.urls) не открывается
+        напрямую, мимо VPN (TCP сокетом с меткой mark_bypass); False — открылся хоть один;
+        None — проверить нечем (нет метки, имена не разрешились)."""
+        if self.mark is None:
+            return None
+        tried = 0
+        for url in probehosts.all_urls(self.cfg):
+            parts = urlsplit(url)
+            if not parts.hostname:
+                continue
+            address = self._provider_address(parts.hostname)
+            if address is None:
+                continue
+            tried += 1
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+            if checks.tcp_check(address, port, timeout=REACH_TIMEOUT, mark=self.mark):
+                return False
+        return True if tried else None
+
+    def _whitelist_servers(self, view: list[NodeInfo]) -> list[NodeInfo]:
+        """Серверы для белых списков: множитель x100 и выше в имени («для LTE»)."""
+        if self.inventory is None:
+            return []
+        names = {node.fingerprint: node.name for node in self.inventory.nodes}
+        pattern = self.cfg.filters.multiplier_regex
+        return [
+            info for info in view if info.role in ("proxy", "spare")
+            and cost.multiplier(names.get(info.fingerprint, ""), pattern) >= WHITELIST_MULTIPLIER
+        ]
+
+    def _whitelist_offer(self, view: list[NodeInfo]) -> dict | None:
+        """Сервер для белых списков, который предложить заказчику: ответивший последний скан
+        — первым, затем быстрее ответивший; None — таких серверов нет."""
+        servers = self._whitelist_servers(view)
+        if not servers or self.inventory is None:
+            return None
+        scans = self._fresh_scans()
+        nodes = {node.fingerprint: node for node in self.inventory.nodes}
+
+        def rank(info: NodeInfo) -> tuple:
+            entry = scans.get(info.probe_tag) or {}
+            good = entry.get("verdict") in REPLACEABLE_VERDICTS
+            return (not good, float(entry.get("seconds") or 99.0), info.tag)
+
+        best = min(servers, key=rank)
+        node = nodes.get(best.fingerprint)
+        name = node.name if node is not None else best.tag
+        answered = (scans.get(best.probe_tag) or {}).get("verdict") in REPLACEABLE_VERDICTS
+        return {
+            "tag": best.tag, "name": name, "answered": answered,
+            "multiplier": cost.multiplier(name, self.cfg.filters.multiplier_regex),
+        }
+
+    def _isolated_failure(self, info: NodeInfo, view: list[NodeInfo]) -> bool:
+        """Отказал этот участник, а не почти все сразу, и заменить его есть кем.
+
+        Другие участники «работают», если ядро не считает их мёртвыми (dead_since — по пробам
+        самого Xray, от порядка сканов не зависит) и они прошли первую проверку. Отказавших —
+        не больше половины. Ручной выбор не меняется. Запасной — со свежим удачным сканом,
+        рейтингом выше нуля, не «нестабильный по ТСПУ» и не с закрытым адресом."""
+        pin = self._manual_pin()
+        if pin is not None and pinning.same_server(str(pin.get("tag") or ""), info.tag):
+            return False
+        members = [item for item in view if item.role == "proxy"]
+        working = [
+            item for item in members
+            if item.tag != info.tag and item.tag not in self.dead_since
+            and item.tag not in self.bad_members
+        ]
+        if not working or (len(members) - len(working)) * 2 > len(members):
+            return False
+        scans = self._fresh_scans()
+        return any(
+            item.role == "spare" and scans.get(item.probe_tag, {}).get("verdict")
+            in REPLACEABLE_VERDICTS and not self._is_unstable(item.fingerprint)
+            and item.fingerprint not in self._closed and self._score(item) > 0
+            for item in view
+        )
+
+    def _address_closed(self, node: ServerNode, name: str) -> bool:
+        """Адрес сервера закрыт целиком: TCP к нему напрямую не открывается (проверено не
+        раньше CLOSED_RECHECK назад или сейчас). Новая отметка — строка в журнале."""
+        now = self.wall()
+        when = self._closed.get(node.fingerprint)
+        if when is not None and now - when < CLOSED_RECHECK:
+            return True
+        if self._server_reachable(node) is not False:
+            if self._closed.pop(node.fingerprint, None) is not None:
+                self._save_profiles()
+            return False
+        self._closed[node.fingerprint] = now
+        self._save_profiles()
+        self.log.info(
+            "%s: TCP к адресу сервера напрямую не открывается — адрес закрыт целиком, обход не "
+            "поможет; профили не перебираю", name,
+        )
+        return True
+
+    def _server_reachable(self, node: ServerNode) -> bool | None:
+        """Открывается ли TCP к адресу сервера напрямую, мимо VPN (сокет с меткой
+        mark_bypass). None — проверить нечем: нет метки, протокол или транспорт не TCP,
+        цепочка (соединение идёт через другой сервер), домен без адреса в применённом конфиге."""
+        if self.mark is None or not _over_tcp(node):
+            return None
+        address = node.address
+        if not _ipv4(address):
+            applied = engine.read_json(self.paths.xray_config_file) or {}
+            hosts = (applied.get("dns") or {}).get("hosts")
+            found = hosts.get(address) if isinstance(hosts, dict) else None
+            found = [found] if isinstance(found, str) else found or []
+            address = next((ip for ip in found if isinstance(ip, str) and _ipv4(ip)), "")
+            if not address:
+                return None
+        return checks.tcp_check(address, node.port, timeout=REACH_TIMEOUT, mark=self.mark)
 
     def _member_profiles(self, view: list[NodeInfo], observatory: dict) -> None:
         """Участники на дроблении (ТЗ R1.3): каждая проба ядра без сбоя — плюс к счёту
@@ -2974,6 +3221,12 @@ class Daemon:
                 self._unstable[str(key)] = float(until)
             else:
                 skipped += 1
+        closed = saved.get("closed")
+        for key, when in (closed.items() if isinstance(closed, dict) else ()):
+            if isinstance(when, (int, float)) and not isinstance(when, bool):
+                self._closed[str(key)] = float(when)
+            else:
+                skipped += 1
         if skipped:
             self.log.warning("записей о пробах профилей в базе не разобрано: %d — пропущены",
                              skipped)
@@ -2990,6 +3243,9 @@ class Daemon:
         }
         self._escalations = {key: times for key, times in self._escalations.items() if times}
         self._unstable = {key: until for key, until in self._unstable.items() if until > now}
+        self._closed = {
+            key: when for key, when in self._closed.items() if now - when < CLOSED_RECHECK
+        }
         if self.inventory is not None:
             known = {node.fingerprint for node in self.inventory.nodes}
             switched = {key: when for key, when in switched.items() if key in known}
@@ -3001,7 +3257,7 @@ class Daemon:
             TRIALS_META, json.dumps({
                 "trials": self._trial_saved, "switched": switched,
                 "escalations": self._escalations, "escalated": self._escalated,
-                "unstable": self._unstable,
+                "unstable": self._unstable, "closed": self._closed,
             }),
         )
 
@@ -4626,6 +4882,8 @@ class Daemon:
                 self.capture is not None
                 and getattr(self.capture, "tailscale_via_vpn", lambda: False)()
             ),
+            whitelist={"since": self.whitelist_since, "offer": self._whitelist_offer(view)}
+            if self.whitelist_since is not None else None,
         )
         spent = json.dumps(self.guard.spent, sort_keys=True)
         if spent != self.store.get_meta(speedguard.META_SPENT):
