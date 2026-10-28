@@ -25,9 +25,11 @@
    ссылки» в карточке больше нет; старые снимки VPNJantit шлюз удаляет сам.
 4. `sudo xgw diag` — новая строка «Бесплатный пул».
 
-Здесь, у разработчика, — юнит-тесты (агент с подставными работниками, сторона демона, конфиг
-OpenVPN, правила), ruff и стенд ядра в WSL с подставным OpenVPN. Настоящий OpenVPN — впервые
-на этой машине.
+Здесь, у разработчика, — только юнит-тесты и ruff (решение заказчика: проверок у разработчика
+— минимум). Всё остальное проверяется на этой машине: установка и повторная установка, бэкенд
+OpenVPN, правила, **живое поколение** (изоляция службы и работников, маршрут только через
+туннель, права файлов, секреты), подключения, журналы, панель, выключение. Настоящий OpenVPN —
+впервые на этой машине.
 
 ## 0. Запрещено
 
@@ -66,11 +68,13 @@ Ubuntu и двух системных пользователей без вход
 выключите наблюдение кнопкой «Выключить» в карточке «Бесплатные серверы» панели XGW.
 (3) В панели по моей просьбе прочитаете мне сводку из карточки «Бесплатные серверы».
 (4) В конце откроете любой сайт на этом компьютере и на телефоне.
+(5) В конце — ещё одна переустановка тем же кодом (проверка, что повторная установка ничего не
+создаёт заново): интернет дома ещё раз пропадёт на несколько секунд.
 Можно согласиться не на все пункты.»
 
-Против пункта 1 или 2 — **стоп**. Против 3 — шаги 3.3 и 5.1 пропустить; против 4 — шаг 8.3.
-Если против 2 только выключение кнопкой — шаг 7.1 пропустить. В отчёте у пропущенного — «не
-выполнялся».
+Против пункта 1 или 2 — **стоп**. Против 3 — шаги 3.3 и 5.1 пропустить; против 4 — шаг 8.3;
+против 5 — шаг 8.2. Если против 2 только выключение кнопкой — шаг 7.1 пропустить. В отчёте у
+пропущенного — «не выполнялся».
 
 Шаг 1.2. Папка, помощник проверки и состояние до установки:
 
@@ -80,7 +84,11 @@ mkdir -p "$HOME/xgw-fp2" && chmod 700 "$HOME/xgw-fp2" && cd "$HOME/xgw-fp2" && c
 Только читает: состояние XGW (/run/xgw, /var/lib/xgw/freepool, рабочий конфиг Xray), бэкенд
 OpenVPN (пакет, пользователи, служба, пересылка IPv4, набор fp_peers, ufw, veth) и журналы со
 стандартного ввода — счётчики, коды, права и да/нет, без адресов, имён, ссылок и паролей.
-Режимы: units, backend, pool, checks, files, config, leak, digest, subs, fwd, log, agentlog."""
+watch — живые поколения: свойства службы, возможности и пространство имён агента и работников
+(/proc), интерфейсы и маршруты внутри (/proc/<pid>/net), права файлов в /tmp службы, секреты в
+состоянии; ничего не меняет и в пространство имён не входит.
+Режимы: units, backend, pool, checks, files, config, leak, digest, subs, fwd, log, agentlog,
+watch."""
 import json
 import os
 import re
@@ -96,6 +104,10 @@ DAY = 86400.0
 HOUR = 3600.0
 IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 NOT_TUNNEL = ("REACHABLE", "CLOSED", "UNTESTED")
+CAPS = {0: "chown", 1: "dac_override", 2: "dac_read_search", 3: "fowner", 4: "fsetid",
+        5: "kill", 6: "setgid", 7: "setuid", 8: "setpcap", 10: "net_bind_service",
+        12: "net_admin", 13: "net_raw", 16: "sys_module", 19: "sys_ptrace", 21: "sys_admin"}
+RANK = {"guarded": 1, "connecting": 2, "up": 3}
 
 
 def run(argv):
@@ -145,6 +157,131 @@ def counted(items):
     for item in items:
         found[item] = found.get(item, 0) + 1
     return ", ".join(f"{name} {count}" for name, count in sorted(found.items())) or "—"
+
+
+def caps(value):
+    try:
+        number = int(value, 16)
+    except ValueError:
+        return "?"
+    return ",".join(CAPS.get(bit, f"bit{bit}") for bit in range(64) if number >> bit & 1) or "нет"
+
+
+def proc_status(pid):
+    fields = {}
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            key, _sep, value = line.partition(":")
+            fields[key] = value.strip()
+    except OSError:
+        pass
+    return fields
+
+
+def account(uid, group=False):
+    import grp
+    import pwd
+
+    try:
+        return grp.getgrgid(int(uid)).gr_name if group else pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError):
+        return str(uid)
+
+
+def netns(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/ns/net")
+    except OSError:
+        return ""
+
+
+def describe(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return "нет"
+    return (f"{oct(info.st_mode & 0o777)[2:]} {account(info.st_uid)}:"
+            f"{account(info.st_gid, group=True)}")
+
+
+def routes(pid):
+    default, single = "нет", 0
+    try:
+        rows = Path(f"/proc/{pid}/net/route").read_text(encoding="ascii").splitlines()[1:]
+    except OSError:
+        return "маршруты внутри: не прочитаны"
+    for row in rows:
+        cols = row.split()
+        if len(cols) < 8:
+            continue
+        if cols[1] == "00000000" and cols[7] == "00000000":
+            default = cols[0]
+        elif cols[7] == "FFFFFFFF":
+            single += 1
+    return f"маршрут по умолчанию внутри: {default}; маршрутов к одному адресу: {single}"
+
+
+def snapshot(paths, gen, host_ns):
+    unit = f"xgw-fp@{gen}.service"
+    _code, props = run(["systemctl", "show", unit, "-p", "PrivateNetwork", "-p", "PrivateTmp",
+                        "-p", "NoNewPrivileges", "-p", "ProtectSystem", "-p", "KillMode",
+                        "-p", "CapabilityBoundingSet"])
+    lines = ["служба: " + "; ".join(sorted(line.strip() for line in props.splitlines()
+                                           if line.strip()))]
+    pid = show(unit, "MainPID")
+    directory = paths.run / "fp" / gen
+    manifest = read_json(directory / "manifest.json") or {}
+    if not pid.isdigit() or pid == "0":
+        return lines + ["агент: не найден"]
+    status = proc_status(pid)
+    ns = netns(pid)
+    lines.append(f"агент: пользователь {account((status.get('Uid') or '?').split()[0])}; "
+                 f"возможности {caps(status.get('CapEff', '0'))}; NoNewPrivs "
+                 f"{status.get('NoNewPrivs', '?')}; своё пространство имён: "
+                 f"{'да' if ns and ns != host_ns else 'НЕТ'}")
+    try:
+        names = sorted(line.split(":")[0].strip() for line in
+                       Path(f"/proc/{pid}/net/dev").read_text(encoding="ascii").splitlines()[2:])
+    except OSError:
+        names = []
+    lines.append("интерфейсы внутри: " + (", ".join(names) or "не прочитаны"))
+    lines.append(routes(pid))
+    workers = []
+    for entry in Path("/proc").iterdir() if ns else ():
+        if not entry.name.isdigit() or entry.name == pid or netns(entry.name) != ns:
+            continue
+        info = proc_status(entry.name)
+        if info.get("Name", "").startswith("python"):
+            continue  # проба самопроверки охраны
+        owner = account((info.get("Uid") or "?").split()[0])
+        workers.append(f"{info.get('Name', '?')} от {owner}, возможности "
+                       f"{caps(info.get('CapEff', '0'))}, NoNewPrivs "
+                       f"{info.get('NoNewPrivs', '?')}")
+    lines.append("работники: " + ("; ".join(sorted(workers)) or "нет"))
+    tmp = Path(f"/proc/{pid}/root/tmp")
+    for name, files in (("xgw-ovpn", ("client.conf", "auth")), ("xgw-socks", ("socks.json",))):
+        items = [describe(tmp / name)] + [f"{item} {describe(tmp / name / item)}"
+                                          for item in files if (tmp / name / item).exists()]
+        lines.append(f"{name}: " + "; ".join(items))
+    lines.append(f"задание: {describe(directory / 'manifest.json')}; состояние: "
+                 f"{describe(directory / 'state.json')}")
+    try:
+        state_text = (directory / "state.json").read_text(encoding="utf-8")
+    except OSError:
+        state_text = ""
+    words = [word for word in [str(manifest.get("socks_pass") or ""),
+                               *str(manifest.get("auth") or "").splitlines()[1:2]]
+             if len(word) >= 6]
+    lines.append(f"секреты задания в state.json: "
+                 f"{'ЕСТЬ' if any(word in state_text for word in words) else 'нет'} "
+                 f"(проверено {len(words)})")
+    index = manifest.get("index")
+    _code, peers = run(["nft", "list", "set", "ip", "xgw", "fp_peers"])
+    match = re.search(r"elements = \{([^}]*)\}", peers, re.S)
+    count = len([item for item in match.group(1).split(",") if item.strip()]) if match else 0
+    veth = Path(f"/sys/class/net/fpv{index}").exists()
+    lines.append(f"veth на хосте: {'есть' if veth else 'нет'}; элементов fp_peers: {count}")
+    return lines
 
 
 def openvpn_processes():
@@ -220,6 +357,10 @@ elif mode == "backend":
 
     problem = backend.unavailable(paths, cmd.run)
     print("бэкенд OpenVPN: " + ("годится" if not problem else problem))
+    _code, text = run(["systemd-analyze", "security", "--no-pager", "xgw-fp@0000000000.service"])
+    level = [line for line in text.splitlines() if "Overall exposure level" in line]
+    print("оценка systemd службы xgw-fp@: "
+          + (level[-1].split(":", 1)[1].strip() if level else "не получена"))
 elif mode == "pool":
     _cfg, paths = xgw()
     status = read_json(paths.status_file) or {}
@@ -317,6 +458,11 @@ elif mode == "files":
             continue
         running += pattern in command
     print(f"временных каталогов проверок: {left}; временных Xray сейчас: {running}")
+    from xgw import managed
+
+    panel = read_json(managed.path_for(paths.config_file)) or {}
+    print(f"panel.json: поле ссылок пула: {'ЕСТЬ' if 'free_pool_links' in panel else 'нет'}; "
+          f"режим пула: {panel.get('free_pool_mode') or '—'}")
 elif mode == "config":
     cfg, paths = xgw()
     from xgw.freepool.store import PoolStore
@@ -434,15 +580,56 @@ elif mode == "agentlog":
         not address.startswith(("10.250.", "127.")) for address in IPV4.findall(line)))
     print(f"строк с внешним адресом: {outer}; Traceback: "
           f"{sum(1 for line in lines if 'Traceback' in line)}")
+elif mode == "watch":
+    _cfg, paths = xgw()
+    limit = float(sys.argv[2]) if len(sys.argv) > 2 else 480.0
+    deadline = time.time() + limit
+    host_ns = netns(1)
+    seen = {}
+    while time.time() < deadline:
+        base = paths.run / "fp"
+        for directory in sorted(base.iterdir()) if base.exists() else []:
+            if not directory.is_dir() or not re.fullmatch(r"[0-9a-f]{10}", directory.name):
+                continue
+            try:
+                state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                state = {}
+            info = seen.setdefault(directory.name, {"phases": [], "rank": 0, "full": [],
+                                                    "up": "", "reason": "", "selftest": "—"})
+            phase = str(state.get("phase") or "")
+            if phase and (not info["phases"] or info["phases"][-1] != phase):
+                info["phases"].append(phase)
+            if state.get("reason"):
+                info["reason"] = str(state["reason"])
+            if isinstance(state.get("selftest"), dict):
+                info["selftest"] = "пройдена" if state["selftest"].get("ok") else "НЕ пройдена"
+            rank = RANK.get(phase, 0)
+            if rank > info["rank"]:
+                if rank <= 2 or not info["full"]:
+                    info["full"] = snapshot(paths, directory.name, host_ns)
+                if rank == 3:
+                    info["up"] = routes(show(f"xgw-fp@{directory.name}.service", "MainPID"))
+                info["rank"] = rank
+        time.sleep(0.5)
+    up = sum(1 for info in seen.values() if "up" in info["phases"])
+    print(f"поколений увидено: {len(seen)}; поднялось: {up}")
+    for number, info in enumerate(seen.values(), 1):
+        print(f"поколение {number}: фазы {' → '.join(info['phases']) or '—'}; самопроверка "
+              f"{info['selftest']}; причина отказа: {info['reason'] or '—'}")
+        for line in info["full"]:
+            print(f"  {line}")
+        if info["up"]:
+            print(f"  после подъёма: {info['up']}")
 else:
     print("режим: units | backend | pool | checks | files | config | leak | digest | subs | fwd"
-          " | log | agentlog")
+          " | log | agentlog | watch")
 EOF
 python3 -c "import hashlib;d=open('fpm2check.py','rb').read().rstrip(b'\n')+b'\n';print(hashlib.sha256(d).hexdigest()[:16])"; sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|^Бесплатный пул' | tee before.txt; for m in units files digest subs; do sudo python3 -I fpm2check.py $m; done | tee state-before.txt; sudo journalctl -u xgw --since "60 min ago" --no-pager | sudo python3 -I fpm2check.py log | tee log-before.txt
 ```
 
 Ожидается:
-- `26798dfee5dfb0ee`;
+- `0d9d6a4b827ac706`;
 - `Состояние: HEALTHY …`, `Перехват: включён …`, строки `Xray …` и `sing-box …`, строки
   `Бесплатный пул` нет — записать как есть;
 - четыре службы `active`; «поколений xgw-fp@ сейчас: 0 (—); процессов openvpn XGW: 0; других
@@ -486,7 +673,7 @@ cd ~/zcod/xgw && date '+%F %T' | tee "$HOME/xgw-fp2/install-time.txt" && sudo sh
 Шаг 2.3. Через 2 минуты — шлюз в порядке, бэкенд поставлен, пул выключен:
 
 ```bash
-sleep 120; cd "$HOME/xgw-fp2" && sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|^Бесплатный пул' | tee after-install.txt; for m in units backend digest files pool; do sudo python3 -I fpm2check.py $m; done | tee -a after-install.txt; sudo xgw pool 2>&1 | head -1 | tee -a after-install.txt; sudo xgw diag 2>&1 | grep -E 'Бесплатный пул|^Итог' | tee -a after-install.txt; sudo journalctl -u xgw --since "$(cat install-time.txt)" --no-pager | sudo python3 -I fpm2check.py log | tee log-install.txt
+sleep 120; cd "$HOME/xgw-fp2" && sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|^Бесплатный пул' | tee after-install.txt; for m in units backend digest files pool; do sudo python3 -I fpm2check.py $m; done | tee -a after-install.txt; sudo xgw pool 2>&1 | head -1 | tee -a after-install.txt; sudo xgw diag 2>&1 | grep -E 'Бесплатный пул|Конфиг|^Итог' | tee -a after-install.txt; sudo journalctl -u xgw --since "$(cat install-time.txt)" --no-pager | sudo python3 -I fpm2check.py log | tee log-install.txt
 ```
 
 Ожидается:
@@ -497,10 +684,12 @@ sleep 120; cd "$HOME/xgw-fp2" && sudo xgw status 2>&1 | grep -E '^Состоян
   «пересылка IPv4: 1»; «набор fp_peers: нет» (пул выключен — правил пула нет); «veth fpv
   сейчас: 0; каталогов поколений: 0»; «ufw: …» — записать; «бэкенд OpenVPN: в правилах XGW нет
   набора fp_peers — перехват не загружен» (так и должно быть при выключенном пуле);
+  «оценка systemd службы xgw-fp@: <число> <OK или MEDIUM> …» — записать;
 - «отпечаток таблиц: совпадает; … True»;
 - «снимков списков: N (vpnbook …, vpngate …)» — **без vpnjantit**;
 - «free_pool в состоянии: нет»; «Бесплатный пул: выключен; регион EU (строго)»;
-- `OK    Бесплатный пул: выключен — режим подписок`; строка `Итог: …` — записать;
+- `OK    Бесплатный пул: выключен — режим подписок`; строка `Конфиг` — без слов
+  `free_pool` и `VPNJantit`; строка `Итог: …` — записать;
 - в журнале с установки: «снимки убранных источников удалены: 1» (0 — если снимков VPNJantit
   уже не было), «Traceback: 0».
 
@@ -513,27 +702,72 @@ sleep 120; cd "$HOME/xgw-fp2" && sudo xgw status 2>&1 | grep -E '^Состоян
 - «пересылка IPv4: 0» — **стоп**, сообщить заказчику (у шлюза с LAN она должна быть 1);
 - «ufw: включён; правило fpv+: НЕТ» — **дефект «ufw: нет правила для туннелей»**;
 - в снимках есть vpnjantit — **дефект «снимки VPNJantit не удалены»**;
+- в строке `Конфиг` есть `free_pool` или `VPNJantit` — записать дословно (наблюдение: в
+  config.toml остались ключи прошлых версий);
+- «оценка systemd …» — `EXPOSED` или `UNSAFE` — записать (наблюдение), «не получена» —
+  записать и продолжить;
 - отпечаток не совпадает — повторить через минуту, снова так — **дефект «отпечаток таблиц
   меняется сам»**.
 
 ## 3. Включение наблюдения
 
-Шаг 3.1. Включить:
+Шаг 3.1. Включить и сразу 8 минут наблюдать живые поколения (помощник только читает
+`/proc`, `systemctl show` и файлы состояния; в службы не вмешивается):
 
 ```bash
-cd "$HOME/xgw-fp2" && date '+%F %T' | tee observe-time.txt && sudo xgw pool mode observe 2>&1 | tee mode-on.txt
+cd "$HOME/xgw-fp2" && date '+%F %T' | tee observe-time.txt && sudo xgw pool mode observe 2>&1 | tee mode-on.txt; sudo python3 -I fpm2check.py watch 480 | tee live.txt
 ```
 
-Ожидается: «Наблюдение за бесплатным пулом включено: списки серверов собираются через
-подписку, серверы проверяются, а трафик идёт как прежде — через подписку. Демон применит режим
-на ближайшем шаге». Записать.
+Ожидается:
+- «Наблюдение за бесплатным пулом включено: списки серверов собираются через подписку,
+  серверы проверяются, а трафик идёт как прежде — через подписку. Демон применит режим на
+  ближайшем шаге»;
+- через 8 минут: «поколений увидено: N; поднялось: U», N — от 1 (обычно 3–5), U — любое;
+- у каждого поколения:
+  - «фазы guarded → connecting → …» (поднявшееся — «… → up»), «самопроверка пройдена» (у
+    отказавшего до неё — «—»), «причина отказа: …» — записать;
+  - «служба: CapabilityBoundingSet=cap_chown cap_kill cap_setgid cap_setuid cap_net_admin;
+    KillMode=mixed; NoNewPrivileges=yes; PrivateNetwork=yes; PrivateTmp=yes;
+    ProtectSystem=strict» (порядок слов в возможностях — любой);
+  - «агент: пользователь root; возможности chown,kill,setgid,setuid,net_admin; NoNewPrivs 1;
+    своё пространство имён: да»;
+  - «интерфейсы внутри: fpi<номер>, fpt0, lo»;
+  - «маршрут по умолчанию внутри: нет; маршрутов к одному адресу: 1» (снимок сделан до
+    подъёма туннеля); у поднявшегося — ещё «после подъёма: маршрут по умолчанию внутри: fpt0;
+    …»;
+  - «работники: openvpn от xgw-ovpn, возможности нет, NoNewPrivs 1; xray от xgw-fps,
+    возможности нет, NoNewPrivs 1» (у отказавшего до запуска работников — «нет»);
+  - «xgw-ovpn: 750 root:xgw-ovpn; client.conf 640 root:xgw-ovpn; auth 640 root:xgw-ovpn»
+    (`auth` — только у источника с учёткой); «xgw-socks: 750 root:xgw-fps; socks.json 640
+    root:xgw-fps»;
+  - «задание: 600 root:root; состояние: 600 root:root»; «секреты задания в state.json: нет»;
+  - «veth на хосте: есть; элементов fp_peers: 1».
 
-Если не так: «ошибка: …» — записать дословно, **стоп**, сообщить заказчику.
+Записать всё как есть.
 
-Шаг 3.2. Через 4 минуты — правила пула загружены, списки получены, бэкенд годится:
+Если не так:
+- «ошибка: …» в ответе команды — записать дословно, **стоп**, сообщить заказчику;
+- «поколений увидено: 0» — продолжить: шаг 3.2 покажет, годится ли бэкенд (подключения могли
+  начаться позже);
+- у агента не root, другие возможности, NoNewPrivs не 1 или «своё пространство имён: НЕТ»; у
+  службы нет `PrivateNetwork=yes` или `NoNewPrivileges=yes` — **дефект «изоляция поколения»**,
+  **стоп**, сообщить заказчику;
+- «маршрут по умолчанию внутри» не «нет» в снимке до подъёма или после подъёма не `fpt0` —
+  **дефект «маршрут мимо туннеля»**, **стоп**;
+- работник от root или с возможностями, или NoNewPrivs не 1 — **дефект «права работника»**,
+  **стоп**;
+- среди интерфейсов внутри есть что-то кроме `fpi…`, `fpt0`, `lo` — **дефект «лишний интерфейс
+  в пространстве имён»**;
+- права файлов шире (не 750/640/600) или владелец другой — **дефект «права файлов
+  поколения»**; «секреты задания в state.json: ЕСТЬ» — **дефект «секрет в состоянии»**;
+- «самопроверка НЕ пройдена» — **дефект «охрана пропускает»**, **стоп**;
+- «агент: не найден» или строки «не прочитаны» — записать (поколение могло закончиться между
+  опросами) и продолжить.
+
+Шаг 3.2. Сразу после шага 3.1 — правила пула загружены, списки получены, бэкенд годится:
 
 ```bash
-sleep 240; cd "$HOME/xgw-fp2" && for m in pool backend digest units; do sudo python3 -I fpm2check.py $m; done | tee pool-1.txt; sudo xgw status 2>&1 | grep -E '^Состояние|^Бесплатный пул' | tee -a pool-1.txt; sudo xgw diag 2>&1 | grep -E 'Бесплатный пул' | tee -a pool-1.txt; sudo journalctl -u xgw --since "$(cat observe-time.txt)" --no-pager | sudo python3 -I fpm2check.py log | tee log-1.txt
+sleep 10; cd "$HOME/xgw-fp2" && for m in pool backend digest units files; do sudo python3 -I fpm2check.py $m; done | tee pool-1.txt; sudo xgw status 2>&1 | grep -E '^Состояние|^Бесплатный пул' | tee -a pool-1.txt; sudo xgw diag 2>&1 | grep -E 'Бесплатный пул' | tee -a pool-1.txt; sudo journalctl -u xgw --since "$(cat observe-time.txt)" --no-pager | sudo python3 -I fpm2check.py log | tee log-1.txt
 ```
 
 Ожидается:
@@ -545,6 +779,8 @@ sleep 240; cd "$HOME/xgw-fp2" && for m in pool backend digest units; do sudo pyt
 - **«набор fp_peers: есть; элементов 0»** (или 1 — идёт подключение); **«бэкенд OpenVPN:
   годится»**;
 - «отпечаток таблиц: совпадает; … True»;
+- «panel.json: поле ссылок пула: нет; режим пула: observe» (ссылки VPNJantit прошлой версии
+  отброшены при записи режима);
 - `Состояние: HEALTHY …`; строка `Бесплатный пул (наблюдение, регион EU): найдено …`;
 - `OK    Бесплатный пул: режим observe; бэкенд OpenVPN готов (…)`, строки `FAIL` у «Бесплатный
   пул» нет;
@@ -561,6 +797,7 @@ sleep 240; cd "$HOME/xgw-fp2" && for m in pool backend digest units; do sudo pyt
   2 минуты и повторить; снова так — **дефект «правила пула не загрузились»** (продолжить: OpenVPN
   тогда проверяется только по адресу);
 - «бэкенд OpenVPN: …» с другой причиной — записать дословно, **дефект «бэкенд не годится»**;
+- «panel.json: поле ссылок пула: ЕСТЬ» — **дефект «ссылки VPNJantit остались в panel.json»**;
 - «правила загружены заново» больше 2 — **дефект «правила загружаются по кругу»**;
 - источник `UNAVAILABLE` или `RATE_LIMITED` — записать, продолжить; оба `UNAVAILABLE` —
   записать `sudo python3 -I fpm2check.py subs | tee subs-1.txt` и продолжить;
@@ -604,6 +841,7 @@ cd "$HOME/xgw-fp2" && for m in checks pool units backend fwd files config; do su
 - «подключений за час: H (…)», H не больше 4, у каждого источника не больше 2;
 - «трафик одной проверки туннелем, наибольший: X МБ», X не больше 20;
 - «OpenVPN туннелем: годится; поднялось …» в сводке — U как выше (может отличаться на 1);
+  «пригодно R (…)» — в скобках только `EU …` или «—» (регион строгий);
 - «поколений xgw-fp@ сейчас: 0» или 1 (идёт подключение); «процессов openvpn XGW: 0» или 1;
   «других openvpn» — как до установки;
 - «набор fp_peers: есть; элементов 0» (или 1); «veth fpv сейчас: 0» (или 1); «каталогов
@@ -639,6 +877,7 @@ cd "$HOME/xgw-fp2" && for m in checks pool units backend fwd files config; do su
 - поколений, veth или каталогов 2 и больше — повторить через 2 минуты; снова так — **дефект
   «поколения не убираются»**;
 - X больше 20 — **дефект «проверка туннелем тратит много трафика»**;
+- в скобках у «пригодно» есть не `EU` — **дефект «регион не строгий»**;
 - «из них серверов бесплатного пула» или «выходов к работникам пула» больше 0 — **дефект
   «пул попал в рабочий конфиг»**, **стоп**, сообщить заказчику;
 - «строк с внешним адресом» больше 0 — **наблюдение** (адрес в журнале службы); строки не
@@ -744,7 +983,24 @@ sleep 180; cd "$HOME/xgw-fp2" && sudo journalctl -u xgw --since "$(cat off-time.
 **дефект «поколение убрано не до конца»**; «правила загружены заново» больше 3 — **дефект
 «правила загружаются по кругу»**. Сообщить заказчику.
 
-Шаг 8.2 (при согласии на пункт 4). **Попроси заказчика** (дословно):
+Шаг 8.2 (при согласии на пункт 5). Повторная установка тем же кодом. **Скажи заказчику**
+(дословно): «Запускаю повторную установку тем же кодом — интернет дома пропадёт на несколько
+секунд. WAN она не трогает.» Затем:
+
+```bash
+cd ~/zcod/xgw && date '+%F %T' | tee "$HOME/xgw-fp2/reinstall-time.txt" && sudo sh packaging/install.sh --yes 2>&1 | tee "$HOME/xgw-fp2/reinstall.txt" | tail -4; echo "код ${PIPESTATUS[0]}"; grep -cE 'пакеты: .*openvpn|пользователь xgw-' "$HOME/xgw-fp2/reinstall.txt" | sed 's/^/строк «пакеты openvpn» и «пользователь xgw-…»: /'; cd "$HOME/xgw-fp2"; sleep 120; for m in units backend digest; do sudo python3 -I fpm2check.py $m; done | tee reinstall-after.txt; sudo journalctl -u xgw --since "$(cat reinstall-time.txt)" --no-pager | sudo python3 -I fpm2check.py log | tee -a reinstall-after.txt; sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:' | tee -a reinstall-after.txt
+```
+
+Ожидается: «код 0»; «строк «пакеты openvpn» и «пользователь xgw-…»: 0» (пакет и пользователи
+уже есть — заново не ставятся); пакет, пользователи, служба — как в шаге 2.3; «поколений xgw-fp@
+сейчас: 0»; «набор fp_peers: нет»; «отпечаток таблиц: совпадает; … True»; в журнале «Traceback:
+0», «снимки убранных источников удалены: 0»; `HEALTHY`, перехват включён. Записать.
+
+Если не так: код не 0 — **стоп**, сообщить заказчику (сеть не откатывать); строк больше 0 —
+**дефект «повторная установка создаёт заново»**; пользователей или службы нет — **дефект
+«повторная установка убрала бэкенд»**.
+
+Шаг 8.3 (при согласии на пункт 4). **Попроси заказчика** (дословно):
 
 «Откройте любой сайт на этом компьютере и любой сайт на телефоне. Открываются?»
 
@@ -782,9 +1038,9 @@ fpm2check.py: <сумма, 16 знаков>. Пакет openvpn: <версия>.
 |---|---|---|
 | 1.2 до | — | состояние, службы, openvpn, снимки, отпечаток, подписки, журнал |
 | 2.2 установка | … | код, пакеты, пользователи, ufw |
-| 2.3 после установки | … | HEALTHY, бэкенд (пакет, пользователи, служба, пересылка, fp_peers), снимки без VPNJantit, diag |
-| 3.1 включение | … | ответ команды |
-| 3.2 правила и списки | … | fp_peers, бэкенд годится, источники, загрузка правил, diag, Traceback |
+| 2.3 после установки | … | HEALTHY, бэкенд (пакет, пользователи, служба, пересылка, fp_peers, оценка systemd), снимки без VPNJantit, diag (пул, конфиг) |
+| 3.1 включение и живые поколения | … | ответ команды; поколений/поднялось; служба, агент, интерфейсы, маршрут до и после подъёма, работники, права файлов, секреты |
+| 3.2 правила и списки | … | fp_peers, бэкенд годится, panel.json, источники, загрузка правил, diag, Traceback |
 | 3.3 карточка | … / не выполнялся | фраза, метки, нет VPNJantit |
 | 4.1 подключения, 35 мин | … | попыток/поднялось, итоги, отказы, пределы, самопроверки, fwd-сброс, поколения, секреты конфига |
 | 4.2 подключения, 65 мин | … | то же |
@@ -792,7 +1048,8 @@ fpm2check.py: <сумма, 16 знаков>. Пакет openvpn: <версия>.
 | 6.1 секреты | … | права, пароли, ссылки и настройки OpenVPN в журналах, status.json |
 | 7.1 выключение | … / не выполнялся | ответ панели, кнопка, поколения, fp_peers, diag |
 | 8.1 итог | … | после выключения, Traceback, следы поколений, правила, отпечаток, подписки, HEALTHY |
-| 8.2 сайты | … / не выполнялся | ответ заказчика |
+| 8.2 повторная установка | … / не выполнялся | код, строк пакета и пользователей, бэкенд, HEALTHY |
+| 8.3 сайты | … / не выполнялся | ответ заказчика |
 
 ## Выводы шагов
 <файлы $HOME/xgw-fp2/*.txt; имя пользователя → <user>; ответы заказчика дословно>
