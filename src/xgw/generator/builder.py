@@ -578,10 +578,47 @@ def _modernize(outbound: dict) -> None:
 
 def _apply_sockopt(outbound: dict, mark: int) -> None:
     stream = outbound.setdefault("streamSettings", {})
-    sockopt = dict(stream.get("sockopt") or {})
-    sockopt["mark"] = mark
-    sockopt["domainStrategy"] = "UseIPv4"
-    stream["sockopt"] = sockopt
+    for leg in [stream, *_download_legs(stream)]:
+        if leg is not stream and _loopback(leg.get("address")):
+            continue  # мост к своему 127.0.0.1 метку не получает (loopback_guard)
+        current = leg.get("sockopt")
+        sockopt = dict(current) if isinstance(current, dict) else {}
+        sockopt["mark"] = mark
+        sockopt["domainStrategy"] = "UseIPv4"
+        leg["sockopt"] = sockopt
+
+
+_XHTTP_KEYS = ("xhttpSettings", "splithttpSettings")
+
+
+def _download_legs(stream: dict, depth: int = 0) -> list[dict]:
+    """Отдельные каналы загрузки XHTTP — downloadSettings прямо в xhttpSettings или в его
+    extra. У Xray это свой StreamConfig со своим sockopt: родительский он берёт, только если
+    задан sockopt.penetrate (transport/internet/splithttp/dialer.go, 26.10.21). Без метки
+    mark_bypass соединение такого канала снова попало бы в перехват (пятый аудит, T1)."""
+    legs: list[dict] = []
+    if depth >= 4:
+        return legs
+    for key in _XHTTP_KEYS:
+        settings = stream.get(key)
+        if not isinstance(settings, dict):
+            continue
+        for options in (settings, settings.get("extra")):
+            download = options.get("downloadSettings") if isinstance(options, dict) else None
+            if isinstance(download, dict):
+                legs.append(download)
+                legs.extend(_download_legs(download, depth + 1))
+    return legs
+
+
+def _loopback(address: object) -> bool:
+    text = str(address or "").strip("[]").lower()
+    if text == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
 
 
 def build(

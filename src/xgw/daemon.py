@@ -1546,7 +1546,10 @@ class Daemon:
     def _base_ping(self, members: list[NodeInfo], password: str) -> bool:
         """Базовый запрос через VPN — через самих участников: носят ли они трафик вообще.
         Через http-in его понёс бы резервный выход, когда пробы ядра падают у всех."""
-        return target.base_ping(self.cfg, members, password, user=builder.PROBE_USER)
+        others = [url for url in probehosts.all_urls(self.cfg) if url != self.cfg.probe.url]
+        return target.base_ping(
+            self.cfg, members, password, user=builder.PROBE_USER, extra_urls=others,
+        )
 
     def _direct_probe(self) -> str:
         """probe.url напрямую, мимо VPN: пусто — отдаётся, иначе класс сбоя."""

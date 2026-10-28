@@ -36,13 +36,12 @@ import secrets
 import shutil
 import socket
 import sqlite3
-import sys
 import threading
 import time
 from collections import Counter
 from collections.abc import Callable
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -71,7 +70,8 @@ from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
 from ..phones import Phones
 from ..store import SubscriptionCache
-from . import status
+from . import httpbound, status
+from . import record as recording
 from .appapi import AppApi
 from .record import MAX_SECONDS, Recorder, RecordError
 from .speed import SKIP_PRICE
@@ -98,6 +98,10 @@ ROUTE_RESTART = ("Применяется сразу; если для этого 
                  "устройств прервутся на пару секунд")
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
 # остановка демона (по умолчанию в http.server — 0,5 с).
+# Панель — по 127.0.0.1 и по tailnet (Tailscale Serve): соединений сразу не больше, чем нужно
+# нескольким вкладкам, и срок на чтение запроса (пятый аудит, A2; httpbound.py).
+PANEL_CONNECTIONS = 32
+PANEL_READ_DEADLINE = 20.0
 SHUTDOWN_POLL = 0.1
 _ORDER = {"member": 0, "spare": 1, "waiting": 2, "disabled": 3, "skipped": 4}
 _VERDICTS = {"OK": 0, "SLOW": 1, None: 2}  # запасные: сначала пригодные к замене
@@ -234,23 +238,6 @@ def _shared(entry: dict) -> dict:
     }
 
 
-class _Server(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    log = None
-
-    def handle_error(self, request, client_address) -> None:
-        if self.log is None:
-            return
-        error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            # Браузер закрыл соединение, не дочитав ответ (отчёт f6b, наблюдение 3): это не
-            # сбой панели — одной строкой, без трассировки.
-            self.log.info("панель: клиент %s закрыл соединение раньше ответа", client_address[0])
-            return
-        self.log.exception("панель: запрос не обработан")
-
-
 class Refused(Exception):
     """Запрос отклонён; code — статус HTTP, текст — для человека."""
 
@@ -295,7 +282,7 @@ class Panel:
         self._acting = threading.local()
         self._selecting: tuple[float, list[str]] = (0.0, [])
         self._labels: dict[str, str] = {}
-        self._server: _Server | None = None
+        self._server: httpbound.BoundedServer | None = None
         self._thread: threading.Thread | None = None
         self._ts_card: tuple[float, dict | None] = (0.0, None)
         self._ts_jobs: dict[str, ts.Job] = {}  # «login», «serve», «funnel» — фоновые команды
@@ -332,8 +319,11 @@ class Panel:
     def start(self) -> None:
         panel = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(httpbound.DeadlineHandler):
             timeout = 15
+            # Срок на чтение запроса (пятый аудит, A2): у GET и HEAD его снимает handle(), у POST —
+            # _read_body, когда тело прочитано; ответ им не ограничен.
+            read_deadline = PANEL_READ_DEADLINE
             server_version = "xgw"
             sys_version = ""
 
@@ -349,8 +339,10 @@ class Panel:
             def do_POST(self) -> None:
                 panel.handle(self, "POST")
 
-        self._server = _Server(("127.0.0.1", self.port), Handler)
-        self._server.log = self.log
+        self._server = httpbound.BoundedServer(
+            ("127.0.0.1", self.port), Handler, slots=PANEL_CONNECTIONS, label="панель",
+            log=self.log,
+        )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="xgw-panel", daemon=True,
@@ -1877,6 +1869,11 @@ class Panel:
         return False
 
     def handle(self, handler: BaseHTTPRequestHandler, method: str) -> None:
+        if getattr(handler, "cut", False):
+            handler.close_connection = True  # запрос не дочитан за срок — отвечать некому
+            return
+        if method != "POST":
+            httpbound.request_read(handler)  # тело есть только у POST: его срок снимает _read_body
         body = method != "HEAD"
         try:
             self._route(handler, method, body)
@@ -2040,13 +2037,16 @@ class Panel:
         if length < 0:
             raise Refused(HTTPStatus.BAD_REQUEST, "Неверная длина запроса")
         if length <= MAX_BODY:
-            return handler.rfile.read(length)
+            data = handler.rfile.read(length)
+            httpbound.request_read(handler)
+            return data
         left = min(length, MAX_DRAIN)
         while left > 0:
             chunk = handler.rfile.read(min(left, 65536))
             if not chunk:
                 break
             left -= len(chunk)
+        httpbound.request_read(handler)
         handler.close_connection = True
         return None
 
@@ -2094,17 +2094,23 @@ class Panel:
         path = self.recorder.path(name)
         if path is None:
             raise Refused(HTTPStatus.NOT_FOUND, "Нет такой записи")
-        data = path.read_bytes()
-        handler.send_response(HTTPStatus.OK)
-        handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
-        handler.send_header("Content-Disposition", f'attachment; filename="xgw-{name}"')
-        handler.send_header("Content-Length", str(len(data)))
-        handler.send_header("Cache-Control", "no-store")
-        handler.send_header("X-Content-Type-Options", "nosniff")
-        handler.send_header("Content-Security-Policy", _CSP)
-        handler.end_headers()
-        if body:
-            handler.wfile.write(data)
+        try:
+            with recording.download_slot():
+                size = path.stat().st_size
+                handler.send_response(HTTPStatus.OK)
+                handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+                handler.send_header("Content-Disposition", f'attachment; filename="xgw-{name}"')
+                handler.send_header("Content-Length", str(size))
+                handler.send_header("Cache-Control", "no-store")
+                handler.send_header("X-Content-Type-Options", "nosniff")
+                handler.send_header("Content-Security-Policy", _CSP)
+                handler.end_headers()
+                if body and not recording.send_file(path, size, handler.wfile):
+                    handler.close_connection = True
+                    self.log.info("панель: скачивание записи прервано — дольше %.0f с",
+                                  recording.SEND_DEADLINE)
+        except recording.Busy as exc:
+            raise Refused(HTTPStatus.TOO_MANY_REQUESTS, str(exc)) from exc
 
     def _text(self, handler, code: HTTPStatus, text: str, body: bool) -> None:
         self._send(handler, code, "text/plain; charset=utf-8", text.encode("utf-8"), body)

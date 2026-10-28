@@ -49,11 +49,11 @@ def test_xray_api_is_called_with_the_socket_address(tmp_path, monkeypatch):
     paths.ensure()
     calls = []
 
-    def run(argv, **_kwargs):
+    def run(argv, timeout, limit=api_module.MAX_OUTPUT):
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return 0, "", ""
 
-    monkeypatch.setattr(api_module.subprocess, "run", run)
+    monkeypatch.setattr(api_module, "bounded_run", run)
     engine.make_api(paths, Path("/opt/xgw/xray/xray")).balancer_info("auto")
     argv = calls[0]
     assert argv[argv.index("-s") + 1] == f"unix://{paths.xray_api_socket}"
@@ -84,3 +84,20 @@ def test_process_service_makes_the_socket_dir_and_drops_a_stale_socket(tmp_path)
         assert not sock_path.exists()
     finally:
         service.stop()
+
+
+def test_xray_api_output_is_bounded():
+    """Пятый аудит, A7: ответ `xray api` приходит от процесса ядра — больше предела он не
+    копится в памяти демона: процесс убивается, ApiError. Срок — как у subprocess.run."""
+    import sys
+
+    from xgw.xraycore.api import ApiError, bounded_run
+
+    code, out, err = bounded_run(
+        [sys.executable, "-c", "import sys; print('ok'); print('w', file=sys.stderr)"], 10)
+    assert (code, out.strip(), err.strip()) == (0, "ok", "w")
+    with pytest.raises(ApiError, match="больше"):
+        bounded_run([sys.executable, "-c", "import sys; sys.stdout.write('x' * 50000)"], 10,
+                    limit=1000)
+    with pytest.raises(subprocess.TimeoutExpired):
+        bounded_run([sys.executable, "-c", "import time; time.sleep(5)"], 0.3)

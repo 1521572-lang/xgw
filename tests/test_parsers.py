@@ -395,9 +395,9 @@ def test_tls_server_name_falls_back_to_host():
     assert raw.outbound["streamSettings"]["tlsSettings"]["serverName"] == "cdn.example.com"
 
 
-def test_unknown_transport_warning_names_it():
-    raw = parse_link(links.VLESS_WS.replace("type=ws", "type=quantum"))
-    assert any("'quantum'" in warning for warning in raw.warnings)
+def test_unknown_transport_error_names_it():
+    with pytest.raises(ParseError, match="'quantum'"):
+        parse_link(links.VLESS_WS.replace("type=ws", "type=quantum"))
 
 
 def test_broken_port_is_parse_error_without_secrets():
@@ -437,3 +437,32 @@ def test_xray_json_hysteria2_skipped():
     servers, warnings = parse_outbounds(config["outbounds"], "sub")
     assert servers == []
     assert any("hysteria2" in warning for warning in warnings)
+
+
+def test_sing_box_node_with_bad_server_ports_is_skipped_alone():
+    """Пятый аудит, T3: узел sing-box с неверным server_ports пропускается с причиной, а не
+    роняет разбор всей подписки. «443» и «20000-20100» sing-box 1.14.3 не принимает («bad port
+    range») — с таким узлом не прошла бы проверка всего его конфига."""
+    from xgw.parsers.common import parse_body
+
+    good = {"type": "hysteria2", "tag": "hy-ok", "server": "198.51.100.7",
+            "server_ports": ["20000:20100"], "password": "p",
+            "tls": {"enabled": True, "server_name": "example.com"}}
+    broken = (["garbage"], ["443"], ["20000-20100"], ["70000:70001"], "20000:20100", [443],
+              ["300:200"])
+    bad = [dict(good, tag=f"hy-{index}", server_ports=ports)
+           for index, ports in enumerate(broken)]
+    raws, _meta, warnings = parse_body(json.dumps({"outbounds": [good, *bad]}), "sub")
+    assert [raw.name for raw in raws] == ["hy-ok"]
+    assert raws[0].port == 20000
+    assert sum("server_ports" in warning for warning in warnings) == len(broken)
+
+
+def test_unknown_transport_is_skipped_not_turned_into_tcp():
+    """Пятый аудит: узел с неизвестным транспортом пропускается с причиной — на tcp его пробы
+    показывали бы мёртвым, а отказы портили бы состояние."""
+    link = ("vless://11111111-2222-3333-4455-666666666661@198.51.100.4:443"
+            "?type=quantum&security=tls&sni=example.com#Q")
+    servers, _meta, warnings = parse_links_text(link + "\n" + links.VLESS_REALITY, "test")
+    assert [server.address for server in servers] == ["203.0.113.10"]
+    assert any("неизвестный транспорт" in warning for warning in warnings)

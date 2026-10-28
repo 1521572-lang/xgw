@@ -608,3 +608,30 @@ def test_rating_balance_matches_the_recommendations():
     assert abs(rating.health_factor(1.0, 1.0) - 0.15) < 1e-9  # 1 − 0,6 − 0,25
     assert rating.quota_low({"total": 100, "upload": 0, "download": 96})
     assert not rating.quota_low({"total": 0})
+
+
+def test_xhttp_download_leg_gets_the_bypass_mark():
+    """Пятый аудит, T1: отдельный канал загрузки XHTTP (downloadSettings — прямо в
+    xhttpSettings или в extra) у Xray 26.10.21 — свой StreamConfig со своим sockopt; без метки
+    его соединение снова попало бы в перехват. Свои поля канала остаются; мост к 127.0.0.1
+    метку не получает."""
+    from xgw.generator.builder import _apply_sockopt
+
+    for inline in (True, False):
+        down = {"address": "down.example.com", "port": 443, "network": "xhttp",
+                "sockopt": {"mark": 777, "tcpFastOpen": True},
+                "xhttpSettings": {"downloadSettings": {"address": "deeper.example.com"}}}
+        options = {"downloadSettings": down}
+        xhttp = {"path": "/up", "mode": "packet-up", **(options if inline else {})}
+        if not inline:
+            xhttp["extra"] = options
+        outbound = {"streamSettings": {"network": "xhttp", "xhttpSettings": xhttp}}
+        _apply_sockopt(outbound, 2)
+        assert outbound["streamSettings"]["sockopt"] == {"mark": 2, "domainStrategy": "UseIPv4"}
+        assert down["sockopt"] == {"mark": 2, "domainStrategy": "UseIPv4", "tcpFastOpen": True}
+        deeper = down["xhttpSettings"]["downloadSettings"]
+        assert deeper["sockopt"]["mark"] == 2
+    bridge = {"address": "127.0.0.1", "port": 1080}
+    outbound = {"streamSettings": {"xhttpSettings": {"downloadSettings": bridge}}}
+    _apply_sockopt(outbound, 2)
+    assert "sockopt" not in bridge

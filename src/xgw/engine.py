@@ -24,7 +24,7 @@ from .apply.applier import Applier, ApplyOutcome
 from .generator import builder, validate
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
-from .model import ServerNode, raw_to_node
+from .model import ServerNode, raw_to_node, split_variants
 from .net import lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
@@ -201,6 +201,10 @@ def collect(
         for warning in manual_warnings:
             logger.warning("%s", warning)
         inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
+    split = split_variants(inventory.nodes)
+    if split:
+        logger.info("серверов с одним адресом и ключом, но разными путём, SNI или режимом: %d "
+                    "— это разные серверы, не дубли", split)
     log.add_secrets(masking.collect_secrets([node.outbound for node in inventory.nodes]))
     return inventory
 
@@ -335,7 +339,10 @@ def _load_subscription(
                 "подписка %s: резолверы не ответили — получена по прежнему адресу %s",
                 label, result.address,
             )
-        if hosts is not None and result.host and result.address:
+        # Только https: по http ни сертификата, ни подлинности ответа нет — адрес, с которого
+        # пришёл ответ, ничем не подтверждён (пятый аудит, D3).
+        if hosts is not None and result.host and result.address and urlsplit(
+                result.url).scheme == "https":
             try:
                 if hosts.remember(result.host, result.address):
                     # Новый адрес (или имя) — одна строка; тот же адрес каждый час — молча.

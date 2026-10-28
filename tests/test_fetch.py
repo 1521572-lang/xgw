@@ -679,3 +679,52 @@ def test_redirect_keeps_credentials_on_the_same_origin_only():
     # http → https того же хоста — уже другой адрес (порт и схема): без учётных заголовков.
     assert fetch.redirect_headers("http://a.example.net/", "https://a.example.net/", sent) == {
         "X-Hwid": "h1"}
+
+
+def test_frozen_first_address_gives_way_to_the_next_one(monkeypatch, no_sleep):
+    """Пятый аудит, D1: первый адрес имени принимает соединение, но не отвечает (ТСПУ душит
+    этот адрес хостинга), — повтор идёт на другой адрес того же имени, а не снова на первый."""
+    server = HttpServer(_response(200, b"vless://x"))
+    frozen = socket.socket()
+    frozen.bind(("127.0.0.2", server.port))
+    frozen.listen(4)  # соединение принимает ядро, ответа нет
+    monkeypatch.setattr(fetch, "resolve_domain", lambda *args, **kwargs: ["127.0.0.2", "127.0.0.1"])
+    try:
+        result = fetch_url(f"http://sub.example.com:{server.port}/s",
+                           bootstrap=["tls://77.88.8.8"], timeout=0.5, retries=1)
+    finally:
+        frozen.close()
+    assert (result.body, result.address) == (b"vless://x", "127.0.0.1")
+    assert no_sleep == [2.0]
+
+
+def test_wrong_certificate_on_one_address_tries_another(monkeypatch, no_sleep):
+    """Чужой сертификат у одного адреса (заглушка по дороге), а у имени есть ещё не
+    испробованные, — повтор на другой адрес; у всех адресов чужой — отказ без повторов.
+    Проверка сертификата не отключается."""
+    calls: list[set] = []
+
+    def once(url, headers, timeout, mark, dns, proxy, data, cancel):
+        calls.append(set(dns.failed))
+        if len(calls) == 1:
+            dns.seen.update({"192.0.2.1", "192.0.2.2"})
+            dns.failed.add("192.0.2.1")
+            raise ssl.SSLCertVerificationError("чужой сертификат")
+        return FetchResult(status=200, headers={}, body=b"ok", url=url)
+
+    monkeypatch.setattr(fetch, "_request_with_redirects", once)
+    assert fetch_url("https://sub.example.com/s", bootstrap=["tls://77.88.8.8"]).body == b"ok"
+    assert calls == [set(), {"192.0.2.1"}] and no_sleep == [2.0]
+
+    tries: list[int] = []
+
+    def always(url, headers, timeout, mark, dns, proxy, data, cancel):
+        tries.append(1)
+        dns.seen.add("192.0.2.1")
+        dns.failed.add("192.0.2.1")
+        raise ssl.SSLCertVerificationError("чужой сертификат")
+
+    monkeypatch.setattr(fetch, "_request_with_redirects", always)
+    with pytest.raises(FetchError):
+        fetch_url("https://sub.example.com/s", bootstrap=["tls://77.88.8.8"])
+    assert tries == [1]

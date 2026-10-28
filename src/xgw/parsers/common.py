@@ -143,8 +143,9 @@ def build_stream(
     requested = (net or "tcp").lower()
     net = _NETWORKS.get(requested)
     if net is None:
-        warnings.append(f"неизвестный транспорт {requested!r}, используется tcp")
-        net = "tcp"
+        # Раньше — tcp: такой узел пробы показывали мёртвым, а его отказы портили состояние
+        # (пятый аудит). Теперь он пропускается с причиной.
+        raise ParseError(f"неизвестный транспорт {requested!r}")
     stream: dict = {"network": net}
 
     if net == "tcp":

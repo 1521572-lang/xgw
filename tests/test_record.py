@@ -211,3 +211,23 @@ def test_recording_needs_free_disk_space_and_stops_when_it_runs_out(tmp_path):
     _finish(recorder)
     meta = json.loads((tmp_path / name).with_suffix(".json").read_text(encoding="utf-8"))
     assert meta["why"] == "на диске кончается место" and record.MAX_SECONDS == 300
+
+
+def test_download_goes_in_chunks_and_at_most_two_at_once(tmp_path, monkeypatch):
+    """Пятый аудит: запись отдаётся кусками (не целиком в память), не больше двух скачиваний
+    сразу, а медленный получатель не держит поток дольше SEND_DEADLINE."""
+    import io
+
+    path = tmp_path / "x.pcap"
+    path.write_bytes(b"a" * 200_000)
+    out = io.BytesIO()
+    assert record.send_file(path, 150_000, out) is True
+    assert out.getvalue() == b"a" * 150_000  # сколько обещано в Content-Length — не больше
+    with (record.download_slot(), record.download_slot(), pytest.raises(record.Busy),
+          record.download_slot()):
+        pass  # третье место не даётся
+    with record.download_slot():
+        pass  # места освобождаются
+    ticks = iter(range(0, 10_000, 400))
+    monkeypatch.setattr(record, "SEND_DEADLINE", 1000.0)
+    assert record.send_file(path, 200_000, io.BytesIO(), clock=lambda: next(ticks)) is False

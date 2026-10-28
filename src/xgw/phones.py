@@ -29,7 +29,6 @@ from pathlib import Path
 from .paths import Paths, atomic_write_json
 
 PAIR_TTL = 600.0  # сколько живёт код из QR, секунд
-PAIR_TRIES = 5
 SKEW = 60.0  # насколько время в запросе может расходиться с часами шлюза
 MAX_PHONES = 10
 MAX_NAME = 40
@@ -42,6 +41,19 @@ _ID_RE = re.compile(r"[0-9a-f]{12}")
 _NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 _CODE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 _NAME_DROP = re.compile(r"[\x00-\x1f\x7f<>\"'`]")
+
+
+class PhoneBusy(Exception):
+    """Подпись верна, но телефон спрашивает чаще предела: отметка запроса не записана."""
+
+
+class NonceStoreError(Exception):
+    """Подпись верна, но отметка принятого запроса не записана в /run/xgw: после перезапуска
+    демона тот же запрос прошёл бы снова. phone — кто спрашивал."""
+
+    def __init__(self, phone: Phone, reason: str) -> None:
+        super().__init__(reason)
+        self.phone = phone
 
 
 class PhoneError(Exception):
@@ -191,8 +203,10 @@ class Phones:
     # --- для API приложения -------------------------------------------------------
 
     def pair(self, code: object, name: object) -> tuple[str, bytes]:
-        """Код из QR → (id телефона, ключ). Код гасится при успехе и после PAIR_TRIES
-        неверных попыток: чужой запрос не должен сразу гасить QR на экране заказчика."""
+        """Код из QR → (id телефона, ключ). Код гасится при успехе, по сроку PAIR_TTL и
+        отменой в панели. Неверные коды его не гасят (пятый аудит, A5): код — 32 случайных
+        символа (192 бита), подобрать его нельзя, а чужие запросы через Funnel гасили бы QR на
+        экране заказчика; частые неудачи закрывает блокировка API (appapi.FAILS_MAX)."""
         if not isinstance(code, str) or not _CODE_RE.fullmatch(code):
             raise PhoneError("код привязки не того вида")
         with self._lock:
@@ -201,9 +215,6 @@ class Phones:
                 self._pair = None
                 raise PhoneError("код привязки не запрашивался или истёк")
             if not hmac.compare_digest(code.encode("ascii"), pair["code"].encode("ascii")):
-                pair["fails"] = pair.get("fails", 0) + 1
-                if pair["fails"] >= PAIR_TRIES:
-                    self._pair = None
                 raise PhoneError("неверный код привязки")
             self._pair = None
             phones = self._load()
@@ -219,7 +230,10 @@ class Phones:
             self._paired_last = phone_id
         return phone_id, key
 
-    def verify(self, headers, method: str, path: str, body: bytes) -> Phone:
+    def verify(
+        self, headers, method: str, path: str, body: bytes,
+        admit: Callable[[str], bool] | None = None,
+    ) -> Phone:
         """Подпись запроса (заголовки X-XGW-Phone, -Time, -Nonce, -Signature); иначе
         PhoneError."""
         phone_id = str(headers.get("X-XGW-Phone") or "")
@@ -248,12 +262,20 @@ class Phones:
             marker = f"{phone_id}:{nonce}"
             if marker in self._nonces:
                 raise PhoneError("повтор запроса")
+            if admit is not None and not admit(phone_id):
+                raise PhoneBusy("слишком часто")
             self._nonces[marker] = now
-            with contextlib.suppress(OSError):
+            stored = ""
+            try:
                 atomic_write_json(self.paths.run / NONCES_FILE, self._nonces, mode=0o600)
+            except OSError as exc:
+                stored = str(exc) or type(exc).__name__
             if now - self._seen_saved.get(phone_id, 0.0) >= SEEN_EVERY:
                 item["seen"] = now
                 with contextlib.suppress(OSError):
                     self._save(phones)
                 self._seen_saved[phone_id] = now
-            return Phone(phone_id, item["name"], item["paired"], item["seen"])
+            phone = Phone(phone_id, item["name"], item["paired"], item["seen"])
+            if stored:
+                raise NonceStoreError(phone, stored)
+            return phone

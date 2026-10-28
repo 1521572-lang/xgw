@@ -123,6 +123,49 @@ def _del_rules(mark: int, table: int, runner: Runner, family: int, iif: str | No
         runner([*argv, "lookup", str(table)])
 
 
+def _plain(rule: dict) -> bool:
+    """Без лишних условий: полная маска метки, «from all», без адреса назначения."""
+    return (
+        rule.get("fwmask") in (None, "0xffffffff")
+        and rule.get("src", "all") == "all"
+        and rule.get("dst", "all") == "all"
+    )
+
+
+def _exact(rule: dict, pref: int) -> bool:
+    """Правило XGW как есть: его приоритет и без лишних условий. Правило с той же меткой и
+    таблицей, но другим приоритетом (например, после main — 32767) помеченный трафик в
+    таблицу не ведёт: main выбирается раньше (пятый аудит)."""
+    return rule.get("priority") == pref and _plain(rule)
+
+
+def _ensure_rule(
+    mark: int, table: int, runner: Runner, family: int, iif: str | None, pref: int
+) -> None:
+    """Ровно одно правило `fwmark <mark> [iif <iif>] lookup <table> pref <pref>`. Своё с другим
+    приоритетом (сдвинутое) убирается — после того, как нужное на месте: иначе на миг
+    помеченный трафик ушёл бы по main мимо VPN. Чужие правила с другими условиями (src, маска)
+    не трогаются."""
+    ip = _ip(family)
+    selector = ["fwmark", str(mark), *(["iif", iif] if iif is not None else []),
+                "lookup", str(table)]
+    existing = _rules(mark, table, runner, family, iif)
+    exact = [rule for rule in existing if _exact(rule, pref)]
+    if not exact:
+        runner([*ip, "rule", "add", *selector, "pref", str(pref)])
+    for rule in existing:
+        if exact and rule is exact[0]:
+            continue
+        if _plain(rule) and isinstance(rule.get("priority"), int):
+            runner([*ip, "rule", "del", *selector, "pref", str(rule["priority"])])
+
+
+def _has_exact(
+    mark: int, table: int, runner: Runner, family: int, iif: str | None, pref: int
+) -> bool:
+    return any(_exact(rule, pref) for rule in _rules(mark, table, runner, family, iif))
+
+
 def has_rule(
     mark: int, table: int, runner: Runner, family: int = 4, iif: str | None = None
 ) -> bool:
@@ -139,7 +182,7 @@ def present(
     """Правило, локальный маршрут и ровно те маршруты throw, что нужны (throws)."""
     routes = _routes(table, runner, family)
     return (
-        bool(_rules(mark, table, runner, family))
+        _has_exact(mark, table, runner, family, None, PREF)
         and any(_is_local(route, family) for route in routes)
         and _throws(routes) == set(throws)
     )
@@ -160,11 +203,7 @@ def ensure(
             runner([*ip, "route", "replace", "throw", network, "table", str(table)])
     for network in sorted(have - set(throws)):
         runner([*ip, "route", "del", "throw", network, "table", str(table)])
-    existing = _rules(mark, table, runner, family)
-    for _extra in existing[1:]:
-        runner([*ip, "rule", "del", "fwmark", str(mark), "lookup", str(table)])
-    if not existing:
-        runner([*ip, "rule", "add", "fwmark", str(mark), "lookup", str(table), "pref", str(PREF)])
+    _ensure_rule(mark, table, runner, family, None, PREF)
 
 
 def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
@@ -185,7 +224,7 @@ def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
 def present_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> bool:
     routes = _routes(table, runner, family)
     return (
-        bool(_rules(mark, table, runner, family, "lo"))
+        _has_exact(mark, table, runner, family, "lo", PREF_TUN)
         and any(_is_tun(route, family, dev) for route in routes)
         and any(_is_blackhole(route, family) for route in routes)
     )
@@ -200,12 +239,7 @@ def ensure_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> 
     runner([*ip, "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
             "table", str(table)])
     runner([*ip, "route", "replace", "default", "dev", dev, "table", str(table)])
-    existing = _rules(mark, table, runner, family, "lo")
-    for _extra in existing[1:]:
-        runner([*ip, "rule", "del", "fwmark", str(mark), "iif", "lo", "lookup", str(table)])
-    if not existing:
-        runner([*ip, "rule", "add", "fwmark", str(mark), "iif", "lo", "lookup", str(table),
-                "pref", str(PREF_TUN)])
+    _ensure_rule(mark, table, runner, family, "lo", PREF_TUN)
 
 
 def remove_tun(
@@ -237,7 +271,7 @@ def present_containers(mark: int, table: int, runner: Runner, dev: str | None) -
     (тогда нужен и маршрут в него)."""
     routes = _routes(table, runner, 4)
     return (
-        bool(_rules(mark, table, runner, 4))
+        _has_exact(mark, table, runner, 4, None, PREF_CONTAINERS)
         and any(_is_blackhole(route, 4) for route in routes)
         and (dev is None or any(_is_tun(route, 4, dev) for route in routes))
     )
@@ -250,12 +284,7 @@ def ensure_containers(mark: int, table: int, runner: Runner, dev: str | None) ->
             "table", str(table)])
     if dev is not None:
         runner(["ip", "route", "replace", "default", "dev", dev, "table", str(table)])
-    existing = _rules(mark, table, runner, 4)
-    for _extra in existing[1:]:
-        runner(["ip", "rule", "del", "fwmark", str(mark), "lookup", str(table)])
-    if not existing:
-        runner(["ip", "rule", "add", "fwmark", str(mark), "lookup", str(table),
-                "pref", str(PREF_CONTAINERS)])
+    _ensure_rule(mark, table, runner, 4, None, PREF_CONTAINERS)
 
 
 def remove_containers(

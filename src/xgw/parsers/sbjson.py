@@ -16,6 +16,7 @@ outbound.
 from __future__ import annotations
 
 import copy
+import re
 
 from . import convert
 from .common import ParseError, RawServer, SingboxSpec
@@ -84,6 +85,29 @@ def parse_config(config: dict, source: str) -> tuple[list[RawServer], list[str]]
     return servers, warnings
 
 
+_PORT_RANGE_RE = re.compile(r"(\d{1,5}):(\d{1,5})")
+
+
+def _port_ranges(value: object) -> int | None:
+    """Первый порт из server_ports; None — диапазонов нет. Запись — только «начало:конец»:
+    «443» и «20000-20100» sing-box 1.14.3 не принимает («bad port range», проверено), и с
+    таким узлом не прошла бы проверка всего конфига sing-box. Неверная запись — ParseError:
+    узел пропускается с причиной, остальные узлы подписки остаются (пятый аудит, T3)."""
+    if value is None or value == []:
+        return None
+    if not isinstance(value, list):
+        raise ParseError("server_ports: нужен список диапазонов")
+    first: int | None = None
+    for item in value:
+        match = _PORT_RANGE_RE.fullmatch(item) if isinstance(item, str) else None
+        low, high = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+        if not 0 < low <= high < 65536:
+            raise ParseError(f"server_ports: неверный диапазон «{item}» (нужно «начало:конец»)")
+        if first is None:
+            first = low
+    return first
+
+
 def _server(item: dict, by_tag: dict[str, dict], source: str, warnings: list[str]) -> RawServer:
     kind = str(item["type"])
     tag = str(item.get("tag") or "")
@@ -108,8 +132,9 @@ def _server(item: dict, by_tag: dict[str, dict], source: str, warnings: list[str
         credential = str(body.get("private_key") or "")
     else:
         address, port = str(body.get("server") or ""), body.get("server_port")
-        if (not port) and isinstance(body.get("server_ports"), list) and body["server_ports"]:
-            port = int(str(body["server_ports"][0]).partition(":")[0])
+        first = _port_ranges(body.get("server_ports"))
+        if not port and first is not None:
+            port = first
         credential = str(
             body.get("uuid") or body.get("password") or body.get("username")
             or body.get("auth_str") or ""

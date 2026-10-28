@@ -92,19 +92,17 @@ def test_pairing_code_works_once_and_for_ten_minutes(book):
         store.pair(late, "поздно")
 
 
-def test_wrong_codes_do_not_kill_the_qr_at_once(book):
+def test_wrong_codes_do_not_kill_the_qr(book):
+    """Пятый аудит, A5: чужие неверные коды QR не гасят — подобрать 192 бита нельзя, а погасить
+    QR на экране заказчика чужим запросам через Funnel было бы легко. Гасит его успех."""
     store, _clock, _paths = book
     code = store.new_code()
-    for _ in range(phones.PAIR_TRIES - 1):
+    for _ in range(50):
         with pytest.raises(phones.PhoneError):
             store.pair("x" * 32, "чужой")
     assert store.pair(code, "свой")[0]
-    code = store.new_code()
-    for _ in range(phones.PAIR_TRIES):
-        with pytest.raises(phones.PhoneError):
-            store.pair("y" * 32, "чужой")
     with pytest.raises(phones.PhoneError):
-        store.pair(code, "свой")  # перебор — код погашен
+        store.pair(code, "второй")  # успех код гасит
 
 
 def test_signature_time_replay_and_revoke(book):
@@ -608,3 +606,79 @@ def test_hello_is_cheap_and_needs_no_phone(api, monkeypatch):
     started = time.monotonic()
     assert api.phone.raw("GET", "/api/hello")[0] == 200
     assert calls == [] and time.monotonic() - started < 2
+
+
+def test_client_gone_before_the_reply_is_one_line():
+    """Отчёт 0.2.0-audit4, шаг 6: клиент закрыл соединение раньше ответа — одна строка в
+    журнале без трассировки; прочие сбои — с трассировкой, как раньше."""
+    from types import SimpleNamespace
+
+    from xgw.watch import httpbound
+
+    lines: list[str] = []
+    log = SimpleNamespace(info=lambda *args: lines.append("info"),
+                          exception=lambda *args: lines.append("exception"))
+    server = SimpleNamespace(log=log, label="API приложения")
+    for error in (BrokenPipeError, ConnectionResetError, ValueError):
+        try:
+            raise error("x")
+        except Exception:
+            httpbound.BoundedServer.handle_error(server, None, ("127.0.0.1", 1))
+    assert lines == ["info", "info", "exception"]
+
+
+def test_request_cut_by_the_deadline_gets_no_reply_and_no_traceback(tmp_path, monkeypatch):
+    """Запрос не дочитан за READ_DEADLINE — соединение закрыто, ответа нет (раньше на него шёл
+    421 в закрытый сокет и трассировка в журнале)."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(appapi, "READ_DEADLINE", 0.5)
+    seen: list[str] = []
+    log = SimpleNamespace(info=lambda *args: seen.append("info"),
+                          warning=lambda *args: seen.append("warning"),
+                          exception=lambda *args: seen.append("exception"))
+    rig = Rig(tmp_path, monkeypatch)
+    server = AppApi(rig.panel, rig.panel.phones, port=0, logger=log)
+    server.start()
+    try:
+        slow = socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        slow.sendall(b"GET /api/hello HTTP/1.1\r\n")  # заголовки не дописаны
+        assert slow.recv(100) == b""
+        slow.close()
+        time.sleep(0.5)
+    finally:
+        server.stop()
+        rig.panel.stop()
+    assert "exception" not in seen
+
+
+def test_unsaved_nonce_refuses_commands_but_not_reading(api, monkeypatch):
+    """Пятый аудит, A4: отметка принятого запроса не записана в /run/xgw — команду, которая
+    меняет состояние, шлюз не выполняет (после перезапуска демона её повтор прошёл бы), а
+    состояние отдаёт: повтор чтения ничего не меняет."""
+    from xgw import phones as phones_module
+
+    phone = _pair(api)
+    real = phones_module.atomic_write_json
+
+    def broken(path, data, **kwargs):
+        if path.name == phones_module.NONCES_FILE:
+            raise OSError(28, "No space left on device")
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(phones_module, "atomic_write_json", broken)
+    assert phone.signed("GET", "/api/state")[0] == 200
+    status, payload = phone.signed("POST", "/api/act", {"action": "refresh"})
+    assert status == 503 and "отметку" in payload["error"]
+
+
+def test_requests_over_the_limit_leave_no_nonce(book):
+    """Пятый аудит, A6: предел запросов телефона проверяется до записи отметки — запрос сверх
+    него (admit) отклоняется (PhoneBusy) и отметку не пишет."""
+    store, clock, paths = book
+    phone_id, key = store.pair(store.new_code(), "Galaxy")
+    headers = _headers(phone_id, key, "GET", "/api/state", b"", clock())
+    with pytest.raises(phones.PhoneBusy):
+        store.verify(headers, "GET", "/api/state", b"", admit=lambda _phone: False)
+    assert not (paths.run / phones.NONCES_FILE).exists()
+    assert store.verify(headers, "GET", "/api/state", b"", admit=lambda _phone: True).id == phone_id

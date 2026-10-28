@@ -956,3 +956,27 @@ def test_page_has_the_one_server_speed_icon(rig, user):
     response, text = user.request("GET", "/app.js")
     assert response.status == 200
     assert 'act("speed/one", { tag: server.tag }' in text and "speed_queued" in text
+
+
+def test_panel_connections_are_capped_and_a_slow_request_is_cut(tmp_path, monkeypatch):
+    """Пятый аудит, A2: у панели, как у API приложения, соединений сразу — не больше
+    PANEL_CONNECTIONS, а запрос, который шлют по байту, закрывается по сроку."""
+    import socket
+
+    monkeypatch.setattr(panel_module, "PANEL_CONNECTIONS", 1)
+    monkeypatch.setattr(panel_module, "PANEL_READ_DEADLINE", 0.5)
+    rig = Rig(tmp_path, monkeypatch)
+    try:
+        slow = socket.create_connection(("127.0.0.1", rig.panel.port), timeout=5)
+        slow.sendall(b"GET / HTTP/1.1\r\n")  # заголовки не дописаны
+        time.sleep(0.2)
+        extra = socket.create_connection(("127.0.0.1", rig.panel.port), timeout=5)
+        extra.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        assert extra.recv(100) == b""  # единственное место занято — закрыто без ответа
+        extra.close()
+        started = time.monotonic()
+        assert slow.recv(100) == b""
+        assert time.monotonic() - started < 3
+        slow.close()
+    finally:
+        rig.panel.stop()

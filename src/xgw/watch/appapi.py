@@ -27,25 +27,25 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import gzip
 import json
-import socket
 import threading
 import time
 from collections import deque
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 from .. import __version__, engine, log
 from ..generator import phone as phoning
-from ..phones import Phone, PhoneError, Phones
+from ..phones import NonceStoreError, Phone, PhoneBusy, PhoneError, Phones
+from . import httpbound
+from . import record as recording
 
 MAX_BODY = 65536  # вставленные ссылки серверов — десятки строк по полкилобайта
 RATE = 60  # запросов в минуту с одного телефона: опрос раз в 6 с и кнопки
 # Неудачных входов в минуту на весь шлюз — после них на минуту закрыты привязка и запросы без
 # верной подписи. Запросы привязанных телефонов идут и тогда: подпись HMAC не подобрать, а
-# код привязки — 32 случайных символа и PAIR_TRIES попыток. Иначе десяток чужих запросов
+# код привязки — 32 случайных символа (192 бита). Иначе десяток чужих запросов
 # через Funnel (адрес *.ts.net публичен) раз в минуту закрывал бы вход владельцу (четвёртый
 # аудит 0.2.0, ASSUMPTIONS п. 253).
 FAILS_MAX = 10
@@ -56,6 +56,8 @@ FAIL_PAUSE = 0.5
 # Handler.timeout на каждое чтение (медленный отправитель держал бы поток сколько угодно).
 MAX_CONNECTIONS = 16
 READ_DEADLINE = 20.0
+NONCE_FAILED = "шлюз не смог сохранить отметку запроса — повторите позже"
+NONCE_WARN_EVERY = 600.0
 BUSY = "слишком много неудач, подождите"
 # Состояние — как у панели, десятки килобайт раз в 6 с: по мобильной сети — сжатым. Android
 # сам просит gzip (Accept-Encoding) и сам распаковывает.
@@ -76,36 +78,6 @@ _HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 }
-
-
-class _Server(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    log = None
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-
-    def process_request(self, request, client_address) -> None:
-        if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)  # заняты все MAX_CONNECTIONS — сразу закрыть
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
-
-    def handle_error(self, request, client_address) -> None:
-        if self.log is not None:
-            self.log.exception("API приложения: запрос не обработан")
 
 
 class _Done(Exception):
@@ -139,8 +111,9 @@ class AppApi:
         self._fails: deque[float] = deque()
         self._locked_until = 0.0
         self._rates: dict[str, deque[float]] = {}
+        self._nonce_warned = float("-inf")
         self._lock = threading.Lock()
-        self._server: _Server | None = None
+        self._server: httpbound.BoundedServer | None = None
         self._thread: threading.Thread | None = None
 
     # --- запуск ------------------------------------------------------------------
@@ -148,30 +121,16 @@ class AppApi:
     def start(self) -> None:
         api = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(httpbound.DeadlineHandler):
             timeout = 15
+            # Срок на чтение всего запроса — заголовков и тела (AppApi._route снимает его, когда
+            # тело прочитано; ответ им не ограничен — запись трафика по мобильной сети дольше).
+            read_deadline = READ_DEADLINE
             server_version = "xgw"
             sys_version = ""
 
             def log_message(self, *_args) -> None:
                 """Запросы не журналируются."""
-
-            def setup(self) -> None:
-                super().setup()
-                # Срок на чтение всего запроса: истёк — соединение закрывается (AppApi._route
-                # отменяет его, когда тело прочитано; ответ им не ограничен — запись трафика
-                # по мобильной сети может идти дольше).
-                self.deadline = threading.Timer(READ_DEADLINE, self._cut)
-                self.deadline.daemon = True
-                self.deadline.start()
-
-            def _cut(self) -> None:
-                with contextlib.suppress(OSError):
-                    self.connection.shutdown(socket.SHUT_RDWR)
-
-            def finish(self) -> None:
-                self.deadline.cancel()
-                super().finish()
 
             def do_GET(self) -> None:
                 api.handle(self, "GET")
@@ -179,8 +138,10 @@ class AppApi:
             def do_POST(self) -> None:
                 api.handle(self, "POST")
 
-        self._server = _Server(("127.0.0.1", self.port), Handler)
-        self._server.log = self.log
+        self._server = httpbound.BoundedServer(
+            ("127.0.0.1", self.port), Handler, slots=MAX_CONNECTIONS, label="API приложения",
+            log=self.log,
+        )
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="xgw-appapi", daemon=True,
@@ -206,6 +167,11 @@ class AppApi:
         return {name, f"{name}:443"} if name else set()
 
     def handle(self, handler: BaseHTTPRequestHandler, method: str) -> None:
+        if getattr(handler, "cut", False):
+            # Срок READ_DEADLINE истёк, соединение уже закрыто: запрос не дочитан, отвечать
+            # некому (отчёт 0.2.0-audit4: проба медленного запроса получала ответ 421).
+            handler.close_connection = True
+            return
         try:
             self._route(handler, method)
         except _Reply as reply:
@@ -216,9 +182,7 @@ class AppApi:
     def _route(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         host = (handler.headers.get("Host") or "").strip().lower()
         body = self._read_body(handler)
-        deadline = getattr(handler, "deadline", None)
-        if deadline is not None:
-            deadline.cancel()  # запрос прочитан целиком
+        httpbound.request_read(handler)
         if host not in self.hosts():
             raise _Reply(HTTPStatus.MISDIRECTED_REQUEST, {"error": "не тот адрес"})
         path = handler.path.split("?", 1)[0]
@@ -229,13 +193,25 @@ class AppApi:
                 raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": BUSY})
             self._pair(body)
         try:
-            phone = self.phones.verify(handler.headers, method, handler.path, body)
+            # Предел запросов телефона — до записи отметки: запросы сверх него не пишут её на
+            # каждый раз (пятый аудит, A6).
+            phone = self.phones.verify(
+                handler.headers, method, handler.path, body, admit=self._rate_ok,
+            )
+        except PhoneBusy as exc:
+            raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "слишком часто"}) from exc
+        except NonceStoreError as exc:
+            # Подпись верна, но отметка запроса не записана в /run/xgw: команду, которая меняет
+            # состояние, не выполнять — после перезапуска демона её повтор прошёл бы (пятый
+            # аудит, A4). Чтение состояния — можно: его повтор ничего не меняет.
+            self._nonce_failed(exc)
+            if method != "GET":
+                raise _Reply(HTTPStatus.SERVICE_UNAVAILABLE, {"error": NONCE_FAILED}) from exc
+            phone = exc.phone
         except PhoneError as exc:
             if self._locked():  # без паузы: поток не держится, пока дверь закрыта
                 raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": BUSY}) from exc
             self._fail(f"запрос отклонён: {exc}")
-        if not self._rate_ok(phone.id):
-            raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": "слишком часто"})
         if method == "GET" and path == "/api/state":
             raise _Reply(HTTPStatus.OK, phone_state(self.panel.state()))
         if method == "GET" and path == "/api/phone-config":
@@ -272,6 +248,15 @@ class AppApi:
     def _locked(self) -> bool:
         with self._lock:
             return self.clock() < self._locked_until
+
+    def _nonce_failed(self, exc: NonceStoreError) -> None:
+        now = self.clock()
+        with self._lock:
+            if now - self._nonce_warned < NONCE_WARN_EVERY:
+                return  # телефон спрашивает состояние каждые несколько секунд
+            self._nonce_warned = now
+        self.log.warning("API приложения: отметка запроса телефона не сохранена (%s) — "
+                         "команды не выполняются, пока запись не пойдёт", exc)
 
     def _fail(self, text: str):
         """Неудачный вход: в журнал — причина, телефону — общий ответ после паузы."""
@@ -342,14 +327,21 @@ class AppApi:
         path = self.panel.recorder.path(name)
         if path is None:
             raise _Reply(HTTPStatus.NOT_FOUND, {"error": "такой записи нет"})
-        data = path.read_bytes()
-        handler.send_response(HTTPStatus.OK)
-        handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
-        handler.send_header("Content-Length", str(len(data)))
-        for header, value in _HEADERS.items():
-            handler.send_header(header, value)
-        handler.end_headers()
-        handler.wfile.write(data)
+        try:
+            with recording.download_slot():
+                size = path.stat().st_size
+                handler.send_response(HTTPStatus.OK)
+                handler.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+                handler.send_header("Content-Length", str(size))
+                for header, value in _HEADERS.items():
+                    handler.send_header(header, value)
+                handler.end_headers()
+                if not recording.send_file(path, size, handler.wfile):
+                    handler.close_connection = True
+                    self.log.info("API приложения: скачивание записи прервано — дольше %.0f с",
+                                  recording.SEND_DEADLINE)
+        except recording.Busy as exc:
+            raise _Reply(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(exc)}) from exc
         raise _Done
 
     @staticmethod

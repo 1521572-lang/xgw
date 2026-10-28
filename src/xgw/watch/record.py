@@ -15,6 +15,7 @@ MIN_FREE: забытая запись на 80 Мбит/с не должна съ
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -30,6 +31,14 @@ DEFAULT_SECONDS = 120
 MAX_SECONDS = 300
 MAX_BYTES = 50 * 1024 * 1024
 KEEP = 3
+# Скачивание записи (панель и API приложения вместе): файл до MAX_BYTES отдаётся кусками, а не
+# целиком в память, и сразу — не больше DOWNLOADS_AT_ONCE (пятый аудит: 16 скачиваний по 50 МиБ —
+# 800 МиБ памяти). SEND_DEADLINE — на всё скачивание: медленный получатель не держит поток
+# сколько угодно (по мобильной сети 50 МБ — минуты).
+DOWNLOADS_AT_ONCE = 2
+SEND_CHUNK = 64 * 1024
+SEND_DEADLINE = 600.0
+_downloads = threading.BoundedSemaphore(DOWNLOADS_AT_ONCE)
 MIN_FREE = 512 * 1024 * 1024  # свободного места на диске — не меньше, иначе запись не идёт
 FREE_CHECK = 2.0  # как часто проверять свободное место во время записи, с
 SNAPLEN = 65535
@@ -37,6 +46,38 @@ SNAPLEN = 65535
 ETH_P_ALL = 0x0003
 SO_ATTACH_FILTER = 26
 LINKTYPE_ETHERNET = 1
+class Busy(Exception):
+    """Уже идут DOWNLOADS_AT_ONCE скачиваний записи."""
+
+
+@contextlib.contextmanager
+def download_slot():
+    """Место для скачивания записи; мест нет — Busy."""
+    if not _downloads.acquire(blocking=False):
+        raise Busy(f"уже идут {DOWNLOADS_AT_ONCE} скачивания записи — подождите")
+    try:
+        yield
+    finally:
+        _downloads.release()
+
+
+def send_file(path: Path, size: int, wfile, *, clock: Callable[[], float] = time.monotonic) -> bool:
+    """Первые size байт файла — в wfile кусками по SEND_CHUNK. False — не уложились в
+    SEND_DEADLINE: остальное не отправлено, соединение надо закрыть."""
+    deadline = clock() + SEND_DEADLINE
+    left = size
+    with path.open("rb") as source:
+        while left > 0:
+            chunk = source.read(min(SEND_CHUNK, left))
+            if not chunk:
+                break
+            wfile.write(chunk)
+            left -= len(chunk)
+            if left > 0 and clock() > deadline:
+                return False
+    return True
+
+
 _NAME = re.compile(r"^[0-9a-f]{12}-\d{8}-\d{6}\.pcap$")
 
 # classic BPF: ld/ldh — загрузка слова или полуслова кадра, jeq — сравнение, ret — сколько
