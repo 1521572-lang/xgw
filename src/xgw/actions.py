@@ -250,6 +250,35 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
     return Outcome(0, "автовыбор: сервер снова выбирает Xray")
 
 
+# --- бесплатный пул ---------------------------------------------------------------------
+
+POOL_MODE_TEXT = {
+    "off": "Бесплатный пул выключен",
+    "observe": "Наблюдение за бесплатным пулом включено: списки серверов собираются через "
+               "подписку, серверы проверяются, а трафик идёт как прежде — через подписку",
+}
+
+
+def set_pool_mode(paths: Paths, store_path, mode: str) -> Outcome:
+    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге). В этой версии —
+    off или observe: трафик через пул (on) — следующая веха (docs/FREEPOOL-PLAN.md)."""
+    from . import managed
+
+    if mode not in POOL_MODE_TEXT:
+        return Outcome(2, "режим — off или observe (трафик через пул — в следующей версии)")
+    try:
+        changed = managed.set_free_pool_mode(store_path, mode)
+    except managed.ManagedError as exc:
+        return Outcome(1, str(exc))
+    except OSError as exc:
+        return Outcome(1, f"режим не записан: {exc} — запустите команду через sudo")
+    if changed:
+        with open_store(paths) as store:
+            store.add_event("freepool", "бесплатный пул: наблюдение включено" if mode == "observe"
+                            else "бесплатный пул выключен")
+    return Outcome(0, POOL_MODE_TEXT[mode])
+
+
 # --- ядро сервера ----------------------------------------------------------------------
 
 

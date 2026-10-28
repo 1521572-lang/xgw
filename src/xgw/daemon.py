@@ -47,6 +47,7 @@ from .apply.rotation import (
     preferred_members,
 )
 from .config import Config, parse_seconds, probe_bytes
+from .freepool.pool import FreePool
 from .generator import builder
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
@@ -171,6 +172,8 @@ PROFILE_RECHECK = 24 * 3600.0
 # дробление, ни другое ядро не помогут; лестница не запускается, а сервер в работе меняется
 # сразу. Отметка «адрес закрыт» держится CLOSED_RECHECK или до первого ответа сервера.
 CLOSED_RECHECK = PROFILE_RETRY
+# Бесплатный пул: шаг наблюдения не чаще (опрос источников — по своим интервалам внутри).
+FREEPOOL_EVERY = 60.0
 # Белые списки (анти-ТСПУ 2.0): провайдер пускает только на российские адреса. Признак: VPN не
 # работает (ALL_DEAD, RESERVE), российские адреса напрямую открываются (watchdog.wan_check и
 # wan_checks — provider_ok), а из зарубежных проверочных хостов (probe.url, probe.urls) напрямую
@@ -418,6 +421,13 @@ class Daemon:
         self.service = self.applier.service
         self.singbox = engine.make_singbox(cfg, paths)
         self.mark = engine.bypass_mark(cfg, self.log)
+        # Бесплатный пул (веха М1, наблюдение): опрос источников через несущий канал и проверки —
+        # в отдельном потоке, не дольше шага watchdog; сводка — из него же (кэш).
+        self.freepool = FreePool(cfg, paths, logger=self.log)
+        self._freepool_next = 0.0
+        self._freepool_thread: threading.Thread | None = None
+        self._freepool_summary: dict | None = None
+        self._freepool_force = False
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
         # sinks — куда доставлять уведомления (рабочий стол); их собирает
         # `xgw run`, в тестах и на стенде получателей нет.
@@ -760,6 +770,41 @@ class Daemon:
         if done:
             self.log.info("%s", done)
 
+    def request_freepool_refresh(self) -> None:
+        """Панель: опросить источники бесплатного пула сейчас."""
+        self._freepool_force = True
+        self._freepool_next = 0.0
+        self.poke.set()
+
+    def _freepool_step(self, now: float) -> None:
+        """Шаг бесплатного пула: раз в FREEPOOL_EVERY — фоновый поток с опросом источников,
+        которым пора, и проверками нескольких кандидатов. Режим off — ничего."""
+        if self.cfg.free_pool.mode == "off":
+            self._freepool_summary = None
+            return
+        busy = self._freepool_thread is not None and self._freepool_thread.is_alive()
+        if busy or now < self._freepool_next:
+            return
+        self._freepool_next = now + FREEPOOL_EVERY
+        force, self._freepool_force = self._freepool_force, False
+        via = engine.healthy_http_in(self.cfg)
+        from .generator import validate
+
+        xray_bin = validate.find_xray(None, self.paths)
+
+        def work() -> None:
+            try:
+                if self._freepool_summary is None:  # после запуска — сразу то, что сохранено
+                    self._freepool_summary = self.freepool.summary()
+                self.freepool.refresh_due(via=via, mark=self.mark, force=force)
+                self.freepool.check_some(mark=self.mark, xray_bin=xray_bin)
+                self._freepool_summary = self.freepool.summary()
+            except Exception:  # опытный режим не должен останавливать шлюз — в журнал целиком
+                self.log.exception("бесплатный пул: шаг не выполнен")
+
+        self._freepool_thread = threading.Thread(target=work, name="xgw-freepool", daemon=True)
+        self._freepool_thread.start()
+
     def request_refresh(self) -> None:
         """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes. Заодно заново
         проверяются домены, отложенные как несуществующие."""
@@ -859,6 +904,12 @@ class Daemon:
         self._escalated = dict(previous._escalated)
         self._unstable = dict(previous._unstable)
         self._closed = dict(previous._closed)
+        self.freepool = previous.freepool
+        self.freepool.cfg = self.cfg
+        self._freepool_next = previous._freepool_next
+        self._freepool_thread = previous._freepool_thread
+        self._freepool_summary = previous._freepool_summary
+        self._freepool_force = previous._freepool_force
         self._calm = dict(previous._calm)
         self._calm_seen = dict(previous._calm_seen)
         self._dead_scanned = dict(previous._dead_scanned)
@@ -1008,6 +1059,7 @@ class Daemon:
                 "в том числе лимитированных",
             )
         self._whitelist_step(view, signals, state, now)
+        self._freepool_step(now)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False
@@ -4884,6 +4936,7 @@ class Daemon:
             ),
             whitelist={"since": self.whitelist_since, "offer": self._whitelist_offer(view)}
             if self.whitelist_since is not None else None,
+            free_pool=self._freepool_summary if self.cfg.free_pool.mode != "off" else None,
         )
         spent = json.dumps(self.guard.spent, sort_keys=True)
         if spent != self.store.get_meta(speedguard.META_SPENT):

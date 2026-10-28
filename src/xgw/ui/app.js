@@ -268,6 +268,7 @@
     draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
     setBusy($("cores-check"), s.busy.cores);
     draw("netcheck", [s.netcheck, Math.floor(s.now / 60)], () => renderNetcheck(s));
+    draw("pool", [s.free_pool, Math.floor(s.now / 60)], () => renderPool(s));
     setBusy($("netcheck-run"), Boolean((s.netcheck || {}).running));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
@@ -1457,6 +1458,48 @@
   // VPN, утечки DNS и IPv6, чужие правила фаервола. Демон сам её не запускает.
   const CHECK_LEVELS = { OK: ["on", "в порядке"], WARN: ["warn", "внимание"], FAIL: ["rec", "ошибка"] };
 
+  // Бесплатный пул (docs/FREEPOOL-PLAN.md, веха М1): наблюдение — трафик идёт через подписку.
+  const POOL_SOURCES = { vpngate: "VPN Gate", vpnbook: "VPNBook", vpnjantit: "VPNJantit" };
+  const POOL_STATUS = {
+    SUCCESS: "ок", PARTIAL: "частично", UNAVAILABLE: "недоступен", RATE_LIMITED: "просит реже",
+    SCHEMA_CHANGED: "формат изменился", NEEDS_USER_ACTION: "нужна учётка", DISABLED: "выключен",
+    RESOURCE_LIMIT: "слишком большой ответ",
+  };
+
+  function renderPool(s) {
+    const pool = s.free_pool || { mode: "off" };
+    const on = pool.mode !== "off";
+    const sum = pool.summary || null;
+    $("pool-toggle").textContent = on ? "Выключить" : "Включить наблюдение";
+    $("pool-refresh").hidden = !on;
+    $("pool-import-box").hidden = !on;
+    if (!on) {
+      $("pool-text").textContent = "Альтернативный режим: серверы VPN Gate, VPNBook и VPNJantit вместо подписки. Наблюдение собирает их списки через подписку и проверяет серверы, а трафик идёт как прежде — через подписку.";
+      fill($("pool-sources"), [], "");
+      fill($("pool-links"), [], "");
+      return;
+    }
+    if (!sum) {
+      $("pool-text").textContent = "Наблюдение включено: первый опрос источников — в ближайшую минуту.";
+    } else {
+      const regionsText = Object.entries(sum.by_region || {}).map(([name, count]) => `${name} ${count}`).join(", ");
+      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}, сейчас поддерживается ${sum.supported_now} (VLESS, Trojan, Outline), OpenVPN — ${sum.openvpn} (подключение — в следующей версии). Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}; OpenVPN с открытым адресом — ${sum.reachable_openvpn}, адрес закрыт — ${sum.closed}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ.`
+        + (sum.needs_user_action ? ` У VPNJantit ${sum.needs_user_action} серверов онлайн — учётку к ним выдаёт форма на сайте.` : "");
+      fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },
+        el("div", { class: "row-main" },
+          el("div", { class: "row-title" }, el("span", { text: POOL_SOURCES[src.id] || src.id }),
+            el("span", { class: `tag ${src.status === "SUCCESS" ? "ok" : src.status === "PARTIAL" ? "warn" : "bad"}`, text: POOL_STATUS[src.status] || src.status })),
+          el("div", { class: "row-sub", text: (src.retrieved_at ? `список от ${stamp(src.retrieved_at, s.now)}` : "списка ещё нет")
+            + (src.variants ? ` · вариантов ${src.variants}` : "") + (src.endpoints ? ` · серверов ${src.endpoints}` : "")
+            + (src.stale ? " · список устарел" : "") + (src.detail ? ` · ${src.detail}` : "") })))), "");
+    }
+    fill($("pool-links"), (pool.links || []).map((link, index) => el("li", { class: "check-row" },
+      el("div", { class: "row-main" }, el("div", { class: "row-title" },
+        el("span", { text: `${link.name || link.host} · ${link.scheme}` }),
+        el("button", { class: "btn ghost", type: "button", text: "Убрать",
+          onclick: (event) => act("freepool/forget", { index }, event.currentTarget) }))))), "");
+  }
+
   function renderNetcheck(s) {
     const n = s.netcheck || {};
     fill($("netcheck"), (n.checks || []).map((check) => {
@@ -1555,6 +1598,14 @@
   $("phones-add").addEventListener("click", () => act("phones/pair", {}, $("phones-add")));
   $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
   $("netcheck-run").addEventListener("click", () => act("netcheck", {}, $("netcheck-run")));
+  $("pool-toggle").addEventListener("click", () => act("freepool/mode", {
+    mode: ((state || {}).free_pool || {}).mode === "observe" ? "off" : "observe" }, $("pool-toggle")));
+  $("pool-refresh").addEventListener("click", () => act("freepool/refresh", {}, $("pool-refresh")));
+  $("pool-import-add").addEventListener("click", async () => {
+    if (await act("freepool/import", { text: $("pool-import").value }, $("pool-import-add"))) {
+      $("pool-import").value = "";
+    }
+  });
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";

@@ -175,6 +175,24 @@
       <ul id="netcheck" class="list netcheck"></ul>
       <p id="netcheck-when" class="muted small"></p>
     </section>
+
+    <section class="card pool-card" id="pool-card" aria-labelledby="pool-title">
+      <div class="card-head">
+        <h2 id="pool-title">Бесплатные серверы</h2>
+        <button id="pool-toggle" class="btn ghost" type="button"></button>
+      </div>
+      <p id="pool-text" class="muted small"></p>
+      <ul id="pool-sources" class="list"></ul>
+      <button id="pool-refresh" class="btn ghost" type="button" hidden>Опросить источники</button>
+      <details id="pool-import-box" hidden>
+        <summary class="muted small">Выданные ссылки (VPNJantit и другие)</summary>
+        <p class="muted small">Учётку VPNJantit выдаёт форма на их сайте — откройте его через
+          подписку, создайте учётку и вставьте выданную ссылку сюда. Ссылки — по одной в строке.</p>
+        <textarea id="pool-import" rows="3" placeholder="vless://…"></textarea>
+        <button id="pool-import-add" class="btn" type="button">Добавить</button>
+        <ul id="pool-links" class="list"></ul>
+      </details>
+    </section>
   </div>
 
   <div class="col main">

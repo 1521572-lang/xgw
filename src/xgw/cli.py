@@ -170,6 +170,19 @@ def main(argv: list[str] | None = None) -> int:
     cores_back.add_argument("core", choices=("xray", "sing-box"))
     # Задание от панели — его выполняет служба xgw-core.service.
     cores_sub.add_parser("run-job", help=argparse.SUPPRESS)
+    pool_parser = subparsers.add_parser(
+        "pool", parents=[common],
+        help="бесплатный пул (VPN Gate, VPNBook, VPNJantit): сводка наблюдения и режим",
+    )
+    pool_sub = pool_parser.add_subparsers(dest="pool_action")
+    pool_status = pool_sub.add_parser(
+        "status", help="найдено, проверено, пригодно; как ответили источники",
+    )
+    pool_status.add_argument("--json", action="store_true", help="вывести JSON")
+    pool_mode = pool_sub.add_parser(
+        "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку)",
+    )
+    pool_mode.add_argument("mode", choices=("off", "observe"))
     core = subparsers.add_parser(
         "core", parents=[common],
         help="закрепить за сервером ядро: xray, sing-box или auto (выбирает шлюз)",
@@ -250,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         "update-singbox": _cmd_update_singbox,
         "cores": _cmd_cores,
         "core": _cmd_core,
+        "pool": _cmd_pool,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
     }[args.command]
@@ -1032,6 +1046,25 @@ def _cmd_core(args, cfg: config.Config, paths: Paths, logger) -> int:
         return _fail(outcome.text, outcome.code)
     logger.info("%s", outcome.text)
     print(outcome.text)
+    return 0
+
+
+def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """`xgw pool` — то же, что карточка «Бесплатные серверы» в панели (freepool/)."""
+    if args.pool_action == "mode":
+        outcome = actions.set_pool_mode(paths, managed.path_for(args.config_path), args.mode)
+        if not outcome.ok:
+            return _fail(outcome.text, outcome.code)
+        logger.info("%s", outcome.text)
+        print(outcome.text + ". Демон применит режим на ближайшем шаге")
+        return 0
+    from .freepool import pool as pooling
+
+    summary = pooling.FreePool(cfg, paths, logger=logger).summary()
+    if getattr(args, "json", False):
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        print(pooling.render(summary, time.time()))
     return 0
 
 

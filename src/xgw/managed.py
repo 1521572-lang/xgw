@@ -93,6 +93,7 @@ def load(path: Path) -> tuple[dict, str]:
         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
+        "free_pool_mode": None, "free_pool_links": [],
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -144,7 +145,64 @@ def load(path: Path) -> tuple[dict, str]:
         else None,
         "kernel_devices": _devices(raw.get("kernel_devices")),
         "tailscale": _tailscale(raw.get("tailscale")),
+        # Бесплатный пул (docs/FREEPOOL-PLAN.md): режим из панели и выданные источником ссылки
+        # (VPNJantit выдаёт учётку формой сайта — заказчик вставляет ссылку в панель).
+        "free_pool_mode": raw["free_pool_mode"]
+        if raw.get("free_pool_mode") in FREE_POOL_MODES else None,
+        "free_pool_links": _pool_links(raw.get("free_pool_links")),
     }, ""
+
+
+FREE_POOL_MODES = ("off", "observe", "on")
+POOL_LINK_SCHEMES = ("vless://", "trojan://", "ss://", "vmess://")
+MAX_POOL_LINKS = 50
+
+
+def _pool_links(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    links = [item.strip() for item in value if isinstance(item, str)]
+    links = [item for item in links if item.startswith(POOL_LINK_SCHEMES) and len(item) < 4096]
+    return list(dict.fromkeys(links))[:MAX_POOL_LINKS]
+
+
+def set_free_pool_mode(path: Path, mode: str | None) -> bool:
+    """Режим бесплатного пула из панели (None — как в config.toml); True — изменилось."""
+    if mode is not None and mode not in FREE_POOL_MODES:
+        raise ManagedError("ожидается off, observe или on")
+
+    def change(data: dict) -> bool:
+        if data["free_pool_mode"] == mode:
+            return False
+        data["free_pool_mode"] = mode
+        return True
+
+    return _update(path, change)
+
+
+def add_pool_links(path: Path, text: str) -> int:
+    """Добавить выданные источником ссылки (по одной в строке); сколько добавлено."""
+    candidates = _pool_links([line for line in str(text).splitlines() if line.strip()])
+
+    def change(data: dict) -> int:
+        before = list(data["free_pool_links"])
+        merged = _pool_links([*before, *candidates])
+        data["free_pool_links"] = merged
+        return len(merged) - len(before)
+
+    return _update(path, change)
+
+
+def remove_pool_link(path: Path, index: int) -> bool:
+    def change(data: dict) -> bool:
+        links = list(data["free_pool_links"])
+        if not 0 <= index < len(links):
+            return False
+        del links[index]
+        data["free_pool_links"] = links
+        return True
+
+    return _update(path, change)
 
 
 def _tailscale(value: object) -> dict:

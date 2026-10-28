@@ -139,6 +139,38 @@ class TrayConf:
     enabled: bool = True
 
 
+# Бесплатный пул (docs/FREEPOOL-PLAN.md): off — режим подписок; observe — пул собирается и
+# проверяется, трафик идёт через подписку (веха М1); on — трафик через бесплатные серверы
+# (веха М2; до неё ведёт себя как observe). Подписка в любом режиме — несущий канал для
+# каталогов: сайты со списками доступны только через VPN.
+FREE_POOL_MODES = ("off", "observe", "on")
+FREE_POOL_REGIONS = ("EU", "US", "ASIA", "auto")
+FREE_POOL_PROVIDERS = ("vpngate", "vpnbook", "vpnjantit")
+
+
+@dataclass
+class FreePoolConf:
+    mode: str = "off"
+    # Регион выхода: EU (страны ЕС), US, ASIA (M49) или auto — любой из них (ТЗ R14–R17).
+    # strict — только этот регион; preferred — ещё fallback_regions, по порядку.
+    region: str = "EU"
+    region_policy: str = "strict"
+    fallback_regions: list[str] = field(default_factory=list)
+    providers: list[str] = field(default_factory=lambda: list(FREE_POOL_PROVIDERS))
+    # Как часто опрашивать источники, минут (ТЗ R12: стартовые значения, не квоты сервисов).
+    vpngate_refresh_min: int = 15
+    vpnbook_refresh_min: int = 60
+    vpnjantit_refresh_min: int = 60
+    # Проверок кандидатов за шаг демона (наблюдение): по одной теневой пробе или TCP-проверке.
+    checks_per_step: int = 2
+    # Бюджет трафика проверок пула за сутки, МБ (ТЗ R28): routine, из него защищённый резерв
+    # проверок здоровья, плюс аварийный.
+    budget_mb: int = 512
+    health_reserved_mb: int = 128
+    emergency_mb: int = 64
+    max_instances: int = 4  # работников OpenVPN сразу (веха М2)
+
+
 @dataclass
 class Subscription:
     name: str = "main"
@@ -442,6 +474,9 @@ class Managed:
     # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
     # (routing.kernel_direct); None — как в config.toml.
     kernel_direct: bool | None = None
+    # Бесплатный пул из панели: режим (None — как в config.toml) и выданные источником ссылки.
+    free_pool_mode: str | None = None
+    free_pool_links: list[str] = field(default_factory=list)
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -475,6 +510,7 @@ class Config:
     panel: PanelConf = field(default_factory=PanelConf)
     tailscale: TailscaleConf = field(default_factory=TailscaleConf)
     tray: TrayConf = field(default_factory=TrayConf)
+    free_pool: FreePoolConf = field(default_factory=FreePoolConf)
     managed: Managed = field(default_factory=Managed)
 
 
@@ -497,6 +533,7 @@ _SECTIONS = {
     "panel": PanelConf,
     "tailscale": TailscaleConf,
     "tray": TrayConf,
+    "free_pool": FreePoolConf,
 }
 
 
@@ -565,6 +602,9 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     if data["kernel_direct"] is not None:
         cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
+    if data["free_pool_mode"] is not None:
+        cfg.free_pool.mode = cfg.managed.free_pool_mode = data["free_pool_mode"]
+    cfg.managed.free_pool_links = list(data["free_pool_links"])
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
@@ -797,9 +837,50 @@ def service_ports(cfg: Config) -> dict[str, int]:
     }
 
 
+def _validate_free_pool(pool: FreePoolConf) -> list[str]:
+    warnings: list[str] = []
+    defaults = FreePoolConf()
+    if pool.mode not in FREE_POOL_MODES:
+        warnings.append(f"free_pool.mode={pool.mode}: ожидается off, observe или on — off")
+        pool.mode = defaults.mode
+    if pool.mode == "on":  # веха М2 (docs/FREEPOOL-PLAN.md)
+        warnings.append("free_pool.mode=on: трафик через бесплатный пул — в следующей версии, "
+                        "пока observe (наблюдение, трафик через подписку)")
+        pool.mode = "observe"
+    if pool.region not in FREE_POOL_REGIONS:
+        warnings.append(f"free_pool.region={pool.region}: ожидается EU, US, ASIA или auto — EU")
+        pool.region = defaults.region
+    if pool.region_policy not in ("strict", "preferred"):
+        warnings.append("free_pool.region_policy: ожидается strict или preferred — strict")
+        pool.region_policy = defaults.region_policy
+    bad = [item for item in pool.fallback_regions if item not in FREE_POOL_REGIONS[:3]]
+    if bad:
+        warnings.append(f"free_pool.fallback_regions: {', '.join(bad)} пропущены")
+        pool.fallback_regions = [item for item in pool.fallback_regions if item not in bad]
+    unknown = [item for item in pool.providers if item not in FREE_POOL_PROVIDERS]
+    if unknown:
+        warnings.append(f"free_pool.providers: неизвестные {', '.join(unknown)} пропущены")
+        pool.providers = [item for item in pool.providers if item in FREE_POOL_PROVIDERS]
+    for name, low, high in (
+        ("vpngate_refresh_min", 5, 1440), ("vpnbook_refresh_min", 15, 1440),
+        ("vpnjantit_refresh_min", 15, 1440), ("checks_per_step", 1, 8),
+        ("budget_mb", 64, 10240), ("health_reserved_mb", 16, 10240), ("emergency_mb", 0, 1024),
+        ("max_instances", 1, 8),
+    ):
+        value = getattr(pool, name)
+        if not low <= value <= high:
+            warnings.append(f"free_pool.{name}={value}: ожидается {low}–{high} — "
+                            f"{getattr(defaults, name)}")
+            setattr(pool, name, getattr(defaults, name))
+    if pool.health_reserved_mb > pool.budget_mb:
+        warnings.append("free_pool.health_reserved_mb больше budget_mb — резерв = budget_mb")
+        pool.health_reserved_mb = pool.budget_mb
+    return warnings
+
+
 def _validate(cfg: Config) -> list[str]:
     """Проверяет значения; опасные для работы исправляет на значения по умолчанию."""
-    warnings: list[str] = []
+    warnings: list[str] = _validate_free_pool(cfg.free_pool)
     for name in ("include_regex", "exclude_regex", "multiplier_regex"):
         try:
             re.compile(getattr(cfg.filters, name))
