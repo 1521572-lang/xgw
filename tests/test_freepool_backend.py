@@ -149,7 +149,15 @@ def test_guard_opens_only_the_server_and_the_tunnel(tmp_path):
     assert 'oif "lo" meta skuid { 0, 990 } accept' in text  # управление — root и OpenVPN
     output = text.split("chain output {")[1].split("chain forward")[0]
     rules = [line.strip() for line in output.splitlines() if line.strip() not in ("", "}")]
-    assert rules[-1] == 'counter name "refused_out" reject with icmpx type admin-prohibited'
+    # Отчёт М2а.1: отбитое — по отправителю; служебный IPv6 ядра — не в отбитое.
+    assert all(f"counter {name} {{ }}" in text for name in agenting.COUNTERS)
+    assert rules[1] == 'meta nfproto ipv6 counter name "dropped_v6" drop'
+    reject = "reject with icmpx type admin-prohibited"
+    assert rules[-3:] == [f'meta skuid 990 counter name "refused_ovpn" {reject}',
+                          f'meta skuid 991 counter name "refused_socks" {reject}',
+                          f'counter name "refused_other" {reject}']
+    # Работнику на lo — ничего: готовность агент смотрит в /proc/net/tcp.
+    assert not any("991" in rule and '"lo"' in rule for rule in rules)
     forward = text.split("chain forward {")[1].split("}")[0]
     assert "accept" not in forward
 
@@ -245,18 +253,58 @@ def test_inner_check_and_tunnel_counters_are_told_without_addresses():
     assert agenting.tunnel_text(stats) == ("в туннель 12 пакетов (10 КБ), из туннеля 3 пакетов "
                                            "(2 КБ)")
     assert agenting.parse_link_stats("5: fpt0: <UP>\n") is None
+    assert agenting.deltas({"refused_ovpn": 2, "refused_socks": -1}, {
+        "refused_ovpn": 5, "refused_socks": 3}) == {"refused_ovpn": 3}
+    assert agenting.guard_text({"refused_ovpn": 0, "refused_socks": 20, "refused_other": 2,
+                                "dropped_v6": 5}) \
+        == "OpenVPN 0, работник 20, ответы ядра 2, служебный IPv6 5"
+    assert agenting.guard_text({}) == ""
+
+
+_LISTEN = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n"
+           "   0: 0100007F:1D51 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0\n"
+           "   1: 0203FA0A:0438 00000000:0000 0A 00000000:00000000 00:00000000 00000000   991\n")
+
+
+def test_socks_readiness_and_core_failure_reasons():
+    """Порт работника — по /proc/net/tcp (LISTEN, порт hex); причина отказа ядра — последнее
+    звено цепочки Xray или строка FATAL sing-box, без секретов, адресов и имён."""
+    assert agenting.listening(_LISTEN, 1080) and agenting.listening(_LISTEN, 7505)
+    assert not agenting.listening(_LISTEN.replace(":0438 00000000:0000 0A",
+                                                  ":0438 0A00000A:9C40 01"), 1080)
+    assert not agenting.listening(_LISTEN.splitlines()[0], 1080)
+    key = "5Yi9hS3Vk3jRVFJ6AHVNMw=="
+    assert agenting.core_reason([
+        "2026/10/28 22:53:38 [Info] infra/conf/serial: Reading config",
+        f"Failed to start: main: failed to create server > proxy/shadowsocks_2022: invalid key: "
+        f"{key} > proxy/shadowsocks_2022: bad key",
+        "2026/10/28 22:53:38 [Warning] common/errors: The feature Shadowsocks is deprecated "
+        "and might be removed",
+    ], {f"{key}:{key}"}) == "proxy/shadowsocks_2022: bad key"
+    pbk = "KMxOyjmYIWpwGe_lfbKyS5r5FOpofIhE3rhoqy-MYbg"
+    reason = agenting.core_reason([
+        "Failed to start: main: failed to load config files: [/tmp/pool-x/config.json] > "
+        "infra/conf: Failed to build REALITY config. > infra/conf: invalid \"password\": "
+        f"{pbk}"], {pbk})
+    assert reason == 'invalid "password": ***'
+    assert agenting.core_reason([
+        "FATAL[0000] start service: initialize outbound[0]: dial 198.51.100.7 at "
+        "h.example.org failed"]) \
+        == "start service: initialize outbound[0]: dial <ip> at <host> failed"
+    assert agenting.core_reason(["started", "[Warning] might be removed"]) == ""
 
 
 # --- агент поколения: ход с подставными работниками -------------------------------------------
 
 
 class _Runner:
-    """Подставные ip и nft внутри пространства имён агента."""
+    """Подставные ip и nft внутри пространства имён агента. grow — счётчики охраны, которые
+    растут на единицу при каждом чтении."""
 
-    def __init__(self, *, grow: bool = False) -> None:
+    def __init__(self, *, grow=()) -> None:
         self.calls: list[tuple[str, ...]] = []
-        self.refused = 0
-        self.grow = grow
+        self.counters = dict.fromkeys(agenting.COUNTERS, 0)
+        self.grow = set(grow)
 
     def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         self.calls.append(tuple(argv))
@@ -269,9 +317,10 @@ class _Runner:
                     "    TX:  bytes packets errors dropped carrier collsns\n"
                     "          4096       9      0       0       0       0\n")
         if argv[:3] == ["nft", "list", "counter"]:
-            if self.grow:
-                self.refused += 1
-            return (f"table inet xgwfp {{ counter refused_out {{ packets {self.refused} "
+            name = argv[-1]
+            if name in self.grow:
+                self.counters[name] += 1
+            return (f"table inet xgwfp {{ counter {name} {{ packets {self.counters[name]} "
                     "bytes 0 } }")
         return ""
 
@@ -320,14 +369,7 @@ class _Spawn:
         return _Proc(lines=self.openvpn_lines if argv[0].endswith("openvpn") else ())
 
 
-class _Ready:
-    """Порт SOCKS-работника открыт (подключение агента для проверки готовности)."""
-
-    def close(self) -> None:
-        pass
-
-
-def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None):
+def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None, proc_tcp=lambda: _LISTEN):
     paths = Paths(root=tmp_path / "root")
     paths.ensure()
     path = agenting.manifest_path(paths, GEN)
@@ -339,13 +381,19 @@ def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None):
                         lambda target, uid, gid: chowned.append((Path(target).name, uid, gid)))
     ours, theirs = socket.socketpair()
     ours.settimeout(5.0)
+    connects: list[tuple] = []
+
+    def connect(address, timeout):
+        connects.append(address)
+        if address[1] != agenting.MGMT_PORT:  # к работнику агент не подключается (М2а.1)
+            raise ConnectionRefusedError(address)
+        return theirs
+
     agent = agenting.Agent(
-        paths, GEN, runner=runner or _Runner(), spawn=spawn or _Spawn(),
-        connect=lambda address, timeout: theirs if address[1] == agenting.MGMT_PORT
-        else _Ready(),
-        users=USERS.__getitem__,
-        tmp=tmp_path / "tmp", out=io.StringIO(),
+        paths, GEN, runner=runner or _Runner(), spawn=spawn or _Spawn(), connect=connect,
+        users=USERS.__getitem__, tmp=tmp_path / "tmp", out=io.StringIO(), proc_tcp=proc_tcp,
     )
+    agent.connects = connects
     (tmp_path / "tmp").mkdir()
     return agent, ours, chowned
 
@@ -400,6 +448,11 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
     journal = agent.out.getvalue()
     assert "через туннель: TCP Cloudflare:443 — OPEN (90 мс); DNS сервера — OK (20 мс)" \
         in journal and "10.8.0.1" not in journal
+    # «Туннель поднят» — до проверки изнутри; готовность работника — без подключения к нему.
+    assert journal.index("туннель поднят, MTU 1500") < journal.index("через туннель:") \
+        < journal.index("SOCKS-работник готов")
+    assert agent.state["tunnel_at"] > 0
+    assert all(address[1] == agenting.MGMT_PORT for address in agent.connects)
     ours.sendall(b">STATE:1730000001,RECONNECTING,ping-restart,,,,,\n")
     _wait(lambda: agent.state.get("phase") == "reconnecting")
     assert ("ip", "route", "del", "default", "dev", "fpt0") in runner.calls
@@ -408,21 +461,27 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
     assert result == [0] and agent.state["phase"] == "stopped"
     saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
     assert saved["phase"] == "stopped" and "FakePass77" not in json.dumps(saved)
-    assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"] == 0
+    zero = dict.fromkeys(agenting.COUNTERS, 0)
+    assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"] == zero
     assert ("итог туннеля: в туннель 9 пакетов (4 КБ), из туннеля 0 пакетов (0 КБ); ошибок "
-            "канала данных 0; охрана отбила после подъёма 0") in agent.out.getvalue()
+            "канала данных 0; охрана после подъёма: OpenVPN 0, работник 0, ответы ядра 0, "
+            "служебный IPv6 0") in agent.out.getvalue()
 
 
 def test_guard_refusal_before_the_tunnel_is_a_gateway_defect(tmp_path, monkeypatch):
-    """«No route to host» при подключении: счётчик охраны вырос — GUARD_BLOCKED (дефект шлюза);
-    не вырос — HOST_UNREACHABLE (ICMP с пути к серверу, не дефект)."""
+    """«No route to host» при подключении: вырос счётчик пакетов OpenVPN — GUARD_BLOCKED
+    (дефект шлюза; код по журналу OpenVPN — рядом); выросли только ответы ядра и служебный
+    IPv6 (отчёт М2а.1) или ничего — HOST_UNREACHABLE (ICMP с пути к серверу, не дефект)."""
     lines = ["TCP: connect to [AF_INET]1.0.0.1:1535 failed: No route to host"]
-    for grow, code in ((True, "GUARD_BLOCKED"), (False, "HOST_UNREACHABLE")):
-        (tmp_path / code).mkdir()
+    cases = (({agenting.REFUSED_OVPN}, "GUARD_BLOCKED"),
+             ({agenting.REFUSED_OTHER, agenting.DROPPED_V6}, "HOST_UNREACHABLE"),
+             ((), "HOST_UNREACHABLE"))
+    for number, (grow, code) in enumerate(cases):
+        (tmp_path / str(number)).mkdir()
         runner = _Runner(grow=grow)
-        agent, ours, _chowned = _agent(tmp_path / code, monkeypatch, runner=runner,
+        agent, ours, _chowned = _agent(tmp_path / str(number), monkeypatch, runner=runner,
                                        spawn=_Spawn(openvpn_lines=lines))
-        if grow:  # самопроверка с растущим счётчиком: отказы — «охраной»
+        if grow:  # самопроверка с растущими счётчиками не нужна здесь
             agent._selftest = lambda manifest, ids: {}
         result = _start(agent)
         _wait(lambda agent=agent: agent.state.get("phase") == "connecting" and agent.log)
@@ -430,9 +489,34 @@ def test_guard_refusal_before_the_tunnel_is_a_gateway_defect(tmp_path, monkeypat
         ours.close()  # OpenVPN закрыл управление
         agent.thread.join(5)
         assert result == [3] and agent.state["reason"] == code
+        assert agent.state["openvpn_code"] == "HOST_UNREACHABLE"
         journal = agent.out.getvalue()
         assert "OpenVPN: TCP: connect to [AF_INET]<ip>:1535 failed: No route to host" in journal
-        assert ("охрана отбила за подключение" in journal) is grow
+        assert ("охрана за подключение:" in journal) is bool(grow)
+        assert ("(по журналу OpenVPN: HOST_UNREACHABLE)" in journal) is (code == "GUARD_BLOCKED")
+        assert "итог туннеля" not in journal  # туннель не поднимался
+
+
+def test_worker_failure_after_the_tunnel_keeps_what_was_seen_inside(tmp_path, monkeypatch):
+    """Туннель поднялся, а работник порт не открыл: SOCKS_FAILED, но в состоянии раньше фазы
+    failed — что туннель был, проверка изнутри и итог туннеля (демон берёт их в запись)."""
+    monkeypatch.setattr(agenting, "SOCKS_WAIT", 0.3)
+    runner = _Runner()
+    agent, ours, _chowned = _agent(tmp_path, monkeypatch, runner=runner,
+                                   proc_tcp=lambda: _LISTEN.splitlines()[0])
+    result = _start(agent)
+    _wait(lambda: agent.state.get("phase") == "connecting")
+    assert ours.recv(64).startswith(b"state on\n")
+    ours.sendall(f">STATE:1730000000,CONNECTED,SUCCESS,10.8.0.6,{PEER},1194,,\n".encode())
+    agent.thread.join(5)
+    assert result == [3]
+    saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
+    assert (saved["phase"], saved["reason"]) == ("failed", "SOCKS_FAILED")
+    assert saved["tunnel_at"] > 0 and saved["inner"]["tcp"] == "TIMEOUT"
+    assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"]["refused_socks"] == 0
+    journal = agent.out.getvalue()
+    assert journal.index("итог туннеля:") < journal.index(f"поколение {GEN}: SOCKS_FAILED")
+    assert journal.count("итог туннеля:") == 1
 
 
 def test_tunnel_address_is_taken_from_push_reply_when_state_has_none(tmp_path, monkeypatch):
@@ -471,18 +555,21 @@ def test_open_guard_stops_before_any_worker(tmp_path, monkeypatch):
 
 
 def test_refusal_counts_as_closed_only_with_the_guard_counter(tmp_path, monkeypatch):
-    """ECONNREFUSED и прочие отказы — «закрыто охраной», только если вырос счётчик
-    refused_out; иначе пакет мог уйти, и это провал самопроверки."""
-    agent, _ours, _chowned = _agent(tmp_path, monkeypatch, runner=_Runner(grow=True),
-                                    spawn=_Spawn(probe="ECONNREFUSED"))
+    """ECONNREFUSED и прочие отказы — «закрыто охраной», только если вырос счётчик этого
+    пользователя (refused_socks, refused_ovpn); вырос чужой (ответы ядра) или никакой — пакет
+    мог уйти, и это провал самопроверки."""
+    agent, _ours, _chowned = _agent(
+        tmp_path, monkeypatch, spawn=_Spawn(probe="ECONNREFUSED"),
+        runner=_Runner(grow={agenting.REFUSED_OVPN, agenting.REFUSED_SOCKS}))
     manifest = _manifest(tmp_path)
     ids = {"ovpn": USERS[agenting.OVPN_USER], "socks": USERS[agenting.SOCKS_USER]}
     results = agent._selftest(manifest, ids)
     assert all(value == "ECONNREFUSED (охрана)" for value in results.values())
-    agent.runner = _Runner(grow=False)
-    with pytest.raises(agenting.AgentError) as info:
-        agent._selftest(manifest, ids)
-    assert info.value.code == "GUARD_FAILED"
+    for grow in ({agenting.REFUSED_OTHER, agenting.DROPPED_V6}, ()):
+        agent.runner = _Runner(grow=grow)
+        with pytest.raises(agenting.AgentError) as info:
+            agent._selftest(manifest, ids)
+        assert info.value.code == "GUARD_FAILED"
 
 
 # --- сторона демона (backend.py) --------------------------------------------------------------
@@ -785,6 +872,37 @@ def test_openvpn_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     # Предел подключений в час (1) исчерпан — второй сервер ждёт, а не подключается.
     assert pool.check_some(mark=2, xray_bin=Path("/opt/xgw/xray/xray")) == 0
     assert len(runtime.prepared) == 1
+
+
+def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):
+    """Отчёт М2а.1: туннели поднялись, работник отказал — а в записях ни «туннель поднимался»,
+    ни что видно изнутри. Теперь — и то и другое, вместе с отбитым охраной после подъёма."""
+    from xgw.freepool import probe as probe_module
+    from xgw.freepool import providers
+    from xgw.freepool.models import Backend
+
+    catalog = providers.parse_vpngate((FIXTURES / "vpngate.csv").read_text(encoding="utf-8"),
+                                      now=1_800_000_000.0)
+    variant = next(replace(item, address=PEER) for item in catalog.variants
+                   if item.backend == Backend.OPENVPN and item.profile is not None)
+
+    class Failing(_Runtime):
+        def wait(self, lease, *, cancel=None) -> dict:
+            return {**_Runtime.state(self, lease), "phase": "failed", "reason": "SOCKS_FAILED",
+                    "detail": "SOCKS-работник не открыл порт", "tunnel_at": 1_800_000_050.0,
+                    "refused_after_up": {"refused_ovpn": 0, "refused_socks": 20,
+                                         "refused_other": 1, "dropped_v6": 4}}
+
+    runtime = Failing()
+    outcome = probe_module.check_openvpn(
+        variant, variant.profile, runtime=runtime, cfg=Config(),
+        xray_bin=Path("/opt/xgw/xray/xray"), run_dir=tmp_path)
+    assert (outcome.verdict, outcome.tunnel_up) == ("SOCKS_FAILED", True)
+    assert outcome.diagnosis == (
+        "TCP Cloudflare:443 — TIMEOUT; DNS Cloudflare — TIMEOUT; в туннель 30 пакетов (2 КБ), "
+        "из туннеля 0 пакетов (0 КБ); охрана после подъёма: OpenVPN 0, работник 20, ответы "
+        "ядра 1, служебный IPv6 4")
+    assert runtime.stopped == [GEN]
 
 
 def test_without_backend_openvpn_falls_back_to_the_address_check(tmp_path, monkeypatch):

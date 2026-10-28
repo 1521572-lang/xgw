@@ -352,6 +352,65 @@ def _list_text(text: str) -> str:
     return decoded if "://" in decoded else stripped
 
 
+# Чего Xray 26.10.21 не принимает (xray run -test 28.10.2026; отчёт М2а.1 — «Xray завершился с
+# кодом 23» у серверов списков): шифры Shadowsocks без AEAD и aes-192-gcm, ключ 2022 не той
+# длины, убранные flow VLESS, транспорт HTTP/2 (h2; заменён XHTTP), shortId REALITY не из
+# пар hex до 16 знаков, ключ REALITY не 43 знака base64url. Основная подписка такие серверы
+# отсеивает проверкой сборки (generator/validate.py); у списков — здесь, с причиной.
+XRAY_SS_METHODS = frozenset((
+    "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305",
+    "xchacha20-poly1305", "xchacha20-ietf-poly1305", "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305",
+))
+SS2022_KEY_BYTES = {"2022-blake3-aes-128-gcm": 16, "2022-blake3-aes-256-gcm": 32,
+                    "2022-blake3-chacha20-poly1305": 32}
+XRAY_FLOWS = frozenset(("", "xtls-rprx-vision", "xtls-rprx-vision-udp443"))
+_SHORT_ID = re.compile(r"(?:[0-9A-Fa-f]{2}){0,8}")
+_REALITY_KEY = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def _ss2022_key_ok(password: str, size: int) -> bool:
+    for part in password.split(":"):
+        try:
+            if len(base64.b64decode(part, validate=True)) != size:
+                return False
+        except (binascii.Error, ValueError):
+            return False
+    return True
+
+
+def xray_problem(outbound: dict) -> str:
+    """Почему Xray не примет этот outbound (по проверенному списку выше); пусто — примет.
+    Значения секретов в причину не попадают."""
+    settings = outbound.get("settings") or {}
+    protocol = str(outbound.get("protocol") or "")
+    if protocol == "shadowsocks":
+        for server in settings.get("servers") or []:
+            method = str(server.get("method") or "").lower()
+            if method not in XRAY_SS_METHODS:
+                return f"шифр Shadowsocks {method[:32]} — Xray его не принимает"
+            size = SS2022_KEY_BYTES.get(method)
+            if size and not _ss2022_key_ok(str(server.get("password") or ""), size):
+                return "ключ Shadowsocks 2022 не той длины"
+    if protocol == "vless":
+        for item in settings.get("vnext") or []:
+            for user in item.get("users") or []:
+                flow = str(user.get("flow") or "")
+                if flow not in XRAY_FLOWS:
+                    return f"flow VLESS {flow[:32]} — убран из Xray"
+    stream = outbound.get("streamSettings") or {}
+    if str(stream.get("network") or "") in ("h2", "http"):
+        return "транспорт HTTP/2 (h2) — убран из Xray, заменён XHTTP"
+    reality = stream.get("realitySettings") if stream.get("security") == "reality" else None
+    if isinstance(reality, dict):
+        if not _SHORT_ID.fullmatch(str(reality.get("shortId") or "")):
+            return "shortId REALITY — не пары hex до 16 знаков"
+        key = str(reality.get("publicKey") or reality.get("password") or "")
+        if not _REALITY_KEY.fullmatch(key):
+            return "ключ REALITY — не 43 знака base64url"
+    return ""
+
+
 def _list_variant(provider: str, raw, url: str) -> tuple[Variant | None, str]:
     """Сервер из списка → вариант; (None, причина) — не принят."""
     address = raw.address.strip("[]").lower()
@@ -371,6 +430,9 @@ def _list_variant(provider: str, raw, url: str) -> tuple[Variant | None, str]:
         stream = raw.outbound.get("streamSettings") or {}
         if raw.outbound.get("proxySettings") or (stream.get("sockopt") or {}).get("dialerProxy"):
             return None, "цепочка серверов"
+        problem = xray_problem(raw.outbound)
+        if problem:
+            return None, problem
         backend, outbound, singbox = Backend.XRAY, raw.outbound, None
     elif raw.singbox is not None and not raw.singbox.endpoint:
         if raw.singbox.main.get("detour") and not raw.singbox.extra:

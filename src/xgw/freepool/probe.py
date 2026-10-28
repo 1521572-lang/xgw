@@ -38,7 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .. import fetch
+from .. import fetch, masking
 from ..config import Config
 from ..watch import checks, shadow
 from ..watch.scan import ScanResult, scan_node
@@ -153,22 +153,28 @@ def _run_probe(argv_of: Callable[[Path], list[str]], config: dict, port: int, pa
                cfg: Config, run_dir: Path, spawn: Callable[..., subprocess.Popen],
                what: str) -> Outcome:
     """Временный процесс с конфигом config (0600, во временном каталоге run_dir), проба через
-    его порт port, остановка — всегда."""
+    его порт port, остановка — всегда. Вывод процесса — в файл того же каталога: не
+    запустился — в причину идёт его строка отказа без секретов (отчёт М2а.1: «Xray завершился
+    с кодом 23» ×4, а почему — не узнать)."""
     run_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="pool-", dir=run_dir) as directory:
         path = Path(directory) / "config.json"
         path.write_text(json.dumps(config), encoding="utf-8")
         path.chmod(0o600)
-        try:
-            proc = spawn(argv_of(path), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-        except OSError as exc:
-            return Outcome("UNTESTED", error=f"{what} не запущен: {exc}")
+        log_path = Path(directory) / "core.log"
+        with open(log_path, "wb") as log:
+            try:
+                proc = spawn(argv_of(path), stdin=subprocess.DEVNULL, stdout=log,
+                             stderr=subprocess.STDOUT)
+            except OSError as exc:
+                return Outcome("UNTESTED", error=f"{what} не запущен: {exc}")
         try:
             try:
                 shadow._wait_port(port, time.monotonic() + START_WAIT, proc)
             except shadow.ShadowError as exc:
-                return Outcome("UNTESTED", error=str(exc).replace("теневой Xray", what))
+                error = str(exc).replace("теневой Xray", what)
+                why = core_failure(log_path, config)
+                return Outcome("UNTESTED", error=f"{error}: {why}" if why else error)
             return _probe(port, password, cfg)
         finally:
             proc.terminate()
@@ -177,6 +183,19 @@ def _run_probe(argv_of: Callable[[Path], list[str]], config: dict, port: int, pa
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=STOP_WAIT)
+
+
+def core_failure(log_path: Path, config: dict) -> str:
+    """Строка отказа временного процесса из его вывода (agent.core_reason): секреты конфига,
+    адреса и имена скрыты. Пусто — вывода нет или в нём нет ошибки."""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - 16384))
+            text = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    return agenting.core_reason(text.splitlines(), masking.collect_secrets(config))
 
 
 def check_xray(
@@ -291,11 +310,17 @@ def openvpn_peer(variant: Variant, profile: OvpnProfile) -> str:
 
 
 def tunnel_diagnosis(at_up: dict, after: dict) -> str:
-    """Что видел агент: проверка изнутри (при подъёме) и счётчики fpt0 после пробы. Без
-    адресов — это строка журнала демона и записи кандидата."""
+    """Что видел агент: проверка изнутри (при подъёме), счётчики fpt0 и отбитое охраной после
+    подъёма — на момент после пробы или отказа. Без адресов — это строка журнала демона и
+    записи кандидата."""
     inner = agenting.inner_text(after.get("inner") or at_up.get("inner"))
-    traffic = agenting.tunnel_text(after.get("tun"))
-    return "; ".join(part for part in (inner, traffic) if part)[:300]
+    traffic = agenting.tunnel_text(after.get("tun") or at_up.get("tun"))
+    refused = after.get("refused_after_up") or {}
+    guard = ""
+    if isinstance(refused, dict) and any(
+            refused.get(name) for name in (agenting.REFUSED_OVPN, agenting.REFUSED_SOCKS)):
+        guard = "охрана после подъёма: " + agenting.guard_text(refused)
+    return "; ".join(part for part in (inner, traffic, guard) if part)[:300]
 
 
 def check_openvpn(
@@ -324,9 +349,13 @@ def check_openvpn(
     try:
         state = runtime.wait(lease, cancel=cancel)
         if state.get("phase") != "up":
+            # Туннель мог подняться, а отказать — работник (отчёт М2а.1: SOCKS_FAILED у всех
+            # четырёх, а в записях — ни «туннель поднимался», ни что видно изнутри).
+            was_up = bool(state.get("tunnel_at"))
             return Outcome(
                 str(state.get("reason") or "TUNNEL_FAILED"), round(time.monotonic() - started, 2),
                 runtime.counters(lease), error=str(state.get("detail") or "")[:160],
+                tunnel_up=was_up, diagnosis=tunnel_diagnosis(state, state) if was_up else "",
             )
         connected = round(time.monotonic() - started, 2)
         outbound = {"tag": "pool", "protocol": "socks", "settings": {"servers": [{

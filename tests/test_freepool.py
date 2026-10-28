@@ -442,6 +442,90 @@ def test_github_lists_become_xray_and_singbox_variants():
                                      now=5.0).status is Status.SCHEMA_CHANGED
 
 
+def test_list_servers_xray_does_not_accept_are_rejected_with_a_reason():
+    """Отчёт М2а.1: «Xray завершился с кодом 23» у серверов списков. Чего Xray 26.10.21 не
+    принимает (проверено xray run -test), — в отклонённые при разборе, без значений секретов."""
+    uuid = "0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b"
+    pbk = "A" * 43
+
+    def ss(method, password="sspass1234567890"):
+        user = base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+        return f"ss://{user}@198.51.100.14:8388#{method}"
+
+    def vless(query, name):
+        return f"vless://{uuid}@198.51.100.10:443?{query}#{name}"
+
+    reality = f"security=reality&sni=a.example.com&pbk={pbk}&fp=chrome&type=tcp"
+    key16 = base64.b64encode(b"k" * 16).decode()
+    text = "\n".join([
+        ss("aes-256-gcm"), ss("AES-128-GCM"), ss("2022-blake3-aes-128-gcm", key16),
+        ss("aes-256-cfb"), ss("rc4-md5"), ss("aes-192-gcm"), ss("none"),
+        ss("2022-blake3-aes-256-gcm", key16),
+        vless("security=tls&sni=a.example.com&type=tcp&flow=xtls-rprx-vision-udp443", "u443"),
+        vless("security=tls&sni=a.example.com&type=tcp&flow=xtls-rprx-direct", "direct"),
+        vless("security=tls&sni=a.example.com&type=h2&path=%2F", "h2"),
+        vless("security=tls&sni=a.example.com&type=http&path=%2F", "http"),
+        vless(reality + "&sid=ABCD", "sid-ok"), vless(reality + "&sid=abc", "sid-odd"),
+        vless(reality + "&sid=0123456789abcdef01", "sid-long"),
+        vless(f"security=reality&sni=a.example.com&pbk={pbk}=&type=tcp", "pbk-padded"),
+    ])
+    result = providers.parse_link_list(providers.MAHDIBLAND, [("u", text)], now=1.0)
+    assert sorted(variant.name.split()[-1] for variant in result.variants) == [
+        "2022-blake3-aes-128-gcm", "AES-128-GCM", "aes-256-gcm", "sid-ok", "u443"]
+    assert result.rejections == {
+        "шифр Shadowsocks aes-256-cfb — Xray его не принимает": 1,
+        "шифр Shadowsocks rc4-md5 — Xray его не принимает": 1,
+        "шифр Shadowsocks aes-192-gcm — Xray его не принимает": 1,
+        "шифр Shadowsocks none — Xray его не принимает": 1,
+        "ключ Shadowsocks 2022 не той длины": 1,
+        "flow VLESS xtls-rprx-direct — убран из Xray": 1,
+        "транспорт HTTP/2 (h2) — убран из Xray, заменён XHTTP": 2,
+        "shortId REALITY — не пары hex до 16 знаков": 2,
+        "ключ REALITY — не 43 знака base64url": 1,
+    }
+
+
+def test_probe_core_failure_is_told_without_secrets(tmp_path):
+    """Временный Xray не запустился — в причине его строка отказа (последнее звено), а ключ
+    из неё скрыт; так отчёт покажет, что именно не так с сервером списка."""
+    from xgw.config import Config
+    from xgw.freepool import probe
+    from xgw.freepool.models import Variant
+
+    key = base64.b64encode(b"q" * 16).decode()
+
+    class Dead:
+        returncode = 23
+
+        def poll(self):
+            return 23
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 23
+
+    def spawn(argv, **kwargs):
+        kwargs["stdout"].write(
+            f"Failed to start: main: failed to create server > proxy/shadowsocks_2022: invalid "
+            f"key: {key} > infra/conf: unknown cipher method: {key}\n".encode())
+        kwargs["stdout"].flush()
+        return Dead()
+
+    variant = Variant(provider="mahdibland", backend=Backend.XRAY, protocol="shadowsocks",
+                      host="", address="198.51.100.14", port=8388, transport="tcp", name="x",
+                      country_hint="",
+                      outbound={"protocol": "shadowsocks", "settings": {"servers": [{
+                          "address": "198.51.100.14", "port": 8388,
+                          "method": "2022-blake3-aes-128-gcm", "password": key}]}})
+    outcome = probe.check_xray(variant, Config(), Path("/opt/xgw/xray/xray"), tmp_path,
+                               spawn=spawn)
+    assert outcome.verdict == "UNTESTED"
+    assert outcome.error == "Xray завершился с кодом 23: unknown cipher method: ***"
+    assert not list(tmp_path.iterdir())  # временный каталог убран вместе с выводом
+
+
 def test_github_list_in_base64_is_decoded():
     text = base64.b64encode(_fixture("mahdibland-eternity.txt").encode()).decode()
     result = providers.parse_link_list(providers.MAHDIBLAND, [("u", text)], now=1.0)

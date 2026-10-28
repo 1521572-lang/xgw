@@ -24,11 +24,20 @@ CAP_KILL (их остановка: uid другой); NoNewPrivileges. По ша
    затем SOCKS-работник (Xray от xgw-fps; конфиг так же в /tmp службы) с ответившим DNS
    первым. Отчёт М2а 28.10.2026: четыре туннеля поднялись, а через них не прошло ни одного
    запроса — без этой проверки не понять, кто не пропускает: сервер (или ТСПУ) или путь до
-   работника;
+   работника. Готовность работника — по /proc/net/tcp (порт слушается), без подключения:
+   отчёт М2а.1 — подключение агента к порту работника охрана отбивала (ответ работника через
+   lo ей не разрешён), и все туннели кончались SOCKS_FAILED;
 8. состояние — /run/xgw/fp/<gen>/state.json (его читает демон; пока туннель поднят — и
-   счётчики fpt0 раз в 2 с). SIGTERM — работники останавливаются, итог туннеля (пакеты в
-   туннель и из него, ошибки канала данных, отбитое охраной) — одной строкой в журнал,
+   счётчики fpt0 и охраны раз в 2 с). SIGTERM или отказ — работники останавливаются, итог
+   туннеля (пакеты в туннель и из него, ошибки канала данных, отбитое охраной) — одной строкой
+   в журнал и в состояние раньше фазы failed (демон берёт его в запись проверки),
    пространство имён исчезает вместе со службой, а с ним и veth.
+
+Счётчики охраны — по отправителю (отчёт М2а.1: общий счётчик принимал за отказ OpenVPN ответы
+ядра): refused_ovpn — пакеты OpenVPN (рост до подъёма — GUARD_BLOCKED), refused_socks —
+работника SOCKS и проверки изнутри (после подъёма — попытка мимо туннеля), refused_other — без
+сокета работника (ответы ядра серверу: сброс TCP после закрытия соединения, ICMP), dropped_v6 —
+служебный IPv6 ядра при подъёме fpi и fpt0 (IPv6 здесь не нужен никому).
 
 Строки журнала OpenVPN в журнал службы не пишутся: в состоянии — только коды причин
 (classify). Исключение — при отказе одна строка, по которой он распознан, с адресами IPv4 и
@@ -54,6 +63,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import masking
 from ..net import cmd
 from ..paths import Paths, atomic_write_json
 from .ovpn import OvpnRejected
@@ -68,6 +78,10 @@ SOCKS_USER_NAME = "xgw"
 OVPN_USER, SOCKS_USER = "xgw-ovpn", "xgw-fps"
 OVPN_DIR, SOCKS_DIR = "/tmp/xgw-ovpn", "/tmp/xgw-socks"
 TABLE = "xgwfp"
+REFUSED_OVPN, REFUSED_SOCKS, REFUSED_OTHER = "refused_ovpn", "refused_socks", "refused_other"
+DROPPED_V6 = "dropped_v6"
+COUNTERS = (REFUSED_OVPN, REFUSED_SOCKS, REFUSED_OTHER, DROPPED_V6)
+PROC_TCP = Path("/proc/net/tcp")  # сокеты TCP своего пространства имён
 VETH_WAIT = 20.0  # сколько ждать внутренний конец veth от демона
 UP_WAIT = 45.0  # подключение OpenVPN вместе с рукопожатием (R54: холодный кандидат — 45 с)
 RECONNECT_WAIT = 60.0  # после обрыва: не вернулся — отказ, а не вечные попытки
@@ -221,14 +235,16 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
     интерфейсу управления); OpenVPN — только к адресу, протоколу и порту сервера через veth;
     SOCKS-работник — только в туннель (IPv4) и ответами на подключения хоста к своему порту.
     Ввод: lo, ответы на свои соединения и подключение хоста к SOCKS. Форвардинга нет вовсе.
-    Новые входящие из туннеля (сервер VPN к агенту, к SOCKS, к управлению) — закрыты."""
+    Новые входящие из туннеля (сервер VPN к агенту, к SOCKS, к управлению) — закрыты.
+    Отбитое считается по отправителю (COUNTERS, docstring модуля)."""
     inner, host = inner_link(manifest.index), host_address(manifest.index)
     me = inner_address(manifest.index)
+    reject = "reject with icmpx type admin-prohibited"
     return "\n".join((
         f"table inet {TABLE}",
         f"delete table inet {TABLE}",
         f"table inet {TABLE} {{",
-        "    counter refused_out { }",
+        *(f"    counter {name} {{ }}" for name in COUNTERS),
         "    chain input {",
         "        type filter hook input priority filter; policy drop;",
         '        iif "lo" accept',
@@ -238,6 +254,10 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
         "    }",
         "    chain output {",
         "        type filter hook output priority filter; policy drop;",
+        # IPv6 здесь не нужен никому (OpenVPN — к IPv4 сервера, работник — UseIPv4), а ядро
+        # само шлёт служебный (поиск маршрутизатора, MLD, DAD) при подъёме fpi и fpt0: в
+        # отбитое он не идёт — отчёт М2а.1 принял его за отказ подключения OpenVPN.
+        f'        meta nfproto ipv6 counter name "{DROPPED_V6}" drop',
         f'        oif "lo" meta skuid {{ 0, {ovpn_uid} }} accept',
         # Ответ отказа (reject ниже) ядро шлёт отправителю через lo, без сокета: без этого
         # правила охрана отбросила бы и его, и отказ превратился бы в таймаут.
@@ -251,7 +271,11 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
         "time-exceeded } accept",
         # Отказ, а не тихий сброс: работник узнаёт сразу, а самопроверка отличает «закрыто
         # охраной» от «пакет ушёл и не ответили» (TCP при drop ждал бы до таймаута).
-        '        counter name "refused_out" reject with icmpx type admin-prohibited',
+        f'        meta skuid {ovpn_uid} counter name "{REFUSED_OVPN}" {reject}',
+        f'        meta skuid {socks_uid} counter name "{REFUSED_SOCKS}" {reject}',
+        # Без сокета работника: ответы ядра серверу (сброс TCP на его пакеты после закрытия
+        # соединения OpenVPN, ICMP), сам агент.
+        f'        counter name "{REFUSED_OTHER}" {reject}',
         "    }",
         "    chain forward {",
         "        type filter hook forward priority filter; policy drop;",
@@ -497,6 +521,68 @@ def tunnel_text(stats: object) -> str:
         return ""
 
 
+def listening(text: str, port: int) -> bool:
+    """Слушается ли TCP-порт по тексту /proc/net/tcp: локальный адрес «ADDR:PORT» (порт —
+    hex в порядке байт сети), состояние 0A — LISTEN."""
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 4 and fields[3] == "0A" \
+                and fields[1].rpartition(":")[2].upper() == f"{port:04X}":
+            return True
+    return False
+
+
+def deltas(start: dict | None, end: dict | None) -> dict[str, int]:
+    """Прирост счётчиков охраны между двумя снимками (_counters); нечитаемый — без него."""
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return {}
+    found = {}
+    for name in COUNTERS:
+        a, b = start.get(name, -1), end.get(name, -1)
+        if isinstance(a, int) and isinstance(b, int) and a >= 0 and b >= a:
+            found[name] = b - a
+    return found
+
+
+def guard_text(found: object) -> str:
+    """Прирост счётчиков охраны по-русски: «OpenVPN 0, работник 0, ответы ядра 2, служебный
+    IPv6 5»; пусто — счётчики не прочитаны."""
+    if not isinstance(found, dict) or not found:
+        return ""
+    labels = ((REFUSED_OVPN, "OpenVPN"), (REFUSED_SOCKS, "работник"),
+              (REFUSED_OTHER, "ответы ядра"), (DROPPED_V6, "служебный IPv6"))
+    return ", ".join(f"{label} {found[name]}" for name, label in labels if name in found)
+
+
+# Строка отказа ядра (Xray: «Failed to start: … > infra/conf: unknown cipher method: …»;
+# sing-box: «FATAL[0000] …»): сначала такие, затем ошибки, затем прочие пометки — не
+# предупреждения (у Xray «might be removed» есть и в них).
+_CORE_FATAL = ("Failed to start", "FATAL")
+_CORE_ERROR = ("[Error]", "ERROR")
+_CORE_MARKERS = ("failed", "invalid", "unknown", "removed", "not supported")
+_CORE_PREFIX = re.compile(r"^(?:[A-Z]+\[\d+\]\s*)?(?:(?:infra/conf|common/errors|main): )*")
+
+
+def core_reason(lines, secrets=()) -> str:
+    """Почему ядро (Xray, sing-box) не запустилось, по его выводу: последнее звено цепочки
+    «… > …» без имён модулей; секреты конфига (secrets — и части пароля «ключ:ключ»), ссылки,
+    UUID, адреса и имена хостов скрыты (Xray печатает в ошибке ключ или пароль). Не длиннее
+    120 знаков; пусто — строки с ошибкой нет."""
+    lines = [line.strip() for line in lines if line.strip()]
+    quiet = [line for line in lines if "[Warning]" not in line and "[Info]" not in line]
+    found = ""
+    for group, pool in ((_CORE_FATAL, lines), (_CORE_ERROR, quiet), (_CORE_MARKERS, quiet)):
+        found = next((line for line in reversed(pool) if any(m in line for m in group)), "")
+        if found:
+            break
+    if not found:
+        return ""
+    text = _CORE_PREFIX.sub("", found.rsplit(" > ", 1)[-1])
+    parts = {piece for secret in secrets if isinstance(secret, str)
+             for piece in (secret, *secret.split(":")) if len(piece) >= 4}
+    return masked(masking.mask_text(text, parts))[:120]
+
+
 # Самопроверка охраны: дочерний процесс от пользователя работника пытается открыть TCP.
 _PROBE = (
     "import errno,socket,sys\n"
@@ -509,7 +595,7 @@ _PROBE = (
     "    print(errno.errorcode.get(e.errno,'TIMEOUT') if e.errno else 'TIMEOUT')\n"
 )
 # Закрыто: нет маршрута (ENETUNREACH) — само по себе; остальное — только если вырос счётчик
-# отбитого охраной (refused_out): иначе пакет мог уйти.
+# отбитого охраной у этого пользователя (refused_ovpn, refused_socks): иначе пакет мог уйти.
 NO_ROUTE = "ENETUNREACH"
 REJECTED = ("EPERM", "EACCES", "EHOSTUNREACH", "ECONNREFUSED", "EHOSTDOWN")
 _PACKETS = re.compile(r"packets (\d+)")
@@ -523,9 +609,11 @@ class Agent:
         users: Callable[[str], tuple[int, int]] | None = None,
         clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
         tmp: Path = Path("/tmp"), out=sys.stdout,
+        proc_tcp: Callable[[], str] = lambda: PROC_TCP.read_text(encoding="ascii"),
     ) -> None:
         self.paths, self.gen = paths, gen
         self.runner, self.spawn, self.connect = runner, spawn, connect
+        self.proc_tcp = proc_tcp
         self.users = users or _user_ids
         self.clock, self.sleep = clock, sleep
         self.tmp, self.out = tmp, out
@@ -538,10 +626,13 @@ class Agent:
         self.state: dict = {"gen": gen, "phase": "starting", "since": time.time()}
         self.manifest: Manifest | None = None
         self.ids: dict[str, tuple[int, int]] = {}
-        # Счётчик охраны: после самопроверки (подключение OpenVPN) и после подъёма (работник).
-        self.refused_base: int | None = None
-        self.refused_up: int | None = None
+        # Снимки счётчиков охраны (_counters): после самопроверки (подключение OpenVPN) и при
+        # подъёме (дальше — работник и проверка изнутри).
+        self.refused_base: dict[str, int] | None = None
+        self.refused_up: dict[str, int] | None = None
         self.was_up = False
+        self.summarized = False
+        self.socks_log: deque[str] = deque(maxlen=8)
 
     # --- состояние для демона --------------------------------------------------------------
 
@@ -604,18 +695,18 @@ class Agent:
         наружу, SOCKS к интерфейсу управления — всё должно быть закрыто."""
         socks, ovpn = ids["socks"], ids["ovpn"]
         cases = {
-            "socks_to_peer": (socks, manifest.peer, manifest.port),
-            "socks_to_internet": (socks, "1.1.1.1", 443),
-            "socks_to_mgmt": (socks, "127.0.0.1", MGMT_PORT),
-            "ovpn_to_host": (ovpn, host_address(manifest.index), 22),
-            "ovpn_to_internet": (ovpn, "1.1.1.1", 443),
+            "socks_to_peer": (socks, REFUSED_SOCKS, manifest.peer, manifest.port),
+            "socks_to_internet": (socks, REFUSED_SOCKS, "1.1.1.1", 443),
+            "socks_to_mgmt": (socks, REFUSED_SOCKS, "127.0.0.1", MGMT_PORT),
+            "ovpn_to_host": (ovpn, REFUSED_OVPN, host_address(manifest.index), 22),
+            "ovpn_to_internet": (ovpn, REFUSED_OVPN, "1.1.1.1", 443),
         }
         results: dict[str, str] = {}
         bad: list[str] = []
-        for name, (who, address, port) in cases.items():
-            before = self._refused()
+        for name, (who, counter, address, port) in cases.items():
+            before = self._counter(counter)
             result = self._probe(*who, address, port)
-            counted = self._refused() > before
+            counted = self._counter(counter) > before
             results[name] = result + (" (охрана)" if counted else "")
             if not (result == NO_ROUTE or (result in REJECTED and counted)):
                 bad.append(name)
@@ -626,11 +717,14 @@ class Agent:
             raise AgentError("GUARD_FAILED", "охрана пропускает: " + ", ".join(bad))
         return results
 
-    def _refused(self) -> int:
-        text = self.runner(["nft", "list", "counter", "inet", TABLE, "refused_out"],
+    def _counter(self, name: str) -> int:
+        text = self.runner(["nft", "list", "counter", "inet", TABLE, name],
                            timeout=10.0, check=False)
         match = _PACKETS.search(text)
         return int(match.group(1)) if match else -1
+
+    def _counters(self) -> dict[str, int]:
+        return {name: self._counter(name) for name in COUNTERS}
 
     def _write_dir(self, directory: Path, gid: int, content: dict[str, str]) -> None:
         """Каталог работника в /tmp службы: root:<группа работника>, 0750; файлы — 0640."""
@@ -676,26 +770,30 @@ class Agent:
 
     def _start_socks(self, manifest: Manifest, dns: list[str]) -> None:
         """SOCKS-работник — только при поднятом туннеле: DNS берётся из проверки изнутри.
-        Готов — когда открыл свой порт (подключение root внутри пространства имён — через lo)."""
+        Готов — когда его порт слушается (/proc/net/tcp своего пространства имён). Не
+        подключением: ответ работника через lo охрана не пропускает (отчёт М2а.1)."""
         socks_dir = self.tmp / Path(SOCKS_DIR).name
         self._write_dir(socks_dir, self.ids["socks"][1], {
             "socks.json": json.dumps(socks_config(manifest, dns), ensure_ascii=False)})
         proc = self._start("socks", [manifest.xray_bin, "run", "-c",
                                      str(socks_dir / "socks.json")], self.ids["socks"])
-        threading.Thread(target=self._drain, args=(proc,), daemon=True).start()
+        reader = threading.Thread(target=self._drain, args=(proc,), daemon=True)
+        reader.start()
         deadline = self.clock() + SOCKS_WAIT
         while True:
             if self._dead("socks"):
-                raise AgentError("SOCKS_FAILED", "SOCKS-работник завершился при запуске")
+                reader.join(timeout=1.0)
+                why = core_reason(self.socks_log, (manifest.socks_pass,))
+                raise AgentError("SOCKS_FAILED", "SOCKS-работник завершился при запуске"
+                                 + (f": {why}" if why else ""))
             try:
-                conn = self.connect((inner_address(manifest.index), SOCKS_PORT), 0.5)
-            except OSError:
-                if self.clock() > deadline or self.stop.is_set():
-                    raise AgentError("SOCKS_FAILED", "SOCKS-работник не открыл порт") from None
-                self.sleep(0.1)
-                continue
-            conn.close()
-            return
+                if listening(self.proc_tcp(), SOCKS_PORT):
+                    return
+            except OSError as exc:
+                raise AgentError("SOCKS_FAILED", f"/proc/net/tcp не читается: {exc}") from exc
+            if self.clock() > deadline or self.stop.is_set():
+                raise AgentError("SOCKS_FAILED", "SOCKS-работник не открыл порт")
+            self.sleep(0.1)
 
     def _tun_stats(self) -> dict[str, int] | None:
         try:
@@ -705,16 +803,17 @@ class Agent:
 
     def _summary(self) -> None:
         """Итог поднимавшегося туннеля — в журнал и состояние: пакеты в туннель и из него,
-        ошибки канала данных, отбитое охраной после подъёма (это попытки работника мимо
-        туннеля). Сбой здесь — не повод не остановить работников."""
+        ошибки канала данных, отбитое охраной после подъёма (у работника — попытки мимо
+        туннеля). Один раз; сбой здесь — не повод не остановить работников."""
+        if self.summarized:
+            return
+        self.summarized = True
         stats = self._tun_stats()
-        refused = self._refused()
-        after = refused - self.refused_up if self.refused_up is not None and refused >= 0 \
-            and self.refused_up >= 0 else -1
+        after = deltas(self.refused_up, self._counters())
         parts = [tunnel_text(stats) or "счётчики fpt0 не прочитаны",
                  f"ошибок канала данных {self.data_errors}"
                  + (f" ({self.data_error_line})" if self.data_error_line else ""),
-                 f"охрана отбила после подъёма {after if after >= 0 else '—'}"]
+                 f"охрана после подъёма: {guard_text(after) or '—'}"]
         self._write(tun=stats, refused_after_up=after)
         self._say("итог туннеля: " + "; ".join(parts))
 
@@ -745,8 +844,10 @@ class Agent:
                     self.data_error_line = masked(line)
 
     def _drain(self, proc: subprocess.Popen) -> None:
-        for _line in proc.stdout or ():
-            pass  # предупреждения Xray: журнал службы не засоряется
+        """Вывод работника SOCKS — не в журнал службы: последние строки только для причины
+        отказа при запуске (core_reason)."""
+        for line in proc.stdout or ():
+            self.socks_log.append(line.rstrip("\n")[:400])
 
     def _up(self, address: str, manifest: Manifest) -> None:
         problem = tunnel_problem(address, manifest)
@@ -759,13 +860,18 @@ class Agent:
         self._ip("route", "replace", "default", "dev", TUN)
         if not self.was_up:
             # Первый подъём: проверка изнутри и SOCKS-работник — до фазы up (демон начинает
-            # пробу, как только её видит).
+            # пробу, как только её видит). Туннель поднят — в состояние сразу: откажет
+            # работник — демон всё равно запишет, что туннель был и что видно изнутри.
             self.was_up = True
-            self.refused_up = self._refused()
+            self.refused_up = self._counters()
+            self._write(tunnel=address, mtu=mtu, tunnel_at=time.time())
+            self._say(f"туннель поднят, MTU {mtu}")
             servers, inner = self._inner_check(manifest)
             self._start_socks(manifest, worker_dns(servers, inner))
+            self._say("SOCKS-работник готов")
+        else:
+            self._say(f"туннель снова поднят, MTU {mtu}")
         self._write(phase="up", tunnel=address, mtu=mtu, up_at=time.time())
-        self._say(f"туннель поднят, MTU {mtu}")
 
     def _down(self, why: str) -> None:
         self._ip("route", "del", "default", "dev", TUN, check=False)
@@ -796,8 +902,11 @@ class Agent:
                 if up and self.clock() - stats_at >= STATS_EVERY:
                     stats_at = self.clock()
                     stats = self._tun_stats()
+                    values: dict = {"refused_after_up": deltas(self.refused_up,
+                                                               self._counters())}
                     if stats is not None:
-                        self._write(tun=stats)
+                        values["tun"] = stats
+                    self._write(**values)
                 ready, _w, _x = select.select([sock], [], [], 1.0)
                 if ready:
                     chunk = sock.recv(4096)
@@ -886,7 +995,7 @@ class Agent:
             self._veth(manifest)
             self._selftest(manifest, ids)
             conf = self._files(manifest, ids)
-            self.refused_base = self._refused()
+            self.refused_base = self._counters()
             proc = self._start("openvpn", [manifest.openvpn_bin, "--config", str(conf)],
                                ids["ovpn"])
             threading.Thread(target=self._read_openvpn, args=(proc,), daemon=True).start()
@@ -896,41 +1005,51 @@ class Agent:
             return 0
         except AgentError as exc:
             code, text = exc.code, str(exc)
-            blocked = self._blocked()
-            if blocked > 0 and not self.was_up:
-                # До подъёма работает только OpenVPN, а пакеты ему отбила своя охрана — дефект
+            before_up = self._before_up()
+            if before_up.get(REFUSED_OVPN, 0) > 0 and not self.was_up:
+                # До подъёма работает только OpenVPN, а его пакеты отбила своя охрана — дефект
                 # шлюза, как бы ни назвал отказ сам OpenVPN («No route to host» и т. п.).
-                code, text = "GUARD_BLOCKED", f"охрана отбила подключение OpenVPN ({text})"
-            self._write(phase="failed", reason=code, detail=text[:200])
-            self._say(f"поколение {self.gen}: {code} — {text}")
+                # Ответы ядра и служебный IPv6 — не его пакеты (отчёт М2а.1).
+                code, text = "GUARD_BLOCKED", f"охрана отбила пакеты OpenVPN ({text})"
+            self._summarize()  # раньше фазы failed: демон берёт итог в запись проверки
+            self._write(phase="failed", reason=code, openvpn_code=exc.code, detail=text[:200],
+                        refused_before_up=before_up)
+            self._say(f"поколение {self.gen}: {code}"
+                      + (f" (по журналу OpenVPN: {exc.code})" if code != exc.code else "")
+                      + f" — {text}")
             line = evidence(list(self.log), exc.code)
             if line:
                 self._say(f"OpenVPN: {line}")
-            if blocked > 0:
-                self._say(f"охрана отбила за подключение: {blocked}")
+            if any(before_up.values()):
+                self._say(f"охрана за подключение: {guard_text(before_up)}")
             return 3
         except (OSError, cmd.CommandError, subprocess.SubprocessError) as exc:
+            self._summarize()
             self._write(phase="failed", reason="AGENT_ERROR", detail=type(exc).__name__)
             self._say(f"поколение {self.gen}: ошибка агента — {exc}")
             return 4
         finally:
-            if self.was_up:
-                try:
-                    self._summary()
-                except (OSError, cmd.CommandError, ValueError) as exc:
-                    self._say(f"итог туннеля не собран: {exc}")
+            self._summarize()
             self._stop_children()
 
-    def _blocked(self) -> int:
-        """Сколько пакетов охрана отбила с запуска OpenVPN до подъёма туннеля; 0 — нисколько
-        или OpenVPN не запускался."""
-        if self.refused_base is None or self.refused_base < 0:
-            return 0
+    def _summarize(self) -> None:
+        if not self.was_up:
+            return
         try:
-            now = self._refused() if self.refused_up is None else self.refused_up
+            self._summary()
+        except (OSError, cmd.CommandError, ValueError) as exc:
+            self._say(f"итог туннеля не собран: {exc}")
+
+    def _before_up(self) -> dict[str, int]:
+        """Прирост счётчиков охраны с запуска OpenVPN до подъёма туннеля (или до сих пор);
+        пусто — OpenVPN не запускался или счётчики не прочитаны."""
+        if self.refused_base is None:
+            return {}
+        try:
+            end = self.refused_up if self.refused_up is not None else self._counters()
         except (OSError, cmd.CommandError):
-            return 0
-        return max(0, now - self.refused_base)
+            return {}
+        return deltas(self.refused_base, end)
 
 
 def _user_ids(name: str) -> tuple[int, int]:

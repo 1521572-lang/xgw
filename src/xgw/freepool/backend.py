@@ -36,7 +36,9 @@ UNIT = "xgw-fp@{gen}.service"
 UNIT_FILE = "xgw-fp@.service"
 OPENVPN_BIN = Path("/usr/sbin/openvpn")
 START_WAIT = 10.0
-UP_MARGIN = 20.0  # сверх срока агента: veth, самопроверка, запуск работников
+# Сверх срока агента: veth, самопроверка, проверка изнутри (INNER_WAIT 12 с) и запуск
+# работника (SOCKS_WAIT 5 с). Отчёт М2а.1: в коммит М2а.1 не попало — оставалось 20 с.
+UP_MARGIN = 35.0
 TABLE = "xgw"
 PEERS_SET = "fp_peers"
 
