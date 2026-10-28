@@ -507,3 +507,62 @@ def test_rtt_is_a_second_request_on_the_open_connection(tls_files):
         timeout=5, silence=2, tls_context=context, rtt=True,
     )
     assert result.ok and result.rtt_ms is None
+
+
+def test_own_probe_asks_a_random_part_of_a_known_file(monkeypatch):
+    """Анти-ТСПУ 2.0, пробы без шаблона: файл известного размера — случайная его часть, не
+    меньше RANDOM_MIN (больше двух записей TLS — «заморозка» на 16–32 КБ ловится); адрес с
+    размером в параметрах и trace — целиком, как раньше."""
+    from xgw.config import DEFAULT_PROBE_SIZE, DEFAULT_PROBE_URL, Config
+    from xgw.generator.builder import NodeInfo
+    from xgw.watch import scan as scan_module
+
+    sizes = {scan_module.range_size(DEFAULT_PROBE_URL) for _ in range(200)}
+    assert min(sizes) >= scan_module.RANDOM_MIN and max(sizes) <= DEFAULT_PROBE_SIZE
+    assert len(sizes) > 50  # длина и правда меняется
+    assert scan_module.range_size("https://speed.example/__down?bytes=65536") == 0
+    assert scan_module.range_size("https://www.cloudflare.com/cdn-cgi/trace") == 0
+    asked: list[int] = []
+
+    def fake(*args, range_end=0, **kwargs):
+        asked.append(range_end)
+        return scan_module.DownloadResult(ok=True, downloaded=range_end, status=206)
+
+    monkeypatch.setattr(scan_module, "http_get_via_proxy", fake)
+    node = NodeInfo("a" * 8, "spare-nl-aaaa", "probe-nl-aaaa", 20001, "spare")
+    cfg = Config()
+    scan_module.scan_node(node, cfg, probe_pass="p", random_size=True)
+    scan_module.scan_node(node, cfg, probe_pass="p")
+    assert asked[0] >= scan_module.RANDOM_MIN and asked[1] == 0
+
+
+def test_range_header_asks_part_of_the_file_and_206_is_success():
+    """range_end — Range: bytes=0-…; ответ 206 с телом такой длины — удача."""
+    import socket
+    import threading
+
+    body = b"x" * 1000
+    seen: list[bytes] = []
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def serve():
+        conn, _ = server.accept()
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += conn.recv(4096)
+        seen.append(request)
+        conn.sendall(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-399/1000\r\n"
+                     b"Content-Length: 400\r\n\r\n" + body[:400])
+        conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    result = http_get_via_proxy("127.0.0.1", port, "http://files.example/f.woff",
+                                timeout=5, range_end=400)
+    thread.join(5)
+    server.close()
+    assert result.ok and result.status == 206 and result.downloaded == 400
+    assert b"Range: bytes=0-399\r\n" in seen[0]

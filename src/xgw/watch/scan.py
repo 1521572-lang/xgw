@@ -16,8 +16,9 @@ import random
 import threading
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
-from ..config import Config
+from ..config import Config, probe_bytes
 from ..generator.builder import PROBE_USER, NodeInfo
 from .checks import DownloadResult, http_get_via_proxy
 
@@ -35,6 +36,12 @@ RESERVE_CANDIDATES = 3
 # их учитывал и бюджет проверок (status.probe_budget).
 DEVICE_CHECK = 30.0
 RTT_EVERY = 600.0
+# Пробы без шаблона (анти-ТСПУ 2.0): собственная проба статическим файлом известного размера
+# просит случайную его часть (Range) — от RANDOM_MIN байт до целого. Снаружи туннеля видна
+# только длина всплеска, а одинаковые всплески по 57 КБ раз в несколько минут — заметный шаблон.
+# RANDOM_MIN больше двух записей TLS (~32,7 КБ): «заморозка» по объёму на 16–32 КБ ловится и
+# так (стенд phase_lab: обрыв видится кратно ~16,3 КБ).
+RANDOM_MIN = 40_000
 
 
 def cheap_url(cfg: Config) -> str:
@@ -81,18 +88,23 @@ def scan_node(
     url: str | None = None,
     silence: float = 5.0,
     cancel: threading.Event | None = None,
+    random_size: bool = False,
 ) -> ScanResult:
     """Проба одного узла через его probe-inbound (127.0.0.1:<probe_port>).
+
+    random_size — для статического файла известного размера просить случайную его часть
+    (range_size); у прочих адресов (trace, ?bytes=…) — как раньше, целиком.
 
     probe_pass — пароль из применённого конфига (builder.probe_state): у
     работающего Xray действует именно он. cancel — демон останавливается: проба
     прерывается, вердикт CANCELLED (о сервере он ничего не говорит, не записывается).
     """
     started = time.monotonic()
+    target = url or cfg.probe.url
     result = http_get_via_proxy(
         "127.0.0.1",
         node.probe_port,
-        url or cfg.probe.url,
+        target,
         timeout=max(silence + 5.0, 15.0),
         silence=silence,
         proxy_user=probe_user,
@@ -100,6 +112,7 @@ def scan_node(
         user_agent=cfg.probe.user_agent,
         cancel=cancel,
         rtt=True,
+        range_end=range_size(target) if random_size else 0,
     )
     seconds = time.monotonic() - started
     return ScanResult(
@@ -112,6 +125,15 @@ def scan_node(
         status=result.status,
         rtt_ms=result.rtt_ms,
     )
+
+
+def range_size(url: str) -> int:
+    """Случайная длина тела пробы url: от RANDOM_MIN до размера файла; 0 — просить целиком
+    (размер неизвестен, адрес с параметрами или файл меньше RANDOM_MIN)."""
+    size = probe_bytes(url)
+    if not size or size <= RANDOM_MIN or urlsplit(url).query:
+        return 0
+    return random.randint(RANDOM_MIN, size)
 
 
 def scan_spares(

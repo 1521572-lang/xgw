@@ -64,6 +64,7 @@ def http_get_via_proxy(
     max_body_seconds: float = 0.0,
     cancel: threading.Event | None = None,
     rtt: bool = False,
+    range_end: int = 0,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -81,7 +82,10 @@ def http_get_via_proxy(
     время до его заголовков — сетевая задержка rtt_ms (п. 2.3 рекомендаций к аудиту 0.1.18):
     время пробы целиком (рукопожатия TCP и TLS через сервер, загрузка файла) больше её в
     разы — у «польша 2» 340–470 мс при RTT 40–60.
+    `range_end` — сколько байт тела просить (Range: bytes=0-…, ответ 206); 0 — весь файл.
+    Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
     """
+    ranged = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
     parts = urlsplit(url)
     host = parts.hostname
     if not host or parts.scheme not in ("http", "https"):
@@ -117,7 +121,7 @@ def http_get_via_proxy(
             if parts.query:
                 path = f"{path}?{parts.query}"
             request = _request(
-                "GET", path, {"Host": _host_header(host, port, 443)}, user_agent,
+                "GET", path, {"Host": _host_header(host, port, 443), **ranged}, user_agent,
                 keep_alive=rtt,
             )
         else:
@@ -125,7 +129,7 @@ def http_get_via_proxy(
                 sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
             except OSError as exc:  # в т. ч. таймаут: локальный inbound недоступен
                 return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}")
-            headers = {"Host": _host_header(host, port, 80)}
+            headers = {"Host": _host_header(host, port, 80), **ranged}
             if proxy_user:
                 token = base64.b64encode(f"{proxy_user}:{proxy_pass}".encode()).decode("ascii")
                 headers["Proxy-Authorization"] = f"Basic {token}"

@@ -7,7 +7,7 @@ import json
 import pytest
 from test_daemon import Harness, _started
 from test_daemon_main import _free_inventory
-from test_dualcore import Dual, _has, _rescan, _start
+from test_dualcore import Dual, _has, _jam, _rescan, _start
 
 from xgw import config, fetch, tailscale
 from xgw.config import Config
@@ -71,6 +71,7 @@ def test_a_frozen_member_climbs_the_xray_steps_in_place_and_keeps_the_one_that_a
     событие и панель говорят, какой обход и после какого вердикта."""
     _start(tspu)
     member = _member(tspu)
+    _jam(tspu, member)
     tspu.table[member.probe_tag] = {
         "xray:default": "FROZEN", "xray:fragment": "STALL_BEFORE_BODY", "xray:split": "OK",
     }
@@ -98,6 +99,7 @@ def test_a_member_dead_on_every_xray_step_is_replaced(tspu):
     tspu.cfg.filters.rotate_after_min = 0
     _start(tspu)
     member = _member(tspu)
+    _jam(tspu, member)
     tspu.table[member.probe_tag] = {"*": "CONNECT_FAIL"}
     tspu.vetted.clear()
     _rescan(tspu)
@@ -153,6 +155,7 @@ def test_a_calm_member_goes_back_to_plain_xray(tspu):
     # своих тестах.
     tspu._rebalance_at = float("inf")
     member = _member(tspu)
+    _jam(tspu, member)
     tspu.table[member.probe_tag] = {"xray:default": "FROZEN"}
     tspu.vetted.clear()
     _rescan(tspu)
@@ -511,6 +514,7 @@ def test_shadow_probe_returns_the_base_profile_without_touching_traffic(tspu):
     _start(tspu)
     tspu._rebalance_at = float("inf")
     member = _member(tspu)
+    _jam(tspu, member)
     tspu.table[member.probe_tag] = {"xray:default": "FROZEN"}
     tspu.vetted.clear()
     _rescan(tspu)
@@ -533,3 +537,189 @@ def test_shadow_probe_returns_the_base_profile_without_touching_traffic(tspu):
             break
     assert tspu.profile(member) == "xray:default" and not tspu._profile_trial
     assert _has(tspu, "теневая проба отдельным Xray")
+
+
+# --- анти-ТСПУ 2.0: фаза отказа и быстрая замена -------------------------------------------
+
+
+def test_a_lone_frozen_member_is_replaced_at_once_and_tried_with_fragmenting_as_a_spare(
+        tspu, caplog):
+    """«Заморозился» один участник, а другие работают и есть проверенный запасной — замена
+    сразу, без ступеней дробления на месте (трафик не ждёт); обход проверяется на нём, когда он
+    стал запасным."""
+    import logging
+
+    caplog.set_level(logging.INFO)
+    _start(tspu)
+    member = _member(tspu)
+    tspu.table[member.probe_tag] = {"xray:default": "FROZEN", "xray:fragment": "OK"}
+    tspu.vetted.clear()
+    _rescan(tspu)
+    for _ in range(3):
+        tspu.tick()
+        if member.tag not in tspu.tags("proxy"):
+            break
+    assert member.tag not in tspu.tags("proxy")
+    assert not any(profile != "xray:default" for tag, profile in tspu.seen
+                   if tag == member.probe_tag)  # дробления на месте не было
+    assert "а другие участники работают — меняю его на проверенный запасной сразу" in caplog.text
+    for _ in range(6):
+        _rescan(tspu)
+        tspu.tick()
+        if ("xray:fragment" in [profile for tag, profile in tspu.seen
+                                if tag == member.probe_tag]):
+            break
+    assert (member.probe_tag, "xray:fragment") in tspu.seen  # лестница — уже запасным
+
+
+def test_a_closed_address_skips_the_ladder_and_shows_in_the_panel(tspu, monkeypatch):
+    """TCP к адресу сервера напрямую не открывается — адрес закрыт целиком: у всех профилей
+    тот же адрес и порт, лестница не запускается (запасной), участник меняется сразу. Отметка
+    видна в состоянии и снимается первым ответом сервера."""
+    _start(tspu)
+    monkeypatch.setattr(Daemon, "_server_reachable", lambda self, node: False)
+    spare = next(info for info in tspu.view() if info.role == "spare"
+                 and info.profile == "xray:default"
+                 and fragmenting.eligible(tspu.node(info).outbound or {}))
+    tspu.table[spare.probe_tag] = {"*": "TIMEOUT"}
+    for _ in range(3):
+        _rescan(tspu)
+        tspu.tick()
+    assert all(profile == "xray:default" for tag, profile in tspu.seen if tag == spare.probe_tag)
+    assert spare.fingerprint in tspu._closed and not tspu._profile_wanted
+    assert _entry(tspu, spare.tag)["closed_ts"] is not None
+    tspu.table[spare.probe_tag] = {}
+    _rescan(tspu)
+    tspu.tick()
+    assert spare.fingerprint not in tspu._closed  # ответил — отметка снята
+
+
+def test_reachable_address_keeps_the_ladder(tspu, monkeypatch):
+    """TCP к адресу открывается — режет не адрес, а рукопожатие: лестница как раньше."""
+    _start(tspu)
+    monkeypatch.setattr(Daemon, "_server_reachable", lambda self, node: True)
+    spare = next(info for info in tspu.view() if info.role == "spare"
+                 and info.profile == "xray:default"
+                 and fragmenting.eligible(tspu.node(info).outbound or {}))
+    tspu.table[spare.probe_tag] = {"xray:default": "TIMEOUT", "xray:fragment": "OK"}
+    for _ in range(4):
+        _rescan(tspu)
+        tspu.tick()
+    assert (spare.probe_tag, "xray:fragment") in tspu.seen and not tspu._closed
+
+
+def test_server_reachable_checks_tcp_servers_directly_only(tspu, monkeypatch):
+    """Прямая проверка — только у серверов поверх TCP и без цепочки, по IP из подписки или из
+    dns.hosts применённого конфига; UDP-протоколы и цепочки — «проверить нечем»."""
+    from xgw import daemon as daemon_module
+    from xgw.model import ServerNode
+
+    _start(tspu)
+    asked: list[tuple[str, int]] = []
+    monkeypatch.setattr(daemon_module.checks, "tcp_check",
+                        lambda host, port, **kwargs: asked.append((host, port)) or False)
+    tspu.mark = 2
+
+    def node(protocol, address, outbound=None, keep_tag=None):
+        return ServerNode(fingerprint="f" * 8, name="x", country="nl", protocol=protocol,
+                          address=address, port=443, outbound=outbound or {}, source="s",
+                          keep_tag=keep_tag)
+
+    tcp = {"streamSettings": {"network": "tcp", "security": "reality"}}
+    assert tspu._server_reachable(node("vless", "198.51.100.7", tcp)) is False
+    assert asked == [("198.51.100.7", 443)]
+    assert tspu._server_reachable(node("hysteria2", "198.51.100.8")) is None
+    assert tspu._server_reachable(node("vless", "198.51.100.9", {"streamSettings": {
+        "network": "kcp"}})) is None
+    assert tspu._server_reachable(node("vless", "198.51.100.9", {"streamSettings": {
+        "network": "tcp", "sockopt": {"dialerProxy": "chain"}}})) is None
+    assert tspu._server_reachable(node("vless", "unknown.example.com", tcp)) is None
+    applied = json.loads(tspu.paths.xray_config_file.read_text(encoding="utf-8"))
+    applied.setdefault("dns", {})["hosts"] = {"known.example.com": ["198.51.100.10"]}
+    tspu.paths.xray_config_file.write_text(json.dumps(applied), encoding="utf-8")
+    assert tspu._server_reachable(node("vless", "known.example.com", tcp)) is False
+    assert asked[-1] == ("198.51.100.10", 443)
+    tspu.mark = None
+    assert tspu._server_reachable(node("vless", "198.51.100.7", tcp)) is None
+
+
+# --- анти-ТСПУ 2.0: белые списки ----------------------------------------------------------
+
+
+def _broken(**kwargs):
+    """Сигналы шага: VPN не работает, провайдер (российские адреса) отвечает."""
+    from xgw.watch.states import Signals
+
+    return Signals(**{"provider_ok": True, "xray_ok": True, "total_members": 2,
+                      "alive_members": 0, "e2e_ok": False, **kwargs})
+
+
+def test_whitelist_is_detected_reported_and_offered_but_nothing_changes(tspu, monkeypatch):
+    """VPN не работает, российские адреса открываются, зарубежные — нет, дважды подряд —
+    событие и предупреждение с сервером x100; шлюз сам ничего не меняет (решение заказчика).
+    Зарубежное открылось — событие «сняты»."""
+    from xgw import daemon as daemon_module
+
+    _start(tspu)
+    view = tspu.view()
+    spare = next(info for info in view if info.role == "spare")
+    lte = tspu.node(spare).name
+    monkeypatch.setattr(daemon_module.cost, "multiplier",
+                        lambda name, pattern: 100.0 if name == lte else 1.0)
+    closed = [True]
+    monkeypatch.setattr(Daemon, "_foreign_closed", lambda self: closed[0])
+    applied = len(tspu.applied)
+    every = daemon_module.WHITELIST_EVERY
+    tspu._whitelist_step(view, _broken(), State.ALL_DEAD, 1000.0)
+    assert tspu.whitelist_since is None  # одной проверки мало
+    tspu._whitelist_step(view, _broken(), State.ALL_DEAD, 1000.0 + every)
+    assert tspu.whitelist_since is not None
+    assert _has(tspu, "похоже, провайдер включил белые списки")
+    assert _has(tspu, f"Можно включить сервер для белых списков «{lte}»")
+    assert len(tspu.applied) == applied and tspu._manual_pin() is None  # сам ничего не меняет
+    tspu._write_status(view, {}, True)
+    offer = tspu.status()["whitelist"]["offer"]
+    assert offer["tag"] == spare.tag and offer["multiplier"] == 100.0
+    closed[0] = False
+    tspu._whitelist_step(view, _broken(), State.ALL_DEAD, 1000.0 + 2 * every)
+    assert tspu.whitelist_since is None and _has(tspu, "белые списки сняты")
+    tspu._write_status(view, {}, True)
+    assert tspu.status()["whitelist"] is None
+
+
+def test_no_whitelist_while_the_vpn_works_or_russia_is_closed_too(tspu, monkeypatch):
+    """VPN работает — проверки нет вовсе; провайдер не отвечает и по российским адресам — это
+    не белые списки, а нет сети."""
+    from xgw import daemon as daemon_module
+
+    _start(tspu)
+    view = tspu.view()
+    asked: list[int] = []
+    monkeypatch.setattr(Daemon, "_foreign_closed", lambda self: asked.append(1) or True)
+    every = daemon_module.WHITELIST_EVERY
+    for step in range(3):
+        tspu._whitelist_step(view, _broken(), State.HEALTHY, 1000.0 + step * every)
+    for step in range(3):
+        tspu._whitelist_step(view, _broken(provider_ok=False), State.ALL_DEAD,
+                             2000.0 + step * every)
+    assert tspu.whitelist_since is None and asked == []
+
+
+def test_foreign_closed_tries_the_probe_hosts_directly(tspu, monkeypatch):
+    """Зарубежные хосты — probe.url и probe.urls, TCP напрямую сокетом с меткой: открылся хоть
+    один — не белые списки; без метки — проверить нечем."""
+    from xgw import daemon as daemon_module
+
+    tspu.mark = 2
+    asked: list[int] = []
+    monkeypatch.setattr(Daemon, "_provider_address", lambda self, host: "198.51.100.1")
+    monkeypatch.setattr(daemon_module.checks, "tcp_check",
+                        lambda host, port, **kwargs: asked.append(port) or False)
+    assert tspu._foreign_closed() is True
+    assert len(asked) == len(probehosts.all_urls(tspu.cfg))
+    monkeypatch.setattr(daemon_module.checks, "tcp_check", lambda host, port, **kwargs: True)
+    assert tspu._foreign_closed() is False
+    monkeypatch.setattr(Daemon, "_provider_address", lambda self, host: None)
+    assert tspu._foreign_closed() is None  # имена не разрешились
+    tspu.mark = None
+    assert tspu._foreign_closed() is None

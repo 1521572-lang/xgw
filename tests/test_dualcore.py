@@ -97,6 +97,15 @@ def _start(daemon: Dual) -> Dual:
     return daemon
 
 
+def _jam(daemon: Dual, member) -> None:
+    """Глушение по всей сети: ядро считает мёртвыми и других участников. Тогда участник,
+    который «заморозился», проверяется на дроблении на месте (ТЗ R1), а не меняется сразу
+    (анти-ТСПУ 2.0: одиночный отказ — замена сразу)."""
+    daemon.set_alive(**{
+        tag.replace("-", "_"): False for tag in daemon.tags("proxy") if tag != member.tag
+    })
+
+
 def _rescan(daemon: Dual) -> None:
     daemon.next_scan = daemon.t
     daemon.next_refresh = daemon.t + 3600
@@ -336,6 +345,7 @@ def test_members_try_only_xray_fragmenting_in_place(dual):
     member = next(info for info in dual.view() if info.role == "proxy"
                   and info.profile == "xray:default"
                   and fragmenting.eligible(dual.node(info).outbound or {}))
+    _jam(dual, member)
     dual.table[member.probe_tag] = {"*": "FROZEN"}
     dual.vetted.clear()
     _rescan(dual)

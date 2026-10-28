@@ -229,6 +229,7 @@ def _shared(entry: dict) -> dict:
         "speed_bg_mbps": entry.get("speed_bg_mbps"),
         "escalation": entry.get("escalation"),
         "unstable_until": entry.get("unstable_until"),
+        "closed_ts": entry.get("closed_ts"),
         "fragment": bool(entry.get("fragment")),
         "profile": entry.get("profile") or "", "core": entry.get("core") or "",
         # Сетевая задержка (RTT, 0.2.0) — отдельно от времени пробы целиком (delay_ms) — и
@@ -643,6 +644,8 @@ class Panel:
             # хотя живы безлимитные (status.class_warning). Пусто — всё в порядке.
             "stranded": snapshot.get("stranded") or "",
             "class_warning": snapshot.get("class_warning") or "",
+            # Белые списки (анти-ТСПУ 2.0): предупреждение и сервер, который можно включить.
+            "whitelist": snapshot.get("whitelist"),
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.

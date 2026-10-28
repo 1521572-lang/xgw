@@ -189,6 +189,8 @@ def _tspu_fields(scene: str, fingerprint: str, now: float) -> dict:
             "ts": now - 3 * 3600})
     if fingerprint == "a7a7a7a7":
         fields["unstable_until"] = now + 4 * 3600
+    if fingerprint == "c9c9c9c9":
+        fields["closed_ts"] = now - 40 * 60  # анти-ТСПУ 2.0: адрес закрыт целиком
     return fields
 
 
@@ -345,6 +347,10 @@ def _tspu_status(scene: str, now: float) -> dict:
         {"entry": "https://9.9.9.9:5053", "ok": False, "ms": 5000, "error": "тайм-аут"},
     ]
     return {
+        # Анти-ТСПУ 2.0: белые списки распознаны, шлюз предлагает сервер x100 (сам не меняет).
+        "whitelist": {"since": now - 15 * 60, "offer": {
+            "tag": "proxy-se-d4d4", "name": "🇸🇪 x100 Швеция · Стокгольм", "multiplier": 100.0,
+            "answered": True}},
         "probe_hosts": {"current": hosts[0]["url"], "hosts": hosts},
         "resolvers": {"ts": now - 600, "results": resolvers},
         "tailscale_via_vpn": True,

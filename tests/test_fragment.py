@@ -354,11 +354,15 @@ def test_dead_member_gives_way_to_a_spare_that_answers_only_with_fragmenting(dpi
 
 
 def test_a_member_is_fragmented_in_place_and_mode_off_switches_nobody(dpi):
-    """ТЗ R1 (0.1.18): участник, который без дробления не отвечает (CONNECT_FAIL), не
-    списывается — ему на месте включают дробление ClientHello, и он остаётся в работе. При
-    fragment.mode = "off" не переключают никого."""
+    """ТЗ R1 (0.1.18): при глушении по всей сети (ядро считает мёртвыми и других участников)
+    участник, который без дробления не отвечает (CONNECT_FAIL), не списывается — ему на месте
+    включают дробление ClientHello, и он остаётся в работе. Одиночный отказ при живых других —
+    замена сразу (анти-ТСПУ 2.0, test_tspu). При fragment.mode = "off" не переключают никого."""
     _started(dpi)
     member = next(info for info in dpi.view() if info.role == "proxy")
+    dpi.set_alive(**{
+        tag.replace("-", "_"): False for tag in dpi.tags("proxy") if tag != member.tag
+    })
     dpi.blocked.add(member.probe_tag)
     dpi.vetted.clear()  # первая проверка участника — снова
     _rescan(dpi)
