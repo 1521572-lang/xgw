@@ -145,7 +145,8 @@ class TrayConf:
 # каталогов: сайты со списками доступны только через VPN.
 FREE_POOL_MODES = ("off", "observe", "on")
 FREE_POOL_REGIONS = ("EU", "US", "ASIA", "auto")
-FREE_POOL_PROVIDERS = ("vpngate", "vpnbook")
+# igareck и mahdibland — списки серверов на GitHub (28.10.2026, после отчёта вехи М2а).
+FREE_POOL_PROVIDERS = ("vpngate", "vpnbook", "igareck", "mahdibland")
 # Источники, убранные из пула: VPNJantit — 28.10.2026 по отчёту вехи М1 (учётку выдаёт форма
 # сайта на 7 дней, без неё ни одного рабочего сервера).
 RETIRED_POOL_PROVIDERS = ("vpnjantit",)
@@ -163,8 +164,12 @@ class FreePoolConf:
     # Как часто опрашивать источники, минут (ТЗ R12: стартовые значения, не квоты сервисов).
     vpngate_refresh_min: int = 15
     vpnbook_refresh_min: int = 60
+    lists_refresh_min: int = 120  # списки GitHub: обновляются раз в 2–4 часа
     # Проверок кандидатов за шаг демона (наблюдение): по одной теневой пробе или TCP-проверке.
     checks_per_step: int = 2
+    # Проверок серверов списков GitHub за шаг — сверх checks_per_step и без бюджета трафика
+    # (решение заказчика 28.10.2026: экономия трафика для них не нужна); 0 — не проверять.
+    list_checks_per_step: int = 4
     # Бюджет трафика проверок пула за сутки, МБ (ТЗ R28): routine, из него защищённый резерв
     # проверок здоровья, плюс аварийный.
     budget_mb: int = 512
@@ -874,7 +879,8 @@ def _validate_free_pool(pool: FreePoolConf) -> list[str]:
     pool.providers = [item for item in pool.providers if item in FREE_POOL_PROVIDERS]
     for name, low, high in (
         ("vpngate_refresh_min", 5, 1440), ("vpnbook_refresh_min", 15, 1440),
-        ("checks_per_step", 1, 8),
+        ("lists_refresh_min", 30, 1440), ("checks_per_step", 1, 8),
+        ("list_checks_per_step", 0, 16),
         ("budget_mb", 64, 10240), ("health_reserved_mb", 16, 10240), ("emergency_mb", 0, 1024),
         ("max_instances", 1, 8), ("handshakes_per_hour", 0, 60), ("handshakes_per_day", 0, 500),
         ("provider_handshakes_per_hour", 0, 30),

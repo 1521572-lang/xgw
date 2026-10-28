@@ -1066,9 +1066,21 @@ def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
         logger.info("%s", outcome.text)
         print(outcome.text + ". Демон применит режим на ближайшем шаге")
         return 0
+    from .freepool import backend as backending
     from .freepool import pool as pooling
 
-    summary = pooling.FreePool(cfg, paths, logger=logger).summary()
+    # Сводка демона (её же показывает панель): только он знает, годится ли бэкенд OpenVPN.
+    # Отчёт М2а: своя сводка CLI писала «проверка туннелем недоступна: ещё не проверялся» при
+    # четырёх поднятых туннелях. Демона нет — своя, бэкенд проверяется здесь же (без уборки
+    # поколений: ими ведает демон).
+    max_age = max(3.0 * cfg.watchdog.interval_s, 180.0)
+    snapshot = None if _daemon_down(paths) else status.read_status(paths, max_age)
+    summary = (snapshot or {}).get("free_pool")
+    if not isinstance(summary, dict):
+        pool = pooling.FreePool(cfg, paths, logger=logger)
+        pool.backend_problem = (backending.unavailable(paths, cmd.run) if os.geteuid() == 0
+                                else "проверяет демон — запустите через sudo")
+        summary = pool.summary()
     if getattr(args, "json", False):
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:

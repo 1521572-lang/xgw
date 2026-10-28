@@ -3,6 +3,8 @@
     snapshots/<источник>.json      последний принятый снимок каталога (варианты, итог опроса)
     snapshots/<источник>.<n>.json  три прежних (R13)
     secrets.json (0600)            общие учётки источников (VPNBook)
+                                   (у серверов списков GitHub учётка — в самой ссылке, она в
+                                   снимке, и снимок тоже 0600)
     profiles/<вариант>.ovpn        профили VPNBook, скачанные кнопкой «Download» (М2а)
     candidates.json                состояние проверок вариантов (по variant_id)
 
@@ -83,6 +85,7 @@ def variant_from_dict(data: dict) -> Variant | None:
             usage_policy=tuple(data.get("usage_policy", ())), profile=profile,
             outbound=data.get("outbound"), source_url=data.get("source_url", ""),
             extra=tuple(tuple(item) for item in data.get("extra", ())),
+            singbox=data.get("singbox") if isinstance(data.get("singbox"), dict) else None,
         )
     except (KeyError, TypeError, ValueError):
         return None

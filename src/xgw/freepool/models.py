@@ -37,7 +37,8 @@ class Access(StrEnum):
 
 class Backend(StrEnum):
     OPENVPN = "openvpn"  # отдельный изолированный работник (веха М2)
-    XRAY = "xray"  # outbound Xray: VLESS, Trojan, Shadowsocks (Outline)
+    XRAY = "xray"  # outbound Xray: VLESS, VMess, Trojan, Shadowsocks (Outline, списки GitHub)
+    SINGBOX = "sing-box"  # только sing-box: Hysteria2, TUIC, AnyTLS (списки GitHub)
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,7 @@ class Variant:
 
     provider: str
     backend: str
-    protocol: str  # openvpn | shadowsocks | vless | trojan
+    protocol: str  # openvpn | shadowsocks | vless | vmess | trojan | hysteria2 | tuic | anytls
     host: str
     address: str  # IPv4 из каталога, если он есть
     port: int
@@ -66,6 +67,9 @@ class Variant:
     outbound: dict | None = None
     source_url: str = ""
     extra: tuple[tuple[str, str], ...] = field(default=())
+    # Сервер для sing-box (parsers.common.SingboxSpec словарём: main, endpoint, extra) — у тех,
+    # кого Xray не умеет.
+    singbox: dict | None = None
 
     @property
     def endpoint_id(self) -> str:
@@ -75,9 +79,10 @@ class Variant:
     def variant_id(self) -> str:
         if self.profile is not None:
             payload = self.profile.digest()
-        elif self.outbound is not None:
+        elif self.outbound is not None or self.singbox is not None:
             payload = hashlib.sha256(
-                json.dumps(self.outbound, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                json.dumps(self.outbound if self.outbound is not None else self.singbox,
+                           sort_keys=True, ensure_ascii=False).encode("utf-8")
             ).hexdigest()
         else:
             payload = ""

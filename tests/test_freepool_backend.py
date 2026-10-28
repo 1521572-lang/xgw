@@ -161,6 +161,9 @@ def test_socks_worker_listens_on_veth_with_a_password(tmp_path):
     assert inbound["settings"]["auth"] == "password" and inbound["settings"]["udp"] is True
     assert inbound["settings"]["accounts"] == [{"user": "xgw", "pass": "s" * 24}]
     assert config["outbounds"][0]["protocol"] == "freedom"
+    assert config["dns"]["servers"] == ["1.1.1.1", "8.8.8.8"]
+    with_server = agenting.socks_config(_manifest(tmp_path), ["10.8.0.1", "1.1.1.1", "10.8.0.1"])
+    assert with_server["dns"]["servers"] == ["10.8.0.1", "1.1.1.1"]
 
 
 def test_management_lines_and_pushed_options():
@@ -173,6 +176,12 @@ def test_management_lines_and_pushed_options():
             "ping 10,ping-restart 120,ifconfig 10.8.0.6 10.8.0.5,tun-mtu 1400,peer-id 0'")
     assert agenting.pushed(line) == ("10.8.0.6", 1400)
     assert agenting.pushed("Initialization Sequence Completed") == ("", 0)
+    # DNS сервера: в конфиг не принимается (pull-filter), но для работника — первым.
+    dns = ("PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option "
+           "DNS 127.0.0.1,dhcp-option DNS 10.250.1.1,dhcp-option DNS 8.8.4.4,dhcp-option DNS "
+           "9.9.9.9,ifconfig 10.8.0.6 10.8.0.5'")
+    assert agenting.pushed_dns(dns) == ["10.8.0.1", "8.8.4.4"]
+    assert agenting.pushed_dns("dhcp-option DNS 10.8.0.1") == []  # не из PUSH_REPLY
 
 
 def test_tunnel_address_from_the_server_is_untrusted(tmp_path):
@@ -197,6 +206,45 @@ def test_failure_codes_from_the_openvpn_journal():
                               "Connection refused"], "CONNECT_REFUSED") \
         == "TCP: connect to [AF_INET]<ip>:443 failed: Connection refused"
     assert agenting.evidence(["Initialization"], "AUTH_FAILED") == ""
+    # «No route to host» — ICMP с пути (или охрана: run решает по её счётчику), «Network is
+    # unreachable» — нет маршрута у себя (дефект шлюза). Отчёт М2а: оба были одним кодом.
+    assert agenting.classify(["TCP: connect to [AF_INET]1.0.0.1:1535 failed: No route to "
+                              "host"]) == "HOST_UNREACHABLE"
+    assert agenting.classify(["connect to [AF_INET]1.0.0.1:443 failed: Network is "
+                              "unreachable"]) == "NETWORK_UNREACHABLE"
+    # UNKNOWN — последняя строка с пометкой ошибки, без адресов и имён хостов.
+    assert agenting.evidence([
+        "OpenVPN 2.6.19 x86_64-pc-linux-gnu", "VERIFY OK: depth=0, CN=vpn12.opengw.net",
+        ">FATAL:Error: unexpected reply from 1.0.0.1, read /tmp/xgw-ovpn/client.conf",
+    ], "UNKNOWN") == ">FATAL:Error: unexpected reply from <ip>, read /tmp/xgw-ovpn/client.conf"
+    assert agenting.masked("VERIFY OK: depth=0, CN=vpn12.opengw.net") \
+        == "VERIFY OK: depth=0, CN=<host>"
+
+
+def test_inner_check_and_tunnel_counters_are_told_without_addresses():
+    """Проверка изнутри: вывод дочернего процесса → итоги по меткам (адреса DNS в журнал не
+    идут); DNS работника — ответившие первыми; счётчики fpt0 из `ip -s link`."""
+    servers = agenting.inner_servers(["10.8.0.1"])
+    assert servers == [("сервера", "10.8.0.1"), ("Cloudflare", "1.1.1.1")]
+    inner = agenting.parse_inner("tcp OPEN 120\ndns 10.8.0.1 TIMEOUT\ndns 1.1.1.1 OK 35\n",
+                                 servers)
+    assert inner == {"tcp": "OPEN 120", "dns": [["сервера", "TIMEOUT"], ["Cloudflare", "OK 35"]]}
+    assert agenting.inner_text(inner) == ("TCP Cloudflare:443 — OPEN (120 мс); DNS сервера — "
+                                          "TIMEOUT; DNS Cloudflare — OK (35 мс)")
+    assert agenting.worker_dns(servers, inner) == ["1.1.1.1", "10.8.0.1", "8.8.8.8"]
+    assert agenting.parse_inner("garbage", servers)["tcp"] == "—"
+    assert agenting.inner_servers(["1.1.1.1"]) == [("сервера", "1.1.1.1")]
+    text = ("5: fpt0: <POINTOPOINT,UP> mtu 1500 qdisc fq_codel state UNKNOWN\n"
+            "    link/none \n"
+            "    RX:  bytes packets errors dropped  missed   mcast\n"
+            "          2048       3      0       0       0       0\n"
+            "    TX:  bytes packets errors dropped carrier collsns\n"
+            "         10240      12      0       0       0       0\n")
+    stats = agenting.parse_link_stats(text)
+    assert stats == {"rx_bytes": 2048, "rx_packets": 3, "tx_bytes": 10240, "tx_packets": 12}
+    assert agenting.tunnel_text(stats) == ("в туннель 12 пакетов (10 КБ), из туннеля 3 пакетов "
+                                           "(2 КБ)")
+    assert agenting.parse_link_stats("5: fpt0: <UP>\n") is None
 
 
 # --- агент поколения: ход с подставными работниками -------------------------------------------
@@ -214,6 +262,12 @@ class _Runner:
         self.calls.append(tuple(argv))
         if argv[:3] == ["ip", "-o", "link"]:
             return "7: fpi3@if8: <BROADCAST,MULTICAST> mtu 1500\n"
+        if argv[:3] == ["ip", "-s", "link"]:
+            return ("5: fpt0: <POINTOPOINT,UP> mtu 1500\n    link/none\n"
+                    "    RX:  bytes packets errors dropped  missed   mcast\n"
+                    "             0       0      0       0       0       0\n"
+                    "    TX:  bytes packets errors dropped carrier collsns\n"
+                    "          4096       9      0       0       0       0\n")
         if argv[:3] == ["nft", "list", "counter"]:
             if self.grow:
                 self.refused += 1
@@ -250,15 +304,27 @@ class _Proc:
 
 
 class _Spawn:
-    def __init__(self, probe: str = "ENETUNREACH", openvpn_lines=()) -> None:
-        self.probe, self.openvpn_lines = probe, openvpn_lines
+    def __init__(self, probe: str = "ENETUNREACH", openvpn_lines=(),
+                 inner: str = "tcp TIMEOUT\ndns 1.1.1.1 TIMEOUT\n") -> None:
+        self.probe, self.openvpn_lines, self.inner = probe, openvpn_lines, inner
         self.workers: list[tuple[str, int, int]] = []
+        self.inner_args: list[tuple] = []
 
     def __call__(self, argv, **kwargs):
+        if argv[1] == "-I" and "recvfrom" in argv[3]:  # проверка изнутри
+            self.inner_args.append((tuple(argv[4:]), kwargs["user"]))
+            return _Proc(out=self.inner)
         if argv[1] == "-I":  # самопроверка охраны
             return _Proc(out=self.probe + "\n")
         self.workers.append((argv[0], kwargs["user"], kwargs["group"]))
         return _Proc(lines=self.openvpn_lines if argv[0].endswith("openvpn") else ())
+
+
+class _Ready:
+    """Порт SOCKS-работника открыт (подключение агента для проверки готовности)."""
+
+    def close(self) -> None:
+        pass
 
 
 def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None):
@@ -275,7 +341,9 @@ def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None):
     ours.settimeout(5.0)
     agent = agenting.Agent(
         paths, GEN, runner=runner or _Runner(), spawn=spawn or _Spawn(),
-        connect=lambda address, timeout: theirs, users=USERS.__getitem__,
+        connect=lambda address, timeout: theirs if address[1] == agenting.MGMT_PORT
+        else _Ready(),
+        users=USERS.__getitem__,
         tmp=tmp_path / "tmp", out=io.StringIO(),
     )
     (tmp_path / "tmp").mkdir()
@@ -291,10 +359,14 @@ def _start(agent) -> list[int]:
 
 
 def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, monkeypatch):
-    """Порядок: охрана → TUN с владельцем → «guarded» → veth → самопроверка → файлы работников
-    → работники от своих пользователей → маршрут по умолчанию только при CONNECTED; обрыв —
-    маршрут убран; остановка — фаза stopped."""
-    runner, spawn = _Runner(), _Spawn()
+    """Порядок: охрана → TUN с владельцем → «guarded» → veth → самопроверка → файлы OpenVPN →
+    OpenVPN от своего пользователя → при CONNECTED маршрут по умолчанию, проверка изнутри (от
+    пользователя SOCKS) и только затем SOCKS-работник с DNS сервера; обрыв — маршрут убран;
+    остановка — фаза stopped и итог туннеля в журнале."""
+    runner = _Runner()
+    spawn = _Spawn(openvpn_lines=["PUSH: Received control message: 'PUSH_REPLY,dhcp-option "
+                                  "DNS 10.8.0.1,ifconfig 10.8.0.6 10.8.0.5'"],
+                   inner="tcp OPEN 90\ndns 10.8.0.1 OK 20\ndns 1.1.1.1 TIMEOUT\n")
     agent, ours, chowned = _agent(tmp_path, monkeypatch, runner=runner, spawn=spawn)
     result = _start(agent)
     _wait(lambda: agent.state.get("phase") == "connecting")
@@ -305,19 +377,29 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
                         "group", "990")
     assert ("ip", "route", "add", f"{PEER}/32", "via", "10.250.3.1", "dev", "fpi3") in calls
     assert not any(call[:3] == ("ip", "route", "replace") for call in calls)
-    assert spawn.workers == [("/opt/xgw/xray/xray", 991, 991), ("/usr/sbin/openvpn", 990, 990)]
+    assert spawn.workers == [("/usr/sbin/openvpn", 990, 990)]  # SOCKS — только с туннелем
     assert agent.state["selftest"]["ok"] is True
     conf = tmp_path / "tmp" / "xgw-ovpn" / "client.conf"
     assert conf.read_text(encoding="utf-8").startswith("client\n")
     assert oct(conf.stat().st_mode & 0o777) == "0o640"
     assert (tmp_path / "tmp" / "xgw-ovpn" / "auth").read_text(encoding="utf-8") \
         == "fpuser\nFakePass77\n"
-    assert ("auth", 0, 990) in chowned and ("socks.json", 0, 991) in chowned
+    assert ("auth", 0, 990) in chowned and not (tmp_path / "tmp" / "xgw-socks").exists()
 
     ours.sendall(f">STATE:1730000000,CONNECTED,SUCCESS,10.8.0.6,{PEER},1194,,\n".encode())
     _wait(lambda: agent.state.get("phase") == "up")
     assert ("ip", "addr", "add", "10.8.0.6/32", "dev", "fpt0") in runner.calls
-    assert runner.calls[-1] == ("ip", "route", "replace", "default", "dev", "fpt0")
+    assert ("ip", "route", "replace", "default", "dev", "fpt0") in runner.calls
+    assert spawn.inner_args == [(("10.8.0.1", "1.1.1.1"), 991)]
+    assert agent.state["inner"]["tcp"] == "OPEN 90"
+    assert spawn.workers == [("/usr/sbin/openvpn", 990, 990), ("/opt/xgw/xray/xray", 991, 991)]
+    socks = json.loads((tmp_path / "tmp" / "xgw-socks" / "socks.json").read_text(
+        encoding="utf-8"))
+    assert socks["dns"]["servers"] == ["10.8.0.1", "1.1.1.1", "8.8.8.8"]
+    assert ("socks.json", 0, 991) in chowned
+    journal = agent.out.getvalue()
+    assert "через туннель: TCP Cloudflare:443 — OPEN (90 мс); DNS сервера — OK (20 мс)" \
+        in journal and "10.8.0.1" not in journal
     ours.sendall(b">STATE:1730000001,RECONNECTING,ping-restart,,,,,\n")
     _wait(lambda: agent.state.get("phase") == "reconnecting")
     assert ("ip", "route", "del", "default", "dev", "fpt0") in runner.calls
@@ -326,6 +408,31 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
     assert result == [0] and agent.state["phase"] == "stopped"
     saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
     assert saved["phase"] == "stopped" and "FakePass77" not in json.dumps(saved)
+    assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"] == 0
+    assert ("итог туннеля: в туннель 9 пакетов (4 КБ), из туннеля 0 пакетов (0 КБ); ошибок "
+            "канала данных 0; охрана отбила после подъёма 0") in agent.out.getvalue()
+
+
+def test_guard_refusal_before_the_tunnel_is_a_gateway_defect(tmp_path, monkeypatch):
+    """«No route to host» при подключении: счётчик охраны вырос — GUARD_BLOCKED (дефект шлюза);
+    не вырос — HOST_UNREACHABLE (ICMP с пути к серверу, не дефект)."""
+    lines = ["TCP: connect to [AF_INET]1.0.0.1:1535 failed: No route to host"]
+    for grow, code in ((True, "GUARD_BLOCKED"), (False, "HOST_UNREACHABLE")):
+        (tmp_path / code).mkdir()
+        runner = _Runner(grow=grow)
+        agent, ours, _chowned = _agent(tmp_path / code, monkeypatch, runner=runner,
+                                       spawn=_Spawn(openvpn_lines=lines))
+        if grow:  # самопроверка с растущим счётчиком: отказы — «охраной»
+            agent._selftest = lambda manifest, ids: {}
+        result = _start(agent)
+        _wait(lambda agent=agent: agent.state.get("phase") == "connecting" and agent.log)
+        assert ours.recv(64).startswith(b"state on\n")  # непрочитанное — RST вместо закрытия
+        ours.close()  # OpenVPN закрыл управление
+        agent.thread.join(5)
+        assert result == [3] and agent.state["reason"] == code
+        journal = agent.out.getvalue()
+        assert "OpenVPN: TCP: connect to [AF_INET]<ip>:1535 failed: No route to host" in journal
+        assert ("охрана отбила за подключение" in journal) is grow
 
 
 def test_tunnel_address_is_taken_from_push_reply_when_state_has_none(tmp_path, monkeypatch):
@@ -615,6 +722,10 @@ class _Runtime:
     def counters(self, lease) -> int:
         return 700_000
 
+    def state(self, lease) -> dict:  # что агент записал к концу пробы
+        return {"phase": "up", "inner": {"tcp": "TIMEOUT", "dns": [["Cloudflare", "TIMEOUT"]]},
+                "tun": {"tx_packets": 30, "tx_bytes": 2048, "rx_packets": 0, "rx_bytes": 0}}
+
     def stop(self, lease) -> None:
         self.stopped.append(lease.gen)
 
@@ -666,6 +777,11 @@ def test_openvpn_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     assert (summary["tunnels_up"], summary["handshakes_hour"], summary["ready"]) == (1, 1, 1)
     assert summary["openvpn_backend"] == "" and summary["by_region"] == {"EU": 1}
     assert pool.spent_today() == 700_000
+    # Что агент видел изнутри — в записи кандидата и журнале демона, без адресов.
+    [record] = [value for key, value in pool.store.candidates().items()
+                if not key.startswith("_")]
+    assert record["diagnosis"] == ("TCP Cloudflare:443 — TIMEOUT; DNS Cloudflare — TIMEOUT; "
+                                   "в туннель 30 пакетов (2 КБ), из туннеля 0 пакетов (0 КБ)")
     # Предел подключений в час (1) исчерпан — второй сервер ждёт, а не подключается.
     assert pool.check_some(mark=2, xray_bin=Path("/opt/xgw/xray/xray")) == 0
     assert len(runtime.prepared) == 1

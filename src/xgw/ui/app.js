@@ -1459,7 +1459,10 @@
   const CHECK_LEVELS = { OK: ["on", "в порядке"], WARN: ["warn", "внимание"], FAIL: ["rec", "ошибка"] };
 
   // Бесплатный пул (docs/FREEPOOL-PLAN.md, веха М1): наблюдение — трафик идёт через подписку.
-  const POOL_SOURCES = { vpngate: "VPN Gate", vpnbook: "VPNBook" };
+  const POOL_SOURCES = {
+    vpngate: "VPN Gate", vpnbook: "VPNBook",
+    igareck: "GitHub igareck (проверены в России)", mahdibland: "GitHub mahdibland",
+  };
   const POOL_STATUS = {
     SUCCESS: "ок", PARTIAL: "частично", UNAVAILABLE: "недоступен", RATE_LIMITED: "просит реже",
     SCHEMA_CHANGED: "формат изменился", DISABLED: "выключен",
@@ -1473,7 +1476,7 @@
     $("pool-toggle").textContent = on ? "Выключить" : "Включить наблюдение";
     $("pool-refresh").hidden = !on;
     if (!on) {
-      $("pool-text").textContent = "Альтернативный режим: серверы VPN Gate и VPNBook вместо подписки. Наблюдение собирает их списки через подписку и проверяет серверы, а трафик идёт как прежде — через подписку.";
+      $("pool-text").textContent = "Альтернативный режим: бесплатные серверы (списки GitHub, VPN Gate, VPNBook) вместо подписки. Наблюдение собирает их списки через подписку и проверяет серверы, а трафик идёт как прежде — через подписку.";
       fill($("pool-sources"), [], "");
       return;
     }
@@ -1485,7 +1488,8 @@
       const openvpn = sum.openvpn_backend
         ? `OpenVPN — ${sum.openvpn} (туннелем не проверить: ${sum.openvpn_backend}; адрес открыт — ${sum.reachable_openvpn}, закрыт — ${sum.closed})`
         : `OpenVPN — ${sum.openvpn}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}`;
-      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: ключей Outline — ${sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ.`;
+      const bySource = Object.entries(sum.ready_by_source || {}).map(([name, count]) => `${POOL_SOURCES[name] || name} — ${count}`).join(", ");
+      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
       fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },
         el("div", { class: "row-main" },
           el("div", { class: "row-title" }, el("span", { text: POOL_SOURCES[src.id] || src.id }),
