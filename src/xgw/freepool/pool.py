@@ -32,6 +32,7 @@ from ..paths import Paths
 from . import backend as backending
 from . import ovpn, ovpnconf, providers, regions
 from . import probe as probing
+from . import traffic as trafficking
 from .models import Access, Backend, ProviderResult, Status, Variant
 from .store import PoolStore
 
@@ -246,9 +247,7 @@ class FreePool:
         return [variant for variant in found if variant.access == Access.FREE]
 
     def wanted_regions(self) -> list[str]:
-        pool = self.cfg.free_pool
-        extra = pool.fallback_regions if pool.region_policy == "preferred" else []
-        return [pool.region, *[item for item in extra if item != pool.region]]
+        return trafficking.wanted_regions(self.cfg)
 
     def _in_region(self, country: str) -> bool:
         return any(regions.allowed(country, region) for region in self.wanted_regions())
@@ -597,6 +596,9 @@ def render(summary: dict, now: float) -> str:
     lines.append(f"Трафик проверок за сутки: {summary.get('spent_mb', 0)} из "
                  f"{summary.get('budget_mb', 0)} МБ; серверы списков GitHub — "
                  f"{summary.get('lists_spent_mb', 0)} МБ (без предела)")
+    flow = summary.get("traffic")
+    if isinstance(flow, dict):
+        lines.append(trafficking.text(flow))
     for source in summary.get("sources") or []:
         when = source.get("retrieved_at")
         age = f"список {int((now - float(when)) // 60)} мин назад" if when else "списка ещё нет"

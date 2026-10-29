@@ -259,13 +259,23 @@ POOL_MODE_TEXT = {
 }
 
 
-def set_pool_mode(paths: Paths, store_path, mode: str) -> Outcome:
-    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге). В этой версии —
-    off или observe: трафик через пул (on) — следующая веха (docs/FREEPOOL-PLAN.md)."""
+def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool = False,
+                  ) -> Outcome:
+    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге): off или observe.
+    Весь дом через пул (on) — веха М2б.2 (docs/FREEPOOL-PLAN.md). Устройства «через
+    бесплатные серверы» (М2б.1) при выключенном пуле закрыты: панель (refuse_closing) тогда
+    не выключает, команда выключает и говорит об этом."""
     from . import managed
 
     if mode not in POOL_MODE_TEXT:
-        return Outcome(2, "режим — off или observe (трафик через пул — в следующей версии)")
+        return Outcome(2, "режим — off или observe (весь дом через пул — в следующей версии)")
+    stored, _problem = managed.load(store_path)
+    via_pool = [item.get("name") or item.get("ip") for item in stored.get("routes") or []
+                if item.get("server") == managed.POOL_ROUTE]
+    if mode == "off" and via_pool and refuse_closing:
+        return Outcome(2, "Через бесплатные серверы идёт устройство «" + "», «".join(via_pool)
+                       + "»: без пула у него закроются зарубежные сайты. Сначала верните его "
+                       "на подписку в списке устройств (сервер: авто), потом выключайте")
     try:
         changed = managed.set_free_pool_mode(store_path, mode)
     except managed.ManagedError as exc:
@@ -276,7 +286,11 @@ def set_pool_mode(paths: Paths, store_path, mode: str) -> Outcome:
         with open_store(paths) as store:
             store.add_event("freepool", "бесплатный пул: наблюдение включено" if mode == "observe"
                             else "бесплатный пул выключен")
-    return Outcome(0, POOL_MODE_TEXT[mode])
+    text = POOL_MODE_TEXT[mode]
+    if mode == "off" and via_pool:
+        text += (". Устройства через бесплатные серверы (" + ", ".join(via_pool) + ") остались "
+                 "без зарубежных сайтов — верните их на подписку в списке устройств панели")
+    return Outcome(0, text)
 
 
 # --- ядро сервера ----------------------------------------------------------------------

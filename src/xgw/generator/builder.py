@@ -23,6 +23,11 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+# Бесплатный пул (веха М2б.1): устройства с «Бесплатные серверы» в панели — балансировщиком
+# «pool» из допущенных серверов пула (freepool/traffic.py). Все они мертвы или их нет —
+# выход «block»: у такого устройства закрыто, а не подписка и не прямой WAN (R05).
+POOL_BALANCER = "pool"
+POOL_PREFIX = "pool-"
 # API Xray — Unix-сокет в каталоге службы xgw-xray (RuntimeDirectory), а не порт на 127.0.0.1:
 # к порту мог подключиться любой процесс машины (ASSUMPTIONS п. 253). Стенд и тесты под
 # XGW_ROOT передают свой путь (engine.assemble — paths.xray_api_socket).
@@ -34,6 +39,7 @@ API_SOCKET = "/run/xgw-xray/api.sock"
 # правил (devices_down) — через API ядра, как любое изменение routing.
 TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
+_POOL_TAG_RE = re.compile(r"^pool-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
 
 
@@ -47,7 +53,7 @@ class NodeInfo:
     tag: str
     probe_tag: str
     probe_port: int
-    role: str  # proxy | spare
+    role: str  # proxy | spare | pool
     fragment: bool = False  # соединение идёт через дробление ClientHello (fragment.py)
     # Профиль обхода (profiles.py): каким ядром и как ведётся сервер.
     profile: str = profiling.XRAY_DEFAULT
@@ -77,6 +83,9 @@ class BuildResult:
     nodes: list[NodeInfo]
     chain_tags: list[str]
     fallback_tag: str
+    # Серверы бесплатного пула (балансировщик «pool», роль pool): отдельно от участников и
+    # запасных подписки — их счёт, замены и замеры демона пул не задевает.
+    pool: list[NodeInfo] = field(default_factory=list)
 
 
 def is_junk(address: str, port: int) -> bool:
@@ -426,6 +435,32 @@ def _allocate_ports(
     return ports
 
 
+def applied_pool(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
+    """Серверы бесплатного пула в работающем ядре (теги pool-*): как applied_nodes, но для
+    балансировщика «pool». fingerprint — полный, если сервер однозначно нашёлся среди nodes,
+    иначе hex-часть тега."""
+    _password, ports = probe_state(config)
+    result: list[NodeInfo] = []
+    if not isinstance(config, Mapping):
+        return result
+    for outbound in config.get("outbounds") or []:
+        if not isinstance(outbound, Mapping):
+            continue
+        match = _POOL_TAG_RE.match(str(outbound.get("tag") or ""))
+        if not match:
+            continue
+        country, prefix = match.groups()
+        found = {node.fingerprint for node in nodes
+                 if node.country == country and node.fingerprint.startswith(prefix)}
+        result.append(NodeInfo(
+            fingerprint=found.pop() if len(found) == 1 else prefix,
+            tag=f"pool-{country}-{prefix}", probe_tag=f"probe-{country}-{prefix}",
+            probe_port=ports.get(f"probe-{country}-{prefix}", 0), role="pool",
+            fragment=fragmenting.used(outbound), profile=outbound_profile(outbound),
+        ))
+    return result
+
+
 def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
     """Участники и запасные так, как они заведены в работающем ядре: теги, роли
     и порты проб из применённого конфига. Нужны демону и CLI — следить за
@@ -637,6 +672,8 @@ def build(
     devices_down: Collection[str] = (),
     avoid_ports: Collection[int] = (),
     api_listen: str = API_SOCKET,
+    pool: Sequence[ServerNode] = (),
+    pool_devices: Sequence[str] = (),
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
@@ -647,6 +684,10 @@ def build(
     если её перезапуск отложен); входы bridge обходятся и так.
 
     api_listen — где слушает API Xray: путь сокета (API_SOCKET) или «адрес:порт».
+
+    pool — допущенные серверы бесплатного пула (freepool/traffic.py), pool_devices — адреса
+    устройств, которые идут через них (веха М2б.1): балансировщик «pool», правило по адресу
+    после прямых доменов; pool пуст — правило в «block» (закрыто, R05).
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -672,9 +713,12 @@ def build(
     password = probe_password or secrets.token_urlsafe(24)
 
     ordered = list(selection.members) + list(selection.spares)
-    suffixes = assign_suffixes(ordered)
+    taken = {node.fingerprint for node in ordered}
+    pooled = [node for node in pool if node.fingerprint not in taken]
+    suffixes = assign_suffixes([*ordered, *pooled])
     ports = _allocate_ports(
-        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg,
+        [f"probe-{suffixes[node.fingerprint]}" for node in [*ordered, *pooled]],
+        probe_ports or {}, cfg,
         avoid={*avoid_ports, *(bridge.ports.values() if bridge is not None else ())},
     )
 
@@ -692,9 +736,21 @@ def build(
             )
         )
 
+    pool_infos = [
+        NodeInfo(
+            fingerprint=node.fingerprint,
+            tag=f"{POOL_PREFIX}{suffixes[node.fingerprint]}",
+            probe_tag=f"probe-{suffixes[node.fingerprint]}",
+            probe_port=ports[f"probe-{suffixes[node.fingerprint]}"],
+            role="pool",
+        )
+        for node in pooled
+    ]
+    every = [*nodes, *pool_infos]
+
     outbounds: list[dict] = []
     mode = cfg.fragment.mode
-    for info, node in zip(nodes, ordered, strict=True):
+    for info, node in zip(every, [*ordered, *pooled], strict=True):
         profile = (profile_of or {}).get(node.fingerprint)
         if profile is None:
             wanted = mode == "always" or (mode != "off" and node.fingerprint in fragment)
@@ -731,9 +787,9 @@ def build(
         _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
         outbounds.append(outbound)
-    if any(info.fragment for info in nodes):
+    if any(info.fragment for info in every):
         outbounds.append(fragmenting.outbound(cfg))
-    if any(info.profile == profiling.XRAY_SPLIT for info in nodes):
+    if any(info.profile == profiling.XRAY_SPLIT for info in every):
         outbounds.append(fragmenting.split_outbound(cfg))
     outbounds.extend(
         [
@@ -760,7 +816,7 @@ def build(
             "port": info.probe_port,
             "settings": {"accounts": [{"user": PROBE_USER, "pass": password}]},
         }
-        for info in nodes
+        for info in every
     ]
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
     # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
@@ -832,7 +888,7 @@ def build(
     direct_dns = [_dns_server(server) for server in cfg.dns.direct_servers]
     rules: list[dict] = [
         {"type": "field", "inboundTag": [info.probe_tag], "outboundTag": info.tag}
-        for info in nodes
+        for info in every
     ]
     if capture:
         rules.append(
@@ -863,6 +919,14 @@ def build(
         {"type": "field", "source": [ip], "outboundTag": tag}
         for ip, tag in device_routes(cfg, nodes, devices_down)
     )
+    # Устройства через бесплатный пул (М2б.1) — тоже после прямых доменов; серверов пула нет —
+    # закрыто: через подписку такое устройство не идёт (решение заказчика 29.10.2026).
+    if pool_devices:
+        rules.append(
+            {"type": "field", "source": list(pool_devices), "balancerTag": POOL_BALANCER}
+            if pool_infos else
+            {"type": "field", "source": list(pool_devices), "outboundTag": "block"}
+        )
     if cfg.routing.proxy_domains:
         rules.append(
             {
@@ -927,10 +991,19 @@ def build(
                     "strategy": {"type": "leastPing"},
                     "fallbackTag": fallback_tag,
                 },
+                *([{
+                    "tag": POOL_BALANCER,
+                    "selector": [POOL_PREFIX],
+                    "strategy": {"type": "leastPing"},
+                    "fallbackTag": "block",
+                }] if pool_infos else []),
             ],
         },
         "burstObservatory": {
-            "subjectSelector": ["proxy-"],
+            # Пробы ядра для пула — по наличию устройств через него, а не серверов: секция
+            # burstObservatory меняется только перезапуском Xray, и пропадание серверов пула
+            # не должно рвать соединения всего дома.
+            "subjectSelector": ["proxy-", *([POOL_PREFIX] if pool_devices else [])],
             "pingConfig": {
                 "destination": probe_url or cfg.probe.url,
                 "connectivity": "",
@@ -946,4 +1019,5 @@ def build(
         nodes=nodes,
         chain_tags=[node.keep_tag or "" for node in selection.chains],
         fallback_tag=fallback_tag,
+        pool=pool_infos,
     )

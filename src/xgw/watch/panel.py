@@ -96,6 +96,12 @@ MANUAL = "manual"  # источник серверов, заданных отд�
 # Свой сервер устройства демон применяет сразу, не дожидаясь окна перезапуска (отчёт Ф4).
 ROUTE_RESTART = ("Применяется сразу; если для этого нужен перезапуск Xray, соединения всех "
                  "устройств прервутся на пару секунд")
+# Устройство через бесплатный пул (М2б.1): что владельцы серверов видят и что будет без них.
+POOL_ROUTE_NOTE = ("Владельцы бесплатных серверов неизвестны и видят, к каким сайтам идёт "
+                   "устройство: содержимое сайтов с https защищено, без https — нет. Российские "
+                   "домены (.ru, .su, .рф) — напрямую, как у всех")
+POOL_ROUTE_CLOSED = ("Пока бесплатных серверов нет, зарубежные сайты у устройства закрыты: "
+                     "через подписку оно не пойдёт")
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
 # остановка демона (по умолчанию в http.server — 0,5 с).
 # Панель — по 127.0.0.1 и по tailnet (Tailscale Serve): соединений сразу не больше, чем нужно
@@ -1467,13 +1473,27 @@ class Panel:
             return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
         if address not in gateway.network or address == gateway.ip:
             return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        if server == managed.POOL_ROUTE:
+            # Устройство через бесплатный пул (веха М2б.1): серверы пула проверяет наблюдение.
+            if cfg.free_pool.mode == "off":
+                return actions.Outcome(
+                    2, "Сначала включите наблюдение в карточке «Бесплатные серверы»: без него "
+                       "шлюз не проверяет бесплатные серверы, и устройству идти некуда")
+            return self._apply_devices(
+                store_path,
+                lambda: managed.set_route(store_path, mac, str(address),
+                                          name if lan.valid_hostname(name) else "",
+                                          managed.POOL_ROUTE),
+                f"Устройство «{label}» идёт через бесплатные серверы",
+                (POOL_ROUTE_NOTE, POOL_ROUTE_CLOSED, ROUTE_RESTART),
+            )
         _snapshot, _xray_ok, members, spares = self._core(time.time())
         rows, _gone = self._servers(members, spares)
         row = next((row for row in rows if row["fingerprint"] == server
                     and row["status"] in ("member", "spare", "waiting")), None)
         if row is None:
             return actions.Outcome(2, "этого сервера нет среди включённых — обновите страницу")
-        name = (found or {}).get("name") or (lease.name if lease else "")
         return self._apply_devices(
             store_path,
             lambda: managed.set_route(
@@ -1735,7 +1755,8 @@ class Panel:
             self._wake()
             return actions.Outcome(0, "Ссылка сервера убрана")
         if name == "freepool/mode":
-            outcome = actions.set_pool_mode(self.paths, store_path, str(body.get("mode") or ""))
+            outcome = actions.set_pool_mode(self.paths, store_path, str(body.get("mode") or ""),
+                                            refuse_closing=True)
             if outcome.ok:
                 self._wake()
             return outcome

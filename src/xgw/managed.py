@@ -36,6 +36,12 @@ SERVER_MODES = ("enabled", "disabled", "removed")
 # Ядро, закреплённое за сервером вручную (`xgw core`, переключатель в панели); «auto» не хранится.
 CORE_PINS = ("xray", "sing-box")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
+# Сервер устройства — бесплатный пул (веха М2б.1, freepool/traffic.py), а не сервер подписки.
+POOL_ROUTE = "pool"
+
+
+def _route_ok(server: str) -> bool:
+    return bool(_FINGERPRINT_RE.fullmatch(server)) or server == POOL_ROUTE
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 # Имя шлюза в tailnet (Self.DNSName без точки): «gw.tail1234.ts.net».
@@ -406,7 +412,7 @@ def _routes(value: object) -> list[dict]:
     for entry in value if isinstance(value, list) else []:
         server = entry.get("server") if isinstance(entry, dict) else None
         mac = normalize_mac(entry.get("mac")) if isinstance(entry, dict) else None
-        if mac and isinstance(server, str) and _FINGERPRINT_RE.fullmatch(server):
+        if mac and isinstance(server, str) and _route_ok(server):
             servers.setdefault(mac, server)
     return [{**item, "server": servers[item["mac"]]} for item in _devices(value)
             if item["mac"] in servers]
@@ -418,7 +424,7 @@ def set_route(path: Path, mac: str, ip: str, name: str, server: str) -> bool:
     mac_ok = normalize_mac(mac)
     if mac_ok is None:
         raise ManagedError("неверный MAC устройства")
-    if server and not _FINGERPRINT_RE.fullmatch(server):
+    if server and not _route_ok(server):
         raise ManagedError("неверный сервер")
 
     def change(data: dict) -> bool:

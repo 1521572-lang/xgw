@@ -47,11 +47,12 @@ from .apply.rotation import (
     preferred_members,
 )
 from .config import Config, parse_seconds, probe_bytes
+from .freepool import traffic
 from .freepool.pool import FreePool
 from .generator import builder
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
-from .generator.builder import BALANCER_TAG, NodeInfo
+from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
 from .model import ServerNode
 from .net import tun
 from .net.capture import capture_inbounds
@@ -208,6 +209,13 @@ CORES_RECHECK = 600.0
 # Расход: ~8 КБ × 2 в минуту ≈ 23 МБ в сутки на сервер (status.probe_budget, devices).
 DEVICE_CHECK = scan.DEVICE_CHECK
 DEVICE_STREAK = 2
+# Устройства через бесплатный пул (М2б.1, _pool_step): допущенные серверы пула проверяются раз
+# в POOL_CHECK; пересборка ради них — не чаще POOL_OPEN, если у устройств закрыто, а допущенные
+# есть (сборка могла их не принять — без паузы она шла бы каждую минуту), иначе не чаще
+# POOL_REBUILD. Умерший закреплённый сменяется сразу — закреплением другого живого, без сборки.
+POOL_CHECK = 60.0
+POOL_OPEN = 180.0
+POOL_REBUILD = 600.0
 # Сетевая задержка (RTT, п. 2.3): у запасных — по их сканам, у участников — дешёвым запросом
 # через probe-inbound раз в RTT_EVERY (по одному за шаг; ~8 КБ на проверку). Замер старше
 # RTT_KEEP в рейтинге не учитывается (meta «rtt»: отпечаток → {"ms", "ts"}).
@@ -532,6 +540,16 @@ class Daemon:
         self._device_streak: dict[str, tuple[bool, int]] = {}
         self._device_checked: dict[str, float] = {}
         self._device_dead: set[str] = set()
+        # Устройства через бесплатный пул (_pool_step): закреплённый тег «pool» и по какому
+        # применённому конфигу он закреплён (время файла: перезапуск и смена routing снимают
+        # закрепление), когда проверены допущенные и пересобран конфиг ради них, имена
+        # серверов пула по тегу и сводка для состояния.
+        self._pool_pinned = ""
+        self._pool_pin_key = 0.0
+        self._pool_checked_at = 0.0
+        self._pool_rebuilt_at = 0.0
+        self._pool_names: dict[str, tuple[str, str]] = {}
+        self._pool_traffic: dict | None = None
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
         # чтобы все проверки уложились в probe.max_daily_probe_mb (ДОП-4).
@@ -857,6 +875,12 @@ class Daemon:
         self._device_streak = dict(previous._device_streak)
         self._device_checked = dict(previous._device_checked)
         self._device_dead = set(previous._device_dead)
+        self._pool_pinned = previous._pool_pinned
+        self._pool_pin_key = previous._pool_pin_key
+        self._pool_checked_at = previous._pool_checked_at
+        self._pool_rebuilt_at = previous._pool_rebuilt_at
+        self._pool_names = dict(previous._pool_names)
+        self._pool_traffic = previous._pool_traffic
         self._health = previous._health
         self._observed = dict(previous._observed)
         self._rebalance_at = previous._rebalance_at
@@ -1103,6 +1127,7 @@ class Daemon:
         self._containers_appeared(applied)
         if signals.xray_ok:
             self._device_step(view, applied, observatory)
+            self._pool_step(applied, observatory or {})
             self._rtt_step(view, applied, observatory)
         if not changed and self._urgent_rebuild and self.inventory is not None:
             # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
@@ -2500,6 +2525,101 @@ class Daemon:
             self.log.error("не записан %s: %s", self.paths.devices_down_file, exc)
             return
         self._urgent_rebuild = self._urgent_rebuild or "свой сервер устройства: проверка сервера"
+
+    # --- устройства через бесплатный пул (М2б.1) --------------------------------------
+
+    def _pool_step(self, applied: dict, observatory: dict) -> None:
+        """Устройства через бесплатный пул (freepool/traffic.py). Закреплённый сервер
+        балансировщика «pool» — живой по пробам ядра с меньшей задержкой; держится, пока жив
+        (без прыжков между серверами, как основной с 0.1.9); умер — следующий живой; живых
+        нет — закрепление снято, и балансировщик ведёт в block: у устройств закрыто (R05)."""
+        devices = traffic.pool_devices(self.cfg)
+        now = self.wall()
+        if devices and now - self._pool_checked_at >= POOL_CHECK:
+            self._pool_checked_at = now
+            self._pool_due(applied, now)
+        pool = builder.applied_pool(applied)
+        if not devices:
+            self._pool_pinned, self._pool_traffic = "", None
+            return
+        alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
+        current = self._pool_pinned if any(info.tag == self._pool_pinned for info in alive) else ""
+        if not current and alive:
+            current = min(alive, key=lambda info: (
+                (observatory.get(info.tag) or {}).get("delay") or 1e9, info.tag)).tag
+        try:
+            key = self.paths.xray_config_file.stat().st_mtime
+        except OSError:
+            key = 0.0
+        was_closed = self._pool_traffic.get("closed") if self._pool_traffic else None
+        if current != self._pool_pinned or (current and key != self._pool_pin_key):
+            try:
+                if current:
+                    self.api.pin(POOL_BALANCER, current)
+                elif self._pool_pinned and pool:  # без серверов нет и балансировщика «pool»
+                    self.api.unpin(POOL_BALANCER)
+            except ApiError as exc:
+                self.log.warning("сервер бесплатного пула не закреплён: %s", exc)
+                return
+            if current != self._pool_pinned:
+                self.notifier.event("freepool", self._pool_change_text(current, pool, devices))
+            self._pool_pinned, self._pool_pin_key = current, key
+        elif not alive and was_closed is not True:
+            self.notifier.event("freepool", self._pool_change_text("", pool, devices))
+        name, country = self._pool_names.get(current, ("", ""))
+        self._pool_traffic = {
+            "devices": devices, "members": len(pool), "alive": len(alive),
+            "closed": not alive, "server": name, "country": country, "tag": current,
+            "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
+            if current else 0,
+        }
+
+    def _pool_change_text(self, current: str, pool: list[NodeInfo], devices: list[str]) -> str:
+        who = ", ".join(devices)
+        if current:
+            name, country = self._pool_names.get(current, (current, ""))
+            return (f"бесплатный пул: устройства {who} идут через «{name}»"
+                    + (f" ({country})" if country else ""))
+        if not pool:
+            return f"бесплатный пул: допущенных серверов нет — у устройств {who} закрыто"
+        return f"бесплатный пул: все серверы пула молчат — у устройств {who} закрыто"
+
+    def _pool_due(self, applied: dict, now: float) -> None:
+        """Допущенные серверы пула против применённого состава «pool»: у устройств закрыто, а
+        допущенные есть, — сборка не чаще POOL_OPEN; сервер выпал из допущенных или есть место
+        для новых — не чаще POOL_REBUILD. Состав выбирает engine.assemble."""
+        try:
+            found = traffic.admitted(self.cfg, self.paths, now)
+        except (OSError, ValueError) as exc:
+            self.log.error("бесплатный пул: допущенные серверы не прочитаны: %s", exc)
+            return
+        infos = builder.applied_pool(applied, [item.node for item in found])
+        names = {item.node.fingerprint: (item.node.name, item.node.country.upper())
+                 for item in found}
+        for info in infos:
+            if info.fingerprint in names:
+                self._pool_names[info.tag] = names[info.fingerprint]
+        applied_fps = {info.fingerprint for info in infos}
+        lost = [info for info in infos if info.fingerprint not in names]
+        room = len(infos) < traffic.MEMBERS and bool(set(names) - applied_fps)
+        if not infos and found:
+            reason, pause = "бесплатный пул: состав серверов для устройств", POOL_OPEN
+        elif lost or room:
+            reason, pause = "бесплатный пул: обновление серверов для устройств", POOL_REBUILD
+        else:
+            return
+        if now - self._pool_rebuilt_at < pause:
+            return
+        self._pool_rebuilt_at = now
+        self._urgent_rebuild = self._urgent_rebuild or reason
+
+    def _pool_summary(self) -> dict | None:
+        """Сводка пула для состояния и панели; с устройствами через пул — и их «traffic»."""
+        if self.cfg.free_pool.mode == "off" or self._freepool_summary is None:
+            return None
+        if self._pool_traffic is None:
+            return self._freepool_summary
+        return {**self._freepool_summary, "traffic": self._pool_traffic}
 
     # --- сетевая задержка (RTT, п. 2.3) ----------------------------------------------
 
@@ -4937,7 +5057,7 @@ class Daemon:
             ),
             whitelist={"since": self.whitelist_since, "offer": self._whitelist_offer(view)}
             if self.whitelist_since is not None else None,
-            free_pool=self._freepool_summary if self.cfg.free_pool.mode != "off" else None,
+            free_pool=self._pool_summary(),
         )
         spent = json.dumps(self.guard.spent, sort_keys=True)
         if spent != self.store.get_meta(speedguard.META_SPENT):

@@ -1195,6 +1195,46 @@ class Diag:
                       "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
 
     def _free_pool(self) -> list[Check]:
+        return [*self._free_pool_backend(), *self._pool_traffic()]
+
+    def _pool_traffic(self) -> list[Check]:
+        """Устройства через бесплатный пул (М2б.1): их правило в рабочем конфиге ведёт в
+        балансировщик «pool» из серверов пула или в block (закрыто), но не в подписку; в
+        балансировщике подписки серверов пула нет."""
+        from .freepool import traffic as fptraffic
+
+        devices = fptraffic.pool_devices(self.cfg)
+        if not devices:
+            return []
+        name = "Устройства через бесплатный пул"
+        who = ", ".join(devices)
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        routing = applied.get("routing") or {}
+        rules = [rule for rule in routing.get("rules") or []
+                 if isinstance(rule, dict) and set(devices) <= set(rule.get("source") or [])]
+        pool = builder.applied_pool(applied)
+        auto = next((item for item in routing.get("balancers") or []
+                     if isinstance(item, dict) and item.get("tag") == BALANCER_TAG), {})
+        if any(str(prefix).startswith(builder.POOL_PREFIX)
+               for prefix in auto.get("selector") or []):
+            return [Check(name, FAIL, "серверы пула попали в балансировщик подписки",
+                          "sudo systemctl restart xgw")]
+        if not rules:
+            return [Check(name, FAIL, f"{who}: правила в рабочем конфиге нет — устройство идёт "
+                                      "через подписку", "подождите минуту и повторите; снова "
+                                      "так — sudo systemctl restart xgw")]
+        rule = rules[0]
+        if rule.get("outboundTag") == "block":
+            why = ("наблюдение выключено" if self.cfg.free_pool.mode == "off"
+                   else "допущенных серверов нет")
+            return [Check(name, WARN, f"{who}: закрыто — {why}",
+                          "вернуть на подписку — «Сервер: авто» в списке устройств панели")]
+        if rule.get("balancerTag") != builder.POOL_BALANCER or not pool:
+            return [Check(name, FAIL, f"{who}: правило ведёт не в бесплатный пул",
+                          "sudo systemctl restart xgw")]
+        return [Check(name, OK, f"{who}: через бесплатный пул, серверов в «pool»: {len(pool)}")]
+
+    def _free_pool_backend(self) -> list[Check]:
         """Бесплатный пул (docs/FREEPOOL-PLAN.md): режим и годится ли бэкенд OpenVPN — без
         него серверы OpenVPN проверяются только доступностью адреса; при включённом ufw — есть
         ли правило для veth поколений (fpv+), иначе ufw отбросит их соединения."""

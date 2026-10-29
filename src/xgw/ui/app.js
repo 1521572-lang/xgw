@@ -1046,7 +1046,10 @@
         label: row.multiplier ? `${row.name} · лимит ×${row.multiplier}` : row.name,
       }));
     const direct = s.kernel_direct || {};
-    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices, direct)),
+    // Бесплатный пул (М2б.1): выбор есть, пока наблюдение включено (пул проверяет серверы).
+    const freePool = s.free_pool || { mode: "off" };
+    const pool = { on: freePool.mode !== "off", flow: (freePool.summary || {}).traffic || null };
+    fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices, direct, pool)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
     $("records-block").hidden = !records.files.length;
     fill($("records"), records.files.map(recordRow));
@@ -1128,13 +1131,19 @@
 
   // Переключатель — «VPN для этого устройства»: включён по умолчанию. Устройство,
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
-  // Свой сервер устройства (Ф4): «Авто» — как у всех, через основной сервер.
-  function routeSelect(device, choices) {
+  // Свой сервер устройства (Ф4): «Авто» — как у всех, через основной сервер. «Бесплатные
+  // серверы» — через бесплатный пул (М2б.1): пул пуст — у устройства закрыто, не подписка.
+  const POOL_ROUTE_TEXT = "Владельцы бесплатных серверов неизвестны и видят, к каким сайтам идёт устройство: содержимое сайтов с https защищено, без https — нет. Российские домены (.ru, .su, .рф) — напрямую, как у всех. Пока бесплатных серверов нет, зарубежные сайты у устройства закрыты: через подписку оно не пойдёт. Вернуть — «Сервер: авто».";
+
+  function routeSelect(device, choices, pool) {
     const name = device.name || device.mac;
     const select = el("select", { class: "prio route", "aria-label": `Сервер для устройства ${name}`,
       title: "Через какой сервер идёт это устройство. Недоступен — временно через основной" });
     select.append(el("option", { value: "", text: "Сервер: авто" }));
-    let known = !device.route;
+    if (pool.on || device.route === "pool") {
+      select.append(el("option", { value: "pool", text: "Бесплатные серверы" }));
+    }
+    let known = !device.route || device.route === "pool";
     for (const choice of choices) {
       known = known || choice.fingerprint === device.route;
       select.append(el("option", { value: choice.fingerprint, text: choice.label }));
@@ -1143,13 +1152,31 @@
     select.value = device.route || "";
     select.addEventListener("change", () => {
       const before = device.route || "";
-      act("device/route", { mac: device.mac, server: select.value }, select)
-        .then((ok) => { if (!ok) select.value = before; });
+      const wanted = select.value;
+      const send = () => act("device/route", { mac: device.mac, server: wanted }, select)
+        .then((ok) => { select.value = ok ? wanted : before; });
+      if (wanted === "pool") {
+        select.value = before;
+        confirmRemove(`Пустить «${name}» через бесплатные серверы?`, POOL_ROUTE_TEXT, send,
+          "Через бесплатные", "primary");
+        return;
+      }
+      send();
     });
     return select;
   }
 
-  function deviceRow(device, active, now, choices, direct) {
+  // Метка устройства через бесплатный пул: закрыто — пул выключен, серверов нет или все молчат.
+  function poolTag(pool) {
+    const closed = !pool.on || Boolean(pool.flow && pool.flow.closed);
+    return closed
+      ? { cls: "tag warn", text: "бесплатные серверы · закрыто",
+          title: "Бесплатных серверов сейчас нет (или наблюдение выключено): зарубежные сайты у устройства закрыты, пока они не появятся. Вернуть на подписку — «Сервер: авто»" }
+      : { cls: "tag on", text: "бесплатные серверы",
+          title: pool.flow && pool.flow.server ? `Сейчас через «${pool.flow.server}»${pool.flow.country ? ` (${pool.flow.country})` : ""}` : "" };
+  }
+
+  function deviceRow(device, active, now, choices, direct, pool) {
     const title = el("div", { class: "row-title" }, el("span", { text: device.name || "без имени" }));
     if (device.offline) title.append(el("span", { class: "tag", text: "не в сети" }));
     if (active && active.mac === device.mac) {
@@ -1177,15 +1204,17 @@
       el("div", { class: "row-main" }, title,
         el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` }),
         device.bypass ? null
-          : el("div", { class: "picks" }, routeSelect(device, choices), directSelect(device, direct))),
-      el("span", {
-        class: device.bypass ? "tag warn" : "tag on",
-        text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")
-          : (device.route ? (device.route_down ? "свой сервер молчит · через основной"
-            : "свой сервер") : "через VPN"),
-        title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml"
-          : (device.route_down ? "Свой сервер устройства не отвечает проверкам шлюза — пока он молчит, устройство идёт через основной; вернётся само" : ""),
-      }),
+          : el("div", { class: "picks" }, routeSelect(device, choices, pool), directSelect(device, direct))),
+      !device.bypass && device.route === "pool"
+        ? el("span", { class: poolTag(pool).cls, text: poolTag(pool).text, title: poolTag(pool).title })
+        : el("span", {
+          class: device.bypass ? "tag warn" : "tag on",
+          text: device.bypass ? (locked ? "мимо VPN · config.toml" : "мимо VPN")
+            : (device.route ? (device.route_down ? "свой сервер молчит · через основной"
+              : "свой сервер") : "через VPN"),
+          title: locked ? "Задано в network.bypass_hosts: поменять можно только в config.toml"
+            : (device.route_down ? "Свой сервер устройства не отвечает проверкам шлюза — пока он молчит, устройство идёт через основной; вернётся само" : ""),
+        }),
       el("div", { class: "row-tools" }, recordTool(device, active, now), control));
   }
 
@@ -1469,6 +1498,19 @@
     RESOURCE_LIMIT: "слишком большой ответ",
   };
 
+  // Устройства через бесплатные серверы (М2б.1) — фраза в карточке пула.
+  function poolFlowText(flow, devices) {
+    if (!flow) return "";
+    const names = (flow.devices || []).map((ip) => {
+      const found = (devices || []).find((device) => device.ip === ip);
+      return found && found.name ? found.name : ip;
+    }).join(", ");
+    if (flow.closed) {
+      return ` Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. Вернуть на подписку — «Сервер: авто» в списке устройств.`;
+    }
+    return ` Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
+  }
+
   function renderPool(s) {
     const pool = s.free_pool || { mode: "off" };
     const on = pool.mode !== "off";
@@ -1489,7 +1531,7 @@
         ? `OpenVPN — ${sum.openvpn} (туннелем не проверить: ${sum.openvpn_backend}; адрес открыт — ${sum.reachable_openvpn}, закрыт — ${sum.closed})`
         : `OpenVPN — ${sum.openvpn}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки OpenVPN после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
       const bySource = Object.entries(sum.ready_by_source || {}).map(([name, count]) => `${POOL_SOURCES[name] || name} — ${count}`).join(", ");
-      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
+      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.${poolFlowText(sum.traffic, s.devices)}`;
       fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },
         el("div", { class: "row-main" },
           el("div", { class: "row-title" }, el("span", { text: POOL_SOURCES[src.id] || src.id }),

@@ -1117,6 +1117,10 @@ def render_status(status: dict) -> str:
             + (f" ({regions})" if regions else "")
             + f"; трафик проверок {pool.get('spent_mb', 0)} из {pool.get('budget_mb', 0)} МБ"
         )
+        if isinstance(pool.get("traffic"), dict):
+            from ..freepool import traffic as fptraffic
+
+            lines.append(fptraffic.text(pool["traffic"]))
     whitelist = status.get("whitelist")
     if isinstance(whitelist, dict):
         offer = whitelist.get("offer") if isinstance(whitelist.get("offer"), dict) else None
