@@ -3,15 +3,20 @@
 
 Форматы сверены с настоящими ответами 28.10.2026 (очищенные образцы — tests/fixtures/freepool):
 
-VPN Gate — официальный CSV api/iphone: строка-маркер `*vpn_servers`, заголовок `#HostName,…`,
-строки, замыкающая `*`. Профиль OpenVPN — base64 в последнем столбце. Каталог частичный
-(authoritative = False): пропавшая строка не значит, что сервер умер (R13).
+VPN Gate (веха М2в, 29.10.2026: OpenVPN убран из XGW — решение заказчика) — страница списка
+серверов www.vpngate.net/en/ (сверена с настоящей 29.10.2026, ~210 КБ, 100 серверов): таблица с
+заголовком «DDNS hostname», строки — по 10 ячеек `<td class='vg_table_row_…'>`, заголовок
+повторяется через каждые десять. Ячейки: флаг страны (`images/flags/JP.png`), имя DDNS
+(*.opengw.net) и IPv4, сессии и время работы, скорость и задержка, SSL-VPN, L2TP/IPsec,
+OpenVPN, MS-SSTP («SSTP Hostname : имя[:порт]», порт 443 не пишется), оператор, счёт. Берутся
+только серверы с SSTP (TLS по TCP; у OpenVPN и L2TP в CSV-каталоге и на странице — нет: ТСПУ
+распознаёт их по протоколу). Вход — общий «vpn»/«vpn» (страница howto_sstp.aspx). Каталог
+частичный (authoritative = False): VPN Gate показывает каждому свою часть списка, пропавшая
+строка не значит, что сервер умер (R13).
 
 VPNBook — сайт на Next.js: данные страницы — в `self.__next_f.push([1,"…"])` (JSON-строки).
-OpenVPN: массив `"servers":[{id, name, hostname, ipAddress, countryCode, countryName}]`, общая
-учётка на все серверы («Username … Password … Last updated: …»), профиль — официальная кнопка
-«Download» страницы: /api/openvpn?hostname=…&protocol=…&ip=… (протоколы tcp443, tcp80, udp53,
-udp25000 — из скрипта страницы). Outline: «connectionString»: ss://…@хост:443/?outline=1.
+Берутся только ключи Outline: «connectionString»: ss://…@хост:443/?outline=1 (страница OpenVPN
+и её общая учётка — не нужны с М2в).
 
 Списки GitHub (решение заказчика 28.10.2026, после отчёта М2а) — текстовые файлы со ссылками
 серверов по одной в строке, строки «# …» — пояснения (как у подписок; бывает и base64 целиком).
@@ -29,8 +34,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-import csv
-import io
+import html
 import ipaddress
 import itertools
 import json
@@ -39,7 +43,6 @@ import unicodedata
 from collections import Counter
 
 from .. import fetch, masking
-from . import ovpn
 from .models import Access, Backend, ProviderResult, Status, Variant
 
 VPNGATE = "vpngate"
@@ -49,11 +52,10 @@ MAHDIBLAND = "mahdibland"
 LIST_PROVIDERS = (IGARECK, MAHDIBLAND)  # списки GitHub: проверки — без бюджета трафика
 PROVIDERS = (VPNGATE, VPNBOOK, *LIST_PROVIDERS)
 
-VPNGATE_URL = "https://www.vpngate.net/api/iphone/"
-VPNBOOK_OPENVPN_URL = "https://www.vpnbook.com/freevpn/openvpn"
+VPNGATE_URL = "https://www.vpngate.net/en/"
+# Общий вход SSTP у всех серверов VPN Gate (www.vpngate.net/en/howto_sstp.aspx) — не секрет.
+VPNGATE_USER = VPNGATE_PASSWORD = "vpn"
 VPNBOOK_OUTLINE_URL = "https://www.vpnbook.com/freevpn/outline-vpn"
-VPNBOOK_PROFILE_URL = "https://www.vpnbook.com/api/openvpn"
-VPNBOOK_PROTOCOLS = ("tcp443", "tcp80", "udp53", "udp25000")
 GITHUB_RAW = "raw.githubusercontent.com"
 _IGARECK = f"https://{GITHUB_RAW}/igareck/vpn-configs-for-russia/main/"
 LIST_URLS = {
@@ -66,7 +68,7 @@ MAX_LIST_LINES = 5000
 MAX_LIST_VARIANTS = 2000
 MAX_LINK = 8192
 
-# Доверенные хосты каждого источника (R09): каталог, профили и перенаправления — только сюда.
+# Доверенные хосты каждого источника (R09): каталог и перенаправления — только сюда.
 ORIGINS = {
     VPNGATE: frozenset(("www.vpngate.net",)),
     VPNBOOK: frozenset(("www.vpnbook.com",)),
@@ -75,11 +77,14 @@ ORIGINS = {
 }
 
 MAX_ROWS = 2000
-MAX_B64 = 400_000  # профиль до 256 КиБ в base64
-VPNGATE_REQUIRED = (
-    "HostName", "IP", "Score", "Ping", "Speed", "CountryShort", "NumVpnSessions", "Uptime",
-    "OpenVPN_ConfigData_Base64",
-)
+# Заголовок таблицы серверов: у таблицы сессий на той же странице (с тем же id) его нет.
+_VG_MARKER = "DDNS hostname"
+_VG_ROW = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
+_VG_CELL = re.compile(r"<td\b[^>]*>(.*?)</td>", re.S | re.I)
+_VG_FLAG = re.compile(r"flags/([A-Z]{2})\.png")
+_VG_BREAK = re.compile(r"<br\s*/?>|</?p\b[^>]*>|</span>|</a>", re.I)
+_VG_TAG = re.compile(r"<[^>]*>")
+_VG_SSTP = "SSTP Hostname"
 _FLIGHT = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
 _HOST = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
 _IPV4 = re.compile(r"(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}")
@@ -104,81 +109,106 @@ def _int(value: str) -> int:
 # --- VPN Gate ---------------------------------------------------------------------------------
 
 
+def _cell_lines(cell: str) -> list[str]:
+    """Ячейка таблицы → строки текста: разрывы (<br>, абзац, конец span и ссылки) — новые строки,
+    теги убраны, сущности HTML раскрыты, пустые — выброшены."""
+    text = _VG_TAG.sub("", _VG_BREAK.sub("\n", cell))
+    return [line for line in (" ".join(html.unescape(raw).split()) for raw in text.split("\n"))
+            if line]
+
+
+def _number(text: str) -> float:
+    """Первое число строки («1,171,661.52 GB», «158.22 Mbps», «Ping: 12 ms»); 0 — нет."""
+    match = re.search(r"\d[\d,]*(?:\.\d+)?", text or "")
+    return float(match.group(0).replace(",", "")) if match else 0.0
+
+
+def _sstp_endpoint(cell: str, host: str) -> tuple[int, str]:
+    """Ячейка MS-SSTP → (порт, ""), или (0, почему не годится). Имя SSTP — то же, что имя DDNS
+    сервера: иное — не доверять строке."""
+    lines = _cell_lines(cell)
+    for position, line in enumerate(lines):
+        if line.startswith(_VG_SSTP):
+            value = line.split(":", 1)[1].strip() if ":" in line else ""
+            if not value and position + 1 < len(lines):
+                value = lines[position + 1]
+            name, _colon, port_text = value.lower().partition(":")
+            if name != host:
+                return 0, "имя SSTP не совпадает с именем сервера"
+            port = int(port_text) if port_text.isdigit() else (443 if not port_text else 0)
+            if not 0 < port < 65536:
+                return 0, "неверный порт SSTP"
+            return port, ""
+    return 0, "нет SSTP"
+
+
 def parse_vpngate(text: str, *, now: float, url: str = VPNGATE_URL) -> ProviderResult:
-    """CSV VPN Gate → варианты OpenVPN. Схема не та — SCHEMA_CHANGED (прежний снимок остаётся);
-    нет замыкающей `*` — PARTIAL (документ обрезан)."""
+    """Страница списка VPN Gate → варианты SSTP. Таблицы серверов нет — SCHEMA_CHANGED (прежний
+    снимок остаётся); нет её конца — PARTIAL (документ обрезан)."""
     result = ProviderResult(VPNGATE, Status.SCHEMA_CHANGED, retrieved_at=now)
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines or lines[0].strip() != "*vpn_servers":
-        result.detail = "нет строки-маркера *vpn_servers"
+    marker = text.find(_VG_MARKER)
+    start = text.rfind("<table", 0, marker) if marker >= 0 else -1
+    if start < 0:
+        result.detail = "нет таблицы серверов («DDNS hostname»)"
         return result
-    if len(lines) < 2 or not lines[1].startswith("#"):
-        result.detail = "нет заголовка #HostName,…"
-        return result
-    complete = lines[-1].strip() == "*"
-    body = [line for line in lines[1:] if line.strip() and line.strip() != "*"]
-    rows = list(csv.reader(io.StringIO("\n".join(body)[1:])))
+    end = text.find("</table>", marker)
+    complete = end >= 0
+    table = text[start: end if complete else len(text)]
+    rows = [row for row in _VG_ROW.findall(table) if "vg_table_row" in row]
     if not rows:
-        result.detail = "пустой заголовок"
+        result.detail = "в таблице нет строк серверов"
         return result
-    header = rows[0]
-    index = {name: position for position, name in enumerate(header)}
-    missing = [name for name in VPNGATE_REQUIRED if name not in index]
-    if missing:
-        result.detail = "нет столбцов: " + ", ".join(missing)
-        return result
-    if len(rows) - 1 > MAX_ROWS:
+    if len(rows) > MAX_ROWS:
         result.status = Status.RESOURCE_LIMIT
         result.detail = f"строк больше {MAX_ROWS}"
         return result
     reasons: Counter[str] = Counter()
-    for row in rows[1:]:
-        if len(row) < len(header):
-            reasons["строка короче заголовка"] += 1
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        cells = _VG_CELL.findall(row)
+        if len(cells) != 10:
+            reasons["строка не из 10 ячеек"] += 1
             continue
-        field = {name: row[position] for name, position in index.items()}
-        encoded = field["OpenVPN_ConfigData_Base64"].strip()
-        if not encoded or len(encoded) > MAX_B64:
-            reasons["нет профиля или он слишком большой"] += 1
+        flag = _VG_FLAG.search(cells[0])
+        country = flag.group(1) if flag else ""
+        names = _cell_lines(cells[1])
+        host = _host(names[0]) if names else ""
+        address = _ipv4(names[1]) if len(names) > 1 else ""
+        if not host or "." not in host or not address:
+            reasons["нет имени или адреса сервера"] += 1
             continue
-        try:
-            profile_text = base64.b64decode(encoded, validate=True).decode("utf-8")
-            profile = ovpn.parse(profile_text)
-        except (binascii.Error, ValueError):
-            reasons["профиль не base64/UTF-8"] += 1
+        port, why = _sstp_endpoint(cells[7], host)
+        if why:
+            reasons[why] += 1
             continue
-        except ovpn.OvpnRejected as exc:
-            reasons[str(exc)] += 1
+        if (host, port) in seen:
+            reasons["повтор"] += 1
             continue
-        country = field.get("CountryShort", "").strip().upper()
-        speed = _int(field.get("Speed", ""))
+        seen.add((host, port))
+        sessions, quality = _cell_lines(cells[2]), _cell_lines(cells[3])
+        speed = _number(quality[0]) if quality else 0.0
+        ping = next((_number(line) for line in quality if line.startswith("Ping")), 0.0)
         hints = (
-            ("ping_ms", str(_int(field.get("Ping", "")))),
-            ("speed_mbps", f"{speed / 1e6:.1f}"),
-            ("score", str(_int(field.get("Score", "")))),
-            ("sessions", str(_int(field.get("NumVpnSessions", "")))),
-            ("uptime_days", str(_int(field.get("Uptime", "")) // 86_400_000)),
+            ("ping_ms", str(int(ping))),
+            ("speed_mbps", f"{speed:.1f}"),
+            ("score", str(int(_number(" ".join(_cell_lines(cells[9])))))),
+            ("sessions", str(int(_number(sessions[0])) if sessions else 0)),
+            ("uptime_days", str(int(_number(sessions[1])) if len(sessions) > 1
+                                and "day" in sessions[1] else 0)),
         )
-        for remote in profile.remotes:
-            address = _ipv4(remote.host) or _ipv4(field.get("IP", ""))
-            result.variants.append(Variant(
-                provider=VPNGATE, backend=Backend.OPENVPN, protocol="openvpn",
-                host=_host(remote.host) if not _ipv4(remote.host) else "",
-                address=address, port=remote.port, transport=remote.proto,
-                name=f"VPN Gate {country} {field.get('HostName', '').strip()[:32]}",
-                country_hint=country if re.fullmatch(r"[A-Z]{2}", country) else "",
-                access=Access.FREE, hints=hints, credential_scope="",
-                profile=profile, source_url=url,
-            ))
+        result.variants.append(Variant(
+            provider=VPNGATE, backend=Backend.SSTP, protocol="sstp", host=host,
+            address=address, port=port, transport="tcp",
+            name=f"VPN Gate {country} {host.split('.', 1)[0][:32]}",
+            country_hint=country, access=Access.FREE, hints=hints, source_url=url,
+        ))
     result.rejected = sum(reasons.values())
     result.rejections = dict(reasons)
     result.complete_response = complete
     result.authoritative = False
     result.status = Status.SUCCESS if complete else Status.PARTIAL
     if not complete:
-        result.detail = "нет замыкающей строки «*» — документ обрезан"
+        result.detail = "нет конца таблицы серверов — документ обрезан"
     return result
 
 
@@ -194,89 +224,6 @@ def _flight(page: str) -> str:
         except ValueError:
             continue
     return "".join(parts)
-
-
-def _servers(flight: str) -> list[dict]:
-    """Массив "servers":[…] данных страницы; пусто — не найден."""
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'"servers":\[', flight):
-        try:
-            value, _end = decoder.raw_decode(flight, match.end() - 1)
-        except ValueError:
-            continue
-        if isinstance(value, list) and all(isinstance(item, dict) for item in value):
-            return value
-    return []
-
-
-def vpnbook_credentials(flight: str) -> dict[str, str]:
-    """Общая учётка VPNBook на все серверы: {username, password, updated}; пусто — нет.
-    Значения — в отрисованных элементах страницы: «Username», значение, «Password», значение,
-    затем «Last updated: …»."""
-    end = flight.find("Last updated: ")
-    if end < 0:
-        return {}
-    strings = re.findall(r'"children":"([^"]{1,64})"', flight[max(0, end - 2500): end + 80])
-    found: dict[str, str] = {}
-    for position, value in enumerate(strings[:-1]):
-        if value == "Username":
-            found["username"] = strings[position + 1]
-        elif value == "Password":
-            found["password"] = strings[position + 1]
-    updated = re.search(r"Last updated: ([A-Z][a-z]{2} \d{1,2}, \d{4})", flight[end: end + 60])
-    if updated:
-        found["updated"] = updated.group(1)
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", found.get("username", "")) or not re.fullmatch(
-            r"[A-Za-z0-9._!@#$%^&*-]{1,64}", found.get("password", "")):
-        return {}
-    return found
-
-
-def parse_vpnbook_openvpn(page: str, *, now: float) -> ProviderResult:
-    """Страница OpenVPN VPNBook → серверы (вариантов пока без профиля: профиль качается
-    отдельно для отобранных, needs="profile") и общая учётка."""
-    result = ProviderResult(VPNBOOK, Status.SCHEMA_CHANGED, retrieved_at=now)
-    flight = _flight(page)
-    servers = _servers(flight)
-    if not servers:
-        result.detail = 'нет массива "servers" в данных страницы'
-        return result
-    credentials = vpnbook_credentials(flight)
-    if credentials:
-        result.credentials["vpnbook"] = credentials
-    for item in servers:
-        host = _host(str(item.get("hostname") or ""))
-        server_id = str(item.get("id") or "")
-        country = str(item.get("countryCode") or "").upper()
-        if not host or not re.fullmatch(r"[a-z]{2}\d{1,4}", server_id):
-            result.rejected += 1
-            continue
-        for protocol in VPNBOOK_PROTOCOLS:
-            transport, port = protocol[:3], int(protocol[3:])
-            result.variants.append(Variant(
-                provider=VPNBOOK, backend=Backend.OPENVPN, protocol="openvpn", host=host,
-                address=_ipv4(str(item.get("ipAddress") or "")), port=port, transport=transport,
-                name=f"VPNBook {item.get('name') or server_id} {protocol}",
-                country_hint=country if re.fullmatch(r"[A-Z]{2}", country) else "",
-                access=Access.FREE, needs="profile", credential_scope="vpnbook",
-                source_url=VPNBOOK_OPENVPN_URL,
-                extra=(("server_id", server_id), ("protocol", protocol)),
-            ))
-    result.complete_response = True
-    result.authoritative = True  # страница перечисляет все свои бесплатные серверы
-    result.status = Status.SUCCESS
-    if not credentials:
-        result.detail = "учётка на странице не найдена — профили без неё не подключатся"
-    return result
-
-
-def vpnbook_profile_query(variant: Variant) -> dict[str, str]:
-    """Параметры официальной кнопки «Download» для профиля этого варианта."""
-    extra = dict(variant.extra)
-    query = {"hostname": variant.host, "protocol": extra.get("protocol", "")}
-    if variant.address:
-        query["ip"] = variant.address
-    return query
 
 
 def parse_vpnbook_outline(page: str, *, now: float) -> ProviderResult:

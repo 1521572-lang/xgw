@@ -1,10 +1,11 @@
-"""Бэкенд OpenVPN бесплатного пула со стороны демона (веха М2а, docs/FREEPOOL-PLAN.md).
+"""Туннельный бэкенд бесплатного пула со стороны демона (веха М2а; с М2в туннель — SSTP вместо
+OpenVPN, docs/FREEPOOL-PLAN.md).
 
 Поколение — одна служба xgw-fp@<gen> (агент в своём пространстве имён, agent.py) и пара veth.
 Демон (хост, CAP_NET_ADMIN) делает то, что вне пространства имён агента:
 
-  • задание поколения — /run/xgw/fp/<gen>/manifest.json (root, 0600): конфиг OpenVPN,
-    собранный заново из профиля (ovpnconf.py), учётка, пароль SOCKS;
+  • задание поколения — /run/xgw/fp/<gen>/manifest.json (root, 0600): адрес, порт и имя
+    сервера SSTP, общий вход источника, пароль SOCKS;
   • адрес сервера в наборе fp_peers таблицы ip xgw (адрес . протокол . порт): из fpv* в
     интернет — только к нему (net/nft.py); список — /run/xgw/fp/peers.json, чтобы полная
     перезагрузка таблицы его не потеряла;
@@ -34,7 +35,13 @@ from . import agent as agenting
 
 UNIT = "xgw-fp@{gen}.service"
 UNIT_FILE = "xgw-fp@.service"
-OPENVPN_BIN = Path("/usr/sbin/openvpn")
+# Пакет Ubuntu sstp-client (тянет ppp): sstpc, pppd и модуль pppd для ключей MS-CHAPv2 — в
+# каталоге модулей своей версии pppd.
+SSTPC_BIN = Path("/usr/sbin/sstpc")
+PPPD_BIN = Path("/usr/sbin/pppd")
+PPPD_PLUGINS = Path("/usr/lib/pppd")
+PLUGIN = "sstp-pppd-plugin.so"
+PPP_DEVICE = Path("/dev/ppp")  # создаёт kmod-static-nodes; модуль ppp_generic ядро грузит само
 START_WAIT = 10.0
 # Сверх срока агента: veth, самопроверка, проверка изнутри (INNER_WAIT 12 с) и запуск
 # работника (SOCKS_WAIT 5 с). Отчёт М2а.1: в коммит М2а.1 не попало — оставалось 20 с.
@@ -58,8 +65,8 @@ class Lease:
     gen: str
     index: int
     peer: str
-    proto: str
     port: int
+    proto: str = "tcp"  # SSTP — только TCP (TLS)
     started: float = 0.0
     pid: int = 0
     socks_pass: str = ""
@@ -91,17 +98,22 @@ def peer_elements(paths: Paths) -> tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
-def unavailable(paths: Paths, runner: cmd.Runner, *, openvpn: Path = OPENVPN_BIN,
-                users: Callable[[str], object] | None = None,
+def unavailable(paths: Paths, runner: cmd.Runner, *, sstpc: Path = SSTPC_BIN,
+                pppd: Path = PPPD_BIN, plugins: Path = PPPD_PLUGINS,
+                ppp_device: Path = PPP_DEVICE, users: Callable[[str], object] | None = None,
                 proc_sys: Path = Path("/proc/sys")) -> str:
-    """Почему бэкенд OpenVPN сейчас не годится; пусто — годится. Без OpenVPN, пользователей
-    работников, файла службы, пересылки IPv4 (трафик туннеля идёт из fpv* в WAN через хост) или
-    набора fp_peers в загруженной таблице XGW (без него из fpv* ничего не выйдет) проверять
-    нечем."""
-    if not openvpn.exists():
-        return "нет OpenVPN (пакет openvpn — ставит xgw install)"
+    """Почему бэкенд SSTP сейчас не годится; пусто — годится. Без sstpc, pppd и его модуля
+    sstp-pppd-plugin.so, /dev/ppp, пользователей работников, файла службы, пересылки IPv4
+    (трафик туннеля идёт из fpv* в WAN через хост) или набора fp_peers в загруженной таблице
+    XGW (без него из fpv* ничего не выйдет) проверять нечем."""
+    if not sstpc.exists() or not pppd.exists():
+        return "нет клиента SSTP (пакет sstp-client — ставит xgw install)"
+    if not any(plugins.glob(f"*/{PLUGIN}")):
+        return f"нет модуля pppd {PLUGIN} (пакет sstp-client)"
+    if not ppp_device.exists():
+        return "нет устройства /dev/ppp (модуль ядра ppp_generic)"
     lookup = users or _getpwnam
-    for name in (agenting.OVPN_USER, agenting.SOCKS_USER):
+    for name in (agenting.VPN_USER, agenting.SOCKS_USER):
         try:
             lookup(name)
         except KeyError:
@@ -157,21 +169,21 @@ class Backend:
                 return index
         raise BackendError("RESOURCE_LIMIT", "нет свободного номера veth")
 
-    def prepare(self, *, peer: str, proto: str, port: int, openvpn_conf: str, auth: str,
-                lan: tuple[str, ...], xray_bin: Path, openvpn_bin: Path = OPENVPN_BIN) -> Lease:
+    def prepare(self, *, peer: str, port: int, host: str, user: str, password: str,
+                lan: tuple[str, ...], xray_bin: Path, sstpc_bin: Path = SSTPC_BIN) -> Lease:
         """Задание, адрес в fp_peers, veth, служба; возвращается сразу после запуска службы
         (подключение — wait)."""
         gen = secrets.token_hex(5)
-        lease = Lease(gen=gen, index=self._index(), peer=peer, proto=proto, port=port,
+        lease = Lease(gen=gen, index=self._index(), peer=peer, port=port,
                       socks_pass=secrets.token_urlsafe(24))
         directory = agenting.run_dir(self.paths, gen)
         directory.mkdir(parents=True, mode=0o700)
         directory.chmod(0o700)
         atomic_write_json(agenting.manifest_path(self.paths, gen), {
-            "gen": gen, "index": lease.index, "peer": peer, "proto": proto, "port": port,
-            "openvpn_conf": openvpn_conf, "auth": auth,
+            "gen": gen, "index": lease.index, "peer": peer, "port": port, "host": host,
+            "user": user, "password": password,
             "socks_pass": lease.socks_pass, "lan": list(lan),
-            "xray_bin": str(xray_bin), "openvpn_bin": str(openvpn_bin),
+            "xray_bin": str(xray_bin), "sstpc_bin": str(sstpc_bin),
         }, mode=0o600)
         self.leases[gen] = lease
         try:

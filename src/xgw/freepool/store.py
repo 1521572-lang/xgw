@@ -1,12 +1,12 @@
 """Хранилище бесплатного пула: /var/lib/xgw/freepool (0700, root).
 
     snapshots/<источник>.json      последний принятый снимок каталога (варианты, итог опроса)
-    snapshots/<источник>.<n>.json  три прежних (R13)
-    secrets.json (0600)            общие учётки источников (VPNBook)
-                                   (у серверов списков GitHub учётка — в самой ссылке, она в
-                                   снимке, и снимок тоже 0600)
-    profiles/<вариант>.ovpn        профили VPNBook, скачанные кнопкой «Download» (М2а)
+    snapshots/<источник>.<n>.json  три прежних (R13); у серверов списков GitHub учётка — в
+                                   самой ссылке, она в снимке, и снимок тоже 0600
     candidates.json                состояние проверок вариантов (по variant_id)
+
+До вехи М2в (OpenVPN убран 29.10.2026) здесь были secrets.json (учётка VPNBook) и profiles/
+(профили OpenVPN) — retire_openvpn удаляет их, а из снимков и проверок — варианты OpenVPN.
 
 Снимок принимается атомарно (запись во временный файл и переименование). Итог опроса с ошибкой
 (UNAVAILABLE, SCHEMA_CHANGED, RATE_LIMITED…) снимок не заменяет: остаётся прежний (last-good), а
@@ -16,15 +16,16 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 
-from ..paths import Paths, atomic_write_json, atomic_write_text
-from .models import ProviderResult, Status, Variant
-from .ovpn import OvpnProfile, Remote
+from ..paths import Paths, atomic_write_json
+from .models import Backend, ProviderResult, Status, Variant
 
 KEEP_SNAPSHOTS = 3
 ACCEPTED = (Status.SUCCESS, Status.PARTIAL)
+KNOWN_BACKENDS = frozenset(str(item) for item in Backend)
 
 
 def root(paths: Paths) -> Path:
@@ -44,45 +45,21 @@ def variant_to_dict(variant: Variant) -> dict:
     data["hints"] = [list(item) for item in variant.hints]
     data["extra"] = [list(item) for item in variant.extra]
     data["usage_policy"] = list(variant.usage_policy)
-    if variant.profile is not None:
-        profile = asdict(variant.profile)
-        profile["remotes"] = [asdict(remote) for remote in variant.profile.remotes]
-        profile["ciphers"] = list(variant.profile.ciphers)
-        profile["managed"] = list(variant.profile.managed)
-        profile["tuning"] = [list(item) for item in variant.profile.tuning]
-        data["profile"] = profile
     return data
 
 
 def variant_from_dict(data: dict) -> Variant | None:
+    """Вариант из снимка; None — не разобрать или бэкенда больше нет (OpenVPN до М2в)."""
+    if str(data.get("backend") or "") not in KNOWN_BACKENDS:
+        return None
     try:
-        profile = data.get("profile")
-        if isinstance(profile, dict):
-            profile = OvpnProfile(
-                remotes=tuple(Remote(**remote) for remote in profile["remotes"]),
-                ciphers=tuple(profile["ciphers"]), auth=profile["auth"], ca=profile["ca"],
-                cert=profile.get("cert", ""), key=profile.get("key", ""),
-                tls_auth=profile.get("tls_auth", ""), tls_crypt=profile.get("tls_crypt", ""),
-                key_direction=profile.get("key_direction", ""),
-                needs_password=bool(profile.get("needs_password")),
-                remote_cert_tls=profile.get("remote_cert_tls", ""),
-                verify_x509_name=profile.get("verify_x509_name", ""),
-                tls_version_min=profile.get("tls_version_min", ""),
-                legacy_crypto=bool(profile.get("legacy_crypto")),
-                managed=tuple(profile.get("managed", ())),
-                tuning=tuple(tuple(item) for item in profile.get("tuning", ())),
-                fallback_cipher=str(profile.get("fallback_cipher") or ""),
-            )
-        else:
-            profile = None
         return Variant(
             provider=data["provider"], backend=data["backend"], protocol=data["protocol"],
             host=data["host"], address=data["address"], port=int(data["port"]),
             transport=data["transport"], name=data["name"], country_hint=data["country_hint"],
             access=data.get("access", "free"),
             hints=tuple(tuple(item) for item in data.get("hints", ())),
-            needs=data.get("needs", ""), credential_scope=data.get("credential_scope", ""),
-            usage_policy=tuple(data.get("usage_policy", ())), profile=profile,
+            usage_policy=tuple(data.get("usage_policy", ())),
             outbound=data.get("outbound"), source_url=data.get("source_url", ""),
             extra=tuple(tuple(item) for item in data.get("extra", ())),
             singbox=data.get("singbox") if isinstance(data.get("singbox"), dict) else None,
@@ -133,10 +110,6 @@ class PoolStore:
             "variants": [variant_to_dict(variant) for variant in result.variants],
         }
         atomic_write_json(current, snapshot, mode=0o600)
-        if result.credentials:
-            secrets = self.secrets()
-            secrets.setdefault("shared", {}).update(result.credentials)
-            atomic_write_json(self.dir / "secrets.json", secrets, mode=0o600)
         return True
 
     def snapshot(self, provider: str) -> dict:
@@ -156,10 +129,28 @@ class PoolStore:
                 removed.add(provider)
         return sorted(removed)
 
-    # --- секреты и состояние проверок -----------------------------------------------------
+    def retire_openvpn(self) -> list[str]:
+        """Остатки OpenVPN (до вехи М2в): учётка VPNBook, профили, итоги проверок туннелей
+        OpenVPN. Варианты OpenVPN в снимках не читаются (variant_from_dict), а со следующим
+        опросом источника уходят и из файла. Что убрано — для журнала."""
+        removed: list[str] = []
+        secrets = self.dir / "secrets.json"
+        if secrets.exists():
+            secrets.unlink()
+            removed.append("учётка VPNBook")
+        profiles = self.dir / "profiles"
+        if profiles.is_dir():
+            shutil.rmtree(profiles)
+            removed.append("профили OpenVPN")
+        state = self.candidates()
+        kept = {key: value for key, value in state.items()
+                if key.startswith("_") or value.get("backend") != "openvpn"}
+        if len(kept) < len(state):
+            self.save_candidates(kept)
+            removed.append(f"итоги проверок OpenVPN ({len(state) - len(kept)})")
+        return removed
 
-    def secrets(self) -> dict:
-        return _read(self.dir / "secrets.json")
+    # --- состояние проверок -----------------------------------------------------------------
 
     def candidates(self) -> dict[str, dict]:
         data = _read(self.dir / "candidates.json")
@@ -168,19 +159,3 @@ class PoolStore:
     def save_candidates(self, data: dict[str, dict]) -> None:
         self._ensure()
         atomic_write_json(self.dir / "candidates.json", data, mode=0o600)
-
-    # --- профили, скачанные отдельно (VPNBook) ----------------------------------------------
-
-    def profile(self, key: str) -> tuple[str, float]:
-        """Сохранённый текст профиля и когда скачан; ("", 0) — нет."""
-        path = self.dir / "profiles" / f"{key}.ovpn"
-        try:
-            return path.read_text(encoding="utf-8"), path.stat().st_mtime
-        except OSError:
-            return "", 0.0
-
-    def save_profile(self, key: str, text: str) -> None:
-        self._ensure()
-        directory = self.dir / "profiles"
-        directory.mkdir(mode=0o700, exist_ok=True)
-        atomic_write_text(directory / f"{key}.ovpn", text, mode=0o600)

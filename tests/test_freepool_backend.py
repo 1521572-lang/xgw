@@ -1,10 +1,9 @@
-"""Бэкенд OpenVPN бесплатного пула (веха М2а, docs/FREEPOOL-PLAN.md): конфиг клиента, агент
-поколения, сторона демона, правила nftables и проверка туннелем в пуле. Сам OpenVPN здесь не
-запускается (решение заказчика 28.10.2026) — работники и интерфейс управления подставные."""
+"""Туннельный бэкенд бесплатного пула (вехи М2а и М2в, docs/FREEPOOL-PLAN.md): агент поколения
+(SSTP — sstpc и pppd), сторона демона, правила nftables и проверка туннелем в пуле. sstpc и
+pppd здесь не запускаются — их проверяет ТЗ на машине заказчика; работники подставные."""
 
 import io
 import json
-import socket
 import threading
 import time
 from dataclasses import replace
@@ -15,19 +14,16 @@ import pytest
 from xgw.config import Config
 from xgw.freepool import agent as agenting
 from xgw.freepool import backend as backending
-from xgw.freepool import ovpn, ovpnconf
 from xgw.net import cmd, nft
 from xgw.paths import Paths, atomic_write_json
 
 FIXTURES = Path(__file__).parent / "fixtures" / "freepool"
 # Публичный адрес: документационные сети (198.51.100.0/24 образцов) peer_address не принимает.
 PEER = "1.0.0.1"
+HOST = "vpn-1.opengw.example"
 GEN = "0123456789"
-USERS = {agenting.OVPN_USER: (990, 990), agenting.SOCKS_USER: (991, 991)}
-
-
-def _profile() -> ovpn.OvpnProfile:
-    return ovpn.parse((FIXTURES / "vpnbook-profile.ovpn").read_text(encoding="utf-8"))
+USERS = {agenting.VPN_USER: (990, 990), agenting.SOCKS_USER: (991, 991)}
+TUNNEL, GATEWAY = "10.211.1.5", "10.211.254.254"  # так раздаёт SecureNAT серверов VPN Gate
 
 
 def _wait(condition, seconds: float = 5.0) -> None:
@@ -37,76 +33,14 @@ def _wait(condition, seconds: float = 5.0) -> None:
         time.sleep(0.02)
 
 
-# --- конфиг клиента (ovpnconf.py) -------------------------------------------------------------
-
-
-def test_client_config_is_built_anew_from_the_parsed_profile():
-    """Из профиля источника берутся только шифры, ключи и проверка сервера; адрес — один,
-    закреплённый; маршрутов, скриптов и DNS сервера нет; учётка — файлом без кэша."""
-    text = ovpnconf.client_config(_profile(), remote_ip=PEER, proto="tcp", port=443,
-                                  with_auth=True, mgmt_port=agenting.MGMT_PORT)
-    lines = text.splitlines()
-    for line in ("client", "dev fpt0", "dev-type tun", "proto tcp-client", f"remote {PEER} 443",
-                 "nobind", "ifconfig-noexec", "route-noexec", "disable-dco", "script-security 1",
-                 'pull-filter ignore "redirect-gateway"', 'pull-filter ignore "route"',
-                 'pull-filter ignore "dhcp-option"', "tls-version-min 1.2", "auth SHA256",
-                 "auth-retry none", "auth-user-pass /tmp/xgw-ovpn/auth", "auth-nocache",
-                 f"management 127.0.0.1 {agenting.MGMT_PORT}"):
-        assert line in lines, line
-    assert any(line.startswith("data-ciphers AES-256-GCM") for line in lines)
-    assert "198.51.100.30" not in text and "dev tun1" not in text  # remote и dev источника
-    assert "\nredirect-gateway" not in text and "explicit-exit-notify" not in text
-    assert text.count("<ca>") == 1 and "<cert>" in text and "<key>" in text
-    assert all(line == line.rstrip() for line in lines)
-    udp = ovpnconf.client_config(_profile(), remote_ip=PEER, proto="udp", port=1194,
-                                 with_auth=False, mgmt_port=7505).splitlines()
-    assert "proto udp" in udp and "explicit-exit-notify 1" in udp
-    assert not any(line.startswith("auth-user-pass") for line in udp)
-
-
-@pytest.mark.parametrize("remote, proto, port", [
-    ("10.0.0.1", "tcp", 443),  # частный
-    ("198.51.100.7", "tcp", 443),  # документационный — не публичный
-    ("vpn.example", "udp", 1194),  # имя здесь не резолвится (R45)
-    (PEER, "icmp", 443),
-    (PEER, "tcp", 0),
-])
-def test_client_config_refuses_what_it_cannot_pin(remote, proto, port):
-    with pytest.raises(ovpn.OvpnRejected):
-        ovpnconf.client_config(_profile(), remote_ip=remote, proto=proto, port=port,
-                               with_auth=False, mgmt_port=7505)
-
-
-def test_server_check_is_passed_on_but_never_weakened():
-    with pytest.raises(ovpn.OvpnRejected):
-        ovpnconf.client_config(replace(_profile(), remote_cert_tls="client"), remote_ip=PEER,
-                               proto="tcp", port=443, with_auth=False, mgmt_port=7505)
-    with pytest.raises(ovpn.OvpnRejected):  # кавычка сломала бы строку конфига
-        ovpnconf.client_config(replace(_profile(), verify_x509_name='vpn" --up /bin/sh'),
-                               remote_ip=PEER, proto="tcp", port=443, with_auth=False,
-                               mgmt_port=7505)
-    text = ovpnconf.client_config(
-        replace(_profile(), remote_cert_tls="server", verify_x509_name="vpn.example name"),
-        remote_ip=PEER, proto="tcp", port=443, with_auth=False, mgmt_port=7505)
-    assert "remote-cert-tls server" in text and 'verify-x509-name "vpn.example" name' in text
-
-
-def test_auth_file_takes_two_plain_lines_only():
-    assert ovpnconf.auth_text("vpn", "vpn") == "vpn\nvpn\n"
-    for username, password in (("", "x"), ("a\nb", "x"), ("a", "x\r"), ("a", "x" * 300)):
-        with pytest.raises(ovpn.OvpnRejected):
-            ovpnconf.auth_text(username, password)
-
-
-# --- агент поколения: задание, охрана, разбор (agent.py) ---------------------------------------
+# --- агент поколения: задание, ключи клиента, охрана, разбор (agent.py) ----------------------
 
 
 def _data(**changes) -> dict:
     data = {
-        "gen": GEN, "index": 3, "peer": PEER, "proto": "udp", "port": 1194,
-        "openvpn_conf": "client\n", "auth": "fpuser\nFakePass77\n", "socks_pass": "s" * 24,
-        "lan": ["192.168.50.0/24"], "xray_bin": "/opt/xgw/xray/xray",
-        "openvpn_bin": "/usr/sbin/openvpn",
+        "gen": GEN, "index": 3, "peer": PEER, "port": 443, "host": HOST, "user": "vpn",
+        "password": "vpn", "socks_pass": "s" * 24, "lan": ["192.168.50.0/24"],
+        "xray_bin": "/opt/xgw/xray/xray", "sstpc_bin": "/usr/sbin/sstpc",
     }
     data.update(changes)
     return data
@@ -119,13 +53,16 @@ def _manifest(tmp_path, **changes) -> agenting.Manifest:
 
 
 def test_manifest_is_checked_field_by_field(tmp_path):
-    """Агент — root, значения задания уходят в ip, nft и конфиги: каждое поле проверяется."""
+    """Агент — root, значения задания уходят в ip, nft, аргументы sstpc и файл ключей pppd:
+    каждое поле проверяется."""
     manifest = _manifest(tmp_path)
-    assert (manifest.index, manifest.peer, manifest.lan) == (3, PEER, ("192.168.50.0/24",))
+    assert (manifest.index, manifest.peer, manifest.host) == (3, PEER, HOST)
+    assert manifest.lan == ("192.168.50.0/24",)
     for change in ({"index": 64}, {"peer": "10.1.1.1"}, {"peer": "vpn.example"},
-                   {"proto": "icmp"}, {"port": 70000}, {"socks_pass": "short"},
-                   {"socks_pass": "s" * 20 + " ;rm"}, {"xray_bin": "xray"},
-                   {"openvpn_bin": "/usr/../bin/sh"}, {"lan": ["nope"]}, {"openvpn_conf": ""},
+                   {"port": 70000}, {"host": "bad host"}, {"host": "-x.example"},
+                   {"host": "x"}, {"user": 'vpn"'}, {"password": "a b"}, {"password": ""},
+                   {"socks_pass": "short"}, {"socks_pass": "s" * 20 + " ;rm"},
+                   {"xray_bin": "xray"}, {"sstpc_bin": "/usr/../bin/sh"}, {"lan": ["nope"]},
                    {"gen": "fedcba9876"}):
         with pytest.raises(agenting.AgentError) as info:
             _manifest(tmp_path, **change)
@@ -137,26 +74,57 @@ def test_manifest_is_checked_field_by_field(tmp_path):
         agenting.load_manifest(tmp_path / "manifest.json", GEN)
 
 
+def test_sstpc_and_pppd_get_only_what_the_tunnel_needs(tmp_path):
+    """sstpc: журнал — в вывод агента (не syslog), цепочка сертификата — по системным, имя — в
+    HTTP (SNI не посылается: без --tls-ext), без --cert-warn и без маршрута к серверу (его
+    ставит агент), права — xgw-vpn после подключения; ключи pppd — файлом (у sstpc под них
+    массив на 20 мест): интерфейс fpt0, без маршрута по умолчанию, DNS сервера и IPv6."""
+    manifest = _manifest(tmp_path)
+    options = tmp_path / "ppp.options"
+    argv = agenting.sstpc_argv(manifest, options)
+    assert argv[0] == "/usr/sbin/sstpc"
+    assert argv[1:4] == ["--log-stderr", "--log-level", "2"]
+    def value(option: str) -> str:
+        return argv[argv.index(option) + 1]
+
+    assert value("--ca-dir") == "/etc/ssl/certs" and value("--host") == HOST
+    assert (value("--user"), value("--password")) == ("vpn", "vpn")
+    assert (value("--priv-user"), value("--priv-group")) == ("xgw-vpn", "xgw-vpn")
+    for forbidden in ("--cert-warn", "--tls-ext", "--save-server-route", "--priv-dir",
+                      "--nolaunchpppd"):
+        assert forbidden not in argv
+    server = argv.index(f"{PEER}:443")
+    assert argv[server + 1:] == ["file", str(options)]
+    lines = agenting.ppp_options().splitlines()
+    for line in ("ifname fpt0", "nodetach", "logfd 2", "noauth", "noipdefault",
+                 "nodefaultroute", "noipv6", "require-mschap-v2", "refuse-pap", "refuse-eap"):
+        assert line in lines, line
+    for line in lines:
+        assert line.split()[0] not in ("defaultroute", "usepeerdns", "persist", "noresolvconf",
+                                       "replacedefaultroute", "proxyarp")
+
+
 def test_guard_opens_only_the_server_and_the_tunnel(tmp_path):
-    """Охрана (R46): таблица заменяется только своя; OpenVPN — только к серверу через veth,
-    SOCKS — только в туннель; всё прочее на выходе — отказ со счётчиком, форвардинга нет."""
+    """Охрана (R46): таблица заменяется только своя; к серверу через veth — только root (сокет
+    sstpc создан до сброса прав), xgw-vpn — никуда; SOCKS — только в туннель; всё прочее на
+    выходе — отказ со счётчиком, форвардинга нет."""
     text = agenting.guard_rules(_manifest(tmp_path), 990, 991)
     assert text.startswith("table inet xgwfp\ndelete table inet xgwfp\ntable inet xgwfp {\n")
     assert "flush" not in text and text.count("policy drop") == 3
-    assert (f'meta skuid 990 oifname "fpi3" ip daddr {PEER} meta l4proto udp th dport 1194 '
-            "accept") in text
+    assert f'meta skuid 0 oifname "fpi3" ip daddr {PEER} tcp dport 443 accept' in text
     assert 'meta skuid 991 oifname "fpt0" meta nfproto ipv4 accept' in text
-    assert 'oif "lo" meta skuid { 0, 990 } accept' in text  # управление — root и OpenVPN
+    assert 'oif "lo" meta skuid 0 accept' in text
     output = text.split("chain output {")[1].split("chain forward")[0]
     rules = [line.strip() for line in output.splitlines() if line.strip() not in ("", "}")]
     # Отчёт М2а.1: отбитое — по отправителю; служебный IPv6 ядра — не в отбитое.
     assert all(f"counter {name} {{ }}" in text for name in agenting.COUNTERS)
     assert rules[1] == 'meta nfproto ipv6 counter name "dropped_v6" drop'
     reject = "reject with icmpx type admin-prohibited"
-    assert rules[-3:] == [f'meta skuid 990 counter name "refused_ovpn" {reject}',
+    assert rules[-3:] == [f'meta skuid {{ 0, 990 }} counter name "refused_vpn" {reject}',
                           f'meta skuid 991 counter name "refused_socks" {reject}',
                           f'counter name "refused_other" {reject}']
-    # Работнику на lo — ничего: готовность агент смотрит в /proc/net/tcp.
+    # Пользователю VPN не открыто ничего; работнику на lo — ничего (готовность — /proc/net/tcp).
+    assert not any("990" in rule and "accept" in rule for rule in rules)
     assert not any("991" in rule and '"lo"' in rule for rule in rules)
     forward = text.split("chain forward {")[1].split("}")[0]
     assert "accept" not in forward
@@ -172,80 +140,80 @@ def test_socks_worker_listens_on_veth_with_a_password(tmp_path):
     # Отчёт М2а.2: с UseIPv4 Xray спрашивал системный резолвер (127.0.0.53 на lo).
     assert config["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"] == "ForceIPv4"
     assert config["dns"]["servers"] == ["1.1.1.1", "8.8.8.8"]
-    with_server = agenting.socks_config(_manifest(tmp_path), ["10.8.0.1", "1.1.1.1", "10.8.0.1"])
-    assert with_server["dns"]["servers"] == ["10.8.0.1", "1.1.1.1"]
+    with_gateway = agenting.socks_config(_manifest(tmp_path), [GATEWAY, "1.1.1.1", GATEWAY])
+    assert with_gateway["dns"]["servers"] == [GATEWAY, "1.1.1.1"]
 
 
-def test_management_lines_and_pushed_options():
-    assert agenting.parse_state(f">STATE:1730000000,CONNECTED,SUCCESS,10.8.0.6,{PEER},1194,,") \
-        == ("CONNECTED", "SUCCESS", "10.8.0.6")
-    assert agenting.parse_state("1730000001,RECONNECTING,ping-restart,,,,,") == (
-        "RECONNECTING", "ping-restart", "")
-    assert agenting.parse_state("SUCCESS: real-time state notification set to ON") is None
-    line = ("PUSH: Received control message: 'PUSH_REPLY,route 10.8.0.1,topology net30,"
-            "ping 10,ping-restart 120,ifconfig 10.8.0.6 10.8.0.5,tun-mtu 1400,peer-id 0'")
-    assert agenting.pushed(line) == ("10.8.0.6", 1400)
-    assert agenting.pushed("Initialization Sequence Completed") == ("", 0)
-    # DNS сервера: в конфиг не принимается (pull-filter), но для работника — первым.
-    dns = ("PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option "
-           "DNS 127.0.0.1,dhcp-option DNS 10.250.1.1,dhcp-option DNS 8.8.4.4,dhcp-option DNS "
-           "9.9.9.9,ifconfig 10.8.0.6 10.8.0.5'")
-    assert agenting.pushed_dns(dns) == ["10.8.0.1", "8.8.4.4"]
-    assert agenting.pushed_dns("dhcp-option DNS 10.8.0.1") == []  # не из PUSH_REPLY
+def test_tunnel_addresses_come_from_the_ppp_interface():
+    """Подъём — адрес на fpt0 (IPCP): свой и другой конец PPP из `ip -4 -o addr`; MTU — из
+    `ip -o link`."""
+    line = (f"8: fpt0    inet {TUNNEL} peer {GATEWAY}/32 scope global fpt0\\       "
+            "valid_lft forever preferred_lft forever\n")
+    assert agenting.parse_addr(line) == (TUNNEL, GATEWAY)
+    assert agenting.parse_addr(f"8: fpt0    inet {TUNNEL}/32 scope global fpt0\n") == (TUNNEL, "")
+    assert agenting.parse_addr("") == ("", "")
+    assert agenting.parse_addr('Device "fpt0" does not exist.') == ("", "")
+    assert agenting.parse_mtu("8: fpt0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400 "
+                              "qdisc fq_codel state UNKNOWN mode DEFAULT") == 1400
+    assert agenting.parse_mtu("") == 0
 
 
 def test_tunnel_address_from_the_server_is_untrusted(tmp_path):
     manifest = _manifest(tmp_path)
-    assert agenting.tunnel_problem("10.8.0.6", manifest) == ""
+    assert agenting.tunnel_problem(TUNNEL, manifest) == ""
     for address in ("8.8.8.8", "127.0.0.2", "169.254.1.1", "10.250.3.9", "192.168.50.7", "x"):
         assert agenting.tunnel_problem(address, manifest), address
 
 
-def test_failure_codes_from_the_openvpn_journal():
-    assert agenting.classify(["AUTH: Received control message: AUTH_FAILED"]) == "AUTH_FAILED"
-    assert agenting.classify(["TLS Error: TLS key negotiation failed to occur within 60 "
-                              "seconds (check your network connectivity)"]) \
-        == "TLS_HANDSHAKE_FAILED"
-    assert agenting.classify(["VERIFY ERROR: depth=0, error=certificate has expired"]) \
+def test_failure_codes_from_the_client_output():
+    """Строки sstpc 1.0.20 и pppd (по их исходникам) → код; более точная причина — раньше
+    общей «TCP или TLS не сложились»."""
+    assert agenting.classify(["CHAP authentication failed"]) == "AUTH_FAILED"
+    assert agenting.classify(["MS-CHAP authentication failed: E=691"]) == "AUTH_FAILED"
+    assert agenting.classify(["SSL certificate verification failed: unable to get local "
+                              "issuer certificate (20)",
+                              "Verification of server certificate failed"]) \
         == "CERT_VERIFY_FAILED"
-    assert agenting.classify(["TCP: connect to [AF_INET]1.0.0.1:443 failed: Connection "
-                              "refused"]) == "CONNECT_REFUSED"
-    assert agenting.classify([]) == "UNKNOWN"
-    # В журнал службы — строка с причиной, но без адресов.
-    assert agenting.evidence(["Initialization", "TCP: connect to [AF_INET]1.0.0.1:443 failed: "
-                              "Connection refused"], "CONNECT_REFUSED") \
-        == "TCP: connect to [AF_INET]<ip>:443 failed: Connection refused"
-    assert agenting.evidence(["Initialization"], "AUTH_FAILED") == ""
+    assert agenting.classify(["HTTP handshake with server failed"]) == "SSTP_REFUSED"
+    assert agenting.classify(["LCP: timeout sending Config-Requests"]) == "PPP_TIMEOUT"
+    assert agenting.classify(["No response to 3 echo-requests",
+                              "Serial link appears to be disconnected."]) == "LINK_LOST"
+    assert agenting.classify(["Could not setup notification"]) == "SSTPC_SOCKET"
+    assert agenting.classify(["Could not complete connect to the client"]) == "CONNECT_FAILED"
+    assert agenting.classify(["Could not complete connect to the client",
+                              "connect: Connection refused"]) == "CONNECT_REFUSED"
     # «No route to host» — ICMP с пути (или охрана: run решает по её счётчику), «Network is
     # unreachable» — нет маршрута у себя (дефект шлюза). Отчёт М2а: оба были одним кодом.
-    assert agenting.classify(["TCP: connect to [AF_INET]1.0.0.1:1535 failed: No route to "
-                              "host"]) == "HOST_UNREACHABLE"
-    assert agenting.classify(["connect to [AF_INET]1.0.0.1:443 failed: Network is "
-                              "unreachable"]) == "NETWORK_UNREACHABLE"
-    # UNKNOWN — последняя строка с пометкой ошибки, без адресов и имён хостов.
-    assert agenting.evidence([
-        "OpenVPN 2.6.19 x86_64-pc-linux-gnu", "VERIFY OK: depth=0, CN=vpn12.opengw.net",
-        ">FATAL:Error: unexpected reply from 1.0.0.1, read /tmp/xgw-ovpn/client.conf",
-    ], "UNKNOWN") == ">FATAL:Error: unexpected reply from <ip>, read /tmp/xgw-ovpn/client.conf"
-    assert agenting.masked("VERIFY OK: depth=0, CN=vpn12.opengw.net") \
-        == "VERIFY OK: depth=0, CN=<host>"
+    assert agenting.classify(["connect: No route to host"]) == "HOST_UNREACHABLE"
+    assert agenting.classify(["connect: Network is unreachable"]) == "NETWORK_UNREACHABLE"
+    assert agenting.classify([]) == "UNKNOWN"
+    # В журнал службы — строка с причиной, но без адресов и имён хостов.
+    assert agenting.evidence(["Connected to 1.0.0.1", "Could not connect to `1.0.0.1:443'"],
+                             "CONNECT_FAILED") == "Could not connect to `<ip>:443'"
+    assert agenting.evidence(["Connected"], "AUTH_FAILED") == ""
+    assert agenting.evidence([f"Connected to {HOST}", "read failed from 1.0.0.1, ret -1"],
+                             "UNKNOWN") == "read failed from <ip>, ret -1"
+    assert agenting.masked(f"Connected to {HOST}") == "Connected to <host>"
+    assert agenting.masked("plugin sstp-pppd-plugin.so loaded") \
+        == "plugin sstp-pppd-plugin.so loaded"
 
 
 def test_inner_check_and_tunnel_counters_are_told_without_addresses():
     """Проверка изнутри: вывод дочернего процесса → итоги по меткам (адреса DNS в журнал не
     идут); DNS работника — ответившие первыми; счётчики fpt0 из `ip -s link`."""
-    servers = agenting.inner_servers(["10.8.0.1"])
-    assert servers == [("сервера", "10.8.0.1"), ("Cloudflare", "1.1.1.1")]
-    inner = agenting.parse_inner("tcp OPEN 120\ndns 10.8.0.1 TIMEOUT\ndns 1.1.1.1 OK 35\n",
+    servers = agenting.inner_servers([GATEWAY])
+    assert servers == [("шлюза туннеля", GATEWAY), ("Cloudflare", "1.1.1.1")]
+    inner = agenting.parse_inner(f"tcp OPEN 120\ndns {GATEWAY} TIMEOUT\ndns 1.1.1.1 OK 35\n",
                                  servers)
-    assert inner == {"tcp": "OPEN 120", "dns": [["сервера", "TIMEOUT"], ["Cloudflare", "OK 35"]]}
-    assert agenting.inner_text(inner) == ("TCP Cloudflare:443 — OPEN (120 мс); DNS сервера — "
-                                          "TIMEOUT; DNS Cloudflare — OK (35 мс)")
-    assert agenting.worker_dns(servers, inner) == ["1.1.1.1", "10.8.0.1", "8.8.8.8"]
+    assert inner == {"tcp": "OPEN 120",
+                     "dns": [["шлюза туннеля", "TIMEOUT"], ["Cloudflare", "OK 35"]]}
+    assert agenting.inner_text(inner) == ("TCP Cloudflare:443 — OPEN (120 мс); DNS шлюза "
+                                          "туннеля — TIMEOUT; DNS Cloudflare — OK (35 мс)")
+    assert agenting.worker_dns(servers, inner) == ["1.1.1.1", GATEWAY, "8.8.8.8"]
     assert agenting.parse_inner("garbage", servers)["tcp"] == "—"
-    assert agenting.inner_servers(["1.1.1.1"]) == [("сервера", "1.1.1.1")]
-    text = ("5: fpt0: <POINTOPOINT,UP> mtu 1500 qdisc fq_codel state UNKNOWN\n"
-            "    link/none \n"
+    assert agenting.inner_servers([]) == [("Cloudflare", "1.1.1.1")]
+    text = ("8: fpt0: <POINTOPOINT,UP> mtu 1400 qdisc fq_codel state UNKNOWN\n"
+            "    link/ppp \n"
             "    RX:  bytes packets errors dropped  missed   mcast\n"
             "          2048       3      0       0       0       0\n"
             "    TX:  bytes packets errors dropped carrier collsns\n"
@@ -254,12 +222,12 @@ def test_inner_check_and_tunnel_counters_are_told_without_addresses():
     assert stats == {"rx_bytes": 2048, "rx_packets": 3, "tx_bytes": 10240, "tx_packets": 12}
     assert agenting.tunnel_text(stats) == ("в туннель 12 пакетов (10 КБ), из туннеля 3 пакетов "
                                            "(2 КБ)")
-    assert agenting.parse_link_stats("5: fpt0: <UP>\n") is None
-    assert agenting.deltas({"refused_ovpn": 2, "refused_socks": -1}, {
-        "refused_ovpn": 5, "refused_socks": 3}) == {"refused_ovpn": 3}
-    assert agenting.guard_text({"refused_ovpn": 0, "refused_socks": 20, "refused_other": 2,
+    assert agenting.parse_link_stats("8: fpt0: <UP>\n") is None
+    assert agenting.deltas({"refused_vpn": 2, "refused_socks": -1}, {
+        "refused_vpn": 5, "refused_socks": 3}) == {"refused_vpn": 3}
+    assert agenting.guard_text({"refused_vpn": 0, "refused_socks": 20, "refused_other": 2,
                                 "dropped_v6": 5}) \
-        == "OpenVPN 0, работник 20, ответы ядра 2, служебный IPv6 5"
+        == "клиент VPN 0, работник 20, ответы ядра 2, служебный IPv6 5"
     assert agenting.guard_text({}) == ""
     # Канал к серверу (fpi): RX — от сервера, TX — к нему.
     delta = agenting.link_delta(
@@ -307,20 +275,29 @@ def test_socks_readiness_and_core_failure_reasons():
 
 
 class _Runner:
-    """Подставные ip и nft внутри пространства имён агента. grow — счётчики охраны, которые
-    растут на единицу при каждом чтении."""
+    """Подставные ip и nft внутри пространства имён агента. address — адрес fpt0 (пусто —
+    туннеля нет); grow — счётчики охраны, которые растут на единицу при каждом чтении."""
 
     def __init__(self, *, grow=()) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.counters = dict.fromkeys(agenting.COUNTERS, 0)
         self.grow = set(grow)
+        self.address, self.gateway = "", ""
 
     def __call__(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         self.calls.append(tuple(argv))
         if argv[:3] == ["ip", "-o", "link"]:
+            if argv[-1] == "fpt0":
+                return ("8: fpt0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400\n"
+                        if self.address else "")
             return "7: fpi3@if8: <BROADCAST,MULTICAST> mtu 1500\n"
+        if argv[:4] == ["ip", "-4", "-o", "addr"]:
+            if not self.address:
+                return ""
+            return (f"8: fpt0    inet {self.address} peer {self.gateway}/32 scope global fpt0"
+                    "\\       valid_lft forever preferred_lft forever\n")
         if argv[:3] == ["ip", "-s", "link"]:
-            return ("5: fpt0: <POINTOPOINT,UP> mtu 1500\n    link/none\n"
+            return ("8: fpt0: <POINTOPOINT,UP> mtu 1400\n    link/ppp\n"
                     "    RX:  bytes packets errors dropped  missed   mcast\n"
                     "             0       0      0       0       0       0\n"
                     "    TX:  bytes packets errors dropped carrier collsns\n"
@@ -335,12 +312,12 @@ class _Runner:
 
 
 class _Proc:
-    """Подставной процесс: работник (жив до terminate) или проба самопроверки (ответ)."""
+    """Подставной процесс: работник (жив до terminate или до exit) или проба (ответ)."""
 
-    def __init__(self, lines=(), out: str = "") -> None:
+    def __init__(self, lines=(), out: str = "", exited: bool = False) -> None:
         self.stdout = iter(lines)
         self.out = out
-        self.returncode = None
+        self.returncode = 1 if exited else None
 
     def poll(self):
         return self.returncode
@@ -362,11 +339,14 @@ class _Proc:
 
 
 class _Spawn:
-    def __init__(self, probe: str = "ENETUNREACH", openvpn_lines=(),
+    def __init__(self, probe: str = "ENETUNREACH", client_lines=(), client_exits=False,
                  inner: str = "tcp TIMEOUT\ndns 1.1.1.1 TIMEOUT\n") -> None:
-        self.probe, self.openvpn_lines, self.inner = probe, openvpn_lines, inner
+        self.probe, self.client_lines, self.client_exits = probe, client_lines, client_exits
+        self.inner = inner
         self.workers: list[tuple[str, int, int]] = []
         self.inner_args: list[tuple] = []
+        self.client: _Proc | None = None
+        self.client_argv: list[str] = []
 
     def __call__(self, argv, **kwargs):
         if argv[1] == "-I" and "recvfrom" in argv[3]:  # проверка изнутри
@@ -375,36 +355,30 @@ class _Spawn:
         if argv[1] == "-I":  # самопроверка охраны
             return _Proc(out=self.probe + "\n")
         self.workers.append((argv[0], kwargs["user"], kwargs["group"]))
-        return _Proc(lines=self.openvpn_lines if argv[0].endswith("openvpn") else ())
+        if argv[0].endswith("sstpc"):
+            self.client_argv = list(argv)
+            self.client = _Proc(lines=self.client_lines, exited=self.client_exits)
+            return self.client
+        return _Proc()
 
 
 def _agent(tmp_path, monkeypatch, *, runner=None, spawn=None, proc_tcp=lambda: _LISTEN):
+    monkeypatch.setattr(agenting, "POLL_EVERY", 0.01)
+    monkeypatch.setattr(agenting, "STATS_EVERY", 0.05)
     paths = Paths(root=tmp_path / "root")
     paths.ensure()
     path = agenting.manifest_path(paths, GEN)
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(_data(openvpn_conf="client\nremote 1.0.0.1 1194\n")),
-                    encoding="utf-8")
+    path.write_text(json.dumps(_data()), encoding="utf-8")
     chowned: list[tuple[str, int, int]] = []
     monkeypatch.setattr(agenting.os, "chown",
                         lambda target, uid, gid: chowned.append((Path(target).name, uid, gid)))
-    ours, theirs = socket.socketpair()
-    ours.settimeout(5.0)
-    connects: list[tuple] = []
-
-    def connect(address, timeout):
-        connects.append(address)
-        if address[1] != agenting.MGMT_PORT:  # к работнику агент не подключается (М2а.1)
-            raise ConnectionRefusedError(address)
-        return theirs
-
     agent = agenting.Agent(
-        paths, GEN, runner=runner or _Runner(), spawn=spawn or _Spawn(), connect=connect,
+        paths, GEN, runner=runner or _Runner(), spawn=spawn or _Spawn(),
         users=USERS.__getitem__, tmp=tmp_path / "tmp", out=io.StringIO(), proc_tcp=proc_tcp,
     )
-    agent.connects = connects
     (tmp_path / "tmp").mkdir()
-    return agent, ours, chowned
+    return agent, chowned
 
 
 def _start(agent) -> list[int]:
@@ -416,101 +390,113 @@ def _start(agent) -> list[int]:
 
 
 def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, monkeypatch):
-    """Порядок: охрана → TUN с владельцем → «guarded» → veth → самопроверка → файлы OpenVPN →
-    OpenVPN от своего пользователя → при CONNECTED маршрут по умолчанию, проверка изнутри (от
-    пользователя SOCKS) и только затем SOCKS-работник с DNS сервера; обрыв — маршрут убран;
-    остановка — фаза stopped и итог туннеля в журнале."""
+    """Порядок: охрана → «guarded» → veth → самопроверка → файл ключей pppd → sstpc от root →
+    адрес на fpt0: маршрут по умолчанию, проверка изнутри (от пользователя SOCKS, DNS шлюза
+    туннеля) и только затем SOCKS-работник; остановка — фаза stopped и итог туннеля в
+    журнале, без адресов."""
     runner = _Runner()
-    spawn = _Spawn(openvpn_lines=[
-        "2026-10-29 00:48:50 WARNING: 'comp-lzo' is present in remote config for 1.0.0.1",
-        "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,ifconfig "
-        "10.8.0.6 10.8.0.5,WARNING'"],
-        inner="tcp OPEN 90\ndns 10.8.0.1 OK 20\ndns 1.1.1.1 TIMEOUT\n")
-    agent, ours, chowned = _agent(tmp_path, monkeypatch, runner=runner, spawn=spawn)
+    spawn = _Spawn(client_lines=[f"Connected to {HOST}",
+                                 "Could not set process user id, Operation not permitted (1)"],
+                   inner=f"tcp OPEN 90\ndns {GATEWAY} OK 20\ndns 1.1.1.1 TIMEOUT\n")
+    agent, chowned = _agent(tmp_path, monkeypatch, runner=runner, spawn=spawn)
     result = _start(agent)
     _wait(lambda: agent.state.get("phase") == "connecting")
-    assert ours.recv(64).startswith(b"state on\n")
     calls = runner.calls
     assert calls[:2] == [("ip", "link", "set", "lo", "up"), ("nft", "-f", "-")]
-    assert calls[2] == ("ip", "tuntap", "add", "dev", "fpt0", "mode", "tun", "user", "990",
-                        "group", "990")
+    assert not any(call[:2] == ("ip", "tuntap") for call in calls)  # интерфейс создаёт pppd
     assert ("ip", "route", "add", f"{PEER}/32", "via", "10.250.3.1", "dev", "fpi3") in calls
     assert not any(call[:3] == ("ip", "route", "replace") for call in calls)
-    assert spawn.workers == [("/usr/sbin/openvpn", 990, 990)]  # SOCKS — только с туннелем
+    assert spawn.workers == [("/usr/sbin/sstpc", 0, 0)]  # SOCKS — только с туннелем
+    assert spawn.client_argv[-2:] == ["file", str(tmp_path / "tmp" / "xgw-vpn" / "ppp.options")]
     assert agent.state["selftest"]["ok"] is True
-    conf = tmp_path / "tmp" / "xgw-ovpn" / "client.conf"
-    assert conf.read_text(encoding="utf-8").startswith("client\n")
-    assert oct(conf.stat().st_mode & 0o777) == "0o640"
-    assert (tmp_path / "tmp" / "xgw-ovpn" / "auth").read_text(encoding="utf-8") \
-        == "fpuser\nFakePass77\n"
-    assert ("auth", 0, 990) in chowned and not (tmp_path / "tmp" / "xgw-socks").exists()
+    assert set(agent.state["selftest"]["results"]) == {
+        "socks_to_peer", "socks_to_internet", "vpn_to_peer", "vpn_to_host", "vpn_to_internet"}
+    options = tmp_path / "tmp" / "xgw-vpn" / "ppp.options"
+    assert options.read_text(encoding="utf-8") == agenting.ppp_options()
+    assert oct(options.stat().st_mode & 0o777) == "0o640" and ("ppp.options", 0, 0) in chowned
+    assert not (tmp_path / "tmp" / "xgw-socks").exists()
 
-    ours.sendall(f">STATE:1730000000,CONNECTED,SUCCESS,10.8.0.6,{PEER},1194,,\n".encode())
+    runner.address, runner.gateway = TUNNEL, GATEWAY
     _wait(lambda: agent.state.get("phase") == "up")
-    assert ("ip", "addr", "add", "10.8.0.6/32", "dev", "fpt0") in runner.calls
     assert ("ip", "route", "replace", "default", "dev", "fpt0") in runner.calls
-    assert spawn.inner_args == [(("10.8.0.1", "1.1.1.1"), 991)]
+    assert not any(call[:3] == ("ip", "addr", "add") and call[-1] == "fpt0"
+                   for call in runner.calls)  # адрес ставит pppd
+    assert (agent.state["tunnel"], agent.state["mtu"]) == (TUNNEL, 1400)
+    assert spawn.inner_args == [((GATEWAY, "1.1.1.1"), 991)]
     assert agent.state["inner"]["tcp"] == "OPEN 90"
-    assert spawn.workers == [("/usr/sbin/openvpn", 990, 990), ("/opt/xgw/xray/xray", 991, 991)]
+    assert spawn.workers == [("/usr/sbin/sstpc", 0, 0), ("/opt/xgw/xray/xray", 991, 991)]
     socks = json.loads((tmp_path / "tmp" / "xgw-socks" / "socks.json").read_text(
         encoding="utf-8"))
-    assert socks["dns"]["servers"] == ["10.8.0.1", "1.1.1.1", "8.8.8.8"]
+    assert socks["dns"]["servers"] == [GATEWAY, "1.1.1.1", "8.8.8.8"]
     assert ("socks.json", 0, 991) in chowned
     journal = agent.out.getvalue()
-    assert "через туннель: TCP Cloudflare:443 — OPEN (90 мс); DNS сервера — OK (20 мс)" \
-        in journal and "10.8.0.1" not in journal
+    assert ("через туннель: TCP Cloudflare:443 — OPEN (90 мс); DNS шлюза туннеля — OK (20 мс)"
+            in journal) and "10.211." not in journal
     # «Туннель поднят» — до проверки изнутри; готовность работника — без подключения к нему.
-    assert journal.index("туннель поднят, MTU 1500") < journal.index("через туннель:") \
+    assert journal.index("туннель поднят, MTU 1400") < journal.index("через туннель:") \
         < journal.index("SOCKS-работник готов")
     assert agent.state["tunnel_at"] > 0
-    assert all(address[1] == agenting.MGMT_PORT for address in agent.connects)
-    ours.sendall(b">STATE:1730000001,RECONNECTING,ping-restart,,,,,\n")
-    _wait(lambda: agent.state.get("phase") == "reconnecting")
-    assert ("ip", "route", "del", "default", "dev", "fpt0") in runner.calls
+    _wait(lambda: "tun" in agent.state)  # счётчики, пока туннель поднят
     agent.stop.set()
     agent.thread.join(5)
     assert result == [0] and agent.state["phase"] == "stopped"
     saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
-    assert saved["phase"] == "stopped" and "FakePass77" not in json.dumps(saved)
-    zero = dict.fromkeys(agenting.COUNTERS, 0)
-    assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"] == zero
+    assert saved["phase"] == "stopped" and saved["tun"]["tx_packets"] == 9
+    assert saved["refused_after_up"] == dict.fromkeys(agenting.COUNTERS, 0)
     assert saved["link_after_up"] == {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0,
                                       "tx_packets": 0}
-    # Предупреждение OpenVPN — без адреса и метки времени; строка PUSH_REPLY — никогда.
     assert ("итог туннеля: в туннель 9 пакетов (4 КБ), из туннеля 0 пакетов (0 КБ); канал к "
             "серверу после подъёма: от сервера 0 пакетов (0 КБ), к серверу 0 пакетов (0 КБ); "
-            "ошибок канала данных 0; охрана после подъёма: OpenVPN 0, работник 0, ответы ядра 0, "
-            "служебный IPv6 0; предупреждения OpenVPN: WARNING: 'comp-lzo' is present in remote "
-            "config for <ip>") in agent.out.getvalue()
-    assert saved["notices"] == ["WARNING: 'comp-lzo' is present in remote config for <ip>"]
+            "охрана после подъёма: клиент VPN 0, работник 0, ответы ядра 0, служебный IPv6 0; "
+            "предупреждения клиента: Could not set process user id, Operation not permitted "
+            "(1)") in agent.out.getvalue()
+    assert saved["notices"] == ["Could not set process user id, Operation not permitted (1)"]
+    assert HOST not in agent.out.getvalue()
+
+
+def test_lost_link_ends_the_generation(tmp_path, monkeypatch):
+    """Адрес fpt0 пропал (pppd завершился: эхо LCP без ответа) — LINK_LOST; переподключения нет
+    — поколение заменяет демон; итог туннеля — один раз, со счётчиками последнего снимка."""
+    runner = _Runner()
+    spawn = _Spawn(client_lines=["No response to 3 echo-requests",
+                                 "Serial link appears to be disconnected."])
+    agent, _chowned = _agent(tmp_path, monkeypatch, runner=runner, spawn=spawn)
+    result = _start(agent)
+    _wait(lambda: agent.state.get("phase") == "connecting")
+    runner.address, runner.gateway = TUNNEL, GATEWAY
+    _wait(lambda: agent.state.get("phase") == "up")
+    runner.address = ""
+    agent.thread.join(5)
+    assert result == [3]
+    saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
+    assert (saved["phase"], saved["reason"]) == ("failed", "LINK_LOST")
+    journal = agent.out.getvalue()
+    assert journal.count("итог туннеля:") == 1
+    assert journal.index("итог туннеля:") < journal.index(f"поколение {GEN}: LINK_LOST")
+    assert "SSTP: No response to 3 echo-requests" in journal
 
 
 def test_guard_refusal_before_the_tunnel_is_a_gateway_defect(tmp_path, monkeypatch):
-    """«No route to host» при подключении: вырос счётчик пакетов OpenVPN — GUARD_BLOCKED
-    (дефект шлюза; код по журналу OpenVPN — рядом); выросли только ответы ядра и служебный
+    """«No route to host» при подключении: вырос счётчик пакетов клиента — GUARD_BLOCKED
+    (дефект шлюза; код по выводу клиента — рядом); выросли только ответы ядра и служебный
     IPv6 (отчёт М2а.1) или ничего — HOST_UNREACHABLE (ICMP с пути к серверу, не дефект)."""
-    lines = ["TCP: connect to [AF_INET]1.0.0.1:1535 failed: No route to host"]
-    cases = (({agenting.REFUSED_OVPN}, "GUARD_BLOCKED"),
+    lines = ["Could not complete connect to the client", "connect: No route to host"]
+    cases = (({agenting.REFUSED_VPN}, "GUARD_BLOCKED"),
              ({agenting.REFUSED_OTHER, agenting.DROPPED_V6}, "HOST_UNREACHABLE"),
              ((), "HOST_UNREACHABLE"))
     for number, (grow, code) in enumerate(cases):
         (tmp_path / str(number)).mkdir()
         runner = _Runner(grow=grow)
-        agent, ours, _chowned = _agent(tmp_path / str(number), monkeypatch, runner=runner,
-                                       spawn=_Spawn(openvpn_lines=lines))
+        agent, _chowned = _agent(tmp_path / str(number), monkeypatch, runner=runner,
+                                 spawn=_Spawn(client_lines=lines, client_exits=True))
         if grow:  # самопроверка с растущими счётчиками не нужна здесь
             agent._selftest = lambda manifest, ids: {}
-        result = _start(agent)
-        _wait(lambda agent=agent: agent.state.get("phase") == "connecting" and agent.log)
-        assert ours.recv(64).startswith(b"state on\n")  # непрочитанное — RST вместо закрытия
-        ours.close()  # OpenVPN закрыл управление
-        agent.thread.join(5)
-        assert result == [3] and agent.state["reason"] == code
-        assert agent.state["openvpn_code"] == "HOST_UNREACHABLE"
+        assert agent.run() == 3
+        assert agent.state["reason"] == code and agent.state["client_code"] == "HOST_UNREACHABLE"
         journal = agent.out.getvalue()
-        assert "OpenVPN: TCP: connect to [AF_INET]<ip>:1535 failed: No route to host" in journal
+        assert "SSTP: connect: No route to host" in journal
         assert ("охрана за подключение:" in journal) is bool(grow)
-        assert ("(по журналу OpenVPN: HOST_UNREACHABLE)" in journal) is (code == "GUARD_BLOCKED")
+        assert ("(по выводу клиента: HOST_UNREACHABLE)" in journal) is (code == "GUARD_BLOCKED")
         assert "итог туннеля" not in journal  # туннель не поднимался
 
 
@@ -519,14 +505,10 @@ def test_worker_failure_after_the_tunnel_keeps_what_was_seen_inside(tmp_path, mo
     failed — что туннель был, проверка изнутри и итог туннеля (демон берёт их в запись)."""
     monkeypatch.setattr(agenting, "SOCKS_WAIT", 0.3)
     runner = _Runner()
-    agent, ours, _chowned = _agent(tmp_path, monkeypatch, runner=runner,
-                                   proc_tcp=lambda: _LISTEN.splitlines()[0])
-    result = _start(agent)
-    _wait(lambda: agent.state.get("phase") == "connecting")
-    assert ours.recv(64).startswith(b"state on\n")
-    ours.sendall(f">STATE:1730000000,CONNECTED,SUCCESS,10.8.0.6,{PEER},1194,,\n".encode())
-    agent.thread.join(5)
-    assert result == [3]
+    runner.address, runner.gateway = TUNNEL, GATEWAY
+    agent, _chowned = _agent(tmp_path, monkeypatch, runner=runner,
+                             proc_tcp=lambda: _LISTEN.splitlines()[0])
+    assert agent.run() == 3
     saved = json.loads(agenting.state_path(agent.paths, GEN).read_text(encoding="utf-8"))
     assert (saved["phase"], saved["reason"]) == ("failed", "SOCKS_FAILED")
     assert saved["tunnel_at"] > 0 and saved["inner"]["tcp"] == "TIMEOUT"
@@ -536,50 +518,58 @@ def test_worker_failure_after_the_tunnel_keeps_what_was_seen_inside(tmp_path, mo
     assert journal.count("итог туннеля:") == 1
 
 
-def test_tunnel_address_is_taken_from_push_reply_when_state_has_none(tmp_path, monkeypatch):
-    spawn = _Spawn(openvpn_lines=["PUSH: Received control message: 'PUSH_REPLY,ifconfig "
-                                  "10.8.0.10 10.8.0.9,tun-mtu 1400'"])
-    agent, ours, _chowned = _agent(tmp_path, monkeypatch, spawn=spawn)
-    result = _start(agent)
-    _wait(lambda: agent.state.get("phase") == "connecting")
-    ours.sendall(b">STATE:1730000000,CONNECTED,SUCCESS,,,,,\n")
-    _wait(lambda: agent.state.get("phase") == "up")
-    assert (agent.state["tunnel"], agent.state["mtu"]) == ("10.8.0.10", 1400)
-    agent.stop.set()
-    agent.thread.join(5)
-    assert result == [0]
-
-
-def test_wrong_credentials_end_the_generation(tmp_path, monkeypatch):
-    agent, ours, _chowned = _agent(tmp_path, monkeypatch)
-    result = _start(agent)
-    _wait(lambda: agent.state.get("phase") == "connecting")
-    ours.sendall(b">PASSWORD:Verification Failed: 'Auth'\n")
-    agent.thread.join(5)
-    assert result == [3]
-    assert (agent.state["phase"], agent.state["reason"]) == ("failed", "AUTH_FAILED")
+@pytest.mark.parametrize("lines, code", [
+    (["MS-CHAP authentication failed: E=691", "CHAP authentication failed"], "AUTH_FAILED"),
+    (["SSL certificate verification failed: self-signed certificate (18)",
+      "Verification of server certificate failed"], "CERT_VERIFY_FAILED"),
+    (["HTTP handshake with server failed"], "SSTP_REFUSED"),
+    ([], "UNKNOWN"),
+])
+def test_client_refusal_ends_the_generation(tmp_path, monkeypatch, lines, code):
+    agent, _chowned = _agent(tmp_path, monkeypatch,
+                             spawn=_Spawn(client_lines=lines, client_exits=True))
+    assert agent.run() == 3
+    assert (agent.state["phase"], agent.state["reason"]) == ("failed", code)
     journal = agent.out.getvalue()
     assert "охрана проверена: socks_to_peer ENETUNREACH" in journal and PEER not in journal
 
 
+def test_tunnel_that_never_comes_up_times_out_with_the_ppp_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(agenting, "UP_WAIT", 0.2)
+    agent, _chowned = _agent(tmp_path, monkeypatch, spawn=_Spawn(
+        client_lines=["LCP: timeout sending Config-Requests"]))
+    assert agent.run() == 3 and agent.state["reason"] == "PPP_TIMEOUT"
+    (tmp_path / "quiet").mkdir()
+    quiet, _chowned = _agent(tmp_path / "quiet", monkeypatch)  # клиент молчит
+    assert quiet.run() == 3 and quiet.state["reason"] == "TIMEOUT"
+
+
+def test_foreign_tunnel_address_is_refused(tmp_path, monkeypatch):
+    runner = _Runner()
+    runner.address, runner.gateway = "8.8.8.8", GATEWAY
+    agent, _chowned = _agent(tmp_path, monkeypatch, runner=runner)
+    assert agent.run() == 3 and agent.state["reason"] == "BAD_TUNNEL_ADDRESS"
+    assert not any(call[:3] == ("ip", "route", "replace") for call in runner.calls)
+
+
 def test_open_guard_stops_before_any_worker(tmp_path, monkeypatch):
-    """Самопроверка нашла выход мимо туннеля — GUARD_FAILED, работники не запускаются."""
+    """Самопроверка нашла выход мимо туннеля — GUARD_FAILED, клиент не запускается."""
     spawn = _Spawn(probe="OPEN")
-    agent, _ours, _chowned = _agent(tmp_path, monkeypatch, spawn=spawn)
+    agent, _chowned = _agent(tmp_path, monkeypatch, spawn=spawn)
     assert agent.run() == 3
     assert (agent.state["phase"], agent.state["reason"]) == ("failed", "GUARD_FAILED")
-    assert spawn.workers == [] and not (tmp_path / "tmp" / "xgw-ovpn").exists()
+    assert spawn.workers == [] and not (tmp_path / "tmp" / "xgw-vpn").exists()
 
 
 def test_refusal_counts_as_closed_only_with_the_guard_counter(tmp_path, monkeypatch):
     """ECONNREFUSED и прочие отказы — «закрыто охраной», только если вырос счётчик этого
-    пользователя (refused_socks, refused_ovpn); вырос чужой (ответы ядра) или никакой — пакет
+    пользователя (refused_socks, refused_vpn); вырос чужой (ответы ядра) или никакой — пакет
     мог уйти, и это провал самопроверки."""
-    agent, _ours, _chowned = _agent(
+    agent, _chowned = _agent(
         tmp_path, monkeypatch, spawn=_Spawn(probe="ECONNREFUSED"),
-        runner=_Runner(grow={agenting.REFUSED_OVPN, agenting.REFUSED_SOCKS}))
+        runner=_Runner(grow={agenting.REFUSED_VPN, agenting.REFUSED_SOCKS}))
     manifest = _manifest(tmp_path)
-    ids = {"ovpn": USERS[agenting.OVPN_USER], "socks": USERS[agenting.SOCKS_USER]}
+    ids = {"vpn": USERS[agenting.VPN_USER], "socks": USERS[agenting.SOCKS_USER]}
     results = agent._selftest(manifest, ids)
     assert all(value == "ECONNREFUSED (охрана)" for value in results.values())
     for grow in ({agenting.REFUSED_OTHER, agenting.DROPPED_V6}, ()):
@@ -631,9 +621,8 @@ def _backend(tmp_path, **runner):
 
 
 def _prepare(backend):
-    return backend.prepare(peer=PEER, proto="udp", port=1194, openvpn_conf="client\n",
-                           auth="vpn\nvpn\n", lan=("192.168.50.0/24",),
-                           xray_bin=Path("/opt/xgw/xray/xray"))
+    return backend.prepare(peer=PEER, port=443, host=HOST, user="vpn", password="vpn",
+                           lan=("192.168.50.0/24",), xray_bin=Path("/opt/xgw/xray/xray"))
 
 
 def test_generation_is_prepared_in_order_and_removed_without_traces(tmp_path):
@@ -641,7 +630,7 @@ def test_generation_is_prepared_in_order_and_removed_without_traces(tmp_path):
     задание агент принимает как есть; остановка убирает службу, veth, адрес и каталог."""
     backend, host, paths = _backend(tmp_path)
     lease = _prepare(backend)
-    element = f"{PEER} . udp . 1194"
+    element = f"{PEER} . tcp . 443"
     assert (lease.index, lease.pid, lease.element) == (1, 4242, element)
     calls = host.calls
     add = calls.index(("nft", "add", "element", "ip", "xgw", "fp_peers", "{", element, "}"))
@@ -653,6 +642,7 @@ def test_generation_is_prepared_in_order_and_removed_without_traces(tmp_path):
     assert oct(manifest_file.stat().st_mode & 0o777) == "0o600"
     manifest = agenting.load_manifest(manifest_file, lease.gen)
     assert (manifest.peer, manifest.index, manifest.socks_pass) == (PEER, 1, lease.socks_pass)
+    assert (manifest.host, manifest.sstpc_bin) == (HOST, "/usr/sbin/sstpc")
     assert backending.peer_elements(paths) == (element,)
 
     backend.stop(lease)
@@ -682,7 +672,7 @@ def test_waiting_ends_on_up_on_exit_and_on_the_deadline(tmp_path):
     backend, host, paths = _backend(tmp_path)
     lease = _prepare(backend)
     state = agenting.state_path(paths, lease.gen)
-    atomic_write_json(state, {"phase": "up", "tunnel": "10.8.0.6"}, mode=0o600)
+    atomic_write_json(state, {"phase": "up", "tunnel": TUNNEL}, mode=0o600)
     assert backend.wait(lease)["phase"] == "up"
     atomic_write_json(state, {"phase": "connecting"}, mode=0o600)
     host.active = "failed"
@@ -696,7 +686,7 @@ def test_waiting_ends_on_up_on_exit_and_on_the_deadline(tmp_path):
 
 def test_traffic_is_counted_on_the_host_veth(tmp_path):
     backend, _host, _paths = _backend(tmp_path)
-    lease = backending.Lease(gen=GEN, index=5, peer=PEER, proto="tcp", port=443)
+    lease = backending.Lease(gen=GEN, index=5, peer=PEER, port=443)
     assert backend.counters(lease) == 0
     stats = tmp_path / "sys-class-net" / "fpv5" / "statistics"
     stats.mkdir(parents=True)
@@ -731,11 +721,13 @@ def test_peer_elements_accept_only_address_proto_port(tmp_path):
 
 
 def test_backend_unavailable_says_why(tmp_path):
-    """Без OpenVPN, пользователей, службы, пересылки IPv4 или набора fp_peers — проверки
-    туннелем нет, и причина видна в сводке и в xgw diag."""
+    """Без sstpc и pppd, модуля sstp-pppd-plugin.so, /dev/ppp, пользователей, службы,
+    пересылки IPv4 или набора fp_peers — проверки туннелем нет, и причина видна в сводке и в
+    xgw diag."""
     paths = Paths(root=tmp_path / "root")
     paths.ensure()
-    openvpn = tmp_path / "openvpn"
+    sstpc, pppd = tmp_path / "sstpc", tmp_path / "pppd"
+    plugins, ppp = tmp_path / "pppd-plugins", tmp_path / "dev-ppp"
     proc_sys = tmp_path / "proc-sys"
     (proc_sys / "net" / "ipv4").mkdir(parents=True)
     forward = proc_sys / "net" / "ipv4" / "ip_forward"
@@ -750,12 +742,19 @@ def test_backend_unavailable_says_why(tmp_path):
         return ""
 
     def check(runner=nft_ok) -> str:
-        return backending.unavailable(paths, runner, openvpn=openvpn, users=users,
-                                      proc_sys=proc_sys)
+        return backending.unavailable(paths, runner, sstpc=sstpc, pppd=pppd, plugins=plugins,
+                                      ppp_device=ppp, users=users, proc_sys=proc_sys)
 
-    assert "нет OpenVPN" in check()
-    openvpn.write_text("", encoding="utf-8")
-    assert "нет пользователя xgw-ovpn" in check()
+    assert "нет клиента SSTP (пакет sstp-client" in check()
+    sstpc.write_text("", encoding="utf-8")
+    assert "нет клиента SSTP" in check()  # без pppd — тоже
+    pppd.write_text("", encoding="utf-8")
+    assert "нет модуля pppd sstp-pppd-plugin.so" in check()
+    (plugins / "2.5.2").mkdir(parents=True)
+    (plugins / "2.5.2" / "sstp-pppd-plugin.so").write_text("", encoding="utf-8")
+    assert "нет устройства /dev/ppp" in check()
+    ppp.write_text("", encoding="utf-8")
+    assert "нет пользователя xgw-vpn" in check()
     known.update(USERS)
     assert "нет службы xgw-fp@.service" in check()
     paths.systemd_dir.mkdir(parents=True, exist_ok=True)
@@ -786,7 +785,7 @@ def test_pool_rules_exist_only_with_the_pool_and_go_first(lan_if, capture):
     форвардинга») и маскарадинг 10.250.0.0/16 — только при free_pool.mode не off."""
     cfg = Config()
     cfg.network.lan_if = lan_if
-    element = f"{PEER} . udp . 1194"
+    element = f"{PEER} . tcp . 443"
     off = nft.render(nft.build_rules(cfg, capture=capture, time_uids=(),
                                      fp_peers=(element,))[0])
     assert "fp_peers" not in off and "fpv" not in off and "10.250." not in off
@@ -817,11 +816,11 @@ class _Runtime:
 
     def prepare(self, **kwargs) -> backending.Lease:
         self.prepared.append(kwargs)
-        return backending.Lease(gen=GEN, index=1, peer=kwargs["peer"], proto=kwargs["proto"],
-                                port=kwargs["port"], socks_pass="p" * 24)
+        return backending.Lease(gen=GEN, index=1, peer=kwargs["peer"], port=kwargs["port"],
+                                socks_pass="p" * 24)
 
     def wait(self, lease, *, cancel=None) -> dict:
-        return {"phase": "up", "tunnel": "10.8.0.6"}
+        return {"phase": "up", "tunnel": TUNNEL}
 
     def counters(self, lease) -> int:
         return 700_000
@@ -834,14 +833,24 @@ class _Runtime:
         self.stopped.append(lease.gen)
 
 
-def test_openvpn_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
-    """Бэкенд годится — сервер OpenVPN проверяется настоящим туннелем: временный Xray идёт
-    через SOCKS-работника поколения; трафик — больший из счётчиков; поколение убирается;
-    подключений — не больше одного за шаг и не больше предела в час (R26, R29)."""
+def _gate_variants(count: int, **changes):
+    from xgw.freepool import providers
+
+    catalog = providers.parse_vpngate((FIXTURES / "vpngate.html").read_text(encoding="utf-8"),
+                                      now=1_800_000_000.0)
+    first = catalog.variants[0]
+    return [replace(first, host=f"vpn{index}.opengw.example", address=PEER, country_hint="DE",
+                    **changes) for index in range(count)]
+
+
+def test_sstp_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
+    """Бэкенд годится — сервер SSTP проверяется настоящим туннелем: временный Xray идёт через
+    SOCKS-работника поколения; задание — адрес, порт, имя и общий вход VPN Gate; трафик —
+    больший из счётчиков; поколение убирается; подключений — не больше одного за шаг и не
+    больше предела в час (R26, R29)."""
     from xgw.freepool import pool as pool_module
     from xgw.freepool import probe as probe_module
-    from xgw.freepool import providers
-    from xgw.freepool.models import Backend, ProviderResult, Status
+    from xgw.freepool.models import ProviderResult, Status
     from xgw.freepool.pool import FreePool
     from xgw.freepool.probe import Outcome
 
@@ -851,11 +860,7 @@ def test_openvpn_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     cfg.free_pool.mode = "observe"
     cfg.free_pool.providers = ["vpngate"]
     cfg.free_pool.handshakes_per_hour = 1
-    catalog = providers.parse_vpngate((FIXTURES / "vpngate.csv").read_text(encoding="utf-8"),
-                                      now=1_800_000_000.0)
-    variants = [replace(variant, address=PEER, country_hint="DE")
-                for variant in catalog.variants if variant.backend == Backend.OPENVPN][:2]
-    assert len(variants) == 2
+    variants = _gate_variants(2)
     runtime = _Runtime()
     pool = FreePool(cfg, paths, runtime=runtime, clock=lambda: 1_800_000_100.0,
                     sleep=lambda seconds: None)
@@ -872,18 +877,21 @@ def test_openvpn_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     assert pool.check_some(mark=2, xray_bin=Path("/opt/xgw/xray/xray"),
                            via=("127.0.0.1", 10809)) == 1
     assert len(runtime.prepared) == 1 and runtime.stopped == [GEN]
-    assert runtime.prepared[0]["peer"] == PEER and "remote 1.0.0.1" in \
-        runtime.prepared[0]["openvpn_conf"]
+    prepared = runtime.prepared[0]
+    assert (prepared["peer"], prepared["port"], prepared["user"], prepared["password"]) == (
+        PEER, 443, "vpn", "vpn")
+    assert prepared["host"] in {variant.host for variant in variants}
     assert seen == [{"tag": "pool", "protocol": "socks", "settings": {"servers": [{
         "address": "10.250.1.2", "port": 1080, "users": [{"user": "xgw", "pass": "p" * 24}],
     }]}}]
     summary = pool.summary()
     assert (summary["tunnels_up"], summary["handshakes_hour"], summary["ready"]) == (1, 1, 1)
-    assert summary["openvpn_backend"] == "" and summary["by_region"] == {"EU": 1}
+    assert summary["tunnel_backend"] == "" and summary["by_region"] == {"EU": 1}
     assert pool.spent_today() == 700_000
     # Что агент видел изнутри — в записи кандидата и журнале демона, без адресов.
     [record] = [value for key, value in pool.store.candidates().items()
                 if not key.startswith("_")]
+    assert record["backend"] == "sstp"
     assert record["diagnosis"] == ("TCP Cloudflare:443 — TIMEOUT; DNS Cloudflare — TIMEOUT; "
                                    "в туннель 30 пакетов (2 КБ), из туннеля 0 пакетов (0 КБ)")
     # Предел подключений в час (1) исчерпан — второй сервер ждёт, а не подключается.
@@ -895,13 +903,8 @@ def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):
     """Отчёт М2а.1: туннели поднялись, работник отказал — а в записях ни «туннель поднимался»,
     ни что видно изнутри. Теперь — и то и другое, вместе с отбитым охраной после подъёма."""
     from xgw.freepool import probe as probe_module
-    from xgw.freepool import providers
-    from xgw.freepool.models import Backend
 
-    catalog = providers.parse_vpngate((FIXTURES / "vpngate.csv").read_text(encoding="utf-8"),
-                                      now=1_800_000_000.0)
-    variant = next(replace(item, address=PEER) for item in catalog.variants
-                   if item.backend == Backend.OPENVPN and item.profile is not None)
+    [variant] = _gate_variants(1)
 
     class Failing(_Runtime):
         def wait(self, lease, *, cancel=None) -> dict:
@@ -909,24 +912,27 @@ def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):
                     "detail": "SOCKS-работник не открыл порт", "tunnel_at": 1_800_000_050.0,
                     "link_after_up": {"rx_packets": 4, "rx_bytes": 2048, "tx_packets": 12,
                                       "tx_bytes": 4096},
-                    "refused_after_up": {"refused_ovpn": 0, "refused_socks": 20,
+                    "refused_after_up": {"refused_vpn": 0, "refused_socks": 20,
                                          "refused_other": 1, "dropped_v6": 4}}
 
     runtime = Failing()
-    outcome = probe_module.check_openvpn(
-        variant, variant.profile, runtime=runtime, cfg=Config(),
-        xray_bin=Path("/opt/xgw/xray/xray"), run_dir=tmp_path)
+    outcome = probe_module.check_tunnel(
+        variant, runtime=runtime, cfg=Config(), xray_bin=Path("/opt/xgw/xray/xray"),
+        run_dir=tmp_path, user="vpn", password="vpn")
     assert (outcome.verdict, outcome.tunnel_up) == ("SOCKS_FAILED", True)
     assert outcome.diagnosis == (
         "TCP Cloudflare:443 — TIMEOUT; DNS Cloudflare — TIMEOUT; в туннель 30 пакетов (2 КБ), "
         "из туннеля 0 пакетов (0 КБ); канал к серверу: от сервера 4 пакетов (2 КБ), к серверу "
-        "12 пакетов (4 КБ); охрана после подъёма: OpenVPN 0, работник 20, ответы ядра 1, "
+        "12 пакетов (4 КБ); охрана после подъёма: клиент VPN 0, работник 20, ответы ядра 1, "
         "служебный IPv6 4")
     assert runtime.stopped == [GEN]
 
 
-def test_without_backend_openvpn_falls_back_to_the_address_check(tmp_path, monkeypatch):
+def test_without_backend_sstp_falls_back_to_the_address_check(tmp_path, monkeypatch):
+    """Бэкенда нет — у сервера SSTP проверяется только TCP к публичному адресу напрямую, а
+    причина видна в сводке."""
     from xgw.freepool import pool as pool_module
+    from xgw.freepool import probe as probe_module
 
     paths = Paths(root=tmp_path / "root")
     paths.ensure()
@@ -934,9 +940,24 @@ def test_without_backend_openvpn_falls_back_to_the_address_check(tmp_path, monke
     cfg.free_pool.mode = "observe"
     pool = pool_module.FreePool(cfg, paths, runtime=_Runtime(), sleep=lambda seconds: None)
     monkeypatch.setattr(pool_module.backending, "unavailable",
-                        lambda *args, **kwargs: "нет OpenVPN (пакет openvpn — ставит xgw install)")
-    assert pool.refresh_backend().startswith("нет OpenVPN")
-    assert "проверка туннелем недоступна: нет OpenVPN" in pool_module.render(pool.summary(), 0)
+                        lambda *args, **kwargs: "нет клиента SSTP (пакет sstp-client — ставит "
+                        "xgw install)")
+    assert pool.refresh_backend().startswith("нет клиента SSTP")
+    assert "проверка туннелем недоступна: нет клиента SSTP" in pool_module.render(
+        pool.summary(), 0)
+    [variant] = _gate_variants(1)
+    calls: list[tuple] = []
+
+    def tcp_check(address, port, *, timeout, mark):
+        calls.append((address, port, mark))
+        return True
+
+    assert probe_module.check_tunnel_reach(variant, 2, tcp_check=tcp_check).verdict \
+        == "REACHABLE"
+    assert calls == [(PEER, 443, 2)]
+    private = replace(variant, address="198.51.100.7")
+    assert probe_module.check_tunnel_reach(private, 2, tcp_check=tcp_check).verdict \
+        == "UNTESTED" and len(calls) == 1
 
 
 def _tunnel_pool(tmp_path, monkeypatch, catalogs: dict, **values):
@@ -969,22 +990,12 @@ def _tunnel_pool(tmp_path, monkeypatch, catalogs: dict, **values):
     return pool, runtime, clock
 
 
-def _gate_variants(count: int, **changes):
-    from xgw.freepool import providers
-    from xgw.freepool.models import Backend
-
-    catalog = providers.parse_vpngate((FIXTURES / "vpngate.csv").read_text(encoding="utf-8"),
-                                      now=1_800_000_000.0)
-    [first] = [variant for variant in catalog.variants if variant.backend == Backend.OPENVPN][:1]
-    return [replace(first, host=f"vpn{index}.example", address=PEER, country_hint="DE",
-                    **changes) for index in range(count)]
-
-
 def test_exhausted_source_does_not_block_the_other(tmp_path, monkeypatch):
-    """У VPN Gate предел подключений в час исчерпан — следующим шагом подключается сервер
-    VPNBook, даже если перед ним в очереди много серверов VPN Gate."""
+    """У одного источника предел подключений в час исчерпан — следующим шагом подключается
+    сервер другого (здесь — подставной второй источник туннелей), даже если перед ним в
+    очереди много серверов первого."""
     gate = _gate_variants(9)
-    book = [replace(_gate_variants(1)[0], provider="vpnbook", host="book.example",
+    book = [replace(_gate_variants(1)[0], provider="vpnbook", host="book.opengw.example",
                     country_hint="")]
     pool, runtime, clock = _tunnel_pool(tmp_path, monkeypatch, {"vpngate": gate,
                                                                 "vpnbook": book},
@@ -1030,7 +1041,7 @@ def test_address_only_result_does_not_delay_the_tunnel(tmp_path, monkeypatch):
     state = pool.store.candidates()
     for variant, verdict in ((reachable, "REACHABLE"), (closed, "CLOSED")):
         state[variant.variant_id] = {"checked_at": clock[0] - 60, "verdict": verdict,
-                                     "backend": "openvpn", "provider": "vpngate"}
+                                     "backend": "sstp", "provider": "vpngate"}
     pool.store.save_candidates(state)
     assert pool.next_checks(None) == []
     assert [variant.variant_id for variant in pool.next_checks(None, tunnels=True)] == [

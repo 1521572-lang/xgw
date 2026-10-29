@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку)",
     )
     pool_mode.add_argument("mode", choices=("off", "observe"))
-    # Агент поколения OpenVPN — его запускает служба xgw-fp@<gen> (freepool/agent.py).
+    # Агент поколения туннеля SSTP — его запускает служба xgw-fp@<gen> (freepool/agent.py).
     pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
     pool_agent.add_argument("gen")
     core = subparsers.add_parser(
@@ -1069,7 +1069,7 @@ def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .freepool import backend as backending
     from .freepool import pool as pooling
 
-    # Сводка демона (её же показывает панель): только он знает, годится ли бэкенд OpenVPN.
+    # Сводка демона (её же показывает панель): только он знает, годится ли бэкенд туннелей.
     # Отчёт М2а: своя сводка CLI писала «проверка туннелем недоступна: ещё не проверялся» при
     # четырёх поднятых туннелях. Демона нет — своя, бэкенд проверяется здесь же (без уборки
     # поколений: ими ведает демон).

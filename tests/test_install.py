@@ -329,7 +329,7 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
     assert sum(1 for item in box.system.profiles.values()
                if item["connection.id"] == nm.PROFILE) == 1
     # xray и два работника бесплатного пула — каждый по одному разу.
-    assert [call[-1] for call in box.system.commands("useradd")] == ["xgw-ovpn", "xgw-fps",
+    assert [call[-1] for call in box.system.commands("useradd")] == ["xgw-vpn", "xgw-fps",
                                                                      "xray"]
 
 

@@ -802,8 +802,8 @@ def test_open_fail_mode_and_plain_http_subscription_are_warned(box):
 
 
 def test_free_pool_backend_and_its_ufw_rule(box, monkeypatch):
-    """«Бесплатный пул»: выключен — OK; бэкенд OpenVPN не годится — WARN с причиной (серверы
-    OpenVPN тогда проверяются только доступностью адреса); при включённом ufw без правила для
+    """«Бесплатный пул»: выключен — OK; бэкенд SSTP не годится — WARN с причиной (серверы
+    SSTP тогда проверяются только доступностью адреса); при включённом ufw без правила для
     fpv+ — FAIL с готовой командой."""
     from xgw.freepool import backend as fpbackend
 
@@ -812,9 +812,10 @@ def test_free_pool_backend_and_its_ufw_rule(box, monkeypatch):
     box.cfg.free_pool.mode = "observe"
     assert box.diag(is_root=False)._free_pool()[0].level == WARN
     monkeypatch.setattr(fpbackend, "unavailable",
-                        lambda *args, **kwargs: "нет OpenVPN (пакет openvpn — ставит xgw install)")
+                        lambda *args, **kwargs: "нет клиента SSTP (пакет sstp-client — ставит "
+                        "xgw install)")
     [check] = box.diag()._free_pool()
-    assert check.level == WARN and "только доступностью адреса: нет OpenVPN" in check.text
+    assert check.level == WARN and "только доступностью адреса: нет клиента SSTP" in check.text
     monkeypatch.setattr(fpbackend, "unavailable", lambda *args, **kwargs: "")
     assert [check.level for check in box.diag()._free_pool()] == [OK]
     box.system.ufw_active = True

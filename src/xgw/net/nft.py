@@ -173,7 +173,7 @@ class Rules:
     direct_lan: tuple[str, ...] = ()
     direct_local: bool = False
     # Бесплатный пул (free_pool.mode не off, docs/FREEPOOL-PLAN.md): из пространств имён
-    # агентов OpenVPN (veth fpv*) в интернет — только к серверам из fp_peers («адрес . протокол
+    # агентов туннелей (veth fpv*) в интернет — только к серверам из fp_peers («адрес . протокол
     # . порт»), с маскарадингом; остальное из fpv* и в fpv* закрыто.
     free_pool: bool = False
     fp_peers: tuple[str, ...] = ()
@@ -494,7 +494,7 @@ def _fp_set(rules: Rules) -> list[str]:
 
 
 def _fp_forward() -> list[str]:
-    """Форвардинг из пространств имён агентов OpenVPN — первым в цепочке, раньше правила
+    """Форвардинг из пространств имён агентов туннелей — первым в цепочке, раньше правила
     «чужой форвардинг» (иначе fpv* → WAN прошёл бы им): только к серверу из fp_peers и ответы
     обратно; остальное из fpv* и в fpv* — сброс."""
     return [
@@ -746,7 +746,7 @@ def render(rules: Rules) -> str:
                 f'iifname "{ts.INTERFACE}" {QUIC_MATCH} ip saddr != @{TS_EXIT_SET} {QUIC_REJECT}'
             )
         forward = [
-            # Бесплатный пул: агенты OpenVPN — только к своим серверам (раньше «чужого»).
+            # Бесплатный пул: агенты туннелей — только к своим серверам (раньше «чужого»).
             *(_fp_forward() if rules.free_pool else []),
             # QUIC устройств сети и tailnet — отбить сразу: браузер уйдёт на TCP/443.
             *quic,

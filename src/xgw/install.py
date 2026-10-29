@@ -46,16 +46,19 @@ UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 # Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
 # LAN настроен, — и обновление ядер из панели (cores.UNIT): её не включают вовсе, она
 # работает только по заданию демона. Порядок — порядок запуска; останавливаются в обратном.
-# Бесплатный пул: служба одного поколения OpenVPN (шаблон; её запускает только демон).
+# Бесплатный пул: служба одного поколения туннеля SSTP (шаблон; её запускает только демон).
 FP_UNIT = "xgw-fp@.service"
 UNIT_FILES = (
     "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service", cores.UNIT,
     FP_UNIT,
 )
 XRAY_USER = "xray"
-# Работники бесплатного пула (freepool/agent.py): OpenVPN и SOCKS — каждый от своего
-# пользователя, без входа и без возможностей.
-FP_USERS = ("xgw-ovpn", "xgw-fps")
+# Работники бесплатного пула (freepool/agent.py): клиент SSTP (sstpc после подключения) и
+# SOCKS — каждый от своего пользователя, без входа и без возможностей. xgw-ovpn (OpenVPN до
+# вехи М2в) больше не создаётся; созданного прежней установкой убирает xgw uninstall (журнал).
+FP_USERS = ("xgw-vpn", "xgw-fps")
+# Клиент SSTP бесплатного пула: пакет Ubuntu sstp-client (sstpc и модуль pppd; тянет ppp).
+SSTP_PACKAGE = "sstp-client"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
 # Сколько systemd ждёт остановки демона (TimeoutStopSec в packaging/xgw.service), и сколько
 # ждут его перезапуска установка и удаление: дольше, с запасом на запуск. Демон, занятый
@@ -309,8 +312,8 @@ class Installer:
             facts.packages.append("nftables")
         if facts.lan_if and self.which("dnsmasq") is None:
             facts.packages.append(dnsmasq.PACKAGE)
-        if self.which("openvpn") is None:
-            facts.packages.append("openvpn")  # бесплатный пул: работник OpenVPN (М2а)
+        if self.which("sstpc") is None:
+            facts.packages.append(SSTP_PACKAGE)  # бесплатный пул: туннели SSTP (М2в)
         facts.user_exists = bool(
             self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
         )
@@ -404,7 +407,7 @@ class Installer:
         if facts.fp_users_missing:
             lines.append(
                 f"  • системные пользователи {', '.join(facts.fp_users_missing)} (без входа) — "
-                "работники бесплатных серверов OpenVPN"
+                "работники туннелей бесплатных серверов (SSTP и SOCKS)"
             )
         lines.append(f"  • код — {self.paths.lib_dir}, команда — {self.paths.launcher}")
         if self._xray_fits(facts.xray_version):

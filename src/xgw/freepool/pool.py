@@ -13,6 +13,9 @@ free_pool.*_refresh_min со сдвигом ±20 % (R12); после ошибк�
 Списки GitHub (providers.LIST_PROVIDERS) — так же через несущий канал (файлы — десятки КБ, раз в
 free_pool.lists_refresh_min), а проверки их серверов — без бюджета трафика суток, своим числом
 за шаг (free_pool.list_checks_per_step) и чаще (LIST_CHECK_EVERY): решение заказчика 28.10.2026.
+
+Туннели — с вехи М2в серверы SSTP VPN Gate (OpenVPN убран 29.10.2026 по решению заказчика):
+пределы подключений R29 и порядок проверки — прежние, вход — общий «vpn»/«vpn».
 """
 
 from __future__ import annotations
@@ -21,17 +24,16 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 from .. import fetch, log, masking
 from ..config import Config
 from ..net import cmd
 from ..paths import Paths
 from . import backend as backending
-from . import ovpn, ovpnconf, providers, regions
 from . import probe as probing
+from . import providers, regions
 from . import traffic as trafficking
 from .models import Access, Backend, ProviderResult, Status, Variant
 from .store import PoolStore
@@ -46,7 +48,6 @@ CHECK_EVERY = 6 * 3600.0  # проверенный вариант снова —
 LIST_CHECK_EVERY = 2 * 3600.0
 DAY = 86400.0
 HOUR = 3600.0
-PROFILE_TTL = DAY  # профиль VPNBook скачивается заново раз в сутки
 SOURCE_LEASE = DAY  # вариант, которого нет в каталоге дольше суток, новым не назначается (R13)
 
 Fetcher = Callable[..., fetch.FetchResult]
@@ -83,7 +84,6 @@ class FreePool:
         self.next_refresh: dict[str, float] = {}
         self.failures: dict[str, int] = {}
         self._lock = threading.Lock()
-        self._remember_secrets()
         self._prune_retired()
 
     def _prune_retired(self) -> None:
@@ -97,13 +97,14 @@ class FreePool:
         if removed:
             self.log.info("бесплатный пул: удалены снимки убранных источников — %s",
                           ", ".join(removed))
-
-    def _remember_secrets(self) -> None:
-        """Общие учётки источников (пароль VPNBook) коротки для регулярок маскировки — их
-        значения регистрируются явно (log.add_secrets)."""
-        shared = self.store.secrets().get("shared") or {}
-        log.add_secrets(str(value) for record in shared.values() if isinstance(record, dict)
-                        for key, value in record.items() if key == "password")
+        try:
+            retired = self.store.retire_openvpn()
+        except OSError as exc:
+            self.log.warning("бесплатный пул: остатки OpenVPN не удалены: %s", exc)
+            return
+        if retired:
+            self.log.info("бесплатный пул: OpenVPN убран (веха М2в) — удалены %s",
+                          ", ".join(retired))
 
     # --- источники ------------------------------------------------------------------------
 
@@ -142,23 +143,12 @@ class FreePool:
                 return ProviderResult(provider, status, retrieved_at=now, detail=detail)
             return providers.parse_vpngate(text, now=now)
         if provider == providers.VPNBOOK:
-            text, status, detail = self._fetch_text(
-                provider, providers.VPNBOOK_OPENVPN_URL, via, mark)
-            if text is None:
-                return ProviderResult(provider, status, retrieved_at=now, detail=detail)
-            result = providers.parse_vpnbook_openvpn(text, now=now)
-            self.sleep(REQUEST_SPACING)
+            # С вехи М2в — только ключи Outline (страница OpenVPN и её учётка не нужны).
             text, status, detail = self._fetch_text(
                 provider, providers.VPNBOOK_OUTLINE_URL, via, mark)
-            outline = (providers.parse_vpnbook_outline(text, now=now) if text is not None
-                       else ProviderResult(provider, status, detail=detail))
-            if outline.status is Status.SUCCESS:
-                result.variants.extend(outline.variants)
-            elif result.status is Status.SUCCESS:
-                result.status = Status.PARTIAL
-                result.complete_response = False
-                result.detail = f"страница Outline: {outline.detail or outline.status}"
-            return result
+            if text is None:
+                return ProviderResult(provider, status, retrieved_at=now, detail=detail)
+            return providers.parse_vpnbook_outline(text, now=now)
         if provider in providers.LIST_URLS:
             return self._poll_list(provider, via=via, mark=mark, now=now)
         return ProviderResult(provider, Status.DISABLED, retrieved_at=now)
@@ -207,8 +197,6 @@ class FreePool:
                 self.sleep(REQUEST_SPACING)
             result = self.poll(provider, via=via, mark=mark)
             accepted = self.store.commit(result)
-            if accepted and result.credentials:
-                self._remember_secrets()
             if result.status in (Status.SUCCESS, Status.PARTIAL):
                 self.failures.pop(provider, None)
                 self.next_refresh[provider] = now + _due(self._interval(provider))
@@ -254,18 +242,15 @@ class FreePool:
 
     def next_checks(self, limit: int | None, *, tunnels: bool = False) -> list[Variant]:
         """Кого проверить сейчас (None — всех по порядку): сначала с подсказкой нужного
-        региона, ещё не проверенных и давно проверенных; варианты, которым нужен профиль, —
-        только туннелем. Сервер OpenVPN, у которого проверяли только адрес (REACHABLE, без
-        бэкенда), туннелем проверяется сразу, а не через 6 часов."""
+        региона, ещё не проверенных и давно проверенных. Сервер SSTP, у которого проверяли
+        только адрес (REACHABLE, без бэкенда), туннелем проверяется сразу, а не через 6 часов."""
         now = self.clock()
         state = self.store.candidates()
         ready: list[tuple[tuple, Variant]] = []
         for variant in self.variants():
-            if variant.needs == "profile" and not tunnels:
-                continue  # профиль VPNBook нужен только туннелю
             record = state.get(variant.variant_id, {})
             checked = float(record.get("checked_at") or 0.0)
-            if tunnels and variant.backend == Backend.OPENVPN \
+            if tunnels and variant.backend == Backend.SSTP \
                     and record.get("verdict") == "REACHABLE":
                 checked = 0.0
             every = LIST_CHECK_EVERY if variant.provider in providers.LIST_PROVIDERS \
@@ -285,7 +270,7 @@ class FreePool:
                    if isinstance(item, list) and now - float(item[0]) < DAY)
 
     def refresh_backend(self) -> str:
-        """Годится ли бэкенд OpenVPN сейчас (backend.unavailable); при первой проверке —
+        """Годится ли бэкенд туннелей сейчас (backend.unavailable); при первой проверке —
         убрать следы поколений прошлого запуска демона."""
         self.backend_problem = backending.unavailable(self.paths, self.runner)
         if not self.backend_problem and not self._reconciled:
@@ -302,7 +287,7 @@ class FreePool:
                 if isinstance(item, list) and len(item) == 2 and now - float(item[0]) < DAY]
 
     def handshake_allowed(self, provider: str) -> bool:
-        """Пределы новых подключений OpenVPN (R29): в час, в сутки, в час на источник."""
+        """Пределы новых подключений туннелей (R29): в час, в сутки, в час на источник."""
         pool = self.cfg.free_pool
         now = self.clock()
         items = self.handshakes()
@@ -316,40 +301,6 @@ class FreePool:
         state["_handshakes"] = {"items": [*self.handshakes(), [self.clock(), provider]]}
         self.store.save_candidates(state)
 
-    def openvpn_material(self, variant: Variant, *, via, mark: int | None,
-                         ) -> tuple[ovpn.OvpnProfile | None, str, str]:
-        """Профиль и учётка для туннеля: (профиль, auth-текст, почему нельзя). VPNBook —
-        профиль официальной кнопкой «Download» через несущий канал (раз в сутки) и общая
-        учётка со страницы."""
-        profile = variant.profile
-        if variant.needs == "profile":
-            text, fetched = self.store.profile(variant.variant_id)
-            if not text or self.clock() - fetched > PROFILE_TTL:
-                url = vpnbook_profile_url(variant)
-                fetched_text, status, detail = self._fetch_text(variant.provider, url, via, mark)
-                if fetched_text is None:
-                    return None, "", f"профиль не скачан: {status} {detail}".strip()
-                text = fetched_text
-                self.store.save_profile(variant.variant_id, text)
-            try:
-                profile = ovpn.parse(text)
-            except ovpn.OvpnRejected as exc:
-                return None, "", f"профиль отклонён: {exc}"
-        if profile is None:
-            return None, "", "нет профиля"
-        auth = ""
-        if profile.needs_password:
-            account = (self.store.secrets().get("shared") or {}).get(
-                variant.credential_scope or variant.provider) or {}
-            if variant.provider == providers.VPNGATE and not account:
-                account = {"username": "vpn", "password": "vpn"}  # общий логин VPN Gate
-            try:
-                auth = ovpnconf.auth_text(str(account.get("username") or ""),
-                                          str(account.get("password") or ""))
-            except ovpn.OvpnRejected:
-                return None, "", "нет учётки источника"
-        return profile, auth, ""
-
     def _lan(self) -> tuple[str, ...]:
         from ..net import lan
 
@@ -359,7 +310,7 @@ class FreePool:
     def check_some(self, *, mark: int | None, xray_bin: Path | None, via=None,
                    cancel=None) -> int:
         """Проверить до free_pool.checks_per_step вариантов каталогов в пределах бюджета
-        суток; туннелем OpenVPN — не больше одного за шаг и в пределах рукопожатий (R26, R29).
+        суток; туннелем SSTP — не больше одного за шаг и в пределах рукопожатий (R26, R29).
         Серверы списков GitHub — сверх этого, до free_pool.list_checks_per_step за шаг и без
         бюджета (решение заказчика 28.10.2026: экономия трафика для них не нужна)."""
         budget = (self.cfg.free_pool.budget_mb - self.cfg.free_pool.health_reserved_mb) * 1_048_576
@@ -388,25 +339,21 @@ class FreePool:
                     continue
                 outcome = proxied
             elif not tunnels:
-                if variant.needs:
-                    continue
-                outcome = probing.check_openvpn_reach(variant, mark)
+                outcome = probing.check_tunnel_reach(variant, mark)
             else:
                 if tunnel_checks or not self.handshake_allowed(variant.provider):
                     continue
-                profile, auth, why = self.openvpn_material(variant, via=via, mark=mark)
-                if profile is not None and not probing.openvpn_peer(variant, profile):
+                if not probing.tunnel_peer(variant):
                     # Без публичного IPv4 подключаться не к чему — и предел не тратится.
-                    profile, why = None, "у сервера нет публичного IPv4"
-                if profile is None:
-                    outcome = probing.Outcome("UNTESTED", error=why[:160])
+                    outcome = probing.Outcome("UNTESTED", error="у сервера нет публичного IPv4")
                 else:
                     self._note_handshake(variant.provider)
                     tunnel_checks += 1
-                    outcome = probing.check_openvpn(
-                        replace(variant, profile=profile), profile, runtime=self.runtime,
-                        cfg=self.cfg, xray_bin=xray_bin, run_dir=self.paths.run / "freepool",
-                        auth=auth, lan=self._lan(), cancel=cancel,
+                    assert xray_bin is not None
+                    outcome = probing.check_tunnel(
+                        variant, runtime=self.runtime, cfg=self.cfg, xray_bin=xray_bin,
+                        run_dir=self.paths.run / "freepool", user=providers.VPNGATE_USER,
+                        password=providers.VPNGATE_PASSWORD, lan=self._lan(), cancel=cancel,
                     )
             self._record(variant, outcome)
             done[kind] += 1
@@ -489,9 +436,9 @@ class FreePool:
             for region in regions.regions_of(record.get("egress_country") or ""):
                 if "auto" in wanted or region in wanted:
                     by_region[region] = by_region.get(region, 0) + 1
-        openvpn_checked = [r for r in checked if r.get("backend") == Backend.OPENVPN]
+        tunnel_checked = [r for r in checked if r.get("backend") == Backend.SSTP]
         failures: dict[str, int] = {}
-        for record in openvpn_checked:
+        for record in tunnel_checked:
             verdict = str(record.get("verdict") or "")
             if not record.get("tunnel_up") and verdict not in ("REACHABLE", "CLOSED",
                                                                "UNTESTED"):
@@ -505,8 +452,8 @@ class FreePool:
             ready_by_source[source] = ready_by_source.get(source, 0) + 1
         listed = [v for v in variants if v.provider in providers.LIST_PROVIDERS]
         return {
-            "openvpn_backend": self.backend_problem,
-            "tunnels_up": len([r for r in openvpn_checked if r.get("tunnel_up")]),
+            "tunnel_backend": self.backend_problem,
+            "tunnels_up": len([r for r in tunnel_checked if r.get("tunnel_up")]),
             "tunnel_failures": failures,
             "handshakes_hour": len(hour), "handshakes_day": len(day_items),
             "handshakes_day_limit": day_limit,
@@ -523,10 +470,10 @@ class FreePool:
             "lists_singbox": len([v for v in listed if v.backend == Backend.SINGBOX]),
             "outline": len([v for v in variants if v.backend == Backend.XRAY
                             and v.provider not in providers.LIST_PROVIDERS]),
-            "openvpn": len([v for v in variants if v.backend == Backend.OPENVPN]),
+            "sstp": len([v for v in variants if v.backend == Backend.SSTP]),
             "checked": len(checked), "ready": len(ready), "by_region": by_region,
             "ready_by_source": ready_by_source,
-            "reachable_openvpn": len([r for r in checked if r.get("verdict") == "REACHABLE"]),
+            "reachable_tunnel": len([r for r in checked if r.get("verdict") == "REACHABLE"]),
             "closed": len([r for r in checked if r.get("verdict") == "CLOSED"]),
             "spent_mb": round(self.spent_today() / 1_048_576, 1),
             "budget_mb": self.cfg.free_pool.budget_mb,
@@ -554,7 +501,7 @@ POOL_STATUS = {
 
 
 def _quota_text(free_at: float) -> str:
-    """Суточный предел подключений OpenVPN занят — с какого времени снова можно."""
+    """Суточный предел подключений туннелей занят — с какого времени снова можно."""
     if not free_at:
         return ""
     return (" — суточный предел занят, следующее после "
@@ -569,17 +516,17 @@ def render(summary: dict, now: float) -> str:
              f"({'строго' if summary.get('region_policy') == 'strict' else 'с запасными'})"]
     regions_text = ", ".join(f"{name} {count}" for name, count in sorted(
         (summary.get("by_region") or {}).items()))
-    problem = summary.get("openvpn_backend") or ""
+    problem = summary.get("tunnel_backend") or ""
     lines.append(
         f"Найдено {summary.get('found', 0)}: из списков GitHub {summary.get('lists', 0)}"
         f" (из них только sing-box {summary.get('lists_singbox', 0)}), Outline "
-        f"{summary.get('outline', 0)}, OpenVPN {summary.get('openvpn', 0)}"
+        f"{summary.get('outline', 0)}, SSTP (VPN Gate) {summary.get('sstp', 0)}"
         + (f" (проверка туннелем недоступна: {problem})" if problem else ""))
     if not problem:
         failures = ", ".join(f"{code} {count}" for code, count in sorted(
             (summary.get("tunnel_failures") or {}).items()))
         lines.append(
-            f"OpenVPN туннелем: поднялось {summary.get('tunnels_up', 0)}"
+            f"SSTP туннелем: поднялось {summary.get('tunnels_up', 0)}"
             + (f", отказы: {failures}" if failures else "")
             + f"; подключений за час {summary.get('handshakes_hour', 0)}, за сутки "
             f"{summary.get('handshakes_day', 0)} из {summary.get('handshakes_day_limit', '?')}"
@@ -587,7 +534,7 @@ def render(summary: dict, now: float) -> str:
     lines.append(
         f"Проверено {summary.get('checked', 0)}, пригодно {summary.get('ready', 0)}"
         + (f" ({regions_text})" if regions_text else "")
-        + f"; OpenVPN с открытым адресом {summary.get('reachable_openvpn', 0)}, адрес закрыт "
+        + f"; SSTP с открытым адресом {summary.get('reachable_tunnel', 0)}, адрес закрыт "
         f"{summary.get('closed', 0)}")
     by_source = ", ".join(f"{POOL_SOURCES.get(name, name)} {count}" for name, count in sorted(
         (summary.get("ready_by_source") or {}).items()))
@@ -613,11 +560,6 @@ def render(summary: dict, now: float) -> str:
         status_text = POOL_STATUS.get(source.get("status"), source.get("status"))
         lines.append(f"  {name}: {status_text} · " + " · ".join(extra))
     return "\n".join(lines)
-
-
-def vpnbook_profile_url(variant: Variant) -> str:
-    """Адрес официальной кнопки «Download» для профиля варианта VPNBook (М2)."""
-    return providers.VPNBOOK_PROFILE_URL + "?" + urlencode(providers.vpnbook_profile_query(variant))
 
 
 def run_dir(paths: Paths) -> Path:

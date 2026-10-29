@@ -1235,9 +1235,9 @@ class Diag:
         return [Check(name, OK, f"{who}: через бесплатный пул, серверов в «pool»: {len(pool)}")]
 
     def _free_pool_backend(self) -> list[Check]:
-        """Бесплатный пул (docs/FREEPOOL-PLAN.md): режим и годится ли бэкенд OpenVPN — без
-        него серверы OpenVPN проверяются только доступностью адреса; при включённом ufw — есть
-        ли правило для veth поколений (fpv+), иначе ufw отбросит их соединения."""
+        """Бесплатный пул (docs/FREEPOOL-PLAN.md): режим и годится ли бэкенд туннелей SSTP —
+        без него серверы SSTP проверяются только доступностью адреса; при включённом ufw —
+        есть ли правило для veth поколений (fpv+), иначе ufw отбросит их соединения."""
         from .freepool import backend as fpbackend
 
         name = "Бесплатный пул"
@@ -1245,21 +1245,22 @@ class Diag:
         if mode == "off":
             return [Check(name, OK, "выключен — режим подписок")]
         if not self.root:
-            return [Check(name, WARN, f"режим {mode}; бэкенд OpenVPN без sudo не проверить",
+            return [Check(name, WARN, f"режим {mode}; бэкенд SSTP без sudo не проверить",
                           "sudo xgw diag")]
         problem = fpbackend.unavailable(self.paths, self.runner, proc_sys=self.proc_sys)
         if problem:
-            return [Check(name, WARN, f"режим {mode}; серверы OpenVPN проверяются только "
+            return [Check(name, WARN, f"режим {mode}; серверы SSTP проверяются только "
                                       f"доступностью адреса: {problem}")]
-        result = [Check(name, OK, f"режим {mode}; бэкенд OpenVPN готов (openvpn, пользователи "
-                                  "xgw-ovpn и xgw-fps, служба xgw-fp@, набор fp_peers)")]
+        result = [Check(name, OK, f"режим {mode}; бэкенд SSTP готов (sstpc и pppd, /dev/ppp, "
+                                  "пользователи xgw-vpn и xgw-fps, служба xgw-fp@, набор "
+                                  "fp_peers)")]
         if self.which("ufw") is not None and ufw.active(self.runner):
             listed = self.runner(["ufw", "status"], timeout=20.0, check=False)
             if "fpv+" not in listed:
                 wan = lan.effective_wan(self.cfg, self.runner)
                 rule = ufw.wanted(self.lan_if or "lan", wan)[-1]  # правило пула — последнее
                 result.append(Check(
-                    name, FAIL, "ufw включён, а правила для туннелей OpenVPN (fpv+) нет: их "
+                    name, FAIL, "ufw включён, а правила для туннелей SSTP (fpv+) нет: их "
                                 "соединения ufw отбросит", "sudo ufw " + " ".join(rule)))
         return result
 

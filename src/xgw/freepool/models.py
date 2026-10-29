@@ -2,8 +2,8 @@
 
 Идентичность — не 32-битный отпечаток подписок (model.make_fingerprint), а variant_id: 128 бит
 SHA-256 от канонического описания (источник, бэкенд, протокол, адрес, порт, транспорт, отпечаток
-профиля или outbound'а). endpoint_id — источник + хост + порт + транспорт: один сервер разных
-вариантов (TCP/UDP, другой профиль) — общий endpoint.
+outbound'а). endpoint_id — источник + хост + порт + транспорт: один сервер разных вариантов —
+общий endpoint.
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
-
-from .ovpn import OvpnProfile
 
 
 class Status(StrEnum):
@@ -36,7 +34,9 @@ class Access(StrEnum):
 
 
 class Backend(StrEnum):
-    OPENVPN = "openvpn"  # отдельный изолированный работник (веха М2)
+    # Туннель SSTP в изолированном пространстве имён (agent.py, веха М2в: вместо OpenVPN —
+    # решение заказчика 29.10.2026).
+    SSTP = "sstp"
     XRAY = "xray"  # outbound Xray: VLESS, VMess, Trojan, Shadowsocks (Outline, списки GitHub)
     SINGBOX = "sing-box"  # только sing-box: Hysteria2, TUIC, AnyTLS (списки GitHub)
 
@@ -47,7 +47,7 @@ class Variant:
 
     provider: str
     backend: str
-    protocol: str  # openvpn | shadowsocks | vless | vmess | trojan | hysteria2 | tuic | anytls
+    protocol: str  # sstp | shadowsocks | vless | vmess | trojan | hysteria2 | tuic | anytls
     host: str
     address: str  # IPv4 из каталога, если он есть
     port: int
@@ -58,12 +58,7 @@ class Variant:
     # Показатели источника (ping, speed, score, sessions…) — подсказки порядка проверки, не
     # измерения шлюза (R23 шаг 2).
     hints: tuple[tuple[str, str], ...] = ()
-    # Чего не хватает до подключения: "" — ничего, "profile" — профиля (VPNBook: скачивается
-    # отдельно официальной кнопкой страницы; учётка — общая со страницы).
-    needs: str = ""
-    credential_scope: str = ""
     usage_policy: tuple[str, ...] = ()  # например ("no-torrent",)
-    profile: OvpnProfile | None = None
     outbound: dict | None = None
     source_url: str = ""
     extra: tuple[tuple[str, str], ...] = field(default=())
@@ -77,9 +72,7 @@ class Variant:
 
     @property
     def variant_id(self) -> str:
-        if self.profile is not None:
-            payload = self.profile.digest()
-        elif self.outbound is not None or self.singbox is not None:
+        if self.outbound is not None or self.singbox is not None:
             payload = hashlib.sha256(
                 json.dumps(self.outbound if self.outbound is not None else self.singbox,
                            sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -104,6 +97,3 @@ class ProviderResult:
     detail: str = ""
     rejected: int = 0  # строк каталога, не принятых разбором (причины — в rejections)
     rejections: dict[str, int] = field(default_factory=dict)
-    # Общие учётки источника (VPNBook: одна пара на все серверы): область → {username,
-    # password, updated}. Секрет: в журнал и панель не попадает.
-    credentials: dict[str, dict[str, str]] = field(default_factory=dict)

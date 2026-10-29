@@ -1527,11 +1527,12 @@
     } else {
       const regionsText = Object.entries(sum.by_region || {}).map(([name, count]) => `${name} ${count}`).join(", ");
       const failures = Object.entries(sum.tunnel_failures || {}).map(([code, count]) => `${code} ${count}`).join(", ");
-      const openvpn = sum.openvpn_backend
-        ? `OpenVPN — ${sum.openvpn} (туннелем не проверить: ${sum.openvpn_backend}; адрес открыт — ${sum.reachable_openvpn}, закрыт — ${sum.closed})`
-        : `OpenVPN — ${sum.openvpn}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки OpenVPN после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
+      // Туннели — серверы SSTP VPN Gate (веха М2в; до неё — OpenVPN).
+      const tunnels = sum.tunnel_backend
+        ? `SSTP (VPN Gate) — ${sum.sstp || 0} (туннелем не проверить: ${sum.tunnel_backend}; адрес открыт — ${sum.reachable_tunnel || 0}, закрыт — ${sum.closed})`
+        : `SSTP (VPN Gate) — ${sum.sstp || 0}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки туннелем после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
       const bySource = Object.entries(sum.ready_by_source || {}).map(([name, count]) => `${POOL_SOURCES[name] || name} — ${count}`).join(", ");
-      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.${poolFlowText(sum.traffic, s.devices)}`;
+      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${tunnels}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.${poolFlowText(sum.traffic, s.devices)}`;
       fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },
         el("div", { class: "row-main" },
           el("div", { class: "row-title" }, el("span", { text: POOL_SOURCES[src.id] || src.id }),

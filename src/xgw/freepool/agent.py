@@ -1,50 +1,57 @@
-"""Агент бесплатного сервера OpenVPN (веха М2а): процесс службы xgw-fp@<gen>.
+"""Агент бесплатного сервера SSTP (веха М2в; до неё — OpenVPN, М2а): процесс службы
+xgw-fp@<gen>.
+
+С вехи М2в туннель — MS-SSTP (PPP поверх TLS по TCP) клиентом sstpc и pppd из пакетов Ubuntu
+sstp-client и ppp: OpenVPN убран из XGW по решению заказчика 29.10.2026 («неэффективен в
+условиях ТСПУ» — тот распознаёт его по протоколу, а SSTP для DPI — обычный TLS). Всё, что
+вокруг туннеля (пространство имён, охрана, veth, самопроверка, проверка изнутри,
+SOCKS-работник, счётчики), — прежнее, проверенное отчётами М2а–М2а.4.
 
 Демон запускает службу с PrivateNetwork=yes: у агента своё пространство имён сети, в нём
-только lo. Возможности — CAP_NET_ADMIN (правила, адреса и маршруты своего пространства),
-CAP_SETUID и CAP_SETGID (работники — от своих пользователей), CAP_CHOWN (файлы работников),
-CAP_KILL (их остановка: uid другой); NoNewPrivileges. По шагам:
+только lo. Возможности — CAP_NET_ADMIN (правила, адреса и маршруты своего пространства; ею же
+pppd создаёт интерфейс PPP), CAP_SETUID и CAP_SETGID (работники — от своих пользователей),
+CAP_CHOWN (файлы работников, каталог sstpc), CAP_KILL (их остановка); NoNewPrivileges. /etc/ppp
+службы — пустой (TemporaryFileSystem): ни /etc/ppp/options, ни скрипты ip-up хоста pppd не
+видит. По шагам:
 
 1. охрана nftables (таблица inet xgwfp, guard_rules): ввод, вывод и форвардинг закрыты,
    открыто только перечисленное там, — раньше, чем появится хоть один маршрут;
-2. постоянный TUN fpt0 с владельцем xgw-ovpn (`ip tuntap add … user`): работник OpenVPN
-   подключается к нему без возможностей, а создать другое устройство не может (проверено в
-   пространстве имён WSL);
-3. veth: демон создаёт пару fpv<idx>/fpi<idx> и переносит fpi<idx> сюда по PID агента; агент
+2. veth: демон создаёт пару fpv<idx>/fpi<idx> и переносит fpi<idx> сюда по PID агента; агент
    ставит 10.250.<idx>.2/30 и маршрут только к адресу сервера (/32 через хост);
-4. самопроверка охраны (R46, «самый важный тест»): при живом маршруте к серверу и без
-   туннеля пользователь SOCKS к серверу и наружу не выходит, пользователь OpenVPN — к хосту и
-   наружу, кроме сервера; не так — GUARD_FAILED, работники не запускаются;
-5. OpenVPN (от xgw-ovpn): конфиг — в /tmp службы (PrivateTmp — у каждого поколения свой),
-   root:<группа работника>, 0640;
-6. интерфейс управления OpenVPN (127.0.0.1 в своём пространстве): CONNECTED — адрес туннеля
-   на fpt0 и маршрут по умолчанию в fpt0; RECONNECTING, EXITING и прочие — маршрут убран;
-7. после первого CONNECTED — проверка изнутри (inner_check, от пользователя SOCKS): TCP к
-   Cloudflare:443 и DNS через туннель — DNS сервера (dhcp-option из PUSH_REPLY) и Cloudflare;
-   затем SOCKS-работник (Xray от xgw-fps; конфиг так же в /tmp службы) с ответившим DNS
-   первым. Отчёт М2а 28.10.2026: четыре туннеля поднялись, а через них не прошло ни одного
-   запроса — без этой проверки не понять, кто не пропускает: сервер (или ТСПУ) или путь до
-   работника. Готовность работника — по /proc/net/tcp (порт слушается), без подключения:
-   отчёт М2а.1 — подключение агента к порту работника охрана отбивала (ответ работника через
-   lo ей не разрешён), и все туннели кончались SOCKS_FAILED;
-8. состояние — /run/xgw/fp/<gen>/state.json (его читает демон; пока туннель поднят — и
+3. самопроверка охраны (R46, «самый важный тест»): при живом маршруте к серверу и без
+   туннеля пользователь SOCKS к серверу и наружу не выходит, пользователь VPN (xgw-vpn — от
+   него sstpc работает после подключения) — ни к серверу, ни к хосту, ни наружу; не так —
+   GUARD_FAILED, клиент не запускается;
+4. sstpc — от root (иначе он не запустит pppd), подключается к IPv4 сервера (имя DDNS — только
+   в HTTP и для сертификата: SNI не посылается, ключ --tls-ext не задан), проверяет цепочку
+   сертификата по системным (--ca-dir /etc/ssl/certs; у серверов VPN Gate — доверенный
+   сертификат *.opengw.net, проверено в браузере 29.10.2026), запускает pppd с файлом ключей
+   (ppp_options: интерфейс fpt0, без маршрута по умолчанию, без DNS сервера, без IPv6) и
+   сбрасывает права на xgw-vpn (--priv-user; без --priv-dir: chroot требует CAP_SYS_CHROOT).
+   TCP-сокет создан до сброса — у охраны он root (meta skuid 0), поэтому к серверу открыт
+   только root, а xgw-vpn — никуда;
+5. туннель поднят — у fpt0 появился адрес (IPCP; `ip -4 -o addr`): агент ставит маршрут по
+   умолчанию в fpt0; адрес пропал или клиент завершился — отказ (LINK_LOST): переподключения
+   нет, поколение заменяет демон;
+6. после подъёма — проверка изнутри (inner_check, от пользователя SOCKS): TCP к
+   Cloudflare:443 и DNS через туннель — DNS шлюза туннеля (адрес другого конца PPP) и
+   Cloudflare; затем SOCKS-работник (Xray от xgw-fps) с ответившим DNS первым. Готовность
+   работника — по /proc/net/tcp (порт слушается), без подключения (отчёт М2а.1);
+7. состояние — /run/xgw/fp/<gen>/state.json (его читает демон; пока туннель поднят — и
    счётчики fpt0 и охраны раз в 2 с). SIGTERM или отказ — работники останавливаются, итог
-   туннеля (пакеты в туннель и из него, ошибки канала данных, отбитое охраной) — одной строкой
-   в журнал и в состояние раньше фазы failed (демон берёт его в запись проверки),
-   пространство имён исчезает вместе со службой, а с ним и veth.
+   туннеля (пакеты в туннель и из него, канал к серверу, отбитое охраной) — одной строкой
+   в журнал и в состояние раньше фазы failed, пространство имён исчезает вместе со службой.
 
-Счётчики охраны — по отправителю (отчёт М2а.1: общий счётчик принимал за отказ OpenVPN ответы
-ядра): refused_ovpn — пакеты OpenVPN (рост до подъёма — GUARD_BLOCKED), refused_socks —
-работника SOCKS и проверки изнутри (после подъёма — попытка мимо туннеля), refused_other — без
-сокета работника (ответы ядра серверу: сброс TCP после закрытия соединения, ICMP), dropped_v6 —
-служебный IPv6 ядра при подъёме fpi и fpt0 (IPv6 здесь не нужен никому).
+Счётчики охраны — по отправителю (отчёт М2а.1): refused_vpn — клиент VPN (root и xgw-vpn;
+рост до подъёма — GUARD_BLOCKED), refused_socks — работник SOCKS и проверка изнутри (после
+подъёма — попытка мимо туннеля), refused_other — без сокета (ответы ядра серверу: сброс TCP,
+ICMP), dropped_v6 — служебный IPv6 ядра при подъёме fpi и fpt0.
 
-Строки журнала OpenVPN в журнал службы не пишутся: в состоянии — только коды причин
-(classify). Исключения — при отказе одна строка, по которой он распознан (evidence), и в итоге
-туннеля до трёх предупреждений OpenVPN (WARNING, OPTIONS ERROR, сжатие; без строк с
-настройками и учёткой) — с адресами IPv4 и именами хостов, заменёнными на <ip> и <host>: без
-них отказ на машине заказчика не разобрать. В итоге туннеля и канал к серверу (счётчики fpi с
-подъёма): отвечает ли сервер вообще, когда из туннеля ничего не приходит (отчёт М2а.2).
+Строки sstpc и pppd (оба пишут в вывод агента: sstpc — --log-stderr, без syslog; pppd — logfd
+2, и ещё в syslog — там только частные адреса туннеля) в журнал службы не пишутся: в состоянии
+— только коды причин (classify). Исключения — при отказе одна строка, по которой он
+распознан (evidence), и в итоге туннеля до трёх предупреждений — с адресами IPv4 и именами
+хостов, заменёнными на <ip> и <host>.
 """
 
 from __future__ import annotations
@@ -53,9 +60,7 @@ import ipaddress
 import json
 import os
 import re
-import select
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -68,72 +73,93 @@ from pathlib import Path
 from .. import masking
 from ..net import cmd
 from ..paths import Paths, atomic_write_json
-from .ovpn import OvpnRejected
-from .ovpnconf import AUTH_FILE, TUN, peer_address
 
 GEN_RE = re.compile(r"[0-9a-f]{10}")
 INDEX_MIN, INDEX_MAX = 1, 63
 SUBNET = "10.250.0.0/16"
+TUN = "fpt0"  # интерфейс PPP туннеля (pppd: ifname)
 SOCKS_PORT = 1080
-MGMT_PORT = 7505
 SOCKS_USER_NAME = "xgw"
-OVPN_USER, SOCKS_USER = "xgw-ovpn", "xgw-fps"
-OVPN_DIR, SOCKS_DIR = "/tmp/xgw-ovpn", "/tmp/xgw-socks"
+VPN_USER, SOCKS_USER = "xgw-vpn", "xgw-fps"
+VPN_DIR, SOCKS_DIR = "/tmp/xgw-vpn", "/tmp/xgw-socks"
+CA_DIR = "/etc/ssl/certs"
 TABLE = "xgwfp"
-REFUSED_OVPN, REFUSED_SOCKS, REFUSED_OTHER = "refused_ovpn", "refused_socks", "refused_other"
+REFUSED_VPN, REFUSED_SOCKS, REFUSED_OTHER = "refused_vpn", "refused_socks", "refused_other"
 DROPPED_V6 = "dropped_v6"
-COUNTERS = (REFUSED_OVPN, REFUSED_SOCKS, REFUSED_OTHER, DROPPED_V6)
+COUNTERS = (REFUSED_VPN, REFUSED_SOCKS, REFUSED_OTHER, DROPPED_V6)
 PROC_TCP = Path("/proc/net/tcp")  # сокеты TCP своего пространства имён
 VETH_WAIT = 20.0  # сколько ждать внутренний конец veth от демона
-UP_WAIT = 45.0  # подключение OpenVPN вместе с рукопожатием (R54: холодный кандидат — 45 с)
-RECONNECT_WAIT = 60.0  # после обрыва: не вернулся — отказ, а не вечные попытки
-MGMT_WAIT = 10.0
+UP_WAIT = 45.0  # подключение с рукопожатием (R54: холодный кандидат — 45 с)
+POLL_EVERY = 0.5  # до подъёма — как часто смотреть адрес fpt0
 STOP_WAIT = 5.0
 SOCKS_WAIT = 5.0  # SOCKS-работник открывает порт
 INNER_WAIT = 12.0  # проверка изнутри целиком (TCP 3 с и DNS по 2 с на сервер)
 STATS_EVERY = 2.0  # счётчики fpt0 в состояние, пока туннель поднят
 LOG_LINES = 60
 MAX_MANIFEST = 512 * 1024
-PUBLIC_DNS = ("1.1.1.1", "8.8.8.8")  # после DNS сервера; 1.1.1.1 проверяется изнутри
+PUBLIC_DNS = ("1.1.1.1", "8.8.8.8")  # после DNS шлюза туннеля; 1.1.1.1 проверяется изнутри
 
-# Строки журнала OpenVPN 2.6 → причина (ТЗ R31, R42). Порядок важен: первая найденная.
+# Ключи pppd (справка pppd 2.4.9 Ubuntu 24.04 и 2.5.2 Ubuntu 26.04 — все есть в обеих):
+# файлом, а не командной строкой — у sstpc под аргументы pppd массив на 20 мест без проверки
+# границ (исходник sstp-pppd.c 1.0.20), а 11 из них он занимает сам. noresolvconf нет в 2.4.9
+# — не нужен: resolv.conf pppd пишет только с usepeerdns. pppd — от root (CAP_NET_ADMIN для
+# интерфейса), sstpc сам передаёт ему user, файл пароля и свой модуль sstp-pppd-plugin.so.
+PPP_OPTIONS = (
+    f"ifname {TUN}",
+    "nodetach",
+    "logfd 2",  # stdin и stdout pppd — терминал туннеля (sstp-task.c), stderr — вывод sstpc
+    "noauth",
+    "noipdefault",
+    "nodefaultroute",
+    "noipv6",
+    "refuse-eap",
+    "refuse-pap",
+    "refuse-chap",
+    "refuse-mschap",
+    "require-mschap-v2",
+    "nobsdcomp",
+    "nodeflate",
+    "novj",
+    "lcp-echo-interval 10",
+    "lcp-echo-failure 3",
+)
+
+# Строки sstpc 1.0.20 и pppd → причина (ТЗ R31, R42). Порядок важен: первая найденная.
+# Тексты sstpc — из его исходника (sstp-client.c, sstp-stream.c), pppd — из chap.c, lcp.c и
+# fsm.c; ошибки сокета — strerror в строках sstpc.
 _CAUSES = (
-    ("AUTH_FAILED", ("AUTH_FAILED", "auth-failure")),
-    ("CONFIG_REJECTED", ("Options error", "Unrecognized option")),
-    ("TUN_FAILED", ("Cannot open TUN/TAP", "TUNSETIFF", "Cannot ioctl")),
-    ("UNSUPPORTED_CRYPTO", ("md too weak", "key too small", "Unsupported cipher",
-                            "unsupported certificate", "no shared cipher")),
-    ("CERT_VERIFY_FAILED", ("VERIFY ERROR", "certificate verify failed", "VERIFY X509NAME",
-                            "VERIFY KU ERROR", "VERIFY EKU ERROR")),
+    ("AUTH_FAILED", ("authentication failed",)),
+    ("CERT_VERIFY_FAILED", ("Verification of server certificate failed",
+                            "SSL certificate verification failed",
+                            "certificate did not match")),
+    ("SSTP_REFUSED", ("HTTP handshake with server failed",)),
+    ("PPP_TIMEOUT", ("timeout sending Config-Requests",)),
+    ("LINK_LOST", ("echo-requests", "appears to be disconnected")),
+    ("PPP_DEVICE_FAILED", ("/dev/ppp", "Couldn't load plugin")),
+    ("SSTPC_SOCKET", ("Could not setup notification",)),
     ("CONNECT_REFUSED", ("Connection refused",)),
-    ("CONNECT_TIMEOUT", ("Connection timed out", "server-poll-timeout")),
-    ("TLS_HANDSHAKE_FAILED", ("TLS key negotiation failed", "TLS handshake failed",
-                              "TLS Error")),
-    ("TRANSPORT_RESET", ("Connection reset", "connection-reset")),
+    ("CONNECT_TIMEOUT", ("Connection timed out",)),
+    ("TRANSPORT_RESET", ("Connection reset",)),
     # Маршрута нет в своём пространстве имён — дефект шлюза (маршрут к серверу ставит агент).
     ("NETWORK_UNREACHABLE", ("Network is unreachable",)),
-    # EHOSTUNREACH: ICMP «узел недоступен» или «запрещено» с пути к серверу — либо отказ своей
-    # охраны (admin-prohibited). Охрана — только если вырос её счётчик (run: GUARD_BLOCKED).
+    # EHOSTUNREACH: ICMP «узел недоступен» с пути — либо отказ своей охраны (admin-prohibited).
+    # Охрана — только если вырос её счётчик (run: GUARD_BLOCKED).
     ("HOST_UNREACHABLE", ("No route to host",)),
+    # TCP или TLS не сложились, а errno sstpc не написал.
+    ("CONNECT_FAILED", ("Could not complete connect", "Could not connect to")),
 )
-# Канал данных после подъёма: пакеты не расшифровываются или отброшены (сжатие, шифр, адрес).
-_DATA_ERRORS = ("Decrypt", "decompression header", "bad source address",
-                "HMAC authentication failed", "Bad compression")
 # Отказ, причина которого не распознана: последняя строка с такой пометкой (evidence).
-_MARKERS = ("FATAL", "ERROR", "error", "failed", "Exiting due to")
-# Предупреждения OpenVPN — первые три в итог туннеля, без адресов (отчёт М2а.2: туннели подняты,
-# а назад — ни пакета; несогласие о сжатии и т. п. OpenVPN пишет именно так). Строки с
-# настройками и учёткой — никогда.
-_NOTICES = ("WARNING", "OPTIONS ERROR", "compress")
-_SETTINGS_LINES = ("PUSH", "auth-user-pass")
-_STAMP = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
-_STATE = re.compile(r"^(?:>STATE:)?(\d+),([A-Z_]+),([^,]*),?([^,]*),?([^,]*)")
-_PUSH_IFCONFIG = re.compile(r"PUSH_REPLY.*?\bifconfig (\d{1,3}(?:\.\d{1,3}){3}) ")
-_PUSH_MTU = re.compile(r"PUSH_REPLY.*?\btun-mtu (\d{3,5})\b")
-_PUSH_DNS = re.compile(r"\bdhcp-option DNS (\d{1,3}(?:\.\d{1,3}){3})\b")
+_MARKERS = ("Could not", "failed", "Failed", "error", "Error", "Terminat")
+# Предупреждения клиента — первые три в итог туннеля (сброс прав, каталог sstpc и т. п.).
+_NOTICES = ("Could not", "warn", "WARN")
 _IPV4_ANY = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _HOSTNAME = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
-_FILE_SUFFIXES = {"conf", "ovpn", "json", "txt", "pem", "crt", "key", "py"}
+_FILE_SUFFIXES = {"conf", "options", "json", "txt", "pem", "crt", "key", "py", "so"}
+_DNS_NAME = re.compile(r"(?=.{4,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+                       r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+_ACCOUNT = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_INET = re.compile(r"\binet (\d{1,3}(?:\.\d{1,3}){3})(?: peer (\d{1,3}(?:\.\d{1,3}){3}))?")
+_MTU = re.compile(r"\bmtu (\d{3,5})\b")
 
 
 class AgentError(Exception):
@@ -150,15 +176,27 @@ class Manifest:
 
     gen: str
     index: int
-    peer: str
-    proto: str
+    peer: str  # публичный IPv4 сервера — к нему подключается sstpc
     port: int
-    openvpn_conf: str
-    auth: str  # содержимое auth-user-pass или ""
+    host: str  # имя сервера (DDNS): заголовок HTTP SSTP и проверка сертификата
+    user: str
+    password: str
     socks_pass: str
     lan: tuple[str, ...]  # сети, с которыми адрес туннеля не должен пересекаться
     xray_bin: str
-    openvpn_bin: str
+    sstpc_bin: str
+
+
+def peer_address(text: str) -> str:
+    """Адрес сервера: только публичный IPv4 (R45: один закреплённый адрес на вариант; имя
+    здесь не резолвится). ValueError — не годится."""
+    try:
+        address = ipaddress.IPv4Address(text.strip())
+    except ValueError as exc:
+        raise ValueError("адрес сервера — не IPv4") from exc
+    if not address.is_global:
+        raise ValueError("адрес сервера — не публичный")
+    return str(address)
 
 
 def host_address(index: int) -> str:
@@ -190,7 +228,8 @@ def state_path(paths: Paths, gen: str) -> Path:
 
 
 def load_manifest(path: Path, gen: str) -> Manifest:
-    """Задание с проверкой каждого поля: агент — root, а значения уходят в ip, nft и конфиги."""
+    """Задание с проверкой каждого поля: агент — root, а значения уходят в ip, nft, аргументы
+    sstpc и файл ключей pppd."""
     if not GEN_RE.fullmatch(gen):
         raise AgentError("BAD_MANIFEST", "имя поколения не то")
     try:
@@ -202,11 +241,10 @@ def load_manifest(path: Path, gen: str) -> Manifest:
     try:
         manifest = Manifest(
             gen=str(data["gen"]), index=int(data["index"]), peer=str(data["peer"]),
-            proto=str(data["proto"]), port=int(data["port"]),
-            openvpn_conf=str(data["openvpn_conf"]), auth=str(data.get("auth") or ""),
-            socks_pass=str(data["socks_pass"]),
+            port=int(data["port"]), host=str(data["host"]), user=str(data["user"]),
+            password=str(data["password"]), socks_pass=str(data["socks_pass"]),
             lan=tuple(str(item) for item in data.get("lan") or ()),
-            xray_bin=str(data["xray_bin"]), openvpn_bin=str(data["openvpn_bin"]),
+            xray_bin=str(data["xray_bin"]), sstpc_bin=str(data["sstpc_bin"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AgentError("BAD_MANIFEST", f"в задании нет поля или оно не того вида: {exc}") from exc
@@ -217,13 +255,17 @@ def load_manifest(path: Path, gen: str) -> Manifest:
         problems.append("номер veth вне диапазона")
     try:
         peer_address(manifest.peer)
-    except OvpnRejected as exc:
+    except ValueError as exc:
         problems.append(str(exc))
-    if manifest.proto not in ("tcp", "udp") or not 0 < manifest.port < 65536:
-        problems.append("протокол или порт сервера")
+    if not 0 < manifest.port < 65536:
+        problems.append("порт сервера")
+    if not _DNS_NAME.fullmatch(manifest.host):
+        problems.append("имя сервера")
+    if not _ACCOUNT.fullmatch(manifest.user) or not _ACCOUNT.fullmatch(manifest.password):
+        problems.append("вход SSTP")
     if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", manifest.socks_pass):
         problems.append("пароль SOCKS")
-    for binary in (manifest.xray_bin, manifest.openvpn_bin):
+    for binary in (manifest.xray_bin, manifest.sstpc_bin):
         if not binary.startswith("/") or ".." in binary:
             problems.append("путь программы")
     for network in manifest.lan:
@@ -231,20 +273,18 @@ def load_manifest(path: Path, gen: str) -> Manifest:
             ipaddress.IPv4Network(network, strict=False)
         except ValueError:
             problems.append("сеть LAN")
-    if not manifest.openvpn_conf or "\x00" in manifest.openvpn_conf:
-        problems.append("конфиг OpenVPN")
     if problems:
         raise AgentError("BAD_MANIFEST", "; ".join(problems))
     return manifest
 
 
-def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
-    """Охрана пространства имён (R46). Вывод: lo — только root (агент) и OpenVPN (к своему
-    интерфейсу управления); OpenVPN — только к адресу, протоколу и порту сервера через veth;
+def guard_rules(manifest: Manifest, vpn_uid: int, socks_uid: int) -> str:
+    """Охрана пространства имён (R46). Вывод: lo — только root; к адресу и порту сервера через
+    veth — только root (TCP-сокет sstpc создан до сброса прав); xgw-vpn — никуда;
     SOCKS-работник — только в туннель (IPv4) и ответами на подключения хоста к своему порту.
     Ввод: lo, ответы на свои соединения и подключение хоста к SOCKS. Форвардинга нет вовсе.
-    Новые входящие из туннеля (сервер VPN к агенту, к SOCKS, к управлению) — закрыты.
-    Отбитое считается по отправителю (COUNTERS, docstring модуля)."""
+    Новые входящие из туннеля (сервер VPN к агенту, к SOCKS) — закрыты. Отбитое считается по
+    отправителю (COUNTERS, docstring модуля)."""
     inner, host = inner_link(manifest.index), host_address(manifest.index)
     me = inner_address(manifest.index)
     reject = "reject with icmpx type admin-prohibited"
@@ -262,16 +302,16 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
         "    }",
         "    chain output {",
         "        type filter hook output priority filter; policy drop;",
-        # IPv6 здесь не нужен никому (OpenVPN — к IPv4 сервера, работник — UseIPv4), а ядро
-        # само шлёт служебный (поиск маршрутизатора, MLD, DAD) при подъёме fpi и fpt0: в
-        # отбитое он не идёт — отчёт М2а.1 принял его за отказ подключения OpenVPN.
+        # IPv6 здесь не нужен никому (SSTP — к IPv4 сервера, pppd — noipv6, работник —
+        # ForceIPv4), а ядро само шлёт служебный (поиск маршрутизатора, MLD, DAD) при подъёме
+        # fpi и fpt0: в отбитое он не идёт — отчёт М2а.1 принял его за отказ подключения.
         f'        meta nfproto ipv6 counter name "{DROPPED_V6}" drop',
-        f'        oif "lo" meta skuid {{ 0, {ovpn_uid} }} accept',
+        '        oif "lo" meta skuid 0 accept',
         # Ответ отказа (reject ниже) ядро шлёт отправителю через lo, без сокета: без этого
         # правила охрана отбросила бы и его, и отказ превратился бы в таймаут.
         '        oif "lo" icmp type destination-unreachable accept',
-        f'        meta skuid {ovpn_uid} oifname "{inner}" ip daddr {manifest.peer} '
-        f"meta l4proto {manifest.proto} th dport {manifest.port} accept",
+        f'        meta skuid 0 oifname "{inner}" ip daddr {manifest.peer} '
+        f"tcp dport {manifest.port} accept",
         f'        meta skuid {socks_uid} oifname "{TUN}" meta nfproto ipv4 accept',
         f'        meta skuid {socks_uid} oifname "{inner}" ip daddr {host} ct state established '
         "accept",
@@ -279,10 +319,10 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
         "time-exceeded } accept",
         # Отказ, а не тихий сброс: работник узнаёт сразу, а самопроверка отличает «закрыто
         # охраной» от «пакет ушёл и не ответили» (TCP при drop ждал бы до таймаута).
-        f'        meta skuid {ovpn_uid} counter name "{REFUSED_OVPN}" {reject}',
+        f'        meta skuid {{ 0, {vpn_uid} }} counter name "{REFUSED_VPN}" {reject}',
         f'        meta skuid {socks_uid} counter name "{REFUSED_SOCKS}" {reject}',
-        # Без сокета работника: ответы ядра серверу (сброс TCP на его пакеты после закрытия
-        # соединения OpenVPN, ICMP), сам агент.
+        # Без сокета: ответы ядра серверу (сброс TCP на его пакеты после закрытия соединения,
+        # ICMP).
         f'        counter name "{REFUSED_OTHER}" {reject}',
         "    }",
         "    chain forward {",
@@ -292,10 +332,28 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
     )) + "\n"
 
 
+def ppp_options() -> str:
+    """Файл ключей pppd (`file …` в командной строке sstpc)."""
+    return "\n".join(PPP_OPTIONS) + "\n"
+
+
+def sstpc_argv(manifest: Manifest, options: Path) -> list[str]:
+    """Командная строка sstpc (справка sstpc 1.0.19/1.0.20 и его исходник): журнал — в вывод
+    агента на уровне INFO (2), цепочка сертификата — по системным, имя — в заголовке HTTP,
+    права — xgw-vpn после подключения, сервер — адрес:порт, дальше — ключи pppd."""
+    return [
+        manifest.sstpc_bin, "--log-stderr", "--log-level", "2",
+        "--ca-dir", CA_DIR, "--host", manifest.host,
+        "--user", manifest.user, "--password", manifest.password,
+        "--priv-user", VPN_USER, "--priv-group", VPN_USER, "--ipparam", manifest.gen,
+        f"{manifest.peer}:{manifest.port}", "file", str(options),
+    ]
+
+
 def socks_config(manifest: Manifest, dns: tuple[str, ...] | list[str] = PUBLIC_DNS) -> dict:
     """SOCKS-работник: Xray, socks с паролем на внутреннем адресе veth (TCP и UDP), выход —
     freedom по маршруту по умолчанию (он есть только в туннель), DNS — серверы через туннель:
-    DNS сервера VPN, если он прислал и тот ответил, затем публичные. Проверено xray run -test
+    DNS шлюза туннеля, если тот ответил, затем публичные. Проверено xray run -test
     (26.10.21). ForceIPv4, а не UseIPv4: при UseIPv4 Xray, не дождавшись своего DNS, спрашивает
     системный резолвер из /etc/resolv.conf (проверено в пространстве имён WSL: запросы A и AAAA)
     — у шлюза это 127.0.0.53 на lo, работнику туда нельзя, и охрана отбивала их (отчёт М2а.2:
@@ -320,43 +378,23 @@ def socks_config(manifest: Manifest, dns: tuple[str, ...] | list[str] = PUBLIC_D
     }
 
 
-def parse_state(line: str) -> tuple[str, str, str] | None:
-    """Строка состояния интерфейса управления (`>STATE:` или ответ на `state`): время,
-    состояние, описание, адрес TUN, адрес сервера… → (состояние, описание, адрес TUN)."""
-    match = _STATE.match(line.strip())
+def parse_addr(text: str) -> tuple[str, str]:
+    """Адреса туннеля из `ip -4 -o addr show dev fpt0`: (свой, другой конец PPP); ("", "") —
+    адреса ещё нет (IPCP не завершён)."""
+    match = _INET.search(text or "")
     if not match:
-        return None
-    return match.group(2), match.group(3), match.group(4)
+        return "", ""
+    return match.group(1), match.group(2) or ""
 
 
-def pushed(line: str) -> tuple[str, int]:
-    """Из строки журнала с PUSH_REPLY: адрес туннеля и MTU, если сервер их прислал."""
-    address = _PUSH_IFCONFIG.search(line)
-    mtu = _PUSH_MTU.search(line)
-    return (address.group(1) if address else ""), (int(mtu.group(1)) if mtu else 0)
-
-
-def pushed_dns(line: str) -> list[str]:
-    """DNS сервера из PUSH_REPLY (dhcp-option DNS; в конфиг они не принимаются — pull-filter,
-    но в журнал OpenVPN строка попадает целиком): IPv4 не из служебных сетей и не из сети veth,
-    не больше двух."""
-    if "PUSH_REPLY" not in line:
-        return []
-    found: list[str] = []
-    for text in _PUSH_DNS.findall(line):
-        try:
-            ip = ipaddress.IPv4Address(text)
-        except ValueError:
-            continue
-        if ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_link_local \
-                or ip in ipaddress.IPv4Network(SUBNET) or str(ip) in found:
-            continue
-        found.append(str(ip))
-    return found[:2]
+def parse_mtu(text: str) -> int:
+    """MTU интерфейса из `ip -o link show`; 0 — не найден."""
+    match = _MTU.search(text or "")
+    return int(match.group(1)) if match else 0
 
 
 def masked(line: str) -> str:
-    """Строка журнала OpenVPN для журнала службы: адреса IPv4 — <ip>, имена хостов — <host>
+    """Строка sstpc или pppd для журнала службы: адреса IPv4 — <ip>, имена хостов — <host>
     (имена файлов остаются), не длиннее 200 знаков."""
     text = _IPV4_ANY.sub("<ip>", line.strip())
 
@@ -385,7 +423,7 @@ def tunnel_problem(address: str, manifest: Manifest) -> str:
 
 
 def classify(lines) -> str:
-    """Причина отказа по журналу OpenVPN; UNKNOWN — не распознана."""
+    """Причина отказа по выводу sstpc и pppd; UNKNOWN — не распознана."""
     text = "\n".join(lines)
     for code, needles in _CAUSES:
         if any(needle in text for needle in needles):
@@ -394,9 +432,9 @@ def classify(lines) -> str:
 
 
 def evidence(lines, code: str) -> str:
-    """Строка журнала OpenVPN, по которой распознана причина code (masked); у UNKNOWN —
-    последняя строка с пометкой ошибки (FATAL, ERROR…): отчёт М2а — четыре UNKNOWN, и ни
-    одной строки, по которой их разобрать. Пусто — такой нет."""
+    """Строка вывода, по которой распознана причина code (masked); у UNKNOWN — последняя
+    строка с пометкой ошибки: отчёт М2а — четыре UNKNOWN, и ни одной строки, по которой их
+    разобрать. Пусто — такой нет."""
     lines = list(lines)
     needles = dict(_CAUSES).get(code, ())
     for line in lines:
@@ -451,10 +489,10 @@ _INNER = (
 )
 
 
-def inner_servers(pushed: list[str]) -> list[tuple[str, str]]:
+def inner_servers(gateways: list[str]) -> list[tuple[str, str]]:
     """DNS для проверки изнутри: (метка для журнала, адрес). Адреса в журнал не попадают."""
-    servers = [("сервера", address) for address in pushed]
-    if PUBLIC_DNS[0] not in pushed:
+    servers = [("шлюза туннеля", address) for address in gateways]
+    if PUBLIC_DNS[0] not in gateways:
         servers.append(("Cloudflare", PUBLIC_DNS[0]))
     return servers
 
@@ -484,7 +522,7 @@ def _result_text(value: object) -> str:
 
 def inner_text(inner: object) -> str:
     """Итог проверки изнутри по-русски и без адресов: «TCP Cloudflare:443 — OPEN (120 мс);
-    DNS сервера — TIMEOUT; DNS Cloudflare — OK (35 мс)»; пусто — проверки не было."""
+    DNS шлюза туннеля — TIMEOUT; DNS Cloudflare — OK (35 мс)»; пусто — проверки не было."""
     if not isinstance(inner, dict) or not inner:
         return ""
     parts = [f"TCP Cloudflare:443 — {_result_text(inner.get('tcp'))}"]
@@ -532,8 +570,8 @@ def link_delta(start: object, end: object) -> dict[str, int] | None:
 
 
 def link_text(delta: object) -> str:
-    """Канал к серверу по-русски: на fpi RX — от сервера, TX — к нему (с рукопожатием,
-    служебными пакетами OpenVPN и шифрованием)."""
+    """Канал к серверу по-русски: на fpi RX — от сервера, TX — к нему (с TLS и служебными
+    пакетами PPP)."""
     if not isinstance(delta, dict):
         return ""
     try:
@@ -580,11 +618,11 @@ def deltas(start: dict | None, end: dict | None) -> dict[str, int]:
 
 
 def guard_text(found: object) -> str:
-    """Прирост счётчиков охраны по-русски: «OpenVPN 0, работник 0, ответы ядра 2, служебный
-    IPv6 5»; пусто — счётчики не прочитаны."""
+    """Прирост счётчиков охраны по-русски: «клиент VPN 0, работник 0, ответы ядра 2,
+    служебный IPv6 5»; пусто — счётчики не прочитаны."""
     if not isinstance(found, dict) or not found:
         return ""
-    labels = ((REFUSED_OVPN, "OpenVPN"), (REFUSED_SOCKS, "работник"),
+    labels = ((REFUSED_VPN, "клиент VPN"), (REFUSED_SOCKS, "работник"),
               (REFUSED_OTHER, "ответы ядра"), (DROPPED_V6, "служебный IPv6"))
     return ", ".join(f"{label} {found[name]}" for name, label in labels if name in found)
 
@@ -630,7 +668,7 @@ _PROBE = (
     "    print(errno.errorcode.get(e.errno,'TIMEOUT') if e.errno else 'TIMEOUT')\n"
 )
 # Закрыто: нет маршрута (ENETUNREACH) — само по себе; остальное — только если вырос счётчик
-# отбитого охраной у этого пользователя (refused_ovpn, refused_socks): иначе пакет мог уйти.
+# отбитого охраной у этого пользователя (refused_vpn, refused_socks): иначе пакет мог уйти.
 NO_ROUTE = "ENETUNREACH"
 REJECTED = ("EPERM", "EACCES", "EHOSTUNREACH", "ECONNREFUSED", "EHOSTDOWN")
 _PACKETS = re.compile(r"packets (\d+)")
@@ -640,14 +678,13 @@ class Agent:
     def __init__(
         self, paths: Paths, gen: str, *, runner: cmd.Runner = cmd.run,
         spawn: Callable[..., subprocess.Popen] = subprocess.Popen,
-        connect: Callable[..., socket.socket] = socket.create_connection,
         users: Callable[[str], tuple[int, int]] | None = None,
         clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
         tmp: Path = Path("/tmp"), out=sys.stdout,
         proc_tcp: Callable[[], str] = lambda: PROC_TCP.read_text(encoding="ascii"),
     ) -> None:
         self.paths, self.gen = paths, gen
-        self.runner, self.spawn, self.connect = runner, spawn, connect
+        self.runner, self.spawn = runner, spawn
         self.proc_tcp = proc_tcp
         self.users = users or _user_ids
         self.clock, self.sleep = clock, sleep
@@ -655,13 +692,10 @@ class Agent:
         self.stop = threading.Event()
         self.children: dict[str, subprocess.Popen] = {}
         self.log: deque[str] = deque(maxlen=LOG_LINES)
-        self.pushed_address, self.pushed_mtu = "", 0
-        self.pushed_dns: list[str] = []
-        self.data_errors, self.data_error_line = 0, ""
         self.state: dict = {"gen": gen, "phase": "starting", "since": time.time()}
         self.manifest: Manifest | None = None
         self.ids: dict[str, tuple[int, int]] = {}
-        # Снимки счётчиков охраны (_counters): после самопроверки (подключение OpenVPN) и при
+        # Снимки счётчиков охраны (_counters): после самопроверки (подключение клиента) и при
         # подъёме (дальше — работник и проверка изнутри).
         self.refused_base: dict[str, int] | None = None
         self.refused_up: dict[str, int] | None = None
@@ -670,6 +704,7 @@ class Agent:
         self.socks_log: deque[str] = deque(maxlen=8)
         self.notices: list[str] = []
         self.link_up: dict[str, int] | None = None  # счётчики fpi при подъёме
+        self.reader: threading.Thread | None = None  # читает вывод sstpc и pppd
 
     # --- состояние для демона --------------------------------------------------------------
 
@@ -688,14 +723,10 @@ class Agent:
     def _ip(self, *args: str, check: bool = True) -> str:
         return self.runner(["ip", *args], timeout=10.0, check=check)
 
-    def _guard(self, manifest: Manifest, ovpn_uid: int, socks_uid: int) -> None:
+    def _guard(self, manifest: Manifest, vpn_uid: int, socks_uid: int) -> None:
         self._ip("link", "set", "lo", "up")
-        self.runner(["nft", "-f", "-"], input=guard_rules(manifest, ovpn_uid, socks_uid),
+        self.runner(["nft", "-f", "-"], input=guard_rules(manifest, vpn_uid, socks_uid),
                     timeout=10.0)
-
-    def _tun(self, ovpn_uid: int, ovpn_gid: int) -> None:
-        self._ip("tuntap", "add", "dev", TUN, "mode", "tun", "user", str(ovpn_uid),
-                 "group", str(ovpn_gid))
 
     def _veth(self, manifest: Manifest) -> None:
         name = inner_link(manifest.index)
@@ -728,15 +759,15 @@ class Agent:
         return (out or "").strip() or "TIMEOUT"
 
     def _selftest(self, manifest: Manifest, ids: dict[str, tuple[int, int]]) -> dict:
-        """R46: SOCKS к серверу (маршрут /32 есть, туннеля нет) и наружу, OpenVPN к хосту и
-        наружу, SOCKS к интерфейсу управления — всё должно быть закрыто."""
-        socks, ovpn = ids["socks"], ids["ovpn"]
+        """R46: SOCKS к серверу (маршрут /32 есть, туннеля нет) и наружу; пользователь VPN
+        (sstpc после сброса прав) к серверу, к хосту и наружу — всё должно быть закрыто."""
+        socks, vpn = ids["socks"], ids["vpn"]
         cases = {
             "socks_to_peer": (socks, REFUSED_SOCKS, manifest.peer, manifest.port),
             "socks_to_internet": (socks, REFUSED_SOCKS, "1.1.1.1", 443),
-            "socks_to_mgmt": (socks, REFUSED_SOCKS, "127.0.0.1", MGMT_PORT),
-            "ovpn_to_host": (ovpn, REFUSED_OVPN, host_address(manifest.index), 22),
-            "ovpn_to_internet": (ovpn, REFUSED_OVPN, "1.1.1.1", 443),
+            "vpn_to_peer": (vpn, REFUSED_VPN, manifest.peer, manifest.port),
+            "vpn_to_host": (vpn, REFUSED_VPN, host_address(manifest.index), 22),
+            "vpn_to_internet": (vpn, REFUSED_VPN, "1.1.1.1", 443),
         }
         results: dict[str, str] = {}
         bad: list[str] = []
@@ -776,18 +807,17 @@ class Agent:
             os.chown(path, 0, gid)
             path.chmod(0o640)
 
-    def _files(self, manifest: Manifest, ids: dict[str, tuple[int, int]]) -> Path:
-        ovpn_dir = self.tmp / Path(OVPN_DIR).name
-        content = {"client.conf": manifest.openvpn_conf}
-        if manifest.auth:
-            content["auth"] = manifest.auth
-        self._write_dir(ovpn_dir, ids["ovpn"][1], content)
-        return ovpn_dir / "client.conf"
+    def _files(self) -> Path:
+        """Файл ключей pppd: pppd — root, читать его больше некому (каталог root:root)."""
+        vpn_dir = self.tmp / Path(VPN_DIR).name
+        self._write_dir(vpn_dir, 0, {"ppp.options": ppp_options()})
+        return vpn_dir / "ppp.options"
 
-    def _inner_check(self, manifest: Manifest) -> tuple[list[tuple[str, str]], dict]:
+    def _inner_check(self, manifest: Manifest, gateways: list[str]
+                     ) -> tuple[list[tuple[str, str]], dict]:
         """Через поднятый туннель, от пользователя SOCKS: TCP и DNS (inner_servers). Итог — в
         состояние и одной строкой в журнал, без адресов."""
-        servers = inner_servers(self.pushed_dns)
+        servers = inner_servers(gateways)
         uid, gid = self.ids["socks"]
         proc = self.spawn(
             [sys.executable, "-I", "-c", _INNER, *(address for _label, address in servers)],
@@ -847,21 +877,20 @@ class Agent:
 
     def _summary(self) -> None:
         """Итог поднимавшегося туннеля — в журнал и состояние: пакеты в туннель и из него,
-        ошибки канала данных, отбитое охраной после подъёма (у работника — попытки мимо
-        туннеля). Один раз; сбой здесь — не повод не остановить работников."""
+        канал к серверу, отбитое охраной после подъёма (у работника — попытки мимо туннеля).
+        fpt0 к этому времени может уже не быть (pppd завершился) — тогда последние счётчики
+        из состояния. Один раз; сбой здесь — не повод не остановить работников."""
         if self.summarized:
             return
         self.summarized = True
-        stats = self._tun_stats()
+        stats = self._tun_stats() or self.state.get("tun")
         link = self._link_after_up()
         after = deltas(self.refused_up, self._counters())
         parts = [tunnel_text(stats) or "счётчики fpt0 не прочитаны",
                  f"канал к серверу после подъёма: {link_text(link) or 'не прочитан'}",
-                 f"ошибок канала данных {self.data_errors}"
-                 + (f" ({self.data_error_line})" if self.data_error_line else ""),
                  f"охрана после подъёма: {guard_text(after) or '—'}"]
         if self.notices:
-            parts.append("предупреждения OpenVPN: " + " | ".join(self.notices))
+            parts.append("предупреждения клиента: " + " | ".join(self.notices))
         self._write(tun=stats, link_after_up=link, refused_after_up=after,
                     notices=self.notices)
         self._say("итог туннеля: " + "; ".join(parts))
@@ -875,25 +904,14 @@ class Agent:
         self.children[name] = proc
         return proc
 
-    def _read_openvpn(self, proc: subprocess.Popen) -> None:
+    def _read_client(self, proc: subprocess.Popen) -> None:
+        """Вывод sstpc и pppd: последние строки — для причины отказа, первые предупреждения —
+        для итога туннеля (без адресов)."""
         for line in proc.stdout or ():
-            line = line.rstrip("\n")
+            line = line.rstrip("\n")[:400]
             self.log.append(line)
-            address, mtu = pushed(line)
-            if address:
-                self.pushed_address = address
-            if mtu:
-                self.pushed_mtu = mtu
-            dns = pushed_dns(line)
-            if dns:
-                self.pushed_dns = dns
-            if any(needle in line for needle in _DATA_ERRORS):
-                self.data_errors += 1
-                if not self.data_error_line:
-                    self.data_error_line = masked(line)
-            if len(self.notices) < 3 and any(mark in line for mark in _NOTICES) \
-                    and not any(word in line for word in _SETTINGS_LINES):
-                text = masked(_STAMP.sub("", line.strip()))[:160]
+            if len(self.notices) < 3 and any(mark in line for mark in _NOTICES):
+                text = masked(line)[:160]
                 if text not in self.notices:
                     self.notices.append(text)
 
@@ -903,128 +921,86 @@ class Agent:
         for line in proc.stdout or ():
             self.socks_log.append(line.rstrip("\n")[:400])
 
-    def _up(self, address: str, manifest: Manifest) -> None:
+    def _addresses(self) -> tuple[str, str]:
+        try:
+            return parse_addr(self._ip("-4", "-o", "addr", "show", "dev", TUN, check=False))
+        except (OSError, cmd.CommandError):
+            return "", ""
+
+    def _up(self, address: str, gateway: str, manifest: Manifest) -> None:
         problem = tunnel_problem(address, manifest)
         if problem:
             raise AgentError("BAD_TUNNEL_ADDRESS", problem)
-        mtu = self.pushed_mtu if 576 <= self.pushed_mtu <= 1500 else 1500
-        self._ip("addr", "flush", "dev", TUN)
-        self._ip("addr", "add", f"{address}/32", "dev", TUN)
-        self._ip("link", "set", "dev", TUN, "mtu", str(mtu), "up")
+        gateways = [gateway] if gateway and not tunnel_problem(gateway, manifest) else []
+        mtu = parse_mtu(self._ip("-o", "link", "show", "dev", TUN, check=False))
         self._ip("route", "replace", "default", "dev", TUN)
-        if not self.was_up:
-            # Первый подъём: проверка изнутри и SOCKS-работник — до фазы up (демон начинает
-            # пробу, как только её видит). Туннель поднят — в состояние сразу: откажет
-            # работник — демон всё равно запишет, что туннель был и что видно изнутри.
-            self.was_up = True
-            self.refused_up = self._counters()
-            self.link_up = self._tun_stats(inner_link(manifest.index))
-            self._write(tunnel=address, mtu=mtu, tunnel_at=time.time())
-            self._say(f"туннель поднят, MTU {mtu}")
-            servers, inner = self._inner_check(manifest)
-            self._start_socks(manifest, worker_dns(servers, inner))
-            self._say("SOCKS-работник готов")
-        else:
-            self._say(f"туннель снова поднят, MTU {mtu}")
-        self._write(phase="up", tunnel=address, mtu=mtu, up_at=time.time())
+        # Подъём: проверка изнутри и SOCKS-работник — до фазы up (демон начинает пробу, как
+        # только её видит). Туннель поднят — в состояние сразу: откажет работник — демон всё
+        # равно запишет, что туннель был и что видно изнутри.
+        self.was_up = True
+        self.refused_up = self._counters()
+        self.link_up = self._tun_stats(inner_link(manifest.index))
+        self._write(tunnel=address, mtu=mtu, tunnel_at=time.time())
+        self._say(f"туннель поднят, MTU {mtu or '?'}")
+        servers, inner = self._inner_check(manifest, gateways)
+        self._start_socks(manifest, worker_dns(servers, inner))
+        self._say("SOCKS-работник готов")
+        self._write(phase="up", up_at=time.time())
 
-    def _down(self, why: str) -> None:
-        self._ip("route", "del", "default", "dev", TUN, check=False)
-        self._ip("addr", "flush", "dev", TUN, check=False)
-        self._write(phase="reconnecting", why=why)
-
-    def _manage(self, manifest: Manifest) -> None:
-        """Цикл интерфейса управления, пока не попросили остановиться."""
-        deadline = self.clock() + MGMT_WAIT
-        sock = None
-        while sock is None:
-            try:
-                sock = self.connect(("127.0.0.1", MGMT_PORT), 2.0)
-            except OSError:
-                if self.clock() > deadline or self._dead("openvpn"):
-                    raise AgentError(classify(self.log) if self.log else "NO_MANAGEMENT",
-                                     "интерфейс управления OpenVPN не ответил") from None
-                self.sleep(0.3)
-        sock.setblocking(False)
-        sock.sendall(b"state on\nstate\n")
-        buffer = b""
-        up = False
+    def _watch(self, manifest: Manifest) -> None:
+        """Ждать подъёма туннеля (адрес на fpt0), затем держать его, пока не попросили
+        остановиться: раз в 2 с — счётчики в состояние; адрес пропал, клиент или работник
+        завершились — отказ."""
         started = self.clock()
-        lost_at: float | None = None
+        up = False
         stats_at = 0.0
-        try:
-            while not self.stop.is_set():
-                if up and self.clock() - stats_at >= STATS_EVERY:
-                    stats_at = self.clock()
-                    stats = self._tun_stats()
-                    values: dict = {"refused_after_up": deltas(self.refused_up,
-                                                               self._counters())}
-                    if stats is not None:
-                        values["tun"] = stats
-                    link = self._link_after_up()
-                    if link is not None:
-                        values["link_after_up"] = link
-                    self._write(**values)
-                ready, _w, _x = select.select([sock], [], [], 1.0)
-                if ready:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        if self.stop.is_set():
-                            return  # остановка: OpenVPN закрылся вместе со службой
-                        raise AgentError(classify(self.log), "OpenVPN закрыл управление")
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        raw, buffer = buffer.split(b"\n", 1)
-                        line = raw.decode("utf-8", "replace").strip()
-                        if line.startswith(">FATAL:"):
-                            self.log.append(line)  # её текст — улика отказа (evidence)
-                            raise AgentError(classify(self.log), "OpenVPN: FATAL")
-                        if line.startswith(">PASSWORD:Verification Failed"):
-                            raise AgentError("AUTH_FAILED", "учётка не принята")
-                        parsed = parse_state(line)
-                        if parsed is None:
-                            continue
-                        name, _desc, address = parsed
-                        if name == "CONNECTED":
-                            # Адреса в строке состояния нет — берём из PUSH_REPLY журнала: его
-                            # читает другой поток, строка может отстать на мгновение.
-                            waited = self.clock() + 2.0
-                            while not address and not self.pushed_address \
-                                    and self.clock() < waited:
-                                self.sleep(0.1)
-                            address = address or self.pushed_address
-                            if not address:
-                                raise AgentError("NO_TUNNEL_ADDRESS",
-                                                 "OpenVPN не сообщил адрес туннеля")
-                            self._up(address, manifest)
-                            up, lost_at = True, None
-                        elif name in ("RECONNECTING", "EXITING") and up:
-                            self._down(name)
-                            up, lost_at = False, self.clock()
-                        else:
-                            self._write(phase="up" if up else "connecting", openvpn=name)
-                if self.stop.is_set():
-                    return
-                if self._dead("openvpn"):
-                    raise AgentError(classify(self.log), "OpenVPN завершился")
-                if self._dead("socks"):
-                    raise AgentError("SOCKS_FAILED", "SOCKS-работник завершился")
-                now = self.clock()
-                if not up and lost_at is None and now - started > UP_WAIT:
+        while not self.stop.is_set():
+            if not up:
+                address, gateway = self._addresses()
+                if address:
+                    self._up(address, gateway, manifest)
+                    up = True
+                    continue
+                if self._dead("vpn"):
+                    raise AgentError(classify(self.log), "клиент SSTP завершился")
+                if self.clock() - started > UP_WAIT:
                     raise AgentError(classify(self.log) if self.log else "TIMEOUT",
                                      "туннель не поднялся за отведённое время")
-                if lost_at is not None and now - lost_at > RECONNECT_WAIT:
-                    raise AgentError(classify(self.log), "туннель не вернулся после обрыва")
-        finally:
-            sock.close()
+                self.sleep(POLL_EVERY)
+                continue
+            if self.clock() - stats_at >= STATS_EVERY:
+                stats_at = self.clock()
+                address, _gateway = self._addresses()
+                if not address:
+                    raise AgentError(classify(self.log) if self.log else "LINK_LOST",
+                                     "туннель оборвался")
+                values: dict = {"refused_after_up": deltas(self.refused_up, self._counters())}
+                stats = self._tun_stats()
+                if stats is not None:
+                    values["tun"] = stats
+                link = self._link_after_up()
+                if link is not None:
+                    values["link_after_up"] = link
+                self._write(**values)
+            if self._dead("vpn"):
+                raise AgentError(classify(self.log) if self.log else "LINK_LOST",
+                                 "клиент SSTP завершился")
+            if self._dead("socks"):
+                raise AgentError("SOCKS_FAILED", "SOCKS-работник завершился")
+            self.sleep(POLL_EVERY)
 
     def _dead(self, name: str) -> bool:
         proc = self.children.get(name)
-        return proc is not None and proc.poll() is not None
+        dead = proc is not None and proc.poll() is not None
+        if dead and name == "vpn" and self.reader is not None:
+            # Клиент завершился — дочитать его вывод: причину отказа берут из последних строк.
+            self.reader.join(timeout=1.0)
+        return dead
 
     def _stop_children(self) -> None:
-        """Работников — SIGTERM, затем SIGKILL. Сигнал не прошёл (нет CAP_KILL) — их добьёт
-        systemd после выхода агента (KillMode=mixed); это не повод не убрать маршрут."""
+        """Работников — SIGTERM, затем SIGKILL (sstpc сам останавливает свой pppd). Сигнал не
+        прошёл — их добьёт systemd после выхода агента (KillMode=mixed); это не повод не убрать
+        маршрут."""
         for proc in self.children.values():
             if proc.poll() is None:
                 try:
@@ -1045,39 +1021,38 @@ class Agent:
         try:
             manifest = load_manifest(manifest_path(self.paths, self.gen), self.gen)
             self.manifest = manifest
-            ids = {"ovpn": self.users(OVPN_USER), "socks": self.users(SOCKS_USER)}
+            ids = {"vpn": self.users(VPN_USER), "socks": self.users(SOCKS_USER)}
             self.ids = ids
-            self._guard(manifest, ids["ovpn"][0], ids["socks"][0])
-            self._tun(*ids["ovpn"])
+            self._guard(manifest, ids["vpn"][0], ids["socks"][0])
             self._write(phase="guarded")
             self._veth(manifest)
             self._selftest(manifest, ids)
-            conf = self._files(manifest, ids)
+            options = self._files()
             self.refused_base = self._counters()
-            proc = self._start("openvpn", [manifest.openvpn_bin, "--config", str(conf)],
-                               ids["ovpn"])
-            threading.Thread(target=self._read_openvpn, args=(proc,), daemon=True).start()
+            proc = self._start("vpn", sstpc_argv(manifest, options), (0, 0))
+            self.reader = threading.Thread(target=self._read_client, args=(proc,), daemon=True)
+            self.reader.start()
             self._write(phase="connecting")
-            self._manage(manifest)
+            self._watch(manifest)
             self._write(phase="stopped")
             return 0
         except AgentError as exc:
             code, text = exc.code, str(exc)
             before_up = self._before_up()
-            if before_up.get(REFUSED_OVPN, 0) > 0 and not self.was_up:
-                # До подъёма работает только OpenVPN, а его пакеты отбила своя охрана — дефект
-                # шлюза, как бы ни назвал отказ сам OpenVPN («No route to host» и т. п.).
+            if before_up.get(REFUSED_VPN, 0) > 0 and not self.was_up:
+                # До подъёма наружу ходит только клиент, а его пакеты отбила своя охрана —
+                # дефект шлюза, как бы ни назвал отказ сам клиент («No route to host» и т. п.).
                 # Ответы ядра и служебный IPv6 — не его пакеты (отчёт М2а.1).
-                code, text = "GUARD_BLOCKED", f"охрана отбила пакеты OpenVPN ({text})"
+                code, text = "GUARD_BLOCKED", f"охрана отбила пакеты клиента ({text})"
             self._summarize()  # раньше фазы failed: демон берёт итог в запись проверки
-            self._write(phase="failed", reason=code, openvpn_code=exc.code, detail=text[:200],
+            self._write(phase="failed", reason=code, client_code=exc.code, detail=text[:200],
                         refused_before_up=before_up)
             self._say(f"поколение {self.gen}: {code}"
-                      + (f" (по журналу OpenVPN: {exc.code})" if code != exc.code else "")
+                      + (f" (по выводу клиента: {exc.code})" if code != exc.code else "")
                       + f" — {text}")
             line = evidence(list(self.log), exc.code)
             if line:
-                self._say(f"OpenVPN: {line}")
+                self._say(f"SSTP: {line}")
             if any(before_up.values()):
                 self._say(f"охрана за подключение: {guard_text(before_up)}")
             return 3
@@ -1099,8 +1074,8 @@ class Agent:
             self._say(f"итог туннеля не собран: {exc}")
 
     def _before_up(self) -> dict[str, int]:
-        """Прирост счётчиков охраны с запуска OpenVPN до подъёма туннеля (или до сих пор);
-        пусто — OpenVPN не запускался или счётчики не прочитаны."""
+        """Прирост счётчиков охраны с запуска клиента до подъёма туннеля (или до сих пор);
+        пусто — клиент не запускался или счётчики не прочитаны."""
         if self.refused_base is None:
             return {}
         try:
@@ -1132,4 +1107,4 @@ def main(gen: str, paths: Paths) -> int:
     return agent.run()
 
 
-__all__ = ["AUTH_FILE", "Agent", "AgentError", "Manifest", "main"]
+__all__ = ["Agent", "AgentError", "Manifest", "main"]

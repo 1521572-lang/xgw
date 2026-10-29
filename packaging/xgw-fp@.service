@@ -1,8 +1,8 @@
-# XGW: бесплатный сервер OpenVPN — одно поколение (docs/FREEPOOL-PLAN.md, веха М2а). Запускает и
-# останавливает только демон XGW; задание — /run/xgw/fp/<поколение>/manifest.json. Включать службу
-# не нужно.
+# XGW: бесплатный сервер SSTP — одно поколение (docs/FREEPOOL-PLAN.md, вехи М2а и М2в). Запускает
+# и останавливает только демон XGW; задание — /run/xgw/fp/<поколение>/manifest.json. Включать
+# службу не нужно.
 [Unit]
-Description=XGW: бесплатный сервер OpenVPN %i (изолированное пространство имён)
+Description=XGW: бесплатный сервер SSTP %i (изолированное пространство имён)
 Documentation=https://github.com/1521572-lang/xgw
 After=network.target xgw-net.service
 ConditionPathExists=/run/xgw/fp/%i/manifest.json
@@ -11,23 +11,30 @@ ConditionPathExists=/run/xgw/fp/%i/manifest.json
 Type=simple
 ExecStart=/usr/local/bin/xgw pool agent %i
 # Своё пространство имён сети: в нём только lo, veth передаёт демон (agent.py). Свой /tmp:
-# конфиги работников этого поколения другим поколениям не видны.
+# файлы работников этого поколения другим поколениям не видны.
 PrivateNetwork=yes
 PrivateTmp=yes
 ProtectSystem=strict
 # /run — только чтение явно: с ProtectKernelTunables systemd 259 открывает его на запись.
 ReadOnlyPaths=/run
 ReadWritePaths=/run/xgw/fp/%i
+# pppd читает /etc/ppp/options и запускает /etc/ppp/ip-up — у службы /etc/ppp пустой: ни
+# настройки, ни скрипты хоста туннель не трогают. sstpc держит сокет для модуля pppd в
+# /run/sstpc (так собран пакет Ubuntu) — у службы это свой пустой каталог.
+TemporaryFileSystem=/etc/ppp:ro /run/sstpc
 ProtectHome=yes
 UMask=0077
 NoNewPrivileges=yes
-# CAP_NET_ADMIN — охрана nftables, TUN, адреса и маршруты своего пространства имён;
-# CAP_SETUID и CAP_SETGID — работники OpenVPN и SOCKS от своих пользователей (у них
-# возможностей нет); CAP_CHOWN — их файлы (root:<группа работника>, 0640); CAP_KILL — их
-# остановка (у работников другой uid, а KillMode=mixed шлёт SIGTERM только агенту).
+# CAP_NET_ADMIN — охрана nftables, адреса и маршруты своего пространства имён, интерфейс PPP
+# у pppd; CAP_SETUID и CAP_SETGID — работники от своих пользователей (sstpc сбрасывает права
+# на xgw-vpn сам, SOCKS — xgw-fps; у них возможностей нет); CAP_CHOWN — их файлы и каталог
+# sstpc; CAP_KILL — их остановка (KillMode=mixed шлёт SIGTERM только агенту).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
 DevicePolicy=closed
-DeviceAllow=/dev/net/tun rw
+# /dev/ppp — pppd; терминал между sstpc и pppd — псевдотерминал (/dev/ptmx и /dev/pts/*).
+DeviceAllow=/dev/ppp rw
+DeviceAllow=/dev/ptmx rw
+DeviceAllow=char-pts rw
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectKernelTunables=yes
@@ -43,6 +50,6 @@ MemoryMax=384M
 TasksMax=64
 Restart=no
 TimeoutStopSec=15
-# SIGTERM — только агенту: он сам останавливает работников и убирает маршрут; оставшихся
-# после его выхода systemd добивает.
+# SIGTERM — только агенту: он сам останавливает клиента (sstpc — свой pppd) и работника и
+# убирает маршрут; оставшихся после его выхода systemd добивает.
 KillMode=mixed

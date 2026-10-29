@@ -15,12 +15,12 @@ FROZEN, таймаут…) и, если она прошла, страна вых
 (dns.hosts у Xray, hosts-сервер DNS у sing-box — как в основном конфиге). Список с GitHub — чужой
 текст: без этого он мог бы направить пробу на адрес LAN или самого шлюза.
 
-Сервер OpenVPN (веха М2а) — настоящим туннелем: поколение бэкенда (backend.py, agent.py) в своём
-пространстве имён, затем та же проба, что у Xray, только выход временного Xray — SOCKS-работник
-поколения. Трафик — по счётчикам veth (внешние байты с рукопожатием); что видел агент изнутри
-(TCP и DNS через туннель, пакеты из туннеля) — diagnosis. Бэкенда нет (OpenVPN не установлен,
-перехват не загружен) — как в М1: прямое TCP-соединение с адресом сервера мимо VPN, закрыт ли
-адрес целиком; UDP — «не проверено».
+Сервер SSTP (VPN Gate; веха М2в, до неё — OpenVPN с М2а) — настоящим туннелем: поколение
+бэкенда (backend.py, agent.py) в своём пространстве имён, затем та же проба, что у Xray, только
+выход временного Xray — SOCKS-работник поколения. Трафик — по счётчикам veth (внешние байты с
+рукопожатием); что видел агент изнутри (TCP и DNS через туннель, пакеты из туннеля) —
+diagnosis. Бэкенда нет (sstp-client не установлен, перехват не загружен) — как в М1: прямое
+TCP-соединение с адресом сервера мимо VPN, закрыт ли адрес целиком.
 """
 
 from __future__ import annotations
@@ -43,11 +43,9 @@ from ..config import Config
 from ..watch import checks, shadow
 from ..watch.scan import ScanResult, scan_node
 from . import agent as agenting
-from . import ovpnconf
 from .backend import Backend as Runtime
 from .backend import BackendError
 from .models import Backend, Variant
-from .ovpn import OvpnProfile, OvpnRejected
 
 START_WAIT = 5.0
 STOP_WAIT = 3.0
@@ -60,19 +58,19 @@ Resolver = Callable[..., list[str]]
 
 @dataclass
 class Outcome:
-    """Итог проверки варианта: verdict — как у скана (OK, SLOW, FROZEN, TIMEOUT…) или
-    REACHABLE / CLOSED / UNTESTED / BACKEND_PENDING для OpenVPN до вехи М2."""
+    """Итог проверки варианта: verdict — как у скана (OK, SLOW, FROZEN, TIMEOUT…), код отказа
+    туннеля (agent.py) или REACHABLE / CLOSED / UNTESTED для туннеля без бэкенда."""
 
     verdict: str
     seconds: float = 0.0
     bytes_used: int = 0
     egress_country: str = ""
     error: str = ""
-    connect_seconds: float = 0.0  # OpenVPN: от запуска поколения до поднятого туннеля
-    # OpenVPN: туннель поднимался (дальше проба могла и не пройти). Код итога этого не
-    # говорит: TIMEOUT бывает и у агента (туннель не поднялся), и у пробы через туннель.
+    connect_seconds: float = 0.0  # туннель: от запуска поколения до поднятого туннеля
+    # Туннель поднимался (дальше проба могла и не пройти). Код итога этого не говорит:
+    # TIMEOUT бывает и у агента (туннель не поднялся), и у пробы через туннель.
     tunnel_up: bool = False
-    # OpenVPN: что агент увидел изнутри (TCP и DNS через туннель, пакеты из туннеля) — без
+    # Туннель: что агент увидел изнутри (TCP и DNS через туннель, пакеты из туннеля) — без
     # адресов. Отчёт М2а: проба через туннель не прошла ни разу, а почему — не узнать.
     diagnosis: str = ""
 
@@ -275,18 +273,16 @@ def check_singbox(
                       password, cfg, run_dir, spawn, "sing-box")
 
 
-def check_openvpn_reach(
+def check_tunnel_reach(
     variant: Variant, mark: int | None,
     tcp_check: Callable[..., bool] = checks.tcp_check,
 ) -> Outcome:
-    """OpenVPN до бэкенда: открывается ли TCP к адресу сервера напрямую."""
-    if variant.backend != Backend.OPENVPN:
+    """Туннель без бэкенда: открывается ли TCP к адресу сервера напрямую."""
+    if variant.backend != Backend.SSTP:
         return Outcome("UNTESTED")
-    if variant.transport != "tcp":
-        return Outcome("UNTESTED", error="UDP — проверка только туннелем (веха М2)")
-    address = variant.address or variant.host
+    address = tunnel_peer(variant)
     if not address or mark is None:
-        return Outcome("UNTESTED", error="нет адреса или метки обхода")
+        return Outcome("UNTESTED", error="нет публичного адреса или метки обхода")
     started = time.monotonic()
     with contextlib.suppress(OSError):
         if tcp_check(address, variant.port, timeout=REACH_TIMEOUT, mark=mark):
@@ -295,19 +291,13 @@ def check_openvpn_reach(
                    error="TCP к адресу напрямую не открывается")
 
 
-def openvpn_peer(variant: Variant, profile: OvpnProfile) -> str:
-    """Адрес сервера для туннеля: публичный IPv4 из каталога или из remote профиля с тем же
-    портом. Имя здесь не резолвится (R45: один закреплённый адрес); нет — пусто."""
-    candidates = [variant.address, variant.host,
-                  *(remote.host for remote in profile.remotes if remote.port == variant.port)]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            return ovpnconf.peer_address(candidate)
-        except OvpnRejected:
-            continue
-    return ""
+def tunnel_peer(variant: Variant) -> str:
+    """Адрес сервера для туннеля: публичный IPv4 из каталога (R45: один закреплённый адрес;
+    имя здесь не резолвится); нет — пусто."""
+    try:
+        return agenting.peer_address(variant.address) if variant.address else ""
+    except ValueError:
+        return ""
 
 
 def tunnel_diagnosis(at_up: dict, after: dict) -> str:
@@ -320,33 +310,26 @@ def tunnel_diagnosis(at_up: dict, after: dict) -> str:
     refused = after.get("refused_after_up") or {}
     guard = ""
     if isinstance(refused, dict) and any(
-            refused.get(name) for name in (agenting.REFUSED_OVPN, agenting.REFUSED_SOCKS)):
+            refused.get(name) for name in (agenting.REFUSED_VPN, agenting.REFUSED_SOCKS)):
         guard = "охрана после подъёма: " + agenting.guard_text(refused)
     return "; ".join(part for part in (inner, traffic, link and f"канал к серверу: {link}",
                                        guard) if part)[:DIAGNOSIS_MAX]
 
 
-def check_openvpn(
-    variant: Variant, profile: OvpnProfile, *, runtime: Runtime, cfg: Config, xray_bin: Path,
-    run_dir: Path, auth: str = "", lan: tuple[str, ...] = (), cancel=None,
+def check_tunnel(
+    variant: Variant, *, runtime: Runtime, cfg: Config, xray_bin: Path, run_dir: Path,
+    user: str, password: str, lan: tuple[str, ...] = (), cancel=None,
     spawn: Callable[..., subprocess.Popen] = subprocess.Popen,
 ) -> Outcome:
-    """Поколение бэкенда для варианта → туннель поднялся → проба и страна выхода через его
+    """Поколение бэкенда для варианта SSTP → туннель поднялся → проба и страна выхода через его
     SOCKS-работника → поколение убрано (всегда, и при сбое)."""
-    peer = openvpn_peer(variant, profile)
+    peer = tunnel_peer(variant)
     if not peer:
         return Outcome("UNTESTED", error="у сервера нет публичного IPv4")
-    try:
-        conf = ovpnconf.client_config(
-            profile, remote_ip=peer, proto=variant.transport, port=variant.port,
-            with_auth=bool(auth), mgmt_port=agenting.MGMT_PORT,
-        )
-    except OvpnRejected as exc:
-        return Outcome("CONFIG_REJECTED", error=str(exc)[:160])
     started = time.monotonic()
     try:
-        lease = runtime.prepare(peer=peer, proto=variant.transport, port=variant.port,
-                                openvpn_conf=conf, auth=auth, lan=lan, xray_bin=xray_bin)
+        lease = runtime.prepare(peer=peer, port=variant.port, host=variant.host, user=user,
+                                password=password, lan=lan, xray_bin=xray_bin)
     except BackendError as exc:
         return Outcome(exc.code, round(time.monotonic() - started, 2), error=str(exc)[:160])
     try:

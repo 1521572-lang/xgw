@@ -44,7 +44,7 @@ def active(runner: cmd.Runner = cmd.run) -> bool:
 
 def wanted(lan_if: str, wan_if: str) -> list[list[str]]:
     """Правила для шлюза: аргументы `ufw` без самой команды. Последнее — бесплатный пул:
-    агенты OpenVPN (veth fpv*) выходят в интернет к своим серверам; к каким именно — решает
+    агенты туннелей (veth fpv*) выходят в интернет к своим серверам; к каким именно — решает
     таблица XGW (набор fp_peers), а ufw иначе отбросил бы их форвардинг."""
     forward = ["route", "allow", "in", "on", lan_if]
     pool = ["route", "allow", "in", "on", "fpv+"]

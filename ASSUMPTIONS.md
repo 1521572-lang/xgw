@@ -4118,3 +4118,67 @@ Happ»), затем дополнен редактированием списка
      путём (DoT через подписку): смена DNS задела бы весь дом; в М2б.2 — через пул.
      Здесь — юнит-тесты затронутых файлов один раз и ruff; остальное —
      `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b1.md` (Ubuntu 24.04).
+263. **Бесплатный пул: SSTP вместо OpenVPN (веха М2в, 29.10.2026).** Решение заказчика: «можно
+     убрать из сборки openvpn как неэффективный в условиях тспу», «отказаться от openvpn в
+     пользу более эффективных протоколов». В отчётах М2а–М2а.4 из ~20 подключений к VPN Gate
+     туннель поднялся один раз; часть отказов — ещё на TCP (адрес закрыт — там протокол не
+     поможет).
+     (а) Факты VPN Gate (страница www.vpngate.net/en/, просмотрена 29.10.2026 в браузере): 100
+     серверов; SSL-VPN (родной SoftEther) — у 94, MS-SSTP — у 72, L2TP/IPsec — у 17 (только
+     японские университетские); по странам — Япония 42, Корея 25, Россия 10, Евросоюз 2. Порт
+     SSTP — тот же TCP-порт, что у SSL-VPN и OpenVPN TCP. Вход SSTP и L2TP — `vpn`/`vpn`
+     (howto_sstp.aspx, howto_l2tp.aspx); SSTP — только по имени `*.opengw.net`. Сертификаты
+     серверов доверенные: браузер открыл https://<имя>:<порт>/ без предупреждения у
+     университетского сервера и у добровольца. CSV api/iphone про SSTP ничего не говорит —
+     источник теперь страница (очищенный образец — tests/fixtures/freepool/vpngate.html).
+     (б) Почему SSTP: PPP внутри TLS по TCP, для DPI — HTTPS. L2TP/IPsec не взят: по
+     публикациям режется по протоколу с 2022 года, клиент тяжёлый (strongSwan, xl2tpd, pppd).
+     Родной SoftEther — запасной шаг: клиент в Ubuntu (softether-vpnclient) — снимок кода 2020
+     года, адаптер второго уровня с DHCP, подключение из Linux VPN Gate не описывает.
+     Достоверных сообщений о блокировке SSTP в России не нашлось — только отзывы.
+     (в) Клиент — пакет Ubuntu `sstp-client` (universe: 24.04 — 1.0.19, 26.04 — 1.0.20; тянет
+     ppp 2.4.9 и 2.5.2). По справке sstpc и его исходнику 1.0.20: сервер — «адрес:порт», имя —
+     `--host` (заголовок HTTP и сверка сертификата); SNI — только с `--tls-ext` (не задаём:
+     имени opengw.net в рукопожатии нет); без `--ca-dir` сверяется только CN (точное
+     совпадение), с `--ca-dir` — только цепочка (имя — нет): берём `--ca-dir /etc/ssl/certs`;
+     права сбрасываются после подключения (setgid/setuid; chroot — только с `--priv-dir`, ему
+     нужна CAP_SYS_CHROOT — не задаём), TCP-сокет создан от root; `--log-stderr` выключает
+     syslog, уровень 2 — INFO. pppd он запускает как `/usr/sbin/pppd <терминал> 38400 user …
+     file <пароль> plugin sstp-pppd-plugin.so sstp-sock <путь>`, а под все аргументы pppd у
+     него массив на 20 мест без проверки границ — наши ключи pppd поэтому файлом (`file`).
+     stdin и stdout pppd — терминал туннеля, stderr — вывод sstpc: `logfd 2`. Сокет для
+     модуля pppd —
+     `/var/run/sstpc/sstpc-<ipparam>` (debian/rules: `--with-runtime-dir`); пакет создаёт
+     пользователя sstpc с домом /run/sstpc (после перезагрузки каталога нет).
+     (г) pppd: ключи сверены по справке 24.04 и 26.04; `noresolvconf` в 2.4.9 нет — не нужен
+     (resolv.conf pppd пишет только с usepeerdns). Строки отказов — по исходнику pppd: chap.c
+     «CHAP authentication failed», lcp.c «No response to … echo-requests», fsm.c «timeout
+     sending Config-Requests». pppd читает /etc/ppp/options и запускает /etc/ppp/ip-up — у
+     службы `TemporaryFileSystem=/etc/ppp:ro /run/sstpc` (проверено в WSL, systemd 259: точку
+     монтирования systemd создаёт сам — на хосте остаётся пустой /run/sstpc, внутри запись
+     есть, остальной /run и /etc/ppp — только чтение); DeviceAllow /dev/ppp, /dev/ptmx,
+     char-pts. Модули ppp_generic и ppp_async подгружает ядро по обращению (ProtectKernelModules
+     этого не запрещает) — проверка ТЗ.
+     (д) Агент: охрана — к адресу и порту сервера только root (`meta skuid 0`), пользователь
+     клиента `xgw-vpn` (был xgw-ovpn) — никуда; самопроверка — ещё и xgw-vpn к серверу. Подъём —
+     адрес на fpt0 (`ip -4 -o addr`, pppd: `ifname fpt0`, `nodefaultroute`), маршрут по
+     умолчанию ставит агент; DNS для проверки изнутри — другой конец PPP («шлюз туннеля»).
+     Обрыв — LINK_LOST, переподключения нет. Коды: AUTH_FAILED, CERT_VERIFY_FAILED,
+     SSTP_REFUSED, PPP_TIMEOUT, LINK_LOST, PPP_DEVICE_FAILED, SSTPC_SOCKET, CONNECT_REFUSED,
+     CONNECT_TIMEOUT, HOST_UNREACHABLE, NETWORK_UNREACHABLE, CONNECT_FAILED; счётчик охраны
+     refused_vpn; GUARD_BLOCKED — как раньше.
+     (е) Источники: VPN Gate — страница (таблица с «DDNS hostname», строки по 10 ячеек, страна
+     по флагу, «SSTP Hostname : имя[:порт]» — имя должно совпасть с именем сервера); VPNBook —
+     только ключи Outline. Убраны ovpn.py и ovpnconf.py, страница OpenVPN VPNBook, её учётка и
+     профили; при запуске пула удаляются secrets.json, profiles/ и итоги проверок OpenVPN,
+     варианты OpenVPN прежних снимков не читаются. Сводка: `tunnel_backend`, `sstp`,
+     `reachable_tunnel` вместо openvpn_*.
+     (ж) Установка: пакет `sstp-client` вместо openvpn, пользователи `xgw-vpn` и `xgw-fps`;
+     xgw-ovpn прежней установки убирает `xgw uninstall` по журналу, пакет openvpn — по совету
+     удаления. `xgw diag` и backend.unavailable: sstpc, pppd, его модуль, /dev/ppp.
+     (з) Не проверено здесь (решение заказчика — основные проверки по ТЗ на машине): sstpc и
+     pppd в службе, сброс прав, принимают ли серверы SSTP без SNI, проходит ли цепочка, нужен
+     ли модулю crypto binding, сколько серверов поднимают туннель и передают данные. Регион:
+     при EU к трафику годятся единицы серверов VPN Gate — решение по итогам наблюдения.
+     Здесь — юнит-тесты затронутых файлов один раз и ruff; остальное —
+     `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v1.md`.
