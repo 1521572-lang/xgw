@@ -355,8 +355,11 @@ def _list_text(text: str) -> str:
 # Чего Xray 26.10.21 не принимает (xray run -test 28.10.2026; отчёт М2а.1 — «Xray завершился с
 # кодом 23» у серверов списков): шифры Shadowsocks без AEAD и aes-192-gcm, ключ 2022 не той
 # длины, убранные flow VLESS, транспорт HTTP/2 (h2; заменён XHTTP), shortId REALITY не из
-# пар hex до 16 знаков, ключ REALITY не 43 знака base64url. Основная подписка такие серверы
-# отсеивает проверкой сборки (generator/validate.py); у списков — здесь, с причиной.
+# пар hex до 16 знаков, ключ REALITY не 43 знака base64url. Отчёт М2а.3 (проверено 29.10):
+# VLESS без TLS, REALITY и VLESS-шифрования и trojan без TLS Xray принимает только к частному
+# адресу («…prohibited unless the server address is a private IP or domain»), а серверы
+# списков — публичные. Основная подписка такие серверы отсеивает проверкой сборки
+# (generator/validate.py); у списков — здесь, с причиной.
 XRAY_SS_METHODS = frozenset((
     "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "chacha20-ietf-poly1305",
     "xchacha20-poly1305", "xchacha20-ietf-poly1305", "2022-blake3-aes-128-gcm",
@@ -392,13 +395,18 @@ def xray_problem(outbound: dict) -> str:
             size = SS2022_KEY_BYTES.get(method)
             if size and not _ss2022_key_ok(str(server.get("password") or ""), size):
                 return "ключ Shadowsocks 2022 не той длины"
+    stream = outbound.get("streamSettings") or {}
+    secured = stream.get("security") in ("tls", "reality")
     if protocol == "vless":
         for item in settings.get("vnext") or []:
             for user in item.get("users") or []:
                 flow = str(user.get("flow") or "")
                 if flow not in XRAY_FLOWS:
                     return f"flow VLESS {flow[:32]} — убран из Xray"
-    stream = outbound.get("streamSettings") or {}
+                if not secured and str(user.get("encryption") or "none") == "none":
+                    return "VLESS без TLS и шифрования — Xray не пускает к публичному адресу"
+    if protocol == "trojan" and not secured:
+        return "trojan без TLS — Xray не пускает к публичному адресу"
     if str(stream.get("network") or "") in ("h2", "http"):
         return "транспорт HTTP/2 (h2) — убран из Xray, заменён XHTTP"
     reality = stream.get("realitySettings") if stream.get("security") == "reality" else None

@@ -997,6 +997,31 @@ def test_exhausted_source_does_not_block_the_other(tmp_path, monkeypatch):
     assert sorted(item[1] for item in pool.handshakes()) == ["vpnbook", "vpngate"]
 
 
+def test_exhausted_day_limit_says_when_it_frees(tmp_path, monkeypatch):
+    """Отчёт М2а.3: ночное наблюдение заняло суточный предел, а в сводке было только
+    «подключений за час 0». Теперь — сколько из предела и когда освободится следующее."""
+    from xgw.freepool import pool as pool_module
+
+    pool, runtime, clock = _tunnel_pool(tmp_path, monkeypatch, {"vpngate": _gate_variants(3)},
+                                        handshakes_per_day=2)
+    xray = Path("/opt/xgw/xray/xray")
+    first = clock[0]
+    assert pool.check_some(mark=2, xray_bin=xray) == 1
+    summary = pool.summary()
+    assert (summary["handshakes_day"], summary["handshakes_day_limit"],
+            summary["handshakes_free_at"]) == (1, 2, 0.0)
+    assert "за сутки 1 из 2\n" in pool_module.render(summary, clock[0]) + "\n"
+    clock[0] += 3600
+    assert pool.check_some(mark=2, xray_bin=xray) == 1
+    clock[0] += 3600
+    assert pool.check_some(mark=2, xray_bin=xray) == 0
+    summary = pool.summary()
+    assert summary["handshakes_free_at"] == first + pool_module.DAY
+    text = pool_module.render(summary, clock[0])
+    assert "за сутки 2 из 2 — суточный предел занят, следующее после " in text
+    assert len(runtime.prepared) == 2
+
+
 def test_address_only_result_does_not_delay_the_tunnel(tmp_path, monkeypatch):
     """Сервер, у которого без бэкенда проверили только адрес (REACHABLE), туннелем проверяется
     сразу; закрытый адрес (CLOSED) — нет: туннель к нему не дойдёт."""

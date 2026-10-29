@@ -443,8 +443,8 @@ def test_github_lists_become_xray_and_singbox_variants():
 
 
 def test_list_servers_xray_does_not_accept_are_rejected_with_a_reason():
-    """Отчёт М2а.1: «Xray завершился с кодом 23» у серверов списков. Чего Xray 26.10.21 не
-    принимает (проверено xray run -test), — в отклонённые при разборе, без значений секретов."""
+    """Отчёты М2а.1 и М2а.3: «Xray завершился с кодом 23» у серверов списков. Чего Xray 26.10.21
+    не принимает (проверено xray run -test), — в отклонённые при разборе, без значений секретов."""
     uuid = "0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b"
     pbk = "A" * 43
 
@@ -468,10 +468,15 @@ def test_list_servers_xray_does_not_accept_are_rejected_with_a_reason():
         vless(reality + "&sid=ABCD", "sid-ok"), vless(reality + "&sid=abc", "sid-odd"),
         vless(reality + "&sid=0123456789abcdef01", "sid-long"),
         vless(f"security=reality&sni=a.example.com&pbk={pbk}=&type=tcp", "pbk-padded"),
+        vless("type=tcp", "plain"), vless("security=none&type=ws&path=%2F", "plain-ws"),
+        vless("encryption=mlkem768x25519plus.native.0rtt.a2V5&type=tcp", "vlessenc"),
+        "trojan://trpass123456@198.51.100.12:443?security=none&type=tcp#trojan-plain",
+        "trojan://trpass123456@198.51.100.12:443?sni=t.example.com&type=tcp#trojan-tls",
     ])
     result = providers.parse_link_list(providers.MAHDIBLAND, [("u", text)], now=1.0)
     assert sorted(variant.name.split()[-1] for variant in result.variants) == [
-        "2022-blake3-aes-128-gcm", "AES-128-GCM", "aes-256-gcm", "sid-ok", "u443"]
+        "2022-blake3-aes-128-gcm", "AES-128-GCM", "aes-256-gcm", "sid-ok", "trojan-tls", "u443",
+        "vlessenc"]
     assert result.rejections == {
         "шифр Shadowsocks aes-256-cfb — Xray его не принимает": 1,
         "шифр Shadowsocks rc4-md5 — Xray его не принимает": 1,
@@ -482,6 +487,8 @@ def test_list_servers_xray_does_not_accept_are_rejected_with_a_reason():
         "транспорт HTTP/2 (h2) — убран из Xray, заменён XHTTP": 2,
         "shortId REALITY — не пары hex до 16 знаков": 2,
         "ключ REALITY — не 43 знака base64url": 1,
+        "VLESS без TLS и шифрования — Xray не пускает к публичному адресу": 2,
+        "trojan без TLS — Xray не пускает к публичному адресу": 1,
     }
 
 

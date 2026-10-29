@@ -1487,7 +1487,7 @@
       const failures = Object.entries(sum.tunnel_failures || {}).map(([code, count]) => `${code} ${count}`).join(", ");
       const openvpn = sum.openvpn_backend
         ? `OpenVPN — ${sum.openvpn} (туннелем не проверить: ${sum.openvpn_backend}; адрес открыт — ${sum.reachable_openvpn}, закрыт — ${sum.closed})`
-        : `OpenVPN — ${sum.openvpn}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}`;
+        : `OpenVPN — ${sum.openvpn}, туннелем поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки OpenVPN после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
       const bySource = Object.entries(sum.ready_by_source || {}).map(([name, count]) => `${POOL_SOURCES[name] || name} — ${count}`).join(", ");
       $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${openvpn}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
       fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },

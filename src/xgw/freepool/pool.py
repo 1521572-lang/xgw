@@ -497,7 +497,9 @@ class FreePool:
             if not record.get("tunnel_up") and verdict not in ("REACHABLE", "CLOSED",
                                                                "UNTESTED"):
                 failures[verdict] = failures.get(verdict, 0) + 1
-        hour = [item for item in self.handshakes() if now - float(item[0]) < HOUR]
+        day_items = self.handshakes()
+        day_limit = self.cfg.free_pool.handshakes_per_day
+        hour = [item for item in day_items if now - float(item[0]) < HOUR]
         ready_by_source: dict[str, int] = {}
         for record in ready:
             source = str(record.get("provider") or "")
@@ -507,7 +509,12 @@ class FreePool:
             "openvpn_backend": self.backend_problem,
             "tunnels_up": len([r for r in openvpn_checked if r.get("tunnel_up")]),
             "tunnel_failures": failures,
-            "handshakes_hour": len(hour), "handshakes_day": len(self.handshakes()),
+            "handshakes_hour": len(hour), "handshakes_day": len(day_items),
+            "handshakes_day_limit": day_limit,
+            # Суточный предел занят (отчёт М2а.3: ночное наблюдение исчерпало его к утру) —
+            # когда освободится следующее подключение: окно скользящее, 24 ч от самого старого.
+            "handshakes_free_at": (min(float(item[0]) for item in day_items) + DAY
+                                   if day_items and len(day_items) >= day_limit else 0.0),
             "mode": self.cfg.free_pool.mode, "region": self.cfg.free_pool.region,
             "region_policy": self.cfg.free_pool.region_policy,
             "found": len(variants),
@@ -547,6 +554,14 @@ POOL_STATUS = {
 }
 
 
+def _quota_text(free_at: float) -> str:
+    """Суточный предел подключений OpenVPN занят — с какого времени снова можно."""
+    if not free_at:
+        return ""
+    return (" — суточный предел занят, следующее после "
+            + time.strftime("%d.%m %H:%M", time.localtime(free_at)))
+
+
 def render(summary: dict, now: float) -> str:
     """`xgw pool status`: сводка наблюдения текстом."""
     mode = {"off": "выключен", "observe": "наблюдение (трафик через подписку)"}.get(
@@ -568,7 +583,8 @@ def render(summary: dict, now: float) -> str:
             f"OpenVPN туннелем: поднялось {summary.get('tunnels_up', 0)}"
             + (f", отказы: {failures}" if failures else "")
             + f"; подключений за час {summary.get('handshakes_hour', 0)}, за сутки "
-            f"{summary.get('handshakes_day', 0)}")
+            f"{summary.get('handshakes_day', 0)} из {summary.get('handshakes_day_limit', '?')}"
+            + _quota_text(float(summary.get("handshakes_free_at") or 0)))
     lines.append(
         f"Проверено {summary.get('checked', 0)}, пригодно {summary.get('ready', 0)}"
         + (f" ({regions_text})" if regions_text else "")
