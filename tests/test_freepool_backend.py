@@ -169,6 +169,8 @@ def test_socks_worker_listens_on_veth_with_a_password(tmp_path):
     assert inbound["settings"]["auth"] == "password" and inbound["settings"]["udp"] is True
     assert inbound["settings"]["accounts"] == [{"user": "xgw", "pass": "s" * 24}]
     assert config["outbounds"][0]["protocol"] == "freedom"
+    # Отчёт М2а.2: с UseIPv4 Xray спрашивал системный резолвер (127.0.0.53 на lo).
+    assert config["outbounds"][0]["streamSettings"]["sockopt"]["domainStrategy"] == "ForceIPv4"
     assert config["dns"]["servers"] == ["1.1.1.1", "8.8.8.8"]
     with_server = agenting.socks_config(_manifest(tmp_path), ["10.8.0.1", "1.1.1.1", "10.8.0.1"])
     assert with_server["dns"]["servers"] == ["10.8.0.1", "1.1.1.1"]
@@ -259,6 +261,13 @@ def test_inner_check_and_tunnel_counters_are_told_without_addresses():
                                 "dropped_v6": 5}) \
         == "OpenVPN 0, работник 20, ответы ядра 2, служебный IPv6 5"
     assert agenting.guard_text({}) == ""
+    # Канал к серверу (fpi): RX — от сервера, TX — к нему.
+    delta = agenting.link_delta(
+        {"rx_bytes": 1000, "rx_packets": 5, "tx_bytes": 2000, "tx_packets": 8},
+        {"rx_bytes": 4096, "rx_packets": 9, "tx_bytes": 7120, "tx_packets": 20})
+    assert agenting.link_text(delta) == ("от сервера 4 пакетов (3 КБ), к серверу 12 пакетов "
+                                         "(5 КБ)")
+    assert agenting.link_delta(None, delta) is None and agenting.link_text(None) == ""
 
 
 _LISTEN = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid\n"
@@ -412,9 +421,11 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
     пользователя SOCKS) и только затем SOCKS-работник с DNS сервера; обрыв — маршрут убран;
     остановка — фаза stopped и итог туннеля в журнале."""
     runner = _Runner()
-    spawn = _Spawn(openvpn_lines=["PUSH: Received control message: 'PUSH_REPLY,dhcp-option "
-                                  "DNS 10.8.0.1,ifconfig 10.8.0.6 10.8.0.5'"],
-                   inner="tcp OPEN 90\ndns 10.8.0.1 OK 20\ndns 1.1.1.1 TIMEOUT\n")
+    spawn = _Spawn(openvpn_lines=[
+        "2026-10-29 00:48:50 WARNING: 'comp-lzo' is present in remote config for 1.0.0.1",
+        "PUSH: Received control message: 'PUSH_REPLY,dhcp-option DNS 10.8.0.1,ifconfig "
+        "10.8.0.6 10.8.0.5,WARNING'"],
+        inner="tcp OPEN 90\ndns 10.8.0.1 OK 20\ndns 1.1.1.1 TIMEOUT\n")
     agent, ours, chowned = _agent(tmp_path, monkeypatch, runner=runner, spawn=spawn)
     result = _start(agent)
     _wait(lambda: agent.state.get("phase") == "connecting")
@@ -463,9 +474,15 @@ def test_agent_guards_first_and_routes_only_while_the_tunnel_is_up(tmp_path, mon
     assert saved["phase"] == "stopped" and "FakePass77" not in json.dumps(saved)
     zero = dict.fromkeys(agenting.COUNTERS, 0)
     assert saved["tun"]["tx_packets"] == 9 and saved["refused_after_up"] == zero
-    assert ("итог туннеля: в туннель 9 пакетов (4 КБ), из туннеля 0 пакетов (0 КБ); ошибок "
-            "канала данных 0; охрана после подъёма: OpenVPN 0, работник 0, ответы ядра 0, "
-            "служебный IPv6 0") in agent.out.getvalue()
+    assert saved["link_after_up"] == {"rx_bytes": 0, "rx_packets": 0, "tx_bytes": 0,
+                                      "tx_packets": 0}
+    # Предупреждение OpenVPN — без адреса и метки времени; строка PUSH_REPLY — никогда.
+    assert ("итог туннеля: в туннель 9 пакетов (4 КБ), из туннеля 0 пакетов (0 КБ); канал к "
+            "серверу после подъёма: от сервера 0 пакетов (0 КБ), к серверу 0 пакетов (0 КБ); "
+            "ошибок канала данных 0; охрана после подъёма: OpenVPN 0, работник 0, ответы ядра 0, "
+            "служебный IPv6 0; предупреждения OpenVPN: WARNING: 'comp-lzo' is present in remote "
+            "config for <ip>") in agent.out.getvalue()
+    assert saved["notices"] == ["WARNING: 'comp-lzo' is present in remote config for <ip>"]
 
 
 def test_guard_refusal_before_the_tunnel_is_a_gateway_defect(tmp_path, monkeypatch):
@@ -890,6 +907,8 @@ def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):
         def wait(self, lease, *, cancel=None) -> dict:
             return {**_Runtime.state(self, lease), "phase": "failed", "reason": "SOCKS_FAILED",
                     "detail": "SOCKS-работник не открыл порт", "tunnel_at": 1_800_000_050.0,
+                    "link_after_up": {"rx_packets": 4, "rx_bytes": 2048, "tx_packets": 12,
+                                      "tx_bytes": 4096},
                     "refused_after_up": {"refused_ovpn": 0, "refused_socks": 20,
                                          "refused_other": 1, "dropped_v6": 4}}
 
@@ -900,8 +919,9 @@ def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):
     assert (outcome.verdict, outcome.tunnel_up) == ("SOCKS_FAILED", True)
     assert outcome.diagnosis == (
         "TCP Cloudflare:443 — TIMEOUT; DNS Cloudflare — TIMEOUT; в туннель 30 пакетов (2 КБ), "
-        "из туннеля 0 пакетов (0 КБ); охрана после подъёма: OpenVPN 0, работник 20, ответы "
-        "ядра 1, служебный IPv6 4")
+        "из туннеля 0 пакетов (0 КБ); канал к серверу: от сервера 4 пакетов (2 КБ), к серверу "
+        "12 пакетов (4 КБ); охрана после подъёма: OpenVPN 0, работник 20, ответы ядра 1, "
+        "служебный IPv6 4")
     assert runtime.stopped == [GEN]
 
 

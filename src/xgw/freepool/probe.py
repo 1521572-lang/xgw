@@ -53,6 +53,7 @@ START_WAIT = 5.0
 STOP_WAIT = 3.0
 REACH_TIMEOUT = 4.0
 TRACE_BYTES = 4096
+DIAGNOSIS_MAX = 400  # вид изнутри, fpt0, канал к серверу, охрана
 
 Resolver = Callable[..., list[str]]
 
@@ -315,12 +316,14 @@ def tunnel_diagnosis(at_up: dict, after: dict) -> str:
     записи кандидата."""
     inner = agenting.inner_text(after.get("inner") or at_up.get("inner"))
     traffic = agenting.tunnel_text(after.get("tun") or at_up.get("tun"))
+    link = agenting.link_text(after.get("link_after_up") or at_up.get("link_after_up"))
     refused = after.get("refused_after_up") or {}
     guard = ""
     if isinstance(refused, dict) and any(
             refused.get(name) for name in (agenting.REFUSED_OVPN, agenting.REFUSED_SOCKS)):
         guard = "охрана после подъёма: " + agenting.guard_text(refused)
-    return "; ".join(part for part in (inner, traffic, guard) if part)[:300]
+    return "; ".join(part for part in (inner, traffic, link and f"канал к серверу: {link}",
+                                       guard) if part)[:DIAGNOSIS_MAX]
 
 
 def check_openvpn(

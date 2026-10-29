@@ -449,7 +449,8 @@ class FreePool:
             "egress_country": outcome.egress_country, "error": outcome.error[:160],
             "provider": variant.provider, "backend": variant.backend,
             "connect_seconds": outcome.connect_seconds, "bytes": outcome.bytes_used,
-            "tunnel_up": outcome.tunnel_up, "diagnosis": outcome.diagnosis[:300],
+            "tunnel_up": outcome.tunnel_up,
+            "diagnosis": outcome.diagnosis[:probing.DIAGNOSIS_MAX],
         }
         self.store.save_candidates(state)
         self.log.info("бесплатный пул: проверка %s (%s, %s) — %s%s%s", variant.name[:48],

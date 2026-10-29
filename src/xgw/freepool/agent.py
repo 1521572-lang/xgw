@@ -40,9 +40,11 @@ CAP_KILL (их остановка: uid другой); NoNewPrivileges. По ша
 служебный IPv6 ядра при подъёме fpi и fpt0 (IPv6 здесь не нужен никому).
 
 Строки журнала OpenVPN в журнал службы не пишутся: в состоянии — только коды причин
-(classify). Исключение — при отказе одна строка, по которой он распознан, с адресами IPv4 и
-именами хостов, заменёнными на <ip> и <host> (evidence): без неё отказ на машине заказчика не
-разобрать.
+(classify). Исключения — при отказе одна строка, по которой он распознан (evidence), и в итоге
+туннеля до трёх предупреждений OpenVPN (WARNING, OPTIONS ERROR, сжатие; без строк с
+настройками и учёткой) — с адресами IPv4 и именами хостов, заменёнными на <ip> и <host>: без
+них отказ на машине заказчика не разобрать. В итоге туннеля и канал к серверу (счётчики fpi с
+подъёма): отвечает ли сервер вообще, когда из туннеля ничего не приходит (отчёт М2а.2).
 """
 
 from __future__ import annotations
@@ -119,6 +121,12 @@ _DATA_ERRORS = ("Decrypt", "decompression header", "bad source address",
                 "HMAC authentication failed", "Bad compression")
 # Отказ, причина которого не распознана: последняя строка с такой пометкой (evidence).
 _MARKERS = ("FATAL", "ERROR", "error", "failed", "Exiting due to")
+# Предупреждения OpenVPN — первые три в итог туннеля, без адресов (отчёт М2а.2: туннели подняты,
+# а назад — ни пакета; несогласие о сжатии и т. п. OpenVPN пишет именно так). Строки с
+# настройками и учёткой — никогда.
+_NOTICES = ("WARNING", "OPTIONS ERROR", "compress")
+_SETTINGS_LINES = ("PUSH", "auth-user-pass")
+_STAMP = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d ")
 _STATE = re.compile(r"^(?:>STATE:)?(\d+),([A-Z_]+),([^,]*),?([^,]*),?([^,]*)")
 _PUSH_IFCONFIG = re.compile(r"PUSH_REPLY.*?\bifconfig (\d{1,3}(?:\.\d{1,3}){3}) ")
 _PUSH_MTU = re.compile(r"PUSH_REPLY.*?\btun-mtu (\d{3,5})\b")
@@ -286,9 +294,12 @@ def guard_rules(manifest: Manifest, ovpn_uid: int, socks_uid: int) -> str:
 
 def socks_config(manifest: Manifest, dns: tuple[str, ...] | list[str] = PUBLIC_DNS) -> dict:
     """SOCKS-работник: Xray, socks с паролем на внутреннем адресе veth (TCP и UDP), выход —
-    freedom по маршруту по умолчанию (он есть только в туннель), DNS — серверы через туннель
-    (системного резолвера в пространстве имён нет): DNS сервера VPN, если он прислал и тот
-    ответил, затем публичные. Проверено xray run -test (26.10.21)."""
+    freedom по маршруту по умолчанию (он есть только в туннель), DNS — серверы через туннель:
+    DNS сервера VPN, если он прислал и тот ответил, затем публичные. Проверено xray run -test
+    (26.10.21). ForceIPv4, а не UseIPv4: при UseIPv4 Xray, не дождавшись своего DNS, спрашивает
+    системный резолвер из /etc/resolv.conf (проверено в пространстве имён WSL: запросы A и AAAA)
+    — у шлюза это 127.0.0.53 на lo, работнику туда нельзя, и охрана отбивала их (отчёт М2а.2:
+    «работник 16/8/8» после подъёма). С ForceIPv4 таких запросов нет."""
     me = inner_address(manifest.index)
     return {
         "log": {"loglevel": "warning"},
@@ -304,7 +315,7 @@ def socks_config(manifest: Manifest, dns: tuple[str, ...] | list[str] = PUBLIC_D
         }],
         "outbounds": [{
             "tag": "tunnel", "protocol": "freedom",
-            "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}},
+            "streamSettings": {"sockopt": {"domainStrategy": "ForceIPv4"}},
         }],
     }
 
@@ -509,6 +520,30 @@ def parse_link_stats(text: str) -> dict[str, int] | None:
     return found if len(found) == 4 else None
 
 
+def link_delta(start: object, end: object) -> dict[str, int] | None:
+    """Прирост счётчиков fpi (канал к серверу) между двумя снимками parse_link_stats."""
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return None
+    try:
+        return {key: max(0, int(end[key]) - int(start[key])) for key in
+                ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def link_text(delta: object) -> str:
+    """Канал к серверу по-русски: на fpi RX — от сервера, TX — к нему (с рукопожатием,
+    служебными пакетами OpenVPN и шифрованием)."""
+    if not isinstance(delta, dict):
+        return ""
+    try:
+        return (f"от сервера {int(delta['rx_packets'])} пакетов "
+                f"({int(delta['rx_bytes']) // 1024} КБ), к серверу {int(delta['tx_packets'])} "
+                f"пакетов ({int(delta['tx_bytes']) // 1024} КБ)")
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
 def tunnel_text(stats: object) -> str:
     """Счётчики fpt0 по-русски: TX ядра — в туннель (к серверу), RX — из туннеля (от него)."""
     if not isinstance(stats, dict):
@@ -633,6 +668,8 @@ class Agent:
         self.was_up = False
         self.summarized = False
         self.socks_log: deque[str] = deque(maxlen=8)
+        self.notices: list[str] = []
+        self.link_up: dict[str, int] | None = None  # счётчики fpi при подъёме
 
     # --- состояние для демона --------------------------------------------------------------
 
@@ -795,11 +832,18 @@ class Agent:
                 raise AgentError("SOCKS_FAILED", "SOCKS-работник не открыл порт")
             self.sleep(0.1)
 
-    def _tun_stats(self) -> dict[str, int] | None:
+    def _tun_stats(self, dev: str = TUN) -> dict[str, int] | None:
         try:
-            return parse_link_stats(self._ip("-s", "link", "show", "dev", TUN, check=False))
+            return parse_link_stats(self._ip("-s", "link", "show", "dev", dev, check=False))
         except (OSError, cmd.CommandError):
             return None
+
+    def _link_after_up(self) -> dict[str, int] | None:
+        """Канал к серверу (fpi) с подъёма туннеля: отвечает ли сервер вообще, когда из
+        туннеля ничего не приходит."""
+        if self.manifest is None:
+            return None
+        return link_delta(self.link_up, self._tun_stats(inner_link(self.manifest.index)))
 
     def _summary(self) -> None:
         """Итог поднимавшегося туннеля — в журнал и состояние: пакеты в туннель и из него,
@@ -809,12 +853,17 @@ class Agent:
             return
         self.summarized = True
         stats = self._tun_stats()
+        link = self._link_after_up()
         after = deltas(self.refused_up, self._counters())
         parts = [tunnel_text(stats) or "счётчики fpt0 не прочитаны",
+                 f"канал к серверу после подъёма: {link_text(link) or 'не прочитан'}",
                  f"ошибок канала данных {self.data_errors}"
                  + (f" ({self.data_error_line})" if self.data_error_line else ""),
                  f"охрана после подъёма: {guard_text(after) or '—'}"]
-        self._write(tun=stats, refused_after_up=after)
+        if self.notices:
+            parts.append("предупреждения OpenVPN: " + " | ".join(self.notices))
+        self._write(tun=stats, link_after_up=link, refused_after_up=after,
+                    notices=self.notices)
         self._say("итог туннеля: " + "; ".join(parts))
 
     def _start(self, name: str, argv: list[str], ids: tuple[int, int]) -> subprocess.Popen:
@@ -842,6 +891,11 @@ class Agent:
                 self.data_errors += 1
                 if not self.data_error_line:
                     self.data_error_line = masked(line)
+            if len(self.notices) < 3 and any(mark in line for mark in _NOTICES) \
+                    and not any(word in line for word in _SETTINGS_LINES):
+                text = masked(_STAMP.sub("", line.strip()))[:160]
+                if text not in self.notices:
+                    self.notices.append(text)
 
     def _drain(self, proc: subprocess.Popen) -> None:
         """Вывод работника SOCKS — не в журнал службы: последние строки только для причины
@@ -864,6 +918,7 @@ class Agent:
             # работник — демон всё равно запишет, что туннель был и что видно изнутри.
             self.was_up = True
             self.refused_up = self._counters()
+            self.link_up = self._tun_stats(inner_link(manifest.index))
             self._write(tunnel=address, mtu=mtu, tunnel_at=time.time())
             self._say(f"туннель поднят, MTU {mtu}")
             servers, inner = self._inner_check(manifest)
@@ -906,6 +961,9 @@ class Agent:
                                                                self._counters())}
                     if stats is not None:
                         values["tun"] = stats
+                    link = self._link_after_up()
+                    if link is not None:
+                        values["link_after_up"] = link
                     self._write(**values)
                 ready, _w, _x = select.select([sock], [], [], 1.0)
                 if ready:
