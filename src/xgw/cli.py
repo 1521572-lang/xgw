@@ -180,9 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     pool_status.add_argument("--json", action="store_true", help="вывести JSON")
     pool_mode = pool_sub.add_parser(
-        "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку)",
+        "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку), "
+                     "on — весь дом через бесплатные серверы",
     )
-    pool_mode.add_argument("mode", choices=("off", "observe"))
+    pool_mode.add_argument("mode", choices=("off", "observe", "on"))
     # Агент поколения туннеля SSTP — его запускает служба xgw-fp@<gen> (freepool/agent.py).
     pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
     pool_agent.add_argument("gen")
@@ -1060,7 +1061,11 @@ def _cmd_core(args, cfg: config.Config, paths: Paths, logger) -> int:
 def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
     """`xgw pool` — то же, что карточка «Бесплатные серверы» в панели (freepool/)."""
     if args.pool_action == "mode":
-        outcome = actions.set_pool_mode(paths, managed.path_for(args.config_path), args.mode)
+        from .freepool import traffic as fptraffic
+
+        ready = len(fptraffic.admitted(cfg, paths, time.time())) if args.mode == "on" else None
+        outcome = actions.set_pool_mode(paths, managed.path_for(args.config_path), args.mode,
+                                        ready=ready)
         if not outcome.ok:
             return _fail(outcome.text, outcome.code)
         logger.info("%s", outcome.text)

@@ -457,8 +457,9 @@ def assemble(
     applied_sb = read_json(paths.singbox_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
     pool_devs = traffic.pool_devices(cfg)
+    pool_all = traffic.whole_house(cfg)
     pool_ready, pool_hosts = _pool_servers(cfg, paths, inventory, applied, mark, logger,
-                                           pool_devs)
+                                           bool(pool_devs) or pool_all)
     prices = node_costs(cfg, inventory)
     if prefer is None:
         prefer = builder.member_fingerprints(applied, inventory.nodes)
@@ -577,7 +578,7 @@ def assemble(
                 avoid_ports={*(plan.ports.values() if plan is not None else ()),
                              *(applied_ports or {}).values()},
                 api_listen=str(paths.xray_api_socket),
-                pool=pool_nodes, pool_devices=pool_devs,
+                pool=pool_nodes, pool_devices=pool_devs, pool_all=pool_all,
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
@@ -708,13 +709,14 @@ def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:
 
 def _pool_servers(
     cfg: config.Config, paths: Paths, inventory: Inventory, applied: dict | None, mark,
-    logger, devices: list[str],
+    logger, active: bool,
 ) -> tuple[list[traffic.TrafficServer], dict[str, list[str]]]:
     """Серверы бесплатного пула для сборки (М2б.1): допущенные (traffic.admitted), состав —
     как в применённом конфиге, пока они допущены (traffic.choose), и только те, чьё имя
     разрешается в публичные адреса (probe.server_hosts — как у проверок пула: список не
-    направит трафик устройства в домашнюю сеть). Устройств через пул нет — пусто."""
-    if not devices:
+    направит трафик устройства в домашнюю сеть). Через пул никто не идёт (active — ни
+    устройств, ни всего дома, traffic.pool_active) — пусто."""
+    if not active:
         return [], {}
     found = traffic.admitted(cfg, paths, time.time())
     kept = {info.fingerprint for info in builder.applied_pool(applied, [s.node for s in found])}

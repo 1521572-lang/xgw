@@ -1110,8 +1110,10 @@ def render_status(status: dict) -> str:
     if isinstance(pool, dict):
         regions = ", ".join(f"{name} {count}" for name, count in sorted(
             (pool.get("by_region") or {}).items()))
+        mode = {"observe": "наблюдение", "on": "весь дом"}.get(str(pool.get("mode")),
+                                                                 str(pool.get("mode")))
         lines.append(
-            f"Бесплатный пул ({'наблюдение' if pool.get('mode') == 'observe' else pool.get('mode')}"
+            f"Бесплатный пул ({mode}"
             f", регион {pool.get('region')}): найдено {pool.get('found', 0)}, проверено "
             f"{pool.get('checked', 0)}, пригодно {pool.get('ready', 0)}"
             + (f" ({regions})" if regions else "")

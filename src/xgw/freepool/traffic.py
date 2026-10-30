@@ -50,6 +50,17 @@ def pool_devices(cfg: Config) -> list[str]:
     return sorted(ip for ip, server in cfg.managed.routes.items() if server == POOL_ROUTE)
 
 
+def whole_house(cfg: Config) -> bool:
+    """Весь дом через бесплатные серверы (free_pool.mode = on, веха М2б.2): подписка — только
+    несущий канал входов демона (generator/builder.py, pool_all)."""
+    return cfg.free_pool.mode == "on"
+
+
+def pool_active(cfg: Config) -> bool:
+    """Через пул идёт трафик: весь дом или хотя бы одно устройство."""
+    return whole_house(cfg) or bool(pool_devices(cfg))
+
+
 def wanted_regions(cfg: Config) -> list[str]:
     """Регион пула и, при region_policy = preferred, запасные регионы."""
     pool = cfg.free_pool
@@ -136,7 +147,8 @@ def text(flow: dict) -> str:
     """Устройства через бесплатные серверы одной строкой (`xgw pool`, `xgw status`): flow —
     сводка демона free_pool.traffic (Daemon._pool_step)."""
     devices = ", ".join(str(item) for item in flow.get("devices") or [])
-    head = f"Через бесплатные серверы: {devices}"
+    head = ("Весь дом через бесплатные серверы" if flow.get("all")
+            else f"Через бесплатные серверы: {devices}")
     if flow.get("closed"):
         why = ("допущенных серверов нет" if not flow.get("members")
                else "все серверы пула молчат")

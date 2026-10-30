@@ -674,6 +674,7 @@ def build(
     api_listen: str = API_SOCKET,
     pool: Sequence[ServerNode] = (),
     pool_devices: Sequence[str] = (),
+    pool_all: bool = False,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
@@ -688,6 +689,11 @@ def build(
     pool — допущенные серверы бесплатного пула (freepool/traffic.py), pool_devices — адреса
     устройств, которые идут через них (веха М2б.1): балансировщик «pool», правило по адресу
     после прямых доменов; pool пуст — правило в «block» (закрыто, R05).
+
+    pool_all — весь дом через пул (free_pool.mode = on, веха М2б.2): весь трафик перехвата и
+    запросы DNS самого Xray — в «pool» (пуст — в block, кроме прямых доменов и адресов), а
+    «auto» из серверов подписки — только входам демона http-in и socks-in: несущий канал для
+    списков пула, подписок и обновлений. Свои серверы устройств (Ф4) тогда не действуют.
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -914,28 +920,27 @@ def build(
     if cfg.routing.direct_ips:
         rules.append({"type": "field", "ip": list(cfg.routing.direct_ips), "outboundTag": "direct"})
     # Свой сервер устройства — после DNS, частных сетей и direct_*: российские сайты у
-    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника.
-    rules.extend(
-        {"type": "field", "source": [ip], "outboundTag": tag}
-        for ip, tag in device_routes(cfg, nodes, devices_down)
-    )
-    # Устройства через бесплатный пул (М2б.1) — тоже после прямых доменов; серверов пула нет —
-    # закрыто: через подписку такое устройство не идёт (решение заказчика 29.10.2026).
-    if pool_devices:
-        rules.append(
-            {"type": "field", "source": list(pool_devices), "balancerTag": POOL_BALANCER}
-            if pool_infos else
-            {"type": "field", "source": list(pool_devices), "outboundTag": "block"}
+    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника. Весь дом через пул —
+    # свои серверы из подписки не действуют.
+    if not pool_all:
+        rules.extend(
+            {"type": "field", "source": [ip], "outboundTag": tag}
+            for ip, tag in device_routes(cfg, nodes, devices_down)
         )
+    # Серверов пула нет — закрыто: через подписку трафик пула не идёт (R05, решение заказчика
+    # 29.10.2026).
+    to_pool = {"balancerTag": POOL_BALANCER} if pool_infos else {"outboundTag": "block"}
+    # Устройства через бесплатный пул (М2б.1) — тоже после прямых доменов.
+    if pool_devices and not pool_all:
+        rules.append({"type": "field", "source": list(pool_devices), **to_pool})
+    if pool_all:
+        # Несущий канал (М2б.2): серверы подписки — только входам демона.
+        rules.append({"type": "field", "inboundTag": ["http-in", "socks-in"],
+                      "balancerTag": BALANCER_TAG})
+    rest = to_pool if pool_all else {"balancerTag": BALANCER_TAG}
     if cfg.routing.proxy_domains:
-        rules.append(
-            {
-                "type": "field",
-                "domain": list(cfg.routing.proxy_domains),
-                "balancerTag": BALANCER_TAG,
-            }
-        )
-    rules.append({"type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG})
+        rules.append({"type": "field", "domain": list(cfg.routing.proxy_domains), **rest})
+    rules.append({"type": "field", "network": "tcp,udp", **rest})
 
     # Резервный выход — дешёвый лимитированный запасной: через него трафик идёт, только
     # когда observatory считает мёртвыми всех участников. В subjectSelector он не входит,
@@ -957,6 +962,11 @@ def build(
                 entry["port"] = port
             dns_servers.append(entry)
     for address, port in map(_dns_server, cfg.dns.proxy_servers):
+        if pool_all and "://" not in address:
+            # Весь дом через пул (М2б.2): DNS — по TCP («tcp://», DNS-over-TCP через маршрутизацию
+            # Xray, app/dns/nameserver.go). Проверки пула меряют только TCP, а бесплатный сервер
+            # может не пропускать UDP — у всего дома тогда не разрешались бы имена.
+            address = f"tcp://{address}"
         dns_servers.append(address if port is None else {"address": address, "port": port})
 
     config = {
@@ -1000,10 +1010,10 @@ def build(
             ],
         },
         "burstObservatory": {
-            # Пробы ядра для пула — по наличию устройств через него, а не серверов: секция
-            # burstObservatory меняется только перезапуском Xray, и пропадание серверов пула
-            # не должно рвать соединения всего дома.
-            "subjectSelector": ["proxy-", *([POOL_PREFIX] if pool_devices else [])],
+            # Пробы ядра для пула — по наличию устройств через него (или всего дома), а не
+            # серверов: секция burstObservatory меняется только перезапуском Xray, и пропадание
+            # серверов пула не должно рвать соединения всего дома.
+            "subjectSelector": ["proxy-", *([POOL_PREFIX] if pool_devices or pool_all else [])],
             "pingConfig": {
                 "destination": probe_url or cfg.probe.url,
                 "connectivity": "",

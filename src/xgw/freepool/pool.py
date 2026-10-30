@@ -572,7 +572,8 @@ def _quota_text(free_at: float) -> str:
 
 def render(summary: dict, now: float) -> str:
     """`xgw pool status`: сводка наблюдения текстом."""
-    mode = {"off": "выключен", "observe": "наблюдение (трафик через подписку)"}.get(
+    mode = {"off": "выключен", "observe": "наблюдение (трафик через подписку)",
+            "on": "весь дом через бесплатные серверы (подписка — несущий канал)"}.get(
         str(summary.get("mode")), str(summary.get("mode")))
     lines = [f"Бесплатный пул: {mode}; регион {summary.get('region')} "
              f"({'строго' if summary.get('region_policy') == 'strict' else 'с запасными'})"]

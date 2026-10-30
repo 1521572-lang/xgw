@@ -1197,12 +1197,46 @@ class Diag:
     def _free_pool(self) -> list[Check]:
         return [*self._free_pool_backend(), *self._pool_traffic()]
 
+    def _pool_house(self) -> list[Check]:
+        """Весь дом через бесплатный пул (М2б.2): последнее правило рабочего конфига (весь
+        прочий трафик) ведёт в «pool» или в block (закрыто), входы демона http-in и socks-in —
+        в подписку («auto», несущий канал), в «auto» серверов пула нет."""
+        name = "Весь дом через бесплатный пул"
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        routing = applied.get("routing") or {}
+        rules = [rule for rule in routing.get("rules") or [] if isinstance(rule, dict)]
+        auto = next((item for item in routing.get("balancers") or []
+                     if isinstance(item, dict) and item.get("tag") == BALANCER_TAG), {})
+        if any(str(prefix).startswith(builder.POOL_PREFIX)
+               for prefix in auto.get("selector") or []):
+            return [Check(name, FAIL, "серверы пула попали в балансировщик подписки",
+                          "sudo systemctl restart xgw")]
+        last = rules[-1] if rules else {}
+        carrier = next((rule for rule in rules if "http-in" in (rule.get("inboundTag") or [])
+                        and rule.get("balancerTag") == BALANCER_TAG), None)
+        if last.get("balancerTag") == BALANCER_TAG or carrier is None:
+            return [Check(name, FAIL, "в рабочем конфиге весь дом ещё идёт через подписку",
+                          "подождите минуту и повторите; снова так — sudo systemctl restart xgw")]
+        if last.get("outboundTag") == "block":
+            return [Check(name, WARN, "закрыто: допущенных серверов нет — зарубежные сайты у "
+                                      "всего дома закрыты, российские — напрямую",
+                          "вернуть режим подписок — кнопка на вкладке «Бесплатные серверы» "
+                          "или sudo xgw pool mode observe")]
+        pool = builder.applied_pool(applied)
+        if last.get("balancerTag") != builder.POOL_BALANCER or not pool:
+            return [Check(name, FAIL, "весь прочий трафик ведёт не в бесплатный пул",
+                          "sudo systemctl restart xgw")]
+        return [Check(name, OK, f"через бесплатный пул, серверов в «pool»: {len(pool)}; "
+                                "подписка — только входам демона (несущий канал)")]
+
     def _pool_traffic(self) -> list[Check]:
         """Устройства через бесплатный пул (М2б.1): их правило в рабочем конфиге ведёт в
         балансировщик «pool» из серверов пула или в block (закрыто), но не в подписку; в
         балансировщике подписки серверов пула нет."""
         from .freepool import traffic as fptraffic
 
+        if fptraffic.whole_house(self.cfg):
+            return self._pool_house()
         devices = fptraffic.pool_devices(self.cfg)
         if not devices:
             return []

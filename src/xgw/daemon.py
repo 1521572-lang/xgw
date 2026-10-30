@@ -847,6 +847,12 @@ class Daemon:
             # Свой сервер устройства (Ф4) выбран в панели — его ждут сразу. С 0.2.0 это только
             # правило маршрутизации: применяется через API ядра, без перезапуска Xray.
             self._urgent_rebuild = "свой сервер устройства"
+        modes = (previous.cfg.free_pool.mode, self.cfg.free_pool.mode)
+        if modes[0] != modes[1] and "on" in modes:
+            # Весь дом через пул (М2б.2) включили или выключили в панели — ждут сразу. Пробы ядра
+            # для пула (burstObservatory) могут потребовать перезапуска Xray.
+            self._urgent_rebuild = ("бесплатный пул: весь дом" if modes[1] == "on"
+                                    else "бесплатный пул: режим подписок")
         # Серверы те же — заново проверять участников незачем.
         self.vetted = set(previous.vetted)
         self.bad_members = dict(previous.bad_members)
@@ -2534,12 +2540,14 @@ class Daemon:
         (без прыжков между серверами, как основной с 0.1.9); умер — следующий живой; живых
         нет — закрепление снято, и балансировщик ведёт в block: у устройств закрыто (R05)."""
         devices = traffic.pool_devices(self.cfg)
+        whole = traffic.whole_house(self.cfg)  # весь дом через пул (М2б.2)
+        who = "весь дом" if whole else ", ".join(devices)
         now = self.wall()
-        if devices and now - self._pool_checked_at >= POOL_CHECK:
+        if (devices or whole) and now - self._pool_checked_at >= POOL_CHECK:
             self._pool_checked_at = now
             self._pool_due(applied, now)
         pool = builder.applied_pool(applied)
-        if not devices:
+        if not (devices or whole):
             self._pool_pinned, self._pool_traffic = "", None
             return
         alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
@@ -2562,13 +2570,13 @@ class Daemon:
                 self.log.warning("сервер бесплатного пула не закреплён: %s", exc)
                 return
             if current != self._pool_pinned:
-                self.notifier.event("freepool", self._pool_change_text(current, pool, devices))
+                self.notifier.event("freepool", self._pool_change_text(current, pool, who))
             self._pool_pinned, self._pool_pin_key = current, key
         elif not alive and was_closed is not True:
-            self.notifier.event("freepool", self._pool_change_text("", pool, devices))
+            self.notifier.event("freepool", self._pool_change_text("", pool, who))
         name, country = self._pool_names.get(current, ("", ""))
         self._pool_traffic = {
-            "devices": devices, "members": len(pool), "alive": len(alive),
+            "devices": devices, "all": whole, "members": len(pool), "alive": len(alive),
             "closed": not alive, "server": name, "country": country, "tag": current,
             "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
             if current else 0,
@@ -2581,15 +2589,18 @@ class Daemon:
             } for info in pool],
         }
 
-    def _pool_change_text(self, current: str, pool: list[NodeInfo], devices: list[str]) -> str:
-        who = ", ".join(devices)
+    def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str) -> str:
+        """who — адреса устройств через пул или «весь дом» (М2б.2)."""
+        whole = who == "весь дом"
+        subject = "весь дом идёт" if whole else f"устройства {who} идут"
+        target = "у всего дома" if whole else f"у устройств {who}"
         if current:
             name, country = self._pool_names.get(current, (current, ""))
-            return (f"бесплатный пул: устройства {who} идут через «{name}»"
+            return (f"бесплатный пул: {subject} через «{name}»"
                     + (f" ({country})" if country else ""))
         if not pool:
-            return f"бесплатный пул: допущенных серверов нет — у устройств {who} закрыто"
-        return f"бесплатный пул: все серверы пула молчат — у устройств {who} закрыто"
+            return f"бесплатный пул: допущенных серверов нет — {target} закрыто"
+        return f"бесплатный пул: все серверы пула молчат — {target} закрыто"
 
     def _pool_due(self, applied: dict, now: float) -> None:
         """Допущенные серверы пула против применённого состава «pool»: у устройств закрыто, а
@@ -4092,12 +4103,18 @@ class Daemon:
         ):
             self._release_main()
             return
-        if self.cfg.speed.guard:
+        # Весь дом через пул (М2б.2): подписка — только несущий канал, трафика клиентов через
+        # неё нет — ни пассивной оценки, ни контроля скорости; плановых замеров тоже (_speed_step).
+        carrier = traffic.whole_house(self.cfg)
+        if self.cfg.speed.guard and not carrier:
             # Пассивная оценка — до замеров: участнику, через которого и так качают, замер не
             # нужен (ТЗ R5.2).
             self._passive_step(view)
         measured = self._speed_step(view, applied, observatory, now)
-        self._guard_step(view, applied, observatory)
+        if carrier:
+            self.guard.episode = None
+        else:
+            self._guard_step(view, applied, observatory)
         alive = [
             info for info in members if (observatory.get(info.tag) or {}).get("alive")
         ]
@@ -4436,13 +4453,16 @@ class Daemon:
             )
             self._speed_forced = set(self.speed_queue)
             self.speed_total, self.speed_done = len(self.speed_queue), 0
-        else:
+        elif not traffic.whole_house(self.cfg):
+            # Весь дом через пул (М2б.2) — плановых замеров серверов подписки нет: она только
+            # несущий канал, и квоту тратить незачем. По кнопке — как обычно.
             prices = self._prices()
             for info in targets:
                 if info.probe_tag not in queued and self._speed_due(info, prices):
                     self.speed_queue.append(info.probe_tag)
                     self.speed_total += 1
-        self._guard_queue(targets)
+        if not traffic.whole_house(self.cfg):
+            self._guard_queue(targets)
         self._speed_waiting = False
         if not self.speed_queue:
             self.speed_total = self.speed_done = 0

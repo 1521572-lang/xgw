@@ -372,6 +372,9 @@ button, textarea, input { font: inherit; color: inherit; }
 .ts-enable { align-self: flex-start; margin-top: .45rem; }
 .ts-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
 .ts-note > span { flex: 1 1 14rem; }
+/* Весь дом через бесплатные серверы (М2б.2): напоминание и кнопка возврата в главной карточке. */
+.house-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
+.house-note > span { flex: 1 1 14rem; }
 a.btn { display: inline-flex; align-items: center; color: inherit; text-decoration: none; }
 a.btn.primary { color: var(--accent-ink); }
 /* QR-код — тёмные модули на белом в любой теме: так его читает камера телефона. */

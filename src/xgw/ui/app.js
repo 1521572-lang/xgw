@@ -272,7 +272,10 @@
     // Выбор сервера устройства — из включённых: строки перерисовываются, когда их набор меняется.
     const routable = s.servers.filter((row) => ["member", "spare", "waiting"].includes(row.status))
       .map((row) => [row.fingerprint, row.name, row.multiplier || 0]);
-    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable, (s.kernel_direct || {}).reason], () => renderDevices(s));
+    // Метка «бесплатные серверы» в строках устройств — по режиму пула и тому, закрыт ли он.
+    const flow = poolFlow(s);
+    const poolKey = [(s.free_pool || {}).mode, flow ? flow.closed : null, flow ? flow.server : ""];
+    draw("devices", [s.devices, s.lan, (s.records || {}).files, recording ? recording.name : "", routable, (s.kernel_direct || {}).reason, poolKey], () => renderDevices(s));
     draw("direct", s.kernel_direct, () => renderDirect(s));
     const recTag = $("devices").querySelector(".tag.rec");
     if (recTag && recording) recTag.textContent = recordText(recording, s.now);
@@ -371,9 +374,22 @@
     note.replaceChildren(...lines);
   }
 
+  // Весь дом через бесплатные серверы (free_pool.mode = on, веха М2б.2): подписка — только
+  // несущий канал шлюза, трафик устройств — через пул.
+  const poolHouse = (s) => (s.free_pool || {}).mode === "on";
+  const poolFlow = (s) => ((s.free_pool || {}).summary || {}).traffic || null;
+
   function health(s, stale) {
     if (!s.updated) return ["off", "Запускается…"];
     if (stale) return ["bad", "Демон XGW не отвечает"];
+    if (poolHouse(s)) {
+      // Здоровье — по пулу: серверы подписки несут только каналы шлюза.
+      if (["WAN_DOWN", "XRAY_DOWN", "LEAK"].includes(s.state)) return STATES[s.state];
+      if (s.capture.mode === "on" && s.capture.lan_problem) return ["bad", "Нет интернета в сети"];
+      const flow = poolFlow(s);
+      if (!flow) return ["warn", "Бесплатные серверы подключаются"];
+      return flow.closed ? ["bad", "Бесплатных серверов нет"] : ["ok", "Через бесплатные серверы"];
+    }
     if (!s.members.length) return ["off", "Серверов нет"];
     // Серверы в порядке ещё не значит, что у устройств сети есть интернет.
     if (s.capture.mode === "on" && s.capture.lan_problem) return ["bad", "Нет интернета в сети"];
@@ -450,6 +466,10 @@
       } else if (s.capture.lan_problem) {
         heroTone = "bad";
         sub = `Устройства сети без интернета: ${s.capture.lan_problem}`;
+      } else if (poolHouse(s) && (poolFlow(s) || {}).closed) {
+        sub = "Бесплатных серверов нет — зарубежные сайты закрыты, российские открываются напрямую";
+      } else if (poolHouse(s) && tone !== "bad") {
+        sub = scopeText(s.capture).replace("через VPN", "через бесплатные серверы");
       } else if (tone === "bad") sub = `VPN включён, но сейчас не работает: ${s.action || "нет связи"}`;
       else if (s.capture.loaded === false) {
         heroTone = "bad";
@@ -476,6 +496,23 @@
     $("power-why").hidden = !why;
     $("power-why").textContent = capital(why);
 
+    renderHouse(s);
+    if (poolHouse(s)) {
+      // Весь дом через пул: «сейчас через» — закреплённый сервер пула; выбор сервера подписки
+      // («Автовыбор») касается только несущего канала.
+      const flow = poolFlow(s);
+      const server = on && !s.capture.inbound_missing && flow && !flow.closed && flow.server;
+      $("current").hidden = !server;
+      if (server) {
+        $("current-label").textContent = "Бесплатный сервер";
+        $("current-name").textContent = server + (flow.country ? ` (${flow.country})` : "")
+          + (flow.delay_ms ? ` · ${flow.delay_ms} мс` : "");
+        $("current-name").title = server;
+      }
+      $("unpin").hidden = true;
+      return;
+    }
+
     // Без перехвата трафик машины идёт напрямую — «сейчас через» было бы неправдой.
     // Выбранный вручную не отвечает (pin.down) — трафик ведёт автовыбор, его и показываем.
     const chosen = s.pin && !s.pin.down
@@ -496,6 +533,18 @@
       $("current-name").title = current.name || current.tag;
     }
     $("unpin").hidden = !s.pin;
+  }
+
+  // Напоминание в главной карточке, что весь дом идёт через пул, и кнопка возврата (М2б.2).
+  function renderHouse(s) {
+    const house = poolHouse(s);
+    $("house-note").hidden = !house;
+    if (!house) return;
+    const closed = Boolean((poolFlow(s) || {}).closed);
+    $("house-note").classList.toggle("bad", closed);
+    $("house-text").textContent = closed
+      ? "Весь дом идёт через бесплатные серверы, а их сейчас нет: зарубежные сайты закрыты у всех. Подписка их откроет."
+      : "Весь дом идёт через бесплатные серверы; подписка — только несущий канал (списки бесплатных серверов, подписки, обновления).";
   }
 
   // --- серверы по подпискам -------------------------------------------------
@@ -1063,7 +1112,10 @@
     const direct = s.kernel_direct || {};
     // Бесплатный пул (М2б.1): выбор есть, пока наблюдение включено (пул проверяет серверы).
     const freePool = s.free_pool || { mode: "off" };
-    const pool = { on: freePool.mode !== "off", flow: (freePool.summary || {}).traffic || null };
+    const pool = {
+      on: freePool.mode !== "off", all: freePool.mode === "on",
+      flow: (freePool.summary || {}).traffic || null,
+    };
     fill($("devices"), s.devices.map((device) => deviceRow(device, records.active, s.now, choices, direct, pool)),
     "Устройств пока нет: адреса выдаются, когда устройство подключается к Wi-Fi роутера.");
     $("records-block").hidden = !records.files.length;
@@ -1148,6 +1200,7 @@
   // которое пущено мимо VPN в config.toml, панель не меняет — у него только метка.
   // Свой сервер устройства (Ф4): «Авто» — как у всех, через основной сервер. «Бесплатные
   // серверы» — через бесплатный пул (М2б.1): пул пуст — у устройства закрыто, не подписка.
+  const HOUSE_TEXT = "Все устройства, эта машина и Docker пойдут через бесплатные серверы, запросы DNS — тоже; российские домены (.ru, .su, .рф) — напрямую, как сейчас. Владельцы бесплатных серверов неизвестны и видят, к каким сайтам вы ходите: содержимое сайтов с https защищено, без https — нет. Если допущенных серверов не станет, зарубежные сайты закроются у всех — подписку вернёт кнопка «Вернуть режим подписок». Подписка остаётся несущим каналом (списки бесплатных серверов, подписки, обновления); свои серверы устройств в этом режиме не действуют. Xray может перезапуститься — интернет пропадёт на несколько секунд.";
   const POOL_ROUTE_TEXT = "Владельцы бесплатных серверов неизвестны и видят, к каким сайтам идёт устройство: содержимое сайтов с https защищено, без https — нет. Российские домены (.ru, .su, .рф) — напрямую, как у всех. Пока бесплатных серверов нет, зарубежные сайты у устройства закрыты: через подписку оно не пойдёт. Вернуть — «Сервер: авто».";
 
   function routeSelect(device, choices, pool) {
@@ -1165,6 +1218,11 @@
     }
     if (!known) select.append(el("option", { value: device.route, text: "выбранный сервер выключен" }));
     select.value = device.route || "";
+    if (pool.all) {
+      // Весь дом через пул (М2б.2): свой сервер устройства не действует.
+      select.disabled = true;
+      select.title = "Весь дом идёт через бесплатные серверы — выбор сервера устройства вступит в силу, когда вернут режим подписок";
+    }
     select.addEventListener("change", () => {
       const before = device.route || "";
       const wanted = select.value;
@@ -1184,9 +1242,10 @@
   // Метка устройства через бесплатный пул: закрыто — пул выключен, серверов нет или все молчат.
   function poolTag(pool) {
     const closed = !pool.on || Boolean(pool.flow && pool.flow.closed);
+    const back = pool.all ? "Вернуть подписку — «Вернуть режим подписок»" : "Вернуть на подписку — «Сервер: авто»";
     return closed
       ? { cls: "tag warn", text: "бесплатные серверы · закрыто",
-          title: "Бесплатных серверов сейчас нет (или наблюдение выключено): зарубежные сайты у устройства закрыты, пока они не появятся. Вернуть на подписку — «Сервер: авто»" }
+          title: `Бесплатных серверов сейчас нет (или наблюдение выключено): зарубежные сайты у устройства закрыты, пока они не появятся. ${back}` }
       : { cls: "tag on", text: "бесплатные серверы",
           title: pool.flow && pool.flow.server ? `Сейчас через «${pool.flow.server}»${pool.flow.country ? ` (${pool.flow.country})` : ""}` : "" };
   }
@@ -1220,7 +1279,7 @@
         el("div", { class: "row-sub mono", text: `${device.ip} · ${device.mac}` }),
         device.bypass ? null
           : el("div", { class: "picks" }, routeSelect(device, choices, pool), directSelect(device, direct))),
-      !device.bypass && device.route === "pool"
+      !device.bypass && (device.route === "pool" || pool.all)
         ? el("span", { class: poolTag(pool).cls, text: poolTag(pool).text, title: poolTag(pool).title })
         : el("span", {
           class: device.bypass ? "tag warn" : "tag on",
@@ -1516,12 +1575,13 @@
   // Устройства через бесплатные серверы (М2б.1) — строка над списком серверов пула.
   function poolFlowText(flow, devices) {
     if (!flow) return "";
-    const names = (flow.devices || []).map((ip) => {
+    const names = flow.all ? "весь дом" : (flow.devices || []).map((ip) => {
       const found = (devices || []).find((device) => device.ip === ip);
       return found && found.name ? found.name : ip;
     }).join(", ");
     if (flow.closed) {
-      return `Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. Вернуть на подписку — «Сервер: авто» в списке устройств.`;
+      const back = flow.all ? "Вернуть подписку — «Вернуть режим подписок»." : "Вернуть на подписку — «Сервер: авто» в списке устройств.";
+      return `Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. ${back}`;
     }
     return `Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
   }
@@ -1752,8 +1812,19 @@
     const pool = s.free_pool || { mode: "off" };
     const on = pool.mode !== "off";
     const sum = on ? pool.summary || null : null;
+    const house = pool.mode === "on";
+    // Наблюдение: «Весь дом через бесплатные» и «Выключить»; весь дом — «Вернуть режим
+    // подписок» (наблюдение продолжается); выключен — «Включить наблюдение».
+    $("pool-toggle").hidden = house;
     $("pool-toggle").textContent = on ? "Выключить" : "Включить наблюдение";
+    $("pool-house").hidden = !on;
+    $("pool-house").textContent = house ? "Вернуть режим подписок" : "Весь дом через бесплатные";
+    $("pool-house").className = house ? "btn ghost" : "btn primary";
     $("pool-refresh").hidden = !on;
+    $("carrier-note").hidden = !house;
+    $("carrier-note").textContent = house
+      ? "Весь дом идёт через бесплатные серверы: серверы подписки несут только каналы шлюза — списки бесплатных серверов, подписки, обновления. Плановых замеров их скорости в этом режиме нет. Трафик устройств — на вкладке «Бесплатные серверы»."
+      : "";
     $("pool-count").textContent = sum && sum.found ? String(sum.found) : "";
     const flow = sum ? sum.traffic || null : null;
     $("pool-flow").hidden = !flow;
@@ -1772,7 +1843,7 @@
     const tunnels = sum.tunnel_backend
       ? `SSTP (VPN Gate) — ${sum.sstp || 0} (туннелем не проверить: ${sum.tunnel_backend}; адрес открыт — ${sum.reachable_tunnel || 0}, закрыт — ${sum.closed})`
       : `SSTP (VPN Gate) — ${sum.sstp || 0}, туннелем за сутки: попыток ${sum.tunnel_attempts || 0}, поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки туннелем после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
-    $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${tunnels}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
+    $("pool-text").textContent = `${house ? "Весь дом через бесплатные серверы" : "Наблюдение"} (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${tunnels}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
     if (tab === "pool") renderPoolGroups(s, sum); // сотни строк — только на открытой вкладке
   }
 
@@ -1875,7 +1946,17 @@
   $("cores-check").addEventListener("click", () => act("cores/check", {}, $("cores-check")));
   $("netcheck-run").addEventListener("click", () => act("netcheck", {}, $("netcheck-run")));
   $("pool-toggle").addEventListener("click", () => act("freepool/mode", {
-    mode: ((state || {}).free_pool || {}).mode === "observe" ? "off" : "observe" }, $("pool-toggle")));
+    mode: ((state || {}).free_pool || {}).mode === "off" ? "observe" : "off" }, $("pool-toggle")));
+  // Весь дом через пул (М2б.2) — с подтверждением; возврат в режим подписок — сразу.
+  $("pool-house").addEventListener("click", () => {
+    if (((state || {}).free_pool || {}).mode === "on") {
+      act("freepool/mode", { mode: "observe" }, $("pool-house"));
+      return;
+    }
+    confirmRemove("Пустить весь дом через бесплатные серверы?", HOUSE_TEXT,
+      () => act("freepool/mode", { mode: "on" }, $("pool-house")), "Весь дом через бесплатные", "primary");
+  });
+  $("house-back").addEventListener("click", () => act("freepool/mode", { mode: "observe" }, $("house-back")));
   $("pool-refresh").addEventListener("click", () => act("freepool/refresh", {}, $("pool-refresh")));
   $("tab-subs").addEventListener("click", () => showTab("subs"));
   $("tab-pool").addEventListener("click", () => showTab("pool"));

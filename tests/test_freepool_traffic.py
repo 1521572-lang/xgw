@@ -173,6 +173,62 @@ def test_pool_device_is_closed_without_pool_servers_and_xray_is_not_restarted(pa
     assert removed == sorted(info.tag for info in builder.applied_pool(full))
 
 
+def test_whole_house_goes_through_the_pool_and_the_subscription_carries_the_daemon(paths):
+    """Весь дом через пул (М2б.2): прочий трафик и DNS Xray — в «pool» (пуст — block), прямые
+    домены — напрямую раньше; серверы подписки — только входам демона (несущий канал); свои
+    серверы устройств (Ф4) и правило устройств пула не нужны; пробы ядра для пула — по режиму."""
+    _pool(paths)
+    cfg = _cfg("on")
+    pool = [item.node for item in traffic.admitted(cfg, paths, NOW)]
+    selection = _selection(SUBSCRIPTION)
+    cfg.managed.routes = {DEVICE: managed.POOL_ROUTE,
+                          "192.168.50.130": selection.members[0].fingerprint}
+    usual = builder.build(cfg, selection, hosts={}, pool=pool, pool_devices=[DEVICE]).config
+    assert [rule["source"] for rule in usual["routing"]["rules"] if rule.get("source")] \
+        == [["192.168.50.130"], [DEVICE]]
+    config = builder.build(cfg, selection, hosts={}, pool=pool, pool_devices=[DEVICE],
+                           pool_all=True).config
+    rules = config["routing"]["rules"]
+    assert not [rule for rule in rules if rule.get("source")]
+    carrier = rules.index({"type": "field", "inboundTag": ["http-in", "socks-in"],
+                           "balancerTag": "auto"})
+    direct = next(i for i, rule in enumerate(rules) if "domain:ru" in (rule.get("domain") or []))
+    assert direct < carrier < len(rules) - 1
+    assert rules[-1] == {"type": "field", "network": "tcp,udp", "balancerTag": "pool"}
+    assert config["burstObservatory"]["subjectSelector"] == ["proxy-", "pool-"]
+    # DNS через пул — по TCP: бесплатный сервер может не пропускать UDP.
+    assert usual["dns"]["servers"][-2:] == ["1.1.1.1", "8.8.8.8"]
+    assert config["dns"]["servers"][-2:] == ["tcp://1.1.1.1", "tcp://8.8.8.8"]
+    empty = builder.build(cfg, selection, hosts={}, pool=[], pool_all=True).config
+    assert empty["routing"]["rules"][-1] == {"type": "field", "network": "tcp,udp",
+                                             "outboundTag": "block"}
+    assert empty["burstObservatory"] == config["burstObservatory"]
+    # Режим включён без устройств через пул — сборка всё равно берёт допущенных.
+    raws, _meta, _warnings = parse_links_text(SUBSCRIPTION, "main")
+    inventory = engine.Inventory([raw_to_node(raw, "main") for raw in raws])
+    cfg.managed.routes = {}
+    assembly = engine.assemble(cfg, paths, inventory, mark=None, logger=LOG, xray_bin=None,
+                               check=False)
+    assert assembly.result.pool and assembly.pool_devices == []
+    assert assembly.result.config["routing"]["rules"][-1]["balancerTag"] == "pool"
+
+
+def test_whole_house_is_not_switched_on_without_admitted_servers(paths, tmp_path):
+    """Панель не включает весь дом без допущенных серверов (закрылось бы всё), команда
+    включает и предупреждает; возврат в режим подписок — своим событием."""
+    store = tmp_path / "panel.json"
+    refused = actions.set_pool_mode(paths, store, "on", refuse_closing=True, ready=0)
+    assert refused.code == 2 and "Допущенных" in refused.text
+    done = actions.set_pool_mode(paths, store, "on", ready=0)
+    assert done.ok and "сейчас нет" in done.text
+    assert managed.load(store)[0]["free_pool_mode"] == "on"
+    assert actions.set_pool_mode(paths, store, "observe", refuse_closing=True).ok
+    with actions.open_store(paths) as db:
+        texts = [row["detail"] for row in db.recent_events(10)]
+    assert texts[:2] == ["бесплатный пул: режим подписок возвращён, наблюдение продолжается",
+                         "бесплатный пул: весь дом через бесплатные серверы"]
+
+
 def test_assemble_puts_admitted_pool_servers_into_the_config(paths):
     """engine.assemble берёт допущенные серверы пула сам — каждая сборка демона, CLI и
     установки одинаково ведёт устройство через пул."""
@@ -250,3 +306,19 @@ def test_daemon_pins_a_live_pool_server_without_jumping(paths):
     assert daemon.api.calls[-1] == ("unpin", "pool")
     assert daemon._pool_traffic["closed"] and "закрыто" in daemon.events[-1]
     assert len(daemon.events) == 3
+
+
+def test_daemon_keeps_the_whole_house_on_a_live_pool_server(paths):
+    """Весь дом через пул (М2б.2) — тот же закреплённый сервер «pool», и без устройств."""
+    applied = {"outbounds": [{"tag": "pool-de-aaaa"}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    daemon = _daemon(paths)
+    daemon.cfg = _cfg("on")
+    daemon.cfg.managed.routes = {}
+    daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.2}})
+    assert daemon.api.calls == [("pin", "pool", "pool-de-aaaa")]
+    flow = daemon._pool_traffic
+    assert flow["all"] and flow["devices"] == [] and "весь дом идёт через" in daemon.events[-1]
+    assert traffic.text(flow).startswith("Весь дом через бесплатные серверы — сервер")
+    daemon._pool_step(applied, {"pool-de-aaaa": {"alive": False}})
+    assert "у всего дома закрыто" in daemon.events[-1]

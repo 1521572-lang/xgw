@@ -318,10 +318,10 @@ def test_bad_free_pool_settings_fall_back_with_warnings(tmp_path):
         "checks_per_step = 50\n", encoding="utf-8")
     cfg, warnings = config.load(path)
     pool = cfg.free_pool
-    assert pool.mode == "observe"  # трафик через пул — следующая веха, пока наблюдение
+    assert pool.mode == "on"  # весь дом через пул — с вехи М2б.2
     assert (pool.region, pool.providers, pool.fallback_regions) == ("EU", ["vpngate"], ["US"])
     assert (pool.health_reserved_mb, pool.checks_per_step) == (100, 2)
-    assert len([item for item in warnings if item.startswith("free_pool.")]) == 6
+    assert len([item for item in warnings if item.startswith("free_pool.")]) == 5
     path.write_text("", encoding="utf-8")
     assert config.load(path)[0].free_pool.mode == "off"  # без раздела — выключен
 
@@ -345,8 +345,12 @@ def test_pool_command_shows_the_summary_and_switches_the_mode(tmp_path, monkeypa
     assert main(["pool", "--config", str(path), "status"]) == 0
     text = capsys.readouterr().out
     assert "Бесплатный пул: наблюдение" in text and "VPN Gate: — · списка ещё нет" in text
-    with pytest.raises(SystemExit):  # трафик через пул (on) — не в этой версии
-        main(["pool", "--config", str(path), "mode", "on"])
+    # Весь дом через пул (М2б.2): команда включает и без допущенных серверов, но предупреждает.
+    assert main(["pool", "--config", str(path), "mode", "on"]) == 0
+    assert "Допущенных бесплатных серверов сейчас нет" in capsys.readouterr().out
+    assert managed.load(managed.path_for(path))[0]["free_pool_mode"] == "on"
+    with pytest.raises(SystemExit):
+        main(["pool", "--config", str(path), "mode", "full"])
 
 
 def test_regions_count_only_the_wanted(tmp_path, monkeypatch):

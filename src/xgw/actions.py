@@ -256,19 +256,28 @@ POOL_MODE_TEXT = {
     "off": "Бесплатный пул выключен",
     "observe": "Наблюдение за бесплатным пулом включено: списки серверов собираются через "
                "подписку, серверы проверяются, а трафик идёт как прежде — через подписку",
+    "on": "Весь дом идёт через бесплатные серверы: устройства, эта машина, Docker и DNS. "
+          "Подписка — только несущий канал: списки бесплатных серверов, подписки, обновления. "
+          "Вернуть — «Вернуть режим подписок» в панели или sudo xgw pool mode observe",
+}
+POOL_MODE_EVENT = {
+    "off": "бесплатный пул выключен",
+    "observe": "бесплатный пул: наблюдение включено",
+    "on": "бесплатный пул: весь дом через бесплатные серверы",
 }
 
 
 def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool = False,
-                  ) -> Outcome:
-    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге): off или observe.
-    Весь дом через пул (on) — веха М2б.2 (docs/FREEPOOL-PLAN.md). Устройства «через
-    бесплатные серверы» (М2б.1) при выключенном пуле закрыты: панель (refuse_closing) тогда
-    не выключает, команда выключает и говорит об этом."""
+                  ready: int | None = None) -> Outcome:
+    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге): off, observe или
+    on — весь дом через пул (веха М2б.2). Устройства «через бесплатные серверы» (М2б.1) при
+    выключенном пуле закрыты, а весь дом без допущенных серверов (ready — их число,
+    traffic.admitted) остался бы без зарубежных сайтов: панель (refuse_closing) тогда режим не
+    меняет, команда меняет и говорит об этом."""
     from . import managed
 
     if mode not in POOL_MODE_TEXT:
-        return Outcome(2, "режим — off или observe (весь дом через пул — в следующей версии)")
+        return Outcome(2, "режим — off, observe или on")
     stored, _problem = managed.load(store_path)
     via_pool = [item.get("name") or item.get("ip") for item in stored.get("routes") or []
                 if item.get("server") == managed.POOL_ROUTE]
@@ -276,6 +285,13 @@ def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool =
         return Outcome(2, "Через бесплатные серверы идёт устройство «" + "», «".join(via_pool)
                        + "»: без пула у него закроются зарубежные сайты. Сначала верните его "
                        "на подписку в списке устройств (сервер: авто), потом выключайте")
+    empty = mode == "on" and not ready
+    if empty and refuse_closing:
+        return Outcome(2, "Допущенных бесплатных серверов сейчас нет (или наблюдение выключено): "
+                          "весь дом остался бы без зарубежных сайтов. Включите наблюдение и "
+                          "дождитесь допущенных серверов — их видно на вкладке «Бесплатные "
+                          "серверы»")
+    previous = stored.get("free_pool_mode")
     try:
         changed = managed.set_free_pool_mode(store_path, mode)
     except managed.ManagedError as exc:
@@ -283,10 +299,15 @@ def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool =
     except OSError as exc:
         return Outcome(1, f"режим не записан: {exc} — запустите команду через sudo")
     if changed:
+        event = POOL_MODE_EVENT[mode]
+        if previous == "on" and mode == "observe":
+            event = "бесплатный пул: режим подписок возвращён, наблюдение продолжается"
         with open_store(paths) as store:
-            store.add_event("freepool", "бесплатный пул: наблюдение включено" if mode == "observe"
-                            else "бесплатный пул выключен")
+            store.add_event("freepool", event)
     text = POOL_MODE_TEXT[mode]
+    if empty:
+        text += (". Допущенных бесплатных серверов сейчас нет — зарубежные сайты закрыты, пока "
+                 "они не появятся")
     if mode == "off" and via_pool:
         text += (". Устройства через бесплатные серверы (" + ", ".join(via_pool) + ") остались "
                  "без зарубежных сайтов — верните их на подписку в списке устройств панели")

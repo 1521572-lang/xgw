@@ -857,10 +857,6 @@ def _validate_free_pool(pool: FreePoolConf) -> list[str]:
     if pool.mode not in FREE_POOL_MODES:
         warnings.append(f"free_pool.mode={pool.mode}: ожидается off, observe или on — off")
         pool.mode = defaults.mode
-    if pool.mode == "on":  # веха М2 (docs/FREEPOOL-PLAN.md)
-        warnings.append("free_pool.mode=on: трафик через бесплатный пул — в следующей версии, "
-                        "пока observe (наблюдение, трафик через подписку)")
-        pool.mode = "observe"
     if pool.region not in FREE_POOL_REGIONS:
         warnings.append(f"free_pool.region={pool.region}: ожидается EU, US, ASIA или auto — EU")
         pool.region = defaults.region

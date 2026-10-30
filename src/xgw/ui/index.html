@@ -42,6 +42,10 @@
         </div>
         <button id="unpin" class="btn small-btn" type="button" title="Сервер снова выбирает шлюз" hidden>Автовыбор</button>
       </div>
+      <div id="house-note" class="note house-note" role="status" hidden>
+        <span id="house-text"></span>
+        <button id="house-back" class="btn small-btn" type="button">Вернуть режим подписок</button>
+      </div>
     </section>
 
     <section class="card subs-card" aria-labelledby="subs-title">
@@ -200,6 +204,7 @@
         </div>
         <button id="speed" class="btn ghost" type="button">Замерить скорость</button>
       </div>
+      <p id="carrier-note" class="note" role="status" hidden></p>
       <p id="nodes-note" class="muted small nodes-note" hidden></p>
       <p id="tier-note" class="muted small" hidden></p>
       <p id="stranded-note" class="note" role="status" hidden></p>
@@ -228,6 +233,7 @@
         <h2 id="pool-title">Бесплатные серверы <span id="pool-count" class="count"></span></h2>
         <div class="head-tools">
           <button id="pool-refresh" class="btn ghost" type="button" hidden>Опросить источники</button>
+          <button id="pool-house" class="btn primary" type="button" hidden></button>
           <button id="pool-toggle" class="btn ghost" type="button"></button>
         </div>
       </div>

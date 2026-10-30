@@ -63,6 +63,7 @@ from .. import pin as pinning
 from .. import tailscale as ts
 from ..config import Config
 from ..freepool import pool as pooling
+from ..freepool import traffic as fptraffic
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
 from ..net import cmd, dnsmasq, lan, nft
@@ -1768,8 +1769,11 @@ class Panel:
             self._wake()
             return actions.Outcome(0, "Ссылка сервера убрана")
         if name == "freepool/mode":
-            outcome = actions.set_pool_mode(self.paths, store_path, str(body.get("mode") or ""),
-                                            refuse_closing=True)
+            mode = str(body.get("mode") or "")
+            # Весь дом через пул без допущенных серверов — закрыто для всех: панель не включает.
+            ready = len(fptraffic.admitted(cfg, self.paths, time.time())) if mode == "on" else None
+            outcome = actions.set_pool_mode(self.paths, store_path, mode, refuse_closing=True,
+                                            ready=ready)
             if outcome.ok:
                 self._wake()
             return outcome
