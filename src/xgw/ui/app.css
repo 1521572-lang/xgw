@@ -145,8 +145,11 @@ button, textarea, input { font: inherit; color: inherit; }
   .phones-card { order: 7; }
   .cores-card { order: 8; }
   .netcheck-card { order: 9; }
+  .mode-tabs, .pool-card { order: 2; }
   body[data-empty="1"] .subs-card { order: 2; }
-  body[data-empty="1"] .servers-card { order: 3; }
+  body[data-empty="1"] .servers-card,
+  body[data-empty="1"] .mode-tabs,
+  body[data-empty="1"] .pool-card { order: 3; }
 }
 
 .card {
@@ -614,6 +617,41 @@ a.icon-btn { text-decoration: none; }
   .server .choose { padding-right: .55rem; padding-left: .55rem; }
 }
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
+
+/* --- вкладки «Подписки | Бесплатные серверы» -------------------------------- */
+
+.mode-tabs {
+  display: flex;
+  gap: .25rem;
+  padding: .25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+.mode-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: .5rem .8rem;
+  border: 0;
+  border-radius: calc(var(--radius) - .25rem);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mode-tab:hover { color: var(--text); }
+.mode-tab[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.mode-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.head-tools { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
+
+/* Бесплатные серверы — по источникам, как серверы подписок; в шапке источника — итог опроса. */
+#pool-groups > .group:first-child { border-top: 0; }
+.group > summary > .tag { align-self: center; }
+.group-note { margin-bottom: .3rem; white-space: normal; }
+.pool-more { margin: 0 0 .5rem; }
+.pool-more > summary { padding: .3rem 0; color: var(--muted); font-size: .87rem; cursor: pointer; }
 
 .switch {
   position: relative;

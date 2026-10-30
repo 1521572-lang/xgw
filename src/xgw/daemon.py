@@ -2572,6 +2572,13 @@ class Daemon:
             "closed": not alive, "server": name, "country": country, "tag": current,
             "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
             if current else 0,
+            # Серверы балансировщика «pool» для строк вкладки «Бесплатные серверы»: id — начало
+            # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра.
+            "servers": [{
+                "id": info.fingerprint, "tag": info.tag,
+                "alive": bool((observatory.get(info.tag) or {}).get("alive")),
+                "delay_ms": round(((observatory.get(info.tag) or {}).get("delay") or 0) * 1000),
+            } for info in pool],
         }
 
     def _pool_change_text(self, current: str, pool: list[NodeInfo], devices: list[str]) -> str:

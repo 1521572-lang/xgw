@@ -43,6 +43,7 @@
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
     singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
     guard: "контроль скорости", cores: "обновление ядер", netcheck: "проверка сети",
+    freepool: "бесплатные серверы",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",
@@ -63,6 +64,19 @@
   let gone = false; // панель открыли в другой вкладке — эта больше ничего не делает
   const drawn = {};
   const groups = new Map(); // источник → его раскрывающийся блок; живёт между перерисовками
+  const poolGroups = new Map(); // то же у бесплатных серверов
+
+  // Вкладка «Подписки» или «Бесплатные серверы»: выбор помнит этот браузер (если даст).
+  const TAB_KEY = "xgw-tab";
+  let tab = "subs";
+  try {
+    if (localStorage.getItem(TAB_KEY) === "pool") tab = "pool";
+  } catch (error) { /* хранилище браузера недоступно — открывается «Подписки» */ }
+  // Строки бесплатных серверов (/api/pool): их сотни, поэтому не в /api/state, а отдельно —
+  // пока открыта вкладка и когда демон пересчитал сводку пула (summary.computed_at).
+  let poolList = null;
+  let poolAt = null;
+  let poolLoading = false;
 
   // --- мелочи ---------------------------------------------------------------
 
@@ -268,7 +282,8 @@
     draw("cores", [s.cores, Math.floor(s.now / 60)], () => renderCores(s));
     setBusy($("cores-check"), s.busy.cores);
     draw("netcheck", [s.netcheck, Math.floor(s.now / 60)], () => renderNetcheck(s));
-    draw("pool", [s.free_pool, Math.floor(s.now / 60)], () => renderPool(s));
+    wantPool(s);
+    draw("pool", [s.free_pool, poolAt, tab, Math.floor(s.now / 60)], () => renderPool(s));
     setBusy($("netcheck-run"), Boolean((s.netcheck || {}).running));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
@@ -1498,7 +1513,7 @@
     RESOURCE_LIMIT: "слишком большой ответ",
   };
 
-  // Устройства через бесплатные серверы (М2б.1) — фраза в карточке пула.
+  // Устройства через бесплатные серверы (М2б.1) — строка над списком серверов пула.
   function poolFlowText(flow, devices) {
     if (!flow) return "";
     const names = (flow.devices || []).map((ip) => {
@@ -1506,41 +1521,259 @@
       return found && found.name ? found.name : ip;
     }).join(", ");
     if (flow.closed) {
-      return ` Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. Вернуть на подписку — «Сервер: авто» в списке устройств.`;
+      return `Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. Вернуть на подписку — «Сервер: авто» в списке устройств.`;
     }
-    return ` Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
+    return `Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
+  }
+
+  // Строки серверов пула — только пока открыта вкладка; заново — по новой сводке демона.
+  function wantPool(s) {
+    const pool = s.free_pool || {};
+    const sum = pool.mode !== "off" ? pool.summary : null;
+    if (!sum) {
+      poolList = null;
+      poolAt = null;
+      return;
+    }
+    const at = sum.computed_at || 0;
+    if (tab !== "pool" || poolLoading || at === poolAt) return;
+    loadPool(at);
+  }
+
+  async function loadPool(at) {
+    poolLoading = true;
+    try {
+      const response = await fetch("/api/pool", { cache: "no-store", credentials: "same-origin" });
+      if (response.status === 401) {
+        location.reload();
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      poolList = await response.json();
+      poolAt = at;
+    } catch (error) {
+      return; // не вышло — снова при следующем опросе состояния
+    } finally {
+      poolLoading = false;
+    }
+    if (state && !gone) render();
+  }
+
+  function showTab(name) {
+    tab = name;
+    try {
+      localStorage.setItem(TAB_KEY, name);
+    } catch (error) { /* не запомнилось — в следующий раз откроется «Подписки» */ }
+    for (const [id, key] of [["tab-subs", "subs"], ["tab-pool", "pool"]]) {
+      $(id).setAttribute("aria-selected", String(key === name));
+      $(id).tabIndex = key === name ? 0 : -1;
+    }
+    $("servers-card").hidden = name !== "subs";
+    $("pool-card").hidden = name !== "pool";
+    if (state) render();
+  }
+
+  const POOL_PROTOCOLS = {
+    vless: "VLESS", vmess: "VMess", trojan: "Trojan", shadowsocks: "Shadowsocks",
+    hysteria2: "Hysteria2", tuic: "TUIC", anytls: "AnyTLS", sstp: "SSTP",
+  };
+  const POOL_BACKENDS = {
+    xray: "Сервер ведёт Xray",
+    "sing-box": "Протокол умеет только второе ядро — sing-box",
+    sstp: "Туннель SSTP (VPN Gate): шлюз подключается к нему в изолированной службе",
+  };
+  // Итог проверки шлюза: как у запасных серверов подписки, плюс свои у туннелей SSTP.
+  const POOL_VERDICTS = {
+    ...VERDICTS,
+    REACHABLE: ["warn", "адрес открыт"],
+    CLOSED: ["bad", "адрес закрыт"],
+    UNTESTED: ["none", "не проверить"],
+  };
+  function poolVerdict(row) {
+    if (!row.verdict) return ["none", "не проверялся"];
+    return POOL_VERDICTS[row.verdict] || ["bad", row.backend === "sstp" ? "отказ туннеля" : "отказ"];
+  }
+  const poolWorks = (row) => row.verdict === "OK" || row.verdict === "SLOW";
+
+  // Порядок строк: через какой идут устройства, остальные в работе, допущенные, рабочие,
+  // прочие проверенные; внутри — по задержке, затем свежие проверки первыми.
+  function poolRank(item) {
+    if (item.current) return 0;
+    if (item.live) return 1;
+    if (!item.row.why) return 2;
+    if (poolWorks(item.row)) return 3;
+    return item.row.checked_at ? 4 : 5;
+  }
+  const poolOrder = (a, b) => poolRank(a) - poolRank(b)
+    || (a.row.delay_ms ?? 1e9) - (b.row.delay_ms ?? 1e9)
+    || (b.row.checked_at || 0) - (a.row.checked_at || 0);
+
+  function poolValue(item, s) {
+    const { row, live } = item;
+    if (live) {
+      if (!live.alive) {
+        return el("span", { class: "delay bad", text: "нет ответа", title: "Сервер в работе у устройств, но пробы ядра Xray не проходит" });
+      }
+      return live.delay_ms
+        ? el("span", { class: `delay ${delayTone(live.delay_ms)}`, text: `${live.delay_ms} мс`, title: "Задержка по пробам ядра Xray: сервер в работе у устройств" })
+        : el("span", { class: "delay none", text: "жив" });
+    }
+    const [tone, text] = poolVerdict(row);
+    if (row.delay_ms !== null && row.delay_ms !== undefined) {
+      return el("span", {
+        class: `delay ${delayTone(row.delay_ms)}`, text: `${row.delay_ms} мс`,
+        title: `Время пробы целиком при проверке ${stamp(row.checked_at, s.now)}: ${text}`,
+      });
+    }
+    return el("span", { class: `delay ${tone}`, text });
+  }
+
+  function poolNote(item, s) {
+    const row = item.row;
+    const failed = Boolean(row.checked_at) && !poolWorks(row);
+    const parts = [];
+    if (item.current) parts.push("через него сейчас идут устройства");
+    else if (item.live) parts.push("в работе у устройств: подхватит трафик, если текущий перестанет отвечать");
+    else if (!row.why) parts.push("допущен к трафику устройств");
+    else if (!failed) parts.push(row.why);
+    if (row.checked_at) {
+      let checked = `проверен ${stamp(row.checked_at, s.now)}`;
+      if (failed) {
+        const code = POOL_VERDICTS[row.verdict] ? "" : ` (${row.verdict})`;
+        checked += ` — ${poolVerdict(row)[1]}${code}${row.error ? `: ${row.error}` : ""}`;
+      }
+      parts.push(checked);
+      if (row.tunnel_up) parts.push(`туннель поднялся${row.connect_s ? ` за ${decimal(row.connect_s)} с` : ""}`);
+      parts.push(row.next_at > s.now ? `перепроверка не раньше ${stamp(row.next_at, s.now)}` : "ждёт перепроверки");
+    }
+    return parts.join(" · ");
+  }
+
+  function poolRow(item, s) {
+    const { row, live } = item;
+    const title = el("div", { class: "row-title" }, el("span", { text: row.name, title: row.name }));
+    if (item.current) {
+      title.append(el("span", { class: "tag on", text: "сейчас через", title: "Устройства, пущенные через бесплатные серверы, идут через этот сервер" }));
+    } else if (live) {
+      title.append(el("span", { class: "tag on", text: "в работе", title: "В балансировщике бесплатных серверов для устройств" }));
+    } else if (!row.why) {
+      title.append(el("span", { class: "tag", text: "допущен", title: "Подходит для трафика устройств: свежая проверка шлюза прошла, выход — в регионе пула" }));
+    }
+    const protocol = POOL_PROTOCOLS[row.protocol] || row.protocol;
+    title.append(el("span", {
+      class: "tag", text: row.backend === "sing-box" ? `${protocol} · sing-box` : protocol,
+      title: POOL_BACKENDS[row.backend] || "",
+    }));
+    if (row.country) {
+      title.append(el("span", {
+        class: "tag", text: row.egress ? row.country : `${row.country} по каталогу`,
+        title: row.egress ? "Страна выхода — по проверке шлюза" : "Страна по каталогу источника: выход шлюз ещё не проверил",
+      }));
+    }
+    const verdictTone = poolVerdict(row)[0];
+    const tone = live ? (live.alive ? "ok" : "bad") : verdictTone === "none" ? "" : verdictTone;
+    const classes = ["server"];
+    if (item.current) classes.push("selected");
+    if (!row.checked_at) classes.push("off");
+    return el("li", { class: classes.join(" ") },
+      el("span", { class: `dot ${tone}` }),
+      title,
+      el("div", { class: "values" }, poolValue(item, s)),
+      el("div", { class: "row-sub", text: poolNote(item, s) }));
+  }
+
+  // Блок источника живёт между перерисовками — раскрытые списки не схлопываются.
+  function poolGroupNode(source) {
+    let node = poolGroups.get(source);
+    if (!node) {
+      node = el("details", { class: "group", open: true },
+        el("summary", {}, el("span", { class: "group-name" }), el("span", { class: "tag" }),
+          el("span", { class: "group-count muted small" })),
+        el("div", { class: "row-sub group-note" }));
+      node.list = el("ul", { class: "list servers" });
+      node.moreList = el("ul", { class: "list servers" });
+      node.more = el("details", { class: "pool-more" }, el("summary"), node.moreList);
+      node.append(node.list, node.more);
+      poolGroups.set(source, node);
+    }
+    return node;
+  }
+
+  // Серверы пула по источникам, как серверы подписок: в шапке источника — итог его опроса.
+  function renderPoolGroups(s, sum) {
+    const empty = $("pool-empty");
+    if (!poolList) {
+      $("pool-groups").replaceChildren();
+      empty.hidden = false;
+      empty.textContent = "Загружаю список серверов…";
+      return;
+    }
+    const rows = poolList.servers || [];
+    const flow = sum.traffic || null;
+    const live = (flow && flow.servers) || [];
+    const known = sum.sources || [];
+    const sources = known.map((src) => src.id);
+    for (const row of rows) if (!sources.includes(row.source)) sources.push(row.source);
+    const nodes = [];
+    for (const source of sources) {
+      const src = known.find((item) => item.id === source) || {};
+      const items = rows.filter((row) => row.source === source).map((row) => {
+        const hit = live.find((item) => item.id && row.id.startsWith(item.id)) || null;
+        return { row, live: hit, current: Boolean(hit && flow && !flow.closed && hit.tag === flow.tag) };
+      }).sort(poolOrder);
+      const checked = items.filter((item) => item.row.checked_at);
+      const waiting = items.filter((item) => !item.row.checked_at);
+      const node = poolGroupNode(source);
+      node.querySelector(".group-name").textContent = POOL_SOURCES[source] || source;
+      const tag = node.querySelector("summary > .tag");
+      tag.hidden = !src.status || src.status === "—"; // «—» — источник ещё не опрашивался
+      // Цвета — как у «Проверки сети» (CHECK_LEVELS): классов tag.ok и tag.bad в app.css нет.
+      tag.className = `tag ${src.status === "SUCCESS" ? "on" : src.status === "PARTIAL" ? "warn" : "rec"}`;
+      tag.textContent = POOL_STATUS[src.status] || src.status || "";
+      node.querySelector(".group-count").textContent = items.length
+        ? `допущено ${items.filter((item) => !item.row.why).length} · проверено ${checked.length} из ${items.length}`
+        : "серверов нет";
+      node.querySelector(".group-note").textContent = (src.retrieved_at ? `Список от ${stamp(src.retrieved_at, s.now)}` : "Списка ещё нет")
+        + (src.stale ? " · список устарел" : "") + (src.detail ? ` · ${src.detail}` : "");
+      fill(node.list, checked.map((item) => poolRow(item, s)),
+        items.length ? "Проверенных серверов этого источника пока нет." : "");
+      node.more.hidden = !waiting.length;
+      node.more.querySelector("summary").textContent = `Ещё не проверялись — ${waiting.length}: шлюз проверяет их по очереди`;
+      fill(node.moreList, waiting.map((item) => poolRow(item, s)));
+      nodes.push(node);
+    }
+    for (const source of [...poolGroups.keys()]) if (!sources.includes(source)) poolGroups.delete(source);
+    $("pool-groups").replaceChildren(...nodes);
+    empty.hidden = rows.length > 0;
+    empty.textContent = "Источники ещё не дали серверов: их списки шлюз получает через подписку при опросе.";
   }
 
   function renderPool(s) {
     const pool = s.free_pool || { mode: "off" };
     const on = pool.mode !== "off";
-    const sum = pool.summary || null;
+    const sum = on ? pool.summary || null : null;
     $("pool-toggle").textContent = on ? "Выключить" : "Включить наблюдение";
     $("pool-refresh").hidden = !on;
-    if (!on) {
-      $("pool-text").textContent = "Альтернативный режим: бесплатные серверы (списки GitHub, VPN Gate, VPNBook) вместо подписки. Наблюдение собирает их списки через подписку и проверяет серверы, а трафик идёт как прежде — через подписку.";
-      fill($("pool-sources"), [], "");
+    $("pool-count").textContent = sum && sum.found ? String(sum.found) : "";
+    const flow = sum ? sum.traffic || null : null;
+    $("pool-flow").hidden = !flow;
+    $("pool-flow").textContent = poolFlowText(flow, s.devices);
+    if (!sum) {
+      $("pool-text").textContent = on
+        ? "Наблюдение включено: первый опрос источников — в ближайшую минуту."
+        : "Альтернативный режим: бесплатные серверы (списки GitHub, VPN Gate, VPNBook) вместо подписки. Наблюдение собирает их списки через подписку и проверяет серверы, а трафик идёт как прежде — через подписку. Включите его — и здесь появятся серверы по источникам: страна, протокол, итог проверки шлюза и задержка, как у серверов подписок.";
+      $("pool-groups").replaceChildren();
+      $("pool-empty").hidden = true;
       return;
     }
-    if (!sum) {
-      $("pool-text").textContent = "Наблюдение включено: первый опрос источников — в ближайшую минуту.";
-    } else {
-      const regionsText = Object.entries(sum.by_region || {}).map(([name, count]) => `${name} ${count}`).join(", ");
-      const failures = Object.entries(sum.tunnel_failures || {}).map(([code, count]) => `${code} ${count}`).join(", ");
-      // Туннели — серверы SSTP VPN Gate (веха М2в; до неё — OpenVPN).
-      const tunnels = sum.tunnel_backend
-        ? `SSTP (VPN Gate) — ${sum.sstp || 0} (туннелем не проверить: ${sum.tunnel_backend}; адрес открыт — ${sum.reachable_tunnel || 0}, закрыт — ${sum.closed})`
-        : `SSTP (VPN Gate) — ${sum.sstp || 0}, туннелем за сутки: попыток ${sum.tunnel_attempts || 0}, поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки туннелем после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
-      const bySource = Object.entries(sum.ready_by_source || {}).map(([name, count]) => `${POOL_SOURCES[name] || name} — ${count}`).join(", ");
-      $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${tunnels}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}${bySource ? `: ${bySource}` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.${poolFlowText(sum.traffic, s.devices)}`;
-      fill($("pool-sources"), (sum.sources || []).map((src) => el("li", { class: "check-row" },
-        el("div", { class: "row-main" },
-          el("div", { class: "row-title" }, el("span", { text: POOL_SOURCES[src.id] || src.id }),
-            el("span", { class: `tag ${src.status === "SUCCESS" ? "ok" : src.status === "PARTIAL" ? "warn" : "bad"}`, text: POOL_STATUS[src.status] || src.status })),
-          el("div", { class: "row-sub", text: (src.retrieved_at ? `список от ${stamp(src.retrieved_at, s.now)}` : "списка ещё нет")
-            + (src.variants ? ` · вариантов ${src.variants}` : "")
-            + (src.stale ? " · список устарел" : "") + (src.detail ? ` · ${src.detail}` : "") })))), "");
-    }
+    const regionsText = Object.entries(sum.by_region || {}).map(([name, count]) => `${name} ${count}`).join(", ");
+    const failures = Object.entries(sum.tunnel_failures || {}).map(([code, count]) => `${code} ${count}`).join(", ");
+    // Туннели — серверы SSTP VPN Gate (веха М2в; до неё — OpenVPN).
+    const tunnels = sum.tunnel_backend
+      ? `SSTP (VPN Gate) — ${sum.sstp || 0} (туннелем не проверить: ${sum.tunnel_backend}; адрес открыт — ${sum.reachable_tunnel || 0}, закрыт — ${sum.closed})`
+      : `SSTP (VPN Gate) — ${sum.sstp || 0}, туннелем за сутки: попыток ${sum.tunnel_attempts || 0}, поднялось ${sum.tunnels_up || 0}${failures ? ` (отказы: ${failures})` : ""}, подключений за час ${sum.handshakes_hour || 0}${sum.handshakes_free_at ? `; суточный предел ${sum.handshakes_day_limit} подключений занят — новые проверки туннелем после ${day(sum.handshakes_free_at)} ${clock(sum.handshakes_free_at)}` : ""}`;
+    $("pool-text").textContent = `Наблюдение (регион ${sum.region}): найдено ${sum.found}: из списков GitHub — ${sum.lists || 0}, ключей Outline — ${sum.outline ?? sum.supported_now}, ${tunnels}. Проверено ${sum.checked}, пригодно ${sum.ready}${regionsText ? ` (${regionsText})` : ""}. Трафик проверок за сутки — ${sum.spent_mb} из ${sum.budget_mb} МБ; серверы списков GitHub — ${sum.lists_spent_mb || 0} МБ, без предела.`;
+    if (tab === "pool") renderPoolGroups(s, sum); // сотни строк — только на открытой вкладке
   }
 
   function renderNetcheck(s) {
@@ -1644,6 +1877,15 @@
   $("pool-toggle").addEventListener("click", () => act("freepool/mode", {
     mode: ((state || {}).free_pool || {}).mode === "observe" ? "off" : "observe" }, $("pool-toggle")));
   $("pool-refresh").addEventListener("click", () => act("freepool/refresh", {}, $("pool-refresh")));
+  $("tab-subs").addEventListener("click", () => showTab("subs"));
+  $("tab-pool").addEventListener("click", () => showTab("pool"));
+  // Стрелки влево и вправо переключают вкладки, как у вкладок в программах.
+  $("tab-subs").parentElement.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    const next = tab === "subs" ? "pool" : "subs";
+    showTab(next);
+    $(`tab-${next}`).focus();
+  });
   $("phones-cancel").addEventListener("click", () => act("phones/cancel", {}, $("phones-cancel")));
   $("ts-route").addEventListener("change", () => {
     const before = state && state.tailscale ? state.tailscale.route : "direct";
@@ -1754,5 +1996,6 @@
     });
   }
 
+  showTab(tab);
   load().then(schedule);
 })();

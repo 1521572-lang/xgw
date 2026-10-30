@@ -460,6 +460,8 @@ class FreePool:
             ready_by_source[source] = ready_by_source.get(source, 0) + 1
         listed = [v for v in variants if v.provider in providers.LIST_PROVIDERS]
         return {
+            # Когда сводка посчитана: по нему панель берёт заново список серверов (/api/pool).
+            "computed_at": now,
             "tunnel_backend": self.backend_problem,
             "tunnel_attempts": len(tunnels),
             "tunnels_up": len([item for item in tunnels if item[2]]),
@@ -500,6 +502,51 @@ class FreePool:
         now = self.clock()
         return sum(int(item[1]) for item in (state.get(key) or {}).get("items", [])
                    if isinstance(item, list) and now - float(item[0]) < DAY)
+
+
+def server_rows(cfg: Config, paths: Paths, now: float, *,
+                store: PoolStore | None = None) -> list[dict]:
+    """Серверы пула для панели — вкладка «Бесплатные серверы», как серверы подписок: по строке
+    на вариант — страна, протокол, итог последней проверки шлюза, когда перепроверка и почему
+    сервер не допущен к трафику устройств (traffic.refusal). Ссылки, ключи и outbound'ы сюда не
+    попадают. Наблюдение выключено — пусто: пул тогда серверы не проверяет."""
+    if cfg.free_pool.mode == "off":
+        return []
+    store = store or PoolStore(paths)
+    records = store.candidates()
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for provider in cfg.free_pool.providers:
+        every = LIST_CHECK_EVERY if provider in providers.LIST_PROVIDERS else CHECK_EVERY
+        for variant in store.variants(provider):
+            key = variant.variant_id
+            if variant.access != Access.FREE or key in seen:
+                continue
+            seen.add(key)
+            found = records.get(key)
+            record = found if isinstance(found, dict) else {}
+            checked = float(record.get("checked_at") or 0.0)
+            verdict = str(record.get("verdict") or "") if checked else ""
+            egress = str(record.get("egress_country") or "").upper() if checked else ""
+            seconds = float(record.get("seconds") or 0.0)
+            connect = float(record.get("connect_seconds") or 0.0)
+            rows.append({
+                "id": key, "source": provider,
+                "name": (variant.name or f"{variant.host or variant.address}:{variant.port}")[:80],
+                "protocol": variant.protocol, "backend": variant.backend,
+                # Страна выхода — по проверке шлюза; пока её нет — подсказка каталога.
+                "country": egress or variant.country_hint.upper(), "egress": bool(egress),
+                "verdict": verdict, "checked_at": checked or None,
+                "next_at": checked + every if checked else None,
+                # Проба целиком (рукопожатия и файл), как задержка запасных серверов подписки.
+                "delay_ms": round(seconds * 1000) if verdict in ("OK", "SLOW") and seconds
+                else None,
+                "tunnel_up": bool(record.get("tunnel_up")),
+                "connect_s": round(connect, 1) if connect else None,
+                "error": str(record.get("error") or "")[:160] if checked else "",
+                "why": trafficking.refusal(cfg, variant, found, now),
+            })
+    return rows
 
 
 POOL_SOURCES = {

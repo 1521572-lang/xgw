@@ -62,6 +62,7 @@ from .. import (
 from .. import pin as pinning
 from .. import tailscale as ts
 from ..config import Config
+from ..freepool import pool as pooling
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
 from ..net import cmd, dnsmasq, lan, nft
@@ -763,6 +764,18 @@ class Panel:
                 store.add_event("netcheck", "проверка сети: " + netcheck.summary(checks))
         except (OSError, sqlite3.Error) as exc:
             self.log.error("итог проверки сети не записан: %s", exc)
+
+    def pool_servers(self) -> dict:
+        """Вкладка «Бесплатные серверы»: строки серверов пула (freepool.pool.server_rows).
+        Страница просит их, только пока вкладка открыта, и заново — когда демон пересчитал
+        сводку пула (summary.computed_at): сотни строк в /api/state каждые 3 с были бы лишними."""
+        cfg = self.cfg
+        try:
+            rows = pooling.server_rows(cfg, self.paths, time.time())
+        except (OSError, ValueError) as exc:
+            self.log.error("серверы бесплатного пула не прочитаны: %s", exc)
+            rows = []
+        return {"mode": cfg.free_pool.mode, "region": cfg.free_pool.region, "servers": rows}
 
     def _cores_card(self, snapshot: dict, now: float) -> dict:
         singbox = snapshot.get("singbox") or {}
@@ -1972,6 +1985,10 @@ class Panel:
             if host != self._tailnet_host():
                 self._page_signal(handler.headers.get("X-XGW-Focus") or "")
             self._json(handler, HTTPStatus.OK, self.state(), body)
+        elif url.path == "/api/pool":
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._json(handler, HTTPStatus.OK, self.pool_servers(), body)
         elif url.path.startswith("/records/"):
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")

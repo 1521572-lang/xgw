@@ -175,20 +175,18 @@
       <ul id="netcheck" class="list netcheck"></ul>
       <p id="netcheck-when" class="muted small"></p>
     </section>
-
-    <section class="card pool-card" id="pool-card" aria-labelledby="pool-title">
-      <div class="card-head">
-        <h2 id="pool-title">Бесплатные серверы</h2>
-        <button id="pool-toggle" class="btn ghost" type="button"></button>
-      </div>
-      <p id="pool-text" class="muted small"></p>
-      <ul id="pool-sources" class="list"></ul>
-      <button id="pool-refresh" class="btn ghost" type="button" hidden>Опросить источники</button>
-    </section>
   </div>
 
   <div class="col main">
-    <section class="card servers-card" aria-labelledby="servers-title">
+    <!-- Серверы подписок и бесплатные серверы — две вкладки одного места (app.js, showTab). -->
+    <div class="mode-tabs" role="tablist" aria-label="Какие серверы показать">
+      <button id="tab-subs" class="mode-tab" type="button" role="tab" aria-selected="true"
+              aria-controls="servers-card">Подписки</button>
+      <button id="tab-pool" class="mode-tab" type="button" role="tab" aria-selected="false"
+              aria-controls="pool-card">Бесплатные серверы</button>
+    </div>
+
+    <section class="card servers-card" id="servers-card" role="tabpanel" aria-labelledby="servers-title">
       <div class="card-head">
         <h2 id="servers-title">Серверы <span id="members-count" class="count"></span></h2>
         <button id="scan" class="btn ghost" type="button">Проверить запасные</button>
@@ -223,6 +221,20 @@
           <span id="removed-count" class="group-count muted small"></span></summary>
         <ul id="removed" class="list servers"></ul>
       </details>
+    </section>
+
+    <section class="card pool-card" id="pool-card" role="tabpanel" aria-labelledby="pool-title" hidden>
+      <div class="card-head">
+        <h2 id="pool-title">Бесплатные серверы <span id="pool-count" class="count"></span></h2>
+        <div class="head-tools">
+          <button id="pool-refresh" class="btn ghost" type="button" hidden>Опросить источники</button>
+          <button id="pool-toggle" class="btn ghost" type="button"></button>
+        </div>
+      </div>
+      <p id="pool-text" class="muted small"></p>
+      <p id="pool-flow" class="note" role="status" hidden></p>
+      <div id="pool-groups"></div>
+      <p id="pool-empty" class="muted empty-text" hidden></p>
     </section>
 
     <section class="card devices-card" id="devices-card" aria-labelledby="devices-title" hidden>

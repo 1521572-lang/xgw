@@ -79,6 +79,30 @@ def _node(variant: Variant, country: str) -> ServerNode:
     )
 
 
+def refusal(cfg: Config, variant: Variant, record: object, now: float) -> str:
+    """Почему сервер пула не допущен к трафику устройств; пусто — допущен. record — итог его
+    проверки из candidates.json. Причину показывает панель в строке сервера."""
+    if variant.backend not in (Backend.XRAY, Backend.SINGBOX):
+        return "туннели SSTP к трафику устройств — следующим шагом"
+    # Только адрес-литерал (публичный IPv4 — разбор списка): сервер добавляется в работающий
+    # Xray через API, а имя такого сервера Xray до перезапуска разрешает своим DNS, мимо
+    # закрепления публичными адресами (generator/diff.py, dns.hosts). Серверы с именем —
+    # следующим шагом.
+    if not variant.address:
+        return "адрес сервера — имя, а не IPv4: к трафику — следующим шагом"
+    if not isinstance(record, dict) or not record.get("checked_at"):
+        return "ещё не проверялся"
+    if str(record.get("verdict") or "") not in ("OK", "SLOW"):
+        return "последняя проверка не прошла"
+    if now - float(record.get("checked_at") or 0) > FRESH:
+        return f"проверка старше {int(FRESH // 3600)} ч — ждёт новой"
+    country = str(record.get("egress_country") or "").upper()
+    wanted = wanted_regions(cfg)
+    if not any(regions.allowed(country, region) for region in wanted):
+        return f"выход {country or 'не определён'} — не в регионе {', '.join(wanted)}"
+    return ""
+
+
 def admitted(cfg: Config, paths: Paths, now: float, *,
              store: PoolStore | None = None) -> list[TrafficServer]:
     """Допущенные к трафику серверы пула по порядку выбора (лучшие первыми). Наблюдение
@@ -87,33 +111,19 @@ def admitted(cfg: Config, paths: Paths, now: float, *,
         return []
     store = store or PoolStore(paths)
     records = store.candidates()
-    wanted = wanted_regions(cfg)
     found: list[TrafficServer] = []
     seen: set[str] = set()
     for provider in cfg.free_pool.providers:
         for variant in store.variants(provider):
             if variant.access != Access.FREE:
                 continue
-            if variant.backend not in (Backend.XRAY, Backend.SINGBOX):
-                continue
-            # Только адрес-литерал (публичный IPv4 — разбор списка): сервер добавляется в
-            # работающий Xray через API, а имя такого сервера Xray до перезапуска разрешает
-            # своим DNS, мимо закрепления публичными адресами (generator/diff.py, dns.hosts).
-            # Серверы с именем — следующим шагом.
-            if not variant.address:
-                continue
             key = variant.variant_id
             record = records.get(key)
-            if key in seen or not isinstance(record, dict):
+            if key in seen or refusal(cfg, variant, record, now):
                 continue
+            assert isinstance(record, dict)
             verdict = str(record.get("verdict") or "")
-            if verdict not in ("OK", "SLOW"):
-                continue
-            if now - float(record.get("checked_at") or 0) > FRESH:
-                continue
             country = str(record.get("egress_country") or "").upper()
-            if not any(regions.allowed(country, region) for region in wanted):
-                continue
             seconds = float(record.get("seconds") or 0)
             speed = float(record.get("bytes") or 0) / seconds if seconds > 0 else 0.0
             seen.add(key)

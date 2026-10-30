@@ -8,7 +8,7 @@ import pytest
 
 from xgw import actions, engine, managed
 from xgw.config import Config
-from xgw.freepool import providers, traffic
+from xgw.freepool import pool, providers, traffic
 from xgw.freepool.models import ProviderResult, Status
 from xgw.freepool.store import PoolStore
 from xgw.generator import builder, diff
@@ -87,6 +87,26 @@ def test_admitted_are_fresh_working_servers_of_the_region_with_an_address(paths)
     assert (node.country, node.source, node.address) == ("de", "pool:mahdibland",
                                                          "198.51.100.21")
     assert traffic.admitted(_cfg("off"), paths, NOW) == []
+
+
+def test_panel_rows_tell_why_a_pool_server_is_not_admitted(paths):
+    """Вкладка «Бесплатные серверы»: строка на каждый сервер пула с итогом проверки и причиной,
+    по которой он не допущен; допущенные — те же, что у admitted; ссылок и ключей в строках нет."""
+    ids = _pool(paths)
+    rows = {row["id"]: row for row in pool.server_rows(_cfg(), paths, NOW)}
+    assert set(rows) == set(ids.values())
+    admitted = {item.node.fingerprint for item in traffic.admitted(_cfg(), paths, NOW)}
+    assert {key for key, row in rows.items() if not row["why"]} == admitted
+    why = {name: rows[key]["why"] for name, key in ids.items()}
+    assert "имя" in why["named"] and "старше 3 ч" in why["stale"]
+    assert "US" in why["us"] and why["dead"] == "последняя проверка не прошла"
+    fast = rows[ids["fast"]]
+    assert (fast["country"], fast["egress"], fast["verdict"], fast["delay_ms"]) == ("DE", True,
+                                                                                   "OK", 1000)
+    assert fast["next_at"] == NOW - 600 + pool.LIST_CHECK_EVERY
+    assert rows[ids["dead"]]["delay_ms"] is None
+    assert UUID not in str(rows) and "outbound" not in str(rows)
+    assert pool.server_rows(_cfg("off"), paths, NOW) == []
 
 
 def test_pool_composition_keeps_applied_servers_first():
@@ -216,6 +236,10 @@ def test_daemon_pins_a_live_pool_server_without_jumping(paths):
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.3},
                                 "pool-de-bbbb": {"alive": True, "delay": 0.1}})
     assert daemon.api.calls == [("pin", "pool", "pool-de-bbbb")]
+    # Строкам вкладки «Бесплатные серверы» — весь состав «pool» с задержкой по пробам ядра.
+    assert daemon._pool_traffic["servers"] == [
+        {"id": "aaaa", "tag": "pool-de-aaaa", "alive": True, "delay_ms": 300},
+        {"id": "bbbb", "tag": "pool-de-bbbb", "alive": True, "delay_ms": 100}]
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.05},
                                 "pool-de-bbbb": {"alive": True, "delay": 0.2}})
     assert daemon.api.calls == [("pin", "pool", "pool-de-bbbb")]

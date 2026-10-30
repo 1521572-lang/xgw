@@ -230,6 +230,16 @@ def test_token_moves_into_a_cookie_and_out_of_the_address(rig):
     assert rig.client.request("GET", "/api/state")[0].status == 401
 
 
+def test_pool_servers_come_separately_and_only_after_login(rig):
+    """Строки бесплатных серверов — отдельным запросом /api/pool (их сотни: в /api/state каждые
+    3 с они были бы лишними) и только после входа; наблюдение выключено — строк нет."""
+    assert rig.client.request("GET", "/api/pool")[0].status == 401
+    rig.client.login()
+    response, text = rig.client.request("GET", "/api/pool")
+    assert response.status == 200
+    assert json.loads(text) == {"mode": "off", "region": "EU", "servers": []}
+
+
 def test_one_time_login_code_works_once_and_only_for_a_minute(rig, monkeypatch):
     """Ссылку для браузера XGW открывает сам (установка, «Войти заново» у ярлыка): в ней
     не постоянный токен, а одноразовый код — адрес виден в списке процессов и журнале."""
