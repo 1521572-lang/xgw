@@ -15,7 +15,14 @@
   --info: #62adff;
   --shadow: 0 1px 2px rgb(0 0 0 / 35%), 0 12px 32px rgb(0 0 0 / 22%);
   --radius: 18px;
+  --page: 1120px;
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
+}
+
+/* На широком мониторе страница шире: при 1120px по бокам оставались огромные поля, а длинные
+   строки серверов переносились (отзыв заказчика к вкладке пула, 30.10). */
+@media (min-width: 1500px) {
+  :root { --page: min(1560px, 94vw); }
 }
 
 @media (prefers-color-scheme: light) {
@@ -73,7 +80,7 @@ button, textarea, input { font: inherit; color: inherit; }
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  max-width: 1120px;
+  max-width: var(--page);
   margin: 0 auto;
   padding: 1.1rem 1.25rem .4rem;
 }
@@ -108,7 +115,7 @@ button, textarea, input { font: inherit; color: inherit; }
 .chip[data-tone="bad"]::before { background: var(--bad); }
 
 .banner {
-  max-width: 1088px;
+  max-width: calc(var(--page) - 32px);
   margin: .6rem auto 0;
   padding: .7rem 1rem;
   border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
@@ -122,7 +129,7 @@ button, textarea, input { font: inherit; color: inherit; }
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
-  max-width: 1120px;
+  max-width: var(--page);
   margin: 0 auto;
   padding: .8rem 1rem 1.5rem;
 }
@@ -698,7 +705,7 @@ a.icon-btn { text-decoration: none; }
 .events time { flex: none; width: 5.6rem; color: var(--muted); font-size: .84rem; font-variant-numeric: tabular-nums; }
 .events .row-main { overflow-wrap: anywhere; }
 
-.foot { max-width: 1120px; margin: 0 auto; padding: 0 1.3rem 2rem; }
+.foot { max-width: var(--page); margin: 0 auto; padding: 0 1.3rem 2rem; }
 
 /* --- окна и сообщения ----------------------------------------------------- */
 

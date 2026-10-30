@@ -2550,16 +2550,27 @@ class Daemon:
         if not (devices or whole):
             self._pool_pinned, self._pool_traffic = "", None
             return
-        alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
-        current = self._pool_pinned if any(info.tag == self._pool_pinned for info in alive) else ""
-        if not current and alive:
-            current = min(alive, key=lambda info: (
-                (observatory.get(info.tag) or {}).get("delay") or 1e9, info.tag)).tag
         try:
             key = self.paths.xray_config_file.stat().st_mtime
         except OSError:
             key = 0.0
         was_closed = self._pool_traffic.get("closed") if self._pool_traffic else None
+        # Шаг идёт раньше срочной пересборки: при включении режима он видел старый конфиг без
+        # серверов пула и писал «допущенных серверов нет — закрыто» (отчёт М2б.2, дефект 1).
+        # Пока пересборка впереди, а после перезапуска Xray — до первых проб ядра (не опробован
+        # ещё не мёртв; не дольше трёх интервалов проб), это «подключаются»: сводка без
+        # «traffic», без события и без снятия закрепления. Уже закрытое так и остаётся закрытым.
+        waiting = (not pool and bool(self._urgent_rebuild)) or (
+            bool(pool) and 0 <= now - key < 3 * checks_interval(self.cfg)
+            and not any(info.tag in observatory for info in pool))
+        if waiting and was_closed is not True:
+            self._pool_traffic = None
+            return
+        alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
+        current = self._pool_pinned if any(info.tag == self._pool_pinned for info in alive) else ""
+        if not current and alive:
+            current = min(alive, key=lambda info: (
+                (observatory.get(info.tag) or {}).get("delay") or 1e9, info.tag)).tag
         if current != self._pool_pinned or (current and key != self._pool_pin_key):
             try:
                 if current:

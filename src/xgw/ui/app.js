@@ -80,18 +80,25 @@
 
   // --- мелочи ---------------------------------------------------------------
 
+  // Флажки-эмодзи в именах серверов (🇯🇵 — пара «региональных символов») без шрифта с флагами
+  // браузер рисует битыми (отчёт вкладки пула, 30.10); страна у сервера и так видна меткой.
+  // Убираются только при показе — вместе с пробелом рядом: данные и действия — с именами как есть.
+  const FLAGS = /[\u{1F1E6}-\u{1F1FF}]+\s*|\s*[\u{1F1E6}-\u{1F1FF}]+/gu;
+  const plain = (text) => String(text).replace(FLAGS, "");
+
   function el(tag, props, ...children) {
     const node = document.createElement(tag);
     for (const [key, value] of Object.entries(props || {})) {
       if (value === null || value === undefined || value === false) continue;
       if (key === "class") node.className = value;
-      else if (key === "text") node.textContent = value;
+      else if (key === "text") node.textContent = plain(value);
       else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+      else if (key === "title" || key === "aria-label" || key === "label") node.setAttribute(key, plain(value));
       else node.setAttribute(key, value === true ? "" : String(value));
     }
     for (const child of children) {
       if (child === null || child === undefined || child === false) continue;
-      node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+      node.append(child instanceof Node ? child : document.createTextNode(plain(child)));
     }
     return node;
   }
@@ -505,9 +512,9 @@
       $("current").hidden = !server;
       if (server) {
         $("current-label").textContent = "Бесплатный сервер";
-        $("current-name").textContent = server + (flow.country ? ` (${flow.country})` : "")
+        $("current-name").textContent = plain(server) + (flow.country ? ` (${flow.country})` : "")
           + (flow.delay_ms ? ` · ${flow.delay_ms} мс` : "");
-        $("current-name").title = server;
+        $("current-name").title = plain(server);
       }
       $("unpin").hidden = true;
       return;
@@ -529,8 +536,8 @@
       const shown = hasRtt(current) ? current.rtt_ms : current.delay_ms;
       const delay = shown !== null && shown !== undefined ? ` · ${shown} мс` : "";
       const speed = current.speed_mbps !== null && current.speed_mbps !== undefined ? ` · ${mbps(current.speed_mbps)}` : "";
-      $("current-name").textContent = (current.name || current.tag) + speed + delay;
-      $("current-name").title = current.name || current.tag;
+      $("current-name").textContent = plain(current.name || current.tag) + speed + delay;
+      $("current-name").title = plain(current.name || current.tag);
     }
     $("unpin").hidden = !s.pin;
   }
@@ -856,7 +863,7 @@
       return;
     }
     const price = reserve.cost ? ` (${multiplierText(reserve.cost)})` : "";
-    note.textContent = `Серверы в работе не отвечают — трафик идёт через резервный сервер «${reserve.name}»${price}. `
+    note.textContent = `Серверы в работе не отвечают — трафик идёт через резервный сервер «${plain(reserve.name)}»${price}. `
       + (reserve.cost ? "Он тратит квоту подписки; " : "")
       + "шлюз ищет живые серверы среди запасных и вернётся к серверам в работе, как только они ответят.";
   }
@@ -875,7 +882,7 @@
         + `на прежнем сервере, новые поиски — после ${clock(guard.cooldown_until)}.`;
     }
     note.hidden = !text;
-    note.textContent = text;
+    note.textContent = plain(text);
   }
 
   // Основной сервер: весь трафик через самый быстрый из серверов в работе.
@@ -911,7 +918,7 @@
       text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
         + (sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
     }
-    $("main-note").textContent = text;
+    $("main-note").textContent = plain(text);
   }
 
   function renderServers(s) {
@@ -940,7 +947,7 @@
       // Уже выбран вручную — кнопка не нужна (вернуть автовыбор — кнопкой «Автовыбор»).
       button.hidden = !offer || Boolean(s.pin && sameServer(offer.tag, s.pin.tag));
       if (offer) {
-        button.textContent = `Включить «${offer.name}»`;
+        button.textContent = plain(`Включить «${offer.name}»`);
         button.onclick = (event) => act("pin", { tag: offer.tag, ttl: "forever" }, event.currentTarget);
       }
     }
@@ -1751,9 +1758,11 @@
           el("span", { class: "group-count muted small" })),
         el("div", { class: "row-sub group-note" }));
       node.list = el("ul", { class: "list servers" });
+      node.deadList = el("ul", { class: "list servers" });
+      node.dead = el("details", { class: "pool-more" }, el("summary"), node.deadList);
       node.moreList = el("ul", { class: "list servers" });
       node.more = el("details", { class: "pool-more" }, el("summary"), node.moreList);
-      node.append(node.list, node.more);
+      node.append(node.list, node.dead, node.more);
       poolGroups.set(source, node);
     }
     return node;
@@ -1783,6 +1792,10 @@
       }).sort(poolOrder);
       const checked = items.filter((item) => item.row.checked_at);
       const waiting = items.filter((item) => !item.row.checked_at);
+      // Не прошедшие проверку — свёрнуты (отзыв заказчика к вкладке, 30.10: сотни «тайм-аутов»
+      // вокруг одного живого); на виду — в работе, допущенные и рабочие (poolRank до 3).
+      const shown = checked.filter((item) => poolRank(item) <= 3);
+      const dead = checked.filter((item) => poolRank(item) > 3);
       const node = poolGroupNode(source);
       node.querySelector(".group-name").textContent = POOL_SOURCES[source] || source;
       const tag = node.querySelector("summary > .tag");
@@ -1795,8 +1808,11 @@
         : "серверов нет";
       node.querySelector(".group-note").textContent = (src.retrieved_at ? `Список от ${stamp(src.retrieved_at, s.now)}` : "Списка ещё нет")
         + (src.stale ? " · список устарел" : "") + (src.detail ? ` · ${src.detail}` : "");
-      fill(node.list, checked.map((item) => poolRow(item, s)),
-        items.length ? "Проверенных серверов этого источника пока нет." : "");
+      fill(node.list, shown.map((item) => poolRow(item, s)),
+        !items.length ? "" : checked.length ? "Рабочих серверов у этого источника сейчас нет." : "Проверенных серверов этого источника пока нет.");
+      node.dead.hidden = !dead.length;
+      node.dead.querySelector("summary").textContent = `Не прошли проверку — ${dead.length}: шлюз перепроверит их позже`;
+      fill(node.deadList, dead.map((item) => poolRow(item, s)));
       node.more.hidden = !waiting.length;
       node.more.querySelector("summary").textContent = `Ещё не проверялись — ${waiting.length}: шлюз проверяет их по очереди`;
       fill(node.moreList, waiting.map((item) => poolRow(item, s)));
@@ -1828,7 +1844,7 @@
     $("pool-count").textContent = sum && sum.found ? String(sum.found) : "";
     const flow = sum ? sum.traffic || null : null;
     $("pool-flow").hidden = !flow;
-    $("pool-flow").textContent = poolFlowText(flow, s.devices);
+    $("pool-flow").textContent = plain(poolFlowText(flow, s.devices));
     if (!sum) {
       $("pool-text").textContent = on
         ? "Наблюдение включено: первый опрос источников — в ближайшую минуту."
@@ -1877,8 +1893,8 @@
   let editSubCallback = null;
 
   function confirmRemove(title, text, action, yes = "Убрать", tone = "danger") {
-    $("confirm-title").textContent = title;
-    $("confirm-text").textContent = text;
+    $("confirm-title").textContent = plain(title);
+    $("confirm-text").textContent = plain(text);
     $("confirm-yes").textContent = yes;
     $("confirm-yes").className = `btn ${tone === "primary" ? "primary" : "danger"}`;
     confirmed = action;

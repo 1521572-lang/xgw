@@ -2,6 +2,7 @@
 рабочем конфиге, «закрыто» без серверов, выбор в панели и закреплённый сервер у демона."""
 
 import logging
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -322,3 +323,28 @@ def test_daemon_keeps_the_whole_house_on_a_live_pool_server(paths):
     assert traffic.text(flow).startswith("Весь дом через бесплатные серверы — сервер")
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": False}})
     assert "у всего дома закрыто" in daemon.events[-1]
+
+
+def test_switching_the_whole_house_on_is_connecting_not_closed(paths):
+    """Отчёт М2б.2, дефект 1: шаг до пересборки видел старый конфиг без серверов пула и писал
+    «допущенных серверов нет — закрыто». Пока пересборка впереди и пока ядро после перезапуска
+    не опробовало серверы пула — «подключаются» (traffic нет, события нет); дольше трёх
+    интервалов проб без ответа — закрыто, как прежде."""
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    daemon = _daemon(paths)
+    daemon.cfg = _cfg("on")
+    daemon.cfg.managed.routes = {}
+    daemon._urgent_rebuild = "бесплатный пул: весь дом"
+    daemon._pool_step({"outbounds": [{"tag": "proxy-de-0001"}]}, {"proxy-de-0001": {"alive": True}})
+    assert daemon._pool_traffic is None and daemon.events == [] and daemon.api.calls == []
+    daemon._urgent_rebuild = ""
+    applied = {"outbounds": [{"tag": "pool-de-aaaa"}]}
+    os.utime(paths.xray_config_file, (NOW - 20, NOW - 20))  # Xray только что перезапущен
+    daemon._pool_step(applied, {})
+    assert daemon._pool_traffic is None and daemon.events == [] and daemon.api.calls == []
+    daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.2}})
+    assert daemon.api.calls == [("pin", "pool", "pool-de-aaaa")]
+    assert len(daemon.events) == 1 and "весь дом идёт через" in daemon.events[0]
+    os.utime(paths.xray_config_file, (NOW - 600, NOW - 600))
+    daemon._pool_step(applied, {})
+    assert daemon._pool_traffic["closed"] and "все серверы пула молчат" in daemon.events[-1]
