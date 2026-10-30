@@ -333,6 +333,7 @@ class FreePool:
             kind = "list" if variant.provider in providers.LIST_PROVIDERS else "catalog"
             if done[kind] >= limits[kind]:
                 continue
+            tunnel = False
             if variant.backend in (Backend.XRAY, Backend.SINGBOX):
                 proxied = self._check_proxy(variant, mark=mark, xray_bin=xray_bin)
                 if proxied is None:
@@ -349,13 +350,14 @@ class FreePool:
                 else:
                     self._note_handshake(variant.provider)
                     tunnel_checks += 1
+                    tunnel = True
                     assert xray_bin is not None
                     outcome = probing.check_tunnel(
                         variant, runtime=self.runtime, cfg=self.cfg, xray_bin=xray_bin,
                         run_dir=self.paths.run / "freepool", user=providers.VPNGATE_USER,
                         password=providers.VPNGATE_PASSWORD, lan=self._lan(), cancel=cancel,
                     )
-            self._record(variant, outcome)
+            self._record(variant, outcome, tunnel=tunnel)
             done[kind] += 1
         return sum(done.values())
 
@@ -379,7 +381,11 @@ class FreePool:
             return probing.Outcome("UNTESTED", error="нет sing-box (ставит xgw install)")
         return probing.check_singbox(variant, self.cfg, singbox_bin, run, hosts=hosts)
 
-    def _record(self, variant: Variant, outcome: probing.Outcome) -> None:
+    def _record(self, variant: Variant, outcome: probing.Outcome, *, tunnel: bool = False) -> None:
+        """Итог проверки варианта. tunnel — это было подключение туннеля: оно идёт и в журнал
+        туннелей за сутки (_tunnels), который, в отличие от итогов по вариантам, не теряет
+        записи серверов, ушедших из списка VPN Gate (отчёт М2в.1: сводка показывала 2–3 попытки
+        при 18 настоящих)."""
         now = self.clock()
         state = self.store.candidates()
         # Трафик проверок серверов списков — отдельно: в бюджет суток он не входит.
@@ -390,6 +396,9 @@ class FreePool:
         if outcome.bytes_used:
             ledger["items"].append([now, outcome.bytes_used])
         state[key] = ledger
+        if tunnel:
+            state["_tunnels"] = {"items": [
+                *self._tunnels(state), [now, outcome.verdict, 1 if outcome.tunnel_up else 0]]}
         state[variant.variant_id] = {
             "checked_at": now, "verdict": outcome.verdict, "seconds": outcome.seconds,
             "egress_country": outcome.egress_country, "error": outcome.error[:160],
@@ -436,12 +445,11 @@ class FreePool:
             for region in regions.regions_of(record.get("egress_country") or ""):
                 if "auto" in wanted or region in wanted:
                     by_region[region] = by_region.get(region, 0) + 1
-        tunnel_checked = [r for r in checked if r.get("backend") == Backend.SSTP]
+        # Подключения туннелей за сутки — по журналу, а не по итогам вариантов из снимков.
+        tunnels = self._tunnels(state)
         failures: dict[str, int] = {}
-        for record in tunnel_checked:
-            verdict = str(record.get("verdict") or "")
-            if not record.get("tunnel_up") and verdict not in ("REACHABLE", "CLOSED",
-                                                               "UNTESTED"):
+        for _when, verdict, up in tunnels:
+            if not up:
                 failures[verdict] = failures.get(verdict, 0) + 1
         day_items = self.handshakes()
         day_limit = self.cfg.free_pool.handshakes_per_day
@@ -453,7 +461,8 @@ class FreePool:
         listed = [v for v in variants if v.provider in providers.LIST_PROVIDERS]
         return {
             "tunnel_backend": self.backend_problem,
-            "tunnels_up": len([r for r in tunnel_checked if r.get("tunnel_up")]),
+            "tunnel_attempts": len(tunnels),
+            "tunnels_up": len([item for item in tunnels if item[2]]),
             "tunnel_failures": failures,
             "handshakes_hour": len(hour), "handshakes_day": len(day_items),
             "handshakes_day_limit": day_limit,
@@ -480,6 +489,12 @@ class FreePool:
             "lists_spent_mb": round(self._spent(state, "_list_ledger") / 1_048_576, 1),
             "sources": sources,
         }
+
+    def _tunnels(self, state: dict) -> list[list]:
+        """Подключения туннелей за сутки: [время, вердикт, 1 — туннель поднимался]."""
+        now = self.clock()
+        return [item for item in (state.get("_tunnels") or {}).get("items", [])
+                if isinstance(item, list) and len(item) == 3 and now - float(item[0]) < DAY]
 
     def _spent(self, state: dict, key: str) -> int:
         now = self.clock()
@@ -526,7 +541,8 @@ def render(summary: dict, now: float) -> str:
         failures = ", ".join(f"{code} {count}" for code, count in sorted(
             (summary.get("tunnel_failures") or {}).items()))
         lines.append(
-            f"SSTP туннелем: поднялось {summary.get('tunnels_up', 0)}"
+            f"SSTP туннелем за сутки: попыток {summary.get('tunnel_attempts', 0)}, поднялось "
+            f"{summary.get('tunnels_up', 0)}"
             + (f", отказы: {failures}" if failures else "")
             + f"; подключений за час {summary.get('handshakes_hour', 0)}, за сутки "
             f"{summary.get('handshakes_day', 0)} из {summary.get('handshakes_day_limit', '?')}"

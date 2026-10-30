@@ -87,7 +87,15 @@ def test_sstpc_and_pppd_get_only_what_the_tunnel_needs(tmp_path):
     def value(option: str) -> str:
         return argv[argv.index(option) + 1]
 
-    assert value("--ca-dir") == "/etc/ssl/certs" and value("--host") == HOST
+    # --ca-path, а не --ca-dir: такого ключа у sstpc нет (отчёт М2в.1).
+    assert value("--ca-path") == "/etc/ssl/certs" and value("--host") == HOST
+    # Только ключи из таблицы getopt_long sstp-option.c 1.0.18 и 1.0.20 (и --log-*, их снимает
+    # sstp-log.c): неизвестный ключ — sstpc завершается, не подключаясь.
+    known = {"--ca-cert", "--ca-path", "--cert-warn", "--help", "--host", "--ipparam",
+             "--nolaunchpppd", "--password", "--priv-user", "--priv-group", "--priv-dir",
+             "--proxy", "--user", "--uuid", "--save-server-route", "--tls-ext", "--version",
+             "--crl-file", "--crl-path", "--log-level", "--log-stderr"}
+    assert {item for item in argv if item.startswith("--")} <= known
     assert (value("--user"), value("--password")) == ("vpn", "vpn")
     assert (value("--priv-user"), value("--priv-group")) == ("xgw-vpn", "xgw-vpn")
     for forbidden in ("--cert-warn", "--tls-ext", "--save-server-route", "--priv-dir",
@@ -187,6 +195,9 @@ def test_failure_codes_from_the_client_output():
     assert agenting.classify(["connect: No route to host"]) == "HOST_UNREACHABLE"
     assert agenting.classify(["connect: Network is unreachable"]) == "NETWORK_UNREACHABLE"
     assert agenting.classify([]) == "UNKNOWN"
+    # sstpc не принял свою строку — дефект шлюза, а не UNKNOWN (отчёт М2в.1).
+    assert agenting.classify(["**Error: Could not execute `/usr/sbin/sstpc', Invalid command "
+                              "line option: `?' (-1)"]) == "SSTPC_ARGS"
     # В журнал службы — строка с причиной, но без адресов и имён хостов.
     assert agenting.evidence(["Connected to 1.0.0.1", "Could not connect to `1.0.0.1:443'"],
                              "CONNECT_FAILED") == "Could not connect to `<ip>:443'"
@@ -886,6 +897,7 @@ def test_sstp_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     }]}}]
     summary = pool.summary()
     assert (summary["tunnels_up"], summary["handshakes_hour"], summary["ready"]) == (1, 1, 1)
+    assert summary["tunnel_attempts"] == 1
     assert summary["tunnel_backend"] == "" and summary["by_region"] == {"EU": 1}
     assert pool.spent_today() == 700_000
     # Что агент видел изнутри — в записи кандидата и журнале демона, без адресов.
@@ -897,6 +909,14 @@ def test_sstp_server_is_checked_through_its_tunnel(tmp_path, monkeypatch):
     # Предел подключений в час (1) исчерпан — второй сервер ждёт, а не подключается.
     assert pool.check_some(mark=2, xray_bin=Path("/opt/xgw/xray/xray")) == 0
     assert len(runtime.prepared) == 1
+    # Сервер ушёл из списка VPN Gate — итог по нему убран, а журнал подключений за сутки
+    # помнит попытку (отчёт М2в.1: сводка показывала 2–3 при 18).
+    left = [variant for variant in variants if variant.host != prepared["host"]]
+    pool.store.commit(ProviderResult("vpngate", Status.SUCCESS, variants=left,
+                                     retrieved_at=1_800_000_050.0, complete_response=True))
+    pool._prune_candidates()
+    summary = pool.summary()
+    assert (summary["tunnel_attempts"], summary["tunnels_up"]) == (1, 1)
 
 
 def test_tunnel_that_came_up_is_recorded_even_when_the_worker_fails(tmp_path):

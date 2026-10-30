@@ -628,11 +628,11 @@ def test_pool_command_prefers_the_daemon_summary(tmp_path, monkeypatch, capsys):
     path = tmp_path / "config.toml"
     path.write_text('[free_pool]\nmode = "observe"\n', encoding="utf-8")
     daemon = {"mode": "observe", "region": "EU", "region_policy": "strict", "found": 9,
-              "tunnel_backend": "", "tunnels_up": 4, "sources": []}
+              "tunnel_backend": "", "tunnel_attempts": 6, "tunnels_up": 4, "sources": []}
     paths.status_file.write_text(json.dumps({"updated": time.time(), "free_pool": daemon}),
                                  encoding="utf-8")
     monkeypatch.setattr(cli, "_daemon_down", lambda paths: False)
     assert cli.main(["pool", "--config", str(path), "status"]) == 0
     text = capsys.readouterr().out
-    assert "SSTP туннелем: поднялось 4" in text and "недоступна" not in text
+    assert "SSTP туннелем за сутки: попыток 6, поднялось 4" in text and "недоступна" not in text
 

@@ -24,7 +24,7 @@ CAP_CHOWN (файлы работников, каталог sstpc), CAP_KILL (и�
    GUARD_FAILED, клиент не запускается;
 4. sstpc — от root (иначе он не запустит pppd), подключается к IPv4 сервера (имя DDNS — только
    в HTTP и для сертификата: SNI не посылается, ключ --tls-ext не задан), проверяет цепочку
-   сертификата по системным (--ca-dir /etc/ssl/certs; у серверов VPN Gate — доверенный
+   сертификата по системным (--ca-path /etc/ssl/certs; у серверов VPN Gate — доверенный
    сертификат *.opengw.net, проверено в браузере 29.10.2026), запускает pppd с файлом ключей
    (ppp_options: интерфейс fpt0, без маршрута по умолчанию, без DNS сервера, без IPv6) и
    сбрасывает права на xgw-vpn (--priv-user; без --priv-dir: chroot требует CAP_SYS_CHROOT).
@@ -128,6 +128,9 @@ PPP_OPTIONS = (
 # Тексты sstpc — из его исходника (sstp-client.c, sstp-stream.c), pppd — из chap.c, lcp.c и
 # fsm.c; ошибки сокета — strerror в строках sstpc.
 _CAUSES = (
+    # sstpc не принял свою командную строку (sstp_usage_die) — дефект шлюза, не сервер и не
+    # сеть: до подключения дело не дошло (отчёт М2в.1 записал это в UNKNOWN).
+    ("SSTPC_ARGS", ("Invalid command line option", "Unrecognized command line option")),
     ("AUTH_FAILED", ("authentication failed",)),
     ("CERT_VERIFY_FAILED", ("Verification of server certificate failed",
                             "SSL certificate verification failed",
@@ -338,12 +341,16 @@ def ppp_options() -> str:
 
 
 def sstpc_argv(manifest: Manifest, options: Path) -> list[str]:
-    """Командная строка sstpc (справка sstpc 1.0.19/1.0.20 и его исходник): журнал — в вывод
-    агента на уровне INFO (2), цепочка сертификата — по системным, имя — в заголовке HTTP,
-    права — xgw-vpn после подключения, сервер — адрес:порт, дальше — ключи pppd."""
+    """Командная строка sstpc: журнал — в вывод агента на уровне INFO (2), цепочка сертификата —
+    по системным, имя — в заголовке HTTP, права — xgw-vpn после подключения, сервер —
+    адрес:порт, дальше — ключи pppd. Ключи — из таблицы getopt_long исходника sstp-option.c
+    1.0.18 и 1.0.20 (Ubuntu 24.04 ставит 1.0.19 между ними): каталог сертификатов — --ca-path;
+    --ca-dir там нет, и sstpc завершался при разборе строки, не подключаясь (отчёт М2в.1: 18
+    отказов «Invalid command line option»). Ключи --log-* снимает со строки sstp-log.c раньше
+    getopt_long; --user sstpc передаёт pppd как `user`, пароль — временным файлом."""
     return [
         manifest.sstpc_bin, "--log-stderr", "--log-level", "2",
-        "--ca-dir", CA_DIR, "--host", manifest.host,
+        "--ca-path", CA_DIR, "--host", manifest.host,
         "--user", manifest.user, "--password", manifest.password,
         "--priv-user", VPN_USER, "--priv-group", VPN_USER, "--ipparam", manifest.gen,
         f"{manifest.peer}:{manifest.port}", "file", str(options),

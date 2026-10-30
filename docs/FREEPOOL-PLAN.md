@@ -182,7 +182,7 @@ DeviceAllow /dev/ppp, /dev/ptmx, char-pts):
   1. охрана: к адресу и порту сервера — только root (TCP-сокет sstpc создан до сброса прав),
      xgw-vpn — никуда; SOCKS — только в fpt0; отбитое — refused_vpn, refused_socks, …
   2. veth, маршрут /32 к серверу; самопроверка (SOCKS и xgw-vpn — к серверу, хосту, наружу);
-  3. sstpc --log-stderr --log-level 2 --ca-dir /etc/ssl/certs --host <имя> --user vpn
+  3. sstpc --log-stderr --log-level 2 --ca-path /etc/ssl/certs --host <имя> --user vpn
      --password vpn --priv-user xgw-vpn --priv-group xgw-vpn --ipparam <gen> <адрес>:<порт>
      file /tmp/xgw-vpn/ppp.options — SNI нет (без --tls-ext), цепочка сертификата — по
      системным, pppd: ifname fpt0, nodetach, logfd 2, noauth, noipdefault, nodefaultroute,
@@ -204,6 +204,13 @@ DeviceAllow /dev/ppp, /dev/ptmx, char-pts):
 проходит ли проверка сертификата без SNI, передаёт ли туннель данные, страны пригодных;
 остатки OpenVPN убраны; секреты; выключение без следов. По итогам — регион для VPN Gate и
 переход к М2б.3 (туннели SSTP постоянными выходами) или к родному SoftEther.
+
+**Отчёт М2в.1** — главный вопрос не решён: агент передавал sstpc несуществующий ключ
+`--ca-dir`, клиент завершался при разборе строки, все 18 подключений — UNKNOWN. **М2в.2**
+(ASSUMPTIONS п. 264): ключ `--ca-path` (сверено с исходником sstp-client 1.0.18 и 1.0.20), код
+SSTPC_ARGS для отказа самого клиента, подключения туннелей за сутки — журналом, а не по
+вариантам текущих снимков. Проверка — тот же вопрос, что у М2в.1:
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v2.md`.
 
 ## Веха М2б: трафик через бесплатный пул
 
@@ -360,10 +367,12 @@ WAN R39, полный набор команд R50, восстановление 
 **М2а.4** — её повтор с проверкой предела до установки, предел в сводке, отсев серверов без
 TLS: `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2a4.md`, отчёт — без дефектов: шлюз доводит
 ответы сервера до туннеля, первая рабочая проба через туннель пула. **М2б** — трафик через
-бесплатный пул: М2б.1 — одно устройство (`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b1.md`),
-М2б.2 — весь дом, М2б.3 — туннели постоянными выходами (раздел «Веха М2б»). **М2в** — OpenVPN
-убран, у VPN Gate — SSTP (решение 9, раздел «Веха М2в»):
-`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v1.md`. **М3** — восстановление, интерфейс
+бесплатный пул: М2б.1 — одно устройство (`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b1.md`,
+отчёт — без дефектов: телефон час ходил через пул), М2б.2 — весь дом, М2б.3 — туннели
+постоянными выходами (раздел «Веха М2б»). **М2в** — OpenVPN убран, у VPN Gate — SSTP (решение 9,
+раздел «Веха М2в»): `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v1.md`, отчёт — sstpc не
+принимал ключ `--ca-dir`; **М2в.2** — исправление:
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v2.md`. **М3** — восстановление, интерфейс
 целиком, сутки наблюдения.
 
 ## Что нужно извне
