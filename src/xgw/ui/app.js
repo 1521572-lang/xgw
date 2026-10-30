@@ -88,6 +88,10 @@
   // именами как есть. В своих текстах панели и шлюза эмодзи нет.
   const EMOJI = "[\\p{Extended_Pictographic}\\u{1F1E6}-\\u{1F1FF}\\u{1F3FB}-\\u{1F3FF}\\u{FE0E}\\u{FE0F}\\u{200D}\\u{20E3}\\u{E0020}-\\u{E007F}]+";
   const EMOJI_AROUND = new RegExp(`\\s*${EMOJI}\\s*`, "gu");
+  // Разделитель вокруг убранного эмодзи остаётся один: «Хельсинки | 🇫🇮 | [BL]» → «Хельсинки |
+  // [BL]», а не «| |» (отчёт m2b2fix2); с краёв имени — без разделителя.
+  const SEP_REPEAT = /([|•·\/–—-])(?:\s+\1)+/g;
+  const SEP_EDGES = /^[\s|•·\/–—-]+|[\s|•·\/–—-]+$/g;
   function plain(text) {
     const value = String(text);
     const bare = value.replace(EMOJI_AROUND, (found, at, all) => {
@@ -95,7 +99,9 @@
       const after = all[at + found.length] || "";
       return before && after && !"«(„\"[".includes(before) && !"»)\"],.:;".includes(after) ? " " : "";
     });
-    return bare.trim() ? bare : value; // имя из одних эмодзи — как есть, иначе строка пуста
+    if (bare === value) return value;
+    const tidy = bare.replace(SEP_REPEAT, "$1").replace(SEP_EDGES, "");
+    return tidy.trim() ? tidy : value; // имя из одних эмодзи — как есть, иначе строка пуста
   }
 
   function el(tag, props, ...children) {
@@ -419,6 +425,11 @@
     const [tone, text] = health(s, stale);
     $("chip").dataset.tone = tone;
     $("chip").textContent = text;
+    // Во «всём доме через пул» метка — переключатель: «поменять «через бесплатные серверы» нет
+    // возможности» (замечание заказчика в отчёте М2б.2).
+    const house = !stale && poolHouse(s);
+    $("chip").disabled = !house;
+    $("chip").title = house ? "Нажмите, чтобы вернуть режим подписок" : "";
   }
 
   function scopeText(capture) {
@@ -1985,6 +1996,13 @@
       () => act("freepool/mode", { mode: "on" }, $("pool-house")), "Весь дом через бесплатные", "primary");
   });
   $("house-back").addEventListener("click", () => act("freepool/mode", { mode: "observe" }, $("house-back")));
+  // Метка вверху — с подтверждением: по метке состояния нажимают и случайно.
+  $("chip").addEventListener("click", () => {
+    if (!state || !poolHouse(state)) return;
+    confirmRemove("Вернуть режим подписок?",
+      "Трафик всего дома снова пойдёт через серверы подписки; наблюдение за бесплатными серверами продолжится.",
+      () => act("freepool/mode", { mode: "observe" }, $("chip")), "Вернуть режим подписок", "primary");
+  });
   $("pool-refresh").addEventListener("click", () => act("freepool/refresh", {}, $("pool-refresh")));
   $("tab-subs").addEventListener("click", () => showTab("subs"));
   $("tab-pool").addEventListener("click", () => showTab("pool"));

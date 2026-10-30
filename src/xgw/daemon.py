@@ -219,6 +219,9 @@ POOL_REBUILD = 600.0
 # Пересборка для пула впереди или ядро ещё не пробовало его серверы — «подключаются», а не
 # «закрыто», но не дольше POOL_WAIT (первые пробы ядра — за интервал probe.interval).
 POOL_WAIT = 120.0
+# Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
+# HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
+HOUSE_SYNC = 300.0
 # Сетевая задержка (RTT, п. 2.3): у запасных — по их сканам, у участников — дешёвым запросом
 # через probe-inbound раз в RTT_EVERY (по одному за шаг; ~8 КБ на проверку). Замер старше
 # RTT_KEEP в рейтинге не учитывается (meta «rtt»: отпечаток → {"ms", "ts"}).
@@ -383,6 +386,18 @@ class Lifecycle(StrEnum):
 # журнал демона: «подключается → работает» бывает при каждом перезапуске Xray.
 LIFECYCLE_EVENTS = frozenset({Lifecycle.BLOCKED, Lifecycle.OPEN, Lifecycle.OFF})
 LIFECYCLE_TEXT = {life: status.LIFECYCLE_WORDS[str(life)][0] for life in Lifecycle}
+
+
+class _PoolCancel:
+    """Отмена проверок бесплатного пула (FreePool.check_some): демон останавливается или
+    наблюдение выключили — начатый шаг пула не проверяет следующие серверы (отчёт m2b2fix2:
+    проверки шли и после «Выключить»). Настройки пул получает при каждом перечитывании."""
+
+    def __init__(self, stop: threading.Event, pool: FreePool) -> None:
+        self.stop, self.pool = stop, pool
+
+    def is_set(self) -> bool:
+        return self.stop.is_set() or self.pool.cfg.free_pool.mode == "off"
 
 
 class Daemon:
@@ -554,6 +569,7 @@ class Daemon:
         self._pool_names: dict[str, tuple[str, str]] = {}
         self._pool_traffic: dict | None = None
         self._pool_wait_since = 0.0
+        self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
         # чтобы все проверки уложились в probe.max_daily_probe_mb (ДОП-4).
@@ -813,6 +829,7 @@ class Daemon:
         from .generator import validate
 
         xray_bin = validate.find_xray(None, self.paths)
+        cancel = _PoolCancel(self._stop, self.freepool)
 
         def work() -> None:
             try:
@@ -820,7 +837,7 @@ class Daemon:
                     self._freepool_summary = self.freepool.summary()
                 self.freepool.refresh_due(via=via, mark=self.mark, force=force)
                 self.freepool.check_some(mark=self.mark, xray_bin=xray_bin, via=via,
-                                         cancel=self._stop)
+                                         cancel=cancel)
                 self._freepool_summary = self.freepool.summary()
             except Exception:  # опытный режим не должен останавливать шлюз — в журнал целиком
                 self.log.exception("бесплатный пул: шаг не выполнен")
@@ -892,6 +909,7 @@ class Daemon:
         self._pool_names = dict(previous._pool_names)
         self._pool_traffic = previous._pool_traffic
         self._pool_wait_since = previous._pool_wait_since
+        self._house_synced_at = previous._house_synced_at
         self._health = previous._health
         self._observed = dict(previous._observed)
         self._rebalance_at = previous._rebalance_at
@@ -1139,6 +1157,7 @@ class Daemon:
         if signals.xray_ok:
             self._device_step(view, applied, observatory)
             self._pool_step(applied, observatory or {})
+            self._house_sync(applied, now)
             self._rtt_step(view, applied, observatory)
         if not changed and self._urgent_rebuild and self.inventory is not None:
             # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
@@ -2609,6 +2628,20 @@ class Daemon:
             } for info in pool],
         }
 
+    def _house_sync(self, applied: dict, now: float) -> None:
+        """Рабочий конфиг Xray против режима «весь дом». После перезагрузки `xgw run` снимал
+        режим, а сборка без пула ждала окна перезапуска: до 04:00 весь дом шёл через бесплатные
+        серверы при панели «выключено», и смены режима этого не меняли (отчёт m2b2fix2,
+        дефект 1). Расхождение — срочная сборка, кто бы ни сменил режим."""
+        whole = traffic.whole_house(self.cfg)
+        if builder.applied_whole(applied) == whole or self._urgent_rebuild:
+            return
+        if self._house_synced_at is not None and now - self._house_synced_at < HOUSE_SYNC:
+            return
+        self._house_synced_at = now
+        self._urgent_rebuild = ("бесплатный пул: весь дом" if whole
+                                else "бесплатный пул: режим подписок")
+
     def _house_mark(self, whole: bool) -> None:
         """Метка «весь дом действует в этой загрузке» (Paths.house_file): без неё после
         перезагрузки `xgw run` возвращает режим подписок (actions.house_after_boot)."""
@@ -2669,9 +2702,14 @@ class Daemon:
         """Сводка пула для состояния и панели; с устройствами через пул — и их «traffic»."""
         if self.cfg.free_pool.mode == "off" or self._freepool_summary is None:
             return None
+        # Сводку пересчитывает фоновый шаг пула после своих проверок — режим в ней отставал от
+        # настроек на минуты (отчёт m2b2fix2, наблюдение 7): режим и регион — из настроек.
+        pool = self.cfg.free_pool
+        summary = {**self._freepool_summary, "mode": pool.mode, "region": pool.region,
+                   "region_policy": pool.region_policy}
         if self._pool_traffic is None:
-            return self._freepool_summary
-        return {**self._freepool_summary, "traffic": self._pool_traffic}
+            return summary
+        return {**summary, "traffic": self._pool_traffic}
 
     # --- сетевая задержка (RTT, п. 2.3) ----------------------------------------------
 

@@ -464,6 +464,15 @@ def applied_pool(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> li
     return result
 
 
+def applied_whole(config: Mapping | None) -> bool:
+    """Весь дом через пул в работающем ядре (М2б.2): есть правило несущего канала — входы демона
+    http-in и socks-in в балансировщик подписки. Оно собирается только при pool_all."""
+    routing = config.get("routing") if isinstance(config, Mapping) else None
+    rules = routing.get("rules") if isinstance(routing, Mapping) else None
+    return any(isinstance(rule, Mapping) and "http-in" in (rule.get("inboundTag") or [])
+               and rule.get("balancerTag") == BALANCER_TAG for rule in rules or [])
+
+
 def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
     """Участники и запасные так, как они заведены в работающем ядре: теги, роли
     и порты проб из применённого конфига. Нужны демону и CLI — следить за

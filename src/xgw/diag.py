@@ -1242,12 +1242,19 @@ class Diag:
 
         if fptraffic.whole_house(self.cfg):
             return self._pool_house()
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        if builder.applied_whole(applied):
+            # Режим снят, а рабочий конфиг — прежний (отчёт m2b2fix2, дефект 1): демон
+            # пересобирает его срочно, сам — не позже чем через несколько минут.
+            return [Check("Весь дом через бесплатный пул", FAIL,
+                          f"режим {self.cfg.free_pool.mode}, а рабочий конфиг Xray всё ещё ведёт "
+                          "весь дом через бесплатные серверы",
+                          "подождите 5 минут и повторите; снова так — sudo xgw apply --now")]
         devices = fptraffic.pool_devices(self.cfg)
         if not devices:
             return []
         name = "Устройства через бесплатный пул"
         who = ", ".join(devices)
-        applied = engine.read_json(self.paths.xray_config_file) or {}
         routing = applied.get("routing") or {}
         rules = [rule for rule in routing.get("rules") or []
                  if isinstance(rule, dict) and set(devices) <= set(rule.get("source") or [])]

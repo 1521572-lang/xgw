@@ -268,6 +268,50 @@ def test_whole_house_does_not_survive_a_reboot(paths, tmp_path):
         assert db.recent_events(1)[0]["detail"] == actions.HOUSE_BOOT_EVENT
 
 
+def test_the_working_config_follows_the_mode(paths):
+    """Отчёт m2b2fix2, дефект 1: после перезагрузки режим снят, а рабочий конфиг Xray — «весь
+    дом», и сборка без пула ждала окна перезапуска (смены режима этого не меняли). Расхождение
+    режима и рабочего конфига — срочная сборка, не чаще HOUSE_SYNC; xgw diag — FAIL. Сводка
+    пула — с режимом из настроек; проверки пула выключение останавливает."""
+    import threading
+
+    from xgw.daemon import HOUSE_SYNC, _PoolCancel
+    from xgw.diag import FAIL, Diag
+
+    _pool(paths)
+    selection = _selection(SUBSCRIPTION)
+    pool = [item.node for item in traffic.admitted(_cfg("on"), paths, NOW)]
+    house = builder.build(_cfg("on"), selection, hosts={}, pool=pool, pool_all=True).config
+    usual = builder.build(_cfg(), selection, hosts={}, pool=pool, pool_devices=[DEVICE]).config
+    assert builder.applied_whole(house) and not builder.applied_whole(usual)
+    assert not builder.applied_whole(None) and not builder.applied_whole({"routing": {}})
+    daemon = _daemon(paths)  # режим observe
+    daemon._house_sync(usual, 100.0)
+    assert daemon._urgent_rebuild == ""
+    daemon._house_sync(house, 100.0)
+    assert daemon._urgent_rebuild == "бесплатный пул: режим подписок"
+    daemon._urgent_rebuild = ""  # сборку отклонили — снова не раньше HOUSE_SYNC
+    daemon._house_sync(house, 100.0 + HOUSE_SYNC - 1)
+    assert daemon._urgent_rebuild == ""
+    daemon._house_sync(house, 100.0 + HOUSE_SYNC)
+    assert daemon._urgent_rebuild == "бесплатный пул: режим подписок"
+    daemon.cfg, daemon._urgent_rebuild = _cfg("on"), ""
+    daemon._house_sync(usual, 100.0 + 2 * HOUSE_SYNC)
+    assert daemon._urgent_rebuild == "бесплатный пул: весь дом"
+    atomic_write_json(paths.xray_config_file, house)
+    check = Diag(_cfg(), paths, net=False)._pool_traffic()[0]
+    assert check.level == FAIL and "всё ещё ведёт весь дом" in check.text
+    # Фоновый шаг пула пересчитывает сводку после проверок — режим в ней из настроек.
+    daemon.cfg, daemon._freepool_summary = _cfg(), {"mode": "on", "region": "EU", "found": 3}
+    assert daemon._pool_summary() == {"mode": "observe", "region": "EU",
+                                      "region_policy": "strict", "found": 3}
+    holder = SimpleNamespace(cfg=_cfg())
+    cancel = _PoolCancel(threading.Event(), holder)
+    assert not cancel.is_set()
+    holder.cfg = _cfg("off")
+    assert cancel.is_set()
+
+
 def test_assemble_puts_admitted_pool_servers_into_the_config(paths):
     """engine.assemble берёт допущенные серверы пула сам — каждая сборка демона, CLI и
     установки одинаково ведёт устройство через пул."""
@@ -318,7 +362,7 @@ def _daemon(paths):
     for name, value in (("_pool_pinned", ""), ("_pool_pin_key", 0.0),
                         ("_pool_checked_at", NOW), ("_pool_rebuilt_at", 0.0),
                         ("_pool_names", {}), ("_pool_traffic", None),
-                        ("_pool_wait_since", 0.0)):
+                        ("_pool_wait_since", 0.0), ("_house_synced_at", None)):
         setattr(daemon, name, value)
     return daemon
 

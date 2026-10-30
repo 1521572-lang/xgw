@@ -391,8 +391,11 @@ TLS: `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2a4.md`, отчёт — без
 нет», исправлен: ASSUMPTIONS п. 268, `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix.md`;
 отчёт исправлений — в режиме «весь дом» терялся удалённый доступ через Tailscale, а режим
 переживал перезагрузку: Tailscale — через подписку, перезагрузка снимает режим, п. 269,
-`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix2.md`), М2б.3 — туннели
-постоянными выходами (раздел «Веха М2б»). **М2в** — OpenVPN убран, у VPN Gate — SSTP (решение 9,
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix2.md`; отчёт — доступ не терялся, но после
+перезагрузки рабочий конфиг Xray остался «весь дом» до окна перезапуска: демон сверяет конфиг с
+режимом и пересобирает срочно, метка вверху панели — переключатель, п. 270,
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix3.md`), М2б.3 — туннели постоянными выходами
+(раздел «Веха М2б»; отложена, пока ни один туннель SSTP не поднялся — п. 270 (е)). **М2в** — OpenVPN убран, у VPN Gate — SSTP (решение 9,
 раздел «Веха М2в»): `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v1.md`, отчёт — sstpc не
 принимал ключ `--ca-dir`; **М2в.2** — исправление:
 `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v2.md`, отчёт — без дефектов: клиент запускается,
