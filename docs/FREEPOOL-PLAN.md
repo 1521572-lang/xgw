@@ -388,7 +388,10 @@ TLS: `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2a4.md`, отчёт — без
 отчёт — без дефектов: телефон час ходил через пул), М2б.2 — весь дом
 (`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2.md`, отчёт — пройден: весь дом ходил через
 пул, подписка несла только каналы шлюза; мелкий дефект — при включении «допущенных серверов
-нет», исправлен: ASSUMPTIONS п. 268, `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix.md`), М2б.3 — туннели
+нет», исправлен: ASSUMPTIONS п. 268, `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix.md`;
+отчёт исправлений — в режиме «весь дом» терялся удалённый доступ через Tailscale, а режим
+переживал перезагрузку: Tailscale — через подписку, перезагрузка снимает режим, п. 269,
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2b2fix2.md`), М2б.3 — туннели
 постоянными выходами (раздел «Веха М2б»). **М2в** — OpenVPN убран, у VPN Gate — SSTP (решение 9,
 раздел «Веха М2в»): `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-m2v1.md`, отчёт — sstpc не
 принимал ключ `--ca-dir`; **М2в.2** — исправление:

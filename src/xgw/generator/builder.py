@@ -38,6 +38,9 @@ API_SOCKET = "/run/xgw-xray/api.sock"
 # минуту). Жив ли сервер, проверяет демон (Daemon._device_step), и мёртвого он убирает из
 # правил (devices_down) — через API ядра, как любое изменение routing.
 TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
+# Управление, DERP и журнал Tailscale (controlplane, derpN, log): весь дом через пул (М2б.2) их
+# в бесплатные серверы не пускает — удалённый доступ к шлюзу держится на tailscaled.
+TS_CONTROL = ("domain:tailscale.com", "domain:tailscale.io")
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
 _POOL_TAG_RE = re.compile(r"^pool-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
@@ -934,9 +937,13 @@ def build(
     if pool_devices and not pool_all:
         rules.append({"type": "field", "source": list(pool_devices), **to_pool})
     if pool_all:
-        # Несущий канал (М2б.2): серверы подписки — только входам демона.
+        # Несущий канал (М2б.2): серверы подписки — только входам демона и Tailscale. Через
+        # бесплатные серверы tailscaled (tailscale.route = "vpn" или DERP напрямую не отвечает —
+        # тогда он идёт через Xray) терял управление и DERP, а с ними удалённый доступ к шлюзу —
+        # до перезагрузки (отчёт m2b2fix, дефект 1). Имена — по сниффингу (TLS, HTTP).
         rules.append({"type": "field", "inboundTag": ["http-in", "socks-in"],
                       "balancerTag": BALANCER_TAG})
+        rules.append({"type": "field", "domain": list(TS_CONTROL), "balancerTag": BALANCER_TAG})
     rest = to_pool if pool_all else {"balancerTag": BALANCER_TAG}
     if cfg.routing.proxy_domains:
         rules.append({"type": "field", "domain": list(cfg.routing.proxy_domains), **rest})
@@ -951,11 +958,14 @@ def build(
             info.tag for info in nodes if info.fingerprint == selection.reserve.fingerprint
         )
     dns_servers: list[object] = []
-    if cfg.routing.direct_domains:
+    # Весь дом через пул: имена Tailscale — прямыми серверами DNS, как прямые домены, а не через
+    # бесплатные серверы: без них tailscaled не находит управление и DERP (отчёт m2b2fix).
+    direct_names = [*cfg.routing.direct_domains, *(TS_CONTROL if pool_all else ())]
+    if direct_names:
         for address, port in direct_dns:
             entry: dict = {
                 "address": address,
-                "domains": list(cfg.routing.direct_domains),
+                "domains": direct_names,
                 "skipFallback": True,
             }
             if port is not None:

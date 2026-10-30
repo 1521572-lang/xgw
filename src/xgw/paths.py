@@ -107,6 +107,14 @@ class Paths:
         return self.run / "devices-down.json"
 
     @property
+    def house_file(self) -> Path:
+        """Метка «весь дом через пул (М2б.2) включён в этой загрузке»: ставит демон, пока режим
+        on действует (Daemon._pool_step). /run очищается при перезагрузке, а при перезапуске
+        службы — нет (RuntimeDirectoryPreserve): метки нет, а режим on — машина только что
+        загрузилась, и `xgw run` возвращает режим подписок (actions.house_after_boot)."""
+        return self.run / "house-on"
+
+    @property
     def api_dirty_file(self) -> Path:
         """Метка «ядро изменено через API лишь частично» — живёт до перезапуска Xray
         (каталог /run очищается при перезагрузке вместе с состоянием ядра)."""

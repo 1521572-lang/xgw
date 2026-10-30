@@ -2,7 +2,6 @@
 рабочем конфиге, «закрыто» без серверов, выбор в панели и закреплённый сервер у демона."""
 
 import logging
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +14,7 @@ from xgw.freepool.store import PoolStore
 from xgw.generator import builder, diff
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
-from xgw.paths import Paths
+from xgw.paths import Paths, atomic_write_json
 
 LOG = logging.getLogger("test")
 NOW = 1_800_000_000.0
@@ -197,9 +196,32 @@ def test_whole_house_goes_through_the_pool_and_the_subscription_carries_the_daem
     assert direct < carrier < len(rules) - 1
     assert rules[-1] == {"type": "field", "network": "tcp,udp", "balancerTag": "pool"}
     assert config["burstObservatory"]["subjectSelector"] == ["proxy-", "pool-"]
+    # Управление и DERP Tailscale — через подписку, а их имена — прямыми серверами DNS: без них
+    # удалённый доступ к шлюзу терялся (отчёт m2b2fix, дефект 1). В режиме подписок — как было.
+    tailscale = rules.index({"type": "field", "domain": list(builder.TS_CONTROL),
+                             "balancerTag": "auto"})
+    assert carrier < tailscale < len(rules) - 1
+    assert not [rule for rule in usual["routing"]["rules"]
+                if rule.get("domain") == list(builder.TS_CONTROL)]
+    direct_dns = [entry for entry in config["dns"]["servers"] if isinstance(entry, dict)]
+    assert direct_dns and all(set(builder.TS_CONTROL) <= set(entry["domains"])
+                              for entry in direct_dns)
+    assert not [entry for entry in usual["dns"]["servers"] if isinstance(entry, dict)
+                and set(builder.TS_CONTROL) & set(entry["domains"])]
     # DNS через пул — по TCP: бесплатный сервер может не пропускать UDP.
     assert usual["dns"]["servers"][-2:] == ["1.1.1.1", "8.8.8.8"]
     assert config["dns"]["servers"][-2:] == ["tcp://1.1.1.1", "tcp://8.8.8.8"]
+    # xgw diag: весь дом — в «pool», входы демона и Tailscale — через подписку; правила
+    # Tailscale нет — FAIL (удалённый доступ к шлюзу может пропасть).
+    from xgw.diag import FAIL, OK, Diag
+
+    atomic_write_json(paths.xray_config_file, config)
+    check = Diag(cfg, paths, net=False)._pool_house()[0]
+    assert check.level == OK and "Tailscale" in check.text
+    atomic_write_json(paths.xray_config_file, {
+        **config, "routing": {**config["routing"],
+                              "rules": [rule for i, rule in enumerate(rules) if i != tailscale]}})
+    assert Diag(cfg, paths, net=False)._pool_house()[0].level == FAIL
     empty = builder.build(cfg, selection, hosts={}, pool=[], pool_all=True).config
     assert empty["routing"]["rules"][-1] == {"type": "field", "network": "tcp,udp",
                                              "outboundTag": "block"}
@@ -228,6 +250,22 @@ def test_whole_house_is_not_switched_on_without_admitted_servers(paths, tmp_path
         texts = [row["detail"] for row in db.recent_events(10)]
     assert texts[:2] == ["бесплатный пул: режим подписок возвращён, наблюдение продолжается",
                          "бесплатный пул: весь дом через бесплатные серверы"]
+
+
+def test_whole_house_does_not_survive_a_reboot(paths, tmp_path):
+    """Отчёт m2b2fix, дефект 1: весь дом вернулся сам после перезагрузки, а снять его без
+    удалённого доступа было нечем. Метки этой загрузки нет — режим подписок (observe) и событие;
+    метка есть (перезапуск службы, установка) — весь дом остаётся."""
+    store = tmp_path / "panel.json"
+    assert managed.set_free_pool_mode(store, "on")
+    paths.house_file.touch()
+    assert not actions.house_after_boot(paths, store)
+    assert managed.load(store)[0]["free_pool_mode"] == "on"
+    paths.house_file.unlink()
+    assert actions.house_after_boot(paths, store)
+    assert managed.load(store)[0]["free_pool_mode"] == "observe"
+    with actions.open_store(paths) as db:
+        assert db.recent_events(1)[0]["detail"] == actions.HOUSE_BOOT_EVENT
 
 
 def test_assemble_puts_admitted_pool_servers_into_the_config(paths):
@@ -279,7 +317,8 @@ def _daemon(paths):
     daemon._urgent_rebuild = ""
     for name, value in (("_pool_pinned", ""), ("_pool_pin_key", 0.0),
                         ("_pool_checked_at", NOW), ("_pool_rebuilt_at", 0.0),
-                        ("_pool_names", {}), ("_pool_traffic", None)):
+                        ("_pool_names", {}), ("_pool_traffic", None),
+                        ("_pool_wait_since", 0.0)):
         setattr(daemon, name, value)
     return daemon
 
@@ -328,23 +367,35 @@ def test_daemon_keeps_the_whole_house_on_a_live_pool_server(paths):
 def test_switching_the_whole_house_on_is_connecting_not_closed(paths):
     """Отчёт М2б.2, дефект 1: шаг до пересборки видел старый конфиг без серверов пула и писал
     «допущенных серверов нет — закрыто». Пока пересборка впереди и пока ядро после перезапуска
-    не опробовало серверы пула — «подключаются» (traffic нет, события нет); дольше трёх
-    интервалов проб без ответа — закрыто, как прежде."""
+    (сборкой или установкой — отчёт m2b2fix, дефект 3) не опробовало серверы пула —
+    «подключаются» (traffic нет, события нет), но не дольше POOL_WAIT; дольше — закрыто, как
+    прежде. Пока весь дом действует — метка этой загрузки (Paths.house_file)."""
+    from xgw.daemon import POOL_WAIT
+
     paths.xray_config_file.write_text("{}", encoding="utf-8")
     daemon = _daemon(paths)
     daemon.cfg = _cfg("on")
     daemon.cfg.managed.routes = {}
+    daemon._pool_checked_at = NOW + 10_000  # допущенные здесь не перепроверяются
     daemon._urgent_rebuild = "бесплатный пул: весь дом"
     daemon._pool_step({"outbounds": [{"tag": "proxy-de-0001"}]}, {"proxy-de-0001": {"alive": True}})
     assert daemon._pool_traffic is None and daemon.events == [] and daemon.api.calls == []
+    assert paths.house_file.exists()
     daemon._urgent_rebuild = ""
     applied = {"outbounds": [{"tag": "pool-de-aaaa"}]}
-    os.utime(paths.xray_config_file, (NOW - 20, NOW - 20))  # Xray только что перезапущен
+    daemon.wall = lambda: NOW + 20  # сборка перезапустила Xray: проб ещё не было
     daemon._pool_step(applied, {})
     assert daemon._pool_traffic is None and daemon.events == [] and daemon.api.calls == []
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.2}})
     assert daemon.api.calls == [("pin", "pool", "pool-de-aaaa")]
     assert len(daemon.events) == 1 and "весь дом идёт через" in daemon.events[0]
-    os.utime(paths.xray_config_file, (NOW - 600, NOW - 600))
+    # Xray перезапустила установка (конфиг прежний): снова ждём проб — не дольше POOL_WAIT.
+    daemon._pool_step(applied, {})
+    assert daemon._pool_traffic is None and len(daemon.events) == 1
+    daemon.wall = lambda: NOW + 21 + POOL_WAIT
     daemon._pool_step(applied, {})
     assert daemon._pool_traffic["closed"] and "все серверы пула молчат" in daemon.events[-1]
+    daemon.cfg = _cfg("observe")
+    daemon.cfg.managed.routes = {}
+    daemon._pool_step(applied, {})
+    assert not paths.house_file.exists()

@@ -216,6 +216,9 @@ DEVICE_STREAK = 2
 POOL_CHECK = 60.0
 POOL_OPEN = 180.0
 POOL_REBUILD = 600.0
+# Пересборка для пула впереди или ядро ещё не пробовало его серверы — «подключаются», а не
+# «закрыто», но не дольше POOL_WAIT (первые пробы ядра — за интервал probe.interval).
+POOL_WAIT = 120.0
 # Сетевая задержка (RTT, п. 2.3): у запасных — по их сканам, у участников — дешёвым запросом
 # через probe-inbound раз в RTT_EVERY (по одному за шаг; ~8 КБ на проверку). Замер старше
 # RTT_KEEP в рейтинге не учитывается (meta «rtt»: отпечаток → {"ms", "ts"}).
@@ -543,13 +546,14 @@ class Daemon:
         # Устройства через бесплатный пул (_pool_step): закреплённый тег «pool» и по какому
         # применённому конфигу он закреплён (время файла: перезапуск и смена routing снимают
         # закрепление), когда проверены допущенные и пересобран конфиг ради них, имена
-        # серверов пула по тегу и сводка для состояния.
+        # серверов пула по тегу, сводка для состояния и с какого времени пул «подключается».
         self._pool_pinned = ""
         self._pool_pin_key = 0.0
         self._pool_checked_at = 0.0
         self._pool_rebuilt_at = 0.0
         self._pool_names: dict[str, tuple[str, str]] = {}
         self._pool_traffic: dict | None = None
+        self._pool_wait_since = 0.0
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
         # чтобы все проверки уложились в probe.max_daily_probe_mb (ДОП-4).
@@ -887,6 +891,7 @@ class Daemon:
         self._pool_rebuilt_at = previous._pool_rebuilt_at
         self._pool_names = dict(previous._pool_names)
         self._pool_traffic = previous._pool_traffic
+        self._pool_wait_since = previous._pool_wait_since
         self._health = previous._health
         self._observed = dict(previous._observed)
         self._rebalance_at = previous._rebalance_at
@@ -2547,6 +2552,7 @@ class Daemon:
             self._pool_checked_at = now
             self._pool_due(applied, now)
         pool = builder.applied_pool(applied)
+        self._house_mark(whole)
         if not (devices or whole):
             self._pool_pinned, self._pool_traffic = "", None
             return
@@ -2557,13 +2563,16 @@ class Daemon:
         was_closed = self._pool_traffic.get("closed") if self._pool_traffic else None
         # Шаг идёт раньше срочной пересборки: при включении режима он видел старый конфиг без
         # серверов пула и писал «допущенных серверов нет — закрыто» (отчёт М2б.2, дефект 1).
-        # Пока пересборка впереди, а после перезапуска Xray — до первых проб ядра (не опробован
-        # ещё не мёртв; не дольше трёх интервалов проб), это «подключаются»: сводка без
-        # «traffic», без события и без снятия закрепления. Уже закрытое так и остаётся закрытым.
+        # Пока пересборка впереди, а после перезапуска Xray (сборкой, установкой, самим ядром) —
+        # до первых проб ядра (не опробован ещё не мёртв), это «подключаются»: сводка без
+        # «traffic», без события и без снятия закрепления — не дольше POOL_WAIT от начала
+        # ожидания (отчёт m2b2fix, дефект 3). Уже закрытое так и остаётся закрытым.
         waiting = (not pool and bool(self._urgent_rebuild)) or (
-            bool(pool) and 0 <= now - key < 3 * checks_interval(self.cfg)
-            and not any(info.tag in observatory for info in pool))
-        if waiting and was_closed is not True:
+            bool(pool) and not any(info.tag in observatory for info in pool))
+        if not waiting or was_closed is True:
+            self._pool_wait_since = 0.0
+        elif now - (self._pool_wait_since or now) < POOL_WAIT:
+            self._pool_wait_since = self._pool_wait_since or now
             self._pool_traffic = None
             return
         alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
@@ -2599,6 +2608,20 @@ class Daemon:
                 "delay_ms": round(((observatory.get(info.tag) or {}).get("delay") or 0) * 1000),
             } for info in pool],
         }
+
+    def _house_mark(self, whole: bool) -> None:
+        """Метка «весь дом действует в этой загрузке» (Paths.house_file): без неё после
+        перезагрузки `xgw run` возвращает режим подписок (actions.house_after_boot)."""
+        marked = self.paths.house_file.exists()
+        if whole == marked:
+            return
+        try:
+            if whole:
+                self.paths.house_file.touch(mode=0o644)
+            else:
+                self.paths.house_file.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.error("метка всего дома через пул не записана: %s", exc)
 
     def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str) -> str:
         """who — адреса устройств через пул или «весь дом» (М2б.2)."""

@@ -758,6 +758,12 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             logger.info("российские адреса мимо Xray: общий переключатель разделён — включён у "
                         "этого компьютера и у устройств, что сейчас в сети")
             cfg, _warnings = config.load(args.config_path)
+    # Весь дом через пул после перезагрузки — снова режим подписок (actions.house_after_boot).
+    with contextlib.suppress(config.ConfigError):
+        if cfg.free_pool.mode == "on" and actions.house_after_boot(
+                paths, managed.path_for(args.config_path)):
+            logger.warning(actions.HOUSE_BOOT_EVENT)
+            cfg, _warnings = config.load(args.config_path)
     reloaded = False
     previous = None
     panel = None

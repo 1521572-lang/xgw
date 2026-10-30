@@ -1199,8 +1199,8 @@ class Diag:
 
     def _pool_house(self) -> list[Check]:
         """Весь дом через бесплатный пул (М2б.2): последнее правило рабочего конфига (весь
-        прочий трафик) ведёт в «pool» или в block (закрыто), входы демона http-in и socks-in —
-        в подписку («auto», несущий канал), в «auto» серверов пула нет."""
+        прочий трафик) ведёт в «pool» или в block (закрыто), входы демона http-in и socks-in и
+        управление Tailscale — в подписку («auto», несущий канал), в «auto» серверов пула нет."""
         name = "Весь дом через бесплатный пул"
         applied = engine.read_json(self.paths.xray_config_file) or {}
         routing = applied.get("routing") or {}
@@ -1226,8 +1226,13 @@ class Diag:
         if last.get("balancerTag") != builder.POOL_BALANCER or not pool:
             return [Check(name, FAIL, "весь прочий трафик ведёт не в бесплатный пул",
                           "sudo systemctl restart xgw")]
+        if not any(rule.get("domain") == list(builder.TS_CONTROL)
+                   and rule.get("balancerTag") == BALANCER_TAG for rule in rules):
+            return [Check(name, FAIL, "управление Tailscale идёт через бесплатные серверы — "
+                                      "удалённый доступ к шлюзу может пропасть",
+                          "вернуть режим подписок — sudo xgw pool mode observe")]
         return [Check(name, OK, f"через бесплатный пул, серверов в «pool»: {len(pool)}; "
-                                "подписка — только входам демона (несущий канал)")]
+                                "подписка — только входам демона и Tailscale (несущий канал)")]
 
     def _pool_traffic(self) -> list[Check]:
         """Устройства через бесплатный пул (М2б.1): их правило в рабочем конфиге ведёт в

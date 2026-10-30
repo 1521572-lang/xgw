@@ -314,6 +314,29 @@ def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool =
     return Outcome(0, text)
 
 
+HOUSE_BOOT_EVENT = ("бесплатный пул: весь дом снят после перезагрузки — трафик через подписку, "
+                    "наблюдение продолжается; включить снова — кнопкой на вкладке")
+
+
+def house_after_boot(paths: Paths, store_path) -> bool:
+    """Весь дом через пул не переживает перезагрузку (отчёт m2b2fix, дефект 1): удалённый
+    доступ к шлюзу пропал, а режим вернулся сам после двух перезагрузок подряд — снять его,
+    когда шлюз недоступен, было нечем. Метки этой загрузки (Paths.house_file) нет — режим on
+    становится observe; True — режим изменён (настройки перечитать)."""
+    from . import managed
+
+    if paths.house_file.exists():
+        return False
+    try:
+        changed = managed.set_free_pool_mode(store_path, "observe")
+    except (managed.ManagedError, OSError):
+        return False
+    if changed:
+        with open_store(paths) as store:
+            store.add_event("freepool", HOUSE_BOOT_EVENT)
+    return changed
+
+
 # --- ядро сервера ----------------------------------------------------------------------
 
 
