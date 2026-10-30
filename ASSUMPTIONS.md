@@ -4263,3 +4263,35 @@ Happ»), затем дополнен редактированием списка
      ruff; `node --check` для app.js; помощник ТЗ — на подставном состоянии с настоящей панелью.
      Панель в браузере не открывалась (правило заказчика: интерфейс — по ТЗ):
      `docs/TEST-PLAN-REAL-MACHINE-0.2.0-freepool-tab.md`.
+266. **Бесплатный пул: отчёт М2в.2 и этапы отказа SSTP (30.10.2026).** Отчёт
+     (`docs/TEST-REPORT-REAL-MACHINE-0.2.0-freepool-m2v2-2026-10-30.md`) — без дефектов: sstpc
+     с `--ca-path` запускается (SSTPC_ARGS — 0), изоляция, следы и секреты в порядке, журнал
+     подключений за сутки работает. Прогон сокращён по просьбе заказчика (72 минуты вместо
+     125): 4 подключения SSTP, туннель — 0: CONNECT_FAILED 1 (строка «Could not complete connect
+     to the client»), UNKNOWN 3 (строк ошибки нет). Списки GitHub: 39–45 пригодных в EU.
+     (а) **Что значат строки sstpc** — по исходнику sstp-client 1.0.20 (sources.debian.org,
+     прочитано 30.10.2026: sstp-client.c, sstp-stream.c, sstp-http.c, sstp-log.h). Уровень
+     журнала 2 — info: «Resolved», «Connected to» (TCP установлен), «Started PPP Link
+     Negotiation» и «Connection Established» (SSTP принят, идёт PPP). TCP — неблокирующий
+     connect со сроком 10 с: истёк — «Connect timed out», затем «Could not complete connect to
+     the client» и выход; итог connect() sstpc не проверяет (SO_ERROR), поэтому отказ TCP (RST)
+     выглядит как «Connected to» и обрыв на первой записи TLS («Unrecoverable … error»). Затем
+     TLS и запрос SSTP_DUPLEX_POST — одной отправкой со сроком 10 с (не успел — «HTTP handshake
+     with server failed»), ответ сервера sstpc ждёт 60 с — дольше UP_WAIT агента (45 с).
+     (б) **Вывод по отчёту**: CONNECT_FAILED — сервер не ответил на TCP SYN за 10 с. Три UNKNOWN
+     — агент снял поколение по UP_WAIT при живом клиенте: строк ошибки нет, значит, клиент
+     прошёл TCP, TLS и отправку запроса (на каждом из них за 10 с иначе была бы строка), а
+     ответа SSTP за 45 с не было. Сервер или путь «замолкает» после TLS — похоже на заморозку
+     ТСПУ после рукопожатия, но перегруженный сервер VPN Gate даёт то же; сертификат и вход
+     `vpn`/`vpn` не проверялись — до них не дошло.
+     (в) **Коды теперь** (agent.classify): «Connect timed out» — CONNECT_TIMEOUT (была общая
+     CONNECT_FAILED); «Unrecoverable SSL error» и «Unrecoverable socket error» — новый
+     TLS_FAILED (обрыв на TLS, в том числе отказ TCP — см. (а)); туннель не поднялся за UP_WAIT
+     без строки ошибки — этап по строкам info: «Connected to» — новый **SSTP_NO_REPLY** (TCP и
+     TLS прошли, на запрос SSTP ответа нет), «Started PPP Link Negotiation» / «Connection
+     Established» — PPP_TIMEOUT, ни одного этапа — TIMEOUT. UNKNOWN остаётся только у
+     завершившегося клиента с нераспознанной строкой. UP_WAIT не увеличен (R54, 45 с): итог
+     sstpc через 60 с («HTTP handshake with server failed») сказал бы то же, что SSTP_NO_REPLY.
+     Строка, по которой распознан этап, идёт в журнал как обычно («SSTP: Connected to <host>»).
+     (г) **Проверено** здесь: юнит-тесты `tests/test_freepool_backend.py`, ruff. На машине —
+     в следующем прогоне наблюдения с подключениями SSTP.

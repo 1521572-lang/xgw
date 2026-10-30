@@ -195,6 +195,20 @@ def test_failure_codes_from_the_client_output():
     assert agenting.classify(["connect: No route to host"]) == "HOST_UNREACHABLE"
     assert agenting.classify(["connect: Network is unreachable"]) == "NETWORK_UNREACHABLE"
     assert agenting.classify([]) == "UNKNOWN"
+    # Этапы sstpc (отчёт М2в.2, sstp-stream.c и sstp-http.c 1.0.20): SYN без ответа 10 с —
+    # CONNECT_TIMEOUT; обрыв на TLS — TLS_FAILED; туннель не поднялся за UP_WAIT без строки
+    # ошибки — этап, до которого дошёл клиент.
+    assert agenting.classify(["Connect timed out", "Could not complete connect to the client"]) \
+        == "CONNECT_TIMEOUT"
+    assert agenting.classify(["Connected to x", "Unrecoverable SSL error -1",
+                              "HTTP handshake with server failed"]) == "TLS_FAILED"
+    connected = [f"Resolved {HOST} to 1.0.0.1", f"Connected to {HOST}"]
+    assert agenting.classify(connected) == "UNKNOWN"
+    assert agenting.classify(connected, timed_out=True) == "SSTP_NO_REPLY"
+    assert agenting.classify([*connected, "Started PPP Link Negotiation"], timed_out=True) \
+        == "PPP_TIMEOUT"
+    assert agenting.classify(connected[:1], timed_out=True) == "TIMEOUT"
+    assert agenting.evidence(connected, "SSTP_NO_REPLY") == "Connected to <host>"
     # sstpc не принял свою строку — дефект шлюза, а не UNKNOWN (отчёт М2в.1).
     assert agenting.classify(["**Error: Could not execute `/usr/sbin/sstpc', Invalid command "
                               "line option: `?' (-1)"]) == "SSTPC_ARGS"
@@ -553,6 +567,12 @@ def test_tunnel_that_never_comes_up_times_out_with_the_ppp_reason(tmp_path, monk
     (tmp_path / "quiet").mkdir()
     quiet, _chowned = _agent(tmp_path / "quiet", monkeypatch)  # клиент молчит
     assert quiet.run() == 3 and quiet.state["reason"] == "TIMEOUT"
+    # Отчёт М2в.2: TCP и TLS прошли, а на запрос SSTP сервер молчит — этап, а не UNKNOWN.
+    (tmp_path / "silent").mkdir()
+    silent, _chowned = _agent(tmp_path / "silent", monkeypatch, spawn=_Spawn(
+        client_lines=[f"Resolved {PEER} to {PEER}", f"Connected to {PEER}"]))
+    assert silent.run() == 3 and silent.state["reason"] == "SSTP_NO_REPLY"
+    assert "SSTP: Connected to <ip>" in silent.out.getvalue()
 
 
 def test_foreign_tunnel_address_is_refused(tmp_path, monkeypatch):

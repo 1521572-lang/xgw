@@ -135,13 +135,19 @@ _CAUSES = (
     ("CERT_VERIFY_FAILED", ("Verification of server certificate failed",
                             "SSL certificate verification failed",
                             "certificate did not match")),
+    # Соединение оборвалось на TLS (sstp-stream.c): сброс сервером или с пути. sstpc не смотрит
+    # итог connect(), и отказ TCP (RST) тоже приходит сюда, после «Connected to».
+    ("TLS_FAILED", ("Unrecoverable SSL error", "Unrecoverable socket error")),
+    # TLS и запрос SSTP_DUPLEX_POST не ушли за 10 с или сервер ответил не 200 (sstp-http.c).
     ("SSTP_REFUSED", ("HTTP handshake with server failed",)),
     ("PPP_TIMEOUT", ("timeout sending Config-Requests",)),
     ("LINK_LOST", ("echo-requests", "appears to be disconnected")),
     ("PPP_DEVICE_FAILED", ("/dev/ppp", "Couldn't load plugin")),
     ("SSTPC_SOCKET", ("Could not setup notification",)),
     ("CONNECT_REFUSED", ("Connection refused",)),
-    ("CONNECT_TIMEOUT", ("Connection timed out",)),
+    # «Connect timed out» — sstpc 10 с ждал ответа на TCP SYN (sstp-stream.c); за ней идёт
+    # «Could not complete connect to the client» (отчёт М2в.2: записано как CONNECT_FAILED).
+    ("CONNECT_TIMEOUT", ("Connection timed out", "Connect timed out")),
     ("TRANSPORT_RESET", ("Connection reset",)),
     # Маршрута нет в своём пространстве имён — дефект шлюза (маршрут к серверу ставит агент).
     ("NETWORK_UNREACHABLE", ("Network is unreachable",)),
@@ -150,6 +156,16 @@ _CAUSES = (
     ("HOST_UNREACHABLE", ("No route to host",)),
     # TCP или TLS не сложились, а errno sstpc не написал.
     ("CONNECT_FAILED", ("Could not complete connect", "Could not connect to")),
+)
+# Туннель не поднялся за UP_WAIT, а ошибки клиент не написал: причина — этап, до которого он
+# дошёл, по его строкам уровня info (sstp-client.c 1.0.20; --log-level 2). «Connected to» — TCP
+# установлен; дальше sstpc за 10 с проходит TLS и шлёт SSTP_DUPLEX_POST (не успел — «HTTP
+# handshake with server failed»), а ответа ждёт 60 с — дольше UP_WAIT. «Started PPP Link
+# Negotiation» и «Connection Established» — SSTP принят, идёт PPP. Отчёт М2в.2: три подключения
+# из четырёх стали UNKNOWN — ошибок в выводе не было.
+_PHASES = (
+    ("PPP_TIMEOUT", ("Started PPP Link Negotiation", "Connection Established")),
+    ("SSTP_NO_REPLY", ("Connected to",)),
 )
 # Отказ, причина которого не распознана: последняя строка с такой пометкой (evidence).
 _MARKERS = ("Could not", "failed", "Failed", "error", "Error", "Terminat")
@@ -429,12 +445,19 @@ def tunnel_problem(address: str, manifest: Manifest) -> str:
     return ""
 
 
-def classify(lines) -> str:
-    """Причина отказа по выводу sstpc и pppd; UNKNOWN — не распознана."""
+def classify(lines, *, timed_out: bool = False) -> str:
+    """Причина отказа по выводу sstpc и pppd; UNKNOWN — не распознана. timed_out — туннель не
+    поднялся за UP_WAIT при живом клиенте: без строки ошибки причина — его этап (_PHASES), а
+    ни одного этапа — TIMEOUT."""
     text = "\n".join(lines)
     for code, needles in _CAUSES:
         if any(needle in text for needle in needles):
             return code
+    if timed_out:
+        for code, needles in _PHASES:
+            if any(needle in text for needle in needles):
+                return code
+        return "TIMEOUT"
     return "UNKNOWN"
 
 
@@ -443,7 +466,7 @@ def evidence(lines, code: str) -> str:
     строка с пометкой ошибки: отчёт М2а — четыре UNKNOWN, и ни одной строки, по которой их
     разобрать. Пусто — такой нет."""
     lines = list(lines)
-    needles = dict(_CAUSES).get(code, ())
+    needles = (*dict(_CAUSES).get(code, ()), *dict(_PHASES).get(code, ()))
     for line in lines:
         if any(needle in line for needle in needles):
             return masked(line)
@@ -971,7 +994,7 @@ class Agent:
                 if self._dead("vpn"):
                     raise AgentError(classify(self.log), "клиент SSTP завершился")
                 if self.clock() - started > UP_WAIT:
-                    raise AgentError(classify(self.log) if self.log else "TIMEOUT",
+                    raise AgentError(classify(self.log, timed_out=True),
                                      "туннель не поднялся за отведённое время")
                 self.sleep(POLL_EVERY)
                 continue
