@@ -77,6 +77,16 @@
   let poolList = null;
   let poolAt = null;
   let poolLoading = false;
+  // Расход трафика (/api/traffic, usage.py) — тоже отдельно: раз в минуту и при смене периода.
+  const USAGE_KEY = "xgw-usage-days";
+  let usageDays = "1";
+  try {
+    const saved = localStorage.getItem(USAGE_KEY);
+    if (["1", "7", "30"].includes(saved)) usageDays = saved;
+  } catch (error) { /* хранилище браузера недоступно — «Сегодня» */ }
+  let usage = null;
+  let usageAt = 0;
+  let usageLoading = false;
 
   // --- мелочи ---------------------------------------------------------------
 
@@ -312,6 +322,7 @@
     draw("netcheck", [s.netcheck, Math.floor(s.now / 60)], () => renderNetcheck(s));
     wantPool(s);
     draw("pool", [s.free_pool, poolAt, tab, Math.floor(s.now / 60)], () => renderPool(s));
+    wantUsage(s);
     setBusy($("netcheck-run"), Boolean((s.netcheck || {}).running));
     draw("notes", [s.nodes, s.budget, s.probe_target, s.subscriptions.map((sub) => sub.name), s.probe_hosts, s.resolvers, s.tailscale_via_vpn, Math.floor(s.now / 60)], () => renderNotes(s));
     setBusy($("refresh"), s.busy.refresh);
@@ -1003,7 +1014,7 @@
       : "Серверов пока нет. Добавьте подписку — вставьте её адрес в поле «Подписки».";
     $("pin-note").hidden = !s.pin;
     const pinRow = s.pin ? s.servers.find((server) => sameServer(server.tag, s.pin.tag)) : null;
-    const pinName = s.pin ? (pinRow && pinRow.name) || s.pin.name || s.pin.tag : "";
+    const pinName = s.pin ? plain((pinRow && pinRow.name) || s.pin.name || s.pin.tag) : "";
     $("pin-note").textContent = !s.pin ? ""
       : s.pin.down
         ? `Выбранный вручную «${pinName}» не отвечает — трафик идёт через серверы, выбранные автоматически. Когда он снова ответит, шлюз вернётся к нему.`
@@ -1886,6 +1897,81 @@
     if (tab === "pool") renderPoolGroups(s, sum); // сотни строк — только на открытой вкладке
   }
 
+  // --- расход трафика (usage.py) ----------------------------------------------
+
+  function wantUsage(s) {
+    if (usageLoading || (usage && String(usage.days) === usageDays && s.now - usageAt < 60)) return;
+    loadUsage(s.now);
+  }
+
+  async function loadUsage(at) {
+    usageLoading = true;
+    try {
+      const response = await fetch(`/api/traffic?days=${usageDays}`, { cache: "no-store", credentials: "same-origin" });
+      if (response.status === 401) {
+        location.reload();
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      usage = await response.json();
+      usageAt = at;
+    } catch (error) {
+      return; // не вышло — снова при следующем опросе состояния
+    } finally {
+      usageLoading = false;
+    }
+    if (!gone) renderUsage();
+  }
+
+  // Байты по-русски, как в `xgw traffic`: 850 КБ, 12,4 МБ, 3,1 ГБ.
+  function bytes(value) {
+    if (value < 1e6) return `${Math.max(0, Math.round(value / 1e3))} КБ`;
+    const [number, unit] = value < 1e9 ? [value / 1e6, "МБ"] : [value / 1e9, "ГБ"];
+    return `${number >= 100 ? Math.round(number) : decimal(number)} ${unit}`;
+  }
+
+  // Строка расхода: имя, метка, «↓ получено · ↑ отправлено» и полоса — доля от самой большой
+  // строки списка.
+  function usageRow(name, tag, item, max, extra = "") {
+    const total = item.up + item.down;
+    const bar = el("span", {});
+    bar.style.width = `${max ? Math.max(1, Math.round((total * 100) / max)) : 0}%`;
+    const title = el("div", { class: "row-title" }, el("span", { text: name, title: name }));
+    if (tag) title.append(el("span", { class: "tag", text: tag }));
+    return el("li", {}, el("div", { class: "row-main" }, title,
+      el("div", { class: "row-sub", text: `↓ ${bytes(item.down)} · ↑ ${bytes(item.up)}${extra}` }),
+      el("span", { class: "usage-bar" }, bar)));
+  }
+
+  function renderUsage() {
+    for (const node of document.querySelectorAll(".usage-period")) {
+      node.setAttribute("aria-pressed", String(node.dataset.days === usageDays));
+    }
+    if (!usage) return;
+    if (usage.error) {
+      $("usage-text").textContent = `Не получилось: ${usage.error}.`;
+      return;
+    }
+    const period = usage.days === 1 ? "Сегодня" : `За ${usage.days} дней, с ${usage.since.split("-").reverse().join(".")}`;
+    $("usage-text").textContent = `${period}: ↓ получено, ↑ отправлено. Устройства — по счётчикам шлюза: всё, что устройство получило и отправило, через VPN и напрямую. Подписки — трафик через их серверы; «учтено подпиской» — с множителями серверов (x10 — вдесятеро), как считает провайдер.`;
+    const devices = usage.devices || [];
+    const deviceMax = Math.max(0, ...devices.map((item) => item.up + item.down));
+    fill($("usage-devices"), devices.map((item) => usageRow(item.name || "Без имени", item.ip, item, deviceMax)),
+      "Данных пока нет: шлюз записывает расход раз в минуту.");
+    const rows = (usage.subscriptions || []).map((item) => [sourceName(item.name), "подписка", item, item.quota
+      ? ` · учтено подпиской ≈ ${bytes(item.billed)} · по данным подписки ${bytes(item.quota.used)} из ${bytes(item.quota.total)}${item.quota.expire ? `, до ${day(item.quota.expire)}` : ""}`
+      : ""]);
+    const pool = usage.pool || { up: 0, down: 0 };
+    if (pool.up || pool.down) rows.push(["Бесплатные серверы", "", pool, ""]);
+    rows.push(["Напрямую (мимо VPN)", "", usage.direct || { up: 0, down: 0 }, ""]);
+    if (usage.wan) {
+      rows.push(["Всего через провайдера (WAN)", "", usage.wan, " · вместе со служебным трафиком VPN"]);
+      rows.push(["Шлюз и служебное", "", usage.gateway, " · WAN минус устройства: сам шлюз, проверки серверов, обновления"]);
+    }
+    const subMax = Math.max(0, ...rows.map(([, , item]) => item.up + item.down));
+    fill($("usage-subs"), rows.map(([name, tag, item, extra]) => usageRow(name, tag, item, subMax, extra)), "Данных пока нет.");
+  }
+
   function renderNetcheck(s) {
     const n = s.netcheck || {};
     fill($("netcheck"), (n.checks || []).map((check) => {
@@ -2004,6 +2090,16 @@
       () => act("freepool/mode", { mode: "observe" }, $("chip")), "Вернуть режим подписок", "primary");
   });
   $("pool-refresh").addEventListener("click", () => act("freepool/refresh", {}, $("pool-refresh")));
+  for (const node of document.querySelectorAll(".usage-period")) {
+    node.addEventListener("click", () => {
+      usageDays = node.dataset.days;
+      try {
+        localStorage.setItem(USAGE_KEY, usageDays);
+      } catch (error) { /* не запомнилось — в следующий раз «Сегодня» */ }
+      renderUsage();
+      if (state) loadUsage(state.now);
+    });
+  }
   $("tab-subs").addEventListener("click", () => showTab("subs"));
   $("tab-pool").addEventListener("click", () => showTab("pool"));
   // Стрелки влево и вправо переключают вкладки, как у вкладок в программах.

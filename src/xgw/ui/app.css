@@ -710,6 +710,12 @@ a.icon-btn { text-decoration: none; }
 .events time { flex: none; width: 5.6rem; color: var(--muted); font-size: .84rem; font-variant-numeric: tabular-nums; }
 .events .row-main { overflow-wrap: anywhere; }
 
+/* Трафик (usage.py): полоса под строкой — доля от самой большой строки списка. */
+.usage .row-sub { white-space: normal; }
+.usage-bar { display: block; height: 4px; margin-top: .35rem; overflow: hidden; border-radius: 2px; background: var(--line); }
+.usage-bar > span { display: block; height: 100%; background: var(--accent); }
+.usage-period[aria-pressed="true"] { border-color: var(--accent); }
+
 .foot { max-width: var(--page); margin: 0 auto; padding: 0 1.3rem 2rem; }
 
 /* --- окна и сообщения ----------------------------------------------------- */

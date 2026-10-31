@@ -35,7 +35,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, cost, engine, fetch, log, priority, rating
+from . import cores, cost, engine, fetch, log, priority, rating, usage
 from . import pin as pinning
 from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
@@ -54,7 +54,7 @@ from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
 from .model import ServerNode
-from .net import tun
+from .net import cmd, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
 from .store import Store
@@ -454,6 +454,10 @@ class Daemon:
         self._freepool_thread: threading.Thread | None = None
         self._freepool_summary: dict | None = None
         self._freepool_force = False
+        # Учёт расхода трафика по устройствам и подпискам (usage.py): nftables — только у
+        # настоящего шлюза (с перехватом), счётчики Xray — всегда.
+        self.meter = usage.Meter(cfg, paths, runner=cmd.run if capture is not None else None,
+                                 logger=self.log)
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
         # sinks — куда доставлять уведомления (рабочий стол); их собирает
         # `xgw run`, в тестах и на стенде получателей нет.
@@ -808,6 +812,15 @@ class Daemon:
         if done:
             self.log.info("%s", done)
 
+    def _usage_step(self, applied: dict | None) -> None:
+        """Учёт расхода трафика (usage.py): раз в минуту — разницы счётчиков nftables и Xray в
+        базу. Счётчики Xray — из ответа /debug/vars этого шага (_read_observatory)."""
+        try:
+            self.meter.step(self.store, self._metrics, applied,
+                            self.inventory.nodes if self.inventory is not None else ())
+        except Exception as exc:  # учёт не должен останавливать шлюз
+            self.log.error("учёт трафика: шаг не выполнен: %s", exc)
+
     def request_freepool_refresh(self) -> None:
         """Панель: опросить источники бесплатного пула сейчас."""
         self._freepool_force = True
@@ -964,6 +977,8 @@ class Daemon:
         self._freepool_thread = previous._freepool_thread
         self._freepool_summary = previous._freepool_summary
         self._freepool_force = previous._freepool_force
+        self.meter = previous.meter
+        self.meter.cfg = self.cfg
         self._calm = dict(previous._calm)
         self._calm_seen = dict(previous._calm_seen)
         self._dead_scanned = dict(previous._dead_scanned)
@@ -1114,6 +1129,7 @@ class Daemon:
             )
         self._whitelist_step(view, signals, state, now)
         self._freepool_step(now)
+        self._usage_step(applied)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False

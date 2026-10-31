@@ -206,6 +206,12 @@ def main(argv: list[str] | None = None) -> int:
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
     )
+    traffic_parser = subparsers.add_parser(
+        "traffic", parents=[common], help="расход трафика по устройствам и подпискам",
+    )
+    traffic_parser.add_argument(
+        "--days", type=int, default=1, help="за сколько дней, включая сегодня (1 — сегодня)",
+    )
     tray_parser = subparsers.add_parser(
         "tray", help="значок XGW в трее рабочего стола (запускается при входе в сеанс)",
     )
@@ -275,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         "pool": _cmd_pool,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
+        "traffic": _cmd_traffic,
     }[args.command]
     try:
         return handler(args, cfg, paths, logger)
@@ -1194,6 +1201,18 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
         "Откройте ссылку в браузере на этой машине. Браузер запомнит вход: дальше панель "
         "открывается ярлыком «XGW» или адресом без токена."
     )
+    return 0
+
+
+def _cmd_traffic(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """Расход трафика по устройствам, подпискам и выходам (usage.py) за --days дней."""
+    from . import usage
+
+    try:
+        found = usage.report(cfg, paths, max(1, args.days))
+    except (OSError, sqlite3.Error) as exc:
+        return _fail(f"учёт трафика не прочитан: {exc} — нужен sudo")
+    print(usage.text(found))
     return 0
 
 

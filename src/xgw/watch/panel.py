@@ -58,6 +58,7 @@ from .. import (
     priority,
     qr,
     tray,
+    usage,
 )
 from .. import pin as pinning
 from .. import tailscale as ts
@@ -777,6 +778,16 @@ class Panel:
             self.log.error("серверы бесплатного пула не прочитаны: %s", exc)
             rows = []
         return {"mode": cfg.free_pool.mode, "region": cfg.free_pool.region, "servers": rows}
+
+    def traffic(self, days: str) -> dict:
+        """Карточка «Трафик»: расход по устройствам, подпискам и выходам (usage.report) за
+        1, 7 или 30 дней. Отдельно от /api/state: страница просит его раз в минуту."""
+        period = int(days) if days in ("1", "7", "30") else 1
+        try:
+            return usage.report(self.cfg, self.paths, period)
+        except (OSError, sqlite3.Error) as exc:
+            self.log.error("учёт трафика не прочитан: %s", exc)
+            return {"days": period, "error": "учёт трафика не прочитан"}
 
     def _cores_card(self, snapshot: dict, now: float) -> dict:
         singbox = snapshot.get("singbox") or {}
@@ -1993,6 +2004,11 @@ class Panel:
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
             self._json(handler, HTTPStatus.OK, self.pool_servers(), body)
+        elif url.path == "/api/traffic":
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._json(handler, HTTPStatus.OK, self.traffic((query.get("days") or ["1"])[0]),
+                       body)
         elif url.path.startswith("/records/"):
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")

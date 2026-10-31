@@ -14,7 +14,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from . import log, managed, tray
+from . import log, managed, tray, usage
 from . import tailscale as ts
 from .config import Config
 from .install import DAEMON_STOP_WAIT, FP_UNIT, UNIT_FILES, XRAY_USER, Journal
@@ -122,6 +122,9 @@ class Uninstaller:
         Capture(
             self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
         ).down(remove_tun=True)
+        # Таблицу учёта трафика (usage.py) ставит демон, а не перехват: её — отдельно.
+        with contextlib.suppress(cmd.CommandError):
+            usage.remove(self.runner)
         return "таблицы nftables, ip rule, маршрут и интерфейс TUN убраны"
 
     def _dnsmasq(self) -> str | None:

@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS scans (
     error TEXT,
     ts REAL
 );
+CREATE TABLE IF NOT EXISTS usage (
+    day TEXT,
+    kind TEXT,
+    key TEXT,
+    up INTEGER NOT NULL DEFAULT 0,
+    down INTEGER NOT NULL DEFAULT 0,
+    billed INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, kind, key)
+);
 """
 
 
@@ -132,6 +141,29 @@ class Store:
     def scans(self) -> dict[str, dict]:
         rows = self.conn.execute("SELECT * FROM scans").fetchall()
         return {row["probe_tag"]: dict(row) for row in rows}
+
+    def add_usage(self, day: str, rows: list[tuple[str, str, int, int, int]]) -> None:
+        """Расход трафика за день (usage.Meter): (вид, ключ, вверх, вниз, учтено подпиской)
+        прибавляется к уже записанному."""
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO usage (day, kind, key, up, down, billed) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(day, kind, key) DO UPDATE SET up = up + excluded.up, "
+                "down = down + excluded.down, billed = billed + excluded.billed",
+                [(day, *row) for row in rows],
+            )
+
+    def usage_since(self, day: str) -> list[dict]:
+        """Суммы расхода с дня day включительно по виду и ключу."""
+        rows = self.conn.execute(
+            "SELECT kind, key, SUM(up) AS up, SUM(down) AS down, SUM(billed) AS billed "
+            "FROM usage WHERE day >= ? GROUP BY kind, key", (day,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_usage(self, before: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM usage WHERE day < ?", (before,))
 
     def prune_scans(self, keep: set[str]) -> None:
         """Убирает сканы узлов, которых больше нет в конфиге."""
