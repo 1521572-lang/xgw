@@ -715,10 +715,12 @@ def _pool_servers(
     как в применённом конфиге, пока они допущены (traffic.choose), и только те, чьё имя
     разрешается в публичные адреса (probe.server_hosts — как у проверок пула: список не
     направит трафик устройства в домашнюю сеть). Через пул никто не идёт (active — ни
-    устройств, ни всего дома, traffic.pool_active) — пусто."""
+    устройств, ни всего дома, traffic.pool_active) — пусто. Серверы, уже стоящие в «pool»,
+    допускаются со старой удачной проверкой до traffic.KEEP (восстановление, М3)."""
     if not active:
         return [], {}
-    found = traffic.admitted(cfg, paths, time.time())
+    members = {info.fingerprint for info in builder.applied_pool(applied)}
+    found = traffic.admitted(cfg, paths, time.time(), members=members)
     kept = {info.fingerprint for info in builder.applied_pool(applied, [s.node for s in found])}
     chosen = traffic.choose(found, kept, exclude={node.fingerprint for node in inventory.nodes},
                             prefer=cfg.managed.free_pool_pin)

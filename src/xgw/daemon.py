@@ -220,6 +220,11 @@ POOL_REBUILD = 600.0
 # Пересборка для пула впереди или ядро ещё не пробовало его серверы — «подключаются», а не
 # «закрыто», но не дольше POOL_WAIT (первые пробы ядра — за интервал probe.interval).
 POOL_WAIT = 120.0
+# Восстановление пула (М3, _pool_silence): сервер «pool» молчит у проб ядра дольше POOL_SILENT —
+# пулу на перепроверку вне очереди (истёкший ключ, ушедший сервер выбывает с первой неудачей, а
+# не через часы); пул закрыт — списки серверов обновляются вне расписания, не чаще POOL_REFRESH.
+POOL_SILENT = 300.0
+POOL_REFRESH = 1800.0
 # Скорость серверов «pool» (_pool_speed_step) — обычным замером (speed.measure, speed.max_mb):
 # экономия их трафика не нужна (решение заказчика 5). Живой сервер без замера — сразу, по одному
 # за шаг; повторный замер — раз в speed.unlimited_hours, при занятом канале пула (больше
@@ -597,6 +602,10 @@ class Daemon:
         self._pool_downlinks: dict[str, tuple[float, int]] = {}
         self._pool_measured: tuple[str, int] = ("", 0)
         self._pool_spared_tag = ""
+        # Восстановление (_pool_silence): с какого времени молчит у проб ядра каждый сервер
+        # «pool» и когда списки обновлялись вне расписания из-за закрытого пула.
+        self._pool_silent: dict[str, float] = {}
+        self._pool_refreshed_at = 0.0
         self.diary = poolstats.Diary(self.store, clock=self.wall)  # дневник пула (М3)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
@@ -962,6 +971,8 @@ class Daemon:
         self._pool_downlinks = dict(previous._pool_downlinks)
         self._pool_measured = previous._pool_measured
         self._pool_spared_tag = previous._pool_spared_tag
+        self._pool_silent = dict(previous._pool_silent)
+        self._pool_refreshed_at = previous._pool_refreshed_at
         self.diary = previous.diary
         self.diary.store = self.store
         self._house_synced_at = previous._house_synced_at
@@ -2633,9 +2644,14 @@ class Daemon:
             self._pool_checked_at = now
             self._pool_due(applied, now)
         pool = builder.applied_pool(applied)
+        # Состав «pool» — пулу сразу, и пока ядро его ещё не пробовало: после запуска демона его
+        # серверы проверяются раньше прочих (FreePool.next_checks, восстановление М3).
+        self.freepool.members = frozenset(
+            info.fingerprint for info in pool) if devices or whole else frozenset()
         self._house_mark(whole)
         if not (devices or whole):
             self._pool_pinned, self._pool_traffic = "", None
+            self._pool_silence([], set(), now)
             self.diary.idle()
             return
         try:
@@ -2663,6 +2679,7 @@ class Daemon:
         if spared is not None:
             alive.append(spared)
         live = {info.tag for info in alive}
+        self._pool_silence(pool, live, now)
         candidates = [self._pool_candidate(info, observatory) for info in alive]
         # Выбранный вручную на вкладке «Бесплатные серверы» — пока жив; молчит или ещё не в
         # составе — сервер выбирает шлюз, как у выбранного вручную сервера подписки.
@@ -2698,6 +2715,12 @@ class Daemon:
             self.notifier.event("freepool", self._pool_change_text("", pool, who))
         if not alive and was_closed is not True:
             self.diary.count("closures")
+        if not alive and now - self._pool_refreshed_at >= POOL_REFRESH:
+            # Закрыто: списки — вне расписания (у источников могли смениться ключи и серверы).
+            self._pool_refreshed_at = now
+            self._freepool_force = True
+            self.diary.count("refreshed")
+            self.log.info("бесплатный пул закрыт — списки серверов обновляются вне расписания")
         self._pool_basis = basis
         name, country = self._pool_names.get(current, ("", ""))
         mbps = next((item.mbps for item in candidates if item.tag == current), None)
@@ -2720,6 +2743,22 @@ class Daemon:
                 **self._pool_speed_view(info),
             } for info in pool],
         }
+
+    def _pool_silence(self, pool: list[NodeInfo], live: set[str], now: float) -> None:
+        """Серверы «pool», что молчат у проб ядра дольше POOL_SILENT, — пулу (FreePool.urgent):
+        их проверка — вне очереди, и с неудачей сервер выбывает из допущенных (_pool_due), а не
+        держит место до traffic.FRESH (восстановление, М3: истёкшие ключи, ушедшие серверы)."""
+        silent = {info.tag: self._pool_silent.get(info.tag, now) for info in pool
+                  if info.tag not in live}
+        self._pool_silent = silent
+        urgent = {info.fingerprint for info in pool
+                  if info.tag in silent and now - silent[info.tag] >= POOL_SILENT}
+        for info in pool:
+            if info.fingerprint in urgent and info.fingerprint not in self.freepool.urgent:
+                self.diary.count("rechecked")
+                self.log.info("сервер пула %s молчит у проб ядра %d мин — перепроверка вне "
+                              "очереди", info.tag, (now - silent[info.tag]) // 60)
+        self.freepool.urgent = frozenset(urgent)
 
     def _pool_candidate(self, info: NodeInfo, observatory: dict) -> speed.Candidate:
         name, country = self._pool_names.get(info.tag, ("", ""))
@@ -2962,9 +3001,11 @@ class Daemon:
         """Допущенные серверы пула против применённого состава «pool»: у устройств закрыто, а
         допущенные есть, или выбранного вручную допущенного сервера нет в составе — сборка не
         чаще POOL_OPEN; сервер выпал из допущенных или есть место для новых — не чаще
-        POOL_REBUILD. Состав выбирает engine.assemble."""
+        POOL_REBUILD. Состав выбирает engine.assemble; стоящие в «pool» допущены со старой удачной
+        проверкой до traffic.KEEP (восстановление, М3)."""
+        members = {info.fingerprint for info in builder.applied_pool(applied)}
         try:
-            found = traffic.admitted(self.cfg, self.paths, now)
+            found = traffic.admitted(self.cfg, self.paths, now, members=members)
         except (OSError, ValueError) as exc:
             self.log.error("бесплатный пул: допущенные серверы не прочитаны: %s", exc)
             return
@@ -2990,6 +3031,8 @@ class Daemon:
         if now - self._pool_rebuilt_at < pause:
             return
         self._pool_rebuilt_at = now
+        if lost:
+            self.diary.count("dropped", len(lost))
         self._urgent_rebuild = self._urgent_rebuild or reason
 
     def _pool_summary(self) -> dict | None:

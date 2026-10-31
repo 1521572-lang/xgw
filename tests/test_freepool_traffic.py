@@ -112,6 +112,49 @@ def test_panel_rows_tell_why_a_pool_server_is_not_admitted(paths):
     assert pool.server_rows(_cfg("off"), paths, NOW) == []
 
 
+def test_pool_member_keeps_its_place_with_an_old_check(paths):
+    """Восстановление (М3): сервер, уже стоящий в «pool», допущен со старой удачной проверкой до
+    traffic.KEEP — после сна шлюза устройства не закрываются, пока проверки догоняют; новый
+    сервер с такой же проверкой — нет."""
+    ids = _pool(paths)
+    member = ids["stale"][:8]
+    assert ids["stale"] not in {item.node.fingerprint
+                                for item in traffic.admitted(_cfg(), paths, NOW)}
+    kept = traffic.admitted(_cfg(), paths, NOW, members={member})
+    assert ids["stale"] in {item.node.fingerprint for item in kept}
+    later = NOW - traffic.FRESH - 1 + traffic.KEEP + 1
+    assert ids["stale"] not in {item.node.fingerprint for item in traffic.admitted(
+        _cfg(), paths, later, members={member})}
+    variant = next(item for item in PoolStore(paths).variants(providers.MAHDIBLAND)
+                   if item.variant_id == ids["stale"])
+    record = PoolStore(paths).candidates()[ids["stale"]]
+    assert traffic.refusal(_cfg(), variant, record, later, member=True) == (
+        "проверка старше 24 ч — ждёт новой")
+
+
+def test_pool_checks_its_servers_and_former_good_ones_first(paths):
+    """Восстановление (М3): сервер «pool», который молчит у проб ядра, проверяется вне
+    расписания, но не чаще URGENT_GAP; когда пора, остальные серверы «pool» и прежде пригодные
+    идут раньше прочих — после перерыва допуск возвращается с них."""
+    ids = _pool(paths)
+    names = {key: name for name, key in ids.items()}
+    clock = [NOW + 600]
+    checker = pool.FreePool(_cfg(), paths, clock=lambda: clock[0])
+    checker.members = frozenset({ids["fast"][:8], ids["ok"][:8]})
+    checker.urgent = frozenset({ids["ok"][:8]})
+
+    def order() -> list[str]:
+        return [names[variant.variant_id] for variant in checker.next_checks(None)]
+
+    assert order() == ["ok", "stale"]  # прочим ещё рано, «stale» — проверка старше 2 ч
+    clock[0] = NOW - 600 + pool.URGENT_GAP - 1
+    assert order() == ["stale"]
+    clock[0] = NOW + pool.LIST_CHECK_EVERY
+    found = order()
+    assert found[:3] == ["ok", "fast", "stale"]
+    assert set(found[3:5]) == {"slow", "named"} and set(found[5:]) == {"us", "dead"}
+
+
 def test_pool_composition_keeps_applied_servers_first():
     """Сборка не перетасовывает «pool»: применённые и ещё допущенные — первыми; сервер,
     совпавший с сервером подписки, — не в пуле."""
@@ -425,8 +468,10 @@ def _daemon(paths):
                         ("_pool_basis", ""), ("_pool_deferred_since", None),
                         ("_pool_bytes", None), ("_pool_own", 0), ("_speed_ran", False),
                         ("_metrics", {}), ("_pool_downlinks", {}), ("_pool_measured", ("", 0)),
-                        ("_pool_spared_tag", "")):
+                        ("_pool_spared_tag", ""), ("_pool_silent", {}),
+                        ("_pool_refreshed_at", 0.0), ("_freepool_force", False)):
         setattr(daemon, name, value)
+    daemon.freepool = SimpleNamespace(members=frozenset(), urgent=frozenset())
     daemon.diary = poolstats.Diary(_Meta(), clock=lambda: daemon.wall())
     return daemon
 
@@ -554,6 +599,48 @@ def test_pinned_pool_server_carrying_traffic_is_not_dead(paths):
     today = daemon.diary.days()[poolstats.day_of(clock[0])]
     assert (today["spared"], today["switch_dead"], today["closures"]) == (1, 1, 1)
     assert today["active_s"] == 40 and "closed_s" not in today
+
+
+def test_silent_pool_server_is_rechecked_out_of_turn(paths):
+    """Восстановление (М3): состав «pool» — пулу, чтобы его серверы проверялись первыми; сервер,
+    молчащий у проб ядра дольше POOL_SILENT, — на перепроверку вне очереди (один раз за
+    эпизод в дневник); ответил — снят. Пул закрыт — списки обновляются вне расписания, не
+    чаще POOL_REFRESH."""
+    from xgw.daemon import POOL_REFRESH, POOL_SILENT
+
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    clock = [NOW]
+    daemon = _daemon(paths)
+    daemon.wall = lambda: clock[0]
+    silent = {a: {"alive": True, "delay": 0.1}, b: {"alive": False}}
+    daemon._pool_step(applied, silent)
+    assert daemon.freepool.members == {"aaaa", "bbbb"} and daemon.freepool.urgent == set()
+    clock[0] += POOL_SILENT
+    daemon._pool_step(applied, silent)
+    assert daemon.freepool.urgent == {"bbbb"}
+    clock[0] += 60
+    daemon._pool_step(applied, silent)
+    assert daemon.freepool.urgent == {"bbbb"}
+    daemon._pool_step(applied, {a: {"alive": True, "delay": 0.1}, b: {"alive": True}})
+    assert daemon.freepool.urgent == set() and daemon._pool_silent == {}
+    assert not daemon._freepool_force
+    closed = {a: {"alive": False}, b: {"alive": False}}
+    daemon._pool_step(applied, closed)
+    assert daemon._freepool_force and daemon._pool_traffic["closed"]
+    daemon._freepool_force = False
+    clock[0] += POOL_REFRESH - 1
+    daemon._pool_step(applied, closed)
+    assert not daemon._freepool_force
+    clock[0] += 1
+    daemon._pool_step(applied, closed)
+    assert daemon._freepool_force
+    today = daemon.diary.days()[poolstats.day_of(clock[0])]
+    assert (today["rechecked"], today["refreshed"]) == (3, 2)  # b, затем a и b у закрытого
+    daemon.cfg.managed.routes = {}
+    daemon._pool_step(applied, closed)
+    assert daemon.freepool.members == set() and daemon.freepool.urgent == set()
 
 
 def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):

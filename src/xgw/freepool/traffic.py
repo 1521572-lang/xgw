@@ -16,6 +16,7 @@ VPN Gate, до М2в — OpenVPN) — отдельным шагом М2б.3 (р�
 from __future__ import annotations
 
 import copy
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from .. import managed
@@ -31,6 +32,11 @@ from .store import PoolStore
 POOL_ROUTE = managed.POOL_ROUTE  # managed.routes[адрес] — устройство через бесплатные серверы
 # Серверы списков перепроверяются раз в 2 часа (pool.LIST_CHECK_EVERY): час — запас на очередь.
 FRESH = 3 * 3600.0
+# Сервер балансировщика «pool» держит место со старой удачной проверкой до KEEP: его
+# перепроверка — первой в очереди (pool.FreePool.next_checks), и после сна или выключения шлюза
+# устройства не закрываются, пока проверки догоняют; живость тем временем видят пробы ядра.
+# Молчит у проб ядра — перепроверяется вне очереди и с неудачей выбывает (М3, восстановление).
+KEEP = 24 * 3600.0
 MEMBERS = 8  # серверов пула в балансировщике «pool» (живых выбирают пробы ядра)
 SOURCE_PREFIX = "pool:"  # ServerNode.source серверов пула: «pool:<источник>»
 
@@ -91,9 +97,11 @@ def _node(variant: Variant, country: str) -> ServerNode:
     )
 
 
-def refusal(cfg: Config, variant: Variant, record: object, now: float) -> str:
+def refusal(cfg: Config, variant: Variant, record: object, now: float, *,
+            member: bool = False) -> str:
     """Почему сервер пула не допущен к трафику устройств; пусто — допущен. record — итог его
-    проверки из candidates.json. Причину показывает панель в строке сервера."""
+    проверки из candidates.json; member — сервер уже в балансировщике «pool» (проверка годна
+    KEEP, а не FRESH). Причину показывает панель в строке сервера."""
     if variant.backend not in (Backend.XRAY, Backend.SINGBOX):
         return "туннели SSTP к трафику устройств — следующим шагом"
     # Только адрес-литерал (публичный IPv4 — разбор списка): сервер добавляется в работающий
@@ -106,8 +114,9 @@ def refusal(cfg: Config, variant: Variant, record: object, now: float) -> str:
         return "ещё не проверялся"
     if str(record.get("verdict") or "") not in ("OK", "SLOW"):
         return "последняя проверка не прошла"
-    if now - float(record.get("checked_at") or 0) > FRESH:
-        return f"проверка старше {int(FRESH // 3600)} ч — ждёт новой"
+    limit = KEEP if member else FRESH
+    if now - float(record.get("checked_at") or 0) > limit:
+        return f"проверка старше {int(limit // 3600)} ч — ждёт новой"
     country = str(record.get("egress_country") or "").upper()
     wanted = wanted_regions(cfg)
     if not any(regions.allowed(country, region) for region in wanted):
@@ -115,10 +124,12 @@ def refusal(cfg: Config, variant: Variant, record: object, now: float) -> str:
     return ""
 
 
-def admitted(cfg: Config, paths: Paths, now: float, *,
-             store: PoolStore | None = None) -> list[TrafficServer]:
-    """Допущенные к трафику серверы пула по порядку выбора (лучшие первыми). Наблюдение
-    выключено — никого: пул тогда не проверяет серверы, и свежих итогов нет."""
+def admitted(cfg: Config, paths: Paths, now: float, *, store: PoolStore | None = None,
+             members: Collection[str] = ()) -> list[TrafficServer]:
+    """Допущенные к трафику серверы пула по порядку выбора (лучшие первыми). members — начала
+    id серверов, уже стоящих в балансировщике «pool» (builder.applied_pool без узлов): их
+    проверка годна KEEP. Наблюдение выключено — никого: пул тогда не проверяет серверы, и
+    свежих итогов нет."""
     if cfg.free_pool.mode == "off":
         return []
     store = store or PoolStore(paths)
@@ -131,7 +142,8 @@ def admitted(cfg: Config, paths: Paths, now: float, *,
                 continue
             key = variant.variant_id
             record = records.get(key)
-            if key in seen or refusal(cfg, variant, record, now):
+            member = any(key.startswith(prefix) for prefix in members)
+            if key in seen or refusal(cfg, variant, record, now, member=member):
                 continue
             assert isinstance(record, dict)
             verdict = str(record.get("verdict") or "")

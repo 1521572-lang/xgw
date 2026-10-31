@@ -46,6 +46,9 @@ CHECK_EVERY = 6 * 3600.0  # проверенный вариант снова —
 # Сервер списка GitHub — чаще: списки обновляются раз в 2–4 часа, серверы живут недолго, а
 # трафик их проверок не бережётся (решение заказчика 28.10.2026).
 LIST_CHECK_EVERY = 2 * 3600.0
+# Сервер балансировщика «pool», который молчит у проб ядра, проверяется вне расписания, но не
+# чаще (восстановление, М3: истёкший ключ или ушедший сервер выбывает с первой неудачей).
+URGENT_GAP = 15 * 60.0
 DAY = 86400.0
 HOUR = 3600.0
 SOURCE_LEASE = DAY  # вариант, которого нет в каталоге дольше суток, новым не назначается (R13)
@@ -59,6 +62,11 @@ class PoolError(Exception):
 
 def _due(seconds: float) -> float:
     return seconds * random.uniform(1.0 - JITTER, 1.0 + JITTER)
+
+
+def _listed(key: str, prefixes: frozenset[str]) -> bool:
+    """id варианта среди начал id (теги pool-<страна>-<начало> рабочего конфига)."""
+    return any(key.startswith(prefix) for prefix in prefixes)
 
 
 class FreePool:
@@ -83,6 +91,10 @@ class FreePool:
         self.sleep = sleep
         self.next_refresh: dict[str, float] = {}
         self.failures: dict[str, int] = {}
+        # Серверы балансировщика «pool» (начала id вариантов) и те из них, что молчат у проб
+        # ядра: их проверки — раньше прочих (next_checks). Ставит демон (Daemon._pool_silence).
+        self.members: frozenset[str] = frozenset()
+        self.urgent: frozenset[str] = frozenset()
         self._lock = threading.Lock()
         self._prune_retired()
 
@@ -241,25 +253,35 @@ class FreePool:
         return any(regions.allowed(country, region) for region in self.wanted_regions())
 
     def next_checks(self, limit: int | None, *, tunnels: bool = False) -> list[Variant]:
-        """Кого проверить сейчас (None — всех по порядку): сначала с подсказкой нужного
-        региона, ещё не проверенных и давно проверенных. Сервер SSTP, у которого проверяли
-        только адрес (REACHABLE, без бэкенда), туннелем проверяется сразу, а не через 6 часов."""
+        """Кого проверить сейчас (None — всех по порядку). Первыми — серверы «pool», которые
+        молчат у проб ядра (urgent): вне расписания, но не чаще URGENT_GAP. Затем, когда им пора,
+        остальные серверы «pool» (members) и прежде пригодные (OK или SLOW в регионе): после сна
+        или выключения шлюза допуск восстанавливается с них, а не с сотен непроверенных (М3).
+        Затем прочие: с подсказкой нужного региона, ещё не проверенные и давно проверенные.
+        Сервер SSTP, у которого проверяли только адрес (REACHABLE, без бэкенда), туннелем
+        проверяется сразу, а не через 6 часов."""
         now = self.clock()
         state = self.store.candidates()
+        members, urgent_ids = self.members, self.urgent
         ready: list[tuple[tuple, Variant]] = []
         for variant in self.variants():
-            record = state.get(variant.variant_id, {})
+            key = variant.variant_id
+            record = state.get(key, {})
             checked = float(record.get("checked_at") or 0.0)
             if tunnels and variant.backend == Backend.SSTP \
                     and record.get("verdict") == "REACHABLE":
                 checked = 0.0
             every = LIST_CHECK_EVERY if variant.provider in providers.LIST_PROVIDERS \
                 else CHECK_EVERY
-            if now - checked < every:
+            urgent = _listed(key, urgent_ids) and now - checked >= URGENT_GAP
+            if not urgent and now - checked < every:
                 continue
+            good = record.get("verdict") in ("OK", "SLOW") and self._in_region(
+                str(record.get("egress_country") or ""))
+            tier = 0 if urgent else 1 if _listed(key, members) else 2 if good else 3
             hint_ok = self._in_region(variant.country_hint)
-            ready.append(((not hint_ok, checked, variant.backend != Backend.XRAY,
-                           variant.variant_id), variant))
+            ready.append(((tier, not hint_ok, checked, variant.backend != Backend.XRAY, key),
+                          variant))
         ready.sort(key=lambda item: item[0])
         return [variant for _key, variant in ready[:limit]]
 

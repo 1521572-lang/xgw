@@ -70,8 +70,10 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
         clock[0] += 20
         diary.tick(closed=False, mbps=54.0)
     for field in ("switch_first", "switch_speed", "switch_dead", "switch_dead", "measured",
-                  "measured", "failed", "spared", "closures"):
+                  "measured", "failed", "spared", "closures", "rechecked", "rechecked",
+                  "refreshed"):
         diary.count(field)
+    diary.count("dropped", 2)
     diary.flush(force=True)
     store.add_usage(DAY, [("pool", "pool", 120_000_000, 3_200_000_000, 3_200_000_000),
                           ("sub", "aaaa1111", 5_000_000, 40_000_000, 40_000_000)])
@@ -87,6 +89,8 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
         "состава 0, вручную 0",
         "  средняя скорость ведущего 54 Мбит/с; замеров 2, не удались 1; проба ядра опоздала под "
         "нагрузкой: 1",
+        "  восстановление: молчащих перепроверено вне очереди 2, выбыло из состава 2, списки "
+        "обновлены при закрытом пуле 1",
         "  трафик через пул ↓ 3,2 ГБ ↑ 120 МБ, через подписку ↓ 40,0 МБ ↑ 5,0 МБ",
     ]
     assert stats.times(3) == "3 раза" and stats.times(12) == "12 раз"

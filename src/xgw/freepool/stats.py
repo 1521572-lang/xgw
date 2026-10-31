@@ -4,7 +4,12 @@
 рейтинга R32 и правила смены по качеству R35 (FREEPOOL-PLAN, «Что остаётся на М3»: «если
 испытания покажут нужду»).
 
-Счётчики копит демон (Daemon._pool_step, _pool_spared, _pool_speed_step) и пишет в meta
+С восстановлением пула (М3) — и сколько молчащих серверов «pool» перепроверено вне очереди
+(rechecked), сколько выбыло из состава (dropped) и сколько раз списки обновлялись вне расписания
+из-за закрытого пула (refreshed).
+
+Счётчики копит демон (Daemon._pool_step, _pool_spared, _pool_speed_step, _pool_silence,
+_pool_due) и пишет в meta
 STATS_META не чаще раза в SAVE_EVERY; `xgw pool stats` печатает их вместе с трафиком пула и
 подписки за те же дни (usage.py). Имён серверов здесь нет — только числа."""
 
@@ -165,5 +170,9 @@ def text(rows: list[dict]) -> str:
                      f"{mbps_text(speed) if speed is not None else '— (не замерялся)'}; замеров "
                      f"{int(row.get('measured', 0))}, не удались {int(row.get('failed', 0))}; "
                      f"проба ядра опоздала под нагрузкой: {int(row.get('spared', 0))}")
+        lines.append(f"  восстановление: молчащих перепроверено вне очереди "
+                     f"{int(row.get('rechecked', 0))}, выбыло из состава "
+                     f"{int(row.get('dropped', 0))}, списки обновлены при закрытом пуле "
+                     f"{int(row.get('refreshed', 0))}")
         lines.append(f"  {traffic}")
     return "\n".join(lines)
