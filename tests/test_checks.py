@@ -186,6 +186,22 @@ def test_connect_fail():
     assert classify(result, 0.1) == "CONNECT_FAIL"
 
 
+def test_no_content_response_ends_without_waiting_for_close():
+    """У ответа 204 тела нет (RFC 9110): закрытия соединения не ждём (проверка YouTube)."""
+    from xgw.watch import checks
+
+    left, right = socket.socketpair()
+    try:
+        right.sendall(b"HTTP/1.1 204 No Content\r\nDate: today\r\n\r\n")
+        started = time.monotonic()
+        result = checks._read_response(left, silence=3.0, deadline=time.monotonic() + 10.0)
+        assert result.ok and result.status == 204 and result.downloaded == 0
+        assert time.monotonic() - started < 1.0
+    finally:
+        left.close()
+        right.close()
+
+
 def test_classify_verdicts():
     ok = DownloadResult(ok=True, downloaded=70000)
     assert classify(ok, 1.0) == "OK"

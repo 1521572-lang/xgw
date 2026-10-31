@@ -470,8 +470,15 @@ def _daemon(paths):
                         ("_metrics", {}), ("_pool_downlinks", {}), ("_pool_measured", ("", 0)),
                         ("_pool_spared_tag", ""), ("_pool_silent", {}),
                         ("_pool_refreshed_at", 0.0), ("_freepool_force", False),
-                        ("_pool_tags", set())):
+                        ("_pool_tags", set()), ("_pool_boot", ""), ("_pool_saved", ""),
+                        ("_pool_speed_ran", False), ("_youtube", {}), ("_youtube_down", None),
+                        ("_youtube_rates", {}), ("_youtube_own", ("", 0)),
+                        ("_youtube_tainted", False), ("_youtube_bg_at", 0.0),
+                        ("_youtube_switches", []), ("_youtube_paused_until", 0.0),
+                        ("_youtube_noted", set()), ("probe_target", ""),
+                        ("_stop", threading.Event()), ("main", None)):
         setattr(daemon, name, value)
+    daemon.store = _Meta()
     daemon.freepool = SimpleNamespace(members=frozenset(), urgent=frozenset())
     daemon.diary = poolstats.Diary(_Meta(), clock=lambda: daemon.wall())
     return daemon
@@ -782,3 +789,140 @@ def test_switching_the_whole_house_on_is_connecting_not_closed(paths):
     daemon.cfg.managed.routes = {}
     daemon._pool_step(applied, {})
     assert not paths.house_file.exists()
+
+
+def _youtube(daemon, key: str, *, state: str = "blocked", fails: int = 2,
+             mbps: float | None = None) -> None:
+    """Итог проверки YouTube сервера (Daemon._youtube_step) — прямо в память демона."""
+    daemon._youtube[key] = {"state": state, "fails": fails, "mbps": mbps, "error": "",
+                            "ts": daemon.wall()}
+
+
+def test_pool_leaves_a_server_youtube_does_not_pass(paths):
+    """Отчёт freepool-recovery2: YouTube через сервер пула буферизовался, и заказчик сменил сервер
+    сам. Через закреплённый YouTube плох две проверки подряд — пул уходит на другой живой, с
+    причиной в событии и в дневнике; одна неудача — не повод; плохи все — сервер прежний."""
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    daemon = _daemon(paths)
+    daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
+    daemon._pool_names = {a: ("Первый", "DE"), b: ("Второй", "DE")}
+    alive = {a: {"alive": True, "delay": 0.1}, b: {"alive": True, "delay": 0.3}}
+    daemon._pool_step(applied, alive)
+    assert daemon._pool_pinned == a
+    _youtube(daemon, "a" * 32, fails=1)
+    daemon._pool_step(applied, alive)
+    assert daemon._pool_pinned == a
+    _youtube(daemon, "a" * 32, state="slow", mbps=1.8)
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", b)
+    assert daemon.events[-1] == (
+        f"бесплатный пул: устройства {DEVICE} идут через «Второй» (DE) — «Первый» тормозит на "
+        "YouTube (1,8 Мбит/с с серверов Google)")
+    assert daemon.diary.days()[poolstats.day_of(NOW)]["switch_youtube"] == 1
+    assert daemon._pool_traffic["servers"][0]["youtube"] == "slow"
+    _youtube(daemon, "b" * 32)
+    daemon._pool_step(applied, alive)
+    assert daemon._pool_pinned == b and len(daemon.events) == 2
+
+
+def test_pool_server_after_restart_is_not_announced_again(paths):
+    """Отчёт freepool-recovery2, дефект 1: после перезапуска демона «весь дом идёт через» писался
+    второй раз для того же сервера, хотя смены не было. Прежний сервер, пока жив, остаётся — без
+    события и без счёта в дневнике, даже если другой отвечает быстрее; дальше — как всегда;
+    прежний молчит — смена с причиной."""
+    from xgw.daemon import POOL_PINNED_META
+
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    daemon = _daemon(paths)
+    daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
+    daemon._pool_boot = daemon._pool_saved = "b" * 32
+    daemon._pool_step(applied, {a: {"alive": True, "delay": 0.1}, b: {"alive": True, "delay": 0.3}})
+    assert daemon.api.calls == [("pin", "pool", b)] and daemon.events == []
+    assert "switch_first" not in daemon.diary.days().get(poolstats.day_of(NOW), {})
+    daemon._pool_step(applied, {a: {"alive": True, "delay": 0.1}, b: {"alive": False}})
+    assert daemon._pool_pinned == a and "«pool-de-bbbb» не отвечает" in daemon.events[-1]
+    assert daemon.store.meta[POOL_PINNED_META] == "a" * 32
+    again = _daemon(paths)
+    again._pool_ids = dict(daemon._pool_ids)
+    again._pool_boot = again._pool_saved = "a" * 32
+    again._pool_step(applied, {a: {"alive": False}, b: {"alive": True, "delay": 0.3}})
+    assert again._pool_pinned == b and len(again.events) == 1
+    assert "«pool-de-aaaa» не отвечает" in again.events[0]
+
+
+def test_youtube_is_checked_through_the_pool_server_that_carries_traffic(paths):
+    """Сервер «pool», через который идёт трафик, проверяется первым — вместе с трафиком клиентов
+    через него (без своей проверки); первая неудача подтверждается через YOUTUBE_RETRY; фоном —
+    другой живой; шаг с замером скорости и следующий за ним — без проверок (счётчики испорчены)."""
+    from xgw import daemon as daemon_module
+    from xgw.watch import youtube
+
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}], "inbounds": [
+        {"tag": f"probe-de-{name}", "port": port,
+         "settings": {"accounts": [{"user": "probe", "pass": "secret"}]}}
+        for name, port in (("aaaa", 20001), ("bbbb", 20002))]}
+    clock = [NOW]
+    daemon = _daemon(paths)
+    daemon.cfg = _cfg("on")
+    daemon.cfg.managed.routes = {}
+    daemon.wall = lambda: clock[0]
+    daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
+    daemon._pool_pinned = b
+    checked = []
+
+    def check(info, password, *, client, measure):
+        checked.append((info.tag, password, round(client, 1), measure))
+        if info.tag == b:
+            return youtube.Verdict(youtube.SLOW, 1.0, 4_000_000)
+        return youtube.Verdict(youtube.OK, 30.0, 4_000_000)
+
+    daemon._youtube_check = check
+    alive = {a: {"alive": True, "delay": 0.1}, b: {"alive": True, "delay": 0.3}}
+
+    def step(seconds: float, downlink: int) -> None:
+        clock[0] += seconds
+        daemon._metrics = {"stats": {"outbound": {b: {"uplink": 0, "downlink": downlink}}}}
+        daemon._youtube_step([], applied, alive, clock[0])
+
+    step(0, 0)
+    assert checked == [(b, "secret", 0.0, True)]
+    assert daemon._youtube["b" * 32]["fails"] == 1 and daemon._youtube_bad("b" * 32) == ""
+    step(20, 54_000_000)  # 50 МБ клиентов за 20 с плюс своя проверка: подтверждение ещё рано
+    assert checked[-1][0] == a
+    step(40, 79_000_000)  # 25 МБ клиентов за 40 с — 5 Мбит/с
+    assert checked[-1] == (b, "secret", 5.0, True)
+    assert daemon._youtube_bad("b" * 32) == (
+        "тормозит на YouTube (1,0 Мбит/с с серверов Google и 5,0 Мбит/с у клиентов)")
+    clock[0] += daemon.cfg.speed.youtube_minutes * 60
+    daemon._pool_speed_ran = True
+    step(20, 79_000_000)
+    daemon._pool_speed_ran = False
+    step(20, 79_000_000)
+    assert len(checked) == 3
+    step(20, 79_000_000)
+    assert len(checked) == 4 and checked[-1][0] == b
+    saved = json.loads(daemon.store.meta[daemon_module.YOUTUBE_META])
+    assert saved["b" * 32]["fails"] == 3 and saved["a" * 32]["state"] == "ok"
+    assert daemon.diary.days()[poolstats.day_of(NOW)]["youtube_slow"] == 3
+
+
+def test_youtube_switches_pause_when_every_server_is_bad(paths):
+    """Три смены из-за YouTube за час — дело не в серверах: смены приостанавливаются на два часа
+    (событие), проверки при этом идут."""
+    from xgw.daemon import YOUTUBE_PAUSE
+
+    daemon = _daemon(paths)
+    _youtube(daemon, "a" * 32)
+    assert daemon._youtube_bad("a" * 32) == "не пропускает YouTube"
+    for _ in range(3):
+        daemon._youtube_switched()
+    assert "смены из-за YouTube приостановлены на 2 ч" in daemon.events[-1]
+    assert daemon._youtube_bad("a" * 32) == ""
+    daemon.wall = lambda: NOW + YOUTUBE_PAUSE
+    _youtube(daemon, "a" * 32)
+    assert daemon._youtube_bad("a" * 32) == "не пропускает YouTube"

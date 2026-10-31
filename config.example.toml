@@ -206,6 +206,21 @@ min_mbps = 12
 cooldown_minutes = 40
 episode_mb = 15
 guard_daily_mb = 300
+# YouTube через сервер, который несёт трафик (основной сервер подписки и сервер бесплатного
+# пула): раз в youtube_minutes шлюз запрашивает youtube_urls (сайт и видеосеть, ответ без тела)
+# и качает 4 МБ из youtube_speed_url (сервер Google). Не ответили или скорость вместе с трафиком
+# клиентов через этот сервер ниже youtube_mbps — две проверки подряд — сервер меняется на
+# другой живой. Остальные живые серверы проверяются реже, чтобы замена была известна заранее;
+# лимитированные — только когда через них идёт трафик и без загрузки файла, x100 — никогда.
+# youtube_mbps = 0 — проверять только доступность; youtube = false — не проверять.
+youtube = true
+youtube_urls = [
+    "https://www.youtube.com/generate_204",
+    "https://redirector.googlevideo.com/generate_204",
+]
+youtube_speed_url = "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz"
+youtube_mbps = 5
+youtube_minutes = 30
 
 [fragment]
 # Дробление ClientHello — обход фильтра, который блокирует соединение по имени сайта

@@ -59,7 +59,7 @@ from .net import cmd, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
 from .store import Store
-from .watch import checks, scan, shadow, speed, status, target
+from .watch import checks, scan, shadow, speed, status, target, youtube
 from .watch import guard as speedguard
 from .watch import hosts as probehosts
 from .watch import resolvers as resolving
@@ -231,6 +231,28 @@ POOL_REFRESH = 1800.0
 # SPEED_BUSY_BPS) ждёт, но не дольше SPEED_FORCE_AFTER. Замеры — в meta POOL_SPEED_META: id
 # варианта → {"mbps", "bytes", "seconds", "error", "ts"}, хранятся SPEED_KEEP.
 POOL_SPEED_META = "pool_speed"
+# Сервер «pool», закреплённый последним (полный id варианта; пусто — пул закрыт или выключен):
+# после перезапуска демона тот же сервер не объявляется заново (отчёт freepool-recovery2,
+# дефект 1: «весь дом идёт через» дважды без смены и без причины).
+POOL_PINNED_META = "pool_pinned"
+# YouTube через сервер (М3, watch/youtube.py, _youtube_step): итоги — в meta YOUTUBE_META, ключ —
+# отпечаток сервера подписки или полный id варианта пула → {"state", "fails", "mbps", "client",
+# "error", "ts"}. Сервер, который несёт трафик, проверяется раз в speed.youtube_minutes, после
+# неудачи — снова через YOUTUBE_RETRY; остальные живые (безлимитные) — раз в YOUTUBE_OTHERS, после
+# неудачи — через YOUTUBE_SUSPECT, и не чаще одного раза в YOUTUBE_GAP. Плох — YOUTUBE_CONFIRM
+# неудач подряд, и итог не старше YOUTUBE_STALE. Смен из-за YouTube YOUTUBE_CAROUSEL_COUNT за
+# YOUTUBE_CAROUSEL — дело, похоже, не в серверах: смены приостанавливаются на YOUTUBE_PAUSE.
+YOUTUBE_META = "youtube"
+YOUTUBE_RETRY = 60.0
+YOUTUBE_OTHERS = 6 * 3600.0
+YOUTUBE_SUSPECT = 600.0
+YOUTUBE_GAP = 120.0
+YOUTUBE_CONFIRM = 2
+YOUTUBE_STALE = 24 * 3600.0
+YOUTUBE_KEEP = 7 * 86400.0
+YOUTUBE_CAROUSEL = 3600.0
+YOUTUBE_CAROUSEL_COUNT = 3
+YOUTUBE_PAUSE = 2 * 3600.0
 # Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
 # HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
 HOUSE_SYNC = 300.0
@@ -608,6 +630,24 @@ class Daemon:
         self._pool_refreshed_at = 0.0
         self._pool_tags: set[str] = set()  # состав «pool» прошлого шага — для «выбыло» дневника
         self.diary = poolstats.Diary(self.store, clock=self.wall)  # дневник пула (М3)
+        # Сервер «pool», закреплённый до запуска демона (POOL_PINNED_META): с ним сверяется только
+        # первое закрепление после запуска.
+        self._pool_boot = self._pool_saved = self.store.get_meta(POOL_PINNED_META) or ""
+        self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
+        # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
+        # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
+        # (тег, байты), шёл ли замер скорости шагом раньше (тогда счётчики им испорчены), когда
+        # была фоновая проверка, смены из-за YouTube за YOUTUBE_CAROUSEL, до каких пор смены
+        # приостановлены и о каком выбранном вручную плохом сервере уже сообщено.
+        self._youtube: dict[str, dict] | None = None
+        self._youtube_down: tuple[float, dict[str, int]] | None = None
+        self._youtube_rates: dict[str, float] = {}
+        self._youtube_own: tuple[str, int] = ("", 0)
+        self._youtube_tainted = False
+        self._youtube_bg_at = 0.0
+        self._youtube_switches: list[float] = []
+        self._youtube_paused_until = 0.0
+        self._youtube_noted: set[str] = set()
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
@@ -981,6 +1021,16 @@ class Daemon:
         self._pool_silent = dict(previous._pool_silent)
         self._pool_refreshed_at = previous._pool_refreshed_at
         self._pool_tags = set(previous._pool_tags)
+        self._pool_boot, self._pool_saved = previous._pool_boot, previous._pool_saved
+        self._youtube = previous._youtube
+        self._youtube_down = previous._youtube_down
+        self._youtube_rates = dict(previous._youtube_rates)
+        self._youtube_own = previous._youtube_own
+        self._youtube_tainted = previous._youtube_tainted
+        self._youtube_bg_at = previous._youtube_bg_at
+        self._youtube_switches = list(previous._youtube_switches)
+        self._youtube_paused_until = previous._youtube_paused_until
+        self._youtube_noted = set(previous._youtube_noted)
         self.diary = previous.diary
         self.diary.store = self.store
         self._house_synced_at = previous._house_synced_at
@@ -1115,7 +1165,7 @@ class Daemon:
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
-        self._scanned = self._speed_ran = False
+        self._scanned = self._speed_ran = self._pool_speed_ran = False
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
@@ -1326,6 +1376,7 @@ class Daemon:
         self._main_step(view, applied, observatory or {}, state, signals, now)
         if signals.xray_ok and not changed:  # после перезапуска Xray пробы ядра устарели
             self._pool_speed_step(applied, observatory or {}, now)
+            self._youtube_step(view, applied, observatory or {}, now)
         if state is not State.WAN_DOWN:
             self._cores_step()
             self._netmon_step(signals.xray_ok)
@@ -2654,7 +2705,8 @@ class Daemon:
         pool = builder.applied_pool(applied)
         self._house_mark(whole)
         if not (devices or whole):
-            self._pool_pinned, self._pool_traffic = "", None
+            self._pool_pinned, self._pool_traffic, self._pool_boot = "", None, ""
+            self._pool_remember("")
             self._pool_silence([], set(), now)
             self._pool_tags = set()
             self.diary.idle()
@@ -2691,14 +2743,31 @@ class Daemon:
             alive.append(spared)
         live = {info.tag for info in alive}
         self._pool_silence(pool, live, now)
+        if not self._pool_pinned and self._pool_boot:
+            # Демон только запущен: закреплённый до запуска сервер (POOL_PINNED_META) — нынешний.
+            # Жив — закрепляется снова без смены и без события (отчёт freepool-recovery2, дефект 1:
+            # «весь дом идёт через» второй раз и выбор лучшего заново); молчит — смена с причиной.
+            self._pool_pinned = next((info.tag for info in pool
+                                      if self._pool_ids.get(info.tag) == self._pool_boot), "")
+            self._pool_boot = ""
+            if self._pool_pinned in live:
+                self._pool_since = now
+                self.log.info("бесплатный пул после запуска демона — через прежний %s",
+                              self._pool_pinned)
         candidates = [self._pool_candidate(info, observatory) for info in alive]
+        # YouTube (_youtube_step): сервер, через который YouTube не проходит или тормозит, не
+        # выбирается, пока есть другие живые; плохи все — выбор как без проверки.
+        fine = [item for item in candidates if not self._youtube_bad(item.key)]
+        why = ""
+        if fine and len(fine) < len(candidates) and self._pool_pinned in live:
+            why = self._youtube_bad(self._pool_ids.get(self._pool_pinned, ""))
         # Выбранный вручную на вкладке «Бесплатные серверы» — пока жив; молчит или ещё не в
         # составе — сервер выбирает шлюз, как у выбранного вручную сервера подписки.
         pin = self.cfg.managed.free_pool_pin
         wanted = traffic.pinned(alive, pin)
         manual = "on" if wanted is not None else "down" if pin else ""
         current, slower, basis = self._pool_choice(
-            candidates, wanted.tag if wanted is not None else "", now)
+            fine or candidates, wanted.tag if wanted is not None else "", now)
         if current != self._pool_pinned or (current and key != self._pool_pin_key):
             try:
                 if current:
@@ -2712,15 +2781,18 @@ class Daemon:
                 self._pool_since = now
                 chosen = next((item for item in candidates if item.tag == current), None)
                 lost = self._pool_pinned if current and manual != "on" and slower is None else ""
-                gone = "" if not lost else (
+                gone = "" if not lost else "youtube" if why else (
                     "dead" if any(info.tag == lost for info in pool) else "left")
                 self.notifier.event("freepool", self._pool_change_text(
                     current, pool, who, manual, chosen=chosen, slower=slower,
-                    lost="" if manual else lost, gone=gone))
+                    lost="" if manual else lost, gone=gone, why=why))
                 if current:
                     self.diary.count("switch_" + (
                         "manual" if manual == "on" else "speed" if slower is not None
                         else gone or "first"))
+                if gone == "youtube":
+                    self._youtube_switched()
+                self._pool_remember(self._pool_ids.get(current, ""))
             self._pool_pinned, self._pool_pin_key = current, key
         elif not alive and was_closed is not True:
             self.notifier.event("freepool", self._pool_change_text("", pool, who))
@@ -2747,11 +2819,12 @@ class Daemon:
             "manual": manual,
             # Серверы балансировщика «pool» для строк вкладки «Бесплатные серверы»: id — начало
             # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра, скорость —
-            # по свежему замеру (_pool_speed_step).
+            # по свежему замеру (_pool_speed_step), YouTube — по последней проверке (_youtube_step).
             "servers": [{
                 "id": info.fingerprint, "tag": info.tag, "alive": info.tag in live,
                 "delay_ms": round(((observatory.get(info.tag) or {}).get("delay") or 0) * 1000),
                 **self._pool_speed_view(info),
+                **self._youtube_view(self._pool_ids.get(info.tag, "")),
             } for info in pool],
         }
 
@@ -2925,6 +2998,7 @@ class Daemon:
             (observatory.get(item.tag) or {}).get("delay") or 1e9, item.tag))
         result = speed.measure(info, self.cfg, probe_pass=password,
                                max_mb=speed.size_mb(self.cfg, 0.0), cancel=self._stop)
+        self._pool_speed_ran = True
         self._pool_own += result.bytes_read
         self._pool_measured = (info.tag, result.bytes_read)
         if result.mbps is None and self.stopping:
@@ -2947,6 +3021,231 @@ class Daemon:
         else:
             self.log.info("замер скорости %s: %s, %d байт за %.1f с", info.tag,
                           speed.mbps_text(result.mbps), result.bytes_read, result.seconds)
+
+    def _pool_remember(self, variant: str) -> None:
+        """Закреплённый сервер «pool» — в базу (POOL_PINNED_META), когда он сменился."""
+        if variant != self._pool_saved:
+            self._pool_saved = variant
+            self.store.set_meta(POOL_PINNED_META, variant)
+
+    # --- YouTube через сервер (М3, watch/youtube.py) -----------------------------------
+
+    def _youtube_records(self) -> dict[str, dict]:
+        if self._youtube is None:
+            try:
+                loaded = json.loads(self.store.get_meta(YOUTUBE_META) or "{}")
+            except ValueError:
+                loaded = {}
+            self._youtube = {
+                str(key): value for key, value in loaded.items() if isinstance(value, dict)
+            } if isinstance(loaded, dict) else {}
+        return self._youtube
+
+    def _youtube_record(self, key: str) -> dict | None:
+        """Итог последней проверки сервера, если он не старше YOUTUBE_STALE."""
+        record = self._youtube_records().get(key) if key else None
+        if record is None or self.wall() - float(record.get("ts") or 0) > YOUTUBE_STALE:
+            return None
+        return record
+
+    def _youtube_bad(self, key: str) -> str:
+        """Чем сервер плох для YouTube (youtube.problem): YOUTUBE_CONFIRM неудач подряд, итог не
+        старше YOUTUBE_STALE. Пусто — годен, не проверялся, проверка выключена или смены из-за
+        YouTube приостановлены (_youtube_switched)."""
+        if not self.cfg.speed.youtube or self.wall() < self._youtube_paused_until:
+            return ""
+        record = self._youtube_record(key)
+        if record is None or int(record.get("fails") or 0) < YOUTUBE_CONFIRM:
+            return ""
+        return youtube.problem(record)
+
+    def _youtube_view(self, key: str) -> dict:
+        """YouTube через сервер для сводки: итог последней проверки и скорость с серверов Google."""
+        record = self._youtube_record(key)
+        if record is None:
+            return {}
+        mbps = record.get("mbps")
+        return {"youtube": record.get("state"),
+                **({"youtube_mbps": mbps} if isinstance(mbps, (int, float)) else {})}
+
+    def _youtube_switched(self) -> None:
+        """Смена сервера из-за YouTube. YOUTUBE_CAROUSEL_COUNT смен за YOUTUBE_CAROUSEL — YouTube
+        плох через все серверы подряд, дело не в них (сбой у Google, сеть самой машины): смены из-за
+        YouTube приостанавливаются на YOUTUBE_PAUSE, проверки идут как шли."""
+        wall = self.wall()
+        self._youtube_switches = [
+            at for at in self._youtube_switches if wall - at < YOUTUBE_CAROUSEL
+        ] + [wall]
+        if len(self._youtube_switches) < YOUTUBE_CAROUSEL_COUNT:
+            return
+        self._youtube_switches = []
+        self._youtube_paused_until = wall + YOUTUBE_PAUSE
+        self.notifier.event(
+            "youtube",
+            f"YouTube плох через {YOUTUBE_CAROUSEL_COUNT} сервера подряд за час — дело, похоже, "
+            f"не в серверах; смены из-за YouTube приостановлены на {YOUTUBE_PAUSE / 3600:.0f} ч",
+        )
+
+    def _youtube_traffic(self, now: float) -> None:
+        """Трафик клиентов через каждый сервер с прошлого шага, Мбит/с: по счётчикам downlink
+        Xray, без своей проверки YouTube прошлого шага."""
+        counters = {
+            tag: down for tag, (_up, down) in usage.outbound_counters(self._metrics).items()
+        }
+        previous, self._youtube_down = self._youtube_down, (now, counters)
+        (own_tag, own), self._youtube_own = self._youtube_own, ("", 0)
+        self._youtube_rates = {}
+        if previous is None or now <= previous[0]:
+            return
+        seconds = now - previous[0]
+        for tag, down in counters.items():
+            delta = down - previous[1].get(tag, down) - (own if tag == own_tag else 0)
+            self._youtube_rates[tag] = max(delta, 0) * 8 / seconds / speed.MB
+
+    def _youtube_main_tag(self, view: list[NodeInfo]) -> str:
+        """Через какой сервер подписки идёт трафик: выбранный вручную (пока отвечает) или
+        основной."""
+        pin = self._manual_pin()
+        if pin is not None and not pin.get("down"):
+            node = pinning.resolve(pin, view)
+            return node.tag if node is not None else ""
+        return self.main["tag"] if self.main is not None else ""
+
+    def _youtube_targets(
+        self, view: list[NodeInfo], applied: dict, observatory: dict,
+    ) -> list[tuple[NodeInfo, str, bool, bool, bool]]:
+        """Кого можно проверить: (узел, ключ итога, несёт ли трафик, замерять ли скорость, сервер
+        пула). Серверы «pool» — пока через пул идёт трафик: живые и закреплённый. Серверы подписки —
+        кроме режима «весь дом» (подписка тогда лишь несущий канал): тот, через кого идёт трафик
+        (лимитированный — без замера скорости: квота), и живые безлимитные участники. x100 и
+        дороже не проверяются: это серверы для LTE, и каждый байт через них — сотня байт квоты."""
+        def alive(info: NodeInfo) -> bool:
+            return bool((observatory.get(info.tag) or {}).get("alive"))
+
+        targets = []
+        if traffic.pool_active(self.cfg):
+            for info in builder.applied_pool(applied):
+                key = self._pool_ids.get(info.tag, "")
+                carries = info.tag == self._pool_pinned
+                if key and info.probe_port and (alive(info) or carries):
+                    targets.append((info, key, carries, True, True))
+        if traffic.whole_house(self.cfg):
+            return targets
+        current = self._youtube_main_tag(view)
+        prices = self._prices()
+        for info in view:
+            price = prices.get(info.fingerprint)
+            if (len(info.fingerprint) < 8 or not info.probe_port or price is None
+                    or price >= speed.SKIP_PRICE):
+                continue
+            carries = info.tag == current
+            if carries or (info.role == "proxy" and price <= 0 and alive(info)):
+                targets.append((info, info.fingerprint, carries, price <= 0, False))
+        return targets
+
+    def _youtube_due(self, key: str, carries: bool) -> bool:
+        """Пора ли проверять: сервер, через который идёт трафик, — раз в speed.youtube_minutes,
+        остальные — раз в YOUTUBE_OTHERS; первая неудача подтверждается раньше (YOUTUBE_RETRY и
+        YOUTUBE_SUSPECT): плохим сервер считается после YOUTUBE_CONFIRM неудач подряд."""
+        record = self._youtube_records().get(key)
+        if record is None:
+            return True
+        age = self.wall() - float(record.get("ts") or 0)
+        confirm = int(record.get("fails") or 0) == 1
+        if carries:
+            return age >= (YOUTUBE_RETRY if confirm else self.cfg.speed.youtube_minutes * 60.0)
+        return age >= (YOUTUBE_SUSPECT if confirm else YOUTUBE_OTHERS)
+
+    def _youtube_step(
+        self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
+    ) -> None:
+        """Проверка YouTube через сервер (watch/youtube.py) — в конце шага, одна за шаг и не в
+        шаге с замером скорости или сразу после него (счётчики трафика им испорчены). Сначала —
+        серверы, через которые идёт трафик (пула, затем подписки); затем фоном остальные живые,
+        не чаще раза в YOUTUBE_GAP: на замену должен быть известен годный. Решают итоги
+        _pool_step (сервер пула) и _main_candidate, _choose_main (основной сервер подписки)."""
+        measured = self._speed_ran or self._pool_speed_ran
+        tainted, self._youtube_tainted = self._youtube_tainted, measured
+        self._youtube_traffic(now)
+        if (not self.cfg.speed.youtube or measured or tainted or self.stopping
+                or self.probe_target):
+            return
+        password, _ports = builder.probe_state(applied)
+        if not password:
+            return
+        records = self._youtube_records()
+        targets = [item for item in self._youtube_targets(view, applied, observatory)
+                   if self._youtube_due(item[1], item[2])]
+        current = [item for item in targets if item[2]]
+        wall = self.wall()
+        if current:
+            target = current[0]
+        elif targets and wall - self._youtube_bg_at >= YOUTUBE_GAP:
+            target = min(targets, key=lambda item: (
+                float((records.get(item[1]) or {}).get("ts") or 0), item[0].tag))
+        else:
+            return
+        info, key, carries, measure, pooled = target
+        client = self._youtube_rates.get(info.tag, 0.0) if carries else 0.0
+        verdict = self._youtube_check(info, password, client=client, measure=measure)
+        if verdict.state == youtube.CANCELLED:
+            return  # проверку прервала остановка демона: о сервере она ничего не говорит
+        self._youtube_own = (info.tag, verdict.bytes_used)
+        if pooled:  # свой трафик — не нагрузка канала пула и не трафик закреплённого
+            self._pool_own += verdict.bytes_used
+            self._pool_measured = (info.tag, verdict.bytes_used)
+        if not carries:
+            self._youtube_bg_at = wall
+        fails = 0 if verdict.state == youtube.OK else int(
+            (records.get(key) or {}).get("fails") or 0) + 1
+        record = {"state": verdict.state, "fails": fails, "mbps": verdict.mbps,
+                  "error": verdict.error, "ts": wall}
+        if client >= 0.1:
+            record["client"] = round(client, 1)
+        records[key] = record
+        for old in [item for item, value in records.items()
+                    if wall - float(value.get("ts") or 0) > YOUTUBE_KEEP]:
+            del records[old]
+        self.store.set_meta(YOUTUBE_META, json.dumps(records, sort_keys=True))
+        self.log.info("YouTube через %s%s: %s", info.tag, " (несёт трафик)" if carries else "",
+                      youtube.summary(verdict))
+        if pooled:
+            self.diary.count("youtube_checked")
+            if verdict.state != youtube.OK:
+                self.diary.count("youtube_" + verdict.state)
+        self._youtube_manual(view, info, key, pooled)
+
+    def _youtube_check(self, info: NodeInfo, password: str, *, client: float,
+                       measure: bool) -> youtube.Verdict:
+        return youtube.check(info, self.cfg, probe_pass=password, client_mbps=client,
+                             speed=measure, cancel=self._stop)
+
+    def _youtube_manual(self, view: list[NodeInfo], info: NodeInfo, key: str,
+                        pooled: bool) -> None:
+        """Выбранный вручную сервер плох для YouTube — событие, раз на сервер, пока он плох: ручной
+        выбор главнее, шлюз его не меняет (как с выходом в домашнюю страну)."""
+        why = self._youtube_bad(key)
+        if not why:
+            self._youtube_noted.discard(key)
+            return
+        if key in self._youtube_noted:
+            return
+        if pooled:
+            if self.cfg.managed.free_pool_pin != key or info.tag != self._pool_pinned:
+                return
+            name = self._pool_names.get(info.tag, ("", ""))[0] or info.tag
+            text = (f"бесплатный пул: выбранный вручную сервер «{name}» {why} — выберите другой на "
+                    "вкладке «Бесплатные серверы» или верните автовыбор")
+        else:
+            pin = self._manual_pin()
+            node = pinning.resolve(pin, view) if pin is not None and not pin.get("down") else None
+            if node is None or node.tag != info.tag:
+                return
+            name = self._node_name(info) or info.tag
+            text = (f"выбранный вручную сервер «{name}» {why} — выберите другой или верните "
+                    "автовыбор: xgw unpin")
+        self._youtube_noted.add(key)
+        self.notifier.event("youtube", text)
 
     def _house_sync(self, applied: dict, now: float) -> None:
         """Рабочий конфиг Xray против режима «весь дом». После перезагрузки `xgw run` снимал
@@ -2979,12 +3278,13 @@ class Daemon:
     def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str,
                           manual: str = "", *, chosen: speed.Candidate | None = None,
                           slower: speed.Candidate | None = None, lost: str = "",
-                          gone: str = "") -> str:
+                          gone: str = "", why: str = "") -> str:
         """who — адреса устройств через пул или «весь дом» (М2б.2); manual — как у сводки
         пула: "on" — сервер выбран вручную, "down" — выбранный вручную молчит; chosen — новый
         закреплённый (скорость по замеру), slower — прежний, если новый его быстрее; lost —
         тег прежнего, если его сменили не по скорости: gone "dead" — он не отвечает, "left" —
-        его больше нет в составе «pool» (отчёт freepool-speed, дефект 1: смена без причины)."""
+        его больше нет в составе «pool» (отчёт freepool-speed, дефект 1: смена без причины),
+        "youtube" — через него плох YouTube, why — чем (youtube.problem)."""
         whole = who == "весь дом"
         subject = "весь дом идёт" if whole else f"устройства {who} идут"
         target = "у всего дома" if whole else f"у устройств {who}"
@@ -2998,7 +3298,8 @@ class Daemon:
                 note = f" — быстрее, чем {speed.describe(slower)}" + note
             elif lost:
                 was = self._pool_names.get(lost, (lost, ""))[0]
-                note = (f" — «{was}» не отвечает" if gone == "dead"
+                note = (f" — «{was}» {why}" if gone == "youtube"
+                        else f" — «{was}» не отвечает" if gone == "dead"
                         else f" — «{was}» больше не в работе") + note
             mbps = chosen.mbps if chosen is not None else None
             return (f"бесплатный пул: {subject} через «{name}»"
@@ -4607,6 +4908,13 @@ class Daemon:
             reason = "не отвечает пробам ядра"
         elif not signals.e2e_ok:
             reason = "загрузка через него не прошла"
+        # YouTube через основной плох (_youtube_step), а есть живой участник, через которого — нет.
+        youtube_why = "" if reason else self._youtube_bad(record["key"])
+        if youtube_why and any(
+            info.tag != member.tag and (observatory.get(info.tag) or {}).get("alive")
+            and not self._youtube_bad(self._speed_key(info)) for info in members
+        ):
+            reason = youtube_why
         if not reason:
             return self._candidate(member, observatory)
         wall = self.wall()
@@ -4618,6 +4926,10 @@ class Daemon:
             "source": record.get("source") or (node.source if node else ""),
         }
         self._set_main(None)
+        if youtube_why and reason == youtube_why:
+            self.notifier.event("main", f"основной сервер {name} {reason} — выбираю другой")
+            self._youtube_switched()
+            return None
         if not dead:  # пробы ядра проходят, а загрузка — нет
             carousel = wall - self._main_failed_at < MAIN_CAROUSEL
             self._main_failed_at = wall
@@ -4683,6 +4995,8 @@ class Daemon:
         Прежний основной отказал — сначала ищется той же страны из другой подписки, потом
         той же страны: без прыжка по странам (ASSUMPTIONS п. 224)."""
         wall = self.wall()
+        # Через кого плох YouTube (_youtube_step) — основным, только если других нет.
+        candidates = [item for item in candidates if not self._youtube_bad(item.key)] or candidates
         rested = [item for item in candidates if self.main_cooldown.get(item.key, 0.0) <= wall]
         lost, self._lost_main = self._lost_main, None
         pool = rested or candidates
@@ -4711,7 +5025,7 @@ class Daemon:
         for info in view:
             if (
                 info.role != "spare" or info.fingerprint in self.home_exits
-                or self._score(info) <= 0
+                or self._score(info) <= 0 or self._youtube_bad(info.fingerprint)
                 or (scans.get(info.probe_tag) or {}).get("verdict") not in REPLACEABLE_VERDICTS
                 or self._is_unstable(info.fingerprint)
             ):
@@ -4739,6 +5053,7 @@ class Daemon:
         pool = [
             item for item in [*alive, *self._spare_candidates(view)]
             if item.key != current.key and self.main_cooldown.get(item.key, 0.0) <= wall
+            and not self._youtube_bad(item.key)
         ]
         rival = speed.best(pool)
         by_delay = record.get("basis") != "speed"

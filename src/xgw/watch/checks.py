@@ -250,6 +250,8 @@ def _read_response(
     if not 200 <= status < 300:
         kind = "proxy" if status == 407 else "http"
         return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}")
+    if status == 204:
+        length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
     started = time.monotonic()
     downloaded = len(rest)

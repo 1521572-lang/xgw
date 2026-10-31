@@ -6,10 +6,12 @@
 
 С восстановлением пула (М3) — и сколько молчащих серверов «pool» перепроверено вне очереди
 (rechecked), сколько выбыло из состава (dropped) и сколько раз списки обновлялись вне расписания
-из-за закрытого пула (refreshed).
+из-за закрытого пула (refreshed). С проверкой YouTube (М3, watch/youtube.py) — сколько раз YouTube
+проверялся через серверы «pool» (youtube_checked), сколько раз сервер его не пропускал
+(youtube_blocked) или тормозил (youtube_slow) и сколько смен было из-за этого (switch_youtube).
 
 Счётчики копит демон (Daemon._pool_step, _pool_spared, _pool_speed_step, _pool_silence,
-_pool_due) и пишет в meta
+_pool_due, _youtube_step) и пишет в meta
 STATS_META не чаще раза в SAVE_EVERY; `xgw pool stats` печатает их вместе с трафиком пула и
 подписки за те же дни (usage.py). Имён серверов здесь нет — только числа."""
 
@@ -31,8 +33,8 @@ SAVE_EVERY = 60.0
 # машины или остановка демона, а не время работы пула.
 STEP_CAP = 120.0
 # Почему сменился ведущий: первый выбор (или после «закрыто»), на более быстрый по замеру,
-# прежний не отвечал, прежнего нет в составе «pool», выбран вручную.
-REASONS = ("first", "speed", "dead", "left", "manual")
+# прежний не отвечал, прежнего нет в составе «pool», выбран вручную, через прежний плох YouTube.
+REASONS = ("first", "speed", "dead", "left", "manual", "youtube")
 
 
 def day_of(ts: float) -> str:
@@ -165,7 +167,7 @@ def text(rows: list[dict]) -> str:
         lines.append(f"  смен сервера {sum(switches.values())}: первый выбор {switches['first']}, "
                      f"на более быстрый {switches['speed']}, прежний не отвечал "
                      f"{switches['dead']}, прежний вне состава {switches['left']}, вручную "
-                     f"{switches['manual']}")
+                     f"{switches['manual']}, через прежний плох YouTube {switches['youtube']}")
         lines.append(f"  средняя скорость ведущего "
                      f"{mbps_text(speed) if speed is not None else '— (не замерялся)'}; замеров "
                      f"{int(row.get('measured', 0))}, не удались {int(row.get('failed', 0))}; "
@@ -174,5 +176,8 @@ def text(rows: list[dict]) -> str:
                      f"{int(row.get('rechecked', 0))}, выбыло из состава "
                      f"{int(row.get('dropped', 0))}, списки обновлены при закрытом пуле "
                      f"{int(row.get('refreshed', 0))}")
+        lines.append(f"  YouTube: проверок {int(row.get('youtube_checked', 0))}, не пропускал "
+                     f"{int(row.get('youtube_blocked', 0))}, тормозил "
+                     f"{int(row.get('youtube_slow', 0))}")
         lines.append(f"  {traffic}")
     return "\n".join(lines)

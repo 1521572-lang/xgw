@@ -71,7 +71,8 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
         diary.tick(closed=False, mbps=54.0)
     for field in ("switch_first", "switch_speed", "switch_dead", "switch_dead", "measured",
                   "measured", "failed", "spared", "closures", "rechecked", "rechecked",
-                  "refreshed"):
+                  "refreshed", "switch_youtube", "youtube_checked", "youtube_checked",
+                  "youtube_checked", "youtube_slow", "youtube_blocked"):
         diary.count(field)
     diary.count("dropped", 2)
     diary.flush(force=True)
@@ -85,12 +86,13 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
         f"{YESTERDAY}: через пул никто не шёл; трафик через пул ↓ 0 КБ ↑ 0 КБ, через подписку "
         "↓ 900 МБ ↑ 1,0 МБ",
         f"{DAY}: через пул 1 ч 0 мин, закрыто 0 с (1 раз)",
-        "  смен сервера 4: первый выбор 1, на более быстрый 1, прежний не отвечал 2, прежний вне "
-        "состава 0, вручную 0",
+        "  смен сервера 5: первый выбор 1, на более быстрый 1, прежний не отвечал 2, прежний вне "
+        "состава 0, вручную 0, через прежний плох YouTube 1",
         "  средняя скорость ведущего 54 Мбит/с; замеров 2, не удались 1; проба ядра опоздала под "
         "нагрузкой: 1",
         "  восстановление: молчащих перепроверено вне очереди 2, выбыло из состава 2, списки "
         "обновлены при закрытом пуле 1",
+        "  YouTube: проверок 3, не пропускал 1, тормозил 1",
         "  трафик через пул ↓ 3,2 ГБ ↑ 120 МБ, через подписку ↓ 40,0 МБ ↑ 5,0 МБ",
     ]
     assert stats.times(3) == "3 раза" and stats.times(12) == "12 раз"

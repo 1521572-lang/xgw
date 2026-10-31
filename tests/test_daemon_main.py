@@ -624,3 +624,29 @@ def test_the_button_measures_a_server_the_background_would_skip(daemon):
     daemon.request_speed_one("spare-zz-0000")
     _step(daemon)
     assert daemon.measured[-1] == first and daemon.speed_one_pending() == []
+
+
+def test_main_leaves_a_server_youtube_does_not_pass(daemon):
+    """Решение заказчика 31.10.2026: через основной не проходит YouTube две проверки подряд —
+    основным становится другой живой участник, с причиной в событии. YouTube плох через всех —
+    основной прежний: интернет важнее YouTube."""
+    from xgw.watch.youtube import BLOCKED, Verdict
+
+    first, second = _start(daemon)
+    daemon.speeds = {first: 30.0, second: 90.0}
+    _settle(daemon)
+    assert daemon.main["tag"] == second
+    daemon.youtube[second] = Verdict(BLOCKED, error="www.youtube.com: TLS: reset")
+    daemon.t += daemon.cfg.speed.youtube_minutes * 60  # прошлая проверка основного устарела
+    for _ in range(10):
+        _step(daemon, 30.0)
+        if daemon.main and daemon.main["tag"] == first:
+            break
+    assert daemon.main["tag"] == first and daemon.api.state.override == first
+    assert any("не пропускает YouTube — выбираю другой" in event
+               for event in _main_events(daemon))
+    daemon.youtube[first] = Verdict(BLOCKED, error="www.youtube.com: TLS: reset")
+    daemon.t += daemon.cfg.speed.youtube_minutes * 60
+    for _ in range(10):
+        _step(daemon, 30.0)
+    assert daemon.main["tag"] == first

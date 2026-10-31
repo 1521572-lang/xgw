@@ -236,6 +236,13 @@ class Probe:
 # User-Agent, без Accept-Encoding): ответ 200, тело целиком (ASSUMPTIONS, п. 185).
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
 DEFAULT_SPEED_FALLBACK = "https://cdn.jsdelivr.net/npm/typescript@5.3.3/lib/typescript.js"
+# Проверка YouTube (watch/youtube.py): сайт и видеосеть отвечают 204 без тела; файл для скорости —
+# неизменяемый архив на dl.google.com (68 972 532 байта, Range понимает). Проверены 31.10.2026.
+DEFAULT_YOUTUBE_URLS = (
+    "https://www.youtube.com/generate_204",
+    "https://redirector.googlevideo.com/generate_204",
+)
+DEFAULT_YOUTUBE_SPEED_URL = "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz"
 
 
 @dataclass
@@ -284,6 +291,16 @@ class Speed:
     cooldown_minutes: int = 40
     episode_mb: int = 15
     guard_daily_mb: int = 300
+    # YouTube через сервер, который несёт трафик (М3, watch/youtube.py): основной сервер подписки
+    # и сервер бесплатного пула раз в youtube_minutes, остальные живые — реже. Не ответили
+    # youtube_urls или скорость с серверов Google (youtube_speed_url, 4 МБ) вместе с трафиком
+    # клиентов ниже youtube_mbps — дважды подряд — сервер сменяется, если есть другой живой.
+    # youtube_mbps = 0 — только доступность; youtube = false — не проверять.
+    youtube: bool = True
+    youtube_urls: list[str] = field(default_factory=lambda: list(DEFAULT_YOUTUBE_URLS))
+    youtube_speed_url: str = DEFAULT_YOUTUBE_SPEED_URL
+    youtube_mbps: int = 5
+    youtube_minutes: int = 30
 
 
 @dataclass
@@ -1072,6 +1089,8 @@ _SPEED_LIMITS = {
     "cooldown_minutes": (1, 1440),
     "episode_mb": (1, 200),
     "guard_daily_mb": (0, 10000),
+    "youtube_mbps": (0, 1000),
+    "youtube_minutes": (5, 1440),
 }
 
 
@@ -1085,7 +1104,7 @@ def _validate_speed(speed: Speed) -> list[str]:
                 f"speed.{name}={value}: допустимо от {low} до {high} — используется {default}"
             )
             setattr(speed, name, default)
-    for name in ("url", "url_fallback"):
+    for name in ("url", "url_fallback", "youtube_speed_url"):
         value = getattr(speed, name).strip()
         if value and urlsplit(value).scheme not in ("http", "https"):
             default = getattr(Speed(), name)
@@ -1094,6 +1113,14 @@ def _validate_speed(speed: Speed) -> list[str]:
         setattr(speed, name, value)
     if not speed.url:
         speed.url, speed.url_fallback = speed.url_fallback, ""
+    urls = [url.strip() for url in speed.youtube_urls if url.strip()]
+    wrong = [url for url in urls if urlsplit(url).scheme not in ("http", "https")]
+    if wrong:
+        warnings.append(f"speed.youtube_urls: не http(s)-адреса пропущены: {', '.join(wrong)}")
+    speed.youtube_urls = [url for url in urls if url not in wrong]
+    if speed.youtube and not speed.youtube_urls:
+        warnings.append("speed.youtube_urls пуст — проверка YouTube выключена")
+        speed.youtube = False
     if speed.every_hours == 0:
         speed.unlimited_hours = speed.limited_hours = 0
         warnings.append(

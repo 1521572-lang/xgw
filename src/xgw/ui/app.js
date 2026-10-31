@@ -43,7 +43,7 @@
     main: "основной сервер", fragment: "дробление ClientHello", profile: "профиль обхода",
     singbox: "sing-box", core: "ядро сервера", dns: "bootstrap-DNS", tailscale: "Tailscale",
     guard: "контроль скорости", cores: "обновление ядер", netcheck: "проверка сети",
-    freepool: "бесплатные серверы",
+    freepool: "бесплатные серверы", youtube: "YouTube",
     HEALTHY: "в порядке", DEGRADED: "часть недоступна", ALL_DEAD: "все недоступны",
     WAN_DOWN: "нет провайдера", XRAY_DOWN: "Xray", LEAK: "утечка",
     PROBE_TARGET_UNREACHABLE: "адрес проверки", RESERVE: "резервный сервер",

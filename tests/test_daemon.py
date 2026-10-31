@@ -23,6 +23,7 @@ from xgw.store import Store
 from xgw.watch.scan import ScanResult
 from xgw.watch.speed import SpeedResult
 from xgw.watch.states import State
+from xgw.watch.youtube import OK, Verdict
 from xgw.xraycore.api import ApiError, BalancerInfo
 
 ALL_LINKS = [*links.FULL_LINKS, links.TROJAN_INSECURE]
@@ -200,6 +201,8 @@ class Harness(Daemon):
         self._before: set[str] = set()
         self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
         self.downlinks: dict[str, int] = {}  # downlink участников (тег → байт, счётчик Xray)
+        self.youtube: dict[str, Verdict] = {}  # тег → итог проверки YouTube (по умолчанию годен)
+        self.youtube_checked: list[str] = []
 
     def _read_observatory(self):
         if self.observatory is None:
@@ -306,6 +309,10 @@ class Harness(Daemon):
 
     def _direct_probe(self):
         return self.direct
+
+    def _youtube_check(self, info, password, *, client, measure):
+        self.youtube_checked.append(info.tag)
+        return self.youtube.get(info.tag, Verdict(OK, 40.0 if measure else None, 4_000_000))
 
     # --- удобства для тестов ---
 
