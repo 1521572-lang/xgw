@@ -161,6 +161,14 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def usage_by_day(self, day: str) -> list[dict]:
+        """Суммы расхода с дня day включительно по дню и виду (дневник пула, freepool/stats.py)."""
+        rows = self.conn.execute(
+            "SELECT day, kind, SUM(up) AS up, SUM(down) AS down FROM usage WHERE day >= ? "
+            "GROUP BY day, kind", (day,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def prune_usage(self, before: str) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM usage WHERE day < ?", (before,))

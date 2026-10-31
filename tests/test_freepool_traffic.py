@@ -11,6 +11,7 @@ import pytest
 from xgw import actions, engine, managed
 from xgw.config import Config
 from xgw.freepool import pool, providers, traffic
+from xgw.freepool import stats as poolstats
 from xgw.freepool.models import ProviderResult, Status
 from xgw.freepool.store import PoolStore
 from xgw.generator import builder, diff
@@ -393,6 +394,19 @@ class _Api:
         self.calls.append(("unpin", balancer))
 
 
+class _Meta:
+    """meta базы в памяти — для дневника пула."""
+
+    def __init__(self):
+        self.meta = {}
+
+    def get_meta(self, key):
+        return self.meta.get(key)
+
+    def set_meta(self, key, value):
+        self.meta[key] = value
+
+
 def _daemon(paths):
     from xgw.daemon import Daemon
 
@@ -409,8 +423,11 @@ def _daemon(paths):
                         ("_pool_wait_since", 0.0), ("_house_synced_at", None),
                         ("_pool_ids", {}), ("_pool_speed", {}), ("_pool_since", 0.0),
                         ("_pool_basis", ""), ("_pool_deferred_since", None),
-                        ("_pool_bytes", None), ("_pool_own", 0), ("_speed_ran", False)):
+                        ("_pool_bytes", None), ("_pool_own", 0), ("_speed_ran", False),
+                        ("_metrics", {}), ("_pool_downlinks", {}), ("_pool_measured", ("", 0)),
+                        ("_pool_spared_tag", "")):
         setattr(daemon, name, value)
+    daemon.diary = poolstats.Diary(_Meta(), clock=lambda: daemon.wall())
     return daemon
 
 
@@ -496,8 +513,47 @@ def test_daemon_moves_the_pool_to_a_faster_server_without_jumping(paths):
                                   "mbps": 100.0, "speed_at": NOW}
     daemon._pool_step(applied, {**alive, b: {"alive": False}})
     assert daemon.api.calls[-1] == ("pin", "pool", c)  # той же страны, хотя A быстрее
-    assert daemon.events[-1].endswith("через «C» (NL), 20 Мбит/с")
+    # Отчёт freepool-speed, дефект 1: смена не по скорости — с причиной.
+    assert daemon.events[-1].endswith("через «C» (NL), 20 Мбит/с — «B» не отвечает")
     assert len(daemon.events) == 4
+    today = daemon.diary.days()[poolstats.day_of(clock[0])]
+    assert (today["switch_first"], today["switch_speed"], today["switch_dead"]) == (1, 2, 1)
+
+
+def test_pinned_pool_server_carrying_traffic_is_not_dead(paths):
+    """Отчёт freepool-speed, дефект 1: пробы ядра сочли закреплённый мёртвым, а через него идёт
+    трафик (проба опоздала в забитом канале) — он остаётся; свой замер через него — не трафик
+    клиентов: без трафика он сменяется, и событие называет причину."""
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    clock = [NOW]
+    daemon = _daemon(paths)
+    daemon.wall = lambda: clock[0]
+
+    def load(downlink):
+        daemon._metrics = {"stats": {"outbound": {a: {"uplink": 0, "downlink": downlink}}}}
+
+    load(0)
+    daemon._pool_step(applied, {a: {"alive": True, "delay": 0.1},
+                                b: {"alive": True, "delay": 0.3}})
+    assert daemon.api.calls == [("pin", "pool", a)]
+    dead = {a: {"alive": False}, b: {"alive": True, "delay": 0.3}}
+    clock[0] += 20
+    load(5_000_000)  # 2,5 МБ за 10 с — больше watchdog.busy_bytes
+    daemon._pool_step(applied, dead)
+    assert daemon.api.calls == [("pin", "pool", a)]
+    assert daemon._pool_traffic["alive"] == 2 and daemon._pool_traffic["servers"][0]["alive"]
+    daemon._pool_measured = (a, 5_000_000)  # весь прирост — свой замер
+    clock[0] += 20
+    load(10_000_000)
+    daemon._pool_step(applied, dead)
+    assert daemon.api.calls[-1] == ("pin", "pool", b)
+    assert daemon.events[-1].endswith("через «pool-de-bbbb» — «pool-de-aaaa» не отвечает")
+    daemon._pool_step(applied, {a: {"alive": False}, b: {"alive": False}})
+    today = daemon.diary.days()[poolstats.day_of(clock[0])]
+    assert (today["spared"], today["switch_dead"], today["closures"]) == (1, 1, 1)
+    assert today["active_s"] == 40 and "closed_s" not in today
 
 
 def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):

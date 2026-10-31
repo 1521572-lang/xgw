@@ -189,6 +189,12 @@ def main(argv: list[str] | None = None) -> int:
                     "«Бесплатные серверы»); auto — выбирает шлюз",
     )
     pool_pin.add_argument("server", help="id сервера пула (не короче 6 знаков) или auto")
+    pool_stats = pool_sub.add_parser(
+        "stats", help="дневник пула по дням: сколько трафик шёл через пул и было закрыто, смены "
+                      "сервера и почему, скорость, замеры, трафик",
+    )
+    pool_stats.add_argument("--days", type=int, default=2,
+                            help="за сколько дней, включая сегодня (по умолчанию 2)")
     # Агент поколения туннеля SSTP — его запускает служба xgw-fp@<gen> (freepool/agent.py).
     pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
     pool_agent.add_argument("gen")
@@ -1096,6 +1102,16 @@ def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
             return _fail(outcome.text, outcome.code)
         logger.info("%s", outcome.text)
         print(outcome.text + ". Демон применит выбор на ближайшем шаге")
+        return 0
+    if args.pool_action == "stats":
+        from .freepool import stats as poolstats
+
+        try:
+            with actions.open_store(paths) as store:
+                rows = poolstats.report(store, max(1, args.days))
+        except (OSError, sqlite3.Error) as exc:
+            return _fail(f"дневник пула не прочитан: {exc} — нужен sudo")
+        print(poolstats.text(rows))
         return 0
     from .freepool import backend as backending
     from .freepool import pool as pooling
