@@ -35,7 +35,7 @@ def test_no_file_means_nothing_added(conf):
          "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
          "kernel_devices": [], "core": {},
          "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
-         "free_pool_mode": None}, "")
+         "free_pool_mode": None, "free_pool_pin": ""}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -100,6 +100,7 @@ def test_junk_inside_the_file_is_ignored(conf):
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
         # бесплатный пул из панели не включали
         "free_pool_mode": None,
+        "free_pool_pin": "",
     }
 
 

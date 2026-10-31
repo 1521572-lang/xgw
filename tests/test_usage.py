@@ -124,7 +124,9 @@ def test_meter_writes_deltas_by_device_subscription_and_exit(paths):
     assert not meter.step(store, metrics(100, 1000, 0, 0, 0), applied, nodes)
     assert len(nft.loads) == 1 and "xgw_acct" in nft.loads[0]  # таблица учёта поставлена
     clock[0] += usage.USAGE_EVERY - 1
-    assert not meter.step(store, metrics(9e9, 9e9, 0, 0, 0), applied, nodes)  # рано
+    # Счётчики Xray — каждый шаг (копятся до записи), nftables и запись — раз в минуту.
+    assert not meter.step(store, metrics(150, 1500, 0, 0, 0), applied, nodes)
+    assert store.usage_since("2000-01-01") == []  # до записи ничего; старое убрано сразу
     clock[0] = NOW + usage.USAGE_EVERY
     nft.listing = _nft_json({"192.168.50.20": 1000}, {"192.168.50.20": 5000}, 8000, 3000)
     assert meter.step(store, metrics(300, 2000, 400, 700, 60), applied, nodes)
@@ -155,6 +157,23 @@ def test_meter_writes_deltas_by_device_subscription_and_exit(paths):
     assert found["subscriptions"][1]["quota"] is None
     printed = usage.text(found)
     assert "phone (192.168.50.20)" in printed and "учтено подпиской" in printed
+    store.close()
+
+
+def test_meter_keeps_traffic_of_an_outbound_removed_between_writes(paths):
+    """Отчёт usage: 26,8 МБ из 30 у подписки. Сервер пересобрали между записями — его outbound и
+    счётчик пропали; отсчёт на каждом шаге демона успел взять его трафик."""
+    clock = [NOW]
+    meter = usage.Meter(Config(), paths, runner=None, clock=lambda: clock[0])
+    store = Store(paths.db_file)
+    meter.step(store, {"stats": {"outbound": {"direct": {"uplink": 0, "downlink": 0}}}}, None, ())
+    clock[0] += 30
+    meter.step(store, {"stats": {"outbound": {"direct": {"uplink": 0, "downlink": 500}}}},
+               None, ())
+    clock[0] += usage.USAGE_EVERY
+    assert meter.step(store, {"stats": {"outbound": {}}}, None, ())  # outbound убран
+    assert store.usage_since("2000-01-01") == [
+        {"kind": usage.DIRECT, "key": usage.DIRECT, "up": 0, "down": 500, "billed": 0}]
     store.close()
 
 

@@ -16,11 +16,13 @@ policy.system.statsOutbound*): тег → сервер → его подписк
 бесплатные серверы, direct — напрямую мимо VPN. «Учтено подпиской» — байты, умноженные на
 множитель сервера (x10 — вдесятеро): так считает провайдер с квотой.
 
-Счётчики накопительные — с запуска Xray или с появления элемента набора. Демон раз в
-USAGE_EVERY берёт разницу с прошлым отсчётом. Значение меньше прошлого означает сброс
-(перезапуск Xray, истёкший элемент набора, пересозданная таблица), и тогда разница — само
-значение. Первый отсчёт после запуска демона — только база: счётчики Xray копились и до него,
-а записанное прошлым запуском повторять нельзя (теряется не больше USAGE_EVERY). В базу
+Счётчики накопительные — с запуска Xray или с появления элемента набора. Демон берёт разницу с
+прошлым отсчётом: у Xray — каждый шаг (счётчик убранного outbound'а пропадает вместе с ним), у
+nftables — раз в USAGE_EVERY, тогда же накопленное пишется в базу. Значение меньше прошлого
+означает сброс (перезапуск Xray, истёкший элемент набора), и тогда разница — само значение.
+Первый отсчёт Xray после запуска демона — только база: счётчики копились и до него, а
+записанное прошлым запуском повторять нельзя; таблицу учёта новый демон ставит заново, и её
+счётчики идут с нуля. Теряется не больше USAGE_EVERY — незаписанное к остановке демона. В базу
 состояния (state.db, таблица usage) пишутся суммы по дням: день, вид, ключ, байт вверх и вниз,
 учтено подпиской. Хранятся USAGE_DAYS дней.
 """
@@ -137,53 +139,71 @@ def today(clock: Callable[[], float] = time.time) -> str:
 
 class Meter:
     """Отсчёты счётчиков и запись разниц в базу (Daemon._usage_step). Переходит к новому
-    демону при перечитывании настроек (Daemon._resume) вместе с прошлыми отсчётами."""
+    демону при перечитывании настроек (Daemon._resume) вместе с прошлыми отсчётами и
+    накопленным, но ещё не записанным."""
 
     def __init__(self, cfg: Config, paths: Paths, *, runner: cmd.Runner | None = cmd.run,
                  clock: Callable[[], float] = time.time, logger=None) -> None:
         """runner None — без nftables (демон без перехвата, тесты): только счётчики Xray."""
         self.cfg, self.paths, self.runner, self.clock, self.log = cfg, paths, runner, clock, logger
         self._table = ""  # текст таблицы учёта, которую поставил этот демон
-        self._last: dict[str, int] | None = None  # прошлые отсчёты: id счётчика → байт
+        # Прошлые отсчёты (id счётчика → байт); None — отсчётов ещё не было (первый — база).
+        self._xray_last: dict[str, int] | None = None
+        self._nft_last: dict[str, int] | None = None
+        self._pending: dict[tuple[str, str], list[int]] = {}  # (вид, ключ) → вверх, вниз, учтено
         self._next = 0.0
         self._pruned = ""
         self._warned = ""
 
     def step(self, store: Store, metrics: Mapping, applied: Mapping | None,
              nodes: Sequence) -> bool:
-        """Отсчёт раз в USAGE_EVERY. True — разницы записаны в базу."""
+        """Счётчики Xray — на каждом шаге демона: outbound пересобранного или убранного сервера
+        пропадает вместе со счётчиком, и чем реже отсчёт, тем больше его трафика теряется (отчёт
+        usage: 26,8 МБ из 30 у подписки). nftables и запись накопленного в базу — раз в
+        USAGE_EVERY. True — записано."""
+        readings, owners = self._xray(metrics, applied, nodes)
+        self._add(self._xray_last, readings, owners)
+        self._xray_last = readings
         now = self.clock()
         if now < self._next:
             return False
         self._next = now + USAGE_EVERY
-        readings, owners, labels = self._read(metrics, applied, nodes)
-        last, self._last = self._last, readings
-        if last is None:
-            return False  # первый отсчёт — база
-        sums: dict[tuple[str, str], list[int]] = {}
-        for ident, value in readings.items():
-            before = last.get(ident, 0)
-            delta = value - before if value >= before else value
-            if delta <= 0:
-                continue
-            kind, key, direction, factor = owners[ident]
-            row = sums.setdefault((kind, key), [0, 0, 0])
-            row[0 if direction == "up" else 1] += delta
-            row[2] += round(delta * factor)
+        labels: dict[str, dict] = {}
+        counted = self._devices()
+        if counted is not None:
+            readings, owners, labels = counted
+            self._add(self._nft_last, readings, owners)
+            self._nft_last = readings
         day = today(self.clock)
-        if sums:
-            store.add_usage(day, [(kind, key, *row) for (kind, key), row in sorted(sums.items())])
+        rows = [(kind, key, *row) for (kind, key), row in sorted(self._pending.items())]
+        self._pending = {}
+        if rows:
+            store.add_usage(day, rows)
         if labels:
             self._save_labels(store, labels)
         if self._pruned != day:
             self._pruned = day
             before = datetime.date.fromisoformat(day) - datetime.timedelta(days=USAGE_DAYS)
             store.prune_usage(before.isoformat())
-        return bool(sums)
+        return bool(rows)
 
-    def _read(self, metrics: Mapping, applied: Mapping | None, nodes: Sequence):
-        """Текущие отсчёты: id → байт, id → (вид, ключ, направление, множитель), подписи
-        устройств."""
+    def _add(self, last: dict[str, int] | None, readings: dict[str, int],
+             owners: dict[str, tuple[str, str, str, float]]) -> None:
+        """Разницы с прошлым отсчётом — в накопленное; прошлого нет — это база."""
+        if last is None:
+            return
+        for ident, value in readings.items():
+            before = last.get(ident, 0)
+            delta = value - before if value >= before else value
+            if delta <= 0:
+                continue
+            kind, key, direction, factor = owners[ident]
+            row = self._pending.setdefault((kind, key), [0, 0, 0])
+            row[0 if direction == "up" else 1] += delta
+            row[2] += round(delta * factor)
+
+    def _xray(self, metrics: Mapping, applied: Mapping | None, nodes: Sequence):
+        """Счётчики outbound'ов Xray: id → байт, id → (вид, ключ, направление, множитель)."""
         readings: dict[str, int] = {}
         owners: dict[str, tuple[str, str, str, float]] = {}
         infos = {info.tag: info for info in builder.applied_nodes(applied, nodes)}
@@ -203,6 +223,13 @@ class Meter:
             for direction, value in (("up", up), ("down", down)):
                 ident = f"xray:{tag}:{direction}"
                 readings[ident], owners[ident] = value, (kind, key, direction, factor)
+        return readings, owners
+
+    def _devices(self):
+        """Счётчики nftables: id → байт, id → (вид, ключ, направление, 0), подписи устройств;
+        None — в этом отсчёте их нет."""
+        readings: dict[str, int] = {}
+        owners: dict[str, tuple[str, str, str, float]] = {}
         labels: dict[str, dict] = {}
         counted = self._nft()
         if counted is not None:
@@ -219,7 +246,8 @@ class Meter:
                 if name in named:
                     ident = f"nft:{name}"
                     readings[ident], owners[ident] = named[name], (WAN, WAN, direction, 0.0)
-        return readings, owners, labels
+            return readings, owners, labels
+        return None
 
     def _nft(self) -> tuple[dict[str, int], dict[str, int], dict[str, int]] | None:
         """Счётчики таблицы учёта; таблицы нет или она устарела (сменились LAN или WAN) —
@@ -239,7 +267,9 @@ class Meter:
             if wanted != self._table:
                 self.runner(["nft", "-f", "-"], input=wanted)
                 self._table = wanted
-                return None  # новые счётчики — с нуля; читать их будем следующим отсчётом
+                # Таблица новая — её счётчики с нуля: следующий отсчёт считается целиком.
+                self._nft_last = {}
+                return None
             return parse(self.runner(["nft", "-j", "list", "table", "ip", TABLE]))
         except (cmd.CommandError, OSError, ValueError) as exc:
             self._table = ""  # таблица пропала или не встала — поставить снова в следующий раз

@@ -1753,6 +1753,12 @@
   function poolRow(item, s) {
     const { row, live } = item;
     const title = el("div", { class: "row-title" }, el("span", { text: row.name, title: row.name }));
+    const pinned = row.id === ((s.free_pool || {}).pin || "");
+    if (pinned) {
+      title.append(el("span", (poolFlow(s) || {}).manual === "down"
+        ? { class: "tag warn", text: "выбран · не отвечает", title: "Выбран вручную, но молчит или ещё не в балансировщике: пока трафик ведёт выбранный шлюзом" }
+        : { class: "tag on", text: "выбран вручную", title: "Трафик бесплатного пула идёт через этот сервер, пока он отвечает" }));
+    }
     if (item.current) {
       title.append(el("span", { class: "tag on", text: "сейчас через", title: "Устройства, пущенные через бесплатные серверы, идут через этот сервер" }));
     } else if (live) {
@@ -1774,13 +1780,34 @@
     const verdictTone = poolVerdict(row)[0];
     const tone = live ? (live.alive ? "ok" : "bad") : verdictTone === "none" ? "" : verdictTone;
     const classes = ["server"];
-    if (item.current) classes.push("selected");
+    if (item.current || pinned) classes.push("selected");
     if (!row.checked_at) classes.push("off");
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
       el("div", { class: "values" }, poolValue(item, s)),
-      el("div", { class: "row-sub", text: poolNote(item, s) }));
+      el("div", { class: "row-sub", text: poolNote(item, s) }),
+      el("div", { class: "row-tools" }, poolChoose(row, s, pinned)));
+  }
+
+  // Ручной выбор сервера пула (п. 272), как «Выбрать» у серверов подписок: трафик пула — через
+  // него, пока он отвечает; молчит — через выбранный шлюзом. Выбрать можно только допущенный.
+  function poolChoose(row, s, pinned) {
+    const flow = poolFlow(s);
+    if (pinned) {
+      return el("button", {
+        class: "btn small-btn choose", type: "button", text: "Автовыбор",
+        title: "Сервер бесплатного пула снова выбирает шлюз",
+        onclick: (event) => act("freepool/pin", { id: "" }, event.currentTarget),
+      });
+    }
+    if (row.why || !flow) return null;
+    return el("button", {
+      class: "btn small-btn choose", type: "button", text: "Выбрать",
+      title: `Трафик бесплатного пула — через «${row.name}», пока он отвечает`,
+      "aria-label": `Выбрать ${row.name}`,
+      onclick: (event) => act("freepool/pin", { id: row.id }, event.currentTarget),
+    });
   }
 
   // Блок источника живёт между перерисовками — раскрытые списки не схлопываются.

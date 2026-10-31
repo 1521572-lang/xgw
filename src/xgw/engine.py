@@ -720,7 +720,8 @@ def _pool_servers(
         return [], {}
     found = traffic.admitted(cfg, paths, time.time())
     kept = {info.fingerprint for info in builder.applied_pool(applied, [s.node for s in found])}
-    chosen = traffic.choose(found, kept, exclude={node.fingerprint for node in inventory.nodes})
+    chosen = traffic.choose(found, kept, exclude={node.fingerprint for node in inventory.nodes},
+                            prefer=cfg.managed.free_pool_pin)
     ready: list[traffic.TrafficServer] = []
     hosts: dict[str, list[str]] = {}
     for item in chosen:

@@ -117,6 +117,48 @@ def test_pool_composition_keeps_applied_servers_first():
     assert [item.node.fingerprint for item in chosen] == ["c", "a"]
 
 
+def test_pool_server_chosen_by_hand(paths, tmp_path):
+    """П. 272: сервер пула, выбранный вручную на вкладке, — только из допущенных (по id или его
+    началу); в состав «pool» он идёт первым, демон держит его, пока жив, а умер — сервер выбирает
+    шлюз; нет его в составе — срочная сборка; «auto» — снова выбирает шлюз."""
+    ids = _pool(paths)
+    cfg = _cfg("on")
+    cfg.managed.routes = {}
+    store = tmp_path / "panel.json"
+    assert actions.set_pool_pin(paths, store, cfg, ids["dead"]).code == 2  # не допущен
+    assert actions.set_pool_pin(paths, store, cfg, ids["fast"][:4]).code == 2  # короткое начало
+    done = actions.set_pool_pin(paths, store, cfg, ids["slow"][:8])
+    assert done.ok and "slow» (DE)" in done.text
+    assert managed.load(store)[0]["free_pool_pin"] == ids["slow"]
+    found = traffic.admitted(cfg, paths, NOW)
+    chosen = traffic.choose(found, {ids["fast"]}, exclude=set(), limit=2, prefer=ids["slow"])
+    assert [item.node.fingerprint for item in chosen] == [ids["slow"], ids["fast"]]
+    # Демон: выбранный держится, хотя другой быстрее; умер — выбирает шлюз, с пометкой.
+    fast, slow = f"pool-de-{ids['fast'][:8]}", f"pool-de-{ids['slow'][:8]}"
+    applied = {"outbounds": [{"tag": fast}, {"tag": slow}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    daemon = _daemon(paths)
+    daemon.cfg = cfg
+    cfg.managed.free_pool_pin = ids["slow"]
+    daemon._pool_step(applied, {fast: {"alive": True, "delay": 0.1},
+                                slow: {"alive": True, "delay": 0.4}})
+    assert daemon.api.calls == [("pin", "pool", slow)]
+    assert daemon._pool_traffic["manual"] == "on" and "выбран вручную" in daemon.events[-1]
+    daemon._pool_step(applied, {fast: {"alive": True, "delay": 0.1}, slow: {"alive": False}})
+    assert daemon.api.calls[-1] == ("pin", "pool", fast)
+    assert daemon._pool_traffic["manual"] == "down" and "не отвечает" in daemon.events[-1]
+    # Выбранного нет в составе «pool» — срочная сборка (engine.assemble поставит его первым).
+    daemon._pool_due({"outbounds": [{"tag": fast}]}, NOW)
+    assert daemon._urgent_rebuild == "бесплатный пул: выбранный вручную сервер"
+    back = actions.set_pool_pin(paths, store, cfg, "auto")
+    assert back.ok and managed.load(store)[0]["free_pool_pin"] == ""
+    with actions.open_store(paths) as db:
+        texts = [row["detail"] for row in db.recent_events(2)]
+    assert texts[0] == "бесплатный пул: выбор сервера вручную снят — сервер выбирает шлюз"
+    assert texts[1].startswith("бесплатный пул: сервер «")
+    assert texts[1].endswith("slow» (DE) выбран вручную")
+
+
 def _selection(*links_text: str) -> builder.Selection:
     raws, _meta, _warnings = parse_links_text("\n".join(links_text), "main")
     return builder.Selection(members=[raw_to_node(raw, "main") for raw in raws])

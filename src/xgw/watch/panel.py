@@ -656,7 +656,8 @@ class Panel:
             # Белые списки (анти-ТСПУ 2.0): предупреждение и сервер, который можно включить.
             "whitelist": snapshot.get("whitelist"),
             # Бесплатный пул: режим и сводка наблюдения.
-            "free_pool": {"mode": cfg.free_pool.mode, "summary": snapshot.get("free_pool")},
+            "free_pool": {"mode": cfg.free_pool.mode, "pin": cfg.managed.free_pool_pin,
+                          "summary": snapshot.get("free_pool")},
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.
@@ -1785,6 +1786,14 @@ class Panel:
             ready = len(fptraffic.admitted(cfg, self.paths, time.time())) if mode == "on" else None
             outcome = actions.set_pool_mode(self.paths, store_path, mode, refuse_closing=True,
                                             ready=ready)
+            if outcome.ok:
+                self._wake()
+            return outcome
+        if name == "freepool/pin":
+            wanted = body.get("id")
+            if not isinstance(wanted, str):
+                return actions.Outcome(2, "ожидается id сервера пула или пусто")
+            outcome = actions.set_pool_pin(self.paths, store_path, cfg, wanted)
             if outcome.ok:
                 self._wake()
             return outcome

@@ -36,6 +36,7 @@ SERVER_MODES = ("enabled", "disabled", "removed")
 # Ядро, закреплённое за сервером вручную (`xgw core`, переключатель в панели); «auto» не хранится.
 CORE_PINS = ("xray", "sing-box")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
+_VARIANT_RE = re.compile(r"[0-9a-f]{32}")  # id варианта бесплатного пула (freepool/models.py)
 # Сервер устройства — бесплатный пул (веха М2б.1, freepool/traffic.py), а не сервер подписки.
 POOL_ROUTE = "pool"
 
@@ -99,7 +100,7 @@ def load(path: Path) -> tuple[dict, str]:
         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
-        "free_pool_mode": None,
+        "free_pool_mode": None, "free_pool_pin": "",
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -137,6 +138,7 @@ def load(path: Path) -> tuple[dict, str]:
     links = [link for link in raw.get("links") or [] if isinstance(link, str) and link]
     removed = _fingerprints(raw.get("removed"))
     disabled = [item for item in _fingerprints(raw.get("disabled")) if item not in removed]
+    pool_pin = raw.get("free_pool_pin")
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
@@ -154,6 +156,9 @@ def load(path: Path) -> tuple[dict, str]:
         # Бесплатный пул (docs/FREEPOOL-PLAN.md): режим из панели.
         "free_pool_mode": raw["free_pool_mode"]
         if raw.get("free_pool_mode") in FREE_POOL_MODES else None,
+        # Сервер пула, выбранный вручную на вкладке «Бесплатные серверы» (id варианта).
+        "free_pool_pin": pool_pin
+        if isinstance(pool_pin, str) and _VARIANT_RE.fullmatch(pool_pin) else "",
     }, ""
 
 
@@ -169,6 +174,20 @@ def set_free_pool_mode(path: Path, mode: str | None) -> bool:
         if data["free_pool_mode"] == mode:
             return False
         data["free_pool_mode"] = mode
+        return True
+
+    return _update(path, change)
+
+
+def set_free_pool_pin(path: Path, variant_id: str) -> bool:
+    """Сервер пула, выбранный вручную (id варианта; пусто — выбирает шлюз); True — изменилось."""
+    if variant_id and not _VARIANT_RE.fullmatch(variant_id):
+        raise ManagedError("ожидается id сервера пула — 32 шестнадцатеричных знака")
+
+    def change(data: dict) -> bool:
+        if data["free_pool_pin"] == variant_id:
+            return False
+        data["free_pool_pin"] = variant_id
         return True
 
     return _update(path, change)

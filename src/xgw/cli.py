@@ -184,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
                      "on — весь дом через бесплатные серверы",
     )
     pool_mode.add_argument("mode", choices=("off", "observe", "on"))
+    pool_pin = pool_sub.add_parser(
+        "pin", help="выбрать сервер пула вручную (id или его начало, как на вкладке "
+                    "«Бесплатные серверы»); auto — выбирает шлюз",
+    )
+    pool_pin.add_argument("server", help="id сервера пула (не короче 6 знаков) или auto")
     # Агент поколения туннеля SSTP — его запускает служба xgw-fp@<gen> (freepool/agent.py).
     pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
     pool_agent.add_argument("gen")
@@ -1083,6 +1088,14 @@ def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
             return _fail(outcome.text, outcome.code)
         logger.info("%s", outcome.text)
         print(outcome.text + ". Демон применит режим на ближайшем шаге")
+        return 0
+    if args.pool_action == "pin":
+        outcome = actions.set_pool_pin(paths, managed.path_for(args.config_path), cfg,
+                                       args.server)
+        if not outcome.ok:
+            return _fail(outcome.text, outcome.code)
+        logger.info("%s", outcome.text)
+        print(outcome.text + ". Демон применит выбор на ближайшем шаге")
         return 0
     from .freepool import backend as backending
     from .freepool import pool as pooling

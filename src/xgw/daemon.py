@@ -887,6 +887,12 @@ class Daemon:
             # для пула (burstObservatory) могут потребовать перезапуска Xray.
             self._urgent_rebuild = ("бесплатный пул: весь дом" if modes[1] == "on"
                                     else "бесплатный пул: режим подписок")
+        if (previous.cfg.managed.free_pool_pin != self.cfg.managed.free_pool_pin
+                and traffic.pool_active(self.cfg)):
+            # Сервер пула выбран вручную в панели — в состав «pool» он должен попасть сразу
+            # (engine.assemble ставит его первым), а закрепит его _pool_step.
+            self._urgent_rebuild = (self._urgent_rebuild
+                                    or "бесплатный пул: выбранный вручную сервер")
         # Серверы те же — заново проверять участников незачем.
         self.vetted = set(previous.vetted)
         self.bad_members = dict(previous.bad_members)
@@ -2611,8 +2617,15 @@ class Daemon:
             self._pool_traffic = None
             return
         alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
+        # Выбранный вручную на вкладке «Бесплатные серверы» — пока жив; молчит или ещё не в
+        # составе — сервер выбирает шлюз, как у выбранного вручную сервера подписки.
+        pin = self.cfg.managed.free_pool_pin
+        wanted = traffic.pinned(alive, pin)
+        manual = "on" if wanted is not None else "down" if pin else ""
         current = self._pool_pinned if any(info.tag == self._pool_pinned for info in alive) else ""
-        if not current and alive:
+        if wanted is not None:
+            current = wanted.tag
+        elif not current and alive:
             current = min(alive, key=lambda info: (
                 (observatory.get(info.tag) or {}).get("delay") or 1e9, info.tag)).tag
         if current != self._pool_pinned or (current and key != self._pool_pin_key):
@@ -2625,7 +2638,8 @@ class Daemon:
                 self.log.warning("сервер бесплатного пула не закреплён: %s", exc)
                 return
             if current != self._pool_pinned:
-                self.notifier.event("freepool", self._pool_change_text(current, pool, who))
+                self.notifier.event("freepool",
+                                    self._pool_change_text(current, pool, who, manual))
             self._pool_pinned, self._pool_pin_key = current, key
         elif not alive and was_closed is not True:
             self.notifier.event("freepool", self._pool_change_text("", pool, who))
@@ -2635,6 +2649,9 @@ class Daemon:
             "closed": not alive, "server": name, "country": country, "tag": current,
             "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
             if current else 0,
+            # Сервер выбран вручную: "on" — он и ведёт трафик, "down" — молчит или ещё не в
+            # составе (ведёт выбранный шлюзом), "" — выбирает шлюз.
+            "manual": manual,
             # Серверы балансировщика «pool» для строк вкладки «Бесплатные серверы»: id — начало
             # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра.
             "servers": [{
@@ -2672,23 +2689,30 @@ class Daemon:
         except OSError as exc:
             self.log.error("метка всего дома через пул не записана: %s", exc)
 
-    def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str) -> str:
-        """who — адреса устройств через пул или «весь дом» (М2б.2)."""
+    def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str,
+                          manual: str = "") -> str:
+        """who — адреса устройств через пул или «весь дом» (М2б.2); manual — как у сводки
+        пула: "on" — сервер выбран вручную, "down" — выбранный вручную молчит."""
         whole = who == "весь дом"
         subject = "весь дом идёт" if whole else f"устройства {who} идут"
         target = "у всего дома" if whole else f"у устройств {who}"
         if current:
             name, country = self._pool_names.get(current, (current, ""))
+            note = {
+                "on": " — выбран вручную",
+                "down": ": выбранный вручную не отвечает — сервер выбирает шлюз",
+            }.get(manual, "")
             return (f"бесплатный пул: {subject} через «{name}»"
-                    + (f" ({country})" if country else ""))
+                    + (f" ({country})" if country else "") + note)
         if not pool:
             return f"бесплатный пул: допущенных серверов нет — {target} закрыто"
         return f"бесплатный пул: все серверы пула молчат — {target} закрыто"
 
     def _pool_due(self, applied: dict, now: float) -> None:
         """Допущенные серверы пула против применённого состава «pool»: у устройств закрыто, а
-        допущенные есть, — сборка не чаще POOL_OPEN; сервер выпал из допущенных или есть место
-        для новых — не чаще POOL_REBUILD. Состав выбирает engine.assemble."""
+        допущенные есть, или выбранного вручную допущенного сервера нет в составе — сборка не
+        чаще POOL_OPEN; сервер выпал из допущенных или есть место для новых — не чаще
+        POOL_REBUILD. Состав выбирает engine.assemble."""
         try:
             found = traffic.admitted(self.cfg, self.paths, now)
         except (OSError, ValueError) as exc:
@@ -2703,8 +2727,11 @@ class Daemon:
         applied_fps = {info.fingerprint for info in infos}
         lost = [info for info in infos if info.fingerprint not in names]
         room = len(infos) < traffic.MEMBERS and bool(set(names) - applied_fps)
+        pin = self.cfg.managed.free_pool_pin
         if not infos and found:
             reason, pause = "бесплатный пул: состав серверов для устройств", POOL_OPEN
+        elif pin in names and pin not in applied_fps:
+            reason, pause = "бесплатный пул: выбранный вручную сервер", POOL_OPEN
         elif lost or room:
             reason, pause = "бесплатный пул: обновление серверов для устройств", POOL_REBUILD
         else:

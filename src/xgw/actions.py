@@ -337,6 +337,49 @@ def house_after_boot(paths: Paths, store_path) -> bool:
     return changed
 
 
+def set_pool_pin(paths: Paths, store_path, cfg, wanted: str) -> Outcome:
+    """Сервер бесплатного пула, выбранный вручную (panel.json; демон применит на ближайшем
+    шаге): wanted — id варианта или его начало (не короче 6 знаков) среди допущенных к трафику;
+    пусто или «auto» — выбирает шлюз. Выбранный держится, пока жив; молчит — трафик ведёт
+    выбранный шлюзом, а вернётся выбранный, когда снова ответит."""
+    import time
+
+    from . import managed
+    from .freepool import traffic as fptraffic
+
+    wanted = wanted.strip().lower()
+    chosen = None
+    if wanted not in ("", "auto"):
+        found = [item for item in fptraffic.admitted(cfg, paths, time.time())
+                 if len(wanted) >= 6 and item.node.fingerprint.startswith(wanted)]
+        if len(found) != 1:
+            return Outcome(2, "Такого сервера среди допущенных к трафику нет (или начало id "
+                              "подходит нескольким): выбрать можно только сервер без причины "
+                              "недопуска на вкладке «Бесплатные серверы»")
+        chosen = found[0]
+    try:
+        changed = managed.set_free_pool_pin(store_path, chosen.node.fingerprint if chosen else "")
+    except managed.ManagedError as exc:
+        return Outcome(1, str(exc))
+    except OSError as exc:
+        return Outcome(1, f"выбор не записан: {exc} — запустите команду через sudo")
+    if chosen is None:
+        text = "Сервер бесплатного пула снова выбирает шлюз"
+        event = "бесплатный пул: выбор сервера вручную снят — сервер выбирает шлюз"
+    else:
+        country = chosen.node.country.upper()
+        label = f"«{chosen.node.name}»" + (f" ({country})" if country != "XX" else "")
+        text = (f"Выбран {label}: трафик пула идёт через него, пока он отвечает; молчит — "
+                "через выбранный шлюзом")
+        event = f"бесплатный пул: сервер {label} выбран вручную"
+    if changed:
+        with open_store(paths) as store:
+            store.add_event("freepool", event)
+    if not fptraffic.pool_active(cfg):
+        text += ". Сейчас через бесплатные серверы никто не идёт — выбор подействует, когда пойдёт"
+    return Outcome(0, text)
+
+
 # --- ядро сервера ----------------------------------------------------------------------
 
 

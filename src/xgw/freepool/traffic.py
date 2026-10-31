@@ -160,11 +160,23 @@ def text(flow: dict) -> str:
 
 
 def choose(servers: list[TrafficServer], applied: set[str], *, exclude: set[str],
-           limit: int = MEMBERS) -> list[TrafficServer]:
-    """Состав балансировщика «pool»: сначала те, что уже в применённом конфиге (applied —
-    их отпечатки), если ещё допущены, — состав не перетасовывается при каждой сборке; затем
-    лучшие из остальных до limit. exclude — отпечатки серверов подписки в той же сборке."""
+           limit: int = MEMBERS, prefer: str = "") -> list[TrafficServer]:
+    """Состав балансировщика «pool»: сервер, выбранный вручную (prefer — id варианта), если он
+    допущен; затем те, что уже в применённом конфиге (applied — их отпечатки), если ещё
+    допущены, — состав не перетасовывается при каждой сборке; затем лучшие из остальных до
+    limit. exclude — отпечатки серверов подписки в той же сборке."""
     usable = [item for item in servers if item.node.fingerprint not in exclude]
-    kept = [item for item in usable if item.node.fingerprint in applied]
-    rest = [item for item in usable if item.node.fingerprint not in applied]
-    return (kept + rest)[:limit]
+    first = [item for item in usable if prefer and item.node.fingerprint == prefer]
+    others = [item for item in usable if not first or item.node.fingerprint != prefer]
+    kept = [item for item in others if item.node.fingerprint in applied]
+    rest = [item for item in others if item.node.fingerprint not in applied]
+    return (first + kept + rest)[:limit]
+
+
+def pinned(pool: list, pin: str) -> object | None:
+    """Сервер «pool», выбранный вручную: pin — id варианта, у NodeInfo из применённого конфига
+    отпечаток — полный или начало id из тега pool-<страна>-<начало>."""
+    if not pin:
+        return None
+    return next((info for info in pool if info.fingerprint and pin.startswith(info.fingerprint)),
+                None)

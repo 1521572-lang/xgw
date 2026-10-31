@@ -489,8 +489,10 @@ class Managed:
     # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
     # (routing.kernel_direct); None — как в config.toml.
     kernel_direct: bool | None = None
-    # Бесплатный пул из панели: режим (None — как в config.toml).
+    # Бесплатный пул из панели: режим (None — как в config.toml) и сервер, выбранный вручную
+    # (id варианта, 32 hex; пусто — выбирает шлюз).
     free_pool_mode: str | None = None
+    free_pool_pin: str = ""
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -618,6 +620,7 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
     if data["free_pool_mode"] is not None:
         cfg.free_pool.mode = cfg.managed.free_pool_mode = data["free_pool_mode"]
+    cfg.managed.free_pool_pin = data["free_pool_pin"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
