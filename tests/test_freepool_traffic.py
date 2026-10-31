@@ -469,7 +469,8 @@ def _daemon(paths):
                         ("_pool_bytes", None), ("_pool_own", 0), ("_speed_ran", False),
                         ("_metrics", {}), ("_pool_downlinks", {}), ("_pool_measured", ("", 0)),
                         ("_pool_spared_tag", ""), ("_pool_silent", {}),
-                        ("_pool_refreshed_at", 0.0), ("_freepool_force", False)):
+                        ("_pool_refreshed_at", 0.0), ("_freepool_force", False),
+                        ("_pool_tags", set())):
         setattr(daemon, name, value)
     daemon.freepool = SimpleNamespace(members=frozenset(), urgent=frozenset())
     daemon.diary = poolstats.Diary(_Meta(), clock=lambda: daemon.wall())
@@ -602,10 +603,10 @@ def test_pinned_pool_server_carrying_traffic_is_not_dead(paths):
 
 
 def test_silent_pool_server_is_rechecked_out_of_turn(paths):
-    """Восстановление (М3): состав «pool» — пулу, чтобы его серверы проверялись первыми; сервер,
-    молчащий у проб ядра дольше POOL_SILENT, — на перепроверку вне очереди (один раз за
-    эпизод в дневник); ответил — снят. Пул закрыт — списки обновляются вне расписания, не
-    чаще POOL_REFRESH."""
+    """Восстановление (М3): сервер «pool», молчащий у проб ядра дольше POOL_SILENT, — на
+    перепроверку вне очереди (один раз за эпизод в дневник); ответил — снят. Пул закрыт —
+    списки обновляются вне расписания, не чаще POOL_REFRESH. Выбывшие из состава дневник
+    считает по самому составу."""
     from xgw.daemon import POOL_REFRESH, POOL_SILENT
 
     a, b = "pool-de-aaaa", "pool-de-bbbb"
@@ -616,7 +617,7 @@ def test_silent_pool_server_is_rechecked_out_of_turn(paths):
     daemon.wall = lambda: clock[0]
     silent = {a: {"alive": True, "delay": 0.1}, b: {"alive": False}}
     daemon._pool_step(applied, silent)
-    assert daemon.freepool.members == {"aaaa", "bbbb"} and daemon.freepool.urgent == set()
+    assert daemon.freepool.urgent == set()
     clock[0] += POOL_SILENT
     daemon._pool_step(applied, silent)
     assert daemon.freepool.urgent == {"bbbb"}
@@ -636,11 +637,59 @@ def test_silent_pool_server_is_rechecked_out_of_turn(paths):
     clock[0] += 1
     daemon._pool_step(applied, closed)
     assert daemon._freepool_force
+    daemon._pool_step({"outbounds": [{"tag": a}]}, {a: {"alive": True, "delay": 0.1}})
     today = daemon.diary.days()[poolstats.day_of(clock[0])]
     assert (today["rechecked"], today["refreshed"]) == (3, 2)  # b, затем a и b у закрытого
+    assert today["dropped"] == 1 and daemon.freepool.urgent == set()
     daemon.cfg.managed.routes = {}
-    daemon._pool_step(applied, closed)
-    assert daemon.freepool.members == set() and daemon.freepool.urgent == set()
+    daemon._pool_step(applied, closed)  # через пул никто: выключение режима — не «выбыло»
+    assert daemon.freepool.urgent == set() and daemon._pool_tags == set()
+    assert daemon.diary.days()[poolstats.day_of(clock[0])]["dropped"] == 1
+
+
+def test_pool_gets_its_members_before_the_check_thread_starts(paths):
+    """Отчёт freepool-recovery: после запуска демона в первую пачку проверок вклинился
+    посторонний сервер — состав «pool» пул получал только в _pool_step, после запуска потока.
+    Теперь — в _freepool_step, до него; через пул никто не идёт — состав пуст."""
+    daemon = _daemon(paths)
+    daemon._freepool_thread, daemon._freepool_next = None, NOW + 3600
+    applied = {"outbounds": [{"tag": "pool-de-aaaa"}, {"tag": "pool-nl-bbbb"}]}
+    daemon._freepool_step(NOW, applied)
+    assert daemon.freepool.members == {"aaaa", "bbbb"}
+    daemon.cfg.managed.routes = {}
+    daemon._freepool_step(NOW, applied)
+    assert daemon.freepool.members == set()
+
+
+def test_pinned_pool_server_that_is_gone_is_released(paths):
+    """Отчёт freepool-recovery, наблюдение 3: выбор вручную держался на выбывшем сервере. Как у
+    подписки: выбранный сервер ушёл из списков или не прошёл проверку — выбор снимается с
+    событием; проверка лишь устарела — нет (её освежит очередь)."""
+    ids = _pool(paths)
+    store = managed.path_for(paths.config_file)
+    daemon = _daemon(paths)
+    for pin, kept in ((ids["stale"], True), (ids["dead"], False), ("f" * 32, False)):
+        managed.set_free_pool_pin(store, pin)
+        daemon.cfg.managed.free_pool_pin = pin
+        daemon._pool_due({}, NOW)
+        assert (managed.load(store)[0]["free_pool_pin"] == pin) is kept
+    assert daemon.events == [
+        f"бесплатный пул: выбранный вручную сервер «{ids['dead'][:8]}» больше не допущен "
+        "(последняя проверка не прошла) — сервер снова выбирает шлюз",
+        "бесплатный пул: выбранный вручную сервер «ffffffff» больше не допущен (его больше нет "
+        "в списках источников) — сервер снова выбирает шлюз"]
+
+
+def test_pool_server_checks_spend_the_health_reserve(paths):
+    """R28: прочие проверки каталогов — в бюджете без резерва здоровья, серверы «pool» — с
+    резервом, молчащий сервер «pool» — и с аварийным запасом сверху."""
+    checker = pool.FreePool(_cfg(), paths)
+    budget = checker.cfg.free_pool
+    budget.budget_mb, budget.health_reserved_mb, budget.emergency_mb = 512, 128, 64
+    checker.members, checker.urgent = frozenset({"aaaa", "bbbb"}), frozenset({"bbbb"})
+    assert checker._ceiling("c" * 32) == 384 * 1_048_576
+    assert checker._ceiling("a" * 32) == 512 * 1_048_576
+    assert checker._ceiling("b" * 32) == 576 * 1_048_576
 
 
 def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):

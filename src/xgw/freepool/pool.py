@@ -332,16 +332,16 @@ class FreePool:
     def check_some(self, *, mark: int | None, xray_bin: Path | None, via=None,
                    cancel=None) -> int:
         """Проверить до free_pool.checks_per_step вариантов каталогов в пределах бюджета
-        суток; туннелем SSTP — не больше одного за шаг и в пределах рукопожатий (R26, R29).
-        Серверы списков GitHub — сверх этого, до free_pool.list_checks_per_step за шаг и без
-        бюджета (решение заказчика 28.10.2026: экономия трафика для них не нужна)."""
-        budget = (self.cfg.free_pool.budget_mb - self.cfg.free_pool.health_reserved_mb) * 1_048_576
+        суток (_ceiling); туннелем SSTP — не больше одного за шаг и в пределах рукопожатий (R26,
+        R29). Серверы списков GitHub — сверх этого, до free_pool.list_checks_per_step за шаг и
+        без бюджета (решение заказчика 28.10.2026: экономия трафика для них не нужна)."""
         limits = {
-            "catalog": self.cfg.free_pool.checks_per_step if self.spent_today() < budget else 0,
+            "catalog": self.cfg.free_pool.checks_per_step,
             "list": self.cfg.free_pool.list_checks_per_step,
         }
         if not any(limits.values()):
             return 0
+        spent = self.spent_today()
         tunnels = not self.refresh_backend() and xray_bin is not None
         done = {"catalog": 0, "list": 0}
         tunnel_checks = 0
@@ -354,6 +354,8 @@ class FreePool:
                 break
             kind = "list" if variant.provider in providers.LIST_PROVIDERS else "catalog"
             if done[kind] >= limits[kind]:
+                continue
+            if kind == "catalog" and spent >= self._ceiling(variant.variant_id):
                 continue
             tunnel = False
             if variant.backend in (Backend.XRAY, Backend.SINGBOX):
@@ -381,7 +383,22 @@ class FreePool:
                     )
             self._record(variant, outcome, tunnel=tunnel)
             done[kind] += 1
+            if kind == "catalog":
+                spent += outcome.bytes_used
         return sum(done.values())
+
+    def _ceiling(self, key: str) -> float:
+        """Сколько байт проверок каталогов за сутки можно истратить к проверке этого варианта
+        (R28): прочим — бюджет без защищённого резерва здоровья, серверу «pool» — с резервом,
+        молчащему серверу «pool» — и аварийный запас сверху (восстановление, М3: иначе при
+        исчерпанном бюджете ключ Outline в работе не перепроверялся бы вовсе)."""
+        pool = self.cfg.free_pool
+        megabytes = pool.budget_mb - pool.health_reserved_mb
+        if _listed(key, self.urgent):
+            megabytes = pool.budget_mb + pool.emergency_mb
+        elif _listed(key, self.members):
+            megabytes = pool.budget_mb
+        return megabytes * 1_048_576
 
     def _check_proxy(self, variant: Variant, *, mark: int | None,
                      xray_bin: Path | None) -> probing.Outcome | None:

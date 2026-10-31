@@ -156,6 +156,21 @@ def admitted(cfg: Config, paths: Paths, now: float, *, store: PoolStore | None =
     return found
 
 
+def pin_gone(cfg: Config, paths: Paths, pin: str, *, store: PoolStore | None = None) -> str:
+    """Почему сервер пула, выбранный вручную (pin — id варианта), больше не допущен навсегда:
+    его нет в списках источников, последняя проверка не прошла, выход вне региона; пусто — ещё
+    допущен или его проверка лишь устарела (её освежит очередь). Как у подписки: сервер убран —
+    выбор снимается (отчёт freepool-recovery, наблюдение 3: выбор держался на выбывшем)."""
+    store = store or PoolStore(paths)
+    variant = next((item for provider in cfg.free_pool.providers
+                    for item in store.variants(provider) if item.variant_id == pin), None)
+    if variant is None:
+        return "его больше нет в списках источников"
+    record = store.candidates().get(pin)
+    checked = float(record.get("checked_at") or 0) if isinstance(record, dict) else 0.0
+    return refusal(cfg, variant, record, checked)  # на время проверки: возраст не в счёт
+
+
 def text(flow: dict) -> str:
     """Устройства через бесплатные серверы одной строкой (`xgw pool`, `xgw status`): flow —
     сводка демона free_pool.traffic (Daemon._pool_step)."""

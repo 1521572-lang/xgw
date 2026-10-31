@@ -35,7 +35,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, cost, engine, fetch, log, priority, rating, usage
+from . import cores, cost, engine, fetch, log, managed, priority, rating, usage
 from . import pin as pinning
 from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
@@ -606,6 +606,7 @@ class Daemon:
         # «pool» и когда списки обновлялись вне расписания из-за закрытого пула.
         self._pool_silent: dict[str, float] = {}
         self._pool_refreshed_at = 0.0
+        self._pool_tags: set[str] = set()  # состав «pool» прошлого шага — для «выбыло» дневника
         self.diary = poolstats.Diary(self.store, clock=self.wall)  # дневник пула (М3)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
@@ -862,12 +863,18 @@ class Daemon:
         self._freepool_next = 0.0
         self.poke.set()
 
-    def _freepool_step(self, now: float) -> None:
+    def _freepool_step(self, now: float, applied: dict) -> None:
         """Шаг бесплатного пула: раз в FREEPOOL_EVERY — фоновый поток с опросом источников,
-        которым пора, и проверками нескольких кандидатов. Режим off — ничего."""
+        которым пора, и проверками нескольких кандидатов. Режим off — ничего. Состав «pool»
+        рабочего конфига пул получает до запуска потока: его серверы проверяются раньше прочих
+        (FreePool.next_checks) и после запуска демона — с первой же пачки (отчёт
+        freepool-recovery: в первую пачку после запуска вклинился посторонний сервер)."""
         if self.cfg.free_pool.mode == "off":
             self._freepool_summary = None
             return
+        self.freepool.members = frozenset(
+            info.fingerprint for info in builder.applied_pool(applied)
+        ) if traffic.pool_active(self.cfg) else frozenset()
         busy = self._freepool_thread is not None and self._freepool_thread.is_alive()
         if busy or now < self._freepool_next:
             return
@@ -973,6 +980,7 @@ class Daemon:
         self._pool_spared_tag = previous._pool_spared_tag
         self._pool_silent = dict(previous._pool_silent)
         self._pool_refreshed_at = previous._pool_refreshed_at
+        self._pool_tags = set(previous._pool_tags)
         self.diary = previous.diary
         self.diary.store = self.store
         self._house_synced_at = previous._house_synced_at
@@ -1181,7 +1189,7 @@ class Daemon:
                 "в том числе лимитированных",
             )
         self._whitelist_step(view, signals, state, now)
-        self._freepool_step(now)
+        self._freepool_step(now, applied)
         self._usage_step(applied)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
@@ -2644,16 +2652,19 @@ class Daemon:
             self._pool_checked_at = now
             self._pool_due(applied, now)
         pool = builder.applied_pool(applied)
-        # Состав «pool» — пулу сразу, и пока ядро его ещё не пробовало: после запуска демона его
-        # серверы проверяются раньше прочих (FreePool.next_checks, восстановление М3).
-        self.freepool.members = frozenset(
-            info.fingerprint for info in pool) if devices or whole else frozenset()
         self._house_mark(whole)
         if not (devices or whole):
             self._pool_pinned, self._pool_traffic = "", None
             self._pool_silence([], set(), now)
+            self._pool_tags = set()
             self.diary.idle()
             return
+        # Выбывшие из состава — по самому составу, кто бы его ни пересобрал (_pool_due, запуск
+        # демона, смена подписок): отчёт freepool-recovery, дневник отставал от событий.
+        tags = {info.tag for info in pool}
+        if self._pool_tags - tags:
+            self.diary.count("dropped", len(self._pool_tags - tags))
+        self._pool_tags = tags
         try:
             key = self.paths.xray_config_file.stat().st_mtime
         except OSError:
@@ -3020,6 +3031,8 @@ class Daemon:
         lost = [info for info in infos if info.fingerprint not in names]
         room = len(infos) < traffic.MEMBERS and bool(set(names) - applied_fps)
         pin = self.cfg.managed.free_pool_pin
+        if pin and pin not in names and self._drop_pool_pin(pin):
+            pin = ""
         if not infos and found:
             reason, pause = "бесплатный пул: состав серверов для устройств", POOL_OPEN
         elif pin in names and pin not in applied_fps:
@@ -3031,9 +3044,30 @@ class Daemon:
         if now - self._pool_rebuilt_at < pause:
             return
         self._pool_rebuilt_at = now
-        if lost:
-            self.diary.count("dropped", len(lost))
         self._urgent_rebuild = self._urgent_rebuild or reason
+
+    def _drop_pool_pin(self, pin: str) -> bool:
+        """Выбранный вручную сервер пула больше не допущен навсегда (traffic.pin_gone: ушёл из
+        списков, не прошёл проверку) — выбор снимается с событием, как у подписки, когда сервер
+        убран (отчёт freepool-recovery, наблюдение 3: выбор держался на выбывшем, и каждая смена
+        шла с «выбранный вручную не отвечает»). Старая проверка — не повод. True — снят."""
+        try:
+            why = traffic.pin_gone(self.cfg, self.paths, pin)
+        except (OSError, ValueError) as exc:
+            self.log.error("бесплатный пул: выбранный вручную сервер не проверен: %s", exc)
+            return False
+        if not why:
+            return False
+        try:
+            managed.set_free_pool_pin(managed.path_for(self.paths.config_file), "")
+        except (managed.ManagedError, OSError) as exc:
+            self.log.warning("бесплатный пул: выбор вручную не снят: %s", exc)
+            return False
+        tag = next((tag for tag, full in self._pool_ids.items() if full == pin), "")
+        name = self._pool_names.get(tag, ("", ""))[0] or pin[:8]
+        self.notifier.event("freepool", f"бесплатный пул: выбранный вручную сервер «{name}» "
+                            f"больше не допущен ({why}) — сервер снова выбирает шлюз")
+        return True
 
     def _pool_summary(self) -> dict | None:
         """Сводка пула для состояния и панели; с устройствами через пул — и их «traffic»."""
