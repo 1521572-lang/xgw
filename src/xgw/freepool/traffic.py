@@ -23,6 +23,7 @@ from ..config import Config
 from ..model import ServerNode
 from ..parsers.common import SingboxSpec
 from ..paths import Paths
+from ..watch import speed
 from . import regions
 from .models import Access, Backend, Variant
 from .store import PoolStore
@@ -154,7 +155,9 @@ def text(flow: dict) -> str:
                else "все серверы пула молчат")
         return f"{head} — закрыто: {why}"
     country = f" ({flow['country']})" if flow.get("country") else ""
-    return (f"{head} — сервер «{flow.get('server') or '?'}»{country}, задержка "
+    mbps = flow.get("mbps")
+    rate = f", {speed.mbps_text(float(mbps))}" if isinstance(mbps, (int, float)) else ""
+    return (f"{head} — сервер «{flow.get('server') or '?'}»{country}{rate}, задержка "
             f"{flow.get('delay_ms', 0)} мс; живых {flow.get('alive', 0)} из "
             f"{flow.get('members', 0)}")
 

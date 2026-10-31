@@ -1,7 +1,9 @@
 """Веха М2б.1: устройство через бесплатный пул — допуск серверов пула, балансировщик «pool» в
 рабочем конфиге, «закрыто» без серверов, выбор в панели и закреплённый сервер у демона."""
 
+import json
 import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -404,7 +406,10 @@ def _daemon(paths):
     for name, value in (("_pool_pinned", ""), ("_pool_pin_key", 0.0),
                         ("_pool_checked_at", NOW), ("_pool_rebuilt_at", 0.0),
                         ("_pool_names", {}), ("_pool_traffic", None),
-                        ("_pool_wait_since", 0.0), ("_house_synced_at", None)):
+                        ("_pool_wait_since", 0.0), ("_house_synced_at", None),
+                        ("_pool_ids", {}), ("_pool_speed", {}), ("_pool_since", 0.0),
+                        ("_pool_basis", ""), ("_pool_deferred_since", None),
+                        ("_pool_bytes", None), ("_pool_own", 0), ("_speed_ran", False)):
         setattr(daemon, name, value)
     return daemon
 
@@ -420,8 +425,8 @@ def test_daemon_pins_a_live_pool_server_without_jumping(paths):
     assert daemon.api.calls == [("pin", "pool", "pool-de-bbbb")]
     # Строкам вкладки «Бесплатные серверы» — весь состав «pool» с задержкой по пробам ядра.
     assert daemon._pool_traffic["servers"] == [
-        {"id": "aaaa", "tag": "pool-de-aaaa", "alive": True, "delay_ms": 300},
-        {"id": "bbbb", "tag": "pool-de-bbbb", "alive": True, "delay_ms": 100}]
+        {"id": "aaaa", "tag": "pool-de-aaaa", "alive": True, "delay_ms": 300, "mbps": None},
+        {"id": "bbbb", "tag": "pool-de-bbbb", "alive": True, "delay_ms": 100, "mbps": None}]
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": True, "delay": 0.05},
                                 "pool-de-bbbb": {"alive": True, "delay": 0.2}})
     assert daemon.api.calls == [("pin", "pool", "pool-de-bbbb")]
@@ -448,6 +453,106 @@ def test_daemon_keeps_the_whole_house_on_a_live_pool_server(paths):
     assert traffic.text(flow).startswith("Весь дом через бесплатные серверы — сервер")
     daemon._pool_step(applied, {"pool-de-aaaa": {"alive": False}})
     assert "у всего дома закрыто" in daemon.events[-1]
+
+
+def test_daemon_moves_the_pool_to_a_faster_server_without_jumping(paths):
+    """Закреплённый сервер «pool» — по замеру: выбранный по задержке (замерены не все живые)
+    уступает замеренному более быстрому сразу, выбранный по скорости — только продержавшись
+    speed.hold_minutes; умер — лучший той же страны, а не самый быстрый вообще."""
+    a, b, c = "pool-de-aaaa", "pool-nl-bbbb", "pool-nl-cccc"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}, {"tag": c}]}
+    paths.xray_config_file.write_text("{}", encoding="utf-8")
+    clock = [NOW]
+    daemon = _daemon(paths)
+    daemon.wall = lambda: clock[0]
+    daemon._pool_names = {a: ("A", "DE"), b: ("B", "NL"), c: ("C", "NL")}
+    daemon._pool_ids = {tag: tag[-4:] * 8 for tag in (a, b, c)}
+
+    def speeds(values):
+        daemon._pool_speed = {daemon._pool_ids[tag]: {"mbps": value, "ts": NOW}
+                              for tag, value in values.items()}
+
+    alive = {a: {"alive": True, "delay": 0.3}, b: {"alive": True, "delay": 0.1},
+             c: {"alive": True, "delay": 0.5}}
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", b)  # замеров нет — по задержке
+    speeds({a: 40.0, b: 10.0})
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", a)
+    assert daemon.events[-1] == (f"бесплатный пул: устройства {DEVICE} идут через «A» (DE), "
+                                 "40 Мбит/с — быстрее, чем «B» (10 Мбит/с)")
+    speeds({a: 40.0, b: 10.0, c: 20.0})  # замерены все живые — выбор окончательный
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", a) and daemon._pool_basis == "speed"
+    speeds({a: 40.0, b: 100.0, c: 20.0})
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", a)  # держится speed.hold_minutes
+    clock[0] += daemon.cfg.speed.hold_minutes * 60
+    daemon._pool_step(applied, alive)
+    assert daemon.api.calls[-1] == ("pin", "pool", b)
+    flow = daemon._pool_traffic
+    assert flow["mbps"] == 100.0 and "(NL), 100 Мбит/с, задержка 100 мс" in traffic.text(flow)
+    assert flow["servers"][1] == {"id": "bbbb", "tag": b, "alive": True, "delay_ms": 100,
+                                  "mbps": 100.0, "speed_at": NOW}
+    daemon._pool_step(applied, {**alive, b: {"alive": False}})
+    assert daemon.api.calls[-1] == ("pin", "pool", c)  # той же страны, хотя A быстрее
+    assert daemon.events[-1].endswith("через «C» (NL), 20 Мбит/с")
+    assert len(daemon.events) == 4
+
+
+def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):
+    """Замер серверов «pool» — по одному за шаг через их probe-inbound: сначала незамеренные
+    (закреплённый первым) — и при занятом канале; повторный — через speed.unlimited_hours, при
+    занятом канале ждёт, но не дольше SPEED_FORCE_AFTER; в шаге, где уже замеряли серверы
+    подписки, — нет."""
+    from xgw import daemon as daemon_module
+    from xgw.watch import speed
+
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}], "inbounds": [
+        {"tag": f"probe-de-{name}", "port": port,
+         "settings": {"accounts": [{"user": "probe", "pass": "secret"}]}}
+        for name, port in (("aaaa", 20001), ("bbbb", 20002))]}
+    measured = []
+
+    def measure(info, cfg, *, probe_pass, max_mb, cancel):
+        measured.append((info.tag, info.probe_port, probe_pass, max_mb))
+        return speed.SpeedResult(25.0, 10_000_000, 3.2)
+
+    monkeypatch.setattr(speed, "measure", measure)
+    clock = [NOW]
+    saved = {}
+    daemon = _daemon(paths)
+    daemon.wall = lambda: clock[0]
+    daemon._stop = threading.Event()
+    daemon.store = SimpleNamespace(set_meta=saved.__setitem__)
+    daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
+    daemon._pool_pinned = b
+
+    def load(downlink):
+        daemon._metrics = {"stats": {"outbound": {a: {"uplink": 0, "downlink": downlink}}}}
+
+    alive = {a: {"alive": True, "delay": 0.1}, b: {"alive": True, "delay": 0.3}}
+    load(0)
+    daemon._pool_speed_step(applied, alive, 100.0)
+    assert measured == [(b, 20002, "secret", 10.0)]
+    load(100_000_000)  # канал занят, но у «a» замера нет вовсе
+    daemon._pool_speed_step(applied, alive, 120.0)
+    assert [item[0] for item in measured] == [b, a]
+    record = json.loads(saved[daemon_module.POOL_SPEED_META])["a" * 32]
+    assert record["mbps"] == 25.0 and record["busy"] is True
+    daemon._pool_speed_step(applied, alive, 140.0)
+    assert len(measured) == 2  # оба замерены недавно
+    clock[0] += daemon.cfg.speed.unlimited_hours * 3600
+    load(200_000_000)
+    daemon._pool_speed_step(applied, alive, 160.0)
+    assert len(measured) == 2 and daemon._pool_deferred_since == 160.0
+    load(3_000_000_000)
+    daemon._pool_speed_step(applied, alive, 160.0 + daemon_module.SPEED_FORCE_AFTER)
+    assert [item[0] for item in measured] == [b, a, b]
+    daemon._speed_ran = True
+    daemon._pool_speed_step(applied, alive, 4000.0)
+    assert len(measured) == 3
 
 
 def test_switching_the_whole_house_on_is_connecting_not_closed(paths):

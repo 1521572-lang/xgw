@@ -219,6 +219,12 @@ POOL_REBUILD = 600.0
 # Пересборка для пула впереди или ядро ещё не пробовало его серверы — «подключаются», а не
 # «закрыто», но не дольше POOL_WAIT (первые пробы ядра — за интервал probe.interval).
 POOL_WAIT = 120.0
+# Скорость серверов «pool» (_pool_speed_step) — обычным замером (speed.measure, speed.max_mb):
+# экономия их трафика не нужна (решение заказчика 5). Живой сервер без замера — сразу, по одному
+# за шаг; повторный замер — раз в speed.unlimited_hours, при занятом канале пула (больше
+# SPEED_BUSY_BPS) ждёт, но не дольше SPEED_FORCE_AFTER. Замеры — в meta POOL_SPEED_META: id
+# варианта → {"mbps", "bytes", "seconds", "error", "ts"}, хранятся SPEED_KEEP.
+POOL_SPEED_META = "pool_speed"
 # Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
 # HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
 HOUSE_SYNC = 300.0
@@ -573,6 +579,18 @@ class Daemon:
         self._pool_names: dict[str, tuple[str, str]] = {}
         self._pool_traffic: dict | None = None
         self._pool_wait_since = 0.0
+        # Скорость серверов «pool» (_pool_speed_step): полный id варианта по тегу, замеры (meta
+        # POOL_SPEED_META), когда и по чему выбран закреплённый ("speed" — по замеру, когда
+        # замерены все живые; "delay" — предварительно), с какого шага повторный замер ждёт
+        # свободного канала, прошлый отсчёт трафика серверов пула и байты своего замера.
+        self._pool_ids: dict[str, str] = {}
+        self._pool_speed: dict[str, dict] | None = None
+        self._pool_since = 0.0
+        self._pool_basis = ""
+        self._pool_deferred_since: float | None = None
+        self._pool_bytes: tuple[float, int] | None = None
+        self._pool_own = 0
+        self._speed_ran = False  # на этом шаге шёл замер серверов подписки
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
@@ -928,6 +946,11 @@ class Daemon:
         self._pool_names = dict(previous._pool_names)
         self._pool_traffic = previous._pool_traffic
         self._pool_wait_since = previous._pool_wait_since
+        self._pool_ids = dict(previous._pool_ids)
+        self._pool_speed = previous._pool_speed
+        self._pool_since, self._pool_basis = previous._pool_since, previous._pool_basis
+        self._pool_deferred_since = previous._pool_deferred_since
+        self._pool_bytes, self._pool_own = previous._pool_bytes, previous._pool_own
         self._house_synced_at = previous._house_synced_at
         self._health = previous._health
         self._observed = dict(previous._observed)
@@ -1060,7 +1083,7 @@ class Daemon:
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
-        self._scanned = False
+        self._scanned = self._speed_ran = False
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
@@ -1269,6 +1292,8 @@ class Daemon:
             return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
+        if signals.xray_ok and not changed:  # после перезапуска Xray пробы ядра устарели
+            self._pool_speed_step(applied, observatory or {}, now)
         if state is not State.WAN_DOWN:
             self._cores_step()
             self._netmon_step(signals.xray_ok)
@@ -2582,9 +2607,11 @@ class Daemon:
 
     def _pool_step(self, applied: dict, observatory: dict) -> None:
         """Устройства через бесплатный пул (freepool/traffic.py). Закреплённый сервер
-        балансировщика «pool» — живой по пробам ядра с меньшей задержкой; держится, пока жив
-        (без прыжков между серверами, как основной с 0.1.9); умер — следующий живой; живых
-        нет — закрепление снято, и балансировщик ведёт в block: у устройств закрыто (R05)."""
+        балансировщика «pool» — самый быстрый живой по замеру (_pool_speed_step), пока замеров
+        нет — с меньшей задержкой по пробам ядра; держится, пока жив, и сменяется более быстрым
+        без прыжков, как основной сервер подписки (_pool_choice); умер — лучший живой той же
+        страны; живых нет — закрепление снято, и балансировщик ведёт в block: у устройств
+        закрыто (R05)."""
         devices = traffic.pool_devices(self.cfg)
         whole = traffic.whole_house(self.cfg)  # весь дом через пул (М2б.2)
         who = "весь дом" if whole else ", ".join(devices)
@@ -2617,17 +2644,14 @@ class Daemon:
             self._pool_traffic = None
             return
         alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
+        candidates = [self._pool_candidate(info, observatory) for info in alive]
         # Выбранный вручную на вкладке «Бесплатные серверы» — пока жив; молчит или ещё не в
         # составе — сервер выбирает шлюз, как у выбранного вручную сервера подписки.
         pin = self.cfg.managed.free_pool_pin
         wanted = traffic.pinned(alive, pin)
         manual = "on" if wanted is not None else "down" if pin else ""
-        current = self._pool_pinned if any(info.tag == self._pool_pinned for info in alive) else ""
-        if wanted is not None:
-            current = wanted.tag
-        elif not current and alive:
-            current = min(alive, key=lambda info: (
-                (observatory.get(info.tag) or {}).get("delay") or 1e9, info.tag)).tag
+        current, slower, basis = self._pool_choice(
+            candidates, wanted.tag if wanted is not None else "", now)
         if current != self._pool_pinned or (current and key != self._pool_pin_key):
             try:
                 if current:
@@ -2638,28 +2662,175 @@ class Daemon:
                 self.log.warning("сервер бесплатного пула не закреплён: %s", exc)
                 return
             if current != self._pool_pinned:
-                self.notifier.event("freepool",
-                                    self._pool_change_text(current, pool, who, manual))
+                self._pool_since = now
+                chosen = next((item for item in candidates if item.tag == current), None)
+                self.notifier.event("freepool", self._pool_change_text(
+                    current, pool, who, manual, chosen=chosen, slower=slower))
             self._pool_pinned, self._pool_pin_key = current, key
         elif not alive and was_closed is not True:
             self.notifier.event("freepool", self._pool_change_text("", pool, who))
+        self._pool_basis = basis
         name, country = self._pool_names.get(current, ("", ""))
         self._pool_traffic = {
             "devices": devices, "all": whole, "members": len(pool), "alive": len(alive),
             "closed": not alive, "server": name, "country": country, "tag": current,
             "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
             if current else 0,
+            "mbps": next((item.mbps for item in candidates if item.tag == current), None),
             # Сервер выбран вручную: "on" — он и ведёт трафик, "down" — молчит или ещё не в
             # составе (ведёт выбранный шлюзом), "" — выбирает шлюз.
             "manual": manual,
             # Серверы балансировщика «pool» для строк вкладки «Бесплатные серверы»: id — начало
-            # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра.
+            # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра, скорость —
+            # по свежему замеру (_pool_speed_step).
             "servers": [{
                 "id": info.fingerprint, "tag": info.tag,
                 "alive": bool((observatory.get(info.tag) or {}).get("alive")),
                 "delay_ms": round(((observatory.get(info.tag) or {}).get("delay") or 0) * 1000),
+                **self._pool_speed_view(info),
             } for info in pool],
         }
+
+    def _pool_candidate(self, info: NodeInfo, observatory: dict) -> speed.Candidate:
+        name, country = self._pool_names.get(info.tag, ("", ""))
+        delay = (observatory.get(info.tag) or {}).get("delay")
+        return speed.Candidate(
+            tag=info.tag, key=self._pool_ids.get(info.tag, info.fingerprint), name=name,
+            mbps=self._pool_mbps(info), country=country,
+            delay_ms=delay * 1000.0 if isinstance(delay, (int, float)) else None,
+        )
+
+    def _pool_choice(self, candidates: list[speed.Candidate], wanted: str,
+                     now: float) -> tuple[str, speed.Candidate | None, str]:
+        """Закреплённый сервер «pool»: (тег, нынешний, если его сменил более быстрый, основание
+        выбора). Выбранный вручную (wanted) — пока жив. Нынешний держится, пока жив, и уступает
+        только замеренному, который быстрее на speed.gain_pct: сразу, если нынешний выбран
+        предварительно (основание "delay": замерены не все живые), иначе — продержавшись
+        speed.hold_minutes (без прыжков, как основной сервер подписки). Нынешнего нет —
+        лучший живой той же страны, иначе просто лучший (speed.best_like): замеренные — по
+        скорости, остальные — по задержке."""
+        if wanted:
+            return wanted, None, "manual"
+        pending = any(item.mbps is None for item in candidates)
+        held = next((item for item in candidates if item.tag == self._pool_pinned), None)
+        if held is None:
+            lost = self._pool_names.get(self._pool_pinned, ("", ""))[1]
+            pick = speed.best_like(candidates, lost, "")
+            if pick is None:
+                return "", None, ""
+            return pick.tag, None, "speed" if pick.mbps is not None and not pending else "delay"
+        by_delay = self._pool_basis == "delay"
+        rival = speed.best([item for item in candidates if item.tag != held.tag])
+        if rival is not None and speed.faster(rival, held, self.cfg.speed.gain_pct) and (
+                by_delay or now - self._pool_since >= self.cfg.speed.hold_minutes * 60.0):
+            return rival.tag, held, "delay" if pending else "speed"
+        # Замерены все живые — выбор окончательный, дальше нынешний держится hold_minutes.
+        return held.tag, None, "speed" if by_delay and not pending else self._pool_basis
+
+    def _pool_speeds(self) -> dict[str, dict]:
+        if self._pool_speed is None:
+            try:
+                loaded = json.loads(self.store.get_meta(POOL_SPEED_META) or "{}")
+            except ValueError:
+                loaded = {}
+            self._pool_speed = loaded if isinstance(loaded, dict) else {}
+        return self._pool_speed
+
+    def _pool_record(self, info: NodeInfo) -> dict | None:
+        """Последний замер сервера «pool» — по полному id варианта (_pool_due)."""
+        record = self._pool_speeds().get(self._pool_ids.get(info.tag, ""))
+        return record if isinstance(record, dict) else None
+
+    def _pool_mbps(self, info: NodeInfo) -> float | None:
+        """Свежий удачный замер сервера «pool», Мбит/с: не старше SPEED_FRESH сроков
+        speed.unlimited_hours; None — замера нет, он не удался или устарел, замеры выключены."""
+        hours = speed.every_hours(self.cfg, 0.0)
+        record = self._pool_record(info) or {}
+        mbps = record.get("mbps")
+        if not hours or not isinstance(mbps, (int, float)):
+            return None
+        if self.wall() - float(record.get("ts") or 0) > SPEED_FRESH * hours * 3600.0:
+            return None
+        return float(mbps)
+
+    def _pool_speed_view(self, info: NodeInfo) -> dict:
+        """Скорость сервера «pool» для строки вкладки: свежий замер, когда он был и шёл ли при
+        занятом канале (цифра может быть занижена)."""
+        mbps = self._pool_mbps(info)
+        if mbps is None:
+            return {"mbps": None}
+        record = self._pool_record(info) or {}
+        return {"mbps": mbps, "speed_at": record.get("ts"),
+                **({"speed_busy": True} if record.get("busy") else {})}
+
+    def _pool_busy(self, now: float) -> bool:
+        """Идёт ли через серверы пула заметный трафик: байт/с с прошлого шага больше
+        SPEED_BUSY_BPS без своего замера прошлого шага (как _traffic_busy у подписки)."""
+        counters = usage.outbound_counters(self._metrics)
+        total = sum(up + down for tag, (up, down) in counters.items()
+                    if tag.startswith(builder.POOL_PREFIX)) if counters else None
+        previous, self._pool_bytes = self._pool_bytes, (now, total) if total is not None else None
+        own, self._pool_own = self._pool_own, 0
+        if total is None or previous is None or now <= previous[0]:
+            return False
+        return (total - previous[1] - own) / (now - previous[0]) > SPEED_BUSY_BPS
+
+    def _pool_speed_step(self, applied: dict, observatory: dict, now: float) -> None:
+        """Замер скорости серверов «pool» — в конце шага, по одному и не в шаге, где уже шёл
+        замер серверов подписки. Живой сервер без замера — сразу: сначала закреплённый (по нему
+        решается, менять ли), затем по задержке; повторный — раз в speed.unlimited_hours, при
+        занятом канале пула ждёт, но не дольше SPEED_FORCE_AFTER. С новым замером закреплённый
+        сверяется на следующем шаге (_pool_choice)."""
+        busy = self._pool_busy(now)
+        hours = speed.every_hours(self.cfg, 0.0)
+        if not hours or self._speed_ran or self.stopping or not traffic.pool_active(self.cfg):
+            return
+        password, _ports = builder.probe_state(applied)
+        wall = self.wall()
+        never: list[NodeInfo] = []
+        stale: list[NodeInfo] = []
+        for info in builder.applied_pool(applied):
+            if not (info.probe_port and info.tag in self._pool_ids
+                    and (observatory.get(info.tag) or {}).get("alive")):
+                continue
+            record = self._pool_record(info)
+            if record is None:
+                never.append(info)
+            elif wall - float(record.get("ts") or 0) >= hours * 3600.0:
+                stale.append(info)
+        if not stale:
+            self._pool_deferred_since = None
+        elif not never and busy:
+            if self._pool_deferred_since is None:
+                self._pool_deferred_since = now
+            if now - self._pool_deferred_since < SPEED_FORCE_AFTER:
+                return
+        targets = never or stale
+        if not targets or not password:
+            return
+        info = min(targets, key=lambda item: (
+            item.tag != self._pool_pinned,
+            (observatory.get(item.tag) or {}).get("delay") or 1e9, item.tag))
+        result = speed.measure(info, self.cfg, probe_pass=password,
+                               max_mb=speed.size_mb(self.cfg, 0.0), cancel=self._stop)
+        self._pool_own += result.bytes_read
+        if result.mbps is None and self.stopping:
+            return  # замер прервала остановка демона: это не неудача сервера
+        records = self._pool_speeds()
+        records[self._pool_ids[info.tag]] = {
+            "mbps": result.mbps, "bytes": result.bytes_read, "seconds": result.seconds,
+            "error": result.error, "ts": self.wall(), **({"busy": True} if busy else {}),
+        }
+        oldest = self.wall() - SPEED_KEEP
+        for key in [key for key, value in records.items()
+                    if not isinstance(value, dict) or float(value.get("ts") or 0) < oldest]:
+            del records[key]
+        self.store.set_meta(POOL_SPEED_META, json.dumps(records, sort_keys=True))
+        if result.mbps is None:
+            self.log.info("замер скорости %s не удался: %s", info.tag, result.error)
+        else:
+            self.log.info("замер скорости %s: %s, %d байт за %.1f с", info.tag,
+                          speed.mbps_text(result.mbps), result.bytes_read, result.seconds)
 
     def _house_sync(self, applied: dict, now: float) -> None:
         """Рабочий конфиг Xray против режима «весь дом». После перезагрузки `xgw run` снимал
@@ -2690,9 +2861,11 @@ class Daemon:
             self.log.error("метка всего дома через пул не записана: %s", exc)
 
     def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str,
-                          manual: str = "") -> str:
+                          manual: str = "", *, chosen: speed.Candidate | None = None,
+                          slower: speed.Candidate | None = None) -> str:
         """who — адреса устройств через пул или «весь дом» (М2б.2); manual — как у сводки
-        пула: "on" — сервер выбран вручную, "down" — выбранный вручную молчит."""
+        пула: "on" — сервер выбран вручную, "down" — выбранный вручную молчит; chosen — новый
+        закреплённый (скорость по замеру), slower — прежний, если новый его быстрее."""
         whole = who == "весь дом"
         subject = "весь дом идёт" if whole else f"устройства {who} идут"
         target = "у всего дома" if whole else f"у устройств {who}"
@@ -2702,8 +2875,12 @@ class Daemon:
                 "on": " — выбран вручную",
                 "down": ": выбранный вручную не отвечает — сервер выбирает шлюз",
             }.get(manual, "")
+            if slower is not None:
+                note = f" — быстрее, чем {speed.describe(slower)}" + note
+            mbps = chosen.mbps if chosen is not None else None
             return (f"бесплатный пул: {subject} через «{name}»"
-                    + (f" ({country})" if country else "") + note)
+                    + (f" ({country})" if country else "")
+                    + (f", {speed.mbps_text(mbps)}" if mbps is not None else "") + note)
         if not pool:
             return f"бесплатный пул: допущенных серверов нет — {target} закрыто"
         return f"бесплатный пул: все серверы пула молчат — {target} закрыто"
@@ -2724,6 +2901,7 @@ class Daemon:
         for info in infos:
             if info.fingerprint in names:
                 self._pool_names[info.tag] = names[info.fingerprint]
+                self._pool_ids[info.tag] = info.fingerprint
         applied_fps = {info.fingerprint for info in infos}
         lost = [info for info in infos if info.fingerprint not in names]
         room = len(infos) < traffic.MEMBERS and bool(set(names) - applied_fps)
@@ -4707,6 +4885,7 @@ class Daemon:
                 self.guard.note_total(self._speed_key(info), total)
             self.speed_done += 1
             count += 1
+            self._speed_ran = True
             if result.mbps is None:
                 self.log.info("замер скорости %s не удался: %s", info.tag, result.error)
             else:

@@ -547,6 +547,7 @@
       if (server) {
         $("current-label").textContent = "Бесплатный сервер";
         $("current-name").textContent = plain(server) + (flow.country ? ` (${flow.country})` : "")
+          + (flow.mbps !== null && flow.mbps !== undefined ? ` · ${mbps(flow.mbps)}` : "")
           + (flow.delay_ms ? ` · ${flow.delay_ms} мс` : "");
         $("current-name").title = plain(server);
       }
@@ -1624,7 +1625,8 @@
       const back = flow.all ? "Вернуть подписку — «Вернуть режим подписок»." : "Вернуть на подписку — «Сервер: авто» в списке устройств.";
       return `Через бесплатные серверы: ${names} — закрыто: ${flow.members ? "все серверы пула молчат" : "допущенных серверов нет"}. ${back}`;
     }
-    return `Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
+    const rate = flow.mbps !== null && flow.mbps !== undefined ? `, ${mbps(flow.mbps)}` : "";
+    return `Через бесплатные серверы: ${names} — сервер «${flow.server || "?"}»${flow.country ? ` (${flow.country})` : ""}${rate}, задержка ${flow.delay_ms || 0} мс; живых ${flow.alive || 0} из ${flow.members || 0}.`;
   }
 
   // Строки серверов пула — только пока открыта вкладка; заново — по новой сводке демона.
@@ -1729,6 +1731,19 @@
     return el("span", { class: `delay ${tone}`, text });
   }
 
+  // Скорость сервера в работе у устройств — по замеру шлюза, как у серверов подписки; замер при
+  // занятом канале бледнее.
+  function poolSpeed(item, s) {
+    const live = item.live;
+    if (!live || live.mbps === null || live.mbps === undefined) return null;
+    const busy = Boolean(live.speed_busy);
+    return el("span", {
+      class: `speed${busy ? " old" : ""}`, text: mbps(live.mbps),
+      title: `Скорость по замеру ${stamp(live.speed_at, s.now)}`
+        + (busy ? " — канал был занят, цифра может быть занижена" : ""),
+    });
+  }
+
   function poolNote(item, s) {
     const row = item.row;
     const failed = Boolean(row.checked_at) && !poolWorks(row);
@@ -1785,7 +1800,7 @@
     return el("li", { class: classes.join(" ") },
       el("span", { class: `dot ${tone}` }),
       title,
-      el("div", { class: "values" }, poolValue(item, s)),
+      el("div", { class: "values" }, poolSpeed(item, s), poolValue(item, s)),
       el("div", { class: "row-sub", text: poolNote(item, s) }),
       el("div", { class: "row-tools" }, poolChoose(row, s, pinned)));
   }
