@@ -13,7 +13,8 @@ YouTube, у Google — плохая связность с его сетью ил
    переадресацией (3xx) — тоже ответ YouTube через сервер; ошибка соединения, TLS, тишина или
    код 4xx/5xx — «не пропускает»;
 2. загрузка до SPEED_MB из speed.youtube_speed_url — неизменяемый файл на dl.google.com (те же
-   узлы Google, что отдают видео; Range понимает, проверено 31.10.2026): хватает ли скорости на
+   узлы Google, что отдают видео; Range понимает, проверено 31.10.2026; с части адресов он
+   отдаётся переадресацией на узел кэша *.gvt1.com — она проходится): хватает ли скорости на
    видео без буферизации — не меньше speed.youtube_mbps вместе с трафиком клиентов через этот
    же сервер за прошлый шаг (сервер, через который клиенты уже качают, своей загрузкой не
    разогнать). Файл не отдан с ошибкой HTTP — скорость не узнать, но YouTube отвечает: годен.
@@ -26,7 +27,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from ..config import Config
 from ..generator.builder import PROBE_USER, NodeInfo
@@ -36,6 +37,12 @@ from .speed import MB, MIN_BYTES, mbps_text
 OK, BLOCKED, SLOW, CANCELLED = "ok", "blocked", "slow", "cancelled"
 SPEED_MB = 4.0  # загрузка с серверов Google не больше…
 SPEED_SECONDS = 8.0  # …и не дольше
+# Переадресации файла замера: dl.google.com → redirector.gvt1.com → rN---sn-….gvt1.com (узел кэша
+# Google рядом с выходом сервера; отчёт youtube 01.11.2026: у 7 серверов пула из 8 скорость не
+# замерялась — переадресацию клиент проб считал ошибкой). Только https и только к доменам Google.
+REDIRECTS = 4
+GOOGLE = ("google.com", "gvt1.com", "gvt2.com", "googleapis.com", "googlevideo.com",
+          "gstatic.com", "googleusercontent.com", "ggpht.com", "youtube.com", "ytimg.com")
 # Трафик одного запроса без тела: рукопожатие TLS (цепочка сертификатов Google) и заголовки.
 # Оценка сверху — для счётчиков своего трафика (daemon.Daemon._youtube_rates).
 HANDSHAKE_BYTES = 8_000
@@ -47,6 +54,14 @@ class Verdict:
     mbps: float | None = None  # своя загрузка с серверов Google; None — не замерялась
     bytes_used: int = 0
     error: str = ""
+
+
+def google(url: str) -> bool:
+    """https-адрес на домене Google — по нему переадресацию файла замера можно пройти."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and any(
+        host == domain or host.endswith("." + domain) for domain in GOOGLE)
 
 
 def reached(result: DownloadResult) -> bool:
@@ -79,18 +94,26 @@ def check(
     if not speed or not cfg.speed.youtube_mbps or not url:
         return Verdict(OK, bytes_used=used)
     size = int(SPEED_MB * MB)
-    result = http_get_via_proxy(
-        "127.0.0.1", node.probe_port, url, timeout=15.0, silence=5.0,
-        proxy_user=PROBE_USER, proxy_pass=probe_pass, max_total=SPEED_SECONDS + 20.0,
-        user_agent=cfg.probe.user_agent, max_bytes=size, max_body_seconds=SPEED_SECONDS,
-        range_end=size, cancel=cancel,
-    )
-    used += HANDSHAKE_BYTES + result.downloaded
+    for _hop in range(REDIRECTS + 1):
+        result = http_get_via_proxy(
+            "127.0.0.1", node.probe_port, url, timeout=15.0, silence=5.0,
+            proxy_user=PROBE_USER, proxy_pass=probe_pass, max_total=SPEED_SECONDS + 20.0,
+            user_agent=cfg.probe.user_agent, max_bytes=size, max_body_seconds=SPEED_SECONDS,
+            range_end=size, cancel=cancel,
+        )
+        used += HANDSHAKE_BYTES + result.downloaded
+        target = urljoin(url, result.location) if result.location else ""
+        if not (result.kind == "http" and target and google(target)):
+            break
+        url = target  # dl.google.com отдаёт файл с узлов кэша Google (*.gvt1.com) переадресацией
     if result.kind == "cancelled":
         return Verdict(CANCELLED, bytes_used=used, error=result.error)
     if not result.ok and result.kind in ("http", "proxy"):
-        return Verdict(OK, bytes_used=used, error=f"файл замера Google: {result.error}")
-    if result.ok and result.downloaded < MIN_BYTES:
+        why = "переадресация не к Google" if result.location and not google(target) else (
+            "слишком много переадресаций" if result.location else result.error)
+        return Verdict(OK, bytes_used=used, error=f"файл замера Google: {why}")
+    capped = result.body_seconds >= SPEED_SECONDS - 0.5  # тело оборвано по времени, а не кончилось
+    if result.ok and result.downloaded < MIN_BYTES and not capped:
         return Verdict(OK, bytes_used=used,
                        error=f"файл замера Google слишком мал: {result.downloaded} байт")
     # Тишина, обрыв, таймаут — сколько успело прийти за время тела (ничего — 0).

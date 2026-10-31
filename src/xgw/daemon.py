@@ -225,6 +225,8 @@ POOL_WAIT = 120.0
 # не через часы); пул закрыт — списки серверов обновляются вне расписания, не чаще POOL_REFRESH.
 POOL_SILENT = 300.0
 POOL_REFRESH = 1800.0
+# Шаг watchdog дольше TICK_SLOW — строка в журнале: что в нём шло (Daemon.run, _tick_work).
+TICK_SLOW = 60.0
 # Скорость серверов «pool» (_pool_speed_step) — обычным замером (speed.measure, speed.max_mb):
 # экономия их трафика не нужна (решение заказчика 5). Живой сервер без замера — сразу, по одному
 # за шаг; повторный замер — раз в speed.unlimited_hours, при занятом канале пула (больше
@@ -634,6 +636,7 @@ class Daemon:
         # первое закрепление после запуска.
         self._pool_boot = self._pool_saved = self.store.get_meta(POOL_PINNED_META) or ""
         self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
+        self._youtube_ran = False  # на этом шаге шла проверка YouTube
         # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
         # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
         # (тег, байты), шёл ли замер скорости шагом раньше (тогда счётчики им испорчены), когда
@@ -783,11 +786,18 @@ class Daemon:
         self.log.info("демон XGW запущен, шаг watchdog %d с", self.cfg.watchdog.interval_s)
         self._stop = stop
         while not stop.is_set() and not changed():
+            started = time.monotonic()
             try:
                 state = self.tick()
             except Exception:  # сбой одного шага не должен ронять демон
                 self.log.exception("шаг watchdog завершился ошибкой")
                 state = self.machine.state
+            spent = time.monotonic() - started
+            if spent >= TICK_SLOW:
+                # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
+                # freepool-recovery, youtube: режим «весь дом» не появлялся в ней 3 минуты).
+                self.log.warning("шаг watchdog занял %d с — состояние обновлено с опозданием (%s)",
+                                 spent, self._tick_work())
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
             if self._manual_scan and self.scan_queue:
                 pause = MANUAL_SCAN_PAUSE
@@ -795,6 +805,14 @@ class Daemon:
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+
+    def _tick_work(self) -> str:
+        """Что из долгого шло в последнем шаге — для строки о долгом шаге (run)."""
+        parts = [name for name, done in (
+            ("скан", self._scanned), ("замер скорости подписки", self._speed_ran),
+            ("замер сервера пула", self._pool_speed_ran), ("проверка YouTube", self._youtube_ran),
+        ) if done]
+        return ", ".join(parts) or "без проверок и замеров"
 
     @property
     def stopping(self) -> bool:
@@ -1165,7 +1183,7 @@ class Daemon:
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
-        self._scanned = self._speed_ran = self._pool_speed_ran = False
+        self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
@@ -3188,6 +3206,7 @@ class Daemon:
         info, key, carries, measure, pooled = target
         client = self._youtube_rates.get(info.tag, 0.0) if carries else 0.0
         verdict = self._youtube_check(info, password, client=client, measure=measure)
+        self._youtube_ran = True
         if verdict.state == youtube.CANCELLED:
             return  # проверку прервала остановка демона: о сервере она ничего не говорит
         self._youtube_own = (info.tag, verdict.bytes_used)

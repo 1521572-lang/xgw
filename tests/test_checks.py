@@ -197,6 +197,10 @@ def test_no_content_response_ends_without_waiting_for_close():
         result = checks._read_response(left, silence=3.0, deadline=time.monotonic() + 10.0)
         assert result.ok and result.status == 204 and result.downloaded == 0
         assert time.monotonic() - started < 1.0
+        # Переадресация: адрес из Location — вызывающему (проверка YouTube идёт по нему).
+        right.sendall(b"HTTP/1.1 302 Found\r\nlocation: https://r1.gvt1.com/f\r\n\r\n")
+        moved = checks._read_response(left, silence=3.0, deadline=time.monotonic() + 10.0)
+        assert not moved.ok and moved.status == 302 and moved.location == "https://r1.gvt1.com/f"
     finally:
         left.close()
         right.close()

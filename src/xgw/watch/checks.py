@@ -40,6 +40,7 @@ class DownloadResult:
     # None — не замерялась или сервер закрыл соединение после первого ответа.
     rtt_ms: float | None = None
     reusable: bool = False  # соединение после ответа годится для следующего запроса
+    location: str = ""  # заголовок Location ответа 3xx (переходит по нему вызывающий)
 
     @property
     def frozen(self) -> bool:
@@ -249,7 +250,8 @@ def _read_response(
         return DownloadResult(ok=False, kind="http", error="ответ не похож на HTTP")
     if not 200 <= status < 300:
         kind = "proxy" if status == 407 else "http"
-        return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}")
+        return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}",
+                              location=_header(head, "location") if 300 <= status < 400 else "")
     if status == 204:
         length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
@@ -325,6 +327,15 @@ def _parse_head(head: bytes) -> tuple[int | None, int | None, bool]:
     if chunked:
         length = None  # длина тела задаётся кадрами, Content-Length игнорируется
     return int(fields[1]), length, chunked
+
+
+def _header(head: bytes, wanted: str) -> str:
+    """Значение заголовка ответа (имя без учёта регистра); пусто — заголовка нет."""
+    for line in head.decode("latin-1").split(fetch.CRLF)[1:]:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == wanted:
+            return value.strip()
+    return ""
 
 
 def _complete(downloaded: int, length: int | None, chunked: bool, tail: bytes) -> bool:

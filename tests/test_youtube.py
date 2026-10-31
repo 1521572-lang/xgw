@@ -80,3 +80,33 @@ def test_youtube_settings_are_checked(tmp_path):
     defaults = Config().speed
     assert defaults.youtube and defaults.youtube_mbps == 5
     assert defaults.youtube_urls == list(config.DEFAULT_YOUTUBE_URLS)
+
+
+def test_youtube_speed_file_follows_google_redirects(monkeypatch):
+    """Отчёт youtube 01.11.2026: у 7 серверов пула из 8 скорость не замерялась — dl.google.com
+    отдавал файл переадресацией на узел кэша Google. По ней проверка идёт (только к Google);
+    переадресация не к Google — скорость не узнать."""
+    hop = "https://redirector.gvt1.com/edgedl/go/go1.22.5.linux-amd64.tar.gz"
+    cache = "https://r3---sn-abcd.gvt1.com/edgedl/go/go1.22.5.linux-amd64.tar.gz"
+    slow = DownloadResult(ok=True, downloaded=1_000_000, status=206, body_seconds=4.0)
+    calls = _fake(monkeypatch, {
+        SITE: ANSWER, VIDEO: ANSWER,
+        FILE: DownloadResult(ok=False, kind="http", status=302, error="HTTP 302", location=hop),
+        hop: DownloadResult(ok=False, kind="http", status=302, error="HTTP 302", location=cache),
+        cache: slow})
+    verdict = youtube.check(NODE, Config(), probe_pass="x")
+    assert verdict.state == youtube.SLOW and verdict.mbps == 2.0
+    assert calls[2:] == [(FILE, 4_000_000), (hop, 4_000_000), (cache, 4_000_000)]
+    _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: DownloadResult(
+        ok=False, kind="http", status=302, error="HTTP 302", location="https://block.example/")})
+    verdict = youtube.check(NODE, Config(), probe_pass="x")
+    assert verdict.state == youtube.OK and verdict.mbps is None
+    assert verdict.error == "файл замера Google: переадресация не к Google"
+
+
+def test_youtube_speed_cut_by_time_is_slow(monkeypatch):
+    """За 8 с пришло меньше 256 КБ — это не «файл мал», а «тормозит»."""
+    crawl = DownloadResult(ok=True, downloaded=100_000, status=206, body_seconds=8.0)
+    _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: crawl})
+    verdict = youtube.check(NODE, Config(), probe_pass="x")
+    assert verdict.state == youtube.SLOW and verdict.mbps == 0.1
