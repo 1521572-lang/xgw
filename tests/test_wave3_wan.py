@@ -1,7 +1,8 @@
 """Обновление сохраняет действующий WAN; проверка без настоящей сети."""
 from test_install import Box
 
-from xgw.net import sysctl
+from xgw.install import Journal
+from xgw.net import nm, sysctl
 
 
 def test_existing_unit_preserves_current_wan_even_after_partial_install(tmp_path):
@@ -38,3 +39,17 @@ def test_preserved_wan_boot_key_is_not_written_back_to_current_interface(tmp_pat
     assert key not in written and key not in previous
     assert target.read_text().strip() == "0"
     assert key + " = 1" in box.paths.sysctl_file.read_text()
+
+
+def test_update_does_not_move_active_wan_profile_named_xgw_lan(tmp_path):
+    box = Box(tmp_path)
+    Journal(box.paths.journal_file).set("finished", 1)
+    wan = box.system.profile("wan")
+    wan["connection.id"] = nm.PROFILE  # след старой ошибочной привязки
+    before = dict(wan)
+    assert box.install() == 1
+    assert "перепривязка входящего подключения запрещена" in box.text()
+    assert wan == before
+    uuid = box.system.uuid_of(nm.PROFILE)
+    assert not [call for call in box.system.commands("nmcli", "connection", "modify")
+                if uuid in call]

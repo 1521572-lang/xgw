@@ -931,6 +931,15 @@ class Installer:
             conflict = self.subnet_conflict()
             if conflict:
                 raise InstallError(conflict)
+            if self._preserve_wan and facts.nm_running and facts.wan_if:
+                wan_uuid = self.nm.active_uuid(facts.wan_if)
+                if wan_uuid:
+                    profiles = self.nm.profiles()
+                    info = self.nm.get(wan_uuid, "connection.interface-name")
+                    if (any(p.uuid == wan_uuid and p.name == nm.PROFILE for p in profiles)
+                            or info.get("connection.interface-name") == facts.lan_if):
+                        raise InstallError("активный профиль WAN конфликтует с настройкой LAN; "
+                                           "перепривязка входящего подключения запрещена")
             self._sysctl(facts)
             self._step(f"sysctl — {self.paths.sysctl_file}")
             record, warnings = nm.setup_lan(
