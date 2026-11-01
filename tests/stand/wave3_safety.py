@@ -158,12 +158,16 @@ def pulse(directory: Path, disarm: bool = False) -> None:
 
 def job(directory: Path, action: str, repo: Path) -> None:
     pulse(directory)
+    # Повторный install в том же опыте не должен выглядеть завершённым по rc старого enable.
+    save(directory / "job-result.json", {"action": action, "state": "running", "rc": None})
     command = (["/bin/sh", str(repo / "packaging/install.sh"), "--yes"]
                if action == "install" else ["/usr/local/bin/xgw", "enable"])
     with (directory / "job.log").open("wb") as stream:
         result = subprocess.run(command, cwd=repo, stdout=stream,
                                 stderr=subprocess.STDOUT, check=False)
-    save(directory / "job-result.json", {"action": action, "rc": result.returncode})
+    save(directory / "job-result.json", {
+        "action": action, "state": "finished", "rc": result.returncode,
+    })
 
 
 def observe(directory: Path) -> None:

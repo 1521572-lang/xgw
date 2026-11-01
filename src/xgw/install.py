@@ -1242,12 +1242,12 @@ class Installer:
             capture.up()  # повторная установка: выбор пользователя (enable/disable) в силе
         elif xray_ok:
             capture.enable()
+        elif self._capture_initial_on:
+            raise InstallError("Xray не готов после обновления; выбранный VPN не снимается")
         elif not engine.has_sources(self.cfg):
             capture.disable()
             self._step("подписок пока нет — VPN не включён, интернет работает напрямую")
         else:
-            if self._capture_initial_on:
-                raise InstallError("Xray не готов после обновления; выбранный VPN не снимается")
             capture.disable()
             self._warn(
                 "Xray не запущен, поэтому перехват не включён: интернет работает напрямую. "

@@ -35,7 +35,12 @@ def test_failed_install_resumes_only_paused_controller(tmp_path):
     assert not box.system.commands("systemctl", "stop", "xgw-xray.service")
 
 
-def test_existing_implicit_on_does_not_become_off_on_failed_first_apply(tmp_path):
+@pytest.mark.parametrize("has_sources", [True, False])
+def test_existing_implicit_on_does_not_become_off_on_failed_first_apply(
+        tmp_path, monkeypatch, has_sources):
+    from xgw import engine
+
+    monkeypatch.setattr(engine, "has_sources", lambda cfg: has_sources)
     box = Box(tmp_path)
     installer = box.installer()
     installer._capture_initial_on = True
@@ -70,6 +75,25 @@ def safety():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_new_job_does_not_report_previous_enable_success(tmp_path, monkeypatch):
+    tool = safety()
+    result = tmp_path / "job-result.json"
+    tool.save(result, {"action": "enable", "state": "finished", "rc": 0})
+    monkeypatch.setattr(tool, "pulse", lambda directory: None)
+
+    def run(command, **kwargs):
+        assert tool.json.loads(result.read_text()) == {
+            "action": "install", "state": "running", "rc": None,
+        }
+        return tool.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    tool.job(tmp_path, "install", tmp_path)
+    assert tool.json.loads(result.read_text()) == {
+        "action": "install", "state": "finished", "rc": 0,
+    }
 
 
 def test_expired_local_lease_recovers_without_tester_or_network(tmp_path, monkeypatch):
