@@ -175,6 +175,32 @@ sudo xgw pool | head -1
 не выключать его ради подготовки. Не продолжать по одному последнему коду pipeline:
 проверить сам ожидаемый текст; пустой вывод не является успехом.
 
+Ручной выбор получить отдельно безопасным фильтром JSON; весь status JSON не печатать:
+
+```bash
+sudo python3 -I - <<'PY'
+import hashlib,json,re,subprocess
+result=subprocess.run(['/usr/local/bin/xgw','status','--json'],stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,timeout=12,check=True)
+data=json.loads(result.stdout)
+if 'pin' not in data:
+    raise SystemExit('STOP: неизвестная схема pin')
+pin=data['pin']
+if pin is not None and (not isinstance(pin,dict) or not isinstance(pin.get('tag'),str)):
+    raise SystemExit('STOP: неизвестная схема pin')
+tag=pin['tag'] if pin else None
+safe=bool(tag and re.fullmatch(r'(?:proxy|spare)-[a-z]{2}-[0-9a-f]{4,64}',tag))
+print(json.dumps({'manual_pin_active':bool(pin),'safe_tag':tag if safe else None,
+                  'tag_sha256':hashlib.sha256(tag.encode()).hexdigest() if tag else None,
+                  'down':bool(pin and pin.get('down'))}))
+print('PIN_STATE_OK')
+PY
+```
+
+Нужен PIN_STATE_OK. Отсутствие активного pin допустимо: записать manual_pin_active=false,
+не создавать выбор. При скрытом tag сравнивать fingerprint. Изменение/истечение pin позже
+записать как факт; не возвращать старый выбор вручную для совпадения с ожиданием.
+
 ```bash
 python3 -I - <<'PY'
 import subprocess
@@ -381,7 +407,7 @@ Guardian намеренно оставляет xgw/xgw-net остановлен�
 sleep 5
 ```
 
-Повторить read-only команды status/pool и CORE_UNITS-проверку из S2.2: HEALTHY/off/pool off, прежние
+Повторить read-only команды status/pool, PIN_STATE и CORE_UNITS из S2.2: HEALTHY/off/pool off, прежние
 ядра/pin и связь. Иначе STOP. Не переходить к B1 по старому статусу из прежнего окна.
 
 ## 6. B1: новая off-база перед enable
@@ -529,7 +555,7 @@ sudo systemctl start xgw
 sleep 5
 ```
 
-Read-only status/pool и CORE_UNITS-проверка из S2.2: ожидаются HEALTHY/off/pool off,
+Read-only status/pool, PIN_STATE и CORE_UNITS из S2.2: ожидаются HEALTHY/off/pool off,
 CORE_UNITS_OK, прежние ядра/pin.
 Если сам сбор был прерван, но возврат доказан, старт контроллера всё равно разрешён:
 это восстановление проверенного off, не новая попытка enable.
