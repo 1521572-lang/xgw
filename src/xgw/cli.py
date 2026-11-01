@@ -535,8 +535,11 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
     password, _ports = builder.probe_state(applied)
     view = builder.applied_nodes(applied)
     if args.tag and not args.all:
-        suffix = args.tag.split("-", 1)[-1]
-        view = [info for info in view if args.tag in (info.tag, info.probe_tag, suffix)]
+        # Тег сервера, тег его probe-inbound или их общая часть «nl-1a2b». Раньше общая часть
+        # бралась из самого аргумента, и слово без дефиса совпадало с любым узлом — `xgw probe нет`
+        # проверял все серверы подряд (отчёт audit6, шаг 3.1).
+        view = [info for info in view
+                if args.tag in (info.tag, info.probe_tag, info.tag.split("-", 1)[-1])]
         if not view:
             return _fail(f"узла {args.tag} нет в рабочем конфиге (см. xgw servers)", 2)
     if not password or not view:

@@ -370,6 +370,10 @@ def test_probe_single_tag_exit_code(gateway, monkeypatch, capsys):
     capsys.readouterr()
     assert gateway.run("probe", "proxy-zz-0000") == 2
     assert "нет в рабочем конфиге" in capsys.readouterr().err
+    # Отчёт audit6: слово без дефиса («нет» вместо тега) проверяло все серверы подряд.
+    assert gateway.run("probe", "нет") == 2
+    assert gateway.run("probe", member.split("-", 1)[1]) == 0  # общая часть тега «nl-1a2b»
+    assert [tag for tag, _password in seen] == [member, spare, member]
 
 
 # --- pin / unpin ---------------------------------------------------------------

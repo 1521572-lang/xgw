@@ -640,6 +640,7 @@ class Daemon:
         self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
         self._youtube_ran = False  # на этом шаге шла проверка YouTube
         self._tick_spent: dict[str, float] = {}  # части шага → секунды (_spent)
+        self._rebuild_spent = (0.0, 0.0)  # последняя сборка: (сборка, применение), секунды
         # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
         # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
         # (тег, байты), шёл ли замер скорости шагом раньше (тогда счётчики им испорчены), когда
@@ -2142,6 +2143,8 @@ class Daemon:
     def _refresh_now(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
         minutes = min((sub.refresh_minutes for sub in self.cfg.subscriptions), default=60)
         self.next_refresh = now + jitter(max(1, minutes) * 60.0)
+        began = time.monotonic()
+        self._rebuild_spent = (0.0, 0.0)
         try:
             inventory = self._collect(via_xray)
         except fetch.Cancelled:
@@ -2172,7 +2175,13 @@ class Daemon:
         if inventory.complete:
             self._sub_failing_since, self._sub_alerted = None, False
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
-        return self._rebuild(None, urgent=urgent, reason="обновление подписки")
+        collected = time.monotonic() - began
+        changed = self._rebuild(None, urgent=urgent, reason="обновление подписки")
+        # Отчёты youtube3 и audit6: шаг с обновлением подписки длится 80–110 с — где именно время.
+        assembled, applied = self._rebuild_spent
+        self.log.info("обновление подписки: опрос %.0f с, сборка %.0f с, применение %.0f с",
+                      collected, assembled, applied)
+        return changed
 
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
@@ -2188,6 +2197,7 @@ class Daemon:
         # Перечитывание sing-box рвёт соединения через него: сразу — при аварии и в окне
         # перезапуска, иначе — только если через него никто не идёт (engine.assemble).
         reload = True if urgent or self._singbox_window() else None
+        began = time.monotonic()
         try:
             assembly = self._assemble(prefer, reserve, profiles, reload)
         except engine.EngineError as exc:
@@ -2198,7 +2208,9 @@ class Daemon:
                 # Сборка отложила домены, которых нет в DNS. Список для панели записан до
                 # неё — иначе там такой сервер значился бы «включён, сейчас возьмёт в работу».
                 self._save_inventory(self.inventory)
+        assembled = time.monotonic()
         outcome = self._apply(assembly.result.config, urgent=urgent, singbox=assembly.singbox)
+        self._rebuild_spent = (assembled - began, time.monotonic() - assembled)
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)
         return self._report(outcome, reason)
