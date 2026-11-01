@@ -81,7 +81,10 @@ def test_new_job_does_not_report_previous_enable_success(tmp_path, monkeypatch):
     tool = safety()
     result = tmp_path / "job-result.json"
     tool.save(result, {"action": "enable", "state": "finished", "rc": 0})
-    tool.save(tmp_path / "status.json", {"state": "armed", "dry": False})
+    tool.save(tmp_path / "status.json", {
+        "state": "armed", "kind": "fixed", "dry": False,
+        "deadline": tool.time.monotonic() + 25,
+    })
     monkeypatch.setattr(tool, "pulse", lambda directory: None)
 
     def run(command, **kwargs):
@@ -103,6 +106,47 @@ def test_dry_calibration_cannot_authorize_install(tmp_path, monkeypatch):
     monkeypatch.setattr(tool, "pulse", lambda directory: pytest.fail("must not pulse"))
     with pytest.raises(SystemExit, match="dry"):
         tool.job(tmp_path, "install", tmp_path)
+
+
+@pytest.mark.parametrize("dry", [True, False])
+def test_fixed_window_cannot_be_cancelled_or_extended_by_operator_files(tmp_path, monkeypatch, dry):
+    tool = safety()
+    clock = [0.0]
+    monkeypatch.setattr(tool.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        # Даже auto-pulse и disarm-файл не продлевают заранее ограниченный опыт.
+        tool.save(tmp_path / "lease.json", clock[0])
+        (tmp_path / "disarm").touch()
+        clock[0] += seconds
+
+    monkeypatch.setattr(tool.time, "sleep", sleep)
+    boot = tool.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    tool.save(tmp_path / "snapshot.json", {"boot": boot})
+    monkeypatch.setattr(tool, "restore", lambda directory:
+                        tool.save(directory / "status.json", {"state": "RESTORED_OFF"}))
+    tool.window(tmp_path, 25, dry=dry)
+    assert clock[0] == 25
+    expected = "WINDOW_EXPIRED" if dry else "RESTORED_OFF"
+    assert tool.json.loads((tmp_path / "status.json").read_text())["state"] == expected
+
+
+def test_job_refuses_legacy_operator_lease_even_when_it_is_fresh(tmp_path):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "armed", "dry": False})
+    with pytest.raises(SystemExit, match="непродлеваемое"):
+        tool.job(tmp_path, "install", tmp_path)
+
+
+def test_launch_refuses_job_if_guard_start_is_not_confirmed(tmp_path, monkeypatch):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "prepared"})
+    calls = []
+    monkeypatch.setattr(tool, "call", lambda argv, timeout, **kwargs:
+                        calls.append(argv) or 124)
+    with pytest.raises(SystemExit, match="старт страховки"):
+        tool.launch(tmp_path, "install", tmp_path)
+    assert len(calls) == 1 and "--unit=" + tool.SAFETY in calls[0]
 
 
 def test_expired_local_lease_recovers_without_tester_or_network(tmp_path, monkeypatch):

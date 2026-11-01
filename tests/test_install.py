@@ -255,14 +255,14 @@ def test_ipv6_proxy_leaves_ipv6_on_wan_and_loads_its_rules(box):
     assert system.kernel.tables == {} and system.kernel.rules6 == [] and not system.kernel.route6
 
 
-def test_ipv6_off_to_proxy_gives_ipv6_back_to_wan_and_back_again(box):
+def test_ipv6_mode_changes_on_update_preserve_wan_profile(box):
     assert box.install() == 0
     assert box.system.profile("wan")["ipv6.method"] == "disabled"
     box.cfg.network.ipv6 = "proxy"
     assert box.install() == 0, box.text()
-    assert box.system.profile("wan")["ipv6.method"] == "auto"  # как было до XGW
-    assert "nm_wan" not in Journal(box.paths.journal_file).data
-    assert "IPv6 в профиле WAN (wan0) возвращён" in box.text()
+    assert box.system.profile("wan")["ipv6.method"] == "disabled"  # текущее состояние сохранено
+    assert Journal(box.paths.journal_file).get("nm_wan")["ipv6_method"] == "auto"
+    assert "обратная миграция IPv6 при обновлении не выполняется" in box.text()
     box.cfg.network.ipv6 = "off"
     assert box.install() == 0
     assert box.system.profile("wan")["ipv6.method"] == "disabled"
@@ -315,15 +315,15 @@ def test_netplan_wan_gets_ipv6_off_by_sysctl_and_back(box, lan_if):
     assert "IPv6 на wan0 — как до установки" in box.text() and "✗" not in box.text()
 
 
-def test_netplan_wan_ipv6_comes_back_when_ipv6_goes_through_xray(box):
+def test_netplan_wan_ipv6_boot_setting_is_preserved_when_proxy_is_selected(box):
     key = _netplan_wan(box)
     assert box.install() == 0
     box.cfg.network.ipv6 = "proxy"
     assert box.install() == 0, box.text()
-    assert key.read_text(encoding="ascii").strip() == "0"
-    assert "disable_ipv6" not in box.paths.sysctl_file.read_text(encoding="utf-8")
-    assert "nm_wan" not in Journal(box.paths.journal_file).data
-    assert "IPv6 на wan0 возвращён" in box.text()
+    assert key.read_text(encoding="ascii").strip() == "1"
+    text = box.paths.sysctl_file.read_text(encoding="utf-8")
+    assert "net/ipv6/conf/wan0/disable_ipv6 = 1" in text
+    assert Journal(box.paths.journal_file).get("nm_wan")["sysctl"] is True
 
 
 def test_second_install_keeps_the_original_state_in_the_journal(box):

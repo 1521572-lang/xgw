@@ -1,4 +1,4 @@
-"""Локальная страховка только для согласованного повторного теста wave3c.
+"""Локальная страховка только для согласованного повторного теста wave3d.
 
 Не устанавливается как часть XGW. Исходное состояние обязательно off. Доверенная
 копия и snapshot готовятся до опасных действий; watchdog запускается отдельным
@@ -19,8 +19,8 @@ from pathlib import Path
 
 LEASE_SECONDS = 25.0
 MAX_SECONDS = 1800.0
-JOB = "xgw-w3c-job.service"
-SAFETY = "xgw-w3c-safety.service"
+JOB = "xgw-w3d-job.service"
+SAFETY = "xgw-w3d-safety.service"
 
 
 def atomic(path: Path, data: bytes) -> None:
@@ -57,6 +57,8 @@ def prepare(directory: Path) -> None:
     from xgw.paths import Paths
 
     paths = Paths.from_env()
+    if not (paths.systemd_dir / "xgw.service").is_file():
+        raise SystemExit("STOP: этот тест допустим только для существующей установки")
     cfg, _ = config.load(paths.config_file)
     capture = Capture(cfg, paths)
     if capture.mode() != "off" or capture.choice() is not False or cfg.free_pool.mode != "off":
@@ -74,6 +76,7 @@ def prepare(directory: Path) -> None:
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     atomic(directory / "off.nft", data)
     atomic(directory / "capture.json", paths.var.joinpath("capture.json").read_bytes())
+    wan = lan.effective_wan(cfg, cmd.run)
     save(directory / "snapshot.json", {
         "capture_state": str(paths.var / "capture.json"),
         "open_marker": str(paths.run / "capture-open"),
@@ -81,7 +84,8 @@ def prepare(directory: Path) -> None:
         "state_sha256": hashlib.sha256((directory / "capture.json").read_bytes()).hexdigest(),
         "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "status_file": str(paths.status_file),
-        "interfaces": {"WAN": lan.effective_wan(cfg, cmd.run), "LAN": cfg.network.lan_if},
+        "interfaces": {"WAN": wan, "LAN": cfg.network.lan_if},
+        "wan_facts": wan_facts(wan),
         "bypass_mark": cfg.capture.mark_bypass,
     })
     save(directory / "status.json", {"state": "prepared"})
@@ -160,8 +164,60 @@ def watch(directory: Path, dry: bool = False) -> None:
         time.sleep(0.25)
 
 
+def window(directory: Path, seconds: int, dry: bool = False) -> None:
+    """Непродлеваемое окно: закончится даже без единой следующей команды модели."""
+    if seconds not in (25, 45):
+        raise SystemExit("STOP: допустимы только окна25/45с")
+    if not dry:
+        snapshot = json.loads((directory / "snapshot.json").read_text())
+        if snapshot["boot"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
+            raise SystemExit("STOP: snapshot от другой загрузки")
+    began = time.monotonic()
+    deadline = began + seconds
+    save(directory / "lease.json", began)  # метрика полного срока в restore
+    save(directory / "status.json", {
+        "state": "armed", "kind": "fixed", "dry": dry,
+        "deadline": deadline, "window_seconds": seconds,
+    })
+    while time.monotonic() < deadline:
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    if dry:
+        save(directory / "status.json", {"state": "WINDOW_EXPIRED", "window_seconds": seconds})
+    else:
+        restore(directory)
+
+
+def launch(directory: Path, action: str, repo: Path) -> None:
+    """Весь старт локален: сначала независимый timer, потом ограниченный test-job."""
+    if json.loads((directory / "status.json").read_text()).get("state") != "prepared":
+        raise SystemExit("STOP: нужен новый подготовленный snapshot")
+    seconds = 45 if action == "install" else 25
+    if call(["systemd-run", "--unit=" + SAFETY, "--collect", "--property=TimeoutStopSec=2",
+             "/usr/bin/python3", "-I", str(Path(__file__).resolve()), "window",
+             str(directory), str(seconds)], 3) != 0:
+        raise SystemExit("STOP: старт страховки не подтверждён; не повторять, проверить status")
+    until = time.monotonic() + 2
+    while time.monotonic() < until:
+        state = json.loads((directory / "status.json").read_text())
+        if state.get("state") == "armed" and state.get("kind") == "fixed":
+            break
+        time.sleep(0.05)
+    else:
+        raise SystemExit("STOP: таймер не вооружён; job не запущен")
+    if call(["systemctl", "is-active", "--quiet", SAFETY], 1) != 0:
+        raise SystemExit("STOP: служба страховки не active; job не запущен")
+    if call(["systemd-run", "--unit=" + JOB, "--collect", "--property=TimeoutStopSec=2",
+             "/usr/bin/python3", "-I", str(Path(__file__).resolve()), "job",
+             str(directory), action, str(repo)], 3) != 0:
+        raise SystemExit("STOP: job не подтверждён; таймер уже работает, не повторять")
+    print(json.dumps({"started": action, "fixed_window_seconds": seconds,
+                      "rollback": "always_off", "pulse_required": False}))
+
+
 def pulse(directory: Path, disarm: bool = False) -> None:
     status = json.loads((directory / "status.json").read_text())
+    if status.get("kind") == "fixed":
+        raise SystemExit("STOP: фиксированное окно нельзя продлевать или снимать")
     lease = float(json.loads((directory / "lease.json").read_text()))
     gap = time.monotonic() - lease
     if status.get("state") != "armed" or gap >= LEASE_SECONDS:
@@ -175,9 +231,12 @@ def pulse(directory: Path, disarm: bool = False) -> None:
 
 
 def job(directory: Path, action: str, repo: Path) -> None:
-    if json.loads((directory / "status.json").read_text()).get("dry") is not False:
+    status = json.loads((directory / "status.json").read_text())
+    if status.get("dry") is not False:
         raise SystemExit("STOP: dry-калибровка не разрешает install/enable")
-    pulse(directory)
+    if (status.get("state") != "armed" or status.get("kind") != "fixed"
+            or status.get("deadline", 0) - time.monotonic() < 1):
+        raise SystemExit("STOP: непродлеваемое окно не вооружено или уже завершается")
     # Повторный install в том же опыте не должен выглядеть завершённым по rc старого enable.
     save(directory / "job-result.json", {"action": action, "state": "running", "rc": None})
     command = (["/bin/sh", str(repo / "packaging/install.sh"), "--yes"]
@@ -209,6 +268,64 @@ def observe(directory: Path) -> None:
         except OSError:
             result["links"][label] = "unknown"
     print(json.dumps(result))
+
+
+def wan_facts(interface: str) -> dict:
+    """Только чтение. Адреса/UUID/DNS не печатаются: в snapshot только SHA256."""
+    def query(argv):
+        try:
+            result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=2, check=False)
+            return result.stdout if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def digest(data):
+        return hashlib.sha256(data).hexdigest() if data is not None else None
+
+    live = query(["nmcli", "-g", "GENERAL.CON-UUID,IP4.GATEWAY,IP4.DNS,IP6.GATEWAY,IP6.DNS",
+                  "device", "show", interface])
+    lines = live.decode().splitlines() if live else []
+    uuid = lines[0] if lines else ""
+    fields = ("connection.interface-name,802-3-ethernet.mtu,ipv4.method,ipv4.addresses,"
+              "ipv4.gateway,ipv4.dns,ipv4.routes,ipv4.ignore-auto-dns,ipv6.method,"
+              "ipv6.addresses,ipv6.gateway,ipv6.dns,ipv6.routes,ipv6.ignore-auto-dns")
+    profile = query(["nmcli", "-g", fields, "connection", "show", uuid]) if uuid else None
+    addresses = query(["ip", "-j", "address", "show", "dev", interface])
+    try:
+        stable = sorted((item.get("family"), item.get("local"), item.get("prefixlen"),
+                         item.get("scope")) for link in json.loads(addresses or b"null")
+                        for item in link.get("addr_info", []))
+        addresses = json.dumps(stable).encode()
+    except (ValueError, TypeError, AttributeError):
+        addresses = None
+    routes = {}
+    for family in (4, 6):
+        raw = query(["ip", "-j", f"-{family}", "route", "show", "default", "dev", interface])
+        try:
+            values = json.loads(raw or b"null")
+            stable = [{k: v for k, v in item.items() if k not in ("expires", "cache")}
+                      for item in values]
+            routes[str(family)] = digest(json.dumps(stable, sort_keys=True).encode())
+        except (ValueError, TypeError, AttributeError):
+            routes[str(family)] = None
+    try:
+        mtu = (Path("/sys/class/net") / interface / "mtu").read_text().strip()
+    except OSError:
+        mtu = None
+    return {"profile": digest(profile), "addresses": digest(addresses),
+            "live_gateway_dns": digest("\n".join(lines[1:]).encode()) if lines else None,
+            "route4": routes["4"], "route6": routes["6"], "mtu": mtu}
+
+
+def compare_wan(directory: Path) -> None:
+    snapshot = json.loads((directory / "snapshot.json").read_text())
+    before = snapshot.get("wan_facts", {})
+    after = wan_facts(snapshot["interfaces"]["WAN"])
+    compared = {key: (before[key] == value if before.get(key) is not None and value is not None
+                      else None) for key, value in after.items()}
+    verified = bool(compared) and all(v is True for v in compared.values())
+    print(json.dumps({"WAN_unchanged": compared, "all_verified": verified}))
 
 
 def probe(directory: Path) -> None:
@@ -244,6 +361,8 @@ def main() -> None:
         watch(directory, dry=True)
     elif mode == "watch":
         watch(directory)
+    elif mode in ("window", "window-dry"):
+        window(directory, int(sys.argv[3]), dry=mode == "window-dry")
     elif mode in ("pulse", "disarm"):
         pulse(directory, disarm=mode == "disarm")
         # Один короткий операторский цикл: продление и результат job в одной команде.
@@ -257,12 +376,16 @@ def main() -> None:
             print(result.read_text())
     elif mode == "observe":
         observe(directory)
+    elif mode == "facts":
+        compare_wan(directory)
     elif mode == "probe":
         probe(directory)
     elif mode == "job" and sys.argv[3] in ("install", "enable"):
         job(directory, sys.argv[3], Path(sys.argv[4]).resolve())
+    elif mode == "launch" and sys.argv[3] in ("install", "enable"):
+        launch(directory, sys.argv[3], Path(sys.argv[4]).resolve())
     else:
-        raise SystemExit("prepare|watch-dry|watch|pulse|disarm|status|job")
+        raise SystemExit("prepare|window[-dry] DIR 25|45|launch DIR install|enable REPO|status")
 
 
 if __name__ == "__main__":

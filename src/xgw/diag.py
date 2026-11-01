@@ -906,13 +906,13 @@ class Diag:
             if chains6 is not None:
                 return [Check(
                     "IPv6", FAIL, text + " — защита IPv6 (v6_guard) не загружена",
-                    "sudo xgw net up — загрузит её; отключить IPv6 на WAN заново: sudo xgw install",
+                    "sudo xgw net up — загрузит её; обновление сохраняет профиль WAN",
                 )]
         # Не «nmcli connection modify»: у профиля из netplan это сбрасывает привязку к
         # карте (nm.netplan_defined). Установка выбирает безопасный способ сама.
         return [Check(
             "IPv6", FAIL, text,
-            "sudo xgw install — отключит IPv6 на WAN заново и скажет, если не сможет",
+            "проверьте capture.local и защиту IPv6; обновление сохраняет профиль WAN",
         )]
 
     def _panel_login(self) -> list[Check]:

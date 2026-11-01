@@ -338,6 +338,7 @@ class Installer:
         self._singbox_migration_complete = False
         self._daemon_paused = False
         self._capture_initial_on = False
+        self._preserve_wan = False
 
     # --- что известно о машине --------------------------------------------------
 
@@ -520,7 +521,10 @@ class Installer:
                 f"  • DHCP {start.strip()}–{end.strip()} на {facts.lan_if}: своя служба "
                 f"xgw-dhcp (dnsmasq, {dnsmasq.conf_path(self.paths)}); DNS в ней выключен"
             )
-        if not cfg.network.ipv6_proxy:
+        if self._preserve_wan:
+            lines.append("  • профиль WAN и его IPv6 сохраняются как сейчас; "
+                         "изменяются правила VPN и настройки LAN")
+        elif not cfg.network.ipv6_proxy:
             lines.append(
                 f"  • IPv6 на WAN ({facts.wan_if or 'не найден'}) будет отключён: "
                 "иначе трафик уйдёт мимо VPN"
@@ -575,6 +579,10 @@ class Installer:
     # --- запуск -----------------------------------------------------------------
 
     def run(self, *, assume_yes: bool = False, force: bool = False) -> int:
+        # Обновление и продолжение частичной установки не перенастраивают входящий
+        # адаптер. Старые записи нужны удалению, но не разрешают повторно применять WAN.
+        self._preserve_wan = ("finished" in self.journal or "nm_wan" in self.journal
+                              or (self.paths.systemd_dir / "xgw.service").exists())
         facts = self.facts()
         problems = self.problems(facts)
         conflict = self.subnet_conflict()
@@ -932,7 +940,12 @@ class Installer:
             self._step(f"профиль {nm.PROFILE} на {facts.lan_if}: {self.cfg.network.lan_address}")
             for warning in warnings:
                 self._warn(warning)
-        if not self.cfg.network.ipv6_proxy:
+        if self._preserve_wan:
+            self._step("профиль WAN сохранён: без modify/reapply и переключения IPv6")
+            if self.journal.get("nm_wan"):
+                self._step("прежняя запись WAN сохранена для удаления; "
+                           "обратная миграция IPv6 при обновлении не выполняется")
+        elif not self.cfg.network.ipv6_proxy:
             self._wan_ipv6(facts)
         else:
             self._wan_ipv6_back(facts)
@@ -1018,9 +1031,10 @@ class Installer:
         disable_ipv6 карты WAN, если IPv6 на ней выключает sysctl (nm.wan_ipv6_off).
         Значения до установки запоминаются один раз — для каждого ключа."""
         record = self.journal.get("nm_wan") or {}
-        wan = record.get("device", "") if record.get("sysctl") else ""
+        wan = record.get("device", "") if record.get("sysctl") and not self._preserve_wan else ""
         settings = sysctl.wanted(forwarding=bool(facts.lan_if), wan_ipv6_off=wan)
-        previous = sysctl.install(self.paths, self.proc_sys, settings)
+        previous = sysctl.install(self.paths, self.proc_sys, settings,
+                                 preserve_wan=self._preserve_wan)
         saved = dict(self.journal.get("sysctl") or {})
         for name, value in previous.items():
             saved.setdefault(name, value)
