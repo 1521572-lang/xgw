@@ -90,9 +90,36 @@ def test_variant_fingerprint_does_not_depend_on_the_neighbours():
     b, a = _variants("b", "a")
     split_variants([b, a], known, now=5.0)
     assert (a.fingerprint, b.fingerprint) == (first, second)
-    (c,) = _variants("c")  # новый вариант один: общий отпечаток уже выдан варианту A
+    (c,) = _variants("c")  # вместо двух — один новый: какой из них, не понять — общий отпечаток
     split_variants([c], known, now=6.0)
-    assert c.fingerprint not in (first, second)
+    assert c.fingerprint == first
+
+
+def test_a_single_server_whose_path_changes_on_every_download_keeps_its_fingerprint():
+    """Отчёт audit6b: у 21 одиночного сервера подписки поле варианта другое при каждом
+    скачивании — и с историей выдачи каждый раз новый отпечаток: сканы заново, очередь замеров
+    скорости запасных («0 из 20») не доходила до конца. Единственный вариант — тот же сервер: он
+    наследует отпечаток единственного варианта прошлого опроса; история не растёт."""
+    from xgw.model import split_variants
+
+    known: dict = {}
+    seen = []
+    for step, path in enumerate(("r1", "r2", "r3", "r4"), 1):
+        (node,) = _variants(path)
+        split_variants([node], known, now=float(step))
+        seen.append(node.fingerprint)
+    assert len(set(seen)) == 1 and sum(len(entries) for entries in known.values()) == 1
+    # Вариант B, оставшийся один, держит свой отпечаток и тогда, когда его путь меняется.
+    a, b = _variants("a", "b")
+    split_variants([a, b], known, now=5.0)
+    own = b.fingerprint
+    (b,) = _variants("b")
+    split_variants([b], known, now=6.0)
+    assert b.fingerprint == own
+    for step, path in enumerate(("b2", "b3"), 7):
+        (node,) = _variants(path)
+        split_variants([node], known, now=float(step))
+        assert node.fingerprint == own
 
 
 def test_websocket_host_from_headers_tells_servers_apart_and_old_ids_stay():
