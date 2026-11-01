@@ -977,14 +977,17 @@ def test_install_says_so_when_capture_waits_for_the_xray_inbound(box):
     перехвате, а настройки с тех пор сменили): установка не рапортует «включён».
     capture.hold = "block" (по умолчанию): до перезапуска Xray мимо VPN ничего не уходит."""
     fakexray.write(box.paths, {"inbounds": [{"tag": "socks-in"}]})
-    assert box.install() == 0
+    box.paths.systemd_dir.mkdir(parents=True, exist_ok=True)
+    (box.paths.systemd_dir / "xgw.service").write_text("[Service]\n")
+    Journal(box.paths.journal_file).set("finished", 1.0)
+    assert box.install() == 1
     text = box.text()
     assert "правила nftables загружены, трафик заблокирован до перезапуска Xray" in text
     assert "! перехват пока не включён: в применённом конфиге Xray нет inbound tproxy-in" in text
     assert "Интернет закрыт, мимо VPN ничего не уходит" in text
     table = box.system.kernel.table
     assert "tproxy" not in table and "chain block_output" in table and "masquerade" in table
-    assert "Предупреждений: 1" in text
+    assert "перехват не готов после установки" in text
 
 
 # --- второе ядро (sing-box) --------------------------------------------------------------

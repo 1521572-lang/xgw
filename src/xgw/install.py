@@ -336,6 +336,8 @@ class Installer:
         self._singbox_config_before: bytes | None = None
         self._singbox_restart_attempted = False
         self._singbox_migration_complete = False
+        self._daemon_paused = False
+        self._capture_initial_on = False
 
     # --- что известно о машине --------------------------------------------------
 
@@ -602,6 +604,10 @@ class Installer:
         # Установка поверх работающей (прошлая дошла до конца и не откатывалась): дом уже
         # ходит в интернет через этот шлюз, и откат к состоянию до XGW оставил бы его без сети.
         reinstall = "finished" in self.journal
+        self._capture_initial_on = (
+            self.capture.capturing and self.capture.mode() == "on"
+            and (reinstall or (self.paths.systemd_dir / "xgw.service").exists())
+        )
         self.paths.ensure()
         self.journal.setdefault("started", time.time())
         # Метки и таблица — чтобы удаление нашло правила и без config.toml.
@@ -614,6 +620,7 @@ class Installer:
         try:
             self._system(facts)
         except (InstallError, cmd.CommandError, binary.BinaryError, OSError) as exc:
+            self._resume_paused_daemon()
             self.out(f"✗ установка остановлена: {exc}")
             self.out("Сеть не менялась. Исправьте причину и запустите установку снова.")
             return 1
@@ -625,6 +632,7 @@ class Installer:
                     self._abort_singbox_migration(str(exc))
                 except InstallError as recovery:
                     exc = recovery
+            self._resume_paused_daemon()
             self.out(f"✗ настройка сети не удалась: {exc}")
             if reinstall:
                 self.out(
@@ -659,11 +667,36 @@ class Installer:
         self.out("Система:")
         self._packages(facts)
         self._user(facts)
-        self._code()
         self._xray(facts)
         self._singbox(facts)
+        # Загрузки могут быть долгими: правила и прежний демон в это время работают.
+        # Перед заменой Python-кода останавливаем только контроллер. Правила и ядра
+        # не снимаются. Новый код и конфиг больше не применяют два писателя одновременно.
+        self._pause_daemon()
+        self._code()
         self._tidy_config()
         self._permissions()
+
+    def _pause_daemon(self) -> None:
+        active = self.runner(["systemctl", "is-active", "xgw.service"], check=False).strip()
+        if active not in ("active", "activating", "reloading"):
+            return
+        self._daemon_paused = True
+        self.runner(["systemctl", "stop", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+        after = self.runner(["systemctl", "is-active", "xgw.service"], check=False).strip()
+        if after not in ("inactive", "failed", "unknown"):
+            raise InstallError("демон ещё не остановлен — код и правила не заменяются")
+        self._step("демон остановлен на время обновления; ядра и правила сохранены")
+
+    def _resume_paused_daemon(self) -> None:
+        if not self._daemon_paused:
+            return
+        try:
+            self.runner(["systemctl", "start", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            self._daemon_paused = False
+        except cmd.CommandError as exc:
+            self._warn(f"демон после ошибки установки не запущен: {exc}; "
+                       "сохраните ошибку, затем sudo systemctl start xgw")
 
     def _packages(self, facts: Facts) -> None:
         if not facts.packages:
@@ -924,6 +957,7 @@ class Installer:
         if self.cfg.panel.enabled:
             self._panel()
         self._daemon()
+        self._verify_capture_result(xray_ok)
         self._tray()
         if self.cfg.status.lan_page and facts.lan_if:
             self._token()
@@ -937,7 +971,9 @@ class Installer:
         systemctl не дождался — задание systemd идёт дальше, служба не запустилась —
         systemd (Restart=always) попробует снова."""
         try:
-            self.runner(["systemctl", "restart", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            verb = "start" if self._daemon_paused else "restart"
+            self.runner(["systemctl", verb, "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            self._daemon_paused = False
         except cmd.CommandError as exc:
             self._warn(
                 f"демон xgw пока не запущен ({exc}). Сеть, DHCP и перехват работают и без "
@@ -1210,6 +1246,8 @@ class Installer:
             capture.disable()
             self._step("подписок пока нет — VPN не включён, интернет работает напрямую")
         else:
+            if self._capture_initial_on:
+                raise InstallError("Xray не готов после обновления; выбранный VPN не снимается")
             capture.disable()
             self._warn(
                 "Xray не запущен, поэтому перехват не включён: интернет работает напрямую. "
@@ -1233,6 +1271,28 @@ class Installer:
                     f"перехват пока не включён: {capture.inbound_problem()}. {held}; "
                     "перехват включится сам после перезапуска Xray (сразу: sudo xgw apply --now)"
                 )
+
+    def _verify_capture_result(self, xray_ok: bool) -> None:
+        """Код 0 подтверждает фактический выбранный режим, а не только завершение команд."""
+        if self._daemon_paused:
+            raise InstallError("остановленный для обновления демон не запущен; "
+                               "установка не завершена")
+        capture = self.capture
+        if not capture.configured:
+            return
+        mode = capture.mode()
+        if self._capture_initial_on and mode != "on":
+            raise InstallError("после обновления выбранный ранее VPN снят; установка не завершена")
+        if mode == "on" and (not xray_ok or capture.effective_mode() != "on"):
+            raise InstallError("перехват не готов после установки; выбранный режим сохранён, "
+                               "проверьте Xray и inbound, sudo xgw diag")
+        if capture.loaded() is not True:
+            raise InstallError("правила после установки не проверены; установка не завершена")
+        if mode == "on" and capture.guard_loaded() is not True:
+            raise InstallError("барьер после установки не проверен; установка не завершена")
+        self._step("режим и правила после установки проверены: "
+                   + ("VPN включён, барьер загружен" if mode == "on"
+                      else "перехват снят по выбору владельца"))
 
     def _token(self) -> None:
         status_page.ensure_token(self.cfg, self.paths)
