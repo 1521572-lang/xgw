@@ -19,8 +19,8 @@ from pathlib import Path
 
 LEASE_SECONDS = 25.0
 MAX_SECONDS = 1800.0
-JOB = "xgw-w3d-job.service"
-SAFETY = "xgw-w3d-safety.service"
+JOB = "xgw-w3e-job.service"
+SAFETY = "xgw-w3e-safety.service"
 
 
 def atomic(path: Path, data: bytes) -> None:
@@ -87,6 +87,8 @@ def prepare(directory: Path) -> None:
         "interfaces": {"WAN": wan, "LAN": cfg.network.lan_if},
         "wan_facts": wan_facts(wan),
         "bypass_mark": cfg.capture.mark_bypass,
+        "probe_urls": list(dict.fromkeys([cfg.probe.url, *cfg.probe.urls]))[:2],
+        "probe_user_agent": cfg.probe.user_agent,
     })
     save(directory / "status.json", {"state": "prepared"})
     print("PREPARED: исходный off сохранён; страховка ещё не запущена")
@@ -240,7 +242,10 @@ def job(directory: Path, action: str, repo: Path) -> None:
     # Повторный install в том же опыте не должен выглядеть завершённым по rc старого enable.
     save(directory / "job-result.json", {"action": action, "state": "running", "rc": None})
     command = (["/bin/sh", str(repo / "packaging/install.sh"), "--yes"]
-               if action == "install" else ["/usr/local/bin/xgw", "enable"])
+               if action == "install" else [
+                   sys.executable, "-I", str(Path(__file__).with_name("wave3_enable_probe.py")),
+                   "run", str(directory),
+               ])
     with (directory / "job.log").open("wb") as stream:
         result = subprocess.run(command, cwd=repo, stdout=stream,
                                 stderr=subprocess.STDOUT, check=False)
