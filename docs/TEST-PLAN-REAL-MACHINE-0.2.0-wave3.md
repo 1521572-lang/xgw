@@ -1,130 +1,111 @@
-# Проверка XGW 0.2.0: волна 3 кросс-аудита — барьер и отдельный пользователь sing-box
+# Проверка XGW 0.2.0: волна 3 — барьер и отдельный пользователь sing-box
 
-## Как работать с этим ТЗ (прочитай целиком до начала)
+## Как выполнять
 
-Ты — исполнитель проверки на машине заказчика. У тебя есть **терминал** в сеансе заказчика
-(`sudo` — от его имени). Браузер в этой проверке не нужен: всё — командами.
+Исполнитель — Flash в терминале сеанса заказчика; `sudo` — от его имени. Прочитать весь план
+до первого действия. Выполнять по одному шагу: **Действие → Команда → Ожидается →
+Если не так**, сохранять вывод в `$HOME/xgw-w3`. Около 45 минут. Подписку, ручной выбор сервера
+и FreePool не менять. Не выполнять дополнительные сетевые опыты. При неоднозначности
+остановить зависимые шаги и сообщить заказчику; предположения отделять от фактов.
 
-Одна сессия, около 45 минут (из них около 15 минут — ожидание). Режим бесплатных серверов в этой
-проверке **не трогается** — дом всё время идёт через подписку.
+Машина: ThinkCentre, Ubuntu 24.04.5 LTS/systemd 255, KDE X11; клон `~/zcod/xgw`.
+Принятые ядра Xray 26.10.31 и sing-box 1.14.4 должны сохраниться. Код — ветка `freepool`, версия 0.2.0.
+Commit реализации: **`fd65fc4b18fa8ea658737e9612544bdf63536b4c`**. ТЗ находится в том же репозитории, как и предыдущие планы;
+локальный ZIP/patch и ручная передача manifest не требуются. Документы могут быть новее
+commit реализации: перед установкой проверяется неизменность кода `src/`, `packaging/`,
+`config.example.toml`, `pyproject.toml`. Текст ТЗ и наличие функции не подтверждают результаты
+реального прогона. Все реальные результаты первоначально `NOT_RUN`.
 
-Правила:
-1. Шаги — строго по порядку, по одному. Номер шага пиши в начале своего сообщения.
-2. В каждом шаге: **Действие**, **Команда** (копируй блок целиком, ничего в нём не меняя),
-   **Ожидается** и **Если не так**. Сверх написанного ничего не делай и не придумывай.
-3. Выводы команд сохраняются в файлы `$HOME/xgw-w3/…`. Время шага — по выводу `date` в
-   команде, не по памяти.
-4. Тестовые правки правил XGW делает **только** помощник (`w3check.py cut …`) в шагах 3.2–3.4:
-   он убирает одно правило, сразу пробует соединение и ждёт, пока шлюз вернёт правило сам.
-5. Долгие ожидания — командой `sleep`. Если терминал обрывает команды дольше 2 минут — разбей
-   ожидание на несколько `sleep 110` подряд и продолжай с той же команды без `sleep`.
-6. Не уверен, что делать, — остановись и спроси заказчика. Ответы заказчика записывай дословно
-   (без имён серверов, устройств и подписок).
-7. Экземпляр этого ТЗ держи в `$HOME/xgw-w3/plan.md` (не в /tmp). Файл помощника создаётся
-   **только** командой шага 1.2. Это **новый** помощник (`w3check.py`).
-8. Режимы помощника у разработчика на живом шлюзе не запускались (решение заказчика: проверки —
-   на машине). Если режим `w3check.py` выводит `Traceback` — запиши режим и последнюю строку
-   ошибки как **дефект помощника** и продолжай шаг по остальным строкам и командам `xgw`. Сам
-   файл помощника не исправляй.
-9. Если вывод не совпал с «Ожидается», а в «Если не так» этот случай не описан — запиши
-   дословно строку помощника, отметь «не по ожиданию» и иди дальше. Догадки о причине — только в
-   «Наблюдения», со словом «предположение».
+Проверяем только PR-N4/N5: независимый `inet xgw_guard` при повреждении перехвата и постоянный
+sing-box под `xgw-singbox` с пустыми capabilities, отдельными конфигом/группой. Новая FSM,
+all-core netns, capless Xray, TUN ownership, G1, DAE и временные FreePool-процессы вне проверки.
+Ядро должно принимать guard; отказ его загрузки должен прерывать всю транзакцию, сохраняя
+предыдущий набор. Устаревший текст о продолжении без guard не является допустимым fallback.
+Полное `flush ruleset` снимает и guard: от него эта волна защиты не обещает.
 
-Машина: ThinkCentre, Ubuntu 24.04.5 LTS (systemd 255), KDE Plasma (X11). Клон — `~/zcod/xgw`.
-Код — ветка `freepool`, версия 0.2.0. На машине — Xray 26.10.31 и sing-box 1.14.4, принятые
-шлюзом через карточку «Ядра»: установка их не откатывает.
+**Граница доказательства.** RST и рост локального reject-счётчика — только
+`LOCAL_GUARD_EVIDENCE`. Это не доказательство отсутствия пакета на WAN. Общий счётчик может
+включать чужой трафик; демон может восстановить правила до пробы и обнулить счётчики при
+перезагрузке. Без внешнего WAN sentinel/фактической записи пакетов E4 на этой машине остаётся
+`NOT_RUN`, даже если все локальные проверки успешны. Здесь выполняется только IPv4 TCP с
+самого шлюза; LAN, Docker, tailnet, IPv6 и UDP не получают статус PASS по этой пробе. Их
+пакетные проверки относятся к отдельному Linux VM/netns gate и должны иметь свои артефакты.
 
-### Что нового (ASSUMPTIONS п. 285) и зачем проверка
+## 0. Ограничения и остановка
 
-Внешний аудит предложил ещё две защиты:
-1. **Барьер.** Раньше, если чужая программа удаляла правила перехвата XGW (цепочку, всю таблицу
-   или правило маршрутизации), трафик самой машины на секунды уходил мимо VPN — пока демон не
-   вернёт правила. Теперь есть отдельная таблица-барьер `inet xgw_guard`: она выпускает в
-   интернет только сокеты ядер, служебное (DHCP, время, Tailscale) и то, что правила перехвата
-   пропустили сами. Пропали правила — соединение отбивается сразу, а не идёт мимо VPN.
-2. **sing-box от своего пользователя.** Раньше Xray и sing-box работали от одного пользователя
-   `xray`, и у sing-box были права менять сеть машины. Теперь sing-box — от пользователя
-   `xgw-singbox`, без прав: конфиг и API Xray ему недоступны, правила сети он не меняет.
-
-Ожидания этой проверки:
-1. После установки: барьер есть; sing-box — от `xgw-singbox`, «права: нет», в его конфиге нет
-   `routing_mark`; серверы через sing-box живы, как до установки; в журнале sing-box нет
-   «operation not permitted».
-2. От имени sing-box **все шесть** попыток (конфиг и API Xray, состояние XGW, правила nftables и
-   ip rule; и Xray — конфиг sing-box) — «отказ».
-3. В каждой из трёх тестовых правок соединение сразу после правки — **«отбито (сброс)»**, барьер
-   отбил хотя бы один пакет, шлюз вернул правило сам (за секунды; правило ip rule — до 40 с), и
-   после возврата соединение снова идёт.
-4. За 10 минут наблюдения барьер **не отбил ни одного** пакета (законный трафик он не трогает),
-   правила не загружались заново, Tailscale в сети, время синхронизировано.
-
-## 0. Запрещено
-
-- `xgw net down`, `xgw disable`, `xgw uninstall`, `install.sh --force`, `reboot`, сон машины —
-  **никогда**. Запуск, остановка и перезапуск служб `xgw*` (и `xgw-fp@*`), `tailscaled`,
-  NetworkManager, `ssh` — кроме `sudo systemctl start xgw` в разделе «Если что-то пошло не так».
-- Ручные `nft`, `ip`, `ip netns`, `iptables`, `tc`, `sysctl -w`, `apt`, `runuser`, `sudo -u` —
-  **никогда** (правки и попытки от имени ядер делает помощник в шагах 3.1–3.4). Исключение —
-  `sudo xgw net up` в «Если не так» шагов 3.2–3.4. Команды `tailscale`, `xray`, `sing-box`,
-  `sstpc`, `pppd`, `sudo xgw pool …` (кроме `sudo xgw pool` без аргументов в шаге 1.3),
-  `sudo xgw pin`, `sudo xgw unpin`, `sudo xgw probe` — **никогда**.
-- Браузер, панель, сайты — в этой проверке не открывать.
-- Править `/etc/xgw`, `/opt/xgw`, `/var/lib/xgw`, `/run/xgw`, `/etc/systemd`, код XGW. Печатать
-  `config.toml`, `panel.json`, `status.json`, `capture.json`, рабочие конфиги Xray и sing-box,
-  кэш подписок, `inventory.json`, базу `state.db`, полный вывод `nft list ruleset`, `nft list
-  table`, `ip rule`, `ip route`. Коммитить что-либо, кроме файла отчёта (§6).
-- Писать в отчёт: **имена серверов, устройств и подписок**, адреса tailnet, MAC, имена
-  пользователей машины (→ `<user>`), внешние IP, адреса LAN-устройств, домены и ссылки серверов
-  VPN, строки журнала. Можно: коды стран, теги вида `proxy-nl-8763`, имена служебных
-  пользователей `xray` и `xgw-singbox`, права (`CAP_NET_ADMIN`), строки помощника, счётчики,
-  статусы, времена.
+- Не выполнять `net down`, disable, uninstall, `--force`, reboot, сон, остановку/перезапуск
+  служб, произвольные nft/ip/sysctl/apt/runuser, панель/браузер, pool/pin/probe-команды.
+  Исключения: штатная установка шага 2.2, точные режимы помощника §3 и восстановление ниже.
+- Не редактировать установленный код/конфиги и системные службы. Рабочий клон обновляется только
+  штатным fast-forward в шаге2.1. Не выполнять reset/checkout при несовпадении.
+- Не печатать сырые конфиги, status/capture/state, подписки, полный ruleset/маршруты и журналы.
+  В локальных install.txt могут быть частные данные: не публиковать файл целиком.
+- В отчёте скрыть имена устройств/подписок/пользователей машины, LAN/tailnet/MAC/внешние IP,
+  домены/URL серверов и строки журнала. Разрешены служебные xray/xgw-singbox, теги proxy-…,
+  capabilities, права, счётчики, времена и подготовленные строки помощника.
+- Нет guard, несовпадение Capture.loaded, нездоровая база или ошибка изоляции — **не делать
+  cut**, записать FAIL/NOT_RUN и перейти к безопасному итогу. Traceback помощника — дефект
+  помощника; не чинить его на машине и не делать последующие cut.
+- Интернет/доступ отсутствует дольше 60 с: `sudo xgw net up`; если `systemctl is-active xgw`
+  не active — `sudo systemctl start xgw`; подождать 30 с. Сохранить сокращённый status/state,
+  остановить все дальнейшие cut и сообщить заказчику. Не откатывать сеть произвольными командами.
 
 ## 1. Подготовка
 
-Шаг 1.0. Предусловие — прошлая проверка закончена:
+### 1.0. Предусловия (только чтение)
+
+В клоне `~/zcod/xgw` должна быть ветка `freepool`, без локальных правок. Другую ветку,
+незавершённый merge, изменённые/неотслеживаемые файлы не сбрасывать: STOP и сообщить заказчику.
+Сохранить экземпляр этого ТЗ в `$HOME/xgw-w3/plan.md` вне клона; чтение нового ТЗ на GitHub
+само по себе клон не обновляет. Обновление — только шаг2.1 после исходных замеров.
 
 ```bash
-cd ~/zcod/xgw && git fetch -q && git log origin/freepool --format=%s | grep -ci 'волна 2 кросс-аудита'; systemctl list-timers --all --no-pager xgw-yt-guard.timer | head -3; cd ~
+mkdir -p "$HOME/xgw-w3" && chmod 700 "$HOME/xgw-w3" && cd ~/zcod/xgw && git branch --show-current && git rev-parse HEAD && git status --porcelain && systemctl list-timers --all --no-pager xgw-yt-guard.timer | head -3
 ```
 
-Ожидается: `1` или больше (отчёт прошлой проверки); «0 timers listed».
+Ожидается `freepool`, хеш исходного кода, чистый клон, `0 timers listed`.
+Wave2-отчёт уже завершён; его наличие не доказывает wave3. Если уже установлен новый код,
+записать факт и исходный HEAD: повторный прогон не выдавать за первую миграцию.
 
-Если не так: первая строка `0` — **стоп**, сообщить заказчику.
+### 1.1. Согласие на живую проверку
 
-Шаг 1.1. **Спроси заказчика** (дословно):
+Если в этой сессии уже дано явное согласие на соответствующий пункт, сослаться на него и не
+спрашивать повторно. Иначе спросить по пунктам, записать ответ и время:
 
-«Проверяю исправления по аудиту: (а) отдельный барьер — если чужая программа удалит правила
-XGW, трафик дома не уйдёт мимо VPN; (б) sing-box работает от своего пользователя, без прав на
-сеть машины. Режим бесплатных серверов не трогаю, дом всё время идёт через подписку. По пунктам:
-(1) Переустановка XGW с новым кодом: служба XGW, Xray, sing-box и DHCP перезапустятся — интернет
-дома пропадёт на несколько секунд, соединения, открытые до установки, могут один раз оборваться.
-Ядра останутся.
-(2) Три тестовые правки правил самого XGW: убираю по одному его правилу и сразу проверяю, что
-соединение с общедоступным адресом в интернете отбивается, а не идёт мимо VPN. Правило шлюз
-возвращает сам: в двух случаях за секунды, в третьем — до 40 секунд, и всё это время интернета
-дома нет. Ещё — проверки, что sing-box не может читать чужие файлы и менять правила сети (они
-ничего не меняют).
-(3) 10 минут наблюдения: я ничего не меняю, только читаю журнал и счётчики.
-Можно согласиться не на все пункты.»
+«Проверяю отдельный барьер и sing-box без сетевых прав. FreePool и подписку не меняю.
+(1) Можно установить проверенный локальный код? Службы могут перезапуститься; возможен короткий
+обрыв интернета и старых соединений, принятые ядра сохраняются.
+(2) Можно выполнить шесть проверок изоляции и три точные тестовые правки правил XGW? Возможен
+обрыв до 40 секунд (граница ожидания 60 секунд). Проверка пытается открыть чужой файл/API,
+создать временный файл состояния и добавить безопасное тестовое ip rule; ожидается отказ,
+неожиданно созданные объекты сразу удаляются. RST со счётчиком даёт лишь локальное свидетельство,
+без WAN sentinel отсутствие пакетов на проводе этим не доказано.
+(3) Можно 10 минут читать состояние/счётчики и журнал без правок? Можно согласиться частично.»
 
-Против пункта 1 — **стоп**. Против 2 — пропустить §3 (кроме метки в конце шага 3.4). Против 3 —
-пропустить шаг 4.1. **Запиши, на что согласился заказчик.**
+Отказ от (1) — STOP; отказ от (2) — весь §3 NOT_RUN; отказ от (3) — §4 NOT_RUN.
+Не считать молчание согласием. Новые live-проверки сверх этих пунктов не добавлять.
 
-Шаг 1.2. Папка, помощник проверки и его сумма:
+### 1.2. Помощник и его fingerprint
+
+Команду скопировать целиком. Не менять помощник на машине. Он читает только подготовленные
+агрегаты; `isolation` делает описанные попытки, `cut` — одну точную правку. Перед cut он
+отказывается работать без целого guard/исходного перехвата/успешной пробы и в открытом режиме.
+`cut rule` для host TUN не применяется: host использует pref90, а не pref100.
 
 ```bash
-mkdir -p "$HOME/xgw-w3" && chmod 700 "$HOME/xgw-w3" && cd "$HOME/xgw-w3" && cat > w3check.py <<'EOF'
+cd "$HOME/xgw-w3" && cat > w3check.py <<'EOF'
 """XGW 0.2.0: волна 3 кросс-аудита (барьер inet xgw_guard, sing-box от своего пользователя) —
 помощник проверки. Читает состояние XGW (/run/xgw/status.json, /var/lib/xgw/capture.json — только
-наличие эталона и текст расхождения), таблицы nftables (счётчики барьера, число правил),
+наличие эталона и признак расхождения), таблицы nftables (счётчики барьера, число правил),
 процессы ядер (/proc/PID/status), права на их конфиги и журнал со стандартного ввода
 (journalctl -o short-unix). Меняет что-то только режим cut — по команде шага: убирает одно
 своё правило XGW и ждёт, пока демон его вернёт. Режим isolation пробует от имени пользователей
 ядер читать чужое и добавить правило ip rule (у них прав нет — ничего не меняется; если вдруг
-добавится — убирает сразу). Адресов устройств и серверов не печатает. Время — секунды с 1970
+добавится — убирает сразу; при неудаче очистки останавливается). Адресов устройств и серверов не печатает. Время — секунды с 1970
 (date +%s). Режимы: units, state, sub, sbstat [МЕТКА], guard, allow, cores, isolation,
 cut output|table|rule, capstate, check, log [МЕТКА], sblog, ts, time."""
 import grp
+import ipaddress
 import json
 import os
 import pwd
@@ -140,7 +121,7 @@ UNITS = ("xgw.service", "xgw-net.service", "xgw-xray.service", "xgw-singbox.serv
          "xgw-dhcp.service")
 LIB = os.environ.get("W3CHECK_LIB", "/opt/xgw/lib")
 STAMP = re.compile(r"^(\d+(?:\.\d+)?) ")
-CHAIN = re.compile(r"^\s*chain (\w+) \{\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
+CHAIN = re.compile(r"^\s*chain (\w+) \{[^\n]*\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
 SB_USER = "xgw-singbox"
 GUARD = ("inet", "xgw_guard")
 BIT = "0x20000000"
@@ -180,7 +161,7 @@ def read_json(path):
         return None
     except (OSError, ValueError) as exc:
         print(f"{Path(path).name} не читается: {type(exc).__name__}")
-        sys.exit(0)
+        sys.exit(2)
 
 
 def status_of(paths):
@@ -193,13 +174,20 @@ def when(line):
     return float(found.group(1)) if found else None
 
 
+class GuardCounts(dict):
+    generation = None
+
+
 def guard_counts():
     """{цепочка: [счётчики правил отказа]} барьера; None — барьера нет; строка — ошибка."""
-    code, out = run(["nft", "list", "table", *GUARD])
+    code, out = run(["nft", "-a", "list", "table", *GUARD])
     if code != 0:
-        return None if "No such file" in out else (out.strip().splitlines() or ["?"])[-1]
-    return {name: [int(n) for n in re.findall(r"counter packets (\d+)", body)]
-            for name, body in CHAIN.findall(out)}
+        return None if "No such file" in out else f"код {code}"
+    counts = GuardCounts({name: [int(n) for n in re.findall(r"counter packets (\d+)", body)]
+                          for name, body in CHAIN.findall(out)})
+    handle = re.search(r"table inet xgw_guard \{\s*# handle (\d+)", out)
+    counts.generation = int(handle.group(1)) if handle else None
+    return counts
 
 
 def total(counts):
@@ -240,7 +228,16 @@ def unit_process(unit):
         name = str(uid)
     rights = [label for bit, label in sorted(CAPS.items()) if caps >> bit & 1]
     other = caps & ~sum(1 << bit for bit in CAPS)
-    return name, (", ".join(rights) or "нет") + (f" и ещё {other:#x}" if other else "")
+    try:
+        xray_gid = grp.getgrnam("xray").gr_gid
+    except KeyError:
+        xray_gid = -1
+    gids = {int(value) for value in fields.get("Groups", "").split()}
+    gids.add(int(fields["Gid"].split()[1]))
+    capsets = {label: int(fields[key].strip(), 16) for label, key in
+               (("Eff", "CapEff"), ("Prm", "CapPrm"), ("Amb", "CapAmb"), ("Bnd", "CapBnd"))}
+    return (name, (", ".join(rights) or "нет") + (f" и ещё {other:#x}" if other else ""),
+            xray_gid in gids, capsets)
 
 
 def name_of(lookup, ident):
@@ -311,9 +308,10 @@ elif mode == "guard":
     else:
         def pair(name):
             values = counts.get(name)
-            return f"TCP {values[0]}, прочее {values[1]}" if values and len(values) >= 2 else "—"
+            return f"TCP {values[-2]}, прочее {values[-1]}" if values and len(values) >= 2 else "—"
         print(f"барьер: есть; цепочки: {', '.join(sorted(counts))}; отбито: машина {pair('output')}"
-              f"; транзит {pair('transit')}; всего {total(counts)}")
+              f"; транзит {pair('transit')}; loopback {sum(counts.get('output', [])[:-2])}; "
+              f"всего {total(counts)}; поколение таблицы {counts.generation}")
 elif mode == "allow":
     code, out = run(["nft", "-t", "list", "table", "ip", "xgw"])
     if code != 0:
@@ -336,6 +334,10 @@ elif mode == "cores":
         found = unit_process(unit)
         print(f"{label}: " + ("не работает" if found is None
                               else f"пользователь {found[0]}, права: {found[1]}"))
+        if label == "sing-box" and found is not None:
+            print("группа xray у процесса sing-box: " + ("ДА" if found[2] else "нет"))
+            print("sing-box capabilities: " + " ".join(f"{key}={value:#x}"
+                                                         for key, value in found[3].items()))
     xray_dir = paths.xray_config_dir
     sb_dir = paths.singbox_config_file.parent
     print(f"конфиг Xray: {owner(xray_dir / 'config.json')} (каталог {owner(xray_dir)}); "
@@ -356,7 +358,7 @@ elif mode == "isolation":
     sock = ("import socket, sys\ns = socket.socket(socket.AF_UNIX)\ntry:\n"
             "    s.connect(sys.argv[1])\n    print('подключился')\nexcept PermissionError:\n"
             "    print('отказ')\nexcept OSError as e:\n    print(type(e).__name__)")
-    write = ("import os, sys\np = os.path.join(sys.argv[1], 'w3-test')\ntry:\n"
+    write = ("import os, sys\np = os.path.join(sys.argv[1], 'w3-test-' + str(os.getpid()))\ntry:\n"
              "    open(p, 'x').close()\n    os.remove(p)\n    print('записал')\n"
              "except PermissionError:\n    print('отказ')\nexcept OSError as e:\n"
              "    print(type(e).__name__)")
@@ -368,21 +370,36 @@ elif mode == "isolation":
     xray_conf = paths.xray_config_dir / "config.json"
     print(f"sing-box → конфиг Xray: {py(SB_USER, read, xray_conf)}")
     print(f"sing-box → API Xray: {py(SB_USER, sock, '/run/xgw-xray/api.sock')}")
-    print(f"sing-box → состояние XGW (/var/lib/xgw): {py(SB_USER, write, paths.var)}")
+    print(f"sing-box → запись в состояние XGW (/var/lib/xgw): {py(SB_USER, write, paths.var)}")
     code, out = run(["nft", "list", "tables"], user=SB_USER)
     print("sing-box → правила nftables: " + ("ПРОЧИТАЛ" if code == 0 else "отказ"
                                               if "not permitted" in out else f"код {code}"))
+    rc, listing = run(["ip", "-j", "rule", "show"])
+    try:
+        rules = json.loads(listing) if rc == 0 else None
+    except ValueError:
+        rules = None
+    if not isinstance(rules, list) or any(isinstance(rule, dict)
+            and rule.get("priority") == 49 for rule in rules):
+        print("sing-box → правило ip rule: NOT_RUN (pref 49 занят или список недоступен)")
+        print(f"Xray → конфиг sing-box: {py('xray', read, paths.singbox_config_file)}")
+        sys.exit(2)
     rule = ["ip", "rule", "add", "from", TEST_NET, "lookup", "main", "pref", "49"]
     code, out = run(rule, user=SB_USER)
     if code == 0:
-        run(["ip", "rule", "del", "from", TEST_NET, "lookup", "main", "pref", "49"])
-        print("sing-box → правило ip rule: ДОБАВИЛ (сразу убрано)")
+        cleaned, _out = run(["ip", "rule", "del", "from", TEST_NET, "lookup", "main", "pref", "49"])
+        print("sing-box → правило ip rule: ДОБАВИЛ (сразу убрано)" if cleaned == 0
+              else "sing-box → правило ip rule: ДОБАВИЛ; ОЧИСТКА НЕ УДАЛАСЬ; STOP")
+        if cleaned != 0:
+            sys.exit(2)
     else:
         print("sing-box → правило ip rule: " + ("отказ" if "not permitted" in out
                                                  else f"код {code}"))
     print(f"Xray → конфиг sing-box: {py('xray', read, paths.singbox_config_file)}")
 elif mode == "cut":
-    cfg, _paths = xgw()
+    cfg, paths = xgw()
+    from xgw.net import capture as capturing
+
     what = sys.argv[2] if len(sys.argv) > 2 else ""
     mark, table = cfg.capture.mark_proxy, cfg.capture.route_table
     commands = {
@@ -394,7 +411,38 @@ elif mode == "cut":
     }
     if what not in commands:
         print("cut: output | table | rule")
-        sys.exit(0)
+        sys.exit(2)
+    capture = capturing.capture_for(cfg, paths)
+    if (not cfg.capture.local or not cfg.capture.hold_blocks or cfg.capture.fail_mode != "closed"
+            or cfg.free_pool.mode != "off" or capture.effective_mode() != "on"):
+        print("NOT_RUN: нужны local=True, hold=block, fail_mode=closed, pool=off и capture mode=on")
+        sys.exit(2)
+    if what == "rule" and cfg.capture.tun:
+        print("NOT_RUN: host TUN использует pref 90; host probe не проверяет удаление pref 100")
+        sys.exit(2)
+    if any(ipaddress.ip_address(PROBE[0]) in ipaddress.ip_network(cidr, strict=False)
+           for cidr in cfg.capture.exclude_cidrs):
+        print("NOT_RUN: адрес пробы исключён из перехвата")
+        sys.exit(2)
+    before = guard_counts()
+    if (not isinstance(before, dict) or not {"forward", "output", "pass", "transit"} <= before.keys()
+            or len(before.get("output", [])) != 6 or len(before.get("transit", [])) != 2):
+        print("NOT_RUN: барьер отсутствует, не читается или его структура не ожидаемая")
+        sys.exit(2)
+    if capture.loaded() is not True:
+        print("NOT_RUN: исходные правила не соответствуют эталону")
+        sys.exit(2)
+    process = unit_process("xgw-singbox.service")
+    if (process is None or process[0] != SB_USER or process[2]
+            or any(process[3].values())):
+        print("NOT_RUN: UID/группы/capability-наборы службы sing-box не изолированы")
+        sys.exit(2)
+
+    def number(value):
+        try:
+            return int(str(value), 0)
+        except ValueError:
+            return None
 
     def restored():
         if what == "output":
@@ -408,20 +456,31 @@ elif mode == "cut":
             rules = json.loads(out) if code == 0 else []
         except ValueError:
             rules = []
-        return any(isinstance(item, dict) and item.get("priority") == 100
-                   and str(item.get("table")) == str(table) for item in rules)
+        keys = {"priority", "src", "dst", "fwmark", "fwmask", "iif", "table", "protocol"}
+        return any(isinstance(item, dict) and set(item) <= keys
+                   and item.get("priority") == 100 and str(item.get("table")) == str(table)
+                   and number(item.get("fwmark", "")) == mark
+                   and number(item.get("fwmask", "0xffffffff")) == 0xffffffff
+                   and item.get("src", "all") == "all" and item.get("dst", "all") == "all"
+                   and item.get("iif") is None for item in rules)
 
     if not restored():
-        print("правило и так не на месте — правку не делаю")
-        sys.exit(0)
-    before = guard_counts()
+        print("NOT_RUN: правило и так не на месте — правку не делаю")
+        sys.exit(2)
+    baseline = probe()
+    print(f"соединение до правки: {baseline}")
+    if not baseline.startswith("соединилось"):
+        print("NOT_RUN: нет исходного успешного соединения; правку не делаю")
+        sys.exit(2)
     label, argv = commands[what]
-    code, out = run(argv)
+    code, _out = run(argv)
     if code != 0:
-        print(f"правка не сделана: {(out.strip().splitlines() or ['?'])[-1]}")
-        sys.exit(0)
+        print(f"NOT_RUN: правка не сделана, код {code}")
+        sys.exit(2)
     began = time.monotonic()
+    damage_before = not restored()
     first = probe()
+    damage_after = not restored()
     after = guard_counts()
     back = None
     while time.monotonic() - began < 60:
@@ -430,12 +489,24 @@ elif mode == "cut":
             break
         time.sleep(0.5)
     second = probe() if back is not None else "не проверялось"
-    grown = (f"+{total(after) - total(before)}" if isinstance(after, dict)
-             and isinstance(before, dict) else "барьера нет")
-    print(f"{label}; соединение с адресом в интернете сразу после правки: {first}; барьер "
-          f"отбил пакетов: {grown}")
-    print("правило вернул демон через " + (f"{back:.1f} с" if back is not None
-                                           else "— НЕ вернул за 60 с")
+    delta = tcp_delta = None
+    stable = (isinstance(after, dict) and isinstance(before, dict)
+              and before.generation is not None and before.generation == after.generation
+              and len(after.get("output", [])) == 6)
+    if stable:
+        delta = total(after) - total(before)
+        tcp_delta = after["output"][-2] - before["output"][-2]
+        grown = (f"{delta:+d}; final host TCP {tcp_delta:+d}" if delta >= 0 and tcp_delta >= 0
+                 else "COUNTER_RESET_OR_RELOAD")
+    else:
+        grown = "COUNTER_RESET_OR_RELOAD_OR_GENERATION_UNKNOWN"
+    local = (stable and damage_before and damage_after and first.startswith("отбито (сброс)")
+             and delta is not None and delta >= 0 and tcp_delta is not None and tcp_delta > 0)
+    print(f"{label}; соединение сразу после правки: {first}; изменение счётчиков: {grown}")
+    print(f"повреждение присутствует до/после пробы: {damage_before}/{damage_after}; "
+          + ("LOCAL_GUARD_EVIDENCE" if local else "INCONCLUSIVE") + "; E4 NOT_RUN")
+    print("структура правила вернулась через " + (f"{back:.1f} с" if back is not None
+                                                   else "— НЕ вернулась за 60 с")
           + f"; соединение после возврата: {second}")
 elif mode == "capstate":
     _cfg, paths = xgw()
@@ -443,7 +514,7 @@ elif mode == "capstate":
     state = state if isinstance(state, dict) else {}
     mismatch = state.get("mismatch") or ""
     print(f"эталон правил: {'есть' if state.get('baseline') else 'нет'}; расхождение с текстом "
-          "правил: " + (mismatch if mismatch else "нет"))
+          "правил: " + ("ЕСТЬ (текст скрыт)" if mismatch else "нет"))
 elif mode == "check":
     cfg, paths = xgw()
     from xgw.net import capture as capturing
@@ -497,263 +568,271 @@ else:
     print("режим: units | state | sub | sbstat [МЕТКА] | guard | allow | cores | isolation | "
           "cut output|table|rule | capstate | check | log [МЕТКА] | sblog | ts | time")
 EOF
-python3 -c "import hashlib;d=open('w3check.py','rb').read().rstrip(b'\n')+b'\n';print(hashlib.sha256(d).hexdigest()[:16])"
+python3 - <<'PY'
+from pathlib import Path
+import hashlib
+p = Path('w3check.py')
+data = p.read_bytes().replace(b'\r\n', b'\n').rstrip(b'\n') + b'\n'
+p.write_bytes(data)
+print(hashlib.sha256(data).hexdigest())
+PY
 ```
 
-Ожидается: одна строка — сумма `3ef5da75fc86fe66`.
+Ожидается полный SHA256 `ac3e6d94cb90c66759474204f1a8b7bfbd6d2008dde094d63a5cf2c2389b8b04`. Нормализация: CRLF→LF и один завершающий LF.
+Другая сумма — повторить копирование один раз; снова другая — STOP. Эту же сумму должен
+подтвердить шаг2.1. Только синтаксическая/offline проверка помощника у разработчика не является
+запуском на машине и не переводит реальные кейсы в PASS.
 
-Если не так: сумма другая — выполнить шаг заново, скопировав блок целиком; снова другая —
-**стоп**, сообщить заказчику.
-
-Шаг 1.3. Состояние до установки (здесь ещё прежний код):
+### 1.3. До установки
 
 ```bash
-cd "$HOME/xgw-w3" && date '+%F %T' | tee before.txt; sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|Ожидает окна' | tee -a before.txt; sudo xgw pool 2>&1 | head -1 | tee -a before.txt; for m in units state sub sbstat guard allow cores isolation check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a before.txt
+cd "$HOME/xgw-w3" && date '+%F %T' | tee before.txt
+sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|Ожидает окна' | tee -a before.txt
+sudo xgw pool 2>&1 | head -1 | tee -a before.txt
+for m in units state sub sbstat guard allow cores check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a before.txt
 ```
 
-Ожидается (записать **целиком** строки помощника):
-- `HEALTHY`, перехват включён, Xray 26.10.31, sing-box 1.14.4; первая строка `xgw pool` —
-  «Бесплатный пул: выключен; …»; пять служб `active`; `sub` — «выбран вручную: …» — записать;
-- `sbstat` — «sing-box: отвечает: да; серверов через него: N; участников на sing-box: A (живы
-  B); …» — **записать N, A, B**;
-- `guard` — «барьер: нет»; `allow` — «правил с битом барьера в ip xgw: 0 (бит 0x20000000: нет);
-  правил с пользователем sing-box: 0»;
-- `cores` — «Xray: пользователь xray, права: CAP_NET_BIND_SERVICE, CAP_NET_ADMIN», «sing-box:
-  пользователь xray, права: CAP_NET_BIND_SERVICE, CAP_NET_ADMIN»; оба конфига «root:xray 640»;
-  «routing_mark в конфиге sing-box: K» (K больше 0) — записать;
-- `isolation` — «пользователя xgw-singbox нет»;
-- `check` — «проверка правил: True за X с; повторно: True за Y с» — записать X и Y.
+Записать весь безопасный вывод помощника, N/A/B sing-box, версии и ручной выбор. Ожидается
+HEALTHY, включённый перехват, pool off, рабочие службы, Capture.loaded True дважды. На старом
+коде отсутствие guard/UID xgw-singbox — ожидаемая база, а не результат wave3. Старые capabilities,
+права конфигов и routing_mark зафиксировать фактически, не подставлять образец. При pool on,
+не-HEALTHY или неработающих ядрах — STOP до установки и согласовать дальнейшую диагностику.
 
-Если не так: режим пула `on` — **стоп**, сообщить заказчику. `sing-box: … не работает` или
-«отвечает: нет» — записать; в шаге 2.3 строки о sing-box сравнивать не с чем, остальное —
-выполнять.
+## 2. Опубликованный код и установка
 
-## 2. Установка
+### 2.1. Обновление freepool и проверка commit
 
-Шаг 2.1. Код:
+Только после исходных замеров и согласия1. Блок обновляет чистую ветку fast-forward,
+проверяет commit реализации, неизменность runtime-кода и fingerprint помощника.
+Любая ошибка — STOP; не обходить её reset/force/ручной правкой. Никакого ZIP применять не нужно.
 
 ```bash
-cd ~/zcod/xgw && git checkout freepool && git pull --ff-only && git log -1 --format='%h %s' && grep -q '^__version__ = "0.2.0"' src/xgw/__init__.py && grep -q 'def render_guard' src/xgw/net/nft.py && grep -q '^User=xgw-singbox' packaging/xgw-singbox.service && echo "правка в коде: есть"; cd "$HOME/xgw-w3"
+(
+set -o pipefail
+cd "$HOME/xgw-w3" || exit 2
+python3 - <<'PY' | tee source-preflight.txt
+import ast, hashlib, subprocess
+from pathlib import Path
+repo = Path.home() / 'zcod/xgw'
+helper = Path.home() / 'xgw-w3/w3check.py'
+code = 'fd65fc4b18fa8ea658737e9612544bdf63536b4c'
+expected_helper = 'ac3e6d94cb90c66759474204f1a8b7bfbd6d2008dde094d63a5cf2c2389b8b04'
+
+def git(*args):
+    return subprocess.check_output(['git', '-C', str(repo), *args], text=True).strip()
+
+def require(ok, text):
+    if not ok:
+        raise SystemExit('STOP: ' + text)
+
+require(git('branch', '--show-current') == 'freepool', 'нужна ветка freepool')
+require(not git('status', '--porcelain'), 'рабочее дерево не чистое')
+before = git('rev-parse', 'HEAD')
+subprocess.run(['git', '-C', str(repo), 'fetch', '-q', 'origin', 'freepool'], check=True)
+subprocess.run(['git', '-C', str(repo), 'merge', '--ff-only', 'origin/freepool'], check=True)
+subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', code, 'HEAD'], check=True)
+runtime = ['src', 'packaging', 'config.example.toml', 'pyproject.toml']
+require(not git('diff', '--name-only', code, 'HEAD', '--', *runtime),
+        'опубликованный runtime-код изменён после проверяемого commit; требуется новое ТЗ')
+require(not git('status', '--porcelain'), 'после обновления клон не чистый')
+data = helper.read_bytes().replace(b'\r\n', b'\n').rstrip(b'\n') + b'\n'
+require(hashlib.sha256(data).hexdigest() == expected_helper, 'сумма помощника')
+tree = ast.parse((repo / 'src/xgw/net/nft.py').read_text(encoding='utf-8'))
+require(any(isinstance(n, ast.FunctionDef) and n.name == 'render_guard' for n in tree.body),
+        'нет render_guard')
+unit = (repo / 'packaging/xgw-singbox.service').read_text(encoding='utf-8').splitlines()
+for line in ('User=xgw-singbox', 'Group=xgw-singbox', 'AmbientCapabilities=', 'CapabilityBoundingSet='):
+    require(line in unit, 'не тот unit sing-box: ' + line)
+print('SOURCE_PREFLIGHT_OK')
+print('HEAD до обновления: ' + before)
+print('commit реализации: ' + code)
+print('HEAD установки: ' + git('rev-parse', 'HEAD'))
+print('tree установки: ' + git('rev-parse', 'HEAD^{tree}'))
+print('helper_sha256: ' + hashlib.sha256(data).hexdigest())
+PY
+)
 ```
 
-Ожидается: строка `<хеш> <тема коммита>` и «правка в коде: есть». Записать хеш.
+Ожидается `SOURCE_PREFLIGHT_OK`, исходный HEAD, commit реализации, HEAD/tree установки и
+полный fingerprint помощника. Сохранить source-preflight.txt. После неуспешного обновления
+установку не начинать. В отчёте идентичность кода — эти фактические Git-хеши.
+Локальные проверки описаны в `docs/IMPLEMENTATION-WAVE3-LOCAL.md`; реальные проверки пока
+NOT_RUN. Наличие commit не превращает отсутствующее WAN packet evidence в E4 PASS.
 
-Если не так: нет строки «правка в коде» — **стоп**, сообщить заказчику.
+### 2.2. Установка
 
-Шаг 2.2. **Скажи заказчику** (дословно): «Запускаю установку. WAN и DHCP она не трогает;
-интернет дома пропадёт на несколько секунд. Дождитесь, пожалуйста, конца — я сообщу.» Затем:
+Только после успешного 2.1 и согласия1. Сказать: «Запускаю установку опубликованного проверяемого
+кода. Возможен краткий обрыв; дождитесь завершения». Полный вывод остаётся локально:
 
 ```bash
-cd ~/zcod/xgw && date '+%F %T' | tee "$HOME/xgw-w3/install-time.txt" && date +%s > "$HOME/xgw-w3/t-install.txt" && sudo sh packaging/install.sh --yes 2>&1 | tee "$HOME/xgw-w3/install.txt" | tail -6; echo "код ${PIPESTATUS[0]}"; grep -E 'пользователь xgw-singbox|sing-box перезапущен|Ядро|демон xgw|Установка не начата' "$HOME/xgw-w3/install.txt"; cd "$HOME/xgw-w3"
+(
+set -o pipefail
+cd ~/zcod/xgw || exit 2
+date '+%F %T' | tee "$HOME/xgw-w3/install-time.txt"
+date +%s > "$HOME/xgw-w3/t-install.txt"
+sudo sh packaging/install.sh --yes 2>&1 | tee "$HOME/xgw-w3/install.txt" | tail -6
+w3_install_rc=${PIPESTATUS[0]}
+printf 'код %s\n' "$w3_install_rc" | tee "$HOME/xgw-w3/install-rc.txt"
+exit "$w3_install_rc"
+)
 ```
 
-Ожидается: «код 0», «✓ пользователь xgw-singbox», «sing-box перезапущен: файл его службы
-изменился», «демон xgw запущен».
+Ожидается код0. Не угадывать успех по последней строке tee. При не-0 — STOP, сохранить файлы,
+сообщить заказчику; не исправлять/откатывать вручную. Если kernel/guard preflight отказывает,
+записать FAIL совместимости и выполнить только безопасный итог. Не продолжать без guard.
 
-Если не так: «Установка не начата» и строка «Ядро: … не принимает правила» — **дефект «ядро не
-принимает барьер»**: записать строку `Ядро` целиком, **стоп**, сообщить заказчику (сеть не
-менялась). Код не 0 по другой причине — **стоп**, сохранить вывод, сообщить заказчику (сеть не
-откатывать). Нет строки «sing-box перезапущен» — записать «не по ожиданию», продолжать.
+### 2.3. После установки
 
-Шаг 2.3. Через 90 секунд — барьер, ядра и журналы после установки:
+Подождать 90 секунд (двумя ожиданиями по45, если нужно поддерживать связь). Затем:
 
 ```bash
-cd "$HOME/xgw-w3" && sleep 90; sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^sing-box|Ожидает окна' | tee after-install.txt; for m in units state sub guard allow cores capstate check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a after-install.txt; sudo python3 -I w3check.py sbstat "$(cat t-install.txt)" | tee -a after-install.txt; sudo journalctl -u xgw --since "$(cat install-time.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log | tee log-install.txt; sudo journalctl -u xgw-singbox --since "$(cat install-time.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py sblog | tee -a log-install.txt; sudo xgw diag 2>&1 | grep -E 'Ядро|Перехват|Барьер|Пользователи ядер|Эталон правил' | tee -a after-install.txt
+cd "$HOME/xgw-w3"
+sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|Ожидает окна' | tee after-install.txt
+for m in units state sub guard allow cores capstate check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a after-install.txt
+sudo python3 -I w3check.py sbstat "$(cat t-install.txt)" | tee -a after-install.txt
+sudo journalctl -u xgw --since "$(cat install-time.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log | tee log-install.txt
+sudo journalctl -u xgw-singbox --since "$(cat install-time.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py sblog | tee -a log-install.txt
+sudo xgw diag 2>&1 | grep -E 'Ядро|Перехват|Барьер|Пользователи ядер|Эталон правил' | tee -a after-install.txt
 ```
 
-Ожидается (записать **целиком**):
-- `HEALTHY`, перехват включён, «sing-box …: работает, серверов через него: N» (N — как в шаге
-  1.3); строки «Ожидает окна перезапуска» нет; пять служб `active`; `sub` — как в шаге 1.3;
-- **`guard` — «барьер: есть; цепочки: forward, output, pass, transit; отбито: машина TCP …,
-  прочее …; транзит TCP …, прочее …; всего G»** — записать G (может быть больше 0: соединения,
-  открытые до установки);
-- `allow` — «правил с битом барьера в ip xgw: 1 или больше (бит 0x20000000: есть); правил с
-  пользователем sing-box: 2»;
-- **`cores` — «Xray: пользователь xray, права: CAP_NET_BIND_SERVICE, CAP_NET_ADMIN»; «sing-box:
-  пользователь xgw-singbox, права: нет»; «конфиг Xray: root:xray 640 (каталог root:xray 2750);
-  конфиг sing-box: root:xgw-singbox 640 (каталог root:xgw-singbox 2750)»; «routing_mark в
-  конфиге sing-box: 0»**;
-- `capstate` — «эталон правил: есть; расхождение с текстом правил: нет»; `check` — `True`,
-  записать X и Y;
-- `sbstat` — «sing-box: отвечает: да; серверов через него: N; участников на sing-box: A (живы
-  B′); …» — записать (B′ — не меньше B из шага 1.3, если серверы не менялись);
-- журнал XGW: «загрузок правил заново: 0» (или 1); «барьер держит: 0»; «барьер не загружен: 0»;
-  «не сходятся с текстом правил: 0»; «ошибок загрузки правил: 0»; «Traceback: 0»;
-- **журнал sing-box: «operation not permitted: 0»; «permission denied: 0»; «FATAL: 0»**;
-- `xgw diag` — «OK Ядро: … и барьер»; «OK Перехват: включён, правила загружены»; **«OK Барьер:
-  держит: …»**; **«OK Пользователи ядер: sing-box — от своего пользователя, без прав на сеть
-  машины»**; строки «Эталон правил» нет.
+Ожидается HEALTHY, pooloff, те же версии/ручной выбор; пять служб active, Capture.loaded True
+дважды, эталон есть и расхождения нет. Guard имеет forward/output/pass/transit; в output четыре loopback-reject и два
+финальных reject, в transit два финальных reject. TCP/прочее — последние два счётчика каждой
+цепочки, loopback показан отдельно, «всего» включает все восемь. Бит0x20000000 присутствует в правилах прямого пропуска; UID bypass
+sing-box присутствует (ожидаются два в ipxgw; точный режим и фактическое число записать).
+Постоянный sing-box: пользователь xgw-singbox, effective capabilities нет, группы xray нет;
+capability-наборы Eff/Prm/Amb/Bnd=0; его конфиг root:xgw-singbox0640, каталог2750; Xray отдельно root:xray0640/2750; routing_mark0.
+Diag подтверждает соответствие guard политике и изоляцию; FAIL недопустим; sing-box отвечает, нет новых permission/fatal
+ошибок. Числа N/A/B сравнить фактически: уменьшение alive само по себе ещё не доказывает
+регрессию прав, удалённый узел мог стать недоступным. `sbstat` берёт статус XGW, не заменяет
+самостоятельную передачу payload. Начальные ненулевые guard counters возможны после обрыва
+старых direct-сессий; записать их, не обнулять.
 
-Если не так: `guard` — «барьер: нет» или `xgw diag` «FAIL Барьер» — **дефект «барьер не
-загружен»**: записать строки «Барьер» и счётчик «барьер не загружен», продолжать (§3 всё равно
-выполнять — он покажет, отбивается ли соединение). `cores` — sing-box от `xray` или «права» не
-«нет» — **дефект «sing-box не отделён»**. В журнале sing-box «operation not permitted» больше 0
-или «отвечает: нет» — **дефект «sing-box без прав не работает»**: подождать 2 минуты, повторить
-`sudo python3 -I w3check.py sbstat "$(cat t-install.txt)"`, записать оба вывода. Живых участников
-на sing-box меньше, чем в шаге 1.3, — записать «не по ожиданию» (сервер мог и правда умереть).
+Нет guard, нет изоляции, capture mismatch, неHEALTHY или sing-box не работает — записать FAIL,
+**весь §3 NOT_RUN**, сообщить заказчику и перейти к §5. Не проверять дырявый барьер cut-правкой.
+При одной недоступности удалённого узла не приписывать причину permissions без подтверждения.
 
-## 3. Проверки (если заказчик согласился на пункт 2)
+## 3. Изоляция и три scoped fault (только согласие2 и целая база)
 
-Шаг 3.1. Изоляция ядер — попытки от имени sing-box и Xray (ничего не меняют):
+### 3.1. Шесть попыток изоляции
 
 ```bash
 cd "$HOME/xgw-w3" && sudo python3 -I w3check.py isolation | tee r-31.txt
 ```
 
-Ожидается — шесть строк, **везде «отказ»**:
-«sing-box → конфиг Xray: отказ», «sing-box → API Xray: отказ», «sing-box → состояние XGW
-(/var/lib/xgw): отказ», «sing-box → правила nftables: отказ», «sing-box → правило ip rule:
-отказ», «Xray → конфиг sing-box: отказ».
+Ожидаются шесть «отказ»: чтение конфигаXray, UNIXAPIXray, запись состоянияXGW, nftlisttables,
+ipruleadd и чтение конфигаSB пользователемXray. Проверка runuser описывает обычный UID;
+CapEff/группа **реального процесса службы** отдельно проверены в2.3. FileNotFoundError,
+отсутствующий пользователь, занятый pref49, ошибка инструмента — INCONCLUSIVE/NOT_RUN, не PASS
+изоляции. Любой успешный доступ/создание — FAIL изоляции, последующие cut NOT_RUN. При ошибке
+очистки тестового правила — STOP и сообщить; не импровизировать с ip-командами.
 
-Если не так: в любой строке «прочитан», «подключился», «записал», «ПРОЧИТАЛ» или «ДОБАВИЛ
-(сразу убрано)» — **дефект «изоляция ядер»**: записать строку целиком. Другое слово (например,
-`FileNotFoundError`) — записать «не по ожиданию».
+**Оценка каждого cut до перехода к следующему:**
 
-Шаг 3.2. Опустошить цепочку меток трафика самой машины:
+Записать исходную успешную пробу, fault-present до/после, ответ после повреждения, counterdelta,
+структурное время восстановления, успешную пробу после и Capture.loaded True. Ориентиры: output/
+таблица до10с, RPDB до40с, предел60с. Время — структурный polling, полное восстановление отдельно
+подтверждает loaded, не округлять до первого пакета. RST+положительная delta при наблюдённом
+повреждении — только LOCAL_GUARD_EVIDENCE. Если демон успел до/во время пробы, поколение guard сменилось/не читается, счётчик сброшен,
+проба timeout или delta0 — INCONCLUSIVE, не leak/PASS. `соединилось` при fault-present — сигнал
+для расследования пути; без packet evidence не объявлять утечку. Не повторять cut ради гонки.
+Если guard пропал или loaded остаётсяFalse, нет восстановления60с или соединение после не
+вернулось — FAIL восстановления, выполнить безопасный recovery§0, дальнейшие cut NOT_RUN.
+Даже три LOCAL_GUARD_EVIDENCE не закрывают E4 actual-packets gate.
 
-```bash
-cd "$HOME/xgw-w3" && date +%s > t-32.txt && sudo python3 -I w3check.py cut output | tee r-32.txt; sleep 5; for m in guard capstate check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a r-32.txt; sudo journalctl -u xgw --since "@$(cat t-32.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-32.txt)" | tee -a r-32.txt
-```
 
-Ожидается:
-- **«цепочка output (метки трафика машины) опустошена; соединение с адресом в интернете сразу
-  после правки: отбито (сброс) за 0.0X с; барьер отбил пакетов: +1»** (или больше);
-- «правило вернул демон через T с» (T — до 10) — **записать T**; «соединение после возврата:
-  соединилось за … с»;
-- `guard` — «всего» больше, чем в шаге 2.3; `capstate` — «эталон правил: есть; расхождение …:
-  нет»; `check` — `True`;
-- журнал: «загрузок правил заново: 1»; «Traceback: 0».
-
-Если не так: сразу после правки «соединилось» — **дефект «барьер пропустил соединение»** (без
-барьера оно ушло бы мимо VPN): записать обе строки `cut` целиком. «нет ответа за 3 с» — записать
-«не по ожиданию» (барьер должен отбивать сразу). «НЕ вернул за 60 с» — выполнить `sudo xgw net
-up`, записать её вывод и **дефект «демон не вернул правило»**. «правило и так не на месте» —
-записать, выполнить `sudo xgw net up`, повторить шаг один раз.
-
-Шаг 3.3. Удалить таблицу перехвата `ip xgw` целиком:
+### 3.2. Опустошить только output ipxgw
 
 ```bash
-cd "$HOME/xgw-w3" && date +%s > t-33.txt && sudo python3 -I w3check.py cut table | tee r-33.txt; sleep 5; for m in guard capstate check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a r-33.txt; sudo journalctl -u xgw --since "@$(cat t-33.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-33.txt)" | tee -a r-33.txt
+cd "$HOME/xgw-w3" && date +%s > t-32.txt && sudo python3 -I w3check.py cut output | tee r-32.txt
+for m in guard capstate check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a r-32.txt
+sudo journalctl -u xgw --since "@$(cat t-32.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-32.txt)" | tee -a r-32.txt
 ```
 
-Ожидается: **«таблица ip xgw удалена; соединение … сразу после правки: отбито (сброс) …; барьер
-отбил пакетов: +1»** (или больше); «правило вернул демон через T с» (T — до 10) — **записать
-T**; «соединение после возврата: соединилось …»; `capstate`, `check` — как в шаге 3.2; журнал —
-«загрузок правил заново: 1»; «Traceback: 0».
+### 3.3. Удалить только ipxgw
 
-Если не так: как в шаге 3.2.
-
-Шаг 3.4. Удалить правило маршрутизации XGW (pref 100) — его демон замечает на ближайшем шаге,
-до 40 секунд; всё это время интернета дома нет:
+Только после успешного восстановления и проверки3.2, иначе NOT_RUN:
 
 ```bash
-cd "$HOME/xgw-w3" && date +%s > t-34.txt && sudo python3 -I w3check.py cut rule | tee r-34.txt; sleep 5; for m in guard capstate check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a r-34.txt; sudo journalctl -u xgw --since "@$(cat t-34.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-34.txt)" | tee -a r-34.txt; date +%s > t-watch.txt
+cd "$HOME/xgw-w3" && date +%s > t-33.txt && sudo python3 -I w3check.py cut table | tee r-33.txt
+for m in guard capstate check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a r-33.txt
+sudo journalctl -u xgw --since "@$(cat t-33.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-33.txt)" | tee -a r-33.txt
 ```
 
-Ожидается: **«правило ip rule XGW (pref 100) удалено; соединение … сразу после правки: отбито
-(сброс) …; барьер отбил пакетов: +1»** (или больше); «правило вернул демон через T с» (T — до 40)
-— **записать T**; «соединение после возврата: соединилось …»; `capstate`, `check` — как в шаге
-3.2; журнал — «загрузок правил заново: 1»; «Traceback: 0».
+### 3.4. Удалить только собственное fwmark/RPDB pref100
 
-Если не так: как в шаге 3.2.
-
-Если заказчик **не** согласился на пункт 2 — выполни только это, чтобы была метка наблюдения:
+Только после успешного восстановления3.3. В hostTUN этот кейс NOT_RUN без изменения сети;
+проверку pref90 или клиентовLAN здесь не добавлять.
 
 ```bash
-cd "$HOME/xgw-w3" && date +%s > t-watch.txt && echo "метка записана"
+cd "$HOME/xgw-w3" && date +%s > t-34.txt && sudo python3 -I w3check.py cut rule | tee r-34.txt
+for m in guard capstate check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a r-34.txt
+sudo journalctl -u xgw --since "@$(cat t-34.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-34.txt)" | tee -a r-34.txt
 ```
 
-## 4. Наблюдение (если заказчик согласился на пункт 3)
 
-Шаг 4.1. 10 минут без правок — барьер не должен отбить ни одного пакета:
+## 4. Десять минут наблюдения (только согласие3)
+
+Сохранить начальные счётчики и метку независимо от того, выполнялся ли §3:
 
 ```bash
-cd "$HOME/xgw-w3" && sudo python3 -I w3check.py guard | tee guard-start.txt; sleep 600; sudo python3 -I w3check.py guard | tee guard-end.txt; sudo journalctl -u xgw --since "@$(cat t-watch.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-watch.txt)" | tee log-watch.txt; sudo journalctl -u xgw-singbox --since "@$(cat t-watch.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py sblog | tee -a log-watch.txt; sudo python3 -I w3check.py sbstat "$(cat t-install.txt)" | tee -a log-watch.txt; for m in state ts time capstate check; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a log-watch.txt
+cd "$HOME/xgw-w3" && date +%s > t-watch.txt && sudo python3 -I w3check.py guard | tee guard-start.txt
 ```
 
-(Если терминал обрывает длинные команды — первая команда с `guard-start.txt`, затем `sleep 110`
-5 раз и `sleep 50`, затем остальное без `sleep`.)
-
-Ожидается (записать **целиком**):
-- **«всего» в `guard-end.txt` — то же число, что в `guard-start.txt`** (главная проверка:
-  законный трафик барьер не трогает);
-- журнал XGW: «загрузок правил заново: 0»; «барьер держит: 0»; «Traceback: 0»; журнал sing-box —
-  все три счётчика `0`;
-- `sbstat` — «отвечает: да»; участники на sing-box живы, как в шаге 2.3; «проверены после
-  метки: …» — записать;
-- `HEALTHY`; «Tailscale: Running; в сети: да»; «время синхронизировано: yes»; `capstate` —
-  «эталон правил: есть; расхождение … нет»; `check` — `True`.
-
-Если не так: «всего» выросло — **дефект «барьер отбивает законный трафик»**: записать обе строки
-`guard` (по ним видно, машина или транзит, TCP или прочее). «Tailscale: …» не Running или «в
-сети: нет» — **дефект «Tailscale за барьером»**. «время синхронизировано: no» — записать «не по
-ожиданию». «загрузок правил заново» больше 0 — **дефект «загрузка правил по кругу»**.
-
-## 5. Итог
-
-Шаг 5.1. Секреты и итог:
+Подождать 10 минут без вмешательства; поддерживать связь с заказчиком. Ожидать отдельными
+командами `sleep 60` десять раз, не одним блокирующим вызовом на600с. Затем:
 
 ```bash
-cd "$HOME/xgw-w3" && sudo journalctl -u xgw --since "$(cat install-time.txt)" --no-pager | grep -c -E 'vless://|vmess://|trojan://|ss://|hysteria2://|hy2://|tuic://' | tee secrets.txt; date '+%F %T' | tee final.txt; sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|Ожидает окна' | tee -a final.txt; for m in units state sub guard cores; do sudo python3 -I w3check.py $m; done 2>&1 | tee -a final.txt
+cd "$HOME/xgw-w3"
+sudo python3 -I w3check.py guard | tee guard-end.txt
+sudo journalctl -u xgw --since "@$(cat t-watch.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py log "$(cat t-watch.txt)" | tee log-watch.txt
+sudo journalctl -u xgw-singbox --since "@$(cat t-watch.txt)" -o short-unix --no-pager | sudo python3 -I w3check.py sblog | tee -a log-watch.txt
+sudo python3 -I w3check.py sbstat "$(cat t-install.txt)" | tee -a log-watch.txt
+for m in state ts time capstate check; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a log-watch.txt
 ```
 
-Ожидается: `0`; `HEALTHY`, перехват включён, Xray 26.10.31, sing-box 1.14.4, строки «Ожидает
-окна перезапуска» нет; пять служб `active`; режим пула и «выбран вручную» — как в шаге 1.3;
-барьер есть; sing-box — от `xgw-singbox`, «права: нет».
+Желательно отсутствие неожиданных reload/permission/fatal/Traceback, стабильная работа подписки,
+Tailscale/time и loadedTrue. Записать начальные/конечные счётчики и **факт reload**. Рост reject
+не доказывает блокировку законного трафика: без атрибуции потоку это OBSERVATION. Нулевая delta
+тоже не доказывает работоспособность всех разрешённых путей. При reload/reset delta несопоставима.
+Новые регулярные reload без внесённых правок или воспроизводимая потеря ранее работавшего пути —
+дефект/расследование с условиями; не приписывать все фоновые отказы guard по одному счётчику.
 
-**Скажи заказчику** (дословно): «Проверка закончена, пишу отчёт.»
+## 5. Безопасный итог
 
-## Если что-то пошло не так
+Если установка не начиналась, пропустить чтение отсутствующего install-time; записать STOP и
+фактическое состояние. Иначе:
 
-- Пропал интернет или доступ дольше 60 секунд, или заказчик не отвечает **2 минуты** —
-  **сразу**: `sudo xgw net up`; если `systemctl is-active xgw` — не `active`, то `sudo systemctl
-  start xgw`; подожди 30 секунд. Записать время и строки `sudo python3 -I w3check.py state` и
-  `sudo xgw status 2>&1 | head -5` (без имён). Дальше — §5 и отчёт.
-- Не `HEALTHY` больше 5 минут, службы не `active` — записать, сообщить заказчику, ничего не
-  перезапускать.
-
-## 6. Отчёт
-
-Файл `docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3-<ДАТА>.md` в клоне (`<ДАТА>` — дата начала
-проверки, ГГГГ-ММ-ДД), коммит «Отчёт: XGW 0.2.0, волна 3 кросс-аудита» и `git push` в
-`freepool`. Только этот файл (`git add` только его). Без имён серверов, устройств и подписок,
-адресов, доменов и строк журнала. Шаблон (заполни каждую ячейку; пропущенное — «не
-выполнялся»):
-
-```markdown
-# Отчёт: XGW 0.2.0 — волна 3 кросс-аудита: барьер и отдельный пользователь sing-box
-
-Код: <хеш>. Установка: <время>, код <код>. Согласие заказчика: пункты <…>.
-w3check.py: <сумма>. Режим пула до проверки: <…>. Ядра: Xray <…>, sing-box <…>. Исполнитель:
-<модель>.
-
-## Итог
-| Барьер после установки (есть; отбито G) | sing-box: пользователь; права; routing_mark | Изоляция (из 6 — «отказ») | output: сразу; вернул, с | ip xgw: сразу; вернул, с | ip rule: сразу; вернул, с | Барьер отбил за 10 мин | Загрузок правил за 10 мин | sing-box: живых участников до → после |
-|---|---|---|---|---|---|---|---|---|
-| <есть; 0> | <xgw-singbox; нет; 0> | <6> | <отбито; 1.2> | <отбито; 1.5> | <отбито; 21> | <0> | <0> | <2 → 2> |
-
-## Кейсы
-| Шаг | Результат | Кратко |
-|---|---|---|
-| 1.0 предусловие | … | … |
-| 1.3 до | — | … |
-| 2.1 код | … | … |
-| 2.2 установка | … | … |
-| 2.3 после установки | … | … |
-| 3.1 изоляция ядер | … | … |
-| 3.2 опустошена output | … | … |
-| 3.3 удалена ip xgw | … | … |
-| 3.4 удалено ip rule | … | … |
-| 4.1 наблюдение 10 мин | … | … |
-| 5 итог | … | … |
-
-## Выводы шагов
-- <строки помощника по шагам (из файлов $HOME/xgw-w3/…); строки xgw diag «Ядро», «Перехват»,
-  «Барьер», «Пользователи ядер», «Эталон правил»; ответы заказчика дословно, без имён>
-
-## Дефекты
-<нет / нумерованный список: шаг, что ожидалось, что получилось, строки помощника>
-
-## Наблюдения
-<…>
+```bash
+cd "$HOME/xgw-w3"
+sudo journalctl -u xgw --since "$(cat install-time.txt)" --no-pager | grep -c -E 'vless://|vmess://|trojan://|ss://|hysteria2://|hy2://|tuic://' | tee secrets.txt
+date '+%F %T' | tee final.txt
+sudo xgw status 2>&1 | grep -E '^Состояние|Перехват:|^Xray|^sing-box|Ожидает окна' | tee -a final.txt
+for m in units state sub guard cores; do sudo python3 -I w3check.py "$m"; done 2>&1 | tee -a final.txt
 ```
+
+Ожидается0 URL-pattern matches, HEALTHY, те же ядра/режим/ручной выбор, guard и SBизоляция.
+Нулевой pattern-count покрывает только перечисленные URI, **не доказывает отсутствие всех
+секретов** в журнале. При matches не печатать строки, отметить число и сообщить разработчику.
+Сказать заказчику: «Проверка закончена, сохраняю локальный отчёт».
+
+## 6. Локальный отчёт и последующий review
+
+Заполнить отдельный `docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3-TEMPLATE.md`, сохранить результат
+**локально** в `$HOME/xgw-w3/TEST-REPORT-REAL-MACHINE-0.2.0-wave3-YYYY-MM-DD.md`. Каждый пункт
+получает фактический PASS/FAIL/INCONCLUSIVE/NOT_RUN и ссылку на сохранённый файл. Не выполненные
+кейсы и отсутствующее согласие остаются NOT_RUN; пример успешного вывода не является результатом.
+Код обозначить commit реализации, фактическими HEAD/tree установки и helperSHA.
+E4 без фактического packet artifact — NOT_RUN с явной причиной «нет WANsentinel на машине».
+Итог ограничить проверенными плоскостями и отдельно назвать непокрытые пути/сценарии.
+
+Отчёт оформить по аналогии с предыдущими:
+`docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3-<ДАТА>.md` в клоне (`<ДАТА>` — дата начала
+проверки). Перенести только заполненный обезличенный отчёт. Для публикации отчёта применяется
+тот же порядок, что в wave2: коммит «Отчёт: XGW 0.2.0, волна 3 кросс-аудита» и `git push`
+в `freepool`. В staging должен быть **только этот файл отчёта**. Если отчёт уже опубликован,
+push не fast-forward или есть чужие изменения — STOP; не amend/reset/rebase/force и не
+публиковать код, конфиги, evidence/private install.txt. Исходники исполнитель не исправляет.
+
+После публикации сообщить разработчику ссылку/commit отчёта, фактические дефекты и NOT_RUN.
+Разработчик продолжает исправления по отчёту. Отчёт не закрывает непроверенные сценарии.
