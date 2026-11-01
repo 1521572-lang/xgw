@@ -1129,6 +1129,94 @@ def test_refresh_request_is_served_on_the_next_tick(daemon):
     assert daemon.collected == [True] and not daemon.refresh_pending
 
 
+def _slow_collect(daemon: Harness) -> threading.Event:
+    """Опрос подписок, который ждёт, пока тест не откроет ворота."""
+    gate = threading.Event()
+    collect = daemon._collect
+    daemon._collect = lambda via_xray: gate.wait(5) and collect(via_xray)
+    daemon.refresh_wait = 0.05
+    return gate
+
+
+def test_slow_subscription_poll_runs_outside_the_step(daemon):
+    """Отчёты audit6b и audit6c: шаг с обновлением подписки длился 90–135 с, из них опрос
+    37–68 с, и всё это время watchdog не замечал упавших серверов. Опрос — в фоне: шаг ждёт
+    его не дольше refresh_wait, второй опрос, пока идёт первый, не начинается, а итог
+    применяет первый шаг после конца опроса (демон будится сразу)."""
+    _started(daemon)
+    gate = _slow_collect(daemon)
+    daemon.source = _inventory(links.FULL_LINKS)  # один сервер пропал из подписки
+    daemon.next_refresh = 0.0
+    started = time.monotonic()
+    daemon.tick()
+    daemon.request_refresh()
+    daemon.poke.clear()
+    daemon.tick()
+    assert time.monotonic() - started < 2
+    assert daemon.collected == [] and daemon.applied == [] and daemon.refresh_pending
+    gate.set()
+    assert daemon.poke.wait(5)
+    daemon.tick()
+    assert daemon.collected == [True] and len(daemon.applied) == 1
+    assert len(daemon.tags("proxy")) + len(daemon.tags("spare")) == 4
+    assert not daemon.refresh_pending
+
+
+def test_settings_change_during_a_subscription_poll(daemon):
+    """Настройки перечитаны, пока опрос подписок шёл в фоне: источники прежние — итог опроса
+    применяет новый демон, не опрашивая подписки заново; источники сменились — опрос прежних
+    отменяется, а новый демон опрашивает новые."""
+    _started(daemon)
+    gate = _slow_collect(daemon)
+    daemon.source = _inventory(links.FULL_LINKS)
+    daemon.next_refresh = 0.0
+    daemon.tick()
+    job = daemon._fetch
+    second = _second(daemon, lambda cfg: None)
+    try:
+        assert second._fetch is job and second.refresh_pending
+        gate.set()
+        assert job.done.wait(5)
+        second.tick()
+        assert daemon.collected == [True] and second.collected == []
+        assert second.inventory is job.inventory and len(second.applied) == 1
+        assert not second.refresh_pending
+        again = _slow_collect(second)
+        second.next_refresh = 0.0
+        second.tick()
+        dropped = second._fetch
+        third = _second(second, lambda cfg: cfg.manual.links.append(links.SS_PLAIN))
+        try:
+            assert dropped.cancel.is_set() and third._fetch is None
+            third.tick()
+            assert third.collected == [True]  # источники изменились — опрос сразу
+        finally:
+            again.set()
+            third.store.close()
+    finally:
+        second.store.close()
+
+
+def test_spares_are_scanned_once_the_subscription_arrives_after_a_restart(daemon):
+    """Демон перезапущен: подписка приходит из фонового опроса не в первом шаге — круг сканов
+    запасных ждёт её, а не следующего срока через час (до неё цены запасных неизвестны, и
+    _queue_scan пропустил бы их всех)."""
+    _started(daemon)
+    restarted = Harness(daemon.cfg, daemon.paths)
+    try:
+        restarted.t = daemon.t
+        restarted.set_alive()
+        gate = _slow_collect(restarted)
+        restarted.tick()
+        assert restarted.inventory is None and restarted.scanned == []
+        gate.set()
+        assert restarted.poke.wait(5)
+        restarted.tick()
+        assert set(restarted.tags("spare")) <= set(restarted.scanned)
+    finally:
+        restarted.store.close()
+
+
 def test_scan_request_checks_the_spares_now(daemon):
     _started(daemon)
     daemon.tick()

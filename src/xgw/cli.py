@@ -813,6 +813,7 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             sinks = notify.build_sinks(cfg, mark=engine.bypass_mark(cfg, logger))
             daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture, sinks=sinks)
             if args.once:
+                daemon.refresh_wait = None  # опрос подписок — до конца: шаг один
                 print(daemon.tick())
                 daemon.store.close()
                 return 0

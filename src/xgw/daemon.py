@@ -129,6 +129,11 @@ RESERVE_NOTE_AFTER = 300.0
 # Подписка не обновляется дольше этого — уведомить: разовый сбой провайдера подписки
 # повода не даёт, а долгий — значит, что-то с ней не так (истекла, сменился адрес).
 SUBSCRIPTION_ALERT_AFTER = 3600.0
+# Опрос подписок идёт в фоновом потоке (_refresh): отчёты audit6b и audit6c — шаг с
+# обновлением подписки длился 90–135 с, из них опрос 37–68 с, и всё это время watchdog не
+# замечал упавших серверов. Шаг, начавший опрос, ждёт его не дольше REFRESH_WAIT: быстрый
+# опрос (файл, кэш) применяется в том же шаге, долгий — первым шагом после его конца.
+REFRESH_WAIT = 2.0
 # Основной сервер (_main_step). С сервера, ушедшего в отказ, основной уходит сразу, и
 # снова основным он не берётся MAIN_COOLDOWN, пока есть другие живые участники.
 MAIN_COOLDOWN = 1800.0
@@ -436,6 +441,42 @@ class _PoolCancel:
 
     def is_set(self) -> bool:
         return self.stop.is_set() or self.pool.cfg.free_pool.mode == "off"
+
+
+class _FetchCancel:
+    """Отмена фонового опроса подписок (_Fetch): демон останавливается либо источники
+    серверов в настройках сменились (adopt) — опрос прежних больше не нужен."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop, self.dropped = stop, threading.Event()
+
+    def is_set(self) -> bool:
+        return self.stop.is_set() or self.dropped.is_set()
+
+    def wait(self, seconds: float) -> bool:
+        """Как threading.Event.wait — пауза перед повтором запроса (fetch._pause)."""
+        deadline = time.monotonic() + seconds
+        while not self.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self.stop.wait(min(left, fetch.CANCEL_SLICE))
+        return True
+
+
+@dataclasses.dataclass
+class _Fetch:
+    """Опрос подписок в фоновом потоке (Daemon._refresh) и его итог."""
+
+    via_xray: bool
+    urgent: bool
+    cancel: _FetchCancel
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    waiting: bool = False  # шаг ждёт конца опроса сам — будить демон незачем
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)  # done и waiting
+    inventory: engine.Inventory | None = None
+    error: Exception | None = None
+    spent: float = 0.0  # секунд на опрос
 
 
 class Daemon:
@@ -780,7 +821,10 @@ class Daemon:
         self._refresh_asked = False
         self._scan_asked = False
         self._manual_scan = False
-        self._refreshing = False
+        self._fetch: _Fetch | None = None  # опрос подписок в фоне: идёт или ждёт применения
+        # Сколько шаг ждёт начатого им опроса подписок (REFRESH_WAIT); None — до конца
+        # (`xgw run --once`: шаг один, применить итог позже некому).
+        self.refresh_wait: float | None = REFRESH_WAIT
         self._rebuild_asked = False
 
     # --- цикл ------------------------------------------------------------------
@@ -986,11 +1030,17 @@ class Daemon:
     def adopt(self, previous: Daemon) -> None:
         """Настройки перечитаны. Если источники серверов прежние, подписки заново
         не запрашиваются: конфиг пересобирается из уже полученного списка — так
-        отключение сервера в панели не стоит запроса к каждой подписке."""
+        отключение сервера в панели не стоит запроса к каждой подписке. Опрос подписок, который
+        прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
+        прежних отменяется."""
         self._resume(previous)
-        if previous.inventory is None or (
-            engine.sources_key(previous.cfg) != engine.sources_key(self.cfg)
-        ):
+        same = engine.sources_key(previous.cfg) == engine.sources_key(self.cfg)
+        if previous._fetch is not None and same:
+            self._fetch = previous._fetch
+            self.next_refresh = previous.next_refresh
+        elif previous._fetch is not None:
+            previous._fetch.cancel.dropped.set()
+        if previous.inventory is None or not same:
             return
         self.inventory = previous.inventory
         self.next_refresh = previous.next_refresh
@@ -1192,7 +1242,7 @@ class Daemon:
 
     @property
     def refresh_pending(self) -> bool:
-        return self._refresh_asked or self._refreshing
+        return self._refresh_asked or self._fetch is not None
 
     @property
     def scan_pending(self) -> bool:
@@ -1219,7 +1269,7 @@ class Daemon:
         if applied is None:
             # Первый запуск: рабочего конфига ещё нет — собрать и запустить Xray.
             if now >= self.next_refresh or refresh_asked or self._rebuild_asked:
-                self._refresh(now, via_xray=False, urgent=True)
+                self._refresh(now, via_xray=False, urgent=True, background=False)
             at = self._spent("первая сборка конфига", at)
             applied = engine.read_json(self.paths.xray_config_file)
             if applied is None:
@@ -1338,7 +1388,10 @@ class Daemon:
                 self._rebuild_asked = False
                 self._save_inventory(self.inventory)
             changed = self._rebuild(None, urgent=True, reason=reason)
-        if not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
+        if not changed and self._fetch is not None and self._fetch.done.is_set():
+            # Опрос подписок шёл в фоне (_refresh) и закончился — его итог в работу.
+            changed = self._refresh_done(now, urgent)
+        elif not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
             # Внеочередное обновление подписки напрямую и скан всех запасных.
             self.next_all_dead = now + ALL_DEAD_RETRY
             changed = self._refresh(now, via_xray=False, urgent=True)
@@ -1388,7 +1441,9 @@ class Daemon:
         elif scan_asked:
             self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
         if not changed and probing and signals.xray_ok and signals.provider_ok:
-            if now >= self.next_scan:
+            # Подписка после запуска демона ещё не получена (опрос в фоне): цены запасных
+            # неизвестны, _queue_scan их пропустил бы — круг ждёт её, а не следующего срока.
+            if now >= self.next_scan and self.inventory is not None:
                 self.next_scan = now + jitter(self._scan_period(view) * 60.0)
                 self._queue_scan(view, now)
             self._queue_members(view)
@@ -2130,28 +2185,66 @@ class Daemon:
             self.paths.pending_config_file.unlink(missing_ok=True)
         return self._report(outcome, "отложенный перезапуск")
 
-    def _refresh(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
-        """Опрос подписок и применение изменений."""
+    def _refresh(
+        self, now: float, *, via_xray: bool, urgent: bool, background: bool = True,
+    ) -> bool:
+        """Опрос подписок и применение изменений. Опрос — в фоновом потоке (REFRESH_WAIT):
+        шаг ждёт его не дольше refresh_wait (background=False — до конца: первый запуск,
+        рабочего конфига ещё нет), не дождался — итог применит первый шаг после конца опроса
+        (_refresh_done). Опрос уже идёт — второй не начинается, срочность переходит к нему."""
         if self.stopping:
             return False
-        self._refreshing = True
-        try:
-            return self._refresh_now(now, via_xray=via_xray, urgent=urgent)
-        finally:
-            self._refreshing = False
+        job = self._fetch if self._fetch is not None else self._start_fetch(now, via_xray)
+        job.urgent = job.urgent or urgent
+        with job.lock:
+            job.waiting = True
+        job.done.wait(self.refresh_wait if background else None)
+        with job.lock:
+            job.waiting = False
+            finished = job.done.is_set()
+        if not finished:
+            return False
+        return self._refresh_done(now, urgent)
 
-    def _refresh_now(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
+    def _start_fetch(self, now: float, via_xray: bool) -> _Fetch:
         minutes = min((sub.refresh_minutes for sub in self.cfg.subscriptions), default=60)
         self.next_refresh = now + jitter(max(1, minutes) * 60.0)
-        began = time.monotonic()
-        self._rebuild_spent = (0.0, 0.0)
-        try:
-            inventory = self._collect(via_xray)
-        except fetch.Cancelled:
+        # Начавший опрос шаг его ждёт (_refresh) — и тогда, когда поток кончил раньше, чем шаг
+        # начал ждать.
+        job = self._fetch = _Fetch(via_xray, False, _FetchCancel(self._stop), waiting=True)
+        self.log.info("опрос подписок начат — идёт в фоне, шаги демона не ждут")
+
+        def work() -> None:
+            began = time.monotonic()
+            try:
+                job.inventory = self._collect(via_xray)
+            except Exception as exc:  # итог — шагу (_refresh_done), как при опросе в нём самом
+                job.error = exc
+            job.spent = time.monotonic() - began
+            with job.lock:
+                job.done.set()
+                wake = not job.waiting
+            if wake:
+                self.poke.set()  # итог — в работу сразу, не дожидаясь очередного шага
+
+        threading.Thread(target=work, name="xgw-subscriptions", daemon=True).start()
+        return job
+
+    def _refresh_done(self, now: float, urgent: bool) -> bool:
+        """Итог опроса подписок (_refresh) — в работу: ошибки для панели, список серверов и
+        сборка конфига (срочная, если срочным был опрос или шаг, который его применяет)."""
+        job, self._fetch = self._fetch, None
+        assert job is not None
+        if isinstance(job.error, fetch.Cancelled):
             # Остановка прервала опрос: о подписках он ничего не говорит — ни сбоя, ни
             # ошибок для панели, ни неполного списка серверов.
             self.log.info("опрос подписок прерван: демон останавливается")
             return False
+        if job.error is not None:
+            raise job.error
+        inventory = job.inventory
+        assert inventory is not None
+        self._rebuild_spent = (0.0, 0.0)
         self._save_errors(inventory)
         if inventory.nodes:
             self._save_inventory(inventory)
@@ -2175,12 +2268,12 @@ class Daemon:
         if inventory.complete:
             self._sub_failing_since, self._sub_alerted = None, False
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
-        collected = time.monotonic() - began
-        changed = self._rebuild(None, urgent=urgent, reason="обновление подписки")
+        changed = self._rebuild(None, urgent=job.urgent or urgent, reason="обновление подписки")
         # Отчёты youtube3 и audit6: шаг с обновлением подписки длится 80–110 с — где именно время.
+        # Опрос с 0.2.0 — в фоне, вне шага; сборка и применение — в шаге.
         assembled, applied = self._rebuild_spent
         self.log.info("обновление подписки: опрос %.0f с, сборка %.0f с, применение %.0f с",
-                      collected, assembled, applied)
+                      job.spent, assembled, applied)
         return changed
 
     def _rebuild(
@@ -2258,9 +2351,11 @@ class Daemon:
             self.log.error("ошибки подписок не записаны: %s", exc)
 
     def _collect(self, via_xray: bool) -> engine.Inventory:
+        """Опрос подписок; идёт в фоновом потоке (_start_fetch)."""
+        job = self._fetch
         return engine.collect(
             self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray,
-            cancel=self._stop,
+            cancel=job.cancel if job is not None else self._stop,
         )
 
     def _assemble(
