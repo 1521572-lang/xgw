@@ -90,6 +90,10 @@ def prepare(directory: Path) -> None:
 
 def restore(directory: Path) -> None:
     began = time.monotonic()
+    try:
+        last_pulse = float(json.loads((directory / "lease.json").read_text()))
+    except (OSError, ValueError, TypeError):
+        last_pulse = None
     save(directory / "status.json", {"state": "restoring"})
     snapshot = json.loads((directory / "snapshot.json").read_text())
     rules = (directory / "off.nft").read_bytes()
@@ -117,11 +121,14 @@ def restore(directory: Path) -> None:
             save(directory / "job-result.json", result)
     except (OSError, ValueError):
         pass
+    ended = time.monotonic()
     save(directory / "status.json", {
         "state": "RESTORED_OFF" if applied == 0 else "FAILED_RESTORE",
         "nft_rc": applied, "stop_rc": stopped, "kill_rc": killed,
-        "daemon": "left_stopped_for_review", "monotonic": time.monotonic(),
-        "recovery_seconds": round(time.monotonic() - began, 3),
+        "daemon": "left_stopped_for_review", "monotonic": ended,
+        "recovery_seconds": round(ended - began, 3),
+        "seconds_since_last_pulse": (round(ended - last_pulse, 3)
+                                     if last_pulse is not None else None),
     })
 
 

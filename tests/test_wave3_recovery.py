@@ -130,6 +130,7 @@ def test_rescue_uses_prepared_rules_and_bounded_commands_not_installed_xgw(tmp_p
     })
     calls = []
     tool.save(tmp_path / "job-result.json", {"action": "install", "state": "running", "rc": None})
+    tool.save(tmp_path / "lease.json", tool.time.monotonic() - tool.LEASE_SECONDS)
     monkeypatch.setattr(tool, "call", lambda argv, timeout, **kw:
                         calls.append((argv, timeout, kw)) or 0)
     tool.restore(tmp_path)
@@ -137,6 +138,8 @@ def test_rescue_uses_prepared_rules_and_bounded_commands_not_installed_xgw(tmp_p
     assert calls[-1][2]["data"] == rules
     assert sum(call[1] for call in calls) == 5
     assert target.read_bytes() == state
-    assert tool.json.loads((tmp_path / "status.json").read_text())["state"] == "RESTORED_OFF"
+    status = tool.json.loads((tmp_path / "status.json").read_text())
+    assert status["state"] == "RESTORED_OFF"
+    assert status["seconds_since_last_pulse"] >= tool.LEASE_SECONDS
     result = tool.json.loads((tmp_path / "job-result.json").read_text())
     assert result["state"] == "aborted_by_safety"
