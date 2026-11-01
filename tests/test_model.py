@@ -58,3 +58,64 @@ def test_variants_of_one_server_are_not_duplicates():
     assert shared not in (first.fingerprint, second.fingerprint)
     assert alone.fingerprint == kept
     assert len(first.fingerprint) == 8
+
+
+XHTTP = ("vless://11111111-2222-3333-4455-666666666661@edge.example.com:443"
+         "?type=xhttp&security=tls&sni=edge.example.com&mode=packet-up&path=")
+
+
+def _variants(*paths: str):
+    return [raw_to_node(parse_link(f"{XHTTP}/{path}#{path}"), "main") for path in paths]
+
+
+def test_variant_fingerprint_does_not_depend_on_the_neighbours():
+    """R01 кросс-аудита 4cc96b9: A → A+B → A менял отпечаток A дважды, а с ним терялись выбор
+    вручную, замеры и итоги проверок. С историей выдачи отпечаток варианта — его собственный:
+    A остаётся A, B — B, хоть один, хоть вместе, в любом порядке."""
+    from xgw.model import split_variants
+
+    known: dict = {}
+    (alone,) = _variants("a")
+    split_variants([alone], known, now=1.0)
+    first = alone.fingerprint
+    a, b = _variants("a", "b")
+    assert split_variants([a, b], known, now=2.0) == 1
+    assert a.fingerprint == first != b.fingerprint
+    second = b.fingerprint
+    (a,) = _variants("a")
+    split_variants([a], known, now=3.0)
+    (b,) = _variants("b")
+    split_variants([b], known, now=4.0)
+    assert (a.fingerprint, b.fingerprint) == (first, second)
+    b, a = _variants("b", "a")
+    split_variants([b, a], known, now=5.0)
+    assert (a.fingerprint, b.fingerprint) == (first, second)
+    (c,) = _variants("c")  # новый вариант один: общий отпечаток уже выдан варианту A
+    split_variants([c], known, now=6.0)
+    assert c.fingerprint not in (first, second)
+
+
+def test_websocket_host_from_headers_tells_servers_apart_and_old_ids_stay():
+    """R01: серверы одного CDN, различимые только устаревшей записью headers.Host, — разные; а
+    прежние отпечатки вариантов (без неё) при первом запуске сохраняются по прошлому списку."""
+    from xgw import model
+
+    link = ("vless://11111111-2222-3333-4455-666666666662@cdn.example.com:443"
+            "?type=ws&security=tls&sni=cdn.example.com&path=%2F#X")
+
+    def node(path: str, host: str):
+        item = raw_to_node(parse_link(link), "main")
+        item.outbound["streamSettings"]["wsSettings"] = {"path": path, "headers": {"Host": host}}
+        return item
+
+    one, two = node("/", "a.example"), node("/", "b.example")
+    assert model.variant_key(one) != model.variant_key(two)
+    assert model.variant_key(one, legacy=True) == model.variant_key(two, legacy=True)
+    model.split_variants([one, two], {})
+    assert one.fingerprint != two.fingerprint
+    left, right = node("/l", "h.example"), node("/r", "h.example")
+    base = left.fingerprint
+    old = {model._variant_fingerprint(base, model.variant_key(item, legacy=True))
+           for item in (left, right)}
+    model.split_variants([left, right], {}, previous=old)
+    assert {left.fingerprint, right.fingerprint} == old

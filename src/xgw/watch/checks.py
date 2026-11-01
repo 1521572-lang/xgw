@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import re
 import socket
 import ssl
 import threading
@@ -20,6 +21,9 @@ from .. import fetch, marknet
 
 HEAD_LIMIT = 64 * 1024  # заголовки ответа длиннее — это уже не HTTP
 MAX_TOTAL_SECONDS = 60.0
+# Строка разметки тела «частями» (размер части с расширениями, трейлер) длиннее — не HTTP.
+CHUNK_LINE_LIMIT = 4096
+_CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}")
 
 
 @dataclass
@@ -28,7 +32,9 @@ class DownloadResult:
     downloaded: int = 0            # сколько байт ТЕЛА успели скачать (заголовки не в счёт)
     stalled: bool = False          # True = тишина дольше порога при открытом соединении
     error: str = ""
-    # Этап сбоя: connect | proxy | tls | http | stall | truncated | timeout | io
+    # Этап сбоя: connect | proxy | tls | http | stall | truncated | timeout | reset | io.
+    # reset — соединение оборвано после отправки запроса (RST, ошибка TLS посреди ответа):
+    # код ответа и пришедшие байты тела сохраняются (C02 кросс-аудита 4cc96b9).
     kind: str = ""
     status: int = 0                # код ответа HTTP, если заголовки получены
     body: bytes = b""              # начало тела (не больше keep_body байт)
@@ -66,13 +72,18 @@ def http_get_via_proxy(
     cancel: threading.Event | None = None,
     rtt: bool = False,
     range_end: int = 0,
+    min_body: int = 0,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
     https открывается CONNECT-туннелем. Успех — только ответ 2xx с телом,
-    дочитанным до Content-Length (или до закрытия, если длина не объявлена).
-    Нет новых байтов `silence` секунд → stalled; вся загрузка дольше
-    `max_total` секунд → timeout (защита от «капающего» сервера).
+    дочитанным до Content-Length, до последней части ответа «частями» (chunked) или до
+    закрытия, если длина не объявлена. Нет новых байтов `silence` секунд → stalled; вся
+    загрузка дольше `max_total` секунд → timeout (защита от «капающего» сервера): это общий
+    срок всех этапов — соединения с прокси, CONNECT, рукопожатия TLS и ответа (C03
+    кросс-аудита 4cc96b9: раньше каждый этап ждал свои `timeout` секунд сверх него).
+    `min_body` — тело короче (ответ 204, пустой 200) — неудача: пробе нужен файл, а не
+    ответ без тела (C01).
     `user_agent` — заголовок запроса (probe.user_agent); пусто — «xgw/<версия>».
     `max_bytes` / `max_body_seconds` — замер скорости: тело дальше этого не читается, и
     загрузка всё равно удачная (ok), хоть файл и не дочитан.
@@ -93,6 +104,14 @@ def http_get_via_proxy(
         return DownloadResult(ok=False, kind="http", error="неподдерживаемый URL пробы")
     port = parts.port or (443 if parts.scheme == "https" else 80)
     deadline = time.monotonic() + max_total
+
+    def left(cap: float) -> float:
+        """Ожидание этапа: не дольше cap и не дольше, чем осталось до общего срока."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("общий срок пробы исчерпан")
+        return min(cap, remaining)
+
     sock: socket.socket | None = None
     try:
         if cancel is not None and cancel.is_set():
@@ -100,8 +119,8 @@ def http_get_via_proxy(
         if parts.scheme == "https":
             try:
                 sock = fetch.open_tunnel(
-                    (proxy_host, proxy_port), host, port,
-                    timeout=timeout, user=proxy_user, password=proxy_pass, cancel=cancel,
+                    (proxy_host, proxy_port), host, port, timeout=left(timeout),
+                    user=proxy_user, password=proxy_pass, cancel=cancel, deadline=deadline,
                 )
             except fetch.ProxyError as exc:
                 return DownloadResult(ok=False, kind="proxy", status=exc.status, error=str(exc))
@@ -112,12 +131,12 @@ def http_get_via_proxy(
                 sock = context.wrap_socket(
                     sock, server_hostname=host, do_handshake_on_connect=False
                 )
-                fetch.wait_io(sock, sock.do_handshake, timeout, cancel)
+                fetch.wait_io(sock, sock.do_handshake, left(timeout), cancel)
             except TimeoutError as exc:
                 return DownloadResult(ok=False, kind="timeout", error=f"таймаут TLS: {exc}")
             except (ssl.SSLError, OSError) as exc:
                 return DownloadResult(ok=False, kind="tls", error=f"TLS: {exc}")
-            sock.settimeout(timeout)
+            sock.settimeout(left(timeout))
             path = parts.path or "/"
             if parts.query:
                 path = f"{path}?{parts.query}"
@@ -127,7 +146,7 @@ def http_get_via_proxy(
             )
         else:
             try:
-                sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+                sock = socket.create_connection((proxy_host, proxy_port), timeout=left(timeout))
             except OSError as exc:  # в т. ч. таймаут: локальный inbound недоступен
                 return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}")
             headers = {"Host": _host_header(host, port, 80), **ranged}
@@ -135,11 +154,18 @@ def http_get_via_proxy(
                 token = base64.b64encode(f"{proxy_user}:{proxy_pass}".encode()).decode("ascii")
                 headers["Proxy-Authorization"] = f"Basic {token}"
             request = _request("GET", url, headers, user_agent)  # абсолютный URI
+            sock.settimeout(left(timeout))
         sock.sendall(request)
         result = _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
             max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
         )
+        if result.ok and result.downloaded < min_body:
+            return DownloadResult(
+                ok=False, kind="http", status=result.status, downloaded=result.downloaded,
+                body=result.body, body_seconds=result.body_seconds,
+                error=f"ответ без тела (HTTP {result.status}, {result.downloaded} байт)",
+            )
         if rtt and parts.scheme == "https" and result.ok and result.reusable:
             head = _request("HEAD", path, {"Host": _host_header(host, port, 443)}, user_agent)
             result.rtt_ms = _head_rtt(sock, head, silence, deadline, cancel)
@@ -224,8 +250,9 @@ def _read_response(
     sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0,
     max_bytes: int = 0, max_body_seconds: float = 0.0, cancel: threading.Event | None = None,
 ) -> DownloadResult:
-    """Читает ответ: заголовки, затем тело до Content-Length или закрытия (либо до
-    max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до конца)."""
+    """Читает ответ: заголовки, затем тело до Content-Length, последней части ответа «частями»
+    или закрытия (либо до max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до
+    конца). downloaded и body — полезные байты тела, без разметки частей."""
     buffer = b""
     try:
         while fetch.HEAD_END not in buffer:
@@ -243,6 +270,10 @@ def _read_response(
         )
     except _Deadline:
         return DownloadResult(ok=False, kind="timeout", error="таймаут до заголовков ответа")
+    except OSError as exc:  # RST, ошибка TLS: таймауты сюда не доходят (_recv)
+        return DownloadResult(
+            ok=False, kind="reset", error=f"обрыв соединения до заголовков ответа: {exc}"
+        )
 
     head, _, rest = buffer.partition(fetch.HEAD_END)
     status, length, chunked = _parse_head(head)
@@ -256,9 +287,10 @@ def _read_response(
         length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
     started = time.monotonic()
-    downloaded = len(rest)
-    body = rest[:keep_body]
-    tail = rest[-5:]
+    parts = _Chunked() if chunked else None
+    payload = parts.feed(rest) if parts is not None else rest
+    downloaded = len(payload)
+    body = payload[:keep_body]
 
     def enough() -> bool:
         return bool(max_bytes and downloaded >= max_bytes) or bool(
@@ -266,7 +298,13 @@ def _read_response(
         )
 
     try:
-        while not _complete(downloaded, length, chunked, tail):
+        while not _complete(downloaded, length, parts):
+            if parts is not None and parts.error:
+                return DownloadResult(
+                    ok=False, downloaded=downloaded, kind="http", status=status, body=body,
+                    error=f"ответ частями не по стандарту: {parts.error}",
+                    body_seconds=time.monotonic() - started,
+                )
             if enough():
                 return DownloadResult(
                     ok=True, downloaded=downloaded, status=status, body=body,
@@ -275,10 +313,16 @@ def _read_response(
             chunk = _recv(sock, silence, deadline, cancel)
             if not chunk:
                 break
-            downloaded += len(chunk)
+            data = parts.feed(chunk) if parts is not None else chunk
+            downloaded += len(data)
             if len(body) < keep_body:
-                body += chunk[: keep_body - len(body)]
-            tail = (tail + chunk)[-5:]
+                body += data[: keep_body - len(body)]
+    except OSError as exc:  # RST посреди тела: не «не подключился» — код и байты сохраняются
+        return DownloadResult(
+            ok=False, downloaded=downloaded, kind="reset", status=status, body=body,
+            error=f"обрыв соединения после {downloaded} байт тела: {exc}",
+            body_seconds=time.monotonic() - started,
+        )
     except _Silence:
         where = f"после {downloaded} байт тела" if downloaded else "до начала тела"
         return DownloadResult(
@@ -297,6 +341,13 @@ def _read_response(
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
             error=f"соединение закрыто после {downloaded} из {length} байт тела",
+            body_seconds=seconds,
+        )
+    if parts is not None and not parts.done:
+        # C01 кросс-аудита 4cc96b9: обрыв посреди ответа частями раньше считался целым ответом.
+        return DownloadResult(
+            ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
+            error=f"соединение закрыто посреди ответа частями, после {downloaded} байт тела",
             body_seconds=seconds,
         )
     result = DownloadResult(
@@ -338,11 +389,71 @@ def _header(head: bytes, wanted: str) -> str:
     return ""
 
 
-def _complete(downloaded: int, length: int | None, chunked: bool, tail: bytes) -> bool:
+def _complete(downloaded: int, length: int | None, parts: _Chunked | None) -> bool:
     if length is not None:
         return downloaded >= length
-    # Завершающий кадр chunked-тела; без него ждём закрытия соединения.
-    return chunked and tail == b"0" + fetch.HEAD_END
+    # Последняя часть ответа «частями» и трейлеры; без длины и частей — ждём закрытия.
+    return parts is not None and parts.done
+
+
+class _Chunked:
+    """Разбор тела «частями» (Transfer-Encoding: chunked, RFC 9112 §7.1): размер части (hex,
+    расширения после «;» не в счёт), данные, перевод строки; последняя часть — нулевая, за ней
+    трейлеры до пустой строки. feed(data) — полезные байты из data. C01 кросс-аудита 4cc96b9:
+    раньше конец тела искался по последним пяти байтам потока — обрыв посреди части считался
+    целым ответом, такие же байты внутри данных — концом, а байты разметки — телом."""
+
+    def __init__(self) -> None:
+        self.line = b""  # недочитанная строка разметки
+        self.left = 0  # сколько байт данных текущей части впереди
+        self.state = "size"  # size | data | crlf | trailer | done
+        self.trailers = 0
+        self.error = ""
+
+    @property
+    def done(self) -> bool:
+        return self.state == "done"
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        pos = 0
+        while pos < len(data) and self.state != "done" and not self.error:
+            if self.state == "data":
+                take = min(self.left, len(data) - pos)
+                out += data[pos:pos + take]
+                pos += take
+                self.left -= take
+                if not self.left:
+                    self.state = "crlf"
+                continue
+            end = data.find(b"\n", pos)
+            if end < 0:
+                self.line += data[pos:]
+                if len(self.line) > CHUNK_LINE_LIMIT:
+                    self.error = "строка разметки слишком длинная"
+                break
+            line, self.line = (self.line + data[pos:end]).rstrip(b"\r"), b""
+            pos = end + 1
+            if len(line) > CHUNK_LINE_LIMIT:
+                self.error = "строка разметки слишком длинная"
+            elif self.state == "crlf":
+                if line:
+                    self.error = "нет перевода строки после части"
+                self.state = "size"
+            elif self.state == "size":
+                size = line.split(b";", 1)[0].strip()
+                if not _CHUNK_SIZE.fullmatch(size):
+                    self.error = "неверный размер части"
+                else:
+                    self.left = int(size, 16)
+                    self.state = "data" if self.left else "trailer"
+            else:  # трейлеры
+                self.trailers += len(line) + 2
+                if not line:
+                    self.state = "done"
+                elif self.trailers > HEAD_LIMIT:
+                    self.error = "трейлеры слишком длинные"
+        return bytes(out)
 
 
 def tcp_check(host: str, port: int, *, timeout: float = 5.0, mark: int | None = None) -> bool:

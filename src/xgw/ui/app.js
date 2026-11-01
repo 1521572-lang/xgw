@@ -24,6 +24,7 @@
     OK: ["ok", "в порядке"],
     SLOW: ["warn", "медленный"],
     FROZEN: ["bad", "замораживается"],
+    BODY_RESET: ["bad", "обрывается"],
     STALL_BEFORE_BODY: ["bad", "не отвечает"],
     CONNECT_FAIL: ["bad", "недоступен"],
     TIMEOUT: ["bad", "тайм-аут"],

@@ -32,7 +32,7 @@ SAME_COUNTRY = 0.7
 # Вердикты первой проверки участника, при которых он меняется без ожидания
 # rotate_after_min. Таймаут сюда не входит: он бывает разовым, и такой узел идёт
 # обычным путём — через alive = false от самого Xray.
-REPLACE_NOW_VERDICTS = ("CONNECT_FAIL", "FROZEN")
+REPLACE_NOW_VERDICTS = ("CONNECT_FAIL", "FROZEN", "BODY_RESET")
 
 
 @dataclass

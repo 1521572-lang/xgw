@@ -586,3 +586,87 @@ def test_range_header_asks_part_of_the_file_and_206_is_success():
     server.close()
     assert result.ok and result.status == 206 and result.downloaded == 400
     assert b"Range: bytes=0-399\r\n" in seen[0]
+
+
+class ScriptSocket:
+    """Сокет по сценарию для _read_response: bytes — пришло, b"" — закрыто, исключение — обрыв."""
+
+    def __init__(self, *steps):
+        self.steps = list(steps)
+
+    def settimeout(self, _seconds):
+        pass
+
+    def recv(self, _size):
+        step = self.steps.pop(0) if self.steps else b""
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+CHUNKED = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+
+def _read(*steps, **kwargs):
+    from xgw.watch import checks
+
+    return checks._read_response(ScriptSocket(*steps), silence=3.0,
+                                 deadline=time.monotonic() + 10.0, **kwargs)
+
+
+def test_chunked_body_is_parsed_and_framing_is_not_counted():
+    """C01 кросс-аудита 4cc96b9: тело «частями» с расширением и трейлером, хоть по байту —
+    целое; в downloaded и body только полезные байты, без разметки."""
+    data = CHUNKED + b"5;name=x\r\nhello\r\n6\r\n world\r\n0\r\nX-Sum: 1\r\n\r\n"
+    result = _read(*(data[index:index + 1] for index in range(len(data))), keep_body=64)
+    assert result.ok and result.reusable
+    assert result.downloaded == 11 and result.body == b"hello world"
+
+
+def test_chunked_body_cut_in_the_middle_is_not_a_whole_answer():
+    """C01: обрыв посреди части — не целый ответ, как и байты конца ответа внутри данных части;
+    неверный размер части — ответ не по стандарту."""
+    cut = _read(CHUNKED + b"5\r\nhel", b"")
+    assert not cut.ok and cut.kind == "truncated" and cut.downloaded == 3 and not cut.reusable
+    fake_end = _read(CHUNKED + b"10\r\nabc0\r\n\r\n", b"")
+    assert not fake_end.ok and fake_end.kind == "truncated" and fake_end.downloaded == 8
+    broken = _read(CHUNKED + b"zz\r\nhello\r\n0\r\n\r\n")
+    assert not broken.ok and broken.kind == "http" and "размер части" in broken.error
+
+
+def test_reset_in_the_body_keeps_the_status_and_the_bytes():
+    """C02: RST после 16 КиБ тела — не «не подключился»: код и байты сохранены, вердикт
+    BODY_RESET. Сброс до заголовков — CONNECT_FAIL, и его стоит повторить другим хостом."""
+    from xgw.watch import hosts
+
+    reset = ConnectionResetError(104, "Connection reset by peer")
+    cut = _read(HEADERS + b"x" * 16384, reset)
+    assert not cut.ok and cut.kind == "reset" and cut.status == 200 and cut.downloaded == 16384
+    assert classify(cut, 2.0) == "BODY_RESET"
+    early = _read(reset)
+    assert early.kind == "reset" and early.status == 0 and classify(early, 2.0) == "CONNECT_FAIL"
+    assert hosts.host_specific(early.kind, early.status)
+    assert not hosts.host_specific(cut.kind, cut.status)
+
+
+def test_answer_without_a_body_fails_a_probe_that_needs_one(serve):
+    """C01: ответ 204 — не файл: проба с min_body его не засчитывает (проверка YouTube — да)."""
+    empty = b"HTTP/1.1 204 No Content\r\n\r\n"
+    assert _get(serve(empty)).ok
+    result = _get(serve(empty), min_body=1)
+    assert not result.ok and result.kind == "http" and result.status == 204
+    assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+def test_total_time_covers_the_proxy_reply_too(serve):
+    """C03: прокси отвечает на CONNECT по байту раз в 0,3 с — проба кончается по общему сроку,
+    а не через timeout на каждый байт."""
+    drip: list = []
+    for byte in b"HTTP/1.1 200 Connection established\r\n\r\n":
+        drip += [bytes([byte]), 0.3]
+    server = serve(*drip)
+    started = time.monotonic()
+    result = http_get_via_proxy("127.0.0.1", server.port, "https://origin.example.com/big",
+                                timeout=5, silence=5.0, max_total=1.0)
+    assert not result.ok and result.kind == "connect"
+    assert time.monotonic() - started < 2.5

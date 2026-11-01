@@ -358,3 +358,42 @@ def test_wake_queue_is_bounded(monkeypatch):
     for _ in range(100):
         watcher._put("rules")
     assert watcher._queue.qsize() == 4
+
+
+def test_own_load_window_wakes_a_dispatcher_that_waits_without_a_deadline():
+    """N05 кросс-аудита 4cc96b9: диспетчер уже ждал без срока, когда пришло событие правил в
+    окне своей загрузки, — и о закрытии окна узнавал только со следующим событием. Теперь он
+    просыпается, следит за окном и после него один раз будит «rules»."""
+    wakes: list[str] = []
+    quiet = [True]
+    lines = [0.4, "delete rule ip xgw output handle 7"]
+    watcher = _events(
+        Launcher(lambda: FakeProc(lines, hold=8)), wakes, debounce=0.1,
+        quiet_rules=lambda: quiet[0],
+    )
+    watcher.start()
+    try:
+        time.sleep(0.8)
+        assert wakes == []
+        quiet[0] = False
+        assert _wait(lambda: wakes == ["rules"], 2.0)
+    finally:
+        watcher.stop()
+
+
+def test_a_reason_that_did_not_fit_the_full_queue_is_not_lost(monkeypatch):
+    """N06: буря событий сети заполнила очередь — единственное событие правил всё равно будит."""
+    from xgw.watch import events as events_module
+
+    monkeypatch.setattr(events_module, "QUEUE_MAX", 4)
+    wakes: list[str] = []
+    watcher = _events(Launcher(lambda: FakeProc([], hold=5)), wakes, debounce=0.1)
+    for _ in range(4):
+        watcher._put("net")
+    watcher._put("rules")
+    assert watcher._queue.qsize() == 4 and watcher._dropped == {"rules"}
+    watcher.start()
+    try:
+        assert _wait(lambda: "rules" in wakes, 2.0)
+    finally:
+        watcher.stop()

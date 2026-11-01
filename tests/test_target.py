@@ -246,3 +246,67 @@ def test_base_ping_counts_other_probe_hosts_and_asks_at_once(monkeypatch):
     assert time.monotonic() - started < 1.0
     assert not target.base_ping(cfg, members, "pass", extra_urls=["https://dead.example/x"])
     assert len({url for _port, url in asked}) == 3
+
+
+def test_first_answer_stops_the_other_base_requests(monkeypatch):
+    """C05 кросс-аудита 4cc96b9: после первого ответа уже начатые запросы через других
+    участников не досиживают свои 15 с — их прерывает общее событие."""
+    import threading
+    import time
+
+    cfg = Config()
+    members = [NodeInfo(f"{name}" * 8, f"proxy-nl-{name * 4}", f"probe-nl-{name * 4}", port,
+                        "proxy") for name, port in (("a", 20001), ("b", 20002), ("c", 20003))]
+    stopped: list[bool] = []
+    lock = threading.Lock()
+
+    def get(host, port, url, **kwargs):
+        if port == 20001:
+            time.sleep(0.1)
+            return checks.DownloadResult(ok=True)
+        cancelled = kwargs["cancel"].wait(3.0)
+        with lock:
+            stopped.append(cancelled)
+        return checks.DownloadResult(ok=False, kind="cancelled")
+
+    monkeypatch.setattr(target.checks, "http_get_via_proxy", get)
+    started = time.monotonic()
+    assert target.base_ping(cfg, members, "pass")
+    deadline = time.monotonic() + 2.0
+    while len(stopped) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert stopped == [True, True] and time.monotonic() - started < 1.0
+
+
+def test_another_probe_host_is_asked_within_one_budget(monkeypatch):
+    """C03: answers_via спрашивает участников по очереди, но всех вместе — не дольше
+    ANSWERS_BUDGET; демон останавливается — не спрашивает вовсе."""
+    import threading
+    import time
+
+    monkeypatch.setattr(target, "ANSWERS_BUDGET", 1.5)
+    members = [NodeInfo(f"{index}" * 8, f"proxy-nl-{index}", f"probe-nl-{index}", 20000 + index,
+                        "proxy") for index in range(1, 9)]
+    asked: list[float] = []
+
+    def get(host, port, url, **kwargs):
+        asked.append(kwargs["max_total"])
+        time.sleep(min(0.4, kwargs["max_total"]))
+        return checks.DownloadResult(ok=False, kind="timeout")
+
+    monkeypatch.setattr(target.checks, "http_get_via_proxy", get)
+    started = time.monotonic()
+    assert not target.answers_via(Config(), members, "pass", "https://other.example/x.js")
+    assert time.monotonic() - started < 2.0 and 0 < len(asked) < len(members)
+    assert all(limit <= 1.5 for limit in asked)
+    stop = threading.Event()
+    stop.set()
+    asked.clear()
+    assert not target.answers_via(Config(), members, "pass", "https://x.example/", cancel=stop)
+    assert asked == []
+
+
+def test_reset_in_the_middle_of_the_answer_means_the_probe_url_answers():
+    """C02: обрыв посреди ответа (BODY_RESET) — как «заморозка»: адрес пробы отвечает."""
+    cut = _result("BODY_RESET", bytes_read=16384, kind="reset", status=200)
+    assert target.signature(cut) == ""

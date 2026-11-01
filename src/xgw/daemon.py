@@ -1849,7 +1849,8 @@ class Daemon:
         for url in others:
             if self.stopping:
                 return ""
-            if target.answers_via(self.cfg, members, password, url, user=builder.PROBE_USER):
+            if target.answers_via(self.cfg, members, password, url, user=builder.PROBE_USER,
+                                  cancel=self._stop):
                 self.hosts.answered(url)
                 return url
         return ""
@@ -2487,15 +2488,18 @@ class Daemon:
     def _scan_url(self, info: NodeInfo) -> str | None:
         """Чем проверять узел: запасной лимитированной подписки — дешёвым запросом
         (scan.cheap_url), остальные — проверочным хостом (None: _probe_scan берёт его по
-        кругу)."""
-        if info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0:
+        кругу). Запасной на пробе профиля обхода — проверочным хостом и при квоте: ответ в
+        сотни байт «заморозку» не покажет, а по нему решалось бы, выучен ли профиль (T05)."""
+        if (info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0
+                and info.fingerprint not in self._profile_trial):
             return scan.cheap_url(self.cfg)
         return None
 
     def _probe_scan(self, info: NodeInfo, password: str) -> scan.ScanResult:
         """Собственная проба сервера. Хост — по кругу (watch/hosts.py); хост ответил ошибкой
-        HTTP (403, 404, 5xx) — та же проба другим хостом: ответил тот — пауза хосту, вердикт
-        по второй пробе. Обрыв и «заморозку» хост не объясняет — это вердикт о сервере."""
+        HTTP (403, 404, 5xx) или сбросил соединение, не начав ответа, — та же проба другим
+        хостом: ответил тот — пауза хосту, вердикт по второй пробе. Обрыв посреди ответа и
+        «заморозку» хост не объясняет — это вердикт о сервере (hosts.host_specific)."""
         cheap = self._scan_url(info)
         if cheap is not None:
             return self._scan(info, password, cheap)
@@ -2579,9 +2583,12 @@ class Daemon:
             )
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
-        """url — адрес проверки; None — probe.url."""
+        """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
+        целиком: по итогу решается, выучен ли профиль, а случайная часть файла короче порога
+        «заморозки» дала бы OK и выучила бы негодный профиль (T05 кросс-аудита 4cc96b9)."""
         return scan.scan_node(
-            info, self.cfg, probe_pass=password, url=url, cancel=self._stop, random_size=True,
+            info, self.cfg, probe_pass=password, url=url, cancel=self._stop,
+            random_size=info.fingerprint not in self._profile_trial,
         )
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:

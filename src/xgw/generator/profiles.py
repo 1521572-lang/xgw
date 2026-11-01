@@ -80,11 +80,13 @@ CORE_META = "core_settings"
 # Пробы профилей, время смены профиля и выученный обход серверов (daemon.py, 0.1.14/0.1.18).
 TRIALS_META = "profile_trials"
 
-FROZEN_VERDICTS = ("FROZEN", "STALL_BEFORE_BODY")
+# Обрыв посреди ответа (BODY_RESET, кросс-аудит 4cc96b9) — тот же признак, что «заморозка»:
+# путь режет поток после начала ответа.
+FROZEN_VERDICTS = ("FROZEN", "BODY_RESET", "STALL_BEFORE_BODY")
 REFUSED_VERDICTS = ("CONNECT_FAIL", "TIMEOUT")
 TRIGGER_VERDICTS = FROZEN_VERDICTS + REFUSED_VERDICTS
 # Вердикты, при которых сервер в работе переводится на дробление, а не списывается (ТЗ R1).
-ESCALATE_VERDICTS = ("STALL_BEFORE_BODY", "FROZEN", "CONNECT_FAIL")
+ESCALATE_VERDICTS = ("STALL_BEFORE_BODY", "FROZEN", "BODY_RESET", "CONNECT_FAIL")
 
 
 def core_of(profile: str) -> str:

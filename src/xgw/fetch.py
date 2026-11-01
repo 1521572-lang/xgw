@@ -499,28 +499,40 @@ def open_tunnel(
     user: str = "",
     password: str = "",
     cancel: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> socket.socket:
     """CONNECT-туннель через http-inbound Xray к host:port.
 
     Ответ прокси читается ровно до пустой строки: следом идут данные туннеля
     (TLS-рукопожатие), и ни один лишний байт забрать или оставить нельзя.
-    cancel — прервать ожидание ответа (Cancelled), см. wait_io.
+    cancel — прервать ожидание ответа (Cancelled), см. wait_io. deadline (time.monotonic) —
+    общий срок: ответ по байту не растягивает ожидание сверх него (C03 кросс-аудита 4cc96b9).
     """
+
+    def left() -> float:
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("общий срок пробы исчерпан")
+        return min(timeout, remaining)
+
     try:
         host = host if ":" in host else host.encode("idna").decode("ascii")
     except UnicodeError as exc:
         raise ProxyError(f"недопустимое имя хоста: {host}") from exc
-    sock = socket.create_connection(proxy, timeout=timeout)
+    sock = socket.create_connection(proxy, timeout=left())
     try:
         target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
         if user:
             token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
             lines.append(f"Proxy-Authorization: Basic {token}")
+        sock.settimeout(left())
         sock.sendall((CRLF.join(lines) + CRLF * 2).encode("ascii"))
         head = b""
         while not head.endswith(HEAD_END):
-            chunk = wait_io(sock, lambda: sock.recv(1), timeout, cancel)
+            chunk = wait_io(sock, lambda: sock.recv(1), left(), cancel)
             if not chunk:
                 raise ProxyError("прокси закрыл соединение, не ответив на CONNECT")
             head += chunk

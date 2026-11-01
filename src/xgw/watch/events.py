@@ -143,6 +143,10 @@ class NetEvents:
         # События правил пришли в окне своей загрузки (quiet_rules): среди них могли быть и
         # чужие — когда окно закроется, одна проверка (пятый аудит).
         self._quiet_seen = threading.Event()
+        # Причины, не поместившиеся в полную очередь (_put): диспетчер забирает их с очередным
+        # элементом — очередь полна, значит, он его вот-вот получит.
+        self._dropped: set[str] = set()
+        self._dropped_lock = threading.Lock()
         self._procs: dict[str, subprocess.Popen] = {}
         self._lock = threading.Lock()
         self._threads: list[threading.Thread] = []
@@ -241,15 +245,25 @@ class NetEvents:
         elif name == "rules" and parse_rules(line):
             if self.quiet_rules():
                 # Своя загрузка правил: события netlink приходят уже после nft -f. Не будить
-                # сейчас, но проверить, когда окно закроется.
-                self._quiet_seen.set()
+                # сейчас, но проверить, когда окно закроется. Диспетчер, который ждёт без срока,
+                # пустое пробуждение переводит на опрос окна (N05 кросс-аудита 4cc96b9: раньше
+                # он узнавал об окне только со следующим событием).
+                if not self._quiet_seen.is_set():
+                    self._quiet_seen.set()
+                    self._put("")
                 return
             self.log.debug("событие правил: %s", line.strip()[:160])
             self._put("rules")
 
     def _put(self, reason: str) -> None:
-        with contextlib.suppress(queue.Full):
+        """В очередь диспетчера; очередь полна — причина запоминается отдельно и не теряется
+        (N06 кросс-аудита 4cc96b9: буря событий сети вытесняла единственное событие правил)."""
+        try:
             self._queue.put_nowait(reason)
+        except queue.Full:
+            if reason:
+                with self._dropped_lock:
+                    self._dropped.add(reason)
 
     def _dispatch(self) -> None:
         """Повторы одной причины внутри окна debounce — одно пробуждение. Первое событие
@@ -275,18 +289,20 @@ class NetEvents:
             if self._quiet_seen.is_set() and not self.quiet_rules():
                 self._quiet_seen.clear()
                 self._put("rules")  # окно своей загрузки закрылось: проверить правила
+            with self._dropped_lock:
+                dropped, self._dropped = self._dropped, set()
             now = time.monotonic()
-            if reason:
-                same_burst = now - last.get(reason, float("-inf")) < BURST
-                last[reason] = now
-                if now - fired.get(reason, float("-inf")) >= self.debounce:
-                    fired[reason] = now
-                    pending.discard(reason)
-                    burst.add(reason)
-                    self._fire(reason)
-                elif not (same_burst and reason in burst):
-                    burst.discard(reason)
-                    pending.add(reason)
+            for arrived in ([reason] if reason else []) + sorted(dropped - {reason}):
+                same_burst = now - last.get(arrived, float("-inf")) < BURST
+                last[arrived] = now
+                if now - fired.get(arrived, float("-inf")) >= self.debounce:
+                    fired[arrived] = now
+                    pending.discard(arrived)
+                    burst.add(arrived)
+                    self._fire(arrived)
+                elif not (same_burst and arrived in burst):
+                    burst.discard(arrived)
+                    pending.add(arrived)
             for late in [r for r in pending if now - fired[r] >= self.debounce]:
                 pending.discard(late)
                 fired[late] = now

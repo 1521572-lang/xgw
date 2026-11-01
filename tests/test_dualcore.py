@@ -1017,3 +1017,28 @@ def test_status_has_a_line_about_the_second_core():
     assert "НЕ ОТВЕЧАЕТ — демон" in status.render_singbox({**base, "alive": False})
     assert "переведены на него" in status.render_singbox({**base, "failed": True})
     assert "серверов для него пока нет" in status.render_singbox({**base, "expected": False})
+
+
+def test_a_profile_trial_is_decided_by_the_whole_probe_file(monkeypatch):
+    """T05 кросс-аудита 4cc96b9: по итогу скана на пробе профиля решается, выучен ли профиль, а
+    случайная часть файла короче порога «заморозки» дала бы OK. Сервер на пробе сканируется
+    файлом целиком и проверочным хостом — даже запасной лимитированной подписки."""
+    import threading
+
+    from xgw.daemon import Daemon
+    from xgw.generator.builder import NodeInfo
+    from xgw.watch import scan
+
+    seen: list[tuple] = []
+    monkeypatch.setattr(scan, "scan_node",
+                        lambda *_a, **kw: seen.append((kw["url"], kw["random_size"])))
+    daemon = Daemon.__new__(Daemon)
+    daemon.cfg, daemon._stop, daemon._profile_trial = Config(), threading.Event(), {}
+    daemon._prices = lambda: {"aaaa1111": 1.0}
+    info = NodeInfo("aaaa1111", "spare-nl-aaaa", "probe-nl-aaaa", 20001, "spare")
+    assert daemon._scan_url(info) == scan.cheap_url(daemon.cfg)
+    Daemon._scan(daemon, info, "secret")
+    daemon._profile_trial["aaaa1111"] = object()
+    assert daemon._scan_url(info) is None
+    Daemon._scan(daemon, info, "secret")
+    assert seen == [(None, True), (None, False)]

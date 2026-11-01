@@ -157,6 +157,43 @@ def load_inventory(paths: Paths) -> list[dict]:
     return [item for item in servers if isinstance(item, dict)] if isinstance(servers, list) else []
 
 
+# История выдачи отпечатков (model.split_variants): отпечаток → {сводка полей варианта →
+# [выданный отпечаток, когда виден]}. Записи старше FINGERPRINTS_KEEP забываются. Ни адресов,
+# ни ключей в ней нет — только хеши.
+FINGERPRINTS_KEEP = 30 * 86400.0
+
+
+def fingerprints_file(paths: Paths) -> Path:
+    return paths.var / "fingerprints.json"
+
+
+def _load_fingerprints(paths: Paths) -> dict[str, dict[str, list]]:
+    loaded = read_json(fingerprints_file(paths)) or {}
+    known = loaded.get("known") if isinstance(loaded, dict) else None
+    if not isinstance(known, dict):
+        return {}
+    return {
+        str(base): {
+            str(digest): entry for digest, entry in entries.items()
+            if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str)
+        }
+        for base, entries in known.items() if isinstance(entries, dict)
+    }
+
+
+def _save_fingerprints(paths: Paths, known: dict[str, dict[str, list]], now: float,
+                       logger) -> None:
+    fresh = {
+        base: kept for base, entries in known.items()
+        if (kept := {digest: entry for digest, entry in entries.items()
+                     if now - float(entry[1] or 0) < FINGERPRINTS_KEEP})
+    }
+    try:
+        atomic_write_json(fingerprints_file(paths), {"saved": now, "known": fresh}, mode=0o600)
+    except OSError as exc:  # не root (xgw build) — история не пишется, отпечатки те же
+        logger.debug("история отпечатков не записана: %s", exc)
+
+
 def config_secrets(cfg: config.Config) -> list[str]:
     """Секреты из config.toml, которые регулярками не распознать."""
     values = [cfg.status.token]
@@ -207,7 +244,12 @@ def collect(
         for warning in manual_warnings:
             logger.warning("%s", warning)
         inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
-    split = split_variants(inventory.nodes)
+    # Отпечаток варианта — по истории выдачи, а не по соседям в списке (R01 кросс-аудита).
+    known = _load_fingerprints(paths)
+    previous = set() if known else {item.get("fingerprint") for item in load_inventory(paths)}
+    now = time.time()
+    split = split_variants(inventory.nodes, known, previous=previous, now=now)
+    _save_fingerprints(paths, known, now, logger)
     if split:
         logger.info("серверов с одним адресом и ключом, но разными путём, SNI или режимом: %d "
                     "— это разные серверы, не дубли", split)

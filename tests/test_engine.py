@@ -364,3 +364,24 @@ def test_direct_fetch_logs_a_new_cache_address_once(tmp_path, monkeypatch, caplo
                                                    "напрямую, адрес её сервера записан")
     assert "203.0.113.8" not in lines[0]  # адреса подписок в журнал не пишутся
     assert hosts.addresses() == {"subs.example.org": ["203.0.113.8"]}
+
+
+def test_variant_fingerprints_survive_a_neighbour_coming_and_going(paths):
+    """R01 кросс-аудита 4cc96b9: история выдачи отпечатков — в /var/lib/xgw; по ней вариант A
+    сохраняет отпечаток, когда рядом появляется и пропадает вариант B. В файле — только хеши."""
+    xhttp = ("vless://11111111-2222-3333-4455-6666666666b1@edge.example.net:443"
+             "?type=xhttp&security=tls&sni=edge.example.net&mode=packet-up&path=")
+    cfg = Config()
+
+    def collect(*paths_):
+        cfg.manual.links = [f"{xhttp}/{path}#{path}" for path in paths_]
+        nodes = engine.collect(cfg, paths, mark=None, logger=LOG).nodes
+        return {node.name: node.fingerprint for node in nodes}
+
+    first = collect("a")["a"]
+    both = collect("a", "b")
+    assert both["a"] == first != both["b"]
+    assert collect("a")["a"] == first and collect("b")["b"] == both["b"]
+    text = engine.fingerprints_file(paths).read_text(encoding="utf-8")
+    assert "edge.example.net" not in text and "11111111" not in text
+    assert oct(engine.fingerprints_file(paths).stat().st_mode & 0o777) == "0o600"
