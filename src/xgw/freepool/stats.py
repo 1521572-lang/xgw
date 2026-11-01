@@ -8,7 +8,8 @@
 (rechecked), сколько выбыло из состава (dropped) и сколько раз списки обновлялись вне расписания
 из-за закрытого пула (refreshed). С проверкой YouTube (М3, watch/youtube.py) — сколько раз YouTube
 проверялся через серверы «pool» (youtube_checked), сколько раз сервер его не пропускал
-(youtube_blocked) или тормозил (youtube_slow) и сколько смен было из-за этого (switch_youtube).
+(youtube_blocked), тормозил (youtube_slow) или не дал замерить скорость — файлы Google через него
+не скачались (youtube_unknown) — и сколько смен было из-за этого (switch_youtube).
 
 Счётчики копит демон (Daemon._pool_step, _pool_spared, _pool_speed_step, _pool_silence,
 _pool_due, _youtube_step) и пишет в meta
@@ -178,6 +179,7 @@ def text(rows: list[dict]) -> str:
                      f"{int(row.get('refreshed', 0))}")
         lines.append(f"  YouTube: проверок {int(row.get('youtube_checked', 0))}, не пропускал "
                      f"{int(row.get('youtube_blocked', 0))}, тормозил "
-                     f"{int(row.get('youtube_slow', 0))}")
+                     f"{int(row.get('youtube_slow', 0))}, скорость не узнать "
+                     f"{int(row.get('youtube_unknown', 0))}")
         lines.append(f"  {traffic}")
     return "\n".join(lines)

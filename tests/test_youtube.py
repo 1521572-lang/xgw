@@ -51,12 +51,26 @@ def test_youtube_redirect_is_an_answer_and_the_speed_decides(monkeypatch):
 
 
 def test_youtube_speed_file_failures(monkeypatch):
-    """Файл Google не отдан с ошибкой HTTP — скорость не узнать, а YouTube отвечает: годен.
-    Тишина посреди тела — тормозит. Лимитированный сервер — без файла."""
-    _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER,
-                        FILE: DownloadResult(ok=False, kind="http", status=403, error="HTTP 403")})
+    """Отчёт youtube2: файл Google не отдан с ошибкой HTTP — замер по запасному файлу; не отдан и
+    он — «скорость не узнать», неудача. Тишина посреди тела — тормозит. Лимитированный сервер —
+    без файла."""
+    missing = DownloadResult(ok=False, kind="http", status=404, error="HTTP 404")
+    calls = _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: missing,
+                                youtube.SPARE_URL: DownloadResult(
+                                    ok=True, downloaded=4_000_000, status=206, body_seconds=2.0)})
     verdict = youtube.check(NODE, Config(), probe_pass="x")
-    assert verdict.state == youtube.OK and verdict.mbps is None and "HTTP 403" in verdict.error
+    assert verdict.state == youtube.OK and verdict.mbps == 16.0
+    assert verdict.error == "основной файл замера: HTTP 404 от dl.google.com; замер по запасному"
+    assert [url for url, _end in calls[2:]] == [FILE, youtube.SPARE_URL]
+    _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: missing,
+                        youtube.SPARE_URL: DownloadResult(
+                            ok=False, kind="http", status=403, error="HTTP 403")})
+    verdict = youtube.check(NODE, Config(), probe_pass="x")
+    assert verdict.state == youtube.UNKNOWN and verdict.mbps is None
+    assert verdict.error == ("файл замера Google: HTTP 404 от dl.google.com; запасной: HTTP 403 "
+                             "от dl.google.com")
+    assert youtube.problem({"state": "unknown"}).startswith("не даёт замерить скорость YouTube")
+    assert youtube.summary(verdict).startswith("скорость не узнать (файл замера Google: HTTP 404")
     stall = DownloadResult(ok=False, downloaded=200_000, stalled=True, kind="stall",
                            body_seconds=6.0, error="тишина 5 с после 200000 байт тела")
     _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: stall})
@@ -97,11 +111,19 @@ def test_youtube_speed_file_follows_google_redirects(monkeypatch):
     verdict = youtube.check(NODE, Config(), probe_pass="x")
     assert verdict.state == youtube.SLOW and verdict.mbps == 2.0
     assert calls[2:] == [(FILE, 4_000_000), (hop, 4_000_000), (cache, 4_000_000)]
-    _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: DownloadResult(
-        ok=False, kind="http", status=302, error="HTTP 302", location="https://block.example/")})
+    away = DownloadResult(ok=False, kind="http", status=302, error="HTTP 302",
+                          location="https://block.example/")
+    missing = DownloadResult(ok=False, kind="http", status=404, error="HTTP 404")
+    _fake(monkeypatch, {
+        SITE: ANSWER, VIDEO: ANSWER, FILE: away,
+        youtube.SPARE_URL: DownloadResult(ok=False, kind="http", status=302, error="HTTP 302",
+                                          location=hop),
+        hop: DownloadResult(ok=False, kind="http", status=302, error="HTTP 302", location=cache),
+        cache: missing})
     verdict = youtube.check(NODE, Config(), probe_pass="x")
-    assert verdict.state == youtube.OK and verdict.mbps is None
-    assert verdict.error == "файл замера Google: переадресация не к Google"
+    assert verdict.state == youtube.UNKNOWN and verdict.mbps is None
+    assert verdict.error == ("файл замера Google: переадресация не к Google; запасной: HTTP 404 "
+                             "от узла кэша Google после переадресаций: 2")
 
 
 def test_youtube_speed_cut_by_time_is_slow(monkeypatch):

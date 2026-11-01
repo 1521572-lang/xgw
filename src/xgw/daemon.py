@@ -225,8 +225,10 @@ POOL_WAIT = 120.0
 # не через часы); пул закрыт — списки серверов обновляются вне расписания, не чаще POOL_REFRESH.
 POOL_SILENT = 300.0
 POOL_REFRESH = 1800.0
-# Шаг watchdog дольше TICK_SLOW — строка в журнале: что в нём шло (Daemon.run, _tick_work).
+# Шаг watchdog дольше TICK_SLOW — строка в журнале: что в нём шло и на что ушло время — части шага
+# не короче TICK_PART (Daemon.run, _tick_work, _spent).
 TICK_SLOW = 60.0
+TICK_PART = 5.0
 # Скорость серверов «pool» (_pool_speed_step) — обычным замером (speed.measure, speed.max_mb):
 # экономия их трафика не нужна (решение заказчика 5). Живой сервер без замера — сразу, по одному
 # за шаг; повторный замер — раз в speed.unlimited_hours, при занятом канале пула (больше
@@ -637,6 +639,7 @@ class Daemon:
         self._pool_boot = self._pool_saved = self.store.get_meta(POOL_PINNED_META) or ""
         self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
         self._youtube_ran = False  # на этом шаге шла проверка YouTube
+        self._tick_spent: dict[str, float] = {}  # части шага → секунды (_spent)
         # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
         # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
         # (тег, байты), шёл ли замер скорости шагом раньше (тогда счётчики им испорчены), когда
@@ -807,12 +810,26 @@ class Daemon:
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
 
     def _tick_work(self) -> str:
-        """Что из долгого шло в последнем шаге — для строки о долгом шаге (run)."""
+        """Что из долгого шло в последнем шаге и на что ушло время — для строки о долгом шаге
+        (run). Отчёт youtube2: шаги по 93–120 с после установки, запуска демона и обновления
+        подписки шли «без проверок и замеров» — части шага скажут, где время."""
         parts = [name for name, done in (
             ("скан", self._scanned), ("замер скорости подписки", self._speed_ran),
             ("замер сервера пула", self._pool_speed_ran), ("проверка YouTube", self._youtube_ran),
         ) if done]
-        return ", ".join(parts) or "без проверок и замеров"
+        longest = sorted(((spent, name) for name, spent in self._tick_spent.items()
+                          if spent >= TICK_PART), reverse=True)
+        text = ", ".join(parts) or "без проверок и замеров"
+        if longest:
+            text += "; дольше всего — " + ", ".join(
+                f"{name} {spent:.0f} с" for spent, name in longest[:3])
+        return text
+
+    def _spent(self, name: str, since: float) -> float:
+        """Часть шага name шла с since до сейчас (для _tick_work); сейчас — начало следующей."""
+        moment = time.monotonic()
+        self._tick_spent[name] = self._tick_spent.get(name, 0.0) + moment - since
+        return moment
 
     @property
     def stopping(self) -> bool:
@@ -1184,6 +1201,8 @@ class Daemon:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
         self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
+        self._tick_spent = {}
+        at = time.monotonic()
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
@@ -1200,6 +1219,7 @@ class Daemon:
             # Первый запуск: рабочего конфига ещё нет — собрать и запустить Xray.
             if now >= self.next_refresh or refresh_asked or self._rebuild_asked:
                 self._refresh(now, via_xray=False, urgent=True)
+            at = self._spent("первая сборка конфига", at)
             applied = engine.read_json(self.paths.xray_config_file)
             if applied is None:
                 self._write_status([], None, False)
@@ -1211,6 +1231,7 @@ class Daemon:
         reserve = builder.reserve_tag(applied)
         signals, observatory = self._signals(members, now, reserve=bool(reserve))
         signals = self._probe_target(view, applied, signals, now)
+        at = self._spent("сигналы ядра", at)
         previous = self.machine.state
         decision = self.machine.update(signals)
         state = decision.state
@@ -1257,7 +1278,9 @@ class Daemon:
                 "в том числе лимитированных",
             )
         self._whitelist_step(view, signals, state, now)
+        at = self._spent("белый список", at)
         self._freepool_step(now, applied)
+        at = self._spent("списки бесплатного пула", at)
         self._usage_step(applied)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
@@ -1299,11 +1322,13 @@ class Daemon:
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
         self._containers_appeared(applied)
+        at = self._spent("перехват и конфиг", at)
         if signals.xray_ok:
             self._device_step(view, applied, observatory)
             self._pool_step(applied, observatory or {})
             self._house_sync(applied, now)
             self._rtt_step(view, applied, observatory)
+        at = self._spent("устройства и сервер пула", at)
         if not changed and self._urgent_rebuild and self.inventory is not None:
             # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
             # считает мёртвыми всех участников; без inbound TUN контейнеры без интернета.
@@ -1343,6 +1368,7 @@ class Daemon:
         # Проба профиля, которую прервал перезапуск демона (или итог которой не применился), —
         # снова в памяти до сканов: иначе скан принял бы пробный профиль за выученный.
         self._resume_trials()
+        at = self._spent("подписка и сборка конфига", at)
 
         # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
@@ -1384,6 +1410,7 @@ class Daemon:
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
+        at = self._spent("сканы и замены", at)
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
@@ -1392,14 +1419,18 @@ class Daemon:
             return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
+        at = self._spent("основной сервер и замеры подписки", at)
         if signals.xray_ok and not changed:  # после перезапуска Xray пробы ядра устарели
             self._pool_speed_step(applied, observatory or {}, now)
             self._youtube_step(view, applied, observatory or {}, now)
+        at = self._spent("замер пула и YouTube", at)
         if state is not State.WAN_DOWN:
             self._cores_step()
             self._netmon_step(signals.xray_ok)
+        at = self._spent("ядра и сеть", at)
         self._publish_scores(view, observatory or {})
         self._write_status(view, observatory, signals.xray_ok)
+        self._spent("запись состояния", at)
         return state
 
     # --- сигналы ---------------------------------------------------------------
@@ -2983,7 +3014,8 @@ class Daemon:
         замер серверов подписки. Живой сервер без замера — сразу: сначала закреплённый (по нему
         решается, менять ли), затем по задержке; повторный — раз в speed.unlimited_hours, при
         занятом канале пула ждёт, но не дольше SPEED_FORCE_AFTER. С новым замером закреплённый
-        сверяется на следующем шаге (_pool_choice)."""
+        сверяется на следующем шаге (_pool_choice). Пока через закреплённый пора проверить
+        YouTube, другие ждут (_youtube_waits)."""
         busy = self._pool_busy(now)
         hours = speed.every_hours(self.cfg, 0.0)
         if not hours or self._speed_ran or self.stopping or not traffic.pool_active(self.cfg):
@@ -3014,6 +3046,8 @@ class Daemon:
         info = min(targets, key=lambda item: (
             item.tag != self._pool_pinned,
             (observatory.get(item.tag) or {}).get("delay") or 1e9, item.tag))
+        if info.tag != self._pool_pinned and self._youtube_waits():
+            return
         result = speed.measure(info, self.cfg, probe_pass=password,
                                max_mb=speed.size_mb(self.cfg, 0.0), cancel=self._stop)
         self._pool_speed_ran = True
@@ -3173,6 +3207,15 @@ class Daemon:
         if carries:
             return age >= (YOUTUBE_RETRY if confirm else self.cfg.speed.youtube_minutes * 60.0)
         return age >= (YOUTUBE_SUSPECT if confirm else YOUTUBE_OTHERS)
+
+    def _youtube_waits(self) -> bool:
+        """Через закреплённый сервер «pool» пора проверить YouTube: замеры других серверов пула
+        (_pool_speed_step) ждут. Проверка не идёт ни в шаге с замером, ни в следующем, а замеры
+        после включения идут подряд по шагу на сервер — отчёт youtube2, наблюдение 4: первая
+        проверка ведущего через ~15 мин после включения «весь дом» (было 8 серверов без замера)."""
+        key = self._pool_ids.get(self._pool_pinned, "")
+        return bool(self.cfg.speed.youtube and key and not self.probe_target
+                    and self._youtube_due(key, True))
 
     def _youtube_step(
         self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,

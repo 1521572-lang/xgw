@@ -72,7 +72,7 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
     for field in ("switch_first", "switch_speed", "switch_dead", "switch_dead", "measured",
                   "measured", "failed", "spared", "closures", "rechecked", "rechecked",
                   "refreshed", "switch_youtube", "youtube_checked", "youtube_checked",
-                  "youtube_checked", "youtube_slow", "youtube_blocked"):
+                  "youtube_checked", "youtube_slow", "youtube_blocked", "youtube_unknown"):
         diary.count(field)
     diary.count("dropped", 2)
     diary.flush(force=True)
@@ -92,7 +92,7 @@ def test_stats_text_by_day_with_pool_and_subscription_traffic(store):
         "нагрузкой: 1",
         "  восстановление: молчащих перепроверено вне очереди 2, выбыло из состава 2, списки "
         "обновлены при закрытом пуле 1",
-        "  YouTube: проверок 3, не пропускал 1, тормозил 1",
+        "  YouTube: проверок 3, не пропускал 1, тормозил 1, скорость не узнать 1",
         "  трафик через пул ↓ 3,2 ГБ ↑ 120 МБ, через подписку ↓ 40,0 МБ ↑ 5,0 МБ",
     ]
     assert stats.times(3) == "3 раза" and stats.times(12) == "12 раз"

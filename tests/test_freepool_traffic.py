@@ -727,6 +727,7 @@ def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):
     daemon.store = SimpleNamespace(set_meta=saved.__setitem__)
     daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
     daemon._pool_pinned = b
+    daemon._youtube = {"b" * 32: {"state": "ok", "fails": 0, "ts": NOW}}  # YouTube проверен
 
     def load(downlink):
         daemon._metrics = {"stats": {"outbound": {a: {"uplink": 0, "downlink": downlink}}}}
@@ -752,6 +753,38 @@ def test_pool_servers_are_measured_one_per_step(paths, monkeypatch):
     daemon._speed_ran = True
     daemon._pool_speed_step(applied, alive, 4000.0)
     assert len(measured) == 3
+
+
+def test_pool_speed_waits_for_the_youtube_check_of_the_pinned_server(paths, monkeypatch):
+    """Отчёт youtube2, наблюдение 4: после включения «весь дом» восемь серверов пула без замера
+    замерялись подряд, шаг за шагом, а проверка YouTube не идёт ни в шаге с замером, ни в
+    следующем — ведущий проверен через ~15 мин. Пока через закреплённый пора проверить YouTube,
+    другие ждут; сам закреплённый замеряется."""
+    from xgw.watch import speed
+
+    a, b = "pool-de-aaaa", "pool-de-bbbb"
+    applied = {"outbounds": [{"tag": a}, {"tag": b}], "inbounds": [
+        {"tag": f"probe-de-{name}", "port": port,
+         "settings": {"accounts": [{"user": "probe", "pass": "secret"}]}}
+        for name, port in (("aaaa", 20001), ("bbbb", 20002))]}
+    measured = []
+
+    def measure(info, cfg, *, probe_pass, max_mb, cancel):
+        measured.append(info.tag)
+        return speed.SpeedResult(25.0, 10_000_000, 3.2)
+
+    monkeypatch.setattr(speed, "measure", measure)
+    daemon = _daemon(paths)
+    daemon.store = SimpleNamespace(set_meta=lambda *_a: None)
+    daemon._pool_ids = {a: "a" * 32, b: "b" * 32}
+    daemon._pool_pinned = b
+    alive = {a: {"alive": True, "delay": 0.1}, b: {"alive": True, "delay": 0.3}}
+    daemon._pool_speed_step(applied, alive, 100.0)
+    daemon._pool_speed_step(applied, alive, 120.0)
+    assert measured == [b]  # «a» ждёт: YouTube через «b» ещё не проверялся
+    daemon._youtube = {"b" * 32: {"state": "ok", "fails": 0, "ts": NOW}}
+    daemon._pool_speed_step(applied, alive, 140.0)
+    assert measured == [b, a]
 
 
 def test_switching_the_whole_house_on_is_connecting_not_closed(paths):
@@ -926,3 +959,18 @@ def test_youtube_switches_pause_when_every_server_is_bad(paths):
     daemon.wall = lambda: NOW + YOUTUBE_PAUSE
     _youtube(daemon, "a" * 32)
     assert daemon._youtube_bad("a" * 32) == "не пропускает YouTube"
+    # Отчёт youtube2: файлы Google через сервер не скачать (ни основной, ни запасной) — неудача.
+    _youtube(daemon, "a" * 32, state="unknown")
+    assert daemon._youtube_bad("a" * 32).startswith("не даёт замерить скорость YouTube")
+
+
+def test_long_step_says_where_the_time_went(paths):
+    """Отчёт youtube2: шаги по 93–120 с шли «без проверок и замеров» — строка о долгом шаге
+    называет части шага не короче TICK_PART, самые долгие первыми."""
+    daemon = _daemon(paths)
+    daemon._scanned = daemon._youtube_ran = False
+    daemon._tick_spent = {"сигналы ядра": 2.0, "подписка и сборка конфига": 85.4,
+                          "перехват и конфиг": 12.0}
+    assert daemon._tick_work() == (
+        "без проверок и замеров; дольше всего — подписка и сборка конфига 85 с, "
+        "перехват и конфиг 12 с")
