@@ -87,6 +87,12 @@ from .cmd import CommandError, Runner
 
 TABLE = "xgw"
 TABLE6 = "xgw6"
+GUARD = "xgw_guard"
+GUARD_TABLE = GUARD
+# Connection approval is written only by the capture policy, never by the guard.
+# It is independent of packet marks (Xray, containers and tailscaled).
+GUARD_CT = 0x20000000
+_GUARD_APPROVE = f"ct mark set ct mark or {GUARD_CT:#x}"
 TS_SET = "ts_direct"  # метка tailscaled, которая идёт мимо Xray (Т1)
 TS_EXIT_SET = "ts_exit_direct"  # устройства tailnet, выходящие через шлюз напрямую
 TS_MARK = f"{ts.MARK:#x}"
@@ -177,6 +183,7 @@ class Rules:
     # . порт»), с маскарадингом; остальное из fpv* и в fpv* закрыто.
     free_pool: bool = False
     fp_peers: tuple[str, ...] = ()
+    singbox_uid: int | None = None
 
     @property
     def ts4(self) -> bool:
@@ -240,6 +247,26 @@ def time_service_uids() -> tuple[int, ...]:
         except KeyError:
             continue
     return tuple(uids)
+
+
+def singbox_user_uid() -> int | None:
+    """Dedicated, capability-free main sing-box service; absent on first install/tests."""
+    try:
+        import pwd
+
+        return pwd.getpwnam("xgw-singbox").pw_uid
+    except (ImportError, KeyError):
+        return None
+
+
+def _singbox_skip(rules: Rules, verdict: str) -> list[str]:
+    return [] if rules.singbox_uid is None else [f"meta skuid {rules.singbox_uid} {verdict}"]
+
+
+def _approve(rule: str) -> str:
+    """Approve exactly this direct path, retaining every other conntrack mark bit."""
+    predicate, verdict = rule.rsplit(" ", 1)
+    return f"{predicate} {_GUARD_APPROVE} {verdict}"
 
 
 def build_rules(
@@ -348,6 +375,7 @@ def build_rules(
             direct_local=direct_local,
             free_pool=cfg.free_pool.mode != "off",
             fp_peers=fp_peers if cfg.free_pool.mode != "off" else (),
+            singbox_uid=singbox_user_uid(),
         ),
         warnings,
     )
@@ -498,7 +526,7 @@ def _fp_forward() -> list[str]:
     «чужой форвардинг» (иначе fpv* → WAN прошёл бы им): только к серверу из fp_peers и ответы
     обратно; остальное из fpv* и в fpv* — сброс."""
     return [
-        f'iifname "{FP_IFS}" ip daddr . meta l4proto . th dport @{FP_SET} counter accept',
+        _approve(f'iifname "{FP_IFS}" ip daddr . meta l4proto . th dport @{FP_SET} counter accept'),
         f'iifname "{FP_IFS}" counter drop',
         f'oifname "{FP_IFS}" ct state established,related accept',
         f'oifname "{FP_IFS}" counter drop',
@@ -533,7 +561,7 @@ def _ts_exit_forward(rules: Rules, reject: str) -> list[str]:
     не TCP и не UDP; в blocked — всё) — отбивается."""
     lines = [
         f'iifname "{ts.INTERFACE}" ip daddr @reserved4 accept',
-        f'iifname "{ts.INTERFACE}" ip saddr @{TS_EXIT_SET} counter accept',
+        _approve(f'iifname "{ts.INTERFACE}" ip saddr @{TS_EXIT_SET} counter accept'),
     ]
     if rules.forward_icmp and rules.ts_exit:
         lines.append(f'iifname "{ts.INTERFACE}" meta l4proto icmp counter accept')
@@ -592,7 +620,7 @@ def render(rules: Rules) -> str:
     if rules.free_pool:
         blocks.append(_fp_set(rules))
     # Российские адреса (Ф6) — мимо Xray; DNS к ним перехватывается, как всякий.
-    to_direct = f"ip daddr @{DIRECT_SET} th dport != 53 return"
+    to_direct = _approve(f"ip daddr @{DIRECT_SET} th dport != 53 return")
     direct = [to_direct] if rules.direct_local else []
     from_direct = f"ip saddr @{DIRECT_LAN_SET} ip daddr @{DIRECT_SET}"
 
@@ -659,6 +687,7 @@ def render(rules: Rules) -> str:
     if rules.capture_local:
         output = [
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
+            *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts4 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
             "meta l4proto != { tcp, udp } return",
@@ -682,6 +711,9 @@ def render(rules: Rules) -> str:
         # к loopback с этой меткой не пускаем. Свои запросы к loopback XGW шлёт без
         # метки (marknet.connect_marked), остальные сокеты Xray к нему не ходят.
         guard = [f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject"]
+        if rules.singbox_uid is not None:
+            guard.append(f"meta skuid {rules.singbox_uid} ct direction original "
+                         "ip daddr 127.0.0.0/8 counter reject")
         if rules.block_quic and rules.capture_local:
             # QUIC самой машины: метку перехвата цепочка output ставит только тому, что ушло
             # бы в Xray, — соединения Xray, sing-box и tailscaled здесь не встречаются.
@@ -739,7 +771,8 @@ def render(rules: Rules) -> str:
                 # QUIC устройств с разгрузкой к российским адресам (Ф6) идёт напрямую, как
                 # через обычный роутер: отбой нужен только трафику через Xray (дробление
                 # ClientHello). Одним правилом отбоя «кроме устройства и сети» не сказать.
-                quic.append(f'iifname "{lan_if}" {out} {from_direct} udp dport 443 counter accept')
+                quic.append(_approve(
+                    f'iifname "{lan_if}" {out} {from_direct} udp dport 443 counter accept'))
             quic.append(f'iifname "{lan_if}" {QUIC_MATCH} ip saddr != @bypass4 {QUIC_REJECT}')
         if rules.block_quic and rules.ts_exit:
             quic.append(
@@ -763,9 +796,9 @@ def render(rules: Rules) -> str:
             "ct state established,related accept",
         ]
         if rules.capture_lan:
-            forward.append(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept')
+            forward.append(_approve(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept'))
             if rules.direct_lan:
-                forward.append(f'iifname "{lan_if}" {out} {from_direct} counter accept')
+                forward.append(_approve(f'iifname "{lan_if}" {out} {from_direct} counter accept'))
             if rules.forward_icmp:
                 forward.append(f'iifname "{lan_if}" {out} meta l4proto icmp counter accept')
         else:
@@ -816,8 +849,13 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
         blocks.append(_fp_set(rules))
     if rules.block_local:
         output = [
+            f"meta mark {bypass} ip daddr 127.0.0.0/8 counter reject",
+            *([f"meta skuid {rules.singbox_uid} ct direction original "
+               "ip daddr 127.0.0.0/8 counter reject"]
+              if rules.singbox_uid is not None else []),
             'oifname "lo" accept',
             f"meta mark {bypass} accept",  # сокеты Xray/sing-box и прямые запросы XGW
+            *_singbox_skip(rules, "accept"),
             # tailscaled — всегда, а не по набору ts_direct (К3): при route = "vpn" и
             # здоровом Xray перехвата в blocked нет, и Tailscale не ходил бы никуда.
             *([f"meta mark and {TS_MASK} == {TS_MARK} accept",
@@ -844,6 +882,8 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
     # сети (как и в режиме on) и ответы опубликованных портов (ct reply) — можно.
     bridges = " ".join(f'oifname != "{name}"' for name in rules.block_containers)
     for name in rules.block_containers:
+        forward.append(_approve(
+            f'iifname "{name}" {bridges} ip saddr @bypass_containers counter accept'))
         forward.append(
             f'iifname "{name}" {bridges} ct direction original ip daddr != @reserved4 '
             f"ip saddr != @bypass_containers {reject}"
@@ -857,9 +897,10 @@ def _blocked_blocks(rules: Rules) -> list[list[str]]:
             forward += [
                 # Установленные соединения — только у тех, кому обход разрешён: сессии,
                 # открытые при снятом перехвате, по записи conntrack не доживают.
-                f'iifname "{lan_if}" ip saddr @bypass4 ct state established,related accept',
+                _approve(f'iifname "{lan_if}" ip saddr @bypass4 '
+                         'ct state established,related accept'),
                 f'oifname "{lan_if}" ip daddr @bypass4 ct state established,related accept',
-                f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept',
+                _approve(f'iifname "{lan_if}" {out} ip saddr @bypass4 counter accept'),
                 # TCP — сбросом: и открытая раньше сессия обрывается сразу, а не висит.
                 f'iifname "{lan_if}" meta l4proto tcp counter reject with tcp reset',
                 f'iifname "{lan_if}" {reject}',
@@ -929,6 +970,7 @@ def render6(rules: Rules) -> str:
             )
         output = [
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
+            *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts6 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
             "meta l4proto != { tcp, udp } return",
@@ -946,6 +988,9 @@ def render6(rules: Rules) -> str:
         # То же, что loopback_guard в `ip xgw`: прямой запрос Xray не должен попасть
         # на службы самого шлюза, если имя разрешилось в ::1. И QUIC машины по IPv6.
         guard6 = [f"meta mark {bypass} ip6 daddr ::1 counter reject"]
+        if rules.singbox_uid is not None:
+            guard6.append(f"meta skuid {rules.singbox_uid} ct direction original "
+                          "ip6 daddr ::1 counter reject")
         if rules.block_quic:
             guard6.append(
                 f"meta mark {proxy} udp dport 443 ip6 daddr != @reserved6 "
@@ -970,8 +1015,13 @@ def render6(rules: Rules) -> str:
                 "v6_guard",
                 "type filter hook output priority filter; policy accept;",
                 [
+                    f"meta mark {rules.mark_bypass:#x} ip6 daddr ::1 counter reject",
+                    *([f"meta skuid {rules.singbox_uid} ct direction original "
+                       "ip6 daddr ::1 counter reject"]
+                      if rules.singbox_uid is not None else []),
                     'oifname "lo" accept',
                     f"meta mark {rules.mark_bypass:#x} accept",
+                    *_singbox_skip(rules, "accept"),
                     *(_ts_skip("accept") if rules.ts6 else []),
                     "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, "
                     "parameter-problem, nd-router-solicit, nd-router-advert, "
@@ -999,6 +1049,71 @@ def render6(rules: Rules) -> str:
     return _table("ip6", TABLE6, blocks)
 
 
+def render_guard(rules: Rules) -> str:
+    """Independent TCP/UDP egress barrier for protected paths, never an authorizer.
+
+    A scoped capture-table/routing failure leaves this table in place. Explicit
+    off/open removes it. Other forwarded networks and non-TCP/UDP keep their policy.
+    Only capture rules write GUARD_CT; the guard itself never sets packet/ct marks.
+    """
+    if not (rules.capture or rules.blocked or rules.containers or rules.ts_exit):
+        return ""
+    reject = ["meta l4proto tcp counter reject with tcp reset",
+              "counter reject with icmpx type admin-prohibited"]
+    interfaces = ['"lo"', f'"{ts.INTERFACE}"']
+    if rules.tun_name:
+        interfaces.append(f'"{rules.tun_name}"')
+    common = [
+        "meta l4proto != { tcp, udp } accept",
+        "ct direction reply accept",
+        'oifname { ' + ", ".join(interfaces) + ' } accept',
+        "fib daddr type local accept",
+    ]
+    if rules.reserved:
+        common.append("ip daddr { " + ", ".join(rules.reserved) + " } th dport != 53 accept")
+    if rules.reserved6:
+        common.append("ip6 daddr { " + ", ".join(rules.reserved6) + " } th dport != 53 accept")
+    common.append(f"ct mark and {GUARD_CT:#x} != 0 accept")
+    output = [f"meta mark {rules.mark_bypass:#x} ip daddr 127.0.0.0/8 counter reject",
+              f"meta mark {rules.mark_bypass:#x} ip6 daddr ::1 counter reject"]
+    if rules.singbox_uid is not None:
+        output += [f"meta skuid {rules.singbox_uid} ct direction original "
+                   "ip daddr 127.0.0.0/8 counter reject",
+                   f"meta skuid {rules.singbox_uid} ct direction original "
+                   "ip6 daddr ::1 counter reject"]
+    if not (rules.capture_local or rules.block_local):
+        output.append("meta nfproto ipv4 return")
+    if not (rules.capture6 or rules.v6_guard):
+        output.append("meta nfproto ipv6 return")
+    # This rejection precedes the loopback exception, including during a lost
+    # capture table: the dedicated backend must not reach local gateway services.
+    output += ["jump pass", f"meta mark {rules.mark_bypass:#x} accept",
+               *_singbox_skip(rules, "accept")]
+    if rules.tailscale:
+        output.append(f"meta mark and {TS_MASK} == {TS_MARK} accept")
+    output += ["udp sport 68 udp dport 67 accept", "udp sport 546 udp dport 547 accept"]
+    for uid in rules.time_uids:
+        output += [f"meta skuid {uid} udp dport 123 accept",
+                   f"meta skuid {uid} tcp dport {NTS_KE_PORT} accept"]
+    output += reject
+    ingress = []
+    if rules.capture_lan or rules.block_lan:
+        ingress.append(rules.lan_if)
+    ingress += list(rules.containers or rules.block_containers)
+    if rules.ts_forward:
+        ingress.append(ts.INTERFACE)
+    if rules.free_pool:
+        ingress.append(FP_IFS)
+    forward = [f'iifname "{name}" goto transit' for name in dict.fromkeys(ingress)]
+    forward.append("return")
+    return _table("inet", GUARD, [
+        _chain("pass", "", common),
+        _chain("transit", "", ["jump pass", *reject]),
+        _chain("output", "type filter hook output priority 10; policy accept;", output),
+        _chain("forward", "type filter hook forward priority 10; policy accept;", forward),
+    ])
+
+
 def _delete_text(family: str, table: str) -> str:
     """Удаление таблицы, которое не падает, если её нет."""
     return f"table {family} {table}\ndelete table {family} {table}\n"
@@ -1018,19 +1133,22 @@ def apply(rules: Rules, runner: Runner) -> list[str]:
     сетей direct4 второй раз — и только IPv4. Ошибка в IPv4 — та же ошибка и при загрузке
     одного IPv4 ниже: правила остаются прежними."""
     text = render(rules) or _delete_text("ip", TABLE)
+    guard = render_guard(rules) or _delete_text("inet", GUARD)
     try:
-        runner(["nft", "-f", "-"], input=text + (render6(rules) or _delete_text("ip6", TABLE6)))
+        runner(["nft", "-f", "-"],
+               input=text + (render6(rules) or _delete_text("ip6", TABLE6)) + guard)
     except CommandError as exc:
         if rules.capture6 or rules.v6_guard:
             raise  # без этих правил IPv6 машины ушёл бы мимо VPN
-        runner(["nft", "-f", "-"], input=text)
+        # IPv6 may be optional, the barrier never is: no fallback without it.
+        runner(["nft", "-f", "-"], input=text + guard)
         return [f"таблица ip6 {TABLE6} не загружена: {exc}"]
     return []
 
 
 def delete(runner: Runner) -> None:
     """Убирает обе таблицы XGW; чужие таблицы не трогает."""
-    runner(["nft", "-f", "-"], input=_delete_text("ip", TABLE))
+    runner(["nft", "-f", "-"], input=_delete_text("ip", TABLE) + _delete_text("inet", GUARD))
     with contextlib.suppress(CommandError):  # IPv6 в ядре выключен — таблицы и не было
         runner(["nft", "-f", "-"], input=_delete_text("ip6", TABLE6))
 
@@ -1136,7 +1254,7 @@ def set_elements(text: str, name: str) -> set[str]:
 # поштучно (CHECKED_SETS) или их элементы кладёт демон на ходу (fp_peers).
 POLICY_SETS = {"ip": ("reserved4", "bypass4", DIRECT_SET), "ip6": ("reserved6",)}
 
-_CHAIN = re.compile(r"^\s*chain (\w+) \{\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
+_CHAIN = re.compile(r"^\s*chain (\w+) \{\n(.*?)^\s*\}\s*$", flags=re.MULTILINE | re.DOTALL)
 _SET = re.compile(r"^\s*set (\w+) \{\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
 
 
@@ -1153,7 +1271,17 @@ def manifest(text: str, family: str, table: str) -> dict[str, tuple] | None:
         hook = re.search(r"\btype (\w+) hook (\w+)", body)
         policy = re.search(r"\bpolicy (\w+)", body)
         head = (*hook.groups(), policy.group(1) if policy else "accept") if hook else ("", "", "")
-        rules = sum(1 for line in body.splitlines() if _rule_line(line))
+        # nft wraps long anonymous sets. Their continuation lines are part of
+        # the same rule, including a closing brace followed by the verdict.
+        rules = 0
+        depth = 0
+        for line in body.splitlines():
+            if not depth and not _rule_line(line):
+                continue
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                rules += 1
+                depth = 0
         # Одно имя дважды бывает только в подставленном тексте: правила считаются вместе.
         before = found.get(f"chain {name}", ("", "", "", 0))
         found[f"chain {name}"] = (*(head if hook else before[:3]), before[3] + rules)

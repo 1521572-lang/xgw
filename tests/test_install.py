@@ -11,7 +11,16 @@ from fakesys import FakeSystem
 
 from xgw import config, managed
 from xgw.generator import builder
-from xgw.install import FP_UNIT, FP_USERS, UNIT_FILES, Facts, Installer, Journal
+from xgw.install import (
+    FP_UNIT,
+    FP_USERS,
+    SINGBOX_USER,
+    UNIT_FILES,
+    Facts,
+    Installer,
+    InstallError,
+    Journal,
+)
 from xgw.net import nm, sleep, sysctl, ufw
 from xgw.net.cmd import CommandError
 from xgw.paths import Paths
@@ -323,14 +332,14 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
     assert box.install() == 0, box.text()
     second = Journal(box.paths.journal_file).data
     for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "fp_users_created",
-                "sleep"):
+                "singbox_user_created", "sleep"):
         assert second[key] == first[key], key
     # Профиль один, а не по одному на каждый запуск.
     assert sum(1 for item in box.system.profiles.values()
                if item["connection.id"] == nm.PROFILE) == 1
-    # xray и два работника бесплатного пула — каждый по одному разу.
-    assert [call[-1] for call in box.system.commands("useradd")] == ["xgw-vpn", "xgw-fps",
-                                                                     "xray"]
+    # Оба ядра и два работника бесплатного пула — каждый по одному разу.
+    assert [call[-1] for call in box.system.commands("useradd")] == [
+        SINGBOX_USER, "xgw-vpn", "xgw-fps", "xray"]
 
 
 def test_machine_only_mode_does_not_touch_lan_things(box):
@@ -450,7 +459,8 @@ def test_network_failure_rolls_everything_back(box):
     assert not (box.paths.etc / "dnsmasq.conf").exists()
     # Код и то, что установка не откатывает, остаются — повторный запуск о них помнит.
     assert box.paths.launcher.exists() and "xray" in system.users
-    assert set(Journal(box.paths.journal_file).data) == {"packages", "user_created"}
+    assert set(Journal(box.paths.journal_file).data) == {
+        "packages", "user_created", "singbox_user_created", "fp_users_created"}
 
 
 def test_system_failure_stops_before_the_network_is_touched(box):
@@ -553,6 +563,7 @@ def test_uninstall_returns_everything(box):
     assert not (paths.etc / "dnsmasq.conf").exists()
     assert "dnsmasq.service" not in system.units  # штатную службу XGW не трогал
     assert "xray" not in system.users
+    assert SINGBOX_USER not in system.users
     assert ("systemctl", "unmask", *sleep.TARGETS) in system.calls
     assert not paths.opt.exists() and not paths.var.exists() and not paths.launcher.exists()
     assert not paths.xray_config_dir.exists()
@@ -584,12 +595,14 @@ def test_uninstall_keeps_things_that_existed_before(box):
     system.packages.update({"dnsmasq", "dnsmasq-base"})
     system.missing.discard("dnsmasq")
     system.users.add("xray")
+    system.users.add(SINGBOX_USER)
     system.unit("dnsmasq.service").update(active=True, enabled=True)
     assert box.install() == 0
     # Своя служба DHCP не мешает штатной: та как работала, так и работает.
     assert system.units["dnsmasq.service"] == {"active": True, "enabled": True}
     assert box.uninstall() == 0
     assert "xray" in system.users  # пользователь был и до XGW
+    assert SINGBOX_USER in system.users
     assert system.units["dnsmasq.service"] == {"active": True, "enabled": True}
     assert "sudo apt remove" not in box.text()
 
@@ -1111,14 +1124,19 @@ def test_install_comments_out_config_lines_that_mean_nothing(box):
 
 @pytest.mark.parametrize("unit", ["xgw-xray.service", "xgw-singbox.service"])
 def test_core_units_are_sandboxed(unit):
-    """Ядра работают от xray; модули и параметры ядра, его журнал, часы, свои пространства
+    """Ядра работают от разных пользователей; модули и параметры ядра, журнал, часы, пространства
     имён и лишние семейства сокетов им не нужны (аудит, F-11; поведение под systemd с TUN,
     TPROXY и всеми протоколами sing-box проверено то же)."""
     text = (REPO / "packaging" / unit).read_text(encoding="utf-8")
     settings = dict(
         line.split("=", 1) for line in text.splitlines() if "=" in line and line[0] != "#"
     )
-    assert settings["User"] == "xray" and settings["NoNewPrivileges"] == "true"
+    expected_user = SINGBOX_USER if unit == "xgw-singbox.service" else "xray"
+    assert settings["User"] == settings["Group"] == expected_user
+    assert settings["NoNewPrivileges"] == "true"
+    if unit == "xgw-singbox.service":
+        assert settings["AmbientCapabilities"] == settings["CapabilityBoundingSet"] == ""
+        assert not settings.get("SupplementaryGroups")
     for key in ("ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
                 "ProtectClock", "ProtectHostname", "RestrictNamespaces",
                 "RestrictRealtime", "RestrictSUIDSGID", "LockPersonality"):
@@ -1203,6 +1221,7 @@ def test_reinstall_notices_changed_service_files(box):
     ({"xgw-xray.service"}, "unchanged", 1, False),
     ({"xgw-xray.service"}, "restart", 0, False),
     ({"xgw-singbox.service"}, "unchanged", 0, True),
+    ({"xgw-singbox.service"}, "api", 0, True),
     ({"xgw-singbox.service"}, "unchanged", 0, None),  # sing-box не работает
     (set(), "unchanged", 0, False),
 ])
@@ -1239,3 +1258,196 @@ def test_reinstall_restarts_cores_whose_service_files_changed(
     tried = box.system.commands("systemctl", "try-restart", "xgw-singbox.service")
     assert bool(tried) is bool(singbox)
     assert ("sing-box перезапущен: файл его службы изменился" in box.text()) is bool(singbox)
+
+
+def test_core_config_permissions_use_separate_setgid_groups(box, monkeypatch):
+    paths = box.paths
+    paths.ensure()
+    for directory in (paths.xray_config_dir, paths.singbox_config_dir):
+        (directory / "config.pending.json").write_text("{}", encoding="utf-8")
+    changed = []
+    installer = box.installer()
+    installer.chown = lambda path, user, group: changed.append((path, user, group))
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    installer._permissions()
+    assert paths.etc.stat().st_mode & 0o7777 == 0o755
+    assert paths.var.stat().st_mode & 0o7777 == 0o700
+    for directory, group in ((paths.xray_config_dir, "xray"),
+                             (paths.singbox_config_dir, SINGBOX_USER)):
+        assert (directory, "root", group) in changed
+        assert directory.stat().st_mode & 0o7777 == 0o2750
+        for item in directory.iterdir():
+            assert (item, "root", group) in changed
+            assert item.stat().st_mode & 0o7777 == 0o640
+
+
+def test_failed_singbox_user_creation_is_not_recorded_as_owned(box):
+    box.system.refuse[f"/usr/sbin/nologin {SINGBOX_USER}"] = "useradd failed"
+    assert box.install() == 1
+    assert not Journal(box.paths.journal_file).get("singbox_user_created")
+    assert SINGBOX_USER not in box.system.users
+    assert not box.system.commands("nft")
+
+
+def test_rollback_retains_account_ownership_for_later_uninstall(box):
+    box.system.refuse["systemctl daemon-reload"] = "reload failed"
+    assert box.install() == 1
+    journal = Journal(box.paths.journal_file)
+    assert journal.get("singbox_user_created") is True
+    assert set(journal.get("fp_users_created")) == set(FP_USERS)
+    assert {SINGBOX_USER, "xray", *FP_USERS} <= box.system.users
+    box.system.refuse.clear()
+    assert box.uninstall() == 0, box.text()
+    assert not {SINGBOX_USER, "xray", *FP_USERS} & box.system.users
+
+
+def test_singbox_user_cleanup_can_be_retried_after_another_step_failed(box):
+    box.system.users.add(SINGBOX_USER)
+    uninstaller = Uninstaller(box.cfg, box.paths, runner=box.system, out=box.out.append)
+    uninstaller.journal.set("singbox_user_created", True)
+    uninstaller._user()
+    uninstaller._user()
+    assert box.system.commands("userdel", SINGBOX_USER) == [("userdel", SINGBOX_USER)]
+    assert not uninstaller.journal.get("singbox_user_created")
+
+
+def test_capture_is_refreshed_before_applying_main_config(box):
+    installer = box.installer()
+    events = []
+    up = installer.capture.up
+
+    def capture_up():
+        events.append("capture")
+        return up()
+
+    installer.capture.up = capture_up
+    installer.first_apply = lambda: events.append("apply") or True
+    assert installer.run(assume_yes=True) == 0, box.text()
+    assert events.index("capture") < events.index("apply")
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_changed_singbox_unit_restarts_after_validation_instead_of_reload(
+    box, monkeypatch, valid,
+):
+    from types import SimpleNamespace
+
+    from xgw.apply.singbox import SingboxCore
+    from xgw.install import engine as install_engine
+    from xgw.paths import atomic_write_json
+
+    paths = box.paths
+    paths.ensure()
+    old_config = {"outbounds": [{"type": "direct", "routing_mark": 2}]}
+    new_config = {"outbounds": [{"type": "direct"}]}
+    atomic_write_json(paths.singbox_config_file, old_config)
+    events = []
+    service = SimpleNamespace(
+        is_active=lambda: True,
+        restart=lambda: events.append("restart"),
+        reload=lambda: events.append("reload"),
+    )
+
+    def validate(candidate):
+        assert candidate == new_config
+        events.append("validate")
+        return valid, "invalid candidate" if not valid else ""
+
+    core = SingboxCore(box.cfg, paths, service, validator=validate)
+    applier = SimpleNamespace(
+        api=SimpleNamespace(balancer_info=lambda tag: {}),
+        apply=lambda *args, **kwargs: events.append("xray") or SimpleNamespace(mode="api"),
+    )
+    assembly = SimpleNamespace(
+        singbox=SimpleNamespace(config=new_config, reload=False),
+        result=SimpleNamespace(config={}, nodes=[]),
+    )
+    monkeypatch.setattr(install_engine, "bypass_mark", lambda *args: None)
+    monkeypatch.setattr(install_engine, "make_applier", lambda *args: applier)
+    monkeypatch.setattr(install_engine, "make_singbox", lambda *args: core)
+    monkeypatch.setattr(install_engine, "collect", lambda *args, **kwargs: SimpleNamespace(
+        quotas={}))
+    monkeypatch.setattr(install_engine, "assemble", lambda *args, **kwargs: assembly)
+    monkeypatch.setattr(install_engine, "persist", lambda *args: None)
+    installer = box.installer()
+    installer.units_changed = {"xgw-singbox.service"}
+    if valid:
+        assert installer._first_apply() is True
+    else:
+        with pytest.raises(InstallError, match="миграция sing-box не выполнена"):
+            installer._first_apply()
+    assert assembly.singbox.reload is True
+    assert events == (["validate", "restart", "xray"] if valid else ["validate"])
+    assert core.read() == (new_config if valid else old_config)
+    assert not box.system.commands("systemctl", "try-restart", "xgw-singbox.service")
+
+
+def test_changed_singbox_unit_starts_an_unchanged_expected_config(box, monkeypatch):
+    from types import SimpleNamespace
+
+    from xgw.apply.singbox import SingboxCore
+    from xgw.install import engine as install_engine
+    from xgw.paths import atomic_write_json
+
+    box.paths.ensure()
+    candidate = {"outbounds": [{"type": "direct"}]}
+    atomic_write_json(box.paths.singbox_config_file, candidate)
+    core = SingboxCore(box.cfg, box.paths, SimpleNamespace(), validator=lambda c: (True, ""))
+    applier = SimpleNamespace(
+        api=SimpleNamespace(balancer_info=lambda tag: {}),
+        apply=lambda *args, **kwargs: SimpleNamespace(mode="unchanged"),
+    )
+    assembly = SimpleNamespace(
+        singbox=SimpleNamespace(config=candidate, reload=False),
+        result=SimpleNamespace(config={}, nodes=[]),
+    )
+    monkeypatch.setattr(install_engine, "bypass_mark", lambda *args: None)
+    monkeypatch.setattr(install_engine, "make_applier", lambda *args: applier)
+    monkeypatch.setattr(install_engine, "make_singbox", lambda *args: core)
+    monkeypatch.setattr(install_engine, "collect", lambda *args, **kwargs: SimpleNamespace(
+        quotas={}))
+    monkeypatch.setattr(install_engine, "assemble", lambda *args, **kwargs: assembly)
+    monkeypatch.setattr(install_engine, "persist", lambda *args: None)
+    installer = box.installer()
+    installer.units_changed = {"xgw-singbox.service"}
+    assert installer._first_apply() is True
+    assert box.system.commands("systemctl", "restart", "xgw-singbox.service")
+
+
+@pytest.mark.parametrize("uid,groups", [(0, {985}), (997, {985}),
+                                        (996, {985, 986}), (996, {0, 985})])
+def test_existing_singbox_identity_with_shared_privileges_is_rejected(box, uid, groups):
+    box.system.users.update({"xray", SINGBOX_USER})
+    box.system.user_ids[SINGBOX_USER] = (uid, 985)
+    box.system.user_groups[SINGBOX_USER] = groups
+    assert box.install(force=True) == 1
+    assert "отдельный ненулевой UID" in box.text()
+    assert not box.system.commands("nft")
+    assert not box.system.commands("userdel")
+
+
+def test_failed_migration_restores_unit_config_and_dac_before_restarting_old_worker(box):
+    from xgw.install import SINGBOX_UNIT
+
+    box.paths.ensure()
+    box.paths.systemd_dir.mkdir(parents=True, exist_ok=True)
+    unit = box.paths.systemd_dir / SINGBOX_UNIT
+    old_unit = "[Service]\nUser=xray\nCapabilityBoundingSet=CAP_NET_ADMIN\n"
+    old_config = '{"outbounds":[{"type":"direct","routing_mark":2}]}\n'
+    unit.write_text(old_unit, encoding="utf-8")
+    box.paths.singbox_config_file.write_text(old_config, encoding="utf-8")
+    box.paths.singbox_config_file.chmod(0o640)
+    box.paths.singbox_config_dir.chmod(0o2750)
+    installer = box.installer()
+    installer._permissions()
+    unit.write_text("[Service]\nUser=xgw-singbox\n", encoding="utf-8")
+    box.paths.singbox_config_file.write_text('{"new":true}', encoding="utf-8")
+    installer.units_changed.add(SINGBOX_UNIT)
+    installer._mark_singbox_restart()
+    with pytest.raises(InstallError, match="восстановлены"):
+        installer._abort_singbox_migration("synthetic restart failure")
+    assert unit.read_text(encoding="utf-8") == old_unit
+    assert box.paths.singbox_config_file.read_text(encoding="utf-8") == old_config
+    assert box.paths.singbox_config_file.stat().st_mode & 0o7777 == 0o640
+    assert SINGBOX_UNIT not in installer.units_changed
+    assert box.system.commands("systemctl", "restart", SINGBOX_UNIT)

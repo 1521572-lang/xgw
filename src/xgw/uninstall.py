@@ -17,14 +17,16 @@ from pathlib import Path
 from . import log, managed, tray, usage
 from . import tailscale as ts
 from .config import Config
-from .install import DAEMON_STOP_WAIT, FP_UNIT, UNIT_FILES, XRAY_USER, Journal
+from .install import DAEMON_STOP_WAIT, FP_UNIT, SINGBOX_USER, UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
 
 # Что остаётся в журнале после отката неудачной установки: это установка не
 # откатывает, а при повторном запуске должна помнить, что было до неё.
-_KEPT_AFTER_ROLLBACK = ("packages", "user_created", "dnsmasq")
+_KEPT_AFTER_ROLLBACK = (
+    "packages", "user_created", "singbox_user_created", "fp_users_created", "dnsmasq",
+)
 
 
 class Uninstaller:
@@ -268,6 +270,11 @@ class Uninstaller:
         removed = [str(name) for name in self.journal.get("fp_users_created") or []]
         for name in removed:
             self.runner(["userdel", name], timeout=30.0, check=False)
+        if self.journal.get("singbox_user_created"):
+            if self.runner(["getent", "passwd", SINGBOX_USER], check=False).strip():
+                self.runner(["userdel", SINGBOX_USER], timeout=30.0)
+            self.journal.discard("singbox_user_created")
+            removed.append(SINGBOX_USER)
         if self.journal.get("user_created"):
             self.runner(["userdel", XRAY_USER], timeout=30.0)
             removed.append(XRAY_USER)

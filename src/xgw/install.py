@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import cores, desktop, engine, fetch, log, managed, tray
+from .apply.singbox import SingboxService
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, retire_obsolete
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
@@ -53,6 +54,7 @@ UNIT_FILES = (
     FP_UNIT,
 )
 XRAY_USER = "xray"
+SINGBOX_USER = "xgw-singbox"
 # Работники бесплатного пула (freepool/agent.py): клиент SSTP (sstpc после подключения) и
 # SOCKS — каждый от своего пользователя, без входа и без возможностей. xgw-ovpn (OpenVPN до
 # вехи М2в) больше не создаётся; созданного прежней установкой убирает xgw uninstall (журнал).
@@ -234,12 +236,39 @@ class Facts:
     wan_if: str = ""
     packages: list[str] = field(default_factory=list)  # чего не хватает
     user_exists: bool = False
+    singbox_user_exists: bool = False
+    singbox_user_problem: str = ""
     fp_users_missing: list[str] = field(default_factory=list)
     xray_version: tuple[int, int, int] | None = None
     singbox_version: tuple[int, int, int] | None = None
     nm_running: bool = False
     lan_profiles: list[str] = field(default_factory=list)  # профили, которые будут отключены
     ufw_active: bool = False
+
+
+class _RestartOnReload(SingboxService):
+    """Установка нового unit: reload конфига обязан сменить и процесс с его правами."""
+
+    def __init__(self, service: SingboxService, before_restart: Callable[[], None]) -> None:
+        self.service = service
+        self.before_restart = before_restart
+
+    def start(self) -> None:
+        self.before_restart()
+        self.service.start()
+
+    def stop(self) -> None:
+        self.service.stop()
+
+    def restart(self) -> None:
+        self.before_restart()
+        self.service.restart()
+
+    def is_active(self) -> bool:
+        return self.service.is_active()
+
+    def reload(self) -> None:
+        self.restart()
 
 
 def _has_qt() -> bool:
@@ -302,6 +331,11 @@ class Installer:
         # Файлы служб, которые эта установка поменяла: работающий процесс живёт по прежнему
         # (ограничения systemd — с запуска), поэтому ядра перезапускаются (_first_apply).
         self.units_changed: set[str] = set()
+        self._singbox_unit_before: str | None = None
+        self._singbox_dac_before: dict[Path, tuple[int, int, int]] = {}
+        self._singbox_config_before: bytes | None = None
+        self._singbox_restart_attempted = False
+        self._singbox_migration_complete = False
 
     # --- что известно о машине --------------------------------------------------
 
@@ -314,9 +348,31 @@ class Installer:
             facts.packages.append(dnsmasq.PACKAGE)
         if self.which("sstpc") is None:
             facts.packages.append(SSTP_PACKAGE)  # бесплатный пул: туннели SSTP (М2в)
-        facts.user_exists = bool(
-            self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
-        )
+        xray_entry = self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
+        singbox_entry = self.runner(["getent", "passwd", SINGBOX_USER], check=False).strip()
+        facts.user_exists = bool(xray_entry)
+        facts.singbox_user_exists = bool(singbox_entry)
+        if facts.singbox_user_exists:
+            try:
+                uid = int(singbox_entry.split(":")[2])
+                groups = {int(value) for value in self.runner(
+                    ["id", "-G", SINGBOX_USER], check=False).split()}
+                xray_uid = int(xray_entry.split(":")[2]) if xray_entry else None
+                xray_group = self.runner(["getent", "group", XRAY_USER], check=False).strip()
+                xray_gid = int(xray_group.split(":")[2]) if xray_group else None
+                if xray_entry and xray_gid is None:
+                    raise ValueError("группа xray не прочитана")
+                if not groups:
+                    raise ValueError("id -G не вернул группы")
+                if uid == 0 or uid == xray_uid or 0 in groups or xray_gid in groups:
+                    facts.singbox_user_problem = (
+                        f"пользователь {SINGBOX_USER} должен иметь отдельный ненулевой UID "
+                        "и не состоять в группах root или xray"
+                    )
+            except (ValueError, IndexError):
+                facts.singbox_user_problem = (
+                    f"не удалось проверить UID и группы существующего {SINGBOX_USER} через NSS"
+                )
         facts.fp_users_missing = [
             name for name in FP_USERS
             if not self.runner(["getent", "passwd", name], check=False).strip()
@@ -359,6 +415,8 @@ class Installer:
     def problems(self, facts: Facts) -> list[str]:
         """Причины, по которым установку начинать нельзя."""
         found: list[str] = []
+        if facts.singbox_user_problem:
+            found.append(facts.singbox_user_problem)
         if facts.lan_if:
             if facts.lan_if == facts.wan_if:
                 found.append(
@@ -403,6 +461,11 @@ class Installer:
         if not facts.user_exists:
             lines.append(
                 f"  • системный пользователь {XRAY_USER} (без входа) — от него работает Xray"
+            )
+        if not facts.singbox_user_exists:
+            lines.append(
+                f"  • отдельный системный пользователь {SINGBOX_USER} (без входа) — sing-box "
+                "без capabilities и доступа к конфигам Xray"
             )
         if facts.fp_users_missing:
             lines.append(
@@ -557,6 +620,11 @@ class Installer:
         try:
             xray_ok = self._network(facts, assume_yes)
         except (InstallError, cmd.CommandError, CaptureError, OSError) as exc:
+            if SINGBOX_UNIT in self.units_changed and not self._singbox_migration_complete:
+                try:
+                    self._abort_singbox_migration(str(exc))
+                except InstallError as recovery:
+                    exc = recovery
             self.out(f"✗ настройка сети не удалась: {exc}")
             if reinstall:
                 self.out(
@@ -617,7 +685,19 @@ class Installer:
         self._step(f"пакеты: {', '.join(facts.packages)}")
 
     def _user(self, facts: Facts) -> None:
-        self.journal.setdefault("user_created", not facts.user_exists)
+        if facts.singbox_user_problem:
+            raise InstallError(facts.singbox_user_problem)
+        if facts.user_exists:
+            self.journal.setdefault("user_created", False)
+        if not facts.singbox_user_exists:
+            self.runner([
+                "useradd", "--system", "--user-group", "--no-create-home",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", SINGBOX_USER,
+            ])
+            # Записываем владение только после успешного создания: чужого пользователя
+            # uninstall не удаляет. Значение переживает повторную установку и её откат.
+            self.journal.set("singbox_user_created", True)
+            self._step(f"пользователь {SINGBOX_USER}")
         for name in facts.fp_users_missing:
             self.runner([
                 "useradd", "--system", "--user-group", "--no-create-home",
@@ -631,6 +711,7 @@ class Installer:
             "useradd", "--system", "--user-group", "--no-create-home",
             "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", XRAY_USER,
         ])
+        self.journal.set("user_created", True)
         self._step(f"пользователь {XRAY_USER}")
 
     def _code(self) -> None:
@@ -722,33 +803,81 @@ class Installer:
                    f"{', '.join(retired)} (значения остались в комментарии)")
 
     def _permissions(self) -> None:
-        """/etc/xgw/config.toml — 0600; конфиг Xray — 0640 root:xray.
+        """Секреты шлюза — 0600; конфиги ядер — 0640 root:<группа своего ядра>.
 
-        Каталог конфигов Xray получает setgid: файлы, которые XGW создаёт в нём
-        позже (атомарная запись через временный файл), наследуют группу xray.
+        Каталоги ядер получают setgid: атомарно заменённые файлы наследуют свою
+        группу. sing-box не состоит в группе xray и не читает её конфиги или API.
         """
         for secret in (self.paths.config_file, managed.path_for(self.paths.config_file)):
             with contextlib.suppress(OSError):
                 os.chmod(secret, 0o600)
         if os.geteuid() != 0:
             return
+        unit = self.paths.systemd_dir / SINGBOX_UNIT
+        if unit.exists():
+            self._singbox_unit_before = unit.read_text(encoding="utf-8")
+            if self.paths.singbox_config_file.exists():
+                self._singbox_config_before = self.paths.singbox_config_file.read_bytes()
+            for item in (self.paths.singbox_config_dir,
+                         *self.paths.singbox_config_dir.iterdir()):
+                if item.is_dir() or item.is_file():
+                    status = item.stat()
+                    self._singbox_dac_before[item] = (
+                        status.st_uid, status.st_gid, status.st_mode & 0o7777)
         os.chmod(self.paths.etc, 0o755)
         os.chmod(self.paths.var, 0o700)
-        try:
-            # Конфиги ядер читает пользователь xray: root:xray, каталог с setgid.
-            for directory in (self.paths.xray_config_dir, self.paths.singbox_config_dir):
-                self.chown(directory, "root", XRAY_USER)
+        for directory, group in ((self.paths.xray_config_dir, XRAY_USER),
+                                 (self.paths.singbox_config_dir, SINGBOX_USER)):
+            try:
+                self.chown(directory, "root", group)
                 os.chmod(directory, 0o2750)
                 for item in directory.iterdir():
                     if item.is_file():
-                        self.chown(item, "root", XRAY_USER)
+                        self.chown(item, "root", group)
                         os.chmod(item, 0o640)
-        except LookupError as exc:
-            raise InstallError(f"пользователь {XRAY_USER} не создан: {exc}") from exc
+            except LookupError as exc:
+                raise InstallError(f"группа {group} не создана: {exc}") from exc
         for item in (self.paths.opt, self.paths.xray_dir, self.paths.singbox_dir,
                      self.paths.lib_dir):
             with contextlib.suppress(OSError):
                 os.chmod(item, 0o755)
+
+    def _abort_singbox_migration(self, reason: str) -> None:
+        """Не оставляем старый marked-конфиг под новым unit без CAP_NET_ADMIN."""
+        try:
+            if self._singbox_unit_before is not None:
+                atomic_write_text(self.paths.systemd_dir / SINGBOX_UNIT,
+                                  self._singbox_unit_before, mode=0o644)
+                if self._singbox_config_before is not None:
+                    atomic_write_text(self.paths.singbox_config_file,
+                                      self._singbox_config_before.decode("utf-8"), mode=0o640)
+                directory = self.paths.singbox_config_dir
+                defaults = self._singbox_dac_before.get(directory)
+                for item in (directory, *directory.iterdir()):
+                    if not (item.is_file() or item.is_dir()):
+                        continue
+                    saved = self._singbox_dac_before.get(item)
+                    if saved is None and defaults is not None:
+                        saved = (defaults[0], defaults[1], 0o640)
+                    if saved is not None:
+                        uid, gid, mode = saved
+                        self.chown(item, uid, gid)
+                        os.chmod(item, mode)
+                self.runner(["systemctl", "daemon-reload"], timeout=60.0)
+                self.units_changed.discard(SINGBOX_UNIT)
+                if self._singbox_restart_attempted and self._singbox_config_before is not None:
+                    self.runner(["systemctl", "restart", SINGBOX_UNIT], timeout=60.0)
+        except (OSError, LookupError, cmd.CommandError) as exc:
+            raise InstallError(
+                f"миграция sing-box не выполнена ({reason}); прежний unit/DAC "
+                f"не удалось полностью восстановить: {exc}"
+            ) from exc
+        restored = ("прежние unit/config/DAC восстановлены" if self._singbox_unit_before is not None
+                    else "предыдущей установки sing-box не было")
+        raise InstallError(f"миграция sing-box не выполнена: {reason}; {restored}")
+
+    def _mark_singbox_restart(self) -> None:
+        self._singbox_restart_attempted = True
 
     # --- сеть -------------------------------------------------------------------
 
@@ -785,6 +914,10 @@ class Installer:
         self._legacy_dnsmasq()
         self._units()
         self._dnsmasq(bool(facts.lan_if))
+        # На обновлении старый sing-box пока ещё имеет routing_mark. Сначала nft должен
+        # узнать UID новой службы; только затем можно применять конфиг без SO_MARK.
+        # up сохраняет enable/disable/open и удерживает on при отсутствии inbound'а.
+        self.capture.up()
         # Без подписок собирать нечего: Xray запустит демон, когда их добавят в панели.
         xray_ok = self.first_apply() if engine.has_sources(self.cfg) else False
         self._capture(xray_ok)
@@ -984,26 +1117,48 @@ class Installer:
                 self.cfg, self.paths, inventory, mark=mark, logger=self.log, xray_bin=xray_bin
             )
         except engine.EngineError as exc:
+            if SINGBOX_UNIT in self.units_changed:
+                self._abort_singbox_migration(str(exc))
             self._warn(f"конфиг Xray не собран: {exc}")
             return self._xray_answers(applier, 0.0)
+        singbox_core = None
+        change = getattr(assembly, "singbox", None)
+        if SINGBOX_UNIT in self.units_changed and change is not None:
+            # Обновление User/capabilities — окно обслуживания. Конфиг сначала проверяет
+            # штатный SingboxCore; вместо SIGHUP он запускает процесс уже с новым unit.
+            # Иначе старый xray-процесс начал бы открывать сокеты без метки и без UID bypass.
+            change.reload = True
+            singbox_core = engine.make_singbox(self.cfg, self.paths)
+            singbox_core.service = _RestartOnReload(
+                singbox_core.service, self._mark_singbox_restart)
         outcome, singbox_outcome = engine.apply_all(
             self.cfg, self.paths, assembly, applier, force_now=True,
+            singbox_core=singbox_core,
         )
         if singbox_outcome is not None and singbox_outcome.mode != "unchanged":
             self._step(engine.describe_singbox(singbox_outcome))
-        if SINGBOX_UNIT in self.units_changed and (
-                singbox_outcome is None or singbox_outcome.mode not in ("started", "removed")):
-            # Новые ограничения службы действуют с запуска процесса; перечитывание конфига
-            # (SIGHUP) их не применяет. Не работает — и перезапускать нечего (try-restart).
+        if SINGBOX_UNIT in self.units_changed and singbox_outcome is not None \
+                and singbox_outcome.mode in ("rejected", "rollback", "failed", "deferred"):
+            self._abort_singbox_migration(engine.describe_singbox(singbox_outcome))
+        if singbox_core is not None and singbox_outcome is not None \
+                and singbox_outcome.mode in ("started", "reloaded"):
+            self._step("sing-box перезапущен: файл его службы изменился")
+        elif SINGBOX_UNIT in self.units_changed and (
+                singbox_outcome is None or singbox_outcome.mode == "unchanged"):
+            # Даже неизменившийся конфиг требует новых прав процесса. Не запускаем ядро,
+            # которое не было нужно; ранее остановленное, но с ожидаемым конфигом — запускаем.
             running = self.runner(
                 ["systemctl", "is-active", SINGBOX_UNIT], check=False).strip() == "active"
-            if running:
+            expected = singbox_core is not None and singbox_core.expected()
+            if running or expected:
                 try:
-                    self.runner(["systemctl", "try-restart", SINGBOX_UNIT], timeout=60.0)
+                    self._mark_singbox_restart()
+                    self.runner(["systemctl", "restart" if expected else "try-restart",
+                                 SINGBOX_UNIT], timeout=60.0)
                     self._step("sing-box перезапущен: файл его службы изменился")
                 except cmd.CommandError as exc:
-                    self._warn(f"sing-box не перезапущен ({exc}): новые ограничения службы "
-                               "вступят в силу при следующем запуске")
+                    self._abort_singbox_migration(f"sing-box не перезапущен: {exc}")
+        self._singbox_migration_complete = True
         if outcome is None:
             self._warn(engine.describe_singbox(singbox_outcome))  # type: ignore[arg-type]
             return self._xray_answers(applier, 0.0)

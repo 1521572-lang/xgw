@@ -5,7 +5,7 @@ TUN), локальные прокси, проверочные входы probe-*
 основного сервера работают как раньше. Серверы, которые ведёт sing-box, подключены к Xray так:
 
     Xray (outbound proxy-… / spare-…, socks) → 127.0.0.1:<порт> → sing-box (inbound sb-in-…,
-    socks) → сервер (outbound sb-out-…, с меткой mark_bypass: мимо перехвата)
+    socks) → сервер (outbound sb-out-…, мимо перехвата по UID xgw-singbox)
 
 Для каждого сервера, который умеет sing-box, в его конфиг заранее заведены варианты — по одному
 входу и выходу на профиль (generator/profiles.py): обычный (d), с дроблением TLS (f), с
@@ -15,7 +15,8 @@ TUN), локальные прокси, проверочные входы probe-*
 меняется состав серверов, и откладывается, пока через sing-box идёт трафик (engine.assemble).
 
 Мост — без метки: цепочка loopback_guard отклоняет пакеты с меткой mark_bypass к 127.0.0.0/8.
-Метку ставит sing-box на своих сокетах к серверам (routing_mark).
+Основная служба sing-box работает без capabilities: её сокеты обходят перехват по UID.
+Временные пробы бесплатного пула (freepool/probe.py) работают от демона и сохраняют метку.
 
 Проверка сертификата не отключается: `tls.insecure` в конфиг не попадает (parsers/).
 """
@@ -113,7 +114,7 @@ def variant_letters(spec, cfg: Config) -> list[str]:
     return letters
 
 
-def _variant(spec, letter: str, fingerprint: str, mark: int) -> tuple[list[dict], bool]:
+def _variant(spec, letter: str, fingerprint: str) -> tuple[list[dict], bool]:
     """Outbound'ы варианта (главный первым) и признак «это endpoint»."""
     main = copy.deepcopy(spec.main)
     extras = copy.deepcopy(spec.extra)
@@ -135,7 +136,9 @@ def _variant(spec, letter: str, fingerprint: str, mark: int) -> tuple[list[dict]
         if main.get("detour") in renames:
             main["detour"] = renames[main["detour"]]
     for body in (main, *extras):
-        body["routing_mark"] = mark
+        # Только конфиг основной службы: у xgw-singbox нет CAP_NET_ADMIN для SO_MARK.
+        # Удаляем также метки из импортированного spec; пробы пула собираются отдельно.
+        body.pop("routing_mark", None)
     return [main, *extras], spec.endpoint
 
 
@@ -228,7 +231,6 @@ def build(
     ]
     if not chosen:
         return None
-    mark = cfg.capture.mark_bypass
     password = bridge_password(previous) or secrets.token_urlsafe(24)
     secret = clash_secret(previous) or secrets.token_urlsafe(24)
     old_ports = bridge_ports(previous)
@@ -240,11 +242,11 @@ def build(
         for letter in variant_letters(node.singbox, cfg):
             key = (node.fingerprint, letter)
             wanted.append(key)
-            bodies[key] = _variant(node.singbox, letter, node.fingerprint, mark)
+            bodies[key] = _variant(node.singbox, letter, node.fingerprint)
     ports: dict[tuple[str, str], int] = {}
     for key in wanted:
         port = old_ports.get(key)
-        if isinstance(port, int) and 0 < port < 65536 and port not in taken:
+        if isinstance(port, int) and 1024 <= port < 65536 and port not in taken:
             ports[key] = port
             taken.add(port)
     candidate = cfg.core.port_base
@@ -387,7 +389,7 @@ def find_invalid(
     for node in nodes:
         if node.singbox is None:
             continue
-        items, endpoint = _variant(node.singbox, "d", node.fingerprint, cfg.capture.mark_bypass)
+        items, endpoint = _variant(node.singbox, "d", node.fingerprint)
         key = checks.rejected_key(items, core)
         reason = checks.known_rejection(key)
         if reason is None:

@@ -2126,6 +2126,13 @@ class Daemon:
                 self.notifier.event("capture", tidied)
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
+            guard_loaded = getattr(capture, "guard_loaded", None)
+            if guard_loaded is not None:
+                try:
+                    if guard_loaded() is True:
+                        text += "; барьер соответствует политике и остаётся загруженным"
+                except Exception:
+                    pass  # ошибка диагностики не заменяет исходную причину сбоя загрузки
             self.log.error("%s", text)
             if text != self._capture_error:  # одно событие на причину, а не на каждый шаг
                 self._capture_error = text

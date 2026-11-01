@@ -75,7 +75,8 @@ def test_gateway_with_lan_and_local_capture():
     assert forward[1] == 'oifname "xgwtun0" tcp flags syn tcp option maxseg size set rt mtu'
     assert forward[2] == 'iifname != "lan0" oifname != "lan0" accept'  # чужой форвардинг
     assert "tcp flags syn tcp option maxseg size set rt mtu" in forward
-    assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
+    assert ('iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter '
+            'ct mark set ct mark or 0x20000000 accept') in forward
     assert 'iifname "lan0" oifname != "lan0" meta l4proto icmp counter accept' in forward
     assert 'iifname "lan0" oifname != "lan0" counter accept' not in forward  # fail-closed
     assert _chain(text, "postrouting") == ['iifname "lan0" oifname != "lan0" counter masquerade']
@@ -421,7 +422,7 @@ def test_apply_is_one_transaction_and_tolerates_missing_ipv6():
 
     class NoIpv6(FakeKernel):
         def _nft(self, argv, text):
-            if "ip6" in text:
+            if "table ip6 " in text:
                 raise CommandError("nft: Operation not supported")
             return super()._nft(argv, text)
 
@@ -457,6 +458,7 @@ def test_blocked_mode_lets_only_xray_and_service_traffic_out():
         assert f"chain {chain} {{" not in text  # перехвата нет — и TPROXY тоже
     assert "tproxy" not in text and "meta mark set" not in text
     assert _chain(text, "block_output") == [
+        "meta mark 0x2 ip daddr 127.0.0.0/8 counter reject",
         'oifname "lo" accept',
         "meta mark 0x2 accept",
         "ct direction reply accept",
@@ -472,7 +474,8 @@ def test_blocked_mode_lets_only_xray_and_service_traffic_out():
     forward = _chain(text, "forward")
     assert "type filter hook forward priority filter; policy drop;" in text
     assert forward[-1] == 'iifname "lan0" counter reject with icmp type admin-prohibited'
-    assert 'iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter accept' in forward
+    assert ('iifname "lan0" oifname != "lan0" ip saddr @bypass4 counter '
+            'ct mark set ct mark or 0x20000000 accept') in forward
     assert forward[-2] == 'iifname "lan0" meta l4proto tcp counter reject with tcp reset'
     assert "masquerade" in _chain(text, "postrouting")[-1]  # обход VPN по-прежнему работает
 
@@ -481,7 +484,8 @@ def test_blocked_keeps_established_only_for_bypass_devices():
     """Сессии, открытые в режиме «снят», в blocked не доживают по записи conntrack."""
     forward = _chain(nft.render(_blocked(_cfg())), "forward")
     assert "ct state established,related accept" not in forward
-    assert 'iifname "lan0" ip saddr @bypass4 ct state established,related accept' in forward
+    assert ('iifname "lan0" ip saddr @bypass4 ct state established,related '
+            'ct mark set ct mark or 0x20000000 accept') in forward
     assert 'oifname "lan0" ip daddr @bypass4 ct state established,related accept' in forward
 
 
@@ -489,8 +493,8 @@ def test_blocked_rejects_containers_except_bypass_subnets():
     """Без цепочки containers мосты Docker прошли бы правилом «чужой форвардинг»."""
     text = nft.render(_blocked(_cfg()))
     forward = _chain(text, "forward")
-    rejects = [rule for rule in forward if rule.startswith('iifname "docker0"')
-               or rule.startswith('iifname "br-*"')]
+    rejects = [rule for rule in forward if "reject" in rule and (
+        rule.startswith('iifname "docker0"') or rule.startswith('iifname "br-*"'))]
     assert len(rejects) == 2
     for rule in rejects:
         assert 'oifname != "docker0" oifname != "br-*"' in rule  # между мостами — можно
@@ -536,7 +540,8 @@ def test_v6_guard_with_ipv6_off_regardless_of_networkmanager():
 def test_v6_guard_lets_xray_sockets_out():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     guard = _chain(nft.render6(rules), "v6_guard")
-    assert guard[:2] == ['oifname "lo" accept', "meta mark 0x2 accept"]
+    assert guard[:3] == ["meta mark 0x2 ip6 daddr ::1 counter reject",
+                         'oifname "lo" accept', "meta mark 0x2 accept"]
     assert "ip6 daddr { fe80::/10, ff00::/8 } accept" in guard
     assert "ct direction reply accept" in guard
 
@@ -627,7 +632,7 @@ def _variants():
 def test_real_nft_accepts_rules(name):
     cfg, capture = _variants()[name]
     rules, _ = nft.build_rules(cfg, capture=capture, time_uids=(0,))
-    for text in (nft.render(rules), nft.render6(rules)):
+    for text in (nft.render(rules), nft.render6(rules), nft.render_guard(rules)):
         if not text:
             continue
         done = subprocess.run(
@@ -653,7 +658,7 @@ def _blocked_variants():
 @pytest.mark.parametrize("name", list(_blocked_variants()))
 def test_real_nft_accepts_blocked_rules_in_one_transaction(name):
     rules = _blocked(_blocked_variants()[name], uids=(0,))
-    text = nft.render(rules) + nft.render6(rules)
+    text = nft.render(rules) + nft.render6(rules) + nft.render_guard(rules)
     done = subprocess.run(
         ["nft", "-c", "-f", "-"], input=text, capture_output=True, text=True, timeout=30
     )
@@ -803,14 +808,14 @@ def test_russian_addresses_go_past_xray_in_the_kernel(tmp_path):
     text = nft.render(rules)
     assert "elements = { 5.8.0.0/13, 5.16.0.0/14, 203.0.113.0/24 }" in text
     assert nft.set_elements(text, nft.DIRECT_LAN_SET) == {"192.168.50.20"}
-    direct = "ip daddr @direct4 th dport != 53 return"
+    direct = "ip daddr @direct4 th dport != 53 ct mark set ct mark or 0x20000000 return"
     assert f'iifname "lan0" ip saddr @direct_lan4 {direct}' in _chain(text, "prerouting")
     assert direct not in _chain(text, "output") and direct not in _chain(text, "containers")
     forward = _chain(text, "forward")
     device = 'iifname "lan0" oifname "wan0" ip saddr @direct_lan4 ip daddr @direct4'
-    assert f"{device} counter accept" in forward
+    assert f"{device} counter ct mark set ct mark or 0x20000000 accept" in forward
     assert forward[:2] == [  # QUIC устройства к российским адресам не отбивается, прочий — да
-        f"{device} udp dport 443 counter accept",
+        f"{device} udp dport 443 counter ct mark set ct mark or 0x20000000 accept",
         'iifname "lan0" udp dport 443 ip daddr != @reserved4 ip saddr != @bypass4 '
         "counter reject with icmp type port-unreachable",
     ]
@@ -979,3 +984,106 @@ def test_changed_chains_sets_and_policy_elements_are_named():
     assert nft.set_problem(LOADED, LISTED.replace("10.128.0.0/9", "10.128.0.0/10"), "ip") == (
         "другие элементы в наборах: reserved4")
     assert nft.intervals("10.0.0.0/8, мусор") is None
+
+
+def test_guard_never_approves_flows_and_only_scopes_managed_ingress():
+    cfg = _cfg()
+    cfg.free_pool.mode = "test"
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=(104,), tailnet=True)
+    guard = nft.render_guard(rules)
+    assert guard.startswith("table inet xgw_guard\ndelete table inet xgw_guard\n")
+    assert "ct mark set" not in guard and "meta mark set" not in guard
+    assert "ct mark and 0x20000000 != 0 accept" in guard
+    assert "ct state established,related accept" not in guard
+    forward = _chain(guard, "forward")
+    assert forward == [
+        'iifname "lan0" goto transit', 'iifname "docker0" goto transit',
+        'iifname "br-*" goto transit', 'iifname "tailscale0" goto transit',
+        'iifname "fpv*" goto transit', 'return',
+    ]
+    assert 'iifname "virbr*"' not in guard
+    assert _chain(guard, "transit")[-2:] == [
+        "meta l4proto tcp counter reject with tcp reset",
+        "counter reject with icmpx type admin-prohibited",
+    ]
+    assert "meta l4proto != { tcp, udp } accept" in guard.split("chain pass {", 1)[1]
+    # This barrier carries no broad country/set direct permission of its own.
+    assert "@direct4" not in guard and "@bypass4" not in guard
+    assert "meta skuid 104 udp dport 123 accept" in guard
+    assert nft.render_guard(nft.build_rules(cfg, capture=False, time_uids=())[0]) == ""
+    assert nft.render_guard(_blocked(cfg))
+
+
+def test_capture_approves_only_explicit_direct_paths():
+    cfg = _cfg(wan_if="wan0")
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=(), tailnet=True)
+    rules = dataclasses.replace(
+        rules, direct4=("203.0.113.0/24",), direct_lan=("192.168.50.20",),
+        direct_local=True, free_pool=True, fp_peers=("198.51.100.10 . tcp . 443",),
+    )
+    text = nft.render(rules)
+    approved = [line for line in text.splitlines() if "ct mark set" in line]
+    assert approved
+    assert all("ct mark set ct mark or 0x20000000" in line for line in approved)
+    assert all(any(key in line for key in (
+        "@direct4", "@bypass4", "@ts_exit_direct", "@fp_peers")) for line in approved)
+    assert not any("tproxy" in line or "meta mark set" in line for line in approved)
+    assert "ct mark set meta mark" not in text
+    # Neither a foreign established flow nor the broad libvirt accept gains authorization.
+    assert "ct state established,related accept" in _chain(text, "forward")
+    assert 'iifname != "lan0" oifname != "lan0" accept' in _chain(text, "forward")
+
+
+def test_dedicated_singbox_uid_has_bypass_and_loopback_refusal(monkeypatch):
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: 27123)
+    for cfg, blocked in ((_cfg(), False), (_cfg(), True), (_proxy6(), False)):
+        rules, _ = nft.build_rules(cfg, capture=not blocked, blocked=blocked, time_uids=())
+        assert rules.singbox_uid == 27123
+        text = nft.render(rules)
+        assert ("meta skuid 27123 accept" if blocked else "meta skuid 27123 return") in text
+        assert "meta skuid 27123 ct direction original ip daddr 127.0.0.0/8 counter reject" in text
+        text6 = nft.render6(rules)
+        assert "meta skuid 27123 ct direction original ip6 daddr ::1 counter reject" in text6
+        assert "meta skuid 27123 accept" in nft.render_guard(rules)
+
+
+def test_guard_manifest_counts_wrapped_anonymous_set_as_one_rule():
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    text = nft.render_guard(rules)
+    actual = text.replace(", 100.64.0.0/10", ",\n            100.64.0.0/10").replace(
+        " } th dport != 53", "\n        } th dport != 53")
+    assert actual != text
+    assert nft.manifest(text, "inet", nft.GUARD) == nft.manifest(actual, "inet", nft.GUARD)
+
+
+def test_guard_failure_never_falls_back_to_unguarded_capture():
+    kernel = FakeKernel()
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    nft.apply(rules, kernel)
+    before = dict(kernel.tables)
+    calls = []
+
+    def unsupported(argv, **kwargs):
+        calls.append(kwargs.get("input", ""))
+        if "table inet xgw_guard {" in kwargs.get("input", ""):
+            raise CommandError("guard expression unsupported")
+        return kernel(argv, **kwargs)
+
+    with pytest.raises(CommandError, match="guard expression unsupported"):
+        nft.apply(dataclasses.replace(rules, bypass=("192.168.50.21",)), unsupported)
+    assert kernel.tables == before
+    assert calls and all("table inet xgw_guard {" in text for text in calls)
+
+
+def test_explicit_off_and_delete_remove_guard_without_touching_foreign_tables():
+    kernel = FakeKernel()
+    kernel.tables[("inet", "foreign")] = "keep"
+    cfg = _cfg()
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    nft.apply(rules, kernel)
+    assert ("inet", nft.GUARD) in kernel.tables
+    nft.apply(nft.build_rules(cfg, capture=False, time_uids=())[0], kernel)
+    assert ("inet", nft.GUARD) not in kernel.tables
+    nft.apply(rules, kernel)
+    nft.delete(kernel)
+    assert kernel.tables == {("inet", "foreign"): "keep"}

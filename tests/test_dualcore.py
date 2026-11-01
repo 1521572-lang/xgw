@@ -28,6 +28,25 @@ LINKS = [
 ]
 
 
+def test_ephemeral_singbox_probe_keeps_mark_while_main_service_uses_uid_bypass():
+    from xgw.freepool.models import Backend, Variant
+    from xgw.freepool.probe import singbox_config
+
+    cfg = Config()
+    node = _inventory([HY2]).nodes[0]
+    spec = node.singbox
+    variant = Variant(
+        provider="test", backend=Backend.SINGBOX, protocol="hysteria2", host=node.address,
+        address="", port=node.port, transport="udp", name="test", country_hint="",
+        singbox={"main": spec.main, "extra": spec.extra, "endpoint": spec.endpoint},
+    )
+    temporary = singbox_config(variant, cfg, 20001, "probe-password", {})
+    assert all(item["routing_mark"] == cfg.capture.mark_bypass
+               for item in temporary["outbounds"])
+    main = singboxing.build(cfg, [node], {}).config
+    assert all("routing_mark" not in item for item in main["outbounds"])
+
+
 def _inventory(link_list=LINKS) -> engine.Inventory:
     raws, _meta, _warnings = parse_links_text("\n".join(link_list), "main")
     quotas = {"main": {"upload": 0, "download": 10**9, "total": 0}}  # безлимитная

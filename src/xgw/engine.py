@@ -993,12 +993,14 @@ def describe_singbox(outcome: singbox_apply.SingboxOutcome) -> str:
 def apply_all(
     cfg: config.Config, paths: Paths, assembly: Assembly, applier: Applier, *,
     force_now: bool = False,
+    singbox_core: singbox_apply.SingboxCore | None = None,
 ) -> tuple[ApplyOutcome | None, singbox_apply.SingboxOutcome | None]:
     """Применяет сборку: сначала sing-box (мосты должны слушать), затем Xray. Если sing-box
     конфиг не принял, Xray не применяется (он собран под него): вернётся только итог sing-box."""
     outcome = None
     if assembly.singbox is not None:
-        outcome = make_singbox(cfg, paths).apply(
+        core = singbox_core if singbox_core is not None else make_singbox(cfg, paths)
+        outcome = core.apply(
             assembly.singbox.config, reload=assembly.singbox.reload,
         )
         if outcome.mode in ("rejected", "rollback", "failed"):

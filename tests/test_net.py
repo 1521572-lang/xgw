@@ -1304,7 +1304,7 @@ def test_baseline_is_taken_only_when_nobody_touched_the_tables_after_the_load(ga
     assert once._state().get("baseline") and once.loaded() is True
     restless = capture(churn=10)
     assert restless.up() == "on" and loads() == 2 + BASELINE_TRIES
-    assert restless._state().get("baseline") is None and restless.loaded() is True
+    assert restless._state().get("baseline") is None and restless.loaded() is None
 
 
 def test_mismatch_seen_right_after_the_own_load_does_not_reload_in_circles(gateway):
@@ -1315,7 +1315,8 @@ def test_mismatch_seen_right_after_the_own_load_does_not_reload_in_circles(gatew
 
     def runner(argv, **kwargs):
         text = kernel(argv, **kwargs)
-        if list(argv[:1]) == ["nft"] and "table" in argv and text.rstrip().endswith("}"):
+        if (list(argv[:1]) == ["nft"] and "table" in argv and "xgw" in argv
+                and text.rstrip().endswith("}")):
             end = text.rstrip().rfind("}")
             text = text[:end] + "    chain extra {\n        accept\n    }\n}\n"
         return text
@@ -1395,3 +1396,75 @@ def test_extra_route_in_an_xgw_table_is_noticed_and_removed():
     iprule.ensure_containers(2, 101, kernel, "xgwtun0")
     assert iprule.present_tun(1, 101, kernel, 4, "xgwtun0")
     assert iprule.present_containers(2, 101, kernel, "xgwtun0")
+
+
+def test_guard_is_independent_of_capture_tables_and_routing(gateway):
+    gateway.enable()
+    kernel = gateway.kernel
+    key = ("inet", nft.GUARD)
+    barrier = kernel.tables[key]
+    assert gateway.guard_loaded() is True and gateway.loaded() is True
+    del kernel.tables[("ip", nft.TABLE)]
+    assert kernel.tables[key] == barrier
+    assert gateway.guard_loaded() is True and gateway.loaded() is False
+    gateway.up()
+    kernel.rules.clear()
+    assert gateway.guard_loaded() is True and gateway.loaded() is False
+    assert kernel.tables[key] == barrier
+
+
+def test_guard_missing_or_modified_is_never_loaded(gateway):
+    gateway.enable()
+    kernel = gateway.kernel
+    key = ("inet", nft.GUARD)
+    original = kernel.tables.pop(key)
+    assert gateway.guard_loaded() is False and gateway.loaded() is False
+    gateway.up()
+    # A counterfeit keeps the table/chains/counts but replaces a deny verdict.
+    kernel.tables[key] = original.replace(
+        "meta l4proto tcp counter reject with tcp reset", "meta l4proto tcp counter accept", 1)
+    assert nft.manifest(kernel.tables[key], "inet", nft.GUARD) == nft.manifest(
+        original, "inet", nft.GUARD)
+    assert gateway.guard_loaded() is False and gateway.loaded() is False
+    gateway.up()
+    assert gateway.guard_loaded() is True and gateway.loaded() is True
+
+
+def test_guard_baseline_ignores_counters_but_tracks_desired_scope(gateway):
+    gateway.enable()
+    key = ("inet", nft.GUARD)
+    gateway.kernel.tables[key] = gateway.kernel.tables[key].replace(
+        "counter", "counter packets 12 bytes 720")
+    assert gateway.guard_loaded() is True and gateway.loaded() is True
+    gateway.cfg.capture.local = False
+    assert gateway.guard_loaded() is False  # changed policy cannot reuse the old proof
+
+
+def test_blocked_installs_guard_and_explicit_disable_removes_it(gateway):
+    fakexray.write(gateway.paths, {"inbounds": []})
+    assert gateway.enable() == "blocked"
+    assert gateway.guard_loaded() is True and gateway.loaded() is True
+    assert ("inet", nft.GUARD) in gateway.kernel.tables
+    gateway.disable()
+    assert ("inet", nft.GUARD) not in gateway.kernel.tables
+    assert gateway.guard_loaded() is True and gateway.loaded() is True
+
+
+def test_failed_atomic_reload_retains_previous_guard(gateway):
+    gateway.enable()
+    before = dict(gateway.kernel.tables)
+    gateway.kernel.refuse = "nft -f"
+    with pytest.raises(CaptureError):
+        gateway.up()
+    assert gateway.kernel.tables == before
+    gateway.kernel.refuse = None
+    assert gateway.guard_loaded() is True
+
+
+def test_first_failed_guard_apply_does_not_enable_forwarding(gateway):
+    assert sysctl.read(sysctl.IP_FORWARD, gateway.proc) == "0"
+    gateway.kernel.refuse = "nft -f"
+    with pytest.raises(CaptureError):
+        gateway.enable()
+    assert sysctl.read(sysctl.IP_FORWARD, gateway.proc) == "0"
+    assert gateway.kernel.tables == {}

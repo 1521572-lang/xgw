@@ -72,6 +72,64 @@ def test_render_counts_levels_and_shows_advice():
     assert text.endswith("Итог: OK — 1, WARN — 1, FAIL — 0".replace("FAIL — 0", "FAIL — 1"))
 
 
+@pytest.mark.parametrize("loaded,level", [(True, OK), (False, FAIL), (None, WARN)])
+def test_independent_barrier_diagnostic(box, monkeypatch, loaded, level):
+    box.installed()
+
+    class CaptureStub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def mode(self):
+            return "on"
+
+        def guard_loaded(self):
+            return loaded
+
+    monkeypatch.setattr(diag, "Capture", CaptureStub)
+    monkeypatch.setattr(diag.nft, "listing", lambda *args, **kwargs:
+                        "counter packets 2 bytes 100\ncounter packets 3 bytes 200")
+    check = box.diag()._barrier()[0]
+    assert check.level == level
+    if loaded:
+        assert "5" in check.text and "соответствуют" in check.text
+    elif loaded is None:
+        assert "неизвестно" in check.text
+
+
+def test_core_identity_checks_running_uid_and_all_capability_sets(box, monkeypatch, tmp_path):
+    import pwd
+    from types import SimpleNamespace
+
+    box.installed()
+    box.paths.singbox_config_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=910))
+    proc = tmp_path / "proc" / "123"
+    proc.mkdir(parents=True)
+    props = "User=xgw-singbox\nMainPID=123\n"
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["systemctl", "show", "xgw-singbox.service"]:
+            return props
+        return box.system(argv, **kwargs)
+
+    def write_status(uids="910 910 910 910", bounding="0"):
+        (proc / "status").write_text(
+            f"Uid:\t{uids}\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t{bounding}\n",
+            encoding="utf-8",
+        )
+
+    write_status()
+    checker = box.diag(runner=runner, proc=proc.parent)
+    assert checker._core_users()[0].level == OK
+    write_status(bounding="1000")
+    assert checker._core_users()[0].level == FAIL
+    write_status(uids="0 910 910 910")
+    assert checker._core_users()[0].level == FAIL
+    (proc / "status").unlink()
+    assert checker._core_users()[0].level == WARN
+
+
 @pytest.mark.skipif(not LINUX, reason="остальные проверки идут только в Linux")
 def test_clean_machine_before_install_has_no_failures(box):
     checks = box.diag().run()

@@ -51,7 +51,7 @@ QUIET_POLL = 0.5
 # Интерфейсы, события которых шаг демона не ускоряют: loopback, TUN самого Xray (он
 # опускает его при каждом перезапуске) и контейнеры Docker (мосты, veth).
 IGNORED_IFS = ("lo", "docker*", "br-*", "veth*")
-TABLES = (("ip", "xgw"), ("ip6", "xgw6"))
+TABLES = (("ip", "xgw"), ("ip6", "xgw6"), ("inet", "xgw_guard"))
 
 _LINK = re.compile(r"^(?:Deleted )?\d+: ([^:@\s]+)[@:]")
 _ADDR = re.compile(r"^(?:Deleted )?\d+: ([^:@\s]+)\s+inet6? ")

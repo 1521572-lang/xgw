@@ -665,7 +665,7 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
             print(text.rstrip("\n") or "# LAN не настроен (network.lan_if пуст): dnsmasq не нужен")
             return 0
         rules = capture.rules()
-        text = nft.render(rules) + nft.render6(rules)
+        text = nft.render(rules) + nft.render6(rules) + nft.render_guard(rules)
         print(text.rstrip("\n") or "# правил нет: перехват выключен и network.lan_if не задан")
         return 0
 

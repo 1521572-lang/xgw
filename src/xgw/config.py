@@ -848,9 +848,10 @@ def _validate_core(core: CoreSection) -> list[str]:
             f"{defaults.port_base}"
         )
         core.port_base = defaults.port_base
-    if not 1 <= core.api_port <= 65535:
+    if not 1024 <= core.api_port <= 65535:
         warnings.append(
-            f"core.api_port={core.api_port} вне диапазона — используется {defaults.api_port}"
+            f"core.api_port={core.api_port}: ожидается 1024–65535 — используется "
+            f"{defaults.api_port}"
         )
         core.api_port = defaults.api_port
     return warnings
