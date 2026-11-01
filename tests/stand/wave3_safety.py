@@ -287,7 +287,8 @@ def wan_facts(interface: str) -> dict:
                   "device", "show", interface])
     lines = live.decode().splitlines() if live else []
     uuid = lines[0] if lines else ""
-    fields = ("connection.interface-name,802-3-ethernet.mtu,ipv4.method,ipv4.addresses,"
+    fields = ("connection.uuid,connection.interface-name,802-3-ethernet.mtu,"
+              "ipv4.method,ipv4.addresses,"
               "ipv4.gateway,ipv4.dns,ipv4.routes,ipv4.ignore-auto-dns,ipv6.method,"
               "ipv6.addresses,ipv6.gateway,ipv6.dns,ipv6.routes,ipv6.ignore-auto-dns")
     profile = query(["nmcli", "-g", fields, "connection", "show", uuid]) if uuid else None
@@ -301,7 +302,7 @@ def wan_facts(interface: str) -> dict:
         addresses = None
     routes = {}
     for family in (4, 6):
-        raw = query(["ip", "-j", f"-{family}", "route", "show", "default", "dev", interface])
+        raw = query(["ip", "-j", f"-{family}", "route", "show", "default"])
         try:
             values = json.loads(raw or b"null")
             stable = [{k: v for k, v in item.items() if k not in ("expires", "cache")}
