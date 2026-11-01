@@ -1,4 +1,4 @@
-"""Локальная страховка только для согласованного повторного теста wave3b.
+"""Локальная страховка только для согласованного повторного теста wave3c.
 
 Не устанавливается как часть XGW. Исходное состояние обязательно off. Доверенная
 копия и snapshot готовятся до опасных действий; watchdog запускается отдельным
@@ -17,10 +17,10 @@ import tempfile
 import time
 from pathlib import Path
 
-LEASE_SECONDS = 15.0
+LEASE_SECONDS = 25.0
 MAX_SECONDS = 1800.0
-JOB = "xgw-w3b-job.service"
-SAFETY = "xgw-w3b-safety.service"
+JOB = "xgw-w3c-job.service"
+SAFETY = "xgw-w3c-safety.service"
 
 
 def atomic(path: Path, data: bytes) -> None:
@@ -101,13 +101,22 @@ def restore(directory: Path) -> None:
     # Не ждём net.lock либо зависший install: прекращаем единственных разрешённых
     # писателей этого теста. Остановка демона не снимает его правила и не рвёт Xray.
     stopped = call(["systemctl", "stop", "--no-block", JOB,
-                    "xgw.service", "xgw-net.service"], 2)
+                    "xgw.service", "xgw-net.service"], 1)
     killed = call(["systemctl", "kill", "--kill-whom=all", "--signal=KILL",
-                   JOB, "xgw.service", "xgw-net.service"], 2)
-    applied = call(["nft", "-f", "-"], 8, data=rules)
+                   JOB, "xgw.service", "xgw-net.service"], 1)
+    applied = call(["nft", "-f", "-"], 3, data=rules)
     if applied == 0:
         atomic(Path(snapshot["capture_state"]), state)
         Path(snapshot["open_marker"]).unlink(missing_ok=True)
+    # Прерванный job не должен вечно выглядеть выполняющимся. Прочее восстановление
+    # не зависит от наличия/читаемости необязательного артефакта результата.
+    try:
+        result = json.loads((directory / "job-result.json").read_text())
+        if isinstance(result, dict) and result.get("state") == "running":
+            result.update(state="aborted_by_safety", rc=None)
+            save(directory / "job-result.json", result)
+    except (OSError, ValueError):
+        pass
     save(directory / "status.json", {
         "state": "RESTORED_OFF" if applied == 0 else "FAILED_RESTORE",
         "nft_rc": applied, "stop_rc": stopped, "kill_rc": killed,
@@ -147,16 +156,20 @@ def watch(directory: Path, dry: bool = False) -> None:
 def pulse(directory: Path, disarm: bool = False) -> None:
     status = json.loads((directory / "status.json").read_text())
     lease = float(json.loads((directory / "lease.json").read_text()))
-    if status.get("state") != "armed" or time.monotonic() - lease >= LEASE_SECONDS:
+    gap = time.monotonic() - lease
+    if status.get("state") != "armed" or gap >= LEASE_SECONDS:
         raise SystemExit("STOP: страховка не armed или lease истёк; новый опыт запрещён")
     if disarm:
         atomic(directory / "disarm", b"confirmed\n")
     else:
         save(directory / "lease.json", time.monotonic())
     print("DISARM_REQUESTED" if disarm else "LEASE_OK")
+    print(json.dumps({"previous_gap_seconds": round(gap, 3), "lease_seconds": LEASE_SECONDS}))
 
 
 def job(directory: Path, action: str, repo: Path) -> None:
+    if json.loads((directory / "status.json").read_text()).get("dry") is not False:
+        raise SystemExit("STOP: dry-калибровка не разрешает install/enable")
     pulse(directory)
     # Повторный install в том же опыте не должен выглядеть завершённым по rc старого enable.
     save(directory / "job-result.json", {"action": action, "state": "running", "rc": None})
@@ -226,6 +239,10 @@ def main() -> None:
         watch(directory)
     elif mode in ("pulse", "disarm"):
         pulse(directory, disarm=mode == "disarm")
+        # Один короткий операторский цикл: продление и результат job в одной команде.
+        result = directory / "job-result.json"
+        if result.exists():
+            print(result.read_text())
     elif mode == "status":
         print((directory / "status.json").read_text())
         result = directory / "job-result.json"

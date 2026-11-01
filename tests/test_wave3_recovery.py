@@ -81,6 +81,7 @@ def test_new_job_does_not_report_previous_enable_success(tmp_path, monkeypatch):
     tool = safety()
     result = tmp_path / "job-result.json"
     tool.save(result, {"action": "enable", "state": "finished", "rc": 0})
+    tool.save(tmp_path / "status.json", {"state": "armed", "dry": False})
     monkeypatch.setattr(tool, "pulse", lambda directory: None)
 
     def run(command, **kwargs):
@@ -94,6 +95,14 @@ def test_new_job_does_not_report_previous_enable_success(tmp_path, monkeypatch):
     assert tool.json.loads(result.read_text()) == {
         "action": "install", "state": "finished", "rc": 0,
     }
+
+
+def test_dry_calibration_cannot_authorize_install(tmp_path, monkeypatch):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "armed", "dry": True})
+    monkeypatch.setattr(tool, "pulse", lambda directory: pytest.fail("must not pulse"))
+    with pytest.raises(SystemExit, match="dry"):
+        tool.job(tmp_path, "install", tmp_path)
 
 
 def test_expired_local_lease_recovers_without_tester_or_network(tmp_path, monkeypatch):
@@ -120,11 +129,14 @@ def test_rescue_uses_prepared_rules_and_bounded_commands_not_installed_xgw(tmp_p
         "capture_state": str(target), "open_marker": str(tmp_path / "open"),
     })
     calls = []
+    tool.save(tmp_path / "job-result.json", {"action": "install", "state": "running", "rc": None})
     monkeypatch.setattr(tool, "call", lambda argv, timeout, **kw:
                         calls.append((argv, timeout, kw)) or 0)
     tool.restore(tmp_path)
     assert [call[0][0] for call in calls] == ["systemctl", "systemctl", "nft"]
     assert calls[-1][2]["data"] == rules
-    assert sum(call[1] for call in calls) == 12
+    assert sum(call[1] for call in calls) == 5
     assert target.read_bytes() == state
     assert tool.json.loads((tmp_path / "status.json").read_text())["state"] == "RESTORED_OFF"
+    result = tool.json.loads((tmp_path / "job-result.json").read_text())
+    assert result["state"] == "aborted_by_safety"
