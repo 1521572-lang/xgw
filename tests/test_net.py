@@ -533,7 +533,8 @@ def test_describe(gateway):
         "mode": "on", "lan_if": "lan0", "lan": True, "local": True,
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
         "direct4": 0, "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
-        "tun_problem": "", "inbound_missing": "", "blocked": False,
+        "tun_problem": "", "inbound_missing": "", "blocked": False, "mismatch": "",
+        "early_rules": [],
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
     gateway.cfg.capture.containers = True
@@ -872,7 +873,7 @@ def test_loaded_notices_a_lost_interface_route_or_tproxy(gateway_tun):
     gateway.up()
     kernel.tables[("ip", "xgw")] += "    chain prerouting {\n    }\n"
     assert gateway.loaded() is False  # чужая правка таблицы: отпечаток не тот (4-й аудит)
-    gateway._save(tables=gateway._tables_digest())  # будто цепочку загрузил сам XGW
+    gateway._save(baseline=gateway._tables_digest())  # будто цепочку загрузил сам XGW
     assert gateway.loaded() is True  # prerouting для LAN в TUN-режиме нужен
     gateway.cfg.network.lan_if = ""
     assert gateway.loaded() is False  # без LAN TPROXY остался бы лишним
@@ -1237,3 +1238,160 @@ def test_ensure_keeps_a_foreign_rule_with_other_selectors():
     assert iprule.present(1, 100, kernel) is True
     assert foreign in kernel.rules and moved not in kernel.rules
     assert sorted(rule["priority"] for rule in kernel.rules) == [50, 100]
+
+
+# --- кросс-аудит 4cc96b9: эталон правил (N01, N02) и маршрутизация (N03, N04) -------------
+
+
+def test_extra_element_in_a_policy_set_is_noticed_and_removed(gateway):
+    """N02: элементы наборов политики в краткий вывод nft (и в отпечаток таблиц) не попадают —
+    чужой элемент в bypass4 (на весь интернет мимо Xray) проверка прежде не видела. Теперь
+    элементы сверяются с текстом правил, и загрузка возвращает набор из него."""
+    gateway.cfg.network.static_leases = ["aa:bb:cc:dd:ee:ff,192.168.50.20"]
+    gateway.cfg.network.bypass_hosts = ["aa:bb:cc:dd:ee:ff"]
+    assert gateway.enable() == "on" and gateway.loaded() is True
+    kernel = gateway.kernel
+    assert "elements = { 192.168.50.20" in kernel.table
+    kernel.tables[("ip", "xgw")] = kernel.table.replace(
+        "elements = { 192.168.50.20", "elements = { 0.0.0.0/1, 192.168.50.20", 1)
+    assert gateway.loaded() is False
+    assert gateway.up() == "on" and gateway.loaded() is True
+    assert "0.0.0.0/1" not in kernel.table
+
+
+def _generations(kernel, churn: int):
+    """Поколение правил «ядра»: каждая загрузка `nft -f` — +1, и churn раз сразу после того,
+    как загрузивший прочитал поколение, таблицы правит кто-то ещё — ещё +1."""
+    state = {"gen": 1, "churn": churn, "fresh": False}
+
+    def generation():
+        value = state["gen"]
+        if state["fresh"] and state["churn"]:
+            state["churn"] -= 1
+            state["gen"] += 1
+        state["fresh"] = False
+        return value
+
+    def runner(argv, **kwargs):
+        text = kernel(argv, **kwargs)
+        if list(argv[:2]) == ["nft", "-f"]:
+            state["gen"] += 1
+            state["fresh"] = True
+        return text
+
+    return runner, generation
+
+
+def test_baseline_is_taken_only_when_nobody_touched_the_tables_after_the_load(gateway):
+    """N01: прежде эталоном становилось то, что ядро показало после загрузки, — вместе с чужой
+    правкой, успевшей между загрузкой и чтением. Теперь поколение правил ядра сразу после своей
+    загрузки должно совпасть с поколением при чтении; не совпало — загрузка ещё раз (не больше
+    BASELINE_TRIES), так и не вышло — эталона нет, а проверка обходится без него."""
+    from xgw.net.capture import BASELINE_TRIES
+
+    def capture(churn: int) -> Capture:
+        runner, generation = _generations(gateway.kernel, churn)
+        made = Capture(gateway.cfg, gateway.paths, runner=runner, proc_sys=gateway.proc,
+                       time_uids=(), generation=generation)
+        made.sys_net = gateway.sys_net
+        return made
+
+    def loads() -> int:
+        return sum(1 for text in gateway.kernel.loads if "table ip xgw {" in text)
+
+    once = capture(churn=1)
+    assert once.enable() == "on" and loads() == 2  # чужая правка — загружено ещё раз
+    assert once._state().get("baseline") and once.loaded() is True
+    restless = capture(churn=10)
+    assert restless.up() == "on" and loads() == 2 + BASELINE_TRIES
+    assert restless._state().get("baseline") is None and restless.loaded() is True
+
+
+def test_mismatch_seen_right_after_the_own_load_does_not_reload_in_circles(gateway):
+    """Таблицы не сошлись с текстом правил сразу после своей загрузки (например, nft печатает
+    не то, что ждёт разбор): эталона нет, расхождение записано — журнал, `xgw diag` — и loaded()
+    его терпит, а не загружает правила на каждом шаге. Новое расхождение — повод."""
+    kernel = gateway.kernel
+
+    def runner(argv, **kwargs):
+        text = kernel(argv, **kwargs)
+        if list(argv[:1]) == ["nft"] and "table" in argv and text.rstrip().endswith("}"):
+            end = text.rstrip().rfind("}")
+            text = text[:end] + "    chain extra {\n        accept\n    }\n}\n"
+        return text
+
+    odd = Capture(gateway.cfg, gateway.paths, runner=runner, proc_sys=gateway.proc, time_uids=())
+    odd.sys_net = gateway.sys_net
+    assert odd.enable() == "on"
+    assert odd._state().get("mismatch") == "таблица ip xgw: лишний chain extra"
+    assert odd._state().get("baseline") is None and odd.loaded() is True
+    assert odd.describe()["mismatch"] == "таблица ip xgw: лишний chain extra"
+    kernel.tables[("ip", "xgw")] = kernel.table.replace("set bypass4 {", "set gone {", 1)
+    assert odd.loaded() is False
+
+
+def test_rule_narrowed_by_extra_selectors_is_not_the_xgw_rule():
+    """N03: правило с той же меткой, таблицей и приоритетом, но только для uidrange (ipproto,
+    порта, oif…) прежде считалось правилом XGW — помеченный трафик остальных ушёл бы по main
+    мимо VPN. Теперь оно не наше: XGW ставит своё, а чужое не трогает ни при загрузке, ни при
+    снятии. Метка «1» и «0x1», маска «4294967295» и «0xffffffff» — одно и то же."""
+    kernel = FakeKernel()
+    narrowed = {"priority": 100, "src": "all", "fwmark": "0x1", "uidrange": "1000-1000",
+                "table": "100"}
+    ours = {"priority": 100, "src": "all", "fwmark": "0x1", "table": "100"}
+    kernel.rules = [dict(narrowed)]
+    iprule.ensure(1, 100, kernel)
+    assert narrowed in kernel.rules and ours in kernel.rules and iprule.present(1, 100, kernel)
+    kernel.rules = [dict(narrowed),
+                    {"priority": 100, "src": "all", "fwmark": "1", "fwmask": "4294967295",
+                     "table": "100"}]
+    assert iprule.present(1, 100, kernel)
+    kernel.rules = [dict(narrowed)]
+    assert not iprule.present(1, 100, kernel) and not iprule.has_rule(1, 100, kernel)
+    iprule.remove(1, 100, kernel)
+    assert kernel.rules == [narrowed]
+
+
+def test_rules_before_xgw_are_reported_and_left_alone(gateway):
+    """N03: чужое правило раньше правил XGW может увести помеченный трафик мимо его таблиц.
+    XGW его не трогает, но о нём говорит `xgw diag`; правило в таблицу XGW и обычное «lookup
+    local» — не в счёт. Чужое правило с меткой XGW, но с другими условиями, проверку правил
+    по кругу не гоняет и после загрузки остаётся на месте."""
+    assert gateway.enable() == "on"
+    cap = gateway.cfg.capture
+    kernel = gateway.kernel
+    foreign = {"priority": 80, "src": "all", "fwmark": hex(cap.mark_proxy), "iif": "lo",
+               "uidrange": "4000000000-4000000000", "table": str(cap.tun_route_table)}
+    kernel.rules.append(dict(foreign))
+    assert gateway.loaded() is True and gateway.describe()["early_rules"] == []
+    escape = {"priority": 10, "src": "all", "table": "main"}
+    kernel.rules.append(dict(escape))
+    assert gateway.describe()["early_rules"] == [10]
+    assert gateway.up() == "on" and foreign in kernel.rules and escape in kernel.rules
+    assert iprule.early(kernel, 4, (cap.route_table,)) == [10, 80]
+
+
+def test_extra_route_in_an_xgw_table_is_noticed_and_removed():
+    """N04: лишний маршрут в своей таблице (сеть через WAN, unreachable…) прежде проверке не
+    мешал: локальный маршрут на месте — значит, всё на месте, а помеченные пакеты к той сети
+    шли мимо VPN. Теперь в таблице XGW — ровно её маршруты: лишний виден и убирается."""
+    kernel = FakeKernel()
+    lan = ("192.168.50.0/24",)
+    iprule.ensure(1, 100, kernel, throws=lan)
+    assert iprule.present(1, 100, kernel, throws=lan)
+    leak = {"dst": "198.51.100.0/24", "gateway": "192.0.2.1", "dev": "wan0"}
+    kernel.routes(100).append(dict(leak))
+    assert not iprule.present(1, 100, kernel, throws=lan)
+    iprule.ensure(1, 100, kernel, throws=lan)
+    assert leak not in kernel.routes(100) and iprule.present(1, 100, kernel, throws=lan)
+    # Таблица TUN — её делят машина и контейнеры.
+    kernel.links["xgwtun0"] = "tun"
+    iprule.ensure_tun(1, 101, kernel, 4, "xgwtun0")
+    iprule.ensure_containers(2, 101, kernel, "xgwtun0")
+    assert iprule.present_tun(1, 101, kernel, 4, "xgwtun0")
+    kernel.routes(101).append({"type": "unreachable", "dst": "203.0.113.0/24"})
+    assert not iprule.present_tun(1, 101, kernel, 4, "xgwtun0")
+    assert not iprule.present_containers(2, 101, kernel, "xgwtun0")
+    iprule.ensure_containers(2, 101, kernel, "xgwtun0")
+    assert iprule.present_tun(1, 101, kernel, 4, "xgwtun0")
+    assert iprule.present_containers(2, 101, kernel, "xgwtun0")

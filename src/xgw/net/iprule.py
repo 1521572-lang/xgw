@@ -42,6 +42,12 @@ TUN (capture.method = "tun") — пакеты самой машины уходя
 семейств отдельные, номера одни и те же.
 
 Повторное применение дубликатов не создаёт.
+
+Таблицы маршрутизации XGW (route_table, tun_route_table) — свои: в них ровно те маршруты,
+что выше, а лишний (кто-то добавил, например, сеть через WAN) проверка видит, и загрузка его
+убирает — иначе помеченные пакеты к этой сети ушли бы мимо VPN (кросс-аудит 4cc96b9, N04).
+Чужие правила `ip rule` не трогаются никогда — даже с той же меткой и таблицей, но с другими
+условиями (N03).
 """
 
 from __future__ import annotations
@@ -55,29 +61,46 @@ PREF_TUN = 90
 PREF_CONTAINERS = 95
 BLACKHOLE_METRIC = 4096
 ANYWHERE = {4: "0.0.0.0/0", 6: "::/0"}
+# Ключи `ip -j rule show`, при которых правило — ровно правило XGW (кросс-аудит 4cc96b9, N03).
+# Любой другой (uidrange, ipproto, sport, dport, oif, l3mdev, not, suppress_prefixlength, tos,
+# goto…) сужает или меняет правило: помеченный трафик, которому оно не подходит, ушёл бы по
+# main мимо VPN, а проверка считала бы правило на месте.
+RULE_KEYS = frozenset({"priority", "src", "dst", "fwmark", "fwmask", "iif", "table", "protocol"})
 
 
 def _ip(family: int) -> list[str]:
     return ["ip", "-6"] if family == 6 else ["ip"]
 
 
-def _rules(
-    mark: int, table: int, runner: Runner, family: int = 4, iif: str | None = None
-) -> list[dict]:
-    """Правила `fwmark <mark> [iif <iif>] lookup <table>`, которые уже есть в системе."""
+def _number(value: object) -> int | None:
+    """Метка или маска из `ip -j rule show`: «0x1» и «1» — одно и то же число."""
+    text = str(value).strip()
+    for base in (0, 16):
+        try:
+            return int(text, base)
+        except ValueError:
+            continue
+    return None
+
+
+def _listing(runner: Runner, family: int) -> list[dict]:
     try:
         listing = json.loads(runner([*_ip(family), "-j", "rule", "show"]) or "[]")
     except json.JSONDecodeError as exc:
         raise CommandError(f"ip -j rule show: непонятный ответ ({exc})") from exc
-    found = []
-    for rule in listing:
-        try:
-            same_mark = int(str(rule.get("fwmark", "")), 16) == mark
-        except ValueError:
-            same_mark = False
-        if same_mark and str(rule.get("table")) == str(table) and rule.get("iif") == iif:
-            found.append(rule)
-    return found
+    return [rule for rule in listing if isinstance(rule, dict)]
+
+
+def _rules(
+    mark: int, table: int, runner: Runner, family: int = 4, iif: str | None = None
+) -> list[dict]:
+    """Правила `fwmark <mark> [iif <iif>] lookup <table>`, которые уже есть в системе (и
+    чужие с теми же меткой и таблицей — их отличает _plain)."""
+    return [
+        rule for rule in _listing(runner, family)
+        if _number(rule.get("fwmark", "")) == mark and str(rule.get("table")) == str(table)
+        and rule.get("iif") == iif
+    ]
 
 
 def _routes(table: int, runner: Runner, family: int) -> list[dict]:
@@ -114,19 +137,44 @@ def _is_tun(route: dict, family: int, dev: str) -> bool:
     )
 
 
+def _unexpected(routes: list[dict], allowed) -> list[dict]:
+    """Маршруты таблицы XGW, которых в ней быть не должно (allowed — что должно)."""
+    return [route for route in routes if not allowed(route)]
+
+
+def _del_route(route: dict, table: int, runner: Runner, family: int) -> None:
+    """Убирает маршрут таблицы XGW таким, каким его показал `ip -j route show`."""
+    kind = route.get("type")
+    argv = [*_ip(family), "route", "del", *([str(kind)] if kind and kind != "unicast" else []),
+            str(route.get("dst") or "default")]
+    if route.get("gateway"):
+        argv += ["via", str(route["gateway"])]
+    if route.get("dev"):
+        argv += ["dev", str(route["dev"])]
+    if isinstance(route.get("metric"), int):
+        argv += ["metric", str(route["metric"])]
+    runner([*argv, "table", str(table)])
+
+
 def _del_rules(mark: int, table: int, runner: Runner, family: int, iif: str | None) -> None:
+    """Убирает свои правила — без лишних условий (_plain), каждое по его приоритету: чужое
+    правило с той же меткой и таблицей, но с другими условиями остаётся (N03)."""
     ip = _ip(family)
-    for _rule in _rules(mark, table, runner, family, iif):
+    for rule in _rules(mark, table, runner, family, iif):
+        if not (_plain(rule) and isinstance(rule.get("priority"), int)):
+            continue
         argv = [*ip, "rule", "del", "fwmark", str(mark)]
         if iif is not None:
             argv += ["iif", iif]
-        runner([*argv, "lookup", str(table)])
+        runner([*argv, "lookup", str(table), "pref", str(rule["priority"])])
 
 
 def _plain(rule: dict) -> bool:
-    """Без лишних условий: полная маска метки, «from all», без адреса назначения."""
+    """Без лишних условий: только ключи RULE_KEYS, полная маска метки, «from all», без адреса
+    назначения."""
     return (
-        rule.get("fwmask") in (None, "0xffffffff")
+        set(rule) <= RULE_KEYS
+        and _number(rule.get("fwmask", 0xFFFFFFFF)) == 0xFFFFFFFF
         and rule.get("src", "all") == "all"
         and rule.get("dst", "all") == "all"
     )
@@ -169,22 +217,55 @@ def _has_exact(
 def has_rule(
     mark: int, table: int, runner: Runner, family: int = 4, iif: str | None = None
 ) -> bool:
-    """Есть ли правило `fwmark <mark> [iif <iif>] lookup <table>` (для поиска лишних)."""
-    return bool(_rules(mark, table, runner, family, iif))
+    """Есть ли своё правило `fwmark <mark> [iif <iif>] lookup <table>` (для поиска лишних).
+    Чужое с другими условиями не в счёт: убрать его XGW не вправе (_del_rules), и проверка
+    иначе загружала бы правила по кругу."""
+    return any(_plain(rule) for rule in _rules(mark, table, runner, family, iif))
+
+
+def early(runner: Runner, family: int, tables: tuple[int, ...], before: int = PREF) -> list[int]:
+    """Приоритеты чужих правил `ip rule` раньше правил XGW (кросс-аудит 4cc96b9, N03): такое
+    правило может увести помеченный трафик мимо таблиц XGW, по main мимо VPN. Не в счёт
+    обычное «from all lookup local» (pref 0), правила в таблицы XGW (tables) и правила без
+    lookup (unreachable, prohibit — они трафик не выпускают). Ничего не меняет: чужие правила
+    XGW не трогает, о них говорит `xgw diag`."""
+    try:
+        listing = _listing(runner, family)
+    except CommandError:
+        return []
+    own = {str(table) for table in tables}
+    found = set()
+    for rule in listing:
+        priority = rule.get("priority")
+        target = rule.get("table")
+        if not isinstance(priority, int) or priority >= before or target is None:
+            continue
+        if str(target) in own or (priority == 0 and str(target) == "local" and _plain(rule)):
+            continue
+        found.add(priority)
+    return sorted(found)
 
 
 # --- TPROXY: локальная доставка ------------------------------------------------
 
 
+def _tproxy_route(family: int):
+    """Что может быть в таблице TPROXY: локальная доставка и маршруты throw (их набор
+    сверяется отдельно)."""
+    return lambda route: _is_local(route, family) or route.get("type") == "throw"
+
+
 def present(
     mark: int, table: int, runner: Runner, family: int = 4, throws: tuple[str, ...] = ()
 ) -> bool:
-    """Правило, локальный маршрут и ровно те маршруты throw, что нужны (throws)."""
+    """Правило, локальный маршрут и ровно те маршруты throw, что нужны (throws), — и ничего
+    лишнего в таблице (N04)."""
     routes = _routes(table, runner, family)
     return (
         _has_exact(mark, table, runner, family, None, PREF)
         and any(_is_local(route, family) for route in routes)
         and _throws(routes) == set(throws)
+        and not _unexpected(routes, _tproxy_route(family))
     )
 
 
@@ -194,7 +275,8 @@ def ensure(
     """Правило и маршрут есть ровно в одном экземпляре; маршруты throw — ровно для
     подсетей throws (лишние убираются: подсеть LAN сменили). Сначала маршруты, правило —
     последним: без них помеченный пакет самой машины ушёл бы по main мимо VPN (третий аудит
-    0.2.0)."""
+    0.2.0). Лишние маршруты таблицы убираются уже после правила (N04): не убрался — правило
+    и нужные маршруты всё равно на месте."""
     ip = _ip(family)
     runner([*ip, "route", "replace", "local", ANYWHERE[family], "dev", "lo", "table", str(table)])
     have = _throws(_routes(table, runner, family))
@@ -204,6 +286,8 @@ def ensure(
     for network in sorted(have - set(throws)):
         runner([*ip, "route", "del", "throw", network, "table", str(table)])
     _ensure_rule(mark, table, runner, family, None, PREF)
+    for route in _unexpected(_routes(table, runner, family), _tproxy_route(family)):
+        _del_route(route, table, runner, family)
 
 
 def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
@@ -221,12 +305,25 @@ def remove(mark: int, table: int, runner: Runner, family: int = 4) -> None:
 # --- TUN: маршрут в интерфейс --------------------------------------------------
 
 
+def _tun_route(family: int, dev: str | None):
+    """Что может быть в таблице TUN (её делят машина и контейнеры): чёрная дыра и маршрут в
+    интерфейс dev, если он есть."""
+    return lambda route: _is_blackhole(route, family) or (
+        dev is not None and _is_tun(route, family, dev))
+
+
+def _drop_unexpected(table: int, runner: Runner, family: int, dev: str | None) -> None:
+    for route in _unexpected(_routes(table, runner, family), _tun_route(family, dev)):
+        _del_route(route, table, runner, family)
+
+
 def present_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> bool:
     routes = _routes(table, runner, family)
     return (
         _has_exact(mark, table, runner, family, "lo", PREF_TUN)
         and any(_is_tun(route, family, dev) for route in routes)
         and any(_is_blackhole(route, family) for route in routes)
+        and not _unexpected(routes, _tun_route(family, dev))
     )
 
 
@@ -234,12 +331,14 @@ def ensure_tun(mark: int, table: int, runner: Runner, family: int, dev: str) -> 
     """Пакеты с меткой, созданные на самой машине, уходят в интерфейс dev (он уже должен
     существовать); правило, интерфейсный маршрут и чёрная дыра — по одному экземпляру.
     Сначала таблица (чёрная дыра, затем интерфейс), правило — последним: без маршрутов в
-    таблице помеченный пакет ушёл бы по main мимо VPN (третий аудит 0.2.0)."""
+    таблице помеченный пакет ушёл бы по main мимо VPN (третий аудит 0.2.0). Лишние маршруты
+    таблицы — после правила (N04)."""
     ip = _ip(family)
     runner([*ip, "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
             "table", str(table)])
     runner([*ip, "route", "replace", "default", "dev", dev, "table", str(table)])
     _ensure_rule(mark, table, runner, family, "lo", PREF_TUN)
+    _drop_unexpected(table, runner, family, dev)
 
 
 def remove_tun(
@@ -274,17 +373,20 @@ def present_containers(mark: int, table: int, runner: Runner, dev: str | None) -
         _has_exact(mark, table, runner, 4, None, PREF_CONTAINERS)
         and any(_is_blackhole(route, 4) for route in routes)
         and (dev is None or any(_is_tun(route, 4, dev) for route in routes))
+        and not _unexpected(routes, _tun_route(4, dev))
     )
 
 
 def ensure_containers(mark: int, table: int, runner: Runner, dev: str | None) -> None:
     """Пакеты контейнеров с меткой mark уходят в TUN-интерфейс dev, а пока его нет — в
-    чёрную дыру. Правило — по одному экземпляру и последним, после маршрутов (как ensure_tun)."""
+    чёрную дыру. Правило — по одному экземпляру и последним, после маршрутов (как ensure_tun);
+    лишние маршруты таблицы — после правила (N04)."""
     runner(["ip", "route", "replace", "blackhole", "default", "metric", str(BLACKHOLE_METRIC),
             "table", str(table)])
     if dev is not None:
         runner(["ip", "route", "replace", "default", "dev", dev, "table", str(table)])
     _ensure_rule(mark, table, runner, 4, None, PREF_CONTAINERS)
+    _drop_unexpected(table, runner, 4, dev)
 
 
 def remove_containers(

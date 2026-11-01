@@ -1128,6 +1128,113 @@ def set_elements(text: str, name: str) -> set[str]:
     return {item.strip().removesuffix("/32") for item in found.group(1).split(",") if item.strip()}
 
 
+# --- эталон таблиц: текст правил, а не то, что ядро показало после загрузки -----------------
+
+# Наборы политики (кросс-аудит 4cc96b9, N02): от их элементов зависит, что идёт мимо Xray, —
+# частные сети (reserved4, reserved6), устройства bypass_hosts (bypass4) и российские сети
+# (direct4). Их элементы сверяются с текстом правил (set_problem). Прочие наборы сверяются
+# поштучно (CHECKED_SETS) или их элементы кладёт демон на ходу (fp_peers).
+POLICY_SETS = {"ip": ("reserved4", "bypass4", DIRECT_SET), "ip6": ("reserved6",)}
+
+_CHAIN = re.compile(r"^\s*chain (\w+) \{\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
+_SET = re.compile(r"^\s*set (\w+) \{\n(.*?)^\s*\}", flags=re.MULTILINE | re.DOTALL)
+
+
+def manifest(text: str, family: str, table: str) -> dict[str, tuple] | None:
+    """Устройство таблицы из текста загрузки (render, render6) или из `nft list table`:
+    «chain ИМЯ» → (тип, hook, policy, число правил), «set ИМЯ» → (тип, флаги). None — таблицы
+    нет. Сами правила так не сравнить — nft печатает их по-своему; их стережёт отпечаток
+    (tables_digest), снятый сразу после своей загрузки (Capture._baseline)."""
+    start = text.rfind(f"table {family} {table} {{")
+    if start < 0:
+        return None
+    found: dict[str, tuple] = {}
+    for name, body in _CHAIN.findall(text[start:]):
+        hook = re.search(r"\btype (\w+) hook (\w+)", body)
+        policy = re.search(r"\bpolicy (\w+)", body)
+        head = (*hook.groups(), policy.group(1) if policy else "accept") if hook else ("", "", "")
+        rules = sum(1 for line in body.splitlines() if _rule_line(line))
+        # Одно имя дважды бывает только в подставленном тексте: правила считаются вместе.
+        before = found.get(f"chain {name}", ("", "", "", 0))
+        found[f"chain {name}"] = (*(head if hook else before[:3]), before[3] + rules)
+    for name, body in _SET.findall(text[start:]):
+        kind = re.search(r"^\s*type (.+?);?\s*$", body, flags=re.MULTILINE)
+        flags = re.search(r"^\s*flags (.+?);?\s*$", body, flags=re.MULTILINE)
+        found[f"set {name}"] = (kind.group(1) if kind else "", flags.group(1) if flags else "")
+    return found
+
+
+def manifest_problem(expected: dict | None, actual: dict | None, name: str) -> str:
+    """Чем загруженная таблица name (actual) расходится с текстом правил (expected); "" —
+    ничем."""
+    if expected is None or actual is None:
+        if expected is actual:
+            return ""
+        return f"таблица {name} есть, хотя не нужна" if expected is None else f"нет таблицы {name}"
+    problems = []
+    for key in sorted(expected.keys() | actual.keys()):
+        if key not in actual:
+            problems.append(f"нет {key}")
+        elif key not in expected:
+            problems.append(f"лишний {key}")
+        elif expected[key] != actual[key]:
+            problems.append(f"{key}: {actual[key]} вместо {expected[key]}")
+    return f"таблица {name}: " + "; ".join(problems) if problems else ""
+
+
+def _elements(text: str, name: str) -> str:
+    """Текст элементов набора name — первого в тексте (listing(sets=…) ставит полный набор
+    перед таблицей)."""
+    match = re.search(rf"^\s*set {name} \{{\n(.*?)^\s*\}}", text, flags=re.MULTILINE | re.DOTALL)
+    if match is None:
+        return ""
+    found = re.search(r"elements\s*=\s*\{(.*?)\}", match.group(1), flags=re.DOTALL)
+    return found.group(1) if found else ""
+
+
+@functools.lru_cache(maxsize=8)
+def intervals(elements: str) -> tuple[tuple[int, int], ...] | None:
+    """Элементы набора адресов (текст между фигурными скобками) как объединение интервалов:
+    сети, адреса и диапазоны «a-b» — nft печатает соседние сети и диапазоны по-своему, а
+    покрывают они то же самое. None — элемент не разобрать. Кэш: в direct4 десятки тысяч сетей,
+    а проверка правил идёт на каждом шаге демона."""
+    spans = []
+    for item in elements.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        first, sep, last = item.partition("-")
+        try:
+            if sep:
+                spans.append((int(ipaddress.ip_address(first.strip())),
+                              int(ipaddress.ip_address(last.strip()))))
+            else:
+                network = ipaddress.ip_network(item, strict=False)
+                spans.append((int(network.network_address), int(network.broadcast_address)))
+        except ValueError:
+            return None
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def set_problem(expected: str, actual: str, family: str) -> str:
+    """Наборы политики (POLICY_SETS) загруженной таблицы против текста правил: покрывают ли их
+    элементы то же самое. actual — с полными наборами (listing(sets=…) или полный вывод);
+    "" — покрывают."""
+    wrong = [
+        name for name in POLICY_SETS[family]
+        if has_set(expected, name) and (
+            intervals(_elements(expected, name)) is None
+            or intervals(_elements(expected, name)) != intervals(_elements(actual, name)))
+    ]
+    return "другие элементы в наборах: " + ", ".join(wrong) if wrong else ""
+
+
 # --- поколение правил ядра -------------------------------------------------------------
 
 NETLINK_NETFILTER = 12
@@ -1277,8 +1384,10 @@ def parse_chains(text: str) -> dict[str, bool]:
 
 def _has_rules(body: str) -> bool:
     """Есть ли в теле цепочки (вывод `nft list`) хоть одно правило, кроме строки hook."""
-    for line in body.splitlines():
-        line = line.strip()
-        if line and not line.startswith(("type ", "policy ", "comment ", "#")):
-            return True
-    return False
+    return any(_rule_line(line) for line in body.splitlines())
+
+
+def _rule_line(line: str) -> bool:
+    """Строка тела цепочки — правило, а не строка hook, policy или комментарий."""
+    line = line.strip()
+    return bool(line) and not line.startswith(("type ", "policy ", "comment ", "#"))

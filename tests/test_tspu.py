@@ -299,7 +299,7 @@ def test_probe_target_state_only_when_every_host_is_down(hosted, monkeypatch):
     alternate = probehosts.all_urls(hosted.cfg)[1]
     monkeypatch.setattr(
         target, "answers_via",
-        lambda cfg, members, password, url, user="": url == alternate,
+        lambda cfg, members, password, url, user="", cancel=None: url == alternate,
     )
     state = hosted.tick()
     assert state is not State.PROBE_TARGET_UNREACHABLE and state is not State.ALL_DEAD

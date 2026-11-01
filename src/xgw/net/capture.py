@@ -68,6 +68,9 @@ TPROXY6_TAG = "tproxy-in6"
 LAN_PROBE_TARGET = "1.1.1.1"
 TUN_TAG = "tun-in"
 CAPTURE_TAGS = (TPROXY_TAG, TPROXY6_TAG, TUN_TAG)
+# Сколько раз загружать таблицы, пока эталон (Capture._baseline) не снят без чужих правок
+# nftables между загрузкой и чтением (Docker, tailscaled правят свои таблицы).
+BASELINE_TRIES = 3
 
 
 def capture_inbounds(config: dict | None) -> list[str]:
@@ -134,6 +137,7 @@ class Capture:
         # него — только если тест передал generation сам.
         if generation is None and runner is cmd.run:
             generation = nft.generation
+        self._generation = generation  # и для эталона загруженных таблиц (_baseline)
         self.lister: cmd.Runner = (
             nft.Listings(runner, generation) if generation is not None else runner)
         self.log = logger or log.get_logger("net")
@@ -473,13 +477,10 @@ class Capture:
                 # Сначала маршрут для помеченных пакетов (интерфейс TUN уже подготовлен),
                 # потом правила, которые метят; ненужное убирается уже после них.
                 self._routes_up(rules)
-                with self._own_rules():
-                    warnings = nft.apply(rules, self.runner)
-                self._routes_down(rules)
-            else:
-                with self._own_rules():
-                    warnings = nft.apply(rules, self.runner)
-                self._routes_down(rules)
+            with self._own_rules():
+                warnings = nft.apply(rules, self.runner)
+                applied = self._gen()  # сразу после загрузки — для эталона (_baseline)
+            self._routes_down(rules)
             # Какой набор direct4 загружен (Ф6): loaded() сверяет отпечаток, а не тысячи сетей.
             digest = nft.direct_digest(rules.direct4, rules.direct_local) if rules.direct4 else None
             if self._state().get("direct4") != digest:
@@ -489,23 +490,90 @@ class Capture:
         for warning in warnings:
             self.log.warning("%s", warning)
         self.tidy()
-        # Отпечаток только что загруженных таблиц — для loaded(). Прочитать нельзя — отпечатка
-        # нет, и loaded() сверяет как раньше (по цепочкам), а не загружает правила по кругу.
-        self._save(tables=self._tables_digest())
+        # Эталон только что загруженных таблиц — для loaded(). Таблицы правил кто-то менял между
+        # загрузкой и чтением — загрузить ещё раз (BASELINE_TRIES); так и не вышло — эталона нет,
+        # и loaded() сверяет цепочки, наборы и текст правил, а не загружает правила по кругу.
+        for attempt in range(BASELINE_TRIES):
+            digest, mismatch, settled = self._baseline(rules, applied)
+            if settled or attempt == BASELINE_TRIES - 1:
+                break
+            try:
+                with self._own_rules():
+                    nft.apply(rules, self.runner)
+                    applied = self._gen()
+            except (cmd.CommandError, OSError) as exc:
+                raise CaptureError(str(exc)) from exc
+        if not settled:
+            self.log.warning("эталон правил не снят: таблицы nftables менялись во время загрузки")
+        if mismatch and mismatch != self._state().get("mismatch"):
+            self.log.error("правила загружены, но не сходятся с текстом правил: %s", mismatch)
+        self._save(baseline=digest, mismatch=mismatch or None, tables=None)
         return mode
 
-    def _tables_digest(self, text: str | None = None) -> str | None:
-        """Отпечаток таблиц `ip xgw` и `ip6 xgw6` (nft.tables_digest); text — уже прочитанный
-        краткий вывод `ip xgw`. None — прочитать нельзя."""
+    def _gen(self) -> int | None:
+        """Поколение правил nftables (nft.generation); None — узнать нечем или не удалось."""
+        return self._generation() if self._generation is not None else None
+
+    def _baseline(self, rules: nft.Rules, applied: int | None) -> tuple[str | None, str, bool]:
+        """Отпечаток только что загруженных таблиц — эталон для loaded() — и чем они расходятся
+        с текстом правил (кросс-аудит 4cc96b9, N01: прежде эталоном становилось то, что ядро
+        показало после загрузки, вместе с чужой правкой, успевшей между ними). Эталон — только
+        если поколение правил ядра сразу после своей загрузки, перед чтением и после него одно
+        и то же (иначе settled = False: таблицы менял кто-то ещё) и прочитанное сходится с
+        текстом правил. Поколения не узнать вовсе (подставной runner тестов, нет netlink) —
+        только второе. Возвращает (отпечаток или None, расхождение, settled)."""
+        usable = self.ipv6_usable()
+        before = self._gen()
+        text = nft.listing(self.lister, terse=True, sets=self._checked_sets())
+        text6 = nft.listing(self.lister, "ip6", nft.TABLE6, terse=True) if usable else ""
+        text6_full = nft.listing(self.lister, "ip6", nft.TABLE6) if usable else ""
+        after = self._gen()
+        if text is None or text6 is None or text6_full is None:
+            return None, "", True  # прочитать нельзя: сверять не с чем, повторять незачем
+        generations = {applied, before, after}
+        settled = generations == {None} or (len(generations) == 1)
+        mismatch = self._desired_problem(rules, text, text6_full if usable else None)
+        digest = self._tables_digest(text, text6) if settled and not mismatch else None
+        return digest, mismatch, settled
+
+    @staticmethod
+    def _checked_sets() -> tuple[str, ...]:
+        """Наборы `ip xgw`, чьи элементы нужны проверке: поштучные и наборы политики."""
+        return (*nft.CHECKED_SETS, *nft.POLICY_SETS["ip"])
+
+    def _desired_problem(self, rules: nft.Rules, text: str, text6: str | None) -> str:
+        """Чем загруженные таблицы расходятся с текстом правил (nft.render, render6): цепочки,
+        наборы и элементы наборов политики (кросс-аудит 4cc96b9, N01 и N02). text — `ip xgw`
+        с полными наборами (_checked_sets); text6 — полный вывод `ip6 xgw6`, None — IPv6 в ядре
+        нет. "" — сходятся."""
+        wanted = nft.render(rules)
+        problems = [
+            nft.manifest_problem(nft.manifest(wanted, "ip", nft.TABLE),
+                                 nft.manifest(text, "ip", nft.TABLE), f"ip {nft.TABLE}"),
+            nft.set_problem(wanted, text, "ip"),
+        ]
+        if text6 is not None:
+            wanted6 = nft.render6(rules)
+            problems += [
+                nft.manifest_problem(nft.manifest(wanted6, "ip6", nft.TABLE6),
+                                     nft.manifest(text6, "ip6", nft.TABLE6), f"ip6 {nft.TABLE6}"),
+                nft.set_problem(wanted6, text6, "ip6"),
+            ]
+        return "; ".join(problem for problem in problems if problem)
+
+    def _tables_digest(self, text: str | None = None, text6: str | None = None) -> str | None:
+        """Отпечаток таблиц `ip xgw` и `ip6 xgw6` (nft.tables_digest); text и text6 — уже
+        прочитанные краткие выводы. None — прочитать нельзя."""
         if text is None:
             text = nft.listing(self.lister, terse=True)
             if text is None:
                 return None
-        text6 = ""
-        if self.ipv6_usable():
-            text6 = nft.listing(self.lister, "ip6", nft.TABLE6, terse=True)
-            if text6 is None:
-                return None
+        if text6 is None:
+            text6 = ""
+            if self.ipv6_usable():
+                text6 = nft.listing(self.lister, "ip6", nft.TABLE6, terse=True)
+                if text6 is None:
+                    return None
         return nft.tables_digest(
             nft.structure(text, "ip", nft.TABLE), nft.structure(text6, "ip6", nft.TABLE6))
 
@@ -736,7 +804,7 @@ class Capture:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
         rules = self.rules(self.effective_mode())
-        text = nft.listing(self.lister, terse=True, sets=nft.CHECKED_SETS)
+        text = nft.listing(self.lister, terse=True, sets=self._checked_sets())
         if text is None:
             return None
         listed = nft.parse_chains(text)
@@ -747,7 +815,16 @@ class Capture:
         guard = self._v6_guard_loaded(rules)
         if guard is not True:
             return guard
-        loaded_digest = self._state().get("tables")
+        text6 = nft.listing(self.lister, "ip6", nft.TABLE6) if self.ipv6_usable() else None
+        if self.ipv6_usable() and text6 is None:
+            return None
+        state = self._state()
+        problem = self._desired_problem(rules, text, text6)
+        # Расхождение, которое было и сразу после своей загрузки (_load: «не сходятся с текстом
+        # правил»), — не повод загружать правила по кругу: о нём журнал и `xgw diag`.
+        if problem and problem != state.get("mismatch"):
+            return False  # цепочку, набор или элементы набора политики меняли (N01, N02)
+        loaded_digest = state.get("baseline")
         if loaded_digest is not None:
             current = self._tables_digest(text)
             if current is None:
@@ -761,7 +838,7 @@ class Capture:
         if not rules.blocked and nft.quic_loaded(text) != rules.quic:
             return False  # network.block_quic переключили
         if nft.has_set(text, nft.DIRECT_SET) != bool(rules.direct4) or (
-                rules.direct4 and self._state().get("direct4")
+                rules.direct4 and state.get("direct4")
                 != nft.direct_digest(rules.direct4, rules.direct_local)):
             return False  # разгрузку переключили, сменились geoip.dat или direct_ips
         if nft.has_set(text, nft.DIRECT_LAN_SET) != bool(rules.direct_lan) or (
@@ -951,6 +1028,11 @@ class Capture:
             if problem and self.loaded(tun=False) is True:
                 tun_only = problem
         missing = (self.inbound_problem() or self.held) if self.mode() == "on" else ""
+        cap = self.cfg.capture
+        early = sorted({
+            pref for family in self._families()
+            for pref in iprule.early(self.runner, family, (cap.route_table, cap.tun_route_table))
+        }) if check and self.mode() == "on" else []
         return {
             "mode": self.mode(),
             "lan_if": rules.lan_if,
@@ -976,4 +1058,9 @@ class Capture:
             "inbound_missing": missing,
             # При этом трафик закрыт (hold = "block"), а не идёт напрямую.
             "blocked": bool(missing) and self.hold_mode() == "blocked",
+            # Чем таблицы расходились с текстом правил сразу после своей загрузки (_load):
+            # эталона тогда нет, а loaded() это расхождение терпит. Пусто — сходились.
+            "mismatch": str(self._state().get("mismatch") or ""),
+            # Чужие правила ip rule раньше правил XGW (iprule.early): их приоритеты.
+            "early_rules": early,
         }

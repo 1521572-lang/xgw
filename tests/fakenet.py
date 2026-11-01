@@ -127,6 +127,25 @@ class FakeKernel:
             return json.dumps(routes)
         verb, body = body[0], body[1:]
         metric = int(body[body.index("metric") + 1]) if "metric" in body else 0
+        kinds = ("unicast", "unreachable", "prohibit", "blackhole", "local")
+        kind = body[0] if body[0] in kinds else None
+        dst = body[1] if kind else body[0]
+        if verb == "del" and body[0] != "throw" and (
+                kind in ("unicast", "unreachable", "prohibit")
+                or dst not in ("default", "0.0.0.0/0", "::/0")):
+            # Лишний маршрут, который в таблицу положил «кто-то» (тест): ищется по типу,
+            # приемнику и тому, что указано (via, dev, metric).
+            rest = body[1:] if kind else body  # rest[0] — приемник
+            words = dict(zip(rest[1::2], rest[2::2], strict=False))
+            for route in routes:
+                if ((route.get("type") or "unicast") == (kind or "unicast")
+                        and route.get("dst") == dst
+                        and all(str(route.get(key)) == words[word] for word, key in (
+                            ("via", "gateway"), ("dev", "dev"), ("metric", "metric"))
+                            if word in words)):
+                    routes.remove(route)
+                    return ""
+            raise CommandError(f"{command}: RTNETLINK answers: No such process")
         if body[0] == "throw":
             route = {"type": "throw", "dst": body[1]}
             if verb == "del":

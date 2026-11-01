@@ -901,3 +901,81 @@ def test_generation_reply_cut_or_not_ours_is_none():
     assert nft.parse_generation(reply) == 42
     assert nft.parse_generation(reply, seq=7) == 42
     assert nft.parse_generation(reply, seq=1) is None
+
+
+# --- эталон таблиц (кросс-аудит 4cc96b9, N01 и N02) ---------------------------------------
+
+LOADED = """table ip xgw
+delete table ip xgw
+table ip xgw {
+    set reserved4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/8, 192.168.0.0/16 }
+    }
+    set bypass4 {
+        type ipv4_addr
+        flags interval
+    }
+    chain output {
+        type route hook output priority mangle; policy accept;
+        ip daddr @reserved4 return
+        meta mark set 0x1 accept
+    }
+}
+"""
+# Та же таблица так, как её печатает nft: табуляция, счётчики, соседние сети и диапазон.
+LISTED = """table ip xgw {
+\tset reserved4 {
+\t\ttype ipv4_addr
+\t\tflags interval
+\t\telements = { 10.0.0.0/9, 10.128.0.0/9,
+\t\t\t     192.168.0.0-192.168.255.255 }
+\t}
+\tset bypass4 {
+\t\ttype ipv4_addr
+\t\tflags interval
+\t}
+\tchain output {
+\t\ttype route hook output priority mangle; policy accept;
+\t\tip daddr @reserved4 return
+\t\tmeta mark set 0x00000001 counter packets 3 bytes 180 accept
+\t}
+}
+"""
+
+
+def test_manifest_of_the_rules_text_matches_what_nft_prints():
+    """Эталон — из текста загрузки, а не из того, что ядро показало после неё (N01): цепочки
+    (тип, hook, policy, число правил) и наборы сравниваются с выводом nft, а элементы наборов
+    политики — как адреса, которые они покрывают, а не строками (N02)."""
+    expected = nft.manifest(LOADED, "ip", nft.TABLE)
+    assert expected == nft.manifest(LISTED, "ip", nft.TABLE) == {
+        "chain output": ("route", "output", "accept", 2),
+        "set reserved4": ("ipv4_addr", "interval"), "set bypass4": ("ipv4_addr", "interval"),
+    }
+    assert nft.manifest_problem(expected, nft.manifest(LISTED, "ip", nft.TABLE), "ip xgw") == ""
+    assert nft.set_problem(LOADED, LISTED, "ip") == ""
+    assert nft.manifest("", "ip", nft.TABLE) is None
+
+
+def test_changed_chains_sets_and_policy_elements_are_named():
+    expected = nft.manifest(LOADED, "ip", nft.TABLE)
+    one_rule_less = LISTED.replace("\t\tip daddr @reserved4 return\n", "")
+    assert nft.manifest_problem(expected, nft.manifest(one_rule_less, "ip", nft.TABLE),
+                                "ip xgw") == (
+        "таблица ip xgw: chain output: ('route', 'output', 'accept', 1) вместо "
+        "('route', 'output', 'accept', 2)")
+    no_set = LISTED.replace("\tset bypass4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n", "")
+    assert "нет set bypass4" in nft.manifest_problem(
+        expected, nft.manifest(no_set, "ip", nft.TABLE), "ip xgw")
+    assert nft.manifest_problem(expected, None, "ip xgw") == "нет таблицы ip xgw"
+    assert nft.manifest_problem(None, expected, "ip xgw") == "таблица ip xgw есть, хотя не нужна"
+    # Устройство bypass_hosts на весь интернет — мимо Xray ушло бы всё: элементы не те.
+    wide = LISTED.replace("\t\tflags interval\n\t}\n\tchain",
+                          "\t\tflags interval\n\t\telements = { 0.0.0.0/1 }\n\t}\n\tchain")
+    assert nft.manifest_problem(expected, nft.manifest(wide, "ip", nft.TABLE), "ip xgw") == ""
+    assert nft.set_problem(LOADED, wide, "ip") == "другие элементы в наборах: bypass4"
+    assert nft.set_problem(LOADED, LISTED.replace("10.128.0.0/9", "10.128.0.0/10"), "ip") == (
+        "другие элементы в наборах: reserved4")
+    assert nft.intervals("10.0.0.0/8, мусор") is None

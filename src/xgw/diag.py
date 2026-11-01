@@ -932,6 +932,22 @@ class Diag:
                 ))
             elif info["mode"] == "on":
                 result.append(Check("Перехват", OK, "включён, правила загружены"))
+            # Кросс-аудит 4cc96b9, N01–N03: таблицы не сошлись с текстом правил сразу после
+            # загрузки, чужие правила маршрутизации раньше правил XGW.
+            if info.get("mismatch"):
+                result.append(Check(
+                    "Эталон правил", WARN,
+                    f"загруженные таблицы не сходятся с текстом правил: {info['mismatch']}",
+                    "sudo xgw net up; не помогло — sudo xgw logs --export и отчёт",
+                ))
+            if info.get("early_rules"):
+                prefs = ", ".join(str(pref) for pref in info["early_rules"])
+                result.append(Check(
+                    "Маршрутизация", WARN,
+                    f"чужие правила ip rule раньше правил XGW (pref {prefs}): помеченный трафик "
+                    "может уйти мимо VPN",
+                    "ip rule show — чьи это правила; XGW чужие не трогает",
+                ))
         return result
 
     def _journal(self) -> list[Check]:
