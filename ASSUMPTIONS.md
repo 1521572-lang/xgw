@@ -5222,3 +5222,21 @@ Happ»), затем дополнен редактированием списка
      может оборваться, результат частичный. Нужен новый real guarded run, не повторный G1.
      В этой итерации продуктовый src/packaging/config не изменены относительно573b233;
      keeper restore/window/launch прежние, никаких дополнительных netns/широких VM suites.
+294. **wave3hbc24353: второй plain успех, неизвестности требуют точной классификации.**
+     Enable8.533с0, plain200/32769/0.466с, marked200/32769/0.292с, rollback25.161с/
+     restore0.161с/nft0/WAN6/6True. Loadednull/child_deadline8с наphase loaded; mode/inbound/
+     LISTEN/lookup получены. Guard query=deadline_or_error. Старый catch объединял таймаут,
+     OSError и ошибки JSON/schema: вывод отчёта «запрос точно не завершился за0.8с» сильнее
+     данных. Не считать это доказанной задержкой nft; нужен класс ошибки/rc/elapsed.
+     Wave3i меняет только helpers: independent guard worker параллельно loaded8с иHTTPS4с,
+     JSON numeric query3с, приon только при неуспехе один native numeric fallback3с. Это
+     разные представления read-only данных, не повтор enable/fault и не продление safety25с.
+     Сохраняются отдельные timeout/nonzero/parse-schema/error_class/elapsed/bytecount, native
+     hook/drop/reject summary; raw stdout/stderr остаются root0600 внеGit. On/off guard.json
+     являются отдельными артефактами; guard не тратит бюджет loaded child.
+     Локальная instrumentation Capture instance сохраняет до48 timed call records иactive
+     stack для generation/runner/методов. Возвращаемые значения/исключения прежние, argv и
+     тексты ошибок не публикуются. Неожиданный writer отвергается, readonly_violation=true.
+     Замеры включают overhead checkpoint и не являются benchmark. Приtruncated нельзя
+     объявлять отсутствие дальнейших вызовов. Guardian25с/restore/launch ипродукт573b233
+     неизменны.34 узких sampler теста PASS(9новых); realwave3iNOT_RUN, полнаяwave3 открыта.

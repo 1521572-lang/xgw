@@ -8,6 +8,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -151,12 +152,13 @@ def baseline(directory):
     guard.save(directory / "baseline.json", base)
     diagnostic = loaded(directory)
     guard.save(directory / "off-diagnostic.json", diagnostic)
+    off_guard = guard_query(directory, "off")
     base.update(ready=chosen is not None and diagnostic_ready(diagnostic),
                 diagnostic_gate=diagnostic_ready(diagnostic))
     guard.save(directory / "baseline.json", base)
     print(json.dumps({"ready_for_enable": base["ready"],
                       "baseline_healthy": healthy, "baseline": results,
-                      "off_diagnostic": diagnostic}))
+                      "off_diagnostic": diagnostic, "off_guard": off_guard}))
 
 
 def permit(directory):
@@ -191,6 +193,7 @@ def diagnostic_ready(value):
             or value.get("effective_mode") != "off" or value.get("configured_local") is not True
             or value.get("inbound_problem_present") is not False or value.get("loaded") is False
             or value.get("mismatch_present") is not False
+            or value.get("read_trace", {}).get("readonly_violation") is True
             or value.get("loaded_reason") not in ("measured", "capture_unknown",
                                                   "child_deadline", "child_error")
             or not any("route_type" in item for item in value.get("routes", {}).values())
@@ -264,11 +267,182 @@ def guard_layout(items):
     return result
 
 
+def native_guard_layout(text):
+    """Native nft pretty-print fallback, exact chain indent and numeric priority (-y)."""
+    result = {"query": "ok", "host_hook": None, "host_priority": None,
+              "forward_hook": None, "host_drop_rules": 0, "host_reject_rules": 0}
+    active = None
+    for line in text.splitlines():
+        header = re.fullmatch(r'(\s*)chain (output|forward) \{', line)
+        if header:
+            active = (header[1], header[2])
+            continue
+        if active is None:
+            continue
+        indent, chain = active
+        if line == indent + "}":
+            active = None
+            continue
+        hook = re.search(r'\btype filter hook (\w+) priority (-?\d+);', line)
+        if hook:
+            if chain == "output":
+                result["host_hook"] = hook[1] if hook[1] in ("output", "postrouting") else "other"
+                result["host_priority"] = int(hook[2])
+            else:
+                result["forward_hook"] = "forward" if hook[1] == "forward" else "other"
+        elif chain == "output" and not line.strip().startswith(("#", "comment ", "policy ")):
+            result["host_drop_rules"] += bool(re.search(r'\bdrop\s*$', line))
+            result["host_reject_rules"] += bool(re.search(r'\breject(?: with [\w -]+)?\s*$', line))
+    return result
+
+
+def complete_layout(value):
+    return (value.get("host_hook") is not None and type(value.get("host_priority")) is int
+            and value.get("forward_hook") is not None)
+
+
+def guard_query(directory, context):
+    """Independent reader. Distinguish command timeout, rc, JSON, schema, native fallback."""
+    if context not in ("off", "on"):
+        raise ValueError("guard context")
+    snapshot = read_json(directory / "snapshot.json")
+
+    def capture_enabled():
+        try:
+            enabled = read_json(Path(snapshot["capture_state"])).get("enabled")
+            return enabled if type(enabled) is bool else None
+        except (OSError, ValueError):
+            return None
+
+    value = {"context": context, "query": "unconfirmed", "attempts": [],
+             "capture_enabled_before": capture_enabled()}
+    for encoding in (("json", "text") if context == "on" else ("json",)):
+        attempt = {"encoding": encoding, "budget_seconds": 3}
+        began = time.monotonic()
+        argv = ["nft", "-n", "-y", *(["-j"] if encoding == "json" else []),
+                "list", "table", "inet", "xgw_guard"]
+        stdout, stderr = b"", b""
+        layout = None
+        try:
+            check = subprocess.run(argv, capture_output=True, timeout=3, check=False)
+            stdout, stderr = check.stdout, check.stderr
+            attempt.update(rc=check.returncode, state="nonzero")
+            if check.returncode == 0:
+                attempt["state"] = "parse"
+                if encoding == "json":
+                    decoded = json.loads(stdout)
+                    items = decoded["nftables"]
+                    if (not isinstance(items, list)
+                            or not all(isinstance(item, dict) for item in items)):
+                        raise TypeError("nftables shape")
+                    layout = guard_layout(items)
+                else:
+                    layout = native_guard_layout(stdout.decode("utf-8"))
+                attempt["state"] = "ok" if complete_layout(layout) else "schema_error"
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.output or b"", exc.stderr or b""
+            attempt.update(state="timeout", rc=None)
+        except OSError as exc:
+            attempt.update(state="spawn_error", error_class=type(exc).__name__, rc=None)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            attempt.update(state="parse_or_schema_error", error_class=type(exc).__name__)
+        guard.atomic(directory / f"{context}-guard-{encoding}.stdout", stdout)
+        guard.atomic(directory / f"{context}-guard-{encoding}.stderr", stderr)
+        attempt.update(seconds=round(time.monotonic() - began, 3),
+                       stdout_bytes=len(stdout), stderr_bytes=len(stderr))
+        value["attempts"].append(attempt)
+        if attempt["state"] == "ok":
+            value.update(layout)
+            value["source"] = encoding
+            break
+    value["capture_enabled_after"] = capture_enabled()
+    guard.save(directory / f"{context}-guard.json", value)
+    return value
+
+
+def read_command_label(argv):
+    words = list(argv)
+    if not words or any(any(char in word for char in ";\n\r") for word in words):
+        return None
+    options = {"-4", "-6", "-j", "-t", "-n", "-y", "-s", "-o", "-d"}
+    rest = [word for word in words[1:] if word not in options]
+    if words[0] == "nft" and rest[:1] == ["list"]:
+        if rest[1:4] in (["table", "ip", "xgw"], ["table", "ip6", "xgw6"],
+                          ["table", "inet", "xgw_guard"]):
+            return "nft_list_" + "_".join(rest[1:4])
+        return "nft_list"
+    if (words[0] == "ip" and len(rest) >= 2 and rest[0] in ("rule", "route", "addr", "link")
+            and rest[1] in ("show", "get")):
+        return "ip_" + rest[0] + "_read"
+    return None
+
+
+def trace_capture(capture, path, value):
+    """Observe unchanged return/exception semantics; refuse an unexpected writer in this reader."""
+    trace = {"calls": [], "active": [], "truncated": False}
+    value["read_trace"] = trace
+    origin = time.monotonic()
+    sequence = 0
+
+    def wrap(label, function):
+        def observed(*args, **kwargs):
+            nonlocal sequence
+            sequence += 1
+            if len(trace["calls"]) >= 48:
+                if not trace["truncated"]:
+                    trace["truncated"] = True
+                    guard.save(path, value)
+                return function(*args, **kwargs)
+            record = {"id": sequence, "label": label, "state": "running",
+                      "begin_seconds": round(time.monotonic() - origin, 3)}
+            trace["calls"].append(record)
+            trace["active"].append({"id": sequence, "label": label})
+            guard.save(path, value)
+            began = time.monotonic()
+            try:
+                result = function(*args, **kwargs)
+                record["state"] = "returned"
+                return result
+            except Exception as exc:
+                record.update(state="exception", error_class=type(exc).__name__)
+                raise
+            finally:
+                record["seconds"] = round(time.monotonic() - began, 3)
+                trace["active"].pop()
+                guard.save(path, value)
+        return observed
+
+    if hasattr(capture, "runner"):
+        original = capture.runner
+
+        def reader(argv, **kwargs):
+            label = read_command_label(argv)
+            if label is None:
+                trace["readonly_violation"] = True
+                guard.save(path, value)
+                raise RuntimeError("readonly diagnostic refused unexpected command")
+            return wrap(label, original)(argv, **kwargs)
+
+        capture.runner = reader
+        if hasattr(capture.lister, "runner"):
+            capture.lister.runner = reader
+    if getattr(capture, "_generation", None) is not None:
+        generation = wrap("nft_generation", capture._generation)
+        capture._generation = generation
+        if hasattr(capture.lister, "generation"):
+            capture.lister.generation = generation
+    for name in ("rules", "effective_mode", "inbound_problem", "guard_loaded",
+                 "_v6_guard_loaded", "_desired_problem", "_tables_digest", "_ts_loaded",
+                 "_tun_problem"):
+        if hasattr(capture, name):
+            setattr(capture, name, wrap("method_" + name, getattr(capture, name)))
+
+
 def kernel(directory, context):
-    """Фактический guard читать ДО импорта/сборки installed capture policy."""
+    """Installed capture read with explicit progress; guard query is independent."""
     path = directory / "kernel-diagnostic.json"
     value = {"schema": 1, "context": context, "loaded": None, "loaded_reason": "pending",
-             "phase": "guard_query", "routes": {}}
+             "phase": "capture_state", "routes": {}}
     guard.save(path, value)
     snapshot = read_json(directory / "snapshot.json")
     try:
@@ -277,14 +451,6 @@ def kernel(directory, context):
         value["capture_enabled_now"] = enabled if type(enabled) is bool else None
     except (OSError, ValueError):
         value["capture_enabled_now"] = None
-    try:
-        check = subprocess.run(["nft", "-j", "list", "table", "inet", "xgw_guard"],
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               timeout=0.8, check=False)
-        value["guard_layout"] = (guard_layout(json.loads(check.stdout)["nftables"])
-                                 if check.returncode == 0 else {"query": "not_confirmed"})
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        value["guard_layout"] = {"query": "deadline_or_error"}
     value["phase"] = "capture_import"
     guard.save(path, value)
     sys.path.insert(0, "/opt/xgw/lib")
@@ -299,6 +465,7 @@ def kernel(directory, context):
     value["phase"] = "capture_create"
     guard.save(path, value)
     capture = capture_for(cfg, paths)
+    trace_capture(capture, path, value)
     mode = capture.mode()
     state = capture._state()
     value.update(
@@ -419,8 +586,9 @@ def run(directory):
         return 2
     # Три независимых read-only задачи; сохранять каждый готовый результат немедленно.
     # Вся группа — внутри JOB cgroup, поэтому rollback прекращает и оставшиеся дочерние.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         tasks = {pool.submit(loaded, directory, "on"): "loaded"}
+        tasks[pool.submit(guard_query, directory, "on")] = "guard"
         tasks.update({pool.submit(probe, directory, base["target"], marked): "https"
                       for marked in (False, True)})
         for future in as_completed(tasks):
@@ -451,7 +619,8 @@ def main():
         kernel(directory, sys.argv[3])
     elif mode == "report":
         for name in ("baseline.json", "off-diagnostic.json", "enable-result.json",
-                     "on-observations.json", "kernel-diagnostic.json"):
+                     "on-observations.json", "kernel-diagnostic.json",
+                     "off-guard.json", "on-guard.json"):
             if (directory / name).exists():
                 print(json.dumps({name: read_json(directory / name)}))
     else:

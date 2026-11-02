@@ -117,7 +117,8 @@ def test_only_listen_state_at_exact_tproxy_port_is_listener(tmp_path, state, exp
 
 
 @pytest.mark.parametrize("failure", ["no_listener", "missing_inbound", "local_disabled",
-                                     "mismatch", "no_routes", "invalid_result"])
+                                     "mismatch", "no_routes", "invalid_result",
+                                     "readonly_violation"])
 def test_off_diagnostic_prevents_ready_before_known_bad_enable(failure):
     tool = sampler()
     value = {"schema": 1, "requested_mode": "off", "effective_mode": "off",
@@ -137,6 +138,8 @@ def test_off_diagnostic_prevents_ready_before_known_bad_enable(failure):
         value["mismatch_present"] = True
     elif failure == "no_routes":
         value["routes"] = {}
+    elif failure == "readonly_violation":
+        value["read_trace"] = {"readonly_violation": True}
     else:
         value["loaded_reason"] = "invalid_result"
     assert tool.diagnostic_ready(value) is False
@@ -209,22 +212,103 @@ def test_guard_and_routes_saved_before_slow_inbound_policy_build(tmp_path, monke
     def command(argv, **kwargs):
         if argv[0] == "nft":
             value = {"nftables": [{"chain": {"table": "xgw_guard", "name": "output",
-                                            "hook": "postrouting", "prio": 10}}]}
+                                            "hook": "postrouting", "prio": 10}},
+                                  {"chain": {"table": "xgw_guard", "name": "forward",
+                                             "hook": "forward"}}]}
         else:
             value = [{"type": "local", "dev": "lo", "table": 100}]
-        return SimpleNamespace(returncode=0, stdout=tool.json.dumps(value))
+        return SimpleNamespace(returncode=0, stdout=tool.json.dumps(value).encode(), stderr=b"")
 
     monkeypatch.setattr(tool.subprocess, "run", command)
     monkeypatch.setattr(config, "load", lambda path: (cfg, []))
     monkeypatch.setattr(capture, "capture_for", lambda *args: SlowCapture())
     monkeypatch.setattr(Paths, "from_env", lambda: SimpleNamespace(config_file=tmp_path / "cfg"))
     monkeypatch.setattr(tool, "listener_summary", lambda port: {"ipv4_loopback": True})
+    layout = tool.guard_query(tmp_path, "on")
+    assert layout["host_hook"] == "postrouting"
     with pytest.raises(RuntimeError, match="slow_inbound"):
         tool.kernel(tmp_path, "on")
     checkpoint = tool.read_json(tmp_path / "kernel-diagnostic.json")
-    assert checkpoint["guard_layout"]["host_hook"] == "postrouting"
+    assert tool.read_json(tmp_path / "on-guard.json")["host_hook"] == "postrouting"
     assert checkpoint["capture_enabled_now"] is True
     assert checkpoint["listener"]["ipv4_loopback"] is True
     assert set(checkpoint["routes"]) == {"unmarked", "proxy", "bypass"}
     assert checkpoint["phase"] == "inbound_check"
     assert checkpoint["loaded"] is None
+
+
+NATIVE_GUARD = '''table inet xgw_guard {
+    chain output {
+        type filter hook postrouting priority 10; policy accept;
+        meta iif != 0 return
+        counter packets 0 bytes 0 drop
+    }
+    chain forward {
+        type filter hook forward priority 10; policy accept;
+        return
+    }
+}
+'''
+
+
+def test_native_fallback_reports_only_guard_metadata():
+    tool = sampler()
+    assert tool.native_guard_layout(NATIVE_GUARD) == {
+        "query": "ok", "host_hook": "postrouting", "host_priority": 10,
+        "forward_hook": "forward", "host_drop_rules": 1, "host_reject_rules": 0}
+
+
+@pytest.mark.parametrize("failure,expected", [("timeout", "timeout"), ("rc", "nonzero"),
+                                             ("json", "parse_or_schema_error"),
+                                             ("schema", "parse_or_schema_error")])
+def test_guard_query_distinguishes_failure_and_uses_readonly_native_fallback(
+        tmp_path, monkeypatch, failure, expected):
+    tool = sampler()
+    state = tmp_path / "capture.json"
+    tool.guard.save(state, {"enabled": True})
+    tool.guard.save(tmp_path / "snapshot.json", {"capture_state": str(state)})
+
+    def command(argv, **kwargs):
+        assert kwargs["timeout"] == 3
+        assert "list" in argv and "-n" in argv and "-y" in argv
+        if "-j" in argv:
+            if failure == "timeout":
+                raise tool.subprocess.TimeoutExpired(argv, 3)
+            return SimpleNamespace(returncode=1 if failure == "rc" else 0,
+                                   stdout=b"bad json" if failure == "json" else b'[]', stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=NATIVE_GUARD.encode(), stderr=b"")
+
+    monkeypatch.setattr(tool.subprocess, "run", command)
+    result = tool.guard_query(tmp_path, "on")
+    assert result["attempts"][0]["state"] == expected
+    assert result["attempts"][1]["state"] == "ok"
+    assert result["source"] == "text"
+    assert result["capture_enabled_before"] is True
+    assert result["host_hook"] == "postrouting"
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["ip", "-d", "-j", "link", "show", "dev", "private"], "ip_link_read"),
+    (["nft", "list", "table", "inet", "xgw_guard; flush ruleset"], None),
+])
+def test_read_trace_refuses_writers_without_logging_interface_names(argv, expected):
+    assert sampler().read_command_label(argv) == expected
+
+
+def test_method_trace_preserves_exception_and_records_active_boundary(tmp_path):
+    tool = sampler()
+
+    class Capture:
+        def rules(self):
+            raise ValueError("private details")
+
+    value = {}
+    capture = Capture()
+    tool.trace_capture(capture, tmp_path / "trace.json", value)
+    with pytest.raises(ValueError, match="private details"):
+        capture.rules()
+    saved = tool.read_json(tmp_path / "trace.json")
+    assert saved["read_trace"]["active"] == []
+    record = saved["read_trace"]["calls"][0]
+    assert record["state"] == "exception" and record["error_class"] == "ValueError"
+    assert "private details" not in tool.json.dumps(saved)
