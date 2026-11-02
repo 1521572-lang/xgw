@@ -1326,6 +1326,25 @@ def _elements(text: str, name: str) -> str:
     return found.group(1) if found else ""
 
 
+_IPV4_HOST_MASKS = {str(prefix): (1 << (32 - prefix)) - 1 for prefix in range(33)}
+
+
+def _network_span(item: str) -> tuple[int, int]:
+    """Canonical IPv4 prefix/host without per-element Network/cached-property objects.
+
+    IPv4Address still validates the address. Other masks and IPv6 retain the
+    standard-library parser and its accepted/rejected input forms.
+    """
+    address, slash, prefix = item.partition("/")
+    if ":" not in address and (not slash or prefix in _IPV4_HOST_MASKS):
+        value = int(ipaddress.IPv4Address(address))
+        host_mask = _IPV4_HOST_MASKS[prefix] if slash else 0
+        start = value & ~host_mask
+        return start, start | host_mask
+    network = ipaddress.ip_network(item, strict=False)
+    return int(network.network_address), int(network.broadcast_address)
+
+
 @functools.lru_cache(maxsize=8)
 def intervals(elements: str) -> tuple[tuple[int, int], ...] | None:
     """Элементы набора адресов (текст между фигурными скобками) как объединение интервалов:
@@ -1343,8 +1362,7 @@ def intervals(elements: str) -> tuple[tuple[int, int], ...] | None:
                 spans.append((int(ipaddress.ip_address(first.strip())),
                               int(ipaddress.ip_address(last.strip()))))
             else:
-                network = ipaddress.ip_network(item, strict=False)
-                spans.append((int(network.network_address), int(network.broadcast_address)))
+                spans.append(_network_span(item))
         except ValueError:
             return None
     merged: list[tuple[int, int]] = []
@@ -1360,12 +1378,13 @@ def set_problem(expected: str, actual: str, family: str) -> str:
     """Наборы политики (POLICY_SETS) загруженной таблицы против текста правил: покрывают ли их
     элементы то же самое. actual — с полными наборами (listing(sets=…) или полный вывод);
     "" — покрывают."""
-    wrong = [
-        name for name in POLICY_SETS[family]
-        if has_set(expected, name) and (
-            intervals(_elements(expected, name)) is None
-            or intervals(_elements(expected, name)) != intervals(_elements(actual, name)))
-    ]
+    wrong = []
+    for name in POLICY_SETS[family]:
+        if not has_set(expected, name):
+            continue
+        wanted = intervals(_elements(expected, name))
+        if wanted is None or wanted != intervals(_elements(actual, name)):
+            wrong.append(name)
     return "другие элементы в наборах: " + ", ".join(wrong) if wrong else ""
 
 

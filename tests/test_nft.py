@@ -1,6 +1,7 @@
 """Правила nftables: генерация текста и проверка `nft -c -f` (без root — пропуск)."""
 
 import dataclasses
+import ipaddress
 import os
 import shutil
 import subprocess
@@ -984,6 +985,36 @@ def test_changed_chains_sets_and_policy_elements_are_named():
     assert nft.set_problem(LOADED, LISTED.replace("10.128.0.0/9", "10.128.0.0/10"), "ip") == (
         "другие элементы в наборах: reserved4")
     assert nft.intervals("10.0.0.0/8, мусор") is None
+
+
+def test_interval_fast_path_matches_all_ipv4_prefixes_with_host_bits():
+    for address in ("0.0.0.0", "10.20.30.40", "203.0.113.5", "255.255.255.255"):
+        for prefix in range(33):
+            item = f"{address}/{prefix}"
+            network = ipaddress.ip_network(item, strict=False)
+            expected = ((int(network.network_address), int(network.broadcast_address)),)
+            assert nft.intervals(item) == expected
+
+
+@pytest.mark.parametrize("item", ["192.0.2.1", "192.0.2.1/024", "192.0.2.1/255.255.255.0",
+                                  "192.0.2.1/0.0.0.255", "2001:db8::1/64", "::1"])
+def test_interval_noncanonical_and_ipv6_forms_keep_stdlib_semantics(item):
+    network = ipaddress.ip_network(item, strict=False)
+    assert nft.intervals(item) == ((int(network.network_address), int(network.broadcast_address)),)
+
+
+@pytest.mark.parametrize("item", ["192.0.2.1/33", "01.2.3.4/24", "192.0.2.1/-1",
+                                  "192.0.2.1/", "bad", "2001:db8::1/129"])
+def test_interval_malformed_input_remains_unverifiable(item):
+    assert nft.intervals(item) is None
+
+
+def test_interval_equivalent_cidr_host_range_and_changed_large_set():
+    expected = "set direct4 {\n type ipv4_addr\n flags interval\n elements = { 192.0.2.0/24 }\n}\n"
+    same = expected.replace("192.0.2.0/24", "192.0.2.0-192.0.2.255")
+    changed = expected.replace("192.0.2.0/24", "192.0.2.0-192.0.2.254")
+    assert nft.set_problem(expected, same, "ip") == ""
+    assert nft.set_problem(expected, changed, "ip") == "другие элементы в наборах: direct4"
 
 
 def test_guard_never_approves_flows_and_only_scopes_managed_ingress():

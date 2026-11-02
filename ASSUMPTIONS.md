@@ -5240,3 +5240,21 @@ Happ»), затем дополнен редактированием списка
      Замеры включают overhead checkpoint и не являются benchmark. Приtruncated нельзя
      объявлять отсутствие дальнейших вызовов. Guardian25с/restore/launch ипродукт573b233
      неизменны.34 узких sampler теста PASS(9новых); realwave3iNOT_RUN, полнаяwave3 открыта.
+295. **wave3ib32669a: короткий host-кейс принят, задержка на desired policy.** Actual guard
+     JSON0.064с: postrouting10/forward/drop5/reject0, capturebefore/aftertrue; plainтретий
+     успех200/32769/0.428с, marked200/32769/0.436с; enable8.524с0, restore25.126с/0.126с,
+     nft0/WAN6/6True. Loadednull/child8сdeadline: active method__desired_problem сtrace5.626с.
+     Это граница незавершённости, не длительность метода/зависание. Историческая h-причина
+     deadline_or_error по новому быстрому запросу не устанавливается задним числом; вывод
+     отчётаi «причина была в конкуренции» остаётся гипотезой. Полная wave3/D1/D2/E4 ещё открыта.
+     PurePython профиль конкретного метода на синтетических4096/20000disjointIPv4, CIDR vs
+     host spelling, без kernel/packet команд: cold0.1555/0.8168с до,0.0837/0.3869с после.
+     CProfile основная стоимость — intervals/ipaddress.Network. Это одна фикстура подWSL,
+     не время ThinkCentre и не гарантия уложиться в8с. Продуктовый wave3j меняет только
+     _network_span/intervals/set_problem: canonical IPv4 host/prefix вычисляется после строгого
+     IPv4Address; unusual masks/IPv6 оставлены stdlib. Host bits маскируются какstrict=False;
+     invalid→None, cache8/merge/все comparisons сохранены, _elements(expected) не повторяется.
+     Render/guard/RPDB/WAN/sysctl/Tailscale не меняются.17 узких parser/manifest проверок PASS,
+     включая132prefix/address assertions и equivalent/changed policy. Safety25с прежнее.
+     Реальный j требует одной атомарной замены nft.py приoff/остановленных писателях с SHA/
+     backup/dry nft-c; НЕ fullinstaller/G1старойверсии. Realwave3jNOT_RUN, следующийотчёт нужен.
