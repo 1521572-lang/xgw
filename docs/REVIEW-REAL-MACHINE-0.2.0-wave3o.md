@@ -61,6 +61,8 @@ mapping/config — BLOCKED без запросов и без реконстру�
 
 Локально только15узких mocked/fixture проверок нового сборщика, Ruff и статическая
 проверка ТЗ. Нет широких VM/netns/реальных запросов. Runtimepatch пока не обоснован.
-Реальная **wave3p NOT_RUN**; ожидается TEST-REPORT-REAL-MACHINE-0.2.0-wave3p-ДАТА.md.
+Обновление02.11: отчёт P08cdf113dd0a020321199dda86166a9bde6dae5a получен:
+STOP до запроса/request0. [Разбор P](REVIEW-REAL-MACHINE-0.2.0-wave3p.md),
+следующий пакет Qreadonly; реальная QNOT_RUN.
 Fullwave3/D1-on/E4/scopedfaults/LANUDP/IPv6/DNS/allTS открыты, wave4/DAE не начинаем.
 Рабочая LAN считается работающей; gateway on сохраняется, always_off guardian запрещён.

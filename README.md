@@ -888,11 +888,14 @@ Wave3o4fbde2e принята как read-only диагностический с�
 boot/pin сохранены;2строки общей TLS-категории условно связаны сSB1, точная причина
 не установлена. ScanSB1 устаревший, scanSB2 послеN. Одинаковые классы attrs не исключают
 различий приватных параметров. Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3o.md`.
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3p.md` +matching TEMPLATE:
-один НОВЫЙ запрос ровно черезSB1 с privateplan до запроса и запретом повторов,
-только при точном O→current configdigest. N→O остаётся условным временным mapping.
-Нет переключений VPN/узлов/WAN/LAN/Tailscale/служб/правил. SB2positive не повторяется,
-Npartial не превращается вPASS. Реальнаяwave3p NOT_RUN; рабочий on сохраняется.
+Wave3p08cdf11: STOP_SINGLE_PROBE/rc3/request_count0/ValueError, рабочий on/settings/
+6PID/process/boot/pin сохранены. Нового измерения SB1 нет. Точный stage не записан —
+недоработка диагностики теста; runtimepatch не обоснован. Review —
+`docs/REVIEW-REAL-MACHINE-0.2.0-wave3p.md`.
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3q.md` +matching TEMPLATE:
+только readonly чтения P/O/N/currentconfig, фиксированные stage/code и safegatechecks.
+Нетcurl/journal/GET/сканов/переключений; P не повторять. Currentgate не точный oldPsite,
+filetime support не историческийdigestproof. Реальнаяwave3q NOT_RUN, on сохраняется.
 
 ### TUN
 

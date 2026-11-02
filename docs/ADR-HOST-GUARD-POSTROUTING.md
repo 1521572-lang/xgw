@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3p.md: один новый запрос ровно SB-1,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3q.md: readonly разбор STOP до запроса P,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -17,6 +17,13 @@ Wave3o4fbde2e принята как readonly сбор, не SB1PASS/причин
 Review-wave3o фиксирует основания и ограничения. P сохраняет закрытый план до одной
 попытки того же SB1 при точном O→current SBconfigdigest; N→O только filetime support.
 Переходы VPN/узла/WAN/LAN/служб/правил запрещены. Реальнаяwave3p NOT_RUN.
+
+Wave3p08cdf11: STOP_SINGLE_PROBE/rc3/request0/ValueError, контекст сохранён.
+Измерения SB1 не было, точный exception site не записан; это пробел диагностики теста.
+Актуальный Q — только чтения сохранённых файлов и safe stage/code/currentgateflags,
+без curl/journal/GET/сканов/повтораP/переключений. Currentgate не точная старая ветвьP.
+Review-wave3p фиксирует вывод из порядка исходников; реальнаяwave3q NOT_RUN.
+
 
 
 
