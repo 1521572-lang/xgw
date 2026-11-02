@@ -66,5 +66,5 @@ FILE_TIME_SUPPORTED_NOT_DIGEST_PROVEN, не digestproof P. Даже currentOconf
 
 Локально13узких fixture/mockedпроверок нового readonlyсборщика и RuffPASS; только
 статическая проверка ТЗ, без broadVM/netns/живыхлогов/запросов/шлюза. Runtime и старые
-helpers неизменны. Реальная **wave3q NOT_RUN**. Ожидается
-TEST-REPORT-REAL-MACHINE-0.2.0-wave3q-ДАТА.md. Рабочий on сохраняется, offrollback запрещён.
+helpers неизменны. Обновление02.11: Qe768971594d20ca6ac0b424bc114cadf2c33f179 получена/readonlyпринята.
+См. [reviewQ](REVIEW-REAL-MACHINE-0.2.0-wave3q.md); новый R с отдельной baseline NOT_RUN. Рабочий on сохраняется, offrollback запрещён.

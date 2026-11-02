@@ -892,10 +892,14 @@ Wave3p08cdf11: STOP_SINGLE_PROBE/rc3/request_count0/ValueError, рабочий o
 6PID/process/boot/pin сохранены. Нового измерения SB1 нет. Точный stage не записан —
 недоработка диагностики теста; runtimepatch не обоснован. Review —
 `docs/REVIEW-REAL-MACHINE-0.2.0-wave3p.md`.
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3q.md` +matching TEMPLATE:
-только readonly чтения P/O/N/currentconfig, фиксированные stage/code и safegatechecks.
-Нетcurl/journal/GET/сканов/переключений; P не повторять. Currentgate не точный oldPsite,
-filetime support не историческийdigestproof. Реальнаяwave3q NOT_RUN, on сохраняется.
+Qe768971 принята в scope readonly: O→currentconfigdigest отличается, остальные10gate
+и context сохранены. Pblocked0 остаётся, exactoldsiteUNRECORDED; filetime не digestproof.
+Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3q.md`.
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3r.md` +matching TEMPLATE:
+один запрос с новой currentbaseline/закрытымplan ДО запроса, по referencekeyO/vless/d.
+HistoricalendpointidentityUNPROVEN, никакого поискадругогоуспешногоузла/переписыванияN.
+Внутри опыта config/process/settings/boot/6PID/pin неизменны; stage+safe codes при STOP.
+Без переключений VPN/WAN/LAN/Tailscale/служб/правил. Реальнаяwave3r NOT_RUN.
 
 ### TUN
 

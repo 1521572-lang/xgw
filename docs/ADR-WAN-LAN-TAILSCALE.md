@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3q.md: readonly разбор STOP до запроса P,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3r.md: один запрос с новой текущей базой,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -23,6 +23,14 @@ Wave3p08cdf11: STOP_SINGLE_PROBE/rc3/request0/ValueError, контекст со�
 Актуальный Q — только чтения сохранённых файлов и safe stage/code/currentgateflags,
 без curl/journal/GET/сканов/повтораP/переключений. Currentgate не точная старая ветвьP.
 Review-wave3p фиксирует вывод из порядка исходников; реальнаяwave3q NOT_RUN.
+
+Qe768971 принята: readonly/context сохранён; единственный false — O→currentconfigdigest.
+Pblocked/request0 остаётся; точная старая ветвь UNRECORDED, filetime support не digestproof.
+R вводит новую baseline, один текущий uniquevless/d по referencekeyO; historicalidentity
+UNPROVEN (короткийключ не неизменность endpoint). Полный currentconfigdigest/identity
+фиксируются ДО однойпопытки, любое изменение внутри R→STOP. Нет отката кO/переключений.
+Review-wave3q содержит решение; реальнаяwave3r NOT_RUN. Npartial не переписывается вPASS.
+
 
 
 
