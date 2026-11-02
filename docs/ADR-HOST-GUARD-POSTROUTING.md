@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3n.md: HTTPS через постоянный SB при on,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3o.md: сохранённые данные частичного N,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -36,6 +36,16 @@ scope: отдельные capless UID/GID/Groups, не весь service sandbox;
 существующие постоянные SOCKS-входы SB, без смены основного pin/ядра/правил/режима VPN.
 Это positive compatibility worker, не fault/E4 или все LAN/UDP/IPv6/Tailscale пути.
 Реальнаяwave3n NOT_RUN; рабочий on сохраняется, полный wave3 acceptance ещё открыт.
+
+
+Wave3ne4f6f2d: частичный результат1/2, не общийPASS. SB-2vless/d206/32769/.372с,
+ownedlistener/TLS/контекст подтверждены; SB-1двеcurl97/HTTP0/bytes0. УспехSB2 исключает
+глобальную неспособность процесса, но не endpoint-specific права/конфиг/маршрут SB1.
+Случайнаяпоhealth выборка2из71 не доказывает проблему продукта. On/6PID/settings/pin
+сохранены. Новый runtimepatch пока не обоснован. Wave3o читает только существующие
+свидетельства/журналы/lastscan, не повторяет запросы и не меняет рабочий шлюз.
+Исторический mapping по filetimes не скрывает отсутствие старого configdigest.
+Review-wave3n фиксирует пределы; O_NOT_RUN, полнаяwave3 открыта.
 
 
 ## Факты и оставшаяся неопределённость
