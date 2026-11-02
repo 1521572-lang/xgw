@@ -75,9 +75,18 @@ sysctl disable_ipv6. Это существующий код, не новый в�
 Затем по отдельной команде владельца установка завершилась с rc0 вне окна; это не PASS
 45-секундного бюджета. Дальнейшая переустановка ради завершения не нужна.
 
-Текущий канонический следующий шаг — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3e.md`: подробный
-пошаговый протокол с read-only job-context preflight, одним enable в окне25с, локальными
-HTTPS-пробами и обязательным off-rollback. Следующая команда модели для восстановления
-не требуется. Код продукта и Tailscale route/fallback/capture.local не меняются.
-Plain-проба следует действующей политике и может идти direct по исключению; это не
-доказательство VPN-egress. D1-on-reinstall/D2/E4 и полная приёмка волны3 остаются открытыми.
+Отчёт wave3e9677cb9 подтвердил enable rc0 за9.279с и возвратoff за25.167с (restore0.167с),
+WAN6/6True, carrier1 в точках. Во времяon plain TCP получил ConnectionRefusedError за0.089с,
+а marked-проба того же этапа прочитала32769байт/HTTP200. Вoff обе пробы успешны. Причина
+различия путей не установлена; ни физическое отключение WAN, ни ТСПУ этим не доказаны.
+Связь во времяon UNKNOWN; loaded в Markdown UNKNOWN без значения, нужен исходный артефакт.
+
+Текущий канонический следующий шаг — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3f.md`: сначала
+read-only чтение исторического loaded, затем job-context/off-preflight и off diagnostic.
+Отсутствующие inbound/IPv4 LISTEN (при host TPROXY), local=false, mismatch, loadedfalse или
+неполная диагностическая база запрещают переход к enable. При готовой базе — один enable
+в неизменном окне25с, параллельные bounded mode/inbound/LISTEN/route-get/loaded и HTTPS,
+обязательный off-rollback. Следующая команда модели для восстановления не требуется.
+Изменены только test helpers, код продукта и Tailscale route/fallback/capture.local прежние.
+Route-get моделирует lookup, LISTEN не доказывает PID/accept, plain может идти direct по
+исключению: это не доказательство VPN-egress. D1-on-reinstall/D2/E4 и волна3 ещё открыты.

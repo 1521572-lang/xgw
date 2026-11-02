@@ -825,6 +825,14 @@ HTTPS body-пробы и обязательный возвратoff. Устан�
 read-only проверкой job-context до enable, матрицей STOP/INCONCLUSIVE и точным порядком
 публикации отчёта. Шаблон отделяет CLI rc, sampler rc, partial frames и фактическую связь.
 
+В отчёте wave3e enable завершилсяrc0, через25.167с восстановилсяoff, WAN6/6True. При on
+обычный TCP получил отказ, marked HTTPS прошёл; причина ещё не локализована. Актуальное
+подробное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3f.md`, шаблон —
+`docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3f-TEMPLATE.md`. Сначала read-only прежний loaded
+и новая off-диагностика (mode/inbound/LISTEN/lookup), затем только при готовой базе один
+enable в прежнем25с окне. Новые гейты блокируют опыт с известной неисправной базой;
+продуктовые capture/маршрутизация/WAN/Tailscale не изменены. Полная волна3 ещё не принята.
+
 ### TUN
 
 `capture.method = "tun"` меняет только путь **трафика самой машины** в Xray: вместо
