@@ -758,6 +758,10 @@ metadata выше. Отсутствующие raw файлы при прерва
 Это наблюдение локального Capture instance, без изменений продуктовых файлов/алгоритма.
 Каждый record: id/label/state/begin_seconds и, если завершён, seconds; exception — только
 error_class. Никаких argv/URL/IP/имён интерфейсов/текста исключений в журнале нет.
+Begin_seconds отсчитывается от начала trace после создания Capture, не от launch/стартаchild.
+Лимит8с относится ко всему diagnostic child, включая подготовку; это не измеренная
+длительность отдельного Capture.loaded. Для running record длительность неизвестна,
+её нельзя вычислить как8−begin_seconds: начала отсчёта различаются.
 
 Допустимые labels: nft_generation; nft_list_table_ip_xgw/ip6_xgw6/inet_xgw_guard;
 nft_list (включаяset); ip_rule_read/ip_route_read/ip_addr_read/ip_link_read; method_rules,
