@@ -858,14 +858,16 @@ loaded/layout остались UNKNOWN. Точный разбор — `docs/REVI
 full diagnostic с bounded read_trace/active stack. Runtime/config и safety25с прежние;
 переустановка/G1/изменение WAN/Tailscale вwave3i запрещены.
 
-Отчёт wave3i впервые подтвердил actualguard postrouting10/forward/drop5/reject0 и третий
-plainHTTPS успех0.428с, rollback25.126с/WAN6/6True. Короткийhost-кейс принят, полныйloaded
-не завершился на_desired_problem. Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3i.md`.
-Узкий parsercandidate сохраняет render/guard/полноту сравненияpolicysets; наsynthetic20тыс.
-IPv4 профиль0.8168→0.3869с, не benchmarkThinkCentre. АктуальноеТЗ —
-`docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md` +matchingTEMPLATE: послеoff-preflight новая
-atomicзамена толькоnft.py сSHA/backup,4files/dry nft-c, затемодинenable25с. Полныйinstaller/
-WAN/Tailscale/config не меняются, budgetsнеповышаются. Реальнаяwave3jNOT_RUN, полнаяwave3открыта.
+Отчёт wave3j подтвердил `Capture.loaded=true / measured / complete / rc0` при on
+в бюджете 8 с. Обычный HTTPS: HTTP200/32769 байт/0.307 с, marked0.290 с;
+фактический guard postrouting10/forward/drop5/reject0. Возврат25.130 с, WAN6/6 сохранён.
+Короткий host-кейс и измеренное соответствие приняты; полная волна3 открыта.
+Подробно — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3j.md`.
+
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3k.md` и matching TEMPLATE:
+только чтение при исходном HEALTHY/off/pooloff для подготовки LAN/E4/Tailscale приёмки.
+Никакого enable, повторной установки/G1, изменения WAN/LAN/Tailscale или запуска capture.
+Реальная wave3k NOT_RUN; cache/lease/наличие инструмента не означают LAN/E4 PASS.
 
 ### TUN
 

@@ -101,8 +101,16 @@ Wave3ib32669a впервые подтвердил actualpostrouting10/forward/dr
 успех0.428с, rollback25.126с/WAN6/6True. Короткийhost-кейс принят; loadedchild8состановился
 на_desired_problem. Историческаяпричинаh остаётсянеизвестной. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3i.md.
 
-Текущийпротокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md`: off-preflight, новаяatomicзамена
-ТОЛЬКО nft.py(parser) сold/newSHA/backup при остановленныхписателях,4files/dry nft-c,
-стартoff/freshbaseline/одинenable25с. Полныйinstaller/WAN/sysctl/config/Tailscale/ядра
-не меняются; render/guard прежние. Full8/guard3+3/HTTPS4/safety25 неизменны. Проверки
-policysets не пропущены, syntheticprofile не гарантияреального8с. Полнаяwave3/D1/D2/E4 открыты.
+Wave3j8cdf9bc подтвердил loaded=true/measured/complete/rc0 приon в8с child-бюджете,
+actualguard JSON0.025с postrouting10/forward/drop5/reject0, plain0.307с/marked0.290с
+с HTTP200/32769 байт. Enable8.034с0, rollback25.130с/restore0.130с/nft0/WAN6/6True.
+Новая parser-версия NFT10c1 установлена один раз, четыре файла совпали, dry nft-c успешен.
+Принят короткий host-кейс и его измеренное соответствие. Состояние после HEALTHY/off/
+pooloff; непрерывная связь вon, LAN/UDP/IPv6/DNS/Tailscale/E4/D1-on ещё не доказаны.
+
+Текущий протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3k.md`: только чтение приoff для
+получения предпосылок независимой LAN/E4/Tailscale приёмки. Не повторять G1/установку/enable,
+не запускать захват, не менять WAN/LAN/sysctl/config/Tailscale/ядра. Наличие инструмента,
+lease или neighbour не закрывает гейт. Отсутствующие ответы владельца — UNKNOWN.
+При следующем активном опыте независимый локальный возврат обязателен; incoming outage
+>1 минуты нельзя восстанавливать следующей командой модели. Полная волна3 остаётся открыта.

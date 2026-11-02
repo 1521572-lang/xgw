@@ -1,7 +1,9 @@
 # ADR: host guard после policy reroute
 
-Статус02.11.2026: wave3g/h/i дали три plainHTTPS успеха. Вwave3i actualonhook подтверждён:
-postrouting10/forward/drop5/reject0, короткий host-кейс принят. Полныйloaded ещёUNKNOWN.
+Статус 02.11.2026: wave3g/h/i/j дали четыре plain HTTPS успеха. В wave3j
+loaded=true/measured/complete/rc0 при on, actualguard postrouting10/forward/drop5/reject0.
+Короткий host-кейс и измеренное соответствие приняты; полная волна3 открыта.
+Точный разбор — REVIEW-REAL-MACHINE-0.2.0-wave3j.md.
 
 ## Факты и оставшаяся неопределённость
 
@@ -84,18 +86,20 @@ marked200/32769/0.436с, enable8.524с0, rollback25.126с/0.126с/nft0/WAN6/6Tru
 не завершился на method__desired_problem. Новый быстрыйguard не определяет заднимчислом
 причину старогоdeadline_or_error. Точные пределы: REVIEW-REAL-MACHINE-0.2.0-wave3i.md.
 
-PurePython профиль этого участка на20тыс.syntheticIPv4 показал0.8168→0.3869с после узкого
-parser candidate. Это не ThinkCentre benchmark. Render/guard moduleAST прежние, comparisons
-не пропускаются. Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md:
-off-preflight, новаяодноразовая atomicзамена толькоnft.py поold2739/new10c1 SHA сbackup при
-остановленныхписателях,4installed/dry nft-c, стартoff и одинenable25с. Не полныйinstaller.
-Fullchild8с/guard3+3с/HTTPS4с параллельны, safety25с прежнее. WAN/config/Tailscale/ядра и
-scopedfaults не меняются. Реальныйloaded уновогопарсераNOT_RUN, гарантий8с нет.
+PurePython профиль мотивировал узкое parser-изменение351fb54. В wave3j новая версия
+NFT10c1 установлена с backup и SHA, dry nft-c успешен; render/guard прежние. Loaded приon
+впервые measured true/complete/rc0 в8с child-бюджете, _desired_problem returned1.099с.
+Actualguard JSON0.025с подтвердил postrouting10/forward/drop5/reject0 при capture=true
+до/после. Plain200/32769/0.307с, marked0.290с, enable8.034с0, rollback25.130с/0.130с,
+nft0/WAN6/6True. Trace truncated48 не отменяет complete verdict. Это не A/B benchmark
+и не определение исторической причины дедлайнов. Переменные и пределы — review wave3j.
 
-Приon ожидается postrouting10/forward/drop>=1/reject0, capture state читается отдельно.
-Loaded checkpoint и независимый guard-event не являются одним снимком. Contexton —
-запрошенная фаза, не самостоятельное доказательство перехвата;
-off checkpoint не переносить вon. Layout не заменяет loaded и не считает пакеты.
-Plain/marked prefix_ok с новым layout и успешным возвратом закрыл вwave3i только короткий host-кейс.
-Loadedunknown остаётся неизвестностью соответствия; D1-on/D2/E4/LAN/UDP/IPv6/Tailscale/волна3
-открыты. Guardian возвращает подготовленный сетевойoff, не версию файла.
+Текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3k.md: только read-only опись
+предпосылок при off. Без установки/G1/enable/таймеров/захвата и без изменения адаптеров,
+правил, конфигурации, ядер или Tailscale. Новый продуктовый PR по отчёту j не требуется.
+
+Layout/checkpoint/loaded — разные наблюдения; layout считает правила, не пакеты.
+Короткий host-кейс и его measured соответствие приняты, но LAN/UDP/IPv6/DNS/Tailscale/E4,
+D1-on/D2/scoped faults и полная волна3 открыты. Возврат в подготовленный off — механизм
+согласованного опыта; непрерывная связь вon UNKNOWN. Следующий активный опыт требует
+независимой локальной страховки, не следующей команды Flash.
