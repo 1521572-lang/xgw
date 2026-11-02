@@ -849,7 +849,14 @@ reroute A/B воспроизведён локальный reject host guard вOU
 Актуальный протокол — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md` и matching report TEMPLATE:
 без повторного G1/installer, четыре installed совпадения, off-preflight и один enable25с.
 Readonly diagnostic on8с/off4с, HTTPS parallel4с; глобальное safety25с неизменно. Продуктовый
-код/конфиг вwave3h прежний, полная волна3 ещё открыта. Реальная wave3h NOT_RUN.
+код/конфиг вwave3h прежний, полная волна3 ещё открыта.
+
+Wave3h подтвердил второй plainHTTPS успех200/32769/0.466с, rollback25.161с/WAN6/6True;
+loaded/layout остались UNKNOWN. Точный разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3h.md`.
+Актуальный протокол — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md` +matching report TEMPLATE:
+отдельный guard worker с JSON/native read-only fallback и точной классификацией ошибок,
+full diagnostic с bounded read_trace/active stack. Runtime/config и safety25с прежние;
+переустановка/G1/изменение WAN/Tailscale запрещены. Реальная wave3i NOT_RUN.
 
 ### TUN
 

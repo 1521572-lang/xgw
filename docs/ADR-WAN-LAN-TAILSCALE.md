@@ -93,9 +93,12 @@ rollback25.172с/restore0.171с/nft0/WAN6/6True. Повторять обновл
 on-hook и loaded не получены: test child4с остановился до layout. Его ранняя стадия включала
 тяжёлый inbound_problem/rules(on), поэтому сборщик переставлен, без нового продуктового PR.
 
-Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md`: сверка4 файлов,
-off-preflight25с, fresh baseline и один enable25с. Actual guard query раньше installed imports,
-mode/listener/routes раньше inbound; checkpoint/фазы, readonly on-child8с вместо4с (off4).
-Глобальное safety окно25с и автономный offrollback прежние. Ни G1/installer, ни WAN/LAN/sysctl,
-ни Tailscale/capture.local не меняются. Layout/prefix не доказывают весь VPN-egress;
+Wave3hbc24353 повторил plainHTTPS успех0.466с, restore25.161с/0.161с/nft0/WAN6/6True.
+Loaded8сdeadline иguard deadline_or_error остаются неизвестностями. Последнее не является
+доказанным timeout, подробнее в REVIEW-REAL-MACHINE-0.2.0-wave3h.md.
+
+Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md`: сверка4 файлов,
+off-preflight25с/freshbaseline/одинenable25с. Independent guardJSON3с/native fallback3с с
+точной классификацией, full diagnostic8с/read_trace параллельноHTTPS4с. Safety25с прежнее,
+G1/installer/WAN/sysctl/Tailscale не меняются. Layout/trace/prefix не доказывают весьegress;
 D1-on/D2/E4 и волна3 открыты. Подробнее в ADR-HOST-GUARD-POSTROUTING.md.

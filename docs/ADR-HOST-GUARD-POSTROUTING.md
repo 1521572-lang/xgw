@@ -1,6 +1,6 @@
 # ADR: host guard после policy reroute
 
-Статус 02.11.2026: wave3g дал один функциональный plain HTTPS успех на ThinkCentre;
+Статус 02.11.2026: wave3g/h дали два функциональных plain HTTPS успеха на ThinkCentre;
 фактический on-hook/полное соответствие политики ещё не подтверждены.
 
 ## Факты и оставшаяся неопределённость
@@ -73,15 +73,22 @@ Plain приon впервые получил200/32769/0.354с, marked200/32769/0
 и стоял ДО чтения actual guard. Старый phaseconfig охватывал несколько операций; нельзя
 выдать неизвестную задержку за доказанную медленную config.load/DNS/GeoIP.
 
-Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md. Продукт не меняется
-относительно573b233; сверка4 installed файлов, off-preflight25с, свежая база и один enable25с.
-Helper читает actual guard ДО installed imports, mode/LISTEN/routes ДО inbound_problem;
-сохраняет подробнуюphase и checkpoint. Off diagnostic4с, on8с параллельно HTTPS4с; глобальное
-окно25с не увеличено. Если enable долгий, child может быть прерван guardian, что даёт partial.
+Wave3hbc24353 дал повторный plain200/32769/0.466с, enable8.533с0, rollback25.161с/0.161с,
+nft0/WAN6/6True. Loadednull/8сdeadline наphase loaded. Guard querydeadline_or_error не
+доказывает timeout: catch объединял ошибки процесса/разбора. Внутри loaded вновь вызывается
+сборка rules; ранний завершённый inbound не исключает внутренние стадии. Уточнения и точные
+permalink: REVIEW-REAL-MACHINE-0.2.0-wave3h.md.
+
+Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md. Runtime573b233 прежний;
+4 installed сверки, off-preflight25с, freshbaseline и один enable25с. Guard читается отдельным
+worker: JSON3с, при неуспехеon один native3с, точные классы ошибок/rc/elapsed, private raw.
+Полный diagnostic8с параллелен, до48 read_trace границ/active stack локального Capture.
+Off diagnostic4с/guardJSON3с; общий25с не меняется. Partial при долгом enable остаётсяpartial.
 G1/full installer/ядра/scoped faults запрещены, WAN/Tailscale/config не меняются.
 
 Приon ожидается postrouting10/forward/drop>=1/reject0, capture state читается отдельно.
-Checkpoint contexton — запрошенная фаза, не самостоятельное доказательство перехвата;
+Loaded checkpoint и независимый guard-event не являются одним снимком. Contexton —
+запрошенная фаза, не самостоятельное доказательство перехвата;
 off checkpoint не переносить вon. Layout не заменяет loaded и не считает пакеты.
 Plain/marked prefix_ok с новым layout и успешным возвратом закрывает только короткий host-кейс.
 Loadedunknown остаётся неизвестностью соответствия; D1-on/D2/E4/LAN/UDP/IPv6/Tailscale/волна3
