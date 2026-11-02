@@ -15,7 +15,7 @@ SOCKS-входы sing-box (базовый профиль d), максимум2у
 baseline. Продукт/службы/правила не устанавливаются и не меняются.
 
 Product/старыеhelpers pin351fb54e074f4a7b497a8a4244fc74c6088788d7. Новый сборщик
-tests/stand/wave3_bridge_probe.py SHA256 db9edb6f7dd95549f52e21a9b733e33404bcef1f34189819d35d8f42d78b6390;
+tests/stand/wave3_bridge_probe.py SHA256 2f02303299db7dbccb7dc5edfa971dbce595063ad0a88eff59ba8e8054c85fef;
 прежний reader wave3_on_observer.py SHA256 0db2acf6fa27632ccbdd6294b44f3e20fecd14805a1a1ac6dcf56d153f1f1d46 (не изменён).
 Доставка Git/freepool, фактические HEAD/tree записать в отчёт. Freeze только helpers в/run.
 
@@ -200,7 +200,7 @@ sudo python3 -I - "$HOME/zcod/xgw" <<'PY'
 import hashlib,os,sys
 from pathlib import Path
 repo=Path(sys.argv[1])
-expected={'wave3_bridge_probe.py':'db9edb6f7dd95549f52e21a9b733e33404bcef1f34189819d35d8f42d78b6390',
+expected={'wave3_bridge_probe.py':'2f02303299db7dbccb7dc5edfa971dbce595063ad0a88eff59ba8e8054c85fef',
           'wave3_on_observer.py':'0db2acf6fa27632ccbdd6294b44f3e20fecd14805a1a1ac6dcf56d153f1f1d46'}
 payload={name:(repo/'tests/stand'/name).read_bytes() for name in expected}
 if any(hashlib.sha256(payload[name]).hexdigest()!=sha for name,sha in expected.items()):

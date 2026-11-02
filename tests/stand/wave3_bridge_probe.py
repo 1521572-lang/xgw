@@ -279,6 +279,28 @@ def save(value):
         stream.write("\n")
 
 
+def process_ready(value):
+    sb = value["singbox"]
+    return (
+        reader.good(value)
+        and all(
+            sb.get(key) is True
+            for key in (
+                "account_nonprivileged",
+                "uid_all_match_service",
+                "gid_all_match_service",
+                "forbidden_groups_absent",
+                "same_process_during_read",
+                "no_new_privs",
+            )
+        )
+        and all(
+            sb.get("cap_sets_zero", {}).get(key) is True
+            for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+        )
+    )
+
+
 def main():
     if (
         os.geteuid() != 0
@@ -302,19 +324,8 @@ def main():
     }
     digest = None
     try:
-        sb = before["singbox"]
-        if (
-            old_pin is None
-            or not reader.good(before)
-            or sb.get("account_nonprivileged") is not True
-            or sb.get("no_new_privs") is not True
-        ):
+        if old_pin is None or not process_ready(before):
             raise ValueError("on/process context")
-        if not all(
-            sb.get("cap_sets_zero", {}).get(key) is True
-            for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
-        ):
-            raise ValueError("capability context")
         curl = shutil.which("curl")
         result["curl_available"] = curl is not None
         if not curl:
@@ -403,7 +414,7 @@ def main():
         result["same_singbox_process"] = before["singbox"].get("process_identity") == after[
             "singbox"
         ].get("process_identity")
-        result["on_context_preserved"] = reader.good(before) and reader.good(after)
+        result["on_context_preserved"] = process_ready(before) and process_ready(after)
         result["same_boot"] = before["boot_private"] == after["boot_private"]
         new_pin = pin_token()
         result["pin_record_readable_after"] = new_pin is not None

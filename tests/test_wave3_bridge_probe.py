@@ -149,3 +149,34 @@ def test_pin_read_is_private_and_cannot_create_missing_database(tmp_path, monkey
     token = tool.pin_token()
     assert isinstance(token, bytes) and b"PRIVATE_SELECTION" not in token
     assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "uid_all_match_service",
+        "gid_all_match_service",
+        "forbidden_groups_absent",
+        "same_process_during_read",
+    ],
+)
+def test_unknown_or_wrong_service_identity_cannot_be_ready(missing, monkeypatch):
+    tool = probe()
+    monkeypatch.setattr(tool.reader, "good", lambda value: True)
+    flags = {
+        key: True
+        for key in (
+            "account_nonprivileged",
+            "uid_all_match_service",
+            "gid_all_match_service",
+            "forbidden_groups_absent",
+            "same_process_during_read",
+            "no_new_privs",
+        )
+    }
+    flags["cap_sets_zero"] = {
+        key: True for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+    }
+    assert tool.process_ready({"singbox": flags}) is True
+    flags[missing] = None
+    assert tool.process_ready({"singbox": flags}) is False
