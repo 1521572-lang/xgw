@@ -97,8 +97,12 @@ Wave3hbc24353 повторил plainHTTPS успех0.466с, restore25.161с/0.1
 Loaded8сdeadline иguard deadline_or_error остаются неизвестностями. Последнее не является
 доказанным timeout, подробнее в REVIEW-REAL-MACHINE-0.2.0-wave3h.md.
 
-Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md`: сверка4 файлов,
-off-preflight25с/freshbaseline/одинenable25с. Independent guardJSON3с/native fallback3с с
-точной классификацией, full diagnostic8с/read_trace параллельноHTTPS4с. Safety25с прежнее,
-G1/installer/WAN/sysctl/Tailscale не меняются. Layout/trace/prefix не доказывают весьegress;
-D1-on/D2/E4 и волна3 открыты. Подробнее в ADR-HOST-GUARD-POSTROUTING.md.
+Wave3ib32669a впервые подтвердил actualpostrouting10/forward/drop5/reject0, plainтретий
+успех0.428с, rollback25.126с/WAN6/6True. Короткийhost-кейс принят; loadedchild8состановился
+на_desired_problem. Историческаяпричинаh остаётсянеизвестной. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3i.md.
+
+Текущийпротокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md`: off-preflight, новаяatomicзамена
+ТОЛЬКО nft.py(parser) сold/newSHA/backup при остановленныхписателях,4files/dry nft-c,
+стартoff/freshbaseline/одинenable25с. Полныйinstaller/WAN/sysctl/config/Tailscale/ядра
+не меняются; render/guard прежние. Full8/guard3+3/HTTPS4/safety25 неизменны. Проверки
+policysets не пропущены, syntheticprofile не гарантияреального8с. Полнаяwave3/D1/D2/E4 открыты.

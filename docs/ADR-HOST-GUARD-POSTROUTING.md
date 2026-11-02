@@ -1,7 +1,7 @@
 # ADR: host guard после policy reroute
 
-Статус 02.11.2026: wave3g/h дали два функциональных plain HTTPS успеха на ThinkCentre;
-фактический on-hook/полное соответствие политики ещё не подтверждены.
+Статус02.11.2026: wave3g/h/i дали три plainHTTPS успеха. Вwave3i actualonhook подтверждён:
+postrouting10/forward/drop5/reject0, короткий host-кейс принят. Полныйloaded ещёUNKNOWN.
 
 ## Факты и оставшаяся неопределённость
 
@@ -79,17 +79,23 @@ nft0/WAN6/6True. Loadednull/8сdeadline наphase loaded. Guard querydeadline_or
 сборка rules; ранний завершённый inbound не исключает внутренние стадии. Уточнения и точные
 permalink: REVIEW-REAL-MACHINE-0.2.0-wave3h.md.
 
-Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md. Runtime573b233 прежний;
-4 installed сверки, off-preflight25с, freshbaseline и один enable25с. Guard читается отдельным
-worker: JSON3с, при неуспехеon один native3с, точные классы ошибок/rc/elapsed, private raw.
-Полный diagnostic8с параллелен, до48 read_trace границ/active stack локального Capture.
-Off diagnostic4с/guardJSON3с; общий25с не меняется. Partial при долгом enable остаётсяpartial.
-G1/full installer/ядра/scoped faults запрещены, WAN/Tailscale/config не меняются.
+Wave3ib32669a подтвердил actuallayout JSON0.064с икороткий host-кейс: plain200/32769/0.428с,
+marked200/32769/0.436с, enable8.524с0, rollback25.126с/0.126с/nft0/WAN6/6True. Fullchild8с
+не завершился на method__desired_problem. Новый быстрыйguard не определяет заднимчислом
+причину старогоdeadline_or_error. Точные пределы: REVIEW-REAL-MACHINE-0.2.0-wave3i.md.
+
+PurePython профиль этого участка на20тыс.syntheticIPv4 показал0.8168→0.3869с после узкого
+parser candidate. Это не ThinkCentre benchmark. Render/guard moduleAST прежние, comparisons
+не пропускаются. Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md:
+off-preflight, новаяодноразовая atomicзамена толькоnft.py поold2739/new10c1 SHA сbackup при
+остановленныхписателях,4installed/dry nft-c, стартoff и одинenable25с. Не полныйinstaller.
+Fullchild8с/guard3+3с/HTTPS4с параллельны, safety25с прежнее. WAN/config/Tailscale/ядра и
+scopedfaults не меняются. Реальныйloaded уновогопарсераNOT_RUN, гарантий8с нет.
 
 Приon ожидается postrouting10/forward/drop>=1/reject0, capture state читается отдельно.
 Loaded checkpoint и независимый guard-event не являются одним снимком. Contexton —
 запрошенная фаза, не самостоятельное доказательство перехвата;
 off checkpoint не переносить вon. Layout не заменяет loaded и не считает пакеты.
-Plain/marked prefix_ok с новым layout и успешным возвратом закрывает только короткий host-кейс.
+Plain/marked prefix_ok с новым layout и успешным возвратом закрыл вwave3i только короткий host-кейс.
 Loadedunknown остаётся неизвестностью соответствия; D1-on/D2/E4/LAN/UDP/IPv6/Tailscale/волна3
 открыты. Guardian возвращает подготовленный сетевойoff, не версию файла.

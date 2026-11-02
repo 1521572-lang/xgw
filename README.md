@@ -856,7 +856,16 @@ loaded/layout остались UNKNOWN. Точный разбор — `docs/REVI
 Актуальный протокол — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3i.md` +matching report TEMPLATE:
 отдельный guard worker с JSON/native read-only fallback и точной классификацией ошибок,
 full diagnostic с bounded read_trace/active stack. Runtime/config и safety25с прежние;
-переустановка/G1/изменение WAN/Tailscale запрещены. Реальная wave3i NOT_RUN.
+переустановка/G1/изменение WAN/Tailscale вwave3i запрещены.
+
+Отчёт wave3i впервые подтвердил actualguard postrouting10/forward/drop5/reject0 и третий
+plainHTTPS успех0.428с, rollback25.126с/WAN6/6True. Короткийhost-кейс принят, полныйloaded
+не завершился на_desired_problem. Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3i.md`.
+Узкий parsercandidate сохраняет render/guard/полноту сравненияpolicysets; наsynthetic20тыс.
+IPv4 профиль0.8168→0.3869с, не benchmarkThinkCentre. АктуальноеТЗ —
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3j.md` +matchingTEMPLATE: послеoff-preflight новая
+atomicзамена толькоnft.py сSHA/backup,4files/dry nft-c, затемодинenable25с. Полныйinstaller/
+WAN/Tailscale/config не меняются, budgetsнеповышаются. Реальнаяwave3jNOT_RUN, полнаяwave3открыта.
 
 ### TUN
 
