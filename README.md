@@ -884,10 +884,15 @@ SB с проверенным socketowner/TLS. SB-1 на обеих целях д
 Успех одного входа не исключает endpoint-specific проблему другого; выбор первых2из71
 не был health-filter. Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3n.md`.
 
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3o.md` +matching TEMPLATE:
-только сохранённый Nsummary, ограниченный journal/конфигурационные признаки и lastscan.
-Никаких новых запросов/смены узла/перезапусков/правил/VPN; если историческое соответствие
-не поддержано данными, результат UNKNOWN. Реальнаяwave3o NOT_RUN, рабочий on сохраняется.
+Wave3o4fbde2e принята как read-only диагностический сбор: on/6PID/settings/SBconfig/
+boot/pin сохранены;2строки общей TLS-категории условно связаны сSB1, точная причина
+не установлена. ScanSB1 устаревший, scanSB2 послеN. Одинаковые классы attrs не исключают
+различий приватных параметров. Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3o.md`.
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3p.md` +matching TEMPLATE:
+один НОВЫЙ запрос ровно черезSB1 с privateplan до запроса и запретом повторов,
+только при точном O→current configdigest. N→O остаётся условным временным mapping.
+Нет переключений VPN/узлов/WAN/LAN/Tailscale/служб/правил. SB2positive не повторяется,
+Npartial не превращается вPASS. Реальнаяwave3p NOT_RUN; рабочий on сохраняется.
 
 ### TUN
 
