@@ -1055,6 +1055,11 @@ def render_guard(rules: Rules) -> str:
     A scoped capture-table/routing failure leaves this table in place. Explicit
     off/open removes it. Other forwarded networks and non-TCP/UDP keep their policy.
     Only capture rules write GUARD_CT; the guard itself never sets packet/ct marks.
+
+    Host egress is checked in POSTROUTING: an OUTPUT route-chain can reroute to lo
+    while the same hook's nf_hook_state.out still names the original WAN device.
+    The late hook sees the actual output device. It uses drop (reject is not valid
+    in POSTROUTING), and ignores forwarded packets already scoped by forward.
     """
     if not (rules.capture or rules.blocked or rules.containers or rules.ts_exit):
         return ""
@@ -1074,13 +1079,14 @@ def render_guard(rules: Rules) -> str:
     if rules.reserved6:
         common.append("ip6 daddr { " + ", ".join(rules.reserved6) + " } th dport != 53 accept")
     common.append(f"ct mark and {GUARD_CT:#x} != 0 accept")
-    output = [f"meta mark {rules.mark_bypass:#x} ip daddr 127.0.0.0/8 counter reject",
-              f"meta mark {rules.mark_bypass:#x} ip6 daddr ::1 counter reject"]
+    output = ["meta iif != 0 return",
+              f"meta mark {rules.mark_bypass:#x} ip daddr 127.0.0.0/8 counter drop",
+              f"meta mark {rules.mark_bypass:#x} ip6 daddr ::1 counter drop"]
     if rules.singbox_uid is not None:
         output += [f"meta skuid {rules.singbox_uid} ct direction original "
-                   "ip daddr 127.0.0.0/8 counter reject",
+                   "ip daddr 127.0.0.0/8 counter drop",
                    f"meta skuid {rules.singbox_uid} ct direction original "
-                   "ip6 daddr ::1 counter reject"]
+                   "ip6 daddr ::1 counter drop"]
     if not (rules.capture_local or rules.block_local):
         output.append("meta nfproto ipv4 return")
     if not (rules.capture6 or rules.v6_guard):
@@ -1095,7 +1101,7 @@ def render_guard(rules: Rules) -> str:
     for uid in rules.time_uids:
         output += [f"meta skuid {uid} udp dport 123 accept",
                    f"meta skuid {uid} tcp dport {NTS_KE_PORT} accept"]
-    output += reject
+    output += ["counter drop"]
     ingress = []
     if rules.capture_lan or rules.block_lan:
         ingress.append(rules.lan_if)
@@ -1109,7 +1115,7 @@ def render_guard(rules: Rules) -> str:
     return _table("inet", GUARD, [
         _chain("pass", "", common),
         _chain("transit", "", ["jump pass", *reject]),
-        _chain("output", "type filter hook output priority 10; policy accept;", output),
+        _chain("output", "type filter hook postrouting priority 10; policy accept;", output),
         _chain("forward", "type filter hook forward priority 10; policy accept;", forward),
     ])
 

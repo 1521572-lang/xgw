@@ -140,3 +140,25 @@ def test_off_diagnostic_prevents_ready_before_known_bad_enable(failure):
     else:
         value["loaded_reason"] = "invalid_result"
     assert tool.diagnostic_ready(value) is False
+
+
+@pytest.mark.parametrize("hook", ["output", "postrouting"])
+def test_guard_layout_reports_actual_hook_without_exposing_rules(hook):
+    tool = sampler()
+    value = tool.guard_layout([
+        {"chain": {"family": "inet", "table": "xgw_guard", "name": "output",
+                   "hook": hook, "prio": 10}},
+        {"chain": {"table": "xgw_guard", "name": "forward", "hook": "forward"}},
+        {"rule": {"table": "xgw_guard", "chain": "output", "expr": [
+            {"match": {"right": "192.0.2.1"}}, {"counter": {"packets": 2}}, {"drop": None}]}},
+        {"rule": {"table": "foreign", "chain": "output", "expr": [{"reject": None}]}},
+    ])
+    assert value == {"query": "ok", "host_hook": hook, "host_priority": 10,
+                     "forward_hook": "forward", "host_drop_rules": 1, "host_reject_rules": 0}
+
+
+def test_guard_layout_does_not_invent_missing_chain_metadata():
+    tool = sampler()
+    value = tool.guard_layout([{"metainfo": {"version": "1.0.9"}}])
+    assert value["host_hook"] is None
+    assert value["forward_hook"] is None

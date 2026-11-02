@@ -5183,3 +5183,23 @@ Happ»), затем дополнен редактированием списка
      отслеживаемого job и атомарно сохраняются по готовности; порядок строк не порядок фаз.
      Никаких новых nft/iprule/sysctl/NM действий, отключения guard или Tailscale исключений.
      Независимые25с и restore/window/launch не меняются; установка уже завершена, не повторять.
+292. **wave3f221eecb: локальный отказ OUTPUT guard воспроизведён отдельно.** В реальном отчёте
+     enable6.183с/rc0, restore25.146с/0.146с, WAN6/6True. PlainTCPrefused0.065с, markedHTTP200.
+     Inbound/listener/proxy lookup корректны; loadednull/child_deadline4с, не False. Старый
+     wave3e loaded в JSON оказался полем неожиданного типа, а не отсутствующим полем.
+     Один узкий изолированный WSL6.18 netns-опыт проверил конкретный оставшийся вопрос:
+     OUTPUT route-chain меняет skb route наlo, но следующий hook читает прежний state.out=WAN.
+     Старый guard даёт refused; тот же поток с POSTROUTING guard принимается настоящим
+     IP_TRANSPARENT listener (содержимое TPROXY, а не DIRECT). Удаление RPDB либо capture-table
+     оставляет plain заблокированным, markedDIRECT работает. Это причинное A/B для фикстуры,
+     не доказательство тождества ядра/причины ThinkCentre и не реальная приёмка XGW/VPN/IPv6.
+     Исправление только render_guard: host цепочка output переносится в POSTROUTING10 доSNAT,
+     проверяя фактический oif; iif!=0 return сохраняет отдельный forward scope. Host отказ —
+     drop, поскольку reject недопустим вpostrouting; клиент может получить таймаут вместоRST.
+     Forward/transit reject прежний. Ни accept поmark_proxy, ни ct-approve, ни общий
+     established accept не добавлены. Явные core/direct/service исключения не расширены.
+     Для реальной проверки wave3g сначала автономный off-preflight, затем атомарная замена
+     ТОЛЬКО установленного net/nft.py при остановленных xgw/xgw-net, с точными old/newSHA и
+     приватной резервной копией. Снова старт вoff, один enable25с, обязательный off-rollback.
+     Полный installer, WAN/NM/sysctl/capture.local/Tailscale и scoped faults не трогать.
+     Guardian restore/window/launch прежние; реальная wave3g NOT_RUN, D1/D2/E4/волна3 открыты.

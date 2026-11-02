@@ -83,7 +83,7 @@ try:
             try:
                 s.connect(("198.18.0.2", 23456))
                 return True
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, TimeoutError):
                 return False
 
     # Syntax and live listing normalization, including actual kernel formatting.
@@ -112,7 +112,7 @@ try:
     run(["nft", "delete", "table", "ip", nft.TABLE])
     assert not connect(), "New unauthorized plain TCP escaped the surviving guard"
     assert connect(rules.mark_bypass), "Core marked TCP incorrectly rejected"
-    evidence.append("after deleting ip xgw: new plain TCP reset, core-marked TCP connects")
+    evidence.append("after deleting ip xgw: new plain TCP blocked, core-marked TCP connects")
     guard_after = nft.structure(nft.listing(run, "inet", nft.GUARD), "inet", nft.GUARD)
     assert guard_before == guard_after
 
@@ -137,7 +137,7 @@ os.setgroups([]);os.setgid(65534);os.setuid(65534)
 def dial(host,port):
  s=socket.socket();s.settimeout(1)
  try:s.connect((host,port));return True
- except ConnectionRefusedError:return False
+ except (ConnectionRefusedError,TimeoutError):return False
  finally:s.close()
 print(json.dumps([dial('198.18.0.2',23456),dial('127.0.0.1',23457)]))
 """

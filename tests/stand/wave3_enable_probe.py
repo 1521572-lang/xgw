@@ -243,6 +243,27 @@ def listener_summary(port, root=Path("/proc/net")):
     return result
 
 
+def guard_layout(items):
+    """Фактические hook/drop, без правил, адресов и имён чужих объектов."""
+    result = {"query": "ok", "host_hook": None, "host_priority": None,
+              "forward_hook": None, "host_drop_rules": 0, "host_reject_rules": 0}
+    for item in items:
+        chain = item.get("chain", {})
+        if chain.get("table") == "xgw_guard":
+            if chain.get("name") == "output":
+                hook = chain.get("hook")
+                result["host_hook"] = hook if hook in ("output", "postrouting") else "other"
+                priority = chain.get("prio")
+                result["host_priority"] = priority if type(priority) is int else None
+            elif chain.get("name") == "forward":
+                result["forward_hook"] = "forward" if chain.get("hook") == "forward" else "other"
+        rule = item.get("rule", {})
+        if rule.get("table") == "xgw_guard" and rule.get("chain") == "output":
+            result["host_drop_rules"] += any("drop" in expr for expr in rule.get("expr", []))
+            result["host_reject_rules"] += any("reject" in expr for expr in rule.get("expr", []))
+    return result
+
+
 def kernel(directory):
     """Read-only child: сохраняет быстрые факты ДО потенциально медленного loaded()."""
     sys.path.insert(0, "/opt/xgw/lib")
@@ -289,6 +310,16 @@ def kernel(directory):
         value["routes"][label] = summary
         value["phase"] = "routes"
         guard.save(path, value)
+    try:
+        check = subprocess.run(["nft", "-j", "list", "table", "inet", "xgw_guard"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=0.8, check=False)
+        value["guard_layout"] = (guard_layout(json.loads(check.stdout)["nftables"])
+                                 if check.returncode == 0 else {"query": "not_confirmed"})
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        value["guard_layout"] = {"query": "deadline_or_error"}
+    value["phase"] = "guard_layout"
+    guard.save(path, value)
     value.update(phase="loaded", loaded_reason="pending_loaded")
     guard.save(path, value)
     answer = capture.loaded()

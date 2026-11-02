@@ -1014,6 +1014,29 @@ def test_guard_never_approves_flows_and_only_scopes_managed_ingress():
     assert nft.render_guard(_blocked(cfg))
 
 
+@pytest.mark.parametrize("method", ["tproxy", "tun"])
+@pytest.mark.parametrize("ipv6", ["off", "proxy"])
+def test_host_guard_uses_actual_egress_after_reroute_without_proxy_mark_permission(method, ipv6):
+    cfg = _cfg()
+    cfg.capture.method = method
+    cfg.network.ipv6 = ipv6
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    text = nft.render_guard(rules)
+    assert "type filter hook postrouting priority 10; policy accept;" in text
+    assert "type filter hook output priority 10" not in text
+    output = _chain(text, "output")
+    assert output[0] == "meta iif != 0 return"  # scoped forward barrier remains separate
+    assert output[-1] == "counter drop"
+    assert not any("reject" in rule for rule in output)  # invalid at POSTROUTING
+    assert not any(f"meta mark {rules.mark_proxy:#x} accept" in rule for rule in output)
+    assert "ct mark set" not in text
+    assert "type filter hook forward priority 10; policy accept;" in text
+    assert _chain(text, "transit")[-2:] == [
+        "meta l4proto tcp counter reject with tcp reset",
+        "counter reject with icmpx type admin-prohibited",
+    ]
+
+
 def test_capture_approves_only_explicit_direct_paths():
     cfg = _cfg(wan_if="wan0")
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=(), tailnet=True)
