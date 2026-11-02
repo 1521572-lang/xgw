@@ -13,6 +13,7 @@ import ssl
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -141,14 +142,21 @@ def baseline(directory):
             break
     if chosen is None and targets:
         chosen = 0  # off-body может быть уже заблокирован ТСПУ; сравнение останется ограниченным
-    guard.save(directory / "baseline.json", {
-        "ready": chosen is not None, "baseline_healthy": healthy,
+    base = {
+        "ready": False, "baseline_healthy": healthy,
         "target": chosen, "results": results,
         "monotonic": time.monotonic(),
         "sampler_sha256": hashlib.sha256(HERE.read_bytes()).hexdigest(),
-    })
-    print(json.dumps({"ready_for_enable": chosen is not None,
-                      "baseline_healthy": healthy, "baseline": results}))
+    }
+    guard.save(directory / "baseline.json", base)
+    diagnostic = loaded(directory)
+    guard.save(directory / "off-diagnostic.json", diagnostic)
+    base.update(ready=chosen is not None and diagnostic_ready(diagnostic),
+                diagnostic_gate=diagnostic_ready(diagnostic))
+    guard.save(directory / "baseline.json", base)
+    print(json.dumps({"ready_for_enable": base["ready"],
+                      "baseline_healthy": healthy, "baseline": results,
+                      "off_diagnostic": diagnostic}))
 
 
 def permit(directory):
@@ -177,20 +185,148 @@ def observe(directory):
     return value
 
 
-def loaded():
-    code = ("import sys,json; sys.path.insert(0,'/opt/xgw/lib'); "
-            "from xgw import config; from xgw.paths import Paths; "
-            "from xgw.net.capture import capture_for; p=Paths.from_env(); "
-            "c,_=config.load(p.config_file); "
-            "print(json.dumps({'loaded':capture_for(c,p).loaded()}))")
+def diagnostic_ready(value):
+    """Отсутствующий IPv4 listener/неизвестный контекст — STOP до enable, не настройка сети."""
+    if (value.get("schema") != 1 or value.get("requested_mode") != "off"
+            or value.get("effective_mode") != "off" or value.get("configured_local") is not True
+            or value.get("inbound_problem_present") is not False or value.get("loaded") is False
+            or value.get("mismatch_present") is not False
+            or value.get("loaded_reason") not in ("measured", "capture_unknown",
+                                                  "child_deadline", "child_error")
+            or not any("route_type" in item for item in value.get("routes", {}).values())
+            or value.get("capture_method") not in ("tproxy", "tun")):
+        return False
+    if value["capture_method"] == "tproxy":
+        listener = value.get("listener", {})
+        return listener.get("tcp_read") is True and (
+            listener.get("ipv4_any") is True or listener.get("ipv4_loopback") is True)
+    return True
+
+
+def route_summary(route, interfaces, tun_name, tables):
+    """Только класс lookup; ни адресов, ни имён интерфейсов, ни чужих table ID."""
+    device = route.get("dev")
+    role = next((key for key, value in interfaces.items() if device and device == value), None)
+    if device == "lo":
+        role = "loopback"
+    elif device and device == tun_name:
+        role = "tun"
+    table = str(route.get("table", "main"))
+    table_role = next((key for key, value in tables.items() if table == str(value)), None)
+    kind = route.get("type", "unicast")
+    return {"device_role": role or "other_or_absent",
+            "route_type": kind if kind in ("local", "unicast", "blackhole", "unreachable",
+                                            "prohibit", "throw") else "other",
+            "table_role": table_role or ("main" if table in ("main", "254") else "other")}
+
+
+def listener_summary(port, root=Path("/proc/net")):
+    """LISTEN в текущем netns; наличие сокета не доказывает PID/работу TPROXY."""
+    result = {}
+    for name, roles in (("tcp", {"00000000": "ipv4_any", "0100007F": "ipv4_loopback"}),
+                        ("tcp6", {"0" * 32: "ipv6_any",
+                                  "0" * 24 + "01000000": "ipv6_loopback"})):
+        try:
+            labels = {value: False for value in roles.values()}
+            labels[name + "_other_address"] = False
+            for line in (root / name).read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 4 or fields[3] != "0A":
+                    continue
+                address, raw_port = fields[1].split(":")
+                if int(raw_port, 16) == port:
+                    labels[roles.get(address, name + "_other_address")] = True
+            result.update(labels)
+            result[name + "_read"] = True
+        except (OSError, ValueError):
+            result[name + "_read"] = False
+    return result
+
+
+def kernel(directory):
+    """Read-only child: сохраняет быстрые факты ДО потенциально медленного loaded()."""
+    sys.path.insert(0, "/opt/xgw/lib")
+    from xgw import config
+    from xgw.net.capture import capture_for
+    from xgw.paths import Paths
+
+    path = directory / "kernel-diagnostic.json"
+    value = {"schema": 1, "loaded": None, "loaded_reason": "pending",
+             "phase": "config", "routes": {}}
+    guard.save(path, value)
+    paths = Paths.from_env()
+    cfg, _ = config.load(paths.config_file)
+    capture = capture_for(cfg, paths)
+    problem = capture.inbound_problem()
+    mode = capture.mode()
+    state = capture._state()
+    value.update(
+        phase="fast_facts", capture_method="tun" if cfg.capture.tun else "tproxy",
+        configured_local=cfg.capture.local, configured_lan=cfg.capture.lan,
+        requested_mode=mode,
+        effective_mode=capture.hold_mode() if mode == "on" and problem else mode,
+        inbound_problem_present=bool(problem), mismatch_present=bool(state.get("mismatch")),
+        listener=listener_summary(cfg.capture.tproxy_port),
+    )
+    guard.save(path, value)
+    snapshot = read_json(directory / "snapshot.json")
+    chosen = read_json(directory / "baseline.json")["target"]
+    target = read_json(directory / "probe-plan.json")[chosen]
+    for label, mark in (("unmarked", 0), ("proxy", cfg.capture.mark_proxy),
+                        ("bypass", cfg.capture.mark_bypass)):
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "-j", "route", "get", target["address"][0], "mark", str(mark),
+                 "uid", "0", "ipproto", "tcp", "dport", str(target["port"])],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=0.7, check=False)
+            rows = json.loads(result.stdout) if result.returncode == 0 else []
+            summary = route_summary(rows[0], snapshot["interfaces"], cfg.capture.tun_name,
+                                    {"tproxy": cfg.capture.route_table,
+                                     "tun": cfg.capture.tun_route_table}) if rows else {
+                                         "query": "nonzero_or_empty", "rc": result.returncode}
+        except (OSError, ValueError, IndexError, TypeError, subprocess.TimeoutExpired):
+            summary = {"query": "deadline_or_error"}
+        value["routes"][label] = summary
+        value["phase"] = "routes"
+        guard.save(path, value)
+    value.update(phase="loaded", loaded_reason="pending_loaded")
+    guard.save(path, value)
+    answer = capture.loaded()
+    value.update(phase="complete", loaded=answer if type(answer) is bool else None,
+                 loaded_reason="measured" if type(answer) is bool else "capture_unknown")
+    guard.save(path, value)
+
+
+def loaded(directory):
+    path = directory / "kernel-diagnostic.json"
+    guard.save(path, {"schema": 1, "loaded": None, "loaded_reason": "pending_child"})
+    reason = "child_error"
+    rc = None
     try:
-        check = subprocess.run([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=6, check=False)
-        if check.returncode == 0:
-            return json.loads(check.stdout)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        pass
-    return {"loaded": "UNKNOWN"}
+        check = subprocess.run([sys.executable, "-I", str(HERE), "kernel", str(directory)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=4, check=False)
+        rc = check.returncode
+        reason = "invalid_result" if rc == 0 else "child_error"
+    except subprocess.TimeoutExpired:
+        reason = "child_deadline"
+    except OSError:
+        reason = "spawn_error"
+    try:
+        value = read_json(path)
+        if not isinstance(value, dict) or value.get("schema") != 1:
+            raise ValueError("schema")
+    except (OSError, ValueError):
+        value = {"schema": 1}
+        reason = "invalid_result"
+    if type(value.get("loaded")) is not bool:
+        value["loaded"] = None
+        if not (rc == 0 and value.get("loaded_reason") == "capture_unknown"):
+            value["loaded_reason"] = reason
+    else:
+        value["loaded_reason"] = "measured"
+    value["child_rc"] = rc
+    return value
 
 
 def in_job():
@@ -228,11 +364,15 @@ def run(directory):
     guard.save(directory / "on-observations.json", events)
     if rc != 0:
         return 2
-    events.append({"stage": "loaded", **loaded()})
-    guard.save(directory / "on-observations.json", events)
-    for marked in (False, True):
-        events.append({"stage": "https", **probe(directory, base["target"], marked)})
-        guard.save(directory / "on-observations.json", events)
+    # Три независимых read-only задачи; сохранять каждый готовый результат немедленно.
+    # Вся группа — внутри JOB cgroup, поэтому rollback прекращает и оставшиеся дочерние.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        tasks = {pool.submit(loaded, directory): "loaded"}
+        tasks.update({pool.submit(probe, directory, base["target"], marked): "https"
+                      for marked in (False, True)})
+        for future in as_completed(tasks):
+            events.append({"stage": tasks[future], **future.result()})
+            guard.save(directory / "on-observations.json", events)
     events.append({"stage": "after_https", "facts": observe(directory)})
     guard.save(directory / "on-observations.json", events)
     return 0  # выполнен сбор; это не автоматический PASS сети
@@ -254,12 +394,15 @@ def main():
         print(json.dumps(fetch(directory, int(sys.argv[3]), bool(int(sys.argv[4])))))
     elif mode == "run":
         raise SystemExit(run(directory))
+    elif mode == "kernel":
+        kernel(directory)
     elif mode == "report":
-        for name in ("baseline.json", "enable-result.json", "on-observations.json"):
+        for name in ("baseline.json", "off-diagnostic.json", "enable-result.json",
+                     "on-observations.json"):
             if (directory / name).exists():
                 print(json.dumps({name: read_json(directory / name)}))
     else:
-        raise SystemExit("context|baseline|run|report DIR")
+        raise SystemExit("context|baseline|run|report DIR; kernel — внутренний read-only child")
 
 
 if __name__ == "__main__":

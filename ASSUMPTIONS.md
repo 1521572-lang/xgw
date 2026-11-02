@@ -5163,3 +5163,23 @@ Happ»), затем дополнен редактированием списка
      отслеживаемого job при armed/active fixed-window; bare run не разрешает мутацию.
      Локально только6 новых узких регрессий иruff;
      реальный wave3e NOT_RUN. Продуктовый src/packaging в этом пакете не менялся.
+291. **wave3e9677cb9: включение состоялось, обычный TCP не прошёл.** Реальный enable rc0
+     за9.279с; независимый возврат25.167с (restore0.167с), nft_rc0, WAN6/6True. Off plain и
+     marked получили32769байт/200; on plain ConnectionRefusedError вTCP за0.089с, marked
+     получил32769байт/200 за0.289с. Carrier1 в точках, связь послеoff подтверждена, внутриon
+     UNKNOWN. Это не доказательство физического отключения WAN, ТСПУ или конкретного виновника.
+     Полная волна3, D1-on/D2/E4/LAN/UDP/IPv6/Tailscale не приняты. Loaded в отчёте UNKNOWN,
+     якобы stage без поля: старый sampler при нормальном результате всегда задаёт loaded;
+     без чтения сохранённого JSON не объявлять причиной таймаут или дефект библиотеки.
+     Wave3f меняет только test helpers: сначала безопасное чтение прежнего артефакта в ТЗ,
+     затем быстрые read-only cfg/effective-mode/inbound/LISTEN/route-get факты сохраняются
+     до loaded; None получает явную причину deadline/child_error/invalid_result/capture_unknown.
+     Вoff нет inbound/IPv4 LISTEN (TPROXY), host capture выключен или loadedFalse -> readyFalse,
+     до enable STOP. Socket LISTEN не доказывает владельца PID/IP_TRANSPARENT/приём потока;
+     IPv6 LISTEN не принимается за IPv4 без отдельного доказательства dual-stack.
+     Route-get с mark0/proxy/bypass — модель lookup, не след фактического пакета; выводятся
+     только роли interface/table, без адресов и имён. Unmarked lookup вWAN до nft нормален.
+     После enable ограниченные loaded/plain/marked children запускаются параллельно внутри
+     отслеживаемого job и атомарно сохраняются по готовности; порядок строк не порядок фаз.
+     Никаких новых nft/iprule/sysctl/NM действий, отключения guard или Tailscale исключений.
+     Независимые25с и restore/window/launch не меняются; установка уже завершена, не повторять.
