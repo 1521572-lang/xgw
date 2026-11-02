@@ -831,7 +831,17 @@ read-only проверкой job-context до enable, матрицей STOP/INCO
 `docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3f-TEMPLATE.md`. Сначала read-only прежний loaded
 и новая off-диагностика (mode/inbound/LISTEN/lookup), затем только при готовой базе один
 enable в прежнем25с окне. Новые гейты блокируют опыт с известной неисправной базой;
-продуктовые capture/маршрутизация/WAN/Tailscale не изменены. Полная волна3 ещё не принята.
+продуктовые capture/маршрутизация/WAN/Tailscale в wave3f не изменены. Полная волна3 ещё не принята.
+
+Wave3f повторил plain TCP отказ при корректных inbound/LISTEN/proxy lookup. В изолированном
+reroute A/B воспроизведён локальный reject host guard вOUTPUT; кандидат wave3g переносит
+проверку фактического host egress вPOSTROUTING сdrop, сохраняя scoped forward/reject и закрытый
+выход при потере маршрута/capture. Реальная причина и исправление ещё требуют подтверждения.
+Актуальное подробное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3g.md`, шаблон —
+`docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3g-TEMPLATE.md`; объяснение —
+`docs/ADR-HOST-GUARD-POSTROUTING.md`. После off-preflight выборочно обновляется один nft.py,
+с backup/точнымиSHA/dry nft-c при остановленном контроллере; затем один guarded enable25с.
+Полный installer/WAN/sysctl/ядра/Tailscale не меняются. Реальная wave3g NOT_RUN.
 
 ### TUN
 

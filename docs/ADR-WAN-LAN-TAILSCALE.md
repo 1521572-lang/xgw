@@ -81,12 +81,16 @@ WAN6/6True, carrier1 в точках. Во времяon plain TCP получил
 различия путей не установлена; ни физическое отключение WAN, ни ТСПУ этим не доказаны.
 Связь во времяon UNKNOWN; loaded в Markdown UNKNOWN без значения, нужен исходный артефакт.
 
-Текущий канонический следующий шаг — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3f.md`: сначала
-read-only чтение исторического loaded, затем job-context/off-preflight и off diagnostic.
-Отсутствующие inbound/IPv4 LISTEN (при host TPROXY), local=false, mismatch, loadedfalse или
-неполная диагностическая база запрещают переход к enable. При готовой базе — один enable
-в неизменном окне25с, параллельные bounded mode/inbound/LISTEN/route-get/loaded и HTTPS,
-обязательный off-rollback. Следующая команда модели для восстановления не требуется.
-Изменены только test helpers, код продукта и Tailscale route/fallback/capture.local прежние.
-Route-get моделирует lookup, LISTEN не доказывает PID/accept, plain может идти direct по
-исключению: это не доказательство VPN-egress. D1-on-reinstall/D2/E4 и волна3 ещё открыты.
+Отчёт wave3f221eecb повторил plainTCPrefused0.065с при исправных inbound/listener/proxy lookup;
+loadednull/child_deadline4с. Один изолированный netns A/B воспроизвёл отказ host guard вOUTPUT
+после reroute: hook видит прежний WAN oif. Новый host guard проверяет фактический oif в
+POSTROUTING, при неразрешённом выходе drop. Forward guard прежний. Никакого нового accept
+поproxy mark нет. Причина ThinkCentre ещё требует подтверждения; факты и границы в
+`ADR-HOST-GUARD-POSTROUTING.md`.
+
+Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3g.md`: обязательный off
+preflight25с, атомарное обновление одного installed net/nft.py при остановленных писателях,
+backup/old-newSHA и dry nft-c, стартoff, один enable в неизменном окне25с. Самплер сохраняет
+фактические hook/priority/drop-layout до loaded. Всегда автономный off-rollback, без следующей
+команды модели. Профили WAN/LAN/sysctl, Tailscale route/fallback/capture.local не меняются.
+Ни route-get, ни LISTEN, ни bodyprefix не доказывают весь VPN-egress. D1-on/D2/E4 и волна3 открыты.
