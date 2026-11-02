@@ -5217,7 +5217,7 @@ Happ»), затем дополнен редактированием списка
      inbound_problem. Раздельные phase capture_import/config_load/capture_create/inbound_check/
      loaded показывают место незавершённого child. Final checkpoint доступен в report с context;
      pending/прерванные факты остаются UNKNOWN, контекстon сам по себе не доказывает режим.
-     Off child остаётся4с, on readonly child8с после трёх фактических ограничений4с; parallel с
+     Off child остаётся4с, on readonly child8с после двух подтверждённых4с deadlines f/g; parallel с
      двумя HTTPS-child4с. НЕ увеличивается независимое safety окно25с: при долгом enable job
      может оборваться, результат частичный. Нужен новый real guarded run, не повторный G1.
      В этой итерации продуктовый src/packaging/config не изменены относительно573b233;

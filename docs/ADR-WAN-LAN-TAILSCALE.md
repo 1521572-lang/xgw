@@ -88,9 +88,14 @@ POSTROUTING, при неразрешённом выходе drop. Forward guard 
 поproxy mark нет. Причина ThinkCentre ещё требует подтверждения; факты и границы в
 `ADR-HOST-GUARD-POSTROUTING.md`.
 
-Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3g.md`: обязательный off
-preflight25с, атомарное обновление одного installed net/nft.py при остановленных писателях,
-backup/old-newSHA и dry nft-c, стартoff, один enable в неизменном окне25с. Самплер сохраняет
-фактические hook/priority/drop-layout до loaded. Всегда автономный off-rollback, без следующей
-команды модели. Профили WAN/LAN/sysctl, Tailscale route/fallback/capture.local не меняются.
-Ни route-get, ни LISTEN, ни bodyprefix не доказывают весь VPN-egress. D1-on/D2/E4 и волна3 открыты.
+Wave3g6c93e22 успешно установил nft.py; plainon впервые200/32769/0.354с, marked тоже успешен,
+rollback25.172с/restore0.171с/nft0/WAN6/6True. Повторять обновление не нужно. Фактический
+on-hook и loaded не получены: test child4с остановился до layout. Его ранняя стадия включала
+тяжёлый inbound_problem/rules(on), поэтому сборщик переставлен, без нового продуктового PR.
+
+Текущий канонический протокол — `TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md`: сверка4 файлов,
+off-preflight25с, fresh baseline и один enable25с. Actual guard query раньше installed imports,
+mode/listener/routes раньше inbound; checkpoint/фазы, readonly on-child8с вместо4с (off4).
+Глобальное safety окно25с и автономный offrollback прежние. Ни G1/installer, ни WAN/LAN/sysctl,
+ни Tailscale/capture.local не меняются. Layout/prefix не доказывают весь VPN-egress;
+D1-on/D2/E4 и волна3 открыты. Подробнее в ADR-HOST-GUARD-POSTROUTING.md.

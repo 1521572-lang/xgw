@@ -1,6 +1,7 @@
 # ADR: host guard после policy reroute
 
-Статус 02.11.2026: принято для кандидата wave3g; приёмка ThinkCentre NOT_RUN.
+Статус 02.11.2026: wave3g дал один функциональный plain HTTPS успех на ThinkCentre;
+фактический on-hook/полное соответствие политики ещё не подтверждены.
 
 ## Факты и оставшаяся неопределённость
 
@@ -61,15 +62,27 @@ skb mark и выполняет reroute вlo. Вывод из
 
 ## Реальный следующий шаг
 
-Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3g.md. Mandatory off-preflight
-25с, затем при остановленных xgw/xgw-net атомарно заменить только installed net/nft.py по
-old/new SHA с root0600 backup. Dry nft-c проверяет новый on guard без применения. После
-проверки4 installed файлов стартовать контроллер вoff. Только затем один enable25с с
-независимым неизменным rollback. Полный installer/обновление ядер/scoped faults запрещены.
+В [отчёте wave3g](https://github.com/1521572-lang/xgw/blob/6c93e22f153617168e8aa77afa2ad3ef7289462f/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3g-2026-11-02.md)
+G1 успешно установил новый nft.py с backup/SHA/dry nft-c. Повторная замена не нужна.
+Plain приon впервые получил200/32769/0.354с, marked200/32769/0.380с; enable8.801с0,
+возврат25.172с/restore0.171с/nft0/WAN6/6True. Guard layout неизвестен: diagnostic4с остановился
+на phaseconfig до быстрых фактов. Работоспособность одного host-запроса измерена; полного
+доказательства механизма/соответствия/стабильности это не даёт.
 
-Новый sampler сохраняет фактические hook/priority/drop-rule counts перед bounded loaded:
-приon ожидается postrouting10, forward, host_drop>=1, host_reject0. Layout не заменяет
-Capture.loaded и не является счётчиком пакетов. Plain/marked prefix_ok с новым layout и
-успешным возвратом закрывает только этот короткий host-кейс. Loadedunknown остаётся
-неизвестностью соответствия; D1-on/D2/E4/LAN/UDP/IPv6/Tailscale и полная волна3 открыты.
-Guardian возвращает подготовленный сетевойoff; новый файл после опыта остаётся установленным.
+Найдено ограничение test helper: inbound_problem вызывает полную rules(on), включая GeoIP,
+и стоял ДО чтения actual guard. Старый phaseconfig охватывал несколько операций; нельзя
+выдать неизвестную задержку за доказанную медленную config.load/DNS/GeoIP.
+
+Единственный текущий протокол — TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md. Продукт не меняется
+относительно573b233; сверка4 installed файлов, off-preflight25с, свежая база и один enable25с.
+Helper читает actual guard ДО installed imports, mode/LISTEN/routes ДО inbound_problem;
+сохраняет подробнуюphase и checkpoint. Off diagnostic4с, on8с параллельно HTTPS4с; глобальное
+окно25с не увеличено. Если enable долгий, child может быть прерван guardian, что даёт partial.
+G1/full installer/ядра/scoped faults запрещены, WAN/Tailscale/config не меняются.
+
+Приon ожидается postrouting10/forward/drop>=1/reject0, capture state читается отдельно.
+Checkpoint contexton — запрошенная фаза, не самостоятельное доказательство перехвата;
+off checkpoint не переносить вon. Layout не заменяет loaded и не считает пакеты.
+Plain/marked prefix_ok с новым layout и успешным возвратом закрывает только короткий host-кейс.
+Loadedunknown остаётся неизвестностью соответствия; D1-on/D2/E4/LAN/UDP/IPv6/Tailscale/волна3
+открыты. Guardian возвращает подготовленный сетевойoff, не версию файла.

@@ -841,7 +841,15 @@ reroute A/B воспроизведён локальный reject host guard вOU
 `docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3g-TEMPLATE.md`; объяснение —
 `docs/ADR-HOST-GUARD-POSTROUTING.md`. После off-preflight выборочно обновляется один nft.py,
 с backup/точнымиSHA/dry nft-c при остановленном контроллере; затем один guarded enable25с.
-Полный installer/WAN/sysctl/ядра/Tailscale не меняются. Реальная wave3g NOT_RUN.
+Полный installer/WAN/sysctl/ядра/Tailscale не меняются.
+
+Отчёт wave3g подтвердил установку nft.py и первый plain HTTPS успех приon (200/32769/0.354с),
+автономный возврат25.172с и WAN6/6True. Actual on-layout/loaded остались UNKNOWN: test child
+потратил4с до чтения guard. Новый helper сначала читает actual guard, потом тяжёлую политику.
+Актуальный протокол — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3h.md` и matching report TEMPLATE:
+без повторного G1/installer, четыре installed совпадения, off-preflight и один enable25с.
+Readonly diagnostic on8с/off4с, HTTPS parallel4с; глобальное safety25с неизменно. Продуктовый
+код/конфиг вwave3h прежний, полная волна3 ещё открыта. Реальная wave3h NOT_RUN.
 
 ### TUN
 
