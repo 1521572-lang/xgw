@@ -895,11 +895,13 @@ Wave3p08cdf11: STOP_SINGLE_PROBE/rc3/request_count0/ValueError, рабочий o
 Qe768971 принята в scope readonly: O→currentconfigdigest отличается, остальные10gate
 и context сохранены. Pblocked0 остаётся, exactoldsiteUNRECORDED; filetime не digestproof.
 Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3q.md`.
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3r.md` +matching TEMPLATE:
-один запрос с новой currentbaseline/закрытымplan ДО запроса, по referencekeyO/vless/d.
-HistoricalendpointidentityUNPROVEN, никакого поискадругогоуспешногоузла/переписыванияN.
-Внутри опыта config/process/settings/boot/6PID/pin неизменны; stage+safe codes при STOP.
-Без переключений VPN/WAN/LAN/Tailscale/служб/правил. Реальнаяwave3r NOT_RUN.
+Rbd51241: отрицательный запрос curl97/0байт/.977с, одна relatedстрокаREALITYverification.
+Рабочий контекст/plan/owner сохранены, причина не назначена. Review —
+`docs/REVIEW-REAL-MACHINE-0.2.0-wave3r.md`; N/P/Q не переписаны новым результатом.
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3s.md` +matching TEMPLATE:
+readonlyсверка текущих REALITYполей с parsedlocalcache/manual, только bools/coverage.
+Если configdigest!=Rplan — CURRENT_ONLY, не старыйRконтракт. Parsedviewравенство не
+URIparser/сервер/causePASS. Нетcurl/journal/сканов/переключений. Реальнаяwave3s NOT_RUN.
 
 ### TUN
 

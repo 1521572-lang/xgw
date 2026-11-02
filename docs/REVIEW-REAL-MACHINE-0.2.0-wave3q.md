@@ -58,6 +58,7 @@ R делает один ограниченный HTTPS и ограниченно
 
 10новых узких fixture/mocked проверок wrapperPASS, RuffPASS, статическая проверка
 команд ТЗ; старые helpers/runtime не менялись. Нет broadVM/netns/живых запросов/логов/
-шлюза. Реальная **wave3r NOT_RUN**, ждём TEST-REPORT-REAL-MACHINE-0.2.0-wave3r-ДАТА.md.
+шлюза. Обновление02.11: Rbd512410a5515692a3870c8aba153535c742a0d2 получена, отрицательнаяпопытка.
+[РазборR](REVIEW-REAL-MACHINE-0.2.0-wave3r.md), следующийSreadonly NOT_RUN.
 Fullwave3/D1-on/E4/scopedfaults/LANUDP/IPv6/DNS/allTS открыты, wave4/DAE не начинаем.
 Рабочая LAN считается работающей; on сохранён, старый always_off запрещён.
