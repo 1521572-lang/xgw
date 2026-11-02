@@ -864,10 +864,16 @@ full diagnostic с bounded read_trace/active stack. Runtime/config и safety25с
 Короткий host-кейс и измеренное соответствие приняты; полная волна3 открыта.
 Подробно — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3j.md`.
 
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3k.md` и matching TEMPLATE:
-только чтение при исходном HEALTHY/off/pooloff для подготовки LAN/E4/Tailscale приёмки.
-Никакого enable, повторной установки/G1, изменения WAN/LAN/Tailscale или запуска capture.
-Реальная wave3k NOT_RUN; cache/lease/наличие инструмента не означают LAN/E4 PASS.
+В wave3k получена опись: WAN/LAN UP/carrier1, tcpdump имеется, Tailscale route=vpn;
+сбор при off не менял три контролируемых файла. Затем владелец уточнил: шлюз используется
+для раздачи через Wi-Fi-роутер, VPN возвращается в рабочий on. Эту рабочую схему принимаем
+за baseline; выключать её ради подготовки больше не требуется.
+
+Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3l.md` +matching TEMPLATE:
+минимум10 минут обычной работы с read-only снимками, без переключения VPN/служб/адаптеров,
+без SSH-инвентаризации роутера и без установки продукта. Старый rollback-to-off не применять.
+Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3k.md`. Реальнаяwave3l NOT_RUN;
+приёмка свойств доработок продолжается при сохранении рабочего шлюза.
 
 ### TUN
 
