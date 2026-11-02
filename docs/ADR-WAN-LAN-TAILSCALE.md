@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3m.md: границы доступа при рабочем on,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3n.md: HTTPS через постоянный SB при on,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -30,6 +30,15 @@ patch не требуется. Wave3m проверяет файловые/API/ne
 собственный пустой state-probe, если ошибочно разрешено создание: удалить свой inode,
 зафиксировать FAIL, без правок каталога/конфигов. Live ip rule add/del запрещены.
 Реальнаяwave3m NOT_RUN; полнаяwave3 открыта.
+
+
+Wave3m09abf5c принята:6/6 actual permission cases с проверенной identity, root nft-read
+control успешен, state-файл не создан, on/PID/настройки сохранены. Review-wave3m фиксирует
+scope: отдельные capless UID/GID/Groups, не весь service sandbox; live ipruleadd NOT_RUN.
+Новый дефект продукта не найден. Следующий wave3n выполняет небольшие HTTPS GET через
+существующие постоянные SOCKS-входы SB, без смены основного pin/ядра/правил/режима VPN.
+Это positive compatibility worker, не fault/E4 или все LAN/UDP/IPv6/Tailscale пути.
+Реальнаяwave3n NOT_RUN; рабочий on сохраняется, полный wave3 acceptance ещё открыт.
 
 
 ## Что показал реальный прогон
