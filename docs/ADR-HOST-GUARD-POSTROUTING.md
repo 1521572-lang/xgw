@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3l.md: только наблюдение обычной работы,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3m.md: границы доступа при рабочем on,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -17,6 +17,17 @@ SSH/sentinel не являются условием признания суще�
 loaded=true/measured/complete/rc0 при on, actualguard postrouting10/forward/drop5/reject0.
 Короткий host-кейс и измеренное соответствие приняты; полная волна3 открыта.
 Точный разбор — REVIEW-REAL-MACHINE-0.2.0-wave3j.md.
+
+Wave3l149ffec принята:608.141с/on bookends,6active/PID same/NRestartsdelta0,
+sing-box nonprivileged/caps0×5/NoNewPrivs/DAC подтверждены; настройки прежние.
+Отдельное клиентское использование/Tailscale в интервале не наблюдалось; LAN-счётчики
+не являются атрибуцией потоку. Review-wave3l содержит точные пределы. Новый продуктовый
+patch не требуется. Wave3m проверяет файловые/API/netlink границы отдельными capless
+процессами с фактическими UID/GID/Groups; сеть/службы/VPN не изменяются. Исключение только
+собственный пустой state-probe, если ошибочно разрешено создание: удалить свой inode,
+зафиксировать FAIL, без правок каталога/конфигов. Live ip rule add/del запрещены.
+Реальнаяwave3m NOT_RUN; полнаяwave3 открыта.
+
 
 ## Факты и оставшаяся неопределённость
 
