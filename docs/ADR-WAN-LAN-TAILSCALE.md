@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3s.md: локальная readonly сверка REALITY,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3t.md: единый укрупнённый пакет7этапов,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -36,6 +36,14 @@ Rbd51241: отрицательная попытка curl97/HTTP0/bytes0/.977с, 
 новыйлитерал; shortkeyidentityнедоказана. Официальныйcoreимеетфоновыйfallback: curlbudget
 неполныйбюджетпостоянногоcore. S толькоreadonlyconfig/Rplan/локальныйcache/manualparser,
 boolсверка/форма/coverage, noGET/journal/scans/переключения. Реальнаяwave3s NOT_RUN.
+
+Sa748237 принята: configRdigest/3cache/12equalfields/6syntaxflags/contextсохранны,
+не parser/server/causePASS. Владелец потребовал укрупнять ТЗ. T объединяет независимый
+разбор источников, все defaultVLESSконтракты/всеprofilebridgeграфы/healthhistory/journal/
+6мин пассивных LANсчётчиков: одинworker, автоматические переходы, один итоговый отчёт.
+Softphasefail не останавливает остальные чтения. Noactiveprobes/faults/networkchanges.
+Review-wave3s фиксирует границы. Реальнаяwave3t NOT_RUN, полнаяwave3ещёоткрыта.
+
 
 
 

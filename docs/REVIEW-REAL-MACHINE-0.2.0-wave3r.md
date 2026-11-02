@@ -67,6 +67,6 @@ equality не правильность серверных ожиданий. Ambi
 Никаких curl/journal/scan/APIwrites/пиннинга/служб/правил/адаптеров/VPN. Старые helpers
 не менялись; sourceidentity всего установленногоPythonдерева проверяется перед parser.
 14узких fixtures/mocked проверокPASS/RuffPASS, синтаксисТЗпроверен. BroadVM/netns/живые
-прогоны нами не делались. Реальная **wave3s NOT_RUN**, ожидается
-TEST-REPORT-REAL-MACHINE-0.2.0-wave3s-ДАТА.md. Fullwave3/D1-on/E4/faults/LANUDP/IPv6/DNS/
+прогоны нами не делались. Обновление02.11: Sa7482377b5cb0d85a015d8a7fcc747743b8e7e94 получена, scopedconsistencyпринята.
+[РазборS](REVIEW-REAL-MACHINE-0.2.0-wave3s.md); новый укрупнённый TNOT_RUN. Fullwave3/D1-on/E4/faults/LANUDP/IPv6/DNS/
 allTS открыты, неwave4/DAE. РабочаяLANработает; baselineon и запретalways_off сохраняются.

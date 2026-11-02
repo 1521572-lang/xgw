@@ -898,10 +898,13 @@ Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3q.md`.
 Rbd51241: отрицательный запрос curl97/0байт/.977с, одна relatedстрокаREALITYverification.
 Рабочий контекст/plan/owner сохранены, причина не назначена. Review —
 `docs/REVIEW-REAL-MACHINE-0.2.0-wave3r.md`; N/P/Q не переписаны новым результатом.
-Актуальное ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3s.md` +matching TEMPLATE:
-readonlyсверка текущих REALITYполей с parsedlocalcache/manual, только bools/coverage.
-Если configdigest!=Rplan — CURRENT_ONLY, не старыйRконтракт. Parsedviewравенство не
-URIparser/сервер/causePASS. Нетcurl/journal/сканов/переключений. Реальнаяwave3s NOT_RUN.
+Sa748237 принята:12parsedfields/6syntaxflags/3cache/configRdigest/context совпали,
+не parser/server/causePASS. Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3s.md`.
+По требованию владельца задания укрупняются: актуальное
+`docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3t.md` +matching TEMPLATE — семь автоматических
+этапов в одномworker: independentrecords/allVLESS/allprofilegraph/health/journal/
+6мин пассивнойLAN. Автопереходы после optionalUNAVAILABLE, одинконсолидированныйотчёт.
+NoGET/сканы/переключения/правила/службы. Реальнаяwave3t NOT_RUN, on сохраняется.
 
 ### TUN
 
