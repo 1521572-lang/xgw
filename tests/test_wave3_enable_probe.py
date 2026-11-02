@@ -90,7 +90,7 @@ def test_loaded_deadline_keeps_fast_facts_without_claiming_false(tmp_path, monke
     result = tool.loaded(tmp_path)
     assert result == {"schema": 1, "loaded": None, "loaded_reason": "child_deadline",
                       "effective_mode": "blocked", "inbound_problem_present": True,
-                      "child_rc": None}
+                      "child_rc": None, "context": "off", "child_budget_seconds": 4}
 
 
 def test_route_summary_classifies_proxy_loopback_without_addresses():
@@ -162,3 +162,69 @@ def test_guard_layout_does_not_invent_missing_chain_metadata():
     value = tool.guard_layout([{"metainfo": {"version": "1.0.9"}}])
     assert value["host_hook"] is None
     assert value["forward_hook"] is None
+
+
+@pytest.mark.parametrize("context,budget", [("off", 4), ("on", 8)])
+def test_diagnostic_budget_and_context_are_explicit_without_extending_guard(
+        tmp_path, monkeypatch, context, budget):
+    tool = sampler()
+
+    def child(argv, **kwargs):
+        assert argv[-1] == context
+        assert kwargs["timeout"] == budget
+        tool.guard.save(tmp_path / "kernel-diagnostic.json", {
+            "schema": 1, "loaded": True, "loaded_reason": "measured"})
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(tool.subprocess, "run", child)
+    result = tool.loaded(tmp_path, context)
+    assert result["child_budget_seconds"] == budget
+    assert result["context"] == context
+
+
+def test_guard_and_routes_saved_before_slow_inbound_policy_build(tmp_path, monkeypatch):
+    from xgw import config
+    from xgw.net import capture
+    from xgw.paths import Paths
+
+    tool = sampler()
+    state_path = tmp_path / "live-state.json"
+    tool.guard.save(state_path, {"enabled": True})
+    tool.guard.save(tmp_path / "snapshot.json", {
+        "capture_state": str(state_path), "interfaces": {"WAN": "wan0", "LAN": "lan0"}})
+    tool.guard.save(tmp_path / "probe-plan.json", [{"address": ["198.51.100.1", 443], "port": 443}])
+    tool.guard.save(tmp_path / "baseline.json", {"target": 0})
+    cfg = config.Config()
+
+    class SlowCapture:
+        def mode(self):
+            return "on"
+
+        def _state(self):
+            return {"enabled": True}
+
+        def inbound_problem(self):
+            raise RuntimeError("slow_inbound")
+
+    def command(argv, **kwargs):
+        if argv[0] == "nft":
+            value = {"nftables": [{"chain": {"table": "xgw_guard", "name": "output",
+                                            "hook": "postrouting", "prio": 10}}]}
+        else:
+            value = [{"type": "local", "dev": "lo", "table": 100}]
+        return SimpleNamespace(returncode=0, stdout=tool.json.dumps(value))
+
+    monkeypatch.setattr(tool.subprocess, "run", command)
+    monkeypatch.setattr(config, "load", lambda path: (cfg, []))
+    monkeypatch.setattr(capture, "capture_for", lambda *args: SlowCapture())
+    monkeypatch.setattr(Paths, "from_env", lambda: SimpleNamespace(config_file=tmp_path / "cfg"))
+    monkeypatch.setattr(tool, "listener_summary", lambda port: {"ipv4_loopback": True})
+    with pytest.raises(RuntimeError, match="slow_inbound"):
+        tool.kernel(tmp_path, "on")
+    checkpoint = tool.read_json(tmp_path / "kernel-diagnostic.json")
+    assert checkpoint["guard_layout"]["host_hook"] == "postrouting"
+    assert checkpoint["capture_enabled_now"] is True
+    assert checkpoint["listener"]["ipv4_loopback"] is True
+    assert set(checkpoint["routes"]) == {"unmarked", "proxy", "bypass"}
+    assert checkpoint["phase"] == "inbound_check"
+    assert checkpoint["loaded"] is None

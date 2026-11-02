@@ -1,4 +1,4 @@
-"""Локальная страховка только для согласованного короткого теста wave3g.
+"""Локальная страховка только для согласованного короткого теста wave3h.
 
 Не устанавливается как часть XGW. Исходное состояние обязательно off. Доверенная
 копия и snapshot готовятся до опасных действий; watchdog запускается отдельным
@@ -19,8 +19,8 @@ from pathlib import Path
 
 LEASE_SECONDS = 25.0
 MAX_SECONDS = 1800.0
-JOB = "xgw-w3g-job.service"
-SAFETY = "xgw-w3g-safety.service"
+JOB = "xgw-w3h-job.service"
+SAFETY = "xgw-w3h-safety.service"
 
 
 def atomic(path: Path, data: bytes) -> None:

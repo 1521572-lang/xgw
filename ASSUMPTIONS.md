@@ -5203,3 +5203,22 @@ Happ»), затем дополнен редактированием списка
      приватной резервной копией. Снова старт вoff, один enable25с, обязательный off-rollback.
      Полный installer, WAN/NM/sysctl/capture.local/Tailscale и scoped faults не трогать.
      Guardian restore/window/launch прежние; реальная wave3g NOT_RUN, D1/D2/E4/волна3 открыты.
+293. **wave3g6c93e22: plain body прошёл, диагностика потеряла ранние факты.** G1 атомарно
+     установил новый nft.py (2739e81c), old backup75057aaf сохранён,4 файла/синтаксис подтверждены.
+     Enable8.801с/rc0; plainHTTP200/32769/0.354с, marked200/32769/0.380с; возврат25.172с,
+     restore0.171с/nft0/WAN6/6True. Это один функциональный успех; actual on guard_layout не
+     получен, loadednull/child_deadline/phaseconfig. Причина ThinkCentre ещё не подтверждена
+     layout/loaded, полная волна3 не принята. Нет оснований переустанавливать или менять WAN.
+     Найдена ошибка порядка test diagnostic: inbound_problem сам вызывает rules(on), т.е.
+     собирает всю политику/GeoIP, хотя был поставлен до «быстрых» layout/listener/route фактов.
+     Phaseconfig старого helper охватывал не только config.load, но и capture/inbound; нельзя
+     из отчёта утверждать, какой именно вызов занял время. Wave3h читает actual guard через
+     nft JSON ДО installed imports, сохраняет capture_enabled_now, затем listener/routes ДО
+     inbound_problem. Раздельные phase capture_import/config_load/capture_create/inbound_check/
+     loaded показывают место незавершённого child. Final checkpoint доступен в report с context;
+     pending/прерванные факты остаются UNKNOWN, контекстon сам по себе не доказывает режим.
+     Off child остаётся4с, on readonly child8с после трёх фактических ограничений4с; parallel с
+     двумя HTTPS-child4с. НЕ увеличивается независимое safety окно25с: при долгом enable job
+     может оборваться, результат частичный. Нужен новый real guarded run, не повторный G1.
+     В этой итерации продуктовый src/packaging/config не изменены относительно573b233;
+     keeper restore/window/launch прежние, никаких дополнительных netns/широких VM suites.

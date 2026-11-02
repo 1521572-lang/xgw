@@ -264,33 +264,51 @@ def guard_layout(items):
     return result
 
 
-def kernel(directory):
-    """Read-only child: сохраняет быстрые факты ДО потенциально медленного loaded()."""
+def kernel(directory, context):
+    """Фактический guard читать ДО импорта/сборки installed capture policy."""
+    path = directory / "kernel-diagnostic.json"
+    value = {"schema": 1, "context": context, "loaded": None, "loaded_reason": "pending",
+             "phase": "guard_query", "routes": {}}
+    guard.save(path, value)
+    snapshot = read_json(directory / "snapshot.json")
+    try:
+        state = read_json(Path(snapshot["capture_state"]))
+        enabled = state.get("enabled")
+        value["capture_enabled_now"] = enabled if type(enabled) is bool else None
+    except (OSError, ValueError):
+        value["capture_enabled_now"] = None
+    try:
+        check = subprocess.run(["nft", "-j", "list", "table", "inet", "xgw_guard"],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=0.8, check=False)
+        value["guard_layout"] = (guard_layout(json.loads(check.stdout)["nftables"])
+                                 if check.returncode == 0 else {"query": "not_confirmed"})
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        value["guard_layout"] = {"query": "deadline_or_error"}
+    value["phase"] = "capture_import"
+    guard.save(path, value)
     sys.path.insert(0, "/opt/xgw/lib")
     from xgw import config
     from xgw.net.capture import capture_for
     from xgw.paths import Paths
 
-    path = directory / "kernel-diagnostic.json"
-    value = {"schema": 1, "loaded": None, "loaded_reason": "pending",
-             "phase": "config", "routes": {}}
+    value["phase"] = "config_load"
     guard.save(path, value)
     paths = Paths.from_env()
     cfg, _ = config.load(paths.config_file)
+    value["phase"] = "capture_create"
+    guard.save(path, value)
     capture = capture_for(cfg, paths)
-    problem = capture.inbound_problem()
     mode = capture.mode()
     state = capture._state()
     value.update(
         phase="fast_facts", capture_method="tun" if cfg.capture.tun else "tproxy",
         configured_local=cfg.capture.local, configured_lan=cfg.capture.lan,
         requested_mode=mode,
-        effective_mode=capture.hold_mode() if mode == "on" and problem else mode,
-        inbound_problem_present=bool(problem), mismatch_present=bool(state.get("mismatch")),
+        mismatch_present=bool(state.get("mismatch")),
         listener=listener_summary(cfg.capture.tproxy_port),
     )
     guard.save(path, value)
-    snapshot = read_json(directory / "snapshot.json")
     chosen = read_json(directory / "baseline.json")["target"]
     target = read_json(directory / "probe-plan.json")[chosen]
     for label, mark in (("unmarked", 0), ("proxy", cfg.capture.mark_proxy),
@@ -310,16 +328,13 @@ def kernel(directory):
         value["routes"][label] = summary
         value["phase"] = "routes"
         guard.save(path, value)
-    try:
-        check = subprocess.run(["nft", "-j", "list", "table", "inet", "xgw_guard"],
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               timeout=0.8, check=False)
-        value["guard_layout"] = (guard_layout(json.loads(check.stdout)["nftables"])
-                                 if check.returncode == 0 else {"query": "not_confirmed"})
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        value["guard_layout"] = {"query": "deadline_or_error"}
-    value["phase"] = "guard_layout"
+    value["phase"] = "inbound_check"
     guard.save(path, value)
+    # inbound_problem() itself builds full rules("on"), including large GeoIP sets.
+    # It is not a cheap file-only check; keep it behind independently saved kernel facts.
+    problem = capture.inbound_problem()
+    value.update(effective_mode=capture.hold_mode() if mode == "on" and problem else mode,
+                 inbound_problem_present=bool(problem))
     value.update(phase="loaded", loaded_reason="pending_loaded")
     guard.save(path, value)
     answer = capture.loaded()
@@ -328,15 +343,19 @@ def kernel(directory):
     guard.save(path, value)
 
 
-def loaded(directory):
+def loaded(directory, context="off"):
+    if context not in ("off", "on"):
+        raise ValueError("diagnostic context")
+    budget = 8 if context == "on" else 4
     path = directory / "kernel-diagnostic.json"
-    guard.save(path, {"schema": 1, "loaded": None, "loaded_reason": "pending_child"})
+    guard.save(path, {"schema": 1, "context": context, "loaded": None,
+                      "loaded_reason": "pending_child"})
     reason = "child_error"
     rc = None
     try:
-        check = subprocess.run([sys.executable, "-I", str(HERE), "kernel", str(directory)],
+        check = subprocess.run([sys.executable, "-I", str(HERE), "kernel", str(directory), context],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=4, check=False)
+                               timeout=budget, check=False)
         rc = check.returncode
         reason = "invalid_result" if rc == 0 else "child_error"
     except subprocess.TimeoutExpired:
@@ -357,6 +376,9 @@ def loaded(directory):
     else:
         value["loaded_reason"] = "measured"
     value["child_rc"] = rc
+    value["context"] = context
+    value["child_budget_seconds"] = budget
+    guard.save(path, value)  # final normalization also available if events are incomplete
     return value
 
 
@@ -398,7 +420,7 @@ def run(directory):
     # Три независимых read-only задачи; сохранять каждый готовый результат немедленно.
     # Вся группа — внутри JOB cgroup, поэтому rollback прекращает и оставшиеся дочерние.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        tasks = {pool.submit(loaded, directory): "loaded"}
+        tasks = {pool.submit(loaded, directory, "on"): "loaded"}
         tasks.update({pool.submit(probe, directory, base["target"], marked): "https"
                       for marked in (False, True)})
         for future in as_completed(tasks):
@@ -426,10 +448,10 @@ def main():
     elif mode == "run":
         raise SystemExit(run(directory))
     elif mode == "kernel":
-        kernel(directory)
+        kernel(directory, sys.argv[3])
     elif mode == "report":
         for name in ("baseline.json", "off-diagnostic.json", "enable-result.json",
-                     "on-observations.json"):
+                     "on-observations.json", "kernel-diagnostic.json"):
             if (directory / name).exists():
                 print(json.dumps({name: read_json(directory / name)}))
     else:
