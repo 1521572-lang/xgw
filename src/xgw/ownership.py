@@ -18,6 +18,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .ownership_identity import CodeIdentity, IdentityRefused, valid_record
+
 MAX_BYTES = 65536
 MAX_WRITERS = 32
 MAX_RECEIPTS = 32
@@ -67,7 +69,18 @@ class Registry:
     Construction does no filesystem reads, directory creation or clock calls.
     """
 
-    def __init__(self, directory, *, boot_id, expected_uid=0, clock_ns=None, lock_budget=0.2):
+    def __init__(self, directory, *, boot_id, expected_uid=0, clock_ns=None, lock_budget=0.2,
+                 code_identity=None):
+        require(code_identity is None or type(code_identity) is CodeIdentity,
+                "CODE_IDENTITY_ARGUMENT")
+        try:
+            record = None if code_identity is None else code_identity.record()
+        except IdentityRefused:
+            raise Refused("CODE_IDENTITY_ARGUMENT") from None
+        self.code_identity = self._code_identity = code_identity
+        self._code_record = record
+        self._code_digest = None if code_identity is None else code_identity.digest()
+        self._state_schema = 1 if code_identity is None else 2
         require(boot(boot_id), "BOOT_ARGUMENT")
         require(integer(expected_uid), "OWNER_ARGUMENT")
         require(
@@ -83,6 +96,22 @@ class Registry:
         self.clock_ns = time.monotonic_ns if clock_ns is None else clock_ns
         require(callable(self.clock_ns), "CLOCK_ARGUMENT")
         self.lock_budget = lock_budget
+
+    def code_context(self):
+        require(self.code_identity is self._code_identity, "CODE_CONTEXT_CHANGED")
+        try:
+            current = None if self.code_identity is None else self.code_identity.record()
+        except IdentityRefused:
+            raise Refused("CODE_CONTEXT_CHANGED") from None
+        require(current == self._code_record, "CODE_CONTEXT_CHANGED")
+
+    def token_fields(self, fields):
+        return fields | {"code_identity_sha256"} if self._state_schema == 2 else fields
+
+    def bind_token(self, token):
+        if self._state_schema == 2:
+            token["code_identity_sha256"] = self._code_digest
+        return token
 
     def metadata(self, info, *, directory=False):
         kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
@@ -136,6 +165,7 @@ class Registry:
 
     def initialize(self):
         """Exclusive explicit bootstrap of a NEW store. Never repairs or reuses one."""
+        self.code_context()
         try:
             self.directory.mkdir(mode=0o700, parents=False, exist_ok=False)
             directory_fd = self.open_directory()
@@ -143,7 +173,7 @@ class Registry:
                 self.exclusive_write(directory_fd, "lock", {})
                 info = os.stat("lock", dir_fd=directory_fd, follow_symlinks=False)
                 state = {
-                    "schema": 1,
+                    "schema": self._state_schema,
                     "registry_id": uuid.uuid4().hex,
                     "boot_id": self.boot_id,
                     "lock_device": info.st_dev,
@@ -156,6 +186,8 @@ class Registry:
                     "lease": None,
                     "receipts": [],
                 }
+                if self._state_schema == 2:
+                    state["code_identity"] = dict(self._code_record)
                 self.validate(state)
                 self.exclusive_write(directory_fd, "state.json", state)
                 os.fsync(directory_fd)
@@ -165,6 +197,7 @@ class Registry:
             raise Refused("INITIALIZE_FAILED") from None
 
     def validate(self, state):
+        self.code_context()
         fields = {
             "schema",
             "registry_id",
@@ -179,8 +212,14 @@ class Registry:
             "lease",
             "receipts",
         }
+        if self._state_schema == 2:
+            fields.add("code_identity")
         require(isinstance(state, dict) and set(state) == fields, "STATE_SCHEMA")
-        require(type(state["schema"]) is int and state["schema"] == 1, "STATE_SCHEMA")
+        require(type(state["schema"]) is int and state["schema"] == self._state_schema,
+                "STATE_SCHEMA")
+        if self._state_schema == 2:
+            require(valid_record(state["code_identity"])
+                    and state["code_identity"] == self._code_record, "CODE_IDENTITY_MISMATCH")
         require(identity(state["registry_id"]) and boot(state["boot_id"]), "STATE_IDENTITY")
         require(state["boot_id"] == self.boot_id, "BOOT_MISMATCH")
         require(
@@ -281,6 +320,7 @@ class Registry:
 
     @contextlib.contextmanager
     def locked(self):
+        self.code_context()
         try:
             directory_fd = self.open_directory()
             try:
@@ -329,17 +369,18 @@ class Registry:
             raise Refused("COMMIT_UNCERTAIN") from None
 
     def writer_token(self, state, writer):
-        return {
+        return self.bind_token({
             "registry_id": state["registry_id"],
             "boot_id": state["boot_id"],
             "id": writer["id"],
             "role": writer["role"],
-        }
+        })
 
     def check_writer_token(self, state, token):
         require(
             isinstance(token, dict)
-            and set(token) == {"registry_id", "boot_id", "id", "role"}
+            and set(token) == self.token_fields({"registry_id", "boot_id", "id", "role"})
+            and (self._state_schema == 1 or token["code_identity_sha256"] == self._code_digest)
             and token["registry_id"] == state["registry_id"]
             and token["boot_id"] == self.boot_id
             and integer(token["id"])
@@ -409,13 +450,13 @@ class Registry:
 
     def recovery_token(self, state):
         lease = state["lease"]
-        return {
+        return self.bind_token({
             "registry_id": state["registry_id"],
             "boot_id": state["boot_id"],
             "run_id": lease["run_id"],
             "epoch": lease["epoch"],
             "generation": lease["generation"],
-        }
+        })
 
     def acquire(self, *, run_id, expected_generation, duration_ns):
         require(
@@ -446,7 +487,8 @@ class Registry:
         require(
             state["lease"] is not None
             and isinstance(token, dict)
-            and set(token) == {"registry_id", "boot_id", "run_id", "epoch", "generation"}
+            and set(token) == self.token_fields(
+                {"registry_id", "boot_id", "run_id", "epoch", "generation"})
             and type(token["epoch"]) is int
             and type(token["generation"]) is int
             and token == self.recovery_token(state),
@@ -479,10 +521,13 @@ class Registry:
     def summary(self):
         """Sanitized bookkeeping. This is never a runtime recovery qualification."""
         with self.locked() as (_, __, state):
-            return {
+            result = {
                 "writers": len(state["writers"]),
                 "unknown": sum(w["phase"] == "UNKNOWN" for w in state["writers"]),
                 "generation": state["generation"],
                 "receipts": len(state["receipts"]),
                 "phase": state["lease"]["phase"] if state["lease"] else "IDLE",
             }
+            if self._state_schema == 2:
+                result.update(schema=2, code_bound=True)
+            return result

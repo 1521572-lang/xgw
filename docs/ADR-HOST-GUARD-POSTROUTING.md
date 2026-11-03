@@ -1,27 +1,26 @@
 # ADR: host guard после policy reroute
 
-## Текущий статус — AI78 принят; укрупнённый AJ328 (04.11.2026)
+## Текущий статус — AJ328 принят; единый AK437 (04.11.2026)
 
-[AI report](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ai-2026-11-04.md) принят78/78 в
-scope explicitprivateFILES:batch7743мс/casesum5652мс/3positiveI/4UNKNOWN/1fenced.
-[Разбор AI](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md). Exactformatterprefix совпал;
-NULLoutcome вI не подставлять. NNP0/sudo0/start-monitor-show-report0/HEALTHY_ON/poolOFF/
-linkALIVE/versionssame/owneractions0. WorkerexitNOT_COLLECTED. Старыеbatches не повторять.
+[AJreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3aj-2026-11-04.md) принят328/328:
+82LEGACY/82OWNED(65COMPLETED17UNKNOWN)/82FENCED+B36/C22/D24. Batch71180мс/casesum59282мс.
+[Разбор AJ](REVIEW-REAL-MACHINE-0.2.0-wave3aj.md). Exact publicprefix равен pinnedformatter.
+HEALTHY_ON/poolOFF/linkALIVE/versionssame/NNP0/sudo0/start-monitor-show-report0/owneractions0.
+WorkerexitNOT_COLLECTED. Receiptprivateeffects неnetworksuccess. Старыеbatches не повторять.
 
-Владелец потребовал больше работы в одном ТЗ. [Пакет AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md):
-**4,205×AI**,15sourceentrypoints/4блока, одинstart/автопереходы/partialdata/одинreport.
-[ADR lifecycle](ADR-REC-C-LIFECYCLE-ENTRYPOINTS.md). A246 equivalence/fence,
-B36 dependencies/definitions,C22 drift/factories,D24 composites/FILES. No reruns/delaypadding.
-Global source/baseline/privacy/scopeSTOP сохранены. RealAJ NOT_RUN;15narrowchecks/RuffPASS.
+Следующий максимальный готовый [AK437](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ak.md):
+225protocol/50artifacts/146declaredsurfaces/16integration; одинstart/partial/одинreport.
+[ADR code identity](ADR-REC-C-CODE-IDENTITY-AND-PREFLIGHT.md). RealAK NOT_RUN.
+19narrowtests/RuffPASS, full437/broadVM/oldbatches НЕвыполнялись. Общие STOP сохранены.
 
-Source118/pin8A11M:новыйownership_entrypoints.py, changesengine.py/actions.py;115старых
-source/units/config/pyproject/standhelpers неизменны. OptionalouterLIFECYCLE охватывает
-SB→XR и15engine/actions calls; nestedownerpropagation и boundarychecks междуsteps.
-LegacyNone AST прежний/НЕfenced. Installedruntime не обновлён;9actors50hooks отдельны
-от15newfunctions, не globalgraph/version/boot/pathaliases/realverifiers/repair/bootstrap.
-Все7runtimegatesfalse;LiveC BLOCKED_BOOTSTRAP,independentoriginalon/code/unitrescueдоfault.
-OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/service/
-live rules. HostнеLANproof. Fullwave3/LAN/performance/DAE gates прежние. Ниже история.
+Source121/pin11A11M; противAJ3A+2M:identity/seal/surface новые, Registry/diagnostics changed.
+Остальные116source/packaging8/config/pyproject/oldhelpers unchanged. Explicit schema2
+code namespace и readonly exactartifact/65surfacepreflight, schema1None сохранена.
+Нет implicitmigration/loadedcodeattestation/mandatoryruntimegraph/actualdomainverifier/
+boot/repair/bootstrapactivation. Installedruntime не обновлялся. Все7runtimegatesfalse.
+LiveC BLOCKED_BOOTSTRAP; independentoriginalon/code/unitrescue ДОinstall/fault.
+OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/services/
+live rules. HostнеLANproof. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
 
 
 

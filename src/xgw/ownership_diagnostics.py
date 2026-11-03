@@ -33,6 +33,8 @@ REASONS = frozenset(
         "RECEIPT_LIMIT",
         "RECEIPT_SCHEMA",
         "RECEIPT_VALUES",
+        "CODE_IDENTITY_MISMATCH",
+        "CODE_CONTEXT_CHANGED",
     }
 )
 

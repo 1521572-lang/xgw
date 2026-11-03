@@ -1,5 +1,10 @@
 # ADR: общий допуск для lifecycle-операций engine и actions
 
+Обновление04.11.2026: [AJ328 принят](REVIEW-REAL-MACHINE-0.2.0-wave3aj.md).
+Следующий [AK437](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ak.md) добавляет opt-in code namespace/preflight.
+Ниже историческое описание AJ candidate до actualreport; runtimegates остаютсяfalse.
+
+
 Статус04.11.2026: source candidate готов, реальная AJ квалификация NOT_RUN.
 [AI принят](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md). [Единое ТЗ AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md).
 Прямое указание владельца: увеличить объём готовой работы за один заход. Объединены
