@@ -900,11 +900,14 @@ Rbd51241: отрицательный запрос curl97/0байт/.977с, од�
 `docs/REVIEW-REAL-MACHINE-0.2.0-wave3r.md`; N/P/Q не переписаны новым результатом.
 Sa748237 принята:12parsedfields/6syntaxflags/3cache/configRdigest/context совпали,
 не parser/server/causePASS. Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3s.md`.
-По требованию владельца задания укрупняются: актуальное
-`docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3t.md` +matching TEMPLATE — семь автоматических
-этапов в одномworker: independentrecords/allVLESS/allprofilegraph/health/journal/
-6мин пассивнойLAN. Автопереходы после optionalUNAVAILABLE, одинконсолидированныйотчёт.
-NoGET/сканы/переключения/правила/службы. Реальнаяwave3t NOT_RUN, on сохраняется.
+T8d208e9 принята:7этапов/364.31с/contextсохранён;6/67VLESSсверокравны,
+61NOT_RUN,141bridgeграфсогласован. Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3t.md`.
+Тестовый JSONarraycontainergap исправляется отдельным новымcollector, runtimeне меняется.
+Актуальное укрупнённое ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3u.md` +TEMPLATE:
+8автоматическихэтапов/одинworker/одинотчёт, расширенныйsourcewalk/configdiff/keyedhealth/
+effectiveunits/writerjournal и аудит cumulativeT7 безповторанаблюдения.
+Доступен толькоThinkCentre(подтверждено03.11), LANклиентские пути не подменяются hostпробами.
+Noactivequeries/networkchanges; реальнаяwave3u NOT_RUN, on/WAN/LAN/Tailscaleсохраняются.
 
 ### TUN
 

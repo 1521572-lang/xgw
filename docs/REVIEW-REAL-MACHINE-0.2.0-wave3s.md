@@ -62,6 +62,6 @@ unsupportedformat, неоднозначность, queryfalse/truncated/нуле
 
 Продукт и старые helpers неизменны. Новый batchwrapper прошёл17узких mocked/fixture
 проверок и Ruff; syntaxТЗпроверен. Локально нет broadVM/netns/реальных логов/шлюза/
-запросов/сервиса/правил. Реальная **wave3t NOT_RUN**, ожидается один
-TEST-REPORT-REAL-MACHINE-0.2.0-wave3t-ДАТА.md. Fullwave3/D1-on/E4/faults/LANUDP/IPv6/DNS/
+запросов/сервиса/правил. Обновление03.11: T8d208e9d25be2c0fee9dff2a6fa348db038150ae получена/scopedпринята.
+[РазборT](REVIEW-REAL-MACHINE-0.2.0-wave3t.md); новыйU8этапов NOT_RUN. Fullwave3/D1-on/E4/faults/LANUDP/IPv6/DNS/
 allTS/performance остаются открытыми; неwave4/DAE. Рабочийon/WAN/LAN/Tailscale сохраняются.

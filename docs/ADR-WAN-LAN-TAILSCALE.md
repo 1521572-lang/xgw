@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3t.md: единый укрупнённый пакет7этапов,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3u.md: единый пакет8этапов без активныхпроб,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -43,6 +43,13 @@ Sa748237 принята: configRdigest/3cache/12equalfields/6syntaxflags/context
 6мин пассивных LANсчётчиков: одинworker, автоматические переходы, один итоговый отчёт.
 Softphasefail не останавливает остальные чтения. Noactiveprobes/faults/networkchanges.
 Review-wave3s фиксирует границы. Реальнаяwave3t NOT_RUN, полнаяwave3ещёоткрыта.
+
+T8d208e9 принята scopedreadonly7phases/364.31с/contextсохранён. 6/67contractsравны,
+61NOT_RUN;141bridgeграф согласован. Исправляется testcollectorJSONarraycontainergap,
+неruntime. U:8этапов sourcecoverage/configgenerations/keyedscans/unitprops/writerjournal,
+одинworker/отчёт. Аудит cumulativeT7 безповторанаблюдения. Владелец03.11: толькоThinkCentre,
+отдельногоLANклиентанет; hostпробы не LANдоказательство. Реальнаяwave3u NOT_RUN.
+
 
 
 
