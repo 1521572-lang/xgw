@@ -1,5 +1,7 @@
 # Разбор wave3y: REC-B принят в границе snapshot/check-only
 
+Обновление: [Z19/19 принят](REVIEW-REAL-MACHINE-0.2.0-wave3z.md); следующий [AA](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aa.md) проверяет lifetime admission. Старый Z NOT_RUN ниже — исторический статус до фактического отчёта.
+
 [Отчёт Y](https://github.com/1521572-lang/xgw/blob/1440d51558636a6059c4b7f211abc4561908aee7/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3y-2026-11-03.md),
 commit **1440d51558636a6059c4b7f211abc4561908aee7**, принят fast-forward.
 Прогон03.11.2026,12:02:33–12:09 MSK; сбор5.705с. Tested HEAD

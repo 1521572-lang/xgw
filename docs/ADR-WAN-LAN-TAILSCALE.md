@@ -1,5 +1,35 @@
 # WAN, LAN и условный маршрут Tailscale
 
+
+## Актуально после Z — lifetime admission AA (03.11.2026)
+
+[Отчёт Z](TEST-REPORT-REAL-MACHINE-0.2.0-wave3z-2026-11-03.md) проверен:
+19/19, три realprocesscases/4children, command0, HEALTHY/on/pool/versions/связь сохранны.
+Принят только cooperative sandboxscope, реальный fence/driver/activeflagsfalse.
+Y/REC-B snapshot/check-only принят ранее; Y6/X26/W25/Z19 не повторять.
+
+[Разбор Z](REVIEW-REAL-MACHINE-0.2.0-wave3z.md),
+[аудит entrypoints и bootstrap](REC-C-CALLSITES-AND-BOOTSTRAP.md),
+[ADR lifetime admission](ADR-REC-C-ADMISSION-LIFETIME.md),
+[единое ТЗ AA](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aa.md).
+AA22 новых cases/3child — только user-sandbox; реальный AA NOT_RUN до отчёта.
+
+Уточнение прежнего долгого ownershiplock: вокруг systemctlrestart он создаёт риск
+parent→ExecStartPost→xgwnettun→тотжеlock. Новый кандидат использует короткий registrylock
+и durabletickets на lifetime writers. При непустом registry lease сразу отказывается,
+без PENDING, orphanpruning и остановки служб. COMMITTING/UNKNOWN запрещают silentretirement.
+Это не productintegration и не доказательство общего lockgraph.
+
+Далее productregistry/entrypointadapters/outcomereceipts. Fake-only независимый REC-D
+можно разрабатывать до Cinstallation, потому что он не меняет сеть; это уточняет старое
+строго последовательное описание C→D. Реальный E требует принятия и C, и D, и bootstrap.
+Установка C-ENTRY пока BLOCKED_BOOTSTRAP: нет независимого возврата исходных code/unit/on.
+Nooff/install/G1/WAN/LAN/Tailscale/pin/pool/service/ruleschanges. ThinkCentreonly, workingLAN.
+Fullwave3/D1-on/fault/LANUDP/IPv6/DNS/E4/performance/allTS открыты, неwave4/DAE.
+
+Ниже история предыдущих кандидатов; прежние NOT_RUN не отменяют принятые выше отчёты.
+
+
 ## Актуальное уточнение владельца 02.11.2026 — сохранять рабочий on
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN

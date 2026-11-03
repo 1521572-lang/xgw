@@ -1,5 +1,35 @@
 # REC-C: писатели поколения, первая инвентаризация и план внедрения fence
 
+
+## Актуально после Z — lifetime admission AA (03.11.2026)
+
+[Отчёт Z](TEST-REPORT-REAL-MACHINE-0.2.0-wave3z-2026-11-03.md) проверен:
+19/19, три realprocesscases/4children, command0, HEALTHY/on/pool/versions/связь сохранны.
+Принят только cooperative sandboxscope, реальный fence/driver/activeflagsfalse.
+Y/REC-B snapshot/check-only принят ранее; Y6/X26/W25/Z19 не повторять.
+
+[Разбор Z](REVIEW-REAL-MACHINE-0.2.0-wave3z.md),
+[аудит entrypoints и bootstrap](REC-C-CALLSITES-AND-BOOTSTRAP.md),
+[ADR lifetime admission](ADR-REC-C-ADMISSION-LIFETIME.md),
+[единое ТЗ AA](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aa.md).
+AA22 новых cases/3child — только user-sandbox; реальный AA NOT_RUN до отчёта.
+
+Уточнение прежнего долгого ownershiplock: вокруг systemctlrestart он создаёт риск
+parent→ExecStartPost→xgwnettun→тотжеlock. Новый кандидат использует короткий registrylock
+и durabletickets на lifetime writers. При непустом registry lease сразу отказывается,
+без PENDING, orphanpruning и остановки служб. COMMITTING/UNKNOWN запрещают silentretirement.
+Это не productintegration и не доказательство общего lockgraph.
+
+Далее productregistry/entrypointadapters/outcomereceipts. Fake-only независимый REC-D
+можно разрабатывать до Cinstallation, потому что он не меняет сеть; это уточняет старое
+строго последовательное описание C→D. Реальный E требует принятия и C, и D, и bootstrap.
+Установка C-ENTRY пока BLOCKED_BOOTSTRAP: нет независимого возврата исходных code/unit/on.
+Nooff/install/G1/WAN/LAN/Tailscale/pin/pool/service/ruleschanges. ThinkCentreonly, workingLAN.
+Fullwave3/D1-on/fault/LANUDP/IPv6/DNS/E4/performance/allTS открыты, неwave4/DAE.
+
+Ниже история предыдущих кандидатов; прежние NOT_RUN не отменяют принятые выше отчёты.
+
+
 Актуально после Y1440d51: REC-B принята в snapshot/check-only scope, guard10/10 исправлен
 только в тесте. Zпроверяет cooperative sandbox candidate/19cases/3processcases; реальные
 writers ещё не интегрированы, fence NOT_INSTALLED. См. ADR-REC-C-OWNERSHIP и ReviewY.
@@ -84,6 +114,8 @@ Manifest status PLANNED_NOT_ARMED, fence/driver/active gates=false. Kernel check
 По результату X исправлять конкретный дефект снимка/парсера, если он появится;
 при успешном scope продолжать C1/C2, не возвращаться к TLS/cache/journal микропрогонам.
 
+Уточнение имени: функция nft.py1154 называется delete, раннее remove было опиской.
+
 ## 5. Дополнительные прямые nft writers: scope и admission
 
 Продолжение статического аудита, не исчерпывающий call graph и не реальное наблюдение.
@@ -93,7 +125,7 @@ Manifest status PLANNED_NOT_ARMED, fence/driver/active gates=false. Kernel check
 | [Backend._save_peers/_nft_element](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L152-L163) | peers.json и **host ip xgw/fp_peers**, TABLE=xgw | Прямые add/delete element обходят capture._load; включить в admission/generation publication |
 | [Backend.prepare](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L172-L195) | запись peers и add element | Нужна граница между файлом поколения и kernel update; проверить cleanup при частичной ошибке |
 | [Backend.stop/reconcile](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L281-L335) | delete/flush fp_peers плюс lifecycle | Режим pool off сам по себе не доказывает отсутствие этих writers; actual invocation в Y не устанавливалась |
-| [nft.remove](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/net/nft.py#L1154-L1159) | capture+guard removal | Top-level down/uninstall paths должны получить явный admission; не обходить через cleanup |
+| [nft.delete](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/net/nft.py#L1154-L1159) | capture+guard removal | Top-level down/uninstall paths должны получить явный admission; не обходить через cleanup |
 | [usage.remove/_nft](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/usage.py#L250-L274) | отдельная **ip xgw_acct** (TABLE line44) | Не объявлять writer ip xgw только по наличию nft -f; сохранить чужой относительно snapshot scope |
 | [agent._guard](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/agent.py#L752-L759) и [штатный unit](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/packaging/xgw-fp%40.service#L10-L16) | table xgwfp; штатный unit PrivateNetwork=yes | Различать host vs namespace; прямой CLI entry и зависимости peer generation ещё требуют аудита |
 
