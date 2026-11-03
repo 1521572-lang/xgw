@@ -1,5 +1,11 @@
 # Разбор wave3ag: HOLD — итог заявлен, таблица противоречит закреплённому сборщику
 
+Обновление04.11.2026: [AH exactreadback](REVIEW-REAL-MACHINE-0.2.0-wave3ah.md) принят;
+AG129 принят в sourcefixture scope, HOLD снят. Ниже исходный разбор до получения AH;
+он сохраняет историю противоречий publictable. Originaltestreports не переписаны.
+Следующий пакет [AI78](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ai.md), realAI NOT_RUN.
+
+
 [Полученный отчёт](https://github.com/1521572-lang/xgw/blob/62ae684af177b60e8e52683251caacab771c5760/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ag-2026-11-03.md#L1)
 принят в Git fast-forward, commit62ae684af177b60e8e52683251caacab771c5760.
 **AG129 пока не принят как доказанный результат.** Оригинальный отчёт сохраняется.

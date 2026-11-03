@@ -1,27 +1,25 @@
 # ADR REC-C: dormant registry foundation с одним atomic record
 
-## Текущий статус — AG HOLD; единый AH readback (03.11.2026)
+## Текущий статус — AH принят; AG129 принят; единый AI78 (04.11.2026)
 
-[Отчёт AG](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ag-2026-11-03.md) доставлен
-commit62ae684af177b60e8e52683251caacab771c5760, но **129/129 пока не принято**:
-54 строки expected_return противоречат pinned helper8045d3a; 88 времён приблизительные.
-[Разбор AG](REVIEW-REAL-MACHINE-0.2.0-wave3ag.md). Причина неизвестна;
-actual нельзя заменять source expectation. Original reports не переписываются.
+[AHreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ah-2026-11-03.md) exactreadback
+AG129/AF145/AE112=386existingrows/0newtests/0contractmismatch. [Разбор AH](REVIEW-REAL-MACHINE-0.2.0-wave3ah.md).
+AGHOLD снят в optional-source/fake-effects scope. В прежнейAGtable были54expected/
+36observedenum/88approxms расхождения, actualsavedreadback соответствует source.
+88различающихсяrows, не сумма178cases. Originalreports сохраняются. AF/AE безdiff.
+NNP0/sudo0/collect0/show0/HEALTHY_ON/poolOFF/linkALIVE/versionssame/owneractions0.
+WorkerexitNOT_COLLECTED; mutableownerfiles не authentication. Старыеbatches не повторять.
 
-[ТЗ AH](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ah.md) и
-[ADR readback](ADR-REC-EVIDENCE-READBACK.md): один read-only сбор existing
-AG129/AF145/AE112, до386 сохранённых строк, **ноль новых cases и повторов batches**.
-Точные поля/nulls/времена переносятся автоматически; профиль с отсутствующим архивом
-не мешает чтению остальных. Реальный AH NOT_RUN, ожидается один wave3ah-report.
-Локально9 узких parser/privacy/render checks PASS; это не ThinkCentre evidence.
-
-Продуктовые src116/units/config/pyproject/прежние helpers неизменны относительно8045d3a,
-source diff кpin351 остаётся6A10M. Installedruntime не обновлялся. Следующий product
-этап ждёт сверки AG. Все7 runtime gates false; explicit9actors/50methods не globalfence.
-LiveC BLOCKED_BOOTSTRAP; independent original-on/code/unitrescue обязателен доinstall/fault.
+[Единое ТЗ AI](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ai.md) и
+[ADR FILES completion](ADR-REC-C-FILES-COMPLETION.md):78НОВЫХcases/одинstart/
+автопереходы/partialsnapshot/одинавтоматическийreport. Толькоnewownership_completion.py,
+117source/7A10M; все прежние116source/units/config/pyproject/standhelpers UNCHANGED.
+Concrete fresh namedFILES completion +exactrole/resultpolicy; другиеdomains→UNKNOWN.
+Это неglobalruntimeverifier/rolepolicy/pathalias/atomicsnapshot/activation. Runtimeнеwired/
+installedнеобновлён, все7gatesfalse. RealAI NOT_RUN;13unique narrowchecks/RuffPASS.
+LiveC BLOCKED_BOOTSTRAP; independent original-on/code/unitrescue доinstall/fault.
 OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/service/
-live rules. Host не LAN proof. HEALTHY19:28 противAF15:31 — причина/момент смены не
-установлены. Fullwave3/LAN/performance/DAE gates прежние. Ниже — история до AH.
+live rules. Host неLANproof. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
 
 
 
