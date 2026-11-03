@@ -909,12 +909,18 @@ reference 12/12. Рабочий on и контекст сохранены. U8-ж
 `docs/REVIEW-REAL-MACHINE-0.2.0-wave3u.md`.
 Счётчики T исправлены по U: последние cumulative RX5 517 331/TX139 736 077 байт;
 сумма всех cumulative из T не является трафиком интервала.
-Актуальное укрупнённое ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3v.md` + TEMPLATE:
-один worker/четыре автоматических этапа/один отчёт: U identity, классификация gap,
-категории изменения объектов и один bounded journal2ч/10с/1MiB.
-Повтора принятых сетевых опытов, графа/units/scanJOIN и активных запросов нет.
-Доступен только ThinkCentre (подтверждено03.11); host-пробы не клиентское доказательство.
-Реальная wave3v NOT_RUN; продуктовый patch по U не обоснован, on/WAN/LAN/Tailscale сохранены.
+V be1fc1b принят: четыре этапа/1.747с, рабочий on сохранён.
+Оставшийся gap — missing_identity;0 mismatch/ambiguity. В наблюдаемой паре current/last-good
+44VLESS изменены только по категории tls. Журнал2ч успешно прочитан, writer не установлен.
+Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3v.md`; повтор кэша/журнала не требуется.
+Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3w.md` + TEMPLATE:
+25 синтетических сценариев чистой модели возврата исходного on, один запуск/один отчёт.
+`ADR-RECOVERY-ORIGINAL-ON.md` и `PR-SPEC-WAVE3-ON-RECOVERY.md` задают этапы snapshot,
+writer fence, независимого driver и последующего scoped fault. Сейчас реализована только
+чистая модель REC-A; реальный driver/fence/recovery ещё не реализованы. Никаких timer,
+guardian, установки или сетевых изменений W не делает. Реальная wave3w NOT_RUN.
+Доступен только ThinkCentre; host-пробы не LAN acceptance. LAN считается работающей,
+on/WAN/LAN/Tailscale сохраняются; full wave3/D1-on/faults открыты, wave4/DAE не начинать.
 
 ### TUN
 

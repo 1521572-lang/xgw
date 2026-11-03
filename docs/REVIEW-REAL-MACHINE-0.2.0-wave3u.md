@@ -105,3 +105,13 @@ SHA старых помощников и product runtime сохранены.
 LAN UDP/IPv6/DNS/E4 не подменять gateway-запросами. Работающая LAN принимается как исходная
 схема. Performance/all Tailscale/full wave3 открыты, wave4/DAE не начинать. Отрицательный R,
 частичный N и заблокированный P не переписываются текущим static equality или saved OK.
+
+## После фактического V
+
+[Review V](REVIEW-REAL-MACHINE-0.2.0-wave3v.md): четыре этапа/1.747с/on сохранён.
+При совпавших SB/трёх body классификация gap — missing_identity,0 ambiguity/mismatch.
+В наблюдаемой паре V44 изменённых объекта — VLESS/tls, identity/groups0; исторический
+last-good U отдельно не отождествлён. Журнал2ч получен/708строк/EOF/rc0, writer неизвестен.
+Эта ветвь readonly завершена, очередной cache/journal/R request не назначен.
+Следующий этап REC-A — чистая модель original-on recovery; W передаёт25 сценариев,
+реальный driver/fence/snapshot остаются не реализованы. Никаких живых faults/таймеров в W.

@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3v.md: четыре этапа чтения,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3w.md: чистая модель on-recovery,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -90,6 +90,19 @@ ownedlistener/TLS/контекст подтверждены; SB-1двеcurl97/HT
 свидетельства/журналы/lastscan, не повторяет запросы и не меняет рабочий шлюз.
 Исторический mapping по filetimes не скрывает отсутствие старого configdigest.
 Review-wave3n фиксирует пределы; O_NOT_RUN, полнаяwave3 открыта.
+
+
+### Принято после реального V,03.11.2026
+
+V be1fc1b завершён/1.747с/context/on сохранны. SameSB/cache с U; один missing_identity,
+0 mismatch/ambiguity. В текущей паре поколений44VLESS отличаются только категорией tls,
+identity/groups0. Журнал2ч/708строк/EOF/rc0 успешно получен, writer/причина не установлены.
+Review-wave3v завершает эту readonly ветвь. Следующий открытый этап — возврат исходного on.
+ADR-RECOVERY-ORIGINAL-ON и PR-SPEC-WAVE3-ON-RECOVERY определяют REC-A–E.
+Реализована чистая модель REC-A, без сетевых/служебных/файловых операций модели;
+W передаёт25 синтетических сценариев на ThinkCentre одним пакетом/отчётом.
+Реальный driver/fence/recovery НЕ реализованы, simulate не разрешает fault/D1-on.
+ТЗ W не создаётtimer/guardian и не меняет сеть/службы; реальная wave3w NOT_RUN.
 
 
 ### Принято после реального U, 03.11.2026
