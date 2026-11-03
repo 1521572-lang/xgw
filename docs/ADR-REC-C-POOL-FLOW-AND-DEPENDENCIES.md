@@ -1,26 +1,27 @@
 # ADR REC-C: FreePool/PoolStore source flow и три явные dependency-связи
 
-## Текущий статус — AJ328 принят; единый AK437 (04.11.2026)
+## Текущий статус — AK435/437, два helper fixes; единый AL756 (04.11.2026)
 
-[AJreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3aj-2026-11-04.md) принят328/328:
-82LEGACY/82OWNED(65COMPLETED17UNKNOWN)/82FENCED+B36/C22/D24. Batch71180мс/casesum59282мс.
-[Разбор AJ](REVIEW-REAL-MACHINE-0.2.0-wave3aj.md). Exact publicprefix равен pinnedformatter.
+[AKreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ak-2026-11-04.md):435/437,
+A225/225 B50/50 C144/146 D16/16. [Разбор](REVIEW-REAL-MACHINE-0.2.0-wave3ak.md).
+Exactpublicprefix равен pinnedformatter; batch65475ms/casesum47693ms/413sreportinterval.
+H_DEFAULT/H_DEFAULT_CODE TypeError ДОmutation, ошибочно выбран среднийwrapper.
+Productsource НЕсломанэтимиfixtures. ВесьAKHOLD,435casesпринятытолькоscoped.
 HEALTHY_ON/poolOFF/linkALIVE/versionssame/NNP0/sudo0/start-monitor-show-report0/owneractions0.
-WorkerexitNOT_COLLECTED. Receiptprivateeffects неnetworksuccess. Старыеbatches не повторять.
+Actualoverallshape_rcNOT_COLLECTED; show0не checker0. WorkerexitNOT_COLLECTED.
 
-Следующий максимальный готовый [AK437](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ak.md):
-225protocol/50artifacts/146declaredsurfaces/16integration; одинstart/partial/одинreport.
-[ADR code identity](ADR-REC-C-CODE-IDENTITY-AND-PREFLIGHT.md). RealAK NOT_RUN.
-19narrowtests/RuffPASS, full437/broadVM/oldbatches НЕвыполнялись. Общие STOP сохранены.
+[AL756](TEST-PLAN-REAL-MACHINE-0.2.0-wave3al.md) исправляетобаtargets и квалифицирует
+306declareddefaults/innercode/closure slots наdirectcatalog+preflight, одинstart/report.
+[PR-spec](PR-SPEC-WAVE3AL-DEFAULTS-REPAIR.md). 17narrowtests/RuffPASS; realALNOT_RUN.
+Baseline→mutationrefusal→restore→fresh; incomplete restore/globalbaseline→STOP,
+ordinaryindependentFAIL→continue. Show/shapeactualrc разделены15полямиfooter.
 
-Source121/pin11A11M; противAJ3A+2M:identity/seal/surface новые, Registry/diagnostics changed.
-Остальные116source/packaging8/config/pyproject/oldhelpers unchanged. Explicit schema2
-code namespace и readonly exactartifact/65surfacepreflight, schema1None сохранена.
-Нет implicitmigration/loadedcodeattestation/mandatoryruntimegraph/actualdomainverifier/
-boot/repair/bootstrapactivation. Installedruntime не обновлялся. Все7runtimegatesfalse.
-LiveC BLOCKED_BOOTSTRAP; independentoriginalon/code/unitrescue ДОinstall/fault.
-OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/services/
-live rules. HostнеLANproof. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
+Source121/pin11A11M/packaging8/config/pyproject/59oldstandfiles UNCHANGEDсtestedAK,
+новый productpatch НЕнужен. Installedruntime не обновлялся. Oldbatchesнеповторять.
+Metadatafixtures неbusinessbody/networkproof/deepclosure/globalgraph; all7gatesfalse.
+LiveCBLOCKED_BOOTSTRAP; independentoriginalon/code/unitrescue ДОinstall/fault.
+OnlyThinkCentre/workingLAN/HEALTHY/on/LANclientнет, nooff/install/WAN/LAN/TS/pool/config/
+services/live rules. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
 
 
 Статус03.11.2026: dormant source candidate AG; [AF145 принято](REVIEW-REAL-MACHINE-0.2.0-wave3af.md).

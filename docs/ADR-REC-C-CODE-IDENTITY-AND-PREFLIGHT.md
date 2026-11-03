@@ -1,5 +1,10 @@
 # ADR: opt-in schema2 code identity и readonly build preflight
 
+Обновление04.11.2026: [AK435/437](REVIEW-REAL-MACHINE-0.2.0-wave3ak.md), две ошибки
+в тестовых fixtures, fullqualificationHOLD. [AL756](TEST-PLAN-REAL-MACHINE-0.2.0-wave3al.md)
+исправляетtargets без productpatch. Ниже исходное решение доactualAK; runtimegatesfalse.
+
+
 Статус04.11.2026: source candidate готов, реальный AK437 NOT_RUN.
 [AJ принят328/328](REVIEW-REAL-MACHINE-0.2.0-wave3aj.md).
 [Единое ТЗ AK437](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ak.md).
