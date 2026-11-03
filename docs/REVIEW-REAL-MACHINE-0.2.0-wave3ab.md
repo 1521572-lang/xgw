@@ -1,5 +1,7 @@
 # Разбор wave3ab и укрупнение следующей квалификации
 
+Обновление: [AC51/51 принята](REVIEW-REAL-MACHINE-0.2.0-wave3ac.md); [AD130](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ad.md) проверяетopt-inhooksреальныхsourcebodiesсfakeeffects. СтарыйACNOT_RUNниже—история.
+
 [Отчёт AB](https://github.com/1521572-lang/xgw/blob/cce1d22c952482b556a315fece63274ed78c239e/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ab-2026-11-03.md)
 принят fast-forward, commitcce1d22c952482b556a315fece63274ed78c239e.
 03.11.2026,13:58:58–14:05MSK — интервал всего прогона, не helperelapsed.

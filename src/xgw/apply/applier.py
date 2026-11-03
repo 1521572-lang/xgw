@@ -33,6 +33,7 @@ from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
 from ..net import cmd, tun
 from ..net.capture import capture_inbounds
+from ..ownership_hooks import owned
 from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.api import ApiClient, ApiError
 from ..xraycore.service import XrayService, XrayServiceError
@@ -80,7 +81,9 @@ class Applier:
         now_fn=lambda: datetime.datetime.now().time(),
         wait_seconds: float = RESTART_WAIT_SECONDS,
         runner: cmd.Runner = cmd.run,
+        ownership=None,
     ) -> None:
+        self.ownership = ownership
         self.runner = runner
         self.cfg = cfg
         self.paths = paths
@@ -94,6 +97,7 @@ class Applier:
         self.now_fn = now_fn
         self.wait_seconds = wait_seconds
 
+    @owned("CORE")
     def apply(
         self, new_config: dict, *, urgent: bool = False, force_now: bool = False
     ) -> ApplyOutcome:
@@ -105,6 +109,7 @@ class Applier:
         with file_lock(self.paths.lock_file):
             return self._apply_locked(new_config, restart_now=urgent or force_now)
 
+    @owned("CORE")
     def rollback(self, reason: str) -> ApplyOutcome:
         """Откат на last-good по решению watchdog: Xray не поднимается с текущим
         конфигом. Если last-good нет или он совпадает с текущим — откатывать нечего."""

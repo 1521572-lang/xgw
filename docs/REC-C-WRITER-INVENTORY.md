@@ -1,6 +1,43 @@
 # REC-C: писатели поколения, первая инвентаризация и план внедрения fence
 
 
+## Актуально после AC — единый AD130 source-hook пакет (03.11.2026)
+
+[ACreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ac-2026-11-03.md) проверен:
+51/51,A28/B16/D7; fakepositiverestorations2/expectedfailure1/refusals2/unused2;
+measuredtimings5, WORKLOAD8directchildren+7driverlaunchobservations. HEALTHY/on/pool/
+версии/связьсохранны. [Разбор AC](REVIEW-REAL-MACHINE-0.2.0-wave3ac.md) уточняет
+Acounts:10COMPLETED/2REFUSED/14UNKNOWN/2terminalcases, ане11/15. Общий51PASSверен.
+AC51/AB32/AA22/Z19/Y6/X26/W25неповторять. Runtimeгейтыfalse.
+
+[Единое ТЗ AD](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ad.md) объединяет130НОВЫХcases:
+38вариантовреальныхметодов×LEGACY/OWNED/FENCED +16context/error/readerchecks.
+[ADR AD](ADR-REC-C-OPT-IN-SOURCE-HOOKS.md). Одинstart/автопереходы/partialreadout/одинreport,
+максимальныйготовыйsafeобъём. РеальнаяAD NOT_RUN; локально8узкихtests/RuffPASS.
+
+Source diffпротивpin351 теперь4A+7M: ownership*.pyдобавлены; 7модулейCapture/Backend/
+Applier/SingboxCore/Job/ApiClient/managedполучилиopt-inhooks. 31instancewrapper+managed
+_update. СохраняемостьстарыхbodyпроверяетсяAST. Вsourceстарые7модулейтеперьимпортируют
+hooks; раннее«нетimports»нижеисторическое. Ноexistingruntimeactors coordinatorНЕпередают,
+NoneсохраняетlegacyиНЕобеспечиваетfence. Installedruntimeне меняется/неустанавливается.
+Mandatorybinding/realverifier/repair/recovery/bootstrapNOT_IMPLEMENTED.
+
+ADfreezehelper+publicSHAmanifest+114sourcefilesвusernotes, импортprivatefrozen_ad, не
+installedXGW. Runner/API/service/TUNподставные, dummycorefilesтольковfixture. Auditguard
+отказываетprocess/socket/out-of-noteswriteдоэффекта; этонеhostilecode securitysandbox.
+Никакихworkloadprocesses/ACfakeDповторов/служб/сети. FENCEDchecksпроверяютfixturecontent/
+modes/entriesиtrace0; OWNEDreturnclass+одинreceipt. CallerassertionsнеactualKERNEL/APIproof.
+
+Coordinatorсохраняетbusinessresult/exception, nestedrolesделятticket, nestedfailuretaints
+outer. Deferredresultsотвергаютсявключаявложенные, thread/PIDcontextпроверяется. Новая
+регрессиязакрываетescapeвложенногогенератора; генераторbodyнеисполняется. DefaultNone
+неразрешаетзаявлятьglobalfence/ставитьlivefault. LiveCinstallationBLOCKED_BOOTSTRAP.
+Nooff/install/G1/WAN/LAN/TS/pin/pool/config/service/ruleschanges. OnlyThinkCentre,
+workingLAN/HEALTHY/on. Fullwave3/D1-on/fault/LANUDP/IPv6/DNS/E4/performance/allTSоткрыты,
+неwave4/DAE. Далееистория; прежнийACNOT_RUNзаменёнфактическимотчётом,неliveготовностью.
+
+
+
 ## Актуально после AB — единый максимальный пакет AC (03.11.2026)
 
 [ABотчёт](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ab-2026-11-03.md) проверен:32/32,

@@ -18,6 +18,7 @@ from typing import TypeVar
 from urllib.parse import urlsplit
 
 from . import priority as priority_levels
+from .ownership_hooks import call_owned
 from .parsers.common import parse_links_text
 from .paths import LockTimeout, atomic_write_json, file_lock
 
@@ -67,7 +68,11 @@ def lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
-def _update(path: Path, change: Callable[[dict], T]) -> T:
+def _update(path: Path, change: Callable[[dict], T], *, ownership=None) -> T:
+    return call_owned(ownership, "PANEL", lambda: _update_locked(path, change))
+
+
+def _update_locked(path: Path, change: Callable[[dict], T]) -> T:
     """load → change → save под блокировкой. У panel.json несколько писателей: панель
     (поток демона) и команды `xgw priority`, `xgw core`; без блокировки правка, сделанная
     между чтением и записью другого писателя, терялась.

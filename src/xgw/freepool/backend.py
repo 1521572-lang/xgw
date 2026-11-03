@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..net import cmd
+from ..ownership_hooks import owned
 from ..paths import Paths, atomic_write_json
 from . import agent as agenting
 
@@ -144,18 +145,21 @@ class Backend:
     def __init__(self, paths: Paths, *, runner: cmd.Runner = cmd.run, logger=None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 sys_net: Path = Path("/sys/class/net")) -> None:
+                 sys_net: Path = Path("/sys/class/net"), ownership=None) -> None:
+        self.ownership = ownership
         self.paths, self.runner, self.log = paths, runner, logger
         self.clock, self.sleep, self.sys_net = clock, sleep, sys_net
         self.leases: dict[str, Lease] = {}
 
     # --- набор fp_peers -------------------------------------------------------------------
 
+    @owned("PEERS")
     def _save_peers(self) -> None:
         atomic_write_json(peers_file(self.paths),
                           {"peers": sorted({lease.element for lease in self.leases.values()})},
                           mode=0o600)
 
+    @owned("PEERS")
     def _nft_element(self, verb: str, element: str) -> None:
         self.runner(["nft", verb, "element", "ip", TABLE, PEERS_SET, "{", element, "}"],
                     timeout=10.0, check=verb == "add")
@@ -169,6 +173,7 @@ class Backend:
                 return index
         raise BackendError("RESOURCE_LIMIT", "нет свободного номера veth")
 
+    @owned("PEERS")
     def prepare(self, *, peer: str, port: int, host: str, user: str, password: str,
                 lan: tuple[str, ...], xray_bin: Path, sstpc_bin: Path = SSTPC_BIN) -> Lease:
         """Задание, адрес в fp_peers, veth, служба; возвращается сразу после запуска службы
@@ -278,6 +283,7 @@ class Backend:
                 return 0
         return total
 
+    @owned("PEERS")
     def stop(self, lease: Lease) -> None:
         """Служба, veth, адрес в fp_peers, каталог. Ничто из этого не должно остаться и при
         сбое на полпути (ошибки — в журнал, дальше)."""
@@ -298,6 +304,7 @@ class Backend:
             self._warn(f"peers.json не записан: {exc}")
         shutil.rmtree(agenting.run_dir(self.paths, lease.gen), ignore_errors=True)
 
+    @owned("PEERS")
     def reconcile(self) -> int:
         """Убрать следы поколений, которых демон не ведёт (после перезапуска демона или
         сбоя): службы, veth, адреса, каталоги. Сколько убрано."""

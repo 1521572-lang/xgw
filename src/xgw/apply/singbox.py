@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .. import log
 from ..generator import singbox as singboxing
+from ..ownership_hooks import owned
 from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.service import (
     PidfileXrayService,
@@ -96,7 +97,9 @@ class SingboxCore:
         validator: Validator | None = None,
         logger=None,
         wait_seconds: float = READY_SECONDS,
+        ownership=None,
     ) -> None:
+        self.ownership = ownership
         self.cfg = cfg
         self.paths = paths
         self.service = service
@@ -109,6 +112,7 @@ class SingboxCore:
 
     # --- применение ----------------------------------------------------------------
 
+    @owned("CORE")
     def apply(self, config: dict | None, *, reload: bool) -> SingboxOutcome:
         """config — желаемый конфиг (None — sing-box больше не нужен); reload — применить
         сейчас, иначе отложить (конфиг ждёт в config.pending.json)."""
@@ -232,6 +236,7 @@ class SingboxCore:
         except (OSError, http.client.HTTPException):
             return False
 
+    @owned("CORE")
     def restart(self) -> str | None:
         """Перезапуск службы; None — поднялся, иначе причина."""
         current = self.read()
@@ -241,6 +246,7 @@ class SingboxCore:
             return f"перезапуск sing-box не удался: {exc}"
         return self._wait_ready(current or {})
 
+    @owned("CORE")
     def rollback(self, reason: str) -> SingboxOutcome:
         """Откат на last-good по решению watchdog. Нечего откатывать — unchanged."""
         with file_lock(self.paths.lock_file):

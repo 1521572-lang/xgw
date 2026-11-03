@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import masking
+from ..ownership_hooks import owned
 from ..paths import secret_tempdir
 
 
@@ -146,6 +147,7 @@ class ApiClient:
     # (ASSUMPTIONS п. 253). Нет файла или адреса в нём — server.
     config_file: Path | None = None
     _cache: dict = field(default_factory=dict, compare=False, repr=False)
+    ownership: object | None = field(default=None, compare=False, repr=False, kw_only=True)
 
     def address(self) -> str:
         """Адрес API для `xray api -s`; файл конфига перечитывается, только когда он изменился."""
@@ -202,22 +204,27 @@ class ApiClient:
 
     # --- outbounds ------------------------------------------------------------
 
+    @owned("API")
     def add_outbounds(self, outbounds: list[dict]) -> str:
         return self._run("ado", payload={"outbounds": outbounds})
 
+    @owned("API")
     def remove_outbound(self, tag: str) -> str:
         return self._run("rmo", tag)
 
     # --- inbounds -------------------------------------------------------------
 
+    @owned("API")
     def add_inbounds(self, inbounds: list[dict]) -> str:
         return self._run("adi", payload={"inbounds": inbounds})
 
+    @owned("API")
     def remove_inbound(self, tag: str) -> str:
         return self._run("rmi", tag)
 
     # --- routing --------------------------------------------------------------
 
+    @owned("API")
     def replace_routing(self, routing: dict, *, append: bool = False) -> str:
         """Замена правил маршрутизации вместе с балансировщиками (adrules)."""
         flags = ["-append"] if append else []
@@ -238,9 +245,11 @@ class ApiClient:
     def list_inbounds(self) -> str:
         return self._run("lsi")
 
+    @owned("API")
     def pin(self, balancer: str, outbound_tag: str) -> str:
         """Ручное закрепление узла (xgw pin); отключает автопереключение!"""
         return self._run("bo", outbound_tag, flags=["-b", balancer])
 
+    @owned("API")
     def unpin(self, balancer: str) -> str:
         return self._run("bo", flags=["-b", balancer, "-r"])

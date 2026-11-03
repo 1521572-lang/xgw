@@ -36,6 +36,7 @@ from . import engine, fetch, log
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config
 from .generator import singbox as singboxing
 from .net import cmd
+from .ownership_hooks import owned
 from .paths import LockTimeout, Paths, atomic_write_json, file_lock
 from .sbcore import binary as sbbinary
 from .store import Store
@@ -643,7 +644,9 @@ class Job:
         logger=None,
         out: Callable[[str], None] = print,
         now: Callable[[], float] = time.time,
+        ownership=None,
     ) -> None:
+        self.ownership = ownership
         self.cfg = cfg
         self.paths = paths
         self.cores = cores if cores is not None else adapters(cfg, paths)
@@ -694,6 +697,7 @@ class Job:
 
     # --- шаги ----------------------------------------------------------------------
 
+    @owned("CORE")
     def update(self, core: str, version: str, reason: str) -> str:
         adapter, title = self.cores[core], TITLES[core]
         target = core_dir(self.paths, core)
@@ -788,6 +792,7 @@ class Job:
         return (f"{title} обновлён: {old} → {version}, проверки пройдены{note}.{watch} Вернуть "
                 f"{old} — кнопка «Вернуть {old}» в панели")
 
+    @owned("CORE")
     def rollback(self, core: str, reason: str) -> str:
         adapter, title = self.cores[core], TITLES[core]
         target = core_dir(self.paths, core)
