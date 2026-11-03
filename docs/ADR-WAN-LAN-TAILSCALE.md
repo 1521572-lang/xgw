@@ -1,5 +1,29 @@
 # WAN, LAN и условный маршрут Tailscale
 
+## Текущий статус — AG HOLD; единый AH readback (03.11.2026)
+
+[Отчёт AG](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ag-2026-11-03.md) доставлен
+commit62ae684af177b60e8e52683251caacab771c5760, но **129/129 пока не принято**:
+54 строки expected_return противоречат pinned helper8045d3a; 88 времён приблизительные.
+[Разбор AG](REVIEW-REAL-MACHINE-0.2.0-wave3ag.md). Причина неизвестна;
+actual нельзя заменять source expectation. Original reports не переписываются.
+
+[ТЗ AH](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ah.md) и
+[ADR readback](ADR-REC-EVIDENCE-READBACK.md): один read-only сбор existing
+AG129/AF145/AE112, до386 сохранённых строк, **ноль новых cases и повторов batches**.
+Точные поля/nulls/времена переносятся автоматически; профиль с отсутствующим архивом
+не мешает чтению остальных. Реальный AH NOT_RUN, ожидается один wave3ah-report.
+Локально9 узких parser/privacy/render checks PASS; это не ThinkCentre evidence.
+
+Продуктовые src116/units/config/pyproject/прежние helpers неизменны относительно8045d3a,
+source diff кpin351 остаётся6A10M. Installedruntime не обновлялся. Следующий product
+этап ждёт сверки AG. Все7 runtime gates false; explicit9actors/50methods не globalfence.
+LiveC BLOCKED_BOOTSTRAP; independent original-on/code/unitrescue обязателен доinstall/fault.
+OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/service/
+live rules. Host не LAN proof. HEALTHY19:28 противAF15:31 — причина/момент смены не
+установлены. Fullwave3/LAN/performance/DAE gates прежние. Ниже — история до AH.
+
+
 
 ## Актуально после AF — единый AG129 pool-flow пакет (03.11.2026)
 
