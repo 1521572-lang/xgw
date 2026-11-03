@@ -1,5 +1,10 @@
 # ADR REC-C: opt-in hooks реальных методов, без runtime activation
 
+Актуальное состояние03.11: [AE112 принято](REVIEW-REAL-MACHINE-0.2.0-wave3ae.md),
+[AF145 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3af.md),
+[новый ADR source flow](ADR-REC-C-SOURCE-FLOW-AND-FACTORIES.md). Далее история прежнего
+snapshot. Текущий boundary37/source6A8M/111sourceunchanged; installed runtime не менялся.
+
 Актуальное решение03.11: [AD130 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ad.md),
 [AE112 подготовлен](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ae.md),
 [новый ADR binding/files](ADR-REC-C-BOUND-COMPOSITE-AND-FILES.md). Ниже история AD;

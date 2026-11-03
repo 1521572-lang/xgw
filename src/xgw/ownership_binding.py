@@ -33,7 +33,7 @@ class PanelWriter:
         return managed._update(self.path, change, ownership=self.ownership)
 
 
-# This is the accepted AD source boundary, not the complete runtime writer graph.
+# Declared source boundary only; the global runtime writer graph remains incomplete.
 SPECS = MappingProxyType(
     {
         "capture": (
@@ -61,7 +61,9 @@ SPECS = MappingProxyType(
         ),
         "xray": (Applier, "CORE", ("apply", "rollback")),
         "singbox": (SingboxCore, "CORE", ("apply", "rollback", "restart")),
-        "cores": (Job, "CORE", ("update", "rollback")),
+        "cores": (
+            Job, "CORE", ("update", "rollback", "run", "_reject", "_stage", "_save", "_event"),
+        ),
         "api": (
             ApiClient,
             "API",

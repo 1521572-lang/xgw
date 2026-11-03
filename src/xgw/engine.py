@@ -939,12 +939,12 @@ def persist(
 # --- доступ к работающему ядру -------------------------------------------------
 
 
-def make_api(paths: Paths, xray_bin: Path) -> ApiClient:
+def make_api(paths: Paths, xray_bin: Path, *, ownership=None) -> ApiClient:
     """Клиент API Xray: адрес — из применённого конфига (ApiClient.address), до первого конфига —
     сокет paths.xray_api_socket."""
     return ApiClient(
         xray_bin, server=server_address(str(paths.xray_api_socket)),
-        config_file=paths.xray_config_file,
+        config_file=paths.xray_config_file, ownership=ownership,
     )
 
 
@@ -958,17 +958,19 @@ def make_service(paths: Paths, xray_bin: Path | None) -> XrayService:
     return SystemdXrayService()
 
 
-def make_applier(cfg: config.Config, paths: Paths, xray_bin: Path) -> Applier:
+def make_applier(cfg: config.Config, paths: Paths, xray_bin: Path, *, ownership=None) -> Applier:
     return Applier(
-        cfg, paths, make_api(paths, xray_bin), make_service(paths, xray_bin), xray_bin=xray_bin
+        cfg, paths, make_api(paths, xray_bin, ownership=ownership), make_service(paths, xray_bin),
+        xray_bin=xray_bin, ownership=ownership,
     )
 
 
-def make_singbox(cfg: config.Config, paths: Paths) -> singbox_apply.SingboxCore:
+def make_singbox(cfg: config.Config, paths: Paths, *, ownership=None) -> singbox_apply.SingboxCore:
     """Применение и слежение за sing-box (второе ядро, apply/singbox.py)."""
     bin_path = singboxing.find_binary(None, paths)
     return singbox_apply.SingboxCore(
-        cfg, paths, singbox_apply.make_service(paths, bin_path), bin_path=bin_path,
+        cfg, paths, singbox_apply.make_service(paths, bin_path),
+        bin_path=bin_path, ownership=ownership,
     )
 
 

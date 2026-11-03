@@ -125,3 +125,37 @@ def owned(role):
 
 def call_owned(coordinator, role, operation):
     return operation() if coordinator is None else coordinator.call(role, operation)
+
+
+def owned_function(role):
+    """Synchronous free-function hook with explicit keyword-only ownership=None.
+
+    Optional legacy calls remain unbound. No environment/context-global activation.
+    The original signature and business result/exception are preserved by wraps.
+    """
+    if type(role) is not str or role not in ROLES:
+        raise MutationBlocked("ROLE_REFUSED")
+
+    def decorate(function):
+        parameter = inspect.signature(function).parameters.get("ownership")
+        if (
+            parameter is None
+            or parameter.kind is not inspect.Parameter.KEYWORD_ONLY
+            or parameter.default is not None
+        ):
+            raise MutationBlocked("OWNERSHIP_SIGNATURE_REFUSED")
+        if (
+            inspect.iscoroutinefunction(function)
+            or inspect.isgeneratorfunction(function)
+            or inspect.isasyncgenfunction(function)
+        ):
+            raise MutationBlocked("DEFERRED_FUNCTION_REFUSED")
+
+        @wraps(function)
+        def invoke(*args, **kwargs):
+            return call_owned(kwargs.get("ownership"), role, lambda: function(*args, **kwargs))
+
+        invoke.ownership_role = role
+        return invoke
+
+    return decorate
