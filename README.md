@@ -902,12 +902,19 @@ Sa748237 принята:12parsedfields/6syntaxflags/3cache/configRdigest/context
 не parser/server/causePASS. Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3s.md`.
 T8d208e9 принята:7этапов/364.31с/contextсохранён;6/67VLESSсверокравны,
 61NOT_RUN,141bridgeграфсогласован. Review — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3t.md`.
-Тестовый JSONarraycontainergap исправляется отдельным новымcollector, runtimeне меняется.
-Актуальное укрупнённое ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3u.md` +TEMPLATE:
-8автоматическихэтапов/одинworker/одинотчёт, расширенныйsourcewalk/configdiff/keyedhealth/
-effectiveunits/writerjournal и аудит cumulativeT7 безповторанаблюдения.
-Доступен толькоThinkCentre(подтверждено03.11), LANклиентские пути не подменяются hostпробами.
-Noactivequeries/networkchanges; реальнаяwave3u NOT_RUN, on/WAN/LAN/Tailscaleсохраняются.
+Тестовый пробел JSON-контейнеров исправлен и проверен реальным U:
+101 supported record; 66/67 VLESS равны, 0 mismatch, 1 без уникальной записи;
+reference 12/12. Рабочий on и контекст сохранены. U8-журнал превысил бюджет3с;
+автор дрейфа конфигурации не установлен. Разбор —
+`docs/REVIEW-REAL-MACHINE-0.2.0-wave3u.md`.
+Счётчики T исправлены по U: последние cumulative RX5 517 331/TX139 736 077 байт;
+сумма всех cumulative из T не является трафиком интервала.
+Актуальное укрупнённое ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3v.md` + TEMPLATE:
+один worker/четыре автоматических этапа/один отчёт: U identity, классификация gap,
+категории изменения объектов и один bounded journal2ч/10с/1MiB.
+Повтора принятых сетевых опытов, графа/units/scanJOIN и активных запросов нет.
+Доступен только ThinkCentre (подтверждено03.11); host-пробы не клиентское доказательство.
+Реальная wave3v NOT_RUN; продуктовый patch по U не обоснован, on/WAN/LAN/Tailscale сохранены.
 
 ### TUN
 

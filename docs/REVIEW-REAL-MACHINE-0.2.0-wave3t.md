@@ -73,3 +73,13 @@ Fullwave3/D1-on/E4/faults/LANUDP/IPv6/DNS/allTS/performance остаются о�
 службы/правила/pin/Tailscale не меняются. Ни новыхсоединений, ни packetcapture, ни netns.
 14узкихfixtures/mockedchecksPASS/RuffPASS; syntaxТЗпроверен. BroadVM/netns/liveнами NOT_RUN.
 Реальная **wave3u NOT_RUN**, ожидается один TEST-REPORT-REAL-MACHINE-0.2.0-wave3u-ДАТА.md.
+
+## После реального U
+
+[Review U](REVIEW-REAL-MACHINE-0.2.0-wave3u.md): 101 supported, 66/67 equal,
+reference12/12; текущий legacy-T на тех же U bytes даёт0/0/8 против46/47/8.
+Исторический Tcache изменился; старые6/67 не переписаны, форма старойreference не доказана.
+U подтвердил суммирование cumulative в таблице T; последние дельты —
+RX5 517 331/TX139 736 077 байт. Не скорость VPN/пакетная атрибуция.
+U8 превысил3с; writer не установлен. Следующий единый пакет V классифицирует
+gap и объекты/один bounded journal; повтор T7/M/L/J/графа/units не нужен.
