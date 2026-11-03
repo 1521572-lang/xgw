@@ -99,6 +99,17 @@ def test_observer_policy_is_validated_again_at_composition(context, field, value
         FileCompletion(contract, observer, accept=lambda result: True)
 
 
+def test_checker_refusal_message_is_not_copied_into_evidence(context):
+    _, observer, contract = context
+
+    def reject(value):
+        raise CompletionRefused("PRIVATE_CHECKER_TEXT")
+
+    verifier = FileCompletion(contract, observer, accept=reject)
+    assert not verifier(contract.roles, True).accepted()
+    assert verifier.last.reason == "CHECK_ERROR"
+
+
 @pytest.mark.parametrize("case", ["I_COMMITTED", "I_NOOP", "I_ROLLBACK", "I_FILES_MISMATCH"])
 def test_real_panel_composite_final_files_gate_receipt(tmp_path, case):
     stand = Path(__file__).parents[1] / "tests/stand"

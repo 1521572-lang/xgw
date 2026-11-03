@@ -50,6 +50,19 @@ OBSERVER_METHODS = MappingProxyType(
         for name in ("observe", "open_root", "directory", "observe_one")
     }
 )
+FAILURE_REASONS = frozenset(
+    {
+        "VERIFIER_CONTEXT",
+        "VERIFIER_DRIFT",
+        "OBSERVER_DRIFT",
+        "ROLE_COVERAGE",
+        "DOMAIN_NOT_IMPLEMENTED",
+        "RESULT_NOT_ACCEPTED",
+        "VERIFIER_TAINTED",
+        "OBSERVATION_TYPE",
+        "FILES_NOT_VERIFIED",
+    }
+)
 
 
 class FileCompletion:
@@ -174,7 +187,11 @@ class FileCompletion:
             self.last = CompletionEvidence("FILES_VERIFIED", True, True, matched, checked, True)
             return Verification(self.contract.outcome, (("FILES", True),))
         except CompletionRefused as exc:
-            self.last = CompletionEvidence(str(exc), accepted, observed, matched, checked)
+            # A caller checker can raise this public exception too. Never copy
+            # its arbitrary message (or invoke a subclass's __str__) into evidence.
+            reason = exc.args[0] if type(exc) is CompletionRefused and len(exc.args) == 1 else None
+            reason = reason if type(reason) is str and reason in FAILURE_REASONS else "CHECK_ERROR"
+            self.last = CompletionEvidence(reason, accepted, observed, matched, checked)
             return Verification()
         except Exception:
             self.last = CompletionEvidence("CHECK_ERROR", accepted, observed, matched, checked)

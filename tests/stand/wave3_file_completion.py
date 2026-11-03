@@ -17,7 +17,7 @@ from pathlib import Path
 
 NOTES = Path.home() / "xgw-w3ai"
 SUPPORT_SHA = "9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917"
-MANIFEST_SHA = "c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249"
+MANIFEST_SHA = "35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078"
 CONTRACTS = (
     "T_TYPE",
     "T_ROLES_EMPTY",
@@ -418,7 +418,10 @@ def checker_case(f, name):
         if name == "K_TEXT":
             return "true"
         if name == "K_EXCEPTION":
-            raise RuntimeError("PRIVATE_FIXTURE_TEXT")
+            holder["errors"] = holder.get("errors", 0) + 1
+            if holder["errors"] == 1:
+                raise RuntimeError("PRIVATE_FIXTURE_TEXT")
+            raise c.CompletionRefused("PRIVATE_FIXTURE_TEXT")
         if name == "K_TERMINAL":
             raise KeyboardInterrupt()
         if name == "K_REENTER":
@@ -454,6 +457,8 @@ def checker_case(f, name):
             "K_FILECHANGE_DURING_CHECK": "FILES_NOT_VERIFIED",
         }.get(name, "RESULT_NOT_ACCEPTED")
         decision(v, reason=reason)
+        if name == "K_EXCEPTION":
+            decision(v, reason="CHECK_ERROR")
 
 
 def integration_case(f, name):

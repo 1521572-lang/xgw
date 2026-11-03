@@ -58,7 +58,7 @@
   "src/xgw/ownership.py": "2a04974052ff99ee27bbf8392e75db13d31a4551fc7163ccf54c1f9618da67a5",
   "src/xgw/ownership_adapters.py": "70a1abece7e73eaeefbf1514c73dacd89602d3cd65e710f658ab4427a1d738a3",
   "src/xgw/ownership_binding.py": "e41bd022df94e814218b774947d33e002e4ebeb5ece16e6262c49df32ba0849f",
-  "src/xgw/ownership_completion.py": "59c7fad44023f5244b15ef35469ac2d5a0726a19d1742c11d6129a2171908e7d",
+  "src/xgw/ownership_completion.py": "b1ecdcb8ff708f7a5a1936d6b7a7176d405c331a18c5c3b4344edf74105a73b5",
   "src/xgw/ownership_diagnostics.py": "f49d8e64fda4924a2094bdc61d372459ccb24c6d13d40b33f3b06bfa3bccc32d",
   "src/xgw/ownership_files.py": "b8fb4e078782fb81e86f217d86e855fabed76eac3db3756f438a8f62a7ed26d7",
   "src/xgw/ownership_hooks.py": "66da70aa6e306a93c12e0507c5db4d60de5f8a7319d62e35abd52146927fd95f",

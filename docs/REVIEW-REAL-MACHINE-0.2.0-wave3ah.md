@@ -57,7 +57,7 @@ installed116/rootDAC/realboot/сети/служб. HEALTHYtimestamp19:28 про�
 immutablepartialreport/одинreport. ConcreteFILES observation вместо literalTrue,
 exactrolecoverage и unsupportedotherdomains→UNKNOWN. Source117/7A10M, только1новый
 source относительноAG/AH; прежние116source/oldhelpers/units/config unchanged.
-Installedruntime не менялся. RealAI NOT_RUN;13unique narrowchecks/RuffPASS локально.
+Installedruntime не менялся. RealAI NOT_RUN;14unique narrowchecks/RuffPASS локально.
 LiveC BLOCKED_BOOTSTRAP. Mandatoryruntimegraph/version/boot/pathalias/interprocess/
 kernel/API/process/routes/mode verifiers/repair/bootstrap ещё открыты. Fullwave3/LAN/
 45s/performance/allTS/DAE gates прежние. SourcefixturePASS не разрешает liveinstall/fault.

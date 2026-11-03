@@ -16,7 +16,7 @@ WorkerexitNOT_COLLECTED; mutableownerfiles не authentication. Старыеbatc
 117source/7A10M; все прежние116source/units/config/pyproject/standhelpers UNCHANGED.
 Concrete fresh namedFILES completion +exactrole/resultpolicy; другиеdomains→UNKNOWN.
 Это неglobalruntimeverifier/rolepolicy/pathalias/atomicsnapshot/activation. Runtimeнеwired/
-installedнеобновлён, все7gatesfalse. RealAI NOT_RUN;13unique narrowchecks/RuffPASS.
+installedнеобновлён, все7gatesfalse. RealAI NOT_RUN;14unique narrowchecks/RuffPASS.
 LiveC BLOCKED_BOOTSTRAP; independent original-on/code/unitrescue доinstall/fault.
 OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/service/
 live rules. Host неLANproof. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.

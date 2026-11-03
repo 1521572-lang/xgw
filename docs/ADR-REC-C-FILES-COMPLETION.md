@@ -36,7 +36,8 @@ Noop/rollback label требует отдельного businesschecker и ож�
 Drift до/послеchecker/observe, false/exception/partialfileevidence→VerificationUNKNOWN.
 Пойманный reentrantcall taintsouter, не позволяет скрыть nestederror. Terminalsignal
 записывает CHECK_INTERRUPTED, очищаетactiveguard, повторно выбрасывается Coordinator/
-execute, который ведёт UNKNOWNticketbest-effort. LastCompletionEvidence диагностический,
+execute, который ведёт UNKNOWNticketbest-effort. Произвольный текст CompletionRefused из callerchecker не копируется в evidence:
+неизвестныйmessage/subclass→CHECK_ERROR без вызова __str__. LastCompletionEvidence диагностический,
 не receipt. Никаких retry/repair/compensation/lease/registrycreation/activation.
 
 ## Квалификация AI — максимум готового safe объёма

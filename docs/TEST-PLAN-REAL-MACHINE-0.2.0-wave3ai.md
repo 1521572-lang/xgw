@@ -51,9 +51,9 @@ ReadonlyPrivateFiles observer существующийAE, байты не мен
 
 | Artifact → frozen file | SHA256 |
 |---|---|
-| tests/stand/wave3_file_completion.py → batch.py |bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122|
+| tests/stand/wave3_file_completion.py → batch.py |e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8|
 | tests/stand/wave3_source_hooks.py → support.py |9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917|
-| tests/stand/wave3_completion_manifest.json → manifest.json |c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249|
+| tests/stand/wave3_completion_manifest.json → manifest.json |35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078|
 
 Freeze3+117GitLFsource в~/xgw-w3ai0700, files0600/dirs0700/exactinventory/hash/noextras/
 symlink/overwrite. Dummyproductoutputs600; deliberatebad644/root755/linkfixtures внутри
@@ -74,7 +74,7 @@ trustedregression, не hostile-code sandbox/coarsedirfdlimitations прежни
 другиеindependentcases продолжаются. UnexpectedOSError/ScopeStop/audit/unfinishedthread
 →globalSTOP/remainingNOT_RUN. Source/baseline/privacySTOP не ослаблять ради объёма.
 
-Локально13unique narrowchecksPASS:8policy+freshfile/reentry/internaldrift/partialcount/
+Локально14unique narrowchecksPASS:9policy+freshfile/reentry/internaldrift/partialcount/
 noIO +4realPanelcomposites +1partialreportprivacyfreeze. Найден/fixedfixtureJSONkeyorder
 mismatch; доhandoffзакрытemptyobserverpolicygap узкойрегрессией. Full78/threadfixture/ThinkCentre нами
 NOT_RUN. Ruff/AST/ТЗsyntax отдельно, не реальныеnetwork/systemd/kernel проверки.
@@ -175,13 +175,13 @@ expected={'src/xgw/ownership.py': 'A', 'src/xgw/ownership_adapters.py': 'A', 'sr
 actual=git('diff','--name-status','351fb54e074f4a7b497a8a4244fc74c6088788d7','HEAD','--',*runtime).splitlines()
 require(actual==[expected[name]+'\t'+name for name in sorted(expected)],'SOURCE_DIFF_NOT_7A_10M')
 manifest=repo/'tests/stand/wave3_completion_manifest.json'
-require(hashlib.sha256(manifest.read_bytes()).hexdigest()=='c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249','MANIFEST_SHA')
+require(hashlib.sha256(manifest.read_bytes()).hexdigest()=='35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078','MANIFEST_SHA')
 data=json.loads(manifest.read_bytes())
 require(len(data)==117,'SOURCE_COUNT')
 require(set(data)=={str(p.relative_to(repo)).replace('\\','/') for p in (repo/'src/xgw').rglob('*.py')},'SOURCE_INVENTORY')
 for name,digest in data.items():
     require(hashlib.sha256((repo/name).read_bytes()).hexdigest()==digest,'SOURCE_SHA')
-require(hashlib.sha256((repo/'tests/stand/wave3_file_completion.py').read_bytes()).hexdigest()=='bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122','BATCH_SHA')
+require(hashlib.sha256((repo/'tests/stand/wave3_file_completion.py').read_bytes()).hexdigest()=='e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8','BATCH_SHA')
 require(hashlib.sha256((repo/'tests/stand/wave3_source_hooks.py').read_bytes()).hexdigest()=='9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917','SUPPORT_SHA')
 print('SOURCE_DIFF_SEVEN_ADD_TEN_MODIFY')
 print('SOURCE_MANIFEST_MATCHED',len(data))
@@ -270,8 +270,8 @@ def freeze(target,raw,digest):
     with os.fdopen(fd,'wb') as out:
         out.write(raw)
 raw=(repo/'tests/stand/wave3_completion_manifest.json').read_bytes()
-freeze(notes/'manifest.json',raw,'c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249')
-freeze(notes/'batch.py',(repo/'tests/stand/wave3_file_completion.py').read_bytes(),'bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122')
+freeze(notes/'manifest.json',raw,'35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078')
+freeze(notes/'batch.py',(repo/'tests/stand/wave3_file_completion.py').read_bytes(),'e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8')
 freeze(notes/'support.py',(repo/'tests/stand/wave3_source_hooks.py').read_bytes(),'9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
 data=json.loads(raw)
 if type(data) is not dict or len(data)!=117:
@@ -307,7 +307,7 @@ def valid(path,digest):
     info=path.lstat()
     return stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_mode&0o7777==0o600 and info.st_nlink==1 and hashlib.sha256(path.read_bytes()).hexdigest()==digest
 ok=os.geteuid()!=0 and not notes.is_symlink() and notes.stat().st_uid==os.getuid() and notes.stat().st_mode&0o7777==0o700
-ok=ok and valid(notes/'batch.py','bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122') and valid(notes/'manifest.json','c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249') and valid(notes/'support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
+ok=ok and valid(notes/'batch.py','e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8') and valid(notes/'manifest.json','35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078') and valid(notes/'support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
 data=json.loads((notes/'manifest.json').read_bytes())
 ok=ok and len(data)==117
 source=notes/'source'
@@ -507,6 +507,8 @@ refusals неfilesystemobservations. R6+U6 refuse ДОchecker/observe; D12identi
 также до них. Terminalnegative K_TERMINAL — ожидаемыйrethrow, не завершённаяоперация.
 I8 только3positivecompletions/4UNKNOWN/1fenced; receipt/gen1 только3positive.
 В I_ROLLBACK возвращаются dummybytes; originalon/code/unit/45s/networkrescue НЕпроверены.
+K_EXCEPTION проверяет RuntimeError и private-message CompletionRefused последовательно;
+обе→CHECK_ERROR/UNKNOWN, в таблице последнее состояние, это одинcase, не дваPASS.
 ВсеactualNULL/partialполя сохранять. Не переносить старыеafter/kernel/PID какновые.
 
 ### F3. Проверить prefix/footer/identity и опубликовать ОДИН новый AIreport
@@ -524,14 +526,14 @@ def require(v,c):
 require(os.geteuid()!=0 and git('branch','--show-current')=='freepool' and not git('status','--porcelain'),'OWNER_BRANCH_CLEAN')
 git('fetch','-q','origin','freepool');git('merge','--ff-only','origin/freepool')
 require(git('diff','--name-only','2479d76b86b3543b17a5c9c2b61e2a3807490f88','HEAD','--','src','packaging','config.example.toml','pyproject.toml').splitlines()==['src/xgw/ownership_completion.py'],'PRODUCT_SOURCE_CHANGED')
-for rel,digest in [('tests/stand/wave3_file_completion.py','bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122'),('tests/stand/wave3_completion_manifest.json','c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249')]:
+for rel,digest in [('tests/stand/wave3_file_completion.py','e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8'),('tests/stand/wave3_completion_manifest.json','35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078')]:
     require(hashlib.sha256((repo/rel).read_bytes()).hexdigest()==digest,'AI_SOURCE_SHA')
 for name,digest in json.loads((repo/'tests/stand/wave3_completion_manifest.json').read_bytes()).items():
     require(hashlib.sha256((repo/name).read_bytes()).hexdigest()==digest,'PRODUCT_BYTES_CHANGED')
 import stat
 info=notes.lstat()
 require(stat.S_ISDIR(info.st_mode) and info.st_uid==os.getuid() and info.st_mode&0o7777==0o700,'FROZEN_NOTES_METADATA')
-for rel,name,digest in [('tests/stand/wave3_file_completion.py','batch.py','bdbec6af841378cb5350d7f45c7076ac6e9fee1c0fcc0cfc2cc239aa181c9122'),('tests/stand/wave3_source_hooks.py','support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917'),('tests/stand/wave3_completion_manifest.json','manifest.json','c575672fc7727f30a75d01d40727aab67a8f971608f44b598754b228d9c7f249')]:
+for rel,name,digest in [('tests/stand/wave3_file_completion.py','batch.py','e36a7a559503a008ecfe7fbeb41ed956c0b8ebe41d2a9cb7a3e3608e6c6307c8'),('tests/stand/wave3_source_hooks.py','support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917'),('tests/stand/wave3_completion_manifest.json','manifest.json','35239748c162c1ed182386626fb5ff8edf5d3a4eb10307be54781a8c5bb03078')]:
     target=notes/name;info=target.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_mode&0o7777==0o600 and info.st_nlink==1 and hashlib.sha256(target.read_bytes()).hexdigest()==digest,'FROZEN_ARTIFACT_CHANGED')
 proc=subprocess.run(['python3','-I','-B',str(notes/'batch.py'),'report'],capture_output=True,text=True,timeout=10,check=False)
