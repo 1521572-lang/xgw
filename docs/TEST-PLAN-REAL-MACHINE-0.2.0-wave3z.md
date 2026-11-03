@@ -26,7 +26,7 @@ child процесса суммарно. Ошибка case не прекраща
 ## 2. Точная идентичность, файлы и разрешённые эффекты
 
 Productpin351fb54e074f4a7b497a8a4244fc74c6088788d7; tested actualHEAD/tree записать.
-tests/stand/wave3_writer_fence_dry.py SHA256 **4a85e87eb82756bc0fbb260288b9b5ff557dfe36f47e11e7801b39a44912ed25**. Ownerfreeze в ~/xgw-w3z/fence.py,
+tests/stand/wave3_writer_fence_dry.py SHA256 **be2f1558bae1882ae5bbf2d52de937aa2133ddfa66417e59f27fd37479e2f36b**. Ownerfreeze в ~/xgw-w3z/fence.py,
 0600, каталог0700. CLI только `batch` обычным пользователем Python3-I-B.
 Внутренний `_peer` вручную запрещён; helper сам запускает фиксированные modes writer/hold/lease.
 Root-запуск helper отвергается. Все настоящие UID/поколения/lease XGW вне этого кода.
@@ -187,7 +187,7 @@ notes=Path.home()/'xgw-w3z'
 if notes.is_symlink() or notes.stat().st_uid!=os.getuid() or notes.stat().st_mode&0o777!=0o700:
     raise SystemExit('STOP_NOTES_METADATA')
 raw=(Path.home()/'zcod/xgw/tests/stand/wave3_writer_fence_dry.py').read_bytes()
-expected='4a85e87eb82756bc0fbb260288b9b5ff557dfe36f47e11e7801b39a44912ed25'
+expected='be2f1558bae1882ae5bbf2d52de937aa2133ddfa66417e59f27fd37479e2f36b'
 if len(raw)>131072 or hashlib.sha256(raw).hexdigest()!=expected:
     raise SystemExit('STOP_FENCE_DRY_SOURCE_SHA')
 if (notes/'fence.py').exists() or (notes/'fence.py').is_symlink():
@@ -216,7 +216,7 @@ ok=(os.geteuid()!=0 and not notes.is_symlink() and notes.exists()
     and notes.stat().st_uid==os.getuid() and notes.stat().st_mode&0o777==0o700
     and model.exists() and not model.is_symlink() and model.stat().st_uid==os.getuid()
     and model.stat().st_mode&0o777==0o600
-    and hashlib.sha256(model.read_bytes()).hexdigest()=='4a85e87eb82756bc0fbb260288b9b5ff557dfe36f47e11e7801b39a44912ed25')
+    and hashlib.sha256(model.read_bytes()).hexdigest()=='be2f1558bae1882ae5bbf2d52de937aa2133ddfa66417e59f27fd37479e2f36b')
 unused=not any((notes/name).exists() or (notes/name).is_symlink()
                for name in ('controller-started.json','controller-result.json','fence-started.json','fence-result.json','sandbox'))
 print('FROZEN_FENCE_DRY_RESUME_OK' if ok and unused else 'STOP_RESUME_IDENTITY_OR_ALREADY_STARTED')
@@ -239,7 +239,7 @@ notes=Path.home()/'xgw-w3z'
 model=notes/'fence.py'
 if os.geteuid()==0 or notes.is_symlink() or notes.stat().st_uid!=os.getuid() or notes.stat().st_mode&0o777!=0o700:
     raise SystemExit('STOP_OWNER_NOTES')
-if not model.exists() or model.is_symlink() or model.stat().st_uid!=os.getuid() or model.stat().st_mode&0o777!=0o600 or hashlib.sha256(model.read_bytes()).hexdigest()!='4a85e87eb82756bc0fbb260288b9b5ff557dfe36f47e11e7801b39a44912ed25':
+if not model.exists() or model.is_symlink() or model.stat().st_uid!=os.getuid() or model.stat().st_mode&0o777!=0o600 or hashlib.sha256(model.read_bytes()).hexdigest()!='be2f1558bae1882ae5bbf2d52de937aa2133ddfa66417e59f27fd37479e2f36b':
     raise SystemExit('STOP_FROZEN_FENCE_DRY_SHA')
 if any((notes/name).exists() or (notes/name).is_symlink() for name in ('controller-started.json','controller-result.json','fence-started.json','fence-result.json','sandbox')):
     raise SystemExit('STOP_ALREADY_STARTED_READ_S3_2')

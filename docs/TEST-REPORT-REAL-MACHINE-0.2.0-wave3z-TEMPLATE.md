@@ -1,7 +1,7 @@
 # Отчёт: XGW wave3z — cooperative writer fence в sandbox
 
 Дата/времяMSK: ... . TestedHEAD/tree: ... . Productpin351fb54e074f4a7b497a8a4244fc74c6088788d7.
-Runtime diff: ... . HelperSHA 4a85e87eb82756bc0fbb260288b9b5ff557dfe36f47e11e7801b39a44912ed25/ownerfreeze0600: ... . NNPканала/sudo/owneractions: ... .
+Runtime diff: ... . HelperSHA be2f1558bae1882ae5bbf2d52de937aa2133ddfa66417e59f27fd37479e2f36b/ownerfreeze0600: ... . NNPканала/sudo/owneractions: ... .
 Baseline/финал HEALTHY/on/pool/versions/связь: ... . Installedruntime/110treeповтор NOT_RUN.
 
 | Этап | rc/marker/file | Фактические данные | scope/limits |

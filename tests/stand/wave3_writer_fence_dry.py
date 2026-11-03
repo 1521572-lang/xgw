@@ -450,8 +450,10 @@ def batch():
     test("LOCK_INODE_REPLACEMENT_REJECTED", replacement)
 
     def concurrent(s):
-        children = [spawn_peer(s.root, "writer"), spawn_peer(s.root, "writer")]
+        children = []
         try:
+            children.append(spawn_peer(s.root, "writer"))
+            children.append(spawn_peer(s.root, "writer"))
             outputs = [p.communicate(timeout=4)[0].decode().strip() for p in children]
             details = {
                 "committed": outputs.count("COMMITTED"),
