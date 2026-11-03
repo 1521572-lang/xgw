@@ -49,9 +49,9 @@ F_OWNER проверяет отказ при другом expected owner уже 
 
 | Артефакт → frozen file | SHA256 |
 |---|---|
-| tests/stand/wave3_bound_batch.py → batch.py |df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4|
+| tests/stand/wave3_bound_batch.py → batch.py |fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680|
 | tests/stand/wave3_source_hooks.py → support.py |9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917|
-| tests/stand/wave3_binding_manifest.json → manifest.json |b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218|
+| tests/stand/wave3_binding_manifest.json → manifest.json |d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0|
 
 116 source *.py по новому manifest копируются в ~/xgw-w3ae/source. Это source inventory,
 НЕ аттестация installed116. Support — неизменённые AD fixtures/guard/loader/helpers;
@@ -172,13 +172,13 @@ expected={'src/xgw/ownership.py': 'A', 'src/xgw/ownership_adapters.py': 'A', 'sr
 actual=git('diff','--name-status','351fb54e074f4a7b497a8a4244fc74c6088788d7','HEAD','--',*runtime).splitlines()
 require(actual==[expected[name]+'\t'+name for name in sorted(expected)],'SOURCE_DIFF_NOT_6A_7M')
 manifest=repo/'tests/stand/wave3_binding_manifest.json'
-require(hashlib.sha256(manifest.read_bytes()).hexdigest()=='b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218','MANIFEST_SHA')
+require(hashlib.sha256(manifest.read_bytes()).hexdigest()=='d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0','MANIFEST_SHA')
 data=json.loads(manifest.read_bytes())
 require(len(data)==116,'SOURCE_COUNT')
 require(set(data)=={str(p.relative_to(repo)).replace('\\','/') for p in (repo/'src/xgw').rglob('*.py')},'SOURCE_INVENTORY')
 for name,digest in data.items():
     require(hashlib.sha256((repo/name).read_bytes()).hexdigest()==digest,'SOURCE_SHA')
-require(hashlib.sha256((repo/'tests/stand/wave3_bound_batch.py').read_bytes()).hexdigest()=='df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4','BATCH_SHA')
+require(hashlib.sha256((repo/'tests/stand/wave3_bound_batch.py').read_bytes()).hexdigest()=='fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680','BATCH_SHA')
 require(hashlib.sha256((repo/'tests/stand/wave3_source_hooks.py').read_bytes()).hexdigest()=='9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917','SUPPORT_SHA')
 print('SOURCE_DIFF_SIX_ADD_SEVEN_MODIFY')
 print('SOURCE_MANIFEST_MATCHED',len(data))
@@ -257,8 +257,8 @@ def freeze(target,raw,digest):
     with os.fdopen(fd,'wb') as out:
         out.write(raw)
 raw=(repo/'tests/stand/wave3_binding_manifest.json').read_bytes()
-freeze(notes/'manifest.json',raw,'b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218')
-freeze(notes/'batch.py',(repo/'tests/stand/wave3_bound_batch.py').read_bytes(),'df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4')
+freeze(notes/'manifest.json',raw,'d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0')
+freeze(notes/'batch.py',(repo/'tests/stand/wave3_bound_batch.py').read_bytes(),'fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680')
 freeze(notes/'support.py',(repo/'tests/stand/wave3_source_hooks.py').read_bytes(),'9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
 data=json.loads(raw)
 if type(data) is not dict or len(data)!=116:
@@ -294,7 +294,7 @@ def valid(path,digest):
     info=path.lstat()
     return stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_mode&0o7777==0o600 and info.st_nlink==1 and hashlib.sha256(path.read_bytes()).hexdigest()==digest
 ok=os.geteuid()!=0 and not notes.is_symlink() and notes.stat().st_uid==os.getuid() and notes.stat().st_mode&0o7777==0o700
-ok=ok and valid(notes/'batch.py','df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4') and valid(notes/'manifest.json','b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218') and valid(notes/'support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
+ok=ok and valid(notes/'batch.py','fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680') and valid(notes/'manifest.json','d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0') and valid(notes/'support.py','9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917')
 data=json.loads((notes/'manifest.json').read_bytes())
 ok=ok and len(data)==116
 source=notes/'source'
@@ -644,10 +644,10 @@ git('merge','--ff-only','origin/freepool')
 git('merge-base','--is-ancestor',code,'HEAD')
 expected={'src/xgw/ownership.py': 'A', 'src/xgw/ownership_adapters.py': 'A', 'src/xgw/ownership_diagnostics.py': 'A', 'src/xgw/ownership_hooks.py': 'A', 'src/xgw/ownership_binding.py': 'A', 'src/xgw/ownership_files.py': 'A', 'src/xgw/net/capture.py': 'M', 'src/xgw/freepool/backend.py': 'M', 'src/xgw/apply/applier.py': 'M', 'src/xgw/apply/singbox.py': 'M', 'src/xgw/cores.py': 'M', 'src/xgw/xraycore/api.py': 'M', 'src/xgw/managed.py': 'M'}
 require(git('diff','--name-status',code,'HEAD','--',*runtime).splitlines()==[expected[name]+'\t'+name for name in sorted(expected)],'source diff не6A7M')
-require(hashlib.sha256((repo/'tests/stand/wave3_binding_manifest.json').read_bytes()).hexdigest()=='b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218','manifest SHA изменился')
+require(hashlib.sha256((repo/'tests/stand/wave3_binding_manifest.json').read_bytes()).hexdigest()=='d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0','manifest SHA изменился')
 for name,digest in json.loads((repo/'tests/stand/wave3_binding_manifest.json').read_bytes()).items():
     require(hashlib.sha256((repo/name).read_bytes()).hexdigest()==digest,'source SHA изменился')
-require(hashlib.sha256((repo/'tests/stand/wave3_bound_batch.py').read_bytes()).hexdigest()=='df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4','helper SHA изменился')
+require(hashlib.sha256((repo/'tests/stand/wave3_bound_batch.py').read_bytes()).hexdigest()=='fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680','helper SHA изменился')
 require(hashlib.sha256((repo/'tests/stand/wave3_source_hooks.py').read_bytes()).hexdigest()=='9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917','support SHA изменился')
 require(not git('status','--porcelain'),'клон изменился во время подготовки')
 (repo/relative).write_bytes(draft)

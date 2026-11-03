@@ -2,7 +2,7 @@
 
 MSK дата/интервал: ... . TestedHEAD/tree: ... . Baseline pin 351fb54e074f4a7b497a8a4244fc74c6088788d7.
 Source diff6A7M, предыдущие AD114 source bytes unchanged: ... .
-HelperSHA df8b24c3b392027304cd5c38a950e374471b5c37edfd2cc4c61943d68a050fb4; SupportSHA 9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917; ManifestSHA b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218.
+HelperSHA fd45da562e6a93bf9d695b79131d2548e331bda9f364618deffd5808d0f67680; SupportSHA 9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917; ManifestSHA d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0.
 116 source freeze/0700/0600/private frozen_ad import: ... . Installed runtime unchanged: ... .
 NNP/sudo/owner actions: ... . HEALTHY/on/pool/versions/connection before/after: ... .
 Source checks ≠ installed116; oldAD130/AC51/.../Yroot/installed110 NOT_RUN: ... .

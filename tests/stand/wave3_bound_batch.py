@@ -16,7 +16,7 @@ from pathlib import Path
 
 NOTES = Path.home() / "xgw-w3ae"
 SUPPORT_SHA = "9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917"
-MANIFEST_SHA = "b0103bde08c7f2fa51ca2fb5c2b35aed962ab49ef8a56fc43a0696bb1af2d218"
+MANIFEST_SHA = "d38f369bc1f45e636b92c35635b261c3cba6eb33f3f42ea737cca09ad43275a0"
 WRITERS = ("capture", "peers", "xray", "singbox", "cores", "api", "panel")
 METHODS = (
     ("capture", "_save"),
