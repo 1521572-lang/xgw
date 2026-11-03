@@ -913,14 +913,17 @@ V be1fc1b принят: четыре этапа/1.747с, рабочий on со�
 Оставшийся gap — missing_identity;0 mismatch/ambiguity. В наблюдаемой паре current/last-good
 44VLESS изменены только по категории tls. Журнал2ч успешно прочитан, writer не установлен.
 Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3v.md`; повтор кэша/журнала не требуется.
-Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3w.md` + TEMPLATE:
-25 синтетических сценариев чистой модели возврата исходного on, один запуск/один отчёт.
-`ADR-RECOVERY-ORIGINAL-ON.md` и `PR-SPEC-WAVE3-ON-RECOVERY.md` задают этапы snapshot,
-writer fence, независимого driver и последующего scoped fault. Сейчас реализована только
-чистая модель REC-A; реальный driver/fence/recovery ещё не реализованы. Никаких timer,
-guardian, установки или сетевых изменений W не делает. Реальная wave3w NOT_RUN.
-Доступен только ThinkCentre; host-пробы не LAN acceptance. LAN считается работающей,
-on/WAN/LAN/Tailscale сохраняются; full wave3/D1-on/faults открыты, wave4/DAE не начинать.
+W e670ceb принят:25/25 синтетических сценариев REC-A, рабочий on сохранён.
+Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3w.md`.
+Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3x.md` + TEMPLATE:
+REC-B private snapshot,26 validation cases, один nft --check и after, один отчёт.
+Сборщик не импортирует XGW, material root0700/0600; проверка не применяет проект.
+`docs/REC-C-WRITER-INVENTORY.md` фиксирует писателей и план следующего fence.
+Snapshot-кандидат реализован в test/stand; реальный driver и writer fence не реализованы,
+active gate=false, plan PLANNED_NOT_ARMED. Реальная wave3x NOT_RUN. Никаких live faults,
+таймеров, guardian, установки или изменений сети/служб пакет не выполняет.
+Доступен только ThinkCentre; host-пробы не LAN acceptance. Работающая LAN принимается
+как baseline, on/WAN/LAN/Tailscale сохраняются. Fullwave3/D1-on/faults открыты, неwave4/DAE.
 
 ### TUN
 

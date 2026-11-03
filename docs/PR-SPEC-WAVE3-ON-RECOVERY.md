@@ -57,7 +57,7 @@ config/DB/proc, subprocess/socket/nft/systemctl, служб, timer или сет
 7. Никакого RESTORED_OFF, fallbackdirect и автоматического обхода guard.
 
 Доставка: текущий code+ADR+это ТЗ+ТЗ W+единый шаблон. Локально только AST/static safety/Ruff;
-проверку25 сценариев перенести в один реальный прогон W. **W NOT_RUN** до отчёта.
+W e670ceb подтвердил25/25 на ThinkCentre; REC-A принят как синтетическая модель.
 Model PASS не разрешает REC-E. Реальный driver/fence/snapshot остаются не реализованными.
 
 ## 4. REC-B — snapshot и построение плана без применения
@@ -88,6 +88,14 @@ wrongfamily/table, чужая таблица, oldboot, неполный guard, �
 
 Один реальный пакет Flash: source identity → readonly collection → plan qualification →
 все отрицательные синтетические fixtures → один отчёт. Никаких live fault/arm/replay.
+
+Кандидат REC-B теперь реализован в tests/stand/wave3_on_snapshot.py. ТЗ X собирает private
+material и scoped JSON-проект, выполняет один nft -c -j -f - без применения и after.
+26 validation cases объединены в тот же worker. Реальная X NOT_RUN, absent-table replay
+не проверен, manifest PLANNED_NOT_ARMED и все active/fence/driver gates=false.
+Текущий collector сознательно stdlib: raw TOML capturedefaults100/1, raw panel opaque,
+без productparser/старогоguardian. Для REC-C использовать отдельную инвентаризацию
+REC-C-WRITER-INVENTORY.md; её наличие не реализация fence.
 
 ## 5. REC-C — writer fence и владение поколением
 

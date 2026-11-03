@@ -82,3 +82,11 @@ saved OK не превращают её в PASS. Причины «ТСПУ», «
 Доступен только ThinkCentre. LAN UDP/IPv6/DNS/E4 не подменять запросами шлюза. Рабочая LAN
 считается работающей. D1-on/scoped faults, performance, all Tailscale и полная wave3 открыты;
 wave4/DAE не начинать. WAN/LAN/Tailscale/pin/pool/службы/правила остаются неизменными.
+
+## После фактического W
+
+[Review W](REVIEW-REAL-MACHINE-0.2.0-wave3w.md):25/25 synthetic cases приняты,
+status HEALTHY/on и pool сохранены. Реальное recovery/автономность не проверены.
+Следующий X — REC-B candidate private snapshot/26fixtures/nft-check-only/after;
+writer fence/runtime driver не реализованы, live faults не разрешены этим результатом.
+Readonly TLS/cache/journal ветвь не возобновляется.

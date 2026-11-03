@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3w.md: чистая модель on-recovery,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3x.md: snapshot/check-only,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -90,6 +90,17 @@ ownedlistener/TLS/контекст подтверждены; SB-1двеcurl97/HT
 свидетельства/журналы/lastscan, не повторяет запросы и не меняет рабочий шлюз.
 Исторический mapping по filetimes не скрывает отсутствие старого configdigest.
 Review-wave3n фиксирует пределы; O_NOT_RUN, полнаяwave3 открыта.
+
+
+### Принято после реального W,03.11.2026
+
+W e670ceb:25/25 synthetic model cases, working on/status bookends сохранены.
+REC-A принят в своём scope; реальная автономность/recoverytime не проверены.
+X реализует кандидат REC-B snapshot и check-only nft-c без применения правил,
+26 validation cases/четыре автоэтапа/один отчёт. Material root0700/0600, gatesfalse.
+Writer inventory описан в REC-C-WRITER-INVENTORY; fence/driver НЕ реализованы.
+Реальная wave3x NOT_RUN. D1-on/faults по-прежнему требуют независимого возвратаon.
+Рабочая LAN считается работающей, единственный ThinkCentre не LAN-клиентский proof.
 
 
 ### Принято после реального V,03.11.2026

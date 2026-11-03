@@ -4,6 +4,12 @@
 writer fence, snapshot и автономность ещё не приняты. Текущее исполнение — только ТЗ W.
 Документ не является командой вооружить механизм или изменить живую сеть.
 
+Обновление после W e670ceb: REC-A25/25 принят на ThinkCentre. Добавлен snapshot-кандидат
+REC-B tests/stand/wave3_on_snapshot.py и ТЗ X:26validationcases/private material/один
+nft --check/after, без применения. Реальная X NOT_RUN. Writer fence/runtime driver
+не реализованы, все active gates false. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3w.md
+и REC-C-WRITER-INVENTORY.md. Существующий snapshot ещё не прошёл реальную qualification.
+
 ## Основание
 
 Рабочая схема ThinkCentre/XGW→роутер→устройства, HEALTHY/on. У Flash доступен только
