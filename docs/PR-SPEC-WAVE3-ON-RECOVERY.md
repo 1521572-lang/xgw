@@ -1,5 +1,12 @@
 # Единое ТЗ исполнителю: возврат исходного on, REC-A–E
 
+Обновление Y1440d51: REC-B snapshot/check-only qualification принята, Xguardtestbug закрыт.
+Ymanifest остаётся PLANNED_NOT_ARMED. Следующий REC-C test candidate реализован в
+tests/stand/wave3_writer_fence_dry.py; Zпередаёт19cases/3processcases без product integration.
+ADR-REC-C-OWNERSHIP задаёт epoch/token/lease/retirement; runtime fence/driver не установлен,
+реальная Z NOT_RUN. Старые блокировки/живые writers и root snapshot в Z не затрагиваются.
+
+
 Обновление после X283bb12: REC-B partial/guard contract bug. Исторический collector
 ошибочно ожидал forward priority5 вместо source10. Новый Y v2 исправляет тест и
 публикует safe guard observations; старый X/run неизменён, живые правила не менять.

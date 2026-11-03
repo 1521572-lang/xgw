@@ -1,5 +1,10 @@
 # REC-C: писатели поколения, первая инвентаризация и план внедрения fence
 
+Актуально после Y1440d51: REC-B принята в snapshot/check-only scope, guard10/10 исправлен
+только в тесте. Zпроверяет cooperative sandbox candidate/19cases/3processcases; реальные
+writers ещё не интегрированы, fence NOT_INSTALLED. См. ADR-REC-C-OWNERSHIP и ReviewY.
+
+
 Обновление после X283bb12: REC-B partial/guard contract bug. Исторический collector
 ошибочно ожидал forward priority5 вместо source10. Новый Y v2 исправляет тест и
 публикует safe guard observations; старый X/run неизменён, живые правила не менять.
@@ -78,3 +83,25 @@ Manifest status PLANNED_NOT_ARMED, fence/driver/active gates=false. Kernel check
 проверяет проект в текущем контексте, не реальный replay и не случай отсутствующей таблицы.
 По результату X исправлять конкретный дефект снимка/парсера, если он появится;
 при успешном scope продолжать C1/C2, не возвращаться к TLS/cache/journal микропрогонам.
+
+## 5. Дополнительные прямые nft writers: scope и admission
+
+Продолжение статического аудита, не исчерпывающий call graph и не реальное наблюдение.
+
+| Путь | Scope | Следствие для будущего fence |
+|---|---|---|
+| [Backend._save_peers/_nft_element](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L152-L163) | peers.json и **host ip xgw/fp_peers**, TABLE=xgw | Прямые add/delete element обходят capture._load; включить в admission/generation publication |
+| [Backend.prepare](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L172-L195) | запись peers и add element | Нужна граница между файлом поколения и kernel update; проверить cleanup при частичной ошибке |
+| [Backend.stop/reconcile](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/backend.py#L281-L335) | delete/flush fp_peers плюс lifecycle | Режим pool off сам по себе не доказывает отсутствие этих writers; actual invocation в Y не устанавливалась |
+| [nft.remove](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/net/nft.py#L1154-L1159) | capture+guard removal | Top-level down/uninstall paths должны получить явный admission; не обходить через cleanup |
+| [usage.remove/_nft](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/usage.py#L250-L274) | отдельная **ip xgw_acct** (TABLE line44) | Не объявлять writer ip xgw только по наличию nft -f; сохранить чужой относительно snapshot scope |
+| [agent._guard](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/src/xgw/freepool/agent.py#L752-L759) и [штатный unit](https://github.com/1521572-lang/xgw/blob/351fb54e074f4a7b497a8a4244fc74c6088788d7/packaging/xgw-fp%40.service#L10-L16) | table xgwfp; штатный unit PrivateNetwork=yes | Различать host vs namespace; прямой CLI entry и зависимости peer generation ещё требуют аудита |
+
+Snapshot Y содержит наблюдавшиеся fp_peers в kernel table, но не устанавливает исключение
+будущих backend writes. Перед real replay fence обязан учитывать и file generation,
+и host set operations. Не копировать Ysnapshot в Z: sandbox использует только synthetic g0/g1.
+Zcooperative Store демонстрирует admission/commit под одним lock для synthetic record;
+перенос permit наружу перед настоящим nft/API write запрещён контрактом.
+Lock order/top-level call graph/bootstrap installation ещё не доказаны. Никакой автоматической
+установки по sandbox PASS. Следующие product adapters требуют отдельного конкретного кода
+и безопасной real-machine qualification с независимым возвратом исходного on.

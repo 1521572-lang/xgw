@@ -81,3 +81,10 @@ REC-B пока не закрыт. REC-C остаётся следующим эт
 Driver/fence/live recovery не реализованы,45с/absent-table replay/автономность не проверены.
 Доступен только ThinkCentre; LAN считается работающей, host не LAN-client proof.
 Full wave3/D1-on/faults/LAN UDP/IPv6/DNS/E4/performance/all Tailscale открыты, неwave4/DAE.
+
+## После фактического Y
+
+[Review Y](REVIEW-REAL-MACHINE-0.2.0-wave3y.md):6/6 и liveguard10/10 подтвердили исправление
+тестового контракта; snapshot/check0/afterstable/manifestPLANNED_NOT_ARMED получены.
+REC-B qualification принята в этом scope. Actual replay/absenttable/45с/autonomy не проверены.
+Следующий Z — cooperative writer sandbox/19cases/3processcases, без product fence integration.

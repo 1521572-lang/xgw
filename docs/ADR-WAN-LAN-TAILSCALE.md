@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3y.md: исправленный guard contract/snapshot/check-only,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3z.md: sandbox writers/locks,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -93,6 +93,15 @@ ownedlistener/TLS/контекст подтверждены; SB-1двеcurl97/HT
 свидетельства/журналы/lastscan, не повторяет запросы и не меняет рабочий шлюз.
 Исторический mapping по filetimes не скрывает отсутствие старого configdigest.
 Review-wave3n фиксирует пределы; O_NOT_RUN, полнаяwave3 открыта.
+
+
+### Принято после Y,03.11.2026
+
+Y1440d51:6/6guard, live10/10/dropcount5/reject0, полный REC-B snapshot/check0/afterstable,
+manifestPLANNED_NOT_ARMED; working on сохранён. Xtestcontractbug закрыт, product не менялся.
+Zпередаёт19cooperative sandbox fence cases, три process cases, без XGW/runtime integration.
+Реальные fence/driver/activegatesfalse. Root Ymaterial не используется. Реальная Z NOT_RUN.
+Подробно ReviewY/ADR-REC-C-OWNERSHIP/ТЗ Z; полнаяwave3/D1-on/faults остаются открыты.
 
 
 ### Поправка после X,03.11.2026

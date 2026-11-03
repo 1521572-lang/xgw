@@ -915,18 +915,16 @@ V be1fc1b принят: четыре этапа/1.747с, рабочий on со�
 Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3v.md`; повтор кэша/журнала не требуется.
 W e670ceb принят:25/25 синтетических сценариев REC-A, рабочий on сохранён.
 Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3w.md`.
-X283bb12 принят частично:26/26 validation cases, ON_SNAPSHOT_PARTIAL/GUARD_LAYOUT;
-полный snapshot/check/after не получены, manifest не создан. Working on сохранён.
-Найдена ошибка тестового collector: ожидал forward priority5, product задаёт10;
-число5 в прежних отчётах — host_drop_rules count. Живые правила не менять.
-Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3x.md`.
-Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3y.md` + TEMPLATE:
-шесть новых guard regressions и полный REC-B snapshot/check-only/after одним worker/отчётом.
-X26/W25 повторно не исполняются; исторический Xhelper/run сохранён, новый v2 в отдельном runY.
-В readout добавлены безопасные bool/count признаки guard. Source-aligned contract10/10 строгий.
-Реальная wave3y NOT_RUN; REC-B не закрыт, fence/driver/recovery НЕ реализованы.
-Все active gatesfalse; никакой установки/timer/guardian/fault/изменений сети и служб.
-OnlyThinkCentre/workingLAN, hostнеLANclient. Fullwave3/D1-on/faults открыты, неwave4/DAE.
+Y1440d51 принят:6/6, живой guard10/10, snapshot/check-only0/afterstable,
+private manifest PLANNED_NOT_ARMED. Test defect Xforward5 закрыт; working on сохранён.
+Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3y.md`.
+Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3z.md` + TEMPLATE:
+19 cooperative fence cases в закрытом пользовательском sandbox, три process cases,
+один batch/один отчёт. Y6/X26/W25 не повторяются, root snapshot не читается.
+`ADR-REC-C-OWNERSHIP.md` задаёт контракт epoch/owner/generation/deadline/retirement.
+Кандидат test-only: в product writers не встроен, реальный fence/driver не установлен,
+active gatesfalse. Реальная wave3z NOT_RUN. Нет network/service/rule/установочных действий.
+OnlyThinkCentre/workingLAN, hostнеLANclient; fullwave3/D1-on/faults открыты, неwave4/DAE.
 
 ### TUN
 
