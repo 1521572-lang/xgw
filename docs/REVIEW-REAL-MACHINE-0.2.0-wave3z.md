@@ -1,5 +1,7 @@
 # Разбор wave3z: принят sandbox-контракт, runtime fence ещё отсутствует
 
+Обновление: [AA22/22 принята](REVIEW-REAL-MACHINE-0.2.0-wave3aa.md); [AB](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ab.md) проверяет новый dormant sourceRegistry без установки. Старое AA NOT_RUN ниже — исторический статус.
+
 [Отчёт Z](https://github.com/1521572-lang/xgw/blob/2a5b1fbfa722c7995a783e2b3c0744cd3757aba5/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3z-2026-11-03.md)
 принят fast-forward, commit2a5b1fbfa722c7995a783e2b3c0744cd3757aba5.
 03.11.2026,13:03:13–13:09MSK. Tested044f92bc2f40622fd2b0d9c7870ef158923e3d3d,

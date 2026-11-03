@@ -1,6 +1,36 @@
 # REC-C: писатели поколения, первая инвентаризация и план внедрения fence
 
 
+## Актуально после AA — dormant registry AB (03.11.2026)
+
+[AAотчёт](TEST-REPORT-REAL-MACHINE-0.2.0-wave3aa-2026-11-03.md) принят:
+22/22, триprocesscases/3children, command0/shapevalid, HEALTHY/on/pool/versions/связь
+сохранны. [Разбор AA](REVIEW-REAL-MACHINE-0.2.0-wave3aa.md). Это sandboxscope;
+реальные fence/recovery/activeflagsfalse. AA22/Z19/Y6/X26/W25 не повторять.
+
+Следующий [ADRfoundation](ADR-REC-C-REGISTRY-FOUNDATION.md) и
+[единое ТЗ AB](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ab.md):32 новых проверок sourceRegistry,
+включая bootidentity/metadata/receipts/pre-postrename и3processcases/4children.
+Реальный AB NOT_RUN. Новый src/xgw/ownership.py — **единственное source-добавление**,
+без import-timeI/O и без импорта из существующего runtime/entrypoints. Все старые src,
+packaging/config/CLI неизменны, на ThinkCentre не устанавливается. Поэтому source diff
+не пуст, а установленный рабочий runtime остаётся прежним.
+
+Unifiedrecord сохраняет generation+writerremoval+receipt одной заменой. Это заменяет
+двухфайловый COMMITTINGgap AA, но не даёт kernel/APIatomicity. state.next → failclosed,
+без autorepair/prune; COMMIT_UNCERTAIN не разрешает повтор. Receipts — assertions caller,
+не networkproof. FoundationC-REG1 не закрывает C-REG2repair/C-ENTRY/C-VERIFY/bootstrap.
+
+Далее fixes поAB либо dormantadapters/repair/receipts; fake-only независимыйD может
+разрабатываться до Cinstallation. Установка C-ENTRY остаётся BLOCKED_BOOTSTRAP:
+независимый возврат исходных code/unit/on ещё не реализован. Nooff/install/G1/WAN/LAN/
+Tailscale/pin/pool/service/ruleschanges. ТолькоThinkCentre, workingLAN; hostнеLANclientproof.
+Fullwave3/D1-on/fault/LANUDP/IPv6/DNS/E4/performance/allTS открыты, неwave4/DAE.
+
+Ниже история. Прежние AA/Z NOT_RUN — статус до полученных выше фактических отчётов.
+
+
+
 ## Актуально после Z — lifetime admission AA (03.11.2026)
 
 [Отчёт Z](TEST-REPORT-REAL-MACHINE-0.2.0-wave3z-2026-11-03.md) проверен:
