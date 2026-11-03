@@ -1,5 +1,38 @@
 # ADR REC-C: dormant registry foundation с одним atomic record
 
+
+## Актуально после AB — единый максимальный пакет AC (03.11.2026)
+
+[ABотчёт](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ab-2026-11-03.md) проверен:32/32,
+3processcases/4children, command0/shapevalid; HEALTHY/on/pool/versions/связьсохранны.
+[Разбор AB](REVIEW-REAL-MACHINE-0.2.0-wave3ab.md). Scopefoundationonly; AB32/AA22/Z19/Y6/
+X26/W25 не повторять. Driver/fence/repair/activegatesреальнойсети по-прежнемуfalse.
+
+Прямоеуказаниевладельца: последующиеТЗ — весьмаксимальныйготовыйsafeобъём заодинзаход,
+безпотерикачества: независимыеветви/автопереходы/partialresults/одинreport. Не дробить на
+микрозадания. Globalidentity/baseline/privacySTOP и prerequisitegatesнеослаблять.
+
+[ТЗ AC](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ac.md) объединяет51 новыйcase:28adapter +
+16readonlydiagnostic +7fake-onlyprocess. [ADR](ADR-REC-C-ADAPTERS-AND-FAKE-D.md).
+Один detachedusercollector/EXCLstart/checkpoints/summary/Markdown. Casefailнеблокирует
+другиеветви. Реальная AC NOT_RUN. Локально8узкихtests/RuffPASS, fullbatchнеисполнялся.
+
+Source diffпротивpin351 теперьровно3новыхмодуля:ownership.py(ABbytesunchanged),
+ownership_adapters.py,ownership_diagnostics.py. Прежнийruntime/entrypoints/unit/config
+не менялись и не импортируютновыемодули; installedruntimeнеобновлялся. Неinstall/restart.
+Adapterverification — callerassertions, diagnosticsneverrepair/promote/prune. FakeD
+возвращаеттолькоusercasefileпослеexit/crashсвоегоcontroller; это неслужба/таймер/
+networkguardian/реальныйrescue. Положительныхfakerestorations2, expectedfailure1,
+refusals2,unused2, не7restored. D01–D05 timingmeasured; D06/D07 timeNOT_MEASURED.
+
+C-ENTRY/verifier/fence/repair/recovery/bootstrapNOT_IMPLEMENTED. Liveустановкапо-прежнему
+BLOCKED_BOOTSTRAP; realEтребуетC+D+независимоговозвратаисходногоon. Nooff/install/G1/
+WAN/LAN/Tailscale/pin/pool/service/ruleschanges. OnlyThinkCentre/workingLAN/HEALTHY/on.
+Fullwave3/D1-on/faults/LANUDP/IPv6/DNS/E4/performance/allTSоткрыты,неwave4/DAE.
+
+Ниже история; прежнийAB NOT_RUN отменён фактическим отчётомвыше, livegatesнеподменять.
+
+
 Статус03.11.2026: sourcecandidate, **не активирован и не установлен**.
 Основание: AA22/22 принят в sandboxscope. Новая библиотека src/xgw/ownership.py не импортируется
 существующими entrypoints, не создаёт каталогов при импорте/конструировании, не включает

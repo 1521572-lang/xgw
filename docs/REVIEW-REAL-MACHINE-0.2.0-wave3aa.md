@@ -1,5 +1,7 @@
 # Разбор wave3aa: lifetime candidate принят, переход к dormant registry
 
+Обновление: [AB32/32 принята](REVIEW-REAL-MACHINE-0.2.0-wave3ab.md); [единыйAC](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ac.md) объединяет51новыйcase безустановки. ПрежнийAB NOT_RUN ниже — история.
+
 [Отчёт AA](https://github.com/1521572-lang/xgw/blob/e64a39b7743da2a1f999d51e829dfd0f4b3dd9f9/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3aa-2026-11-03.md)
 принят fast-forward, commit **e64a39b7743da2a1f999d51e829dfd0f4b3dd9f9**.
 Прогон03.11.2026,13:33:06–13:39MSK; это интервал всего прогона, не измеренный helperelapsed.
