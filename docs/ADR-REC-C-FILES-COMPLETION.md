@@ -1,5 +1,10 @@
 # ADR: explicit FILES completion и строгий контракт неполных проверок
 
+Обновление04.11.2026: [AI78 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md). Следующий
+[AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md) объединяет15lifecycleentrypoints;
+ниже сохранено описание FILES candidate до actualAIreport. Globalgates прежние.
+
+
 Статус04.11.2026: sourcecandidate готов; реальнаяAIqualification NOT_RUN.
 [AHreview](REVIEW-REAL-MACHINE-0.2.0-wave3ah.md) снялAGHOLD exactreadback; старые
 AG129/AF145/AE112/AD130/... не повторяются. [ТЗ AI](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ai.md).

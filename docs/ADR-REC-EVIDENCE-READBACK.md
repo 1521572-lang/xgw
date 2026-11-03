@@ -1,5 +1,10 @@
 # ADR: точное чтение existing artifacts перед принятием AG
 
+Актуализация после AI04.11.2026: [AI78 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md),
+AGHOLD ранее снят exactAH. Готов [следующий укрупнённый AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md).
+Ниже история соответствующего отчёта; прежние NOT_RUN не отменяют actualAIreview.
+
+
 Обновление04.11.2026: [AH exactreadback](REVIEW-REAL-MACHINE-0.2.0-wave3ah.md) принят;
 AG129 принят в sourcefixture scope, HOLD снят. Ниже исходный разбор до получения AH;
 он сохраняет историю противоречий publictable. Originaltestreports не переписаны.

@@ -20,12 +20,14 @@ from .generator import builder, validate
 from .generator.builder import BALANCER_TAG
 from .net import cmd, dnsmasq
 from .net.capture import Capture, CaptureError
+from .ownership_entrypoints import EntryBoundary, owned_entrypoint, pin_actor, require_bound_actor
 from .paths import Paths
 from .store import Store
 from .watch import status
-from .xraycore.api import ApiError
+from .xraycore.api import ApiClient, ApiError
 
 MAX_PIN_SECONDS = 24 * 3600
+_API_ENTRY = pin_actor(ApiClient, ("pin", "unpin"))
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,8 @@ def scope(info: dict) -> str:
 # --- перехват ------------------------------------------------------------------
 
 
-def enable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
+@owned_entrypoint("LIFECYCLE", dependencies=(("capture", Capture, ("enable",), False),))
+def enable(cfg: config.Config, paths: Paths, capture: Capture, *, ownership=None) -> Outcome:
     if not capture.capturing:
         return Outcome(
             2,
@@ -113,7 +116,10 @@ def enable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
     return Outcome(0, text)
 
 
-def enable_checked(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
+@owned_entrypoint("LIFECYCLE", dependencies=(("capture", Capture, ("enable",), False),))
+def enable_checked(
+    cfg: config.Config, paths: Paths, capture: Capture, *, ownership=None,
+) -> Outcome:
     """Включение для тех, кто не видит терминала (панель, бот): пока Xray не отвечает,
     не включает — с fail-closed машина осталась бы без интернета, а человек без
     возможности вернуть его. Команда `xgw enable` включает и предупреждает."""
@@ -122,10 +128,11 @@ def enable_checked(cfg: config.Config, paths: Paths, capture: Capture) -> Outcom
             1, "Xray не отвечает — VPN не включён: иначе машина осталась бы без интернета. "
                "Проверьте подписку и серверы",
         )
-    return enable(cfg, paths, capture)
+    return enable(cfg, paths, capture, ownership=ownership)
 
 
-def disable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
+@owned_entrypoint("LIFECYCLE", dependencies=(("capture", Capture, ("disable",), False),))
+def disable(cfg: config.Config, paths: Paths, capture: Capture, *, ownership=None) -> Outcome:
     paths.ensure()
     try:
         capture.disable()
@@ -143,9 +150,11 @@ def disable(cfg: config.Config, paths: Paths, capture: Capture) -> Outcome:
 # --- сеть после изменения настроек ---------------------------------------------
 
 
+@owned_entrypoint("LIFECYCLE", dependencies=(("capture", Capture, ("up",), False),))
 def apply_network(
     cfg: config.Config, paths: Paths, capture: Capture, *, logger,
     runner: Callable[..., str] = cmd.run,
+    ownership=None,
 ) -> tuple[list[str], list[str]]:
     """Доводит до конфига правила nftables (bypass_hosts, exclude_cidrs) и DHCP
     (dhcp_range, static_leases). Возвращает (что сделано, что не удалось): сбой одного
@@ -175,7 +184,8 @@ def apply_network(
 # --- ручное закрепление --------------------------------------------------------
 
 
-def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
+@owned_entrypoint("LIFECYCLE")
+def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str, *, ownership=None) -> Outcome:
     """Ручной выбор сервера (pinning.py): участника или запасного, на срок или бессрочно
     (ttl_text = pinning.FOREVER). Перестанет отвечать — трафик временно ведёт автовыбор, а
     когда ответит — снова он (демон, _manual_step)."""
@@ -197,7 +207,12 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
             f"{', '.join(members) or 'нет'} (все — xgw servers)",
         )
     try:
-        engine.make_api(paths, xray_bin).pin(BALANCER_TAG, tag)
+        boundary = EntryBoundary(ownership)
+        api = engine.make_api(paths, xray_bin, ownership=ownership)
+        boundary.validate()
+        api = require_bound_actor(ownership, api, _API_ENTRY)
+        api.pin(BALANCER_TAG, tag)
+        boundary.validate()
     except ApiError as exc:
         return Outcome(1, str(exc))
     now = time.time()
@@ -231,12 +246,18 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
     )
 
 
-def unpin(cfg: config.Config, paths: Paths) -> Outcome:
+@owned_entrypoint("LIFECYCLE")
+def unpin(cfg: config.Config, paths: Paths, *, ownership=None) -> Outcome:
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is None:
         return Outcome(1, f"xray не найден (ожидается {paths.xray_bin} либо XGW_XRAY_BIN)")
     try:
-        engine.make_api(paths, xray_bin).unpin(BALANCER_TAG)
+        boundary = EntryBoundary(ownership)
+        api = engine.make_api(paths, xray_bin, ownership=ownership)
+        boundary.validate()
+        api = require_bound_actor(ownership, api, _API_ENTRY)
+        api.unpin(BALANCER_TAG)
+        boundary.validate()
     except ApiError as exc:
         return Outcome(1, str(exc))
     with open_store(paths) as store:
@@ -267,8 +288,9 @@ POOL_MODE_EVENT = {
 }
 
 
+@owned_entrypoint("LIFECYCLE")
 def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool = False,
-                  ready: int | None = None) -> Outcome:
+                  ready: int | None = None, ownership=None) -> Outcome:
     """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге): off, observe или
     on — весь дом через пул (веха М2б.2). Устройства «через бесплатные серверы» (М2б.1) при
     выключенном пуле закрыты, а весь дом без допущенных серверов (ready — их число,
@@ -293,7 +315,7 @@ def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool =
                           "серверы»")
     previous = stored.get("free_pool_mode")
     try:
-        changed = managed.set_free_pool_mode(store_path, mode)
+        changed = managed.set_free_pool_mode(store_path, mode, ownership=ownership)
     except managed.ManagedError as exc:
         return Outcome(1, str(exc))
     except OSError as exc:
@@ -318,7 +340,8 @@ HOUSE_BOOT_EVENT = ("бесплатный пул: весь дом снят по�
                     "наблюдение продолжается; включить снова — кнопкой на вкладке")
 
 
-def house_after_boot(paths: Paths, store_path) -> bool:
+@owned_entrypoint("LIFECYCLE")
+def house_after_boot(paths: Paths, store_path, *, ownership=None) -> bool:
     """Весь дом через пул не переживает перезагрузку (отчёт m2b2fix, дефект 1): удалённый
     доступ к шлюзу пропал, а режим вернулся сам после двух перезагрузок подряд — снять его,
     когда шлюз недоступен, было нечем. Метки этой загрузки (Paths.house_file) нет — режим on
@@ -328,7 +351,7 @@ def house_after_boot(paths: Paths, store_path) -> bool:
     if paths.house_file.exists():
         return False
     try:
-        changed = managed.set_free_pool_mode(store_path, "observe")
+        changed = managed.set_free_pool_mode(store_path, "observe", ownership=ownership)
     except (managed.ManagedError, OSError):
         return False
     if changed:
@@ -337,7 +360,8 @@ def house_after_boot(paths: Paths, store_path) -> bool:
     return changed
 
 
-def set_pool_pin(paths: Paths, store_path, cfg, wanted: str) -> Outcome:
+@owned_entrypoint("LIFECYCLE")
+def set_pool_pin(paths: Paths, store_path, cfg, wanted: str, *, ownership=None) -> Outcome:
     """Сервер бесплатного пула, выбранный вручную (panel.json; демон применит на ближайшем
     шаге): wanted — id варианта или его начало (не короче 6 знаков) среди допущенных к трафику;
     пусто или «auto» — выбирает шлюз. Выбранный держится, пока жив; молчит — трафик ведёт
@@ -358,7 +382,9 @@ def set_pool_pin(paths: Paths, store_path, cfg, wanted: str) -> Outcome:
                               "недопуска на вкладке «Бесплатные серверы»")
         chosen = found[0]
     try:
-        changed = managed.set_free_pool_pin(store_path, chosen.node.fingerprint if chosen else "")
+        changed = managed.set_free_pool_pin(
+            store_path, chosen.node.fingerprint if chosen else "", ownership=ownership,
+        )
     except managed.ManagedError as exc:
         return Outcome(1, str(exc))
     except OSError as exc:
@@ -408,7 +434,8 @@ def pick_server(paths: Paths, wanted: str) -> tuple[dict | None, str]:
 CORE_NAMES = {"auto": "выбирает шлюз", "xray": "только Xray", "sing-box": "только sing-box"}
 
 
-def set_core(paths: Paths, store_path, wanted: str, core: str) -> Outcome:
+@owned_entrypoint("LIFECYCLE")
+def set_core(paths: Paths, store_path, wanted: str, core: str, *, ownership=None) -> Outcome:
     """Закрепляет за сервером ядро: xray, sing-box или auto (panel.json; демон применит на
     ближайшем шаге). Сервер, который умеет одно ядро, на другое не закрепляется."""
     from . import managed
@@ -426,7 +453,7 @@ def set_core(paths: Paths, store_path, wanted: str, core: str) -> Outcome:
     if core == "sing-box" and capability == "xray":
         return Outcome(2, f"«{name}» умеет только Xray — на sing-box его не перевести")
     try:
-        changed = managed.set_core(store_path, [fingerprint], core)
+        changed = managed.set_core(store_path, [fingerprint], core, ownership=ownership)
     except managed.ManagedError as exc:
         return Outcome(1, str(exc))
     except OSError as exc:

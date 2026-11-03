@@ -28,12 +28,16 @@ from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .model import ServerNode, raw_to_node, split_variants
 from .net import lan, nft
+from .ownership_entrypoints import EntryBoundary, owned_entrypoint, pin_actor, require_bound_actor
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
 from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
 from .watch import target
 from .xraycore.api import ApiClient, server_address
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
+
+_SINGBOX_ENTRY = pin_actor(singbox_apply.SingboxCore, ("apply", "rollback", "restart"))
+_APPLIER_ENTRY = pin_actor(Applier, ("apply", "rollback"))
 
 
 class EngineError(Exception):
@@ -125,7 +129,10 @@ def inventory_file(paths: Paths) -> Path:
     return paths.var / "inventory.json"
 
 
-def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> None:
+@owned_entrypoint("LIFECYCLE")
+def save_inventory(
+    paths: Paths, cfg: config.Config, inventory: Inventory, *, ownership=None,
+) -> None:
     """Список всех серверов подписок — для панели: и тех, что в конфиг не попали.
 
     В нём только то, что видно и так (имя, протокол, источник); ключей нет.
@@ -181,8 +188,9 @@ def _load_fingerprints(paths: Paths) -> dict[str, dict[str, list]]:
     }
 
 
+@owned_entrypoint("LIFECYCLE")
 def _save_fingerprints(paths: Paths, known: dict[str, dict[str, list]], now: float,
-                       logger) -> None:
+                       logger, *, ownership=None) -> None:
     fresh = {
         base: kept for base, entries in known.items()
         if (kept := {digest: entry for digest, entry in entries.items()
@@ -202,6 +210,7 @@ def config_secrets(cfg: config.Config) -> list[str]:
     return [value for value in values if value]
 
 
+@owned_entrypoint("LIFECYCLE")
 def collect(
     cfg: config.Config,
     paths: Paths,
@@ -210,6 +219,7 @@ def collect(
     logger,
     via_xray: bool = True,
     cancel: threading.Event | None = None,
+    ownership=None,
 ) -> Inventory:
     """Опрос всех подписок и ручных ссылок.
 
@@ -249,7 +259,7 @@ def collect(
     previous = set() if known else {item.get("fingerprint") for item in load_inventory(paths)}
     now = time.time()
     split = split_variants(inventory.nodes, known, previous=previous, now=now)
-    _save_fingerprints(paths, known, now, logger)
+    _save_fingerprints(paths, known, now, logger, ownership=ownership)
     if split:
         logger.info("серверов с одним адресом и ключом, но разными путём, SNI или режимом: %d "
                     "— это разные серверы, не дубли", split)
@@ -886,6 +896,7 @@ def summary(assembly: Assembly) -> dict[str, int]:
     }
 
 
+@owned_entrypoint("LIFECYCLE")
 def persist(
     paths: Paths,
     assembly: Assembly,
@@ -893,6 +904,7 @@ def persist(
     *,
     record_event: bool = True,
     applied: bool = True,
+    ownership=None,
 ) -> None:
     """Записывает в SQLite состав узлов последней сборки и квоты подписок. applied — конфиг
     стал рабочим: тогда и снимок настроек ядра, по которым он собран (`xgw generate` пишет
@@ -992,22 +1004,38 @@ def describe_singbox(outcome: singbox_apply.SingboxOutcome) -> str:
     return text
 
 
+@owned_entrypoint("LIFECYCLE", dependencies=(
+    ("applier", Applier, ("apply", "rollback"), False),
+    ("singbox_core", singbox_apply.SingboxCore, ("apply", "rollback", "restart"), True),
+))
 def apply_all(
     cfg: config.Config, paths: Paths, assembly: Assembly, applier: Applier, *,
     force_now: bool = False,
     singbox_core: singbox_apply.SingboxCore | None = None,
+    ownership=None,
 ) -> tuple[ApplyOutcome | None, singbox_apply.SingboxOutcome | None]:
     """Применяет сборку: сначала sing-box (мосты должны слушать), затем Xray. Если sing-box
     конфиг не принял, Xray не применяется (он собран под него): вернётся только итог sing-box."""
     outcome = None
+    boundary = EntryBoundary(ownership, ((applier, *_APPLIER_ENTRY, False),
+                                         (singbox_core, *_SINGBOX_ENTRY, True)))
     if assembly.singbox is not None:
-        core = singbox_core if singbox_core is not None else make_singbox(cfg, paths)
+        core = (singbox_core if singbox_core is not None
+                else make_singbox(cfg, paths, ownership=ownership))
+        boundary.validate()
+        require_bound_actor(ownership, core, _SINGBOX_ENTRY)
+        boundary = EntryBoundary(ownership, ((applier, *_APPLIER_ENTRY, False),
+                                             (core, *_SINGBOX_ENTRY, False)))
         outcome = core.apply(
             assembly.singbox.config, reload=assembly.singbox.reload,
         )
+        boundary.validate()
         if outcome.mode in ("rejected", "rollback", "failed"):
             return None, outcome
-    return applier.apply(assembly.result.config, force_now=force_now), outcome
+    boundary.validate()
+    applied = applier.apply(assembly.result.config, force_now=force_now)
+    boundary.validate()
+    return applied, outcome
 
 
 def describe(outcome: ApplyOutcome) -> str:

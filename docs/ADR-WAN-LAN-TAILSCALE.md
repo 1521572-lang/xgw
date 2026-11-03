@@ -1,25 +1,27 @@
 # WAN, LAN и условный маршрут Tailscale
 
-## Текущий статус — AH принят; AG129 принят; единый AI78 (04.11.2026)
+## Текущий статус — AI78 принят; укрупнённый AJ328 (04.11.2026)
 
-[AHreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ah-2026-11-03.md) exactreadback
-AG129/AF145/AE112=386existingrows/0newtests/0contractmismatch. [Разбор AH](REVIEW-REAL-MACHINE-0.2.0-wave3ah.md).
-AGHOLD снят в optional-source/fake-effects scope. В прежнейAGtable были54expected/
-36observedenum/88approxms расхождения, actualsavedreadback соответствует source.
-88различающихсяrows, не сумма178cases. Originalreports сохраняются. AF/AE безdiff.
-NNP0/sudo0/collect0/show0/HEALTHY_ON/poolOFF/linkALIVE/versionssame/owneractions0.
-WorkerexitNOT_COLLECTED; mutableownerfiles не authentication. Старыеbatches не повторять.
+[AI report](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ai-2026-11-04.md) принят78/78 в
+scope explicitprivateFILES:batch7743мс/casesum5652мс/3positiveI/4UNKNOWN/1fenced.
+[Разбор AI](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md). Exactformatterprefix совпал;
+NULLoutcome вI не подставлять. NNP0/sudo0/start-monitor-show-report0/HEALTHY_ON/poolOFF/
+linkALIVE/versionssame/owneractions0. WorkerexitNOT_COLLECTED. Старыеbatches не повторять.
 
-[Единое ТЗ AI](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ai.md) и
-[ADR FILES completion](ADR-REC-C-FILES-COMPLETION.md):78НОВЫХcases/одинstart/
-автопереходы/partialsnapshot/одинавтоматическийreport. Толькоnewownership_completion.py,
-117source/7A10M; все прежние116source/units/config/pyproject/standhelpers UNCHANGED.
-Concrete fresh namedFILES completion +exactrole/resultpolicy; другиеdomains→UNKNOWN.
-Это неglobalruntimeverifier/rolepolicy/pathalias/atomicsnapshot/activation. Runtimeнеwired/
-installedнеобновлён, все7gatesfalse. RealAI NOT_RUN;14unique narrowchecks/RuffPASS.
-LiveC BLOCKED_BOOTSTRAP; independent original-on/code/unitrescue доinstall/fault.
+Владелец потребовал больше работы в одном ТЗ. [Пакет AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md):
+**4,205×AI**,15sourceentrypoints/4блока, одинstart/автопереходы/partialdata/одинreport.
+[ADR lifecycle](ADR-REC-C-LIFECYCLE-ENTRYPOINTS.md). A246 equivalence/fence,
+B36 dependencies/definitions,C22 drift/factories,D24 composites/FILES. No reruns/delaypadding.
+Global source/baseline/privacy/scopeSTOP сохранены. RealAJ NOT_RUN;15narrowchecks/RuffPASS.
+
+Source118/pin8A11M:новыйownership_entrypoints.py, changesengine.py/actions.py;115старых
+source/units/config/pyproject/standhelpers неизменны. OptionalouterLIFECYCLE охватывает
+SB→XR и15engine/actions calls; nestedownerpropagation и boundarychecks междуsteps.
+LegacyNone AST прежний/НЕfenced. Installedruntime не обновлён;9actors50hooks отдельны
+от15newfunctions, не globalgraph/version/boot/pathaliases/realverifiers/repair/bootstrap.
+Все7runtimegatesfalse;LiveC BLOCKED_BOOTSTRAP,independentoriginalon/code/unitrescueдоfault.
 OnlyThinkCentre/workingLAN/HEALTHY/on; nooff/install/G1/WAN/LAN/TS/pool/config/service/
-live rules. Host неLANproof. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
+live rules. HostнеLANproof. Fullwave3/LAN/performance/DAE gates прежние. Ниже история.
 
 
 

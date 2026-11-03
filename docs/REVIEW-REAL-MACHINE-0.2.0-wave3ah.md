@@ -1,5 +1,10 @@
 # Разбор AH: readback принят; AG129 принят в пределах source fixture
 
+Актуализация после AI04.11.2026: [AI78 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ai.md),
+AGHOLD ранее снят exactAH. Готов [следующий укрупнённый AJ328](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aj.md).
+Ниже история соответствующего отчёта; прежние NOT_RUN не отменяют actualAIreview.
+
+
 [AH report](https://github.com/1521572-lang/xgw/blob/2479d76b86b3543b17a5c9c2b61e2a3807490f88/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ah-2026-11-03.md#L1)
 доставлен fast-forward, commit2479d76b86b3543b17a5c9c2b61e2a3807490f88.
 Readback delivery2669a2aa82d6f56b4cd43781f4ad07bfe1470b7a,
