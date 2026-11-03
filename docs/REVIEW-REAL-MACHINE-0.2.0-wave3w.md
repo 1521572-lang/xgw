@@ -73,3 +73,10 @@ runtime и все прежние stand helpers неизменны. Полных 
 Ожидается `docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3x-ДАТА.md`.
 У Flash только ThinkCentre; LAN считается работающей. LAN UDP/IPv6/DNS/E4, D1-on,
 scoped faults, performance/all Tailscale/full wave3 открыты; wave4/DAE не начинать.
+
+## После фактического X
+
+[Review X](REVIEW-REAL-MACHINE-0.2.0-wave3x.md):26/26 cases, GUARD_LAYOUT/partial,
+check и after не выполнялись. Найден дефект тестового ожидания forward priority5
+при product10;5 было host-drop count. Y v2 исправляет контракт, добавляет sanitized
+наблюдения и6 новых guard cases; старыеX26/W25 не повторяет. REC-B ещё не закрыт.

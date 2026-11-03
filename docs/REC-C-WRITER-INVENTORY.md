@@ -1,5 +1,12 @@
 # REC-C: писатели поколения, первая инвентаризация и план внедрения fence
 
+Обновление после X283bb12: REC-B partial/guard contract bug. Исторический collector
+ошибочно ожидал forward priority5 вместо source10. Новый Y v2 исправляет тест и
+публикует safe guard observations; старый X/run неизменён, живые правила не менять.
+Y объединяет6 новых guard cases и snapshot/check/after; реальная Y NOT_RUN. REC-B пока
+не закрыт, переход к REC-C/D/E не выполнен. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3x.md.
+
+
 Статус03.11.2026: анализ исходников, **writer fence NOT_IMPLEMENTED**. Это не полный
 доказанный call graph и не разрешение остановить службы. Исходники по product pin
 351fb54e074f4a7b497a8a4244fc74c6088788d7. Тестовый X не меняет ни один из этих путей.

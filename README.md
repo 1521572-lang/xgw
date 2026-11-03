@@ -915,15 +915,18 @@ V be1fc1b принят: четыре этапа/1.747с, рабочий on со�
 Разбор — `docs/REVIEW-REAL-MACHINE-0.2.0-wave3v.md`; повтор кэша/журнала не требуется.
 W e670ceb принят:25/25 синтетических сценариев REC-A, рабочий on сохранён.
 Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3w.md`.
-Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3x.md` + TEMPLATE:
-REC-B private snapshot,26 validation cases, один nft --check и after, один отчёт.
-Сборщик не импортирует XGW, material root0700/0600; проверка не применяет проект.
-`docs/REC-C-WRITER-INVENTORY.md` фиксирует писателей и план следующего fence.
-Snapshot-кандидат реализован в test/stand; реальный driver и writer fence не реализованы,
-active gate=false, plan PLANNED_NOT_ARMED. Реальная wave3x NOT_RUN. Никаких live faults,
-таймеров, guardian, установки или изменений сети/служб пакет не выполняет.
-Доступен только ThinkCentre; host-пробы не LAN acceptance. Работающая LAN принимается
-как baseline, on/WAN/LAN/Tailscale сохраняются. Fullwave3/D1-on/faults открыты, неwave4/DAE.
+X283bb12 принят частично:26/26 validation cases, ON_SNAPSHOT_PARTIAL/GUARD_LAYOUT;
+полный snapshot/check/after не получены, manifest не создан. Working on сохранён.
+Найдена ошибка тестового collector: ожидал forward priority5, product задаёт10;
+число5 в прежних отчётах — host_drop_rules count. Живые правила не менять.
+Подробно `docs/REVIEW-REAL-MACHINE-0.2.0-wave3x.md`.
+Следующее ТЗ — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3y.md` + TEMPLATE:
+шесть новых guard regressions и полный REC-B snapshot/check-only/after одним worker/отчётом.
+X26/W25 повторно не исполняются; исторический Xhelper/run сохранён, новый v2 в отдельном runY.
+В readout добавлены безопасные bool/count признаки guard. Source-aligned contract10/10 строгий.
+Реальная wave3y NOT_RUN; REC-B не закрыт, fence/driver/recovery НЕ реализованы.
+Все active gatesfalse; никакой установки/timer/guardian/fault/изменений сети и служб.
+OnlyThinkCentre/workingLAN, hostнеLANclient. Fullwave3/D1-on/faults открыты, неwave4/DAE.
 
 ### TUN
 

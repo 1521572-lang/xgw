@@ -1,5 +1,12 @@
 # Единое ТЗ исполнителю: возврат исходного on, REC-A–E
 
+Обновление после X283bb12: REC-B partial/guard contract bug. Исторический collector
+ошибочно ожидал forward priority5 вместо source10. Новый Y v2 исправляет тест и
+публикует safe guard observations; старый X/run неизменён, живые правила не менять.
+Y объединяет6 новых guard cases и snapshot/check/after; реальная Y NOT_RUN. REC-B пока
+не закрыт, переход к REC-C/D/E не выполнен. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3x.md.
+
+
 Роль: исполнитель кода уровня Principal Linux/Netfilter engineer. Минимум VM-прогонов,
 проверки реального systemd/nft/network — через подробное ТЗ Flash на ThinkCentre.
 Исходное решение: [ADR](ADR-RECOVERY-ORIGINAL-ON.md).

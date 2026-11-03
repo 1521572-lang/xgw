@@ -1,5 +1,12 @@
 # ADR: независимое восстановление исходного on перед scoped faults
 
+Обновление после X283bb12: REC-B partial/guard contract bug. Исторический collector
+ошибочно ожидал forward priority5 вместо source10. Новый Y v2 исправляет тест и
+публикует safe guard observations; старый X/run неизменён, живые правила не менять.
+Y объединяет6 новых guard cases и snapshot/check/after; реальная Y NOT_RUN. REC-B пока
+не закрыт, переход к REC-C/D/E не выполнен. Подробно REVIEW-REAL-MACHINE-0.2.0-wave3x.md.
+
+
 Статус 03.11.2026: архитектурное решение и чистая модель REC-A. Реальный driver,
 writer fence, snapshot и автономность ещё не приняты. Текущее исполнение — только ТЗ W.
 Документ не является командой вооружить механизм или изменить живую сеть.

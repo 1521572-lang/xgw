@@ -4,7 +4,7 @@
 
 Шлюз уже используется по схеме XGW → Wi-Fi-роутер → устройства; владелец возвращает VPN
 в on и требует исходить из этой рабочей схемы. Принимаем рабочий on за текущий baseline.
-Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3x.md: snapshot/check-only,
+Актуальное ТЗ — TEST-PLAN-REAL-MACHINE-0.2.0-wave3y.md: исправленный guard contract/snapshot/check-only,
 без enable/disable/restart/install/faults и без изменения WAN/LAN/Tailscale.
 Прежний always_off guardian не применять на рабочем on. Старые сценарии ниже — история;
 будущий разрушительный тест требует восстановления исходного on, а не автоматического off.
@@ -93,6 +93,17 @@ ownedlistener/TLS/контекст подтверждены; SB-1двеcurl97/HT
 свидетельства/журналы/lastscan, не повторяет запросы и не меняет рабочий шлюз.
 Исторический mapping по filetimes не скрывает отсутствие старого configdigest.
 Review-wave3n фиксирует пределы; O_NOT_RUN, полнаяwave3 открыта.
+
+
+### Поправка после X,03.11.2026
+
+X283bb12:26/26 cases, snapshot GUARD_LAYOUT/partial; check/after NOT_RUN, on сохранён.
+В тестовом X ошибочно требовался forward priority5. Product render_guard задаёт10;
+старые «forward/drop5» означали hook forward и число host-drop правил5, не priority5.
+Прежний observer forward priority не измерял. Исторические записи не являются указанием
+менять живую таблицу. Новый Y v2 строго10/10 и safe details, шесть новых регрессий,
+полная qualification REC-B одним пакетом. Реальная wave3y NOT_RUN; REC-B не закрыт.
+Review-wave3x содержит исходниковое доказательство и пределы реального X.
 
 
 ### Принято после реального W,03.11.2026
