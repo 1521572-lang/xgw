@@ -1,5 +1,10 @@
 # ADR REC-C: opt-in hooks реальных методов, без runtime activation
 
+Актуальное решение03.11: [AD130 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ad.md),
+[AE112 подготовлен](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ae.md),
+[новый ADR binding/files](ADR-REC-C-BOUND-COMPOSITE-AND-FILES.md). Ниже история AD;
+старое NOT_RUN заменено отчётом, installed runtime остаётся неизменным.
+
 Статус03.11.2026: sourcecandidate. AC51/51 принят в scopegenericadapter/readonlydiagnostics/
 fakefileprocess. Новый AD проверяет реальные source entrypoints с закрытыми fixtures.
 Installedruntime/pin/pool/WAN/LAN/Tailscale/services/rules неизменны, установки нет.

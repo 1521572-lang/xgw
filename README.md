@@ -1,42 +1,35 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
 
-## Актуально после AC — единый AD130 source-hook пакет (03.11.2026)
+## Актуально после AD — единый AE112 bound composite пакет (03.11.2026)
 
-[ACreport](docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ac-2026-11-03.md) проверен:
-51/51,A28/B16/D7; fakepositiverestorations2/expectedfailure1/refusals2/unused2;
-measuredtimings5, WORKLOAD8directchildren+7driverlaunchobservations. HEALTHY/on/pool/
-версии/связьсохранны. [Разбор AC](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ac.md) уточняет
-Acounts:10COMPLETED/2REFUSED/14UNKNOWN/2terminalcases, ане11/15. Общий51PASSверен.
-AC51/AB32/AA22/Z19/Y6/X26/W25неповторять. Runtimeгейтыfalse.
+[Отчёт AD](docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ad-2026-11-03.md) проверен:
+130/130,38LEGACY/38OWNED/38FENCED/16extras, audit violations0, network/liveops0.
+[Разбор AD](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ad.md). HEALTHY/on/pool/версии/связь
+сохранены в bookends. Причина изменения метки HEALTHY между прогонами не установлена.
+AD130/AC51/AB32/AA22/Z19/Y6/X26/W25 не повторять. Семь runtime gates false.
 
-[Единое ТЗ AD](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3ad.md) объединяет130НОВЫХcases:
-38вариантовреальныхметодов×LEGACY/OWNED/FENCED +16context/error/readerchecks.
-[ADR AD](docs/ADR-REC-C-OPT-IN-SOURCE-HOOKS.md). Одинstart/автопереходы/partialreadout/одинreport,
-максимальныйготовыйsafeобъём. РеальнаяAD NOT_RUN; локально8узкихtests/RuffPASS.
+[Единое ТЗ AE](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3ae.md) содержит112 НОВЫХ cases:
+32hook/14binding/12boundary/13plan/17composite/24file, один start/автопереходы/partial data/
+один отчёт. [ADR AE](docs/ADR-REC-C-BOUND-COMPOSITE-AND-FILES.md). Весь готовый safe объём,
+без микрозаданий. Реальная AE NOT_RUN; локально11 узких regressions/Ruff проходят.
 
-Source diffпротивpin351 теперь4A+7M: ownership*.pyдобавлены; 7модулейCapture/Backend/
-Applier/SingboxCore/Job/ApiClient/managedполучилиopt-inhooks. 31instancewrapper+managed
-_update. СохраняемостьстарыхbodyпроверяетсяAST. Вsourceстарые7модулейтеперьимпортируют
-hooks; раннее«нетimports»нижеисторическое. Ноexistingruntimeactors coordinatorНЕпередают,
-NoneсохраняетlegacyиНЕобеспечиваетfence. Installedruntimeне меняется/неустанавливается.
-Mandatorybinding/realverifier/repair/recovery/bootstrapNOT_IMPLEMENTED.
+Source diff pin351 теперь6A7M, manifest116. Два новых dormant модуля binding/files;
+все114 прежних AD source files, helpers/units/config сохранены байт-в-байт. Installed
+XGW не менялся. Explicit bundle требует7 objects/32 hooks/один Coordinator и держит
+один ticket для batch, проверяет drift между шагами. PrivateFiles читает exact named
+fixture files без записи. Partial side effects возможны; UNKNOWN не retry permission.
+4 positive composite vs13 expected negatives,3 positive file vs21 refusals — не112
+успешных применений. Source inventory не installed116, file subset не atomic snapshot.
 
-ADfreezehelper+publicSHAmanifest+114sourcefilesвusernotes, импортprivatefrozen_ad, не
-installedXGW. Runner/API/service/TUNподставные, dummycorefilesтольковfixture. Auditguard
-отказываетprocess/socket/out-of-noteswriteдоэффекта; этонеhostilecode securitysandbox.
-Никакихworkloadprocesses/ACfakeDповторов/служб/сети. FENCEDchecksпроверяютfixturecontent/
-modes/entriesиtrace0; OWNEDreturnclass+одинreceipt. CallerassertionsнеactualKERNEL/APIproof.
-
-Coordinatorсохраняетbusinessresult/exception, nestedrolesделятticket, nestedfailuretaints
-outer. Deferredresultsотвергаютсявключаявложенные, thread/PIDcontextпроверяется. Новая
-регрессиязакрываетescapeвложенногогенератора; генераторbodyнеисполняется. DefaultNone
-неразрешаетзаявлятьglobalfence/ставитьlivefault. LiveCinstallationBLOCKED_BOOTSTRAP.
-Nooff/install/G1/WAN/LAN/TS/pin/pool/config/service/ruleschanges. OnlyThinkCentre,
-workingLAN/HEALTHY/on. Fullwave3/D1-on/fault/LANUDP/IPv6/DNS/E4/performance/allTSоткрыты,
-неwave4/DAE. Далееистория; прежнийACNOT_RUNзаменёнфактическимотчётом,неliveготовностью.
-
-
+Глобальный actor/version/boot handshake, все runtime callsites/dependencies/path aliases,
+real KERNEL/API/process verifier, repair/recovery/bootstrap ещё открыты. None legacy
+остаётся unfenced вне explicit bundle. Нельзя устанавливать это как готовый global fence.
+LiveCinstallation BLOCKED_BOOTSTRAP; independent original-on/code/unit rescue обязателен.
+Nooff/install/G1/WAN/LAN/TS/pin/pool/config/service/live rules; always_off запрещён.
+Only ThinkCentre/workingLAN/HEALTHY/on, host не LAN-client proof. Fullwave3/D1-on/faults/
+LANUDP/IPv6/DNS/E4/performance/allTS открыты; неwave4/DAE. Ниже история прежних этапов;
+ранний AD NOT_RUN заменён фактическим отчётом, это не runtime qualification.
 
 ## Актуально после AB — единый максимальный пакет AC (03.11.2026)
 
