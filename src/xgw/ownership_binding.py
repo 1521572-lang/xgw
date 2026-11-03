@@ -17,6 +17,8 @@ from .apply.applier import Applier
 from .apply.singbox import SingboxCore
 from .cores import Job
 from .freepool.backend import Backend
+from .freepool.pool import FreePool
+from .freepool.store import PoolStore
 from .net.capture import Capture
 from .ownership import Registry
 from .ownership_hooks import Coordinator, MutationBlocked, owned
@@ -78,6 +80,13 @@ SPECS = MappingProxyType(
             ),
         ),
         "panel": (PanelWriter, "PANEL", ("update",)),
+        "pool_store": (PoolStore, "PEERS", (
+            "_ensure", "commit", "prune", "retire_openvpn", "save_candidates",
+        )),
+        "pool": (FreePool, "PEERS", (
+            "_prune_retired", "refresh_due", "_prune_candidates", "refresh_backend",
+            "_note_handshake", "check_some", "_check_proxy", "_record",
+        )),
     }
 )
 FUNCTIONS = MappingProxyType(
@@ -104,7 +113,7 @@ class Step:
 
 
 class BoundWriters:
-    """Require all seven explicit objects, same exact coordinator and intact hooks.
+    """Require all nine explicit objects, same exact coordinator and intact hooks.
 
     Does not attach/repair ownership, create a registry or discover actors. Revalidates
     the whole declared boundary before admission and before/after every step. Other
@@ -147,6 +156,13 @@ class BoundWriters:
                     and getattr(function, "ownership_role", None) == role,
                     "HOOK_DRIFT",
                 )
+
+        require(
+            getattr(self.actors["xray"], "api", None) is self.actors["api"]
+            and getattr(self.actors["pool"], "store", None) is self.actors["pool_store"]
+            and getattr(self.actors["pool"], "runtime", None) is self.actors["peers"],
+            "DEPENDENCY_BINDING_REFUSED",
+        )
 
     def validate_steps(self, steps, accept):
         self.validate()

@@ -1,5 +1,10 @@
 # ADR REC-C: free-function writers, ранний Job gate и передача ownership фабриками
 
+Актуально03.11: [AF145 принято](REVIEW-REAL-MACHINE-0.2.0-wave3af.md),
+[AG129 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ag.md),
+[новый ADR pool/dependencies](ADR-REC-C-POOL-FLOW-AND-DEPENDENCIES.md). Далее история:
+текущий declared boundary9actors/50methods/source6A10M; globalruntimegate false.
+
 Статус03.11.2026: source candidate AF; [AE112 принято](REVIEW-REAL-MACHINE-0.2.0-wave3ae.md).
 Реальное выполнение AF NOT_RUN. Нет установки/активации или сетевого отказа.
 

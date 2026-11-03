@@ -20,6 +20,7 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
+from ..ownership_hooks import owned
 from ..paths import Paths, atomic_write_json
 from .models import Backend, ProviderResult, Status, Variant
 
@@ -69,9 +70,11 @@ def variant_from_dict(data: dict) -> Variant | None:
 
 
 class PoolStore:
-    def __init__(self, paths: Paths) -> None:
+    def __init__(self, paths: Paths, *, ownership=None) -> None:
+        self.ownership = ownership
         self.dir = root(paths)
 
+    @owned("PEERS")
     def _ensure(self) -> None:
         (self.dir / "snapshots").mkdir(parents=True, exist_ok=True)
         self.dir.chmod(0o700)
@@ -82,6 +85,7 @@ class PoolStore:
         suffix = f".{generation}" if generation else ""
         return self.dir / "snapshots" / f"{provider}{suffix}.json"
 
+    @owned("PEERS")
     def commit(self, result: ProviderResult) -> bool:
         """Принять итог опроса: SUCCESS/PARTIAL — новый снимок (прежние — со сдвигом номеров),
         иначе — только отметка об ошибке рядом с прежним. True — снимок заменён."""
@@ -119,6 +123,7 @@ class PoolStore:
         items = self.snapshot(provider).get("variants") or []
         return [variant for variant in map(variant_from_dict, items) if variant is not None]
 
+    @owned("PEERS")
     def prune(self, keep: tuple[str, ...]) -> list[str]:
         """Удалить снимки источников не из keep (убранных из XGW); их имена."""
         removed: set[str] = set()
@@ -129,6 +134,7 @@ class PoolStore:
                 removed.add(provider)
         return sorted(removed)
 
+    @owned("PEERS")
     def retire_openvpn(self) -> list[str]:
         """Остатки OpenVPN (до вехи М2в): учётка VPNBook, профили, итоги проверок туннелей
         OpenVPN. Варианты OpenVPN в снимках не читаются (variant_from_dict), а со следующим
@@ -156,6 +162,7 @@ class PoolStore:
         data = _read(self.dir / "candidates.json")
         return {key: value for key, value in data.items() if isinstance(value, dict)}
 
+    @owned("PEERS")
     def save_candidates(self, data: dict[str, dict]) -> None:
         self._ensure()
         atomic_write_json(self.dir / "candidates.json", data, mode=0o600)

@@ -1,5 +1,10 @@
 # ADR REC-C: opt-in hooks реальных методов, без runtime activation
 
+Актуально03.11: [AF145 принято](REVIEW-REAL-MACHINE-0.2.0-wave3af.md),
+[AG129 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ag.md),
+[новый ADR pool/dependencies](ADR-REC-C-POOL-FLOW-AND-DEPENDENCIES.md). Далее история:
+текущий declared boundary9actors/50methods/source6A10M; globalruntimegate false.
+
 Актуальное состояние03.11: [AE112 принято](REVIEW-REAL-MACHINE-0.2.0-wave3ae.md),
 [AF145 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3af.md),
 [новый ADR source flow](ADR-REC-C-SOURCE-FLOW-AND-FACTORIES.md). Далее история прежнего

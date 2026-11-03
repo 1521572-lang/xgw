@@ -1,35 +1,38 @@
 # ADR REC-C: владение поколением и cooperative fence
 
 
-## Актуально после AE — единый AF145 source-flow пакет (03.11.2026)
+## Актуально после AF — единый AG129 pool-flow пакет (03.11.2026)
 
-[Отчёт AE](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ae-2026-11-03.md) проверен:112/112,
-4positive composites/13expected negatives и3positive file observations/21refusals.
-[Разбор AE](REVIEW-REAL-MACHINE-0.2.0-wave3ae.md). HEALTHY/on/pool/версии/связь сохранены,
-HEALTHY15:31 метка прежняя. Runtime7gatesfalse/network+liveops0. AE112/AD130/AC51/AB32/
-AA22/Z19/Y6/X26/W25 не повторять, Yroot не читать, installed110 NOT_RUN.
+[AFreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3af-2026-11-03.md) принят145/145,
+P78/K42/F9/E16. [Разбор AF](REVIEW-REAL-MACHINE-0.2.0-wave3af.md) уточняет extras:
+2completed/6UNKNOWN/8definition-admissionrefusals, не2/4/10. Два Hnested callbacks
+выполнялись; H_SIGNATURE — неверная ownershipsignature, H_DEFERRED — generatordefinition.
+AST proof архитектора локальный, не действие worker. Общий145PASS неизменён.
+HEALTHY15:31/on/pool/версии/связь сохранены. Runtime7gatesfalse/network+liveops0.
+AF145/AE112/AD130/AC51/... не повторять. Yroot/installed110 NOT_RUN.
 
-[Единое ТЗ AF](TEST-PLAN-REAL-MACHINE-0.2.0-wave3af.md) объединяет145НОВЫХ cases:
-P78/K42/F9/E16, одинstart/автопереходы/partialdata/одинreport, весь готовый safe объём.
-[ADR AF](ADR-REC-C-SOURCE-FLOW-AND-FACTORIES.md). Локально11 узких tests/RuffPASS,
-после recorder уточнения повторены3 затронутые проверки. Реальный AF NOT_RUN.
+[Единое ТЗ AG](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ag.md):129НОВЫХcases/S30/P54/C9/E36,
+одинstart/автопереходы/partialdata/одинreport, весь готовый safe объём.
+[ADR AG](ADR-REC-C-POOL-FLOW-AND-DEPENDENCIES.md). Локально11 narrowtests/RuffPASS,
+full129/реальныйThinkCentreAG NOT_RUN.
 
-Source116/pin6A8M: изменились5 files относительно AE (ownership_hooks/binding,managed,
-cores,engine), другие111source/oldhelpers/units/config неизменны. 31newfreefunctionhooks
-(25panel+6core),5newJobinstancehooks,3optional factories передают coordinator. Bound
-declaration37methods вместо32. Тела после scaffolding AST-identical, отдельно Jobguard.
-Job.run gated ДО statewrite/requestunlink; nested suppressed error сохраняет UNKNOWN.
-Фабрики создают objects безadmission/receipt, explicit-owned constructor не ownedmutation.
+Source116/pin6A10M: changed3 vsAF (pool/store/binding),113source/oldhelpers/units/config
+unchanged. 13newPEERShooks, constructor ownership propagation/foreignRuntimeguard;
+declared9actors/50methods, exactrefsApplier.api/pool.store/pool.runtime. PoolStorectornoIO/
+noadmission; ownedFreePoolconstructorcleanup1receipt, неenginefactory0receipt.
+AST старых pool/store bodies после scaffolding идентичны, injectedRuntimeguard отдельно.
+Fakepoll/probes/runner/tunnel неmeasurement speed/ping/region/realVPN. Dummyfiles only.
 
-Installedruntime НЕ менялся. Nonelegacy остаётся unfenced: daemon/CLI/service callers
-неwired, полный writer/dependency/pathalias inventory/handshake/real KERNEL/API/process
-verifiers/repair/bootstrap не готовы. Core.start --no-block ticket не охватывает срок
-отдельной службы. Нельзя выдавать optional sourceflow за global runtime fence.
-LiveC BLOCKED_BOOTSTRAP: independent original-on/code/unit rescue до install/fault;
-always_off запрещён. Nooff/install/G1/WAN/LAN/TS/pin/pool/config/service/live rules.
-OnlyThinkCentre/workingLAN/HEALTHY/on, host не LANclientproof. Fullwave3/D1-on/faults/
-LANUDP/IPv6/DNS/E4/performance/allTS открыты; неwave4/DAE. Ниже история: прежние AE32/
-114unchanged/AE NOT_RUN описывают прежний snapshot, не текущее AF состояние.
+Installedruntime НЕ менялся. Nonelegacyunfenced; глобальныйdaemon/CLI/servicecomposition/
+fullinventory/pathaliases/interprocess/version/boot/asyncdispatch/realverifiers/repair/
+bootstrap не готовы. 3referencechecks неfilesystemaliaspolicy. LiveCBLOCKED_BOOTSTRAP;
+independent original-on/code/unitrescue доinstall/fault, always_off запрещён.
+Nooff/install/G1/WAN/LAN/TS/pin/pool/config/service/live rules. OnlyThinkCentre/workingLAN/
+HEALTHY/on, hostнеLANproof. Fullwave3/D1-on/faults/LANUDP/IPv6/DNS/E4/performance/allTS
+открыты,неwave4/DAE. Ниже история: старые37methods/AFNOT_RUN/constructorprunegap относятся
+к предыдущему snapshot; sourceprune в AG gated, actual runtime всё ещё legacy.
+
+
 
 
 

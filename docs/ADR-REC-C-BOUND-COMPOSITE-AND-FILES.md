@@ -1,5 +1,10 @@
 # ADR REC-C: явное связывание writers, одно завершение composite и private file evidence
 
+Актуально03.11: [AF145 принято](REVIEW-REAL-MACHINE-0.2.0-wave3af.md),
+[AG129 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ag.md),
+[новый ADR pool/dependencies](ADR-REC-C-POOL-FLOW-AND-DEPENDENCIES.md). Далее история:
+текущий declared boundary9actors/50methods/source6A10M; globalruntimegate false.
+
 Актуальное состояние03.11: [AE112 принято](REVIEW-REAL-MACHINE-0.2.0-wave3ae.md),
 [AF145 подготовлено](TEST-PLAN-REAL-MACHINE-0.2.0-wave3af.md),
 [новый ADR source flow](ADR-REC-C-SOURCE-FLOW-AND-FACTORIES.md). Далее история прежнего
@@ -14,7 +19,7 @@ AD130/130 принят: [разбор](REVIEW-REAL-MACHINE-0.2.0-wave3ad.md).
 AD hooks сами по себе необязательны. Один actor с ownership=None обходит bookkeeping,
 а два последовательных самостоятельных apply публикуют два поколения. Для будущей
 composition нужен явный полный boundary и один outer ticket. Новая библиотека
-[ownership_binding.py](../src/xgw/ownership_binding.py#L106) требует семь объектов:
+[ownership_binding.py](../src/xgw/ownership_binding.py#L115) требует семь объектов:
 Capture/Backend/Applier/SingboxCore/Job/ApiClient/PanelWriter, exact types и один exact
 Coordinator. Конструктор проверяет аргументы/методы, не читает/создаёт registry.
 Никакого implicit attach/default registry/env activation/daemon wiring.
@@ -42,7 +47,7 @@ Step содержит whitelist writer/method/tuple args/tuple keyword pairs; du
 не ресурсный verifier. Аргументы внутри tuples — trusted caller objects, не deep copy
 и не защищённая сериализация. Plan не принимает arbitrary top-level operation callback.
 
-[PreparedBatch.run](../src/xgw/ownership_binding.py#L195) потребляет одну попытку ДО
+[PreparedBatch.run](../src/xgw/ownership_binding.py#L211) потребляет одну попытку ДО
 проверки/admission. Даже REFUSED не разрешает retry этим plan. PreparedBatch не имеет
 durable replay identity; пересоздание объекта/процесса не защищено этим флагом.
 Runtime protocol ещё должен запретить unsafe recreation по uncertain результату.
