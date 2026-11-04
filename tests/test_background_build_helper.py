@@ -2,8 +2,10 @@
 
 import importlib.util
 import os
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -132,3 +134,99 @@ def test_failed_prepare_copy_cleans_only_its_temporary_directory(tmp_path, monke
     monkeypatch.setattr(helper, "write", write)
     helper.prepare(repo)
     assert (root / "state.json").is_file()
+
+
+def timing_fixture(monkeypatch, *, now, written, polled=0):
+    helper = load()
+    state = dict(builds=0, max_gap_s=0, stale_s=0, poll_gap_s=0,
+                 _watch=[0, 0, polled])
+    snapshot = {"assembly": {"builds": 3, "build_s": 12.5,
+                              "apply_s": 1.2, "outcome": "unchanged"}}
+    monkeypatch.setattr(helper, "read_status", lambda _path: (snapshot, int(written * 1e9)))
+    monkeypatch.setattr(helper.time, "monotonic", lambda: now)
+    return helper, state
+
+
+def test_late_poll_does_not_turn_a_twenty_second_write_into_twenty_six(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=25.98, written=20)
+    helper.status_watch(state)
+    assert state["max_gap_s"] == 20 and state["poll_gap_s"] == 25.98
+    assert state["builds"] == 3 and state["build_s"] == 12.5
+
+
+def test_unchanged_status_over_twenty_five_stops_and_keeps_assembly_facts(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=25.98, written=0, polled=25.8)
+    with pytest.raises(helper.CheckStop, match="не изменялся"):
+        helper.status_watch(state)
+    assert state["stale_s"] == 25.98 and state["builds"] == 3
+
+
+def test_frequently_observed_real_write_delay_is_not_relaxed(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=25.1, written=25.05, polled=24.9)
+    with pytest.raises(helper.CheckStop, match="между записями"):
+        helper.status_watch(state)
+    assert state["max_gap_s"] == 25.05
+
+
+def test_missing_observations_are_unknown_not_proven_write_delay(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=40, written=40)
+    with pytest.raises(helper.CheckStop, match="не установлен"):
+        helper.status_watch(state)
+
+
+def test_backwards_file_clock_is_unknown(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=1, written=-1)
+    with pytest.raises(helper.CheckStop, match="время записи пошло назад"):
+        helper.status_watch(state)
+
+
+def test_status_data_and_timestamp_belong_to_same_open_file(tmp_path, monkeypatch):
+    helper = load()
+    path, replacement = tmp_path / "status.json", tmp_path / "new.json"
+    path.write_bytes(b'{"old": true}')
+    replacement.write_bytes(b'{"new": true}')
+    os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+    fstat = helper.os.fstat
+    def replace_then_stat(fd):
+        os.replace(replacement, path)
+        return fstat(fd)
+    monkeypatch.setattr(helper, "os", SimpleNamespace(
+        open=os.open, fdopen=os.fdopen, fstat=replace_then_stat,
+        O_RDONLY=os.O_RDONLY, O_NOFOLLOW=os.O_NOFOLLOW,
+    ))
+    snapshot, stamp = helper.read_status(path)
+    assert snapshot == {"old": True} and stamp == 1_000_000_000
+    assert path.read_bytes() == b'{"new": true}'
+
+
+def test_slow_read_child_keeps_watching_status():
+    helper = load()
+    calls = []
+    rc, raw = helper.run([sys.executable, "-c", "import time; time.sleep(.45); print('done')"],
+                         timeout=3, watch=lambda: calls.append(time.monotonic()))
+    assert rc == 0 and raw.strip() == b"done" and len(calls) >= 3
+
+
+def test_measurement_stop_reaps_its_read_child(monkeypatch):
+    helper = load()
+    popen, children = helper.subprocess.Popen, []
+    def spawn(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        children.append(process)
+        return process
+    def stop():
+        raise helper.CheckStop("fixed failure")
+    monkeypatch.setattr(helper.subprocess, "Popen", spawn)
+    with pytest.raises(helper.CheckStop):
+        helper.run([sys.executable, "-c", "import time; time.sleep(30)"], watch=stop)
+    assert len(children) == 1 and children[0].poll() is not None
+
+
+def test_ready_read_returns_before_the_observation_window_ends(monkeypatch, capsys):
+    helper = load()
+    monkeypatch.setattr(helper, "prepared", lambda: dict(phase="наблюдение", updated=time.time()))
+    def no_sleep(_seconds):
+        raise AssertionError("ready must not wait for the end")
+    monkeypatch.setattr(helper.time, "sleep", no_sleep)
+    assert helper.report(ready=True) == 2
+    assert "Прогон продолжается: наблюдение" in capsys.readouterr().out

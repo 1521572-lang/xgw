@@ -13,8 +13,9 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/run/xgw-background-build-2")
+ROOT = Path("/run/xgw-background-build-3")
 LIB = Path("/opt/xgw/lib/xgw")
+STATUS = Path("/run/xgw/status.json")
 FILES = {
     "daemon.py": (
         "3fb8d542c26f2eaafa0710dd19f0e1d715628bf6b212868cb30d009ee1a42989",
@@ -31,15 +32,39 @@ WORKING_STATES = {"HEALTHY", "DEGRADED"}
 STAGE = "чтение команды"
 
 
+class CheckStop(Exception):
+    """Только фиксированная безопасная причина остановки измерения."""
+
+
 def require(ok):
     if not ok:
         raise ValueError("проверка")
 
 
-def run(args, timeout=8):
-    result = subprocess.run(args, capture_output=True, timeout=timeout, check=False)
-    require(len(result.stdout) <= 8 * 1024 * 1024)
-    return result.returncode, result.stdout
+def run(args, timeout=8, watch=None):
+    if watch is None:
+        result = subprocess.run(args, capture_output=True, timeout=timeout, check=False)
+        require(len(result.stdout) <= 8 * 1024 * 1024)
+        return result.returncode, result.stdout
+    # HTTPS/импорт приложения не останавливают частое чтение статуса в родителе.
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                watch()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    out, _ = process.communicate(timeout=min(0.2, remaining))
+                    require(len(out) <= 8 * 1024 * 1024)
+                    return process.returncode, out
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            process.kill()
+            process.communicate()
+            raise
 
 
 def regular(path):
@@ -59,6 +84,62 @@ def sha(raw):
 def read(path):
     raw, _ = regular(path)
     return json.loads(raw)
+
+
+def read_status(path=STATUS):
+    # Данные и время записи берём из одного открытого файла, даже при atomic replace.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(1048577)
+        info = os.fstat(stream.fileno())
+    require(stat.S_ISREG(info.st_mode) and len(raw) <= 1048576)
+    snapshot = json.loads(raw)
+    require(type(snapshot) is dict)
+    return snapshot, info.st_mtime_ns
+
+
+def status_watch(state):
+    snapshot, mtime = read_status(STATUS)
+    now = time.monotonic()
+    assembly = snapshot.get("assembly") or {}
+    require(type(assembly.get("builds")) is int)
+    # Сохраняем факты ДО возможного отказа порога, а не теряем последнюю строку.
+    state["builds"] = max(state["builds"], assembly["builds"])
+    state["build_s"], state["apply_s"] = assembly.get("build_s"), assembly.get("apply_s")
+    state["apply_result"] = assembly.get("outcome")
+    previous = state.get("_watch")
+    if previous is None:
+        state["_watch"] = [mtime, now, now]
+        return
+    last_mtime, seen, polled = previous
+    poll_gap = now - polled
+    state["poll_gap_s"] = max(state["poll_gap_s"], poll_gap)
+    if mtime != last_mtime:
+        gap = (mtime - last_mtime) / 1e9
+        state["_watch"] = [mtime, now, now]
+        if gap < 0:
+            raise CheckStop("время записи пошло назад; результат измерения неизвестен")
+        state["max_gap_s"] = max(state["max_gap_s"], gap)
+        if gap > 25:
+            if poll_gap > 1:
+                raise CheckStop("пропуск частого чтения; интервал записи не установлен")
+            raise CheckStop("интервал между записями статуса больше 25 с")
+    else:
+        state["_watch"] = [mtime, seen, now]
+        stale = now - seen
+        state["stale_s"] = max(state["stale_s"], stale)
+        if stale > 25:
+            raise CheckStop("статус не изменялся больше 25 с")
+
+
+def wait_status(state, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        status_watch(state)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
 
 
 def write(path, raw, mode=0o600, uid=0, gid=0):
@@ -87,7 +168,7 @@ def sample():
 
     paths = Paths(Path("/"))
     cfg = config.load(paths.config_file)[0]
-    snapshot = read(paths.status_file)
+    snapshot, mtime = read_status(paths.status_file)
     signature = []
     for path in (paths.config_file, paths.etc / "panel.json"):
         signature.append(sha(regular(path)[0]) if path.exists() else None)
@@ -113,13 +194,14 @@ def sample():
         "on": capture_for(cfg, paths).effective_mode() == "on", "https": https,
         "signature": signature, "pool": cfg.free_pool.mode,
         "pin": {key: pin.get(key) for key in ("tag", "until", "expires")},
-        "pids": [int(p) for p in pids], "mtime": paths.status_file.stat().st_mtime_ns,
+        "pids": [int(p) for p in pids], "mtime": mtime,
         "assembly": snapshot.get("assembly"),
     }
 
 
-def observe(helper=None):
-    rc, raw = run([sys.executable, "-I", "-B", str(helper or ROOT / "helper.py"), "_sample"])
+def observe(helper=None, watch=None):
+    args = [sys.executable, "-I", "-B", str(helper or ROOT / "helper.py"), "_sample"]
+    rc, raw = run(args) if watch is None else run(args, watch=watch)
     require(rc == 0)
     return json.loads(raw)
 
@@ -190,6 +272,7 @@ def prepare(repo):
               "https_failures": 0, "restored": None, "net_up_rc": None, "result": None,
               "failed_stage": None, "failure_kind": None,
               "gateway_state": None, "on": None, "https": None, "apply_result": None,
+              "poll_gap_s": 0, "stale_s": 0,
               "states": {name: 0 for name in sorted(WORKING_STATES)}}, directory)
         os.rename(directory, ROOT)
     print("Подготовлено. Установленный XGW не изменён")
@@ -255,17 +338,12 @@ def worker():
             require(current["https"] and current["on"] and time.monotonic() < deadline)
             time.sleep(1)
         state["phase"], state["stage"] = "наблюдение", "десять минут"
-        last = time.monotonic()
-        last_mtime = current["mtime"]
-        deadline = last + 600
+        status_watch(state)
+        save(state)  # report --ready выпускает исполнителя к кнопке без ожидания 45 с.
+        deadline = time.monotonic() + 600
         failures = 0
         while time.monotonic() < deadline:
-            current = observe()
-            now = time.monotonic()
-            gap = now - last
-            state["max_gap_s"] = round(max(state["max_gap_s"], gap), 2)
-            if current["mtime"] != last_mtime:
-                last, last_mtime = now, current["mtime"]
+            current = observe(watch=lambda: status_watch(state))
             state["samples"] += 1
             state["gateway_state"], state["on"], state["https"] = (
                 current["state"], current["on"], current["https"])
@@ -273,14 +351,10 @@ def worker():
                 state["states"][current["state"]] += 1
             state["https_failures"] += int(not current["https"])
             failures = failures + 1 if not good(current, state["before"]) else 0
-            require(failures < 2 and gap <= 25)
-            assembly = current.get("assembly") or {}
-            require(type(assembly.get("builds")) is int)
-            state["builds"] = max(state["builds"], assembly["builds"])
-            state["build_s"], state["apply_s"] = assembly.get("build_s"), assembly.get("apply_s")
-            state["apply_result"] = assembly.get("outcome")
+            if failures >= 2:
+                raise CheckStop("дважды не прошли on/HTTPS/службы или сохранность настроек")
             save(state)
-            time.sleep(2)
+            wait_status(state, 2)
         state["stage"] = "итог"
         rc, raw = run(["journalctl", "-u", "xgw.service", "--since", f"@{state['started']:.6f}",
                        "--no-pager", "-o", "json"], timeout=10)
@@ -298,7 +372,8 @@ def worker():
         rollback = False
     except Exception as exc:
         state["failed_stage"] = state["stage"]
-        state["failure_kind"] = ("тайм-аут дочерней команды"
+        state["failure_kind"] = (str(exc) if isinstance(exc, CheckStop) else
+                                 "тайм-аут дочерней команды"
                                  if isinstance(exc, subprocess.TimeoutExpired) else
                                  "ошибка чтения или записи" if isinstance(exc, OSError) else
                                  "несовпадение ожидания или ошибка формата")
@@ -334,10 +409,12 @@ def start(approved):
     print("Прогон запущен. Помощник сам завершит проверку или вернёт прежний код")
 
 
-def report(wait=False):
-    deadline = time.monotonic() + (45 if wait else 0)
+def report(wait=False, ready=False):
+    deadline = time.monotonic() + (45 if wait or ready else 0)
     state = prepared()
     while state["phase"] in ("запущен", "наблюдение", "возврат") and time.monotonic() < deadline:
+        if ready and state["phase"] == "наблюдение":
+            break
         time.sleep(1)
         state = prepared()
     if state["phase"] not in ("завершён", "остановлен"):
@@ -354,7 +431,9 @@ def report(wait=False):
         ("Последнее on / HTTPS", (state["on"], state["https"])),
         ("Наблюдений HEALTHY / DEGRADED",
          (state["states"]["HEALTHY"], state["states"]["DEGRADED"])),
-        ("Наибольший наблюдаемый промежуток статуса, с", state["max_gap_s"]),
+        ("Наибольший интервал между прочитанными записями статуса, с", state["max_gap_s"]),
+        ("Наибольшее подтверждённое время без изменения статуса, с", state["stale_s"]),
+        ("Наибольшая пауза частого чтения статуса, с", state["poll_gap_s"]),
         ("Начатых сборок", state["builds"]), ("Последняя сборка, с", state["build_s"]),
         ("Последнее применение, с", state["apply_s"]), ("Шагов от 60 с", state["slow_steps"]),
         ("Результат применения", state["apply_result"]),
@@ -363,7 +442,9 @@ def report(wait=False):
         ("Код аварийного xgw net up", state["net_up_rc"]),
     ):
         print(f"- {label}: {value if value is not None else 'НЕ ВЫПОЛНЯЛОСЬ'}")
-    print("\nПромежутки измерены опросом, с погрешностью длительности опроса. "
+    print("\nСтатус читается отдельно от HTTPS, обычно каждые 0,2 с; "
+          "время записи — из того же файла. "
+          "Пропуск чтения и превышение порога записи различаются. "
           "Это наблюдение ThinkCentre, а не проверка устройств за роутером.\n"
           "Сбор данных: завершён")
     return 0
@@ -381,7 +462,8 @@ def main():
     elif command == "_worker":
         worker()
     elif command == "report":
-        return report(sys.argv[2:] == ["--wait"])
+        require(sys.argv[2:] in ([], ["--wait"], ["--ready"]))
+        return report(wait=sys.argv[2:] == ["--wait"], ready=sys.argv[2:] == ["--ready"])
     else:
         raise ValueError("команда")
     return 0
