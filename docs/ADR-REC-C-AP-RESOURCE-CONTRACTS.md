@@ -1,5 +1,13 @@
 # ADR AP: описание ресурсов, симуляция и dry-run подготовки запуска
 
+Обновление04.11.2026: [AP211 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
+211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают
+runtimeквитанции: I3verificationfalse/receipt0/UNKNOWNwriter1. Каталог65требуетвсе7domains/
+completenessUNKNOWN. HEALTHY_ON/poolOFF/linkALIVE/versionssame/bookendsсохранны.
+Actualcollectors/provenanceНЕреализованы;all7gatesfalse/LiveCBLOCKED_BOOTSTRAP.
+СтарыеAPcasesнеповторять. Ниже описаниедоactualAP;егоNOT_RUNустарелпослеэтойприёмки.
+
+
 Статус: реализован source candidate AP-1…4; realAP NOT_RUN. Source124 против122,
 добавлены только ownership_resources.py и ownership_resource_catalog.py. Существующий
 runtime/units/defaultownership/daemonCLI/installer не изменены.

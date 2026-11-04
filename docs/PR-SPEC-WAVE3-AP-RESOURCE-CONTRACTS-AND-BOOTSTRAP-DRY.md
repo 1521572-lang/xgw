@@ -1,5 +1,13 @@
 # ТЗ разработчику AP: контракты ресурсов и dry-run подготовки запуска
 
+Обновление04.11.2026: [AP211 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
+211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают
+runtimeквитанции: I3verificationfalse/receipt0/UNKNOWNwriter1. Каталог65требуетвсе7domains/
+completenessUNKNOWN. HEALTHY_ON/poolOFF/linkALIVE/versionssame/bookendsсохранны.
+Actualcollectors/provenanceНЕреализованы;all7gatesfalse/LiveCBLOCKED_BOOTSTRAP.
+СтарыеAPcasesнеповторять. Ниже описаниедоactualAP;егоNOT_RUNустарелпослеэтойприёмки.
+
+
 Обновление04.11.2026: AP-1…4 реализованы в source-only candidate, реальный AP NOT_RUN.
 Готов единый [TEST-PLAN AP211](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ap.md),
 [API contract](API-CONTRACT-WAVE3AP.md), [65 exact resource anchors](RESOURCE-TABLE-WAVE3AP.md),

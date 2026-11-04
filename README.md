@@ -1,5 +1,13 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
+Обновление04.11.2026: [AP211 принят](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
+211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают
+runtimeквитанции: I3verificationfalse/receipt0/UNKNOWNwriter1. Каталог65требуетвсе7domains/
+completenessUNKNOWN. HEALTHY_ON/poolOFF/linkALIVE/versionssame/bookendsсохранны.
+Actualcollectors/provenanceНЕреализованы;all7gatesfalse/LiveCBLOCKED_BOOTSTRAP.
+СтарыеAPcasesнеповторять. Ниже описаниедоactualAP;егоNOT_RUNустарелпослеэтойприёмки.
+
+
 Обновление04.11.2026: AP-1…4 реализованы в source-only candidate, реальный AP NOT_RUN.
 Готов единый [TEST-PLAN AP211](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3ap.md),
 [API contract](docs/API-CONTRACT-WAVE3AP.md), [65 exact resource anchors](docs/RESOURCE-TABLE-WAVE3AP.md),
