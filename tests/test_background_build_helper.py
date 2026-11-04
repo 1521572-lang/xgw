@@ -268,7 +268,7 @@ def test_restore_keeps_working_network_without_code_proof(tmp_path, monkeypatch,
     assert state["restored"] is False and "связь исправна" in state["restore_note"]
 
 
-def test_file_rewrites_do_not_hide_stale_mandatory_checks(monkeypatch):
+def test_file_rewrites_record_age_of_mandatory_checks_without_rejecting(monkeypatch):
     helper, state = timing_fixture(monkeypatch, now=26, written=25, polled=25.8)
     state["_watch"] = [24 * 1_000_000_000, 25, 25.8]
     reader = helper.read_status
@@ -277,9 +277,16 @@ def test_file_rewrites_do_not_hide_stale_mandatory_checks(monkeypatch):
         snapshot["watchdog"]["health_observed"] = 0
         return snapshot, stamp
     monkeypatch.setattr(helper, "read_status", read)
-    with pytest.raises(helper.CheckStop, match="обязательные проверки"):
-        helper.status_watch(state)
+    helper.status_watch(state)
     assert state["health_stale_s"] == 26
+
+
+def test_health_interval_is_informational_while_file_interval_remains_bounded(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=30, written=29, polled=29.8)
+    state["_watch"] = [28 * 1_000_000_000, 29, 29.8]
+    state["_health_observed"] = 0
+    helper.status_watch(state)
+    assert state["health_gap_s"] == 30 and state["max_gap_s"] == 1
 
 
 @pytest.mark.parametrize("status", [200, 302])

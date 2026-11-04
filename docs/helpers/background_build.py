@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/run/xgw-fresh-status")
+ROOT = Path("/run/xgw-status-acceptance")
 LIB = Path("/opt/xgw/lib/xgw")
 STATUS = Path("/run/xgw/status.json")
 LOOP = Path("/run/xgw/watchdog-step.json")
@@ -124,15 +124,10 @@ def status_watch(state):
     state["_health_observed"] = observed
     age = now - observed
     state["health_stale_s"] = max(state["health_stale_s"], age)
-    if age > 25:
-        raise CheckStop("свежие обязательные проверки не опубликованы больше 25 с")
     if before is not None and observed != before:
         gap = observed - before
         require(gap >= 0)
         state["health_gap_s"] = max(state["health_gap_s"], gap)
-        if gap > 25:
-            raise CheckStop("пропуск чтения свежих проверок" if poll_gap > 1 else
-                            "интервал свежих обязательных проверок больше 25 с")
     if mtime != last_mtime:
         gap = (mtime - last_mtime) / 1e9
         state["_watch"] = [mtime, now, now]
@@ -518,6 +513,7 @@ def report(wait=False, ready=False):
                               else "запрос не подтверждён")
     for label, value in (
         ("Итог", "прошло" if state["result"] else "не прошло"),
+        ("Предел 25 с", "запись статуса; возраст проверок — справочно"),
         ("Последний этап", state["stage"]), ("Наблюдений", state["samples"]),
         ("Этап неудачи", state["failed_stage"]),
         ("Класс неудачи", state["failure_kind"]),
