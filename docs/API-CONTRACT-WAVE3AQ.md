@@ -68,6 +68,9 @@ permission/missing/budget дают partial; cleanup failure прекращает
 Их positive paths локально проверены только fake I/O,4 новых stand cases без host calls.
 Final executable/ancestor/proc mount policy, permissions, active issuer и actual wire
 qualification требуют отдельного scope review. Это не включённый host collector.
+24 — logical file/link observations (8file opens+16readlinks в полном profile), не число
+syscalls: bounded stream делает дополнительные read/EOF/fstat/close. Attempts, bytes,
+kernel reads и child count нельзя сводить в один счётчик. В текущем offline runner они0.
 
 ReadonlyObservationSession(policy, exact backend, clock_values=None, expected_states=()).
 Все expected_states создаются независимо ДО collect и pin по identity/flat immutable values.

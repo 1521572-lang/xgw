@@ -1,11 +1,15 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
-Актуально 04.11.2026: [следующее ТЗ AQ для разработчика](docs/PR-SPEC-WAVE3AQ-READONLY-OBSERVATION-SOURCES.md).
-AP211 принят в simulation/dry scope. AQ задаёт readonly adapters, provenance, scoped
-comparison и подготовку единого пакета Flash. AQ пока SPEC_ONLY/NOT_IMPLEMENTED/NOT_RUN;
-нового READY runner нет. Host collector scope проверяется по конкретному будущему плану,
-не запускается по одному этому ТЗ. Runtime/сеть не изменены;7 gates false, C BLOCKED_BOOTSTRAP.
-Ниже сохранена история; прежние «выполнять AP/AO/AN» не являются текущим заданием.
+Актуально 04.11.2026: [TEST-PLAN AQ91 для Flash](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3aq.md).
+Готова offline-квалификация новых wire adapters/session provenance/scoped comparison.
+127source,17A11M к pin351;124прежних source/packaging/config/65старых stand files unchanged.
+Локально39narrowtests+2frozen loader/checkpoint PASS; полный91/realAQ NOT_RUN.
+Host ветвь строго BLOCKED_SCOPE_REVIEW/HOST_NOT_RUN. Proposed proc/query/profile candidate
+не подключён к host backend; никаких команд для его активации в плане нет.
+[API](docs/API-CONTRACT-WAVE3AQ.md), [96 exact source anchors](docs/RESOURCE-SOURCES-WAVE3AQ.md),
+[ADR](docs/ADR-REC-C-AQ-READONLY-EVIDENCE.md), [исходное ТЗ](docs/PR-SPEC-WAVE3AQ-READONLY-OBSERVATION-SOURCES.md).
+Runtime/сеть не изменены;7 gates false, C BLOCKED_BOOTSTRAP. AQ не runtime qualification.
+Ниже история; прежние «выполнять AP/AO/AN» и AQ SPEC_ONLY не текущее задание.
 
 Обновление04.11.2026: [AP211 принят](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
 211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают

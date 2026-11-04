@@ -1,5 +1,16 @@
 # ТЗ AQ: readonly-источники наблюдений, provenance и единый пакет квалификации
 
+Обновление04.11.2026: готов source candidate и единый [TEST-PLAN AQ91](TEST-PLAN-REAL-MACHINE-0.2.0-wave3aq.md).
+[API/schema](API-CONTRACT-WAVE3AQ.md), [96exact anchors/65surfaces](RESOURCE-SOURCES-WAVE3AQ.md),
+[ADR](ADR-REC-C-AQ-READONLY-EVIDENCE.md).39narrow+2frozenloader/checkpoint PASS, full91/realAQ NOT_RUN.
+Реализованы AQ-1 types/strict schema/session ownership, AQ-2 wire parsers и unwired bounded
+query/proc/profile candidate, AQ-3 FIXTURE scoped comparison/AP boundary preservation,
+AQ-4 offline lifecycle/guard/private partial, AQ-5 новые проверки, AQ-6 готовый offline пакет.
+Actual host issuer/proc mount/executable/permissions/installed formats qualification НЕ закрыты;
+host branch BLOCKED_SCOPE_REVIEW/HOST_NOT_RUN. Включить её флагом/обходом guard нельзя.
+Нет runtime wiring/install/сети;all7gatesfalse/LiveCBLOCKED_BOOTSTRAP. Ниже исходное ТЗ;
+его SPEC_ONLY относится к состоянию на момент постановки, не к готовому offline пакету.
+
 Дата: 04.11.2026. Исполнитель первого этапа — модель-разработчик. Исполнитель будущего
 реального прогона — Flash на ThinkCentre. Статус документа: **SPEC_ONLY / NOT_IMPLEMENTED / NOT_RUN**.
 Это новое задание, а не предложение повторить AP211. Не начинать исполнение с запуска
