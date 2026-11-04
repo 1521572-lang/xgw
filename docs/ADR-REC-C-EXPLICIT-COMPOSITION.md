@@ -1,5 +1,9 @@
 # ADR: explicit build-bound composition и проверка FILES
 
+Обновление04.11.2026: [AO66 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ao.md), оба ANfixturedefects
+закрыты actualAO. OriginalAN850/852 неизменён. Ниже история; runtimegatesfalse.
+
+
 Обновление04.11.2026: AN850/852, загрузчик отработал. Два expectedRuntimeError fixtures
 исправлены, productruntime неизменён. [Разбор AN](REVIEW-REAL-MACHINE-0.2.0-wave3an.md).
 Выполнять [AO66](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ao.md), неAN/850повторов. RealAO NOT_RUN.

@@ -1,27 +1,22 @@
 # ADR REC-C: opt-in hooks реальных методов, без runtime activation
 
-## Текущий статус — AL756 принят, AK fixtures закрыты; AM852 готов (04.11.2026)
+## Текущий статус — AO66 принят, ошибки AN закрыты; AP — ТЗ разработчику (04.11.2026)
 
-[ALreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3al-2026-11-04.md):756/756,
-обаAKfixturedefects закрыты4actualrepairrows/depth2/targetrestoredtrue/old+fresh65true.
-[Разбор](REVIEW-REAL-MACHINE-0.2.0-wave3al.md). Exactprefix равен pinnedformatter,
-batch82981ms/casesum46686ms/660sreportinterval. 378PREFLIGHTsource+unitstrue1каждый.
+[Разбор AO](REVIEW-REAL-MACHINE-0.2.0-wave3ao.md):66/66,exactprefix byteequal,
+два ANfixtures repaired+BODY/CHECKER positions1–32. All66writerUNKNOWN1/receipt0/
+gen0/no furthersteps/final0/restoretrue. Частныйpanelfile присутствуетв64случаях:
+этоpartialeffects,неatomicrollback. Batch145671ms/casesum143823ms/371sreportinterval.
 HEALTHY_ON/poolOFF/linkALIVE/versionssame/NNP0/sudo0/start-monitor-show-shape-report0/
-owneractions0. WorkerexitNOT_COLLECTED. AKoriginal435/437непереименованв437PASS.
+owneractions0. WorkerexitNOT_COLLECTED. OriginalAN850/852 не изменён в852PASS.
+Source122/units/config/pyproject/старыеhelpersUNCHANGED;повторятьAO/AN/oldbatchesне нужно.
 
-[AM852](TEST-PLAN-REAL-MACHINE-0.2.0-wave3am.md):новыйexplicitcomposition связывает
-codeboundRegistry/preflight+9actors/50hooks+namedFILES под однимticket, checkpoints
-доadmit/внутри/междуsteps/передипослеFILES. [ADR](ADR-REC-C-EXPLICIT-COMPOSITION.md).
-One start/partial/one report;22narrowtests/RuffPASS, realAM852NOT_RUN.
-
-Новыйтолькоownership_composition.py/source122/pin12A11M;121старыхsource/units/config/
-pyproject/61oldstandfiles неизменны. Installedruntimeнеобновлён. Nonelegacyunfenced,
-mandatorydaemon/CLI/startupgraph/domainverifiers/boot/pathaliases/repair/bootstrapнеwired.
-FILESнеnetworkproof. MethodcleanupfailureможетоставитьLIVE1UNKNOWN0/noreceipt:
-смотретьwriter_total,неidle/retry. Все7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP.
-Independentoriginalon/code/unitrescue ДОinstall/fault;OnlyThinkCentre/LANclientнет/
-workingLAN/HEALTHY/on. Nooff/install/WAN/LAN/TS/pool/config/services/live rules.
-Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
+Следующее [ТЗ разработчику AP](PR-SPEC-WAVE3-AP-RESOURCE-CONTRACTS-AND-BOOTSTRAP-DRY.md):
+явные resource contracts, comparison preservingUNKNOWN, drystartup prerequisites,
+одна новая квалификация после реализации. APНЕреализован/НЕFlashready/realAPNOT_RUN.
+Нет новых livecommands/collector/installer. All7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP.
+Globalmandatorycomposition/actualdomainverifiers/boot/pathaliases/repair/rescue/fullwave3/
+LAN/performance/DAEещёоткрыты. OnlyThinkCentre/workingLAN/HEALTHYon/LANclientнет.
+Nooff/install/WAN/LAN/TS/pool/config/services/live rules. Ниже история.
 
 
 Актуально03.11: [AF145 принято](REVIEW-REAL-MACHINE-0.2.0-wave3af.md),

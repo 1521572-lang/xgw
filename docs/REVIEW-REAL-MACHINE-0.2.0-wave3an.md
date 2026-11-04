@@ -1,5 +1,9 @@
 # AN:850/852; два expected-operation-error fixtures требуют исправления
 
+Обновление04.11.2026: [AO66 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ao.md), оба ANfixturedefects
+закрыты actualAO. OriginalAN850/852 неизменён. Ниже история; runtimegatesfalse.
+
+
 Source: docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3an-2026-11-04.md.
 Pinnedpureformatter воспроизвёлexactpublicprefix, originalнеизменён.
 Логикапродукта корректно сохраняетRuntimeError изтела/checker, пишетUNKNOWN1/noReceipt.
