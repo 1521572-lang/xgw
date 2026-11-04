@@ -17,7 +17,7 @@ simulation_only у actual-looking JSON не доказывает источни�
 3. MATCH относится только FIXTURE expected и named scope; aggregate/runtime всегда
    UNKNOWN. Complete domain/global graph/installed loaded identity не заявляются.
 4. Host adapter намеренно всегда закрыт. Наличие предложенного argv/bounded transport
-   не разрешает host запуск и не означает готовый proc collector/profile orchestration.
+   не разрешает host запуск. Proc assembly/full sequence существуют только как unwired candidate.
    Для host нужны review конкретных capabilities, executable path policy, proc magic
    links/permissions/budgets/full profile и отдельное wire qualification по actual версии.
 5. Offline worker сохраняет accepted AD audit guard. No subprocess/socket/liveops в

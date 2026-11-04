@@ -66,7 +66,7 @@
   "src/xgw/ownership_hooks.py": "66da70aa6e306a93c12e0507c5db4d60de5f8a7319d62e35abd52146927fd95f",
   "src/xgw/ownership_identity.py": "9390002f30967992fae59fd52e938efe992da5631f2a40f88a620fe81c61f6ae",
   "src/xgw/ownership_observation_compare.py": "8ae0f314a855bbd8ca42157a57f2502f487debc822b0fc4b1fc57aa5bf3879e0",
-  "src/xgw/ownership_observation_sources.py": "cf4c8ccc7148911f8b991cf20b7513beb3018e2feac00bb2e080d71d7d401b71",
+  "src/xgw/ownership_observation_sources.py": "f74b233cd24ce3600785cd8228d1c2a5b123f5b9038b81c25f865af519409e1d",
   "src/xgw/ownership_observations.py": "c5f6094a429aa61fc3ffdc01d93269509a25e2cabf0df474c149bd425f34ab9a",
   "src/xgw/ownership_resource_catalog.py": "9d957229e9eb46b00666aa38fd77fad0ce9aa47d2b29981f89813170a3a42de7",
   "src/xgw/ownership_resources.py": "a405d219f125d85e5693ec5cefac1c26a91364f427b1599ad62ba33f65cf568b",

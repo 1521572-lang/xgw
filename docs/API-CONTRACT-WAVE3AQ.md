@@ -61,8 +61,13 @@ ProposedTransport/query и proposed_argv — unwired candidate, не путь ho
 literal show/property и terse list table. Transport имеет streaming cap+1, deadline,
 общий byte budget,≤9 children; cleanup только своего Popen child. Не root/service PID.
 Executable final lstat policy не является полным ancestor/mount/exec race proof.
-Подключение proc reads, final executable policy и всего host profile требует отдельного
-scope review/implementation; не считать наличие query полноценным host collector.
+ProposedTransport._proc_stream/proc_context/proc_process и proposed_profile реализуют
+unwired candidate: bounded zero-size proc stream, fixed self/PID namespace links, PID только
+из успешно decoded UNIT, нет /proc/0; порядок9children/24proc-context reads. Ordinary
+permission/missing/budget дают partial; cleanup failure прекращает дальнейшие reads.
+Их positive paths локально проверены только fake I/O,4 новых stand cases без host calls.
+Final executable/ancestor/proc mount policy, permissions, active issuer и actual wire
+qualification требуют отдельного scope review. Это не включённый host collector.
 
 ReadonlyObservationSession(policy, exact backend, clock_values=None, expected_states=()).
 Все expected_states создаются независимо ДО collect и pin по identity/flat immutable values.
@@ -112,5 +117,5 @@ runtime_verification всегда UNKNOWN Verification. AP helpers/types/facade 
 
 Stand markers: READONLY_OBSERVATIONS_BATCH_STARTED, ..._BATCH_RECORDED/PARTIAL,
 ..._REPORT_READY; scope OFFLINE_OBSERVATION_QUALIFICATION_HOST_BLOCKED.
-Worker_exit NOT_COLLECTED.87cases — не87host operations. Источник будущего host протокола:
+Worker_exit NOT_COLLECTED.91cases — не87host operations. Источник будущего host протокола:
 [ТЗ AQ](PR-SPEC-WAVE3AQ-READONLY-OBSERVATION-SOURCES.md); текущий host branch закрыт.

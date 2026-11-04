@@ -52,6 +52,10 @@ def helper(monkeypatch):
         "I_IMPORT",
         "I_RUNTIME",
         "I_CONSTRUCTOR",
+        "I_PROPOSED_PROC",
+        "I_PID_ZERO",
+        "I_PID_MISMATCH",
+        "I_PROFILE_CLEANUP",
     ),
 )
 def test_new_observation_paths(helper, tmp_path, case):
@@ -156,3 +160,82 @@ def test_candidate_transport_uses_caps_and_only_owned_child(helper, monkeypatch,
                 == {"cap": "OUTPUT_LIMIT", "timeout": "TIMEOUT", "rc1": "ERROR"}[mode]
             )
     assert events.count("fake_spawn") == 1 and events.count("own_child_kill") == 1
+
+
+def test_candidate_proc_assembly_zero_size_stream_and_unit_binding(helper, monkeypatch):
+    t, s, _ = helper.modules()
+    paths, opened = [], {}
+    contents = {
+        "/proc/sys/kernel/random/boot_id": b"11111111-1111-1111-1111-111111111111\n",
+        "/proc/123/stat": helper.stat_raw(),
+    }
+
+    def fake_open(path, flags):
+        assert path in contents and flags & s.os.O_NOFOLLOW and flags & s.os.O_NONBLOCK
+        fd = 1000 + len(paths)
+        paths.append(path)
+        opened[fd] = contents[path]
+        return fd
+
+    def fake_read(fd, size):
+        data = opened[fd][:size]
+        opened[fd] = opened[fd][size:]
+        return data
+
+    with monkeypatch.context() as patch:
+        patch.setattr(s.os, "open", fake_open)
+        patch.setattr(s.os, "read", fake_read)
+        patch.setattr(s.os, "fstat", lambda fd: SimpleNamespace(st_mode=0o100444, st_size=0))
+        patch.setattr(s.os, "close", lambda fd: None)
+        patch.setattr(
+            s.os, "readlink", lambda path: "net:[1]" if path.endswith("net") else "mnt:[2]"
+        )
+        patch.setattr(s.time, "monotonic", lambda: 0.0)
+        transport = s.ProposedTransport(t.CapturePolicy())
+        context = transport.proc_context()
+        process = transport.proc_process(s.spec_for("UNIT_XGW"), helper.complete(helper.unit_raw()))
+    assert context.collection == process.collection == "COMPLETE"
+    assert s.decode(s.spec_for("PROCESS_XGW"), process).status == "COMPLETE"
+    assert paths == ["/proc/sys/kernel/random/boot_id", "/proc/123/stat"]
+
+
+def test_candidate_zero_pid_does_not_read_proc(helper, monkeypatch):
+    t, s, _ = helper.modules()
+
+    def forbidden(*args):
+        pytest.fail("PID0 caused proc read")
+
+    monkeypatch.setattr(s.os, "open", forbidden)
+    result = s.ProposedTransport(t.CapturePolicy()).proc_process(
+        s.spec_for("UNIT_XGW"), helper.complete(helper.unit_raw(MainPID="0"))
+    )
+    assert result.reason == "PID_NOT_PRESENT"
+
+
+def test_candidate_wrong_pid_is_not_bound(helper, monkeypatch):
+    t, s, _ = helper.modules()
+    monkeypatch.setattr(s.ProposedTransport, "_proc_stream", lambda *args: helper.stat_raw(pid=124))
+    monkeypatch.setattr(s.ProposedTransport, "_namespace", lambda *args: "net:[1]")
+    result = s.ProposedTransport(t.CapturePolicy()).proc_process(
+        s.spec_for("UNIT_XGW"), helper.complete(helper.unit_raw())
+    )
+    assert result.collection == "ERROR" and result.reason == "INVALID_PAYLOAD"
+
+
+def test_candidate_profile_stops_after_unconfirmed_cleanup(helper, monkeypatch):
+    t, s, _ = helper.modules()
+    calls = []
+    monkeypatch.setattr(
+        s.ProposedTransport, "proc_context", lambda self: helper.complete(helper.context_raw())
+    )
+
+    def query(self, spec, executable):
+        calls.append(spec.scope_id)
+        self.cleanup_confirmed = False
+        return t.SourceResult(
+            collection="ERROR", reason="CLEANUP_UNCONFIRMED", cleanup_confirmed=False
+        )
+
+    monkeypatch.setattr(s.ProposedTransport, "query", query)
+    rows = s.proposed_profile(s.ProposedTransport(t.CapturePolicy()))
+    assert calls == ["UNIT_XGW"] and len(rows) == 2

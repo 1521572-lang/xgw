@@ -16,7 +16,7 @@ from types import FunctionType, SimpleNamespace
 NOTES = Path.home() / "xgw-w3aq"
 AK_SHA = "927128c0486d45eabd7c81a6416e74be9f1e7153ec6f9a0121ac8083177b9e55"
 SUPPORT_SHA = "9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917"
-MANIFEST_SHA = '4ad3f406f0c1634a579e07662ebfb726107988ba8faca03ff629bb5cd86f54da'
+MANIFEST_SHA = '974d03a8a31750a365887c85745b227ce493f62ec4deed203b2744b950e68b4d'
 UNITS_SHA = "373695d50a921ef2e2fdc8398192ef62f7d6fd0414704d3822b967c8e3142bd4"
 SURFACE_SHA = "8c5dd6e0362e939f2e366b3b14dde554220d8a2160122f824fb7b61a3d80adbe"
 LEGACY_SHA = "2a04974052ff99ee27bbf8392e75db13d31a4551fc7163ccf54c1f9618da67a5"
@@ -123,6 +123,10 @@ GROUPS = {
         "RUNTIME",
         "ARGV",
         "CONSTRUCTOR",
+        "PROPOSED_PROC",
+        "PID_ZERO",
+        "PID_MISMATCH",
+        "PROFILE_CLEANUP",
     ),
 }
 EXPECTED = tuple(g + "_" + v for g, values in GROUPS.items() for v in values)
@@ -556,9 +560,6 @@ def session_case(name):
         session, exp = session_fixture()
         collect_fixture(session)
     elif name == "STALE":
-        session._clock_index = 255
-        session.clock_values = session.clock_values  # immutable owned provider remains
-        session._last_clock = None
         # Use a separately constructed session with a true late clock sample.
         session, exp = session_fixture(clock_values=tuple([0.0] * 10 + [31.0]))
         ev = collect_fixture(session)
@@ -654,6 +655,47 @@ def budget_case(name):
 
 def integration(name):
     t, s, c = modules()
+    if name in ("PROPOSED_PROC", "PID_ZERO", "PID_MISMATCH", "PROFILE_CLEANUP"):
+        transport = s.ProposedTransport(t.CapturePolicy())
+        transport._proc_stream = lambda path: (
+            b"11111111-1111-1111-1111-111111111111\n"
+            if path.endswith("boot_id")
+            else stat_raw(pid=124 if name == "PID_MISMATCH" else 123)
+        )
+        transport._namespace = lambda pid, kind: kind + ":[1]"
+        if name == "PROPOSED_PROC":
+            require(transport.proc_context().collection == "COMPLETE", "CONTEXT_ASSEMBLY")
+            result = transport.proc_process(s.spec_for("UNIT_XGW"), complete(unit_raw()))
+            require(result.collection == "COMPLETE", "PROC_ASSEMBLY")
+        elif name == "PID_ZERO":
+
+            def forbidden(*args):
+                raise AssertionError("PID0_READ")
+
+            transport._proc_stream = forbidden
+            result = transport.proc_process(s.spec_for("UNIT_XGW"), complete(unit_raw(MainPID="0")))
+            require(result.reason == "PID_NOT_PRESENT", "PID0_UNOBSERVED")
+        elif name == "PID_MISMATCH":
+            result = transport.proc_process(s.spec_for("UNIT_XGW"), complete(unit_raw()))
+            require(
+                result.collection == "ERROR" and result.reason == "INVALID_PAYLOAD", "PID_BOUND"
+            )
+        else:
+            calls = []
+            transport.proc_context = lambda: complete(context_raw())
+
+            def query(spec, executable):
+                calls.append(spec.scope_id)
+                transport.cleanup_confirmed = False
+                return t.SourceResult(
+                    collection="ERROR", reason="CLEANUP_UNCONFIRMED", cleanup_confirmed=False
+                )
+
+            transport.query = query
+            require(
+                len(s.proposed_profile(transport)) == 2 and calls == ["UNIT_XGW"], "PROFILE_STOP"
+            )
+        return
     if name == "ARGV":
         for scope, exe in (("UNIT_XGW", "/usr/bin/systemctl"), ("NFT_IPV4", "/usr/sbin/nft")):
             argv = s.proposed_argv(s.spec_for(scope), exe)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import selectors
@@ -405,3 +406,143 @@ class ProposedTransport:
         if rc != 0 or not output["out"]:
             return SourceResult(collection="ERROR", rc=rc, reason="QUERY_FAILED")
         return SourceResult("COMPLETE", bytes(output["out"]), rc, "OBSERVED")
+
+    def _proc_budget(self):
+        require(self.cleanup_confirmed)
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+        return (
+            now - self.started < self.policy.total_seconds and self.used < self.policy.total_bytes
+        )
+
+    def _proc_stream(self, path):
+        # Caller is one of the two fixed context/process assemblers below. This is
+        # not an arbitrary file-read backend; no /proc scan or symlink follow.
+        require(
+            path == "/proc/sys/kernel/random/boot_id"
+            or re.fullmatch(r"/proc/[1-9][0-9]{0,9}/stat", path)
+        )
+        if not self._proc_budget():
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            require(stat.S_ISREG(os.fstat(fd).st_mode))
+            raw = bytearray()
+            while True:
+                if not self._proc_budget():
+                    return None
+                room = min(self.policy.proc_bytes - len(raw), self.policy.total_bytes - self.used)
+                chunk = os.read(fd, min(8192, room + 1))
+                self.used += len(chunk)
+                require(len(chunk) <= room)
+                if not chunk:
+                    return bytes(raw)
+                raw.extend(chunk)
+        finally:
+            os.close(fd)
+
+    def _namespace(self, pid, kind):
+        require(pid == "self" or (type(pid) is int and 1 <= pid <= 2**31 - 1))
+        require(kind in ("net", "mnt"))
+        if not self._proc_budget():
+            return None
+        value = os.readlink(f"/proc/{pid}/ns/{kind}")
+        require(type(value) is str and re.fullmatch(kind + r":\[[0-9]{1,20}\]", value))
+        self.used += len(value.encode())
+        require(self.used <= self.policy.total_bytes)
+        return value
+
+    def proc_context(self):
+        """Candidate private assembly. Does not attest the proc mount/host root."""
+        if not self.cleanup_confirmed:
+            return SourceResult(
+                collection="ERROR", reason="CLEANUP_UNCONFIRMED", cleanup_confirmed=False
+            )
+        try:
+            boot = self._proc_stream("/proc/sys/kernel/random/boot_id")
+            net, mnt = self._namespace("self", "net"), self._namespace("self", "mnt")
+            if boot is None or net is None or mnt is None:
+                return SourceResult(collection="BUDGET", reason="BUDGET")
+            raw = canonical({"boot": boot.decode("ascii").strip(), "net": net, "mnt": mnt})
+            decode_context(raw)
+            return SourceResult("COMPLETE", raw, None, "OBSERVED")
+        except PermissionError:
+            return SourceResult(collection="ERROR", reason="PERMISSION_DENIED")
+        except OSError:
+            return SourceResult(collection="ERROR", reason="QUERY_FAILED")
+        except (ObservationRefused, UnicodeError):
+            return SourceResult(collection="OUTPUT_LIMIT", reason="OUTPUT_LIMIT")
+
+    def proc_process(self, unit_spec, unit_result):
+        require(type(unit_spec) is SourceSpec and unit_spec.source_id == "UNIT")
+        unit_spec.__post_init__()
+        require(type(unit_result) is SourceResult)
+        unit_result.__post_init__()
+        if not self.cleanup_confirmed:
+            return SourceResult(
+                collection="ERROR", reason="CLEANUP_UNCONFIRMED", cleanup_confirmed=False
+            )
+        unit = decode(unit_spec, unit_result)
+        if unit.status != "COMPLETE":
+            return SourceResult(reason="PROCESS_UNBOUND")
+        pid = strict_json(unit.canonical)["MainPID"]
+        if pid == 0:
+            return SourceResult(reason="PID_NOT_PRESENT")
+        try:
+            raw = self._proc_stream(f"/proc/{pid}/stat")
+            net, mnt = self._namespace(pid, "net"), self._namespace(pid, "mnt")
+            if raw is None or net is None or mnt is None:
+                return SourceResult(collection="BUDGET", reason="BUDGET")
+            require(strict_json(decode_stat(raw))["pid"] == pid)
+            payload = canonical(
+                {"unit_scope": unit_spec.scope_id, "stat": raw.decode(), "net": net, "mnt": mnt}
+            )
+            if len(payload) > self.policy.proc_bytes:
+                return SourceResult(collection="OUTPUT_LIMIT", reason="OUTPUT_LIMIT")
+            return SourceResult("COMPLETE", payload, None, "OBSERVED")
+        except OSError as exc:
+            reason = (
+                "PID_NOT_PRESENT"
+                if exc.errno in (errno.ENOENT, errno.ESRCH)
+                else "PERMISSION_DENIED"
+                if exc.errno in (errno.EACCES, errno.EPERM)
+                else "QUERY_FAILED"
+            )
+            return SourceResult(collection="ERROR", reason=reason)
+        except (ObservationRefused, UnicodeError):
+            return SourceResult(collection="ERROR", reason="INVALID_PAYLOAD")
+
+
+def proposed_profile(transport):
+    """Unwired future host sequence; never called by the closed host backend/runner.
+
+    Returns private results, not SESSION_CAPTURED authority or accepted verification.
+    Whole-profile context/unit consistency must still be checked by a qualified consumer.
+    """
+    require(type(transport) is ProposedTransport)
+    rows = [("COLLECTOR_CONTEXT", "BEFORE", transport.proc_context())]
+    units = tuple(s for s in SPECS if s.source_id == "UNIT")
+    for unit in units:
+        if not transport.cleanup_confirmed:
+            return tuple(rows)
+        rows.append((unit.scope_id, "BEFORE", transport.query(unit, "/usr/bin/systemctl")))
+    unit_before = {scope: result for scope, phase, result in rows if phase == "BEFORE"}
+    for phase in ("BEFORE", "AFTER"):
+        if phase == "AFTER":
+            for spec in (s for s in SPECS if s.source_id == "NFT_TABLE"):
+                if not transport.cleanup_confirmed:
+                    return tuple(rows)
+                rows.append((spec.scope_id, "SINGLE", transport.query(spec, "/usr/sbin/nft")))
+        for unit in units:
+            if not transport.cleanup_confirmed:
+                return tuple(rows)
+            scope = "PROCESS_" + unit.scope_id.removeprefix("UNIT_")
+            rows.append((scope, phase, transport.proc_process(unit, unit_before[unit.scope_id])))
+    for unit in units:
+        if not transport.cleanup_confirmed:
+            return tuple(rows)
+        rows.append((unit.scope_id, "AFTER", transport.query(unit, "/usr/bin/systemctl")))
+    if transport.cleanup_confirmed:
+        rows.append(("COLLECTOR_CONTEXT", "AFTER", transport.proc_context()))
+    return tuple(rows)
