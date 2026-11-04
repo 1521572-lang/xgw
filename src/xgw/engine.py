@@ -27,13 +27,13 @@ from .generator import builder, validate
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .model import ServerNode, raw_to_node, split_variants
-from .net import lan, nft
+from .net import cmd, lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
 from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
 from .watch import target
 from .xraycore.api import ApiClient, server_address
-from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService
+from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService, XrayServiceError
 
 
 class EngineError(Exception):
@@ -58,8 +58,7 @@ class SingboxChange:
     """Что сборка требует от sing-box (apply/singbox.py)."""
 
     config: dict | None  # желаемый конфиг; None — вести через sing-box некого
-    reload: bool  # применить сейчас; иначе отложить: через sing-box идёт трафик (перечитывание
-    # конфига рвёт его соединения), пока не наступит окно перезапуска или не станет срочно
+    reload: bool  # совместимость первого запуска/стенда; рабочие изменения идут новым поколением
     bridged: int = 0  # сколько серверов в новом конфиге Xray ведёт sing-box
     verdict: bool | None = None  # итог sing-box check; None — проверка не выполнялась
 
@@ -521,13 +520,8 @@ def assemble(
     )
     sb_bin = singboxing.find_binary(None, paths) if check and enabled else None
     applied_ports = singboxing.bridge_ports(applied_sb)
-    carried = _carrying_tags(paths, applied)
-    bridged_now = any(
-        singboxing.bridge_variant(outbound)
-        for outbound in (applied or {}).get("outbounds") or []
-        if isinstance(outbound, dict) and outbound.get("tag") in carried
-    )
-    reload_now = (not bridged_now) if reload_singbox is None else reload_singbox
+    # Состав меняется отдельным поколением, а не SIGHUP; трафик больше не требует окна.
+    reload_now = True
     if not enabled:
         served: set[str] = set()
     elif reload_now:
@@ -980,6 +974,7 @@ def describe_singbox(outcome: singbox_apply.SingboxOutcome) -> str:
                     "бы соединения (применить сейчас: xgw apply --now)",
         "started": "sing-box запущен",
         "reloaded": "конфиг sing-box перечитан",
+        "generation": "sing-box: новое поколение выбрано через API; прежнее завершает соединения",
         "removed": "sing-box остановлен: серверов для него нет",
         "rejected": "конфиг sing-box отклонён, sing-box работает на прежнем",
         "rollback": "sing-box не принял новый конфиг — выполнен откат на last-good",
@@ -997,13 +992,33 @@ def apply_all(
 ) -> tuple[ApplyOutcome | None, singbox_apply.SingboxOutcome | None]:
     """Применяет сборку: сначала sing-box (мосты должны слушать), затем Xray. Если sing-box
     конфиг не принял, Xray не применяется (он собран под него): вернётся только итог sing-box."""
+    from .apply import singbox_generation as generations
+
     outcome = None
     if assembly.singbox is not None:
         core = singbox_core if singbox_core is not None else make_singbox(cfg, paths)
+        if assembly.singbox.config is None and core.read() is not None:
+            result = applier.apply(assembly.result.config, force_now=force_now)
+            if result.mode in ("api", "restart", "unchanged"):
+                generations.retire(core)
+            return result, singbox_apply.SingboxOutcome(
+                "deferred", "старое поколение завершает соединения")
+        if generations.needed(core, assembly.singbox.config):
+            try:
+                prepared = generations.prepare(
+                    core, assembly.singbox.config, assembly.result.config)
+                result = generations.finish(core, applier, prepared)
+            except (ValueError, OSError, XrayServiceError, cmd.CommandError) as exc:
+                return None, singbox_apply.SingboxOutcome("rejected", str(exc))
+            if result.mode == "api":
+                assembly.result.config.clear()
+                assembly.result.config.update(prepared.xray)
+            return result, singbox_apply.SingboxOutcome(
+                "generation" if result.mode == "api" else "rejected", result.detail)
         outcome = core.apply(
             assembly.singbox.config, reload=assembly.singbox.reload,
         )
-        if outcome.mode in ("rejected", "rollback", "failed"):
+        if outcome.mode in ("rejected", "rollback", "failed", "deferred"):
             return None, outcome
     return applier.apply(assembly.result.config, force_now=force_now), outcome
 

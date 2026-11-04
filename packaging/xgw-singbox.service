@@ -1,8 +1,8 @@
 # XGW: sing-box — второе ядро (hysteria2, TUIC, AnyTLS, WireGuard и обход блокировок). Xray
 # остаётся точкой входа всего трафика и ведёт к sing-box через его локальные входы на 127.0.0.1.
 # Конфиг пишет XGW; служба запускается, только когда он есть (серверов для sing-box нет — её нет).
-# Перечитывание конфига (systemctl reload) рвёт соединения через sing-box, поэтому XGW делает его
-# редко и откладывает, пока через sing-box идёт трафик.
+# Обычный процесс для первого запуска и boot. Рабочий состав меняется отдельным поколением;
+# ExecCondition не позволяет запустить дубликат при перезапуске демона во время drain.
 [Unit]
 Description=XGW: sing-box
 Documentation=https://github.com/SagerNet/sing-box
@@ -17,6 +17,7 @@ Group=xgw-singbox
 AmbientCapabilities=
 CapabilityBoundingSet=
 NoNewPrivileges=true
+ExecCondition=/usr/local/bin/xgw singbox legacy-ready
 ExecStartPre=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json
 ExecStart=/opt/xgw/sing-box/sing-box --disable-color run -c /etc/xgw/sing-box/config.json
 ExecReload=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json

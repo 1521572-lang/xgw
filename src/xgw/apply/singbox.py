@@ -1,9 +1,8 @@
 """Применение конфига sing-box и слежение за ним (generator/singbox.py).
 
-В отличие от Xray, sing-box умеет перечитывать конфиг (SIGHUP), но проверено на 1.14.3: при этом
-рвутся ВСЕ его соединения. Поэтому конфиг sing-box меняется редко — только когда меняется состав
-серверов (смена профиля сервера идёт через API Xray и sing-box не трогает) — и, если через
-sing-box идёт трафик, откладывается до окна перезапуска (engine.assemble решает, сейчас ли).
+SIGHUP рвёт соединения sing-box. В рабочем systemd новый состав подготавливает
+singbox_generation, затем Xray меняет мосты через API. Здесь остаются первый запуск,
+слежение и штатное восстановление процесса; перечитывание сохранено для процесса стенда.
 
 Порядок такой же, как у Xray: проверка `sing-box check` до записи, прежний рабочий конфиг
 сохраняется как last-good, не поднялся за wait_seconds — откат на него. Все операции под той же
@@ -72,7 +71,9 @@ def make_service(paths: Paths, bin_path: Path | None) -> SingboxService:
         return PidfileSingboxService(
             bin_path or paths.singbox_bin, paths.singbox_config_file, paths.run / "singbox.pid",
         )
-    return SystemdSingboxService()
+    from . import singbox_process as processes
+
+    return SystemdSingboxService(processes.unit(processes.read(paths)["active"]))
 
 
 @dataclass
@@ -114,6 +115,14 @@ class SingboxCore:
         сейчас, иначе отложить (конфиг ждёт в config.pending.json)."""
         with file_lock(self.paths.lock_file):
             current = self.read()
+            if config == current:
+                self.paths.singbox_pending_file.unlink(missing_ok=True)
+                return SingboxOutcome("unchanged")
+            from . import singbox_process as processes
+
+            state = processes.reap(self)
+            if state["pending"] or (state["draining"] and config != current):
+                return SingboxOutcome("deferred", "предыдущее поколение ещё завершается")
             if config is None:
                 if current is None:
                     return SingboxOutcome("unchanged")
@@ -122,9 +131,9 @@ class SingboxCore:
                         "deferred", "sing-box больше не нужен — остановка отложена",
                     )
                 return self._remove()
-            if config == current:
-                self.paths.singbox_pending_file.unlink(missing_ok=True)
-                return SingboxOutcome("unchanged")
+            if current is not None and isinstance(self.service, SystemdSingboxService):
+                return SingboxOutcome(
+                    "deferred", "состав sing-box меняется только отдельным поколением")
             if not reload:
                 atomic_write_json(self.paths.singbox_pending_file, config)
                 return SingboxOutcome("deferred", "перечитывание рвёт соединения через sing-box")
@@ -200,6 +209,10 @@ class SingboxCore:
         return SingboxOutcome("removed")
 
     def _rollback(self, reason: str) -> SingboxOutcome:
+        from . import singbox_process as processes
+
+        if processes.read(self.paths)["active"] != "legacy":
+            return SingboxOutcome("failed", "отдельный откат ядра не согласован с мостами Xray")
         try:
             good_text = self.paths.singbox_last_good_file.read_text(encoding="utf-8")
             good = json.loads(good_text)
@@ -223,7 +236,9 @@ class SingboxCore:
             return False
         secret = singboxing.clash_secret(self.read())
         try:
-            conn = http.client.HTTPConnection(singboxing.LOCAL, self.cfg.core.api_port, timeout=2.0)
+            conn = http.client.HTTPConnection(
+                singboxing.LOCAL, singboxing.clash_port(self.read(), self.cfg.core.api_port),
+                timeout=2.0)
             try:
                 conn.request("GET", "/version", headers={"Authorization": f"Bearer {secret}"})
                 return conn.getresponse().status == 200
@@ -231,6 +246,13 @@ class SingboxCore:
                 conn.close()
         except (OSError, http.client.HTTPException):
             return False
+
+    def sync_generation(self):
+        from . import singbox_process as processes
+
+        if isinstance(self.service, (SystemdSingboxService, SystemdXrayService)):
+            self.service = SystemdSingboxService(
+                processes.unit(processes.read(self.paths)["active"]))
 
     def restart(self) -> str | None:
         """Перезапуск службы; None — поднялся, иначе причина."""

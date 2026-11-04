@@ -510,6 +510,9 @@ class _Build:
     error: Exception | None = None
     spent: float = 0.0
     discard: bool = False
+    preparation_started: bool = False
+    generation: object = None
+    generation_core: object = None
 
 
 class Daemon:
@@ -2485,6 +2488,10 @@ class Daemon:
                    and job.inputs[0] == self.cfg and job.inputs[1] == self.inventory
                    and job.stamp == stamp)
         if job.discard or not current:
+            if job.generation is not None:
+                from .apply import singbox_generation as generations
+
+                generations.abort(job.generation_core, job.generation)
             self._build_discarded += 1
             self.log.info("устаревшая сборка конфига отброшена без применения")
             if self._build_next is None and not job.discard:
@@ -2502,9 +2509,41 @@ class Daemon:
             raise job.error
         assembly = job.assembly
         assert assembly is not None
+        from .apply import singbox_generation as generations
+
+        if (not job.preparation_started and assembly.singbox is not None
+                and generations.needed(self.singbox, assembly.singbox.config)):
+            if not generations.available(self.singbox):
+                self._build = job
+                return False
+            job.preparation_started = True
+            job.generation_core = self.singbox
+            job.done.clear()
+            self._build = job
+            def prepare_generation():
+                try:
+                    job.generation = generations.prepare(
+                        job.generation_core, assembly.singbox.config, assembly.result.config)
+                except Exception as exc:
+                    self.log.warning("подготовка поколения sing-box не выполнена: %s", exc)
+                    job.error = engine.EngineError(
+                        "поколение sing-box не подготовлено; прежнее сохранено")
+                finally:
+                    job.spent = time.monotonic() - job.began
+                    job.done.set()
+                    job.wake.set()
+            threading.Thread(
+                target=prepare_generation, name="xgw-singbox-prepare", daemon=True).start()
+            return False
         began = time.monotonic()
-        outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
-                              singbox=assembly.singbox)
+        if job.generation is not None:
+            outcome = generations.finish(self.singbox, self.applier, job.generation)
+            if outcome.mode == "api":
+                assembly.result.config.clear()
+                assembly.result.config.update(job.generation.xray)
+        else:
+            outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
+                                  singbox=assembly.singbox)
         self._rebuild_spent = (job.spent, time.monotonic() - began)
         self._build_last = self._rebuild_spent
         self._build_outcome = outcome.mode
@@ -2589,6 +2628,13 @@ class Daemon:
         self, config: dict, *, urgent: bool, singbox: engine.SingboxChange | None = None,
     ) -> ApplyOutcome:
         """Сначала sing-box (мосты должны слушать), затем Xray."""
+        if singbox is not None and singbox.config is None and self.singbox.read() is not None:
+            from .apply import singbox_generation as generations
+
+            outcome = self.applier.apply(config, urgent=urgent)
+            if outcome.mode in ("api", "restart", "unchanged"):
+                generations.retire(self.singbox)
+            return outcome
         rejected = self._apply_singbox(singbox)
         if rejected is not None:
             return rejected
@@ -4642,6 +4688,10 @@ class Daemon:
         на last-good, дальше — серверы переводятся на Xray. True — конфиг Xray пересобран."""
         if self.stopping:
             return False
+        from .apply import singbox_generation as generations
+
+        generations.recover(self.singbox)
+        self.singbox.sync_generation()
         if self._singbox_failed:
             return self._singbox_recover(now)
         if not self.singbox.expected():
@@ -4890,6 +4940,8 @@ class Daemon:
 
     def _singbox_status(self, view: list[NodeInfo]) -> dict:
         """Второе ядро для статуса: режим, установлен ли, отвечает ли, сколько серверов ведёт."""
+        from .apply import singbox_process as generations
+
         installed = singboxing.find_binary(None, self.paths) is not None
         bridged = sum(1 for info in view if profiling.core_of(info.profile) == "sing-box")
         expected = installed and self.singbox.expected()
@@ -4901,6 +4953,7 @@ class Daemon:
             "alive": (not self._singbox_failed and self._singbox_alive) if expected else None,
             "failed": self._singbox_failed,
             "bridged": bridged,
+            "generations": generations.summary(self.paths),
         }
 
     def _singbox_version(self) -> str:
@@ -4929,6 +4982,9 @@ class Daemon:
         if change is None or self._singbox_failed:
             return None
         outcome = self.singbox.apply(change.config, reload=change.reload)
+        if outcome.mode == "deferred":
+            self._rebuild_asked = True
+            return ApplyOutcome("rejected", detail="sing-box ждёт подготовки отдельного поколения")
         if outcome.mode in ("started", "reloaded", "removed"):
             count = 0 if change.config is None else len(change.config.get("inbounds") or [])
             self.notifier.event("singbox", {

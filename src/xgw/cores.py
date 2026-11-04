@@ -594,7 +594,10 @@ class SingboxAdapter(Adapter):
         query = urllib.parse.urlencode({"url": scan.cheap_url(self.cfg), "timeout": 5000})
         path = f"/proxies/{urllib.parse.quote(tag, safe='')}/delay?{query}"
         try:
-            conn = http.client.HTTPConnection(singboxing.LOCAL, self.cfg.core.api_port, timeout=8.0)
+            conn = http.client.HTTPConnection(
+                singboxing.LOCAL, singboxing.clash_port(config, self.cfg.core.api_port),
+                timeout=8.0,
+            )
             try:
                 conn.request("GET", path, headers={"Authorization": f"Bearer {secret}"})
                 response = conn.getresponse()

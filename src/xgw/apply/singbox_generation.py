@@ -1,0 +1,275 @@
+"""Подготовка sing-box в фоне, затем API-переключение в шаге; максимум два процесса."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import secrets
+import time
+from dataclasses import dataclass
+
+from ..config import probe_bytes, service_ports
+from ..generator import singbox as sb
+from ..generator.diff import diff_configs
+from ..paths import atomic_write_json, file_lock
+from ..watch import checks
+from ..xraycore.service import SystemdXrayService
+from . import singbox_process as processes
+from .applier import ApplyOutcome
+
+
+def digest(config):
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+
+
+@dataclass
+class Prepared:
+    token: str
+    slot: str
+    old: dict
+    config: dict
+    xray: dict
+    previous_xray: dict
+
+
+def needed(core, config):
+    return config is not None and core.read() is not None and config != core.read()
+
+
+def available(core):
+    with file_lock(core.paths.lock_file):
+        state = processes.reap(core)
+        return not (state["pending"] or state["draining"] or core.paths.api_dirty_file.exists())
+
+
+def remap(core, config, xray, old):
+    candidate, routed = copy.deepcopy(config), copy.deepcopy(xray)
+    used = set(service_ports(core.cfg).values()) | processes.ports(old)
+    used.add(sb.clash_port(old, core.cfg.core.api_port))
+    replacement = {}
+    next_port = core.cfg.core.port_base
+    for inbound in candidate["inbounds"]:
+        while next_port in used and next_port <= 65535:
+            next_port += 1
+        if next_port > 65535:
+            raise ValueError("нет портов для нового поколения sing-box")
+        replacement[inbound["listen_port"]] = next_port
+        inbound.update(type="mixed", listen_port=next_port)
+        used.add(next_port)
+    api_port = core.cfg.core.api_port
+    while api_port in used and api_port <= 65535:
+        api_port += 1
+    if api_port > 65535:
+        raise ValueError("нет порта API нового поколения sing-box")
+    candidate["experimental"]["clash_api"]["external_controller"] = f"{sb.LOCAL}:{api_port}"
+    for outbound in routed.get("outbounds", []):
+        if sb.bridge_variant(outbound):
+            server = outbound["settings"]["servers"][0]
+            server["port"] = replacement[server["port"]]
+    return candidate, routed
+
+
+def bridge_check(core, config, routed):
+    """Полный GET через хотя бы один используемый мост; плохие отдельные серверы допустимы."""
+    wanted = processes.xray_ports(routed)
+    deadline = time.monotonic() + 90
+    for inbound in config["inbounds"]:
+        if inbound["listen_port"] not in wanted:
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        user = inbound["users"][0]
+        reply = checks.http_get_via_proxy(
+            sb.LOCAL, inbound["listen_port"], core.cfg.probe.url,
+            proxy_user=user["username"], proxy_pass=user["password"],
+            max_total=min(30, left), min_body=probe_bytes(core.cfg.probe.url) or 1,
+            user_agent=core.cfg.probe.user_agent,
+        )
+        if reply.ok:
+            return True
+    return False
+
+
+def prepare(core, config, xray):
+    """Никаких API-записей Xray. Кандидат не получает пользовательский трафик."""
+    with file_lock(core.paths.lock_file):
+        state = processes.reap(core)
+        if state["pending"] or state["draining"] or core.paths.api_dirty_file.exists():
+            raise ValueError("предыдущее поколение ещё завершается или API требует восстановления")
+        old = core.read()
+        if old is None:
+            raise ValueError("нет исходного поколения sing-box")
+        previous_xray = json.loads(core.paths.xray_config_file.read_text(encoding="utf-8"))
+        candidate, routed = remap(core, config, xray, old)
+        diff = diff_configs(previous_xray, routed)
+        if diff.restart_reasons:
+            raise ValueError("смена поколения потребовала бы перезапуска Xray")
+        if core.validator(candidate)[0] is not True:
+            raise ValueError("новый sing-box не прошёл check")
+        slot = next(slot for slot in processes.SLOTS if slot != state["active"])
+        prepared = Prepared(secrets.token_hex(16), slot, old, candidate, routed, previous_xray)
+        processes.config_write(core.paths, slot, candidate)
+        atomic_write_json(core.paths.singbox_last_good_file, old)
+        state["pending"] = {"slot": slot, "token": prepared.token,
+                            "owner": os.getpid(), "phase": "preparing",
+                            "owner_start": processes.owner_start(os.getpid()),
+                            "xray_sha": digest(routed), "old_ports": sorted(processes.ports(old))}
+        processes.write(core.paths, state)
+    try:
+        processes.start(core, slot, candidate)
+        error = core._wait_ready(candidate)
+        if error or not bridge_check(core, candidate, routed):
+            raise ValueError("новое поколение не прошло настоящий запрос через мост")
+        with file_lock(core.paths.lock_file):
+            state = processes.read(core.paths)
+            if (state["pending"] or {}).get("token") != prepared.token:
+                raise ValueError("подготовка поколения была отменена")
+            state["pending"]["phase"] = "ready"
+            processes.write(core.paths, state)
+        return prepared
+    except BaseException:
+        abort(core, prepared)
+        raise
+
+
+def abort(core, prepared):
+    with file_lock(core.paths.lock_file):
+        _abort_locked(core, prepared)
+
+
+def _abort_locked(core, prepared):
+    state = processes.read(core.paths)
+    pending = state["pending"] or {}
+    if pending.get("token") == prepared.token and pending.get("phase") != "uncertain":
+        state["pending"]["phase"] = "aborting"
+        processes.write(core.paths, state)
+        processes.stop(prepared.slot)
+        if processes.stopped(prepared.slot):
+            state["pending"] = None
+        processes.write(core.paths, state)
+
+
+def finish(core, applier, prepared):
+    with file_lock(core.paths.lock_file):
+        state = processes.read(core.paths)
+        pending = state["pending"] or {}
+        actual = json.loads(core.paths.xray_config_file.read_text(encoding="utf-8"))
+        if (pending.get("token") != prepared.token or pending.get("phase") != "ready"
+                or core.read() != prepared.old or actual != prepared.previous_xray):
+            _abort_locked(core, prepared)
+            return ApplyOutcome("rejected", detail="исходный конфиг изменился во время проверки")
+        if applier.validator(prepared.xray)[0] is not True:
+            _abort_locked(core, prepared)
+            return ApplyOutcome("rejected", detail="Xray не принял новые мосты")
+        if (not SystemdXrayService(processes.unit(prepared.slot)).is_active()
+                or core._wait_ready(prepared.config) is not None):
+            _abort_locked(core, prepared)
+            return ApplyOutcome("rejected", detail="подготовленное поколение перестало отвечать")
+        # Оба процесса уже работают; при неопределённом исходе не убивать их.
+        state["pending"]["phase"] = "uncertain"
+        processes.write(core.paths, state)
+        outcome = applier._apply_locked(prepared.xray, restart_now=False, api_only=True)
+        if outcome.mode not in ("api", "unchanged"):
+            if not core.paths.api_dirty_file.exists():
+                state["pending"]["phase"] = "ready"
+                processes.write(core.paths, state)
+                _abort_locked(core, prepared)
+            return outcome
+        _promote(core, state, prepared.config)
+        core.paths.singbox_pending_file.unlink(missing_ok=True)
+        return outcome
+
+
+def _promote(core, state, config):
+    pending = state["pending"]
+    atomic_write_json(core.paths.singbox_config_file, config)
+    os.chown(core.paths.singbox_config_file, 0, core.paths.singbox_config_dir.stat().st_gid)
+    state.update(active=pending["slot"], pending=None,
+                 draining={"slot": state["active"], "until": time.monotonic()
+                           + processes.DRAIN_SECONDS, "ports": pending["old_ports"]})
+    processes.write(core.paths, state)
+    core.sync_generation()
+
+
+def recover(core):
+    """После перезапуска демона не оставить кандидата и не остановить уже выбранный API-процесс."""
+    with file_lock(core.paths.lock_file):
+        state = processes.reap(core)
+        pending = state["pending"]
+        if not pending:
+            return
+        if pending["phase"] == "aborting":
+            processes.stop(pending["slot"])
+            if processes.stopped(pending["slot"]):
+                state["pending"] = None
+                processes.write(core.paths, state)
+            return
+        if pending["phase"] == "uncertain":
+            actual = json.loads(core.paths.xray_config_file.read_text(encoding="utf-8"))
+            if not core.paths.api_dirty_file.exists() and digest(actual) == pending["xray_sha"]:
+                config = json.loads(processes.config_path(core.paths, pending["slot"]).read_text())
+                _promote(core, state, config)
+            elif not core.paths.api_dirty_file.exists():
+                config = json.loads(processes.config_path(core.paths, pending["slot"]).read_text())
+                if not processes.xray_ports(actual).intersection(processes.ports(config)):
+                    state["pending"]["phase"] = "aborting"
+                    processes.write(core.paths, state)
+            return
+        try:
+            alive = processes.owner_start(pending["owner"]) == pending["owner_start"]
+        except FileNotFoundError:
+            alive = False
+        if not alive:
+            processes.stop(pending["slot"])
+            if processes.stopped(pending["slot"]):
+                state["pending"] = None
+                processes.write(core.paths, state)
+
+
+def legacy(core, applier):
+    """Явный штатный возврат перед откатом ПО: прерывает соединения sing-box, требует согласия."""
+    recover(core)
+    with file_lock(core.paths.lock_file):
+        state = processes.read(core.paths)
+        pending = state["pending"]
+        if pending and pending["phase"] != "uncertain":
+            raise ValueError("подготовка ещё идёт; дождитесь результата перед возвратом")
+        if pending:
+            actual = json.loads(core.paths.xray_config_file.read_text(encoding="utf-8"))
+            if digest(actual) == pending["xray_sha"]:
+                config = json.loads(processes.config_path(core.paths, pending["slot"]).read_text())
+                atomic_write_json(core.paths.singbox_config_file, config)
+                os.chown(core.paths.singbox_config_file, 0,
+                         core.paths.singbox_config_dir.stat().st_gid)
+        for slot in processes.SLOTS:
+            service = SystemdXrayService(processes.unit(slot))
+            if service.is_active():
+                service.stop()
+        original = SystemdXrayService(processes.LEGACY)
+        processes.write(core.paths, {"active": "legacy", "draining": None, "pending": None})
+        original.restart()
+        if core._wait_ready(core.read() or {}) is not None:
+            raise ValueError("обычная служба sing-box не готова")
+        if core.paths.api_dirty_file.exists():
+            error = applier._restart_and_wait()
+            if error:
+                raise ValueError("штатное восстановление Xray не завершено")
+        processes.state_path(core.paths).unlink(missing_ok=True)
+        core.service = original
+
+
+def retire(core):
+    """Xray уже применил конфиг без мостов: дать последним соединениям срок drain."""
+    with file_lock(core.paths.lock_file):
+        state = processes.reap(core)
+        if state["pending"] or state["draining"]:
+            raise ValueError("предыдущее поколение ещё завершается")
+        current = core.read()
+        state["draining"] = {"slot": state["active"], "until": time.monotonic()
+                             + processes.DRAIN_SECONDS, "ports": sorted(processes.ports(current))}
+        state["active"] = "legacy"
+        processes.write(core.paths, state)
+        core.paths.singbox_config_file.unlink(missing_ok=True)

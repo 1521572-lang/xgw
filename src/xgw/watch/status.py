@@ -1028,6 +1028,14 @@ def render_singbox(info: dict, *, pending: bool = False) -> str:
         text = f"работает, серверов через него: {info.get('bridged', 0)}"
     if pending:
         text += "; новый конфиг ждёт окна перезапуска (перечитывание рвёт соединения через него)"
+    generations = info.get("generations") or {}
+    if generations.get("draining"):
+        text += f"; прежнее поколение завершает соединения ({generations.get('drain_left_s', 0)} с)"
+    if generations.get("pending"):
+        phase = {"preparing": "проверяется", "ready": "готово к переключению",
+                 "aborting": "кандидат останавливается",
+                 "uncertain": "нужно восстановление API"}.get(generations["pending"], "не готово")
+        text += "; новое поколение: " + phase
     return f"sing-box{version}: {text}"
 
 

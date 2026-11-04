@@ -119,8 +119,34 @@ class Applier:
 
     # --- внутреннее ------------------------------------------------------------
 
-    def _apply_locked(self, new_config: dict, *, restart_now: bool) -> ApplyOutcome:
+    def _apply_locked(
+        self, new_config: dict, *, restart_now: bool, api_only: bool = False,
+    ) -> ApplyOutcome:
         current = self._read_current()
+        if api_only:
+            if current is None or self.paths.api_dirty_file.exists():
+                return ApplyOutcome("rejected", detail="API не готово к смене поколения")
+            diff = diff_configs(current, new_config)
+            if diff.restart_reasons or diff.plan is None:
+                return ApplyOutcome(
+                    "rejected", detail="смена поколения потребовала бы restart Xray")
+            if current == new_config:
+                return ApplyOutcome("unchanged")
+            self._mark_dirty()  # также crash между первым API-вызовом и promote
+            try:
+                ops = apply_plan(self.api, diff.plan)
+            except ApiError:
+                # Восстановить только затронутые API-объекты. Не перезапускать Xray ради G1.
+                try:
+                    self._restore_api(current, diff.plan)
+                except ApiError:
+                    return ApplyOutcome(
+                        "failed", detail="исход API неизвестен; оба поколения сохранены")
+                self._clear_dirty()
+                return ApplyOutcome("rejected", detail="ошибка API; прежние мосты восстановлены")
+            self._promote(new_config)
+            self._clear_dirty()
+            return ApplyOutcome("api", ops=ops)
         if current is None:
             return self._restart(new_config, reason="первый запуск")
         if current == new_config:
@@ -162,6 +188,20 @@ class Applier:
             ops=reasons,
             detail="ожидание окна " + self.cfg.apply.restart_window,
         )
+
+    def _restore_api(self, current, plan):
+        for kind in ("outbound", "inbound"):
+            before = {entry["tag"]: entry for entry in current.get(kind + "s", [])}
+            touched = {entry["tag"] for entry in getattr(plan, "add_" + kind + "s")}
+            touched.update(entry["tag"] for entry in getattr(plan, "replace_" + kind + "s"))
+            touched.update(getattr(plan, "remove_" + kind + "_tags"))
+            for tag in sorted(touched):
+                with contextlib.suppress(ApiError):
+                    getattr(self.api, "remove_" + kind)(tag)
+                if tag in before:
+                    getattr(self.api, "add_" + kind + "s")([before[tag]])
+        if plan.routing is not None:
+            self.api.replace_routing(current.get("routing", {}))
 
     def _restart(self, config: dict, *, reason: str) -> ApplyOutcome:
         self._promote(config)

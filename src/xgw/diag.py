@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from . import cores, engine, fetch, log, masking, tray
 from . import tailscale as ts
+from .apply import singbox_process as generations
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
 from .generator import builder, validate
 from .generator import singbox as singboxing
@@ -475,7 +476,8 @@ class Diag:
         if not self.root or not self.installed or not self.paths.singbox_config_file.exists():
             return []
         name = "Пользователи ядер"
-        raw = self.runner(["systemctl", "show", SINGBOX_UNIT,
+        active_unit = generations.unit(generations.read(self.paths)["active"])
+        raw = self.runner(["systemctl", "show", active_unit,
                            "--property=User,MainPID"], check=False)
         props = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         pid = props.get("MainPID", "")
@@ -944,6 +946,8 @@ class Diag:
             unit for unit in UNITS
             if unit != SINGBOX_UNIT or self.paths.singbox_config_file.exists()
         ] + ([dnsmasq.UNIT] if self.lan_if else [])
+        units = [generations.unit(generations.read(self.paths)["active"])
+                 if unit == SINGBOX_UNIT else unit for unit in units]
         down = [
             unit for unit in units
             if self.runner(["systemctl", "is-active", unit], check=False).strip() != "active"

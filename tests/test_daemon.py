@@ -105,6 +105,9 @@ class FakeSingbox:
     def read(self):
         return engine.read_json(self.paths.singbox_config_file)
 
+    def sync_generation(self):
+        pass
+
     def expected(self):
         return self.read() is not None
 
@@ -2936,3 +2939,59 @@ def test_fresh_health_is_published_before_optional_work_without_faking_new_obser
     final = daemon.status()["watchdog"]
     assert final["phase"] == "complete" and final["health_observed"] is not None
     assert final["health_observed"] == checkpoints[0]["health_observed"]
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_generation_prepares_in_background_and_only_fresh_result_switches(
+    daemon, monkeypatch, stale,
+):
+    from types import SimpleNamespace
+
+    from xgw.apply import singbox_generation as generations
+
+    _started(daemon)
+    original_assemble = daemon._assemble
+    daemon._build_applied = False
+
+    def assemble(*args, **kwargs):
+        result = original_assemble(*args, **kwargs)
+        result.singbox = engine.SingboxChange(config={"inbounds": []}, reload=True)
+        return result
+
+    monkeypatch.setattr(daemon, "_assemble", assemble)
+    gate, entered = threading.Event(), threading.Event()
+    prepared = SimpleNamespace(xray=engine.read_json(daemon.paths.xray_config_file))
+    switched, aborted = [], []
+    main = threading.get_ident()
+
+    def prepare(*args):
+        assert threading.get_ident() != main
+        entered.set()
+        assert gate.wait(5)
+        return prepared
+
+    monkeypatch.setattr(generations, "needed", lambda *args: True)
+    monkeypatch.setattr(generations, "available", lambda *args: True)
+    monkeypatch.setattr(generations, "prepare", prepare)
+    monkeypatch.setattr(generations, "finish", lambda *args: (
+        switched.append(threading.get_ident()) or ApplyOutcome("api")))
+    monkeypatch.setattr(generations, "abort", lambda *args: aborted.append(True))
+    try:
+        daemon._rebuild(None, urgent=False, reason="generation")
+        if not entered.is_set():
+            daemon._build.done.wait(5)
+            daemon._finish_build()
+        assert entered.wait(2)
+        job = daemon._build
+        daemon.tick()
+        assert daemon.status()["assembly"]["state"] == "building" and not switched
+        job.discard = stale
+        gate.set()
+        assert job.done.wait(5)
+        daemon._finish_build()
+        assert switched == ([] if stale else [main])
+        assert bool(aborted) is stale
+    finally:
+        gate.set()
+        if daemon._build is not None:
+            daemon._build.done.wait(5)

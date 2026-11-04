@@ -11,8 +11,8 @@ TUN), локальные прокси, проверочные входы probe-*
 входу и выходу на профиль (generator/profiles.py): обычный (d), с дроблением TLS (f), с
 мультиплексированием и паддингом (m). Сменить профиль — значит заменить outbound Xray через API
 (другой порт моста): конфиг sing-box не меняется, соединения не рвутся. Проверено на sing-box
-1.14.3: перечитывание конфига (SIGHUP) рвёт ВСЕ его соединения, поэтому оно нужно только когда
-меняется состав серверов, и откладывается, пока через sing-box идёт трафик (engine.assemble).
+1.14.3: перечитывание конфига (SIGHUP) рвёт ВСЕ его соединения. Поэтому новый состав
+проверяется отдельным процессом до переключения мостов Xray (apply/singbox_generation.py).
 
 Мост — без метки: цепочка loopback_guard отклоняет пакеты с меткой mark_bypass к 127.0.0.0/8.
 Основная служба sing-box работает без capabilities: её сокеты обходят перехват по UID.
@@ -179,6 +179,15 @@ def clash_secret(config: Mapping | None) -> str:
     return value if isinstance(value, str) else ""
 
 
+def clash_port(config: Mapping | None, default: int) -> int:
+    try:
+        address = config["experimental"]["clash_api"]["external_controller"]
+        host, port = address.rsplit(":", 1)
+        return int(port) if host == LOCAL and 1024 <= int(port) <= 65535 else default
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return default
+
+
 def bridge_variant(outbound: Mapping) -> str:
     """Буква варианта, если outbound Xray — мост к sing-box; иначе пусто."""
     if outbound.get("protocol") != "socks":
@@ -234,7 +243,8 @@ def build(
     password = bridge_password(previous) or secrets.token_urlsafe(24)
     secret = clash_secret(previous) or secrets.token_urlsafe(24)
     old_ports = bridge_ports(previous)
-    taken = _reserved_ports(cfg) | set(avoid)
+    old_types = {item.get("tag"): item.get("type") for item in (previous or {}).get("inbounds", [])}
+    taken = _reserved_ports(cfg) | set(avoid) | {clash_port(previous, cfg.core.api_port)}
     wanted: list[tuple[str, str]] = []
     bodies: dict[tuple[str, str], tuple[list[dict], bool]] = {}
     for node in chosen:
@@ -267,7 +277,8 @@ def build(
         (endpoints if endpoint else outbounds).append(items[0])
         outbounds.extend(items[1:])
         inbounds.append({
-            "type": "socks", "tag": tag_in(fingerprint, letter), "listen": LOCAL,
+            "type": old_types.get(tag_in(fingerprint, letter), "socks"),
+            "tag": tag_in(fingerprint, letter), "listen": LOCAL,
             "listen_port": ports[key],
             "users": [{"username": f"{BRIDGE_USER}-{letter}", "password": password}],
         })
@@ -290,7 +301,8 @@ def build(
         "outbounds": outbounds,
         "route": {"rules": rules, "default_domain_resolver": "hosts"},
         "experimental": {"clash_api": {
-            "external_controller": f"{LOCAL}:{cfg.core.api_port}", "secret": secret,
+            "external_controller": f"{LOCAL}:{clash_port(previous, cfg.core.api_port)}",
+            "secret": secret,
         }},
     }
     if endpoints:

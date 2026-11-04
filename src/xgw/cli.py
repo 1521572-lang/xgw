@@ -90,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
         "(по умолчанию 10m)",
     )
     subparsers.add_parser("unpin", parents=[common], help="автовыбор: снять ручной выбор сервера")
+    generations = subparsers.add_parser("singbox", parents=[common], help="поколения sing-box")
+    generations.add_argument("operation", choices=("status", "rotate", "legacy", "legacy-ready"))
+    generations.add_argument(
+        "--yes", action="store_true", help="согласиться на возврат обычной службы")
     prio = subparsers.add_parser(
         "priority", parents=[common],
         help="приоритет сервера: high, medium (по умолчанию) или low; в работе — серверы "
@@ -272,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = {
         "generate": _cmd_generate,
         "apply": _cmd_apply,
+        "singbox": _cmd_singbox,
         "status": _cmd_status,
         "servers": _cmd_status,
         "probe": _cmd_probe,
@@ -314,6 +319,51 @@ def _require_xray(paths: Paths) -> Path | None:
 
 
 # --- generate / apply ----------------------------------------------------------
+
+
+def _cmd_singbox(args, cfg, paths, logger):
+    from .apply import singbox_generation as generations
+    from .apply import singbox_process as processes
+    from .xraycore.service import XrayServiceError
+
+    if args.operation == "legacy-ready":
+        return 0 if processes.read(paths)["active"] == "legacy" else 1
+    if not desktop.is_root():
+        return _fail("нужен sudo xgw singbox " + args.operation)
+    if args.operation == "status":
+        print(json.dumps(processes.summary(paths), ensure_ascii=False))
+        return 0
+    core = engine.make_singbox(cfg, paths)
+    binary_path = _require_xray(paths)
+    if binary_path is None:
+        return 1
+    applier = engine.make_applier(cfg, paths, binary_path)
+    try:
+        if args.operation == "legacy":
+            from .install import default_ask
+
+            if not args.yes and not default_ask(
+                "Возврат обычной службы оборвёт соединения sing-box; при повреждённом API "
+                "также перезапустит Xray. Продолжить?",
+            ):
+                return 1
+            generations.legacy(core, applier)
+            print("Обычная служба sing-box восстановлена")
+            return 0
+        current = core.read()
+        routed = engine.read_json(paths.xray_config_file)
+        if current is None or routed is None:
+            return _fail("нет рабочего конфига для смены поколения")
+        prepared = generations.prepare(core, current, routed)
+        outcome = generations.finish(core, applier, prepared)
+        if outcome.mode == "api":
+            _restore_pin(paths, applier.api, logger)
+            print("Поколение sing-box переключено через API; старое завершает соединения")
+            return 0
+        return _fail(outcome.detail)
+    except (ValueError, OSError, cmd.CommandError, XrayServiceError) as exc:
+        logger.warning("смена поколения sing-box не выполнена: %s", exc)
+        return _fail("поколение не переключено; прочитайте xgw singbox status и приватный журнал")
 
 
 def _cmd_generate(args, cfg: config.Config, paths: Paths, logger) -> int:
@@ -493,6 +543,10 @@ def _snapshot(cfg: config.Config, paths: Paths) -> dict | None:
     # Закрепление, перехват и текущий выбор балансировщика — на момент вывода, а
     # не последнего шага демона.
     snapshot["pin"] = _active_pin(paths)
+    from .apply import singbox_process as processes
+
+    with contextlib.suppress(PermissionError):
+        snapshot.setdefault("singbox", {})["generations"] = processes.summary(paths)
     capture = capture_for(cfg, paths)
     if capture.configured:
         written = snapshot.get("capture") or {}
