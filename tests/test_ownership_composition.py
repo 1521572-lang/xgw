@@ -113,3 +113,31 @@ def test_partial_details_survive_operation_exception(helper, tmp_path, monkeypat
     assert helper.DETAILS["unknown_writers"] == 1
     assert helper.DETAILS["registry_receipts"] == 0
     assert helper.DETAILS["target_restored"] is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "F_BODY_RAISE",
+        "F_CHECKER_RAISE",
+        "POSITION_BODY_16",
+        "POSITION_CHECKER_16",
+        "POSITION_BODY_32",
+        "POSITION_CHECKER_32",
+    ],
+)
+def test_operation_fault_positions(helper, tmp_path, case):
+    work = tmp_path / "private"
+    work.mkdir(mode=0o700)
+    helper.run_case(SimpleNamespace(root=tmp_path, work=work), case)
+    assert helper.DETAILS["operation_error_observed"] is True
+    assert helper.DETAILS["registry_receipts"] == 0
+    assert helper.DETAILS["unknown_writers"] == 1
+
+
+def test_unexpected_runtime_is_not_accepted(helper):
+    def operation():
+        raise RuntimeError("unexpected")
+
+    with pytest.raises(RuntimeError, match=r"^unexpected$"):
+        helper.refuse(operation, expected_runtime=True)

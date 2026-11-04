@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 
-NOTES = Path.home() / "xgw-w3an"
+NOTES = Path.home() / "xgw-w3ao"
 AK_SHA = "927128c0486d45eabd7c81a6416e74be9f1e7153ec6f9a0121ac8083177b9e55"
 SUPPORT_SHA = "9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917"
 MANIFEST_SHA = "dee99fd4c4ce43e53f0244a6e09a860e3e20f52bfa633fde14a48a25028604f3"
@@ -226,16 +226,9 @@ FAILURE_CASES = tuple(
     )
 )
 EXPECTED = (
-    HOOK_CASES
-    + ACTOR_CASES
-    + REFERENCE_CASES
-    + CODE_CASES
-    + METHOD_CASES
-    + CONTEXT_CASES
-    + POLICY_CASES
-    + PLAN_CASES
-    + POSITIVE_CASES
-    + FAILURE_CASES
+    "F_CHECKER_RAISE",
+    "F_BODY_RAISE",
+    *(f"POSITION_{phase}_{index:02d}" for phase in ("BODY", "CHECKER") for index in range(1, 33)),
 )
 DETAIL_KEYS = (
     "body_calls",
@@ -255,8 +248,19 @@ DETAIL_KEYS = (
     "plan_used",
     "refused",
     "target_restored",
+    "operation_error_observed",
+    "failure_step",
+    "panel_present",
 )
-BOOL_KEYS = {"build_matched", "files_verified", "plan_used", "refused", "target_restored"}
+BOOL_KEYS = {
+    "build_matched",
+    "files_verified",
+    "plan_used",
+    "refused",
+    "target_restored",
+    "operation_error_observed",
+    "panel_present",
+}
 INT_KEYS = set(DETAIL_KEYS) - BOOL_KEYS - {"phase"}
 PHASES = {
     "NOT_OBSERVED",
@@ -365,6 +369,7 @@ def fixture(f, name):
     sf = M["ownership_surface"]
     f.undo = []
     f.body_calls = f.checker_calls = f.final_calls = 0
+    f.fault_at = 1
     f.trigger = lambda when: None
     f.failure = name if name in FAILURE_CASES else None
     f.noop = name in ("I_NOOP", "I_ROLLBACK", "I_FULL_NOOP", "I_FULL_ROLLBACK")
@@ -443,7 +448,7 @@ def fixture(f, name):
     def change(data):
         f.body_calls += 1
         f.trigger("BODY")
-        if f.failure == "F_BODY_RAISE":
+        if f.failure == "F_BODY_RAISE" and f.body_calls == f.fault_at:
             raise RuntimeError("PRIVATE_FIXTURE")
         if f.failure == "F_BODY_TERMINAL":
             raise SystemExit(9)
@@ -460,7 +465,7 @@ def fixture(f, name):
             return False
         if f.failure == "F_CHECKER_BOOL":
             return 1
-        if f.failure == "F_CHECKER_RAISE":
+        if f.failure == "F_CHECKER_RAISE" and f.checker_calls == f.fault_at:
             raise RuntimeError("PRIVATE_FIXTURE")
         if f.failure == "F_FILE_HASH":
             f.panel.write_bytes(b"PRIVATE_CHANGED")
@@ -476,7 +481,7 @@ def fixture(f, name):
     f.plan = None
 
 
-def refuse(call, terminal=False):
+def refuse(call, terminal=False, expected_runtime=False):
     try:
         call()
     except (M["ownership_hooks"].MutationBlocked, M["ownership"].Refused):
@@ -484,6 +489,14 @@ def refuse(call, terminal=False):
     except SystemExit:
         require(terminal, "UNEXPECTED_TERMINAL")
         DETAILS["refused"] = True
+    except RuntimeError as exc:
+        if (
+            not expected_runtime
+            or type(exc) is not RuntimeError
+            or exc.args != ("PRIVATE_FIXTURE",)
+        ):
+            raise
+        DETAILS["operation_error_observed"] = True
     else:
         raise ValueError("EXPECTED_REFUSAL")
 
@@ -729,7 +742,15 @@ def plan_case(f, name):
 
 
 def run_case(f, name):
+    position = None
+    if name.startswith("POSITION_"):
+        _, phase, index = name.split("_")
+        position = int(index)
+        name = "F_BODY_RAISE" if phase == "BODY" else "F_CHECKER_RAISE"
     fixture(f, name)
+    if position is not None:
+        f.fault_at = position
+        f.steps = f.steps * 32
     try:
         if name in HOOK_CASES + ACTOR_CASES + REFERENCE_CASES + CODE_CASES:
             matrix_case(f, name)
@@ -749,7 +770,11 @@ def run_case(f, name):
             elif name == "F_NESTED":
                 refuse(lambda: f.coordinator.call("PANEL", f.plan.run))
             elif name in FAILURE_CASES:
-                refuse(f.plan.run, terminal=name in ("F_BODY_TERMINAL", "F_FINAL_TERMINAL"))
+                refuse(
+                    f.plan.run,
+                    terminal=name in ("F_BODY_TERMINAL", "F_FINAL_TERMINAL"),
+                    expected_runtime=name in ("F_BODY_RAISE", "F_CHECKER_RAISE"),
+                )
             else:
                 value = f.plan.run()
                 require(value == (not f.noop,) * len(f.steps), "RETURN")
@@ -775,6 +800,8 @@ def run_case(f, name):
             surface_checked=f.gate.last.surface_checked,
             files_verified=f.files.last.verified,
             plan_used=None if f.plan is None else f.plan.used,
+            failure_step=f.fault_at,
+            panel_present=f.panel.exists(),
         )
     if name in CONTEXT_CASES + POLICY_CASES + PLAN_CASES:
         require(
@@ -783,6 +810,18 @@ def run_case(f, name):
         )
     if name in FAILURE_CASES:
         require(summary["receipts"] == 0 and summary["unknown"] == 1, "FAILED_COMPLETED")
+    if name in ("F_BODY_RAISE", "F_CHECKER_RAISE"):
+        body_error = name == "F_BODY_RAISE"
+        require(
+            DETAILS["operation_error_observed"] is True
+            and f.body_calls == f.fault_at
+            and f.checker_calls == f.fault_at - int(body_error)
+            and f.final_calls == 0
+            and summary["writers"] == summary["unknown"] == 1
+            and summary["generation"] == summary["receipts"] == 0
+            and f.panel.exists() is (not body_error or f.fault_at > 1),
+            "FAULT_POSITION_NOT_PROVEN",
+        )
     if name in METHOD_CASES:
         late = name.rsplit("_", 1)[1] not in ("PREPARE", "RUN")
         require(
@@ -923,7 +962,7 @@ def batch():
         "marker": "BOUND_COMPOSITION_BATCH_RECORDED"
         if passed == len(EXPECTED)
         else "BOUND_COMPOSITION_BATCH_PARTIAL",
-        "scope": "EXPLICIT_BUILD_BOUND_ACTORS_AND_PRIVATE_FILES_ONLY",
+        "scope": "OPERATION_FAULT_POSITION_QUALIFICATION_ONLY",
         "expected": len(EXPECTED),
         "completed": len(rows),
         "passed": passed,
@@ -1000,7 +1039,7 @@ def report():
     if selected == "summary.json":
         require(
             "final" not in data
-            and data.get("scope") == "EXPLICIT_BUILD_BOUND_ACTORS_AND_PRIVATE_FILES_ONLY"
+            and data.get("scope") == "OPERATION_FAULT_POSITION_QUALIFICATION_ONLY"
             and data.get("marker")
             in ("BOUND_COMPOSITION_BATCH_RECORDED", "BOUND_COMPOSITION_BATCH_PARTIAL"),
             "REPORT_IDENTITY",
@@ -1014,7 +1053,7 @@ def report():
     require(len(rows) <= len(EXPECTED) and data.get("completed") == len(rows), "REPORT_COUNT")
     manifest = SUPPORT.read(NOTES / "manifest.json")
     lines = [
-        "# Отчёт: XGW wave3an — code-bound writer and FILES composition",
+        "# Отчёт: XGW wave3ao — operation exception qualification",
         "",
         "Автоматические exact данные; таблицу не редактировать. worker_exit_rc=NOT_COLLECTED.",
         "Explicit composition/private FILES; installed runtime не активировался.",
