@@ -9,10 +9,11 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/run/xgw-background-build")
+ROOT = Path("/run/xgw-background-build-2")
 LIB = Path("/opt/xgw/lib/xgw")
 FILES = {
     "daemon.py": (
@@ -26,6 +27,7 @@ FILES = {
 }
 UNIT = "c80a578528b96f7549811f27328902351715a44fa4d859eca605717446aa2b21"
 PHASES = {"готов", "запущен", "наблюдение", "завершён", "возврат", "остановлен"}
+WORKING_STATES = {"HEALTHY", "DEGRADED"}
 STAGE = "чтение команды"
 
 
@@ -71,9 +73,9 @@ def write(path, raw, mode=0o600, uid=0, gid=0):
     os.replace(temporary, path)
 
 
-def save(state):
+def save(state, directory=None):
     state["updated"] = time.time()
-    write(ROOT / "state.json", json.dumps(state, ensure_ascii=False).encode())
+    write((directory or ROOT) / "state.json", json.dumps(state, ensure_ascii=False).encode())
 
 
 def sample():
@@ -107,7 +109,7 @@ def sample():
     finally:
         connection.close()
     return {
-        "healthy": snapshot.get("state") == "HEALTHY", "daemon_active": daemon_active,
+        "state": snapshot.get("state"), "daemon_active": daemon_active,
         "on": capture_for(cfg, paths).effective_mode() == "on", "https": https,
         "signature": signature, "pool": cfg.free_pool.mode,
         "pin": {key: pin.get(key) for key in ("tag", "until", "expires")},
@@ -116,14 +118,15 @@ def sample():
     }
 
 
-def observe():
-    rc, raw = run([sys.executable, "-I", "-B", str(ROOT / "helper.py"), "_sample"])
+def observe(helper=None):
+    rc, raw = run([sys.executable, "-I", "-B", str(helper or ROOT / "helper.py"), "_sample"])
     require(rc == 0)
     return json.loads(raw)
 
 
 def good(current, before):
-    return (all(current.get(key) is True for key in ("healthy", "on", "https", "daemon_active"))
+    return (current.get("state") in WORKING_STATES
+            and all(current.get(key) is True for key in ("on", "https", "daemon_active"))
             and all(current.get(key) == before.get(key)
                     for key in ("signature", "pool", "pin", "pids")))
 
@@ -162,26 +165,33 @@ def prepare(repo):
     require(sha(unit) == UNIT)
     rc, dropins = run(["systemctl", "show", "--value", "-p", "DropInPaths", "xgw.service"])
     require(rc == 0 and not dropins.strip())
-    STAGE = "приватная копия для возврата"
-    ROOT.mkdir(mode=0o700)
-    write(ROOT / "helper.py", regular(Path(__file__).resolve())[0])
-    write(ROOT / "unit.backup", unit)
-    for index, name in enumerate(FILES):
-        write(ROOT / f"old-{index}.py", originals[name])
-        write(ROOT / f"new-{index}.py", replacements[name])
     STAGE = "исходное состояние: дочерняя проверка до 8 с"
-    baseline = observe()
-    for field, label in (("healthy", "HEALTHY"), ("on", "on"), ("https", "HTTPS")):
+    baseline = observe(Path(__file__).resolve())
+    STAGE = "исходное состояние HEALTHY или DEGRADED"
+    require(baseline.get("state") in WORKING_STATES)
+    for field, label in (("on", "on"), ("https", "HTTPS"), ("daemon_active", "служба xgw")):
         STAGE = "исходная проверка " + label
         require(baseline[field] is True)
     STAGE = "свежесть исходного статуса до 120 с"
     require(time.time() - baseline["mtime"] / 1e9 <= 120)
-    save({"phase": "готов", "stage": "подготовка", "before": baseline,
-          "metadata": metadata, "changed": [], "samples": 0, "max_gap_s": 0,
-          "builds": 0, "build_s": None, "apply_s": None, "slow_steps": None,
-          "https_failures": 0, "restored": None, "net_up_rc": None, "result": None,
-          "failed_stage": None, "failure_kind": None,
-          "health": None, "on": None, "https": None, "apply_result": None})
+    STAGE = "приватная копия для возврата"
+    # Каталог готового прогона появляется только после всех проверок и записей.
+    # Неудачная подготовка удаляет только свою временную копию, не старые прогоны.
+    with tempfile.TemporaryDirectory(prefix="xgw-build-prepare-", dir=ROOT.parent) as temporary:
+        directory = Path(temporary)
+        write(directory / "helper.py", regular(Path(__file__).resolve())[0])
+        write(directory / "unit.backup", unit)
+        for index, name in enumerate(FILES):
+            write(directory / f"old-{index}.py", originals[name])
+            write(directory / f"new-{index}.py", replacements[name])
+        save({"phase": "готов", "stage": "подготовка", "before": baseline,
+              "metadata": metadata, "changed": [], "samples": 0, "max_gap_s": 0,
+              "builds": 0, "build_s": None, "apply_s": None, "slow_steps": None,
+              "https_failures": 0, "restored": None, "net_up_rc": None, "result": None,
+              "failed_stage": None, "failure_kind": None,
+              "gateway_state": None, "on": None, "https": None, "apply_result": None,
+              "states": {name: 0 for name in sorted(WORKING_STATES)}}, directory)
+        os.rename(directory, ROOT)
     print("Подготовлено. Установленный XGW не изменён")
 
 
@@ -257,8 +267,10 @@ def worker():
             if current["mtime"] != last_mtime:
                 last, last_mtime = now, current["mtime"]
             state["samples"] += 1
-            state["health"], state["on"], state["https"] = (
-                current["healthy"], current["on"], current["https"])
+            state["gateway_state"], state["on"], state["https"] = (
+                current["state"], current["on"], current["https"])
+            if current["state"] in WORKING_STATES:
+                state["states"][current["state"]] += 1
             state["https_failures"] += int(not current["https"])
             failures = failures + 1 if not good(current, state["before"]) else 0
             require(failures < 2 and gap <= 25)
@@ -338,7 +350,10 @@ def report(wait=False):
         ("Последний этап", state["stage"]), ("Наблюдений", state["samples"]),
         ("Этап неудачи", state["failed_stage"]),
         ("Класс неудачи", state["failure_kind"]),
-        ("Последнее HEALTHY / on / HTTPS", (state["health"], state["on"], state["https"])),
+        ("Последнее состояние демона", state["gateway_state"]),
+        ("Последнее on / HTTPS", (state["on"], state["https"])),
+        ("Наблюдений HEALTHY / DEGRADED",
+         (state["states"]["HEALTHY"], state["states"]["DEGRADED"])),
         ("Наибольший наблюдаемый промежуток статуса, с", state["max_gap_s"]),
         ("Начатых сборок", state["builds"]), ("Последняя сборка, с", state["build_s"]),
         ("Последнее применение, с", state["apply_s"]), ("Шагов от 60 с", state["slow_steps"]),

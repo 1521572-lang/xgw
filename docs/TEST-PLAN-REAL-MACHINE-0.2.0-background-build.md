@@ -1,5 +1,9 @@
 # Сборка конфига в фоне — проверка на рабочем ThinkCentre
 
+Исправление прежнего задания после STOP на HEALTHY. Старые три попытки не повторять.
+Ждать десять минут устойчивого HEALTHY до старта не нужно: DEGRADED допустим при рабочем on и HTTPS.
+Старый /run/xgw-background-build не удалять и не запускать; он остаётся записью прошлой подготовки.
+
 Исполнитель: GLM-5.3-Flash. Только эта машина; отдельного клиента за роутером нет.
 Волна 3 закрыта владельцем без трёх правок. Старые cut/isolation/watch/clarify не выполнять.
 Цель: рабочий on сохраняется, сборка не задерживает шаг демона, статус обновляется до 25 с.
@@ -20,7 +24,7 @@ cd "$HOME/zcod/xgw" && test "$(git branch --show-current)" = freepool && test -z
 ## 2. Проверить помощник
 
 ```bash
-printf '%s  %s\n' 'c5fa81fc08bb8b9c4eb402a9347da89043b70b0f221d60b50a026d200b697fd0' "$HOME/zcod/xgw/docs/helpers/background_build.py" | sha256sum --check --status && printf 'Сумма помощника верна\n'
+printf '%s  %s\n' 'b349026c7d4fa2d67e06df6c0aa42964573524c79110622afc7718b87b93f4cd' "$HOME/zcod/xgw/docs/helpers/background_build.py" | sha256sum --check --status && printf 'Сумма помощника верна\n'
 ```
 Ожидается `Сумма помощника верна`, код 0. Иначе STOP: не править файл и сумму.
 
@@ -31,8 +35,11 @@ sudo -n python3 -I -B "$HOME/zcod/xgw/docs/helpers/background_build.py" prepare 
 ```
 Ожидается `Подготовлено. Установленный XGW не изменён`, код 0.
 Помощник сверяет старые и новые суммы daemon.py и watch/status.py, права, неизменный unit
-xgw.service без drop-in, HEALTHY/on/HTTPS и исходный статус не старше 120 с. Loaded не вызывается.
-Приватные старые/новые файлы, unit и помощник сохраняются в /run/xgw-background-build (0700).
+xgw.service без drop-in, состояние HEALTHY или DEGRADED, on/HTTPS, работающий демон и статус до 120 с.
+Loaded не вызывается. DEGRADED и переходы HEALTHY ↔ DEGRADED не являются отказом.
+Сначала выполняются проверки чтением; затем приватные копии готовятся во временном каталоге.
+Только полностью готовый набор становится /run/xgw-background-build-2 (0700).
+При ошибке временная копия удаляется самим помощником. Старый каталог не читается и не удаляется.
 Исходники, конфиги, службы и правила на этом шаге не меняются.
 Если код 3: STOP; передать точный безопасный этап из сообщения. Prepare не повторять,
 каталог не удалять, другую установленную версию не подгонять под ожидаемые суммы.
@@ -51,7 +58,7 @@ xgw.service. Ядра и сетевые службы штатно не пере�
 ## 5. Запустить один раз
 
 ```bash
-sudo -n python3 -I -B /run/xgw-background-build/helper.py start --owner-approved
+sudo -n python3 -I -B /run/xgw-background-build-2/helper.py start --owner-approved
 ```
 Ожидается `Прогон запущен. Помощник сам завершит проверку или вернёт прежний код`, код 0.
 Он работает отдельным процессом и не зависит от следующей команды модели или связи.
@@ -65,7 +72,7 @@ sudo -n python3 -I -B /run/xgw-background-build/helper.py start --owner-approved
 ## 6. Дождаться наблюдения и один раз обновить подписки
 
 ```bash
-sudo -n python3 -I -B /run/xgw-background-build/helper.py report --wait
+sudo -n python3 -I -B /run/xgw-background-build-2/helper.py report --wait
 ```
 Код 2 и `Прогон продолжается: наблюдение` — открыть уже используемую панель XGW, на вкладке
 подписок один раз нажать существующую кнопку «Обновить». Ожидается «Обновляю подписки…».
@@ -81,7 +88,7 @@ sudo -n python3 -I -B /run/xgw-background-build/helper.py report --wait
 ```bash
 bash <<'BASH'
 for n in $(seq 1 16); do
-  sudo -n python3 -I -B /run/xgw-background-build/helper.py report --wait
+  sudo -n python3 -I -B /run/xgw-background-build-2/helper.py report --wait
   rc=$?
   case "$rc" in 0) exit 0;; 2) continue;; *) exit "$rc";; esac
 done
@@ -93,7 +100,8 @@ BASH
 Код 2 внутри цикла — только продолжающееся наблюдение, не ошибка и не разрешение повторить старт.
 Код 3/пропажа прогресса: STOP, без kill/retry/prepare/старых ТЗ. Сообщить владельцу.
 Если связь пропадала, после возврата разрешено только report; следующая команда не является rescue.
-Помощник проверяет HEALTHY/on/HTTPS, прежние настройки, пул, выбор и процессы ядер;
+Помощник принимает HEALTHY и DEGRADED, включая переходы между ними, проверяет on/HTTPS,
+прежние настройки, пул, выбор и процессы ядер;
 считает промежутки обновления статуса и строки журнала о шагах от 60 с, без публикации журнала.
 Критерии: завершена сборка, шагов от 60 с — 0, промежуток статуса не больше 25 с,
 неудачных HTTPS-проб — 0. Медленная сборка сама по себе не означает медленный шаг.
@@ -102,7 +110,7 @@ BASH
 ## 8. Сохранить и прочитать один отчёт
 
 ```bash
-cd "$HOME/zcod/xgw" && sudo -n python3 -I -B /run/xgw-background-build/helper.py report > "docs/TEST-REPORT-REAL-MACHINE-0.2.0-background-build-$(date +%F).md"
+cd "$HOME/zcod/xgw" && sudo -n python3 -I -B /run/xgw-background-build-2/helper.py report > "docs/TEST-REPORT-REAL-MACHINE-0.2.0-background-build-$(date +%F).md"
 ```
 Ожидается код 0. Если не так, не публиковать пустой файл и не сочинять недостающие наблюдения.
 Дополнить внизу только: проверенный Git commit; согласие владельца да/нет;
