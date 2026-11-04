@@ -867,6 +867,7 @@ class Daemon:
         self._build_last = (0.0, 0.0)
         self._build_outcome: str | None = None
         self._loop_step_s = 0.0
+        self._health_observed: float | None = None
 
     # --- цикл ------------------------------------------------------------------
 
@@ -1357,6 +1358,7 @@ class Daemon:
         reserve = builder.reserve_tag(applied)
         signals, observatory = self._signals(members, now, reserve=bool(reserve))
         signals = self._probe_target(view, applied, signals, now)
+        self._health_observed = time.monotonic()
         at = self._spent("сигналы ядра", at)
         previous = self.machine.state
         decision = self.machine.update(signals)
@@ -1437,6 +1439,9 @@ class Daemon:
             self._write_status(view, observatory, signals.xray_ok)
             return state
 
+        # Новые сигналы и сверка перехвата уже получены. Не задерживаем их
+        # публикацию до конца сканов, замеров и применения готовой сборки.
+        self._write_status(view, observatory, signals.xray_ok, checkpoint=True)
         if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._finish_build()
         if not changed and state is not State.XRAY_DOWN and not self.core_job:
@@ -6205,7 +6210,7 @@ class Daemon:
             self.log.info("%s", text)
 
     def _write_status(
-        self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool
+        self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool, *, checkpoint=False,
     ) -> None:
         self._last_status = (view, observatory, xray_ok)
         state = self.machine.state
@@ -6236,6 +6241,10 @@ class Daemon:
             if self.whitelist_since is not None else None,
             free_pool=self._pool_summary(),
         )
+        snapshot["watchdog"] = {
+            "health_observed": self._health_observed,
+            "phase": "checks" if checkpoint else "complete",
+        }
         job = self._build
         snapshot["assembly"] = {
             "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")

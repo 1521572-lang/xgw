@@ -2,6 +2,7 @@
 """Один конечный прогон обновления двух файлов; сеть штатно не меняет."""
 
 import hashlib
+import hmac
 import http.client
 import json
 import math
@@ -14,14 +15,14 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/run/xgw-watchdog-schedule")
+ROOT = Path("/run/xgw-fresh-status")
 LIB = Path("/opt/xgw/lib/xgw")
 STATUS = Path("/run/xgw/status.json")
 LOOP = Path("/run/xgw/watchdog-step.json")
 FILES = {
     "daemon.py": (
         "3fb8d542c26f2eaafa0710dd19f0e1d715628bf6b212868cb30d009ee1a42989",
-        "e6d2723e8c98d246a2a39e1e610fa232746bb601b7dfec805dbe81d5a5f1d465",
+        "fb20490d5531857a98230b014954196e22c0aba388421dc7504164743ed6a70e",
     ),
     "watch/status.py": (
         "32f04d54b06392e82bd0ff120cfb4f445098560fa8d530f361d9cc1a72a1283a",
@@ -117,6 +118,21 @@ def status_watch(state):
     last_mtime, seen, polled = previous
     poll_gap = now - polled
     state["poll_gap_s"] = max(state["poll_gap_s"], poll_gap)
+    observed = (snapshot.get("watchdog") or {}).get("health_observed")
+    require(type(observed) in (int, float) and math.isfinite(observed) and 0 <= observed <= now)
+    before = state.get("_health_observed")
+    state["_health_observed"] = observed
+    age = now - observed
+    state["health_stale_s"] = max(state["health_stale_s"], age)
+    if age > 25:
+        raise CheckStop("свежие обязательные проверки не опубликованы больше 25 с")
+    if before is not None and observed != before:
+        gap = observed - before
+        require(gap >= 0)
+        state["health_gap_s"] = max(state["health_gap_s"], gap)
+        if gap > 25:
+            raise CheckStop("пропуск чтения свежих проверок" if poll_gap > 1 else
+                            "интервал свежих обязательных проверок больше 25 с")
     if mtime != last_mtime:
         gap = (mtime - last_mtime) / 1e9
         state["_watch"] = [mtime, now, now]
@@ -305,6 +321,7 @@ def prepare(repo):
               "loop_phase": None, "loop_age_s": None, "loop_interval_s": None,
               "loop_previous_s": None, "loop_period_s": None, "loop_sleep_left_s": None,
               "restore_note": None,
+              "health_stale_s": 0, "health_gap_s": 0,
               "states": {name: 0 for name in sorted(WORKING_STATES)}}, directory)
         os.rename(directory, ROOT)
     print("Подготовлено. Установленный XGW не изменён")
@@ -449,6 +466,36 @@ def start(approved):
     print("Прогон запущен. Помощник сам завершит проверку или вернёт прежний код")
 
 
+def request_refresh(port, token):
+    cookie = hmac.new(token.encode("ascii"), b"xgw-panel", hashlib.sha256).hexdigest()
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        connection.request("POST", "/api/refresh", body=b"{}", headers={
+            "Content-Type": "application/json", "X-XGW-Panel": "1",
+            "Origin": f"http://127.0.0.1:{port}", "Cookie": f"xgw_panel={cookie}",
+        })
+        response = connection.getresponse()
+        raw = response.read(4097)
+        require(response.status == 200 and len(raw) <= 4096)
+        payload = json.loads(raw)
+        return type(payload) is dict and payload.get("ok") is True
+    finally:
+        connection.close()
+
+
+def refresh():
+    global STAGE
+    STAGE = "однократное обновление подписок"
+    require(prepared()["phase"] == "наблюдение")
+    fd = os.open(ROOT / "refresh-requested", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)  # Повтор запроса запрещён, в том числе при неизвестном ответе.
+    rc, raw = run([sys.executable, "-I", "-B", str(ROOT / "helper.py"), "_refresh"])
+    ok = rc == 0 and raw.strip() == b"yes"
+    write(ROOT / "refresh.json", json.dumps({"ok": ok}).encode())
+    require(ok)
+    print("Обновление подписок запрошено один раз")
+
+
 def report(wait=False, ready=False):
     deadline = time.monotonic() + (45 if wait or ready else 0)
     state = prepared()
@@ -462,6 +509,13 @@ def report(wait=False, ready=False):
         print("Прогон продолжается: " + state["phase"])
         return 2
     print("# Проверка фоновой сборки конфига\n")
+    refresh_result = "помощником не выполнялось"
+    if (ROOT / "refresh-requested").exists():
+        refresh_result = "ответ неизвестен; повтор запрещён"
+        if (ROOT / "refresh.json").exists():
+            result = read(ROOT / "refresh.json")
+            refresh_result = ("запрос принят" if result.get("ok") is True
+                              else "запрос не подтверждён")
     for label, value in (
         ("Итог", "прошло" if state["result"] else "не прошло"),
         ("Последний этап", state["stage"]), ("Наблюдений", state["samples"]),
@@ -474,6 +528,8 @@ def report(wait=False, ready=False):
         ("Наибольший интервал между прочитанными записями статуса, с", state["max_gap_s"]),
         ("Наибольшее подтверждённое время без изменения статуса, с", state["stale_s"]),
         ("Наибольшая пауза частого чтения статуса, с", state["poll_gap_s"]),
+        ("Наибольший возраст свежих обязательных проверок, с", state["health_stale_s"]),
+        ("Наибольший интервал свежих обязательных проверок, с", state["health_gap_s"]),
         ("Цикл: текущая фаза",
          {"tick": "работа шага", "sleep": "ожидание"}.get(state["loop_phase"])),
         ("Цикл: прошло от начала шага, с", state["loop_age_s"]),
@@ -484,6 +540,7 @@ def report(wait=False, ready=False):
         ("Начатых сборок", state["builds"]), ("Последняя сборка, с", state["build_s"]),
         ("Последнее применение, с", state["apply_s"]), ("Шагов от 60 с", state["slow_steps"]),
         ("Результат применения", state["apply_result"]),
+        ("Обновление подписок через помощник", refresh_result),
         ("Неудачных HTTPS-проб", state["https_failures"]),
         ("Прежний код возвращён и on проверен", state["restored"]),
         ("Проверка возврата", state["restore_note"]),
@@ -509,6 +566,19 @@ def main():
         print(json.dumps(sample()))
     elif command == "_worker":
         worker()
+    elif command == "refresh":
+        refresh()
+    elif command == "_refresh":
+        sys.path.insert(0, "/opt/xgw/lib")
+        from xgw import config
+        from xgw.paths import Paths
+
+        paths = Paths(Path("/"))
+        cfg = config.load(paths.config_file)[0]
+        token = regular(paths.panel_token_file)[0].decode("ascii").strip()
+        require(16 <= len(token) <= 256)
+        require(request_refresh(cfg.panel.port, token))
+        print("yes")
     elif command == "report":
         require(sys.argv[2:] in ([], ["--wait"], ["--ready"]))
         return report(wait=sys.argv[2:] == ["--wait"], ready=sys.argv[2:] == ["--ready"])

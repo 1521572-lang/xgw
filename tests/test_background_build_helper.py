@@ -138,10 +138,11 @@ def test_failed_prepare_copy_cleans_only_its_temporary_directory(tmp_path, monke
 
 def timing_fixture(monkeypatch, *, now, written, polled=0):
     helper = load()
-    state = dict(builds=0, max_gap_s=0, stale_s=0, poll_gap_s=0,
+    state = dict(builds=0, max_gap_s=0, stale_s=0, poll_gap_s=0, health_stale_s=0, health_gap_s=0,
                  _watch=[0, 0, polled])
     snapshot = {"assembly": {"builds": 3, "build_s": 12.5,
-                              "apply_s": 1.2, "outcome": "unchanged"}}
+                              "apply_s": 1.2, "outcome": "unchanged"},
+                "watchdog": {"health_observed": now}}
     monkeypatch.setattr(helper, "read_status", lambda _path: (snapshot, int(written * 1e9)))
     monkeypatch.setattr(helper.time, "monotonic", lambda: now)
     return helper, state
@@ -265,3 +266,52 @@ def test_restore_keeps_working_network_without_code_proof(tmp_path, monkeypatch,
     helper.restore(state)
     assert commands == [] and state["net_up_rc"] is None
     assert state["restored"] is False and "связь исправна" in state["restore_note"]
+
+
+def test_file_rewrites_do_not_hide_stale_mandatory_checks(monkeypatch):
+    helper, state = timing_fixture(monkeypatch, now=26, written=25, polled=25.8)
+    state["_watch"] = [24 * 1_000_000_000, 25, 25.8]
+    reader = helper.read_status
+    def read(path):
+        snapshot, stamp = reader(path)
+        snapshot["watchdog"]["health_observed"] = 0
+        return snapshot, stamp
+    monkeypatch.setattr(helper, "read_status", read)
+    with pytest.raises(helper.CheckStop, match="обязательные проверки"):
+        helper.status_watch(state)
+    assert state["health_stale_s"] == 26
+
+
+@pytest.mark.parametrize("status", [200, 302])
+def test_terminal_refresh_uses_local_action_and_keeps_token_private(monkeypatch, status):
+    helper = load()
+    sent = []
+    class Connection:
+        def __init__(self, host, port, **kwargs):
+            assert (host, port) == ("127.0.0.1", 8781)
+        def request(self, method, path, **kwargs):
+            sent.append((method, path, kwargs))
+        def getresponse(self):
+            return SimpleNamespace(status=status, read=lambda _limit: b'{"ok":true}')
+        def close(self):
+            sent.append("closed")
+    monkeypatch.setattr(helper.http.client, "HTTPConnection", Connection)
+    if status == 200:
+        assert helper.request_refresh(8781, "private-test-token") is True
+    else:
+        with pytest.raises(ValueError):
+            helper.request_refresh(8781, "private-test-token")
+    assert sent[0][0:2] == ("POST", "/api/refresh") and sent[1:] == ["closed"]
+    assert "private-test-token" not in sent[0][2]["headers"]["Cookie"]
+
+
+def test_terminal_refresh_claim_prevents_second_request(tmp_path, monkeypatch):
+    helper = load()
+    monkeypatch.setattr(helper, "ROOT", tmp_path)
+    monkeypatch.setattr(helper, "prepared", lambda: {"phase": "наблюдение"})
+    calls = []
+    monkeypatch.setattr(helper, "run", lambda args: calls.append(args) or (0, b"yes"))
+    helper.refresh()
+    with pytest.raises(FileExistsError):
+        helper.refresh()
+    assert len(calls) == 1 and helper.read(tmp_path / "refresh.json")["ok"] is True

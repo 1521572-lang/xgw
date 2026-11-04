@@ -2925,3 +2925,14 @@ def test_watchdog_schedule_while_building_keeps_short_period(daemon, monkeypatch
     daemon._build_next = object()
     starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [2, 2])
     assert starts == [0, 5] and sleeps == [3, 3]
+
+
+def test_fresh_health_is_published_before_optional_work_without_faking_new_observation(daemon):
+    _started(daemon)
+    checkpoints = []
+    daemon._scan_step = lambda *_args: checkpoints.append(daemon.status()["watchdog"])
+    daemon.tick()
+    assert len(checkpoints) == 1 and checkpoints[0]["phase"] == "checks"
+    final = daemon.status()["watchdog"]
+    assert final["phase"] == "complete" and final["health_observed"] is not None
+    assert final["health_observed"] == checkpoints[0]["health_observed"]
