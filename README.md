@@ -1,5 +1,12 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
+Актуально 04.11.2026: [следующее ТЗ AQ для разработчика](docs/PR-SPEC-WAVE3AQ-READONLY-OBSERVATION-SOURCES.md).
+AP211 принят в simulation/dry scope. AQ задаёт readonly adapters, provenance, scoped
+comparison и подготовку единого пакета Flash. AQ пока SPEC_ONLY/NOT_IMPLEMENTED/NOT_RUN;
+нового READY runner нет. Host collector scope проверяется по конкретному будущему плану,
+не запускается по одному этому ТЗ. Runtime/сеть не изменены;7 gates false, C BLOCKED_BOOTSTRAP.
+Ниже сохранена история; прежние «выполнять AP/AO/AN» не являются текущим заданием.
+
 Обновление04.11.2026: [AP211 принят](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
 211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают
 runtimeквитанции: I3verificationfalse/receipt0/UNKNOWNwriter1. Каталог65требуетвсе7domains/
@@ -32,7 +39,7 @@ All7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP;installedruntime/networkНЕизм�
 AM852 не считается выполненным. Установленный runtime и сеть не менялись.
 
 
-## Текущий статус — AO66 принят, ошибки AN закрыты; AP — ТЗ разработчику (04.11.2026)
+## История перед приёмкой AP — AO66 принят, ошибки AN закрыты (04.11.2026)
 
 [Разбор AO](docs/REVIEW-REAL-MACHINE-0.2.0-wave3ao.md):66/66,exactprefix byteequal,
 два ANfixtures repaired+BODY/CHECKER positions1–32. All66writerUNKNOWN1/receipt0/

@@ -1,5 +1,9 @@
 # ADR AP: описание ресурсов, симуляция и dry-run подготовки запуска
 
+Следующий этап: [ТЗ AQ](PR-SPEC-WAVE3AQ-READONLY-OBSERVATION-SOURCES.md), пока SPEC_ONLY.
+Отдельные readonly sources/provenance не ослабляют simulation trust boundary AP.
+Нового готового Flash runner или разрешения host collection это ADR не даёт.
+
 Обновление04.11.2026: [AP211 принят](REVIEW-REAL-MACHINE-0.2.0-wave3ap.md).
 211/211/summary/byteexactprefix;C91/P20/A14/B17/T65/I4. Данныесимуляции не создают
 runtimeквитанции: I3verificationfalse/receipt0/UNKNOWNwriter1. Каталог65требуетвсе7domains/
