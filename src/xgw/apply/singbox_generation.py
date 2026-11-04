@@ -102,6 +102,12 @@ def prepare(core, config, xray):
         old = core.read()
         if old is None:
             raise ValueError("нет исходного поколения sing-box")
+        # Параллельные WireGuard peers с тем же ключом могут перетянуть endpoint друг у друга.
+        # Отказ до старта: даже проверка кандидата не должна мешать текущему туннелю.
+        if any(body.get("endpoints") or any(o.get("type") == "wireguard"
+               for o in body.get("outbounds", [])) for body in (old, config)):
+            raise ValueError(
+                "параллельная смена WireGuard не поддерживается; прежний туннель сохранён")
         previous_xray = json.loads(core.paths.xray_config_file.read_text(encoding="utf-8"))
         candidate, routed = remap(core, config, xray, old)
         diff = diff_configs(previous_xray, routed)

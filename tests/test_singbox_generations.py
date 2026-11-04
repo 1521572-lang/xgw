@@ -192,6 +192,21 @@ def test_candidate_cannot_require_xray_restart(gateway):
     assert w.alive == {p.LEGACY} and not w.api.calls
 
 
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_identity_bound_endpoint_is_refused_before_launch(gateway, side):
+    w = gateway
+    config = copy.deepcopy(w.old)
+    if side == "old":
+        w.old["endpoints"] = [{"type": "wireguard", "private_key": "fake"}]
+        atomic_write_json(w.paths.singbox_config_file, w.old)
+    else:
+        config["endpoints"] = [{"type": "wireguard", "private_key": "fake"}]
+    with pytest.raises(ValueError, match="WireGuard"):
+        g.prepare(w.core, config, w.xray)
+    assert w.alive == {p.LEGACY} and not w.api.calls
+    assert p.read(w.paths)["pending"] is None
+
+
 def test_ready_process_dies_before_api_old_remains(gateway):
     w = gateway
     prepared = g.prepare(w.core, w.old, w.xray)
