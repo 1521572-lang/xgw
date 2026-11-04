@@ -265,13 +265,16 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, reserve=None, profiles=None, reload_singbox=None):
+    def _assemble(self, prefer, reserve=None, profiles=None, reload_singbox=None, *, snapshot=None):
+        cfg, inventory, scores, failed = snapshot if snapshot is not None else (
+            self.cfg, self.inventory, self._scores_now(), self._singbox_failed,
+        )
         return engine.assemble(
-            self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
-            xray_bin=None, check=False, prefer=prefer, scores=self._scores_now(),
+            cfg, self.paths, inventory, mark=None, logger=self.log,
+            xray_bin=None, check=False, prefer=prefer, scores=scores,
             reserve=reserve,
             profiles=profiles, reload_singbox=reload_singbox,
-            singbox_ok=self.singbox_ok and not self._singbox_failed,
+            singbox_ok=self.singbox_ok and not failed,
         )
 
     def _apply(self, config, *, urgent, singbox=None):
@@ -2655,3 +2658,210 @@ def test_scans_are_stretched_to_fit_the_daily_limit():
     assert budget.scan_minutes == minutes and budget.total <= 1024 * status.MB
     cfg.probe.max_daily_probe_mb = 100  # одни пробы ядра больше лимита
     assert status.scan_minutes(cfg, 5, 300, 10, size, checks) == status.MAX_SCAN_MINUTES
+
+
+# --- сборка конфига в фоне: только изменённый путь, без живой сети -----------------
+
+
+def _blocked_build(daemon):
+    daemon._build_applied = False
+    gate = threading.Event()
+    entered = threading.Event()
+    original = daemon._assemble
+    calls = []
+
+    def assemble(*args, **kwargs):
+        calls.append(threading.get_ident())
+        entered.set()
+        assert gate.wait(5)
+        return original(*args, **kwargs)
+
+    daemon._assemble = assemble
+    return gate, entered, calls
+
+
+def test_background_build_keeps_status_and_applies_in_main(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    before = engine.read_json(daemon.paths.xray_config_file)
+    main = threading.get_ident()
+    applied_in = []
+    original = daemon._apply
+    daemon._apply = lambda *a, **kw: applied_in.append(threading.get_ident()) or original(*a, **kw)
+    callbacks = []
+    try:
+        started = time.monotonic()
+        assert not daemon._rebuild(
+            None, urgent=False, reason="test",
+            complete={"test": lambda changed: callbacks.append(threading.get_ident())},
+        )
+        assert entered.wait(1) and time.monotonic() - started < 1
+        job = daemon._build
+        for _ in range(2):
+            daemon.tick()
+            assert daemon.status()["assembly"]["state"] == "building"
+            assert engine.read_json(daemon.paths.xray_config_file) == before
+        assert calls != [main] and not applied_in and not callbacks
+        gate.set()
+        assert job.done.wait(5)
+        daemon.tick()
+        assert applied_in == callbacks == [main]
+        assert daemon.status()["assembly"]["state"] == "idle"
+        assert daemon.status()["assembly"]["outcome"] == "unchanged"
+        assert daemon.status()["assembly"]["builds"] == 2  # первый запуск и фоновая сборка
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+@pytest.mark.parametrize("change", ["config", "inventory", "file"])
+def test_background_build_discards_stale_inputs(daemon, change):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        if change == "config":
+            daemon.cfg.filters.max_members = 1
+        elif change == "inventory":
+            daemon.inventory.nodes.pop()
+        else:
+            atomic_write_json(daemon.paths.devices_down_file, {})
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build()
+        assert daemon._build_discarded == 1 and daemon.applied == []
+        fresh = daemon._build
+        assert fresh is not None and fresh is not job and fresh.done.wait(5)
+        daemon._finish_build()
+        assert len(calls) == 2
+        assert len(daemon.tags("proxy")) == (1 if change == "config" else 2)
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+def test_background_build_coalesces_and_keeps_latest_request(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    done = []
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        first = daemon._build
+        daemon._rebuild(None, urgent=False, reason="same")
+        assert daemon._build is first and daemon._build_next is None
+        prefer = [node.fingerprint for node in daemon.inventory.nodes[-2:]]
+        daemon._rebuild(prefer, urgent=True, reason="new",
+                        complete={"new": lambda changed: done.append(threading.get_ident())})
+        assert daemon._build is first and first.discard and len(calls) == 1
+        gate.set()
+        assert first.done.wait(5)
+        daemon._finish_build()
+        assert daemon._build.done.wait(5)
+        daemon._finish_build()
+        assert len(calls) == 2 and done == [threading.get_ident()]
+        assert {info.fingerprint for info in builder.applied_nodes(
+            engine.read_json(daemon.paths.xray_config_file), daemon.inventory.nodes)
+            if info.role == "proxy"} == set(prefer)
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+def test_background_build_stop_does_not_apply(daemon):
+    _started(daemon)
+    gate, entered, _ = _blocked_build(daemon)
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        daemon._stop.set()
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build() and daemon.applied == []
+    finally:
+        gate.set()
+        daemon._stop.clear()
+
+
+def test_background_build_adopt_waits_for_old_worker(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    second = None
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        second = _second(daemon, lambda cfg: setattr(cfg.filters, "max_members", 1))
+        assert second._build is job and job.discard
+        second.tick()
+        assert second._build is job and len(calls) == 1
+        gate.set()
+        assert job.done.wait(5)
+        second.tick()
+        if second._build is not None:
+            assert second._build.done.wait(5)
+            second.tick()
+        assert second._build_discarded == 1
+        assert len(second.tags("proxy")) == 1 and daemon.applied == []
+    finally:
+        gate.set()
+        if second:
+            if second._build:
+                second._build.done.wait(5)
+            second.store.close()
+
+
+def test_background_build_error_keeps_working_config(daemon):
+    _started(daemon)
+    daemon._build_applied = False
+    before = engine.read_json(daemon.paths.xray_config_file)
+    def fail(*args, **kwargs):
+        raise engine.EngineError("test failure")
+    daemon._assemble = fail
+    assert not daemon._rebuild(None, urgent=False, reason="test")
+    assert daemon._build is None and daemon.applied == []
+    assert engine.read_json(daemon.paths.xray_config_file) == before
+
+
+def test_background_build_cli_once_waits(daemon):
+    _started(daemon)
+    daemon._build_applied = False
+    daemon.refresh_wait = None
+    completed = threading.Event()
+    original = daemon._assemble
+    def delayed(*args, **kwargs):
+        time.sleep(0.15)
+        result = original(*args, **kwargs)
+        completed.set()
+        return result
+    daemon._assemble = delayed
+    daemon._rebuild(None, urgent=False, reason="test")
+    assert completed.is_set() and daemon._build is None
+
+
+def test_background_build_manual_choice_cancels_old_rotation(daemon):
+    _started(daemon)
+    gate, entered, _ = _blocked_build(daemon)
+    try:
+        prefer = [node.fingerprint for node in daemon.inventory.nodes[-2:]]
+        daemon._rebuild(prefer, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        daemon._save_pin({"tag": daemon.tags("proxy")[0], "until": None, "since": daemon.wall()})
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build() and daemon.applied == []
+        assert daemon._build.request.prefer is None
+        assert daemon._build.done.wait(5)
+        daemon._finish_build()
+        assert daemon._manual_pin()["tag"] == daemon.tags("proxy")[0]
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)

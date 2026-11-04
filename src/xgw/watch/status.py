@@ -1098,6 +1098,10 @@ def render_status(status: dict) -> str:
         lines.append(f"Состояние: {status['state']}{tail} — {status.get('action') or 'ничего'}")
     else:
         lines.append("Состояние: демон XGW не запущен — показаны разовые данные")
+    assembly = status.get("assembly") or {}
+    if assembly.get("state") in ("building", "ready", "queued"):
+        lines.append("Конфиг: собирается в фоне; текущий продолжает работать "
+                     f"({assembly.get('elapsed_s', 0):g} с)")
     lines.append(render_xray(status.get("xray") or {}))
     singbox_line = render_singbox(
         status.get("singbox") or {}, pending=bool(status.get("singbox_pending")),

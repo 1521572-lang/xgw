@@ -134,6 +134,7 @@ SUBSCRIPTION_ALERT_AFTER = 3600.0
 # замечал упавших серверов. Шаг, начавший опрос, ждёт его не дольше REFRESH_WAIT: быстрый
 # опрос (файл, кэш) применяется в том же шаге, долгий — первым шагом после его конца.
 REFRESH_WAIT = 2.0
+BUILD_WAIT = 0.1  # быстрый конфиг применится сразу; долгий не задерживает watchdog
 # Основной сервер (_main_step). С сервера, ушедшего в отказ, основной уходит сразу, и
 # снова основным он не берётся MAIN_COOLDOWN, пока есть другие живые участники.
 MAIN_COOLDOWN = 1800.0
@@ -477,6 +478,38 @@ class _Fetch:
     inventory: engine.Inventory | None = None
     error: Exception | None = None
     spent: float = 0.0  # секунд на опрос
+
+
+@dataclasses.dataclass
+class _BuildRequest:
+    prefer: list[str] | None
+    urgent: bool
+    reason: str
+    reserve: str | None = None
+    profiles: dict[str, str] = dataclasses.field(default_factory=dict)
+    callbacks: dict = dataclasses.field(default_factory=dict)
+
+    def key(self) -> tuple:
+        return (tuple(self.prefer) if self.prefer is not None else None,
+                self.urgent, self.reserve, tuple(sorted(self.profiles.items())))
+
+
+@dataclasses.dataclass
+class _Build:
+    request: _BuildRequest
+    cfg: Config
+    inventory: engine.Inventory
+    inputs: tuple
+    stamp: tuple
+    reload: bool | None
+    wake: threading.Event
+    dead: frozenset
+    began: float = dataclasses.field(default_factory=time.monotonic)
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    assembly: engine.Assembly | None = None
+    error: Exception | None = None
+    spent: float = 0.0
+    discard: bool = False
 
 
 class Daemon:
@@ -826,6 +859,13 @@ class Daemon:
         # (`xgw run --once`: шаг один, применить итог позже некому).
         self.refresh_wait: float | None = REFRESH_WAIT
         self._rebuild_asked = False
+        self._build: _Build | None = None
+        self._build_next: _BuildRequest | None = None
+        self._build_applied = False
+        self._build_discarded = 0
+        self._build_count = 0
+        self._build_last = (0.0, 0.0)
+        self._build_outcome: str | None = None
 
     # --- цикл ------------------------------------------------------------------
 
@@ -847,6 +887,8 @@ class Daemon:
                 self.log.warning("шаг watchdog занял %d с — состояние обновлено с опозданием (%s)",
                                  spent, self._tick_work())
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
+            if self._build is not None or self._build_next is not None:
+                pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:
                 pause = MANUAL_SCAN_PAUSE
             self._sleep(stop, changed, jitter(pause))
@@ -1034,6 +1076,13 @@ class Daemon:
         прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
         прежних отменяется."""
         self._resume(previous)
+        if previous._build is not None:
+            # Поток не трогаем и второй параллельно не запускаем. Старый результат
+            # отбросим; настройкам нового экземпляра нужен собственный снимок.
+            self._build = previous._build
+            self._build.discard = True
+            self._build.wake = self.poke
+            previous._build = None
         same = engine.sources_key(previous.cfg) == engine.sources_key(self.cfg)
         if previous._fetch is not None and same:
             self._fetch = previous._fetch
@@ -1253,6 +1302,7 @@ class Daemon:
         now = self.clock()
         self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
         self._tick_spent = {}
+        self._build_applied = False
         at = time.monotonic()
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
@@ -1362,6 +1412,8 @@ class Daemon:
             self._write_status(view, observatory, signals.xray_ok)
             return state
 
+        if not changed and state is not State.XRAY_DOWN and not self.core_job:
+            changed = self._finish_build()
         if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._singbox_step(now)
         if (
@@ -2278,42 +2330,163 @@ class Daemon:
         changed = self._rebuild(None, urgent=job.urgent or urgent, reason="обновление подписки")
         # Отчёты youtube3 и audit6: шаг с обновлением подписки длится 80–110 с — где именно время.
         # Опрос с 0.2.0 — в фоне, вне шага; сборка и применение — в шаге.
-        assembled, applied = self._rebuild_spent
-        self.log.info("обновление подписки: опрос %.0f с, сборка %.0f с, применение %.0f с",
-                      job.spent, assembled, applied)
+        self.log.info("обновление подписки: опрос %.0f с; сборка запрошена отдельно", job.spent)
         return changed
+
+    def _assembly_stamp(self) -> tuple:
+        """Версии входных файлов и допуска к трафику, не счётчиков и рейтинга."""
+        files = (self.paths.config_file, managed.path_for(self.paths.config_file),
+                 self.paths.xray_config_file, self.paths.singbox_config_file,
+                 self.paths.devices_down_file, self.paths.var / "probe-fallback.json",
+                 self.xray_bin, singboxing.find_binary(None, self.paths))
+        def version(path):
+            if path is None:
+                return None
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                return None
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        applied = engine.read_json(self.paths.xray_config_file)
+        members = {info.fingerprint for info in builder.applied_pool(applied)}
+        pool = ()
+        if traffic.pool_active(self.cfg):
+            admitted = traffic.admitted(self.cfg, self.paths, self.wall(), members=members)
+            pool = tuple(sorted(item.node.fingerprint for item in admitted))
+        pin = self._manual_pin()
+        choice = tuple(pin.get(key) for key in ("tag", "until", "since", "down")) if pin else ()
+        return (tuple(version(path) for path in files), self._singbox_failed,
+                self._singbox_window(),
+                tuple(sorted(engine._carrying_tags(self.paths, applied))), pool, choice)
 
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
         reserve: str | None = None, profiles: dict[str, str] | None = None,
+        complete=None,
     ) -> bool:
+        """Запрос сборки: один поток и один объединённый следующий запрос.
+
+        Только готовый, ещё актуальный результат применяется в шаге демона.
+        Быстрая сборка укладывается в BUILD_WAIT. Без рабочего конфига/при --once
+        первый запуск ждёт результат, как прежде; рабочий watchdog этого не делает.
+        """
         assert self.inventory is not None
         if self.stopping:
-            # Остановка пришла, пока шёл опрос подписок или сканы: новое применение не
-            # начинаем — прерывать его на середине нельзя, а ждать его systemd не обязан.
-            self.log.info("%s: не применяется — демон останавливается", reason)
             return False
-        dead = engine.quarantined()
-        # Перечитывание sing-box рвёт соединения через него: сразу — при аварии и в окне
-        # перезапуска, иначе — только если через него никто не идёт (engine.assemble).
-        reload = True if urgent or self._singbox_window() else None
+        request = _BuildRequest(copy.deepcopy(prefer), urgent, reason, reserve,
+                                dict(profiles or {}))
+        request.callbacks.update(complete or {})
+        job = self._build
+        base = self._build_next
+        if (base is None and job is not None
+                and job.cfg is self.cfg and job.inventory is self.inventory):
+            base = job.request
+        if base is not None:
+            callbacks = dict(base.callbacks)
+            for key, callback in request.callbacks.items():
+                callbacks.pop(key, None)
+                callbacks[key] = callback
+            request = _BuildRequest(
+                request.prefer if request.prefer is not None else base.prefer,
+                base.urgent or request.urgent, reason,
+                request.reserve if request.reserve is not None else base.reserve,
+                {**base.profiles, **request.profiles}, callbacks,
+            )
+        if job is not None:
+            if not job.discard and request.key() == job.request.key():
+                job.request.callbacks = request.callbacks
+                return False
+            self._build_next = request
+            job.discard = True
+            return False
+        if self._build_applied:
+            self._build_next = request
+            self.poke.set()
+            return False
+        self._build_next = None
+        job = self._start_build(request)
+        wait = (None if self.refresh_wait is None or not self.paths.xray_config_file.exists()
+                else BUILD_WAIT)
+        job.done.wait(wait)
+        return self._finish_build()
+
+    def _start_build(self, request: _BuildRequest) -> _Build:
+        assert self.inventory is not None and self._build is None
+        # Поток не получает соединение SQLite шага и не читает изменяемые поля Daemon.
+        # Рейтинг — последний опубликованный снимок; при его отсутствии engine читает
+        # сохранённый рейтинг собственным соединением.
+        inputs = (copy.deepcopy(self.cfg), copy.deepcopy(self.inventory),
+                  self._scores_now(), self._singbox_failed)
+        reload = True if request.urgent or self._singbox_window() else None
+        job = self._build = _Build(request, self.cfg, self.inventory, inputs,
+                                   self._assembly_stamp(), reload, self.poke, engine.quarantined())
+        self.log.info("сборка конфига начата — идёт в фоне, шаги демона не ждут")
+        self._build_count += 1
+        def work():
+            try:
+                job.assembly = self._assemble(request.prefer, request.reserve, request.profiles,
+                                              reload, snapshot=inputs)
+            except Exception as exc:
+                job.error = exc
+            finally:
+                job.spent = time.monotonic() - job.began
+                job.done.set()
+                job.wake.set()
+        threading.Thread(target=work, name="xgw-config-build", daemon=True).start()
+        return job
+
+    def _finish_build(self) -> bool:
+        """Вызывается только шагом: проверка актуальности, применение, учёт и продолжения."""
+        if self.stopping or self._build_applied:
+            return False
+        job = self._build
+        if job is None:
+            if self._build_next is not None and self.inventory is not None:
+                request, self._build_next = self._build_next, None
+                self._start_build(request)
+            return False
+        if not job.done.is_set():
+            return False
+        self._build = None
+        if engine.quarantined() != job.dead and self.inventory is not None:
+            self._save_inventory(self.inventory)
+        stamp = self._assembly_stamp()
+        current = (job.cfg is self.cfg and job.inventory is self.inventory
+                   and job.inputs[0] == self.cfg and job.inputs[1] == self.inventory
+                   and job.stamp == stamp)
+        if job.discard or not current:
+            self._build_discarded += 1
+            self.log.info("устаревшая сборка конфига отброшена без применения")
+            if self._build_next is None and not job.discard:
+                # Файл поменялся без нового запроса: пересобрать, а не применить старое.
+                self._build_next = (job.request if job.stamp[-1] == stamp[-1] else
+                                    _BuildRequest(None, job.request.urgent, "изменён ручной выбор"))
+            if self._build_next is not None and self.inventory is not None:
+                request, self._build_next = self._build_next, None
+                self._start_build(request)
+            return False
+        if job.error is not None:
+            if isinstance(job.error, engine.EngineError):
+                self.notifier.event("config", f"{job.request.reason}: {job.error}", notify=True)
+                return False
+            raise job.error
+        assembly = job.assembly
+        assert assembly is not None
         began = time.monotonic()
-        try:
-            assembly = self._assemble(prefer, reserve, profiles, reload)
-        except engine.EngineError as exc:
-            self.notifier.event("config", f"{reason}: {exc}", notify=True)
-            return False
-        finally:
-            if engine.quarantined() != dead:
-                # Сборка отложила домены, которых нет в DNS. Список для панели записан до
-                # неё — иначе там такой сервер значился бы «включён, сейчас возьмёт в работу».
-                self._save_inventory(self.inventory)
-        assembled = time.monotonic()
-        outcome = self._apply(assembly.result.config, urgent=urgent, singbox=assembly.singbox)
-        self._rebuild_spent = (assembled - began, time.monotonic() - assembled)
+        outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
+                              singbox=assembly.singbox)
+        self._rebuild_spent = (job.spent, time.monotonic() - began)
+        self._build_last = self._rebuild_spent
+        self._build_outcome = outcome.mode
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)
-        return self._report(outcome, reason)
+        changed = self._report(outcome, job.request.reason)
+        self._build_applied = True
+        for callback in job.request.callbacks.values():
+            callback(changed)
+        self.log.info("конфиг собран в фоне за %.1f с, применён в шаге за %.1f с",
+                      *self._rebuild_spent)
+        return changed
 
     def _report(self, outcome: ApplyOutcome, reason: str) -> bool:
         """Событие по итогу применения; True — рабочий конфиг изменился."""
@@ -2368,14 +2541,18 @@ class Daemon:
     def _assemble(
         self, prefer: list[str] | None, reserve: str | None = None,
         profiles: dict[str, str] | None = None, reload_singbox: bool | None = None,
+        *, snapshot: tuple | None = None,
     ) -> engine.Assembly:
         assert self.inventory is not None
+        cfg, inventory, scores, failed = snapshot if snapshot is not None else (
+            self.cfg, self.inventory, self._scores_now(), self._singbox_failed,
+        )
         return engine.assemble(
-            self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
-            xray_bin=self.xray_bin, prefer=prefer, scores=self._scores_now(),
+            cfg, self.paths, inventory, mark=self.mark, logger=self.log,
+            xray_bin=self.xray_bin, prefer=prefer, scores=scores,
             reserve=reserve,
             profiles=profiles, reload_singbox=reload_singbox,
-            singbox_ok=False if self._singbox_failed else None,
+            singbox_ok=False if failed else None,
         )
 
     def _apply(
@@ -3827,37 +4004,39 @@ class Daemon:
         }
         if not changes:
             return False
-        names = ", ".join(sorted(by_fingerprint[key].tag for key in wanted))
         # Проба дробления у участника — сразу: он не отвечает, и трафик ждёт (через API ядра,
         # без перезапуска Xray).
         urgent = any(wish.escalate for wish in wanted.values())
-        changed = self._rebuild(
-            None, urgent=urgent, reason=f"профиль обхода ({names})", profiles=changes,
+        def complete(changed, wanted):
+            applied = engine.read_json(self.paths.xray_config_file)
+            now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
+            now = self.wall()
+            for key, wish in wanted.items():
+                if now_profiles.get(key) != wish.profile:
+                    # Не применилось: решение примет следующий скан. Сервер, который так и остался
+                    # на пробном профиле, снова на пробе (_resume_trials) — запись о ней в базе.
+                    continue
+                self._profile_switched[key] = now
+                if wish.trial:
+                    info = by_fingerprint[key]
+                    self._profile_trial[key] = ProfileTrial(
+                        wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
+                        wish.verdict, wish.escalate,
+                    )
+                    self._trial_saved[key] = {
+                        "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
+                        "recheck": wish.recheck, "verdict": wish.verdict, "escalate": wish.escalate,
+                    }
+                    self._queue_first(info.probe_tag)
+                else:
+                    self._trial_saved.pop(key, None)  # возврат применён — проба окончена
+            self._save_profiles()
+
+        return self._rebuild(
+            None, urgent=urgent, reason="профиль обхода", profiles=changes,
+            complete={key: lambda changed, key=key: complete(changed, {key: wanted[key]})
+                      for key in wanted},
         )
-        applied = engine.read_json(self.paths.xray_config_file)
-        now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
-        now = self.wall()
-        for key, wish in wanted.items():
-            if now_profiles.get(key) != wish.profile:
-                # Не применилось: решение примет следующий скан. Сервер, который так и остался
-                # на пробном профиле, снова на пробе (_resume_trials) — запись о ней в базе.
-                continue
-            self._profile_switched[key] = now
-            if wish.trial:
-                info = by_fingerprint[key]
-                self._profile_trial[key] = ProfileTrial(
-                    wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
-                    wish.verdict, wish.escalate,
-                )
-                self._trial_saved[key] = {
-                    "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
-                    "recheck": wish.recheck, "verdict": wish.verdict, "escalate": wish.escalate,
-                }
-                self._queue_first(info.probe_tag)
-            else:
-                self._trial_saved.pop(key, None)  # возврат применён — проба окончена
-        self._save_profiles()
-        return changed
 
     # --- эскалация у серверов в работе (ТЗ R1) -------------------------------------
 
@@ -5284,11 +5463,15 @@ class Daemon:
             f"встаёт в работу вместо «{dropped}» и станет основным",
         )
         prefer = preferred_members(members, Rotation(replacements=[(drop.tag, node)]))
-        if self._rebuild(prefer, urgent=False, reason="перевод запасного в работу"):
+        def complete(changed):
+            if not changed:
+                return
             self._promoted = {
                 "key": node.fingerprint, "name": node.name, "since": self.wall(),
                 "was": current.name or current.tag,
             }
+        self._rebuild(prefer, urgent=False, reason="перевод запасного в работу",
+                      complete={"promotion": complete})
 
     def _weakness(self, info: NodeInfo, observatory: dict) -> tuple:
         """Кого из участников выводить первым: мёртвого, потом с наименьшим рейтингом."""
@@ -6028,6 +6211,16 @@ class Daemon:
             if self.whitelist_since is not None else None,
             free_pool=self._pool_summary(),
         )
+        job = self._build
+        snapshot["assembly"] = {
+            "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")
+            if job is not None else "queued" if self._build_next is not None else "idle",
+            "elapsed_s": round(time.monotonic() - job.began, 1) if job else 0,
+            "builds": self._build_count, "discarded": self._build_discarded,
+            "build_s": round(self._build_last[0], 3),
+            "apply_s": round(self._build_last[1], 3),
+            "outcome": self._build_outcome,
+        }
         spent = json.dumps(self.guard.spent, sort_keys=True)
         if spent != self.store.get_meta(speedguard.META_SPENT):
             self.store.set_meta(speedguard.META_SPENT, spent)
