@@ -1,27 +1,27 @@
 # ADR REC-C / D-fake: один пакет адаптеров, диагностики и process independence
 
-## Текущий статус — AK435/437, два helper fixes; единый AL756 (04.11.2026)
+## Текущий статус — AL756 принят, AK fixtures закрыты; AM852 готов (04.11.2026)
 
-[AKreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3ak-2026-11-04.md):435/437,
-A225/225 B50/50 C144/146 D16/16. [Разбор](REVIEW-REAL-MACHINE-0.2.0-wave3ak.md).
-Exactpublicprefix равен pinnedformatter; batch65475ms/casesum47693ms/413sreportinterval.
-H_DEFAULT/H_DEFAULT_CODE TypeError ДОmutation, ошибочно выбран среднийwrapper.
-Productsource НЕсломанэтимиfixtures. ВесьAKHOLD,435casesпринятытолькоscoped.
-HEALTHY_ON/poolOFF/linkALIVE/versionssame/NNP0/sudo0/start-monitor-show-report0/owneractions0.
-Actualoverallshape_rcNOT_COLLECTED; show0не checker0. WorkerexitNOT_COLLECTED.
+[ALreport](TEST-REPORT-REAL-MACHINE-0.2.0-wave3al-2026-11-04.md):756/756,
+обаAKfixturedefects закрыты4actualrepairrows/depth2/targetrestoredtrue/old+fresh65true.
+[Разбор](REVIEW-REAL-MACHINE-0.2.0-wave3al.md). Exactprefix равен pinnedformatter,
+batch82981ms/casesum46686ms/660sreportinterval. 378PREFLIGHTsource+unitstrue1каждый.
+HEALTHY_ON/poolOFF/linkALIVE/versionssame/NNP0/sudo0/start-monitor-show-shape-report0/
+owneractions0. WorkerexitNOT_COLLECTED. AKoriginal435/437непереименованв437PASS.
 
-[AL756](TEST-PLAN-REAL-MACHINE-0.2.0-wave3al.md) исправляетобаtargets и квалифицирует
-306declareddefaults/innercode/closure slots наdirectcatalog+preflight, одинstart/report.
-[PR-spec](PR-SPEC-WAVE3AL-DEFAULTS-REPAIR.md). 17narrowtests/RuffPASS; realALNOT_RUN.
-Baseline→mutationrefusal→restore→fresh; incomplete restore/globalbaseline→STOP,
-ordinaryindependentFAIL→continue. Show/shapeactualrc разделены15полямиfooter.
+[AM852](TEST-PLAN-REAL-MACHINE-0.2.0-wave3am.md):новыйexplicitcomposition связывает
+codeboundRegistry/preflight+9actors/50hooks+namedFILES под однимticket, checkpoints
+доadmit/внутри/междуsteps/передипослеFILES. [ADR](ADR-REC-C-EXPLICIT-COMPOSITION.md).
+One start/partial/one report;22narrowtests/RuffPASS, realAM852NOT_RUN.
 
-Source121/pin11A11M/packaging8/config/pyproject/59oldstandfiles UNCHANGEDсtestedAK,
-новый productpatch НЕнужен. Installedruntime не обновлялся. Oldbatchesнеповторять.
-Metadatafixtures неbusinessbody/networkproof/deepclosure/globalgraph; all7gatesfalse.
-LiveCBLOCKED_BOOTSTRAP; independentoriginalon/code/unitrescue ДОinstall/fault.
-OnlyThinkCentre/workingLAN/HEALTHY/on/LANclientнет, nooff/install/WAN/LAN/TS/pool/config/
-services/live rules. Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
+Новыйтолькоownership_composition.py/source122/pin12A11M;121старыхsource/units/config/
+pyproject/61oldstandfiles неизменны. Installedruntimeнеобновлён. Nonelegacyunfenced,
+mandatorydaemon/CLI/startupgraph/domainverifiers/boot/pathaliases/repair/bootstrapнеwired.
+FILESнеnetworkproof. MethodcleanupfailureможетоставитьLIVE1UNKNOWN0/noreceipt:
+смотретьwriter_total,неidle/retry. Все7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP.
+Independentoriginalon/code/unitrescue ДОinstall/fault;OnlyThinkCentre/LANclientнет/
+workingLAN/HEALTHY/on. Nooff/install/WAN/LAN/TS/pool/config/services/live rules.
+Fullwave3/45s/LAN/performance/DAE gates прежние. Ниже история.
 
 
 

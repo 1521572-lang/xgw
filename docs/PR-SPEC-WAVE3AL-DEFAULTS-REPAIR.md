@@ -1,5 +1,10 @@
 # PR-spec AL: закончить две AK проверки и квалифицировать полную цепочку метаданных
 
+Обновление04.11.2026: [AL756 принят](REVIEW-REAL-MACHINE-0.2.0-wave3al.md), обаAKfixturedefects
+закрыты actualrepairrows. OriginalAK435/437 не изменён. Ниже история доactualAL.
+Следующий [AM852](TEST-PLAN-REAL-MACHINE-0.2.0-wave3am.md), runtimegatesfalse.
+
+
 Статус04.11.2026: реализация тестового пакета готова, realAL756 NOT_RUN.
 [AK435/437 разобран](REVIEW-REAL-MACHINE-0.2.0-wave3ak.md).
 [ТЗ Flash](TEST-PLAN-REAL-MACHINE-0.2.0-wave3al.md).

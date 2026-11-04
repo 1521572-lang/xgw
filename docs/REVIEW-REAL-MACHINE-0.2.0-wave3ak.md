@@ -1,5 +1,10 @@
 # Разбор AK:435/437; две ошибки тестового сборщика, полный пакет пока HOLD
 
+Обновление04.11.2026: [AL756 принят](REVIEW-REAL-MACHINE-0.2.0-wave3al.md), обаAKfixturedefects
+закрыты actualrepairrows. OriginalAK435/437 не изменён. Ниже история доactualAL.
+Следующий [AM852](TEST-PLAN-REAL-MACHINE-0.2.0-wave3am.md), runtimegatesfalse.
+
+
 [Оригинальный отчёт AK](https://github.com/1521572-lang/xgw/blob/625ac2a043a0003a6f36d1d42f997df1d5f6375c/docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3ak-2026-11-04.md#L1)
 получен fast-forward; добавился только report. Tested69adb641768cf501de67f9d787708b90691dcec9,
 tree730e351d133f8c6f4496a5af71a76784a2613f3b/source121/packaging8/surfaces65.
