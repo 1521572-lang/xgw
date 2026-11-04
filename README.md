@@ -1,5 +1,11 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
+Обновление04.11.2026: AM остановился до первого case, публикация была корректно запрещена.
+[Разбор AM](docs/REVIEW-REAL-MACHINE-0.2.0-wave3am.md). Исправлен loader, добавлен emptycheckpoint.
+Выполнять [AN852](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3an.md); realAN NOT_RUN.
+AM852 не считается выполненным. Установленный runtime и сеть не менялись.
+
+
 ## Текущий статус — AL756 принят, AK fixtures закрыты; AM852 готов (04.11.2026)
 
 [ALreport](docs/TEST-REPORT-REAL-MACHINE-0.2.0-wave3al-2026-11-04.md):756/756,

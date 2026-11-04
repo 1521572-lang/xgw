@@ -1,5 +1,11 @@
 # ADR: explicit build-bound composition и проверка FILES
 
+Обновление04.11.2026: AM остановился до первого case, публикация была корректно запрещена.
+[Разбор AM](REVIEW-REAL-MACHINE-0.2.0-wave3am.md). Исправлен loader, добавлен emptycheckpoint.
+Выполнять [AN852](TEST-PLAN-REAL-MACHINE-0.2.0-wave3an.md); realAN NOT_RUN.
+AM852 не считается выполненным. Установленный runtime и сеть не менялись.
+
+
 Статус04.11.2026: source candidate готов, realAM852 NOT_RUN.
 [AL756 принят](REVIEW-REAL-MACHINE-0.2.0-wave3al.md). [ТЗ AM](TEST-PLAN-REAL-MACHINE-0.2.0-wave3am.md).
 

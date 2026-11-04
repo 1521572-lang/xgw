@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from types import FunctionType, SimpleNamespace
 
-NOTES = Path.home() / "xgw-w3am"
+NOTES = Path.home() / "xgw-w3an"
 AK_SHA = "927128c0486d45eabd7c81a6416e74be9f1e7153ec6f9a0121ac8083177b9e55"
 SUPPORT_SHA = "9a03913dd77b11366573e3e6e8f7a90424b5fbc282ae88ddd4eed265752d5917"
 MANIFEST_SHA = "dee99fd4c4ce43e53f0244a6e09a860e3e20f52bfa633fde14a48a25028604f3"
@@ -311,6 +311,7 @@ def source():
     global M
     AK.source()
     M = AK.M
+    M["ownership_binding"] = importlib.import_module("frozen_ad.ownership_binding")
     M["ownership_composition"] = importlib.import_module("frozen_ad.ownership_composition")
     require(tuple(M["ownership_binding"].FUNCTIONS) == HOOKS, "HOOK_INVENTORY")
     cm = M["ownership_composition"]
@@ -849,6 +850,7 @@ def batch():
     global DETAILS
     SUPPORT.create(NOTES / "worker-claimed.json", {"claimed": True})
     os.umask(0o077)
+    SUPPORT.atomic("progress.json", {"final": False, "completed": 0, "cases": []})
     source_count = SUPPORT.verify_source()
     source()
     cases = NOTES / "cases"
@@ -1012,7 +1014,7 @@ def report():
     require(len(rows) <= len(EXPECTED) and data.get("completed") == len(rows), "REPORT_COUNT")
     manifest = SUPPORT.read(NOTES / "manifest.json")
     lines = [
-        "# Отчёт: XGW wave3am — code-bound writer and FILES composition",
+        "# Отчёт: XGW wave3an — code-bound writer and FILES composition",
         "",
         "Автоматические exact данные; таблицу не редактировать. worker_exit_rc=NOT_COLLECTED.",
         "Explicit composition/private FILES; installed runtime не активировался.",
