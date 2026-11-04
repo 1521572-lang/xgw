@@ -1,5 +1,18 @@
 # ТЗ разработчику AP: контракты ресурсов и dry-run подготовки запуска
 
+Обновление04.11.2026: AP-1…4 реализованы в source-only candidate, реальный AP NOT_RUN.
+Готов единый [TEST-PLAN AP211](TEST-PLAN-REAL-MACHINE-0.2.0-wave3ap.md),
+[API contract](API-CONTRACT-WAVE3AP.md), [65 exact resource anchors](RESOURCE-TABLE-WAVE3AP.md),
+[ADR/trust boundary](ADR-REC-C-AP-RESOURCE-CONTRACTS.md).
+Новые2sourceмодуля,124source/pin14A11M;122старыхsource/units/config/pyproject/
+старыеhelpersunchanged. 16narrowresource-tests+2real frozenloader/checkpoint tests PASS,
+Ruff/syntax/hash/schema-checks PASS. Full211/ThinkCentreNOT_RUN, oldbatchesнеповторять.
+КонсервативныйcatalogueUNKNOWN/all7required;actualcollectors/provenanceNOT_IMPLEMENTED.
+SimulationMATCH/dryREADY_FOR_REVIEW не runtimepermission; facadeVerificationUNKNOWN.
+All7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP;installedruntime/networkНЕизменены.
+Ниже сохранено исходное описание/история до этой реализации.
+
+
 Статус 04.11.2026: задание на реализацию, НЕ готовый тестовый пакет Flash.
 База: f75fdc8803f3a2e24f1ee90b3f8d27c1aaa7d1af, ветка freepool.
 Приёмка AO66 завершена. Код продукта на этой базе —122 Python-файла, pin351:

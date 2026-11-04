@@ -1,5 +1,18 @@
 # XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов
 
+Обновление04.11.2026: AP-1…4 реализованы в source-only candidate, реальный AP NOT_RUN.
+Готов единый [TEST-PLAN AP211](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3ap.md),
+[API contract](docs/API-CONTRACT-WAVE3AP.md), [65 exact resource anchors](docs/RESOURCE-TABLE-WAVE3AP.md),
+[ADR/trust boundary](docs/ADR-REC-C-AP-RESOURCE-CONTRACTS.md).
+Новые2sourceмодуля,124source/pin14A11M;122старыхsource/units/config/pyproject/
+старыеhelpersunchanged. 16narrowresource-tests+2real frozenloader/checkpoint tests PASS,
+Ruff/syntax/hash/schema-checks PASS. Full211/ThinkCentreNOT_RUN, oldbatchesнеповторять.
+КонсервативныйcatalogueUNKNOWN/all7required;actualcollectors/provenanceNOT_IMPLEMENTED.
+SimulationMATCH/dryREADY_FOR_REVIEW не runtimepermission; facadeVerificationUNKNOWN.
+All7runtimegatesfalse/LiveCBLOCKED_BOOTSTRAP;installedruntime/networkНЕизменены.
+Ниже сохранено исходное описание/история до этой реализации.
+
+
 Обновление04.11.2026: AN850/852, загрузчик отработал. Два expectedRuntimeError fixtures
 исправлены, productruntime неизменён. [Разбор AN](docs/REVIEW-REAL-MACHINE-0.2.0-wave3an.md).
 Выполнять [AO66](docs/TEST-PLAN-REAL-MACHINE-0.2.0-wave3ao.md), неAN/850повторов. RealAO NOT_RUN.
