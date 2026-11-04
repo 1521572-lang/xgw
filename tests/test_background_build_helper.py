@@ -1,6 +1,8 @@
 """Узкая проверка возврата двух файлов. Никаких команд машины."""
 
 import importlib.util
+import json
+import logging
 import os
 import sys
 import time
@@ -322,3 +324,56 @@ def test_terminal_refresh_claim_prevents_second_request(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         helper.refresh()
     assert len(calls) == 1 and helper.read(tmp_path / "refresh.json")["ok"] is True
+
+
+@pytest.mark.parametrize("journal", [False, True])
+@pytest.mark.parametrize("seconds", [59, 60, 90])
+def test_slow_steps_match_actual_application_formatter(journal, seconds):
+    from xgw.log import _FORMAT, MaskingFormatter
+
+    helper = load()
+    body = f"шаг watchdog занял {seconds} с — состояние обновлено с опозданием (скан)"
+    record = logging.LogRecord("xgw.daemon", logging.WARNING, "", 0, body, (), None)
+    message = MaskingFormatter(_FORMAT, journal=journal).format(record)
+    assert helper.count_slow_steps([message]) == int(seconds >= 60)
+
+
+def test_slow_steps_accept_bare_body_and_ignore_unrelated_text():
+    helper = load()
+    body = "шаг watchdog занял 60 с — состояние обновлено с опозданием (скан)"
+    assert helper.count_slow_steps([body, "скан: " + body, None, 1]) == 1
+
+
+@pytest.mark.parametrize("slow", [0, 1])
+def test_recount_reads_only_completed_interval(tmp_path, monkeypatch, capsys, slow):
+    helper = load()
+    monkeypatch.setattr(helper, "ROOT", tmp_path)
+    (tmp_path / "helper.py").write_bytes(b"old helper")
+    monkeypatch.setattr(helper, "ACCEPTED_HELPER_SHA", helper.sha(b"old helper"))
+    monkeypatch.setattr(helper, "prepared", lambda: dict(
+        phase="завершён", result=True, started=1000, updated=1601))
+    messages = ["2026-11-04 22:00:00,001 INFO xgw.daemon: демон XGW запущен, шаг watchdog 20 с"]
+    if slow:
+        messages.append("2026-11-04 22:01:00,001 WARNING xgw.daemon: "
+                        "шаг watchdog занял 60 с — состояние обновлено с опозданием (скан)")
+    calls = []
+    def run(args, **_kwargs):
+        calls.append(args)
+        return 0, b"\n".join(json.dumps({"MESSAGE": m}).encode() for m in messages)
+    monkeypatch.setattr(helper, "run", run)
+    assert helper.recount() == 0
+    assert len(calls) == 1 and calls[0][0] == "journalctl"
+    assert "@1000.000000" in calls[0] and "@1601.000000" in calls[0]
+    assert f"с учётом формата журнала: {slow}" in capsys.readouterr().out
+
+
+def test_recount_does_not_claim_zero_when_start_of_interval_is_missing(tmp_path, monkeypatch):
+    helper = load()
+    monkeypatch.setattr(helper, "ROOT", tmp_path)
+    (tmp_path / "helper.py").write_bytes(b"old helper")
+    monkeypatch.setattr(helper, "ACCEPTED_HELPER_SHA", helper.sha(b"old helper"))
+    monkeypatch.setattr(helper, "prepared", lambda: dict(
+        phase="завершён", result=True, started=1000, updated=1601))
+    monkeypatch.setattr(helper, "run", lambda *a, **kw: (0, b'{"MESSAGE":"unrelated"}'))
+    with pytest.raises(ValueError):
+        helper.recount()

@@ -7,6 +7,7 @@ import http.client
 import json
 import math
 import os
+import re
 import ssl
 import stat
 import subprocess
@@ -33,6 +34,7 @@ UNIT = "c80a578528b96f7549811f27328902351715a44fa4d859eca605717446aa2b21"
 PHASES = {"готов", "запущен", "наблюдение", "завершён", "возврат", "остановлен"}
 WORKING_STATES = {"HEALTHY", "DEGRADED"}
 STAGE = "чтение команды"
+ACCEPTED_HELPER_SHA = "06a68feb66274fdc7d5828141edabed9f41111285e92aae04e1ccd9a8ed95c39"
 
 
 class CheckStop(Exception):
@@ -42,6 +44,24 @@ class CheckStop(Exception):
 def require(ok):
     if not ok:
         raise ValueError("проверка")
+
+
+def log_body(message):
+    if not isinstance(message, str):
+        return ""
+    message = re.sub(r"^<[0-7]>", "", message)
+    return re.sub(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} "
+                  r"(?:DEBUG|INFO|WARNING|ERROR|CRITICAL) xgw[\w.-]*: ", "", message, count=1)
+
+
+def count_slow_steps(messages):
+    count = 0
+    for message in messages:
+        match = re.match(r"шаг watchdog занял (\d+) с — состояние обновлено с опозданием",
+                         log_body(message))
+        if match and int(match[1]) >= 60:
+            count += 1
+    return count
 
 
 def run(args, timeout=8, watch=None):
@@ -412,8 +432,7 @@ def worker():
                        "--no-pager", "-o", "json"], timeout=10)
         require(rc == 0)
         messages = [json.loads(line).get("MESSAGE", "") for line in raw.splitlines()]
-        state["slow_steps"] = sum(isinstance(m, str) and m.startswith("шаг watchdog занял ")
-                                  for m in messages)
+        state["slow_steps"] = count_slow_steps(messages)
         current = observe()
         require(good(current, state["before"]) and state["slow_steps"] == 0
                 and state["builds"] > 0 and state["build_s"] is not None
@@ -551,6 +570,37 @@ def report(wait=False, ready=False):
     return 0
 
 
+def recount():
+    global STAGE
+    STAGE = "пересчёт журнала завершённого прогона"
+    require(sha(regular(ROOT / "helper.py")[0]) == ACCEPTED_HELPER_SHA)
+    state = prepared()
+    require(state["phase"] == "завершён" and state["result"] is True)
+    began, ended = state["started"], state["updated"]
+    require(all(type(value) in (int, float) and math.isfinite(value) for value in (began, ended)))
+    require(0 <= began <= ended and ended - began >= 600)
+    rc, raw = run(["journalctl", "-u", "xgw.service", "--since", f"@{began:.6f}",
+                   "--until", f"@{ended:.6f}", "--no-pager", "-o", "json"], timeout=10)
+    require(rc == 0)
+    rows = [json.loads(line) for line in raw.splitlines()]
+    require(rows and all(type(row) is dict for row in rows))
+    messages = [row.get("MESSAGE", "") for row in rows]
+    starts = sum(log_body(message).startswith("демон XGW запущен, шаг watchdog ")
+                 for message in messages)
+    require(starts >= 1)  # Нет начала окна в журнале — не выдумываем ноль.
+    slow = count_slow_steps(messages)
+    print("# Пересчёт долгих шагов завершённого прогона\n")
+    print("- Исходный отчёт: 261808dd347baa81dac0fa4d5201804c7110d219")
+    print(f"- Длительность окна чтения, с: {ended - began:.3f}")
+    print(f"- Записей службы: {len(rows)}")
+    print(f"- Запусков демона в окне: {starts}")
+    print(f"- Шагов от 60 с с учётом формата журнала: {slow}")
+    print("- Критерий: " + ("подтверждён" if slow == 0 else "не пройден"))
+    print("\nТолько чтение прежнего интервала. Установка, перезапуск, обновление подписок, "
+          "сетевые действия и повтор наблюдения не выполнялись.\nСбор данных: завершён")
+    return 0
+
+
 def main():
     require(os.geteuid() == 0)
     command = sys.argv[1]
@@ -564,6 +614,8 @@ def main():
         worker()
     elif command == "refresh":
         refresh()
+    elif command == "recount":
+        return recount()
     elif command == "_refresh":
         sys.path.insert(0, "/opt/xgw/lib")
         from xgw import config
