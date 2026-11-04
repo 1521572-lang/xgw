@@ -1,10 +1,14 @@
 # Закрытие волны 3 на ThinkCentre
 
+После STOP на шаге 4 выполняется только [однократное уточнение](TEST-PLAN-REAL-MACHINE-0.2.0-wave3-close-readonly.md).
+Не повторять prepare или baseline в уже созданном каталоге. Следующие шаги пока остановлены.
+Для нового запуска помощник теперь сохраняет шесть отдельных результатов baseline.
+
 Исполнитель — GLM-5.3-Flash, обычный терминал владельца. Прочитать всё до начала.
 Шлюз работает: XGW → Wi-Fi-роутер → устройства. On сохраняем. Установку не выполнять.
 WAN, LAN, Tailscale, пул и ручной выбор сервера не менять. Версия остаётся 0.2.0.
 REC-C удалён и сохранён в archive/rec-c. Его прежние задания больше не выполнять.
-Помощник — только `docs/helpers/wave3_close.py`, SHA-256: `d8ad2ad139d5f398ee4cd750a54a066ae3e9cbe25d4fd970aaf0581982e4e31f`.
+Помощник — только `docs/helpers/wave3_close.py`, SHA-256: `65af212bf4c4501876842b165d708abfca075ee8b4242766cb79caaf0d0a22f3`.
 Весь прогон занимает около 15 минут. Только IPv4 TCP с самого шлюза; не проверка LAN/UDP/IPv6.
 
 ## 1. Обновить чистый клон
@@ -20,7 +24,7 @@ cd "$HOME/zcod/xgw" && test "$(git branch --show-current)" = freepool && test -z
 
 ```bash
 printf '%s  %s
-' 'd8ad2ad139d5f398ee4cd750a54a066ae3e9cbe25d4fd970aaf0581982e4e31f' "$HOME/zcod/xgw/docs/helpers/wave3_close.py" | sha256sum --check --status && printf 'Сумма помощника верна
+' '65af212bf4c4501876842b165d708abfca075ee8b4242766cb79caaf0d0a22f3' "$HOME/zcod/xgw/docs/helpers/wave3_close.py" | sha256sum --check --status && printf 'Сумма помощника верна
 '
 ```
 Ожидается `Сумма помощника верна`, код 0. Иначе STOP; файл на машине не исправлять.

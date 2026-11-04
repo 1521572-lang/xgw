@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,3 +158,143 @@ def test_no_raw_identity_in_report(helper, tmp_path, monkeypatch, capsys):
     helper.report()
     out = capsys.readouterr().out
     assert "private-" not in out and "NOT_RUN" in out and len(out.splitlines()) <= 18
+
+
+def fake_baseline(helper, tmp_path, monkeypatch):
+    monkeypatch.setattr(helper, "ROOT", tmp_path)
+    monkeypatch.setattr(helper, "ACTIVE", tmp_path / "active.json")
+    initial = {"cuts": {k: {"result": "не выполнялось", "rescue": False} for k in helper.KINDS}}
+    helper.save(initial)
+    calls = []
+
+    def context(*, checks=None):
+        calls.append("context")
+        checks.update(health=True, on=True)
+        return None, SimpleNamespace(), None, ("private-config", "off", "private-pin"), True
+
+    monkeypatch.setattr(helper, "context", context)
+    monkeypatch.setattr(
+        helper, "loaded_detail", lambda: calls.append("loaded") or (True, "правила соответствуют")
+    )
+    monkeypatch.setattr(helper, "guard", lambda: calls.append("guard") or snapshot(9))
+    monkeypatch.setattr(helper, "https_detail", lambda: calls.append("https") or (True, "HTTP 200"))
+    monkeypatch.setattr(helper, "permissions", lambda paths: calls.append("permissions") and None)
+    monkeypatch.setattr(helper, "recover_window", lambda *args: pytest.fail("network mutation"))
+    monkeypatch.setattr(
+        helper.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("worker started")
+    )
+    return initial, calls
+
+
+def test_clarification_records_failures_and_continues_independent_reads(
+    helper, tmp_path, monkeypatch, capsys
+):
+    initial, calls = fake_baseline(helper, tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        helper, "loaded_detail", lambda: calls.append("loaded") or (None, "таймаут loaded (8 с)")
+    )
+
+    def guard():
+        calls.append("guard")
+        raise helper.CheckFailed("hook или приоритет host-цепочки не совпали")
+
+    def permissions(paths):
+        calls.append("permissions")
+        raise PermissionError("private-server.example")
+
+    monkeypatch.setattr(helper, "guard", guard)
+    monkeypatch.setattr(helper, "permissions", permissions)
+    monkeypatch.setattr(
+        helper, "https_detail", lambda: calls.append("https") or (False, "HTTP 403")
+    )
+    assert helper.baseline(clarification=True) == 3
+    state = helper.read(tmp_path / "state.json")
+    assert calls == ["context", "loaded", "guard", "https", "permissions"]
+    assert state["clarification"]["completed"] is True
+    assert state["clarification"]["checks"]["loaded"]["passed"] is None
+    assert state["clarification"]["checks"]["guard"]["passed"] is False
+    assert state["cuts"] == initial["cuts"] and state.get("baseline") is not True
+    assert "identity" not in state and not helper.ACTIVE.exists()
+    text = capsys.readouterr().out
+    assert "таймаут loaded" in text and "HTTP 403" in text and "private-" not in text
+    assert "Изоляция sing-box: 0" not in text and len(text.splitlines()) <= 15
+    with pytest.raises(RuntimeError):
+        helper.baseline(clarification=True)
+    assert len(calls) == 5
+
+
+def test_all_green_clarification_never_authorizes_old_cut(helper, tmp_path, monkeypatch):
+    initial, _ = fake_baseline(helper, tmp_path, monkeypatch)
+    frozen = tmp_path / "helper.py"
+    frozen.write_bytes(b"old frozen helper")
+    assert helper.baseline(clarification=True) == 0
+    state = helper.read(tmp_path / "state.json")
+    assert state.get("baseline") is not True and "identity" not in state
+    assert state["cuts"] == initial["cuts"] and frozen.read_bytes() == b"old frozen helper"
+    with pytest.raises(RuntimeError):
+        helper.launch("output")
+
+
+def test_normal_baseline_keeps_failed_check_instead_of_claiming_not_run(
+    helper, tmp_path, monkeypatch, capsys
+):
+    fake_baseline(helper, tmp_path, monkeypatch)
+    monkeypatch.setattr(helper, "https_detail", lambda: (False, "HTTP 403"))
+    assert helper.baseline() == 3
+    state = helper.read(tmp_path / "state.json")
+    assert state["baseline"] is False and state["baseline_checks"]["completed"] is True
+    out = capsys.readouterr().out
+    assert "HTTPS: не пройдено; HTTP 403" in out and "Изоляция sing-box: не выполнялась" in out
+
+
+@pytest.mark.parametrize(
+    "mode,value,detail",
+    (
+        ("true", True, "правила соответствуют"),
+        ("false", False, "правила не соответствуют"),
+        ("unknown", None, "неизвестный результат"),
+        ("timeout", None, "таймаут loaded"),
+        ("oserror", None, "не удалось запустить"),
+        ("rc3", None, "кодом 3"),
+        ("private-server.example", None, "не распознан ответ"),
+    ),
+)
+def test_loaded_details_keep_timeout_false_unknown_separate(
+    helper, monkeypatch, mode, value, detail
+):
+    def run(argv, **kwargs):
+        assert argv[-1] == "_loaded_result" and kwargs["timeout"] == 8
+        if mode == "timeout":
+            raise helper.subprocess.TimeoutExpired("private-command", 8)
+        if mode == "oserror":
+            raise OSError("private-path")
+        return SimpleNamespace(returncode=3 if mode == "rc3" else 0, stdout=mode.encode())
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    result, text = helper.loaded_detail()
+    assert result is value and detail in text and "private-" not in text
+
+
+@pytest.mark.parametrize(
+    "error,value,detail",
+    (
+        (None, False, "HTTP 403"),
+        (TimeoutError("private-host"), None, "таймаут HTTPS"),
+    ),
+)
+def test_https_failure_has_only_safe_details(helper, monkeypatch, error, value, detail):
+    class Connection:
+        def request(self, *args):
+            if error:
+                raise error
+
+        def getresponse(self):
+            return SimpleNamespace(status=403)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(helper.ssl, "create_default_context", object)
+    monkeypatch.setattr(helper.http.client, "HTTPSConnection", lambda *args, **kwargs: Connection())
+    result, text = helper.https_detail()
+    assert result is value and detail in text and "private-" not in text

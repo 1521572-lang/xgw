@@ -23,6 +23,23 @@ TARGET = ("1.1.1.1", 443)
 KINDS = {"output": "цепочка output", "table": "таблица ip xgw", "rule": "правило pref 100"}
 LIMITS = {"output": 10, "table": 10, "rule": 40}
 USER = "xgw-singbox"
+CHECK_LABELS = {
+    "health": "Состояние HEALTHY",
+    "on": "Перехват on",
+    "loaded": "Соответствие правил (loaded)",
+    "guard": "Барьер POSTROUTING и счётчики",
+    "https": "HTTPS",
+    "permissions": "Права sing-box и конфигов",
+}
+
+
+class CheckFailed(RuntimeError):
+    """Only locally authored labels; never an exception text from a command."""
+
+
+def checked(ok, label):
+    if not ok:
+        raise CheckFailed(label)
 
 
 def require(ok):
@@ -77,7 +94,7 @@ def app():
     return cfg, paths, capture_for(cfg, paths)
 
 
-def context():
+def context(*, checks=None):
     cfg, paths, capture = app()
     status = read(paths.status_file)
     pin = status.get("pin") or {}
@@ -88,19 +105,24 @@ def context():
     if panel.exists():
         digest += hashlib.sha256(panel.read_bytes()).hexdigest()
     mode = cfg.free_pool.mode
+    health = status.get("state") == "HEALTHY"
+    on = capture.effective_mode() == "on"
+    if checks is not None:
+        checks.update(health=health, on=on)
     return (
         cfg,
         paths,
         capture,
         (digest, mode, json.dumps(private, sort_keys=True)),
-        (status.get("state") == "HEALTHY" and capture.effective_mode() == "on"),
+        health and on,
     )
 
 
 def guard(raw=None):
     if raw is None:
         rc, raw, _ = command(["nft", "-j", "-a", "list", "table", "inet", "xgw_guard"])
-        require(rc == 0)
+        checked(rc is not None, "запрос барьера не завершился")
+        checked(rc == 0, "запрос барьера вернул ошибку")
     require(len(raw) <= 65536)
     data = json.loads(raw)
     table = hook = None
@@ -129,7 +151,9 @@ def guard(raw=None):
             ]:
                 require(terminal is None)
                 terminal = key
-    require(type(table) is int and hook is True and counts and terminal in counts)
+    checked(type(table) is int, "не распознан идентификатор таблицы барьера")
+    checked(hook is True, "hook или приоритет host-цепочки не совпали")
+    checked(bool(counts) and terminal in counts, "конечный счётчик drop не распознан")
     return table, counts, terminal
 
 
@@ -152,17 +176,28 @@ def tcp():
         return "ошибка"
 
 
-def https():
+def https_detail():
     conn = http.client.HTTPSConnection(
         TARGET[0], TARGET[1], timeout=5, context=ssl.create_default_context()
     )
     try:
         conn.request("HEAD", "/")
-        return 200 <= conn.getresponse().status < 400
+        code = conn.getresponse().status
+        return 200 <= code < 400, f"HTTP {code}"
+    except ssl.SSLCertVerificationError:
+        return False, "проверка сертификата не прошла"
+    except ssl.SSLError:
+        return False, "ошибка TLS"
+    except TimeoutError:
+        return None, "таймаут HTTPS (5 с)"
     except (OSError, http.client.HTTPException):
-        return False
+        return False, "ошибка соединения или HTTP"
     finally:
         conn.close()
+
+
+def https():
+    return https_detail()[0] is True
 
 
 def permissions(paths):
@@ -172,33 +207,41 @@ def permissions(paths):
         (paths.singbox_config_file, grp.getgrnam(USER).gr_gid),
     ):
         info = path.lstat()
-        require(
+        checked(
             stat.S_ISREG(info.st_mode)
             and info.st_uid == 0
             and info.st_gid == gid
-            and stat.S_IMODE(info.st_mode) == 0o640
+            and stat.S_IMODE(info.st_mode) == 0o640,
+            "владелец, группа или режим конфига "
+            + ("Xray" if path == paths.xray_config_file else "sing-box"),
         )
     rc, pid, _ = command(
         ["systemctl", "show", "--value", "--property=MainPID", "xgw-singbox.service"]
     )
-    require(rc == 0 and pid.strip().isdigit() and int(pid) > 0)
+    checked(
+        rc == 0 and pid.strip().isdigit() and int(pid) > 0, "служба sing-box не предъявила процесс"
+    )
     fields = dict(
         line.split(":", 1)
         for line in Path(f"/proc/{int(pid)}/status").read_text().splitlines()
         if ":" in line
     )
-    require(int(fields["Uid"].split()[1]) == sb.pw_uid and int(fields["CapEff"].strip(), 16) == 0)
-    require(xr.pw_gid not in {int(n) for n in fields["Groups"].split()})
+    checked(int(fields["Uid"].split()[1]) == sb.pw_uid, "не совпал пользователь sing-box")
+    checked(int(fields["CapEff"].strip(), 16) == 0, "CapEff sing-box не равен нулю")
+    checked(
+        xr.pw_gid not in {int(n) for n in fields["Groups"].split()}, "у sing-box есть группа Xray"
+    )
     rc, after, _ = command(
         ["systemctl", "show", "--value", "--property=MainPID", "xgw-singbox.service"]
     )
-    require(rc == 0 and after == pid)
+    checked(rc == 0 and after == pid, "процесс sing-box изменился во время чтения")
 
     def marks(value):
         if isinstance(value, dict):
-            require(
+            checked(
                 "routing_mark" not in value
-                or (type(value["routing_mark"]) is int and value["routing_mark"] == 0)
+                or (type(value["routing_mark"]) is int and value["routing_mark"] == 0),
+                "routing_mark sing-box не равен нулю",
             )
             for child in value.values():
                 marks(child)
@@ -216,16 +259,102 @@ def loaded():
     return rc == 0 and out.strip() == b"yes"
 
 
-def baseline():
-    _, paths, _, identity, healthy = context()
-    require(healthy and loaded())
-    snap = guard()
-    permissions(paths)
-    require(https())
+def loaded_detail():
+    argv = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "_loaded_result"]
+    try:
+        proc = subprocess.run(
+            argv, cwd="/", stdin=subprocess.DEVNULL, capture_output=True, timeout=8, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return None, "таймаут loaded (8 с)"
+    except OSError:
+        return None, "не удалось запустить loaded"
+    if proc.returncode != 0:
+        return None, f"дочерняя проверка завершилась с кодом {proc.returncode}"
+    value = proc.stdout.strip()
+    if value in (b"true", b"false", b"unknown"):
+        return {b"true": True, b"false": False, b"unknown": None}[value], (
+            "правила соответствуют"
+            if value == b"true"
+            else "правила не соответствуют"
+            if value == b"false"
+            else "loaded вернул неизвестный результат"
+        )
+    return None, "не распознан ответ loaded"
+
+
+def baseline(*, clarification=False):
+    """Persist every observation, including failure; never collect by rendering report."""
     state = read(ROOT / "state.json")
-    state.update(baseline=True, identity=identity, count=sum(snap[1].values()))
+    require(not ACTIVE.exists())
+    if clarification:
+        require("clarification" not in state and not state.get("baseline"))
+        require(all(row.get("result") == "не выполнялось" for row in state["cuts"].values()))
+    key = "clarification" if clarification else "baseline_checks"
+    require(key not in state)
+    rows = {name: {"passed": None, "detail": "не выполнялось"} for name in CHECK_LABELS}
+    state[key] = {"completed": False, "checks": rows}
     save(state)
+
+    def record(name, fn):
+        try:
+            value, detail = fn()
+            require(value is None or type(value) is bool)
+            rows[name] = {"passed": value, "detail": detail}
+        except CheckFailed as exc:
+            rows[name] = {"passed": False, "detail": str(exc)}
+        except (FileNotFoundError, PermissionError):
+            rows[name] = {"passed": None, "detail": "файл или объект недоступен для чтения"}
+        except (ValueError, KeyError, TypeError):
+            rows[name] = {"passed": None, "detail": "не распознан формат данных"}
+        except Exception:
+            rows[name] = {"passed": None, "detail": "проверка не завершилась"}
+        save(state)
+
+    observed = {}
+    identity = paths = None
+    try:
+        _, paths, _, identity, _ = context(checks=observed)
+        for name in ("health", "on"):
+            record(name, lambda name=name: (observed[name], "прочитано"))
+    except Exception:
+        for name in ("health", "on"):
+            rows[name] = {"passed": None, "detail": "не удалось прочитать состояние и конфиг"}
+        save(state)
+    record("loaded", loaded_detail)
+
+    def guard_detail():
+        snapshot = guard()
+        return (
+            True,
+            f"POSTROUTING; счётчиков {len(snapshot[1])}; пакетов {sum(snapshot[1].values())}",
+        )
+
+    record("guard", guard_detail)
+    record("https", https_detail)
+    record(
+        "permissions",
+        lambda: (
+            (permissions(paths) is None, "проверены")
+            if paths is not None
+            else (None, "конфиг не прочитан; пути не подставлялись")
+        ),
+    )
+    passed = all(row["passed"] is True for row in rows.values())
+    state[key]["completed"] = True
+    if not clarification:
+        state["baseline"] = passed
+        if passed:
+            state["identity"] = identity
+    save(state)
+    if clarification:
+        report()
+        return 0 if passed else 3
+    if not passed:
+        report()
+        return 3
     print("Исходный on: исправен; барьер POSTROUTING: есть; HTTPS: проходит; привилегии: верны")
+    return 0
 
 
 def isolation():
@@ -482,12 +611,60 @@ def launch(kind):
 
 def report():
     data = read(ROOT / "state.json")
+    if "clarification" in data:
+        entry = data["clarification"]
+        lines = ["# Уточнение исходной проверки волны 3", ""]
+        for name, label in CHECK_LABELS.items():
+            row = entry["checks"][name]
+            value = (
+                "пройдено"
+                if row["passed"] is True
+                else "не пройдено"
+                if row["passed"] is False
+                else "не проверено"
+            )
+            lines.append(f"{label}: {value}; {row['detail']}")
+        lines += [
+            "Сбор данных: " + ("завершён" if entry["completed"] else "не завершён"),
+            "Это новые наблюдения; причину прежнего отказа задним числом они не доказывают.",
+            "Правки сети, восстановление, установка и повторный prepare не выполнялись.",
+            "Допуск к правкам не выдан. Заключительная проверка волны ещё не завершена.",
+        ]
+        print("\n".join(lines[:2] + ["- " + line for line in lines[2:]]))
+        return
+    baseline_result = (
+        "пройдено"
+        if data.get("baseline") is True
+        else "не пройдено"
+        if data.get("baseline_checks", {}).get("completed")
+        else "нет сохранённого успешного итога"
+    )
     lines = [
         "# Закрытие волны 3",
         "",
-        f"Исходный on, барьер, HTTPS: {'пройдено' if data.get('baseline') else 'не выполнялось'}",
-        f"Изоляция sing-box: {data.get('isolation', 0)} из 6 — отказ",
+        f"Исходный on, барьер, HTTPS: {baseline_result}",
+        f"Изоляция sing-box: {data['isolation']} из 6 — отказ"
+        if "isolation" in data
+        else "Изоляция sing-box: не выполнялась",
     ]
+    for key, title in (
+        ("baseline_checks", "Проверки исходной базы"),
+        ("clarification", "Однократное уточнение без правок"),
+    ):
+        if key not in data:
+            continue
+        entry = data[key]
+        lines.append(title + (": завершено" if entry["completed"] else ": не завершено"))
+        for name, label in CHECK_LABELS.items():
+            row = entry["checks"][name]
+            value = (
+                "пройдено"
+                if row["passed"] is True
+                else "не пройдено"
+                if row["passed"] is False
+                else "не проверено"
+            )
+            lines.append(f"{label}: {value}; {row['detail']}")
     if "isolation_details" in data:
         labels = (
             "конфиг Xray",
@@ -576,6 +753,9 @@ def main():
     if action == "_loaded":
         require(app()[2].loaded() is True)
         print("yes")
+    elif action == "_loaded_result":
+        value = app()[2].loaded()
+        print("true" if value is True else "false" if value is False else "unknown")
     elif action == "_work":
         require(
             len(sys.argv) == 3
@@ -590,7 +770,10 @@ def main():
             ACTIVE.unlink()
     elif action == "baseline":
         require(not ACTIVE.exists())
-        baseline()
+        return baseline()
+    elif action == "clarify":
+        require(len(sys.argv) == 2)
+        return baseline(clarification=True)
     elif action == "isolation":
         isolation()
     elif action == "cut":
@@ -611,6 +794,12 @@ def main():
     elif action == "wait":
         return wait()
     elif action == "report":
+        require(len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == "--clarified"))
+        if len(sys.argv) == 3:
+            require(
+                not ACTIVE.exists()
+                and read(ROOT / "state.json").get("clarification", {}).get("completed") is True
+            )
         report()
     else:
         require(False)
