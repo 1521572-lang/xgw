@@ -36,6 +36,13 @@ SERVER_MODES = ("enabled", "disabled", "removed")
 # Ядро, закреплённое за сервером вручную (`xgw core`, переключатель в панели); «auto» не хранится.
 CORE_PINS = ("xray", "sing-box")
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{8}")
+_VARIANT_RE = re.compile(r"[0-9a-f]{32}")  # id варианта бесплатного пула (freepool/models.py)
+# Сервер устройства — бесплатный пул (веха М2б.1, freepool/traffic.py), а не сервер подписки.
+POOL_ROUTE = "pool"
+
+
+def _route_ok(server: str) -> bool:
+    return bool(_FINGERPRINT_RE.fullmatch(server)) or server == POOL_ROUTE
 _MAC_RE = re.compile(r"([0-9a-f]{2}:){5}[0-9a-f]{2}")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 # Имя шлюза в tailnet (Self.DNSName без точки): «gw.tail1234.ts.net».
@@ -93,6 +100,7 @@ def load(path: Path) -> tuple[dict, str]:
         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
+        "free_pool_mode": None, "free_pool_pin": "",
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -130,6 +138,7 @@ def load(path: Path) -> tuple[dict, str]:
     links = [link for link in raw.get("links") or [] if isinstance(link, str) and link]
     removed = _fingerprints(raw.get("removed"))
     disabled = [item for item in _fingerprints(raw.get("disabled")) if item not in removed]
+    pool_pin = raw.get("free_pool_pin")
     return {
         "subscriptions": subscriptions, "links": links, "disabled": disabled, "removed": removed,
         "devices": _devices(raw.get("devices")),
@@ -144,7 +153,44 @@ def load(path: Path) -> tuple[dict, str]:
         else None,
         "kernel_devices": _devices(raw.get("kernel_devices")),
         "tailscale": _tailscale(raw.get("tailscale")),
+        # Бесплатный пул (docs/FREEPOOL-PLAN.md): режим из панели.
+        "free_pool_mode": raw["free_pool_mode"]
+        if raw.get("free_pool_mode") in FREE_POOL_MODES else None,
+        # Сервер пула, выбранный вручную на вкладке «Бесплатные серверы» (id варианта).
+        "free_pool_pin": pool_pin
+        if isinstance(pool_pin, str) and _VARIANT_RE.fullmatch(pool_pin) else "",
     }, ""
+
+
+FREE_POOL_MODES = ("off", "observe", "on")
+
+
+def set_free_pool_mode(path: Path, mode: str | None) -> bool:
+    """Режим бесплатного пула из панели (None — как в config.toml); True — изменилось."""
+    if mode is not None and mode not in FREE_POOL_MODES:
+        raise ManagedError("ожидается off, observe или on")
+
+    def change(data: dict) -> bool:
+        if data["free_pool_mode"] == mode:
+            return False
+        data["free_pool_mode"] = mode
+        return True
+
+    return _update(path, change)
+
+
+def set_free_pool_pin(path: Path, variant_id: str) -> bool:
+    """Сервер пула, выбранный вручную (id варианта; пусто — выбирает шлюз); True — изменилось."""
+    if variant_id and not _VARIANT_RE.fullmatch(variant_id):
+        raise ManagedError("ожидается id сервера пула — 32 шестнадцатеричных знака")
+
+    def change(data: dict) -> bool:
+        if data["free_pool_pin"] == variant_id:
+            return False
+        data["free_pool_pin"] = variant_id
+        return True
+
+    return _update(path, change)
 
 
 def _tailscale(value: object) -> dict:
@@ -385,7 +431,7 @@ def _routes(value: object) -> list[dict]:
     for entry in value if isinstance(value, list) else []:
         server = entry.get("server") if isinstance(entry, dict) else None
         mac = normalize_mac(entry.get("mac")) if isinstance(entry, dict) else None
-        if mac and isinstance(server, str) and _FINGERPRINT_RE.fullmatch(server):
+        if mac and isinstance(server, str) and _route_ok(server):
             servers.setdefault(mac, server)
     return [{**item, "server": servers[item["mac"]]} for item in _devices(value)
             if item["mac"] in servers]
@@ -397,7 +443,7 @@ def set_route(path: Path, mac: str, ip: str, name: str, server: str) -> bool:
     mac_ok = normalize_mac(mac)
     if mac_ok is None:
         raise ManagedError("неверный MAC устройства")
-    if server and not _FINGERPRINT_RE.fullmatch(server):
+    if server and not _route_ok(server):
         raise ManagedError("неверный сервер")
 
     def change(data: dict) -> bool:

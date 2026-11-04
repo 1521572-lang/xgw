@@ -66,6 +66,9 @@ class FakeDaemon:
     def request_speed_one(self, key: str) -> None:
         self.asked.append(f"speed:{key}")
 
+    def request_freepool_refresh(self) -> None:
+        self.asked.append("freepool")
+
     def speed_one_pending(self) -> list[str]:
         return [item.removeprefix("speed:") for item in self.asked if item.startswith("speed:")]
 
@@ -225,6 +228,16 @@ def test_token_moves_into_a_cookie_and_out_of_the_address(rig):
     assert response.status == 403 and 'name="token"' in text
     rig.client.cookie = "xgw_panel=" + "0" * 64
     assert rig.client.request("GET", "/api/state")[0].status == 401
+
+
+def test_pool_servers_come_separately_and_only_after_login(rig):
+    """Строки бесплатных серверов — отдельным запросом /api/pool (их сотни: в /api/state каждые
+    3 с они были бы лишними) и только после входа; наблюдение выключено — строк нет."""
+    assert rig.client.request("GET", "/api/pool")[0].status == 401
+    rig.client.login()
+    response, text = rig.client.request("GET", "/api/pool")
+    assert response.status == 200
+    assert json.loads(text) == {"mode": "off", "region": "EU", "servers": []}
 
 
 def test_one_time_login_code_works_once_and_only_for_a_minute(rig, monkeypatch):
@@ -754,6 +767,20 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
     }
     rig.panel.configure(rig.panel.cfg, None)  # демон ещё не создан
     assert not user.act("refresh", {})["ok"]
+
+
+def test_free_pool_card_switches_observation(rig, user):
+    """Карточка «Бесплатные серверы»: наблюдение включается и выключается (трафик через пул —
+    не в этой версии); «Опросить источники» — только при включённом наблюдении."""
+    assert user.state()["free_pool"] == {"mode": "off", "summary": None}
+    assert not user.act("freepool/mode", {"mode": "on"})["ok"]
+    assert not user.act("freepool/refresh", {})["ok"]
+    assert user.act("freepool/mode", {"mode": "observe"})["ok"]
+    assert rig.saved()["free_pool_mode"] == "observe"
+    assert user.state()["free_pool"]["mode"] == "observe"
+    assert user.act("freepool/refresh", {})["ok"] and rig.daemon.asked == ["freepool"]
+    assert user.act("freepool/mode", {"mode": "off"})["ok"]
+    assert rig.saved()["free_pool_mode"] == "off"
 
 
 def test_refresh_without_subscriptions_is_refused(rig, user):

@@ -14,17 +14,19 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from . import log, managed, tray
+from . import log, managed, tray, usage
 from . import tailscale as ts
 from .config import Config
-from .install import DAEMON_STOP_WAIT, UNIT_FILES, XRAY_USER, Journal
+from .install import DAEMON_STOP_WAIT, FP_UNIT, SINGBOX_USER, UNIT_FILES, XRAY_USER, Journal
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
 
 # Что остаётся в журнале после отката неудачной установки: это установка не
 # откатывает, а при повторном запуске должна помнить, что было до неё.
-_KEPT_AFTER_ROLLBACK = ("packages", "user_created", "dnsmasq")
+_KEPT_AFTER_ROLLBACK = (
+    "packages", "user_created", "singbox_user_created", "fp_users_created", "dnsmasq",
+)
 
 
 class Uninstaller:
@@ -106,6 +108,11 @@ class Uninstaller:
             return None
         # Демон первым: иначе он успел бы вернуть правила и перезапустить Xray.
         for unit in reversed(UNIT_FILES):
+            if unit == FP_UNIT:
+                # Шаблон: останавливаются запущенные поколения бесплатного пула.
+                self.runner(["systemctl", "stop", "xgw-fp@*.service"], timeout=60.0,
+                            check=False)
+                continue
             if (self.paths.systemd_dir / unit).exists():
                 self.runner(
                     ["systemctl", "disable", "--now", unit], timeout=DAEMON_STOP_WAIT, check=False
@@ -117,6 +124,9 @@ class Uninstaller:
         Capture(
             self.cfg, self.paths, runner=self.runner, logger=self.log, proc_sys=self.proc_sys
         ).down(remove_tun=True)
+        # Таблицу учёта трафика (usage.py) ставит демон, а не перехват: её — отдельно.
+        with contextlib.suppress(cmd.CommandError):
+            usage.remove(self.runner)
         return "таблицы nftables, ip rule, маршрут и интерфейс TUN убраны"
 
     def _dnsmasq(self) -> str | None:
@@ -257,10 +267,21 @@ class Uninstaller:
         return "; ".join(done) + " — сняты; tailscaled, вход в tailnet и SSH не тронуты"
 
     def _user(self) -> str | None:
-        if not self.journal.get("user_created"):
+        removed = [str(name) for name in self.journal.get("fp_users_created") or []]
+        for name in removed:
+            self.runner(["userdel", name], timeout=30.0, check=False)
+        if self.journal.get("singbox_user_created"):
+            if self.runner(["getent", "passwd", SINGBOX_USER], check=False).strip():
+                self.runner(["userdel", SINGBOX_USER], timeout=30.0)
+            self.journal.discard("singbox_user_created")
+            removed.append(SINGBOX_USER)
+        if self.journal.get("user_created"):
+            self.runner(["userdel", XRAY_USER], timeout=30.0)
+            removed.append(XRAY_USER)
+        if not removed:
             return None
-        self.runner(["userdel", XRAY_USER], timeout=30.0)
-        return f"пользователь {XRAY_USER} удалён"
+        return ("пользователи " if len(removed) > 1 else "пользователь ") + ", ".join(removed) \
+            + " удален" + ("ы" if len(removed) > 1 else "")
 
     # --- файлы и итог -----------------------------------------------------------
 

@@ -2,9 +2,29 @@
 
 from pathlib import Path
 
+import pytest
+
 from xgw.config import Config, load, probe_bytes, retire_obsolete
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
+
+
+@pytest.mark.parametrize("port", [1, 80, 1023, 65536])
+def test_singbox_api_requires_an_unprivileged_port(tmp_path, port):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[core]\napi_port = {port}\n", encoding="utf-8")
+    cfg, warnings = load(path)
+    assert cfg.core.api_port == Config().core.api_port
+    assert any("core.api_port" in warning and "1024–65535" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("port", [1024, 65535])
+def test_singbox_api_accepts_unprivileged_port_boundaries(tmp_path, port):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[core]\napi_port = {port}\n", encoding="utf-8")
+    cfg, warnings = load(path)
+    assert cfg.core.api_port == port
+    assert not any("core.api_port" in warning for warning in warnings)
 
 
 def test_fragment_and_bbr_defaults_and_bad_values(tmp_path):

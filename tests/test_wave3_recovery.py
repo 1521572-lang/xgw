@@ -1,0 +1,189 @@
+"""Узкие регрессии по реальному отчёту wave3, без изменения сети и служб."""
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+from test_install import Box
+
+from xgw.install import InstallError
+
+
+def test_install_stops_controller_before_code_and_starts_without_second_sigterm(tmp_path):
+    box = Box(tmp_path)
+    box.system.unit("xgw.service")["active"] = True
+    installer = box.installer()
+    order = []
+    for method in ("_packages", "_user", "_xray", "_singbox", "_tidy_config", "_permissions"):
+        setattr(installer, method, lambda *args: None)
+    installer._code = lambda: order.append(box.system.unit("xgw.service")["active"])
+    installer._system(installer.facts())
+    assert order == [False]
+    installer._daemon()
+    assert box.system.commands("systemctl", "stop", "xgw.service")
+    assert box.system.commands("systemctl", "start", "xgw.service")
+    assert not box.system.commands("systemctl", "restart", "xgw.service")
+
+
+def test_failed_install_resumes_only_paused_controller(tmp_path):
+    box = Box(tmp_path)
+    box.system.unit("xgw.service")["active"] = True
+    installer = box.installer()
+    installer._pause_daemon()
+    installer._resume_paused_daemon()
+    assert box.system.unit("xgw.service")["active"]
+    assert not box.system.commands("systemctl", "stop", "xgw-xray.service")
+
+
+@pytest.mark.parametrize("has_sources", [True, False])
+def test_existing_implicit_on_does_not_become_off_on_failed_first_apply(
+        tmp_path, monkeypatch, has_sources):
+    from xgw import engine
+
+    monkeypatch.setattr(engine, "has_sources", lambda cfg: has_sources)
+    box = Box(tmp_path)
+    installer = box.installer()
+    installer._capture_initial_on = True
+    assert installer.capture.choice() is None
+    with pytest.raises(InstallError, match="не снимается"):
+        installer._capture(False)
+    assert installer.capture.choice() is None
+
+
+@pytest.mark.parametrize("mode,loaded,guard", [("off", True, True), ("on", False, True),
+                                             ("on", True, False)])
+def test_install_cannot_return_success_for_missing_requested_policy(tmp_path, mode, loaded, guard):
+    installer = Box(tmp_path).installer()
+    installer._capture_initial_on = True
+    capture = type("CaptureFixture", (), {
+        "configured": True, "mode": lambda s: mode, "effective_mode": lambda s: mode,
+        "loaded": lambda s: loaded, "guard_loaded": lambda s: guard,
+    })()
+    installer.capture = capture
+    with pytest.raises(InstallError):
+        installer._verify_capture_result(True)
+
+
+def test_daemon_unit_preserves_child_transaction_on_sigterm():
+    unit = (Path(__file__).parents[1] / "packaging/xgw.service").read_text()
+    assert "KillMode=mixed\n" in unit
+
+
+def safety():
+    path = Path(__file__).parent / "stand/wave3_safety.py"
+    spec = importlib.util.spec_from_file_location("wave3_safety", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_new_job_does_not_report_previous_enable_success(tmp_path, monkeypatch):
+    tool = safety()
+    result = tmp_path / "job-result.json"
+    tool.save(result, {"action": "enable", "state": "finished", "rc": 0})
+    tool.save(tmp_path / "status.json", {
+        "state": "armed", "kind": "fixed", "dry": False,
+        "deadline": tool.time.monotonic() + 25,
+    })
+    monkeypatch.setattr(tool, "pulse", lambda directory: None)
+
+    def run(command, **kwargs):
+        assert tool.json.loads(result.read_text()) == {
+            "action": "install", "state": "running", "rc": None,
+        }
+        return tool.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    tool.job(tmp_path, "install", tmp_path)
+    assert tool.json.loads(result.read_text()) == {
+        "action": "install", "state": "finished", "rc": 0,
+    }
+
+
+def test_dry_calibration_cannot_authorize_install(tmp_path, monkeypatch):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "armed", "dry": True})
+    monkeypatch.setattr(tool, "pulse", lambda directory: pytest.fail("must not pulse"))
+    with pytest.raises(SystemExit, match="dry"):
+        tool.job(tmp_path, "install", tmp_path)
+
+
+@pytest.mark.parametrize("dry", [True, False])
+def test_fixed_window_cannot_be_cancelled_or_extended_by_operator_files(tmp_path, monkeypatch, dry):
+    tool = safety()
+    clock = [0.0]
+    monkeypatch.setattr(tool.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        # Даже auto-pulse и disarm-файл не продлевают заранее ограниченный опыт.
+        tool.save(tmp_path / "lease.json", clock[0])
+        (tmp_path / "disarm").touch()
+        clock[0] += seconds
+
+    monkeypatch.setattr(tool.time, "sleep", sleep)
+    boot = tool.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    tool.save(tmp_path / "snapshot.json", {"boot": boot})
+    monkeypatch.setattr(tool, "restore", lambda directory:
+                        tool.save(directory / "status.json", {"state": "RESTORED_OFF"}))
+    tool.window(tmp_path, 25, dry=dry)
+    assert clock[0] == 25
+    expected = "WINDOW_EXPIRED" if dry else "RESTORED_OFF"
+    assert tool.json.loads((tmp_path / "status.json").read_text())["state"] == expected
+
+
+def test_job_refuses_legacy_operator_lease_even_when_it_is_fresh(tmp_path):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "armed", "dry": False})
+    with pytest.raises(SystemExit, match="непродлеваемое"):
+        tool.job(tmp_path, "install", tmp_path)
+
+
+def test_launch_refuses_job_if_guard_start_is_not_confirmed(tmp_path, monkeypatch):
+    tool = safety()
+    tool.save(tmp_path / "status.json", {"state": "prepared"})
+    calls = []
+    monkeypatch.setattr(tool, "call", lambda argv, timeout, **kwargs:
+                        calls.append(argv) or 124)
+    with pytest.raises(SystemExit, match="старт страховки"):
+        tool.launch(tmp_path, "install", tmp_path)
+    assert len(calls) == 1 and "--unit=" + tool.SAFETY in calls[0]
+
+
+def test_expired_local_lease_recovers_without_tester_or_network(tmp_path, monkeypatch):
+    tool = safety()
+    clock = [0.0]
+    monkeypatch.setattr(tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(tool.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    tool.watch(tmp_path, dry=True)
+    assert tool.json.loads((tmp_path / "status.json").read_text())["state"] == "DRY_EXPIRED"
+    assert clock[0] == tool.LEASE_SECONDS
+    with pytest.raises(SystemExit, match="lease"):
+        tool.pulse(tmp_path)
+
+
+def test_rescue_uses_prepared_rules_and_bounded_commands_not_installed_xgw(tmp_path, monkeypatch):
+    tool = safety()
+    rules, state = b"prepared off rules", b'{"enabled":false}'
+    (tmp_path / "off.nft").write_bytes(rules)
+    (tmp_path / "capture.json").write_bytes(state)
+    target = tmp_path / "live-capture.json"
+    tool.save(tmp_path / "snapshot.json", {
+        "off_sha256": tool.hashlib.sha256(rules).hexdigest(),
+        "state_sha256": tool.hashlib.sha256(state).hexdigest(),
+        "capture_state": str(target), "open_marker": str(tmp_path / "open"),
+    })
+    calls = []
+    tool.save(tmp_path / "job-result.json", {"action": "install", "state": "running", "rc": None})
+    tool.save(tmp_path / "lease.json", tool.time.monotonic() - tool.LEASE_SECONDS)
+    monkeypatch.setattr(tool, "call", lambda argv, timeout, **kw:
+                        calls.append((argv, timeout, kw)) or 0)
+    tool.restore(tmp_path)
+    assert [call[0][0] for call in calls] == ["systemctl", "systemctl", "nft"]
+    assert calls[-1][2]["data"] == rules
+    assert sum(call[1] for call in calls) == 5
+    assert target.read_bytes() == state
+    status = tool.json.loads((tmp_path / "status.json").read_text())
+    assert status["state"] == "RESTORED_OFF"
+    assert status["seconds_since_last_pulse"] >= tool.LEASE_SECONDS
+    result = tool.json.loads((tmp_path / "job-result.json").read_text())
+    assert result["state"] == "aborted_by_safety"

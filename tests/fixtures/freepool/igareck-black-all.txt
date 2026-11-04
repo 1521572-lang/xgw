@@ -1,0 +1,13 @@
+# profile-title: 🏴 ЧЕРНЫЕ СПИСКИ 🏴 BLACK LISTS | Полная • Full | SS, Hy2, Vmess, Trojan
+# profile-update-interval: 1
+# Date/Time: 2026-10-28 / 20:19 (Moscow)
+# Количество: 5
+# For more info and VPN-configs - visit: www.github.com/igareck/vpn-configs-for-russia
+
+# RU: Эта подписка может содержать Trojan/Hysteria2/Hy2 с legacy-параметрами insecure=1 или allowInsecure=1.
+
+trojan://FakeTrojanPass@198.51.100.43:443?security=tls&sni=t.example.org&type=tcp#%F0%9F%87%B8%F0%9F%87%AA%20Sweden%2C%20Stockholm%20%7C%20%5BBL%5D
+hysteria2://FakeHyPass@198.51.100.44:443?sni=h.example.org&insecure=1#%F0%9F%87%B3%F0%9F%87%B1%20The%20Netherlands%2C%20Amsterdam%20%7C%20%5BBL%5D
+vmess://eyJ2IjogIjIiLCAicHMiOiAi8J+Ht/Cfh7QgUm9tYW5pYSwgQnVjaGFyZXN0IHwgW0JMXSIsICJhZGQiOiAidm0uZXhhbXBsZS5vcmciLCAicG9ydCI6ICI0NDMiLCAiaWQiOiAiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwgImFpZCI6ICIwIiwgInNjeSI6ICJhdXRvIiwgIm5ldCI6ICJ3cyIsICJ0eXBlIjogIm5vbmUiLCAiaG9zdCI6ICJ2bS5leGFtcGxlLm9yZyIsICJwYXRoIjogIi92bSIsICJ0bHMiOiAidGxzIiwgInNuaSI6ICJ2bS5leGFtcGxlLm9yZyJ9
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpGYWtlU3NQYXNzMQ@198.51.100.45:8388#%F0%9F%87%AD%F0%9F%87%B0%20Hong%20Kong%2C%20Fo%20Tan%20%7C%20%5BBL%5D
+socks://dXNlcjpwYXNz@198.51.100.46:1080#open-proxy

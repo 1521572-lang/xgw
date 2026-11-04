@@ -1,8 +1,9 @@
 """Скан запасных серверов: probe.url через probe-inbound каждого spare-*.
 
 Классы (раздел 6.8): OK, SLOW, FROZEN (часть тела, затем тишина — фиксируем
-число байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT. Служебный CANCELLED — проба
-прервана остановкой демона; в базу он не попадает.
+число байт), BODY_RESET (ответ начался, затем обрыв соединения — C02 кросс-аудита 4cc96b9:
+раньше это был CONNECT_FAIL без байт), STALL_BEFORE_BODY, CONNECT_FAIL, TIMEOUT. Служебный
+CANCELLED — проба прервана остановкой демона; в базу он не попадает.
 
 Запасные лимитированных подписок проверяются дешёвым запросом (cheap_url, обычно
 probe.trace_url — сотни байт вместо 57 КБ): каждый байт через такой сервер тратит квоту,
@@ -52,7 +53,8 @@ def cheap_url(cfg: Config) -> str:
 @dataclass
 class ScanResult:
     tag: str
-    verdict: str          # OK | SLOW | FROZEN | STALL_BEFORE_BODY | CONNECT_FAIL | TIMEOUT
+    # OK | SLOW | FROZEN | BODY_RESET | STALL_BEFORE_BODY | CONNECT_FAIL | TIMEOUT
+    verdict: str
     bytes_read: int       # байт тела до остановки
     seconds: float
     error: str = ""
@@ -70,6 +72,8 @@ def classify(result: DownloadResult, seconds: float, slow: float = SLOW_SECONDS)
         return "SLOW" if seconds > slow else "OK"
     if result.frozen:
         return "FROZEN"
+    if result.kind == "reset" and (result.status or result.downloaded):
+        return "BODY_RESET"  # ответ начался и оборвался: путь режет поток, как «заморозка»
     if result.stalled:  # тишина до первого байта тела
         return "STALL_BEFORE_BODY"
     if result.kind == "timeout":
@@ -113,6 +117,7 @@ def scan_node(
         cancel=cancel,
         rtt=True,
         range_end=range_size(target) if random_size else 0,
+        min_body=1,  # ответ без тела (204) — не проба: файла нет
     )
     seconds = time.monotonic() - started
     return ScanResult(

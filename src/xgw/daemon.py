@@ -35,7 +35,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, cost, engine, fetch, log, priority, rating
+from . import cores, cost, engine, fetch, log, managed, priority, rating, usage
 from . import pin as pinning
 from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
@@ -47,16 +47,19 @@ from .apply.rotation import (
     preferred_members,
 )
 from .config import Config, parse_seconds, probe_bytes
+from .freepool import stats as poolstats
+from .freepool import traffic
+from .freepool.pool import FreePool
 from .generator import builder
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
-from .generator.builder import BALANCER_TAG, NodeInfo
+from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
 from .model import ServerNode
-from .net import tun
+from .net import cmd, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
 from .store import Store
-from .watch import checks, scan, shadow, speed, status, target
+from .watch import checks, scan, shadow, speed, status, target, youtube
 from .watch import guard as speedguard
 from .watch import hosts as probehosts
 from .watch import resolvers as resolving
@@ -126,6 +129,12 @@ RESERVE_NOTE_AFTER = 300.0
 # Подписка не обновляется дольше этого — уведомить: разовый сбой провайдера подписки
 # повода не даёт, а долгий — значит, что-то с ней не так (истекла, сменился адрес).
 SUBSCRIPTION_ALERT_AFTER = 3600.0
+# Опрос подписок идёт в фоновом потоке (_refresh): отчёты audit6b и audit6c — шаг с
+# обновлением подписки длился 90–135 с, из них опрос 37–68 с, и всё это время watchdog не
+# замечал упавших серверов. Шаг, начавший опрос, ждёт его не дольше REFRESH_WAIT: быстрый
+# опрос (файл, кэш) применяется в том же шаге, долгий — первым шагом после его конца.
+REFRESH_WAIT = 2.0
+BUILD_WAIT = 0.1  # быстрый конфиг применится сразу; долгий не задерживает watchdog
 # Основной сервер (_main_step). С сервера, ушедшего в отказ, основной уходит сразу, и
 # снова основным он не берётся MAIN_COOLDOWN, пока есть другие живые участники.
 MAIN_COOLDOWN = 1800.0
@@ -171,6 +180,8 @@ PROFILE_RECHECK = 24 * 3600.0
 # дробление, ни другое ядро не помогут; лестница не запускается, а сервер в работе меняется
 # сразу. Отметка «адрес закрыт» держится CLOSED_RECHECK или до первого ответа сервера.
 CLOSED_RECHECK = PROFILE_RETRY
+# Бесплатный пул: шаг наблюдения не чаще (опрос источников — по своим интервалам внутри).
+FREEPOOL_EVERY = 60.0
 # Белые списки (анти-ТСПУ 2.0): провайдер пускает только на российские адреса. Признак: VPN не
 # работает (ALL_DEAD, RESERVE), российские адреса напрямую открываются (watchdog.wan_check и
 # wan_checks — provider_ok), а из зарубежных проверочных хостов (probe.url, probe.urls) напрямую
@@ -205,6 +216,56 @@ CORES_RECHECK = 600.0
 # Расход: ~8 КБ × 2 в минуту ≈ 23 МБ в сутки на сервер (status.probe_budget, devices).
 DEVICE_CHECK = scan.DEVICE_CHECK
 DEVICE_STREAK = 2
+# Устройства через бесплатный пул (М2б.1, _pool_step): допущенные серверы пула проверяются раз
+# в POOL_CHECK; пересборка ради них — не чаще POOL_OPEN, если у устройств закрыто, а допущенные
+# есть (сборка могла их не принять — без паузы она шла бы каждую минуту), иначе не чаще
+# POOL_REBUILD. Умерший закреплённый сменяется сразу — закреплением другого живого, без сборки.
+POOL_CHECK = 60.0
+POOL_OPEN = 180.0
+POOL_REBUILD = 600.0
+# Пересборка для пула впереди или ядро ещё не пробовало его серверы — «подключаются», а не
+# «закрыто», но не дольше POOL_WAIT (первые пробы ядра — за интервал probe.interval).
+POOL_WAIT = 120.0
+# Восстановление пула (М3, _pool_silence): сервер «pool» молчит у проб ядра дольше POOL_SILENT —
+# пулу на перепроверку вне очереди (истёкший ключ, ушедший сервер выбывает с первой неудачей, а
+# не через часы); пул закрыт — списки серверов обновляются вне расписания, не чаще POOL_REFRESH.
+POOL_SILENT = 300.0
+POOL_REFRESH = 1800.0
+# Шаг watchdog дольше TICK_SLOW — строка в журнале: что в нём шло и на что ушло время — части шага
+# не короче TICK_PART (Daemon.run, _tick_work, _spent).
+TICK_SLOW = 60.0
+TICK_PART = 5.0
+# Скорость серверов «pool» (_pool_speed_step) — обычным замером (speed.measure, speed.max_mb):
+# экономия их трафика не нужна (решение заказчика 5). Живой сервер без замера — сразу, по одному
+# за шаг; повторный замер — раз в speed.unlimited_hours, при занятом канале пула (больше
+# SPEED_BUSY_BPS) ждёт, но не дольше SPEED_FORCE_AFTER. Замеры — в meta POOL_SPEED_META: id
+# варианта → {"mbps", "bytes", "seconds", "error", "ts"}, хранятся SPEED_KEEP.
+POOL_SPEED_META = "pool_speed"
+# Сервер «pool», закреплённый последним (полный id варианта; пусто — пул закрыт или выключен):
+# после перезапуска демона тот же сервер не объявляется заново (отчёт freepool-recovery2,
+# дефект 1: «весь дом идёт через» дважды без смены и без причины).
+POOL_PINNED_META = "pool_pinned"
+# YouTube через сервер (М3, watch/youtube.py, _youtube_step): итоги — в meta YOUTUBE_META, ключ —
+# отпечаток сервера подписки или полный id варианта пула → {"state", "fails", "mbps", "client",
+# "error", "ts"}. Сервер, который несёт трафик, проверяется раз в speed.youtube_minutes, после
+# неудачи — снова через YOUTUBE_RETRY; остальные живые (безлимитные) — раз в YOUTUBE_OTHERS, после
+# неудачи — через YOUTUBE_SUSPECT, и не чаще одного раза в YOUTUBE_GAP. Плох — YOUTUBE_CONFIRM
+# неудач подряд, и итог не старше YOUTUBE_STALE. Смен из-за YouTube YOUTUBE_CAROUSEL_COUNT за
+# YOUTUBE_CAROUSEL — дело, похоже, не в серверах: смены приостанавливаются на YOUTUBE_PAUSE.
+YOUTUBE_META = "youtube"
+YOUTUBE_RETRY = 60.0
+YOUTUBE_OTHERS = 6 * 3600.0
+YOUTUBE_SUSPECT = 600.0
+YOUTUBE_GAP = 120.0
+YOUTUBE_CONFIRM = 2
+YOUTUBE_STALE = 24 * 3600.0
+YOUTUBE_KEEP = 7 * 86400.0
+YOUTUBE_CAROUSEL = 3600.0
+YOUTUBE_CAROUSEL_COUNT = 3
+YOUTUBE_PAUSE = 2 * 3600.0
+# Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
+# HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
+HOUSE_SYNC = 300.0
 # Сетевая задержка (RTT, п. 2.3): у запасных — по их сканам, у участников — дешёвым запросом
 # через probe-inbound раз в RTT_EVERY (по одному за шаг; ~8 КБ на проверку). Замер старше
 # RTT_KEEP в рейтинге не учитывается (meta «rtt»: отпечаток → {"ms", "ts"}).
@@ -371,6 +432,86 @@ LIFECYCLE_EVENTS = frozenset({Lifecycle.BLOCKED, Lifecycle.OPEN, Lifecycle.OFF})
 LIFECYCLE_TEXT = {life: status.LIFECYCLE_WORDS[str(life)][0] for life in Lifecycle}
 
 
+class _PoolCancel:
+    """Отмена проверок бесплатного пула (FreePool.check_some): демон останавливается или
+    наблюдение выключили — начатый шаг пула не проверяет следующие серверы (отчёт m2b2fix2:
+    проверки шли и после «Выключить»). Настройки пул получает при каждом перечитывании."""
+
+    def __init__(self, stop: threading.Event, pool: FreePool) -> None:
+        self.stop, self.pool = stop, pool
+
+    def is_set(self) -> bool:
+        return self.stop.is_set() or self.pool.cfg.free_pool.mode == "off"
+
+
+class _FetchCancel:
+    """Отмена фонового опроса подписок (_Fetch): демон останавливается либо источники
+    серверов в настройках сменились (adopt) — опрос прежних больше не нужен."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop, self.dropped = stop, threading.Event()
+
+    def is_set(self) -> bool:
+        return self.stop.is_set() or self.dropped.is_set()
+
+    def wait(self, seconds: float) -> bool:
+        """Как threading.Event.wait — пауза перед повтором запроса (fetch._pause)."""
+        deadline = time.monotonic() + seconds
+        while not self.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self.stop.wait(min(left, fetch.CANCEL_SLICE))
+        return True
+
+
+@dataclasses.dataclass
+class _Fetch:
+    """Опрос подписок в фоновом потоке (Daemon._refresh) и его итог."""
+
+    via_xray: bool
+    urgent: bool
+    cancel: _FetchCancel
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    waiting: bool = False  # шаг ждёт конца опроса сам — будить демон незачем
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)  # done и waiting
+    inventory: engine.Inventory | None = None
+    error: Exception | None = None
+    spent: float = 0.0  # секунд на опрос
+
+
+@dataclasses.dataclass
+class _BuildRequest:
+    prefer: list[str] | None
+    urgent: bool
+    reason: str
+    reserve: str | None = None
+    profiles: dict[str, str] = dataclasses.field(default_factory=dict)
+    callbacks: dict = dataclasses.field(default_factory=dict)
+
+    def key(self) -> tuple:
+        return (tuple(self.prefer) if self.prefer is not None else None,
+                self.urgent, self.reserve, tuple(sorted(self.profiles.items())))
+
+
+@dataclasses.dataclass
+class _Build:
+    request: _BuildRequest
+    cfg: Config
+    inventory: engine.Inventory
+    inputs: tuple
+    stamp: tuple
+    reload: bool | None
+    wake: threading.Event
+    dead: frozenset
+    began: float = dataclasses.field(default_factory=time.monotonic)
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    assembly: engine.Assembly | None = None
+    error: Exception | None = None
+    spent: float = 0.0
+    discard: bool = False
+
+
 class Daemon:
     def __init__(
         self,
@@ -418,6 +559,17 @@ class Daemon:
         self.service = self.applier.service
         self.singbox = engine.make_singbox(cfg, paths)
         self.mark = engine.bypass_mark(cfg, self.log)
+        # Бесплатный пул (веха М1, наблюдение): опрос источников через несущий канал и проверки —
+        # в отдельном потоке, не дольше шага watchdog; сводка — из него же (кэш).
+        self.freepool = FreePool(cfg, paths, logger=self.log)
+        self._freepool_next = 0.0
+        self._freepool_thread: threading.Thread | None = None
+        self._freepool_summary: dict | None = None
+        self._freepool_force = False
+        # Учёт расхода трафика по устройствам и подпискам (usage.py): nftables — только у
+        # настоящего шлюза (с перехватом), счётчики Xray — всегда.
+        self.meter = usage.Meter(cfg, paths, runner=cmd.run if capture is not None else None,
+                                 logger=self.log)
         self.machine = StateMachine(cfg.watchdog.fail_threshold)
         # sinks — куда доставлять уведомления (рабочий стол); их собирает
         # `xgw run`, в тестах и на стенде получателей нет.
@@ -522,6 +674,62 @@ class Daemon:
         self._device_streak: dict[str, tuple[bool, int]] = {}
         self._device_checked: dict[str, float] = {}
         self._device_dead: set[str] = set()
+        # Устройства через бесплатный пул (_pool_step): закреплённый тег «pool» и по какому
+        # применённому конфигу он закреплён (время файла: перезапуск и смена routing снимают
+        # закрепление), когда проверены допущенные и пересобран конфиг ради них, имена
+        # серверов пула по тегу, сводка для состояния и с какого времени пул «подключается».
+        self._pool_pinned = ""
+        self._pool_pin_key = 0.0
+        self._pool_checked_at = 0.0
+        self._pool_rebuilt_at = 0.0
+        self._pool_names: dict[str, tuple[str, str]] = {}
+        self._pool_traffic: dict | None = None
+        self._pool_wait_since = 0.0
+        # Скорость серверов «pool» (_pool_speed_step): полный id варианта по тегу, замеры (meta
+        # POOL_SPEED_META), когда и по чему выбран закреплённый ("speed" — по замеру, когда
+        # замерены все живые; "delay" — предварительно), с какого шага повторный замер ждёт
+        # свободного канала, прошлый отсчёт трафика серверов пула и байты своего замера.
+        self._pool_ids: dict[str, str] = {}
+        self._pool_speed: dict[str, dict] | None = None
+        self._pool_since = 0.0
+        self._pool_basis = ""
+        self._pool_deferred_since: float | None = None
+        self._pool_bytes: tuple[float, int] | None = None
+        self._pool_own = 0
+        self._speed_ran = False  # на этом шаге шёл замер серверов подписки
+        # Закреплённый «мёртв» по пробам ядра, а трафик через него идёт (_pool_spared): прошлые
+        # счётчики downlink серверов пула, последний свой замер (тег, байты) и кого уже щадили.
+        self._pool_downlinks: dict[str, tuple[float, int]] = {}
+        self._pool_measured: tuple[str, int] = ("", 0)
+        self._pool_spared_tag = ""
+        # Восстановление (_pool_silence): с какого времени молчит у проб ядра каждый сервер
+        # «pool» и когда списки обновлялись вне расписания из-за закрытого пула.
+        self._pool_silent: dict[str, float] = {}
+        self._pool_refreshed_at = 0.0
+        self._pool_tags: set[str] = set()  # состав «pool» прошлого шага — для «выбыло» дневника
+        self.diary = poolstats.Diary(self.store, clock=self.wall)  # дневник пула (М3)
+        # Сервер «pool», закреплённый до запуска демона (POOL_PINNED_META): с ним сверяется только
+        # первое закрепление после запуска.
+        self._pool_boot = self._pool_saved = self.store.get_meta(POOL_PINNED_META) or ""
+        self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
+        self._youtube_ran = False  # на этом шаге шла проверка YouTube
+        self._tick_spent: dict[str, float] = {}  # части шага → секунды (_spent)
+        self._rebuild_spent = (0.0, 0.0)  # последняя сборка: (сборка, применение), секунды
+        # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
+        # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
+        # (тег, байты), шёл ли замер скорости шагом раньше (тогда счётчики им испорчены), когда
+        # была фоновая проверка, смены из-за YouTube за YOUTUBE_CAROUSEL, до каких пор смены
+        # приостановлены и о каком выбранном вручную плохом сервере уже сообщено.
+        self._youtube: dict[str, dict] | None = None
+        self._youtube_down: tuple[float, dict[str, int]] | None = None
+        self._youtube_rates: dict[str, float] = {}
+        self._youtube_own: tuple[str, int] = ("", 0)
+        self._youtube_tainted = False
+        self._youtube_bg_at = 0.0
+        self._youtube_switches: list[float] = []
+        self._youtube_paused_until = 0.0
+        self._youtube_noted: set[str] = set()
+        self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
         # чтобы все проверки уложились в probe.max_daily_probe_mb (ДОП-4).
@@ -646,8 +854,20 @@ class Daemon:
         self._refresh_asked = False
         self._scan_asked = False
         self._manual_scan = False
-        self._refreshing = False
+        self._fetch: _Fetch | None = None  # опрос подписок в фоне: идёт или ждёт применения
+        # Сколько шаг ждёт начатого им опроса подписок (REFRESH_WAIT); None — до конца
+        # (`xgw run --once`: шаг один, применить итог позже некому).
+        self.refresh_wait: float | None = REFRESH_WAIT
         self._rebuild_asked = False
+        self._build: _Build | None = None
+        self._build_next: _BuildRequest | None = None
+        self._build_applied = False
+        self._build_discarded = 0
+        self._build_count = 0
+        self._build_last = (0.0, 0.0)
+        self._build_outcome: str | None = None
+        self._loop_step_s = 0.0
+        self._health_observed: float | None = None
 
     # --- цикл ------------------------------------------------------------------
 
@@ -656,17 +876,73 @@ class Daemon:
         self.log.info("демон XGW запущен, шаг watchdog %d с", self.cfg.watchdog.interval_s)
         self._stop = stop
         while not stop.is_set() and not changed():
+            started = time.monotonic()
+            self._loop_progress("tick", started=started)
             try:
                 state = self.tick()
             except Exception:  # сбой одного шага не должен ронять демон
                 self.log.exception("шаг watchdog завершился ошибкой")
                 state = self.machine.state
+            spent = time.monotonic() - started
+            self._loop_step_s = spent
+            if spent >= TICK_SLOW:
+                # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
+                # freepool-recovery, youtube: режим «весь дом» не появлялся в ней 3 минуты).
+                self.log.warning("шаг watchdog занял %d с — состояние обновлено с опозданием (%s)",
+                                 spent, self._tick_work())
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
+            if self._build is not None or self._build_next is not None:
+                pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:
                 pause = MANUAL_SCAN_PAUSE
-            self._sleep(stop, changed, jitter(pause))
+            period = jitter(pause)
+            # Нормальный интервал — от начала шага. Иначе работа 8 с + ожидание
+            # 20–24 с дают 28–32 с без нового статуса даже без долгой сборки.
+            # WAN_DOWN и ручной скан сохраняют прежнюю паузу ПОСЛЕ работы.
+            relative = state is not State.WAN_DOWN and not (self._manual_scan and self.scan_queue)
+            deadline = (started if relative else time.monotonic()) + period
+            self._loop_progress("sleep", started=started, deadline=deadline,
+                                period=period, step_s=spent)
+            self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
+        self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+
+    def _loop_progress(self, phase: str, **details) -> None:
+        """Отдельная запись работы цикла для конечного помощника проверки.
+
+        Не переписывает status.json и не выдаёт старое состояние за свежее.
+        Ни имён серверов, ни адресов, ни настроек подключения здесь нет.
+        """
+        try:
+            atomic_write_json(self.paths.run / "watchdog-step.json", {
+                "phase": phase, "at": time.monotonic(), "interval_s": self.cfg.watchdog.interval_s,
+                "previous_step_s": self._loop_step_s, **details,
+            }, mode=0o600)
+        except OSError as exc:
+            self.log.debug("ход цикла не записан: %s", exc)
+
+    def _tick_work(self) -> str:
+        """Что из долгого шло в последнем шаге и на что ушло время — для строки о долгом шаге
+        (run). Отчёт youtube2: шаги по 93–120 с после установки, запуска демона и обновления
+        подписки шли «без проверок и замеров» — части шага скажут, где время."""
+        parts = [name for name, done in (
+            ("скан", self._scanned), ("замер скорости подписки", self._speed_ran),
+            ("замер сервера пула", self._pool_speed_ran), ("проверка YouTube", self._youtube_ran),
+        ) if done]
+        longest = sorted(((spent, name) for name, spent in self._tick_spent.items()
+                          if spent >= TICK_PART), reverse=True)
+        text = ", ".join(parts) or "без проверок и замеров"
+        if longest:
+            text += "; дольше всего — " + ", ".join(
+                f"{name} {spent:.0f} с" for spent, name in longest[:3])
+        return text
+
+    def _spent(self, name: str, since: float) -> float:
+        """Часть шага name шла с since до сейчас (для _tick_work); сейчас — начало следующей."""
+        moment = time.monotonic()
+        self._tick_spent[name] = self._tick_spent.get(name, 0.0) + moment - since
+        return moment
 
     @property
     def stopping(self) -> bool:
@@ -760,6 +1036,58 @@ class Daemon:
         if done:
             self.log.info("%s", done)
 
+    def _usage_step(self, applied: dict | None) -> None:
+        """Учёт расхода трафика (usage.py): раз в минуту — разницы счётчиков nftables и Xray в
+        базу. Счётчики Xray — из ответа /debug/vars этого шага (_read_observatory)."""
+        try:
+            self.meter.step(self.store, self._metrics, applied,
+                            self.inventory.nodes if self.inventory is not None else ())
+        except Exception as exc:  # учёт не должен останавливать шлюз
+            self.log.error("учёт трафика: шаг не выполнен: %s", exc)
+
+    def request_freepool_refresh(self) -> None:
+        """Панель: опросить источники бесплатного пула сейчас."""
+        self._freepool_force = True
+        self._freepool_next = 0.0
+        self.poke.set()
+
+    def _freepool_step(self, now: float, applied: dict) -> None:
+        """Шаг бесплатного пула: раз в FREEPOOL_EVERY — фоновый поток с опросом источников,
+        которым пора, и проверками нескольких кандидатов. Режим off — ничего. Состав «pool»
+        рабочего конфига пул получает до запуска потока: его серверы проверяются раньше прочих
+        (FreePool.next_checks) и после запуска демона — с первой же пачки (отчёт
+        freepool-recovery: в первую пачку после запуска вклинился посторонний сервер)."""
+        if self.cfg.free_pool.mode == "off":
+            self._freepool_summary = None
+            return
+        self.freepool.members = frozenset(
+            info.fingerprint for info in builder.applied_pool(applied)
+        ) if traffic.pool_active(self.cfg) else frozenset()
+        busy = self._freepool_thread is not None and self._freepool_thread.is_alive()
+        if busy or now < self._freepool_next:
+            return
+        self._freepool_next = now + FREEPOOL_EVERY
+        force, self._freepool_force = self._freepool_force, False
+        via = engine.healthy_http_in(self.cfg)
+        from .generator import validate
+
+        xray_bin = validate.find_xray(None, self.paths)
+        cancel = _PoolCancel(self._stop, self.freepool)
+
+        def work() -> None:
+            try:
+                if self._freepool_summary is None:  # после запуска — сразу то, что сохранено
+                    self._freepool_summary = self.freepool.summary()
+                self.freepool.refresh_due(via=via, mark=self.mark, force=force)
+                self.freepool.check_some(mark=self.mark, xray_bin=xray_bin, via=via,
+                                         cancel=cancel)
+                self._freepool_summary = self.freepool.summary()
+            except Exception:  # опытный режим не должен останавливать шлюз — в журнал целиком
+                self.log.exception("бесплатный пул: шаг не выполнен")
+
+        self._freepool_thread = threading.Thread(target=work, name="xgw-freepool", daemon=True)
+        self._freepool_thread.start()
+
     def request_refresh(self) -> None:
         """Панель: обновить подписки сейчас, не дожидаясь refresh_minutes. Заодно заново
         проверяются домены, отложенные как несуществующие."""
@@ -770,11 +1098,24 @@ class Daemon:
     def adopt(self, previous: Daemon) -> None:
         """Настройки перечитаны. Если источники серверов прежние, подписки заново
         не запрашиваются: конфиг пересобирается из уже полученного списка — так
-        отключение сервера в панели не стоит запроса к каждой подписке."""
+        отключение сервера в панели не стоит запроса к каждой подписке. Опрос подписок, который
+        прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
+        прежних отменяется."""
         self._resume(previous)
-        if previous.inventory is None or (
-            engine.sources_key(previous.cfg) != engine.sources_key(self.cfg)
-        ):
+        if previous._build is not None:
+            # Поток не трогаем и второй параллельно не запускаем. Старый результат
+            # отбросим; настройкам нового экземпляра нужен собственный снимок.
+            self._build = previous._build
+            self._build.discard = True
+            self._build.wake = self.poke
+            previous._build = None
+        same = engine.sources_key(previous.cfg) == engine.sources_key(self.cfg)
+        if previous._fetch is not None and same:
+            self._fetch = previous._fetch
+            self.next_refresh = previous.next_refresh
+        elif previous._fetch is not None:
+            previous._fetch.cancel.dropped.set()
+        if previous.inventory is None or not same:
             return
         self.inventory = previous.inventory
         self.next_refresh = previous.next_refresh
@@ -783,6 +1124,18 @@ class Daemon:
             # Свой сервер устройства (Ф4) выбран в панели — его ждут сразу. С 0.2.0 это только
             # правило маршрутизации: применяется через API ядра, без перезапуска Xray.
             self._urgent_rebuild = "свой сервер устройства"
+        modes = (previous.cfg.free_pool.mode, self.cfg.free_pool.mode)
+        if modes[0] != modes[1] and "on" in modes:
+            # Весь дом через пул (М2б.2) включили или выключили в панели — ждут сразу. Пробы ядра
+            # для пула (burstObservatory) могут потребовать перезапуска Xray.
+            self._urgent_rebuild = ("бесплатный пул: весь дом" if modes[1] == "on"
+                                    else "бесплатный пул: режим подписок")
+        if (previous.cfg.managed.free_pool_pin != self.cfg.managed.free_pool_pin
+                and traffic.pool_active(self.cfg)):
+            # Сервер пула выбран вручную в панели — в состав «pool» он должен попасть сразу
+            # (engine.assemble ставит его первым), а закрепит его _pool_step.
+            self._urgent_rebuild = (self._urgent_rebuild
+                                    or "бесплатный пул: выбранный вручную сервер")
         # Серверы те же — заново проверять участников незачем.
         self.vetted = set(previous.vetted)
         self.bad_members = dict(previous.bad_members)
@@ -811,6 +1164,37 @@ class Daemon:
         self._device_streak = dict(previous._device_streak)
         self._device_checked = dict(previous._device_checked)
         self._device_dead = set(previous._device_dead)
+        self._pool_pinned = previous._pool_pinned
+        self._pool_pin_key = previous._pool_pin_key
+        self._pool_checked_at = previous._pool_checked_at
+        self._pool_rebuilt_at = previous._pool_rebuilt_at
+        self._pool_names = dict(previous._pool_names)
+        self._pool_traffic = previous._pool_traffic
+        self._pool_wait_since = previous._pool_wait_since
+        self._pool_ids = dict(previous._pool_ids)
+        self._pool_speed = previous._pool_speed
+        self._pool_since, self._pool_basis = previous._pool_since, previous._pool_basis
+        self._pool_deferred_since = previous._pool_deferred_since
+        self._pool_bytes, self._pool_own = previous._pool_bytes, previous._pool_own
+        self._pool_downlinks = dict(previous._pool_downlinks)
+        self._pool_measured = previous._pool_measured
+        self._pool_spared_tag = previous._pool_spared_tag
+        self._pool_silent = dict(previous._pool_silent)
+        self._pool_refreshed_at = previous._pool_refreshed_at
+        self._pool_tags = set(previous._pool_tags)
+        self._pool_boot, self._pool_saved = previous._pool_boot, previous._pool_saved
+        self._youtube = previous._youtube
+        self._youtube_down = previous._youtube_down
+        self._youtube_rates = dict(previous._youtube_rates)
+        self._youtube_own = previous._youtube_own
+        self._youtube_tainted = previous._youtube_tainted
+        self._youtube_bg_at = previous._youtube_bg_at
+        self._youtube_switches = list(previous._youtube_switches)
+        self._youtube_paused_until = previous._youtube_paused_until
+        self._youtube_noted = set(previous._youtube_noted)
+        self.diary = previous.diary
+        self.diary.store = self.store
+        self._house_synced_at = previous._house_synced_at
         self._health = previous._health
         self._observed = dict(previous._observed)
         self._rebalance_at = previous._rebalance_at
@@ -859,6 +1243,14 @@ class Daemon:
         self._escalated = dict(previous._escalated)
         self._unstable = dict(previous._unstable)
         self._closed = dict(previous._closed)
+        self.freepool = previous.freepool
+        self.freepool.cfg = self.cfg
+        self._freepool_next = previous._freepool_next
+        self._freepool_thread = previous._freepool_thread
+        self._freepool_summary = previous._freepool_summary
+        self._freepool_force = previous._freepool_force
+        self.meter = previous.meter
+        self.meter.cfg = self.cfg
         self._calm = dict(previous._calm)
         self._calm_seen = dict(previous._calm_seen)
         self._dead_scanned = dict(previous._dead_scanned)
@@ -925,7 +1317,7 @@ class Daemon:
 
     @property
     def refresh_pending(self) -> bool:
-        return self._refresh_asked or self._refreshing
+        return self._refresh_asked or self._fetch is not None
 
     @property
     def scan_pending(self) -> bool:
@@ -934,7 +1326,10 @@ class Daemon:
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
         now = self.clock()
-        self._scanned = False
+        self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
+        self._tick_spent = {}
+        self._build_applied = False
+        at = time.monotonic()
         resumed, self._resumed = self._resumed, False
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
@@ -950,7 +1345,8 @@ class Daemon:
         if applied is None:
             # Первый запуск: рабочего конфига ещё нет — собрать и запустить Xray.
             if now >= self.next_refresh or refresh_asked or self._rebuild_asked:
-                self._refresh(now, via_xray=False, urgent=True)
+                self._refresh(now, via_xray=False, urgent=True, background=False)
+            at = self._spent("первая сборка конфига", at)
             applied = engine.read_json(self.paths.xray_config_file)
             if applied is None:
                 self._write_status([], None, False)
@@ -962,6 +1358,8 @@ class Daemon:
         reserve = builder.reserve_tag(applied)
         signals, observatory = self._signals(members, now, reserve=bool(reserve))
         signals = self._probe_target(view, applied, signals, now)
+        self._health_observed = time.monotonic()
+        at = self._spent("сигналы ядра", at)
         previous = self.machine.state
         decision = self.machine.update(signals)
         state = decision.state
@@ -1008,6 +1406,10 @@ class Daemon:
                 "в том числе лимитированных",
             )
         self._whitelist_step(view, signals, state, now)
+        at = self._spent("белый список", at)
+        self._freepool_step(now, applied)
+        at = self._spent("списки бесплатного пула", at)
+        self._usage_step(applied)
 
         urgent = state in (State.ALL_DEAD, State.XRAY_DOWN)
         changed = False
@@ -1037,6 +1439,11 @@ class Daemon:
             self._write_status(view, observatory, signals.xray_ok)
             return state
 
+        # Новые сигналы и сверка перехвата уже получены. Не задерживаем их
+        # публикацию до конца сканов, замеров и применения готовой сборки.
+        self._write_status(view, observatory, signals.xray_ok, checkpoint=True)
+        if not changed and state is not State.XRAY_DOWN and not self.core_job:
+            changed = self._finish_build()
         if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._singbox_step(now)
         if (
@@ -1048,9 +1455,13 @@ class Daemon:
         if not changed and self.paths.pending_config_file.exists():
             changed = self._apply_pending(urgent)
         self._containers_appeared(applied)
+        at = self._spent("перехват и конфиг", at)
         if signals.xray_ok:
             self._device_step(view, applied, observatory)
+            self._pool_step(applied, observatory or {})
+            self._house_sync(applied, now)
             self._rtt_step(view, applied, observatory)
+        at = self._spent("устройства и сервер пула", at)
         if not changed and self._urgent_rebuild and self.inventory is not None:
             # Срочно, без окна перезапуска: пока ядро пробует недоступный probe.url, оно
             # считает мёртвыми всех участников; без inbound TUN контейнеры без интернета.
@@ -1059,7 +1470,10 @@ class Daemon:
                 self._rebuild_asked = False
                 self._save_inventory(self.inventory)
             changed = self._rebuild(None, urgent=True, reason=reason)
-        if not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
+        if not changed and self._fetch is not None and self._fetch.done.is_set():
+            # Опрос подписок шёл в фоне (_refresh) и закончился — его итог в работу.
+            changed = self._refresh_done(now, urgent)
+        elif not changed and state is State.ALL_DEAD and now >= self.next_all_dead:
             # Внеочередное обновление подписки напрямую и скан всех запасных.
             self.next_all_dead = now + ALL_DEAD_RETRY
             changed = self._refresh(now, via_xray=False, urgent=True)
@@ -1090,6 +1504,7 @@ class Daemon:
         # Проба профиля, которую прервал перезапуск демона (или итог которой не применился), —
         # снова в памяти до сканов: иначе скан принял бы пробный профиль за выученный.
         self._resume_trials()
+        at = self._spent("подписка и сборка конфига", at)
 
         # Пока не отвечает сам probe.url, сканы только испортили бы вердикты запасных
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
@@ -1108,7 +1523,9 @@ class Daemon:
         elif scan_asked:
             self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
         if not changed and probing and signals.xray_ok and signals.provider_ok:
-            if now >= self.next_scan:
+            # Подписка после запуска демона ещё не получена (опрос в фоне): цены запасных
+            # неизвестны, _queue_scan их пропустил бы — круг ждёт её, а не следующего срока.
+            if now >= self.next_scan and self.inventory is not None:
                 self.next_scan = now + jitter(self._scan_period(view) * 60.0)
                 self._queue_scan(view, now)
             self._queue_members(view)
@@ -1131,6 +1548,7 @@ class Daemon:
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
+        at = self._spent("сканы и замены", at)
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
@@ -1139,11 +1557,18 @@ class Daemon:
             return state
         self._manual_step(view, applied, observatory or {}, signals)
         self._main_step(view, applied, observatory or {}, state, signals, now)
+        at = self._spent("основной сервер и замеры подписки", at)
+        if signals.xray_ok and not changed:  # после перезапуска Xray пробы ядра устарели
+            self._pool_speed_step(applied, observatory or {}, now)
+            self._youtube_step(view, applied, observatory or {}, now)
+        at = self._spent("замер пула и YouTube", at)
         if state is not State.WAN_DOWN:
             self._cores_step()
             self._netmon_step(signals.xray_ok)
+        at = self._spent("ядра и сеть", at)
         self._publish_scores(view, observatory or {})
         self._write_status(view, observatory, signals.xray_ok)
+        self._spent("запись состояния", at)
         return state
 
     # --- сигналы ---------------------------------------------------------------
@@ -1562,7 +1987,8 @@ class Daemon:
         for url in others:
             if self.stopping:
                 return ""
-            if target.answers_via(self.cfg, members, password, url, user=builder.PROBE_USER):
+            if target.answers_via(self.cfg, members, password, url, user=builder.PROBE_USER,
+                                  cancel=self._stop):
                 self.hosts.answered(url)
                 return url
         return ""
@@ -1782,6 +2208,13 @@ class Daemon:
                 self.notifier.event("capture", tidied)
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
+            guard_loaded = getattr(capture, "guard_loaded", None)
+            if guard_loaded is not None:
+                try:
+                    if guard_loaded() is True:
+                        text += "; барьер соответствует политике и остаётся загруженным"
+                except Exception:
+                    pass  # ошибка диагностики не заменяет исходную причину сбоя загрузки
             self.log.error("%s", text)
             if text != self._capture_error:  # одно событие на причину, а не на каждый шаг
                 self._capture_error = text
@@ -1841,26 +2274,66 @@ class Daemon:
             self.paths.pending_config_file.unlink(missing_ok=True)
         return self._report(outcome, "отложенный перезапуск")
 
-    def _refresh(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
-        """Опрос подписок и применение изменений."""
+    def _refresh(
+        self, now: float, *, via_xray: bool, urgent: bool, background: bool = True,
+    ) -> bool:
+        """Опрос подписок и применение изменений. Опрос — в фоновом потоке (REFRESH_WAIT):
+        шаг ждёт его не дольше refresh_wait (background=False — до конца: первый запуск,
+        рабочего конфига ещё нет), не дождался — итог применит первый шаг после конца опроса
+        (_refresh_done). Опрос уже идёт — второй не начинается, срочность переходит к нему."""
         if self.stopping:
             return False
-        self._refreshing = True
-        try:
-            return self._refresh_now(now, via_xray=via_xray, urgent=urgent)
-        finally:
-            self._refreshing = False
+        job = self._fetch if self._fetch is not None else self._start_fetch(now, via_xray)
+        job.urgent = job.urgent or urgent
+        with job.lock:
+            job.waiting = True
+        job.done.wait(self.refresh_wait if background else None)
+        with job.lock:
+            job.waiting = False
+            finished = job.done.is_set()
+        if not finished:
+            return False
+        return self._refresh_done(now, urgent)
 
-    def _refresh_now(self, now: float, *, via_xray: bool, urgent: bool) -> bool:
+    def _start_fetch(self, now: float, via_xray: bool) -> _Fetch:
         minutes = min((sub.refresh_minutes for sub in self.cfg.subscriptions), default=60)
         self.next_refresh = now + jitter(max(1, minutes) * 60.0)
-        try:
-            inventory = self._collect(via_xray)
-        except fetch.Cancelled:
+        # Начавший опрос шаг его ждёт (_refresh) — и тогда, когда поток кончил раньше, чем шаг
+        # начал ждать.
+        job = self._fetch = _Fetch(via_xray, False, _FetchCancel(self._stop), waiting=True)
+        self.log.info("опрос подписок начат — идёт в фоне, шаги демона не ждут")
+
+        def work() -> None:
+            began = time.monotonic()
+            try:
+                job.inventory = self._collect(via_xray)
+            except Exception as exc:  # итог — шагу (_refresh_done), как при опросе в нём самом
+                job.error = exc
+            job.spent = time.monotonic() - began
+            with job.lock:
+                job.done.set()
+                wake = not job.waiting
+            if wake:
+                self.poke.set()  # итог — в работу сразу, не дожидаясь очередного шага
+
+        threading.Thread(target=work, name="xgw-subscriptions", daemon=True).start()
+        return job
+
+    def _refresh_done(self, now: float, urgent: bool) -> bool:
+        """Итог опроса подписок (_refresh) — в работу: ошибки для панели, список серверов и
+        сборка конфига (срочная, если срочным был опрос или шаг, который его применяет)."""
+        job, self._fetch = self._fetch, None
+        assert job is not None
+        if isinstance(job.error, fetch.Cancelled):
             # Остановка прервала опрос: о подписках он ничего не говорит — ни сбоя, ни
             # ошибок для панели, ни неполного списка серверов.
             self.log.info("опрос подписок прерван: демон останавливается")
             return False
+        if job.error is not None:
+            raise job.error
+        inventory = job.inventory
+        assert inventory is not None
+        self._rebuild_spent = (0.0, 0.0)
         self._save_errors(inventory)
         if inventory.nodes:
             self._save_inventory(inventory)
@@ -1884,36 +2357,166 @@ class Daemon:
         if inventory.complete:
             self._sub_failing_since, self._sub_alerted = None, False
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
-        return self._rebuild(None, urgent=urgent, reason="обновление подписки")
+        changed = self._rebuild(None, urgent=job.urgent or urgent, reason="обновление подписки")
+        # Отчёты youtube3 и audit6: шаг с обновлением подписки длится 80–110 с — где именно время.
+        # Опрос с 0.2.0 — в фоне, вне шага; сборка и применение — в шаге.
+        self.log.info("обновление подписки: опрос %.0f с; сборка запрошена отдельно", job.spent)
+        return changed
+
+    def _assembly_stamp(self) -> tuple:
+        """Версии входных файлов и допуска к трафику, не счётчиков и рейтинга."""
+        files = (self.paths.config_file, managed.path_for(self.paths.config_file),
+                 self.paths.xray_config_file, self.paths.singbox_config_file,
+                 self.paths.devices_down_file, self.paths.var / "probe-fallback.json",
+                 self.xray_bin, singboxing.find_binary(None, self.paths))
+        def version(path):
+            if path is None:
+                return None
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                return None
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        applied = engine.read_json(self.paths.xray_config_file)
+        members = {info.fingerprint for info in builder.applied_pool(applied)}
+        pool = ()
+        if traffic.pool_active(self.cfg):
+            admitted = traffic.admitted(self.cfg, self.paths, self.wall(), members=members)
+            pool = tuple(sorted(item.node.fingerprint for item in admitted))
+        pin = self._manual_pin()
+        choice = tuple(pin.get(key) for key in ("tag", "until", "since", "down")) if pin else ()
+        return (tuple(version(path) for path in files), self._singbox_failed,
+                self._singbox_window(),
+                tuple(sorted(engine._carrying_tags(self.paths, applied))), pool, choice)
 
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
         reserve: str | None = None, profiles: dict[str, str] | None = None,
+        complete=None,
     ) -> bool:
+        """Запрос сборки: один поток и один объединённый следующий запрос.
+
+        Только готовый, ещё актуальный результат применяется в шаге демона.
+        Быстрая сборка укладывается в BUILD_WAIT. Без рабочего конфига/при --once
+        первый запуск ждёт результат, как прежде; рабочий watchdog этого не делает.
+        """
         assert self.inventory is not None
         if self.stopping:
-            # Остановка пришла, пока шёл опрос подписок или сканы: новое применение не
-            # начинаем — прерывать его на середине нельзя, а ждать его systemd не обязан.
-            self.log.info("%s: не применяется — демон останавливается", reason)
             return False
-        dead = engine.quarantined()
-        # Перечитывание sing-box рвёт соединения через него: сразу — при аварии и в окне
-        # перезапуска, иначе — только если через него никто не идёт (engine.assemble).
-        reload = True if urgent or self._singbox_window() else None
-        try:
-            assembly = self._assemble(prefer, reserve, profiles, reload)
-        except engine.EngineError as exc:
-            self.notifier.event("config", f"{reason}: {exc}", notify=True)
+        request = _BuildRequest(copy.deepcopy(prefer), urgent, reason, reserve,
+                                dict(profiles or {}))
+        request.callbacks.update(complete or {})
+        job = self._build
+        base = self._build_next
+        if (base is None and job is not None
+                and job.cfg is self.cfg and job.inventory is self.inventory):
+            base = job.request
+        if base is not None:
+            callbacks = dict(base.callbacks)
+            for key, callback in request.callbacks.items():
+                callbacks.pop(key, None)
+                callbacks[key] = callback
+            request = _BuildRequest(
+                request.prefer if request.prefer is not None else base.prefer,
+                base.urgent or request.urgent, reason,
+                request.reserve if request.reserve is not None else base.reserve,
+                {**base.profiles, **request.profiles}, callbacks,
+            )
+        if job is not None:
+            if not job.discard and request.key() == job.request.key():
+                job.request.callbacks = request.callbacks
+                return False
+            self._build_next = request
+            job.discard = True
             return False
-        finally:
-            if engine.quarantined() != dead:
-                # Сборка отложила домены, которых нет в DNS. Список для панели записан до
-                # неё — иначе там такой сервер значился бы «включён, сейчас возьмёт в работу».
-                self._save_inventory(self.inventory)
-        outcome = self._apply(assembly.result.config, urgent=urgent, singbox=assembly.singbox)
+        if self._build_applied:
+            self._build_next = request
+            self.poke.set()
+            return False
+        self._build_next = None
+        job = self._start_build(request)
+        wait = (None if self.refresh_wait is None or not self.paths.xray_config_file.exists()
+                else BUILD_WAIT)
+        job.done.wait(wait)
+        return self._finish_build()
+
+    def _start_build(self, request: _BuildRequest) -> _Build:
+        assert self.inventory is not None and self._build is None
+        # Поток не получает соединение SQLite шага и не читает изменяемые поля Daemon.
+        # Рейтинг — последний опубликованный снимок; при его отсутствии engine читает
+        # сохранённый рейтинг собственным соединением.
+        inputs = (copy.deepcopy(self.cfg), copy.deepcopy(self.inventory),
+                  self._scores_now(), self._singbox_failed)
+        reload = True if request.urgent or self._singbox_window() else None
+        job = self._build = _Build(request, self.cfg, self.inventory, inputs,
+                                   self._assembly_stamp(), reload, self.poke, engine.quarantined())
+        self.log.info("сборка конфига начата — идёт в фоне, шаги демона не ждут")
+        self._build_count += 1
+        def work():
+            try:
+                job.assembly = self._assemble(request.prefer, request.reserve, request.profiles,
+                                              reload, snapshot=inputs)
+            except Exception as exc:
+                job.error = exc
+            finally:
+                job.spent = time.monotonic() - job.began
+                job.done.set()
+                job.wake.set()
+        threading.Thread(target=work, name="xgw-config-build", daemon=True).start()
+        return job
+
+    def _finish_build(self) -> bool:
+        """Вызывается только шагом: проверка актуальности, применение, учёт и продолжения."""
+        if self.stopping or self._build_applied:
+            return False
+        job = self._build
+        if job is None:
+            if self._build_next is not None and self.inventory is not None:
+                request, self._build_next = self._build_next, None
+                self._start_build(request)
+            return False
+        if not job.done.is_set():
+            return False
+        self._build = None
+        if engine.quarantined() != job.dead and self.inventory is not None:
+            self._save_inventory(self.inventory)
+        stamp = self._assembly_stamp()
+        current = (job.cfg is self.cfg and job.inventory is self.inventory
+                   and job.inputs[0] == self.cfg and job.inputs[1] == self.inventory
+                   and job.stamp == stamp)
+        if job.discard or not current:
+            self._build_discarded += 1
+            self.log.info("устаревшая сборка конфига отброшена без применения")
+            if self._build_next is None and not job.discard:
+                # Файл поменялся без нового запроса: пересобрать, а не применить старое.
+                self._build_next = (job.request if job.stamp[-1] == stamp[-1] else
+                                    _BuildRequest(None, job.request.urgent, "изменён ручной выбор"))
+            if self._build_next is not None and self.inventory is not None:
+                request, self._build_next = self._build_next, None
+                self._start_build(request)
+            return False
+        if job.error is not None:
+            if isinstance(job.error, engine.EngineError):
+                self.notifier.event("config", f"{job.request.reason}: {job.error}", notify=True)
+                return False
+            raise job.error
+        assembly = job.assembly
+        assert assembly is not None
+        began = time.monotonic()
+        outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
+                              singbox=assembly.singbox)
+        self._rebuild_spent = (job.spent, time.monotonic() - began)
+        self._build_last = self._rebuild_spent
+        self._build_outcome = outcome.mode
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)
-        return self._report(outcome, reason)
+        changed = self._report(outcome, job.request.reason)
+        self._build_applied = True
+        for callback in job.request.callbacks.values():
+            callback(changed)
+        self.log.info("конфиг собран в фоне за %.1f с, применён в шаге за %.1f с",
+                      *self._rebuild_spent)
+        return changed
 
     def _report(self, outcome: ApplyOutcome, reason: str) -> bool:
         """Событие по итогу применения; True — рабочий конфиг изменился."""
@@ -1958,22 +2561,28 @@ class Daemon:
             self.log.error("ошибки подписок не записаны: %s", exc)
 
     def _collect(self, via_xray: bool) -> engine.Inventory:
+        """Опрос подписок; идёт в фоновом потоке (_start_fetch)."""
+        job = self._fetch
         return engine.collect(
             self.cfg, self.paths, mark=self.mark, logger=self.log, via_xray=via_xray,
-            cancel=self._stop,
+            cancel=job.cancel if job is not None else self._stop,
         )
 
     def _assemble(
         self, prefer: list[str] | None, reserve: str | None = None,
         profiles: dict[str, str] | None = None, reload_singbox: bool | None = None,
+        *, snapshot: tuple | None = None,
     ) -> engine.Assembly:
         assert self.inventory is not None
+        cfg, inventory, scores, failed = snapshot if snapshot is not None else (
+            self.cfg, self.inventory, self._scores_now(), self._singbox_failed,
+        )
         return engine.assemble(
-            self.cfg, self.paths, self.inventory, mark=self.mark, logger=self.log,
-            xray_bin=self.xray_bin, prefer=prefer, scores=self._scores_now(),
+            cfg, self.paths, inventory, mark=self.mark, logger=self.log,
+            xray_bin=self.xray_bin, prefer=prefer, scores=scores,
             reserve=reserve,
             profiles=profiles, reload_singbox=reload_singbox,
-            singbox_ok=False if self._singbox_failed else None,
+            singbox_ok=False if failed else None,
         )
 
     def _apply(
@@ -2200,15 +2809,18 @@ class Daemon:
     def _scan_url(self, info: NodeInfo) -> str | None:
         """Чем проверять узел: запасной лимитированной подписки — дешёвым запросом
         (scan.cheap_url), остальные — проверочным хостом (None: _probe_scan берёт его по
-        кругу)."""
-        if info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0:
+        кругу). Запасной на пробе профиля обхода — проверочным хостом и при квоте: ответ в
+        сотни байт «заморозку» не покажет, а по нему решалось бы, выучен ли профиль (T05)."""
+        if (info.role == "spare" and self._prices().get(info.fingerprint, 1.0) > 0
+                and info.fingerprint not in self._profile_trial):
             return scan.cheap_url(self.cfg)
         return None
 
     def _probe_scan(self, info: NodeInfo, password: str) -> scan.ScanResult:
         """Собственная проба сервера. Хост — по кругу (watch/hosts.py); хост ответил ошибкой
-        HTTP (403, 404, 5xx) — та же проба другим хостом: ответил тот — пауза хосту, вердикт
-        по второй пробе. Обрыв и «заморозку» хост не объясняет — это вердикт о сервере."""
+        HTTP (403, 404, 5xx) или сбросил соединение, не начав ответа, — та же проба другим
+        хостом: ответил тот — пауза хосту, вердикт по второй пробе. Обрыв посреди ответа и
+        «заморозку» хост не объясняет — это вердикт о сервере (hosts.host_specific)."""
         cheap = self._scan_url(info)
         if cheap is not None:
             return self._scan(info, password, cheap)
@@ -2292,9 +2904,12 @@ class Daemon:
             )
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
-        """url — адрес проверки; None — probe.url."""
+        """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
+        целиком: по итогу решается, выучен ли профиль, а случайная часть файла короче порога
+        «заморозки» дала бы OK и выучила бы негодный профиль (T05 кросс-аудита 4cc96b9)."""
         return scan.scan_node(
-            info, self.cfg, probe_pass=password, url=url, cancel=self._stop, random_size=True,
+            info, self.cfg, probe_pass=password, url=url, cancel=self._stop,
+            random_size=info.fingerprint not in self._profile_trial,
         )
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
@@ -2447,6 +3062,716 @@ class Daemon:
             self.log.error("не записан %s: %s", self.paths.devices_down_file, exc)
             return
         self._urgent_rebuild = self._urgent_rebuild or "свой сервер устройства: проверка сервера"
+
+    # --- устройства через бесплатный пул (М2б.1) --------------------------------------
+
+    def _pool_step(self, applied: dict, observatory: dict) -> None:
+        """Устройства через бесплатный пул (freepool/traffic.py). Закреплённый сервер
+        балансировщика «pool» — самый быстрый живой по замеру (_pool_speed_step), пока замеров
+        нет — с меньшей задержкой по пробам ядра; держится, пока жив, и сменяется более быстрым
+        без прыжков, как основной сервер подписки (_pool_choice); умер — лучший живой той же
+        страны; живых нет — закрепление снято, и балансировщик ведёт в block: у устройств
+        закрыто (R05)."""
+        devices = traffic.pool_devices(self.cfg)
+        whole = traffic.whole_house(self.cfg)  # весь дом через пул (М2б.2)
+        who = "весь дом" if whole else ", ".join(devices)
+        now = self.wall()
+        if (devices or whole) and now - self._pool_checked_at >= POOL_CHECK:
+            self._pool_checked_at = now
+            self._pool_due(applied, now)
+        pool = builder.applied_pool(applied)
+        self._house_mark(whole)
+        if not (devices or whole):
+            self._pool_pinned, self._pool_traffic, self._pool_boot = "", None, ""
+            self._pool_remember("")
+            self._pool_silence([], set(), now)
+            self._pool_tags = set()
+            self.diary.idle()
+            return
+        # Выбывшие из состава — по самому составу, кто бы его ни пересобрал (_pool_due, запуск
+        # демона, смена подписок): отчёт freepool-recovery, дневник отставал от событий.
+        tags = {info.tag for info in pool}
+        if self._pool_tags - tags:
+            self.diary.count("dropped", len(self._pool_tags - tags))
+        self._pool_tags = tags
+        try:
+            key = self.paths.xray_config_file.stat().st_mtime
+        except OSError:
+            key = 0.0
+        was_closed = self._pool_traffic.get("closed") if self._pool_traffic else None
+        # Шаг идёт раньше срочной пересборки: при включении режима он видел старый конфиг без
+        # серверов пула и писал «допущенных серверов нет — закрыто» (отчёт М2б.2, дефект 1).
+        # Пока пересборка впереди, а после перезапуска Xray (сборкой, установкой, самим ядром) —
+        # до первых проб ядра (не опробован ещё не мёртв), это «подключаются»: сводка без
+        # «traffic», без события и без снятия закрепления — не дольше POOL_WAIT от начала
+        # ожидания (отчёт m2b2fix, дефект 3). Уже закрытое так и остаётся закрытым.
+        waiting = (not pool and bool(self._urgent_rebuild)) or (
+            bool(pool) and not any(info.tag in observatory for info in pool))
+        if not waiting or was_closed is True:
+            self._pool_wait_since = 0.0
+        elif now - (self._pool_wait_since or now) < POOL_WAIT:
+            self._pool_wait_since = self._pool_wait_since or now
+            self._pool_traffic = None
+            self.diary.tick(closed=False, mbps=None)
+            return
+        alive = [info for info in pool if (observatory.get(info.tag) or {}).get("alive")]
+        spared = self._pool_spared(pool, observatory, now)
+        if spared is not None:
+            alive.append(spared)
+        live = {info.tag for info in alive}
+        self._pool_silence(pool, live, now)
+        if not self._pool_pinned and self._pool_boot:
+            # Демон только запущен: закреплённый до запуска сервер (POOL_PINNED_META) — нынешний.
+            # Жив — закрепляется снова без смены и без события (отчёт freepool-recovery2, дефект 1:
+            # «весь дом идёт через» второй раз и выбор лучшего заново); молчит — смена с причиной.
+            self._pool_pinned = next((info.tag for info in pool
+                                      if self._pool_ids.get(info.tag) == self._pool_boot), "")
+            self._pool_boot = ""
+            if self._pool_pinned in live:
+                self._pool_since = now
+                self.log.info("бесплатный пул после запуска демона — через прежний %s",
+                              self._pool_pinned)
+        candidates = [self._pool_candidate(info, observatory) for info in alive]
+        # YouTube (_youtube_step): сервер, через который YouTube не проходит или тормозит, не
+        # выбирается, пока есть другие живые; плохи все — выбор как без проверки.
+        fine = [item for item in candidates if not self._youtube_bad(item.key)]
+        why = ""
+        if fine and len(fine) < len(candidates) and self._pool_pinned in live:
+            why = self._youtube_bad(self._pool_ids.get(self._pool_pinned, ""))
+        # Выбранный вручную на вкладке «Бесплатные серверы» — пока жив; молчит или ещё не в
+        # составе — сервер выбирает шлюз, как у выбранного вручную сервера подписки.
+        pin = self.cfg.managed.free_pool_pin
+        wanted = traffic.pinned(alive, pin)
+        manual = "on" if wanted is not None else "down" if pin else ""
+        current, slower, basis = self._pool_choice(
+            fine or candidates, wanted.tag if wanted is not None else "", now)
+        if current != self._pool_pinned or (current and key != self._pool_pin_key):
+            try:
+                if current:
+                    self.api.pin(POOL_BALANCER, current)
+                elif self._pool_pinned and pool:  # без серверов нет и балансировщика «pool»
+                    self.api.unpin(POOL_BALANCER)
+            except ApiError as exc:
+                self.log.warning("сервер бесплатного пула не закреплён: %s", exc)
+                return
+            if current != self._pool_pinned:
+                self._pool_since = now
+                chosen = next((item for item in candidates if item.tag == current), None)
+                lost = self._pool_pinned if current and manual != "on" and slower is None else ""
+                gone = "" if not lost else "youtube" if why else (
+                    "dead" if any(info.tag == lost for info in pool) else "left")
+                self.notifier.event("freepool", self._pool_change_text(
+                    current, pool, who, manual, chosen=chosen, slower=slower,
+                    lost="" if manual else lost, gone=gone, why=why))
+                if current:
+                    self.diary.count("switch_" + (
+                        "manual" if manual == "on" else "speed" if slower is not None
+                        else gone or "first"))
+                if gone == "youtube":
+                    self._youtube_switched()
+                self._pool_remember(self._pool_ids.get(current, ""))
+            self._pool_pinned, self._pool_pin_key = current, key
+        elif not alive and was_closed is not True:
+            self.notifier.event("freepool", self._pool_change_text("", pool, who))
+        if not alive and was_closed is not True:
+            self.diary.count("closures")
+        if not alive and now - self._pool_refreshed_at >= POOL_REFRESH:
+            # Закрыто: списки — вне расписания (у источников могли смениться ключи и серверы).
+            self._pool_refreshed_at = now
+            self._freepool_force = True
+            self.diary.count("refreshed")
+            self.log.info("бесплатный пул закрыт — списки серверов обновляются вне расписания")
+        self._pool_basis = basis
+        name, country = self._pool_names.get(current, ("", ""))
+        mbps = next((item.mbps for item in candidates if item.tag == current), None)
+        self.diary.tick(closed=not alive, mbps=mbps)
+        self._pool_traffic = {
+            "devices": devices, "all": whole, "members": len(pool), "alive": len(alive),
+            "closed": not alive, "server": name, "country": country, "tag": current,
+            "delay_ms": round(((observatory.get(current) or {}).get("delay") or 0) * 1000)
+            if current else 0,
+            "mbps": mbps,
+            # Сервер выбран вручную: "on" — он и ведёт трафик, "down" — молчит или ещё не в
+            # составе (ведёт выбранный шлюзом), "" — выбирает шлюз.
+            "manual": manual,
+            # Серверы балансировщика «pool» для строк вкладки «Бесплатные серверы»: id — начало
+            # id варианта из тега pool-<страна>-<начало>, задержка — по пробам ядра, скорость —
+            # по свежему замеру (_pool_speed_step), YouTube — по последней проверке (_youtube_step).
+            "servers": [{
+                "id": info.fingerprint, "tag": info.tag, "alive": info.tag in live,
+                "delay_ms": round(((observatory.get(info.tag) or {}).get("delay") or 0) * 1000),
+                **self._pool_speed_view(info),
+                **self._youtube_view(self._pool_ids.get(info.tag, "")),
+            } for info in pool],
+        }
+
+    def _pool_silence(self, pool: list[NodeInfo], live: set[str], now: float) -> None:
+        """Серверы «pool», что молчат у проб ядра дольше POOL_SILENT, — пулу (FreePool.urgent):
+        их проверка — вне очереди, и с неудачей сервер выбывает из допущенных (_pool_due), а не
+        держит место до traffic.FRESH (восстановление, М3: истёкшие ключи, ушедшие серверы)."""
+        silent = {info.tag: self._pool_silent.get(info.tag, now) for info in pool
+                  if info.tag not in live}
+        self._pool_silent = silent
+        urgent = {info.fingerprint for info in pool
+                  if info.tag in silent and now - silent[info.tag] >= POOL_SILENT}
+        for info in pool:
+            if info.fingerprint in urgent and info.fingerprint not in self.freepool.urgent:
+                self.diary.count("rechecked")
+                self.log.info("сервер пула %s молчит у проб ядра %d мин — перепроверка вне "
+                              "очереди", info.tag, (now - silent[info.tag]) // 60)
+        self.freepool.urgent = frozenset(urgent)
+
+    def _pool_candidate(self, info: NodeInfo, observatory: dict) -> speed.Candidate:
+        name, country = self._pool_names.get(info.tag, ("", ""))
+        delay = (observatory.get(info.tag) or {}).get("delay")
+        return speed.Candidate(
+            tag=info.tag, key=self._pool_ids.get(info.tag, info.fingerprint), name=name,
+            mbps=self._pool_mbps(info), country=country,
+            delay_ms=delay * 1000.0 if isinstance(delay, (int, float)) else None,
+        )
+
+    def _pool_choice(self, candidates: list[speed.Candidate], wanted: str,
+                     now: float) -> tuple[str, speed.Candidate | None, str]:
+        """Закреплённый сервер «pool»: (тег, нынешний, если его сменил более быстрый, основание
+        выбора). Выбранный вручную (wanted) — пока жив. Нынешний держится, пока жив, и уступает
+        только замеренному, который быстрее на speed.gain_pct: сразу, если нынешний выбран
+        предварительно (основание "delay": замерены не все живые), иначе — продержавшись
+        speed.hold_minutes (без прыжков, как основной сервер подписки). Нынешнего нет —
+        лучший живой той же страны, иначе просто лучший (speed.best_like): замеренные — по
+        скорости, остальные — по задержке."""
+        if wanted:
+            return wanted, None, "manual"
+        pending = any(item.mbps is None for item in candidates)
+        held = next((item for item in candidates if item.tag == self._pool_pinned), None)
+        if held is None:
+            lost = self._pool_names.get(self._pool_pinned, ("", ""))[1]
+            pick = speed.best_like(candidates, lost, "")
+            if pick is None:
+                return "", None, ""
+            return pick.tag, None, "speed" if pick.mbps is not None and not pending else "delay"
+        by_delay = self._pool_basis == "delay"
+        rival = speed.best([item for item in candidates if item.tag != held.tag])
+        if rival is not None and speed.faster(rival, held, self.cfg.speed.gain_pct) and (
+                by_delay or now - self._pool_since >= self.cfg.speed.hold_minutes * 60.0):
+            return rival.tag, held, "delay" if pending else "speed"
+        # Замерены все живые — выбор окончательный, дальше нынешний держится hold_minutes.
+        return held.tag, None, "speed" if by_delay and not pending else self._pool_basis
+
+    def _pool_speeds(self) -> dict[str, dict]:
+        if self._pool_speed is None:
+            try:
+                loaded = json.loads(self.store.get_meta(POOL_SPEED_META) or "{}")
+            except ValueError:
+                loaded = {}
+            self._pool_speed = loaded if isinstance(loaded, dict) else {}
+        return self._pool_speed
+
+    def _pool_record(self, info: NodeInfo) -> dict | None:
+        """Последний замер сервера «pool» — по полному id варианта (_pool_due)."""
+        record = self._pool_speeds().get(self._pool_ids.get(info.tag, ""))
+        return record if isinstance(record, dict) else None
+
+    def _pool_mbps(self, info: NodeInfo) -> float | None:
+        """Свежий удачный замер сервера «pool», Мбит/с: не старше SPEED_FRESH сроков
+        speed.unlimited_hours; None — замера нет, он не удался или устарел, замеры выключены."""
+        hours = speed.every_hours(self.cfg, 0.0)
+        record = self._pool_record(info) or {}
+        mbps = record.get("mbps")
+        if not hours or not isinstance(mbps, (int, float)):
+            return None
+        if self.wall() - float(record.get("ts") or 0) > SPEED_FRESH * hours * 3600.0:
+            return None
+        return float(mbps)
+
+    def _pool_speed_view(self, info: NodeInfo) -> dict:
+        """Скорость сервера «pool» для строки вкладки: свежий замер, когда он был и шёл ли при
+        занятом канале (цифра может быть занижена)."""
+        mbps = self._pool_mbps(info)
+        if mbps is None:
+            return {"mbps": None}
+        record = self._pool_record(info) or {}
+        return {"mbps": mbps, "speed_at": record.get("ts"),
+                **({"speed_busy": True} if record.get("busy") else {})}
+
+    def _pool_busy(self, now: float) -> bool:
+        """Идёт ли через серверы пула заметный трафик: байт/с с прошлого шага больше
+        SPEED_BUSY_BPS без своего замера прошлого шага (как _traffic_busy у подписки)."""
+        counters = usage.outbound_counters(self._metrics)
+        total = sum(up + down for tag, (up, down) in counters.items()
+                    if tag.startswith(builder.POOL_PREFIX)) if counters else None
+        previous, self._pool_bytes = self._pool_bytes, (now, total) if total is not None else None
+        own, self._pool_own = self._pool_own, 0
+        if total is None or previous is None or now <= previous[0]:
+            return False
+        return (total - previous[1] - own) / (now - previous[0]) > SPEED_BUSY_BPS
+
+    def _pool_spared(self, pool: list[NodeInfo], observatory: dict,
+                     now: float) -> NodeInfo | None:
+        """Закреплённый сервер «pool», которого пробы ядра сочли мёртвым, хотя через него с
+        прошлого шага идёт трафик (не меньше watchdog.busy_bytes за busy_window_s): проба
+        опоздала в забитом канале, а сервер жив (как _dead_but_busy у подписки). Отчёт
+        freepool-speed, дефект 1: закреплённый дважды сменился за 4 минуты, пока замеры других
+        серверов занимали канал, а задержки бесплатных серверов — 1,6–3,9 с при пределе пробы
+        8 с. Свой замер через него из счётчика вычитается."""
+        downlinks = {
+            tag: (now, down) for tag, (_up, down) in usage.outbound_counters(self._metrics).items()
+            if tag.startswith(builder.POOL_PREFIX)
+        }
+        previous, self._pool_downlinks = self._pool_downlinks, downlinks
+        (measured, own), self._pool_measured = self._pool_measured, ("", 0)
+        tag = self._pool_pinned
+        info = next((item for item in pool if item.tag == tag), None)
+        entry = observatory.get(tag)
+        got = None
+        if info is not None and entry is not None and not entry.get("alive"):
+            got = self._carried(previous.get(tag), downlinks.get(tag),
+                                own if measured == tag else 0)
+        if got is None:
+            self._pool_spared_tag = ""
+            return None
+        if self._pool_spared_tag != tag:
+            self._pool_spared_tag = tag
+            self.diary.count("spared")
+            self.log.info(
+                "проба ядра опоздала под нагрузкой: %.1f МБ за %d с через %s — сервер пула жив",
+                got / 1e6, self.cfg.watchdog.busy_window_s, tag)
+        return info
+
+    def _pool_speed_step(self, applied: dict, observatory: dict, now: float) -> None:
+        """Замер скорости серверов «pool» — в конце шага, по одному и не в шаге, где уже шёл
+        замер серверов подписки. Живой сервер без замера — сразу: сначала закреплённый (по нему
+        решается, менять ли), затем по задержке; повторный — раз в speed.unlimited_hours, при
+        занятом канале пула ждёт, но не дольше SPEED_FORCE_AFTER. С новым замером закреплённый
+        сверяется на следующем шаге (_pool_choice). Пока через закреплённый пора проверить
+        YouTube, другие ждут (_youtube_waits)."""
+        busy = self._pool_busy(now)
+        hours = speed.every_hours(self.cfg, 0.0)
+        if not hours or self._speed_ran or self.stopping or not traffic.pool_active(self.cfg):
+            return
+        password, _ports = builder.probe_state(applied)
+        wall = self.wall()
+        never: list[NodeInfo] = []
+        stale: list[NodeInfo] = []
+        for info in builder.applied_pool(applied):
+            if not (info.probe_port and info.tag in self._pool_ids
+                    and (observatory.get(info.tag) or {}).get("alive")):
+                continue
+            record = self._pool_record(info)
+            if record is None:
+                never.append(info)
+            elif wall - float(record.get("ts") or 0) >= hours * 3600.0:
+                stale.append(info)
+        if not stale:
+            self._pool_deferred_since = None
+        elif not never and busy:
+            if self._pool_deferred_since is None:
+                self._pool_deferred_since = now
+            if now - self._pool_deferred_since < SPEED_FORCE_AFTER:
+                return
+        targets = never or stale
+        if not targets or not password:
+            return
+        info = min(targets, key=lambda item: (
+            item.tag != self._pool_pinned,
+            (observatory.get(item.tag) or {}).get("delay") or 1e9, item.tag))
+        if info.tag != self._pool_pinned and self._youtube_waits():
+            return
+        result = speed.measure(info, self.cfg, probe_pass=password,
+                               max_mb=speed.size_mb(self.cfg, 0.0), cancel=self._stop)
+        self._pool_speed_ran = True
+        self._pool_own += result.bytes_read
+        self._pool_measured = (info.tag, result.bytes_read)
+        if result.mbps is None and self.stopping:
+            return  # замер прервала остановка демона: это не неудача сервера
+        self.diary.count("measured")
+        if result.mbps is None:
+            self.diary.count("failed")
+        records = self._pool_speeds()
+        records[self._pool_ids[info.tag]] = {
+            "mbps": result.mbps, "bytes": result.bytes_read, "seconds": result.seconds,
+            "error": result.error, "ts": self.wall(), **({"busy": True} if busy else {}),
+        }
+        oldest = self.wall() - SPEED_KEEP
+        for key in [key for key, value in records.items()
+                    if not isinstance(value, dict) or float(value.get("ts") or 0) < oldest]:
+            del records[key]
+        self.store.set_meta(POOL_SPEED_META, json.dumps(records, sort_keys=True))
+        if result.mbps is None:
+            self.log.info("замер скорости %s не удался: %s", info.tag, result.error)
+        else:
+            self.log.info("замер скорости %s: %s, %d байт за %.1f с", info.tag,
+                          speed.mbps_text(result.mbps), result.bytes_read, result.seconds)
+
+    def _pool_remember(self, variant: str) -> None:
+        """Закреплённый сервер «pool» — в базу (POOL_PINNED_META), когда он сменился."""
+        if variant != self._pool_saved:
+            self._pool_saved = variant
+            self.store.set_meta(POOL_PINNED_META, variant)
+
+    # --- YouTube через сервер (М3, watch/youtube.py) -----------------------------------
+
+    def _youtube_records(self) -> dict[str, dict]:
+        if self._youtube is None:
+            try:
+                loaded = json.loads(self.store.get_meta(YOUTUBE_META) or "{}")
+            except ValueError:
+                loaded = {}
+            self._youtube = {
+                str(key): value for key, value in loaded.items() if isinstance(value, dict)
+            } if isinstance(loaded, dict) else {}
+        return self._youtube
+
+    def _youtube_record(self, key: str) -> dict | None:
+        """Итог последней проверки сервера, если он не старше YOUTUBE_STALE."""
+        record = self._youtube_records().get(key) if key else None
+        if record is None or self.wall() - float(record.get("ts") or 0) > YOUTUBE_STALE:
+            return None
+        return record
+
+    def _youtube_bad(self, key: str) -> str:
+        """Чем сервер плох для YouTube (youtube.problem): YOUTUBE_CONFIRM неудач подряд, итог не
+        старше YOUTUBE_STALE. Пусто — годен, не проверялся, проверка выключена или смены из-за
+        YouTube приостановлены (_youtube_switched)."""
+        if not self.cfg.speed.youtube or self.wall() < self._youtube_paused_until:
+            return ""
+        record = self._youtube_record(key)
+        if record is None or int(record.get("fails") or 0) < YOUTUBE_CONFIRM:
+            return ""
+        return youtube.problem(record)
+
+    def _youtube_view(self, key: str) -> dict:
+        """YouTube через сервер для сводки: итог последней проверки и скорость с серверов Google."""
+        record = self._youtube_record(key)
+        if record is None:
+            return {}
+        mbps = record.get("mbps")
+        return {"youtube": record.get("state"),
+                **({"youtube_mbps": mbps} if isinstance(mbps, (int, float)) else {})}
+
+    def _youtube_switched(self) -> None:
+        """Смена сервера из-за YouTube. YOUTUBE_CAROUSEL_COUNT смен за YOUTUBE_CAROUSEL — YouTube
+        плох через все серверы подряд, дело не в них (сбой у Google, сеть самой машины): смены из-за
+        YouTube приостанавливаются на YOUTUBE_PAUSE, проверки идут как шли."""
+        wall = self.wall()
+        self._youtube_switches = [
+            at for at in self._youtube_switches if wall - at < YOUTUBE_CAROUSEL
+        ] + [wall]
+        if len(self._youtube_switches) < YOUTUBE_CAROUSEL_COUNT:
+            return
+        self._youtube_switches = []
+        self._youtube_paused_until = wall + YOUTUBE_PAUSE
+        self.notifier.event(
+            "youtube",
+            f"YouTube плох через {YOUTUBE_CAROUSEL_COUNT} сервера подряд за час — дело, похоже, "
+            f"не в серверах; смены из-за YouTube приостановлены на {YOUTUBE_PAUSE / 3600:.0f} ч",
+        )
+
+    def _youtube_traffic(self, now: float) -> None:
+        """Трафик клиентов через каждый сервер с прошлого шага, Мбит/с: по счётчикам downlink
+        Xray, без своей проверки YouTube прошлого шага."""
+        counters = {
+            tag: down for tag, (_up, down) in usage.outbound_counters(self._metrics).items()
+        }
+        previous, self._youtube_down = self._youtube_down, (now, counters)
+        (own_tag, own), self._youtube_own = self._youtube_own, ("", 0)
+        self._youtube_rates = {}
+        if previous is None or now <= previous[0]:
+            return
+        seconds = now - previous[0]
+        for tag, down in counters.items():
+            delta = down - previous[1].get(tag, down) - (own if tag == own_tag else 0)
+            self._youtube_rates[tag] = max(delta, 0) * 8 / seconds / speed.MB
+
+    def _youtube_main_tag(self, view: list[NodeInfo]) -> str:
+        """Через какой сервер подписки идёт трафик: выбранный вручную (пока отвечает) или
+        основной."""
+        pin = self._manual_pin()
+        if pin is not None and not pin.get("down"):
+            node = pinning.resolve(pin, view)
+            return node.tag if node is not None else ""
+        return self.main["tag"] if self.main is not None else ""
+
+    def _youtube_targets(
+        self, view: list[NodeInfo], applied: dict, observatory: dict,
+    ) -> list[tuple[NodeInfo, str, bool, bool, bool]]:
+        """Кого можно проверить: (узел, ключ итога, несёт ли трафик, замерять ли скорость, сервер
+        пула). Серверы «pool» — пока через пул идёт трафик: живые и закреплённый. Серверы подписки —
+        кроме режима «весь дом» (подписка тогда лишь несущий канал): тот, через кого идёт трафик
+        (лимитированный — без замера скорости: квота), и живые безлимитные участники. x100 и
+        дороже не проверяются: это серверы для LTE, и каждый байт через них — сотня байт квоты."""
+        def alive(info: NodeInfo) -> bool:
+            return bool((observatory.get(info.tag) or {}).get("alive"))
+
+        targets = []
+        if traffic.pool_active(self.cfg):
+            for info in builder.applied_pool(applied):
+                key = self._pool_ids.get(info.tag, "")
+                carries = info.tag == self._pool_pinned
+                if key and info.probe_port and (alive(info) or carries):
+                    targets.append((info, key, carries, True, True))
+        if traffic.whole_house(self.cfg):
+            return targets
+        current = self._youtube_main_tag(view)
+        prices = self._prices()
+        for info in view:
+            price = prices.get(info.fingerprint)
+            if (len(info.fingerprint) < 8 or not info.probe_port or price is None
+                    or price >= speed.SKIP_PRICE):
+                continue
+            carries = info.tag == current
+            if carries or (info.role == "proxy" and price <= 0 and alive(info)):
+                targets.append((info, info.fingerprint, carries, price <= 0, False))
+        return targets
+
+    def _youtube_due(self, key: str, carries: bool) -> bool:
+        """Пора ли проверять: сервер, через который идёт трафик, — раз в speed.youtube_minutes,
+        остальные — раз в YOUTUBE_OTHERS; первая неудача подтверждается раньше (YOUTUBE_RETRY и
+        YOUTUBE_SUSPECT): плохим сервер считается после YOUTUBE_CONFIRM неудач подряд."""
+        record = self._youtube_records().get(key)
+        if record is None:
+            return True
+        age = self.wall() - float(record.get("ts") or 0)
+        confirm = int(record.get("fails") or 0) == 1
+        if carries:
+            return age >= (YOUTUBE_RETRY if confirm else self.cfg.speed.youtube_minutes * 60.0)
+        return age >= (YOUTUBE_SUSPECT if confirm else YOUTUBE_OTHERS)
+
+    def _youtube_waits(self) -> bool:
+        """Через закреплённый сервер «pool» пора проверить YouTube: замеры других серверов пула
+        (_pool_speed_step) ждут. Проверка не идёт ни в шаге с замером, ни в следующем, а замеры
+        после включения идут подряд по шагу на сервер — отчёт youtube2, наблюдение 4: первая
+        проверка ведущего через ~15 мин после включения «весь дом» (было 8 серверов без замера)."""
+        key = self._pool_ids.get(self._pool_pinned, "")
+        return bool(self.cfg.speed.youtube and key and not self.probe_target
+                    and self._youtube_due(key, True))
+
+    def _youtube_step(
+        self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
+    ) -> None:
+        """Проверка YouTube через сервер (watch/youtube.py) — в конце шага, одна за шаг и не в
+        шаге с замером скорости или сразу после него (счётчики трафика им испорчены). Сначала —
+        серверы, через которые идёт трафик (пула, затем подписки); затем фоном остальные живые,
+        не чаще раза в YOUTUBE_GAP: на замену должен быть известен годный. Решают итоги
+        _pool_step (сервер пула) и _main_candidate, _choose_main (основной сервер подписки)."""
+        measured = self._speed_ran or self._pool_speed_ran
+        tainted, self._youtube_tainted = self._youtube_tainted, measured
+        self._youtube_traffic(now)
+        if (not self.cfg.speed.youtube or measured or tainted or self.stopping
+                or self.probe_target):
+            return
+        password, _ports = builder.probe_state(applied)
+        if not password:
+            return
+        records = self._youtube_records()
+        targets = [item for item in self._youtube_targets(view, applied, observatory)
+                   if self._youtube_due(item[1], item[2])]
+        current = [item for item in targets if item[2]]
+        wall = self.wall()
+        if current:
+            target = current[0]
+        elif targets and wall - self._youtube_bg_at >= YOUTUBE_GAP:
+            target = min(targets, key=lambda item: (
+                float((records.get(item[1]) or {}).get("ts") or 0), item[0].tag))
+        else:
+            return
+        info, key, carries, measure, pooled = target
+        client = self._youtube_rates.get(info.tag, 0.0) if carries else 0.0
+        verdict = self._youtube_check(info, password, client=client, measure=measure)
+        self._youtube_ran = True
+        if verdict.state == youtube.CANCELLED:
+            return  # проверку прервала остановка демона: о сервере она ничего не говорит
+        self._youtube_own = (info.tag, verdict.bytes_used)
+        if pooled:  # свой трафик — не нагрузка канала пула и не трафик закреплённого
+            self._pool_own += verdict.bytes_used
+            self._pool_measured = (info.tag, verdict.bytes_used)
+        if not carries:
+            self._youtube_bg_at = wall
+        fails = 0 if verdict.state == youtube.OK else int(
+            (records.get(key) or {}).get("fails") or 0) + 1
+        record = {"state": verdict.state, "fails": fails, "mbps": verdict.mbps,
+                  "error": verdict.error, "ts": wall}
+        if client >= 0.1:
+            record["client"] = round(client, 1)
+        records[key] = record
+        for old in [item for item, value in records.items()
+                    if wall - float(value.get("ts") or 0) > YOUTUBE_KEEP]:
+            del records[old]
+        self.store.set_meta(YOUTUBE_META, json.dumps(records, sort_keys=True))
+        self.log.info("YouTube через %s%s: %s", info.tag, " (несёт трафик)" if carries else "",
+                      youtube.summary(verdict))
+        if pooled:
+            self.diary.count("youtube_checked")
+            if verdict.state != youtube.OK:
+                self.diary.count("youtube_" + verdict.state)
+        self._youtube_manual(view, info, key, pooled)
+
+    def _youtube_check(self, info: NodeInfo, password: str, *, client: float,
+                       measure: bool) -> youtube.Verdict:
+        return youtube.check(info, self.cfg, probe_pass=password, client_mbps=client,
+                             speed=measure, cancel=self._stop)
+
+    def _youtube_manual(self, view: list[NodeInfo], info: NodeInfo, key: str,
+                        pooled: bool) -> None:
+        """Выбранный вручную сервер плох для YouTube — событие, раз на сервер, пока он плох: ручной
+        выбор главнее, шлюз его не меняет (как с выходом в домашнюю страну)."""
+        why = self._youtube_bad(key)
+        if not why:
+            self._youtube_noted.discard(key)
+            return
+        if key in self._youtube_noted:
+            return
+        if pooled:
+            if self.cfg.managed.free_pool_pin != key or info.tag != self._pool_pinned:
+                return
+            name = self._pool_names.get(info.tag, ("", ""))[0] or info.tag
+            text = (f"бесплатный пул: выбранный вручную сервер «{name}» {why} — выберите другой на "
+                    "вкладке «Бесплатные серверы» или верните автовыбор")
+        else:
+            pin = self._manual_pin()
+            node = pinning.resolve(pin, view) if pin is not None and not pin.get("down") else None
+            if node is None or node.tag != info.tag:
+                return
+            name = self._node_name(info) or info.tag
+            text = (f"выбранный вручную сервер «{name}» {why} — выберите другой или верните "
+                    "автовыбор: xgw unpin")
+        self._youtube_noted.add(key)
+        self.notifier.event("youtube", text)
+
+    def _house_sync(self, applied: dict, now: float) -> None:
+        """Рабочий конфиг Xray против режима «весь дом». После перезагрузки `xgw run` снимал
+        режим, а сборка без пула ждала окна перезапуска: до 04:00 весь дом шёл через бесплатные
+        серверы при панели «выключено», и смены режима этого не меняли (отчёт m2b2fix2,
+        дефект 1). Расхождение — срочная сборка, кто бы ни сменил режим."""
+        whole = traffic.whole_house(self.cfg)
+        if builder.applied_whole(applied) == whole or self._urgent_rebuild:
+            return
+        if self._house_synced_at is not None and now - self._house_synced_at < HOUSE_SYNC:
+            return
+        self._house_synced_at = now
+        self._urgent_rebuild = ("бесплатный пул: весь дом" if whole
+                                else "бесплатный пул: режим подписок")
+
+    def _house_mark(self, whole: bool) -> None:
+        """Метка «весь дом действует в этой загрузке» (Paths.house_file): без неё после
+        перезагрузки `xgw run` возвращает режим подписок (actions.house_after_boot)."""
+        marked = self.paths.house_file.exists()
+        if whole == marked:
+            return
+        try:
+            if whole:
+                self.paths.house_file.touch(mode=0o644)
+            else:
+                self.paths.house_file.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.error("метка всего дома через пул не записана: %s", exc)
+
+    def _pool_change_text(self, current: str, pool: list[NodeInfo], who: str,
+                          manual: str = "", *, chosen: speed.Candidate | None = None,
+                          slower: speed.Candidate | None = None, lost: str = "",
+                          gone: str = "", why: str = "") -> str:
+        """who — адреса устройств через пул или «весь дом» (М2б.2); manual — как у сводки
+        пула: "on" — сервер выбран вручную, "down" — выбранный вручную молчит; chosen — новый
+        закреплённый (скорость по замеру), slower — прежний, если новый его быстрее; lost —
+        тег прежнего, если его сменили не по скорости: gone "dead" — он не отвечает, "left" —
+        его больше нет в составе «pool» (отчёт freepool-speed, дефект 1: смена без причины),
+        "youtube" — через него плох YouTube, why — чем (youtube.problem)."""
+        whole = who == "весь дом"
+        subject = "весь дом идёт" if whole else f"устройства {who} идут"
+        target = "у всего дома" if whole else f"у устройств {who}"
+        if current:
+            name, country = self._pool_names.get(current, (current, ""))
+            note = {
+                "on": " — выбран вручную",
+                "down": ": выбранный вручную не отвечает — сервер выбирает шлюз",
+            }.get(manual, "")
+            if slower is not None:
+                note = f" — быстрее, чем {speed.describe(slower)}" + note
+            elif lost:
+                was = self._pool_names.get(lost, (lost, ""))[0]
+                note = (f" — «{was}» {why}" if gone == "youtube"
+                        else f" — «{was}» не отвечает" if gone == "dead"
+                        else f" — «{was}» больше не в работе") + note
+            mbps = chosen.mbps if chosen is not None else None
+            return (f"бесплатный пул: {subject} через «{name}»"
+                    + (f" ({country})" if country else "")
+                    + (f", {speed.mbps_text(mbps)}" if mbps is not None else "") + note)
+        if not pool:
+            return f"бесплатный пул: допущенных серверов нет — {target} закрыто"
+        return f"бесплатный пул: все серверы пула молчат — {target} закрыто"
+
+    def _pool_due(self, applied: dict, now: float) -> None:
+        """Допущенные серверы пула против применённого состава «pool»: у устройств закрыто, а
+        допущенные есть, или выбранного вручную допущенного сервера нет в составе — сборка не
+        чаще POOL_OPEN; сервер выпал из допущенных или есть место для новых — не чаще
+        POOL_REBUILD. Состав выбирает engine.assemble; стоящие в «pool» допущены со старой удачной
+        проверкой до traffic.KEEP (восстановление, М3)."""
+        members = {info.fingerprint for info in builder.applied_pool(applied)}
+        try:
+            found = traffic.admitted(self.cfg, self.paths, now, members=members)
+        except (OSError, ValueError) as exc:
+            self.log.error("бесплатный пул: допущенные серверы не прочитаны: %s", exc)
+            return
+        infos = builder.applied_pool(applied, [item.node for item in found])
+        names = {item.node.fingerprint: (item.node.name, item.node.country.upper())
+                 for item in found}
+        for info in infos:
+            if info.fingerprint in names:
+                self._pool_names[info.tag] = names[info.fingerprint]
+                self._pool_ids[info.tag] = info.fingerprint
+        applied_fps = {info.fingerprint for info in infos}
+        lost = [info for info in infos if info.fingerprint not in names]
+        room = len(infos) < traffic.MEMBERS and bool(set(names) - applied_fps)
+        pin = self.cfg.managed.free_pool_pin
+        if pin and pin not in names and self._drop_pool_pin(pin):
+            pin = ""
+        if not infos and found:
+            reason, pause = "бесплатный пул: состав серверов для устройств", POOL_OPEN
+        elif pin in names and pin not in applied_fps:
+            reason, pause = "бесплатный пул: выбранный вручную сервер", POOL_OPEN
+        elif lost or room:
+            reason, pause = "бесплатный пул: обновление серверов для устройств", POOL_REBUILD
+        else:
+            return
+        if now - self._pool_rebuilt_at < pause:
+            return
+        self._pool_rebuilt_at = now
+        self._urgent_rebuild = self._urgent_rebuild or reason
+
+    def _drop_pool_pin(self, pin: str) -> bool:
+        """Выбранный вручную сервер пула больше не допущен навсегда (traffic.pin_gone: ушёл из
+        списков, не прошёл проверку) — выбор снимается с событием, как у подписки, когда сервер
+        убран (отчёт freepool-recovery, наблюдение 3: выбор держался на выбывшем, и каждая смена
+        шла с «выбранный вручную не отвечает»). Старая проверка — не повод. True — снят."""
+        try:
+            why = traffic.pin_gone(self.cfg, self.paths, pin)
+        except (OSError, ValueError) as exc:
+            self.log.error("бесплатный пул: выбранный вручную сервер не проверен: %s", exc)
+            return False
+        if not why:
+            return False
+        try:
+            managed.set_free_pool_pin(managed.path_for(self.paths.config_file), "")
+        except (managed.ManagedError, OSError) as exc:
+            self.log.warning("бесплатный пул: выбор вручную не снят: %s", exc)
+            return False
+        tag = next((tag for tag, full in self._pool_ids.items() if full == pin), "")
+        name = self._pool_names.get(tag, ("", ""))[0] or pin[:8]
+        self.notifier.event("freepool", f"бесплатный пул: выбранный вручную сервер «{name}» "
+                            f"больше не допущен ({why}) — сервер снова выбирает шлюз")
+        return True
+
+    def _pool_summary(self) -> dict | None:
+        """Сводка пула для состояния и панели; с устройствами через пул — и их «traffic»."""
+        if self.cfg.free_pool.mode == "off" or self._freepool_summary is None:
+            return None
+        # Сводку пересчитывает фоновый шаг пула после своих проверок — режим в ней отставал от
+        # настроек на минуты (отчёт m2b2fix2, наблюдение 7): режим и регион — из настроек.
+        pool = self.cfg.free_pool
+        summary = {**self._freepool_summary, "mode": pool.mode, "region": pool.region,
+                   "region_policy": pool.region_policy}
+        if self._pool_traffic is None:
+            return summary
+        return {**summary, "traffic": self._pool_traffic}
 
     # --- сетевая задержка (RTT, п. 2.3) ----------------------------------------------
 
@@ -2709,37 +4034,39 @@ class Daemon:
         }
         if not changes:
             return False
-        names = ", ".join(sorted(by_fingerprint[key].tag for key in wanted))
         # Проба дробления у участника — сразу: он не отвечает, и трафик ждёт (через API ядра,
         # без перезапуска Xray).
         urgent = any(wish.escalate for wish in wanted.values())
-        changed = self._rebuild(
-            None, urgent=urgent, reason=f"профиль обхода ({names})", profiles=changes,
+        def complete(changed, wanted):
+            applied = engine.read_json(self.paths.xray_config_file)
+            now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
+            now = self.wall()
+            for key, wish in wanted.items():
+                if now_profiles.get(key) != wish.profile:
+                    # Не применилось: решение примет следующий скан. Сервер, который так и остался
+                    # на пробном профиле, снова на пробе (_resume_trials) — запись о ней в базе.
+                    continue
+                self._profile_switched[key] = now
+                if wish.trial:
+                    info = by_fingerprint[key]
+                    self._profile_trial[key] = ProfileTrial(
+                        wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
+                        wish.verdict, wish.escalate,
+                    )
+                    self._trial_saved[key] = {
+                        "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
+                        "recheck": wish.recheck, "verdict": wish.verdict, "escalate": wish.escalate,
+                    }
+                    self._queue_first(info.probe_tag)
+                else:
+                    self._trial_saved.pop(key, None)  # возврат применён — проба окончена
+            self._save_profiles()
+
+        return self._rebuild(
+            None, urgent=urgent, reason="профиль обхода", profiles=changes,
+            complete={key: lambda changed, key=key: complete(changed, {key: wanted[key]})
+                      for key in wanted},
         )
-        applied = engine.read_json(self.paths.xray_config_file)
-        now_profiles = builder.applied_profiles(applied, self.inventory.nodes)
-        now = self.wall()
-        for key, wish in wanted.items():
-            if now_profiles.get(key) != wish.profile:
-                # Не применилось: решение примет следующий скан. Сервер, который так и остался
-                # на пробном профиле, снова на пробе (_resume_trials) — запись о ней в базе.
-                continue
-            self._profile_switched[key] = now
-            if wish.trial:
-                info = by_fingerprint[key]
-                self._profile_trial[key] = ProfileTrial(
-                    wish.profile, list(wish.rest), wish.prev, info.probe_tag, now, wish.recheck,
-                    wish.verdict, wish.escalate,
-                )
-                self._trial_saved[key] = {
-                    "profile": wish.profile, "rest": list(wish.rest), "prev": wish.prev,
-                    "recheck": wish.recheck, "verdict": wish.verdict, "escalate": wish.escalate,
-                }
-                self._queue_first(info.probe_tag)
-            else:
-                self._trial_saved.pop(key, None)  # возврат применён — проба окончена
-        self._save_profiles()
-        return changed
 
     # --- эскалация у серверов в работе (ТЗ R1) -------------------------------------
 
@@ -3912,12 +5239,18 @@ class Daemon:
         ):
             self._release_main()
             return
-        if self.cfg.speed.guard:
+        # Весь дом через пул (М2б.2): подписка — только несущий канал, трафика клиентов через
+        # неё нет — ни пассивной оценки, ни контроля скорости; плановых замеров тоже (_speed_step).
+        carrier = traffic.whole_house(self.cfg)
+        if self.cfg.speed.guard and not carrier:
             # Пассивная оценка — до замеров: участнику, через которого и так качают, замер не
             # нужен (ТЗ R5.2).
             self._passive_step(view)
         measured = self._speed_step(view, applied, observatory, now)
-        self._guard_step(view, applied, observatory)
+        if carrier:
+            self.guard.episode = None
+        else:
+            self._guard_step(view, applied, observatory)
         alive = [
             info for info in members if (observatory.get(info.tag) or {}).get("alive")
         ]
@@ -3967,6 +5300,13 @@ class Daemon:
             reason = "не отвечает пробам ядра"
         elif not signals.e2e_ok:
             reason = "загрузка через него не прошла"
+        # YouTube через основной плох (_youtube_step), а есть живой участник, через которого — нет.
+        youtube_why = "" if reason else self._youtube_bad(record["key"])
+        if youtube_why and any(
+            info.tag != member.tag and (observatory.get(info.tag) or {}).get("alive")
+            and not self._youtube_bad(self._speed_key(info)) for info in members
+        ):
+            reason = youtube_why
         if not reason:
             return self._candidate(member, observatory)
         wall = self.wall()
@@ -3978,6 +5318,10 @@ class Daemon:
             "source": record.get("source") or (node.source if node else ""),
         }
         self._set_main(None)
+        if youtube_why and reason == youtube_why:
+            self.notifier.event("main", f"основной сервер {name} {reason} — выбираю другой")
+            self._youtube_switched()
+            return None
         if not dead:  # пробы ядра проходят, а загрузка — нет
             carousel = wall - self._main_failed_at < MAIN_CAROUSEL
             self._main_failed_at = wall
@@ -4043,6 +5387,8 @@ class Daemon:
         Прежний основной отказал — сначала ищется той же страны из другой подписки, потом
         той же страны: без прыжка по странам (ASSUMPTIONS п. 224)."""
         wall = self.wall()
+        # Через кого плох YouTube (_youtube_step) — основным, только если других нет.
+        candidates = [item for item in candidates if not self._youtube_bad(item.key)] or candidates
         rested = [item for item in candidates if self.main_cooldown.get(item.key, 0.0) <= wall]
         lost, self._lost_main = self._lost_main, None
         pool = rested or candidates
@@ -4071,7 +5417,7 @@ class Daemon:
         for info in view:
             if (
                 info.role != "spare" or info.fingerprint in self.home_exits
-                or self._score(info) <= 0
+                or self._score(info) <= 0 or self._youtube_bad(info.fingerprint)
                 or (scans.get(info.probe_tag) or {}).get("verdict") not in REPLACEABLE_VERDICTS
                 or self._is_unstable(info.fingerprint)
             ):
@@ -4099,6 +5445,7 @@ class Daemon:
         pool = [
             item for item in [*alive, *self._spare_candidates(view)]
             if item.key != current.key and self.main_cooldown.get(item.key, 0.0) <= wall
+            and not self._youtube_bad(item.key)
         ]
         rival = speed.best(pool)
         by_delay = record.get("basis") != "speed"
@@ -4146,11 +5493,15 @@ class Daemon:
             f"встаёт в работу вместо «{dropped}» и станет основным",
         )
         prefer = preferred_members(members, Rotation(replacements=[(drop.tag, node)]))
-        if self._rebuild(prefer, urgent=False, reason="перевод запасного в работу"):
+        def complete(changed):
+            if not changed:
+                return
             self._promoted = {
                 "key": node.fingerprint, "name": node.name, "since": self.wall(),
                 "was": current.name or current.tag,
             }
+        self._rebuild(prefer, urgent=False, reason="перевод запасного в работу",
+                      complete={"promotion": complete})
 
     def _weakness(self, info: NodeInfo, observatory: dict) -> tuple:
         """Кого из участников выводить первым: мёртвого, потом с наименьшим рейтингом."""
@@ -4256,13 +5607,16 @@ class Daemon:
             )
             self._speed_forced = set(self.speed_queue)
             self.speed_total, self.speed_done = len(self.speed_queue), 0
-        else:
+        elif not traffic.whole_house(self.cfg):
+            # Весь дом через пул (М2б.2) — плановых замеров серверов подписки нет: она только
+            # несущий канал, и квоту тратить незачем. По кнопке — как обычно.
             prices = self._prices()
             for info in targets:
                 if info.probe_tag not in queued and self._speed_due(info, prices):
                     self.speed_queue.append(info.probe_tag)
                     self.speed_total += 1
-        self._guard_queue(targets)
+        if not traffic.whole_house(self.cfg):
+            self._guard_queue(targets)
         self._speed_waiting = False
         if not self.speed_queue:
             self.speed_total = self.speed_done = 0
@@ -4392,6 +5746,7 @@ class Daemon:
                 self.guard.note_total(self._speed_key(info), total)
             self.speed_done += 1
             count += 1
+            self._speed_ran = True
             if result.mbps is None:
                 self.log.info("замер скорости %s не удался: %s", info.tag, result.error)
             else:
@@ -4855,7 +6210,7 @@ class Daemon:
             self.log.info("%s", text)
 
     def _write_status(
-        self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool
+        self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool, *, checkpoint=False,
     ) -> None:
         self._last_status = (view, observatory, xray_ok)
         state = self.machine.state
@@ -4884,7 +6239,22 @@ class Daemon:
             ),
             whitelist={"since": self.whitelist_since, "offer": self._whitelist_offer(view)}
             if self.whitelist_since is not None else None,
+            free_pool=self._pool_summary(),
         )
+        snapshot["watchdog"] = {
+            "health_observed": self._health_observed,
+            "phase": "checks" if checkpoint else "complete",
+        }
+        job = self._build
+        snapshot["assembly"] = {
+            "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")
+            if job is not None else "queued" if self._build_next is not None else "idle",
+            "elapsed_s": round(time.monotonic() - job.began, 1) if job else 0,
+            "builds": self._build_count, "discarded": self._build_discarded,
+            "build_s": round(self._build_last[0], 3),
+            "apply_s": round(self._build_last[1], 3),
+            "outcome": self._build_outcome,
+        }
         spent = json.dumps(self.guard.spent, sort_keys=True)
         if spent != self.store.get_meta(speedguard.META_SPENT):
             self.store.set_meta(speedguard.META_SPENT, spent)

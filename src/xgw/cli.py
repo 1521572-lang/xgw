@@ -170,6 +170,34 @@ def main(argv: list[str] | None = None) -> int:
     cores_back.add_argument("core", choices=("xray", "sing-box"))
     # Задание от панели — его выполняет служба xgw-core.service.
     cores_sub.add_parser("run-job", help=argparse.SUPPRESS)
+    pool_parser = subparsers.add_parser(
+        "pool", parents=[common],
+        help="бесплатный пул (VPN Gate, VPNBook): сводка наблюдения и режим",
+    )
+    pool_sub = pool_parser.add_subparsers(dest="pool_action")
+    pool_status = pool_sub.add_parser(
+        "status", help="найдено, проверено, пригодно; как ответили источники",
+    )
+    pool_status.add_argument("--json", action="store_true", help="вывести JSON")
+    pool_mode = pool_sub.add_parser(
+        "mode", help="off — выключен, observe — наблюдение (трафик идёт через подписку), "
+                     "on — весь дом через бесплатные серверы",
+    )
+    pool_mode.add_argument("mode", choices=("off", "observe", "on"))
+    pool_pin = pool_sub.add_parser(
+        "pin", help="выбрать сервер пула вручную (id или его начало, как на вкладке "
+                    "«Бесплатные серверы»); auto — выбирает шлюз",
+    )
+    pool_pin.add_argument("server", help="id сервера пула (не короче 6 знаков) или auto")
+    pool_stats = pool_sub.add_parser(
+        "stats", help="дневник пула по дням: сколько трафик шёл через пул и было закрыто, смены "
+                      "сервера и почему, скорость, замеры, трафик",
+    )
+    pool_stats.add_argument("--days", type=int, default=2,
+                            help="за сколько дней, включая сегодня (по умолчанию 2)")
+    # Агент поколения туннеля SSTP — его запускает служба xgw-fp@<gen> (freepool/agent.py).
+    pool_agent = pool_sub.add_parser("agent", help=argparse.SUPPRESS)
+    pool_agent.add_argument("gen")
     core = subparsers.add_parser(
         "core", parents=[common],
         help="закрепить за сервером ядро: xray, sing-box или auto (выбирает шлюз)",
@@ -188,6 +216,12 @@ def main(argv: list[str] | None = None) -> int:
     panel.add_argument(
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
+    )
+    traffic_parser = subparsers.add_parser(
+        "traffic", parents=[common], help="расход трафика по устройствам и подпискам",
+    )
+    traffic_parser.add_argument(
+        "--days", type=int, default=1, help="за сколько дней, включая сегодня (1 — сегодня)",
     )
     tray_parser = subparsers.add_parser(
         "tray", help="значок XGW в трее рабочего стола (запускается при входе в сеанс)",
@@ -210,6 +244,11 @@ def main(argv: list[str] | None = None) -> int:
             return tray.open_main(args.open)
         return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
     paths = Paths.from_env()
+    if args.command == "pool" and args.pool_action == "agent":
+        # Служба xgw-fp@<gen>: config.toml агенту не нужен — только задание демона.
+        from .freepool import agent as agenting
+
+        return agenting.main(args.gen, paths)
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
         # прочитать, — та же команда от root через pkexec.
@@ -250,8 +289,10 @@ def main(argv: list[str] | None = None) -> int:
         "update-singbox": _cmd_update_singbox,
         "cores": _cmd_cores,
         "core": _cmd_core,
+        "pool": _cmd_pool,
         "logs": _cmd_logs,
         "panel": _cmd_panel,
+        "traffic": _cmd_traffic,
     }[args.command]
     try:
         return handler(args, cfg, paths, logger)
@@ -494,8 +535,11 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
     password, _ports = builder.probe_state(applied)
     view = builder.applied_nodes(applied)
     if args.tag and not args.all:
-        suffix = args.tag.split("-", 1)[-1]
-        view = [info for info in view if args.tag in (info.tag, info.probe_tag, suffix)]
+        # Тег сервера, тег его probe-inbound или их общая часть «nl-1a2b». Раньше общая часть
+        # бралась из самого аргумента, и слово без дефиса совпадало с любым узлом — `xgw probe нет`
+        # проверял все серверы подряд (отчёт audit6, шаг 3.1).
+        view = [info for info in view
+                if args.tag in (info.tag, info.probe_tag, info.tag.split("-", 1)[-1])]
         if not view:
             return _fail(f"узла {args.tag} нет в рабочем конфиге (см. xgw servers)", 2)
     if not password or not view:
@@ -621,7 +665,7 @@ def _cmd_net(args, cfg: config.Config, paths: Paths, logger) -> int:
             print(text.rstrip("\n") or "# LAN не настроен (network.lan_if пуст): dnsmasq не нужен")
             return 0
         rules = capture.rules()
-        text = nft.render(rules) + nft.render6(rules)
+        text = nft.render(rules) + nft.render6(rules) + nft.render_guard(rules)
         print(text.rstrip("\n") or "# правил нет: перехват выключен и network.lan_if не задан")
         return 0
 
@@ -735,6 +779,12 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             logger.info("российские адреса мимо Xray: общий переключатель разделён — включён у "
                         "этого компьютера и у устройств, что сейчас в сети")
             cfg, _warnings = config.load(args.config_path)
+    # Весь дом через пул после перезагрузки — снова режим подписок (actions.house_after_boot).
+    with contextlib.suppress(config.ConfigError):
+        if cfg.free_pool.mode == "on" and actions.house_after_boot(
+                paths, managed.path_for(args.config_path)):
+            logger.warning(actions.HOUSE_BOOT_EVENT)
+            cfg, _warnings = config.load(args.config_path)
     reloaded = False
     previous = None
     panel = None
@@ -763,6 +813,7 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             sinks = notify.build_sinks(cfg, mark=engine.bypass_mark(cfg, logger))
             daemon = Daemon(cfg, paths, xray_bin=xray_bin, capture=capture, sinks=sinks)
             if args.once:
+                daemon.refresh_wait = None  # опрос подписок — до конца: шаг один
                 print(daemon.tick())
                 daemon.store.close()
                 return 0
@@ -1035,6 +1086,59 @@ def _cmd_core(args, cfg: config.Config, paths: Paths, logger) -> int:
     return 0
 
 
+def _cmd_pool(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """`xgw pool` — то же, что карточка «Бесплатные серверы» в панели (freepool/)."""
+    if args.pool_action == "mode":
+        from .freepool import traffic as fptraffic
+
+        ready = len(fptraffic.admitted(cfg, paths, time.time())) if args.mode == "on" else None
+        outcome = actions.set_pool_mode(paths, managed.path_for(args.config_path), args.mode,
+                                        ready=ready)
+        if not outcome.ok:
+            return _fail(outcome.text, outcome.code)
+        logger.info("%s", outcome.text)
+        print(outcome.text + ". Демон применит режим на ближайшем шаге")
+        return 0
+    if args.pool_action == "pin":
+        outcome = actions.set_pool_pin(paths, managed.path_for(args.config_path), cfg,
+                                       args.server)
+        if not outcome.ok:
+            return _fail(outcome.text, outcome.code)
+        logger.info("%s", outcome.text)
+        print(outcome.text + ". Демон применит выбор на ближайшем шаге")
+        return 0
+    if args.pool_action == "stats":
+        from .freepool import stats as poolstats
+
+        try:
+            with actions.open_store(paths) as store:
+                rows = poolstats.report(store, max(1, args.days))
+        except (OSError, sqlite3.Error) as exc:
+            return _fail(f"дневник пула не прочитан: {exc} — нужен sudo")
+        print(poolstats.text(rows))
+        return 0
+    from .freepool import backend as backending
+    from .freepool import pool as pooling
+
+    # Сводка демона (её же показывает панель): только он знает, годится ли бэкенд туннелей.
+    # Отчёт М2а: своя сводка CLI писала «проверка туннелем недоступна: ещё не проверялся» при
+    # четырёх поднятых туннелях. Демона нет — своя, бэкенд проверяется здесь же (без уборки
+    # поколений: ими ведает демон).
+    max_age = max(3.0 * cfg.watchdog.interval_s, 180.0)
+    snapshot = None if _daemon_down(paths) else status.read_status(paths, max_age)
+    summary = (snapshot or {}).get("free_pool")
+    if not isinstance(summary, dict):
+        pool = pooling.FreePool(cfg, paths, logger=logger)
+        pool.backend_problem = (backending.unavailable(paths, cmd.run) if os.geteuid() == 0
+                                else "проверяет демон — запустите через sudo")
+        summary = pool.summary()
+    if getattr(args, "json", False):
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        print(pooling.render(summary, time.time()))
+    return 0
+
+
 PANEL_WAIT = 15.0  # сколько ждать, пока только что запущенный демон откроет панель
 
 
@@ -1130,6 +1234,18 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
         "Откройте ссылку в браузере на этой машине. Браузер запомнит вход: дальше панель "
         "открывается ярлыком «XGW» или адресом без токена."
     )
+    return 0
+
+
+def _cmd_traffic(args, cfg: config.Config, paths: Paths, logger) -> int:
+    """Расход трафика по устройствам, подпискам и выходам (usage.py) за --days дней."""
+    from . import usage
+
+    try:
+        found = usage.report(cfg, paths, max(1, args.days))
+    except (OSError, sqlite3.Error) as exc:
+        return _fail(f"учёт трафика не прочитан: {exc} — нужен sudo")
+    print(usage.text(found))
     return 0
 
 

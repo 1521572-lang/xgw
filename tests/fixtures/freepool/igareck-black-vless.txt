@@ -1,0 +1,12 @@
+# profile-title: 🏴 ЧЕРНЫЕ СПИСКИ 🏴 BLACK LISTS | Полная • Full | VLESS
+# profile-update-interval: 1
+# Date/Time: 2026-10-28 / 20:19 (Moscow)
+# Количество: 5
+# For more info and VPN-configs - visit: www.github.com/igareck/vpn-configs-for-russia
+
+
+vless://0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@198.51.100.41:443?security=reality&sni=www.example.com&pbk=ZmFrZS1wdWJsaWMta2V5LWZvci10ZXN0cy0wMDAwMDA&sid=ab12&fp=chrome&type=tcp&flow=xtls-rprx-vision#%F0%9F%87%AB%F0%9F%87%AE%20Finland%2C%20Helsinki%20%7C%20%F0%9F%8C%90%20%7C%20%5BBL%5D
+vless://0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@cdn.example.net:443?security=tls&sni=cdn.example.net&type=ws&path=%2Fws&host=cdn.example.net#%F0%9F%87%A9%F0%9F%87%AA%20Germany%2C%20Frankfurt%20am%20Main%20%7C%20%5BBL%5D
+vless://0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@198.51.100.42:443?security=tls&sni=x.example.org&type=xhttp&path=%2Fx&mode=auto#%F0%9F%87%AB%F0%9F%87%B7%20France%2C%20Paris%20%7C%20%F0%9F%8C%90%20%7C%20%5BBL%5D
+vless://0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@198.51.100.41:443?security=reality&sni=www.example.com&pbk=ZmFrZS1wdWJsaWMta2V5LWZvci10ZXN0cy0wMDAwMDA&sid=ab12&fp=chrome&type=tcp&flow=xtls-rprx-vision#%F0%9F%87%AB%F0%9F%87%AE%20Finland%2C%20Helsinki%20%7C%20%F0%9F%8C%90%20%7C%20%5BBL%5D
+vless://0b6a2a3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@192.168.1.10:443?security=tls&sni=lan.example&type=tcp#%F0%9F%87%A9%F0%9F%87%AA%20Germany%2C%20LAN%20trap%20%7C%20%5BBL%5D

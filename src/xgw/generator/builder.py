@@ -23,6 +23,11 @@ from . import singbox as singboxing
 
 PROBE_USER = "xgw"
 BALANCER_TAG = "auto"
+# Бесплатный пул (веха М2б.1): устройства с «Бесплатные серверы» в панели — балансировщиком
+# «pool» из допущенных серверов пула (freepool/traffic.py). Все они мертвы или их нет —
+# выход «block»: у такого устройства закрыто, а не подписка и не прямой WAN (R05).
+POOL_BALANCER = "pool"
+POOL_PREFIX = "pool-"
 # API Xray — Unix-сокет в каталоге службы xgw-xray (RuntimeDirectory), а не порт на 127.0.0.1:
 # к порту мог подключиться любой процесс машины (ASSUMPTIONS п. 253). Стенд и тесты под
 # XGW_ROOT передают свой путь (engine.assemble — paths.xray_api_socket).
@@ -33,7 +38,11 @@ API_SOCKET = "/run/xgw-xray/api.sock"
 # минуту). Жив ли сервер, проверяет демон (Daemon._device_step), и мёртвого он убирает из
 # правил (devices_down) — через API ядра, как любое изменение routing.
 TS_NET = "domain:ts.net"  # Tailscale Funnel и MagicDNS — мимо VPN-серверов
+# Управление, DERP и журнал Tailscale (controlplane, derpN, log): весь дом через пул (М2б.2) их
+# в бесплатные серверы не пускает — удалённый доступ к шлюзу держится на tailscaled.
+TS_CONTROL = ("domain:tailscale.com", "domain:tailscale.io")
 _TAG_RE = re.compile(r"^(proxy|spare|probe)-([a-z]{2})-([0-9a-f]{4,8})$")
+_POOL_TAG_RE = re.compile(r"^pool-([a-z]{2})-([0-9a-f]{4,8})$")
 TAG_RE = _TAG_RE  # тег узла: роль, страна, начало отпечатка (для команд CLI)
 
 
@@ -47,7 +56,7 @@ class NodeInfo:
     tag: str
     probe_tag: str
     probe_port: int
-    role: str  # proxy | spare
+    role: str  # proxy | spare | pool
     fragment: bool = False  # соединение идёт через дробление ClientHello (fragment.py)
     # Профиль обхода (profiles.py): каким ядром и как ведётся сервер.
     profile: str = profiling.XRAY_DEFAULT
@@ -77,6 +86,9 @@ class BuildResult:
     nodes: list[NodeInfo]
     chain_tags: list[str]
     fallback_tag: str
+    # Серверы бесплатного пула (балансировщик «pool», роль pool): отдельно от участников и
+    # запасных подписки — их счёт, замены и замеры демона пул не задевает.
+    pool: list[NodeInfo] = field(default_factory=list)
 
 
 def is_junk(address: str, port: int) -> bool:
@@ -426,6 +438,41 @@ def _allocate_ports(
     return ports
 
 
+def applied_pool(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
+    """Серверы бесплатного пула в работающем ядре (теги pool-*): как applied_nodes, но для
+    балансировщика «pool». fingerprint — полный, если сервер однозначно нашёлся среди nodes,
+    иначе hex-часть тега."""
+    _password, ports = probe_state(config)
+    result: list[NodeInfo] = []
+    if not isinstance(config, Mapping):
+        return result
+    for outbound in config.get("outbounds") or []:
+        if not isinstance(outbound, Mapping):
+            continue
+        match = _POOL_TAG_RE.match(str(outbound.get("tag") or ""))
+        if not match:
+            continue
+        country, prefix = match.groups()
+        found = {node.fingerprint for node in nodes
+                 if node.country == country and node.fingerprint.startswith(prefix)}
+        result.append(NodeInfo(
+            fingerprint=found.pop() if len(found) == 1 else prefix,
+            tag=f"pool-{country}-{prefix}", probe_tag=f"probe-{country}-{prefix}",
+            probe_port=ports.get(f"probe-{country}-{prefix}", 0), role="pool",
+            fragment=fragmenting.used(outbound), profile=outbound_profile(outbound),
+        ))
+    return result
+
+
+def applied_whole(config: Mapping | None) -> bool:
+    """Весь дом через пул в работающем ядре (М2б.2): есть правило несущего канала — входы демона
+    http-in и socks-in в балансировщик подписки. Оно собирается только при pool_all."""
+    routing = config.get("routing") if isinstance(config, Mapping) else None
+    rules = routing.get("rules") if isinstance(routing, Mapping) else None
+    return any(isinstance(rule, Mapping) and "http-in" in (rule.get("inboundTag") or [])
+               and rule.get("balancerTag") == BALANCER_TAG for rule in rules or [])
+
+
 def applied_nodes(config: Mapping | None, nodes: Sequence[ServerNode] = ()) -> list[NodeInfo]:
     """Участники и запасные так, как они заведены в работающем ядре: теги, роли
     и порты проб из применённого конфига. Нужны демону и CLI — следить за
@@ -637,6 +684,9 @@ def build(
     devices_down: Collection[str] = (),
     avoid_ports: Collection[int] = (),
     api_listen: str = API_SOCKET,
+    pool: Sequence[ServerNode] = (),
+    pool_devices: Sequence[str] = (),
+    pool_all: bool = False,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
@@ -647,6 +697,15 @@ def build(
     если её перезапуск отложен); входы bridge обходятся и так.
 
     api_listen — где слушает API Xray: путь сокета (API_SOCKET) или «адрес:порт».
+
+    pool — допущенные серверы бесплатного пула (freepool/traffic.py), pool_devices — адреса
+    устройств, которые идут через них (веха М2б.1): балансировщик «pool», правило по адресу
+    после прямых доменов; pool пуст — правило в «block» (закрыто, R05).
+
+    pool_all — весь дом через пул (free_pool.mode = on, веха М2б.2): весь трафик перехвата и
+    запросы DNS самого Xray — в «pool» (пуст — в block, кроме прямых доменов и адресов), а
+    «auto» из серверов подписки — только входам демона http-in и socks-in: несущий канал для
+    списков пула, подписок и обновлений. Свои серверы устройств (Ф4) тогда не действуют.
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -672,9 +731,12 @@ def build(
     password = probe_password or secrets.token_urlsafe(24)
 
     ordered = list(selection.members) + list(selection.spares)
-    suffixes = assign_suffixes(ordered)
+    taken = {node.fingerprint for node in ordered}
+    pooled = [node for node in pool if node.fingerprint not in taken]
+    suffixes = assign_suffixes([*ordered, *pooled])
     ports = _allocate_ports(
-        [f"probe-{suffixes[node.fingerprint]}" for node in ordered], probe_ports or {}, cfg,
+        [f"probe-{suffixes[node.fingerprint]}" for node in [*ordered, *pooled]],
+        probe_ports or {}, cfg,
         avoid={*avoid_ports, *(bridge.ports.values() if bridge is not None else ())},
     )
 
@@ -692,9 +754,21 @@ def build(
             )
         )
 
+    pool_infos = [
+        NodeInfo(
+            fingerprint=node.fingerprint,
+            tag=f"{POOL_PREFIX}{suffixes[node.fingerprint]}",
+            probe_tag=f"probe-{suffixes[node.fingerprint]}",
+            probe_port=ports[f"probe-{suffixes[node.fingerprint]}"],
+            role="pool",
+        )
+        for node in pooled
+    ]
+    every = [*nodes, *pool_infos]
+
     outbounds: list[dict] = []
     mode = cfg.fragment.mode
-    for info, node in zip(nodes, ordered, strict=True):
+    for info, node in zip(every, [*ordered, *pooled], strict=True):
         profile = (profile_of or {}).get(node.fingerprint)
         if profile is None:
             wanted = mode == "always" or (mode != "off" and node.fingerprint in fragment)
@@ -731,9 +805,9 @@ def build(
         _modernize(outbound)
         _apply_sockopt(outbound, cfg.capture.mark_bypass)
         outbounds.append(outbound)
-    if any(info.fragment for info in nodes):
+    if any(info.fragment for info in every):
         outbounds.append(fragmenting.outbound(cfg))
-    if any(info.profile == profiling.XRAY_SPLIT for info in nodes):
+    if any(info.profile == profiling.XRAY_SPLIT for info in every):
         outbounds.append(fragmenting.split_outbound(cfg))
     outbounds.extend(
         [
@@ -760,7 +834,7 @@ def build(
             "port": info.probe_port,
             "settings": {"accounts": [{"user": PROBE_USER, "pass": password}]},
         }
-        for info in nodes
+        for info in every
     ]
     # Перехват выключен целиком (capture.lan = capture.local = false) — XGW только
     # управляет Xray: TPROXY-inbound не нужен, а без root он и не откроется.
@@ -832,7 +906,7 @@ def build(
     direct_dns = [_dns_server(server) for server in cfg.dns.direct_servers]
     rules: list[dict] = [
         {"type": "field", "inboundTag": [info.probe_tag], "outboundTag": info.tag}
-        for info in nodes
+        for info in every
     ]
     if capture:
         rules.append(
@@ -858,20 +932,31 @@ def build(
     if cfg.routing.direct_ips:
         rules.append({"type": "field", "ip": list(cfg.routing.direct_ips), "outboundTag": "direct"})
     # Свой сервер устройства — после DNS, частных сетей и direct_*: российские сайты у
-    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника.
-    rules.extend(
-        {"type": "field", "source": [ip], "outboundTag": tag}
-        for ip, tag in device_routes(cfg, nodes, devices_down)
-    )
-    if cfg.routing.proxy_domains:
-        rules.append(
-            {
-                "type": "field",
-                "domain": list(cfg.routing.proxy_domains),
-                "balancerTag": BALANCER_TAG,
-            }
+    # устройства по-прежнему напрямую. TPROXY сохраняет адрес источника. Весь дом через пул —
+    # свои серверы из подписки не действуют.
+    if not pool_all:
+        rules.extend(
+            {"type": "field", "source": [ip], "outboundTag": tag}
+            for ip, tag in device_routes(cfg, nodes, devices_down)
         )
-    rules.append({"type": "field", "network": "tcp,udp", "balancerTag": BALANCER_TAG})
+    # Серверов пула нет — закрыто: через подписку трафик пула не идёт (R05, решение заказчика
+    # 29.10.2026).
+    to_pool = {"balancerTag": POOL_BALANCER} if pool_infos else {"outboundTag": "block"}
+    # Устройства через бесплатный пул (М2б.1) — тоже после прямых доменов.
+    if pool_devices and not pool_all:
+        rules.append({"type": "field", "source": list(pool_devices), **to_pool})
+    if pool_all:
+        # Несущий канал (М2б.2): серверы подписки — только входам демона и Tailscale. Через
+        # бесплатные серверы tailscaled (tailscale.route = "vpn" или DERP напрямую не отвечает —
+        # тогда он идёт через Xray) терял управление и DERP, а с ними удалённый доступ к шлюзу —
+        # до перезагрузки (отчёт m2b2fix, дефект 1). Имена — по сниффингу (TLS, HTTP).
+        rules.append({"type": "field", "inboundTag": ["http-in", "socks-in"],
+                      "balancerTag": BALANCER_TAG})
+        rules.append({"type": "field", "domain": list(TS_CONTROL), "balancerTag": BALANCER_TAG})
+    rest = to_pool if pool_all else {"balancerTag": BALANCER_TAG}
+    if cfg.routing.proxy_domains:
+        rules.append({"type": "field", "domain": list(cfg.routing.proxy_domains), **rest})
+    rules.append({"type": "field", "network": "tcp,udp", **rest})
 
     # Резервный выход — дешёвый лимитированный запасной: через него трафик идёт, только
     # когда observatory считает мёртвыми всех участников. В subjectSelector он не входит,
@@ -882,17 +967,25 @@ def build(
             info.tag for info in nodes if info.fingerprint == selection.reserve.fingerprint
         )
     dns_servers: list[object] = []
-    if cfg.routing.direct_domains:
+    # Весь дом через пул: имена Tailscale — прямыми серверами DNS, как прямые домены, а не через
+    # бесплатные серверы: без них tailscaled не находит управление и DERP (отчёт m2b2fix).
+    direct_names = [*cfg.routing.direct_domains, *(TS_CONTROL if pool_all else ())]
+    if direct_names:
         for address, port in direct_dns:
             entry: dict = {
                 "address": address,
-                "domains": list(cfg.routing.direct_domains),
+                "domains": direct_names,
                 "skipFallback": True,
             }
             if port is not None:
                 entry["port"] = port
             dns_servers.append(entry)
     for address, port in map(_dns_server, cfg.dns.proxy_servers):
+        if pool_all and "://" not in address:
+            # Весь дом через пул (М2б.2): DNS — по TCP («tcp://», DNS-over-TCP через маршрутизацию
+            # Xray, app/dns/nameserver.go). Проверки пула меряют только TCP, а бесплатный сервер
+            # может не пропускать UDP — у всего дома тогда не разрешались бы имена.
+            address = f"tcp://{address}"
         dns_servers.append(address if port is None else {"address": address, "port": port})
 
     config = {
@@ -927,10 +1020,19 @@ def build(
                     "strategy": {"type": "leastPing"},
                     "fallbackTag": fallback_tag,
                 },
+                *([{
+                    "tag": POOL_BALANCER,
+                    "selector": [POOL_PREFIX],
+                    "strategy": {"type": "leastPing"},
+                    "fallbackTag": "block",
+                }] if pool_infos else []),
             ],
         },
         "burstObservatory": {
-            "subjectSelector": ["proxy-"],
+            # Пробы ядра для пула — по наличию устройств через него (или всего дома), а не
+            # серверов: секция burstObservatory меняется только перезапуском Xray, и пропадание
+            # серверов пула не должно рвать соединения всего дома.
+            "subjectSelector": ["proxy-", *([POOL_PREFIX] if pool_devices or pool_all else [])],
             "pingConfig": {
                 "destination": probe_url or cfg.probe.url,
                 "connectivity": "",
@@ -946,4 +1048,5 @@ def build(
         nodes=nodes,
         chain_tags=[node.keep_tag or "" for node in selection.chains],
         fallback_tag=fallback_tag,
+        pool=pool_infos,
     )

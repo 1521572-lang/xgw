@@ -23,6 +23,7 @@ from xgw.store import Store
 from xgw.watch.scan import ScanResult
 from xgw.watch.speed import SpeedResult
 from xgw.watch.states import State
+from xgw.watch.youtube import OK, Verdict
 from xgw.xraycore.api import ApiError, BalancerInfo
 
 ALL_LINKS = [*links.FULL_LINKS, links.TROJAN_INSECURE]
@@ -200,6 +201,8 @@ class Harness(Daemon):
         self._before: set[str] = set()
         self.traffic: int | None = None  # байт через серверы (счётчик Xray); None — нет
         self.downlinks: dict[str, int] = {}  # downlink участников (тег → байт, счётчик Xray)
+        self.youtube: dict[str, Verdict] = {}  # тег → итог проверки YouTube (по умолчанию годен)
+        self.youtube_checked: list[str] = []
 
     def _read_observatory(self):
         if self.observatory is None:
@@ -262,13 +265,16 @@ class Harness(Daemon):
         self.collected.append(via_xray)
         return self.source
 
-    def _assemble(self, prefer, reserve=None, profiles=None, reload_singbox=None):
+    def _assemble(self, prefer, reserve=None, profiles=None, reload_singbox=None, *, snapshot=None):
+        cfg, inventory, scores, failed = snapshot if snapshot is not None else (
+            self.cfg, self.inventory, self._scores_now(), self._singbox_failed,
+        )
         return engine.assemble(
-            self.cfg, self.paths, self.inventory, mark=None, logger=self.log,
-            xray_bin=None, check=False, prefer=prefer, scores=self._scores_now(),
+            cfg, self.paths, inventory, mark=None, logger=self.log,
+            xray_bin=None, check=False, prefer=prefer, scores=scores,
             reserve=reserve,
             profiles=profiles, reload_singbox=reload_singbox,
-            singbox_ok=self.singbox_ok and not self._singbox_failed,
+            singbox_ok=self.singbox_ok and not failed,
         )
 
     def _apply(self, config, *, urgent, singbox=None):
@@ -306,6 +312,10 @@ class Harness(Daemon):
 
     def _direct_probe(self):
         return self.direct
+
+    def _youtube_check(self, info, password, *, client, measure):
+        self.youtube_checked.append(info.tag)
+        return self.youtube.get(info.tag, Verdict(OK, 40.0 if measure else None, 4_000_000))
 
     # --- удобства для тестов ---
 
@@ -1120,6 +1130,94 @@ def test_refresh_request_is_served_on_the_next_tick(daemon):
     assert daemon.refresh_pending and daemon.poke.is_set()
     daemon.tick()
     assert daemon.collected == [True] and not daemon.refresh_pending
+
+
+def _slow_collect(daemon: Harness) -> threading.Event:
+    """Опрос подписок, который ждёт, пока тест не откроет ворота."""
+    gate = threading.Event()
+    collect = daemon._collect
+    daemon._collect = lambda via_xray: gate.wait(5) and collect(via_xray)
+    daemon.refresh_wait = 0.05
+    return gate
+
+
+def test_slow_subscription_poll_runs_outside_the_step(daemon):
+    """Отчёты audit6b и audit6c: шаг с обновлением подписки длился 90–135 с, из них опрос
+    37–68 с, и всё это время watchdog не замечал упавших серверов. Опрос — в фоне: шаг ждёт
+    его не дольше refresh_wait, второй опрос, пока идёт первый, не начинается, а итог
+    применяет первый шаг после конца опроса (демон будится сразу)."""
+    _started(daemon)
+    gate = _slow_collect(daemon)
+    daemon.source = _inventory(links.FULL_LINKS)  # один сервер пропал из подписки
+    daemon.next_refresh = 0.0
+    started = time.monotonic()
+    daemon.tick()
+    daemon.request_refresh()
+    daemon.poke.clear()
+    daemon.tick()
+    assert time.monotonic() - started < 2
+    assert daemon.collected == [] and daemon.applied == [] and daemon.refresh_pending
+    gate.set()
+    assert daemon.poke.wait(5)
+    daemon.tick()
+    assert daemon.collected == [True] and len(daemon.applied) == 1
+    assert len(daemon.tags("proxy")) + len(daemon.tags("spare")) == 4
+    assert not daemon.refresh_pending
+
+
+def test_settings_change_during_a_subscription_poll(daemon):
+    """Настройки перечитаны, пока опрос подписок шёл в фоне: источники прежние — итог опроса
+    применяет новый демон, не опрашивая подписки заново; источники сменились — опрос прежних
+    отменяется, а новый демон опрашивает новые."""
+    _started(daemon)
+    gate = _slow_collect(daemon)
+    daemon.source = _inventory(links.FULL_LINKS)
+    daemon.next_refresh = 0.0
+    daemon.tick()
+    job = daemon._fetch
+    second = _second(daemon, lambda cfg: None)
+    try:
+        assert second._fetch is job and second.refresh_pending
+        gate.set()
+        assert job.done.wait(5)
+        second.tick()
+        assert daemon.collected == [True] and second.collected == []
+        assert second.inventory is job.inventory and len(second.applied) == 1
+        assert not second.refresh_pending
+        again = _slow_collect(second)
+        second.next_refresh = 0.0
+        second.tick()
+        dropped = second._fetch
+        third = _second(second, lambda cfg: cfg.manual.links.append(links.SS_PLAIN))
+        try:
+            assert dropped.cancel.is_set() and third._fetch is None
+            third.tick()
+            assert third.collected == [True]  # источники изменились — опрос сразу
+        finally:
+            again.set()
+            third.store.close()
+    finally:
+        second.store.close()
+
+
+def test_spares_are_scanned_once_the_subscription_arrives_after_a_restart(daemon):
+    """Демон перезапущен: подписка приходит из фонового опроса не в первом шаге — круг сканов
+    запасных ждёт её, а не следующего срока через час (до неё цены запасных неизвестны, и
+    _queue_scan пропустил бы их всех)."""
+    _started(daemon)
+    restarted = Harness(daemon.cfg, daemon.paths)
+    try:
+        restarted.t = daemon.t
+        restarted.set_alive()
+        gate = _slow_collect(restarted)
+        restarted.tick()
+        assert restarted.inventory is None and restarted.scanned == []
+        gate.set()
+        assert restarted.poke.wait(5)
+        restarted.tick()
+        assert set(restarted.tags("spare")) <= set(restarted.scanned)
+    finally:
+        restarted.store.close()
 
 
 def test_scan_request_checks_the_spares_now(daemon):
@@ -2560,3 +2658,281 @@ def test_scans_are_stretched_to_fit_the_daily_limit():
     assert budget.scan_minutes == minutes and budget.total <= 1024 * status.MB
     cfg.probe.max_daily_probe_mb = 100  # одни пробы ядра больше лимита
     assert status.scan_minutes(cfg, 5, 300, 10, size, checks) == status.MAX_SCAN_MINUTES
+
+
+# --- сборка конфига в фоне: только изменённый путь, без живой сети -----------------
+
+
+def _blocked_build(daemon):
+    daemon._build_applied = False
+    gate = threading.Event()
+    entered = threading.Event()
+    original = daemon._assemble
+    calls = []
+
+    def assemble(*args, **kwargs):
+        calls.append(threading.get_ident())
+        entered.set()
+        assert gate.wait(5)
+        return original(*args, **kwargs)
+
+    daemon._assemble = assemble
+    return gate, entered, calls
+
+
+def test_background_build_keeps_status_and_applies_in_main(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    before = engine.read_json(daemon.paths.xray_config_file)
+    main = threading.get_ident()
+    applied_in = []
+    original = daemon._apply
+    daemon._apply = lambda *a, **kw: applied_in.append(threading.get_ident()) or original(*a, **kw)
+    callbacks = []
+    try:
+        started = time.monotonic()
+        assert not daemon._rebuild(
+            None, urgent=False, reason="test",
+            complete={"test": lambda changed: callbacks.append(threading.get_ident())},
+        )
+        assert entered.wait(1) and time.monotonic() - started < 1
+        job = daemon._build
+        for _ in range(2):
+            daemon.tick()
+            assert daemon.status()["assembly"]["state"] == "building"
+            assert engine.read_json(daemon.paths.xray_config_file) == before
+        assert calls != [main] and not applied_in and not callbacks
+        gate.set()
+        assert job.done.wait(5)
+        daemon.tick()
+        assert applied_in == callbacks == [main]
+        assert daemon.status()["assembly"]["state"] == "idle"
+        assert daemon.status()["assembly"]["outcome"] == "unchanged"
+        assert daemon.status()["assembly"]["builds"] == 2  # первый запуск и фоновая сборка
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+@pytest.mark.parametrize("change", ["config", "inventory", "file"])
+def test_background_build_discards_stale_inputs(daemon, change):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        if change == "config":
+            daemon.cfg.filters.max_members = 1
+        elif change == "inventory":
+            daemon.inventory.nodes.pop()
+        else:
+            atomic_write_json(daemon.paths.devices_down_file, {})
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build()
+        assert daemon._build_discarded == 1 and daemon.applied == []
+        fresh = daemon._build
+        assert fresh is not None and fresh is not job and fresh.done.wait(5)
+        daemon._finish_build()
+        assert len(calls) == 2
+        assert len(daemon.tags("proxy")) == (1 if change == "config" else 2)
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+def test_background_build_coalesces_and_keeps_latest_request(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    done = []
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        first = daemon._build
+        daemon._rebuild(None, urgent=False, reason="same")
+        assert daemon._build is first and daemon._build_next is None
+        prefer = [node.fingerprint for node in daemon.inventory.nodes[-2:]]
+        daemon._rebuild(prefer, urgent=True, reason="new",
+                        complete={"new": lambda changed: done.append(threading.get_ident())})
+        assert daemon._build is first and first.discard and len(calls) == 1
+        gate.set()
+        assert first.done.wait(5)
+        daemon._finish_build()
+        assert daemon._build.done.wait(5)
+        daemon._finish_build()
+        assert len(calls) == 2 and done == [threading.get_ident()]
+        assert {info.fingerprint for info in builder.applied_nodes(
+            engine.read_json(daemon.paths.xray_config_file), daemon.inventory.nodes)
+            if info.role == "proxy"} == set(prefer)
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+def test_background_build_stop_does_not_apply(daemon):
+    _started(daemon)
+    gate, entered, _ = _blocked_build(daemon)
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        daemon._stop.set()
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build() and daemon.applied == []
+    finally:
+        gate.set()
+        daemon._stop.clear()
+
+
+def test_background_build_adopt_waits_for_old_worker(daemon):
+    _started(daemon)
+    gate, entered, calls = _blocked_build(daemon)
+    second = None
+    try:
+        daemon._rebuild(None, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        second = _second(daemon, lambda cfg: setattr(cfg.filters, "max_members", 1))
+        assert second._build is job and job.discard
+        second.tick()
+        assert second._build is job and len(calls) == 1
+        gate.set()
+        assert job.done.wait(5)
+        second.tick()
+        if second._build is not None:
+            assert second._build.done.wait(5)
+            second.tick()
+        assert second._build_discarded == 1
+        assert len(second.tags("proxy")) == 1 and daemon.applied == []
+    finally:
+        gate.set()
+        if second:
+            if second._build:
+                second._build.done.wait(5)
+            second.store.close()
+
+
+def test_background_build_error_keeps_working_config(daemon):
+    _started(daemon)
+    daemon._build_applied = False
+    before = engine.read_json(daemon.paths.xray_config_file)
+    def fail(*args, **kwargs):
+        raise engine.EngineError("test failure")
+    daemon._assemble = fail
+    assert not daemon._rebuild(None, urgent=False, reason="test")
+    assert daemon._build is None and daemon.applied == []
+    assert engine.read_json(daemon.paths.xray_config_file) == before
+
+
+def test_background_build_cli_once_waits(daemon):
+    _started(daemon)
+    daemon._build_applied = False
+    daemon.refresh_wait = None
+    completed = threading.Event()
+    original = daemon._assemble
+    def delayed(*args, **kwargs):
+        time.sleep(0.15)
+        result = original(*args, **kwargs)
+        completed.set()
+        return result
+    daemon._assemble = delayed
+    daemon._rebuild(None, urgent=False, reason="test")
+    assert completed.is_set() and daemon._build is None
+
+
+def test_background_build_manual_choice_cancels_old_rotation(daemon):
+    _started(daemon)
+    gate, entered, _ = _blocked_build(daemon)
+    try:
+        prefer = [node.fingerprint for node in daemon.inventory.nodes[-2:]]
+        daemon._rebuild(prefer, urgent=False, reason="test")
+        assert entered.wait(1)
+        job = daemon._build
+        daemon._save_pin({"tag": daemon.tags("proxy")[0], "until": None, "since": daemon.wall()})
+        gate.set()
+        assert job.done.wait(5)
+        assert not daemon._finish_build() and daemon.applied == []
+        assert daemon._build.request.prefer is None
+        assert daemon._build.done.wait(5)
+        daemon._finish_build()
+        assert daemon._manual_pin()["tag"] == daemon.tags("proxy")[0]
+    finally:
+        gate.set()
+        if daemon._build:
+            daemon._build.done.wait(5)
+
+
+def _scheduled_run(daemon, monkeypatch, state, durations, spread=1.0):
+    import xgw.daemon as module
+
+    now, starts, sleeps = [0.0], [], []
+    stop = threading.Event()
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module, "jitter", lambda seconds: seconds * spread)
+    def tick():
+        starts.append(now[0])
+        now[0] += durations[len(starts) - 1]
+        return state
+    def sleep(_stop, _changed, seconds):
+        sleeps.append(seconds)
+        progress = json.loads((daemon.paths.run / "watchdog-step.json").read_text())
+        assert progress["phase"] == "sleep"
+        assert progress["step_s"] == durations[len(starts) - 1]
+        now[0] += seconds
+        if len(starts) == len(durations):
+            stop.set()
+    monkeypatch.setattr(daemon, "tick", tick)
+    monkeypatch.setattr(daemon, "_sleep", sleep)
+    daemon.cfg.watchdog.interval_s = 20
+    _run_once(daemon, stop)
+    return starts, sleeps
+
+
+@pytest.mark.parametrize("state", [State.HEALTHY, State.DEGRADED])
+@pytest.mark.parametrize("spread", [1.0, 1.2])
+def test_watchdog_schedule_includes_step_work_in_interval(daemon, monkeypatch, state, spread):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, state, [8, 8, 8], spread)
+    period = 20 * spread
+    assert starts == [0, period, 2 * period] and sleeps == [period - 8] * 3
+    assert not daemon.paths.status_file.exists()  # запись хода не притворяется свежим статусом
+
+
+def test_watchdog_schedule_overrun_does_not_add_wait_or_replay_missed_ticks(daemon, monkeypatch):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.DEGRADED, [30, 3, 3])
+    assert starts == [0, 30, 50] and sleeps == [0, 17, 17]
+
+
+def test_watchdog_schedule_wan_down_keeps_pause_after_work(daemon, monkeypatch):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.WAN_DOWN, [8, 8])
+    assert starts == [0, 68] and sleeps == [60, 60]
+
+
+def test_watchdog_schedule_manual_scan_keeps_pause_after_work(daemon, monkeypatch):
+    from xgw.daemon import MANUAL_SCAN_PAUSE
+
+    daemon._manual_scan = True
+    daemon.scan_queue.append("unused")
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [8, 8])
+    assert starts == [0, 8 + MANUAL_SCAN_PAUSE] and sleeps == [MANUAL_SCAN_PAUSE] * 2
+
+
+def test_watchdog_schedule_while_building_keeps_short_period(daemon, monkeypatch):
+    daemon._build_next = object()
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [2, 2])
+    assert starts == [0, 5] and sleeps == [3, 3]
+
+
+def test_fresh_health_is_published_before_optional_work_without_faking_new_observation(daemon):
+    _started(daemon)
+    checkpoints = []
+    daemon._scan_step = lambda *_args: checkpoints.append(daemon.status()["watchdog"])
+    daemon.tick()
+    assert len(checkpoints) == 1 and checkpoints[0]["phase"] == "checks"
+    final = daemon.status()["watchdog"]
+    assert final["phase"] == "complete" and final["health_observed"] is not None
+    assert final["health_observed"] == checkpoints[0]["health_observed"]

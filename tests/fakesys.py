@@ -40,6 +40,10 @@ class FakeSystem:
         # Программ нет в системе (which их не найдёт): dnsmasq даёт пакет dnsmasq-base.
         self.missing: set[str] = {"dnsmasq"}
         self.users: set[str] = set()
+        self.user_ids: dict[str, tuple[int, int]] = {
+            "xray": (997, 986), "xgw-singbox": (996, 985),
+        }
+        self.user_groups: dict[str, set[int]] = {}
         self.ufw_active = False
         self.ufw_rules: list[tuple[str, ...]] = []
         self.ufw_reloads = 0
@@ -256,7 +260,20 @@ class FakeSystem:
 
     def _getent(self, args, command, check) -> str:
         name = args[1]
-        return f"{name}:x:997:986::/nonexistent:/usr/sbin/nologin\n" if name in self.users else ""
+        if name not in self.users:
+            return ""
+        uid, gid = self.user_ids.get(name, (995, 984))
+        if args[0] == "group":
+            return f"{name}:x:{gid}:\n"
+        return f"{name}:x:{uid}:{gid}::/nonexistent:/usr/sbin/nologin\n"
+
+    def _id(self, args, command, check) -> str:
+        assert args[0] == "-G", command
+        name = args[1]
+        if name not in self.users:
+            return ""
+        gid = self.user_ids.get(name, (995, 984))[1]
+        return " ".join(str(group) for group in sorted(self.user_groups.get(name, {gid}))) + "\n"
 
     def _useradd(self, args, command, check) -> str:
         self.users.add(args[-1])

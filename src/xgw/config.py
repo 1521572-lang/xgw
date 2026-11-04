@@ -139,6 +139,53 @@ class TrayConf:
     enabled: bool = True
 
 
+# Бесплатный пул (docs/FREEPOOL-PLAN.md): off — режим подписок; observe — пул собирается и
+# проверяется, трафик идёт через подписку (веха М1); on — трафик через бесплатные серверы
+# (веха М2; до неё ведёт себя как observe). Подписка в любом режиме — несущий канал для
+# каталогов: сайты со списками доступны только через VPN.
+FREE_POOL_MODES = ("off", "observe", "on")
+FREE_POOL_REGIONS = ("EU", "US", "ASIA", "auto")
+# igareck и mahdibland — списки серверов на GitHub (28.10.2026, после отчёта вехи М2а).
+FREE_POOL_PROVIDERS = ("vpngate", "vpnbook", "igareck", "mahdibland")
+# Источники, убранные из пула: VPNJantit — 28.10.2026 по отчёту вехи М1 (учётку выдаёт форма
+# сайта на 7 дней, без неё ни одного рабочего сервера).
+RETIRED_POOL_PROVIDERS = ("vpnjantit",)
+
+
+@dataclass
+class FreePoolConf:
+    mode: str = "off"
+    # Регион выхода: EU (страны ЕС), US, ASIA (M49) или auto — любой из них (ТЗ R14–R17).
+    # strict — только этот регион; preferred — ещё fallback_regions, по порядку.
+    region: str = "EU"
+    region_policy: str = "strict"
+    fallback_regions: list[str] = field(default_factory=list)
+    providers: list[str] = field(default_factory=lambda: list(FREE_POOL_PROVIDERS))
+    # Как часто опрашивать источники, минут (ТЗ R12: стартовые значения, не квоты сервисов).
+    vpngate_refresh_min: int = 15
+    vpnbook_refresh_min: int = 60
+    lists_refresh_min: int = 120  # списки GitHub: обновляются раз в 2–4 часа
+    # Проверок кандидатов за шаг демона (наблюдение): по одной теневой пробе или TCP-проверке.
+    checks_per_step: int = 2
+    # Проверок серверов списков GitHub за шаг — сверх checks_per_step и без бюджета трафика
+    # (решение заказчика 28.10.2026: экономия трафика для них не нужна); 0 — не проверять.
+    list_checks_per_step: int = 4
+    # Бюджет трафика проверок пула за сутки, МБ (ТЗ R28): routine, из него защищённый резерв
+    # проверок здоровья, плюс аварийный.
+    budget_mb: int = 512
+    health_reserved_mb: int = 128
+    emergency_mb: int = 64
+    max_instances: int = 4  # туннелей сразу (веха М2)
+    # Новых подключений туннелей (рукопожатий; с вехи М2в — SSTP, до неё — OpenVPN) — не
+    # больше (ТЗ R29: защита серверов от нагрузки и от перебора, не их квоты): в час всего, в
+    # сутки всего и в час на один источник. В сутки — 96, а не 60 из R29 (решение заказчика
+    # 29.10.2026, ASSUMPTIONS п. 261): 60 останавливали наблюдение на 9 часов в сутки; с М2в
+    # туннели — один источник (VPN Gate), и суточный предел не срабатывает раньше часового.
+    handshakes_per_hour: int = 12
+    handshakes_per_day: int = 96
+    provider_handshakes_per_hour: int = 2
+
+
 @dataclass
 class Subscription:
     name: str = "main"
@@ -189,6 +236,13 @@ class Probe:
 # User-Agent, без Accept-Encoding): ответ 200, тело целиком (ASSUMPTIONS, п. 185).
 DEFAULT_SPEED_URL = "https://speed.cloudflare.com/__down?bytes=10000000"
 DEFAULT_SPEED_FALLBACK = "https://cdn.jsdelivr.net/npm/typescript@5.3.3/lib/typescript.js"
+# Проверка YouTube (watch/youtube.py): сайт и видеосеть отвечают 204 без тела; файл для скорости —
+# неизменяемый архив на dl.google.com (68 972 532 байта, Range понимает). Проверены 31.10.2026.
+DEFAULT_YOUTUBE_URLS = (
+    "https://www.youtube.com/generate_204",
+    "https://redirector.googlevideo.com/generate_204",
+)
+DEFAULT_YOUTUBE_SPEED_URL = "https://dl.google.com/go/go1.22.5.linux-amd64.tar.gz"
 
 
 @dataclass
@@ -237,6 +291,16 @@ class Speed:
     cooldown_minutes: int = 40
     episode_mb: int = 15
     guard_daily_mb: int = 300
+    # YouTube через сервер, который несёт трафик (М3, watch/youtube.py): основной сервер подписки
+    # и сервер бесплатного пула раз в youtube_minutes, остальные живые — реже. Не ответили
+    # youtube_urls или скорость с серверов Google (youtube_speed_url, 4 МБ) вместе с трафиком
+    # клиентов ниже youtube_mbps — дважды подряд — сервер сменяется, если есть другой живой.
+    # youtube_mbps = 0 — только доступность; youtube = false — не проверять.
+    youtube: bool = True
+    youtube_urls: list[str] = field(default_factory=lambda: list(DEFAULT_YOUTUBE_URLS))
+    youtube_speed_url: str = DEFAULT_YOUTUBE_SPEED_URL
+    youtube_mbps: int = 5
+    youtube_minutes: int = 30
 
 
 @dataclass
@@ -442,6 +506,10 @@ class Managed:
     # Российские адреса мимо Xray у самой машины и контейнеров включены или выключены в панели
     # (routing.kernel_direct); None — как в config.toml.
     kernel_direct: bool | None = None
+    # Бесплатный пул из панели: режим (None — как в config.toml) и сервер, выбранный вручную
+    # (id варианта, 32 hex; пусто — выбирает шлюз).
+    free_pool_mode: str | None = None
+    free_pool_pin: str = ""
     # Имя шлюза в tailnet, для которого панель включила Serve (панель по tailnet, Т2);
     # пусто — не включала. Только тогда панель принимает Host «имя:8443».
     tailscale_serve: str = ""
@@ -475,6 +543,7 @@ class Config:
     panel: PanelConf = field(default_factory=PanelConf)
     tailscale: TailscaleConf = field(default_factory=TailscaleConf)
     tray: TrayConf = field(default_factory=TrayConf)
+    free_pool: FreePoolConf = field(default_factory=FreePoolConf)
     managed: Managed = field(default_factory=Managed)
 
 
@@ -497,6 +566,7 @@ _SECTIONS = {
     "panel": PanelConf,
     "tailscale": TailscaleConf,
     "tray": TrayConf,
+    "free_pool": FreePoolConf,
 }
 
 
@@ -565,6 +635,9 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     if data["kernel_direct"] is not None:
         cfg.routing.kernel_direct = cfg.managed.kernel_direct = data["kernel_direct"]
+    if data["free_pool_mode"] is not None:
+        cfg.free_pool.mode = cfg.managed.free_pool_mode = data["free_pool_mode"]
+    cfg.managed.free_pool_pin = data["free_pool_pin"]
     cfg.managed.tailscale_serve = data["tailscale"]["serve"]
     cfg.managed.tailscale_funnel = data["tailscale"]["funnel"]
     cfg.managed.tailscale_direct = [item["ip"] for item in data["tailscale"]["direct"]]
@@ -646,6 +719,7 @@ _DROPPED: dict[str, dict[str, str]] = {
     # Четвёртый аудит 0.2.0 (ASSUMPTIONS п. 253): API Xray — сокет, к порту мог подключиться
     # любой процесс машины.
     "xray": {"api_port": "API Xray слушает сокет /run/xgw-xray/api.sock, а не порт"},
+    "free_pool": {"vpnjantit_refresh_min": "VPNJantit из бесплатного пула убран"},
 }
 _TABLE = re.compile(r"^[ \t]*\[[ \t]*([A-Za-z0-9_.-]+)[ \t]*\][ \t]*(#.*)?$")
 _ARRAY_TABLE = re.compile(r"^[ \t]*\[\[")
@@ -774,9 +848,10 @@ def _validate_core(core: CoreSection) -> list[str]:
             f"{defaults.port_base}"
         )
         core.port_base = defaults.port_base
-    if not 1 <= core.api_port <= 65535:
+    if not 1024 <= core.api_port <= 65535:
         warnings.append(
-            f"core.api_port={core.api_port} вне диапазона — используется {defaults.api_port}"
+            f"core.api_port={core.api_port}: ожидается 1024–65535 — используется "
+            f"{defaults.api_port}"
         )
         core.api_port = defaults.api_port
     return warnings
@@ -797,9 +872,53 @@ def service_ports(cfg: Config) -> dict[str, int]:
     }
 
 
+def _validate_free_pool(pool: FreePoolConf) -> list[str]:
+    warnings: list[str] = []
+    defaults = FreePoolConf()
+    if pool.mode not in FREE_POOL_MODES:
+        warnings.append(f"free_pool.mode={pool.mode}: ожидается off, observe или on — off")
+        pool.mode = defaults.mode
+    if pool.region not in FREE_POOL_REGIONS:
+        warnings.append(f"free_pool.region={pool.region}: ожидается EU, US, ASIA или auto — EU")
+        pool.region = defaults.region
+    if pool.region_policy not in ("strict", "preferred"):
+        warnings.append("free_pool.region_policy: ожидается strict или preferred — strict")
+        pool.region_policy = defaults.region_policy
+    bad = [item for item in pool.fallback_regions if item not in FREE_POOL_REGIONS[:3]]
+    if bad:
+        warnings.append(f"free_pool.fallback_regions: {', '.join(bad)} пропущены")
+        pool.fallback_regions = [item for item in pool.fallback_regions if item not in bad]
+    retired = [item for item in pool.providers if item in RETIRED_POOL_PROVIDERS]
+    if retired:
+        warnings.append("free_pool.providers: VPNJantit из бесплатного пула убран — "
+                        "из списка его можно удалить")
+    unknown = [item for item in pool.providers
+               if item not in FREE_POOL_PROVIDERS and item not in RETIRED_POOL_PROVIDERS]
+    if unknown:
+        warnings.append(f"free_pool.providers: неизвестные {', '.join(unknown)} пропущены")
+    pool.providers = [item for item in pool.providers if item in FREE_POOL_PROVIDERS]
+    for name, low, high in (
+        ("vpngate_refresh_min", 5, 1440), ("vpnbook_refresh_min", 15, 1440),
+        ("lists_refresh_min", 30, 1440), ("checks_per_step", 1, 8),
+        ("list_checks_per_step", 0, 16),
+        ("budget_mb", 64, 10240), ("health_reserved_mb", 16, 10240), ("emergency_mb", 0, 1024),
+        ("max_instances", 1, 8), ("handshakes_per_hour", 0, 60), ("handshakes_per_day", 0, 500),
+        ("provider_handshakes_per_hour", 0, 30),
+    ):
+        value = getattr(pool, name)
+        if not low <= value <= high:
+            warnings.append(f"free_pool.{name}={value}: ожидается {low}–{high} — "
+                            f"{getattr(defaults, name)}")
+            setattr(pool, name, getattr(defaults, name))
+    if pool.health_reserved_mb > pool.budget_mb:
+        warnings.append("free_pool.health_reserved_mb больше budget_mb — резерв = budget_mb")
+        pool.health_reserved_mb = pool.budget_mb
+    return warnings
+
+
 def _validate(cfg: Config) -> list[str]:
     """Проверяет значения; опасные для работы исправляет на значения по умолчанию."""
-    warnings: list[str] = []
+    warnings: list[str] = _validate_free_pool(cfg.free_pool)
     for name in ("include_regex", "exclude_regex", "multiplier_regex"):
         try:
             re.compile(getattr(cfg.filters, name))
@@ -971,6 +1090,8 @@ _SPEED_LIMITS = {
     "cooldown_minutes": (1, 1440),
     "episode_mb": (1, 200),
     "guard_daily_mb": (0, 10000),
+    "youtube_mbps": (0, 1000),
+    "youtube_minutes": (5, 1440),
 }
 
 
@@ -984,7 +1105,7 @@ def _validate_speed(speed: Speed) -> list[str]:
                 f"speed.{name}={value}: допустимо от {low} до {high} — используется {default}"
             )
             setattr(speed, name, default)
-    for name in ("url", "url_fallback"):
+    for name in ("url", "url_fallback", "youtube_speed_url"):
         value = getattr(speed, name).strip()
         if value and urlsplit(value).scheme not in ("http", "https"):
             default = getattr(Speed(), name)
@@ -993,6 +1114,14 @@ def _validate_speed(speed: Speed) -> list[str]:
         setattr(speed, name, value)
     if not speed.url:
         speed.url, speed.url_fallback = speed.url_fallback, ""
+    urls = [url.strip() for url in speed.youtube_urls if url.strip()]
+    wrong = [url for url in urls if urlsplit(url).scheme not in ("http", "https")]
+    if wrong:
+        warnings.append(f"speed.youtube_urls: не http(s)-адреса пропущены: {', '.join(wrong)}")
+    speed.youtube_urls = [url for url in urls if url not in wrong]
+    if speed.youtube and not speed.youtube_urls:
+        warnings.append("speed.youtube_urls пуст — проверка YouTube выключена")
+        speed.youtube = False
     if speed.every_hours == 0:
         speed.unlimited_hours = speed.limited_hours = 0
         warnings.append(

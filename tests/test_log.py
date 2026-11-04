@@ -44,6 +44,17 @@ def test_registered_short_secret_is_masked(journal):
     assert "***" in journal.getvalue()
 
 
+def test_secrets_are_replaced_not_changed_in_place(journal):
+    """Опрос подписок регистрирует секреты в фоновом потоке, а форматтер другого потока в это
+    время перебирает набор: прежний набор не меняется — вместо него новый."""
+    before = log._secrets
+    log.add_secrets(["fresh-secret"])
+    assert "fresh-secret" in log._secrets and "fresh-secret" not in before
+    same = log._secrets
+    log.add_secrets(["fresh-secret", "abc"])  # нового нет (короткие не в счёт) — набор тот же
+    assert log._secrets is same
+
+
 def test_exception_text_is_masked(journal):
     try:
         raise ValueError(f"bad link vless://{UUID}@203.0.113.10:443?security=tls")

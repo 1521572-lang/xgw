@@ -21,6 +21,8 @@ from . import config, cost, fetch, log, marknet, masking, rating
 from . import pin as pinning
 from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
+from .freepool import probe as pool_probe
+from .freepool import traffic
 from .generator import builder, validate
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
@@ -72,6 +74,10 @@ class Assembly:
     # Настройки ядра, по которым собран конфиг (profiles.core_settings): persist пишет их в
     # базу, следующая сборка по ним отличает выученный обычный sing-box от закреплённого.
     core: dict = field(default_factory=dict)
+    # Серверы бесплатного пула в сборке (freepool/traffic.TrafficServer), веха М2б.1.
+    pool: list = field(default_factory=list)
+    # Устройства через бесплатный пул: пул пуст — у них закрыто.
+    pool_devices: list[str] = field(default_factory=list)
 
 
 def bypass_mark(cfg: config.Config, logger) -> int | None:
@@ -151,6 +157,43 @@ def load_inventory(paths: Paths) -> list[dict]:
     return [item for item in servers if isinstance(item, dict)] if isinstance(servers, list) else []
 
 
+# История выдачи отпечатков (model.split_variants): отпечаток → {сводка полей варианта →
+# [выданный отпечаток, когда виден]}. Записи старше FINGERPRINTS_KEEP забываются. Ни адресов,
+# ни ключей в ней нет — только хеши.
+FINGERPRINTS_KEEP = 30 * 86400.0
+
+
+def fingerprints_file(paths: Paths) -> Path:
+    return paths.var / "fingerprints.json"
+
+
+def _load_fingerprints(paths: Paths) -> dict[str, dict[str, list]]:
+    loaded = read_json(fingerprints_file(paths)) or {}
+    known = loaded.get("known") if isinstance(loaded, dict) else None
+    if not isinstance(known, dict):
+        return {}
+    return {
+        str(base): {
+            str(digest): entry for digest, entry in entries.items()
+            if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str)
+        }
+        for base, entries in known.items() if isinstance(entries, dict)
+    }
+
+
+def _save_fingerprints(paths: Paths, known: dict[str, dict[str, list]], now: float,
+                       logger) -> None:
+    fresh = {
+        base: kept for base, entries in known.items()
+        if (kept := {digest: entry for digest, entry in entries.items()
+                     if now - float(entry[1] or 0) < FINGERPRINTS_KEEP})
+    }
+    try:
+        atomic_write_json(fingerprints_file(paths), {"saved": now, "known": fresh}, mode=0o600)
+    except OSError as exc:  # не root (xgw build) — история не пишется, отпечатки те же
+        logger.debug("история отпечатков не записана: %s", exc)
+
+
 def config_secrets(cfg: config.Config) -> list[str]:
     """Секреты из config.toml, которые регулярками не распознать."""
     values = [cfg.status.token]
@@ -201,7 +244,12 @@ def collect(
         for warning in manual_warnings:
             logger.warning("%s", warning)
         inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
-    split = split_variants(inventory.nodes)
+    # Отпечаток варианта — по истории выдачи, а не по соседям в списке (R01 кросс-аудита).
+    known = _load_fingerprints(paths)
+    previous = set() if known else {item.get("fingerprint") for item in load_inventory(paths)}
+    now = time.time()
+    split = split_variants(inventory.nodes, known, previous=previous, now=now)
+    _save_fingerprints(paths, known, now, logger)
     if split:
         logger.info("серверов с одним адресом и ключом, но разными путём, SNI или режимом: %d "
                     "— это разные серверы, не дубли", split)
@@ -450,6 +498,10 @@ def assemble(
     applied = read_json(paths.xray_config_file)
     applied_sb = read_json(paths.singbox_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
+    pool_devs = traffic.pool_devices(cfg)
+    pool_all = traffic.whole_house(cfg)
+    pool_ready, pool_hosts = _pool_servers(cfg, paths, inventory, applied, mark, logger,
+                                           bool(pool_devs) or pool_all)
     prices = node_costs(cfg, inventory)
     if prefer is None:
         prefer = builder.member_fingerprints(applied, inventory.nodes)
@@ -520,11 +572,15 @@ def assemble(
             dead = dead | gone
             continue
         ordered = [*selection.members, *selection.spares]
+        pool_nodes = [item.node for item in pool_ready if item.node.fingerprint not in rejected]
+        # Имя сервера пула закреплено только публичными адресами (_pool_servers); то же имя у
+        # подписки — её адреса.
+        hosts = {**pool_hosts, **hosts}
         plan = None
         if enabled:
             try:
                 plan = singboxing.build(
-                    cfg, ordered, hosts, previous=applied_sb, skip=nosb,
+                    cfg, [*ordered, *pool_nodes], hosts, previous=applied_sb, skip=nosb,
                     avoid=set(probe_ports.values()),
                 )
             except ValueError as exc:
@@ -539,13 +595,18 @@ def assemble(
                 config=applied_sb or {}, ports=applied_ports,
                 password=singboxing.bridge_password(applied_sb),
             )
+        # Сервер пула, которого умеет только sing-box, — только если его мост уже есть: иначе
+        # сборка упала бы целиком (нет входа sing-box), а пока sing-box не перечитан, его
+        # место в «pool» займут остальные.
+        pool_nodes = [node for node in pool_nodes if node.outbound or (
+            effective is not None and effective.letters(node.fingerprint))]
         profile_of = {
             node.fingerprint: profiling.resolve(
                 node, cfg, effective.letters(node.fingerprint) if effective else (),
                 current=current.get(node.fingerprint), override=decided.get(node.fingerprint),
                 same_pin=profiling.pin_unchanged(cfg, saved_core, node.fingerprint),
             )
-            for node in ordered
+            for node in [*ordered, *pool_nodes]
         }
         try:
             result = builder.build(
@@ -559,18 +620,23 @@ def assemble(
                 avoid_ports={*(plan.ports.values() if plan is not None else ()),
                              *(applied_ports or {}).values()},
                 api_listen=str(paths.xray_api_socket),
+                pool=pool_nodes, pool_devices=pool_devs, pool_all=pool_all,
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc
+        in_pool = {info.fingerprint for info in result.pool}
+        pooled = [item for item in pool_ready if item.node.fingerprint in in_pool]
         change = SingboxChange(
             config=plan.config if plan is not None else None, reload=reload_now,
             bridged=sum(
-                1 for info in result.nodes if profiling.core_of(info.profile) == "sing-box"
+                1 for info in [*result.nodes, *result.pool]
+                if profiling.core_of(info.profile) == "sing-box"
             ),
         )
         core = profiling.core_settings(cfg)
         if not check:
-            return Assembly(result, selection, None, len(rejected), change, core)
+            return Assembly(result, selection, None, len(rejected), change, core, pooled,
+                            pool_devs)
         if plan is not None and sb_bin is not None:
             change.verdict, sb_output = singboxing.validate_config(plan.config, sb_bin)
             if change.verdict is False:
@@ -593,7 +659,8 @@ def assemble(
                 continue
         verdict, output = validate.validate_config(result.config, xray_bin)
         if verdict is not False:
-            return Assembly(result, selection, verdict, len(rejected), change, core)
+            return Assembly(result, selection, verdict, len(rejected), change, core, pooled,
+                            pool_devs)
         # Конфиг не прошёл: ищем серверы, которые установленный Xray не принимает
         # (снятый транспорт, неизвестный шифр), и собираем конфиг без них.
         newly = _reject_invalid(result, xray_bin, logger) - rejected
@@ -604,11 +671,12 @@ def assemble(
 
 def _carrying_tags(paths: Paths, applied: dict | None) -> set[str]:
     """Теги серверов, через которые сейчас идёт настоящий трафик: участники балансировщика,
-    резервный выход и выбранный вручную сервер. Запасные его не несут (только короткие пробы),
-    поэтому перечитывание sing-box им не мешает."""
+    серверы бесплатного пула (М2б.1), резервный выход и выбранный вручную сервер. Запасные
+    его не несут (только короткие пробы), поэтому перечитывание sing-box им не мешает."""
     tags = {
         str(outbound.get("tag")) for outbound in (applied or {}).get("outbounds") or []
-        if isinstance(outbound, dict) and str(outbound.get("tag", "")).startswith("proxy-")
+        if isinstance(outbound, dict)
+        and str(outbound.get("tag", "")).startswith(("proxy-", builder.POOL_PREFIX))
     }
     tags.add(builder.reserve_tag(applied))
     try:
@@ -681,11 +749,40 @@ def node_costs(cfg: config.Config, inventory: Inventory) -> dict[str, float]:
     return cost.costs(inventory.nodes, inventory.quotas, cfg.filters.multiplier_regex)
 
 
+def _pool_servers(
+    cfg: config.Config, paths: Paths, inventory: Inventory, applied: dict | None, mark,
+    logger, active: bool,
+) -> tuple[list[traffic.TrafficServer], dict[str, list[str]]]:
+    """Серверы бесплатного пула для сборки (М2б.1): допущенные (traffic.admitted), состав —
+    как в применённом конфиге, пока они допущены (traffic.choose), и только те, чьё имя
+    разрешается в публичные адреса (probe.server_hosts — как у проверок пула: список не
+    направит трафик устройства в домашнюю сеть). Через пул никто не идёт (active — ни
+    устройств, ни всего дома, traffic.pool_active) — пусто. Серверы, уже стоящие в «pool»,
+    допускаются со старой удачной проверкой до traffic.KEEP (восстановление, М3)."""
+    if not active:
+        return [], {}
+    members = {info.fingerprint for info in builder.applied_pool(applied)}
+    found = traffic.admitted(cfg, paths, time.time(), members=members)
+    kept = {info.fingerprint for info in builder.applied_pool(applied, [s.node for s in found])}
+    chosen = traffic.choose(found, kept, exclude={node.fingerprint for node in inventory.nodes},
+                            prefer=cfg.managed.free_pool_pin)
+    ready: list[traffic.TrafficServer] = []
+    hosts: dict[str, list[str]] = {}
+    for item in chosen:
+        pinned, why = pool_probe.server_hosts(item.variant, cfg, mark)
+        if why:
+            logger.info("сервер пула %s не в сборке: %s", item.node.name, why)
+            continue
+        hosts.update(pinned)
+        ready.append(item)
+    return ready, hosts
+
+
 def _reject_invalid(result: builder.BuildResult, xray_bin: Path | None, logger) -> set[str]:
-    """Отпечатки серверов, чьи outbounds установленный Xray не принимает."""
+    """Отпечатки серверов, чьи outbounds установленный Xray не принимает (и серверов пула)."""
     if xray_bin is None:
         return set()
-    by_tag = {info.tag: info.fingerprint for info in result.nodes}
+    by_tag = {info.tag: info.fingerprint for info in [*result.nodes, *result.pool]}
     candidates = [o for o in result.config["outbounds"] if o.get("tag") in by_tag]
     invalid = validate.find_invalid_outbounds(candidates, xray_bin)
     for tag, reason in invalid.items():
@@ -824,7 +921,7 @@ def persist(
         store = Store(paths.db_file)
         try:
             store.replace_nodes(entries)
-            store.prune_scans({info.probe_tag for info in result.nodes})
+            store.prune_scans({info.probe_tag for info in [*result.nodes, *result.pool]})
             store.set_meta("quota", json.dumps(quotas, ensure_ascii=False))
             store.set_meta("nodes_summary", json.dumps(summary(assembly)))
             if applied and assembly.core:
@@ -896,12 +993,14 @@ def describe_singbox(outcome: singbox_apply.SingboxOutcome) -> str:
 def apply_all(
     cfg: config.Config, paths: Paths, assembly: Assembly, applier: Applier, *,
     force_now: bool = False,
+    singbox_core: singbox_apply.SingboxCore | None = None,
 ) -> tuple[ApplyOutcome | None, singbox_apply.SingboxOutcome | None]:
     """Применяет сборку: сначала sing-box (мосты должны слушать), затем Xray. Если sing-box
     конфиг не принял, Xray не применяется (он собран под него): вернётся только итог sing-box."""
     outcome = None
     if assembly.singbox is not None:
-        outcome = make_singbox(cfg, paths).apply(
+        core = singbox_core if singbox_core is not None else make_singbox(cfg, paths)
+        outcome = core.apply(
             assembly.singbox.config, reload=assembly.singbox.reload,
         )
         if outcome.mode in ("rejected", "rollback", "failed"):

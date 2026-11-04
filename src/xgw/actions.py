@@ -250,6 +250,136 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
     return Outcome(0, "автовыбор: сервер снова выбирает Xray")
 
 
+# --- бесплатный пул ---------------------------------------------------------------------
+
+POOL_MODE_TEXT = {
+    "off": "Бесплатный пул выключен",
+    "observe": "Наблюдение за бесплатным пулом включено: списки серверов собираются через "
+               "подписку, серверы проверяются, а трафик идёт как прежде — через подписку",
+    "on": "Весь дом идёт через бесплатные серверы: устройства, эта машина, Docker и DNS. "
+          "Подписка — только несущий канал: списки бесплатных серверов, подписки, обновления. "
+          "Вернуть — «Вернуть режим подписок» в панели или sudo xgw pool mode observe",
+}
+POOL_MODE_EVENT = {
+    "off": "бесплатный пул выключен",
+    "observe": "бесплатный пул: наблюдение включено",
+    "on": "бесплатный пул: весь дом через бесплатные серверы",
+}
+
+
+def set_pool_mode(paths: Paths, store_path, mode: str, *, refuse_closing: bool = False,
+                  ready: int | None = None) -> Outcome:
+    """Режим бесплатного пула (panel.json; демон применит на ближайшем шаге): off, observe или
+    on — весь дом через пул (веха М2б.2). Устройства «через бесплатные серверы» (М2б.1) при
+    выключенном пуле закрыты, а весь дом без допущенных серверов (ready — их число,
+    traffic.admitted) остался бы без зарубежных сайтов: панель (refuse_closing) тогда режим не
+    меняет, команда меняет и говорит об этом."""
+    from . import managed
+
+    if mode not in POOL_MODE_TEXT:
+        return Outcome(2, "режим — off, observe или on")
+    stored, _problem = managed.load(store_path)
+    via_pool = [item.get("name") or item.get("ip") for item in stored.get("routes") or []
+                if item.get("server") == managed.POOL_ROUTE]
+    if mode == "off" and via_pool and refuse_closing:
+        return Outcome(2, "Через бесплатные серверы идёт устройство «" + "», «".join(via_pool)
+                       + "»: без пула у него закроются зарубежные сайты. Сначала верните его "
+                       "на подписку в списке устройств (сервер: авто), потом выключайте")
+    empty = mode == "on" and not ready
+    if empty and refuse_closing:
+        return Outcome(2, "Допущенных бесплатных серверов сейчас нет (или наблюдение выключено): "
+                          "весь дом остался бы без зарубежных сайтов. Включите наблюдение и "
+                          "дождитесь допущенных серверов — их видно на вкладке «Бесплатные "
+                          "серверы»")
+    previous = stored.get("free_pool_mode")
+    try:
+        changed = managed.set_free_pool_mode(store_path, mode)
+    except managed.ManagedError as exc:
+        return Outcome(1, str(exc))
+    except OSError as exc:
+        return Outcome(1, f"режим не записан: {exc} — запустите команду через sudo")
+    if changed:
+        event = POOL_MODE_EVENT[mode]
+        if previous == "on" and mode == "observe":
+            event = "бесплатный пул: режим подписок возвращён, наблюдение продолжается"
+        with open_store(paths) as store:
+            store.add_event("freepool", event)
+    text = POOL_MODE_TEXT[mode]
+    if empty:
+        text += (". Допущенных бесплатных серверов сейчас нет — зарубежные сайты закрыты, пока "
+                 "они не появятся")
+    if mode == "off" and via_pool:
+        text += (". Устройства через бесплатные серверы (" + ", ".join(via_pool) + ") остались "
+                 "без зарубежных сайтов — верните их на подписку в списке устройств панели")
+    return Outcome(0, text)
+
+
+HOUSE_BOOT_EVENT = ("бесплатный пул: весь дом снят после перезагрузки — трафик через подписку, "
+                    "наблюдение продолжается; включить снова — кнопкой на вкладке")
+
+
+def house_after_boot(paths: Paths, store_path) -> bool:
+    """Весь дом через пул не переживает перезагрузку (отчёт m2b2fix, дефект 1): удалённый
+    доступ к шлюзу пропал, а режим вернулся сам после двух перезагрузок подряд — снять его,
+    когда шлюз недоступен, было нечем. Метки этой загрузки (Paths.house_file) нет — режим on
+    становится observe; True — режим изменён (настройки перечитать)."""
+    from . import managed
+
+    if paths.house_file.exists():
+        return False
+    try:
+        changed = managed.set_free_pool_mode(store_path, "observe")
+    except (managed.ManagedError, OSError):
+        return False
+    if changed:
+        with open_store(paths) as store:
+            store.add_event("freepool", HOUSE_BOOT_EVENT)
+    return changed
+
+
+def set_pool_pin(paths: Paths, store_path, cfg, wanted: str) -> Outcome:
+    """Сервер бесплатного пула, выбранный вручную (panel.json; демон применит на ближайшем
+    шаге): wanted — id варианта или его начало (не короче 6 знаков) среди допущенных к трафику;
+    пусто или «auto» — выбирает шлюз. Выбранный держится, пока жив; молчит — трафик ведёт
+    выбранный шлюзом, а вернётся выбранный, когда снова ответит."""
+    import time
+
+    from . import managed
+    from .freepool import traffic as fptraffic
+
+    wanted = wanted.strip().lower()
+    chosen = None
+    if wanted not in ("", "auto"):
+        found = [item for item in fptraffic.admitted(cfg, paths, time.time())
+                 if len(wanted) >= 6 and item.node.fingerprint.startswith(wanted)]
+        if len(found) != 1:
+            return Outcome(2, "Такого сервера среди допущенных к трафику нет (или начало id "
+                              "подходит нескольким): выбрать можно только сервер без причины "
+                              "недопуска на вкладке «Бесплатные серверы»")
+        chosen = found[0]
+    try:
+        changed = managed.set_free_pool_pin(store_path, chosen.node.fingerprint if chosen else "")
+    except managed.ManagedError as exc:
+        return Outcome(1, str(exc))
+    except OSError as exc:
+        return Outcome(1, f"выбор не записан: {exc} — запустите команду через sudo")
+    if chosen is None:
+        text = "Сервер бесплатного пула снова выбирает шлюз"
+        event = "бесплатный пул: выбор сервера вручную снят — сервер выбирает шлюз"
+    else:
+        country = chosen.node.country.upper()
+        label = f"«{chosen.node.name}»" + (f" ({country})" if country != "XX" else "")
+        text = (f"Выбран {label}: трафик пула идёт через него, пока он отвечает; молчит — "
+                "через выбранный шлюзом")
+        event = f"бесплатный пул: сервер {label} выбран вручную"
+    if changed:
+        with open_store(paths) as store:
+            store.add_event("freepool", event)
+    if not fptraffic.pool_active(cfg):
+        text += ". Сейчас через бесплатные серверы никто не идёт — выбор подействует, когда пойдёт"
+    return Outcome(0, text)
+
+
 # --- ядро сервера ----------------------------------------------------------------------
 
 

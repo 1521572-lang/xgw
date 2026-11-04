@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from .parsers.common import RawServer, SingboxSpec
@@ -115,8 +116,10 @@ def raw_to_node(raw: RawServer, source: str) -> ServerNode:
     )
 
 
-def variant_key(node: ServerNode) -> str:
-    """Путь, Host, режим, SNI и ключ REALITY сервера — то, что make_fingerprint не учитывает."""
+def variant_key(node: ServerNode, *, legacy: bool = False) -> str:
+    """Путь, Host, режим, SNI и ключ REALITY сервера — то, что make_fingerprint не учитывает.
+    Host — и из устаревшей записи headers.Host (R01 кросс-аудита 4cc96b9: серверы одного CDN,
+    различимые только ею, схлопывались в один); legacy — без неё, как до этой правки."""
     parts: dict[str, object] = {}
     stream = node.outbound.get("streamSettings") if node.outbound else None
     if isinstance(stream, dict):
@@ -126,6 +129,12 @@ def variant_key(node: ServerNode) -> str:
                 for name in _STREAM_FIELDS:
                     if settings.get(name):
                         parts[f"{key}.{name}"] = settings[name]
+                headers = settings.get("headers")
+                if not legacy and f"{key}.host" not in parts and isinstance(headers, dict):
+                    host = next((value for name, value in headers.items()
+                                 if str(name).lower() == "host" and value), None)
+                    if host:
+                        parts[f"{key}.host"] = host
         for key in ("tlsSettings", "realitySettings"):
             settings = stream.get(key)
             if isinstance(settings, dict):
@@ -147,22 +156,63 @@ def variant_key(node: ServerNode) -> str:
     return json.dumps(parts, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def split_variants(nodes: list[ServerNode]) -> int:
+def _variant_fingerprint(fingerprint: str, key: str) -> str:
+    return hashlib.sha256(f"{fingerprint}|{key}".encode()).hexdigest()[:8]
+
+
+def split_variants(
+    nodes: list[ServerNode], known: dict[str, dict[str, list]] | None = None, *,
+    previous: Collection[str] = (), now: float = 0.0,
+) -> int:
     """Серверы с одним отпечатком (протокол, адрес, порт, ключ, транспорт), но разными путём,
     Host, SNI, ключом REALITY или режимом XHTTP — разные выходы, а не дубли: им отпечаток с
-    этими полями. У остальных отпечаток прежний — закрепления, история и замеры не теряются;
-    настоящие дубли (поля те же) по-прежнему схлопывает builder. Возвращает, скольким серверам
-    дан новый отпечаток."""
+    этими полями. Единственный вариант своего отпечатка его и сохраняет — закрепления, история
+    и замеры не теряются; настоящие дубли (поля те же) по-прежнему схлопывает builder.
+
+    known — история выдачи (engine.fingerprints_file): отпечаток → {сводка полей варианта →
+    [выданный отпечаток, когда виден]}; дополняется здесь. По ней отпечаток сервера не зависит
+    от соседей в списке (R01 кросс-аудита 4cc96b9): раньше A → A+B → A менял отпечаток A дважды,
+    и с ним терялись выбор вручную, замеры и итоги проверок. Единственный вариант с новой сводкой
+    — тот же сервер, сменивший путь, SNI или другое поле (у части подписок одно из них другое при
+    каждом скачивании — отчёт audit6b): он наследует отпечаток единственного варианта прошлого
+    опроса, а без такого — общий; запись прежней сводки при этом уходит. previous — отпечатки
+    прошлого списка серверов (engine.load_inventory), нужны только без истории (первый запуск
+    после обновления): сервер, чья сводка полей изменилась с этой правкой, сохраняет прежний
+    отпечаток.
+
+    Возвращает, сколько серверов получили отпечаток варианта, а не общий."""
+    known = {} if known is None else known
     groups: dict[str, list[ServerNode]] = {}
     for node in nodes:
         groups.setdefault(node.fingerprint, []).append(node)
     changed = 0
     for fingerprint, group in groups.items():
         keys = [variant_key(node) for node in group]
-        if len(set(keys)) < 2:
-            continue
-        for node, key in zip(group, keys, strict=True):
-            basis = f"{fingerprint}|{key}"
-            node.fingerprint = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:8]
-            changed += 1
+        digests = [hashlib.sha256(key.encode()).hexdigest()[:16] for key in keys]
+        seen = known.setdefault(fingerprint, {})
+        # Варианты прошлого опроса — записи с самой поздней отметкой (один опрос — одно now).
+        latest = max((float(entry[1] or 0) for entry in seen.values()), default=None)
+        last = {str(entry[0]) for entry in seen.values() if float(entry[1] or 0) == latest}
+        single = len(set(digests)) < 2
+        for node, key, digest in zip(group, keys, digests, strict=True):
+            entry = seen.get(digest)
+            legacy = _variant_fingerprint(fingerprint, variant_key(node, legacy=True))
+            if entry is not None:
+                chosen = str(entry[0])
+            elif legacy in previous and legacy != _variant_fingerprint(fingerprint, key):
+                chosen = legacy
+            elif single:
+                chosen = next(iter(last)) if len(last) == 1 else fingerprint
+                for other in [item for item, value in seen.items() if value[0] == chosen]:
+                    del seen[other]  # отпечаток переходит к новой сводке полей
+            else:
+                chosen = _variant_fingerprint(fingerprint, key)
+                taken = {str(value[0]) for item, value in seen.items() if item != digest}
+                salt = 0
+                while chosen in taken or chosen == fingerprint:  # занят другим вариантом
+                    salt += 1
+                    chosen = _variant_fingerprint(fingerprint, f"{key}#{salt}")
+            seen[digest] = [chosen, now]
+            changed += chosen != fingerprint
+            node.fingerprint = chosen
     return changed

@@ -58,10 +58,13 @@ from .. import (
     priority,
     qr,
     tray,
+    usage,
 )
 from .. import pin as pinning
 from .. import tailscale as ts
 from ..config import Config
+from ..freepool import pool as pooling
+from ..freepool import traffic as fptraffic
 from ..generator import validate
 from ..generator.builder import BALANCER_TAG
 from ..net import cmd, dnsmasq, lan, nft
@@ -96,6 +99,12 @@ MANUAL = "manual"  # источник серверов, заданных отд�
 # Свой сервер устройства демон применяет сразу, не дожидаясь окна перезапуска (отчёт Ф4).
 ROUTE_RESTART = ("Применяется сразу; если для этого нужен перезапуск Xray, соединения всех "
                  "устройств прервутся на пару секунд")
+# Устройство через бесплатный пул (М2б.1): что владельцы серверов видят и что будет без них.
+POOL_ROUTE_NOTE = ("Владельцы бесплатных серверов неизвестны и видят, к каким сайтам идёт "
+                   "устройство: содержимое сайтов с https защищено, без https — нет. Российские "
+                   "домены (.ru, .su, .рф) — напрямую, как у всех")
+POOL_ROUTE_CLOSED = ("Пока бесплатных серверов нет, зарубежные сайты у устройства закрыты: "
+                     "через подписку оно не пойдёт")
 # Как часто сервер проверяет, не пора ли остановиться: столько самое большее ждёт
 # остановка демона (по умолчанию в http.server — 0,5 с).
 # Панель — по 127.0.0.1 и по tailnet (Tailscale Serve): соединений сразу не больше, чем нужно
@@ -646,6 +655,9 @@ class Panel:
             "class_warning": snapshot.get("class_warning") or "",
             # Белые списки (анти-ТСПУ 2.0): предупреждение и сервер, который можно включить.
             "whitelist": snapshot.get("whitelist"),
+            # Бесплатный пул: режим и сводка наблюдения.
+            "free_pool": {"mode": cfg.free_pool.mode, "pin": cfg.managed.free_pool_pin,
+                          "summary": snapshot.get("free_pool")},
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.
@@ -755,6 +767,28 @@ class Panel:
                 store.add_event("netcheck", "проверка сети: " + netcheck.summary(checks))
         except (OSError, sqlite3.Error) as exc:
             self.log.error("итог проверки сети не записан: %s", exc)
+
+    def pool_servers(self) -> dict:
+        """Вкладка «Бесплатные серверы»: строки серверов пула (freepool.pool.server_rows).
+        Страница просит их, только пока вкладка открыта, и заново — когда демон пересчитал
+        сводку пула (summary.computed_at): сотни строк в /api/state каждые 3 с были бы лишними."""
+        cfg = self.cfg
+        try:
+            rows = pooling.server_rows(cfg, self.paths, time.time())
+        except (OSError, ValueError) as exc:
+            self.log.error("серверы бесплатного пула не прочитаны: %s", exc)
+            rows = []
+        return {"mode": cfg.free_pool.mode, "region": cfg.free_pool.region, "servers": rows}
+
+    def traffic(self, days: str) -> dict:
+        """Карточка «Трафик»: расход по устройствам, подпискам и выходам (usage.report) за
+        1, 7 или 30 дней. Отдельно от /api/state: страница просит его раз в минуту."""
+        period = int(days) if days in ("1", "7", "30") else 1
+        try:
+            return usage.report(self.cfg, self.paths, period)
+        except (OSError, sqlite3.Error) as exc:
+            self.log.error("учёт трафика не прочитан: %s", exc)
+            return {"days": period, "error": "учёт трафика не прочитан"}
 
     def _cores_card(self, snapshot: dict, now: float) -> dict:
         singbox = snapshot.get("singbox") or {}
@@ -1465,13 +1499,27 @@ class Panel:
             return actions.Outcome(2, "такого устройства в сети нет — обновите страницу")
         if address not in gateway.network or address == gateway.ip:
             return actions.Outcome(2, "адрес устройства вне сети шлюза")
+        name = (found or {}).get("name") or (lease.name if lease else "")
+        if server == managed.POOL_ROUTE:
+            # Устройство через бесплатный пул (веха М2б.1): серверы пула проверяет наблюдение.
+            if cfg.free_pool.mode == "off":
+                return actions.Outcome(
+                    2, "Сначала включите наблюдение в карточке «Бесплатные серверы»: без него "
+                       "шлюз не проверяет бесплатные серверы, и устройству идти некуда")
+            return self._apply_devices(
+                store_path,
+                lambda: managed.set_route(store_path, mac, str(address),
+                                          name if lan.valid_hostname(name) else "",
+                                          managed.POOL_ROUTE),
+                f"Устройство «{label}» идёт через бесплатные серверы",
+                (POOL_ROUTE_NOTE, POOL_ROUTE_CLOSED, ROUTE_RESTART),
+            )
         _snapshot, _xray_ok, members, spares = self._core(time.time())
         rows, _gone = self._servers(members, spares)
         row = next((row for row in rows if row["fingerprint"] == server
                     and row["status"] in ("member", "spare", "waiting")), None)
         if row is None:
             return actions.Outcome(2, "этого сервера нет среди включённых — обновите страницу")
-        name = (found or {}).get("name") or (lease.name if lease else "")
         return self._apply_devices(
             store_path,
             lambda: managed.set_route(
@@ -1732,6 +1780,28 @@ class Panel:
             self._event("ссылка сервера убрана из панели")
             self._wake()
             return actions.Outcome(0, "Ссылка сервера убрана")
+        if name == "freepool/mode":
+            mode = str(body.get("mode") or "")
+            # Весь дом через пул без допущенных серверов — закрыто для всех: панель не включает.
+            ready = len(fptraffic.admitted(cfg, self.paths, time.time())) if mode == "on" else None
+            outcome = actions.set_pool_mode(self.paths, store_path, mode, refuse_closing=True,
+                                            ready=ready)
+            if outcome.ok:
+                self._wake()
+            return outcome
+        if name == "freepool/pin":
+            wanted = body.get("id")
+            if not isinstance(wanted, str):
+                return actions.Outcome(2, "ожидается id сервера пула или пусто")
+            outcome = actions.set_pool_pin(self.paths, store_path, cfg, wanted)
+            if outcome.ok:
+                self._wake()
+            return outcome
+        if name == "freepool/refresh":
+            if self.daemon is None or cfg.free_pool.mode == "off":
+                return actions.Outcome(2, "сначала включите наблюдение за бесплатным пулом")
+            self.daemon.request_freepool_refresh()
+            return actions.Outcome(0, "Опрашиваю источники бесплатных серверов через подписку…")
         if name == "sticky":
             if not isinstance(body.get("on"), bool):
                 return actions.Outcome(2, "ожидается on: true или false")
@@ -1939,6 +2009,15 @@ class Panel:
             if host != self._tailnet_host():
                 self._page_signal(handler.headers.get("X-XGW-Focus") or "")
             self._json(handler, HTTPStatus.OK, self.state(), body)
+        elif url.path == "/api/pool":
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._json(handler, HTTPStatus.OK, self.pool_servers(), body)
+        elif url.path == "/api/traffic":
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._json(handler, HTTPStatus.OK, self.traffic((query.get("days") or ["1"])[0]),
+                       body)
         elif url.path.startswith("/records/"):
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")

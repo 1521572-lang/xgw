@@ -31,6 +31,7 @@ probe.url_fallback, другие probe.urls и probe.trace_url): иначе он
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
@@ -80,7 +81,8 @@ def signature(result: ScanResult) -> str:
     Пусто — проба прошла либо это «заморозка»: и то, и другое значит, что адрес
     пробы отвечает.
     """
-    if result.verdict in _GOOD or result.verdict == "FROZEN" or result.bytes_read > 0:
+    if result.verdict in _GOOD or result.verdict in ("FROZEN", "BODY_RESET") or (
+            result.bytes_read > 0):
         return ""
     if result.status and not 200 <= result.status < 300:
         return f"HTTP {result.status}"
@@ -133,6 +135,9 @@ def sample(
 
 # Одновременных запросов base_ping через участников (участники × проверочные хосты).
 BASE_PING_WORKERS = 16
+# answers_via спрашивает участников по очереди, по 15 с на запрос, но всех вместе — не дольше
+# этого (C03 кросс-аудита 4cc96b9: при десятке мёртвых участников шаг демона ждал минуты).
+ANSWERS_BUDGET = 30.0
 
 
 def base_ping(
@@ -146,7 +151,8 @@ def base_ping(
     не trace_url — серверы трафик носят. probe.url (jsDelivr) и trace_url оба бывают у
     Cloudflare, и его отказ выходным адресам VPN выглядел бы смертью всех серверов (пятый
     аудит, Q1). Запросы через участников идут одновременно: не дольше одного запроса (15 с),
-    а не по 15 с на каждого участника.
+    а не по 15 с на каждого участника; первый ответ прерывает остальные (C05 кросс-аудита
+    4cc96b9: уже начатые запросы досиживали свои 15 с после ответа).
 
     members (с паролем проб) — спрашивать через probe-inbound каждого участника, пока
     не ответит хоть один. Через http-in нельзя, когда у балансировщика есть резервный
@@ -163,13 +169,14 @@ def base_ping(
     pairs = [(info, url) for url in urls for info in members if info.probe_port]
     if not pairs:
         return False
+    answered = threading.Event()  # ответ есть: остальные запросы прерываются
 
     def attempt(pair: tuple[NodeInfo, str]) -> bool:
         info, url = pair
         return checks.http_get_via_proxy(
             "127.0.0.1", info.probe_port, url,
             timeout=10.0, silence=5.0, max_total=15.0, user_agent=cfg.probe.user_agent,
-            proxy_user=user, proxy_pass=password,
+            proxy_user=user, proxy_pass=password, cancel=answered,
         ).ok
 
     pool = ThreadPoolExecutor(
@@ -179,6 +186,7 @@ def base_ping(
         futures = [pool.submit(attempt, pair) for pair in pairs]
         return any(future.result() for future in as_completed(futures))
     finally:
+        answered.set()
         pool.shutdown(wait=False, cancel_futures=True)
 
 
@@ -300,13 +308,20 @@ def use_fallback(cfg: Config, paths: Paths, on: bool, url: str = "") -> bool:
 
 def answers_via(
     cfg: Config, members: Sequence[NodeInfo], password: str, url: str, user: str = "",
+    cancel: threading.Event | None = None,
 ) -> bool:
     """Открывается ли url через серверы в работе (probe-inbound каждого, пока не ответит
-    хоть один) — так демон ищет другой проверочный хост, когда не отвечает probe.url."""
-    return any(
-        checks.http_get_via_proxy(
-            "127.0.0.1", info.probe_port, url, timeout=10.0, silence=5.0, max_total=15.0,
-            user_agent=cfg.probe.user_agent, proxy_user=user, proxy_pass=password,
-        ).ok
-        for info in members if info.probe_port
-    )
+    хоть один) — так демон ищет другой проверочный хост, когда не отвечает probe.url. Всех
+    вместе — не дольше ANSWERS_BUDGET; cancel — демон останавливается."""
+    deadline = time.monotonic() + ANSWERS_BUDGET
+    for info in members:
+        left = deadline - time.monotonic()
+        if left < 1.0 or (cancel is not None and cancel.is_set()):
+            return False
+        if info.probe_port and checks.http_get_via_proxy(
+            "127.0.0.1", info.probe_port, url, timeout=10.0, silence=5.0,
+            max_total=min(15.0, left), user_agent=cfg.probe.user_agent, proxy_user=user,
+            proxy_pass=password, cancel=cancel,
+        ).ok:
+            return True
+    return False

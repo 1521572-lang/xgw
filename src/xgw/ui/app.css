@@ -15,7 +15,14 @@
   --info: #62adff;
   --shadow: 0 1px 2px rgb(0 0 0 / 35%), 0 12px 32px rgb(0 0 0 / 22%);
   --radius: 18px;
+  --page: 1120px;
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
+}
+
+/* На широком мониторе страница шире: при 1120px по бокам оставались огромные поля, а длинные
+   строки серверов переносились (отзыв заказчика к вкладке пула, 30.10). */
+@media (min-width: 1500px) {
+  :root { --page: min(1560px, 94vw); }
 }
 
 @media (prefers-color-scheme: light) {
@@ -73,7 +80,7 @@ button, textarea, input { font: inherit; color: inherit; }
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  max-width: 1120px;
+  max-width: var(--page);
   margin: 0 auto;
   padding: 1.1rem 1.25rem .4rem;
 }
@@ -106,9 +113,14 @@ button, textarea, input { font: inherit; color: inherit; }
 .chip[data-tone="ok"]::before { background: var(--accent); }
 .chip[data-tone="warn"]::before { background: var(--warn); }
 .chip[data-tone="bad"]::before { background: var(--bad); }
+/* Метка — кнопка только во «всём доме через пул»: нажатие предлагает вернуть режим подписок. */
+.chip:disabled { cursor: default; }
+.chip:enabled { cursor: pointer; }
+.chip:enabled::after { content: "▾"; color: var(--muted); font-size: .75rem; }
+.chip:enabled:hover { border-color: color-mix(in srgb, var(--text) 35%, var(--line)); }
 
 .banner {
-  max-width: 1088px;
+  max-width: calc(var(--page) - 32px);
   margin: .6rem auto 0;
   padding: .7rem 1rem;
   border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
@@ -122,7 +134,7 @@ button, textarea, input { font: inherit; color: inherit; }
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
-  max-width: 1120px;
+  max-width: var(--page);
   margin: 0 auto;
   padding: .8rem 1rem 1.5rem;
 }
@@ -145,8 +157,11 @@ button, textarea, input { font: inherit; color: inherit; }
   .phones-card { order: 7; }
   .cores-card { order: 8; }
   .netcheck-card { order: 9; }
+  .mode-tabs, .pool-card { order: 2; }
   body[data-empty="1"] .subs-card { order: 2; }
-  body[data-empty="1"] .servers-card { order: 3; }
+  body[data-empty="1"] .servers-card,
+  body[data-empty="1"] .mode-tabs,
+  body[data-empty="1"] .pool-card { order: 3; }
 }
 
 .card {
@@ -369,6 +384,9 @@ button, textarea, input { font: inherit; color: inherit; }
 .ts-enable { align-self: flex-start; margin-top: .45rem; }
 .ts-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
 .ts-note > span { flex: 1 1 14rem; }
+/* Весь дом через бесплатные серверы (М2б.2): напоминание и кнопка возврата в главной карточке. */
+.house-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
+.house-note > span { flex: 1 1 14rem; }
 a.btn { display: inline-flex; align-items: center; color: inherit; text-decoration: none; }
 a.btn.primary { color: var(--accent-ink); }
 /* QR-код — тёмные модули на белом в любой теме: так его читает камера телефона. */
@@ -615,6 +633,41 @@ a.icon-btn { text-decoration: none; }
 }
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
 
+/* --- вкладки «Подписки | Бесплатные серверы» -------------------------------- */
+
+.mode-tabs {
+  display: flex;
+  gap: .25rem;
+  padding: .25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+.mode-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: .5rem .8rem;
+  border: 0;
+  border-radius: calc(var(--radius) - .25rem);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mode-tab:hover { color: var(--text); }
+.mode-tab[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.mode-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.head-tools { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
+
+/* Бесплатные серверы — по источникам, как серверы подписок; в шапке источника — итог опроса. */
+#pool-groups > .group:first-child { border-top: 0; }
+.group > summary > .tag { align-self: center; }
+.group-note { margin-bottom: .3rem; white-space: normal; }
+.pool-more { margin: 0 0 .5rem; }
+.pool-more > summary { padding: .3rem 0; color: var(--muted); font-size: .87rem; cursor: pointer; }
+
 .switch {
   position: relative;
   flex: none;
@@ -657,7 +710,13 @@ a.icon-btn { text-decoration: none; }
 .events time { flex: none; width: 5.6rem; color: var(--muted); font-size: .84rem; font-variant-numeric: tabular-nums; }
 .events .row-main { overflow-wrap: anywhere; }
 
-.foot { max-width: 1120px; margin: 0 auto; padding: 0 1.3rem 2rem; }
+/* Трафик (usage.py): полоса под строкой — доля от самой большой строки списка. */
+.usage .row-sub { white-space: normal; }
+.usage-bar { display: block; height: 4px; margin-top: .35rem; overflow: hidden; border-radius: 2px; background: var(--line); }
+.usage-bar > span { display: block; height: 100%; background: var(--accent); }
+.usage-period[aria-pressed="true"] { border-color: var(--accent); }
+
+.foot { max-width: var(--page); margin: 0 auto; padding: 0 1.3rem 2rem; }
 
 /* --- окна и сообщения ----------------------------------------------------- */
 

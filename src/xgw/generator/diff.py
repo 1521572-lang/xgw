@@ -20,8 +20,9 @@ RESTART_SECTIONS = ("log", "api", "metrics", "stats", "policy", "burstObservator
 # dns-out) — часть каркаса: через них идёт служебный трафик самого ядра. Outbound
 # дробления ClientHello (fragment.py) есть, только пока он нужен хоть одному серверу:
 # добавляется (ado) раньше, чем на него сошлются заменённые серверы, а снимается (rmo)
-# после них — порядок apply_plan.
-API_OUTBOUND_PREFIXES = ("proxy-", "spare-", "chain-", "fragment")
+# после них — порядок apply_plan. Серверы бесплатного пула (pool-*, веха М2б.1) — так же:
+# смена их состава не должна перезапускать Xray и рвать соединения всего дома.
+API_OUTBOUND_PREFIXES = ("proxy-", "spare-", "chain-", "fragment", "pool-")
 API_INBOUND_PREFIX = "probe-"
 
 

@@ -426,6 +426,7 @@ def collect_status(
     probe_hosts: dict | None = None,
     tailscale_via_vpn: bool = False,
     whitelist: dict | None = None,
+    free_pool: dict | None = None,
     guard: dict | None = None,
 ) -> dict:
     """Снимок состояния для status.json. observatory=None — метрики недоступны.
@@ -688,6 +689,8 @@ def collect_status(
         # Белые списки (анти-ТСПУ 2.0): {"since", "offer": {"tag", "name", "multiplier",
         # "answered"} | None}; None — их нет. Шлюз сам ничего не меняет.
         "whitelist": whitelist,
+        # Бесплатный пул (docs/FREEPOOL-PLAN.md): сводка наблюдения; None — режим off.
+        "free_pool": free_pool,
         # Контроль скорости участников (ТЗ R5–R8, watch/guard.py): подозрения, идущий поиск
         # замены, пауза после «глобальной просадки», трафик поисков за сутки.
         "guard": guard or {},
@@ -1095,6 +1098,10 @@ def render_status(status: dict) -> str:
         lines.append(f"Состояние: {status['state']}{tail} — {status.get('action') or 'ничего'}")
     else:
         lines.append("Состояние: демон XGW не запущен — показаны разовые данные")
+    assembly = status.get("assembly") or {}
+    if assembly.get("state") in ("building", "ready", "queued"):
+        lines.append("Конфиг: собирается в фоне; текущий продолжает работать "
+                     f"({assembly.get('elapsed_s', 0):g} с)")
     lines.append(render_xray(status.get("xray") or {}))
     singbox_line = render_singbox(
         status.get("singbox") or {}, pending=bool(status.get("singbox_pending")),
@@ -1103,6 +1110,23 @@ def render_status(status: dict) -> str:
         lines.append(singbox_line)
     if status.get("probe_target"):
         lines.append(status["probe_target"])
+    pool = status.get("free_pool")
+    if isinstance(pool, dict):
+        regions = ", ".join(f"{name} {count}" for name, count in sorted(
+            (pool.get("by_region") or {}).items()))
+        mode = {"observe": "наблюдение", "on": "весь дом"}.get(str(pool.get("mode")),
+                                                                 str(pool.get("mode")))
+        lines.append(
+            f"Бесплатный пул ({mode}"
+            f", регион {pool.get('region')}): найдено {pool.get('found', 0)}, проверено "
+            f"{pool.get('checked', 0)}, пригодно {pool.get('ready', 0)}"
+            + (f" ({regions})" if regions else "")
+            + f"; трафик проверок {pool.get('spent_mb', 0)} из {pool.get('budget_mb', 0)} МБ"
+        )
+        if isinstance(pool.get("traffic"), dict):
+            from ..freepool import traffic as fptraffic
+
+            lines.append(fptraffic.text(pool["traffic"]))
     whitelist = status.get("whitelist")
     if isinstance(whitelist, dict):
         offer = whitelist.get("offer") if isinstance(whitelist.get("offer"), dict) else None

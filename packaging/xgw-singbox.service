@@ -11,12 +11,11 @@ Wants=xgw-net.service
 ConditionPathExists=/etc/xgw/sing-box/config.json
 
 [Service]
-User=xray
-Group=xray
-# CAP_NET_ADMIN — метка на сокетах к серверам (routing_mark = mark_bypass: мимо перехвата),
-# CAP_NET_BIND_SERVICE — на случай портов ниже 1024 в конфиге.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+User=xgw-singbox
+Group=xgw-singbox
+# Обход перехвата — по UID в nftables. Мосты и API слушают только высокие порты.
+AmbientCapabilities=
+CapabilityBoundingSet=
 NoNewPrivileges=true
 ExecStartPre=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json
 ExecStart=/opt/xgw/sing-box/sing-box --disable-color run -c /etc/xgw/sing-box/config.json

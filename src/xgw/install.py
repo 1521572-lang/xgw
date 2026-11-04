@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import cores, desktop, engine, fetch, log, managed, tray
+from .apply.singbox import SingboxService
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, retire_obsolete
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG
@@ -46,10 +47,20 @@ UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 # Все файлы служб XGW: и DHCP для сети LAN (свой dnsmasq) — её включают, только когда
 # LAN настроен, — и обновление ядер из панели (cores.UNIT): её не включают вовсе, она
 # работает только по заданию демона. Порядок — порядок запуска; останавливаются в обратном.
+# Бесплатный пул: служба одного поколения туннеля SSTP (шаблон; её запускает только демон).
+FP_UNIT = "xgw-fp@.service"
 UNIT_FILES = (
     "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service", cores.UNIT,
+    FP_UNIT,
 )
 XRAY_USER = "xray"
+SINGBOX_USER = "xgw-singbox"
+# Работники бесплатного пула (freepool/agent.py): клиент SSTP (sstpc после подключения) и
+# SOCKS — каждый от своего пользователя, без входа и без возможностей. xgw-ovpn (OpenVPN до
+# вехи М2в) больше не создаётся; созданного прежней установкой убирает xgw uninstall (журнал).
+FP_USERS = ("xgw-vpn", "xgw-fps")
+# Клиент SSTP бесплатного пула: пакет Ubuntu sstp-client (sstpc и модуль pppd; тянет ppp).
+SSTP_PACKAGE = "sstp-client"
 XRAY_WAIT = 20.0  # сколько ждать ответа API после первого запуска Xray
 # Сколько systemd ждёт остановки демона (TimeoutStopSec в packaging/xgw.service), и сколько
 # ждут его перезапуска установка и удаление: дольше, с запасом на запуск. Демон, занятый
@@ -225,11 +236,39 @@ class Facts:
     wan_if: str = ""
     packages: list[str] = field(default_factory=list)  # чего не хватает
     user_exists: bool = False
+    singbox_user_exists: bool = False
+    singbox_user_problem: str = ""
+    fp_users_missing: list[str] = field(default_factory=list)
     xray_version: tuple[int, int, int] | None = None
     singbox_version: tuple[int, int, int] | None = None
     nm_running: bool = False
     lan_profiles: list[str] = field(default_factory=list)  # профили, которые будут отключены
     ufw_active: bool = False
+
+
+class _RestartOnReload(SingboxService):
+    """Установка нового unit: reload конфига обязан сменить и процесс с его правами."""
+
+    def __init__(self, service: SingboxService, before_restart: Callable[[], None]) -> None:
+        self.service = service
+        self.before_restart = before_restart
+
+    def start(self) -> None:
+        self.before_restart()
+        self.service.start()
+
+    def stop(self) -> None:
+        self.service.stop()
+
+    def restart(self) -> None:
+        self.before_restart()
+        self.service.restart()
+
+    def is_active(self) -> bool:
+        return self.service.is_active()
+
+    def reload(self) -> None:
+        self.restart()
 
 
 def _has_qt() -> bool:
@@ -292,6 +331,14 @@ class Installer:
         # Файлы служб, которые эта установка поменяла: работающий процесс живёт по прежнему
         # (ограничения systemd — с запуска), поэтому ядра перезапускаются (_first_apply).
         self.units_changed: set[str] = set()
+        self._singbox_unit_before: str | None = None
+        self._singbox_dac_before: dict[Path, tuple[int, int, int]] = {}
+        self._singbox_config_before: bytes | None = None
+        self._singbox_restart_attempted = False
+        self._singbox_migration_complete = False
+        self._daemon_paused = False
+        self._capture_initial_on = False
+        self._preserve_wan = False
 
     # --- что известно о машине --------------------------------------------------
 
@@ -302,9 +349,37 @@ class Installer:
             facts.packages.append("nftables")
         if facts.lan_if and self.which("dnsmasq") is None:
             facts.packages.append(dnsmasq.PACKAGE)
-        facts.user_exists = bool(
-            self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
-        )
+        if self.which("sstpc") is None:
+            facts.packages.append(SSTP_PACKAGE)  # бесплатный пул: туннели SSTP (М2в)
+        xray_entry = self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
+        singbox_entry = self.runner(["getent", "passwd", SINGBOX_USER], check=False).strip()
+        facts.user_exists = bool(xray_entry)
+        facts.singbox_user_exists = bool(singbox_entry)
+        if facts.singbox_user_exists:
+            try:
+                uid = int(singbox_entry.split(":")[2])
+                groups = {int(value) for value in self.runner(
+                    ["id", "-G", SINGBOX_USER], check=False).split()}
+                xray_uid = int(xray_entry.split(":")[2]) if xray_entry else None
+                xray_group = self.runner(["getent", "group", XRAY_USER], check=False).strip()
+                xray_gid = int(xray_group.split(":")[2]) if xray_group else None
+                if xray_entry and xray_gid is None:
+                    raise ValueError("группа xray не прочитана")
+                if not groups:
+                    raise ValueError("id -G не вернул группы")
+                if uid == 0 or uid == xray_uid or 0 in groups or xray_gid in groups:
+                    facts.singbox_user_problem = (
+                        f"пользователь {SINGBOX_USER} должен иметь отдельный ненулевой UID "
+                        "и не состоять в группах root или xray"
+                    )
+            except (ValueError, IndexError):
+                facts.singbox_user_problem = (
+                    f"не удалось проверить UID и группы существующего {SINGBOX_USER} через NSS"
+                )
+        facts.fp_users_missing = [
+            name for name in FP_USERS
+            if not self.runner(["getent", "passwd", name], check=False).strip()
+        ]
         if self.paths.xray_bin.exists():
             facts.xray_version = binary.installed_version(self.paths.xray_bin)
         if self.paths.singbox_bin.exists():
@@ -343,6 +418,8 @@ class Installer:
     def problems(self, facts: Facts) -> list[str]:
         """Причины, по которым установку начинать нельзя."""
         found: list[str] = []
+        if facts.singbox_user_problem:
+            found.append(facts.singbox_user_problem)
         if facts.lan_if:
             if facts.lan_if == facts.wan_if:
                 found.append(
@@ -387,6 +464,16 @@ class Installer:
         if not facts.user_exists:
             lines.append(
                 f"  • системный пользователь {XRAY_USER} (без входа) — от него работает Xray"
+            )
+        if not facts.singbox_user_exists:
+            lines.append(
+                f"  • отдельный системный пользователь {SINGBOX_USER} (без входа) — sing-box "
+                "без capabilities и доступа к конфигам Xray"
+            )
+        if facts.fp_users_missing:
+            lines.append(
+                f"  • системные пользователи {', '.join(facts.fp_users_missing)} (без входа) — "
+                "работники туннелей бесплатных серверов (SSTP и SOCKS)"
             )
         lines.append(f"  • код — {self.paths.lib_dir}, команда — {self.paths.launcher}")
         if self._xray_fits(facts.xray_version):
@@ -434,7 +521,10 @@ class Installer:
                 f"  • DHCP {start.strip()}–{end.strip()} на {facts.lan_if}: своя служба "
                 f"xgw-dhcp (dnsmasq, {dnsmasq.conf_path(self.paths)}); DNS в ней выключен"
             )
-        if not cfg.network.ipv6_proxy:
+        if self._preserve_wan:
+            lines.append("  • профиль WAN и его IPv6 сохраняются как сейчас; "
+                         "изменяются правила VPN и настройки LAN")
+        elif not cfg.network.ipv6_proxy:
             lines.append(
                 f"  • IPv6 на WAN ({facts.wan_if or 'не найден'}) будет отключён: "
                 "иначе трафик уйдёт мимо VPN"
@@ -489,6 +579,10 @@ class Installer:
     # --- запуск -----------------------------------------------------------------
 
     def run(self, *, assume_yes: bool = False, force: bool = False) -> int:
+        # Обновление и продолжение частичной установки не перенастраивают входящий
+        # адаптер. Старые записи нужны удалению, но не разрешают повторно применять WAN.
+        self._preserve_wan = ("finished" in self.journal or "nm_wan" in self.journal
+                              or (self.paths.systemd_dir / "xgw.service").exists())
         facts = self.facts()
         problems = self.problems(facts)
         conflict = self.subnet_conflict()
@@ -518,6 +612,10 @@ class Installer:
         # Установка поверх работающей (прошлая дошла до конца и не откатывалась): дом уже
         # ходит в интернет через этот шлюз, и откат к состоянию до XGW оставил бы его без сети.
         reinstall = "finished" in self.journal
+        self._capture_initial_on = (
+            self.capture.capturing and self.capture.mode() == "on"
+            and (reinstall or (self.paths.systemd_dir / "xgw.service").exists())
+        )
         self.paths.ensure()
         self.journal.setdefault("started", time.time())
         # Метки и таблица — чтобы удаление нашло правила и без config.toml.
@@ -530,12 +628,19 @@ class Installer:
         try:
             self._system(facts)
         except (InstallError, cmd.CommandError, binary.BinaryError, OSError) as exc:
+            self._resume_paused_daemon()
             self.out(f"✗ установка остановлена: {exc}")
             self.out("Сеть не менялась. Исправьте причину и запустите установку снова.")
             return 1
         try:
             xray_ok = self._network(facts, assume_yes)
         except (InstallError, cmd.CommandError, CaptureError, OSError) as exc:
+            if SINGBOX_UNIT in self.units_changed and not self._singbox_migration_complete:
+                try:
+                    self._abort_singbox_migration(str(exc))
+                except InstallError as recovery:
+                    exc = recovery
+            self._resume_paused_daemon()
             self.out(f"✗ настройка сети не удалась: {exc}")
             if reinstall:
                 self.out(
@@ -570,11 +675,36 @@ class Installer:
         self.out("Система:")
         self._packages(facts)
         self._user(facts)
-        self._code()
         self._xray(facts)
         self._singbox(facts)
+        # Загрузки могут быть долгими: правила и прежний демон в это время работают.
+        # Перед заменой Python-кода останавливаем только контроллер. Правила и ядра
+        # не снимаются. Новый код и конфиг больше не применяют два писателя одновременно.
+        self._pause_daemon()
+        self._code()
         self._tidy_config()
         self._permissions()
+
+    def _pause_daemon(self) -> None:
+        active = self.runner(["systemctl", "is-active", "xgw.service"], check=False).strip()
+        if active not in ("active", "activating", "reloading"):
+            return
+        self._daemon_paused = True
+        self.runner(["systemctl", "stop", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+        after = self.runner(["systemctl", "is-active", "xgw.service"], check=False).strip()
+        if after not in ("inactive", "failed", "unknown"):
+            raise InstallError("демон ещё не остановлен — код и правила не заменяются")
+        self._step("демон остановлен на время обновления; ядра и правила сохранены")
+
+    def _resume_paused_daemon(self) -> None:
+        if not self._daemon_paused:
+            return
+        try:
+            self.runner(["systemctl", "start", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            self._daemon_paused = False
+        except cmd.CommandError as exc:
+            self._warn(f"демон после ошибки установки не запущен: {exc}; "
+                       "сохраните ошибку, затем sudo systemctl start xgw")
 
     def _packages(self, facts: Facts) -> None:
         if not facts.packages:
@@ -596,13 +726,33 @@ class Installer:
         self._step(f"пакеты: {', '.join(facts.packages)}")
 
     def _user(self, facts: Facts) -> None:
-        self.journal.setdefault("user_created", not facts.user_exists)
+        if facts.singbox_user_problem:
+            raise InstallError(facts.singbox_user_problem)
+        if facts.user_exists:
+            self.journal.setdefault("user_created", False)
+        if not facts.singbox_user_exists:
+            self.runner([
+                "useradd", "--system", "--user-group", "--no-create-home",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", SINGBOX_USER,
+            ])
+            # Записываем владение только после успешного создания: чужого пользователя
+            # uninstall не удаляет. Значение переживает повторную установку и её откат.
+            self.journal.set("singbox_user_created", True)
+            self._step(f"пользователь {SINGBOX_USER}")
+        for name in facts.fp_users_missing:
+            self.runner([
+                "useradd", "--system", "--user-group", "--no-create-home",
+                "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", name,
+            ])
+            self.journal.extend("fp_users_created", [name])
+            self._step(f"пользователь {name}")
         if facts.user_exists:
             return
         self.runner([
             "useradd", "--system", "--user-group", "--no-create-home",
             "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", XRAY_USER,
         ])
+        self.journal.set("user_created", True)
         self._step(f"пользователь {XRAY_USER}")
 
     def _code(self) -> None:
@@ -694,33 +844,81 @@ class Installer:
                    f"{', '.join(retired)} (значения остались в комментарии)")
 
     def _permissions(self) -> None:
-        """/etc/xgw/config.toml — 0600; конфиг Xray — 0640 root:xray.
+        """Секреты шлюза — 0600; конфиги ядер — 0640 root:<группа своего ядра>.
 
-        Каталог конфигов Xray получает setgid: файлы, которые XGW создаёт в нём
-        позже (атомарная запись через временный файл), наследуют группу xray.
+        Каталоги ядер получают setgid: атомарно заменённые файлы наследуют свою
+        группу. sing-box не состоит в группе xray и не читает её конфиги или API.
         """
         for secret in (self.paths.config_file, managed.path_for(self.paths.config_file)):
             with contextlib.suppress(OSError):
                 os.chmod(secret, 0o600)
         if os.geteuid() != 0:
             return
+        unit = self.paths.systemd_dir / SINGBOX_UNIT
+        if unit.exists():
+            self._singbox_unit_before = unit.read_text(encoding="utf-8")
+            if self.paths.singbox_config_file.exists():
+                self._singbox_config_before = self.paths.singbox_config_file.read_bytes()
+            for item in (self.paths.singbox_config_dir,
+                         *self.paths.singbox_config_dir.iterdir()):
+                if item.is_dir() or item.is_file():
+                    status = item.stat()
+                    self._singbox_dac_before[item] = (
+                        status.st_uid, status.st_gid, status.st_mode & 0o7777)
         os.chmod(self.paths.etc, 0o755)
         os.chmod(self.paths.var, 0o700)
-        try:
-            # Конфиги ядер читает пользователь xray: root:xray, каталог с setgid.
-            for directory in (self.paths.xray_config_dir, self.paths.singbox_config_dir):
-                self.chown(directory, "root", XRAY_USER)
+        for directory, group in ((self.paths.xray_config_dir, XRAY_USER),
+                                 (self.paths.singbox_config_dir, SINGBOX_USER)):
+            try:
+                self.chown(directory, "root", group)
                 os.chmod(directory, 0o2750)
                 for item in directory.iterdir():
                     if item.is_file():
-                        self.chown(item, "root", XRAY_USER)
+                        self.chown(item, "root", group)
                         os.chmod(item, 0o640)
-        except LookupError as exc:
-            raise InstallError(f"пользователь {XRAY_USER} не создан: {exc}") from exc
+            except LookupError as exc:
+                raise InstallError(f"группа {group} не создана: {exc}") from exc
         for item in (self.paths.opt, self.paths.xray_dir, self.paths.singbox_dir,
                      self.paths.lib_dir):
             with contextlib.suppress(OSError):
                 os.chmod(item, 0o755)
+
+    def _abort_singbox_migration(self, reason: str) -> None:
+        """Не оставляем старый marked-конфиг под новым unit без CAP_NET_ADMIN."""
+        try:
+            if self._singbox_unit_before is not None:
+                atomic_write_text(self.paths.systemd_dir / SINGBOX_UNIT,
+                                  self._singbox_unit_before, mode=0o644)
+                if self._singbox_config_before is not None:
+                    atomic_write_text(self.paths.singbox_config_file,
+                                      self._singbox_config_before.decode("utf-8"), mode=0o640)
+                directory = self.paths.singbox_config_dir
+                defaults = self._singbox_dac_before.get(directory)
+                for item in (directory, *directory.iterdir()):
+                    if not (item.is_file() or item.is_dir()):
+                        continue
+                    saved = self._singbox_dac_before.get(item)
+                    if saved is None and defaults is not None:
+                        saved = (defaults[0], defaults[1], 0o640)
+                    if saved is not None:
+                        uid, gid, mode = saved
+                        self.chown(item, uid, gid)
+                        os.chmod(item, mode)
+                self.runner(["systemctl", "daemon-reload"], timeout=60.0)
+                self.units_changed.discard(SINGBOX_UNIT)
+                if self._singbox_restart_attempted and self._singbox_config_before is not None:
+                    self.runner(["systemctl", "restart", SINGBOX_UNIT], timeout=60.0)
+        except (OSError, LookupError, cmd.CommandError) as exc:
+            raise InstallError(
+                f"миграция sing-box не выполнена ({reason}); прежний unit/DAC "
+                f"не удалось полностью восстановить: {exc}"
+            ) from exc
+        restored = ("прежние unit/config/DAC восстановлены" if self._singbox_unit_before is not None
+                    else "предыдущей установки sing-box не было")
+        raise InstallError(f"миграция sing-box не выполнена: {reason}; {restored}")
+
+    def _mark_singbox_restart(self) -> None:
+        self._singbox_restart_attempted = True
 
     # --- сеть -------------------------------------------------------------------
 
@@ -733,6 +931,15 @@ class Installer:
             conflict = self.subnet_conflict()
             if conflict:
                 raise InstallError(conflict)
+            if self._preserve_wan and facts.nm_running and facts.wan_if:
+                wan_uuid = self.nm.active_uuid(facts.wan_if)
+                if wan_uuid:
+                    profiles = self.nm.profiles()
+                    info = self.nm.get(wan_uuid, "connection.interface-name")
+                    if (any(p.uuid == wan_uuid and p.name == nm.PROFILE for p in profiles)
+                            or info.get("connection.interface-name") == facts.lan_if):
+                        raise InstallError("активный профиль WAN конфликтует с настройкой LAN; "
+                                           "перепривязка входящего подключения запрещена")
             self._sysctl(facts)
             self._step(f"sysctl — {self.paths.sysctl_file}")
             record, warnings = nm.setup_lan(
@@ -742,7 +949,12 @@ class Installer:
             self._step(f"профиль {nm.PROFILE} на {facts.lan_if}: {self.cfg.network.lan_address}")
             for warning in warnings:
                 self._warn(warning)
-        if not self.cfg.network.ipv6_proxy:
+        if self._preserve_wan:
+            self._step("профиль WAN сохранён: без modify/reapply и переключения IPv6")
+            if self.journal.get("nm_wan"):
+                self._step("прежняя запись WAN сохранена для удаления; "
+                           "обратная миграция IPv6 при обновлении не выполняется")
+        elif not self.cfg.network.ipv6_proxy:
             self._wan_ipv6(facts)
         else:
             self._wan_ipv6_back(facts)
@@ -757,12 +969,17 @@ class Installer:
         self._legacy_dnsmasq()
         self._units()
         self._dnsmasq(bool(facts.lan_if))
+        # На обновлении старый sing-box пока ещё имеет routing_mark. Сначала nft должен
+        # узнать UID новой службы; только затем можно применять конфиг без SO_MARK.
+        # up сохраняет enable/disable/open и удерживает on при отсутствии inbound'а.
+        self.capture.up()
         # Без подписок собирать нечего: Xray запустит демон, когда их добавят в панели.
         xray_ok = self.first_apply() if engine.has_sources(self.cfg) else False
         self._capture(xray_ok)
         if self.cfg.panel.enabled:
             self._panel()
         self._daemon()
+        self._verify_capture_result(xray_ok)
         self._tray()
         if self.cfg.status.lan_page and facts.lan_if:
             self._token()
@@ -776,7 +993,9 @@ class Installer:
         systemctl не дождался — задание systemd идёт дальше, служба не запустилась —
         systemd (Restart=always) попробует снова."""
         try:
-            self.runner(["systemctl", "restart", "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            verb = "start" if self._daemon_paused else "restart"
+            self.runner(["systemctl", verb, "xgw.service"], timeout=DAEMON_STOP_WAIT)
+            self._daemon_paused = False
         except cmd.CommandError as exc:
             self._warn(
                 f"демон xgw пока не запущен ({exc}). Сеть, DHCP и перехват работают и без "
@@ -821,9 +1040,10 @@ class Installer:
         disable_ipv6 карты WAN, если IPv6 на ней выключает sysctl (nm.wan_ipv6_off).
         Значения до установки запоминаются один раз — для каждого ключа."""
         record = self.journal.get("nm_wan") or {}
-        wan = record.get("device", "") if record.get("sysctl") else ""
+        wan = record.get("device", "") if record.get("sysctl") and not self._preserve_wan else ""
         settings = sysctl.wanted(forwarding=bool(facts.lan_if), wan_ipv6_off=wan)
-        previous = sysctl.install(self.paths, self.proc_sys, settings)
+        previous = sysctl.install(self.paths, self.proc_sys, settings,
+                                 preserve_wan=self._preserve_wan)
         saved = dict(self.journal.get("sysctl") or {})
         for name, value in previous.items():
             saved.setdefault(name, value)
@@ -956,26 +1176,48 @@ class Installer:
                 self.cfg, self.paths, inventory, mark=mark, logger=self.log, xray_bin=xray_bin
             )
         except engine.EngineError as exc:
+            if SINGBOX_UNIT in self.units_changed:
+                self._abort_singbox_migration(str(exc))
             self._warn(f"конфиг Xray не собран: {exc}")
             return self._xray_answers(applier, 0.0)
+        singbox_core = None
+        change = getattr(assembly, "singbox", None)
+        if SINGBOX_UNIT in self.units_changed and change is not None:
+            # Обновление User/capabilities — окно обслуживания. Конфиг сначала проверяет
+            # штатный SingboxCore; вместо SIGHUP он запускает процесс уже с новым unit.
+            # Иначе старый xray-процесс начал бы открывать сокеты без метки и без UID bypass.
+            change.reload = True
+            singbox_core = engine.make_singbox(self.cfg, self.paths)
+            singbox_core.service = _RestartOnReload(
+                singbox_core.service, self._mark_singbox_restart)
         outcome, singbox_outcome = engine.apply_all(
             self.cfg, self.paths, assembly, applier, force_now=True,
+            singbox_core=singbox_core,
         )
         if singbox_outcome is not None and singbox_outcome.mode != "unchanged":
             self._step(engine.describe_singbox(singbox_outcome))
-        if SINGBOX_UNIT in self.units_changed and (
-                singbox_outcome is None or singbox_outcome.mode not in ("started", "removed")):
-            # Новые ограничения службы действуют с запуска процесса; перечитывание конфига
-            # (SIGHUP) их не применяет. Не работает — и перезапускать нечего (try-restart).
+        if SINGBOX_UNIT in self.units_changed and singbox_outcome is not None \
+                and singbox_outcome.mode in ("rejected", "rollback", "failed", "deferred"):
+            self._abort_singbox_migration(engine.describe_singbox(singbox_outcome))
+        if singbox_core is not None and singbox_outcome is not None \
+                and singbox_outcome.mode in ("started", "reloaded"):
+            self._step("sing-box перезапущен: файл его службы изменился")
+        elif SINGBOX_UNIT in self.units_changed and (
+                singbox_outcome is None or singbox_outcome.mode == "unchanged"):
+            # Даже неизменившийся конфиг требует новых прав процесса. Не запускаем ядро,
+            # которое не было нужно; ранее остановленное, но с ожидаемым конфигом — запускаем.
             running = self.runner(
                 ["systemctl", "is-active", SINGBOX_UNIT], check=False).strip() == "active"
-            if running:
+            expected = singbox_core is not None and singbox_core.expected()
+            if running or expected:
                 try:
-                    self.runner(["systemctl", "try-restart", SINGBOX_UNIT], timeout=60.0)
+                    self._mark_singbox_restart()
+                    self.runner(["systemctl", "restart" if expected else "try-restart",
+                                 SINGBOX_UNIT], timeout=60.0)
                     self._step("sing-box перезапущен: файл его службы изменился")
                 except cmd.CommandError as exc:
-                    self._warn(f"sing-box не перезапущен ({exc}): новые ограничения службы "
-                               "вступят в силу при следующем запуске")
+                    self._abort_singbox_migration(f"sing-box не перезапущен: {exc}")
+        self._singbox_migration_complete = True
         if outcome is None:
             self._warn(engine.describe_singbox(singbox_outcome))  # type: ignore[arg-type]
             return self._xray_answers(applier, 0.0)
@@ -1023,6 +1265,8 @@ class Installer:
             capture.up()  # повторная установка: выбор пользователя (enable/disable) в силе
         elif xray_ok:
             capture.enable()
+        elif self._capture_initial_on:
+            raise InstallError("Xray не готов после обновления; выбранный VPN не снимается")
         elif not engine.has_sources(self.cfg):
             capture.disable()
             self._step("подписок пока нет — VPN не включён, интернет работает напрямую")
@@ -1050,6 +1294,28 @@ class Installer:
                     f"перехват пока не включён: {capture.inbound_problem()}. {held}; "
                     "перехват включится сам после перезапуска Xray (сразу: sudo xgw apply --now)"
                 )
+
+    def _verify_capture_result(self, xray_ok: bool) -> None:
+        """Код 0 подтверждает фактический выбранный режим, а не только завершение команд."""
+        if self._daemon_paused:
+            raise InstallError("остановленный для обновления демон не запущен; "
+                               "установка не завершена")
+        capture = self.capture
+        if not capture.configured:
+            return
+        mode = capture.mode()
+        if self._capture_initial_on and mode != "on":
+            raise InstallError("после обновления выбранный ранее VPN снят; установка не завершена")
+        if mode == "on" and (not xray_ok or capture.effective_mode() != "on"):
+            raise InstallError("перехват не готов после установки; выбранный режим сохранён, "
+                               "проверьте Xray и inbound, sudo xgw diag")
+        if capture.loaded() is not True:
+            raise InstallError("правила после установки не проверены; установка не завершена")
+        if mode == "on" and capture.guard_loaded() is not True:
+            raise InstallError("барьер после установки не проверен; установка не завершена")
+        self._step("режим и правила после установки проверены: "
+                   + ("VPN включён, барьер загружен" if mode == "on"
+                      else "перехват снят по выбору владельца"))
 
     def _token(self) -> None:
         status_page.ensure_token(self.cfg, self.paths)

@@ -91,18 +91,35 @@ def ipv6_usable(root: Path = PROC_SYS) -> bool:
 
 
 def install(
-    paths: Paths, root: Path = PROC_SYS, settings: dict[str, str] | None = None
+    paths: Paths, root: Path = PROC_SYS, settings: dict[str, str] | None = None,
+    *, preserve_wan: bool = False,
 ) -> dict[str, str]:
     """Ставит 90-xgw.conf (settings — по умолчанию SETTINGS) и применяет значения.
-    Возвращает прежние — для журнала. Пустой settings — файл не нужен и убирается."""
+    Возвращает прежние — для журнала. preserve_wan сохраняет старые boot-ключи WAN
+    в файле, но не записывает WAN в /proc, даже если ключ передан в settings."""
     settings = SETTINGS if settings is None else settings
+    if preserve_wan:
+        settings = {name: value for name, value in settings.items()
+                    if not _WAN_IPV6.fullmatch(name)}
+    persisted = dict(settings)
+    if preserve_wan:
+        # Старый netplan-WAN мог быть выключен этим файлом. Сохраняем boot-настройку,
+        # не применяя её заново к /proc и не возвращая старое значение незаметно.
+        try:
+            old = paths.sysctl_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            old = ""
+        for line in old.splitlines():
+            name, sep, value = line.partition("=")
+            if sep and _WAN_IPV6.fullmatch(name.strip()) and value.strip() in ("0", "1"):
+                persisted[name.strip()] = value.strip()
     previous: dict[str, str] = {}
     for name in settings:
         value = read(_path(name), root)
         if value is not None:
             previous[name] = value
-    if settings:
-        atomic_write_text(paths.sysctl_file, file_text(settings), mode=0o644)
+    if persisted:
+        atomic_write_text(paths.sysctl_file, file_text(persisted), mode=0o644)
     else:
         paths.sysctl_file.unlink(missing_ok=True)
     for name, value in settings.items():

@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -135,6 +136,8 @@ class Diag:
             ("Программы", self._programs),
             ("Xray", self._xray),
             ("Ядро", self._kernel),
+            ("Барьер", self._barrier),
+            ("Пользователи ядер", self._core_users),
             ("TUN", self._tun),
             ("Путь LAN", self._lan_path),
             ("Файрвол", self._firewall),
@@ -151,6 +154,7 @@ class Diag:
             ("Панель", self._panel_login),
             ("Трафик проверок", self._budget),
             ("Tailscale", self._tailscale),
+            ("Бесплатный пул", self._free_pool),
         ]
         groups += [
             ("QUIC", self._quic),
@@ -425,7 +429,7 @@ class Diag:
         rules, _warnings = nft.build_rules(self.cfg, capture=True)
         if rules.empty:
             return [Check("Ядро", OK, "перехват выключен в конфиге — правила не нужны")]
-        text = nft.render(rules) + nft.render6(rules)
+        text = nft.render(rules) + nft.render6(rules) + nft.render_guard(rules)
         if self.which("unshare") is None:
             try:
                 self.runner(["nft", "-c", "-f", "-"], input=text)
@@ -442,6 +446,59 @@ class Diag:
                 "нужны модули nft_tproxy, nft_fib, nft_ct, nft_masq (пакет linux-modules-extra)",
             )]
         return [Check("Ядро", OK, "ядро принимает правила TPROXY (tproxy, fib, ct, masquerade)")]
+
+    def _barrier(self) -> list[Check]:
+        """Проверяет наличие и состав отдельного барьера, не создавая тестовый трафик."""
+        if not self.root or not self.installed:
+            return []
+        capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log,
+                          proc_sys=self.proc_sys)
+        if capture.mode() != "on":
+            return [Check("Барьер", WARN, "перехват снят — защитный барьер не требуется")]
+        loaded = capture.guard_loaded()
+        if loaded is None:
+            return [Check("Барьер", WARN, "состояние барьера неизвестно — правила не прочитаны")]
+        if not loaded:
+            return [Check("Барьер", WARN if self.preinstall else FAIL,
+                          "защитный барьер отсутствует или не соответствует политике",
+                          "sudo xgw net up; если не поможет — сохранить вывод ошибки")]
+        text = nft.listing(self.runner, "inet", nft.GUARD_TABLE)
+        if text is None:
+            return [Check("Барьер", WARN, "барьер проверен, но счётчики прочитать не удалось")]
+        dropped = sum(int(value) for value in re.findall(r"counter packets (\d+)", text))
+        return [Check("Барьер", OK,
+                      "правила барьера соответствуют политике; "
+                      f"отбито пакетов с загрузки {dropped}")]
+
+    def _core_users(self) -> list[Check]:
+        """Сверяет пользователя и эффективные права именно работающего sing-box."""
+        if not self.root or not self.installed or not self.paths.singbox_config_file.exists():
+            return []
+        name = "Пользователи ядер"
+        raw = self.runner(["systemctl", "show", SINGBOX_UNIT,
+                           "--property=User,MainPID"], check=False)
+        props = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+        pid = props.get("MainPID", "")
+        if not pid.isdecimal() or int(pid) == 0:
+            return [Check(name, WARN, "sing-box не запущен — права процесса не проверены")]
+        try:
+            import pwd
+
+            expected_uid = pwd.getpwnam("xgw-singbox").pw_uid
+            fields = dict(line.split(":", 1) for line in
+                          (self.proc / pid / "status").read_text(encoding="utf-8").splitlines()
+                          if ":" in line)
+            uids = [int(value) for value in fields["Uid"].split()]
+            caps = [int(fields[key].strip(), 16)
+                    for key in ("CapEff", "CapPrm", "CapAmb", "CapBnd")]
+        except (OSError, KeyError, ValueError, ImportError):
+            return [Check(name, WARN, "пользователь или права sing-box не прочитаны")]
+        if props.get("User") != "xgw-singbox" or len(uids) != 4 or any(
+                value != expected_uid for value in uids) or any(caps):
+            return [Check(name, WARN if self.preinstall else FAIL,
+                          "sing-box ещё работает с общим пользователем или правами на сеть",
+                          "sudo xgw install — применить службу с отдельным пользователем")]
+        return [Check(name, OK, "sing-box: отдельный пользователь xgw-singbox, возможности сняты")]
 
     def _tun(self) -> list[Check]:
         """Интерфейс TUN — для трафика машины (capture.method = tun) или контейнеров Docker:
@@ -849,13 +906,13 @@ class Diag:
             if chains6 is not None:
                 return [Check(
                     "IPv6", FAIL, text + " — защита IPv6 (v6_guard) не загружена",
-                    "sudo xgw net up — загрузит её; отключить IPv6 на WAN заново: sudo xgw install",
+                    "sudo xgw net up — загрузит её; обновление сохраняет профиль WAN",
                 )]
         # Не «nmcli connection modify»: у профиля из netplan это сбрасывает привязку к
         # карте (nm.netplan_defined). Установка выбирает безопасный способ сама.
         return [Check(
             "IPv6", FAIL, text,
-            "sudo xgw install — отключит IPv6 на WAN заново и скажет, если не сможет",
+            "проверьте capture.local и защиту IPv6; обновление сохраняет профиль WAN",
         )]
 
     def _panel_login(self) -> list[Check]:
@@ -931,6 +988,22 @@ class Diag:
                 ))
             elif info["mode"] == "on":
                 result.append(Check("Перехват", OK, "включён, правила загружены"))
+            # Кросс-аудит 4cc96b9, N01–N03: таблицы не сошлись с текстом правил сразу после
+            # загрузки, чужие правила маршрутизации раньше правил XGW.
+            if info.get("mismatch"):
+                result.append(Check(
+                    "Эталон правил", WARN,
+                    f"загруженные таблицы не сходятся с текстом правил: {info['mismatch']}",
+                    "sudo xgw net up; не помогло — sudo xgw logs --export и отчёт",
+                ))
+            if info.get("early_rules"):
+                prefs = ", ".join(str(pref) for pref in info["early_rules"])
+                result.append(Check(
+                    "Маршрутизация", WARN,
+                    f"чужие правила ip rule раньше правил XGW (pref {prefs}): помеченный трафик "
+                    "может уйти мимо VPN",
+                    "ip rule show — чьи это правила; XGW чужие не трогает",
+                ))
         return result
 
     def _journal(self) -> list[Check]:
@@ -1192,6 +1265,125 @@ class Diag:
                                       "TCP, где действует дробление ClientHello")]
         return [Check("QUIC", WARN, "правило против QUIC не загружено",
                       "демон загрузит правила заново сам; иначе — sudo systemctl restart xgw")]
+
+    def _free_pool(self) -> list[Check]:
+        return [*self._free_pool_backend(), *self._pool_traffic()]
+
+    def _pool_house(self) -> list[Check]:
+        """Весь дом через бесплатный пул (М2б.2): последнее правило рабочего конфига (весь
+        прочий трафик) ведёт в «pool» или в block (закрыто), входы демона http-in и socks-in и
+        управление Tailscale — в подписку («auto», несущий канал), в «auto» серверов пула нет."""
+        name = "Весь дом через бесплатный пул"
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        routing = applied.get("routing") or {}
+        rules = [rule for rule in routing.get("rules") or [] if isinstance(rule, dict)]
+        auto = next((item for item in routing.get("balancers") or []
+                     if isinstance(item, dict) and item.get("tag") == BALANCER_TAG), {})
+        if any(str(prefix).startswith(builder.POOL_PREFIX)
+               for prefix in auto.get("selector") or []):
+            return [Check(name, FAIL, "серверы пула попали в балансировщик подписки",
+                          "sudo systemctl restart xgw")]
+        last = rules[-1] if rules else {}
+        carrier = next((rule for rule in rules if "http-in" in (rule.get("inboundTag") or [])
+                        and rule.get("balancerTag") == BALANCER_TAG), None)
+        if last.get("balancerTag") == BALANCER_TAG or carrier is None:
+            return [Check(name, FAIL, "в рабочем конфиге весь дом ещё идёт через подписку",
+                          "подождите минуту и повторите; снова так — sudo systemctl restart xgw")]
+        if last.get("outboundTag") == "block":
+            return [Check(name, WARN, "закрыто: допущенных серверов нет — зарубежные сайты у "
+                                      "всего дома закрыты, российские — напрямую",
+                          "вернуть режим подписок — кнопка на вкладке «Бесплатные серверы» "
+                          "или sudo xgw pool mode observe")]
+        pool = builder.applied_pool(applied)
+        if last.get("balancerTag") != builder.POOL_BALANCER or not pool:
+            return [Check(name, FAIL, "весь прочий трафик ведёт не в бесплатный пул",
+                          "sudo systemctl restart xgw")]
+        if not any(rule.get("domain") == list(builder.TS_CONTROL)
+                   and rule.get("balancerTag") == BALANCER_TAG for rule in rules):
+            return [Check(name, FAIL, "управление Tailscale идёт через бесплатные серверы — "
+                                      "удалённый доступ к шлюзу может пропасть",
+                          "вернуть режим подписок — sudo xgw pool mode observe")]
+        return [Check(name, OK, f"через бесплатный пул, серверов в «pool»: {len(pool)}; "
+                                "подписка — только входам демона и Tailscale (несущий канал)")]
+
+    def _pool_traffic(self) -> list[Check]:
+        """Устройства через бесплатный пул (М2б.1): их правило в рабочем конфиге ведёт в
+        балансировщик «pool» из серверов пула или в block (закрыто), но не в подписку; в
+        балансировщике подписки серверов пула нет."""
+        from .freepool import traffic as fptraffic
+
+        if fptraffic.whole_house(self.cfg):
+            return self._pool_house()
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        if builder.applied_whole(applied):
+            # Режим снят, а рабочий конфиг — прежний (отчёт m2b2fix2, дефект 1): демон
+            # пересобирает его срочно, сам — не позже чем через несколько минут.
+            # Перед установкой — не повод отказать: установленный демон сверит конфиг с режимом
+            # сам (отчёт m2b2fix3: защита не пускала исправление на застрявший шлюз).
+            return [Check("Весь дом через бесплатный пул", WARN if self.preinstall else FAIL,
+                          f"режим {self.cfg.free_pool.mode}, а рабочий конфиг Xray всё ещё ведёт "
+                          "весь дом через бесплатные серверы",
+                          "установка пересоберёт конфиг под режим" if self.preinstall else
+                          "подождите 5 минут и повторите; снова так — sudo xgw apply --now")]
+        devices = fptraffic.pool_devices(self.cfg)
+        if not devices:
+            return []
+        name = "Устройства через бесплатный пул"
+        who = ", ".join(devices)
+        routing = applied.get("routing") or {}
+        rules = [rule for rule in routing.get("rules") or []
+                 if isinstance(rule, dict) and set(devices) <= set(rule.get("source") or [])]
+        pool = builder.applied_pool(applied)
+        auto = next((item for item in routing.get("balancers") or []
+                     if isinstance(item, dict) and item.get("tag") == BALANCER_TAG), {})
+        if any(str(prefix).startswith(builder.POOL_PREFIX)
+               for prefix in auto.get("selector") or []):
+            return [Check(name, FAIL, "серверы пула попали в балансировщик подписки",
+                          "sudo systemctl restart xgw")]
+        if not rules:
+            return [Check(name, FAIL, f"{who}: правила в рабочем конфиге нет — устройство идёт "
+                                      "через подписку", "подождите минуту и повторите; снова "
+                                      "так — sudo systemctl restart xgw")]
+        rule = rules[0]
+        if rule.get("outboundTag") == "block":
+            why = ("наблюдение выключено" if self.cfg.free_pool.mode == "off"
+                   else "допущенных серверов нет")
+            return [Check(name, WARN, f"{who}: закрыто — {why}",
+                          "вернуть на подписку — «Сервер: авто» в списке устройств панели")]
+        if rule.get("balancerTag") != builder.POOL_BALANCER or not pool:
+            return [Check(name, FAIL, f"{who}: правило ведёт не в бесплатный пул",
+                          "sudo systemctl restart xgw")]
+        return [Check(name, OK, f"{who}: через бесплатный пул, серверов в «pool»: {len(pool)}")]
+
+    def _free_pool_backend(self) -> list[Check]:
+        """Бесплатный пул (docs/FREEPOOL-PLAN.md): режим и годится ли бэкенд туннелей SSTP —
+        без него серверы SSTP проверяются только доступностью адреса; при включённом ufw —
+        есть ли правило для veth поколений (fpv+), иначе ufw отбросит их соединения."""
+        from .freepool import backend as fpbackend
+
+        name = "Бесплатный пул"
+        mode = self.cfg.free_pool.mode
+        if mode == "off":
+            return [Check(name, OK, "выключен — режим подписок")]
+        if not self.root:
+            return [Check(name, WARN, f"режим {mode}; бэкенд SSTP без sudo не проверить",
+                          "sudo xgw diag")]
+        problem = fpbackend.unavailable(self.paths, self.runner, proc_sys=self.proc_sys)
+        if problem:
+            return [Check(name, WARN, f"режим {mode}; серверы SSTP проверяются только "
+                                      f"доступностью адреса: {problem}")]
+        result = [Check(name, OK, f"режим {mode}; бэкенд SSTP готов (sstpc и pppd, /dev/ppp, "
+                                  "пользователи xgw-vpn и xgw-fps, служба xgw-fp@, набор "
+                                  "fp_peers)")]
+        if self.which("ufw") is not None and ufw.active(self.runner):
+            listed = self.runner(["ufw", "status"], timeout=20.0, check=False)
+            if "fpv+" not in listed:
+                wan = lan.effective_wan(self.cfg, self.runner)
+                rule = ufw.wanted(self.lan_if or "lan", wan)[-1]  # правило пула — последнее
+                result.append(Check(
+                    name, FAIL, "ufw включён, а правила для туннелей SSTP (fpv+) нет: их "
+                                "соединения ufw отбросит", "sudo ufw " + " ".join(rule)))
+        return result
 
     def _kernel_direct(self) -> list[Check]:
         """Ф6: российские адреса ядром мимо Xray — у кого включено, сколько сетей, загружен ли

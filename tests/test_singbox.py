@@ -85,7 +85,7 @@ def test_config_has_a_bridge_per_variant_and_nothing_else():
         item["tag"] for item in config["inbounds"])
     assert all(item["listen"] == "127.0.0.1" and item["type"] == "socks"
                for item in config["inbounds"])
-    assert all(item["routing_mark"] == cfg.capture.mark_bypass for item in config["outbounds"])
+    assert all("routing_mark" not in item for item in config["outbounds"])
     rules = config["route"]["rules"]
     assert rules[-1] == {"action": "reject"} and len(rules) == len(config["inbounds"]) + 1
     assert {rule["outbound"] for rule in rules[:-1]} == {
@@ -143,15 +143,35 @@ def test_wireguard_is_an_endpoint_and_chains_are_renamed_per_variant():
     plan = singbox.build(cfg, _nodes(WG, STLS), {})
     config = plan.config
     assert [item["type"] for item in config["endpoints"]] == ["wireguard"]
-    assert config["endpoints"][0]["routing_mark"] == cfg.capture.mark_bypass
+    assert "routing_mark" not in config["endpoints"][0]
     node = _nodes(STLS)[0]
     main = next(item for item in config["outbounds"] if item["tag"] == singbox.tag_out(
         node.fingerprint, "d"))
     chain = next(item for item in config["outbounds"] if item["type"] == "shadowtls")
     assert main["detour"] == chain["tag"] and chain["tag"].startswith("sb-out-")
-    assert chain["routing_mark"] == cfg.capture.mark_bypass
+    assert "routing_mark" not in chain
     only_wireguard = singbox.build(cfg, _nodes(WG), {}).config
     assert only_wireguard["outbounds"]  # sing-box без outbound'ов не стартует
+
+
+def test_main_service_removes_imported_marks_from_endpoints_and_detour_chains():
+    nodes = _nodes(WG, STLS)
+    for node in nodes:
+        node.singbox.main["routing_mark"] = 123
+        for item in node.singbox.extra:
+            item["routing_mark"] = 456
+    config = singbox.build(Config(), nodes, {}).config
+    assert '"routing_mark"' not in json.dumps(config)
+    assert all(node.singbox.main["routing_mark"] == 123 for node in nodes)
+
+
+def test_main_service_does_not_reuse_a_previous_privileged_bridge_port():
+    cfg = Config()
+    nodes = _nodes(HY2)
+    first = singbox.build(cfg, nodes, {})
+    first.config["inbounds"][0]["listen_port"] = 80
+    again = singbox.build(cfg, nodes, {}, previous=first.config)
+    assert min(again.ports.values()) >= 1024
 
 
 def test_bridge_outbound_is_recognised_by_the_login_it_carries():

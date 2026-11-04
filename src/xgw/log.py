@@ -84,8 +84,13 @@ def setup(level: str = "INFO", secrets: Iterable[str] | None = None) -> None:
 
 
 def add_secrets(values: Iterable[str]) -> None:
-    """Регистрирует секреты, которые регулярками не распознать (короткие пароли)."""
-    _secrets.update(value for value in values if value and len(value) >= 4)
+    """Регистрирует секреты, которые регулярками не распознать (короткие пароли). Набор
+    заменяется целиком, а не дополняется: опрос подписок идёт в фоновом потоке, а форматтер
+    другого потока в это время перебирает прежний набор."""
+    global _secrets
+    fresh = {value for value in values if value and len(value) >= 4}
+    if not fresh <= _secrets:
+        _secrets = _secrets | fresh
 
 
 def get_logger(name: str) -> logging.Logger:
