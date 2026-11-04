@@ -866,6 +866,7 @@ class Daemon:
         self._build_count = 0
         self._build_last = (0.0, 0.0)
         self._build_outcome: str | None = None
+        self._loop_step_s = 0.0
 
     # --- цикл ------------------------------------------------------------------
 
@@ -875,12 +876,14 @@ class Daemon:
         self._stop = stop
         while not stop.is_set() and not changed():
             started = time.monotonic()
+            self._loop_progress("tick", started=started)
             try:
                 state = self.tick()
             except Exception:  # сбой одного шага не должен ронять демон
                 self.log.exception("шаг watchdog завершился ошибкой")
                 state = self.machine.state
             spent = time.monotonic() - started
+            self._loop_step_s = spent
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
                 # freepool-recovery, youtube: режим «весь дом» не появлялся в ней 3 минуты).
@@ -891,10 +894,32 @@ class Daemon:
                 pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:
                 pause = MANUAL_SCAN_PAUSE
-            self._sleep(stop, changed, jitter(pause))
+            period = jitter(pause)
+            # Нормальный интервал — от начала шага. Иначе работа 8 с + ожидание
+            # 20–24 с дают 28–32 с без нового статуса даже без долгой сборки.
+            # WAN_DOWN и ручной скан сохраняют прежнюю паузу ПОСЛЕ работы.
+            relative = state is not State.WAN_DOWN and not (self._manual_scan and self.scan_queue)
+            deadline = (started if relative else time.monotonic()) + period
+            self._loop_progress("sleep", started=started, deadline=deadline,
+                                period=period, step_s=spent)
+            self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+
+    def _loop_progress(self, phase: str, **details) -> None:
+        """Отдельная запись работы цикла для конечного помощника проверки.
+
+        Не переписывает status.json и не выдаёт старое состояние за свежее.
+        Ни имён серверов, ни адресов, ни настроек подключения здесь нет.
+        """
+        try:
+            atomic_write_json(self.paths.run / "watchdog-step.json", {
+                "phase": phase, "at": time.monotonic(), "interval_s": self.cfg.watchdog.interval_s,
+                "previous_step_s": self._loop_step_s, **details,
+            }, mode=0o600)
+        except OSError as exc:
+            self.log.debug("ход цикла не записан: %s", exc)
 
     def _tick_work(self) -> str:
         """Что из долгого шло в последнем шаге и на что ушло время — для строки о долгом шаге

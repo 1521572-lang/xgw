@@ -4,6 +4,7 @@
 import hashlib
 import http.client
 import json
+import math
 import os
 import ssl
 import stat
@@ -13,13 +14,14 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/run/xgw-background-build-3")
+ROOT = Path("/run/xgw-watchdog-schedule")
 LIB = Path("/opt/xgw/lib/xgw")
 STATUS = Path("/run/xgw/status.json")
+LOOP = Path("/run/xgw/watchdog-step.json")
 FILES = {
     "daemon.py": (
         "3fb8d542c26f2eaafa0710dd19f0e1d715628bf6b212868cb30d009ee1a42989",
-        "684b1aca24874654e7da0f43f477863c193821f4d7936a0f5ac7f8694bfcf0b3",
+        "e6d2723e8c98d246a2a39e1e610fa232746bb601b7dfec805dbe81d5a5f1d465",
     ),
     "watch/status.py": (
         "32f04d54b06392e82bd0ff120cfb4f445098560fa8d530f361d9cc1a72a1283a",
@@ -99,6 +101,7 @@ def read_status(path=STATUS):
 
 
 def status_watch(state):
+    loop_progress(state)
     snapshot, mtime = read_status(STATUS)
     now = time.monotonic()
     assembly = snapshot.get("assembly") or {}
@@ -130,6 +133,32 @@ def status_watch(state):
         state["stale_s"] = max(state["stale_s"], stale)
         if stale > 25:
             raise CheckStop("статус не изменялся больше 25 с")
+
+
+def loop_progress(state):
+    """Отдельная запись хода цикла: не освежает и не заменяет проверку status.json."""
+    if "started" not in state:
+        return
+    try:
+        record, mtime = read_status(LOOP)
+    except (OSError, ValueError):
+        return
+    if mtime < state["started"] * 1e9 or record.get("phase") not in ("tick", "sleep"):
+        return
+    def number(value):
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    keys = ("started", "interval_s", "previous_step_s")
+    if any(not number(record.get(key)) for key in keys):
+        return
+    state["loop_phase"] = record["phase"]
+    state["loop_age_s"] = max(0, time.monotonic() - record["started"])
+    state["loop_interval_s"] = record["interval_s"]
+    state["loop_previous_s"] = record["previous_step_s"]
+    period = record.get("period")
+    state["loop_period_s"] = period if number(period) else None
+    deadline = record.get("deadline")
+    state["loop_sleep_left_s"] = (max(0, deadline - time.monotonic())
+                                  if number(deadline) else None)
 
 
 def wait_status(state, seconds):
@@ -273,6 +302,9 @@ def prepare(repo):
               "failed_stage": None, "failure_kind": None,
               "gateway_state": None, "on": None, "https": None, "apply_result": None,
               "poll_gap_s": 0, "stale_s": 0,
+              "loop_phase": None, "loop_age_s": None, "loop_interval_s": None,
+              "loop_previous_s": None, "loop_period_s": None, "loop_sleep_left_s": None,
+              "restore_note": None,
               "states": {name: 0 for name in sorted(WORKING_STATES)}}, directory)
         os.rename(directory, ROOT)
     print("Подготовлено. Установленный XGW не изменён")
@@ -285,6 +317,7 @@ def restart():
 
 def restore(state):
     state["phase"], state["stage"] = "возврат", "возврат прежнего кода"
+    state["restore_note"] = "проверяется"
     save(state)
     # Не восстанавливаем настройки владельца, конфиги ядер или сетевые профили.
     for index, name in enumerate(FILES):
@@ -293,19 +326,26 @@ def restore(state):
         write(LIB / name, old, *state["metadata"][name])
     restart()
     until = time.monotonic() + 15
+    current = None
     while time.monotonic() < until:
         try:
             current = observe()
             if good(current, state["before"]) and current.get("assembly") is None:
                 state["restored"] = True
+                state["restore_note"] = "прежний код и рабочий on подтверждены"
                 return
         except Exception:
-            pass
+            current = None
         time.sleep(1)
+    if current and all(current.get(key) is True for key in ("on", "https")):
+        state["restored"] = False
+        state["restore_note"] = "связь исправна; полный возврат кода пока не подтверждён"
+        return
     # Только аварийный возврат on, явно включённый в согласие шага запуска.
     state["net_up_rc"], _ = run(["/usr/local/bin/xgw", "net", "up"], timeout=20)
     current = observe()
     state["restored"] = good(current, state["before"]) and current.get("assembly") is None
+    state["restore_note"] = "проверка после аварийного net up"
 
 
 def worker():
@@ -434,11 +474,19 @@ def report(wait=False, ready=False):
         ("Наибольший интервал между прочитанными записями статуса, с", state["max_gap_s"]),
         ("Наибольшее подтверждённое время без изменения статуса, с", state["stale_s"]),
         ("Наибольшая пауза частого чтения статуса, с", state["poll_gap_s"]),
+        ("Цикл: текущая фаза",
+         {"tick": "работа шага", "sleep": "ожидание"}.get(state["loop_phase"])),
+        ("Цикл: прошло от начала шага, с", state["loop_age_s"]),
+        ("Цикл: настроенный интервал, с", state["loop_interval_s"]),
+        ("Цикл: предыдущий шаг, с", state["loop_previous_s"]),
+        ("Цикл: период с jitter / осталось ожидать, с",
+         (state["loop_period_s"], state["loop_sleep_left_s"])),
         ("Начатых сборок", state["builds"]), ("Последняя сборка, с", state["build_s"]),
         ("Последнее применение, с", state["apply_s"]), ("Шагов от 60 с", state["slow_steps"]),
         ("Результат применения", state["apply_result"]),
         ("Неудачных HTTPS-проб", state["https_failures"]),
         ("Прежний код возвращён и on проверен", state["restored"]),
+        ("Проверка возврата", state["restore_note"]),
         ("Код аварийного xgw net up", state["net_up_rc"]),
     ):
         print(f"- {label}: {value if value is not None else 'НЕ ВЫПОЛНЯЛОСЬ'}")

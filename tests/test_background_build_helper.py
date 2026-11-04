@@ -230,3 +230,38 @@ def test_ready_read_returns_before_the_observation_window_ends(monkeypatch, caps
     monkeypatch.setattr(helper.time, "sleep", no_sleep)
     assert helper.report(ready=True) == 2
     assert "Прогон продолжается: наблюдение" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_status_failure_keeps_current_loop_phase_but_rejects_old_attempt(monkeypatch, fresh):
+    helper, state = timing_fixture(monkeypatch, now=25.98, written=0, polled=25.8)
+    state["started"] = 10
+    reader = helper.read_status
+    def read(path):
+        if path == helper.LOOP:
+            return ({"phase": "tick", "started": 2, "interval_s": 20,
+                     "previous_step_s": 8}, (11 if fresh else 9) * 1_000_000_000)
+        return reader(path)
+    monkeypatch.setattr(helper, "read_status", read)
+    with pytest.raises(helper.CheckStop, match="не изменялся"):
+        helper.status_watch(state)
+    assert state.get("loop_phase") == ("tick" if fresh else None)
+    assert state["builds"] == 3
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_restore_keeps_working_network_without_code_proof(tmp_path, monkeypatch, active):
+    helper, root, repo, baseline = prepare_fixture(tmp_path, monkeypatch)
+    helper.prepare(repo)
+    state = helper.read(root / "state.json")
+    baseline["assembly"] = {}  # прежний status ещё не предъявлен, но связь исправна
+    baseline["daemon_active"] = active
+    monkeypatch.setattr(helper, "restart", lambda: None)
+    moments = iter([0, 1, 16])
+    monkeypatch.setattr(helper.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(helper.time, "sleep", lambda _seconds: None)
+    commands = []
+    monkeypatch.setattr(helper, "run", lambda args, **_kwargs: commands.append(args) or (0, b""))
+    helper.restore(state)
+    assert commands == [] and state["net_up_rc"] is None
+    assert state["restored"] is False and "связь исправна" in state["restore_note"]

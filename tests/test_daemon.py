@@ -2865,3 +2865,63 @@ def test_background_build_manual_choice_cancels_old_rotation(daemon):
         gate.set()
         if daemon._build:
             daemon._build.done.wait(5)
+
+
+def _scheduled_run(daemon, monkeypatch, state, durations, spread=1.0):
+    import xgw.daemon as module
+
+    now, starts, sleeps = [0.0], [], []
+    stop = threading.Event()
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module, "jitter", lambda seconds: seconds * spread)
+    def tick():
+        starts.append(now[0])
+        now[0] += durations[len(starts) - 1]
+        return state
+    def sleep(_stop, _changed, seconds):
+        sleeps.append(seconds)
+        progress = json.loads((daemon.paths.run / "watchdog-step.json").read_text())
+        assert progress["phase"] == "sleep"
+        assert progress["step_s"] == durations[len(starts) - 1]
+        now[0] += seconds
+        if len(starts) == len(durations):
+            stop.set()
+    monkeypatch.setattr(daemon, "tick", tick)
+    monkeypatch.setattr(daemon, "_sleep", sleep)
+    daemon.cfg.watchdog.interval_s = 20
+    _run_once(daemon, stop)
+    return starts, sleeps
+
+
+@pytest.mark.parametrize("state", [State.HEALTHY, State.DEGRADED])
+@pytest.mark.parametrize("spread", [1.0, 1.2])
+def test_watchdog_schedule_includes_step_work_in_interval(daemon, monkeypatch, state, spread):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, state, [8, 8, 8], spread)
+    period = 20 * spread
+    assert starts == [0, period, 2 * period] and sleeps == [period - 8] * 3
+    assert not daemon.paths.status_file.exists()  # запись хода не притворяется свежим статусом
+
+
+def test_watchdog_schedule_overrun_does_not_add_wait_or_replay_missed_ticks(daemon, monkeypatch):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.DEGRADED, [30, 3, 3])
+    assert starts == [0, 30, 50] and sleeps == [0, 17, 17]
+
+
+def test_watchdog_schedule_wan_down_keeps_pause_after_work(daemon, monkeypatch):
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.WAN_DOWN, [8, 8])
+    assert starts == [0, 68] and sleeps == [60, 60]
+
+
+def test_watchdog_schedule_manual_scan_keeps_pause_after_work(daemon, monkeypatch):
+    from xgw.daemon import MANUAL_SCAN_PAUSE
+
+    daemon._manual_scan = True
+    daemon.scan_queue.append("unused")
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [8, 8])
+    assert starts == [0, 8 + MANUAL_SCAN_PAUSE] and sleeps == [MANUAL_SCAN_PAUSE] * 2
+
+
+def test_watchdog_schedule_while_building_keeps_short_period(daemon, monkeypatch):
+    daemon._build_next = object()
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [2, 2])
+    assert starts == [0, 5] and sleeps == [3, 3]
