@@ -30,7 +30,6 @@ from urllib.parse import urlsplit
 from .. import fetch, log, masking
 from ..config import Config
 from ..net import cmd
-from ..ownership_hooks import MutationBlocked, owned
 from ..paths import Paths
 from . import backend as backending
 from . import probe as probing
@@ -77,18 +76,12 @@ class FreePool:
     def __init__(self, cfg: Config, paths: Paths, *, logger=None, clock=time.time,
                  fetcher: Fetcher = fetch.fetch_url, sleep=time.sleep,
                  runtime: backending.Backend | None = None,
-                 runner: cmd.Runner = cmd.run, ownership=None) -> None:
-        self.ownership = ownership
-        if ownership is not None and runtime is not None and (
-            type(runtime) is not backending.Backend or runtime.ownership is not ownership
-        ):
-            raise MutationBlocked("POOL_RUNTIME_BINDING_REFUSED")
+                 runner: cmd.Runner = cmd.run) -> None:
         self.cfg = cfg
         self.paths = paths
-        self.store = PoolStore(paths, ownership=ownership)
+        self.store = PoolStore(paths)
         self.runner = runner
-        self.runtime = runtime or backending.Backend(
-            paths, runner=runner, logger=logger, ownership=ownership)
+        self.runtime = runtime or backending.Backend(paths, runner=runner, logger=logger)
         self.backend_problem = "ещё не проверялся"
         self._reconciled = False
         self.resolve: probing.Resolver = fetch.resolve_domain  # имена серверов (server_hosts)
@@ -105,7 +98,6 @@ class FreePool:
         self._lock = threading.Lock()
         self._prune_retired()
 
-    @owned("PEERS")
     def _prune_retired(self) -> None:
         """Снимки источников, которых в XGW больше нет (VPNJantit убран 28.10.2026 по отчёту
         вехи М1), удаляются с диска."""
@@ -205,7 +197,6 @@ class FreePool:
         }[provider]
         return minutes * 60.0
 
-    @owned("PEERS")
     def refresh_due(self, *, via, mark: int | None, force: bool = False) -> list[ProviderResult]:
         """Опросить источники, которым пора; между ними — REQUEST_SPACING."""
         results: list[ProviderResult] = []
@@ -237,7 +228,6 @@ class FreePool:
             self._prune_candidates()
         return results
 
-    @owned("PEERS")
     def _prune_candidates(self) -> None:
         """Итоги проверок вариантов, которых нет ни в одном снимке, — убрать: списки GitHub
         меняются каждые несколько часов, и candidates.json рос бы без конца."""
@@ -301,7 +291,6 @@ class FreePool:
         return sum(int(item[1]) for item in ledger.get("items", [])
                    if isinstance(item, list) and now - float(item[0]) < DAY)
 
-    @owned("PEERS")
     def refresh_backend(self) -> str:
         """Годится ли бэкенд туннелей сейчас (backend.unavailable); при первой проверке —
         убрать следы поколений прошлого запуска демона."""
@@ -329,7 +318,6 @@ class FreePool:
                 and len([item for item in hour if item[1] == provider])
                 < pool.provider_handshakes_per_hour)
 
-    @owned("PEERS")
     def _note_handshake(self, provider: str) -> None:
         state = self.store.candidates()
         state["_handshakes"] = {"items": [*self.handshakes(), [self.clock(), provider]]}
@@ -341,7 +329,6 @@ class FreePool:
         gateway = lan.gateway(self.cfg)
         return (str(gateway.network),) if gateway is not None else ()
 
-    @owned("PEERS")
     def check_some(self, *, mark: int | None, xray_bin: Path | None, via=None,
                    cancel=None) -> int:
         """Проверить до free_pool.checks_per_step вариантов каталогов в пределах бюджета
@@ -413,7 +400,6 @@ class FreePool:
             megabytes = pool.budget_mb
         return megabytes * 1_048_576
 
-    @owned("PEERS")
     def _check_proxy(self, variant: Variant, *, mark: int | None,
                      xray_bin: Path | None) -> probing.Outcome | None:
         """Сервер Xray или sing-box временным процессом; адрес — только публичный
@@ -434,7 +420,6 @@ class FreePool:
             return probing.Outcome("UNTESTED", error="нет sing-box (ставит xgw install)")
         return probing.check_singbox(variant, self.cfg, singbox_bin, run, hosts=hosts)
 
-    @owned("PEERS")
     def _record(self, variant: Variant, outcome: probing.Outcome, *, tunnel: bool = False) -> None:
         """Итог проверки варианта. tunnel — это было подключение туннеля: оно идёт и в журнал
         туннелей за сутки (_tunnels), который, в отличие от итогов по вариантам, не теряет

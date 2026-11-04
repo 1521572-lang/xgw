@@ -36,7 +36,6 @@ from . import engine, fetch, log
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config
 from .generator import singbox as singboxing
 from .net import cmd
-from .ownership_hooks import MutationBlocked, owned, owned_function
 from .paths import LockTimeout, Paths, atomic_write_json, file_lock
 from .sbcore import binary as sbbinary
 from .store import Store
@@ -121,8 +120,7 @@ def load_state(paths: Paths) -> dict:
     return _read(paths.cores_state_file)
 
 
-@owned_function("CORE")
-def save_state(paths: Paths, state: dict, *, ownership=None) -> None:
+def save_state(paths: Paths, state: dict) -> None:
     atomic_write_json(paths.cores_state_file, state, mode=0o644)
 
 
@@ -156,15 +154,14 @@ def keeps(paths: Paths, core: str, version: tuple[int, int, int] | None) -> bool
     return version == wanted or (version == accepted(paths, core) and version > wanted)
 
 
-@owned_function("CORE")
-def forget(paths: Paths, core: str, *, ownership=None) -> None:
+def forget(paths: Paths, core: str) -> None:
     """Установка или `xgw update-xray` поставили проверенную версию: принятая, прежняя и
     наблюдение больше ни к чему."""
     state = load_state(paths)
     if core in state:
         state.pop(core, None)
         with contextlib.suppress(OSError):
-            save_state(paths, state, ownership=ownership)
+            save_state(paths, state)
     shutil.rmtree(prev_dir(paths, core), ignore_errors=True)
 
 
@@ -196,7 +193,6 @@ def job_active(paths: Paths, now: float) -> bool:
 # --- задание для службы xgw-core -------------------------------------------------
 
 
-@owned_function("CORE")
 def start(
     paths: Paths,
     core: str,
@@ -206,7 +202,6 @@ def start(
     reason: str = "panel",
     runner: Callable[..., str] = cmd.run,
     now: Callable[[], float] = time.time,
-    ownership=None,
 ) -> str:
     """Кладёт задание и запускает службу xgw-core. Пусто — запущено, иначе почему нет."""
     if core not in CORES or action not in ACTIONS:
@@ -225,8 +220,7 @@ def start(
     return ""
 
 
-@owned_function("CORE")
-def take_request(paths: Paths, *, ownership=None) -> dict | None:
+def take_request(paths: Paths) -> dict | None:
     """Задание из /run/xgw/core-request.json. Файл убирает само задание (Job.run), когда уже
     записало «идёт»: иначе между ними панель на миг видела бы итог прошлого задания."""
     try:
@@ -353,7 +347,6 @@ def check_due(paths: Paths, now: float) -> bool:
     return now - float(record.get("at") or 0) >= wait
 
 
-@owned_function("CORE")
 def check(
     cfg: Config,
     paths: Paths,
@@ -362,7 +355,6 @@ def check(
     mark: int | None = None,
     platform: tuple[str, str] | None = None,
     now: Callable[[], float] = time.time,
-    ownership=None,
 ) -> tuple[dict, list[tuple[str, bool]]]:
     """Смотрит выпуски на GitHub и пишет cores-check.json. Возвращает запись и события
     (текст, уведомлять ли): о новом выпуске — один раз на версию, об убранной с GitHub
@@ -651,9 +643,7 @@ class Job:
         logger=None,
         out: Callable[[str], None] = print,
         now: Callable[[], float] = time.time,
-        ownership=None,
     ) -> None:
-        self.ownership = ownership
         self.cfg = cfg
         self.paths = paths
         self.cores = cores if cores is not None else adapters(cfg, paths)
@@ -667,7 +657,6 @@ class Job:
             self._ways = routes(self.cfg, engine.bypass_mark(self.cfg, self.log))
         return self._ways
 
-    @owned("CORE")
     def run(self, core: str, action: str, version: str = "", reason: str = "panel") -> int:
         if core not in self.cores or action not in ACTIONS:
             self.out("ошибка: ожидается ядро xray или sing-box и действие update или rollback")
@@ -705,7 +694,6 @@ class Job:
 
     # --- шаги ----------------------------------------------------------------------
 
-    @owned("CORE")
     def update(self, core: str, version: str, reason: str) -> str:
         adapter, title = self.cores[core], TITLES[core]
         target = core_dir(self.paths, core)
@@ -800,7 +788,6 @@ class Job:
         return (f"{title} обновлён: {old} → {version}, проверки пройдены{note}.{watch} Вернуть "
                 f"{old} — кнопка «Вернуть {old}» в панели")
 
-    @owned("CORE")
     def rollback(self, core: str, reason: str) -> str:
         adapter, title = self.cores[core], TITLES[core]
         target = core_dir(self.paths, core)
@@ -850,7 +837,6 @@ class Job:
 
     # --- мелочи ------------------------------------------------------------------
 
-    @owned("CORE")
     def _reject(self, core: str, version: str, reason: str) -> None:
         """Этот выпуск не прошёл проверку на шлюзе — панель покажет почему."""
         state = load_state(self.paths)
@@ -861,7 +847,6 @@ class Job:
         state[core] = entry
         self._save(state)
 
-    @owned("CORE")
     def _stage(self, text: str) -> None:
         self.log.info("%s", text)
         state = load_state(self.paths)
@@ -870,14 +855,12 @@ class Job:
             job["stage"] = text
             self._save(state)
 
-    @owned("CORE")
     def _save(self, state: dict) -> None:
         try:
-            save_state(self.paths, state, ownership=self.ownership)
+            save_state(self.paths, state)
         except OSError as exc:
             self.log.error("cores.json не записан: %s", exc)
 
-    @owned("CORE")
     def _event(self, text: str) -> None:
         try:
             store = Store(self.paths.db_file)
@@ -889,19 +872,15 @@ class Job:
             self.log.error("событие не записано: %s", exc)
 
 
-@owned_function("CORE")
 def run_request(
     cfg: Config, paths: Paths, *, logger=None, out=print, job: Job | None = None,
-    ownership=None,
 ) -> int:
     """`xgw cores run-job` — то, что выполняет служба xgw-core по заданию демона."""
-    if ownership is not None and job is not None and job.ownership is not ownership:
-        raise MutationBlocked("JOB_BINDING_REFUSED")
-    request = take_request(paths, ownership=ownership)
+    request = take_request(paths)
     if request is None:
         out("заданий нет")
         return 0
-    job = job or Job(cfg, paths, logger=logger, out=out, ownership=ownership)
+    job = job or Job(cfg, paths, logger=logger, out=out)
     code = job.run(
         str(request.get("core") or ""), str(request.get("action") or ""),
         str(request.get("version") or ""), str(request.get("reason") or "panel"),

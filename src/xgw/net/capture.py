@@ -52,7 +52,6 @@ from pathlib import Path
 from .. import log
 from .. import tailscale as ts
 from ..config import Config
-from ..ownership_hooks import owned
 from ..paths import Paths, atomic_write_json, file_lock
 from . import cmd, iprule, lan, nft, sysctl, tun
 
@@ -127,9 +126,7 @@ class Capture:
         proc_sys: Path = sysctl.PROC_SYS,
         time_uids: tuple[int, ...] | None = None,
         generation: Callable[[], int | None] | None = None,
-        ownership=None,
     ) -> None:
-        self.ownership = ownership
         self.cfg = cfg
         self.paths = paths
         self.runner = runner
@@ -185,7 +182,6 @@ class Capture:
             return {}
         return state if isinstance(state, dict) else {}
 
-    @owned("CAPTURE")
     def _save(self, **changes: object) -> None:
         state = self._state()
         for key, value in changes.items():
@@ -448,7 +444,6 @@ class Capture:
             self.log.debug("интерфейс TUN не проверен: %s", exc)
             return ""
 
-    @owned("CAPTURE")
     def _load(self, mode: str) -> str:
         self.held = ""
         if mode == "on":
@@ -637,7 +632,6 @@ class Capture:
             return False
         return baseline == nft.tables_digest(nft.structure(guard, "inet", nft.GUARD))
 
-    @owned("CAPTURE")
     def tidy(self) -> str:
         """Убирает интерфейс TUN, который больше не нужен: в конфиге не capture.method =
         "tun", а работающий Xray запущен без inbound'а TUN (иначе он держит интерфейс
@@ -659,7 +653,6 @@ class Capture:
         self.log.info("%s", text)
         return text
 
-    @owned("CAPTURE")
     def restore_tun(self) -> str:
         """После запуска Xray: интерфейс TUN поднят, с адресом, и маршруты в него на месте.
 
@@ -686,7 +679,6 @@ class Capture:
                 raise CaptureError(str(exc)) from exc
             return f"интерфейс {rules.tun_name} поднят, маршруты в него на месте"
 
-    @owned("CAPTURE")
     def tailscale_direct(self, xray_down: bool) -> str:
         """tailscale.route = "vpn": пока Xray не отвечает, сокеты tailscaled идут напрямую —
         иначе удалённый доступ пропал бы вместе с VPN. Метка в наборе ts_direct меняется
@@ -721,7 +713,6 @@ class Capture:
         return ("Xray не отвечает — Tailscale идёт напрямую, мимо VPN" if wanted
                 else "Xray отвечает — Tailscale снова идёт через VPN")
 
-    @owned("CAPTURE")
     def tailscale_fallback(self, on: bool) -> str:
         """tailscale.route = "direct", а серверы DERP напрямую не отвечают (ТЗ R4b): сокеты
         tailscaled временно идут через Xray (on) — или снова напрямую. Как tailscale_direct:
@@ -754,13 +745,11 @@ class Capture:
         """tailscaled сейчас идёт через VPN по аварийному маршруту (ТЗ R4b)."""
         return self.ts_fallback_marker.exists()
 
-    @owned("CAPTURE")
     def up(self) -> str:
         """Загружает правила текущего режима (после перезагрузки, после сбоя)."""
         with self._lock():
             return self._load(self.mode())
 
-    @owned("CAPTURE")
     def enable(self) -> str:
         with self._lock():
             mode = self._load("on" if self.capturing else "none")
@@ -769,7 +758,6 @@ class Capture:
             self.open_marker.unlink(missing_ok=True)
             return mode
 
-    @owned("CAPTURE")
     def disable(self) -> str:
         """Снимает перехват (prerouting, output, ip rule); форвардинг с
         маскарадингом остаётся — сеть работает напрямую."""
@@ -779,7 +767,6 @@ class Capture:
             self.open_marker.unlink(missing_ok=True)
             return mode
 
-    @owned("CAPTURE")
     def open(self) -> str:
         """fail_mode = "open": временно снять перехват, выбор пользователя не трогая."""
         with self._lock():
@@ -787,14 +774,12 @@ class Capture:
             self.open_marker.touch()
             return self._load(self.mode())
 
-    @owned("CAPTURE")
     def close(self) -> str:
         """Вернуть перехват после временного снятия."""
         with self._lock():
             self.open_marker.unlink(missing_ok=True)
             return self._load(self.mode())
 
-    @owned("CAPTURE")
     def down(self, *, remove_tun: bool = False) -> None:
         """Убирает всё, что XGW добавил в сеть: таблицы, правило, маршрут, форвардинг.
 

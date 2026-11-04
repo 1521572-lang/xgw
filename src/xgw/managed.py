@@ -18,7 +18,6 @@ from typing import TypeVar
 from urllib.parse import urlsplit
 
 from . import priority as priority_levels
-from .ownership_hooks import call_owned, owned_function
 from .parsers.common import parse_links_text
 from .paths import LockTimeout, atomic_write_json, file_lock
 
@@ -68,12 +67,7 @@ def lock_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.lock")
 
 
-def _update(path: Path, change: Callable[[dict], T], *, ownership=None) -> T:
-    return call_owned(ownership, "PANEL", lambda: _update_locked(path, change, ownership=ownership))
-
-
-@owned_function("PANEL")
-def _update_locked(path: Path, change: Callable[[dict], T], *, ownership=None) -> T:
+def _update(path: Path, change: Callable[[dict], T]) -> T:
     """load → change → save под блокировкой. У panel.json несколько писателей: панель
     (поток демона) и команды `xgw priority`, `xgw core`; без блокировки правка, сделанная
     между чтением и записью другого писателя, терялась.
@@ -88,7 +82,7 @@ def _update_locked(path: Path, change: Callable[[dict], T], *, ownership=None) -
                 raise ManagedError(error)
             result = change(data)
             if result:
-                save(path, data, ownership=ownership)
+                save(path, data)
             return result
     except LockTimeout as exc:
         raise ManagedError(f"{exc}: настройки меняет другой процесс XGW — повторите") from exc
@@ -171,8 +165,7 @@ def load(path: Path) -> tuple[dict, str]:
 FREE_POOL_MODES = ("off", "observe", "on")
 
 
-@owned_function("PANEL")
-def set_free_pool_mode(path: Path, mode: str | None, *, ownership=None) -> bool:
+def set_free_pool_mode(path: Path, mode: str | None) -> bool:
     """Режим бесплатного пула из панели (None — как в config.toml); True — изменилось."""
     if mode is not None and mode not in FREE_POOL_MODES:
         raise ManagedError("ожидается off, observe или on")
@@ -183,11 +176,10 @@ def set_free_pool_mode(path: Path, mode: str | None, *, ownership=None) -> bool:
         data["free_pool_mode"] = mode
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_free_pool_pin(path: Path, variant_id: str, *, ownership=None) -> bool:
+def set_free_pool_pin(path: Path, variant_id: str) -> bool:
     """Сервер пула, выбранный вручную (id варианта; пусто — выбирает шлюз); True — изменилось."""
     if variant_id and not _VARIANT_RE.fullmatch(variant_id):
         raise ManagedError("ожидается id сервера пула — 32 шестнадцатеричных знака")
@@ -198,7 +190,7 @@ def set_free_pool_pin(path: Path, variant_id: str, *, ownership=None) -> bool:
         data["free_pool_pin"] = variant_id
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
 def _tailscale(value: object) -> dict:
@@ -240,8 +232,7 @@ def _tailnet_devices(value: object) -> list[dict]:
     return result[:MAX_DEVICES]
 
 
-@owned_function("PANEL")
-def set_tailscale_direct(path: Path, ip: str, name: str, *, direct: bool, ownership=None) -> bool:
+def set_tailscale_direct(path: Path, ip: str, name: str, *, direct: bool) -> bool:
     """Устройство tailnet выходит через шлюз напрямую (direct) или снова через Xray."""
     address = tailnet_address(ip)
     if address is None:
@@ -256,18 +247,17 @@ def set_tailscale_direct(path: Path, ip: str, name: str, *, direct: bool, owners
         data["tailscale"] = {**data["tailscale"], "direct": listed}
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def replace_tailscale_direct(path: Path, devices: list[dict], *, ownership=None) -> None:
+def replace_tailscale_direct(path: Path, devices: list[dict]) -> None:
     """Вернуть прежний список (сеть не приняла изменение)."""
 
     def change(data: dict) -> bool:
         data["tailscale"] = {**data["tailscale"], "direct": _tailnet_devices(devices)}
         return True
 
-    _update(path, change, ownership=ownership)
+    _update(path, change)
 
 
 def _priority(value: object) -> dict[str, str]:
@@ -331,10 +321,7 @@ def _devices(value: object) -> list[dict]:
     return result[:MAX_DEVICES]
 
 
-@owned_function("PANEL")
-def set_device(
-    path: Path, mac: str, ip: str, name: str = "", *, bypass: bool, ownership=None,
-) -> bool:
+def set_device(path: Path, mac: str, ip: str, name: str = "", *, bypass: bool) -> bool:
     """Ставит устройство «мимо VPN» (bypass) либо возвращает его в VPN; True — что-то
     изменилось. Адрес запоминается: шлюз узнаёт устройство по адресу, поэтому запись
     превращается в статическую аренду DHCP — иначе адрес достался бы другому."""
@@ -362,14 +349,12 @@ def set_device(
         data["devices"] = devices
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
 def replace_devices(
     path: Path, devices: list[dict], routes: list[dict] | None = None,
     kernel: list[dict] | None = None,
-    *, ownership=None,
 ) -> None:
     """Возвращает прежние списки устройств (мимо VPN, со своим сервером и с российскими
     адресами мимо Xray) — откат, если сеть изменение не приняла."""
@@ -382,13 +367,10 @@ def replace_devices(
             data["kernel_devices"] = _devices(kernel)
         return True
 
-    _update(path, change, ownership=ownership)
+    _update(path, change)
 
 
-@owned_function("PANEL")
-def set_kernel_device(
-    path: Path, mac: str, ip: str, name: str = "", *, on: bool, ownership=None,
-) -> bool:
+def set_kernel_device(path: Path, mac: str, ip: str, name: str = "", *, on: bool) -> bool:
     """Российские адреса устройства — ядром мимо Xray (on) либо снова через Xray; True —
     что-то изменилось. Правило ядра узнаёт устройство по адресу: он закрепляется арендой."""
     mac_ok = normalize_mac(mac)
@@ -414,11 +396,10 @@ def set_kernel_device(
         data["kernel_devices"] = kernel
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def split_kernel_direct(path: Path, online: list[dict], *, ownership=None) -> bool:
+def split_kernel_direct(path: Path, online: list[dict]) -> bool:
     """До разгрузки по устройствам переключатель «российские адреса мимо Xray» был один на
     всю сеть. Включённый в panel.json, он остаётся переключателем самой машины, а устройства,
     что сейчас в сети (online: {mac, ip, name}), получают свой — разгрузка, которую оставили
@@ -440,7 +421,7 @@ def split_kernel_direct(path: Path, online: list[dict], *, ownership=None) -> bo
         ])
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
 def _routes(value: object) -> list[dict]:
@@ -456,8 +437,7 @@ def _routes(value: object) -> list[dict]:
             if item["mac"] in servers]
 
 
-@owned_function("PANEL")
-def set_route(path: Path, mac: str, ip: str, name: str, server: str, *, ownership=None) -> bool:
+def set_route(path: Path, mac: str, ip: str, name: str, server: str) -> bool:
     """Свой сервер устройства (отпечаток) либо «авто» (server пуст); True — что-то изменилось.
     Устройство мимо VPN своего сервера иметь не может: в Xray его трафик не попадает."""
     mac_ok = normalize_mac(mac)
@@ -486,11 +466,10 @@ def set_route(path: Path, mac: str, ip: str, name: str, server: str, *, ownershi
         data["routes"] = routes
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_servers(path: Path, fingerprints: list[str], mode: str, *, ownership=None) -> bool:
+def set_servers(path: Path, fingerprints: list[str], mode: str) -> bool:
     """Включает, отключает или убирает серверы; True — что-то изменилось.
 
     Сервер опознаётся по отпечатку (протокол, адрес, порт, ключ, транспорт):
@@ -512,11 +491,10 @@ def set_servers(path: Path, fingerprints: list[str], mode: str, *, ownership=Non
             data[mode] = [*data[mode], *chosen][-MAX_SERVERS:]
         return (set(data["disabled"]), set(data["removed"])) != before
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_priority(path: Path, fingerprints: list[str], level: str, *, ownership=None) -> bool:
+def set_priority(path: Path, fingerprints: list[str], level: str) -> bool:
     """Ставит серверам приоритет: high, medium или low; True — что-то изменилось.
     Средний — уровень по умолчанию, поэтому он не хранится: запись просто убирается."""
     if level not in priority_levels.LEVELS or not fingerprints or not all(
@@ -535,11 +513,10 @@ def set_priority(path: Path, fingerprints: list[str], level: str, *, ownership=N
         data["priority"] = dict(list(levels.items())[-MAX_SERVERS:])
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_core(path: Path, fingerprints: list[str], core: str, *, ownership=None) -> bool:
+def set_core(path: Path, fingerprints: list[str], core: str) -> bool:
     """Закрепляет за серверами ядро: xray, sing-box или auto (выбор шлюза — не хранится);
     True — что-то изменилось. Запись — по отпечатку, как у приоритета."""
     if (core != "auto" and core not in CORE_PINS) or not fingerprints or not all(
@@ -557,11 +534,10 @@ def set_core(path: Path, fingerprints: list[str], core: str, *, ownership=None) 
         data["core"] = dict(list(cores.items())[-MAX_SERVERS:])
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_sticky(path: Path, value: bool, *, ownership=None) -> bool:
+def set_sticky(path: Path, value: bool) -> bool:
     """Основной сервер (speed.sticky) включён или выключен; True — что-то изменилось."""
     if not isinstance(value, bool):
         raise ManagedError("ожидается true или false")
@@ -572,11 +548,10 @@ def set_sticky(path: Path, value: bool, *, ownership=None) -> bool:
         data["sticky"] = value
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_kernel_direct(path: Path, value: bool | None, *, ownership=None) -> bool:
+def set_kernel_direct(path: Path, value: bool | None) -> bool:
     """Российские адреса самой машины и контейнеров мимо Xray (routing.kernel_direct)
     включены, выключены или (None) — как в config.toml; True — что-то изменилось."""
     if value is not None and not isinstance(value, bool):
@@ -588,11 +563,10 @@ def set_kernel_direct(path: Path, value: bool | None, *, ownership=None) -> bool
         data["kernel_direct"] = value
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_tailscale_serve(path: Path, name: str, *, ownership=None) -> bool:
+def set_tailscale_serve(path: Path, name: str) -> bool:
     """Запоминает, что XGW включил Serve для этого имени в tailnet; пусто — выключил.
     True — что-то изменилось."""
     name = name.strip().lower().rstrip(".")
@@ -605,11 +579,10 @@ def set_tailscale_serve(path: Path, name: str, *, ownership=None) -> bool:
         data["tailscale"] = {**data["tailscale"], "serve": name}
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_tailscale_funnel(path: Path, name: str, *, ownership=None) -> bool:
+def set_tailscale_funnel(path: Path, name: str) -> bool:
     """Запоминает, что XGW включил Funnel для этого имени (API приложения); пусто —
     выключил. True — что-то изменилось."""
     name = name.strip().lower().rstrip(".")
@@ -622,11 +595,10 @@ def set_tailscale_funnel(path: Path, name: str, *, ownership=None) -> bool:
         data["tailscale"] = {**data["tailscale"], "funnel": name}
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def set_tailscale_route(path: Path, route: str, *, ownership=None) -> bool:
+def set_tailscale_route(path: Path, route: str) -> bool:
     """Маршрут tailscaled: direct или vpn (как tailscale.route в config.toml)."""
     if route not in TS_ROUTES:
         raise ManagedError("маршрут Tailscale: direct или vpn")
@@ -637,11 +609,10 @@ def set_tailscale_route(path: Path, route: str, *, ownership=None) -> bool:
         data["tailscale"] = {**data["tailscale"], "route": route}
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def drop_telegram(path: Path, *, ownership=None) -> bool:
+def drop_telegram(path: Path) -> bool:
     """Прежние версии хранили в panel.json бота Telegram (токен и чат). Telegram в XGW больше
     нет — токен, секрет, не должен лежать на диске: файл переписывается без него. True —
     было что убрать."""
@@ -651,12 +622,10 @@ def drop_telegram(path: Path, *, ownership=None) -> bool:
         return False
     if not isinstance(raw, dict) or "telegram" not in raw:
         return False
-    # load() поля telegram уже не знает
-    return _update(path, lambda data: True, ownership=ownership)
+    return _update(path, lambda data: True)  # load() поля telegram уже не знает
 
 
-@owned_function("PANEL")
-def save(path: Path, data: dict, *, ownership=None) -> None:
+def save(path: Path, data: dict) -> None:
     atomic_write_json(Path(path), data, mode=0o600)
 
 
@@ -720,7 +689,6 @@ def _free_name(wanted: str, taken: set[str]) -> str:
     raise ManagedError("не удалось подобрать имя подписки")
 
 
-@owned_function("PANEL")
 def add_subscription(
     path: Path,
     url: str,
@@ -729,7 +697,6 @@ def add_subscription(
     taken: set[str],
     user_agent: str = "",
     headers: dict[str, str] | None = None,
-    ownership=None,
 ) -> str:
     """Добавляет подписку и возвращает её имя. taken — имена, занятые в config.toml."""
     url = check_url(url)
@@ -755,17 +722,15 @@ def add_subscription(
         )
         return chosen
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
 def update_subscription(
     path: Path,
     name: str,
     *,
     user_agent: str | None = None,
     headers: dict[str, str] | None = None,
-    ownership=None,
 ) -> bool:
     """Обновляет User-Agent и заголовки управляемой подписки. False — нет такой подписки."""
 
@@ -779,11 +744,10 @@ def update_subscription(
                 return True
         return False
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def remove_subscription(path: Path, name: str, *, ownership=None) -> bool:
+def remove_subscription(path: Path, name: str) -> bool:
     def change(data: dict) -> bool:
         kept = [item for item in data["subscriptions"] if item["name"] != name]
         if len(kept) == len(data["subscriptions"]):
@@ -791,7 +755,7 @@ def remove_subscription(path: Path, name: str, *, ownership=None) -> bool:
         data["subscriptions"] = kept
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
 def split_links(text: str) -> list[str]:
@@ -799,8 +763,7 @@ def split_links(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if "://" in line]
 
 
-@owned_function("PANEL")
-def add_links(path: Path, text: str, *, taken: set[str], ownership=None) -> int:
+def add_links(path: Path, text: str, *, taken: set[str]) -> int:
     """Добавляет ссылки серверов (vless://, vmess://, trojan://, ss://); возвращает,
     сколько добавлено. Ссылка, которую XGW не разбирает, не принимается."""
 
@@ -821,11 +784,10 @@ def add_links(path: Path, text: str, *, taken: set[str], ownership=None) -> int:
             added += 1
         return added
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
 
 
-@owned_function("PANEL")
-def remove_link(path: Path, identifier: str, *, ownership=None) -> bool:
+def remove_link(path: Path, identifier: str) -> bool:
     def change(data: dict) -> bool:
         kept = [link for link in data["links"] if link_id(link) != identifier]
         if len(kept) == len(data["links"]):
@@ -833,4 +795,4 @@ def remove_link(path: Path, identifier: str, *, ownership=None) -> bool:
         data["links"] = kept
         return True
 
-    return _update(path, change, ownership=ownership)
+    return _update(path, change)
