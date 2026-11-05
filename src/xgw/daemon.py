@@ -2615,8 +2615,10 @@ class Daemon:
             if outcome.mode == "api":
                 assembly.result.config.clear()
                 assembly.result.config.update(job.generation.xray)
-                self.log.info("поколение sing-box сменено: изменились %s",
-                              ", ".join(job.generation.parts) or "только порты")
+                fields = job.generation.fields
+                self.log.info("поколение sing-box сменено: изменились %s%s",
+                              ", ".join(job.generation.parts) or "только порты",
+                              f" (поля: {', '.join(fields)})" if fields else "")
         else:
             outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
                                   singbox=assembly.singbox)
@@ -5725,7 +5727,10 @@ class Daemon:
         ):
             return False
         record = self._speeds().get(key)
-        return record is None or self.wall() - float(record.get("ts") or 0) >= hours * 3600.0
+        if record is None:
+            return True
+        stamp = float(record.get("ts") or 0)
+        return self.wall() - stamp >= hours * 3600.0 * speed.due_factor(key, stamp)
 
     def _speed_step(
         self, view: list[NodeInfo], applied: dict | None, observatory: dict, now: float

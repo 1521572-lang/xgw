@@ -581,6 +581,27 @@ def dns_server_ip(entry: str) -> str:
     return address
 
 
+# Отпечаток ClientHello (uTLS) для TLS-серверов Xray, у которых его нет в ссылке (аудит
+# противодействия ТСПУ 05.11.2026, P0): без него Xray подключается стеком Go, и JA3/JA4 не
+# похож ни на один браузер. chrome — как у sing-box (parsers/convert.DEFAULT_FINGERPRINT) и у
+# большинства клиентов. Отпечаток из ссылки главнее; он постоянен для сервера, не меняется
+# от соединения к соединению. REALITY задаёт отпечаток сам; XHTTP по HTTP/3 — QUIC.
+DEFAULT_TLS_FINGERPRINT = "chrome"
+
+
+def _default_fingerprint(stream: dict, network: str | None = None) -> None:
+    if str(stream.get("security") or "").lower() != "tls":
+        return
+    if fragmenting.xhttp_h3(stream, network):
+        return
+    tls = stream.get("tlsSettings")
+    tls = dict(tls) if isinstance(tls, dict) else {}
+    if str(tls.get("fingerprint") or "").strip():
+        return
+    tls["fingerprint"] = DEFAULT_TLS_FINGERPRINT
+    stream["tlsSettings"] = tls
+
+
 def _modernize(outbound: dict) -> None:
     """Записывает outbound так, как этого ждёт Xray 26.3.27.
 
@@ -603,6 +624,9 @@ def _modernize(outbound: dict) -> None:
     if isinstance(tls, dict) and ("allowInsecure" in tls or "xgwSingboxPin" in tls):
         dropped = ("allowInsecure", "xgwSingboxPin")
         stream["tlsSettings"] = {key: value for key, value in tls.items() if key not in dropped}
+    _default_fingerprint(stream)
+    for leg in fragmenting.download_legs(stream):
+        _default_fingerprint(leg, "xhttp")
     for key in ("wsSettings", "httpupgradeSettings"):
         settings = stream.get(key)
         headers = settings.get("headers") if isinstance(settings, dict) else None

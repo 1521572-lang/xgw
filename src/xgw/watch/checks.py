@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import random
 import re
 import socket
 import ssl
@@ -100,6 +101,7 @@ def http_get_via_proxy(
     Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
     """
     ranged = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
+    user_agent = pick_agent(user_agent)  # один UA на соединение: и GET, и HEAD по нему
     parts = urlsplit(url)
     host = parts.hostname
     if not host or parts.scheme not in ("http", "https"):
@@ -217,6 +219,38 @@ def _host_header(host: str, port: int, default_port: int) -> str:
     return name if port == default_port else f"{name}:{port}"
 
 
+# Пул браузерных User-Agent для проб (аудит противодействия ТСПУ 05.11.2026, P0): одна и та
+# же строка во всех пробах — примета для сервера назначения и VPN-сервера (ТСПУ заголовков
+# внутри туннеля не видит). Выбор — один на соединение: GET и HEAD по нему идут с одним UA.
+# Свой probe.user_agent в config.toml главнее пула.
+BROWSER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/26.0 Safari/605.1.15",
+)
+
+
+def pick_agent(user_agent: str = "") -> str:
+    """UA для одного соединения пробы: пул браузерных, если в config.toml свой не задан
+    (пусто или прежнее значение по умолчанию)."""
+    from ..config import DEFAULT_PROBE_UA
+
+    if not user_agent or user_agent == DEFAULT_PROBE_UA or not user_agent.isprintable():
+        return random.choice(BROWSER_AGENTS)
+    return user_agent
+
+
 def _request(
     method: str, target: str, headers: dict[str, str], user_agent: str = "", *,
     keep_alive: bool = False,
@@ -224,7 +258,7 @@ def _request(
     lines = [f"{method} {target} HTTP/1.1"]
     lines.extend(f"{key}: {value}" for key, value in headers.items())
     # Без Accept-Encoding: тело нужно целиком, несжатым — по нему считается размер пробы.
-    agent = user_agent if user_agent and user_agent.isprintable() else fetch.DEFAULT_UA
+    agent = user_agent if user_agent and user_agent.isprintable() else pick_agent()
     connection = "keep-alive" if keep_alive else "close"
     lines.extend(["User-Agent: " + agent, "Accept: */*", f"Connection: {connection}"])
     return (fetch.CRLF.join(lines) + fetch.CRLF * 2).encode("utf-8")

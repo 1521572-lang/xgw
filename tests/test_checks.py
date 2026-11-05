@@ -410,15 +410,16 @@ def test_connect_rejected_by_proxy():
 
 
 def test_probe_request_carries_the_configured_user_agent(serve):
-    """probe.user_agent доходит до сервера; без него — «xgw/<версия>». Сжатия проба не
-    просит: тело нужно целиком, по нему считается расход трафика."""
+    """probe.user_agent доходит до сервера; без него — браузерный из пула (аудит ТСПУ
+    05.11.2026), а не «xgw/<версия>». Сжатия проба не просит: тело нужно целиком."""
     server = serve(HEADERS + b"x" * BODY)
     agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
     assert _get(server, user_agent=agent).ok
     assert f"User-Agent: {agent}\r\n".encode() in server.requests[0]
     assert b"Accept-Encoding" not in server.requests[0]
     assert _get(server).ok
-    assert b"User-Agent: xgw/0.1\r\n" in server.requests[1]
+    assert b"User-Agent: Mozilla/5.0 " in server.requests[1]
+    assert b"xgw/" not in server.requests[1]
     assert _get(server, user_agent="Bad\r\nX-Injected: 1").ok  # перевод строки не пролезет
     assert b"X-Injected" not in server.requests[2]
 

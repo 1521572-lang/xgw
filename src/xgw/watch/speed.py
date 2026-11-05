@@ -24,6 +24,7 @@ speed.unlimited_hours, лимитированные — раз в speed.limited_
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from dataclasses import dataclass
 
@@ -72,6 +73,15 @@ def every_hours(cfg: Config, price: float, *, spare: bool = False) -> int:
     if spare and hours and cfg.speed.spare_hours:
         return max(hours, cfg.speed.spare_hours)
     return hours
+
+
+def due_factor(key: str, ts: float) -> float:
+    """Множитель срока следующего фонового замера, 0,8–1,2 (аудит противодействия ТСПУ
+    05.11.2026, P1): серверы, замеренные вместе, расходятся во времени, а не идут серией
+    каждые N часов. Постоянен для одного замера (ключ сервера и время замера) — срок не
+    скачет от шага к шагу."""
+    digest = hashlib.sha256(f"{key}:{int(ts)}".encode()).digest()
+    return 0.8 + 0.4 * int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
 
 
 def measure(

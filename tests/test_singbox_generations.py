@@ -371,3 +371,19 @@ def test_switch_history_in_summary(gateway):
     assert summary["switches_24h"] == 1
     assert summary["switch_reasons_24h"] == {"dns_hosts": 1}
     assert summary["last_switch_parts"] == ["dns_hosts"]
+    assert summary["switch_fields_24h"] == {} and summary["last_switch_fields"] == []
+
+
+def test_changed_server_fields_are_named_without_values():
+    old = {"outbounds": [
+        {"tag": "a", "server": "x", "tls": {"reality": {"short_id": "11"}, "sni": "s"}},
+        {"tag": "b", "server": "y", "transport": {"path": "/p"}},
+        {"tag": "c", "server": "z"}]}
+    new = copy.deepcopy(old)
+    new["outbounds"][0]["tls"]["reality"]["short_id"] = "22"
+    new["outbounds"][1]["transport"]["path"] = "/q"
+    new["outbounds"][1]["server_port"] = 8443
+    fields = g.changed_fields(old, new)
+    assert fields == ("server_port", "tls.reality.short_id", "transport.path", "servers=2")
+    assert "22" not in repr(fields) and "/q" not in repr(fields)
+    assert g.changed_fields(old, copy.deepcopy(old)) == ()

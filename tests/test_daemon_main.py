@@ -122,7 +122,7 @@ def test_main_is_the_fastest_and_every_live_server_is_measured_hourly(daemon):
     for _ in range(10):
         _step(daemon)
     assert len(daemon.measured) == measured  # замеры свежие — до срока не повторяются
-    daemon.t += 3600
+    daemon.t += 3600 * 1.2  # срок каждого — ×0,8–1,2 (speed.due_factor)
     _settle(daemon)
     assert {first, second, *spares} <= set(daemon.measured[measured:])
     assert daemon.api.calls.count(("pin", second)) == 1  # закреплено один раз
@@ -295,7 +295,7 @@ def test_limited_servers_are_measured(paths):
         _step(daemon)
         _step(daemon)
         assert len(daemon.measured) == measured
-        daemon.t += 3600 * 4
+        daemon.t += 3600 * 5.5  # 7,5 ч: срок ×0,8–1,2 от limited_hours (speed.due_factor)
         _settle(daemon)
         assert {first, second} <= set(daemon.measured[measured:])
     finally:

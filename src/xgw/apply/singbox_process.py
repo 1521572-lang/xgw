@@ -208,8 +208,16 @@ def _history(state):
     for item in items:
         for part in item.get("parts") or ["rotate"]:
             reasons[part] = reasons.get(part, 0) + 1
+    fields = {}
+    for item in items:
+        for name in item.get("fields") or []:
+            if not str(name).startswith("servers="):
+                fields[name] = fields.get(name, 0) + 1
     return {"switches_24h": len(items), "switch_reasons_24h": reasons,
-            "last_switch_parts": (items[-1].get("parts") or ["rotate"]) if items else None}
+            "last_switch_parts": (items[-1].get("parts") or ["rotate"]) if items else None,
+            # Поля серверов, что меняла подписка за сутки (без значений), и последний раз.
+            "switch_fields_24h": fields,
+            "last_switch_fields": (items[-1].get("fields") or []) if items else None}
 
 
 def summary(paths):

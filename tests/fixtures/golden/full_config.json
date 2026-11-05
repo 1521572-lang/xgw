@@ -164,7 +164,8 @@
         "network": "tcp",
         "security": "tls",
         "tlsSettings": {
-          "serverName": "nl2.example.org"
+          "serverName": "nl2.example.org",
+          "fingerprint": "chrome"
         },
         "sockopt": {
           "mark": 2,

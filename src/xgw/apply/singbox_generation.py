@@ -33,6 +33,7 @@ class Prepared:
     xray: dict
     previous_xray: dict
     parts: tuple[str, ...] = ()
+    fields: tuple[str, ...] = ()
 
 
 HISTORY_SECONDS = 86400
@@ -62,6 +63,32 @@ def changed_parts(old, new):
         if old.get(key) != new.get(key):
             parts.append(key)
     return tuple(parts)
+
+
+def _paths(old, new, prefix="", depth=0):
+    if isinstance(old, dict) and isinstance(new, dict) and depth < 3:
+        found = []
+        for key in sorted(set(old) | set(new), key=str):
+            if old.get(key) != new.get(key):
+                found += _paths(old.get(key), new.get(key), f"{prefix}{key}.", depth + 1)
+        return found
+    return [prefix.rstrip(".") or "*"]
+
+
+def changed_fields(old, new):
+    """Какие поля серверов изменились (server_settings): имена вроде tls.reality.short_id и
+    число серверов в конце ("servers=3"), без значений — по ним видно, что меняет
+    подписка от загрузки к загрузке («карусель» поколений, отчёт conncheck-generations-r2:
+    4 смены за 2 часа). Не больше 12 имён."""
+    old_out, new_out = _by_tag(old or {}, "outbounds"), _by_tag(new or {}, "outbounds")
+    names, servers = set(), 0
+    for tag in set(old_out) & set(new_out):
+        if old_out[tag] != new_out[tag]:
+            servers += 1
+            names.update(_paths(old_out[tag], new_out[tag]))
+    if not servers:
+        return ()
+    return (*sorted(names)[:12], f"servers={servers}")
 
 
 def needed(core, config):
@@ -147,14 +174,14 @@ def prepare(core, config, xray):
             raise ValueError("новый sing-box не прошёл check")
         slot = next(slot for slot in processes.SLOTS if slot != state["active"])
         prepared = Prepared(secrets.token_hex(16), slot, old, candidate, routed, previous_xray,
-                            changed_parts(old, config))
+                            changed_parts(old, config), changed_fields(old, config))
         processes.config_write(core.paths, slot, candidate)
         atomic_write_json(core.paths.singbox_last_good_file, old)
         state["pending"] = {"slot": slot, "token": prepared.token,
                             "owner": os.getpid(), "phase": "preparing",
                             "owner_start": processes.owner_start(os.getpid()),
                             "xray_sha": digest(routed), "old_ports": sorted(processes.ports(old)),
-                            "parts": list(prepared.parts)}
+                            "parts": list(prepared.parts), "fields": list(prepared.fields)}
         processes.write(core.paths, state)
     try:
         processes.start(core, slot, candidate)
@@ -233,7 +260,8 @@ def _promote(core, state, config):
     now = time.time()
     history = [item for item in state.get("history") or []
                if isinstance(item, dict) and now - float(item.get("ts") or 0) < HISTORY_SECONDS]
-    history.append({"ts": now, "parts": list(pending.get("parts") or [])})
+    history.append({"ts": now, "parts": list(pending.get("parts") or []),
+                    "fields": list(pending.get("fields") or [])})
     state["history"] = history[-200:]
     state.update(active=pending["slot"], pending=None,
                  draining={"slot": state["active"], "until": time.monotonic()
