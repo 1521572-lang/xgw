@@ -297,7 +297,7 @@ def test_budget_summary_shows_the_month_and_the_share_of_the_quota():
     assert "Трафик проверок: ~920 МБ/сут" in text
     assert "~35.1 ГБ/мес" in text and "проба 57 620 Б (по оценке); участников — 5" in text
     assert "запасных — 65, скан раз в 60 мин" in text
-    assert "за месяц это ~18 % квоты подписки «main»" in text
+    assert "за месяц это ~17.5 % квоты подписки «main»" in text
     cfg.probe.max_daily_probe_mb = 500
     over = status.budget_summary(cfg, budget, quotas, 5, 65)
     assert over["over"] is True and "больше лимита 500" in over["warnings"][0]

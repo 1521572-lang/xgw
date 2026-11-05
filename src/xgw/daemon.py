@@ -1795,10 +1795,16 @@ class Daemon:
         return True
 
     def _e2e_get(self, url: str) -> checks.DownloadResult:
-        return checks.http_get_via_proxy(
+        """Тело читается не дальше известного размера адреса или scan.SCAN_CAP_BYTES (C06);
+        байты — в журнал проверок (назначение e2e, без подписки: идёт через основной)."""
+        result = checks.http_get_via_proxy(
             "127.0.0.1", self.cfg.xray.http_port, url, silence=5.0,
             max_total=30.0, user_agent=self.cfg.probe.user_agent,
+            max_bytes=scan.body_cap(url),
         )
+        self.store.record_scan_body("", result.downloaded, "daemon", None, self.wall(),
+                                    purpose="e2e")
+        return result
 
     def _host_failed(self, url: str, why: str) -> None:
         """Проверочный хост не ответил, а другой ответил: пауза и событие (одно на паузу)."""
@@ -3432,6 +3438,8 @@ class Daemon:
             return
         result = speed.measure(info, self.cfg, probe_pass=password,
                                max_mb=speed.size_mb(self.cfg, 0.0), cancel=self._stop)
+        self.store.record_scan_body(info.tag, result.bytes_read, "daemon", None, self.wall(),
+                                    purpose="speed")
         self._pool_speed_ran = True
         self._pool_own += result.bytes_read
         self._pool_measured = (info.tag, result.bytes_read)
@@ -3898,6 +3906,18 @@ class Daemon:
             self.cfg, len(members), full, cheap, known or status.DEFAULT_PROBE_BYTES,
             status.checks_bytes(devices, len(members)), guessed=not known,
         )
+        if known:
+            # Прогноз проверяется журналом (C06): сканы за 24 ч, включая срочные, против
+            # остатка лимита после проб ядра и дешёвых проверок.
+            try:
+                ledger = self.store.scan_bodies_24h(self.wall())
+                spent = float((ledger["by_purpose"].get("scan") or {}).get("bytes") or 0)
+            except Exception as exc:  # журнал — уточнение прогноза, не условие скана
+                self.log.debug("журнал проверок не прочитан: %s", exc)
+            else:
+                room = status.scan_room(self.cfg, len(members), known,
+                                        status.checks_bytes(devices, len(members)))
+                minutes = status.ledger_minutes(minutes, self._scan_minutes, spent, room)
         base = max(1, self.cfg.probe.scan_spares_minutes)
         if minutes != self._scan_minutes:
             text = (
@@ -5842,9 +5862,12 @@ class Daemon:
         подозрительного участника и замеры кандидатов на его место (ТЗ R6)."""
         price = self._prices().get(info.fingerprint, 1.0)
         size = speed.size_mb(self.cfg, price, spare=small or info.role == "spare")
-        return speed.measure(
+        result = speed.measure(
             info, self.cfg, probe_pass=password, max_mb=size, cancel=self._stop,
         )
+        self.store.record_scan_body(info.tag, result.bytes_read, "daemon",
+                                    self.cfg.filters.multiplier_regex, self.wall(), purpose="speed")
+        return result
 
     def _traffic_now(self, tag: str) -> int | None:
         """Счётчик трафика сервера сейчас (uplink + downlink, свежий /debug/vars)."""

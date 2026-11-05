@@ -16,6 +16,7 @@ from xgw.paths import Paths, atomic_write_json
 from xgw.watch.checks import DownloadResult
 from xgw.xraycore.api import ApiError
 
+NL = chr(10)
 REAL_BRIDGE_CHECK = g.bridge_check
 REAL_START = p.start
 REAL_STOPPED = p.stopped
@@ -83,6 +84,7 @@ def gateway(tmp_path, monkeypatch):
     monkeypatch.setattr(p, "stop", lambda slot: alive.discard(p.unit(slot)))
     monkeypatch.setattr(p, "stopped", lambda slot: p.unit(slot) not in alive)
     monkeypatch.setattr(g, "bridge_check", lambda *args: True)
+    monkeypatch.setattr(p, "identity", lambda core, slot: "")
     applier = Applier(cfg, paths, api, Service("xray-never-restart"),
                       validator=lambda config: (True, ""))
     monkeypatch.setattr(applier, "_restart", lambda *args, **kwargs: pytest.fail("Xray restart"))
@@ -284,3 +286,58 @@ def test_marker_precedes_canonical_config_during_promotion(gateway, monkeypatch)
     assert observed == [True]
     g.legacy(w.core, w.applier)
     assert not p.marker_path(w.paths).exists()
+
+
+def _fake_proc(tmp_path, *, uid=990, gid=991, caps="0000000000000000", nnp="1",
+               argv0="/opt/xgw/sing-box/sing-box", born=("777", "777")):
+    base = tmp_path / "proc" / "4242"
+    base.mkdir(parents=True)
+    stat = "4242 (sing-box) S " + " ".join(["0"] * 18)
+    reads = iter(born)
+    status = NL.join(["Name:\tsing-box", f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}",
+                      f"Gid:\t{gid}\t{gid}\t{gid}\t{gid}",
+                      *[f"{key}:\t{caps}" for key in p._CAPS], f"NoNewPrivs:\t{nnp}"])
+    (base / "status").write_text(status)
+    (base / "cmdline").write_bytes(argv0.encode() + bytes(1) + b"run" + bytes(1))
+    return base, stat, reads
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    ({}, ""),
+    ({"uid": 0}, "не от xgw-singbox"),
+    ({"caps": "0000000000003000"}, "capabilities"),
+    ({"nnp": "0"}, "NoNewPrivileges"),
+    ({"argv0": "/usr/bin/other"}, "не бинарник"),
+    ({"born": ("777", "778")}, "сменился"),
+])
+def test_new_generation_identity_is_checked_before_switch(tmp_path, monkeypatch, change, reason):
+    """G1: UID/GID, capabilities, NoNewPrivileges и образ работающего процесса поколения;
+    время рождения до и после чтения — тот же процесс."""
+    base, stat, reads = _fake_proc(tmp_path, **change)
+    real_read = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == base / "stat":
+            return stat + " " + next(reads)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(p, "main_pid", lambda slot: 4242)
+    monkeypatch.setattr(p.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=990))
+    monkeypatch.setattr(p.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=991))
+    monkeypatch.setattr(p.sb, "find_binary", lambda cfg, paths: Path("/opt/xgw/sing-box/sing-box"))
+    core = SimpleNamespace(paths=None)
+    problem = p.identity(core, "blue", proc=tmp_path / "proc")
+    assert (reason in problem) if reason else problem == ""
+
+
+def test_failed_identity_aborts_candidate_and_marks_checked_generation(gateway, monkeypatch):
+    w = gateway
+    monkeypatch.setattr(p, "identity", lambda core, slot: "работает не от xgw-singbox")
+    with pytest.raises(ValueError, match="не от xgw-singbox"):
+        g.prepare(w.core, w.old, w.xray)
+    assert w.alive == {p.LEGACY} and w.api.calls == [] and p.read(w.paths)["pending"] is None
+    monkeypatch.setattr(p, "identity", lambda core, slot: "")
+    prepared = g.prepare(w.core, w.old, w.xray)
+    assert g.finish(w.core, w.applier, prepared).mode == "api"
+    assert p.summary(w.paths)["identity_ok"] is True

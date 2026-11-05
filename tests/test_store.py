@@ -145,5 +145,51 @@ def test_scan_body_window_retries_and_quota_across_restart(tmp_path):
     store.close()
     store = Store(path)
     assert store.scan_bodies_24h(86500) == {
-        "as_of": 86500, "bytes": 18, "attempts": 3, "quota_bytes": {"s": 180}}
+        "as_of": 86500, "bytes": 18, "attempts": 3, "quota_bytes": {"s": 180},
+        "by_purpose": {"scan": {"bytes": 18, "attempts": 3}}}
     store.close()
+
+
+def test_ledger_purposes_and_migration_of_old_journal(tmp_path):
+    """C06: замеры скорости и сквозная проверка — в том же журнале со своим назначением;
+    журнал первой части C05 (без колонки purpose) дополняется, старые записи — сканы."""
+    import sqlite3
+
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE scan_bodies (ts REAL NOT NULL, origin TEXT NOT NULL, "
+                   "bytes INTEGER NOT NULL, source TEXT, quota_bytes INTEGER)")
+        db.execute("INSERT INTO scan_bodies VALUES (100, 'daemon', 5, NULL, NULL)")
+    store = Store(path)
+    store.record_scan_body("t", 40, "daemon", None, 101, purpose="speed")
+    store.record_scan_body("", 7, "daemon", None, 102, purpose="e2e")
+    Store(path).close()  # второй процесс: колонка уже есть
+    assert store.scan_bodies_24h(200)["by_purpose"] == {
+        "scan": {"bytes": 5, "attempts": 1}, "speed": {"bytes": 40, "attempts": 1},
+        "e2e": {"bytes": 7, "attempts": 1}}
+    store.close()
+
+
+def test_ledger_stretches_spare_scans_only_past_the_room():
+    """C06: период скана растёт, только когда журнал сканов за 24 ч больше остатка лимита;
+    растяжение держится до 80 % остатка, потом прогноз."""
+    from xgw.watch import status
+
+    assert status.ledger_minutes(30, 30, 100, 1000) == 30
+    assert status.ledger_minutes(30, 30, 2000, 1000) == 60
+    assert status.ledger_minutes(30, 60, 900, 1000) == 60
+    assert status.ledger_minutes(30, 60, 700, 1000) == 30
+    assert status.ledger_minutes(30, 30, 10**12, 1000) == status.MAX_SCAN_MINUTES
+    assert status.ledger_minutes(30, 30, 1, 0) == status.MAX_SCAN_MINUTES
+    assert status.ledger_parts({"by_purpose": {"scan": {"bytes": 2_000_000},
+                                                "e2e": {"bytes": 3000}}}) == (
+        "сквозная 3.0 КБ, сканы 2.0 МБ")
+
+
+def test_scan_body_is_capped_even_if_server_ignores_range():
+    """C06: Range — просьба серверу; скан читает не больше запрошенного, известного размера
+    адреса или SCAN_CAP_BYTES."""
+    from xgw.watch import scan
+
+    assert scan.body_cap("https://example.com/x", 50_000) == 50_000
+    assert scan.body_cap("https://example.com/unknown") == scan.SCAN_CAP_BYTES

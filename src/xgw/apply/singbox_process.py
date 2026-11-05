@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import time
 from pathlib import Path
 
@@ -98,6 +100,63 @@ def start(core, slot, config):
              str(binary), "--disable-color", "run", "-c", str(path)], timeout=60)
 
 
+CORE_USER = "xgw-singbox"
+_CAPS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+
+
+def main_pid(slot):
+    output = cmd.run(["systemctl", "show", unit(slot), "-p", "MainPID"], check=False, timeout=10)
+    fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    try:
+        return int(fields.get("MainPID") or 0)
+    except ValueError:
+        return 0
+
+
+def identity(core, slot, proc: Path | None = None):
+    """Пусто — процесс поколения работает от xgw-singbox без capabilities, с NoNewPrivileges и
+    это бинарник sing-box; иначе причина. Проверяется работающий MainPID после готовности, до
+    переключения Xray (открытый вопрос G1: права в момент запуска). Читается только то, что
+    открыто демону и без CAP_SYS_PTRACE: status, cmdline и время рождения до и после чтения —
+    тот же процесс, а не новый с тем же номером."""
+    proc = proc or Path("/proc")
+    pid = main_pid(slot)
+    if pid <= 0:
+        return "процесс нового поколения sing-box не найден"
+    base = proc / str(pid)
+    try:
+        born = (base / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        status = (base / "status").read_text()
+        argv = (base / "cmdline").read_bytes().split(bytes(1))
+        again = (base / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "процесс нового поколения sing-box исчез во время проверки прав"
+    if again != born:
+        return "процесс нового поколения sing-box сменился во время проверки прав"
+    values = {key: value.split() for key, _, value in
+              (line.partition(":") for line in status.splitlines())}
+    try:
+        uid, gid = pwd.getpwnam(CORE_USER).pw_uid, grp.getgrnam(CORE_USER).gr_gid
+    except KeyError:
+        return f"нет пользователя или группы {CORE_USER}"
+    if values.get("Uid") != [str(uid)] * 4 or values.get("Gid") != [str(gid)] * 4:
+        return f"процесс нового поколения sing-box работает не от {CORE_USER}"
+    for key in _CAPS:
+        field = values.get(key) or [""]
+        try:
+            empty = int(field[0], 16) == 0
+        except ValueError:
+            empty = False
+        if not empty:
+            return f"у процесса нового поколения sing-box есть capabilities ({key})"
+    if values.get("NoNewPrivs") != ["1"]:
+        return "у процесса нового поколения sing-box не включён NoNewPrivileges"
+    binary = sb.find_binary(None, core.paths)
+    if binary is None or not argv or argv[0].decode(errors="replace") != str(binary):
+        return "процесс нового поколения — не бинарник sing-box"
+    return ""
+
+
 def ports(config):
     return set(sb.bridge_ports(config).values())
 
@@ -149,4 +208,6 @@ def summary(paths):
         "drain_left_s": max(0, round(old["until"] - time.monotonic())) if old else 0,
         "pending": state["pending"]["phase"] if state["pending"] else None,
         "process_limit": 2,
+        # Права процесса действующего поколения проверены демоном до переключения (identity).
+        "identity_ok": (state.get("identity") or {}).get("slot") == state["active"] or None,
     }

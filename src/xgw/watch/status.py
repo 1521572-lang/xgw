@@ -107,13 +107,43 @@ def scan_minutes(
     per_round = full * size + cheap * CHEAP_SCAN_BYTES
     if per_round <= 0 or guessed:
         return base
-    interval = parse_seconds(cfg.probe.interval) or 30
-    fixed = members * size * 86400 / max(1, interval) + checks
-    room = cfg.probe.max_daily_probe_mb * MB - fixed
+    room = scan_room(cfg, members, size, checks)
     if room <= per_round:
         return MAX_SCAN_MINUTES
     need = math.ceil(1440 * per_round / room)
     return min(MAX_SCAN_MINUTES, max(base, need))
+
+
+def scan_room(cfg: Config, members: int, size: int, checks: int = 0) -> float:
+    """Байт в сутки, остающихся сканам в лимите probe.max_daily_probe_mb после проб ядра по
+    участникам (оценка: Xray их не считает по отдельности) и дешёвых проверок checks."""
+    interval = parse_seconds(cfg.probe.interval) or 30
+    fixed = members * size * 86400 / max(1, interval) + checks
+    return cfg.probe.max_daily_probe_mb * MB - fixed
+
+
+def ledger_minutes(planned: int, current: int, spent: float, room: float) -> int:
+    """Период скана по фактическому журналу (C06): сканы за 24 ч (вместе со срочными — резерв
+    здоровья идёт первым) прочитали больше остатка лимита room — фоновый скан запасных реже
+    во столько же раз. Прежнее растяжение держится, пока журнал не опустится ниже 80 % room;
+    planned — период по прогнозу (scan_minutes), current — действующий."""
+    if room <= 0:
+        return MAX_SCAN_MINUTES if spent > 0 else planned
+    if spent > room * 1.1:
+        return min(MAX_SCAN_MINUTES, max(planned, math.ceil(planned * spent / room)))
+    if current > planned and spent > room * 0.8:
+        return min(MAX_SCAN_MINUTES, current)
+    return planned
+
+
+PURPOSES = {"scan": "сканы", "speed": "замеры скорости", "e2e": "сквозная"}
+
+
+def ledger_parts(actual: dict) -> str:
+    """«сканы 1.2 МБ, замеры скорости 40.0 МБ, сквозная 3.1 МБ» — из by_purpose журнала."""
+    kinds = actual.get("by_purpose") or {}
+    return ", ".join(f"{PURPOSES.get(key, key)} {size_text(value['bytes'])}"
+                     for key, value in sorted(kinds.items()) if value.get("bytes") is not None)
 
 
 def probe_budget(
@@ -1097,10 +1127,11 @@ def render_budget(budget: dict) -> list[str]:
             lines.append(f"  за месяц это ~{share:.1f} % квоты подписки «{name}»{spent}")
     actual = budget.get("scan_actual_24h")
     if actual is not None:
-        lines.append(f"  Журнал сканов за 24 ч: {size_text(actual['bytes'])} тела, "
-                     f"попыток {actual['attempts']}")
+        parts = ledger_parts(actual)
+        lines.append(f"  Журнал проверок за 24 ч: {size_text(actual['bytes'])} тела, "
+                     f"попыток {actual['attempts']}" + (f" ({parts})" if parts else ""))
         for name, size in actual["quota_bytes"].items():
-            lines.append(f"  «{name}»: {size_text(size)} квоты по множителям сканов")
+            lines.append(f"  «{name}»: {size_text(size)} квоты по множителям проверок")
     lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
     return lines
 

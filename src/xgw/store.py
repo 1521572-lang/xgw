@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -65,7 +66,16 @@ class Store:
         self.conn = sqlite3.connect(path, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Назначение записи журнала проверок (C06): scan, speed, e2e. Старые записи — сканы."""
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(scan_bodies)")}
+        if "purpose" not in columns:
+            # Колонку мог только что добавить другой процесс (демон и CLI).
+            with contextlib.suppress(sqlite3.OperationalError):
+                self.conn.execute("ALTER TABLE scan_bodies ADD COLUMN purpose TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -129,8 +139,11 @@ class Store:
 
     def record_scan_body(
         self, tag: str, size: int, origin: str, pattern: str | None, ts: float,
+        purpose: str = "scan",
     ) -> None:
-        """Одна завершившаяся попытка, включая неполное тело. Диагностика демона многопоточна."""
+        """Одна завершившаяся попытка, включая неполное тело. Диагностика демона многопоточна.
+        purpose — scan (скан сервера), speed (замер скорости), e2e (сквозная проверка через
+        основной). Байты — полезное тело после TLS, не трафик WAN."""
         try:
             with closing(sqlite3.connect(self.path, timeout=0.25)) as db, db:
                 db.execute("DELETE FROM scan_bodies WHERE ts <= ?", (ts - 86400,))
@@ -145,8 +158,9 @@ class Store:
                             quota_bytes = round(size * cost.multiplier(name or "", pattern))
                     except (ValueError, TypeError, AttributeError, OverflowError):
                         quota_bytes = None  # Сами байты известны и при неполных метаданных.
-                db.execute("INSERT INTO scan_bodies VALUES (?, ?, ?, ?, ?)",
-                           (ts, origin, size, source, quota_bytes))
+                db.execute("INSERT INTO scan_bodies (ts, origin, bytes, source, quota_bytes, "
+                           "purpose) VALUES (?, ?, ?, ?, ?, ?)",
+                           (ts, origin, size, source, quota_bytes, purpose))
         except sqlite3.Error:
             logging.getLogger(__name__).warning("Не удалось записать расход скана в журнал")
 
@@ -155,8 +169,13 @@ class Store:
             "SELECT source, SUM(bytes), SUM(quota_bytes), COUNT(*) FROM scan_bodies "
             "WHERE ts > ? AND ts <= ? GROUP BY source", (now - 86400, now),
         ).fetchall()
+        kinds = self.conn.execute(
+            "SELECT COALESCE(purpose, 'scan'), SUM(bytes), COUNT(*) FROM scan_bodies "
+            "WHERE ts > ? AND ts <= ? GROUP BY 1", (now - 86400, now),
+        ).fetchall()
         return {"as_of": now, "bytes": sum(r[1] for r in rows), "attempts": sum(r[3] for r in rows),
-                "quota_bytes": {r[0]: r[2] for r in rows if r[0] and r[2] is not None}}
+                "quota_bytes": {r[0]: r[2] for r in rows if r[0] and r[2] is not None},
+                "by_purpose": {r[0]: {"bytes": r[1], "attempts": r[2]} for r in kinds}}
 
     def save_scan(
         self,

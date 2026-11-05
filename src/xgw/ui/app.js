@@ -402,9 +402,12 @@
     const lines = forecast ? [lead] : [];
     const actual = budget.scan_actual_24h;
     if (actual) {
-      lines.push(el("span", { text: ` Журнал сканов за 24 ч: ${size(actual.bytes)} тела, попыток ${actual.attempts}.` }));
+      const purposes = { scan: "сканы", speed: "замеры скорости", e2e: "сквозная" };
+      const kinds = Object.entries(actual.by_purpose || {}).sort()
+        .map(([key, value]) => `${purposes[key] || key} ${size(value.bytes)}`).join(", ");
+      lines.push(el("span", { text: ` Журнал проверок за 24 ч: ${size(actual.bytes)} тела, попыток ${actual.attempts}${kinds ? ` (${kinds})` : ""}.` }));
       for (const [name, bytes] of Object.entries(actual.quota_bytes || {})) {
-        lines.push(el("span", { text: ` По множителям сканов «${name}» — ${size(bytes)} квоты.` }));
+        lines.push(el("span", { text: ` По множителям проверок «${name}» — ${size(bytes)} квоты.` }));
       }
     }
     for (const [name, share] of Object.entries(budget.quota_share || {})) {

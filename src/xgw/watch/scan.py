@@ -43,6 +43,10 @@ RTT_EVERY = 600.0
 # RANDOM_MIN больше двух записей TLS (~32,7 КБ): «заморозка» по объёму на 16–32 КБ ловится и
 # так (стенд phase_lab: обрыв видится кратно ~16,3 КБ).
 RANDOM_MIN = 40_000
+# Предел тела скана, если размер адреса неизвестен (C06 кросс-аудита 4cc96b9): Range — только
+# просьба к серверу, ответ 200 с целым файлом читается не дальше запрошенного или известного
+# размера, а незнакомый адрес — не дальше SCAN_CAP_BYTES.
+SCAN_CAP_BYTES = 2_000_000
 
 
 def cheap_url(cfg: Config) -> str:
@@ -105,6 +109,7 @@ def scan_node(
     """
     started = time.monotonic()
     target = url or cfg.probe.url
+    ranged = range_size(target) if random_size else 0
     result = http_get_via_proxy(
         "127.0.0.1",
         node.probe_port,
@@ -116,7 +121,8 @@ def scan_node(
         user_agent=cfg.probe.user_agent,
         cancel=cancel,
         rtt=True,
-        range_end=range_size(target) if random_size else 0,
+        range_end=ranged,
+        max_bytes=body_cap(target, ranged),
         min_body=1,  # ответ без тела (204) — не проба: файла нет
     )
     seconds = time.monotonic() - started
@@ -130,6 +136,12 @@ def scan_node(
         status=result.status,
         rtt_ms=result.rtt_ms,
     )
+
+
+def body_cap(url: str, ranged: int = 0) -> int:
+    """Сколько байт тела читать самое большее: запрошенный Range, известный размер файла или
+    SCAN_CAP_BYTES (C06)."""
+    return ranged or probe_bytes(url) or SCAN_CAP_BYTES
 
 
 def range_size(url: str) -> int:

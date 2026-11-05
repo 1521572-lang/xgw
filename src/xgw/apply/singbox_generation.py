@@ -129,6 +129,9 @@ def prepare(core, config, xray):
         error = core._wait_ready(candidate)
         if error or not bridge_check(core, candidate, routed):
             raise ValueError("новое поколение не прошло настоящий запрос через мост")
+        problem = processes.identity(core, slot)
+        if problem:
+            raise ValueError(problem)
         with file_lock(core.paths.lock_file):
             state = processes.read(core.paths)
             if (state["pending"] or {}).get("token") != prepared.token:
@@ -194,6 +197,7 @@ def _promote(core, state, config):
     atomic_write_text(processes.marker_path(core.paths), "managed\n", mode=0o644)
     atomic_write_json(core.paths.singbox_config_file, config)
     os.chown(core.paths.singbox_config_file, 0, core.paths.singbox_config_dir.stat().st_gid)
+    state["identity"] = {"slot": pending["slot"], "ts": time.time()}
     state.update(active=pending["slot"], pending=None,
                  draining={"slot": state["active"], "until": time.monotonic()
                            + processes.DRAIN_SECONDS, "ports": pending["old_ports"]})
