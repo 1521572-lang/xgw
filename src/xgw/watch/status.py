@@ -996,6 +996,8 @@ def render_capture(capture: dict) -> str:
             "Перехват: ВРЕМЕННО СНЯТ — Xray недоступен, fail_mode = open; "
             "трафик идёт напрямую, мимо VPN"
         )
+    if capture.get("capture_failed"):
+        return f"Перехват: ошибка восстановления правил; {capture['failure_reason']}"
     if capture.get("inbound_missing"):
         # Перехват включён, но Xray работает без нужного inbound'а: правила перехвата
         # не загружены (иначе трафик ушёл бы в никуда) — он заблокирован или идёт напрямую.

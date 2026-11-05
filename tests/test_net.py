@@ -1413,6 +1413,36 @@ def test_guard_is_independent_of_capture_tables_and_routing(gateway):
     assert kernel.tables[key] == barrier
 
 
+def test_restore_guard_repairs_only_barrier_and_respects_policy(gateway):
+    gateway.enable()
+    kernel = gateway.kernel
+    del kernel.tables[("ip", nft.TABLE)]
+    key = ("inet", nft.GUARD)
+    del kernel.tables[key]
+    before = dict(kernel.tables)
+    assert gateway.restore_guard() == "restored"
+    assert {k: v for k, v in kernel.tables.items() if k != key} == before
+    assert gateway.guard_loaded() is True and gateway.loaded() is False
+    loads = len(kernel.loads)
+    assert gateway.restore_guard() == "present"
+    assert len(kernel.loads) == loads
+    for switch in (gateway.open, gateway.disable):
+        switch()
+        loads = len(kernel.loads)
+        assert gateway.restore_guard() == "not_required"
+        assert key not in kernel.tables and len(kernel.loads) == loads
+
+
+def test_restore_guard_does_not_certify_competing_write(gateway):
+    gateway.enable()
+    gateway.kernel.tables.pop(("inet", nft.GUARD))
+    gateway._save(guard_baseline=None, guard_spec=None)
+    gateway._generation = iter([10, 11, 12]).__next__
+    with pytest.raises(CaptureError, match="поколение"):
+        gateway.restore_guard()
+    assert "guard_baseline" not in gateway._state()
+
+
 def test_guard_missing_or_modified_is_never_loaded(gateway):
     gateway.enable()
     kernel = gateway.kernel

@@ -620,8 +620,9 @@ class Capture:
         A name/counter alone is not evidence: compare its desired specification,
         structure and the digest verified inside the post-apply generation bracket.
         """
-        rules = self.rules(self.effective_mode())
-        wanted = nft.render_guard(rules)
+        return self._guard_loaded(nft.render_guard(self.rules(self.effective_mode())))
+
+    def _guard_loaded(self, wanted: str) -> bool | None:
         guard = nft.listing(self.lister, "inet", nft.GUARD)
         if guard is None:
             return None
@@ -639,6 +640,40 @@ class Capture:
         if state.get("guard_spec") != nft.tables_digest(wanted):
             return False
         return baseline == nft.tables_digest(nft.structure(guard, "inet", nft.GUARD))
+
+    def restore_guard(self) -> str:
+        """После сбоя полной загрузки сверить политику заново под общей сетевой блокировкой."""
+        with self._lock():
+            mode = self.effective_mode()
+            if mode not in ("on", "blocked"):
+                return "not_required"
+            rules = self.rules(mode)
+            wanted = nft.render_guard(rules)
+            verified = self._guard_loaded(wanted)
+            if verified is None:
+                return "unknown"
+            if verified:
+                return "present"
+            before = self._gen()
+            with self._own_rules():
+                nft.apply_guard(rules, self.runner)
+            applied = self._gen()
+            guard = nft.listing(self.runner, "inet", nft.GUARD)
+            after = self._gen()
+            if self._generation is not None and (
+                before is None or applied != (before + 1) % (1 << 32) or after != applied
+            ):
+                raise CaptureError("поколение правил при восстановлении барьера не подтверждено")
+            if not guard or nft.manifest_problem(
+                nft.manifest(wanted, "inet", nft.GUARD), nft.manifest(guard, "inet", nft.GUARD),
+                f"inet {nft.GUARD}",
+            ):
+                raise CaptureError("правила независимого барьера не подтверждены")
+            self._save(
+                guard_baseline=nft.tables_digest(nft.structure(guard, "inet", nft.GUARD)),
+                guard_spec=nft.tables_digest(wanted),
+            )
+            return "restored"
 
     def tidy(self) -> str:
         """Убирает интерфейс TUN, который больше не нужен: в конфиге не capture.method =

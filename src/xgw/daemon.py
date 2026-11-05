@@ -2192,6 +2192,8 @@ class Daemon:
             self.xray_down_since = None
         elif self.xray_down_since is None:
             self.xray_down_since = now
+        mode = (self.capture_info or {}).get("mode")
+        checking_rules = True
         try:
             mode = capture.mode()
             if self.cfg.capture.fail_mode == "open":
@@ -2216,7 +2218,9 @@ class Daemon:
             if moved:
                 self.notifier.event("capture", moved)
             loaded = capture.loaded()
-            reloaded = loaded is False
+            reloaded = loaded is False or (
+                loaded is None and bool((self.capture_info or {}).get("capture_failed"))
+            )
             cause = ""
             if reloaded:
                 # Правила пропали (чужой flush ruleset, перезапуск nftables), ещё не
@@ -2226,6 +2230,7 @@ class Daemon:
                 cause = tun_problem() if tun_problem is not None else ""
                 capture.up()
                 loaded = capture.loaded()
+            checking_rules = False
             lan_problem = self._lan_path(capture, mode, loaded, reloaded)
             info = capture.describe(check=False)
             self.capture_info = {**info, "loaded": loaded, "lan_problem": lan_problem}
@@ -2262,13 +2267,27 @@ class Daemon:
                 self.notifier.event("capture", tidied)
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             text = f"правила перехвата не загружены: {exc}"
-            guard_loaded = getattr(capture, "guard_loaded", None)
-            if guard_loaded is not None:
+            if checking_rules:
+                guard = "unknown"
+                restore = getattr(capture, "restore_guard", None)
                 try:
-                    if guard_loaded() is True:
-                        text += "; барьер соответствует политике и остаётся загруженным"
-                except Exception:
-                    pass  # ошибка диагностики не заменяет исходную причину сбоя загрузки
+                    if restore is not None:
+                        guard = restore()
+                except Exception as guard_exc:
+                    guard = "failed"
+                    text += f"; ошибка восстановления барьера: {guard_exc}"
+                reason = {
+                    "restored": "независимый барьер восстановлен отдельно",
+                    "present": "независимый барьер соответствует политике",
+                    "not_required": "выбранный режим не требует восстановления барьера",
+                    "unknown": "состояние независимого барьера не подтверждено",
+                    "failed": "защита независимым барьером не подтверждена",
+                }[guard]
+                text += f"; {reason}"
+                self.capture_info = {
+                    **(self.capture_info or {}), "mode": mode, "loaded": False,
+                    "capture_failed": True, "guard_recovery": guard, "failure_reason": reason,
+                }
             self.log.error("%s", text)
             if text != self._capture_error:  # одно событие на причину, а не на каждый шаг
                 self._capture_error = text
@@ -6330,6 +6349,9 @@ class Daemon:
             return Lifecycle.OFF, ""
         if mode == "open":
             return Lifecycle.OPEN, "Xray недоступен дольше минуты (capture.fail_mode = open)"
+        if info.get("capture_failed"):
+            protected = info.get("guard_recovery") in ("restored", "present")
+            return (Lifecycle.BLOCKED if protected else Lifecycle.OPEN), info["failure_reason"]
         missing = str(info.get("inbound_missing") or "")
         if missing:
             return (Lifecycle.BLOCKED if info.get("blocked") else Lifecycle.OPEN), missing

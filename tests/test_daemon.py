@@ -981,6 +981,28 @@ def test_daemon_reports_dead_lan_path(guarded):
     assert daemon.status()["capture"]["lan_problem"] == ""
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_failed_capture_reports_guard_separately(guarded, failed):
+    daemon, capture = guarded
+    capture.is_loaded, capture.fail = False, True
+
+    def restore():
+        if failed:
+            raise RuntimeError("nft: EINVAL")
+        return "restored"
+
+    capture.restore_guard = restore
+    daemon.tick()
+    data = daemon.status()["capture"]
+    assert data["capture_failed"] and data["loaded"] is False
+    assert data["guard_recovery"] == ("failed" if failed else "restored")
+    assert data["lifecycle"] == ("open" if failed else "blocked")
+    capture.fail = False
+    daemon.tick()
+    assert daemon.status()["capture"]["loaded"]
+    assert not daemon.status()["capture"].get("capture_failed")
+
+
 def test_rules_failure_is_reported_once(guarded):
     daemon, capture = guarded
     capture.is_loaded, capture.fail = False, True

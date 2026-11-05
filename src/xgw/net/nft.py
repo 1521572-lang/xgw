@@ -1138,6 +1138,14 @@ def _delete_text(family: str, table: str) -> str:
 # --- загрузка в ядро ------------------------------------------------------------
 
 
+def apply_guard(rules: Rules, runner: Runner) -> None:
+    """Одна транзакция только для независимого барьера."""
+    guard = render_guard(rules)
+    if not guard:
+        raise CommandError("для выбранного режима барьер не предусмотрен")
+    runner(["nft", "-f", "-"], input=guard)
+
+
 def apply(rules: Rules, runner: Runner) -> list[str]:
     """Загружает правила (или убирает таблицы, если правил нет) — обе таблицы одной
     транзакцией: между ними правила IPv4 и IPv6 не расходятся. Возвращает предупреждения:
