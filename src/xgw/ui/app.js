@@ -649,7 +649,10 @@
   }
 
   // Скорость: 85 Мбит/с; ниже 10 — с одним знаком после запятой.
-  const mbps = (value) => (value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`);
+  function mbps(value) {
+    if (value > 0 && value < 0.1) return `${Math.round(value * 1000)} кбит/с`;
+    return value >= 10 ? `${Math.round(value)} Мбит/с` : `${decimal(value)} Мбит/с`;
+  }
   const hasSpeed = (server) => server.speed_mbps !== null && server.speed_mbps !== undefined;
 
   // Скорость по последнему замеру — рядом с задержкой; у запасных тоже (меньшей загрузкой).

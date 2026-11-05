@@ -99,13 +99,13 @@ def measure(
     seconds = round(result.body_seconds, 2)
     if not result.ok:
         return SpeedResult(None, result.downloaded, seconds, result.error)
-    if result.downloaded < MIN_BYTES:
+    if result.downloaded < MIN_BYTES and not result.body_time_limited:
         return SpeedResult(
             None, result.downloaded, seconds,
             f"файл замера слишком мал: {result.downloaded} байт — укажите speed.url побольше",
         )
     mbps = result.downloaded * 8 / max(result.body_seconds, 0.05) / MB
-    return SpeedResult(round(mbps, 1), result.downloaded, seconds)
+    return SpeedResult(round(mbps, 3), result.downloaded, seconds)
 
 
 @dataclass(frozen=True)
@@ -167,6 +167,8 @@ def faster(rival: Candidate, main: Candidate, gain_pct: int) -> bool:
 
 def mbps_text(value: float) -> str:
     """85 Мбит/с; 8,5 Мбит/с — ниже 10 с одним знаком после запятой."""
+    if 0 < value < 0.1:
+        return f"{value * 1000:.0f} кбит/с"
     if value >= 10:
         return f"{value:.0f} Мбит/с"
     return f"{value:.1f}".replace(".", ",") + " Мбит/с"

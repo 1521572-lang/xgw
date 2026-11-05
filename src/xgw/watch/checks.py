@@ -48,6 +48,8 @@ class DownloadResult:
     reusable: bool = False  # соединение после ответа годится для следующего запроса
     location: str = ""  # заголовок Location ответа 3xx (переходит по нему вызывающий)
 
+    body_time_limited: bool = False  # чтение прервал именно лимит времени тела
+
     @property
     def frozen(self) -> bool:
         """«Заморозка»: часть тела пришла, затем тишина."""
@@ -296,10 +298,8 @@ def _read_response(
     downloaded = len(payload)
     body = payload[:keep_body]
 
-    def enough() -> bool:
-        return bool(max_bytes and downloaded >= max_bytes) or bool(
-            max_body_seconds and time.monotonic() - started >= max_body_seconds
-        )
+    body_deadline = started + max_body_seconds if max_body_seconds > 0 else deadline
+    read_deadline = min(deadline, body_deadline)
 
     try:
         while not _complete(downloaded, length, parts):
@@ -309,12 +309,12 @@ def _read_response(
                     error=f"ответ частями не по стандарту: {parts.error}",
                     body_seconds=time.monotonic() - started,
                 )
-            if enough():
+            if max_bytes and downloaded >= max_bytes:
                 return DownloadResult(
                     ok=True, downloaded=downloaded, status=status, body=body,
                     body_seconds=time.monotonic() - started,
                 )
-            chunk = _recv(sock, silence, deadline, cancel)
+            chunk = _recv(sock, silence, read_deadline, cancel)
             if not chunk:
                 break
             data = parts.feed(chunk) if parts is not None else chunk
@@ -339,6 +339,13 @@ def _read_response(
             body_seconds=time.monotonic() - started,
         )
     except _Deadline:
+        if cancel is not None and cancel.is_set():
+            return DownloadResult(ok=False, downloaded=downloaded, kind="cancelled", status=status,
+                                  error="проверка прервана",
+                                  body_seconds=time.monotonic() - started)
+        if body_deadline < deadline and downloaded > 0:
+            return DownloadResult(ok=True, downloaded=downloaded, status=status, body=body,
+                                  body_seconds=time.monotonic() - started, body_time_limited=True)
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="timeout", status=status, body=body,
             error=f"загрузка не уложилась в отведённое время ({downloaded} байт тела)",

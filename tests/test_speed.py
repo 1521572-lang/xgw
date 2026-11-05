@@ -96,6 +96,7 @@ def test_download_stops_at_max_body_seconds(origin):
         "127.0.0.1", server.port, "http://speed.example/file", max_body_seconds=1.0, timeout=5,
     )
     assert result.ok and 0 < result.downloaded < 10 * MB
+    assert result.body_time_limited
     assert 1.0 <= result.body_seconds < 2.0 and time.monotonic() - started < 3.0
 
 
@@ -113,6 +114,18 @@ def test_measure_counts_body_throughput(origin):
     assert result.bytes_read >= 2 * MB  # max_mb = 2
     # Скорость — байты тела за время тела.
     assert result.mbps == pytest.approx(result.bytes_read * 8 / result.seconds / MB, rel=0.05)
+
+
+def test_measure_distinguishes_a_timed_body_from_a_short_file(monkeypatch):
+    from xgw.watch.checks import DownloadResult
+
+    result = DownloadResult(ok=True, downloaded=64_000, body_seconds=8)
+    monkeypatch.setattr(speed, "http_get_via_proxy", lambda *args, **kwargs: result)
+    node, cfg = SimpleNamespace(probe_port=1), _cfg("http://speed.example/file")
+    assert speed.measure(node, cfg, probe_pass="x").mbps is None
+    result.body_time_limited = True
+    assert speed.measure(node, cfg, probe_pass="x").mbps == 0.064
+    assert speed.mbps_text(0.016) == "16 кбит/с"
 
 
 def test_measure_stops_at_the_given_size(origin):

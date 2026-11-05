@@ -61,7 +61,8 @@ class Guard:
     cfg: Config
     wall: Callable[[], float]
     # tag → (time.time(), байт uplink + downlink с запуска Xray) на прошлой пассивной оценке
-    counters: dict[str, tuple[float, int]] = field(default_factory=dict)
+    counters: dict[str, tuple[float, int, str]] = field(default_factory=dict)
+    low_windows: dict[str, int] = field(default_factory=dict)
     next_sample: float = 0.0
     passive: dict[str, deque] = field(default_factory=dict)  # ключ сервера → оценки
     lows: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
@@ -85,22 +86,29 @@ class Guard:
             return None
         self.next_sample = now + self.cfg.speed.passive_seconds
         result: dict[str, float] = {}
+        low_windows: dict[str, int] = {}
         for tag, total in counters.items():
             previous = self.counters.get(tag)
-            self.counters[tag] = (now, total)
             key = keys.get(tag)
+            if key is None:
+                self.counters.pop(tag, None)
+                continue
+            self.counters[tag] = (now, total, key)
             # Счётчик меньше прежнего — Xray перезапущен: оценка с этой точки.
-            if key is None or previous is None or now <= previous[0] or total < previous[1]:
+            if not previous or key != previous[2] or now <= previous[0] or total < previous[1]:
                 continue
             delta = max(0, total - previous[1] - own.get(tag, 0))
-            mbps = round(delta * 8 / (now - previous[0]) / MB, 1)
+            mbps = round(delta * 8 / (now - previous[0]) / MB, 3)
             self.passive.setdefault(key, deque(maxlen=PASSIVE_KEEP)).append(Passive(mbps, now))
             result[key] = mbps
             if mbps >= self.cfg.speed.passive_mbps:
                 self.clear(key)  # исправен: трафик клиентов сам показывает полосу
-            elif ACTIVE_FLOOR_MBPS <= mbps < self.cfg.speed.low_mbps and key not in self.throttled:
-                # Через сервер качают, а идёт медленно — замерить сразу, не ждать срока.
-                self.recheck_at.setdefault(key, now)
+            elif 0 < mbps < self.cfg.speed.low_mbps and key not in self.throttled:
+                if mbps < ACTIVE_FLOOR_MBPS:
+                    low_windows[key] = self.low_windows.get(key, 0) + 1
+                if mbps >= ACTIVE_FLOOR_MBPS or low_windows.get(key, 0) >= 3:
+                    self.recheck_at.setdefault(key, now)
+        self.low_windows = low_windows
         for tag in set(self.counters) - set(counters):
             del self.counters[tag]
         return result
@@ -142,6 +150,7 @@ class Guard:
         return False
 
     def clear(self, key: str) -> None:
+        self.low_windows.pop(key, None)
         self.lows.pop(key, None)
         self.recheck_at.pop(key, None)
         self.throttled.pop(key, None)

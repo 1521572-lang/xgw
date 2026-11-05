@@ -61,6 +61,37 @@ def test_passive_estimate_counts_only_the_clients_traffic():
     assert guard.passive_records()["fp-nl"]["mbps"] == 4.0
 
 
+def test_three_slow_windows_trigger_only_a_confirmation():
+    guard, clock = _guard()
+    tag = "proxy"
+    key = "server"
+    total = 0
+
+    def sample(delta, own=0):
+        nonlocal total
+        clock.now += guard.cfg.speed.passive_seconds
+        total += delta
+        guard.sample({tag: total}, {tag: own}, {tag: key})
+
+    slow = 2000 * guard.cfg.speed.passive_seconds  # 16 кбит/с
+    sample(0)
+    sample(slow)
+    sample(slow)
+    sample(slow, own=slow)
+    sample(slow)
+    sample(slow)
+    assert not guard.due()
+    sample(slow)
+    assert guard.due() == [key] and not guard.throttled
+    guard.note_total(key, 40)
+    sample(slow)
+    assert not guard.due()
+    sample(slow)
+    key = "replacement"
+    sample(slow)
+    assert not guard.due() and not guard.low_windows
+
+
 def test_three_low_totals_in_ten_minutes_mean_throttled():
     """R6.1: три суммарные оценки подряд ниже low_mbps за low_minutes — придушен; хорошая
     оценка между ними счёт обнуляет; старые низкие не считаются."""

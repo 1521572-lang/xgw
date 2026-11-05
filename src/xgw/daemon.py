@@ -5901,8 +5901,8 @@ class Daemon:
                 if after is not None and after >= before:
                     # Трафик клиентов через этот же сервер за время замера (ТЗ R5.3).
                     extra = max(0, after - before - result.bytes_read)
-                    background = round(extra * 8 / span / speedguard.MB, 1)
-            total = result.mbps if result.mbps is None else round(result.mbps + background, 1)
+                    background = round(extra * 8 / span / speedguard.MB, 3)
+            total = result.mbps if result.mbps is None else round(result.mbps + background, 3)
             records = self._speeds()
             records[self._speed_key(info)] = {
                 "mbps": total, "bytes": result.bytes_read, "seconds": result.seconds,
@@ -6001,8 +6001,6 @@ class Daemon:
             tag: value for tag, value in metrics.outbound_totals(self._metrics).items()
             if tag in members
         }
-        if not counters:
-            return
         sampled = self.guard.sample(counters, self._own_by_tag, members)
         if sampled is None:
             return
