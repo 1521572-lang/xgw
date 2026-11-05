@@ -1,9 +1,9 @@
 """Две конечные загрузки через probe-inbound Xray и один штатный singbox rotate."""
-
 import dataclasses
 import http.client
 import json
 import os
+import re
 import socket
 import sqlite3
 import ssl
@@ -14,20 +14,15 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-ROOT = Path("/run/xgw-g1-fix1")
+ROOT = Path("/run/xgw-g1-fix2")
 SIZE = 2 * 1024 * 1024
-
-
 def save(result):
-    path = ROOT / "summary.json"
     temporary = ROOT / "summary.next"
     temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
-
+    temporary.replace(ROOT / "summary.json")
 
 def run(argv, timeout=180):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
-
 
 def download_url(url):
     parts = urlsplit(url)
@@ -35,23 +30,19 @@ def download_url(url):
     if (parts.scheme != "https" or not parts.hostname
             or parts.hostname.rstrip(".").lower() == "speed.cloudflare.com"):
         raise ValueError("для конечной загрузки нужен настроенный HTTPS адрес")
-    if "bytes" not in query:
-        return url  # фиксированный файл: ниже запрашивается и проверяется Range
-    query["bytes"] = str(SIZE)
-    return urlunsplit(parts._replace(query=urlencode(query)))
-
+    if "bytes" in query:
+        query["bytes"] = str(SIZE)
+        return urlunsplit(parts._replace(query=urlencode(query)))
+    return url  # Фиксированный файл: запрашивается и проверяется Range.
 
 def established(port):
     output = run(["ss", "-Htn", "state", "established", "src", f"127.0.0.1:{port}"])
     return output.returncode == 0 and bool(output.stdout.strip())
 
-
 def process_count():
     from xgw.apply import singbox_process as processes
-
     count, permissions = 0, True
     import pwd
-
     uid = pwd.getpwnam("xgw-singbox").pw_uid
     for slot in ("legacy", "blue", "green"):
         result = run(["systemctl", "show", processes.unit(slot), "-p", "MainPID", "--value"])
@@ -68,11 +59,28 @@ def process_count():
         permissions &= int(fields["CapEff"].strip(), 16) == 0
     return count, permissions
 
+def response_error(reply, state):
+    length = reply.getheader("Content-Length")
+    state["length"] = int(length) if length and length.isascii() and length.isdecimal() else None
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
+                         reply.getheader("Content-Range", "").strip(), re.IGNORECASE)
+    state["range"] = ([int(match[1]), int(match[2]),
+                       int(match[3]) if match[3] != "*" else None] if match else None)
+    state["identity"] = reply.getheader("Content-Encoding", "identity").lower() == "identity"
+    if reply.status not in (200, 206):
+        return "HTTP_STATUS"
+    if not state["identity"]:
+        return "ENCODED_BODY"
+    if reply.status == 206 and (not match or state["range"][:2] != [0, SIZE - 1]
+                               or (state["range"][2] is not None and state["range"][2] < SIZE)):
+        return "RANGE_MISMATCH"
+    if length is not None and state["length"] != SIZE:
+        return "LENGTH_MISMATCH"
+    return None
 
 def stream(proxy_port, password, url, agent, state):
     from xgw import fetch
-
-    sock = None
+    sock, reply, started = None, None, None
     try:
         parts = urlsplit(url)
         sock = fetch.open_tunnel(("127.0.0.1", proxy_port), parts.hostname, parts.port or 443,
@@ -86,14 +94,11 @@ def stream(proxy_port, password, url, agent, state):
         path = parts.path + ("?" + parts.query if parts.query else "")
         connection.request("GET", path, headers={
             "User-Agent": agent, "Accept-Encoding": "identity", "Connection": "close",
-            "Range": f"bytes=0-{SIZE - 1}"})
+            "Cache-Control": "no-cache", "Range": f"bytes=0-{SIZE - 1}"})
         reply = connection.getresponse()
         state["http"] = reply.status
-        length = reply.getheader("Content-Length")
-        ranged = reply.getheader("Content-Range", "").startswith(f"bytes 0-{SIZE - 1}/")
-        if (reply.status not in (200, 206) or (reply.status == 206 and not ranged)
-                or (length is not None and int(length) != SIZE)):
-            state["error"] = "BODY_OR_HTTP"
+        state["error"] = response_error(reply, state)
+        if state["error"]:
             return
         started = time.monotonic()
         while state["bytes"] < SIZE:
@@ -102,37 +107,39 @@ def stream(proxy_port, password, url, agent, state):
                 break
             state["bytes"] += len(data)
             state["receiving"].set()
-            time.sleep(0.5)  # Backpressure, не искусственная пауза после законченного ответа.
-        state["seconds"] = round(time.monotonic() - started, 1)
+            if state["bytes"] < SIZE:
+                time.sleep(0.75)  # Backpressure до завершения тела, не пауза после него.
         state["ok"] = state["bytes"] == SIZE and not reply.read(1)
+        state["error"] = None if state["ok"] else "BODY_SIZE"
     except Exception:
         state["error"] = "STREAM_FAILED"
     finally:
+        if started is not None:
+            state["seconds"] = round(time.monotonic() - started, 1)
+        if reply:
+            reply.close()
         if sock:
             sock.close()
         state["done"].set()
 
-
 def start_stream(port, password, url, agent):
     state = {"bytes": 0, "ok": False, "seconds": 0, "http": 0, "error": None,
+             "length": None, "range": None, "identity": None,
              "receiving": threading.Event(), "done": threading.Event()}
     threading.Thread(target=stream, args=(port, password, url, agent, state), daemon=True).start()
     return state
 
-
 def public_stream(state):
-    return {key: state[key] for key in ("bytes", "ok", "seconds", "http", "error")}
-
+    keys = ("bytes", "ok", "seconds", "http", "error", "length", "range", "identity")
+    return {key: state.get(key) for key in keys}
 
 def pin_value(paths):
     with sqlite3.connect(f"file:{paths.db_file}?mode=ro", uri=True) as db:
         row = db.execute("SELECT value FROM meta WHERE key='pin'").fetchone()
     value = json.loads(row[0]) if row and row[0] else None
-    if isinstance(value, dict):
-        value = {key: value.get(key) for key in ("tag", "since", "until")}
-        value["tag"] = str(value["tag"]).partition("-")[2]
-    return value
-
+    return ({"tag": str(value.get("tag")).partition("-")[2],
+             "since": value.get("since"), "until": value.get("until")}
+            if isinstance(value, dict) else value)
 
 def health():
     response = run(["xgw", "status", "--json"])
@@ -154,8 +161,6 @@ def health():
     ok &= reply.returncode == 0 and reply.stdout.isdigit() and 200 <= int(reply.stdout) < 400
     print("Рабочий on и HTTPS подтверждены" if ok else "Рабочий on или HTTPS не подтверждены")
     return 0 if ok else 3
-
-
 def main():
     os.umask(0o077)
     ROOT.mkdir(mode=0o700, exist_ok=True)
@@ -168,15 +173,8 @@ def main():
         print((ROOT / "summary.json").read_text())
         return 0
     if (ROOT / "summary.json").exists():
-        previous = json.loads((ROOT / "summary.json").read_text())
-        if previous.get("stage") in {
-            "before", "WAIT_FOR_PREVIOUS_GENERATION", "NO_WORKING_SINGBOX_ROUTE",
-            "BASELINE_STREAM_NOT_PROVEN",
-        } and previous.get("rotate_rc") is None:
-            (ROOT / f"preflight-{time.time_ns()}.json").write_text(json.dumps(previous))
-        else:
-            print("Результат уже есть: читайте report; новую смену поколения не запускайте")
-            return 3
+        print("Результат уже есть: читайте report; это последний повтор, новый start запрещён")
+        return 3
     from xgw import config
     from xgw.apply import singbox_process as processes
     from xgw.generator import builder, singbox
@@ -187,12 +185,11 @@ def main():
               "permissions": True, "old_retired": False, "status_gap_s": 0,
               "status_within_25": True,
               "settings_unchanged": None, "pin_unchanged": None}
+    result["max_processes"], result["permissions"] = process_count()
     save(result)
     paths = Paths(Path("/"))
     cfg, _ = config.load(paths.config_file)
     pin_before = pin_value(paths)
-    primary = len(sys.argv) > 1 and sys.argv[1] == "primary"
-    url = download_url(cfg.speed.url if primary else (cfg.speed.url_fallback or cfg.speed.url))
     routed = json.loads(paths.xray_config_file.read_text())
     password, _ = builder.probe_state(routed)
     before = processes.read(paths)
@@ -217,15 +214,33 @@ def main():
         save(result)
         return 3
     info, old_port = chosen
-    first = start_stream(info.probe_port, password, url, cfg.probe.user_agent)
-    deadline = time.monotonic() + 180
-    while not first["receiving"].is_set() and not first["done"].is_set():
-        if time.monotonic() >= deadline:
+    result["attempts"] = []
+    for label, raw in (("fallback", cfg.speed.url_fallback), ("primary", cfg.speed.url),
+                       ("youtube", cfg.speed.youtube_speed_url)):
+        try:
+            url = download_url(raw)
+        except ValueError:
+            continue
+        first = start_stream(info.probe_port, password, url, cfg.probe.user_agent)
+        deadline = time.monotonic() + 180
+        while not first["receiving"].is_set() and not first["done"].is_set():
+            if time.monotonic() >= deadline:
+                result.update(stage="BASELINE_WAIT_TIMEOUT", first=public_stream(first))
+                save(result)
+                return 3
+            time.sleep(0.2)
+        result["attempts"].append({"source": label, **public_stream(first)})
+        result["source"] = label
+        result["old_endpoint"] = first["receiving"].is_set() and established(old_port)
+        if result["old_endpoint"] and not first["done"].is_set():
             break
-        time.sleep(0.2)
-    result["old_endpoint"] = first["receiving"].is_set() and established(old_port)
-    if not result["old_endpoint"] or first["done"].is_set():
-        result.update(stage="BASELINE_STREAM_NOT_PROVEN", first=public_stream(first))
+        if first["bytes"] or not first["done"].is_set():
+            break  # Не перезапускать уже начавшееся тело/живой worker ради PASS.
+    else:
+        first = None
+    if first is None or not result["old_endpoint"] or first["done"].is_set():
+        result.update(stage="BASELINE_STREAM_NOT_PROVEN",
+                      first=public_stream(first) if first else None)
         save(result)
         return 3
     result["stage"] = "rotate"
@@ -250,15 +265,14 @@ def main():
                 result["new_endpoint"] = True
                 result["overlap"] |= (not first["done"].is_set() and established(old_port))
             current_status = paths.status_file.stat().st_mtime_ns
+            result["status_within_25"] &= time.time_ns() - old_status <= 25_000_000_000
             if current_status != old_status:
                 result["status_within_25"] &= current_status - old_status <= 25_000_000_000
                 result["status_gap_s"] = max(result["status_gap_s"],
                                               round((current_status - old_status) / 1e9, 1))
                 old_status = current_status
             state = processes.read(paths)
-            old_active = run([
-                "systemctl", "is-active", "--quiet", processes.unit(before["active"])])
-            result["old_retired"] = (not state["draining"] and old_active.returncode != 0
+            result["old_retired"] = (not state["draining"] and processes.stopped(before["active"])
                                      and state["active"] != before["active"])
             result["first"] = public_stream(first)
             result["second"] = public_stream(second) if second else None
@@ -280,7 +294,6 @@ def main():
                  and first["seconds"] >= 60 and second["seconds"] >= 60
                  and result["status_within_25"] and result["settings_unchanged"]
                  and result["permissions"] and result["max_processes"] == 2) else 3
-
 
 if __name__ == "__main__":
     sys.path.insert(0, "/opt/xgw/lib")
