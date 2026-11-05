@@ -200,6 +200,18 @@ def reap(core):
     return state
 
 
+def _history(state):
+    now = time.time()
+    items = [item for item in state.get("history") or []
+             if isinstance(item, dict) and now - float(item.get("ts") or 0) < 86400]
+    reasons = {}
+    for item in items:
+        for part in item.get("parts") or ["rotate"]:
+            reasons[part] = reasons.get(part, 0) + 1
+    return {"switches_24h": len(items), "switch_reasons_24h": reasons,
+            "last_switch_parts": (items[-1].get("parts") or ["rotate"]) if items else None}
+
+
 def summary(paths):
     state = read(paths)
     old = state["draining"]
@@ -210,4 +222,6 @@ def summary(paths):
         "process_limit": 2,
         # Права процесса действующего поколения проверены демоном до переключения (identity).
         "identity_ok": (state.get("identity") or {}).get("slot") == state["active"] or None,
+        # Смены поколения за сутки и что их вызвало (singbox_generation.changed_parts).
+        **_history(state),
     }

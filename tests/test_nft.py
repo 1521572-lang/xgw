@@ -1141,3 +1141,19 @@ def test_explicit_off_and_delete_remove_guard_without_touching_foreign_tables():
     nft.apply(rules, kernel)
     nft.delete(kernel)
     assert kernel.tables == {("inet", "foreign"): "keep"}
+
+
+def test_guard_lets_only_root_reach_the_os_connectivity_check():
+    """Значок «ограниченное подключение» (отчёт g1-c06): сокет проверки связности
+    NetworkManager привязан к WAN и уходит мимо перехвата. Барьер пропускает только root, только
+    TCP на порт проверки и только к её адресам — и до общего drop."""
+    cfg = _cfg()
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=(),
+                               conncheck=(("198.51.100.7", "198.51.100.8"), 80))
+    output = _chain(nft.render_guard(rules), "output")
+    rule = "meta skuid 0 ip daddr { 198.51.100.7, 198.51.100.8 } tcp dport 80 accept"
+    assert rule in output and output.index(rule) < output.index("counter drop")
+    plain, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    assert "skuid 0" not in nft.render_guard(plain)
+    off, _ = nft.build_rules(cfg, capture=False, time_uids=(), conncheck=(("198.51.100.7",), 80))
+    assert off.conncheck4 == ()

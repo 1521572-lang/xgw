@@ -56,7 +56,7 @@ from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
 from .model import ServerNode
-from .net import cmd, tun
+from .net import cmd, conncheck, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
 from .store import Store
@@ -745,6 +745,7 @@ class Daemon:
         self.next_refresh = 0.0
         self.next_scan = 0.0
         self.next_leak = 0.0
+        self.next_conncheck = 0.0  # адрес проверки связности NetworkManager (net/conncheck.py)
         self.next_all_dead = 0.0
         self.next_rescan = 0.0
         # Рейтинг (rating.py): итоги проверок по часам (отпечаток → {час: [удачи, сбои]}),
@@ -1632,6 +1633,11 @@ class Daemon:
                 self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
         self._downlinks = downlinks
 
+        if now >= self.next_conncheck and self.capture is not None:
+            self.next_conncheck = now + conncheck.REFRESH
+            threading.Thread(target=self._conncheck_refresh, name="xgw-conncheck",
+                             daemon=True).start()
+
         self.leak_fresh = False
         if not self.capture_active():
             self.leak = False
@@ -1755,6 +1761,20 @@ class Daemon:
             got / 1e6, self.cfg.watchdog.busy_window_s, tag,
         )
         return tag
+
+    def _conncheck_refresh(self) -> None:
+        """Адрес проверки связности NetworkManager → /run/xgw/conncheck.json (net/conncheck.py):
+        барьер пропускает этот запрос, и значок шлюза не пишет «ограниченное подключение».
+        Сменились адреса — сверка правил перезагрузит барьер."""
+        def resolve(host: str) -> list[str]:
+            return fetch.resolve_domain(host, list(self.cfg.dns.resolvers), mark=self.mark,
+                                        cancel=self._stop, public_only=True)
+
+        try:
+            if conncheck.refresh(self.paths, resolve):
+                self.log.info("адреса проверки связности NetworkManager обновлены")
+        except Exception as exc:  # значок — не повод мешать шагу демона
+            self.log.debug("адрес проверки связности не обновлён: %s", exc)
 
     def _check_e2e(self) -> bool:
         """Сквозная загрузка проверочного хоста через http-in с детектором «тишины».
@@ -2552,6 +2572,8 @@ class Daemon:
             if outcome.mode == "api":
                 assembly.result.config.clear()
                 assembly.result.config.update(job.generation.xray)
+                self.log.info("поколение sing-box сменено: изменились %s",
+                              ", ".join(job.generation.parts) or "только порты")
         else:
             outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
                                   singbox=assembly.singbox)

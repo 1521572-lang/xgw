@@ -99,6 +99,13 @@ def capture_for(cfg: Config, paths: Paths, **kwargs) -> Capture:
     return Capture(cfg, paths, **kwargs)
 
 
+def _conncheck(paths: Paths) -> tuple[tuple[str, ...], int]:
+    """Адреса проверки связности NetworkManager для исключения в барьере (net/conncheck.py)."""
+    from . import conncheck
+
+    return conncheck.read(paths)
+
+
 def _fp_peers(paths: Paths) -> tuple[str, ...]:
     """Серверы бесплатного пула, к которым сейчас есть поколения (freepool/backend.py)."""
     from ..freepool.backend import peer_elements
@@ -221,6 +228,7 @@ class Capture:
             ts_fallback=self.ts_fallback_marker.exists(),
             geoip=self.paths.xray_dir / "geoip.dat",
             fp_peers=_fp_peers(self.paths),
+            conncheck=_conncheck(self.paths),
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6

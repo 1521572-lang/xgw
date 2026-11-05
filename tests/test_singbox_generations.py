@@ -341,3 +341,33 @@ def test_failed_identity_aborts_candidate_and_marks_checked_generation(gateway, 
     prepared = g.prepare(w.core, w.old, w.xray)
     assert g.finish(w.core, w.applier, prepared).mode == "api"
     assert p.summary(w.paths)["identity_ok"] is True
+
+
+def test_generation_switch_reasons_are_counted():
+    """«Карусель» из отчёта g1-c06: что изменилось в конфиге sing-box, ради чего новое
+    поколение, — в состоянии поколений и в `xgw singbox status` за сутки."""
+    old = {"inbounds": [{"tag": "a"}], "outbounds": [{"tag": "o", "server": "x"}],
+           "dns": {"servers": [1]}, "route": {"rules": [1]}}
+    assert g.changed_parts(old, copy.deepcopy(old)) == ()
+    dns = copy.deepcopy(old)
+    dns["dns"] = {"servers": [2]}
+    assert g.changed_parts(old, dns) == ("dns_hosts",)
+    settings = copy.deepcopy(old)
+    settings["outbounds"][0]["server"] = "y"
+    assert g.changed_parts(old, settings) == ("server_settings",)
+    more = copy.deepcopy(old)
+    more["inbounds"].append({"tag": "b"})
+    assert g.changed_parts(old, more) == ("servers",)
+
+
+def test_switch_history_in_summary(gateway):
+    w = gateway
+    changed = copy.deepcopy(w.old)
+    changed["dns"] = {"servers": [{"type": "hosts", "predefined": {"h": ["192.0.2.9"]}}]}
+    prepared = g.prepare(w.core, changed, w.xray)
+    assert prepared.parts == ("dns_hosts",)
+    assert g.finish(w.core, w.applier, prepared).mode == "api"
+    summary = p.summary(w.paths)
+    assert summary["switches_24h"] == 1
+    assert summary["switch_reasons_24h"] == {"dns_hosts": 1}
+    assert summary["last_switch_parts"] == ["dns_hosts"]

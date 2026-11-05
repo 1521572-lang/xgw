@@ -32,6 +32,36 @@ class Prepared:
     config: dict
     xray: dict
     previous_xray: dict
+    parts: tuple[str, ...] = ()
+
+
+HISTORY_SECONDS = 86400
+
+
+def _by_tag(config, key):
+    return {str(item.get("tag")): item for item in config.get(key) or [] if isinstance(item, dict)}
+
+
+def changed_parts(old, new):
+    """Что изменилось в конфиге sing-box, ради чего нужно новое поколение («карусель» из
+    отчёта g1-c06): servers — состав серверов или вариантов; server_settings — параметры
+    серверов; dns_hosts — адреса доменов серверов; endpoints, route — прочее. Порты мостов
+    и порт Clash API подбирает remap — их смена не причина. Пусто — конфиг тот же
+    (штатный rotate)."""
+    old, new = old or {}, new or {}
+    parts = []
+    old_in, new_in = _by_tag(old, "inbounds"), _by_tag(new, "inbounds")
+    old_out, new_out = _by_tag(old, "outbounds"), _by_tag(new, "outbounds")
+    if set(old_in) != set(new_in) or set(old_out) != set(new_out):
+        parts.append("servers")
+    elif any(old_out[tag] != new_out[tag] for tag in new_out):
+        parts.append("server_settings")
+    if old.get("dns") != new.get("dns"):
+        parts.append("dns_hosts")
+    for key in ("endpoints", "route"):
+        if old.get(key) != new.get(key):
+            parts.append(key)
+    return tuple(parts)
 
 
 def needed(core, config):
@@ -116,13 +146,15 @@ def prepare(core, config, xray):
         if core.validator(candidate)[0] is not True:
             raise ValueError("новый sing-box не прошёл check")
         slot = next(slot for slot in processes.SLOTS if slot != state["active"])
-        prepared = Prepared(secrets.token_hex(16), slot, old, candidate, routed, previous_xray)
+        prepared = Prepared(secrets.token_hex(16), slot, old, candidate, routed, previous_xray,
+                            changed_parts(old, config))
         processes.config_write(core.paths, slot, candidate)
         atomic_write_json(core.paths.singbox_last_good_file, old)
         state["pending"] = {"slot": slot, "token": prepared.token,
                             "owner": os.getpid(), "phase": "preparing",
                             "owner_start": processes.owner_start(os.getpid()),
-                            "xray_sha": digest(routed), "old_ports": sorted(processes.ports(old))}
+                            "xray_sha": digest(routed), "old_ports": sorted(processes.ports(old)),
+                            "parts": list(prepared.parts)}
         processes.write(core.paths, state)
     try:
         processes.start(core, slot, candidate)
@@ -198,6 +230,11 @@ def _promote(core, state, config):
     atomic_write_json(core.paths.singbox_config_file, config)
     os.chown(core.paths.singbox_config_file, 0, core.paths.singbox_config_dir.stat().st_gid)
     state["identity"] = {"slot": pending["slot"], "ts": time.time()}
+    now = time.time()
+    history = [item for item in state.get("history") or []
+               if isinstance(item, dict) and now - float(item.get("ts") or 0) < HISTORY_SECONDS]
+    history.append({"ts": now, "parts": list(pending.get("parts") or [])})
+    state["history"] = history[-200:]
     state.update(active=pending["slot"], pending=None,
                  draining={"slot": state["active"], "until": time.monotonic()
                            + processes.DRAIN_SECONDS, "ports": pending["old_ports"]})

@@ -184,6 +184,10 @@ class Rules:
     free_pool: bool = False
     fp_peers: tuple[str, ...] = ()
     singbox_uid: int | None = None
+    # Проверка связности NetworkManager (net/conncheck.py): её сокет привязан к WAN и
+    # уходит мимо перехвата; барьер пропускает только root к этим адресам и порту.
+    conncheck4: tuple[str, ...] = ()
+    conncheck_port: int = 80
 
     @property
     def ts4(self) -> bool:
@@ -274,6 +278,7 @@ def build_rules(
     time_uids: tuple[int, ...] | None = None,
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
     ts_fallback: bool = False, geoip: Path | None = None, fp_peers: tuple[str, ...] = (),
+    conncheck: tuple[tuple[str, ...], int] = ((), 80),
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
@@ -376,6 +381,8 @@ def build_rules(
             free_pool=cfg.free_pool.mode != "off",
             fp_peers=fp_peers if cfg.free_pool.mode != "off" else (),
             singbox_uid=singbox_user_uid(),
+            conncheck4=conncheck[0] if capture or blocked else (),
+            conncheck_port=conncheck[1],
         ),
         warnings,
     )
@@ -1101,6 +1108,9 @@ def render_guard(rules: Rules) -> str:
     for uid in rules.time_uids:
         output += [f"meta skuid {uid} udp dport 123 accept",
                    f"meta skuid {uid} tcp dport {NTS_KE_PORT} accept"]
+    if rules.conncheck4:
+        output.append("meta skuid 0 ip daddr { " + ", ".join(rules.conncheck4)
+                      + f" }} tcp dport {rules.conncheck_port} accept")
     output += ["counter drop"]
     ingress = []
     if rules.capture_lan or rules.block_lan:
