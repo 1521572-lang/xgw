@@ -130,3 +130,20 @@ def test_host_cache_addresses_expire_one_by_one(tmp_path):
     old = {"old.example.com": {"ips": ["198.51.100.1"], "ts": now[0]}}
     (tmp_path / "dns-cache.json").write_text(json.dumps(old), encoding="utf-8")
     assert cache.addresses() == {"old.example.com": ["198.51.100.1"]}
+
+
+def test_scan_body_window_retries_and_quota_across_restart(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "state.db"
+    store = Store(path)
+    store.conn.execute("INSERT INTO nodes (fingerprint,tag,source,name) VALUES ('a','t','s','x10')")
+    store.set_meta("quota", '{"s":{"total":10000}}')
+    with ThreadPoolExecutor(1) as worker:
+        for stamp, size in [(100, 1000), (101, 7), (86500, 0), (86500, 11)]:
+            worker.submit(store.record_scan_body, "t", size, "daemon", r"x(\d+)", stamp).result()
+    store.close()
+    store = Store(path)
+    assert store.scan_bodies_24h(86500) == {
+        "as_of": 86500, "bytes": 18, "attempts": 3, "quota_bytes": {"s": 180}}
+    store.close()

@@ -989,9 +989,10 @@ def test_when_nothing_answers_other_cores_and_transports_are_scanned_first(dual)
     (member,) = [info for info in dual.view() if info.role == "proxy"]
     nodes = {node.fingerprint: node for node in dual.inventory.nodes}
 
+    from xgw.daemon import _transport
+
     def kind(info):
-        transport = "udp" if nodes[info.fingerprint].protocol == "hysteria2" else "tcp"
-        return profiles.core_of(info.profile), transport
+        return profiles.core_of(info.profile), _transport(nodes[info.fingerprint])
 
     dual.machine.state = type(dual.machine.state)("ALL_DEAD")
     dual.scan_queue.clear()

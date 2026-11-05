@@ -209,6 +209,14 @@ def render_page(snapshot: dict | None, devices: list[dict], *, now: float | None
                 f"<p>Всего ~{_esc(budget.get('all_mb'))} МБ в сутки, "
                 f"~{_esc(budget.get('month_gb'))} ГБ в месяц.</p>"
             )
+        actual = budget.get("scan_actual_24h")
+        if actual is not None:
+            body = status.size_text(actual["bytes"])
+            parts.append(f"<p>Журнал сканов за 24 ч: {_esc(body)} тела, "
+                         f"попыток {_esc(actual['attempts'])}.</p>")
+            for name, size in actual["quota_bytes"].items():
+                quota = status.size_text(size)
+                parts.append(f"<p>«{_esc(name)}»: {_esc(quota)} квоты по множителям сканов.</p>")
         for warning in budget.get("warnings") or []:
             parts.append(f'<p class="note">{_esc(warning)}</p>')
     for name, quota in (snapshot.get("quota") or {}).items():
