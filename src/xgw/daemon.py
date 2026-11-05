@@ -51,6 +51,7 @@ from .freepool import stats as poolstats
 from .freepool import traffic
 from .freepool.pool import FreePool
 from .generator import builder
+from .generator import fragment as fragmenting
 from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
@@ -339,9 +340,7 @@ def _over_tcp(node: ServerNode) -> bool:
     sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
     if sockopt.get("dialerProxy"):
         return False
-    tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
-    alpn = tls.get("alpn")
-    return not (isinstance(alpn, list) and "h3" in alpn)
+    return not fragmenting.xhttp_h3(stream)  # правило выбора HTTP/3 самого Xray (T02)
 
 
 def _server_text(name: str, tag: str) -> str:

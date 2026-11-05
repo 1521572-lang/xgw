@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 
+from . import fragment as fragmenting
 from .builder import BALANCER_TAG
 
 TUN_TAG = "tun-in"
@@ -58,8 +59,18 @@ def _dialer(outbound: Mapping) -> str:
 
 
 def _strip_mark(outbound: dict) -> None:
+    """Метка шлюза телефону не нужна — и у основного канала, и у отдельных каналов загрузки
+    XHTTP (builder ставит её на них так же)."""
     stream = outbound.get("streamSettings")
-    sockopt = stream.get("sockopt") if isinstance(stream, dict) else None
+    if not isinstance(stream, dict):
+        return
+    for leg in fragmenting.download_legs(stream):
+        leg_sockopt = leg.get("sockopt")
+        if isinstance(leg_sockopt, dict):
+            leg_sockopt.pop("mark", None)
+            if not leg_sockopt:
+                del leg["sockopt"]
+    sockopt = stream.get("sockopt")
     if not isinstance(sockopt, dict):
         return
     sockopt.pop("mark", None)

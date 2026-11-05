@@ -344,6 +344,7 @@
   }
 
   const decimal = (value, digits = 1) => Number(value).toFixed(digits).replace(".", ",");
+  const size = (bytes) => (bytes >= 1e6 ? `${decimal(bytes / 1e6)} МБ` : `${decimal(bytes / 1e3)} КБ`);
 
   // Сводка разбора подписок, предупреждение о недоступном адресе проверки и расход
   // трафика на проверки серверов — в сутки и в месяц.
@@ -401,9 +402,9 @@
     const lines = forecast ? [lead] : [];
     const actual = budget.scan_actual_24h;
     if (actual) {
-      lines.push(el("span", { text: ` Журнал сканов за 24 ч: ${actual.bytes} Б тела, попыток ${actual.attempts}.` }));
+      lines.push(el("span", { text: ` Журнал сканов за 24 ч: ${size(actual.bytes)} тела, попыток ${actual.attempts}.` }));
       for (const [name, bytes] of Object.entries(actual.quota_bytes || {})) {
-        lines.push(el("span", { text: ` По множителям сканов «${name}» — ${bytes} Б квоты.` }));
+        lines.push(el("span", { text: ` По множителям сканов «${name}» — ${size(bytes)} квоты.` }));
       }
     }
     for (const [name, share] of Object.entries(budget.quota_share || {})) {

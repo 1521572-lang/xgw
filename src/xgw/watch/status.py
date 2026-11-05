@@ -1062,6 +1062,11 @@ def render_nodes(summary: dict) -> str:
     return text
 
 
+def size_text(value: float) -> str:
+    """Байты журнала сканов — в КБ или МБ (десятичных, как прогноз бюджета)."""
+    return f"{value / 1e6:.1f} МБ" if value >= 1e6 else f"{value / 1e3:.1f} КБ"
+
+
 def render_budget(budget: dict) -> list[str]:
     """Трафик проверок: в сутки и в месяц, из чего складывается и какая это доля квоты."""
     lines = [
@@ -1092,10 +1097,10 @@ def render_budget(budget: dict) -> list[str]:
             lines.append(f"  за месяц это ~{share:.1f} % квоты подписки «{name}»{spent}")
     actual = budget.get("scan_actual_24h")
     if actual is not None:
-        lines.append(f"  Журнал сканов за 24 ч: {actual['bytes']} Б тела, "
+        lines.append(f"  Журнал сканов за 24 ч: {size_text(actual['bytes'])} тела, "
                      f"попыток {actual['attempts']}")
         for name, size in actual["quota_bytes"].items():
-            lines.append(f"  «{name}»: {size} Б квоты по множителям сканов")
+            lines.append(f"  «{name}»: {size_text(size)} квоты по множителям сканов")
     lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
     return lines
 

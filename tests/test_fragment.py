@@ -399,3 +399,88 @@ def test_engine_keeps_fragmenting_from_the_applied_config(dpi):
     )
     assert fragmented_fingerprints(again.result.config, dpi.inventory.nodes) == {
         spare.fingerprint}
+
+
+def test_xhttp_http3_follows_the_xray_selector():
+    """T02: HTTP/3 у XHTTP — только TLS с alpn ровно ["h3"]; splithttp — тот же XHTTP."""
+    def stream(**extra):
+        return {"streamSettings": {"security": "tls", "network": "xhttp", **extra}}
+
+    assert fragmenting.eligible(stream(tlsSettings={"alpn": ["h2", "h3"]}))
+    assert fragmenting.eligible(stream(tlsSettings={"alpn": "h3,h2"}))
+    assert not fragmenting.eligible(stream(tlsSettings={"alpn": "h3"}))
+    assert not fragmenting.eligible(stream(network="splithttp", tlsSettings={"alpn": ["h3"]}))
+    assert fragmenting.eligible({"streamSettings": {
+        "security": "reality", "network": "xhttp", "tlsSettings": {"alpn": ["h3"]}}})
+    # У других транспортов alpn h3 не уводит соединение с TCP.
+    assert fragmenting.eligible({"streamSettings": {
+        "security": "tls", "network": "ws", "tlsSettings": {"alpn": ["h3"]}}})
+
+    from types import SimpleNamespace
+
+    from xgw.daemon import _over_tcp
+
+    def node(**extra):
+        return SimpleNamespace(protocol="vless", keep_tag="", outbound=stream(**extra))
+
+    assert _over_tcp(node(tlsSettings={"alpn": ["h2", "h3"]}))
+    assert not _over_tcp(node(network="splithttp", tlsSettings={"alpn": ["h3"]}))
+
+
+def _xhttp_with_download_legs():
+    def leg(address, **extra):
+        return {"address": address, "port": 443, "network": "xhttp", "security": "tls", **extra}
+
+    return {
+        "tag": "proxy-x", "protocol": "vless",
+        "streamSettings": {
+            "network": "xhttp", "security": "reality",
+            "xhttpSettings": {
+                "downloadSettings": leg("dl.example.com"),
+                "extra": {"downloadSettings": leg("dl2.example.com", security="reality")},
+            },
+            "splithttpSettings": {"downloadSettings": leg("127.0.0.1")},
+        },
+    }
+
+
+def test_fragment_profile_covers_separate_xhttp_download_legs():
+    """T01: отдельный канал загрузки XHTTP идёт через тот же профиль дробления и сохраняет
+    метку шлюза; мост к 127.0.0.1, QUIC-канал и чужая цепочка не трогаются."""
+    from xgw.generator.builder import _apply_sockopt
+
+    outbound = _xhttp_with_download_legs()
+    xhttp = outbound["streamSettings"]["xhttpSettings"]
+    h3 = {"address": "h3.example.com", "network": "xhttp", "security": "tls",
+          "tlsSettings": {"alpn": ["h3"]}}
+    chained = {"address": "c.example.com", "security": "tls",
+               "sockopt": {"dialerProxy": "chain-nl-1"}}
+    xhttp["downloadSettings"]["xhttpSettings"] = {"downloadSettings": h3}
+    xhttp["extra"]["downloadSettings"]["xhttpSettings"] = {"downloadSettings": chained}
+    _apply_sockopt(outbound, 255)
+    assert fragmenting.eligible(outbound)
+    fragmenting.enable(outbound, fragmenting.SPLIT_TAG)
+
+    stream = outbound["streamSettings"]
+    assert stream["sockopt"]["dialerProxy"] == fragmenting.SPLIT_TAG
+    for leg in (xhttp["downloadSettings"], xhttp["extra"]["downloadSettings"]):
+        assert leg["sockopt"] == {"mark": 255, "domainStrategy": "UseIPv4",
+                                  "dialerProxy": fragmenting.SPLIT_TAG}
+    assert "sockopt" not in stream["splithttpSettings"]["downloadSettings"]
+    assert "dialerProxy" not in h3["sockopt"]
+    assert chained["sockopt"]["dialerProxy"] == "chain-nl-1"
+    assert fragmenting.split_used(outbound) and not fragmenting.used(outbound)
+
+
+def test_phone_config_drops_gateway_mark_on_download_legs():
+    from xgw.generator import phone
+
+    outbound = _xhttp_with_download_legs()
+    from xgw.generator.builder import _apply_sockopt
+
+    _apply_sockopt(outbound, 255)
+    fragmenting.enable(outbound)
+    phone._strip_mark(outbound)
+    for leg in fragmenting.download_legs(outbound["streamSettings"]):
+        assert "mark" not in (leg.get("sockopt") or {})
+    assert outbound["streamSettings"]["sockopt"]["dialerProxy"] == fragmenting.TAG
