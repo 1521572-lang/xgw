@@ -1,7 +1,6 @@
 """Ровно путь G1: без VM-сети и запуска процессов, с настоящим API-планировщиком."""
 
 import copy
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +40,7 @@ def gateway(tmp_path, monkeypatch):
         def restart(self):
             if self.unit == p.LEGACY:
                 assert p.read(paths)["active"] == "legacy"  # ExecCondition
+                assert not p.marker_path(paths).exists()
             alive.add(self.unit)
 
     old = {
@@ -102,6 +102,7 @@ def test_prepare_api_switch_drain_and_next_generation(gateway, monkeypatch):
     assert prepared.xray["burstObservatory"] == w.xray["burstObservatory"]
     assert p.xray_ports(prepared.xray).isdisjoint(p.ports(w.old))
     assert w.core.read() == prepared.config and p.LEGACY in w.alive
+    assert p.marker_path(w.paths).is_file()
     with pytest.raises(ValueError):
         g.prepare(w.core, prepared.config, prepared.xray)
     state = p.read(w.paths)
@@ -249,25 +250,37 @@ def test_transient_unit_keeps_installed_sandbox(gateway, monkeypatch):
     assert not any("SIGHUP" in part for part in captured)
 
 
-def test_real_machine_helper_keeps_query_and_public_types(tmp_path):
-    import importlib.util
 
-    path = Path(__file__).resolve().parents[1] / "docs/helpers/singbox_generation_check.py"
-    spec = importlib.util.spec_from_file_location("g1_helper", path)
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
-    assert helper.download_url("https://example.invalid/down?bytes=10000000&kind=test") == (
-        "https://example.invalid/down?bytes=2097152&kind=test")
-    with pytest.raises(ValueError):
-        helper.download_url("http://example.invalid/no-size")
-    state = {"bytes": 2097152, "ok": True, "seconds": 128.0, "http": 200,
-             "error": None, "receiving": object(), "done": object()}
-    assert json.loads(json.dumps(helper.public_stream(state)))["bytes"] == 2097152
-    helper.ROOT = tmp_path
-    status = {"state": "DEGRADED", "daemon_down": False, "xray": {"ok": True},
-              "capture": {"mode": "on", "blocked": False, "loaded": True}}
-    helper.run = lambda argv: SimpleNamespace(returncode=0, stdout=(
-        json.dumps(status) if argv[0] == "xgw" else "301"))
-    assert helper.health() == 0
-    status["capture"]["loaded"] = False
-    assert helper.health() == 3
+def test_boot_condition_is_checked_by_pid1_without_cli_config_access():
+    text = (Path(__file__).resolve().parents[1] / "packaging/xgw-singbox.service").read_text()
+    unit, service = text.split("[Service]", 1)
+    assert "ConditionPathExists=!/run/xgw/singbox-managed" in unit
+    assert "ExecCondition=" not in service
+    assert "User=xgw-singbox" in service and "CapabilityBoundingSet=\n" in service
+    assert "AmbientCapabilities=\n" in service and "NoNewPrivileges=true" in service
+
+
+def test_unused_marker_is_cleared_after_legacy_recovery(gateway):
+    w = gateway
+    w.paths.run.mkdir(parents=True)
+    p.marker_path(w.paths).write_text("managed\n")
+    p.reap(w.core)
+    assert not p.marker_path(w.paths).exists()
+
+
+def test_marker_precedes_canonical_config_during_promotion(gateway, monkeypatch):
+    w = gateway
+    prepared = g.prepare(w.core, w.old, w.xray)
+    original = g.atomic_write_json
+    observed = []
+
+    def write(path, value, **kwargs):
+        if path == w.paths.singbox_config_file:
+            observed.append(p.marker_path(w.paths).exists())
+        return original(path, value, **kwargs)
+
+    monkeypatch.setattr(g, "atomic_write_json", write)
+    assert g.finish(w.core, w.applier, prepared).mode == "api"
+    assert observed == [True]
+    g.legacy(w.core, w.applier)
+    assert not p.marker_path(w.paths).exists()

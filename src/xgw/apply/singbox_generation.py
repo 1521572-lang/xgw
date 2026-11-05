@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from ..config import probe_bytes, service_ports
 from ..generator import singbox as sb
 from ..generator.diff import diff_configs
-from ..paths import atomic_write_json, file_lock
+from ..paths import atomic_write_json, atomic_write_text, file_lock
 from ..watch import checks
 from ..xraycore.service import SystemdXrayService
 from . import singbox_process as processes
@@ -191,6 +191,7 @@ def finish(core, applier, prepared):
 
 def _promote(core, state, config):
     pending = state["pending"]
+    atomic_write_text(processes.marker_path(core.paths), "managed\n", mode=0o644)
     atomic_write_json(core.paths.singbox_config_file, config)
     os.chown(core.paths.singbox_config_file, 0, core.paths.singbox_config_dir.stat().st_gid)
     state.update(active=pending["slot"], pending=None,
@@ -256,6 +257,7 @@ def legacy(core, applier):
                 service.stop()
         original = SystemdXrayService(processes.LEGACY)
         processes.write(core.paths, {"active": "legacy", "draining": None, "pending": None})
+        processes.marker_path(core.paths).unlink(missing_ok=True)
         original.restart()
         if core._wait_ready(core.read() or {}) is not None:
             raise ValueError("обычная служба sing-box не готова")

@@ -2,13 +2,14 @@
 # остаётся точкой входа всего трафика и ведёт к sing-box через его локальные входы на 127.0.0.1.
 # Конфиг пишет XGW; служба запускается, только когда он есть (серверов для sing-box нет — её нет).
 # Обычный процесс для первого запуска и boot. Рабочий состав меняется отдельным поколением;
-# ExecCondition не позволяет запустить дубликат при перезапуске демона во время drain.
+# Условие PID1 не позволяет запустить дубликат при перезапуске демона во время drain.
 [Unit]
 Description=XGW: sing-box
 Documentation=https://github.com/SagerNet/sing-box
 After=network.target nss-lookup.target xgw-net.service
 Wants=xgw-net.service
 ConditionPathExists=/etc/xgw/sing-box/config.json
+ConditionPathExists=!/run/xgw/singbox-managed
 
 [Service]
 User=xgw-singbox
@@ -17,7 +18,6 @@ Group=xgw-singbox
 AmbientCapabilities=
 CapabilityBoundingSet=
 NoNewPrivileges=true
-ExecCondition=/usr/local/bin/xgw singbox legacy-ready
 ExecStartPre=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json
 ExecStart=/opt/xgw/sing-box/sing-box --disable-color run -c /etc/xgw/sing-box/config.json
 ExecReload=/opt/xgw/sing-box/sing-box check -c /etc/xgw/sing-box/config.json

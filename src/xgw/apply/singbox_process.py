@@ -31,6 +31,10 @@ def state_path(paths):
     return paths.run / "singbox-generations.json"
 
 
+def marker_path(paths):
+    return paths.run / "singbox-managed"
+
+
 def read(paths):
     try:
         state = json.loads(state_path(paths).read_text(encoding="utf-8"))
@@ -132,6 +136,8 @@ def reap(core):
             if stopped(old["slot"]):
                 state["draining"] = None
                 write(core.paths, state)
+    if state["active"] == "legacy" and not state["pending"] and not state["draining"]:
+        marker_path(core.paths).unlink(missing_ok=True)
     return state
 
 

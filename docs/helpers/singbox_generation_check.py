@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-ROOT = Path("/run/xgw-g1")
+ROOT = Path("/run/xgw-g1-fix1")
 SIZE = 2 * 1024 * 1024
 
 
@@ -32,8 +32,11 @@ def run(argv, timeout=180):
 def download_url(url):
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query))
-    if parts.scheme != "https" or "bytes" not in query:
-        raise ValueError("для конечной загрузки нужен уже настроенный HTTPS speed.url с bytes")
+    if (parts.scheme != "https" or not parts.hostname
+            or parts.hostname.rstrip(".").lower() == "speed.cloudflare.com"):
+        raise ValueError("для конечной загрузки нужен настроенный HTTPS адрес")
+    if "bytes" not in query:
+        return url  # фиксированный файл: ниже запрашивается и проверяется Range
     query["bytes"] = str(SIZE)
     return urlunsplit(parts._replace(query=urlencode(query)))
 
@@ -82,11 +85,14 @@ def stream(proxy_port, password, url, agent, state):
         connection.sock = sock
         path = parts.path + ("?" + parts.query if parts.query else "")
         connection.request("GET", path, headers={
-            "User-Agent": agent, "Accept-Encoding": "identity", "Connection": "close"})
+            "User-Agent": agent, "Accept-Encoding": "identity", "Connection": "close",
+            "Range": f"bytes=0-{SIZE - 1}"})
         reply = connection.getresponse()
         state["http"] = reply.status
         length = reply.getheader("Content-Length")
-        if reply.status != 200 or (length is not None and int(length) != SIZE):
+        ranged = reply.getheader("Content-Range", "").startswith(f"bytes 0-{SIZE - 1}/")
+        if (reply.status not in (200, 206) or (reply.status == 206 and not ranged)
+                or (length is not None and int(length) != SIZE)):
             state["error"] = "BODY_OR_HTTP"
             return
         started = time.monotonic()
@@ -185,7 +191,8 @@ def main():
     paths = Paths(Path("/"))
     cfg, _ = config.load(paths.config_file)
     pin_before = pin_value(paths)
-    url = download_url(cfg.speed.url)
+    primary = len(sys.argv) > 1 and sys.argv[1] == "primary"
+    url = download_url(cfg.speed.url if primary else (cfg.speed.url_fallback or cfg.speed.url))
     routed = json.loads(paths.xray_config_file.read_text())
     password, _ = builder.probe_state(routed)
     before = processes.read(paths)

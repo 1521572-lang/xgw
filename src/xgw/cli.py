@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers.add_parser("unpin", parents=[common], help="автовыбор: снять ручной выбор сервера")
     generations = subparsers.add_parser("singbox", parents=[common], help="поколения sing-box")
-    generations.add_argument("operation", choices=("status", "rotate", "legacy", "legacy-ready"))
+    generations.add_argument("operation", choices=("status", "rotate", "legacy"))
     generations.add_argument(
         "--yes", action="store_true", help="согласиться на возврат обычной службы")
     prio = subparsers.add_parser(
@@ -326,8 +326,6 @@ def _cmd_singbox(args, cfg, paths, logger):
     from .apply import singbox_process as processes
     from .xraycore.service import XrayServiceError
 
-    if args.operation == "legacy-ready":
-        return 0 if processes.read(paths)["active"] == "legacy" else 1
     if not desktop.is_root():
         return _fail("нужен sudo xgw singbox " + args.operation)
     if args.operation == "status":
