@@ -1,6 +1,10 @@
 # Значок «ограниченное подключение» и причины смены поколений sing-box
 
-На машине по отчёту 869a7fb установлен dcde6b6. Новый код d05eeb63ddb73f6f543b6d36d567699612848a9d:
+На машине установлен dcde6b6: первый прогон этого ТЗ (отчёт 7949034, код d05eeb6) откатился
+по health сразу после установки. Причина в коде: демон записывал адреса проверки связности
+фоном, и до следующего шага сверка считала барьер незагруженным. Теперь файл адресов и
+загрузку правил делает основной поток в одном шаге; health после установки ждёт до 90 с.
+Новый код c7fc6e446f74f821afa50ccc079b80d838dd7278:
 
 - Значок сети шлюза. NetworkManager проверяет связность HTTP-запросом, привязанным к WAN;
   такой запрос уходит мимо перехвата, и барьер XGW с 02.11 его молча отбрасывал — значок
@@ -32,7 +36,7 @@ git status --short
 git switch freepool
 git fetch origin
 git merge --ff-only origin/freepool
-CODE=d05eeb63ddb73f6f543b6d36d567699612848a9d
+CODE=c7fc6e446f74f821afa50ccc079b80d838dd7278
 BASE=dcde6b645386cdec494064a3788411fb4becff3b
 TARGET="$HOME/xgw-ccgen-$CODE"
 PREV="$HOME/xgw-g1c06-$BASE"
@@ -60,12 +64,16 @@ BASE, если установка или on/HTTPS откажут. Нет сог�
 ```sh
 sudo sh -s -- "$TARGET" "$PREV" "$HELPER" <<'SH'
 umask 077
-d=/run/xgw-ccgen
+d=/run/xgw-ccgen2
 mkdir -m 700 "$d" || exit 3
 sh "$1/packaging/install.sh" --yes >"$d/install.log" 2>&1
 i=$?; echo "$i" >"$d/install.rc"
-python3 -I "$3" health >"$d/health.json" 2>&1
-h=$?; echo "$h" >"$d/health.rc"
+h=3; n=0
+while [ "$n" -lt 9 ]; do
+    if python3 -I "$3" health >"$d/health.json" 2>&1; then h=0; break; fi
+    n=$((n + 1)); sleep 10
+done
+echo "$h" >"$d/health.rc"
 if [ "$i" -ne 0 ] || [ "$h" -ne 0 ]; then
     sh "$2/packaging/install.sh" --yes >"$d/return.log" 2>&1
     echo "$?" >"$d/return.rc"
@@ -74,7 +82,7 @@ if [ "$i" -ne 0 ] || [ "$h" -ne 0 ]; then
 fi
 printf '%s\n' 'Проверьте сохранённые rc'
 SH
-sudo cat /run/xgw-ccgen/install.rc /run/xgw-ccgen/health.rc
+sudo cat /run/xgw-ccgen2/install.rc /run/xgw-ccgen2/health.rc
 ```
 
 Ожидается 0 и 0. После потери связи — проверить сохранённые rc, установку заново не начинать.
@@ -127,5 +135,5 @@ diag до/после (OK/WARN/FAIL); пул/pin/настройки/связь:
 Что осталось непроверенным; PASS/PARTIAL/INSTALL_NOT_RUN:
 ```
 
-Файл docs/TEST-REPORT-REAL-MACHINE-0.2.0-conncheck-generations-ДАТА.md. В freepool добавить,
+Файл docs/TEST-REPORT-REAL-MACHINE-0.2.0-conncheck-generations-r2-ДАТА.md. В freepool добавить,
 проверить git diff --cached --name-only и --check, закоммитить и отправить только этот отчёт.
