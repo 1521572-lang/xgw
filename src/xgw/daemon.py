@@ -317,8 +317,15 @@ UDP_PROTOCOLS = ("hysteria2", "hysteria", "tuic", "wireguard")
 
 
 def _transport(node) -> str:
-    """tcp или udp: по чему сервер связывается с клиентом (QUIC и WireGuard — по UDP)."""
-    return "udp" if node.protocol in UDP_PROTOCOLS else "tcp"
+    """tcp или udp: физический путь до сервера. UDP — протоколы на QUIC и WireGuard, а у Xray
+    ещё транспорт mKCP, QUIC и XHTTP по HTTP/3 (fragment.over_udp, правило самого Xray). Одно
+    правило для выбора запасного «по другому пути» (_alternatives) и прямой TCP-проверки
+    (_over_tcp): раньше первое смотрело только на протокол, и VLESS по mKCP или XHTTP-h3
+    считался TCP, а второе — нет (C07 кросс-аудита 4cc96b9)."""
+    if node.protocol in UDP_PROTOCOLS:
+        return "udp"
+    stream = node.outbound.get("streamSettings") if node.outbound else None
+    return "udp" if isinstance(stream, dict) and fragmenting.over_udp(stream) else "tcp"
 
 
 def _ipv4(text: str) -> bool:
@@ -329,18 +336,17 @@ def _ipv4(text: str) -> bool:
 
 
 def _over_tcp(node: ServerNode) -> bool:
-    """Сервер работает поверх TCP и напрямую (не цепочкой через другой сервер)."""
-    if node.protocol not in TCP_PROTOCOLS or node.keep_tag:
+    """Сервер работает поверх TCP и напрямую (не цепочкой через другой сервер): путь по
+    _transport — TCP, а протокол и транспорт из известных TCP-шных."""
+    if node.protocol not in TCP_PROTOCOLS or node.keep_tag or _transport(node) != "tcp":
         return False
     stream = node.outbound.get("streamSettings") if node.outbound else None
     if not isinstance(stream, dict):
         return True  # только sing-box (AnyTLS) или без streamSettings — обычный TCP
-    if str(stream.get("network") or "tcp") not in TCP_NETWORKS:
+    if str(stream.get("network") or "tcp").lower() not in TCP_NETWORKS:
         return False
     sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
-    if sockopt.get("dialerProxy"):
-        return False
-    return not fragmenting.xhttp_h3(stream)  # правило выбора HTTP/3 самого Xray (T02)
+    return not sockopt.get("dialerProxy")
 
 
 def _server_text(name: str, tag: str) -> str:
