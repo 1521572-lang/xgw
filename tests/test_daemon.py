@@ -922,6 +922,22 @@ def guarded(tmp_path, monkeypatch):
     instance.store.close()
 
 
+def test_bootstrap_checks_capture_before_fetch(guarded, monkeypatch):
+    daemon, capture = guarded
+    daemon.paths.xray_config_file.write_bytes(b"\xff")
+    capture.is_loaded = False
+    daemon.next_refresh = 0
+    attempts = []
+
+    def refresh(*args, **kwargs):
+        attempts.append(capture.is_loaded)
+
+    monkeypatch.setattr(daemon, "_refresh", refresh)
+    daemon.tick()
+    assert attempts == [True]
+    assert daemon.status()["capture"]["loaded"] is True
+
+
 def test_daemon_reloads_missing_rules(guarded):
     """Чужой flush ruleset или перезапуск nftables: правила пропали — демон их возвращает."""
     daemon, capture = guarded

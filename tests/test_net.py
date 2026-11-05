@@ -365,17 +365,16 @@ def test_enable_refuses_without_applied_tproxy_inbound(gateway):
 
 
 def test_capture_refuses_when_applied_config_is_missing_or_broken(gateway):
-    """Файла нет или он битый — это тоже «Xray ещё не с inbound'ом перехвата». Рабочего
-    конфига нет вовсе (первая установка, подписки ещё нет) — VPN ещё нечем включать, и сеть
-    идёт напрямую даже при hold = "block"; конфиг есть, но без inbound'а — blocked."""
-    for text, mode in ((None, "off"), ("{не json", "off"), ('{"inbounds": "нет"}', "blocked")):
-        if text is None:
-            gateway.paths.xray_config_file.unlink()
+    for data in (None, b"{", b"\xff", b'{"inbounds":"bad"}'):
+        path = gateway.paths.xray_config_file
+        if data is None:
+            path.unlink()
         else:
-            gateway.paths.xray_config_file.write_text(text, encoding="utf-8")
+            path.write_bytes(data)
         assert gateway.inbound_problem()
-        assert gateway.up() == mode and gateway.held
-        assert gateway.effective_mode() == mode
+        assert gateway.up() == "blocked" and gateway.held
+        assert gateway.effective_mode() == "blocked"
+        assert gateway.guard_loaded() and gateway.loaded()
     # Другой порт перехвата — это уже не наш inbound.
     fakexray.write(
         gateway.paths, {"inbounds": [{"tag": "tproxy-in", "protocol": "tunnel", "port": 1234}]}

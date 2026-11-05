@@ -337,7 +337,7 @@ class Capture:
         """Применённый конфиг Xray — тот, с которым ядро запущено или запустится."""
         try:
             config = json.loads(self.paths.xray_config_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         return config if isinstance(config, dict) else None
 
@@ -390,14 +390,8 @@ class Capture:
         return self.hold_mode() if mode == "on" and self.inbound_problem() else mode
 
     def hold_mode(self) -> str:
-        """Чем заменить «on», пока перехват включить нельзя. Рабочего конфига Xray нет вовсе
-        (первая установка, подписки ещё нет) — VPN ещё нечем включать, и закрыть сеть значило
-        бы оставить машину без интернета, пока человек ищет подписку: тогда «off» и при
-        hold = "block". Конфиг есть, но без нужного inbound'а — это минуты до перезапуска
-        Xray, и тогда hold решает."""
-        if self.cfg.capture.hold_blocks and self._applied() is not None:
-            return "blocked"
-        return "off"
+        """Политика ожидания действует и до первого пригодного конфига Xray."""
+        return "blocked" if self.cfg.capture.hold_blocks else "off"
 
     def _containers_tun(self, rules: nft.Rules) -> bool:
         """Интерфейс TUN нужен контейнерам: их перехват включён, и применённый конфиг Xray

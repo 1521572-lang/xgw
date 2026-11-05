@@ -451,7 +451,7 @@ def devices_down(paths: Paths) -> frozenset[str]:
 def read_json(path: Path) -> dict | None:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return loaded if isinstance(loaded, dict) else None
 

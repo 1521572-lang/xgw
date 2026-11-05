@@ -338,6 +338,7 @@ class Installer:
         self._singbox_migration_complete = False
         self._daemon_paused = False
         self._capture_initial_on = False
+        self._capture_initial_hold = False
         self._preserve_wan = False
 
     # --- что известно о машине --------------------------------------------------
@@ -558,8 +559,10 @@ class Installer:
                 )
             if not engine.has_sources(cfg):
                 lines.append(
-                    "  • подписок пока нет: VPN не включится, пока вы не добавите подписку "
-                    "в панели и не нажмёте кнопку — до этого интернет работает напрямую"
+                    "  • подписок пока нет: добавьте подписку в локальной панели. "
+                    + ("Пока нет рабочего конфига, обычный выход в интернет закрыт."
+                       if self.capture.effective_mode() == "blocked"
+                       else "Доступ к сети зависит от выбранного режима перехвата.")
                 )
         if sleep.wanted(cfg):
             lines.append("  • сон: sleep, suspend, hibernate и hybrid-sleep будут замаскированы")
@@ -615,6 +618,10 @@ class Installer:
         self._capture_initial_on = (
             self.capture.capturing and self.capture.mode() == "on"
             and (reinstall or (self.paths.systemd_dir / "xgw.service").exists())
+        )
+        self._capture_initial_hold = (
+            self._capture_initial_on and self.capture.effective_mode() == "blocked"
+            and self.capture.loaded() is True
         )
         self.paths.ensure()
         self.journal.setdefault("started", time.time())
@@ -1258,15 +1265,16 @@ class Installer:
                 time.sleep(0.5)
 
     def _capture(self, xray_ok: bool) -> None:
-        """Правила сети. Перехват включается, только когда Xray отвечает: иначе
-        fail-closed оставил бы машину без интернета сразу после установки."""
+        """Сохранить выбор при обновлении, применить политику ожидания при первой установке."""
         capture = self.capture
         if capture.choice() is not None or not capture.capturing:
             capture.up()  # повторная установка: выбор пользователя (enable/disable) в силе
         elif xray_ok:
             capture.enable()
-        elif self._capture_initial_on:
+        elif self._capture_initial_on and not self._capture_initial_hold:
             raise InstallError("Xray не готов после обновления; выбранный VPN не снимается")
+        elif capture.effective_mode() == "blocked":
+            capture.enable()  # первая установка: после появления inbound демон включит перехват
         elif not engine.has_sources(self.cfg):
             capture.disable()
             self._step("подписок пока нет — VPN не включён, интернет работает напрямую")
@@ -1306,16 +1314,24 @@ class Installer:
         mode = capture.mode()
         if self._capture_initial_on and mode != "on":
             raise InstallError("после обновления выбранный ранее VPN снят; установка не завершена")
-        if mode == "on" and (not xray_ok or capture.effective_mode() != "on"):
+        initial_hold = (
+            mode == "on" and not xray_ok and (not self._capture_initial_on
+                                              or self._capture_initial_hold)
+            and capture.effective_mode() == "blocked"
+        )
+        if mode == "on" and not initial_hold and (not xray_ok or capture.effective_mode() != "on"):
             raise InstallError("перехват не готов после установки; выбранный режим сохранён, "
                                "проверьте Xray и inbound, sudo xgw diag")
         if capture.loaded() is not True:
             raise InstallError("правила после установки не проверены; установка не завершена")
         if mode == "on" and capture.guard_loaded() is not True:
             raise InstallError("барьер после установки не проверен; установка не завершена")
-        self._step("режим и правила после установки проверены: "
-                   + ("VPN включён, барьер загружен" if mode == "on"
-                      else "перехват снят по выбору владельца"))
+        if initial_hold:
+            self._step("проверено: барьер загружен, выход закрыт до появления конфига Xray")
+        else:
+            self._step("режим и правила после установки проверены: "
+                       + ("VPN включён, барьер загружен" if mode == "on"
+                          else "перехват снят по выбору владельца"))
 
     def _token(self) -> None:
         status_page.ensure_token(self.cfg, self.paths)
@@ -1427,6 +1443,8 @@ class Installer:
         sources = engine.has_sources(self.cfg)
         if xray_ok:
             self.out("XGW установлен.")
+        elif self.capture.effective_mode() == "blocked":
+            self.out("XGW установлен. До появления рабочего конфига Xray выход в интернет закрыт.")
         elif sources:
             self.out("XGW установлен, но Xray пока не запущен.")
         else:
@@ -1446,7 +1464,10 @@ class Installer:
                     "щелчок)."
                 )
             if not sources:
-                self.out("  Вставьте в панели адрес подписки и нажмите кнопку включения.")
+                if self.capture.effective_mode() == "blocked":
+                    self.out("  Добавьте подписку. После применения конфига VPN включится.")
+                else:
+                    self.out("  Вставьте в панели адрес подписки и нажмите кнопку включения.")
             self.out(
                 "  Дальше панель открывается ярлыком «XGW» в меню приложений. Если браузер "
                 "забудет вход — правая кнопка по ярлыку, «Войти заново» (спросит пароль); "

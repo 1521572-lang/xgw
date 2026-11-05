@@ -839,23 +839,23 @@ def test_install_with_the_panel_switched_off(box):
     assert "launcher" not in Journal(box.paths.journal_file)
 
 
-def test_install_without_a_subscription_leaves_vpn_off_and_points_to_the_panel(box):
+def test_install_without_a_subscription_holds_and_points_to_the_panel(box):
     from xgw.net.capture import Capture
 
     box.cfg.subscriptions = []
+    box.paths.xray_config_file.unlink()
     applied: list[bool] = []
     installer = box.installer()
     installer.first_apply = lambda: applied.append(True) or True
     assert installer.run(assume_yes=True) == 0, box.text()
     text = box.text()
-    assert applied == []  # собирать конфиг Xray пока не из чего
-    assert "подписок пока нет: VPN не включится" in text  # предупреждено ещё в плане
-    assert "XGW установлен. Подписок пока нет — VPN выключен" in text
-    assert "Вставьте в панели адрес подписки и нажмите кнопку включения" in text
-    assert "Предупреждений" not in text  # это ожидаемое состояние, а не сбой
+    assert applied == []  # собирать конфиг пока не из чего
+    assert "обычный выход в интернет закрыт" in text
+    assert "После применения конфига VPN включится" in text
     capture = Capture(box.cfg, box.paths, runner=box.system, proc_sys=box.proc)
-    assert capture.choice() is False and capture.mode() == "off"
-    assert "tproxy" not in box.system.kernel.table and "masquerade" in box.system.kernel.table
+    assert capture.choice() is True and capture.effective_mode() == "blocked"
+    assert capture.loaded() and capture.guard_loaded()
+    assert box.install() == 0 and capture.effective_mode() == "blocked"
     assert box.system.units["xgw.service"]["active"]
 
 

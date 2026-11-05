@@ -1354,6 +1354,10 @@ class Daemon:
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
         if applied is None:
+            # Блокировку ставим до ожидания сети даже на первом шаге и при повреждении
+            # конфига. Состояние процесса Xray по одному файлу определить нельзя.
+            if self.cfg.capture.hold_blocks:
+                self._guard_capture(self.xray_down_since is None, now)
             # Первый запуск: рабочего конфига ещё нет — собрать и запустить Xray.
             if now >= self.next_refresh or refresh_asked or self._rebuild_asked:
                 self._refresh(now, via_xray=False, urgent=True, background=False)

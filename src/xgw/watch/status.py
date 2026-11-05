@@ -792,7 +792,7 @@ def _tier(cfg: Config, members: list[dict]) -> str | None:
 def _load_json_file(path: Path) -> dict | None:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return loaded if isinstance(loaded, dict) else None
 
