@@ -2953,10 +2953,13 @@ class Daemon:
         """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
         целиком: по итогу решается, выучен ли профиль, а случайная часть файла короче порога
         «заморозки» дала бы OK и выучила бы негодный профиль (T05 кросс-аудита 4cc96b9)."""
-        return scan.scan_node(
+        result = scan.scan_node(
             info, self.cfg, probe_pass=password, url=url, cancel=self._stop,
             random_size=info.fingerprint not in self._profile_trial,
         )
+        self.store.record_scan_body(info.tag, result.bytes_read, "daemon",
+                                    self.cfg.filters.multiplier_regex, self.wall())
+        return result
 
     def _rotate(self, view: list[NodeInfo], observatory: dict, state: State, now: float) -> bool:
         """Меняет участников, мёртвых дольше rotate_after_min, на проверенные запасные;

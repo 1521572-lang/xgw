@@ -168,7 +168,11 @@ def http_get_via_proxy(
             )
         if rtt and parts.scheme == "https" and result.ok and result.reusable:
             head = _request("HEAD", path, {"Host": _host_header(host, port, 443)}, user_agent)
-            result.rtt_ms = _head_rtt(sock, head, silence, deadline, cancel)
+            try:
+                result.rtt_ms = _head_rtt(sock, head, silence, deadline, cancel)
+            except fetch.Cancelled:
+                return DownloadResult(ok=False, kind="cancelled", downloaded=result.downloaded,
+                                      error="проверка прервана", status=result.status)
         return result
     except fetch.Cancelled:
         return DownloadResult(
@@ -317,6 +321,10 @@ def _read_response(
             downloaded += len(data)
             if len(body) < keep_body:
                 body += data[: keep_body - len(body)]
+    except fetch.Cancelled:
+        return DownloadResult(ok=False, downloaded=downloaded, kind="cancelled", status=status,
+                              body=body, error="проверка прервана",
+                              body_seconds=time.monotonic() - started)
     except OSError as exc:  # RST посреди тела: не «не подключился» — код и байты сохраняются
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="reset", status=status, body=body,

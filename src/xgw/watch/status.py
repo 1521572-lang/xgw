@@ -440,6 +440,7 @@ def collect_status(
     names: dict[str, str] = {}
     origins: dict[str, str] = {}
     sub_errors: dict = {}
+    scan_actual = None
     scans: dict[str, dict] = {}
     quotas: dict[str, dict[str, int]] = {}
     events: list[dict] = []
@@ -474,6 +475,7 @@ def collect_status(
             rtts = _load_json(store.get_meta("rtt")) or {}
             scores = _load_json(store.get_meta("rating")) or {}
             events = store.recent_events(10)
+            scan_actual = store.scan_bodies_24h(now)
         finally:
             store.close()
     except Exception:  # статус показываем и без базы
@@ -677,7 +679,7 @@ def collect_status(
         "budget": budget_summary(
             cfg, budget, quotas, len(members), len(plan.full) + len(plan.cheap), spend,
             cheap=len(plan.cheap),
-        ),
+        ) | {"scan_actual_24h": scan_actual},
         # Сводка разбора подписок: сколько серверов отброшено и сколько дублей схлопнуто.
         "nodes": summary,
         "probe_target": probe_target,
@@ -1087,7 +1089,13 @@ def render_budget(budget: dict) -> list[str]:
         for name, share in (budget.get("quota_share") or {}).items():
             daily = (budget.get("quota_mb") or {}).get(name)
             spent = f" (~{daily:.0f} МБ квоты в сутки с множителями)" if daily else ""
-            lines.append(f"  за месяц это ~{share:.0f} % квоты подписки «{name}»{spent}")
+            lines.append(f"  за месяц это ~{share:.1f} % квоты подписки «{name}»{spent}")
+    actual = budget.get("scan_actual_24h")
+    if actual is not None:
+        lines.append(f"  Журнал сканов за 24 ч: {actual['bytes']} Б тела, "
+                     f"попыток {actual['attempts']}")
+        for name, size in actual["quota_bytes"].items():
+            lines.append(f"  «{name}»: {size} Б квоты по множителям сканов")
     lines.extend(f"  ! {warning}" for warning in budget.get("warnings") or [])
     return lines
 

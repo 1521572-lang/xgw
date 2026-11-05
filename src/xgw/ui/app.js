@@ -388,7 +388,8 @@
 
     const budget = s.budget || {};
     const note = $("budget-note");
-    note.hidden = !(budget.all_mb && (budget.members || budget.spares));
+    const forecast = budget.all_mb && (budget.members || budget.spares);
+    note.hidden = !(forecast || budget.scan_actual_24h?.attempts);
     if (note.hidden) return;
     const perDay = budget.all_mb >= 1000 ? `${decimal(budget.all_mb / 1000, 2)} ГБ` : `${Math.round(budget.all_mb)} МБ`;
     const parts = [`проба ${decimal(budget.probe_bytes / 1000)} КБ × ${budget.members} в работе каждые ${budget.interval_s} с`];
@@ -397,12 +398,22 @@
     if (budget.cheap) parts.push(`из них ${budget.cheap} лимитированных — коротким запросом`);
     const lead = el("span", {}, "Проверки серверов расходуют около ", el("b", { text: `${perDay} в сутки` }),
       " и ", el("b", { text: `${decimal(budget.month_gb)} ГБ в месяц` }), ` (${parts.join(", ")}).`);
-    const lines = [lead];
+    const lines = forecast ? [lead] : [];
+    const actual = budget.scan_actual_24h;
+    if (actual) {
+      lines.push(el("span", { text: ` Журнал сканов за 24 ч: ${actual.bytes} Б тела, попыток ${actual.attempts}.` }));
+      for (const [name, bytes] of Object.entries(actual.quota_bytes || {})) {
+        lines.push(el("span", { text: ` По множителям сканов «${name}» — ${bytes} Б квоты.` }));
+      }
+    }
     for (const [name, share] of Object.entries(budget.quota_share || {})) {
       // Доля квоты — с множителями серверов: проба через x10 тратит вдесятеро больше.
-      const exact = share < 1 ? "меньше 1" : `около ${Math.round(share)}`;
-      lines.push(el("span", { text: ` За месяц это ${exact} % трафика подписки «${name}» (с учётом множителей серверов).` }));
+      const exact = decimal(share);
+      const daily = budget.quota_mb?.[name];
+      const amount = daily == null ? "" : `${decimal(daily)} МБ квоты/сут, `;
+      lines.push(el("span", { text: ` Прогноз для «${name}» — ${amount}${exact} % полной квоты за 30 дней.` }));
     }
+    for (const warning of budget.warnings || []) lines.push(el("span", { text: " " + warning }));
     note.classList.toggle("over", Boolean(budget.over));
     if (budget.over) {
       lines.push(el("span", { text: ` Это больше лимита ${budget.limit_mb} МБ в сутки (без сквозной проверки — ${Math.round(budget.total_mb)} МБ): `

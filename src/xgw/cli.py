@@ -601,6 +601,8 @@ def _cmd_probe(args, cfg: config.Config, paths: Paths, logger) -> int:
     with _store(paths) as store:
         for info in view:
             result = scan.scan_node(info, cfg, probe_pass=password)
+            store.record_scan_body(info.tag, result.bytes_read, "cli",
+                                   cfg.filters.multiplier_regex, time.time())
             store.save_scan(
                 info.probe_tag, result.verdict, result.bytes_read, result.seconds, result.error
             )

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import cost
 from .paths import atomic_write_bytes, atomic_write_json
 
 SCHEMA = """
@@ -38,6 +41,11 @@ CREATE TABLE IF NOT EXISTS scans (
     error TEXT,
     ts REAL
 );
+CREATE TABLE IF NOT EXISTS scan_bodies (
+    ts REAL NOT NULL, origin TEXT NOT NULL, bytes INTEGER NOT NULL,
+    source TEXT, quota_bytes INTEGER
+);
+CREATE INDEX IF NOT EXISTS scan_bodies_ts ON scan_bodies(ts);
 CREATE TABLE IF NOT EXISTS usage (
     day TEXT,
     kind TEXT,
@@ -53,6 +61,7 @@ CREATE TABLE IF NOT EXISTS usage (
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.conn = sqlite3.connect(path, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -117,6 +126,37 @@ class Store:
             "SELECT ts FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)
         ).fetchone()
         return float(row["ts"]) if row else None
+
+    def record_scan_body(
+        self, tag: str, size: int, origin: str, pattern: str | None, ts: float,
+    ) -> None:
+        """Одна завершившаяся попытка, включая неполное тело. Диагностика демона многопоточна."""
+        try:
+            with closing(sqlite3.connect(self.path, timeout=0.25)) as db, db:
+                db.execute("DELETE FROM scan_bodies WHERE ts <= ?", (ts - 86400,))
+                rows = db.execute("SELECT source, name FROM nodes WHERE tag=? LIMIT 2",
+                                  (tag,)).fetchall()
+                source, quota_bytes = None, None
+                if len(rows) == 1:
+                    source, name = rows[0]
+                    quota = db.execute("SELECT value FROM meta WHERE key='quota'").fetchone()
+                    try:
+                        if quota and source in cost.limited_sources(json.loads(quota[0])):
+                            quota_bytes = round(size * cost.multiplier(name or "", pattern))
+                    except (ValueError, TypeError, AttributeError, OverflowError):
+                        quota_bytes = None  # Сами байты известны и при неполных метаданных.
+                db.execute("INSERT INTO scan_bodies VALUES (?, ?, ?, ?, ?)",
+                           (ts, origin, size, source, quota_bytes))
+        except sqlite3.Error:
+            logging.getLogger(__name__).warning("Не удалось записать расход скана в журнал")
+
+    def scan_bodies_24h(self, now: float) -> dict:
+        rows = self.conn.execute(
+            "SELECT source, SUM(bytes), SUM(quota_bytes), COUNT(*) FROM scan_bodies "
+            "WHERE ts > ? AND ts <= ? GROUP BY source", (now - 86400, now),
+        ).fetchall()
+        return {"as_of": now, "bytes": sum(r[1] for r in rows), "attempts": sum(r[3] for r in rows),
+                "quota_bytes": {r[0]: r[2] for r in rows if r[0] and r[2] is not None}}
 
     def save_scan(
         self,
