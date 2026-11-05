@@ -669,11 +669,11 @@
 
   // Иконка у скорости (пожелание заказчика 24.10.2026): замер только этого сервера, без общего
   // замера всех. Крутится, пока сервер ждёт замера или замеряется. У x100 замеров нет вовсе.
+  // Не зависит от основного сервера и плановых замеров (05.11.2026: при выключенных иконка
+  // пропадала): ручной замер — просьба человека, его выполняет и демон без них.
   const probeTag = (tag) => `probe-${String(tag || "").split("-").slice(1).join("-")}`;
   function speedTool(server, s) {
     if (server.status !== "member" && server.status !== "spare") return null;
-    const sticky = s.sticky || {};
-    if (!sticky.on || !(sticky.unlimited_hours || sticky.limited_hours)) return null;
     if ((server.multiplier || 0) >= 100) return null;
     const asked = (s.busy && s.busy.speed_one) || [];
     const busy = Boolean(server.speed_queued)

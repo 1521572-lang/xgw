@@ -5364,6 +5364,8 @@ class Daemon:
             and state in (State.HEALTHY, State.DEGRADED) and members
         ):
             self._release_main()
+            if members:
+                self._speed_manual(view, applied)
             return
         # Весь дом через пул (М2б.2): подписка — только несущий канал, трафика клиентов через
         # неё нет — ни пассивной оценки, ни контроля скорости; плановых замеров тоже (_speed_step).
@@ -5710,13 +5712,9 @@ class Daemon:
         сразу — по кнопке. Не в шаге со сканом; при занятом канале фоновый замер ждёт, но
         не дольше SPEED_FORCE_AFTER. True — появился новый замер (сравнить с основным)."""
         if not (self.cfg.speed.unlimited_hours or self.cfg.speed.limited_hours):
-            self.speed_queue.clear()
-            self._speed_forced.clear()
-            self._speed_one.clear()
-            self._speed_any.clear()
+            # Плановых замеров нет; по кнопке у сервера — как обычно (_speed_manual).
             self._speed_asked = False
-            self.speed_total = self.speed_done = 0
-            return False
+            return self._speed_manual(view, applied)
         targets = self._speed_targets(view, observatory)
         self._speed_one_step(view, targets)
         live = {info.probe_tag for info in targets}
@@ -5780,6 +5778,31 @@ class Daemon:
                 return False
         self._speed_scanned_since = None
         return self._measure_queue(targets, applied, busy=self._busy, single=single) > 0
+
+    def _speed_manual(self, view: list[NodeInfo], applied: dict | None) -> bool:
+        """Кнопка у сервера без плановых замеров: основной сервер выключен (speed.sticky),
+        сроки замеров 0, нет HEALTHY/DEGRADED или идёт проверка цели проб. Замеряются только
+        заказанные серверы, по одному запросу; True — появился новый замер."""
+        if not (self._speed_one or self._speed_any):
+            self.speed_queue.clear()
+            self._speed_forced.clear()
+            self.speed_total = self.speed_done = 0
+            return False
+        targets: list[NodeInfo] = []
+        self._speed_one_step(view, targets)
+        self.speed_queue = deque(tag for tag in self.speed_queue if tag in self._speed_any)
+        self._speed_forced &= set(self.speed_queue)
+        if not self.speed_queue:
+            self._speed_any.clear()
+            self.speed_total = self.speed_done = 0
+            return False
+        if self.stopping:
+            return False
+        measured = self._measure_queue(targets, applied, busy=self._busy) > 0
+        self._speed_any &= set(self.speed_queue)
+        if not self.speed_queue:
+            self.speed_total = self.speed_done = 0
+        return measured
 
     def _speed_one_step(self, view: list[NodeInfo], targets: list[NodeInfo]) -> None:
         """Кнопка у одного сервера: он — первым в очередь, замер не ждёт свободного канала.

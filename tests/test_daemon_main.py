@@ -650,3 +650,26 @@ def test_main_leaves_a_server_youtube_does_not_pass(daemon):
     for _ in range(10):
         _step(daemon, 30.0)
     assert daemon.main["tag"] == first
+
+
+@pytest.mark.parametrize("off", ["sticky", "hours"])
+def test_the_button_works_without_background_speed_measurements(daemon, off):
+    """05.11.2026: при выключенном основном сервере (speed.sticky) или сроках замеров 0 иконка
+    пропадала. Кнопка — просьба человека: сервер замеряется и без плановых замеров, а другие
+    серверы фоном не замеряются."""
+    _first, second = _start(daemon)
+    _settle(daemon)
+    if off == "sticky":
+        daemon.cfg.speed.sticky = False
+    else:
+        daemon.cfg.speed.unlimited_hours = daemon.cfg.speed.limited_hours = 0
+    measured = len(daemon.measured)
+    for _ in range(3):
+        _step(daemon)
+    assert daemon.measured[measured:] == []
+    daemon.request_speed_one(second)
+    _step(daemon)
+    assert daemon.measured[measured:] == [second]
+    assert daemon.speed_one_pending() == []
+    _step(daemon)
+    assert daemon.measured[measured:] == [second]

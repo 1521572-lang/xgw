@@ -959,7 +959,8 @@ def test_server_core_is_set_from_the_panel(rig, user):
 def test_one_server_speed_button(rig, user):
     """Иконка у скорости сервера (отчёт cores 24.10.2026): замер одного сервера — участника
     или запасного; демон получает его отпечаток, а пока замер ждёт — сервер в busy.speed_one.
-    Сервер x100, неизвестный тег и выключенные замеры — отказ."""
+    Сервер x100 и неизвестный тег — отказ; при выключенном основном сервере кнопка работает
+    (05.11.2026: иконка пропадала вместе с плановыми замерами)."""
     reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
     assert reply["ok"] and "FI-1" in reply["text"]
     assert rig.daemon.asked == ["speed:cccc3333"]
@@ -976,7 +977,7 @@ def test_one_server_speed_button(rig, user):
     reply = user.act("speed/one", {"tag": "spare-fi-cccc"})
     assert not reply["ok"] and "x100" in reply["text"]
     assert user.act("sticky", {"on": False})["ok"]
-    assert not user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
+    assert user.act("speed/one", {"tag": "proxy-de-bbbb"})["ok"]
 
 
 def test_page_has_the_one_server_speed_icon(rig, user):

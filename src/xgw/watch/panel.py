@@ -1851,13 +1851,8 @@ class Panel:
             return actions.Outcome(2, "ожидается тег сервера")
         if self.daemon is None:
             return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
-        cfg = self.cfg
-        if not cfg.speed.sticky:
-            return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
-        if not (cfg.speed.unlimited_hours or cfg.speed.limited_hours):
-            return actions.Outcome(
-                2, "замер скорости выключен: speed.unlimited_hours и limited_hours = 0"
-            )
+        # Ручной замер одного сервера не зависит от основного сервера (speed.sticky) и сроков
+        # плановых замеров: демон выполняет его и без них (Daemon._speed_manual).
         _snapshot, _xray_ok, members, spares = self._core(time.time())
         entry = next(
             (item for item in (*members, *spares)
