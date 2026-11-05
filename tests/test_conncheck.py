@@ -43,3 +43,28 @@ def test_refresh_writes_public_ipv4_only_and_removes_when_check_is_off(tmp_path)
     assert conncheck.read(paths) == ((), 80)
     conncheck.path(paths).write_text('{"ips": ["10.0.0.1"], "port": 80}')
     assert conncheck.read(paths) == ((), 80)
+
+
+def test_daemon_writes_file_and_reloads_rules_in_one_step(tmp_path):
+    """Отчёт 7949034: файл адресов, записанный фоном, делал барьер «не загруженным» до
+    следующего шага, и health сразу после установки откатил её. Теперь файл и загрузка правил —
+    в основном потоке и вместе; без изменений правила не трогаются."""
+    import logging
+    from types import SimpleNamespace
+
+    from xgw.daemon import Daemon
+
+    paths = Paths(tmp_path)
+    paths.run.mkdir(parents=True)
+    ups = []
+    fake = SimpleNamespace(paths=paths, log=logging.getLogger("t"),
+                           capture=SimpleNamespace(up=lambda: ups.append(1)),
+                           _capture_waits=lambda: False)
+    found = {"host": "check.example.org", "port": 80, "ips": ["91.189.91.49"]}
+    Daemon._conncheck_apply(fake, found)
+    assert ups == [1] and conncheck.read(paths) == (("91.189.91.49",), 80)
+    Daemon._conncheck_apply(fake, found)
+    assert ups == [1]
+    Daemon._conncheck_apply(fake, None)
+    assert ups == [1, 1] and conncheck.read(paths) == ((), 80)
+    assert conncheck.lookup(lambda host: [], run=_run()) is False

@@ -746,6 +746,8 @@ class Daemon:
         self.next_scan = 0.0
         self.next_leak = 0.0
         self.next_conncheck = 0.0  # адрес проверки связности NetworkManager (net/conncheck.py)
+        # Итог фонового conncheck.lookup: (найдено,) — применить в основном потоке.
+        self._conncheck_found: tuple | None = None
         self.next_all_dead = 0.0
         self.next_rescan = 0.0
         # Рейтинг (rating.py): итоги проверок по часам (отпечаток → {час: [удачи, сбои]}),
@@ -1633,9 +1635,12 @@ class Daemon:
                 self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
         self._downlinks = downlinks
 
+        found, self._conncheck_found = self._conncheck_found, None
+        if found is not None:
+            self._conncheck_apply(found[0])
         if now >= self.next_conncheck and self.capture is not None:
             self.next_conncheck = now + conncheck.REFRESH
-            threading.Thread(target=self._conncheck_refresh, name="xgw-conncheck",
+            threading.Thread(target=self._conncheck_lookup, name="xgw-conncheck",
                              daemon=True).start()
 
         self.leak_fresh = False
@@ -1762,19 +1767,34 @@ class Daemon:
         )
         return tag
 
-    def _conncheck_refresh(self) -> None:
-        """Адрес проверки связности NetworkManager → /run/xgw/conncheck.json (net/conncheck.py):
-        барьер пропускает этот запрос, и значок шлюза не пишет «ограниченное подключение».
-        Сменились адреса — сверка правил перезагрузит барьер."""
+    def _conncheck_lookup(self) -> None:
+        """Фоном: адрес проверки связности NetworkManager (busctl, свои резолверы мимо
+        перехвата). Итог применяет основной поток (_conncheck_apply)."""
         def resolve(host: str) -> list[str]:
             return fetch.resolve_domain(host, list(self.cfg.dns.resolvers), mark=self.mark,
                                         cancel=self._stop, public_only=True)
 
         try:
-            if conncheck.refresh(self.paths, resolve):
-                self.log.info("адреса проверки связности NetworkManager обновлены")
+            found = conncheck.lookup(resolve)
         except Exception as exc:  # значок — не повод мешать шагу демона
-            self.log.debug("адрес проверки связности не обновлён: %s", exc)
+            self.log.debug("адрес проверки связности не узнан: %s", exc)
+            return
+        if found is not False:
+            self._conncheck_found = (found,)
+
+    def _conncheck_apply(self, found: dict | None) -> None:
+        """/run/xgw/conncheck.json и сразу правила: барьер пропускает проверку связности, и
+        значок шлюза не пишет «ограниченное подключение». Файл и загрузка — в одном шаге:
+        иначе до следующего шага сверка видела бы барьер «не загруженным» (отчёт 7949034 —
+        health сразу после установки попал в это окно, сработал откат)."""
+        try:
+            if not conncheck.store(self.paths, found):
+                return
+            self.log.info("адреса проверки связности NetworkManager обновлены")
+            if self.capture is not None and not self._capture_waits():
+                self.capture.up()
+        except Exception as exc:  # значок — не повод мешать шагу демона
+            self.log.error("исключение для проверки связности не применено: %s", exc)
 
     def _check_e2e(self) -> bool:
         """Сквозная загрузка проверочного хоста через http-in с детектором «тишины».

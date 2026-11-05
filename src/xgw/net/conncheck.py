@@ -86,20 +86,34 @@ def read(paths: Paths) -> tuple[tuple[str, ...], int]:
     return ips, port
 
 
-def refresh(paths: Paths, resolve, run=cmd.run) -> bool:
-    """Узнать адрес у NetworkManager, разрешить его resolve(host) и записать файл. True —
-    файл изменился. Нет проверки связности — файл удаляется (исключения нет)."""
+def lookup(resolve, run=cmd.run):
+    """Адрес проверки у NetworkManager, разрешённый resolve(host): словарь для store; None —
+    проверки нет (исключение убрать); False — адрес не разрешился (оставить прежний). Сеть и
+    busctl — здесь, в фоновом потоке демона; файл и правила меняет основной поток (store)."""
     target = nm_target(run)
-    file = path(paths)
     if target is None:
-        existed = file.exists()
-        file.unlink(missing_ok=True)
-        return existed
+        return None
     host, port = target
     ips = _public4(resolve(host))
     if not ips:
-        return False  # не разрешился: прежние адреса остаются до следующей попытки
-    wanted = {"host": host, "port": port, "ips": ips}
+        return False
+    return {"host": host, "port": port, "ips": ips}
+
+
+def refresh(paths: Paths, resolve, run=cmd.run) -> bool:
+    """lookup и store разом. True — файл изменился."""
+    found = lookup(resolve, run)
+    return False if found is False else store(paths, found)
+
+
+def store(paths: Paths, wanted: dict | None) -> bool:
+    """Записать адреса (None — удалить файл). True — файл изменился: правила барьера надо
+    загрузить заново сразу, иначе сверка до следующего шага видит «правила не загружены»."""
+    file = path(paths)
+    if wanted is None:
+        existed = file.exists()
+        file.unlink(missing_ok=True)
+        return existed
     try:
         current = json.loads(file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
