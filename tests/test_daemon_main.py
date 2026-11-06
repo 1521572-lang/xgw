@@ -337,6 +337,12 @@ def test_speed_test_waits_while_the_channel_is_busy_but_not_for_ever(daemon):
     assert daemon.measured == [] and daemon.main is not None  # основной есть и без замера
     for _ in range(10):
         _busy_step(daemon, 300)  # 50 минут занятого канала
+    # Шаг со сканом запасных замер пропускает, не откладывая (_speed_step), а сроки сканов с
+    # разбросом: последний шаг мог прийтись на скан — тогда ещё шаг-другой без скана.
+    for _ in range(3):
+        if daemon.status()["speed"]["deferred"]:
+            break
+        _busy_step(daemon)
     assert daemon.measured == []
     assert daemon.status()["speed"]["deferred"] is True
     member = next(m for m in daemon.status()["members"] if m["tag"] == first)

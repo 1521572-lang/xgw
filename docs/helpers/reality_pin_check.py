@@ -32,9 +32,9 @@ RENEWED = "REALITY: свежие SNI и short_id у "
 GROUPED = "в группах одной точки входа — "
 COMPOSITION = "состав sing-box: "
 FLAPS = "REALITY: записей групп пропало "
-LABELS = (("новые +", "new"), ("снова отобраны +", "again"), ("пропали −", "gone"),
-          ("не отобраны −", "dropped"), ("пул +", "pool_in"), ("пул +", "pool_out"),
-          ("набор вариантов ", "variants"))
+LABELS = (("новые +", "new"), ("вернулись +", "back"), ("снова отобраны +", "again"),
+          ("пропали −", "gone"), ("не отобраны −", "dropped"), ("пул +", "pool_in"),
+          ("пул +", "pool_out"), ("набор вариантов ", "variants"))
 REFRESHED = "обновление подписки: опрос"
 
 

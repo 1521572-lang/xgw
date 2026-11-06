@@ -400,10 +400,16 @@ def test_composition_tells_where_servers_came_from_and_went():
     counts = g.composition(
         old, new, inventory={"a" * 8, "b" * 8, "c" * 8, "d" * 8, "e" * 8},
         before={"a" * 8, "b" * 8, "c" * 8, "e" * 8}, pool={"1" * 8, "2" * 8})
-    assert counts == {"new": 1, "again": 1, "gone": 1, "dropped": 1, "pool_in": 1,
+    assert counts == {"new": 1, "back": 0, "again": 1, "gone": 1, "dropped": 1, "pool_in": 1,
                       "pool_out": 1, "variants": 1}
     line = g.describe_composition(counts)
-    assert line.startswith("состав sing-box: +3 −3 (подписка: новые +1, снова отобраны +1")
+    assert line.startswith("состав sing-box: +3 −3 (подписка: новые +1, вернулись +0, снова "
+                           "отобраны +1")
+    back = g.composition(
+        old, new, inventory={"a" * 8, "c" * 8, "d" * 8, "e" * 8},
+        before={"a" * 8, "b" * 8, "c" * 8, "e" * 8}, pool={"1" * 8, "2" * 8},
+        history={"d" * 8})
+    assert (back["new"], back["back"], back["gone"]) == (0, 1, 2)
     first = g.composition(old, new, inventory=set(), before=None, pool=set())
     assert (first["new"], first["again"], first["gone"]) == (3, 0, 3)
     assert not any(g.composition(old, old, inventory=set(), before=None, pool=set()).values())

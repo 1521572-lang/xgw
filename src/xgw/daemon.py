@@ -879,6 +879,9 @@ class Daemon:
         # Состав прошлой смены поколения sing-box: отпечатки списка подписок и пула — для
         # строки журнала о том, откуда смена состава (singbox_generation.composition).
         self._sb_seen: tuple[set[str], set[str]] | None = None
+        # Отпечатки, которые sing-box вёл за последние сутки (wall): вернувшаяся запись
+        # подписки отличается в строке состава от нового сервера.
+        self._sb_history: dict[str, float] = {}
         self._build_outcome: str | None = None
         self._loop_step_s = 0.0
         self._health_observed: float | None = None
@@ -2451,8 +2454,15 @@ class Daemon:
                                                    else [])}
         pool = {item.node.fingerprint for item in assembly.pool or []}
         before, old_pool = self._sb_seen if self._sb_seen is not None else (None, set())
+        wall = self.wall()
+        for fp in generations.served(generation.old):
+            self._sb_history[fp] = wall
+        self._sb_history = {fp: ts for fp, ts in self._sb_history.items() if wall - ts < 86400}
         counts = generations.composition(generation.old, generation.config, inventory=inventory,
-                                         before=before, pool=pool | old_pool)
+                                         before=before, pool=pool | old_pool,
+                                         history=set(self._sb_history))
+        for fp in generations.served(generation.config):
+            self._sb_history[fp] = wall
         self._sb_seen = (inventory, pool)
         if any(counts.values()):
             self.log.info("%s", generations.describe_composition(counts))
