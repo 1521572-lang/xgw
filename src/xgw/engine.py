@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, cost, fetch, log, marknet, masking, rating
+from . import config, cost, fetch, log, marknet, masking, rating, reality
 from . import pin as pinning
 from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
@@ -243,12 +243,23 @@ def collect(
         for warning in manual_warnings:
             logger.warning("%s", warning)
         inventory.nodes.extend(raw_to_node(raw, "manual") for raw in raws)
+    now = time.time()
+    # SNI и short_id REALITY, которые подписка меняет при каждом скачивании, — прежние
+    # (reality.py: «карусель» поколений sing-box, отчёт tspu-audit). До split_variants.
+    pairs = reality.load(reality.reality_file(paths), read_json)
+    held, tracked = reality.stabilize(
+        inventory.nodes, pairs, now=now,
+        dead=reality.dead_fingerprints(read_json(paths.status_file)))
+    if held:
+        logger.info("REALITY: у %d серверов подписка сменила SNI или short_id — оставлены "
+                    "прежние (до суток)", held)
     # Отпечаток варианта — по истории выдачи, а не по соседям в списке (R01 кросс-аудита).
     known = _load_fingerprints(paths)
     previous = set() if known else {item.get("fingerprint") for item in load_inventory(paths)}
-    now = time.time()
     split = split_variants(inventory.nodes, known, previous=previous, now=now)
     _save_fingerprints(paths, known, now, logger)
+    reality.remember(pairs, tracked, now)
+    reality.save(reality.reality_file(paths), pairs, now, logger)
     if split:
         logger.info("серверов с одним адресом и ключом, но разными путём, SNI или режимом: %d "
                     "— это разные серверы, не дубли", split)
