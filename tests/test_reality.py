@@ -40,11 +40,11 @@ def _both(node):
 
 def test_changed_pair_is_held_in_xray_and_singbox():
     known = {}
-    held, _tracked = reality.stabilize([_node()], known, now=1000.0)
-    assert held == 0
+    kept, _tracked = reality.stabilize([_node()], known, now=1000.0)
+    assert kept.held == 0
     node = _node("b.example.org", "bb22")
-    held, tracked = reality.stabilize([node], known, now=4600.0)
-    assert held == 1 and tracked[0][1] is node
+    kept, tracked = reality.stabilize([node], known, now=4600.0)
+    assert (kept.held, kept.grouped) == (1, 0) and tracked[0][1] == [node]
     assert _both(node) == (("a.example.org", "aa11"), ("a.example.org", "aa11"))
 
 
@@ -52,25 +52,25 @@ def test_pair_expires_after_a_day_and_then_is_held_again():
     known = {}
     reality.stabilize([_node()], known, now=0.0)
     late = _node("b.example.org", "bb22")
-    assert reality.stabilize([late], known, now=reality.KEEP_SECONDS)[0] == 0
+    assert reality.stabilize([late], known, now=reality.KEEP_SECONDS)[0].renewed == 1
     assert _both(late)[0] == ("b.example.org", "bb22")
     again = _node("c.example.org", "cc33")
-    assert reality.stabilize([again], known, now=reality.KEEP_SECONDS + 3600)[0] == 1
+    assert reality.stabilize([again], known, now=reality.KEEP_SECONDS + 3600)[0].held == 1
     assert _both(again)[1] == ("b.example.org", "bb22")
 
 
 def test_dead_server_takes_the_fresh_pair_sooner():
     known = {}
-    _held, tracked = reality.stabilize([_node()], known, now=0.0)
+    _kept, tracked = reality.stabilize([_node()], known, now=0.0)
     reality.remember(known, tracked, 0.0)
-    fp = tracked[0][1].fingerprint
+    fp = tracked[0][1][0].fingerprint
     status = {"members": [{"fingerprint": fp, "alive": False}], "spares": []}
     dead = reality.dead_fingerprints(status)
     assert dead == {fp}
     early = _node("b.example.org", "bb22")
-    assert reality.stabilize([early], known, now=3600.0, dead=dead)[0] == 1
+    assert reality.stabilize([early], known, now=3600.0, dead=dead)[0].held == 1
     fresh = _node("b.example.org", "bb22")
-    assert reality.stabilize([fresh], known, now=reality.DEAD_SECONDS, dead=dead)[0] == 0
+    assert reality.stabilize([fresh], known, now=reality.DEAD_SECONDS, dead=dead)[0].held == 0
     assert _both(fresh)[0] == ("b.example.org", "bb22")
 
 
@@ -83,21 +83,43 @@ def test_unchecked_spare_is_not_dead():
     assert reality.dead_fingerprints(None) == frozenset()
 
 
-def test_variants_and_other_servers_are_untouched():
+def test_group_of_one_entry_point_holds_its_pairs_by_place():
+    """Отчёт reality-pin: записи одной точки входа с публичным ключом — один сервер REALITY;
+    группа держит набор пар целиком, места — по прочим полям и имени, не по порядку в
+    подписке. Другое число записей — свежие пары."""
     known = {}
-    reality.stabilize([_node("a.example.org"), _node("b.example.org")], known, now=0.0)
-    one, two = _node("c.example.org"), _node("d.example.org")
-    assert reality.stabilize([one, two], known, now=60.0)[0] == 0
-    assert (_both(one)[0][0], _both(two)[0][0]) == ("c.example.org", "d.example.org")
+    first, second = _node("a.example.org", "aa11"), _node("b.example.org", "bb22")
+    second.name = "NL-2"
+    reality.stabilize([first, second], known, now=0.0)
+    one, two = _node("c.example.org", "cc33"), _node("d.example.org", "dd44")
+    two.name = "NL-2"
+    kept, _tracked = reality.stabilize([two, one], known, now=60.0)
+    assert (kept.held, kept.grouped) == (2, 2)
+    assert _both(one)[0] == ("a.example.org", "aa11")
+    assert _both(two)[1] == ("b.example.org", "bb22")
+    three = [_node("e.example.org"), _node("f.example.org"), _node("g.example.org")]
+    kept, _tracked = reality.stabilize(three, known, now=120.0)
+    assert (kept.held, kept.renewed) == (0, 3)
+
+
+def test_old_record_format_is_read_and_other_servers_are_untouched():
+    known = {}
+    reality.stabilize([_node()], known, now=0.0)
+    key = next(iter(known))
+    known[key] = {"sni": "a.example.org", "sid": "aa11", "since": 0.0, "fp": "x"}
+    node = _node("b.example.org", "bb22")
+    assert reality.stabilize([node], known, now=60.0)[0].held == 1
+    assert _both(node)[0] == ("a.example.org", "aa11")
+    assert known[key]["pairs"] == [["a.example.org", "aa11"]] and "sni" not in known[key]
     other = raw_to_node(parse_link(links.VLESS_WS), "main")
     before = repr(other.outbound)
-    assert reality.stabilize([other], known, now=60.0) == (0, [])
+    assert reality.stabilize([other], known, now=60.0) == (reality.Outcome(), [])
     assert repr(other.outbound) == before
 
 
 def test_unseen_entries_are_forgotten():
     known = {}
-    _held, tracked = reality.stabilize([_node()], known, now=0.0)
+    _kept, tracked = reality.stabilize([_node()], known, now=0.0)
     reality.remember(known, tracked, 0.0)
     assert len(known) == 1
     reality.remember(known, [], reality.KEEP_UNSEEN)

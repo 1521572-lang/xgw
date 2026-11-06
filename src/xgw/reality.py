@@ -10,20 +10,26 @@ tls.reality.short_id и tls.server_name у 44 серверов sing-box).
 Поэтому сервер с теми же протоколом, адресом, портом, ключом, транспортом и публичным ключом
 REALITY, у которого сменились только SNI и/или short_id, сохраняет прежнюю пару до
 KEEP_SECONDS. Свежая берётся, когда срок вышел, или раньше — через DEAD_SECONDS, если сервер по
-последнему состоянию шлюза мёртв: вдруг прежнего значения уже нет в списке сервера. Несколько
-записей на одну точку входа и публичный ключ (варианты, model.split_variants) не трогаются —
-у них SNI различает выходы. Работает до split_variants: сводка полей варианта тогда тоже
-постоянна.
+последнему состоянию шлюза мёртв: вдруг прежнего значения уже нет в списке сервера.
+
+Несколько записей на одну точку входа и публичный ключ (отчёт reality-pin: без них удержание
+ловило 12–14 серверов, а смены с полями REALITY остались) — для REALITY это один и тот же
+сервер: адрес, порт и ключ определяют его, SNI — лишь маскировка. Такая группа держит набор
+пар целиком: записи упорядочены по прочим полям (без SNI и short_id) и имени, и каждая
+получает пару своего места из прошлого опроса, если число записей то же. Работает до
+split_variants: сводка полей варианта тогда тоже постоянна.
 
 Файл REALITY_FILE (каталог состояния, 0600): ключ — хеш точки входа и публичного ключа,
-значение — пара, когда она принята, когда сервер виден и его итоговый отпечаток (для проверки
-«мёртв»). Записи серверов, не виденных KEEP_UNSEEN, забываются.
+значение — пары по местам, когда они приняты, когда группа видна и итоговые отпечатки (для
+проверки «мёртв»). Записи, не виденные KEEP_UNSEEN, забываются.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 
 from .model import ServerNode
@@ -103,49 +109,106 @@ def dead_fingerprints(status: dict | None) -> frozenset[str]:
     return frozenset(dead)
 
 
+@dataclass
+class Outcome:
+    """Итог stabilize для журнала: held — скольким серверам пара оставлена прежней (из них
+    grouped — в группах из нескольких записей); renewed — сколько приняли свежую пару, когда
+    подписка её сменила: срок вышел, сервер мёртв или число записей группы другое."""
+
+    held: int = 0
+    grouped: int = 0
+    renewed: int = 0
+
+
+def _stable(node: ServerNode) -> str:
+    """Описание сервера без SNI и short_id — порядок записей внутри группы."""
+    outbound = json.loads(json.dumps(node.outbound or {}, default=str))
+    main = json.loads(json.dumps(node.singbox.main if node.singbox else {}, default=str))
+    stream = outbound.get("streamSettings")
+    settings = stream.get("realitySettings") if isinstance(stream, dict) else None
+    if isinstance(settings, dict):
+        settings.pop("serverName", None)
+        settings.pop("shortId", None)
+    tls = main.get("tls")
+    if isinstance(tls, dict):
+        tls.pop("server_name", None)
+        if isinstance(tls.get("reality"), dict):
+            tls["reality"].pop("short_id", None)
+    return json.dumps([outbound, main, node.name], sort_keys=True, ensure_ascii=False)
+
+
+def _pairs(entry: object) -> list[list[str]] | None:
+    """Пары записи по местам; прежний формат (одна пара sni/sid) — список из одной."""
+    if not isinstance(entry, dict):
+        return None
+    pairs = entry.get("pairs")
+    if pairs is None and isinstance(entry.get("sni"), str) and isinstance(entry.get("sid"), str):
+        pairs = [[entry["sni"], entry["sid"]]]
+    if not isinstance(pairs, list) or not all(
+            isinstance(item, list) and len(item) == 2
+            and all(isinstance(value, str) for value in item) for item in pairs):
+        return None
+    return [list(item) for item in pairs]
+
+
+def _fingerprints(entry: dict) -> set[str]:
+    found = entry.get("fps")
+    fps = {str(fp) for fp in found} if isinstance(found, list) else set()
+    if entry.get("fp"):
+        fps.add(str(entry["fp"]))
+    return fps
+
+
 def stabilize(
     nodes: list[ServerNode], known: dict[str, dict], *, now: float,
     dead: Collection[str] = (),
-) -> tuple[int, list[tuple[str, ServerNode]]]:
+) -> tuple[Outcome, list[tuple[str, list[ServerNode]]]]:
     """Вернуть серверам прежние SNI и short_id (см. описание модуля); known дополняется.
-    Отпечатки узлов — ещё общие (до split_variants). Возвращает, скольким серверам пара
-    оставлена прежней, и пары (ключ записи, узел) — для remember после split_variants."""
+    Отпечатки узлов — ещё общие (до split_variants). Возвращает итог и группы (ключ записи,
+    узлы по местам) — для remember после split_variants."""
     groups: dict[str, list[tuple[ServerNode, tuple[str, str, str]]]] = {}
     for node in nodes:
         found = pair(node)
         if found is not None:
             groups.setdefault(_key(node.fingerprint, found[0]), []).append((node, found))
-    held, tracked = 0, []
+    outcome, tracked = Outcome(), []
     for key, group in groups.items():
-        if len(group) != 1:
-            known.pop(key, None)  # варианты: SNI различает выходы
-            continue
-        node, (_public, sni, sid) = group[0]
+        group.sort(key=lambda item: _stable(item[0]))
+        ordered = [node for node, _found in group]
+        fresh = [[sni, sid] for _node, (_public, sni, sid) in group]
         entry = known.get(key)
-        if not isinstance(entry, dict) or not isinstance(entry.get("sni"), str) \
-                or not isinstance(entry.get("sid"), str):
-            entry = None
-        if entry is not None and (entry["sni"], entry["sid"]) != (sni, sid):
-            limit = DEAD_SECONDS if entry.get("fp") in dead else KEEP_SECONDS
-            if now - float(entry.get("since") or 0) < limit:
-                _apply(node, entry["sni"], entry["sid"])
-                held += 1
+        pairs = _pairs(entry)
+        if pairs is not None and pairs != fresh:
+            limit = DEAD_SECONDS if _fingerprints(entry) & set(dead) else KEEP_SECONDS
+            if len(pairs) == len(fresh) and now - float(entry.get("since") or 0) < limit:
+                for node, (sni, sid) in zip(ordered, pairs, strict=True):
+                    _apply(node, sni, sid)
+                changed = sum(1 for old, new in zip(pairs, fresh, strict=True) if old != new)
+                outcome.held += changed
+                if len(ordered) > 1:
+                    outcome.grouped += changed
             else:
-                entry = None
-        if entry is None:
-            entry = {"sni": sni, "sid": sid, "since": now}
+                outcome.renewed += len(fresh)
+                pairs = None
+        if pairs is None:
+            entry = {"pairs": fresh, "since": now}
+        else:
+            entry = {name: value for name, value in entry.items() if name not in ("sni", "sid")}
+            entry["pairs"] = pairs
         entry["seen"] = now
         known[key] = entry
-        tracked.append((key, node))
-    return held, tracked
+        tracked.append((key, ordered))
+    return outcome, tracked
 
 
-def remember(known: dict[str, dict], tracked: list[tuple[str, ServerNode]], now: float) -> None:
+def remember(known: dict[str, dict], tracked: list[tuple[str, list[ServerNode]]],
+             now: float) -> None:
     """Итоговые отпечатки (после split_variants) — для проверки «мёртв» при следующем опросе;
     давно не виденные серверы забываются."""
-    for key, node in tracked:
+    for key, ordered in tracked:
         if key in known:
-            known[key]["fp"] = node.fingerprint
+            known[key].pop("fp", None)
+            known[key]["fps"] = [node.fingerprint for node in ordered]
     for key in [key for key, entry in known.items()
                 if now - float(entry.get("seen") or 0) >= KEEP_UNSEEN]:
         del known[key]
