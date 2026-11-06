@@ -7,7 +7,8 @@ refresh     — внеочередное обновление подписок �
               ожидание сборки: сколько серверов сохранили прежнюю пару, сменилось ли поколение
               sing-box и из-за чего (имена частей и полей, без значений);
 generations — смены поколения sing-box с запуска службы xgw: число, причины, поля, и
-              сколько раз обновление подписки оставило прежние пары.
+              сколько раз обновление подписки оставило прежние пары; откуда смены состава
+              (строки «состав sing-box») и сколько записей групп пропало и вернулось.
 """
 
 import hashlib
@@ -29,6 +30,11 @@ SWITCH = "поколение sing-box сменено: изменились "
 HELD = "REALITY: у "
 RENEWED = "REALITY: свежие SNI и short_id у "
 GROUPED = "в группах одной точки входа — "
+COMPOSITION = "состав sing-box: "
+FLAPS = "REALITY: записей групп пропало "
+LABELS = (("новые +", "new"), ("снова отобраны +", "again"), ("пропали −", "gone"),
+          ("не отобраны −", "dropped"), ("пул +", "pool_in"), ("пул +", "pool_out"),
+          ("набор вариантов ", "variants"))
 REFRESHED = "обновление подписки: опрос"
 
 
@@ -85,9 +91,23 @@ def number_after(line, marker):
     return int(value) if value.isdigit() else None
 
 
+def composition(line, totals):
+    text = line.split(COMPOSITION, 1)[1]
+    for marker, name in LABELS:
+        if marker not in text:
+            continue
+        rest = text.split(marker, 1)[1]
+        if name == "pool_out":
+            rest = rest.split("−", 1)[1] if "−" in rest else ""
+        value = rest.split(" ", 1)[0].rstrip(",;)")
+        if value.isdigit():
+            totals[name] += int(value)
+
+
 def summarize(lines, report):
     switches, parts, fields, sizes = 0, Counter(), Counter(), []
     held, grouped, renewed = [], [], []
+    totals, flaps, compositions = Counter(), Counter(), 0
     for line in lines:
         if SWITCH in line:
             switches += 1
@@ -100,6 +120,15 @@ def summarize(lines, report):
                     sizes.append(int(name[8:]) if name[8:].isdigit() else None)
                 else:
                     fields[name.strip()] += 1
+        elif COMPOSITION in line:
+            compositions += 1
+            composition(line, totals)
+        elif FLAPS in line:
+            numbers = [word for word in line.split(FLAPS, 1)[1].replace(",", " ").split()
+                       if word.isdigit()]
+            if len(numbers) == 2:
+                flaps["vanished"] += int(numbers[0])
+                flaps["returned"] += int(numbers[1])
         elif RENEWED in line:
             renewed.append(number_after(line, RENEWED) or 0)
         elif HELD in line:
@@ -110,7 +139,9 @@ def summarize(lines, report):
                   switch_servers=sizes,
                   refreshes=sum(1 for line in lines if REFRESHED in line),
                   held_times=len(held), held_max=max(held, default=0),
-                  grouped_max=max(grouped, default=0), renewed=renewed)
+                  grouped_max=max(grouped, default=0), renewed=renewed,
+                  composition_lines=compositions, composition=dict(totals),
+                  group_flaps=dict(flaps))
 
 
 def panel(path, body=None):
