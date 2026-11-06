@@ -27,6 +27,8 @@ TOKEN = Path("/var/lib/xgw/panel-token")
 PAIRS = Path("/var/lib/xgw/reality.json")
 SWITCH = "поколение sing-box сменено: изменились "
 HELD = "REALITY: у "
+RENEWED = "REALITY: свежие SNI и short_id у "
+GROUPED = "в группах одной точки входа — "
 REFRESHED = "обновление подписки: опрос"
 
 
@@ -63,7 +65,10 @@ def reality(report):
     known = (json.loads(PAIRS.read_bytes()).get("known") or {})
     now = time.time()
     report.update(file=True, mode=oct(mode), records=len(known),
-                  with_fingerprint=sum(1 for e in known.values() if e.get("fp")),
+                  with_fingerprint=sum(1 for e in known.values() if e.get("fp") or e.get("fps")),
+                  groups=sum(1 for e in known.values() if len(e.get("pairs") or []) > 1),
+                  grouped_entries=sum(len(e.get("pairs") or []) for e in known.values()
+                                      if len(e.get("pairs") or []) > 1),
                   older_than_1h=sum(1 for e in known.values()
                                     if now - float(e.get("since") or now) >= 3600))
     return mode == 0o600 and len(known) > 0
@@ -75,8 +80,14 @@ def journal(since):
     return proc.stdout.splitlines()
 
 
+def number_after(line, marker):
+    value = line.split(marker, 1)[1].split(" ", 1)[0].rstrip(")")
+    return int(value) if value.isdigit() else None
+
+
 def summarize(lines, report):
-    switches, parts, fields, held = 0, Counter(), Counter(), []
+    switches, parts, fields, sizes = 0, Counter(), Counter(), []
+    held, grouped, renewed = [], [], []
     for line in lines:
         if SWITCH in line:
             switches += 1
@@ -85,14 +96,21 @@ def summarize(lines, report):
             for part in head.split(", "):
                 parts[part.strip()] += 1
             for name in tail.rstrip(")").split(", ") if tail else []:
-                fields["servers=N" if name.startswith("servers=") else name.strip()] += 1
+                if name.startswith("servers="):
+                    sizes.append(int(name[8:]) if name[8:].isdigit() else None)
+                else:
+                    fields[name.strip()] += 1
+        elif RENEWED in line:
+            renewed.append(number_after(line, RENEWED) or 0)
         elif HELD in line:
-            number = line.split(HELD, 1)[1].split(" ", 1)[0]
-            if number.isdigit():
-                held.append(int(number))
+            held.append(number_after(line, HELD) or 0)
+            if GROUPED in line:
+                grouped.append(number_after(line, GROUPED) or 0)
     report.update(switches=switches, switch_parts=dict(parts), switch_fields=dict(fields),
+                  switch_servers=sizes,
                   refreshes=sum(1 for line in lines if REFRESHED in line),
-                  held_times=len(held), held_max=max(held, default=0))
+                  held_times=len(held), held_max=max(held, default=0),
+                  grouped_max=max(grouped, default=0), renewed=renewed)
 
 
 def panel(path, body=None):
