@@ -91,6 +91,59 @@ def changed_fields(old, new):
     return (*sorted(names)[:12], f"servers={servers}")
 
 
+def _served(config) -> dict[str, set[str]]:
+    """Серверы, которые ведёт конфиг sing-box: отпечаток → буквы вариантов (теги sb-in-…)."""
+    found: dict[str, set[str]] = {}
+    for item in (config or {}).get("inbounds") or []:
+        match = sb._IN_TAG.match(str(item.get("tag") or "")) if isinstance(item, dict) else None
+        if match:
+            found.setdefault(match.group(1), set()).add(match.group(2))
+    return found
+
+
+COMPOSITION = ("new", "again", "gone", "dropped", "pool_in", "pool_out", "variants")
+
+
+def composition(old, new, *, inventory, before, pool):
+    """Откуда смена состава (часть servers в changed_parts; отчёт reality-pin-r3: 4 смены за
+    2 часа — servers и route). Добавленные: new — отпечатка не было в списке подписок прошлой
+    смены (новый сервер или новый отпечаток), again — был в списке, но sing-box его не вёл
+    (снова отобран); убранные: gone — отпечатка нет в нынешнем списке подписок, dropped — в
+    списке есть, но не отобран (мёртв, домен не разрешился, фильтры); pool_in / pool_out —
+    серверы бесплатного пула; variants — тот же сервер с другим набором вариантов. inventory —
+    отпечатки нынешнего списка подписок, before — прошлой смены (None — неизвестно: первая
+    смена после запуска), pool — отпечатки пула, нынешние и прошлые."""
+    old_fps, new_fps = _served(old), _served(new)
+    counts = dict.fromkeys(COMPOSITION, 0)
+    for fp in new_fps.keys() - old_fps.keys():
+        if fp in pool:
+            counts["pool_in"] += 1
+        elif before is not None and fp in before:
+            counts["again"] += 1
+        else:
+            counts["new"] += 1
+    for fp in old_fps.keys() - new_fps.keys():
+        if fp in pool:
+            counts["pool_out"] += 1
+        elif fp in inventory:
+            counts["dropped"] += 1
+        else:
+            counts["gone"] += 1
+    counts["variants"] = sum(1 for fp in old_fps.keys() & new_fps.keys()
+                             if old_fps[fp] != new_fps[fp])
+    return counts
+
+
+def describe_composition(counts) -> str:
+    """Строка журнала о составе: только числа."""
+    added = counts["new"] + counts["again"] + counts["pool_in"]
+    removed = counts["gone"] + counts["dropped"] + counts["pool_out"]
+    return (f"состав sing-box: +{added} −{removed} (подписка: новые +{counts['new']}, снова "
+            f"отобраны +{counts['again']}, пропали −{counts['gone']}, не отобраны "
+            f"−{counts['dropped']}; пул +{counts['pool_in']} −{counts['pool_out']}; сменили "
+            f"набор вариантов {counts['variants']})")
+
+
 def needed(core, config):
     return config is not None and core.read() is not None and config != core.read()
 

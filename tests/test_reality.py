@@ -128,6 +128,28 @@ def test_group_keeps_pairs_when_it_shrinks_or_names_change():
     assert {_both(node)[0][0] for node in renamed} == {"a.example.org", "c.example.org"}
 
 
+def test_vanished_entry_returns_with_its_pair():
+    """Отчёт reality-pin-r3: записи группы пропадают и возвращаются (80 → 76 → 80) — вернувшаяся
+    получает пару, с которой пропала, а не свежую."""
+    known = {}
+    start = [_node(f"{c}.example.org", f"{c}{c}11") for c in "abc"]
+    for node, name in zip(start, ["NL-1", "NL-2", "NL-3"], strict=True):
+        node.name = name
+    reality.stabilize(start, known, now=0.0)
+    two = [_node("x.example.org", "xx11"), _node("y.example.org", "yy11")]
+    two[0].name, two[1].name = "NL-1", "NL-3"
+    kept, _tracked = reality.stabilize(two, known, now=60.0)
+    assert (kept.vanished, kept.returned) == (1, 0)
+    back = [_node(f"{c}.example.org", f"{c}{c}22") for c in "pqr"]
+    for node, name in zip(back, ["NL-1", "NL-2", "NL-3"], strict=True):
+        node.name = name
+    kept, _tracked = reality.stabilize(back, known, now=120.0)
+    assert (kept.held, kept.renewed, kept.returned, kept.vanished) == (3, 0, 1, 0)
+    assert [_both(node)[0][0] for node in back] == [
+        "a.example.org", "b.example.org", "c.example.org"]
+    assert next(iter(known.values()))["gone"] == {}
+
+
 def test_old_record_format_is_read_and_other_servers_are_untouched():
     known = {}
     reality.stabilize([_node()], known, now=0.0)

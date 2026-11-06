@@ -876,6 +876,9 @@ class Daemon:
         self._build_discarded = 0
         self._build_count = 0
         self._build_last = (0.0, 0.0)
+        # Состав прошлой смены поколения sing-box: отпечатки списка подписок и пула — для
+        # строки журнала о том, откуда смена состава (singbox_generation.composition).
+        self._sb_seen: tuple[set[str], set[str]] | None = None
         self._build_outcome: str | None = None
         self._loop_step_s = 0.0
         self._health_observed: float | None = None
@@ -2440,6 +2443,20 @@ class Daemon:
         self.log.info("обновление подписки: опрос %.0f с; сборка запрошена отдельно", job.spent)
         return changed
 
+    def _log_composition(self, generation, assembly) -> None:
+        """Строка журнала: сколько серверов sing-box добавилось и убыло и откуда."""
+        from .apply import singbox_generation as generations
+
+        inventory = {node.fingerprint for node in (self.inventory.nodes if self.inventory
+                                                   else [])}
+        pool = {item.node.fingerprint for item in assembly.pool or []}
+        before, old_pool = self._sb_seen if self._sb_seen is not None else (None, set())
+        counts = generations.composition(generation.old, generation.config, inventory=inventory,
+                                         before=before, pool=pool | old_pool)
+        self._sb_seen = (inventory, pool)
+        if any(counts.values()):
+            self.log.info("%s", generations.describe_composition(counts))
+
     def _assembly_stamp(self) -> tuple:
         """Версии входных файлов и допуска к трафику, не счётчиков и рейтинга."""
         files = (self.paths.config_file, managed.path_for(self.paths.config_file),
@@ -2619,6 +2636,7 @@ class Daemon:
                 self.log.info("поколение sing-box сменено: изменились %s%s",
                               ", ".join(job.generation.parts) or "только порты",
                               f" (поля: {', '.join(fields)})" if fields else "")
+                self._log_composition(job.generation, assembly)
         else:
             outcome = self._apply(assembly.result.config, urgent=job.request.urgent,
                                   singbox=assembly.singbox)

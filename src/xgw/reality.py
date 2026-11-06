@@ -20,7 +20,11 @@ KEEP_SECONDS. Свежая берётся, когда срок вышел, ил�
 опроса к опросу (20–23 свежие пары за опрос, когда при другом числе записей обновлялась вся
 группа), — поэтому место, которого не было, берёт ещё не занятую прежнюю пару группы (место
 пропало — его пара свободна: все записи группы — один сервер), и только когда их не осталось —
-свежую. Работает до split_variants: сводка полей варианта тогда тоже постоянна.
+свежую. Отчёт reality-pin-r3: записи группы пропадают и возвращаются (80 → 76 → 80), и
+вернувшаяся получала свежую пару — новый отпечаток и проверки заново. Поэтому пара пропавшего
+места помнится (`gone`, до KEEP_SECONDS) и возвращается ему, если её не заняла другая запись.
+Работает до split_variants: сводка полей варианта тогда тоже постоянна, и вернувшаяся запись
+получает прежний отпечаток (история split_variants).
 
 Файл REALITY_FILE (каталог состояния, 0600): ключ — хеш точки входа и публичного ключа,
 значение — пары по местам (`pairs`, `ids`), когда они приняты, когда группа видна и итоговые
@@ -123,6 +127,9 @@ class Outcome:
     held: int = 0
     grouped: int = 0
     renewed: int = 0
+    # Записи групп, пропавшие в этом опросе, и вернувшиеся с прежней парой.
+    vanished: int = 0
+    returned: int = 0
 
 
 def _stable(node: ServerNode) -> str:
@@ -175,28 +182,58 @@ def _places(ordered: list[ServerNode]) -> list[str]:
     return ids
 
 
+def _gone(entry: dict, now: float) -> dict[str, list]:
+    """Пары пропавших мест: место → [SNI, short_id, когда пропало]; старше KEEP_SECONDS — нет."""
+    found = entry.get("gone")
+    if not isinstance(found, dict):
+        return {}
+    return {str(pid): list(item) for pid, item in found.items()
+            if isinstance(item, list) and len(item) == 3
+            and all(isinstance(value, str) for value in item[:2])
+            and isinstance(item[2], int | float) and now - float(item[2]) < KEEP_SECONDS}
+
+
 def _choose(
-    ids: list[str], fresh: list[list[str]], entry: dict, pairs: list[list[str]],
-) -> tuple[list[list[str]], list[bool]]:
-    """Пары по местам: своё место — его прежняя пара; новое место — свободная прежняя пара
-    группы, нет такой — свежая. Второй список — пара из прошлого опроса или нет."""
-    old_ids = entry.get("ids") if isinstance(entry.get("ids"), list) else []
-    by_id = {str(pid): pair for pid, pair in zip(old_ids, pairs, strict=False)}
-    taken = {pid for pid in ids if pid in by_id}
-    free = [pair for index, pair in enumerate(pairs)
-            if index >= len(old_ids) or str(old_ids[index]) not in taken]
-    chosen, kept = [], []
-    for pid, new in zip(ids, fresh, strict=True):
-        if pid in by_id:
-            chosen.append(by_id[pid])
-            kept.append(True)
-        elif free:
-            chosen.append(free.pop(0))
-            kept.append(True)
+    ids: list[str], fresh: list[list[str]], entry: dict, pairs: list[list[str]], now: float,
+) -> tuple[list[list[str]], list[bool], dict[str, list], int]:
+    """Пары по местам: своё место — его прежняя пара; вернувшееся — пара, с которой оно
+    пропало, если её не заняли; новое — свободная прежняя пара группы, нет такой — свежая.
+    Возвращает пары, признаки «пара из прошлого», пропавшие места и сколько вернулось."""
+    old_ids = [str(pid) for pid in entry.get("ids") or []] if isinstance(
+        entry.get("ids"), list) and len(entry["ids"]) == len(pairs) else []
+    places = list(zip(old_ids, pairs, strict=True)) if old_ids else []
+    by_id = dict(places)
+    gone = _gone(entry, now)
+    current = set(ids)
+    for pid, item in places:
+        if pid not in current:
+            gone[pid] = [*item, now]
+    chosen: list[list[str] | None] = [by_id.get(pid) for pid in ids]
+    used = {tuple(item) for item in chosen if item is not None}
+    returned = 0
+    for index, pid in enumerate(ids):
+        back = gone.get(pid)
+        if chosen[index] is None and back is not None and tuple(back[:2]) not in used:
+            chosen[index] = back[:2]
+            used.add(tuple(back[:2]))
+            returned += 1
+    free = [item for pid, item in zip(old_ids or [""] * len(pairs), pairs, strict=True)
+            if not old_ids or pid not in current]
+    kept = [item is not None for item in chosen]
+    for index, new in enumerate(fresh):
+        if chosen[index] is not None:
+            continue
+        while free and tuple(free[0]) in used:
+            free.pop(0)
+        if free:
+            chosen[index] = free.pop(0)
+            kept[index] = True
         else:
-            chosen.append(new)
-            kept.append(False)
-    return chosen, kept
+            chosen[index] = new
+        used.add(tuple(chosen[index]))
+    for pid in ids:
+        gone.pop(pid, None)
+    return [list(item) for item in chosen if item is not None], kept, gone, returned
 
 
 def stabilize(
@@ -219,11 +256,17 @@ def stabilize(
         fresh = [[sni, sid] for _node, (_public, sni, sid) in group]
         entry = known.get(key)
         pairs = _pairs(entry)
-        since = now
+        since, gone = now, {}
         if pairs is not None:
             limit = DEAD_SECONDS if _fingerprints(entry) & set(dead) else KEEP_SECONDS
             within = now - float(entry.get("since") or 0) < limit
-            previous, kept = _choose(ids, fresh, entry, pairs)
+            previous, kept, gone, returned = _choose(ids, fresh, entry, pairs, now)
+            vanished = sum(1 for item in gone.values() if item[2] == now)
+            outcome.vanished += vanished
+            if within:
+                outcome.returned += returned
+            else:
+                gone = {}
             for node, prev, new, from_past in zip(ordered, previous, fresh, kept, strict=True):
                 if within and from_past:
                     if prev != new:
@@ -239,7 +282,7 @@ def stabilize(
             pairs = fresh
         entry = {name: value for name, value in (entry or {}).items()
                  if name not in ("sni", "sid", "fp")}
-        entry.update(pairs=pairs, ids=ids, since=since, seen=now)
+        entry.update(pairs=pairs, ids=ids, since=since, seen=now, gone=gone)
         known[key] = entry
         tracked.append((key, ordered))
     return outcome, tracked

@@ -387,3 +387,23 @@ def test_changed_server_fields_are_named_without_values():
     assert fields == ("server_port", "tls.reality.short_id", "transport.path", "servers=2")
     assert "22" not in repr(fields) and "/q" not in repr(fields)
     assert g.changed_fields(old, copy.deepcopy(old)) == ()
+
+
+def test_composition_tells_where_servers_came_from_and_went():
+    """Отчёт reality-pin-r3: смены состава (servers, route) — по строке журнала видно, откуда
+    добавленные и куда делись убранные серверы sing-box; только числа."""
+    def config(*tags):
+        return {"inbounds": [{"tag": f"sb-in-{fp * 8}-{letter}"} for fp, letter in tags]}
+
+    old = config(("a", "d"), ("b", "d"), ("c", "d"), ("c", "f"), ("f", "d"), ("1", "d"))
+    new = config(("a", "d"), ("c", "d"), ("d", "d"), ("e", "d"), ("2", "d"))
+    counts = g.composition(
+        old, new, inventory={"a" * 8, "b" * 8, "c" * 8, "d" * 8, "e" * 8},
+        before={"a" * 8, "b" * 8, "c" * 8, "e" * 8}, pool={"1" * 8, "2" * 8})
+    assert counts == {"new": 1, "again": 1, "gone": 1, "dropped": 1, "pool_in": 1,
+                      "pool_out": 1, "variants": 1}
+    line = g.describe_composition(counts)
+    assert line.startswith("состав sing-box: +3 −3 (подписка: новые +1, снова отобраны +1")
+    first = g.composition(old, new, inventory=set(), before=None, pool=set())
+    assert (first["new"], first["again"], first["gone"]) == (3, 0, 3)
+    assert not any(g.composition(old, old, inventory=set(), before=None, pool=set()).values())
