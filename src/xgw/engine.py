@@ -256,7 +256,8 @@ def collect(
                     kept.held, kept.grouped)
     if kept.renewed:
         logger.info("REALITY: свежие SNI и short_id у %d серверов — срок прежних вышел, "
-                    "сервер мёртв или в группе другое число записей", kept.renewed)
+                    "сервер мёртв или новая запись в группе без свободной прежней пары",
+                    kept.renewed)
     # Отпечаток варианта — по истории выдачи, а не по соседям в списке (R01 кросс-аудита).
     known = _load_fingerprints(paths)
     previous = set() if known else {item.get("fingerprint") for item in load_inventory(paths)}

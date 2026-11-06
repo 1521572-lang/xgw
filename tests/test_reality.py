@@ -97,9 +97,35 @@ def test_group_of_one_entry_point_holds_its_pairs_by_place():
     assert (kept.held, kept.grouped) == (2, 2)
     assert _both(one)[0] == ("a.example.org", "aa11")
     assert _both(two)[1] == ("b.example.org", "bb22")
-    three = [_node("e.example.org"), _node("f.example.org"), _node("g.example.org")]
+    three = [_node("e.example.org", "ee55"), _node("f.example.org", "ff66"),
+             _node("g.example.org", "gg77")]
+    three[1].name = "NL-2"
+    three[2].name = "NL-3"
     kept, _tracked = reality.stabilize(three, known, now=120.0)
-    assert (kept.held, kept.renewed) == (0, 3)
+    assert (kept.held, kept.renewed) == (2, 1)
+    assert [_both(node)[0][0] for node in three] == [
+        "a.example.org", "b.example.org", "g.example.org"]
+
+
+def test_group_keeps_pairs_when_it_shrinks_or_names_change():
+    """Отчёт reality-pin-r2: число записей группы меняется от опроса к опросу — прежние пары
+    остаются у своих мест, пропавшее место освобождает пару, имена другие — пары по порядку."""
+    known = {}
+    names = ["NL-1", "NL-2", "NL-3"]
+    start = [_node(f"{c}.example.org", f"{c}{c}11") for c in "abc"]
+    for node, name in zip(start, names, strict=True):
+        node.name = name
+    reality.stabilize(start, known, now=0.0)
+    two = [_node("x.example.org", "xx11"), _node("y.example.org", "yy11")]
+    two[0].name, two[1].name = "NL-1", "NL-3"
+    kept, _tracked = reality.stabilize(two, known, now=60.0)
+    assert (kept.held, kept.renewed) == (2, 0)
+    assert [_both(node)[0][0] for node in two] == ["a.example.org", "c.example.org"]
+    renamed = [_node("p.example.org", "pp11"), _node("q.example.org", "qq11")]
+    renamed[0].name, renamed[1].name = "DE-1", "DE-2"
+    kept, _tracked = reality.stabilize(renamed, known, now=120.0)
+    assert (kept.held, kept.renewed) == (2, 0)
+    assert {_both(node)[0][0] for node in renamed} == {"a.example.org", "c.example.org"}
 
 
 def test_old_record_format_is_read_and_other_servers_are_untouched():

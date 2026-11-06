@@ -15,12 +15,16 @@ KEEP_SECONDS. Свежая берётся, когда срок вышел, ил�
 Несколько записей на одну точку входа и публичный ключ (отчёт reality-pin: без них удержание
 ловило 12–14 серверов, а смены с полями REALITY остались) — для REALITY это один и тот же
 сервер: адрес, порт и ключ определяют его, SNI — лишь маскировка. Такая группа держит набор
-пар целиком: записи упорядочены по прочим полям (без SNI и short_id) и имени, и каждая
-получает пару своего места из прошлого опроса, если число записей то же. Работает до
-split_variants: сводка полей варианта тогда тоже постоянна.
+пар: место записи — хеш прочих полей (без SNI и short_id) и имени, и запись получает пару
+своего места из прошлого опроса. Отчёт reality-pin-r2: число записей в группе меняется от
+опроса к опросу (20–23 свежие пары за опрос, когда при другом числе записей обновлялась вся
+группа), — поэтому место, которого не было, берёт ещё не занятую прежнюю пару группы (место
+пропало — его пара свободна: все записи группы — один сервер), и только когда их не осталось —
+свежую. Работает до split_variants: сводка полей варианта тогда тоже постоянна.
 
 Файл REALITY_FILE (каталог состояния, 0600): ключ — хеш точки входа и публичного ключа,
-значение — пары по местам, когда они приняты, когда группа видна и итоговые отпечатки (для
+значение — пары по местам (`pairs`, `ids`), когда они приняты, когда группа видна и итоговые
+отпечатки (для
 проверки «мёртв»). Записи, не виденные KEEP_UNSEEN, забываются.
 """
 
@@ -113,7 +117,8 @@ def dead_fingerprints(status: dict | None) -> frozenset[str]:
 class Outcome:
     """Итог stabilize для журнала: held — скольким серверам пара оставлена прежней (из них
     grouped — в группах из нескольких записей); renewed — сколько приняли свежую пару, когда
-    подписка её сменила: срок вышел, сервер мёртв или число записей группы другое."""
+    прежняя была: срок вышел, сервер мёртв или в группе новая запись, а свободной прежней пары
+    нет."""
 
     held: int = 0
     grouped: int = 0
@@ -159,6 +164,41 @@ def _fingerprints(entry: dict) -> set[str]:
     return fps
 
 
+def _places(ordered: list[ServerNode]) -> list[str]:
+    """Место записи в группе: хеш прочих полей и имени; одинаковые — с номером по порядку."""
+    seen: dict[str, int] = {}
+    ids = []
+    for node in ordered:
+        base = hashlib.sha256(_stable(node).encode()).hexdigest()[:12]
+        seen[base] = seen.get(base, 0) + 1
+        ids.append(base if seen[base] == 1 else f"{base}#{seen[base]}")
+    return ids
+
+
+def _choose(
+    ids: list[str], fresh: list[list[str]], entry: dict, pairs: list[list[str]],
+) -> tuple[list[list[str]], list[bool]]:
+    """Пары по местам: своё место — его прежняя пара; новое место — свободная прежняя пара
+    группы, нет такой — свежая. Второй список — пара из прошлого опроса или нет."""
+    old_ids = entry.get("ids") if isinstance(entry.get("ids"), list) else []
+    by_id = {str(pid): pair for pid, pair in zip(old_ids, pairs, strict=False)}
+    taken = {pid for pid in ids if pid in by_id}
+    free = [pair for index, pair in enumerate(pairs)
+            if index >= len(old_ids) or str(old_ids[index]) not in taken]
+    chosen, kept = [], []
+    for pid, new in zip(ids, fresh, strict=True):
+        if pid in by_id:
+            chosen.append(by_id[pid])
+            kept.append(True)
+        elif free:
+            chosen.append(free.pop(0))
+            kept.append(True)
+        else:
+            chosen.append(new)
+            kept.append(False)
+    return chosen, kept
+
+
 def stabilize(
     nodes: list[ServerNode], known: dict[str, dict], *, now: float,
     dead: Collection[str] = (),
@@ -175,27 +215,31 @@ def stabilize(
     for key, group in groups.items():
         group.sort(key=lambda item: _stable(item[0]))
         ordered = [node for node, _found in group]
+        ids = _places(ordered)
         fresh = [[sni, sid] for _node, (_public, sni, sid) in group]
         entry = known.get(key)
         pairs = _pairs(entry)
-        if pairs is not None and pairs != fresh:
+        since = now
+        if pairs is not None:
             limit = DEAD_SECONDS if _fingerprints(entry) & set(dead) else KEEP_SECONDS
-            if len(pairs) == len(fresh) and now - float(entry.get("since") or 0) < limit:
-                for node, (sni, sid) in zip(ordered, pairs, strict=True):
-                    _apply(node, sni, sid)
-                changed = sum(1 for old, new in zip(pairs, fresh, strict=True) if old != new)
-                outcome.held += changed
-                if len(ordered) > 1:
-                    outcome.grouped += changed
-            else:
-                outcome.renewed += len(fresh)
-                pairs = None
-        if pairs is None:
-            entry = {"pairs": fresh, "since": now}
+            within = now - float(entry.get("since") or 0) < limit
+            previous, kept = _choose(ids, fresh, entry, pairs)
+            for node, prev, new, from_past in zip(ordered, previous, fresh, kept, strict=True):
+                if within and from_past:
+                    if prev != new:
+                        _apply(node, *prev)
+                        outcome.held += 1
+                        outcome.grouped += len(ordered) > 1
+                elif not from_past or prev != new:
+                    outcome.renewed += 1
+            if within:
+                since = float(entry.get("since", now))
+            pairs = previous if within else fresh
         else:
-            entry = {name: value for name, value in entry.items() if name not in ("sni", "sid")}
-            entry["pairs"] = pairs
-        entry["seen"] = now
+            pairs = fresh
+        entry = {name: value for name, value in (entry or {}).items()
+                 if name not in ("sni", "sid", "fp")}
+        entry.update(pairs=pairs, ids=ids, since=since, seen=now)
         known[key] = entry
         tracked.append((key, ordered))
     return outcome, tracked
