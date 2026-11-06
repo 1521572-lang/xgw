@@ -483,6 +483,7 @@ class _Fetch:
     inventory: engine.Inventory | None = None
     error: Exception | None = None
     spent: float = 0.0  # секунд на опрос
+    asked: bool = False  # подписку обновили кнопкой: новые серверы — сразу (_hold_new)
 
 
 @dataclasses.dataclass
@@ -879,6 +880,10 @@ class Daemon:
         # Состав прошлой смены поколения sing-box: отпечатки списка подписок и пула — для
         # строки журнала о том, откуда смена состава (singbox_generation.composition).
         self._sb_seen: tuple[set[str], set[str]] | None = None
+        # Новые серверы подписки, ждущие пачки (_hold_new), и когда пачка входила последней.
+        self._new_waiting: set[str] = set()
+        self._new_admitted_at: float | None = None
+        self._inventory_full: engine.Inventory | None = None  # с ждущими — для панели
         # Отпечатки, которые sing-box вёл за последние сутки (wall): вернувшаяся запись
         # подписки отличается в строке состава от нового сервера.
         self._sb_history: dict[str, float] = {}
@@ -1136,6 +1141,9 @@ class Daemon:
             return
         self.inventory = previous.inventory
         self.next_refresh = previous.next_refresh
+        self._new_waiting = set(previous._new_waiting)
+        self._new_admitted_at = previous._new_admitted_at
+        self._inventory_full = previous._inventory_full
         self._rebuild_asked = True
         if previous.cfg.managed.routes != self.cfg.managed.routes:
             # Свой сервер устройства (Ф4) выбран в панели — его ждут сразу. С 0.2.0 это только
@@ -1509,7 +1517,8 @@ class Daemon:
         elif not changed and (
             refresh_asked or (state is not State.WAN_DOWN and now >= self.next_refresh)
         ):
-            changed = self._refresh(now, via_xray=signals.xray_ok, urgent=urgent)
+            changed = self._refresh(now, via_xray=signals.xray_ok, urgent=urgent,
+                                    asked=refresh_asked)
         elif not changed and self._rebuild_asked and self.inventory is not None:
             self._rebuild_asked = False
             self._save_inventory(self.inventory)
@@ -2359,6 +2368,7 @@ class Daemon:
 
     def _refresh(
         self, now: float, *, via_xray: bool, urgent: bool, background: bool = True,
+        asked: bool = False,
     ) -> bool:
         """Опрос подписок и применение изменений. Опрос — в фоновом потоке (REFRESH_WAIT):
         шаг ждёт его не дольше refresh_wait (background=False — до конца: первый запуск,
@@ -2368,6 +2378,7 @@ class Daemon:
             return False
         job = self._fetch if self._fetch is not None else self._start_fetch(now, via_xray)
         job.urgent = job.urgent or urgent
+        job.asked = job.asked or asked
         with job.lock:
             job.waiting = True
         job.done.wait(self.refresh_wait if background else None)
@@ -2436,7 +2447,7 @@ class Daemon:
             # у запроса подписки и так три повтора с паузами.
             self.next_refresh = min(self.next_refresh, now + jitter(SUBSCRIPTION_RETRY))
             return False
-        self.inventory = inventory
+        self.inventory = self._hold_new(inventory, admit=job.urgent or urgent or job.asked)
         if inventory.complete:
             self._sub_failing_since, self._sub_alerted = None, False
         self._rebuild_asked = False  # сборка ниже уже учитывает новые настройки
@@ -2445,6 +2456,47 @@ class Daemon:
         # Опрос с 0.2.0 — в фоне, вне шага; сборка и применение — в шаге.
         self.log.info("обновление подписки: опрос %.0f с; сборка запрошена отдельно", job.spent)
         return changed
+
+    def _hold_new(self, inventory: engine.Inventory, *, admit: bool) -> engine.Inventory:
+        """Новые серверы подписки (отпечатков не было в прошлом списке) — в работу пачкой,
+        не чаще раза в filters.new_hold_hours: каждый новый сервер — новое поколение sing-box
+        (прежнее 5 минут доотдаёт соединения, долгие рвутся), а подписка добавляет по 1–2
+        почти в каждом опросе (отчёт group-hold 07.11.2026). Пока сервер ждёт, его нет в
+        списке, по которому собирается конфиг; в списке для панели он есть. Пачка входит
+        сразу, когда состав меняется и так (подписка убрала серверы), шлюз не в порядке
+        (новые серверы нужны), опрос срочный или подписку обновили кнопкой; без серверов в
+        работе (первый опрос) ждать некому."""
+        wall = self.wall()
+        hours = self.cfg.filters.new_hold_hours
+        self._inventory_full = None
+        found = {node.fingerprint for node in inventory.nodes}
+        if self.inventory is None or self._new_admitted_at is None or not hours:
+            self._new_waiting, self._new_admitted_at = set(), wall
+            return inventory
+        before = {node.fingerprint for node in self.inventory.nodes}
+        waiting = (self._new_waiting | (found - before)) & found
+        if not waiting:
+            self._new_waiting = set()
+            return inventory
+        if admit:
+            reason = "срочный опрос или кнопка «Обновить»"
+        elif self.machine.state is not State.HEALTHY:
+            reason = f"шлюз в состоянии {self.machine.state}"
+        elif before - found:
+            reason = "подписка убрала серверы — состав меняется и так"
+        elif wall - self._new_admitted_at >= hours * 3600.0:
+            reason = f"прошло {hours} ч с прошлой пачки"
+        else:
+            self._new_waiting = waiting
+            due = time.strftime("%H:%M", time.localtime(self._new_admitted_at + hours * 3600.0))
+            self.log.info("новых серверов подписки ждут пачки: %d — в работу не позже %s "
+                          "или раньше, со сменой состава", len(waiting), due)
+            self._inventory_full = inventory
+            return dataclasses.replace(inventory, nodes=[
+                node for node in inventory.nodes if node.fingerprint not in waiting])
+        self.log.info("новые серверы подписки в работу: %d (%s)", len(waiting), reason)
+        self._new_waiting, self._new_admitted_at = set(), wall
+        return inventory
 
     def _log_composition(self, generation, assembly) -> None:
         """Строка журнала: сколько серверов sing-box добавилось и убыло и откуда."""
@@ -2689,6 +2741,8 @@ class Daemon:
         self.notifier.event("subscription", text, notify=alert)
 
     def _save_inventory(self, inventory: engine.Inventory) -> None:
+        if inventory is self.inventory and self._inventory_full is not None:
+            inventory = self._inventory_full  # серверы, ждущие пачки (_hold_new), панель видит
         try:
             engine.save_inventory(self.paths, self.cfg, inventory)
         except OSError as exc:  # список нужен только панели

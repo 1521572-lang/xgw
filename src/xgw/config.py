@@ -209,6 +209,11 @@ class Filters:
     # Множитель расхода трафика в имени сервера («x10 Германия»): первая группа — число.
     # Пусто — множители не ищутся, все серверы x1 (cost.py).
     multiplier_regex: str = cost.DEFAULT_MULTIPLIER_REGEX
+    # Новые серверы подписки — в работу пачкой, не чаще раза в столько часов (отчёт
+    # group-hold 07.11.2026: смены поколения sing-box шли от притока по 1–2 новых сервера
+    # почти в каждом опросе). Сразу — когда подписка убрала серверы, шлюз не в порядке или
+    # подписку обновили кнопкой. 0 — новые сразу, как до 0.2.0.
+    new_hold_hours: int = 6
 
 
 @dataclass
@@ -929,6 +934,10 @@ def _validate(cfg: Config) -> list[str]:
     if cfg.filters.max_members < 1:
         warnings.append("filters.max_members должен быть не меньше 1 — используется 1")
         cfg.filters.max_members = 1
+    if not 0 <= cfg.filters.new_hold_hours <= 48:
+        warnings.append(f"filters.new_hold_hours={cfg.filters.new_hold_hours}: ожидается "
+                        "0–48 — используется 6")
+        cfg.filters.new_hold_hours = 6
     if cfg.watchdog.busy_window_s < 1:
         warnings.append("watchdog.busy_window_s должен быть не меньше 1 — используется 10")
         cfg.watchdog.busy_window_s = Watchdog().busy_window_s

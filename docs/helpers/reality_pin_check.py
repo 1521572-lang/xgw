@@ -9,7 +9,8 @@ refresh     — внеочередное обновление подписок �
 generations — смены поколения sing-box с запуска службы xgw: число, причины, поля, и
               сколько раз обновление подписки оставило прежние пары; откуда смены состава
               (строки «состав sing-box») и сколько записей групп пропало, вернулось и
-              держится копиями.
+              держится копиями; сколько новых серверов подписки ждали пачки и сколько раз и
+              почему пачка входила в работу.
 """
 
 import hashlib
@@ -37,6 +38,10 @@ LABELS = (("новые +", "new"), ("вернулись +", "back"), ("снов�
           ("пропали −", "gone"), ("не отобраны −", "dropped"), ("пул +", "pool_in"),
           ("пул +", "pool_out"), ("набор вариантов ", "variants"))
 REFRESHED = "обновление подписки: опрос"
+WAITING = "новых серверов подписки ждут пачки: "
+ADMITTED = "новые серверы подписки в работу: "
+REASONS = (("кнопка", "button"), ("шлюз в состоянии", "state"), ("убрала", "removed"),
+           ("прошло", "hold"))
 
 
 def health():
@@ -113,6 +118,7 @@ def summarize(lines, report):
     switches, parts, fields, sizes = 0, Counter(), Counter(), []
     held, grouped, renewed = [], [], []
     totals, flaps, compositions, copies = Counter(), Counter(), 0, []
+    waiting, admitted, reasons = [], [], Counter()
     for line in lines:
         if SWITCH in line:
             switches += 1
@@ -136,6 +142,13 @@ def summarize(lines, report):
                 flaps["returned"] += int(numbers[1])
             if len(numbers) == 3:
                 copies.append(int(numbers[2]))
+        elif WAITING in line:
+            waiting.append(number_after(line, WAITING) or 0)
+        elif ADMITTED in line:
+            admitted.append(number_after(line, ADMITTED) or 0)
+            for marker, name in REASONS:
+                if marker in line:
+                    reasons[name] += 1
         elif RENEWED in line:
             renewed.append(number_after(line, RENEWED) or 0)
         elif HELD in line:
@@ -149,7 +162,10 @@ def summarize(lines, report):
                   grouped_max=max(grouped, default=0), renewed=renewed,
                   composition_lines=compositions, composition=dict(totals),
                   group_flaps=dict(flaps), copies_max=max(copies, default=0),
-                  copies_last=copies[-1] if copies else 0)
+                  copies_last=copies[-1] if copies else 0,
+                  new_waiting_lines=len(waiting), new_waiting_max=max(waiting, default=0),
+                  new_batches=len(admitted), new_admitted=sum(admitted),
+                  batch_reasons=dict(reasons))
 
 
 def panel(path, body=None):
