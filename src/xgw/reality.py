@@ -26,6 +26,16 @@ KEEP_SECONDS. Свежая берётся, когда срок вышел, ил�
 Работает до split_variants: сводка полей варианта тогда тоже постоянна, и вернувшаяся запись
 получает прежний отпечаток (история split_variants).
 
+Отчёт sb-composition: состав sing-box меняет только подписка (за 3 часа новых 12, пропавших 17),
+а записей групп пропало 35 и вернулось лишь 4 — подписка выдаёт группе то больше записей, то
+меньше. Когда записей столько же, новая берёт пару пропавшей и сохраняет её отпечаток; смена
+состава — только от другого числа записей. Поэтому пропавшее место группы, чья точка входа
+осталась, держится копией (`copies`): соседняя запись того же вида (поля без SNI, short_id и
+имени те же) с парой пропавшей — тот же сервер REALITY, и отпечаток тот же. Копия живёт, пока
+помнится пара пропавшего места (KEEP_SECONDS), пока группа держит пары и пока копия по
+состоянию шлюза не мертва; новая запись группы сначала занимает пару пропавшего места, и копия
+уходит. Группа пропала целиком — копий нет.
+
 Файл REALITY_FILE (каталог состояния, 0600): ключ — хеш точки входа и публичного ключа,
 значение — пары по местам (`pairs`, `ids`), когда они приняты, когда группа видна и итоговые
 отпечатки (для
@@ -34,6 +44,7 @@ KEEP_SECONDS. Свежая берётся, когда срок вышел, ил�
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Collection
@@ -130,10 +141,13 @@ class Outcome:
     # Записи групп, пропавшие в этом опросе, и вернувшиеся с прежней парой.
     vanished: int = 0
     returned: int = 0
+    # Пропавших мест, оставленных копиями соседней записи (группа того же размера в sing-box).
+    copies: int = 0
 
 
-def _stable(node: ServerNode) -> str:
-    """Описание сервера без SNI и short_id — порядок записей внутри группы."""
+def _stable(node: ServerNode, *, named: bool = True) -> str:
+    """Описание сервера без SNI и short_id (и без имени, named=False) — порядок записей
+    внутри группы."""
     outbound = json.loads(json.dumps(node.outbound or {}, default=str))
     main = json.loads(json.dumps(node.singbox.main if node.singbox else {}, default=str))
     stream = outbound.get("streamSettings")
@@ -146,7 +160,14 @@ def _stable(node: ServerNode) -> str:
         tls.pop("server_name", None)
         if isinstance(tls.get("reality"), dict):
             tls["reality"].pop("short_id", None)
-    return json.dumps([outbound, main, node.name], sort_keys=True, ensure_ascii=False)
+    return json.dumps([outbound, main, node.name if named else ""], sort_keys=True,
+                      ensure_ascii=False)
+
+
+def _shape(node: ServerNode) -> str:
+    """Вид записи: хеш описания без SNI, short_id и имени — копия пропавшей записи делается
+    только с соседки того же вида."""
+    return hashlib.sha256(_stable(node, named=False).encode()).hexdigest()[:12]
 
 
 def _pairs(entry: object) -> list[list[str]] | None:
@@ -182,32 +203,48 @@ def _places(ordered: list[ServerNode]) -> list[str]:
     return ids
 
 
-def _gone(entry: dict, now: float) -> dict[str, list]:
-    """Пары пропавших мест: место → [SNI, short_id, когда пропало]; старше KEEP_SECONDS — нет."""
+def _gone(entry: dict, now: float, dead: Collection[str] = ()) -> dict[str, list]:
+    """Пары пропавших мест: место → [SNI, short_id, когда пропало, вид записи, отпечаток
+    копии]; старше KEEP_SECONDS и с мёртвой копией — нет. Прежний формат (три поля) — без вида:
+    копии у такого места не будет."""
     found = entry.get("gone")
     if not isinstance(found, dict):
         return {}
-    return {str(pid): list(item) for pid, item in found.items()
-            if isinstance(item, list) and len(item) == 3
-            and all(isinstance(value, str) for value in item[:2])
-            and isinstance(item[2], int | float) and now - float(item[2]) < KEEP_SECONDS}
+    gone = {}
+    for pid, item in found.items():
+        if not (isinstance(item, list) and len(item) in (3, 5)
+                and all(isinstance(value, str) for value in item[:2] + item[3:])
+                and isinstance(item[2], int | float) and now - float(item[2]) < KEEP_SECONDS):
+            continue
+        item = [*item[:3], *(item[3:] or ["", ""])]
+        if not item[4] or item[4] not in dead:
+            gone[str(pid)] = item
+    return gone
 
 
 def _choose(
     ids: list[str], fresh: list[list[str]], entry: dict, pairs: list[list[str]], now: float,
-) -> tuple[list[list[str]], list[bool], dict[str, list], int]:
+    dead: Collection[str] = (),
+) -> tuple[list[list[str]], list[bool], dict[str, list], int, int]:
     """Пары по местам: своё место — его прежняя пара; вернувшееся — пара, с которой оно
-    пропало, если её не заняли; новое — свободная прежняя пара группы, нет такой — свежая.
-    Возвращает пары, признаки «пара из прошлого», пропавшие места и сколько вернулось."""
+    пропало, если её не заняли; новое — пара пропавшего места (сначала пропавшего сейчас), нет
+    такой — свежая. Возвращает пары, признаки «пара из прошлого», пропавшие места с ещё не
+    занятыми парами, сколько мест вернулось и сколько пропало сейчас."""
     old_ids = [str(pid) for pid in entry.get("ids") or []] if isinstance(
         entry.get("ids"), list) and len(entry["ids"]) == len(pairs) else []
-    places = list(zip(old_ids, pairs, strict=True)) if old_ids else []
-    by_id = dict(places)
-    gone = _gone(entry, now)
+    shapes = entry.get("shapes")
+    if not (isinstance(shapes, list) and len(shapes) == len(old_ids)
+            and all(isinstance(shape, str) for shape in shapes)):
+        shapes = [""] * len(old_ids)
+    places = list(zip(old_ids, pairs, shapes, strict=True)) if old_ids else []
+    by_id = {pid: item for pid, item, _shape in places}
+    gone = _gone(entry, now, dead)
     current = set(ids)
-    for pid, item in places:
+    vanished = 0
+    for pid, item, shape in places:
         if pid not in current:
-            gone[pid] = [*item, now]
+            gone[pid] = [*item, now, shape, ""]
+            vanished += 1
     chosen: list[list[str] | None] = [by_id.get(pid) for pid in ids]
     used = {tuple(item) for item in chosen if item is not None}
     returned = 0
@@ -217,8 +254,12 @@ def _choose(
             chosen[index] = back[:2]
             used.add(tuple(back[:2]))
             returned += 1
-    free = [item for pid, item in zip(old_ids or [""] * len(pairs), pairs, strict=True)
-            if not old_ids or pid not in current]
+    if old_ids:
+        free = [item[:2] for _pid, item in sorted(
+            ((pid, item) for pid, item in gone.items() if pid not in current),
+            key=lambda found: -float(found[1][2]))]
+    else:
+        free = [list(item) for item in pairs]
     kept = [item is not None for item in chosen]
     for index, new in enumerate(fresh):
         if chosen[index] is not None:
@@ -231,18 +272,46 @@ def _choose(
         else:
             chosen[index] = new
         used.add(tuple(chosen[index]))
-    for pid in ids:
-        gone.pop(pid, None)
-    return [list(item) for item in chosen if item is not None], kept, gone, returned
+    gone = {pid: item for pid, item in gone.items()
+            if pid not in current and tuple(item[:2]) not in used}
+    return [list(item) for item in chosen if item is not None], kept, gone, returned, vanished
+
+
+def _copies(
+    ordered: list[ServerNode], gone: dict[str, list], taken: list[list[str]],
+) -> list[tuple[str, ServerNode]]:
+    """Копии пропавших мест группы: соседняя запись того же вида с парой пропавшей — тот же
+    сервер REALITY (см. описание модуля). Записи с исходным тегом цепочки не копируются: тег
+    в Xray должен быть один."""
+    used = {tuple(item) for item in taken}
+    by_shape: dict[str, ServerNode] = {}
+    for node in ordered:
+        by_shape.setdefault(_shape(node), node)
+    found = []
+    for pid, item in gone.items():
+        sibling = by_shape.get(item[3]) if item[3] else None
+        if sibling is None or sibling.keep_tag or tuple(item[:2]) in used:
+            continue
+        twin = copy.deepcopy(sibling)
+        _apply(twin, item[0], item[1])
+        used.add(tuple(item[:2]))
+        found.append((pid, twin))
+    return found
+
+
+def copies(tracked: list[tuple[str, list[ServerNode], list]]) -> list[ServerNode]:
+    """Копии пропавших мест из итога stabilize — их добавляют к серверам до split_variants."""
+    return [twin for _key, _ordered, found in tracked for _pid, twin in found]
 
 
 def stabilize(
     nodes: list[ServerNode], known: dict[str, dict], *, now: float,
     dead: Collection[str] = (),
-) -> tuple[Outcome, list[tuple[str, list[ServerNode]]]]:
+) -> tuple[Outcome, list[tuple[str, list[ServerNode], list[tuple[str, ServerNode]]]]]:
     """Вернуть серверам прежние SNI и short_id (см. описание модуля); known дополняется.
     Отпечатки узлов — ещё общие (до split_variants). Возвращает итог и группы (ключ записи,
-    узлы по местам) — для remember после split_variants."""
+    узлы по местам, копии пропавших мест) — для copies и remember после split_variants.
+    Сами копии в nodes не добавляются."""
     groups: dict[str, list[tuple[ServerNode, tuple[str, str, str]]]] = {}
     for node in nodes:
         found = pair(node)
@@ -256,15 +325,17 @@ def stabilize(
         fresh = [[sni, sid] for _node, (_public, sni, sid) in group]
         entry = known.get(key)
         pairs = _pairs(entry)
-        since, gone = now, {}
+        since, gone, twins = now, {}, []
         if pairs is not None:
             limit = DEAD_SECONDS if _fingerprints(entry) & set(dead) else KEEP_SECONDS
             within = now - float(entry.get("since") or 0) < limit
-            previous, kept, gone, returned = _choose(ids, fresh, entry, pairs, now)
-            vanished = sum(1 for item in gone.values() if item[2] == now)
+            previous, kept, gone, returned, vanished = _choose(
+                ids, fresh, entry, pairs, now, dead)
             outcome.vanished += vanished
             if within:
                 outcome.returned += returned
+                twins = _copies(ordered, gone, previous)
+                outcome.copies += len(twins)
             else:
                 gone = {}
             for node, prev, new, from_past in zip(ordered, previous, fresh, kept, strict=True):
@@ -282,20 +353,26 @@ def stabilize(
             pairs = fresh
         entry = {name: value for name, value in (entry or {}).items()
                  if name not in ("sni", "sid", "fp")}
-        entry.update(pairs=pairs, ids=ids, since=since, seen=now, gone=gone)
+        entry.update(pairs=pairs, ids=ids, shapes=[_shape(node) for node in ordered],
+                     since=since, seen=now, gone=gone)
         known[key] = entry
-        tracked.append((key, ordered))
+        tracked.append((key, ordered, twins))
     return outcome, tracked
 
 
-def remember(known: dict[str, dict], tracked: list[tuple[str, list[ServerNode]]],
+def remember(known: dict[str, dict],
+             tracked: list[tuple[str, list[ServerNode], list[tuple[str, ServerNode]]]],
              now: float) -> None:
-    """Итоговые отпечатки (после split_variants) — для проверки «мёртв» при следующем опросе;
-    давно не виденные серверы забываются."""
-    for key, ordered in tracked:
+    """Итоговые отпечатки (после split_variants) — для проверки «мёртв» при следующем опросе
+    (у копий — в записи пропавшего места); давно не виденные серверы забываются."""
+    for key, ordered, twins in tracked:
         if key in known:
             known[key].pop("fp", None)
             known[key]["fps"] = [node.fingerprint for node in ordered]
+            gone = known[key].get("gone") or {}
+            for pid, twin in twins:
+                if pid in gone:
+                    gone[pid][4] = twin.fingerprint
     for key in [key for key, entry in known.items()
                 if now - float(entry.get("seen") or 0) >= KEEP_UNSEEN]:
         del known[key]

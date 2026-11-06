@@ -8,7 +8,8 @@ refresh     — внеочередное обновление подписок �
               sing-box и из-за чего (имена частей и полей, без значений);
 generations — смены поколения sing-box с запуска службы xgw: число, причины, поля, и
               сколько раз обновление подписки оставило прежние пары; откуда смены состава
-              (строки «состав sing-box») и сколько записей групп пропало и вернулось.
+              (строки «состав sing-box») и сколько записей групп пропало, вернулось и
+              держится копиями.
 """
 
 import hashlib
@@ -76,7 +77,11 @@ def reality(report):
                   grouped_entries=sum(len(e.get("pairs") or []) for e in known.values()
                                       if len(e.get("pairs") or []) > 1),
                   older_than_1h=sum(1 for e in known.values()
-                                    if now - float(e.get("since") or now) >= 3600))
+                                    if now - float(e.get("since") or now) >= 3600),
+                  gone_places=sum(len(e.get("gone") or {}) for e in known.values()),
+                  copies_with_fingerprint=sum(
+                      1 for e in known.values() for item in (e.get("gone") or {}).values()
+                      if isinstance(item, list) and len(item) == 5 and item[4]))
     return mode == 0o600 and len(known) > 0
 
 
@@ -107,7 +112,7 @@ def composition(line, totals):
 def summarize(lines, report):
     switches, parts, fields, sizes = 0, Counter(), Counter(), []
     held, grouped, renewed = [], [], []
-    totals, flaps, compositions = Counter(), Counter(), 0
+    totals, flaps, compositions, copies = Counter(), Counter(), 0, []
     for line in lines:
         if SWITCH in line:
             switches += 1
@@ -126,9 +131,11 @@ def summarize(lines, report):
         elif FLAPS in line:
             numbers = [word for word in line.split(FLAPS, 1)[1].replace(",", " ").split()
                        if word.isdigit()]
-            if len(numbers) == 2:
+            if len(numbers) in (2, 3):
                 flaps["vanished"] += int(numbers[0])
                 flaps["returned"] += int(numbers[1])
+            if len(numbers) == 3:
+                copies.append(int(numbers[2]))
         elif RENEWED in line:
             renewed.append(number_after(line, RENEWED) or 0)
         elif HELD in line:
@@ -141,7 +148,8 @@ def summarize(lines, report):
                   held_times=len(held), held_max=max(held, default=0),
                   grouped_max=max(grouped, default=0), renewed=renewed,
                   composition_lines=compositions, composition=dict(totals),
-                  group_flaps=dict(flaps))
+                  group_flaps=dict(flaps), copies_max=max(copies, default=0),
+                  copies_last=copies[-1] if copies else 0)
 
 
 def panel(path, body=None):

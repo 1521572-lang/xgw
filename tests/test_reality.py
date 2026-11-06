@@ -22,10 +22,10 @@ def paths(tmp_path, monkeypatch):
     return found
 
 
-def _link(sni, sid, port=443):
+def _link(sni, sid, port=443, name="NL-1"):
     return (f"vless://11111111-2222-3333-4455-666666666661@203.0.113.10:{port}?encryption=none"
             f"&flow=xtls-rprx-vision&security=reality&sni={sni}&fp=chrome"
-            f"&pbk={links.FAKE_PBK}&sid={sid}&type=tcp#NL-1")
+            f"&pbk={links.FAKE_PBK}&sid={sid}&type=tcp#{name}")
 
 
 def _node(sni="a.example.org", sid="aa11", port=443):
@@ -150,6 +150,60 @@ def test_vanished_entry_returns_with_its_pair():
     assert next(iter(known.values()))["gone"] == {}
 
 
+def _group(prefix, names, sid="11"):
+    nodes = [_node(f"{prefix}{index}.example.org", f"{prefix}{prefix}{sid}")
+             for index in range(len(names))]
+    for node, name in zip(nodes, names, strict=True):
+        node.name = name
+    return nodes
+
+
+def test_vanished_entry_is_held_as_a_copy_until_a_new_entry_takes_its_pair():
+    """Отчёт sb-composition: группа то теряет запись, то получает новую — пропавшее место
+    держится копией соседки с его парой, новая запись занимает эту пару, и копия уходит."""
+    known = {}
+    start = _group("a", ["NL-1", "NL-2", "NL-3"])
+    reality.stabilize(start, known, now=0.0)
+    two = _group("x", ["NL-1", "NL-3"])
+    kept, tracked = reality.stabilize(two, known, now=60.0)
+    assert (kept.vanished, kept.copies) == (1, 1)
+    twins = reality.copies(tracked)
+    assert len(twins) == 1 and twins[0] not in two
+    assert _both(twins[0]) == (("a1.example.org", "aa11"), ("a1.example.org", "aa11"))
+    assert [_both(node)[0][0] for node in two] == ["a0.example.org", "a2.example.org"]
+    kept, tracked = reality.stabilize(_group("y", ["NL-1", "NL-3"]), known, now=120.0)
+    assert (kept.vanished, kept.copies) == (0, 1)
+    grown = _group("z", ["NL-1", "NL-3", "NL-4"])
+    kept, tracked = reality.stabilize(grown, known, now=180.0)
+    assert (kept.held, kept.renewed, kept.copies) == (3, 0, 0)
+    assert _both(grown[2])[0] == ("a1.example.org", "aa11")
+    assert next(iter(known.values()))["gone"] == {}
+
+
+def test_copy_goes_when_dead_expired_or_of_another_kind():
+    known = {}
+    reality.stabilize(_group("a", ["NL-1", "NL-2"]), known, now=0.0)
+    _kept, tracked = reality.stabilize(_group("b", ["NL-1"]), known, now=60.0)
+    twin = reality.copies(tracked)[0]
+    twin.fingerprint = "copyfp"
+    reality.remember(known, tracked, 60.0)
+    kept, _tracked = reality.stabilize(_group("c", ["NL-1"]), known, now=120.0)
+    assert kept.copies == 1
+    kept, _tracked = reality.stabilize(_group("d", ["NL-1"]), known, now=180.0,
+                                       dead={"copyfp"})
+    assert kept.copies == 0 and next(iter(known.values()))["gone"] == {}
+    known = {}
+    reality.stabilize(_group("a", ["NL-1", "NL-2"]), known, now=0.0)
+    assert reality.stabilize(_group("b", ["NL-1"]), known, now=60.0)[0].copies == 1
+    late = reality.stabilize(_group("c", ["NL-1"]), known, now=reality.KEEP_SECONDS)[0]
+    assert (late.copies, late.renewed) == (0, 1)
+    known = {}
+    first = _group("a", ["NL-1", "NL-2"])
+    first[1].outbound["streamSettings"]["realitySettings"]["fingerprint"] = "firefox"
+    reality.stabilize(first, known, now=0.0)
+    assert reality.stabilize(_group("b", ["NL-1"]), known, now=60.0)[0].copies == 0
+
+
 def test_old_record_format_is_read_and_other_servers_are_untouched():
     known = {}
     reality.stabilize([_node()], known, now=0.0)
@@ -190,3 +244,21 @@ def test_collect_keeps_pair_and_fingerprint_across_fetches(paths, caplog):
     assert any("оставлены прежние" in r.getMessage() for r in caplog.records)
     path = reality.reality_file(paths)
     assert oct(path.stat().st_mode & 0o777) == "0o600"
+
+
+def test_collect_keeps_group_size_and_fingerprints_when_an_entry_vanishes(paths):
+    """Пропавшая запись группы — копией с прежним отпечатком: состав sing-box не меняется."""
+    cfg = Config()
+
+    def collect(prefix, names):
+        cfg.manual.links = [_link(f"{prefix}{index}.example.org", f"{prefix}{prefix}11",
+                                  name=name) for index, name in enumerate(names)]
+        return engine.collect(cfg, paths, mark=None, logger=LOG).nodes
+
+    first = collect("a", ["NL-1", "NL-2", "NL-3"])
+    second = collect("b", ["NL-1", "NL-3"])
+    assert len(second) == 3
+    assert {node.fingerprint for node in second} == {node.fingerprint for node in first}
+    third = collect("c", ["NL-1", "NL-3", "NL-5"])
+    assert len(third) == 3
+    assert {node.fingerprint for node in third} == {node.fingerprint for node in first}
