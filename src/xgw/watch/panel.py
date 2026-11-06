@@ -1824,8 +1824,6 @@ class Panel:
             if self.daemon is None:
                 return actions.Outcome(1, "демон XGW ещё не готов — повторите через минуту")
             if name == "speed":
-                if not cfg.speed.sticky:
-                    return actions.Outcome(2, "замер скорости выключен: включите основной сервер")
                 if not (cfg.speed.unlimited_hours or cfg.speed.limited_hours):
                     return actions.Outcome(
                         2, "замер скорости выключен: speed.unlimited_hours и limited_hours = 0"
@@ -2076,9 +2074,7 @@ class Panel:
             "singbox": (snapshot.get("singbox") or {}).get("version") or "",
             "core_job": cores.job_active(self.paths, now),
             "main": main,
-            "speed_on": bool(
-                cfg.speed.sticky and (cfg.speed.unlimited_hours or cfg.speed.limited_hours)
-            ),
+            "speed_on": bool(cfg.speed.unlimited_hours or cfg.speed.limited_hours),
             "busy": {
                 "cores": bool(daemon is not None and daemon.cores_pending),
                 "speed": bool(daemon is not None and daemon.speed_pending),

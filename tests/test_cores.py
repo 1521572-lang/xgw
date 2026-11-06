@@ -542,6 +542,8 @@ def harness(tmp_path, monkeypatch):
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []
     cfg.speed.sticky = False
+    # Плановые замеры без основного идут (ASSUMPTIONS п. 325): здесь их нет, как прежде.
+    cfg.speed.unlimited_hours = cfg.speed.limited_hours = 0
     monkeypatch.setattr(daemon, "CORES_FIRST_CHECK", 300.0)
     instance = Harness(cfg, paths)
     instance.xray_version = "26.10.21"

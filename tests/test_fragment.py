@@ -209,6 +209,8 @@ def dpi(tmp_path, monkeypatch):
     cfg.filters.exclude_regex = ""
     cfg.dns.bootstrap = []
     cfg.speed.sticky = False
+    # Плановые замеры без основного идут (ASSUMPTIONS п. 325): здесь их нет, как прежде.
+    cfg.speed.unlimited_hours = cfg.speed.limited_hours = 0
     # Вторая ступень дробления в Xray (0.1.18) — в своих тестах: здесь лестница, как до неё.
     cfg.fragment.split = False
     return Dpi(cfg, paths)

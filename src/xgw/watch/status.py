@@ -240,8 +240,6 @@ def speed_note(
     замера."""
     if isinstance(record.get("mbps"), (int, float)):
         return ""
-    if not cfg.speed.sticky:
-        return "скорость не замеряется: основной сервер выключен"
     if price is not None and price >= SKIP_PRICE:
         return "скорость серверов x100 не замеряется: они для LTE"
     if price is not None and not every_hours(cfg, price, spare=spare):
@@ -266,7 +264,7 @@ def speed_entry_mb(cfg: Config, entry: dict, *, spare: bool = False) -> float:
     срок его класса (speed.every_hours)."""
     price = entry.get("cost", 0.0)
     hours = every_hours(cfg, price, spare=spare)
-    if not (cfg.speed.sticky and hours):
+    if not hours:
         return 0.0
     return size_mb(cfg, price, spare=spare) * 24 / hours
 
@@ -939,7 +937,8 @@ def render_main(status: dict) -> str:
     main = status.get("main")
     if not status.get("sticky", True):
         return ("Основной сервер: выключен (speed.sticky = false) — сервер выбирает ядро "
-                "по задержке и меняет выбор после каждой пробы")
+                "по задержке и меняет выбор после каждой пробы; скорость серверов замеряется, "
+                "как обычно")
     if not main:
         return ""
     name = f"«{main['name']}»" if main.get("name") else main["tag"]

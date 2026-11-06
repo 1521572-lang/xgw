@@ -474,7 +474,8 @@ def test_status_without_sticky(daemon):
     _step(daemon)
     status = daemon.status()
     assert status["sticky"] is False and status["main"] is None
-    assert status["budget"]["speed_mb"] == 0
+    # Плановые замеры идут и без основного (07.11.2026) — их трафик в оценке суток.
+    assert status["budget"]["speed_mb"] > 0
     store = Store(daemon.paths.db_file)
     try:
         assert not store.get_meta("main")
@@ -658,17 +659,32 @@ def test_main_leaves_a_server_youtube_does_not_pass(daemon):
     assert daemon.main["tag"] == first
 
 
-@pytest.mark.parametrize("off", ["sticky", "hours"])
-def test_the_button_works_without_background_speed_measurements(daemon, off):
-    """05.11.2026: при выключенном основном сервере (speed.sticky) или сроках замеров 0 иконка
-    пропадала. Кнопка — просьба человека: сервер замеряется и без плановых замеров, а другие
-    серверы фоном не замеряются."""
+def test_sticky_off_still_measures_every_live_server_in_the_background(daemon):
+    """07.11.2026: основной сервер выключен — скорость в панели застыла на днях давности.
+    Сервер по-прежнему выбирает ядро (закрепления нет), а замеры идут по расписанию."""
+    daemon.cfg.speed.sticky = False
+    first, second = _start(daemon)
+    _settle(daemon)
+    assert {first, second} <= set(daemon.measured)
+    assert set(daemon.tags("spare")) <= set(daemon.measured)
+    assert daemon.main is None and daemon.api.state.override is None
+    assert _main_events(daemon) == []
+    measured = len(daemon.measured)
+    for _ in range(5):
+        _step(daemon)
+    assert len(daemon.measured) == measured
+    daemon.t += 3600 * 1.2
+    _settle(daemon)
+    assert len(daemon.measured) > measured
+    assert daemon.api.state.override is None
+
+
+def test_the_button_works_without_background_speed_measurements(daemon):
+    """05.11.2026: при сроках замеров 0 иконка пропадала. Кнопка — просьба человека: сервер
+    замеряется и без плановых замеров, а другие серверы фоном не замеряются."""
     _first, second = _start(daemon)
     _settle(daemon)
-    if off == "sticky":
-        daemon.cfg.speed.sticky = False
-    else:
-        daemon.cfg.speed.unlimited_hours = daemon.cfg.speed.limited_hours = 0
+    daemon.cfg.speed.unlimited_hours = daemon.cfg.speed.limited_hours = 0
     measured = len(daemon.measured)
     for _ in range(3):
         _step(daemon)

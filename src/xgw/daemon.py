@@ -5404,7 +5404,10 @@ class Daemon:
         резервный выход (fallbackTag), а при XRAY_DOWN и прочем выбирать не из чего.
         Ручное закрепление (xgw pin, панель) главнее: пока оно действует, демон его не
         трогает и основной не выбирает, но серверы замеряет, как обычно, — скорость видна в
-        панели, а итоги замеров основной сверит, когда выбор снимут."""
+        панели, а итоги замеров основной сверит, когда выбор снимут. Так же и при
+        выключенном основном сервере (speed.sticky = false, решение заказчика 07.11.2026):
+        сервер выбирает ядро по задержке, а плановые замеры идут, как обычно, — без них
+        скорость в панели застывала на днях давности."""
         members = [info for info in view if info.role == "proxy"]
         if not signals.xray_ok:
             # Снимать нечего: перезапуск Xray закрепление сбросит сам.
@@ -5412,12 +5415,13 @@ class Daemon:
                 self._set_main(None)
             self._main_pinned = None
             return
-        if not (
-            self.cfg.speed.sticky and not self.probe_target
-            and state in (State.HEALTHY, State.DEGRADED) and members
-        ):
+        ready = not self.probe_target and state in (State.HEALTHY, State.DEGRADED) and members
+        if not (self.cfg.speed.sticky and ready):
             self._release_main()
-            if members:
+            if ready:
+                # Основной выключен: только замеры, без выбора и контроля основного.
+                self._speed_step(view, applied, observatory, now)
+            elif members:
                 self._speed_manual(view, applied)
             return
         # Весь дом через пул (М2б.2): подписка — только несущий канал, трафика клиентов через
@@ -5836,8 +5840,8 @@ class Daemon:
         return self._measure_queue(targets, applied, busy=self._busy, single=single) > 0
 
     def _speed_manual(self, view: list[NodeInfo], applied: dict | None) -> bool:
-        """Кнопка у сервера без плановых замеров: основной сервер выключен (speed.sticky),
-        сроки замеров 0, нет HEALTHY/DEGRADED или идёт проверка цели проб. Замеряются только
+        """Кнопка у сервера без плановых замеров: сроки замеров 0, нет HEALTHY/DEGRADED или
+        идёт проверка цели проб. Замеряются только
         заказанные серверы, по одному запросу; True — появился новый замер."""
         if not (self._speed_one or self._speed_any):
             self.speed_queue.clear()

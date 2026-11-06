@@ -948,7 +948,7 @@
     const on = Boolean(sticky.on);
     $("sticky").setAttribute("aria-checked", String(on));
     const measuring = Boolean(sticky.unlimited_hours || sticky.limited_hours);
-    $("speed").hidden = !on || !measuring;
+    $("speed").hidden = !measuring;
     const pinned = Boolean(s.pin && !s.pin.down);
     let text;
     if (!on) {
@@ -964,13 +964,13 @@
     } else {
       text = "Весь трафик пойдёт через самый быстрый сервер в работе — шлюз выберет его, как только серверы ответят.";
     }
-    if (on && measuring) {
+    if (measuring) {
       const every = (hours) => (hours ? `раз в ${hours} ч` : "не замеряются");
       // 0.1.18: фоном — редко; основной — по своему трафику, при падении или «придушивании» —
       // поиск замены среди кандидатов (решение заказчика 24.10.2026).
       const spareEvery = sticky.spare_hours ? every(Math.max(sticky.spare_hours, sticky.unlimited_hours || 0)) : every(sticky.unlimited_hours);
-      text += `${pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
-        + (sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
+      text += `${!on ? " Скорость серверов всё равно замеряется фоном редко:" : pinned ? " Замеры скорости идут и при ручном выборе:" : " Скорость замеряется фоном редко:"} серверы в работе — ${every(sticky.unlimited_hours)} (лимитированные — ${sticky.limited_hours === sticky.unlimited_hours ? "" : every(sticky.limited_hours) + ", "}меньшей загрузкой), запасные — ${spareEvery}, x100 — не замеряются; до ${s.budget && s.budget.speed_mb ? Math.round(s.budget.speed_mb) : 0} МБ в сутки.`
+        + (on && sticky.guard ? " Скорость основного шлюз видит по его трафику, а если он упадёт или его «придушат», замерит кандидатов и перейдёт на быстрый. Скорость любого сервера можно обновить кнопкой у его строки." : "");
     }
     $("main-note").textContent = plain(text);
   }

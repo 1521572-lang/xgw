@@ -362,6 +362,8 @@ def daemon(tmp_path, monkeypatch):
     # Основной сервер (0.1.9) проверяется отдельно (test_daemon_main.py): здесь ядро само
     # выбирает сервер, как до него, и вызовы API в тестах прежние.
     cfg.speed.sticky = False
+    # Плановые замеры без основного идут (ASSUMPTIONS п. 325): здесь их нет, как прежде.
+    cfg.speed.unlimited_hours = cfg.speed.limited_hours = 0
     instance = Harness(cfg, paths)
     yield instance
     instance.store.close()

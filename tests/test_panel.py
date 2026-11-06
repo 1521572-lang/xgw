@@ -935,7 +935,8 @@ def test_sticky_switch_and_speed_button(rig, user):
     assert reply["ok"] and "выключен" in reply["text"]
     assert user.state()["sticky"]["on"] is False
     assert managed.load(managed.path_for(rig.config_path))[0]["sticky"] is False
-    assert not user.act("speed", {})["ok"]  # без основного сервера замерять незачем
+    # Замеры идут и без основного (ASSUMPTIONS п. 325): кнопка «Замерить все» работает.
+    assert user.act("speed", {})["ok"] and rig.daemon.asked == ["speed", "speed"]
     assert user.act("sticky", {"on": True})["ok"] and user.state()["sticky"]["on"] is True
     assert not user.act("sticky", {"on": "да"})["ok"]
 
