@@ -768,6 +768,58 @@ def test_panel_login_as_root_opens_a_one_time_link_for_the_user(root, monkeypatc
     assert len(opened) == 1
 
 
+def test_gui_login_gives_the_window_a_one_time_code_and_nothing_else(root, monkeypatch, capsys):
+    """Кнопка «Войти» окна XGW: pkexec → `xgw panel --gui-login` печатает порт и одноразовый
+    код одной строкой JSON (её читает окно); токена панели в выводе нет. От человека без
+    pkexec и от самого root кода нет."""
+    import json
+    import socket
+
+    from xgw import desktop
+    from xgw.watch import panel
+
+    monkeypatch.setattr(cli, "PANEL_WAIT", 0.6)
+    monkeypatch.setattr(desktop, "is_root", lambda: False)
+    assert main(["panel", "--gui-login"]) == 1 and not root.config_file.exists()
+    assert "xgw gui" in capsys.readouterr().err
+    monkeypatch.setattr(desktop, "is_root", lambda: True)
+    monkeypatch.setattr(desktop, "invoking_user", lambda: desktop.User("alice", 1000))
+    root.etc.mkdir(parents=True)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        root.config_file.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
+        assert main(["panel", "--gui-login"]) == 0
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["port"] == port and panel.use_login(root, data["code"])
+        assert panel.read_token(root) not in out
+        monkeypatch.setattr(desktop, "invoking_user", lambda: None)
+        assert main(["panel", "--gui-login"]) == 1 and capsys.readouterr().out == ""
+
+
+def test_gui_refuses_root_and_explains_missing_pyqt(monkeypatch, capsys):
+    """`xgw gui` — только от человека; без PyQt6 — что поставить, а не трассировка."""
+    import builtins
+
+    from xgw.gui import app as gui_app
+
+    monkeypatch.setattr(gui_app.os, "geteuid", lambda: 0)
+    assert main(["gui"]) == 2 and "не от root" in capsys.readouterr().err
+    monkeypatch.setattr(gui_app.os, "geteuid", lambda: 1000)
+    real = builtins.__import__
+
+    def no_qt(name, *args, **kwargs):
+        if name.startswith("PyQt6"):
+            raise ImportError(name)
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_qt)
+    monkeypatch.setattr("xgw.desktop.notify", lambda user, text: None)
+    assert main(["gui"]) == 2 and "python3-pyqt6" in capsys.readouterr().err
+
+
 def _free_port() -> int:
     import socket
 

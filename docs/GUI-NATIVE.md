@@ -1,0 +1,93 @@
+# Нативное окно XGW (Ubuntu 24.04, PyQt6)
+
+`xgw gui` — окно управления шлюзом на рабочем столе. Это клиент той же локальной панели, что и
+браузерная (`watch/panel.py`), а не второй backend: всё состояние и все действия идут через её
+HTTP API на 127.0.0.1. Браузерная панель, значок в трее, API приложения Android и CLI остаются
+как есть.
+
+## Что найдено в существующей архитектуре
+
+Панель (`src/xgw/watch/panel.py`, класс `Panel`):
+
+| Запрос | Что отдаёт | Доступ |
+|---|---|---|
+| `GET /api/state` | `Panel.state()` — всё состояние шлюза (поля ниже) | cookie панели |
+| `GET /api/pool` | `Panel.pool_servers()` — сотни строк бесплатного пула, отдельно от state | cookie |
+| `GET /api/traffic?days=N` | `Panel.traffic()` — расход по устройствам, подпискам, пулу, напрямую | cookie |
+| `GET /records/<имя>` | файл записи трафика `.pcap` | cookie |
+| `POST /api/<действие>` | `Panel.act()` → `{"ok", "text", "notes"}` | cookie + `X-XGW-Panel: 1` |
+| `/api/tray`, `/api/tray/<действие>` | сводка и два действия значка | только токен трея |
+
+Поля `Panel.state()` (сняты настоящим кодом в `tests/fixtures/gui/state-*.json`): `state`,
+`action`, `since`, `updated`, `now`, `version`, `xray {ok, version}`, `capture {mode, lan, local,
+lan_if, fail_mode, lifecycle, lifecycle_reason, lan_problem, inbound_missing, loaded, blocked,
+bypass}`, `power {can_on, can_off, why}`, `members`, `spares`, `servers` (строки: `tag`, `name`,
+`status` member/spare/disabled/skipped, `source`, `alive`, `speed_mbps`, `rtt_ms`, `delay_ms`,
+`score`, `multiplier`, `priority`, `core`, `core_pin`, `capability`, `profile`, …), `removed`,
+`sources`, `pin`, `main`, `sticky`, `tier`, `reserve`, `stranded`, `class_warning`, `whitelist`,
+`free_pool {mode, pin, summary}`, `subscriptions`, `links`, `lan`, `kernel_direct`, `devices`,
+`records`, `events`, `budget`, `nodes`, `probe_target`, `probe_hosts`, `resolvers`, `guard`,
+`singbox`, `singbox_pending`, `pending_restart`, `busy {refresh, scan, speed, speed_one, cores}`,
+`cores`, `speed_progress`, `netcheck`, `tailscale`, `phones`.
+
+Действия `Panel.act()`: `power`, `pin`, `unpin`, `add`, `servers`, `priority`, `core`, `device`,
+`device/route`, `direct`, `device/direct`, `record/*`, `tailscale/*`, `phones/*`, `cores/check`,
+`cores/update`, `cores/rollback`, `subscription/remove`, `subscription/edit`, `link/remove`,
+`freepool/mode`, `freepool/pin`, `freepool/refresh`, `sticky`, `speed/one`, `netcheck`,
+`refresh`, `scan`, `speed`.
+
+Безопасность панели, которую окно соблюдает и не ослабляет: Host только `127.0.0.1:<порт>`
+(или tailnet при Serve); вход — токен или одноразовый код (`new_login`, 60 с, один раз) → cookie
+`xgw_panel` = HMAC(токен); POST — только с cookie и заголовком `X-XGW-Panel: 1`, при Origin — тот
+же адрес; тело до 64 КиБ.
+
+Рабочий стол: `desktop.as_admin` (pkexec: 126 — окно пароля закрыли, 127 — пароль не принят),
+`xgw panel --login` (код входа в браузер человека), `tray.py`/`trayapp.py` (значок от имени
+человека, его порт и токен трея — в `~/.config/xgw/tray.json`, одна копия по блокировке).
+
+## Как устроено окно
+
+```
+src/xgw/gui/
+  model.py   — без Qt: смысл состояний (как ui/app.js), форматы, опрос, сеанс, вход
+  client.py  — QNetworkAccessManager: опрос /api/state, действия, /api/pool, /api/traffic
+  login.py   — pkexec → `xgw panel --gui-login` → код → cookie
+  theme.py   — светлая/тёмная тема (по умолчанию — системы), QSS по токенам цвета
+  window.py  — окно: верхняя строка, навигация, страницы
+  app.py     — `xgw gui`: один экземпляр (QLocalServer), запуск от пользователя
+```
+
+Вход: кнопка «Войти» запускает `pkexec /usr/local/bin/xgw panel --gui-login`. Команда от root
+печатает одну строку JSON `{"port", "code"}` в канал вывода (не в командную строку и не в
+журнал), окно меняет код на cookie запросом `/?login=<код>` (ответ 303) и хранит
+`{"port", "cookie"}` в `~/.config/xgw/gui.json` (0600) — как браузер хранит ту же cookie год.
+Постоянный токен панели окну не достаётся. Удалённая панель по tailnet — не в этой версии.
+
+Опрос: один запрос `/api/state` за раз, раз в 3 с, пока окно видно, раз в 15 с — свёрнуто;
+после сбоя — 2, 4, 8 … 60 с ±20 %; ответ на 401 останавливает опрос и показывает вход. Ответ
+старого запроса после смены сеанса не применяется. Действие с тем же ключом не уходит второй
+раз до ответа панели; успех — только по её ответу. Закрытие окна обрывает запросы без ответа и
+не трогает демон, Xray и sing-box.
+
+## Этапы
+
+1. Клиент API, вход, модель состояния — **готово**.
+2. Каркас окна, темы, навигация, «Обзор», `xgw gui` — **готово**.
+3. Серверы (подписок и пула, Model/View) и подписки — далее.
+4. Устройства, трафик, диагностика.
+5. Tailscale, телефоны, обновление ядер.
+6. Трей («Открыть панель» → окно), ярлык, автозапуск, установщик.
+7. Демо-сцены для всех экранов, проверка на Ubuntu 24.04.
+
+Пока раздел не перенесён, в окне он говорит об этом и открывает браузерную панель.
+
+## Запуск
+
+```sh
+xgw gui                                   # окно (от пользователя, не через sudo)
+python3 tests/panel_demo.py --gui         # демо: панель на выдуманных данных и окно, без root
+QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_gui_qt.py tests/test_gui_model.py
+```
+
+Нужен пакет `python3-pyqt6` (его ставит установка XGW для значка в трее). Нет PyQt6 —
+`xgw gui` пишет, что установить; браузерная панель работает и без него.

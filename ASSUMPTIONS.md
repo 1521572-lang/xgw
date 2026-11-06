@@ -5909,3 +5909,36 @@ Happ»), затем дополнен редактированием списка
      `tests/test_config.py`, `tests/test_engine.py`, ruff; `tests/test_daemon.py` и
      `tests/test_dualcore.py` — без новых падений к прежним (п. 325). На машине —
      `docs/TEST-PLAN-REAL-MACHINE-0.2.0-new-batch.md`.
+
+327. **Нативное окно XGW (xgw gui, PyQt6), этапы 1–2 (07.11.2026).**
+     Владелец поставил задачу: современный нативный клиент управления для Ubuntu 24.04 на
+     PyQt6 (Qt Widgets) — не Electron, не QWebEngine и не второй backend; работать от
+     пользователя через существующую панель на 127.0.0.1. Работа — по этапам задачи
+     (docs/GUI-NATIVE.md: найденные API, форматы `Panel.state()`, решения).
+     Сделано: пакет `src/xgw/gui` — `model.py` без Qt (тексты и тона состояний — как
+     ui/app.js; форматы; `PollGate` — один запрос за раз и только свежие ответы;
+     `Backoff` 2…60 с ±20 %; `ActionGuard`; сеанс и разбор входа), `client.py`
+     (QNetworkAccessManager: опрос /api/state раз в 3 с на экране и 15 с свёрнутым, 401 —
+     вход, обрыв — паузы; действия POST с `X-XGW-Panel`; /api/pool, /api/traffic; `close`
+     обрывает запросы без ответа), `login.py`, `theme.py` (светлая/тёмная, по умолчанию —
+     системы; в Qt 6.4 Ubuntu 24.04 нет `colorScheme()`, тогда gsettings GNOME или
+     яркость палитры), `window.py` (верхняя строка, навигация, вход, «Обзор»), `app.py`
+     (один экземпляр через QLocalServer, отказ от root, понятный текст без PyQt6).
+     Вход: `xgw panel --gui-login` — новая узкая команда, только от root с PKEXEC_UID или
+     SUDO_UID: одна строка JSON {port, code} в вывод (код — `panel.new_login`, 60 с, один
+     раз). Окно запускает её через pkexec, меняет код на cookie ответом 303 и хранит
+     {port, cookie} в ~/.config/xgw/gui.json (0600), как браузер — ту же cookie. Токен
+     панели окну не достаётся; проверки Host, cookie, X-XGW-Panel и Origin не менялись.
+     `xgw gui` — до чтения config.toml, как `xgw tray`. Разделы «Серверы», «Подписки»,
+     «Устройства», «Трафик», «Диагностика», «Дополнительно» в этой поставке говорят, что
+     ещё переносятся, и открывают браузерную панель — это этапы 3–6. Демо:
+     `tests/panel_demo.py --gui` (свой файл сеанса и сокет экземпляра). Фикстуры
+     `tests/fixtures/gui/state-*.json` — `Panel.state()` демо-сцен, снятые настоящим кодом.
+     Проверено здесь: `tests/test_gui_model.py`, `tests/test_cli.py`, `tests/test_ops.py`
+     (новые: --gui-login, отказ root и без PyQt6), `tests/test_desktop.py`, ruff — в
+     тестовой среде; `tests/test_gui_qt.py` и `tests/test_gui_model.py` — в контейнере
+     ubuntu:24.04 с системным python3-pyqt6 (Python 3.12.3, PyQt6 6.6.1, Qt 6.4.2,
+     offscreen, от обычного пользователя): 21 passed, снимки «Обзора» в обеих темах при
+     1024×720 и 1440×900. `tests/test_panel.py` — без новых падений (прежнее
+     `test_free_pool_card_switches_observation`). На настоящей Ubuntu 24.04 с графическим
+     сеансом не проверялось — `docs/TEST-PLAN-REAL-MACHINE-0.2.0-gui-s12.md`.

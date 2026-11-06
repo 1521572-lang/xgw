@@ -3,7 +3,7 @@
     python tests/panel_demo.py [--port 8791] [--scene work|empty|trouble|hostile|probe|
                                                       budget|waiting|reserve|tailscale|stranded|
                                                       cores|tspu]
-                               [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID]
+                               [--app-port 8792] [--phone-server ХОСТ:ПОРТ:UUID] [--gui]
 
 Сеть не трогается: «включение VPN» меняет только состояние в памяти. Подписки,
 ссылки и список серверов меняются по-настоящему — в panel.json во временном
@@ -25,6 +25,9 @@ tailscale — шлюз ещё не в tailnet (вход через 12 секун
 серверу, один проверочный хост на паузе, один резолвер bootstrap-DNS не отвечает, Tailscale
 временно через VPN. Иконка ↻ у скорости — замер одного сервера (5 секунд) — во всех сценах.
 Кнопка «Проверить сеть» — тоже во всех: проверки выдуманные, без пакетов наружу, за 4 секунды.
+
+--gui — открыть и нативное окно XGW (xgw gui, нужен PyQt6), вошедшее в эту демо-панель: свой
+файл сеанса во временном каталоге, настоящий вход окна не трогается.
 
 --app-port — для приложения XGW на эмуляторе Android (сборка debug): API приложения открыт на
 0.0.0.0:ПОРТ без TLS, имя шлюза в Host подставляется, как это делает Funnel. «Телефон» сам
@@ -721,6 +724,26 @@ def demo_netcheck(_self) -> list[Check]:
     ]
 
 
+def start_gui(port: int, root: Path):
+    """Окно XGW от этого пользователя, вошедшее в демо-панель: свой файл сеанса (cookie —
+    как у браузера после ссылки входа) и свой сокет одного экземпляра не мешают настоящему."""
+    import hashlib
+    import hmac
+    import os
+    import subprocess
+
+    from xgw.gui import model as gui_model
+
+    session = root / "gui-session.json"
+    cookie = hmac.new(TOKEN.encode(), b"xgw-panel", hashlib.sha256).hexdigest()
+    gui_model.save_session(session, gui_model.Session(port, cookie))
+    env = {**os.environ, gui_model.SESSION_ENV: str(session),
+           "XGW_GUI_INSTANCE": f"xgw-gui-demo-{port}",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    print("Окно XGW: xgw gui (демо-сеанс)", flush=True)
+    return subprocess.Popen([sys.executable, "-m", "xgw", "gui"], env=env)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8791)
@@ -730,6 +753,8 @@ def main() -> None:
                  "reserve", "tailscale", "cores", "stranded", "tspu"))
     parser.add_argument("--app-port", type=int, default=0)
     parser.add_argument("--phone-server", default="")
+    parser.add_argument("--gui", action="store_true",
+                        help="открыть и окно XGW (xgw gui, PyQt6) с входом в эту панель")
     args = parser.parse_args()
     netcheck.Netcheck.run = demo_netcheck
     with tempfile.TemporaryDirectory(prefix="xgw-panel-demo-") as root:
@@ -739,6 +764,8 @@ def main() -> None:
             atomic_write_json(panel.paths.xray_config_file, phone_gateway(args.phone_server))
         panel.start()
         print(f"Панель: http://127.0.0.1:{panel.port}/?token={TOKEN}", flush=True)
+        if args.gui:
+            start_gui(panel.port, Path(root))
         if args.app_port:
             app_forwarder(panel, args.app_port)
             print(f"API приложения для эмулятора: http://10.0.2.2:{args.app_port}", flush=True)

@@ -1,0 +1,212 @@
+{
+ "action": "вмешательство не требуется",
+ "budget": {
+  "all_mb": 248.9,
+  "cheap": 0,
+  "checks_mb": 0.0,
+  "e2e_mb": 248.9,
+  "guessed": false,
+  "interval_s": 30,
+  "limit_mb": 1024,
+  "measured": false,
+  "members": 0,
+  "month_gb": 7.5,
+  "over": false,
+  "probe_bytes": 57620,
+  "probes_mb": 0.0,
+  "quota_mb": {},
+  "quota_share": {},
+  "scan_minutes": 60,
+  "scans_mb": 0.0,
+  "spares": 0,
+  "speed_mb": 0.0,
+  "total_mb": 0.0,
+  "warnings": []
+ },
+ "busy": {
+  "cores": false,
+  "refresh": false,
+  "scan": false,
+  "speed": false,
+  "speed_one": []
+ },
+ "capture": {
+  "blocked": false,
+  "bypass": [],
+  "fail_mode": "closed",
+  "inbound_missing": "",
+  "lan": true,
+  "lan_if": "enp4s0",
+  "lan_problem": "",
+  "lifecycle": "connected",
+  "lifecycle_reason": "",
+  "loaded": true,
+  "local": true,
+  "mode": "off"
+ },
+ "class_warning": "",
+ "cores": {
+  "active": false,
+  "checked": null,
+  "error": "",
+  "job": null,
+  "rows": [
+   {
+    "accepted": false,
+    "baseline": "26.10.21",
+    "core": "xray",
+    "installed": "26.3.27",
+    "latest": null,
+    "previous": "",
+    "rejected": null,
+    "title": "Xray",
+    "updated": null,
+    "watch_until": 0,
+    "withdrawn": false
+   },
+   {
+    "accepted": false,
+    "baseline": "1.14.3",
+    "core": "sing-box",
+    "installed": "1.14.3",
+    "latest": null,
+    "previous": "",
+    "rejected": null,
+    "title": "sing-box",
+    "updated": null,
+    "watch_until": 0,
+    "withdrawn": false
+   }
+  ]
+ },
+ "devices": [],
+ "events": [
+  {
+   "detail": "перехват включён: сеть enp4s0 и эта машина — через Xray",
+   "kind": "capture",
+   "ts": 1794008168.4069364
+  }
+ ],
+ "free_pool": {
+  "mode": "off",
+  "pin": "",
+  "summary": null
+ },
+ "guard": {},
+ "kernel_direct": {
+  "networks": 0,
+  "on": false,
+  "reason": ""
+ },
+ "lan": {
+  "gateway": "192.168.50.1",
+  "interface": "enp4s0"
+ },
+ "links": [],
+ "main": null,
+ "members": [],
+ "netcheck": {
+  "running": false
+ },
+ "nodes": {},
+ "now": 1794008168.7099812,
+ "pending_restart": false,
+ "phones": {
+  "available": false,
+  "enable_url": "",
+  "funnel": false,
+  "list": [],
+  "pairing": {
+   "link": "",
+   "paired": "",
+   "qr": [],
+   "until": null
+  },
+  "waiting": false
+ },
+ "pin": null,
+ "power": {
+  "can_off": false,
+  "can_on": false,
+  "why": "сначала добавьте подписку или ссылку сервера"
+ },
+ "probe_hosts": {},
+ "probe_target": "",
+ "records": {
+  "active": null,
+  "files": []
+ },
+ "removed": [],
+ "reserve": null,
+ "resolvers": {},
+ "servers": [],
+ "since": 1794007268.4087625,
+ "singbox": {
+  "alive": true,
+  "bridged": 0,
+  "expected": true,
+  "failed": false,
+  "installed": true,
+  "mode": "auto",
+  "version": "1.14.3"
+ },
+ "singbox_pending": false,
+ "sources": [],
+ "spares": [],
+ "speed_progress": {},
+ "state": "HEALTHY",
+ "sticky": {
+  "gain_pct": 30,
+  "guard": true,
+  "hold_minutes": 60,
+  "limited_hours": 6,
+  "on": true,
+  "spare_hours": 24,
+  "unlimited_hours": 6
+ },
+ "stranded": "",
+ "subscriptions": [],
+ "tailscale": {
+  "address": "",
+  "auth_qr": [],
+  "auth_url": "",
+  "backend": "",
+  "cgnat": [],
+  "exit": {
+   "advertised": null,
+   "approved": null
+  },
+  "funnel": {
+   "enable_url": "",
+   "live": null,
+   "on": false,
+   "pending": false,
+   "url": ""
+  },
+  "login_pending": false,
+  "name": "",
+  "netfilter_off": null,
+  "override_dns": null,
+  "peers": [],
+  "route": "direct",
+  "route_panel": false,
+  "serve": {
+   "enable_url": "",
+   "live": null,
+   "on": false,
+   "pending": false,
+   "url": ""
+  },
+  "ssh": null,
+  "state": "absent"
+ },
+ "tailscale_via_vpn": false,
+ "tier": null,
+ "updated": 1794008168.4087625,
+ "version": "0.2.0",
+ "whitelist": null,
+ "xray": {
+  "ok": true,
+  "version": "26.3.27"
+ }
+}

@@ -221,6 +221,10 @@ def main(argv: list[str] | None = None) -> int:
         "--login", action="store_true",
         help="войти заново: спросить пароль администратора и открыть панель (Ubuntu)",
     )
+    panel.add_argument(
+        "--gui-login", action="store_true",
+        help="для окна XGW (xgw gui): одноразовый код входа — его запускает окно через pkexec",
+    )
     traffic_parser = subparsers.add_parser(
         "traffic", parents=[common], help="расход трафика по устройствам и подпискам",
     )
@@ -239,6 +243,9 @@ def main(argv: list[str] | None = None) -> int:
         "--open", metavar="АДРЕС", default=None,
         help="открыть панель: вкладку на экране — вывести вперёд, иначе новой (ярлык «XGW»)",
     )
+    subparsers.add_parser(
+        "gui", help="окно XGW на рабочем столе (Ubuntu 24.04, PyQt6) — от имени пользователя",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "tray":
@@ -247,12 +254,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.open:
             return tray.open_main(args.open)
         return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])
+    if args.command == "gui":
+        # Как значок: от имени человека, без config.toml (0600 root) — окно ходит в панель
+        # демона на 127.0.0.1, вход — через pkexec (xgw panel --gui-login).
+        from .gui import app as gui_app
+
+        return gui_app.main()
     paths = Paths.from_env()
     if args.command == "pool" and args.pool_action == "agent":
         # Служба xgw-fp@<gen>: config.toml агенту не нужен — только задание демона.
         from .freepool import agent as agenting
 
         return agenting.main(args.gen, paths)
+    if args.command == "panel" and args.gui_login and not desktop.is_root():
+        return _fail("xgw panel --gui-login запускает окно XGW через pkexec; войдите кнопкой "
+                     "«Войти» в окне (xgw gui)")
     if args.command == "panel" and args.login and not desktop.is_root():
         # Пункт «Войти заново» у ярлыка: от человека, которому config.toml (0600) не
         # прочитать, — та же команда от root через pkexec.
@@ -1258,6 +1274,26 @@ def _panel_login(cfg: config.Config, paths: Paths) -> int:
     return 0
 
 
+def _panel_gui_login(cfg: config.Config, paths: Paths) -> int:
+    """`xgw panel --gui-login` от root через pkexec (кнопка «Войти» окна XGW): одноразовый код
+    входа и порт панели — одной строкой JSON в вывод, который читает окно. Код годится один
+    раз и LOGIN_TTL секунд; постоянный токен панели наружу не выходит. Только для того, кто
+    запустил pkexec или sudo: от самого root вход окну не нужен."""
+    from .watch import panel
+
+    if desktop.invoking_user() is None:
+        return _fail("код входа выдаётся только окну XGW (через pkexec): запустите xgw gui")
+    if not _panel_answers(cfg.panel.port):
+        return _fail(_panel_silent(cfg.panel.port))
+    if not panel.read_token(paths):
+        problem = _system_root_problem(paths)
+        if problem:
+            return _fail(problem)
+        panel.ensure_token(paths)
+    print(json.dumps({"port": cfg.panel.port, "code": panel.new_login(paths)}), flush=True)
+    return 0
+
+
 def _open_panel(cfg: config.Config, paths: Paths, url: str) -> int:
     """`xgw panel --open` — открыть панель в браузере этой машины."""
     if not _panel_answers(cfg.panel.port):
@@ -1272,6 +1308,8 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
 
     if not cfg.panel.enabled:
         return _fail("панель выключена: [panel] enabled = false в config.toml", 2)
+    if args.gui_login:
+        return _panel_gui_login(cfg, paths)
     if args.login:
         return _panel_login(cfg, paths)
     token = panel.read_token(paths)

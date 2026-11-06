@@ -1,0 +1,20 @@
+{
+ "days": 7,
+ "devices": [],
+ "devices_total": {
+  "down": 0,
+  "up": 0
+ },
+ "direct": {
+  "down": 0,
+  "up": 0
+ },
+ "gateway": null,
+ "pool": {
+  "down": 0,
+  "up": 0
+ },
+ "since": "2026-11-01",
+ "subscriptions": [],
+ "wan": null
+}
