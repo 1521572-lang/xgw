@@ -17,6 +17,8 @@ from pathlib import Path
 
 TREE = Path(__file__).resolve().parents[2]
 STATUS = Path("/run/xgw/status.json")
+# Ход цикла демона (Daemon._loop_progress): фаза tick/sleep и длительность шага step_s.
+STEP = Path("/run/xgw/watchdog-step.json")
 LOCK = Path("/run/xgw-diag-install")  # каталог волны 1 (/run/xgw-pacing-install) не мешает
 CONFIG = Path("/etc/xgw/config.toml")
 RECOVER_AFTER = 45.0  # приёмка после установки не дольше — затем сразу возврат (предел 60 с)
@@ -187,8 +189,18 @@ def observe(minutes):
           f"next_planned_in_s={pacing.get('next_planned_in_s')}", flush=True)
     config = hashlib.sha256(CONFIG.read_bytes()).hexdigest()
     marks, last, states = [], STATUS.stat().st_mtime, set()
+    gaps, steps, seen = [], [], None  # разрывы (начало, конец); шаги (когда замечен, step_s)
+    interval = float(data.get("interval_s") or 20)
     while time.time() < begin + minutes * 60:
-        time.sleep(2)
+        time.sleep(1)
+        with contextlib.suppress(OSError, ValueError):
+            step = json.loads(STEP.read_text(encoding="utf-8"))
+            key = (step.get("phase"), step.get("started"))
+            if key != seen:
+                seen = key
+                interval = float(step.get("interval_s") or interval)
+                if step.get("phase") == "sleep" and isinstance(step.get("step_s"), (int, float)):
+                    steps.append((time.time(), float(step["step_s"])))
         try:
             moment = STATUS.stat().st_mtime
         except OSError:
@@ -196,6 +208,7 @@ def observe(minutes):
         if moment == last:
             continue
         marks.append(moment - last)
+        gaps.append((last, moment))
         last = moment
         with contextlib.suppress(OSError, ValueError):
             states.add(snapshot().get("state"))
@@ -213,6 +226,18 @@ def observe(minutes):
     unfinished = journal.count("проверка адреса проб не закончена")
     slow = journal.count("шаг watchdog занял")
     over = sum(1 for gap in marks if gap > 25.0)
+    # Статус пишется после сигналов и в конце шага, шаг начинается через interval_s ±20 % от
+    # начала прошлого: разрыв до 1,2·interval_s + длительность шага — обычный долгий шаг
+    # (справочно). Разрыв больше, или ни одного законченного шага рядом, — зависание (FAIL).
+    hung, explained = 0, []
+    for start, end in gaps:
+        if end - start <= 25.0:
+            continue
+        near = [spent for when, spent in steps if start < when <= end + 70.0]
+        if near and end - start <= 1.2 * interval + max(near) + 2.0:
+            explained.append(f"{end - start:.1f}/{max(near):.1f}")
+        else:
+            hung += 1
     print(f"INFO window_min={(time.time() - begin) / 60:.1f} "
           f"states={sorted(map(str, states))}", flush=True)
     print(f"INFO planned_pauses={planned} min={end.get('planned_min')} "
@@ -227,11 +252,14 @@ def observe(minutes):
           f"unfinished_lines={unfinished}", flush=True)
     median = statistics.median(marks) if marks else None
     print(f"INFO status_writes={len(marks)} median_s={median and round(median, 1)} "
-          f"max_s={marks and round(max(marks), 1)} over25={over} slow_step_lines={slow}",
+          f"max_s={marks and round(max(marks), 1)} over25={over} slow_step_lines={slow} "
+          f"long_steps={explained} hung={hung} steps_seen={len(steps)} "
+          f"step_max_s={steps and round(max(spent for _w, spent in steps), 1)}",
           flush=True)
     require(hashlib.sha256(CONFIG.read_bytes()).hexdigest() == config, "config_unchanged")
     health()
-    require(over == 0, "status_every_25s")
+    require(bool(steps), "watchdog_steps_seen")
+    require(hung == 0, "status_without_hang")
     require(diag.get("workers") == 2 and diag.get("budget_s") == 16.0, "diagnosis_fields")
     require(outside == 0 and waited == 0, "pacing_regression")
     if ran:

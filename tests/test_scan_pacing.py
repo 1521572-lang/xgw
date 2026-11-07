@@ -58,7 +58,9 @@ def test_planned_spares_are_spaced_inside_the_budget(daemon):
     assert len(daemon.scanned) == 3 and len(gaps) == 2  # перед первой пробой шага паузы нет
     assert all(SCAN_GAP[0] <= item <= SCAN_GAP[1] for item in gaps)
     pacing = daemon.status()["scan_pacing"]
-    assert pacing["planned_gaps_s"] == [round(item, 2) for item in gaps]
+    # Демон округляет измеренную паузу (разность часов), тест — заданную: на границе сотых
+    # они расходятся на 0,01 (отчёт diag-limit: 3 из 18 прогонов) — сравнение с допуском.
+    assert pacing["planned_gaps_s"] == pytest.approx(gaps, abs=0.011)
     assert pacing["totals"]["planned"] == 2 and pacing["totals"]["planned_outside"] == 0
     assert pacing["next_planned_in_s"] > 0
 
