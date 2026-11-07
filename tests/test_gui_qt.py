@@ -235,3 +235,18 @@ def test_second_start_raises_the_first_window(qapp):
     wait(qapp, lambda: raised)
     first.server.close()
     assert not gui_app.SingleInstance(name + "-none").notify_running()
+
+
+def test_new_version_replaces_the_open_window_of_the_old_one(qapp):
+    name = f"xgw-gui-test-swap-{os.getpid()}"
+    raised, replaced = [], []
+    old = gui_app.SingleInstance(name, "old")
+    assert old.listen(lambda: raised.append(1), lambda: replaced.append(1))
+    assert gui_app.SingleInstance(name, "old").notify_running()  # та же версия — вперёд
+    wait(qapp, lambda: raised)
+    assert not gui_app.SingleInstance(name, "new").notify_running()  # другая — замена
+    assert replaced and not old.server.isListening()
+    fresh = gui_app.SingleInstance(name, "new")
+    assert fresh.listen(lambda: None)
+    fresh.server.close()
+    assert len(gui_app.code_stamp()) == 16
