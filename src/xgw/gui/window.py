@@ -448,7 +448,8 @@ class OverviewPage(QWidget):
             return ("Демон XGW давно не обновлял состояние: показанное могло устареть. "
                     "Проверьте службу: sudo systemctl status xgw"), set()
         name = str(state.get("state") or "")
-        action = str(state.get("action") or "")
+        # HEALTHY: «вмешательство не требуется» — не повод для карточки предупреждения.
+        action = "" if name == "HEALTHY" else str(state.get("action") or "")
         fixes = {
             "ALL_DEAD": {"refresh", "scan"}, "DEGRADED": {"scan"}, "RESERVE": {"refresh", "scan"},
             "WAN_DOWN": {"netcheck"}, "PROBE_TARGET_UNREACHABLE": {"netcheck"},
