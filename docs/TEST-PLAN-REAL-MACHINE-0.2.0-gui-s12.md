@@ -12,6 +12,7 @@ docs/GUI-NATIVE.md. В этой поставке готовы этапы 1–2: 
 
 Критерии:
 
+- до установки — дозапись отчёта new-batch (шаг 1): `generations` записан;
 - тесты окна на этой машине (offscreen) проходят;
 - установка и health rc0;
 - окно запускается от владельца (не через sudo), вход — окном пароля Ubuntu, после входа
@@ -58,20 +59,29 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest -q -p no:cacheprovide
   tests/test_gui_model.py tests/test_gui_qt.py
 cd ~/xgw
 sudo xgw status --json | python3 -c "import json,sys; print(json.load(sys.stdin).get('state'))"
+HELPER="$PWD/docs/helpers/reality_pin_check.py"
+printf '%s  %s\n' '19169ae0ec1cc6cc2e8f90ea9d145fba4044617259eba4030e80977a5f2e26f7' "$HELPER" | sha256sum -c -
+sudo python3 -I "$HELPER" generations; printf 'generations rc=%s\n' "$?"
 ```
 
 Ожидается `21 passed`. Записать состояние шлюза и `sudo xgw diag --no-net` (числа
-OK/WARN/FAIL). Сверить установленный пакет с PREV функцией `match_package` из ТЗ t01-xhttp
+OK/WARN/FAIL).
+
+`generations` — дозапись отчёта new-batch (тот вышел через 0,6 ч, и пачки не нагружались): с
+установки 132be81 в 02:43 машина работала без переустановки. Записать `hours_since_start`,
+`refreshes`, `switches`, `switch_parts`, `composition`, `new_waiting_lines`, `new_waiting_max`,
+`new_batches`, `new_admitted`, `batch_reasons`, `copies_max`. Ожидается при `hours_since_start`
+≥ 4: `new_waiting_lines` > 0, если подписка давала новые серверы, и смен поколения заметно меньше
+2,5 в час (темп отчёта group-hold). Это только чтение — машину не трогает. Сверить установленный пакет с PREV функцией `match_package` из ТЗ t01-xhttp
 (раздел 1). Если стоит другая версия или нет рабочего on — только чтение, сообщить владельцу.
 
 ## 2. Обычная установка с локальным возвратом
 
 Нужно согласие владельца на обычную установку CODE и на условный возврат штатным установщиком
 BASE, если установка или on/HTTPS откажут. Нет согласия — INSTALL_NOT_RUN. Помощник health —
-из ТЗ new-batch (`docs/helpers/reality_pin_check.py`, та же сумма).
+тот же `$HELPER` из шага 1.
 
 ```sh
-HELPER="$HOME/xgw/docs/helpers/reality_pin_check.py"
 sudo sh -s -- "$TARGET" "$PREV" "$HELPER" <<'SH'
 umask 077
 d=/run/xgw-gui
@@ -164,6 +174,7 @@ python3 tests/panel_demo.py --gui --port 8795 --scene trouble
 
 ```text
 Дата, CODE/BASE, Ubuntu/Python/PyQt6/Qt, согласие, исходный и конечный on/HTTPS:
+Дозапись new-batch: generations до установки <JSON>:
 Тесты окна (passed/failed) / установка / health / совпадение пакета / возврат:
 Отказы шага 3 (rc, суть текста):
 Окно владельца: окно пароля, вход, метка = xgw status?, метрики, второй запуск, процессов,
