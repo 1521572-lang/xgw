@@ -38,10 +38,11 @@ Xray их не различить, поэтому при каждой приме
 
 from __future__ import annotations
 
-from collections.abc import Collection
+import hashlib
+from collections.abc import Collection, Mapping
 
 from ..config import Config
-from ..model import ServerNode
+from ..model import ServerNode, variant_key
 from . import fragment as fragmenting
 
 XRAY_DEFAULT = "xray:default"
@@ -87,6 +88,43 @@ REFUSED_VERDICTS = ("CONNECT_FAIL", "TIMEOUT")
 TRIGGER_VERDICTS = FROZEN_VERDICTS + REFUSED_VERDICTS
 # Вердикты, при которых сервер в работе переводится на дробление, а не списывается (ТЗ R1).
 ESCALATE_VERDICTS = ("STALL_BEFORE_BODY", "FROZEN", "BODY_RESET", "CONNECT_FAIL")
+
+
+# Память профилей (п. 336) — в той же записи базы (TRIALS_META), что пробы, по отпечатку сервера
+# (протокол, адрес, порт, ключ, транспорт — не имя) и ключу его параметров (params_key: путь, Host,
+# SNI, ключ REALITY). Профиль, на котором сервер ответил после пробы, идёт первым в следующей
+# лестнице WORKED_KEEP; профиль, на котором проба не помогла, — последним FAILED_KEEP (он не
+# исключается: другого может и не быть). Сменились параметры — запись несовместима и не
+# действует; запись из будущего (часы ушли назад) — тоже: ни ложного успеха, ни вечного запрета.
+WORKED_KEEP = 7 * 86400.0
+FAILED_KEEP = 6 * 3600.0  # как daemon.PROFILE_RETRY: следующая лестница сервера — не раньше
+
+
+def params_key(node: ServerNode) -> str:
+    """Ключ существенных параметров подключения, которых нет в отпечатке."""
+    return hashlib.sha256(variant_key(node).encode()).hexdigest()[:16]
+
+
+def fresh(when: object, now: float, keep: float) -> bool:
+    """Отметка when свежа: не старше keep и не из будущего."""
+    return isinstance(when, (int, float)) and not isinstance(when, bool) and (
+        0.0 <= now - float(when) < keep)
+
+
+def remembered(
+    steps: list[str], *, key: str, now: float,
+    worked: Mapping | None = None, failed: Mapping | None = None,
+) -> list[str]:
+    """Ступени лестницы в порядке памяти: свежий удачный профиль этого сервера с теми же
+    параметрами — первым, недавно не помогшие — последними; остальное — как в ladder."""
+    good = worked.get("profile") if (
+        isinstance(worked, Mapping) and worked.get("key") == key
+        and fresh(worked.get("ts"), now, WORKED_KEEP)) else None
+    record = failed.get("steps") if (
+        isinstance(failed, Mapping) and failed.get("key") == key) else None
+    bad = {profile for profile, when in (record.items() if isinstance(record, Mapping) else ())
+           if fresh(when, now, FAILED_KEEP)}
+    return sorted(steps, key=lambda step: 0 if step == good else 2 if step in bad else 1)
 
 
 def core_of(profile: str) -> str:

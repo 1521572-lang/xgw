@@ -668,6 +668,11 @@ class Daemon:
         self._unstable: dict[str, float] = {}
         # Адрес сервера закрыт целиком (TCP напрямую не открылся): отпечаток → когда проверено.
         self._closed: dict[str, float] = {}
+        # Память профилей (п. 336, generator/profiles.remembered), в базе вместе с пробами:
+        # на каком профиле сервер ответил после пробы (отпечаток → {"profile", "ts", "key"}) и
+        # на каких проба не помогла (отпечаток → {"key", "verdict", "steps": {профиль: ts}}).
+        self._worked: dict[str, dict] = {}
+        self._failed_steps: dict[str, dict] = {}
         self._calm: dict[str, int] = {}
         self._calm_seen: dict[str, float] = {}
         # Мёртвый участник проверяется собственной пробой раз за «смерть» (тег → dead_since,
@@ -1296,6 +1301,8 @@ class Daemon:
         self._escalated = dict(previous._escalated)
         self._unstable = dict(previous._unstable)
         self._closed = dict(previous._closed)
+        self._worked = dict(previous._worked)
+        self._failed_steps = dict(previous._failed_steps)
         self.freepool = previous.freepool
         self.freepool.cfg = self.cfg
         self._freepool_next = previous._freepool_next
@@ -4352,7 +4359,7 @@ class Daemon:
         if trial is not None:
             if info.profile != trial.profile:
                 # Профиль ещё не применён (конфиг ждёт перезапуска): скан — о прежнем.
-                if now - trial.since >= PROFILE_RETRY:
+                if not profiling.fresh(trial.since, now, PROFILE_RETRY):
                     del self._profile_trial[fingerprint]
                     self._forget_trial(fingerprint)
                 return
@@ -4362,6 +4369,7 @@ class Daemon:
                 self._learned(fingerprint, trial)
                 self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
                 return
+            self._trial_failed(node, trial)
             # Следующая ступень и возврат меняют конфиг: запись о пробе в базе остаётся до их
             # применения (_profile_step) — перезапуск демона до него продолжит эту же пробу.
             if trial.rest:
@@ -4389,10 +4397,10 @@ class Daemon:
                 self._save_profiles()
             elif self._calm_due(fingerprint, info.profile, last):
                 self._recheck_base(info, default, name)
-        elif verdict in profiling.TRIGGER_VERDICTS and (
-            last is None or now - last >= PROFILE_RETRY
+        elif verdict in profiling.TRIGGER_VERDICTS and not profiling.fresh(
+            last, now, PROFILE_RETRY,  # отметка из будущего (часы ушли назад) — не запрет
         ):
-            steps = profiling.ladder(verdict, info.profile, default, avail)
+            steps = self._remembered(node, profiling.ladder(verdict, info.profile, default, avail))
             if steps and verdict in profiling.REFUSED_VERDICTS and self._address_closed(node, name):
                 return  # адрес закрыт целиком — обход не поможет (CLOSED_RECHECK)
             if limited:
@@ -4473,11 +4481,35 @@ class Daemon:
             return []
         avail = profiling.available(node, self.cfg, ())
         default = profiling.base(self.cfg, avail)
-        return [
+        return self._remembered(node, [
             step for step in profiling.ladder(verdict, info.profile, default, avail)
             if profiling.core_of(step) == "xray" and step != info.profile
             and (step in profiling.XRAY_FRAGMENTS or info.profile in profiling.XRAY_FRAGMENTS)
-        ]
+        ])
+
+    def _remembered(self, node: ServerNode, steps: list[str]) -> list[str]:
+        """Ступени лестницы в порядке памяти профилей (profiles.remembered)."""
+        if len(steps) < 2:
+            return steps
+        return profiling.remembered(
+            steps, key=profiling.params_key(node), now=self.wall(),
+            worked=self._worked.get(node.fingerprint),
+            failed=self._failed_steps.get(node.fingerprint),
+        )
+
+    def _trial_failed(self, node: ServerNode | None, trial: ProfileTrial) -> None:
+        """Проба профиля не помогла — профиль в конец следующей лестницы на FAILED_KEEP.
+        Возврат на базу (recheck) сюда не пишется: база — не ступень обхода."""
+        if node is None or trial.recheck:
+            return
+        key, now = profiling.params_key(node), self.wall()
+        record = self._failed_steps.get(node.fingerprint)
+        if not isinstance(record, dict) or record.get("key") != key:
+            record = {"key": key, "steps": {}}
+        record["steps"][trial.profile] = now
+        record["verdict"] = trial.verdict  # почему шла лестница — отдельно от итога ступени
+        self._failed_steps[node.fingerprint] = record
+        self._save_profiles()
 
     def _escalating(self, fingerprint: str) -> bool:
         """Сервер в работе сейчас на пробе дробления (или её ждёт) — замена подождёт."""
@@ -4486,7 +4518,10 @@ class Daemon:
         return bool((trial is not None and trial.escalate) or (wish is not None and wish.escalate))
 
     def _is_unstable(self, fingerprint: str) -> bool:
-        return self._unstable.get(fingerprint, 0.0) > self.wall()
+        """Отметка «нестабилен по ТСПУ» действует до своего срока, но не дольше окна
+        fragment.escalation_hours от сейчас: часы ушли назад — не вечный запрет."""
+        until, now = self._unstable.get(fingerprint, 0.0), self.wall()
+        return now < until <= now + self.cfg.fragment.escalation_hours * 3600.0
 
     def _may_escalate(self, fingerprint: str, server: str) -> bool:
         """Можно ли перевести сервер на тяжёлый профиль ещё раз: не больше
@@ -4495,7 +4530,8 @@ class Daemon:
         server — сервер в тексте события (_server_text)."""
         now = self.wall()
         window = self.cfg.fragment.escalation_hours * 3600.0
-        times = [when for when in self._escalations.get(fingerprint, []) if now - when < window]
+        times = [when for when in self._escalations.get(fingerprint, [])
+                 if profiling.fresh(when, now, window)]
         if len(times) < self.cfg.fragment.escalations:
             self._escalations[fingerprint] = [*times, now]
             self._save_profiles()
@@ -4523,7 +4559,22 @@ class Daemon:
         self._escalated[fingerprint] = {
             "profile": trial.profile, "verdict": trial.verdict, "ts": self.wall(),
         }
+        node = self._node_of(fingerprint)
+        if node is not None:
+            # Память профилей: этот профиль — первым в следующей лестнице (WORKED_KEEP), пока
+            # параметры сервера те же; запись о нём как о не помогшем снимается.
+            key = profiling.params_key(node)
+            self._worked[fingerprint] = {"profile": trial.profile, "ts": self.wall(), "key": key}
+            steps = (self._failed_steps.get(fingerprint) or {}).get("steps")
+            if isinstance(steps, dict):
+                steps.pop(trial.profile, None)
         self._save_profiles()
+
+    def _node_of(self, fingerprint: str) -> ServerNode | None:
+        if self.inventory is None:
+            return None
+        return next((node for node in self.inventory.nodes if node.fingerprint == fingerprint),
+                    None)
 
     def _calm_due(self, fingerprint: str, profile: str, since: float) -> bool:
         """Пора ли пробовать сервер на базовом профиле. Дробление в Xray — после
@@ -4531,6 +4582,9 @@ class Daemon:
         дробление тратит процессор сервера и чуть скорости, держим его только по
         необходимости); профили sing-box — раз в PROFILE_RECHECK, как до 0.1.18."""
         elapsed = self.wall() - since
+        if elapsed < 0:  # отметка из будущего (часы ушли назад): отсчёт — с сейчас
+            self._profile_switched[fingerprint] = self.wall()
+            return False
         if profile in profiling.XRAY_FRAGMENTS:
             return (
                 self._calm.get(fingerprint, 0) >= self.cfg.fragment.calm_probes
@@ -4565,6 +4619,7 @@ class Daemon:
                 self._learned(fingerprint, trial)
                 self._profile_event(trial.prev, trial.profile, f"{name} {_keep_text(trial)}")
                 return False
+            self._trial_failed(node, trial)
             if trial.rest:
                 following = trial.rest[0]
                 self._profile_wanted[fingerprint] = ProfileWish(
@@ -4748,9 +4803,8 @@ class Daemon:
         """Адрес сервера закрыт целиком: TCP к нему напрямую не открывается (проверено не
         раньше CLOSED_RECHECK назад или сейчас). Новая отметка — строка в журнале."""
         now = self.wall()
-        when = self._closed.get(node.fingerprint)
-        if when is not None and now - when < CLOSED_RECHECK:
-            return True
+        if profiling.fresh(self._closed.get(node.fingerprint), now, CLOSED_RECHECK):
+            return True  # отметка из будущего (часы ушли назад) не держит — проверить заново
         if self._server_reachable(node) is not False:
             if self._closed.pop(node.fingerprint, None) is not None:
                 self._save_profiles()
@@ -4948,6 +5002,30 @@ class Daemon:
                 self._closed[str(key)] = float(when)
             else:
                 skipped += 1
+        # Память профилей (п. 336): битая запись пропускается, свежесть проверяется при
+        # использовании (profiles.fresh) — истёкшая и «из будущего» не действуют.
+        worked = saved.get("worked")
+        for key, record in (worked.items() if isinstance(worked, dict) else ()):
+            if (isinstance(record, dict) and record.get("profile") in profiling.ALL
+                    and isinstance(record.get("key"), str)
+                    and isinstance(record.get("ts"), (int, float))
+                    and not isinstance(record.get("ts"), bool)):
+                self._worked[str(key)] = {"profile": record["profile"], "key": record["key"],
+                                          "ts": float(record["ts"])}
+            else:
+                skipped += 1
+        failed = saved.get("failed")
+        for key, record in (failed.items() if isinstance(failed, dict) else ()):
+            steps = record.get("steps") if isinstance(record, dict) else None
+            if isinstance(steps, dict) and isinstance(record.get("key"), str) and all(
+                    step in profiling.ALL and isinstance(when, (int, float))
+                    and not isinstance(when, bool) for step, when in steps.items()):
+                self._failed_steps[str(key)] = {
+                    "key": record["key"], "verdict": str(record.get("verdict") or ""),
+                    "steps": {step: float(when) for step, when in steps.items()},
+                }
+            else:
+                skipped += 1
         if skipped:
             self.log.warning("записей о пробах профилей в базе не разобрано: %d — пропущены",
                              skipped)
@@ -4958,15 +5036,28 @@ class Daemon:
         switched = self._profile_switched
         now = self.wall()
         window = self.cfg.fragment.escalation_hours * 3600.0
+        # Истёкшие отметки и отметки «из будущего» (часы ушли назад) не хранятся: иначе запрет
+        # держался бы, пока часы их не догонят.
         self._escalations = {
-            key: [when for when in times if now - when < window]
+            key: [when for when in times if profiling.fresh(when, now, window)]
             for key, times in self._escalations.items()
         }
         self._escalations = {key: times for key, times in self._escalations.items() if times}
-        self._unstable = {key: until for key, until in self._unstable.items() if until > now}
+        self._unstable = {key: until for key, until in self._unstable.items()
+                          if now < until <= now + window}
         self._closed = {
-            key: when for key, when in self._closed.items() if now - when < CLOSED_RECHECK
+            key: when for key, when in self._closed.items()
+            if profiling.fresh(when, now, CLOSED_RECHECK)
         }
+        self._worked = {key: record for key, record in self._worked.items()
+                        if profiling.fresh(record.get("ts"), now, profiling.WORKED_KEEP)}
+        failed: dict[str, dict] = {}
+        for key, record in self._failed_steps.items():
+            steps = {step: when for step, when in (record.get("steps") or {}).items()
+                     if profiling.fresh(when, now, profiling.FAILED_KEEP)}
+            if steps:
+                failed[key] = {**record, "steps": steps}
+        self._failed_steps = failed
         if self.inventory is not None:
             known = {node.fingerprint for node in self.inventory.nodes}
             switched = {key: when for key, when in switched.items() if key in known}
@@ -4979,6 +5070,7 @@ class Daemon:
                 "trials": self._trial_saved, "switched": switched,
                 "escalations": self._escalations, "escalated": self._escalated,
                 "unstable": self._unstable, "closed": self._closed,
+                "worked": self._worked, "failed": self._failed_steps,
             }),
         )
 
