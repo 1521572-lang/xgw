@@ -305,6 +305,12 @@ class Harness(Daemon):
     def _base_ping(self, members=(), password=""):
         return self.base_ping
 
+    def _scan_gap(self, seconds):
+        """Пауза между плановыми пробами (п. 330): в тестах не ждёт и часов не двигает —
+        только запоминается (tests/test_select_robust.py проверяет её отдельно)."""
+        self.gaps = [*getattr(self, "gaps", []), seconds]
+        return False
+
     def _speed(self, info, password, *, small=False):
         self.measured.append(info.tag)
         self.small.append(small)

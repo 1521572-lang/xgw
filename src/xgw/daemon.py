@@ -75,6 +75,12 @@ LEAK_INTERVAL = 300.0  # проверка утечки — раз в 5 мину�
 WAN_DOWN_INTERVAL = 60.0  # при недоступном провайдере проверки раз в 60 с
 ALL_DEAD_RETRY = 300.0  # как часто повторять внеочередное обновление, пока все мертвы
 SCAN_BUDGET = 8.0  # секунд на сканы за один шаг: watchdog не должен надолго замирать
+# Плановые сканы запасных при исправном рабочем пути (HEALTHY) — не серией подряд, а с паузой
+# SCAN_GAP секунд перед каждой следующей пробой шага (PR-4 ТЗ TS-ANTI-TSPU-HARDENING, п. 330).
+# Пауза входит в SCAN_BUDGET: не помещается — проба ждёт следующего шага. Участники, аварийные
+# состояния (DEGRADED, ALL_DEAD, RESERVE), срочные и ручные проверки паузы не ждут.
+SCAN_GAP = (0.2, 1.5)
+SCAN_PACE_KEEP = 40  # сколько последних проб скана помнить для status.json (scan_pacing)
 RESCAN_PAUSE = 60.0  # внеочередной скан запасных — не чаще
 SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок после неудачи
 PROVIDER_DNS_TTL = 600.0
@@ -615,6 +621,18 @@ class Daemon:
         # отпечатком меняется, запасной на его место не ставится.
         self.home_exits: set[str] = set()
         self.scan_queue: deque[str] = deque()  # probe-теги узлов, ждущих скана
+        # Теги очереди, поставленные срочно (_queue_first(urgent=True): аварийный круг резерва,
+        # белые списки) — без паузы SCAN_GAP; отметка снимается вместе с тегом из очереди.
+        self._scan_urgent: set[str] = set()
+        # Последние пробы скана: [начало, конец, плановая ли, пауза перед ней или None — первая
+        # в шаге] по часам демона — для status.json (scan_pacing).
+        self._scan_pace: deque[list] = deque(maxlen=SCAN_PACE_KEEP)
+        # С запуска демона, для ТЗ на машине: фактические паузы перед плановыми пробами (число,
+        # наименьшая, наибольшая, вне SCAN_GAP), наибольший промежуток от конца прошлой пробы
+        # шага (пауза плюс обработка её итога) и срочные пробы (число, сколько ждали паузы — 0).
+        self._pace_stats: dict = {"planned": 0, "planned_min": None, "planned_max": None,
+                                  "planned_outside": 0, "idle_max": None, "urgent": 0,
+                                  "urgent_waited": 0}
         # Первая проверка участников собственной пробой шлюза: отпечатки уже проверенных
         # и теги тех, кто её не прошёл (тег → вердикт) — их меняют без ожидания
         # rotate_after_min.
@@ -2810,25 +2828,36 @@ class Daemon:
         сюда не попадают: это кандидаты в резервный выход, их редко и дешёвым запросом
         проверяет _reserve_step. everything — проверить и их: по кнопке «Проверить
         запасные» и когда трафик не идёт вовсе (ALL_DEAD)."""
-        queued = set(self.scan_queue)
         prices = self._prices()
         # Трафик не идёт (ALL_DEAD, RESERVE): внутри класса первыми проверяются серверы на другом
         # ядре и другом транспорте, чем у упавших участников, — блокировка, которая срезала TCP
         # через Xray, может пропустить QUIC через sing-box, и наоборот.
-        other = self._alternatives(view) if self.machine.state in (
-            State.ALL_DEAD, State.RESERVE) else set()
+        emergency = self.machine.state in (State.ALL_DEAD, State.RESERVE)
+        other = self._alternatives(view) if emergency else set()
+        # Порядок перемешивается только внутри равного приоритета (тот же рейтинг и «другой
+        # путь»): одинаковых серий проб в одном и том же порядке каждый круг нет (PR-4).
+        shuffle = {info.probe_tag: random.random() for info in view}
         spares = sorted(
             (info for info in view if info.role == "spare"),
-            key=lambda info: (-self._score(info), info.fingerprint not in other),
+            key=lambda info: (-self._score(info), info.fingerprint not in other,
+                              shuffle[info.probe_tag]),
         )
-        for info in spares:
-            if not everything and (
-                info.fingerprint not in prices  # не сопоставлен с подпиской: цена неизвестна
-                or self._score(info) <= 0
-            ):
-                continue
-            if info.probe_tag not in queued:
-                self.scan_queue.append(info.probe_tag)
+        wanted = [
+            info.probe_tag for info in spares
+            if everything or (
+                info.fingerprint in prices  # не сопоставлен с подпиской: цена неизвестна
+                and self._score(info) > 0
+            )
+        ]
+        if emergency or everything:
+            # Аварийная или ручная проверка: плановые записи, уже стоящие в очереди, встают в её
+            # порядок (приоритет выше), без дубликатов; участники и пробы профилей — впереди.
+            order = set(wanted)
+            self.scan_queue = deque(
+                [tag for tag in self.scan_queue if tag not in order] + wanted)
+        else:
+            queued = set(self.scan_queue)
+            self.scan_queue.extend(tag for tag in wanted if tag not in queued)
         self.next_rescan = now + RESCAN_PAUSE
 
     def _alternatives(self, view: list[NodeInfo]) -> set[str]:
@@ -3069,21 +3098,55 @@ class Daemon:
                 self.scan_queue.appendleft(info.probe_tag)
 
     def _scan_step(self, view: list[NodeInfo], applied: dict) -> None:
-        """Сканирует узлы из очереди, пока не истёк бюджет времени шага."""
+        """Сканирует узлы из очереди, пока не истёк бюджет времени шага.
+
+        Плановые сканы запасных при исправном рабочем пути (HEALTHY, не по кнопке, не срочные)
+        идут с паузой SCAN_GAP перед каждой следующей пробой шага (PR-4); пауза считается в
+        SCAN_BUDGET, и проба, которой не хватит бюджета вместе с паузой, ждёт следующего шага.
+        Бюджет вышел — новая проба не начинается (начатая доводится до своего таймаута).
+        Остановка во время паузы или пробы — тег остаётся в очереди; тег сервера, которого нет
+        в применённом конфиге (состав сменился), снимается."""
         if not self.scan_queue:
             return
         password, _ports = builder.probe_state(applied)
         nodes = {info.probe_tag: info for info in view}
         started = self.clock()
+        calm = self.machine.state is State.HEALTHY and not self._manual_scan
+        self._scan_urgent &= set(self.scan_queue)  # отметки ушедших из очереди не копятся
+        previous: list | None = None  # прошлая проба этого шага
         while self.scan_queue and self.clock() - started < SCAN_BUDGET and not self.stopping:
-            probe_tag = self.scan_queue.popleft()
+            probe_tag = self.scan_queue[0]
             info = nodes.get(probe_tag)
             if info is None or not password:
+                self.scan_queue.popleft()
+                self._scan_urgent.discard(probe_tag)
                 continue
+            planned = calm and info.role == "spare" and probe_tag not in self._scan_urgent
+            waited = 0.0
+            if planned and previous is not None:
+                pause = random.uniform(*SCAN_GAP)
+                if SCAN_BUDGET - (self.clock() - started) <= pause:
+                    break  # с паузой не помещается — следующим шагом
+                before = self.clock()
+                if self._scan_gap(pause) or self.clock() - started >= SCAN_BUDGET:
+                    break  # остановка демона (тег в очереди) или бюджет вышел за паузу
+                waited = self.clock() - before
+            self.scan_queue.popleft()
+            urgent = probe_tag in self._scan_urgent
+            self._scan_urgent.discard(probe_tag)
+            pace = [self.clock(), None, planned, None]
+            if previous is not None:
+                pace[3] = round(waited, 3)
+                self._pace_note(planned, waited, pace[0] - previous[1])
+            previous = pace
+            self._scan_pace.append(pace)
             self._scanned = True
             result = self._probe_scan(info, password)
+            pace[1] = self.clock()
             if result.kind == "cancelled":
                 self.scan_queue.appendleft(probe_tag)  # скан не состоялся
+                if urgent:
+                    self._scan_urgent.add(probe_tag)
                 break
             self._note_health(info.fingerprint, result.verdict in REPLACEABLE_VERDICTS)
             if result.verdict in REPLACEABLE_VERDICTS and self._closed.pop(
@@ -3108,6 +3171,41 @@ class Daemon:
                 "скан %s: %s, %d байт за %.1f с", info.tag, result.verdict,
                 result.bytes_read, result.seconds,
             )
+
+    def _scan_gap(self, seconds: float) -> bool:
+        """Пауза между плановыми пробами (событие остановки, монотонные часы); True — демон
+        останавливается."""
+        return self._stop.wait(seconds)
+
+    def _pace_note(self, planned: bool, waited: float, idle: float) -> None:
+        """Проба шага не первая: waited — сколько длилась пауза перед ней, idle — промежуток
+        от конца прошлой пробы (пауза плюс обработка итога прошлой)."""
+        stats, waited = self._pace_stats, round(max(0.0, waited), 3)
+        stats["idle_max"] = round(max(idle, stats["idle_max"] or 0.0), 3)
+        if not planned:
+            stats["urgent"] += 1
+            stats["urgent_waited"] += waited > 0
+            return
+        stats["planned"] += 1
+        stats["planned_max"] = max(waited, stats["planned_max"] or 0.0)
+        low = stats["planned_min"]
+        stats["planned_min"] = waited if low is None else min(low, waited)
+        # Допуск 0,1 с сверху: ожидание события просыпается чуть позже срока.
+        stats["planned_outside"] += not SCAN_GAP[0] - 0.01 <= waited <= SCAN_GAP[1] + 0.1
+
+    def _pacing(self) -> dict:
+        """Для status.json: фактические паузы перед последними плановыми пробами скана
+        (секунды), сколько из последних SCAN_PACE_KEEP проб были плановыми и срочными, итоги с
+        запуска демона (totals) и через сколько секунд следующий плановый круг. Ни тегов, ни
+        адресов. Пробы скана идут по одной (одновременных нет)."""
+        gaps = [round(item[3], 2) for item in self._scan_pace if item[2] and item[3] is not None]
+        return {
+            "gap_s": list(SCAN_GAP), "planned_gaps_s": gaps[-20:],
+            "planned": sum(1 for item in self._scan_pace if item[2]),
+            "urgent": sum(1 for item in self._scan_pace if not item[2]),
+            "totals": dict(self._pace_stats),
+            "next_planned_in_s": round(max(0.0, self.next_scan - self.clock())),
+        }
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
         """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
@@ -4486,7 +4584,7 @@ class Daemon:
         self.whitelist_since = self.wall()
         offer = self._whitelist_offer(view)
         for info in self._whitelist_servers(view):
-            self._queue_first(info.probe_tag)  # проверить их первыми — для предложения
+            self._queue_first(info.probe_tag, urgent=True)  # первыми — для предложения
         hint = (f" Можно включить сервер для белых списков «{offer['name']}» в панели — он "
                 f"тратит квоту в {offer['multiplier']:g} раз быстрее." if offer else
                 " Серверов для белых списков (x100) в подписках нет.")
@@ -4707,10 +4805,14 @@ class Daemon:
             self.log.info("%s без обхода пока не отвечает (%s) — обход остаётся", name, verdict)
         self._save_profiles()
 
-    def _queue_first(self, probe_tag: str) -> None:
+    def _queue_first(self, probe_tag: str, *, urgent: bool = False) -> None:
+        """В начало очереди скана, без дубликата. urgent — без паузы SCAN_GAP (аварийная
+        проверка): плановая запись, ставшая срочной, повышает приоритет здесь же."""
         if probe_tag in self.scan_queue:
             self.scan_queue.remove(probe_tag)
         self.scan_queue.appendleft(probe_tag)
+        if urgent:
+            self._scan_urgent.add(probe_tag)
 
     def _load_profiles(self) -> None:
         """Пробы профилей и время смены профиля из базы (TRIALS_META): прошлый запуск демона
@@ -5242,12 +5344,13 @@ class Daemon:
                 tags.append(current_info.probe_tag)
             self.reserve_round = (self.wall(), tags)
             self.next_reserve_check = now + jitter(RESERVE_RECHECK)
-            queued = set(self.scan_queue)
-            fresh = [tag for tag in tags if tag not in queued]
             if state is State.ALL_DEAD:
-                self.scan_queue.extendleft(reversed(fresh))
+                # Аварийный круг: и те, что уже ждали планового скана, — вперёд и без паузы.
+                for tag in reversed(tags):
+                    self._queue_first(tag, urgent=True)
             else:
-                self.scan_queue.extend(fresh)
+                queued = set(self.scan_queue)
+                self.scan_queue.extend(tag for tag in tags if tag not in queued)
             return False
         started, tags = self.reserve_round
         waiting = set(tags) & set(self.scan_queue)
@@ -6512,6 +6615,7 @@ class Daemon:
             "health_observed": self._health_observed,
             "phase": "checks" if checkpoint else "complete",
         }
+        snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         job = self._build
         snapshot["assembly"] = {
             "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")
