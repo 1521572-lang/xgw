@@ -20,6 +20,7 @@ from PyQt6.QtGui import (
     QRadialGradient,
 )
 from PyQt6.QtWidgets import (
+    QAbstractButton,
     QButtonGroup,
     QFrame,
     QHBoxLayout,
@@ -151,7 +152,54 @@ def draw(painter: QPainter, name: str, color: QColor, width: float = 1.8) -> Non
         path.arcTo(QRectF(5, 5, 14, 14), 60, -300)
         path.moveTo(12, 3.5)
         path.lineTo(12, 11)
+    elif name == "remeasure":
+        path.arcMoveTo(QRectF(4, 4, 16, 16), 30)
+        path.arcTo(QRectF(4, 4, 16, 16), 30, 300)
+        path.moveTo(20, 4.5)
+        path.lineTo(19.9, 9.4)
+        path.lineTo(15, 9.2)
+    elif name == "more":
+        painter.setBrush(color)
+        for x in (6, 12, 18):
+            painter.drawEllipse(QPointF(x, 12), 1.6, 1.6)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+    elif name == "search":
+        path.addEllipse(QPointF(10.5, 10.5), 6, 6)
+        path.moveTo(15, 15)
+        path.lineTo(20, 20)
     painter.drawPath(path)
+
+
+class Switch(QAbstractButton):
+    """Переключатель «вкл/выкл» как в мобильных и VPN-клиентах; состояние — и словом рядом."""
+
+    def __init__(self, label: str = "") -> None:
+        super().__init__()
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(label)
+        self.setFixedSize(46, 26)
+
+    def paintEvent(self, _event) -> None:
+        colors = theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        on = self.isChecked()
+        track = QColor(colors["accent"] if on else colors["border"])
+        if not self.isEnabled():
+            track.setAlpha(110)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(QRectF(1, 3, 44, 20), 10, 10)
+        painter.setBrush(QColor(colors["surface"] if on else colors["text"]))
+        painter.drawEllipse(QPointF(35 if on else 11, 13), 8, 8)
+        if self.hasFocus():
+            pen = QPen(QColor(colors["focus"]))
+            pen.setWidthF(2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(1, 2, 44, 22), 11, 11)
+        painter.end()
 
 
 def icon(name: str, normal: str, active: str | None = None, size: int = 24) -> QIcon:

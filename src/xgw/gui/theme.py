@@ -208,6 +208,22 @@ QPushButton#connect:disabled, QPushButton#connect[tone="off"]:disabled,
 QPushButton#connect[tone="on"]:disabled {{
     background: transparent; color: {c['muted']}; border: 2px dashed {c['border']}; }}
 QPushButton#connect:focus {{ border: 3px solid {c['focus']}; }}
+QPushButton#seg {{ border-radius: 16px; padding: 6px 16px; background: transparent; }}
+QPushButton#seg:checked {{ background: {c['selected']}; border-color: {c['accent']}; }}
+QToolButton#iconButton {{ background: transparent; border: 1px solid transparent;
+    border-radius: 8px; padding: 4px; }}
+QToolButton#iconButton:hover {{ border-color: {c['border']}; background: {c['surface2']}; }}
+QToolButton#iconButton:disabled {{ background: {c['surface2']}; }}
+QToolButton#iconButton::menu-indicator {{ image: none; width: 0; }}
+QLineEdit, QPlainTextEdit {{ background: {c['surface']}; color: {c['text']};
+    border: 1px solid {c['border']}; border-radius: 10px; padding: 6px 10px;
+    selection-background-color: {c['accent']}; }}
+QLineEdit:focus, QPlainTextEdit:focus {{ border: 2px solid {c['focus']}; }}
+QProgressBar {{ background: {c['surface2']}; border: none; border-radius: 3px; }}
+QProgressBar::chunk {{ background: {c['ok']}; border-radius: 3px; }}
+QProgressBar[tone="warn"]::chunk {{ background: {c['warn']}; }}
+QProgressBar[tone="bad"]::chunk {{ background: {c['bad']}; }}
+QDialog, QMessageBox {{ background: {c['surface']}; }}
 QMenu {{ background: {c['surface']}; border: 1px solid {c['border']}; padding: 6px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
 QMenu::item:selected {{ background: {c['selected']}; }}

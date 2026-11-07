@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 
 from . import client as clienting
 from . import model, theme
+from .pages import ServersPage, SubscriptionsPage
 from .widgets import (
     Badge,
     Metric,
@@ -508,9 +509,13 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
         self.login_page = LoginPage(self.start_login)
         self.overview = OverviewPage(self)
-        self.pages: dict[str, QWidget] = {"overview": self.overview}
+        self.servers = ServersPage(self)
+        self.subscriptions = SubscriptionsPage(self)
+        self.pages: dict[str, QWidget] = {"overview": self.overview, "servers": self.servers,
+                                          "subscriptions": self.subscriptions}
         for key, _title in SECTIONS[1:]:
-            self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
+            if key not in self.pages:
+                self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
         for key, _title in SECTIONS:
             self.stack.addWidget(self.pages[key])
         self.stack.addWidget(self.login_page)
@@ -556,6 +561,7 @@ class MainWindow(QMainWindow):
 
     def on_action(self, key: str, ok: bool, text: str) -> None:
         self.statusBar().showMessage(_marked("ok" if ok else "bad", text), 15000)
+        self.subscriptions.action_done(key, ok)
         self.render()
 
     # --- вход ---------------------------------------------------------------------------------
@@ -621,6 +627,9 @@ class MainWindow(QMainWindow):
         tone(self.chip, chip_tone)
         set_text(self.chip, _marked(chip_tone, text))
         self.overview.show_state(state, stale)
+        current = self.stack.currentWidget()
+        if current in (self.servers, self.subscriptions):
+            current.show_state(None if stale and state is None else state)
         self._logo(model.shield(state, stale)[0] if state is not None else "off")
         self._tick()
 
@@ -645,6 +654,8 @@ class MainWindow(QMainWindow):
             return
         key = SECTIONS[max(0, row)][0]
         self.stack.setCurrentWidget(self.pages[key])
+        if key in ("servers", "subscriptions"):
+            self.pages[key].show_state(self.state)
 
     def _theme_changed(self, action: QAction) -> None:
         choice = str(action.data())
@@ -659,6 +670,7 @@ class MainWindow(QMainWindow):
         for page in self.pages.values():
             if isinstance(page, PendingPage):
                 page.recolor(colors)
+        self.servers.recolor()
         self.update()
 
     # --- видимость: опрос реже, пока окно не видно ------------------------------------------

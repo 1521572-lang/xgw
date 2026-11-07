@@ -250,3 +250,61 @@ def test_new_version_replaces_the_open_window_of_the_old_one(qapp):
     assert fresh.listen(lambda: None)
     fresh.server.close()
     assert len(gui_app.code_stamp()) == 16
+
+
+def test_servers_page_acts_through_the_panel(qapp, demo, tmp_path):
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    wait(qapp, lambda: win.state is not None)
+    win.nav.setCurrentRow(1)
+    page = win.servers
+    wait(qapp, lambda: page.groups and any(not w.isHidden() for w in page.groups.values()))
+    cards = [card for group in page.groups.values() for card in group.cards
+             if not card.isHidden() and card.item is not None]
+    germany = next(card for card in cards if card.item.code == "DE")
+    done = []
+    client.actionFinished.connect(lambda *args: done.append(args))
+    germany.choose.click()
+    wait(qapp, lambda: done)
+    assert done[-1][0] == "pin" and done[-1][1] is True
+    page.priority(germany.item, "high")
+    wait(qapp, lambda: len(done) >= 2)
+    assert done[-1][0].startswith("priority:") and done[-1][1] is True
+    page.confirm = lambda title, text, yes: True
+    page.remove(germany.item)
+    wait(qapp, lambda: len(done) >= 3)
+    assert done[-1][0] == "servers" and done[-1][1] is True
+    page.search.setText("финл")
+    assert all(card.item.code == "FI" for group in page.groups.values() if not group.isHidden()
+               for card in group.cards if not card.isHidden())
+    page.tab_buttons[1].click()
+    assert page.pool_observe.isVisible() and not page.pool_house.isVisible()
+    client.stop()
+    win.close()
+
+
+def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qapp, demo,
+                                                                             tmp_path):
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    wait(qapp, lambda: win.state is not None)
+    win.nav.setCurrentRow(2)
+    page = win.subscriptions
+    wait(qapp, lambda: page.cards and not page.cards[0][0].isHidden())
+    assert page.cards[0][1]["name"].text() == "main" and page.cards[0][1]["edit"].isHidden()
+    done = []
+    client.actionFinished.connect(lambda *args: done.append(args))
+    page.text.setPlainText("это не ссылка")
+    page.add.click()
+    wait(qapp, lambda: done)
+    assert done[-1][1] is False and page.text.toPlainText() == "это не ссылка"
+    page.text.setPlainText("trojan://secret@example.org:443#Новый")
+    page.add.click()
+    wait(qapp, lambda: len(done) >= 2)
+    assert done[-1][1] is True and page.text.toPlainText() == ""
+    client.stop()
+    win.close()
