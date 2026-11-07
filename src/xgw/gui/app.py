@@ -141,6 +141,27 @@ class SingleInstance:
         socket.readyRead.connect(read)
 
 
+EXIT_GRACE_S = 15  # столько ждать выхода после закрытия окна, потом — стек и выход
+
+
+def _watch_exit(main_window, app) -> None:
+    """Закрыли окно — программа выходит сама, не дожидаясь решения Qt о «последнем окне»
+    (отчёт gui-s3: на рабочем столе окно закрылось, а процесс остался). Не вышла за
+    EXIT_GRACE_S — стек всех потоков в stderr (там видно, где застряло) и выход.
+    `kill -USR1 <pid>` — тот же стек без выхода, для проверки на машине."""
+    import faulthandler
+    import signal
+
+    with contextlib.suppress(AttributeError, ValueError, RuntimeError):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+    def closed() -> None:
+        faulthandler.dump_traceback_later(EXIT_GRACE_S, exit=True)
+        app.quit()
+
+    main_window.closed.connect(closed)
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("окно XGW запускается от имени пользователя, не от root: xgw gui", file=sys.stderr)
@@ -175,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
     client = clienting.ApiClient(model.load_session(path))
     flow = login.LoginFlow(client.exchange)
     main_window = window.MainWindow(client, flow, path)
+    _watch_exit(main_window, app)
+
     def replaced() -> None:  # запущено окно новой версии: это закрывается
         main_window.close()
         app.quit()

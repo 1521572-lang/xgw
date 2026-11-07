@@ -58,6 +58,13 @@ def set_text(widget: QLabel, text: str) -> None:
         widget.setText(text)
 
 
+def tip(widget: QWidget, text: str) -> None:
+    """Подсказка меняется, только если другой текст: опрос раз в несколько секунд не трогает
+    подсказку, которую человек сейчас читает (отчёт gui-s3)."""
+    if widget.toolTip() != text:
+        widget.setToolTip(text)
+
+
 class Elided(QLabel):
     """Подпись в одну строку: не влезает — обрезается многоточием, целиком — в подсказке."""
 
@@ -485,18 +492,21 @@ class ServerRowWidget(QFrame):
     def show_row(self, row: model.ServerRow) -> None:
         self.badge.show_country(row.flag, row.code)
         set_text(self.name, row.name)
-        self.name.setToolTip(row.name)
+        tip(self.name, row.name)
         set_text(self.sub, row.sub)
-        self.sub.setToolTip(row.sub)
+        tip(self.sub, row.sub)
         self.is_main = row.main
         self._fit()
         set_text(self.speed, row.speed if row.speed != "—" else "")
         set_text(self.delay, row.delay or ("нет замера" if row.speed == "—" else ""))
-        self.delay.setToolTip(row.note)
-        self.speed.setToolTip(row.note)
+        tip(self.delay, row.note)
+        tip(self.speed, row.note)
         tone(self.dot, row.tone)
         set_text(self.state, f"{model.MARKS.get(row.tone, '')} {row.status}".strip())
-        self.dot.setToolTip(row.status)
+        # Слово состояния — подсказкой у всей правой колонки и у строки, а не только у точки
+        # в 10 пикселей: в узкой строке слова не видно (отчёт gui-s3: на точку не попали).
+        for widget in (self.dot, self.holder, self):
+            tip(widget, row.status)
         tone(self, "true" if row.main else "false", "main")
         self.setAccessibleName(f"{row.name}: {row.status}, {row.speed}")
 

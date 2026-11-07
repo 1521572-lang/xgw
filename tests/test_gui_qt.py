@@ -252,6 +252,31 @@ def test_new_version_replaces_the_open_window_of_the_old_one(qapp):
     assert len(gui_app.code_stamp()) == 16
 
 
+def test_status_word_hint_covers_the_row_and_closing_quits(qapp, demo, tmp_path):
+    """Отчёт gui-s3: подсказка у точки в 10 пикселей не показалась, а после закрытия окна
+    процесс остался. Подсказка — у всей правой колонки и строки; закрытие — выход."""
+    import faulthandler
+
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    quits = []
+
+    class App:
+        def quit(self):
+            quits.append(1)
+
+    gui_app._watch_exit(win, App())
+    win.resize(1024, 720)
+    win.show()
+    client.start()
+    wait(qapp, lambda: win.overview.members.visible_rows())
+    row = win.overview.members.visible_rows()[0]
+    assert row.toolTip() and row.holder.toolTip() == row.dot.toolTip() == row.toolTip()
+    win.close()
+    faulthandler.cancel_dump_traceback_later()  # в тесте процесс не завершать
+    assert quits == [1]
+
+
 def test_servers_page_acts_through_the_panel(qapp, demo, tmp_path):
     client = _client(demo.port)
     win = _window(client, tmp_path)

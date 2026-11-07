@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl
+from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -471,6 +471,8 @@ def _busy(state: dict | None, name: str) -> bool:
 
 
 class MainWindow(QMainWindow):
+    closed = pyqtSignal()  # окно закрыто: программе пора выходить (app._watch_exit)
+
     def __init__(self, client: clienting.ApiClient, login, session_path) -> None:
         super().__init__()
         self.client, self.login, self.session_path = client, login, session_path
@@ -685,6 +687,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.client.close()  # демон, Xray и sing-box работают дальше
         super().closeEvent(event)
+        self.closed.emit()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

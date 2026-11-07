@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import listing, model, theme
-from .widgets import Badge, Elided, Switch, icon, label, set_text, tone
+from .widgets import Badge, Elided, Switch, icon, label, set_text, tip, tone
 
 POOL_SHOWN = 300  # строк пула на источник сразу; остальное — поиском (их бывают сотни)
 
@@ -147,10 +147,10 @@ class Row(QFrame):
              value: str, tone_name: str, selected: bool) -> None:
         self.badge.show_country(flag, code)
         set_text(self.name, name)
-        self.name.setToolTip(name)
+        tip(self.name, name)
         self.tags.show_tags(tags)
         set_text(self.sub, sub)
-        self.sub.setToolTip(sub)
+        tip(self.sub, sub)
         set_text(self.speed, speed)
         self.speed.setVisible(bool(speed))
         set_text(self.value, value)
@@ -192,11 +192,11 @@ class ServerCard(Row):
                   selected=item.pinned or any(text == "основной" for _t, text in item.tags))
         self.measure.setVisible(item.measurable)
         self.measure.setEnabled(not item.measuring)
-        self.measure.setToolTip("Скорость этого сервера замеряется…" if item.measuring
-                                else "Замерить скорость только этого сервера")
+        tip(self.measure, "Скорость этого сервера замеряется…" if item.measuring
+            else "Замерить скорость только этого сервера")
         self.measure.setAccessibleName(f"Замерить скорость «{item.name}»")
         self.choose.setVisible(item.choosable)
-        self.choose.setToolTip(f"Весь трафик — через «{item.name}», пока не нажмёте «Автовыбор»")
+        tip(self.choose, f"Весь трафик — через «{item.name}», пока не нажмёте «Автовыбор»")
         self.choose.setAccessibleName(f"Выбрать {item.name}")
         self.more.setVisible(item.editable)
         self.more.setAccessibleName(f"Действия с сервером {item.name}")
