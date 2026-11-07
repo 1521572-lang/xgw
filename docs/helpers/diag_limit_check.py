@@ -179,6 +179,24 @@ def snapshot():
     return json.loads(STATUS.read_text(encoding="utf-8"))
 
 
+def classify_gaps(gaps, steps, interval):
+    """Разрывы записи статуса больше 25 с: (зависаний, объяснённые «разрыв/шаг»). Статус пишется
+    после сигналов и в конце шага, шаг начинается через interval_s ±20 % от начала прошлого:
+    разрыв до 1,2·interval_s + длительность шага — обычный долгий шаг (справочно). Больше или
+    без законченного шага рядом — зависание (FAIL)."""
+    hung, explained = 0, []
+    for gap_from, gap_to in gaps:
+        length = gap_to - gap_from
+        if length <= 25.0:
+            continue
+        near = [spent for when, spent in steps if gap_from < when <= gap_to + 70.0]
+        if near and length <= 1.2 * interval + max(near) + 2.0:
+            explained.append(f"{length:.1f}/{max(near):.1f}")
+        else:
+            hung += 1
+    return hung, explained
+
+
 def observe(minutes):
     begin, data = time.time(), snapshot()
     pacing = data.get("scan_pacing") or {}
@@ -212,11 +230,11 @@ def observe(minutes):
         last = moment
         with contextlib.suppress(OSError, ValueError):
             states.add(snapshot().get("state"))
-    end = (snapshot().get("scan_pacing") or {}).get("totals") or {}
-    planned = end.get("planned", 0) - first.get("planned", 0)
-    outside = end.get("planned_outside", 0) - first.get("planned_outside", 0)
-    urgent = end.get("urgent", 0) - first.get("urgent", 0)
-    waited = end.get("urgent_waited", 0) - first.get("urgent_waited", 0)
+    totals = (snapshot().get("scan_pacing") or {}).get("totals") or {}
+    planned = totals.get("planned", 0) - first.get("planned", 0)
+    outside = totals.get("planned_outside", 0) - first.get("planned_outside", 0)
+    urgent = totals.get("urgent", 0) - first.get("urgent", 0)
+    waited = totals.get("urgent_waited", 0) - first.get("urgent_waited", 0)
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(begin))
     journal = run(["journalctl", "-u", "xgw", "--since", since, "-o", "cat", "--no-pager"],
                   timeout=60)
@@ -226,22 +244,12 @@ def observe(minutes):
     unfinished = journal.count("проверка адреса проб не закончена")
     slow = journal.count("шаг watchdog занял")
     over = sum(1 for gap in marks if gap > 25.0)
-    # Статус пишется после сигналов и в конце шага, шаг начинается через interval_s ±20 % от
-    # начала прошлого: разрыв до 1,2·interval_s + длительность шага — обычный долгий шаг
-    # (справочно). Разрыв больше, или ни одного законченного шага рядом, — зависание (FAIL).
-    hung, explained = 0, []
-    for start, end in gaps:
-        if end - start <= 25.0:
-            continue
-        near = [spent for when, spent in steps if start < when <= end + 70.0]
-        if near and end - start <= 1.2 * interval + max(near) + 2.0:
-            explained.append(f"{end - start:.1f}/{max(near):.1f}")
-        else:
-            hung += 1
+    hung, explained = classify_gaps(gaps, steps, interval)
     print(f"INFO window_min={(time.time() - begin) / 60:.1f} "
           f"states={sorted(map(str, states))}", flush=True)
-    print(f"INFO planned_pauses={planned} min={end.get('planned_min')} "
-          f"max={end.get('planned_max')} outside={outside} idle_max_s={end.get('idle_max')}")
+    print(f"INFO planned_pauses={planned} min={totals.get('planned_min')} "
+          f"max={totals.get('planned_max')} outside={outside} "
+          f"idle_max_s={totals.get('idle_max')}")
     print(f"INFO urgent_probes={urgent} urgent_waited={waited} scan_lines={scans} "
           f"error_lines={len([line for line in errors.splitlines() if line.strip()])}")
     diag = (snapshot().get("scan_pacing") or {}).get("diagnosis") or {}
