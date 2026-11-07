@@ -67,6 +67,9 @@ class Diagnosis:
     down: bool  # не отвечает сам probe.url: серверы трогать не нужно
     signature: str = ""  # общая ошибка проб («HTTP 403», «таймаут»); пусто — ошибки разные
     detail: str = ""  # что показали контрольные запросы
+    # False — пробы не успели дать итог до дедлайна (daemon.DIAG_BUDGET): выводов нет — ни
+    # «адрес отвечает», ни «серверы мертвы»; проверка продолжается на следующем шаге.
+    complete: bool = True
 
     @property
     def text(self) -> str:
@@ -131,6 +134,70 @@ def sample(
     ]
     spares.sort(key=lambda info: 0 if verdicts.get(info.probe_tag) in _GOOD else 1)
     return [*members, *spares[:SAMPLE_SPARES]]
+
+
+class Cutoff:
+    """Отмена проб проверки: остановка демона (stop) или общий дедлайн (по часам clock).
+    Пробы (checks, fetch) смотрят только is_set и wait — этого достаточно."""
+
+    def __init__(self, stop: threading.Event | None, deadline: float,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._stop, self._deadline, self._clock = stop, deadline, clock
+
+    def is_set(self) -> bool:
+        return (self._stop is not None and self._stop.is_set()) or (
+            self._clock() >= self._deadline)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        end = time.monotonic() + (timeout if timeout is not None else 1e9)
+        while not self.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(left, 0.25))
+        return True
+
+
+def diagnosis_order(nodes: Sequence[NodeInfo], verdicts: dict[str, str]) -> list[NodeInfo]:
+    """Порядок проб проверки адреса: запасные, прошедшие последний скан, — первыми: их ответ
+    сразу говорит «адрес отвечает», и неполная проверка не держит шаг; затем участники и
+    остальные. Вывод от порядка не зависит — только скорость итога."""
+    def rank(info: NodeInfo) -> int:
+        if info.role == "spare" and verdicts.get(info.probe_tag) in _GOOD:
+            return 0
+        return 1 if info.role == "proxy" else 2
+    return sorted(nodes, key=rank)
+
+
+def probe_sample(
+    nodes: Sequence[NodeInfo], probe: Callable[[NodeInfo], ScanResult], *,
+    workers: int, cut: Cutoff,
+) -> tuple[list[ScanResult], int]:
+    """Пробы nodes не больше workers одновременно, пока не выставлен cut (дедлайн или
+    остановка): не начатые и прерванные (kind "cancelled") в итог не входят — о сервере они
+    ничего не говорят. Возвращает (итоги, наибольшее число одновременных проб)."""
+    if not nodes:
+        return [], 0
+    lock = threading.Lock()
+    running = [0, 0]  # сейчас, наибольшее
+
+    def one(info: NodeInfo) -> ScanResult | None:
+        if cut.is_set():
+            return None
+        with lock:
+            running[0] += 1
+            running[1] = max(running[1], running[0])
+        try:
+            result = probe(info)
+        finally:
+            with lock:
+                running[0] -= 1
+        return None if result.kind == "cancelled" else result
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(nodes))),
+                            thread_name_prefix="xgw-diag") as pool:
+        results = list(pool.map(one, nodes))
+    return [result for result in results if result is not None], running[1]
 
 
 # Одновременных запросов base_ping через участников (участники × проверочные хосты).

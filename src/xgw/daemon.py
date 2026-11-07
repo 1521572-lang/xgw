@@ -30,7 +30,6 @@ import random
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -94,7 +93,14 @@ WAIT_SLICE = 0.25  # как часто пауза между шагами смо
 NET_WAKE_PAUSE = 2.0
 MANUAL_SCAN_PAUSE = 1.0  # проверка по кнопке идёт подряд, не дожидаясь шага watchdog
 PROBE_TARGET_RECHECK = 300.0  # как часто перепроверять, отвечает ли сам probe.url
-PROBE_WORKERS = 8  # пробы для этой перепроверки идут одновременно: шаг не должен зависать
+# Пробы этой перепроверки (_diagnose_target): не больше DIAG_WORKERS одновременно (было 8 сразу —
+# восемь одинаковых TLS-сессий, PR-4) и все вместе не дольше DIAG_BUDGET за шаг. DIAG_BUDGET не
+# короче самой долгой пробы (scan_node: 15 с), иначе таймауты не доходили бы до итога. Не успели
+# все — итоги держатся DIAG_KEEP и доделываются на следующих шагах; до итога выводов нет: ни «адрес
+# отвечает», ни «серверы мертвы» (сканы и замены ждут). п. 332.
+DIAG_WORKERS = 2
+DIAG_BUDGET = 16.0
+DIAG_KEEP = 180.0
 # Перестановка по рейтингу (_rebalance): лучший годный запасной встаёт на место слабейшего
 # живого участника, если его рейтинг выше хотя бы на MEMBER_GAIN, — не чаще REBALANCE_EVERY:
 # не каждые полминуты, но и не мёртвой хваткой (решение заказчика 20.10.2026).
@@ -633,6 +639,10 @@ class Daemon:
         self._pace_stats: dict = {"planned": 0, "planned_min": None, "planned_max": None,
                                   "planned_outside": 0, "idle_max": None, "urgent": 0,
                                   "urgent_waited": 0}
+        # Неполная проверка адреса проб (_diagnose_target): тег → (итог пробы, когда снят).
+        self._diag_partial: dict[str, tuple[scan.ScanResult, float]] = {}
+        self._diag_cut: object | None = None  # отмена проб этой проверки (target.Cutoff)
+        self._diag_last: dict = {}  # итог последней проверки — для status.json (scan_pacing)
         # Первая проверка участников собственной пробой шлюза: отпечатки уже проверенных
         # и теги тех, кто её не прошёл (тег → вердикт) — их меняют без ожидания
         # rotate_after_min.
@@ -1558,7 +1568,9 @@ class Daemon:
         # (все «недоступны»), а замена участников шла бы по кругу: и то, и другое ждёт.
         # Решает сам признак, а не имя состояния: утечка (LEAK) стоит в машине состояний
         # выше и его заслоняет, а сканам и замене от этого не легче.
-        probing = not self.probe_target
+        # Проверка адреса проб не закончена (_diagnose_target, неполный итог) — тоже ждут: до её
+        # итога отказ серверов не доказан.
+        probing = not self.probe_target and not self._diag_partial
         if scan_asked and probing:
             self._manual_scan = True
             self._queue_scan(view, now, everything=True)
@@ -1569,7 +1581,9 @@ class Daemon:
             self.next_scan = now + jitter(self._scan_period(view) * 60.0)
             self._queue_scan(view, now)
         elif scan_asked:
-            self.notifier.event("probe", "проверка запасных отложена: не отвечает probe.url")
+            self.notifier.event("probe", "проверка запасных отложена: " + (
+                "не отвечает probe.url" if self.probe_target else
+                "не закончена проверка адреса проб"))
         if not changed and probing and signals.xray_ok and signals.provider_ok:
             # Подписка после запуска демона ещё не получена (опрос в фоне): цены запасных
             # неизвестны, _queue_scan их пропустил бы — круг ждёт её, а не следующего срока.
@@ -1977,6 +1991,7 @@ class Daemon:
         # Сквозная проверка ходит по разным хостам (0.1.18) и может пройти, когда ядро, которое
         # пробует один probe.url, сочло мёртвыми всех участников: это тоже повод проверить адрес.
         if reachable and signals.e2e_ok and not self.reserve_mode and not all_dead:
+            self._diag_partial = {}  # повода нет — неполная проверка больше не нужна
             self._target_answers(now)
             # И после перезапуска демона: запись о запасном адресе могла остаться с прошлого
             # раза. Сквозная проверка проходит и через другие хосты (0.1.18) — ядро возвращается
@@ -1987,6 +2002,8 @@ class Daemon:
         suspect = reachable and (self.reserve_mode or all_dead or (
             not signals.e2e_ok and signals.e2e_fail_streak >= self.cfg.watchdog.fail_threshold
         ))
+        if not suspect:
+            self._diag_partial = {}
         if suspect and now >= self.next_target_check and not self.stopping:
             self.next_target_check = now + PROBE_TARGET_RECHECK
             diagnosis = self._diagnose_target(view, applied)
@@ -1994,6 +2011,13 @@ class Daemon:
                 # Пробы прерваны остановкой: ошибка у всех одна, но о probe.url она ничего
                 # не говорит.
                 self.next_target_check = 0.0
+                return signals
+            if not diagnosis.complete:
+                # Дедлайн шага вышел раньше, чем пробы дали итог: это не «адрес отвечает» и не
+                # «серверы мертвы». Доделать на следующем шаге; сканы и замены ждут (_diag_partial).
+                self.next_target_check = now
+                if self.probe_target:
+                    return dataclasses.replace(signals, probe_target_ok=False)
                 return signals
             alternate = self._alternate_host(view, applied) if diagnosis.down else ""
             if alternate:
@@ -2097,13 +2121,53 @@ class Daemon:
         )
 
     def _diagnose_target(self, view: list[NodeInfo], applied: dict) -> target.Diagnosis:
+        """Пробы участников и выборки запасных (target.sample) — не больше DIAG_WORKERS
+        одновременно и не дольше DIAG_BUDGET за шаг (PR-4). Не успели все — итог неполный
+        (Diagnosis.complete = False), снятые пробы держатся DIAG_KEEP и не повторяются на
+        следующем шаге; смена состава (тега нет в выборке) их снимает. Неполный итог годится,
+        только если хоть одна проба получила probe.url: тогда адрес отвечает, что бы ни
+        показали остальные."""
         password, _ports = builder.probe_state(applied)
         verdicts = {tag: entry["verdict"] for tag, entry in self.store.scans().items()}
         nodes = target.sample(view, verdicts, skip=self._costly_spares(view))
         if not password or not nodes:
+            self._diag_partial = {}
             return target.Diagnosis(False)
-        with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(nodes))) as pool:
-            results = list(pool.map(lambda info: self._scan(info, password), nodes))
+        now = self.clock()
+        tags = {info.tag for info in nodes}
+        kept = {tag: item for tag, item in self._diag_partial.items()
+                if tag in tags and 0.0 <= now - item[1] < DIAG_KEEP}
+        todo = target.diagnosis_order(
+            [info for info in nodes if info.tag not in kept], verdicts)
+        self._diag_cut = target.Cutoff(self._stop, self.clock() + DIAG_BUDGET, self.clock)
+        try:
+            fresh, parallel = target.probe_sample(
+                todo, lambda info: self._scan(info, password), workers=DIAG_WORKERS,
+                cut=self._diag_cut,
+            )
+        finally:
+            self._diag_cut = None
+        done = self.clock()
+        merged = {tag: result for tag, (result, _at) in kept.items()}
+        merged.update((result.tag, result) for result in fresh)
+        results = [merged[info.tag] for info in nodes if info.tag in merged]
+        complete = len(results) == len(nodes)
+        answered = any(not target.signature(result) for result in results)
+        self._diag_last = {
+            "complete": complete or answered, "probed": len(results), "of": len(nodes),
+            "max_parallel": parallel, "seconds": round(done - now, 1), "ts": self.wall(),
+        }
+        if not complete and not answered:
+            self._diag_partial = {
+                **kept, **{result.tag: (result, done) for result in fresh},
+            }
+            self.log.info(
+                "проверка адреса проб не закончена за %.0f с: итог у %d из %d серверов — "
+                "продолжу на следующем шаге, выводов пока нет", done - now, len(results),
+                len(nodes),
+            )
+            return target.Diagnosis(False, complete=False)
+        self._diag_partial = {}
         members = [info for info in view if info.role == "proxy"]
         return target.diagnose(
             results, base_ping=lambda: self._base_ping(members, password),
@@ -3205,14 +3269,19 @@ class Daemon:
             "urgent": sum(1 for item in self._scan_pace if not item[2]),
             "totals": dict(self._pace_stats),
             "next_planned_in_s": round(max(0.0, self.next_scan - self.clock())),
+            # Проверка адреса проб (п. 332): предел, срок, ждёт ли доделки, итог последней.
+            "diagnosis": {"workers": DIAG_WORKERS, "budget_s": DIAG_BUDGET,
+                          "pending": len(self._diag_partial), **self._diag_last},
         }
 
     def _scan(self, info: NodeInfo, password: str, url: str | None = None) -> scan.ScanResult:
         """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
         целиком: по итогу решается, выучен ли профиль, а случайная часть файла короче порога
         «заморозки» дала бы OK и выучила бы негодный профиль (T05 кросс-аудита 4cc96b9)."""
+        # Проба проверки адреса (_diagnose_target) прерывается и общим дедлайном этой проверки.
+        cancel = self._diag_cut if self._diag_cut is not None else self._stop
         result = scan.scan_node(
-            info, self.cfg, probe_pass=password, url=url, cancel=self._stop,
+            info, self.cfg, probe_pass=password, url=url, cancel=cancel,  # type: ignore[arg-type]
             random_size=info.fingerprint not in self._profile_trial,
         )
         self.store.record_scan_body(info.tag, result.bytes_read, "daemon",
