@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 
 from . import model, theme
 
-RAIL_WIDTH = 104
+RAIL_WIDTH = 116
 
 
 def label(text: str = "", *, name: str = "", wrap: bool = True) -> QLabel:
@@ -215,7 +215,7 @@ class NavRail(QWidget):
         button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         button.setIconSize(QSize(24, 24))
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        button.setFixedHeight(62)
+        button.setFixedHeight(68)
         button.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # мышью — без рамки фокуса
         return button
 
@@ -334,7 +334,7 @@ def emoji_flags() -> bool:
 class Badge(QLabel):
     """Круглый значок страны: флаг, если в системе есть цветной шрифт эмодзи, иначе код."""
 
-    def __init__(self, size: int = 36) -> None:
+    def __init__(self, size: int = 40) -> None:
         super().__init__()
         self.setObjectName("badge")
         self.setFixedSize(size, size)
@@ -415,16 +415,20 @@ class ServerRowWidget(QFrame):
         self.state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         status.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignHCenter)
         status.addWidget(self.state, 0, Qt.AlignmentFlag.AlignHCenter)
-        holder = QWidget()
-        holder.setLayout(status)
-        holder.setFixedWidth(104)
-        box.addWidget(holder)
+        self.holder = QWidget()
+        self.holder.setLayout(status)
+        self.holder.setFixedWidth(124)
+        box.addWidget(self.holder)
 
     is_main = False
-    PILL_WIDTH = 600  # уже — метка «В работе» не показывается: основной виден по рамке
+    PILL_WIDTH = 640  # уже — без метки «В работе» (основной виден по рамке) и слова состояния
 
     def _fit(self) -> None:
-        self.main.setVisible(self.is_main and self.width() >= self.PILL_WIDTH)
+        """Узкая строка: без метки «В работе» и без слова состояния — точка и подсказка."""
+        wide = self.width() >= self.PILL_WIDTH
+        self.main.setVisible(self.is_main and wide)
+        self.state.setVisible(wide)
+        self.holder.setFixedWidth(124 if wide else 24)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -444,6 +448,7 @@ class ServerRowWidget(QFrame):
         self.speed.setToolTip(row.note)
         tone(self.dot, row.tone)
         set_text(self.state, f"{model.MARKS.get(row.tone, '')} {row.status}".strip())
+        self.dot.setToolTip(row.status)
         tone(self, "true" if row.main else "false", "main")
         self.setAccessibleName(f"{row.name}: {row.status}, {row.speed}")
 

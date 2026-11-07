@@ -49,6 +49,11 @@ def wait(qapp, condition, seconds: float = 10.0) -> None:
 def demo(tmp_path):
     panel = panel_demo.build(tmp_path, _free_port(), "work")
     panel.start()
+    # Статус демо пишет поток раз в 2 с; до первой записи у панели ещё нет состояния
+    # шлюза — тесты ждали бы его наперегонки (отчёт gui-look: тест падал через раз).
+    deadline = time.monotonic() + 10
+    while panel.state().get("state") != "DEGRADED" and time.monotonic() < deadline:
+        time.sleep(0.05)
     yield panel
     panel.stop()
 

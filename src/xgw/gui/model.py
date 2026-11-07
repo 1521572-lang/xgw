@@ -368,6 +368,18 @@ def server_rows(state: dict | None) -> tuple[list[ServerRow], list[ServerRow], i
 
     members.sort(key=rank)
     spares.sort(key=lambda row: order.get(row.tone, 9))
+    # Трафик идёт через основной сервер, даже если это закреплённый вручную запасной или
+    # сервер не из списка участников: он — первая строка «в работе», а не где-то ниже.
+    if main_tag and not any(row.main for row in members):
+        found = next((row for row in spares if row.main), None)
+        if found is not None:
+            spares.remove(found)
+        else:
+            known = next((row for row in _list(state.get("servers"))
+                          if isinstance(row, dict) and row.get("tag") == main_tag), None)
+            found = _row(known or {"tag": main_tag, "name": main.name if main else main_tag},
+                         multipliers, main_tag, False)
+        members.insert(0, found)
     hidden = sum(1 for row in _list(state.get("servers"))
                  if isinstance(row, dict) and row.get("status") in ("disabled", "skipped"))
     return members, spares, hidden

@@ -179,3 +179,12 @@ def test_server_rows_put_the_main_server_first_and_speak_plainly():
     assert hidden == 3
     assert model.server_rows(None) == ([], [], 0)
     assert model.split_flag("Trojan-1") == ("", "Trojan-1")
+
+
+def test_pinned_spare_is_the_first_row_in_work_not_lost_among_spares():
+    work = _state("work")
+    pinned = dict(work, pin={"tag": "spare-pl-f6f6", "down": False})
+    members, spares, _hidden = model.server_rows(pinned)
+    assert members[0].key == "spare-pl-f6f6" and members[0].main
+    assert not any(row.main for row in members[1:]) and len(members) == 6
+    assert all(row.key != "spare-pl-f6f6" for row in spares)

@@ -141,7 +141,7 @@ QWidget {{ color: {c['text']}; }}
 QWidget#rail {{ background: {c['nav']}; border-right: 1px solid {c['border']}; }}
 QToolButton#navButton {{
     color: {c['muted']}; background: transparent; border: none; border-radius: 12px;
-    padding: 8px 2px; font-size: 8pt;
+    padding: 8px 2px; font-size: 9.5pt;
 }}
 QToolButton#navButton:hover {{ background: {c['surface2']}; color: {c['text']}; }}
 QToolButton#navButton:checked {{ background: {c['selected']}; color: {c['text']};
@@ -166,20 +166,20 @@ QFrame#row[main="true"] {{ border: 2px solid {c['accent']};
 QLabel#shieldWord {{ font-size: 10pt; font-weight: 700; }}
 QLabel#heroTitle {{ font-size: 20pt; font-weight: 700; }}
 QLabel#pageTitle {{ font-size: 16pt; font-weight: 700; }}
-QLabel#serverName {{ font-size: 11.5pt; font-weight: 600; }}
-QLabel#rowName, QLabel#rowSpeed {{ font-size: 10.5pt; font-weight: 600; }}
+QLabel#serverName {{ font-size: 12pt; font-weight: 600; }}
+QLabel#rowName, QLabel#rowSpeed {{ font-size: 11.5pt; font-weight: 600; }}
 QLabel#metricValue {{ font-size: 16pt; font-weight: 700; }}
-QLabel#metricTitle, QLabel#section {{ color: {c['muted']}; font-size: 8pt; font-weight: 700; }}
+QLabel#metricTitle, QLabel#section {{ color: {c['muted']}; font-size: 9pt; font-weight: 700; }}
 QLabel#cardTitle {{ font-weight: 600; font-size: 11pt; }}
-QLabel#small {{ color: {c['muted']}; font-size: 8.5pt; }}
+QLabel#small {{ color: {c['muted']}; font-size: 10pt; }}
 QLabel#muted, QLabel[role="muted"] {{ color: {c['muted']}; }}
 QLabel#badge {{
     background: {c['surface2']}; border: 1px solid {c['border']}; border-radius: 18px;
-    color: {c['text']}; font-weight: 700; font-size: 9pt;
+    color: {c['text']}; font-weight: 700; font-size: 9.5pt;
 }}
 QLabel#dot {{ border-radius: 5px; min-width: 10px; max-width: 10px; min-height: 10px;
     max-height: 10px; }}
-QLabel#pill {{ border-radius: 9px; padding: 2px 9px; font-size: 8.5pt; font-weight: 700; }}
+QLabel#pill {{ border-radius: 9px; padding: 2px 9px; font-size: 9pt; font-weight: 700; }}
 QLabel#chip {{
     border: 1px solid {c['border']}; border-radius: 13px; padding: 3px 12px;
     background: {c['surface']}; font-weight: 600;
@@ -204,8 +204,9 @@ QPushButton#connect[tone="on"] {{
     background: transparent; color: {c['text']}; border: 2px solid {c['border']};
 }}
 QPushButton#connect[tone="on"]:hover {{ border-color: {c['bad']}; color: {c['bad']}; }}
-QPushButton#connect:disabled {{ background: {c['surface2']}; color: {c['muted']};
-    border: 1px solid {c['border']}; }}
+QPushButton#connect:disabled, QPushButton#connect[tone="off"]:disabled,
+QPushButton#connect[tone="on"]:disabled {{
+    background: transparent; color: {c['muted']}; border: 2px dashed {c['border']}; }}
 QPushButton#connect:focus {{ border: 3px solid {c['focus']}; }}
 QMenu {{ background: {c['surface']}; border: 1px solid {c['border']}; padding: 6px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
