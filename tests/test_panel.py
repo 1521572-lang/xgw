@@ -591,7 +591,9 @@ def test_subscription_is_added_shown_at_once_and_removed(rig, user):
 def test_config_subscription_is_removed_without_rewriting_and_restored(rig, user):
     """П. 337: подписку из config.toml можно убрать — config.toml цел, отметка в panel.json."""
     before = rig.config_path.read_bytes()
+    SubscriptionCache(rig.paths.cache_dir).save("main", b"cached body")
     result = user.act("subscription/remove", {"name": "main"})
+    assert SubscriptionCache(rig.paths.cache_dir).load("main") is not None  # для возврата
     assert result["ok"] and "config.toml сохранена" in result["text"]
     assert rig.config_path.read_bytes() == before
     assert rig.saved()["hidden_subscriptions"] == ["main"]

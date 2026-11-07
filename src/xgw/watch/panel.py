@@ -1748,15 +1748,16 @@ class Panel:
             sub = body.get("name")
             if isinstance(sub, str) and sub in cfg.managed.subscriptions:
                 managed.remove_subscription(store_path, sub)
+                SubscriptionCache(paths.cache_dir).forget(sub)
                 done = f"Подписка «{sub}» убрана"
             elif isinstance(sub, str) and sub in {item.name for item in cfg.subscriptions}:
                 # Вписана в config.toml (п. 337): файл не переписывается — отметка в panel.json.
+                # Кэш ответа остаётся: вернули, а подписка не ответила — серверы всё равно есть.
                 managed.hide_subscription(store_path, sub, True)
                 done = (f"Подписка «{sub}» убрана; запись в config.toml сохранена — вернуть "
                         "можно в разделе «Подписки»")
             else:
                 return actions.Outcome(2, "такой подписки нет")
-            SubscriptionCache(paths.cache_dir).forget(sub)
             self._event(f"подписка «{sub}» убрана из панели")
             self._wake()
             return actions.Outcome(0, done)
