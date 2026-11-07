@@ -145,3 +145,37 @@ def test_login_output_and_cookie_header_are_parsed_strictly():
     header = b"other=1; Path=/\nxgw_panel=" + b"f" * 64 + b"; Path=/; HttpOnly"
     assert model.cookie_from([header]) == "f" * 64
     assert model.cookie_from([b"xgw_panel=<script>; Path=/"]) == ""
+
+
+def test_capture_line_does_not_lag_behind_the_power_switch():
+    work = _state("work")
+    turned_off = dict(work, capture={**work["capture"], "mode": "off"})
+    assert model.lifecycle(turned_off, False) is None  # не «работает» рядом с «VPN выключен»
+    turned_on = dict(work, capture={**work["capture"], "lifecycle": "off"})
+    assert model.lifecycle(turned_on, False) == (
+        "busy", "Перехват: включается — демон загружает правила сети")
+
+
+def test_shield_word_says_whether_traffic_is_protected():
+    work = _state("work")
+    assert model.shield(work, False) == ("ok", "Защищено")
+    assert model.shield(work, False, acting=True) == ("warn", "Выключаю…")
+    off = dict(work, capture={**work["capture"], "mode": "off"})
+    assert model.shield(off, False) == ("off", "Не защищено")
+    assert model.shield(None, True)[0] == "bad" and model.shield(work, True)[0] == "bad"
+    assert model.shield(_state("trouble"), False)[0] in ("bad", "warn", "off")
+
+
+def test_server_rows_put_the_main_server_first_and_speak_plainly():
+    members, spares, hidden = model.server_rows(_state("work"))
+    assert [row.main for row in members] == [True, False, False, False, False]
+    first = members[0]
+    assert (first.flag, first.name, first.code) == ("🇳🇱", "Нидерланды · Амстердам 1", "NL")
+    assert first.speed == "87,3 Мбит/с" and first.delay == "RTT 29 мс · проба 84 мс"
+    assert first.sub == "xray · подписка «main»" and first.tone == "ok"
+    assert members[-1].tone == "bad" and "×100" in members[-1].sub
+    assert [row.status for row in spares] == [
+        "проверен", "медленный", "ещё не проверен", "не прошёл проверку"]
+    assert hidden == 3
+    assert model.server_rows(None) == ([], [], 0)
+    assert model.split_flag("Trojan-1") == ("", "Trojan-1")

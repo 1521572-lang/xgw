@@ -1,6 +1,9 @@
-"""Главное окно XGW: верхняя строка (состояние, сервер, VPN, обновление), навигация слева и
-страницы. Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на
-каждом опросе, поэтому фокус, выделение и прокрутка не сбиваются.
+"""Главное окно XGW: узкая навигация со значками слева и страницы. «Обзор» устроен как у
+современных VPN-клиентов: слева панель подключения (знак защиты, сервер в работе, крупные
+метрики, большая кнопка VPN), справа — список серверов карточками.
+
+Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на каждом опросе,
+поэтому фокус, выделение и прокрутка не сбиваются.
 
 Этап 1–2 (docs/GUI-NATIVE.md): вход, «Обзор» и переключатель VPN. Разделы, которые ещё не
 перенесены в окно, честно говорят об этом и открывают тот же раздел браузерной панели.
@@ -11,26 +14,35 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QMainWindow,
+    QMenu,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from . import client as clienting
 from . import model, theme
+from .widgets import (
+    Badge,
+    Metric,
+    NavRail,
+    ServerList,
+    ShieldOrb,
+    icon,
+    label,
+    set_text,
+    tone,
+)
 
 SECTIONS = (
     ("overview", "Обзор"),
@@ -39,7 +51,7 @@ SECTIONS = (
     ("devices", "Устройства"),
     ("traffic", "Трафик"),
     ("diagnostics", "Диагностика"),
-    ("extra", "Дополнительно"),
+    ("extra", "Ещё"),
 )
 # Разделы, которые пока только в браузерной панели: что там есть.
 PENDING = {
@@ -51,99 +63,84 @@ PENDING = {
     "diagnostics": "«Проверить сеть», журнал событий, обновление ядер Xray и sing-box.",
     "extra": "Tailscale (вход, SSH, панель по tailnet, Funnel) и телефоны.",
 }
+TITLES = dict(SECTIONS) | {"extra": "Дополнительно"}
 MIN_SIZE = (1024, 720)
 START_SIZE = (1440, 900)
+CONN_WIDTH = (360, 400)  # панель подключения: в узком окне и в широком
+WIDE = 1200
 
 
-def _label(text: str = "", *, role: str = "", wrap: bool = True, name: str = "") -> QLabel:
-    label = QLabel(text)
-    label.setWordWrap(wrap)
-    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    if role:
-        label.setProperty("role", role)
-    if name:
-        label.setObjectName(name)
-    return label
+def _marked(tone_name: str, text: str) -> str:
+    return f"{model.MARKS.get(tone_name, '')} {text}".strip()
 
 
-def _tone(widget: QWidget, tone: str) -> None:
-    """Тон виджета для таблицы стилей; стиль пересчитывается, только если тон сменился."""
-    if widget.property("tone") != tone:
-        widget.setProperty("tone", tone)
-        widget.style().unpolish(widget)
-        widget.style().polish(widget)
-
-
-def _marked(tone: str, text: str) -> str:
-    return f"{model.MARKS.get(tone, '')} {text}".strip()
+def _scroll(inner: QWidget) -> QScrollArea:
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    inner.setObjectName("page")
+    scroll.setWidget(inner)
+    return scroll
 
 
 class Card(QFrame):
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str = "") -> None:
         super().__init__()
         self.setObjectName("card")
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(18, 14, 18, 16)
+        self.body.setContentsMargins(20, 16, 20, 18)
         self.body.setSpacing(8)
         if title:
-            self.body.addWidget(_label(title, name="cardTitle", wrap=False))
+            self.body.addWidget(label(title, name="cardTitle", wrap=False))
 
 
-class Facts(QWidget):
-    """Подписи и значения в два столбца; значения меняются, строки не пересоздаются."""
-
-    def __init__(self, names: list[tuple[str, str]]) -> None:
-        super().__init__()
-        grid = QGridLayout(self)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(6)
-        grid.setColumnStretch(1, 1)
-        self.values: dict[str, QLabel] = {}
-        for row, (key, title) in enumerate(names):
-            grid.addWidget(_label(title, role="muted", wrap=False), row, 0,
-                           Qt.AlignmentFlag.AlignTop)
-            value = _label("—")
-            value.setAccessibleName(title)
-            grid.addWidget(value, row, 1)
-            self.values[key] = value
-
-    def set(self, key: str, text: str) -> None:
-        label = self.values[key]
-        if label.text() != text:
-            label.setText(text)
+def _centered(card: QWidget, width: int) -> QWidget:
+    page = QWidget()
+    page.setObjectName("page")
+    outer = QVBoxLayout(page)
+    outer.addStretch(1)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    card.setMaximumWidth(width)
+    row.addWidget(card, 3)
+    row.addStretch(1)
+    outer.addLayout(row)
+    outer.addStretch(2)
+    return page
 
 
 class LoginPage(QWidget):
     def __init__(self, on_login) -> None:
         super().__init__()
         self.setObjectName("page")
-        outer = QVBoxLayout(self)
-        outer.addStretch(1)
-        card = Card("")
-        card.setMaximumWidth(560)
-        card.body.addWidget(_label("Вход в XGW", name="heroTitle"))
-        card.body.addWidget(_label(
-            "Окно управляет шлюзом через его панель на этой машине. Чтобы войти, Ubuntu спросит "
-            "пароль администратора — один раз: вход запоминается, как в браузере."))
-        self.error = _label("")
-        _tone(self.error, "bad")
+        card = Card()
+        self.orb = ShieldOrb()
+        self.orb.setMinimumHeight(150)
+        card.body.addWidget(self.orb)
+        title = label("Вход в XGW", name="heroTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card.body.addWidget(title)
+        about = label("Окно управляет шлюзом через его панель на этой машине. Чтобы войти, "
+                      "Ubuntu спросит пароль администратора — один раз: вход запоминается, "
+                      "как в браузере.", name="muted")
+        about.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card.body.addWidget(about)
+        self.error = label("")
+        self.error.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tone(self.error, "bad")
         self.error.hide()
         card.body.addWidget(self.error)
+        card.body.addSpacing(6)
         self.button = QPushButton("Войти")
-        self.button.setObjectName("primary")
+        self.button.setObjectName("connect")
+        tone(self.button, "off")
         self.button.setAccessibleName("Войти в XGW с паролем администратора")
         self.button.clicked.connect(on_login)
-        row = QHBoxLayout()
-        row.addWidget(self.button)
-        row.addStretch(1)
-        card.body.addLayout(row)
-        center = QHBoxLayout()
-        center.addStretch(1)
-        center.addWidget(card)
-        center.addStretch(1)
-        outer.addLayout(center)
-        outer.addStretch(2)
+        card.body.addWidget(self.button)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(_centered(card, 520))
 
     def set_busy(self, busy: bool) -> None:
         self.button.setEnabled(not busy)
@@ -157,180 +154,290 @@ class LoginPage(QWidget):
 class PendingPage(QWidget):
     """Раздел ещё в браузерной панели: что в нём и кнопка открыть его там."""
 
-    def __init__(self, title: str, about: str, open_panel) -> None:
+    def __init__(self, key: str, title: str, about: str, open_panel) -> None:
         super().__init__()
         self.setObjectName("page")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        card = Card(title)
-        card.body.addWidget(_label(about))
-        card.body.addWidget(_label(
-            "В окно этот раздел ещё переносится. Пока он работает в браузерной панели XGW — "
-            "с теми же действиями.", role="muted"))
+        card = Card()
+        self.picture = QLabel()
+        self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.key = key
+        card.body.addWidget(self.picture)
+        head = label(title, name="pageTitle")
+        head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card.body.addWidget(head)
+        for text, name in ((about, ""), ("В окно этот раздел ещё переносится. Пока он работает "
+                                         "в браузерной панели XGW — с теми же действиями.",
+                                         "muted")):
+            line = label(text, name=name)
+            line.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card.body.addWidget(line)
+        card.body.addSpacing(6)
         button = QPushButton("Открыть в браузерной панели")
+        button.setObjectName("primary")
         button.setAccessibleName(f"Открыть раздел «{title}» в браузерной панели")
         button.clicked.connect(open_panel)
         row = QHBoxLayout()
+        row.addStretch(1)
         row.addWidget(button)
         row.addStretch(1)
         card.body.addLayout(row)
-        layout.addWidget(card)
-        layout.addStretch(1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(_centered(card, 560))
+
+    def recolor(self, colors: dict[str, str]) -> None:
+        self.picture.setPixmap(icon(self.key, colors["accent"], size=56).pixmap(56, 56))
 
 
 class OverviewPage(QWidget):
-    """«Обзор»: VPN, состояние и что делать, сервер в работе, перехват, версии."""
+    """«Обзор»: панель подключения слева, серверы и защита сети справа."""
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__()
         self.main = main
-        window = main
         self.setObjectName("page")
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        inner = QWidget()
-        inner.setObjectName("page")
-        scroll.setWidget(inner)
-        outer = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-        layout = QVBoxLayout(inner)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(16)
+        outer.setSpacing(0)
+        outer.addWidget(self._connection())
+        outer.addWidget(self._servers(), 1)
 
-        hero = Card("VPN")
-        top = QHBoxLayout()
-        texts = QVBoxLayout()
-        self.power_title = _label("", name="heroTitle")
-        self.power_sub = _label("", role="muted")
-        texts.addWidget(self.power_title)
-        texts.addWidget(self.power_sub)
-        top.addLayout(texts, 1)
+    # --- панель подключения ---------------------------------------------------------------------
+
+    def _connection(self) -> QWidget:
+        self.conn = QFrame()
+        self.conn.setObjectName("conn")
+        self.conn.setFixedWidth(CONN_WIDTH[1])
+        box = QVBoxLayout(self.conn)
+        box.setContentsMargins(28, 26, 28, 18)
+        box.setSpacing(6)
+        self.word = label("", name="shieldWord", wrap=False)
+        font = self.word.font()
+        font.setLetterSpacing(font.SpacingType.AbsoluteSpacing, 1.4)
+        self.word.setFont(font)
+        self.word.setAccessibleName("Защита")
+        box.addWidget(self.word)
+        self.power_title = label("", name="heroTitle")
+        box.addWidget(self.power_title)
+        self.power_sub = label("", name="muted")
+        box.addWidget(self.power_sub)
+        self.lifecycle = label("", name="small")
+        box.addWidget(self.lifecycle)
+        box.addStretch(1)
+        self.orb = ShieldOrb()
+        self.orb.setMaximumHeight(250)
+        box.addWidget(self.orb, 4)
+        box.addStretch(1)
+
+        server = QHBoxLayout()
+        server.setSpacing(12)
+        self.badge = Badge(40)
+        server.addWidget(self.badge)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        self.server_name = label("", name="serverName")
+        self.server_name.setAccessibleName("Сервер в работе")
+        self.server_how = label("", name="small")
+        names.addWidget(self.server_name)
+        names.addWidget(self.server_how)
+        server.addLayout(names, 1)
+        box.addLayout(server)
+        box.addSpacing(6)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
+        self.metrics = {key: Metric(title, about) for key, title, about in (
+            ("speed", "Скорость", "Последний замер скорости через этот сервер"),
+            ("rtt", "RTT", "Время установления соединения с сервером (проба шлюза)"),
+            ("delay", "Проба", "Полная проба ядра: запрос через сервер и ответ целиком"))}
+        for widget in self.metrics.values():
+            tiles.addWidget(widget)
+        box.addLayout(tiles)
+        self.engine = label("", name="small")
+        box.addWidget(self.engine)
+        box.addSpacing(10)
+
         self.power = QPushButton("Включить VPN")
-        self.power.setObjectName("power")
-        self.power.setMinimumWidth(190)
-        self.power.clicked.connect(window.toggle_power)
-        top.addWidget(self.power, 0, Qt.AlignmentFlag.AlignTop)
-        hero.body.addLayout(top)
-        self.power_why = _label("")
-        _tone(self.power_why, "warn")
-        hero.body.addWidget(self.power_why)
-        self.lifecycle = _label("")
-        hero.body.addWidget(self.lifecycle)
-        layout.addWidget(hero)
+        self.power.setObjectName("connect")
+        self.power.setMinimumHeight(52)
+        self.power.clicked.connect(self.main.toggle_power)
+        box.addWidget(self.power)
+        self.power_why = label("")
+        tone(self.power_why, "warn")
+        box.addWidget(self.power_why)
+        box.addSpacing(8)
+        self.versions = label("", name="small")
+        self.versions.setAccessibleName("Версии")
+        box.addWidget(self.versions)
+        self.fresh = label("", name="small", wrap=False)
+        self.fresh.setAccessibleName("Обновление данных")
+        box.addWidget(self.fresh)
+        return self.conn
 
-        state = Card("Состояние шлюза")
-        self.state = _label("")
+    # --- серверы и защита сети ------------------------------------------------------------------
+
+    def _servers(self) -> QWidget:
+        inner = QWidget()
+        box = QVBoxLayout(inner)
+        box.setContentsMargins(28, 24, 28, 24)
+        box.setSpacing(10)
+        head = QHBoxLayout()
+        head.addWidget(label("Серверы", name="pageTitle", wrap=False))
+        self.counts = label("", name="muted", wrap=False)
+        head.addWidget(self.counts, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addStretch(1)
+        self.main.chip = label("", name="chip", wrap=False)
+        self.main.chip.setAccessibleName("Состояние шлюза")
+        head.addWidget(self.main.chip)
+        box.addLayout(head)
+
+        self.alert = QFrame()
+        self.alert.setObjectName("alert")
+        alert = QVBoxLayout(self.alert)
+        alert.setContentsMargins(16, 12, 16, 14)
+        alert.setSpacing(6)
+        self.state = label("", name="cardTitle")
         self.state.setAccessibleName("Состояние шлюза")
-        self.explain = _label("", role="muted")
-        state.body.addWidget(self.state)
-        state.body.addWidget(self.explain)
+        self.explain = label("", name="muted")
+        alert.addWidget(self.state)
+        alert.addWidget(self.explain)
         fixes = QHBoxLayout()
         self.fix_buttons: dict[str, QPushButton] = {}
         for name, title in (("refresh", "Обновить подписки"), ("scan", "Проверить запасные"),
                             ("netcheck", "Проверить сеть")):
             button = QPushButton(title)
             button.setAccessibleName(title)
-            button.clicked.connect(lambda _c=False, act=name: window.run_action(act))
+            button.clicked.connect(lambda _c=False, act=name: self.main.run_action(act))
             button.hide()
             fixes.addWidget(button)
             self.fix_buttons[name] = button
         fixes.addStretch(1)
-        state.body.addLayout(fixes)
-        layout.addWidget(state)
+        alert.addLayout(fixes)
+        box.addWidget(self.alert)
 
-        row = QHBoxLayout()
-        row.setSpacing(16)
-        server = Card("Сервер в работе")
-        self.server = Facts([
-            ("name", "Сервер"), ("how", "Выбран"), ("country", "Страна"), ("core", "Ядро"),
-            ("profile", "Профиль обхода"), ("speed", "Скорость"), ("rtt", "RTT"),
-            ("delay", "Полная проба"),
-        ])
-        server.body.addWidget(self.server)
-        server.body.addStretch(1)
-        row.addWidget(server, 3)
-        capture = Card("Перехват")
-        self.capture = Facts([
-            ("scope", "Через VPN"), ("mode", "Режим"), ("fail", "При сбое"),
-            ("bypass", "Мимо VPN"),
-        ])
-        capture.body.addWidget(self.capture)
-        capture.body.addStretch(1)
-        row.addWidget(capture, 2)
-        layout.addLayout(row)
+        self.members_title = label("", name="section", wrap=False)
+        box.addWidget(self.members_title)
+        self.members = ServerList()
+        box.addWidget(self.members)
+        self.spares_title = label("", name="section", wrap=False)
+        box.addWidget(self.spares_title)
+        self.spares = ServerList()
+        box.addWidget(self.spares)
+        self.hidden = label("", name="small")
+        box.addWidget(self.hidden)
 
-        about = Card("Версии и данные")
-        self.about = Facts([
-            ("xgw", "XGW"), ("xray", "Xray"), ("singbox", "sing-box"), ("updated", "Состояние"),
-        ])
-        about.body.addWidget(self.about)
-        layout.addWidget(about)
-        layout.addStretch(1)
+        box.addSpacing(8)
+        box.addWidget(label("ЗАЩИТА СЕТИ", name="section", wrap=False))
+        guard = Card()
+        self.guard: dict[str, QLabel] = {}
+        for key, title in (("scope", "Через VPN"), ("fail", "При сбое Xray"),
+                           ("bypass", "Мимо VPN")):
+            row = QHBoxLayout()
+            name = label(title, name="muted", wrap=False)
+            name.setFixedWidth(130)
+            value = label("—")
+            value.setAccessibleName(title)
+            row.addWidget(name, 0, Qt.AlignmentFlag.AlignTop)
+            row.addWidget(value, 1)
+            guard.body.addLayout(row)
+            self.guard[key] = value
+        box.addWidget(guard)
+        box.addStretch(1)
+        return _scroll(inner)
+
+    # --- отображение ----------------------------------------------------------------------------
 
     def show_state(self, state: dict | None, stale: bool) -> None:
         acting = self.main.client.actions.busy("power")
         power = model.power(state, stale, acting=acting)
-        self.power_title.setText(power.title)
-        self.power_sub.setText(power.sub)
+        shield_tone, word = model.shield(state, stale, acting=acting)
+        tone(self.conn, shield_tone)
+        tone(self.word, shield_tone)
+        set_text(self.word, word.upper())
+        self.orb.set_tone(shield_tone)
+        set_text(self.power_title, power.title)
+        set_text(self.power_sub, power.sub)
         self.power.setText("Выключаю…" if acting and power.pressed else
                            "Включаю…" if acting else
                            ("Выключить VPN" if power.pressed else "Включить VPN"))
         self.power.setAccessibleName(self.power.text())
         self.power.setEnabled(power.enabled)
-        _tone(self.power, power.tone if power.pressed else "off")
-        self.power.setProperty("pressed_state", power.pressed)
-        self.power_why.setText(power.why)
+        tone(self.power, "on" if power.pressed else "off")
+        set_text(self.power_why, power.why)
         self.power_why.setVisible(bool(power.why))
         line = model.lifecycle(state, stale)
         self.lifecycle.setVisible(line is not None)
         if line is not None:
-            _tone(self.lifecycle, line[0])
-            self.lifecycle.setText(_marked(line[0], line[1]))
+            tone(self.lifecycle, line[0])
+            set_text(self.lifecycle, _marked(line[0], line[1]))
 
-        tone, text = model.health(state, stale)
-        _tone(self.state, tone)
-        self.state.setText(_marked(tone, text))
+        main = model.main_server(state)
+        if main is None:
+            self.badge.show_country("", "")
+            set_text(self.server_name, "Сервер не выбран" if state else "—")
+            set_text(self.server_how, "шлюз ещё не выбрал сервер" if state else "")
+            for metric in self.metrics.values():
+                metric.set("—")
+            set_text(self.engine, "")
+        else:
+            flag, name = model.split_flag(main.name)
+            self.badge.show_country(flag, main.country)
+            set_text(self.server_name, name)
+            set_text(self.server_how, "выбран вручную" if main.pinned else
+                     "выбран по замеру скорости" if main.basis == "speed" else
+                     "выбран по задержке")
+            self.metrics["speed"].set(model.mbps_text(main.speed_mbps))
+            self.metrics["rtt"].set(model.ms_text(main.rtt_ms))
+            self.metrics["delay"].set(model.ms_text(main.delay_ms))
+            engine = " · ".join(part for part in (
+                f"ядро {main.core}" if main.core else "",
+                f"профиль {main.profile.split(':', 1)[-1]}" if main.profile else "") if part)
+            set_text(self.engine, engine)
+        found = dict(model.versions(state))
+        set_text(self.versions, " · ".join(f"{name} {found[name]}" for name in
+                                           ("XGW", "Xray", "sing-box") if found.get(name)))
+        self._show_health(state, stale)
+        self._show_servers(state)
+        self._show_guard(state)
+
+    def _show_health(self, state: dict | None, stale: bool) -> None:
+        health_tone, text = model.health(state, stale)
         detail, fixes = self._explain(state, stale)
-        self.explain.setText(detail)
+        self.alert.setVisible(health_tone != "ok" or bool(detail))
+        self.main.chip.setVisible(self.alert.isHidden())  # одно и то же дважды не пишем
+        tone(self.alert, health_tone)
+        tone(self.state, health_tone)
+        set_text(self.state, _marked(health_tone, text))
+        set_text(self.explain, detail)
         self.explain.setVisible(bool(detail))
         for name, button in self.fix_buttons.items():
             button.setVisible(name in fixes)
             button.setEnabled(not self.main.client.actions.busy(name)
                               and not _busy(state, name))
 
-        main = model.main_server(state)
-        if main is None:
-            for key in self.server.values:
-                self.server.set(key, "—")
-            self.server.set("name", "нет: шлюз ещё не выбрал сервер" if state else "—")
-        else:
-            self.server.set("name", main.name)
-            self.server.set("how", "вручную" if main.pinned else
-                            "по замеру скорости" if main.basis == "speed" else "по задержке")
-            self.server.set("country", main.country or "—")
-            self.server.set("core", main.core or "—")
-            self.server.set("profile", main.profile or "—")
-            self.server.set("speed", model.mbps_text(main.speed_mbps))
-            self.server.set("rtt", model.ms_text(main.rtt_ms))
-            self.server.set("delay", model.ms_text(main.delay_ms))
+    def _show_servers(self, state: dict | None) -> None:
+        members, spares, hidden = model.server_rows(state)
+        alive = sum(1 for row in members if row.tone == "ok")
+        set_text(self.counts, f"работают {alive} из {len(members)}" if members else "")
+        set_text(self.members_title, f"В РАБОТЕ · {len(members)}" if members else "")
+        self.members_title.setVisible(bool(members))
+        self.members.show_rows(members)
+        set_text(self.spares_title, f"ЗАПАСНЫЕ · {len(spares)}" if spares else "")
+        self.spares_title.setVisible(bool(spares))
+        self.spares.show_rows(spares)
+        set_text(self.hidden, (f"Ещё {hidden} строк подписок не в работе (выключены или не "
+                               "серверы). Выбор сервера, приоритет и замеры — в разделе "
+                               "«Серверы».") if hidden else
+                 "Выбор сервера, приоритет и замеры — в разделе «Серверы».")
 
+    def _show_guard(self, state: dict | None) -> None:
         capture = (state or {}).get("capture") or {}
-        modes = {"on": "включён", "open": "временно снят (Xray недоступен)", "off": "выключен",
-                 "none": "не настроен"}
-        self.capture.set("scope", model.scope_text(capture) if capture.get("mode") == "on"
-                         else "ничего: VPN выключен" if capture else "—")
-        self.capture.set("mode", modes.get(str(capture.get("mode") or ""), "—"))
-        self.capture.set("fail", model.FAIL_MODES.get(str(capture.get("fail_mode") or ""), "—"))
+        set_text(self.guard["scope"], model.scope_text(capture) if capture.get("mode") == "on"
+                 else "ничего: VPN выключен" if capture else "—")
+        set_text(self.guard["fail"],
+                 model.FAIL_MODES.get(str(capture.get("fail_mode") or ""), "—"))
         bypass = capture.get("bypass") or []
-        self.capture.set("bypass", f"устройств: {len(bypass)}" if bypass else "нет")
-
-        found = dict(model.versions(state))
-        self.about.set("xgw", found.get("XGW") or "—")
-        self.about.set("xray", found.get("Xray") or "—")
-        self.about.set("singbox", found.get("sing-box") or "—")
-        self.about.set("updated", self.main.freshness_text())
+        set_text(self.guard["bypass"], f"устройств: {len(bypass)}" if bypass else "нет")
 
     @staticmethod
     def _explain(state: dict | None, stale: bool) -> tuple[str, set[str]]:
@@ -369,53 +476,40 @@ class MainWindow(QMainWindow):
         self.state: dict | None = None
         self.received: float | None = None  # time.monotonic() последнего ответа
         self.link = ""
+        self.chip: QLabel  # метка состояния — в заголовке списка серверов «Обзора»
         self.setWindowTitle("XGW")
         self.setMinimumSize(*MIN_SIZE)
         self.resize(*START_SIZE)
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self._topbar())
-        body = QHBoxLayout()
+        body = QHBoxLayout(central)
+        body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
-        root.addLayout(body, 1)
-        side = QVBoxLayout()
-        side.setContentsMargins(0, 0, 0, 0)
-        self.nav = QListWidget()
-        self.nav.setObjectName("nav")
-        self.nav.setAccessibleName("Разделы")
-        self.nav.setFixedWidth(210)
-        for _key, title in SECTIONS:
-            self.nav.addItem(title)
-        side.addWidget(self.nav, 1)
-        self.theme = QComboBox()
-        self.theme.setAccessibleName("Тема окна")
-        for key in theme.THEMES:
-            self.theme.addItem(theme.THEME_NAMES[key], key)
+        self.nav = NavRail(SECTIONS)
+        self.theme_button = self.nav.add_bottom("Тема")
+        self.theme_button.setAccessibleName("Тема окна")
+        self.theme_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self.theme_button)
+        self.theme_actions = QActionGroup(self)
         chosen = str(self.settings.value("theme", "system"))
-        self.theme.setCurrentIndex(max(0, list(theme.THEMES).index(chosen)
-                                       if chosen in theme.THEMES else 0))
-        self.theme.currentIndexChanged.connect(self._theme_changed)
-        holder = QWidget()
-        holder.setObjectName("navfoot")
-        holder.setFixedWidth(210)
-        hold = QVBoxLayout(holder)
-        hold.setContentsMargins(10, 6, 10, 10)
-        hold.addWidget(_label("Тема", role="muted", wrap=False))
-        hold.addWidget(self.theme)
-        side.addWidget(holder)
-        body.addLayout(side)
+        for key in theme.THEMES:
+            action = QAction(theme.THEME_NAMES[key], self, checkable=True)
+            action.setData(key)
+            action.setChecked(key == chosen or (chosen not in theme.THEMES and key == "system"))
+            self.theme_actions.addAction(action)
+            menu.addAction(action)
+        self.theme_actions.triggered.connect(self._theme_changed)
+        self.theme_button.setMenu(menu)
+        body.addWidget(self.nav)
 
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
         self.login_page = LoginPage(self.start_login)
         self.overview = OverviewPage(self)
         self.pages: dict[str, QWidget] = {"overview": self.overview}
-        for key, title in SECTIONS[1:]:
-            self.pages[key] = PendingPage(title, PENDING[key], self.open_browser)
+        for key, _title in SECTIONS[1:]:
+            self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
         for key, _title in SECTIONS:
             self.stack.addWidget(self.pages[key])
         self.stack.addWidget(self.login_page)
@@ -426,6 +520,8 @@ class MainWindow(QMainWindow):
                       activated=lambda row=number: self.nav.setCurrentRow(row))
         QShortcut(QKeySequence("F5"), self, activated=lambda: self.client.poll_soon(0.0))
         self.statusBar().showMessage("Подключаюсь к панели XGW…")
+        self.statusBar().setSizeGripEnabled(False)
+        self.recolor()
 
         self.ticker = QTimer(self)
         self.ticker.timeout.connect(self._tick)
@@ -436,33 +532,6 @@ class MainWindow(QMainWindow):
         client.busyChanged.connect(lambda _key, _busy: self.render())
         login.finished.connect(self.on_login)
         self.render()
-
-    # --- верхняя строка ---------------------------------------------------------------------
-
-    def _topbar(self) -> QWidget:
-        bar = QWidget()
-        bar.setObjectName("topbar")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(16, 10, 16, 10)
-        row.setSpacing(14)
-        title = _label("XGW", wrap=False)
-        title.setStyleSheet("font-weight: 700; font-size: 13pt;")
-        row.addWidget(title)
-        self.chip = _label("", name="chip", wrap=False)
-        self.chip.setAccessibleName("Состояние шлюза")
-        row.addWidget(self.chip)
-        self.via = _label("", role="muted", wrap=False)
-        self.via.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.via.setAccessibleName("Сервер в работе")
-        row.addWidget(self.via, 1)
-        self.fresh = _label("", role="muted", wrap=False)
-        self.fresh.setAccessibleName("Обновление данных")
-        row.addWidget(self.fresh)
-        self.top_power = QPushButton("Включить VPN")
-        self.top_power.setAccessibleName("Включить или выключить VPN")
-        self.top_power.clicked.connect(self.toggle_power)
-        row.addWidget(self.top_power)
-        return bar
 
     # --- события клиента --------------------------------------------------------------------
 
@@ -500,10 +569,8 @@ class MainWindow(QMainWindow):
         if session is None:
             self.login_page.set_error(text)
             return
-        from . import model as m
-
         try:
-            m.save_session(self.session_path, session)
+            model.save_session(self.session_path, session)
         except OSError as exc:
             self.statusBar().showMessage(f"Вход не запомнен: {exc}", 15000)
         self.client.set_session(session)
@@ -534,39 +601,42 @@ class MainWindow(QMainWindow):
 
     def freshness_text(self) -> str:
         if self.received is None:
-            return "ещё не получено"
+            return "Данные ещё не получены"
         age = time.monotonic() - self.received
         if self.link == clienting.LINK_OFFLINE:
-            return f"панель не отвечает; последние данные — {model.ago_text(age)}"
+            return f"Панель не отвечает; последние данные — {model.ago_text(age)}"
         if self.stale:
-            return f"данные устарели: демон не отвечает (получено {model.ago_text(age)})"
-        return f"обновлено {model.ago_text(age)}"
+            return f"Данные устарели: демон не отвечает (получено {model.ago_text(age)})"
+        return f"Обновлено {model.ago_text(age)}"
 
     def render(self) -> None:
         state = None if self.link == clienting.LINK_OFFLINE and self.state is None else self.state
         stale = self.stale
         if self.link == clienting.LINK_OFFLINE:
-            tone, text = "bad", "Панель XGW не отвечает"
+            chip_tone, text = "bad", "Панель XGW не отвечает"
         else:
-            tone, text = (model.health(state, stale) if state is not None
-                          else ("off", "Подключение…"))
-        _tone(self.chip, tone)
-        self.chip.setText(_marked(tone, text))
-        main = model.main_server(state)
-        self.via.setText(f"через {main.name}" + (" (выбран вручную)" if main.pinned else "")
-                         if main is not None and not stale else "")
-        power = model.power(state, stale, acting=self.client.actions.busy("power"))
-        self.top_power.setText("Выключить VPN" if power.pressed else "Включить VPN")
-        self.top_power.setEnabled(power.enabled)
+            chip_tone, text = (model.health(state, stale) if state is not None
+                               else ("off", "Подключение…"))
+        tone(self.chip, chip_tone)
+        set_text(self.chip, _marked(chip_tone, text))
         self.overview.show_state(state, stale)
+        self._logo(model.shield(state, stale)[0] if state is not None else "off")
         self._tick()
 
+    def _logo(self, shield_tone: str) -> None:
+        if self.nav.logo.property("tone") == shield_tone:
+            return
+        self.nav.logo.setProperty("tone", shield_tone)
+        from PyQt6 import QtCore, QtGui
+
+        from .. import trayapp
+
+        kind = {"bad": "down", "busy": "job"}.get(shield_tone, shield_tone)
+        self.nav.logo.setPixmap(trayapp.icon(QtGui, QtCore, kind).pixmap(36, 36))
+
     def _tick(self) -> None:
-        busy = self.client.gate.busy
-        text = "обновляю…" if busy else self.freshness_text()
-        if self.fresh.text() != text:
-            self.fresh.setText(text)
-        self.overview.about.set("updated", self.freshness_text())
+        text = "Обновляю…" if self.client.gate.busy else self.freshness_text()
+        set_text(self.overview.fresh, text)
 
     def _section(self, row: int) -> None:
         if self.link == clienting.LINK_AUTH or self.client.session is None:
@@ -575,10 +645,20 @@ class MainWindow(QMainWindow):
         key = SECTIONS[max(0, row)][0]
         self.stack.setCurrentWidget(self.pages[key])
 
-    def _theme_changed(self) -> None:
-        choice = str(self.theme.currentData())
+    def _theme_changed(self, action: QAction) -> None:
+        choice = str(action.data())
         self.settings.setValue("theme", choice)
         theme.apply(QApplication.instance(), choice)
+        self.recolor()
+
+    def recolor(self) -> None:
+        """Значки рисуются цветом темы — после её смены их надо нарисовать заново."""
+        colors = theme.current()
+        self.nav.recolor(colors, {self.theme_button: "theme"})
+        for page in self.pages.values():
+            if isinstance(page, PendingPage):
+                page.recolor(colors)
+        self.update()
 
     # --- видимость: опрос реже, пока окно не видно ------------------------------------------
 
@@ -596,6 +676,12 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self.client.set_visible(True)
+        if self.focusWidget() is None:
+            self.stack.setFocus()  # без рамки фокуса на первой кнопке при запуске
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.overview.conn.setFixedWidth(CONN_WIDTH[self.width() >= WIDE])
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)

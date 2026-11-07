@@ -182,12 +182,43 @@ def power(state: dict | None, stale: bool, *, acting: bool = False) -> Power:
     return Power(title, sub, hero, pressed, enabled, capital(why))
 
 
+def shield(state: dict | None, stale: bool, *, acting: bool = False) -> tuple[str, str]:
+    """(тон, слово) над большим значком: защищён ли трафик прямо сейчас."""
+    if state is None:
+        return "bad", "Нет связи с шлюзом"
+    if stale:
+        return "bad", "Данные устарели"
+    found = power(state, stale)
+    if acting:
+        return "warn", "Выключаю…" if found.pressed else "Включаю…"
+    mode = _dict(state.get("capture")).get("mode")
+    if mode == "on":
+        return {"ok": ("ok", "Защищено"), "warn": ("warn", "Подключение")}.get(
+            found.tone, ("bad", "Нет связи через VPN"))
+    if mode == "open":
+        return "warn", "Не защищено: временно напрямую"
+    if mode == "none":
+        return "off", "Перехват не настроен"
+    return "off", "Не защищено"
+
+
 def lifecycle(state: dict | None, stale: bool) -> tuple[str, str] | None:
-    """(тон, строка «Перехват: …») или None — строки нет (демона нет или данные устарели)."""
+    """(тон, строка «Перехват: …») или None — строки нет (демона нет или данные устарели).
+
+    Режим перехвата панель меняет сразу по нажатию, а жизненный цикл пишет демон на своём
+    шаге — до этого они расходятся (отчёт gui-s12). Перехват выключен — строки нет: заголовок
+    «VPN выключен» говорит то же, а старое слово рядом с ним сбивало бы. Только что включён, а
+    демон ещё не дошёл, — строка говорит, что перехват включается."""
     if state is None or stale:
         return None
     capture = _dict(state.get("capture"))
-    known = LIFECYCLE.get(str(capture.get("lifecycle") or ""))
+    word = str(capture.get("lifecycle") or "")
+    mode = capture.get("mode")
+    if mode in ("off", "none"):
+        return None
+    if mode == "on" and word == "off":
+        return "busy", "Перехват: включается — демон загружает правила сети"
+    known = LIFECYCLE.get(word)
     if known is None:
         return None
     tone, word, tail = known
@@ -249,6 +280,97 @@ def main_server(state: dict | None) -> MainServer | None:
         rtt_ms=_number(row.get("rtt_ms")), delay_ms=_number(row.get("delay_ms")),
         basis=str(main.get("basis") or ""),
     )
+
+
+def split_flag(name: str) -> tuple[str, str]:
+    """(флаг-эмодзи, имя без него): «🇳🇱 Нидерланды» → («🇳🇱», «Нидерланды»)."""
+    if len(name) >= 2 and all(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in name[:2]):
+        return name[:2], name[2:].strip()
+    return "", name
+
+
+@dataclass(frozen=True)
+class ServerRow:
+    """Строка списка серверов в окне: всё уже в словах, окну остаётся показать."""
+
+    key: str
+    name: str
+    flag: str
+    code: str
+    sub: str
+    speed: str
+    delay: str
+    tone: str
+    status: str
+    main: bool = False
+    note: str = ""
+
+
+SPARE_VERDICTS = {
+    "OK": ("ok", "проверен"), "SLOW": ("warn", "медленный"),
+    "FROZEN": ("bad", "не прошёл проверку"), "DEAD": ("bad", "не отвечает"),
+}
+
+
+def _source_text(source: str) -> str:
+    if source == "manual":
+        return "ссылка"
+    if source == "запасная":
+        return "запасная подписка"
+    return f"подписка «{source}»" if source else ""
+
+
+def _row(item: dict, multipliers: dict[str, float], main_tag: str, spare: bool) -> ServerRow:
+    tag = str(item.get("tag") or "")
+    flag, name = split_flag(str(item.get("name") or tag))
+    multiplier = multipliers.get(tag)
+    parts = [str(item.get("core") or ""), _source_text(str(item.get("source") or ""))]
+    if multiplier and multiplier != 1:
+        parts.append(f"×{multiplier:g}")
+    rtt, delay = _number(item.get("rtt_ms")), _number(item.get("delay_ms"))
+    timing = " · ".join(text for text in (
+        f"RTT {ms_text(rtt)}" if rtt is not None else "",
+        f"проба {ms_text(delay)}" if delay is not None else "") if text)
+    if spare:
+        tone, status = SPARE_VERDICTS.get(str(item.get("verdict") or ""),
+                                          ("off", "ещё не проверен"))
+    else:
+        alive = item.get("alive")
+        tone, status = (("ok", "работает") if alive is True else
+                        ("bad", "не отвечает") if alive is False else ("off", "не проверен"))
+    return ServerRow(
+        key=tag, name=name, flag=flag, code=country_of(tag), sub=" · ".join(p for p in parts if p),
+        speed=mbps_text(_number(item.get("speed_mbps"))), delay=timing, tone=tone,
+        status=status, main=bool(tag) and tag == main_tag,
+        note=str(item.get("speed_note") or ""),
+    )
+
+
+def server_rows(state: dict | None) -> tuple[list[ServerRow], list[ServerRow], int]:
+    """(в работе, запасные, скрытых): основной первым, дальше живые по скорости."""
+    if not state:
+        return [], [], 0
+    multipliers = {str(row.get("tag")): float(row["multiplier"])
+                   for row in _list(state.get("servers"))
+                   if isinstance(row, dict) and _number(row.get("multiplier")) is not None}
+    main = main_server(state)
+    main_tag = main.tag if main is not None else ""
+    members = [_row(item, multipliers, main_tag, False)
+               for item in _list(state.get("members")) if isinstance(item, dict)]
+    spares = [_row(item, multipliers, main_tag, True)
+              for item in _list(state.get("spares")) if isinstance(item, dict)]
+    order = {"ok": 0, "warn": 1, "off": 2, "bad": 3}
+
+    def rank(row: ServerRow) -> tuple:
+        speed = _number(next((item.get("speed_mbps") for item in _list(state.get("members"))
+                              if isinstance(item, dict) and item.get("tag") == row.key), None))
+        return (not row.main, order.get(row.tone, 9), -(speed or 0.0))
+
+    members.sort(key=rank)
+    spares.sort(key=lambda row: order.get(row.tone, 9))
+    hidden = sum(1 for row in _list(state.get("servers"))
+                 if isinstance(row, dict) and row.get("status") in ("disabled", "skipped"))
+    return members, spares, hidden
 
 
 def versions(state: dict | None) -> list[tuple[str, str]]:

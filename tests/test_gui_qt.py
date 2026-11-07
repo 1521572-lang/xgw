@@ -157,10 +157,16 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     assert "Часть серверов недоступна" in win.chip.text() and win.chip.text().startswith("!")
     overview = win.overview
     assert overview.power.text() == "Выключить VPN" and overview.power.isEnabled()
-    assert overview.server.values["speed"].text() == "87,3 Мбит/с"
-    assert overview.server.values["rtt"].text() == "29 мс"
-    assert overview.server.values["delay"].text() == "84 мс"
-    assert overview.about.values["xray"].text() == "26.3.27"
+    assert overview.metrics["speed"].text() == "87,3 Мбит/с"
+    assert overview.metrics["rtt"].text() == "29 мс"
+    assert overview.metrics["delay"].text() == "84 мс"
+    assert "Xray 26.3.27" in overview.versions.text()
+    assert overview.word.text() == "ЗАЩИЩЕНО" and overview.orb.tone == "ok"
+    rows = overview.members.visible_rows()
+    assert len(rows) == 5 and rows[0].is_main and not any(r.is_main for r in rows[1:])
+    assert rows[0].name.text() == "Нидерланды · Амстердам 1"
+    assert len(overview.spares.visible_rows()) == 4
+    assert overview.alert.isVisible() and overview.fix_buttons["scan"].isVisible()
     for row in range(len(window.SECTIONS)):
         win.nav.setCurrentRow(row)
         assert win.stack.currentWidget() is win.pages[window.SECTIONS[row][0]]
@@ -174,7 +180,13 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
             for size in (window.MIN_SIZE, window.START_SIZE):
                 win.resize(*size)
                 qapp.processEvents()
+                win.recolor()
+                qapp.processEvents()
                 win.grab().save(str(Path(shots) / f"overview-{choice}-{size[0]}x{size[1]}.png"))
+            win.nav.setCurrentRow(1)
+            qapp.processEvents()
+            win.grab().save(str(Path(shots) / f"pending-{choice}.png"))
+            win.nav.setCurrentRow(0)
     client.stop()
     win.close()
 

@@ -1,5 +1,8 @@
 """Светлая и тёмная тема окна XGW: палитра Qt и одна таблица стилей (QSS) по токенам цвета.
 
+Вид — как у современных VPN-клиентов: крупный знак защиты с подсветкой цветом состояния,
+карточки со скруглением вместо таблиц, узкая навигация со значками.
+
 По умолчанию — тема системы. В Qt 6.5+ её говорит QStyleHints.colorScheme(); в Ubuntu 24.04 Qt
 6.4, и тогда — настройка GNOME `color-scheme` (gsettings) либо яркость системной палитры (KDE
 передаёт свою палитру Qt-программам сам). Состояние окно всегда пишет и словом, и значком —
@@ -18,17 +21,29 @@ THEMES = ("system", "light", "dark")
 THEME_NAMES = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
 
 LIGHT = {
-    "bg": "#f3f4f6", "surface": "#ffffff", "surface2": "#eef0f3", "border": "#d9dde3",
-    "text": "#1b1e23", "muted": "#58606c", "accent": "#2b67c9", "accent_text": "#ffffff",
-    "ok": "#1d7f46", "warn": "#9a6200", "bad": "#bf2a20", "off": "#626a75", "focus": "#2b67c9",
-    "nav": "#e9ecf0", "selected": "#d6e2f7",
+    "bg": "#f3f5fa", "panel": "#ffffff", "surface": "#ffffff", "surface2": "#eef1f7",
+    "border": "#dde2ec", "text": "#141a2a", "muted": "#5b6578", "accent": "#4a63e7",
+    "accent_text": "#ffffff", "ok": "#0f9d63", "warn": "#b7791f", "bad": "#d64545",
+    "off": "#6b7486", "busy": "#4a63e7", "focus": "#4a63e7", "nav": "#e8ecf5",
+    "selected": "#dde4fb",
 }
 DARK = {
-    "bg": "#15171b", "surface": "#1e2127", "surface2": "#262a31", "border": "#363c45",
-    "text": "#e7e9ed", "muted": "#a3aab6", "accent": "#6f9fff", "accent_text": "#0e1116",
-    "ok": "#53c48a", "warn": "#e2a83b", "bad": "#ff7468", "off": "#9aa1ab", "focus": "#8fb5ff",
-    "nav": "#1a1d22", "selected": "#2b3a55",
+    "bg": "#0e1220", "panel": "#131a2b", "surface": "#182033", "surface2": "#212a40",
+    "border": "#2a3450", "text": "#eef1f8", "muted": "#8f9ab3", "accent": "#6b84ff",
+    "accent_text": "#0b0f1a", "ok": "#34d399", "warn": "#fbbf24", "bad": "#f87171",
+    "off": "#94a3b8", "busy": "#8ea2ff", "focus": "#8ea2ff", "nav": "#0a0e19",
+    "selected": "#222c48",
 }
+TONES = ("ok", "warn", "bad", "off", "busy")
+NL = chr(10)
+
+
+def mix(one: str, two: str, share: float) -> str:
+    """Цвет между one и two: share — доля one (0…1)."""
+    a = [int(one[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(two[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x * share + y * (1 - share)):02x}"
+                         for x, y in zip(a, b, strict=True))
 
 
 def _gnome_dark() -> bool | None:
@@ -76,6 +91,13 @@ def tokens(app: QApplication, choice: str) -> dict[str, str]:
     return DARK if dark else LIGHT
 
 
+def current(app: QApplication | None = None) -> dict[str, str]:
+    """Токены темы, применённой последней, — для виджетов, которые рисуют сами."""
+    app = app or QApplication.instance()
+    found = app.property("xgw_colors") if app is not None else None
+    return dict(found) if isinstance(found, dict) else dict(DARK)
+
+
 def palette(colors: dict[str, str]) -> QPalette:
     result = QPalette()
     role = QPalette.ColorRole
@@ -93,57 +115,107 @@ def palette(colors: dict[str, str]) -> QPalette:
     return result
 
 
+def _tones(c: dict[str, str]) -> str:
+    rules = []
+    for tone in TONES:
+        color = c[tone]
+        top = mix(color, c["panel"], 0.16)
+        rules += [
+            f'QLabel[tone="{tone}"] {{ color: {color}; }}',
+            f'QFrame#conn[tone="{tone}"] {{ background: qlineargradient(x1:0, y1:0, x2:0, '
+            f'y2:1, stop:0 {top}, stop:0.42 {c["panel"]}, stop:1 {c["panel"]}); }}',
+            f'QFrame#alert[tone="{tone}"] {{ border-left: 4px solid {color}; '
+            f'background: {mix(color, c["surface"], 0.08)}; }}',
+            f'QLabel#dot[tone="{tone}"] {{ background: {color}; }}',
+            f'QLabel#pill[tone="{tone}"] {{ color: {color}; '
+            f'background: {mix(color, c["surface"], 0.14)}; }}',
+        ]
+    return NL.join(rules)
+
+
 def stylesheet(c: dict[str, str]) -> str:
-    """Таблица стилей. Размеры — в pt и em, не в пикселях: при масштабе 100–200 % Qt
-    пересчитывает их сам."""
+    """Таблица стилей. Шрифты — в pt: при масштабе 100–200 % Qt пересчитывает их сам."""
     return f"""
-QMainWindow, QWidget#page {{ background: {c['bg']}; }}
-QWidget#topbar {{ background: {c['surface']}; border-bottom: 1px solid {c['border']}; }}
-QListWidget#nav {{
-    background: {c['nav']}; border: none; border-right: 1px solid {c['border']};
-    padding: 6px; outline: none;
+QMainWindow, QWidget#page, QScrollArea {{ background: {c['bg']}; }}
+QWidget {{ color: {c['text']}; }}
+QWidget#rail {{ background: {c['nav']}; border-right: 1px solid {c['border']}; }}
+QToolButton#navButton {{
+    color: {c['muted']}; background: transparent; border: none; border-radius: 12px;
+    padding: 8px 2px; font-size: 8pt;
 }}
-QListWidget#nav::item {{ padding: 8px 10px; border-radius: 6px; color: {c['text']}; }}
-QListWidget#nav::item:selected {{ background: {c['selected']}; color: {c['text']}; }}
-QListWidget#nav:focus {{ border-right: 2px solid {c['focus']}; }}
-QWidget#navfoot {{ background: {c['nav']}; border-right: 1px solid {c['border']}; }}
-QFrame#card {{
-    background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 10px;
+QToolButton#navButton:hover {{ background: {c['surface2']}; color: {c['text']}; }}
+QToolButton#navButton:checked {{ background: {c['selected']}; color: {c['text']};
+    font-weight: 600; }}
+QToolButton#navButton:focus {{ border: 2px solid {c['focus']}; }}
+QToolButton#navButton::menu-indicator {{ image: none; width: 0; }}
+QFrame#conn {{ background: {c['panel']}; border-right: 1px solid {c['border']}; }}
+QFrame#card, QFrame#alert {{
+    background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 14px;
 }}
-QLabel#cardTitle {{ font-weight: 600; color: {c['muted']}; }}
-QLabel#heroTitle {{ font-size: 18pt; font-weight: 600; }}
+QFrame#alert {{ border-radius: 12px; }}
+QFrame#metric {{
+    background: {mix(c['surface2'], c['panel'], 0.7)}; border: 1px solid {c['border']};
+    border-radius: 12px;
+}}
+QFrame#row {{
+    background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 12px;
+}}
+QFrame#row:hover {{ border-color: {mix(c['accent'], c['border'], 0.5)}; }}
+QFrame#row[main="true"] {{ border: 2px solid {c['accent']};
+    background: {mix(c['accent'], c['surface'], 0.07)}; }}
+QLabel#shieldWord {{ font-size: 10pt; font-weight: 700; }}
+QLabel#heroTitle {{ font-size: 20pt; font-weight: 700; }}
+QLabel#pageTitle {{ font-size: 16pt; font-weight: 700; }}
+QLabel#serverName {{ font-size: 11.5pt; font-weight: 600; }}
+QLabel#rowName, QLabel#rowSpeed {{ font-size: 10.5pt; font-weight: 600; }}
+QLabel#metricValue {{ font-size: 16pt; font-weight: 700; }}
+QLabel#metricTitle, QLabel#section {{ color: {c['muted']}; font-size: 8pt; font-weight: 700; }}
+QLabel#cardTitle {{ font-weight: 600; font-size: 11pt; }}
+QLabel#small {{ color: {c['muted']}; font-size: 8.5pt; }}
 QLabel#muted, QLabel[role="muted"] {{ color: {c['muted']}; }}
-QLabel[tone="ok"] {{ color: {c['ok']}; }}
-QLabel[tone="warn"] {{ color: {c['warn']}; }}
-QLabel[tone="bad"] {{ color: {c['bad']}; }}
-QLabel[tone="off"] {{ color: {c['off']}; }}
-QLabel#chip {{
-    border: 1px solid {c['border']}; border-radius: 12px; padding: 2px 10px;
-    background: {c['surface2']}; font-weight: 600;
+QLabel#badge {{
+    background: {c['surface2']}; border: 1px solid {c['border']}; border-radius: 18px;
+    color: {c['text']}; font-weight: 700; font-size: 9pt;
 }}
+QLabel#dot {{ border-radius: 5px; min-width: 10px; max-width: 10px; min-height: 10px;
+    max-height: 10px; }}
+QLabel#pill {{ border-radius: 9px; padding: 2px 9px; font-size: 8.5pt; font-weight: 700; }}
+QLabel#chip {{
+    border: 1px solid {c['border']}; border-radius: 13px; padding: 3px 12px;
+    background: {c['surface']}; font-weight: 600;
+}}
+{_tones(c)}
 QPushButton {{
     background: {c['surface2']}; color: {c['text']}; border: 1px solid {c['border']};
-    border-radius: 6px; padding: 6px 14px;
+    border-radius: 10px; padding: 7px 16px;
 }}
 QPushButton:hover {{ border-color: {c['accent']}; }}
 QPushButton:focus {{ border: 2px solid {c['focus']}; }}
 QPushButton:disabled {{ color: {c['muted']}; }}
-QPushButton#primary {{
+QPushButton#primary, QPushButton#connect[tone="off"] {{
     background: {c['accent']}; color: {c['accent_text']}; border: 1px solid {c['accent']};
-    font-weight: 600;
+    font-weight: 700;
 }}
-QPushButton#power {{ font-size: 12pt; font-weight: 600; padding: 10px 22px; border-radius: 8px; }}
-QPushButton#power[tone="ok"] {{
-    background: {c['ok']}; color: {c['surface']}; border-color: {c['ok']}; }}
-QPushButton#power[tone="warn"] {{
-    background: {c['warn']}; color: {c['surface']}; border-color: {c['warn']}; }}
-QPushButton#power[tone="bad"] {{
-    background: {c['bad']}; color: {c['surface']}; border-color: {c['bad']}; }}
-QPushButton#power:focus {{ border: 3px solid {c['focus']}; }}
-QComboBox {{ padding: 4px 8px; border: 1px solid {c['border']}; border-radius: 6px;
-    background: {c['surface']}; color: {c['text']}; }}
-QComboBox:focus {{ border: 2px solid {c['focus']}; }}
-QStatusBar {{ background: {c['surface']}; border-top: 1px solid {c['border']}; }}
+QPushButton#connect {{
+    font-size: 12pt; font-weight: 700; padding: 12px 22px; border-radius: 24px;
+    min-height: 24px;
+}}
+QPushButton#connect[tone="on"] {{
+    background: transparent; color: {c['text']}; border: 2px solid {c['border']};
+}}
+QPushButton#connect[tone="on"]:hover {{ border-color: {c['bad']}; color: {c['bad']}; }}
+QPushButton#connect:disabled {{ background: {c['surface2']}; color: {c['muted']};
+    border: 1px solid {c['border']}; }}
+QPushButton#connect:focus {{ border: 3px solid {c['focus']}; }}
+QMenu {{ background: {c['surface']}; border: 1px solid {c['border']}; padding: 6px; }}
+QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
+QMenu::item:selected {{ background: {c['selected']}; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: {c['border']}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+QStatusBar {{ background: {c['bg']}; color: {c['muted']}; border-top: 1px solid {c['border']}; }}
+QToolTip {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']};
+    padding: 4px 8px; }}
 """
 
 
@@ -156,5 +228,6 @@ def apply(app: QApplication, choice: str) -> dict[str, str]:
         app.setProperty("xgw_system_dark", system_dark(app))
     app.setStyle("Fusion")  # одинаковые элементы в GNOME и KDE; цвета — из палитры
     app.setPalette(palette(colors))
+    app.setProperty("xgw_colors", dict(colors))
     app.setStyleSheet(stylesheet(colors))
     return colors
