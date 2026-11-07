@@ -321,6 +321,8 @@ def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qap
     page = win.subscriptions
     wait(qapp, lambda: page.cards and not page.cards[0][0].isHidden())
     assert page.cards[0][1]["name"].text() == "main" and page.cards[0][1]["edit"].isHidden()
+    assert not page.cards[0][1]["remove"].isHidden()  # из config.toml — убрать можно (п. 337)
+    assert page.hidden_title.isHidden()
     done = []
     client.actionFinished.connect(lambda *args: done.append(args))
     page.text.setPlainText("это не ссылка")

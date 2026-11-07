@@ -758,6 +758,12 @@ class SubscriptionsPage(QWidget):
         self.links_box.setSpacing(6)
         box.addLayout(self.links_box)
         self.link_rows: list[tuple[QFrame, QLabel, QLabel, QPushButton]] = []
+        self.hidden_title = label("Убранные подписки из config.toml", name="section", wrap=False)
+        box.addWidget(self.hidden_title)
+        self.hidden_box = QVBoxLayout()
+        self.hidden_box.setSpacing(6)
+        box.addLayout(self.hidden_box)
+        self.hidden_rows: list[tuple[QFrame, QLabel, QLabel, QPushButton]] = []
         box.addStretch(1)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -823,7 +829,8 @@ class SubscriptionsPage(QWidget):
                 with contextlib.suppress(TypeError):
                     button.clicked.disconnect()
                 button.clicked.connect(handler)
-                button.setVisible(sub.managed)
+                # Убрать можно любую (п. 337); изменить — только добавленную в окне или панели.
+                button.setVisible(sub.managed or key == "remove")
                 button.setAccessibleName(f"{button.text()} подписку {sub.name}")
             frame.show()
         for frame, _parts in self.cards[len(subs):]:
@@ -857,6 +864,33 @@ class SubscriptionsPage(QWidget):
             frame.show()
         for frame, *_rest in self.link_rows[len(found):]:
             frame.hide()
+        gone = listing.hidden(state)
+        self.hidden_title.setVisible(bool(gone))
+        while len(self.hidden_rows) < len(gone):
+            frame = QFrame()
+            frame.setObjectName("row")
+            line = QHBoxLayout(frame)
+            line.setContentsMargins(14, 8, 14, 8)
+            name = Elided(name="rowName")
+            host = label("", name="small", wrap=False)
+            button = QPushButton("Вернуть")
+            line.addWidget(name, 1)
+            line.addWidget(host)
+            line.addWidget(button)
+            self.hidden_box.addWidget(frame)
+            self.hidden_rows.append((frame, name, host, button))
+        for (frame, name, host, button), (sub, where) in zip(self.hidden_rows, gone,
+                                                              strict=False):
+            set_text(name, sub)
+            set_text(host, f"{where} · из config.toml")
+            with contextlib.suppress(TypeError):
+                button.clicked.disconnect()
+            button.clicked.connect(lambda _c=False, s=sub: self.main.client.act(
+                "subscription/restore", {"name": s}, key="subscription/restore"))
+            button.setAccessibleName(f"Вернуть подписку {sub}")
+            frame.show()
+        for frame, *_rest in self.hidden_rows[len(gone):]:
+            frame.hide()
 
     def _add(self) -> None:
         text = self.text.toPlainText().strip()
@@ -881,8 +915,13 @@ class SubscriptionsPage(QWidget):
             }, key="subscription/edit")
 
     def _remove(self, sub: listing.SubItem) -> None:
-        if self.confirm(f"Убрать подписку «{sub.name}»?",
-                        "Её серверы пропадут из списка при следующем обновлении.", "Убрать"):
+        text = "Её серверы пропадут из списка при следующем обновлении."
+        if not sub.managed:
+            text += (" Запись в config.toml останется: вернуть подписку можно здесь же, "
+                     "в списке убранных.")
+        if len(listing.subscriptions(self.state)) == 1 and not listing.links(self.state):
+            text += " Это единственная подписка: без неё у шлюза не останется серверов."
+        if self.confirm(f"Убрать подписку «{sub.name}»?", text, "Убрать"):
             self.main.client.act("subscription/remove", {"name": sub.name},
                                  key="subscription/remove")
 

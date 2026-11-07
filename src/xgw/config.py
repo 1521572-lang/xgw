@@ -493,6 +493,9 @@ class Managed:
     # в списке панели, убранные из него исчезают.
     disabled: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    # Подписки config.toml, убранные в панели или окне (п. 337): в subscriptions их нет,
+    # запись в config.toml цела — «Вернуть» снимает отметку. Имя → адрес (для маски в панели).
+    hidden: dict[str, str] = field(default_factory=dict)
     # MAC устройств, пущенных мимо VPN в панели: аренда и bypass_hosts добавлены
     # из panel.json. Устройства, заданные в config.toml, сюда не попадают.
     devices: list[str] = field(default_factory=list)
@@ -615,6 +618,11 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     data, error = managed_file.load(path)
     warnings = [error] if error else []
     names = {sub.name for sub in cfg.subscriptions}
+    # Убранные в панели подписки config.toml: имя остаётся занятым (панель не добавит другую
+    # с тем же именем), серверов и запросов у неё нет, пока её не вернут.
+    hidden = set(data["hidden_subscriptions"])
+    cfg.managed.hidden = {sub.name: sub.url for sub in cfg.subscriptions if sub.name in hidden}
+    cfg.subscriptions = [sub for sub in cfg.subscriptions if sub.name not in hidden]
     for item in data["subscriptions"]:
         if item["name"] in names:
             warnings.append(

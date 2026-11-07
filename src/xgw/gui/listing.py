@@ -606,6 +606,13 @@ def subscriptions(state: dict | None) -> list[SubItem]:
     return result
 
 
+def hidden(state: dict | None) -> list[tuple[str, str]]:
+    """Подписки config.toml, убранные в окне или панели (п. 337): (имя, адрес под маской)."""
+    return [(str(item.get("name") or ""), str(item.get("host") or "—"))
+            for item in _list((state or {}).get("hidden_subscriptions"))
+            if isinstance(item, dict) and item.get("name")]
+
+
 def links(state: dict | None) -> list[tuple[str, str, bool]]:
     """Отдельные ссылки серверов: (id, подпись, можно ли убрать из панели)."""
     return [(str(link.get("id") or ""), str(link.get("label") or ""), bool(link.get("managed")))

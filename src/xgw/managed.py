@@ -100,7 +100,7 @@ def load(path: Path) -> tuple[dict, str]:
         "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
-        "free_pool_mode": None, "free_pool_pin": "",
+        "free_pool_mode": None, "free_pool_pin": "", "hidden_subscriptions": [],
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -159,7 +159,41 @@ def load(path: Path) -> tuple[dict, str]:
         # Сервер пула, выбранный вручную на вкладке «Бесплатные серверы» (id варианта).
         "free_pool_pin": pool_pin
         if isinstance(pool_pin, str) and _VARIANT_RE.fullmatch(pool_pin) else "",
+        # Подписки config.toml, убранные в панели или окне (п. 337): сам config.toml панель
+        # не переписывает — имя здесь, и при слиянии такая подписка пропускается.
+        "hidden_subscriptions": _hidden(raw.get("hidden_subscriptions")),
     }, ""
+
+
+MAX_HIDDEN = 64
+
+
+def _hidden(value: object) -> list[str]:
+    result: list[str] = []
+    for name in value if isinstance(value, list) else ():
+        if isinstance(name, str) and name and len(name) <= 200 and name not in result:
+            result.append(name)
+    return result[:MAX_HIDDEN]
+
+
+def hide_subscription(path: Path, name: str, hidden: bool) -> bool:
+    """Убрать (hidden) или вернуть подписку из config.toml; True — что-то изменилось."""
+    if not name or len(name) > 200:
+        raise ManagedError("неверное имя подписки")
+
+    def change(data: dict) -> bool:
+        names = data["hidden_subscriptions"]
+        if (name in names) is hidden:
+            return False
+        if hidden:
+            if len(names) >= MAX_HIDDEN:
+                raise ManagedError(f"убранных подписок уже {MAX_HIDDEN} — больше нельзя")
+            names.append(name)
+        else:
+            names.remove(name)
+        return True
+
+    return _update(path, change)
 
 
 FREE_POOL_MODES = ("off", "observe", "on")

@@ -614,6 +614,9 @@ class Panel:
                 "user_agent": sub.user_agent,
                 "headers": sub.headers,
             })
+        # Подписки config.toml, убранные в панели (п. 337): имя и адрес под маской — «Вернуть».
+        hidden = [{"name": name, "host": masking.mask_url(url) if url else "—"}
+                  for name, url in cfg.managed.hidden.items()]
         links = [
             {
                 "id": managed.link_id(link),
@@ -677,6 +680,7 @@ class Panel:
             "sources": sources,
             "pin": self._pin(now),
             "subscriptions": subscriptions,
+            "hidden_subscriptions": hidden,
             "links": links,
             "lan": {
                 "interface": info["lan_if"],
@@ -1657,7 +1661,8 @@ class Panel:
     def _config_names(self) -> set[str]:
         """Имена подписок, вписанных в config.toml: панель их не трогает."""
         mine = set(self.cfg.managed.subscriptions)
-        return {sub.name for sub in self.cfg.subscriptions if sub.name not in mine}
+        return ({sub.name for sub in self.cfg.subscriptions if sub.name not in mine}
+                | set(self.cfg.managed.hidden))
 
     def act(self, name: str, body: dict, origin: str = "") -> dict:
         """Выполняет действие и возвращает {"ok", "text", "notes"}.
@@ -1741,15 +1746,28 @@ class Panel:
             return self._core_job(name.removeprefix("cores/"), body)
         if name == "subscription/remove":
             sub = body.get("name")
-            if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:
-                return actions.Outcome(
-                    2, "эту подписку панель убрать не может: она вписана в config.toml"
-                )
-            managed.remove_subscription(store_path, sub)
+            if isinstance(sub, str) and sub in cfg.managed.subscriptions:
+                managed.remove_subscription(store_path, sub)
+                done = f"Подписка «{sub}» убрана"
+            elif isinstance(sub, str) and sub in {item.name for item in cfg.subscriptions}:
+                # Вписана в config.toml (п. 337): файл не переписывается — отметка в panel.json.
+                managed.hide_subscription(store_path, sub, True)
+                done = (f"Подписка «{sub}» убрана; запись в config.toml сохранена — вернуть "
+                        "можно в разделе «Подписки»")
+            else:
+                return actions.Outcome(2, "такой подписки нет")
             SubscriptionCache(paths.cache_dir).forget(sub)
             self._event(f"подписка «{sub}» убрана из панели")
             self._wake()
-            return actions.Outcome(0, f"Подписка «{sub}» убрана")
+            return actions.Outcome(0, done)
+        if name == "subscription/restore":
+            sub = body.get("name")
+            if not isinstance(sub, str) or sub not in cfg.managed.hidden:
+                return actions.Outcome(2, "такой убранной подписки нет")
+            managed.hide_subscription(store_path, sub, False)
+            self._event(f"подписка «{sub}» возвращена из панели")
+            self._wake()
+            return actions.Outcome(0, f"Подписка «{sub}» возвращена — получаю серверы…")
         if name == "subscription/edit":
             sub = body.get("name")
             if not isinstance(sub, str) or sub not in cfg.managed.subscriptions:

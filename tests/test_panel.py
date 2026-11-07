@@ -585,8 +585,30 @@ def test_subscription_is_added_shown_at_once_and_removed(rig, user):
     assert user.act("subscription/remove", {"name": "new.example.org"})["ok"]
     assert rig.saved()["subscriptions"] == []
     assert SubscriptionCache(rig.paths.cache_dir).load("new.example.org") is None
-    result = user.act("subscription/remove", {"name": "main"})  # вписана в config.toml
-    assert not result["ok"] and "config.toml" in result["text"]
+    assert not user.act("subscription/remove", {"name": "нет такой"})["ok"]
+
+
+def test_config_subscription_is_removed_without_rewriting_and_restored(rig, user):
+    """П. 337: подписку из config.toml можно убрать — config.toml цел, отметка в panel.json."""
+    before = rig.config_path.read_bytes()
+    result = user.act("subscription/remove", {"name": "main"})
+    assert result["ok"] and "config.toml сохранена" in result["text"]
+    assert rig.config_path.read_bytes() == before
+    assert rig.saved()["hidden_subscriptions"] == ["main"]
+    cfg, warnings = config.load(rig.config_path)
+    assert cfg.subscriptions == [] and list(cfg.managed.hidden) == ["main"] and warnings == []
+    state = user.state()
+    assert state["subscriptions"] == []
+    assert [item["name"] for item in state["hidden_subscriptions"]] == ["main"]
+    assert "S3CR3T" not in json.dumps(state["hidden_subscriptions"])  # адрес под маской
+    # Имя остаётся занятым: другую подписку с таким именем панель не добавит.
+    assert not user.act("add", {"text": "https://other.example.org/x", "name": "main"})["ok"]
+    assert not user.act("subscription/edit", {"name": "main", "user_agent": "x"})["ok"]
+    assert user.act("subscription/restore", {"name": "main"})["ok"]
+    assert rig.saved()["hidden_subscriptions"] == []
+    assert [sub.url for sub in config.load(rig.config_path)[0].subscriptions] == [SUB_URL]
+    assert user.state()["hidden_subscriptions"] == []
+    assert not user.act("subscription/restore", {"name": "main"})["ok"]
 
 
 def test_subscription_user_agent_and_headers_are_editable(rig, user):

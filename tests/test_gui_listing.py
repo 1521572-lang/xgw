@@ -92,3 +92,11 @@ def test_free_pool_rows_rank_working_first_and_offer_choice():
     assert group.items[1].rank == 4 and "тайм-аут" in group.items[1].sub
     assert group.count == "допущено 1 · проверено 2 из 3"
     assert listing.pool_summary({"free_pool": {"mode": "off"}})[0] == "off"
+
+
+def test_hidden_config_subscriptions_are_listed_for_restore():
+    """П. 337: убранные подписки config.toml — имя и адрес под маской, кнопка «Вернуть»."""
+    state = {"hidden_subscriptions": [{"name": "main", "host": "sub.example.net/…"},
+                                      {"name": ""}, "мусор"]}
+    assert listing.hidden(state) == [("main", "sub.example.net/…")]
+    assert listing.hidden({}) == [] and listing.hidden(None) == []
