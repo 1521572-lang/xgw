@@ -16,8 +16,10 @@ bind-interfaces, с которым наш bind-dynamic несовместим, �
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import Config
@@ -70,6 +72,37 @@ def write_conf(cfg: Config, paths: Paths) -> tuple[bool, list[str]]:
     else:
         path.unlink(missing_ok=True)
     return True, warnings
+
+
+@dataclass(frozen=True)
+class ConfSnapshot:
+    """dnsmasq.conf до изменения; text = None — файла не было."""
+
+    text: str | None
+    mode: int = 0o644
+    uid: int = -1
+    gid: int = -1
+
+
+def snapshot_conf(paths: Paths) -> ConfSnapshot:
+    """Снимок того же файла, что пишет write_conf (OSError — прочитать не удалось)."""
+    path = conf_path(paths)
+    try:
+        info = path.stat()
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ConfSnapshot(None)
+    return ConfSnapshot(text, info.st_mode & 0o777, info.st_uid, info.st_gid)
+
+
+def restore_conf(paths: Paths, snapshot: ConfSnapshot) -> None:
+    """Вернуть файл к снимку, вместе с правами и владельцем."""
+    path = conf_path(paths)
+    if snapshot.text is None:
+        path.unlink(missing_ok=True)
+        return
+    atomic_write_text(path, snapshot.text, mode=snapshot.mode)
+    os.chown(path, snapshot.uid, snapshot.gid)
 
 
 def migrate_leases(paths: Paths) -> bool:

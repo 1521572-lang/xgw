@@ -160,6 +160,11 @@ def apply_network(
             problems.append(f"правила сети не обновлены: {exc}")
     if not capture.lan_if:
         return done, problems
+    try:
+        backup = dnsmasq.snapshot_conf(paths)
+    except (OSError, UnicodeDecodeError) as exc:
+        problems.append(f"настройки DHCP не изменены: прежний файл не прочитан ({exc})")
+        return done, problems
     changed, warnings = dnsmasq.write_conf(cfg, paths)
     for warning in warnings:
         logger.warning("%s", warning)
@@ -168,8 +173,22 @@ def apply_network(
             runner(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0)
             done.append("dnsmasq: настройки DHCP обновлены")
         except cmd.CommandError as exc:
-            problems.append(f"dnsmasq не перезапущен: {exc}")
+            problems.append(_rollback_dhcp(paths, backup, runner, exc))
     return done, problems
+
+
+def _rollback_dhcp(
+    paths: Paths, backup: dnsmasq.ConfSnapshot, runner: Callable[..., str],
+    apply_error: cmd.CommandError,
+) -> str:
+    """Новый конфиг dnsmasq не запустился: вернуть прежний, иначе следующий перезапуск применил
+    бы непроверенный (п. 347, A-08). Правила nftables этот сбой не откатывает: шаги независимы."""
+    try:
+        dnsmasq.restore_conf(paths, backup)
+        runner(["systemctl", "restart", dnsmasq.UNIT], timeout=60.0)
+    except (OSError, cmd.CommandError) as rollback_error:
+        return f"dnsmasq не перезапущен ({apply_error}), откат не подтверждён: {rollback_error}"
+    return f"dnsmasq не перезапущен, прежние настройки DHCP возвращены: {apply_error}"
 
 
 # --- ручное закрепление --------------------------------------------------------

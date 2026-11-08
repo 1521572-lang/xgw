@@ -464,7 +464,8 @@ def test_network_failure_rolls_the_device_back(rig, user):
     assert not result["ok"] and "прежние настройки возвращены" in result["text"]
     assert "dnsmasq не перезапущен" in result["text"]
     assert rig.saved()["devices"] == []  # запись откатилась
-    assert "dhcp-host" not in dnsmasq.conf_path(rig.paths).read_text(encoding="utf-8")
+    conf = dnsmasq.conf_path(rig.paths)  # файла не было — и после отката нет (п. 347, A-08)
+    assert not conf.exists() or "dhcp-host" not in conf.read_text(encoding="utf-8")
     assert "192.168.50.101" not in _bypass_set(rig)
     assert user.state()["devices"][0]["bypass"] is False
 

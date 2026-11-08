@@ -2,21 +2,23 @@
 
 import io
 import json
+import logging
 import os
 import tarfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import fakexray
 import links
 import pytest
 from fakesys import FakeSystem
 
-from xgw import cli, config, engine, logs, managed
+from xgw import actions, cli, config, engine, logs, managed
 from xgw.cli import _sync_panel as REAL_SYNC_PANEL
 from xgw.cli import main
-from xgw.net import dnsmasq, lan
+from xgw.net import cmd, dnsmasq, lan
 from xgw.paths import Paths
 from xgw.store import Store
 from xgw.xraycore import binary, update
@@ -1007,3 +1009,65 @@ def test_reload_keeps_the_old_rules_until_xray_gets_the_new_capture_inbound(
     assert seen[1] == (before, {}) and "tproxy" in before
     assert kernel.links == {"xgwtun0": "tun"}  # а после применения — новые правила
     assert any(route.get("dev") == "xgwtun0" for route in kernel.routes(101))
+
+
+# --- п. 347, A-08: откат DHCP --------------------------------------------------------------
+
+
+def _apply_dhcp(paths, cfg, fails):
+    """apply_network с systemctl restart, первые fails вызовов которого — ошибка."""
+    restarts: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        restarts.append(list(argv))
+        if len(restarts) <= fails:
+            raise cmd.CommandError("systemctl: сбой")
+        return ""
+
+    capture = SimpleNamespace(configured=False, lan_if="lan0")
+    done, problems = actions.apply_network(
+        cfg, paths, capture, logger=logging.getLogger("t"), runner=run)
+    return done, problems, restarts
+
+
+def test_failed_dhcp_restart_restores_the_previous_config(tmp_path):
+    paths, cfg = Paths(root=tmp_path), _lan_cfg()
+    dnsmasq.write_conf(cfg, paths)
+    path = dnsmasq.conf_path(paths)
+    before = path.read_text(encoding="utf-8")
+    path.chmod(0o640)
+    cfg.network.dhcp_range = "192.168.50.110,192.168.50.160,6h"
+    done, problems, restarts = _apply_dhcp(paths, cfg, 1)
+    assert path.read_text(encoding="utf-8") == before and path.stat().st_mode & 0o777 == 0o640
+    assert len(restarts) == 2 and done == [] and "настройки DHCP возвращены" in problems[0]
+
+
+def test_failed_dhcp_restart_restores_a_missing_config_as_missing(tmp_path):
+    paths, cfg = Paths(root=tmp_path), _lan_cfg()
+    _done, problems, restarts = _apply_dhcp(paths, cfg, 1)
+    assert not dnsmasq.conf_path(paths).exists() and len(restarts) == 2 and len(problems) == 1
+
+
+def test_failed_dhcp_rollback_is_reported(tmp_path):
+    paths, cfg = Paths(root=tmp_path), _lan_cfg()
+    dnsmasq.write_conf(cfg, paths)
+    cfg.network.dhcp_range = "192.168.50.110,192.168.50.160,6h"
+    _done, problems, _restarts = _apply_dhcp(paths, cfg, 2)
+    assert "откат не подтверждён" in problems[0]
+
+
+def test_unchanged_dhcp_config_is_not_restarted(tmp_path):
+    paths, cfg = Paths(root=tmp_path), _lan_cfg()
+    dnsmasq.write_conf(cfg, paths)
+    assert _apply_dhcp(paths, cfg, 0) == ([], [], [])
+
+
+def test_unreadable_dhcp_snapshot_changes_nothing(tmp_path, monkeypatch):
+    paths, cfg = Paths(root=tmp_path), _lan_cfg()
+
+    def broken(_paths):
+        raise OSError("нет доступа")
+
+    monkeypatch.setattr(dnsmasq, "snapshot_conf", broken)
+    _done, problems, restarts = _apply_dhcp(paths, cfg, 0)
+    assert restarts == [] and not dnsmasq.conf_path(paths).exists() and "не прочитан" in problems[0]
