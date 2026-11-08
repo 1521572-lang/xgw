@@ -1,10 +1,15 @@
 """Мелкие части этапа 2: разбор `xray api bi`, служба с pid-файлом, события,
 статус и оценка трафика проверок."""
 
+import contextlib
 import json
+import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 
 import pytest
 
@@ -518,3 +523,118 @@ def test_status_shows_the_capture_lifecycle_from_the_daemon():
     ) == "Сейчас: перехват заблокирован — Xray не отвечает; мимо VPN ничего не уходит"
     text = status.render_status({"capture": {**capture, "lifecycle": "connecting"}, "xray": {}})
     assert "Сейчас: перехват подключается" in text
+
+
+# --- п. 347, A-02: pid-файл и идентичность процесса ------------------------------------------
+
+
+@pytest.fixture()
+def stranger():
+    """Посторонний живой процесс: его номер оказался в pid-файле."""
+    kill = os.kill  # подмена в signals снимается позже этой фикстуры
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    time.sleep(0.2)  # exec прошёл
+    yield proc
+    with contextlib.suppress(ProcessLookupError):
+        kill(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=5)
+
+
+@pytest.fixture()
+def signals(monkeypatch):
+    """Какие сигналы ушли бы процессам (kill и pidfd_send_signal)."""
+    sent: list[int] = []
+    monkeypatch.setattr(service_module.os, "kill", lambda pid, number: sent.append(number))
+    monkeypatch.setattr(service_module.signal, "pidfd_send_signal",
+                        lambda fd, number: sent.append(number))
+    return sent
+
+
+def _with_pid(tmp_path, proc, binary=sys.executable):
+    service = PidfileXrayService(binary, tmp_path / "config.json", tmp_path / "xray.pid", grace=1)
+    service.pid_file.write_text(f"{proc.pid}\n", encoding="ascii")
+    return service
+
+
+def test_reused_pid_with_another_start_time_gets_no_signal(tmp_path, stranger, signals):
+    service = _with_pid(tmp_path, stranger)
+    identity = asdict(service_module.process_identity(stranger.pid))
+    service.identity_file.write_text(
+        json.dumps({**identity, "start_ticks": identity["start_ticks"] + 1}), encoding="ascii")
+    assert not service.is_active()
+    service.stop()
+    assert signals == [] and stranger.poll() is None
+    assert not service.pid_file.exists() and not service.identity_file.exists()
+
+
+def test_old_pidfile_of_another_program_gets_no_signal(tmp_path, stranger, signals):
+    service = _with_pid(tmp_path, stranger, binary=shutil.which("true"))
+    assert not service.is_active()
+    service.stop()
+    assert signals == [] and stranger.poll() is None
+
+
+def test_old_pidfile_of_the_same_program_is_stopped(tmp_path, stranger):
+    service = _with_pid(tmp_path, stranger)
+    assert service.is_active()
+    service.stop()
+    stranger.wait(timeout=5)
+    assert not service.pid_file.exists()
+
+
+def test_unknown_identity_blocks_signal_and_second_start(tmp_path, stranger, signals, monkeypatch):
+    service = _with_pid(tmp_path, stranger)
+
+    def unknown(_pid):
+        raise service_module.IdentityUnknown("нет прав")
+
+    monkeypatch.setattr(service_module, "process_identity", unknown)
+    assert not service.is_active()
+    with pytest.raises(XrayServiceError, match="не удалось проверить"):
+        service.stop()
+    with pytest.raises(XrayServiceError, match="второй экземпляр"):
+        service.start()
+    assert signals == [] and service.pid_file.exists()
+
+
+def test_process_gone_before_pidfd_is_not_signalled(stranger, signals, monkeypatch):
+    expected = service_module.process_identity(stranger.pid)
+
+    def gone(_pid):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(service_module.os, "pidfd_open", gone)
+    monkeypatch.setattr(service_module, "process_identity", lambda pid: None)
+    assert service_module.send_signal(expected, signal.SIGTERM) is False
+    assert signals == []
+
+
+def test_identity_is_rechecked_after_pidfd_opens(stranger, signals):
+    expected = service_module.process_identity(stranger.pid)
+    wrong = service_module.ProcessIdentity(
+        expected.pid, expected.start_ticks + 1, expected.exe_dev, expected.exe_ino)
+    assert service_module.send_signal(wrong, signal.SIGTERM) is False
+    assert signals == []
+    assert service_module.send_signal(expected, signal.SIGTERM) is True
+    assert signals == [signal.SIGTERM]
+
+
+def test_zombie_has_no_identity():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.monotonic() + 5
+    while service_module.process_identity(proc.pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.05)  # не снят wait(): зомби
+    assert service_module.process_identity(proc.pid) is None
+    proc.wait(timeout=5)
+
+
+def test_start_records_identity_and_own_child_is_reaped(tmp_path, fake_xray):
+    service = PidfileXrayService(sys.executable, tmp_path / "config.json", tmp_path / "xray.pid",
+                                 grace=3)
+    service.start()
+    child = service._proc
+    recorded = json.loads(service.identity_file.read_text(encoding="ascii"))
+    assert recorded["pid"] == child.pid and service.is_active()
+    service.stop()
+    assert child.returncode is not None and service._proc is None
+    assert not service.identity_file.exists()

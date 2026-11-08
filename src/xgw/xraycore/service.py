@@ -9,15 +9,18 @@ pid-файл. Единый интерфейс: start/stop/restart/is_active.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import subprocess
 import tempfile
 import time
 from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .. import log, masking
+from ..paths import atomic_write_json
 from .api import applied_listen
 
 MAX_LOG_BYTES = 2 * 1024 * 1024
@@ -184,12 +187,68 @@ def _is_zombie(pid: int) -> bool:
     return stat.rpartition(")")[2].split()[:1] == ["Z"]
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Чем процесс отличается от другого с тем же номером: время запуска и его программа."""
+
+    pid: int
+    start_ticks: int
+    exe_dev: int
+    exe_ino: int
+
+
+class IdentityUnknown(Exception):
+    """Процесс есть, а кто он — /proc не говорит (нет прав, непонятный ответ)."""
+
+
+def process_identity(pid: int) -> ProcessIdentity | None:
+    """Отпечаток живого процесса; None — такого нет или это зомби. Программа сверяется по
+    устройству и inode: путь в /proc показал бы и текст, и «(deleted)» после обновления ядра."""
+    if pid <= 0:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+        # За именем в скобках (в нём могут быть скобки и пробелы): поле N — индекс N - 3.
+        fields = stat.rpartition(")")[2].split()
+        if fields[0] in ("Z", "X"):
+            return None
+        exe = os.stat(f"/proc/{pid}/exe")
+        return ProcessIdentity(pid, int(fields[19]), exe.st_dev, exe.st_ino)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (OSError, IndexError, ValueError) as exc:
+        raise IdentityUnknown(str(exc)) from exc
+
+
+def send_signal(expected: ProcessIdentity, number: int) -> bool:
+    """Сигнал именно этому процессу; False — его уже нет или номер занял другой. pidfd держит
+    сам процесс: после проверки номер не может перейти к другому. Без pidfd проверка стоит
+    прямо перед kill."""
+    descriptor = None
+    with contextlib.suppress(AttributeError, OSError):
+        descriptor = os.pidfd_open(expected.pid)
+    try:
+        if process_identity(expected.pid) != expected:
+            return False
+        if descriptor is not None:
+            signal.pidfd_send_signal(descriptor, number)
+        else:
+            os.kill(expected.pid, number)
+    except (OSError, IdentityUnknown):
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return True
+
+
 class PidfileXrayService(XrayService):
     """Xray как обычный процесс с pid-файлом — там, где нет systemd-юнита.
 
     `xgw apply` и демон — разные процессы: запущенный одним Xray другой находит
     по pid-файлу. Вывод ядра пишется в файл рядом: без journald иначе не узнать,
-    почему оно не поднялось.
+    почему оно не поднялось. Рядом с pid-файлом — отпечаток процесса (.identity): номер после
+    аварии может достаться чужому процессу, и сигнал ушёл бы ему (п. 347, A-02).
     """
 
     def __init__(self, bin_path, config_path, pid_file: Path, *, grace: float = 5.0) -> None:
@@ -197,6 +256,7 @@ class PidfileXrayService(XrayService):
         self.config_path = str(config_path)
         self.pid_file = Path(pid_file)
         self.log_file = self.pid_file.with_suffix(".log")
+        self.identity_file = self.pid_file.with_suffix(".identity")
         self.grace = grace
         self._proc: subprocess.Popen | None = None  # если запускали сами — чтобы не оставить зомби
 
@@ -206,14 +266,54 @@ class PidfileXrayService(XrayService):
         except (OSError, ValueError):
             return 0
 
-    def is_active(self) -> bool:
+    def _recorded(self, pid: int) -> ProcessIdentity | None:
+        try:
+            data = json.loads(self.identity_file.read_text(encoding="ascii"))
+            recorded = ProcessIdentity(**data)
+        except (OSError, ValueError, TypeError):
+            return None
+        return recorded if recorded.pid == pid else None
+
+    def _owner(self) -> ProcessIdentity | None:
+        """Ядро из pid-файла, подтверждённое отпечатком; None — его нет: процесс завершился или
+        номер теперь у другого. IdentityUnknown — выяснить нельзя, и сигнал не посылается."""
+        pid = self._pid()
+        actual = process_identity(pid)
+        if actual is None:
+            return None
+        recorded = self._recorded(pid)
+        if recorded is not None:
+            return actual if actual == recorded else None
+        # Pid-файл прежней версии, без отпечатка: сверяем хотя бы программу.
+        try:
+            binary = os.stat(self.bin_path)
+        except OSError as exc:
+            raise IdentityUnknown(str(exc)) from exc
+        same = (actual.exe_dev, actual.exe_ino) == (binary.st_dev, binary.st_ino)
+        return actual if same else None
+
+    def _running(self) -> bool:
         pid = self._pid()
         if self._proc is not None and self._proc.poll() is not None:
             # Наш процесс завершён — возможно, другой командой XGW. poll() его снял.
             self._proc = None
         if self._proc is not None and self._proc.pid == pid:
             return True
-        return pid_alive(pid)
+        return self._owner() is not None
+
+    def is_active(self) -> bool:
+        try:
+            return self._running()
+        except IdentityUnknown:
+            return False
+
+    def deliver(self, number: int) -> bool:
+        """Сигнал ядру из pid-файла — только подтверждённому."""
+        try:
+            expected = self._owner()
+        except IdentityUnknown:
+            return False
+        return expected is not None and send_signal(expected, number)
 
     def _trim_log(self) -> None:
         """Журнал ядра дописывается при каждом запуске: большой уходит в .log.1."""
@@ -227,8 +327,14 @@ class PidfileXrayService(XrayService):
             log.get_logger("xray").debug("журнал %s не перенесён: %s", self.log_file, exc)
 
     def start(self) -> None:
-        if self.is_active():
-            return
+        try:
+            if self._running():
+                return
+        except IdentityUnknown as exc:
+            raise XrayServiceError(
+                f"процесс из {self.pid_file} не удалось проверить ({exc}) — второй экземпляр "
+                "не запускаю"
+            ) from exc
         self.pid_file.parent.mkdir(parents=True, exist_ok=True)
         # Каталог сокета API: у службы его создаёт (и убирает при любой остановке) systemd —
         # RuntimeDirectory, здесь — сами. Ядро не работает (is_active выше), а сокет остался —
@@ -251,6 +357,11 @@ class PidfileXrayService(XrayService):
                 )
         except OSError as exc:
             raise XrayServiceError(f"xray не запустился: {exc}") from exc
+        # Отпечаток — раньше номера: иначе номер без отпечатка выглядел бы файлом прежней версии.
+        with contextlib.suppress(OSError, IdentityUnknown):
+            identity = process_identity(self._proc.pid)
+            if identity is not None:
+                atomic_write_json(self.identity_file, asdict(identity), mode=0o644)
         self.pid_file.write_text(f"{self._proc.pid}\n", encoding="ascii")
         deadline = time.monotonic() + min(self.grace, 1.0)
         while time.monotonic() < deadline:
@@ -260,23 +371,51 @@ class PidfileXrayService(XrayService):
                 )
             time.sleep(0.1)
 
+    def _stop_child(self, child: subprocess.Popen) -> None:
+        """Свой процесс — по его Popen: номер занят, пока он не снят, и ошибиться нельзя."""
+        child.terminate()
+        try:
+            child.wait(timeout=self.grace)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=self.grace)
+
+    def _stop_confirmed(self, expected: ProcessIdentity) -> None:
+        send_signal(expected, signal.SIGTERM)
+        deadline = time.monotonic() + self.grace
+        while self.is_active() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if self.is_active() and send_signal(expected, signal.SIGKILL):
+            time.sleep(0.2)
+        # Завершающийся процесс уже без программы в /proc, но ещё не зомби: дождаться и этого.
+        settle = time.monotonic() + 1.0
+        while pid_alive(expected.pid) and time.monotonic() < settle:
+            time.sleep(0.02)
+
     def stop(self) -> None:
+        """Сигнал — только процессу, подтверждённому отпечатком. Номер занят другим (отпечаток
+        иной): нашего ядра нет, сигнала нет, а устаревший файл убирается. Выяснить нельзя —
+        ошибка, и файл остаётся."""
         pid = self._pid()
-        if pid and self.is_active():
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGTERM)
-            deadline = time.monotonic() + self.grace
-            while self.is_active() and time.monotonic() < deadline:
-                time.sleep(0.1)
-            if self.is_active():
-                with contextlib.suppress(OSError):
-                    os.kill(pid, signal.SIGKILL)
-                time.sleep(0.2)
+        child = self._proc
+        if child is not None and child.pid == pid and child.poll() is None:
+            self._stop_child(child)
+        elif pid:
+            try:
+                expected = self._owner()
+            except IdentityUnknown as exc:
+                raise XrayServiceError(
+                    f"процесс из {self.pid_file} не удалось проверить ({exc}) — сигнал не послан"
+                ) from exc
+            if expected is not None:
+                self._stop_confirmed(expected)
         if self._proc is not None:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self._proc.wait(timeout=1)
             self._proc = None
         self.pid_file.unlink(missing_ok=True)
+        self.identity_file.unlink(missing_ok=True)
 
     def restart(self) -> None:
         self.stop()

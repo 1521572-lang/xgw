@@ -55,13 +55,10 @@ class PidfileSingboxService(PidfileXrayService, SingboxService):
     """sing-box как обычный процесс с pid-файлом (стенд, где нет systemd-юнита)."""
 
     def reload(self) -> None:
-        pid = self._pid()
-        if not pid or not self.is_active():
+        if not self.is_active():
             raise XrayServiceError("sing-box не запущен")
-        try:
-            os.kill(pid, signal.SIGHUP)
-        except OSError as exc:
-            raise XrayServiceError(f"sing-box не принял SIGHUP: {exc}") from exc
+        if not self.deliver(signal.SIGHUP):
+            raise XrayServiceError("sing-box не принял SIGHUP")
 
 
 def make_service(paths: Paths, bin_path: Path | None) -> SingboxService:
