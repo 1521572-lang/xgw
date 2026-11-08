@@ -1024,6 +1024,8 @@ def render_capture(capture: dict) -> str:
         text += f" — ИНТЕРФЕЙС TUN НЕ ГОТОВ: {capture['tun_problem']} (sudo xgw net up)"
     elif capture.get("loaded") is False:
         text += " — ПРАВИЛА НЕ ЗАГРУЖЕНЫ (sudo xgw enable)"
+    elif capture.get("routes_unknown"):
+        text += " — МАРШРУТЫ НЕ ПРОЧИТАНЫ, состояние неизвестно (sudo xgw diag)"
     elif capture.get("lan_problem"):
         text += f" — НЕТ ИНТЕРНЕТА У УСТРОЙСТВ СЕТИ: {capture['lan_problem']} (sudo xgw diag)"
     return text

@@ -1008,6 +1008,25 @@ class Diag:
                     "может уйти мимо VPN",
                     "ip rule show — чьи это правила; XGW чужие не трогает",
                 ))
+            elif info.get("early_rules_error"):
+                result.append(Check(
+                    "Маршрутизация", WARN,
+                    "правила ip rule не прочитаны: неизвестно, есть ли чужие правила раньше "
+                    f"правил XGW ({info['early_rules_error']})",
+                    "ip rule show; повторите sudo xgw diag",
+                ))
+            if info.get("routes_unknown"):
+                result.append(Check(
+                    "Маршрутизация", WARN,
+                    f"маршруты XGW не прочитаны, состояние неизвестно: {info['routes_unknown']}",
+                    "ip route show table all; повторите sudo xgw diag",
+                ))
+            if info.get("cleanup_errors"):
+                result.append(Check(
+                    "Снятие правил", WARN,
+                    "не завершено: " + "; ".join(info["cleanup_errors"])[:300],
+                    "sudo xgw net down — доведёт снятие; sudo xgw net up — вернёт правила",
+                ))
         return result
 
     def _journal(self) -> list[Check]:

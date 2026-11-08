@@ -13,6 +13,7 @@ from xgw.config import Config
 from xgw.net import cmd, dnsmasq, iprule, lan, nft, sysctl, tun
 from xgw.net.capture import Capture, CaptureError
 from xgw.paths import Paths
+from xgw.watch import status
 
 # --- ip rule / ip route --------------------------------------------------------
 
@@ -533,7 +534,8 @@ def test_describe(gateway):
         "bypass": ["192.168.50.20"], "ipv6": False, "tun": False, "containers": False,
         "direct4": 0, "docker": False, "fail_mode": "closed", "hold": "block", "loaded": True,
         "tun_problem": "", "inbound_missing": "", "blocked": False, "mismatch": "",
-        "early_rules": [],
+        "early_rules": [], "early_rules_known": True, "early_rules_error": "",
+        "routes_unknown": "", "cleanup_errors": [],
     }
     # Docker создал мост — о контейнерах говорится и в статусе (если их перехват включён).
     gateway.cfg.capture.containers = True
@@ -1497,3 +1499,160 @@ def test_first_failed_guard_apply_does_not_enable_forwarding(gateway):
         gateway.enable()
     assert sysctl.read(sysctl.IP_FORWARD, gateway.proc) == "0"
     assert gateway.kernel.tables == {}
+
+
+# --- п. 347: снятие правил и «не удалось узнать» ---------------------------------------------
+
+
+def _fail_on(gateway, *prefix, error="отказ"):
+    """Команды с таким началом завершаются ошибкой; возвращает настоящий запуск."""
+    real = gateway.runner
+
+    def run(argv, **kwargs):
+        if tuple(argv[:len(prefix)]) == prefix:
+            raise cmd.CommandError(error)
+        return real(argv, **kwargs)
+
+    gateway.runner = run
+    return real
+
+
+@pytest.mark.parametrize("prefix,name", [
+    (("nft", "-f"), "nftables"),
+    (("ip", "rule", "del"), "маршруты TPROXY"),
+    (("ip", "route", "del"), "маршруты TPROXY"),
+])
+def test_down_continues_after_a_failed_step_and_can_be_retried(gateway, prefix, name):
+    gateway.enable()
+    real = _fail_on(gateway, *prefix)
+    with pytest.raises(CaptureError, match=name):
+        gateway.down()
+    assert sysctl.read(sysctl.IP_FORWARD, gateway.proc) == "0"  # следующие шаги выполнены
+    assert gateway._state()["cleanup_pending"] == {"remove_tun": False}
+    assert name in gateway.describe(check=False)["cleanup_errors"][0]
+    gateway.runner = real
+    gateway.down()
+    assert not gateway.kernel.rules and not gateway.kernel.route
+    state = gateway._state()
+    assert "cleanup_pending" not in state and "cleanup_errors" not in state
+
+
+def test_down_reports_every_failed_step(gateway, monkeypatch):
+    gateway.enable()
+    _fail_on(gateway, "ip", "rule", "del")
+
+    def broken(*_args, **_kwargs):
+        raise OSError("только чтение")
+
+    monkeypatch.setattr(sysctl, "write", broken)
+    with pytest.raises(CaptureError, match=r"маршруты TPROXY.*форвардинг"):
+        gateway.down()
+
+
+def test_down_keeps_tailscale_markers_while_tables_are_loaded(gateway):
+    gateway.enable()
+    gateway.ts_marker.parent.mkdir(parents=True, exist_ok=True)
+    gateway.ts_marker.touch()
+    real = _fail_on(gateway, "nft", "-f")
+    with pytest.raises(CaptureError):
+        gateway.down()
+    assert gateway.ts_marker.exists()
+    gateway.runner = real
+    gateway.down()
+    assert not gateway.ts_marker.exists()
+
+
+def test_failed_down_remembers_the_tun_removal(gateway, monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr(tun, "remove", lambda name, runner: removed.append(name))
+    gateway.enable()
+    real = _fail_on(gateway, "nft", "-f")
+    with pytest.raises(CaptureError):
+        gateway.down(remove_tun=True)
+    gateway.runner = real
+    removed.clear()
+    gateway.down()  # повтор без аргумента доводит то, что просили
+    assert removed == [gateway.cfg.capture.tun_name]
+
+
+def test_new_load_supersedes_an_unfinished_down(gateway):
+    gateway.enable()
+    real = _fail_on(gateway, "nft", "-f")
+    with pytest.raises(CaptureError):
+        gateway.down()
+    gateway.runner = real
+    assert gateway.up() == "on"
+    assert "cleanup_pending" not in gateway._state()
+    assert gateway.describe(check=False)["cleanup_errors"] == []
+
+
+NO_TABLE = "ip -j route show table 100: Error: ipv4: FIB table does not exist.\nDump terminated"
+
+
+def _route_show(kernel, reply):
+    """`ip route show` отвечает так, всё остальное — как обычно."""
+
+    def run(argv, **kwargs):
+        if "route" in argv and "show" in argv:
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        return kernel(argv, **kwargs)
+
+    return run
+
+
+def test_missing_table_is_empty():
+    kernel = FakeKernel()
+    run = _route_show(kernel, cmd.CommandError(NO_TABLE))
+    assert not iprule.present(1, 100, run)
+    iprule.remove(1, 100, run)
+    assert kernel.commands("ip", "route", "del") == []
+    assert iprule.present(1, 100, _route_show(kernel, "[]")) is False
+
+
+@pytest.mark.parametrize("reply", [
+    cmd.CommandError("ip -j route show table 100: таймаут 15 с"),
+    cmd.CommandError("ip: программа не найдена"),
+    "{не json",
+    "{}",
+], ids=["timeout", "missing", "malformed", "not-a-list"])
+def test_unreadable_routes_are_an_error_not_an_empty_table(reply):
+    kernel = FakeKernel()
+    iprule.ensure(1, 100, kernel)
+    run = _route_show(kernel, reply)
+    with pytest.raises(cmd.CommandError):
+        iprule.present(1, 100, run)
+    before = len(kernel.commands("ip", "route", "del"))
+    with pytest.raises(cmd.CommandError):
+        iprule.remove(1, 100, run)
+    assert len(kernel.commands("ip", "route", "del")) == before and kernel.route
+
+
+def test_unreadable_routes_are_shown_as_unknown(gateway):
+    gateway.enable()
+    gateway.runner = _route_show(gateway.kernel, cmd.CommandError("таймаут 15 с"))
+    assert gateway.loaded() is None
+    info = gateway.describe()
+    assert info["loaded"] is None and "таймаут" in info["routes_unknown"]
+    assert "МАРШРУТЫ НЕ ПРОЧИТАНЫ" in status.render_capture(info)
+    assert "ПРАВИЛА НЕ ЗАГРУЖЕНЫ" not in status.render_capture(info)
+
+
+def test_unreadable_early_rules_are_unknown(gateway):
+    gateway.enable()
+    assert gateway.describe()["early_rules_known"] is True
+    assert gateway.describe(check=False)["early_rules_known"] is False  # не проверялось
+    real = gateway.runner
+
+    def run(argv, **kwargs):
+        if list(argv) == ["ip", "-j", "rule", "show"]:
+            raise cmd.CommandError("ip: отказ")
+        return real(argv, **kwargs)
+
+    gateway.runner = run
+    info = gateway.describe()
+    assert info["early_rules"] == [] and info["early_rules_known"] is False
+    assert "отказ" in info["early_rules_error"]
+    with pytest.raises(cmd.CommandError):
+        iprule.early(run, 4, (100,))

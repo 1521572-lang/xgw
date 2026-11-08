@@ -61,6 +61,9 @@ PREF_TUN = 90
 PREF_CONTAINERS = 95
 BLACKHOLE_METRIC = 4096
 ANYWHERE = {4: "0.0.0.0/0", 6: "::/0"}
+# Чтение таблицы, в которой ещё не было маршрутов: `ip route show table N` завершается с кодом 2 и
+# этим текстом ядра (проверено: ядро 6.18, iproute2 6.19; язык системы на него не влияет).
+NO_TABLE = "FIB table does not exist"
 # Ключи `ip -j rule show`, при которых правило — ровно правило XGW (кросс-аудит 4cc96b9, N03).
 # Любой другой (uidrange, ipproto, sport, dport, oif, l3mdev, not, suppress_prefixlength, tos,
 # goto…) сужает или меняет правило: помеченный трафик, которому оно не подходит, ушёл бы по
@@ -104,12 +107,20 @@ def _rules(
 
 
 def _routes(table: int, runner: Runner, family: int) -> list[dict]:
+    """Маршруты таблицы. Пусто — только если таблица действительно пуста или её ещё нет; любой
+    другой сбой — CommandError: «не удалось узнать» не значит «маршрутов нет» (п. 347, A-04)."""
     try:
-        routes = json.loads(
-            runner([*_ip(family), "-j", "route", "show", "table", str(table)]) or "[]"
-        )
-    except (CommandError, json.JSONDecodeError):
-        return []  # таблицы маршрутизации ещё нет
+        text = runner([*_ip(family), "-j", "route", "show", "table", str(table)])
+    except CommandError as exc:
+        if NO_TABLE in str(exc):
+            return []
+        raise
+    try:
+        routes = json.loads(text or "[]")
+    except json.JSONDecodeError as exc:
+        raise CommandError(f"ip -j route show: непонятный ответ ({exc})") from exc
+    if not isinstance(routes, list):
+        raise CommandError("ip -j route show: ответ не список")
     return [route for route in routes if isinstance(route, dict)]
 
 
@@ -228,11 +239,9 @@ def early(runner: Runner, family: int, tables: tuple[int, ...], before: int = PR
     правило может увести помеченный трафик мимо таблиц XGW, по main мимо VPN. Не в счёт
     обычное «from all lookup local» (pref 0), правила в таблицы XGW (tables) и правила без
     lookup (unreachable, prohibit — они трафик не выпускают). Ничего не меняет: чужие правила
-    XGW не трогает, о них говорит `xgw diag`."""
-    try:
-        listing = _listing(runner, family)
-    except CommandError:
-        return []
+    XGW не трогает, о них говорит `xgw diag`. Сбой чтения — CommandError: пустой список значит
+    только «таких правил нет» (п. 347, A-05)."""
+    listing = _listing(runner, family)
     own = {str(table) for table in tables}
     found = set()
     for rule in listing:

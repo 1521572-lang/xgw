@@ -47,6 +47,7 @@ import dataclasses
 import json
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 from .. import log
@@ -163,6 +164,7 @@ class Capture:
         # конфиге Xray нет нужного inbound'а либо нет TUN-интерфейса (см. _load). Пусто —
         # такого не было.
         self.held = ""
+        self.routes_error = ""
 
     # --- что настроено ----------------------------------------------------------
 
@@ -313,25 +315,30 @@ class Capture:
                 cap.mark_containers, cap.tun_route_table, self.runner, self._tun_dev(rules)
             )
 
-    def _routes_down(self, rules: nft.Rules) -> None:
-        """Правила `ip rule` и маршруты, которые текущим правилам не нужны (остались от
-        другого режима, от ipv6 = proxy или от снятого перехвата)."""
+    def _route_steps(self, rules: nft.Rules) -> list[tuple[str, Callable[[], None]]]:
+        """Что убрать из `ip rule` и маршрутов, потому что текущим правилам не нужно (осталось
+        от другого режима, от ipv6 = proxy или от снятого перехвата): название и действие."""
         cap = self.cfg.capture
+        steps: list[tuple[str, Callable[[], None]]] = []
         for family in self._families():
             tproxy, via_tun = self._wanted(rules, family)
             if not tproxy:
-                iprule.remove(cap.mark_proxy, cap.route_table, self.runner, family)
+                steps.append((f"маршруты TPROXY IPv{family}", partial(
+                    iprule.remove, cap.mark_proxy, cap.route_table, self.runner, family)))
             if not via_tun:
                 # Маршруты таблицы TUN остаются, пока они нужны контейнерам (только IPv4).
-                iprule.remove_tun(
-                    cap.mark_proxy, cap.tun_route_table, self.runner, family, cap.tun_name,
-                    keep_routes=family == 4 and bool(rules.containers),
-                )
+                steps.append((f"маршруты TUN IPv{family}", partial(
+                    iprule.remove_tun, cap.mark_proxy, cap.tun_route_table, self.runner, family,
+                    cap.tun_name, keep_routes=family == 4 and bool(rules.containers))))
         if not rules.containers:
-            iprule.remove_containers(
-                cap.mark_containers, cap.tun_route_table, self.runner, cap.tun_name,
-                keep_routes=rules.tun,
-            )
+            steps.append(("маршруты контейнеров", partial(
+                iprule.remove_containers, cap.mark_containers, cap.tun_route_table, self.runner,
+                cap.tun_name, keep_routes=rules.tun)))
+        return steps
+
+    def _routes_down(self, rules: nft.Rules) -> None:
+        for _name, step in self._route_steps(rules):
+            step()
 
     def _applied(self) -> dict | None:
         """Применённый конфиг Xray — тот, с которым ядро запущено или запустится."""
@@ -510,6 +517,8 @@ class Capture:
         if mismatch and mismatch != self._state().get("mismatch"):
             self.log.error("правила загружены, но не сходятся с текстом правил: %s", mismatch)
         self._save(
+            # Правила загружены заново: незавершённое снятие (down) больше не цель.
+            cleanup_pending=None, cleanup_errors=None,
             baseline=digest, mismatch=mismatch or None, tables=None,
             guard_baseline=self._verified_guard,
             guard_spec=(nft.tables_digest(nft.render_guard(rules))
@@ -822,22 +831,57 @@ class Capture:
 
         TUN-интерфейс остаётся, если не сказано иное: его держит открытым работающий
         Xray, и без интерфейса его inbound пришлось бы перезапускать. Удаление
-        (`xgw uninstall`) вызывает это уже после остановки служб."""
+        (`xgw uninstall`) вызывает это уже после остановки служб.
+
+        Сбой одного шага не отменяет остальные (п. 347, A-03): выполняется всё, что можно, а
+        затем CaptureError со списком несделанного. Незавершённое снятие помнит capture.json
+        (cleanup_pending, cleanup_errors): повторный вызов его доводит, успешная загрузка правил
+        (_load) отменяет."""
         with self._lock():
+            errors: list[str] = []
+
+            def attempt(name: str, step: Callable[[], object]) -> bool:
+                try:
+                    step()
+                except (cmd.CommandError, OSError) as exc:
+                    errors.append(f"{name}: {exc}")
+                    return False
+                return True
+
+            remove_tun = remove_tun or bool(
+                (self._state().get("cleanup_pending") or {}).get("remove_tun"))
+            attempt("запись состояния",
+                    partial(self._save, cleanup_pending={"remove_tun": remove_tun}))
+            removed = attempt("nftables", self._delete_tables)
+            steps: list[tuple[str, Callable[[], None]]] = []
+            # Перехвата нет: убирается всё.
+            attempt("список маршрутов", lambda: steps.extend(self._route_steps(self.rules("off"))))
+            for name, step in steps:
+                attempt(name, step)
+            if remove_tun:
+                attempt("интерфейс TUN",
+                        partial(tun.remove, self.cfg.capture.tun_name, self.runner))
+            if removed:  # метки Tailscale описывают загруженные таблицы
+                attempt("метки Tailscale", self._unlink_ts_markers)
+            attempt("форвардинг", self._forwarding_restore)
+            attempt("алгоритм TCP", self._congestion_restore)
+            if errors:
+                with contextlib.suppress(OSError):
+                    self._save(cleanup_errors=errors)
+                raise CaptureError("; ".join(errors))
             try:
-                with self._own_rules():
-                    nft.delete(self.runner)
-                self._save(tables=None)  # таблиц нет — сверять loaded() не с чем
-                self._routes_down(self.rules("off"))  # перехвата нет: убирается всё
-                if remove_tun:
-                    tun.remove(self.cfg.capture.tun_name, self.runner)
-                self.ts_marker.unlink(missing_ok=True)
-                self.ts_fallback_marker.unlink(missing_ok=True)
-                self._forwarding_restore()
-                self._congestion_restore()
-            except (cmd.CommandError, OSError) as exc:
+                self._save(tables=None, cleanup_pending=None, cleanup_errors=None)
+                self.open_marker.unlink(missing_ok=True)
+            except OSError as exc:
                 raise CaptureError(str(exc)) from exc
-            self.open_marker.unlink(missing_ok=True)
+
+    def _delete_tables(self) -> None:
+        with self._own_rules():
+            nft.delete(self.runner)
+
+    def _unlink_ts_markers(self) -> None:
+        self.ts_marker.unlink(missing_ok=True)
+        self.ts_fallback_marker.unlink(missing_ok=True)
 
     def _forwarding_on(self) -> None:
         before = sysctl.read(sysctl.IP_FORWARD, self.proc_sys)
@@ -895,6 +939,7 @@ class Capture:
     def loaded(self, *, tun: bool = True) -> bool | None:
         """Соответствует ли ядро текущему режиму. None — узнать нельзя (нет прав).
         tun=False — без проверки интерфейса TUN: на месте ли сами правила и маршруты."""
+        self.routes_error = ""
         rules = self.rules(self.effective_mode())
         barrier = self.guard_loaded()
         if barrier is not True:
@@ -992,7 +1037,7 @@ class Capture:
             if rules.capture6 and not rules.prerouting6 and "prerouting" in chains6:
                 return False
         cap = self.cfg.capture
-        with contextlib.suppress(cmd.CommandError):
+        try:
             if tun and self._tun_problem(rules):
                 return False
             for family in self._families():
@@ -1023,6 +1068,8 @@ class Capture:
             return bool(rules.containers) or not iprule.has_rule(
                 cap.mark_containers, cap.tun_route_table, self.runner
             )
+        except cmd.CommandError as exc:
+            self.routes_error = str(exc)[:300]  # не «маршрутов нет», а «не удалось узнать»
         return None
 
     def _v6_guard_loaded(self, rules: nft.Rules) -> bool | None:
@@ -1124,10 +1171,15 @@ class Capture:
                 tun_only = problem
         missing = (self.inbound_problem() or self.held) if self.mode() == "on" else ""
         cap = self.cfg.capture
-        early = sorted({
-            pref for family in self._families()
-            for pref in iprule.early(self.runner, family, (cap.route_table, cap.tun_route_table))
-        }) if check and self.mode() == "on" else []
+        checked = check and self.mode() == "on"
+        found: set[int] = set()
+        early_error = ""
+        for family in self._families() if checked else ():
+            try:
+                found.update(iprule.early(
+                    self.runner, family, (cap.route_table, cap.tun_route_table)))
+            except cmd.CommandError as exc:
+                early_error = str(exc)[:300]
         return {
             "mode": self.mode(),
             "lan_if": rules.lan_if,
@@ -1156,6 +1208,13 @@ class Capture:
             # Чем таблицы расходились с текстом правил сразу после своей загрузки (_load):
             # эталона тогда нет, а loaded() это расхождение терпит. Пусто — сходились.
             "mismatch": str(self._state().get("mismatch") or ""),
-            # Чужие правила ip rule раньше правил XGW (iprule.early): их приоритеты.
-            "early_rules": early,
+            # Чужие правила ip rule раньше правил XGW (iprule.early): их приоритеты. Пустой
+            # список значит «таких нет», только если early_rules_known (п. 347, A-05).
+            "early_rules": sorted(found),
+            "early_rules_known": checked and not early_error,
+            "early_rules_error": early_error,
+            # Не удалось прочитать маршруты: loaded = None, и это не «маршрутов нет» (A-04).
+            "routes_unknown": self.routes_error if loaded is None else "",
+            # Снятие правил (down) не завершилось: что осталось сделать (A-03).
+            "cleanup_errors": list(self._state().get("cleanup_errors") or []),
         }
