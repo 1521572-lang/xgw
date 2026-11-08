@@ -243,6 +243,10 @@ def main(argv: list[str] | None = None) -> int:
         "--open", metavar="АДРЕС", default=None,
         help="открыть панель: вкладку на экране — вывести вперёд, иначе новой (ярлык «XGW»)",
     )
+    tray_parser.add_argument(
+        "--window", metavar="АДРЕС", default=None,
+        help="открыть окно XGW, а если оно не запустится — панель по адресу (ярлык «XGW»)",
+    )
     subparsers.add_parser(
         "gui", help="окно XGW на рабочем столе (Ubuntu 24.04, PyQt6) — от имени пользователя",
     )
@@ -251,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "tray":
         # От имени человека, в его графическом сеансе: ни config.toml (0600 root), ни журнал
         # XGW значку не нужны — порт панели и токен трея лежат в его ~/.config/xgw.
+        if args.window:
+            return tray.open_main(args.window, window=True)
         if args.open:
             return tray.open_main(args.open)
         return tray.main(["--run"] if args.run else ["--replace"] if args.replace else [])

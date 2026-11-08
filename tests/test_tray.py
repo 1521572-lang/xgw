@@ -3,6 +3,7 @@
 
 import json
 import os
+import subprocess
 import types
 from pathlib import Path
 
@@ -44,14 +45,69 @@ def test_tooltip_tells_state_cores_and_the_chosen_server():
         "XGW: нет связи с панелью — панель не отвечает")
 
 
+class _Window:
+    """Запущенный `xgw gui`: code — код выхода, None — окно работает."""
+
+    def __init__(self, code):
+        self.code = code
+
+    def wait(self, timeout=None):
+        if self.code is None and timeout is not None:
+            raise subprocess.TimeoutExpired("xgw gui", timeout)
+        return self.code
+
+
+@pytest.mark.parametrize(("code", "result", "browser"), [
+    (None, "window", 0),  # окно работает
+    (0, "window", 0),  # окно уже было открыто и выведено вперёд
+    (2, "browser", 1),  # нет PyQt6
+])
+def test_window_opens_and_browser_is_the_fallback(tmp_path, monkeypatch, code, result, browser):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    opened = []
+    monkeypatch.setattr(tray, "open_panel", lambda *args, **_kw: opened.append(args))
+    assert tray.open_window("http://p/", start=lambda: _Window(code)) == result
+    assert len(opened) == browser
+    assert tray.take_lock(tray.lock_path().with_name(tray.WINDOW_LOCK)) is not None  # отпущена
+
+
+def test_window_that_cannot_be_started_falls_back_to_the_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    opened = []
+    monkeypatch.setattr(tray, "open_panel", lambda *args, **_kw: opened.append(args))
+
+    def missing():
+        raise FileNotFoundError("xgw")
+
+    assert tray.open_window("http://p/", start=missing) == "browser" and opened
+
+
+def test_second_quick_click_does_not_start_a_second_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    held = tray.take_lock(tray.lock_path().with_name(tray.WINDOW_LOCK))
+    started = []
+    assert tray.open_window("http://p/", start=lambda: started.append(1)) == "starting"
+    assert not started
+    held.close()
+
+
+def test_window_shortcut_is_not_taken_for_the_tray_icon(tmp_path):
+    proc = tmp_path / "proc"
+    for pid, words in ((100, ["xgw", "tray", "--window", "http://p/"]),
+                       (101, ["xgw", "tray", "--replace"])):
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / "cmdline").write_bytes(chr(0).join(words).encode())
+    assert tray.other_instances(proc, uid=os.getuid(), me=1) == [101]
+
+
 def test_menu_without_the_daemon_and_while_busy():
     labels = [label for _action, label, _on in tray.menu(STATE)]
-    assert labels == ["Открыть панель", "Проверить выпуски ядер", "Замерить скорость сейчас",
-                      "О программе", "Выход"]
+    assert labels == ["Открыть XGW", "Открыть в браузере", "Проверить выпуски ядер",
+                      "Замерить скорость сейчас", "О программе", "Выход"]
     assert all(on for _action, _label, on in tray.menu(STATE))
     offline = dict((action, on) for action, _label, on in tray.menu(None))
-    assert offline == {"open": True, "cores/check": False, "speed": False, "about": True,
-                       "quit": True}
+    assert offline == {"open": True, "browser": True, "cores/check": False, "speed": False,
+                       "about": True, "quit": True}
     busy = dict((action, on) for action, _label, on in tray.menu(
         {**STATE, "busy": {"cores": True, "speed": False}}))
     assert busy["cores/check"] is False and busy["speed"] is True

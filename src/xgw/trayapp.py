@@ -133,20 +133,24 @@ class TrayApp:
     def do(self, action: str) -> None:
         if action == "quit":
             self.app.exit(0)  # закрывается только значок; шлюз работает
-        elif action == "open":
+        elif action in ("open", "browser"):
             url = (self.state or {}).get("panel") or f"http://127.0.0.1:{self.client.port}/"
-            # Вывести вперёд вкладку на экране ждёт до 2 с — не в потоке Qt, чтобы меню не
-            # замирало; open_panel окна Qt не трогает. Одно открытие за раз.
+            # Запуск окна и вывод вперёд вкладки ждут до 3 с — не в потоке Qt, чтобы меню не
+            # замирало; окна Qt значка они не трогают. Одно открытие за раз.
             if self._opening.acquire(blocking=False):
-                threading.Thread(target=self._open, args=(url,), daemon=True).start()
+                threading.Thread(target=self._open, args=(url, action == "browser"),
+                                 daemon=True).start()
         elif action == "about":
             self.QtWidgets.QMessageBox.information(None, "XGW", tray.about(self.state))
         else:
             self._act(action)
 
-    def _open(self, url: str) -> None:
+    def _open(self, url: str, browser: bool) -> None:
         try:
-            tray.open_panel(url, self.client, stamp=tray.launch_stamp())
+            if browser:
+                tray.open_panel(url, self.client, stamp=tray.launch_stamp())
+            else:
+                tray.open_window(url, self.client)
         except OSError as exc:
             print(f"значок XGW: браузер не открылся: {exc}", file=sys.stderr)
         finally:

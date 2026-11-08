@@ -18,9 +18,10 @@ autostart, /etc/xdg/autostart/xgw-tray.desktop ставит установка, 
 `--replace`: сторож прошлого сеанса может пережить выход и держать блокировку со старым
 окружением сеанса (XAUTHORITY), а его значок в новый сеанс уже не встанет.
 
-Панель из ярлыка «XGW» и из значка открывает open_panel: вкладку XGW, которая на экране,
-KWin выводит вперёд — без новой вкладки (заказчик: «можно сделать незаметным открытие второй
-вкладки?»); не на экране или не KDE — xdg-open, как раньше.
+Ярлык «XGW» и значок открывают окно XGW (open_window, п. 344); окно не запустилось — браузерную
+панель. Её открывает open_panel: вкладку XGW, которая на экране, KWin выводит вперёд — без новой
+вкладки (заказчик: «можно сделать незаметным открытие второй вкладки?»); не на экране или не
+KDE — xdg-open, как раньше.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -192,7 +194,8 @@ def _mbps(value: float) -> str:
 
 # Пункты меню: (действие, подпись). Порядок — как в ТЗ R9.
 MENU = (
-    ("open", "Открыть панель"),
+    ("open", "Открыть XGW"),
+    ("browser", "Открыть в браузере"),
     ("cores/check", "Проверить выпуски ядер"),
     ("speed", "Замерить скорость сейчас"),
     ("about", "О программе"),
@@ -397,7 +400,7 @@ def other_instances(
         words = [arg.decode("utf-8", "replace") for arg in raw.split(b"\0") if arg]
         if not words or "tray" not in words or Path(words[0]).name == "systemd-run":
             continue
-        if "--open" in words:  # ярлык открывает панель (open_main) — это не значок
+        if "--open" in words or "--window" in words:  # ярлык (open_main) — это не значок
             continue
         if "xgw" in words or any(Path(word).name == "xgw" for word in words):
             found.append(("--run" in words, int(entry.name)))
@@ -586,15 +589,57 @@ def open_panel(
     return "opened"
 
 
-def open_main(url: str) -> int:
-    """`xgw tray --open <адрес>` — ярлык «XGW» в меню и на панели задач. Без файла значка
-    (~/.config/xgw/tray.json) — просто xdg-open."""
+WINDOW_WAIT = 3.0  # столько ждать кода выхода: окно не запустилось (нет PyQt6, нет графики)
+WINDOW_LOCK = "xgw-window.lock"
+
+
+def start_window() -> subprocess.Popen:
+    """`xgw gui` своей сессией: окно переживает значок и ярлык, запустивший его."""
+    return subprocess.Popen(
+        [Paths.from_env().launcher.as_posix(), "gui"], stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def open_window(
+    url: str, client: Client | None = None, *,
+    start: Callable[[], subprocess.Popen] = start_window, wait: float = WINDOW_WAIT,
+) -> str:
+    """Окно XGW; уже открытое выводит вперёд сам `xgw gui`. "window" — окно на экране,
+    "starting" — его уже запускает другой щелчок (второго окна не будет), "browser" — окно
+    не запустилось, открыта браузерная панель."""
+    claim = take_lock(lock_path().with_name(WINDOW_LOCK))
+    if claim is None:
+        return "starting"
+    try:
+        try:
+            process = start()
+            if process.wait(timeout=wait) == 0:
+                return "window"
+        except subprocess.TimeoutExpired:
+            threading.Thread(target=process.wait, daemon=True).start()  # не оставлять зомби
+            return "window"
+        except OSError as exc:
+            print(f"XGW: окно не запустилось: {exc}", file=sys.stderr)
+    finally:
+        claim.close()
+    open_panel(url, client, stamp=launch_stamp())
+    return "browser"
+
+
+def open_main(url: str, *, window: bool = False) -> int:
+    """`xgw tray --open <адрес>` — браузерная панель, `--window` — окно XGW (основное действие
+    ярлыка «XGW» в меню и на панели задач). Без файла значка (~/.config/xgw/tray.json) — просто
+    xdg-open."""
     client = None
     with contextlib.suppress(TrayError):
         port, token = read_user_file(Path.home())
         client = Client(port, token, timeout=2.0)
     try:
-        open_panel(url, client, stamp=launch_stamp())
+        if window:
+            open_window(url, client)
+        else:
+            open_panel(url, client, stamp=launch_stamp())
     except OSError as exc:
         print(f"XGW: браузер не открылся: {exc}", file=sys.stderr)
         return 1

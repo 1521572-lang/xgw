@@ -87,15 +87,20 @@ Version=1.0
 Name=XGW
 GenericName=VPN gateway
 GenericName[ru]=VPN-шлюз
-Comment=Control panel of the XGW gateway
-Comment[ru]=Панель управления шлюзом XGW
-Exec={launcher} tray --open {url}
+Comment=Control window of the XGW gateway
+Comment[ru]=Окно управления шлюзом XGW
+Exec={launcher} tray --window {url}
 Icon={icon}
 Terminal=false
 Categories=Network;
 Keywords=vpn;xray;proxy;
 StartupNotify=false
-Actions=login;
+Actions=browser;login;
+
+[Desktop Action browser]
+Name=Open in browser
+Name[ru]=Открыть в браузере
+Exec={launcher} tray --open {url}
 
 [Desktop Action login]
 Name=Sign in again

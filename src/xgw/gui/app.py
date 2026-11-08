@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([sys.argv[0], *(argv or [])])
     app.setApplicationName("XGW")
     app.setApplicationDisplayName("XGW")
-    QGuiApplication.setDesktopFileName("xgw")
+    QGuiApplication.setDesktopFileName("xgw-panel")  # ярлык «XGW»: его значок на панели задач
     single = SingleInstance(server_name(), code_stamp())
     if single.notify_running():
         return 0
