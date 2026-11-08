@@ -1,6 +1,12 @@
 """Адрес проверки связности NetworkManager для исключения в барьере (net/conncheck.py)."""
 
 import json
+import logging
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
 
 from xgw.net import cmd, conncheck
 from xgw.paths import Paths
@@ -49,9 +55,6 @@ def test_daemon_writes_file_and_reloads_rules_in_one_step(tmp_path):
     """Отчёт 7949034: файл адресов, записанный фоном, делал барьер «не загруженным» до
     следующего шага, и health сразу после установки откатил её. Теперь файл и загрузка правил —
     в основном потоке и вместе; без изменений правила не трогаются."""
-    import logging
-    from types import SimpleNamespace
-
     from xgw.daemon import Daemon
 
     paths = Paths(tmp_path)
@@ -68,3 +71,76 @@ def test_daemon_writes_file_and_reloads_rules_in_one_step(tmp_path):
     Daemon._conncheck_apply(fake, None)
     assert ups == [1, 1] and conncheck.read(paths) == ((), 80)
     assert conncheck.lookup(lambda host: [], run=_run()) is False
+
+
+# --- п. 347, A-09: один поток и только свежий итог -------------------------------------------
+
+
+def _scheduler(monkeypatch, lookup):
+    from xgw import daemon as daemon_module
+    from xgw.daemon import Daemon
+
+    monkeypatch.setattr(daemon_module.conncheck, "lookup", lookup)
+    applied: list = []
+    fake = SimpleNamespace(
+        _conncheck_lock=threading.Lock(), _conncheck_busy=False, _conncheck_generation=0,
+        _conncheck_found=None, next_conncheck=0.0, capture=object(), log=logging.getLogger("t"),
+        cfg=SimpleNamespace(dns=SimpleNamespace(resolvers=[])), mark=1, _stop=threading.Event(),
+        _conncheck_apply=applied.append,
+    )
+    fake._conncheck_lookup = lambda generation: Daemon._conncheck_lookup(fake, generation)
+    fake.step = lambda now: Daemon._conncheck_step(fake, now)
+    fake.applied = applied
+    return fake
+
+
+def _wait(check):
+    deadline = time.monotonic() + 5
+    while not check() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert check()
+
+
+def test_slow_lookup_is_not_doubled(monkeypatch):
+    gate, started = threading.Event(), []
+
+    def lookup(_resolve):
+        started.append(1)
+        gate.wait(5)
+        return {"host": "a"}
+
+    fake = _scheduler(monkeypatch, lookup)
+    fake.step(10_000.0)
+    _wait(lambda: started)
+    for now in (20_000.0, 30_000.0):
+        fake.step(now)
+    assert len(started) == 1 and fake._conncheck_busy
+    gate.set()
+    _wait(lambda: fake._conncheck_found is not None and not fake._conncheck_busy)
+    fake.step(10_000.0)
+    assert fake.applied == [{"host": "a"}]
+
+
+def test_old_generation_is_not_published(monkeypatch):
+    fake = _scheduler(monkeypatch, lambda _resolve: {"host": "old"})
+    fake._conncheck_generation = 2
+    fake._conncheck_lookup(1)
+    assert fake._conncheck_found is None
+    fake._conncheck_generation = 1
+    fake._conncheck_lookup(1)
+    assert fake._conncheck_found == ({"host": "old"},)
+
+
+@pytest.mark.parametrize("failure", ["error", "stop"])
+def test_failed_or_stopped_lookup_releases_the_guard(monkeypatch, failure):
+    def lookup(_resolve):
+        if failure == "error":
+            raise RuntimeError("сбой")
+        return {"host": "a"}
+
+    fake = _scheduler(monkeypatch, lookup)
+    if failure == "stop":
+        fake._stop.set()
+    fake._conncheck_busy, fake._conncheck_generation = True, 1
+    fake._conncheck_lookup(1)
+    assert fake._conncheck_busy is False and fake._conncheck_found is None

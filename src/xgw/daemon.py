@@ -783,6 +783,10 @@ class Daemon:
         self.next_conncheck = 0.0  # адрес проверки связности NetworkManager (net/conncheck.py)
         # Итог фонового conncheck.lookup: (найдено,) — применить в основном потоке.
         self._conncheck_found: tuple | None = None
+        # Один поток за раз; результат старого поколения не публикуется (п. 347, A-09).
+        self._conncheck_lock = threading.Lock()
+        self._conncheck_busy = False
+        self._conncheck_generation = 0
         self.next_all_dead = 0.0
         self.next_rescan = 0.0
         # Рейтинг (rating.py): итоги проверок по часам (отпечаток → {час: [удачи, сбои]}),
@@ -1700,13 +1704,7 @@ class Daemon:
                 self.e2e_streak = 0 if e2e_ok else self.e2e_streak + 1
         self._downlinks = downlinks
 
-        found, self._conncheck_found = self._conncheck_found, None
-        if found is not None:
-            self._conncheck_apply(found[0])
-        if now >= self.next_conncheck and self.capture is not None:
-            self.next_conncheck = now + conncheck.REFRESH
-            threading.Thread(target=self._conncheck_lookup, name="xgw-conncheck",
-                             daemon=True).start()
+        self._conncheck_step(now)
 
         self.leak_fresh = False
         if not self.capture_active():
@@ -1832,7 +1830,29 @@ class Daemon:
         )
         return tag
 
-    def _conncheck_lookup(self) -> None:
+    def _conncheck_step(self, now: float) -> None:
+        """Забрать готовый итог и, если пора и прежний поток закончил, запустить новый."""
+        generation = None
+        with self._conncheck_lock:
+            found, self._conncheck_found = self._conncheck_found, None
+            if (now >= self.next_conncheck and self.capture is not None
+                    and not self._conncheck_busy):
+                self.next_conncheck = now + conncheck.REFRESH
+                self._conncheck_busy = True
+                self._conncheck_generation += 1
+                generation = self._conncheck_generation
+        if found is not None:
+            self._conncheck_apply(found[0])
+        if generation is not None:
+            try:
+                threading.Thread(target=self._conncheck_lookup, args=(generation,),
+                                 name="xgw-conncheck", daemon=True).start()
+            except RuntimeError as exc:  # потоков нет — не повод застрять на «занято»
+                self.log.error("проверка связности не запущена: %s", exc)
+                with self._conncheck_lock:
+                    self._conncheck_busy = False
+
+    def _conncheck_lookup(self, generation: int) -> None:
         """Фоном: адрес проверки связности NetworkManager (busctl, свои резолверы мимо
         перехвата). Итог применяет основной поток (_conncheck_apply)."""
         def resolve(host: str) -> list[str]:
@@ -1840,12 +1860,16 @@ class Daemon:
                                         cancel=self._stop, public_only=True)
 
         try:
-            found = conncheck.lookup(resolve)
+            found = conncheck.lookup(resolve)  # DNS и busctl — вне блокировки
+            with self._conncheck_lock:
+                if (found is not False and generation == self._conncheck_generation
+                        and not self._stop.is_set()):
+                    self._conncheck_found = (found,)
         except Exception as exc:  # значок — не повод мешать шагу демона
             self.log.debug("адрес проверки связности не узнан: %s", exc)
-            return
-        if found is not False:
-            self._conncheck_found = (found,)
+        finally:
+            with self._conncheck_lock:
+                self._conncheck_busy = False
 
     def _conncheck_apply(self, found: dict | None) -> None:
         """/run/xgw/conncheck.json и сразу правила: барьер пропускает проверку связности, и
