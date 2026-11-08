@@ -2265,9 +2265,16 @@ class Daemon:
         else:
             try:
                 self.reapply_capture()
+                if self.capture is not None and self.capture.loaded() is not True:
+                    raise RuntimeError("загрузка правил не подтверждена")
             except Exception as exc:  # сбой сети не должен ронять шаг watchdog
                 self.log.error("правила перехвата не переприменены: %s", exc)
-            text = f"выход в {home} мимо Xray при включённом перехвате — правила загружены заново"
+                # Текст без причины: он сравнивается с прежним, а причина есть в журнале.
+                text = (f"выход в {home} мимо Xray при включённом перехвате — устранение не "
+                        "подтверждено: правила перехвата не загрузились")
+            else:
+                text = (f"выход в {home} мимо Xray при включённом перехвате — правила "
+                        "загружены заново и проверены")
         if text != self._leak_note:
             self._leak_note = text
             self.notifier.event("leak", text, notify=True)

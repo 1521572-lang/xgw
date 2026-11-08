@@ -3107,3 +3107,33 @@ def test_generation_prepares_in_background_and_only_fresh_result_switches(
         gate.set()
         if daemon._build is not None:
             daemon._build.done.wait(5)
+
+
+def test_leak_reports_success_only_after_the_rules_are_confirmed(guarded, monkeypatch):
+    """п. 347, A-06: при сбое загрузки или без подтверждения события об устранении нет, а
+    сообщение о сбое — одно на смену состояния."""
+    daemon, capture = guarded
+    monkeypatch.setattr(daemon, "_exit_via_xray", lambda: "")
+
+    def leaks():
+        return [event for event in daemon.events() if event.startswith("leak:")]
+
+    capture.fail = True
+    daemon._handle_leak()
+    daemon._handle_leak()
+    assert len(leaks()) == 1 and "не подтверждено" in leaks()[0]
+    assert "загружены заново" not in leaks()[0]
+    assert capture.actions() == ["up", "up"]
+
+    capture.fail = False
+    capture.loaded = lambda: False  # загрузка без ошибки, а правил нет
+    daemon._handle_leak()
+    assert len(leaks()) == 1  # то же состояние
+
+    capture.loaded = lambda: None  # узнать нельзя
+    daemon._handle_leak()
+    assert len(leaks()) == 1
+
+    capture.loaded = lambda: True
+    daemon._handle_leak()
+    assert len(leaks()) == 2 and "загружены заново и проверены" in leaks()[0]  # новые — первыми
