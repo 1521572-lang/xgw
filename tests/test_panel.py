@@ -613,6 +613,34 @@ def test_config_subscription_is_removed_without_rewriting_and_restored(rig, user
     assert not user.act("subscription/restore", {"name": "main"})["ok"]
 
 
+def test_happ_preset_keeps_one_gateway_id_and_other_headers(rig, user):
+    etc = rig.paths.root / "etc"
+    etc.mkdir(parents=True, exist_ok=True)
+    (etc / "machine-id").write_text("abc123def456" + chr(10), encoding="ascii")
+    (etc / "os-release").write_text('NAME="Ubuntu"' + chr(10) + 'VERSION_ID="24.04"' + chr(10),
+                                    encoding="utf-8")
+    assert user.act("add", {"text": "https://new.example.org/sub/S3", "preset": "happ"})["ok"]
+    saved = rig.saved()["subscriptions"][0]
+    hwid = saved["headers"]["x-hwid"]
+    assert saved["user_agent"].startswith("Happ/") and len(hwid) == 16
+    assert "abc123def456" not in hwid  # machine-id наружу не уходит
+    assert saved["headers"]["x-device-os"] == "Linux" and saved["headers"]["x-ver-os"] == "24.04"
+    assert user.act("subscription/edit", {
+        "name": "new.example.org", "user_agent": "другой",
+        "headers": {"X-HWID": "чужой", "Authorization": "свой"}, "preset": "happ",
+    })["ok"]
+    again = rig.saved()["subscriptions"][0]
+    assert again["user_agent"].startswith("Happ/") and again["headers"]["x-hwid"] == hwid
+    assert "X-HWID" not in again["headers"] and again["headers"]["Authorization"] == "свой"
+
+
+def test_happ_preset_without_machine_id_adds_nothing(rig, user):
+    (rig.paths.root / "etc" / "machine-id").unlink(missing_ok=True)
+    result = user.act("add", {"text": "https://new.example.org/sub/S3", "preset": "happ"})
+    assert not result["ok"] and "machine-id" in result["text"]
+    assert not rig.store_path.exists()
+
+
 def test_subscription_user_agent_and_headers_are_editable(rig, user):
     url = "https://new.example.org/sub/ANOTHER-S3CR3T"
     user.act("add", {"text": url})

@@ -17,6 +17,7 @@ import contextlib
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -682,6 +683,11 @@ class ServersPage(QWidget):
             self.run("freepool/pin", {"id": "" if item.pinned else item.id}, key="freepool/pin")
 
 
+HAPP_TIP = ("Для поставщиков, которые незнакомой программе отдают заглушку. Шлюз запросит подписку "
+            "с заголовками Happ и своим постоянным идентификатором; у поставщика с лимитом "
+            "устройств шлюз займёт одно место.")
+
+
 class EditDialog(QDialog):
     """«Изменить подписку»: User-Agent и заголовки, как в браузерной панели."""
 
@@ -697,13 +703,22 @@ class EditDialog(QDialog):
         self.headers = QPlainTextEdit("\n".join(f"{k}: {v}" for k, v in sub.headers.items()))
         self.headers.setFixedHeight(90)
         box.addWidget(self.headers)
+        self.preset = False  # нажата «Запрашивать как Happ»: значения подставит шлюз
+        happ = QPushButton("Запрашивать как Happ")
+        happ.setToolTip(HAPP_TIP)
+        happ.clicked.connect(self._happ)
+        box.addWidget(happ)
         buttons = QDialogButtonBox()
         buttons.addButton("Сохранить", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         box.addWidget(buttons)
-        self.resize(520, 260)
+        self.resize(520, 300)
+
+    def _happ(self) -> None:
+        self.preset = True
+        self.accept()
 
 
 class SubscriptionsPage(QWidget):
@@ -744,6 +759,16 @@ class SubscriptionsPage(QWidget):
         self.add = _button("Добавить", self._add, "primary")
         line.addWidget(self.add)
         card.addLayout(line)
+        options = QHBoxLayout()
+        self.agent = QLineEdit()
+        self.agent.setPlaceholderText("User-Agent (необязательно)")
+        self.agent.setAccessibleName("User-Agent подписки")
+        options.addWidget(self.agent, 1)
+        self.happ = QCheckBox("Как Happ")
+        self.happ.setToolTip(HAPP_TIP)
+        self.happ.toggled.connect(self.agent.setDisabled)
+        options.addWidget(self.happ)
+        card.addLayout(options)
         box.addWidget(frame)
 
         self.subs_box = QVBoxLayout()
@@ -897,7 +922,12 @@ class SubscriptionsPage(QWidget):
         if not text:
             self.main.statusBar().showMessage("Вставьте адрес подписки или ссылку сервера", 8000)
             return
-        self.main.client.act("add", {"text": text, "name": self.name.text().strip()}, key="add")
+        body = {"text": text, "name": self.name.text().strip()}
+        if self.happ.isChecked():
+            body["preset"] = "happ"
+        elif self.agent.text().strip():
+            body["user_agent"] = self.agent.text().strip()
+        self.main.client.act("add", body, key="add")
 
     def action_done(self, key: str, ok: bool) -> None:
         """Добавлено — поле очищается (адрес подписки — секрет, держать его незачем); не вышло —
@@ -905,14 +935,19 @@ class SubscriptionsPage(QWidget):
         if key == "add" and ok:
             self.text.clear()
             self.name.clear()
+            self.agent.clear()
+            self.happ.setChecked(False)
 
     def _edit(self, sub: listing.SubItem) -> None:
         dialog = EditDialog(self, sub)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.main.client.act("subscription/edit", {
+            body = {
                 "name": sub.name, "user_agent": dialog.agent.text().strip(),
                 "headers": listing.parse_headers(dialog.headers.toPlainText()),
-            }, key="subscription/edit")
+            }
+            if dialog.preset:
+                body["preset"] = "happ"
+            self.main.client.act("subscription/edit", body, key="subscription/edit")
 
     def _remove(self, sub: listing.SubItem) -> None:
         text = "Её серверы пропадут из списка при следующем обновлении."

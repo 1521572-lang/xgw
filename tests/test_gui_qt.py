@@ -335,3 +335,22 @@ def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qap
     assert done[-1][1] is True and page.text.toPlainText() == ""
     client.stop()
     win.close()
+
+
+def test_subscription_form_sends_user_agent_or_the_happ_preset(qapp, demo, tmp_path):
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    page = win.subscriptions
+    sent = []
+    client.act = lambda name, body, key=None: sent.append((name, body))
+    page.text.setPlainText("https://example.org/s")
+    page.agent.setText("Clash")
+    page._add()
+    page.happ.setChecked(True)
+    assert not page.agent.isEnabled()
+    page._add()
+    assert sent[0][1]["user_agent"] == "Clash" and "preset" not in sent[0][1]
+    assert sent[1][1]["preset"] == "happ" and "user_agent" not in sent[1][1]
+    page.action_done("add", True)
+    assert page.agent.text() == "" and not page.happ.isChecked() and page.agent.isEnabled()
+    win.close()

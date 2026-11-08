@@ -1781,6 +1781,8 @@ class Panel:
                 return actions.Outcome(2, "user_agent должен быть строкой")
             if headers is not None and not isinstance(headers, dict):
                 return actions.Outcome(2, "headers должен быть объектом")
+            if body.get("preset") == "happ":
+                user_agent, headers = managed.happ_preset(self.paths.root, headers)
             managed.update_subscription(
                 store_path, sub,
                 user_agent=user_agent if user_agent is not None else None,
@@ -1896,6 +1898,8 @@ class Panel:
         if len(lines) == 1 and lines[0].lower().startswith(("http://", "https://")):
             user_agent = body.get("user_agent") if isinstance(body.get("user_agent"), str) else ""
             headers = body.get("headers") if isinstance(body.get("headers"), dict) else {}
+            if body.get("preset") == "happ":
+                user_agent, headers = managed.happ_preset(self.paths.root, headers)
             added = managed.add_subscription(
                 store_path, lines[0], name, taken=self._config_names(),
                 user_agent=user_agent, headers=headers,

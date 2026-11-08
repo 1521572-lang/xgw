@@ -712,6 +712,45 @@ def _clean_headers(headers: dict[str, str]) -> dict[str, str]:
     return result
 
 
+# Набор «как Happ» (п. 345). Имена заголовков — стандарт устройств Happ и Remnawave; версия в
+# User-Agent — из открытых примеров, у самого Happ она меняется: поле можно поправить вручную.
+HAPP_AGENT = "Happ/3.13.0"
+HAPP_HEADERS = ("x-hwid", "x-device-os", "x-ver-os", "x-device-model")
+
+
+def gateway_hwid(root: Path) -> str:
+    """Постоянный идентификатор устройства-шлюза: тот же после переустановки XGW, а сам
+    machine-id наружу не уходит."""
+    try:
+        machine = (root / "etc" / "machine-id").read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        machine = ""
+    if not machine:
+        raise ManagedError("нет /etc/machine-id — идентификатор шлюза взять неоткуда")
+    return hashlib.sha256(f"xgw-hwid:{machine}".encode()).hexdigest()[:16]
+
+
+def _os_version(root: Path) -> str:
+    try:
+        lines = (root / "etc" / "os-release").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    found = next((line[11:] for line in lines if line.startswith("VERSION_ID=")), "")
+    return found.strip().strip('"')[:32]
+
+
+def happ_preset(root: Path, headers: object = None) -> tuple[str, dict[str, str]]:
+    """User-Agent и заголовки «как Happ» со своим HWID шлюза. Другие заголовки подписки
+    (например, авторизация) остаются; прежние значения этого набора заменяются."""
+    kept = {key: value for key, value in (headers if isinstance(headers, dict) else {}).items()
+            if isinstance(key, str) and key.strip().lower() not in HAPP_HEADERS}
+    preset = {"x-hwid": gateway_hwid(root), "x-device-os": "Linux", "x-device-model": "XGW"}
+    version = _os_version(root)
+    if version:
+        preset["x-ver-os"] = version
+    return HAPP_AGENT, {**kept, **preset}
+
+
 def _free_name(wanted: str, taken: set[str]) -> str:
     if wanted not in taken:
         return wanted
