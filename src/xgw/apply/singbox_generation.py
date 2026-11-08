@@ -218,6 +218,12 @@ def bridge_check(core, config, routed, rank=None):
         place = rank.get(match.group(1), UNKNOWN_RANK) if match else UNKNOWN_RANK
         candidates.append((place, index, inbound))
     candidates.sort(key=lambda item: (item[0], item[1]))
+    if not candidates:
+        # Xray не ведёт трафик ни через один мост: все серверы на профилях Xray, а sing-box
+        # держит заготовленные варианты для лестницы. Проверять нечего и рисковать нечем —
+        # процесс уже ответил (_wait_ready). Раньше это был отказ «0 из 0», и вместе с ним
+        # отклонялась вся сборка: новые запасные не применялись (отчёт bridge-order, п. 339).
+        return BridgeCheck(True, "мостов в работе нет")
     deadline = time.monotonic() + BRIDGE_BUDGET
     kinds: dict[str, int] = {}
     tried = 0

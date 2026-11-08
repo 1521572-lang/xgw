@@ -1,6 +1,7 @@
 """Ровно путь G1: без VM-сети и запуска процессов, с настоящим API-планировщиком."""
 
 import copy
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +27,10 @@ REAL_STOPPED = p.stopped
 def gateway(tmp_path, monkeypatch):
     paths, cfg = Paths(tmp_path), Config()
     paths.singbox_config_dir.mkdir(parents=True)
+    if os.geteuid() != 0:
+        # Тесты от владельца без sudo (ТЗ на машине, отчёт bridge-order): chown файла
+        # поколения на root запрещён — владелец файлов здесь не проверяется.
+        monkeypatch.setattr(os, "chown", lambda *args, **kwargs: None)
     alive = {p.LEGACY}
 
     class Service:
@@ -288,6 +293,23 @@ def test_bridges_of_working_servers_are_checked_first(gateway, monkeypatch):
     # Без порядка — как в конфиге; неизвестный (0.5) раньше частых сбоев (0.9).
     REAL_BRIDGE_CHECK(w.core, config, xray, {"aabb1122": 0.9})
     assert [port for port, _cap in captured] == [22002, 22003]
+
+
+def test_no_bridge_in_use_is_not_a_refusal(gateway, monkeypatch):
+    """Отчёт bridge-order: все серверы на Xray, sing-box держит заготовленные варианты —
+    «мостов проверено 0 из 0» отклоняло всю сборку. Теперь поколение меняется."""
+    w = gateway
+    config, _xray = _three_bridges(w)
+    xray = copy.deepcopy(w.xray)
+    xray["outbounds"] = [{"protocol": "freedom", "tag": "direct"}]
+    atomic_write_json(w.paths.xray_config_file, xray)  # и действующий Xray без мостов
+    monkeypatch.setattr(g, "bridge_check", REAL_BRIDGE_CHECK)
+    monkeypatch.setattr(g.checks, "http_get_via_proxy",
+                        lambda *a, **kw: pytest.fail("мостов в работе нет — запросов нет"))
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {})
+    assert checked and checked.summary == "мостов в работе нет"
+    prepared = g.prepare(w.core, config, xray, rank={})
+    assert g.finish(w.core, w.applier, prepared).mode in ("api", "unchanged")
 
 
 def test_failed_bridges_are_counted_in_the_refusal(gateway, monkeypatch):

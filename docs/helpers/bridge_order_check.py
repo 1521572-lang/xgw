@@ -1,5 +1,6 @@
-"""Проверка нового поколения sing-box: живые мосты первыми (п. 338) — подготовка, порядок
-мостов без сети, установка с возвратом, наблюдение за сменой поколения.
+"""Проверка нового поколения sing-box: живые мосты первыми (п. 338), без мостов в работе — не
+отказ (п. 339) — подготовка, порядок мостов без сети, установка с возвратом, наблюдение за
+сменой поколения (журнал — с начала установки: первая пересборка идёт сразу после неё).
 
 Режимы: prepare BASE | health | logic | deploy BASE | observe МИНУТ. Вывод — только числа,
 слова состояний и виды отказов: без адресов, доменов, имён серверов, тегов и SNI.
@@ -16,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 TREE = Path(__file__).resolve().parents[2]
-LOCK = Path("/run/xgw-bridge-install")  # каталоги прошлых проверок не мешают
+LOCK = Path("/run/xgw-bridge2-install")  # каталоги прошлых проверок не мешают
 CONFIG = Path("/etc/xgw/config.toml")
 RECOVER_AFTER = 45.0  # приёмка после установки не дольше — затем сразу возврат (предел 60 с)
 SWITCHED = "поколение sing-box сменено"
@@ -109,11 +110,13 @@ def prepare(base):
 
 def deploy(base):
     LOCK.mkdir(mode=0o700)  # второй запуск при живом каталоге не начнёт вторую установку
+    (LOCK / "started").write_text(f"{time.time():.0f}\n")  # начало журнала для observe
     try:
         ready = match(base) and check_health()
     except (OSError, subprocess.SubprocessError):
         ready = False
     if not ready:
+        (LOCK / "started").unlink()
         LOCK.rmdir()  # ничего не начато — каталог не оставляем
         print("STOP baseline", flush=True)
         raise ValueError("baseline")
@@ -183,6 +186,9 @@ def logic():
     refused = g.bridge_check(core, config, routed, {})
     print(f"INFO refusal={refused.summary}", flush=True)
     require(not refused and SUMMARY.fullmatch(refused.summary) is not None, "refusal_summary")
+    idle = g.bridge_check(core, config, {"outbounds": [{"protocol": "freedom"}]}, {})
+    print(f"INFO no_bridge={idle.summary}", flush=True)
+    require(bool(idle) and idle.summary == "мостов в работе нет", "no_bridge_in_use")
     print("OK logic", flush=True)
 
 
@@ -197,7 +203,14 @@ def observe(minutes):
             seen.append((members, spares))
             states.add(str(state))
         time.sleep(15)
-    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(begin))
+    # С начала установки (каталог LOCK создан до неё): первая пересборка идёт сразу после
+    # перезапуска демона, раньше окна (отчёт bridge-order: отказ за секунды до окна не попал).
+    try:
+        start, origin = float((LOCK / "started").read_text()), "install"
+    except (OSError, ValueError):
+        start, origin = begin, "window"
+    print("INFO journal_from=" + origin, flush=True)
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(min(start, begin)))
     text = journal(since)
     switched, refused, found = tally(text)
     errors = run(["journalctl", "-u", "xgw", "-p", "err", "--since", since, "-o", "cat",
