@@ -1,0 +1,12 @@
+# ThinkCentre: поле User-Agent и набор «как Happ» в окне — 2026-11-08
+
+- Дата; CODE 4e75963; сумма помощника OK (703730a7…); три файла — да (`src/xgw/gui/pages.py`, `src/xgw/managed.py`, `src/xgw/watch/panel.py`).
+- Подготовка: helper_rc=0; installed_is_base OK (45f3eae); on/HTTPS до — OK; diag до (OK/WARN/FAIL): 32/1/0 (прежнее некритичное WARN проверочных хостов); state=HEALTHY, members=5, spares=67, subscriptions=2; пул observe.
+- Тесты: первая строка — `2 passed, 59 deselected` (test_panel -k happ); полные прогоны пяти файлов (offscreen): new — rc=1 (1 failed, 123 passed), base — rc=1 (1 failed, 120 passed; разница 3 — новые тесты); **«новые падения:» — пусто** ✓. Имя упавшего на прежнем коде: `tests/test_panel.py::test_free_pool_card_switches_observation`.
+- Согласие (время приватно): «Разрешаю установку». deploy helper_rc=0; install_rc=0 at=21:07:06; возврат не нужен.
+- Действие владельца: **отказ от действия мышью** («Не буду») — набор «Как Happ» не включался; по ТЗ наблюдение запущено всё равно.
+- Наблюдение 15 мин: helper_rc=4 (NOT_RUN happ); from=install; состояния с числом замеров: DEGRADED — 19, HEALTHY — 21; status_age_max_s=22 (без задержек); OK fields; строки подписок дословно: `INFO sub 1 state=fresh set_age_s=996 reason=none happ=no hwid=no`, `INFO sub 2 state=fresh set_age_s=995 reason=none happ=yes hwid=no`; OK age_consistent; urls_checked=2; **OK no_urls_in_status**, **OK no_hwid_in_status**; `INFO happ_subs=0 same_hwid=True`; config_unchanged OK; on/HTTPS OK.
+- Примечание к выводу: набор Happ не включён (владелец отказался; в panel.json флага нет — проверено приватно), обе подписки fresh с reason=none; `happ=yes` у второй подписки — признак наличия собственного User-Agent (введён ранее вручную), не пресета; семантику строки можно уточнить у разработчика.
+- Конечное: on/HTTPS OK (health rc 0); diag после (OK/WARN/FAIL): 32/1/0 — новых FAIL нет; режим пула без изменений (да: observe).
+- Границы: поставщик набор не проверял (владелец отказался от действия) — принятие набора остаётся открытым вопросом; обход блокировок не проверялся.
+- Итог: **NOT_RUN happ** (владелец отказался от действия мышью), **PASS по регрессии** — поля статуса работают, обе подписки fresh, утечек URL и идентификатора нет, отказов нет. Первый непройденный шаг — отсутствует. Оставлено на машине: CODE 4e75963; каталог /run/xgw-happ-install до перезагрузки; состояние HEALTHY, VPN включён.
