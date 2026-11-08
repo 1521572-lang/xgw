@@ -1605,7 +1605,12 @@ class Daemon:
                 return state
             if state in (State.DEGRADED, State.ALL_DEAD, State.RESERVE) or (
                 state is State.HEALTHY and self.bad_members
-            ) or (state is State.LEAK and self._home_members(view)):
+            ) or (state is State.LEAK and self._home_members(view)) or (
+                # LEAK снялся, потому что трафик ушёл на другой сервер: выходящий в домашнюю
+                # страну остаётся среди участников и меняется, как только появится замена.
+                state is State.HEALTHY and self._home_members(view)
+                and not self._manual_active()
+            ):
                 changed = self._rotate(view, observatory or {}, state, now)
             if not changed:
                 changed = self._rebalance(view, observatory or {}, state)
@@ -3367,9 +3372,10 @@ class Daemon:
         )
         if rotation is None:
             overdue = cfg.filters.rotate_after_min * 60.0
-            waiting = bool(set(self.bad_members) - held or home) or any(
-                self.wall() - since >= overdue for since in dead_since.values()
-            )
+            # При HEALTHY внеочередных сканов ради такой замены нет: она ждёт обычного круга.
+            waiting = bool(
+                set(self.bad_members) - held or (home and state is not State.HEALTHY)
+            ) or any(self.wall() - since >= overdue for since in dead_since.values())
             if waiting and pairs and not self.scan_queue and now >= self.next_rescan:
                 self._queue_scan(view, now)  # менять пора, а свежих сканов нет
             return False

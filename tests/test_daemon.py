@@ -1834,6 +1834,70 @@ def test_server_exiting_at_home_is_replaced_and_not_taken_back(tmp_path, monkeyp
         daemon.store.close()
 
 
+def test_home_exit_member_is_replaced_after_leak_clears(tmp_path, monkeypatch):
+    """Замены не нашлось, LEAK снялся (трафик ушёл на другой сервер), а выходящий в RU сервер
+    остался участником: его меняют с обычным кругом сканов, без внеочередных, и не
+    трогают состав при ручном выборе."""
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.dns.bootstrap = []
+    cfg.filters.exclude_regex = ""
+    cfg.filters.max_members = 2
+    daemon = Harness(cfg, paths, capture_active=lambda: True, reapply_capture=lambda: None)
+
+    def round_of_scans():
+        daemon.next_scan = daemon.t
+        for _ in range(60):
+            daemon.t += 20
+            daemon.tick()
+            if not daemon.scan_queue:
+                break
+        daemon.next_scan = daemon.t + 86400
+
+    try:
+        _started(daemon)
+        daemon.next_refresh = daemon.t + 86400
+        spares = {info.tag for info in daemon.view() if info.role == "spare"}
+        bad = ScanResult("", "CONNECT_FAIL", 0, 0.3, "обрыв", "io", 0)
+        daemon.failures = {
+            info.probe_tag: bad for info in daemon.view() if info.role == "spare"
+        }
+        round_of_scans()
+
+        leaking = daemon.tags("proxy")[0]
+        daemon.api.state = BalancerInfo(override=None, selects=(leaking,))
+        daemon.location = daemon.via_location = "RU"
+        daemon.t = daemon.next_leak + 1
+        assert daemon.tick() is State.LEAK and leaking in daemon.tags("proxy")
+        assert daemon.home_exits
+
+        daemon.location = daemon.via_location = "NL"
+        daemon.api.state = BalancerInfo(override=None, selects=(daemon.tags("proxy")[1],))
+        daemon.scan_queue.clear()
+        daemon.t = daemon.next_leak + 1
+        assert daemon.tick() is State.HEALTHY and leaking in daemon.tags("proxy")
+        daemon.scanned.clear()
+        for _ in range(6):
+            daemon.t += 61
+            assert daemon.tick() is State.HEALTHY
+        assert not spares & set(daemon.scanned)  # внеочередных сканов запасных нет
+
+        daemon.failures = {}
+        monkeypatch.setattr(daemon, "_manual_active", lambda: True)
+        round_of_scans()
+        assert leaking in daemon.tags("proxy")  # при ручном выборе состав не меняется
+
+        monkeypatch.setattr(daemon, "_manual_active", lambda: False)
+        daemon.t += 20
+        assert daemon.tick() is State.HEALTHY and leaking not in daemon.tags("proxy")
+        rotation = [event for event in daemon.events() if event.startswith("rotation:")]
+        assert len(rotation) == 1 and f"сами выходят в RU: {leaking}" in rotation[0]
+    finally:
+        daemon.store.close()
+
+
 def test_probe_url_check_waits_for_the_threshold_while_the_core_sees_members_alive(daemon):
     """Ядро ещё считает участников живыми (его пробы реже): один сбой сквозной
     проверки — не повод, ждём fail_threshold шагов подряд."""
