@@ -19,7 +19,7 @@ build → Applier.apply. Состав участников хранится в �
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import Config
 from ..generator.builder import NodeInfo
@@ -33,11 +33,39 @@ SAME_COUNTRY = 0.7
 # rotate_after_min. Таймаут сюда не входит: он бывает разовым, и такой узел идёт
 # обычным путём — через alive = false от самого Xray.
 REPLACE_NOW_VERDICTS = ("CONNECT_FAIL", "FROZEN", "BODY_RESET")
+# Разные пути (п. 341): среди годных замен одной группы (страна и подписка), чей рейтинг не ниже
+# этой доли лучшего в группе, первой берётся та, что отличается от отказавшего участника адресом
+# и физическим путём (TCP/UDP), затем — чем-то одним. Два имени на одном адресе — не другой путь.
+# Регион, ручной выбор, квота и политика владельца отсеяны раньше; единственного годного сервера
+# недостаток разнообразия не исключает.
+DIVERSE_SHARE = 0.85
+
+
+def diversity(mine: tuple[str, str] | None, theirs: tuple[str, str] | None) -> int:
+    """2 — другой адрес и другой путь, 1 — что-то одно, 0 — то же самое или сведений нет."""
+    if mine is None or theirs is None:
+        return 0
+    return int(mine[0] != theirs[0]) + int(mine[1] != theirs[1])
+
+
+def diversity_text(mine: tuple[str, str] | None, theirs: tuple[str, str] | None) -> str:
+    """Краткая причина выбора замены — без адресов и имён."""
+    if mine is None or theirs is None:
+        return "лучший по рейтингу (путь не известен)"
+    path = theirs[1].upper() or "?"
+    level = diversity(mine, theirs)
+    if level == 2:
+        return f"другой адрес и другой путь ({path})"
+    if level == 1:
+        return (f"другой адрес, тот же путь ({path})" if mine[0] != theirs[0]
+                else f"тот же адрес, другой путь ({path}) — частичное разнообразие")
+    return f"тот же адрес и путь ({path}) — другого сопоставимого нет"
 
 
 @dataclass
 class Rotation:
     replacements: list[tuple[str, ServerNode]]  # (тег мёртвого участника, запасной)
+    reasons: dict[str, str] = field(default_factory=dict)  # тег мёртвого → причина выбора
 
 
 def plan_rotation(
@@ -52,13 +80,16 @@ def plan_rotation(
     urgent: Collection[str] = (),
     origins: dict[str, tuple[str, str]] | None = None,
     scores: dict[str, float] | None = None,
+    routes: dict[str, tuple[str, str]] | None = None,
 ) -> Rotation | None:
     """alive — только по участникам с известным состоянием: узел, которого ещё
     нет в observatory (ядро только что запущено), мёртвым не считается.
 
     urgent — теги участников, не прошедших первую проверку шлюза: их меняют сразу,
     не дожидаясь ни rotate_after_min, ни вердикта observatory. origins — отпечаток →
-    (страна, подписка) участников и запасных; scores — отпечаток → рейтинг (rating.py)."""
+    (страна, подписка) участников и запасных; scores — отпечаток → рейтинг (rating.py);
+    routes — отпечаток → (адрес, путь tcp/udp) для выбора другого пути (DIVERSE_SHARE)."""
+    routes = routes or {}
     rotate_after = cfg.filters.rotate_after_min * 60
     dead_members = [
         info.tag
@@ -79,28 +110,42 @@ def plan_rotation(
     ]
     fingerprints = {info.tag: info.fingerprint for info in members}
     replacements = []
+    reasons: dict[str, str] = {}
     for dead_tag in dead_members:
         if not candidates:
             break
         country, source = origins.get(fingerprints.get(dead_tag, ""), ("", ""))
         top = max((scores.get(node.fingerprint, 0.0) for _info, node in candidates), default=0.0)
+        mine = routes.get(fingerprints.get(dead_tag, ""))
 
-        def rank(pair, country=country, source=source, top=top):
-            info, node = pair
+        def place_of(node, country=country, source=source, top=top):
             score = scores.get(node.fingerprint, 0.0)
             if country and node.country == country and score >= top * SAME_COUNTRY:
-                place = 0 if node.source != source else 1
-            else:
-                place = 2
+                return 0 if node.source != source else 1
+            return 2
+
+        best: dict[int, float] = {}
+        for _info, node in candidates:
+            place = place_of(node)
+            best[place] = max(best.get(place, 0.0), scores.get(node.fingerprint, 0.0))
+
+        def rank(pair, mine=mine, best=best, place_of=place_of):
+            info, node = pair
+            score = scores.get(node.fingerprint, 0.0)
+            place = place_of(node)
+            comparable = score >= best[place] * DIVERSE_SHARE
+            spread = -diversity(mine, routes.get(node.fingerprint)) if comparable else 1
             return (
-                place, -score, 0 if scans[info.tag] == "OK" else 1,
+                place, spread, -score, 0 if scans[info.tag] == "OK" else 1,
                 scan_seconds.get(info.tag, float("inf")),
             )
 
         chosen = min(candidates, key=rank)
         candidates.remove(chosen)
         replacements.append((dead_tag, chosen[1]))
-    return Rotation(replacements=replacements) if replacements else None
+        if mine is not None:
+            reasons[dead_tag] = diversity_text(mine, routes.get(chosen[1].fingerprint))
+    return Rotation(replacements=replacements, reasons=reasons) if replacements else None
 
 
 def preferred_members(members: list[NodeInfo], rotation: Rotation | None) -> list[str]:

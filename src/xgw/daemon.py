@@ -626,6 +626,7 @@ class Daemon:
         # Отпечатки серверов, которые сами выходят в домашнюю страну: участник с таким
         # отпечатком меняется, запасной на его место не ставится.
         self.home_exits: set[str] = set()
+        self._selection: dict | None = None  # последняя замена участника: когда и почему эта
         self.scan_queue: deque[str] = deque()  # probe-теги узлов, ждущих скана
         # Теги очереди, поставленные срочно (_queue_first(urgent=True): аварийный круг резерва,
         # белые списки) — без паузы SCAN_GAP; отметка снимается вместе с тегом из очереди.
@@ -1211,6 +1212,7 @@ class Daemon:
         self.leak, self.next_leak = previous.leak, previous.next_leak
         self._leak_note = previous._leak_note
         self.home_exits = set(previous.home_exits)
+        self._selection = previous._selection
         self.down_ticks = previous.down_ticks
         self.rolled_back = previous.rolled_back
         self.xray_down_since = previous.xray_down_since
@@ -2939,6 +2941,53 @@ class Daemon:
             self.scan_queue.extend(tag for tag in wanted if tag not in queued)
         self.next_rescan = now + RESCAN_PAUSE
 
+    def _routes(self) -> dict[str, tuple[str, str]]:
+        """Отпечаток → (адрес, физический путь tcp/udp) серверов подписки. Адрес — наименьший
+        IPv4 из dns.hosts применённого конфига (домены с одним набором адресов совпадут), иначе
+        как в подписке. Ни запросов DNS, ни баз операторов и стран здесь нет."""
+        if self.inventory is None:
+            return {}
+        applied = engine.read_json(self.paths.xray_config_file) or {}
+        hosts = (applied.get("dns") or {}).get("hosts")
+        hosts = hosts if isinstance(hosts, dict) else {}
+
+        def address(node: ServerNode) -> str:
+            found = hosts.get(node.address)
+            found = [found] if isinstance(found, str) else found or []
+            return min((ip for ip in found if isinstance(ip, str) and _ipv4(ip)),
+                       default=node.address)
+
+        return {node.fingerprint: (address(node), _transport(node))
+                for node in self.inventory.nodes}
+
+    def _selection_status(self, view: list[NodeInfo]) -> dict:
+        """Для status.json (п. 341): сколько запасных годятся в замену (те же условия, что в
+        _rotate) и сколько среди них разных путей — пар (адрес, tcp/udp), которых нет у
+        участников; два имени на одном адресе запаса не прибавляют. Пусто — почему."""
+        routes = self._routes()
+        scans = self._fresh_scans()
+        members = {routes[info.fingerprint] for info in view
+                   if info.role == "proxy" and info.fingerprint in routes}
+        spares = [info for info in view if info.role == "spare" and info.fingerprint in routes]
+        good = [
+            info for info in spares
+            if info.fingerprint not in self.home_exits and self._score(info) > 0
+            and not self._is_unstable(info.fingerprint)
+            and (scans.get(info.probe_tag) or {}).get("verdict") in REPLACEABLE_VERDICTS
+        ]
+        paths = {routes[info.fingerprint] for info in good}
+        other = paths - members
+        if not spares:
+            note = "запасных нет"
+        elif not good:
+            note = "годных запасных нет: свежего удачного скана нет ни у одного"
+        elif not other:
+            note = "годные запасные — на тех же адресах и путях, что участники: другого пути нет"
+        else:
+            note = ""
+        return {"spares_ok": len(good), "paths": len(paths), "other_paths": len(other),
+                "note": note, "last": self._selection}
+
     def _alternatives(self, view: list[NodeInfo]) -> set[str]:
         """Отпечатки запасных, чьи ядро или транспорт отличаются от всех участников: при
         массовой блокировке они проверяются первыми."""
@@ -3369,6 +3418,7 @@ class Daemon:
         rotation = plan_rotation(
             alive, dead_since, verdicts, seconds, members, pairs, cfg, self.wall(),
             urgent=(set(self.bad_members) | set(home)) - held, origins=origins, scores=scores,
+            routes=self._routes(),
         )
         if rotation is None:
             overdue = cfg.filters.rotate_after_min * 60.0
@@ -3379,7 +3429,11 @@ class Daemon:
             if waiting and pairs and not self.scan_queue and now >= self.next_rescan:
                 self._queue_scan(view, now)  # менять пора, а свежих сканов нет
             return False
-        names = ", ".join(f"{tag} → «{node.name}»" for tag, node in rotation.replacements)
+        names = ", ".join(
+            f"{tag} → «{node.name}»" + (f" ({rotation.reasons[tag]})" if tag in rotation.reasons
+                                       else "")
+            for tag, node in rotation.replacements)
+        self._selection = {"ts": self.wall(), "reasons": sorted(set(rotation.reasons.values()))}
         failed = [
             f"{tag} — {self.bad_members[tag]}"
             for tag, _node in rotation.replacements if tag in self.bad_members
@@ -6807,6 +6861,7 @@ class Daemon:
             "phase": "checks" if checkpoint else "complete",
         }
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
+        snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         job = self._build
         snapshot["assembly"] = {
             "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")

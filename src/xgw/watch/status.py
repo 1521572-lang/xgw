@@ -1223,6 +1223,16 @@ def render_status(status: dict) -> str:
     for sub in status.get("subscriptions") or []:
         if sub.get("name") not in quotas and not sub.get("limited"):
             lines.append(f"Подписка «{sub['name']}»: безлимитная (лимит трафика не сообщает)")
+    selection = status.get("selection") or {}
+    if selection.get("note"):
+        lines.append(f"Запас: {selection['note']}")
+    elif selection.get("spares_ok"):
+        lines.append(f"Запас: годных запасных {selection['spares_ok']}, других путей "
+                     f"(адрес или TCP/UDP не как у участников) — "
+                     f"{selection.get('other_paths', 0)}")
+    last = selection.get("last") or {}
+    if last.get("reasons"):
+        lines.append(f"Последняя замена ({_clock(last['ts'])}): {'; '.join(last['reasons'])}")
     budget = status.get("budget") or {}
     if budget:
         lines.extend(render_budget(budget))
