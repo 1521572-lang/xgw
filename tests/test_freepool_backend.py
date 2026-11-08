@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1096,3 +1097,41 @@ def test_server_without_public_address_spends_no_handshake(tmp_path, monkeypatch
                 if not key.startswith("_")]
     assert (record["verdict"], record["error"]) == ("UNTESTED", "у сервера нет публичного IPv4")
     assert runtime.prepared == [] and pool.handshakes() == []
+
+
+# --- п. 347, A-10: снимки вывода клиента ------------------------------------------------------
+
+
+def test_summary_writes_a_stable_copy_of_the_notices(tmp_path, monkeypatch):
+    agent, _chowned = _agent(tmp_path, monkeypatch)
+    written: dict = {}
+    agent.notices.append("первое")
+    agent._write = lambda **values: written.update(values)
+    agent._say = lambda _text: None
+    agent._tun_stats = lambda _dev=None: None
+    agent._counters = dict
+    agent._summary()
+    agent.notices.append("второе")
+    assert written["notices"] == ["первое"]
+
+
+def test_snapshot_is_detached_from_the_reader(tmp_path, monkeypatch):
+    agent, _chowned = _agent(tmp_path, monkeypatch)
+    agent.log.append("строка")
+    lines, notices = agent._log_snapshot()
+    agent.log.append("ещё")
+    assert lines == ["строка"] and notices == ()
+
+
+def test_reader_and_snapshots_can_run_together(tmp_path, monkeypatch):
+    agent, _chowned = _agent(tmp_path, monkeypatch)
+    mark = next(iter(agenting._NOTICES))
+    proc = SimpleNamespace(stdout=[f"{mark} {number}" for number in range(5000)])
+    reader = threading.Thread(target=agent._read_client, args=(proc,), daemon=True)
+    reader.start()
+    while reader.is_alive():
+        lines, notices = agent._log_snapshot()
+        assert len(lines) <= agenting.LOG_LINES and len(notices) <= 3
+    reader.join(timeout=5)
+    assert not reader.is_alive() and len(agent.notices) == 3
+    assert agent._client_code(otherwise="LINK_LOST") != "LINK_LOST"

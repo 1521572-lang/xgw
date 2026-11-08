@@ -733,6 +733,8 @@ class Agent:
         self.summarized = False
         self.socks_log: deque[str] = deque(maxlen=8)
         self.notices: list[str] = []
+        # log и notices пополняет поток чтения; основной берёт их только снимком (п. 347, A-10).
+        self._log_lock = threading.Lock()
         self.link_up: dict[str, int] | None = None  # счётчики fpi при подъёме
         self.reader: threading.Thread | None = None  # читает вывод sstpc и pppd
 
@@ -916,13 +918,14 @@ class Agent:
         stats = self._tun_stats() or self.state.get("tun")
         link = self._link_after_up()
         after = deltas(self.refused_up, self._counters())
+        _lines, notices = self._log_snapshot()
         parts = [tunnel_text(stats) or "счётчики fpt0 не прочитаны",
                  f"канал к серверу после подъёма: {link_text(link) or 'не прочитан'}",
                  f"охрана после подъёма: {guard_text(after) or '—'}"]
-        if self.notices:
-            parts.append("предупреждения клиента: " + " | ".join(self.notices))
+        if notices:
+            parts.append("предупреждения клиента: " + " | ".join(notices))
         self._write(tun=stats, link_after_up=link, refused_after_up=after,
-                    notices=self.notices)
+                    notices=list(notices))
         self._say("итог туннеля: " + "; ".join(parts))
 
     def _start(self, name: str, argv: list[str], ids: tuple[int, int]) -> subprocess.Popen:
@@ -939,11 +942,22 @@ class Agent:
         для итога туннеля (без адресов)."""
         for line in proc.stdout or ():
             line = line.rstrip("\n")[:400]
-            self.log.append(line)
-            if len(self.notices) < 3 and any(mark in line for mark in _NOTICES):
-                text = masked(line)[:160]
-                if text not in self.notices:
-                    self.notices.append(text)
+            with self._log_lock:
+                self.log.append(line)
+                if len(self.notices) < 3 and any(mark in line for mark in _NOTICES):
+                    text = masked(line)[:160]
+                    if text not in self.notices:
+                        self.notices.append(text)
+
+    def _log_snapshot(self) -> tuple[list[str], tuple[str, ...]]:
+        """Согласованный снимок вывода клиента: строки и предупреждения одного момента."""
+        with self._log_lock:
+            return list(self.log), tuple(self.notices)
+
+    def _client_code(self, *, timed_out: bool = False, otherwise: str = "") -> str:
+        """Код отказа по снимку вывода клиента; otherwise — если вывода нет."""
+        lines, _notices = self._log_snapshot()
+        return otherwise if otherwise and not lines else classify(lines, timed_out=timed_out)
 
     def _drain(self, proc: subprocess.Popen) -> None:
         """Вывод работника SOCKS — не в журнал службы: последние строки только для причины
@@ -992,9 +1006,9 @@ class Agent:
                     up = True
                     continue
                 if self._dead("vpn"):
-                    raise AgentError(classify(self.log), "клиент SSTP завершился")
+                    raise AgentError(self._client_code(), "клиент SSTP завершился")
                 if self.clock() - started > UP_WAIT:
-                    raise AgentError(classify(self.log, timed_out=True),
+                    raise AgentError(self._client_code(timed_out=True),
                                      "туннель не поднялся за отведённое время")
                 self.sleep(POLL_EVERY)
                 continue
@@ -1002,7 +1016,7 @@ class Agent:
                 stats_at = self.clock()
                 address, _gateway = self._addresses()
                 if not address:
-                    raise AgentError(classify(self.log) if self.log else "LINK_LOST",
+                    raise AgentError(self._client_code(otherwise="LINK_LOST"),
                                      "туннель оборвался")
                 values: dict = {"refused_after_up": deltas(self.refused_up, self._counters())}
                 stats = self._tun_stats()
@@ -1013,7 +1027,7 @@ class Agent:
                     values["link_after_up"] = link
                 self._write(**values)
             if self._dead("vpn"):
-                raise AgentError(classify(self.log) if self.log else "LINK_LOST",
+                raise AgentError(self._client_code(otherwise="LINK_LOST"),
                                  "клиент SSTP завершился")
             if self._dead("socks"):
                 raise AgentError("SOCKS_FAILED", "SOCKS-работник завершился")
@@ -1080,7 +1094,7 @@ class Agent:
             self._say(f"поколение {self.gen}: {code}"
                       + (f" (по выводу клиента: {exc.code})" if code != exc.code else "")
                       + f" — {text}")
-            line = evidence(list(self.log), exc.code)
+            line = evidence(self._log_snapshot()[0], exc.code)
             if line:
                 self._say(f"SSTP: {line}")
             if any(before_up.values()):
