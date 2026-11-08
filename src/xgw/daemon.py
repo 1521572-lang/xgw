@@ -2762,10 +2762,13 @@ class Daemon:
             job.generation_core = self.singbox
             job.done.clear()
             self._build = job
+            rank = self._bridge_rank()  # в шаге: поток подготовки к счётчикам не ходит
+
             def prepare_generation():
                 try:
                     job.generation = generations.prepare(
-                        job.generation_core, assembly.singbox.config, assembly.result.config)
+                        job.generation_core, assembly.singbox.config, assembly.result.config,
+                        rank=rank)
                 except Exception as exc:
                     self.log.warning("подготовка поколения sing-box не выполнена: %s", exc)
                     job.error = engine.EngineError(
@@ -3038,6 +3041,27 @@ class Daemon:
                     or int(key) <= hour - HEALTH_HOURS]:
             del buckets[key]
         self._health_dirty = True
+
+    def _bridge_rank(self) -> dict[str, float]:
+        """Порядок проверки мостов нового поколения sing-box (generations.bridge_check):
+        участники, что ведут трафик сейчас, — первыми (меньше сбоев — раньше), затем прочие по
+        доле сбоев за сутки; без счёта — UNKNOWN_RANK, между надёжными и ненадёжными."""
+        from .apply.singbox_generation import UNKNOWN_RANK
+
+        hour, rank = int(self.wall() // 3600), {}
+        for fingerprint, buckets in self._healths().items():
+            good = bad = 0
+            for key, counts in (buckets or {}).items():
+                if key.isdigit() and int(key) > hour - HEALTH_HOURS and isinstance(counts, list):
+                    good, bad = good + int(counts[0]), bad + int(counts[1])
+            if good + bad >= HEALTH_MIN:
+                rank[fingerprint] = bad / (good + bad)
+        applied = engine.read_json(self.paths.xray_config_file)
+        if applied is not None and self.inventory is not None:
+            for info in builder.applied_nodes(applied, self.inventory.nodes):
+                if info.role == "proxy":
+                    rank[info.fingerprint] = rank.get(info.fingerprint, UNKNOWN_RANK) - 2.0
+        return rank
 
     def _fail_rate(self, fingerprint: str) -> float:
         hour = int(self.wall() // 3600)

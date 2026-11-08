@@ -186,30 +186,65 @@ def remap(core, config, xray, old):
     return candidate, routed
 
 
-def bridge_check(core, config, routed):
-    """Полный GET через хотя бы один используемый мост; плохие отдельные серверы допустимы."""
+BRIDGE_BUDGET = 90.0
+BRIDGE_EACH = 20.0  # на мост: мёртвый сервер не съедает весь срок — успеть 4–5 мостов
+UNKNOWN_RANK = 0.5  # сервер без счёта сбоев — после надёжных, до часто отказывающих
+
+
+@dataclass
+class BridgeCheck:
+    """Итог проверки мостов: ok и сводка для журнала — только числа и виды отказов."""
+    ok: bool
+    summary: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def bridge_check(core, config, routed, rank=None):
+    """Полный GET через хотя бы один используемый мост; плохие отдельные серверы допустимы.
+
+    rank — отпечаток → порядок (меньше — раньше): участники, что ведут трафик, затем по
+    доле сбоев за сутки (Daemon._bridge_rank). Без порядка мосты шли как в конфиге, и при
+    мёртвых первых серверах (возврат подписки после паузы) срок кончался раньше живых —
+    поколение не менялось ни разу подряд (отчёт sub-remove, 08.11.2026)."""
     wanted = processes.xray_ports(routed)
-    deadline = time.monotonic() + 90
-    for inbound in config["inbounds"]:
+    rank = rank or {}
+    candidates = []
+    for index, inbound in enumerate(config["inbounds"]):
         if inbound["listen_port"] not in wanted:
             continue
+        match = sb._IN_TAG.match(str(inbound.get("tag") or ""))
+        place = rank.get(match.group(1), UNKNOWN_RANK) if match else UNKNOWN_RANK
+        candidates.append((place, index, inbound))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    deadline = time.monotonic() + BRIDGE_BUDGET
+    kinds: dict[str, int] = {}
+    tried = 0
+    for _place, _index, inbound in candidates:
         left = deadline - time.monotonic()
         if left <= 0:
             break
         user = inbound["users"][0]
+        tried += 1
         reply = checks.http_get_via_proxy(
             sb.LOCAL, inbound["listen_port"], core.cfg.probe.url,
             proxy_user=user["username"], proxy_pass=user["password"],
-            max_total=min(30, left), min_body=probe_bytes(core.cfg.probe.url) or 1,
+            max_total=min(BRIDGE_EACH, left), min_body=probe_bytes(core.cfg.probe.url) or 1,
             user_agent=core.cfg.probe.user_agent,
         )
         if reply.ok:
-            return True
-    return False
+            return BridgeCheck(True, f"мост {tried} из {len(candidates)}")
+        kind = str(getattr(reply, "kind", "") or "error")
+        kinds[kind] = kinds.get(kind, 0) + 1
+    outcomes = ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items()))
+    return BridgeCheck(False, f"мостов проверено {tried} из {len(candidates)}"
+                              + (f": {outcomes}" if outcomes else ""))
 
 
-def prepare(core, config, xray):
-    """Никаких API-записей Xray. Кандидат не получает пользовательский трафик."""
+def prepare(core, config, xray, rank=None):
+    """Никаких API-записей Xray. Кандидат не получает пользовательский трафик. rank —
+    порядок проверки мостов (bridge_check)."""
     with file_lock(core.paths.lock_file):
         state = processes.reap(core)
         if state["pending"] or state["draining"] or core.paths.api_dirty_file.exists():
@@ -244,8 +279,14 @@ def prepare(core, config, xray):
     try:
         processes.start(core, slot, candidate)
         error = core._wait_ready(candidate)
-        if error or not bridge_check(core, candidate, routed):
-            raise ValueError("новое поколение не прошло настоящий запрос через мост")
+        if error:
+            raise ValueError("новое поколение не прошло настоящий запрос через мост: "
+                             "sing-box не готов")
+        checked = bridge_check(core, candidate, routed, rank)
+        if not checked:
+            summary = getattr(checked, "summary", "")
+            raise ValueError("новое поколение не прошло настоящий запрос через мост"
+                             + (f" ({summary})" if summary else ""))
         problem = processes.identity(core, slot)
         if problem:
             raise ValueError(problem)

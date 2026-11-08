@@ -235,6 +235,72 @@ def test_body_check_uses_only_new_routed_bridge(gateway, monkeypatch):
     assert captured[0][1]["min_body"] > 0
 
 
+def _three_bridges(w):
+    config, xray = copy.deepcopy(w.old), copy.deepcopy(w.xray)
+    for fp, port in (("bbcc2233", 22002), ("ccdd3344", 22003)):
+        inbound = copy.deepcopy(config["inbounds"][0])
+        inbound.update(tag=f"sb-in-{fp}-d", listen_port=port)
+        config["inbounds"].append(inbound)
+        outbound = sb.bridge_outbound(port, "d", "fake")
+        outbound["tag"] = f"spare-test-{fp}"
+        xray["outbounds"].append(outbound)
+    return config, xray
+
+
+def test_daemon_ranks_members_first_then_by_failures(tmp_path, monkeypatch):
+    from test_daemon import Harness, _started
+
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.filters.exclude_regex = ""
+    cfg.dns.bootstrap = []
+    daemon = Harness(cfg, paths)
+    try:
+        _started(daemon)
+        rank = daemon._bridge_rank()
+        members = [fp for fp, place in rank.items() if place < 0]
+        assert members and all(rank[fp] < g.UNKNOWN_RANK for fp in members)
+        hour = str(int(daemon.wall() // 3600))
+        daemon._healths()["ffff0000"] = {hour: [1, 3]}  # 3 сбоя из 4 — после неизвестных
+        assert daemon._bridge_rank()["ffff0000"] == 0.75
+    finally:
+        daemon.store.close()
+
+
+def test_bridges_of_working_servers_are_checked_first(gateway, monkeypatch):
+    """Отчёт sub-remove: мёртвые первые мосты съедали срок, поколение не менялось. Порядок —
+    по rank (участники, затем доля сбоев), на мост не больше BRIDGE_EACH."""
+    w = gateway
+    config, xray = _three_bridges(w)
+    captured = []
+
+    def reply(*args, **kwargs):
+        captured.append((args[1], kwargs["max_total"]))
+        return DownloadResult(ok=args[1] == 22003, kind="" if args[1] == 22003 else "stall")
+
+    monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ccdd3344": -2.0, "aabb1122": 0.9})
+    assert checked and [port for port, _cap in captured] == [22003]
+    assert all(cap <= g.BRIDGE_EACH for _port, cap in captured)
+    captured.clear()
+    # Без порядка — как в конфиге; неизвестный (0.5) раньше частых сбоев (0.9).
+    REAL_BRIDGE_CHECK(w.core, config, xray, {"aabb1122": 0.9})
+    assert [port for port, _cap in captured] == [22002, 22003]
+
+
+def test_failed_bridges_are_counted_in_the_refusal(gateway, monkeypatch):
+    w = gateway
+    config, xray = _three_bridges(w)
+    monkeypatch.setattr(g, "bridge_check", REAL_BRIDGE_CHECK)
+    monkeypatch.setattr(g.checks, "http_get_via_proxy",
+                        lambda *a, **kw: DownloadResult(ok=False, kind="stall"))
+    with pytest.raises(ValueError, match=r"мостов проверено 3 из 3: stall 3"):
+        g.prepare(w.core, config, xray, rank={})
+    assert w.alive == {p.LEGACY} and p.read(w.paths)["pending"] is None
+
+
 def test_transient_unit_keeps_installed_sandbox(gateway, monkeypatch):
     w = gateway
     # Restore actual start, whose only external operation is captured cmd.run.

@@ -3006,12 +3006,14 @@ def test_generation_prepares_in_background_and_only_fresh_result_switches(
 
     monkeypatch.setattr(daemon, "_assemble", assemble)
     gate, entered = threading.Event(), threading.Event()
-    prepared = SimpleNamespace(xray=engine.read_json(daemon.paths.xray_config_file))
+    prepared = SimpleNamespace(xray=engine.read_json(daemon.paths.xray_config_file),
+                               parts=(), fields=(), old={}, config={})
     switched, aborted = [], []
     main = threading.get_ident()
 
-    def prepare(*args):
+    def prepare(*args, rank=None):
         assert threading.get_ident() != main
+        assert isinstance(rank, dict)  # порядок мостов собран в шаге (отчёт sub-remove)
         entered.set()
         assert gate.wait(5)
         return prepared
