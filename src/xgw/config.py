@@ -191,6 +191,9 @@ class Subscription:
     name: str = "main"
     url: str = ""
     user_agent: str = ""
+    # Только в config.toml: запрашивать с этого адреса, хотя он в частной сети (п. 347). На
+    # перенаправление с него не распространяется.
+    allow_private: bool = False
     headers: dict[str, str] = field(default_factory=dict)
     refresh_minutes: int = 60
 

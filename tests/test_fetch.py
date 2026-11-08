@@ -141,13 +141,14 @@ def test_subscription_requires_http_200(no_sleep):
     """Страница ошибки панели — это сбой, а не «подписка без серверов»."""
     server = HttpServer(_response(403, b"<html>blocked</html>"))
     with pytest.raises(FetchError, match="HTTP 403"):
-        fetch_subscription(server.url())
+        fetch_subscription(server.url(), allow_private=True)
 
 
 def test_subscription_headers_and_user_agent(no_sleep):
     server = HttpServer(_response(200, b"body", "Subscription-Userinfo: upload=1; total=10\r\n"))
     result = fetch_subscription(
-        server.url("/sub?x=1"), user_agent="v2rayN/6.0", headers={"x-hwid": "abc"}
+        server.url("/sub?x=1"), user_agent="v2rayN/6.0", headers={"x-hwid": "abc"},
+        allow_private=True,
     )
     assert parse_userinfo(result.headers["subscription-userinfo"]) == {"upload": 1, "total": 10}
     request = server.requests[0]
@@ -458,7 +459,7 @@ def test_cancel_interrupts_the_pause_before_a_retry():
     server = HttpServer(_response(503))
     started = time.monotonic()
     with pytest.raises(fetch.Cancelled):
-        fetch_subscription(server.url(), cancel=_cancel_after(0.3))
+        fetch_subscription(server.url(), cancel=_cancel_after(0.3), allow_private=True)
     assert time.monotonic() - started < 1.5  # первая пауза — 2 с
     assert len(server.requests) == 1
 
@@ -652,6 +653,7 @@ def test_subscription_falls_back_to_the_known_address(monkeypatch, no_sleep):
         raise fetch.ResolveError("резолверы молчат")
 
     monkeypatch.setattr(fetch, "resolve_domain", no_dns)
+    monkeypatch.setattr(fetch, "disallowed_address", lambda _address: False)  # сервер — loopback
     url = f"http://sub.example.com:{server.port}/s"
     with pytest.raises(FetchError):
         fetch_subscription(url, bootstrap=["udp://203.0.113.53"], retries=0)
@@ -728,3 +730,182 @@ def test_wrong_certificate_on_one_address_tries_another(monkeypatch, no_sleep):
     with pytest.raises(FetchError):
         fetch_url("https://sub.example.com/s", bootstrap=["tls://77.88.8.8"])
     assert tries == [1]
+
+
+# --- п. 347, A-01: адрес назначения подписки ---------------------------------------------
+
+
+REFUSED_HOSTS = [
+    "127.0.0.1", "127.1", "2130706433", "0x7f.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.0.1",
+    "169.254.169.254", "0.0.0.0", "100.64.0.1", "[::1]", "[::]", "[fe80::1]", "[fc00::1]",
+    "[ff02::1]", "[::ffff:127.0.0.1]", "[::ffff:10.0.0.1]", "[::127.0.0.1]",
+    "[2002:7f00:1::]", "[64:ff9b::7f00:1]",
+]
+ROUTES = [None, ("127.0.0.1", 1)]
+RESOLVERS = ["tls://77.88.8.8"]
+
+
+@pytest.fixture()
+def wire(monkeypatch):
+    """Что дошло до сети: адреса прямых соединений и цели CONNECT. Само соединение — отказ."""
+    seen: list[str] = []
+
+    def direct(host, port, **_kwargs):
+        seen.append(host)
+        raise ConnectionRefusedError("стоп")
+
+    def tunnel(_proxy, host, port, **_kwargs):
+        seen.append(host)
+        raise ConnectionRefusedError("стоп")
+
+    monkeypatch.setattr(fetch.marknet, "connect_marked", direct)
+    monkeypatch.setattr(fetch, "open_tunnel", tunnel)
+    return seen
+
+
+@pytest.mark.parametrize("proxy", ROUTES, ids=["direct", "proxy"])
+@pytest.mark.parametrize("host", REFUSED_HOSTS)
+def test_subscription_never_reaches_a_service_address(wire, no_sleep, host, proxy):
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription(f"http://{host}/s", proxy=proxy, retries=0)
+    assert wire == []
+
+
+@pytest.mark.parametrize("proxy", ROUTES, ids=["direct", "proxy"])
+@pytest.mark.parametrize("host", ["127.0.0.1", "[::1]", "10.0.0.1", "169.254.169.254"])
+def test_redirect_to_a_service_address_is_refused(monkeypatch, no_sleep, host, proxy):
+    calls: list[str] = []
+
+    def once(url, headers, timeout, mark, dns, proxy, data, cancel):
+        calls.append(url)
+        return FetchResult(302, {"location": f"http://{host}/inner"}, b"", url)
+
+    monkeypatch.setattr(fetch, "_request_once", once)
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription("http://sub.example.com/s", proxy=proxy, retries=0)
+    assert calls == ["http://sub.example.com/s"]
+
+
+def test_redirect_between_public_addresses_still_works(monkeypatch, no_sleep):
+    answers = iter([FetchResult(302, {"location": "https://cdn.example.org/b"}, b"", ""),
+                    FetchResult(200, {}, b"vless://x", "https://cdn.example.org/b")])
+    monkeypatch.setattr(fetch, "_request_once", lambda *args: next(answers))
+    assert fetch_subscription("https://sub.example.com/a", retries=0).body == b"vless://x"
+
+
+@pytest.mark.parametrize("proxy", ROUTES, ids=["direct", "proxy"])
+def test_mixed_dns_answer_uses_only_public_addresses(monkeypatch, wire, no_sleep, proxy):
+    """Подключение идёт к проверенному адресу, второго разрешения имени нет: ответ DNS не может
+    смениться между проверкой и соединением."""
+    asked: list[str] = []
+
+    def resolve(name, entries, **_kwargs):
+        asked.append(name)
+        return ["10.0.0.5", "203.0.113.8"] if len(asked) == 1 else ["127.0.0.1"]
+
+    monkeypatch.setattr(fetch, "resolve_domain", resolve)
+    with pytest.raises(FetchError):
+        fetch_subscription("http://sub.example.com/s", proxy=proxy, bootstrap=RESOLVERS, retries=0)
+    assert wire == ["203.0.113.8"] and asked == ["sub.example.com"]
+
+
+@pytest.mark.parametrize("proxy", ROUTES, ids=["direct", "proxy"])
+def test_dns_answer_of_service_addresses_only_is_refused(monkeypatch, wire, no_sleep, proxy):
+    monkeypatch.setattr(fetch, "resolve_domain", lambda *args, **kwargs: ["10.0.0.5"])
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription("http://sub.example.com/s", proxy=proxy, bootstrap=RESOLVERS, retries=0)
+    assert wire == []
+
+
+@pytest.mark.parametrize("proxy", ROUTES, ids=["direct", "proxy"])
+def test_service_address_from_the_cache_is_refused(monkeypatch, wire, no_sleep, proxy):
+    def no_dns(*_args, **_kwargs):
+        raise fetch.ResolveError("резолверы молчат")
+
+    monkeypatch.setattr(fetch, "resolve_domain", no_dns)
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription("http://sub.example.com/s", proxy=proxy, bootstrap=RESOLVERS, retries=0,
+                           fallback={"sub.example.com": ["127.0.0.1"]})
+    assert wire == []
+
+
+def test_system_resolver_answer_is_checked_too(monkeypatch, wire, no_sleep):
+    answer = ["203.0.113.8"]
+    monkeypatch.setattr(fetch.socket, "getaddrinfo", lambda *args, **kwargs: [
+        (2, 1, 6, "", (address, 80)) for address in answer])
+    with pytest.raises(FetchError):
+        fetch_subscription("http://sub.example.com/s", retries=0)
+    assert wire == ["203.0.113.8"]
+    answer[0] = "192.168.1.1"
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription("http://sub.example.com/s", retries=0)
+    assert wire == ["203.0.113.8"]
+
+
+def test_connect_names_the_address_and_keeps_the_host_name(monkeypatch, no_sleep):
+    """В CONNECT — проверенный адрес, а имя остаётся в Host (и для TLS); резолвер спрошен через
+    тот же туннель и память о недоступных резолверах не изменилась."""
+    server = HttpServer(_response(200, b"vless://x"))
+    targets: list[str] = []
+    asked: list[dict] = []
+
+    def tunnel(_proxy, host, port, **_kwargs):
+        targets.append(host)
+        return socket.create_connection(("127.0.0.1", server.port), timeout=3)
+
+    def resolve(name, entries, **kwargs):
+        asked.append(kwargs)
+        return ["203.0.113.8"]
+
+    monkeypatch.setattr(fetch, "open_tunnel", tunnel)
+    monkeypatch.setattr(fetch, "resolve_domain", resolve)
+    result = fetch_subscription("http://sub.example.com/s", proxy=("127.0.0.1", 1),
+                                bootstrap=RESOLVERS, retries=0)
+    assert result.body == b"vless://x" and targets == ["203.0.113.8"]
+    assert asked[0]["proxy"] == ("127.0.0.1", 1) and asked[0]["public_only"] is True
+    assert b"Host: sub.example.com\r\n" in server.requests[0]
+    assert result.host == "" and result.address == ""  # адрес через туннель в кэш не идёт
+
+
+def test_tunnel_resolver_failure_does_not_mark_it_down(monkeypatch):
+    fetch._resolver_down.clear()
+
+    def broken(url, name, *, mark=None, cancel=None, proxy=None):
+        assert proxy == ("127.0.0.1", 1)
+        raise OSError("туннель оборвался")
+
+    monkeypatch.setattr(fetch, "doh_query", broken)
+    with pytest.raises(fetch.ResolveError):
+        fetch.resolve_domain("sub.example.com", ["https://1.1.1.1/dns-query"],
+                             proxy=("127.0.0.1", 1))
+    assert fetch._resolver_down == {}
+
+
+def test_tunnel_without_encrypted_resolvers_is_refused(wire, no_sleep):
+    with pytest.raises(FetchError, match="шифрованных резолверов"):
+        fetch_subscription("http://sub.example.com/s", proxy=("127.0.0.1", 1),
+                           bootstrap=["udp://77.88.8.8"], retries=0)
+    assert wire == []
+
+
+def test_allow_private_covers_only_the_configured_origin(monkeypatch, no_sleep):
+    server = HttpServer(_response(200, b"vless://x"))
+    assert fetch_subscription(server.url(), allow_private=True, retries=0).body == b"vless://x"
+    home = "http://10.0.0.5:8080/a"
+    same = iter([FetchResult(302, {"location": "/b"}, b"", home),
+                 FetchResult(200, {}, b"ok", home)])
+    monkeypatch.setattr(fetch, "_request_once", lambda *args: next(same))
+    assert fetch_subscription(home, allow_private=True, retries=0).body == b"ok"
+    other = iter([FetchResult(302, {"location": "http://10.0.0.6:8080/a"}, b"", home)])
+    monkeypatch.setattr(fetch, "_request_once", lambda *args: next(other))
+    with pytest.raises(FetchError, match="служебная сеть"):
+        fetch_subscription(home, allow_private=True, retries=0)
+
+
+def test_public_addresses_are_allowed():
+    for address in ("77.88.55.242", "203.0.113.8", "2a00:1450:4001:81b::200e",
+                    "::ffff:77.88.55.242"):
+        assert not fetch.disallowed_address(address), address
+    fetch.check_target("https://sub.example.com:8443/a")
+    with pytest.raises(FetchError, match="нулевой порт"):
+        fetch.check_target("https://sub.example.com:0/a")

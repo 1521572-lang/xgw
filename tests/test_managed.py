@@ -505,3 +505,11 @@ def test_lock_held_too_long_is_a_message_not_a_crash(conf, monkeypatch):
     with file_lock(managed.lock_path(path)), pytest.raises(ManagedError, match="другой процесс"):
         managed.set_priority(path, ["aaaa1111"], "high")
     assert not path.exists()
+
+
+@pytest.mark.parametrize("url", ["http://192.168.1.1/s", "https://127.0.0.1/s", "http://[::1]/s"])
+def test_check_url_refuses_a_service_address(url):
+    """п. 347, A-01: сразу, а не молчаливым сбоем при обновлении."""
+    with pytest.raises(ManagedError, match="служебная сеть"):
+        managed.check_url(url)
+    assert managed.check_url("https://sub.example.com/s") == "https://sub.example.com/s"

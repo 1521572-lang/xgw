@@ -62,6 +62,7 @@ _BOGONS = tuple(
         "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
     )
 )
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
 def encrypted(entries: Sequence[str]) -> list[str]:
@@ -76,6 +77,23 @@ def is_bogon(address: str) -> bool:
     except ValueError:
         return True
     return ip.version != 4 or any(ip in net for net in _BOGONS)
+
+
+def disallowed_address(address: str) -> bool:
+    """Адрес, на который подписку запрашивать нельзя: служебные сети (_BOGONS), в том числе
+    записанные внутри IPv6, и всё неглобальное в IPv6 (п. 347, A-01). В отличие от is_bogon
+    публичный IPv6 здесь разрешён: это проверка назначения, а не ответа на запрос A."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return True
+    if ip.version == 6:
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is None:
+            # ::a.b.c.d (устаревшая запись IPv4) и NAT64 ведут к IPv4, которого здесь не видно.
+            return int(ip) >> 32 == 0 or ip in _NAT64 or ip.is_multicast or not ip.is_global
+        ip = embedded
+    return any(ip in net for net in _BOGONS)
 
 
 def resolver_order(entries: Sequence[str], now: float | None = None) -> list[str]:
@@ -206,6 +224,7 @@ def fetch_url(
     cancel: threading.Event | None = None,
     strict_dns: bool = False,
     fallback: dict[str, list[str]] | None = None,
+    allow_private: bool = False,
 ) -> FetchResult:
     """GET (или POST, если задано тело `data`): первая попытка и до `retries`
     повторов с паузами 2, 4 и 8 с.
@@ -224,10 +243,14 @@ def fetch_url(
     подписок. `fallback` — имя хоста → адреса, с которыми запрос уже удавался (кэш
     store.HostCache): по ним идёт соединение, если резолверы не ответили или ни один из
     их адресов не соединился. Сертификат TLS проверяется по имени хоста и тогда.
+    С `strict_dns` действует и политика адреса назначения (п. 347, A-01): ни прямо, ни через
+    перенаправление, ни через CONNECT запрос не уходит на служебный адрес. `allow_private` —
+    исключение для самого `url` (тот же источник); перенаправление на другой его не наследует.
     """
     if url.startswith("file://"):
         return _fetch_file(url)
-    dns = _Dns(bootstrap, strict_dns, fallback or {})
+    dns = _Dns(bootstrap, strict_dns, fallback or {},
+               trusted=_origin(url) if allow_private else None)
     attempts = max(0, retries) + 1
     last_error: Exception | None = None
     result: FetchResult | None = None
@@ -286,6 +309,7 @@ def fetch_subscription(
     retries: int = 3,
     cancel: threading.Event | None = None,
     fallback: dict[str, list[str]] | None = None,
+    allow_private: bool = False,
 ) -> FetchResult:
     """Подписка: таймаут 15 с, до 3 повторов. Ответ не 200 — ошибка, а не «пустая подписка».
     Имя хоста — только через шифрованные резолверы (strict_dns в fetch_url); fallback и
@@ -296,6 +320,7 @@ def fetch_subscription(
     result = fetch_url(
         url, headers=merged, mark=mark, timeout=timeout, bootstrap=bootstrap, proxy=proxy,
         retries=retries, cancel=cancel, strict_dns=True, fallback=fallback,
+        allow_private=allow_private,
     )
     if result.status != 200:
         raise FetchError(f"{masking.mask_url(url)}: HTTP {result.status}")
@@ -344,6 +369,10 @@ class _Dns:
     # (пятый аудит, D1). seen — все адреса, что были в выборе.
     failed: set[str] = field(default_factory=set)
     seen: set[str] = field(default_factory=set)
+    # Политика адреса назначения для текущего запроса (check_target, disallowed_address).
+    # trusted — источник, для которого её снял администратор (subscriptions.allow_private).
+    guard: bool = False
+    trusted: tuple[str, str, int | None] | None = None
 
     def untried(self) -> bool:
         """Есть адрес, на котором рукопожатие и ответ ещё не срывались."""
@@ -365,6 +394,10 @@ def _request_with_redirects(
     current = url
     sent = dict(headers)
     for _ in range(5):
+        if dns.strict:  # и первый адрес, и каждое перенаправление
+            dns.guard = _origin(current) != dns.trusted
+            if dns.guard:
+                check_target(current)
         result = _request_once(current, sent, timeout, mark, dns, proxy, data, cancel)
         # Тело за перенаправлением не отправляется: запрос с телом не повторяется по чужому
         # адресу.
@@ -414,6 +447,83 @@ def _is_ip(host: str) -> bool:
     return True
 
 
+def _literal(host: str) -> str | None:
+    """Адрес, если host записан числом в любом виде: обычном, «127.1», «0x7f.0.0.1»,
+    «2130706433» — системный резолвер понимает их все. None — это имя."""
+    host = host.rstrip(".")
+    if _is_ip(host):
+        return host
+    try:
+        return socket.inet_ntoa(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
+
+
+TARGET_REFUSED = "адрес назначения — служебная сеть: подписки с него не запрашиваются"
+
+
+def check_target(url: str) -> None:
+    """Можно ли запрашивать подписку с этого URL: схема, порт, адрес, записанный числом (п. 347,
+    A-01). Адреса имени проверяются позже — каждый перед соединением (_connect, _tunnel_target)."""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise FetchError(f"неподдерживаемая схема: {parts.scheme or '(нет)'}")
+    if not parts.hostname:
+        raise FetchError("в URL нет хоста")
+    if parts.port == 0:
+        raise FetchError("в URL нулевой порт")
+    literal = _literal(parts.hostname)
+    if literal is not None and disallowed_address(literal):
+        raise FetchError(TARGET_REFUSED)
+
+
+def _system_addresses(host: str, port: int) -> list[str]:
+    """Адреса host от системного резолвера, без служебных: соединение идёт уже с адресом, и
+    ответ DNS не может смениться между проверкой и соединением."""
+    literal = _literal(host)
+    if literal is not None:
+        found = [literal]
+    else:
+        found = list(dict.fromkeys(
+            str(info[4][0])
+            for info in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)))
+    allowed = [address for address in found if not disallowed_address(address)]
+    if not allowed:
+        raise FetchError(TARGET_REFUSED)
+    return allowed
+
+
+def _tunnel_target(
+    host: str, dns: _Dns, proxy: tuple[str, int], cancel: threading.Event | None,
+) -> str:
+    """Что назвать в CONNECT. Xray разрешил бы имя сам, и проверка здесь ничего бы не значила,
+    а правило geoip:private ведёт такие адреса в сеть шлюза. Поэтому при политике в CONNECT идёт
+    проверенный адрес, а имя остаётся для TLS и Host. Имя разрешают шифрованные резолверы через
+    тот же туннель: путь через Xray не должен зависеть от прямого доступа к ним (п. 347)."""
+    if not dns.guard:
+        return host
+    literal = _literal(host)
+    if literal is not None:
+        return literal  # проверен в check_target
+    spare = [ip for ip in dns.fallback.get(host, []) if _is_ip(ip)]
+    entries = encrypted(dns.bootstrap or ())
+    addresses: list[str] = []
+    try:
+        if not entries:
+            raise ResolveError(
+                "нет шифрованных резолверов: в dns.resolvers нужен хотя бы один https:// или tls://")
+        addresses = resolve_domain(host, entries, cancel=cancel, public_only=True, proxy=proxy)
+    except ResolveError:
+        if not spare:
+            raise
+    candidates = [ip for ip in dict.fromkeys([*addresses, *spare]) if not disallowed_address(ip)]
+    if not candidates:
+        raise FetchError(TARGET_REFUSED)
+    dns.seen.update(candidates)
+    candidates.sort(key=lambda address: address in dns.failed)
+    return candidates[0]
+
+
 def _connect(
     host: str, port: int, timeout: float, mark: int | None, dns: _Dns | Sequence[str] | None,
     cancel: threading.Event | None = None,
@@ -425,9 +535,21 @@ def _connect(
     def connect(sock: socket.socket, address: tuple[str, int]) -> None:
         wait_connect(sock, address, timeout, cancel)
 
-    if not dns.bootstrap or _is_ip(host):
+    if not dns.guard and (not dns.bootstrap or _is_ip(host)):
         sock = marknet.connect_marked(host, port, timeout=timeout, mark=mark, connect=connect)
         return sock, False
+    last_error: OSError | None = None
+    if dns.guard and (not dns.bootstrap or _literal(host) is not None):
+        for address in _system_addresses(host, port):
+            try:
+                sock = marknet.connect_marked(
+                    address, port, timeout=timeout, mark=mark, connect=connect
+                )
+            except OSError as exc:
+                last_error = exc
+                continue
+            return sock, False
+        raise last_error or OSError(f"нет адресов для {host}")
     spare = [ip for ip in dns.fallback.get(host, []) if _is_ip(ip)]
     entries = encrypted(dns.bootstrap) if dns.strict else list(dns.bootstrap)
     try:
@@ -435,14 +557,17 @@ def _connect(
             raise ResolveError(
                 "нет шифрованных резолверов: в dns.resolvers нужен хотя бы один https:// или tls://")
         addresses = resolve_domain(
-            host, entries, mark=mark, cancel=cancel, public_only=dns.strict,
+            host, entries, mark=mark, cancel=cancel, public_only=dns.guard,
         )
     except ResolveError:
         if not spare:
             raise
         addresses = []
-    last_error: OSError | None = None
     candidates = list(dict.fromkeys([*addresses, *spare]))
+    if dns.guard:
+        candidates = [address for address in candidates if not disallowed_address(address)]
+        if not candidates:
+            raise FetchError(TARGET_REFUSED)
     dns.seen.update(candidates)
     candidates.sort(key=lambda address: address in dns.failed)  # сорвавшиеся — последними
     for address in candidates:
@@ -478,7 +603,8 @@ def check_direct(
 
     ResolveError, OSError (в т. ч. ssl.SSLError: чужой сертификат) — путь не проверен;
     Cancelled — демон останавливается."""
-    sock, _spare = _connect(host, port, timeout, mark, _Dns(bootstrap, strict=True), cancel)
+    sock, _spare = _connect(
+        host, port, timeout, mark, _Dns(bootstrap, strict=True, guard=True), cancel)
     try:
         address = str(sock.getpeername()[0])
         context = ssl.create_default_context()
@@ -570,9 +696,11 @@ def _request_once(
     port = parts.port or default_port
     if cancel is not None and cancel.is_set():
         raise Cancelled
-    address, from_fallback = "", False
+    address, from_fallback, tunnelled = "", False, ""
     if proxy is not None:
-        sock = open_tunnel(proxy, host, port, timeout=timeout, cancel=cancel)
+        target = _tunnel_target(host, dns, proxy, cancel) if isinstance(dns, _Dns) else host
+        tunnelled = target if target != host else ""
+        sock = open_tunnel(proxy, target, port, timeout=timeout, cancel=cancel)
     else:
         sock, from_fallback = _connect(host, port, timeout, mark, dns, cancel)
         # Адрес соединения — для кэша адресов подписок (store.HostCache); подставной сокет
@@ -617,8 +745,8 @@ def _request_once(
             from_fallback=from_fallback,
         )
     except (OSError, http.client.HTTPException):
-        if address and isinstance(dns, _Dns):
-            dns.failed.add(address)  # соединение было, а рукопожатие или ответ — нет
+        if (address or tunnelled) and isinstance(dns, _Dns):
+            dns.failed.add(address or tunnelled)  # соединение было, а рукопожатие или ответ — нет
         raise
     finally:
         with contextlib.suppress(OSError):
@@ -731,7 +859,7 @@ def _parse_a_answers(payload: bytes) -> list[str]:
 
 def doh_query(
     bootstrap_url: str, name: str, *, timeout: float = 8.0, mark: int | None = None,
-    cancel: threading.Event | None = None,
+    cancel: threading.Event | None = None, proxy: tuple[str, int] | None = None,
 ) -> list[str]:
     parts = urlsplit(bootstrap_url)
     path = parts.path or "/dns-query"
@@ -745,6 +873,7 @@ def doh_query(
         mark=mark,
         retries=0,
         cancel=cancel,
+        proxy=proxy,
     )
     if result.status != 200:
         raise ResolveError(f"DoH {masking.mask_url(bootstrap_url)}: HTTP {result.status}")
@@ -788,6 +917,7 @@ def _read_exact(
 def dot_query(
     server: str, name: str, *, port: int = DOT_PORT, timeout: float = 8.0,
     mark: int | None = None, cancel: threading.Event | None = None,
+    proxy: tuple[str, int] | None = None,
 ) -> list[str]:
     """DNS-over-TLS (RFC 7858): запрос DNS с двухбайтовой длиной в соединении TLS к адресу
     резолвера. Сертификат проверяется по самому IP — так у Яндекса, Quad9, AdGuard,
@@ -797,7 +927,8 @@ def dot_query(
         wait_connect(sock, address, timeout, cancel)
 
     wire = _dns_query(name)
-    raw = marknet.connect_marked(server, port, timeout=timeout, mark=mark, connect=connect)
+    raw = (open_tunnel(proxy, server, port, timeout=timeout, cancel=cancel) if proxy is not None
+           else marknet.connect_marked(server, port, timeout=timeout, mark=mark, connect=connect))
     try:
         context = ssl.create_default_context()
         sock = context.wrap_socket(raw, server_hostname=server, do_handshake_on_connect=False)
@@ -829,6 +960,7 @@ def _host_port(text: str, default: int) -> tuple[str, int]:
 def resolve_domain(
     name: str, bootstrap: list[str], *, mark: int | None = None,
     cancel: threading.Event | None = None, public_only: bool = False,
+    proxy: tuple[str, int] | None = None,
 ) -> list[str]:
     """Разрешение домена через bootstrap-резолверы (DoH и DoT по IP, обычный UDP).
 
@@ -840,18 +972,23 @@ def resolve_domain(
 
     NoSuchDomain — адресов нет ни у кого, и хотя бы один резолвер ответил
     определённо (NXDOMAIN или пустой ответ); прочие сбои — ResolveError. cancel — см. fetch_url.
+    proxy — шифрованные резолверы спрашиваются через CONNECT-туннель; о прямой доступности
+    резолвера такой ответ не говорит, поэтому память RESOLVER_PAUSE он не меняет.
     """
     errors: list[str] = []
     absent = ""
+    via = {"proxy": proxy} if proxy is not None else {}
+    went_down = resolver_failed if proxy is None else (lambda _entry: None)
+    answered = resolver_answered if proxy is None else (lambda _entry: None)
     for entry in resolver_order(bootstrap):
         if cancel is not None and cancel.is_set():
             raise Cancelled
         try:
             if entry.startswith("https://"):
-                ips = doh_query(entry, name, mark=mark, cancel=cancel)
+                ips = doh_query(entry, name, mark=mark, cancel=cancel, **via)
             elif entry.startswith("tls://"):
                 server, port = _host_port(entry[len("tls://") :].rstrip("/"), DOT_PORT)
-                ips = dot_query(server, name, port=port, mark=mark, cancel=cancel)
+                ips = dot_query(server, name, port=port, mark=mark, cancel=cancel, **via)
             elif entry.startswith("udp://"):
                 server, port = _host_port(entry[len("udp://") :], 53)
                 ips = plain_dns(server, name, mark=mark, port=port, cancel=cancel)
@@ -861,25 +998,25 @@ def resolve_domain(
             if public_only and ips:
                 public = [ip for ip in ips if not is_bogon(ip)]
                 if not public:
-                    resolver_failed(entry)
+                    went_down(entry)
                     errors.append(
                         f"{masking.mask_url(entry)}: подменённый ответ ({', '.join(ips[:3])})"
                     )
                     continue
                 ips = public
-            resolver_answered(entry)
+            answered(entry)
             if ips:
                 return sorted(set(ips), key=ipaddress.ip_address)
             absent = absent or "у имени нет адреса IPv4"
             errors.append(f"{masking.mask_url(entry)}: пустой ответ")
         except NoSuchDomain as exc:
-            resolver_answered(entry)  # ответил — определённо, а не сбой
+            answered(entry)  # ответил — определённо, а не сбой
             absent = str(exc)
             errors.append(f"{masking.mask_url(entry)}: {exc}")
         except Cancelled:
             raise
         except Exception as exc:
-            resolver_failed(entry)
+            went_down(entry)
             errors.append(f"{masking.mask_url(entry)}: {exc}")
     if absent:
         raise NoSuchDomain(f"домен {name} не разрешается: {absent}")

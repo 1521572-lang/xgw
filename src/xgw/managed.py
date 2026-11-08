@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlsplit
 
+from . import fetch
 from . import priority as priority_levels
 from .parsers.common import parse_links_text
 from .paths import LockTimeout, atomic_write_json, file_lock
@@ -681,6 +682,11 @@ def check_url(url: str) -> str:
     # Только http и https: file:// заставил бы демон читать файлы машины от root.
     if parts.scheme not in ("http", "https") or not host:
         raise ManagedError("адрес подписки должен начинаться с https:// или http://")
+    # Сразу, а не молчаливым сбоем при обновлении. Исключение (allow_private) — только config.toml.
+    try:
+        fetch.check_target(url)
+    except (fetch.FetchError, ValueError) as exc:
+        raise ManagedError(f"адрес подписки не подходит: {exc}") from exc
     return url
 
 

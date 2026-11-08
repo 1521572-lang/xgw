@@ -413,10 +413,13 @@ def _load_subscription(
                 # DNS при упавшем Xray не отвечает. Через Xray хватит одного повтора:
                 # если серверы мертвы, быстрее перейти к прямому запросу.
                 mark=None if via else mark,
-                bootstrap=None if via or mark is None else cfg.dns.resolvers,
+                # Через Xray резолверы спрашиваются по тому же туннелю: в CONNECT идёт
+                # проверенный адрес, а не имя (п. 347, fetch._tunnel_target).
+                bootstrap=cfg.dns.resolvers if via or mark is not None else None,
                 retries=1 if via else 3,
                 cancel=cancel,
-                fallback=hosts.addresses() if hosts is not None and via is None else None,
+                fallback=hosts.addresses() if hosts is not None else None,
+                allow_private=sub.allow_private,
             )
             problem = body_problem(result.body)
             if problem:
