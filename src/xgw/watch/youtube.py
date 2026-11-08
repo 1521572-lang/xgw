@@ -27,6 +27,7 @@ YouTube, у Google — плохая связность с его сетью ил
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
@@ -165,6 +166,47 @@ def _host_label(url: str) -> str:
     закодировано место выхода сервера."""
     host = urlsplit(url).hostname or ""
     return "узла кэша Google" if "---sn-" in host else host
+
+
+def media_candidates(
+    nodes: Sequence[NodeInfo], records: Mapping[str, dict], observatory: Mapping[str, dict],
+    prices: Mapping[str, float], now: float, *, min_mbps: float, sample_ttl: float,
+) -> list[tuple[NodeInfo, float]]:
+    """Кто может быть выходом видео (п. 348), лучшие первыми: (узел, скорость). Только живой
+    безлимитный участник с полным отпечатком и со свежим удачным замером; нет данных — не
+    кандидат. Скорость — вместе с трафиком клиентов, как в check: сервер, через который уже идёт
+    видео, своей загрузкой не разогнать, и выбывать из-за этого он не должен."""
+    found: list[tuple[NodeInfo, float, float]] = []
+    for info in nodes:
+        entry = observatory.get(info.tag) or {}
+        record = records.get(info.fingerprint) or {}
+        price = prices.get(info.fingerprint)
+        mbps, client = record.get("mbps"), record.get("client")
+        if (info.role != "proxy" or len(info.fingerprint) < 8 or not info.probe_port
+                or not entry.get("alive") or price is None or price > 0
+                or record.get("state") != OK or record.get("fails")
+                or not isinstance(mbps, int | float) or isinstance(mbps, bool)
+                or now - float(record.get("ts") or 0) > sample_ttl):
+            continue
+        total = mbps + (client if isinstance(client, int | float) and client > 0 else 0.0)
+        if total >= min_mbps:
+            found.append((info, total, float(entry.get("delay") or 0.0)))
+    found.sort(key=lambda item: (-item[1], item[2], item[0].tag))
+    return [(info, total) for info, total, _delay in found]
+
+
+def media_plan(
+    candidates: Sequence[tuple[NodeInfo, float]], previous: tuple[str, ...], *, gain_pct: float,
+) -> tuple[str, ...]:
+    """Выход видео из кандидатов: лучший, но прежний годный остаётся, если лучший быстрее него
+    меньше чем на gain_pct."""
+    if not candidates:
+        return ()
+    best, top = candidates[0]
+    kept = next((total for info, total in candidates if info.tag in previous), None)
+    if kept is not None and top < kept * (1 + gain_pct / 100):
+        return next(((info.tag,) for info, _total in candidates if info.tag in previous))
+    return (best.tag,)
 
 
 def problem(record: dict) -> str:

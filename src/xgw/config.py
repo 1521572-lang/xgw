@@ -356,6 +356,21 @@ class Routing:
     home_country: str = "RU"
 
 
+@dataclass
+class Media:
+    """Отдельный выход для видео YouTube (п. 348). off — как раньше. best — новые соединения к
+    youtube_domains идут через сервер с лучшим свежим замером, остальной трафик не меняется.
+    Один поток TLS не делится между серверами, видео на шлюзе не кэшируется."""
+
+    youtube_mode: str = "off"
+    youtube_domains: list[str] = field(default_factory=lambda: ["domain:googlevideo.com"])
+    # Замер старше этого не даёт права быть выходом видео. Запасные участники проверяются раз в
+    # 6 ч (daemon.YOUTUBE_OTHERS), поэтому меньше 12 ч срок не бывает: иначе почти все были бы
+    # без свежего замера.
+    youtube_sample_ttl_minutes: int = 720
+    youtube_hold_minutes: int = 10  # плановая смена выхода — не чаще
+
+
 # Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a; 0.2.0): другие операторы и
 # адреса. Яндекс и Quad9 — по DNS-over-TLS (tls://, порт 853): по IP их DoH отвечает только по
 # HTTP/2, а клиент XGW (стандартная библиотека) говорит HTTP/1.1 — проверено 26.10.2026, как и
@@ -544,6 +559,7 @@ class Config:
     speed: Speed = field(default_factory=Speed)
     fragment: Fragment = field(default_factory=Fragment)
     routing: Routing = field(default_factory=Routing)
+    media: Media = field(default_factory=Media)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
     core: CoreSection = field(default_factory=CoreSection)
@@ -567,6 +583,7 @@ _SECTIONS = {
     "speed": Speed,
     "fragment": Fragment,
     "routing": Routing,
+    "media": Media,
     "dns": Dns,
     "xray": XraySection,
     "core": CoreSection,
@@ -1066,6 +1083,7 @@ def _validate(cfg: Config) -> list[str]:
         if not re.fullmatch(r"\d+[smh]", getattr(cfg.probe, name)):
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
     warnings.extend(_validate_speed(cfg.speed))
+    warnings.extend(_validate_media(cfg.media))
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))
     warnings.extend(_validate_hosts(cfg))
@@ -1113,6 +1131,38 @@ _SPEED_LIMITS = {
     "youtube_mbps": (0, 1000),
     "youtube_minutes": (5, 1440),
 }
+
+
+_MEDIA_DOMAIN = re.compile(r"(domain|full):[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+
+
+def _validate_media(media: Media) -> list[str]:
+    """Сбой настройки не должен ломать VPN: что не подошло — выключается с предупреждением."""
+    warnings: list[str] = []
+    if media.youtube_mode == "spread":
+        warnings.append('media.youtube_mode = "spread" пока не поддерживается — выключено')
+        media.youtube_mode = "off"
+    elif media.youtube_mode not in ("off", "best"):
+        warnings.append(f"media.youtube_mode={media.youtube_mode!r}: ожидается off или best — "
+                        "выключено")
+        media.youtube_mode = "off"
+    wrong = [item for item in media.youtube_domains if not _MEDIA_DOMAIN.fullmatch(item)]
+    if wrong:
+        warnings.append("media.youtube_domains: пропущены записи не вида domain:имя или full:имя: "
+                        + ", ".join(wrong))
+        media.youtube_domains = [item for item in media.youtube_domains if item not in wrong]
+    if media.youtube_mode != "off" and not media.youtube_domains:
+        warnings.append("media.youtube_domains пуст — выключено")
+        media.youtube_mode = "off"
+    if not 720 <= media.youtube_sample_ttl_minutes <= 1440:
+        warnings.append(f"media.youtube_sample_ttl_minutes={media.youtube_sample_ttl_minutes}: "
+                        "ожидается 720–1440 — используется 720")
+        media.youtube_sample_ttl_minutes = 720
+    if not 1 <= media.youtube_hold_minutes <= 120:
+        warnings.append(f"media.youtube_hold_minutes={media.youtube_hold_minutes}: ожидается "
+                        "1–120 — используется 10")
+        media.youtube_hold_minutes = 10
+    return warnings
 
 
 def _validate_speed(speed: Speed) -> list[str]:

@@ -394,3 +394,43 @@ def test_lines_stay_when_they_cannot_be_cut_cleanly():
         '[notify\ntelegram_chat_id = "1"\n',
     ):
         assert retire_obsolete(text) == (text, []), text
+
+
+# --- п. 348: выход для видео -----------------------------------------------------------------
+
+
+def _media(tmp_path, body):
+    path = tmp_path / "config.toml"
+    path.write_text(body, encoding="utf-8")
+    return load(path)
+
+
+def test_media_is_off_by_default_and_best_is_accepted(tmp_path):
+    cfg, warnings = _media(tmp_path, "")
+    assert cfg.media.youtube_mode == "off" and warnings == []
+    cfg, warnings = _media(tmp_path, '[media]\nyoutube_mode = "best"\n')
+    assert cfg.media.youtube_mode == "best" and warnings == []
+
+
+@pytest.mark.parametrize("mode", ["spread", "fast", ""])
+def test_media_unknown_or_future_mode_is_off(tmp_path, mode):
+    cfg, warnings = _media(tmp_path, f'[media]\nyoutube_mode = "{mode}"\n')
+    assert cfg.media.youtube_mode == "off" and any("youtube_mode" in item for item in warnings)
+
+
+def test_media_domains_accept_only_matchers(tmp_path):
+    cfg, warnings = _media(tmp_path, (
+        '[media]\nyoutube_mode = "best"\nyoutube_domains = ['
+        '"domain:googlevideo.com", "full:a.example.org", "https://x.y/", "regexp:.*", '
+        '"geosite:x"]\n'))
+    assert cfg.media.youtube_domains == ["domain:googlevideo.com", "full:a.example.org"]
+    assert cfg.media.youtube_mode == "best" and any("youtube_domains" in item for item in warnings)
+    cfg, warnings = _media(tmp_path, '[media]\nyoutube_mode = "best"\nyoutube_domains = []\n')
+    assert cfg.media.youtube_mode == "off" and warnings
+
+
+def test_media_ranges_fall_back(tmp_path):
+    cfg, warnings = _media(tmp_path, (
+        "[media]\nyoutube_sample_ttl_minutes = 60\nyoutube_hold_minutes = 0\n"))
+    assert (cfg.media.youtube_sample_ttl_minutes, cfg.media.youtube_hold_minutes) == (720, 10)
+    assert len(warnings) == 2

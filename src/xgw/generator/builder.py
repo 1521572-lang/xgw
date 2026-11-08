@@ -27,6 +27,7 @@ BALANCER_TAG = "auto"
 # «pool» из допущенных серверов пула (freepool/traffic.py). Все они мертвы или их нет —
 # выход «block»: у такого устройства закрыто, а не подписка и не прямой WAN (R05).
 POOL_BALANCER = "pool"
+YOUTUBE_BALANCER = "youtube"  # выход для видео (п. 348); есть, только пока есть план
 POOL_PREFIX = "pool-"
 # API Xray — Unix-сокет в каталоге службы xgw-xray (RuntimeDirectory), а не порт на 127.0.0.1:
 # к порту мог подключиться любой процесс машины (ASSUMPTIONS п. 253). Стенд и тесты под
@@ -303,6 +304,60 @@ def _referenced_chains(nodes: Sequence[ServerNode], chains: list[ServerNode]) ->
         if nested:
             queue.append(nested)
     return [node for node in chains if node.keep_tag in needed]
+
+
+@dataclass(frozen=True)
+class MediaPlan:
+    """Куда вести видео: теги серверов и домены (config.Media)."""
+
+    outbound_tags: tuple[str, ...]
+    domains: tuple[str, ...]
+
+
+def applied_media(config: Mapping | None) -> tuple[str, ...]:
+    """Теги выхода видео в применённом конфиге; пусто — правила нет."""
+    routing = config.get("routing") if isinstance(config, Mapping) else None
+    balancers = routing.get("balancers") if isinstance(routing, Mapping) else None
+    for balancer in balancers if isinstance(balancers, list) else []:
+        if isinstance(balancer, Mapping) and balancer.get("tag") == YOUTUBE_BALANCER:
+            selector = balancer.get("selector")
+            return tuple(str(tag) for tag in selector) if isinstance(selector, list) else ()
+    return ()
+
+
+def media_problems(config: Mapping | None) -> list[str]:
+    """Что не так с правилом видео в применённом конфиге (`xgw diag`). Пусто — всё согласовано
+    либо правила нет."""
+    routing = config.get("routing") if isinstance(config, Mapping) else None
+    if not isinstance(routing, Mapping):
+        return []
+    rules = [rule for rule in routing.get("rules") or [] if isinstance(rule, Mapping)]
+    at = [index for index, rule in enumerate(rules) if rule.get("balancerTag") == YOUTUBE_BALANCER]
+    balancer = next((item for item in routing.get("balancers") or [] if isinstance(item, Mapping)
+                     and item.get("tag") == YOUTUBE_BALANCER), None)
+    if not at and balancer is None:
+        return []
+    if not at or balancer is None:
+        return ["правило видео и его балансировщик не согласованы"]
+    tags = {str(item.get("tag")) for item in config.get("outbounds") or []
+            if isinstance(item, Mapping)}
+    selector = [str(tag) for tag in balancer.get("selector") or []]
+    problems = []
+    if not selector or not all(tag in tags and tag.startswith("proxy-") for tag in selector):
+        problems.append("в выходе видео сервер, которого нет в конфиге")
+    if any(other != tag and other.startswith(tag) for tag in selector for other in tags):
+        problems.append("выход видео захватывает посторонний сервер: тег — начало другого")
+    if str(balancer.get("fallbackTag")) not in selector:
+        problems.append("запасной выход видео — не его сервер")
+    if applied_whole(config):
+        problems.append("правило видео при режиме «весь дом через пул»")
+    wanted_first = [index for index, rule in enumerate(rules) if rule.get("source")
+                    or rule.get("outboundTag") == "direct"]
+    if wanted_first and at[0] < max(wanted_first):
+        problems.append("правило видео стоит раньше прямых адресов или правил устройств")
+    if at[0] >= len(rules) - 1:
+        problems.append("правило видео стоит после общего правила")
+    return problems
 
 
 def assign_suffixes(nodes: Sequence[ServerNode]) -> dict[str, str]:
@@ -659,6 +714,18 @@ def _apply_sockopt(outbound: dict, mark: int) -> None:
         leg["sockopt"] = sockopt
 
 
+def _media_tags(
+    media: MediaPlan, nodes: Sequence[NodeInfo], outbounds: Sequence[Mapping],
+) -> list[str]:
+    """Теги плана, которые в этой сборке есть среди участников. selector у Xray — начало тега
+    (проверено на 26.10.21: proxy-de-aaaa выбирает и proxy-de-aaaa11), поэтому тег, который
+    начинает другой, не берётся: в группу попал бы посторонний сервер."""
+    members = {info.tag for info in nodes if info.role == "proxy"}
+    every = {str(item.get("tag")) for item in outbounds}
+    return [tag for tag in media.outbound_tags if tag in members
+            and not any(other != tag and other.startswith(tag) for other in every)]
+
+
 def build(
     cfg: Config,
     selection: Selection,
@@ -678,6 +745,7 @@ def build(
     pool: Sequence[ServerNode] = (),
     pool_devices: Sequence[str] = (),
     pool_all: bool = False,
+    media: MediaPlan | None = None,
 ) -> BuildResult:
     """probe_password и probe_ports — из probe_state(применённый конфиг).
 
@@ -697,6 +765,9 @@ def build(
     запросы DNS самого Xray — в «pool» (пуст — в block, кроме прямых доменов и адресов), а
     «auto» из серверов подписки — только входам демона http-in и socks-in: несущий канал для
     списков пула, подписок и обновлений. Свои серверы устройств (Ф4) тогда не действуют.
+
+    media — выход для видео (п. 348): балансировщик и правило по доменам, только если его
+    серверы — участники этой сборки. Нет таких — правила нет, видео идёт общим маршрутом.
 
     fragment — отпечатки серверов, чьё соединение идёт через дробление ClientHello
     (fragment.py; при fragment.mode = "always" — все, кому оно подходит, при "off" — никто).
@@ -945,6 +1016,11 @@ def build(
                       "balancerTag": BALANCER_TAG})
         rules.append({"type": "field", "domain": list(TS_CONTROL), "balancerTag": BALANCER_TAG})
     rest = to_pool if pool_all else {"balancerTag": BALANCER_TAG}
+    media_tags = [] if pool_all or media is None else _media_tags(media, nodes, outbounds)
+    if media_tags:
+        # После прямых адресов и правил устройств: они главнее выхода для видео.
+        rules.append({"type": "field", "domain": list(media.domains),  # type: ignore[union-attr]
+                      "balancerTag": YOUTUBE_BALANCER})
     if cfg.routing.proxy_domains:
         rules.append({"type": "field", "domain": list(cfg.routing.proxy_domains), **rest})
     rules.append({"type": "field", "network": "tcp,udp", **rest})
@@ -1017,6 +1093,15 @@ def build(
                     "strategy": {"type": "leastPing"},
                     "fallbackTag": "block",
                 }] if pool_infos else []),
+                # Отдельный балансировщик, чтобы не трогать burstObservatory (его смена — это
+                # перезапуск Xray): пробы участников уже идут. Стратегия при одном сервере не
+                # влияет на выбор, а fallbackTag держит правило, пока проба не ответила.
+                *([{
+                    "tag": YOUTUBE_BALANCER,
+                    "selector": media_tags,
+                    "strategy": {"type": "leastPing"},
+                    "fallbackTag": media_tags[0],
+                }] if media_tags else []),
             ],
         },
         "burstObservatory": {

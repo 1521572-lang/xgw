@@ -10,9 +10,14 @@ from xgw import rating
 from xgw.config import Config
 from xgw.generator.builder import (
     BuildResult,
+    MediaPlan,
+    NodeInfo,
+    _media_tags,
+    applied_media,
     applied_nodes,
     assign_suffixes,
     build,
+    media_problems,
     member_fingerprints,
     probe_state,
     reserve_fingerprint,
@@ -635,3 +640,89 @@ def test_xhttp_download_leg_gets_the_bypass_mark():
     outbound = {"streamSettings": {"xhttpSettings": {"downloadSettings": bridge}}}
     _apply_sockopt(outbound, 2)
     assert "sockopt" not in bridge
+
+
+# --- п. 348: выход для видео -----------------------------------------------------------------
+
+
+def _media_build(*tags, pool_all=False, tweak=None):
+    raws, _meta, _warnings = parse_links_text("\n".join(links.FULL_LINKS), "test")
+    nodes = [raw_to_node(raw, "test") for raw in raws]
+    cfg = Config()
+    cfg.filters.max_members = 2
+    cfg.routing.proxy_domains = ["domain:example.org"]
+    if tweak is not None:
+        tweak(cfg)
+    selection = select_nodes(nodes, cfg)
+    plain = build(cfg, selection, hosts={}, probe_password="P" * 32)
+    names = [info.tag for info in plain.nodes if info.role == "proxy"]
+    chosen = tuple(names[0] if tag == "first" else tag for tag in tags)
+    plan = MediaPlan(chosen, ("domain:googlevideo.com",))
+    return plain, build(cfg, selection, hosts={}, probe_password="P" * 32, media=plan,
+                        pool_all=pool_all), names
+
+
+def test_empty_media_plan_changes_nothing():
+    plain, built, _names = _media_build()
+    assert built.config == plain.config and applied_media(built.config) == ()
+
+
+def test_media_plan_adds_only_a_balancer_and_a_rule():
+    plain, built, names = _media_build("first")
+    assert built.config["outbounds"] == plain.config["outbounds"]
+    assert built.config["inbounds"] == plain.config["inbounds"]
+    assert built.config["burstObservatory"] == plain.config["burstObservatory"]
+    balancer = built.config["routing"]["balancers"][-1]
+    assert balancer == {"tag": "youtube", "selector": [names[0]],
+                        "strategy": {"type": "leastPing"}, "fallbackTag": names[0]}
+    assert applied_media(built.config) == (names[0],) and media_problems(built.config) == []
+    extra = [rule for rule in built.config["routing"]["rules"]
+             if rule not in plain.config["routing"]["rules"]]
+    assert extra == [{"type": "field", "domain": ["domain:googlevideo.com"],
+                      "balancerTag": "youtube"}]
+
+
+def test_media_rule_stands_after_direct_and_devices_before_the_rest():
+    _plain, built, _names = _media_build("first")
+    rules = built.config["routing"]["rules"]
+    at = next(index for index, rule in enumerate(rules) if rule.get("balancerTag") == "youtube")
+    assert all(rule.get("outboundTag") != "direct" and "source" not in rule
+               for rule in rules[at + 1:])
+    assert rules[at + 1]["domain"] == ["domain:example.org"]
+    assert rules[-1]["network"] == "tcp,udp" and rules[-1]["balancerTag"] == "auto"
+    assert all(rule.get("inboundTag") != ["probe"] and rule.get("balancerTag") != "youtube"
+               for rule in rules if "inboundTag" in rule)
+
+
+def test_media_plan_ignores_servers_outside_this_build_and_whole_house():
+    plain, built, _names = _media_build("proxy-zz-0000")
+    assert built.config == plain.config
+    _plain, whole, _names = _media_build("first", pool_all=True)
+    assert applied_media(whole.config) == ()
+
+
+def test_media_tag_that_prefixes_another_is_not_used():
+    """selector у Xray — начало тега: посторонний сервер попал бы в группу."""
+    infos = [NodeInfo("a" * 16, "proxy-de-aaaa", "probe-a", 1, "proxy")]
+    outbounds = [{"tag": "proxy-de-aaaa"}, {"tag": "proxy-de-aaaa11"}]
+    assert _media_tags(MediaPlan(("proxy-de-aaaa",), ()), infos, outbounds) == []
+    assert _media_tags(MediaPlan(("proxy-de-aaaa",), ()), infos, outbounds[:1]) == ["proxy-de-aaaa"]
+
+
+def test_media_problems_find_a_broken_applied_config():
+    _plain, built, names = _media_build("first")
+    config = json.loads(json.dumps(built.config))
+    balancer = config["routing"]["balancers"][-1]
+    balancer["selector"] = ["proxy-zz-0000"]
+    assert "нет в конфиге" in media_problems(config)[0]
+    balancer["selector"], balancer["fallbackTag"] = [names[0]], "direct"
+    assert any("запасной" in item for item in media_problems(config))
+    config = json.loads(json.dumps(built.config))
+    config["routing"]["balancers"].pop()
+    assert "не согласованы" in media_problems(config)[0]
+    config = json.loads(json.dumps(built.config))
+    rules = config["routing"]["rules"]
+    rule = next(item for item in rules if item.get("balancerTag") == "youtube")
+    rules.remove(rule)
+    rules.insert(0, rule)
+    assert any("раньше" in item for item in media_problems(config))

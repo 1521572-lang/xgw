@@ -156,6 +156,7 @@ class Diag:
             ("Трафик проверок", self._budget),
             ("Tailscale", self._tailscale),
             ("Бесплатный пул", self._free_pool),
+            ("YouTube", self._media),
         ]
         groups += [
             ("QUIC", self._quic),
@@ -385,6 +386,17 @@ class Diag:
             except Exception:
                 self._xray_up = False
         return self._xray_up
+
+    def _media(self) -> list[Check]:
+        """Выход для видео YouTube (п. 348): правило, балансировщик и его серверы согласованы."""
+        applied = engine.read_json(self.paths.xray_config_file)
+        problems = builder.media_problems(applied)
+        if problems:
+            return [Check("YouTube", WARN, "; ".join(problems), "sudo xgw apply --now")]
+        tags = builder.applied_media(applied)
+        if tags:
+            return [Check("YouTube", OK, "отдельный выход для видео: " + ", ".join(tags))]
+        return []
 
     def _xray_api(self) -> list[Check]:
         if self.xray_bin is None or not (self.installed or self.xray_up()):

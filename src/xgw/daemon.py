@@ -276,6 +276,9 @@ YOUTUBE_KEEP = 7 * 86400.0
 YOUTUBE_CAROUSEL = 3600.0
 YOUTUBE_CAROUSEL_COUNT = 3
 YOUTUBE_PAUSE = 2 * 3600.0
+# Выход для видео (п. 348): повтор сборки, если план не применился, и чтения его балансировщика.
+MEDIA_RETRY = 300.0
+MEDIA_VERIFY = 60.0
 # Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
 # HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
 HOUSE_SYNC = 300.0
@@ -772,6 +775,13 @@ class Daemon:
         self._youtube_switches: list[float] = []
         self._youtube_paused_until = 0.0
         self._youtube_noted: set[str] = set()
+        # Выход для видео (_media_step): когда менялся план, когда повторять сборку и проверку
+        # балансировщика, какой план подтверждён, что показывать в статусе.
+        self._media_changed_at = 0.0
+        self._media_retry_at = 0.0
+        self._media_verify_at = 0.0
+        self._media_verified: tuple[str, ...] = ()
+        self._media_view: dict = {"state": "off"}
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
@@ -1256,6 +1266,11 @@ class Daemon:
         self._youtube_switches = list(previous._youtube_switches)
         self._youtube_paused_until = previous._youtube_paused_until
         self._youtube_noted = set(previous._youtube_noted)
+        self._media_changed_at = previous._media_changed_at
+        self._media_retry_at = previous._media_retry_at
+        self._media_verify_at = previous._media_verify_at
+        self._media_verified = previous._media_verified
+        self._media_view = previous._media_view
         self.diary = previous.diary
         self.diary.store = self.store
         self._house_synced_at = previous._house_synced_at
@@ -1641,6 +1656,7 @@ class Daemon:
         if signals.xray_ok and not changed:  # после перезапуска Xray пробы ядра устарели
             self._pool_speed_step(applied, observatory or {}, now)
             self._youtube_step(view, applied, observatory or {}, now)
+            self._media_step(view, applied, observatory or {}, now)
         at = self._spent("замер пула и YouTube", at)
         if state is not State.WAN_DOWN:
             self._cores_step()
@@ -2651,6 +2667,7 @@ class Daemon:
         files = (self.paths.config_file, managed.path_for(self.paths.config_file),
                  self.paths.xray_config_file, self.paths.singbox_config_file,
                  self.paths.devices_down_file, self.paths.var / "probe-fallback.json",
+                 engine.media_file(self.paths),
                  self.xray_bin, singboxing.find_binary(None, self.paths))
         def version(path):
             if path is None:
@@ -4038,13 +4055,14 @@ class Daemon:
         if traffic.whole_house(self.cfg):
             return targets
         current = self._youtube_main_tag(view)
+        media = set(builder.applied_media(applied))  # выход видео несёт видео, хоть и не основной
         prices = self._prices()
         for info in view:
             price = prices.get(info.fingerprint)
             if (len(info.fingerprint) < 8 or not info.probe_port or price is None
                     or price >= speed.SKIP_PRICE):
                 continue
-            carries = info.tag == current
+            carries = info.tag == current or info.tag in media
             if carries or (info.role == "proxy" and price <= 0 and alive(info)):
                 targets.append((info, info.fingerprint, carries, price <= 0, False))
         return targets
@@ -4130,6 +4148,100 @@ class Daemon:
             if verdict.state != youtube.OK:
                 self.diary.count("youtube_" + verdict.state)
         self._youtube_manual(view, info, key, pooled)
+
+    def _media_wanted(
+        self, view: list[NodeInfo], observatory: dict, saved: tuple[str, ...], wall: float,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Состояние выхода для видео и его теги (п. 348). Ручной выбор и режим «весь дом» главнее:
+        правила нет, видео идёт вместе с остальным. Нет данных — тоже нет правила, а не прямой
+        выход мимо VPN."""
+        media, measuring = self.cfg.media, self.cfg.speed
+        if media.youtube_mode == "off":
+            return "off", ()
+        if traffic.whole_house(self.cfg):
+            return "pool_all", ()
+        if not measuring.youtube or not measuring.youtube_mbps:
+            return "disabled_no_measurements", ()
+        pin = self._manual_pin()
+        if pin is not None and not pin.get("down"):
+            return "manual_pin", ()
+        candidates = youtube.media_candidates(
+            view, self._youtube_records(), observatory, self._prices(), wall,
+            min_mbps=measuring.youtube_mbps, sample_ttl=media.youtube_sample_ttl_minutes * 60.0,
+        )
+        plan = youtube.media_plan(candidates, saved, gain_pct=measuring.gain_pct)
+        # Лучший нашёлся, а прежний годен: плановая смена — не чаще hold. Негодный уходит сразу.
+        held = (saved and plan != saved
+                and set(saved) <= {info.tag for info, _total in candidates}
+                and wall - self._media_changed_at < media.youtube_hold_minutes * 60.0)
+        tags = saved if held else plan
+        return ("best" if tags else "waiting_for_samples"), tags
+
+    def _media_step(
+        self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
+    ) -> None:
+        """Выход для видео: план → файл (его читает сборка) → обычная сборка и применение; смена
+        только правил идёт через API, без перезапуска Xray. Основной сервер не трогает."""
+        saved = engine.media_tags(self.paths)
+        current = builder.applied_media(applied)
+        if self.cfg.media.youtube_mode == "off" and not saved and not current:
+            self._media_view = {"state": "off"}
+            return
+        wall = self.wall()
+        state, wanted = self._media_wanted(view, observatory, saved, wall)
+        if wanted != saved:
+            try:
+                engine.save_media(self.paths, wanted)
+            except OSError as exc:
+                self.log.error("выход для видео не записан: %s", exc)
+                self._media_view = {"state": "degraded", "tags": list(current), "samples": []}
+                return
+            self._media_changed_at = wall
+            self._media_retry_at = 0.0
+            self.notifier.event("youtube", (
+                f"новые соединения видео YouTube идут через {wanted[0]}" if wanted
+                else "видео YouTube идёт общим маршрутом"))
+        if current != wanted:
+            if now >= self._media_retry_at and not self.stopping:
+                self._media_retry_at = now + MEDIA_RETRY
+                self._rebuild(None, urgent=False, reason="YouTube: выход для видео")
+            state = "degraded" if wall - self._media_changed_at > MEDIA_RETRY else "applying"
+        elif wanted and not self._media_confirmed(wanted, now):
+            state = "degraded"
+        self._media_view = {"state": state, "tags": list(wanted), "samples": self._media_samples(
+            view, wanted, wall)}
+
+    def _media_confirmed(self, wanted: tuple[str, ...], now: float) -> bool:
+        """Ядро знает этот балансировщик и выбирает только его серверы (проверка — один раз на
+        план; не вышло — снова через MEDIA_VERIFY)."""
+        if self._media_verified == wanted:
+            return True
+        if now < self._media_verify_at:
+            return False
+        self._media_verify_at = now + MEDIA_VERIFY
+        try:
+            info = self.api.balancer_state(builder.YOUTUBE_BALANCER)
+        except ApiError as exc:
+            self.log.warning("выход для видео не подтверждён: %s", exc)
+            return False
+        if not set(info.selects) <= set(wanted):
+            self.log.warning("выход для видео: ядро выбирает другие серверы")
+            return False
+        self._media_verified = wanted
+        return True
+
+    def _media_samples(
+        self, view: list[NodeInfo], tags: tuple[str, ...], wall: float,
+    ) -> list[dict]:
+        """Откуда взят выбор — для статуса: косвенный замер файла Google, а не скорость видео."""
+        records = self._youtube_records()
+        samples = []
+        for info in view:
+            record = records.get(info.fingerprint)
+            if info.tag in tags and record is not None:
+                samples.append({"tag": info.tag, "mbps": record.get("mbps"),
+                                "age_s": round(max(0.0, wall - float(record.get("ts") or 0)))})
+        return samples
 
     def _youtube_check(self, info: NodeInfo, password: str, *, client: float,
                        measure: bool) -> youtube.Verdict:
@@ -6919,6 +7031,7 @@ class Daemon:
         }
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
+        snapshot["media"] = self._media_view  # выход для видео YouTube (п. 348)
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

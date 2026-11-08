@@ -513,6 +513,22 @@ def read_json(path: Path) -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def media_file(paths: Paths) -> Path:
+    """Выход для видео, выбранный демоном (п. 348): отдельным файлом, как devices_down, — чтобы
+    его учитывали сборки всех команд, а сборка со старым выбором не применилась."""
+    return paths.var / "youtube-media.json"
+
+
+def media_tags(paths: Paths) -> tuple[str, ...]:
+    data = read_json(media_file(paths))
+    tags = data.get("tags") if data is not None else None
+    return tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, list) else ()
+
+
+def save_media(paths: Paths, tags: tuple[str, ...]) -> None:
+    atomic_write_json(media_file(paths), {"tags": list(tags)}, mode=0o644)
+
+
 def assemble(
     cfg: config.Config,
     paths: Paths,
@@ -672,6 +688,8 @@ def assemble(
                              *(applied_ports or {}).values()},
                 api_listen=str(paths.xray_api_socket),
                 pool=pool_nodes, pool_devices=pool_devs, pool_all=pool_all,
+                media=None if cfg.media.youtube_mode == "off" else builder.MediaPlan(
+                    media_tags(paths), tuple(cfg.media.youtube_domains)),
             )
         except builder.BuildError as exc:
             raise EngineError(str(exc)) from exc

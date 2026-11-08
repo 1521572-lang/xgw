@@ -14,7 +14,7 @@ from xgw import engine, fetch
 from xgw.apply.applier import ApplyOutcome
 from xgw.apply.singbox import SingboxOutcome
 from xgw.config import Config, Subscription
-from xgw.daemon import Daemon
+from xgw.daemon import MEDIA_VERIFY, Daemon
 from xgw.generator import builder
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
@@ -3137,3 +3137,131 @@ def test_leak_reports_success_only_after_the_rules_are_confirmed(guarded, monkey
     capture.loaded = lambda: True
     daemon._handle_leak()
     assert len(leaks()) == 2 and "загружены заново и проверены" in leaks()[0]  # новые — первыми
+
+
+# --- п. 348: выход для видео -----------------------------------------------------------------
+
+
+def _media_ready(daemon, *, mbps=None):
+    """Режим best, живые участники и свежие удачные замеры YouTube."""
+    daemon.cfg.media.youtube_mode = "best"
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    view = builder.applied_nodes(applied, daemon.inventory.nodes)
+    members = [info for info in view if info.role == "proxy"]
+    observatory = {info.tag: {"alive": True, "delay": 0.1} for info in members}
+    daemon._youtube = {
+        info.fingerprint: {"state": "ok", "fails": 0, "ts": daemon.t,
+                           "mbps": (mbps or {}).get(info.tag, 50.0 - index * 30)}
+        for index, info in enumerate(members)}
+    monkey_prices = {info.fingerprint: 0.0 for info in view}
+    daemon._prices = lambda: monkey_prices
+    return view, observatory, members
+
+
+def _media_run(daemon, view, observatory):
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    daemon._build_applied = False  # новый шаг: одна сборка применяется за шаг
+    daemon._media_step(view, applied, observatory, daemon.t)
+    deadline = time.monotonic() + 5
+    while daemon._build is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+        daemon._finish_build()
+    return engine.read_json(daemon.paths.xray_config_file)
+
+
+def test_media_best_is_applied_through_the_api_without_touching_main(daemon):
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    daemon.main = None
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (members[0].tag,)
+    assert engine.media_tags(daemon.paths) == (members[0].tag,)
+    daemon.t += 1
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "best"
+    assert daemon._media_view["samples"][0]["mbps"] == 50.0
+    assert not any(kind == "pin" for kind, *_rest in daemon.api.calls)
+    assert sum("новые соединения видео" in event for event in daemon.events()) == 1
+
+
+def test_media_off_has_no_plan_and_builds_nothing(daemon):
+    _started(daemon)
+    builds = daemon._build_count
+    view, observatory, _members = _media_ready(daemon)
+    daemon.cfg.media.youtube_mode = "off"
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view == {"state": "off"} and daemon._build_count == builds
+    assert not engine.media_file(daemon.paths).exists()
+
+
+def test_media_waits_without_samples_and_keeps_the_common_route(daemon):
+    _started(daemon)
+    view, observatory, _members = _media_ready(daemon)
+    daemon._youtube = {}
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == () and daemon._media_view["state"] == (
+        "waiting_for_samples")
+    assert not any(rule.get("outboundTag") == "direct" and rule.get("domain") == [
+        "domain:googlevideo.com"] for rule in applied["routing"]["rules"])
+
+
+@pytest.mark.parametrize("change,state", [
+    (lambda cfg: setattr(cfg.speed, "youtube", False), "disabled_no_measurements"),
+    (lambda cfg: setattr(cfg.speed, "youtube_mbps", 0), "disabled_no_measurements"),
+])
+def test_media_needs_measurements(daemon, change, state):
+    _started(daemon)
+    view, observatory, _members = _media_ready(daemon)
+    change(daemon.cfg)
+    daemon._media_step(view, engine.read_json(daemon.paths.xray_config_file), observatory, daemon.t)
+    assert daemon._media_view["state"] == state and engine.media_tags(daemon.paths) == ()
+
+
+def test_media_yields_to_a_manual_pin(daemon, monkeypatch):
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    monkeypatch.setattr(daemon, "_manual_pin", lambda: {"tag": members[1].tag})
+    daemon._media_step(view, engine.read_json(daemon.paths.xray_config_file), observatory, daemon.t)
+    assert daemon._media_view["state"] == "manual_pin" and engine.media_tags(daemon.paths) == ()
+
+
+def test_media_hold_blocks_a_planned_change_but_not_a_bad_server(daemon):
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon, mbps={})
+    first, second = members[0].tag, members[1].tag
+    wall = daemon.t
+    daemon._youtube[members[1].fingerprint]["mbps"] = 500.0
+    daemon._media_changed_at = wall
+    assert daemon._media_wanted(view, observatory, (first,), wall) == ("best", (first,))
+    late = wall + daemon.cfg.media.youtube_hold_minutes * 60 + 1
+    for record in daemon._youtube.values():
+        record["ts"] = late
+    assert daemon._media_wanted(view, observatory, (first,), late) == ("best", (second,))
+    daemon._youtube[members[0].fingerprint]["state"] = "slow"  # негодный — сразу, без hold
+    assert daemon._media_wanted(view, observatory, (first,), wall) == ("best", (second,))
+
+
+def test_media_exit_is_checked_like_a_carrier(daemon):
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    applied = json.loads(json.dumps(engine.read_json(daemon.paths.xray_config_file)))
+    applied["routing"]["balancers"].append(
+        {"tag": "youtube", "selector": [members[1].tag], "fallbackTag": members[1].tag})
+    targets = {item[0].tag: item[2] for item in daemon._youtube_targets(view, applied, observatory)}
+    assert targets[members[1].tag] is True
+
+
+def test_media_unconfirmed_balancer_is_degraded(daemon):
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    _media_run(daemon, view, observatory)
+    daemon.api.down = True
+    daemon._media_verified, daemon._media_verify_at = (), 0.0
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "degraded"
+    assert builder.applied_media(engine.read_json(daemon.paths.xray_config_file)) == (
+        members[0].tag,)
+    daemon.api.down = False
+    daemon.t += MEDIA_VERIFY + 1
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "best"

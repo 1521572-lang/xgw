@@ -5,10 +5,13 @@
 ado, вызове `bi` без тега и перезапуске с ожиданием готовности.
 """
 
+import contextlib
 import copy
 import datetime
+import http.server
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -173,3 +176,64 @@ def test_unsupported_outbounds_are_found():
     assert sorted(invalid) == ["spare-de-bbbb", "spare-us-cccc"]
     # в причине — суть ошибки, без пути к временному файлу
     assert all(reason and ".json" not in reason for reason in invalid.values())
+
+
+def test_media_balancer_selects_only_its_server(tmp_path):
+    """п. 348, настоящий Xray: балансировщик с полным тегом выбирает его одного, добавляется и
+    меняется через API, без перезапуска; основной балансировщик видит всех."""
+    handler = type("Ok", (http.server.BaseHTTPRequestHandler,), {
+        "do_GET": lambda self: (self.send_response(204), self.end_headers()),
+        "log_message": lambda self, *args: None,
+    })
+    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=origin.serve_forever, daemon=True).start()
+    socket_path = tmp_path / "api.sock"
+    config = {
+        "log": {"loglevel": "warning"},
+        "api": {"tag": "api", "listen": str(socket_path),
+                "services": ["HandlerService", "RoutingService", "StatsService"]},
+        "inbounds": [{"tag": "http-in", "protocol": "http", "listen": "127.0.0.1",
+                      "port": free_port()}],
+        "outbounds": [{"tag": tag, "protocol": "freedom"}
+                      for tag in ("proxy-de-aaaa", "proxy-nl-bbbb")],
+        "routing": {"rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}],
+                    "balancers": [{"tag": "auto", "selector": ["proxy-"],
+                                   "strategy": {"type": "leastPing"},
+                                   "fallbackTag": "proxy-de-aaaa"}]},
+        "burstObservatory": {"subjectSelector": ["proxy-"], "pingConfig": {
+            "destination": f"http://127.0.0.1:{origin.server_address[1]}/", "connectivity": "",
+            "interval": "1s", "sampling": 1, "timeout": "2s", "httpMethod": "GET"}},
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    service = ProcessXrayService(Path(XRAY_BIN), path)
+    api = ApiClient(Path(XRAY_BIN), server=f"unix://{socket_path}", timeout=5)
+    service.start()
+
+    def media(tag):
+        return {**config["routing"], "rules": [
+            {"type": "field", "domain": ["domain:googlevideo.com"], "balancerTag": "youtube"},
+            *config["routing"]["rules"]],
+            "balancers": [*config["routing"]["balancers"], {
+                "tag": "youtube", "selector": [tag], "strategy": {"type": "leastPing"},
+                "fallbackTag": tag}]}
+
+    def selected(balancer, wanted):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            with contextlib.suppress(ApiError):
+                got = api.balancer_state(balancer).selects
+                if got == wanted:
+                    return True
+            time.sleep(0.3)
+        return False
+
+    try:
+        api.replace_routing(media("proxy-nl-bbbb"))
+        assert selected("youtube", ("proxy-nl-bbbb",))
+        api.replace_routing(media("proxy-de-aaaa"))
+        assert selected("youtube", ("proxy-de-aaaa",))
+        assert service.is_active()
+    finally:
+        service.stop()
+        origin.shutdown()

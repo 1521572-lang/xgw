@@ -638,3 +638,12 @@ def test_start_records_identity_and_own_child_is_reaped(tmp_path, fake_xray):
     service.stop()
     assert child.returncode is not None and service._proc is None
     assert not service.identity_file.exists()
+
+
+def test_media_status_line():
+    assert status.render_media({"state": "off"}) == "" and status.render_media({}) == ""
+    assert "ждёт свежих замеров" in status.render_media({"state": "waiting_for_samples"})
+    assert "НЕ ПОДТВЕРЖДЕНО" in status.render_media({"state": "degraded"})
+    line = status.render_media({"state": "best", "tags": ["proxy-de-1"], "samples": [
+        {"tag": "proxy-de-1", "mbps": 18.0, "age_s": 720}]})
+    assert line == "YouTube: отдельный выход для видео — proxy-de-1 (18 Мбит/с, замер 12 мин назад)"

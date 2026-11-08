@@ -3,8 +3,11 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from xgw import config
 from xgw.config import Config
+from xgw.generator.builder import NodeInfo
 from xgw.watch import youtube
 from xgw.watch.checks import DownloadResult
 
@@ -132,3 +135,76 @@ def test_youtube_speed_cut_by_time_is_slow(monkeypatch):
     _fake(monkeypatch, {SITE: ANSWER, VIDEO: ANSWER, FILE: crawl})
     verdict = youtube.check(NODE, Config(), probe_pass="x")
     assert verdict.state == youtube.SLOW and verdict.mbps == 0.1
+
+
+# --- п. 348: выход для видео -----------------------------------------------------------------
+
+
+FP = {"a": "a" * 16, "b": "b" * 16, "c": "c" * 16}
+NOW = 100_000.0
+
+
+def _info(name, role="proxy"):
+    return NodeInfo(fingerprint=FP[name], tag=f"{role}-x-{name}", probe_tag=f"probe-x-{name}",
+                    probe_port=20000, role=role)
+
+
+def _good(mbps=20.0, **extra):
+    return {"state": youtube.OK, "fails": 0, "mbps": mbps, "ts": NOW - 60, **extra}
+
+
+def _pick(records, *, nodes=None, alive=("a", "b", "c"), prices=None):
+    nodes = nodes if nodes is not None else [_info("a"), _info("b")]
+    observatory = {f"proxy-x-{name}": {"alive": name in alive, "delay": 0.1} for name in FP}
+    return youtube.media_candidates(
+        nodes, records, observatory,
+        prices if prices is not None else dict.fromkeys(FP.values(), 0.0),
+        NOW, min_mbps=5, sample_ttl=3600.0)
+
+
+@pytest.mark.parametrize("record", [
+    None,
+    {},
+    _good(ts=NOW - 7200),
+    {**_good(), "state": youtube.UNKNOWN},
+    {**_good(), "state": "cancelled"},
+    {**_good(), "state": youtube.SLOW},
+    {**_good(), "state": youtube.BLOCKED},
+    {**_good(), "fails": 1},
+    _good(mbps=None),
+    _good(mbps=4.9),
+], ids=["no-record", "empty", "stale", "unknown", "cancelled", "slow", "blocked", "failed-once",
+        "no-speed", "below-threshold"])
+def test_media_candidate_needs_a_fresh_good_sample(record):
+    assert _pick({FP["a"]: record} if record is not None else {}) == []
+
+
+def test_media_candidate_excludes_other_roles_dead_and_limited():
+    records = {FP["a"]: _good()}
+    assert _pick(records, alive=()) == []
+    assert _pick(records, nodes=[_info("a", "spare")]) == []
+    assert _pick(records, nodes=[_info("a", "pool")]) == []
+    assert _pick(records, prices={FP["a"]: 1.0}) == []
+    assert _pick(records, prices={}) == []  # цена неизвестна — данных нет, это не «безлимитный»
+
+
+def test_media_plan_takes_the_best_and_breaks_ties_by_tag():
+    candidates = _pick({FP["a"]: _good(10.0), FP["b"]: _good(30.0)})
+    assert youtube.media_plan(candidates, (), gain_pct=30) == ("proxy-x-b",)
+    equal = _pick({FP["a"]: _good(20.0), FP["b"]: _good(20.0)})
+    assert youtube.media_plan(equal, (), gain_pct=30) == ("proxy-x-a",)
+
+
+def test_media_plan_keeps_the_previous_within_the_gain():
+    candidates = _pick({FP["a"]: _good(20.0), FP["b"]: _good(25.0)})
+    assert youtube.media_plan(candidates, ("proxy-x-a",), gain_pct=30) == ("proxy-x-a",)
+    faster = _pick({FP["a"]: _good(20.0), FP["b"]: _good(26.0)})
+    assert youtube.media_plan(faster, ("proxy-x-a",), gain_pct=30) == ("proxy-x-b",)
+    assert youtube.media_plan([], ("proxy-x-a",), gain_pct=30) == ()
+
+
+def test_busy_exit_is_not_dropped_for_its_own_clients():
+    """Выход, через который уже идёт видео, своей загрузкой не разогнать (как в check)."""
+    busy = _pick({FP["a"]: _good(2.0, client=20.0)})
+    assert [(info.tag, total) for info, total in busy] == [("proxy-x-a", 22.0)]
+    assert _pick({FP["a"]: _good(2.0)}) == []  # чужая загрузка в чужой записи не считается

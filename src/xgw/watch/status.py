@@ -1139,6 +1139,34 @@ def render_budget(budget: dict) -> list[str]:
     return lines
 
 
+MEDIA_STATES = {
+    "pool_all": "общий маршрут: весь дом идёт через бесплатный пул",
+    "disabled_no_measurements": "не действует: выключены проверки YouTube или порог скорости "
+                                "([speed] youtube, youtube_mbps), идёт общим маршрутом",
+    "waiting_for_samples": "ждёт свежих замеров, пока идёт общим маршрутом",
+    "manual_pin": "приостановлено ручным выбором сервера, идёт вместе с остальным",
+    "applying": "применяется",
+    "degraded": "НЕ ПОДТВЕРЖДЕНО: выход не применён или ядро его не показывает (sudo xgw diag)",
+}
+
+
+def render_media(media: dict) -> str:
+    """Выход для видео (п. 348). Скорость — замер файла Google, а не самого видео."""
+    state = media.get("state")
+    if not state or state == "off":
+        return ""
+    if state != "best":
+        return f"YouTube: {MEDIA_STATES.get(state, state)}"
+    parts = []
+    for sample in media.get("samples") or []:
+        mbps = sample.get("mbps")
+        speed = f"{mbps:g} Мбит/с, " if isinstance(mbps, int | float) else ""
+        parts.append(f"{sample.get('tag')} ({speed}замер {int(sample.get('age_s') or 0) // 60} "
+                     "мин назад)")
+    return "YouTube: отдельный выход для видео — " + (
+        ", ".join(parts) or ", ".join(media.get("tags") or []))
+
+
 def render_status(status: dict) -> str:
     lines: list[str] = []
     if status.get("daemon_down"):
@@ -1165,6 +1193,9 @@ def render_status(status: dict) -> str:
         lines.append(singbox_line)
     if status.get("probe_target"):
         lines.append(status["probe_target"])
+    media_line = render_media(status.get("media") or {})
+    if media_line:
+        lines.append(media_line)
     pool = status.get("free_pool")
     if isinstance(pool, dict):
         regions = ", ".join(f"{name} {count}" for name, count in sorted(
