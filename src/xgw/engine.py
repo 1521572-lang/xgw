@@ -348,6 +348,20 @@ def _is_ip(host: str) -> bool:
     return True
 
 
+def body_problem(body: bytes) -> str:
+    """Почему ответ подписки — не список серверов, по самому телу; пусто — похоже на подписку
+    (дальше решает разбор). Политика одна (п. 342): ни пустой ответ, ни страница HTML (вход,
+    капча, заглушка провайдера), ни ошибка сети пригодный набор не затирают — в работе остаётся
+    последняя удачная версия из кэша, а причина видна в панели и статусе."""
+    text = body.decode("utf-8", "replace").lstrip(chr(0xFEFF)).strip()
+    if not text:
+        return "пустой ответ (серверов нет)"
+    head = text[:512].lower()
+    if head.startswith(("<!doctype", "<html", "<?xml", "<head", "<body")) or "<html" in head:
+        return "вместо подписки пришла страница HTML"
+    return ""
+
+
 def _drop_junk(raws: list[RawServer]) -> list[RawServer]:
     """Без служебных адресов (0.0.0.0, loopback, порт вне диапазона).
 
@@ -394,10 +408,15 @@ def _load_subscription(
                 cancel=cancel,
                 fallback=hosts.addresses() if hosts is not None and via is None else None,
             )
+            problem = body_problem(result.body)
+            if problem:
+                raise ParseError(problem)
             raws, meta, sub_warnings = parse_body(result.body, sub.name)
+            parsed = len(raws)
             raws = _drop_junk(raws)
             if not raws:
-                raise ParseError("в ответе нет серверов")
+                raise ParseError("в ответе только служебные адреса (заглушка)" if parsed
+                                 else "в ответе нет серверов")
         except (fetch.FetchError, ParseError) as exc:
             logger.error("подписка %s, запрос %s: %s", label, route, exc)
             error = masking.mask_text(str(exc))[:300]
@@ -449,8 +468,8 @@ def _load_subscription(
         return [], {}, error
     age_min = max(0, int((time.time() - cached.saved_at) // 60)) if cached.saved_at else 0
     logger.warning(
-        "подписка %s: используется кэш (%d серверов, сохранён %d мин назад)",
-        label, len(raws), age_min,
+        "подписка %s: используется кэш (%d серверов, сохранён %d мин назад): %s",
+        label, len(raws), age_min, error,
     )
     return raws, cached.userinfo, error
 

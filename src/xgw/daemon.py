@@ -58,7 +58,7 @@ from .model import ServerNode
 from .net import cmd, conncheck, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
-from .store import Store
+from .store import Store, SubscriptionCache
 from .watch import checks, scan, shadow, speed, status, target, youtube
 from .watch import guard as speedguard
 from .watch import hosts as probehosts
@@ -2857,6 +2857,32 @@ class Daemon:
                 self.store.set_meta("sub_errors", json.dumps(errors, ensure_ascii=False))
         except Exception as exc:  # состояние не критично для работы шлюза
             self.log.error("ошибки подписок не записаны: %s", exc)
+
+    def _subscription_status(self, snapshot: dict) -> None:
+        """Подписки в status.json (п. 342, новые поля — прежние потребители JSON их не
+        замечают): last_ok_ts — когда подписку в последний раз удалось получить (кэш пишется
+        только с удачного ответа), set_age_s — возраст сохранённого набора, cache_reason —
+        почему последний опрос оставил прежний набор (текст маскирован), его время."""
+        entries = snapshot.get("subscriptions")
+        if not isinstance(entries, list) or not entries:
+            return
+        try:
+            errors = json.loads(self.store.get_meta("sub_errors") or "{}")
+        except Exception:  # битая запись или база недоступна — без причины
+            errors = {}
+        errors = errors if isinstance(errors, dict) else {}
+        cache = SubscriptionCache(self.paths.cache_dir)
+        now = self.wall()
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str):
+                continue
+            saved = cache.saved_at(name)
+            entry["last_ok_ts"] = saved or None
+            entry["set_age_s"] = round(max(0.0, now - saved)) if saved else None
+            problem = errors.get(name) if isinstance(errors.get(name), dict) else {}
+            entry["cache_reason"] = str(problem.get("error") or "") or None
+            entry["cache_reason_ts"] = problem.get("ts") if problem else None
 
     def _collect(self, via_xray: bool) -> engine.Inventory:
         """Опрос подписок; идёт в фоновом потоке (_start_fetch)."""
@@ -6862,6 +6888,7 @@ class Daemon:
         }
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
+        self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {
             "state": ("queued" if job.discard else "ready" if job.done.is_set() else "building")

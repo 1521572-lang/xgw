@@ -1223,6 +1223,11 @@ def render_status(status: dict) -> str:
     for sub in status.get("subscriptions") or []:
         if sub.get("name") not in quotas and not sub.get("limited"):
             lines.append(f"Подписка «{sub['name']}»: безлимитная (лимит трафика не сообщает)")
+        if sub.get("cache_reason"):
+            # Опрос не удался — в работе прежний набор (п. 342): когда он получен и почему.
+            since = (f" — в работе набор от {_clock(sub['last_ok_ts'])}"
+                     if sub.get("last_ok_ts") else " — сохранённого набора нет")
+            lines.append(f"Подписка «{sub['name']}»: не обновилась ({sub['cache_reason']}){since}")
     selection = status.get("selection") or {}
     if selection.get("note"):
         lines.append(f"Запас: {selection['note']}")
