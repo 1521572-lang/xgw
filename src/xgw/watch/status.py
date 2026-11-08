@@ -21,7 +21,7 @@ from ..config import Config, parse_seconds, probe_bytes
 from ..generator import profiles as profiling
 from ..generator.builder import NodeInfo, reserve_tag
 from ..paths import Paths, atomic_write_json
-from ..store import Store
+from ..store import EXPIRED_REASON, Store
 from . import guard as speedguard
 from . import hosts as probehosts
 from . import resolvers as resolving
@@ -1227,6 +1227,8 @@ def render_status(status: dict) -> str:
             # Опрос не удался — в работе прежний набор (п. 342): когда он получен и почему.
             since = (f" — в работе набор от {_clock(sub['last_ok_ts'])}"
                      if sub.get("last_ok_ts") else " — сохранённого набора нет")
+            if str(sub["cache_reason"]).startswith(EXPIRED_REASON):
+                since = ""  # набор истёкшей подписки в работу не берётся (п. 343)
             lines.append(f"Подписка «{sub['name']}»: не обновилась ({sub['cache_reason']}){since}")
     selection = status.get("selection") or {}
     if selection.get("note"):

@@ -256,6 +256,15 @@ class CachedSubscription:
     saved_at: float = 0.0
 
 
+EXPIRED_REASON = "срок подписки истёк, сохранённый набор не используется"
+
+
+def subscription_expired(userinfo: object, now: float) -> bool:
+    """Срок подписки (expire заголовка subscription-userinfo) прошёл; 0 или нет поля — срока нет."""
+    expire = userinfo.get("expire", 0) if isinstance(userinfo, dict) else 0
+    return isinstance(expire, (int, float)) and 0 < expire <= now
+
+
 # Сколько хранится адрес домена подписки (HostCache): неделю — дольше владелец подписки мог
 # переехать, а сертификат прежнего адреса уже никто не продлевает.
 HOST_CACHE_TTL = 7 * 86400.0

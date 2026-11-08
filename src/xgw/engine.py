@@ -30,7 +30,15 @@ from .model import ServerNode, raw_to_node, split_variants
 from .net import cmd, lan, nft
 from .parsers.common import ParseError, RawServer, parse_body, parse_links_text
 from .paths import Paths, atomic_write_json
-from .store import HOST_CHECK_EVERY, HOST_CHECK_RETRY, HostCache, Store, SubscriptionCache
+from .store import (
+    EXPIRED_REASON,
+    HOST_CHECK_EVERY,
+    HOST_CHECK_RETRY,
+    HostCache,
+    Store,
+    SubscriptionCache,
+    subscription_expired,
+)
 from .watch import target
 from .xraycore.api import ApiClient, server_address
 from .xraycore.service import PidfileXrayService, SystemdXrayService, XrayService, XrayServiceError
@@ -231,7 +239,9 @@ def collect(
         raws, userinfo, error = _load_subscription(
             sub, cfg, cache, mark, proxy, logger, cancel, hosts=hosts,
         )
-        if not raws:
+        # Истёкшая подписка не считается временным сбоем: иначе она навсегда остановила бы
+        # применение серверов остальных подписок (п. 343).
+        if not raws and not subscription_expired(userinfo, time.time()):
             inventory.complete = False
         if error:
             inventory.errors[sub.name] = error
@@ -457,6 +467,10 @@ def _load_subscription(
     if cached is None:
         logger.error("подписка %s: получить не удалось, кэша нет", label)
         return [], {}, error
+    if subscription_expired(cached.userinfo, time.time()):
+        # Старый набор не продлевает подписку (п. 343): данные о сроке остаются для окна и панели.
+        logger.error("подписка %s: %s: %s", label, EXPIRED_REASON, error)
+        return [], cached.userinfo, f"{EXPIRED_REASON} ({error})"[:300]
     try:
         raws, _meta, _warnings = parse_body(cached.body, sub.name)
     except ParseError as exc:

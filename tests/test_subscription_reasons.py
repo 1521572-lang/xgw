@@ -3,6 +3,7 @@
 
 import json
 import logging
+import time
 
 import pytest
 from test_daemon import Harness, _started
@@ -10,11 +11,13 @@ from test_daemon import Harness, _started
 from xgw import engine, fetch
 from xgw.config import Config, Subscription
 from xgw.paths import Paths
-from xgw.store import SubscriptionCache
+from xgw.store import EXPIRED_REASON, SubscriptionCache
 from xgw.watch.status import render_status
 
 ALIVE = ("vless://11111111-2222-3333-4455-6666666666a2@alive.example.net:443?type=tcp"
          "&security=tls&sni=alive.example.net#DE%20alive")
+OTHER = ("vless://11111111-2222-3333-4455-6666666666a3@other.example.net:443?type=tcp"
+         "&security=tls&sni=other.example.net#NL%20other")
 JUNK = ("vless://11111111-2222-3333-4455-6666666666a2@0.0.0.0:1?type=tcp"
         "&security=tls&sni=x.example.net#stub")
 LOG = logging.getLogger("test")
@@ -93,6 +96,59 @@ def test_status_shows_last_success_age_and_reason(daemon):
     assert entry["cache_reason"] == "вместо подписки пришла страница HTML"
     text = render_status(daemon.status() | snapshot)
     assert "не обновилась (вместо подписки пришла страница HTML) — в работе набор от" in text
+
+
+@pytest.mark.parametrize(("offset", "kept"), [(-60, False), (3600, True)])
+def test_saved_set_lives_only_until_the_subscription_expires(tmp_path, monkeypatch, offset, kept):
+    cache, load = _loader(tmp_path, monkeypatch, [fetch.FetchError("нет ответа")])
+    expire = int(time.time()) + offset
+    cache.save("main", ALIVE.encode(), {"expire": expire})
+    saved = cache.saved_at("main")
+    raws, info, error = load()
+    assert bool(raws) is kept and info == {"expire": expire}  # окну и панели срок виден
+    assert error.startswith(EXPIRED_REASON) is not kept
+    assert cache.saved_at("main") == saved  # продление подписки вернёт её обычным опросом
+
+
+def test_fresh_answer_is_not_cut_by_the_old_expiry(tmp_path, monkeypatch):
+    cache, load = _loader(tmp_path, monkeypatch, [ALIVE.encode()])
+    cache.save("main", ALIVE.encode(), {"expire": int(time.time()) - 60})
+    raws, _info, error = load()
+    assert raws and error == ""
+
+
+@pytest.mark.parametrize(("saved", "complete", "sources"), [
+    ({"expire": 1}, True, ["new"]),  # истёкшая не держит остальные подписки
+    ({"expire": 0}, True, ["old", "new"]),  # срока нет: сбой, работает старый набор
+    (None, False, ["new"]),  # временный сбой без набора: неполный список не применяется
+])
+def test_expired_subscription_leaves_without_blocking_others(
+        tmp_path, monkeypatch, saved, complete, sources):
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.subscriptions = [Subscription(name="old", url="https://subs.example.org/old"),
+                         Subscription(name="new", url="https://subs.example.org/new")]
+    if saved is not None:
+        SubscriptionCache(paths.cache_dir).save("old", ALIVE.encode(), saved)
+
+    def fake(url, **_kwargs):
+        if url.endswith("/old"):
+            raise fetch.FetchError("нет ответа")
+        return fetch.FetchResult(status=200, headers={}, body=OTHER.encode(), url=url)
+
+    monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
+    inventory = engine.collect(cfg, paths, mark=None, logger=LOG, via_xray=False)
+    assert inventory.complete is complete
+    assert [node.source for node in inventory.nodes] == sources
+
+
+def test_status_does_not_promise_a_set_of_an_expired_subscription():
+    entry = {"name": "main", "limited": True, "last_ok_ts": 1_700_000_000.0,
+             "cache_reason": f"{EXPIRED_REASON} (нет ответа)"}
+    text = render_status({"subscriptions": [entry]})
+    assert EXPIRED_REASON in text and "в работе набор" not in text
 
 
 def test_status_without_a_problem_or_a_saved_set(daemon):
