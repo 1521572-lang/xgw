@@ -1,6 +1,6 @@
 """Экран подписок приложения XGW на телефоне (п. 346): установка APK и проверка через adb.
 
-Режимы: devices | install APK | subs N | dialog | crash | health (health — через sudo).
+Режимы: devices | install APK | version | subs N | dialog N | crash | health (health — через sudo).
 Запускать от владельца: adb под root заново спросил бы разрешение отладки. На экране телефона
 нажимаются только вкладка «Подписки», кнопка «Убрать подписку …» и «Отмена» в её диалоге;
 кнопка «Убрать» диалога не нажимается никогда. Вывод — только числа и признаки: имена и адреса
@@ -55,7 +55,7 @@ def nodes():
         x1, y1, x2, y2 = map(int, match.groups())
         if y2 > y1 and x2 > x1:
             found.append({"label": node.get("text") or node.get("content-desc") or "",
-                          "id": node.get("resource-id") or "",
+                          "id": node.get("resource-id") or "", "top": y1, "bottom": y2,
                           "x": (x1 + x2) // 2, "y": (y1 + y2) // 2})
     return found
 
@@ -102,7 +102,7 @@ def walk(visit):
     before = None
     for _ in range(SWIPES):
         swipe(down=False)
-        now = [node["label"] for node in nodes()]
+        now = [(node["label"], node["y"]) for node in nodes()]
         if now == before:
             break
         before = now
@@ -111,7 +111,7 @@ def walk(visit):
         screen = nodes()
         if visit(screen):
             return
-        now = [node["label"] for node in screen]
+        now = [(node["label"], node["y"]) for node in screen]  # страница больше не движется
         if now == before:
             return
         before = now
@@ -128,6 +128,10 @@ def devices():
 def install(apk):
     result = adb("install", "-r", apk, timeout=180)
     require(result.returncode == 0 and "Success" in result.stdout, "apk_installed")
+    check_version()
+
+
+def check_version():
     version = re.search(r"versionCode=(\d+)", adb("shell", "dumpsys", "package", PACKAGE).stdout)
     print(f"INFO version_code={version[1] if version else 'none'}", flush=True)
     require(version is not None and version[1] == VERSION_CODE, "version_code")
@@ -150,15 +154,24 @@ def subs(expected):
     require(len(removes) == expected, "remove_on_every_subscription")
 
 
-def dialog():
+def reachable(screen, done):
+    """Следующая непроверенная «Убрать подписку …», видимая целиком выше панели вкладок. Панель
+    закреплена поверх страницы: uiautomator видит и строки под ней, а нажатие в такую строку
+    попало бы в вкладку (отчёт android-subs: крайняя правая — «События»)."""
+    bar = next((n for n in screen if n["id"].endswith("go-subs")), None)
+    limit = bar["top"] if bar else 0
+    return next((n for n in screen if n["label"].startswith(REMOVE)
+                 and n["label"] not in done and n["bottom"] <= limit), None)
+
+
+def dialog(expected):
     """Каждая «Убрать подписку …»: диалог открылся, «Отмена» его закрыла, строка на месте."""
     open_subs()
     done, config = set(), 0
 
     def visit(screen):
         nonlocal config
-        target = next((n for n in screen if n["label"].startswith(REMOVE)
-                       and n["label"] not in done), None)
+        target = reachable(screen, done)
         while target is not None:
             done.add(target["label"])
             tap(target)
@@ -170,14 +183,12 @@ def dialog():
             tap(cancel)
             shown = wait_for(lambda: [n for n in nodes() if WARNING in n["label"]] == [], 6)
             require(shown, "dialog_closed")
-            screen = nodes()
-            target = next((n for n in screen if n["label"].startswith(REMOVE)
-                           and n["label"] not in done), None)
-        return False
+            target = reachable(nodes(), done)
+        return len(done) >= expected
 
     walk(visit)
     print(f"INFO dialogs={len(done)} config_note={config}", flush=True)
-    require(bool(done), "dialogs_checked")
+    require(len(done) == expected, "dialogs_checked")
 
 
 def crash():
@@ -209,8 +220,10 @@ def main():
         install(args[1])
     elif len(args) == 2 and args[0] == "subs" and args[1].isdigit():
         subs(int(args[1]))
-    elif args == ["dialog"]:
-        dialog()
+    elif len(args) == 2 and args[0] == "dialog" and args[1].isdigit():
+        dialog(int(args[1]))
+    elif args == ["version"]:
+        check_version()
     elif args == ["crash"]:
         crash()
     elif args == ["health"]:
