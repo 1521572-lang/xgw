@@ -114,6 +114,25 @@ def has_tproxy_rule(path: Path, lan_if: str, mark: int) -> bool:
     return MARKER in (line.strip() for line in lines) and tproxy_rule(lan_if, mark) in lines
 
 
+def _write_and_reload(path: Path, text: str, original: str, runner: cmd.Runner) -> None:
+    """Новый текст before.rules и ufw reload как одно действие: reload не прошёл — файл
+    возвращается, и ufw перечитывает прежний (п. 347, A-07). Иначе файл и работающие правила
+    разошлись бы до следующей перезагрузки."""
+    atomic_write_text(path, text, mode=_mode(path))
+    try:
+        runner(["ufw", "reload"], timeout=60.0)
+    except cmd.CommandError as apply_error:
+        try:
+            atomic_write_text(path, original, mode=_mode(path))
+            runner(["ufw", "reload"], timeout=60.0)
+        except (cmd.CommandError, OSError) as rollback_error:
+            raise cmd.CommandError(
+                f"ufw reload: {apply_error}; откат не подтверждён: {rollback_error} — проверьте "
+                f"{path} и выполните sudo ufw reload"
+            ) from rollback_error
+        raise cmd.CommandError(f"изменение ufw откачено: {apply_error}") from apply_error
+
+
 def add_tproxy_rule(
     path: Path, lan_if: str, mark: int, backup_dir: Path, runner: cmd.Runner = cmd.run
 ) -> None:
@@ -138,12 +157,13 @@ def add_tproxy_rule(
     lines[position:position] = [MARKER, tproxy_rule(lan_if, mark)]
     text = "\n".join(lines) + "\n"
     if text != original:
-        atomic_write_text(path, text, mode=_mode(path))
-    runner(["ufw", "reload"], timeout=60.0)
+        _write_and_reload(path, text, original, runner)
+    else:
+        runner(["ufw", "reload"], timeout=60.0)
 
 
 def remove_tproxy_rule(path: Path, runner: cmd.Runner = cmd.run) -> bool:
-    """Убирает блок XGW из before.rules; True — он там был."""
+    """Убирает блок XGW из before.rules; True — он там был и ufw перечитал файл."""
     try:
         original = path.read_text(encoding="utf-8")
     except OSError:
@@ -152,8 +172,7 @@ def remove_tproxy_rule(path: Path, runner: cmd.Runner = cmd.run) -> bool:
     kept = _without_block(lines)
     if kept == lines:
         return False
-    atomic_write_text(path, "\n".join(kept) + "\n", mode=_mode(path))
-    runner(["ufw", "reload"], timeout=60.0, check=False)
+    _write_and_reload(path, "\n".join(kept) + "\n", original, runner)
     return True
 
 

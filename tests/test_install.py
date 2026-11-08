@@ -1455,3 +1455,58 @@ def test_failed_migration_restores_unit_config_and_dac_before_restarting_old_wor
     assert box.paths.singbox_config_file.stat().st_mode & 0o7777 == 0o640
     assert SINGBOX_UNIT not in installer.units_changed
     assert box.system.commands("systemctl", "restart", SINGBOX_UNIT)
+
+
+# --- п. 347, A-07: файл и работающие правила ufw ---------------------------------------------
+
+
+def _ufw_reload(fails: int):
+    """ufw reload: первые fails вызовов — ошибка; возвращает (запуск, вызовы)."""
+    calls: list[list[str]] = []
+
+    def run(argv, **kwargs):
+        assert kwargs.get("check", True), "ошибка reload не должна игнорироваться"
+        calls.append(list(argv))
+        if len(calls) <= fails:
+            raise CommandError("ufw: сбой")
+        return "Firewall reloaded\n"
+
+    return run, calls
+
+
+def _before(tmp_path):
+    path = tmp_path / "before.rules"
+    path.write_text(BEFORE_RULES, encoding="utf-8")
+    path.chmod(0o640)
+    return path
+
+
+def test_ufw_add_is_rolled_back_when_reload_fails(tmp_path):
+    path = _before(tmp_path)
+    run, calls = _ufw_reload(1)
+    with pytest.raises(CommandError, match="откачено"):
+        ufw.add_tproxy_rule(path, "lan0", 1, tmp_path / "backup", run)
+    assert path.read_text(encoding="utf-8") == BEFORE_RULES and len(calls) == 2
+    assert path.stat().st_mode & 0o777 == 0o640
+
+
+def test_ufw_failed_rollback_is_reported(tmp_path):
+    path = _before(tmp_path)
+    run, _calls = _ufw_reload(2)
+    with pytest.raises(CommandError, match="откат не подтверждён"):
+        ufw.add_tproxy_rule(path, "lan0", 1, tmp_path / "backup", run)
+    assert path.read_text(encoding="utf-8") == BEFORE_RULES
+
+
+def test_ufw_remove_reports_a_failed_reload(tmp_path):
+    path = _before(tmp_path)
+    ufw.add_tproxy_rule(path, "lan0", 1, tmp_path / "backup", _ufw_reload(0)[0])
+    added = path.read_text(encoding="utf-8")
+    assert added != BEFORE_RULES
+    run, calls = _ufw_reload(1)
+    with pytest.raises(CommandError, match="откачено"):
+        ufw.remove_tproxy_rule(path, run)
+    assert path.read_text(encoding="utf-8") == added and len(calls) == 2
+    assert (tmp_path / "backup" / "ufw-before.rules").exists()
+    assert ufw.remove_tproxy_rule(path, _ufw_reload(0)[0]) is True
+    assert path.read_text(encoding="utf-8") == BEFORE_RULES
