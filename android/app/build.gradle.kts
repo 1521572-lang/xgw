@@ -77,7 +77,7 @@ android {
         applicationId = "net.xgw.android"
         minSdk = 30
         targetSdk = 36
-        versionCode = 7
+        versionCode = 8
         versionName = "0.1.18"
     }
     buildTypes {

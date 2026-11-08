@@ -427,7 +427,7 @@
     draw("main", [s.main, s.sticky, s.pin, (s.members || []).length, (s.budget || {}).speed_mb], () => renderMain(s));
     draw("removed", s.removed, () => renderRemoved(s));
     draw("notes", [s.nodes, s.budget, s.probe_target], () => renderNotes(s));
-    draw("subs", [s.subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
+    draw("subs", [s.subscriptions, s.hidden_subscriptions, Math.floor(s.now / 60)], () => renderSubs(s));
     draw("links", s.links, () => renderLinks(s));
     // Идущая запись трафика: строки перерисовываются, только когда она началась или кончилась,
     // а время и размер меняются в метке — иначе кнопка «Остановить» уплывала бы из-под пальца.
@@ -962,14 +962,24 @@
         : sub.fetched ? el("div", { class: "row-sub", text: "Безлимитная: лимит трафика подписка не сообщает" }) : null;
       if (quota) main.append(quota);
       const actions = el("div", { class: "row-actions" });
-      if (sub.managed) {
-        actions.append(iconButton("edit", `Изменить подписку ${sub.name}`, () => editSubscription(sub)));
-        actions.append(iconButton("remove", `Убрать подписку ${sub.name}`, () => ask(
-          `Убрать подписку «${sub.name}»?`, "Её серверы пропадут из списка при следующем обновлении.",
-          "Убрать", () => act("subscription/remove", { name: sub.name }), true)));
-      }
+      if (sub.managed) actions.append(iconButton("edit", `Изменить подписку ${sub.name}`, () => editSubscription(sub)));
+      // Убрать можно и подписку из config.toml (п. 337): файл цел, вернуть — в списке убранных.
+      actions.append(iconButton("remove", `Убрать подписку ${sub.name}`, () => ask(
+        `Убрать подписку «${sub.name}»?`,
+        "Её серверы пропадут из списка при следующем обновлении." +
+          (sub.managed ? "" : " Запись в config.toml останется: вернуть подписку можно здесь же, в списке убранных.") +
+          ((s.subscriptions || []).length === 1 && !(s.links || []).length ? " Это единственная подписка: без неё у шлюза не останется серверов." : ""),
+        "Убрать", () => act("subscription/remove", { name: sub.name }), true)));
       return el("li", {}, main, actions);
     });
+    for (const gone of s.hidden_subscriptions || []) {
+      rows.push(el("li", {},
+        el("div", { class: "row-main" },
+          el("div", { class: "row-title" }, el("span", { text: gone.name }),
+            el("span", { class: "tag", text: "убрана · из config.toml" })),
+          el("div", { class: "row-sub wrap", text: gone.host })),
+        el("button", { class: "btn ghost", type: "button", text: "Вернуть", onclick: () => act("subscription/restore", { name: gone.name }) })));
+    }
     fill($("subs"), rows, (s.links || []).length ? "" : "Подписок пока нет. Вставьте адрес подписки в поле выше и нажмите «Добавить».");
   }
 
