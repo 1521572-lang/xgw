@@ -1644,6 +1644,8 @@ class Daemon:
         if not self.scan_queue or not probing:
             self._manual_scan = False
         at = self._spent("сканы и замены", at)
+        if not changed and signals.xray_ok and not self.stopping and not self.core_job:
+            changed = self._media_apply(now)
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
@@ -4178,8 +4180,8 @@ class Daemon:
     def _media_step(
         self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
     ) -> None:
-        """Выход для видео: план → файл (его читает сборка) → обычная сборка и применение; смена
-        только правил идёт через API, без перезапуска Xray. Основной сервер не трогает."""
+        """Выход для видео: план → файл (его читают сборки), само правило ставит _media_apply на
+        следующем шаге. Основной сервер не трогает."""
         saved = engine.media_tags(self.paths)
         current = builder.applied_media(applied)
         if self.cfg.media.youtube_mode == "off" and not saved and not current:
@@ -4200,14 +4202,32 @@ class Daemon:
                 f"новые соединения видео YouTube идут через {wanted[0]}" if wanted
                 else "видео YouTube идёт общим маршрутом"))
         if current != wanted:
-            if now >= self._media_retry_at and not self.stopping:
-                self._media_retry_at = now + MEDIA_RETRY
-                self._rebuild(None, urgent=False, reason="YouTube: выход для видео")
             state = "degraded" if wall - self._media_changed_at > MEDIA_RETRY else "applying"
         elif wanted and not self._media_confirmed(wanted, now):
             state = "degraded"
         self._media_view = {"state": state, "tags": list(wanted), "samples": self._media_samples(
             view, wanted, wall)}
+
+    def _media_apply(self, now: float) -> bool:
+        """Правило видео — прямо в работающее ядро, только через API (п. 350). Через общую сборку
+        нельзя: она ждёт новое поколение sing-box, и пока его мосты не проходят проверку, правило
+        не применялось вовсе (отчёт youtube-journal), хотя sing-box оно не касается. Идёт до
+        _manual_step: adrules сбрасывает закрепление в ядре, и тот вернёт его на этом же шаге."""
+        if now < self._media_retry_at:
+            return False
+        applied = engine.read_json(self.paths.xray_config_file)
+        wanted = engine.media_tags(self.paths)
+        if applied is None or builder.applied_media(applied) == wanted:
+            return False
+        self._media_retry_at = now + MEDIA_RETRY
+        patched = builder.with_media(
+            applied, builder.MediaPlan(wanted, tuple(self.cfg.media.youtube_domains)),
+            self.cfg.routing.proxy_domains)
+        if patched is None or patched == applied:
+            self.log.warning("правило видео не встроить в рабочий конфиг")
+            return False
+        return self._report(self.applier.apply_api_only(patched, base=applied),
+                            "YouTube: выход для видео")
 
     def _media_confirmed(self, wanted: tuple[str, ...], now: float) -> bool:
         """Ядро знает этот балансировщик и выбирает только его серверы (проверка — один раз на

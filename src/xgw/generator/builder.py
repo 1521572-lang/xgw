@@ -720,10 +720,50 @@ def _media_tags(
     """Теги плана, которые в этой сборке есть среди участников. selector у Xray — начало тега
     (проверено на 26.10.21: proxy-de-aaaa выбирает и proxy-de-aaaa11), поэтому тег, который
     начинает другой, не берётся: в группу попал бы посторонний сервер."""
-    members = {info.tag for info in nodes if info.role == "proxy"}
-    every = {str(item.get("tag")) for item in outbounds}
-    return [tag for tag in media.outbound_tags if tag in members
+    return _usable_media(media.outbound_tags, {info.tag for info in nodes if info.role == "proxy"},
+                         {str(item.get("tag")) for item in outbounds})
+
+
+def _usable_media(tags: Sequence[str], members: set[str], every: set[str]) -> list[str]:
+    return [tag for tag in tags if tag in members
             and not any(other != tag and other.startswith(tag) for other in every)]
+
+
+def _media_rule(domains: Sequence[str]) -> dict:
+    return {"type": "field", "domain": list(domains), "balancerTag": YOUTUBE_BALANCER}
+
+
+def _media_balancer(tags: list[str]) -> dict:
+    return {"tag": YOUTUBE_BALANCER, "selector": tags, "strategy": {"type": "leastPing"},
+            "fallbackTag": tags[0]}
+
+
+def with_media(
+    config: Mapping, media: MediaPlan, proxy_domains: Sequence[str],
+) -> dict | None:
+    """Рабочий конфиг с другим правилом видео (п. 350): меняется только routing, результат —
+    как у полной сборки с этим планом. None — общего правила в конце нет, вставить некуда."""
+    result = copy.deepcopy(dict(config))
+    routing = result.get("routing")
+    if not isinstance(routing, dict):
+        return None
+    rules = [rule for rule in routing.get("rules") or []
+             if rule.get("balancerTag") != YOUTUBE_BALANCER]
+    balancers = [item for item in routing.get("balancers") or []
+                 if item.get("tag") != YOUTUBE_BALANCER]
+    every = {str(item.get("tag")) for item in result.get("outbounds") or []}
+    tags = _usable_media(media.outbound_tags, {tag for tag in every if tag.startswith("proxy-")},
+                         every)
+    if tags:
+        if not rules or rules[-1].get("network") != "tcp,udp":
+            return None
+        at = len(rules) - 1
+        if proxy_domains and at > 0 and rules[at - 1].get("domain") == list(proxy_domains):
+            at -= 1
+        rules.insert(at, _media_rule(media.domains))
+        balancers.append(_media_balancer(tags))
+    routing["rules"], routing["balancers"] = rules, balancers
+    return result
 
 
 def build(
@@ -1019,8 +1059,7 @@ def build(
     media_tags = [] if pool_all or media is None else _media_tags(media, nodes, outbounds)
     if media_tags:
         # После прямых адресов и правил устройств: они главнее выхода для видео.
-        rules.append({"type": "field", "domain": list(media.domains),  # type: ignore[union-attr]
-                      "balancerTag": YOUTUBE_BALANCER})
+        rules.append(_media_rule(media.domains))  # type: ignore[union-attr]
     if cfg.routing.proxy_domains:
         rules.append({"type": "field", "domain": list(cfg.routing.proxy_domains), **rest})
     rules.append({"type": "field", "network": "tcp,udp", **rest})
@@ -1096,12 +1135,7 @@ def build(
                 # Отдельный балансировщик, чтобы не трогать burstObservatory (его смена — это
                 # перезапуск Xray): пробы участников уже идут. Стратегия при одном сервере не
                 # влияет на выбор, а fallbackTag держит правило, пока проба не ответила.
-                *([{
-                    "tag": YOUTUBE_BALANCER,
-                    "selector": media_tags,
-                    "strategy": {"type": "leastPing"},
-                    "fallbackTag": media_tags[0],
-                }] if media_tags else []),
+                *([_media_balancer(media_tags)] if media_tags else []),
             ],
         },
         "burstObservatory": {

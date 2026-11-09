@@ -23,6 +23,7 @@ from xgw.generator.builder import (
     reserve_fingerprint,
     reserve_tag,
     select_nodes,
+    with_media,
 )
 from xgw.model import ServerNode, raw_to_node
 from xgw.parsers.common import parse_links_text
@@ -692,6 +693,25 @@ def test_media_rule_stands_after_direct_and_devices_before_the_rest():
     assert rules[-1]["network"] == "tcp,udp" and rules[-1]["balancerTag"] == "auto"
     assert all(rule.get("inboundTag") != ["probe"] and rule.get("balancerTag") != "youtube"
                for rule in rules if "inboundTag" in rule)
+
+
+def test_with_media_matches_a_full_build_with_the_same_plan():
+    """Иначе следующая полная сборка увидела бы разницу и снова трогала бы правила."""
+    plain, built, names = _media_build("first")
+    plan = MediaPlan((names[0],), ("domain:googlevideo.com",))
+    assert with_media(plain.config, plan, ["domain:example.org"]) == built.config
+    assert with_media(built.config, MediaPlan((), plan.domains), ["domain:example.org"]) == (
+        plain.config)
+    assert "youtube" not in json.dumps(plain.config["routing"])  # исходник не изменён
+
+
+def test_with_media_leaves_out_unknown_servers_and_refuses_an_odd_config():
+    plain, _built, names = _media_build("first")
+    plan = MediaPlan(("proxy-zz-0000",), ("domain:googlevideo.com",))
+    assert with_media(plain.config, plan, []) == plain.config
+    odd = json.loads(json.dumps(plain.config))
+    odd["routing"]["rules"].pop()
+    assert with_media(odd, MediaPlan((names[0],), plan.domains), []) is None
 
 
 def test_media_plan_ignores_servers_outside_this_build_and_whole_house():

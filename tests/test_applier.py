@@ -133,6 +133,48 @@ def test_api_path_promotes_files(env):
     assert json.loads(paths.last_good_file.read_text(encoding="utf-8")) == current
 
 
+def _with_routing_change(config: dict) -> dict:
+    new = copy.deepcopy(config)
+    new["routing"]["rules"].insert(0, {"type": "field", "port": "1", "outboundTag": "block"})
+    return new
+
+
+def test_api_only_changes_routing_without_restart(env):
+    paths, current = env
+    api, service = StubApi(), StubService()
+    new = _with_routing_change(current)
+    assert _applier(paths, api, service).apply_api_only(new, base=current).mode == "api"
+    assert api.calls == ["adrules"] and service.restarts == 0 and _on_disk(paths) == new
+
+
+def test_api_only_refuses_what_would_need_a_restart(env):
+    paths, current = env
+    api, service = StubApi(), StubService()
+    outcome = _applier(paths, api, service).apply_api_only(_needs_restart(current), base=current)
+    assert outcome.mode == "rejected" and api.calls == [] and service.restarts == 0
+    assert _on_disk(paths) == current and not paths.pending_config_file.exists()
+
+
+def test_api_only_refuses_a_stale_base_and_a_dirty_core(env):
+    paths, current = env
+    api, service = StubApi(), StubService()
+    applier = _applier(paths, api, service)
+    new = _with_routing_change(current)
+    assert applier.apply_api_only(new, base={"other": 1}).mode == "rejected"
+    paths.api_dirty_file.write_text("1\n", encoding="utf-8")
+    assert applier.apply_api_only(new, base=current).mode == "rejected"
+    assert api.calls == [] and service.restarts == 0 and _on_disk(paths) == current
+
+
+def test_api_only_api_error_restores_routing_without_restart(env):
+    paths, current = env
+    api, service = StubApi(fail="adrules"), StubService()
+    outcome = _applier(paths, api, service).apply_api_only(
+        _with_routing_change(current), base=current)
+    assert service.restarts == 0 and _on_disk(paths) == current
+    assert outcome.mode == "failed"  # заглушка отказывает и при возврате: исход неизвестен
+
+
 def test_unchanged(env):
     paths, current = env
     assert _applier(paths, StubApi()).apply(current).mode == "unchanged"

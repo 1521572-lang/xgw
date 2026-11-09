@@ -1,8 +1,5 @@
-"""Выход для видео YouTube (п. 348, 349): установка с возвратом, включение, наблюдение, маршрут.
-
-Режимы: health | deploy BASE | enable | observe МИНУТ | route | disable.
-Вывод — только числа и признаки, без тегов и адресов. enable и disable — с согласия владельца.
-"""
+"""Выход для видео (п. 348–350). Режимы: health | deploy BASE | enable | observe МИНУТ | route |
+bridges | disable. Вывод — только числа и признаки. enable и disable — с согласия владельца."""
 import contextlib
 import hashlib
 import json
@@ -16,8 +13,9 @@ import tomllib
 from pathlib import Path
 
 TREE = Path(__file__).resolve().parents[2]
-LOCK = Path("/run/xgw-youtube-unpinned")
+LOCK = Path("/run/xgw-youtube-direct")
 CONFIG = Path("/etc/xgw/config.toml")
+XRAY = Path("/etc/xgw/xray/config.json")
 RECOVER_AFTER = 45.0  # приёмка после установки не дольше — затем сразу возврат
 SWITCH_WAIT = 180  # столько секунд демон может перечитывать настройки
 DEGRADED_LIMIT = 8  # замеров подряд по 15 с: дольше сборки и применения
@@ -114,20 +112,14 @@ def pin_info(data):
     print(f"INFO pin_active={bool(pin) and not pin.get('down')}", flush=True)
 
 
-def media_state():
-    with contextlib.suppress(ValueError, OSError, subprocess.SubprocessError):
-        return (status().get("media") or {}).get("state")
-    return None
-
-
 def wait_state(check):
-    end = time.monotonic() + SWITCH_WAIT
-    while time.monotonic() < end:
-        state = media_state()
-        if check(state):
+    end, state = time.monotonic() + SWITCH_WAIT, None
+    while True:
+        with contextlib.suppress(ValueError, OSError, subprocess.SubprocessError):
+            state = (status().get("media") or {}).get("state")
+        if check(state) or time.monotonic() >= end:
             return state
         time.sleep(5)
-    return media_state()
 
 
 def enable():
@@ -181,7 +173,6 @@ def diag_lines():
 
 
 def observe(minutes):
-    """Только чтение. Выход показан числом смен, сами серверы не выводятся."""
     begin = time.time()
     config = config_sum()
     restarted_from = xray_started()
@@ -226,8 +217,7 @@ def outbound_bytes(tags, port):
 
 
 def route_verdict(video, control, need):
-    """Чужой трафик только прибавляет байты: мало при запросах к видеосети — правило не сработало,
-    столько же при контроле — выход совпал с обычным или мешает чужой трафик: неизвестно."""
+    """Мало байт — правило не сработало; столько же при контроле — неизвестно."""
     seen = sorted(video)[len(video) // 2]
     if seen < need:
         return "missing"
@@ -240,7 +230,6 @@ def route_not_run(why):
 
 
 def route():
-    """Малые запросы с самого шлюза: идёт ли видеосеть через выбранный выход. Повтор безопасен."""
     view = status().get("media") or {}
     tags, began, video, control = view.get("tags") or [], xray_started(), [], []
     if view.get("state") != "best" or not tags:
@@ -270,30 +259,40 @@ def route():
     return 0
 
 
+def bridges():
+    """Запрос через мосты работающего поколения sing-box: выводятся только коды curl."""
+    applied = json.loads(XRAY.read_text(encoding="utf-8"))
+    found = [item for item in applied["outbounds"] if item.get("protocol") == "socks"
+             and item["settings"]["servers"][0].get("address") == "127.0.0.1"]
+    codes, url = [], applied["burstObservatory"]["pingConfig"]["destination"]
+    for item in found[:8]:
+        server = item["settings"]["servers"][0]
+        user = server["users"][0]
+        ask = (f'proxy = "socks5h://127.0.0.1:{server["port"]}"\n'
+               f'proxy-user = "{user["user"]}:{user["pass"]}"\n')  # пароль не в аргументах
+        codes.append(subprocess.run(
+            ["curl", "-K", "-", "--silent", "--max-time", "20", "-o", "/dev/null", url], input=ask,
+            text=True, capture_output=True, timeout=25, check=False).returncode)
+    members = sum(item["tag"].startswith("proxy-") for item in found)
+    print(f"INFO bridges total={len(found)} members={members} curl_rc={codes}", flush=True)
+
+
 def main():
-    args = sys.argv[1:]
-    if args == ["health"]:
-        health()
-    elif len(args) == 2 and args[0] == "deploy":
-        deploy(Path(args[1]).resolve())
-    elif args == ["route"]:
-        return route()
-    elif args == ["enable"]:
-        enable()
-    elif args == ["disable"]:
-        disable()
-    elif len(args) == 2 and args[0] == "observe" and args[1].isdigit():
+    args, simple = sys.argv[1:], {"health": health, "route": route, "bridges": bridges,
+                                  "enable": enable, "disable": disable}
+    if len(args) == 1 and args[0] in simple:
+        return simple[args[0]]() or 0
+    if len(args) == 2 and args[0] == "deploy":
+        return deploy(Path(args[1]).resolve()) or 0
+    if len(args) == 2 and args[0] == "observe" and args[1].isdigit():
         return observe(int(args[1]))
-    else:
-        return 2
-    return 0
+    return 2
 
 
 if __name__ == "__main__":
     try:
         code = main()
-    except Exception as exc:
-        # Не выводим тексты системных команд, адреса и конфиги. Последний OK указывает этап.
+    except Exception as exc:  # без текстов команд и адресов; последний OK указывает этап
         print("STOP", type(exc).__name__, flush=True)
         code = 3
     print(f"helper_rc={code}", flush=True)

@@ -105,6 +105,17 @@ class Applier:
         with file_lock(self.paths.lock_file):
             return self._apply_locked(new_config, restart_now=urgent or force_now)
 
+    def apply_api_only(self, new_config: dict, *, base: dict) -> ApplyOutcome:
+        """Только через API (п. 350): Xray не перезапускается ни при каком исходе, вместо этого —
+        rejected. base — конфиг, из которого собран new_config: другой на диске — тоже rejected."""
+        ok, output = self.validator(new_config)
+        if not ok:
+            return ApplyOutcome("rejected", detail=output)
+        with file_lock(self.paths.lock_file):
+            if self._read_current() != base:
+                return ApplyOutcome("rejected", detail="конфиг изменился во время проверки")
+            return self._apply_locked(new_config, restart_now=False, api_only=True)
+
     def rollback(self, reason: str) -> ApplyOutcome:
         """Откат на last-good по решению watchdog: Xray не поднимается с текущим
         конфигом. Если last-good нет или он совпадает с текущим — откатывать нечего."""

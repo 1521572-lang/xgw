@@ -14,7 +14,7 @@ from xgw import engine, fetch
 from xgw.apply.applier import ApplyOutcome
 from xgw.apply.singbox import SingboxOutcome
 from xgw.config import Config, Subscription
-from xgw.daemon import MEDIA_VERIFY, Daemon
+from xgw.daemon import MEDIA_RETRY, MEDIA_VERIFY, Daemon
 from xgw.generator import builder
 from xgw.model import raw_to_node
 from xgw.parsers.common import parse_links_text
@@ -80,9 +80,19 @@ class FakeService:
 
 
 class FakeApplier:
-    def __init__(self):
+    def __init__(self, paths=None):
+        self.paths = paths
         self.rollbacks: list[str] = []
         self.rollback_mode = "rollback"
+        self.api_only: list[dict] = []
+        self.api_only_mode = "api"
+
+    def apply_api_only(self, config, *, base):
+        self.api_only.append(config)
+        if self.api_only_mode == "api" and self.paths.xray_config_file.exists():
+            assert json.loads(self.paths.xray_config_file.read_text(encoding="utf-8")) == base
+            self.paths.xray_config_file.write_text(json.dumps(config), encoding="utf-8")
+        return ApplyOutcome(self.api_only_mode)
 
     def rollback(self, reason):
         self.rollbacks.append(reason)
@@ -170,7 +180,7 @@ class Harness(Daemon):
         )
         self.api = FakeApi()
         self.service = FakeService()
-        self.applier = FakeApplier()
+        self.applier = FakeApplier(paths)
         self.singbox = FakeSingbox(paths)
         self.singbox_ok = False  # sing-box в тестах включают отдельные тесты (dual-core)
         self.now_time = lambda: datetime.time(12, 0)
@@ -3160,12 +3170,8 @@ def _media_ready(daemon, *, mbps=None):
 
 def _media_run(daemon, view, observatory):
     applied = engine.read_json(daemon.paths.xray_config_file)
-    daemon._build_applied = False  # новый шаг: одна сборка применяется за шаг
     daemon._media_step(view, applied, observatory, daemon.t)
-    deadline = time.monotonic() + 5
-    while daemon._build is not None and time.monotonic() < deadline:
-        time.sleep(0.01)
-        daemon._finish_build()
+    daemon._media_apply(daemon.t)
     return engine.read_json(daemon.paths.xray_config_file)
 
 
@@ -3182,6 +3188,43 @@ def test_media_best_is_applied_through_the_api_without_touching_main(daemon):
     assert daemon._media_view["samples"][0]["mbps"] == 50.0
     assert not any(kind == "pin" for kind, *_rest in daemon.api.calls)
     assert sum("новые соединения видео" in event for event in daemon.events()) == 1
+
+
+def test_media_rule_does_not_wait_for_a_config_build(daemon):
+    """Отчёт youtube-journal: общая сборка ждала новое поколение sing-box, правило не вставало."""
+    _started(daemon)
+    builds = daemon._build_count
+    view, observatory, members = _media_ready(daemon)
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (members[0].tag,)
+    assert daemon._build_count == builds and len(daemon.applier.api_only) == 1
+
+
+def test_media_rejected_rule_is_retried_later_and_turns_degraded(daemon):
+    _started(daemon)
+    view, observatory, _members = _media_ready(daemon)
+    daemon.applier.api_only_mode = "rejected"
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "applying"
+    _media_run(daemon, view, observatory)
+    assert len(daemon.applier.api_only) == 1  # повтор — не чаще MEDIA_RETRY
+    daemon.t += MEDIA_RETRY + 1
+    for record in daemon._youtube.values():
+        record["ts"] = daemon.t
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "degraded" and len(daemon.applier.api_only) == 2
+    assert builder.applied_media(engine.read_json(daemon.paths.xray_config_file)) == ()
+
+
+def test_media_rule_is_removed_the_same_way(daemon):
+    _started(daemon)
+    view, observatory, _members = _media_ready(daemon)
+    _media_run(daemon, view, observatory)
+    daemon._youtube = {}  # замеров больше нет: правило должно уйти
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == () and engine.media_tags(daemon.paths) == ()
+    _media_run(daemon, view, observatory)  # состояние обновляется на следующем шаге
+    assert daemon._media_view["state"] == "waiting_for_samples"
 
 
 def test_media_off_has_no_plan_and_builds_nothing(daemon):
