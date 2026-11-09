@@ -1,8 +1,8 @@
-"""Отдельный выход для видео YouTube (п. 348): установка с возвратом, включение, наблюдение.
+"""Отдельный выход для видео YouTube (п. 348): включение, наблюдение, проверка маршрута.
 
-Режимы: prepare BASE | health | deploy BASE | enable | observe МИНУТ | disable. Вывод — только
-числа и признаки: теги, имена и адреса серверов не выводятся. enable и disable — только с согласия
-владельца: это единственная правка config.toml, и disable возвращает файл байт в байт.
+Режимы: health | enable | observe МИНУТ | route | disable. Установка — помощником коммита 30e4068.
+Вывод — только числа и признаки: теги, имена и адреса серверов не выводятся. enable и disable —
+только с согласия владельца: это единственная правка config.toml, disable возвращает её байт в байт.
 """
 import contextlib
 import hashlib
@@ -13,15 +13,17 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
-TREE = Path(__file__).resolve().parents[2]
 LOCK = Path("/run/xgw-youtube-install")
 CONFIG = Path("/etc/xgw/config.toml")
-RECOVER_AFTER = 45.0  # приёмка после установки не дольше — затем сразу возврат
 SWITCH_WAIT = 180  # столько секунд демон может перечитывать настройки
 DEGRADED_LIMIT = 8  # замеров подряд по 15 с: дольше сборки и применения
 SECTION = '\n[media]\nyoutube_mode = "best"\n'
+ROUTE_URLS = ("https://redirector.googlevideo.com/generate_204",  # попадает под правило видео
+              "https://www.youtube.com/generate_204")  # не попадает: контроль
+ROUTE_ROUNDS, ROUTE_REQUESTS, ROUTE_MIN_BYTES = 3, 6, 2000  # байт на запрос — оценка снизу
 
 
 def run(argv, *, timeout=20):
@@ -58,89 +60,12 @@ def check_health():
         return False
 
 
-def match(tree):
-    files = run(["git", "-c", f"safe.directory={tree}", "-C", str(tree), "ls-files", "-z",
-                 "src/xgw", "packaging"]).rstrip("\0").split("\0")
-    if not files or not all(files):
-        return False
-    for name in files:
-        dest = Path("/opt/xgw") / ("lib/" + name[4:] if name.startswith("src/") else name)
-        if not dest.is_file() or dest.read_bytes() != (tree / name).read_bytes():
-            return False
-    return True
-
-
 def config_sum():
     return hashlib.sha256(CONFIG.read_bytes()).hexdigest()
 
 
 def has_section(text):
     return re.search(r"^\[media\]", text, re.M) is not None
-
-
-def prepare(base):
-    """Только чтение: ни каталогов, ни файлов. Повтор безопасен."""
-    require(all(shutil.which(name) for name in ("git", "curl", "journalctl", "systemctl")), "tools")
-    for tree in (TREE, base):
-        run(["sh", "-n", str(tree / "packaging/install.sh")])
-    print("OK install_scripts_parse", flush=True)
-    if LOCK.exists():
-        print(f"STOP lock_{'finished' if (LOCK / 'result').exists() else 'active'}", flush=True)
-        raise ValueError("lock")
-    health()
-    require(match(base), "installed_is_base")
-    require(not has_section(CONFIG.read_text(encoding="utf-8")), "no_media_section")
-    data = status()
-    print(f"INFO state={data.get('state')} members={len(data.get('members') or [])} "
-          f"spares={len(data.get('spares') or [])}", flush=True)
-    print("config_sha=" + config_sum()[:16], flush=True)
-    print("OK prepare", flush=True)
-
-
-def deploy(base):
-    LOCK.mkdir(mode=0o700)  # второй запуск при живом каталоге не начнёт вторую установку
-    (LOCK / "started").write_text(f"{time.time():.0f}\n")
-    try:
-        ready = match(base) and check_health()
-    except (OSError, subprocess.SubprocessError):
-        ready = False
-    if not ready:
-        (LOCK / "started").unlink()
-        LOCK.rmdir()  # ничего не начато — каталог не оставляем
-        print("STOP baseline", flush=True)
-        raise ValueError("baseline")
-    print("OK baseline", flush=True)
-
-    def install(tree, name):
-        with (LOCK / (name + ".log")).open("xb") as stream:
-            try:
-                rc = subprocess.run(["sh", str(tree / "packaging/install.sh"), "--yes"],
-                                    stdout=stream, stderr=subprocess.STDOUT).returncode
-            except OSError:
-                rc = 127
-        print(f"{name}_rc={rc} at={time.strftime('%H:%M:%S')}", flush=True)
-        return rc
-
-    accepted = False
-    try:
-        if install(TREE, "install") == 0 and match(TREE):
-            done = time.monotonic()
-            while not accepted and time.monotonic() - done < RECOVER_AFTER:
-                accepted = check_health()
-                if not accepted:
-                    time.sleep(3)
-    finally:
-        if not accepted:
-            print(f"recovery_started_at={time.strftime('%H:%M:%S')}", flush=True)
-            rc = install(base, "rollback")
-            restored, tries = False, 6 if rc == 0 and match(base) else 0
-            while not restored and tries:  # до ~1 мин на подъём связи после возврата
-                restored, tries = check_health(), tries - 1
-                if not restored:
-                    time.sleep(5)
-            print("rollback_verified=" + str(restored).lower(), flush=True)
-        (LOCK / "result").write_text("accepted\n" if accepted else "returned\n")
-    require(accepted, "installed")
 
 
 def media_state():
@@ -160,8 +85,9 @@ def wait_state(check):
 
 
 def enable():
-    require((LOCK / "result").is_file()
-            and (LOCK / "result").read_text().strip() == "accepted", "installed_first")
+    # Раздел status «media» есть только у кода 30e4068 и новее, off — режим выключен.
+    require((status().get("media") or {}).get("state") == "off", "installed_first")
+    LOCK.mkdir(mode=0o700, exist_ok=True)
     backup = LOCK / "config.before"
     require(not backup.exists(), "enable_once")
     text = CONFIG.read_text(encoding="utf-8")
@@ -240,14 +166,65 @@ def observe(minutes):
     return 0
 
 
+def outbound_bytes(tags, port):
+    text = run(["curl", "--silent", "--noproxy", "*", "--max-time", "5",
+                f"http://127.0.0.1:{port}/debug/vars"], timeout=8)
+    stats = json.loads(text)["stats"]["outbound"]
+    return sum(value for tag in tags for value in stats[tag].values())
+
+
+def route_verdict(video, control, need):
+    """Чужой трафик только прибавляет байты: мало при запросах к видеосети — правило не сработало,
+    столько же при контроле — выход совпал с обычным или мешает чужой трафик: неизвестно."""
+    seen = sorted(video)[len(video) // 2]
+    if seen < need:
+        return "missing"
+    return "proven" if seen - sorted(control)[len(control) // 2] >= need else "unclear"
+
+
+def route_not_run(why):
+    print("NOT_RUN route " + why, flush=True)
+    return 4
+
+
+def route():
+    """Малые запросы с самого шлюза: идёт ли видеосеть через выбранный выход. Повтор безопасен."""
+    view = status().get("media") or {}
+    tags, began, video, control = view.get("tags") or [], xray_started(), [], []
+    if view.get("state") != "best" or not tags:
+        return route_not_run("state")
+    cfg = tomllib.loads(CONFIG.read_text(encoding="utf-8"))
+    port = (cfg.get("xray") or {}).get("metrics_port", 10086)
+    try:
+        for _ in range(ROUTE_ROUNDS):
+            for url, into in zip(ROUTE_URLS, (video, control), strict=True):
+                before = outbound_bytes(tags, port)
+                for _attempt in range(ROUTE_REQUESTS):
+                    run(["curl", "--silent", "--fail", "--noproxy", "*", "--max-time", "8",
+                         "-o", "/dev/null", url], timeout=12)
+                time.sleep(1)  # счётчик должен успеть увидеть последний ответ
+                into.append(outbound_bytes(tags, port) - before)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        return route_not_run(type(exc).__name__)
+    require(xray_started() == began, "xray_not_restarted")
+    need = ROUTE_REQUESTS * ROUTE_MIN_BYTES
+    print(f"INFO route_video={sorted(video)} route_control={sorted(control)} need={need}",
+          flush=True)
+    same = (status().get("media") or {}).get("tags") == tags
+    verdict = route_verdict(video, control, need) if same else "changed"
+    require(verdict != "missing", "route_video_seen")
+    if verdict != "proven":
+        return route_not_run(verdict)
+    print("OK route_video", flush=True)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] == "prepare":
-        prepare(Path(args[1]).resolve())
-    elif args == ["health"]:
+    if args == ["health"]:
         health()
-    elif len(args) == 2 and args[0] == "deploy":
-        deploy(Path(args[1]).resolve())
+    elif args == ["route"]:
+        return route()
     elif args == ["enable"]:
         enable()
     elif args == ["disable"]:
