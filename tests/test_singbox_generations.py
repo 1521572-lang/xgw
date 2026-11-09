@@ -336,16 +336,20 @@ def test_silent_spares_do_not_stop_a_generation_when_a_usable_server_answers(gat
         return DownloadResult(ok=args[1] == 22004, kind="" if args[1] == 22004 else "tls")
 
     monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
-    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455"})
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455": 0.0})
     assert checked and tried == [22004] and "не из работающих" in checked.summary
     tried.clear()
     # Живой сервер не первый — запасные пробуются раньше него; вариант f не проверяется.
-    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": 0.9}, {"ddee4455"})
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": 0.9}, {"ddee4455": 0.0})
+    assert checked and tried == [22001, 22002, 22003, 22004]
+    tried.clear()
+    # Лимитный (надбавка 1.0) — после запасных, хотя по доле сбоев был бы первым (п. 352).
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": 0.0}, {"ddee4455": 1.0})
     assert checked and tried == [22001, 22002, 22003, 22004]
 
 
 def test_server_outside_the_usable_list_is_not_asked(gateway, monkeypatch):
-    """Лимитный или неисправный сервер в проверку не берётся: запрос потратил бы квоту."""
+    """Сервера нет в списке пригодных — запроса через него нет."""
     w = gateway
     config, xray = _spare_bridges_and_free_server(w)
     tried = []
@@ -355,7 +359,7 @@ def test_server_outside_the_usable_list_is_not_asked(gateway, monkeypatch):
         return DownloadResult(ok=False, kind="tls")
 
     monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
-    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {}, set())
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {}, {})
     assert not checked and sorted(tried) == [22001, 22002, 22003]
     assert "мостов проверено 3 из 3: tls 3" in checked.summary
 
@@ -373,11 +377,11 @@ def test_bridge_that_carries_traffic_is_not_replaced_by_another_server(gateway, 
         return DownloadResult(ok=False, kind="tls")
 
     monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
-    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455"})
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455": 0.0})
     assert not checked and 22004 not in tried
 
 
-def test_daemon_offers_only_unlimited_servers_of_the_working_core(tmp_path, monkeypatch):
+def test_daemon_offers_unlimited_and_limited_servers_with_normal_speed(tmp_path, monkeypatch):
     from test_daemon import Harness, _started
 
     monkeypatch.setenv("XGW_ROOT", str(tmp_path))
@@ -390,13 +394,19 @@ def test_daemon_offers_only_unlimited_servers_of_the_working_core(tmp_path, monk
     try:
         _started(daemon)
         nodes = [node.fingerprint for node in daemon.inventory.nodes]
+        monkeypatch.setattr(daemon, "_mbps", lambda info: None)
         monkeypatch.setattr(daemon, "_prices", lambda: {})
-        assert daemon._bridge_usable() == set()  # стоимость неизвестна — как у лимитного
+        assert daemon._bridge_usable() == {}  # стоимость неизвестна, замера нет
         monkeypatch.setattr(daemon, "_prices", lambda: dict.fromkeys(nodes, 0.0))
         free = daemon._bridge_usable()
-        assert free and free <= set(nodes)
+        assert free and set(free) <= set(nodes) and set(free.values()) == {0.0}
         monkeypatch.setattr(daemon, "_prices", lambda: dict.fromkeys(nodes, 2.0))
-        assert daemon._bridge_usable() == set()
+        assert daemon._bridge_usable() == {}  # лимитный без замера
+        monkeypatch.setattr(daemon, "_mbps", lambda info: cfg.speed.min_mbps - 0.5)
+        assert daemon._bridge_usable() == {}  # медленный лимитный
+        monkeypatch.setattr(daemon, "_mbps", lambda info: float(cfg.speed.min_mbps))
+        limited = daemon._bridge_usable()
+        assert set(limited) == set(free) and set(limited.values()) == {1.0}
     finally:
         daemon.store.close()
 

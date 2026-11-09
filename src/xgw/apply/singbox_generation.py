@@ -207,7 +207,7 @@ def _carries_traffic(routed):
                for item in routed.get("outbounds") or [])
 
 
-def bridge_check(core, config, routed, rank=None, usable=()):
+def bridge_check(core, config, routed, rank=None, usable=None):
     """Полный GET через хотя бы один используемый мост; плохие отдельные серверы допустимы.
 
     rank — отпечаток → порядок (меньше — раньше): участники, что ведут трафик, затем по
@@ -215,12 +215,12 @@ def bridge_check(core, config, routed, rank=None, usable=()):
     мёртвых первых серверах (возврат подписки после паузы) срок кончался раньше живых —
     поколение не менялось ни разу подряд (отчёт sub-remove, 08.11.2026).
 
-    usable — отпечатки исправных безлимитных серверов (Daemon._bridge_usable). Если все мосты
-    Xray запасные, поколение можно проверить и через такой сервер: нужен живой путь через новый
-    процесс sing-box, а не именно эти запасные (п. 351, отчёт bridges-cause: 5 молчащих запасных
-    hysteria2 остановили все сборки на 6 часов). Мост, ведущий трафик, так не заменяется."""
+    usable — пригодные серверы: отпечаток → надбавка к порядку (Daemon._bridge_usable). Если все
+    мосты Xray запасные, поколение можно проверить и через такой сервер: нужен живой путь через
+    новый процесс sing-box, а не именно эти запасные (п. 351, 352; отчёт bridges-cause: 5 молчащих
+    запасных hysteria2 остановили все сборки). Мост, ведущий трафик, так не заменяется."""
     wanted = processes.xray_ports(routed)
-    rank = rank or {}
+    rank, usable = rank or {}, usable or {}
     extra_allowed = not _carries_traffic(routed)
     candidates = []
     extras = []
@@ -230,7 +230,8 @@ def bridge_check(core, config, routed, rank=None, usable=()):
         if inbound["listen_port"] in wanted:
             candidates.append((place, index, inbound, False))
         elif extra_allowed and match and match.group(2) == "d" and match.group(1) in usable:
-            extras.append((place, index, inbound, True))  # без вариантов: один запрос на сервер
+            # Без вариантов: один запрос на сервер.
+            extras.append((place + usable[match.group(1)], index, inbound, True))
     if candidates:
         candidates += extras  # нет мостов вообще — проверять нечего, как раньше
     candidates.sort(key=lambda item: (item[0], item[1]))
@@ -265,7 +266,7 @@ def bridge_check(core, config, routed, rank=None, usable=()):
                               + (f": {outcomes}" if outcomes else ""))
 
 
-def prepare(core, config, xray, rank=None, usable=()):
+def prepare(core, config, xray, rank=None, usable=None):
     """Никаких API-записей Xray. Кандидат не получает пользовательский трафик. rank и usable —
     порядок и запасной набор серверов для проверки мостов (bridge_check)."""
     with file_lock(core.paths.lock_file):

@@ -157,6 +157,7 @@ MAIN_COOLDOWN = 1800.0
 # как до 0.1.9, пока загрузка снова не пройдёт.
 MAIN_CAROUSEL = 120.0
 SPEED_FRESH = 2  # замер годен 2 срока замера своего класса (speed.every_hours)
+LIMITED_BRIDGE_LAST = 1.0  # лимитный сервер проверяет поколение sing-box после безлимитных
 SPEED_KEEP = 7 * 86400.0  # результаты замеров старше не хранятся
 # Канал занят: через серверы идёт больше этого (байт/с, ~2 Мбит/с) — фоновый замер отложен
 # до следующего шага: чужая загрузка исказила бы его, а замер — мешал бы ей. Но не дольше
@@ -3194,16 +3195,23 @@ class Daemon:
                     rank[info.fingerprint] = rank.get(info.fingerprint, UNKNOWN_RANK) - 2.0
         return rank
 
-    def _bridge_usable(self) -> set[str]:
+    def _bridge_usable(self) -> dict[str, float]:
         """Какими серверами можно проверить новое поколение sing-box, если все его мосты у Xray
-        запасные (п. 351): заведены в работающем ядре и безлимитны — запрос через лимитный
-        тратит квоту, а стоимость неизвестного сервера считается как у лимитного."""
+        запасные (п. 351, 352): заведённые в работающем ядре безлимитные и лимитные с нормальной
+        скоростью — свежий замер не ниже speed.min_mbps. Значение — надбавка к порядку проверки:
+        лимитные после безлимитных. Стоимость неизвестного сервера считается как у лимитного."""
         applied = engine.read_json(self.paths.xray_config_file)
         if applied is None or self.inventory is None:
-            return set()
-        prices = self._prices()
-        return {info.fingerprint for info in builder.applied_nodes(applied, self.inventory.nodes)
-                if prices.get(info.fingerprint, 1.0) <= 0}
+            return {}
+        prices, usable = self._prices(), {}
+        for info in builder.applied_nodes(applied, self.inventory.nodes):
+            if prices.get(info.fingerprint, 1.0) <= 0:
+                usable[info.fingerprint] = 0.0
+                continue
+            mbps = self._mbps(info)
+            if mbps is not None and mbps >= self.cfg.speed.min_mbps:
+                usable[info.fingerprint] = LIMITED_BRIDGE_LAST
+        return usable
 
     def _fail_rate(self, fingerprint: str) -> float:
         hour = int(self.wall() // 3600)
