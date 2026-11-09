@@ -4152,9 +4152,10 @@ class Daemon:
     def _media_wanted(
         self, view: list[NodeInfo], observatory: dict, saved: tuple[str, ...], wall: float,
     ) -> tuple[str, tuple[str, ...]]:
-        """Состояние выхода для видео и его теги (п. 348). Ручной выбор и режим «весь дом» главнее:
-        правила нет, видео идёт вместе с остальным. Нет данных — тоже нет правила, а не прямой
-        выход мимо VPN."""
+        """Состояние выхода для видео и его теги (п. 348, 349). Режим «весь дом» главнее: правила
+        нет, видео идёт вместе с остальным. Ручной выбор не мешает: остальной трафик идёт через
+        выбранный сервер, видео — через лучший. Нет данных — нет правила, а не прямой выход мимо
+        VPN."""
         media, measuring = self.cfg.media, self.cfg.speed
         if media.youtube_mode == "off":
             return "off", ()
@@ -4162,9 +4163,6 @@ class Daemon:
             return "pool_all", ()
         if not measuring.youtube or not measuring.youtube_mbps:
             return "disabled_no_measurements", ()
-        pin = self._manual_pin()
-        if pin is not None and not pin.get("down"):
-            return "manual_pin", ()
         candidates = youtube.media_candidates(
             view, self._youtube_records(), observatory, self._prices(), wall,
             min_mbps=measuring.youtube_mbps, sample_ttl=media.youtube_sample_ttl_minutes * 60.0,
@@ -4269,6 +4267,9 @@ class Daemon:
             node = pinning.resolve(pin, view) if pin is not None and not pin.get("down") else None
             if node is None or node.tag != info.tag:
                 return
+            exits = self._media_view.get("tags") or ()
+            if exits and node.tag not in exits:
+                return  # видео идёт через другой выход (п. 349): менять выбранный незачем
             name = self._node_name(info) or info.tag
             text = (f"выбранный вручную сервер «{name}» {why} — выберите другой или верните "
                     "автовыбор: xgw unpin")

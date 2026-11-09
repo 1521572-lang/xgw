@@ -3217,12 +3217,30 @@ def test_media_needs_measurements(daemon, change, state):
     assert daemon._media_view["state"] == state and engine.media_tags(daemon.paths) == ()
 
 
-def test_media_yields_to_a_manual_pin(daemon, monkeypatch):
+def test_media_works_under_a_manual_pin(daemon, monkeypatch):
     _started(daemon)
     view, observatory, members = _media_ready(daemon)
     monkeypatch.setattr(daemon, "_manual_pin", lambda: {"tag": members[1].tag})
-    daemon._media_step(view, engine.read_json(daemon.paths.xray_config_file), observatory, daemon.t)
-    assert daemon._media_view["state"] == "manual_pin" and engine.media_tags(daemon.paths) == ()
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (members[0].tag,)
+    daemon.t += 1
+    _media_run(daemon, view, observatory)
+    assert daemon._media_view["state"] == "best"
+    assert not any(kind == "pin" for kind, *_rest in daemon.api.calls)
+
+
+def test_manual_youtube_warning_is_silent_while_video_uses_another_exit(daemon, monkeypatch):
+    _started(daemon)
+    view, _observatory, members = _media_ready(daemon)
+    pinned = members[1]
+    monkeypatch.setattr(daemon, "_manual_pin", lambda: {"tag": pinned.tag})
+    monkeypatch.setattr(daemon, "_youtube_bad", lambda _key: "тормозит на YouTube")
+    daemon._media_view = {"state": "best", "tags": [members[0].tag]}
+    daemon._youtube_manual(view, pinned, pinned.fingerprint, False)
+    assert not any("выбранный вручную" in event for event in daemon.events())
+    daemon._media_view = {"state": "off"}
+    daemon._youtube_manual(view, pinned, pinned.fingerprint, False)
+    assert any("выбранный вручную" in event for event in daemon.events())
 
 
 def test_media_hold_blocks_a_planned_change_but_not_a_bad_server(daemon):
