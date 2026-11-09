@@ -23,17 +23,16 @@ TRIAL, PLAY_GOAL = 90.0, 12.0  # ролик не дольше (реклама и
 LIMIT_BYTES, DEADLINE = 500_000_000, 30 * 60.0
 VIDEOS = (("plain1", "aqz-KE-bpKQ"), ("plain2", "M7lc1UVf-VE"),
           ("music1", "dQw4w9WgXcQ"), ("music2", "9bZkp7q19f0"))
-# Согласие на cookie: только отказ от необязательных. Проверку на робота не проходим.
 PROBE = """var c=location.hostname.indexOf('consent.')===0;var done=false;var d=document;
-var r=d.querySelector('input[name=set_eom][value=true]');if(r&&r.form){r.form.submit();done=true;}
+var go=arguments[0];var r=d.querySelector('input[name=set_eom][value=true]');
 var n=Array.from(document.querySelectorAll('button')).find(function(b){
  return /^Reject/.test(b.getAttribute('aria-label')||b.innerText||'');});
-if(n&&!done){n.click();done=true;}
+if(go&&r&&r.form){r.form.submit();done=true;}else if(go&&n){n.click();done=true;}
 var v=document.querySelector('video');var p=document.querySelector('.ad-showing');var a=!!p;
 if(v){v.muted=true;if(v.paused&&!a){var x=v.play();if(x&&x.catch){x.catch(function(){});}}}
 var e=document.querySelector('.ytp-error, yt-playability-error-supported-renderers');
-return {consent:c||done,has:!!v,time:v?v.currentTime:0,ad:a,fault:v&&v.error?v.error.code:0,
- error:e?e.innerText.slice(0,300):''};"""
+return {page:c,dialog:!!(r||n),clicked:done,has:!!v,time:v?v.currentTime:0,ad:a,
+ fault:v&&v.error?v.error.code:0,error:e?e.innerText.slice(0,300):''};"""
 ROUTE = {"server": None, "spent": 0}
 Server = collections.namedtuple("Server", "port password")
 
@@ -110,8 +109,7 @@ class Forward(socketserver.BaseRequestHandler):
             return
         upstream.settimeout(120)
         sock.sendall(b"HTTP/1.1 200 OK" + END)
-        thread = threading.Thread(target=pump, args=(upstream, sock), daemon=True)
-        thread.start()
+        threading.Thread(target=pump, args=(upstream, sock), daemon=True).start()
         pump(sock, upstream)
 
 
@@ -166,22 +164,27 @@ def classify(text):
 
 
 def watch(client):
-    end, seen = time.monotonic() + TRIAL, "no_video"
+    end, seen, ready, clicks = time.monotonic() + TRIAL, "no_video", 0.0, 0
     while time.monotonic() < end:
         time.sleep(2)
         with contextlib.suppress(ValueError):  # страница могла смениться во время запроса
-            state = client.call("WebDriver:ExecuteScript", {"script": PROBE, "args": []})
+            go = clicks < 3 and time.monotonic() >= ready  # только отказ и не чаще раза в 15 с
+            state = client.call("WebDriver:ExecuteScript", {"script": PROBE, "args": [go]})
             state = state.get("value") or {}
+            if state.get("clicked"):
+                clicks, ready = clicks + 1, time.monotonic() + 15
             if classify(state.get("error")):
                 return classify(state.get("error"))
             if state.get("fault"):
                 return f"media_err_{state['fault']}"
-            if state.get("consent") or state.get("ad"):
-                seen = "consent" if state.get("consent") else "ad"
+            if state.get("ad"):
+                seen = "ad"
             elif state.get("time", 0) >= PLAY_GOAL:
                 return "played"
-            elif state.get("has"):
-                seen = "stuck"
+            else:
+                seen = ("consent_page" if state.get("page") else
+                        "consent_dialog" if state.get("dialog") else
+                        "stuck" if state.get("has") else seen)
     return seen
 
 
@@ -195,8 +198,7 @@ def trial(base, firefox, proxy, server, video):
     profile.mkdir(mode=0o700)
     os.chown(profile, user.pw_uid, user.pw_gid)
     prefs = {"marionette.port": port, "media.autoplay.default": 0,
-             "media.autoplay.blocking_policy": 0, "intl.accept_languages": '"en-US"',
-             "browser.shell.checkDefaultBrowser": "false"}
+             "media.autoplay.blocking_policy": 0, "intl.accept_languages": '"en-US"'}
     if server is not None:
         prefs.update({"network.proxy.type": 1, "network.proxy.http": '"127.0.0.1"',
                       "network.proxy.http_port": proxy, "network.proxy.ssl": '"127.0.0.1"',
@@ -262,7 +264,6 @@ def run(base):
     listener.daemon_threads = True
     threading.Thread(target=listener.serve_forever, daemon=True).start()
     chosen, port = usable(), listener.server_address[1]
-    print(f"INFO servers_chosen={len(chosen)}", flush=True)
     normal = [one(base, firefox, port, None, "normal", *item, began) for item in VIDEOS]
     per_server = []
     for index, server in enumerate(chosen, 1):
@@ -274,10 +275,10 @@ def run(base):
           f"mb={ROUTE['spent'] / 1_000_000:.1f} minutes={(time.monotonic() - began) / 60:.1f}",
           flush=True)
     health()
-    if played < 2 or len(chosen) < 2:
-        print("NOT_RUN " + ("no_playback" if played < 2 else "few_servers"), flush=True)
-        return 4
     good = sum(count > 0 for count in per_server)
+    if len(chosen) < 2 or not (good or played):
+        print("NOT_RUN " + ("few_servers" if len(chosen) < 2 else "no_playback"), flush=True)
+        return 4
     print("RESULT " + ("all_accept" if good == len(chosen) else
                        "none_accept" if not good else "some_accept"), flush=True)
     return 0
@@ -285,9 +286,8 @@ def run(base):
 
 def main():
     args = sys.argv[1:]
-    if args == ["health"]:
-        return health() or 0
-    return run(args[1]) if len(args) == 2 and args[0] == "run" else 2
+    return (health() or 0) if args == ["health"] else (
+        run(args[1]) if len(args) == 2 and args[0] == "run" else 2)
 
 
 if __name__ == "__main__":
