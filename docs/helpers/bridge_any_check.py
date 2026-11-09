@@ -1,5 +1,5 @@
-"""Новое поколение sing-box через любой пригодный сервер (п. 351). Режимы: health | deploy BASE |
-observe МИНУТ. Вывод — только числа и признаки; строки журнала и адреса не выводятся."""
+"""Новое поколение sing-box через любой пригодный сервер (п. 351, 352). Режимы: health | past С ПО |
+deploy BASE | observe МИНУТ. Вывод — только числа и признаки; строк журнала и адресов нет."""
 import collections
 import contextlib
 import json
@@ -10,15 +10,18 @@ import time
 from pathlib import Path
 
 TREE = Path(__file__).resolve().parents[2]
-LOCK = Path("/run/xgw-bridge-any")
+LOCK = Path("/run/xgw-bridge-any2")  # прежний каталог остался от отката первой попытки
 UNIT = "xgw.service"
-RECOVER_AFTER = 45.0  # приёмка после установки не дольше — затем сразу возврат
+RECOVER_AFTER = 120.0  # приёмка после установки не дольше — затем сразу возврат
+STATUS_WAIT = 30  # 10 с на статус давали ложный STOP (отчёты youtube-direct, bridge-any)
 EVENTS = (("build_started", "сборка конфига начата"),
           ("build_stale", "устаревшая сборка конфига отброшена"),
           ("build_finished", "конфиг собран в фоне"),
           ("generation_changed", "поколение sing-box сменено"),
           ("generation_failed", "подготовка поколения sing-box не выполнена"),
-          ("applied_restart", "применено с перезапуском Xray"))
+          ("applied_restart", "применено с перезапуском Xray"),
+          ("step_error", "шаг watchdog завершился ошибкой"),
+          ("service_started", "Started xgw"))
 CHECKED = re.compile(r"новое поколение sing-box проверено: мост ([0-9]+) из ([0-9]+)"
                      r"(, не из работающих)?")
 FAILED = re.compile(r"мостов проверено ([0-9]+) из ([0-9]+)(?:: ((?:[a-z_]+ [0-9]+(?:, )?)+))?")
@@ -35,15 +38,25 @@ def require(ok, label):
     print("OK " + label, flush=True)
 
 
-def health(timeout=40):
-    data = json.loads(run(["xgw", "status", "--json"], timeout=timeout))
+def is_on(data):
     cap = data.get("capture") or {}
-    require(data.get("daemon_down") is False and data.get("xray", {}).get("ok") is True
+    return (data.get("daemon_down") is False and data.get("xray", {}).get("ok") is True
             and cap.get("mode") == "on" and cap.get("loaded") is True
-            and cap.get("blocked") is False and not cap.get("capture_failed"), "on")
-    code = run(["curl", "--silent", "--noproxy", "*", "--max-time", "8", "-o", "/dev/null",
+            and cap.get("blocked") is False and not cap.get("capture_failed"))
+
+
+def https_code():
+    return run(["curl", "--silent", "--noproxy", "*", "--max-time", "8", "-o", "/dev/null",
                 "-w", "%{http_code}", "https://1.1.1.1/"], timeout=12)
-    require(code.isdigit() and 200 <= int(code) < 400, "https")
+
+
+def code_ok(code):
+    return code.isdigit() and 200 <= int(code) < 400
+
+
+def health(timeout=40):
+    require(is_on(json.loads(run(["xgw", "status", "--json"], timeout=timeout))), "on")
+    require(code_ok(https_code()), "https")
 
 
 def check_health(timeout=10):
@@ -51,6 +64,46 @@ def check_health(timeout=10):
         health(timeout)
         return True
     return False
+
+
+def outcome(call):
+    """Итог команды: (метка, вывод). Метка — только вид неудачи, без текста ошибки."""
+    try:
+        return "ok", call()
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
+    except subprocess.CalledProcessError as exc:
+        return f"rc_{exc.returncode}", ""
+    except (OSError, ValueError):
+        return "error", ""
+
+
+def attempt(number):
+    """Одна попытка приёмки; причина неудачи видна в отчёте (отчёт bridge-any её не имел)."""
+    began = time.monotonic()
+    state, text = outcome(lambda: run(["xgw", "status", "--json"], timeout=STATUS_WAIT))
+    running = False
+    if state == "ok":
+        try:
+            running = bool(is_on(json.loads(text)))
+        except (ValueError, AttributeError):
+            state = "bad_json"
+    spent = round(time.monotonic() - began, 1)
+    web, code = outcome(https_code)
+    print(f"ATTEMPT {number} at={time.strftime('%H:%M:%S')} status={state} status_s={spent} "
+          f"on={int(running)} https={web}:{code if code.isdigit() else '-'}", flush=True)
+    return running and web == "ok" and code_ok(code)
+
+
+def show_journal(since, until=None):
+    events, checked, fails, errors = read_journal(since, until)
+    print("INFO events " + (" ".join(f"{key}={events[key]}" for key in sorted(events)) or "none"),
+          flush=True)
+    print(f"INFO checked (x — сервер не из работающих у Xray) {checked}", flush=True)
+    print("INFO fail_kinds " + (" | ".join(f"{key} x{fails[key]}" for key in sorted(fails))
+                                or "none"), flush=True)
+    print(f"INFO tracebacks={errors}", flush=True)
+    return events
 
 
 def match(tree):
@@ -77,17 +130,20 @@ def deploy(base):
         print(f"{name}_rc={rc} at={time.strftime('%H:%M:%S')}", flush=True)
         return rc
 
-    accepted, began = False, int(time.time()) - 1
+    accepted, began, number = False, int(time.time()) - 1, 0
     try:
         if install(TREE, "install") == 0 and match(TREE):
             done = time.monotonic()
             while not accepted and time.monotonic() - done < RECOVER_AFTER:
-                accepted = check_health()
+                number += 1
+                accepted = attempt(number)
                 if not accepted:
                     time.sleep(3)
     finally:
         if not accepted:
             print(f"recovery_started_at={time.strftime('%H:%M:%S')}", flush=True)
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                show_journal(f"@{began}")
             rc = install(base, "rollback")
             restored, tries = False, 6 if rc == 0 and match(base) else 0
             while not restored and tries:  # до ~1 мин на подъём связи после возврата
@@ -103,10 +159,11 @@ def xray_started():
     return run(["systemctl", "show", "xgw-xray", "-p", "ActiveEnterTimestampMonotonic", "--value"])
 
 
-def read_journal(since):
-    lines = run(["journalctl", "--no-pager", "-o", "cat", "-u", UNIT, "--since", f"@{since}"],
-                timeout=60).splitlines()
+def read_journal(since, until=None):
+    lines = run(["journalctl", "--no-pager", "-o", "cat", "-u", UNIT, "--since", since,
+                 *(["--until", until] if until else [])], timeout=60).splitlines()
     events, checked, fails = collections.Counter(), [], collections.Counter()
+    errors = sum(line.startswith("Traceback") or " Traceback " in line for line in lines)
     for line in lines:
         event = next((label for label, text in EVENTS if text in line), None)
         if event:
@@ -118,7 +175,7 @@ def read_journal(since):
             seen = FAILED.search(line)
             fails[f"{seen[1]}/{seen[2]} " + (seen[3] or "-").replace(", ", ",")
                   if seen else "no_summary"] += 1
-    return events, checked, fails
+    return events, checked, fails, errors
 
 
 def observe(minutes):
@@ -126,16 +183,11 @@ def observe(minutes):
     require(text.isdigit(), "installed_first")
     began, deadline = xray_started(), time.monotonic() + minutes * 60
     while time.monotonic() < deadline:
-        if read_journal(int(text))[0]["generation_changed"]:
+        if read_journal(f"@{text}")[0]["generation_changed"]:
             time.sleep(30)  # сборка после смены поколения успевает завершиться
             break
         time.sleep(20)
-    events, checked, fails = read_journal(int(text))
-    print("INFO events " + (" ".join(f"{key}={events[key]}" for key in sorted(events)) or "none"),
-          flush=True)
-    print(f"INFO checked (x — сервер не из работающих у Xray) {checked}", flush=True)
-    print("INFO fail_kinds " + (" | ".join(f"{key} x{fails[key]}" for key in sorted(fails))
-                                or "none"), flush=True)
+    events = show_journal(f"@{text}")
     require(xray_started() == began, "xray_not_restarted")
     health()
     if events["generation_changed"]:
@@ -152,6 +204,9 @@ def main():
     args = sys.argv[1:]
     if args == ["health"]:
         return health() or 0
+    if len(args) == 3 and args[0] == "past":
+        show_journal(args[1], args[2])
+        return 0
     if len(args) == 2 and args[0] == "deploy":
         return deploy(Path(args[1]).resolve()) or 0
     if len(args) == 2 and args[0] == "observe" and args[1].isdigit():
