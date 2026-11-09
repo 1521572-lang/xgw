@@ -9,11 +9,13 @@ from conftest import golden
 from xgw import rating
 from xgw.config import Config
 from xgw.generator.builder import (
+    YOUTUBE_BALANCER,
     BuildResult,
     MediaPlan,
     NodeInfo,
     _media_tags,
     applied_media,
+    applied_media_domains,
     applied_nodes,
     assign_suffixes,
     build,
@@ -703,6 +705,13 @@ def test_with_media_matches_a_full_build_with_the_same_plan():
     assert with_media(built.config, MediaPlan((), plan.domains), ["domain:example.org"]) == (
         plain.config)
     assert "youtube" not in json.dumps(plain.config["routing"])  # исходник не изменён
+
+
+def test_applied_media_domains_reads_the_rule():
+    rule = {"type": "field", "domain": ["domain:a.example"], "balancerTag": YOUTUBE_BALANCER}
+    assert applied_media_domains({"routing": {"rules": [rule]}}) == ("domain:a.example",)
+    assert applied_media_domains({"routing": {"rules": []}}) == ()
+    assert applied_media_domains(None) == ()
 
 
 def test_with_media_leaves_out_unknown_servers_and_refuses_an_odd_config():

@@ -360,10 +360,15 @@ class Routing:
 class Media:
     """Отдельный выход для видео YouTube (п. 348). off — как раньше. best — новые соединения к
     youtube_domains идут через сервер с лучшим свежим замером, остальной трафик не меняется.
-    Один поток TLS не делится между серверами, видео на шлюзе не кэшируется."""
+    Один поток TLS не делится между серверами, видео на шлюзе не кэшируется. Страница и видео
+    идут через один выход: ссылку на видео YouTube выдаёт для адреса, с которого открыта страница
+    (п. 354)."""
 
     youtube_mode: str = "off"
-    youtube_domains: list[str] = field(default_factory=lambda: ["domain:googlevideo.com"])
+    youtube_domains: list[str] = field(default_factory=lambda: [
+        "domain:googlevideo.com", "domain:youtube.com", "domain:youtubei.googleapis.com",
+        "domain:youtube-nocookie.com",
+    ])
     # Замер старше этого не даёт права быть выходом видео. Запасные участники проверяются раз в
     # 6 ч (daemon.YOUTUBE_OTHERS), поэтому меньше 12 ч срок не бывает: иначе почти все были бы
     # без свежего замера.
@@ -1144,7 +1149,8 @@ def _validate_media(media: Media) -> list[str]:
     """Сбой настройки не должен ломать VPN: что не подошло — выключается с предупреждением."""
     warnings: list[str] = []
     if media.youtube_mode == "spread":
-        warnings.append('media.youtube_mode = "spread" пока не поддерживается — выключено')
+        warnings.append('media.youtube_mode = "spread" не поддерживается: ссылка на видео выдаётся '
+                        "для одного адреса выхода — выключено")
         media.youtube_mode = "off"
     elif media.youtube_mode not in ("off", "best"):
         warnings.append(f"media.youtube_mode={media.youtube_mode!r}: ожидается off или best — "
@@ -1158,6 +1164,10 @@ def _validate_media(media: Media) -> list[str]:
     if media.youtube_mode != "off" and not media.youtube_domains:
         warnings.append("media.youtube_domains пуст — выключено")
         media.youtube_mode = "off"
+    if (media.youtube_mode != "off" and "domain:googlevideo.com" in media.youtube_domains
+            and "domain:youtube.com" not in media.youtube_domains):
+        warnings.append("media.youtube_domains: есть видео, но нет youtube.com — страница и видео "
+                        "пойдут через разные выходы, YouTube может отказать в видео")
     if not 720 <= media.youtube_sample_ttl_minutes <= 1440:
         warnings.append(f"media.youtube_sample_ttl_minutes={media.youtube_sample_ttl_minutes}: "
                         "ожидается 720–1440 — используется 720")

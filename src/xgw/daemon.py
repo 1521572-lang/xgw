@@ -4307,12 +4307,13 @@ class Daemon:
             return False
         applied = engine.read_json(self.paths.xray_config_file)
         wanted = engine.media_tags(self.paths)
-        if applied is None or builder.applied_media(applied) == wanted:
+        domains = tuple(self.cfg.media.youtube_domains)
+        if applied is None or (builder.applied_media(applied) == wanted and (
+                not wanted or builder.applied_media_domains(applied) == domains)):
             return False
         self._media_retry_at = now + MEDIA_RETRY
         patched = builder.with_media(
-            applied, builder.MediaPlan(wanted, tuple(self.cfg.media.youtube_domains)),
-            self.cfg.routing.proxy_domains)
+            applied, builder.MediaPlan(wanted, domains), self.cfg.routing.proxy_domains)
         if patched is None or patched == applied:
             self.log.warning("правило видео не встроить в рабочий конфиг")
             return False

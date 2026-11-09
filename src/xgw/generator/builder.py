@@ -325,6 +325,17 @@ def applied_media(config: Mapping | None) -> tuple[str, ...]:
     return ()
 
 
+def applied_media_domains(config: Mapping | None) -> tuple[str, ...]:
+    """Домены правила видео в применённом конфиге; пусто — правила нет."""
+    routing = config.get("routing") if isinstance(config, Mapping) else None
+    rules = routing.get("rules") if isinstance(routing, Mapping) else None
+    for rule in rules if isinstance(rules, list) else []:
+        if isinstance(rule, Mapping) and rule.get("balancerTag") == YOUTUBE_BALANCER:
+            domain = rule.get("domain")
+            return tuple(str(item) for item in domain) if isinstance(domain, list) else ()
+    return ()
+
+
 def media_problems(config: Mapping | None) -> list[str]:
     """Что не так с правилом видео в применённом конфиге (`xgw diag`). Пусто — всё согласовано
     либо правила нет."""

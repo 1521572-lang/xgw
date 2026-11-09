@@ -169,9 +169,11 @@ max_daily_probe_mb = 1024
 # лучший, страна выхода у них может отличаться. Нужны проверки [speed] youtube = true и
 # youtube_mbps > 0. Нет подходящего сервера — видео идёт общим маршрутом, напрямую мимо VPN не
 # уходит. Видео не кэшируется, скорость нескольких серверов не складывается; соединения меняют
-# сервер только при новом запуске.
+# сервер только при новом запуске. Режима с несколькими серверами сразу нет: ссылку на видео YouTube
+# выдаёт для адреса, с которого открыта страница.
 youtube_mode = "off"
-youtube_domains = ["domain:googlevideo.com"]
+# Страница и видео должны идти через один выход: не убирайте youtube.com, оставив googlevideo.com.
+youtube_domains = ["domain:googlevideo.com", "domain:youtube.com", "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
 # Сколько минут замер считается свежим (720–1440) и как часто менять выход планово (1–120).
 youtube_sample_ttl_minutes = 720
 youtube_hold_minutes = 10

@@ -426,6 +426,19 @@ def test_media_unknown_or_future_mode_is_off(tmp_path, mode):
     assert cfg.media.youtube_mode == "off" and any("youtube_mode" in item for item in warnings)
 
 
+def test_media_default_keeps_page_and_video_on_one_exit(tmp_path):
+    cfg, warnings = _media(tmp_path, '[media]\nyoutube_mode = "best"\n')
+    assert warnings == [] and {
+        "domain:googlevideo.com", "domain:youtube.com", "domain:youtubei.googleapis.com",
+    } <= set(cfg.media.youtube_domains)
+
+
+def test_media_warns_when_page_and_video_are_split(tmp_path):
+    cfg, warnings = _media(
+        tmp_path, '[media]\nyoutube_mode = "best"\nyoutube_domains = ["domain:googlevideo.com"]\n')
+    assert cfg.media.youtube_mode == "best" and any("разные выходы" in item for item in warnings)
+
+
 def test_media_domains_accept_only_matchers(tmp_path):
     cfg, warnings = _media(tmp_path, (
         '[media]\nyoutube_mode = "best"\nyoutube_domains = ['

@@ -3227,6 +3227,18 @@ def test_media_rule_is_removed_the_same_way(daemon):
     assert daemon._media_view["state"] == "waiting_for_samples"
 
 
+def test_media_new_domains_reach_a_running_rule(daemon):
+    """Список адресов сменился, серверы те же: правило обновляется без сборки."""
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    _media_run(daemon, view, observatory)
+    daemon.cfg.media.youtube_domains = ["domain:a.example"]
+    daemon._media_retry_at = 0.0
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (members[0].tag,)
+    assert builder.applied_media_domains(applied) == ("domain:a.example",)
+
+
 def test_media_off_has_no_plan_and_builds_nothing(daemon):
     _started(daemon)
     builds = daemon._build_count
