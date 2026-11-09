@@ -5,13 +5,15 @@
 четырём путям: обычным через шлюз, напрямую с домашнего адреса и напрямую с двумя видами дробления
 ClientHello, которые XGW уже умеет. Для прямых путей он поднимает временный Xray: тот слушает только
 127.0.0.1, работает лишь во время проверки и удаляется вместе со своим файлом. Внешние устройства не нужны.
+Это повтор: в прошлом прогоне помощник принял зависания браузера за результат, прямые пути не были измерены.
 
 Разрешение владельца дано 09.11 только для этой проверки: запросы к YouTube вне настроек XGW, запуск уже
 установленного Firefox без окна и запросы к YouTube напрямую с домашнего адреса. Спрашивать отдельно не
 нужно. Всего до 45 минут; видео небольшого размера, расход ориентировочно несколько сотен мегабайт.
 
-Что проверяется: играет ли ролик, сколько секунд ждали старта, сколько раз плеер ждал данные. Что не
-проверяется и не заявляется: качество видео, скорость канала, приложения YouTube на телефонах и работа
+Что проверяется: отвечает ли сам путь и с какой скоростью отдаёт файл замера из настроек XGW; играет ли
+ролик, сколько секунд ждали старта, сколько раз плеер ждал данные. Что не проверяется и не заявляется:
+качество видео, скорость самой видеосети, приложения YouTube на телефонах и работа
 программы `zapret`. Невидимость для ТСПУ не заявляется. Просьбу YouTube подтвердить, что это не робот,
 помощник не проходит, а только записывает. На запросе о cookie он выбирает отказ от необязательных.
 
@@ -26,13 +28,13 @@ Tailscale и сетевые правила; перезапуск демона, `
 ```bash
 cd ~/xgw && test -z "$(git status --porcelain)" && git switch freepool &&
 git fetch origin && git merge --ff-only origin/freepool
-CODE=831dd5ff54fc9cf13cf18da2fa3d05b7cdd49e0b
+CODE=9a8fd173160c8e1748c92add78becf402618f887
 BASE=49f0440cda315b9b66eff7f33c72ca3ab76058e9
 D=$(mktemp -d "$HOME/xgw-wan.XXXXXXXX")
 TARGET="$D/new"; H="$TARGET/docs/helpers/youtube_wan_check.py"
 git worktree add --detach "$TARGET" "$CODE" &&
 test "$(git -C "$TARGET" rev-parse HEAD)" = "$CODE" &&
-printf '%s  %s\n' '527204bc9f7f6cead4a754811f6455eb0f55750c454bb8252c54e2a98c9fd2e3' "$H" | sha256sum -c -
+printf '%s  %s\n' '46adc34f63ba5a8cbc0ea94373c8202b3d202ae2a26be36371a163b281579c2e' "$H" | sha256sum -c -
 git -C "$TARGET" diff --name-only "$BASE" "$CODE" -- src packaging | wc -l
 ```
 
@@ -55,25 +57,32 @@ sudo python3 -I "$H" run "$D" 2>&1 | tee "$D/run.txt"
 ```
 
 Идёт до 45 минут, второй раз не запускать, Firefox вручную не открывать. Норма — строки в таком порядке:
-`OK on`, `OK https`, `OK user`, `OK temp_xray`, строки `TRIAL …` (пути `normal`, `direct`, `fragment`,
-`split`), `INFO normal=… direct=… fragment=… split=… minutes=…`, `OK on`, `OK https`, затем `RESULT …` и
-`helper_rc=0`. Все строки `TRIAL`, `INFO` и `RESULT` переписать в отчёт как есть.
+`OK on`, `OK https`, `OK user`, `OK temp_xray`, 12 строк `PRECHECK …`, строки `TRIAL …` (пути `normal`,
+`direct`, `fragment`, `split`), `INFO normal=… direct=… fragment=… split=… minutes=…`, `OK on`, `OK https`,
+затем `RESULT …` и `helper_rc=0`. Все строки `PRECHECK`, `TRIAL`, `INFO` и `RESULT` переписать как есть.
+В `INFO` числа — «сыграло / измерено»: запуски с зависанием браузера не считаются измеренными.
 
 - `RESULT direct_ok` — напрямую сыграло минимум 3 ролика из 4. Итог DONE.
 - `RESULT fragment_ok` — напрямую без дробления нет, с одним из видов дробления минимум 3 из 4. Итог DONE.
-- `RESULT none_ok` — ни один прямой путь не дал 3 из 4. Итог DONE.
-- `NOT_RUN no_browser`, `NOT_RUN no_xray` или `NOT_RUN no_playback` (обычным путём сыграло меньше двух
-  роликов), `helper_rc=4` — сравнить не удалось. Итог NOT_RUN, не FAIL. Повторять не надо.
+- `RESULT none_ok` — все прямые пути измерены, ни один не дал 3 из 4. Итог DONE.
+- `NOT_RUN no_browser`, `NOT_RUN no_xray`, `NOT_RUN no_playback` (обычным путём сыграло меньше двух
+  роликов) или `NOT_RUN direct_unmeasured` (прямые пути не измерены), `helper_rc=4` — сравнить не
+  удалось. Итог NOT_RUN, не FAIL. Повторять не надо.
 - `STOP on` / `STOP https` — сразу владельцу, ничего не чинить.
 - `STOP temp_xray` или `STOP` с другим словом, `helper_rc=3` — записать слово, итог PARTIAL.
 
-Что значат значения в `TRIAL`. `start_s` — секунд до начала видео (`-` — не началось), `stalls` — сколько
+В `PRECHECK`: `url` — `page` (страница), `video` (видеосеть), `file` (файл замера из настроек); `curl` —
+код завершения (0 — успех, 28 — время вышло, 35 — сбой TLS); `code` — ответ сервера; `first_s` — секунд до
+первого байта; `mbps` — средняя скорость запроса (для `page` и `video` тело пустое, значение ни о чём не
+говорит). В `TRIAL`: `start_s` — секунд до начала видео (`-` — не началось), `stalls` — сколько
 раз при опросе плеер ждал данные. `result`: `played` — сыграло 20 секунд ролика; `bot` — YouTube просит
 подтвердить, что это не робот; `sign_in` — просит войти; `unavailable` — ролик недоступен; `player_error`
 — другая ошибка плеера; `media_err_N` — браузер не смог декодировать видео; `consent_page` — осталась
 страница запроса о cookie; `consent_dialog` — окно запроса поверх плеера, а видео не пошло; `ad` — время
-кончилось на рекламе; `stuck` — видео есть, но не идёт; `no_video` — плеера нет; `no_browser` — Firefox не
-запустился. Причины не придумывать.
+кончилось на рекламе; `stuck` — видео есть, но не идёт; `no_video` — плеера нет; `page_not_loaded` —
+страница не загрузилась. Запуск не измерен: `no_marionette` — управление Firefox не поднялось;
+`browser_died` — Firefox завершился; `navigate_hang` и `script_hang` — Firefox перестал отвечать.
+Причины не придумывать.
 
 ## 4. Конечное состояние и отчёт
 
@@ -84,14 +93,14 @@ sudo python3 -I "$H" health; sudo xgw diag --no-net >"$D/diag-after"; echo "diag
 Норма: `OK on`, `OK https`, новых FAIL нет; режим пула тот же.
 DEGRADED из `Состояние:` не называть «обычной волной» и причину не придумывать.
 
-Отчёт — `docs/TEST-REPORT-REAL-MACHINE-0.2.0-youtube-wan-ДАТА.md` в freepool, одна страница, без пути D.
+Отчёт — `docs/TEST-REPORT-REAL-MACHINE-0.2.0-youtube-wan-r2-ДАТА.md` в freepool, одна страница, без пути D.
 `git diff --cached --name-only` — только этот файл, `git diff --cached --check`, затем `git pull
 --rebase` и обычный push без force.
 
 ```text
 Дата; CODE; сумма OK; файлов шлюза изменено (ожидается 0):
 До: helper_rc; on/HTTPS; diag (OK/WARN/FAIL); режим пула:
-Проверка: helper_rc; все строки TRIAL и INFO как есть:
+Проверка: helper_rc; все строки PRECHECK, TRIAL и INFO как есть:
 RESULT или NOT_RUN как есть:
 Конечное: on/HTTPS; diag после; режим пула без изменений (да/нет):
 Итог: DONE / NOT_RUN / PARTIAL; первый непройденный шаг; что стоит на машине:
