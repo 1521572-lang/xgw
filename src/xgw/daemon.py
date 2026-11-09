@@ -280,6 +280,11 @@ YOUTUBE_PAUSE = 2 * 3600.0
 # Выход для видео (п. 348): повтор сборки, если план не применился, и чтения его балансировщика.
 MEDIA_RETRY = 300.0
 MEDIA_VERIFY = 60.0
+# Дополнительные проверки кандидатов в выход видео (п. 353): разброс сроков, предел паузы после
+# неудач (от YOUTUBE_GAP, удваивается) и запись суточного расхода трафика.
+MEDIA_SPREAD = 0.2
+MEDIA_BACKOFF_MAX = 1800.0
+MEDIA_BUDGET_META = "youtube_media_budget"
 # Рабочий конфиг Xray расходится с режимом «весь дом» (_house_sync) — срочная сборка не чаще
 # HOUSE_SYNC: отклонённый или откаченный конфиг не пересобирается на каждом шаге.
 HOUSE_SYNC = 300.0
@@ -783,6 +788,7 @@ class Daemon:
         self._media_verify_at = 0.0
         self._media_verified: tuple[str, ...] = ()
         self._media_view: dict = {"state": "off"}
+        self._media_spent: dict[str, int] | None = None  # суточный расход (_media_budget)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
         # Период скана запасных, мин (_scan_period): probe.scan_spares_minutes или больше,
@@ -1272,6 +1278,7 @@ class Daemon:
         self._media_verify_at = previous._media_verify_at
         self._media_verified = previous._media_verified
         self._media_view = previous._media_view
+        self._media_spent = previous._media_spent
         self.diary = previous.diary
         self.diary.store = self.store
         self._house_synced_at = previous._house_synced_at
@@ -4111,6 +4118,56 @@ class Daemon:
         return bool(self.cfg.speed.youtube and key and not self.probe_target
                     and self._youtube_due(key, True))
 
+    def _media_budget(self, wall: float) -> dict[str, int]:
+        """Расход дополнительных проверок за сутки (UTC): запись переживает перезапуск демона."""
+        day = int(wall // 86400)
+        if self._media_spent is None:
+            try:
+                loaded = json.loads(self.store.get_meta(MEDIA_BUDGET_META) or "{}")
+            except ValueError:
+                loaded = {}
+            self._media_spent = loaded if isinstance(loaded, dict) else {}
+        if (self._media_spent.get("day") != day
+                or not isinstance(self._media_spent.get("bytes"), int)):
+            self._media_spent = {"day": day, "bytes": 0}
+        return self._media_spent
+
+    def _media_due(self, key: str, wall: float) -> bool:
+        """Пора ли дополнительно проверить кандидата: раз в media.youtube_check_minutes, после
+        неудачи — с паузой, что удваивается от YOUTUBE_GAP до MEDIA_BACKOFF_MAX. Разброс ±20 %
+        выводится из сервера и времени его проверки: срок один и тот же на всех шагах и после
+        перезапуска, а серверы не совпадают между собой."""
+        record = self._youtube_records().get(key) or {}
+        stamp, fails = float(record.get("ts") or 0), int(record.get("fails") or 0)
+        wait = (min(YOUTUBE_GAP * 2 ** min(fails - 1, 10), MEDIA_BACKOFF_MAX) if fails
+                else self.cfg.media.youtube_check_minutes * 60.0)
+        shift = random.Random(f"{key}:{stamp}").uniform(1.0 - MEDIA_SPREAD, 1.0 + MEDIA_SPREAD)
+        return wall - stamp >= wait * shift
+
+    def _media_extras(
+        self, possible: list[tuple[NodeInfo, str, bool, bool, bool]], wall: float,
+    ) -> list[tuple[NodeInfo, str, bool, bool, bool]]:
+        """Кого проверить сверх обычных сроков, чтобы у выхода видео были свежие замеры (п. 353):
+        живых безлимитных участников, только в режиме best и в пределах суточного лимита. Не
+        начинается, если проверка могла бы его превысить."""
+        measuring = self.cfg.speed
+        if (self.cfg.media.youtube_mode != "best" or traffic.whole_house(self.cfg)
+                or not measuring.youtube or not measuring.youtube_mbps):
+            return []
+        limit = self.cfg.media.youtube_daily_probe_mb * speed.MB
+        if self._media_budget(wall)["bytes"] + youtube.CHECK_MAX_BYTES > limit:
+            return []
+        return [item for item in possible
+                if not item[2] and item[3] and not item[4] and self._media_due(item[1], wall)]
+
+    def _media_status(self) -> dict:
+        """Сводка выхода видео для статуса: вид и расход дополнительных проверок за сутки."""
+        if self._media_view.get("state") in (None, "off"):
+            return self._media_view
+        spent = self._media_budget(self.wall())["bytes"]
+        return {**self._media_view, "probe_mb": round(spent / speed.MB, 1),
+                "probe_limit_mb": self.cfg.media.youtube_daily_probe_mb}
+
     def _youtube_step(
         self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
     ) -> None:
@@ -4129,21 +4186,34 @@ class Daemon:
         if not password:
             return
         records = self._youtube_records()
-        targets = [item for item in self._youtube_targets(view, applied, observatory)
-                   if self._youtube_due(item[1], item[2])]
+        possible = self._youtube_targets(view, applied, observatory)
+        targets = [item for item in possible if self._youtube_due(item[1], item[2])]
         current = [item for item in targets if item[2]]
         wall = self.wall()
+
+        def oldest(item: tuple) -> tuple[float, str]:
+            return float((records.get(item[1]) or {}).get("ts") or 0), item[0].tag
+
+        extra = False
         if current:
             target = current[0]
-        elif targets and wall - self._youtube_bg_at >= YOUTUBE_GAP:
-            target = min(targets, key=lambda item: (
-                float((records.get(item[1]) or {}).get("ts") or 0), item[0].tag))
-        else:
+        elif wall - self._youtube_bg_at < YOUTUBE_GAP:
             return
+        elif targets:
+            target = min(targets, key=oldest)
+        else:
+            extras = self._media_extras(possible, wall)
+            if not extras:
+                return
+            target, extra = min(extras, key=oldest), True
         info, key, carries, measure, pooled = target
         client = self._youtube_rates.get(info.tag, 0.0) if carries else 0.0
         verdict = self._youtube_check(info, password, client=client, measure=measure)
         self._youtube_ran = True
+        if extra:  # в том числе прерванная проверка: её трафик уже потрачен
+            budget = self._media_budget(wall)
+            budget["bytes"] += verdict.bytes_used
+            self.store.set_meta(MEDIA_BUDGET_META, json.dumps(budget, sort_keys=True))
         if verdict.state == youtube.CANCELLED:
             return  # проверку прервала остановка демона: о сервере она ничего не говорит
         self._youtube_own = (info.tag, verdict.bytes_used)
@@ -4163,8 +4233,8 @@ class Daemon:
                     if wall - float(value.get("ts") or 0) > YOUTUBE_KEEP]:
             del records[old]
         self.store.set_meta(YOUTUBE_META, json.dumps(records, sort_keys=True))
-        self.log.info("YouTube через %s%s: %s", info.tag, " (несёт трафик)" if carries else "",
-                      youtube.summary(verdict))
+        label = " (несёт трафик)" if carries else " (дополнительно для видео)" if extra else ""
+        self.log.info("YouTube через %s%s: %s", info.tag, label, youtube.summary(verdict))
         if pooled:
             self.diary.count("youtube_checked")
             if verdict.state != youtube.OK:
@@ -7072,7 +7142,7 @@ class Daemon:
         }
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
-        snapshot["media"] = self._media_view  # выход для видео YouTube (п. 348)
+        snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

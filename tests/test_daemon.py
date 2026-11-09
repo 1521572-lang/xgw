@@ -21,9 +21,9 @@ from xgw.parsers.common import parse_links_text
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store
 from xgw.watch.scan import ScanResult
-from xgw.watch.speed import SpeedResult
+from xgw.watch.speed import MB, SpeedResult
 from xgw.watch.states import State
-from xgw.watch.youtube import OK, Verdict
+from xgw.watch.youtube import CHECK_MAX_BYTES, OK, Verdict
 from xgw.xraycore.api import ApiError, BalancerInfo
 
 ALL_LINKS = [*links.FULL_LINKS, links.TROJAN_INSECURE]
@@ -3310,6 +3310,85 @@ def test_media_exit_is_checked_like_a_carrier(daemon):
         {"tag": "youtube", "selector": [members[1].tag], "fallbackTag": members[1].tag})
     targets = {item[0].tag: item[2] for item in daemon._youtube_targets(view, applied, observatory)}
     assert targets[members[1].tag] is True
+
+
+def _media_candidates_old(daemon, age):
+    """Все участники, кроме несущего трафик, проверены age секунд назад; итог обычных сроков нет."""
+    view, observatory, members = _media_ready(daemon)
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    carrier = daemon._youtube_main_tag(view)
+    for info in members:
+        if info.tag != carrier:
+            daemon._youtube[info.fingerprint]["ts"] = daemon.t - age
+    possible = daemon._youtube_targets(view, applied, observatory)
+    return view, applied, observatory, carrier, possible
+
+
+def test_media_extra_checks_are_only_for_best_and_after_the_interval(daemon):
+    """п. 353: режим выключен — ни одной дополнительной; срок с разбросом ±20 %."""
+    _started(daemon)
+    interval = daemon.cfg.media.youtube_check_minutes * 60
+    _view, _applied, _obs, _carrier, possible = _media_candidates_old(daemon, interval * 1.21)
+    assert len(daemon._media_extras(possible, daemon.t)) == len(
+        [item for item in possible if not item[2]]) > 0
+    daemon.cfg.media.youtube_mode = "off"
+    assert daemon._media_extras(possible, daemon.t) == []
+    _view, _applied, _obs, _carrier, possible = _media_candidates_old(daemon, interval * 0.79)
+    assert daemon._media_extras(possible, daemon.t) == []
+
+
+def test_media_due_is_stable_and_backs_off_after_failures(daemon):
+    _started(daemon)
+    records = daemon._youtube_records()
+    wall = 1_000_000.0
+    cases = (("aa", 1, 95, 145), ("bb", 3, 383, 577), ("cc", 40, 1439, 2161))
+    for key, fails, not_yet, ready in cases:
+        records[key] = {"state": "slow", "fails": fails, "ts": wall}
+        assert not daemon._media_due(key, wall + not_yet)
+        assert daemon._media_due(key, wall + ready)
+    moments = {daemon._media_due("aa", wall + 120) for _ in range(5)}
+    assert len(moments) == 1  # срок не гуляет от шага к шагу
+
+
+def test_media_budget_stops_before_overrun_and_survives_restart(daemon):
+    _started(daemon)
+    interval = daemon.cfg.media.youtube_check_minutes * 60
+    _view, _applied, _obs, _carrier, possible = _media_candidates_old(daemon, interval * 1.21)
+    limit = daemon.cfg.media.youtube_daily_probe_mb * MB
+    wall = daemon.t
+    daemon._media_budget(wall)["bytes"] = limit - CHECK_MAX_BYTES
+    assert daemon._media_extras(possible, wall)
+    daemon._media_budget(wall)["bytes"] += 1
+    assert daemon._media_extras(possible, wall) == []
+    daemon.cfg.media.youtube_daily_probe_mb = 0
+    daemon._media_spent = None
+    assert daemon._media_extras(possible, wall) == []
+    daemon.cfg.media.youtube_daily_probe_mb = 256
+    assert daemon._media_budget(wall + 86400)["bytes"] == 0  # новые сутки
+
+
+def test_media_extra_check_is_one_per_step_counted_and_persisted(daemon):
+    _started(daemon)
+    interval = daemon.cfg.media.youtube_check_minutes * 60
+    view, applied, observatory, carrier, _possible = _media_candidates_old(daemon, interval * 1.21)
+    daemon.youtube_checked.clear()
+    daemon._youtube_bg_at = 0.0
+    daemon._youtube_step(view, applied, observatory, daemon.t)
+    assert len(daemon.youtube_checked) == 1 and daemon.youtube_checked[0] != carrier
+    saved = json.loads(daemon.store.get_meta("youtube_media_budget"))
+    assert saved["bytes"] == 4_000_000
+    daemon._youtube_step(view, applied, observatory, daemon.t)  # YOUTUBE_GAP ещё не прошёл
+    assert len(daemon.youtube_checked) == 1
+    daemon._media_spent = None
+    assert daemon._media_budget(daemon.t)["bytes"] == 4_000_000  # после перезапуска демона
+    daemon._media_view = {"state": "best", "tags": [], "samples": []}
+    view_status = daemon._media_status()
+    assert view_status["probe_mb"] == 4.0 and view_status["probe_limit_mb"] == 256
+
+
+def test_media_off_does_not_add_a_status_field(daemon):
+    _started(daemon)
+    assert daemon._media_status() == {"state": "off"}
 
 
 def test_media_unconfirmed_balancer_is_degraded(daemon):

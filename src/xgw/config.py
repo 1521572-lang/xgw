@@ -369,6 +369,10 @@ class Media:
     # без свежего замера.
     youtube_sample_ttl_minutes: int = 720
     youtube_hold_minutes: int = 10  # плановая смена выхода — не чаще
+    # Дополнительные проверки кандидатов в режиме best (п. 353): как часто и сколько МБ трафика
+    # в сутки на них можно потратить; 0 — только обычные проверки [speed].
+    youtube_check_minutes: int = 60
+    youtube_daily_probe_mb: int = 256
 
 
 # Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a; 0.2.0): другие операторы и
@@ -1162,6 +1166,14 @@ def _validate_media(media: Media) -> list[str]:
         warnings.append(f"media.youtube_hold_minutes={media.youtube_hold_minutes}: ожидается "
                         "1–120 — используется 10")
         media.youtube_hold_minutes = 10
+    if not 15 <= media.youtube_check_minutes <= 360:
+        warnings.append(f"media.youtube_check_minutes={media.youtube_check_minutes}: ожидается "
+                        "15–360 — используется 60")
+        media.youtube_check_minutes = 60
+    if not 0 <= media.youtube_daily_probe_mb <= 10000:
+        warnings.append(f"media.youtube_daily_probe_mb={media.youtube_daily_probe_mb}: ожидается "
+                        "0–10000 — используется 256")
+        media.youtube_daily_probe_mb = 256
     return warnings
 
 

@@ -1162,8 +1162,10 @@ def render_media(media: dict) -> str:
         speed = f"{mbps:g} Мбит/с, " if isinstance(mbps, int | float) else ""
         parts.append(f"{sample.get('tag')} ({speed}замер {int(sample.get('age_s') or 0) // 60} "
                      "мин назад)")
+    limit = media.get("probe_limit_mb")
+    spent = f"; доп. проверки за сутки {media.get('probe_mb')} из {limit} МБ" if limit else ""
     return "YouTube: отдельный выход для видео — " + (
-        ", ".join(parts) or ", ".join(media.get("tags") or []))
+        ", ".join(parts) or ", ".join(media.get("tags") or [])) + spent
 
 
 def render_status(status: dict) -> str:

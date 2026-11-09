@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from xgw.config import Config, load, probe_bytes, retire_obsolete
+from xgw.config import Config, Media, _validate_media, load, probe_bytes, retire_obsolete
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
 
@@ -164,6 +164,14 @@ def test_subscriptions_list(tmp_path):
     assert warnings == []
     assert [sub.name for sub in cfg.subscriptions] == ["a", "b"]
     assert cfg.subscriptions[1].user_agent == "v2rayN/6"
+
+
+def test_media_check_limits_fall_back_with_a_warning():
+    media = Media(youtube_check_minutes=5, youtube_daily_probe_mb=-1)
+    warnings = _validate_media(media)
+    assert media.youtube_check_minutes == 60 and media.youtube_daily_probe_mb == 256
+    assert any("youtube_check_minutes" in item for item in warnings)
+    assert any("youtube_daily_probe_mb" in item for item in warnings)
 
 
 def test_example_config_loads_clean():

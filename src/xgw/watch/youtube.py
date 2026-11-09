@@ -53,6 +53,9 @@ SPARE_URL = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd
 # Трафик одного запроса без тела: рукопожатие TLS (цепочка сертификатов Google) и заголовки.
 # Оценка сверху — для счётчиков своего трафика (daemon.Daemon._youtube_rates).
 HANDSHAKE_BYTES = 8_000
+# Больше одна проверка потратить не может: файл замера, запасной файл и служебные запросы.
+# По этой оценке суточный лимит дополнительных проверок не превышается (п. 353).
+CHECK_MAX_BYTES = int(2 * SPEED_MB * MB) + 16 * HANDSHAKE_BYTES
 
 
 @dataclass(frozen=True)
