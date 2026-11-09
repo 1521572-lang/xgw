@@ -3085,7 +3085,7 @@ def test_generation_prepares_in_background_and_only_fresh_result_switches(
     switched, aborted = [], []
     main = threading.get_ident()
 
-    def prepare(*args, rank=None):
+    def prepare(*args, rank=None, usable=()):
         assert threading.get_ident() != main
         assert isinstance(rank, dict)  # порядок мостов собран в шаге (отчёт sub-remove)
         entered.set()

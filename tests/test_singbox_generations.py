@@ -312,6 +312,95 @@ def test_no_bridge_in_use_is_not_a_refusal(gateway, monkeypatch):
     assert g.finish(w.core, w.applier, prepared).mode in ("api", "unchanged")
 
 
+def _spare_bridges_and_free_server(w):
+    """Все мосты Xray запасные, в sing-box есть ещё безлимитный сервер вне работы Xray."""
+    config, xray = _three_bridges(w)
+    for outbound in xray["outbounds"]:
+        if sb.bridge_variant(outbound):
+            outbound["tag"] = "spare-test-" + str(outbound["settings"]["servers"][0]["port"])
+    for letter, port in (("d", 22004), ("f", 22005)):
+        inbound = copy.deepcopy(config["inbounds"][0])
+        inbound.update(tag=f"sb-in-ddee4455-{letter}", listen_port=port)
+        config["inbounds"].append(inbound)
+    return config, xray
+
+
+def test_silent_spares_do_not_stop_a_generation_when_a_usable_server_answers(gateway, monkeypatch):
+    """Отчёт bridges-cause: 5 молчащих запасных hysteria2 остановили все сборки (п. 351)."""
+    w = gateway
+    config, xray = _spare_bridges_and_free_server(w)
+    tried = []
+
+    def reply(*args, **kwargs):
+        tried.append(args[1])
+        return DownloadResult(ok=args[1] == 22004, kind="" if args[1] == 22004 else "tls")
+
+    monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455"})
+    assert checked and tried == [22004] and "не из работающих" in checked.summary
+    tried.clear()
+    # Живой сервер не первый — запасные пробуются раньше него; вариант f не проверяется.
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": 0.9}, {"ddee4455"})
+    assert checked and tried == [22001, 22002, 22003, 22004]
+
+
+def test_server_outside_the_usable_list_is_not_asked(gateway, monkeypatch):
+    """Лимитный или неисправный сервер в проверку не берётся: запрос потратил бы квоту."""
+    w = gateway
+    config, xray = _spare_bridges_and_free_server(w)
+    tried = []
+
+    def reply(*args, **kwargs):
+        tried.append(args[1])
+        return DownloadResult(ok=False, kind="tls")
+
+    monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {}, set())
+    assert not checked and sorted(tried) == [22001, 22002, 22003]
+    assert "мостов проверено 3 из 3: tls 3" in checked.summary
+
+
+def test_bridge_that_carries_traffic_is_not_replaced_by_another_server(gateway, monkeypatch):
+    """Мост участника молчит — поколение отклоняется, как раньше: другой сервер не довод."""
+    w = gateway
+    config, xray = _spare_bridges_and_free_server(w)
+    first = next(item for item in xray["outbounds"] if sb.bridge_variant(item))
+    first["tag"] = "proxy-test-aabb1122"
+    tried = []
+
+    def reply(*args, **kwargs):
+        tried.append(args[1])
+        return DownloadResult(ok=False, kind="tls")
+
+    monkeypatch.setattr(g.checks, "http_get_via_proxy", reply)
+    checked = REAL_BRIDGE_CHECK(w.core, config, xray, {"ddee4455": -2.0}, {"ddee4455"})
+    assert not checked and 22004 not in tried
+
+
+def test_daemon_offers_only_unlimited_servers_of_the_working_core(tmp_path, monkeypatch):
+    from test_daemon import Harness, _started
+
+    monkeypatch.setenv("XGW_ROOT", str(tmp_path))
+    paths = Paths.from_env()
+    paths.ensure()
+    cfg = Config()
+    cfg.filters.exclude_regex = ""
+    cfg.dns.bootstrap = []
+    daemon = Harness(cfg, paths)
+    try:
+        _started(daemon)
+        nodes = [node.fingerprint for node in daemon.inventory.nodes]
+        monkeypatch.setattr(daemon, "_prices", lambda: {})
+        assert daemon._bridge_usable() == set()  # стоимость неизвестна — как у лимитного
+        monkeypatch.setattr(daemon, "_prices", lambda: dict.fromkeys(nodes, 0.0))
+        free = daemon._bridge_usable()
+        assert free and free <= set(nodes)
+        monkeypatch.setattr(daemon, "_prices", lambda: dict.fromkeys(nodes, 2.0))
+        assert daemon._bridge_usable() == set()
+    finally:
+        daemon.store.close()
+
+
 def test_failed_bridges_are_counted_in_the_refusal(gateway, monkeypatch):
     w = gateway
     config, xray = _three_bridges(w)

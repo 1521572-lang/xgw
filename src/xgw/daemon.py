@@ -2819,13 +2819,14 @@ class Daemon:
             job.generation_core = self.singbox
             job.done.clear()
             self._build = job
-            rank = self._bridge_rank()  # в шаге: поток подготовки к счётчикам не ходит
+            # В шаге: поток подготовки к счётчикам и подписке не ходит.
+            rank, usable = self._bridge_rank(), self._bridge_usable()
 
             def prepare_generation():
                 try:
                     job.generation = generations.prepare(
                         job.generation_core, assembly.singbox.config, assembly.result.config,
-                        rank=rank)
+                        rank=rank, usable=usable)
                 except Exception as exc:
                     self.log.warning("подготовка поколения sing-box не выполнена: %s", exc)
                     job.error = engine.EngineError(
@@ -3192,6 +3193,17 @@ class Daemon:
                 if info.role == "proxy":
                     rank[info.fingerprint] = rank.get(info.fingerprint, UNKNOWN_RANK) - 2.0
         return rank
+
+    def _bridge_usable(self) -> set[str]:
+        """Какими серверами можно проверить новое поколение sing-box, если все его мосты у Xray
+        запасные (п. 351): заведены в работающем ядре и безлимитны — запрос через лимитный
+        тратит квоту, а стоимость неизвестного сервера считается как у лимитного."""
+        applied = engine.read_json(self.paths.xray_config_file)
+        if applied is None or self.inventory is None:
+            return set()
+        prices = self._prices()
+        return {info.fingerprint for info in builder.applied_nodes(applied, self.inventory.nodes)
+                if prices.get(info.fingerprint, 1.0) <= 0}
 
     def _fail_rate(self, fingerprint: str) -> float:
         hour = int(self.wall() // 3600)

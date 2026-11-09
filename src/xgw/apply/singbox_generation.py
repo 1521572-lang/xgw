@@ -201,22 +201,38 @@ class BridgeCheck:
         return self.ok
 
 
-def bridge_check(core, config, routed, rank=None):
+def _carries_traffic(routed):
+    """Есть ли мост, который ведёт трафик: это любой мост Xray, кроме запасных."""
+    return any(sb.bridge_variant(item) and not str(item.get("tag") or "").startswith("spare-")
+               for item in routed.get("outbounds") or [])
+
+
+def bridge_check(core, config, routed, rank=None, usable=()):
     """Полный GET через хотя бы один используемый мост; плохие отдельные серверы допустимы.
 
     rank — отпечаток → порядок (меньше — раньше): участники, что ведут трафик, затем по
     доле сбоев за сутки (Daemon._bridge_rank). Без порядка мосты шли как в конфиге, и при
     мёртвых первых серверах (возврат подписки после паузы) срок кончался раньше живых —
-    поколение не менялось ни разу подряд (отчёт sub-remove, 08.11.2026)."""
+    поколение не менялось ни разу подряд (отчёт sub-remove, 08.11.2026).
+
+    usable — отпечатки исправных безлимитных серверов (Daemon._bridge_usable). Если все мосты
+    Xray запасные, поколение можно проверить и через такой сервер: нужен живой путь через новый
+    процесс sing-box, а не именно эти запасные (п. 351, отчёт bridges-cause: 5 молчащих запасных
+    hysteria2 остановили все сборки на 6 часов). Мост, ведущий трафик, так не заменяется."""
     wanted = processes.xray_ports(routed)
     rank = rank or {}
+    extra_allowed = not _carries_traffic(routed)
     candidates = []
+    extras = []
     for index, inbound in enumerate(config["inbounds"]):
-        if inbound["listen_port"] not in wanted:
-            continue
         match = sb._IN_TAG.match(str(inbound.get("tag") or ""))
         place = rank.get(match.group(1), UNKNOWN_RANK) if match else UNKNOWN_RANK
-        candidates.append((place, index, inbound))
+        if inbound["listen_port"] in wanted:
+            candidates.append((place, index, inbound, False))
+        elif extra_allowed and match and match.group(2) == "d" and match.group(1) in usable:
+            extras.append((place, index, inbound, True))  # без вариантов: один запрос на сервер
+    if candidates:
+        candidates += extras  # нет мостов вообще — проверять нечего, как раньше
     candidates.sort(key=lambda item: (item[0], item[1]))
     if not candidates:
         # Xray не ведёт трафик ни через один мост: все серверы на профилях Xray, а sing-box
@@ -227,7 +243,7 @@ def bridge_check(core, config, routed, rank=None):
     deadline = time.monotonic() + BRIDGE_BUDGET
     kinds: dict[str, int] = {}
     tried = 0
-    for _place, _index, inbound in candidates:
+    for _place, _index, inbound, extra in candidates:
         left = deadline - time.monotonic()
         if left <= 0:
             break
@@ -240,7 +256,8 @@ def bridge_check(core, config, routed, rank=None):
             user_agent=core.cfg.probe.user_agent,
         )
         if reply.ok:
-            return BridgeCheck(True, f"мост {tried} из {len(candidates)}")
+            return BridgeCheck(True, f"мост {tried} из {len(candidates)}"
+                                     + (", не из работающих у Xray" if extra else ""))
         kind = str(getattr(reply, "kind", "") or "error")
         kinds[kind] = kinds.get(kind, 0) + 1
     outcomes = ", ".join(f"{kind} {count}" for kind, count in sorted(kinds.items()))
@@ -248,9 +265,9 @@ def bridge_check(core, config, routed, rank=None):
                               + (f": {outcomes}" if outcomes else ""))
 
 
-def prepare(core, config, xray, rank=None):
-    """Никаких API-записей Xray. Кандидат не получает пользовательский трафик. rank —
-    порядок проверки мостов (bridge_check)."""
+def prepare(core, config, xray, rank=None, usable=()):
+    """Никаких API-записей Xray. Кандидат не получает пользовательский трафик. rank и usable —
+    порядок и запасной набор серверов для проверки мостов (bridge_check)."""
     with file_lock(core.paths.lock_file):
         state = processes.reap(core)
         if state["pending"] or state["draining"] or core.paths.api_dirty_file.exists():
@@ -288,11 +305,13 @@ def prepare(core, config, xray, rank=None):
         if error:
             raise ValueError("новое поколение не прошло настоящий запрос через мост: "
                              "sing-box не готов")
-        checked = bridge_check(core, candidate, routed, rank)
+        checked = bridge_check(core, candidate, routed, rank, usable)
+        summary = getattr(checked, "summary", "")
         if not checked:
-            summary = getattr(checked, "summary", "")
             raise ValueError("новое поколение не прошло настоящий запрос через мост"
                              + (f" ({summary})" if summary else ""))
+        if summary:
+            core.log.info("новое поколение sing-box проверено: %s", summary)
         problem = processes.identity(core, slot)
         if problem:
             raise ValueError(problem)
