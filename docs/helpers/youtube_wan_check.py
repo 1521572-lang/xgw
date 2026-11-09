@@ -1,6 +1,5 @@
-"""Играют ли ссылки youtube.com/watch в Firefox без окна: обычным путём шлюза, напрямую с домашнего
-адреса и напрямую с дроблением ClientHello. Режимы: health | run КАТАЛОГ. Настройки шлюза не
-меняются: временный Xray слушает только 127.0.0.1 и живёт, пока идёт проверка."""
+"""Играет ли YouTube в Firefox без окна обычным путём, напрямую и напрямую с дроблением ClientHello.
+Режимы: health | run КАТАЛОГ. Настройки не меняются: временный Xray только на 127.0.0.1."""
 import contextlib
 import json
 import os
@@ -16,11 +15,11 @@ CONFIG = Path("/etc/xgw/config.toml")
 XRAY = Path("/opt/xgw/xray/xray")
 SEARCH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
 TRIAL, PLAY_GOAL = 90.0, 20.0  # ролик не дольше (реклама идёт в тот же тег); столько должно сыграть
-DEADLINE = 45 * 60.0
-NEED = 3  # роликов из четырёх, чтобы считать путь рабочим
+DEADLINE, NEED = 45 * 60.0, 3  # весь прогон; сколько роликов из четырёх нужно рабочему пути
 VIDEOS = (("plain1", "aqz-KE-bpKQ"), ("plain2", "M7lc1UVf-VE"),
           ("music1", "dQw4w9WgXcQ"), ("music2", "9bZkp7q19f0"))
 PATHS = ("normal", "direct", "fragment", "split")
+UNMEASURED = ("no_marionette", "browser_died", "navigate_hang", "script_hang")
 PROBE = """var c=location.hostname.indexOf('consent.')===0;var done=false;var d=document;
 var go=arguments[0];var r=d.querySelector('input[name=set_eom][value=true]');
 var n=Array.from(document.querySelectorAll('button')).find(function(b){
@@ -64,7 +63,6 @@ def free_port():
 
 
 def build_config():
-    """Конфиг временного Xray: те же метка и параметры дробления, что у XGW. Порты — по путям."""
     sys.path.insert(0, "/opt/xgw/lib")
     from xgw import config as xconfig
     from xgw.generator import fragment
@@ -78,14 +76,30 @@ def build_config():
         "split": {**fragment.split_outbound(cfg), "tag": "split"},
     }
     ports = {name: free_port() for name in outbounds}
-    return {
+    return cfg, ports, {
         "log": {"loglevel": "none"},
         "inbounds": [{"tag": f"in-{name}", "protocol": "http", "listen": "127.0.0.1", "port": port}
                      for name, port in ports.items()],
         "outbounds": list(outbounds.values()),
         "routing": {"rules": [{"type": "field", "inboundTag": [f"in-{name}"], "outboundTag": name}
                               for name in ports]},
-    }, ports
+    }
+
+
+def precheck(cfg, ports):
+    urls = {"page": cfg.speed.youtube_urls[0], "video": cfg.speed.youtube_urls[-1],
+            "file": cfg.speed.youtube_speed_url}
+    for path in PATHS:
+        via = (["--noproxy", "*"] if path == "normal" else
+               ["--proxy", f"http://127.0.0.1:{ports[path]}"])
+        for name, url in urls.items():
+            done = subprocess.run(
+                ["curl", "--silent", *via, "--max-time", "15", "-L", "--max-redirs", "4", "-r",
+                 "0-2097151", "-o", "/dev/null", "-w", "%{http_code} %{time_starttransfer} "
+                 "%{speed_download}", url], text=True, capture_output=True, timeout=20, check=False)
+            code, first, rate = ([*done.stdout.split(), "-", "0", "0"])[:3]
+            print(f"PRECHECK path={path} url={name} curl={done.returncode} code={code} "
+                  f"first_s={float(first):.1f} mbps={float(rate) * 8 / 1e6:.1f}", flush=True)
 
 
 def start_xray(base, config, ports):
@@ -95,19 +109,16 @@ def start_xray(base, config, ports):
     process = subprocess.Popen([str(XRAY), "run", "-c", str(path)], stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.monotonic() + 15
-    for port in ports.values():
-        while True:
-            try:
+    while process.poll() is None and time.monotonic() < end:
+        with contextlib.suppress(OSError):
+            for port in ports.values():
                 socket.create_connection(("127.0.0.1", port), timeout=2).close()
-                break
-            except OSError:
-                if time.monotonic() > end or process.poll() is not None:
-                    process.kill()
-                    process.wait()
-                    path.unlink(missing_ok=True)
-                    return None, path
-                time.sleep(0.3)
-    return process, path
+            return process, path
+        time.sleep(0.3)
+    process.kill()
+    process.wait()
+    path.unlink(missing_ok=True)
+    return None, path
 
 
 class Mario:
@@ -161,7 +172,6 @@ def classify(text):
 
 
 def watch(client):
-    """(итог, секунд до старта видео или None, опросов с ожиданием данных)."""
     began = time.monotonic()
     seen, ready, clicks, first, stalls = "no_video", 0.0, 0, None, 0
     while time.monotonic() - began < TRIAL:
@@ -210,14 +220,20 @@ def trial(base, firefox, proxy, video):
          "MOZ_HEADLESS_HEIGHT=480", f"DBUS_SESSION_BUS_ADDRESS=unix:path={place}/bus",
          firefox, "--headless", "--marionette", "--no-remote", "--profile", str(profile)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stage, loaded = "no_marionette", True
     try:
         client = Mario(port)
-        with contextlib.suppress(ValueError):  # не догрузилась: решает состояние плеера
+        stage = "navigate_hang"
+        try:
             client.call("WebDriver:Navigate",
                         {"url": f"https://www.youtube.com/watch?v={video}&hl=en"})
-        return watch(client)
+        except ValueError:  # страница не загрузилась: это итог пути, а не сбой браузера
+            loaded = False
+        stage = "script_hang"
+        got = watch(client)
+        return ("page_not_loaded", *got[1:]) if not loaded and got[0] == "no_video" else got
     except (OSError, ValueError):
-        return "no_browser", None, 0
+        return ("browser_died" if process.poll() is not None else stage), None, 0
     finally:
         subprocess.run(["pkill", "-KILL", "-f", str(profile)], check=False, capture_output=True)
         process.kill()
@@ -232,11 +248,12 @@ def run(base):
     if not firefox or not XRAY.is_file():
         print("NOT_RUN " + ("no_browser" if not firefox else "no_xray"), flush=True)
         return 4
-    config, ports = build_config()
+    cfg, ports, config = build_config()
     process, config_file = start_xray(base, config, ports)
     require(process is not None, "temp_xray")
-    began, played = time.monotonic(), dict.fromkeys(PATHS, 0)
+    began, played, known = time.monotonic(), dict.fromkeys(PATHS, 0), dict.fromkeys(PATHS, 0)
     try:
+        precheck(cfg, ports)
         for path in PATHS:
             for label, video in VIDEOS:
                 if time.monotonic() - began > DEADLINE:
@@ -244,20 +261,24 @@ def run(base):
                 start = time.monotonic()
                 result, first, stalls = trial(base, firefox, ports.get(path), video)
                 played[path] += result == "played"
-                start_s = "-" if first is None else f"{first:.0f}"
-                print(f"TRIAL path={path} video={label} result={result} start_s={start_s} "
-                      f"stalls={stalls} seconds={time.monotonic() - start:.0f}", flush=True)
+                known[path] += result not in UNMEASURED
+                print(f"TRIAL path={path} video={label} result={result} start_s="
+                      f"{'-' if first is None else round(first)} stalls={stalls} "
+                      f"seconds={time.monotonic() - start:.0f}", flush=True)
     finally:
         process.kill()
         process.wait()
         config_file.unlink(missing_ok=True)
-    print("INFO " + " ".join(f"{name}={played[name]}/{len(VIDEOS)}" for name in PATHS)
+    print("INFO " + " ".join(f"{name}={played[name]}/{known[name]}" for name in PATHS)
           + f" minutes={(time.monotonic() - began) / 60:.1f}", flush=True)
     health()
     if played["normal"] < 2:
         print("NOT_RUN no_playback", flush=True)
         return 4
     tricks = max(played["fragment"], played["split"])
+    if played["direct"] < NEED and tricks < NEED and min(known[p] for p in PATHS[1:]) < NEED:
+        print("NOT_RUN direct_unmeasured", flush=True)
+        return 4
     print("RESULT " + ("direct_ok" if played["direct"] >= NEED else
                        "fragment_ok" if tricks >= NEED else "none_ok"), flush=True)
     return 0
