@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import cores, desktop, engine, fetch, log, managed, tray
+from . import cores, desktop, engine, fetch, log, managed, tray, zapret2_bundle
 from .apply.singbox import SingboxService
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, retire_obsolete
 from .generator import singbox as singboxing
@@ -357,6 +357,12 @@ class Installer:
             facts.packages.append(dnsmasq.PACKAGE)
         if self.which("sstpc") is None:
             facts.packages.append(SSTP_PACKAGE)  # бесплатный пул: туннели SSTP (М2в)
+        if (self.source_root / zapret2_bundle.RELATIVE).exists():
+            for package in zapret2_bundle.RUNTIME_PACKAGES:
+                state = self.runner(["dpkg-query", "-W", "-f=${Status}", package],
+                                    check=False).strip()
+                if state != "install ok installed":
+                    facts.packages.append(package)
         xray_entry = self.runner(["getent", "passwd", XRAY_USER], check=False).strip()
         singbox_entry = self.runner(["getent", "passwd", SINGBOX_USER], check=False).strip()
         facts.user_exists = bool(xray_entry)
@@ -465,6 +471,10 @@ class Installer:
     def plan(self, facts: Facts) -> list[str]:
         cfg = self.cfg
         lines = ["План установки XGW", "", "Система (сеть не меняется):"]
+        if (self.source_root / zapret2_bundle.RELATIVE).exists():
+            lines.append("  • встроенный zapret2 1.0.7; режим и заданные пути сохраняются")
+        else:
+            lines.append("  • комплект zapret2 отсутствует; сборка — packaging/build_release.py")
         if facts.packages:
             lines.append(f"  • пакеты из apt: {', '.join(facts.packages)}")
         if not facts.user_exists:
@@ -587,6 +597,13 @@ class Installer:
     # --- запуск -----------------------------------------------------------------
 
     def run(self, *, assume_yes: bool = False, force: bool = False) -> int:
+        packaged = self.source_root / zapret2_bundle.RELATIVE
+        if packaged.exists() or packaged.is_symlink():
+            try:
+                zapret2_bundle.validate(packaged)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self.out(f"Установка не начата: повреждён комплект zapret2 ({exc})")
+                return 1  # --force не обходит целостность и архитектуру
         # Обновление и продолжение частичной установки не перенастраивают входящий
         # адаптер. Старые записи нужны удалению, но не разрешают повторно применять WAN.
         self._preserve_wan = ("finished" in self.journal or "nm_wan" in self.journal
@@ -693,6 +710,13 @@ class Installer:
         # Перед заменой Python-кода останавливаем только контроллер. Правила и ядра
         # не снимаются. Новый код и конфиг больше не применяют два писателя одновременно.
         self._pause_daemon()
+        packaged = self.source_root / zapret2_bundle.RELATIVE
+        if packaged.exists():
+            try:
+                destination = zapret2_bundle.install(packaged, self.paths.opt)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise InstallError(f"комплект zapret2 не установлен: {exc}") from exc
+            self._step(f"zapret2 — {destination}")
         self._code()
         self._tidy_config()
         self._permissions()

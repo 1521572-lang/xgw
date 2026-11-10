@@ -6,3 +6,4 @@
 *.jar binary
 *.apk binary
 *.bat text eol=crlf
+third_party/zapret2/** -text -whitespace

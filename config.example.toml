@@ -420,8 +420,8 @@ mode = "off" # selective — после подготовки и согласия
 # compare — разовое сравнение двух probe_urls на служебных входах; клиенты остаются на VPN
 domains = ["domain:youtube.com", "domain:googlevideo.com",
            "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
-binary = "/opt/zapret2/nfqws2"
-lua_dir = "/opt/zapret2/lua"
+binary = "/opt/xgw/zapret2/1.0.7/nfqws2"
+lua_dir = "/opt/xgw/zapret2/1.0.7/lua"
 strategy = "multisplit" # также multidisorder; результат зависит от провайдера
 queue_num = 200
 probe_port = 19999

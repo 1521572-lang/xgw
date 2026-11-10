@@ -365,8 +365,8 @@ class Zapret2:
         "domain:youtube.com", "domain:googlevideo.com", "domain:youtubei.googleapis.com",
         "domain:youtube-nocookie.com",
     ])
-    binary: str = "/opt/zapret2/nfqws2"
-    lua_dir: str = "/opt/zapret2/lua"
+    binary: str = "/opt/xgw/zapret2/1.0.7/nfqws2"
+    lua_dir: str = "/opt/xgw/zapret2/1.0.7/lua"
     strategy: str = "multisplit"
     queue_num: int = 200
     probe_port: int = 19999
