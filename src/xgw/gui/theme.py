@@ -1,7 +1,7 @@
 """Светлая тема окна XGW (единственная): палитра Qt и одна таблица стилей (QSS) по токенам цвета.
 
 Вид следует Proton VPN для Windows: спокойные строки, крупная кнопка подключения,
-карта с отметкой страны, боковая панель быстрых действий и карточки сведений о серверах.
+карта фоном с отметкой страны и карточки сведений о серверах.
 
 Палитра — Proton Light (веб-интерфейс Proton): белые поверхности, пурпурный акцент
 #6D4AFF, сигнальные цвета с затемнением под контраст на белом. Выбор «системная/тёмная»
@@ -25,9 +25,11 @@ LIGHT = {
     # selected=акцент ~14% на белом. Палитра одна: тёмной темы в окне больше нет.
     "bg": "#ffffff", "panel": "#fbfbfd", "surface": "#ffffff", "surface2": "#f1f1f4",
     "border": "#e3e2e9", "text": "#1c1b24", "muted": "#716f7f", "accent": "#6d4aff",
-    "accent_text": "#ffffff", "ok": "#1ea885", "warn": "#c77700", "bad": "#d93757",
+    "accent_text": "#ffffff", "ok": "#128369", "warn": "#9d6400", "bad": "#c42f50",
     "off": "#a7a4b5", "busy": "#8a6eff", "focus": "#6d4aff", "nav": "#f1f1f4",
-    "selected": "#ebe6ff",
+    "selected": "#eee9ff",
+    "map_bg": "#f4f1fb", "map_land": "#e3dff0", "map_border": "#c7c0db",
+    "map_selected": "#c6b5f7",
 }
 TONES = ("ok", "warn", "bad", "off", "busy")
 NL = chr(10)
@@ -74,11 +76,8 @@ def _tones(c: dict[str, str]) -> str:
     rules = []
     for tone in TONES:
         color = c[tone]
-        top = mix(color, c["panel"], 0.16)
         rules += [
             f'QLabel[tone="{tone}"] {{ color: {color}; }}',
-            f'QFrame#conn[tone="{tone}"] {{ background: qlineargradient(x1:0, y1:0, x2:0, '
-            f'y2:1, stop:0 {top}, stop:0.42 {c["panel"]}, stop:1 {c["panel"]}); }}',
             f'QFrame#alert[tone="{tone}"] {{ border-left: 4px solid {color}; '
             f'background: {mix(color, c["surface"], 0.08)}; }}',
             f'QLabel#dot[tone="{tone}"] {{ background: {color}; }}',
@@ -97,7 +96,7 @@ QWidget#rail {{ background: {c['nav']}; border-right: 1px solid {c['border']}; }
 QLabel#brand {{ color: {c['accent']}; font-size: 18pt; font-weight: 700; }}
 QToolButton#navButton {{
     color: {c['muted']}; background: transparent; border: none; border-radius: 8px;
-    padding: 8px 12px; font-size: 10.5pt; text-align: left;
+    padding: 8px; font-size: 10.5pt; text-align: left;
 }}
 QToolButton#navButton:hover {{ background: {c['surface2']}; color: {c['text']}; }}
 QToolButton#navButton:checked {{ background: {c['selected']}; color: {c['text']};
@@ -106,14 +105,9 @@ QToolButton#navButton:focus {{ border: 2px solid {c['focus']}; }}
 QToolButton#navButton::menu-indicator {{ image: none; width: 0; }}
 QFrame#conn {{ background: {c['panel']}; border-left: 1px solid {c['border']};
     border-right: 1px solid {c['border']}; }}
-QFrame#quick {{ background: {c['panel']}; }}
-QLabel#quickTitle {{ color: {c['muted']}; font-size: 7.5pt; font-weight: 700;
-    qproperty-alignment: AlignCenter; }}
-QToolButton#quickButton {{ color: {c['muted']}; background: transparent;
-    border: 1px solid transparent; border-radius: 12px; padding: 10px 2px; font-size: 9pt; }}
-QToolButton#quickButton:hover {{ background: {c['surface2']}; color: {c['text']};
-    border-color: {c['border']}; }}
-QToolButton#quickButton:focus {{ border: 2px solid {c['focus']}; }}
+QWidget#connectionContent {{ background: transparent; }}
+QFrame#connectionSummary {{ background: {c['surface']}; border: 1px solid {c['border']};
+    border-radius: 16px; }}
 QFrame#card, QFrame#alert {{
     background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 14px;
 }}
@@ -122,13 +116,14 @@ QFrame#metric {{
     background: {mix(c['surface2'], c['panel'], 0.7)}; border: none; border-radius: 8px;
 }}
 QFrame#row {{ background: transparent; border: 1px solid transparent; border-radius: 8px; }}
+QFrame#row:focus {{ border: 2px solid {c["focus"]}; }}
 QFrame#row:hover {{ background: {c['surface2']}; border-color: transparent; }}
 QFrame#row[main="true"] {{ border: 1px solid {c['accent']}; background: {c['selected']}; }}
 QLabel#shieldWord {{ font-size: 10pt; font-weight: 700; }}
-QLabel#heroTitle {{ font-size: 22pt; font-weight: 700; }}
+QLabel#heroTitle {{ font-size: 23pt; font-weight: 700; }}
 QLabel#pageTitle {{ font-size: 16pt; font-weight: 700; }}
 QLabel#serverName {{ font-size: 12pt; font-weight: 600; }}
-QLabel#rowName, QLabel#rowSpeed {{ font-size: 11.5pt; font-weight: 600; }}
+QLabel#rowName, QLabel#rowSpeed {{ font-size: 10.5pt; font-weight: 600; }}
 QLabel#metricValue {{ font-size: 16pt; font-weight: 700; }}
 QLabel#metricTitle, QLabel#section {{ color: {c['muted']}; font-size: 9pt; font-weight: 700; }}
 QLabel#cardTitle {{ font-weight: 600; font-size: 11pt; }}
@@ -142,7 +137,7 @@ QLabel#dot {{ border-radius: 5px; min-width: 10px; max-width: 10px; min-height: 
     max-height: 10px; }}
 QLabel#pill {{ border-radius: 9px; padding: 2px 9px; font-size: 9pt; font-weight: 700; }}
 QLabel#chip {{
-    border: 1px solid {c['border']}; border-radius: 13px; padding: 3px 12px;
+    font-size: 9pt; border: 1px solid {c['border']}; border-radius: 13px; padding: 3px 12px;
     background: {c['surface']}; font-weight: 600;
 }}
 {_tones(c)}
@@ -184,6 +179,7 @@ QProgressBar {{ background: {c['surface2']}; border: none; border-radius: 3px; }
 QProgressBar::chunk {{ background: {c['ok']}; border-radius: 3px; }}
 QProgressBar[tone="warn"]::chunk {{ background: {c['warn']}; }}
 QProgressBar[tone="bad"]::chunk {{ background: {c['bad']}; }}
+QTextBrowser#serverDetails {{ background: {c["surface"]}; border: none; }}
 QDialog, QMessageBox {{ background: {c['surface']}; }}
 QMenu {{ background: {c['surface']}; border: 1px solid {c['border']}; padding: 6px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}

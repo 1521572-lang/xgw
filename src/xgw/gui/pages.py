@@ -37,7 +37,18 @@ from PyQt6.QtWidgets import (
 )
 
 from . import listing, model, theme
-from .widgets import Badge, Elided, Switch, icon, label, server_details, set_text, tip, tone
+from .widgets import (
+    Badge,
+    DetailsFrame,
+    Elided,
+    Switch,
+    icon,
+    label,
+    server_details,
+    set_text,
+    tip,
+    tone,
+)
 
 POOL_SHOWN = 300  # строк пула на источник сразу; остальное — поиском (их бывают сотни)
 
@@ -106,7 +117,7 @@ class Tags(QWidget):
         self.setVisible(bool(tags))
 
 
-class Row(QFrame):
+class Row(DetailsFrame):
     """Общая строка: значок страны, имя с метками, пояснение, цифры справа, кнопки."""
 
     def __init__(self) -> None:
@@ -193,8 +204,11 @@ class ServerCard(Row):
                   speed=item.speed, value=item.delay, tone_name=item.tone, selected=selected)
         status = {"member": "в работе", "spare": "запасной", "disabled": "отключён",
                   "skipped": "скрыт"}.get(item.status, item.status)
-        tip(self, server_details(item.name, flag=item.flag, code=item.code, status=status,
-                                 speed=item.speed, delay=item.delay, sub=item.sub, main=selected))
+        raw = next((row for row in (self.page.state or {}).get("servers", [])
+                    if row.get("fingerprint") == item.fingerprint), None)
+        self.set_details(server_details(item.name, flag=item.flag, code=item.code, status=status,
+                                 speed=item.speed, delay=item.delay, sub=item.sub,
+                                        main=selected, extra=raw))
         self.measure.setVisible(item.measurable)
         self.measure.setEnabled(not item.measuring)
         tip(self.measure, "Скорость этого сервера замеряется…" if item.measuring
@@ -300,8 +314,9 @@ class PoolCard(Row):
         status = {0: "сейчас через него идёт трафик", 1: "в работе", 2: "допущен",
                   3: "рабочий", 4: "не прошёл проверку", 5: "не проверен"}.get(item.rank, "")
         delay = item.value if item.value.endswith("мс") else ""
-        tip(self, server_details(item.name, code=item.country, status=status, speed=item.speed,
-                                 delay=delay, sub=item.sub, main=item.rank == 0))
+        self.set_details(server_details(item.name, code=item.country, status=status,
+                                        speed=item.speed, delay=delay, sub=item.sub,
+                                        main=item.rank == 0))
         self.choose.setText("Автовыбор" if item.pinned else "Выбрать")
         self.choose.setVisible(item.pinned or item.choosable)
 

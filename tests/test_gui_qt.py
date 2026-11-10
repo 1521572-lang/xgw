@@ -169,8 +169,7 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     assert "Xray 26.3.27" in overview.versions.text()
     assert overview.word.text() == "ЗАЩИЩЕНО" and overview.orb.tone == "ok"
     assert overview.orb.country == "NL"
-    assert set(overview.quick_buttons) == {"devices", "traffic", "diagnostics", "extra"}
-    overview.quick_buttons["devices"].click()
+    win.nav.buttons[3].click()
     assert win.stack.currentWidget() is win.devices
     win.nav.setCurrentRow(0)
     rows = overview.members.visible_rows()
@@ -278,7 +277,7 @@ def test_status_word_hint_covers_the_row_and_closing_quits(qapp, demo, tmp_path)
     row = win.overview.members.visible_rows()[0]
     status = row.holder.toolTip()
     assert status and row.dot.toolTip() == status
-    details = row.toolTip()
+    details = row.detail_html
     assert row.name.text() in details
     assert all(text in details for text in ("Состояние", "Скорость", "Задержка"))
     win.close()
@@ -504,4 +503,50 @@ def test_subscription_form_sends_user_agent_or_the_happ_preset(qapp, demo, tmp_p
     assert sent[1][1]["preset"] == "happ" and "user_agent" not in sent[1][1]
     page.action_done("add", True)
     assert page.agent.text() == "" and not page.happ.isChecked() and page.agent.isEnabled()
+    win.close()
+
+
+def test_server_details_open_without_changing_connection(qapp, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QTextBrowser
+
+    from xgw.gui.widgets import server_details
+
+    client = _client(1)
+    actions = []
+    monkeypatch.setattr(client, "act", lambda *args, **kwargs: actions.append(args))
+    win = _window(client, tmp_path)
+    state = json.loads((Path(__file__).parent / "fixtures/gui/state-work.json").read_text())
+    win.on_state(state)
+    win.show()
+    qapp.processEvents()
+    row = win.overview.members.visible_rows()[0]
+    QTest.mouseClick(row, Qt.MouseButton.LeftButton,
+                     pos=row.name.mapTo(row, row.name.rect().center()))
+    assert row.detail_dialog is not None and row.detail_dialog.isVisible()
+    text = row.detail_dialog.findChild(QTextBrowser).toPlainText()
+    assert all(part in text for part in (row.name.text(), "Протокол", "vless", "RTT", "29 мс"))
+    original = row.detail_dialog
+    row.open_details()
+    assert row.detail_dialog is original
+    row.detail_dialog.close()
+    row.open_details()  # повторное открытие до отложенного удаления прежнего диалога
+    reopened = row.detail_dialog
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert row.detail_dialog is reopened and reopened.isVisible()
+    reopened.close()
+    qapp.processEvents()
+    win.nav.setCurrentRow(1)
+    card = next(card for group in win.servers.groups.values() for card in group.cards
+                if not card.isHidden() and card.item.code == "DE")
+    QTest.keyClick(card, Qt.Key.Key_Return)
+    assert card.detail_dialog is not None and card.detail_dialog.isVisible()
+    card.detail_dialog.close()
+    assert not actions  # ни просмотр, ни закрытие не посылают POST
+    card.choose.click()
+    assert len(actions) == 1 and actions[0][0] == "pin"
+    escaped = server_details("<img src='https://invalid.test/image'>", extra={
+        "protocol": "vless", "password": "PRIVATE_SENTINEL", "outbound": {"secret": "x"}})
+    assert "<img" not in escaped and "&lt;img" in escaped and "PRIVATE_SENTINEL" not in escaped
     win.close()

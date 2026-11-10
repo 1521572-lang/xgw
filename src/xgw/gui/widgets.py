@@ -15,6 +15,7 @@ from PyQt6.QtGui import (
     QColor,
     QFontDatabase,
     QIcon,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
@@ -25,18 +26,22 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from . import model, theme
+from .mapdata import COUNTRIES
 
-RAIL_WIDTH = 184
+RAIL_WIDTH = 72
 
 
 def label(text: str = "", *, name: str = "", wrap: bool = True) -> QLabel:
@@ -70,14 +75,22 @@ def tip(widget: QWidget, text: str) -> None:
 
 def server_details(name: str, *, flag: str = "", code: str = "", status: str = "",
                    speed: str = "", delay: str = "", sub: str = "", note: str = "",
-                   main: bool = False) -> str:
-    """Карточка сервера при наведении: только сведения, уже полученные от шлюза."""
-    rows = [("Состояние", status), ("Скорость", speed), ("Задержка", delay),
+                   main: bool = False, extra: dict | None = None) -> str:
+    """Данные карточки: только разрешённые поля, строки экранируются как обычный текст."""
+    rows = [("Состояние", status), ("Скорость", speed or "Нет замера"), ("Задержка", delay),
             ("Параметры", sub), ("Последний замер", note)]
+    raw = extra or {}
+    for key, title_text in (("protocol", "Протокол"), ("core", "Ядро"),
+                            ("profile", "Профиль обхода")):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            rows.append((title_text, value))
+    if isinstance(raw.get("rtt_ms"), int | float) and "RTT" not in delay:
+        rows.append(("RTT соединения", model.ms_text(raw["rtt_ms"])))
     if main:
         rows.insert(0, ("Роль", "сервер в работе"))
     colors = theme.current()
-    title = " ".join(part for part in (flag, name) if part)
+    title = " ".join(part for part in (flag if emoji_flags() else "", name) if part)
     if code and code != "XX":
         title += f" · {code.upper()}"
     body = []
@@ -89,7 +102,85 @@ def server_details(name: str, *, flag: str = "", code: str = "", status: str = "
                     f"<b>{html.escape(value)}</b></td></tr>")
     return (f"<html><body style='color:{colors['text']}'><div style='padding:4px'>"
             f"<div style='font-size:14pt; padding-bottom:8px'><b>{html.escape(title)}</b></div>"
-            f"<table cellspacing='0' cellpadding='0'>{''.join(body)}</table></div></body></html>")
+            f"<table cellspacing='0' cellpadding='6'>{''.join(body)}</table></div></body></html>")
+
+
+class DetailsFrame(QFrame):
+    """Карточка по клику/Enter. Просмотр не вызывает действия панели."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.detail_html = ""
+        self.detail_dialog: QDialog | None = None
+        self._press = None
+
+    def set_details(self, content: str) -> None:
+        self.detail_html = content
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        tip(self, "Нажмите или нажмите Enter, чтобы открыть сведения о сервере")
+        for child in self.findChildren(QLabel):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def open_details(self) -> None:
+        if not self.detail_html:
+            return
+        if self.detail_dialog is not None and self.detail_dialog.isVisible():
+            self.detail_dialog.raise_()
+            self.detail_dialog.activateWindow()
+            return
+        dialog = QDialog(self.window())
+        dialog.setWindowTitle("Сведения о сервере")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.resize(540, 480)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(22, 20, 22, 18)
+        box.setSpacing(14)
+        box.addWidget(label("Сведения о сервере", name="pageTitle"))
+        view = QTextBrowser()
+        view.setObjectName("serverDetails")
+        view.setOpenLinks(False)
+        view.setOpenExternalLinks(False)
+        view.setHtml(self.detail_html)
+        box.addWidget(view, 1)
+        box.addWidget(label("Снимок данных на момент открытия. Просмотр не меняет "
+                            "подключение. Выбрать сервер можно в разделе «Серверы».", name="small"))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
+        buttons.rejected.connect(dialog.close)
+        box.addWidget(buttons)
+        self.detail_dialog = dialog
+        dialog.destroyed.connect(lambda _obj=None: self._detail_closed(dialog))
+        dialog.show()
+        buttons.button(QDialogButtonBox.StandardButton.Close).setFocus()
+
+    def _detail_closed(self, dialog: QDialog) -> None:
+        if self.detail_dialog is dialog:
+            self.detail_dialog = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.detail_html:
+            self._press = event.position()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        pressed, self._press = self._press, None
+        if (event.button() == Qt.MouseButton.LeftButton and pressed is not None
+                and self.rect().contains(event.position().toPoint())
+                and (event.position() - pressed).manhattanLength() < 8):
+            self.open_details()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.open_details()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
 
 class Elided(QLabel):
@@ -267,7 +358,7 @@ class NavRail(QWidget):
         self.setFixedWidth(RAIL_WIDTH)
         self.setAccessibleName("Разделы")
         self.box = QVBoxLayout(self)
-        self.box.setContentsMargins(14, 18, 14, 14)
+        self.box.setContentsMargins(10, 18, 10, 14)
         self.box.setSpacing(6)
         self.logo = QLabel("XGW")
         self.logo.setObjectName("brand")
@@ -295,7 +386,7 @@ class NavRail(QWidget):
         button.setObjectName("navButton")
         button.setText(title)
         button.setToolTip(title)
-        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         button.setIconSize(QSize(22, 22))
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         button.setFixedHeight(46)
@@ -328,34 +419,15 @@ class NavRail(QWidget):
 # --- знак защиты --------------------------------------------------------------------------------
 
 
-CONTINENTS = (
-    ((.05, .22), (.13, .12), (.27, .17), (.31, .29), (.25, .39), (.20, .42),
-     (.18, .55), (.12, .49), (.08, .36)),
-    ((.23, .56), (.31, .55), (.36, .64), (.33, .78), (.28, .94), (.24, .80)),
-    ((.43, .26), (.49, .20), (.58, .24), (.62, .34), (.55, .41), (.48, .37)),
-    ((.46, .43), (.56, .40), (.63, .50), (.60, .70), (.54, .88), (.48, .70)),
-    ((.57, .22), (.72, .13), (.91, .25), (.88, .44), (.79, .48), (.75, .65),
-     (.68, .59), (.61, .43)),
-    ((.76, .72), (.85, .68), (.92, .77), (.88, .89), (.78, .86)),
-    ((.33, .07), (.39, .06), (.41, .17), (.35, .20), (.31, .14)),
-)
-COUNTRY_POINTS = {
-    "AE": (.66, .55), "AR": (.29, .84), "AT": (.54, .34), "AU": (.84, .79),
-    "BE": (.50, .31), "BG": (.59, .40), "BR": (.32, .71), "CA": (.19, .28),
-    "CH": (.51, .35), "CL": (.27, .84), "CN": (.76, .40), "CY": (.61, .47),
-    "CZ": (.54, .32), "DE": (.52, .29), "DK": (.52, .23), "DZ": (.49, .45),
-    "EE": (.57, .23), "EG": (.58, .49), "ES": (.46, .40), "FI": (.57, .16),
-    "FR": (.48, .33), "GB": (.45, .26), "GR": (.58, .45), "HK": (.78, .50),
-    "HU": (.55, .35), "ID": (.78, .69), "IE": (.43, .26), "IL": (.61, .50),
-    "IN": (.71, .54), "IS": (.40, .15), "IT": (.53, .40), "JP": (.87, .40),
-    "KE": (.61, .63), "KR": (.82, .41), "LT": (.56, .27), "LV": (.57, .25),
-    "MA": (.44, .44), "MX": (.17, .51), "MY": (.75, .60), "NG": (.52, .59),
-    "NL": (.50, .28), "NO": (.51, .15), "NZ": (.91, .87), "PL": (.55, .29),
-    "PT": (.44, .40), "RO": (.58, .36), "RU": (.72, .22), "SE": (.54, .15),
-    "SG": (.76, .64), "SK": (.56, .33), "TH": (.74, .54), "TR": (.63, .44),
-    "TW": (.81, .48), "UA": (.60, .32), "US": (.19, .38), "VN": (.77, .53),
-    "ZA": (.56, .82),
-}
+COUNTRY_POINTS = {code: (lon, lat) for code, lon, lat, _rings in COUNTRIES}
+
+
+def _mercator(lon: float, lat: float) -> QPointF:
+    """Географические координаты в проекции карты, без сетевой геолокации."""
+    import math
+
+    lat = max(-80.0, min(80.0, lat))
+    return QPointF(lon, -math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))))
 
 
 class ShieldOrb(QWidget):
@@ -378,28 +450,51 @@ class ShieldOrb(QWidget):
         value = value.upper()
         if value != self.country:
             self.country = value
-            self.setAccessibleName("Карта и знак защиты" +
-                                   (f"; страна сервера {value}" if value in COUNTRY_POINTS else ""))
+            self.setAccessibleName("Карта стран" +
+                                   (f"; приблизительная страна сервера {value}"
+                                    if value in COUNTRY_POINTS else "; страна неизвестна"))
+            self.setToolTip("Страна из данных сервера, не точное местоположение")
             self.update()
 
-    def _map(self, painter: QPainter) -> None:
+    def _map(self, painter: QPainter) -> QPointF:
         colors = theme.current()
-        painter.setPen(QPen(QColor(colors["border"]), 1.1))
-        painter.setBrush(QColor(colors["surface2"]))
-        for points in CONTINENTS:
-            polygon = QPolygonF([QPointF(x * self.width(), y * self.height())
-                                 for x, y in points])
-            painter.drawPolygon(polygon)
+        width, height = self.width(), self.height()
+        # Страна из подписки — приблизительный ориентир, не координаты VPN-сервера.
+        lon, lat = COUNTRY_POINTS.get(self.country, (15.0, 50.0))
+        origin = _mercator(lon, lat)
+        scale = min(width / 85, height / 75)
+        center = QPointF(width * .5, height * .54)
+        painter.fillRect(self.rect(), QColor(colors["map_bg"]))
+        painter.setPen(QPen(QColor(colors["map_border"]), .85))
+        for code, _lon, _lat, rings in COUNTRIES:
+            painter.setBrush(QColor(colors["map_selected"] if code == self.country
+                                    else colors["map_land"]))
+            for ring in rings:
+                polygon = QPolygonF()
+                for x, y in ring:
+                    p = _mercator(x, y)
+                    polygon.append(QPointF(center.x() + (p.x() - origin.x()) * scale,
+                                           center.y() + (p.y() - origin.y()) * scale))
+                painter.drawPolygon(polygon)
+        # Спокойные зоны под заголовком и метриками; карта остаётся фоном всей области.
+        fade = QLinearGradient(0, 0, 0, height)
+        for at, alpha in ((0, 255), (.29, 245), (.43, 45), (.64, 0), (.77, 225), (1, 255)):
+            color = QColor(colors["panel"])
+            color.setAlpha(alpha)
+            fade.setColorAt(at, color)
+        painter.fillRect(self.rect(), fade)
+        return center
 
     def paintEvent(self, _event) -> None:
         colors = theme.current()
         color = QColor(colors.get(self.tone, colors["off"]))
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._map(painter)
-        point = COUNTRY_POINTS.get(self.country, (.5, .5))
-        center = QPointF(self.width() * point[0], self.height() * point[1])
-        core = max(25.0, min(43.0, min(self.width(), self.height()) * .16))
+        center = self._map(painter)
+        if self.country not in COUNTRY_POINTS:
+            painter.end()
+            return
+        core = 18.0
         glow = QRadialGradient(center, core * 3.6)
         for stop, alpha in ((0.0, 105), (0.55, 45), (1.0, 0)):
             shade = QColor(color)
@@ -501,7 +596,7 @@ class Metric(QFrame):
         return f"{self.value.text()} {self.unit.text()}".strip()
 
 
-class ServerRowWidget(QFrame):
+class ServerRowWidget(DetailsFrame):
     """Строка сервера: страна, имя и подробности, скорость и задержка, состояние."""
 
     def __init__(self) -> None:
@@ -558,7 +653,7 @@ class ServerRowWidget(QFrame):
         super().resizeEvent(event)
         self._fit()
 
-    def show_row(self, row: model.ServerRow) -> None:
+    def show_row(self, row: model.ServerRow, raw: dict | None = None) -> None:
         self.badge.show_country(row.flag, row.code)
         set_text(self.name, row.name)
         tip(self.name, row.name)
@@ -573,9 +668,9 @@ class ServerRowWidget(QFrame):
         # В узкой строке слово состояния доступно подсказкой у всей правой колонки.
         for widget in (self.dot, self.holder):
             tip(widget, row.status)
-        tip(self, server_details(row.name, flag=row.flag, code=row.code, status=row.status,
+        self.set_details(server_details(row.name, flag=row.flag, code=row.code, status=row.status,
                                  speed=row.speed, delay=row.delay, sub=row.sub, note=row.note,
-                                 main=row.main))
+                                 main=row.main, extra=raw))
         tone(self, "true" if row.main else "false", "main")
         self.setAccessibleName(f"{row.name}: {row.status}, {row.speed}")
 
@@ -590,13 +685,15 @@ class ServerList(QWidget):
         self.box.setSpacing(8)
         self.rows: list[ServerRowWidget] = []
 
-    def show_rows(self, rows: list[model.ServerRow]) -> None:
+    def show_rows(self, rows: list[model.ServerRow], state: dict | None = None) -> None:
         while len(self.rows) < len(rows):
             widget = ServerRowWidget()
             self.box.addWidget(widget)
             self.rows.append(widget)
         for widget, row in zip(self.rows, rows, strict=False):
-            widget.show_row(row)
+            raw = next((item for item in (state or {}).get("servers", [])
+                        if item.get("tag") == row.key), None)
+            widget.show_row(row, raw)
             widget.show()
         for widget in self.rows[len(rows):]:
             widget.hide()

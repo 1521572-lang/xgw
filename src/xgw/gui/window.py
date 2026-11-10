@@ -1,5 +1,5 @@
 """Главное окно XGW: навигация слева и страницы. «Обзор» следует компоновке Proton VPN:
-список серверов слева, карта и большая кнопка подключения в центре, быстрые разделы справа.
+список серверов слева, географическая карта фоном и подключение в основной области.
 При наведении на сервер появляется карточка с его фактическими параметрами.
 
 Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на каждом опросе,
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QFrame,
@@ -21,8 +21,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QStackedLayout,
     QStackedWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -39,7 +39,6 @@ from .widgets import (
     NavRail,
     ServerList,
     ShieldOrb,
-    icon,
     label,
     set_text,
     tone,
@@ -55,9 +54,8 @@ SECTIONS = (
     ("extra", "Ещё"),
 )
 MIN_SIZE = (1024, 720)
-START_SIZE = (1440, 900)
-SERVERS_WIDTH = (340, 380)
-QUICK_WIDTH = 132
+START_SIZE = (1280, 820)
+SERVERS_WIDTH = (320, 360)
 WIDE = 1200
 
 
@@ -106,9 +104,9 @@ class LoginPage(QWidget):
         super().__init__()
         self.setObjectName("page")
         card = Card()
-        self.orb = ShieldOrb()
-        self.orb.setMinimumHeight(150)
-        card.body.addWidget(self.orb)
+        brand = label("XGW", name="brand")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card.body.addWidget(brand)
         title = label("Вход в XGW", name="heroTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card.body.addWidget(title)
@@ -143,7 +141,7 @@ class LoginPage(QWidget):
 
 
 class OverviewPage(QWidget):
-    """Серверы слева, карта и подключение в центре, быстрые разделы справа."""
+    """Список серверов и карта с независимым слоем управления подключением."""
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__()
@@ -156,42 +154,24 @@ class OverviewPage(QWidget):
         self.server_panel.setFixedWidth(SERVERS_WIDTH[1])
         outer.addWidget(self.server_panel)
         outer.addWidget(self._connection(), 1)
-        outer.addWidget(self._quick_settings())
-
-    def _quick_settings(self) -> QWidget:
-        self.quick = QFrame()
-        self.quick.setObjectName("quick")
-        self.quick.setFixedWidth(QUICK_WIDTH)
-        box = QVBoxLayout(self.quick)
-        box.setContentsMargins(10, 28, 10, 16)
-        box.setSpacing(8)
-        box.addWidget(label("БЫСТРЫЙ ДОСТУП", name="quickTitle", wrap=False))
-        box.addSpacing(8)
-        self.quick_buttons: dict[str, QToolButton] = {}
-        for key, title in SECTIONS[3:]:
-            button = QToolButton()
-            button.setObjectName("quickButton")
-            button.setText(title)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-            button.setIcon(icon(key, theme.current()["muted"], theme.current()["accent"], 32))
-            button.setIconSize(QSize(32, 32))
-            button.setFixedHeight(86)
-            button.setAccessibleName(f"Открыть раздел «{title}»")
-            row = next(row for row, item in enumerate(SECTIONS) if item[0] == key)
-            button.clicked.connect(lambda _checked=False, row=row: self.main.nav.setCurrentRow(row))
-            box.addWidget(button)
-            self.quick_buttons[key] = button
-        box.addStretch(1)
-        return self.quick
 
     # --- панель подключения ---------------------------------------------------------------------
 
     def _connection(self) -> QWidget:
         self.conn = QFrame()
         self.conn.setObjectName("conn")
-        box = QVBoxLayout(self.conn)
-        box.setContentsMargins(24, 28, 24, 18)
-        box.setSpacing(7)
+        layers = QStackedLayout(self.conn)
+        layers.setContentsMargins(0, 0, 0, 0)
+        layers.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        self.orb = ShieldOrb()
+        layers.addWidget(self.orb)
+        content = QWidget()
+        content.setObjectName("connectionContent")
+        layers.addWidget(content)
+        layers.setCurrentWidget(content)
+        box = QVBoxLayout(content)
+        box.setContentsMargins(28, 28, 28, 22)
+        box.setSpacing(8)
         self.word = label("", name="shieldWord", wrap=False)
         font = self.word.font()
         font.setLetterSpacing(font.SpacingType.AbsoluteSpacing, 1.4)
@@ -218,7 +198,7 @@ class OverviewPage(QWidget):
         self.server_how = label("", name="small")
         names.addWidget(self.server_name)
         names.addWidget(self.server_how)
-        server.addLayout(names)
+        server.addLayout(names, 3)
         server.addStretch(1)
         box.addLayout(server)
         box.addSpacing(8)
@@ -235,10 +215,13 @@ class OverviewPage(QWidget):
         tone(self.power_why, "warn")
         box.addWidget(self.power_why)
 
-        self.orb = ShieldOrb()
-        self.orb.setMaximumHeight(360)
-        box.addWidget(self.orb, 1)
+        box.addStretch(1)
 
+        summary = QFrame()
+        summary.setObjectName("connectionSummary")
+        summary_box = QVBoxLayout(summary)
+        summary_box.setContentsMargins(18, 14, 18, 12)
+        summary_box.setSpacing(8)
         tiles = QHBoxLayout()
         tiles.setSpacing(8)
         self.metrics = {key: Metric(title, about) for key, title, about in (
@@ -247,17 +230,18 @@ class OverviewPage(QWidget):
             ("delay", "Проба", "Полная проба ядра: запрос через сервер и ответ целиком"))}
         for widget in self.metrics.values():
             tiles.addWidget(widget)
-        box.addLayout(tiles)
+        summary_box.addLayout(tiles)
         self.engine = label("", name="small")
         self.engine.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        box.addWidget(self.engine)
+        summary_box.addWidget(self.engine)
         self.lifecycle = label("", name="small")
         self.lifecycle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        box.addWidget(self.lifecycle)
+        summary_box.addWidget(self.lifecycle)
         self.versions = label("", name="small")
         self.versions.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.versions.setAccessibleName("Версии")
-        box.addWidget(self.versions)
+        summary_box.addWidget(self.versions)
+        box.addWidget(summary)
         self.fresh = label("", name="small", wrap=False)
         self.fresh.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.fresh.setAccessibleName("Обновление данных")
@@ -269,17 +253,18 @@ class OverviewPage(QWidget):
     def _servers(self) -> QWidget:
         inner = QWidget()
         box = QVBoxLayout(inner)
-        box.setContentsMargins(28, 24, 28, 24)
+        box.setContentsMargins(18, 24, 18, 20)
         box.setSpacing(10)
         head = QHBoxLayout()
         head.addWidget(label("Серверы", name="pageTitle", wrap=False))
         self.counts = label("", name="muted", wrap=False)
-        head.addWidget(self.counts, 0, Qt.AlignmentFlag.AlignBottom)
         head.addStretch(1)
         self.main.chip = label("", name="chip", wrap=False)
         self.main.chip.setAccessibleName("Состояние шлюза")
-        head.addWidget(self.main.chip)
         box.addLayout(head)
+        box.addWidget(self.counts)
+        box.addWidget(label("Нажмите на сервер для подробностей", name="small"))
+        box.addWidget(self.main.chip)
 
         self.alert = QFrame()
         self.alert.setObjectName("alert")
@@ -291,7 +276,7 @@ class OverviewPage(QWidget):
         self.explain = label("", name="muted")
         alert.addWidget(self.state)
         alert.addWidget(self.explain)
-        fixes = QHBoxLayout()
+        fixes = QVBoxLayout()
         self.fix_buttons: dict[str, QPushButton] = {}
         for name, title in (("refresh", "Обновить подписки"), ("scan", "Проверить запасные"),
                             ("netcheck", "Проверить сеть")):
@@ -301,7 +286,6 @@ class OverviewPage(QWidget):
             button.hide()
             fixes.addWidget(button)
             self.fix_buttons[name] = button
-        fixes.addStretch(1)
         alert.addLayout(fixes)
         box.addWidget(self.alert)
 
@@ -322,9 +306,9 @@ class OverviewPage(QWidget):
         self.guard: dict[str, QLabel] = {}
         for key, title in (("scope", "Через VPN"), ("fail", "При сбое Xray"),
                            ("bypass", "Мимо VPN")):
-            row = QHBoxLayout()
+            row = QVBoxLayout()
+            row.setSpacing(2)
             name = label(title, name="muted", wrap=False)
-            name.setFixedWidth(130)
             value = label("—")
             value.setAccessibleName(title)
             row.addWidget(name, 0, Qt.AlignmentFlag.AlignTop)
@@ -412,10 +396,10 @@ class OverviewPage(QWidget):
         set_text(self.counts, f"работают {alive} из {len(members)}" if members else "")
         set_text(self.members_title, f"В РАБОТЕ · {len(members)}" if members else "")
         self.members_title.setVisible(bool(members))
-        self.members.show_rows(members)
+        self.members.show_rows(members, state)
         set_text(self.spares_title, f"ЗАПАСНЫЕ · {len(spares)}" if spares else "")
         self.spares_title.setVisible(bool(spares))
-        self.spares.show_rows(spares)
+        self.spares.show_rows(spares, state)
         set_text(self.hidden, (f"Ещё {hidden} строк подписок не в работе (выключены или не "
                                "серверы). Выбор сервера, приоритет и замеры — в разделе "
                                "«Серверы».") if hidden else
@@ -647,8 +631,6 @@ class MainWindow(QMainWindow):
         """Значки рисуются цветом темы — после её смены их надо нарисовать заново."""
         colors = theme.current()
         self.nav.recolor(colors, {})
-        for key, button in self.overview.quick_buttons.items():
-            button.setIcon(icon(key, colors["muted"], colors["accent"], 32))
         self.servers.recolor()
         self.update()
 
