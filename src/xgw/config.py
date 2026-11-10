@@ -357,6 +357,27 @@ class Routing:
 
 
 @dataclass
+class Zapret2:
+    """Дополнительный прямой путь для выбранных HTTPS-доменов; сначала проверка."""
+
+    mode: str = "off"
+    domains: list[str] = field(default_factory=lambda: [
+        "domain:youtube.com", "domain:googlevideo.com", "domain:youtubei.googleapis.com",
+        "domain:youtube-nocookie.com",
+    ])
+    binary: str = "/opt/zapret2/nfqws2"
+    lua_dir: str = "/opt/zapret2/lua"
+    strategy: str = "multisplit"
+    queue_num: int = 200
+    probe_port: int = 19999
+    # Адреса задаёт владелец: страница и файл видеосети. Пусто — остаётся VPN.
+    probe_urls: list[str] = field(default_factory=list)
+    check_seconds: int = 180
+    retry_seconds: int = 300
+    daily_probe_mb: int = 256
+
+
+@dataclass
 class Media:
     """Отдельный выход для видео YouTube (п. 348). off — как раньше. best — новые соединения к
     youtube_domains идут через сервер с лучшим свежим замером, остальной трафик не меняется.
@@ -569,6 +590,7 @@ class Config:
     fragment: Fragment = field(default_factory=Fragment)
     routing: Routing = field(default_factory=Routing)
     media: Media = field(default_factory=Media)
+    zapret2: Zapret2 = field(default_factory=Zapret2)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
     core: CoreSection = field(default_factory=CoreSection)
@@ -593,6 +615,7 @@ _SECTIONS = {
     "fragment": Fragment,
     "routing": Routing,
     "media": Media,
+    "zapret2": Zapret2,
     "dns": Dns,
     "xray": XraySection,
     "core": CoreSection,
@@ -911,6 +934,8 @@ def service_ports(cfg: Config) -> dict[str, int]:
         "panel.port": cfg.panel.port,
         "panel.app_port": cfg.panel.app_port,
         "core.api_port": cfg.core.api_port,
+        **({"zapret2.probe_port": cfg.zapret2.probe_port}
+           if cfg.zapret2.mode == "selective" else {}),
     }
 
 
@@ -1093,6 +1118,9 @@ def _validate(cfg: Config) -> list[str]:
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
     warnings.extend(_validate_speed(cfg.speed))
     warnings.extend(_validate_media(cfg.media))
+    from .zapret2 import validate as validate_zapret2
+
+    warnings.extend(validate_zapret2(cfg))
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))
     warnings.extend(_validate_hosts(cfg))

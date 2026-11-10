@@ -412,3 +412,19 @@ list_checks_per_step = 4
 desktop = true
 # Один тип события — не чаще чем раз в это число минут.
 min_interval_min = 10
+
+[zapret2]
+# Дополнительный прямой выход через nfqws2, только выбранные HTTPS-домены.
+# Подготовка и ограничения: docs/ZAPRET2.md. XGW ничего не скачивает и не устанавливает.
+mode = "off" # selective — после подготовки и согласия владельца на прямой домашний IP
+domains = ["domain:youtube.com", "domain:googlevideo.com",
+           "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
+binary = "/opt/zapret2/nfqws2"
+lua_dir = "/opt/zapret2/lua"
+strategy = "multisplit" # также multidisorder; результат зависит от провайдера
+queue_num = 200
+probe_port = 19999
+probe_urls = [] # HTTPS-страница YouTube и HTTPS-файл видеосети; пусто — остаётся VPN
+check_seconds = 180
+retry_seconds = 300
+daily_probe_mb = 256

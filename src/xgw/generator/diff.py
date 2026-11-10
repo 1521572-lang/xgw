@@ -90,7 +90,9 @@ def diff_configs(old: dict, new: dict) -> DiffResult:
     new_inbounds = _by_tag(new.get("inbounds", []))
 
     def static(items: dict[str, dict], prefixes: tuple[str, ...] | str) -> dict[str, dict]:
-        return {tag: item for tag, item in items.items() if not tag.startswith(prefixes)}
+        # У zapret2 отдельные обработчики; добавление/снятие пути не требует restart.
+        return {tag: item for tag, item in items.items() if not tag.startswith(prefixes)
+                and tag not in ("xgw-zapret2", "xgw-zapret2-probe")}
 
     if static(old_inbounds, API_INBOUND_PREFIX) != static(new_inbounds, API_INBOUND_PREFIX):
         reasons.append("основные inbounds")

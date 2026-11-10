@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, engine, fetch, log, masking, tray
+from . import cores, engine, fetch, log, masking, tray, zapret2
 from . import tailscale as ts
 from .apply import singbox_process as generations
 from .config import SINGBOX_VERSION, XRAY_VERSION, Config, probe_bytes
@@ -157,6 +157,7 @@ class Diag:
             ("Tailscale", self._tailscale),
             ("Бесплатный пул", self._free_pool),
             ("YouTube", self._media),
+            ("zapret2", self._zapret2),
         ]
         groups += [
             ("QUIC", self._quic),
@@ -386,6 +387,21 @@ class Diag:
             except Exception:
                 self._xray_up = False
         return self._xray_up
+
+    def _zapret2(self) -> list[Check]:
+        if self.cfg.zapret2.mode == "off":
+            return []
+        if not zapret2.configured(self.cfg):
+            return [Check("zapret2", WARN, "нет проверочных адресов страницы и видеосети; VPN")]
+        snapshot = engine.read_json(self.paths.run / "status.json") or {}
+        view = snapshot.get("zapret2") or {}
+        state = view.get("state", "unknown")
+        fresh = isinstance(view.get("valid_until"), (int, float)) and (
+            view["valid_until"] > time.time())
+        if state == "active" and not fresh:
+            state = "status_expired"
+        return [Check("zapret2", OK if state == "active" and fresh else WARN,
+                      f"{state}; это проверка доступности HTTPS, не воспроизведения видео")]
 
     def _media(self) -> list[Check]:
         """Выход для видео YouTube (п. 348): правило, балансировщик и его серверы согласованы."""

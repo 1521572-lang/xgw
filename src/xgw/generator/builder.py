@@ -12,7 +12,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .. import priority, rating
+from .. import priority, rating, zapret2
 from ..config import Config, service_ports
 from ..model import ServerNode
 from ..net import sysctl
@@ -1164,6 +1164,8 @@ def build(
             },
         },
     }
+    if cfg.zapret2.mode == "selective":
+        config = zapret2.patch(config, cfg)
     return BuildResult(
         config=config,
         nodes=nodes,

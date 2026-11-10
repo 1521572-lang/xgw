@@ -79,7 +79,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import geodat
+from .. import geodat, zapret2
 from .. import tailscale as ts
 from ..config import Config
 from . import lan
@@ -188,6 +188,7 @@ class Rules:
     # уходит мимо перехвата; барьер пропускает только root к этим адресам и порту.
     conncheck4: tuple[str, ...] = ()
     conncheck_port: int = 80
+    zapret2_queue: int | None = None
 
     @property
     def ts4(self) -> bool:
@@ -383,6 +384,8 @@ def build_rules(
             singbox_uid=singbox_user_uid(),
             conncheck4=conncheck[0] if capture or blocked else (),
             conncheck_port=conncheck[1],
+            zapret2_queue=(cfg.zapret2.queue_num
+                           if cfg.zapret2.mode == "selective" else None),
         ),
         warnings,
     )
@@ -697,6 +700,7 @@ def render(rules: Rules) -> str:
             *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts4 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
+            f"meta mark {zapret2.MARKS} return",  # отдельный барьер в xgw_guard
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
             "ip daddr @reserved4 th dport != 53 return",
@@ -1068,7 +1072,8 @@ def render_guard(rules: Rules) -> str:
     The late hook sees the actual output device. It uses drop (reject is not valid
     in POSTROUTING), and ignores forwarded packets already scoped by forward.
     """
-    if not (rules.capture or rules.blocked or rules.containers or rules.ts_exit):
+    if not (rules.capture or rules.blocked or rules.containers or rules.ts_exit
+            or rules.zapret2_queue is not None):
         return ""
     reject = ["meta l4proto tcp counter reject with tcp reset",
               "counter reject with icmpx type admin-prohibited"]
@@ -1086,7 +1091,10 @@ def render_guard(rules: Rules) -> str:
     if rules.reserved6:
         common.append("ip6 daddr { " + ", ".join(rules.reserved6) + " } th dport != 53 accept")
     common.append(f"ct mark and {GUARD_CT:#x} != 0 accept")
+    reserved_marks = not any(mark in (zapret2.MARK, zapret2.FAKE_MARK) for mark in (
+        rules.mark_proxy, rules.mark_bypass, rules.mark_containers))
     output = ["meta iif != 0 return",
+              *(zapret2.guard_rules(rules.zapret2_queue) if reserved_marks else []),
               f"meta mark {rules.mark_bypass:#x} ip daddr 127.0.0.0/8 counter drop",
               f"meta mark {rules.mark_bypass:#x} ip6 daddr ::1 counter drop"]
     if rules.singbox_uid is not None:
@@ -1123,6 +1131,7 @@ def render_guard(rules: Rules) -> str:
     forward = [f'iifname "{name}" goto transit' for name in dict.fromkeys(ingress)]
     forward.append("return")
     return _table("inet", GUARD, [
+        *zapret2.guard_blocks(rules.zapret2_queue),
         _chain("pass", "", common),
         _chain("transit", "", ["jump pass", *reject]),
         _chain("output", "type filter hook postrouting priority 10; policy accept;", output),
@@ -1239,7 +1248,18 @@ def structure(text: str, family: str, table: str) -> str:
     """Таблица из `nft -t list table` без того, что меняется само: значений счётчиков (элементов
     наборов в кратком выводе нет) и полных наборов, которые listing(sets=…) ставит перед ней."""
     start = text.rfind(f"table {family} {table} {{")
-    return _COUNTER.sub("counter", text[start:] if start >= 0 else text)
+    result = _COUNTER.sub("counter", text[start:] if start >= 0 else text)
+    if family == "inet" and table == GUARD:
+        # Lease и остаток TTL меняются каждый шаг; правила/тип/flags набора проверяются
+        # как раньше. Само разрешающее правило ограничено двумя фиксированными метками.
+        def without_lease(match: re.Match) -> str:
+            if match.group(1) != zapret2.LIVE:
+                return match.group(0)
+            return re.sub(r"^[ \t]*elements\s*=\s*\{[^}]*\}[ \t]*\n?", "",
+                          match.group(0), flags=re.MULTILINE)
+
+        result = _SET.sub(without_lease, result)
+    return result
 
 
 def tables_digest(*structures: str) -> str:

@@ -3417,3 +3417,31 @@ def test_media_unconfirmed_balancer_is_degraded(daemon):
     daemon.t += MEDIA_VERIFY + 1
     _media_run(daemon, view, observatory)
     assert daemon._media_view["state"] == "best"
+
+
+def test_zapret2_tick_uses_api_and_restores_vpn_after_worker_death(daemon):
+    from test_zapret2 import Runtime
+
+    from xgw import zapret2
+
+    _started(daemon)
+    daemon.capture = FakeCapture()
+    daemon.cfg.zapret2.mode = "selective"
+    daemon.cfg.zapret2.probe_urls = ["https://www.youtube.com/watch?v=test",
+                                    "https://cdn.googlevideo.com/video"]
+    runtime = Runtime()
+    daemon._zapret2.runtime = runtime
+    daemon._zapret2.probe = lambda *args: True
+    builds = daemon._build_count
+    for _ in range(3):
+        daemon.t += 1
+        daemon.tick()
+    assert zapret2.active(engine.read_json(daemon.paths.xray_config_file))
+    assert daemon._build_count == builds
+    assert len(daemon.applier.api_only) == 2  # каркас, затем проверенный маршрут
+    runtime.up = False
+    daemon.t += 1
+    daemon.tick()
+    assert not zapret2.active(engine.read_json(daemon.paths.xray_config_file))
+    assert daemon._zapret2.view["state"] == "fallback"
+    assert daemon._build_count == builds

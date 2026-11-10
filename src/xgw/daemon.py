@@ -34,7 +34,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, cost, engine, fetch, log, managed, priority, rating, usage
+from . import cores, cost, engine, fetch, log, managed, priority, rating, usage, zapret2
 from . import pin as pinning
 from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
@@ -788,6 +788,7 @@ class Daemon:
         self._media_verify_at = 0.0
         self._media_verified: tuple[str, ...] = ()
         self._media_view: dict = {"state": "off"}
+        self._zapret2 = zapret2.Controller(self.store)
         self._media_spent: dict[str, int] | None = None  # суточный расход (_media_budget)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
@@ -981,6 +982,8 @@ class Daemon:
             self._loop_progress("sleep", started=started, deadline=deadline,
                                 period=period, step_s=spent)
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
+        with contextlib.suppress(OSError, cmd.CommandError):
+            self._zapret2.close()
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
@@ -1652,6 +1655,16 @@ class Daemon:
         if not self.scan_queue or not probing:
             self._manual_scan = False
         at = self._spent("сканы и замены", at)
+        if not changed and signals.xray_ok and not self.stopping and not self.core_job:
+            allowed = (self.cfg.zapret2.mode == "selective" and self.capture is not None
+                       and self.capture.mode() == "on")
+            previous = self._zapret2.view.get("state")
+            changed = self._zapret2.step(
+                self.cfg, applied, self.clock(), self._zapret2_apply,
+                allowed=allowed, cancel=self._stop,
+            )
+            if previous != self._zapret2.view.get("state"):
+                self.notifier.event("zapret2", "zapret2: " + self._zapret2.view["state"])
         if not changed and signals.xray_ok and not self.stopping and not self.core_job:
             changed = self._media_apply(now)
         if changed:
@@ -4297,6 +4310,9 @@ class Daemon:
             state = "degraded"
         self._media_view = {"state": state, "tags": list(wanted), "samples": self._media_samples(
             view, wanted, wall)}
+
+    def _zapret2_apply(self, patched: dict, base: dict) -> bool:
+        return self._report(self.applier.apply_api_only(patched, base=base), "zapret2: маршрут")
 
     def _media_apply(self, now: float) -> bool:
         """Правило видео — прямо в работающее ядро, только через API (п. 350). Через общую сборку
@@ -7144,6 +7160,7 @@ class Daemon:
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
+        snapshot["zapret2"] = dict(self._zapret2.view)
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

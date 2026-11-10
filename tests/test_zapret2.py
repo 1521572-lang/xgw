@@ -1,0 +1,301 @@
+"""Границы нового выхода и возврат на VPN при отказах; без скачивания nfqws2."""
+
+import copy
+import json
+import time
+
+import pytest
+from test_generator import _build
+
+from xgw import zapret2 as z
+from xgw.config import load, service_ports
+from xgw.generator import builder
+from xgw.generator.diff import diff_configs
+from xgw.net import nft
+from xgw.net.cmd import CommandError
+
+
+def setup():
+    built, cfg, selection = _build()
+    cfg.zapret2.mode = "selective"
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/watch?v=test",
+                             "https://cdn.googlevideo.com/video"]
+    return cfg, built.config, selection
+
+
+class Store:
+    def __init__(self):
+        self.data = {}
+
+    def get_meta(self, name):
+        return self.data.get(name)
+
+    def set_meta(self, name, value):
+        self.data[name] = value
+
+
+class Runtime:
+    def __init__(self):
+        self.events = []
+        self.up = False
+        self.broken = False
+
+    def gate(self, seconds=0):
+        self.events.append(("gate", seconds))
+        if self.broken:
+            raise CommandError("private command detail")
+
+    def start(self, cfg):
+        self.events.append(("start", 0))
+        self.up = True
+
+    def stop(self):
+        self.events.append(("stop", 0))
+        self.up = False
+
+    def alive(self, queue):
+        return self.up
+
+
+class Harness:
+    def __init__(self):
+        self.cfg, self.current, _ = setup()
+        self.runtime = Runtime()
+        self.controller = z.Controller(Store(), self.runtime)
+        self.ok = True
+        self.accept = True
+        self.controller.probe = lambda *args: self.ok
+
+    def apply(self, target, base):
+        assert base == self.current
+        self.runtime.events.append(("apply", z.active(target)))
+        if self.accept:
+            self.current = copy.deepcopy(target)
+        return self.accept
+
+    def step(self, now, **kwargs):
+        return self.controller.step(self.cfg, self.current, now, self.apply, **kwargs)
+
+    def activate(self):
+        self.step(0)  # служебный вход
+        assert not z.active(self.current)
+        self.step(1)  # старт очереди
+        assert not z.active(self.current)
+        self.step(2)  # проверка
+        assert z.active(self.current)
+
+
+def test_off_is_original_config_without_starting_anything():
+    result, cfg, _ = _build()
+    assert z.patch(result.config, cfg) == result.config
+    runtime = Runtime()
+    ctl = z.Controller(Store(), runtime)
+    assert not ctl.step(cfg, result.config, 0, lambda *_: pytest.fail("apply called"))
+    assert not runtime.events
+    assert "zapret2.probe_port" not in service_ports(cfg)
+
+
+def test_selected_route_scope_and_priorities():
+    cfg, original, _ = setup()
+    rules = original["routing"]["rules"]
+    rules.insert(-1, {"type": "field", "source": ["192.168.50.5"], "outboundTag": "proxy-a"})
+    rules.insert(-1, {"type": "field", "domain": ["domain:youtube.com"], "balancerTag": "youtube"})
+    target = z.patch(original, cfg, enabled=True)
+    routed = target["routing"]["rules"]
+    at = next(i for i, r in enumerate(routed) if r.get("outboundTag") == z.OUT
+              and r.get("inboundTag") != [z.PROBE])
+    assert routed[at]["network"] == "tcp" and routed[at]["port"] == "443"
+    assert set(routed[at]["inboundTag"]) == {"tproxy-in", "tproxy-in6", "tun-in"}
+    assert at > max(i for i, r in enumerate(routed) if r.get("source")
+                    or r.get("outboundTag") == "direct")
+    assert at < next(i for i, r in enumerate(routed) if r.get("balancerTag") == "youtube")
+    assert target["inbounds"][-1]["settings"]["accounts"][0]["pass"] == "P" * 32
+    assert target["outbounds"][-1]["streamSettings"]["sockopt"]["mark"] == z.MARK
+    assert z.patch(target, cfg, enabled=True) == target
+    assert not diff_configs(original, target).restart_reasons
+    assert not diff_configs(target, z.patch(target, cfg)).restart_reasons
+    cfg.zapret2.mode = "off"
+    assert z.patch(target, cfg) == original
+
+
+def test_build_reserves_probe_port_and_starts_without_direct_rule():
+    cfg, _, selection = setup()
+    cfg.xray.probe_port_base = cfg.zapret2.probe_port
+    config = builder.build(cfg, selection, hosts={}, probe_password="P" * 32).config
+    ports = [i["port"] for i in config["inbounds"] if "port" in i]
+    assert len(ports) == len(set(ports))
+    assert not z.active(config)
+
+
+@pytest.mark.parametrize("value", ["http://www.youtube.com/", "https://evil.example/",
+                                    "https://www.youtube.com:444/", "https://u:p@youtube.com/",
+                                    "https://www.youtube.com/\r\nInjected:yes"])
+def test_bad_probe_never_enables_direct(value):
+    cfg, _, _ = setup()
+    cfg.zapret2.probe_urls = [value]
+    assert z.validate(cfg)
+    assert cfg.zapret2.mode == "off"
+
+
+def test_toml_validation_and_separate_marks(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[zapret2]\nmode="selective"\nstrategy="invalid"\n')
+    cfg, warnings = load(path)
+    assert cfg.zapret2.mode == "off"
+    assert any("strategy" in w for w in warnings)
+    cfg, _, _ = setup()
+    cfg.capture.mark_bypass = z.MARK
+    assert z.validate(cfg)
+    assert cfg.zapret2.mode == "off"
+
+
+def test_missing_video_probe_does_not_launch_worker():
+    h = Harness()
+    h.cfg.zapret2.probe_urls.pop()
+    h.step(0)
+    assert not z.active(h.current)
+    assert not any(name == "start" for name, _ in h.runtime.events)
+
+
+def test_conflicting_probe_port_disables_new_mode():
+    cfg, _, _ = setup()
+    cfg.zapret2.probe_port = cfg.xray.metrics_port
+    assert z.validate(cfg)
+    assert cfg.zapret2.mode == "off"
+
+
+@pytest.mark.parametrize("failure", ["probe", "worker", "budget", "apply"])
+def test_failure_closes_gate_before_fallback(failure):
+    h = Harness()
+    h.activate()
+    h.runtime.events.clear()
+    if failure == "probe":
+        h.ok = False
+    elif failure == "worker":
+        h.runtime.up = False
+    elif failure == "budget":
+        budget = json.loads(h.controller.store.get_meta(z.BUDGET))
+        budget["bytes"] = 1024 ** 3
+        h.controller.store.set_meta(z.BUDGET, json.dumps(budget))
+    else:
+        # Отказ убрать прямое правило: ворота закрыты, состояние честно blocked.
+        h.ok = h.accept = False
+    h.step(200)
+    events = h.runtime.events
+    close = events.index(("gate", 0))
+    fallback = events.index(("apply", False))
+    assert close < fallback < events.index(("stop", 0))
+    assert h.controller.view["state"] == ("blocked" if failure == "apply" else "fallback")
+    assert not h.controller.healthy
+    assert not h.runtime.up
+    if failure != "apply":
+        assert not z.active(h.current)
+
+
+def test_recovery_waits_and_rechecks():
+    h = Harness()
+    h.activate()
+    h.ok = False
+    h.step(200)
+    h.ok = True
+    h.step(201)
+    assert not z.active(h.current)
+    assert h.controller.view["reason"] == "probe_failed"
+    h.step(501)
+    assert not z.active(h.current)
+    h.step(502)
+    assert z.active(h.current)
+
+
+def test_capture_disabled_removes_route_and_stops():
+    h = Harness()
+    h.activate()
+    h.step(3, allowed=False)
+    assert not z.active(h.current)
+    assert not h.runtime.up
+
+
+def test_old_probe_does_not_extend_lease_and_rejected_scaffold_is_blocked():
+    h = Harness()
+    h.activate()
+    h.step(102)
+    assert h.runtime.events[-1] == ("gate", 140)
+    h = Harness()
+    h.accept = False
+    h.step(0)
+    assert h.controller.view["state"] == "blocked"
+    assert h.controller.view["reason"] == "apply_failed"
+
+
+def test_missing_gate_stops_worker_and_does_not_claim_active():
+    h = Harness()
+    h.activate()
+    h.runtime.broken = True
+    h.step(3)
+    assert not z.active(h.current)
+    assert not h.runtime.up
+    assert "private" not in json.dumps(h.controller.view)
+
+
+def test_nft_does_not_broaden_bypass_or_queue_other_traffic():
+    cfg, _, _ = setup()
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    guard = nft.render_guard(rules)
+    text = nft.render(rules)
+    assert "meta mark 0x2 return" in text
+    assert "meta mark and" not in "\n".join(line for line in text.splitlines() if "0x2" in line)
+    assert "meta mark 0x10000000 tcp dport 443 counter queue num 200" in guard
+    assert "queue num 200 bypass" not in guard
+    assert "ct original packets" not in guard  # не требует nf_conntrack_acct/sysctl
+    assert "meta mark 0x50000000 notrack" in guard
+    output = guard.split("chain output {")[1]
+    assert output.index("meta mark { 0x10000000, 0x50000000 } counter drop") < output.index(
+        "jump pass")
+    cfg.zapret2.mode = "off"
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    assert "queue num" not in nft.render_guard(rules)
+
+
+def test_gate_refresh_is_atomic_and_expires():
+    calls = []
+    runtime = z.Runtime(lambda argv, **kw: calls.append((argv, kw)))
+    runtime.gate(240)
+    assert len(calls) == 1
+    script = calls[0][1]["input"]
+    assert script.startswith("flush set inet xgw_guard zapret2_live\n")
+    assert script.count("timeout 240s") == 2
+    assert "bypass" not in script
+
+
+def test_guard_fingerprint_ignores_only_live_lease():
+    cfg, _, _ = setup()
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    text = nft.render_guard(rules)
+    active = text.replace("flags timeout\n", "flags timeout\n"
+                          "    elements = { 0x10000000 timeout 4m expires 3m59s,\n"
+                          "                 0x50000000 timeout 4m expires 3m59s }\n")
+    fingerprint = nft.structure(text, "inet", nft.GUARD)
+    assert nft.structure(active, "inet", nft.GUARD) == fingerprint
+    assert nft.structure(active.replace("queue num 200", "queue num 201"),
+                         "inet", nft.GUARD) != fingerprint
+    assert nft.structure(active.replace("flags timeout", "flags constant"),
+                         "inet", nft.GUARD) != fingerprint
+
+
+@pytest.mark.parametrize("spent", [-1, True, "0"])
+def test_corrupt_budget_cannot_grant_probe(spent):
+    h = Harness()
+    h.controller.store.set_meta(z.BUDGET, json.dumps({"day": int(time.time() // 86400),
+                                                   "bytes": spent}))
+    assert not h.controller._budget(h.cfg)
+
+
+def test_busy_queue_is_not_taken(monkeypatch):
+    calls = []
+    runtime = z.Runtime(lambda argv, **kw: calls.append(argv) or "inactive")
+    monkeypatch.setattr(runtime, "occupied", lambda _queue: True)
+    cfg, _, _ = setup()
+    with pytest.raises(ValueError, match="queue_busy"):
+        runtime.start(cfg)
+    assert all(call[0] != "systemd-run" for call in calls)
+    assert all("stop" not in call for call in calls)
