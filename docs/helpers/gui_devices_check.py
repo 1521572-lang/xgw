@@ -15,6 +15,8 @@ FILES = {
     "devices": ("devices.py", "listing.py", "window.py"),
     "traffic": ("client.py", "listing.py", "traffic.py", "window.py"),
     "operations": ("listing.py", "operations.py", "window.py"),
+    # gui-light: светлая тема Proton — замена темы, каркаса окна и точки входа
+    "light": ("theme.py", "window.py", "app.py"),
 }
 
 

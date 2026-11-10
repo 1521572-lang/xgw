@@ -13,18 +13,15 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMenu,
     QPushButton,
     QScrollArea,
     QStackedWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -443,20 +440,6 @@ class MainWindow(QMainWindow):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         self.nav = NavRail(SECTIONS)
-        self.theme_button = self.nav.add_bottom("Тема")
-        self.theme_button.setAccessibleName("Тема окна")
-        self.theme_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(self.theme_button)
-        self.theme_actions = QActionGroup(self)
-        chosen = str(self.settings.value("theme", "system"))
-        for key in theme.THEMES:
-            action = QAction(theme.THEME_NAMES[key], self, checkable=True)
-            action.setData(key)
-            action.setChecked(key == chosen or (chosen not in theme.THEMES and key == "system"))
-            self.theme_actions.addAction(action)
-            menu.addAction(action)
-        self.theme_actions.triggered.connect(self._theme_changed)
-        self.theme_button.setMenu(menu)
         body.addWidget(self.nav)
 
         self.stack = QStackedWidget()
@@ -619,16 +602,10 @@ class MainWindow(QMainWindow):
         elif key == "traffic":
             self.traffic.refresh()
 
-    def _theme_changed(self, action: QAction) -> None:
-        choice = str(action.data())
-        self.settings.setValue("theme", choice)
-        theme.apply(QApplication.instance(), choice)
-        self.recolor()
-
     def recolor(self) -> None:
         """Значки рисуются цветом темы — после её смены их надо нарисовать заново."""
         colors = theme.current()
-        self.nav.recolor(colors, {self.theme_button: "theme"})
+        self.nav.recolor(colors, {})
         self.servers.recolor()
         self.update()
 

@@ -174,7 +174,6 @@ def main(argv: list[str] | None = None) -> int:
 
         desktop.notify(None, NO_QT)
         return 2
-    from PyQt6.QtCore import QSettings
     from PyQt6.QtGui import QGuiApplication
 
     from .. import trayapp
@@ -188,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     single = SingleInstance(server_name(), code_stamp())
     if single.notify_running():
         return 0
-    theme.apply(app, str(QSettings("XGW", "gui").value("theme", "system")))
+    theme.apply(app, "light")
     from PyQt6 import QtCore, QtGui
 
     app.setWindowIcon(trayapp.icon(QtGui, QtCore, "ok"))

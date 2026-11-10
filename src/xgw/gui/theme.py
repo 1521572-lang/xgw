@@ -1,38 +1,33 @@
-"""Светлая и тёмная тема окна XGW: палитра Qt и одна таблица стилей (QSS) по токенам цвета.
+"""Светлая тема окна XGW (единственная): палитра Qt и одна таблица стилей (QSS) по токенам цвета.
 
 Вид — как у современных VPN-клиентов: крупный знак защиты с подсветкой цветом состояния,
 карточки со скруглением вместо таблиц, узкая навигация со значками.
 
-По умолчанию — тема системы. В Qt 6.5+ её говорит QStyleHints.colorScheme(); в Ubuntu 24.04 Qt
-6.4, и тогда — настройка GNOME `color-scheme` (gsettings) либо яркость системной палитры (KDE
-передаёт свою палитру Qt-программам сам). Состояние окно всегда пишет и словом, и значком —
+Палитра — Proton Light (веб-интерфейс Proton): белые поверхности, пурпурный акцент
+#6D4AFF, сигнальные цвета с затемнением под контраст на белом. Выбор «системная/тёмная»
+убран вместе с переключателем в навигации. Состояние окно всегда пишет и словом, и значком —
 цвет только подсказка.
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
-
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
-THEMES = ("system", "light", "dark")
-THEME_NAMES = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
+THEMES = ("light",)
+THEME_NAMES = {"light": "Светлая"}
 
 LIGHT = {
-    "bg": "#f3f5fa", "panel": "#ffffff", "surface": "#ffffff", "surface2": "#eef1f7",
-    "border": "#dde2ec", "text": "#141a2a", "muted": "#5b6578", "accent": "#4a63e7",
-    "accent_text": "#ffffff", "ok": "#0f9d63", "warn": "#b7791f", "bad": "#d64545",
-    "off": "#6b7486", "busy": "#4a63e7", "focus": "#4a63e7", "nav": "#e8ecf5",
-    "selected": "#dde4fb",
-}
-DARK = {
-    "bg": "#0e1220", "panel": "#131a2b", "surface": "#182033", "surface2": "#212a40",
-    "border": "#2a3450", "text": "#eef1f8", "muted": "#8f9ab3", "accent": "#6b84ff",
-    "accent_text": "#0b0f1a", "ok": "#34d399", "warn": "#fbbf24", "bad": "#f87171",
-    "off": "#94a3b8", "busy": "#8ea2ff", "focus": "#8ea2ff", "nav": "#0a0e19",
-    "selected": "#222c48",
+    # Proton Light: bg/surface=background-norm (#FFFFFF), surface2=background-weak (#F1F1F4),
+    # border=border-weak, text=text-norm, muted=text-hint, accent=interaction-norm (#6D4AFF,
+    # текст на нём белый), ok/warn/bad=signal-* (warn и bad затемнены ради контраста на белом),
+    # off=text-disabled, busy=interaction-norm-active, focus=акцент, nav=рейка background-weak,
+    # selected=акцент ~14% на белом. Палитра одна: тёмной темы в окне больше нет.
+    "bg": "#ffffff", "panel": "#fbfbfd", "surface": "#ffffff", "surface2": "#f1f1f4",
+    "border": "#e3e2e9", "text": "#1c1b24", "muted": "#716f7f", "accent": "#6d4aff",
+    "accent_text": "#ffffff", "ok": "#1ea885", "warn": "#c77700", "bad": "#d93757",
+    "off": "#a7a4b5", "busy": "#8a6eff", "focus": "#6d4aff", "nav": "#f1f1f4",
+    "selected": "#ebe6ff",
 }
 TONES = ("ok", "warn", "bad", "off", "busy")
 NL = chr(10)
@@ -46,56 +41,16 @@ def mix(one: str, two: str, share: float) -> str:
                          for x, y in zip(a, b, strict=True))
 
 
-def _gnome_dark() -> bool | None:
-    tool = shutil.which("gsettings")
-    if tool is None:
-        return None
-    try:
-        found = subprocess.run([tool, "get", "org.gnome.desktop.interface", "color-scheme"],
-                               capture_output=True, text=True, timeout=2.0)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    value = found.stdout.strip().strip("'")
-    if found.returncode != 0 or not value:
-        return None
-    return value == "prefer-dark"
-
-
-def system_dark(app: QApplication) -> bool:
-    hints = app.styleHints()
-    scheme = getattr(hints, "colorScheme", None)
-    if scheme is not None:  # Qt 6.5+
-        from PyQt6.QtCore import Qt
-
-        value = scheme()
-        if value == Qt.ColorScheme.Dark:
-            return True
-        if value == Qt.ColorScheme.Light:
-            return False
-    gnome = _gnome_dark()
-    if gnome is not None:
-        return gnome
-    return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
-
-
 def tokens(app: QApplication, choice: str) -> dict[str, str]:
-    if choice == "system":
-        # Тема системы — по палитре до первой своей: после apply палитра уже наша.
-        known = app.property("xgw_system_dark")
-        if known is None:
-            known = system_dark(app)
-            app.setProperty("xgw_system_dark", known)
-        dark = bool(known)
-    else:
-        dark = choice == "dark"
-    return DARK if dark else LIGHT
+    """Токены темы. Тема одна — светлая; аргументы сохранены ради прежних вызовов."""
+    return LIGHT
 
 
 def current(app: QApplication | None = None) -> dict[str, str]:
     """Токены темы, применённой последней, — для виджетов, которые рисуют сами."""
     app = app or QApplication.instance()
     found = app.property("xgw_colors") if app is not None else None
-    return dict(found) if isinstance(found, dict) else dict(DARK)
+    return dict(found) if isinstance(found, dict) else dict(LIGHT)
 
 
 def palette(colors: dict[str, str]) -> QPalette:
@@ -238,11 +193,7 @@ QToolTip {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c
 
 def apply(app: QApplication, choice: str) -> dict[str, str]:
     """Применить тему ко всему приложению; вернуть её токены (для значков)."""
-    if choice not in THEMES:
-        choice = "system"
-    colors = tokens(app, choice)
-    if app.property("xgw_system_dark") is None:
-        app.setProperty("xgw_system_dark", system_dark(app))
+    colors = tokens(app, choice)  # тема одна: любой выбор даёт светлую
     app.setStyle("Fusion")  # одинаковые элементы в GNOME и KDE; цвета — из палитры
     app.setPalette(palette(colors))
     app.setProperty("xgw_colors", dict(colors))
