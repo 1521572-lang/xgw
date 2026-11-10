@@ -5,8 +5,7 @@
 Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на каждом опросе,
 поэтому фокус, выделение и прокрутка не сбиваются.
 
-Этап 1–2 (docs/GUI-NATIVE.md): вход, «Обзор» и переключатель VPN. Разделы, которые ещё не
-перенесены в окно, честно говорят об этом и открывают тот же раздел браузерной панели.
+Разделы используют общий сеанс локальной панели и показывают состояние шлюза.
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ from PyQt6.QtWidgets import (
 from . import client as clienting
 from . import model, theme
 from .devices import DevicesPage
+from .operations import DiagnosticsPage, ExtraPage
 from .pages import ServersPage, SubscriptionsPage
 from .traffic import TrafficPage
 from .widgets import (
@@ -41,7 +41,6 @@ from .widgets import (
     NavRail,
     ServerList,
     ShieldOrb,
-    icon,
     label,
     set_text,
     tone,
@@ -56,15 +55,6 @@ SECTIONS = (
     ("diagnostics", "Диагностика"),
     ("extra", "Ещё"),
 )
-# Разделы, которые пока только в браузерной панели: что там есть.
-PENDING = {
-    "servers": "Серверы подписок и бесплатного пула: выбор сервера, приоритет, ядро, замеры "
-               "скорости, проверка запасных.",
-    "subscriptions": "Подписки и отдельные ссылки серверов: добавить, изменить, обновить, убрать.",
-    "diagnostics": "«Проверить сеть», журнал событий, обновление ядер Xray и sing-box.",
-    "extra": "Tailscale (вход, SSH, панель по tailnet, Funnel) и телефоны.",
-}
-TITLES = dict(SECTIONS) | {"extra": "Дополнительно"}
 MIN_SIZE = (1024, 720)
 START_SIZE = (1440, 900)
 CONN_WIDTH = (360, 400)  # панель подключения: в узком окне и в широком
@@ -150,44 +140,6 @@ class LoginPage(QWidget):
     def set_error(self, text: str) -> None:
         self.error.setText(text)
         self.error.setVisible(bool(text))
-
-
-class PendingPage(QWidget):
-    """Раздел ещё в браузерной панели: что в нём и кнопка открыть его там."""
-
-    def __init__(self, key: str, title: str, about: str, open_panel) -> None:
-        super().__init__()
-        self.setObjectName("page")
-        card = Card()
-        self.picture = QLabel()
-        self.picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.key = key
-        card.body.addWidget(self.picture)
-        head = label(title, name="pageTitle")
-        head.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        card.body.addWidget(head)
-        for text, name in ((about, ""), ("В окно этот раздел ещё переносится. Пока он работает "
-                                         "в браузерной панели XGW — с теми же действиями.",
-                                         "muted")):
-            line = label(text, name=name)
-            line.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            card.body.addWidget(line)
-        card.body.addSpacing(6)
-        button = QPushButton("Открыть в браузерной панели")
-        button.setObjectName("primary")
-        button.setAccessibleName(f"Открыть раздел «{title}» в браузерной панели")
-        button.clicked.connect(open_panel)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        row.addWidget(button)
-        row.addStretch(1)
-        card.body.addLayout(row)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(_centered(card, 560))
-
-    def recolor(self, colors: dict[str, str]) -> None:
-        self.picture.setPixmap(icon(self.key, colors["accent"], size=56).pixmap(56, 56))
 
 
 class OverviewPage(QWidget):
@@ -515,12 +467,12 @@ class MainWindow(QMainWindow):
         self.subscriptions = SubscriptionsPage(self)
         self.devices = DevicesPage(self)
         self.traffic = TrafficPage(self)
+        self.diagnostics = DiagnosticsPage(self)
+        self.extra = ExtraPage(self)
         self.pages: dict[str, QWidget] = {"overview": self.overview, "servers": self.servers,
                                           "subscriptions": self.subscriptions,
-                                          "devices": self.devices, "traffic": self.traffic}
-        for key, _title in SECTIONS[1:]:
-            if key not in self.pages:
-                self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
+                                          "devices": self.devices, "traffic": self.traffic,
+                                          "diagnostics": self.diagnostics, "extra": self.extra}
         for key, _title in SECTIONS:
             self.stack.addWidget(self.pages[key])
         self.stack.addWidget(self.login_page)
@@ -633,8 +585,9 @@ class MainWindow(QMainWindow):
         set_text(self.chip, _marked(chip_tone, text))
         self.overview.show_state(state, stale)
         current = self.stack.currentWidget()
-        if current in (self.servers, self.subscriptions, self.devices):
-            current.show_state(None if stale and state is None else state)
+        if current in (self.servers, self.subscriptions, self.devices,
+                       self.diagnostics, self.extra):
+            current.show_state(state)
         elif current is self.traffic:
             self.traffic.refresh()
         self._logo(model.shield(state, stale)[0] if state is not None else "off")
@@ -661,7 +614,7 @@ class MainWindow(QMainWindow):
             return
         key = SECTIONS[max(0, row)][0]
         self.stack.setCurrentWidget(self.pages[key])
-        if key in ("servers", "subscriptions", "devices"):
+        if key in ("servers", "subscriptions", "devices", "diagnostics", "extra"):
             self.pages[key].show_state(self.state)
         elif key == "traffic":
             self.traffic.refresh()
@@ -676,9 +629,6 @@ class MainWindow(QMainWindow):
         """Значки рисуются цветом темы — после её смены их надо нарисовать заново."""
         colors = theme.current()
         self.nav.recolor(colors, {self.theme_button: "theme"})
-        for page in self.pages.values():
-            if isinstance(page, PendingPage):
-                page.recolor(colors)
         self.servers.recolor()
         self.update()
 

@@ -61,6 +61,23 @@ def test_traffic_report_uses_backend_totals_and_distinguishes_quota_from_bytes()
         listing.traffic_report(data, 30)
 
 
+def test_diagnostics_formats_checks_and_events_and_validates_links_and_qr():
+    state = _state("work")
+    state["netcheck"] = {"checks": [{"name": "DNS", "level": "WARN", "text": "нет ответа",
+                                    "advice": "повторить"}]}
+    assert listing.network_checks(state) == [("DNS · Внимание", "нет ответа\nповторить")]
+    events = listing.recent_events(state, state["now"])
+    assert any(title.endswith("Конфиг") for title, _detail in events)
+    assert listing.https_link("https://example.test/path") == "https://example.test/path"
+    for link in ("file:///tmp/data", "https://user@example.test", "https://example.test:bad",
+                 "https://example.test/line\n"):
+        assert listing.https_link(link) == ""
+    rows = ["0" * 21] * 21
+    assert listing.qr_rows(rows) == tuple(rows)
+    assert listing.qr_rows(rows[:-1]) == ()
+    assert listing.qr_rows([*rows[:-1], "z" * 21]) == ()
+
+
 def test_servers_are_grouped_by_subscription_and_speak_like_the_web_panel():
     groups = listing.groups(_state("work"))
     assert [group.title for group in groups] == ["main", "запасная", "Отдельные ссылки"]

@@ -1,14 +1,11 @@
-"""Данные разделов «Серверы», «Подписки», «Устройства» и «Трафик» без Qt: строки серверов пула и
-подписок — уже словами. Тексты те же, что у браузерной панели (ui/app.js: serverRow,
-serverNote, renderMain, renderSubs, poolRow, poolNote), чтобы окно и страница говорили об одном
-и том же одинаково. Действия — только существующие действия панели (Panel.act).
-"""
+"""Модели нативного окна без Qt. Отображают состояние и отчёты локальной панели XGW."""
 
 from __future__ import annotations
 
 import datetime
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from ..usage import size
 from . import model
@@ -747,3 +744,62 @@ def traffic_report(data: dict, days: int) -> TrafficReport:
         exits.append(row("Шлюз и служебное", data["gateway"], "WAN за вычетом устройств"))
     return TrafficReport(period, row("Устройства · всего", data["devices_total"]),
                          devices, tuple(exits))
+
+
+CHECK_LEVELS = {"OK": "В порядке", "WARN": "Внимание", "FAIL": "Ошибка"}
+EVENT_KINDS = {
+    "capture": "Перехват", "apply": "Конфиг", "config": "Конфиг",
+    "rotation": "Замена", "rollback": "Откат", "pin": "Выбор сервера", "panel": "Панель",
+    "subscription": "Подписка", "cores": "Обновление ядер", "netcheck": "Проверка сети",
+    "tailscale": "Tailscale", "freepool": "Бесплатные серверы", "youtube": "YouTube",
+}
+
+
+def network_checks(state: dict) -> list[tuple[str, str]]:
+    rows = []
+    for check in _list(_dict(state.get("netcheck")).get("checks")):
+        check = _dict(check)
+        if not check.get("name"):
+            continue
+        level = CHECK_LEVELS.get(str(check.get("level")), "Неизвестно")
+        detail = "\n".join(str(check[key]) for key in ("text", "advice") if check.get(key))
+        rows.append((f"{check['name']} · {level}", detail))
+    return rows
+
+
+def recent_events(state: dict, now: float) -> list[tuple[str, str]]:
+    rows = []
+    for event in _list(state.get("events")):
+        event = _dict(event)
+        if not event.get("detail"):
+            continue
+        kind = str(event.get("kind") or "Событие")
+        rows.append((f"{stamp(event.get('ts'), now)} · {EVENT_KINDS.get(kind, kind)}",
+                     str(event["detail"])))
+    return rows
+
+
+def https_link(value: object) -> str:
+    """Кнопка внешнего входа принимает только HTTPS без учётных данных в URL."""
+    if not isinstance(value, str) or not value or any(
+        not char.isprintable() or char.isspace() or char == "\\" for char in value
+    ):
+        return ""
+    try:
+        url = urlsplit(value)
+        port = url.port
+        if url.scheme == "https" and url.hostname and url.username is None and port != 0:
+            return value
+    except ValueError:
+        pass
+    return ""
+
+
+def qr_rows(value: object) -> tuple[str, ...]:
+    rows = _list(value)
+    count = len(rows)
+    if 21 <= count <= 177 and (count - 21) % 4 == 0 and all(
+        isinstance(row, str) and len(row) == count and set(row) <= {"0", "1"} for row in rows
+    ):
+        return tuple(rows)
+    return ()

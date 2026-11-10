@@ -388,6 +388,71 @@ def test_traffic_discards_a_late_reply_after_period_changes(qapp, demo, tmp_path
         win.close()
 
 
+def test_diagnostics_and_extra_use_panel_actions_and_confirm_changes(qapp, demo, tmp_path,
+                                                                  monkeypatch):
+    sent = []
+    original = demo.state
+
+    def state():
+        data = original()
+        now = data["now"]
+        data["netcheck"] = {"at": now, "checks": [
+            {"name": "DNS", "level": "WARN", "text": "проверить"}]}
+        data["tailscale"] = {"state": "running", "ssh": False}
+        data["phones"] = {"available": True}
+        data["cores"] = {"rows": [{"core": "xray", "title": "Xray", "installed": "26.1.1",
+                                   "latest": {"version": "26.2.2"}, "previous": "26.1.0"}]}
+        return data
+
+    def act(name, body):
+        sent.append((name, body))
+        return panel_demo.actions.Outcome(0, "Готово")
+
+    monkeypatch.setattr(demo, "state", state)
+    monkeypatch.setattr(demo, "_act", act)
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    try:
+        wait(qapp, lambda: win.state is not None)
+        done = []
+        client.actionFinished.connect(lambda *args: done.append(args))
+        win.nav.setCurrentRow(5)
+        page = win.diagnostics
+        assert page.checks.items["0"].title.text() == "DNS · Внимание"
+        assert page.events.items
+        page.run.click()
+        wait(qapp, lambda: len(done) == 1)
+        assert sent == [("netcheck", {})]
+        win.nav.setCurrentRow(6)
+        extra = win.extra
+        ssh = extra.tailscale.items["ssh"].buttons[0]
+        pair = extra.phones.items["pair"].buttons[0]
+        update = extra.cores.items["xray"].buttons[0]
+        extra.confirm = lambda *_args: False
+        for button in (ssh, pair, update):
+            button.click()
+        assert not client.actions.running
+        extra.confirm = lambda *_args: True
+        for number, button in enumerate((ssh, pair, update), 2):
+            button.click()
+            wait(qapp, lambda target=number: len(done) == target)
+        assert sent[1:] == [
+            ("tailscale/ssh", {"on": True}), ("phones/pair", {}),
+            ("cores/update", {"core": "xray", "version": "26.2.2"}),
+        ]
+        client.stop()
+        fixture = state()
+        fixture["phones"]["pairing"] = {"until": time.time() + 300, "qr": ["0" * 21] * 21}
+        win.on_state(fixture)
+        assert extra.pair_qr.isVisible()
+        win.on_link(clienting.LINK_OFFLINE, "")
+        assert extra.pair_qr.isHidden() and not update.isEnabled()
+    finally:
+        win.close()
+
+
 def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qapp, demo,
                                                                              tmp_path):
     client = _client(demo.port)

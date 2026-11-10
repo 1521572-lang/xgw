@@ -14,6 +14,7 @@ sys.path.insert(0, str(SOURCE))
 FILES = {
     "devices": ("devices.py", "listing.py", "window.py"),
     "traffic": ("client.py", "listing.py", "traffic.py", "window.py"),
+    "operations": ("listing.py", "operations.py", "window.py"),
 }
 
 
