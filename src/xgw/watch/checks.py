@@ -50,6 +50,7 @@ class DownloadResult:
     location: str = ""  # заголовок Location ответа 3xx (переходит по нему вызывающий)
 
     body_time_limited: bool = False  # чтение прервал именно лимит времени тела
+    phase: str = ""  # connect, tls, request, headers или body
 
     @property
     def frozen(self) -> bool:
@@ -117,6 +118,7 @@ def http_get_via_proxy(
         return min(cap, remaining)
 
     sock: socket.socket | None = None
+    phase = "connect"
     try:
         if cancel is not None and cancel.is_set():
             raise fetch.Cancelled
@@ -127,9 +129,12 @@ def http_get_via_proxy(
                     user=proxy_user, password=proxy_pass, cancel=cancel, deadline=deadline,
                 )
             except fetch.ProxyError as exc:
-                return DownloadResult(ok=False, kind="proxy", status=exc.status, error=str(exc))
+                return DownloadResult(ok=False, kind="proxy", status=exc.status, error=str(exc),
+                                      phase=phase)
             except OSError as exc:  # в т. ч. таймаут: inbound не открыл туннель
-                return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}")
+                return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}",
+                                      phase=phase)
+            phase = "tls"
             context = tls_context or ssl.create_default_context()
             try:
                 sock = context.wrap_socket(
@@ -137,9 +142,10 @@ def http_get_via_proxy(
                 )
                 fetch.wait_io(sock, sock.do_handshake, left(timeout), cancel)
             except TimeoutError as exc:
-                return DownloadResult(ok=False, kind="timeout", error=f"таймаут TLS: {exc}")
+                return DownloadResult(ok=False, kind="timeout", error=f"таймаут TLS: {exc}",
+                                      phase=phase)
             except (ssl.SSLError, OSError) as exc:
-                return DownloadResult(ok=False, kind="tls", error=f"TLS: {exc}")
+                return DownloadResult(ok=False, kind="tls", error=f"TLS: {exc}", phase=phase)
             sock.settimeout(left(timeout))
             path = parts.path or "/"
             if parts.query:
@@ -152,23 +158,28 @@ def http_get_via_proxy(
             try:
                 sock = socket.create_connection((proxy_host, proxy_port), timeout=left(timeout))
             except OSError as exc:  # в т. ч. таймаут: локальный inbound недоступен
-                return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}")
+                return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}",
+                                      phase=phase)
             headers = {"Host": _host_header(host, port, 80), **ranged}
             if proxy_user:
                 token = base64.b64encode(f"{proxy_user}:{proxy_pass}".encode()).decode("ascii")
                 headers["Proxy-Authorization"] = f"Basic {token}"
             request = _request("GET", url, headers, user_agent)  # абсолютный URI
             sock.settimeout(left(timeout))
+        phase = "request"
         sock.sendall(request)
+        phase = "headers"
         result = _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
             max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
         )
+        result.phase = "body" if 200 <= result.status < 300 else phase
         if result.ok and result.downloaded < min_body:
             return DownloadResult(
                 ok=False, kind="http", status=result.status, downloaded=result.downloaded,
                 body=result.body, body_seconds=result.body_seconds,
                 error=f"ответ без тела (HTTP {result.status}, {result.downloaded} байт)",
+                phase=result.phase,
             )
         if rtt and parts.scheme == "https" and result.ok and result.reusable:
             head = _request("HEAD", path, {"Host": _host_header(host, port, 443)}, user_agent)
@@ -176,16 +187,18 @@ def http_get_via_proxy(
                 result.rtt_ms = _head_rtt(sock, head, silence, deadline, cancel)
             except fetch.Cancelled:
                 return DownloadResult(ok=False, kind="cancelled", downloaded=result.downloaded,
-                                      error="проверка прервана", status=result.status)
+                                      error="проверка прервана", status=result.status,
+                                      phase=result.phase)
         return result
     except fetch.Cancelled:
         return DownloadResult(
-            ok=False, kind="cancelled", error="проверка прервана: демон останавливается"
+            ok=False, kind="cancelled", error="проверка прервана: демон останавливается",
+            phase=phase,
         )
     except TimeoutError as exc:
-        return DownloadResult(ok=False, kind="timeout", error=f"таймаут: {exc}")
+        return DownloadResult(ok=False, kind="timeout", error=f"таймаут: {exc}", phase=phase)
     except OSError as exc:
-        return DownloadResult(ok=False, kind="io", error=str(exc))
+        return DownloadResult(ok=False, kind="io", error=str(exc), phase=phase)
     finally:
         if sock is not None:
             with contextlib.suppress(OSError):

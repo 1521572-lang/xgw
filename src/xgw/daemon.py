@@ -1182,6 +1182,10 @@ class Daemon:
         прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
         прежних отменяется."""
         self._resume(previous)
+        if self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2:
+            self._zapret2.comparison = previous._zapret2.comparison
+            self._zapret2.view = previous._zapret2.view
+            self._zapret2.ready = previous._zapret2.ready
         if previous._build is not None:
             # Поток не трогаем и второй параллельно не запускаем. Старый результат
             # отбросим; настройкам нового экземпляра нужен собственный снимок.
@@ -1656,12 +1660,18 @@ class Daemon:
             self._manual_scan = False
         at = self._spent("сканы и замены", at)
         if not changed and signals.xray_ok and not self.stopping and not self.core_job:
-            allowed = (self.cfg.zapret2.mode == "selective" and self.capture is not None
+            allowed = (self.cfg.zapret2.probe_enabled and self.capture is not None
                        and self.capture.mode() == "on")
+            vpn_probe_port = 0
+            if self.cfg.zapret2.mode == "compare" and observatory:
+                # Один живой участник для обеих проб, через его штатный служебный вход.
+                vpn_probe_port = next((info.probe_port for info in view if info.role == "proxy"
+                                       and info.probe_port
+                                       and (observatory.get(info.tag) or {}).get("alive")), 0)
             previous = self._zapret2.view.get("state")
             changed = self._zapret2.step(
                 self.cfg, applied, self.clock(), self._zapret2_apply,
-                allowed=allowed, cancel=self._stop,
+                allowed=allowed, vpn_probe_port=vpn_probe_port, cancel=self._stop,
             )
             if previous != self._zapret2.view.get("state"):
                 self.notifier.event("zapret2", "zapret2: " + self._zapret2.view["state"])

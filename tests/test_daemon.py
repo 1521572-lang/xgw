@@ -3445,3 +3445,33 @@ def test_zapret2_tick_uses_api_and_restores_vpn_after_worker_death(daemon):
     assert not zapret2.active(engine.read_json(daemon.paths.xray_config_file))
     assert daemon._zapret2.view["state"] == "fallback"
     assert daemon._build_count == builds
+
+
+def test_zapret2_compare_uses_live_member_and_exports_probe_rows(daemon):
+    from test_zapret2 import Runtime
+
+    from xgw.watch.checks import DownloadResult
+
+    _started(daemon)
+    daemon.capture = FakeCapture()
+    daemon.cfg.zapret2.mode = "compare"
+    daemon.cfg.zapret2.probe_urls = ["https://www.youtube.com/watch?v=test",
+                                    "https://cdn.googlevideo.com/video"]
+    applied = engine.read_json(daemon.paths.xray_config_file)
+    members = [info for info in builder.applied_nodes(applied) if info.role == "proxy"]
+    daemon.observatory = {members[1].tag: {"alive": True, "delay": 0.05}}
+    daemon._zapret2.runtime = Runtime()
+    ports = []
+
+    def request(_url, port, _password, _agent, _cancel):
+        ports.append(port)
+        return DownloadResult(True, status=200, downloaded=16384, phase="body")
+
+    daemon._zapret2._request = request
+    for _ in range(3):
+        daemon.t += 1
+        daemon.tick()
+    assert ports == [members[1].probe_port, daemon.cfg.zapret2.probe_port] * 2
+    comparison = daemon.status()["zapret2"]
+    assert comparison["state"] == "compared" and len(comparison["probes"]) == 4
+    assert engine.read_json(daemon.paths.xray_config_file) == applied

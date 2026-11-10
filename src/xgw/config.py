@@ -376,6 +376,10 @@ class Zapret2:
     retry_seconds: int = 300
     daily_probe_mb: int = 256
 
+    @property
+    def probe_enabled(self) -> bool:
+        return self.mode in ("selective", "compare")
+
 
 @dataclass
 class Media:
@@ -935,7 +939,7 @@ def service_ports(cfg: Config) -> dict[str, int]:
         "panel.app_port": cfg.panel.app_port,
         "core.api_port": cfg.core.api_port,
         **({"zapret2.probe_port": cfg.zapret2.probe_port}
-           if cfg.zapret2.mode == "selective" else {}),
+           if cfg.zapret2.probe_enabled else {}),
     }
 
 

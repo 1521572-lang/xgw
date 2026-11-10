@@ -20,6 +20,7 @@ from .net import cmd
 
 if TYPE_CHECKING:
     from .config import Config
+    from .watch.checks import DownloadResult
 
 MARK = 0x10000000
 FAKE_BIT = 0x40000000
@@ -47,8 +48,8 @@ def matches(host: str, domains: list[str]) -> bool:
 def validate(cfg: Config) -> list[str]:
     z = cfg.zapret2
     problems = []
-    if z.mode not in ("off", "selective"):
-        problems.append("mode: ожидается off или selective")
+    if z.mode not in ("off", "selective", "compare"):
+        problems.append("mode: ожидается off, selective или compare")
     if not z.domains or any(not _DOMAIN.fullmatch(d) for d in z.domains):
         problems.append("domains: нужны domain:имя или full:имя")
     if z.strategy not in ("multisplit", "multidisorder"):
@@ -67,6 +68,8 @@ def validate(cfg: Config) -> list[str]:
             problems.append("пути binary и lua_dir должны быть абсолютными Linux-путями")
     if len(z.probe_urls) > 4:
         problems.append("probe_urls: не больше четырёх адресов")
+    if z.mode == "compare" and len(z.probe_urls) != 2:
+        problems.append("compare требует ровно два HTTPS-адреса")
     for value in z.probe_urls:
         try:
             u = urlsplit(value)
@@ -82,9 +85,9 @@ def validate(cfg: Config) -> list[str]:
     if (any("youtube" in d or "googlevideo" in d for d in z.domains)
             and not {"domain:youtube.com", "domain:googlevideo.com"} <= set(z.domains)):
         problems.append("для YouTube нужны вместе youtube.com и googlevideo.com")
-    if z.mode == "selective" and cfg.routing.proxy_domains:
+    if z.probe_enabled and cfg.routing.proxy_domains:
         problems.append("первая версия требует общего маршрута через VPN (proxy_domains пуст)")
-    if z.mode == "selective" and not cfg.network.block_quic:
+    if z.probe_enabled and not cfg.network.block_quic:
         problems.append("для общего выхода страницы и видео требуется network.block_quic = true")
     for mark in (cfg.capture.mark_proxy, cfg.capture.mark_bypass, cfg.capture.mark_containers):
         if mark & (MARK | FAKE_BIT):
@@ -112,7 +115,7 @@ def active(config: dict) -> bool:
                for r in config.get("routing", {}).get("rules", []))
 
 
-def patch(config: dict, cfg: Config, *, enabled: bool = False) -> dict:
+def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = True) -> dict:
     """Статические вход/выход и временное правило. Полная сборка всегда начинает с VPN."""
     from .generator import builder
 
@@ -122,7 +125,7 @@ def patch(config: dict, cfg: Config, *, enabled: bool = False) -> dict:
     result["routing"]["rules"] = rules
     result["inbounds"] = [i for i in result["inbounds"] if i.get("tag") != PROBE]
     result["outbounds"] = [o for o in result["outbounds"] if o.get("tag") != OUT]
-    if cfg.zapret2.mode != "selective":
+    if not probe or not cfg.zapret2.probe_enabled:
         return result
     password, _ = builder.probe_state(config)
     if not password or any(i.get("port") == cfg.zapret2.probe_port for i in result["inbounds"]):
@@ -143,7 +146,7 @@ def patch(config: dict, cfg: Config, *, enabled: bool = False) -> dict:
          "network": "tcp", "port": "443", "outboundTag": OUT},
         {"type": "field", "inboundTag": [PROBE], "outboundTag": "block"},
     ]
-    if enabled and not builder.applied_whole(config):
+    if enabled and cfg.zapret2.mode == "selective" and not builder.applied_whole(config):
         # Прямые исключения, устройства и пул главнее. Служебные входы не включены.
         at = next((n for n, r in enumerate(rules) if
                    r.get("balancerTag") == builder.YOUTUBE_BALANCER
@@ -275,6 +278,7 @@ class Controller:
         self.healthy = False
         self.ready = False
         self.last_error = ""
+        self.comparison: list[dict] | None = None
         self.view = {"state": "off", "reason": "off"}
 
     def _budget(self, cfg: Config) -> bool:
@@ -287,34 +291,71 @@ class Controller:
         except (ValueError, TypeError, AttributeError):
             return False  # повреждённый учёт не превращается в бесплатный бюджет
         charge = len(cfg.zapret2.probe_urls) * PROBE_CHARGE
+        if cfg.zapret2.mode == "compare":
+            charge *= 2
         if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
             return False
         self.store.set_meta(BUDGET, json.dumps({"day": day, "bytes": spent + charge}))
         return True
 
-    def probe(self, cfg: Config, applied: dict, cancel) -> bool:
+    @staticmethod
+    def _request(url: str, port: int, password: str, user_agent: str, cancel) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
+        return checks.http_get_via_proxy(
+            "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
+            proxy_pass=password, timeout=5, silence=4, max_total=8,
+            max_bytes=PROBE_BYTES, min_body=16 * 1024, user_agent=user_agent, cancel=cancel,
+        )
+
+    def probe(self, cfg: Config, applied: dict, cancel) -> bool:
+        from .generator import builder
+
         password, _ = builder.probe_state(applied)
         for url in cfg.zapret2.probe_urls:
-            verdict = checks.http_get_via_proxy(
-                "127.0.0.1", cfg.zapret2.probe_port, url, proxy_user=builder.PROBE_USER,
-                proxy_pass=password or "", timeout=5, silence=4, max_total=8,
-                max_bytes=PROBE_BYTES, min_body=16 * 1024,
-                user_agent=cfg.probe.user_agent, cancel=cancel,
-            )
+            verdict = self._request(url, cfg.zapret2.probe_port, password or "",
+                                    cfg.probe.user_agent, cancel)
             if not verdict.ok:
                 return False
         return True
 
+    def _compare(self, cfg: Config, applied: dict, vpn_port: int, cancel) -> list[dict]:
+        from .generator import builder
+        from .watch import checks
+
+        password, _ = builder.probe_state(applied)
+        if not password or not vpn_port:
+            return []
+        agent = checks.pick_agent(cfg.probe.user_agent)
+        rows = []
+        for index, url in enumerate(cfg.zapret2.probe_urls, 1):
+            for path, port in (("vpn", vpn_port), ("zapret2", cfg.zapret2.probe_port)):
+                if cancel is not None and cancel.is_set():
+                    return rows
+                result = self._request(url, port, password, agent, cancel)
+                connect = result.phase == "connect"
+                rows.append({
+                    "probe": index, "path": path, "phase": result.phase,
+                    "kind": result.kind or "ok", "ok": result.ok,
+                    "http": 0 if connect else result.status,
+                    "connect_http": result.status if connect else 0,
+                    "bytes": result.downloaded,
+                })
+        return rows
+
     def step(self, cfg: Config, applied: dict, now: float, apply, *, allowed=True,
-             cancel=None) -> bool:
+             vpn_probe_port: int = 0, cancel=None) -> bool:
         from .generator import builder
 
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
-        wanted = cfg.zapret2.mode == "selective" and allowed and not builder.applied_whole(applied)
-        if not wanted and not present and not self.ready:
+        comparing = cfg.zapret2.mode == "compare"
+        finished = comparing and self.comparison is not None
+        wanted = (cfg.zapret2.probe_enabled and allowed and not finished
+                  and not builder.applied_whole(applied))
+        if finished and not present and not self.ready and self.view["state"] == "compared":
+            return False
+        if not finished and not wanted and not present and not self.ready:
             self.view = {"state": "off", "reason": "off"}
             return False
         reason = "off" if not wanted else "waiting_for_probe_urls"
@@ -342,13 +383,17 @@ class Controller:
                     self.healthy = False
                     if not self._budget(cfg):
                         raise ValueError("probe_budget")
-                    self.runtime.gate(cfg.zapret2.check_seconds + 60)
-                    if not self.probe(cfg, applied, cancel):
-                        raise ValueError("probe_failed")
-                    self.healthy = True
-                    self.last_error = ""
-                    self.next_check = now + cfg.zapret2.check_seconds
-                if self.healthy:
+                    if comparing:
+                        self.runtime.gate(45)
+                        self.comparison = self._compare(cfg, applied, vpn_probe_port, cancel)
+                    else:
+                        self.runtime.gate(cfg.zapret2.check_seconds + 60)
+                        if not self.probe(cfg, applied, cancel):
+                            raise ValueError("probe_failed")
+                        self.healthy = True
+                        self.last_error = ""
+                        self.next_check = now + cfg.zapret2.check_seconds
+                if self.healthy and not comparing:
                     # Старый удачный GET не продлевает разрешение бесконечно.
                     lease = max(1, int(self.next_check - now) + 60)
                     self.runtime.gate(lease)
@@ -375,17 +420,29 @@ class Controller:
         except cmd.CommandError:
             gate_closed = False  # очередь всё ещё без bypass; lease сам истечёт
         try:
-            target = patch(applied, cfg)
+            finished = comparing and self.comparison is not None
+            target = patch(applied, cfg, probe=not finished)
             changed = target != applied and apply(target, applied)
             routed_back = (target == applied or changed) and reason != "apply_failed"
         except (ValueError, cmd.CommandError, OSError):
             routed_back = False
+        stopped = True
         if self.ready or present:
             try:
                 self.runtime.stop()
             except cmd.CommandError:
                 reason = "stop_failed"
-        self.ready = False
+                stopped = False
+        self.ready = comparing and not stopped
+        if comparing and self.comparison is not None:
+            complete = len(self.comparison) == 4 and all(
+                row["kind"] != "cancelled" for row in self.comparison)
+            cleaned = routed_back and gate_closed and stopped
+            self.view = {"state": "compared" if cleaned else "blocked",
+                         "reason": ("comparison_done" if complete else "comparison_incomplete")
+                         if cleaned else "comparison_cleanup_failed",
+                         "gate_closed": gate_closed, "probes": self.comparison}
+            return changed
         self.view = {"state": "fallback" if routed_back else "blocked", "reason": reason,
                      "gate_closed": gate_closed}
         return changed

@@ -357,6 +357,7 @@ def test_https_download_through_connect_tunnel(tls_files):
     )
     assert result.ok, result.error
     assert result.downloaded == BODY
+    assert result.phase == "body"
     assert proxy.requests[0].startswith(f"CONNECT localhost:{origin.port} HTTP/1.1".encode())
     assert b"Proxy-Authorization: Basic eGd3OnNlY3JldA==" in proxy.requests[0]
 
@@ -406,7 +407,16 @@ def test_connect_rejected_by_proxy():
         "127.0.0.1", proxy.port, "https://origin.example.com/big", timeout=5, silence=1
     )
     assert not result.ok and result.kind == "proxy" and result.status == 407
+    assert result.phase == "connect"
     assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+def test_tls_timeout_has_tls_phase_after_connect(serve):
+    proxy = serve(b"HTTP/1.1 200 Connection Established\r\n\r\n", 2.0)
+    result = http_get_via_proxy(
+        "127.0.0.1", proxy.port, "https://origin.example.com/", timeout=0.5,
+    )
+    assert not result.ok and (result.phase, result.kind, result.status) == ("tls", "timeout", 0)
 
 
 def test_probe_request_carries_the_configured_user_agent(serve):

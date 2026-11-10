@@ -417,6 +417,7 @@ min_interval_min = 10
 # Дополнительный прямой выход через nfqws2, только выбранные HTTPS-домены.
 # Подготовка и ограничения: docs/ZAPRET2.md. XGW ничего не скачивает и не устанавливает.
 mode = "off" # selective — после подготовки и согласия владельца на прямой домашний IP
+# compare — разовое сравнение двух probe_urls на служебных входах; клиенты остаются на VPN
 domains = ["domain:youtube.com", "domain:googlevideo.com",
            "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
 binary = "/opt/zapret2/nfqws2"

@@ -13,6 +13,7 @@ from xgw.generator import builder
 from xgw.generator.diff import diff_configs
 from xgw.net import nft
 from xgw.net.cmd import CommandError
+from xgw.watch import checks
 
 
 def setup():
@@ -205,6 +206,56 @@ def test_recovery_waits_and_rechecks():
     assert not z.active(h.current)
     h.step(502)
     assert z.active(h.current)
+
+
+@pytest.mark.parametrize("direct_ok", [False, True])
+def test_compare_runs_both_pairs_without_enabling_client_route(monkeypatch, direct_ok):
+    h = Harness()
+    h.cfg.zapret2.mode = "compare"
+    assert not z.validate(h.cfg)
+    vpn_port = builder.applied_nodes(h.current)[0].probe_port
+    direct_port = h.cfg.zapret2.probe_port
+    calls = []
+
+    def request(host, port, url, **kwargs):
+        calls.append((port, url, kwargs["user_agent"]))
+        if port == direct_port and not direct_ok:
+            return checks.DownloadResult(False, kind="timeout", phase="tls", error="secret")
+        return checks.DownloadResult(True, downloaded=32768, status=206, phase="body",
+                                     location="secret")
+
+    monkeypatch.setattr(checks, "http_get_via_proxy", request)
+    original = copy.deepcopy(h.current)
+    assert not z.active(z.patch(original, h.cfg, enabled=True))
+    for now in (0, 1, 2, 600):
+        h.step(now, vpn_probe_port=vpn_port)
+    assert h.current == original
+    assert h.controller.view["state"] == "compared"
+    assert h.controller.view["reason"] == "comparison_done"
+    assert [(port, url) for port, url, _ in calls] == [
+        (port, url) for url in h.cfg.zapret2.probe_urls for port in (vpn_port, direct_port)
+    ]
+    assert len({agent for _, _, agent in calls}) == 1
+    assert not h.runtime.up and h.runtime.events[-1] == ("stop", 0)
+    assert all(not enabled for action, enabled in h.runtime.events if action == "apply")
+    assert ("gate", 45) in h.runtime.events
+    assert json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"] == 4 * z.PROBE_CHARGE
+    rows = h.controller.view["probes"]
+    assert [(row["probe"], row["path"], row["ok"]) for row in rows] == [
+        (1, "vpn", True), (1, "zapret2", direct_ok), (2, "vpn", True), (2, "zapret2", direct_ok)
+    ]
+    payload = json.dumps(rows)
+    assert "secret" not in payload and "https://" not in payload
+
+
+def test_compare_without_a_vpn_control_is_incomplete(monkeypatch):
+    h = Harness()
+    h.cfg.zapret2.mode = "compare"
+    monkeypatch.setattr(checks, "http_get_via_proxy", lambda *_a, **_k: pytest.fail("no control"))
+    for now in range(3):
+        h.step(now)
+    assert h.controller.view["reason"] == "comparison_incomplete"
+    assert h.controller.view["probes"] == [] and not h.runtime.up
 
 
 def test_capture_disabled_removes_route_and_stops():

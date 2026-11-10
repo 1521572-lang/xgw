@@ -30,7 +30,7 @@ def pid(unit):
     return int(value) if value.isdigit() else 0
 
 
-def snapshot():
+def snapshot(*, include_comparison=False):
     from xgw import zapret2
     from xgw.config import load
     from xgw.paths import Paths
@@ -46,7 +46,7 @@ def snapshot():
     digest = hashlib.sha256(json.dumps(sections, sort_keys=True).encode()).hexdigest()
     view = status.get("zapret2") or {}
     state = str(view.get("state", "unknown"))
-    if state not in ("off", "unknown", "preparing", "active", "fallback", "blocked"):
+    if state not in ("off", "unknown", "preparing", "active", "fallback", "blocked", "compared"):
         state = "unknown"
     queue = zapret2.Runtime.occupied(cfg.zapret2.queue_num)
     counters = (metrics.fetch_metrics(cfg.xray.metrics_port).get("stats") or {}).get(
@@ -59,13 +59,17 @@ def snapshot():
     if proc.returncode == 0:
         data = json.loads(proc.stdout)
         lease = any(entry.get("set", {}).get("elem") for entry in data.get("nftables", []))
-    return {
+    result = {
         "state": state, "route": zapret2.active(applied), "queue": queue, "lease": bool(lease),
         "xray_pid": pid("xgw-xray.service"), "worker_pid": pid(zapret2.UNIT),
         "protected": digest, "warnings": len(warnings),
         "capture_on": (status.get("capture") or {}).get("mode") == "on",
         "zapret_bytes": total,
     }
+    if include_comparison:
+        result["comparison"] = view.get("probes", [])
+        result["reason"] = view.get("reason", "")
+    return result
 
 
 def show(value, baseline=None):
@@ -79,9 +83,45 @@ def show(value, baseline=None):
     print("CHECK " + " ".join(fields), flush=True)
 
 
+def compare_report(value):
+    rows = value["comparison"]
+    if not isinstance(rows, list) or len(rows) > 4:
+        raise ValueError("invalid_comparison")
+    kinds = {"ok", "connect", "proxy", "tls", "http", "stall", "truncated", "timeout",
+             "reset", "io", "cancelled"}
+    pairs = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("invalid_comparison")
+        n, path = row["probe"], row["path"]
+        phase, kind, ok = row["phase"], row["kind"], row["ok"]
+        http, connect, size = row["http"], row["connect_http"], row["bytes"]
+        if (type(n) is not int or n not in (1, 2) or path not in ("vpn", "zapret2")
+                or phase not in ("connect", "tls", "request", "headers", "body")
+                or kind not in kinds or type(ok) is not bool
+                or any(type(code) is not int or not 0 <= code <= 599 for code in (http, connect))
+                or type(size) is not int or size < 0 or (n, path) in pairs):
+            raise ValueError("invalid_comparison")
+        pairs.add((n, path))
+        print(f"PROBE n={n} path={path} phase={phase} kind={kind} http={http} "
+              f"connect_http={connect} bytes={size} ok={int(ok)}", flush=True)
+    stopped = not (value["queue"] or value["lease"] or value["worker_pid"])
+    complete = (len(pairs) == 4 and value["reason"] == "comparison_done"
+                and value["state"] == "compared" and stopped)
+    reason = value["reason"]
+    if not complete and reason in (
+        "comparison_cleanup_failed", "comparison_incomplete", "waiting_for_probe_urls",
+        "dependency_missing", "worker_down", "runtime_failed", "probe_budget", "apply_failed",
+        "queue_busy", "unsafe_files", "unsafe_directory", "stop_failed",
+    ):
+        print(f"CHECK comparison_reason={reason}", flush=True)
+    print("RESULT " + ("comparison_done" if complete else "comparison_incomplete"))
+    return 0 if complete else 4
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("before", "inspect", "watch", "finish"))
+    parser.add_argument("action", choices=("before", "inspect", "watch", "finish", "compare"))
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=180)
     args = parser.parse_args()
@@ -91,7 +131,8 @@ def main():
         raise RuntimeError("bad_duration")
     if args.action == "before":
         value = snapshot()
-        if value["route"] or not value["capture_on"] or not value["xray_pid"]:
+        if (value["route"] or value["lease"] or value["worker_pid"]
+                or not value["capture_on"] or not value["xray_pid"]):
             raise RuntimeError("baseline_not_ready")
         fd = os.open(args.state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as out:
@@ -102,11 +143,22 @@ def main():
     baseline = json.loads(args.state.read_text())
     deadline = time.monotonic() + args.seconds
     while True:
-        value = snapshot()
+        value = snapshot(include_comparison=args.action == "compare")
         show(value, baseline)
-        if args.action != "watch" or time.monotonic() >= deadline:
+        if args.action == "compare":
+            if (value["route"] or not value["capture_on"]
+                    or value["xray_pid"] != baseline["xray_pid"]
+                    or value["protected"] != baseline["protected"]):
+                print("STOP comparison_guard")
+                return 2
+            if value["state"] in ("compared", "blocked", "fallback"):
+                return compare_report(value)
+        if args.action not in ("watch", "compare") or time.monotonic() >= deadline:
             break
         time.sleep(min(15, max(0, deadline - time.monotonic())))
+    if args.action == "compare":
+        print("RESULT comparison_incomplete")
+        return 4
     if args.action == "finish":
         ok = (not value["route"] and not value["worker_pid"] and not value["lease"]
               and value["capture_on"] and value["protected"] == baseline["protected"])
@@ -118,6 +170,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError):
         print("STOP helper_failed", flush=True)
         sys.exit(2)
