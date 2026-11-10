@@ -13,6 +13,25 @@ def _state(scene: str) -> dict:
     return json.loads((FIXTURES / f"state-{scene}.json").read_text(encoding="utf-8"))
 
 
+def test_devices_keep_fixed_exclusions_and_unavailable_routes_visible():
+    state = _state("work")
+    fixed, selected, unnamed = state["devices"]
+    selected.update(route="fixture-missing", route_down=True, offline=True)
+    unnamed.update(route="pool")
+    rows = {item.mac: item for item in listing.devices(state)}
+    assert rows[fixed["mac"]].locked and "config.toml" in rows[fixed["mac"]].status
+    row = rows[selected["mac"]]
+    assert row.offline and "через основной" in row.status
+    choices = dict(row.choices)
+    assert choices["fixture-missing"] == "Выбранный сервер недоступен"
+    assert "pool" not in choices
+    disabled = next(server for server in state["servers"] if server["status"] == "disabled")
+    assert disabled["fingerprint"] not in choices
+    assert "закрыты" in rows[unnamed["mac"]].status
+    state["lan"] = {}
+    assert listing.devices(state) == []
+
+
 def test_servers_are_grouped_by_subscription_and_speak_like_the_web_panel():
     groups = listing.groups(_state("work"))
     assert [group.title for group in groups] == ["main", "запасная", "Отдельные ссылки"]

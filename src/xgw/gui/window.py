@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 
 from . import client as clienting
 from . import model, theme
+from .devices import DevicesPage
 from .pages import ServersPage, SubscriptionsPage
 from .widgets import (
     Badge,
@@ -59,7 +60,6 @@ PENDING = {
     "servers": "Серверы подписок и бесплатного пула: выбор сервера, приоритет, ядро, замеры "
                "скорости, проверка запасных.",
     "subscriptions": "Подписки и отдельные ссылки серверов: добавить, изменить, обновить, убрать.",
-    "devices": "Устройства сети: маршрут через VPN или напрямую, свой сервер, запись трафика.",
     "traffic": "Расход трафика по устройствам, подпискам и бесплатному пулу.",
     "diagnostics": "«Проверить сеть», журнал событий, обновление ядер Xray и sing-box.",
     "extra": "Tailscale (вход, SSH, панель по tailnet, Funnel) и телефоны.",
@@ -513,8 +513,10 @@ class MainWindow(QMainWindow):
         self.overview = OverviewPage(self)
         self.servers = ServersPage(self)
         self.subscriptions = SubscriptionsPage(self)
+        self.devices = DevicesPage(self)
         self.pages: dict[str, QWidget] = {"overview": self.overview, "servers": self.servers,
-                                          "subscriptions": self.subscriptions}
+                                          "subscriptions": self.subscriptions,
+                                          "devices": self.devices}
         for key, _title in SECTIONS[1:]:
             if key not in self.pages:
                 self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
@@ -630,7 +632,7 @@ class MainWindow(QMainWindow):
         set_text(self.chip, _marked(chip_tone, text))
         self.overview.show_state(state, stale)
         current = self.stack.currentWidget()
-        if current in (self.servers, self.subscriptions):
+        if current in (self.servers, self.subscriptions, self.devices):
             current.show_state(None if stale and state is None else state)
         self._logo(model.shield(state, stale)[0] if state is not None else "off")
         self._tick()
@@ -656,7 +658,7 @@ class MainWindow(QMainWindow):
             return
         key = SECTIONS[max(0, row)][0]
         self.stack.setCurrentWidget(self.pages[key])
-        if key in ("servers", "subscriptions"):
+        if key in ("servers", "subscriptions", "devices"):
             self.pages[key].show_state(self.state)
 
     def _theme_changed(self, action: QAction) -> None:

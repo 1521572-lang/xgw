@@ -310,6 +310,46 @@ def test_servers_page_acts_through_the_panel(qapp, demo, tmp_path):
     win.close()
 
 
+def test_devices_page_only_changes_routes_through_the_panel(qapp, demo, tmp_path, monkeypatch):
+    sent = []
+
+    def act(name, body):
+        sent.append((name, body))
+        return panel_demo.actions.Outcome(0, "Готово")
+
+    monkeypatch.setattr(demo, "_act", act)
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    wait(qapp, lambda: win.state is not None)
+    win.nav.setCurrentRow(3)
+    page = win.devices
+    fixed = next(card for card in page.cards.values() if card.item.locked)
+    card = next(card for card in page.cards.values() if not card.item.bypass)
+    assert not fixed.bypass.isEnabled() and fixed.route.isHidden()
+    assert card.route.isEnabled() and card.route.currentData() == ""
+    done = []
+    client.actionFinished.connect(lambda *args: done.append(args))
+    selected = card.route.itemData(1)
+    card.route.setCurrentIndex(1)
+    card.route.activated.emit(1)
+    wait(qapp, lambda: len(done) == 1)
+    assert sent == [("device/route", {"mac": card.item.mac, "server": selected})]
+    assert card.route.currentData() == ""
+    page.confirm = lambda *_args: False
+    card.bypass.click()
+    assert not client.actions.busy(f"device:{card.item.mac}")
+    page.confirm = lambda *_args: True
+    card.bypass.click()
+    wait(qapp, lambda: len(done) == 2)
+    assert sent[1] == ("device", {"mac": card.item.mac, "bypass": True})
+    client.stop()
+    win.on_link(clienting.LINK_OFFLINE, "")
+    assert not card.bypass.isEnabled() and not card.route.isEnabled()
+    win.close()
+
+
 def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qapp, demo,
                                                                              tmp_path):
     client = _client(demo.port)

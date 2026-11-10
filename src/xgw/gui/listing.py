@@ -1,4 +1,4 @@
-"""Разделы «Серверы» и «Подписки» окна XGW без Qt: строки серверов подписок, бесплатного пула и
+"""Данные разделов «Серверы», «Подписки» и «Устройства» окна XGW без Qt: строки серверов пула и
 подписок — уже словами. Тексты те же, что у браузерной панели (ui/app.js: serverRow,
 serverNote, renderMain, renderSubs, poolRow, poolNote), чтобы окно и страница говорили об одном
 и том же одинаково. Действия — только существующие действия панели (Panel.act).
@@ -446,7 +446,7 @@ def _pool_verdict(row: dict) -> tuple[str, str]:
 def _pool_item(row: dict, live: dict | None, current: bool, state: dict) -> PoolItem:
     now = _num(state.get("now")) or time.time()
     pool = _dict(state.get("free_pool"))
-    flow = _dict(_dict(pool.get("summary")).get("traffic"))
+    flow = model.pool_flow(state) or {}
     pinned = bool(row.get("id")) and row.get("id") == (pool.get("pin") or "")
     tags: list[tuple[str, str]] = []
     if pinned:
@@ -627,3 +627,71 @@ def parse_headers(text: str) -> dict[str, str]:
         if sep and key.strip():
             found[key.strip()] = value.strip()
     return found
+
+
+@dataclass(frozen=True)
+class DeviceItem:
+    mac: str
+    ip: str
+    name: str
+    status: str
+    bypass: bool
+    locked: bool
+    offline: bool
+    kernel: bool
+    route: str
+    choices: tuple[tuple[str, str], ...]
+
+
+def devices(state: dict | None) -> list[DeviceItem]:
+    """Устройства и допустимые серверы из того же снимка, что у браузерной панели."""
+    state = state or {}
+    if not _dict(state.get("lan")).get("interface"):
+        return []
+    pool = _dict(state.get("free_pool"))
+    mode = pool.get("mode", "off")
+    flow = _dict(_dict(pool.get("summary")).get("traffic"))
+    closed = mode == "off" or bool(flow.get("closed"))
+    choices = {"": "Сервер: авто"}
+    if mode != "off":
+        choices["pool"] = "Бесплатные серверы"
+    for row in _list(state.get("servers")):
+        row = _dict(row)
+        fingerprint = row.get("fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint or row.get("status") not in (
+                "member", "spare", "waiting"):
+            continue
+        name = str(row.get("name") or "Сервер без имени")
+        price = _num(row.get("multiplier"))
+        choices[fingerprint] = f"{name} · лимит ×{price:g}" if price else name
+    result: list[DeviceItem] = []
+    for row in _list(state.get("devices")):
+        row = _dict(row)
+        mac = row.get("mac")
+        if not isinstance(mac, str) or not mac:
+            continue
+        bypass, offline = bool(row.get("bypass")), bool(row.get("offline"))
+        locked = bypass and not row.get("managed")
+        route = str(row.get("route") or "")
+        options = dict(choices)
+        if route == "pool" and route not in options:
+            options[route] = "Бесплатные серверы (пул выключен)"
+        elif route not in options:
+            options[route] = "Выбранный сервер недоступен"
+        if bypass:
+            status = "Мимо VPN · задано в config.toml" if locked else "Мимо VPN"
+        elif mode == "on" or route == "pool":
+            status = "Бесплатные серверы"
+            if closed:
+                status += " · зарубежные сайты закрыты"
+        elif route and row.get("route_down"):
+            status = "Свой сервер недоступен · через основной"
+        else:
+            status = "Свой сервер" if route else "Через VPN · автовыбор"
+        if offline:
+            status += " · не в сети"
+        result.append(DeviceItem(
+            mac, str(row.get("ip") or ""), str(row.get("name") or "Без имени"), status,
+            bypass, locked, offline, bool(row.get("kernel")), route, tuple(options.items()),
+        ))
+    return result
