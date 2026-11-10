@@ -1144,9 +1144,12 @@ MEDIA_STATES = {
     "disabled_no_measurements": "не действует: выключены проверки YouTube или порог скорости "
                                 "([speed] youtube, youtube_mbps), идёт общим маршрутом",
     "waiting_for_samples": "ждёт свежих замеров, пока идёт общим маршрутом",
+    "waiting_for_acceptance": "YouTube требует вход на всех подходящих серверах, "
+                              "видео идёт общим маршрутом",
     "applying": "применяется",
     "degraded": "НЕ ПОДТВЕРЖДЕНО: выход не применён или ядро его не показывает (sudo xgw diag)",
 }
+MEDIA_SIGN = {"accept": "плеер готов", "refuse": "требуется вход", "unknown": "нет данных"}
 
 
 def render_media(media: dict) -> str:
@@ -1160,8 +1163,10 @@ def render_media(media: dict) -> str:
     for sample in media.get("samples") or []:
         mbps = sample.get("mbps")
         speed = f"{mbps:g} Мбит/с, " if isinstance(mbps, int | float) else ""
+        sign = MEDIA_SIGN.get(sample.get("sign"))
+        detail = f", допуск: {sign}" if sign else ""
         parts.append(f"{sample.get('tag')} ({speed}замер {int(sample.get('age_s') or 0) // 60} "
-                     "мин назад)")
+                     f"мин назад{detail})")
     limit = media.get("probe_limit_mb")
     spent = f"; доп. проверки за сутки {media.get('probe_mb')} из {limit} МБ" if limit else ""
     return "YouTube: отдельный выход для видео — " + (

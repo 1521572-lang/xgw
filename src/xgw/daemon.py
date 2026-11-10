@@ -4192,6 +4192,47 @@ class Daemon:
         return {**self._media_view, "probe_mb": round(spent / speed.MB, 1),
                 "probe_limit_mb": self.cfg.media.youtube_daily_probe_mb}
 
+    def _media_candidates(
+        self, view: list[NodeInfo], observatory: dict, wall: float, *, sign: str = "",
+    ) -> list[tuple[NodeInfo, float]]:
+        return youtube.media_candidates(
+            view, self._youtube_records(), observatory, self._prices(), wall,
+            min_mbps=self.cfg.speed.youtube_mbps,
+            sample_ttl=self.cfg.media.youtube_sample_ttl_minutes * 60.0, sign=sign,
+        )
+
+    def _youtube_sign_step(
+        self, view: list[NodeInfo], applied: dict, observatory: dict, password: str, wall: float,
+    ) -> bool:
+        """Одна фоновая проверка допуска вместо обычной проверки запасного сервера."""
+        media = self.cfg.media
+        key = youtube.sign_key(media.youtube_sign_url)
+        if (not key or media.youtube_mode != "best" or not self.cfg.speed.youtube_mbps
+                or traffic.whole_house(self.cfg)):
+            return False
+        budget = self._media_budget(wall)
+        if budget["bytes"] + youtube.SIGN_MAX_BYTES > media.youtube_daily_probe_mb * speed.MB:
+            return False
+        candidates = self._media_candidates(view, observatory, wall)
+        current = builder.applied_media(applied)
+        ordered = [info for info, _ in candidates if info.tag in current]
+        ordered.extend(info for info, _ in candidates[:youtube.SIGN_TOP] if info.tag not in current)
+        records = self._youtube_records()
+        info = next((info for info in ordered
+                     if youtube.sign_sample(records[info.fingerprint], key, wall) is None), None)
+        if info is None:
+            return False
+        verdict, used = youtube.check_sign(info, self.cfg, probe_pass=password, cancel=self._stop)
+        self._youtube_ran = True
+        self._youtube_bg_at = wall
+        self._youtube_own = (info.tag, used)
+        budget["bytes"] += used
+        self.store.set_meta(MEDIA_BUDGET_META, json.dumps(budget, sort_keys=True))
+        if verdict != youtube.CANCELLED:
+            records[info.fingerprint]["sign"] = {"state": verdict, "ts": wall, "key": key}
+            self.store.set_meta(YOUTUBE_META, json.dumps(records, sort_keys=True))
+        return True
+
     def _youtube_step(
         self, view: list[NodeInfo], applied: dict, observatory: dict, now: float,
     ) -> None:
@@ -4221,7 +4262,8 @@ class Daemon:
         extra = False
         if current:
             target = current[0]
-        elif wall - self._youtube_bg_at < YOUTUBE_GAP:
+        elif (wall - self._youtube_bg_at < YOUTUBE_GAP
+              or self._youtube_sign_step(view, applied, observatory, password, wall)):
             return
         elif targets:
             target = min(targets, key=oldest)
@@ -4250,6 +4292,9 @@ class Daemon:
             (records.get(key) or {}).get("fails") or 0) + 1
         record = {"state": verdict.state, "fails": fails, "mbps": verdict.mbps,
                   "error": verdict.error, "ts": wall}
+        sign = (records.get(key) or {}).get("sign")
+        if sign is not None:
+            record["sign"] = sign
         if client >= 0.1:
             record["client"] = round(client, 1)
         records[key] = record
@@ -4279,10 +4324,10 @@ class Daemon:
             return "pool_all", ()
         if not measuring.youtube or not measuring.youtube_mbps:
             return "disabled_no_measurements", ()
-        candidates = youtube.media_candidates(
-            view, self._youtube_records(), observatory, self._prices(), wall,
-            min_mbps=measuring.youtube_mbps, sample_ttl=media.youtube_sample_ttl_minutes * 60.0,
-        )
+        sign = youtube.sign_key(media.youtube_sign_url)
+        candidates = self._media_candidates(view, observatory, wall, sign=sign)
+        if not candidates and sign and self._media_candidates(view, observatory, wall):
+            return "waiting_for_acceptance", ()
         plan = youtube.media_plan(candidates, saved, gain_pct=measuring.gain_pct)
         # Лучший нашёлся, а прежний годен: плановая смена — не чаще hold. Негодный уходит сразу.
         held = (saved and plan != saved
@@ -4312,9 +4357,16 @@ class Daemon:
                 return
             self._media_changed_at = wall
             self._media_retry_at = 0.0
-            self.notifier.event("youtube", (
-                f"новые соединения видео YouTube идут через {wanted[0]}" if wanted
-                else "видео YouTube идёт общим маршрутом"))
+            message = (f"новые соединения видео YouTube идут через {wanted[0]}" if wanted
+                       else "видео YouTube идёт общим маршрутом")
+            sign = youtube.sign_key(self.cfg.media.youtube_sign_url)
+            if sign and state in ("best", "waiting_for_acceptance") and any(
+                info.tag in saved and info.tag not in wanted
+                and youtube.sign_sample(self._youtube_records().get(info.fingerprint) or {},
+                                        sign, wall) == youtube.REFUSE for info in view
+            ):
+                message = "На прежнем выходе YouTube потребовал вход. " + message
+            self.notifier.event("youtube", message)
         if current != wanted:
             state = "degraded" if wall - self._media_changed_at > MEDIA_RETRY else "applying"
         elif wanted and not self._media_confirmed(wanted, now):
@@ -4371,12 +4423,15 @@ class Daemon:
     ) -> list[dict]:
         """Откуда взят выбор — для статуса: косвенный замер файла Google, а не скорость видео."""
         records = self._youtube_records()
+        sign = youtube.sign_key(self.cfg.media.youtube_sign_url)
         samples = []
         for info in view:
             record = records.get(info.fingerprint)
             if info.tag in tags and record is not None:
                 samples.append({"tag": info.tag, "mbps": record.get("mbps"),
                                 "age_s": round(max(0.0, wall - float(record.get("ts") or 0)))})
+                if sign:
+                    samples[-1]["sign"] = youtube.sign_sample(record, sign, wall) or youtube.UNKNOWN
         return samples
 
     def _youtube_check(self, info: NodeInfo, password: str, *, client: float,

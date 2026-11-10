@@ -420,6 +420,21 @@ def test_media_is_off_by_default_and_best_is_accepted(tmp_path):
     assert cfg.media.youtube_mode == "best" and warnings == []
 
 
+@pytest.mark.parametrize(("url", "valid"), [
+    ("https://www.youtube.com/watch?v=fixture", True),
+    ("https://www.youtube.com/watch", False),
+    ("https://www.youtube.com:444/watch?v=fixture", False),
+    ("https://www.youtube.com@elsewhere.test/watch?v=fixture", False),
+    ("http://www.youtube.com/watch?v=fixture", False),
+])
+def test_media_sign_url_only_accepts_https_watch_pages(url, valid):
+    media = Media(youtube_sign_url=url)
+    warnings = _validate_media(media)
+    assert media.youtube_sign_url == (url if valid else "")
+    assert bool(warnings) is not valid
+    assert all(url not in warning for warning in warnings)
+
+
 @pytest.mark.parametrize("mode", ["spread", "fast", ""])
 def test_media_unknown_or_future_mode_is_off(tmp_path, mode):
     cfg, warnings = _media(tmp_path, f'[media]\nyoutube_mode = "{mode}"\n')

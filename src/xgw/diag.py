@@ -410,8 +410,20 @@ class Diag:
         if problems:
             return [Check("YouTube", WARN, "; ".join(problems), "sudo xgw apply --now")]
         tags = builder.applied_media(applied)
+        media = {}
+        if self.cfg.media.youtube_mode == "best" and self.cfg.media.youtube_sign_url:
+            snapshot = engine.read_json(self.paths.status_file) or {}
+            media = snapshot.get("media") or {}
         if tags:
-            return [Check("YouTube", OK, "отдельный выход для видео: " + ", ".join(tags))]
+            signs = {sample.get("tag"): sample.get("sign") for sample in media.get("samples") or []}
+            text = "отдельный выход для видео: " + ", ".join(tags)
+            if media:
+                text += ", допуск: " + ", ".join(
+                    status.MEDIA_SIGN.get(signs.get(tag), status.MEDIA_SIGN["unknown"])
+                    for tag in tags)
+            return [Check("YouTube", OK, text)]
+        if media.get("state") == "waiting_for_acceptance":
+            return [Check("YouTube", WARN, status.MEDIA_STATES["waiting_for_acceptance"])]
         return []
 
     def _xray_api(self) -> list[Check]:

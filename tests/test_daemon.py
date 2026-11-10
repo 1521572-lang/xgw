@@ -3314,6 +3314,43 @@ def test_media_hold_blocks_a_planned_change_but_not_a_bad_server(daemon):
     assert daemon._media_wanted(view, observatory, (first,), wall) == ("best", (second,))
 
 
+def test_media_sign_refusal_changes_exit_before_hold_and_is_scoped_to_page(daemon, monkeypatch):
+    from xgw.watch import youtube
+
+    _started(daemon)
+    view, observatory, members = _media_ready(daemon)
+    first, second = members[:2]
+    daemon.cfg.media.youtube_sign_url = "https://www.youtube.com/watch?v=fixture"
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (first.tag,)
+    daemon._youtube_bg_at = 0
+    asked = []
+
+    def check(info, cfg, **kwargs):
+        asked.append(info.tag)
+        return youtube.REFUSE, 330_000
+
+    monkeypatch.setattr(youtube, "check_sign", check)
+    daily_limit = daemon.cfg.media.youtube_daily_probe_mb
+    daemon.cfg.media.youtube_daily_probe_mb = 0
+    daemon._youtube_step(view, applied, observatory, daemon.t)
+    assert not asked
+    daemon.cfg.media.youtube_daily_probe_mb = daily_limit
+    daemon._youtube_step(view, applied, observatory, daemon.t)
+    assert asked == [first.tag]
+    assert daemon._media_budget(daemon.t)["bytes"] == 330_000
+    record = json.loads(daemon.store.get_meta("youtube"))[first.fingerprint]
+    assert record["sign"]["state"] == youtube.REFUSE and record["state"] == OK
+    applied = _media_run(daemon, view, observatory)
+    assert builder.applied_media(applied) == (second.tag,)
+    assert any("YouTube потребовал вход" in event for event in daemon.events())
+    assert daemon._media_view["samples"][0]["sign"] == youtube.UNKNOWN
+    assert youtube.sign_sample(record, record["sign"]["key"],
+                               daemon.t + youtube.SIGN_TTL) is None
+    daemon.cfg.media.youtube_sign_url += "2"
+    assert daemon._media_wanted(view, observatory, (), daemon.t) == ("best", (first.tag,))
+
+
 def test_media_exit_is_checked_like_a_carrier(daemon):
     _started(daemon)
     view, observatory, members = _media_ready(daemon)

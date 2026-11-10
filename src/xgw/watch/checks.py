@@ -77,6 +77,7 @@ def http_get_via_proxy(
     rtt: bool = False,
     range_end: int = 0,
     min_body: int = 0,
+    accept_gzip: bool = False,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -100,8 +101,11 @@ def http_get_via_proxy(
     разы — у «польша 2» 340–470 мс при RTT 40–60.
     `range_end` — сколько байт тела просить (Range: bytes=0-…, ответ 206); 0 — весь файл.
     Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
+    `accept_gzip` — запросить сжатое тело; распаковка остаётся у вызывающего.
     """
-    ranged = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
+    headers = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
+    if accept_gzip:
+        headers["Accept-Encoding"] = "gzip"
     user_agent = pick_agent(user_agent)  # один UA на соединение: и GET, и HEAD по нему
     parts = urlsplit(url)
     host = parts.hostname
@@ -151,7 +155,7 @@ def http_get_via_proxy(
             if parts.query:
                 path = f"{path}?{parts.query}"
             request = _request(
-                "GET", path, {"Host": _host_header(host, port, 443), **ranged}, user_agent,
+                "GET", path, {"Host": _host_header(host, port, 443), **headers}, user_agent,
                 keep_alive=rtt,
             )
         else:
@@ -160,7 +164,7 @@ def http_get_via_proxy(
             except OSError as exc:  # в т. ч. таймаут: локальный inbound недоступен
                 return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}",
                                       phase=phase)
-            headers = {"Host": _host_header(host, port, 80), **ranged}
+            headers["Host"] = _host_header(host, port, 80)
             if proxy_user:
                 token = base64.b64encode(f"{proxy_user}:{proxy_pass}".encode()).decode("ascii")
                 headers["Proxy-Authorization"] = f"Basic {token}"
@@ -270,7 +274,7 @@ def _request(
 ) -> bytes:
     lines = [f"{method} {target} HTTP/1.1"]
     lines.extend(f"{key}: {value}" for key, value in headers.items())
-    # Без Accept-Encoding: тело нужно целиком, несжатым — по нему считается размер пробы.
+    # Замеры скорости не запрашивают сжатие: по телу считается размер пробы.
     agent = user_agent if user_agent and user_agent.isprintable() else pick_agent()
     connection = "keep-alive" if keep_alive else "close"
     lines.extend(["User-Agent: " + agent, "Accept: */*", f"Connection: {connection}"])

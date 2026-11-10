@@ -1,6 +1,7 @@
 """Проверка YouTube через сервер (М3, watch/youtube.py): доступность сайта и видеосети, скорость
 с серверов Google вместе с трафиком клиентов, ключи speed.youtube_*."""
 
+import gzip
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,30 @@ NODE = SimpleNamespace(tag="proxy-de-aaaa", probe_port=20001)
 SITE, VIDEO = config.DEFAULT_YOUTUBE_URLS
 FILE = config.DEFAULT_YOUTUBE_SPEED_URL
 ANSWER = DownloadResult(ok=True, status=204)
+
+
+@pytest.mark.parametrize(("code", "kind", "status", "expected"), [
+    (200, "", b"OK", youtube.ACCEPT),
+    (200, "", b"LOGIN_REQUIRED", youtube.REFUSE),
+    (200, "", b"UNPLAYABLE", youtube.UNKNOWN),
+    (200, "cancelled", b"LOGIN_REQUIRED", youtube.CANCELLED),
+    (302, "http", b"LOGIN_REQUIRED", youtube.UNKNOWN),
+])
+def test_sign_reads_bounded_page_through_authenticated_probe(monkeypatch, code, kind, status,
+                                                       expected):
+    cfg = Config()
+    cfg.media.youtube_sign_url = "https://www.youtube.com/watch?v=fixture"
+    body = gzip.compress(b'{"playabilityStatus":{"status":"' + status + b'"}}')
+
+    def get(host, port, url, **kwargs):
+        assert (host, port, url) == ("127.0.0.1", NODE.probe_port, cfg.media.youtube_sign_url)
+        assert kwargs["proxy_pass"] == "fixture-pass"
+        assert kwargs["accept_gzip"] and kwargs["max_bytes"] == kwargs["keep_body"]
+        return DownloadResult(code == 200, downloaded=len(body), status=code, kind=kind, body=body)
+
+    monkeypatch.setattr(youtube, "http_get_via_proxy", get)
+    assert youtube.check_sign(NODE, cfg, probe_pass="fixture-pass") == (
+        expected, len(body) + youtube.HANDSHAKE_BYTES)
 
 
 def _fake(monkeypatch, results: dict[str, DownloadResult]) -> list[tuple[str, int]]:

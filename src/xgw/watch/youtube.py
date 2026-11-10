@@ -26,7 +26,10 @@ YouTube, у Google — плохая связность с его сетью ил
 
 from __future__ import annotations
 
+import hashlib
+import re
 import threading
+import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
@@ -56,6 +59,14 @@ HANDSHAKE_BYTES = 8_000
 # Больше одна проверка потратить не может: файл замера, запасной файл и служебные запросы.
 # По этой оценке суточный лимит дополнительных проверок не превышается (п. 353).
 CHECK_MAX_BYTES = int(2 * SPEED_MB * MB) + 16 * HANDSHAKE_BYTES
+# Признак допуска — отдельная проба в том же бюджете. Запас на последний блок чтения
+# и заголовки: клиент останавливается после получения блока, а не посреди него.
+SIGN_BODY_BYTES = 2 * 1024 * 1024
+SIGN_MAX_BYTES = SIGN_BODY_BYTES + 2 * 65536 + HANDSHAKE_BYTES
+SIGN_TTL = 6 * 3600
+SIGN_TOP = 3
+ACCEPT, REFUSE = "accept", "refuse"
+_PLAYER_STATUS = re.compile(rb'"playabilityStatus"\s*:\s*\{\s*"status"\s*:\s*"([A-Z_]+)"\s*[,}]')
 
 
 @dataclass(frozen=True)
@@ -64,6 +75,46 @@ class Verdict:
     mbps: float | None = None  # своя загрузка с серверов Google; None — не замерялась
     bytes_used: int = 0
     error: str = ""
+
+
+def sign_key(url: str) -> str:
+    """Запись допуска относится к одному адресу пробы, который в базе не сохраняется."""
+    return hashlib.sha256(url.encode()).hexdigest() if url else ""
+
+
+def sign_sample(record: dict, key: str, now: float) -> str | None:
+    """Свежий итог допуска; None — для этого адреса пора проверить снова."""
+    sample = record.get("sign")
+    if key and isinstance(sample, dict) and sample.get("key") == key:
+        stamp, state = sample.get("ts"), sample.get("state")
+        if (isinstance(stamp, (float, int)) and 0 <= now - stamp < SIGN_TTL
+                and state in (ACCEPT, REFUSE, UNKNOWN)):
+            return state
+    return None
+
+
+def check_sign(node: NodeInfo, cfg: Config, *, probe_pass: str,
+               cancel: threading.Event | None = None) -> tuple[str, int]:
+    """Допуск по странице ролика через служебный вход: итог и оценка расхода."""
+    result = http_get_via_proxy(
+        "127.0.0.1", node.probe_port, cfg.media.youtube_sign_url, timeout=8, max_total=8,
+        proxy_user=PROBE_USER, proxy_pass=probe_pass, user_agent=cfg.probe.user_agent,
+        keep_body=SIGN_BODY_BYTES, max_bytes=SIGN_BODY_BYTES, accept_gzip=True, cancel=cancel,
+    )
+    used = result.downloaded + HANDSHAKE_BYTES
+    if result.kind == "cancelled":
+        return CANCELLED, used
+    if result.status != 200:
+        return UNKNOWN, used
+    body = result.body
+    if body.startswith(b"\x1f\x8b"):
+        try:
+            body = zlib.decompressobj(31).decompress(body, SIGN_BODY_BYTES)
+        except zlib.error:
+            return UNKNOWN, used
+    match = _PLAYER_STATUS.search(body)
+    state = match[1] if match else b""
+    return {b"OK": ACCEPT, b"LOGIN_REQUIRED": REFUSE}.get(state, UNKNOWN), used
 
 
 def google(url: str) -> bool:
@@ -174,6 +225,7 @@ def _host_label(url: str) -> str:
 def media_candidates(
     nodes: Sequence[NodeInfo], records: Mapping[str, dict], observatory: Mapping[str, dict],
     prices: Mapping[str, float], now: float, *, min_mbps: float, sample_ttl: float,
+    sign: str = "",
 ) -> list[tuple[NodeInfo, float]]:
     """Кто может быть выходом видео (п. 348), лучшие первыми: (узел, скорость). Только живой
     безлимитный участник с полным отпечатком и со свежим удачным замером; нет данных — не
@@ -189,7 +241,8 @@ def media_candidates(
                 or not entry.get("alive") or price is None or price > 0
                 or record.get("state") != OK or record.get("fails")
                 or not isinstance(mbps, int | float) or isinstance(mbps, bool)
-                or now - float(record.get("ts") or 0) > sample_ttl):
+                or now - float(record.get("ts") or 0) > sample_ttl
+                or sign_sample(record, sign, now) == REFUSE):
             continue
         total = mbps + (client if isinstance(client, int | float) and client > 0 else 0.0)
         if total >= min_mbps:

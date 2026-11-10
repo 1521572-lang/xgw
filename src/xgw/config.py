@@ -403,6 +403,7 @@ class Media:
     # в сутки на них можно потратить; 0 — только обычные проверки [speed].
     youtube_check_minutes: int = 60
     youtube_daily_probe_mb: int = 256
+    youtube_sign_url: str = ""  # HTTPS-страница ролика для проверки допуска в best
 
 
 # Ещё шифрованные резолверы для bootstrap-DNS (0.1.18, ТЗ R4a; 0.2.0): другие операторы и
@@ -1216,6 +1217,21 @@ def _validate_media(media: Media) -> list[str]:
         warnings.append(f"media.youtube_daily_probe_mb={media.youtube_daily_probe_mb}: ожидается "
                         "0–10000 — используется 256")
         media.youtube_daily_probe_mb = 256
+    url = media.youtube_sign_url
+    if url:
+        try:
+            parts = urlsplit(url)
+            valid = (url.isascii() and all(32 < ord(char) < 127 for char in url)
+                     and not any(char in url for char in "#\\")
+                     and parts.scheme == "https" and parts.netloc.lower() in (
+                         "www.youtube.com", "www.youtube.com:443", "youtube.com", "youtube.com:443")
+                     and parts.path == "/watch" and bool(parse_qs(parts.query).get("v")))
+        except ValueError:
+            valid = False
+        if not valid:
+            warnings.append("media.youtube_sign_url: нужна HTTPS-страница ролика YouTube "
+                            "с параметром v — проверка допуска выключена")
+            media.youtube_sign_url = ""
     return warnings
 
 
