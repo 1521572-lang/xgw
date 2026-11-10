@@ -61,14 +61,14 @@ def test_loop_and_hop_limit_are_bounded(loop):
     h.controller._request = request
     _, url, hops, reason = h.controller._control(
         h.cfg, h.cfg.zapret2.probe_urls[1], 1234, "secret", "agent", None)
-    assert len(calls) == (1 if loop else 3)
-    assert hops == (0 if loop else 2) and reason == ("loop" if loop else "limit")
+    assert len(calls) == (1 if loop else 6)
+    assert hops == (0 if loop else 5) and reason == ("loop" if loop else "hop_limit")
     assert url == calls[-1]
 
 
 def test_redirects_share_one_time_budget(monkeypatch):
     h = Harness()
-    times = iter([10, 10, 17, 19])
+    times = iter([10, 10, 17, 17, 19])
     monkeypatch.setattr(z.time, "monotonic", lambda: next(times))
     limits = []
 
@@ -81,4 +81,34 @@ def test_redirects_share_one_time_budget(monkeypatch):
     result, url, hops, reason = h.controller._control(
         h.cfg, h.cfg.zapret2.probe_urls[1], 1234, "secret", "agent", None)
     assert limits == [8, 1] and result.status == 302
-    assert url.endswith("/next1") and hops == 1 and reason == "limit"
+    assert url.endswith("/next1") and hops == 1 and reason == "time_limit"
+
+
+def test_fifth_redirect_can_load_body_and_is_shared_with_direct():
+    h = Harness()
+    h.cfg.zapret2.probe_urls = [h.cfg.zapret2.probe_urls[1]]
+    calls = []
+
+    def request(url, port, *args, **kwargs):
+        calls.append((url, port))
+        if len(calls) <= 5:
+            return DownloadResult(False, status=302, kind="http", phase="headers",
+                                  location=f"/next{len(calls)}")
+        return DownloadResult(True, status=200, phase="body", downloaded=32768)
+
+    h.controller._request = request
+    rows = h.controller._compare(h.cfg, h.current, 1234, None)
+    assert len(calls) == 7 and calls[-1][0] == calls[-2][0]
+    assert rows[0]["redirects"] == 5 and rows[0]["redirect"] == "followed"
+    assert all(row["ok"] for row in rows)
+
+
+def test_full_chain_reservation_precedes_requests():
+    h = Harness()
+    h.cfg.zapret2.mode = "compare"
+    h.cfg.zapret2.daily_probe_mb = 3
+    assert not h.controller._budget(h.cfg)
+    assert h.controller.store.get_meta(z.BUDGET) is None
+    h.cfg.zapret2.daily_probe_mb = 4
+    assert h.controller._budget(h.cfg)
+    assert json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"] == 14 * z.PROBE_CHARGE

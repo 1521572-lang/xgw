@@ -117,8 +117,9 @@ def compare_report(value):
             raise ValueError("invalid_comparison")
         pairs.add((n, path))
         hops, redirect = row.get("redirects", 0), row.get("redirect", "none")
-        if (type(hops) is not int or not 0 <= hops <= 2
-                or redirect not in ("none", "followed", "blocked", "loop", "limit")):
+        if (type(hops) is not int or not 0 <= hops <= 5
+                or redirect not in ("none", "followed", "blocked", "loop", "limit",
+                                    "hop_limit", "time_limit")):
             raise ValueError("invalid_redirect")
         print(f"PROBE n={n} path={path} phase={phase} kind={kind} http={http} "
               f"connect_http={connect} bytes={size} ok={int(ok)} "

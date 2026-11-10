@@ -249,7 +249,7 @@ def test_compare_runs_both_pairs_without_enabling_client_route(monkeypatch, dire
     assert not h.runtime.up and h.runtime.events[-1] == ("stop", 0)
     assert all(not enabled for action, enabled in h.runtime.events if action == "apply")
     assert ("gate", 45) in h.runtime.events
-    assert json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"] == 8 * z.PROBE_CHARGE
+    assert json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"] == 14 * z.PROBE_CHARGE
     rows = h.controller.view["probes"]
     assert [(row["probe"], row["path"], row["ok"]) for row in rows] == [
         (1, "vpn", True), (1, "zapret2", direct_ok), (2, "vpn", True), (2, "zapret2", direct_ok)

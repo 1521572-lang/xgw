@@ -35,6 +35,7 @@ BUDGET = "zapret2_probe_budget"
 PROBE_BYTES = 64 * 1024
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
+REDIRECT_LIMIT = 5
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
@@ -314,7 +315,7 @@ class Controller:
             return False  # повреждённый учёт не превращается в бесплатный бюджет
         charge = len(cfg.zapret2.probe_urls) * PROBE_CHARGE
         if cfg.zapret2.mode == "compare":
-            charge *= 4  # VPN: исходный GET + до двух переходов; прямой: конечный адрес
+            charge *= REDIRECT_LIMIT + 2  # исходный GET, переходы VPN и один прямой GET
         if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
             return False
         self.store.set_meta(BUDGET, json.dumps({"day": day, "bytes": spent + charge}))
@@ -344,7 +345,7 @@ class Controller:
         return True
 
     def _control(self, cfg: Config, url: str, port: int, password: str, agent: str, cancel):
-        """До двух разрешённых переходов VPN за общий срок 8 с; URL остаётся приватным."""
+        """До пяти разрешённых переходов VPN за общий срок 8 с; URL остаётся приватным."""
         from .watch.checks import DownloadResult
 
         deadline = time.monotonic() + 8
@@ -355,9 +356,11 @@ class Controller:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 result = last_result or DownloadResult(False, kind="timeout", phase="connect")
-                return result, last_url, last_hops, "limit"
+                return result, last_url, last_hops, "time_limit"
             result = self._request(url, port, password, agent, cancel, max_total=remaining)
             last_result, last_url, last_hops = result, url, hops
+            if not result.ok and time.monotonic() >= deadline:
+                return result, url, hops, "time_limit"
             if result.phase == "connect" or result.status not in (301, 302, 303, 307, 308):
                 return result, url, hops, redirect
             try:
@@ -381,8 +384,8 @@ class Controller:
                 return result, url, hops, "blocked"
             if target in seen:
                 return result, url, hops, "loop"
-            if hops == 2:
-                return result, url, hops, "limit"
+            if hops == REDIRECT_LIMIT:
+                return result, url, hops, "hop_limit"
             seen.add(target)
             url, hops, redirect = target, hops + 1, "followed"
 
