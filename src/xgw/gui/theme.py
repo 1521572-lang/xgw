@@ -1,7 +1,7 @@
 """Светлая тема окна XGW (единственная): палитра Qt и одна таблица стилей (QSS) по токенам цвета.
 
-Вид — как у современных VPN-клиентов: крупный знак защиты с подсветкой цветом состояния,
-карточки со скруглением вместо таблиц, узкая навигация со значками.
+Вид следует Proton VPN для Windows: спокойные строки, крупная кнопка подключения,
+карта с отметкой страны, боковая панель быстрых действий и карточки сведений о серверах.
 
 Палитра — Proton Light (веб-интерфейс Proton): белые поверхности, пурпурный акцент
 #6D4AFF, сигнальные цвета с затемнением под контраст на белом. Выбор «системная/тёмная»
@@ -94,32 +94,38 @@ def stylesheet(c: dict[str, str]) -> str:
 QMainWindow, QWidget#page, QScrollArea {{ background: {c['bg']}; }}
 QWidget {{ color: {c['text']}; }}
 QWidget#rail {{ background: {c['nav']}; border-right: 1px solid {c['border']}; }}
+QLabel#brand {{ color: {c['accent']}; font-size: 18pt; font-weight: 700; }}
 QToolButton#navButton {{
-    color: {c['muted']}; background: transparent; border: none; border-radius: 12px;
-    padding: 8px 2px; font-size: 9.5pt;
+    color: {c['muted']}; background: transparent; border: none; border-radius: 8px;
+    padding: 8px 12px; font-size: 10.5pt; text-align: left;
 }}
 QToolButton#navButton:hover {{ background: {c['surface2']}; color: {c['text']}; }}
 QToolButton#navButton:checked {{ background: {c['selected']}; color: {c['text']};
     font-weight: 600; }}
 QToolButton#navButton:focus {{ border: 2px solid {c['focus']}; }}
 QToolButton#navButton::menu-indicator {{ image: none; width: 0; }}
-QFrame#conn {{ background: {c['panel']}; border-right: 1px solid {c['border']}; }}
+QFrame#conn {{ background: {c['panel']}; border-left: 1px solid {c['border']};
+    border-right: 1px solid {c['border']}; }}
+QFrame#quick {{ background: {c['panel']}; }}
+QLabel#quickTitle {{ color: {c['muted']}; font-size: 7.5pt; font-weight: 700;
+    qproperty-alignment: AlignCenter; }}
+QToolButton#quickButton {{ color: {c['muted']}; background: transparent;
+    border: 1px solid transparent; border-radius: 12px; padding: 10px 2px; font-size: 9pt; }}
+QToolButton#quickButton:hover {{ background: {c['surface2']}; color: {c['text']};
+    border-color: {c['border']}; }}
+QToolButton#quickButton:focus {{ border: 2px solid {c['focus']}; }}
 QFrame#card, QFrame#alert {{
     background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 14px;
 }}
 QFrame#alert {{ border-radius: 12px; }}
 QFrame#metric {{
-    background: {mix(c['surface2'], c['panel'], 0.7)}; border: 1px solid {c['border']};
-    border-radius: 12px;
+    background: {mix(c['surface2'], c['panel'], 0.7)}; border: none; border-radius: 8px;
 }}
-QFrame#row {{
-    background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 12px;
-}}
-QFrame#row:hover {{ border-color: {mix(c['accent'], c['border'], 0.5)}; }}
-QFrame#row[main="true"] {{ border: 2px solid {c['accent']};
-    background: {mix(c['accent'], c['surface'], 0.07)}; }}
+QFrame#row {{ background: transparent; border: 1px solid transparent; border-radius: 8px; }}
+QFrame#row:hover {{ background: {c['surface2']}; border-color: transparent; }}
+QFrame#row[main="true"] {{ border: 1px solid {c['accent']}; background: {c['selected']}; }}
 QLabel#shieldWord {{ font-size: 10pt; font-weight: 700; }}
-QLabel#heroTitle {{ font-size: 20pt; font-weight: 700; }}
+QLabel#heroTitle {{ font-size: 22pt; font-weight: 700; }}
 QLabel#pageTitle {{ font-size: 16pt; font-weight: 700; }}
 QLabel#serverName {{ font-size: 12pt; font-weight: 600; }}
 QLabel#rowName, QLabel#rowSpeed {{ font-size: 11.5pt; font-weight: 600; }}
@@ -152,7 +158,7 @@ QPushButton#primary, QPushButton#connect[tone="off"] {{
     font-weight: 700;
 }}
 QPushButton#connect {{
-    font-size: 12pt; font-weight: 700; padding: 12px 22px; border-radius: 24px;
+    font-size: 12pt; font-weight: 700; padding: 12px 22px; border-radius: 8px;
     min-height: 24px;
 }}
 QPushButton#connect[tone="on"] {{
@@ -187,7 +193,7 @@ QScrollBar::handle:vertical {{ background: {c['border']}; border-radius: 4px; mi
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QStatusBar {{ background: {c['bg']}; color: {c['muted']}; border-top: 1px solid {c['border']}; }}
 QToolTip {{ background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']};
-    padding: 4px 8px; }}
+    border-radius: 12px; padding: 12px 14px; font-size: 10pt; }}
 """
 
 

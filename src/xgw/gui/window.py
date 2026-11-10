@@ -1,6 +1,6 @@
-"""Главное окно XGW: узкая навигация со значками слева и страницы. «Обзор» устроен как у
-современных VPN-клиентов: слева панель подключения (знак защиты, сервер в работе, крупные
-метрики, большая кнопка VPN), справа — список серверов карточками.
+"""Главное окно XGW: навигация слева и страницы. «Обзор» следует компоновке Proton VPN:
+список серверов слева, карта и большая кнопка подключения в центре, быстрые разделы справа.
+При наведении на сервер появляется карточка с его фактическими параметрами.
 
 Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на каждом опросе,
 поэтому фокус, выделение и прокрутка не сбиваются.
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QFrame,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +39,7 @@ from .widgets import (
     NavRail,
     ServerList,
     ShieldOrb,
+    icon,
     label,
     set_text,
     tone,
@@ -54,7 +56,8 @@ SECTIONS = (
 )
 MIN_SIZE = (1024, 720)
 START_SIZE = (1440, 900)
-CONN_WIDTH = (360, 400)  # панель подключения: в узком окне и в широком
+SERVERS_WIDTH = (340, 380)
+QUICK_WIDTH = 132
 WIDE = 1200
 
 
@@ -140,7 +143,7 @@ class LoginPage(QWidget):
 
 
 class OverviewPage(QWidget):
-    """«Обзор»: панель подключения слева, серверы и защита сети справа."""
+    """Серверы слева, карта и подключение в центре, быстрые разделы справа."""
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__()
@@ -149,39 +152,64 @@ class OverviewPage(QWidget):
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self._connection())
-        outer.addWidget(self._servers(), 1)
+        self.server_panel = self._servers()
+        self.server_panel.setFixedWidth(SERVERS_WIDTH[1])
+        outer.addWidget(self.server_panel)
+        outer.addWidget(self._connection(), 1)
+        outer.addWidget(self._quick_settings())
+
+    def _quick_settings(self) -> QWidget:
+        self.quick = QFrame()
+        self.quick.setObjectName("quick")
+        self.quick.setFixedWidth(QUICK_WIDTH)
+        box = QVBoxLayout(self.quick)
+        box.setContentsMargins(10, 28, 10, 16)
+        box.setSpacing(8)
+        box.addWidget(label("БЫСТРЫЙ ДОСТУП", name="quickTitle", wrap=False))
+        box.addSpacing(8)
+        self.quick_buttons: dict[str, QToolButton] = {}
+        for key, title in SECTIONS[3:]:
+            button = QToolButton()
+            button.setObjectName("quickButton")
+            button.setText(title)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            button.setIcon(icon(key, theme.current()["muted"], theme.current()["accent"], 32))
+            button.setIconSize(QSize(32, 32))
+            button.setFixedHeight(86)
+            button.setAccessibleName(f"Открыть раздел «{title}»")
+            row = next(row for row, item in enumerate(SECTIONS) if item[0] == key)
+            button.clicked.connect(lambda _checked=False, row=row: self.main.nav.setCurrentRow(row))
+            box.addWidget(button)
+            self.quick_buttons[key] = button
+        box.addStretch(1)
+        return self.quick
 
     # --- панель подключения ---------------------------------------------------------------------
 
     def _connection(self) -> QWidget:
         self.conn = QFrame()
         self.conn.setObjectName("conn")
-        self.conn.setFixedWidth(CONN_WIDTH[1])
         box = QVBoxLayout(self.conn)
-        box.setContentsMargins(28, 26, 28, 18)
-        box.setSpacing(6)
+        box.setContentsMargins(24, 28, 24, 18)
+        box.setSpacing(7)
         self.word = label("", name="shieldWord", wrap=False)
         font = self.word.font()
         font.setLetterSpacing(font.SpacingType.AbsoluteSpacing, 1.4)
         self.word.setFont(font)
         self.word.setAccessibleName("Защита")
+        self.word.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(self.word)
         self.power_title = label("", name="heroTitle")
+        self.power_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(self.power_title)
         self.power_sub = label("", name="muted")
+        self.power_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(self.power_sub)
-        self.lifecycle = label("", name="small")
-        box.addWidget(self.lifecycle)
-        box.addStretch(1)
-        self.orb = ShieldOrb()
-        self.orb.setMaximumHeight(250)
-        box.addWidget(self.orb, 4)
-        box.addStretch(1)
 
         server = QHBoxLayout()
         server.setSpacing(12)
-        self.badge = Badge(40)
+        server.addStretch(1)
+        self.badge = Badge(44)
         server.addWidget(self.badge)
         names = QVBoxLayout()
         names.setSpacing(0)
@@ -190,9 +218,26 @@ class OverviewPage(QWidget):
         self.server_how = label("", name="small")
         names.addWidget(self.server_name)
         names.addWidget(self.server_how)
-        server.addLayout(names, 1)
+        server.addLayout(names)
+        server.addStretch(1)
         box.addLayout(server)
-        box.addSpacing(6)
+        box.addSpacing(8)
+
+        self.power = QPushButton("Включить VPN")
+        self.power.setObjectName("connect")
+        self.power.setMinimumHeight(50)
+        self.power.setMinimumWidth(250)
+        self.power.setMaximumWidth(330)
+        self.power.clicked.connect(self.main.toggle_power)
+        box.addWidget(self.power, 0, Qt.AlignmentFlag.AlignCenter)
+        self.power_why = label("")
+        self.power_why.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tone(self.power_why, "warn")
+        box.addWidget(self.power_why)
+
+        self.orb = ShieldOrb()
+        self.orb.setMaximumHeight(360)
+        box.addWidget(self.orb, 1)
 
         tiles = QHBoxLayout()
         tiles.setSpacing(8)
@@ -204,22 +249,17 @@ class OverviewPage(QWidget):
             tiles.addWidget(widget)
         box.addLayout(tiles)
         self.engine = label("", name="small")
+        self.engine.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(self.engine)
-        box.addSpacing(10)
-
-        self.power = QPushButton("Включить VPN")
-        self.power.setObjectName("connect")
-        self.power.setMinimumHeight(52)
-        self.power.clicked.connect(self.main.toggle_power)
-        box.addWidget(self.power)
-        self.power_why = label("")
-        tone(self.power_why, "warn")
-        box.addWidget(self.power_why)
-        box.addSpacing(8)
+        self.lifecycle = label("", name="small")
+        self.lifecycle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(self.lifecycle)
         self.versions = label("", name="small")
+        self.versions.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.versions.setAccessibleName("Версии")
         box.addWidget(self.versions)
         self.fresh = label("", name="small", wrap=False)
+        self.fresh.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.fresh.setAccessibleName("Обновление данных")
         box.addWidget(self.fresh)
         return self.conn
@@ -322,6 +362,7 @@ class OverviewPage(QWidget):
             set_text(self.lifecycle, _marked(line[0], line[1]))
 
         main = model.main_server(state)
+        self.orb.set_country(main.country if main is not None else "")
         if main is None:
             self.badge.show_country("", "")
             set_text(self.server_name, "Сервер не выбран" if state else "—")
@@ -606,6 +647,8 @@ class MainWindow(QMainWindow):
         """Значки рисуются цветом темы — после её смены их надо нарисовать заново."""
         colors = theme.current()
         self.nav.recolor(colors, {})
+        for key, button in self.overview.quick_buttons.items():
+            button.setIcon(icon(key, colors["muted"], colors["accent"], 32))
         self.servers.recolor()
         self.update()
 
@@ -631,7 +674,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.overview.conn.setFixedWidth(CONN_WIDTH[self.width() >= WIDE])
+        self.overview.server_panel.setFixedWidth(SERVERS_WIDTH[self.width() >= WIDE])
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)

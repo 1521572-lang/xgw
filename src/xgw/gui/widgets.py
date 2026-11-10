@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import html
+
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
@@ -17,6 +19,7 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QPolygonF,
     QRadialGradient,
 )
 from PyQt6.QtWidgets import (
@@ -33,7 +36,7 @@ from PyQt6.QtWidgets import (
 
 from . import model, theme
 
-RAIL_WIDTH = 116
+RAIL_WIDTH = 184
 
 
 def label(text: str = "", *, name: str = "", wrap: bool = True) -> QLabel:
@@ -63,6 +66,30 @@ def tip(widget: QWidget, text: str) -> None:
     подсказку, которую человек сейчас читает (отчёт gui-s3)."""
     if widget.toolTip() != text:
         widget.setToolTip(text)
+
+
+def server_details(name: str, *, flag: str = "", code: str = "", status: str = "",
+                   speed: str = "", delay: str = "", sub: str = "", note: str = "",
+                   main: bool = False) -> str:
+    """Карточка сервера при наведении: только сведения, уже полученные от шлюза."""
+    rows = [("Состояние", status), ("Скорость", speed), ("Задержка", delay),
+            ("Параметры", sub), ("Последний замер", note)]
+    if main:
+        rows.insert(0, ("Роль", "сервер в работе"))
+    colors = theme.current()
+    title = " ".join(part for part in (flag, name) if part)
+    if code and code != "XX":
+        title += f" · {code.upper()}"
+    body = []
+    for title_text, value in rows:
+        if not value or value == "—":
+            continue
+        body.append(f"<tr><td style='color:{colors['muted']}; padding:5px 18px 5px 0'>"
+                    f"{html.escape(title_text)}</td><td style='padding:5px 0'>"
+                    f"<b>{html.escape(value)}</b></td></tr>")
+    return (f"<html><body style='color:{colors['text']}'><div style='padding:4px'>"
+            f"<div style='font-size:14pt; padding-bottom:8px'><b>{html.escape(title)}</b></div>"
+            f"<table cellspacing='0' cellpadding='0'>{''.join(body)}</table></div></body></html>")
 
 
 class Elided(QLabel):
@@ -229,7 +256,7 @@ def icon(name: str, normal: str, active: str | None = None, size: int = 24) -> Q
 
 
 class NavRail(QWidget):
-    """Узкая панель разделов: значок и подпись под ним. API как у QListWidget для окна."""
+    """Панель разделов Proton: значок слева от подписи, спокойная плашка выбора."""
 
     currentRowChanged = pyqtSignal(int)
 
@@ -240,13 +267,14 @@ class NavRail(QWidget):
         self.setFixedWidth(RAIL_WIDTH)
         self.setAccessibleName("Разделы")
         self.box = QVBoxLayout(self)
-        self.box.setContentsMargins(8, 12, 8, 12)
-        self.box.setSpacing(4)
-        self.logo = QLabel()
+        self.box.setContentsMargins(14, 18, 14, 14)
+        self.box.setSpacing(6)
+        self.logo = QLabel("XGW")
+        self.logo.setObjectName("brand")
         self.logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.logo.setFixedHeight(48)
+        self.logo.setFixedHeight(52)
         self.box.addWidget(self.logo)
-        self.box.addSpacing(8)
+        self.box.addSpacing(12)
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
         self.buttons: list[QToolButton] = []
@@ -267,10 +295,10 @@ class NavRail(QWidget):
         button.setObjectName("navButton")
         button.setText(title)
         button.setToolTip(title)
-        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-        button.setIconSize(QSize(24, 24))
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button.setIconSize(QSize(22, 22))
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        button.setFixedHeight(68)
+        button.setFixedHeight(46)
         button.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # мышью — без рамки фокуса
         return button
 
@@ -300,56 +328,100 @@ class NavRail(QWidget):
 # --- знак защиты --------------------------------------------------------------------------------
 
 
+CONTINENTS = (
+    ((.05, .22), (.13, .12), (.27, .17), (.31, .29), (.25, .39), (.20, .42),
+     (.18, .55), (.12, .49), (.08, .36)),
+    ((.23, .56), (.31, .55), (.36, .64), (.33, .78), (.28, .94), (.24, .80)),
+    ((.43, .26), (.49, .20), (.58, .24), (.62, .34), (.55, .41), (.48, .37)),
+    ((.46, .43), (.56, .40), (.63, .50), (.60, .70), (.54, .88), (.48, .70)),
+    ((.57, .22), (.72, .13), (.91, .25), (.88, .44), (.79, .48), (.75, .65),
+     (.68, .59), (.61, .43)),
+    ((.76, .72), (.85, .68), (.92, .77), (.88, .89), (.78, .86)),
+    ((.33, .07), (.39, .06), (.41, .17), (.35, .20), (.31, .14)),
+)
+COUNTRY_POINTS = {
+    "AE": (.66, .55), "AR": (.29, .84), "AT": (.54, .34), "AU": (.84, .79),
+    "BE": (.50, .31), "BG": (.59, .40), "BR": (.32, .71), "CA": (.19, .28),
+    "CH": (.51, .35), "CL": (.27, .84), "CN": (.76, .40), "CY": (.61, .47),
+    "CZ": (.54, .32), "DE": (.52, .29), "DK": (.52, .23), "DZ": (.49, .45),
+    "EE": (.57, .23), "EG": (.58, .49), "ES": (.46, .40), "FI": (.57, .16),
+    "FR": (.48, .33), "GB": (.45, .26), "GR": (.58, .45), "HK": (.78, .50),
+    "HU": (.55, .35), "ID": (.78, .69), "IE": (.43, .26), "IL": (.61, .50),
+    "IN": (.71, .54), "IS": (.40, .15), "IT": (.53, .40), "JP": (.87, .40),
+    "KE": (.61, .63), "KR": (.82, .41), "LT": (.56, .27), "LV": (.57, .25),
+    "MA": (.44, .44), "MX": (.17, .51), "MY": (.75, .60), "NG": (.52, .59),
+    "NL": (.50, .28), "NO": (.51, .15), "NZ": (.91, .87), "PL": (.55, .29),
+    "PT": (.44, .40), "RO": (.58, .36), "RU": (.72, .22), "SE": (.54, .15),
+    "SG": (.76, .64), "SK": (.56, .33), "TH": (.74, .54), "TR": (.63, .44),
+    "TW": (.81, .48), "UA": (.60, .32), "US": (.19, .38), "VN": (.77, .53),
+    "ZA": (.56, .82),
+}
+
+
 class ShieldOrb(QWidget):
-    """Большой знак защиты: круги подсветки цветом состояния и щит со значком внутри."""
+    """Карта мира и знак защиты в приблизительной точке страны VPN-сервера."""
 
     def __init__(self) -> None:
         super().__init__()
         self.tone = "off"
-        self.setMinimumHeight(170)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setAccessibleName("Знак защиты")
+        self.country = ""
+        self.setMinimumHeight(210)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAccessibleName("Карта и знак защиты")
 
     def set_tone(self, value: str) -> None:
         if value != self.tone:
             self.tone = value
             self.update()
 
+    def set_country(self, value: str) -> None:
+        value = value.upper()
+        if value != self.country:
+            self.country = value
+            self.setAccessibleName("Карта и знак защиты" +
+                                   (f"; страна сервера {value}" if value in COUNTRY_POINTS else ""))
+            self.update()
+
+    def _map(self, painter: QPainter) -> None:
+        colors = theme.current()
+        painter.setPen(QPen(QColor(colors["border"]), 1.1))
+        painter.setBrush(QColor(colors["surface2"]))
+        for points in CONTINENTS:
+            polygon = QPolygonF([QPointF(x * self.width(), y * self.height())
+                                 for x, y in points])
+            painter.drawPolygon(polygon)
+
     def paintEvent(self, _event) -> None:
         colors = theme.current()
         color = QColor(colors.get(self.tone, colors["off"]))
-        side = min(self.width(), self.height())
-        center = QPointF(self.width() / 2, self.height() / 2)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        glow = QRadialGradient(center, side / 2)
-        for stop, alpha in ((0.0, 90), (0.55, 40), (1.0, 0)):
+        self._map(painter)
+        point = COUNTRY_POINTS.get(self.country, (.5, .5))
+        center = QPointF(self.width() * point[0], self.height() * point[1])
+        core = max(25.0, min(43.0, min(self.width(), self.height()) * .16))
+        glow = QRadialGradient(center, core * 3.6)
+        for stop, alpha in ((0.0, 105), (0.55, 45), (1.0, 0)):
             shade = QColor(color)
             shade.setAlpha(alpha if self.tone != "off" else alpha // 3)
             glow.setColorAt(stop, shade)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(glow)
-        painter.drawEllipse(center, side / 2, side / 2)
-        for share, alpha in ((0.40, 70), (0.31, 120)):
+        painter.drawEllipse(center, core * 3.6, core * 3.6)
+        for factor, alpha in ((2.7, 75), (1.9, 125)):
             ring = QColor(color)
             ring.setAlpha(alpha if self.tone != "off" else alpha // 2)
-            pen = QPen(ring)
-            pen.setWidthF(1.5)
-            painter.setPen(pen)
+            painter.setPen(QPen(ring, 1.5))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(center, side * share, side * share)
-        core = side * 0.22
+            painter.drawEllipse(center, core * factor, core * factor)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(center, core, core)
-        k = core * 1.25 / 24
-        painter.translate(center.x() - 12 * k, center.y() - 12 * k)
-        painter.scale(k, k)
-        mark = QColor(colors["panel"])
+        painter.translate(center.x() - core * .63, center.y() - core * .63)
+        painter.scale(core * 1.26 / 24, core * 1.26 / 24)
         path = QPainterPath()
         _shield(path)
-        pen = QPen(mark)
-        pen.setWidthF(1.9)
+        pen = QPen(QColor(colors["panel"]), 1.9)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
@@ -439,9 +511,9 @@ class ServerRowWidget(QFrame):
         box.setContentsMargins(12, 10, 14, 10)
         box.setSpacing(12)
         self.badge = Badge()
-        box.addWidget(self.badge)
+        box.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
         texts = QVBoxLayout()
-        texts.setSpacing(1)
+        texts.setSpacing(3)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.name = Elided(name="rowName")
@@ -450,18 +522,15 @@ class ServerRowWidget(QFrame):
         top.addWidget(self.name, 1)
         top.addWidget(self.main)
         texts.addLayout(top)
+        details = QHBoxLayout()
+        details.setSpacing(8)
         self.sub = Elided(name="small")
-        texts.addWidget(self.sub)
-        box.addLayout(texts, 1)
-        right = QVBoxLayout()
-        right.setSpacing(1)
+        details.addWidget(self.sub, 1)
         self.speed = label("", name="rowSpeed", wrap=False)
         self.speed.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.delay = label("", name="small", wrap=False)
-        self.delay.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right.addWidget(self.speed)
-        right.addWidget(self.delay)
-        box.addLayout(right)
+        details.addWidget(self.speed)
+        texts.addLayout(details)
+        box.addLayout(texts, 1)
         status = QVBoxLayout()
         status.setSpacing(3)
         self.dot = QLabel()
@@ -498,15 +567,15 @@ class ServerRowWidget(QFrame):
         self.is_main = row.main
         self._fit()
         set_text(self.speed, row.speed if row.speed != "—" else "")
-        set_text(self.delay, row.delay or ("нет замера" if row.speed == "—" else ""))
-        tip(self.delay, row.note)
         tip(self.speed, row.note)
         tone(self.dot, row.tone)
         set_text(self.state, f"{model.MARKS.get(row.tone, '')} {row.status}".strip())
-        # Слово состояния — подсказкой у всей правой колонки и у строки, а не только у точки
-        # в 10 пикселей: в узкой строке слова не видно (отчёт gui-s3: на точку не попали).
-        for widget in (self.dot, self.holder, self):
+        # В узкой строке слово состояния доступно подсказкой у всей правой колонки.
+        for widget in (self.dot, self.holder):
             tip(widget, row.status)
+        tip(self, server_details(row.name, flag=row.flag, code=row.code, status=row.status,
+                                 speed=row.speed, delay=row.delay, sub=row.sub, note=row.note,
+                                 main=row.main))
         tone(self, "true" if row.main else "false", "main")
         self.setAccessibleName(f"{row.name}: {row.status}, {row.speed}")
 

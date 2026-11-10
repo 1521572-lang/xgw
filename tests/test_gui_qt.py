@@ -168,6 +168,11 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     assert overview.metrics["delay"].text() == "84 мс"
     assert "Xray 26.3.27" in overview.versions.text()
     assert overview.word.text() == "ЗАЩИЩЕНО" and overview.orb.tone == "ok"
+    assert overview.orb.country == "NL"
+    assert set(overview.quick_buttons) == {"devices", "traffic", "diagnostics", "extra"}
+    overview.quick_buttons["devices"].click()
+    assert win.stack.currentWidget() is win.devices
+    win.nav.setCurrentRow(0)
     rows = overview.members.visible_rows()
     assert len(rows) == 5 and rows[0].is_main and not any(r.is_main for r in rows[1:])
     assert rows[0].name.text() == "Нидерланды · Амстердам 1"
@@ -254,8 +259,7 @@ def test_new_version_replaces_the_open_window_of_the_old_one(qapp):
 
 
 def test_status_word_hint_covers_the_row_and_closing_quits(qapp, demo, tmp_path):
-    """Отчёт gui-s3: подсказка у точки в 10 пикселей не показалась, а после закрытия окна
-    процесс остался. Подсказка — у всей правой колонки и строки; закрытие — выход."""
+    """У строки — карточка с параметрами, у узкой правой колонки — короткое состояние."""
     import faulthandler
 
     client = _client(demo.port)
@@ -272,7 +276,11 @@ def test_status_word_hint_covers_the_row_and_closing_quits(qapp, demo, tmp_path)
     client.start()
     wait(qapp, lambda: win.overview.members.visible_rows())
     row = win.overview.members.visible_rows()[0]
-    assert row.toolTip() and row.holder.toolTip() == row.dot.toolTip() == row.toolTip()
+    status = row.holder.toolTip()
+    assert status and row.dot.toolTip() == status
+    details = row.toolTip()
+    assert row.name.text() in details
+    assert all(text in details for text in ("Состояние", "Скорость", "Задержка"))
     win.close()
     faulthandler.cancel_dump_traceback_later()  # в тесте процесс не завершать
     assert quits == [1]
