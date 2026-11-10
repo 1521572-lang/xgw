@@ -8,13 +8,14 @@ XGW не запускает install_easy и не меняет sysctl. Два с�
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import re
 import stat
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .net import cmd
 
@@ -313,20 +314,21 @@ class Controller:
             return False  # повреждённый учёт не превращается в бесплатный бюджет
         charge = len(cfg.zapret2.probe_urls) * PROBE_CHARGE
         if cfg.zapret2.mode == "compare":
-            charge *= 2
+            charge *= 4  # VPN: исходный GET + до двух переходов; прямой: конечный адрес
         if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
             return False
         self.store.set_meta(BUDGET, json.dumps({"day": day, "bytes": spent + charge}))
         return True
 
     @staticmethod
-    def _request(url: str, port: int, password: str, user_agent: str, cancel) -> DownloadResult:
+    def _request(url: str, port: int, password: str, user_agent: str, cancel,
+                 *, max_total: float = 8) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
         return checks.http_get_via_proxy(
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
-            proxy_pass=password, timeout=5, silence=4, max_total=8,
+            proxy_pass=password, timeout=5, silence=4, max_total=max_total,
             max_bytes=PROBE_BYTES, min_body=16 * 1024, user_agent=user_agent, cancel=cancel,
         )
 
@@ -341,6 +343,49 @@ class Controller:
                 return False
         return True
 
+    def _control(self, cfg: Config, url: str, port: int, password: str, agent: str, cancel):
+        """До двух разрешённых переходов VPN за общий срок 8 с; URL остаётся приватным."""
+        from .watch.checks import DownloadResult
+
+        deadline = time.monotonic() + 8
+        seen = {url}
+        hops, redirect = 0, "none"
+        last_result, last_url, last_hops = None, url, 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result = last_result or DownloadResult(False, kind="timeout", phase="connect")
+                return result, last_url, last_hops, "limit"
+            result = self._request(url, port, password, agent, cancel, max_total=remaining)
+            last_result, last_url, last_hops = result, url, hops
+            if result.phase == "connect" or result.status not in (301, 302, 303, 307, 308):
+                return result, url, hops, redirect
+            try:
+                location = result.location
+                if not location or any(ord(c) < 33 or ord(c) > 126 for c in location):
+                    raise ValueError("bad_location")
+                target = urljoin(url, location)
+                parts = urlsplit(target)
+                host = parts.hostname or ""
+                if (parts.scheme != "https" or parts.port not in (None, 443)
+                        or parts.username is not None or parts.password is not None
+                        or parts.fragment or not matches(host, cfg.zapret2.domains)):
+                    raise ValueError("bad_target")
+                try:
+                    ipaddress.ip_address(host)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError("literal_ip")
+            except ValueError:
+                return result, url, hops, "blocked"
+            if target in seen:
+                return result, url, hops, "loop"
+            if hops == 2:
+                return result, url, hops, "limit"
+            seen.add(target)
+            url, hops, redirect = target, hops + 1, "followed"
+
     def _compare(self, cfg: Config, applied: dict, vpn_port: int, cancel) -> list[dict]:
         from .generator import builder
         from .watch import checks
@@ -354,7 +399,13 @@ class Controller:
             for path, port in (("vpn", vpn_port), ("zapret2", cfg.zapret2.probe_port)):
                 if cancel is not None and cancel.is_set():
                     return rows
-                result = self._request(url, port, password, agent, cancel)
+                if path == "vpn":
+                    result, url, hops, redirect = self._control(
+                        cfg, url, port, password, agent, cancel)
+                else:
+                    # Тот же конечный адрес, который запросил VPN; свой редирект не скрываем.
+                    result = self._request(url, port, password, agent, cancel)
+                    hops, redirect = 0, "none"
                 connect = result.phase == "connect"
                 rows.append({
                     "probe": index, "path": path, "phase": result.phase,
@@ -362,6 +413,7 @@ class Controller:
                     "http": 0 if connect else result.status,
                     "connect_http": result.status if connect else 0,
                     "bytes": result.downloaded,
+                    "redirects": hops, "redirect": redirect,
                 })
         return rows
 

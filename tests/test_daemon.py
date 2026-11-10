@@ -3463,7 +3463,7 @@ def test_zapret2_compare_uses_live_member_and_exports_probe_rows(daemon):
     daemon._zapret2.runtime = Runtime()
     ports = []
 
-    def request(_url, port, _password, _agent, _cancel):
+    def request(_url, port, _password, _agent, _cancel, **kwargs):
         ports.append(port)
         return DownloadResult(True, status=200, downloaded=16384, phase="body")
 

@@ -116,8 +116,13 @@ def compare_report(value):
                 or type(size) is not int or size < 0 or (n, path) in pairs):
             raise ValueError("invalid_comparison")
         pairs.add((n, path))
+        hops, redirect = row.get("redirects", 0), row.get("redirect", "none")
+        if (type(hops) is not int or not 0 <= hops <= 2
+                or redirect not in ("none", "followed", "blocked", "loop", "limit")):
+            raise ValueError("invalid_redirect")
         print(f"PROBE n={n} path={path} phase={phase} kind={kind} http={http} "
-              f"connect_http={connect} bytes={size} ok={int(ok)}", flush=True)
+              f"connect_http={connect} bytes={size} ok={int(ok)} "
+              f"redirects={hops} redirect={redirect}", flush=True)
     trace_report(value)
     stopped = not (value["queue"] or value["lease"] or value["worker_pid"])
     complete = (len(pairs) == 4 and value["reason"] == "comparison_done"
