@@ -69,6 +69,7 @@ def snapshot(*, include_comparison=False):
     if include_comparison:
         result["comparison"] = view.get("probes", [])
         result["reason"] = view.get("reason", "")
+        result["trace"] = view.get("trace", {})
     return result
 
 
@@ -81,6 +82,18 @@ def show(value, baseline=None):
         fields += [f"xray_same={int(value['xray_pid'] == baseline['xray_pid'])}",
                    f"protected_same={int(value['protected'] == baseline['protected'])}"]
     print("CHECK " + " ".join(fields), flush=True)
+
+
+def trace_report(value):
+    fields = ("queue_packets", "hello", "send_calls", "send_ok", "applied", "lua_errors")
+    trace = value.get("trace") or {}
+    state = trace.get("state", "unavailable")
+    if (state not in ("observed", "incomplete", "unavailable")
+            or any(type(trace.get(key, -1)) is not int or trace.get(key, -1) < -1
+                   for key in fields)):
+        raise ValueError("invalid_trace")
+    print("TRACE state=" + state + " " + " ".join(
+        f"{key}={trace.get(key, -1)}" for key in fields), flush=True)
 
 
 def compare_report(value):
@@ -105,6 +118,7 @@ def compare_report(value):
         pairs.add((n, path))
         print(f"PROBE n={n} path={path} phase={phase} kind={kind} http={http} "
               f"connect_http={connect} bytes={size} ok={int(ok)}", flush=True)
+    trace_report(value)
     stopped = not (value["queue"] or value["lease"] or value["worker_pid"])
     complete = (len(pairs) == 4 and value["reason"] == "comparison_done"
                 and value["state"] == "compared" and stopped)
@@ -121,7 +135,8 @@ def compare_report(value):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("before", "inspect", "watch", "finish", "compare"))
+    parser.add_argument("action", choices=("before", "inspect", "watch", "finish", "compare",
+                                          "selftest"))
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=180)
     args = parser.parse_args()
@@ -129,9 +144,24 @@ def main():
         raise RuntimeError("root_required")
     if not 1 <= args.seconds <= 600:
         raise RuntimeError("bad_duration")
+    if args.action == "selftest":
+        from xgw import zapret2
+        from xgw.config import load
+        from xgw.paths import Paths
+        from xgw.zapret2_trace import SELFTEST
+
+        cfg, warnings = load(Paths.from_env().config_file)
+        if warnings or cfg.zapret2.mode != "off":
+            raise RuntimeError("baseline_not_ready")
+        cfg.zapret2.mode = "compare"  # только объект в памяти
+        output = run([*zapret2.arguments(cfg), "--lua-init=" + SELFTEST, "--intercept=0"], 15)
+        if "LUA: XGW_Z2_SELFTEST OK" not in output.splitlines():
+            raise RuntimeError("selftest_failed")
+        print("RESULT trace_selftest_ok", flush=True)
+        return 0
     if args.action == "before":
         value = snapshot()
-        if (value["route"] or value["lease"] or value["worker_pid"]
+        if (value["route"] or value["queue"] or value["lease"] or value["worker_pid"]
                 or not value["capture_on"] or not value["xray_pid"]):
             raise RuntimeError("baseline_not_ready")
         fd = os.open(args.state, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -160,8 +190,10 @@ def main():
         print("RESULT comparison_incomplete")
         return 4
     if args.action == "finish":
-        ok = (not value["route"] and not value["worker_pid"] and not value["lease"]
-              and value["capture_on"] and value["protected"] == baseline["protected"])
+        ok = (value["state"] == "off" and not value["route"] and not value["queue"]
+              and not value["worker_pid"] and not value["lease"] and value["capture_on"]
+              and value["xray_pid"] == baseline["xray_pid"]
+              and value["protected"] == baseline["protected"])
         print("RESULT " + ("rollback_ok" if ok else "rollback_failed"))
         return 0 if ok else 1
     return 0

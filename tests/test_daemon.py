@@ -3474,4 +3474,5 @@ def test_zapret2_compare_uses_live_member_and_exports_probe_rows(daemon):
     assert ports == [members[1].probe_port, daemon.cfg.zapret2.probe_port] * 2
     comparison = daemon.status()["zapret2"]
     assert comparison["state"] == "compared" and len(comparison["probes"]) == 4
+    assert comparison["trace"]["applied"] == 2
     assert engine.read_json(daemon.paths.xray_config_file) == applied

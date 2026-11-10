@@ -189,18 +189,25 @@ def guard_rules(queue: int | None) -> list[str]:
 
 
 def arguments(cfg: Config) -> list[str]:
+    from .zapret2_trace import LUA
+
     z = cfg.zapret2
-    return [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
+    args = [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
-            f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua", "--filter-tcp=443",
-            "--filter-l7=tls", "--payload=tls_client_hello",
-            f"--lua-desync={z.strategy}:pos=1,midsld"]
+            f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
+    strategy = z.strategy
+    if z.mode == "compare":
+        args += ["--debug=0", "--lua-init=" + LUA]
+        strategy = "xgw_trace:strategy=" + strategy
+    return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",
+            f"--lua-desync={strategy}:pos=1,midsld"]
 
 
 class Runtime:
     def __init__(self, runner=cmd.run):
         self.runner = runner
         self.started = False
+        self.evidence = None
 
     def gate(self, seconds: int = 0) -> None:
         from .net.capture import Capture
@@ -259,6 +266,19 @@ class Runtime:
         self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,
                      *[arg for p in properties for arg in ("--property", p)], *args], timeout=15)
         self.started = True
+        self.evidence = None
+        if cfg.zapret2.mode == "compare":
+            from .zapret2_trace import Evidence
+
+            self.evidence = Evidence(self.runner, UNIT, cfg.zapret2.queue_num)
+            self.evidence.begin()
+
+    def sample_trace(self) -> None:
+        if self.evidence is not None:
+            self.evidence.sample()
+
+    def finish_trace(self) -> dict:
+        return self.evidence.finish() if self.evidence is not None else {}
 
     def stop(self) -> None:
         self.runner(["systemctl", "stop", UNIT], check=False, timeout=10)
@@ -279,6 +299,7 @@ class Controller:
         self.ready = False
         self.last_error = ""
         self.comparison: list[dict] | None = None
+        self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
 
     def _budget(self, cfg: Config) -> bool:
@@ -386,6 +407,7 @@ class Controller:
                     if comparing:
                         self.runtime.gate(45)
                         self.comparison = self._compare(cfg, applied, vpn_probe_port, cancel)
+                        self.runtime.sample_trace()
                     else:
                         self.runtime.gate(cfg.zapret2.check_seconds + 60)
                         if not self.probe(cfg, applied, cancel):
@@ -435,13 +457,16 @@ class Controller:
                 stopped = False
         self.ready = comparing and not stopped
         if comparing and self.comparison is not None:
+            if stopped and self.comparison_trace is None:
+                self.comparison_trace = self.runtime.finish_trace()
             complete = len(self.comparison) == 4 and all(
                 row["kind"] != "cancelled" for row in self.comparison)
             cleaned = routed_back and gate_closed and stopped
             self.view = {"state": "compared" if cleaned else "blocked",
                          "reason": ("comparison_done" if complete else "comparison_incomplete")
                          if cleaned else "comparison_cleanup_failed",
-                         "gate_closed": gate_closed, "probes": self.comparison}
+                         "gate_closed": gate_closed, "probes": self.comparison,
+                         "trace": self.comparison_trace or {}}
             return changed
         self.view = {"state": "fallback" if routed_back else "blocked", "reason": reason,
                      "gate_closed": gate_closed}

@@ -1184,6 +1184,7 @@ class Daemon:
         self._resume(previous)
         if self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2:
             self._zapret2.comparison = previous._zapret2.comparison
+            self._zapret2.comparison_trace = previous._zapret2.comparison_trace
             self._zapret2.view = previous._zapret2.view
             self._zapret2.ready = previous._zapret2.ready
         if previous._build is not None:

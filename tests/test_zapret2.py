@@ -57,6 +57,14 @@ class Runtime:
     def alive(self, queue):
         return self.up
 
+    def sample_trace(self):
+        self.events.append(("sample", 0))
+
+    def finish_trace(self):
+        assert not self.up
+        return {"state": "observed", "queue_packets": 8, "hello": 2,
+                "send_calls": 6, "send_ok": 6, "applied": 2, "lua_errors": 0}
+
 
 class Harness:
     def __init__(self):
@@ -232,6 +240,8 @@ def test_compare_runs_both_pairs_without_enabling_client_route(monkeypatch, dire
     assert h.current == original
     assert h.controller.view["state"] == "compared"
     assert h.controller.view["reason"] == "comparison_done"
+    assert h.controller.view["trace"]["applied"] == 2
+    assert h.runtime.events.index(("sample", 0)) < h.runtime.events.index(("stop", 0))
     assert [(port, url) for port, url, _ in calls] == [
         (port, url) for url in h.cfg.zapret2.probe_urls for port in (vpn_port, direct_port)
     ]
