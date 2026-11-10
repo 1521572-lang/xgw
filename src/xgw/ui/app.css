@@ -1,51 +1,62 @@
-/* Панель XGW. Без внешних шрифтов и картинок: всё лежит рядом и отдаётся самим шлюзом. */
+/* Панель XGW — тема ProtonVPN Dark (Proton Carbon/Purple).
+   Источник токенов: ProtonVPN/proton-vpn-gtk-app, assets/style/_dark_palette.css
+   (v2, rgba-surface) + dark_colours.css (legacy) + main_widget.css (градиенты
+   состояния) + _primitives.css (кнопки, свитчи, поля, focus-ring).
+   Полная замена app.css: покрывает КАЖДЫЙ селектор прежнего файла —
+   app.js и index.html остаются без изменений (кроме п.6 ТЗ, опционально).
+   Внешних шрифтов и картинок нет: CSP style-src 'self'. */
+/* ВАЖНО (CSP): style-src 'self' запрещает <style> и атрибут style="" в HTML.
+   Все стили — только здесь. Установка значений через el.style.* из JS (полоса
+   квоты, ширина usage-bar) разрешена: CSSOM под CSP не блокируется. */
 
 :root {
   color-scheme: dark;
-  --bg: #0b1017;
-  --card: #131a24;
-  --card-2: #18212d;
-  --line: #243040;
-  --text: #e8eef6;
-  --muted: #8d9aac;
-  --accent: #2fd39a;
-  --accent-ink: #04271b;
-  --warn: #f2b544;
-  --bad: #ff6f6f;
-  --info: #62adff;
-  --shadow: 0 1px 2px rgb(0 0 0 / 35%), 0 12px 32px rgb(0 0 0 / 22%);
-  --radius: 18px;
+
+  /* --- Proton: фоны и поверхности --------------------------------------- */
+  --bg: #16141c;                        /* background-norm */
+  --card: #232129;                      /* surface-default: bg-norm + 5% white */
+  --card-2: #292733;                    /* background-weak (legacy) */
+  --card-3: #3f3b4c;                    /* background-strong */
+  --line: rgba(255, 255, 255, .1);      /* border-weak */
+  --line-strong: rgba(255, 255, 255, .2); /* border-norm */
+
+  /* --- Proton: текст ------------------------------------------------------ */
+  --text: #ffffff;                      /* text-norm */
+  --muted: #a7a4b5;                     /* text-weak (legacy) */
+  --hint: rgba(255, 255, 255, .5);      /* text-hint */
+  --disabled: rgba(255, 255, 255, .3);  /* text-disabled */
+
+  /* --- Proton: акцент (Proton Purple) ------------------------------------ */
+  --accent: #6d4aff;                    /* interaction-norm */
+  --accent-hover: #7c5cff;              /* interaction-norm-hover */
+  --accent-active: #8a6eff;             /* interaction-norm-active */
+  --accent-ink: #ffffff;                /* кнопки Proton: белый текст на пурпурном */
+  --link: #ac99ff;                      /* link-norm / focus-ring */
+
+  /* --- Proton: сигнальные цвета ------------------------------------------ */
+  --ok: #1ea885;                        /* signal-success legacy / Connected-градиент */
+  --ok-text: #3ecfa8;                   /* тот же зелёный, высветленный для мелкого текста */
+  --warn: #ffad33;                      /* signal-warning (v2) */
+  --bad: #f7607e;                       /* signal-danger (Proton Pink) */
+  --info: #239ece;                      /* signal-info */
+  --vpn-green: #2cffcc;                 /* proton-vpn-green: логотип/бренд */
+
+  /* --- метрики ------------------------------------------------------------ */
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 12px 32px rgb(0 0 0 / 28%);
+  --radius: 12px;                       /* карточки (Proton: cooldown-card 12px) */
+  --radius-s: 8px;                      /* кнопки, поля, свитчеры (Proton: 8px) */
   --page: 1120px;
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
 }
 
-/* На широком мониторе страница шире: при 1120px по бокам оставались огромные поля, а длинные
-   строки серверов переносились (отзыв заказчика к вкладке пула, 30.10). */
 @media (min-width: 1500px) {
   :root { --page: min(1560px, 94vw); }
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
-    --bg: #eef1f5;
-    --card: #ffffff;
-    --card-2: #f4f6f9;
-    --line: #dde3ea;
-    --text: #17202b;
-    --muted: #5d6a7a;
-    --accent: #10a271;
-    --accent-ink: #ffffff;
-    --warn: #b17208;
-    --bad: #cf3d3d;
-    --info: #1f6fd0;
-    --shadow: 0 1px 2px rgb(20 30 45 / 8%), 0 10px 28px rgb(20 30 45 / 8%);
-  }
-}
+/* Светлая тема убрана: референс — тёмный Proton; панель всегда тёмная. */
 
 * { box-sizing: border-box; }
 
-/* Атрибут hidden сильнее любого display из правил ниже. */
 [hidden] { display: none !important; }
 
 html, body { margin: 0; }
@@ -56,6 +67,11 @@ body {
   color: var(--text);
   -webkit-font-smoothing: antialiased;
 }
+
+::selection { background: rgb(109 74 255 / 55%); }
+
+/* Скроллбары в цвете Proton (border-norm), как slider у GTK-скроллбара. */
+* { scrollbar-color: var(--line-strong) transparent; scrollbar-width: thin; }
 
 h1, h2, h3, p, ul { margin: 0; }
 ul { padding: 0; list-style: none; }
@@ -73,21 +89,35 @@ button, textarea, input { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 
-/* --- шапка ---------------------------------------------------------------- */
+/* --- шапка (аналог Proton HeaderBar, 48–56px) ----------------------------- */
 
 .top {
+  position: relative;
+  z-index: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  max-width: var(--page);
-  margin: 0 auto;
-  padding: 1.1rem 1.25rem .4rem;
+  max-width: none;
+  margin: 0;
+  padding: .8rem max(1.25rem, calc((100vw - var(--page)) / 2 + 1.25rem)) .6rem;
+  /* Полноширинная полоса background-weak — как headerbar Proton. */
+}
+
+.top::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: #1c1b24;                  /* legacy background-norm: полоса над #16141c */
+  border-bottom: 1px solid var(--line);
 }
 
 .brand { display: flex; align-items: center; gap: .6rem; }
 .brand img { border-radius: 8px; }
 .brand-name { font-size: 1.15rem; font-weight: 700; letter-spacing: .04em; }
+/* «XGW» — фирменный зелёный Proton (#2CFFCC), как логотип в GTK-приложении. */
+.brand-name { color: var(--vpn-green); }
 .brand-note { color: var(--muted); font-size: .9rem; }
 
 .chip {
@@ -98,6 +128,7 @@ button, textarea, input { font: inherit; color: inherit; }
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--card);
+  color: var(--text);
   font-size: .87rem;
   white-space: nowrap;
 }
@@ -107,25 +138,28 @@ button, textarea, input { font: inherit; color: inherit; }
   width: .55rem;
   height: .55rem;
   border-radius: 50%;
-  background: var(--muted);
+  background: var(--hint);
 }
 
-.chip[data-tone="ok"]::before { background: var(--accent); }
+.chip[data-tone="ok"]::before {
+  background: var(--ok);
+  box-shadow: 0 0 0 .2rem rgb(30 168 133 / 18%);
+}
 .chip[data-tone="warn"]::before { background: var(--warn); }
 .chip[data-tone="bad"]::before { background: var(--bad); }
-/* Метка — кнопка только во «всём доме через пул»: нажатие предлагает вернуть режим подписок. */
+
 .chip:disabled { cursor: default; }
 .chip:enabled { cursor: pointer; }
-.chip:enabled::after { content: "▾"; color: var(--muted); font-size: .75rem; }
-.chip:enabled:hover { border-color: color-mix(in srgb, var(--text) 35%, var(--line)); }
+.chip:enabled::after { content: "▾"; color: var(--hint); font-size: .75rem; }
+.chip:enabled:hover { border-color: var(--line-strong); background: var(--card-2); }
 
 .banner {
   max-width: calc(var(--page) - 32px);
   margin: .6rem auto 0;
   padding: .7rem 1rem;
-  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--bad) 12%, var(--card));
+  border: 1px solid rgb(247 96 126 / 55%);
+  border-radius: var(--radius-s);
+  background: rgb(247 96 126 / 12%);
 }
 
 /* --- сетка ---------------------------------------------------------------- */
@@ -136,7 +170,7 @@ button, textarea, input { font: inherit; color: inherit; }
   gap: 1rem;
   max-width: var(--page);
   margin: 0 auto;
-  padding: .8rem 1rem 1.5rem;
+  padding: 1rem 1.25rem 2rem;   /* Proton: контент с отступом 20px */
 }
 
 .col { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
@@ -145,7 +179,6 @@ button, textarea, input { font: inherit; color: inherit; }
   .grid { grid-template-columns: 390px minmax(0, 1fr); align-items: start; }
 }
 
-/* В одну колонку серверы идут сразу за главной кнопкой, подписки — после них. */
 @media (max-width: 939.98px) {
   .col { display: contents; }
   .hero { order: 1; }
@@ -180,10 +213,27 @@ button, textarea, input { font: inherit; color: inherit; }
   margin-bottom: .8rem;
 }
 
-.card-head h2 { font-size: 1.02rem; font-weight: 650; }
-.count { color: var(--muted); font-weight: 500; }
+.card-head h2 {
+  font-size: 1.02rem;
+  font-weight: 600;                 /* Proton: заголовки 600 */
+  letter-spacing: .01em;
+}
 
-/* --- главная кнопка ------------------------------------------------------- */
+.count { color: var(--hint); font-weight: 500; }
+
+/* --- главная карточка статуса (Proton: connection-status + main-widget) ---- */
+
+/* Градиент состояния сверху карточки — из main_widget.css:
+   connected rgba(30,168,133,.2), error rgba(245,56,90,.2), connecting white .1. */
+.hero[data-tone="ok"] {
+  background-image: linear-gradient(to bottom, rgb(30 168 133 / 20%) 0%, rgb(30 168 133 / 0%) 160px);
+}
+.hero[data-tone="warn"] {
+  background-image: linear-gradient(to bottom, rgb(255 255 255 / 10%) 0%, rgb(255 255 255 / 0%) 160px);
+}
+.hero[data-tone="bad"] {
+  background-image: linear-gradient(to bottom, rgb(245 56 90 / 20%) 0%, rgb(245 56 90 / 0%) 160px);
+}
 
 .hero {
   display: flex;
@@ -193,22 +243,28 @@ button, textarea, input { font: inherit; color: inherit; }
   text-align: center;
 }
 
-.hero h1 { margin-top: 1.4rem; font-size: 1.45rem; font-weight: 700; }
+.hero h1 { margin-top: 1.4rem; font-size: 1.5rem; font-weight: 700; }
 .hero > .muted { margin-top: .3rem; max-width: 30ch; }
 .hero > .lifecycle { margin-top: .45rem; max-width: 36ch; color: var(--muted); }
-.lifecycle[data-tone="ok"] { color: var(--accent); }
+.lifecycle[data-tone="ok"] { color: var(--ok-text); }
 .lifecycle[data-tone="warn"] { color: var(--warn); }
 .lifecycle[data-tone="bad"] { color: var(--bad); }
 
+/* Кнопка питания: выключена — пурпурный акцент (Proton «Connect»), включена —
+   зелёный «Protected». Тон глушения/ошибки перекрашивает нажатую кнопку. */
 .power {
-  --tone: var(--muted);
+  --tone: var(--accent);
   display: grid;
   place-items: center;
   width: 9.6rem;
   height: 9.6rem;
   border: 2px solid color-mix(in srgb, var(--tone) 55%, transparent);
   border-radius: 50%;
-  background: var(--card-2);
+  background:
+    radial-gradient(circle at 50% 42%,
+      color-mix(in srgb, var(--tone) 14%, transparent) 0%,
+      transparent 62%),
+    var(--card-2);
   color: var(--tone);
   cursor: pointer;
   transition: transform .15s ease, box-shadow .25s ease, background .25s ease, color .25s ease;
@@ -223,22 +279,39 @@ button, textarea, input { font: inherit; color: inherit; }
   stroke-linecap: round;
 }
 
-.power:hover:not(:disabled) { transform: scale(1.03); }
-.power:active:not(:disabled) { transform: scale(.97); }
-.power:disabled { cursor: not-allowed; opacity: .55; }
+.power:hover:not(:disabled) {
+  --tone: var(--accent-hover);
+  transform: scale(1.03);
+}
+.power:active:not(:disabled) { --tone: var(--accent-active); transform: scale(.97); }
+.power:disabled { --tone: var(--hint); cursor: not-allowed; opacity: .55; }
 
 .power[aria-pressed="true"] {
-  --tone: var(--accent);
+  --tone: var(--ok);
   border-color: transparent;
   background: var(--tone);
-  color: var(--accent-ink);
+  color: #06251c;
   box-shadow:
-    0 0 0 .55rem color-mix(in srgb, var(--tone) 16%, transparent),
-    0 0 3.2rem color-mix(in srgb, var(--tone) 42%, transparent);
+    0 0 0 .55rem rgb(30 168 133 / 16%),
+    0 0 3.2rem rgb(30 168 133 / 42%);
 }
 
-.hero[data-tone="warn"] .power[aria-pressed="true"] { --tone: var(--warn); color: #2b1d00; }
-.hero[data-tone="bad"] .power[aria-pressed="true"] { --tone: var(--bad); color: #2b0606; }
+.hero[data-tone="warn"] .power[aria-pressed="true"] {
+  --tone: var(--warn);
+  background: var(--tone);
+  color: #2b1d00;
+  box-shadow:
+    0 0 0 .55rem rgb(255 173 51 / 16%),
+    0 0 3.2rem rgb(255 173 51 / 42%);
+}
+.hero[data-tone="bad"] .power[aria-pressed="true"] {
+  --tone: var(--bad);
+  background: var(--tone);
+  color: #2b060e;
+  box-shadow:
+    0 0 0 .55rem rgb(247 96 126 / 16%),
+    0 0 3.2rem rgb(247 96 126 / 42%);
+}
 
 .power[data-busy="1"] { animation: pulse 1.1s ease-in-out infinite; }
 
@@ -249,12 +322,13 @@ button, textarea, input { font: inherit; color: inherit; }
 .why {
   margin-top: .8rem;
   padding: .55rem .8rem;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--warn) 13%, transparent);
+  border-radius: var(--radius-s);
+  background: rgb(255 173 51 / 13%);
   color: var(--text);
   font-size: .9rem;
 }
 
+/* Блок «Сейчас через …» — surface на карточке (Proton: surface-default). */
 .current {
   display: flex;
   align-items: center;
@@ -263,7 +337,8 @@ button, textarea, input { font: inherit; color: inherit; }
   width: 100%;
   margin-top: 1.2rem;
   padding: .7rem .9rem;
-  border-radius: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
   background: var(--card-2);
   text-align: left;
 }
@@ -271,7 +346,7 @@ button, textarea, input { font: inherit; color: inherit; }
 .current-text { display: flex; flex-direction: column; min-width: 0; }
 .current-name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 
-/* --- кнопки --------------------------------------------------------------- */
+/* --- кнопки (Proton: r8, primary #6D4AFF, danger #F7607E) ------------------ */
 
 .btn {
   display: inline-flex;
@@ -280,19 +355,29 @@ button, textarea, input { font: inherit; color: inherit; }
   gap: .4rem;
   padding: .5rem .95rem;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--card-2);
+  border-radius: var(--radius-s);
+  background: var(--card-2);          /* interaction-weak */
+  color: var(--text);
   cursor: pointer;
   white-space: nowrap;
   transition: background .15s ease, border-color .15s ease, opacity .15s ease;
 }
 
-.btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--text) 35%, var(--line)); }
+.btn:hover:not(:disabled) { border-color: var(--line-strong); background: #4a4658; } /* interaction-weak */
 .btn:disabled { cursor: not-allowed; opacity: .55; }
+
 .btn.primary { border-color: transparent; background: var(--accent); color: var(--accent-ink); font-weight: 600; }
-.btn.danger { border-color: transparent; background: var(--bad); color: #2b0606; font-weight: 600; }
+.btn.primary:hover:not(:disabled) { border-color: transparent; background: var(--accent-hover); }
+.btn.primary:active:not(:disabled) { background: var(--accent-active); }
+
+.btn.danger { border-color: transparent; background: var(--bad); color: #2b060e; font-weight: 600; }
+.btn.danger:hover:not(:disabled) { border-color: transparent; background: #f47b93; } /* danger-hover */
+
 .btn.ghost { background: transparent; }
+.btn.ghost:hover:not(:disabled) { border-color: transparent; background: rgb(255 255 255 / 10%); } /* surface-hover */
+
 .btn.small-btn, .btn.ghost { padding: .32rem .7rem; font-size: .9rem; }
+
 .btn[data-busy="1"]::before {
   content: "";
   width: .8rem;
@@ -307,6 +392,7 @@ button, textarea, input { font: inherit; color: inherit; }
   to { transform: rotate(360deg); }
 }
 
+/* Иконки-кнопки (Proton: ghost 32×32, иконка 16px, surface-hover). */
 .icon-btn {
   display: inline-grid;
   place-items: center;
@@ -314,45 +400,53 @@ button, textarea, input { font: inherit; color: inherit; }
   height: 2rem;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: var(--radius-s);
   background: transparent;
   color: var(--muted);
   cursor: pointer;
+  transition: background .15s ease;
 }
 
-.icon-btn:hover { border-color: var(--line); color: var(--text); }
+.icon-btn:hover { border-color: transparent; background: rgb(255 255 255 / 10%); color: var(--text); }
 .icon-btn svg { width: 1.05rem; height: 1.05rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 
-:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
+/* Фокус: кольцо Proton #AC99FF (focus-ring), 2px. */
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
 
-/* --- добавление подписки -------------------------------------------------- */
+/* --- добавление подписки --------------------------------------------------- */
 
 .add textarea, .add input {
   display: block;
   width: 100%;
   min-height: 3.6rem;
   padding: .6rem .75rem;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--card-2);
+  border: 1px solid transparent;      /* Proton: бордер поля виден при фокусе/ошибке */
+  border-radius: var(--radius-s);
+  background: rgb(255 255 255 / 5%);  /* surface-default */
+  color: var(--text);
+  caret-color: var(--text);
   resize: vertical;
   font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace;
   font-size: .86rem;
+  transition: background .15s ease, border-color .15s ease;
 }
 
 .add input { min-height: 2.6rem; }
-.add textarea::placeholder, .add input::placeholder { color: var(--muted); font-family: system-ui, sans-serif; }
+.add textarea::placeholder, .add input::placeholder { color: var(--hint); font-family: system-ui, sans-serif; }
+.add textarea:hover, .add input:hover { background: rgb(255 255 255 / 10%); }   /* surface-hover */
+.add textarea:focus, .add input:focus { border-color: #fff; background: rgb(255 255 255 / 20%); } /* focus-within */
 
-/* --- QR-код и код для ввода (вход в Tailscale, привязка телефона) ---------------- */
+/* --- QR-код и код для ввода ------------------------------------------------ */
 
 .pair { margin-top: .8rem; }
 .pair-code {
   display: block;
   margin: .5rem 0;
   padding: .7rem .9rem;
-  border: 1px dashed color-mix(in srgb, var(--accent) 60%, var(--line));
-  border-radius: 12px;
+  border: 1px dashed rgb(172 153 255 / 60%);
+  border-radius: var(--radius-s);
   background: var(--card-2);
+  color: var(--link);
   font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace;
   font-size: 1.2rem;
   letter-spacing: .06em;
@@ -363,7 +457,7 @@ button, textarea, input { font: inherit; color: inherit; }
 
 /* --- Tailscale ------------------------------------------------------------- */
 
-.ts-addr { margin-top: .35rem; font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.ts-addr { margin-top: .35rem; color: var(--link); font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 .ts-start { justify-content: flex-start; flex-wrap: wrap; }
 .ts-row {
   display: flex;
@@ -372,35 +466,37 @@ button, textarea, input { font: inherit; color: inherit; }
   gap: .6rem .75rem;
   margin-top: .8rem;
   padding: .65rem .8rem;
-  border-radius: 12px;
-  background: var(--card-2);
+  border-radius: var(--radius-s);
+  background: rgb(255 255 255 / 4%);
 }
 .ts-link { margin-top: .2rem; color: var(--info); overflow-wrap: anywhere; }
-/* Свой сервер устройства (Ф4): список под адресом в строке устройства. */
+.ts-link:hover { color: #27b1e8; }   /* info-hover */
 .devices-card .route { display: block; max-width: 100%; margin-top: .35rem; }
-/* Свой сервер и российские адреса устройства — рядом, на узком экране — друг под другом. */
 .devices-card .picks { display: flex; flex-wrap: wrap; gap: 0 .5rem; }
 .devices-card .picks .route { margin-left: 0; margin-right: 0; }
 .ts-enable { align-self: flex-start; margin-top: .45rem; }
 .ts-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
 .ts-note > span { flex: 1 1 14rem; }
-/* Весь дом через бесплатные серверы (М2б.2): напоминание и кнопка возврата в главной карточке. */
 .house-note { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .8rem 0 0; }
 .house-note > span { flex: 1 1 14rem; }
 a.btn { display: inline-flex; align-items: center; color: inherit; text-decoration: none; }
 a.btn.primary { color: var(--accent-ink); }
-/* QR-код — тёмные модули на белом в любой теме: так его читает камера телефона. */
+a.btn:hover { color: inherit; }
+/* Ссылки в тексте — link-norm Proton. */
+main a:not(.btn):not(.icon-btn) { color: var(--link); }
+main a:not(.btn):not(.icon-btn):hover { color: #c5b8ff; }
+/* QR-код — тёмные модули на белом в любой теме. */
 .qr {
   display: block;
   width: min(14rem, 100%);
   height: auto;
   margin: .8rem auto 0;
-  border-radius: 10px;
+  border-radius: var(--radius-s);
   background: #fff;
 }
 .qr path { fill: #000; }
 
-/* --- списки --------------------------------------------------------------- */
+/* --- списки ---------------------------------------------------------------- */
 
 .list > li {
   display: flex;
@@ -422,13 +518,11 @@ a.btn.primary { color: var(--accent-ink); }
 .row-error { color: var(--bad); font-size: .87rem; overflow-wrap: anywhere; }
 .row-actions { display: flex; align-items: center; gap: .25rem; flex: none; }
 
-/* Карточка «Ядра»: тексты переносятся, кнопки «Обновить» и «Вернуть …» уходят под них на узком экране. */
 .cores .core-row { flex-wrap: wrap; align-items: flex-start; }
 .cores .core-row .row-main { flex-basis: 14rem; }
 .cores .core-row .row-sub { overflow-wrap: anywhere; }
 .cores .core-row .row-actions { flex-wrap: wrap; gap: .4rem; }
 
-/* Карточка «Проверка сети»: вердикт рядом с названием, вывод и совет — целиком, с переносом. */
 .netcheck .check-row { align-items: flex-start; }
 .netcheck .check-row .row-title { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
 .netcheck .check-row .row-sub { overflow-wrap: anywhere; }
@@ -439,12 +533,17 @@ a.btn.primary { color: var(--accent-ink); }
 .edit-sub textarea {
   width: 100%;
   padding: .5rem .7rem;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--card-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  background: rgb(255 255 255 / 5%);
   color: var(--text);
   font: inherit;
+  transition: background .15s ease, border-color .15s ease;
 }
+.edit-sub input:hover, .edit-sub textarea:hover { background: rgb(255 255 255 / 10%); }
+.edit-sub input:focus, .edit-sub textarea:focus { border-color: #fff; background: rgb(255 255 255 / 20%); }
+
+/* --- метки-бейджи (pill): состояния серверов и устройств ------------------- */
 
 .tag {
   flex: none;
@@ -452,37 +551,42 @@ a.btn.primary { color: var(--accent-ink); }
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--muted);
+  background: rgb(255 255 255 / 4%);
   font-size: .74rem;
   font-weight: 500;
   white-space: nowrap;
 }
 
-.tag.on { border-color: transparent; background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); }
-.tag.warn { border-color: transparent; background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
-.tag.rec { border-color: transparent; background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+.tag.on { border-color: transparent; background: rgb(30 168 133 / 20%); color: var(--ok-text); }
+.tag.warn { border-color: transparent; background: rgb(255 173 51 / 18%); color: var(--warn); }
+.tag.rec { border-color: transparent; background: rgb(247 96 126 / 16%); color: var(--bad); }
 .sub-title { margin: 1rem 0 .2rem; font-size: .95rem; }
 a.icon-btn { text-decoration: none; }
 .rec-btn svg { fill: var(--bad); stroke: none; transform: scale(.75); }
 .icon-btn:disabled { cursor: not-allowed; opacity: .35; }
 
-.dot { flex: none; width: .6rem; height: .6rem; border-radius: 50%; background: var(--muted); }
-.dot.ok { background: var(--accent); box-shadow: 0 0 0 .2rem color-mix(in srgb, var(--accent) 18%, transparent); }
-.dot.warn { background: var(--warn); }
-.dot.bad { background: var(--bad); }
+/* Индикатор-точка строки сервера (Proton: load/status signals). */
+.dot { flex: none; width: .6rem; height: .6rem; border-radius: 50%; background: var(--hint); }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 .2rem rgb(30 168 133 / 18%); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 0 .2rem rgb(255 173 51 / 14%); }
+.dot.bad { background: var(--bad); box-shadow: 0 0 0 .2rem rgb(247 96 126 / 14%); }
 
-.delay { flex: none; min-width: 4.2rem; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-.delay.ok { color: var(--accent); }
+/* Задержка/вердикт: цветной текст, tabular-nums. */
+.delay { flex: none; min-width: 4.2rem; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; font-weight: 600; }
+.delay.ok { color: var(--ok-text); }
 .delay.warn { color: var(--warn); }
 .delay.bad { color: var(--bad); }
-.delay.none { color: var(--muted); font-weight: 400; }
+.delay.none { color: var(--hint); font-weight: 400; }
 
+/* Выбранный (вручную/основной) сервер — пурпурная плашка + линия слева. */
 .servers > li.selected {
   margin: 0 -.6rem;
   padding-right: .6rem;
   padding-left: .6rem;
   border-top-color: transparent;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border-radius: var(--radius-s);
+  background: rgb(109 74 255 / 12%);
+  box-shadow: inset 3px 0 0 0 var(--accent);
 }
 
 .servers > li.selected + li { border-top-color: transparent; }
@@ -490,16 +594,17 @@ a.icon-btn { text-decoration: none; }
 .note {
   margin-bottom: .6rem;
   padding: .55rem .8rem;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--warn) 13%, transparent);
+  border: 1px solid rgb(255 173 51 / 35%);
+  border-radius: var(--radius-s);
+  background: rgb(255 173 51 / 13%);
   font-size: .9rem;
 }
 .note.bad {
-  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
-  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border-color: rgb(247 96 126 / 55%);
+  background: rgb(247 96 126 / 12%);
 }
 .nodes-note { margin: -.2rem 0 .6rem; }
-/* Основной сервер: переключатель, пояснение и кнопка замера скорости. */
+
 .main-box {
   display: flex;
   flex-wrap: wrap;
@@ -507,19 +612,19 @@ a.icon-btn { text-decoration: none; }
   gap: .6rem .75rem;
   margin-bottom: .8rem;
   padding: .65rem .8rem;
-  border-radius: 12px;
-  background: var(--card-2);
+  border-radius: var(--radius-s);
+  background: rgb(255 255 255 / 4%);
 }
 .main-text { display: flex; flex: 1 1 14rem; flex-direction: column; min-width: 0; }
 .main-title { font-weight: 600; }
-/* Расход трафика на проверки серверов: под списком, заметнее — при превышении лимита. */
+
 .budget-note { margin-top: .8rem; padding-top: .7rem; border-top: 1px solid var(--line); }
 .budget-note.over {
   padding: .55rem .8rem;
   border: 0;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--warn) 16%, transparent);
-  color: var(--text, inherit);
+  border-radius: var(--radius-s);
+  background: rgb(255 173 51 / 16%);
+  color: var(--text);
 }
 .budget-note b { font-weight: 600; }
 
@@ -550,34 +655,35 @@ a.icon-btn { text-decoration: none; }
 }
 
 .group[open] > summary::before { transform: rotate(45deg) translate(-.1rem, -.1rem); }
-.group-name { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.group-name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .group-count { flex: none; }
 .group-tools { display: flex; flex-wrap: wrap; gap: .4rem; margin: .1rem 0 .3rem; }
 .group > .list { margin-bottom: .4rem; }
 .empty-text { padding: .4rem 0; }
 
 .row-tools { display: flex; flex: none; align-items: center; gap: .15rem; }
+
+/* Выпадающий выбор (ядро, приоритет, маршруты): поле Proton. */
 .prio {
   flex: none;
   max-width: 6.6rem;
   margin: 0 .15rem;
   padding: .15rem .3rem;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--card-2);
+  border-radius: 6px;
+  background: rgb(255 255 255 / 5%);
   color: var(--muted);
   font: inherit;
   font-size: .8rem;
   cursor: pointer;
+  transition: background .15s ease, border-color .15s ease;
 }
-.prio.high { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
+.prio:hover { background: rgb(255 255 255 / 10%); }
+.prio.high { border-color: rgb(109 74 255 / 55%); color: var(--accent-hover); }
 .prio.low { opacity: .8; }
 .prio[data-busy] { cursor: progress; opacity: .6; }
 
-/* Сервер — в две строки: сверху имя с метками и задержка, снизу состояние и кнопки (выбрать,
-   ядро, приоритет, выключатель, убрать). В одну строку с кнопками имени не оставалось места. */
-/* Четыре колонки: кнопки во второй строке шире задержки, и в общей с ней колонке они отняли бы
-   место у имени. */
+/* Сервер — в две строки (раскладка прежняя, грид-области менять нельзя). */
 .servers > li.server {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto;
@@ -586,7 +692,6 @@ a.icon-btn { text-decoration: none; }
   gap: .3rem .75rem;
 }
 .server > .dot { grid-area: dot; }
-/* Метки, которым не хватает места, уходят под имя, а не сжимают его. */
 .server > .row-title { grid-area: title; flex-wrap: wrap; row-gap: .2rem; }
 .server > .values {
   grid-area: value;
@@ -595,13 +700,12 @@ a.icon-btn { text-decoration: none; }
   justify-content: flex-end;
   gap: .6rem;
 }
-.speed { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
-/* Иконка замера одного сервера — маленькая, рядом с цифрой скорости. */
+.speed { flex: none; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
 .icon-btn.speed-btn { width: 1.6rem; height: 1.6rem; align-self: center; }
 .icon-btn.speed-btn svg { width: .9rem; height: .9rem; }
 .icon-btn.speed-btn[data-busy="1"] svg { animation: spin 1s linear infinite; }
 .icon-btn.speed-btn:disabled { cursor: progress; opacity: .7; }
-.speed.old { color: var(--muted); font-weight: 400; }
+.speed.old { color: var(--hint); font-weight: 400; }
 .server > .row-sub { grid-area: sub; }
 .server > .row-tools {
   grid-area: tools;
@@ -610,14 +714,12 @@ a.icon-btn { text-decoration: none; }
   justify-self: end;
   row-gap: .3rem;
 }
-/* Узкий экран: состояние — во всю ширину, кнопки — третьей строкой от края до края. */
+
 @media (max-width: 599.98px) {
   .servers > li.server {
     grid-template-areas: "dot title title value" ". sub sub sub" "tools tools tools tools";
   }
   .server > .row-tools { justify-self: stretch; }
-  /* Скорость — над задержкой: в одну строку они отнимали у имени половину ширины. Иконка
-     замера — слева от скорости, а не отдельной строкой над ней. */
   .server > .values {
     display: grid;
     grid-template-columns: auto auto;
@@ -627,57 +729,58 @@ a.icon-btn { text-decoration: none; }
   }
   .server > .values > * { grid-column: 2; }
   .server > .values > .speed-btn { grid-column: 1; grid-row: 1; }
-  /* Чтобы кнопки сервера уместились в одну строку и на экране телефона. */
   .server .prio { margin: 0; padding-right: .2rem; padding-left: .25rem; }
   .server .choose { padding-right: .55rem; padding-left: .55rem; }
 }
 .servers > li.off .row-title, .servers > li.off .row-sub { opacity: .62; }
 
-/* --- вкладки «Подписки | Бесплатные серверы» -------------------------------- */
+/* --- вкладки «Подписки | Бесплатные серверы» (Proton: stackswitcher) ------- */
 
 .mode-tabs {
   display: flex;
   gap: .25rem;
-  padding: .25rem;
+  padding: .3rem;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-s);
   background: var(--card);
   box-shadow: var(--shadow);
 }
 .mode-tab {
   flex: 1 1 0;
-  min-width: 0;
+  min-width: 94px;              /* Proton: сегмент 94px */
   padding: .5rem .8rem;
   border: 0;
-  border-radius: calc(var(--radius) - .25rem);
+  border-radius: 6px;
   background: transparent;
   color: var(--muted);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
+  transition: background .15s ease, color .15s ease;
 }
-.mode-tab:hover { color: var(--text); }
-.mode-tab[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
-.mode-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mode-tab:hover { background: rgb(255 255 255 / 10%); color: var(--text); }
+.mode-tab[aria-selected="true"] { background: var(--accent); color: #fff; }
+.mode-tab:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
 .head-tools { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; }
 
-/* Бесплатные серверы — по источникам, как серверы подписок; в шапке источника — итог опроса. */
 #pool-groups > .group:first-child { border-top: 0; }
 .group > summary > .tag { align-self: center; }
 .group-note { margin-bottom: .3rem; white-space: normal; }
 .pool-more { margin: 0 0 .5rem; }
 .pool-more > summary { padding: .3rem 0; color: var(--muted); font-size: .87rem; cursor: pointer; }
 
+/* --- свитчи (Proton: 46×26, ручка 20px, checked = interaction-norm) -------- */
+
 .switch {
   position: relative;
   flex: none;
-  width: 2.3rem;
-  height: 1.3rem;
+  width: 2.875rem;              /* 46px */
+  height: 1.625rem;             /* 26px */
   margin: 0 .2rem;
   padding: 0;
   border: 0;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--muted) 45%, var(--card-2));
+  background: #4a4658;          /* interaction-weak */
   cursor: pointer;
   transition: background .15s ease;
 }
@@ -685,52 +788,54 @@ a.icon-btn { text-decoration: none; }
 .switch::after {
   content: "";
   position: absolute;
-  top: .15rem;
-  left: .15rem;
-  width: 1rem;
-  height: 1rem;
+  top: .1875rem;                /* 3px — посадка ручки, как в Proton */
+  left: .1875rem;
+  width: 1.25rem;               /* 20px */
+  height: 1.25rem;
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 1px 2px rgb(0 0 0 / 35%);
   transition: transform .15s ease;
 }
 
+.switch:hover { background: #5c5969; }              /* interaction-weak-hover */
 .switch[aria-checked="true"] { background: var(--accent); }
-.switch[aria-checked="true"]::after { transform: translateX(1rem); }
+.switch[aria-checked="true"]:hover { background: var(--accent-hover); }
+.switch[aria-checked="true"]::after { transform: translateX(1.25rem); }
 .switch:disabled { cursor: not-allowed; opacity: .4; }
 
-.quota { height: .32rem; margin-top: .4rem; border-radius: 999px; background: var(--card-2); overflow: hidden; }
-.quota > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+/* Прогресс-полосы: квоты и трафик (Proton: levelbar 6px, r3). */
+.quota { height: .32rem; margin-top: .4rem; border-radius: 999px; background: var(--card-3); overflow: hidden; }
+.quota > span { display: block; height: 100%; border-radius: inherit; background: var(--ok); }
 .quota.warn > span { background: var(--warn); }
 .quota.bad > span { background: var(--bad); }
 
 .mono { font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; font-size: .84rem; }
 
 .events > li { align-items: baseline; }
-.events time { flex: none; width: 5.6rem; color: var(--muted); font-size: .84rem; font-variant-numeric: tabular-nums; }
+.events time { flex: none; width: 5.6rem; color: var(--hint); font-size: .84rem; font-variant-numeric: tabular-nums; }
 .events .row-main { overflow-wrap: anywhere; }
 
-/* Трафик (usage.py): полоса под строкой — доля от самой большой строки списка. */
 .usage .row-sub { white-space: normal; }
-.usage-bar { display: block; height: 4px; margin-top: .35rem; overflow: hidden; border-radius: 2px; background: var(--line); }
+.usage-bar { display: block; height: 4px; margin-top: .35rem; overflow: hidden; border-radius: 2px; background: var(--card-3); }
 .usage-bar > span { display: block; height: 100%; background: var(--accent); }
-.usage-period[aria-pressed="true"] { border-color: var(--accent); }
+.usage-period[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-hover); }
 
-.foot { max-width: var(--page); margin: 0 auto; padding: 0 1.3rem 2rem; }
+.foot { max-width: var(--page); margin: 0 auto; padding: 0 1.3rem 2rem; color: var(--hint); }
 
-/* --- окна и сообщения ----------------------------------------------------- */
+/* --- окна и сообщения ------------------------------------------------------ */
 
 .dialog {
   width: min(26rem, calc(100vw - 2rem));
   padding: 1.3rem;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: var(--radius);
-  background: var(--card);
+  background: var(--card-2);          /* Proton: диалоги на background-weak */
   color: var(--text);
   box-shadow: var(--shadow);
 }
 
-.dialog::backdrop { background: rgb(0 0 0 / 55%); }
+.dialog::backdrop { background: rgb(12 12 20 / 60%); }   /* backdrop-norm */
 .dialog h3 { margin-bottom: .5rem; font-size: 1.1rem; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
 
@@ -752,9 +857,9 @@ a.icon-btn { text-decoration: none; }
   max-width: 34rem;
   padding: .65rem 1rem;
   border: 1px solid var(--line);
-  border-left: 4px solid var(--accent);
-  border-radius: 12px;
-  background: var(--card);
+  border-left: 4px solid var(--ok);
+  border-radius: var(--radius-s);
+  background: var(--card-2);
   box-shadow: var(--shadow);
   overflow-wrap: anywhere;
   pointer-events: auto;
@@ -763,16 +868,39 @@ a.icon-btn { text-decoration: none; }
 .toast.bad { border-left-color: var(--bad); }
 .toast .muted { display: block; margin-top: .2rem; font-size: .87rem; }
 
-/* --- страница входа ------------------------------------------------------- */
+/* --- страница входа -------------------------------------------------------- */
 
 body.login { display: grid; place-items: center; padding: 1.5rem; }
-.login-card { display: flex; flex-direction: column; gap: .8rem; width: min(27rem, 100%); padding: 2rem 1.7rem; }
+.login-card {
+  display: flex;
+  flex-direction: column;
+  gap: .8rem;
+  width: min(27rem, 100%);
+  padding: 2rem 1.7rem;
+  /* Свечение бренда сверху карточки, как у главного окна Proton. */
+  background-image: linear-gradient(to bottom, rgb(109 74 255 / 14%) 0%, rgb(109 74 255 / 0%) 160px);
+}
 .login-card h1 { font-size: 1.35rem; }
 .login-card img { border-radius: 14px; }
-.command { margin: 0; padding: .6rem .8rem; border-radius: 10px; background: var(--card-2); font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; }
+.command {
+  margin: 0;
+  padding: .6rem .8rem;
+  border-radius: var(--radius-s);
+  background: var(--card-2);
+  color: var(--vpn-green);
+  font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace;
+}
 .login-form { display: flex; flex-direction: column; gap: .5rem; margin-top: .3rem; }
 .login-form label { font-weight: 600; }
-.login-form input { padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--card-2); }
+.login-form input {
+  padding: .55rem .7rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  background: rgb(255 255 255 / 5%);
+  transition: background .15s ease, border-color .15s ease;
+}
+.login-form input:hover { background: rgb(255 255 255 / 10%); }
+.login-form input:focus { border-color: #fff; background: rgb(255 255 255 / 20%); outline: 2px solid var(--link); outline-offset: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
