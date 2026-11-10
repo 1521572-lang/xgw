@@ -1,4 +1,4 @@
-"""Данные разделов «Серверы», «Подписки» и «Устройства» окна XGW без Qt: строки серверов пула и
+"""Данные разделов «Серверы», «Подписки», «Устройства» и «Трафик» без Qt: строки серверов пула и
 подписок — уже словами. Тексты те же, что у браузерной панели (ui/app.js: serverRow,
 serverNote, renderMain, renderSubs, poolRow, poolNote), чтобы окно и страница говорили об одном
 и том же одинаково. Действия — только существующие действия панели (Panel.act).
@@ -6,9 +6,11 @@ serverNote, renderMain, renderSubs, poolRow, poolNote), чтобы окно и �
 
 from __future__ import annotations
 
+import datetime
 import time
 from dataclasses import dataclass, field
 
+from ..usage import size
 from . import model
 
 MANUAL = "manual"  # ui/app.js MANUAL: отдельные ссылки серверов
@@ -695,3 +697,53 @@ def devices(state: dict | None) -> list[DeviceItem]:
             bypass, locked, offline, bool(row.get("kernel")), route, tuple(options.items()),
         ))
     return result
+
+
+@dataclass(frozen=True)
+class TrafficRow:
+    name: str
+    down: str
+    up: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class TrafficReport:
+    period: str
+    total: TrafficRow
+    devices: tuple[TrafficRow, ...]
+    exits: tuple[TrafficRow, ...]
+
+
+def traffic_report(data: dict, days: int) -> TrafficReport:
+    """Данные /api/traffic, в единицах браузерной панели и команды xgw traffic."""
+    if data.get("days") != days:
+        raise ValueError("другой период")
+    since = datetime.date.fromisoformat(data["since"]).strftime("%d.%m.%Y")
+    period = f"Сегодня, {since}" if days == 1 else f"За {days} дней, с {since}"
+
+    def row(name: str, item: dict, detail: str = "") -> TrafficRow:
+        return TrafficRow(str(name), size(item["down"]), size(item["up"]), str(detail))
+
+    devices = tuple(row(item.get("name") or "Без имени", item, item.get("ip") or "")
+                    for item in data["devices"])
+    exits = []
+    for item in data["subscriptions"]:
+        quota = item.get("quota")
+        detail = ""
+        if quota:
+            detail = (f"Учтено ≈ {size(item['billed'])} · по данным подписки "
+                      f"{size(quota['used'])} из {size(quota['total'])}")
+            if quota.get("expire"):
+                detail += " · до " + time.strftime("%d.%m.%Y", time.localtime(quota["expire"]))
+        exits.append(row(source_name(item["name"]), item, detail))
+    pool = data["pool"]
+    if pool["up"] or pool["down"]:
+        exits.append(row("Бесплатные серверы", pool))
+    exits.append(row("Напрямую (мимо VPN)", data["direct"]))
+    if data.get("wan") is not None:
+        exits.append(row("Всего через провайдера (WAN)", data["wan"],
+                         "Включая служебный трафик VPN"))
+        exits.append(row("Шлюз и служебное", data["gateway"], "WAN за вычетом устройств"))
+    return TrafficReport(period, row("Устройства · всего", data["devices_total"]),
+                         devices, tuple(exits))

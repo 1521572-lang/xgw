@@ -73,6 +73,8 @@ class ApiClient(QObject):
     def set_session(self, session: model.Session | None) -> None:
         self.session = session
         self.gate.drop()
+        for gate in self.side.values():
+            gate.drop()
         self.backoff.reset()
         self.state = None
         if self.running:
@@ -223,6 +225,8 @@ class ApiClient(QObject):
             reply.deleteLater()
             if not gate.finish(number):
                 return
+            if code == 401:
+                self._set_link(LINK_AUTH, model.error_text(401))
             found = model.parse_json(data) if code == 200 else None
             if found is None:
                 done(None, model.error_text(code, data.decode("utf-8", "replace"), network))

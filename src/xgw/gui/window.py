@@ -34,6 +34,7 @@ from . import client as clienting
 from . import model, theme
 from .devices import DevicesPage
 from .pages import ServersPage, SubscriptionsPage
+from .traffic import TrafficPage
 from .widgets import (
     Badge,
     Metric,
@@ -60,7 +61,6 @@ PENDING = {
     "servers": "Серверы подписок и бесплатного пула: выбор сервера, приоритет, ядро, замеры "
                "скорости, проверка запасных.",
     "subscriptions": "Подписки и отдельные ссылки серверов: добавить, изменить, обновить, убрать.",
-    "traffic": "Расход трафика по устройствам, подпискам и бесплатному пулу.",
     "diagnostics": "«Проверить сеть», журнал событий, обновление ядер Xray и sing-box.",
     "extra": "Tailscale (вход, SSH, панель по tailnet, Funnel) и телефоны.",
 }
@@ -514,9 +514,10 @@ class MainWindow(QMainWindow):
         self.servers = ServersPage(self)
         self.subscriptions = SubscriptionsPage(self)
         self.devices = DevicesPage(self)
+        self.traffic = TrafficPage(self)
         self.pages: dict[str, QWidget] = {"overview": self.overview, "servers": self.servers,
                                           "subscriptions": self.subscriptions,
-                                          "devices": self.devices}
+                                          "devices": self.devices, "traffic": self.traffic}
         for key, _title in SECTIONS[1:]:
             if key not in self.pages:
                 self.pages[key] = PendingPage(key, TITLES[key], PENDING[key], self.open_browser)
@@ -634,6 +635,8 @@ class MainWindow(QMainWindow):
         current = self.stack.currentWidget()
         if current in (self.servers, self.subscriptions, self.devices):
             current.show_state(None if stale and state is None else state)
+        elif current is self.traffic:
+            self.traffic.refresh()
         self._logo(model.shield(state, stale)[0] if state is not None else "off")
         self._tick()
 
@@ -660,6 +663,8 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pages[key])
         if key in ("servers", "subscriptions", "devices"):
             self.pages[key].show_state(self.state)
+        elif key == "traffic":
+            self.traffic.refresh()
 
     def _theme_changed(self, action: QAction) -> None:
         choice = str(action.data())

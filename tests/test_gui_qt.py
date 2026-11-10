@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -348,6 +349,43 @@ def test_devices_page_only_changes_routes_through_the_panel(qapp, demo, tmp_path
     win.on_link(clienting.LINK_OFFLINE, "")
     assert not card.bypass.isEnabled() and not card.route.isEnabled()
     win.close()
+
+
+def test_traffic_discards_a_late_reply_after_period_changes(qapp, demo, tmp_path, monkeypatch):
+    fetched = []
+    first, second = threading.Event(), threading.Event()
+    original = demo.traffic
+
+    def traffic(days):
+        fetched.append(days)
+        {"1": first, "7": second}[days].wait(5)
+        return original(days)
+
+    monkeypatch.setattr(demo, "traffic", traffic)
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    try:
+        wait(qapp, lambda: win.state is not None)
+        assert fetched == []
+        win.nav.setCurrentRow(4)
+        wait(qapp, lambda: fetched == ["1"])
+        page = win.traffic
+        page.periods.button(7).click()
+        assert fetched == ["1"]
+        first.set()
+        wait(qapp, lambda: fetched == ["1", "7"])
+        assert page.report is None and page.table.isHidden()
+        second.set()
+        wait(qapp, lambda: page.report is not None)
+        assert page.report.period.startswith("За 7 дней") and not page.table.isHidden()
+        assert page.devices.text(1) == "0 КБ"
+        assert page.exits.child(0).text(0) == "Напрямую (мимо VPN)"
+    finally:
+        first.set()
+        second.set()
+        win.close()
 
 
 def test_subscriptions_page_adds_a_link_and_clears_the_field_only_on_success(qapp, demo,

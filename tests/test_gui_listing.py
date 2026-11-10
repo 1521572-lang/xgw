@@ -4,6 +4,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from xgw.gui import listing
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gui"
@@ -30,6 +32,33 @@ def test_devices_keep_fixed_exclusions_and_unavailable_routes_visible():
     assert "закрыты" in rows[unnamed["mac"]].status
     state["lan"] = {}
     assert listing.devices(state) == []
+
+
+def test_traffic_report_uses_backend_totals_and_distinguishes_quota_from_bytes():
+    data = json.loads((FIXTURES / "traffic-work.json").read_text(encoding="utf-8"))
+    empty = listing.traffic_report(data, 7)
+    assert empty.devices == () and [row.name for row in empty.exits] == ["Напрямую (мимо VPN)"]
+    data.update(
+        devices=[{"name": "", "ip": "fixture", "down": 1_500_000, "up": 10_000}],
+        devices_total={"down": 1_500_000, "up": 10_000},
+        subscriptions=[{
+            "name": "main", "down": 1_500_000, "up": 10_000, "billed": 15_100_000,
+            "quota": {"used": 20_000_000, "total": 1_000_000_000},
+        }],
+        pool={"down": 1000, "up": 0},
+        wan={"down": 1_700_000, "up": 11_000}, gateway={"down": 200_000, "up": 1000},
+    )
+    report = listing.traffic_report(data, 7)
+    assert report.period == "За 7 дней, с 01.11.2026"
+    assert report.total.down == report.devices[0].down == "1,5 МБ"
+    assert report.devices[0].name == "Без имени" and report.devices[0].detail == "fixture"
+    assert report.exits[0].detail == "Учтено ≈ 15,1 МБ · по данным подписки 20,0 МБ из 1,0 ГБ"
+    assert [row.name for row in report.exits[1:]] == [
+        "Бесплатные серверы", "Напрямую (мимо VPN)", "Всего через провайдера (WAN)",
+        "Шлюз и служебное",
+    ]
+    with pytest.raises(ValueError, match="другой период"):
+        listing.traffic_report(data, 30)
 
 
 def test_servers_are_grouped_by_subscription_and_speak_like_the_web_panel():
