@@ -550,3 +550,76 @@ def test_server_details_open_without_changing_connection(qapp, tmp_path, monkeyp
         "protocol": "vless", "password": "PRIVATE_SENTINEL", "outbound": {"secret": "x"}})
     assert "<img" not in escaped and "&lt;img" in escaped and "PRIVATE_SENTINEL" not in escaped
     win.close()
+
+
+def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch):
+    from xgw.gui.zapret2 import SettingsDialog
+
+    original = demo.state
+    view = {"mode": "off", "state": "off", "title": "Выключен", "detail": "Выключен",
+            "config_key": "current", "domains": ["domain:youtube.com", "domain:googlevideo.com"],
+            "strategy": "multisplit", "probe_count": 2, "check_seconds": 180,
+            "retry_seconds": 300, "daily_probe_mb": 256, "can_edit": True,
+            "can_off": False, "blockers": {"selective": [], "compare": []}, "probes": []}
+    sent = []
+
+    def state():
+        return {**original(), "updated": time.time(), "zapret2": dict(view)}
+
+    def act(name, body):
+        sent.append((name, body))
+        return panel_demo.actions.Outcome(0, "Сохранено")
+
+    monkeypatch.setattr(demo, "state", state)
+    monkeypatch.setattr(demo, "_act", act)
+    client = _client(demo.port)
+    win = _window(client, tmp_path)
+    win.show()
+    client.start()
+    try:
+        wait(qapp, lambda: win.state is not None)
+        assert "zapret2" in win.overview.zapret2.text()
+        win.overview.zapret2.click()
+        assert win.stack.currentWidget() is win.zapret2
+        page = win.zapret2
+        compare, enable, disable = page.status.items["mode"].buttons
+        assert compare.isEnabled() and enable.isEnabled() and not disable.isEnabled()
+        page.confirm = lambda *_: False
+        compare.click()
+        assert not sent
+        page.confirm = lambda *_: True
+        compare.click()
+        assert not enable.isEnabled()  # один общий ключ блокирует параллельные команды
+        wait(qapp, lambda: not client.actions.running)
+        assert sent == [("zapret2/mode", {"mode": "compare", "expected": "current"})]
+
+        def fill(dialog):
+            dialog.strategy.setCurrentText("multidisorder")
+            dialog.urls[0].setText("https://youtube.com/watch?v=PRIVATE_SENTINEL")
+            dialog.urls[1].setText("https://cdn.googlevideo.com/video?token=PRIVATE_SENTINEL")
+            assert all(field.echoMode() == QtWidgets.QLineEdit.EchoMode.Password
+                       for field in dialog.urls)
+            return QtWidgets.QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(SettingsDialog, "exec", fill)
+        page.settings_rows.items["settings"].buttons[0].click()
+        wait(qapp, lambda: len(sent) == 2 and not client.actions.running)
+        assert sent[-1][0] == "zapret2/settings"
+        assert sent[-1][1]["settings"]["strategy"] == "multidisorder"
+
+        client.stop()
+        for code, title in (("active", "Работает"), ("fallback", "Возврат на VPN"),
+                            ("blocked", "Возврат не подтверждён"), ("pending", "Применение")):
+            view.update(state=code, title=title, can_edit=False, can_off=True,
+                        blockers={"compare": ["Сначала выключите"],
+                                  "selective": ["Сначала выключите"]})
+            win.on_state(state())
+            assert title in page.status_note.text() and title in win.overview.zapret2.text()
+            assert not compare.isEnabled() and not enable.isEnabled() and disable.isEnabled()
+        win.on_link(clienting.LINK_OFFLINE, "")
+        assert not disable.isEnabled() and "устарели" in win.overview.zapret2.text()
+        win.resize(1024, 720)
+        qapp.processEvents()
+        assert page.width() <= win.width()
+    finally:
+        win.close()

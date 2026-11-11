@@ -43,6 +43,8 @@ from .widgets import (
     set_text,
     tone,
 )
+from .zapret2 import Zapret2Page
+from .zapret2 import summary as zapret2_summary
 
 SECTIONS = (
     ("overview", "Обзор"),
@@ -52,6 +54,7 @@ SECTIONS = (
     ("traffic", "Трафик"),
     ("diagnostics", "Диагностика"),
     ("extra", "Ещё"),
+    ("zapret2", "zapret2"),
 )
 MIN_SIZE = (1024, 720)
 START_SIZE = (1280, 820)
@@ -214,6 +217,11 @@ class OverviewPage(QWidget):
         self.power_why.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tone(self.power_why, "warn")
         box.addWidget(self.power_why)
+        self.zapret2 = QPushButton("zapret2")
+        self.zapret2.setAccessibleName("Состояние и управление zapret2")
+        self.zapret2.clicked.connect(lambda: self.main.nav.setCurrentRow(
+            next(i for i, (key, _) in enumerate(SECTIONS) if key == "zapret2")))
+        box.addWidget(self.zapret2, 0, Qt.AlignmentFlag.AlignCenter)
 
         box.addStretch(1)
 
@@ -323,6 +331,9 @@ class OverviewPage(QWidget):
 
     def show_state(self, state: dict | None, stale: bool) -> None:
         acting = self.main.client.actions.busy("power")
+        zapret_tone, zapret_text = zapret2_summary(state, stale)
+        self.zapret2.setText(zapret_text)
+        tone(self.zapret2, zapret_tone)
         power = model.power(state, stale, acting=acting)
         shield_tone, word = model.shield(state, stale, acting=acting)
         tone(self.conn, shield_tone)
@@ -330,7 +341,10 @@ class OverviewPage(QWidget):
         set_text(self.word, word.upper())
         self.orb.set_tone(shield_tone)
         set_text(self.power_title, power.title)
-        set_text(self.power_sub, power.sub)
+        extra = (" Выбранные домены идут через zapret2 с домашним IP."
+                 if not stale and ((state or {}).get("zapret2") or {}).get("state") == "active"
+                 else "")
+        set_text(self.power_sub, power.sub + extra)
         self.power.setText("Выключаю…" if acting and power.pressed else
                            "Включаю…" if acting else
                            ("Выключить VPN" if power.pressed else "Включить VPN"))
@@ -477,10 +491,12 @@ class MainWindow(QMainWindow):
         self.traffic = TrafficPage(self)
         self.diagnostics = DiagnosticsPage(self)
         self.extra = ExtraPage(self)
+        self.zapret2 = Zapret2Page(self)
         self.pages: dict[str, QWidget] = {"overview": self.overview, "servers": self.servers,
                                           "subscriptions": self.subscriptions,
                                           "devices": self.devices, "traffic": self.traffic,
-                                          "diagnostics": self.diagnostics, "extra": self.extra}
+                                          "diagnostics": self.diagnostics, "extra": self.extra,
+                                          "zapret2": self.zapret2}
         for key, _title in SECTIONS:
             self.stack.addWidget(self.pages[key])
         self.stack.addWidget(self.login_page)
@@ -594,7 +610,7 @@ class MainWindow(QMainWindow):
         self.overview.show_state(state, stale)
         current = self.stack.currentWidget()
         if current in (self.servers, self.subscriptions, self.devices,
-                       self.diagnostics, self.extra):
+                       self.diagnostics, self.extra, self.zapret2):
             current.show_state(state)
         elif current is self.traffic:
             self.traffic.refresh()
@@ -622,7 +638,7 @@ class MainWindow(QMainWindow):
             return
         key = SECTIONS[max(0, row)][0]
         self.stack.setCurrentWidget(self.pages[key])
-        if key in ("servers", "subscriptions", "devices", "diagnostics", "extra"):
+        if key in ("servers", "subscriptions", "devices", "diagnostics", "extra", "zapret2"):
             self.pages[key].show_state(self.state)
         elif key == "traffic":
             self.traffic.refresh()

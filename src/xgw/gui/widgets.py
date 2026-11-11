@@ -260,6 +260,10 @@ def draw(painter: QPainter, name: str, color: QColor, width: float = 1.8) -> Non
         path.moveTo(3, 12)
         for px, py in ((7, 12), (10, 5), (14, 19), (17, 12), (21, 12)):
             path.lineTo(px, py)
+    elif name == "zapret2":
+        painter.drawPolyline(QPolygonF([QPointF(14, 3), QPointF(5, 13), QPointF(11, 13),
+                                       QPointF(9, 21), QPointF(19, 10), QPointF(13, 10),
+                                       QPointF(14, 3)]))
     elif name == "extra":
         for y, knob in ((7, 9), (12, 15), (17, 7)):
             path.moveTo(4, y)

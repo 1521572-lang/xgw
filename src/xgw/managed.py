@@ -102,6 +102,7 @@ def load(path: Path) -> tuple[dict, str]:
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
         "free_pool_mode": None, "free_pool_pin": "", "hidden_subscriptions": [],
+        "zapret2": {},
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -163,7 +164,47 @@ def load(path: Path) -> tuple[dict, str]:
         # Подписки config.toml, убранные в панели или окне (п. 337): сам config.toml панель
         # не переписывает — имя здесь, и при слиянии такая подписка пропускается.
         "hidden_subscriptions": _hidden(raw.get("hidden_subscriptions")),
+        "zapret2": _zapret2(raw.get("zapret2", {})),
     }, ""
+
+
+def zapret2_settings(value: object) -> dict:
+    """Только параметры режима из окна. Пути к исполняемым файлам менять нельзя."""
+    if not isinstance(value, dict) or set(value) - {"mode", "strategy", "domains", "probe_urls"}:
+        raise ManagedError("Неизвестные настройки zapret2")
+    for key, choices in (("mode", ("off", "compare", "selective")),
+                         ("strategy", ("multisplit", "multidisorder"))):
+        if key in value and value[key] not in choices:
+            raise ManagedError("Недопустимый режим или стратегия zapret2")
+    for key, count, length in (("domains", 64, 260), ("probe_urls", 4, 8192)):
+        if key not in value:
+            continue
+        items = value[key]
+        if (not isinstance(items, list) or len(items) > count
+                or any(not isinstance(item, str) or not item or len(item) > length
+                       for item in items)):
+            raise ManagedError("Неверный список доменов или адресов проверок zapret2")
+    return dict(value)
+
+
+def _zapret2(value: object) -> dict:
+    try:
+        return zapret2_settings(value)
+    except ManagedError:
+        return {"mode": "off"}  # повреждённая запись не включает режим из TOML
+
+
+def set_zapret2(path: Path, settings: dict) -> bool:
+    settings = zapret2_settings(settings)
+
+    def change(data: dict) -> bool:
+        target = {**data["zapret2"], **settings}
+        if target == data["zapret2"]:
+            return False
+        data["zapret2"] = target
+        return True
+
+    return _update(path, change)
 
 
 MAX_HIDDEN = 64

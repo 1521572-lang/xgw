@@ -7226,7 +7226,7 @@ class Daemon:
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
-        snapshot["zapret2"] = dict(self._zapret2.view)
+        snapshot["zapret2"] = {**self._zapret2.view, "config_key": zapret2.config_key(self.cfg)}
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

@@ -735,6 +735,9 @@ class Panel:
         masked["tailscale"] = self._tailscale_card()
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
+        from .zapret2_control import card as zapret2_card
+
+        masked["zapret2"] = zapret2_card(cfg, snapshot, info, self.daemon is not None)
         return masked
 
     def _netcheck_card(self) -> dict:
@@ -1696,6 +1699,10 @@ class Panel:
     def _act(self, name: str, body: dict) -> actions.Outcome:
         cfg, paths = self.cfg, self.paths
         store_path = managed.path_for(self.config_path)
+        if name in ("zapret2/mode", "zapret2/settings"):
+            from .zapret2_control import change as change_zapret2
+
+            return change_zapret2(self, name, body)
         if name == "power":
             problem = self.root_problem()
             if problem:

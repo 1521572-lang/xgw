@@ -8,11 +8,13 @@ XGW не запускает install_easy и не меняет sysctl. Два с�
 from __future__ import annotations
 
 import copy
+import hashlib
 import ipaddress
 import json
 import re
 import stat
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
@@ -37,6 +39,12 @@ PROBE_BYTES = 64 * 1024
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+
+
+def config_key(cfg: Config) -> str:
+    """Версия настроек для сверки запроса окна с применённым снимком демона."""
+    raw = json.dumps(asdict(cfg.zapret2), sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def matches(host: str, domains: list[str]) -> bool:

@@ -701,6 +701,8 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     cfg.managed.removed = list(data["removed"])
     cfg.managed.priority = dict(data["priority"])
     cfg.managed.core = dict(data["core"])
+    for key, value in data["zapret2"].items():
+        setattr(cfg.zapret2, key, value)
     if data["sticky"] is not None:
         cfg.speed.sticky = cfg.managed.sticky = data["sticky"]
     if data["kernel_direct"] is not None:
