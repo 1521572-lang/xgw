@@ -86,6 +86,7 @@ class BrowserCandidate:
     index: int
     transfer_size: int | None
     decoded_body_size: int | None
+    protocol: str | None = None
 
 
 def _browser_video_hint(url: str, domains: list[str], now: float) -> bool | None:
@@ -120,8 +121,13 @@ def browser_candidates(resources: list[dict], domains: list[str],
         video_hint = _browser_video_hint(url, domains, now)
         if video_hint is None:
             continue
+        protocol = resource.get("nextHopProtocol")
+        if not isinstance(protocol, str) or not protocol:
+            protocol = None
+        elif protocol not in ("http/1.0", "http/1.1", "h2", "h3"):
+            protocol = "other"
         row = BrowserCandidate(url, index, _resource_size(resource.get("transferSize")),
-                               _resource_size(resource.get("decodedBodySize")))
+                               _resource_size(resource.get("decodedBodySize")), protocol)
         eligible.append((row, video_hint))
     eligible.sort(key=lambda item: (item[0].transfer_size or 0, item[1]), reverse=True)
     unique = {}
@@ -189,6 +195,7 @@ def compare_replays(candidate: BrowserCandidate, domains: list[str], port: int,
             "candidate_index": candidate.index,
             "transfer_size": candidate.transfer_size,
             "decoded_body_size": candidate.decoded_body_size,
+            "browser_protocol": candidate.protocol,
         })
         if verified is None and result["result"] == "browser_video_verified":
             verified = result

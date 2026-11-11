@@ -97,6 +97,7 @@ def test_receipt_and_replay_follow_selected_path(
         if point is not before:
             saved = json.loads(receipt.read_bytes())
             assert saved["playback"] and saved["verification"] == "pending"
+            assert saved["browser_protocol"] == "h2"
             assert ("video" in saved) == (point is after_replay)
             assert len(saved["replay_attempts"]) == (2 if point is after_replay else 0)
         return point
@@ -154,7 +155,7 @@ def test_receipt_and_replay_follow_selected_path(
         if change == "browser_error":
             record_error(observation_error)
             raise OSError("PRIVATE")
-        candidate = helper.video_probe.BrowserCandidate(url, 4, 4096, 3800)
+        candidate = helper.video_probe.BrowserCandidate(url, 4, 4096, 3800, "h2")
         fallback = helper.video_probe.BrowserCandidate(url + "&fallback=1", 1, 500, 200)
         return [candidate, fallback], "Firefox", "played", True
 
@@ -197,6 +198,7 @@ def test_receipt_and_replay_follow_selected_path(
     attempts = [json.loads(line.removeprefix("ATTEMPT "))
                 for line in output.splitlines() if line.startswith("ATTEMPT ")]
     assert attempts == saved["replay_attempts"]
+    assert "protocol=h2" in output
     if calls:
         assert calls == [True, change == "http_pair"]
         assert saved["candidate_count"] == 2
@@ -207,6 +209,7 @@ def test_receipt_and_replay_follow_selected_path(
             assert attempt["candidate_index"] == 4
             assert attempt["transfer_size"] == 4096
             assert attempt["decoded_body_size"] == 3800
+            assert attempt["browser_protocol"] == "h2"
             assert attempt["video"]["content_type"] == "video/mp4"
     assert ("RESULT browser_video_verified" in output) == (expected == "ok")
     assert "PRIVATE" not in output + receipt.read_text()

@@ -45,8 +45,10 @@ if (v.paused) v.play().catch(() => {});
 const resources = performance.getEntriesByType('resource').reverse()
     .filter(entry => entry.name.length <= 8192 && entry.name.includes('/videoplayback?'))
     .slice(0, 16)
-    .map(entry => ({url: entry.name, transferSize: entry.transferSize,
-                    decodedBodySize: entry.decodedBodySize}));
+    .map(entry => ({
+        url: entry.name, transferSize: entry.transferSize,
+        decodedBodySize: entry.decodedBodySize, nextHopProtocol: entry.nextHopProtocol,
+    }));
 const position = v.videoWidth > 0 && !v.paused && !v.seeking ? v.currentTime : null;
 return {state: 'player', position, resources, agent: navigator.userAgent};
 """

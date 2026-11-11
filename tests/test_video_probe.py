@@ -107,17 +107,17 @@ def test_browser_candidates_rank_by_transfer_size_and_keep_original_observation(
     small += "&mime=video%2Fmp4"
     audio += "&mime=audio%2Fmp4"
     entries = [
-        {"url": recent, "transferSize": 0, "decodedBodySize": -10},
+        {"url": recent, "transferSize": 0, "decodedBodySize": -10, "nextHopProtocol": "PRIVATE"},
         {"url": large, "transferSize": 10, "decodedBodySize": 9},
-        {"url": small, "transferSize": 20, "decodedBodySize": 18},
+        {"url": small, "transferSize": 20, "decodedBodySize": 18, "nextHopProtocol": "http/1.1"},
         {"url": unknown, "transferSize": "99", "decodedBodySize": True},
-        {"url": large, "transferSize": 30, "decodedBodySize": 27},
+        {"url": large, "transferSize": 30, "decodedBodySize": 27, "nextHopProtocol": "h2"},
         {"url": audio, "transferSize": 90, "decodedBodySize": 80},
     ]
     assert v.browser_candidates(entries, DOMAINS, 1000) == [
-        v.BrowserCandidate(large, 5, 30, 27),
-        v.BrowserCandidate(small, 3, 20, 18),
-        v.BrowserCandidate(recent, 1, 0, None),
+        v.BrowserCandidate(large, 5, 30, 27, "h2"),
+        v.BrowserCandidate(small, 3, 20, 18, "http/1.1"),
+        v.BrowserCandidate(recent, 1, 0, None, "other"),
     ]
     assert v.browser_candidates(entries[3:4], DOMAINS, 1000) == [
         v.BrowserCandidate(unknown, 1, None, None),

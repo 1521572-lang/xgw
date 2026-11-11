@@ -133,9 +133,9 @@ def verify(paths, before, original_path, node, password):
 def finish(path, result, verification, xray_changed):
     atomic_write_json(path, {**result, "verification": verification,
                              "xray_config_changed": xray_changed}, mode=0o600)
-    print("BROWSER bytes={} playback={} observation={} candidates={}".format(
+    print("BROWSER bytes={} playback={} observation={} candidates={} protocol={}".format(
         result["browser_bytes"], int(result["playback"]), result["observation"],
-        result["candidate_count"]))
+        result["candidate_count"], result["browser_protocol"] or "-"))
     if "video" in result:
         row = result["video"]
         print("VIDEO http={} bytes={} video_mime={} verdict={} expires_in={}".format(
@@ -226,7 +226,8 @@ def main():
             relay.shutdown()
         spent = relay.spent
     result = {**diagnostics, "result": reason, "observation": reason, "browser_bytes": spent,
-              "playback": played, "candidate_count": len(candidates), "replay_attempts": []}
+              "playback": played, "candidate_count": len(candidates), "replay_attempts": [],
+              "browser_protocol": candidates[0].protocol if candidates else None}
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, changed = verify(paths, before, original_path, node, password)
     if verification != "ok" or not candidates:

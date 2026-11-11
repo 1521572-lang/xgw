@@ -34,7 +34,7 @@ def test_curl_request_bounds_and_response_metadata(
 ):
     def run(command, **kwargs):
         assert command[0:4] == ["/usr/bin/curl", "--disable", "--config", "-"]
-        assert "--http2" in command and "--location" not in command
+        assert "--http2" in command and "--verbose" in command and "--location" not in command
         assert command[command.index("--range") + 1] == "0-16383"
         assert command[command.index("--max-filesize") + 1] == "16384"
         assert command[command.index("--max-time") + 1] == "3.000"
@@ -46,7 +46,9 @@ def test_curl_request_bounds_and_response_metadata(
         output = b"\n".join([
             code, b"2", downloaded, length, encoding, b"Text/Plain; x=PRIVATE", b"",
         ])
-        return subprocess.CompletedProcess(command, exit_code, output, b"PRIVATE")
+        stderr = (b"* ALPN: curl offers h2,http/1.1\n* ALPN: server accepted h2\n"
+                  b"> Proxy-Authorization: Basic PRIVATE\n< X-Private: PRIVATE\n")
+        return subprocess.CompletedProcess(command, exit_code, output, stderr)
 
     monkeypatch.setattr(http.subprocess, "run", run)
     reply, meta = http.get("/usr/bin/curl", "https://example.test/?token=PRIVATE", 12345,
@@ -58,6 +60,8 @@ def test_curl_request_bounds_and_response_metadata(
         "content_length": int(length) if length and code != b"000" else None,
         "content_encoding": {b" GZip ": "gzip", b"PRIVATE": "other"}.get(encoding),
         "curl_exit": exit_code,
+        "alpn_offered": ["h2", "http/1.1"],
+        "alpn_selected": "h2",
     }
     assert "PRIVATE" not in repr((reply, meta))
 
@@ -65,11 +69,26 @@ def test_curl_request_bounds_and_response_metadata(
 def test_curl_process_timeout_preserves_requested_protocol(monkeypatch):
     def run(command, **_kwargs):
         assert "--http1.1" in command and "--http2" not in command
-        raise subprocess.TimeoutExpired(command, 3, output=b"PRIVATE")
+        stderr = b"* ALPN: curl offers http/1.1\n* certificate details PRIVATE\n"
+        raise subprocess.TimeoutExpired(command, 3, output=b"PRIVATE", stderr=stderr)
 
     monkeypatch.setattr(http.subprocess, "run", run)
     reply, meta = http.get("/usr/bin/curl", "https://example.test/", 12345, "PRIVATE", "Firefox",
                            http2=False, max_total=3)
     assert not reply.ok and reply.kind == "timeout"
     assert meta["http_requested"] == "1.1" and meta["http_version"] is None
+    assert meta["alpn_offered"] == ["http/1.1"] and meta["alpn_selected"] is None
     assert "PRIVATE" not in repr((reply, meta))
+
+
+@pytest.mark.parametrize("stderr,offered,selected", [
+    (b"< X-Note: * ALPN: server accepted h2\n", None, None),
+    (b"* ALPN: curl offers h2,http/1.1\n"
+     b"* ALPN: server did not agree on a protocol. Uses default.\n", ["h2", "http/1.1"], "none"),
+    (b"* ALPN: curl offers h2,PRIVATE\n"
+     b"* ALPN: server accepted PRIVATE\n", ["h2", "other"], "other"),
+    (b"* ALPN: curl offers h2\n* ALPN: server accepted h2\n"
+     b"* ALPN: curl offers http/1.1\n", ["http/1.1"], None),
+])
+def test_alpn_metadata_uses_only_protocol_labels(stderr, offered, selected):
+    assert http._alpn(stderr) == {"alpn_offered": offered, "alpn_selected": selected}

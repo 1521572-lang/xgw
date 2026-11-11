@@ -168,7 +168,9 @@ def test_navigation_response_is_recorded_before_observation(tmp_path):
 
 def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
     url = "https://cdn.googlevideo.com/videoplayback?expire=1600"
-    resources = [{"url": url, "transferSize": 4096, "decodedBodySize": 3800}]
+    resources = [{
+        "url": url, "transferSize": 4096, "decodedBodySize": 3800, "nextHopProtocol": "h2",
+    }]
     positions = iter([1, 3])
     stages = []
     monkeypatch.setattr(browser.time, "time", lambda: 1000)
@@ -190,7 +192,7 @@ def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
     result = browser.observe(
         Client(), "", ["domain:googlevideo.com"], relay, tmp_path, stages.append,
     )
-    assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800)],
+    assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800, "h2")],
                       "Firefox", "played", True)
     assert stages[-1] == "playback_observed"
 

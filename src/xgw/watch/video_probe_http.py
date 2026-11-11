@@ -15,6 +15,7 @@ METADATA = (
     "%header{content-length}\n%header{content-encoding}\n%header{content-type}\n"
 )
 CONTENT_ENCODINGS = {"identity", "gzip", "deflate", "br", "zstd"}
+ALPN_PROTOCOLS = {b"h2": "h2", b"http/1.1": "http/1.1", b"h3": "h3"}
 
 
 def supports_http2(curl: str) -> bool:
@@ -38,6 +39,23 @@ def _number(text: str) -> int | None:
     return None
 
 
+def _alpn(stderr: bytes | None) -> dict:
+    """Extract only the protocol labels from curl's TLS diagnostics."""
+    offered, selected = None, None
+    offer_prefix = b"* ALPN: curl offers "
+    accept_prefix = b"* ALPN: server accepted "
+    for line in (stderr or b"").splitlines():
+        if line.startswith(offer_prefix):
+            protocols = line[len(offer_prefix):].split(b",")
+            offered = list(dict.fromkeys(ALPN_PROTOCOLS.get(p.strip(), "other") for p in protocols))
+            selected = None
+        elif line.startswith(accept_prefix):
+            selected = ALPN_PROTOCOLS.get(line[len(accept_prefix):].strip(), "other")
+        elif line == b"* ALPN: server did not agree on a protocol. Uses default.":
+            selected = "none"
+    return {"alpn_offered": offered, "alpn_selected": selected}
+
+
 def get(curl: str, url: str, port: int, password: str, agent: str,
         *, http2: bool, max_total: float) -> tuple[DownloadResult, dict]:
     """Send secrets over stdin and keep only selected response metadata."""
@@ -47,6 +65,8 @@ def get(curl: str, url: str, port: int, password: str, agent: str,
         "content_length": None,
         "content_encoding": None,
         "curl_exit": None,
+        "alpn_offered": None,
+        "alpn_selected": None,
     }
     milliseconds = int(max_total * 1000)
     if milliseconds <= 0:
@@ -56,7 +76,7 @@ def get(curl: str, url: str, port: int, password: str, agent: str,
     config = "".join(f"{key} = {json.dumps(value, ensure_ascii=False)}\n"
                      for key, value in options.items())
     command = [
-        curl, "--disable", "--config", "-", "--silent", "--globoff", "--path-as-is",
+        curl, "--disable", "--config", "-", "--silent", "--verbose", "--globoff", "--path-as-is",
         "--proto", "=https", "--proxy", f"http://127.0.0.1:{port}", "--noproxy", "",
         "--proxy-basic", "--http2" if http2 else "--http1.1",
         "--range", f"0-{zapret2.MIN_BODY - 1}", "--max-filesize", str(zapret2.MIN_BODY),
@@ -66,12 +86,14 @@ def get(curl: str, url: str, port: int, password: str, agent: str,
     try:
         result = subprocess.run(command, input=config.encode(), capture_output=True,
                                 env=CURL_ENV, timeout=max_total, check=False)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        metadata.update(_alpn(exc.stderr))
         return DownloadResult(False, kind="timeout"), metadata
     except OSError:
         return DownloadResult(False, kind="io"), metadata
 
     metadata["curl_exit"] = result.returncode
+    metadata.update(_alpn(result.stderr))
     rows = result.stdout.decode("latin-1").split("\n")
     if len(rows) != 7 or rows[-1]:
         return DownloadResult(False, kind="io"), metadata
