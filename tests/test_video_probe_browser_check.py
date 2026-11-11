@@ -97,7 +97,7 @@ def test_receipt_and_replay_follow_selected_path(
             saved = json.loads(receipt.read_bytes())
             assert saved["playback"] and saved["verification"] == "pending"
             assert ("video" in saved) == (point is after_replay)
-            assert len(saved["replay_attempts"]) == int(point is after_replay)
+            assert len(saved["replay_attempts"]) == (2 if point is after_replay else 0)
         return point
 
     class Relay:
@@ -137,6 +137,7 @@ def test_receipt_and_replay_follow_selected_path(
         "method": "WebDriver:Navigate", "exception": "MarionetteCommandError", "code": "timeout",
     }
     observation_error = {"method": "WebDriver:ExecuteScript", "exception": "EOFError"}
+    url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
 
     def observe(_firefox, _user, _page, _domains, _relay, progress, record_error):
         for index, stage in enumerate(expected_stages[1:], 2):
@@ -148,17 +149,19 @@ def test_receipt_and_replay_follow_selected_path(
         if change == "browser_error":
             record_error(observation_error)
             raise OSError("PRIVATE")
-        url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
         candidate = helper.video_probe.BrowserCandidate(url, 4, 4096, 3800)
-        return [candidate], "Firefox", "played", True
+        fallback = helper.video_probe.BrowserCandidate(url + "&fallback=1", 1, 500, 200)
+        return [candidate, fallback], "Firefox", "played", True
 
     monkeypatch.setattr(helper.video_browser, "browser", observe)
     calls = []
 
-    def replay(*args, **_kwargs):
-        calls.append(args)
+    def replay(target, *_args, use_range, **_kwargs):
+        assert target == url
+        calls.append(use_range)
         return {"result": "browser_video_verified", "expires_in": 900, "video": {
             "http": 206, "bytes": 16384, "video_mime": True, "verdict": "ok",
+            "content_type": "video/mp4",
         }}
 
     monkeypatch.setattr(helper.video_probe, "replay", replay)
@@ -188,9 +191,15 @@ def test_receipt_and_replay_follow_selected_path(
                 for line in output.splitlines() if line.startswith("ATTEMPT ")]
     assert attempts == saved["replay_attempts"]
     if calls:
-        assert attempts[0]["attempt"] == 1
-        assert attempts[0]["candidate_index"] == 4
-        assert attempts[0]["transfer_size"] == 4096
-        assert attempts[0]["decoded_body_size"] == 3800
+        assert calls == [True, False]
+        assert saved["candidate_count"] == 2
+        assert saved["comparison_complete"]
+        for index, attempt in enumerate(attempts, 1):
+            assert attempt["attempt"] == index
+            assert attempt["range_header"] is (index == 1)
+            assert attempt["candidate_index"] == 4
+            assert attempt["transfer_size"] == 4096
+            assert attempt["decoded_body_size"] == 3800
+            assert attempt["video"]["content_type"] == "video/mp4"
     assert ("RESULT browser_video_verified" in output) == (expected == "ok")
     assert "PRIVATE" not in output + receipt.read_text()

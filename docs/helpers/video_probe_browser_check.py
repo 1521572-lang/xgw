@@ -231,8 +231,8 @@ def main():
         atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
         print("ATTEMPT", json.dumps(attempt, sort_keys=True), flush=True)
 
-    result.update(video_probe.replay_candidates(candidates, domains, port, password, agent,
-                                               record_attempt))
+    result.update(video_probe.compare_replays(candidates[0], domains, port, password, agent,
+                                              record_attempt))
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, after_replay = verify(paths, before, original_path, node, password)
     changed = True if changed else after_replay

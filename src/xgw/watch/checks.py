@@ -344,11 +344,12 @@ def _read_response(
     status, length, chunked = _parse_head(head)
     if status is None:
         return DownloadResult(ok=False, kind="http", error="ответ не похож на HTTP")
+    content_type = _header(head, "content-type").partition(";")[0].strip().lower()
     if not 200 <= status < 300:
         kind = "proxy" if status == 407 else "http"
         return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}",
-                              location=_header(head, "location") if 300 <= status < 400 else "")
-    content_type = _header(head, "content-type").partition(";")[0].strip().lower()
+                              location=_header(head, "location") if 300 <= status < 400 else "",
+                              content_type=content_type)
     if status == 204:
         length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
@@ -367,7 +368,7 @@ def _read_response(
                 return DownloadResult(
                     ok=False, downloaded=downloaded, kind="http", status=status, body=body,
                     error=f"ответ частями не по стандарту: {parts.error}",
-                    body_seconds=time.monotonic() - started,
+                    body_seconds=time.monotonic() - started, content_type=content_type,
                 )
             if max_bytes and downloaded >= max_bytes:
                 return DownloadResult(
@@ -385,24 +386,24 @@ def _read_response(
     except fetch.Cancelled:
         return DownloadResult(ok=False, downloaded=downloaded, kind="cancelled", status=status,
                               body=body, error="проверка прервана",
-                              body_seconds=time.monotonic() - started)
+                              body_seconds=time.monotonic() - started, content_type=content_type)
     except OSError as exc:  # RST посреди тела: не «не подключился» — код и байты сохраняются
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="reset", status=status, body=body,
             error=f"обрыв соединения после {downloaded} байт тела: {exc}",
-            body_seconds=time.monotonic() - started,
+            body_seconds=time.monotonic() - started, content_type=content_type,
         )
     except _Silence:
         where = f"после {downloaded} байт тела" if downloaded else "до начала тела"
         return DownloadResult(
             ok=False, downloaded=downloaded, stalled=True, kind="stall", status=status,
             body=body, error=f"тишина {silence:.0f} с {where}",
-            body_seconds=time.monotonic() - started,
+            body_seconds=time.monotonic() - started, content_type=content_type,
         )
     except _Deadline:
         if cancel is not None and cancel.is_set():
             return DownloadResult(ok=False, downloaded=downloaded, kind="cancelled", status=status,
-                                  error="проверка прервана",
+                                  error="проверка прервана", content_type=content_type,
                                   body_seconds=time.monotonic() - started)
         if body_deadline < deadline and downloaded > 0:
             return DownloadResult(ok=True, downloaded=downloaded, status=status, body=body,
@@ -411,21 +412,21 @@ def _read_response(
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="timeout", status=status, body=body,
             error=f"загрузка не уложилась в отведённое время ({downloaded} байт тела)",
-            body_seconds=time.monotonic() - started,
+            body_seconds=time.monotonic() - started, content_type=content_type,
         )
     seconds = time.monotonic() - started
     if length is not None and downloaded < length:
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
             error=f"соединение закрыто после {downloaded} из {length} байт тела",
-            body_seconds=seconds,
+            body_seconds=seconds, content_type=content_type,
         )
     if parts is not None and not parts.done:
         # C01 кросс-аудита 4cc96b9: обрыв посреди ответа частями раньше считался целым ответом.
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
             error=f"соединение закрыто посреди ответа частями, после {downloaded} байт тела",
-            body_seconds=seconds,
+            body_seconds=seconds, content_type=content_type,
         )
     result = DownloadResult(
         ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds,

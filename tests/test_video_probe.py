@@ -124,14 +124,18 @@ def test_browser_candidates_rank_by_transfer_size_and_keep_original_observation(
     ]
 
 
-@pytest.mark.parametrize("status,downloaded,mime,expected", [
-    (206, 16384, "video/webm", "browser_video_verified"),
-    (200, 16384, "text/html", "replay_not_video"),
-    (200, 16384, "audio/mp4", "replay_not_video"),
-    (200, 25, "video/mp4", "replay_failed"),
-    (302, 0, "", "replay_failed"),
+@pytest.mark.parametrize("status,downloaded,mime,reported,expected", [
+    (206, 16384, "video/webm", "video/webm", "browser_video_verified"),
+    (200, 16384, "text/html", "text/html", "replay_not_video"),
+    (200, 16384, "audio/mp4", "audio/mp4", "replay_not_video"),
+    (200, 25, "video/mp4", "video/mp4", "replay_failed"),
+    (200, 31, "text/plain", "text/plain", "replay_failed"),
+    (200, 31, "text/private", "other", "replay_failed"),
+    (302, 0, "", None, "replay_failed"),
 ])
-def test_browser_replay_requires_downloaded_video(monkeypatch, status, downloaded, mime, expected):
+def test_browser_replay_requires_downloaded_video(
+    monkeypatch, status, downloaded, mime, reported, expected,
+):
     monkeypatch.setattr(v.time, "time", lambda: 1000)
     url = URL.replace("/video?", "/videoplayback?")
     calls = []
@@ -144,51 +148,58 @@ def test_browser_replay_requires_downloaded_video(monkeypatch, status, downloade
     monkeypatch.setattr(checks, "http_get_via_proxy", fetch)
     result = v.replay(url, DOMAINS, 12345, "PRIVATE", "Firefox")
     assert result["result"] == expected and "PRIVATE" not in json.dumps(result)
+    assert result["video"]["content_type"] == reported
+    assert "text/private" not in json.dumps(result)
     assert len(calls) == 1 and calls[0][:3] == ("127.0.0.1", 12345, url)
     assert calls[0][3]["user_agent"] == "Firefox" and calls[0][3]["range_end"] == 16384
     assert calls[0][3]["strict_max_bytes"]
 
 
-@pytest.mark.parametrize("outcome,attempts", [("verified", 2), ("deadline", 1), ("all_failed", 3)])
-def test_browser_replay_candidates_share_deadline_and_preserve_attempts(
-    monkeypatch, outcome, attempts,
+@pytest.mark.parametrize("success_at,exhaust_first,expected", [
+    (1, False, "browser_video_verified"),
+    (2, False, "browser_video_verified"),
+    (0, False, "replay_failed"),
+    (0, True, "replay_time_budget"),
+    (1, True, "browser_video_verified"),
+])
+def test_browser_replays_compare_same_candidate_and_preserve_attempts(
+    monkeypatch, success_at, exhaust_first, expected,
 ):
     now = [0.0]
     calls, observed = [], []
-    url = URL.replace("/video?", "/videoplayback?")
-    candidates = [v.BrowserCandidate(f"{url}&fixture={n}", 4 - n, 10 - n, 8 - n)
-                  for n in range(4)]
+    url = URL.replace("/video?", "/videoplayback?") + "&range=20-40"
+    candidate = v.BrowserCandidate(url, 4, 10, 8)
     monkeypatch.setattr(v.time, "time", lambda: 1000)
     monkeypatch.setattr(v.time, "monotonic", lambda: now[0])
 
     def fetch(host, port, target, **kwargs):
         assert len(observed) == len(calls)
         assert host == "127.0.0.1" and port == 12345 and kwargs["user_agent"] == "Firefox"
-        assert kwargs["strict_max_bytes"] and kwargs["max_bytes"] == 16384
-        calls.append((target, kwargs["max_total"]))
-        now[0] += kwargs["max_total"] if outcome == "deadline" else 2
-        if outcome == "verified" and len(calls) == 2:
+        assert kwargs["strict_max_bytes"] and kwargs["min_body"] == kwargs["max_bytes"] == 16384
+        calls.append((target, kwargs["max_total"], kwargs["range_end"]))
+        now[0] += kwargs["max_total"] if exhaust_first else 2
+        if len(calls) == success_at:
             return checks.DownloadResult(True, status=206, downloaded=16384,
                                          content_type="video/mp4")
         return checks.DownloadResult(False, status=200, downloaded=31, kind="http",
-                                     phase="body", error="PRIVATE")
+                                     phase="body", error="PRIVATE", content_type="text/plain")
 
     monkeypatch.setattr(checks, "http_get_via_proxy", fetch)
-    result = v.replay_candidates(
-        candidates, DOMAINS, 12345, "PRIVATE", "Firefox",
+    result = v.compare_replays(
+        candidate, DOMAINS, 12345, "PRIVATE", "Firefox",
         lambda index, row: observed.append((index, row)),
     )
-    assert calls == list(zip([row.url for row in candidates[:attempts]],
-                             [8, 6, 4][:attempts], strict=True))
+    attempts = 1 if exhaust_first else 2
+    assert calls == [(url, 8, 16384), (url, 6, 0)][:attempts]
     assert [index for index, _ in observed] == list(range(1, attempts + 1))
-    for candidate, (_, row) in zip(candidates[:attempts], observed, strict=True):
+    for index, row in observed:
         assert row["candidate_index"] == candidate.index
         assert row["transfer_size"] == candidate.transfer_size
         assert row["decoded_body_size"] == candidate.decoded_body_size
-    assert observed[0][1]["video"]["verdict"] == "short_body"
-    assert result["result"] == {
-        "verified": "browser_video_verified",
-        "deadline": "replay_time_budget",
-        "all_failed": "replay_failed",
-    }[outcome]
+        assert row["range_header"] is (index == 1)
+        mime = "video/mp4" if index == success_at else "text/plain"
+        assert row["video"]["content_type"] == mime
+    assert result["result"] == expected
+    assert result["comparison_complete"] is (not exhaust_first)
+    assert result["range_header"] is (success_at == 1 or exhaust_first)
     assert "PRIVATE" not in json.dumps(observed)

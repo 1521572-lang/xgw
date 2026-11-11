@@ -16,8 +16,13 @@ from . import checks
 PAGE_BYTES = 2 * 1024 * 1024
 # Два запроса, включая последний блок чтения и заголовки.
 MAX_CHARGE = 3 * 1024 * 1024
-REPLAY_ATTEMPTS = 3
+MAX_BROWSER_CANDIDATES = 3
 REPLAY_SECONDS = 8
+REPORT_CONTENT_TYPES = frozenset({
+    "application/json", "application/octet-stream", "application/xml",
+    "audio/mp4", "audio/webm", "text/html", "text/plain", "text/xml",
+    "video/mp4", "video/webm",
+})
 PLAYER = re.compile(r'(?:\bytInitialPlayerResponse|window\["ytInitialPlayerResponse"\])\s*=\s*')
 
 
@@ -122,49 +127,61 @@ def browser_candidates(resources: list[dict], domains: list[str],
     unique = {}
     for row, _ in eligible:
         unique.setdefault(row.url, row)
-    return list(unique.values())[:REPLAY_ATTEMPTS]
+    return list(unique.values())[:MAX_BROWSER_CANDIDATES]
 
 
 def replay(url: str, domains: list[str], port: int, password: str, agent: str,
-           *, max_total: float = REPLAY_SECONDS) -> dict:
+           *, max_total: float = REPLAY_SECONDS, use_range: bool = True) -> dict:
     if _browser_video_hint(url, domains, time.time()) is None:
         return {"result": "browser_url_missing"}
     reply = checks.http_get_via_proxy(
         "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
         timeout=5, silence=4, max_total=max_total, max_bytes=zapret2.MIN_BODY,
-        min_body=zapret2.MIN_BODY, range_end=zapret2.MIN_BODY, strict_max_bytes=True,
+        min_body=zapret2.MIN_BODY, range_end=zapret2.MIN_BODY if use_range else 0,
+        strict_max_bytes=True,
     )
     video = reply.content_type.startswith("video/")
     enough = reply.ok and reply.status in (200, 206) and reply.downloaded >= zapret2.MIN_BODY
     result = "replay_failed"
     if enough:
         result = "browser_video_verified" if video else "replay_not_video"
+    content_type = reply.content_type or None
+    if content_type is not None and content_type not in REPORT_CONTENT_TYPES:
+        content_type = "other"
     return {
         "result": result,
-        "video": zapret2.probe_row(2, reply) | {"path": "vpn", "video_mime": video},
+        "video": zapret2.probe_row(2, reply) | {
+            "path": "vpn", "video_mime": video, "content_type": content_type,
+        },
         "expires_in": max(0, int((zapret2.expiry(url) or 0) - time.time())),
     }
 
 
-def replay_candidates(candidates: list[BrowserCandidate], domains: list[str], port: int,
-                      password: str, agent: str, record_attempt) -> dict:
-    """До трёх GET по 16 КиБ, с одним общим сроком и остановкой на первом успехе."""
+def compare_replays(candidate: BrowserCandidate, domains: list[str], port: int,
+                    password: str, agent: str, record_attempt) -> dict:
+    """Два GET одного адреса по 16 КиБ с общим сроком, сначала с заголовком Range."""
     deadline = time.monotonic() + REPLAY_SECONDS
-    result = {"result": "browser_url_missing"}
-    for attempt, candidate in enumerate(candidates[:REPLAY_ATTEMPTS], 1):
+    verified = None
+    result = {}
+    for attempt, use_range in enumerate((True, False), 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {**result, "result": "replay_time_budget"}
-        result = replay(candidate.url, domains, port, password, agent, max_total=remaining)
+            summary = verified or {**result, "result": "replay_time_budget"}
+            return {**summary, "comparison_complete": False}
+        result = replay(candidate.url, domains, port, password, agent, max_total=remaining,
+                        use_range=use_range)
+        if result["result"] == "browser_url_missing":
+            return {**(verified or result), "comparison_complete": False}
+        result["range_header"] = use_range
         record_attempt(attempt, {
             **result,
             "candidate_index": candidate.index,
             "transfer_size": candidate.transfer_size,
             "decoded_body_size": candidate.decoded_body_size,
         })
-        if result["result"] == "browser_video_verified":
-            break
-    return result
+        if verified is None and result["result"] == "browser_video_verified":
+            verified = result
+    return {**(verified or result), "comparison_complete": True}
 
 
 def check(page: str, domains: list[str], port: int, password: str, agent: str,

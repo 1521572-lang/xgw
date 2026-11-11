@@ -116,12 +116,25 @@ def test_content_type_survives_body_limit(serve):
     assert 8192 <= result.downloaded < BODY
 
 
+@pytest.mark.parametrize("status,kind", [(403, "http"), (200, "truncated")])
+def test_content_type_survives_failed_response(serve, status, kind):
+    headers = HEADERS.replace(b"200 OK", f"{status} Fixture".encode())
+    headers = headers.replace(
+        b"Connection:", b"Content-Type: Text/Plain; key=PRIVATE\r\nConnection:",
+    )
+    result = _get(serve(headers + b"x" * 31))
+    assert not result.ok and result.status == status and result.kind == kind
+    assert result.content_type == "text/plain"
+
+
 @pytest.mark.parametrize("split_headers", [False, True])
 def test_strict_body_limit_includes_bytes_received_with_headers(serve, split_headers):
     payload = b"x" * BODY
     chunks = (HEADERS, 0.05, payload) if split_headers else (HEADERS + payload,)
-    result = _get(serve(*chunks), max_bytes=16384, keep_body=BODY, strict_max_bytes=True)
+    server = serve(*chunks)
+    result = _get(server, max_bytes=16384, keep_body=BODY, strict_max_bytes=True)
     assert result.ok and result.downloaded == len(result.body) == 16384
+    assert b"\r\nrange:" not in server.requests[0].lower()
 
 
 def test_headers_split_between_packets(serve):
