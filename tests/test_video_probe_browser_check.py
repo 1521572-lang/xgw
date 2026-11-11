@@ -75,7 +75,8 @@ def test_selected_singbox_bridge_follows_detour_but_ignores_other_outbounds(help
 
 
 @pytest.mark.parametrize(
-    "change", ["unrelated", "before_replay", "after_replay", "process", "browser_error"],
+    "change",
+    ["unrelated", "before_replay", "after_replay", "process", "browser_error", "http_pair"],
 )
 def test_receipt_and_replay_follow_selected_path(
     helper, before, monkeypatch, tmp_path, capsys, change,
@@ -122,9 +123,13 @@ def test_receipt_and_replay_follow_selected_path(
         zapret2=SimpleNamespace(mode="off", probe_urls=[PAGE], domains=domains),
         media=SimpleNamespace(youtube_sign_url=""),
     )
-    monkeypatch.setattr(sys, "argv", ["helper", "--state", str(receipt)])
+    args = ["helper", "--state", str(receipt)]
+    if change == "http_pair":
+        args.append("--compare-http")
+    monkeypatch.setattr(sys, "argv", args)
     monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=1000))
-    monkeypatch.setattr(helper.shutil, "which", lambda *_a, **_kw: "firefox")
+    monkeypatch.setattr(helper.shutil, "which", lambda name, **_kw: name)
+    monkeypatch.setattr(helper.video_probe_http, "supports_http2", lambda curl: curl == "curl")
     monkeypatch.setattr(helper.config, "load", lambda _path: (cfg, []))
     monkeypatch.setattr(helper, "checkpoint", capture)
     monkeypatch.setattr(helper.builder, "applied_nodes", lambda _applied: [NODE])
@@ -156,8 +161,10 @@ def test_receipt_and_replay_follow_selected_path(
     monkeypatch.setattr(helper.video_browser, "browser", observe)
     calls = []
 
-    def replay(target, *_args, use_range, **_kwargs):
+    def replay(target, *_args, use_range, curl, http2, **_kwargs):
         assert target == url
+        assert curl == ("curl" if change == "http_pair" else None)
+        assert http2 is (change == "http_pair" and bool(calls))
         calls.append(use_range)
         return {"result": "browser_video_verified", "expires_in": 900, "video": {
             "http": 206, "bytes": 16384, "video_mime": True, "verdict": "ok",
@@ -175,7 +182,7 @@ def test_receipt_and_replay_follow_selected_path(
         assert output.count("MARIONETTE_ERROR ") == 2
         assert not calls and "PRIVATE" not in receipt.read_text() + output
         return
-    expected = "ok" if change == "unrelated" else "selected_path_changed"
+    expected = "ok" if change in ("unrelated", "http_pair") else "selected_path_changed"
     if change == "process":
         expected = "gateway_settings_or_processes_changed"
     assert helper.main() == (0 if expected == "ok" else 2)
@@ -183,7 +190,7 @@ def test_receipt_and_replay_follow_selected_path(
     assert saved["verification"] == expected and saved["xray_config_changed"]
     assert saved["stages"] == expected_stages
     assert saved["marionette_error"] == navigation_error
-    assert bool(calls) == (change in ("unrelated", "after_replay"))
+    assert bool(calls) == (change in ("unrelated", "after_replay", "http_pair"))
     assert len(saved["replay_attempts"]) == len(calls)
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out
@@ -191,12 +198,12 @@ def test_receipt_and_replay_follow_selected_path(
                 for line in output.splitlines() if line.startswith("ATTEMPT ")]
     assert attempts == saved["replay_attempts"]
     if calls:
-        assert calls == [True, False]
+        assert calls == [True, change == "http_pair"]
         assert saved["candidate_count"] == 2
         assert saved["comparison_complete"]
         for index, attempt in enumerate(attempts, 1):
             assert attempt["attempt"] == index
-            assert attempt["range_header"] is (index == 1)
+            assert attempt["range_header"] is (index == 1 or change == "http_pair")
             assert attempt["candidate_index"] == 4
             assert attempt["transfer_size"] == 4096
             assert attempt["decoded_body_size"] == 3800

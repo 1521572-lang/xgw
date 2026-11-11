@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .. import zapret2
 from ..generator.builder import PROBE_USER
-from . import checks
+from . import checks, video_probe_http
 
 PAGE_BYTES = 2 * 1024 * 1024
 # Два запроса, включая последний блок чтения и заголовки.
@@ -131,15 +131,22 @@ def browser_candidates(resources: list[dict], domains: list[str],
 
 
 def replay(url: str, domains: list[str], port: int, password: str, agent: str,
-           *, max_total: float = REPLAY_SECONDS, use_range: bool = True) -> dict:
+           *, max_total: float = REPLAY_SECONDS, use_range: bool = True,
+           curl: str | None = None, http2: bool = False) -> dict:
     if _browser_video_hint(url, domains, time.time()) is None:
         return {"result": "browser_url_missing"}
-    reply = checks.http_get_via_proxy(
-        "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
-        timeout=5, silence=4, max_total=max_total, max_bytes=zapret2.MIN_BODY,
-        min_body=zapret2.MIN_BODY, range_end=zapret2.MIN_BODY if use_range else 0,
-        strict_max_bytes=True,
-    )
+    metadata = {}
+    if curl is None:
+        reply = checks.http_get_via_proxy(
+            "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
+            timeout=5, silence=4, max_total=max_total, max_bytes=zapret2.MIN_BODY,
+            min_body=zapret2.MIN_BODY, range_end=zapret2.MIN_BODY if use_range else 0,
+            strict_max_bytes=True,
+        )
+    else:
+        reply, metadata = video_probe_http.get(
+            curl, url, port, password, agent, http2=http2, max_total=max_total,
+        )
     video = reply.content_type.startswith("video/")
     enough = reply.ok and reply.status in (200, 206) and reply.downloaded >= zapret2.MIN_BODY
     result = "replay_failed"
@@ -148,28 +155,32 @@ def replay(url: str, domains: list[str], port: int, password: str, agent: str,
     content_type = reply.content_type or None
     if content_type is not None and content_type not in REPORT_CONTENT_TYPES:
         content_type = "other"
+    row = zapret2.probe_row(2, reply) | {
+        "path": "vpn", "video_mime": video, "content_type": content_type,
+    } | metadata
+    if metadata.get("curl_exit") == 63 and not enough:
+        row["verdict"] = "body_limit"
     return {
         "result": result,
-        "video": zapret2.probe_row(2, reply) | {
-            "path": "vpn", "video_mime": video, "content_type": content_type,
-        },
+        "video": row,
         "expires_in": max(0, int((zapret2.expiry(url) or 0) - time.time())),
     }
 
 
 def compare_replays(candidate: BrowserCandidate, domains: list[str], port: int,
-                    password: str, agent: str, record_attempt) -> dict:
-    """Два GET одного адреса по 16 КиБ с общим сроком, сначала с заголовком Range."""
+                    password: str, agent: str, record_attempt, *, curl: str | None = None) -> dict:
+    """Два GET одного адреса: сравниваем Range или версии HTTP в пределах одного срока."""
     deadline = time.monotonic() + REPLAY_SECONDS
     verified = None
     result = {}
-    for attempt, use_range in enumerate((True, False), 1):
+    for attempt in (1, 2):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             summary = verified or {**result, "result": "replay_time_budget"}
             return {**summary, "comparison_complete": False}
+        use_range = curl is not None or attempt == 1
         result = replay(candidate.url, domains, port, password, agent, max_total=remaining,
-                        use_range=use_range)
+                        use_range=use_range, curl=curl, http2=curl is not None and attempt == 2)
         if result["result"] == "browser_url_missing":
             return {**(verified or result), "comparison_complete": False}
         result["range_header"] = use_range

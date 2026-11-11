@@ -203,3 +203,30 @@ def test_browser_replays_compare_same_candidate_and_preserve_attempts(
     assert result["comparison_complete"] is (not exhaust_first)
     assert result["range_header"] is (success_at == 1 or exhaust_first)
     assert "PRIVATE" not in json.dumps(observed)
+
+
+def test_browser_replays_record_negotiated_http_version(monkeypatch):
+    url = URL.replace("/video?", "/videoplayback?")
+    candidate = v.BrowserCandidate(url, 4, 100_000, 99_700)
+    monkeypatch.setattr(v.time, "time", lambda: 1000)
+    calls, attempts = [], []
+
+    def fetch(curl, target, port, password, agent, *, http2, max_total):
+        assert (curl, target, port, password, agent) == ("curl", url, 12345, "PRIVATE", "Firefox")
+        assert 0 < max_total <= v.REPLAY_SECONDS
+        calls.append(http2)
+        return checks.DownloadResult(False, status=200, downloaded=31, content_type="text/plain",
+                                     kind="http", phase="body"), {
+            "http_requested": "2" if http2 else "1.1", "http_version": "1.1",
+            "content_length": 31, "content_encoding": None, "curl_exit": 0,
+        }
+
+    monkeypatch.setattr(v.video_probe_http, "get", fetch)
+    result = v.compare_replays(candidate, DOMAINS, 12345, "PRIVATE", "Firefox",
+                               lambda _index, row: attempts.append(row), curl="curl")
+    assert calls == [False, True]
+    assert result["result"] == "replay_failed" and result["comparison_complete"]
+    assert all(row["range_header"] and row["candidate_index"] == 4 for row in attempts)
+    assert [row["video"]["http_requested"] for row in attempts] == ["1.1", "2"]
+    assert [row["video"]["http_version"] for row in attempts] == ["1.1", "1.1"]
+    assert [row["video"]["content_length"] for row in attempts] == [31, 31]

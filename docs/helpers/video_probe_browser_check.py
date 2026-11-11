@@ -22,7 +22,7 @@ from video_probe_check import snapshot  # noqa: E402
 from xgw import config  # noqa: E402
 from xgw.generator import builder, singbox  # noqa: E402
 from xgw.paths import Paths, atomic_write_json  # noqa: E402
-from xgw.watch import video_browser, video_probe  # noqa: E402
+from xgw.watch import video_browser, video_probe, video_probe_http  # noqa: E402
 
 
 @dataclass
@@ -155,12 +155,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--page-file", type=Path)
+    parser.add_argument("--compare-http", action="store_true")
     args = parser.parse_args()
     user = pwd.getpwnam(os.environ.get("SUDO_USER", "root"))
     firefox = shutil.which("firefox", path=video_browser.SEARCH)
     if not firefox or user.pw_uid == 0:
         print("NOT_RUN no_browser_or_user")
         return
+    curl = None
+    if args.compare_http:
+        curl = shutil.which("curl", path="/usr/bin:/bin")
+        if not curl or not video_probe_http.supports_http2(curl):
+            print("NOT_RUN curl_http2_unavailable")
+            return
     paths = Paths(root=Path("/"))
     cfg, _ = config.load(paths.config_file)
     if cfg.zapret2.mode != "off":
@@ -232,7 +239,7 @@ def main():
         print("ATTEMPT", json.dumps(attempt, sort_keys=True), flush=True)
 
     result.update(video_probe.compare_replays(candidates[0], domains, port, password, agent,
-                                              record_attempt))
+                                              record_attempt, curl=curl))
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, after_replay = verify(paths, before, original_path, node, password)
     changed = True if changed else after_replay
