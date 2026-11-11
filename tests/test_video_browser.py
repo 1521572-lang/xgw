@@ -18,6 +18,41 @@ def test_marionette_reports_eof_instead_of_waiting_for_a_frame():
             protocol.read()
 
 
+def test_control_port_skips_ephemeral_range_and_an_occupied_port(monkeypatch, tmp_path):
+    ephemeral = tmp_path / "ip_local_port_range"
+    ephemeral.write_text("1024  64999\n", encoding="ascii")
+    monkeypatch.setattr(browser, "EPHEMERAL_PORTS", ephemeral)
+    monkeypatch.setattr(browser.random, "sample", lambda choices, count: choices[:count])
+    attempts, closed = [], []
+
+    class Reservation:
+        def bind(self, address):
+            attempts.append(address)
+            if len(attempts) == 1:
+                raise OSError("occupied")
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(browser.socket, "socket", Reservation)
+    reservation = browser.reserve_control_port()
+    assert attempts == [("127.0.0.1", 65000), ("127.0.0.1", 65001)]
+    assert len(closed) == 1 and reservation not in closed
+
+
+def test_foreign_profile_is_not_navigated(tmp_path):
+    calls, stages = [], []
+
+    class Client:
+        def call(self, method, _params):
+            calls.append(method)
+            return {"capabilities": {"moz:profile": str(tmp_path / "other-profile")}}
+
+    result = browser.observe(Client(), "", [], None, tmp_path / "expected", stages.append)
+    assert result == ("", "", "browser_profile_unverified", False)
+    assert calls == ["WebDriver:NewSession"] and not stages
+
+
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):
     opened = []
     upstream, remote = socket.socketpair()

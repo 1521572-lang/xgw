@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import random
 import re
 import select
 import signal
@@ -20,6 +21,7 @@ from . import video_probe
 
 SEARCH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
 LIMIT = 16 * 1024 * 1024
+EPHEMERAL_PORTS = Path("/proc/sys/net/ipv4/ip_local_port_range")
 ASSETS = ["domain:youtube.com", "domain:ytimg.com", "domain:googlevideo.com",
           "full:youtubei.googleapis.com", "full:jnn-pa.googleapis.com", "domain:gstatic.com"]
 CONNECT = re.compile(rb"CONNECT ([a-zA-Z0-9.-]+):443 HTTP/1\.[01]")
@@ -158,9 +160,15 @@ class Marionette:
                 return reply[3]
 
 
-def observe(client, page, domains, relay):
-    client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
+def observe(client, page, domains, relay, profile, progress):
+    session = client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
         "pageLoadStrategy": "eager", "timeouts": {"pageLoad": 7000, "script": 5000}}}})
+    capabilities = session.get("capabilities") if isinstance(session, dict) else None
+    reported = capabilities.get("moz:profile") if isinstance(capabilities, dict) else None
+    if not isinstance(reported, str) or Path(reported).resolve() != profile.resolve():
+        return "", "", "browser_profile_unverified", False
+    progress("session_ready")
+    progress("navigation_started")
     # Состояние плеера можно проверить после таймаута загрузки.
     with contextlib.suppress(ValueError):
         client.call("WebDriver:Navigate", {"url": page})
@@ -178,7 +186,9 @@ def observe(client, page, domains, relay):
         else:
             if last is None:
                 last = position
-            played |= position >= last + 2
+            if not played and position >= last + 2:
+                played = True
+                progress("playback_observed")
         if played and position is not None:
             url = video_probe.browser_candidate(sample["urls"], domains, time.time())
             agent = sample["agent"]
@@ -191,11 +201,30 @@ def observe(client, page, domains, relay):
     return "", "", reason, played
 
 
-def browser(firefox, user, page, domains, relay):
-    with socket.socket() as spare:
-        spare.bind(("127.0.0.1", 0))
-        port = spare.getsockname()[1]
-    with tempfile.TemporaryDirectory(prefix="xgw-video-", dir=user.pw_dir) as directory:
+def reserve_control_port():
+    """Reserve an unused loopback port that outbound TCP connections won't auto-select."""
+    low, high = map(int, EPHEMERAL_PORTS.read_text(encoding="ascii").split())
+    if not 1 <= low <= high <= 65535:
+        raise ValueError("invalid_ephemeral_port_range")
+    # Prefer the low unprivileged range used by the successful machine check.
+    for start, end in ((1024, 10000), (10000, 65536)):
+        candidates = [port for port in range(start, end) if not low <= port <= high]
+        for port in random.sample(candidates, min(32, len(candidates))):
+            reservation = socket.socket()
+            try:
+                reservation.bind(("127.0.0.1", port))
+            except OSError:
+                reservation.close()
+            else:
+                return reservation
+    raise OSError("marionette_port_unavailable")
+
+
+def browser(firefox, user, page, domains, relay, progress):
+    with (tempfile.TemporaryDirectory(prefix="xgw-video-", dir=user.pw_dir) as directory,
+          reserve_control_port() as reservation):
+        port = reservation.getsockname()[1]
+        progress("marionette_port_reserved")
         profile = Path(directory)
         prefs = {
             "marionette.port": port, "intl.accept_languages": "en-US",
@@ -213,6 +242,7 @@ def browser(firefox, user, page, domains, relay):
                                     for k, v in prefs.items()), encoding="utf-8")
         os.chown(settings, user.pw_uid, user.pw_gid)
         os.chown(profile, user.pw_uid, user.pw_gid)
+        reservation.close()
         process = subprocess.Popen(
             ["runuser", "-u", user.pw_name, "--", "env", "-i", f"HOME={user.pw_dir}",
              f"PATH={SEARCH}", f"XDG_RUNTIME_DIR=/run/user/{user.pw_uid}",
@@ -221,6 +251,7 @@ def browser(firefox, user, page, domains, relay):
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
         try:
+            progress("firefox_started")
             start_by = min(relay.deadline, time.monotonic() + 35)
             while process.poll() is None and time.monotonic() < start_by:
                 try:
@@ -229,8 +260,13 @@ def browser(firefox, user, page, domains, relay):
                     time.sleep(0.25)
                     continue
                 with sock:
-                    return observe(Marionette(sock, relay.deadline), page, domains, relay)
-            return "", "", "browser_start_failed", False
+                    client = Marionette(sock, start_by)
+                    progress("marionette_ready")
+                    client.deadline = relay.deadline
+                    return observe(client, page, domains, relay, profile, progress)
+            reason = ("marionette_listen_timeout" if process.poll() is None
+                      else "browser_start_failed")
+            return "", "", reason, False
         except (OSError, EOFError, ValueError):
             return "", "", "browser_control_failed", False
         finally:

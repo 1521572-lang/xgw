@@ -74,7 +74,9 @@ def test_selected_singbox_bridge_follows_detour_but_ignores_other_outbounds(help
     assert helper.compare(before, after, path, NODE, PASSWORD) == "selected_path_changed"
 
 
-@pytest.mark.parametrize("change", ["unrelated", "before_replay", "after_replay", "process"])
+@pytest.mark.parametrize(
+    "change", ["unrelated", "before_replay", "after_replay", "process", "browser_error"],
+)
 def test_receipt_and_replay_follow_selected_path(
     helper, before, monkeypatch, tmp_path, capsys, change,
 ):
@@ -125,8 +127,21 @@ def test_receipt_and_replay_follow_selected_path(
     monkeypatch.setattr(helper, "checkpoint", capture)
     monkeypatch.setattr(helper.builder, "applied_nodes", lambda _applied: [NODE])
     monkeypatch.setattr(helper.video_browser, "Relay", Relay)
-    browser_result = ("PRIVATE", "Firefox", "played", True)
-    monkeypatch.setattr(helper.video_browser, "browser", lambda *_: browser_result)
+    expected_stages = [
+        "relay_ready", "marionette_port_reserved", "firefox_started", "marionette_ready",
+    ]
+
+    def observe(_firefox, _user, _page, _domains, _relay, progress):
+        for index, stage in enumerate(expected_stages[1:], 2):
+            progress(stage)
+            saved = json.loads(receipt.read_bytes())
+            assert saved["stages"] == expected_stages[:index]
+            assert saved["verification"] == "pending"
+        if change == "browser_error":
+            raise OSError("PRIVATE")
+        return "PRIVATE", "Firefox", "played", True
+
+    monkeypatch.setattr(helper.video_browser, "browser", observe)
     calls = []
 
     def replay(*args):
@@ -136,12 +151,19 @@ def test_receipt_and_replay_follow_selected_path(
         }}
 
     monkeypatch.setattr(helper.video_probe, "replay", replay)
+    if change == "browser_error":
+        with pytest.raises(OSError):
+            helper.main()
+        assert json.loads(receipt.read_bytes())["stages"] == expected_stages
+        assert not calls and "PRIVATE" not in receipt.read_text() + capsys.readouterr().out
+        return
     expected = "ok" if change == "unrelated" else "selected_path_changed"
     if change == "process":
         expected = "gateway_settings_or_processes_changed"
     assert helper.main() == (0 if expected == "ok" else 2)
     saved = json.loads(receipt.read_bytes())
     assert saved["verification"] == expected and saved["xray_config_changed"]
+    assert saved["stages"] == expected_stages
     assert bool(calls) == (change in ("unrelated", "after_replay"))
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out

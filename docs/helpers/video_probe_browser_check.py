@@ -187,17 +187,30 @@ def main():
         return
     fd = os.open(args.state, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as receipt:
-        receipt.write('{"started":true}')
+        receipt.write('{"started":true,"stages":[],"verification":"pending"}')
+    stages = []
     port = node.probe_port
     with video_browser.Relay(port, password, time.monotonic() + 120) as relay:
         threading.Thread(target=relay.serve_forever, daemon=True).start()
+
+        def progress(stage):
+            stages.append(stage)
+            atomic_write_json(args.state, {
+                "started": True, "stages": stages, "browser_bytes": relay.spent,
+                "verification": "pending",
+            }, mode=0o600)
+            print("STAGE", stage, flush=True)
+
         try:
-            url, agent, reason, played = video_browser.browser(firefox, user, page, domains, relay)
+            progress("relay_ready")
+            url, agent, reason, played = video_browser.browser(
+                firefox, user, page, domains, relay, progress)
         finally:
             relay.stopped.set()
             relay.shutdown()
         spent = relay.spent
-    result = {"result": reason, "observation": reason, "browser_bytes": spent, "playback": played}
+    result = {"result": reason, "observation": reason, "browser_bytes": spent,
+              "playback": played, "stages": stages}
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, changed = verify(paths, before, original_path, node, password)
     if verification != "ok" or not url:
