@@ -2,6 +2,7 @@ import json
 import socket
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,13 +11,33 @@ from xgw.watch import video_browser as browser
 
 def test_marionette_reports_eof_instead_of_waiting_for_a_frame():
     client, remote = socket.socketpair()
+    errors = []
     with client, remote:
         greeting = b'{"marionetteProtocol":3}'
         remote.sendall(str(len(greeting)).encode() + b":" + greeting + b"10:{")
         remote.shutdown(socket.SHUT_WR)
-        protocol = browser.Marionette(client, time.monotonic() + 2)
+        protocol = browser.Marionette(client, time.monotonic() + 2, errors.append)
         with pytest.raises(EOFError):
-            protocol.read()
+            protocol.call("WebDriver:ExecuteScript", {})
+    assert errors == [{"method": "WebDriver:ExecuteScript", "exception": "EOFError"}]
+
+
+@pytest.mark.parametrize("code,expected", [("timeout", "timeout"), ("PRIVATE", "other")])
+def test_marionette_command_error_records_only_safe_fields(code, expected):
+    client, remote = socket.socketpair()
+    errors = []
+    with client, remote:
+        for value in ({"marionetteProtocol": 3},
+                      [1, 1, {"error": code, "message": "PRIVATE", "stacktrace": "PRIVATE"}, None]):
+            data = json.dumps(value).encode()
+            remote.sendall(str(len(data)).encode() + b":" + data)
+        protocol = browser.Marionette(client, time.monotonic() + 2, errors.append)
+        with pytest.raises(browser.MarionetteCommandError) as failure:
+            protocol.call("WebDriver:Navigate", {})
+    assert errors == [{
+        "method": "WebDriver:Navigate", "exception": "MarionetteCommandError", "code": expected,
+    }]
+    assert "PRIVATE" not in str(failure.value)
 
 
 @pytest.mark.parametrize("budget,first_byte,complete,elapsed", [
@@ -120,6 +141,29 @@ def test_foreign_profile_is_not_navigated(tmp_path):
     result = browser.observe(Client(), "", [], None, tmp_path / "expected", stages.append)
     assert result == ("", "", "browser_profile_unverified", False)
     assert calls == ["WebDriver:NewSession"] and stages == ["session_requested"]
+
+
+def test_navigation_response_is_recorded_before_observation(tmp_path):
+    stages = []
+
+    class Client:
+        deadline = time.monotonic() + 5
+
+        def call(self, method, _params, **_kwargs):
+            if method == "WebDriver:NewSession":
+                return {"capabilities": {"moz:profile": str(tmp_path)}}
+            if method == "WebDriver:Navigate":
+                return None
+            assert method == "WebDriver:ExecuteScript"
+            raise EOFError
+
+    relay = SimpleNamespace(stopped=threading.Event())
+    with pytest.raises(EOFError):
+        browser.observe(Client(), "", [], relay, tmp_path, stages.append)
+    assert stages == [
+        "session_requested", "session_ready", "navigation_started", "navigation_returned",
+        "observation_started",
+    ]
 
 
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):

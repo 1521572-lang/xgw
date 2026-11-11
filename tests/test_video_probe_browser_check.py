@@ -131,13 +131,20 @@ def test_receipt_and_replay_follow_selected_path(
         "relay_ready", "marionette_port_reserved", "firefox_started", "marionette_ready",
     ]
 
-    def observe(_firefox, _user, _page, _domains, _relay, progress):
+    navigation_error = {
+        "method": "WebDriver:Navigate", "exception": "MarionetteCommandError", "code": "timeout",
+    }
+    observation_error = {"method": "WebDriver:ExecuteScript", "exception": "EOFError"}
+
+    def observe(_firefox, _user, _page, _domains, _relay, progress, record_error):
         for index, stage in enumerate(expected_stages[1:], 2):
             progress(stage)
             saved = json.loads(receipt.read_bytes())
             assert saved["stages"] == expected_stages[:index]
             assert saved["verification"] == "pending"
+        record_error(navigation_error)
         if change == "browser_error":
+            record_error(observation_error)
             raise OSError("PRIVATE")
         return "PRIVATE", "Firefox", "played", True
 
@@ -154,8 +161,11 @@ def test_receipt_and_replay_follow_selected_path(
     if change == "browser_error":
         with pytest.raises(OSError):
             helper.main()
-        assert json.loads(receipt.read_bytes())["stages"] == expected_stages
-        assert not calls and "PRIVATE" not in receipt.read_text() + capsys.readouterr().out
+        saved = json.loads(receipt.read_bytes())
+        output = capsys.readouterr().out
+        assert saved["stages"] == expected_stages and saved["marionette_error"] == observation_error
+        assert output.count("MARIONETTE_ERROR ") == 2
+        assert not calls and "PRIVATE" not in receipt.read_text() + output
         return
     expected = "ok" if change == "unrelated" else "selected_path_changed"
     if change == "process":
@@ -164,6 +174,7 @@ def test_receipt_and_replay_follow_selected_path(
     saved = json.loads(receipt.read_bytes())
     assert saved["verification"] == expected and saved["xray_config_changed"]
     assert saved["stages"] == expected_stages
+    assert saved["marionette_error"] == navigation_error
     assert bool(calls) == (change in ("unrelated", "after_replay"))
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out

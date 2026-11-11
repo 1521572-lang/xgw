@@ -114,12 +114,39 @@ class Tunnel(socketserver.BaseRequestHandler):
             return
 
 
+class MarionetteFrameError(ValueError):
+    """Invalid control-channel frame or greeting."""
+
+
+class MarionetteCommandError(ValueError):
+    def __init__(self, reply):
+        super().__init__("marionette_command")
+        code = reply.get("error") if isinstance(reply, dict) else None
+        allowed = ("timeout", "script timeout", "javascript error", "no such window",
+                   "unexpected alert open", "invalid session id", "invalid argument")
+        self.code = code if isinstance(code, str) and code in allowed else "other"
+
+
 class Marionette:
-    def __init__(self, sock, deadline):
+    def __init__(self, sock, deadline, record_error=None):
         self.sock, self.deadline, self.seq = sock, deadline, 0
-        greeting = self.read()
-        if not isinstance(greeting, dict) or greeting.get("marionetteProtocol") != 3:
-            raise ValueError("unexpected_marionette")
+        self.record_error = record_error
+        with self.diagnose("Greeting"):
+            greeting = self.read()
+            if not isinstance(greeting, dict) or greeting.get("marionetteProtocol") != 3:
+                raise MarionetteFrameError("unexpected_marionette")
+
+    @contextlib.contextmanager
+    def diagnose(self, method):
+        try:
+            yield
+        except (OSError, EOFError, ValueError) as exc:
+            if self.record_error is not None:
+                event = {"method": method, "exception": type(exc).__name__}
+                if isinstance(exc, MarionetteCommandError):
+                    event["code"] = exc.code
+                self.record_error(event)
+            raise
 
     def recv(self, size, deadline, max_wait):
         data = bytearray()
@@ -148,23 +175,24 @@ class Marionette:
             if not char.isdigit():
                 break
             prefix += char
-        raise ValueError("bad_marionette_frame")
+        raise MarionetteFrameError("bad_marionette_frame")
 
     def call(self, method, params, *, timeout=None):
-        now = time.monotonic()
-        deadline = self.deadline if timeout is None else min(self.deadline, now + timeout)
-        if deadline <= now:
-            raise TimeoutError
-        self.seq += 1
-        body = json.dumps([0, self.seq, method, params]).encode()
-        self.sock.settimeout(min(deadline - now, 1))
-        self.sock.sendall(str(len(body)).encode() + b":" + body)
-        while True:
-            reply = self.read(deadline=deadline, max_wait=8 if timeout is None else timeout)
-            if isinstance(reply, list) and len(reply) == 4 and reply[:2] == [1, self.seq]:
-                if reply[2]:
-                    raise ValueError("marionette_command")
-                return reply[3]
+        with self.diagnose(method):
+            now = time.monotonic()
+            deadline = self.deadline if timeout is None else min(self.deadline, now + timeout)
+            if deadline <= now:
+                raise TimeoutError
+            self.seq += 1
+            body = json.dumps([0, self.seq, method, params]).encode()
+            self.sock.settimeout(min(deadline - now, 1))
+            self.sock.sendall(str(len(body)).encode() + b":" + body)
+            while True:
+                reply = self.read(deadline=deadline, max_wait=8 if timeout is None else timeout)
+                if isinstance(reply, list) and len(reply) == 4 and reply[:2] == [1, self.seq]:
+                    if reply[2]:
+                        raise MarionetteCommandError(reply[2])
+                    return reply[3]
 
 
 def observe(client, page, domains, relay, profile, progress):
@@ -181,9 +209,14 @@ def observe(client, page, domains, relay, profile, progress):
         return "", "", "browser_profile_unverified", False
     progress("session_ready")
     progress("navigation_started")
-    # Состояние плеера можно проверить после таймаута загрузки.
-    with contextlib.suppress(ValueError):
+    try:
         client.call("WebDriver:Navigate", {"url": page})
+    except MarionetteCommandError:
+        # Ответ с ошибкой оставляет канал синхронизированным для проверки плеера.
+        pass
+    else:
+        progress("navigation_returned")
+    progress("observation_started")
     last, rejected, played, state = None, False, False, "no_video"
     while time.monotonic() + 2 < client.deadline and not relay.stopped.is_set():
         sample = client.call("WebDriver:ExecuteScript", {
@@ -232,7 +265,7 @@ def reserve_control_port():
     raise OSError("marionette_port_unavailable")
 
 
-def browser(firefox, user, page, domains, relay, progress):
+def browser(firefox, user, page, domains, relay, progress, record_error):
     with (tempfile.TemporaryDirectory(prefix="xgw-video-", dir=user.pw_dir) as directory,
           reserve_control_port() as reservation):
         port = reservation.getsockname()[1]
@@ -272,7 +305,7 @@ def browser(firefox, user, page, domains, relay, progress):
                     time.sleep(0.25)
                     continue
                 with sock:
-                    client = Marionette(sock, start_by)
+                    client = Marionette(sock, start_by, record_error)
                     progress("marionette_ready")
                     client.deadline = relay.deadline
                     return observe(client, page, domains, relay, profile, progress)

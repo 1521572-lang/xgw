@@ -188,29 +188,37 @@ def main():
     fd = os.open(args.state, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as receipt:
         receipt.write('{"started":true,"stages":[],"verification":"pending"}')
-    stages = []
+    diagnostics = {"stages": []}
     port = node.probe_port
     with video_browser.Relay(port, password, time.monotonic() + 120) as relay:
         threading.Thread(target=relay.serve_forever, daemon=True).start()
 
-        def progress(stage):
-            stages.append(stage)
+        def save_progress():
             atomic_write_json(args.state, {
-                "started": True, "stages": stages, "browser_bytes": relay.spent,
+                **diagnostics, "started": True, "browser_bytes": relay.spent,
                 "verification": "pending",
             }, mode=0o600)
+
+        def progress(stage):
+            diagnostics["stages"].append(stage)
+            save_progress()
             print("STAGE", stage, flush=True)
+
+        def record_error(event):
+            diagnostics["marionette_error"] = event
+            save_progress()
+            print("MARIONETTE_ERROR", json.dumps(event, sort_keys=True), flush=True)
 
         try:
             progress("relay_ready")
             url, agent, reason, played = video_browser.browser(
-                firefox, user, page, domains, relay, progress)
+                firefox, user, page, domains, relay, progress, record_error)
         finally:
             relay.stopped.set()
             relay.shutdown()
         spent = relay.spent
-    result = {"result": reason, "observation": reason, "browser_bytes": spent,
-              "playback": played, "stages": stages}
+    result = {**diagnostics, "result": reason, "observation": reason, "browser_bytes": spent,
+              "playback": played}
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, changed = verify(paths, before, original_path, node, password)
     if verification != "ok" or not url:
