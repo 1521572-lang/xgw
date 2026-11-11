@@ -12,13 +12,28 @@ from ..paths import file_lock
 from ..xraycore.service import XrayServiceError
 from .states import State
 
+FAILURE = "zapret2_standalone_apply_failure"
+
+
+def apply_blocked(d) -> State:
+    d._zapret2.view = {"state": "blocked", "reason": "apply_failed"}
+    d.machine.state = State.DEGRADED
+    d.action = ("Переключение без VPN остановлено после ошибки. Автоповторы отключены. "
+                "Для повторной попытки выключите режим zapret2 и включите заново.")
+    d._write_status([], None, False)
+    return d.machine.state
+
 
 def tick(daemon, applied: dict | None, now: float) -> State:
     d = daemon
     if d.cfg.zapret2.mode != "standalone":
+        if d.store.get_meta(FAILURE):
+            d.store.set_meta(FAILURE, "")
         return _return_to_vpn(d, now)
     if d.stopping:
         return d.machine.state
+    if d.store.get_meta(FAILURE):
+        return apply_blocked(d)
     if zapret2.validate(d.cfg):
         with contextlib.suppress(OSError, cmd.CommandError):
             d._zapret2.close()
@@ -42,15 +57,15 @@ def tick(daemon, applied: dict | None, now: float) -> State:
                            containers_tun=engine.containers_tun(d.cfg),
                            api_listen=str(d.paths.xray_api_socket)).config
     if target != applied:
+        # До рестарта: падение демона посреди применения тоже не запускает цикл повторов.
+        d.store.set_meta(FAILURE, "pending")
         outcome = d._apply(target, urgent=True)
         d._report(outcome, "Режим zapret2 без VPN")
         applied = engine.read_json(d.paths.xray_config_file)
         if outcome.mode not in ("api", "restart", "unchanged") or applied != target:
-            d._zapret2.view = {"state": "blocked", "reason": "apply_failed"}
-            d.machine.state = State.DEGRADED
-            d.action = "Режим без VPN не применён. Прежний маршрут мог сохраниться."
-            d._write_status([], None, False)
-            return d.machine.state
+            d.store.set_meta(FAILURE, outcome.mode)
+            return apply_blocked(d)
+        d.store.set_meta(FAILURE, "")
     # Не переносим отложенную VPN-сборку в самостоятельный режим.
     d._rebuild_asked = False
     d._refresh_asked = d._scan_asked = d._speed_asked = False

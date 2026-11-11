@@ -1439,6 +1439,11 @@ class Daemon:
         refresh_asked, self._refresh_asked = self._refresh_asked, False
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
+        if self.cfg.zapret2.mode != "standalone":
+            from .watch.standalone import FAILURE
+
+            if self.store.get_meta(FAILURE):
+                self.store.set_meta(FAILURE, "")
         if self.cfg.zapret2.mode == "standalone" or zapret2.standalone(applied):
             from .watch import standalone
 

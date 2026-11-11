@@ -127,6 +127,10 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
             detail = "Прямой интернет без обработки zapret2. Включите перехват кнопкой питания."
     elif cfg.zapret2.mode == "standalone" and state == "blocked":
         title = "Режим без VPN не подтверждён"
+        if reason == "apply_failed":
+            detail = ("Переключение остановлено после ошибки. Автоповторы отключены, "
+                      "в том числе после перезапуска демона. Прежний маршрут мог сохраниться. "
+                      "Для новой попытки выключите режим zapret2 и включите заново.")
     return {
         "mode": cfg.zapret2.mode, "strategy": cfg.zapret2.strategy,
         "domains": list(cfg.zapret2.domains), "probe_count": len(cfg.zapret2.probe_urls),

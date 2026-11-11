@@ -181,6 +181,25 @@ def test_failed_apply_does_not_claim_without_vpn(daemon, monkeypatch):
     assert daemon._zapret2.view["reason"] == "apply_failed"
     assert not daemon._zapret2.runtime.up
     assert not engine.read_json(daemon.paths.status_file)["zapret2"]["without_vpn"]
+    attempts = len(daemon.applied)
+    for _ in range(5):
+        daemon.t += 3600
+        daemon.tick()
+    assert len(daemon.applied) == attempts
+    assert daemon.store.get_meta(standalone.FAILURE) == "rejected"
+
+
+def test_failed_switch_latch_survives_new_daemon_instance(daemon, monkeypatch):
+    prepare_daemon(daemon, monkeypatch)
+    daemon.store.set_meta(standalone.FAILURE, "pending")
+    # Нет памяти предыдущего запуска; запись в SQLite одна останавливает применение.
+    daemon.tick()
+    assert not daemon.applied and not daemon.collected
+    assert daemon._zapret2.view["reason"] == "apply_failed"
+    daemon.cfg.zapret2.mode = "off"
+    daemon._stop.set()  # Сброс отметки не требует сетевой проверки/включения VPN в этом тесте.
+    daemon.tick()
+    assert not daemon.store.get_meta(standalone.FAILURE)
 
 
 def test_gui_does_not_call_direct_mode_vpn_protection():

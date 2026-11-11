@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import log
+from .. import log, zapret2
 from ..generator.builder import BALANCER_TAG
 from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
@@ -247,14 +247,20 @@ class Applier:
         # Ядро запущено заново с конфигом с диска — следов частичного применения нет.
         self._clear_dirty()
         deadline = time.monotonic() + self.wait_seconds
+        direct = zapret2.standalone(self._read_current())
         while True:
             try:
-                # Балансировщик называем явно: без тега `xray api bi` отвечает ошибкой.
-                self.api.balancer_info(BALANCER_TAG)
+                if direct:
+                    # В самостоятельном режиме балансировщика намеренно нет.
+                    self.api.list_outbounds()
+                else:
+                    self.api.balancer_info(BALANCER_TAG)
                 return None
             except ApiError:
                 if time.monotonic() >= deadline:
-                    return f"Xray не поднялся за {self.wait_seconds:.0f} с"
+                    check = "список выходов API" if direct else "VPN-балансировщик API"
+                    return (f"Xray не подтвердил готовность за {self.wait_seconds:.0f} с: "
+                            f"не отвечает {check}")
                 time.sleep(0.5)
 
     def _rollback(self, *, reason: str) -> ApplyOutcome:

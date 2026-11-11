@@ -249,6 +249,28 @@ def test_restart_inside_window_clears_pending(env):
     assert api.bi_args and all(args == ("auto",) for args in api.bi_args)
 
 
+def test_standalone_failure_rolls_back_with_vpn_health(env):
+    from xgw import zapret2
+
+    paths, current = env
+    cfg = Config()
+    cfg.zapret2.mode = "standalone"
+    target = zapret2.without_vpn(current, cfg, ["tproxy-in"])
+    service = StubService()
+
+    class DirectFail(StubApi):
+        def list_outbounds(self):
+            self.calls.append("lso")
+            raise ApiError("API не отвечает")
+
+    api = DirectFail()
+    outcome = _applier(paths, api, service, wait_seconds=0).apply(target, urgent=True)
+    assert outcome.mode == "rollback"
+    assert "список выходов API" in outcome.detail
+    assert api.calls == ["lso"] and api.bi_args == [("auto",)]
+    assert service.restarts == 2 and _on_disk(paths) == current
+
+
 def test_force_now_restarts_at_any_time(env):
     paths, current = env
     service = StubService()
