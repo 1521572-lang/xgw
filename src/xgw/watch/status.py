@@ -1201,6 +1201,8 @@ def render_status(status: dict) -> str:
         lines.append(status["probe_target"])
     media_line = render_media(status.get("media") or {})
     zapret = status.get("zapret2") or {}
+    if zapret.get("without_vpn"):
+        lines.append("Режим шлюза: zapret2 без VPN; остальные домены напрямую")
     if zapret.get("state") not in (None, "off"):
         lines.append(f"zapret2: {zapret['state']} ({zapret.get('reason', '')})")
     if media_line:

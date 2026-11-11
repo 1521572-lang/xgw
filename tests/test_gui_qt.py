@@ -560,7 +560,8 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
             "config_key": "current", "domains": ["domain:youtube.com", "domain:googlevideo.com"],
             "strategy": "multisplit", "probe_count": 2, "check_seconds": 180,
             "retry_seconds": 300, "daily_probe_mb": 256, "can_edit": True,
-            "can_off": False, "blockers": {"selective": [], "compare": []}, "probes": []}
+            "can_off": False, "blockers": {"standalone": [], "selective": [], "compare": []},
+            "probes": []}
     sent = []
 
     def state():
@@ -582,7 +583,8 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
         win.overview.zapret2.click()
         assert win.stack.currentWidget() is win.zapret2
         page = win.zapret2
-        compare, enable, disable = page.status.items["mode"].buttons
+        direct, compare, enable, disable = page.status.items["mode"].buttons
+        assert direct.isEnabled() and direct.text() == "zapret2 без VPN"
         assert compare.isEnabled() and enable.isEnabled() and not disable.isEnabled()
         page.confirm = lambda *_: False
         compare.click()
@@ -606,6 +608,9 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
         wait(qapp, lambda: len(sent) == 2 and not client.actions.running)
         assert sent[-1][0] == "zapret2/settings"
         assert sent[-1][1]["settings"]["strategy"] == "multidisorder"
+        direct.click()
+        wait(qapp, lambda: len(sent) == 3 and not client.actions.running)
+        assert sent[-1] == ("zapret2/mode", {"mode": "standalone", "expected": "current"})
 
         client.stop()
         view.update(probe_expiry=[{"probe": 1, "expires_at": None},
@@ -621,6 +626,7 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
             win.on_state(state())
             assert title in page.status_note.text() and title in win.overview.zapret2.text()
             assert not compare.isEnabled() and not enable.isEnabled() and disable.isEnabled()
+            assert not direct.isEnabled()
         assert "expire истёк" in page.settings_rows.items["settings"].detail.text()
         assert "16 КиБ" in page.results.items["0"].detail.text()
         win.on_link(clienting.LINK_OFFLINE, "")

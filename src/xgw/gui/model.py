@@ -81,7 +81,8 @@ def is_stale(state: dict | None) -> bool:
 
 def pool_house(state: dict) -> bool:
     """Весь дом через бесплатные серверы (free_pool.mode = on, М2б.2)."""
-    return _dict(state.get("free_pool")).get("mode") == "on"
+    return (not _dict(state.get("zapret2")).get("without_vpn")
+            and _dict(state.get("free_pool")).get("mode") == "on")
 
 
 def pool_flow(state: dict) -> dict | None:
@@ -99,6 +100,16 @@ def health(state: dict | None, stale: bool) -> tuple[str, str]:
         return "bad", "Демон XGW не отвечает"
     capture = _dict(state.get("capture"))
     name = str(state.get("state") or "")
+    zapret = _dict(state.get("zapret2"))
+    if zapret.get("without_vpn"):
+        if name == "XRAY_DOWN":
+            return "bad", "Локальный маршрутизатор не отвечает"
+        if capture.get("loaded") is False or capture.get("lan_problem"):
+            return "bad", "Проблема перехвата трафика"
+        return ("ok", "zapret2 без VPN") if zapret.get("state") == "active" else (
+            "warn", str(zapret.get("title") or "zapret2 не готов"))
+    if zapret.get("mode") == "standalone":
+        return "warn", str(zapret.get("title") or "Включение zapret2 без VPN")
     if pool_house(state):
         if name in ("WAN_DOWN", "XRAY_DOWN", "LEAK"):
             return STATES[name]
@@ -175,6 +186,13 @@ def power(state: dict | None, stale: bool, *, acting: bool = False) -> Power:
     elif mode == "none":
         title = "Перехват не настроен"
         sub = "XGW только управляет Xray: в config.toml перехват выключен"
+    zapret = _dict(state.get("zapret2"))
+    if zapret.get("without_vpn") and mode in ("on", "off"):
+        title = "zapret2 без VPN" if mode == "on" else "Прямой интернет · zapret2 выключен"
+        sub = str(zapret.get("detail") or "Выбранные домены через zapret2, остальные напрямую")
+        hero = ("ok" if zapret.get("state") == "active" else "warn") if mode == "on" else "off"
+    elif zapret.get("mode") == "standalone":
+        title, sub, hero = "Включение zapret2 без VPN", str(zapret.get("detail") or ""), "warn"
     pressed = mode in ("on", "open")
     enabled = not acting and not stale and bool(
         allowed.get("can_off") if pressed else allowed.get("can_on"))
@@ -192,6 +210,8 @@ def shield(state: dict | None, stale: bool, *, acting: bool = False) -> tuple[st
     if acting:
         return "warn", "Выключаю…" if found.pressed else "Включаю…"
     mode = _dict(state.get("capture")).get("mode")
+    if _dict(state.get("zapret2")).get("without_vpn"):
+        return found.tone, "Прямое подключение · без VPN"
     if mode == "on":
         return {"ok": ("ok", "Защищено"), "warn": ("warn", "Подключение")}.get(
             found.tone, ("bad", "Нет связи через VPN"))
@@ -213,6 +233,8 @@ def lifecycle(state: dict | None, stale: bool) -> tuple[str, str] | None:
         return None
     capture = _dict(state.get("capture"))
     word = str(capture.get("lifecycle") or "")
+    if _dict(state.get("zapret2")).get("without_vpn"):
+        return None  # Заголовок показывает прямой режим; это не VPN-защита.
     mode = capture.get("mode")
     if mode in ("off", "none"):
         return None

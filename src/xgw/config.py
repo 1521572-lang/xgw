@@ -358,7 +358,7 @@ class Routing:
 
 @dataclass
 class Zapret2:
-    """Дополнительный прямой путь для выбранных HTTPS-доменов; сначала проверка."""
+    """Прямой выход выбранных HTTPS-доменов: самостоятельно или с возвратом на VPN."""
 
     mode: str = "off"
     domains: list[str] = field(default_factory=lambda: [
@@ -370,7 +370,7 @@ class Zapret2:
     strategy: str = "multisplit"
     queue_num: int = 200
     probe_port: int = 19999
-    # Адреса задаёт владелец: страница и файл видеосети. Пусто — остаётся VPN.
+    # Адреса для selective/compare: страница и файл видеосети. standalone их не использует.
     probe_urls: list[str] = field(default_factory=list)
     check_seconds: int = 180
     retry_seconds: int = 300
@@ -379,6 +379,10 @@ class Zapret2:
     @property
     def probe_enabled(self) -> bool:
         return self.mode in ("selective", "compare")
+
+    @property
+    def enabled(self) -> bool:
+        return self.probe_enabled or self.mode == "standalone"
 
 
 @dataclass

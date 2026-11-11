@@ -385,7 +385,7 @@ def build_rules(
             conncheck4=conncheck[0] if capture or blocked else (),
             conncheck_port=conncheck[1],
             zapret2_queue=(cfg.zapret2.queue_num
-                           if cfg.zapret2.probe_enabled else None),
+                           if cfg.zapret2.enabled else None),
         ),
         warnings,
     )
@@ -402,6 +402,8 @@ def kernel_direct_reason(cfg: Config) -> str:
 def kernel_direct_blocker(cfg: Config) -> str:
     """Что мешает разгрузке, даже если её включить (панель отказывает с этим текстом);
     пусто — ничего."""
+    if cfg.zapret2.mode == "standalone":
+        return "zapret2 без VPN: выбранные домены должны проходить через Xray"
     if cfg.routing.proxy_domains:
         return ("в routing.proxy_domains есть домены — с российским адресом они ушли бы мимо "
                 "VPN")

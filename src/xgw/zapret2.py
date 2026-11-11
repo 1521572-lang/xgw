@@ -1,4 +1,4 @@
-"""Выбранные HTTPS-домены через nfqws2; отказ возвращает новые соединения в VPN.
+"""Выбранные HTTPS-домены через nfqws2: самостоятельный режим и дополнение к VPN.
 
 XGW не запускает install_easy и не меняет sysctl. Два собственных SO_MARK не
 пересекаются с bypass/TPROXY/Tailscale. Разрешение WAN имеет срок жизни в nft;
@@ -30,6 +30,7 @@ FAKE_BIT = 0x40000000
 FAKE_MARK = MARK | FAKE_BIT
 MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
 OUT = "xgw-zapret2"
+DIRECT = "xgw-without-vpn"
 PROBE = "xgw-zapret2-probe"
 UNIT = "xgw-zapret2.service"
 LIVE = "zapret2_live"
@@ -98,8 +99,8 @@ def probe_row(index: int, result) -> dict:
 def validate(cfg: Config) -> list[str]:
     z = cfg.zapret2
     problems = []
-    if z.mode not in ("off", "selective", "compare"):
-        problems.append("mode: ожидается off, selective или compare")
+    if z.mode not in ("off", "selective", "compare", "standalone"):
+        problems.append("mode: ожидается off, selective, compare или standalone")
     if not z.domains or any(not _DOMAIN.fullmatch(d) for d in z.domains):
         problems.append("domains: нужны domain:имя или full:имя")
     if z.strategy not in ("multisplit", "multidisorder"):
@@ -137,15 +138,18 @@ def validate(cfg: Config) -> list[str]:
         problems.append("для YouTube нужны вместе youtube.com и googlevideo.com")
     if z.probe_enabled and cfg.routing.proxy_domains:
         problems.append("первая версия требует общего маршрута через VPN (proxy_domains пуст)")
-    if z.probe_enabled and not cfg.network.block_quic:
+    if z.enabled and not cfg.network.block_quic:
         problems.append("для общего выхода страницы и видео требуется network.block_quic = true")
+    if z.mode == "standalone" and cfg.capture.fail_mode != "closed":
+        problems.append("standalone требует capture.fail_mode = closed")
     for mark in (cfg.capture.mark_proxy, cfg.capture.mark_bypass, cfg.capture.mark_containers):
         if mark & (MARK | FAKE_BIT):
             problems.append("метки capture пересекаются с зарезервированными битами zapret2")
             break
-    if problems:
+    if problems and z.mode != "standalone":
         z.mode = "off"
-    return [f"zapret2 выключен: {p}" for p in problems]
+    prefix = "zapret2 не готов" if z.mode == "standalone" else "zapret2 выключен"
+    return [f"{prefix}: {p}" for p in problems]
 
 
 def configured(cfg: Config) -> bool:
@@ -163,6 +167,44 @@ def configured(cfg: Config) -> bool:
 def active(config: dict) -> bool:
     return any(r.get("outboundTag") == OUT and r.get("inboundTag") != [PROBE]
                for r in config.get("routing", {}).get("rules", []))
+
+
+def standalone(config: dict | None) -> bool:
+    return any(o.get("tag") == DIRECT for o in (config or {}).get("outbounds", []))
+
+
+def without_vpn(config: dict, cfg: Config, capture_tags: list[str]) -> dict:
+    """Самостоятельный маршрут: нет серверов, балансировщиков и проб VPN."""
+    from .generator.builder import _dns_server
+
+    result = copy.deepcopy(config)
+    result.pop("burstObservatory", None)
+    direct = next(o for o in result["outbounds"] if o["tag"] == "direct")
+    result["outbounds"] = [direct, {**copy.deepcopy(direct), "tag": DIRECT},
+                           {"tag": "block", "protocol": "blackhole"},
+                           next(o for o in result["outbounds"] if o["tag"] == "dns-out"),
+                           {"tag": OUT, "protocol": "freedom",
+                            "settings": {"domainStrategy": "UseIPv4"},
+                            "streamSettings": {"sockopt": {"mark": MARK}}}]
+    # DNS и LAN доступны без VPN. Правило доменов выше общих прямых исключений.
+    clients = [*capture_tags, "http-in", "socks-in"]
+    for inbound in result["inbounds"]:
+        if inbound["tag"] in clients:
+            inbound["sniffing"] = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
+    result["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": [
+        {"type": "field", "inboundTag": capture_tags, "port": "53",
+         "outboundTag": "dns-out"},
+        {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+        {"type": "field", "inboundTag": clients, "domain": cfg.zapret2.domains,
+         "network": "tcp", "port": "443", "outboundTag": OUT},
+        {"type": "field", "inboundTag": clients, "domain": cfg.zapret2.domains,
+         "outboundTag": "block"},
+        {"type": "field", "network": "tcp,udp", "outboundTag": DIRECT},
+    ]}
+    result["dns"]["servers"] = [address if port is None else {"address": address, "port": port}
+                                for address, port in map(_dns_server, cfg.dns.direct_servers)]
+    result["dns"]["hosts"] = {}
+    return result
 
 
 def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = True) -> dict:
@@ -479,6 +521,10 @@ class Controller:
              vpn_probe_port: int = 0, cancel=None) -> bool:
         from .generator import builder
 
+        if cfg.zapret2.mode == "standalone":
+            self._standalone_step(cfg, applied, now, allowed=allowed)
+            return False
+
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
         comparing = cfg.zapret2.mode == "compare"
         finished = comparing and self.comparison is not None
@@ -581,6 +627,46 @@ class Controller:
         self.view = {"state": "fallback" if routed_back else "blocked", "reason": reason,
                      "gate_closed": gate_closed, "probes": self.probes}
         return changed
+
+    def _standalone_step(self, cfg: Config, applied: dict, now: float, *, allowed: bool) -> None:
+        """Готовность обработчика открывает маршрут, но не означает успех обхода DPI."""
+        reason = "off" if not allowed else "apply_failed"
+        try:
+            if allowed and standalone(applied):
+                if not self.ready and now >= self.next_check:
+                    self.runtime.gate()
+                    self.runtime.start(cfg)
+                    self.ready = True
+                if not self.ready:
+                    reason = self.last_error or "retry_wait"
+                elif not self.runtime.alive(cfg.zapret2.queue_num):
+                    raise ValueError("worker_down")
+                else:
+                    lease = cfg.zapret2.check_seconds + 60
+                    self.runtime.gate(lease)
+                    self.view = {"state": "active", "reason": "worker_ready",
+                                 "valid_until": time.time() + lease, "probes": []}
+                    self.last_error = ""
+                    return
+        except (OSError, ValueError, cmd.CommandError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in (
+                "worker_down", "queue_busy", "unsafe_files", "unsafe_directory"
+            ) else "runtime_failed"
+            self.last_error = reason
+            self.next_check = now + cfg.zapret2.retry_seconds
+        closed = False
+        try:
+            self.runtime.gate()
+            closed = True
+        except cmd.CommandError:
+            pass
+        try:
+            self.runtime.stop()
+            self.ready = False
+        except cmd.CommandError:
+            reason = "stop_failed"
+        self.view = {"state": "blocked" if allowed else "off", "reason": reason,
+                     "gate_closed": closed, "probes": []}
 
     def close(self) -> None:
         if not self.ready:

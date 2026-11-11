@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, cost, fetch, log, marknet, masking, rating, reality
+from . import config, cost, fetch, log, marknet, masking, rating, reality, zapret2
 from . import pin as pinning
 from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
@@ -568,6 +568,17 @@ def assemble(
     Сервер, конфиг которого установленный Xray или sing-box не принимает, отбрасывается.
     """
     applied = read_json(paths.xray_config_file)
+    if cfg.zapret2.mode == "standalone":
+        problems = zapret2.validate(cfg)
+        if problems:
+            raise EngineError("; ".join(problems))
+        selection = builder.Selection()
+        result = builder.build(cfg, selection, hosts={}, containers_tun=containers_tun(cfg),
+                               api_listen=str(paths.xray_api_socket))
+        verdict, output = validate.validate_config(result.config, xray_bin) if check else (None, "")
+        if verdict is False:
+            raise EngineError(f"конфиг без VPN не прошёл xray run -test:\n{output}")
+        return Assembly(result, selection, verdict)
     applied_sb = read_json(paths.singbox_config_file)
     probe_password, probe_ports = builder.probe_state(applied)
     pool_devs = traffic.pool_devices(cfg)

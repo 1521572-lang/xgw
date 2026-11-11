@@ -34,6 +34,12 @@ REASONS = {
     "comparison_done": "Круг сравнения завершён. Результат каждого запроса показан ниже.",
     "comparison_incomplete": "Круг сравнения не завершён полностью.",
     "comparison_cleanup_failed": "Завершение сравнения и возврат маршрута не подтверждены.",
+    "worker_ready": "Без VPN. Обработчик готов. Выбранные HTTPS-домены идут через zapret2, "
+                    "остальные напрямую. Это ещё не подтверждает воспроизведение YouTube.",
+    "vpn_requested": "Запрошен возврат к VPN. Ожидается конфиг с серверами.",
+    "capture_failed": "Не удалось включить перехват для режима без VPN.",
+    "vpn_stopping": "Прямой конфиг применён. Ожидается завершение прежних проверок и VPN-мостов.",
+    "invalid_config": "Проверьте настройки zapret2. Переход в режим без VPN не подтверждён.",
 }
 
 VERDICTS = {
@@ -52,7 +58,7 @@ def prerequisites(cfg, mode: str) -> list[str]:
     candidate = copy.deepcopy(cfg)
     candidate.zapret2.mode = mode
     problems = zapret2.validate(candidate)
-    if not problems and not zapret2.configured(candidate):
+    if not problems and mode != "standalone" and not zapret2.configured(candidate):
         problems.append("Задайте адреса проверок страницы и видео в настройках zapret2.")
     paths = (cfg.zapret2.binary, f"{cfg.zapret2.lua_dir}/zapret-lib.lua",
              f"{cfg.zapret2.lua_dir}/zapret-antidpi.lua")
@@ -79,7 +85,7 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
     elif state == "off" and cfg.zapret2.mode != "off":
         detail = "Режим выбран, но прямой маршрут сейчас не используется. Проверьте VPN и пул."
     blockers = {}
-    for mode in ("compare", "selective"):
+    for mode in ("standalone", "compare", "selective"):
         problems = prerequisites(cfg, mode)
         if not fresh:
             problems.insert(0, "Нет свежих данных демона.")
@@ -89,9 +95,12 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
             problems.insert(0, "Сначала выключите текущий режим zapret2.")
         elif state != "off":
             problems.insert(0, "Дождитесь подтверждённого выключения zapret2.")
-        if capture.get("mode") != "on" or not (snapshot.get("xray") or {}).get("ok"):
+        if mode != "standalone" and (
+                capture.get("mode") != "on" or not (snapshot.get("xray") or {}).get("ok")):
             problems.insert(0, "Сначала включите VPN и дождитесь работающего Xray.")
-        if cfg.free_pool.mode == "on":
+        if mode == "standalone" and not (cfg.capture.local or cfg.capture.lan):
+            problems.insert(0, "Сначала настройте перехват трафика шлюза.")
+        if mode != "standalone" and cfg.free_pool.mode == "on":
             problems.insert(0, "Режим всего дома через бесплатный пул имеет приоритет.")
         if state == "blocked":
             problems.insert(0, "Сначала устраните ошибку возврата на VPN.")
@@ -107,10 +116,22 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
             "verdict": row.get("verdict") if row.get("verdict") in VERDICTS else "unknown",
             "detail": VERDICTS.get(row.get("verdict"), ""),
         })
+    title = TITLES.get(state, TITLES["unknown"])
+    if raw.get("without_vpn"):
+        if state == "active":
+            title = "Обработчик готов · без VPN"
+        elif state == "blocked":
+            title = "Выбранные домены заблокированы · без VPN"
+        elif state == "off":
+            title = "Перехват выключен · без VPN"
+            detail = "Прямой интернет без обработки zapret2. Включите перехват кнопкой питания."
+    elif cfg.zapret2.mode == "standalone" and state == "blocked":
+        title = "Режим без VPN не подтверждён"
     return {
         "mode": cfg.zapret2.mode, "strategy": cfg.zapret2.strategy,
         "domains": list(cfg.zapret2.domains), "probe_count": len(cfg.zapret2.probe_urls),
-        "config_key": key, "state": state, "title": TITLES.get(state, TITLES["unknown"]),
+        "config_key": key, "state": state, "title": title,
+        "without_vpn": bool(raw.get("without_vpn")) if fresh else False,
         "detail": detail, "blockers": blockers, "probes": probes,
         "can_off": fresh and (cfg.zapret2.mode != "off" or state == "blocked"),
         "can_edit": fresh and not pending and cfg.zapret2.mode == "off" and state == "off",

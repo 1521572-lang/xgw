@@ -456,7 +456,7 @@ class Panel:
             }
         if mode in ("on", "open"):
             return {"can_on": False, "can_off": True, "why": ""}
-        if not has_servers:
+        if not has_servers and self.cfg.zapret2.mode != "standalone":
             return {"can_on": False, "can_off": False,
                     "why": "сначала добавьте подписку или ссылку сервера"}
         if not xray_ok:

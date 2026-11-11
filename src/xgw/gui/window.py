@@ -345,8 +345,12 @@ class OverviewPage(QWidget):
                  if not stale and ((state or {}).get("zapret2") or {}).get("state") == "active"
                  else "")
         set_text(self.power_sub, power.sub + extra)
+        direct_mode = (((state or {}).get("zapret2") or {}).get("mode") == "standalone"
+                       or ((state or {}).get("zapret2") or {}).get("without_vpn"))
         self.power.setText("Выключаю…" if acting and power.pressed else
                            "Включаю…" if acting else
+                           ("Выключить перехват" if power.pressed else "Включить zapret2")
+                           if direct_mode else
                            ("Выключить VPN" if power.pressed else "Включить VPN"))
         self.power.setAccessibleName(self.power.text())
         self.power.setEnabled(power.enabled)
@@ -423,6 +427,8 @@ class OverviewPage(QWidget):
         capture = (state or {}).get("capture") or {}
         set_text(self.guard["scope"], model.scope_text(capture) if capture.get("mode") == "on"
                  else "ничего: VPN выключен" if capture else "—")
+        if ((state or {}).get("zapret2") or {}).get("without_vpn"):
+            set_text(self.guard["scope"], "Прямой интернет без VPN")
         set_text(self.guard["fail"],
                  model.FAIL_MODES.get(str(capture.get("fail_mode") or ""), "—"))
         bypass = capture.get("bypass") or []

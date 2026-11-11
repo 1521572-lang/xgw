@@ -419,7 +419,9 @@ min_interval_min = 10
 [zapret2]
 # Дополнительный прямой выход через nfqws2, только выбранные HTTPS-домены.
 # Подготовка и ограничения: docs/ZAPRET2.md. XGW ничего не скачивает и не устанавливает.
-mode = "off" # selective — после подготовки и согласия владельца на прямой домашний IP
+mode = "off" # standalone — zapret2 без VPN; selective — домены с возвратом на VPN
+# standalone: выбранные домены через nfqws2, остальные напрямую; VPN-сервер не нужен.
+# Требуется capture.fail_mode = "closed". probe_urls для standalone не используются.
 # compare — разовое сравнение двух probe_urls на служебных входах; клиенты остаются на VPN
 domains = ["domain:youtube.com", "domain:googlevideo.com",
            "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
@@ -428,7 +430,7 @@ lua_dir = "/opt/xgw/zapret2/1.0.7/lua"
 strategy = "multisplit" # также multidisorder; результат зависит от провайдера
 queue_num = 200
 probe_port = 19999
-probe_urls = [] # HTTPS-страница YouTube и HTTPS-файл видеосети; пусто — остаётся VPN
+probe_urls = [] # только для selective/compare: HTTPS-страница и HTTPS-файл видеосети
 check_seconds = 180
 retry_seconds = 300
 daily_probe_mb = 256

@@ -428,12 +428,18 @@
 
   // Весь дом через бесплатные серверы (free_pool.mode = on, веха М2б.2): подписка — только
   // несущий канал шлюза, трафик устройств — через пул.
-  const poolHouse = (s) => (s.free_pool || {}).mode === "on";
+  const poolHouse = (s) => !(s.zapret2 || {}).without_vpn && (s.free_pool || {}).mode === "on";
   const poolFlow = (s) => ((s.free_pool || {}).summary || {}).traffic || null;
 
   function health(s, stale) {
     if (!s.updated) return ["off", "Запускается…"];
     if (stale) return ["bad", "Демон XGW не отвечает"];
+    if (s.zapret2 && s.zapret2.without_vpn) {
+      if (s.state === "XRAY_DOWN") return ["bad", "Локальный маршрутизатор не отвечает"];
+      if (s.capture.loaded === false || s.capture.lan_problem) return ["bad", "Проблема перехвата трафика"];
+      return s.zapret2.state === "active" ? ["ok", "zapret2 без VPN"] : ["warn", s.zapret2.title];
+    }
+    if (s.zapret2 && s.zapret2.mode === "standalone") return ["warn", s.zapret2.title];
     if (poolHouse(s)) {
       // Здоровье — по пулу: серверы подписки несут только каналы шлюза.
       if (["WAN_DOWN", "XRAY_DOWN", "LEAK"].includes(s.state)) return STATES[s.state];
@@ -485,6 +491,10 @@
 
   function renderLifecycle(s, stale) {
     const line = $("lifecycle");
+    if (s.zapret2 && s.zapret2.without_vpn) {
+      line.hidden = true;
+      return;
+    }
     const known = LIFECYCLE[s.capture.lifecycle];
     // Строку пишет демон: не отвечает он — она устарела.
     line.hidden = !known || stale;
@@ -540,6 +550,16 @@
       title = "Перехват не настроен";
       sub = "XGW только управляет Xray: в config.toml перехват выключен";
     }
+    const withoutVpn = s.zapret2 && s.zapret2.without_vpn;
+    if (withoutVpn) {
+      title = on ? "zapret2 без VPN" : "Прямой интернет · zapret2 выключен";
+      sub = s.zapret2.detail;
+      heroTone = on ? (s.zapret2.state === "active" ? "ok" : "warn") : "off";
+    } else if (s.zapret2 && s.zapret2.mode === "standalone") {
+      title = "Включение zapret2 без VPN";
+      sub = s.zapret2.detail;
+      heroTone = "warn";
+    }
     $("hero").dataset.tone = heroTone;
     renderLifecycle(s, stale);
     $("power-title").textContent = title;
@@ -547,8 +567,10 @@
     const pressed = on || mode === "open";
     power.setAttribute("aria-pressed", String(pressed));
     power.disabled = acting || !(pressed ? s.power.can_off : s.power.can_on);
-    $("power-label").textContent = pressed ? "Выключить VPN" : "Включить VPN";
-    power.title = pressed ? "Выключить VPN" : "Включить VPN";
+    $("power-label").textContent = withoutVpn
+      ? (pressed ? "Выключить перехват" : "Включить zapret2")
+      : (pressed ? "Выключить VPN" : "Включить VPN");
+    power.title = $("power-label").textContent;
     const why = !pressed && !s.power.can_on ? s.power.why : "";
     $("power-why").hidden = !why;
     $("power-why").textContent = capital(why);

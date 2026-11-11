@@ -1439,6 +1439,10 @@ class Daemon:
         refresh_asked, self._refresh_asked = self._refresh_asked, False
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
+        if self.cfg.zapret2.mode == "standalone" or zapret2.standalone(applied):
+            from .watch import standalone
+
+            return standalone.tick(self, applied, now)
         if applied is None:
             # Блокировку ставим до ожидания сети даже на первом шаге и при повреждении
             # конфига. Состояние процесса Xray по одному файлу определить нельзя.
@@ -7166,6 +7170,9 @@ class Daemon:
         if info.get("lan_problem"):
             # Пакеты устройств сети гибнут до Xray: мимо VPN они не уходят, но и не идут.
             return Lifecycle.BLOCKED, str(info["lan_problem"])
+        if self.cfg.zapret2.mode == "standalone":
+            return (Lifecycle.CONNECTED,
+                    "Прямой интернет без VPN; состояние zapret2 показано отдельно")
         tags = [info.tag for info in view if info.role == "proxy"]
         _alive, _dead, unknown = metrics.count_members(observatory or {}, tags)
         if tags and unknown >= len(tags):
@@ -7226,7 +7233,11 @@ class Daemon:
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
-        snapshot["zapret2"] = {**self._zapret2.view, "config_key": zapret2.config_key(self.cfg)}
+        snapshot["zapret2"] = {
+            **self._zapret2.view, "config_key": zapret2.config_key(self.cfg),
+            "without_vpn": xray_ok and not self.paths.api_dirty_file.exists()
+            and zapret2.standalone(engine.read_json(self.paths.xray_config_file)),
+        }
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

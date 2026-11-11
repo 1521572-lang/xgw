@@ -19,9 +19,11 @@ from PyQt6.QtWidgets import (
 from .operations import Control, Page, plain
 from .widgets import set_text, tone
 
-MODES = {"off": "Выключен", "compare": "Сравнение с VPN", "selective": "Выбранные домены"}
+MODES = {"off": "Выключен", "compare": "Сравнение с VPN", "selective": "Домены с возвратом на VPN",
+         "standalone": "zapret2 без VPN"}
 
-REQUIREMENTS = ("Каждый адрес должен отдавать HTTP 2xx и не менее 16 КиБ тела. "
+REQUIREMENTS = ("В режиме «без VPN» адреса проверок не нужны. Для selective и сравнения "
+                "каждый адрес должен отдавать HTTP 2xx и не менее 16 КиБ тела. "
                 "Ответ 204 и маленький служебный файл не подходят. "
                 "Selective не следует перенаправлениям.")
 
@@ -163,6 +165,12 @@ class Zapret2Page(Page):
             self.results.update_rows([])
             return
         controls = (
+            self.mode_control("zapret2 без VPN", "standalone",
+                              "Переключить шлюз на прямой интернет без VPN? "
+                              "Выбранные HTTPS-домены пойдут через zapret2, остальные напрямую. "
+                              "VPN-соединения прервутся при смене режима. Правила VPN для "
+                              "устройств и пула будут приостановлены. При сбое zapret2 выбранные "
+                              "домены блокируются, VPN автоматически не включается."),
             self.mode_control("Сравнить с VPN", "compare",
                               "Выполнить один круг запросов к сохранённым адресам через VPN "
                               "и напрямую через zapret2? Клиентский маршрут сохранится. "
@@ -171,9 +179,11 @@ class Zapret2Page(Page):
                               "Направлять выбранные HTTPS-домены через домашний IP после "
                               "успешной проверки? При отказе шлюз вернёт новые соединения на VPN. "
                               "Воспроизведение видео последними проверками ещё не подтверждено."),
-            self.mode_control("Выключить zapret2", "off",
-                              "Выключить прямой маршрут zapret2 и вернуть новые соединения "
-                              "на обычный маршрут шлюза?"),
+            self.mode_control("Вернуться к VPN" if view.get("without_vpn") else
+                              "Выключить zapret2", "off",
+                              "Выключить режим zapret2 и вернуть обычный режим VPN? "
+                              "Для VPN нужны настроенные серверы. "
+                              "Смена режима прервёт соединения."),
         )
         detail = ("Последнее известное состояние. " if self.main.stale else "") + view["detail"]
         self.status.update_rows([("mode", "Выбран режим — " + MODES.get(view["mode"], "—"),
