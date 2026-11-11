@@ -104,7 +104,7 @@ def test_new_session_timeout_is_recorded_before_navigation(tmp_path):
             raise TimeoutError
 
     assert browser.observe(Client(), "", [], None, tmp_path, stages.append) == (
-        "", "", "browser_session_timeout", False,
+        [], "", "browser_session_timeout", False,
     )
 
 
@@ -139,7 +139,7 @@ def test_foreign_profile_is_not_navigated(tmp_path):
             return {"capabilities": {"moz:profile": str(tmp_path / "other-profile")}}
 
     result = browser.observe(Client(), "", [], None, tmp_path / "expected", stages.append)
-    assert result == ("", "", "browser_profile_unverified", False)
+    assert result == ([], "", "browser_profile_unverified", False)
     assert calls == ["WebDriver:NewSession"] and stages == ["session_requested"]
 
 

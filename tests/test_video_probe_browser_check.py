@@ -97,6 +97,7 @@ def test_receipt_and_replay_follow_selected_path(
             saved = json.loads(receipt.read_bytes())
             assert saved["playback"] and saved["verification"] == "pending"
             assert ("video" in saved) == (point is after_replay)
+            assert len(saved["replay_attempts"]) == int(point is after_replay)
         return point
 
     class Relay:
@@ -116,8 +117,9 @@ def test_receipt_and_replay_follow_selected_path(
         def shutdown(self):
             pass
 
+    domains = ["domain:youtube.com", "domain:googlevideo.com"]
     cfg = SimpleNamespace(
-        zapret2=SimpleNamespace(mode="off", probe_urls=[PAGE], domains=["domain:youtube.com"]),
+        zapret2=SimpleNamespace(mode="off", probe_urls=[PAGE], domains=domains),
         media=SimpleNamespace(youtube_sign_url=""),
     )
     monkeypatch.setattr(sys, "argv", ["helper", "--state", str(receipt)])
@@ -146,18 +148,20 @@ def test_receipt_and_replay_follow_selected_path(
         if change == "browser_error":
             record_error(observation_error)
             raise OSError("PRIVATE")
-        return "PRIVATE", "Firefox", "played", True
+        url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
+        return [url], "Firefox", "played", True
 
     monkeypatch.setattr(helper.video_browser, "browser", observe)
     calls = []
 
-    def replay(*args):
+    def replay(*args, **_kwargs):
         calls.append(args)
         return {"result": "browser_video_verified", "expires_in": 900, "video": {
             "http": 206, "bytes": 16384, "video_mime": True, "verdict": "ok",
         }}
 
     monkeypatch.setattr(helper.video_probe, "replay", replay)
+    monkeypatch.setattr(helper.video_probe.time, "time", lambda: 1000)
     if change == "browser_error":
         with pytest.raises(OSError):
             helper.main()
@@ -176,6 +180,7 @@ def test_receipt_and_replay_follow_selected_path(
     assert saved["stages"] == expected_stages
     assert saved["marionette_error"] == navigation_error
     assert bool(calls) == (change in ("unrelated", "after_replay"))
+    assert len(saved["replay_attempts"]) == len(calls)
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out
     assert ("RESULT browser_video_verified" in output) == (expected == "ok")

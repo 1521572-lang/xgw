@@ -79,6 +79,7 @@ def http_get_via_proxy(
     range_end: int = 0,
     min_body: int = 0,
     accept_gzip: bool = False,
+    strict_max_bytes: bool = False,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -103,6 +104,8 @@ def http_get_via_proxy(
     `range_end` — сколько байт тела просить (Range: bytes=0-…, ответ 206); 0 — весь файл.
     Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
     `accept_gzip` — запросить сжатое тело; распаковка остаётся у вызывающего.
+    `strict_max_bytes` ограничивает чтение тела указанным `max_bytes`, включая байты,
+    прочитанные вместе с заголовками.
     """
     headers = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
     if accept_gzip:
@@ -177,6 +180,7 @@ def http_get_via_proxy(
         result = _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
             max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
+            strict_max_bytes=strict_max_bytes,
         )
         result.phase = "body" if 200 <= result.status < 300 else phase
         if result.ok and result.downloaded < min_body:
@@ -291,13 +295,14 @@ class _Deadline(Exception):
 
 
 def _recv(
-    sock: socket.socket, silence: float, deadline: float, cancel: threading.Event | None = None
+    sock: socket.socket, silence: float, deadline: float, cancel: threading.Event | None = None,
+    *, size: int = 65536,
 ) -> bytes:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise _Deadline
     try:
-        return fetch.wait_io(sock, lambda: sock.recv(65536), min(silence, remaining), cancel)
+        return fetch.wait_io(sock, lambda: sock.recv(size), min(silence, remaining), cancel)
     except TimeoutError:
         if time.monotonic() >= deadline:
             raise _Deadline from None
@@ -307,16 +312,18 @@ def _recv(
 def _read_response(
     sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0,
     max_bytes: int = 0, max_body_seconds: float = 0.0, cancel: threading.Event | None = None,
+    strict_max_bytes: bool = False,
 ) -> DownloadResult:
     """Читает ответ: заголовки, затем тело до Content-Length, последней части ответа «частями»
     или закрытия (либо до max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до
     конца). downloaded и body — полезные байты тела, без разметки частей."""
     buffer = b""
+    limit = max_bytes if strict_max_bytes and max_bytes > 0 else 0
     try:
         while fetch.HEAD_END not in buffer:
             if len(buffer) > HEAD_LIMIT:
                 return DownloadResult(ok=False, kind="http", error="ответ не похож на HTTP")
-            chunk = _recv(sock, silence, deadline, cancel)
+            chunk = _recv(sock, silence, deadline, cancel, size=min(65536, limit or 65536))
             if not chunk:
                 return DownloadResult(
                     ok=False, kind="truncated", error="соединение закрыто до заголовков ответа"
@@ -367,7 +374,8 @@ def _read_response(
                     ok=True, downloaded=downloaded, status=status, body=body,
                     body_seconds=time.monotonic() - started, content_type=content_type,
                 )
-            chunk = _recv(sock, silence, read_deadline, cancel)
+            size = min(65536, limit - downloaded) if limit else 65536
+            chunk = _recv(sock, silence, read_deadline, cancel, size=size)
             if not chunk:
                 break
             data = parts.feed(chunk) if parts is not None else chunk

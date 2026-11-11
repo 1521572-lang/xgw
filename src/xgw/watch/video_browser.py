@@ -202,11 +202,11 @@ def observe(client, page, domains, relay, profile, progress):
             "pageLoadStrategy": "eager", "timeouts": {"pageLoad": 7000, "script": 5000}}}},
             timeout=SESSION_TIMEOUT)
     except TimeoutError:
-        return "", "", "browser_session_timeout", False
+        return [], "", "browser_session_timeout", False
     capabilities = session.get("capabilities") if isinstance(session, dict) else None
     reported = capabilities.get("moz:profile") if isinstance(capabilities, dict) else None
     if not isinstance(reported, str) or Path(reported).resolve() != profile.resolve():
-        return "", "", "browser_profile_unverified", False
+        return [], "", "browser_profile_unverified", False
     progress("session_ready")
     progress("navigation_started")
     try:
@@ -235,15 +235,15 @@ def observe(client, page, domains, relay, profile, progress):
                 played = True
                 progress("playback_observed")
         if played and position is not None:
-            url = video_probe.browser_candidate(sample["urls"], domains, time.time())
+            urls = video_probe.browser_candidates(sample["urls"], domains, time.time())
             agent = sample["agent"]
-            if url and re.fullmatch(r"[ -~]{1,512}", agent):
-                return url, agent, "played", True
+            if urls and re.fullmatch(r"[ -~]{1,512}", agent):
+                return urls, agent, "played", True
         time.sleep(1)
     if relay.stopped.is_set():
-        return "", "", "browser_budget", played
+        return [], "", "browser_budget", played
     reason = "browser_url_missing" if played else "no_playback" if state == "player" else state
-    return "", "", reason, played
+    return [], "", reason, played
 
 
 def reserve_control_port():
@@ -311,9 +311,9 @@ def browser(firefox, user, page, domains, relay, progress, record_error):
                     return observe(client, page, domains, relay, profile, progress)
             reason = ("marionette_listen_timeout" if process.poll() is None
                       else "browser_start_failed")
-            return "", "", reason, False
+            return [], "", reason, False
         except (OSError, EOFError, ValueError):
-            return "", "", "browser_control_failed", False
+            return [], "", "browser_control_failed", False
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)

@@ -116,6 +116,14 @@ def test_content_type_survives_body_limit(serve):
     assert 8192 <= result.downloaded < BODY
 
 
+@pytest.mark.parametrize("split_headers", [False, True])
+def test_strict_body_limit_includes_bytes_received_with_headers(serve, split_headers):
+    payload = b"x" * BODY
+    chunks = (HEADERS, 0.05, payload) if split_headers else (HEADERS + payload,)
+    result = _get(serve(*chunks), max_bytes=16384, keep_body=BODY, strict_max_bytes=True)
+    assert result.ok and result.downloaded == len(result.body) == 16384
+
+
 def test_headers_split_between_packets(serve):
     """Конец заголовков может прийти в следующем пакете — это не сбой."""
     result = _get(serve(HEADERS[:-2], 0.1, HEADERS[-2:] + b"x" * BODY))

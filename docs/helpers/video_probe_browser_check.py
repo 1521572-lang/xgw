@@ -133,8 +133,9 @@ def verify(paths, before, original_path, node, password):
 def finish(path, result, verification, xray_changed):
     atomic_write_json(path, {**result, "verification": verification,
                              "xray_config_changed": xray_changed}, mode=0o600)
-    print("BROWSER bytes={} playback={} observation={}".format(
-        result["browser_bytes"], int(result["playback"]), result["observation"]))
+    print("BROWSER bytes={} playback={} observation={} candidates={}".format(
+        result["browser_bytes"], int(result["playback"]), result["observation"],
+        result["candidate_count"]))
     if "video" in result:
         row = result["video"]
         print("VIDEO http={} bytes={} video_mime={} verdict={} expires_in={}".format(
@@ -211,19 +212,27 @@ def main():
 
         try:
             progress("relay_ready")
-            url, agent, reason, played = video_browser.browser(
+            urls, agent, reason, played = video_browser.browser(
                 firefox, user, page, domains, relay, progress, record_error)
         finally:
             relay.stopped.set()
             relay.shutdown()
         spent = relay.spent
     result = {**diagnostics, "result": reason, "observation": reason, "browser_bytes": spent,
-              "playback": played}
+              "playback": played, "candidate_count": len(urls), "replay_attempts": []}
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, changed = verify(paths, before, original_path, node, password)
-    if verification != "ok" or not url:
+    if verification != "ok" or not urls:
         return finish(args.state, result, verification, changed)
-    result.update(video_probe.replay(url, domains, port, password, agent))
+
+    def record_attempt(index, observation):
+        attempt = {"attempt": index, **observation}
+        result["replay_attempts"].append(attempt)
+        atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
+        print("ATTEMPT", json.dumps(attempt, sort_keys=True), flush=True)
+
+    result.update(video_probe.replay_candidates(urls, domains, port, password, agent,
+                                               record_attempt))
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, after_replay = verify(paths, before, original_path, node, password)
     changed = True if changed else after_replay

@@ -15,6 +15,8 @@ from . import checks
 PAGE_BYTES = 2 * 1024 * 1024
 # Два запроса, включая последний блок чтения и заголовки.
 MAX_CHARGE = 3 * 1024 * 1024
+REPLAY_ATTEMPTS = 3
+REPLAY_SECONDS = 8
 PLAYER = re.compile(r'(?:\bytInitialPlayerResponse|window\["ytInitialPlayerResponse"\])\s*=\s*')
 
 
@@ -72,12 +74,13 @@ def candidate(body: bytes, domains: list[str], now: float) -> tuple[str, str]:
         return "", "player_invalid"
 
 
-def browser_candidate(urls: list[str], domains: list[str], now: float) -> str:
-    """Адрес из Resource Timing ещё не доказывает, что его можно повторить через GET."""
-    fallback = ""
+def browser_candidates(urls: list[str], domains: list[str], now: float) -> list[str]:
+    """Свежие адреса из Resource Timing. Сначала кандидаты с явным video MIME."""
+    video, fallback, seen = [], [], set()
     for url in urls[:16]:
-        if not isinstance(url, str) or not allowed(url, domains):
+        if not isinstance(url, str) or url in seen or not allowed(url, domains):
             continue
+        seen.add(url)
         parts = urlsplit(url)
         until = zapret2.expiry(url)
         if parts.path != "/videoplayback" or until is None or not now + 300 <= until <= now + 86400:
@@ -87,19 +90,20 @@ def browser_candidate(urls: list[str], domains: list[str], now: float) -> str:
         except ValueError:
             continue
         if mime.startswith("video/"):
-            return url
-        if not mime and not fallback:
-            fallback = url
-    return fallback
+            video.append(url)
+        elif not mime:
+            fallback.append(url)
+    return (video + fallback)[:REPLAY_ATTEMPTS]
 
 
-def replay(url: str, domains: list[str], port: int, password: str, agent: str) -> dict:
-    if not browser_candidate([url], domains, time.time()):
+def replay(url: str, domains: list[str], port: int, password: str, agent: str,
+           *, max_total: float = REPLAY_SECONDS) -> dict:
+    if not browser_candidates([url], domains, time.time()):
         return {"result": "browser_url_missing"}
     reply = checks.http_get_via_proxy(
         "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
-        timeout=5, silence=4, max_total=8, max_bytes=zapret2.PROBE_BYTES,
-        min_body=zapret2.MIN_BODY, range_end=zapret2.PROBE_BYTES,
+        timeout=5, silence=4, max_total=max_total, max_bytes=zapret2.MIN_BODY,
+        min_body=zapret2.MIN_BODY, range_end=zapret2.MIN_BODY, strict_max_bytes=True,
     )
     video = reply.content_type.startswith("video/")
     enough = reply.ok and reply.status in (200, 206) and reply.downloaded >= zapret2.MIN_BODY
@@ -111,6 +115,22 @@ def replay(url: str, domains: list[str], port: int, password: str, agent: str) -
         "video": zapret2.probe_row(2, reply) | {"path": "vpn", "video_mime": video},
         "expires_in": max(0, int((zapret2.expiry(url) or 0) - time.time())),
     }
+
+
+def replay_candidates(urls: list[str], domains: list[str], port: int, password: str, agent: str,
+                      record_attempt) -> dict:
+    """До трёх GET по 16 КиБ, с одним общим сроком и остановкой на первом успехе."""
+    deadline = time.monotonic() + REPLAY_SECONDS
+    result = {"result": "browser_url_missing"}
+    for index, url in enumerate(browser_candidates(urls, domains, time.time()), 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {**result, "result": "replay_time_budget"}
+        result = replay(url, domains, port, password, agent, max_total=remaining)
+        record_attempt(index, result)
+        if result["result"] == "browser_video_verified":
+            break
+    return result
 
 
 def check(page: str, domains: list[str], port: int, password: str, agent: str,

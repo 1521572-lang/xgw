@@ -90,16 +90,16 @@ def test_browser_candidate_prefers_video_and_rejects_other_resources():
     url = URL.replace("/video?", "/videoplayback?")
     audio = url + "&mime=audio%2Fwebm"
     video = url + "&mime=video%2Fmp4"
-    assert v.browser_candidate([URL, audio, url, video], DOMAINS, 1000) == video
+    assert v.browser_candidates([URL, audio, url, video, video], DOMAINS, 1000) == [video, url]
     stale = url.replace("expire=1600", "expire=1100")
     other = video.replace("googlevideo.com", "outside.test")
-    assert not v.browser_candidate([audio, stale, other], DOMAINS, 1000)
+    assert not v.browser_candidates([audio, stale, other], DOMAINS, 1000)
 
 
 @pytest.mark.parametrize("status,downloaded,mime,expected", [
-    (206, 32768, "video/webm", "browser_video_verified"),
-    (200, 32768, "text/html", "replay_not_video"),
-    (200, 32768, "audio/mp4", "replay_not_video"),
+    (206, 16384, "video/webm", "browser_video_verified"),
+    (200, 16384, "text/html", "replay_not_video"),
+    (200, 16384, "audio/mp4", "replay_not_video"),
     (200, 25, "video/mp4", "replay_failed"),
     (302, 0, "", "replay_failed"),
 ])
@@ -117,4 +117,44 @@ def test_browser_replay_requires_downloaded_video(monkeypatch, status, downloade
     result = v.replay(url, DOMAINS, 12345, "PRIVATE", "Firefox")
     assert result["result"] == expected and "PRIVATE" not in json.dumps(result)
     assert len(calls) == 1 and calls[0][:3] == ("127.0.0.1", 12345, url)
-    assert calls[0][3]["user_agent"] == "Firefox" and calls[0][3]["range_end"] == 65536
+    assert calls[0][3]["user_agent"] == "Firefox" and calls[0][3]["range_end"] == 16384
+    assert calls[0][3]["strict_max_bytes"]
+
+
+@pytest.mark.parametrize("outcome,attempts", [("verified", 2), ("deadline", 1), ("all_failed", 3)])
+def test_browser_replay_candidates_share_deadline_and_preserve_attempts(
+    monkeypatch, outcome, attempts,
+):
+    now = [0.0]
+    calls, observed = [], []
+    url = URL.replace("/video?", "/videoplayback?")
+    candidates = [f"{url}&fixture={n}" for n in range(4)]
+    monkeypatch.setattr(v.time, "time", lambda: 1000)
+    monkeypatch.setattr(v.time, "monotonic", lambda: now[0])
+
+    def fetch(host, port, target, **kwargs):
+        assert len(observed) == len(calls)
+        assert host == "127.0.0.1" and port == 12345 and kwargs["user_agent"] == "Firefox"
+        assert kwargs["strict_max_bytes"] and kwargs["max_bytes"] == 16384
+        calls.append((target, kwargs["max_total"]))
+        now[0] += kwargs["max_total"] if outcome == "deadline" else 2
+        if outcome == "verified" and len(calls) == 2:
+            return checks.DownloadResult(True, status=206, downloaded=16384,
+                                         content_type="video/mp4")
+        return checks.DownloadResult(False, status=200, downloaded=31, kind="http",
+                                     phase="body", error="PRIVATE")
+
+    monkeypatch.setattr(checks, "http_get_via_proxy", fetch)
+    result = v.replay_candidates(
+        candidates, DOMAINS, 12345, "PRIVATE", "Firefox",
+        lambda index, row: observed.append((index, row)),
+    )
+    assert calls == list(zip(candidates[:attempts], [8, 6, 4][:attempts], strict=True))
+    assert [index for index, _ in observed] == list(range(1, attempts + 1))
+    assert observed[0][1]["video"]["verdict"] == "short_body"
+    assert result["result"] == {
+        "verified": "browser_video_verified",
+        "deadline": "replay_time_budget",
+        "all_failed": "replay_failed",
+    }[outcome]
+    assert "PRIVATE" not in json.dumps(observed)
