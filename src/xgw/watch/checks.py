@@ -51,6 +51,7 @@ class DownloadResult:
 
     body_time_limited: bool = False  # чтение прервал именно лимит времени тела
     phase: str = ""  # connect, tls, request, headers или body
+    content_type: str = ""
 
     @property
     def frozen(self) -> bool:
@@ -183,7 +184,7 @@ def http_get_via_proxy(
                 ok=False, kind="http", status=result.status, downloaded=result.downloaded,
                 body=result.body, body_seconds=result.body_seconds,
                 error=f"ответ без тела (HTTP {result.status}, {result.downloaded} байт)",
-                phase=result.phase,
+                phase=result.phase, content_type=result.content_type,
             )
         if rtt and parts.scheme == "https" and result.ok and result.reusable:
             head = _request("HEAD", path, {"Host": _host_header(host, port, 443)}, user_agent)
@@ -340,6 +341,7 @@ def _read_response(
         kind = "proxy" if status == 407 else "http"
         return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}",
                               location=_header(head, "location") if 300 <= status < 400 else "")
+    content_type = _header(head, "content-type").partition(";")[0].strip().lower()
     if status == 204:
         length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
@@ -363,7 +365,7 @@ def _read_response(
             if max_bytes and downloaded >= max_bytes:
                 return DownloadResult(
                     ok=True, downloaded=downloaded, status=status, body=body,
-                    body_seconds=time.monotonic() - started,
+                    body_seconds=time.monotonic() - started, content_type=content_type,
                 )
             chunk = _recv(sock, silence, read_deadline, cancel)
             if not chunk:
@@ -396,7 +398,8 @@ def _read_response(
                                   body_seconds=time.monotonic() - started)
         if body_deadline < deadline and downloaded > 0:
             return DownloadResult(ok=True, downloaded=downloaded, status=status, body=body,
-                                  body_seconds=time.monotonic() - started, body_time_limited=True)
+                                  body_seconds=time.monotonic() - started, body_time_limited=True,
+                                  content_type=content_type)
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="timeout", status=status, body=body,
             error=f"загрузка не уложилась в отведённое время ({downloaded} байт тела)",
@@ -417,7 +420,8 @@ def _read_response(
             body_seconds=seconds,
         )
     result = DownloadResult(
-        ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds
+        ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds,
+        content_type=content_type,
     )
     # Тело дочитано по длине или по кадрам, а сервер не обещал закрыть соединение — им можно
     # отправить следующий запрос (замер RTT).

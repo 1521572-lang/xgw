@@ -72,6 +72,47 @@ def candidate(body: bytes, domains: list[str], now: float) -> tuple[str, str]:
         return "", "player_invalid"
 
 
+def browser_candidate(urls: list[str], domains: list[str], now: float) -> str:
+    """Адрес из Resource Timing ещё не доказывает, что его можно повторить через GET."""
+    fallback = ""
+    for url in urls[:16]:
+        if not isinstance(url, str) or not allowed(url, domains):
+            continue
+        parts = urlsplit(url)
+        until = zapret2.expiry(url)
+        if parts.path != "/videoplayback" or until is None or not now + 300 <= until <= now + 86400:
+            continue
+        try:
+            mime = parse_qs(parts.query, max_num_fields=100).get("mime", [""])[0]
+        except ValueError:
+            continue
+        if mime.startswith("video/"):
+            return url
+        if not mime and not fallback:
+            fallback = url
+    return fallback
+
+
+def replay(url: str, domains: list[str], port: int, password: str, agent: str) -> dict:
+    if not browser_candidate([url], domains, time.time()):
+        return {"result": "browser_url_missing"}
+    reply = checks.http_get_via_proxy(
+        "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
+        timeout=5, silence=4, max_total=8, max_bytes=zapret2.PROBE_BYTES,
+        min_body=zapret2.MIN_BODY, range_end=zapret2.PROBE_BYTES,
+    )
+    video = reply.content_type.startswith("video/")
+    enough = reply.ok and reply.status in (200, 206) and reply.downloaded >= zapret2.MIN_BODY
+    result = "replay_failed"
+    if enough:
+        result = "browser_video_verified" if video else "replay_not_video"
+    return {
+        "result": result,
+        "video": zapret2.probe_row(2, reply) | {"path": "vpn", "video_mime": video},
+        "expires_in": max(0, int((zapret2.expiry(url) or 0) - time.time())),
+    }
+
+
 def check(page: str, domains: list[str], port: int, password: str, agent: str,
           *, cancel=None) -> dict:
     """Один GET страницы и максимум один GET видео тем же выходом. Только безопасная сводка."""

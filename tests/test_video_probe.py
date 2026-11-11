@@ -84,3 +84,37 @@ def test_candidate_is_not_success_until_video_body_passes(monkeypatch):
     result = v.check(PAGE, DOMAINS, 12345, "PRIVATE", "")
     assert result["result"] == "video_failed" and result["video"]["verdict"] == "http_error"
     assert "PRIVATE" not in json.dumps(result)
+
+
+def test_browser_candidate_prefers_video_and_rejects_other_resources():
+    url = URL.replace("/video?", "/videoplayback?")
+    audio = url + "&mime=audio%2Fwebm"
+    video = url + "&mime=video%2Fmp4"
+    assert v.browser_candidate([URL, audio, url, video], DOMAINS, 1000) == video
+    stale = url.replace("expire=1600", "expire=1100")
+    other = video.replace("googlevideo.com", "outside.test")
+    assert not v.browser_candidate([audio, stale, other], DOMAINS, 1000)
+
+
+@pytest.mark.parametrize("status,downloaded,mime,expected", [
+    (206, 32768, "video/webm", "browser_video_verified"),
+    (200, 32768, "text/html", "replay_not_video"),
+    (200, 32768, "audio/mp4", "replay_not_video"),
+    (200, 25, "video/mp4", "replay_failed"),
+    (302, 0, "", "replay_failed"),
+])
+def test_browser_replay_requires_downloaded_video(monkeypatch, status, downloaded, mime, expected):
+    monkeypatch.setattr(v.time, "time", lambda: 1000)
+    url = URL.replace("/video?", "/videoplayback?")
+    calls = []
+
+    def fetch(host, port, target, **kwargs):
+        calls.append((host, port, target, kwargs))
+        return checks.DownloadResult(status in (200, 206), status=status, downloaded=downloaded,
+                                     content_type=mime, error="PRIVATE")
+
+    monkeypatch.setattr(checks, "http_get_via_proxy", fetch)
+    result = v.replay(url, DOMAINS, 12345, "PRIVATE", "Firefox")
+    assert result["result"] == expected and "PRIVATE" not in json.dumps(result)
+    assert len(calls) == 1 and calls[0][:3] == ("127.0.0.1", 12345, url)
+    assert calls[0][3]["user_agent"] == "Firefox" and calls[0][3]["range_end"] == 65536

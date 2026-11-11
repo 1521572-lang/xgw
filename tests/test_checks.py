@@ -109,6 +109,13 @@ def test_full_download_ok(serve):
     assert classify(result, 1.0) == "OK"
 
 
+def test_content_type_survives_body_limit(serve):
+    headers = HEADERS.replace(b"Connection:", b"Content-Type: Video/MP4\r\nConnection:")
+    result = _get(serve(headers + b"x" * (BODY // 2), 0.2, b"x" * (BODY // 2)), max_bytes=8192)
+    assert result.ok and result.content_type == "video/mp4"
+    assert 8192 <= result.downloaded < BODY
+
+
 def test_headers_split_between_packets(serve):
     """Конец заголовков может прийти в следующем пакете — это не сбой."""
     result = _get(serve(HEADERS[:-2], 0.1, HEADERS[-2:] + b"x" * BODY))
