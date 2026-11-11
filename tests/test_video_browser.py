@@ -166,6 +166,35 @@ def test_navigation_response_is_recorded_before_observation(tmp_path):
     ]
 
 
+def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
+    url = "https://cdn.googlevideo.com/videoplayback?expire=1600"
+    resources = [{"url": url, "transferSize": 4096, "decodedBodySize": 3800}]
+    positions = iter([1, 3])
+    stages = []
+    monkeypatch.setattr(browser.time, "time", lambda: 1000)
+    monkeypatch.setattr(browser.time, "sleep", lambda _seconds: None)
+
+    class Client:
+        deadline = time.monotonic() + 5
+
+        def call(self, method, _params, **_kwargs):
+            if method == "WebDriver:NewSession":
+                return {"capabilities": {"moz:profile": str(tmp_path)}}
+            if method == "WebDriver:Navigate":
+                return None
+            assert method == "WebDriver:ExecuteScript"
+            return {"value": {"state": "player", "position": next(positions),
+                              "resources": resources, "agent": "Firefox"}}
+
+    relay = SimpleNamespace(stopped=threading.Event())
+    result = browser.observe(
+        Client(), "", ["domain:googlevideo.com"], relay, tmp_path, stages.append,
+    )
+    assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800)],
+                      "Firefox", "played", True)
+    assert stages[-1] == "playback_observed"
+
+
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):
     opened = []
     upstream, remote = socket.socketpair()

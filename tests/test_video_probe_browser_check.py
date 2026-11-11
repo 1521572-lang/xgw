@@ -149,7 +149,8 @@ def test_receipt_and_replay_follow_selected_path(
             record_error(observation_error)
             raise OSError("PRIVATE")
         url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
-        return [url], "Firefox", "played", True
+        candidate = helper.video_probe.BrowserCandidate(url, 4, 4096, 3800)
+        return [candidate], "Firefox", "played", True
 
     monkeypatch.setattr(helper.video_browser, "browser", observe)
     calls = []
@@ -183,5 +184,13 @@ def test_receipt_and_replay_follow_selected_path(
     assert len(saved["replay_attempts"]) == len(calls)
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out
+    attempts = [json.loads(line.removeprefix("ATTEMPT "))
+                for line in output.splitlines() if line.startswith("ATTEMPT ")]
+    assert attempts == saved["replay_attempts"]
+    if calls:
+        assert attempts[0]["attempt"] == 1
+        assert attempts[0]["candidate_index"] == 4
+        assert attempts[0]["transfer_size"] == 4096
+        assert attempts[0]["decoded_body_size"] == 3800
     assert ("RESULT browser_video_verified" in output) == (expected == "ok")
     assert "PRIVATE" not in output + receipt.read_text()

@@ -90,10 +90,38 @@ def test_browser_candidate_prefers_video_and_rejects_other_resources():
     url = URL.replace("/video?", "/videoplayback?")
     audio = url + "&mime=audio%2Fwebm"
     video = url + "&mime=video%2Fmp4"
-    assert v.browser_candidates([URL, audio, url, video, video], DOMAINS, 1000) == [video, url]
+    entries = [{"url": item} for item in (URL, audio, url, video, video)]
+    assert v.browser_candidates(entries, DOMAINS, 1000) == [
+        v.BrowserCandidate(video, 4, None, None),
+        v.BrowserCandidate(url, 3, None, None),
+    ]
     stale = url.replace("expire=1600", "expire=1100")
     other = video.replace("googlevideo.com", "outside.test")
-    assert not v.browser_candidates([audio, stale, other], DOMAINS, 1000)
+    excluded = [{"url": item} for item in (audio, stale, other)]
+    assert not v.browser_candidates(excluded, DOMAINS, 1000)
+
+
+def test_browser_candidates_rank_by_transfer_size_and_keep_original_observation():
+    url = URL.replace("/video?", "/videoplayback?")
+    large, small, recent, unknown, audio = [f"{url}&fixture={n}" for n in range(5)]
+    small += "&mime=video%2Fmp4"
+    audio += "&mime=audio%2Fmp4"
+    entries = [
+        {"url": recent, "transferSize": 0, "decodedBodySize": -10},
+        {"url": large, "transferSize": 10, "decodedBodySize": 9},
+        {"url": small, "transferSize": 20, "decodedBodySize": 18},
+        {"url": unknown, "transferSize": "99", "decodedBodySize": True},
+        {"url": large, "transferSize": 30, "decodedBodySize": 27},
+        {"url": audio, "transferSize": 90, "decodedBodySize": 80},
+    ]
+    assert v.browser_candidates(entries, DOMAINS, 1000) == [
+        v.BrowserCandidate(large, 5, 30, 27),
+        v.BrowserCandidate(small, 3, 20, 18),
+        v.BrowserCandidate(recent, 1, 0, None),
+    ]
+    assert v.browser_candidates(entries[3:4], DOMAINS, 1000) == [
+        v.BrowserCandidate(unknown, 1, None, None),
+    ]
 
 
 @pytest.mark.parametrize("status,downloaded,mime,expected", [
@@ -128,7 +156,8 @@ def test_browser_replay_candidates_share_deadline_and_preserve_attempts(
     now = [0.0]
     calls, observed = [], []
     url = URL.replace("/video?", "/videoplayback?")
-    candidates = [f"{url}&fixture={n}" for n in range(4)]
+    candidates = [v.BrowserCandidate(f"{url}&fixture={n}", 4 - n, 10 - n, 8 - n)
+                  for n in range(4)]
     monkeypatch.setattr(v.time, "time", lambda: 1000)
     monkeypatch.setattr(v.time, "monotonic", lambda: now[0])
 
@@ -149,8 +178,13 @@ def test_browser_replay_candidates_share_deadline_and_preserve_attempts(
         candidates, DOMAINS, 12345, "PRIVATE", "Firefox",
         lambda index, row: observed.append((index, row)),
     )
-    assert calls == list(zip(candidates[:attempts], [8, 6, 4][:attempts], strict=True))
+    assert calls == list(zip([row.url for row in candidates[:attempts]],
+                             [8, 6, 4][:attempts], strict=True))
     assert [index for index, _ in observed] == list(range(1, attempts + 1))
+    for candidate, (_, row) in zip(candidates[:attempts], observed, strict=True):
+        assert row["candidate_index"] == candidate.index
+        assert row["transfer_size"] == candidate.transfer_size
+        assert row["decoded_body_size"] == candidate.decoded_body_size
     assert observed[0][1]["video"]["verdict"] == "short_body"
     assert result["result"] == {
         "verified": "browser_video_verified",

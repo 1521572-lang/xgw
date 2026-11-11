@@ -42,11 +42,13 @@ if (v && v.error) return {state: 'media_error'};
 if (!v || ad) return {state: ad ? 'ad' : 'no_video'};
 v.muted = true;
 if (v.paused) v.play().catch(() => {});
-const urls = performance.getEntriesByType('resource').reverse()
-    .map(entry => entry.name).filter(url => url.length <= 8192 && url.includes('/videoplayback?'))
-    .slice(0, 16);
+const resources = performance.getEntriesByType('resource').reverse()
+    .filter(entry => entry.name.length <= 8192 && entry.name.includes('/videoplayback?'))
+    .slice(0, 16)
+    .map(entry => ({url: entry.name, transferSize: entry.transferSize,
+                    decodedBodySize: entry.decodedBodySize}));
 const position = v.videoWidth > 0 && !v.paused && !v.seeking ? v.currentTime : null;
-return {state: 'player', position, urls, agent: navigator.userAgent};
+return {state: 'player', position, resources, agent: navigator.userAgent};
 """
 
 
@@ -235,10 +237,10 @@ def observe(client, page, domains, relay, profile, progress):
                 played = True
                 progress("playback_observed")
         if played and position is not None:
-            urls = video_probe.browser_candidates(sample["urls"], domains, time.time())
+            candidates = video_probe.browser_candidates(sample["resources"], domains, time.time())
             agent = sample["agent"]
-            if urls and re.fullmatch(r"[ -~]{1,512}", agent):
-                return urls, agent, "played", True
+            if candidates and re.fullmatch(r"[ -~]{1,512}", agent):
+                return candidates, agent, "played", True
         time.sleep(1)
     if relay.stopped.is_set():
         return [], "", "browser_budget", played

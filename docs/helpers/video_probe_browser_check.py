@@ -212,17 +212,17 @@ def main():
 
         try:
             progress("relay_ready")
-            urls, agent, reason, played = video_browser.browser(
+            candidates, agent, reason, played = video_browser.browser(
                 firefox, user, page, domains, relay, progress, record_error)
         finally:
             relay.stopped.set()
             relay.shutdown()
         spent = relay.spent
     result = {**diagnostics, "result": reason, "observation": reason, "browser_bytes": spent,
-              "playback": played, "candidate_count": len(urls), "replay_attempts": []}
+              "playback": played, "candidate_count": len(candidates), "replay_attempts": []}
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, changed = verify(paths, before, original_path, node, password)
-    if verification != "ok" or not urls:
+    if verification != "ok" or not candidates:
         return finish(args.state, result, verification, changed)
 
     def record_attempt(index, observation):
@@ -231,7 +231,7 @@ def main():
         atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
         print("ATTEMPT", json.dumps(attempt, sort_keys=True), flush=True)
 
-    result.update(video_probe.replay_candidates(urls, domains, port, password, agent,
+    result.update(video_probe.replay_candidates(candidates, domains, port, password, agent,
                                                record_attempt))
     atomic_write_json(args.state, {**result, "verification": "pending"}, mode=0o600)
     verification, after_replay = verify(paths, before, original_path, node, password)

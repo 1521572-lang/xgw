@@ -6,6 +6,7 @@ import json
 import re
 import time
 import zlib
+from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlsplit
 
 from .. import zapret2
@@ -74,31 +75,59 @@ def candidate(body: bytes, domains: list[str], now: float) -> tuple[str, str]:
         return "", "player_invalid"
 
 
-def browser_candidates(urls: list[str], domains: list[str], now: float) -> list[str]:
-    """Свежие адреса из Resource Timing. Сначала кандидаты с явным video MIME."""
-    video, fallback, seen = [], [], set()
-    for url in urls[:16]:
-        if not isinstance(url, str) or url in seen or not allowed(url, domains):
+@dataclass(frozen=True)
+class BrowserCandidate:
+    url: str = field(repr=False)
+    index: int
+    transfer_size: int | None
+    decoded_body_size: int | None
+
+
+def _browser_video_hint(url: str, domains: list[str], now: float) -> bool | None:
+    if not isinstance(url, str) or not allowed(url, domains):
+        return None
+    parts = urlsplit(url)
+    until = zapret2.expiry(url)
+    if parts.path != "/videoplayback" or until is None or not now + 300 <= until <= now + 86400:
+        return None
+    try:
+        mime = parse_qs(parts.query, max_num_fields=100).get("mime", [""])[0]
+    except ValueError:
+        return None
+    if not mime:
+        return False
+    return True if mime.startswith("video/") else None
+
+
+def _resource_size(value: object) -> int | None:
+    if type(value) is int and 0 <= value <= 2**53 - 1:
+        return value
+    return None
+
+
+def browser_candidates(resources: list[dict], domains: list[str],
+                       now: float) -> list[BrowserCandidate]:
+    """Ранжирует свежие ресурсы по transferSize, затем по подсказке video MIME."""
+    eligible = []
+    for index, resource in enumerate(resources[:16], 1):
+        if not isinstance(resource, dict) or not isinstance(url := resource.get("url"), str):
             continue
-        seen.add(url)
-        parts = urlsplit(url)
-        until = zapret2.expiry(url)
-        if parts.path != "/videoplayback" or until is None or not now + 300 <= until <= now + 86400:
+        video_hint = _browser_video_hint(url, domains, now)
+        if video_hint is None:
             continue
-        try:
-            mime = parse_qs(parts.query, max_num_fields=100).get("mime", [""])[0]
-        except ValueError:
-            continue
-        if mime.startswith("video/"):
-            video.append(url)
-        elif not mime:
-            fallback.append(url)
-    return (video + fallback)[:REPLAY_ATTEMPTS]
+        row = BrowserCandidate(url, index, _resource_size(resource.get("transferSize")),
+                               _resource_size(resource.get("decodedBodySize")))
+        eligible.append((row, video_hint))
+    eligible.sort(key=lambda item: (item[0].transfer_size or 0, item[1]), reverse=True)
+    unique = {}
+    for row, _ in eligible:
+        unique.setdefault(row.url, row)
+    return list(unique.values())[:REPLAY_ATTEMPTS]
 
 
 def replay(url: str, domains: list[str], port: int, password: str, agent: str,
            *, max_total: float = REPLAY_SECONDS) -> dict:
-    if not browser_candidates([url], domains, time.time()):
+    if _browser_video_hint(url, domains, time.time()) is None:
         return {"result": "browser_url_missing"}
     reply = checks.http_get_via_proxy(
         "127.0.0.1", port, url, proxy_user=PROBE_USER, proxy_pass=password, user_agent=agent,
@@ -117,17 +146,22 @@ def replay(url: str, domains: list[str], port: int, password: str, agent: str,
     }
 
 
-def replay_candidates(urls: list[str], domains: list[str], port: int, password: str, agent: str,
-                      record_attempt) -> dict:
+def replay_candidates(candidates: list[BrowserCandidate], domains: list[str], port: int,
+                      password: str, agent: str, record_attempt) -> dict:
     """До трёх GET по 16 КиБ, с одним общим сроком и остановкой на первом успехе."""
     deadline = time.monotonic() + REPLAY_SECONDS
     result = {"result": "browser_url_missing"}
-    for index, url in enumerate(browser_candidates(urls, domains, time.time()), 1):
+    for attempt, candidate in enumerate(candidates[:REPLAY_ATTEMPTS], 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return {**result, "result": "replay_time_budget"}
-        result = replay(url, domains, port, password, agent, max_total=remaining)
-        record_attempt(index, result)
+        result = replay(candidate.url, domains, port, password, agent, max_total=remaining)
+        record_attempt(attempt, {
+            **result,
+            "candidate_index": candidate.index,
+            "transfer_size": candidate.transfer_size,
+            "decoded_body_size": candidate.decoded_body_size,
+        })
         if result["result"] == "browser_video_verified":
             break
     return result
