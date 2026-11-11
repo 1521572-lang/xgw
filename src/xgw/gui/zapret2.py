@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
+
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,6 +20,23 @@ from .operations import Control, Page, plain
 from .widgets import set_text, tone
 
 MODES = {"off": "Выключен", "compare": "Сравнение с VPN", "selective": "Выбранные домены"}
+
+REQUIREMENTS = ("Каждый адрес должен отдавать HTTP 2xx и не менее 16 КиБ тела. "
+                "Ответ 204 и маленький служебный файл не подходят. "
+                "Selective не следует перенаправлениям.")
+
+
+def expiry_text(view: dict) -> str:
+    lines = []
+    for item in view.get("probe_expiry", []):
+        until = item.get("expires_at")
+        if until is None:
+            detail = "срок по адресу неизвестен"
+        else:
+            stamp = datetime.fromtimestamp(until, UTC).strftime("%d.%m.%Y %H:%M UTC")
+            detail = ("срок expire истёк " if until <= time.time() else "expire до ") + stamp
+        lines.append(f"Проверка {item['probe']} · {detail}")
+    return "\n".join(lines)
 
 
 def summary(state: dict | None, stale: bool) -> tuple[str, str]:
@@ -38,6 +58,8 @@ class SettingsDialog(QDialog):
         box = QVBoxLayout(self)
         box.addWidget(plain("Выбранные домены открываются через домашний IP. "
                             "Для YouTube нужны вместе страница и видеосеть."))
+        box.addWidget(plain(REQUIREMENTS))
+        box.addWidget(plain(expiry_text(view)))
         form = QFormLayout()
         self.domains = QPlainTextEdit("\n".join(view.get("domains", [])))
         self.domains.setMaximumHeight(110)
@@ -96,7 +118,7 @@ class Zapret2Page(Page):
         super().__init__(main, "zapret2")
         _, self.status_note, self.status = self.card("Обход блокировок для выбранных доменов")
         _, self.settings_note, self.settings_rows = self.card("Настройки")
-        _, self.results_note, self.results = self.card("Последнее сравнение")
+        _, self.results_note, self.results = self.card("Последние проверки")
         self.body.addStretch(1)
 
     def view(self) -> dict:
@@ -163,18 +185,27 @@ class Zapret2Page(Page):
                     f"Проверка каждые {view['check_seconds']} с · повтор после отказа "
                     f"через {view['retry_seconds']} с · бюджет {view['daily_probe_mb']} МБ/сутки\n"
                     + "\n".join(view["domains"]))
+        settings += "\n" + REQUIREMENTS + "\n" + expiry_text(view)
         self.settings_rows.update_rows([("settings", "Домены и проверки", settings, (
             Control("Настроить", self.edit,
                     view.get("can_edit", False) and self.can_act("zapret2")),
         ))])
         rows = []
         for row in view.get("probes", []):
-            verdict = "успех" if row["ok"] else "не прошла"
+            verdict = ("не запускалась" if row.get("verdict") == "not_run" else
+                       "успех" if row["ok"] else "не прошла")
             title = f"Проверка {row['probe']} · {row['path']} · {verdict}"
             code = (f"HTTP {row['http']}" if row["http"] else
                     f"CONNECT {row['connect_http']}" if row["connect_http"] else "Нет HTTP-ответа")
-            rows.append((title, f"{code} · байт {row['bytes']} · переходов {row['redirects']}"))
+            detail = row.get("detail", "")
+            if row.get("verdict") != "not_run":
+                detail += f"\n{code} · байт {row['bytes']} · переходов {row['redirects']}"
+            if row.get("checked_at"):
+                checked = datetime.fromtimestamp(row["checked_at"], UTC)
+                stamp = checked.strftime("%d.%m %H:%M:%S UTC")
+                detail += "\nПроверено " + stamp
+            rows.append((title, detail))
         self.results.update_text(rows)
-        set_text(self.results_note, "HTTP-проверка не подтверждает воспроизведение видео." if rows
-                 else "Результатов сравнения пока нет. После завершения выключите режим "
-                      "для нового сравнения или включения маршрута.")
+        set_text(self.results_note, "HTTP-проверка не подтверждает воспроизведение видео. "
+                 "Срок expire взят из адреса и не подтверждает его действительность." if rows
+                 else "Результатов проверок пока нет.")

@@ -608,6 +608,11 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
         assert sent[-1][1]["settings"]["strategy"] == "multidisorder"
 
         client.stop()
+        view.update(probe_expiry=[{"probe": 1, "expires_at": None},
+                                  {"probe": 2, "expires_at": 1}], probes=[
+            {"probe": 1, "path": "zapret2", "ok": False, "verdict": "short_body",
+             "http": 200, "bytes": 25, "redirects": 0, "checked_at": 123,
+             "detail": "Тело ответа меньше необходимых 16 КиБ"}])
         for code, title in (("active", "Работает"), ("fallback", "Возврат на VPN"),
                             ("blocked", "Возврат не подтверждён"), ("pending", "Применение")):
             view.update(state=code, title=title, can_edit=False, can_off=True,
@@ -616,6 +621,8 @@ def test_zapret2_controls_status_and_settings(qapp, demo, tmp_path, monkeypatch)
             win.on_state(state())
             assert title in page.status_note.text() and title in win.overview.zapret2.text()
             assert not compare.isEnabled() and not enable.isEnabled() and disable.isEnabled()
+        assert "expire истёк" in page.settings_rows.items["settings"].detail.text()
+        assert "16 КиБ" in page.results.items["0"].detail.text()
         win.on_link(clienting.LINK_OFFLINE, "")
         assert not disable.isEnabled() and "устарели" in win.overview.zapret2.text()
         win.resize(1024, 720)

@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from .net import cmd
 
@@ -35,6 +35,7 @@ UNIT = "xgw-zapret2.service"
 LIVE = "zapret2_live"
 BUDGET = "zapret2_probe_budget"
 PROBE_BYTES = 64 * 1024
+MIN_BODY = 16 * 1024
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
@@ -53,6 +54,45 @@ def matches(host: str, domains: list[str]) -> bool:
         if host == name or (kind == "domain" and host.endswith("." + name)):
             return True
     return False
+
+
+def expiry(url: str) -> int | None:
+    """Подсказка из параметра expire, не проверка подписи или доступности URL."""
+    try:
+        values = parse_qs(urlsplit(url).query, max_num_fields=100).get("expire", [])
+        if len(values) == 1 and values[0].isascii() and values[0].isdigit():
+            value = int(values[0])
+            if 0 < value <= 253402300799:
+                return value
+    except ValueError:
+        pass
+    return None
+
+
+def probe_row(index: int, result) -> dict:
+    phase = result.phase if result.phase in (
+        "connect", "tls", "request", "headers", "body") else "unknown"
+    kind = result.kind if result.kind in (
+        "http", "timeout", "stall", "truncated", "reset", "tls", "connect", "proxy",
+        "cancelled", "io") else "unknown"
+    if result.ok:
+        verdict = "ok"
+    elif phase == "connect":
+        verdict = kind
+    elif result.status == 204:
+        verdict = "empty_body"
+    elif 300 <= result.status < 400:
+        verdict = "redirect"
+    elif 200 <= result.status < 300 and kind == "http" and result.downloaded < MIN_BODY:
+        verdict = "short_body"
+    elif result.status >= 400:
+        verdict = "http_error"
+    else:
+        verdict = kind
+    return {"probe": index, "path": "zapret2", "ok": result.ok, "verdict": verdict,
+            "phase": phase, "http": 0 if phase == "connect" else result.status,
+            "connect_http": result.status if phase == "connect" else 0,
+            "bytes": result.downloaded, "redirects": 0, "checked_at": int(time.time())}
 
 
 def validate(cfg: Config) -> list[str]:
@@ -308,6 +348,7 @@ class Controller:
         self.healthy = False
         self.ready = False
         self.last_error = ""
+        self.probes: list[dict] = []
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
@@ -338,17 +379,22 @@ class Controller:
         return checks.http_get_via_proxy(
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
             proxy_pass=password, timeout=5, silence=4, max_total=max_total,
-            max_bytes=PROBE_BYTES, min_body=16 * 1024, user_agent=user_agent, cancel=cancel,
+            max_bytes=PROBE_BYTES, min_body=MIN_BODY, user_agent=user_agent, cancel=cancel,
         )
 
     def probe(self, cfg: Config, applied: dict, cancel) -> bool:
         from .generator import builder
 
         password, _ = builder.probe_state(applied)
-        for url in cfg.zapret2.probe_urls:
+        self.probes = []
+        for index, url in enumerate(cfg.zapret2.probe_urls, 1):
             verdict = self._request(url, cfg.zapret2.probe_port, password or "",
                                     cfg.probe.user_agent, cancel)
+            self.probes.append(probe_row(index, verdict))
             if not verdict.ok:
+                self.probes.extend({"probe": n, "path": "zapret2", "ok": False,
+                                    "verdict": "not_run", "checked_at": 0}
+                                   for n in range(index + 1, len(cfg.zapret2.probe_urls) + 1))
                 return False
         return True
 
@@ -419,6 +465,7 @@ class Controller:
                     hops, redirect = 0, "none"
                 connect = result.phase == "connect"
                 rows.append({
+                    **probe_row(index, result),
                     "probe": index, "path": path, "phase": result.phase,
                     "kind": result.kind or "ok", "ok": result.ok,
                     "http": 0 if connect else result.status,
@@ -487,7 +534,7 @@ class Controller:
                     if target != applied and not changed:
                         raise ValueError("apply_failed")
                     self.view = {"state": "active", "reason": "probes_ok",
-                                 "valid_until": time.time() + lease}
+                                 "valid_until": time.time() + lease, "probes": self.probes}
                     return changed
                 reason = self.last_error or "retry_wait"
         except (OSError, ValueError, cmd.CommandError) as exc:
@@ -532,7 +579,7 @@ class Controller:
                          "trace": self.comparison_trace or {}}
             return changed
         self.view = {"state": "fallback" if routed_back else "blocked", "reason": reason,
-                     "gate_closed": gate_closed}
+                     "gate_closed": gate_closed, "probes": self.probes}
         return changed
 
     def close(self) -> None:

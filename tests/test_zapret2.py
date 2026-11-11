@@ -104,6 +104,57 @@ def test_off_is_original_config_without_starting_anything():
     assert "zapret2.probe_port" not in service_ports(cfg)
 
 
+@pytest.mark.parametrize("status,body,kind,phase,expected", [
+    (204, 0, "http", "body", "empty_body"),
+    (200, 25, "http", "body", "short_body"),
+    (302, 0, "http", "headers", "redirect"),
+    (403, 0, "http", "headers", "http_error"),
+    (200, 25, "timeout", "body", "timeout"),
+    (407, 0, "proxy", "connect", "proxy"),
+])
+def test_selective_evidence_preserves_failure_and_stops_requests(
+        monkeypatch, status, body, kind, phase, expected):
+    h = Harness()
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append(kwargs)
+        return checks.DownloadResult(False, status=status, downloaded=body, kind=kind,
+                                     phase=phase, error="PRIVATE", location="PRIVATE")
+
+    monkeypatch.setattr(checks, "http_get_via_proxy", request)
+    for now in (0, 1, 2):
+        h.step(now)
+    assert h.controller.view["state"] == "fallback" and not z.active(h.current)
+    rows = h.controller.view["probes"]
+    assert [row["verdict"] for row in rows] == [expected, "not_run"]
+    assert rows[0]["checked_at"] > 0 and rows[1]["checked_at"] == 0
+    assert "PRIVATE" not in json.dumps(rows)
+    assert len(calls) == 1 and calls[0]["min_body"] == 16384
+    h.step(3)
+    assert h.controller.view["probes"] == rows and len(calls) == 1
+
+
+def test_selective_success_replaces_old_evidence(monkeypatch):
+    h = Harness()
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    monkeypatch.setattr(checks, "http_get_via_proxy", lambda *a, **kw: checks.DownloadResult(
+        True, status=200, downloaded=32768, phase="body"))
+    h.controller.probes = [{"verdict": "old"}]
+    h.activate()
+    assert [r["verdict"] for r in h.controller.view["probes"]] == ["ok", "ok"]
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("expire=1", 1), ("expire=2000000000&token=PRIVATE", 2000000000),
+    ("expire=1&expire=2", None), ("expire=no", None), ("expire=-1", None),
+    ("expire=9999999999999999", None), ("token=PRIVATE", None),
+])
+def test_expiry_is_only_a_bounded_timestamp(query, expected):
+    assert z.expiry("https://example.test/video?" + query) == expected
+
+
 def test_selected_route_scope_and_priorities():
     cfg, original, _ = setup()
     rules = original["routing"]["rules"]

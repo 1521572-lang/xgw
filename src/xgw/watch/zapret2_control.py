@@ -36,6 +36,17 @@ REASONS = {
     "comparison_cleanup_failed": "Завершение сравнения и возврат маршрута не подтверждены.",
 }
 
+VERDICTS = {
+    "ok": "Проверка пройдена", "empty_body": "Ответ 204 без тела не подходит для проверки видео",
+    "short_body": "Тело ответа меньше необходимых 16 КиБ", "redirect": "Получено перенаправление",
+    "http_error": "Сервер ответил HTTP-ошибкой", "timeout": "Истекло время ожидания",
+    "stall": "Передача остановилась", "truncated": "Ответ оборвался до завершения",
+    "reset": "Соединение сброшено", "tls": "Ошибка TLS", "connect": "Ошибка соединения",
+    "proxy": "Ошибка служебного прокси", "cancelled": "Проверка прервана",
+    "io": "Ошибка ввода-вывода", "unknown": "Причина не уточнена",
+    "not_run": "Не запускалась после отказа предыдущей проверки",
+}
+
 
 def prerequisites(cfg, mode: str) -> list[str]:
     candidate = copy.deepcopy(cfg)
@@ -91,8 +102,10 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
             continue
         probes.append({
             **{k: row.get(k, 0) if type(row.get(k, 0)) is int else 0
-               for k in ("probe", "http", "connect_http", "bytes", "redirects")},
+               for k in ("probe", "http", "connect_http", "bytes", "redirects", "checked_at")},
             "path": row["path"], "ok": row.get("ok") is True,
+            "verdict": row.get("verdict") if row.get("verdict") in VERDICTS else "unknown",
+            "detail": VERDICTS.get(row.get("verdict"), ""),
         })
     return {
         "mode": cfg.zapret2.mode, "strategy": cfg.zapret2.strategy,
@@ -103,6 +116,8 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
         "can_edit": fresh and not pending and cfg.zapret2.mode == "off" and state == "off",
         "check_seconds": cfg.zapret2.check_seconds, "retry_seconds": cfg.zapret2.retry_seconds,
         "daily_probe_mb": cfg.zapret2.daily_probe_mb,
+        "probe_expiry": [{"probe": n, "expires_at": zapret2.expiry(url)}
+                         for n, url in enumerate(cfg.zapret2.probe_urls, 1)],
     }
 
 

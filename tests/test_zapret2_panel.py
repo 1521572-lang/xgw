@@ -114,6 +114,21 @@ def test_comparison_and_failed_return_are_distinct(rig, user, ready):
     assert user.state()["zapret2"]["state"] == "blocked"
 
 
+def test_selective_evidence_and_expiry_are_private(rig, user, ready):
+    managed.set_zapret2(rig.store_path, {"probe_urls": [
+        "https://youtube.com/watch?v=PRIVATE", "https://cdn.googlevideo.com/v?expire=1&token=PRIVATE"]})
+    rig.panel._wake()
+    ready("fallback", reason="probe_failed", probes=[
+        {"probe": 1, "path": "zapret2", "http": 200, "bytes": 25, "ok": False,
+         "verdict": "short_body", "checked_at": 123, "error": "PRIVATE"},
+        {"probe": 2, "path": "zapret2", "ok": False, "verdict": "not_run"}])
+    view = user.state()["zapret2"]
+    assert view["probe_expiry"] == [{"probe": 1, "expires_at": None}, {"probe": 2, "expires_at": 1}]
+    assert "16 КиБ" in view["probes"][0]["detail"]
+    assert view["probes"][1]["verdict"] == "not_run"
+    assert "PRIVATE" not in json.dumps(view)
+
+
 def test_managed_override_survives_unrelated_writes_and_corruption_disables(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[zapret2]\nmode="selective"\n')
