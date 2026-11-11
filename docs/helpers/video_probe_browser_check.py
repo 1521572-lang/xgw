@@ -156,6 +156,7 @@ def main():
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--page-file", type=Path)
     parser.add_argument("--compare-http", action="store_true")
+    parser.add_argument("--compare-context", action="store_true")
     args = parser.parse_args()
     user = pwd.getpwnam(os.environ.get("SUDO_USER", "root"))
     firefox = shutil.which("firefox", path=video_browser.SEARCH)
@@ -217,10 +218,16 @@ def main():
             save_progress()
             print("MARIONETTE_ERROR", json.dumps(event, sort_keys=True), flush=True)
 
+        def record_fetch(event):
+            diagnostics["browser_fetch"] = event
+            save_progress()
+            print("PAGE_FETCH", json.dumps(event, sort_keys=True), flush=True)
+
         try:
             progress("relay_ready")
             candidates, agent, reason, played = video_browser.browser(
-                firefox, user, page, domains, relay, progress, record_error)
+                firefox, user, page, domains, relay, progress, record_error,
+                record_fetch=record_fetch if args.compare_context else None)
         finally:
             relay.stopped.set()
             relay.shutdown()

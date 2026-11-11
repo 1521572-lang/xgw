@@ -23,6 +23,7 @@ SEARCH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
 LIMIT = 16 * 1024 * 1024
 SESSION_TIMEOUT = 30
 NAVIGATION_TIMEOUT = 15
+PAGE_FETCH_TIMEOUT = 6
 EPHEMERAL_PORTS = Path("/proc/sys/net/ipv4/ip_local_port_range")
 ASSETS = ["domain:youtube.com", "domain:ytimg.com", "domain:googlevideo.com",
           "full:youtubei.googleapis.com", "full:jnn-pa.googleapis.com", "domain:gstatic.com"]
@@ -53,6 +54,42 @@ const resources = performance.getEntriesByType('resource').reverse()
     }));
 const position = v.videoWidth > 0 && !v.paused && !v.seeking ? v.currentTime : null;
 return {state: 'player', position, resources, agent: navigator.userAgent};
+"""
+PAGE_FETCH = """
+const [url, limit, done] = arguments;
+const result = {outcome: 'unreadable', http: null, bytes: null, video_mime: null};
+if (!['youtube.com', 'www.youtube.com'].includes(location.hostname)) {
+    done({...result, outcome: 'wrong_page'});
+    return;
+}
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 4000);
+(async () => {
+    try {
+        const response = await window.fetch(url, {
+            mode: 'cors', credentials: 'omit', cache: 'no-store', redirect: 'error',
+            headers: {Range: 'bytes=0-' + (limit - 1)}, signal: controller.signal,
+        });
+        if (!['basic', 'cors'].includes(response.type)) return;
+        result.outcome = 'response';
+        result.http = response.status;
+        result.bytes = 0;
+        result.video_mime =
+            (response.headers.get('Content-Type') || '').toLowerCase().startsWith('video/');
+        const reader = response.body?.getReader();
+        while (reader && result.bytes < limit) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            result.bytes += Math.min(chunk.value.byteLength, limit - result.bytes);
+        }
+    } catch {
+        result.outcome = controller.signal.aborted ? 'timeout' : 'unreadable';
+    } finally {
+        clearTimeout(timer);
+        controller.abort();
+        done(result);
+    }
+})();
 """
 
 
@@ -201,7 +238,33 @@ class Marionette:
                     return reply[3]
 
 
-def observe(client, page, domains, relay, profile, progress):
+def fetch_in_page(client, candidate, relay):
+    row = {"candidate_index": candidate.index, "http": None, "bytes": None, "video_mime": None}
+    if relay.stopped.is_set() or time.monotonic() + PAGE_FETCH_TIMEOUT >= client.deadline:
+        return {**row, "outcome": "browser_budget"}
+    try:
+        reply = client.call("WebDriver:ExecuteAsyncScript", {
+            "script": PAGE_FETCH, "args": [candidate.url, zapret2.MIN_BODY], "sandbox": "default",
+        }, timeout=PAGE_FETCH_TIMEOUT)
+    except (OSError, EOFError, ValueError):
+        # This is the last command on the browser control channel.
+        return {**row, "outcome": "control_failed"}
+    value = reply.get("value") if isinstance(reply, dict) else None
+    if not isinstance(value, dict):
+        return {**row, "outcome": "invalid_result"}
+    outcome = value.get("outcome")
+    if outcome not in ("response", "unreadable", "timeout", "wrong_page"):
+        return {**row, "outcome": "invalid_result"}
+    status, size, video = value.get("http"), value.get("bytes"), value.get("video_mime")
+    if (type(status) is int and 100 <= status <= 599
+            and type(size) is int and 0 <= size <= zapret2.MIN_BODY and type(video) is bool):
+        row.update(http=status, bytes=size, video_mime=video)
+    if outcome == "response" and row["http"] is None:
+        outcome = "invalid_result"
+    return {**row, "outcome": outcome}
+
+
+def observe(client, page, domains, relay, profile, progress, *, record_fetch=None):
     progress("session_requested")
     try:
         session = client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
@@ -247,6 +310,8 @@ def observe(client, page, domains, relay, profile, progress):
             candidates = video_probe.browser_candidates(sample["resources"], domains, time.time())
             agent = sample["agent"]
             if candidates and re.fullmatch(r"[ -~]{1,512}", agent):
+                if record_fetch is not None:
+                    record_fetch(fetch_in_page(client, candidates[0], relay))
                 return candidates, agent, "played", True
         time.sleep(1)
     if relay.stopped.is_set():
@@ -274,7 +339,7 @@ def reserve_control_port():
     raise OSError("marionette_port_unavailable")
 
 
-def browser(firefox, user, page, domains, relay, progress, record_error):
+def browser(firefox, user, page, domains, relay, progress, record_error, *, record_fetch=None):
     with (tempfile.TemporaryDirectory(prefix="xgw-video-", dir=user.pw_dir) as directory,
           reserve_control_port() as reservation):
         port = reservation.getsockname()[1]
@@ -317,7 +382,8 @@ def browser(firefox, user, page, domains, relay, progress, record_error):
                     client = Marionette(sock, start_by, record_error)
                     progress("marionette_ready")
                     client.deadline = relay.deadline
-                    return observe(client, page, domains, relay, profile, progress)
+                    return observe(client, page, domains, relay, profile, progress,
+                                   record_fetch=record_fetch)
             reason = ("marionette_listen_timeout" if process.poll() is None
                       else "browser_start_failed")
             return [], "", reason, False

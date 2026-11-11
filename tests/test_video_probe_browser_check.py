@@ -76,7 +76,8 @@ def test_selected_singbox_bridge_follows_detour_but_ignores_other_outbounds(help
 
 @pytest.mark.parametrize(
     "change",
-    ["unrelated", "before_replay", "after_replay", "process", "browser_error", "http_pair"],
+    ["unrelated", "before_replay", "after_replay", "process", "browser_error",
+     "http_pair", "context_pair"],
 )
 def test_receipt_and_replay_follow_selected_path(
     helper, before, monkeypatch, tmp_path, capsys, change,
@@ -125,8 +126,11 @@ def test_receipt_and_replay_follow_selected_path(
         media=SimpleNamespace(youtube_sign_url=""),
     )
     args = ["helper", "--state", str(receipt)]
-    if change == "http_pair":
+    use_curl = change in ("http_pair", "context_pair")
+    if use_curl:
         args.append("--compare-http")
+    if change == "context_pair":
+        args.append("--compare-context")
     monkeypatch.setattr(sys, "argv", args)
     monkeypatch.setattr(helper.pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=1000))
     monkeypatch.setattr(helper.shutil, "which", lambda name, **_kw: name)
@@ -145,7 +149,12 @@ def test_receipt_and_replay_follow_selected_path(
     observation_error = {"method": "WebDriver:ExecuteScript", "exception": "EOFError"}
     url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
 
-    def observe(_firefox, _user, _page, _domains, _relay, progress, record_error):
+    page_fetch = {
+        "candidate_index": 4, "outcome": "response",
+        "http": 206, "bytes": 16384, "video_mime": True,
+    }
+
+    def observe(_firefox, _user, _page, _domains, _relay, progress, record_error, *, record_fetch):
         for index, stage in enumerate(expected_stages[1:], 2):
             progress(stage)
             saved = json.loads(receipt.read_bytes())
@@ -155,6 +164,11 @@ def test_receipt_and_replay_follow_selected_path(
         if change == "browser_error":
             record_error(observation_error)
             raise OSError("PRIVATE")
+        if change == "context_pair":
+            record_fetch(page_fetch)
+            assert json.loads(receipt.read_bytes())["browser_fetch"] == page_fetch
+        else:
+            assert record_fetch is None
         candidate = helper.video_probe.BrowserCandidate(url, 4, 4096, 3800, "h2")
         fallback = helper.video_probe.BrowserCandidate(url + "&fallback=1", 1, 500, 200)
         return [candidate, fallback], "Firefox", "played", True
@@ -164,8 +178,8 @@ def test_receipt_and_replay_follow_selected_path(
 
     def replay(target, *_args, use_range, curl, http2, **_kwargs):
         assert target == url
-        assert curl == ("curl" if change == "http_pair" else None)
-        assert http2 is (change == "http_pair" and bool(calls))
+        assert curl == ("curl" if use_curl else None)
+        assert http2 is (use_curl and bool(calls))
         calls.append(use_range)
         return {"result": "browser_video_verified", "expires_in": 900, "video": {
             "http": 206, "bytes": 16384, "video_mime": True, "verdict": "ok",
@@ -183,7 +197,7 @@ def test_receipt_and_replay_follow_selected_path(
         assert output.count("MARIONETTE_ERROR ") == 2
         assert not calls and "PRIVATE" not in receipt.read_text() + output
         return
-    expected = "ok" if change in ("unrelated", "http_pair") else "selected_path_changed"
+    expected = "ok" if change == "unrelated" or use_curl else "selected_path_changed"
     if change == "process":
         expected = "gateway_settings_or_processes_changed"
     assert helper.main() == (0 if expected == "ok" else 2)
@@ -191,21 +205,24 @@ def test_receipt_and_replay_follow_selected_path(
     assert saved["verification"] == expected and saved["xray_config_changed"]
     assert saved["stages"] == expected_stages
     assert saved["marionette_error"] == navigation_error
-    assert bool(calls) == (change in ("unrelated", "after_replay", "http_pair"))
+    assert bool(calls) == (change in ("unrelated", "after_replay") or use_curl)
     assert len(saved["replay_attempts"]) == len(calls)
     assert receipt.stat().st_mode & 0o077 == 0
     output = capsys.readouterr().out
     attempts = [json.loads(line.removeprefix("ATTEMPT "))
                 for line in output.splitlines() if line.startswith("ATTEMPT ")]
     assert attempts == saved["replay_attempts"]
+    if change == "context_pair":
+        assert saved["browser_fetch"] == page_fetch
+        assert "PAGE_FETCH " + json.dumps(page_fetch, sort_keys=True) in output
     assert "protocol=h2" in output
     if calls:
-        assert calls == [True, change == "http_pair"]
+        assert calls == [True, use_curl]
         assert saved["candidate_count"] == 2
         assert saved["comparison_complete"]
         for index, attempt in enumerate(attempts, 1):
             assert attempt["attempt"] == index
-            assert attempt["range_header"] is (index == 1 or change == "http_pair")
+            assert attempt["range_header"] is (index == 1 or use_curl)
             assert attempt["candidate_index"] == 4
             assert attempt["transfer_size"] == 4096
             assert attempt["decoded_body_size"] == 3800

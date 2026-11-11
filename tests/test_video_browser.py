@@ -196,6 +196,7 @@ def test_observe_waits_for_slow_page_within_browser_deadline(monkeypatch, tmp_pa
     }]
     positions = iter([1, 3])
     stages = []
+    fetches = []
     now = [0.0]
 
     def sleep(seconds):
@@ -208,11 +209,14 @@ def test_observe_waits_for_slow_page_within_browser_deadline(monkeypatch, tmp_pa
     class Client:
         deadline = 20
 
-        def call(self, method, _params, **_kwargs):
+        def call(self, method, params, **_kwargs):
             if method == "WebDriver:NewSession":
                 return {"capabilities": {"moz:profile": str(tmp_path)}}
             if method == "WebDriver:Navigate":
                 return None
+            if method == "WebDriver:ExecuteAsyncScript":
+                assert stages[-1] == "playback_observed" and params["args"][0] == url
+                return {"value": {"outcome": "unreadable"}}
             assert method == "WebDriver:ExecuteScript"
             if now[0] < ready_after:
                 return {"value": {"state": "navigation_pending"}}
@@ -222,15 +226,56 @@ def test_observe_waits_for_slow_page_within_browser_deadline(monkeypatch, tmp_pa
     relay = SimpleNamespace(stopped=threading.Event())
     result = browser.observe(
         Client(), "", ["domain:googlevideo.com"], relay, tmp_path, stages.append,
+        record_fetch=fetches.append,
     )
     assert stages.count("navigation_pending") == 1
     if ready_after < Client.deadline:
         assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800, "h2")],
                           "Firefox", "played", True)
         assert now[0] == 10 and stages[-1] == "playback_observed"
+        assert [row["outcome"] for row in fetches] == ["unreadable"]
     else:
         assert result == ([], "", "navigation_pending", False)
         assert now[0] == 18 and stages[-1] == "navigation_pending"
+        assert not fetches
+
+
+@pytest.mark.parametrize("case,outcome,http,size", [
+    ("response", "response", 206, 16384),
+    ("unreadable", "unreadable", None, None),
+    ("timeout", "timeout", 206, 100),
+    ("invalid", "invalid_result", None, None),
+    ("control", "control_failed", None, None),
+    ("budget", "browser_budget", None, None),
+])
+def test_page_fetch_records_only_bounded_metadata(monkeypatch, case, outcome, http, size):
+    url = "https://cdn.googlevideo.com/videoplayback?expire=1600&token=PRIVATE"
+    candidate = browser.video_probe.BrowserCandidate(url, 4, 50_000, 49_700, "h2")
+    calls = []
+    monkeypatch.setattr(browser.time, "monotonic", lambda: 0)
+
+    class Client:
+        deadline = 6 if case == "budget" else 20
+
+        def call(self, method, params, *, timeout):
+            calls.append(method)
+            assert params["args"] == [url, 16384] and params["sandbox"] == "default"
+            assert params["script"] == browser.PAGE_FETCH and timeout == 6
+            if case == "control":
+                raise TimeoutError("PRIVATE")
+            if case == "invalid":
+                return {"value": {"outcome": "response", "http": 206, "bytes": 16385}}
+            return {"value": {
+                "outcome": outcome, "http": http, "bytes": size,
+                "video_mime": True if http else None, "private": "PRIVATE",
+            }}
+
+    relay = SimpleNamespace(stopped=threading.Event())
+    assert browser.fetch_in_page(Client(), candidate, relay) == {
+        "candidate_index": 4, "outcome": outcome, "http": http, "bytes": size,
+        "video_mime": True if http else None,
+    }
+    assert calls == ([] if case == "budget" else ["WebDriver:ExecuteAsyncScript"])
 
 
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):
