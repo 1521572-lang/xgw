@@ -143,16 +143,21 @@ def test_foreign_profile_is_not_navigated(tmp_path):
     assert calls == ["WebDriver:NewSession"] and stages == ["session_requested"]
 
 
-def test_navigation_response_is_recorded_before_observation(tmp_path):
+@pytest.mark.parametrize("reply_timeout", [False, True])
+def test_navigation_response_is_recorded_before_observation(tmp_path, reply_timeout):
     stages = []
 
     class Client:
         deadline = time.monotonic() + 5
 
-        def call(self, method, _params, **_kwargs):
+        def call(self, method, params, **kwargs):
             if method == "WebDriver:NewSession":
+                assert params["capabilities"]["alwaysMatch"]["pageLoadStrategy"] == "none"
                 return {"capabilities": {"moz:profile": str(tmp_path)}}
             if method == "WebDriver:Navigate":
+                assert kwargs["timeout"] == 15
+                if reply_timeout:
+                    raise browser.MarionetteCommandError({"error": "timeout"})
                 return None
             assert method == "WebDriver:ExecuteScript"
             raise EOFError
@@ -160,24 +165,48 @@ def test_navigation_response_is_recorded_before_observation(tmp_path):
     relay = SimpleNamespace(stopped=threading.Event())
     with pytest.raises(EOFError):
         browser.observe(Client(), "", [], relay, tmp_path, stages.append)
-    assert stages == [
-        "session_requested", "session_ready", "navigation_started", "navigation_returned",
-        "observation_started",
-    ]
+    expected = ["session_requested", "session_ready", "navigation_started"]
+    if not reply_timeout:
+        expected.append("navigation_returned")
+    assert stages == [*expected, "observation_started"]
 
 
-def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
+def test_missing_navigation_response_stops_without_sending_another_command(tmp_path):
+    calls, stages = [], []
+
+    class Client:
+        def call(self, method, _params, **_kwargs):
+            calls.append(method)
+            if method == "WebDriver:NewSession":
+                return {"capabilities": {"moz:profile": str(tmp_path)}}
+            assert method == "WebDriver:Navigate"
+            raise TimeoutError
+
+    with pytest.raises(TimeoutError):
+        browser.observe(Client(), "", [], None, tmp_path, stages.append)
+    assert calls == ["WebDriver:NewSession", "WebDriver:Navigate"]
+    assert stages == ["session_requested", "session_ready", "navigation_started"]
+
+
+@pytest.mark.parametrize("ready_after", [9, 30])
+def test_observe_waits_for_slow_page_within_browser_deadline(monkeypatch, tmp_path, ready_after):
     url = "https://cdn.googlevideo.com/videoplayback?expire=1600"
     resources = [{
         "url": url, "transferSize": 4096, "decodedBodySize": 3800, "nextHopProtocol": "h2",
     }]
     positions = iter([1, 3])
     stages = []
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(browser.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(browser.time, "time", lambda: 1000)
-    monkeypatch.setattr(browser.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(browser.time, "sleep", sleep)
 
     class Client:
-        deadline = time.monotonic() + 5
+        deadline = 20
 
         def call(self, method, _params, **_kwargs):
             if method == "WebDriver:NewSession":
@@ -185,6 +214,8 @@ def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
             if method == "WebDriver:Navigate":
                 return None
             assert method == "WebDriver:ExecuteScript"
+            if now[0] < ready_after:
+                return {"value": {"state": "navigation_pending"}}
             return {"value": {"state": "player", "position": next(positions),
                               "resources": resources, "agent": "Firefox"}}
 
@@ -192,9 +223,14 @@ def test_observe_passes_resource_timing_for_played_video(monkeypatch, tmp_path):
     result = browser.observe(
         Client(), "", ["domain:googlevideo.com"], relay, tmp_path, stages.append,
     )
-    assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800, "h2")],
-                      "Firefox", "played", True)
-    assert stages[-1] == "playback_observed"
+    assert stages.count("navigation_pending") == 1
+    if ready_after < Client.deadline:
+        assert result == ([browser.video_probe.BrowserCandidate(url, 1, 4096, 3800, "h2")],
+                          "Firefox", "played", True)
+        assert now[0] == 10 and stages[-1] == "playback_observed"
+    else:
+        assert result == ([], "", "navigation_pending", False)
+        assert now[0] == 18 and stages[-1] == "navigation_pending"
 
 
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):

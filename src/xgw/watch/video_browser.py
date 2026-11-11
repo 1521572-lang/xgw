@@ -22,11 +22,13 @@ from . import video_probe
 SEARCH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
 LIMIT = 16 * 1024 * 1024
 SESSION_TIMEOUT = 30
+NAVIGATION_TIMEOUT = 15
 EPHEMERAL_PORTS = Path("/proc/sys/net/ipv4/ip_local_port_range")
 ASSETS = ["domain:youtube.com", "domain:ytimg.com", "domain:googlevideo.com",
           "full:youtubei.googleapis.com", "full:jnn-pa.googleapis.com", "domain:gstatic.com"]
 CONNECT = re.compile(rb"CONNECT ([a-zA-Z0-9.-]+):443 HTTP/1\.[01]")
 OBSERVE = """
+if (location.href === 'about:blank') return {state: 'navigation_pending'};
 const host = location.hostname;
 if (!['youtube.com', 'www.youtube.com', 'consent.youtube.com'].includes(host))
     return {state: 'other_page'};
@@ -203,7 +205,7 @@ def observe(client, page, domains, relay, profile, progress):
     progress("session_requested")
     try:
         session = client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
-            "pageLoadStrategy": "eager", "timeouts": {"pageLoad": 7000, "script": 5000}}}},
+            "pageLoadStrategy": "none", "timeouts": {"pageLoad": 7000, "script": 5000}}}},
             timeout=SESSION_TIMEOUT)
     except TimeoutError:
         return [], "", "browser_session_timeout", False
@@ -214,7 +216,7 @@ def observe(client, page, domains, relay, profile, progress):
     progress("session_ready")
     progress("navigation_started")
     try:
-        client.call("WebDriver:Navigate", {"url": page})
+        client.call("WebDriver:Navigate", {"url": page}, timeout=NAVIGATION_TIMEOUT)
     except MarionetteCommandError:
         # Ответ с ошибкой оставляет канал синхронизированным для проверки плеера.
         pass
@@ -225,7 +227,10 @@ def observe(client, page, domains, relay, profile, progress):
     while time.monotonic() + 2 < client.deadline and not relay.stopped.is_set():
         sample = client.call("WebDriver:ExecuteScript", {
             "script": OBSERVE, "args": [not rejected]})["value"]
-        state = sample["state"]
+        observed = sample["state"]
+        if observed == "navigation_pending" and state != observed:
+            progress("navigation_pending")
+        state = observed
         rejected |= state == "consent_rejected"
         if state in ("player_refused", "media_error", "other_page"):
             break
