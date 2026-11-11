@@ -21,6 +21,7 @@ from . import video_probe
 
 SEARCH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
 LIMIT = 16 * 1024 * 1024
+SESSION_TIMEOUT = 30
 EPHEMERAL_PORTS = Path("/proc/sys/net/ipv4/ip_local_port_range")
 ASSETS = ["domain:youtube.com", "domain:ytimg.com", "domain:googlevideo.com",
           "full:youtubei.googleapis.com", "full:jnn-pa.googleapis.com", "domain:gstatic.com"]
@@ -120,40 +121,46 @@ class Marionette:
         if not isinstance(greeting, dict) or greeting.get("marionetteProtocol") != 3:
             raise ValueError("unexpected_marionette")
 
-    def recv(self, size):
+    def recv(self, size, deadline, max_wait):
         data = bytearray()
         while len(data) < size:
-            remaining = self.deadline - time.monotonic()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
-            self.sock.settimeout(min(remaining, 8))
+            self.sock.settimeout(min(remaining, max_wait))
             chunk = self.sock.recv(size - len(data))
             if not chunk:
                 raise EOFError
             data.extend(chunk)
         return bytes(data)
 
-    def read(self):
+    def read(self, *, deadline=None, max_wait=8):
+        if deadline is None:
+            deadline = self.deadline
         prefix = b""
         for _ in range(8):
-            char = self.recv(1)
+            char = self.recv(1, deadline, max_wait)
             if char == b":" and prefix:
                 size = int(prefix)
                 if size <= 256 * 1024:
-                    return json.loads(self.recv(size))
+                    return json.loads(self.recv(size, deadline, max_wait))
                 break
             if not char.isdigit():
                 break
             prefix += char
         raise ValueError("bad_marionette_frame")
 
-    def call(self, method, params):
+    def call(self, method, params, *, timeout=None):
+        now = time.monotonic()
+        deadline = self.deadline if timeout is None else min(self.deadline, now + timeout)
+        if deadline <= now:
+            raise TimeoutError
         self.seq += 1
         body = json.dumps([0, self.seq, method, params]).encode()
-        self.sock.settimeout(1)
+        self.sock.settimeout(min(deadline - now, 1))
         self.sock.sendall(str(len(body)).encode() + b":" + body)
         while True:
-            reply = self.read()
+            reply = self.read(deadline=deadline, max_wait=8 if timeout is None else timeout)
             if isinstance(reply, list) and len(reply) == 4 and reply[:2] == [1, self.seq]:
                 if reply[2]:
                     raise ValueError("marionette_command")
@@ -161,8 +168,13 @@ class Marionette:
 
 
 def observe(client, page, domains, relay, profile, progress):
-    session = client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
-        "pageLoadStrategy": "eager", "timeouts": {"pageLoad": 7000, "script": 5000}}}})
+    progress("session_requested")
+    try:
+        session = client.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {
+            "pageLoadStrategy": "eager", "timeouts": {"pageLoad": 7000, "script": 5000}}}},
+            timeout=SESSION_TIMEOUT)
+    except TimeoutError:
+        return "", "", "browser_session_timeout", False
     capabilities = session.get("capabilities") if isinstance(session, dict) else None
     reported = capabilities.get("moz:profile") if isinstance(capabilities, dict) else None
     if not isinstance(reported, str) or Path(reported).resolve() != profile.resolve():

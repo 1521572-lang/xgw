@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import time
@@ -16,6 +17,74 @@ def test_marionette_reports_eof_instead_of_waiting_for_a_frame():
         protocol = browser.Marionette(client, time.monotonic() + 2)
         with pytest.raises(EOFError):
             protocol.read()
+
+
+@pytest.mark.parametrize("budget,first_byte,complete,elapsed", [
+    (120, 13.4, 13.4, 13.4),
+    (120, 29, 31, 30),
+    (10, 9, 13.4, 10),
+])
+def test_new_session_uses_one_deadline_and_keeps_other_reads_short(
+    monkeypatch, budget, first_byte, complete, elapsed,
+):
+    now = [0.0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: now[0])
+
+    def frame(message):
+        body = json.dumps(message).encode()
+        return str(len(body)).encode() + b":" + body
+
+    class DelayedSocket:
+        def __init__(self):
+            self.pending = [(0, frame({"marionetteProtocol": 3}))]
+            self.seq = 0
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendall(self, _data):
+            self.seq += 1
+            reply = frame([1, self.seq, None, {"session": "fixture"}])
+            delays = (first_byte, complete) if self.seq == 1 else (9, 9)
+            self.pending = [(now[0] + delays[0], reply[:1]), (now[0] + delays[1], reply[1:])]
+
+        def recv(self, size):
+            ready, data = self.pending[0]
+            if ready > now[0] + self.timeout:
+                now[0] += self.timeout
+                raise TimeoutError
+            now[0] = max(now[0], ready)
+            if len(data) <= size:
+                self.pending.pop(0)
+            else:
+                self.pending[0] = ready, data[size:]
+            return data[:size]
+
+    protocol = browser.Marionette(DelayedSocket(), budget)
+    if complete <= min(budget, browser.SESSION_TIMEOUT):
+        assert protocol.call("WebDriver:NewSession", {}, timeout=browser.SESSION_TIMEOUT)
+        assert now[0] == pytest.approx(elapsed)
+        with pytest.raises(TimeoutError):
+            protocol.call("WebDriver:Navigate", {})
+        assert now[0] == pytest.approx(elapsed + 8)
+    else:
+        with pytest.raises(TimeoutError):
+            protocol.call("WebDriver:NewSession", {}, timeout=browser.SESSION_TIMEOUT)
+        assert now[0] == pytest.approx(elapsed)
+
+
+def test_new_session_timeout_is_recorded_before_navigation(tmp_path):
+    stages = []
+
+    class Client:
+        def call(self, method, _params, *, timeout):
+            assert method == "WebDriver:NewSession" and timeout == 30
+            assert stages == ["session_requested"]
+            raise TimeoutError
+
+    assert browser.observe(Client(), "", [], None, tmp_path, stages.append) == (
+        "", "", "browser_session_timeout", False,
+    )
 
 
 def test_control_port_skips_ephemeral_range_and_an_occupied_port(monkeypatch, tmp_path):
@@ -44,13 +113,13 @@ def test_foreign_profile_is_not_navigated(tmp_path):
     calls, stages = [], []
 
     class Client:
-        def call(self, method, _params):
+        def call(self, method, _params, *, timeout):
             calls.append(method)
             return {"capabilities": {"moz:profile": str(tmp_path / "other-profile")}}
 
     result = browser.observe(Client(), "", [], None, tmp_path / "expected", stages.append)
     assert result == ("", "", "browser_profile_unverified", False)
-    assert calls == ["WebDriver:NewSession"] and not stages
+    assert calls == ["WebDriver:NewSession"] and stages == ["session_requested"]
 
 
 def test_relay_rejects_outside_hosts_and_shares_traffic_budget(monkeypatch):
