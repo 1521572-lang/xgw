@@ -36,7 +36,7 @@ def tick(daemon, applied: dict | None, now: float) -> State:
         return apply_blocked(d)
     if zapret2.validate(d.cfg):
         with contextlib.suppress(OSError, cmd.CommandError):
-            d._zapret2.close()
+            d._zapret2.close("invalid_config")
         d._zapret2.view = {"state": "blocked", "reason": "invalid_config"}
         d.machine.state = State.DEGRADED
         d.action = "Настройки zapret2 без VPN отклонены. Смена маршрута не подтверждена."
@@ -100,7 +100,12 @@ def tick(daemon, applied: dict | None, now: float) -> State:
                and capture.get("loaded") is True and not capture.get("capture_failed")
                and not capture.get("inbound_missing"))
     previous = d._zapret2.view.get("state")
-    d._zapret2.step(d.cfg, applied, now, d._zapret2_apply, allowed=allowed)
+    # Почему обработчику сейчас нельзя работать — в журнал, если из-за этого он остановлен.
+    gating = ("" if allowed else "xray_down" if not xray_ok else
+              "vpn_stopping" if not bridges_stopped else
+              "capture_off" if d.capture is None or d.capture.mode() != "on" else
+              "capture_not_ready")
+    d._zapret2.step(d.cfg, applied, now, d._zapret2_apply, allowed=allowed, gating=gating)
     if not allowed and d.capture is not None and d.capture.mode() == "on":
         d._zapret2.view = {"state": "blocked", "reason": "capture_failed"}
     if not bridges_stopped:
@@ -111,6 +116,8 @@ def tick(daemon, applied: dict | None, now: float) -> State:
                        State.DEGRADED if d._zapret2.view["state"] == "blocked" else State.HEALTHY)
     d.action = ("Без VPN. Обработчик zapret2 готов; доступность сайтов проверяется в браузере."
                 if allowed and d._zapret2.view["state"] == "active" else
+                "Без VPN. Обработчик zapret2 запускается; выбранные домены пока закрыты."
+                if allowed and d._zapret2.view["state"] == "preparing" else
                 "Без VPN. zapret2 не пропускает выбранные домены; проверьте состояние обработчика."
                 if d.capture is not None and d.capture.mode() == "on" else
                 "Без VPN. Перехват выключен, трафик идёт напрямую без обработки zapret2.")
@@ -151,7 +158,7 @@ def _return_to_vpn(d, now: float) -> State:
         d._standalone_vpn_requested = True
         d.next_refresh = 0
     try:
-        d._zapret2.close()
+        d._zapret2.close("mode_change")
     except (OSError, cmd.CommandError):
         d._zapret2.view = {"state": "blocked", "reason": "stop_failed"}
     else:

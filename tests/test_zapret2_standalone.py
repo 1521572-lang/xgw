@@ -85,6 +85,91 @@ def test_worker_failure_keeps_direct_rule_and_never_falls_back(monkeypatch):
     assert ctl.view["state"] == "off" and not runtime.up
 
 
+def started(slow=0, exits=False):
+    cfg = configured()
+    applied = builder.build(cfg, builder.Selection(), hosts={}).config
+    runtime = Runtime()
+    runtime.slow, runtime.exits = slow, exits
+    ctl = zapret2.Controller(Store(), runtime)
+    return cfg, applied, runtime, ctl, lambda *_: pytest.fail("standalone must not apply")
+
+
+def count(runtime, name):
+    return sum(1 for event, _ in runtime.events if event == name)
+
+
+def test_worker_is_not_stopped_while_queue_appears(caplog):
+    """Отчёт standalone r3: nfqws2 останавливали в секунду запуска — очередь не успевала."""
+    cfg, applied, runtime, ctl, apply = started(slow=2)
+    with caplog.at_level("INFO", logger="xgw.zapret2"):
+        for now in (0, 2):
+            ctl.step(cfg, applied, now, apply)
+            assert ctl.view == {"state": "preparing", "reason": "worker_starting",
+                                "gate_closed": True, "probes": []}
+            assert ctl.starting is not None and not ctl.ready and runtime.up
+        assert runtime.events == [("gate", 0), ("start", 0)]  # ни остановки, ни разрешения
+        ctl.step(cfg, applied, 4, apply)
+    assert ctl.view["state"] == "active" and ctl.ready and ctl.starting is None
+    assert count(runtime, "start") == 1 and count(runtime, "stop") == 0
+    assert runtime.events[-1] == ("gate", cfg.zapret2.check_seconds + 60)
+    assert "очередь занята через 4.0 с" in caplog.text
+
+
+def test_start_deadline_stops_worker_and_waits_for_retry(caplog):
+    cfg, applied, runtime, ctl, apply = started(slow=10**6)
+    with caplog.at_level("INFO", logger="xgw.zapret2"):
+        ctl.step(cfg, applied, 0, apply)
+        ctl.step(cfg, applied, zapret2.START_WAIT - 1, apply)
+        assert ctl.view["state"] == "preparing" and count(runtime, "stop") == 0
+        ctl.step(cfg, applied, zapret2.START_WAIT, apply)
+    assert ctl.view == {"state": "blocked", "reason": "start_timeout",
+                        "gate_closed": True, "probes": []}
+    assert not runtime.up and ctl.starting is None and not ctl.ready
+    assert "отказ обработчика: start_timeout (ActiveState=inactive" in caplog.text
+    assert "остановлен демоном: start_timeout" in caplog.text
+    ctl.step(cfg, applied, zapret2.START_WAIT + 5, apply)  # до retry_seconds — без запуска
+    assert count(runtime, "start") == 1 and ctl.view["reason"] == "start_timeout"
+    runtime.slow = 0
+    ctl.step(cfg, applied, zapret2.START_WAIT + cfg.zapret2.retry_seconds, apply)
+    assert count(runtime, "start") == 2 and ctl.view["state"] == "active"
+
+
+def test_worker_exit_during_start_is_not_hidden_by_the_wait():
+    cfg, applied, runtime, ctl, apply = started(exits=True)
+    ctl.step(cfg, applied, 0, apply)
+    assert ctl.view["state"] == "blocked" and ctl.view["reason"] == "worker_exited"
+    assert ctl.view["gate_closed"] and ctl.starting is None and not runtime.up
+    assert all(seconds == 0 for event, seconds in runtime.events if event == "gate")
+
+
+def test_switching_off_during_start_stops_worker(caplog):
+    cfg, applied, runtime, ctl, apply = started(slow=10**6)
+    ctl.step(cfg, applied, 0, apply)
+    with caplog.at_level("INFO", logger="xgw.zapret2"):
+        ctl.step(cfg, applied, 1, apply, allowed=False, gating="capture_off")
+    assert ctl.view["state"] == "off" and not runtime.up and ctl.starting is None
+    assert "остановлен демоном: capture_off" in caplog.text
+    ctl.step(cfg, applied, 2, apply)  # перехват вернулся: новый запуск без retry_seconds
+    assert count(runtime, "start") == 2 and ctl.starting is not None
+    ctl.close("mode_change")  # смена режима или остановка демона посреди запуска
+    assert not runtime.up and ctl.starting is None
+    assert runtime.events[-2:] == [("gate", 0), ("stop", 0)]
+
+
+def test_daemon_shows_starting_worker_and_steps_sooner(daemon, monkeypatch):
+    prepare_daemon(daemon, monkeypatch)
+    daemon._zapret2.runtime.slow = 1
+    assert daemon.tick() is State.HEALTHY
+    assert daemon._zapret2.view["reason"] == "worker_starting"
+    assert daemon._zapret2.starting is not None  # цикл демона шагает каждые START_POLL
+    assert "запускается" in daemon.action
+    view = zapret2_control.card(daemon.cfg, engine.read_json(daemon.paths.status_file),
+                                {"mode": "on"}, True)
+    assert view["title"] == "Обработчик запускается · без VPN" and "закрыты" in view["detail"]
+    daemon.tick()
+    assert daemon._zapret2.view["state"] == "active" and daemon._zapret2.starting is None
+
+
 def test_standalone_card_does_not_require_vpn_or_probe_urls(monkeypatch):
     import time
 

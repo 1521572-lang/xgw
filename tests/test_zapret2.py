@@ -40,6 +40,8 @@ class Runtime:
         self.events = []
         self.up = False
         self.broken = False
+        self.slow = 0  # столько опросов после start очередь ещё не занята
+        self.exits = False  # процесс завершается сразу после start
 
     def gate(self, seconds=0):
         self.events.append(("gate", seconds))
@@ -55,7 +57,18 @@ class Runtime:
         self.up = False
 
     def alive(self, queue):
-        return self.up
+        return self.state(queue) == "ready"
+
+    def state(self, queue):
+        if not self.up or self.exits:
+            return "dead"
+        if self.slow:
+            self.slow -= 1
+            return "starting"
+        return "ready"
+
+    def describe(self):
+        return "ActiveState=inactive Result=success"
 
     def sample_trace(self):
         self.events.append(("sample", 0))
@@ -411,3 +424,25 @@ def test_busy_queue_is_not_taken(monkeypatch):
         runtime.start(cfg)
     assert all(call[0] != "systemd-run" for call in calls)
     assert all("stop" not in call for call in calls)
+
+
+def test_runtime_tells_starting_from_dead_and_describes_unit_safely(monkeypatch):
+    """п. 385: unit жив, а очереди ещё нет — это запуск, а не падение."""
+    answers = {"is-active": "active\n", "show": (
+        "ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\n"
+        "ExecStart={ path=/opt/private ; argv[]=secret }\n")}
+    runtime = z.Runtime(lambda argv, **kw: answers[argv[1]])
+    queue = {"busy": False}
+    monkeypatch.setattr(runtime, "occupied", lambda _queue: queue["busy"])
+    assert runtime.state(200) == "starting" and not runtime.alive(200)
+    queue["busy"] = True
+    assert runtime.state(200) == "ready" and runtime.alive(200)
+    answers["is-active"] = "activating\n"
+    assert runtime.state(200) == "starting"
+    for word in ("inactive", "failed", "deactivating", ""):
+        answers["is-active"] = word + "\n"
+        assert runtime.state(200) == "dead"
+    text = runtime.describe()
+    assert text == "ActiveState=active SubState=running Result=success ExecMainStatus=0"
+    answers["show"] = "ActiveState=bad value; rm\nResult=exit-code\n"
+    assert runtime.describe() == "Result=exit-code"

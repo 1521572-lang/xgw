@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urljoin, urlsplit
 
+from . import log
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -40,6 +41,11 @@ MIN_BODY = 16 * 1024
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
+# Самостоятельный режим: после запуска nfqws2 очередь NFQUEUE появляется не мгновенно (Lua,
+# netlink). До START_WAIT секунд обработчик не считается упавшим; всё это время выбранные
+# домены закрыты, а демон шагает каждые START_POLL секунд (отчёт standalone r3, п. 385).
+START_WAIT = 20.0
+START_POLL = 2.0
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
@@ -316,10 +322,27 @@ class Runtime:
             Capture.ignore_rules_until = time.monotonic() + Capture.RULES_QUIET
 
     def alive(self, queue: int) -> bool:
-        state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        if state != "active":
-            return False
-        return self.occupied(queue)
+        return self.state(queue) == "ready"
+
+    def state(self, queue: int) -> str:
+        """ready — unit активен и очередь занята; starting — unit жив, очереди ещё нет;
+        dead — unit не работает (упал, остановлен, не создан)."""
+        unit = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
+        if unit == "active":
+            return "ready" if self.occupied(queue) else "starting"
+        return "starting" if unit == "activating" else "dead"
+
+    def describe(self) -> str:
+        """Состояние unit для журнала: только слова и коды systemd, без argv и вывода."""
+        names = ("ActiveState", "SubState", "Result", "ExecMainStatus")
+        try:
+            raw = self.runner(["systemctl", "show", UNIT, *[f"--property={n}" for n in names]],
+                              check=False, timeout=5)
+        except (OSError, cmd.CommandError):
+            return ""
+        found = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+        return " ".join(f"{name}={found[name]}" for name in names
+                        if re.fullmatch(r"[A-Za-z0-9-]{1,32}", found.get(name, "")))
 
     @staticmethod
     def occupied(queue: int) -> bool:
@@ -389,6 +412,10 @@ class Controller:
         self.next_check = 0.0
         self.healthy = False
         self.ready = False
+        # Самостоятельный режим: срок (часы демона), до которого ждём очередь после запуска.
+        self.starting: float | None = None
+        self.started_at = 0.0
+        self.log = log.get_logger("zapret2")
         self.last_error = ""
         self.probes: list[dict] = []
         self.comparison: list[dict] | None = None
@@ -518,11 +545,11 @@ class Controller:
         return rows
 
     def step(self, cfg: Config, applied: dict, now: float, apply, *, allowed=True,
-             vpn_probe_port: int = 0, cancel=None) -> bool:
+             vpn_probe_port: int = 0, cancel=None, gating: str = "") -> bool:
         from .generator import builder
 
         if cfg.zapret2.mode == "standalone":
-            self._standalone_step(cfg, applied, now, allowed=allowed)
+            self._standalone_step(cfg, applied, now, allowed=allowed, gating=gating)
             return False
 
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
@@ -628,18 +655,42 @@ class Controller:
                      "gate_closed": gate_closed, "probes": self.probes}
         return changed
 
-    def _standalone_step(self, cfg: Config, applied: dict, now: float, *, allowed: bool) -> None:
-        """Готовность обработчика открывает маршрут, но не означает успех обхода DPI."""
+    def _standalone_step(self, cfg: Config, applied: dict, now: float, *, allowed: bool,
+                         gating: str = "") -> None:
+        """Готовность обработчика открывает маршрут, но не означает успех обхода DPI.
+
+        Запуск — в два приёма: start, затем ожидание очереди до START_WAIT (шаги демона, не
+        sleep). Пока очереди нет, gate закрыт и процесс не трогаем; упал или срок вышел —
+        остановка, причина в журнале, новая попытка через retry_seconds. gating — почему шаг
+        не разрешён (перехват, мосты, Xray): только для журнала."""
+        queue = cfg.zapret2.queue_num
         reason = "off" if not allowed else "apply_failed"
+        cause = gating or reason
         try:
             if allowed and standalone(applied):
-                if not self.ready and now >= self.next_check:
+                if not self.ready and self.starting is None and now >= self.next_check:
                     self.runtime.gate()
                     self.runtime.start(cfg)
-                    self.ready = True
+                    self.starting, self.started_at = now + START_WAIT, now
+                    self.log.info("обработчик запущен, очередь ожидается до %d с",
+                                  START_WAIT)
+                up = False
+                if self.starting is not None:
+                    state = self.runtime.state(queue)
+                    if state == "dead":
+                        raise ValueError("worker_exited")
+                    if state != "ready":
+                        if now >= self.starting:
+                            raise ValueError("start_timeout")
+                        self.view = {"state": "preparing", "reason": "worker_starting",
+                                     "gate_closed": True, "probes": []}
+                        return
+                    self.starting, self.ready, up = None, True, True
+                    self.log.info("обработчик готов, очередь занята через %.1f с",
+                                  now - self.started_at)
                 if not self.ready:
-                    reason = self.last_error or "retry_wait"
-                elif not self.runtime.alive(cfg.zapret2.queue_num):
+                    reason = cause = self.last_error or "retry_wait"
+                elif not up and not self.runtime.alive(queue):
                     raise ValueError("worker_down")
                 else:
                     lease = cfg.zapret2.check_seconds + 60
@@ -650,10 +701,17 @@ class Controller:
                     return
         except (OSError, ValueError, cmd.CommandError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in (
-                "worker_down", "queue_busy", "unsafe_files", "unsafe_directory"
+                "worker_down", "worker_exited", "start_timeout", "queue_busy", "unsafe_files",
+                "unsafe_directory",
             ) else "runtime_failed"
+            cause = reason
             self.last_error = reason
             self.next_check = now + cfg.zapret2.retry_seconds
+            detail = self.runtime.describe() if reason in (
+                "worker_exited", "start_timeout", "worker_down") else ""
+            self.log.warning("отказ обработчика: %s%s; новая попытка через %d с",
+                             reason, f" ({detail})" if detail else "", cfg.zapret2.retry_seconds)
+        running = self.ready or self.starting is not None
         closed = False
         try:
             self.runtime.gate()
@@ -662,17 +720,24 @@ class Controller:
             pass
         try:
             self.runtime.stop()
-            self.ready = False
+            self.ready, self.starting = False, None
         except cmd.CommandError:
             reason = "stop_failed"
+        if running:
+            # Решение демона видно в журнале: без argv, адресов и вывода nfqws2.
+            self.log.warning("обработчик остановлен демоном: %s; выбранные домены "
+                             "закрыты%s", cause, "" if reason != "stop_failed"
+                             else "; остановка не подтверждена")
         self.view = {"state": "blocked" if allowed else "off", "reason": reason,
                      "gate_closed": closed, "probes": []}
 
-    def close(self) -> None:
-        if not self.ready:
+    def close(self, cause: str = "close") -> None:
+        if not self.ready and self.starting is None:
             return
         try:
             self.runtime.gate()
         finally:
             self.runtime.stop()
             self.ready = self.healthy = False
+            self.starting = None
+            self.log.info("обработчик остановлен демоном: %s", cause)

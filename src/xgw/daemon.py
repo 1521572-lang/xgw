@@ -973,6 +973,10 @@ class Daemon:
                 pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:
                 pause = MANUAL_SCAN_PAUSE
+            if self._zapret2.starting is not None:
+                # Обработчик zapret2 запущен, очередь ещё не занята: готовность — за секунды,
+                # а не через целый шаг; домены всё это время закрыты (п. 385).
+                pause = min(pause, zapret2.START_POLL)
             period = jitter(pause)
             # Нормальный интервал — от начала шага. Иначе работа 8 с + ожидание
             # 20–24 с дают 28–32 с без нового статуса даже без долгой сборки.
@@ -983,10 +987,14 @@ class Daemon:
                                 period=period, step_s=spent)
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
         with contextlib.suppress(OSError, cmd.CommandError):
-            self._zapret2.close()
+            self._zapret2.close("daemon_stop" if stop.is_set() else "settings_changed")
         self.diary.flush(force=True)
         self.store.close()
-        self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
+        # Смена настроек — не перезапуск службы: процесс и PID те же, цикл начинается заново
+        # с новыми настройками (отчёт standalone r3 принял эту строку за перезапуск демона).
+        self.log.info("демон XGW остановлен" if stop.is_set() else
+                      "настройки изменены: цикл watchdog начинается заново, служба не "
+                      "перезапускается")
 
     def _loop_progress(self, phase: str, **details) -> None:
         """Отдельная запись работы цикла для конечного помощника проверки.
