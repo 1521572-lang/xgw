@@ -1,7 +1,8 @@
 """Подбор стратегии zapret2 без VPN: охват адресов YouTube, смена стратегии, замер потока.
 
-selfcheck, listed, use и measure — от root; hosts — от пользователя браузера (тот же путь,
-что у Firefox). Видеоссылки не запрашивает: ролик играет браузер, здесь только счётчики.
+selfcheck, listed, use и measure — от root; hosts и nodes — от пользователя браузера (тот же
+путь, что у Firefox). Ролик играет браузер, здесь только счётчики. nodes читает страницу ролика
+из приватного файла, чтобы узнать видеоузлы этой линии: ссылку и имена узлов не печатает.
 В вывод идут имена стратегий, общеизвестные служебные имена YouTube и числа.
 """
 
@@ -10,11 +11,16 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import socket
 import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _up = Path(__file__).resolve().parents  # копия для `hosts` лежит в /tmp: там src не нужен
@@ -27,6 +33,11 @@ HOSTS = ("www.youtube.com", "redirector.googlevideo.com", "i.ytimg.com", "yt3.gg
          "www.youtube-nocookie.com", "youtu.be", "www.gstatic.com", "www.google.com")
 TIMEOUT = 8.0
 MIB = 1024 * 1024
+WATCH = {"www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"}
+NODE = re.compile(r"[a-z0-9]+---[a-z0-9-]+[.]googlevideo[.]com")
+STATUS = re.compile(r'"playabilityStatus":[ ]*[{][ ]*"status":[ ]*"([A-Z_]+)"')
+AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+PER_VIDEO = 4
 
 
 def loaded():
@@ -75,12 +86,59 @@ def listed(args) -> int:
 def hosts(args) -> int:
     """От пользователя браузера. in_list=true — адрес шёл через zapret2, false — напрямую."""
     marks = json.loads(args.listed.read_text()) if args.listed else {}
-    rows = [{**probe(host), "in_list": marks.get(host)} for host in HOSTS]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        rows = [{**row, "in_list": marks.get(row["host"])} for row in pool.map(probe, HOSTS)]
     for row in rows:
         print(json.dumps(row, sort_keys=True))
     for flag, name in ((True, "zapret2"), (False, "direct")):
         part = [row for row in rows if row["in_list"] is flag]
         print(f"{name}_ok={sum(row['ok'] for row in part)} of {len(part)}")
+    return 0
+
+
+def page_nodes(url: str) -> tuple[list[str], str]:
+    """Видеоузлы, которые YouTube назначил этому адресу клиента, — из страницы ролика.
+    Имена узлов выдают провайдера и город, поэтому наружу идут только счётчики."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in WATCH:
+        return [], "bad_url"
+    request = urllib.request.Request(url, headers={
+        "User-Agent": AGENT, "Accept-Language": "en-US,en;q=0.8", "Cookie": "SOCS=CAI"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as reply:
+            text = reply.read(6 * MIB).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return [], f"http_{exc.code}"
+    except (OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return [], "timeout" if isinstance(reason, TimeoutError) else type(reason).__name__
+    text = urllib.parse.unquote(text.replace(chr(92) + "u0026", "&").replace(chr(92) + "/", "/"))
+    status = STATUS.search(text)
+    return sorted(set(NODE.findall(text)))[:PER_VIDEO], status.group(1) if status else "no_status"
+
+
+def nodes(args) -> int:
+    """От пользователя браузера: отвечают ли видеоузлы роликов из приватного файла (до двух
+    ссылок, по одной в строке). Узлы хранятся в --store и берутся оттуда, пока нет --fresh:
+    все стратегии проверяются на одних и тех же узлах."""
+    if args.store.exists() and not args.fresh:
+        saved = json.loads(args.store.read_text())
+    else:
+        links = [line.strip() for line in args.watch.read_text().splitlines() if line.strip()]
+        saved = [dict(zip(("nodes", "status"), page_nodes(link), strict=True))
+                 for link in links[:2]]
+        if any(item["nodes"] for item in saved):
+            args.store.touch(mode=0o600)
+            args.store.chmod(0o600)
+            args.store.write_text(json.dumps(saved))
+    for number, item in enumerate(saved, 1):
+        with ThreadPoolExecutor(max_workers=PER_VIDEO) as pool:
+            rows = list(pool.map(probe, item["nodes"]))
+        for index, row in enumerate(rows, 1):
+            del row["host"]
+            print(json.dumps({"video": number, "node": index, **row}, sort_keys=True))
+        print(f"video{number}_nodes_ok={sum(row['ok'] for row in rows)} of {len(rows)} "
+              f"page={item['status']}")
     return 0
 
 
@@ -199,6 +257,11 @@ def main() -> int:
     check = sub.add_parser("hosts")
     check.add_argument("--listed", type=Path)
     check.set_defaults(run=hosts)
+    video = sub.add_parser("nodes")
+    video.add_argument("--watch", type=Path, required=True)
+    video.add_argument("--store", type=Path, required=True)
+    video.add_argument("--fresh", action="store_true")
+    video.set_defaults(run=nodes)
     sub.add_parser("selfcheck").set_defaults(run=selfcheck)
     one = sub.add_parser("use")
     one.add_argument("strategy")
