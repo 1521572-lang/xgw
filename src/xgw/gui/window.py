@@ -1,6 +1,6 @@
 """Главное окно XGW: навигация слева и страницы. «Обзор» следует компоновке Proton VPN:
-список серверов слева, географическая карта фоном и подключение в основной области.
-При наведении на сервер появляется карточка с его фактическими параметрами.
+список серверов слева, карта во всю область, поверх неё — состояние защиты, карточка
+подключения с кнопкой и плитки защиты сети. Нажатие на сервер открывает его карточку.
 
 Страницы обновляют только тексты своих виджетов — ничего не создаётся заново на каждом опросе,
 поэтому фокус, выделение и прокрутка не сбиваются.
@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtCore import QPointF, QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -35,12 +36,17 @@ from .pages import ServersPage, SubscriptionsPage
 from .traffic import TrafficPage
 from .widgets import (
     Badge,
+    Elided,
+    FeatureTile,
     Metric,
     NavRail,
     ServerList,
     ShieldOrb,
+    StateHead,
+    icon,
     label,
     set_text,
+    tip,
     tone,
 )
 from .zapret2 import Zapret2Page
@@ -58,8 +64,12 @@ SECTIONS = (
 )
 MIN_SIZE = (1024, 720)
 START_SIZE = (1280, 820)
-SERVERS_WIDTH = (320, 360)
+SERVERS_WIDTH = (310, 340)
+CARD_WIDTH = (340, 380)  # карточка подключения поверх карты
+EDGE = 24  # поля области с картой
 WIDE = 1200
+FAIL_SHORT = {"closed": "Интернет закрывается: мимо VPN ничего не уходит",
+              "open": "Трафик временно идёт напрямую"}
 
 
 def _marked(tone_name: str, text: str) -> str:
@@ -107,10 +117,9 @@ class LoginPage(QWidget):
         super().__init__()
         self.setObjectName("page")
         card = Card()
-        brand = label("XGW", name="brand")
-        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        card.body.addWidget(brand)
-        title = label("Вход в XGW", name="heroTitle")
+        card.body.setContentsMargins(28, 26, 28, 26)
+        card.body.setSpacing(12)
+        title = label("Вход в XGW", name="pageTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card.body.addWidget(title)
         about = label("Окно управляет шлюзом через его панель на этой машине. Чтобы войти, "
@@ -127,12 +136,14 @@ class LoginPage(QWidget):
         self.button = QPushButton("Войти")
         self.button.setObjectName("connect")
         tone(self.button, "off")
+        self.button.setMinimumHeight(46)
+        self.button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.button.setAccessibleName("Войти в XGW с паролем администратора")
         self.button.clicked.connect(on_login)
         card.body.addWidget(self.button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(_centered(card, 520))
+        layout.addWidget(_centered(card, 460))
 
     def set_busy(self, busy: bool) -> None:
         self.button.setEnabled(not busy)
@@ -144,7 +155,8 @@ class LoginPage(QWidget):
 
 
 class OverviewPage(QWidget):
-    """Список серверов и карта с независимым слоем управления подключением."""
+    """Компоновка Proton VPN: список серверов слева, карта во всю область и поверх неё —
+    заголовок состояния, карточка подключения с кнопкой и плитки защиты сети."""
 
     def __init__(self, main: MainWindow) -> None:
         super().__init__()
@@ -158,7 +170,7 @@ class OverviewPage(QWidget):
         outer.addWidget(self.server_panel)
         outer.addWidget(self._connection(), 1)
 
-    # --- панель подключения ---------------------------------------------------------------------
+    # --- карта и карточка подключения -----------------------------------------------------------
 
     def _connection(self) -> QWidget:
         self.conn = QFrame()
@@ -173,115 +185,158 @@ class OverviewPage(QWidget):
         layers.addWidget(content)
         layers.setCurrentWidget(content)
         box = QVBoxLayout(content)
-        box.setContentsMargins(28, 28, 28, 22)
-        box.setSpacing(8)
-        self.word = label("", name="shieldWord", wrap=False)
-        font = self.word.font()
-        font.setLetterSpacing(font.SpacingType.AbsoluteSpacing, 1.4)
-        self.word.setFont(font)
-        self.word.setAccessibleName("Защита")
-        self.word.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        box.addWidget(self.word)
-        self.power_title = label("", name="heroTitle")
-        self.power_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        box.addWidget(self.power_title)
-        self.power_sub = label("", name="muted")
+        box.setContentsMargins(EDGE, 22, EDGE, 10)
+        box.setSpacing(0)
+
+        self.head = StateHead()
+        self.word = self.head.word
+        box.addWidget(self.head)
+        box.addSpacing(4)
+        self.power_sub = label("", name="heroSub")
         self.power_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         box.addWidget(self.power_sub)
+        box.addSpacing(18)
+
+        middle = QHBoxLayout()
+        column = QVBoxLayout()
+        column.setSpacing(10)
+        column.addWidget(self._card())
+        self.zapret2 = QPushButton("zapret2")
+        self.zapret2.setObjectName("linkRow")
+        self.zapret2.setIcon(icon("zapret2", theme.current()["accent"], size=18))
+        self.zapret2.setIconSize(QSize(18, 18))
+        self.zapret2.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zapret2.setAccessibleName("Состояние и управление zapret2")
+        self.zapret2.setToolTip("Открыть раздел zapret2: обход блокировок для выбранных доменов")
+        self.zapret2.clicked.connect(lambda: self.main.open_section("zapret2"))
+        column.addWidget(self.zapret2)
+        column.addStretch(1)
+        middle.addLayout(column)
+        middle.addStretch(1)
+        box.addLayout(middle, 1)
+        box.addSpacing(12)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.tiles = {key: FeatureTile(title, about) for key, title, about in (
+            ("capture", "Перехват", "Что демон XGW делает с трафиком прямо сейчас"),
+            ("fail", "При сбое Xray", "Что будет с интернетом, если Xray перестанет отвечать"),
+            ("bypass", "Мимо VPN", "Устройства, которым разрешён выход мимо VPN"))}
+        for tile in self.tiles.values():
+            tiles.addWidget(tile, 1)
+        self.lifecycle = self.tiles["capture"].value
+        self.guard = {key: self.tiles[key].value for key in ("fail", "bypass")}
+        box.addLayout(tiles)
+        box.addSpacing(8)
+
+        foot = QHBoxLayout()
+        self.versions = label("", name="small", wrap=False)
+        self.versions.setAccessibleName("Версии")
+        foot.addWidget(self.versions)
+        foot.addStretch(1)
+        self.fresh = label("", name="small", wrap=False)
+        self.fresh.setAccessibleName("Обновление данных")
+        foot.addWidget(self.fresh)
+        box.addLayout(foot)
+        return self.conn
+
+    def _card(self) -> QWidget:
+        self.card = QFrame()
+        self.card.setObjectName("connCard")
+        self.card.setFixedWidth(CARD_WIDTH[1])
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(34)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(40, 30, 90, 34))
+        self.card.setGraphicsEffect(shadow)
+        box = QVBoxLayout(self.card)
+        box.setContentsMargins(18, 16, 18, 16)
+        box.setSpacing(12)
+        self.power_title = label("", name="heroTitle")
+        box.addWidget(self.power_title)
 
         server = QHBoxLayout()
         server.setSpacing(12)
-        server.addStretch(1)
         self.badge = Badge(44)
         server.addWidget(self.badge)
         names = QVBoxLayout()
-        names.setSpacing(0)
-        self.server_name = label("", name="serverName")
+        names.setSpacing(1)
+        self.server_name = Elided(name="serverName")
         self.server_name.setAccessibleName("Сервер в работе")
-        self.server_how = label("", name="small")
+        self.server_how = label("", name="small", wrap=False)
         names.addWidget(self.server_name)
         names.addWidget(self.server_how)
-        server.addLayout(names, 3)
-        server.addStretch(1)
+        server.addLayout(names, 1)
         box.addLayout(server)
-        box.addSpacing(8)
 
         self.power = QPushButton("Включить VPN")
         self.power.setObjectName("connect")
-        self.power.setMinimumHeight(50)
-        self.power.setMinimumWidth(250)
-        self.power.setMaximumWidth(330)
+        self.power.setMinimumHeight(46)
+        self.power.setCursor(Qt.CursorShape.PointingHandCursor)
         self.power.clicked.connect(self.main.toggle_power)
-        box.addWidget(self.power, 0, Qt.AlignmentFlag.AlignCenter)
-        self.power_why = label("")
-        self.power_why.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(self.power)
+        self.power_why = label("", name="small")
         tone(self.power_why, "warn")
         box.addWidget(self.power_why)
-        self.zapret2 = QPushButton("zapret2")
-        self.zapret2.setAccessibleName("Состояние и управление zapret2")
-        self.zapret2.clicked.connect(lambda: self.main.nav.setCurrentRow(
-            next(i for i, (key, _) in enumerate(SECTIONS) if key == "zapret2")))
-        box.addWidget(self.zapret2, 0, Qt.AlignmentFlag.AlignCenter)
 
-        box.addStretch(1)
-
-        summary = QFrame()
-        summary.setObjectName("connectionSummary")
-        summary_box = QVBoxLayout(summary)
-        summary_box.setContentsMargins(18, 14, 18, 12)
-        summary_box.setSpacing(8)
+        line = QFrame()
+        line.setObjectName("divider")
+        box.addWidget(line)
         tiles = QHBoxLayout()
-        tiles.setSpacing(8)
+        tiles.setSpacing(10)
         self.metrics = {key: Metric(title, about) for key, title, about in (
             ("speed", "Скорость", "Последний замер скорости через этот сервер"),
             ("rtt", "RTT", "Время установления соединения с сервером (проба шлюза)"),
             ("delay", "Проба", "Полная проба ядра: запрос через сервер и ответ целиком"))}
         for widget in self.metrics.values():
-            tiles.addWidget(widget)
-        summary_box.addLayout(tiles)
-        self.engine = label("", name="small")
-        self.engine.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        summary_box.addWidget(self.engine)
-        self.lifecycle = label("", name="small")
-        self.lifecycle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        summary_box.addWidget(self.lifecycle)
-        self.versions = label("", name="small")
-        self.versions.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.versions.setAccessibleName("Версии")
-        summary_box.addWidget(self.versions)
-        box.addWidget(summary)
-        self.fresh = label("", name="small", wrap=False)
-        self.fresh.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.fresh.setAccessibleName("Обновление данных")
-        box.addWidget(self.fresh)
-        return self.conn
+            tiles.addWidget(widget, 1)
+        box.addLayout(tiles)
+        self.engine = label("", name="small", wrap=False)
+        box.addWidget(self.engine)
+        return self.card
 
-    # --- серверы и защита сети ------------------------------------------------------------------
+    def place(self, wide: bool) -> None:
+        """Ширины под размер окна и точка карты: страна сервера — в свободной части справа."""
+        self.server_panel.setFixedWidth(SERVERS_WIDTH[wide])
+        self.card.setFixedWidth(CARD_WIDTH[wide])
+        width, height = self.conn.width(), self.conn.height()
+        left = EDGE + CARD_WIDTH[wide]
+        self.orb.set_focus(QPointF(left + max(120.0, (width - left) / 2), height * .5 - 16))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.place(self.main.width() >= WIDE)
+
+    # --- серверы --------------------------------------------------------------------------------
 
     def _servers(self) -> QWidget:
         inner = QWidget()
         box = QVBoxLayout(inner)
-        box.setContentsMargins(18, 24, 18, 20)
-        box.setSpacing(10)
+        box.setContentsMargins(12, 20, 12, 16)
+        box.setSpacing(8)
         head = QHBoxLayout()
-        head.addWidget(label("Серверы", name="pageTitle", wrap=False))
-        self.counts = label("", name="muted", wrap=False)
+        head.setContentsMargins(8, 0, 8, 0)
+        head.addWidget(label("Серверы", name="listTitle", wrap=False))
         head.addStretch(1)
+        self.counts = label("", name="small", wrap=False)
+        head.addWidget(self.counts)
+        box.addLayout(head)
         self.main.chip = label("", name="chip", wrap=False)
         self.main.chip.setAccessibleName("Состояние шлюза")
-        box.addLayout(head)
-        box.addWidget(self.counts)
-        box.addWidget(label("Нажмите на сервер для подробностей", name="small"))
-        box.addWidget(self.main.chip)
+        chip = QHBoxLayout()
+        chip.setContentsMargins(8, 0, 8, 0)
+        chip.addWidget(self.main.chip)
+        chip.addStretch(1)
+        box.addLayout(chip)
 
         self.alert = QFrame()
         self.alert.setObjectName("alert")
         alert = QVBoxLayout(self.alert)
-        alert.setContentsMargins(16, 12, 16, 14)
+        alert.setContentsMargins(14, 12, 14, 12)
         alert.setSpacing(6)
         self.state = label("", name="cardTitle")
         self.state.setAccessibleName("Состояние шлюза")
-        self.explain = label("", name="muted")
+        self.explain = label("", name="small")
         alert.addWidget(self.state)
         alert.addWidget(self.explain)
         fixes = QVBoxLayout()
@@ -296,36 +351,35 @@ class OverviewPage(QWidget):
             self.fix_buttons[name] = button
         alert.addLayout(fixes)
         box.addWidget(self.alert)
+        box.addSpacing(4)
 
-        self.members_title = label("", name="section", wrap=False)
+        self.members_title = self._section_title()
         box.addWidget(self.members_title)
         self.members = ServerList()
         box.addWidget(self.members)
-        self.spares_title = label("", name="section", wrap=False)
+        box.addSpacing(4)
+        self.spares_title = self._section_title()
         box.addWidget(self.spares_title)
         self.spares = ServerList()
         box.addWidget(self.spares)
         self.hidden = label("", name="small")
+        self.hidden.setContentsMargins(8, 4, 8, 0)
         box.addWidget(self.hidden)
-
-        box.addSpacing(8)
-        box.addWidget(label("ЗАЩИТА СЕТИ", name="section", wrap=False))
-        guard = Card()
-        self.guard: dict[str, QLabel] = {}
-        for key, title in (("scope", "Через VPN"), ("fail", "При сбое Xray"),
-                           ("bypass", "Мимо VPN")):
-            row = QVBoxLayout()
-            row.setSpacing(2)
-            name = label(title, name="muted", wrap=False)
-            value = label("—")
-            value.setAccessibleName(title)
-            row.addWidget(name, 0, Qt.AlignmentFlag.AlignTop)
-            row.addWidget(value, 1)
-            guard.body.addLayout(row)
-            self.guard[key] = value
-        box.addWidget(guard)
+        self.all_servers = QPushButton("Все серверы и замеры")
+        self.all_servers.setAccessibleName("Открыть раздел «Серверы»")
+        self.all_servers.clicked.connect(lambda: self.main.open_section("servers"))
+        box.addWidget(self.all_servers)
         box.addStretch(1)
-        return _scroll(inner)
+        scroll = _scroll(inner)
+        inner.setObjectName("serverPanel")
+        scroll.setObjectName("serverScroll")
+        return scroll
+
+    @staticmethod
+    def _section_title() -> QLabel:
+        title = label("", name="section", wrap=False)
+        title.setContentsMargins(8, 0, 8, 0)
+        return title
 
     # --- отображение ----------------------------------------------------------------------------
 
@@ -337,16 +391,16 @@ class OverviewPage(QWidget):
         power = model.power(state, stale, acting=acting)
         shield_tone, word = model.shield(state, stale, acting=acting)
         tone(self.conn, shield_tone)
-        tone(self.word, shield_tone)
-        set_text(self.word, word.upper())
+        # Как у Proton: «не защищено» — красным, хотя для шлюза это не авария (тон off).
+        self.head.show_state("bad" if shield_tone == "off" else shield_tone, word,
+                             locked=shield_tone == "ok")
         self.orb.set_tone(shield_tone)
         set_text(self.power_title, power.title)
+        zapret = (state or {}).get("zapret2") or {}
+        direct_mode = bool(zapret.get("mode") == "standalone" or zapret.get("without_vpn"))
         extra = (" Выбранные домены идут через zapret2 с домашним IP."
-                 if not stale and ((state or {}).get("zapret2") or {}).get("state") == "active"
-                 else "")
+                 if not stale and not direct_mode and zapret.get("state") == "active" else "")
         set_text(self.power_sub, power.sub + extra)
-        direct_mode = (((state or {}).get("zapret2") or {}).get("mode") == "standalone"
-                       or ((state or {}).get("zapret2") or {}).get("without_vpn"))
         self.power.setText("Выключаю…" if acting and power.pressed else
                            "Включаю…" if acting else
                            ("Выключить перехват" if power.pressed else "Включить zapret2")
@@ -358,17 +412,26 @@ class OverviewPage(QWidget):
         set_text(self.power_why, power.why)
         self.power_why.setVisible(bool(power.why))
         line = model.lifecycle(state, stale)
-        self.lifecycle.setVisible(line is not None)
+        capture = (state or {}).get("capture") or {}
         if line is not None:
             tone(self.lifecycle, line[0])
-            set_text(self.lifecycle, _marked(line[0], line[1]))
+            set_text(self.lifecycle, _marked(line[0], line[1].removeprefix("Перехват: ")))
+        else:
+            tone(self.lifecycle, "off")
+            set_text(self.lifecycle, "—" if state is None or stale else
+                     "Прямой интернет без VPN" if direct_mode and capture.get("mode") == "on"
+                     else "выключен — трафик идёт напрямую"
+                     if capture.get("mode") in ("off", "none") else "—")
 
-        main = model.main_server(state)
+        # Без VPN сервер подписки не участвует: его имя и замеры здесь вводили бы в заблуждение.
+        main = None if direct_mode else model.main_server(state)
         self.orb.set_country(main.country if main is not None else "")
         if main is None:
             self.badge.show_country("", "")
-            set_text(self.server_name, "Сервер не выбран" if state else "—")
-            set_text(self.server_how, "шлюз ещё не выбрал сервер" if state else "")
+            set_text(self.server_name, "Домашний адрес" if direct_mode and state else
+                     "Сервер не выбран" if state else "—")
+            set_text(self.server_how, "VPN-серверы не используются" if direct_mode and state
+                     else "шлюз ещё не выбрал сервер" if state else "")
             for metric in self.metrics.values():
                 metric.set("—")
             set_text(self.engine, "")
@@ -376,6 +439,7 @@ class OverviewPage(QWidget):
             flag, name = model.split_flag(main.name)
             self.badge.show_country(flag, main.country)
             set_text(self.server_name, name)
+            tip(self.server_name, name)
             set_text(self.server_how, "выбран вручную" if main.pinned else
                      "выбран по замеру скорости" if main.basis == "speed" else
                      "выбран по задержке")
@@ -386,6 +450,7 @@ class OverviewPage(QWidget):
                 f"ядро {main.core}" if main.core else "",
                 f"профиль {main.profile.split(':', 1)[-1]}" if main.profile else "") if part)
             set_text(self.engine, engine)
+        self.engine.setVisible(bool(self.engine.text()))
         found = dict(model.versions(state))
         set_text(self.versions, " · ".join(f"{name} {found[name]}" for name in
                                            ("XGW", "Xray", "sing-box") if found.get(name)))
@@ -418,21 +483,20 @@ class OverviewPage(QWidget):
         set_text(self.spares_title, f"ЗАПАСНЫЕ · {len(spares)}" if spares else "")
         self.spares_title.setVisible(bool(spares))
         self.spares.show_rows(spares, state)
-        set_text(self.hidden, (f"Ещё {hidden} строк подписок не в работе (выключены или не "
-                               "серверы). Выбор сервера, приоритет и замеры — в разделе "
-                               "«Серверы».") if hidden else
-                 "Выбор сервера, приоритет и замеры — в разделе «Серверы».")
+        set_text(self.hidden, f"Ещё {hidden} строк подписок не в работе: выключены или не "
+                              "серверы." if hidden else "")
+        self.hidden.setVisible(bool(hidden))
+        self.all_servers.setVisible(bool(state))
 
     def _show_guard(self, state: dict | None) -> None:
         capture = (state or {}).get("capture") or {}
-        set_text(self.guard["scope"], model.scope_text(capture) if capture.get("mode") == "on"
-                 else "ничего: VPN выключен" if capture else "—")
-        if ((state or {}).get("zapret2") or {}).get("without_vpn"):
-            set_text(self.guard["scope"], "Прямой интернет без VPN")
-        set_text(self.guard["fail"],
-                 model.FAIL_MODES.get(str(capture.get("fail_mode") or ""), "—"))
+        mode = str(capture.get("fail_mode") or "")
+        set_text(self.guard["fail"], FAIL_SHORT.get(mode, "—"))
+        tip(self.tiles["fail"], model.capital(model.FAIL_MODES.get(mode, "")) or
+            "Что будет с интернетом, если Xray перестанет отвечать")
         bypass = capture.get("bypass") or []
-        set_text(self.guard["bypass"], f"устройств: {len(bypass)}" if bypass else "нет")
+        set_text(self.guard["bypass"], f"Устройств: {len(bypass)}" if bypass else
+                 "Нет: все устройства идут через шлюз" if capture else "—")
 
     @staticmethod
     def _explain(state: dict | None, stale: bool) -> tuple[str, set[str]]:
@@ -580,6 +644,9 @@ class MainWindow(QMainWindow):
     def run_action(self, name: str) -> None:
         self.client.act(name, {}, key=name)
 
+    def open_section(self, key: str) -> None:
+        self.nav.setCurrentRow(next(i for i, (name, _) in enumerate(SECTIONS) if name == key))
+
     def open_browser(self) -> None:
         session = self.client.session
         port = session.port if session is not None else 8781
@@ -678,7 +745,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.overview.server_panel.setFixedWidth(SERVERS_WIDTH[self.width() >= WIDE])
+        wide = self.width() >= WIDE
+        self.nav.set_wide(wide)
+        self.overview.place(wide)
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)

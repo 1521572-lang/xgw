@@ -41,7 +41,8 @@ from PyQt6.QtWidgets import (
 from . import model, theme
 from .mapdata import COUNTRIES
 
-RAIL_WIDTH = 72
+RAIL_WIDTH = 68
+RAIL_WIDE = 196
 
 
 def label(text: str = "", *, name: str = "", wrap: bool = True) -> QLabel:
@@ -296,6 +297,19 @@ def draw(painter: QPainter, name: str, color: QColor, width: float = 1.8) -> Non
         path.addEllipse(QPointF(10.5, 10.5), 6, 6)
         path.moveTo(15, 15)
         path.lineTo(20, 20)
+    elif name in ("lock", "unlock"):
+        path.addRoundedRect(QRectF(5, 10.5, 14, 10), 2.4, 2.4)
+        path.moveTo(8.2, 10.5)
+        path.lineTo(8.2, 7.6)
+        path.cubicTo(QPointF(8.2, 2.6), QPointF(15.8, 2.6), QPointF(15.8, 7.6))
+        if name == "lock":
+            path.lineTo(15.8, 10.5)
+        path.moveTo(12, 14.4)
+        path.lineTo(12, 16.8)
+    elif name == "chevron":
+        path.moveTo(9.5, 6.5)
+        path.lineTo(15, 12)
+        path.lineTo(9.5, 17.5)
     painter.drawPath(path)
 
 
@@ -351,7 +365,9 @@ def icon(name: str, normal: str, active: str | None = None, size: int = 24) -> Q
 
 
 class NavRail(QWidget):
-    """Панель разделов Proton: значок слева от подписи, спокойная плашка выбора."""
+    """Панель разделов Proton: значок слева от подписи, спокойная плашка выбора.
+
+    В широком окне — с подписями, в узком — одни значки с подсказками (set_wide)."""
 
     currentRowChanged = pyqtSignal(int)
 
@@ -361,15 +377,23 @@ class NavRail(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedWidth(RAIL_WIDTH)
         self.setAccessibleName("Разделы")
+        self.wide = False
         self.box = QVBoxLayout(self)
-        self.box.setContentsMargins(10, 18, 10, 14)
-        self.box.setSpacing(6)
+        self.box.setContentsMargins(10, 16, 10, 14)
+        self.box.setSpacing(4)
+        head = QHBoxLayout()
+        head.setContentsMargins(8, 0, 0, 0)
+        head.setSpacing(10)
         self.logo = QLabel("XGW")
-        self.logo.setObjectName("brand")
+        self.logo.setFixedSize(36, 44)
         self.logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.logo.setFixedHeight(52)
-        self.box.addWidget(self.logo)
-        self.box.addSpacing(12)
+        head.addWidget(self.logo)
+        self.brand = QLabel("XGW")
+        self.brand.setObjectName("brand")
+        self.brand.hide()
+        head.addWidget(self.brand, 1)
+        self.box.addLayout(head)
+        self.box.addSpacing(14)
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
         self.buttons: list[QToolButton] = []
@@ -393,7 +417,8 @@ class NavRail(QWidget):
         button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         button.setIconSize(QSize(22, 22))
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        button.setFixedHeight(46)
+        button.setFixedHeight(42)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # мышью — без рамки фокуса
         return button
 
@@ -401,6 +426,19 @@ class NavRail(QWidget):
         button = self._button(title)
         self.box.addWidget(button)
         return button
+
+    def set_wide(self, wide: bool) -> None:
+        """Широкая панель — значок и подпись; узкая — значок, подпись в подсказке."""
+        if wide == self.wide:
+            return
+        self.wide = wide
+        self.setFixedWidth(RAIL_WIDE if wide else RAIL_WIDTH)
+        self.brand.setVisible(wide)
+        style = (Qt.ToolButtonStyle.ToolButtonTextBesideIcon if wide
+                 else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        for button in self.findChildren(QToolButton):
+            button.setToolButtonStyle(style)
+            button.setToolTip("" if wide else button.text())
 
     def currentRow(self) -> int:
         return self._row
@@ -435,12 +473,19 @@ def _mercator(lon: float, lat: float) -> QPointF:
 
 
 class ShieldOrb(QWidget):
-    """Карта мира и знак защиты в приблизительной точке страны VPN-сервера."""
+    """Карта мира во всю область «Обзора»: свечение по состоянию защиты сверху и отметка
+    в приблизительной точке страны VPN-сервера. Карта рисуется один раз на размер и состояние
+    (кэш): подписи поверх неё обновляются каждую секунду и не должны пересчитывать контуры."""
+
+    MARK = 15.0  # радиус отметки страны
 
     def __init__(self) -> None:
         super().__init__()
         self.tone = "off"
         self.country = ""
+        self.focus: QPointF | None = None  # где держать страну; None — середина области
+        self._cache: QPixmap | None = None
+        self._key: tuple = ()
         self.setMinimumHeight(210)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAccessibleName("Карта и знак защиты")
@@ -448,6 +493,12 @@ class ShieldOrb(QWidget):
     def set_tone(self, value: str) -> None:
         if value != self.tone:
             self.tone = value
+            self.update()
+
+    def set_focus(self, point: QPointF | None) -> None:
+        """Точка области, куда карта ставит страну сервера: свободное место рядом с карточкой."""
+        if point != self.focus:
+            self.focus = point
             self.update()
 
     def set_country(self, value: str) -> None:
@@ -460,16 +511,18 @@ class ShieldOrb(QWidget):
             self.setToolTip("Страна из данных сервера, не точное местоположение")
             self.update()
 
-    def _map(self, painter: QPainter) -> QPointF:
+    def center(self) -> QPointF:
+        return self.focus or QPointF(self.width() * .5, self.height() * .54)
+
+    def _map(self, painter: QPainter, center: QPointF) -> None:
         colors = theme.current()
         width, height = self.width(), self.height()
         # Страна из подписки — приблизительный ориентир, не координаты VPN-сервера.
         lon, lat = COUNTRY_POINTS.get(self.country, (15.0, 50.0))
         origin = _mercator(lon, lat)
-        scale = min(width / 85, height / 75)
-        center = QPointF(width * .5, height * .54)
+        scale = max(9.0, min(15.0, width / 62))
         painter.fillRect(self.rect(), QColor(colors["map_bg"]))
-        painter.setPen(QPen(QColor(colors["map_border"]), .85))
+        painter.setPen(QPen(QColor(colors["map_border"]), 1.0))
         for code, _lon, _lat, rings in COUNTRIES:
             painter.setBrush(QColor(colors["map_selected"] if code == self.country
                                     else colors["map_land"]))
@@ -480,50 +533,51 @@ class ShieldOrb(QWidget):
                     polygon.append(QPointF(center.x() + (p.x() - origin.x()) * scale,
                                            center.y() + (p.y() - origin.y()) * scale))
                 painter.drawPolygon(polygon)
-        # Спокойные зоны под заголовком и метриками; карта остаётся фоном всей области.
-        fade = QLinearGradient(0, 0, 0, height)
-        for at, alpha in ((0, 255), (.29, 245), (.43, 45), (.64, 0), (.77, 225), (1, 255)):
-            color = QColor(colors["panel"])
+        # Свечение сверху — цвет состояния (как в Proton: зелёное — защищено, красное — нет).
+        shade = QColor(colors["bad" if self.tone in ("off", "bad") else
+                              "accent" if self.tone == "busy" else self.tone])
+        painter.save()
+        painter.translate(width * .5, 0)
+        painter.scale(1.0, .5)
+        reach = max(width * .62, 320.0)
+        aura = QRadialGradient(QPointF(0, 0), reach)
+        for at, alpha in ((0.0, 92), (.45, 40), (1.0, 0)):
+            shade.setAlpha(alpha if self.tone != "off" else alpha * 2 // 3)
+            aura.setColorAt(at, QColor(shade))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(aura)
+        painter.drawEllipse(QPointF(0, 0), reach, reach)
+        painter.restore()
+        # Спокойная полоса внизу — под плитками защиты сети.
+        fade = QLinearGradient(0, height - 190, 0, height)
+        for at, alpha in ((0, 0), (.55, 215), (1, 245)):
+            color = QColor(colors["map_bg"])
             color.setAlpha(alpha)
             fade.setColorAt(at, color)
-        painter.fillRect(self.rect(), fade)
-        return center
+        painter.fillRect(QRectF(0, height - 190, width, 190), fade)
 
-    def paintEvent(self, _event) -> None:
+    def _mark(self, painter: QPainter, center: QPointF) -> None:
         colors = theme.current()
         color = QColor(colors.get(self.tone, colors["off"]))
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        center = self._map(painter)
-        if self.country not in COUNTRY_POINTS:
-            painter.end()
-            return
-        core = 18.0
-        glow = QRadialGradient(center, core * 3.6)
-        for stop, alpha in ((0.0, 105), (0.55, 45), (1.0, 0)):
-            shade = QColor(color)
-            shade.setAlpha(alpha if self.tone != "off" else alpha // 3)
-            glow.setColorAt(stop, shade)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(glow)
-        painter.drawEllipse(center, core * 3.6, core * 3.6)
-        for factor, alpha in ((2.7, 75), (1.9, 125)):
+        core = self.MARK
+        for factor, alpha in ((3.1, 26), (2.1, 52)):
             ring = QColor(color)
-            ring.setAlpha(alpha if self.tone != "off" else alpha // 2)
-            painter.setPen(QPen(ring, 1.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
+            ring.setAlpha(alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(ring)
             painter.drawEllipse(center, core * factor, core * factor)
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setPen(QPen(QColor(colors["surface"]), 2.5))
         painter.setBrush(color)
         painter.drawEllipse(center, core, core)
-        painter.translate(center.x() - core * .63, center.y() - core * .63)
-        painter.scale(core * 1.26 / 24, core * 1.26 / 24)
+        painter.translate(center.x() - core * .62, center.y() - core * .62)
+        painter.scale(core * 1.24 / 24, core * 1.24 / 24)
         path = QPainterPath()
         _shield(path)
-        pen = QPen(QColor(colors["panel"]), 1.9)
+        pen = QPen(QColor(colors["surface"]), 2.0)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
         sign = QPainterPath()
         if self.tone == "ok":
@@ -544,6 +598,24 @@ class ShieldOrb(QWidget):
             sign.moveTo(9, 12)
             sign.lineTo(15, 12)
         painter.drawPath(sign)
+
+    def paintEvent(self, _event) -> None:
+        center = self.center()
+        ratio = self.devicePixelRatioF()
+        key = (self.width(), self.height(), ratio, self.tone, self.country,
+               round(center.x()), round(center.y()))
+        if self._cache is None or key != self._key:
+            pixmap = QPixmap(round(self.width() * ratio), round(self.height() * ratio))
+            pixmap.setDevicePixelRatio(ratio)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self._map(painter, center)
+            if self.country in COUNTRY_POINTS:
+                self._mark(painter, center)
+            painter.end()
+            self._cache, self._key = pixmap, key
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self._cache)
         painter.end()
 
 
@@ -558,31 +630,40 @@ def emoji_flags() -> bool:
 
 
 class Badge(QLabel):
-    """Круглый значок страны: флаг, если в системе есть цветной шрифт эмодзи, иначе код."""
+    """Значок страны: флаг, если в системе есть цветной шрифт эмодзи, иначе код страны;
+    страна не указана — глобус."""
 
-    def __init__(self, size: int = 40) -> None:
+    def __init__(self, size: int = 36) -> None:
         super().__init__()
         self.setObjectName("badge")
         self.setFixedSize(size, size)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.shown: str | None = None
 
     def show_country(self, flag: str, code: str) -> None:
         known = code if code not in ("", "XX") else ""  # XX — страна в теге не указана
-        text = flag if flag and emoji_flags() else (known or "··")
-        set_text(self, text)
+        text = flag if flag and emoji_flags() else known
+        if text == self.shown:
+            return
+        self.shown = text
+        if text:
+            self.setText(text)
+        else:
+            side = self.width() // 2
+            self.setPixmap(icon("servers", theme.current()["muted"], size=side).pixmap(side, side))
         self.setAccessibleName(f"Страна {known}" if known else "Страна не указана")
 
 
 class Metric(QFrame):
-    """Плитка: подпись мелко, число крупно, единица под ним."""
+    """Показатель в карточке подключения: подпись мелко, число крупно, единица под ним."""
 
     def __init__(self, title: str, about: str = "") -> None:
         super().__init__()
         self.setObjectName("metric")
         self.setToolTip(about or title)
         box = QVBoxLayout(self)
-        box.setContentsMargins(14, 10, 14, 12)
-        box.setSpacing(2)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
         box.addWidget(label(title.upper(), name="metricTitle", wrap=False))
         self.value = label("—", name="metricValue", wrap=False)
         self.unit = label("", name="small", wrap=False)
@@ -600,6 +681,54 @@ class Metric(QFrame):
         return f"{self.value.text()} {self.unit.text()}".strip()
 
 
+class StateHead(QWidget):
+    """Заголовок «Обзора»: замок и слово состояния защиты — как «Protected» у Proton.
+
+    Слово состояния — подпись self.word (её читают тесты и экранный диктор)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        box = QHBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(8)
+        box.addStretch(1)
+        self.sign = QLabel()
+        self.sign.setFixedSize(26, 26)
+        box.addWidget(self.sign)
+        self.word = label("", name="shieldWord", wrap=False)
+        self.word.setAccessibleName("Защита")
+        box.addWidget(self.word)
+        box.addStretch(1)
+        self.shown: tuple[str, bool] = ("", False)
+
+    def show_state(self, tone_name: str, text: str, locked: bool) -> None:
+        tone(self.word, tone_name)
+        set_text(self.word, text)
+        if (tone_name, locked) != self.shown:
+            self.shown = (tone_name, locked)
+            colors = theme.current()
+            found = icon("lock" if locked else "unlock", colors.get(tone_name, colors["off"]),
+                         size=26)
+            self.sign.setPixmap(found.pixmap(26, 26))
+
+
+class FeatureTile(QFrame):
+    """Плитка защиты сети под картой (у Proton — Kill switch, NetShield): подпись и значение."""
+
+    def __init__(self, title: str, about: str = "") -> None:
+        super().__init__()
+        self.setObjectName("featureTile")
+        self.setToolTip(about)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(14, 10, 14, 11)
+        box.setSpacing(3)
+        box.addWidget(label(title.upper(), name="metricTitle", wrap=False))
+        self.value = label("—", name="tileValue")
+        self.value.setAccessibleName(title)
+        self.value.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        box.addWidget(self.value, 1)
+
+
 class ServerRowWidget(DetailsFrame):
     """Строка сервера: страна, имя и подробности, скорость и задержка, состояние."""
 
@@ -607,12 +736,12 @@ class ServerRowWidget(DetailsFrame):
         super().__init__()
         self.setObjectName("row")
         box = QHBoxLayout(self)
-        box.setContentsMargins(12, 10, 14, 10)
-        box.setSpacing(12)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(10)
         self.badge = Badge()
-        box.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
+        box.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignVCenter)
         texts = QVBoxLayout()
-        texts.setSpacing(3)
+        texts.setSpacing(2)
         top = QHBoxLayout()
         top.setSpacing(8)
         self.name = Elided(name="rowName")
@@ -631,6 +760,7 @@ class ServerRowWidget(DetailsFrame):
         texts.addLayout(details)
         box.addLayout(texts, 1)
         status = QVBoxLayout()
+        status.setContentsMargins(0, 0, 0, 0)
         status.setSpacing(3)
         self.dot = QLabel()
         self.dot.setObjectName("dot")
@@ -651,7 +781,7 @@ class ServerRowWidget(DetailsFrame):
         wide = self.width() >= self.PILL_WIDTH
         self.main.setVisible(self.is_main and wide)
         self.state.setVisible(wide)
-        self.holder.setFixedWidth(124 if wide else 24)
+        self.holder.setFixedWidth(124 if wide else 14)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -686,7 +816,7 @@ class ServerList(QWidget):
         super().__init__()
         self.box = QVBoxLayout(self)
         self.box.setContentsMargins(0, 0, 0, 0)
-        self.box.setSpacing(8)
+        self.box.setSpacing(2)
         self.rows: list[ServerRowWidget] = []
 
     def show_rows(self, rows: list[model.ServerRow], state: dict | None = None) -> None:

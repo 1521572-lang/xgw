@@ -167,8 +167,12 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     assert overview.metrics["rtt"].text() == "29 мс"
     assert overview.metrics["delay"].text() == "84 мс"
     assert "Xray 26.3.27" in overview.versions.text()
-    assert overview.word.text() == "ЗАЩИЩЕНО" and overview.orb.tone == "ok"
+    assert overview.word.text() == "Защищено" and overview.orb.tone == "ok"
     assert overview.orb.country == "NL"
+    # Страна сервера на карте — в свободной части справа от карточки подключения.
+    assert overview.orb.focus.x() > overview.card.geometry().right()
+    assert "работает" in overview.lifecycle.text()
+    assert win.nav.wide and win.nav.buttons[0].toolTip() == ""
     win.nav.buttons[3].click()
     assert win.stack.currentWidget() is win.devices
     win.nav.setCurrentRow(0)
@@ -183,6 +187,9 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     win.nav.setCurrentRow(0)
     win.resize(*window.MIN_SIZE)
     qapp.processEvents()
+    # Узкое окно: навигация — значки с подсказками, карточка и отметка страны помещаются.
+    assert not win.nav.wide and win.nav.buttons[0].toolTip() == "Обзор"
+    assert overview.card.geometry().right() < overview.orb.focus.x() < overview.conn.width()
     shots = os.environ.get("XGW_GUI_SHOTS")
     if shots:
         for choice in ("light", "dark"):
@@ -549,6 +556,33 @@ def test_server_details_open_without_changing_connection(qapp, tmp_path, monkeyp
     escaped = server_details("<img src='https://invalid.test/image'>", extra={
         "protocol": "vless", "password": "PRIVATE_SENTINEL", "outbound": {"secret": "x"}})
     assert "<img" not in escaped and "&lt;img" in escaped and "PRIVATE_SENTINEL" not in escaped
+    win.close()
+
+
+def test_overview_without_vpn_names_the_home_address_not_a_vpn_server(qapp, demo, tmp_path):
+    """Режим без VPN: карточка не показывает сервер подписки и его замеры как действующие."""
+    client = _client(0, session=False)
+    win = _window(client, tmp_path)
+    win.show()
+    state = demo.state()  # прежние тесты могли выключить VPN в демо-панели
+    state = {**state, "updated": state["now"],
+             "capture": {**state["capture"], "mode": "on", "lifecycle": "connected"}}
+    win.on_state(state)
+    overview = win.overview
+    assert overview.server_name.text() == "Нидерланды · Амстердам 1"
+    assert overview.head.shown == ("ok", True)  # закрытый замок
+    win.on_state({**state, "zapret2": {
+        "mode": "standalone", "state": "active", "without_vpn": True,
+        "title": "Обработчик готов · без VPN", "detail": "Выбранные домены через zapret2"}})
+    assert overview.server_name.text() == "Домашний адрес" and overview.orb.country == ""
+    assert overview.metrics["speed"].text() == "—"
+    assert overview.power.text() == "Выключить перехват"
+    assert overview.power_sub.text() == "Выбранные домены через zapret2"
+    assert overview.lifecycle.text() == "Прямой интернет без VPN"
+    off = {**state, "capture": {**state["capture"], "mode": "off", "lifecycle": "off"}}
+    win.on_state(off)
+    assert overview.word.text() == "Не защищено" and overview.head.shown == ("bad", False)
+    assert overview.orb.tone == "off" and "выключен" in overview.lifecycle.text()
     win.close()
 
 
