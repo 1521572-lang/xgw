@@ -206,6 +206,8 @@ class OverviewPage(QWidget):
         self.zapret2.setIcon(icon("zapret2", theme.current()["accent"], size=18))
         self.zapret2.setIconSize(QSize(18, 18))
         self.zapret2.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zapret2.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.zapret2.setFixedWidth(CARD_WIDTH[1])
         self.zapret2.setAccessibleName("Состояние и управление zapret2")
         self.zapret2.setToolTip("Открыть раздел zapret2: обход блокировок для выбранных доменов")
         self.zapret2.clicked.connect(lambda: self.main.open_section("zapret2"))
@@ -273,6 +275,7 @@ class OverviewPage(QWidget):
         self.power.setObjectName("connect")
         self.power.setMinimumHeight(46)
         self.power.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.power.clicked.connect(self.main.toggle_power)
         box.addWidget(self.power)
         self.power_why = label("", name="small")
@@ -299,6 +302,7 @@ class OverviewPage(QWidget):
         """Ширины под размер окна и точка карты: страна сервера — в свободной части справа."""
         self.server_panel.setFixedWidth(SERVERS_WIDTH[wide])
         self.card.setFixedWidth(CARD_WIDTH[wide])
+        self.zapret2.setFixedWidth(CARD_WIDTH[wide])
         width, height = self.conn.width(), self.conn.height()
         left = EDGE + CARD_WIDTH[wide]
         self.orb.set_focus(QPointF(left + max(120.0, (width - left) / 2), height * .5 - 16))
@@ -367,6 +371,7 @@ class OverviewPage(QWidget):
         box.addWidget(self.hidden)
         self.all_servers = QPushButton("Все серверы и замеры")
         self.all_servers.setAccessibleName("Открыть раздел «Серверы»")
+        self.all_servers.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.all_servers.clicked.connect(lambda: self.main.open_section("servers"))
         box.addWidget(self.all_servers)
         box.addStretch(1)

@@ -34,6 +34,14 @@ def test_devices_keep_fixed_exclusions_and_unavailable_routes_visible():
     assert listing.devices(state) == []
 
 
+def test_traffic_names_servers_that_left_the_list_instead_of_a_question_mark():
+    data = json.loads((FIXTURES / "traffic-work.json").read_text(encoding="utf-8"))
+    data["subscriptions"] = [{"name": "?", "down": 5 << 20, "up": 1 << 20, "billed": 6 << 20},
+                             {"name": "main", "down": 1, "up": 1, "billed": 2}]
+    names = [row.name for row in listing.traffic_report(data, 7).exits]
+    assert names[:2] == ["Серверы, которых уже нет в списке", "main"] and "?" not in names
+
+
 def test_traffic_report_uses_backend_totals_and_distinguishes_quota_from_bytes():
     data = json.loads((FIXTURES / "traffic-work.json").read_text(encoding="utf-8"))
     empty = listing.traffic_report(data, 7)

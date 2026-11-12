@@ -175,6 +175,15 @@ def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_
     assert win.nav.wide and win.nav.buttons[0].toolTip() == ""
     win.nav.buttons[3].click()
     assert win.stack.currentWidget() is win.devices
+    # Страница разошлась с отмеченным разделом — щелчок по нему всё равно её открывает.
+    win.stack.setCurrentWidget(win.traffic)
+    win.nav.buttons[3].click()
+    assert win.stack.currentWidget() is win.devices
+    # Щелчок мышью не оставляет рамку фокуса на строке и кнопках «Обзора».
+    tab_only = window.Qt.FocusPolicy.TabFocus
+    assert all(widget.focusPolicy() == tab_only for widget in (
+        overview.zapret2, overview.power, overview.all_servers, overview.members.rows[0]))
+    assert overview.zapret2.width() == overview.card.width()
     win.nav.setCurrentRow(0)
     rows = overview.members.visible_rows()
     assert len(rows) == 5 and rows[0].is_main and not any(r.is_main for r in rows[1:])

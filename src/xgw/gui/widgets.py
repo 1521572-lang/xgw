@@ -117,9 +117,9 @@ class DetailsFrame(QFrame):
 
     def set_details(self, content: str) -> None:
         self.detail_html = content
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # мышью — без рамки фокуса
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        tip(self, "Нажмите или нажмите Enter, чтобы открыть сведения о сервере")
+        tip(self, "Щелчок или Enter — сведения о сервере")
         for child in self.findChildren(QLabel):
             child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
@@ -406,7 +406,7 @@ class NavRail(QWidget):
             self.box.addWidget(button)
             self.buttons.append(button)
         self.box.addStretch(1)
-        self.group.idClicked.connect(self.setCurrentRow)
+        self.group.idClicked.connect(self._clicked)
         self._row = -1
 
     def _button(self, title: str) -> QToolButton:
@@ -443,6 +443,13 @@ class NavRail(QWidget):
     def currentRow(self) -> int:
         return self._row
 
+    def _clicked(self, row: int) -> None:
+        """Нажатие сообщает раздел всегда, даже уже отмеченный: окно сверяет с ним
+        страницу (отчёт gui-proton: раз подсветка сменилась, а раздел — нет)."""
+        self.buttons[row].setChecked(True)
+        self._row = row
+        self.currentRowChanged.emit(row)
+
     def setCurrentRow(self, row: int) -> None:
         if not 0 <= row < len(self.buttons):
             return
@@ -478,6 +485,7 @@ class ShieldOrb(QWidget):
     (кэш): подписи поверх неё обновляются каждую секунду и не должны пересчитывать контуры."""
 
     MARK = 15.0  # радиус отметки страны
+    AURA = 132.0  # высота свечения: карточка подключения начинается ниже его яркой части
 
     def __init__(self) -> None:
         super().__init__()
@@ -538,10 +546,10 @@ class ShieldOrb(QWidget):
                               "accent" if self.tone == "busy" else self.tone])
         painter.save()
         painter.translate(width * .5, 0)
-        painter.scale(1.0, .5)
         reach = max(width * .62, 320.0)
+        painter.scale(1.0, self.AURA / reach)
         aura = QRadialGradient(QPointF(0, 0), reach)
-        for at, alpha in ((0.0, 92), (.45, 40), (1.0, 0)):
+        for at, alpha in ((0.0, 96), (.4, 46), (.72, 12), (1.0, 0)):
             shade.setAlpha(alpha if self.tone != "off" else alpha * 2 // 3)
             aura.setColorAt(at, QColor(shade))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -722,7 +730,7 @@ class FeatureTile(QFrame):
         box = QVBoxLayout(self)
         box.setContentsMargins(14, 10, 14, 11)
         box.setSpacing(3)
-        box.addWidget(label(title.upper(), name="metricTitle", wrap=False))
+        box.addWidget(label(title.upper(), name="tileTitle", wrap=False))
         self.value = label("—", name="tileValue")
         self.value.setAccessibleName(title)
         self.value.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)

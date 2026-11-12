@@ -733,7 +733,10 @@ def traffic_report(data: dict, days: int) -> TrafficReport:
                       f"{size(quota['used'])} из {size(quota['total'])}")
             if quota.get("expire"):
                 detail += " · до " + time.strftime("%d.%m.%Y", time.localtime(quota["expire"]))
-        exits.append(row(source_name(item["name"]), item, detail))
+        # «?» — учёт не нашёл сервер в текущем списке (usage.py): его уже убрали.
+        name = ("Серверы, которых уже нет в списке" if item["name"] == "?"
+                else source_name(item["name"]))
+        exits.append(row(name, item, detail))
     pool = data["pool"]
     if pool["up"] or pool["down"]:
         exits.append(row("Бесплатные серверы", pool))

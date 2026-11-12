@@ -141,6 +141,8 @@ QLabel#rowSpeed {{ font-size: 10pt; font-weight: 600; }}
 QLabel#metricValue {{ font-size: 15pt; font-weight: 700; }}
 QLabel#metricTitle, QLabel#section {{ color: {c['muted']}; font-size: 8.5pt; font-weight: 700; }}
 QLabel#cardTitle {{ font-weight: 600; font-size: 11pt; }}
+QLabel#tileTitle {{ color: {mix(c['muted'], c['text'], 0.55)}; font-size: 9pt;
+    font-weight: 700; }}
 QLabel#tileValue {{ font-weight: 600; font-size: 10pt; }}
 QLabel#small {{ color: {c['muted']}; font-size: 9.5pt; }}
 QLabel#muted, QLabel[role="muted"] {{ color: {c['muted']}; }}
@@ -205,11 +207,20 @@ QLineEdit, QPlainTextEdit, QComboBox {{ background: {c['surface']}; color: {c['t
     selection-background-color: {c['accent']}; selection-color: {c['accent_text']}; }}
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border: 1px solid {c['focus']}; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
-QProgressBar {{ background: {c['surface2']}; border: none; border-radius: 3px; }}
+QProgressBar {{ background: {mix(c['off'], c['surface'], 0.34)}; border: none;
+    border-radius: 3px; }}
 QProgressBar::chunk {{ background: {c['ok']}; border-radius: 3px; }}
 QProgressBar[tone="warn"]::chunk {{ background: {c['warn']}; }}
 QProgressBar[tone="bad"]::chunk {{ background: {c['bad']}; }}
 QTextBrowser#serverDetails {{ background: {c["surface"]}; border: none; }}
+QTreeWidget {{ background: {c['surface']}; border: 1px solid {c['border']};
+    border-radius: 12px; padding: 6px;
+    alternate-background-color: {mix(c['surface2'], c['surface'], 0.45)}; outline: 0; }}
+QTreeWidget::item {{ padding: 6px 4px; border: none; }}
+QTreeWidget::item:selected {{ background: {c['selected']}; color: {c['text']}; }}
+QHeaderView::section {{ background: {c['surface']}; color: {c['muted']}; border: none;
+    border-bottom: 1px solid {c['border']}; padding: 6px 8px; font-size: 8.5pt;
+    font-weight: 700; }}
 QDialog, QMessageBox {{ background: {c['surface']}; }}
 QMenu {{ background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 8px;
     padding: 6px; }}
