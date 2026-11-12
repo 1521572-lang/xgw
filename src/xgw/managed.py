@@ -172,8 +172,10 @@ def zapret2_settings(value: object) -> dict:
     """Только параметры режима из окна. Пути к исполняемым файлам менять нельзя."""
     if not isinstance(value, dict) or set(value) - {"mode", "strategy", "domains", "probe_urls"}:
         raise ManagedError("Неизвестные настройки zapret2")
+    from . import zapret2  # имена стратегий — из одного места (zapret2.STRATEGIES)
+
     for key, choices in (("mode", ("off", "compare", "selective", "standalone")),
-                         ("strategy", ("multisplit", "multidisorder"))):
+                         ("strategy", tuple(zapret2.STRATEGIES))):
         if key in value and value[key] not in choices:
             raise ManagedError("Недопустимый режим или стратегия zapret2")
     for key, count, length in (("domains", 64, 260), ("probe_urls", 4, 8192)):

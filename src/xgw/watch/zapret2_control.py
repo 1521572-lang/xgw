@@ -141,6 +141,7 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool) -> dict:
                       "Для новой попытки выключите режим zapret2 и включите заново.")
     return {
         "mode": cfg.zapret2.mode, "strategy": cfg.zapret2.strategy,
+        "strategies": list(zapret2.STRATEGIES),
         "domains": list(cfg.zapret2.domains), "probe_count": len(cfg.zapret2.probe_urls),
         "config_key": key, "state": state, "title": title,
         "without_vpn": bool(raw.get("without_vpn")) if fresh else False,

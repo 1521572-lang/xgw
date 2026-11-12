@@ -423,11 +423,14 @@ mode = "off" # standalone — zapret2 без VPN; selective — домены с 
 # standalone: выбранные домены через nfqws2, остальные напрямую; VPN-сервер не нужен.
 # Требуется capture.fail_mode = "closed". probe_urls для standalone не используются.
 # compare — разовое сравнение двух probe_urls на служебных входах; клиенты остаются на VPN
-domains = ["domain:youtube.com", "domain:googlevideo.com",
-           "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
+domains = ["domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com", "domain:ggpht.com",
+           "domain:youtubei.googleapis.com", "domain:youtube.googleapis.com",
+           "domain:youtubeembeddedplayer.googleapis.com", "domain:jnn-pa.googleapis.com",
+           "domain:youtube-nocookie.com", "domain:youtu.be"]
 binary = "/opt/xgw/zapret2/1.0.7/nfqws2"
 lua_dir = "/opt/xgw/zapret2/1.0.7/lua"
-strategy = "multisplit" # также multidisorder; результат зависит от провайдера
+# Также multidisorder, fake_md5, fake_seq, fake_ts, fakedsplit_md5, hostfakesplit_md5, seqovl.
+strategy = "multisplit" # результат зависит от провайдера; compare — только первые две
 queue_num = 200
 probe_port = 19999
 probe_urls = [] # только для selective/compare: HTTPS-страница и HTTPS-файл видеосети

@@ -446,3 +446,43 @@ def test_runtime_tells_starting_from_dead_and_describes_unit_safely(monkeypatch)
     assert text == "ActiveState=active SubState=running Result=success ExecMainStatus=0"
     answers["show"] = "ActiveState=bad value; rm\nResult=exit-code\n"
     assert runtime.describe() == "Result=exit-code"
+
+
+def test_named_strategies_only_emit_known_calls_and_compare_stays_traced(tmp_path):
+    """п. 386: в root-процесс идут только строки из STRATEGIES, не текст настроек."""
+    from xgw import managed
+
+    cfg, _, _ = setup()
+    known = {"multisplit", "multidisorder", "fake", "fakedsplit", "hostfakesplit"}
+    for name, calls in z.STRATEGIES.items():
+        cfg.zapret2.mode, cfg.zapret2.strategy = "selective", name
+        assert not z.validate(cfg)
+        tail = z.arguments(cfg)[-len(calls):]
+        assert tail == [f"--lua-desync={call}" for call in calls]
+        assert all(call.split(":", 1)[0] in known for call in calls)
+        assert all(ch.isalnum() or ch in ":=,_-" for call in calls for ch in call)
+        assert managed.zapret2_settings({"strategy": name}) == {"strategy": name}
+        cfg.zapret2.mode = "compare"
+        assert bool(z.validate(cfg)) == (name not in z.TRACED)
+    assert z.STRATEGIES["multisplit"] == ("multisplit:pos=1,midsld",)
+    with pytest.raises(managed.ManagedError):
+        managed.zapret2_settings({"strategy": "fake:blob=x"})
+
+
+def test_default_domains_cover_what_the_player_page_loads():
+    """Отчёт r4: вне списка картинки и служебные адреса плеера шли напрямую без обработки."""
+    import importlib.util
+    from pathlib import Path
+
+    from xgw.config import Config
+
+    path = Path(__file__).resolve().parents[1] / "docs/helpers/zapret2_strategy_check.py"
+    spec = importlib.util.spec_from_file_location("zapret2_strategy_check", path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    cfg = Config()
+    cfg.zapret2.mode = "standalone"
+    cfg.zapret2.probe_urls = []
+    assert not z.validate(cfg) and len(cfg.zapret2.domains) <= 64
+    outside = [host for host in helper.HOSTS if not z.matches(host, cfg.zapret2.domains)]
+    assert outside == ["www.gstatic.com", "www.google.com"]  # контроль прямого пути

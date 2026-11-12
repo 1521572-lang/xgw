@@ -26,6 +26,20 @@
 `worker_exited`, `worker_down`) и состояние unit пишутся в журнал строками `zapret2: …`:
 `journalctl -u xgw.service | grep 'zapret2:'`. Адресов, доменов и аргументов запуска в них нет.
 
+Стратегия выбирается по имени; аргументы nfqws2 для каждого имени заданы в коде
+(`zapret2.STRATEGIES`), свою строку аргументов задать нельзя:
+
+- `multisplit`, `multidisorder` — ClientHello делится на части (вторая — в обратном порядке);
+- `fake_md5`, `fake_seq`, `fake_ts` — перед настоящим ClientHello уходит ложный, который сервер
+  отбрасывает (TCP MD5, номер вне окна, старая метка времени), затем деление;
+- `fakedsplit_md5`, `hostfakesplit_md5` — ложные части вокруг деления или вокруг имени сервера;
+- `seqovl` — деление с перекрытием номеров последовательности.
+
+Какая из них проходит, зависит от провайдера и меняется со временем; подбирают на своей линии
+настоящим роликом. Сравнение с VPN (`compare`) умеет только первые две. Страница ролика
+открывает не только youtube.com и видеосеть: картинки и служебные адреса плеера тоже должны
+быть в `domains`, иначе они идут напрямую без обработки.
+
 Выбор самостоятельного режима включает настроенный перехват и прерывает прежние VPN-соединения.
 Правила VPN для устройств, бесплатного пула и видео приостановлены. Настройки сохраняются
 для возврата. Разгрузка прямых IP в ядро временно не применяется, чтобы выбранные домены
@@ -88,11 +102,13 @@ XGW выполняет последнюю до запуска своего вр�
 ```toml
 [zapret2]
 mode = "off"                     # selective — включить после подготовки
-domains = ["domain:youtube.com", "domain:googlevideo.com",
-           "domain:youtubei.googleapis.com", "domain:youtube-nocookie.com"]
+domains = ["domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com", "domain:ggpht.com",
+           "domain:youtubei.googleapis.com", "domain:youtube.googleapis.com",
+           "domain:youtubeembeddedplayer.googleapis.com", "domain:jnn-pa.googleapis.com",
+           "domain:youtube-nocookie.com", "domain:youtu.be"]
 binary = "/opt/zapret2/nfqws2"
 lua_dir = "/opt/zapret2/lua"
-strategy = "multisplit"           # также multidisorder; универсальной стратегии нет
+strategy = "multisplit"           # набор — ниже; универсальной стратегии нет
 queue_num = 200                   # свободная NFQUEUE; чужая очередь не захватывается
 probe_port = 19999                # свободный служебный HTTP-вход на loopback, с паролем
 probe_urls = []                   # HTTPS-страница YouTube и HTTPS-файл видеосети

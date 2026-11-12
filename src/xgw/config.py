@@ -361,9 +361,13 @@ class Zapret2:
     """Прямой выход выбранных HTTPS-доменов: самостоятельно или с возвратом на VPN."""
 
     mode: str = "off"
+    # Плееру YouTube нужны не только страница и видеосеть: картинки (ytimg, ggpht) и
+    # служебные адреса плеера. Вне списка они шли бы напрямую без обработки (отчёт r4, п. 386).
     domains: list[str] = field(default_factory=lambda: [
-        "domain:youtube.com", "domain:googlevideo.com", "domain:youtubei.googleapis.com",
-        "domain:youtube-nocookie.com",
+        "domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com", "domain:ggpht.com",
+        "domain:youtubei.googleapis.com", "domain:youtube.googleapis.com",
+        "domain:youtubeembeddedplayer.googleapis.com", "domain:jnn-pa.googleapis.com",
+        "domain:youtube-nocookie.com", "domain:youtu.be",
     ])
     binary: str = "/opt/xgw/zapret2/1.0.7/nfqws2"
     lua_dir: str = "/opt/xgw/zapret2/1.0.7/lua"

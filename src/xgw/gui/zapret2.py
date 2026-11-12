@@ -69,9 +69,11 @@ class SettingsDialog(QDialog):
         form.addRow("Домены", self.domains)
         box.addWidget(plain("Формат доменов — domain:имя или full:имя, по одному на строку."))
         self.strategy = QComboBox()
-        self.strategy.addItems(["multisplit", "multidisorder"])
+        self.strategy.addItems(view.get("strategies") or ["multisplit", "multidisorder"])
         self.strategy.setCurrentText(view.get("strategy", "multisplit"))
         form.addRow("Стратегия", self.strategy)
+        self.strategy.setToolTip("Какая стратегия проходит, зависит от провайдера. Сравнение "
+                                 "с VPN умеет только multisplit и multidisorder.")
         self.urls = []
         for title in ("HTTPS-страница", "HTTPS-файл видео"):
             field = QLineEdit()

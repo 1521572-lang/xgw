@@ -46,6 +46,25 @@ REDIRECT_LIMIT = 5
 # домены закрыты, а демон шагает каждые START_POLL секунд (отчёт standalone r3, п. 385).
 START_WAIT = 20.0
 START_POLL = 2.0
+# Стратегии: имя из настроек → вызовы --lua-desync встроенной zapret-antidpi.lua (v1.0.7).
+# В root-процесс попадают только эти строки, не текст из настроек. Первые две — простое
+# деление ClientHello; остальные добавляют ложный ClientHello или ложные части, которые
+# сервер отбрасывает (TCP MD5, номер вне окна, старая метка времени), либо перекрытие
+# номеров (seqovl). Ложный ClientHello — встроенный blob nfqws2, чужих имён XGW не добавляет.
+# Что из этого проходит у провайдера, показывает только прогон на машине (п. 386).
+_SPLIT = "pos=1,midsld"
+_FAKE = "fake:blob=fake_default_tls:{}:repeats=2:tls_mod=rnd,dupsid"
+STRATEGIES: dict[str, tuple[str, ...]] = {
+    "multisplit": (f"multisplit:{_SPLIT}",),
+    "multidisorder": (f"multidisorder:{_SPLIT}",),
+    "fake_md5": (_FAKE.format("tcp_md5"), f"multidisorder:{_SPLIT}"),
+    "fake_seq": (_FAKE.format("tcp_seq=-10000"), f"multidisorder:{_SPLIT}"),
+    "fake_ts": (_FAKE.format("tcp_ts=-600000"), f"multisplit:{_SPLIT}"),
+    "fakedsplit_md5": ("fakedsplit:pos=midsld:tcp_md5",),
+    "hostfakesplit_md5": ("hostfakesplit:midhost=midsld:tcp_md5",),
+    "seqovl": ("multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls",),
+}
+TRACED = ("multisplit", "multidisorder")  # compare (xgw_trace) наблюдает только их
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
@@ -109,8 +128,10 @@ def validate(cfg: Config) -> list[str]:
         problems.append("mode: ожидается off, selective, compare или standalone")
     if not z.domains or any(not _DOMAIN.fullmatch(d) for d in z.domains):
         problems.append("domains: нужны domain:имя или full:имя")
-    if z.strategy not in ("multisplit", "multidisorder"):
-        problems.append("strategy: ожидается multisplit или multidisorder")
+    if z.strategy not in STRATEGIES:
+        problems.append("strategy: ожидается одно из " + ", ".join(STRATEGIES))
+    elif z.mode == "compare" and z.strategy not in TRACED:
+        problems.append("compare сравнивает только strategy multisplit или multidisorder")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
         problems.append("queue_num или probe_port вне допустимого диапазона")
     if z.probe_port in (cfg.capture.tproxy_port, cfg.xray.metrics_port, cfg.xray.socks_port,
@@ -293,12 +314,12 @@ def arguments(cfg: Config) -> list[str]:
     args = [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
             f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
-    strategy = z.strategy
+    calls = STRATEGIES[z.strategy]
     if z.mode == "compare":
         args += ["--debug=0", "--lua-init=" + LUA]
-        strategy = "xgw_trace:strategy=" + strategy
+        calls = (f"xgw_trace:strategy={z.strategy}:{_SPLIT}",)
     return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",
-            f"--lua-desync={strategy}:pos=1,midsld"]
+            *[f"--lua-desync={call}" for call in calls]]
 
 
 class Runtime:
