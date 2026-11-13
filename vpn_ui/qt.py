@@ -4,7 +4,11 @@
 подмножестве обеих (полные имена перечислений, `exec()`, `Signal`/`Slot`/`Property` отсюда).
 """
 
+import os
+
 try:
+    if os.environ.get("XGW_UI_QT") == "PyQt6":
+        raise ImportError("XGW native pages use PyQt6")
     from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
     from PySide6.QtCore import Property, Signal, Slot
 

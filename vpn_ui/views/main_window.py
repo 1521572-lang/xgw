@@ -117,6 +117,12 @@ class SizeGrip(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QWidget):
     """`use_custom_titlebar=True` — окно без системной рамки со своей шапкой."""
 
+    sidebar_type = SidebarView
+    card_type = ConnectionCardView
+    details_type = SessionDetailsView
+    widgets_type = WidgetBar
+    drawer_type = SettingsDrawerView
+
     def __init__(self, bridge: VpnUiBridge | None = None, *, use_custom_titlebar: bool = True,
                  title: str = "XGW VPN", theme_name: str | None = None,
                  parent: QtWidgets.QWidget | None = None) -> None:
@@ -138,10 +144,10 @@ class MainWindow(QtWidgets.QWidget):
         self.map = MapCanvasView(self)
         self.map.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.titlebar = CustomTitleBar(title, native=not use_custom_titlebar, parent=self)
-        self.card = ConnectionCardView(self.bridge, self)
-        self.details = SessionDetailsView(self.bridge, self)
+        self.card = self.card_type(self.bridge, self)
+        self.details = self.details_type(self.bridge, self)
         self.details.setMaximumWidth(Metrics.CONTENT_MAX)
-        self.widgets = WidgetBar(self.bridge, self)
+        self.widgets = self.widgets_type(self.bridge, self)
         self.sidebar_slot = QtWidgets.QWidget(self)
         self.sidebar_slot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
@@ -162,11 +168,11 @@ class MainWindow(QtWidgets.QWidget):
         outer.addWidget(self.titlebar)
         outer.addLayout(self.grid, 1)
 
-        self.sidebar = SidebarView(self.bridge, self)
+        self.sidebar = self.sidebar_type(self.bridge, self)
         self.grip = SizeGrip(self)
         self.backdrop = Backdrop(self)
         self.backdrop.hide()
-        self.drawer = SettingsDrawerView(self.bridge, self)
+        self.drawer = self.drawer_type(self.bridge, self)
         self.drawer.hide()
         self._slide = QtCore.QPropertyAnimation(self.drawer, b"pos", self)
         self._slide.setDuration(180)
