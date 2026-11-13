@@ -309,6 +309,14 @@ class Netcheck:
         return [Check(item.name, item.level, masking.mask_text(item.text),
                       masking.mask_text(item.advice)) for item in result]
 
+    def _stun_servers(self) -> list[tuple[str, int]]:
+        servers = []
+        for endpoint in self.cfg.network.stun_servers:
+            host, separator, port = endpoint.rpartition(":")
+            if separator and port.isdigit():
+                servers.append((host.strip("[]"), int(port)))
+        return servers
+
     def _server(self) -> tuple[dict | None, str]:
         server = main_server(self.paths)
         return server, f"«{server.get('name') or server.get('tag')}»" if server else ""
@@ -352,7 +360,7 @@ class Netcheck:
         name = "UDP напрямую"
         if self.net.mark is None:
             return [Check(name, OK, "не проверен: нужна метка мимо VPN — запустите через sudo")]
-        if any(self.net.stun(host, port) for host, port in STUN_SERVERS):
+        if any(self.net.stun(host, port) for host, port in self._stun_servers()):
             return [Check(name, OK, "провайдер пропускает UDP: STUN-сервер ответил напрямую")]
         count = quic_servers(self.paths)
         yours = f" (у вас их {count})" if count else ""
@@ -369,7 +377,7 @@ class Netcheck:
                           "что с Xray, покажет sudo xgw diag")]
         _server, label = self._server()
         via = f"сервер {label}" if label else "сервер"
-        if any(self.net.stun_via_xray(host, port) for host, port in STUN_SERVERS):
+        if any(self.net.stun_via_xray(host, port) for host, port in self._stun_servers()):
             return [Check(name, OK, f"UDP идёт через {via}: STUN-сервер ответил через Xray")]
         return [Check(
             name, WARN,

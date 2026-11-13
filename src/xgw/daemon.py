@@ -34,7 +34,7 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import cores, cost, engine, fetch, log, managed, priority, rating, usage, zapret2
+from . import cores, cost, engine, fetch, log, managed, nfqws2, priority, rating, usage, zapret2
 from . import pin as pinning
 from . import tailscale as ts
 from .apply.applier import ApplyOutcome, in_restart_window
@@ -179,12 +179,12 @@ SPEED_SCAN_WAIT = 600.0
 PROMOTE_WAIT = 3600.0
 # Профили обхода (generator/profiles.py, fragment.mode = "auto"). Запасной, который не отвечает
 # так, как не отвечают при блокировке ТСПУ, проверяется в других профилях по лестнице: Xray с
-# дроблением ClientHello, обычный sing-box (0.1.13), sing-box с дроблением TLS, sing-box с
-# мультиплексированием и паддингом (при «заморозке»). Помогло — профиль закрепляется, нет —
-# возвращается прежний, а следующая попытка для этого сервера — не раньше PROFILE_RETRY. Сервер
-# на обученном профиле, который отвечает, раз в PROFILE_RECHECK пробуется на базовом: профили
-# тяжелее (дробление удлиняет рукопожатие, мост к sing-box — лишнее звено), и, если провайдер
-# перестал блокировать, они лишние.
+# дроблением ClientHello, ступени nfqws2 при доступном движке, обычный sing-box (0.1.13), sing-box
+# с дроблением TLS, sing-box с мультиплексированием и паддингом (при «заморозке»). Помогло —
+# профиль закрепляется, нет — возвращается прежний, а следующая попытка для этого сервера — не
+# раньше PROFILE_RETRY. Сервер на обученном профиле, который отвечает, раз в PROFILE_RECHECK
+# пробуется на базовом: профили тяжелее (дробление удлиняет рукопожатие, внешний движок или мост
+# к sing-box — лишнее звено), и, если провайдер перестал блокировать, они лишние.
 PROFILE_RETRY = 6 * 3600.0
 PROFILE_RECHECK = 24 * 3600.0
 # Фаза отказа (анти-ТСПУ 2.0). Через Xray проба не отличает «адрес сервера закрыт» (SYN без
@@ -789,6 +789,8 @@ class Daemon:
         self._media_verified: tuple[str, ...] = ()
         self._media_view: dict = {"state": "off"}
         self._zapret2 = zapret2.Controller(self.store)
+        self._nfqws2 = nfqws2.Controller()
+        self._nfq_view: dict = {}
         self._media_spent: dict[str, int] | None = None  # суточный расход (_media_budget)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
         self._rtt: dict[str, dict] | None = None  # сетевая задержка серверов (_rtts)
@@ -984,6 +986,8 @@ class Daemon:
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
         with contextlib.suppress(OSError, cmd.CommandError):
             self._zapret2.close()
+        with contextlib.suppress(OSError, cmd.CommandError):
+            self._nfqws2.close()
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
@@ -1534,6 +1538,7 @@ class Daemon:
         waiting = self._capture_waits()
         if not waiting:
             self._guard_capture(signals.xray_ok, now)
+        self._nfq_step(view)
         if self.stopping:
             # Правила и Xray согласованы: правила, которым нужен новый inbound, загрузятся
             # после применения конфига, а его начнёт уже следующий запуск демона.
@@ -2375,6 +2380,17 @@ class Daemon:
         except Exception as exc:  # сбой сети не должен ронять шаг watchdog
             self.log.debug("состояние перехвата не прочитано: %s", exc)
             return False
+
+    def _nfq_step(self, view: list[NodeInfo]) -> None:
+        active = bool(self.capture_info and self.capture_info.get("mode") == "on")
+        self._nfqws2.step(
+            self.cfg, [info.profile for info in view], active=active,
+        )
+        if self.capture_info is not None:
+            self.capture_info["nfqws2"] = dict(self._nfqws2.view)
+        if self._nfqws2.view != self._nfq_view:
+            self._nfq_view = dict(self._nfqws2.view)
+            self.log.info("nfqws2: %s", self._nfq_view)
 
     def _guard_capture(self, xray_ok: bool, now: float, *, switched: bool = False) -> None:
         """Следит за правилами перехвата: возвращает пропавшие, а при
@@ -4916,9 +4932,9 @@ class Daemon:
     # --- эскалация у серверов в работе (ТЗ R1) -------------------------------------
 
     def _escalation_steps(self, info: NodeInfo, verdict: str) -> list[str]:
-        """Ступени дробления в Xray, которые стоит проверить участнику с таким вердиктом
-        (лестница profiles.ladder без sing-box: ядро у сервера в работе на ходу не меняется).
-        Пусто — пробовать нечего: дробление выключено, сервер не на Xray, не TLS/REALITY."""
+        """Ступени обхода для участника с таким вердиктом: дробление Xray и, если доступен,
+        nfqws2. Лестница profiles.ladder без sing-box: ядро у сервера в работе на ходу не меняется.
+        Пусто — пробовать нечего: автообход выключен, сервер не на Xray, не TLS/REALITY."""
         if self.cfg.fragment.mode != "auto" or self.inventory is None:
             return []
         if profiling.core_of(info.profile) != "xray":
@@ -4931,7 +4947,6 @@ class Daemon:
         return self._remembered(node, [
             step for step in profiling.ladder(verdict, info.profile, default, avail)
             if profiling.core_of(step) == "xray" and step != info.profile
-            and (step in profiling.XRAY_FRAGMENTS or info.profile in profiling.XRAY_FRAGMENTS)
         ])
 
     def _remembered(self, node: ServerNode, steps: list[str]) -> list[str]:
@@ -5027,7 +5042,7 @@ class Daemon:
         """Пора ли пробовать сервер на базовом профиле. Дробление в Xray — после
         fragment.calm_probes проверок подряд без сбоя и не раньше fragment.calm_hours (ТЗ R1.3:
         дробление тратит процессор сервера и чуть скорости, держим его только по
-        необходимости); профили sing-box — раз в PROFILE_RECHECK, как до 0.1.18."""
+        необходимости); nfqws2 и sing-box — раз в PROFILE_RECHECK."""
         elapsed = self.wall() - since
         if elapsed < 0:  # отметка из будущего (часы ушли назад): отсчёт — с сейчас
             self._profile_switched[fingerprint] = self.wall()
@@ -5042,14 +5057,14 @@ class Daemon:
     def _member_note(
         self, info: NodeInfo, verdict: str, view: list[NodeInfo] | None = None,
     ) -> bool:
-        """Итог собственной пробы участника. True — участник на пробе дробления (замена ждёт).
+        """Итог собственной пробы участника. True — участник на пробе обхода (замена ждёт).
 
         Отказал он один, а другие участники работают, и есть проверенный запасной — замена
-        сразу (анти-ТСПУ 2.0): трафик не ждёт ступеней дробления, а обход проверяется на нём,
+        сразу (анти-ТСПУ 2.0): трафик не ждёт ступеней обхода, а профили проверяются на нём,
         когда он станет запасным (_profile_note). Отказали больше половины участников —
-        глушение по всей сети, замена не поможет: участник проверяется на ступенях дробления в
-        Xray на месте (ТЗ R1, 0.1.18), заменяют его, только если не ответил и там. Отказ при
-        закрытом адресе (TCP напрямую не открывается) — замена сразу: обход не поможет."""
+        глушение по всей сети, замена не поможет: участник проверяется на ступенях Xray и nfqws2
+        на месте (ТЗ R1, 0.1.18), заменяют его, только если не ответил и там. Отказ при закрытом
+        адресе (TCP напрямую не открывается) — замена сразу: обход не поможет."""
         node = self._node(info)
         if self.cfg.fragment.mode != "auto" or node is None:
             return False

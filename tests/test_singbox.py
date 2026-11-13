@@ -68,7 +68,7 @@ def test_fragment_variant_cuts_the_hello_and_waits_less_than_the_default():
     assert fragment["fragment_fallback_delay"] == singbox.FRAGMENT_DELAY
     mux = outbounds[singbox.tag_out(node.fingerprint, "m")]
     assert mux["multiplex"] == {"enabled": True, "protocol": "h2mux", "padding": True}
-    assert mux["tls"]["record_fragment"] is True and "fragment" not in mux["tls"]
+    assert mux["tls"]["record_fragment"] is True and mux["tls"]["fragment"] is True
     default = outbounds[singbox.tag_out(node.fingerprint, "d")]
     assert "fragment" not in default["tls"] and "multiplex" not in default
 

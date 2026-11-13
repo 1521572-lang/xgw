@@ -384,6 +384,12 @@
       },
       {
         "type": "field",
+        "network": "tcp",
+        "port": "2053,2083,2087,2096,8443",
+        "balancerTag": "auto"
+      },
+      {
+        "type": "field",
         "network": "tcp,udp",
         "balancerTag": "auto"
       }

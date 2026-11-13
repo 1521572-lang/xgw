@@ -121,11 +121,10 @@ def _variant(spec, letter: str, fingerprint: str) -> tuple[list[dict], bool]:
     if letter in ("f", "m"):
         for tls in _tls_blocks(type(spec)(main=main, endpoint=spec.endpoint, extra=extras)):
             tls["record_fragment"] = True
-            if letter == "f":
-                tls["fragment"] = True
-                # По умолчанию sing-box ждёт между сегментами 500 мс, и рукопожатие тянулось бы
-                # полсекунды; Xray-дробление ждёт 10–20 мс (generator/fragment.py).
-                tls["fragment_fallback_delay"] = FRAGMENT_DELAY
+            tls["fragment"] = True
+            # По умолчанию sing-box ждёт между сегментами 500 мс, и рукопожатие тянулось бы
+            # полсекунды; Xray-дробление ждёт 5–15 мс (generator/fragment.py).
+            tls["fragment_fallback_delay"] = FRAGMENT_DELAY
     if letter == "m":
         main["multiplex"] = {"enabled": True, "protocol": "h2mux", "padding": True}
     main["tag"] = tag_out(fingerprint, letter)

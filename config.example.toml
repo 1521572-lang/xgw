@@ -37,10 +37,17 @@ disable_sleep = true
 # TCP BBR для соединений этой машины (в том числе с серверами VPN): быстрее на канале с
 # потерями и большой задержкой. Прежний алгоритм возвращают `xgw net down` и удаление.
 tcp_bbr = true
-# QUIC (HTTP/3, UDP/443) устройств сети и самой машины отбивается сразу: браузеры уходят на
-# TCP/443, где действует дробление ClientHello (QUIC дробление не берёт). Соединения шлюза с
-# серверами VPN (в том числе hysteria2 на UDP/443), Tailscale и локальные сети не трогаются.
+# Совместимость: если quic_mode пуст, true означает reject, false — proxy.
 block_quic = true
+# reject — отбивать QUIC, чтобы браузер ушёл на TCP; noise — пропускать UDP/443, Discord Voice
+# и STUN через freedom direct-noise с decoy-пакетами; proxy — обычная маршрутизация без decoy.
+quic_mode = ""
+# Для noise: 2–4 decoy-пакета перед полезным UDP, случайная длина и задержка каждого.
+noise_count = 3
+noise_packet = "64-1200"
+noise_delay = "5-15"
+# STUN для проверки UDP и fake-профилей nfqws2: "имя:порт" или "адрес:порт".
+stun_servers = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
 
 [capture]
 # Перехватывать трафик Wi-Fi-сети. Если и lan, и local выключены, XGW только
@@ -61,6 +68,13 @@ hold = "block"
 forward_icmp = true
 # Сети мимо Xray, например личный кабинет провайдера.
 exclude_cidrs = []
+# Базовые частные и служебные сети мимо перехвата и NFQUEUE. Loopback сохраняется всегда.
+reserved_cidrs = [
+  "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+  "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "224.0.0.0/4",
+  "240.0.0.0/4", "255.255.255.255/32",
+  "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+]
 tproxy_port = 12345
 mark_proxy = 1   # «в Xray»
 mark_bypass = 2  # «мимо перехвата» (сокеты Xray и прямые запросы XGW)
@@ -257,18 +271,18 @@ youtube_minutes = 30
 # Дробление ClientHello — обход фильтра, который блокирует соединение по имени сайта
 # (SNI): первая запись TLS уходит к серверу частями. auto — шлюз сам включает его
 # серверу, который без него не отвечает, а с ним отвечает; always — всем серверам с TLS
-# и REALITY; off — никогда. Рукопожатие с дроблением дольше примерно на 0,2 с.
+# и REALITY; off — никогда. Микрофрагменты разрывают SNI и большой Post-Quantum ClientHello.
 mode = "auto"
 # Поля freedom.fragment Xray: что дробить, длина кусков (байт) и пауза между ними (мс).
 # Длина и пауза — диапазоны: у каждого куска своё случайное значение.
 packets = "tlshello"
-length = "100-200"
-interval = "10-20"
+length = "5-20"
+interval = "5-15"
 # Вторая ступень (если первая не помогла): первые TCP-пакеты соединения режутся на сегменты
 # случайной длины, а не ClientHello на записи TLS. split = false — без неё.
 split = true
 split_packets = "1-3"
-split_length = "20-60"
+split_length = "10-30"
 split_interval = "5-10"
 # Сервер на дроблении пробуется без него после calm_probes проверок подряд без сбоя и не
 # раньше calm_hours на дроблении. Больше escalations переводов на обход за escalation_hours —
@@ -309,6 +323,10 @@ kernel_direct = false
 conn_idle_s = 120
 # Выход в эту страну при включённом перехвате = утечка.
 home_country = "RU"
+# Дополнительные HTTPS-порты Cloudflare — через основной балансировщик.
+cloudflare_tcp_ports = ["2053", "2083", "2087", "2096", "8443"]
+# Discord Voice / STUN; при quic_mode = "noise" идут через direct-noise.
+discord_udp_ports = ["19294-19344", "50000-50100"]
 
 [dns]
 # Через балансировщик Xray. Нестандартный порт — "адрес:порт".
@@ -333,6 +351,9 @@ bootstrap_extra = [
   "tls://9.9.9.11",
 ]
 bootstrap_check_minutes = 30
+# auto — UseIPv4 без IPv6-перехвата и PreferIPv4 с ним; можно явно задать
+# UseIPv4, PreferIPv4 или AsIs.
+query_strategy = "auto"
 
 [xray]
 # XGW работает только с Xray-core 26.10.21 — предварительным выпуском, на котором он
@@ -432,3 +453,16 @@ probe_urls = [] # HTTPS-страница YouTube и HTTPS-файл видеос�
 check_seconds = 180
 retry_seconds = 300
 daily_probe_mb = 256
+
+# Универсальный L3/L4-движок для исходов прокси и direct. auto — использовать nfqws2, если
+# найдены исполняемый файл и оба Lua; off — только Xray/sing-box. При mode = selective/compare
+# универсальный движок не запускается: очередь занята проверкой выбранных доменов.
+engine = "auto"
+# Профиль до обучения сканером: seqovl, hostfakesplit или disorder-badseq.
+engine_profile = "seqovl"
+engine_queue = 200
+# Для disorder-badseq временно отключать GRO/GSO/TSO/TX checksum на WAN и восстанавливать после.
+engine_offload = true
+# Пусто — искать .bin рядом с nfqws2 и Lua. TLS/QUIC используют встроенные blob;
+# внешний stun.bin нужен только для STUN fake.
+blob_dir = ""

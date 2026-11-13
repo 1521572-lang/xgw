@@ -79,7 +79,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import geodat, zapret2
+from .. import geodat, nfqws2, zapret2
 from .. import tailscale as ts
 from ..config import Config
 from . import lan
@@ -189,6 +189,8 @@ class Rules:
     conncheck4: tuple[str, ...] = ()
     conncheck_port: int = 80
     zapret2_queue: int | None = None
+    # Универсальный L3/L4-движок: очередь с bypass и anti-loop по FAKE_MARK.
+    engine_queue: int | None = None
 
     @property
     def ts4(self) -> bool:
@@ -311,8 +313,15 @@ def build_rules(
     if wan_name and not wan_if:
         warnings.append(f"network.wan_if={wan_name!r}: недопустимое имя интерфейса — пропущено")
 
-    networks = [ipaddress.IPv4Network(item) for item in RESERVED4]
-    networks6 = [ipaddress.IPv6Network(item) for item in RESERVED6]
+    networks: list[ipaddress.IPv4Network] = []
+    networks6: list[ipaddress.IPv6Network] = []
+    for item in [*cfg.capture.reserved_cidrs, "127.0.0.0/8", "::1/128"]:
+        try:
+            network = ipaddress.ip_network(item.strip(), strict=False)
+        except ValueError:
+            warnings.append(f"capture.reserved_cidrs: «{item}» — не сеть; пропущено")
+            continue
+        (networks if network.version == 4 else networks6).append(network)
     proxy6 = cfg.network.ipv6_proxy
     for item in cfg.capture.exclude_cidrs:
         try:
@@ -375,7 +384,7 @@ def build_rules(
             ts_exit=tailnet and capture,
             ts_block=tailnet and blocked,
             ts_exit_direct=tuple(cfg.managed.tailscale_direct) if tailnet else (),
-            block_quic=capture and cfg.network.block_quic,
+            block_quic=capture and cfg.network.effective_quic_mode == "reject",
             direct4=direct,
             direct_lan=direct_lan,
             direct_local=direct_local,
@@ -386,6 +395,8 @@ def build_rules(
             conncheck_port=conncheck[1],
             zapret2_queue=(cfg.zapret2.queue_num
                            if cfg.zapret2.probe_enabled else None),
+            engine_queue=(cfg.zapret2.engine_queue if capture and nfqws2.enabled(cfg)
+                          and nfqws2.find_installation(cfg) is not None else None),
         ),
         warnings,
     )
@@ -1060,6 +1071,37 @@ def render6(rules: Rules) -> str:
     return _table("ip6", TABLE6, blocks)
 
 
+def _nfq_blocks(rules: Rules) -> list[list[str]]:
+    if rules.engine_queue is None:
+        return []
+    queue = f"queue num {rules.engine_queue} bypass"
+    common = [
+        "ct state invalid return",
+        "ct direction != original return",
+        f"meta mark & {nfqws2.FAKE_MARK:#x} == {nfqws2.FAKE_MARK:#x} return",
+        "meta l4proto != { tcp, udp } return",
+        'oifname "lo" return',
+        "fib daddr type local return",
+    ]
+    if rules.reserved:
+        common.append("ip daddr { " + ", ".join(rules.reserved) + " } return")
+    if rules.reserved6:
+        common.append("ip6 daddr { " + ", ".join(rules.reserved6) + " } return")
+    output = [
+        *common,
+        f"meta mark {rules.mark_bypass:#x} meta l4proto tcp ct packets <= 8 {queue}",
+        f"meta mark {rules.mark_bypass:#x} meta l4proto udp ct packets <= 4 {queue}",
+    ]
+    if rules.singbox_uid is not None:
+        output += [
+            f"meta skuid {rules.singbox_uid} meta l4proto tcp ct packets <= 8 {queue}",
+            f"meta skuid {rules.singbox_uid} meta l4proto udp ct packets <= 4 {queue}",
+        ]
+    return [_chain(
+        "nfq_output", "type filter hook output priority 90; policy accept;", output
+    )]
+
+
 def render_guard(rules: Rules) -> str:
     """Independent TCP/UDP egress barrier for protected paths, never an authorizer.
 
@@ -1073,7 +1115,7 @@ def render_guard(rules: Rules) -> str:
     in POSTROUTING), and ignores forwarded packets already scoped by forward.
     """
     if not (rules.capture or rules.blocked or rules.containers or rules.ts_exit
-            or rules.zapret2_queue is not None):
+            or rules.zapret2_queue is not None or rules.engine_queue is not None):
         return ""
     reject = ["meta l4proto tcp counter reject with tcp reset",
               "counter reject with icmpx type admin-prohibited"]
@@ -1102,6 +1144,10 @@ def render_guard(rules: Rules) -> str:
                    "ip daddr 127.0.0.0/8 counter drop",
                    f"meta skuid {rules.singbox_uid} ct direction original "
                    "ip6 daddr ::1 counter drop"]
+    if rules.engine_queue is not None:
+        output.append(
+            f"meta mark & {nfqws2.FAKE_MARK:#x} == {nfqws2.FAKE_MARK:#x} accept"
+        )
     if not (rules.capture_local or rules.block_local):
         output.append("meta nfproto ipv4 return")
     if not (rules.capture6 or rules.v6_guard):
@@ -1132,6 +1178,7 @@ def render_guard(rules: Rules) -> str:
     forward.append("return")
     return _table("inet", GUARD, [
         *zapret2.guard_blocks(rules.zapret2_queue),
+        *_nfq_blocks(rules),
         _chain("pass", "", common),
         _chain("transit", "", ["jump pass", *reject]),
         _chain("output", "type filter hook postrouting priority 10; policy accept;", output),

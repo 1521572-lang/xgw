@@ -89,8 +89,8 @@ def validate(cfg: Config) -> list[str]:
         problems.append("для YouTube нужны вместе youtube.com и googlevideo.com")
     if z.probe_enabled and cfg.routing.proxy_domains:
         problems.append("первая версия требует общего маршрута через VPN (proxy_domains пуст)")
-    if z.probe_enabled and not cfg.network.block_quic:
-        problems.append("для общего выхода страницы и видео требуется network.block_quic = true")
+    if z.probe_enabled and cfg.network.effective_quic_mode != "reject":
+        problems.append("для общего выхода страницы и видео требуется network.quic_mode = reject")
     for mark in (cfg.capture.mark_proxy, cfg.capture.mark_bypass, cfg.capture.mark_containers):
         if mark & (MARK | FAKE_BIT):
             problems.append("метки capture пересекаются с зарезервированными битами zapret2")

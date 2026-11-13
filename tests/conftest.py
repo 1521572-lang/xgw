@@ -50,6 +50,12 @@ def _no_panel(monkeypatch):
     monkeypatch.setattr("xgw.cli._sync_panel", lambda panel, *args, **kwargs: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_nfqws2(monkeypatch):
+    """Универсальный движок включают только его тесты с поддельным runtime."""
+    monkeypatch.setattr("xgw.nfqws2.find_installation", lambda cfg: None)
+
+
 @pytest.fixture(scope="session")
 def _empty_sys_net(tmp_path_factory) -> Path:
     return tmp_path_factory.mktemp("sys-class-net")

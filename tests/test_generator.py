@@ -321,7 +321,7 @@ def test_ipv6_proxy_adds_a_second_tproxy_inbound_and_answers_aaaa():
     dns_rule = next(r for r in config["routing"]["rules"] if r.get("port") == "53")
     assert dns_rule["inboundTag"] == ["tproxy-in", "tproxy-in6"]
     # Приложения получают AAAA, а прямые подключения умеют ходить по IPv6.
-    assert config["dns"]["queryStrategy"] == "UseIP"
+    assert config["dns"]["queryStrategy"] == "PreferIPv4"
     direct = next(o for o in config["outbounds"] if o["tag"] == "direct")
     assert direct["settings"]["domainStrategy"] == "UseIP"
     # Серверы подписки по имени по-прежнему ищутся по IPv4: у них своя стратегия.
@@ -383,7 +383,7 @@ def test_ipv6_over_tun_needs_no_second_inbound():
     cfg.network.ipv6 = "proxy"
     config = _v6_build(cfg, ipv6=True)
     assert _tags(config) == ["tun-in", "tproxy-in"]  # tproxy-in6 не нужен: TUN несёт оба семейства
-    assert config["dns"]["queryStrategy"] == "UseIP"
+    assert config["dns"]["queryStrategy"] == "PreferIPv4"
 
 
 def test_no_ipv6_inbound_by_default_or_without_local_capture(monkeypatch):

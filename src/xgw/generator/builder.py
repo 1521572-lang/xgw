@@ -12,7 +12,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .. import priority, rating, zapret2
+from .. import nfqws2, priority, rating, zapret2
 from ..config import Config, service_ports
 from ..model import ServerNode
 from ..net import sysctl
@@ -584,6 +584,10 @@ def outbound_profile(outbound: Mapping) -> str:
     letter = singboxing.bridge_variant(outbound)
     if letter:
         return profiling.PROFILE_OF_LETTER[letter]
+    dialer = fragmenting.dialer(outbound)
+    for profile in profiling.NFQ_PROFILES:
+        if dialer == profiling.nfq_tag(profile):
+            return profile
     if fragmenting.split_used(outbound):
         return profiling.XRAY_SPLIT
     return profiling.XRAY_FRAGMENT if fragmenting.used(outbound) else profiling.XRAY_DEFAULT
@@ -911,6 +915,11 @@ def build(
         elif profile == profiling.XRAY_SPLIT and fragmenting.eligible(outbound):
             fragmenting.enable(outbound, fragmenting.SPLIT_TAG)
             info.profile = profiling.XRAY_SPLIT
+        elif profile in profiling.NFQ_PROFILES and fragmenting.dialer(outbound) in (
+            "", fragmenting.TAG, fragmenting.SPLIT_TAG
+        ):
+            fragmenting.enable(outbound, profiling.nfq_tag(profile))
+            info.profile = profile
         outbounds.append(outbound)
     for node in selection.chains:
         outbound = copy.deepcopy(node.outbound)
@@ -922,6 +931,11 @@ def build(
         outbounds.append(fragmenting.outbound(cfg))
     if any(info.profile == profiling.XRAY_SPLIT for info in every):
         outbounds.append(fragmenting.split_outbound(cfg))
+    for profile in profiling.NFQ_PROFILES:
+        if any(info.profile == profile for info in every):
+            outbounds.append(fragmenting.nfq_outbound(cfg, profiling.nfq_tag(profile)))
+    if cfg.network.effective_quic_mode == "noise":
+        outbounds.append(fragmenting.noise_outbound(cfg))
     outbounds.extend(
         [
             {
@@ -1067,6 +1081,17 @@ def build(
                       "balancerTag": BALANCER_TAG})
         rules.append({"type": "field", "domain": list(TS_CONTROL), "balancerTag": BALANCER_TAG})
     rest = to_pool if pool_all else {"balancerTag": BALANCER_TAG}
+    if cfg.routing.cloudflare_tcp_ports:
+        rules.append({
+            "type": "field", "network": "tcp",
+            "port": ",".join(cfg.routing.cloudflare_tcp_ports), **rest,
+        })
+    if cfg.network.effective_quic_mode == "noise":
+        udp_ports = ["443", *cfg.routing.discord_udp_ports, *nfqws2.stun_ports(cfg)]
+        rules.append({
+            "type": "field", "network": "udp", "port": ",".join(dict.fromkeys(udp_ports)),
+            "outboundTag": "direct-noise",
+        })
     media_tags = [] if pool_all or media is None else _media_tags(media, nodes, outbounds)
     if media_tags:
         # После прямых адресов и правил устройств: они главнее выхода для видео.
@@ -1105,6 +1130,9 @@ def build(
             address = f"tcp://{address}"
         dns_servers.append(address if port is None else {"address": address, "port": port})
 
+    query_strategy = cfg.dns.query_strategy
+    if query_strategy == "auto":
+        query_strategy = "PreferIPv4" if ipv6 else "UseIPv4"
     config = {
         "log": {"loglevel": "warning"},
         "api": {
@@ -1121,9 +1149,9 @@ def build(
         "dns": {
             "hosts": {host: list(ips) for host, ips in sorted(hosts.items())},
             "servers": dns_servers,
-            # Ответы AAAA нужны, только если IPv6 проксируется: иначе приложения,
-            # получив IPv6-адрес, пошли бы в сеть мимо перехвата.
-            "queryStrategy": "UseIP" if ipv6 else "UseIPv4",
+            # auto: AAAA предпочитается только при проксировании IPv6; явная стратегия
+            # позволяет выбрать UseIPv4, PreferIPv4 или AsIs независимо от перехвата.
+            "queryStrategy": query_strategy,
         },
         "inbounds": inbounds,
         "outbounds": outbounds,

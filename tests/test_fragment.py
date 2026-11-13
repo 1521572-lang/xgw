@@ -66,7 +66,7 @@ def test_chosen_servers_dial_through_the_fragment_outbound():
     assert _outbound(config, "fragment") == {
         "tag": "fragment", "protocol": "freedom",
         "settings": {"domainStrategy": "UseIPv4", "fragment": {
-            "packets": "tlshello", "length": "100-200", "interval": "10-20"}},
+            "packets": "tlshello", "length": "5-20", "interval": "5-15"}},
         # Сокет создаёт этот outbound — ему и метка «мимо перехвата».
         "streamSettings": {"sockopt": {"mark": cfg.capture.mark_bypass}},
     }

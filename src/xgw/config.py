@@ -54,6 +54,15 @@ DEFAULT_PROBE_UA = (
 )
 
 
+DEFAULT_RESERVED_CIDRS = (
+    "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "224.0.0.0/4",
+    "240.0.0.0/4", "255.255.255.255/32",
+    "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+)
+DEFAULT_STUN_SERVERS = ("stun.l.google.com:19302", "stun.cloudflare.com:3478")
+
+
 @dataclass
 class Network:
     wan_if: str = ""
@@ -66,21 +75,27 @@ class Network:
     bypass_hosts: list[str] = field(default_factory=list)
     ipv6: str = "off"
     disable_sleep: bool = True
-    # Алгоритм управления перегрузкой TCP — BBR (net.ipv4.tcp_congestion_control): быстрее
-    # на канале с потерями и большой задержкой. Ставит xgw-net, прежний возвращает
-    # `xgw net down` и удаление; false — XGW алгоритм не трогает.
     tcp_bbr: bool = True
-    # QUIC (HTTP/3, UDP/443) устройств сети и самой машины отбивается сразу (ICMP «порт
-    # недоступен»): браузеры уходят на TCP/443, где действует дробление ClientHello, а QUIC
-    # дробление не берёт (0.1.18, ТЗ R2). Собственные соединения шлюза с серверами VPN,
-    # Tailscale и локальные сети не затрагиваются. false — правило не ставится.
     block_quic: bool = True
+    # Пусто — старое поведение block_quic; явный режим имеет приоритет над ним.
+    quic_mode: str = ""
+    noise_count: int = 3
+    noise_packet: str = "64-1200"
+    noise_delay: str = "5-15"
+    stun_servers: list[str] = field(default_factory=lambda: list(DEFAULT_STUN_SERVERS))
 
     @property
     def ipv6_proxy(self) -> bool:
         """IPv6 самой машины идёт через Xray. Любое значение, кроме «proxy», — «off»:
         неизвестное слово не должно молча включать IPv6 мимо перехвата."""
         return self.ipv6.strip().lower() == "proxy"
+
+    @property
+    def effective_quic_mode(self) -> str:
+        explicit = self.quic_mode.strip().lower()
+        if explicit in ("reject", "noise", "proxy"):
+            return explicit
+        return "reject" if self.block_quic else "proxy"
 
 
 @dataclass
@@ -93,6 +108,7 @@ class Capture:
     hold: str = "block"
     forward_icmp: bool = True
     exclude_cidrs: list[str] = field(default_factory=list)
+    reserved_cidrs: list[str] = field(default_factory=lambda: list(DEFAULT_RESERVED_CIDRS))
     tproxy_port: int = 12345
     mark_proxy: int = 1
     mark_bypass: int = 2
@@ -321,14 +337,14 @@ class Fragment:
     # Поля freedom.fragment Xray: что дробить, длина кусков (байт) и пауза между ними (мс).
     # Длина и пауза — диапазоны: Xray берёт случайное значение для каждого куска.
     packets: str = "tlshello"
-    length: str = "100-200"
-    interval: str = "10-20"
+    length: str = "5-20"
+    interval: str = "5-15"
     # Вторая ступень дробления в Xray (0.1.18, ТЗ R1): первые TCP-пакеты соединения режутся на
     # сегменты случайной длины (а не на записи TLS) — если ТСПУ собирает ClientHello из записей,
     # из сегментов он может его и не собрать. split = false — без этой ступени.
     split: bool = True
     split_packets: str = "1-3"
-    split_length: str = "20-60"
+    split_length: str = "10-30"
     split_interval: str = "5-10"
     # Сервер на дроблении, который calm_probes проверок подряд отвечает и пробыл на нём не
     # меньше calm_hours, пробуется без дробления (до 0.1.18 — раз в сутки).
@@ -354,6 +370,12 @@ class Routing:
     kernel_direct: bool = False
     conn_idle_s: int = 120
     home_country: str = "RU"
+    cloudflare_tcp_ports: list[str] = field(
+        default_factory=lambda: ["2053", "2083", "2087", "2096", "8443"]
+    )
+    discord_udp_ports: list[str] = field(
+        default_factory=lambda: ["19294-19344", "50000-50100"]
+    )
 
 
 @dataclass
@@ -375,6 +397,11 @@ class Zapret2:
     check_seconds: int = 180
     retry_seconds: int = 300
     daily_probe_mb: int = 256
+    engine: str = "auto"
+    engine_profile: str = "seqovl"
+    engine_queue: int = 200
+    engine_offload: bool = True
+    blob_dir: str = ""
 
     @property
     def probe_enabled(self) -> bool:
@@ -448,6 +475,7 @@ class Dns:
     # последними.
     bootstrap_extra: list[str] = field(default_factory=lambda: list(DEFAULT_BOOTSTRAP_EXTRA))
     bootstrap_check_minutes: int = 30
+    query_strategy: str = "auto"
 
     @property
     def resolvers(self) -> list[str]:
@@ -927,6 +955,68 @@ def _validate_core(core: CoreSection) -> list[str]:
     return warnings
 
 
+def _port_list(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", value.strip())
+        if not match:
+            continue
+        low, high = int(match.group(1)), int(match.group(2) or match.group(1))
+        if 1 <= low <= high <= 65535:
+            result.append(f"{low}-{high}" if low != high else str(low))
+    return result
+
+
+def _validate_desync(cfg: Config) -> list[str]:
+    warnings = []
+    network = cfg.network
+    if network.quic_mode and network.effective_quic_mode != network.quic_mode.strip().lower():
+        warnings.append("network.quic_mode: ожидается reject, noise или proxy — block_quic")
+        network.quic_mode = ""
+    if not 2 <= network.noise_count <= 4:
+        warnings.append("network.noise_count: ожидается 2–4 — 3")
+        network.noise_count = 3
+    for name, low, high in (("noise_packet", 64, 1200), ("noise_delay", 5, 15)):
+        value = getattr(network, name)
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", value)
+        valid = bool(
+            match and low <= int(match.group(1)) <= int(match.group(2) or match.group(1)) <= high
+        )
+        if not valid:
+            default = getattr(Network(), name)
+            warnings.append(f"network.{name}: ожидается диапазон {low}–{high} — {default}")
+            setattr(network, name, default)
+    endpoints = []
+    for endpoint in network.stun_servers:
+        try:
+            parsed = urlsplit("//" + endpoint)
+            valid = (bool(parsed.hostname) and parsed.port is not None
+                     and not parsed.path and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if valid:
+            endpoints.append(endpoint)
+        else:
+            warnings.append(f"network.stun_servers: «{endpoint}» пропущен")
+    network.stun_servers = endpoints or list(DEFAULT_STUN_SERVERS)
+    networks = []
+    for value in cfg.capture.reserved_cidrs:
+        try:
+            networks.append(str(ipaddress.ip_network(value.strip(), strict=False)))
+        except ValueError:
+            warnings.append(f"capture.reserved_cidrs: «{value}» — не сеть; пропущено")
+    cfg.capture.reserved_cidrs = networks or list(DEFAULT_RESERVED_CIDRS)
+    for name in ("cloudflare_tcp_ports", "discord_udp_ports"):
+        values = _port_list(getattr(cfg.routing, name))
+        if len(values) != len(getattr(cfg.routing, name)):
+            warnings.append(f"routing.{name}: недопустимые порты пропущены")
+        setattr(cfg.routing, name, values)
+    if cfg.dns.query_strategy not in ("auto", "UseIPv4", "PreferIPv4", "AsIs"):
+        warnings.append("dns.query_strategy: ожидается auto, UseIPv4, PreferIPv4 или AsIs — auto")
+        cfg.dns.query_strategy = "auto"
+    return warnings
+
+
 def service_ports(cfg: Config) -> dict[str, int]:
     """Порты на 127.0.0.1, которые слушают сам XGW и его ядра (кроме проверок Xray и мостов
     sing-box — они раздаются по порядку). Их не занимают ни probe-inbounds Xray, ни входы
@@ -1123,8 +1213,11 @@ def _validate(cfg: Config) -> list[str]:
             warnings.append(f"probe.{name}={getattr(cfg.probe, name)}: ожидается, например, 30s")
     warnings.extend(_validate_speed(cfg.speed))
     warnings.extend(_validate_media(cfg.media))
+    from .nfqws2 import validate as validate_nfqws2
     from .zapret2 import validate as validate_zapret2
 
+    warnings.extend(_validate_desync(cfg))
+    warnings.extend(validate_nfqws2(cfg))
     warnings.extend(validate_zapret2(cfg))
     warnings.extend(_validate_fragment(cfg.fragment))
     warnings.extend(_validate_core(cfg.core))

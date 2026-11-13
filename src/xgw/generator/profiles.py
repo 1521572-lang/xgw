@@ -1,10 +1,13 @@
 """Профили обхода блокировок: каким ядром и как шлюз ведёт сервер.
 
-Шесть профилей, от лёгкого к тяжёлому:
+Профили, от лёгкого к тяжёлому:
 
     xray:default           Xray, обычное соединение (ClientHello как у Chrome)
     xray:fragment          Xray, ClientHello режется на части (generator/fragment.py)
     xray:split             Xray, первые пакеты соединения режутся на TCP-сегменты (0.1.18)
+    nfqws2:seqovl          внешний nfqws2, multisplit с перекрытием sequence
+    nfqws2:hostfakesplit   внешний nfqws2, fake TLS и hostfakesplit
+    nfqws2:disorder-badseq внешний nfqws2, fake TLS с badseq и multidisorder
     singbox:default        sing-box, обычное соединение (другая реализация TLS и UDP)
     singbox:tls_fragment   sing-box, ClientHello режется на TCP-сегменты и записи TLS
     singbox:mux_padded     sing-box, мультиплексирование h2mux с паддингом поверх записей TLS
@@ -18,13 +21,14 @@ outbound — прямой, через дробление или мост к sing
 базе (daemon.TRIALS_META, 0.1.14) и после перезапуска продолжает.
 
 Лестница при блокировке (ступень выбирает вердикт скана, daemon.py):
-  «заморозка» (FROZEN, STALL_BEFORE_BODY): xray:fragment → xray:split → singbox:default →
-  singbox:tls_fragment → singbox:mux_padded;
+  «заморозка» (FROZEN, BODY_RESET, STALL_BEFORE_BODY): xray:fragment → xray:split →
+  nfqws2:seqovl → nfqws2:hostfakesplit → nfqws2:disorder-badseq (если установлен nfqws2) →
+  singbox:default → singbox:tls_fragment → singbox:mux_padded;
   отказ в соединении (CONNECT_FAIL, TIMEOUT): по одной попытке xray:fragment, xray:split,
   singbox:default и singbox:tls_fragment.
 Сервер в работе (0.1.18, ТЗ R1) при «заморозке» или отказе не списывается сразу: он
-проверяется на ступенях дробления в Xray (xray:fragment, xray:split) — на месте, без замены;
-мёртвым он считается, только если не ответил и там.
+проверяется на ступенях обхода в Xray (xray:fragment, xray:split, затем nfqws2 при наличии) —
+на месте, без замены; мёртвым он считается, только если не ответил и там.
 У серверов, которые умеет только sing-box, singbox:default — база, и лестница начинается с
 singbox:tls_fragment.
 
@@ -41,6 +45,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Collection, Mapping
 
+from .. import nfqws2
 from ..config import Config
 from ..model import ServerNode, variant_key
 from . import fragment as fragmenting
@@ -48,12 +53,22 @@ from . import fragment as fragmenting
 XRAY_DEFAULT = "xray:default"
 XRAY_FRAGMENT = "xray:fragment"
 XRAY_SPLIT = "xray:split"
+NFQ_SEQOVL = "nfqws2:seqovl"
+NFQ_HOSTFAKESPLIT = "nfqws2:hostfakesplit"
+NFQ_DISORDER = "nfqws2:disorder-badseq"
+NFQ_PROFILES = (NFQ_SEQOVL, NFQ_HOSTFAKESPLIT, NFQ_DISORDER)
 SB_DEFAULT = "singbox:default"
 SB_FRAGMENT = "singbox:tls_fragment"
 SB_MUX = "singbox:mux_padded"
-ALL = (XRAY_DEFAULT, XRAY_FRAGMENT, XRAY_SPLIT, SB_DEFAULT, SB_FRAGMENT, SB_MUX)
+ALL = (XRAY_DEFAULT, XRAY_FRAGMENT, XRAY_SPLIT, *NFQ_PROFILES,
+       SB_DEFAULT, SB_FRAGMENT, SB_MUX)
 # Ступени дробления в Xray — их проходит сервер в работе, прежде чем его признают мёртвым.
 XRAY_FRAGMENTS = (XRAY_FRAGMENT, XRAY_SPLIT)
+
+
+def nfq_tag(profile: str) -> str:
+    return "nfqws2-" + profile.removeprefix("nfqws2:")
+
 
 # Буква варианта в тегах и логине моста (generator/singbox.py).
 LETTERS = {SB_DEFAULT: "d", SB_FRAGMENT: "f", SB_MUX: "m"}
@@ -62,12 +77,17 @@ PROFILE_OF_LETTER = {letter: profile for profile, letter in LETTERS.items()}
 # Короткая отметка в `xgw servers` и панели.
 LABELS = {
     XRAY_DEFAULT: "xray", XRAY_FRAGMENT: "xray+frag", XRAY_SPLIT: "xray+split",
+    NFQ_SEQOVL: "nfq+seqovl", NFQ_HOSTFAKESPLIT: "nfq+hostfake",
+    NFQ_DISORDER: "nfq+disorder",
     SB_DEFAULT: "sb", SB_FRAGMENT: "sb+frag", SB_MUX: "sb+mux",
 }
 NAMES = {
     XRAY_DEFAULT: "Xray",
     XRAY_FRAGMENT: "Xray с дроблением ClientHello",
     XRAY_SPLIT: "Xray с нарезкой первых пакетов",
+    NFQ_SEQOVL: "nfqws2 multisplit с перекрытием sequence",
+    NFQ_HOSTFAKESPLIT: "nfqws2 hostfakesplit с фальшивым TLS",
+    NFQ_DISORDER: "nfqws2 multidisorder с badseq",
     SB_DEFAULT: "sing-box",
     SB_FRAGMENT: "sing-box с дроблением TLS",
     SB_MUX: "sing-box с мультиплексированием и паддингом",
@@ -75,7 +95,7 @@ NAMES = {
 # Профили, которым сервер обучается блокировкой: они сохраняются между сборками. Остальные —
 # выбор настроек (база), поэтому следуют за настройками. Обычный sing-box у сервера с базой
 # Xray — тоже выученный, но с условием (resolve, pin_unchanged).
-LEARNED = (XRAY_FRAGMENT, XRAY_SPLIT, SB_FRAGMENT, SB_MUX)
+LEARNED = (XRAY_FRAGMENT, XRAY_SPLIT, *NFQ_PROFILES, SB_FRAGMENT, SB_MUX)
 # Снимок настроек ядра, по которым собран применённый конфиг (ключ meta в базе состояния).
 CORE_META = "core_settings"
 # Пробы профилей, время смены профиля и выученный обход серверов (daemon.py, 0.1.14/0.1.18).
@@ -174,6 +194,8 @@ def available(node: ServerNode, cfg: Config, bridged: Collection[str]) -> list[s
         xr.append(XRAY_DEFAULT)
         if cfg.fragment.mode != "off" and fragmenting.eligible(node.outbound):
             xr += [XRAY_FRAGMENT, *([XRAY_SPLIT] if cfg.fragment.split else [])]
+        if nfqws2.enabled(cfg) and nfqws2.find_installation(cfg) is not None:
+            xr.extend(NFQ_PROFILES)
     if pin == "sing-box" and sb:
         xr = []
     elif pin == "xray" and xr:
@@ -223,7 +245,9 @@ def ladder(verdict: str, current: str, default: str, avail: list[str]) -> list[s
     сломал его самый профиль), затем ступени лестницы после нынешней. Обычный sing-box стоит
     раньше дробления в sing-box: тот же TLS, но без лишней задержки рукопожатия."""
     frozen = verdict in FROZEN_VERDICTS
-    order = [XRAY_FRAGMENT, XRAY_SPLIT, SB_DEFAULT, SB_FRAGMENT] + ([SB_MUX] if frozen else [])
+    order = [XRAY_FRAGMENT, XRAY_SPLIT, SB_DEFAULT, SB_FRAGMENT]
+    if frozen:
+        order = [XRAY_FRAGMENT, XRAY_SPLIT, *NFQ_PROFILES, SB_DEFAULT, SB_FRAGMENT, SB_MUX]
     steps: list[str] = []
     if current != default and default in avail:
         steps.append(default)

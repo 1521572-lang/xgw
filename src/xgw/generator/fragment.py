@@ -4,9 +4,8 @@
 читает эту запись и по имени решает, пропустить ли соединение. Если запись разрезана на
 куски, ClientHello целиком ни в одном нет, и правило по имени не срабатывает. Xray режет
 запись outbound'ом freedom с полем `fragment`: через него сервер устанавливает соединение
-(`sockopt.dialerProxy`). Проверено на Xray 26.10.10: ClientHello на 1753 байта уходит 12
-частями по 100–200 байт (с паузой 10–20 мс рукопожатие дольше примерно на 0,2 с), а
-конфиг с таким outbound'ом проходит `xray run -test`.
+(`sockopt.dialerProxy`). Микрофрагменты по 5–20 байт разрывают и SNI, и расширения
+большого постквантового ClientHello; пауза между ними — 5–15 мс.
 
 Дробить есть смысл только TLS и REALITY поверх TCP: у остальных ClientHello либо нет,
 либо он идёт по UDP (QUIC). Сервер, который уже устанавливает соединение через
@@ -191,6 +190,34 @@ def split_outbound(cfg: Config) -> dict:
                 "length": cfg.fragment.split_length,
                 "interval": cfg.fragment.split_interval,
             },
+        },
+        "streamSettings": {"sockopt": {"mark": cfg.capture.mark_bypass}},
+    }
+
+
+def nfq_outbound(cfg: Config, profile: str) -> dict:
+    """Свободный исход без дробления Xray: пакеты обрабатывает внешний nfqws2."""
+    return {
+        "tag": profile,
+        "protocol": "freedom",
+        "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {"sockopt": {"mark": cfg.capture.mark_bypass}},
+    }
+
+
+def noise_outbound(cfg: Config) -> dict:
+    """Прямой UDP с несколькими случайными decoy-пакетами перед полезным."""
+    noise = {
+        "type": "rand",
+        "packet": cfg.network.noise_packet,
+        "delay": cfg.network.noise_delay,
+    }
+    return {
+        "tag": "direct-noise",
+        "protocol": "freedom",
+        "settings": {
+            "domainStrategy": "UseIPv4",
+            "noises": [dict(noise) for _ in range(cfg.network.noise_count)],
         },
         "streamSettings": {"sockopt": {"mark": cfg.capture.mark_bypass}},
     }

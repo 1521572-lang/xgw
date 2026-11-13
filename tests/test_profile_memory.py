@@ -36,9 +36,8 @@ def test_success_first_and_failure_last_cut_the_attempts():
     worked = {"profile": profiles.SB_FRAGMENT, "ts": 1000.0, "key": "k"}
     failed = {"key": "k", "steps": {profiles.XRAY_FRAGMENT: 1000.0}}
     order = profiles.remembered(LADDER, key="k", now=2000.0, worked=worked, failed=failed)
-    # Одна последовательность итогов: помогает только sing-box с дроблением. Каждая попытка —
-    # сборка и скан (не меньше шага демона): до — 4 попытки, после — 1.
-    assert LADDER.index(profiles.SB_FRAGMENT) + 1 == 4
+    # Помогает только sing-box с дроблением: до запоминания — семь попыток, после — одна.
+    assert LADDER.index(profiles.SB_FRAGMENT) + 1 == 7
     assert order.index(profiles.SB_FRAGMENT) + 1 == 1
     assert order[-1] == profiles.XRAY_FRAGMENT and sorted(order) == sorted(LADDER)
 
