@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, cost, fetch, log, marknet, masking, rating, reality, zapret2
+from . import config, cost, fetch, geodat, log, marknet, masking, rating, reality, zapret2
 from . import pin as pinning
 from .apply import singbox as singbox_apply
 from .apply.applier import Applier, ApplyOutcome
@@ -135,9 +135,10 @@ def inventory_file(paths: Paths) -> Path:
 def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> None:
     """Список всех серверов подписок — для панели: и тех, что в конфиг не попали.
 
-    В нём только то, что видно и так (имя, протокол, источник); ключей нет.
+    В нём только то, что видно и так (имя, протокол, источник, код страны); ключей нет.
     """
     servers = []
+    countries = geodat.countries(geodat.ui_asset(paths.xray_dir))
     served = {node.fingerprint for node in inventory.nodes if node.singbox is not None}
     if not singbox_available(cfg, paths):
         served = set()
@@ -145,14 +146,19 @@ def save_inventory(paths: Paths, cfg: config.Config, inventory: Inventory) -> No
         if node.keep_tag:
             continue  # звенья цепочек — не самостоятельные серверы
         reason = builder.skip_reason(node, cfg, dead=quarantined(), served=served)
-        servers.append({
+        row = {
             "fingerprint": node.fingerprint,
             "name": node.name,
             "source": node.source,
             "protocol": node.protocol,
             "core": node.capability,
             "skip": "" if reason == "excluded" else reason,
-        })
+        }
+        if not reason or reason == "excluded":
+            code = countries.lookup(node.address)
+            if code:
+                row["endpoint_country"] = code
+        servers.append(row)
     atomic_write_json(
         inventory_file(paths), {"saved": time.time(), "servers": servers}, mode=0o600
     )

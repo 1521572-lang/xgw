@@ -73,7 +73,7 @@ from ..parsers.common import parse_links_text
 from ..paths import Paths, atomic_write_text
 from ..phones import Phones
 from ..store import SubscriptionCache
-from . import httpbound, status
+from . import httpbound, server_geo, status
 from . import record as recording
 from .appapi import AppApi
 from .record import MAX_SECONDS, Recorder, RecordError
@@ -467,7 +467,8 @@ class Panel:
         return {"can_on": True, "can_off": False, "why": ""}
 
     def _servers(
-        self, members: list[dict], spares: list[dict], quotas: dict | None = None
+        self, members: list[dict], spares: list[dict], quotas: dict | None = None,
+        *, countries: dict[str, str] | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Все серверы подписок и отдельно — убранные из списка.
 
@@ -547,6 +548,12 @@ class Panel:
                 row.update(status="skipped", skip=item["skip"])
             else:
                 row.update(status="waiting")
+            if countries is not None and row["status"] != "skipped":
+                # Для живой строки важен применённый конфиг, который может отличаться от подписки.
+                tag = entry.get("tag")
+                code = countries.get(tag) if tag else item.get("endpoint_country")
+                if code:
+                    row["endpoint_country"] = code
             rows.append(row)
         rows.sort(key=lambda row: (
             _ORDER[row["status"]], not row.get("selected"),
@@ -590,7 +597,17 @@ class Panel:
         }
 
         quotas, errors = snapshot.get("quota") or {}, snapshot.get("sub_errors") or {}
-        servers, gone = self._servers(members, spares, quotas)
+        pool_summary = snapshot.get("free_pool")
+        flow = (pool_summary or {}).get("traffic") or {}
+        tags = {row["tag"] for row in (*members, *spares) if row.get("tag")}
+        if flow.get("tag"):
+            tags.add(flow["tag"])
+        countries = server_geo.applied_countries(self.paths, tags) if xray_ok else {}
+        servers, gone = self._servers(members, spares, quotas, countries=countries)
+        if countries.get(flow.get("tag")):
+            pool_summary = {**pool_summary, "traffic": {
+                **flow, "endpoint_country": countries[flow["tag"]],
+            }}
         limited = cost.limited_sources(quotas)
         # Сколько серверов дала подписка: вместе с отключёнными, без служебных записей.
         per_source = Counter(row["source"] for row in servers if row["status"] != "skipped")
@@ -660,7 +677,7 @@ class Panel:
             "whitelist": snapshot.get("whitelist"),
             # Бесплатный пул: режим и сводка наблюдения.
             "free_pool": {"mode": cfg.free_pool.mode, "pin": cfg.managed.free_pool_pin,
-                          "summary": snapshot.get("free_pool")},
+                          "summary": pool_summary},
             # Резервный выход балансировщика (запасной класса хуже, cost.py).
             "reserve": snapshot.get("reserve"),
             # Основной сервер (speed.sticky): весь трафик через него, остальные наготове.

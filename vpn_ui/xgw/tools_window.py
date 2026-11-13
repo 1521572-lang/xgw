@@ -71,10 +71,14 @@ class ToolsWindow(QtWidgets.QMainWindow):
             page.refresh()
         else:
             page.show_state(self.state)
-        self.statusBar().showMessage(self.bridge.message if not self.stale else
-                                    "Нет свежих данных шлюза. Изменения недоступны.")
+        if self.stale:
+            self.statusBar().showMessage("Нет свежих данных шлюза. Изменения недоступны.")
+        elif self.statusBar().currentMessage() == "Нет свежих данных шлюза. Изменения недоступны.":
+            self.statusBar().clearMessage()
 
-    def action_done(self, key, ok, _text):
+    def action_done(self, key, ok, text):
+        if self.isVisible():
+            self.statusBar().showMessage(text, 15000)
         if "subscriptions" in self.pages:
             self.pages["subscriptions"].action_done(key, ok)
 

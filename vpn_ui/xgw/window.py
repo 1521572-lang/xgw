@@ -24,7 +24,6 @@ class XgwWindow(MainWindow):
         self.tools = ToolsWindow(bridge, self)
         bridge.section_requested.connect(self.open_section)
         login.finished.connect(self.on_login)
-        bridge.gateway_changed.connect(self._refocus)
 
     def _build_shortcuts(self):
         self.shortcuts = []
@@ -35,11 +34,16 @@ class XgwWindow(MainWindow):
             shortcut.activated.connect(handler)
             self.shortcuts.append(shortcut)
 
+    def _escape(self):
+        if not self.sidebar.hide_details():
+            super()._escape()
+
     def apply_theme(self, name):
         super().apply_theme(name)
         c = theme.palette()
         app = QtWidgets.QApplication.instance()
         app.setStyleSheet(app.styleSheet() + f"""
+            #TitleBar {{ background: {c.bg_norm.qss}; }}
             #SidebarPane QListWidget, #SidebarPane QTreeWidget {{
                 background: {c.pane.qss}; color: {c.text.qss}; border: 0;
             }}
@@ -60,11 +64,9 @@ class XgwWindow(MainWindow):
         """)
 
     def _refocus(self):
-        b = self.bridge
-        direct = (b.state.get("zapret2") or {}).get("mode") == "standalone"
-        main = (model.main_server(b.state) if not b.stale and not direct and
-                (b.state.get("capture") or {}).get("mode") == "on" else None)
-        code = main.country if main else ""
+        code = self.bridge.map_country()
+        if code not in self.map.points:
+            code = ""
         if code != self.map.focus_code:
             self.map.set_focus(code)
 

@@ -50,6 +50,7 @@ class XgwBridge(VpnUiBridge):
         self.pool_generation = 0
         self.pool_session = client.session
         self.message = ""
+        self.message_until = 0.0
         self.waiting: dict[str, float] = {}
         self.targets: dict[str, dict] = {}
         self.connect_requested.connect(lambda _target: self.power())
@@ -94,15 +95,16 @@ class XgwBridge(VpnUiBridge):
             if not self.client.actions.busy(key) and matched:
                 self.waiting.pop(key)
                 self.targets.pop(key, None)
-                self.message = "Изменение подтверждено состоянием шлюза."
+                self.show_message("Изменение подтверждено состоянием шлюза.")
         self.render()
 
     def on_link(self, link, text):
         if link == api.LINK_OK and self.link != api.LINK_OK:
-            self.message = ""
+            self.message, self.message_until = "", 0
         self.link = link
         if text:
             self.message = text
+            self.message_until = 0
         if link == api.LINK_AUTH:
             self.pool_generation += 1
             self.pool = None
@@ -111,21 +113,31 @@ class XgwBridge(VpnUiBridge):
         self.render()
 
     def on_action(self, key, ok, text):
-        self.message = ("Команда принята; ожидаю состояние шлюза. " + text
-                        if ok and key in self.waiting else text)
+        if key not in ("power", "pin", "unpin", "freepool/pin"):
+            return  # Ответы страниц выводятся в их собственном окне.
+        self.show_message("Команда принята; ожидаю состояние шлюза." if ok and key in self.waiting
+                          else text)
         if not ok:
             self.waiting.pop(key, None)
             self.targets.pop(key, None)
         self.render()
 
+    def show_message(self, text):
+        self.message = text
+        self.message_until = time.monotonic() + 8
+
     def tick(self):
-        expired = [key for key, deadline in self.waiting.items() if time.monotonic() > deadline]
+        now = time.monotonic()
+        expired = [key for key, deadline in self.waiting.items() if now > deadline]
         for key in expired:
             self.waiting.pop(key)
             self.targets.pop(key, None)
         if expired:
-            self.message = "Нет подтверждения действия от демона. Проверьте состояние шлюза."
-        if self.stale or expired:
+            self.show_message("Нет подтверждения действия от демона. Проверьте состояние шлюза.")
+        clear_message = bool(self.message_until and now >= self.message_until)
+        if clear_message:
+            self.message, self.message_until = "", 0
+        if self.stale or expired or clear_message:
             self.render()
         if self.pool_visible and self.client.visible:
             self.fetch_pool()
@@ -201,6 +213,29 @@ class XgwBridge(VpnUiBridge):
         main = model.main_server(self.state) if self.state else None
         self.update_connection_state(state, main.tag if main and not direct else "auto", power.sub)
         self.gateway_changed.emit()
+
+    def map_country(self):
+        """Страна IP текущего VPN-сервера из подтверждённого состояния."""
+        state = self.state
+        capture = state.get("capture") or {}
+        zapret = state.get("zapret2") or {}
+        if (self.stale or capture.get("mode") != "on" or capture.get("blocked")
+                or capture.get("inbound_missing") or capture.get("loaded") is False
+                or zapret.get("without_vpn") or zapret.get("mode") == "standalone"
+                or model.shield(state, False)[0] != "ok"):
+            return ""
+        if model.pool_house(state):
+            flow = model.pool_flow(state) or {}
+            return str(flow.get("endpoint_country") or "").upper()
+        main = model.main_server(state)
+        servers = state.get("servers") or []
+        if main is not None:
+            row = next((row for row in servers if row.get("tag") == main.tag), {})
+        else:
+            selected = [row for row in servers if row.get("selected")]
+            # Балансировщик может использовать несколько серверов одновременно.
+            row = selected[0] if len(selected) == 1 else {}
+        return str(row.get("endpoint_country") or "").upper()
 
     def close(self):
         self.timer.stop()

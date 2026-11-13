@@ -55,8 +55,10 @@ class MapCanvasView(QtWidgets.QWidget):
             self.update()
 
     def set_markers(self, codes: Iterable[str]) -> None:
-        self.markers = sorted({code.upper() for code in codes if code.upper() in self.points})
-        self.update()
+        markers = sorted({code.upper() for code in codes if code.upper() in self.points})
+        if markers != self.markers:
+            self.markers = markers
+            self.update()
 
     def set_focus(self, code: str, animate: bool = True) -> None:
         code = code.upper()
@@ -72,6 +74,8 @@ class MapCanvasView(QtWidgets.QWidget):
             self.update()
 
     def set_state(self, state: ConnectionState) -> None:
+        if state is self.state:
+            return
         self.state = state
         target = theme.qcolor(tokens.STATE_GLOW[state.value])
         self._tint.stop()

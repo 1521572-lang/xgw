@@ -27,7 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import fetch, log, masking
+from .. import fetch, geodat, log, masking
 from ..config import Config
 from ..net import cmd
 from ..paths import Paths
@@ -551,6 +551,7 @@ def server_rows(cfg: Config, paths: Paths, now: float, *,
     попадают. Наблюдение выключено — пусто: пул тогда серверы не проверяет."""
     if cfg.free_pool.mode == "off":
         return []
+    countries = geodat.countries(geodat.ui_asset(paths.xray_dir))
     store = store or PoolStore(paths)
     records = store.candidates()
     rows: list[dict] = []
@@ -575,6 +576,7 @@ def server_rows(cfg: Config, paths: Paths, now: float, *,
                 "protocol": variant.protocol, "backend": variant.backend,
                 # Страна выхода — по проверке шлюза; пока её нет — подсказка каталога.
                 "country": egress or variant.country_hint.upper(), "egress": bool(egress),
+                "endpoint_country": countries.lookup(variant.address),
                 "verdict": verdict, "checked_at": checked or None,
                 "next_at": checked + every if checked else None,
                 # Проба целиком (рукопожатия и файл), как задержка запасных серверов подписки.

@@ -355,6 +355,45 @@ def test_working_server_missing_from_the_list_is_still_shown(rig, user):
     assert names == ["NL-1", "DE-1", "FI-1"]
 
 
+def test_server_country_uses_applied_xray_and_singbox_addresses(rig, user):
+    from test_geodat import write_geoip
+
+    from xgw.generator import singbox
+
+    paths = rig.paths
+    paths.xray_dir.mkdir(parents=True, exist_ok=True)
+    write_geoip(paths.xray_dir / "geoip.dat", {
+        "SE": [("8.8.8.0", 24)], "PT": [("1.1.1.0", 24)], "IT": [("9.9.9.0", 24)],
+    })
+    hosts = {"masked.example": ["8.8.8.8", "8.8.8.9"]}
+    bridge = singbox.bridge_outbound(12000, "d", "private-secret")
+    rig.paths.singbox_config_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(paths.singbox_config_file, {
+        "inbounds": [{"tag": "sb-in-bbbb2222-d", "listen_port": 12000}],
+        "outbounds": [{"tag": "sb-out-bbbb2222-d", "server": "1.1.1.1"}],
+    })
+    config = engine.read_json(paths.xray_config_file) or {}
+    config.update(dns={"hosts": hosts}, outbounds=[
+        {"tag": "proxy-nl-aaaa", "settings": {"vnext": [{"address": "masked.example"}]}},
+        {"tag": "proxy-de-bbbb", **bridge},
+    ])
+    atomic_write_json(paths.xray_config_file, config)
+    _response, text = user.request("GET", "/api/state")
+    assert "masked.example" not in text and "8.8.8.8" not in text and "1.1.1.1" not in text
+    assert "private-secret" not in text
+    rows = {row["name"]: row for row in json.loads(text)["servers"]}
+    assert rows["NL-1"]["endpoint_country"] == "SE"
+    assert rows["DE-1"]["endpoint_country"] == "PT"
+    assert "endpoint_country" not in rows["FI-1"]
+    hosts["masked.example"].append("9.9.9.9")
+    atomic_write_json(paths.xray_config_file, config)
+    rows = {row["name"]: row for row in user.state()["servers"]}
+    assert "endpoint_country" not in rows["NL-1"]
+    write_geoip(paths.xray_dir / "geoip-ui.dat", {"BE": [("1.1.1.0", 24)]})
+    rows = {row["name"]: row for row in user.state()["servers"]}
+    assert rows["DE-1"]["endpoint_country"] == "BE"
+
+
 def test_devices_and_events_are_listed(rig, user):
     from xgw.net import dnsmasq
 

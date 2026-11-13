@@ -5,6 +5,7 @@ from xgw.gui import model
 from .. import theme
 from ..qt import Qt, QtCore, QtWidgets, Signal
 from ..theme import svg_loader
+from ..theme.tokens import Metrics
 from ..views.connection_card_view import ConnectionCardView
 
 SECTIONS = (("zapret2", "zapret2"), ("devices", "Устройства"), ("traffic", "Трафик"),
@@ -18,6 +19,9 @@ class Card(ConnectionCardView):
         self.title.setToolTip("Состояние шлюза, подтверждённое демоном")
         self.subtitle.setTextFormat(Qt.TextFormat.PlainText)
         self.error_text.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_text.setProperty("elide", False)
+        self.error_text.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                                      QtWidgets.QSizePolicy.Policy.Preferred)
         self.subtitle.setWordWrap(True)
         self.subtitle.setMaximumWidth(440)
         self.title.setMinimumWidth(0)
@@ -36,7 +40,11 @@ class Card(ConnectionCardView):
     def refresh(self):
         bridge = self.bridge
         power = model.power(bridge.state or None, bridge.stale, acting=bridge.busy)
-        self.badge.show_icon("Bolt")
+        country = bridge.map_country()
+        if country:
+            self.badge.show_flag(country)
+        else:
+            self.badge.show_icon("Bolt")
         self.title.setText(power.title)
         self.subtitle.setText(power.sub)
         self.flags.hide()
@@ -72,8 +80,8 @@ class Details(QtWidgets.QFrame):
             label.setWordWrap(True)
             label.setTextFormat(Qt.TextFormat.PlainText)
             box.addWidget(label)
-        self.setToolTip("Замеры сервера — последние пробы XGW, не текущая скорость загрузки. "
-                        "Страна на карте — из имени/тега, не подтверждение географии выхода.")
+        self.setToolTip("Замеры сервера — последние пробы XGW. "
+                        "Страна на карте определяется по IP точки подключения.")
         bridge.gateway_changed.connect(self.refresh)
         self.refresh()
 
@@ -143,8 +151,12 @@ class WidgetBar(QtWidgets.QFrame):
             button.setIconSize(QtCore.QSize(24, 24))
 
     def set_bar_width(self, width):
-        self.setFixedWidth(max(width, 98))
+        self.setFixedWidth(width)
+        style = (Qt.ToolButtonStyle.ToolButtonIconOnly if width <= Metrics.WIDGETS_COMPACT
+                 else Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         for button in self.buttons:
+            button.setToolButtonStyle(style)
+            button.setAccessibleName(button.text())
             button.setMinimumHeight(58)
             button.setFixedWidth(self.width() - 14)
 

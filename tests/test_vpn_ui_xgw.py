@@ -57,7 +57,7 @@ class Login(QtCore.QObject):
     process = None
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
@@ -164,6 +164,36 @@ def test_old_pool_reply_cannot_repopulate_after_auth_expiry(scene):
     b.on_link(client.LINK_AUTH, "Вход устарел")
     callback({"servers": [{"id": "old"}]}, "")
     assert b.pool is None
+
+
+def test_map_animates_to_active_endpoint_and_ignores_preview(scene, tmp_path, qapp):
+    c, b, data = scene
+    w = XgwWindow(b, Login(), tmp_path / "session")
+    w.show()
+    qapp.processEvents()
+    assert w.map.focus_code == ""  # В тегах есть страны, но по IP данных ещё нет.
+
+    data = copy.deepcopy(data)
+    current = next(row for row in data["servers"] if row["tag"] == data["main"]["tag"])
+    current["endpoint_country"] = "JP"  # Тег этого сервера содержит NL.
+    b.on_state(data)
+    assert w.map.focus_code == "JP"
+    assert w.map._move.state() == QtCore.QAbstractAnimation.State.Running
+    b.on_state(data)
+    assert w.map.focus_code == "JP"
+    w.sidebar.sources.setCurrentRow(1)
+    assert w.map.focus_code == "JP"
+    assert not c.sent
+
+    other = next(row for row in data["servers"] if row["tag"] != current["tag"] and row["tag"])
+    other["endpoint_country"] = "DE"
+    data["main"]["tag"] = other["tag"]
+    b.on_state(data)
+    assert w.map.focus_code == "DE"
+    data["zapret2"] = {"without_vpn": True, "mode": "off", "state": "active"}
+    b.on_state(data)
+    assert not w.map.focus_code
+    w.close()
 
 
 def test_nested_page_commands_are_checked_again_before_post(qapp, monkeypatch):
