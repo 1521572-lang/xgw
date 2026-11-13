@@ -160,7 +160,7 @@ class Sidebar(QtWidgets.QFrame):
         column.addWidget(self.search)
         options = QtWidgets.QHBoxLayout()
         self.filter = QtWidgets.QComboBox()
-        for title, value in (("Все", "all"), ("Доступны к выбору", "usable"),
+        for title, value in (("Все", "all"), ("Доступные", "usable"),
                              ("Выбран вручную", "chosen")):
             self.filter.addItem(title, value)
         self.sort = QtWidgets.QComboBox()

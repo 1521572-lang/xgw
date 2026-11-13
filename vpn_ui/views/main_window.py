@@ -243,16 +243,19 @@ class MainWindow(QtWidgets.QWidget):
             self.set_overlay(False)
 
     # --- тема ------------------------------------------------------------------------
+    def combo_arrow(self, colors: tokens.Palette) -> str:
+        if self._arrow_dir.isValid():
+            arrow = f"{self._arrow_dir.path()}/chevron-{colors.name}.png"
+            if svg_loader.icon_pixmap("ChevronDown", colors.text_weak, 14, 2.0).save(arrow):
+                return arrow
+        return ""
+
     def apply_theme(self, name: str) -> None:
         manager = theme.manager()
         manager.set_theme(name)
         colors = manager.palette
-        arrow = ""
-        if self._arrow_dir.isValid():
-            arrow = f"{self._arrow_dir.path()}/chevron-{colors.name}.png"
-            svg_loader.icon_pixmap("ChevronDown", colors.text_weak, 16, 2.0).save(arrow)
         app = QtWidgets.QApplication.instance()
-        app.setStyleSheet(qss_builder.build(colors, manager.family(), arrow))
+        app.setStyleSheet(qss_builder.build(colors, manager.family(), self.combo_arrow(colors)))
         self.theme_action.setText("Светлая тема" if colors.name == "dark" else "Тёмная тема")
         self.update()
 

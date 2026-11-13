@@ -23,12 +23,21 @@ def _font(style: TextStyle) -> str:
     return f"font-size: {style.size}px; font-weight: {style.weight};"
 
 
+def combo_controls(arrow_image: str = "") -> str:
+    """Одна поверхность поля и шеврон без отдельной кнопки системного стиля."""
+    arrow = f'image: url("{arrow_image}");' if arrow_image else ""
+    return f"""
+QComboBox::drop-down {{ subcontrol-origin: border; subcontrol-position: top right;
+    background: transparent; border: none; width: 26px; }}
+QComboBox::down-arrow {{ {arrow} width: 14px; height: 14px; }}
+"""
+
+
 def build(colors: Palette, family: str, arrow_image: str = "") -> str:
     """`arrow_image` — путь к перекрашенной стрелке выпадающего списка (PNG)."""
     c = colors
     pane = f"background: {c.pane.qss}; border: 1px solid {c.border_weak.qss};" \
            f" border-radius: {Metrics.PANE_RADIUS}px;"
-    arrow = f"image: url({arrow_image});" if arrow_image else ""
     return f"""
 * {{ font-family: "{family}"; outline: 0; }}
 QWidget#MainWindow {{ background: {c.bg_norm.qss}; }}
@@ -121,8 +130,7 @@ QComboBox#SettingsCombo {{ background: {c.fill_hover.qss}; color: {c.text.qss};
     padding: 5px 10px; min-height: 20px; {_font(BODY)} }}
 QComboBox#SettingsCombo:hover {{ background: {c.fill_active.qss}; }}
 QComboBox#SettingsCombo:focus {{ border: 1px solid {c.border_focus.qss}; }}
-QComboBox#SettingsCombo::drop-down {{ border: none; width: 28px; }}
-QComboBox#SettingsCombo::down-arrow {{ {arrow} width: 16px; height: 16px; }}
+{combo_controls(arrow_image)}
 QComboBox QAbstractItemView {{ background: {c.bg_weak.qss}; color: {c.text.qss};
     border: 1px solid {c.border_weak.qss}; selection-background-color: {c.bg_strong.qss};
     selection-color: {c.text.qss}; padding: 4px; {_font(BODY)} }}

@@ -4,6 +4,7 @@ from xgw.gui import model
 
 from .. import theme
 from ..qt import QtCore, QtGui, QtWidgets, Signal
+from ..theme import tokens
 from ..views.main_window import MainWindow
 from .panels import Card, Details, Settings, WidgetBar
 from .sidebar import Sidebar
@@ -21,7 +22,7 @@ class XgwWindow(MainWindow):
     def __init__(self, bridge, login, session_path, **kwargs):
         self.login, self.session_path = login, session_path
         super().__init__(bridge, title="XGW", **kwargs)
-        self.tools = ToolsWindow(bridge, self)
+        self.tools = ToolsWindow(bridge, self, arrow_image=self.combo_arrow(tokens.LIGHT))
         bridge.section_requested.connect(self.open_section)
         login.finished.connect(self.on_login)
 
@@ -52,10 +53,21 @@ class XgwWindow(MainWindow):
             #SidebarPane QAbstractItemView::item:selected {{
                 background: {c.fill_active.qss}; color: {c.text.qss};
             }}
-            #SidebarPane QPushButton, #SidebarPane QComboBox, #SettingsDrawer QPushButton,
-            #SettingsDrawer QComboBox, QToolButton#XgwTool {{
+            #SidebarPane QPushButton, #SettingsDrawer QPushButton, QToolButton#XgwTool {{
                 background: {c.pane.qss}; color: {c.text.qss};
                 border: 1px solid {c.border_weak.qss}; border-radius: 6px; padding: 5px;
+            }}
+            #SidebarPane QComboBox, #SettingsDrawer QComboBox {{
+                background: {c.pane.qss}; color: {c.text.qss};
+                border: 1px solid {c.border_weak.qss}; border-radius: 6px;
+                padding: 5px 7px;
+            }}
+            #SidebarPane QComboBox:hover, #SidebarPane QComboBox:on,
+            #SettingsDrawer QComboBox:hover, #SettingsDrawer QComboBox:on {{
+                background: {c.fill_hover.qss};
+            }}
+            #SidebarPane QComboBox:focus, #SettingsDrawer QComboBox:focus {{
+                border-color: {c.border_focus.qss};
             }}
             #SidebarPane QPushButton:hover, QToolButton#XgwTool:hover {{
                 background: {c.fill_active.qss};

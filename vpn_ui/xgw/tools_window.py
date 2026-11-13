@@ -7,6 +7,7 @@ from xgw.gui.traffic import TrafficPage
 from xgw.gui.zapret2 import Zapret2Page
 
 from ..qt import QtCore, QtGui, QtWidgets
+from ..theme.qss_builder import combo_controls
 
 PAGES = {"servers": ("Серверы", ServersPage), "subscriptions": ("Подписки", SubscriptionsPage),
          "devices": ("Устройства", DevicesPage), "traffic": ("Трафик", TrafficPage),
@@ -15,7 +16,7 @@ PAGES = {"servers": ("Серверы", ServersPage), "subscriptions": ("Подп
 
 
 class ToolsWindow(QtWidgets.QMainWindow):
-    def __init__(self, bridge, parent=None):
+    def __init__(self, bridge, parent=None, *, arrow_image=""):
         super().__init__(parent)
         self.bridge = bridge
         self.client = bridge.client
@@ -27,7 +28,7 @@ class ToolsWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(680, 520)
         colors = theme.current()
         self.setPalette(theme.palette(colors))
-        self.setStyleSheet(theme.stylesheet(colors))
+        self.setStyleSheet(theme.stylesheet(colors) + combo_controls(arrow_image))
         bridge.gateway_changed.connect(self.refresh)
         self.client.actionFinished.connect(self.action_done)
 
