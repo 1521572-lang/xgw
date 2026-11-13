@@ -455,9 +455,10 @@ retry_seconds = 300
 daily_probe_mb = 256
 
 # Универсальный L3/L4-движок для исходов прокси и direct. auto — использовать nfqws2, если
-# найдены исполняемый файл и оба Lua; off — только Xray/sing-box. При mode = selective/compare
+# найдены исполняемый файл и оба Lua; off — только Xray/sing-box (по умолчанию).
+# Наличие установленного nfqws2 само по себе не включает движок. При mode = selective/compare
 # универсальный движок не запускается: очередь занята проверкой выбранных доменов.
-engine = "auto"
+engine = "off"
 # Профиль до обучения сканером: seqovl, hostfakesplit или disorder-badseq.
 engine_profile = "seqovl"
 engine_queue = 200

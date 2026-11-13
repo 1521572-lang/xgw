@@ -230,7 +230,10 @@ class Runtime:
                     raise ValueError("unsafe_directory")
 
     def start(self, cfg: Config, installation: Installation, profile: str) -> None:
-        if self.alive(cfg.zapret2.engine_queue):
+        key = (str(installation.binary), cfg.zapret2.engine_queue, profile)
+        if self.key is not None or self.alive(cfg.zapret2.engine_queue):
+            # Подхватываем оставшийся unit XGW либо завершаем предыдущую попытку запуска.
+            self.key = self.key or key
             self.stop()
         if self.occupied(cfg.zapret2.engine_queue):
             raise ValueError("queue_busy")
@@ -246,6 +249,9 @@ class Runtime:
             "ProtectKernelModules=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX",
         ]
+        # Таймаут systemd-run не гарантирует, что unit не создан. С этого момента
+        # требуется остановка, даже если подтверждения запуска мы не получили.
+        self.key = key
         try:
             self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,
                          *[arg for item in properties for arg in ("--property", item)], *args],
@@ -253,17 +259,18 @@ class Runtime:
         except Exception:
             self.offload.restore()
             raise
-        self.key = (str(installation.binary), cfg.zapret2.engine_queue, profile)
 
     def stop(self) -> None:
         try:
+            if self.key is None:
+                return  # Движок не запускался: не обращаться к systemd/polkit при выходе.
             self.runner(["systemctl", "stop", UNIT], check=False, timeout=10)
             state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
             if state in ("active", "activating", "deactivating"):
                 raise cmd.CommandError("nfqws2: остановка не подтверждена")
+            self.key = None  # При ошибке остановки следующая попытка всё ещё обязательна.
         finally:
             self.offload.restore()
-            self.key = None
 
 
 class Controller:
@@ -285,10 +292,8 @@ class Controller:
         installation = find_installation(cfg) if enabled(cfg) and active else None
         if installation is None:
             if self.profile or self.runtime.key is not None:
-                try:
+                with contextlib.suppress(OSError, cmd.CommandError):
                     self.runtime.stop()
-                except (OSError, cmd.CommandError):
-                    pass
             self.profile = ""
             self.installation = None
             reason = "disabled" if not enabled(cfg) else ("inactive" if not active else "not_found")

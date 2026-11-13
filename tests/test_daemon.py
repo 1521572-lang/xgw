@@ -1350,10 +1350,12 @@ def test_stop_during_a_refresh_does_not_start_an_apply(daemon):
     assert engine.read_json(daemon.paths.xray_config_file) == before
 
 
-def test_stop_during_a_subscription_poll_ends_it_at_once(daemon, monkeypatch):
+@pytest.mark.parametrize("nfq_engine", ["off", "auto"])
+def test_stop_during_a_subscription_poll_ends_it_at_once(daemon, monkeypatch, nfq_engine):
     """SIGTERM, пока подписка ждёт ответа: ожидание прерывается, следующая подписка не
     запрашивается, и прерванный опрос — не сбой подписки (ни события, ни ошибки в панели,
     ни нового списка серверов). На машине такая остановка ждала таймаутов запроса."""
+    daemon.cfg.zapret2.engine = nfq_engine
     _started(daemon)
     daemon.cfg.subscriptions = [Subscription(name="main", url="https://subs.example.org/a"),
                                 Subscription(name="second", url="https://subs.example.org/b")]
@@ -1361,21 +1363,38 @@ def test_stop_during_a_subscription_poll_ends_it_at_once(daemon, monkeypatch):
     monkeypatch.setattr(engine, "healthy_http_in", lambda _cfg: None)
     stop = threading.Event()
     asked: list[str] = []
+    timing: dict[str, float | bool] = {}
 
     def fake(url, **kwargs):
         asked.append(url)
         stop.set()  # SIGTERM пришёл, пока ждали ответа
         cancel = kwargs.get("cancel")
-        if cancel is not None and cancel.wait(5):
+        timing["cancel_set"] = cancel is not None and cancel.is_set()
+        began = time.monotonic()
+        cancelled = cancel is not None and cancel.wait(5)
+        timing["cancel_wait_s"] = time.monotonic() - began
+        if cancelled:
             raise fetch.Cancelled
         raise fetch.FetchError("timed out")
 
+    close = daemon._nfqws2.close
+
+    def timed_close():
+        began = time.monotonic()
+        try:
+            close()
+        finally:
+            timing["nfqws2_close_s"] = time.monotonic() - began
+
+    monkeypatch.setattr(daemon._nfqws2, "close", timed_close)
     monkeypatch.setattr(engine.fetch, "fetch_subscription", fake)
     inventory_before = engine.inventory_file(daemon.paths).read_bytes()
     daemon.next_refresh = 0.0
     started = time.monotonic()
     assert _run_once(daemon, stop) == [1]
-    assert time.monotonic() - started < 2
+    timing["total_s"] = time.monotonic() - started
+    assert timing["total_s"] < 2, timing
+    assert timing["cancel_set"], timing
     assert asked == ["https://subs.example.org/a"]
     assert daemon.applied == [] and daemon._sub_failing_since is None
     assert daemon.store.get_meta("sub_errors") in (None, "", "{}")

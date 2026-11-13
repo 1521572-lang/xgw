@@ -62,6 +62,17 @@ def test_minimal_file_gives_defaults(tmp_path):
     assert cfg.dns.bootstrap[0] == "https://1.1.1.1/dns-query"
 
 
+@pytest.mark.parametrize("value, expected", [(None, "off"), ("off", "off"), ("auto", "auto")])
+def test_nfqws2_requires_explicit_enable(tmp_path, value, expected):
+    path = tmp_path / "config.toml"
+    path.write_text("[zapret2]\n" + (f'engine = "{value}"\n' if value else ""), encoding="utf-8")
+    cfg, warnings = load(path)
+    assert cfg.zapret2.engine == expected
+    assert warnings == []
+    example, _warnings = load(EXAMPLE)
+    assert example.zapret2.engine == "off"
+
+
 def test_unknown_keys_and_sections_warn(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(

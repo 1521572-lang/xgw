@@ -9,6 +9,7 @@ from xgw.generator import fragment, profiles
 from xgw.generator.builder import build, select_nodes
 from xgw.model import ServerNode
 from xgw.net import nft
+from xgw.net.cmd import CommandError
 
 
 class GeneratorTests(unittest.TestCase):
@@ -107,12 +108,81 @@ class EngineTests(unittest.TestCase):
 
         runtime = BrokenRuntime()
         controller = nfqws2.Controller(runtime)
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
         with mock.patch("xgw.nfqws2.find_installation", return_value=self.installation):
-            controller.step(Config(), [], active=True)
+            controller.step(cfg, [], active=True)
         self.assertEqual(controller.view, {
             "state": "fallback", "reason": "unsafe_files", "profile": "seqovl",
         })
         self.assertEqual(runtime.stopped, 1)
+
+    def test_disabled_engine_does_not_touch_runtime(self):
+        runner = mock.Mock(return_value="inactive")
+        controller = nfqws2.Controller(nfqws2.Runtime(runner))
+        cfg = Config()
+        self.assertEqual(cfg.zapret2.engine, "off")
+        with mock.patch("xgw.nfqws2.find_installation", return_value=self.installation) as find:
+            controller.step(cfg, [], active=True)
+            controller.close()
+        find.assert_not_called()
+        runner.assert_not_called()
+
+    def test_failed_preflight_does_not_stop_service(self):
+        runner = mock.Mock(return_value="inactive")
+        runtime = nfqws2.Runtime(runner)
+        controller = nfqws2.Controller(runtime)
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
+        with (mock.patch("xgw.nfqws2.find_installation", return_value=self.installation),
+              mock.patch.object(runtime, "occupied", return_value=False),
+              mock.patch.object(runtime, "_check_files", side_effect=ValueError("unsafe_files"))):
+            controller.step(cfg, [], active=True)
+            controller.close()
+        self.assertEqual(controller.view["reason"], "unsafe_files")
+        runner.assert_called_once_with(
+            ["systemctl", "is-active", nfqws2.UNIT], check=False, timeout=5,
+        )
+
+    def test_runtime_stops_started_worker_once(self):
+        runner = mock.Mock(return_value="inactive")
+        runtime = nfqws2.Runtime(runner)
+        with (mock.patch.object(runtime, "occupied", return_value=False),
+              mock.patch.object(runtime, "_check_files")):
+            runtime.start(Config(), self.installation, "seqovl")
+        runner.reset_mock()
+        controller = nfqws2.Controller(runtime)
+        controller.close()
+        controller.close()
+        self.assertEqual(runner.call_args_list, [
+            mock.call(["systemctl", "stop", nfqws2.UNIT], check=False, timeout=10),
+            mock.call(["systemctl", "is-active", nfqws2.UNIT], check=False, timeout=5),
+        ])
+        self.assertIsNone(runtime.key)
+
+    def test_failed_start_and_stop_keep_cleanup_pending(self):
+        def run(argv, **kwargs):
+            if argv[0] == "systemd-run":
+                raise CommandError("start timed out after unit creation")
+            return "inactive"
+
+        runner = mock.Mock(side_effect=run)
+        runtime = nfqws2.Runtime(runner)
+        with (mock.patch.object(runtime, "occupied", return_value=False),
+              mock.patch.object(runtime, "_check_files"),
+              self.assertRaises(CommandError)):
+            runtime.start(Config(), self.installation, "seqovl")
+        runner.side_effect = CommandError("stop timed out")
+        controller = nfqws2.Controller(runtime)
+        with self.assertRaises(CommandError):
+            controller.close()
+        self.assertIsNotNone(runtime.key)
+        runner.reset_mock()
+        runner.side_effect = None
+        runner.return_value = "inactive"
+        controller.close()
+        runner.assert_any_call(["systemctl", "stop", nfqws2.UNIT], check=False, timeout=10)
+        self.assertIsNone(runtime.key)
 
 
 if __name__ == "__main__":

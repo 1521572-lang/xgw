@@ -397,7 +397,7 @@ class Zapret2:
     check_seconds: int = 180
     retry_seconds: int = 300
     daily_probe_mb: int = 256
-    engine: str = "auto"
+    engine: str = "off"
     engine_profile: str = "seqovl"
     engine_queue: int = 200
     engine_offload: bool = True
