@@ -42,6 +42,8 @@ class XgwWindow(MainWindow):
     def apply_theme(self, name):
         super().apply_theme(name)
         c = theme.palette()
+        self.bridge.settings.theme = c.name
+        self.drawer.sync_theme()
         app = QtWidgets.QApplication.instance()
         app.setStyleSheet(app.styleSheet() + f"""
             #TitleBar {{ background: {c.bg_norm.qss}; }}
@@ -73,6 +75,29 @@ class XgwWindow(MainWindow):
                 background: {c.fill_active.qss};
             }}
             #SidebarPane QPushButton:disabled {{ color: {c.text_hint.qss}; }}
+            QFrame#GatewayDetails {{ background: {c.pane.qss};
+                border: 1px solid {c.border_weak.qss}; border-radius: 12px; }}
+            QLabel#GatewayCaption {{ color: {c.text_weak.qss}; font-size: 12px; }}
+            QLabel#GatewayServer {{ color: {c.text.qss}; font-size: 18px; font-weight: 600; }}
+            QLabel#GatewayStatus {{ color: {c.text_weak.qss}; background: {c.fill.qss};
+                border-radius: 7px; padding: 3px 8px; font-size: 12px; }}
+            QLabel#GatewayStatus[tone="ok"] {{ color: {c.success.qss}; }}
+            QLabel#GatewayStatus[tone="warn"], QLabel#GatewayStatus[tone="busy"] {{
+                color: {c.text.qss}; background: {c.warning.alpha(0.15).qss}; }}
+            QLabel#GatewayStatus[tone="bad"] {{ color: {c.danger.qss}; }}
+            QFrame#GatewayMetric {{ background: {c.fill.qss}; border: none; border-radius: 7px; }}
+            QLabel#GatewayValue {{ color: {c.text.qss}; font-size: 14px; font-weight: 600; }}
+            QPushButton#GatewayLink {{ background: transparent; color: {c.link.qss};
+                border: 1px solid transparent; border-radius: 6px; padding: 5px 8px; }}
+            QPushButton#GatewayLink:hover {{ background: {c.fill_hover.qss}; }}
+            QPushButton#GatewayLink:focus {{ border-color: {c.border_focus.qss}; }}
+            QToolButton#XgwTool[gatewayTone="ok"] {{ border-color: {c.success.qss}; }}
+            QToolButton#XgwTool[gatewayTone="bad"] {{ border-color: {c.danger.qss}; }}
+            #SettingsDrawer QPushButton#SettingsLink {{ text-align: left;
+                background: {c.fill.qss}; border: none; padding: 10px 12px; }}
+            #SettingsDrawer QPushButton#SettingsLink:hover {{ background: {c.fill_hover.qss}; }}
+            #SettingsDrawer QPushButton#SettingsLink:focus {{
+                border: 1px solid {c.border_focus.qss}; }}
         """)
 
     def _refocus(self):

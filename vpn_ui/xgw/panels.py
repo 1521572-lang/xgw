@@ -7,6 +7,7 @@ from ..qt import Qt, QtCore, QtWidgets, Signal
 from ..theme import svg_loader
 from ..theme.tokens import Metrics
 from ..views.connection_card_view import ConnectionCardView
+from .overview import guard_status, overview, zapret_status
 
 SECTIONS = (("zapret2", "zapret2"), ("devices", "Устройства"), ("traffic", "Трафик"),
             ("diagnostics", "Диагностика"), ("extra", "Ещё"))
@@ -45,8 +46,10 @@ class Card(ConnectionCardView):
             self.badge.show_flag(country)
         else:
             self.badge.show_icon("Bolt")
-        self.title.setText(power.title)
-        self.subtitle.setText(power.sub)
+        self.title.setText("Нет свежих данных" if bridge.stale else power.title)
+        self.subtitle.setText("Войдите в панель для управления шлюзом" if
+                              bridge.link == api.LINK_AUTH else
+                              "Ожидается ответ шлюза" if bridge.stale else power.sub)
         self.flags.hide()
         self.more.hide()
         self.pill.hide()
@@ -65,51 +68,104 @@ class Card(ConnectionCardView):
         self.error.setVisible(bool(bridge.message))
 
 
+def plain_label(name):
+    label = QtWidgets.QLabel()
+    label.setObjectName(name)
+    label.setTextFormat(Qt.TextFormat.PlainText)
+    label.setWordWrap(True)
+    label.setMinimumWidth(0)
+    return label
+
+
+class Metric(QtWidgets.QFrame):
+    def __init__(self, title, tooltip, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GatewayMetric")
+        self.setMinimumHeight(58)
+        box = QtWidgets.QVBoxLayout(self)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(3)
+        caption = plain_label("GatewayCaption")
+        caption.setText(title)
+        self.value = plain_label("GatewayValue")
+        self.value.setText("—")
+        self.setToolTip(tooltip)
+        box.addWidget(caption)
+        box.addWidget(self.value)
+
+
 class Details(QtWidgets.QFrame):
     def __init__(self, bridge, parent=None):
         super().__init__(parent)
         self.bridge = bridge
-        self.setObjectName("SidebarPane")
+        self.setObjectName("GatewayDetails")
+        self.setAccessibleName("Текущее соединение шлюза")
         box = QtWidgets.QVBoxLayout(self)
-        self.status = QtWidgets.QLabel()
-        self.server = QtWidgets.QLabel()
-        self.metrics = QtWidgets.QLabel()
-        self.guard = QtWidgets.QLabel()
-        self.live = QtWidgets.QLabel("Текущая скорость и внешний IP: нет данных")
-        for label in (self.status, self.server, self.metrics, self.guard, self.live):
-            label.setWordWrap(True)
-            label.setTextFormat(Qt.TextFormat.PlainText)
-            box.addWidget(label)
-        self.setToolTip("Замеры сервера — последние пробы XGW. "
-                        "Страна на карте определяется по IP точки подключения.")
+        box.setContentsMargins(16, 12, 16, 12)
+        box.setSpacing(7)
+        heading = QtWidgets.QHBoxLayout()
+        title = plain_label("GatewayCaption")
+        title.setText("ТЕКУЩЕЕ СОЕДИНЕНИЕ")
+        self.status = plain_label("GatewayStatus")
+        heading.addWidget(title)
+        heading.addStretch(1)
+        heading.addWidget(self.status)
+        box.addLayout(heading)
+        self.server = plain_label("GatewayServer")
+        self.source = plain_label("GatewayCaption")
+        box.addWidget(self.server)
+        box.addWidget(self.source)
+        self.grid = QtWidgets.QGridLayout()
+        self.grid.setSpacing(6)
+        self.speed = Metric("Последний замер", "Последняя проба сервера, не текущая скорость.")
+        self.rtt = Metric("Задержка RTT", "Время соединения в последней пробе XGW.")
+        self.core = Metric("Ядро сервера", "Ядро, обслуживающее текущий VPN-сервер.")
+        self.policy = Metric("При отказе", "Политика доступа, переданная шлюзом.")
+        self.cells = (self.speed, self.rtt, self.core, self.policy)
+        self._wide = None
+        self.set_wide(True)
+        box.addLayout(self.grid)
+        foot = QtWidgets.QHBoxLayout()
+        self.live = plain_label("GatewayCaption")
+        self.live.setText("Текущая скорость и внешний IP: нет данных")
+        traffic = QtWidgets.QPushButton("Трафик  ›")
+        traffic.setObjectName("GatewayLink")
+        traffic.setAccessibleName("Открыть расход трафика")
+        traffic.clicked.connect(lambda: bridge.section_requested.emit("traffic"))
+        foot.addWidget(self.live, 1)
+        foot.addWidget(traffic)
+        box.addLayout(foot)
         bridge.gateway_changed.connect(self.refresh)
         self.refresh()
 
-    def set_wide(self, _wide):
-        pass
+    def set_wide(self, wide):
+        if self._wide == wide:
+            return
+        self._wide = wide
+        self.setMinimumHeight(206 if wide else 266)
+        for cell in self.cells:
+            self.grid.removeWidget(cell)
+        for col in range(4):
+            self.grid.setColumnStretch(col, 1 if col < (4 if wide else 2) else 0)
+        for index, cell in enumerate(self.cells):
+            self.grid.addWidget(cell, 0 if wide else index // 2, index if wide else index % 2)
+        self.updateGeometry()
 
     def refresh(self):
         b = self.bridge
-        _tone, title = model.shield(b.state or None, b.stale, acting=b.busy)
-        self.status.setText(title)
-        zapret = b.state.get("zapret2") or {}
-        direct = zapret.get("without_vpn")
-        main = model.main_server(b.state) if not direct and not b.stale else None
-        self.server.setText("Сервер: " + model.split_flag(main.name)[1] if main else
-                            "Домашний адрес · VPN-серверы не используются" if direct and not b.stale
-                            else "Текущий сервер: нет подтверждённых данных")
-        if main:
-            self.metrics.setText(f"Последний замер: {model.mbps_text(main.speed_mbps)} · "
-                                 f"RTT {model.ms_text(main.rtt_ms)} · ядро {main.core or '—'}")
-        else:
-            self.metrics.setText("Замеры VPN-сервера: нет данных")
-        capture = b.state.get("capture") or {}
-        self.guard.setText("Блокировка при отказе: нет свежих данных" if b.stale else
-            "Блокировка трафика: активна" if capture.get("blocked") else
-            "Перехват выключен: прямой интернет" if capture.get("mode") == "off" else
-            "При отказе интернет закрывается" if capture.get("fail_mode") == "closed" else
-            "При отказе допускается прямой интернет" if capture.get("fail_mode") == "open" else
-            "Политика блокировки: нет данных")
+        view = overview(b.state, b.stale, b.busy)
+        self.status.setText(view.status)
+        self.status.setProperty("tone", view.tone)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+        self.server.setText(view.server)
+        self.source.setText(view.source)
+        self.speed.value.setText(view.speed)
+        self.rtt.value.setText(view.rtt)
+        self.core.value.setText(view.core)
+        guard = guard_status(b.state, b.stale)
+        self.policy.value.setText(guard.text)
+        self.policy.setToolTip(guard.detail)
 
 
 class WidgetBar(QtWidgets.QFrame):
@@ -141,8 +197,24 @@ class WidgetBar(QtWidgets.QFrame):
         settings.clicked.connect(self.settings_requested)
         box.addWidget(settings)
         self.buttons.append(settings)
+        self.zapret_note = plain_label("GatewayCaption")
+        self.zapret_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zapret_note.setAccessibleName("Состояние zapret2")
+        box.insertWidget(1, self.zapret_note)
+        bridge.gateway_changed.connect(lambda: self.refresh(bridge))
         theme.manager().changed.connect(self.retint)
         self.retint()
+        self.refresh(bridge)
+
+    def refresh(self, bridge):
+        status = zapret_status(bridge.state, bridge.stale)
+        self.zapret_note.setText(status.text)
+        self.zapret_note.setToolTip(status.detail)
+        self.buttons[0].setToolTip("zapret2 · " + status.text + "\n" + status.detail)
+        self.buttons[0].setAccessibleName("zapret2 · " + status.text + ". Открыть управление")
+        self.buttons[0].setProperty("gatewayTone", status.tone)
+        self.buttons[0].style().unpolish(self.buttons[0])
+        self.buttons[0].style().polish(self.buttons[0])
 
     def retint(self):
         for button in self.buttons:
@@ -156,8 +228,9 @@ class WidgetBar(QtWidgets.QFrame):
                  else Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         for button in self.buttons:
             button.setToolButtonStyle(style)
-            button.setAccessibleName(button.text())
-            button.setMinimumHeight(58)
+            if button is not self.buttons[0]:
+                button.setAccessibleName(button.text())
+            button.setFixedHeight(40 if width <= Metrics.WIDGETS_COMPACT else 58)
             button.setFixedWidth(self.width() - 14)
 
 
@@ -168,26 +241,45 @@ class Settings(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("SettingsDrawer")
         box = QtWidgets.QVBoxLayout(self)
-        box.addWidget(QtWidgets.QLabel("Настройки XGW"))
+        box.setContentsMargins(20, 20, 20, 16)
+        box.setSpacing(12)
+        heading = plain_label("DrawerTitle")
+        heading.setText("Настройки XGW")
+        box.addWidget(heading)
+        about = plain_label("GatewayCaption")
+        about.setText("Подключения, устройства и оформление")
+        box.addWidget(about)
+        box.addSpacing(8)
         for title, section in (("Подписки и отдельные ссылки", "subscriptions"),
                                ("Серверы, ядра и приоритеты", "servers"),
                                ("Маршруты устройств и исключения", "devices"),
                                ("zapret2: режим и стратегия", "zapret2"),
                                ("Tailscale, телефоны и обновления", "extra")):
-            button = QtWidgets.QPushButton(title)
+            button = QtWidgets.QPushButton(title + "  ›")
+            button.setObjectName("SettingsLink")
+            button.setMinimumHeight(48)
+            button.setAccessibleName(title)
             button.clicked.connect(lambda _checked=False, key=section:
                                    bridge.section_requested.emit(key))
             box.addWidget(button)
-        box.addWidget(QtWidgets.QLabel("Тема оформления"))
+        box.addSpacing(12)
+        heading = plain_label("SectionTitle")
+        heading.setText("ОФОРМЛЕНИЕ")
+        box.addWidget(heading)
         self.theme = QtWidgets.QComboBox()
+        self.theme.setAccessibleName("Тема оформления")
         self.theme.addItem("Тёмная", "dark")
         self.theme.addItem("Светлая", "light")
         self.theme.activated.connect(lambda _index: bridge.request_settings(
             theme=self.theme.currentData()))
-        bridge.settings_changed.connect(lambda settings: self.theme.setCurrentIndex(
-            max(0, self.theme.findData(settings.theme))))
+        theme.manager().changed.connect(self.sync_theme)
+        self.sync_theme()
         box.addWidget(self.theme)
         box.addStretch(1)
         close = QtWidgets.QPushButton("Закрыть")
         close.clicked.connect(self.close_requested)
         box.addWidget(close)
+
+    def sync_theme(self):
+        # CLI и меню могут переопределить настройку моста до показа шторки.
+        self.theme.setCurrentIndex(max(0, self.theme.findData(theme.palette().name)))

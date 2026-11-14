@@ -166,6 +166,32 @@ def test_old_pool_reply_cannot_repopulate_after_auth_expiry(scene):
     assert b.pool is None
 
 
+def test_theme_override_and_overview_follow_displayed_state(scene, tmp_path, qapp):
+    from vpn_ui import theme
+
+    c, b, data = scene
+    b.settings.theme = "dark"
+    w = XgwWindow(b, Login(), tmp_path / "session", theme_name="light")
+    w.show()
+    qapp.processEvents()
+    assert w.drawer.theme.currentData() == b.settings.theme == theme.palette().name == "light"
+    assert w.details.speed.value.text() != "—"
+    w.toggle_theme()
+    assert w.drawer.theme.currentData() == b.settings.theme == theme.palette().name == "dark"
+    w.apply_theme("light")
+    assert w.drawer.theme.currentData() == "light"
+    b.on_link(client.LINK_OFFLINE, "Нет связи")
+    assert w.card.title.text() == "Нет свежих данных"
+    assert w.details.speed.value.text() == "—"
+    assert w.widgets.zapret_note.text() == "Нет связи"
+    b.on_link(client.LINK_OK, "")
+    data["zapret2"] = {"mode": "off", "state": "off", "title": "Выключен"}
+    b.on_state(data)
+    assert w.widgets.zapret_note.text() == "Выключен"
+    assert not c.sent  # Оформление и просмотр статуса не меняют маршрут.
+    w.close()
+
+
 def test_map_animates_to_active_endpoint_and_ignores_preview(scene, tmp_path, qapp):
     c, b, data = scene
     w = XgwWindow(b, Login(), tmp_path / "session")
