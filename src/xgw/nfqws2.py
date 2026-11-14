@@ -171,6 +171,16 @@ def launch_key(cfg: Config, installation: Installation, profile: str) -> LaunchK
             cfg.network.wan_if.strip() if offload else "")
 
 
+class OffloadError(cmd.CommandError):
+    """Код отказа offload для статуса; команды и приватные пути туда не попадают."""
+
+
+@dataclass(frozen=True)
+class OffloadFlag:
+    enabled: bool
+    fixed: bool
+
+
 class Offload:
     def __init__(self, runner=cmd.run):
         self.runner = runner
@@ -185,31 +195,75 @@ class Offload:
         raise ValueError("offload_interface")
 
     @staticmethod
-    def _enabled(value: str) -> bool:
-        return value.split(":", 1)[-1].strip().split()[0] == "on"
+    def parse(listing: str) -> dict[str, OffloadFlag]:
+        features = {}
+        for line in listing.splitlines():
+            name, _separator, value = line.partition(":")
+            name = name.strip()
+            if name not in OFFLOADS:
+                continue  # Заголовок Features for ..., пустые строки и прочие функции NIC.
+            words = value.split()
+            if not words or words[0] not in ("on", "off") or name in features:
+                raise OffloadError("offload_state")
+            features[name] = OffloadFlag(words[0] == "on", "[fixed]" in words)
+        if not features:
+            raise OffloadError("offload_state")
+        return features
+
+    def _read(self, interface: str) -> dict[str, OffloadFlag]:
+        try:
+            listing = self.runner(["ethtool", "-k", interface], timeout=10)
+        except (OSError, cmd.CommandError) as exc:
+            raise OffloadError("offload_read") from exc
+        return self.parse(listing)
+
+    def _set(self, values: dict[str, bool]) -> None:
+        if values:
+            args = ["ethtool", "-K", self.interface]
+            for name, enabled in values.items():
+                args += [name, "on" if enabled else "off"]
+            self.runner(args, timeout=10)
 
     def disable(self, interface: str) -> None:
+        if self.interface:
+            self.restore()  # Не затирать снимок, чей откат пока не подтверждён.
         interface = interface or self.wan_interface()
-        listing = self.runner(["ethtool", "-k", interface], timeout=10)
-        current = {line.split(":", 1)[0].strip(): self._enabled(line)
-                   for line in listing.splitlines() if ":" in line}
-        changes = {name: current[name] for name in OFFLOADS if current.get(name)}
+        current = self._read(interface)
+        if any(flag.enabled and flag.fixed for flag in current.values()):
+            raise OffloadError("offload_fixed")
+        changes = {name: False for name, flag in current.items() if flag.enabled}
         # ethtool может изменить часть флагов и завершиться ошибкой: откат всё равно нужен.
-        self.interface, self.saved = interface, changes
-        if changes:
-            args = ["ethtool", "-K", interface]
-            for name in changes:
-                args += [name, "off"]
-            self.runner(args, timeout=10)
+        self.interface = interface
+        self.saved = {name: flag.enabled for name, flag in current.items()}
+        try:
+            self._set(changes)
+            actual = self._read(interface) if changes else current
+            if any(name not in actual or actual[name].enabled for name in current):
+                raise OffloadError("offload_apply")
+        except (OSError, cmd.CommandError) as exc:
+            raise OffloadError("offload_apply") from exc
 
     def restore(self) -> None:
         if not self.interface:
             return
-        args = ["ethtool", "-K", self.interface]
-        for name, enabled_before in self.saved.items():
-            args += [name, "on" if enabled_before else "off"]
-        if self.saved:
-            self.runner(args, timeout=10)
+        try:
+            current = self._read(self.interface)
+            changes = {}
+            for name, enabled_before in self.saved.items():
+                if name not in current:
+                    raise OffloadError("offload_restore")
+                if current[name].enabled != enabled_before:
+                    if current[name].fixed:
+                        raise OffloadError("offload_restore")
+                    changes[name] = enabled_before
+            self._set(changes)
+            actual = self._read(self.interface) if changes else current
+            if any(name not in actual or actual[name].enabled != value
+                   for name, value in self.saved.items()):
+                raise OffloadError("offload_restore")
+        except (OSError, cmd.CommandError) as exc:
+            # Снимок остаётся до успешного чтения и подтверждения исходных значений.
+            raise OffloadError("offload_restore") from exc
         self.interface, self.saved = "", {}
 
 
@@ -271,9 +325,11 @@ class Runtime:
 
     def start(self, cfg: Config, installation: Installation, profile: str) -> None:
         key = launch_key(cfg, installation, profile)
-        if self.key is not None or self.alive(cfg.zapret2.engine_queue):
-            # Подхватываем оставшийся unit XGW либо завершаем предыдущую попытку запуска.
-            self.key = self.key or key
+        if self.key is not None or self.offload.interface:
+            self.stop()
+        elif self.alive(cfg.zapret2.engine_queue):
+            # Подхватываем оставшийся unit XGW.
+            self.key = key
             self.stop()
         if self.occupied(cfg.zapret2.engine_queue):
             raise ValueError("queue_busy")
@@ -328,44 +384,53 @@ class Controller:
                 return profile
         return cfg.zapret2.engine_profile
 
+    def _stop(self) -> str:
+        try:
+            self.runtime.stop()
+        except OffloadError:
+            return "offload_restore"
+        except (OSError, cmd.CommandError):
+            return "worker_stop_failed"
+        self.profile, self.installation = "", None
+        return ""
+
     def step(self, cfg: Config, applied: Collection[str], *, active: bool,
              cancel: threading.Event | None = None) -> None:
         if cancel is not None and cancel.is_set():
-            self.close()
-            self.view = {"state": "off", "reason": "stopping"}
+            error = self._stop()
+            self.view = {"state": "fallback" if error else "off", "reason": error or "stopping"}
             return
         installation = find_installation(cfg) if enabled(cfg) and active else None
         if installation is None:
-            if self.profile or self.runtime.key is not None:
-                with contextlib.suppress(OSError, cmd.CommandError):
-                    self.runtime.stop()
-            self.profile = ""
-            self.installation = None
+            error = self._stop()
             reason = "disabled" if not enabled(cfg) else ("inactive" if not active else "not_found")
-            self.view = {"state": "off", "reason": reason}
+            self.view = {"state": "fallback" if error else "off", "reason": error or reason}
             return
         profile = self.selected_profile(cfg, applied)
         try:
             key = launch_key(cfg, installation, profile)
-            if key == self.runtime.key and self.runtime.alive(cfg.zapret2.engine_queue):
+            if (self.view["state"] == "active" and key == self.runtime.key
+                    and self.runtime.alive(cfg.zapret2.engine_queue)):
                 self.view = {"state": "active", "profile": profile,
                              "queue": cfg.zapret2.engine_queue}
                 return
             self.runtime.start(cfg, installation, profile)
             if not self.runtime.wait_ready(cfg.zapret2.engine_queue, cancel):
                 if cancel is not None and cancel.is_set():
-                    self.close()
-                    self.view = {"state": "off", "reason": "stopping"}
+                    error = self._stop()
+                    self.view = {"state": "fallback" if error else "off",
+                                 "reason": error or "stopping"}
                     return
                 raise ValueError("worker_down")
         except (OSError, ValueError, cmd.CommandError) as exc:
-            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
+            reason = str(exc) if isinstance(exc, (ValueError, OffloadError)) and str(exc) in {
                 "queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
                 "offload_interface", "unknown_profile", "worker_start_timeout",
+                "offload_state", "offload_read", "offload_fixed", "offload_apply",
+                "offload_restore",
             } else "runtime_failed"
-            with contextlib.suppress(OSError, cmd.CommandError):
-                self.runtime.stop()
-            self.view = {"state": "fallback", "reason": reason, "profile": profile}
+            error = self._stop()
+            self.view = {"state": "fallback", "reason": error or reason, "profile": profile}
             return
         self.profile, self.installation = profile, installation
         self.view = {"state": "active", "profile": profile, "queue": cfg.zapret2.engine_queue}

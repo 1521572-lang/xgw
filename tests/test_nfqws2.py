@@ -25,8 +25,11 @@ class WorkerHost:
         self.now = 0.0
         self.flags = dict.fromkeys(nfqws2.OFFLOADS, True)
         self.flags["tcp-segmentation-offload"] = False
+        self.fixed = {"tcp-segmentation-offload"}
         self.initial_flags = dict(self.flags)
         self.never_ready = False
+        self.ignore_offload_writes = False
+        self.offload_writes = []
 
     def sleep(self, seconds):
         self.now += seconds
@@ -45,10 +48,18 @@ class WorkerHost:
             self.starts += 1
             self.active, self.polls = True, 0
         elif args[:2] == ["ethtool", "-k"]:
-            return "\n".join(f"{name}: {'on' if value else 'off'}"
-                             for name, value in self.flags.items())
+            return "Features for test0:\nrx-checksumming: on\n\n" + "\n".join(
+                f"\t{name}: {'on' if value else 'off'}"
+                + (" [fixed]" if name in self.fixed else "")
+                for name, value in self.flags.items()
+            )
         elif args[:2] == ["ethtool", "-K"]:
-            self.flags.update({args[i]: args[i + 1] == "on" for i in range(3, len(args), 2)})
+            changes = {args[i]: args[i + 1] == "on" for i in range(3, len(args), 2)}
+            self.offload_writes.append(changes)
+            if self.fixed & changes.keys():
+                raise CommandError("fixed feature")
+            if not self.ignore_offload_writes:
+                self.flags.update(changes)
         return ""
 
 
@@ -183,9 +194,81 @@ class EngineTests(unittest.TestCase):
 
         controller.runtime.offload.runner = run
         controller.step(cfg, [], active=True)
-        self.assertEqual(controller.view["reason"], "runtime_failed")
+        self.assertEqual(controller.view["reason"], "offload_apply")
         self.assertEqual((host.starts, host.stops), (0, 0))
         self.assertEqual(host.flags, host.initial_flags)
+
+    def test_real_ethtool_layout_distinguishes_fixed_and_requested_flags(self):
+        listing = """Features for test0:
+rx-checksumming: on
+tx-checksumming: on
+    tx-checksum-ipv4: off [fixed]
+    tx-checksum-ip-generic: on
+tcp-segmentation-offload: off [fixed]
+    tx-tcp-ecn-segmentation: off [fixed]
+generic-segmentation-offload: on [requested off]
+generic-receive-offload: on
+
+unrelated-empty-field:
+"""
+        flags = nfqws2.Offload.parse(listing)
+        self.assertEqual(set(flags), set(nfqws2.OFFLOADS))
+        self.assertEqual(flags["tcp-segmentation-offload"], nfqws2.OffloadFlag(False, True))
+        self.assertEqual(flags["generic-segmentation-offload"], nfqws2.OffloadFlag(True, False))
+
+    def test_unknown_offload_state_is_not_assumed_disabled(self):
+        for listing in ("Features for test0:\n", "generic-receive-offload:\n",
+                        "generic-receive-offload: unknown\n",
+                        "generic-receive-offload: off\ngeneric-receive-offload: on\n"):
+            with self.subTest(listing=listing), self.assertRaisesRegex(
+                nfqws2.OffloadError, "offload_state",
+            ):
+                nfqws2.Offload.parse(listing)
+
+    def test_fixed_on_prevents_profile_without_changing_interface(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+        host.fixed.add("generic-receive-offload")
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "offload_fixed")
+        self.assertEqual((host.starts, host.stops), (0, 0))
+        self.assertEqual(host.offload_writes, [])
+        self.assertEqual(host.flags, host.initial_flags)
+
+    def test_successful_command_with_unchanged_flags_is_not_active(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+        host.ignore_offload_writes = True
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "offload_apply")
+        self.assertEqual((host.starts, host.stops), (0, 0))
+        self.assertEqual(host.flags, host.initial_flags)
+        self.assertEqual(controller.runtime.offload.saved, {})
+
+    def test_failed_restore_keeps_snapshot_blocks_start_and_retries_when_off(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+        controller.step(cfg, [], active=True)
+        saved = dict(controller.runtime.offload.saved)
+        self.assertEqual(saved, host.initial_flags)
+        host.ignore_offload_writes = True
+        cfg.zapret2.engine = "off"
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view, {"state": "fallback", "reason": "offload_restore"})
+        self.assertEqual(controller.runtime.offload.saved, saved)
+        cfg.zapret2.engine = "auto"
+        cfg.zapret2.engine_profile = "seqovl"
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "offload_restore")
+        self.assertEqual((host.starts, host.stops), (1, 1))
+        self.assertEqual(controller.runtime.offload.saved, saved)
+        host.ignore_offload_writes = False
+        cfg.zapret2.engine = "off"
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view, {"state": "off", "reason": "disabled"})
+        self.assertEqual(host.flags, host.initial_flags)
+        self.assertEqual(controller.runtime.offload.saved, {})
+        self.assertTrue(all(not (host.fixed & change.keys()) for change in host.offload_writes))
 
     def test_dead_worker_is_not_waited_for(self):
         cfg, controller, host = self.worker()
