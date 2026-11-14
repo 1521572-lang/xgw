@@ -59,6 +59,11 @@ class WorkerHost:
             if self.fixed & changes.keys():
                 raise CommandError("fixed feature")
             if not self.ignore_offload_writes:
+                # Групповая настройка TSO меняет и его дочерний флаг.
+                tso = "tcp-segmentation-offload"
+                child = "tx-tcp-mangleid-segmentation"
+                if tso in changes and child in self.flags and child not in self.fixed:
+                    self.flags[child] = changes[tso]
                 self.flags.update(changes)
         return ""
 
@@ -215,6 +220,67 @@ unrelated-empty-field:
         self.assertEqual(set(flags), set(nfqws2.OFFLOADS))
         self.assertEqual(flags["tcp-segmentation-offload"], nfqws2.OffloadFlag(False, True))
         self.assertEqual(flags["generic-segmentation-offload"], nfqws2.OffloadFlag(True, False))
+
+    def test_restoring_tso_does_not_leave_mangleid_enabled(self):
+        host = WorkerHost()
+        tso = "tcp-segmentation-offload"
+        child = "tx-tcp-mangleid-segmentation"
+        host.fixed.remove(tso)
+        host.flags.update({tso: True, child: False})
+        before = dict(host.flags)
+        offload = nfqws2.Offload(host.run)
+
+        offload.disable("test0")
+        self.assertFalse(host.flags[tso])
+        self.assertNotIn(child, host.offload_writes[0])
+        offload.restore()
+
+        self.assertEqual(host.flags, before)
+        self.assertTrue(host.offload_writes[-2][tso])
+        self.assertEqual(host.offload_writes[-1], {child: False})
+        self.assertEqual(offload.saved, {})
+
+    def test_mangleid_restore_retries_without_cycling_tso_again(self):
+        host = WorkerHost()
+        tso = "tcp-segmentation-offload"
+        child = "tx-tcp-mangleid-segmentation"
+        host.fixed.remove(tso)
+        host.flags.update({tso: True, child: False})
+        before = dict(host.flags)
+
+        def run(args, **kwargs):
+            if child in args and host.flags[tso]:
+                raise CommandError("driver refused mangleid change")
+            return host.run(args, **kwargs)
+
+        offload = nfqws2.Offload(run)
+        offload.disable("test0")
+        with self.assertRaisesRegex(nfqws2.OffloadError, "offload_restore"):
+            offload.restore()
+        self.assertEqual(offload.saved, before)
+        self.assertTrue(host.flags[child])
+
+        offload.runner = host.run
+        writes = len(host.offload_writes)
+        offload.restore()
+        self.assertEqual(host.offload_writes[writes:], [{child: False}])
+        self.assertEqual(host.flags, before)
+
+    def test_fixed_mangleid_is_unchanged_when_driver_preserves_it(self):
+        host = WorkerHost()
+        tso = "tcp-segmentation-offload"
+        child = "tx-tcp-mangleid-segmentation"
+        host.fixed.remove(tso)
+        host.flags.update({tso: True, child: False})
+        host.fixed.add(child)
+        before = dict(host.flags)
+        offload = nfqws2.Offload(host.run)
+
+        offload.disable("test0")
+        offload.restore()
+
+        self.assertEqual(host.flags, before)
+        self.assertTrue(all(child not in changes for changes in host.offload_writes))
 
     def test_unknown_offload_state_is_not_assumed_disabled(self):
         for listing in ("Features for test0:\n", "generic-receive-offload:\n",

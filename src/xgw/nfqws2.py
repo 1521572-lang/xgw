@@ -29,6 +29,7 @@ BLOBS = (
 )
 OFFLOADS = ("generic-receive-offload", "generic-segmentation-offload",
             "tcp-segmentation-offload", "tx-checksum-ip-generic")
+TSO_MANGLEID = "tx-tcp-mangleid-segmentation"
 READY_TIMEOUT = 3.0
 READY_POLL = 0.1
 LaunchKey = tuple[tuple[str, ...], bool, str]
@@ -200,13 +201,13 @@ class Offload:
         for line in listing.splitlines():
             name, _separator, value = line.partition(":")
             name = name.strip()
-            if name not in OFFLOADS:
+            if name not in OFFLOADS and name != TSO_MANGLEID:
                 continue  # Заголовок Features for ..., пустые строки и прочие функции NIC.
             words = value.split()
             if not words or words[0] not in ("on", "off") or name in features:
                 raise OffloadError("offload_state")
             features[name] = OffloadFlag(words[0] == "on", "[fixed]" in words)
-        if not features:
+        if not any(name in features for name in OFFLOADS):
             raise OffloadError("offload_state")
         return features
 
@@ -229,16 +230,17 @@ class Offload:
             self.restore()  # Не затирать снимок, чей откат пока не подтверждён.
         interface = interface or self.wan_interface()
         current = self._read(interface)
-        if any(flag.enabled and flag.fixed for flag in current.values()):
+        managed = {name: current[name] for name in OFFLOADS if name in current}
+        if any(flag.enabled and flag.fixed for flag in managed.values()):
             raise OffloadError("offload_fixed")
-        changes = {name: False for name, flag in current.items() if flag.enabled}
+        changes = {name: False for name, flag in managed.items() if flag.enabled}
         # ethtool может изменить часть флагов и завершиться ошибкой: откат всё равно нужен.
         self.interface = interface
         self.saved = {name: flag.enabled for name, flag in current.items()}
         try:
             self._set(changes)
             actual = self._read(interface) if changes else current
-            if any(name not in actual or actual[name].enabled for name in current):
+            if any(name not in actual or actual[name].enabled for name in managed):
                 raise OffloadError("offload_apply")
         except (OSError, cmd.CommandError) as exc:
             raise OffloadError("offload_apply") from exc
@@ -250,6 +252,8 @@ class Offload:
             current = self._read(self.interface)
             changes = {}
             for name, enabled_before in self.saved.items():
+                if name == TSO_MANGLEID:
+                    continue
                 if name not in current:
                     raise OffloadError("offload_restore")
                 if current[name].enabled != enabled_before:
@@ -258,6 +262,17 @@ class Offload:
                     changes[name] = enabled_before
             self._set(changes)
             actual = self._read(self.interface) if changes else current
+            if TSO_MANGLEID in self.saved:
+                # Включение TSO может включить mangleid. Сравниваем после восстановления TSO.
+                flag = actual.get(TSO_MANGLEID)
+                enabled_before = self.saved[TSO_MANGLEID]
+                if flag is None:
+                    raise OffloadError("offload_restore")
+                if flag.enabled != enabled_before:
+                    if flag.fixed:
+                        raise OffloadError("offload_restore")
+                    self._set({TSO_MANGLEID: enabled_before})
+                    actual = self._read(self.interface)
             if any(name not in actual or actual[name].enabled != value
                    for name, value in self.saved.items()):
                 raise OffloadError("offload_restore")
