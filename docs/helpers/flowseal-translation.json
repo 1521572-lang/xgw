@@ -1,0 +1,3501 @@
+{
+ "source_commit": "2401b7a13837139b0265632464ba563dddbf80d8",
+ "release_label": "1.10.4",
+ "reference_defaults": {
+  "ts": -600000,
+  "badseq": -10000,
+  "badack": -66000,
+  "repeats": 1,
+  "note": "справочный zapret1 1e1d1e2; версия bundled winws Flowseal не сопоставлена"
+ },
+ "global_note": "wf-tcp/wf-udp — фильтры WinDivert (Windows-only); в nfqws2 эквивалент — правила очереди XGW; объём ограничен тестовым YouTube-потоком; значение disabled-режима GameFilter=12 подразумевается в %GameFilter*%",
+ "configurations": {
+  "general (ALT)": {
+   "file": "general (ALT).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_hex_00:0x00",
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:ip_id=zero:tcp_ts=-600000",
+     "--lua-desync=fakedsplit:pattern=fl_hex_00:repeats=6:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun_bin:%LISTS%fl_stun_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fakedsplit:pattern=fl_hex_00:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fakedsplit:pattern=fl_hex_00:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_hex_00": "0x00",
+    "fl_stun_bin": "%BIN%stun.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT10)": {
+   "file": "general (ALT10).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun_bin:%LISTS%fl_stun_bin",
+     "--blob=fl_tls_clienthello_4pda_to_bin:%LISTS%fl_tls_clienthello_4pda_to_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_4pda_to_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_4pda_to_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_stun_bin": "%BIN%stun.bin",
+    "fl_tls_clienthello_4pda_to_bin": "%BIN%tls_clienthello_4pda_to.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT11)": {
+   "file": "general (ALT11).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=8:ip_id=zero:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--blob=fl_stun2_bin:%LISTS%fl_stun2_bin",
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=664:seqovl_pattern=fl_tls_clienthello_www_sferum_ru_bin"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=664:seqovl_pattern=fl_tls_clienthello_www_sferum_ru_bin"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_stun2_bin": "%BIN%stun2.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT12)": {
+   "file": "general (ALT12).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=www.google.com:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun_bin:%LISTS%fl_stun_bin",
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=664:seqovl_pattern=fl_tls_clienthello_www_sferum_ru_bin"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=664:seqovl_pattern=fl_tls_clienthello_www_sferum_ru_bin"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_stun_bin": "%BIN%stun.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT13)": {
+   "file": "general (ALT13).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=www.google.com:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun2_bin:%LISTS%fl_stun2_bin",
+     "--blob=fl_tls_clienthello_sochi_park_bin:%LISTS%fl_tls_clienthello_sochi_park_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_sochi_park_bin:repeats=5:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=5:tcp_ts=-600000",
+     "--lua-desync=hostfakesplit:host=mail.ru:repeats=5:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_sochi_park_bin:repeats=5:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_sochi_park_bin:repeats=5:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=5:tcp_ts=-600000",
+     "--lua-desync=hostfakesplit:host=mail.ru:repeats=5:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_sochi_park_bin:repeats=5:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_sochi_park_bin": "%BIN%tls_clienthello_sochi_park.bin",
+    "fl_stun2_bin": "%BIN%stun2.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "altorder=1 не поддержан pinned Lua zapret2 1.0.7; переведено без altorder — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует"
+   ]
+  },
+  "general (ALT2)": {
+   "file": "general (ALT2).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=2:seqovl=652:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=2:seqovl=652:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=2:seqovl=652:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT3)": {
+   "file": "general (ALT3).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_ts=-600000",
+     "--lua-desync=hostfakesplit:host=www.google.com:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ts=-600000",
+     "--lua-desync=hostfakesplit:host=ya.ru:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ts=-600000",
+     "--lua-desync=hostfakesplit:host=ya.ru:tls_mod=rnd,dupsid,sni=ya.ru:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "altorder=1 не поддержан pinned Lua zapret2 1.0.7; переведено без altorder — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT4)": {
+   "file": "general (ALT4).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:ip_id=zero:tcp_seq=1000:tcp_ack=-66000",
+     "--lua-desync=multisplit:ip_id=zero"
+    ],
+    [
+     "--blob=fl_stun_bin:%LISTS%fl_stun_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000",
+     "--lua-desync=multisplit"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000",
+     "--lua-desync=multisplit"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=1000:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_stun_bin": "%BIN%stun.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT5)": {
+   "file": "general (ALT5).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,2053,2083,2087,2096,8443",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=empty,tls_client_hello",
+     "--lua-desync=syndata",
+     "--lua-desync=multidisorder:pos=midsld"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "S09",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 4,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 5,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "multidisorder без split-pos: default winws не установлен (dp->splits пуст); подставлен pos=midsld (исторический default zapret1) — ADAPTED"
+   ]
+  },
+  "general (ALT6)": {
+   "file": "general (ALT6).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT7)": {
+   "file": "general (ALT7).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=2,sniext+1:seqovl=679:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=2,sniext+1:seqovl=679:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=syndata"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT8)": {
+   "file": "general (ALT8).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=6:ip_id=zero:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (ALT9)": {
+   "file": "general (ALT9).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=www.google.com:repeats=4:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=ozon.ru:repeats=4:tcp_ts=-600000:tcp_md5"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=ozon.ru:repeats=4:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (EXP)": {
+   "file": "general (EXP).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-l7=quic",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=www.google.com:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun2_bin:%LISTS%fl_stun2_bin",
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=4:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=480:seqovl_pattern=fl_stun2_bin"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=4:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--hostlist-exclude-domains=fonts.googleapis.com",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=4:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=480:seqovl_pattern=fl_stun2_bin"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--hostlist-exclude-domains=fonts.googleapis.com",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=4:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q_EXP",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin",
+    "fl_stun2_bin": "%BIN%stun2.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (FAKE TLS AUTO ALT)": {
+   "file": "general (FAKE TLS AUTO ALT).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_seq=2:tcp_ack=-66000",
+     "--lua-desync=fakedsplit:pos=1:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=2:tcp_ack=-66000",
+     "--lua-desync=fakedsplit:pos=1:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=2:tcp_ack=-66000",
+     "--lua-desync=fakedsplit:pos=1:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_seq=2:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (FAKE TLS AUTO ALT2)": {
+   "file": "general (FAKE TLS AUTO ALT2).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_seq=10000000:tcp_ack=-66000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=10000000:tcp_ack=-66000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_seq=10000000:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=10000000:tcp_ack=-66000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_seq=10000000:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (FAKE TLS AUTO ALT3)": {
+   "file": "general (FAKE TLS AUTO ALT3).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=8:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ts=-600000",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=8:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (FAKE TLS AUTO)": {
+   "file": "general (FAKE TLS AUTO).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--blob=fl_hex_00000000:0x00000000",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_hex_00000000:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:ip_id=zero:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=multidisorder:pos=1,midsld:ip_id=zero"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_hex_00000000:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=multidisorder:pos=1,midsld"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=11:tcp_seq=-10000:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=11"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_hex_00000000:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fake_default_tls:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000:tcp_ack=-66000",
+     "--lua-desync=multidisorder:pos=1,midsld"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=11:tcp_seq=-10000:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_hex_00000000": "0x00000000",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fake-tls=! — встроенный fake исходного winws; заменён builtin fake_default_tls nfqws2 (680 байт), побайтовое совпадение не доказано — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (SIMPLE FAKE ALT)": {
+   "file": "general (SIMPLE FAKE ALT).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:ip_id=zero:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--blob=fl_stun2_bin:%LISTS%fl_stun2_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=6:tcp_seq=2:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=6:tcp_seq=2:tcp_ack=-66000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_seq=2:tcp_ack=-66000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_stun2_bin": "%BIN%stun2.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "default ACK badseq не задан в BAT; подставлен справочный -66000 — ADAPTED (п.5)",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (SIMPLE FAKE ALT2)": {
+   "file": "general (SIMPLE FAKE ALT2).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_stun2_bin:%LISTS%fl_stun2_bin",
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_stun2_bin:repeats=6:tcp_ts=-600000",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_stun2_bin": "%BIN%stun2.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general (SIMPLE FAKE)": {
+   "file": "general (SIMPLE FAKE).bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=hostfakesplit:host=www.google.com:ip_id=zero:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_sferum_ru_bin:%LISTS%fl_tls_clienthello_www_sferum_ru_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_google_com_bin:repeats=6:tcp_ts=-600000"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=http_req",
+     "--lua-desync=fake:blob=fl_tls_clienthello_www_sferum_ru_bin:repeats=6:tcp_ts=-600000"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 5,
+     "kind": "H-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 7,
+     "kind": "S-HTTP",
+     "status": "INCLUDED",
+     "note": "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED"
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_tls_clienthello_www_sferum_ru_bin": "%BIN%tls_clienthello_www_sferum_ru.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 не выбирает blob по типу payload) — ADAPTED",
+    "fooling=ts: инкремент в BAT не задан; подставлен справочный TS_INCREMENT_DEFAULT=-600000 (zapret1 1e1d1e2), версия bundled winws не сопоставлена — ADAPTED (п.5)",
+    "hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  },
+  "general": {
+   "file": "general.bat",
+   "global_options_windows_only": [
+    [
+     "wf-tcp",
+     "80,443,2053,2083,2087,2096,8443,%GameFilterTCP%"
+    ],
+    [
+     "wf-udp",
+     "443,19294-19344,50000-50100,%GameFilterUDP%"
+    ]
+   ],
+   "blocks": [
+    [
+     "--blob=fl_quic_initial_www_google_com_bin:%LISTS%fl_quic_initial_www_google_com_bin",
+     "--filter-udp=443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--blob=fl_tls_clienthello_www_google_com_bin:%LISTS%fl_tls_clienthello_www_google_com_bin",
+     "--filter-tcp=443",
+     "--hostlist=%LISTS%list-google.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=681:seqovl_pattern=fl_tls_clienthello_www_google_com_bin:ip_id=zero"
+    ],
+    [
+     "--blob=fl_tls_clienthello_4pda_to_bin:%LISTS%fl_tls_clienthello_4pda_to_bin",
+     "--filter-tcp=80,443",
+     "--hostlist=%LISTS%list-general.txt",
+     "--hostlist=%LISTS%list-general-user.txt",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=568:seqovl_pattern=fl_tls_clienthello_4pda_to_bin"
+    ],
+    [
+     "--filter-udp=443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=quic_initial",
+     "--lua-desync=fake:blob=fl_quic_initial_www_google_com_bin:repeats=6"
+    ],
+    [
+     "--filter-tcp=80,443,8443",
+     "--hostlist-exclude=%LISTS%list-exclude.txt",
+     "--hostlist-exclude=%LISTS%list-exclude-user.txt",
+     "--ipset=%LISTS%ipset-all.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude.txt",
+     "--ipset-exclude=%LISTS%ipset-exclude-user.txt",
+     "--payload=tls_client_hello",
+     "--lua-desync=multisplit:pos=1:seqovl=568:seqovl_pattern=fl_tls_clienthello_4pda_to_bin"
+    ]
+   ],
+   "profiles": [
+    {
+     "profile": 1,
+     "kind": "Q",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 2,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 3,
+     "kind": "DISCORD_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке"
+    },
+    {
+     "profile": 4,
+     "kind": "G",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 5,
+     "kind": "H",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 6,
+     "kind": "I",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 7,
+     "kind": "S",
+     "status": "INCLUDED",
+     "note": ""
+    },
+    {
+     "profile": 8,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    },
+    {
+     "profile": 9,
+     "kind": "GAME_EXCLUDED",
+     "status": "EXCLUDED_COVERAGE",
+     "note": "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке"
+    }
+   ],
+   "blob_decls": {
+    "fl_quic_initial_www_google_com_bin": "%BIN%quic_initial_www_google_com.bin",
+    "fl_tls_clienthello_www_google_com_bin": "%BIN%tls_clienthello_www_google_com.bin",
+    "fl_tls_clienthello_4pda_to_bin": "%BIN%tls_clienthello_4pda_to.bin"
+   },
+   "notes": [
+    "Discord/STUN UDP-порты 19294-19344,50000-50100 и hostlist discord.media не участвуют в тестовом YouTube-потоке",
+    "GameFilter disabled (service.bat: GameFilter=12): порт 12 не встречается в тестовом потоке",
+    "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+   ]
+  }
+ }
+}
