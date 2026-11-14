@@ -1,5 +1,9 @@
 # ThinkCentre. Длинное видео YouTube напрямую с zapret2
 
+Прогон завершён, [отчёт](TEST-REPORT-REAL-MACHINE-0.2.0-nfqws2-youtube-live-2026-11-14.md) — FAIL.
+Следующее задание — [r2, исправление TLS-профилей и ограниченный перебор](TEST-PLAN-REAL-MACHINE-0.2.0-nfqws2-youtube-live-r2.md).
+Раздел 4 ниже используется новым ТЗ только как процедура доказательства пути.
+
 Ветка `gui-light`. Модуль nfqws2 из `c7500f6f40bdfbc9d16b1b23056063813a71a839` принят на
 ThinkCentre. Этот прогон использует установленный XGW и nfqws2. Проверяется универсальный
 движок `engine=auto` из r5, профиль `seqovl`. Режим `mode` остаётся `off`.
