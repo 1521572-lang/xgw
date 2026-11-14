@@ -136,8 +136,10 @@ class EngineTests(unittest.TestCase):
         cfg.notify.min_interval_min = 7
         controller.step(cfg, [], active=True)
         self.assertEqual((host.starts, host.stops), (1, 0))
-        for index, profile in enumerate(("hostfakesplit", "disorder-badseq", "seqovl"), 2):
+        for index, profile in enumerate(("hostfakesplit", "disorder-badseq",
+                                         "hostfakesplit-md5", "fakedsplit-md5", "seqovl"), 2):
             cfg.zapret2.engine_profile = profile
+            self.assertEqual(nfqws2.validate(cfg), [])
             controller.step(cfg, [], active=True)
             self.assertEqual(controller.view["profile"], profile)
             self.assertEqual((host.starts, host.stops), (index, index - 1))
@@ -380,6 +382,56 @@ unrelated-empty-field:
               mock.patch("xgw.nfqws2.shutil.which", return_value=None)):
             self.assertEqual(nfqws2.find_binary(cfg), self.installation.binary)
 
+    def test_protocol_filters_do_not_overwrite_tls_or_each_other(self):
+        # nfqws2 меняет filter-l7 в текущем профиле; только --new начинает другой.
+        for voice in ([], ["50000-50100"]):
+            for stun in ([], ["stun.example:3478"]):
+                for blob in (None, Path("/opt/xgw/stun.bin")):
+                    with self.subTest(voice=voice, stun=stun, blob=blob):
+                        cfg = Config()
+                        cfg.routing.discord_udp_ports = voice
+                        cfg.network.stun_servers = stun
+                        installation = dataclasses.replace(
+                            self.installation,
+                            blobs={**self.installation.blobs, "stun.bin": blob},
+                        )
+                        args = nfqws2.arguments(cfg, installation, "hostfakesplit")
+                        blocks = [[]]
+                        for arg in args:
+                            if arg == "--new":
+                                blocks.append([])
+                            else:
+                                blocks[-1].append(arg)
+                        expected = [
+                            ("tls", "tls_client_hello", 2, "--filter-tcp="),
+                            ("quic", "quic_initial", 1, "--filter-udp="),
+                        ]
+                        if voice:
+                            expected.append(("discord,stun", "discord_ip_discovery,stun",
+                                             1, "--filter-udp="))
+                        if stun and blob:
+                            expected.append(("stun", "stun", 1, "--filter-udp="))
+                        self.assertEqual(len(blocks), len(expected))
+                        for block, (l7, payload, calls, transport) in zip(
+                            blocks, expected, strict=True,
+                        ):
+                            self.assertEqual(
+                                [a for a in block if a.startswith("--filter-l7=")],
+                                [f"--filter-l7={l7}"],
+                            )
+                            self.assertEqual(
+                                [a for a in block if a.startswith("--payload=")],
+                                [f"--payload={payload}"],
+                            )
+                            ports = [a for a in block if a.startswith(
+                                ("--filter-tcp=", "--filter-udp="),
+                            )]
+                            self.assertEqual(len(ports), 1)
+                            self.assertTrue(ports[0].startswith(transport))
+                            self.assertEqual(
+                                sum(a.startswith("--lua-desync=") for a in block), calls,
+                            )
+
     def test_profiles_arguments_and_ladder(self):
         expected = {
             "seqovl": "--lua-desync=multisplit:pos=2,sniext+1:seqovl=679",
@@ -387,6 +439,8 @@ unrelated-empty-field:
                 "--lua-desync=hostfakesplit:host=www.google.com:altorder=1:tcp_ts=+100"
             ),
             "disorder-badseq": "--lua-desync=multidisorder:pos=1,midsld",
+            "hostfakesplit-md5": "--lua-desync=hostfakesplit:midhost=midsld:tcp_md5",
+            "fakedsplit-md5": "--lua-desync=fakedsplit:pos=midsld:tcp_md5",
         }
         for profile, argument in expected.items():
             with self.subTest(profile=profile):
@@ -394,6 +448,12 @@ unrelated-empty-field:
                 self.assertIn("--qnum=200", args)
                 self.assertIn("--fwmark=0x40000000", args)
                 self.assertIn(argument, args)
+                if profile.endswith("-md5"):
+                    self.assertNotIn("nfqws2:" + profile, profiles.ALL)
+                    self.assertEqual(
+                        [a for a in args[:args.index("--new")]
+                         if a.startswith("--lua-desync=")], [argument],
+                    )
         steps = profiles.ladder(
             "FROZEN", profiles.XRAY_DEFAULT, profiles.XRAY_DEFAULT, list(profiles.ALL),
         )

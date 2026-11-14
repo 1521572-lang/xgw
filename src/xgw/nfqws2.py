@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 
 FAKE_MARK = 0x40000000
 UNIT = "xgw-nfqws2.service"
-PROFILES = ("seqovl", "hostfakesplit", "disorder-badseq")
+# MD5 candidates are explicit engine settings, not steps in the VPN server ladder.
+PROFILES = ("seqovl", "hostfakesplit", "disorder-badseq",
+            "hostfakesplit-md5", "fakedsplit-md5")
 BLOBS = (
     "tls_clienthello_www_google_com.bin",
     "quic_initial_www_google_com.bin",
@@ -137,6 +139,10 @@ def arguments(cfg: Config, installation: Installation, profile: str | None = Non
     args += [f"--filter-tcp={tcp}", "--filter-l7=tls", "--payload=tls_client_hello"]
     if profile == "seqovl":
         args.append("--lua-desync=multisplit:pos=2,sniext+1:seqovl=679")
+    elif profile == "hostfakesplit-md5":
+        args.append("--lua-desync=hostfakesplit:midhost=midsld:tcp_md5")
+    elif profile == "fakedsplit-md5":
+        args.append("--lua-desync=fakedsplit:pos=midsld:tcp_md5")
     elif profile == "hostfakesplit":
         args += [
             "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:"
@@ -149,17 +155,19 @@ def arguments(cfg: Config, installation: Installation, profile: str | None = Non
             "tcp_seq=-10000",
             "--lua-desync=multidisorder:pos=1,midsld",
         ]
-    args += ["--filter-udp=443", "--filter-l7=quic", "--payload=quic_initial",
+    # L7 filters replace each other within one nfqws2 profile. Keep protocols separate.
+    args += ["--new", "--filter-udp=443", "--filter-l7=quic", "--payload=quic_initial",
              "--lua-desync=fake:repeats=2:blob=fake_default_quic"]
     voice = _ports(cfg.routing.discord_udp_ports)
     if voice:
-        args += [f"--filter-udp={voice}", "--filter-l7=discord,stun",
+        args += ["--new", f"--filter-udp={voice}", "--filter-l7=discord,stun",
                  "--payload=discord_ip_discovery,stun",
                  "--lua-desync=fake:repeats=2:blob=fake_default_quic"]
     stun = stun_ports(cfg)
     stun_blob = installation.blobs["stun.bin"]
     if stun and stun_blob:
-        args += [f"--blob=fake_default_stun:@{stun_blob}", f"--filter-udp={_ports(stun)}",
+        args += [f"--blob=fake_default_stun:@{stun_blob}", "--new",
+                 f"--filter-udp={_ports(stun)}",
                  "--filter-l7=stun", "--payload=stun",
                  "--lua-desync=fake:repeats=2:blob=fake_default_stun"]
     return args

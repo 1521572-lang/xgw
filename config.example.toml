@@ -460,6 +460,8 @@ daily_probe_mb = 256
 # универсальный движок не запускается: очередь занята проверкой выбранных доменов.
 engine = "off"
 # Профиль до обучения сканером: seqovl, hostfakesplit или disorder-badseq.
+# Для ручной проверки YouTube также hostfakesplit-md5 и fakedsplit-md5.
+# MD5-кандидаты не входят в автоматическую лестницу профилей VPN-серверов.
 engine_profile = "seqovl"
 engine_queue = 200
 # Для disorder-badseq временно отключать GRO/GSO/TSO/TX checksum на WAN и восстанавливать после.
