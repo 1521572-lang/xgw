@@ -572,6 +572,29 @@ def test_run_once(gateway, monkeypatch, capsys):
     assert created[0].ticks == 1 and "HEALTHY" in capsys.readouterr().out
 
 
+def test_failed_reload_closes_preserved_nfqws2(gateway, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import xgw.daemon
+
+    close = Mock()
+
+    class FakeDaemon:
+        def __init__(self, *args, **kwargs):
+            self._nfqws2 = SimpleNamespace(close=close)
+
+        def run(self, stop, changed):
+            monkeypatch.setattr(cli.config, "load", Mock(side_effect=RuntimeError("reload failed")))
+
+    monkeypatch.setattr(xgw.daemon, "Daemon", FakeDaemon)
+    monkeypatch.setattr(cli, "capture_for", lambda *_args: SimpleNamespace(configured=False))
+    monkeypatch.setattr("xgw.watch.status_page.StatusPage.from_config", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="reload failed"):
+        gateway.run("run")
+    close.assert_called_once_with()
+
+
 def test_describe_outcomes():
     assert engine.describe(ApplyOutcome("unchanged")) == "изменений нет"
     text = engine.describe(ApplyOutcome("restart_deferred", ops=["секция dns"], detail="окно"))

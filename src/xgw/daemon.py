@@ -986,8 +986,9 @@ class Daemon:
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
         with contextlib.suppress(OSError, cmd.CommandError):
             self._zapret2.close()
-        with contextlib.suppress(OSError, cmd.CommandError):
-            self._nfqws2.close()
+        if stop.is_set():
+            with contextlib.suppress(OSError, cmd.CommandError):
+                self._nfqws2.close()
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
@@ -1186,6 +1187,10 @@ class Daemon:
         прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
         прежних отменяется."""
         self._resume(previous)
+        # Процесс и снимок offload переживают перечитывание TOML. Новые параметры
+        # сверяются контроллером по launch_key, остановка нужна только при завершении.
+        self._nfqws2 = previous._nfqws2
+        self._nfq_view = dict(previous._nfq_view)
         if self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2:
             self._zapret2.comparison = previous._zapret2.comparison
             self._zapret2.comparison_trace = previous._zapret2.comparison_trace
@@ -2384,7 +2389,7 @@ class Daemon:
     def _nfq_step(self, view: list[NodeInfo]) -> None:
         active = bool(self.capture_info and self.capture_info.get("mode") == "on")
         self._nfqws2.step(
-            self.cfg, [info.profile for info in view], active=active,
+            self.cfg, [info.profile for info in view], active=active, cancel=self._stop,
         )
         if self.capture_info is not None:
             self.capture_info["nfqws2"] = dict(self._nfqws2.view)

@@ -1178,6 +1178,29 @@ def test_run_returns_when_the_config_file_changes(daemon):
     assert ticks == [1, 1, -1] and not stop.is_set()
 
 
+def test_nfqws2_survives_reload_and_closes_on_shutdown(daemon, monkeypatch):
+    from unittest.mock import Mock
+
+    controller = daemon._nfqws2
+    close = Mock(wraps=controller.close)
+    monkeypatch.setattr(controller, "close", close)
+    stop = threading.Event()
+    daemon.run(stop, changed=lambda: True)
+    close.assert_not_called()
+    successor = _second(daemon, lambda cfg: setattr(cfg.zapret2, "engine_profile", "hostfakesplit"))
+    try:
+        assert successor._nfqws2 is controller
+        step = Mock()
+        monkeypatch.setattr(controller, "step", step)
+        successor._nfq_step([])
+        assert step.call_args.kwargs["cancel"] is successor._stop
+        stop.set()
+        successor.run(stop)
+        close.assert_called_once_with()
+    finally:
+        successor.store.close()
+
+
 # --- запросы из панели ---------------------------------------------------------
 
 

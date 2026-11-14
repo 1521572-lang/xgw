@@ -7,6 +7,8 @@ import json
 import os
 import shutil
 import stat
+import threading
+import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,9 @@ BLOBS = (
 )
 OFFLOADS = ("generic-receive-offload", "generic-segmentation-offload",
             "tcp-segmentation-offload", "tx-checksum-ip-generic")
+READY_TIMEOUT = 3.0
+READY_POLL = 0.1
+LaunchKey = tuple[tuple[str, ...], bool, str]
 
 
 @dataclass(frozen=True)
@@ -59,22 +64,27 @@ def enabled(cfg: Config) -> bool:
     return cfg.zapret2.engine == "auto" and not cfg.zapret2.probe_enabled
 
 
+def _is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False  # В том числе каталог, недоступный из sandbox демона.
+
+
 def find_binary(cfg: Config) -> Path | None:
     candidates = [Path(cfg.zapret2.binary)]
     explicit = os.environ.get("XGW_NFQWS2_BIN")
     if explicit:
         candidates.append(Path(explicit))
-    candidates.extend(sorted(Path("/opt/xgw/zapret2").glob("*/nfqws2"), reverse=True))
+    with contextlib.suppress(OSError):
+        candidates.extend(sorted(Path("/opt/xgw/zapret2").glob("*/nfqws2"), reverse=True))
     candidates.extend((Path("/usr/local/sbin/nfqws2"), Path("/usr/sbin/nfqws2")))
     found = shutil.which("nfqws2")
     if found:
         candidates.append(Path(found))
     for candidate in candidates:
-        try:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
-        except OSError:
-            continue
+        if _is_file(candidate) and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 
@@ -85,8 +95,8 @@ def find_installation(cfg: Config) -> Installation | None:
     lua_candidates = [Path(cfg.zapret2.lua_dir), binary.parent / "lua",
                       binary.parent.parent / "lua"]
     lua_dir = next((directory for directory in lua_candidates
-                    if (directory / "zapret-lib.lua").is_file()
-                    and (directory / "zapret-antidpi.lua").is_file()), None)
+                    if _is_file(directory / "zapret-lib.lua")
+                    and _is_file(directory / "zapret-antidpi.lua")), None)
     if lua_dir is None:
         return None
     blob_candidates = []
@@ -97,7 +107,7 @@ def find_installation(cfg: Config) -> Installation | None:
     blobs: dict[str, Path | None] = {}
     for name in BLOBS:
         blobs[name] = next((directory / name for directory in blob_candidates
-                            if (directory / name).is_file()), None)
+                            if _is_file(directory / name)), None)
     return Installation(binary, lua_dir, blobs)
 
 
@@ -154,6 +164,13 @@ def arguments(cfg: Config, installation: Installation, profile: str | None = Non
     return args
 
 
+def launch_key(cfg: Config, installation: Installation, profile: str) -> LaunchKey:
+    """Все параметры процесса: при reload нельзя оставить старые Lua, порты или offload."""
+    offload = cfg.zapret2.engine_offload and profile == "disorder-badseq"
+    return (tuple(arguments(cfg, installation, profile)), offload,
+            cfg.network.wan_if.strip() if offload else "")
+
+
 class Offload:
     def __init__(self, runner=cmd.run):
         self.runner = runner
@@ -177,12 +194,13 @@ class Offload:
         current = {line.split(":", 1)[0].strip(): self._enabled(line)
                    for line in listing.splitlines() if ":" in line}
         changes = {name: current[name] for name in OFFLOADS if current.get(name)}
+        # ethtool может изменить часть флагов и завершиться ошибкой: откат всё равно нужен.
+        self.interface, self.saved = interface, changes
         if changes:
             args = ["ethtool", "-K", interface]
             for name in changes:
                 args += [name, "off"]
             self.runner(args, timeout=10)
-        self.interface, self.saved = interface, changes
 
     def restore(self) -> None:
         if not self.interface:
@@ -201,7 +219,7 @@ class Runtime:
     def __init__(self, runner=cmd.run):
         self.runner = runner
         self.offload = Offload(runner)
-        self.key: tuple[str, int, str] | None = None
+        self.key: LaunchKey | None = None
 
     @classmethod
     def occupied(cls, queue: int) -> bool:
@@ -214,6 +232,28 @@ class Runtime:
     def alive(self, queue: int) -> bool:
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
         return state == "active" and self.occupied(queue)
+
+    def wait_ready(self, queue: int, cancel: threading.Event | None = None) -> bool:
+        """Type=exec подтверждает execve, очередь nfqws2 привязывает позже."""
+        deadline = time.monotonic() + READY_TIMEOUT
+        while cancel is None or not cancel.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ValueError("worker_start_timeout")
+            state = self.runner(["systemctl", "is-active", UNIT], check=False,
+                                timeout=min(1.0, left)).strip()
+            if cancel is not None and cancel.is_set():
+                return False
+            if state == "active" and self.occupied(queue):
+                return True
+            if state not in ("active", "activating"):
+                return False
+            pause = min(READY_POLL, max(0.0, deadline - time.monotonic()))
+            if cancel is None:
+                time.sleep(pause)
+            else:
+                cancel.wait(pause)
+        return False
 
     @staticmethod
     def _check_files(installation: Installation) -> None:
@@ -230,7 +270,7 @@ class Runtime:
                     raise ValueError("unsafe_directory")
 
     def start(self, cfg: Config, installation: Installation, profile: str) -> None:
-        key = (str(installation.binary), cfg.zapret2.engine_queue, profile)
+        key = launch_key(cfg, installation, profile)
         if self.key is not None or self.alive(cfg.zapret2.engine_queue):
             # Подхватываем оставшийся unit XGW либо завершаем предыдущую попытку запуска.
             self.key = self.key or key
@@ -288,7 +328,12 @@ class Controller:
                 return profile
         return cfg.zapret2.engine_profile
 
-    def step(self, cfg: Config, applied: Collection[str], *, active: bool) -> None:
+    def step(self, cfg: Config, applied: Collection[str], *, active: bool,
+             cancel: threading.Event | None = None) -> None:
+        if cancel is not None and cancel.is_set():
+            self.close()
+            self.view = {"state": "off", "reason": "stopping"}
+            return
         installation = find_installation(cfg) if enabled(cfg) and active else None
         if installation is None:
             if self.profile or self.runtime.key is not None:
@@ -300,19 +345,23 @@ class Controller:
             self.view = {"state": "off", "reason": reason}
             return
         profile = self.selected_profile(cfg, applied)
-        key = (str(installation.binary), cfg.zapret2.engine_queue, profile)
         try:
+            key = launch_key(cfg, installation, profile)
             if key == self.runtime.key and self.runtime.alive(cfg.zapret2.engine_queue):
                 self.view = {"state": "active", "profile": profile,
                              "queue": cfg.zapret2.engine_queue}
                 return
             self.runtime.start(cfg, installation, profile)
-            if not self.runtime.alive(cfg.zapret2.engine_queue):
+            if not self.runtime.wait_ready(cfg.zapret2.engine_queue, cancel):
+                if cancel is not None and cancel.is_set():
+                    self.close()
+                    self.view = {"state": "off", "reason": "stopping"}
+                    return
                 raise ValueError("worker_down")
         except (OSError, ValueError, cmd.CommandError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
                 "queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
-                "offload_interface", "unknown_profile",
+                "offload_interface", "unknown_profile", "worker_start_timeout",
             } else "runtime_failed"
             with contextlib.suppress(OSError, cmd.CommandError):
                 self.runtime.stop()

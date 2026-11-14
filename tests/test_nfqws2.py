@@ -1,6 +1,9 @@
 import dataclasses
+import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from xgw import nfqws2
@@ -10,6 +13,43 @@ from xgw.generator.builder import build, select_nodes
 from xgw.model import ServerNode
 from xgw.net import nft
 from xgw.net.cmd import CommandError
+from xgw.nfqws2 import find_installation
+
+
+class WorkerHost:
+    """systemd уже active, но очередь появляется только после нескольких опросов."""
+
+    def __init__(self):
+        self.active = False
+        self.starts = self.stops = self.polls = 0
+        self.now = 0.0
+        self.flags = dict.fromkeys(nfqws2.OFFLOADS, True)
+        self.flags["tcp-segmentation-offload"] = False
+        self.initial_flags = dict(self.flags)
+        self.never_ready = False
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def occupied(self, queue):
+        self.polls += 1
+        return self.active and self.polls >= 3 and not self.never_ready
+
+    def run(self, args, **kwargs):
+        if args[:2] == ["systemctl", "is-active"]:
+            return "active" if self.active else "inactive"
+        if args[:2] == ["systemctl", "stop"]:
+            self.stops += 1
+            self.active = False
+        elif args[0] == "systemd-run":
+            self.starts += 1
+            self.active, self.polls = True, 0
+        elif args[:2] == ["ethtool", "-k"]:
+            return "\n".join(f"{name}: {'on' if value else 'off'}"
+                             for name, value in self.flags.items())
+        elif args[:2] == ["ethtool", "-K"]:
+            self.flags.update({args[i]: args[i + 1] == "on" for i in range(3, len(args), 2)})
+        return ""
 
 
 class GeneratorTests(unittest.TestCase):
@@ -54,6 +94,142 @@ class EngineTests(unittest.TestCase):
             Path("/opt/xgw/zapret2/1.0.7/lua"),
             {name: None for name in nfqws2.BLOBS},
         )
+
+    def worker(self):
+        host = WorkerHost()
+        runtime = nfqws2.Runtime(host.run)
+        patches = self.enterContext(ExitStack())
+        patches.enter_context(mock.patch("xgw.nfqws2.find_installation",
+                                         return_value=self.installation))
+        patches.enter_context(mock.patch.object(runtime, "occupied", host.occupied))
+        patches.enter_context(mock.patch.object(runtime, "_check_files"))
+        patches.enter_context(mock.patch.object(nfqws2, "time", SimpleNamespace(
+            monotonic=lambda: host.now, sleep=host.sleep,
+        )))
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
+        cfg.network.wan_if = "test0"
+        return cfg, nfqws2.Controller(runtime), host
+
+    def test_delayed_queue_and_profile_switch_preserve_offload(self):
+        cfg, controller, host = self.worker()
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["state"], "active")
+        self.assertEqual((host.starts, host.stops), (1, 0))
+        self.assertGreaterEqual(host.now, 2 * nfqws2.READY_POLL)
+        cfg.notify.min_interval_min = 7
+        controller.step(cfg, [], active=True)
+        self.assertEqual((host.starts, host.stops), (1, 0))
+        for index, profile in enumerate(("hostfakesplit", "disorder-badseq", "seqovl"), 2):
+            cfg.zapret2.engine_profile = profile
+            controller.step(cfg, [], active=True)
+            self.assertEqual(controller.view["profile"], profile)
+            self.assertEqual((host.starts, host.stops), (index, index - 1))
+            expected = dict.fromkeys(nfqws2.OFFLOADS, False) if profile == "disorder-badseq" \
+                else host.initial_flags
+            self.assertEqual(host.flags, expected)
+        cfg.zapret2.engine = "off"
+        controller.step(cfg, [], active=True)
+        self.assertFalse(host.active)
+        self.assertEqual(host.flags, host.initial_flags)
+
+    def test_reloaded_worker_arguments_and_offload_trigger_restart(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+        controller.step(cfg, [], active=True)
+        cfg.zapret2.engine_offload = False
+        controller.step(cfg, [], active=True)
+        self.assertEqual(host.starts, 2)
+        self.assertEqual(host.flags, host.initial_flags)
+        cfg.routing.cloudflare_tcp_ports.append("9443")
+        controller.step(cfg, [], active=True)
+        self.assertEqual(host.starts, 3)
+        other = dataclasses.replace(self.installation, lua_dir=Path("/opt/new-lua"))
+        with mock.patch("xgw.nfqws2.find_installation", return_value=other):
+            controller.step(cfg, [], active=True)
+        self.assertEqual(host.starts, 4)
+        controller.close()
+
+    def test_queue_timeout_stops_worker_and_restores_offload(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+        host.never_ready = True
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "worker_start_timeout")
+        self.assertEqual((host.starts, host.stops), (1, 1))
+        self.assertAlmostEqual(host.now, nfqws2.READY_TIMEOUT)
+        self.assertEqual(host.flags, host.initial_flags)
+
+    def test_stop_interrupts_queue_wait_and_prevents_next_start(self):
+        cfg, controller, host = self.worker()
+        host.never_ready = True
+        stop = threading.Event()
+        with mock.patch.object(stop, "wait", side_effect=lambda _seconds: stop.set()):
+            controller.step(cfg, [], active=True, cancel=stop)
+        self.assertEqual(controller.view, {"state": "off", "reason": "stopping"})
+        controller.step(cfg, [], active=True, cancel=stop)
+        self.assertEqual((host.starts, host.stops), (1, 1))
+        self.assertEqual(host.now, 0)
+
+    def test_partial_offload_failure_is_restored(self):
+        cfg, controller, host = self.worker()
+        cfg.zapret2.engine_profile = "disorder-badseq"
+
+        def run(args, **kwargs):
+            result = host.run(args, **kwargs)
+            if args[:2] == ["ethtool", "-K"] and "off" in args[3:]:
+                raise CommandError("partially applied")
+            return result
+
+        controller.runtime.offload.runner = run
+        controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "runtime_failed")
+        self.assertEqual((host.starts, host.stops), (0, 0))
+        self.assertEqual(host.flags, host.initial_flags)
+
+    def test_dead_worker_is_not_waited_for(self):
+        cfg, controller, host = self.worker()
+        with mock.patch.object(controller.runtime, "occupied", return_value=False):
+            # Процесс успел завершиться ещё до первого опроса готовности.
+            original = host.run
+
+            def run(args, **kwargs):
+                result = original(args, **kwargs)
+                if args[0] == "systemd-run":
+                    host.active = False
+                return result
+
+            controller.runtime.runner = run
+            controller.step(cfg, [], active=True)
+        self.assertEqual(controller.view["reason"], "worker_down")
+        self.assertEqual(host.now, 0)
+
+    def test_inaccessible_lua_and_blobs_do_not_break_discovery(self):
+        cfg = Config()
+        cfg.zapret2.lua_dir = "/private/lua"
+
+        def is_file(path):
+            if str(path).startswith("/private/") or path.suffix == ".bin":
+                raise PermissionError("unreadable")
+            return path.name in ("zapret-lib.lua", "zapret-antidpi.lua")
+
+        with (mock.patch("xgw.nfqws2.find_binary", return_value=self.installation.binary),
+              mock.patch.object(Path, "is_file", is_file)):
+            found = find_installation(cfg)
+        self.assertEqual(found.lua_dir, self.installation.lua_dir)
+        self.assertEqual(found.blobs, dict.fromkeys(nfqws2.BLOBS))
+        with (mock.patch("xgw.nfqws2.find_binary", return_value=self.installation.binary),
+              mock.patch.object(Path, "is_file", side_effect=PermissionError("unreadable"))):
+            self.assertIsNone(find_installation(cfg))
+
+    def test_unreadable_search_root_keeps_explicit_binary(self):
+        cfg = Config()
+        cfg.zapret2.binary = str(self.installation.binary)
+        with (mock.patch.object(Path, "glob", side_effect=PermissionError("unreadable")),
+              mock.patch.object(Path, "is_file", return_value=True),
+              mock.patch("xgw.nfqws2.os.access", return_value=True),
+              mock.patch("xgw.nfqws2.shutil.which", return_value=None)):
+            self.assertEqual(nfqws2.find_binary(cfg), self.installation.binary)
 
     def test_profiles_arguments_and_ladder(self):
         expected = {

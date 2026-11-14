@@ -935,6 +935,10 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
             logger.info("настройки перечитаны из %s", args.config_path)
             reloaded = True
     finally:
+        # В том числе исключение между выходом run по reload и запуском нового цикла.
+        if previous is not None:
+            with contextlib.suppress(OSError, cmd.CommandError):
+                previous._nfqws2.close()
         if events is not None:
             events.stop()
         if panel is not None:
