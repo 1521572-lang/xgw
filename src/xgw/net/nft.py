@@ -270,6 +270,14 @@ def _singbox_skip(rules: Rules, verdict: str) -> list[str]:
     return [] if rules.singbox_uid is None else [f"meta skuid {rules.singbox_uid} {verdict}"]
 
 
+def _nfq_generated_skip(rules: Rules, verdict: str) -> list[str]:
+    # nfqws2 adds its bit to the original mark. Exact mark_bypass no longer matches.
+    # Preserve it before capture rewrites the mark and routes the copy back to Xray.
+    return [] if rules.engine_queue is None else [
+        f"meta mark & {nfqws2.FAKE_MARK:#x} == {nfqws2.FAKE_MARK:#x} {verdict}"
+    ]
+
+
 def _approve(rule: str) -> str:
     """Approve exactly this direct path, retaining every other conntrack mark bit."""
     predicate, verdict = rule.rsplit(" ", 1)
@@ -707,6 +715,7 @@ def render(rules: Rules) -> str:
         )
     if rules.capture_local:
         output = [
+            *_nfq_generated_skip(rules, "return"),
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
             *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts4 else []),
@@ -991,6 +1000,7 @@ def render6(rules: Rules) -> str:
                 )
             )
         output = [
+            *_nfq_generated_skip(rules, "return"),
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
             *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts6 else []),
@@ -1043,6 +1053,7 @@ def render6(rules: Rules) -> str:
                       if rules.singbox_uid is not None else []),
                     'oifname "lo" accept',
                     f"meta mark {rules.mark_bypass:#x} accept",
+                    *_nfq_generated_skip(rules, "accept"),
                     *_singbox_skip(rules, "accept"),
                     *(_ts_skip("accept") if rules.ts6 else []),
                     "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, "

@@ -478,6 +478,53 @@ unrelated-empty-field:
         self.assertIn("meta mark 0x2 meta l4proto udp ct packets <= 4", text)
         self.assertIn("meta skuid 990 meta l4proto tcp ct packets <= 8", text)
 
+    def test_generated_packets_skip_capture_before_marks_are_rewritten(self):
+        skip = "meta mark & 0x40000000 == 0x40000000 return"
+        for method in ("tproxy", "tun"):
+            for enabled in (False, True):
+                with self.subTest(method=method, enabled=enabled):
+                    cfg = Config()
+                    cfg.capture.method = method
+                    cfg.network.ipv6 = "proxy"
+                    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+                    rules = dataclasses.replace(
+                        rules, engine_queue=200 if enabled else None,
+                        direct4=("203.0.113.0/24",), direct_local=True,
+                    )
+                    for text in (nft.render(rules), nft.render6(rules)):
+                        chain = text.split("chain output {", 1)[1].split("\n    }", 1)[0]
+                        if enabled:
+                            self.assertIn(skip, chain)
+                            self.assertLess(chain.index(skip), chain.index("meta mark set"))
+                            if "ct mark set" in chain:
+                                self.assertLess(chain.index(skip), chain.index("ct mark set"))
+                        else:
+                            self.assertNotIn(skip, chain)
+                        self.assertIn("meta mark 0x2 return", chain)
+                        self.assertIn("meta mark set 0x1", chain)
+
+    def test_ipv6_guard_permits_generated_packets_only_while_engine_is_enabled(self):
+        permit = "meta mark & 0x40000000 == 0x40000000 accept"
+        cfg = Config()
+        cfg.network.ipv6 = "off"
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+                rules = dataclasses.replace(rules, engine_queue=200 if enabled else None)
+                chain = nft.render6(rules).split("chain v6_guard {", 1)[1].split("\n    }", 1)[0]
+                if enabled:
+                    self.assertIn(permit, chain)
+                    self.assertLess(chain.index(permit), chain.index("reject with tcp reset"))
+                else:
+                    self.assertNotIn(permit, chain)
+                self.assertIn("meta mark 0x2 ip6 daddr ::1 counter reject", chain)
+                self.assertIn("meta l4proto tcp counter reject with tcp reset", chain)
+        cfg.zapret2.engine = "auto"
+        with mock.patch("xgw.nfqws2.find_installation", return_value=self.installation):
+            blocked, _ = nft.build_rules(cfg, capture=True, blocked=True, time_uids=())
+        self.assertIsNone(blocked.engine_queue)
+        self.assertNotIn(permit, nft.render6(blocked))
+
     def test_failed_worker_has_explicit_fallback(self):
         class BrokenRuntime:
             key = None
