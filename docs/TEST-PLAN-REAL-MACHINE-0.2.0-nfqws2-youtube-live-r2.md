@@ -1,5 +1,8 @@
 # ThinkCentre. Исправленные TLS-профили и прямое видео YouTube
 
+Прогон завершён, [отчёт r2](TEST-REPORT-REAL-MACHINE-0.2.0-nfqws2-youtube-live-r2-2026-11-14.md) — FAIL.
+Следующее основное задание — [расширенный проход r3](TEST-PLAN-REAL-MACHINE-0.2.0-nfqws2-youtube-live-r3.md).
+
 Ветка `gui-light`. CODE = `ad76983eadb2ebd6a8ffc32739895065d140e919`.
 BASE = `c7500f6f40bdfbc9d16b1b23056063813a71a839`, установлен по r5.
 [Последний отчёт](TEST-REPORT-REAL-MACHINE-0.2.0-nfqws2-youtube-live-2026-11-14.md) — FAIL.
