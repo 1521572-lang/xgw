@@ -54,3 +54,20 @@ def test_country_networks_are_read_from_geoip_dat(tmp_path):
         geodat.cidrs(path, "RU")
     with pytest.raises(geodat.GeoError, match="не читается"):
         geodat.cidrs(tmp_path / "нет.dat", "RU")
+
+
+def test_endpoint_country_uses_specific_public_network_and_updated_file(tmp_path):
+    path = write_geoip(tmp_path / "geoip.dat", {
+        "FR": [("8.0.0.0", 8), ("2606:4700::", 32)],
+        "NL": [("8.8.8.0", 24)],
+        "DE": [("9.0.0.0", 8), ("192.168.0.0", 16)],
+        "SE": [("9.0.0.0", 8)],
+        "CN": [("8.8.8.8", 32)],
+    }, reverse={"CN"})
+    assert geodat.country(path, "8.8.8.8") == "NL"
+    assert geodat.country(path, "::ffff:8.8.8.8") == "NL"
+    assert geodat.country(path, "2606:4700::1111") == "FR"
+    assert geodat.country(path, "9.9.9.9") == ""
+    assert geodat.country(path, "192.168.0.1") == ""
+    path.write_bytes(b"\x0a\x05RU")
+    assert geodat.country(path, "8.8.8.8") == ""

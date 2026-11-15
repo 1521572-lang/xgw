@@ -248,9 +248,9 @@ def test_persist_once_and_preserve_unrelated_panel_settings(tmp_path, monkeypatc
     # The actual file locking/ownership remains an Ubuntu acceptance check.
 
 
-@pytest.fixture
-def installer(monkeypatch):
-    file = Path(__file__).parents[1] / "docs/helpers/desync_batch1_install.py"
+@pytest.fixture(params=["desync_batch1_install.py", "gui_catalog_install.py"])
+def installer(monkeypatch, request):
+    file = Path(__file__).parents[1] / "docs/helpers" / request.param
     spec = importlib.util.spec_from_file_location("batch1_install", file)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
