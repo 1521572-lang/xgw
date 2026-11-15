@@ -263,9 +263,17 @@ class Applier:
                 self.api.balancer_info(BALANCER_TAG)
                 return None
             except ApiError:
-                if time.monotonic() >= deadline:
-                    return f"Xray не поднялся за {self.wait_seconds:.0f} с"
-                time.sleep(0.5)
+                try:
+                    # Standalone-маршрутизация собирается без балансировщика (builder
+                    # заменяет routing целиком): живость ядра подтверждается любым
+                    # ответом API (список outbound-ов), а не наличие `auto`.
+                    self.api.list_outbounds()
+                    return None
+                except ApiError:
+                    pass
+            if time.monotonic() >= deadline:
+                return f"Xray не поднялся за {self.wait_seconds:.0f} с"
+            time.sleep(0.5)
 
     def _rollback(self, *, reason: str) -> ApplyOutcome:
         last_good = self.paths.last_good_file
