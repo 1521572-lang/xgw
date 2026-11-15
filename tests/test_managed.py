@@ -102,6 +102,9 @@ def test_junk_inside_the_file_is_ignored(conf):
         "free_pool_mode": None,
         "free_pool_pin": "",
         "hidden_subscriptions": [],  # подписки config.toml не убирали (п. 337)
+        # батч 1: managed.load читает и политику desync из panel.json (пусто → без политики)
+        "zapret2": {},
+        "desync": None,
     }
 
 
