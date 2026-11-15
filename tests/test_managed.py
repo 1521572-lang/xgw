@@ -35,7 +35,8 @@ def test_no_file_means_nothing_added(conf):
          "routes": [], "priority": {}, "sticky": None, "kernel_direct": None,
          "kernel_devices": [], "core": {},
          "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
-         "free_pool_mode": None, "free_pool_pin": "", "hidden_subscriptions": []}, "")
+         "free_pool_mode": None, "free_pool_pin": "", "hidden_subscriptions": [],
+         "zapret2": {}, "desync": None}, "")
     cfg, warnings = config.load(conf)
     assert warnings == [] and cfg.managed == config.Managed()
     assert [sub.name for sub in cfg.subscriptions] == ["main"]
@@ -61,11 +62,10 @@ def test_config_is_extended_by_the_panel_file(conf):
 
 
 @pytest.mark.parametrize("text", ["{broken", "[1, 2]", '"строка"'])
-def test_broken_file_is_a_warning_not_a_crash(conf, text):
+def test_broken_file_cannot_silently_replace_managed_network_policy(conf, text):
     managed.path_for(conf).write_text(text, encoding="utf-8")
-    cfg, warnings = config.load(conf)
-    assert len(warnings) == 1 and "panel.json" in warnings[0]
-    assert [sub.name for sub in cfg.subscriptions] == ["main"]
+    with pytest.raises(config.ConfigError, match=r"panel\.json"):
+        config.load(conf)
     with pytest.raises(ManagedError):  # и дописывать в битый файл панель не станет
         managed.add_subscription(managed.path_for(conf), "https://x.example.org/s", taken=set())
 

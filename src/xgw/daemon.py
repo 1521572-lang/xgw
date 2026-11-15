@@ -46,6 +46,7 @@ from .apply.rotation import (
     preferred_members,
 )
 from .config import Config, parse_seconds, probe_bytes
+from .desync import schema as desync_schema
 from .freepool import stats as poolstats
 from .freepool import traffic
 from .freepool.pool import FreePool
@@ -7247,6 +7248,13 @@ class Daemon:
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
         snapshot["zapret2"] = dict(self._zapret2.view)
+        # The card must not label a previous daemon snapshot with newer panel settings.
+        # This identifies observed configuration, not a transaction acknowledgement (T03).
+        try:
+            policy = desync_schema.migrate(dataclasses.asdict(self.cfg.zapret2))
+            snapshot["zapret2_policy_key"] = desync_schema.fingerprint(policy)
+        except desync_schema.PolicyError:
+            snapshot["zapret2_policy_key"] = None
         self._subscription_status(snapshot)  # время успеха и причина кэша подписок (п. 342)
         job = self._build
         snapshot["assembly"] = {

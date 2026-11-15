@@ -6,12 +6,13 @@ from __future__ import annotations
 import ipaddress
 import re
 import tomllib
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import cost
 from . import managed as managed_file
+from .desync import schema as desync_schema
 
 
 class ConfigError(Exception):
@@ -624,6 +625,9 @@ class Config:
     routing: Routing = field(default_factory=Routing)
     media: Media = field(default_factory=Media)
     zapret2: Zapret2 = field(default_factory=Zapret2)
+    # Canonical policy is resolved once, before runtime validation. It is never serialized
+    # into public state (probe URLs can contain credentials).
+    desync: dict = field(default_factory=dict, init=False, repr=False)
     dns: Dns = field(default_factory=Dns)
     xray: XraySection = field(default_factory=XraySection)
     core: CoreSection = field(default_factory=CoreSection)
@@ -680,6 +684,8 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
     warnings: list[str] = []
     kwargs: dict[str, object] = {}
     for key, value in data.items():
+        if key in ("zapret2", "desync"):
+            continue  # strict versioned policy; do not silently discard unknown fields
         if key == "subscriptions":
             subs: list[Subscription] = []
             if isinstance(value, list):
@@ -693,14 +699,26 @@ def load(path: Path | str) -> tuple[Config, list[str]]:
         else:
             warnings.append(f"неизвестная секция [{key}] проигнорирована")
     config = Config(**kwargs)  # type: ignore[arg-type]
-    warnings.extend(_merge_managed(config, managed_file.path_for(path)))
+    warnings.extend(_merge_managed(config, managed_file.path_for(path),
+                                   legacy_zapret=data.get("zapret2", {}),
+                                   desync=data.get("desync")))
+    requested_zapret = asdict(config.zapret2)
     warnings.extend(_validate(config))
+    if asdict(config.zapret2) != requested_zapret:
+        # Disabling selective here could implicitly enable engine=auto on the same queue.
+        # A migrated policy must be accepted as a whole, never silently substituted.
+        raise ConfigError("desync: runtime rejected policy; check zapret2 network prerequisites")
     return config, warnings
 
 
-def _merge_managed(cfg: Config, path: Path) -> list[str]:
+def _merge_managed(cfg: Config, path: Path, *, legacy_zapret: dict | None = None,
+                   desync: dict | None = None) -> list[str]:
     """Дополняет конфиг тем, что добавлено из панели (panel.json рядом с config.toml)."""
     data, error = managed_file.load(path)
+    # panel.json now contains routing policy. An unreadable file cannot safely fall back
+    # to TOML: that could enable a different mode. Preserve the running configuration.
+    if error:
+        raise ConfigError(error)
     warnings = [error] if error else []
     names = {sub.name for sub in cfg.subscriptions}
     # Убранные в панели подписки config.toml: имя остаётся занятым (панель не добавит другую
@@ -744,6 +762,21 @@ def _merge_managed(cfg: Config, path: Path) -> list[str]:
     warnings.extend(_merge_devices(cfg, data["devices"]))
     warnings.extend(_merge_devices(cfg, data["routes"], routes=True))
     warnings.extend(_merge_devices(cfg, data["kernel_devices"], kernel=True))
+    try:
+        legacy = desync_schema.validate_patch(
+            asdict(cfg.zapret2) if legacy_zapret is None else legacy_zapret)
+        base_policy = desync_schema.resolve(legacy, desync)
+        if data["desync"] is not None:
+            # A complete panel policy deliberately overrides the lower-priority TOML.
+            # Conflicts within one document are rejected by managed.load()/resolve().
+            cfg.desync = desync_schema.resolve(data["zapret2"], data["desync"])
+        else:
+            combined = desync_schema.flatten(base_policy)
+            combined.update(data["zapret2"])
+            cfg.desync = desync_schema.migrate(combined)
+        cfg.zapret2 = Zapret2(**desync_schema.project(cfg.desync))
+    except desync_schema.PolicyError as exc:
+        raise ConfigError(str(exc)) from exc
     return warnings
 
 

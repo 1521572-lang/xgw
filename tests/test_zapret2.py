@@ -8,7 +8,7 @@ import pytest
 from test_generator import _build
 
 from xgw import zapret2 as z
-from xgw.config import load, service_ports
+from xgw.config import ConfigError, load, service_ports
 from xgw.generator import builder
 from xgw.generator.diff import diff_configs
 from xgw.net import nft
@@ -149,9 +149,9 @@ def test_bad_probe_never_enables_direct(value):
 def test_toml_validation_and_separate_marks(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[zapret2]\nmode="selective"\nstrategy="invalid"\n')
-    cfg, warnings = load(path)
-    assert cfg.zapret2.mode == "off"
-    assert any("strategy" in w for w in warnings)
+    # Versioned migration must reject invalid policy, not silently choose another route.
+    with pytest.raises(ConfigError, match="strategy"):
+        load(path)
     cfg, _, _ = setup()
     cfg.capture.mark_bypass = z.MARK
     assert z.validate(cfg)

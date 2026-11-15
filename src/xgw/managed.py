@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from . import fetch
 from . import priority as priority_levels
+from .desync import schema as desync_schema
 from .parsers.common import parse_links_text
 from .paths import LockTimeout, atomic_write_json, file_lock
 
@@ -102,6 +103,7 @@ def load(path: Path) -> tuple[dict, str]:
         "kernel_devices": [], "core": {},
         "tailscale": {"serve": "", "route": None, "funnel": "", "direct": []},
         "free_pool_mode": None, "free_pool_pin": "", "hidden_subscriptions": [],
+        "zapret2": {}, "desync": None,
     }
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -111,6 +113,14 @@ def load(path: Path) -> tuple[dict, str]:
         return empty, f"{path} не читается ({exc}) — добавленное из панели не загружено"
     if not isinstance(raw, dict):
         return empty, f"{path}: ожидается объект JSON — добавленное из панели не загружено"
+    try:
+        zapret = desync_schema.validate_patch(raw.get("zapret2", {}))
+        policy = (desync_schema.validate_policy(raw["desync"])
+                  if raw.get("desync") is not None else None)
+        if policy is not None:
+            desync_schema.resolve(zapret, policy)
+    except desync_schema.PolicyError as exc:
+        return empty, str(exc)
     subscriptions = []
     for item in raw.get("subscriptions") or []:
         if not isinstance(item, dict):
@@ -163,7 +173,29 @@ def load(path: Path) -> tuple[dict, str]:
         # Подписки config.toml, убранные в панели или окне (п. 337): сам config.toml панель
         # не переписывает — имя здесь, и при слиянии такая подписка пропускается.
         "hidden_subscriptions": _hidden(raw.get("hidden_subscriptions")),
+        "zapret2": zapret, "desync": policy,
     }, ""
+
+
+def set_desync(path: Path, policy: dict) -> bool:
+    """Persist a complete supported policy atomically; no service or route actions.
+
+Explicit replacement removes legacy overrides to avoid two competing authorities.
+The canonical document must be exported before downgrading to an older backend.
+"""
+    try:
+        policy = desync_schema.validate_policy(policy)
+        desync_schema.project(policy)
+    except desync_schema.PolicyError as exc:
+        raise ManagedError(str(exc)) from exc
+
+    def change(data: dict) -> bool:
+        if data["desync"] == policy and not data["zapret2"]:
+            return False
+        data["desync"], data["zapret2"] = policy, {}
+        return True
+
+    return _update(path, change)
 
 
 MAX_HIDDEN = 64
