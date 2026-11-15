@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 STRATEGIES = {
     "pass": (),
@@ -33,6 +33,15 @@ STRATEGIES = {
     ),
     "hostfakesplit-md5-repeat": ("hostfakesplit:midhost=midsld:tcp_md5:repeats=2",),
     "hostfakesplit-md5-nosplit": ("hostfakesplit:tcp_md5",),
+    "fake-static-md5": (
+        "fake:blob=fake_default_tls:optional:tls_mod=rnd,rndsni:tcp_md5",
+        "multisplit:pos=1,midsld",
+    ),
+    "fake-clone-md5": (
+        "tls_client_hello_clone:blob=xgw_tls_clone",
+        "fake:blob=xgw_tls_clone:optional:tls_mod=rnd,rndsni:tcp_md5",
+        "multisplit:pos=1,midsld",
+    ),
 }
 FIELDS = {"binary", "strategy", "reassembly", "debug", "domains"}
 DOMAIN = re.compile(r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\Z")
@@ -42,7 +51,7 @@ def settings_check(value: object) -> dict:
     if not isinstance(value, dict) or set(value) != FIELDS:
         raise ValueError("settings_schema")
     binary = value["binary"]
-    if (not isinstance(binary, str) or not Path(binary).is_absolute()
+    if (not isinstance(binary, str) or not PurePosixPath(binary).is_absolute()
             or any(c in binary for c in "\r\n\x00")):
         raise ValueError("binary_path")
     if not isinstance(value["strategy"], str) or value["strategy"] not in STRATEGIES:
@@ -96,7 +105,7 @@ def build_arguments(incoming: list[str], settings: dict) -> list[str]:
     for arg, filename in ((lib, "zapret-lib.lua"), (antidpi, "zapret-antidpi.lua")):
         if not arg.startswith("--lua-init=@"):
             raise ValueError("runtime_lua")
-        path = Path(arg.removeprefix("--lua-init=@"))
+        path = PurePosixPath(arg.removeprefix("--lua-init=@"))
         if not path.is_absolute() or path.name != filename:
             raise ValueError("runtime_lua")
     if not incoming[4].startswith("--filter-tcp="):

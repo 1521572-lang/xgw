@@ -436,7 +436,7 @@ unrelated-empty-field:
         expected = {
             "seqovl": "--lua-desync=multisplit:pos=2,sniext+1:seqovl=679",
             "hostfakesplit": (
-                "--lua-desync=hostfakesplit:host=www.google.com:altorder=1:tcp_ts=+100"
+                "--lua-desync=hostfakesplit:host=www.google.com:tcp_ts=+100"
             ),
             "disorder-badseq": "--lua-desync=multidisorder:pos=1,midsld",
             "hostfakesplit-md5": "--lua-desync=hostfakesplit:midhost=midsld:tcp_md5",

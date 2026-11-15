@@ -30,7 +30,7 @@ NOTES_ACK = (f"default ACK badseq не задан в BAT; подставлен �
 NOTES_ALTORDER = ("altorder=1 не поддержан pinned Lua zapret2 1.0.7; переведено без altorder — ADAPTED (п.5)")
 NOTES_HOSTFAKE = ("hostfakesplit без midhost: default-разрез хоста в winws не задан (master zapret1); "
                   "nfqws2 hostfakesplit без midhost тоже не разрезает — поведение соответствует")
-NOTES_PAYLOAD = ("fake-http переведён отдельным блоком по payload=http_req (одна стадия nfqws2 "
+NOTES_PAYLOAD = ("fake-http переведён отдельным блоком filter-l7=http, payload=http_req (одна стадия nfqws2 "
                  "не выбирает blob по типу payload) — ADAPTED")
 NOTES_MDISORDER = ("multidisorder без split-pos: default winws не установлен (dp->splits пуст); "
                    "подставлен pos=midsld (исторический default zapret1) — ADAPTED")
@@ -280,6 +280,12 @@ def translate_profile(num, raw):
     for i in o.get_list("ipset-exclude"):
         args.append("--ipset-exclude=%LISTS%" + str(i).split("/")[-1].replace("%LISTS%", ""))
     parg, need_http = payload_arg(o, kind)
+    # payload controls Lua invocation, not profile selection. Without an L7 filter
+    # the TLS block shadows the HTTP block on their shared TCP ports.
+    if not o.get("filter-l7") and parg == "--payload=tls_client_hello":
+        args.append("--filter-l7=tls")
+    elif not o.get("filter-l7") and parg == "--payload=quic_initial":
+        args.append("--filter-l7=quic")
     args.append(parg)
     args += [f"--lua-desync={s}" for s in stages]
     http_block = None
@@ -288,7 +294,8 @@ def translate_profile(num, raw):
         repeats = o.get("dpi-desync-repeats")
         rep = f":repeats={int(repeats)}" if repeats is not None else ""
         fargs, _ = fooling_args(o.get("dpi-desync-fooling"), o)
-        hb = [a for a in args if not a.startswith(("--payload=", "--lua-desync="))]
+        hb = [a for a in args if not a.startswith(("--payload=", "--lua-desync=", "--filter-l7="))]
+        hb.append("--filter-l7=http")
         hb.append("--payload=http_req")
         for b in fake_http:
             name = blob_name(str(b).split("/")[-1])
@@ -398,13 +405,12 @@ LAUNCHER_TEMPLATE = r"""#!/usr/bin/python3
 # сброса UID повторно открывает их.
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
 import stat
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 YOUTUBE_SCOPE = (
     "youtube.com", "googlevideo.com", "youtubei.googleapis.com",
@@ -424,7 +430,7 @@ def settings_check(value):
     if not isinstance(value, dict) or set(value) != FIELDS:
         raise ValueError("settings_schema")
     binary = value["binary"]
-    if (not isinstance(binary, str) or not Path(binary).is_absolute()
+    if (not isinstance(binary, str) or not PurePosixPath(binary).is_absolute()
             or any(c in binary for c in "\r\n\x00")):
         raise ValueError("binary_path")
     if not isinstance(value["strategy"], str) or value["strategy"] not in CHAINS:
@@ -434,7 +440,7 @@ def settings_check(value):
     if value["scope"] not in ("source", "youtube"):
         raise ValueError("scope")
     data = value["data_dir"]
-    if (not isinstance(data, str) or not Path(data).is_absolute()
+    if (not isinstance(data, str) or not PurePosixPath(data).is_absolute()
             or any(c in data for c in "\r\n\x00")):
         raise ValueError("data_dir")
     return value
@@ -469,7 +475,7 @@ def scope_swap(block, scope):
         return block
     out = []
     for arg in block:
-        if arg.startswith("--hostlist=@") or arg.startswith("--ipset=@"):
+        if arg.startswith(("--hostlist=", "--ipset=", "--hostlist-domains=")):
             continue
         out.append(arg)
     pos = 0
@@ -502,7 +508,7 @@ def build_arguments(incoming, settings):
     for arg, filename in ((lib, "zapret-lib.lua"), (antidpi, "zapret-antidpi.lua")):
         if not arg.startswith("--lua-init=@"):
             raise ValueError("runtime_lua")
-        path = Path(arg.removeprefix("--lua-init=@"))
+        path = PurePosixPath(arg.removeprefix("--lua-init=@"))
         if not path.is_absolute() or path.name != filename:
             raise ValueError("runtime_lua")
     if not incoming[4].startswith("--filter-tcp="):
@@ -516,7 +522,7 @@ def build_arguments(incoming, settings):
     if any(any(c in arg for c in "\r\n\x00") for arg in incoming):
         raise ValueError("runtime_character")
 
-    prefix = str(Path(settings["data_dir"])) + "/"
+    prefix = str(PurePosixPath(settings["data_dir"])) + "/"
     args = [settings["binary"], qnum, mark, lib, antidpi,
             "--debug=1" if settings["debug"] else "--debug=0"]
     if settings["reassembly"] == "disabled":
@@ -526,7 +532,7 @@ def build_arguments(incoming, settings):
         resolved = [a.replace("%LISTS%", prefix) for a in block]
         for a in resolved:
             for opt in ("--hostlist=", "--hostlist-exclude=", "--ipset=", "--ipset-exclude="):
-                if a.startswith(opt) and a[len(opt):].startswith(str(Path(settings["data_dir"]))):
+                if a.startswith(opt) and a[len(opt):].startswith(prefix):
                     secure_file(Path(a[len(opt):]))
         if i:
             args.append("--new")
@@ -577,8 +583,8 @@ launcher = (LAUNCHER_TEMPLATE
             .replace("@@SOURCE@@", json.dumps(src_compact, ensure_ascii=False, indent=1))
             .replace("@@BLOBS@@", json.dumps({cid: t["blob_decls"] for cid, t in translation["configurations"].items()},
                                              ensure_ascii=False, indent=1)))
-(OUTDIR / "flowseal_lab.py").write_text(launcher, encoding="utf-8")
-(OUTDIR / "translation.json").write_text(json.dumps(translation, ensure_ascii=False, indent=1), encoding="utf-8")
+(OUTDIR / "flowseal_lab.py").write_text(launcher, encoding="utf-8", newline="\n")
+(OUTDIR / "translation.json").write_text(json.dumps(translation, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
 import py_compile
 try:
     py_compile.compile(str(OUTDIR / "flowseal_lab.py"), doraise=True)

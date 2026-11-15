@@ -22,6 +22,7 @@ SELECTED_PROFILES = (
 )
 ENGINE_PROFILES = (
     "seqovl", "hostfakesplit", "disorder-badseq", "hostfakesplit-md5", "fakedsplit-md5",
+    "fake-static-md5", "fake-clone-md5",
 )
 GUI_DOMAINS = [
     "domain:youtube.com", "domain:googlevideo.com", "domain:youtubei.googleapis.com",

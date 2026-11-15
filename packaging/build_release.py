@@ -83,7 +83,9 @@ def build(output: Path) -> Path:
             shutil.copyfile(Path("/usr/share/common-licenses") / name, licenses / name)
         version = run([str(dest / "nfqws2"), "--version"])
         # Сборка не требует root/CAP_NET_RAW. Проверка исполнения Lua — отдельным helper.
-        subprocess.run([str(dest / "nfqws2"), "--dry-run", "--intercept=0",
+        # dry-run parses options; it does not execute Lua or packet handlers.
+        # Root-only intercept=0 and real packet checks belong to T06/T12.
+        subprocess.run([str(dest / "nfqws2"), "--dry-run",
                         "--lua-init=@" + str(dest / "lua/zapret-lib.lua"),
                         "--lua-init=@" + str(dest / "lua/zapret-antidpi.lua")], check=True)
         data = {"version": bundle.VERSION, "commit": bundle.COMMIT,

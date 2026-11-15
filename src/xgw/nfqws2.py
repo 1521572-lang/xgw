@@ -23,7 +23,7 @@ FAKE_MARK = 0x40000000
 UNIT = "xgw-nfqws2.service"
 # MD5 candidates are explicit engine settings, not steps in the VPN server ladder.
 PROFILES = ("seqovl", "hostfakesplit", "disorder-badseq",
-            "hostfakesplit-md5", "fakedsplit-md5")
+            "hostfakesplit-md5", "fakedsplit-md5", "fake-static-md5", "fake-clone-md5")
 BLOBS = (
     "tls_clienthello_www_google_com.bin",
     "quic_initial_www_google_com.bin",
@@ -143,11 +143,20 @@ def arguments(cfg: Config, installation: Installation, profile: str | None = Non
         args.append("--lua-desync=hostfakesplit:midhost=midsld:tcp_md5")
     elif profile == "fakedsplit-md5":
         args.append("--lua-desync=fakedsplit:pos=midsld:tcp_md5")
+    elif profile in ("fake-static-md5", "fake-clone-md5"):
+        # Matched experimental pair: only the fake's source changes. Opt-in, not
+        # part of the automatic VPN ladder. Clone failure must not send a real CH.
+        blob = "fake_default_tls"
+        if profile == "fake-clone-md5":
+            args.append("--lua-desync=tls_client_hello_clone:blob=xgw_tls_clone")
+            blob = "xgw_tls_clone"
+        args += [f"--lua-desync=fake:blob={blob}:optional:tls_mod=rnd,rndsni:tcp_md5",
+                 "--lua-desync=multisplit:pos=1,midsld"]
     elif profile == "hostfakesplit":
         args += [
             "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:"
             "tcp_ts=+100",
-            "--lua-desync=hostfakesplit:host=www.google.com:altorder=1:tcp_ts=+100",
+            "--lua-desync=hostfakesplit:host=www.google.com:tcp_ts=+100",
         ]
     else:
         args += [
