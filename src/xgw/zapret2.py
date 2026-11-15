@@ -11,13 +11,11 @@ import copy
 import ipaddress
 import json
 import re
-import stat
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
-from .desync import worker
+from .desync import preflight, worker
 from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES
 from .net import cmd
 
@@ -338,27 +336,11 @@ class Runtime:
     def occupied(queue: int) -> bool:
         return worker.occupied(queue)
 
-    @staticmethod
-    def _check_files(cfg: Config) -> None:
-        for name in (cfg.zapret2.binary, f"{cfg.zapret2.lua_dir}/zapret-lib.lua",
-                     f"{cfg.zapret2.lua_dir}/zapret-antidpi.lua"):
-            path = Path(name).resolve(strict=True)
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-                raise ValueError("unsafe_files")
-            for parent in path.parents:
-                info = parent.stat()
-                if info.st_uid != 0 or info.st_mode & 0o022:
-                    raise ValueError("unsafe_directory")
-
     def start(self, cfg: Config) -> None:
         worker.require_stopped(self.runner, UNIT)
         if self.occupied(cfg.zapret2.queue_num):
             raise ValueError("queue_busy")
-        self._check_files(cfg)
-        args = arguments(cfg)
-        # intercept=0 проверяет Lua, dry-run этого не делает. Вывод не попадает в журнал XGW.
-        self.runner([*args, "--intercept=0"], timeout=10)
+        args = preflight.check(arguments(cfg), self.runner)
         properties = [
             "Type=exec", "BindsTo=xgw.service", "After=xgw.service", "Restart=no",
             "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "NoNewPrivileges=yes",
@@ -636,6 +618,7 @@ class Controller:
         except (OSError, ValueError, cmd.CommandError) as exc:
             # Ни URL, ни argv/вывод nfqws2, ни пароль служебного входа не публикуются.
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
+                     "bundle_mismatch", "bad_worker_options", "lua_init_failed",
                      "probe_budget", "probe_failed", "apply_failed",
                      "worker_unit_busy", "worker_handoff_pending"}
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
@@ -729,6 +712,7 @@ class Controller:
                 reason = self.last_error or "retry_wait"
         except (OSError, ValueError, cmd.CommandError) as exc:
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
+                     "bundle_mismatch", "bad_worker_options", "lua_init_failed",
                      "worker_start_timeout", "apply_failed", "worker_unit_busy",
                      "worker_handoff_pending", "stopping"}
             reason = (str(exc) if isinstance(exc, ValueError) and str(exc) in codes

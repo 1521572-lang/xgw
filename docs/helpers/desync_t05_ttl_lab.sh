@@ -11,7 +11,7 @@ SOURCE=$(realpath "$HERE/../../src")
 BIN=/opt/xgw/zapret2/1.0.7/nfqws2
 LUA=/opt/xgw/zapret2/1.0.7/lua
 test -x "$BIN"
-for program in ip ss sysctl nft curl openssl tcpdump python3 timeout; do command -v "$program"; done
+for program in ip ss sysctl nft curl openssl python3 timeout; do command -v "$program"; done
 mkdir -- "$1"
 OUT=$(realpath "$1")
 C=xgwttl-c-$$
@@ -22,6 +22,8 @@ NAMES=()
 WORKER=
 SERVER=
 CAPS=()
+CAP_STOP=
+LUA_STAGE=
 
 run() {
   local namespace=$1
@@ -30,12 +32,16 @@ run() {
 }
 
 stop_capture() {
-  local pid
+  local pid result=0
+  if [[ -n "$CAP_STOP" ]]; then
+    : >"$CAP_STOP"
+  fi
   for pid in "${CAPS[@]}"; do
-    kill -INT "$pid" 2>/dev/null || true
-    wait "$pid" || true
+    wait "$pid" || result=1
   done
   CAPS=()
+  CAP_STOP=
+  return "$result"
 }
 
 stop_worker() {
@@ -49,7 +55,7 @@ stop_worker() {
 cleanup() {
   local result=$?
   trap - EXIT
-  stop_capture
+  stop_capture || result=1
   stop_worker
   if [[ -n "$SERVER" ]]; then
     kill "$SERVER" 2>/dev/null || true
@@ -59,11 +65,18 @@ cleanup() {
   for namespace in "${NAMES[@]}"; do
     ip netns delete "$namespace" || result=1
   done
+  if [[ -n "$LUA_STAGE" ]]; then
+    rm -f -- "$LUA_STAGE/desync_t05_ttl.lua"
+    rmdir -- "$LUA_STAGE" || result=1
+  fi
   exit "$result"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
+LUA_STAGE=$(mktemp -d /run/xgw-t05-lua.XXXXXXXX)
+chmod 0755 "$LUA_STAGE"
+install -m 0644 "$HERE/desync_t05_ttl.lua" "$LUA_STAGE/desync_t05_ttl.lua"
 printf 'Lab namespaces: %s %s %s %s\n' "$C" "$R1" "$R2" "$S"
 for namespace in "$C" "$R1" "$R2" "$S"; do
   ip netns add "$namespace"
@@ -136,7 +149,7 @@ start_worker() {
   local label=$1 strategy=$2
   local args=("$BIN" --qnum=201 --fwmark=0x40000000 --debug=0
               "--lua-init=@$LUA/zapret-lib.lua" "--lua-init=@$LUA/zapret-antidpi.lua"
-              "--lua-init=@$HERE/desync_t05_ttl.lua" --filter-tcp=443 --filter-l7=tls
+              "--lua-init=@$LUA_STAGE/desync_t05_ttl.lua" --filter-tcp=443 --filter-l7=tls
               --payload=tls_client_hello --lua-desync=xgw_ttl_observe "--lua-desync=$strategy")
   run "$C" timeout 10 "${args[@]}" --intercept=0 >"$OUT/$label.preflight.log" 2>&1
   ip netns exec "$C" "${args[@]}" >"$OUT/$label.worker.log" 2>&1 &
@@ -153,19 +166,19 @@ start_worker() {
 
 trial() {
   local label=$1
-  ip netns exec "$C" tcpdump -Z root -n -U -i right0 -s 128 -w "$OUT/$label.client.pcap" \
-    'host 203.0.113.2 and tcp port 443' >"$OUT/$label.client.log" 2>&1 &
+  CAP_STOP="$OUT/$label.capture.stop"
+  ip netns exec "$C" python3 "$HERE/desync_lab_capture.py" right0 "$OUT/$label.client.pcap" \
+    "$CAP_STOP" "$OUT/$label.client.ready" >"$OUT/$label.client.log" 2>&1 &
   CAPS+=("$!")
-  ip netns exec "$S" tcpdump -Z root -n -U -i left0 -s 128 -w "$OUT/$label.server.pcap" \
-    'host 192.0.2.1 and tcp port 443' >"$OUT/$label.server.log" 2>&1 &
+  ip netns exec "$S" python3 "$HERE/desync_lab_capture.py" left0 "$OUT/$label.server.pcap" \
+    "$CAP_STOP" "$OUT/$label.server.ready" >"$OUT/$label.server.log" 2>&1 &
   CAPS+=("$!")
   for (( i=0; i<50; i++ )); do
-    if grep -q 'listening on' "$OUT/$label.client.log" &&
-       grep -q 'listening on' "$OUT/$label.server.log"; then break; fi
+    if [[ -f "$OUT/$label.client.ready" && -f "$OUT/$label.server.ready" ]]; then break; fi
     sleep 0.1
   done
-  grep -q 'listening on' "$OUT/$label.client.log"
-  grep -q 'listening on' "$OUT/$label.server.log"
+  test -f "$OUT/$label.client.ready"
+  test -f "$OUT/$label.server.ready"
   run "$C" curl --silent --show-error --fail --noproxy '*' --max-time 10 --http1.1 \
     --cacert "$OUT/cert.pem" --resolve probe.xgw.test:443:203.0.113.2 \
     https://probe.xgw.test/body.txt -o "$OUT/$label.body"
@@ -190,6 +203,8 @@ start_worker cold_on "$AUTO"
 trial cold_on
 # Same worker and IP, but no incoming queue and a different real SYN/ACK TTL.
 run "$C" nft flush chain inet xgw_guard zapret2_reply
+run "$C" nft -j list chain inet xgw_guard zapret2_reply |
+  python3 -c 'import json, sys; assert not any("rule" in e for e in json.load(sys.stdin)["nftables"])'
 run "$S" sysctl -qw net.ipv4.ip_default_ttl=60
 trial warm_off
 stop_worker

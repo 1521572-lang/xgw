@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -5,6 +6,7 @@ import pytest
 
 from xgw import nfqws2, zapret2
 from xgw.config import Config
+from xgw.desync import preflight as worker_preflight
 from xgw.desync import worker
 from xgw.net.cmd import CommandError
 
@@ -54,8 +56,7 @@ def test_failed_selected_start_retains_slot_until_its_stop_is_confirmed(monkeypa
                                       dict.fromkeys(nfqws2.BLOBS))
     monkeypatch.setattr(selected, "occupied", lambda queue: False)
     monkeypatch.setattr(engine, "occupied", lambda queue: False)
-    monkeypatch.setattr(engine, "_check_files", lambda installation: None)
-    monkeypatch.setattr(selected, "_check_files", lambda cfg: None)
+    monkeypatch.setattr(worker_preflight, "check", lambda args, runner: args)
 
     def uncertain_start(argv, **kwargs):
         if argv[0] == "systemd-run":
@@ -98,7 +99,7 @@ def test_active_peer_unit_is_not_taken_over_after_daemon_restart(monkeypatch):
 
     runtime = nfqws2.Runtime(run)
     monkeypatch.setattr(runtime, "occupied", lambda queue: False)
-    monkeypatch.setattr(runtime, "_check_files", lambda installation: None)
+    monkeypatch.setattr(worker_preflight, "check", lambda args, runner: args)
     installation = nfqws2.Installation(Path("nfqws2"), Path("lua"),
                                        dict.fromkeys(nfqws2.BLOBS))
     with pytest.raises(ValueError, match="worker_unit_busy"):
@@ -106,3 +107,57 @@ def test_active_peer_unit_is_not_taken_over_after_daemon_restart(monkeypatch):
     runtime.stop()
     assert all(argv[0] != "systemd-run" and "stop" not in argv for argv in calls)
     assert runtime.slot.lease is None
+
+
+@pytest.mark.parametrize(("failing_flag", "expected"), [
+    ("--dry-run", "bad_worker_options"), ("--intercept=0", "lua_init_failed"),
+])
+def test_preflight_uses_resolved_paths_and_distinguishes_parse_from_lua(
+    monkeypatch, tmp_path, failing_flag, expected,
+):
+    binary = tmp_path / "real-nfqws2"
+    lua = tmp_path / "real.lua"
+    paths = {Path("alias"): binary, Path("lua-alias"): lua}
+    monkeypatch.setattr(worker_preflight, "trusted_file", paths.__getitem__)
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        if argv[-1] == failing_flag:
+            raise CommandError("private file detail")
+
+    with pytest.raises(ValueError, match=f"^{expected}$"):
+        worker_preflight.check(["alias", "--lua-init=@lua-alias"], run)
+    assert all(argv[:2] == [str(binary), f"--lua-init=@{lua}"] for argv in calls)
+    assert [argv[-1] for argv in calls] == (
+        ["--dry-run"] if failing_flag == "--dry-run" else ["--dry-run", "--intercept=0"])
+
+
+def test_managed_lua_mismatch_stops_before_executing_binary(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_preflight, "MANAGED_ROOT", tmp_path)
+    monkeypatch.setattr(worker_preflight, "trusted_file", lambda path: path)
+    binary = tmp_path / worker_preflight.VERSION / "nfqws2"
+    lua = binary.parent / "lua" / "zapret-lib.lua"
+    lua.parent.mkdir(parents=True)
+    lua.write_bytes(b"tampered library")
+    runner = Mock()
+    with pytest.raises(ValueError, match=r"^bundle_mismatch$"):
+        worker_preflight.check([str(binary), f"--lua-init=@{lua}"], runner)
+    runner.assert_not_called()
+
+
+def test_packaged_binary_mismatch_aborts_before_preflight(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_preflight, "MANAGED_ROOT", tmp_path)
+    monkeypatch.setattr(worker_preflight, "trusted_file", lambda path: path)
+    binary = tmp_path / worker_preflight.VERSION / "nfqws2"
+    binary.parent.mkdir()
+    binary.write_bytes(b"unexpected program")
+    (binary.parent / "bundle.json").write_text(json.dumps({
+        "version": worker_preflight.VERSION, "commit": worker_preflight.COMMIT,
+        "machine": worker_preflight.platform.machine(), "system": "Linux",
+        "files": {"nfqws2": "0" * 64},
+    }), encoding="utf-8")
+    runner = Mock()
+    with pytest.raises(ValueError, match=r"^bundle_mismatch$"):
+        worker_preflight.check([str(binary)], runner)
+    runner.assert_not_called()

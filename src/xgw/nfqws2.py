@@ -6,7 +6,6 @@ import contextlib
 import json
 import os
 import shutil
-import stat
 import threading
 import time
 from collections.abc import Collection
@@ -14,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .desync import worker
+from .desync import preflight, worker
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -345,20 +344,6 @@ class Runtime:
                 cancel.wait(pause)
         return False
 
-    @staticmethod
-    def _check_files(installation: Installation) -> None:
-        for name in (installation.binary, installation.lua_dir / "zapret-lib.lua",
-                     installation.lua_dir / "zapret-antidpi.lua",
-                     *(path for path in installation.blobs.values() if path)):
-            path = name.resolve(strict=True)
-            info = path.stat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-                raise ValueError("unsafe_files")
-            for parent in path.parents:
-                info = parent.stat()
-                if info.st_uid != 0 or info.st_mode & 0o022:
-                    raise ValueError("unsafe_directory")
-
     def start(self, cfg: Config, installation: Installation, profile: str) -> None:
         key = launch_key(cfg, installation, profile)
         if self.lease is not None:
@@ -366,9 +351,7 @@ class Runtime:
         worker.require_stopped(self.runner, UNIT)
         if self.occupied(cfg.zapret2.engine_queue):
             raise ValueError("queue_busy")
-        self._check_files(installation)
-        args = arguments(cfg, installation, profile)
-        self.runner([*args, "--intercept=0"], timeout=10)
+        args = preflight.check(list(key[0]), self.runner)
         worker.require_stopped(self.runner, worker.SELECTED_UNIT)
         self.lease = self.slot.reserve(UNIT, cfg.zapret2.engine_queue)
         if cfg.zapret2.engine_offload and profile == "disorder-badseq":
@@ -457,6 +440,7 @@ class Controller:
         except (OSError, ValueError, cmd.CommandError) as exc:
             reason = str(exc) if isinstance(exc, (ValueError, OffloadError)) and str(exc) in {
                 "queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
+                "bundle_mismatch", "bad_worker_options", "lua_init_failed",
                 "offload_interface", "unknown_profile", "worker_start_timeout",
                 "offload_state", "offload_read", "offload_fixed", "offload_apply",
                 "offload_restore",

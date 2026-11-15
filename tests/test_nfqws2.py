@@ -119,7 +119,7 @@ class EngineTests(unittest.TestCase):
                                          return_value=self.installation))
         patches.enter_context(mock.patch.object(runtime, "occupied", host.occupied))
         patches.enter_context(mock.patch("xgw.desync.worker.verify_owner", return_value=True))
-        patches.enter_context(mock.patch.object(runtime, "_check_files"))
+        patches.enter_context(mock.patch("xgw.nfqws2.preflight.check", side_effect=lambda a, _: a))
         patches.enter_context(mock.patch.object(nfqws2, "time", SimpleNamespace(
             monotonic=lambda: host.now, sleep=host.sleep,
         )))
@@ -569,7 +569,7 @@ unrelated-empty-field:
         cfg.zapret2.engine = "auto"
         with (mock.patch("xgw.nfqws2.find_installation", return_value=self.installation),
               mock.patch.object(runtime, "occupied", return_value=False),
-              mock.patch.object(runtime, "_check_files", side_effect=ValueError("unsafe_files"))):
+              mock.patch("xgw.nfqws2.preflight.check", side_effect=ValueError("unsafe_files"))):
             controller.step(cfg, [], active=True)
             controller.close()
         self.assertEqual(controller.view["reason"], "unsafe_files")
@@ -581,7 +581,7 @@ unrelated-empty-field:
         runner = mock.Mock(return_value="inactive")
         runtime = nfqws2.Runtime(runner)
         with (mock.patch.object(runtime, "occupied", return_value=False),
-              mock.patch.object(runtime, "_check_files")):
+              mock.patch("xgw.nfqws2.preflight.check", side_effect=lambda a, _: a)):
             runtime.start(Config(), self.installation, "seqovl")
         runner.reset_mock()
         controller = nfqws2.Controller(runtime)
@@ -602,7 +602,7 @@ unrelated-empty-field:
         runner = mock.Mock(side_effect=run)
         runtime = nfqws2.Runtime(runner)
         with (mock.patch.object(runtime, "occupied", return_value=False),
-              mock.patch.object(runtime, "_check_files"),
+              mock.patch("xgw.nfqws2.preflight.check", side_effect=lambda a, _: a),
               self.assertRaises(CommandError)):
             runtime.start(Config(), self.installation, "seqovl")
         runner.side_effect = CommandError("stop timed out")
