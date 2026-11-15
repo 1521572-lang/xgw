@@ -24,6 +24,7 @@
 | FIXTURE_ACTIVE / ERROR / ABSENT / STALE | NOT_RUN | |
 | GUI main screen / details / both themes | NOT_RUN | |
 | Config migration, idempotence, temporary-file flock/0600 | NOT_RUN | |
+| DORMANT_LOAD / DORMANT_PERSIST / UNSUPPORTED_ACTIVATION_REJECTED | NOT_RUN | |
 | Configuration unchanged | NOT_RUN | |
 | Xray PID / other services / network structure unchanged | NOT_RUN | |
 | Installed hashes after timer cancellation | NOT_RUN | |

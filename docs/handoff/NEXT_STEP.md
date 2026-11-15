@@ -1,11 +1,11 @@
-# GLM 5.3 Flash — батч 1: карточка zapret2 и миграция политики
+# GLM 5.3 Flash — батч 1, повтор r2: установка после исправления сохранённой стратегии
 
 - target_os: **Ubuntu 24.04 LTS** (уточнение владельца; прежние упоминания 26.04 не эталон).
 - base_commit: **48f7ebae15096c40aaa4b82b7f3b19488ab24dd3**, gui-light.
 - delivery_branch: **integration/zapret2-batch1**.
 - gui_base_commit: **7c20f59023ec39e5c5ce4606767ea915c3b91f64**, freepool.
 - code_commit: коммит этого NEXT_STEP в delivery_branch; вычисли командой ниже и закрепи.
-- report: `docs/reports/YYYY-MM-DD_desync-batch1.md` в delivery_branch.
+- report: `docs/reports/YYYY-MM-DD_desync-batch1-r2.md` в delivery_branch.
 - scope: **только T01 + T02**. T03–T07 и сетевые эксперименты здесь не выполнять.
 
 Ты выполняешь команды, читаешь журналы, запускаешь GUI и проверяешь экран сама через vision.
@@ -13,6 +13,21 @@
 Один связный проход: проверка, установка с откатом, испытания, восстановление при проблеме,
 автоматическая публикация отчёта и разрешённых хотфиксов. Никакого отдельного подтверждения
 для commit/push отчёта не требуется. Не публикуй токены, подписки, конфиги или полный status.json.
+
+## Что изменилось после первого отчёта
+
+Сначала прочитай `docs/reports/2026-11-15_desync-batch1.md` (48040ea) и fixture-хотфикс
+0a4b664, уже включённый в ветку. В том проходе apply не выполнялся: рабочий backend и GUI
+остались прежними. Теперь известная стратегия `hostfakesplit_md5` сохраняется при mode=off
+в обоих валидаторах, без подстановки multisplit. Включение её в selective/compare и режим
+standalone пока запрещены. Исправлено также старое ожидание `pin` в тесте free_pool;
+оно не меняет поведение приложения. Эти изменения требуют повторной приёмки на Ubuntu.
+
+Не удаляй и не редактируй legacy-zapret2 в рабочем panel.json для обхода проверки.
+Не используй payload, manifest и backup от 557e515: теперь меняется также `zapret2.py`.
+Пройди инструкции заново с новым CODE и новыми каталогами. Старые материалы оставь до
+закрытия приёмки. Новый manifest должен иметь **8 строк backend или 10 с GUI**.
+Старый отчёт не перезаписывай; результат повторного прохода публикуй как `*-r2.md`.
 
 ## 1. Получи закреплённый код
 
@@ -87,16 +102,20 @@ python3 -m venv "$D/test-env"
 "$D/test-env/bin/python" -m pytest -q \
   tests/test_config.py tests/test_managed.py tests/test_zapret2.py tests/test_nfqws2.py tests/test_panel.py
 "$D/test-env/bin/python" -m ruff check \
-  src/xgw/desync src/xgw/config.py src/xgw/managed.py src/xgw/daemon.py \
+  src/xgw/desync src/xgw/config.py src/xgw/managed.py src/xgw/daemon.py src/xgw/zapret2.py \
   src/xgw/watch/panel.py src/xgw/watch/zapret2_control.py src/xgw/gui/zapret2.py \
   vpn_ui/xgw/overview.py tests/conftest.py tests/test_desync_schema.py \
-  tests/test_zapret2_panel.py tests/test_zapret2.py tests/test_managed.py \
+  tests/test_zapret2_panel.py tests/test_zapret2.py tests/test_managed.py tests/test_panel.py \
   docs/helpers/desync_batch1_install.py
 ```
 
 Если Python venv отсутствует, сначала найди существующее dev-окружение. Для установки
 python3-venv запроси недостающий sudo-доступ, если его нет. Не обновляй ОС/ядро/сетевые пакеты.
 Новый провал тестов не скрывай через skip или ослабление assert.
+В r2 ожидается отсутствие прежнего провала free_pool/pin; если он сохранился или появились
+другие — разбери до установки. Отдельно запиши результат параметризованного
+`test_off_is_original_config_without_starting_anything`: сохранённая hostfakesplit_md5
+при off не должна создавать маршрут, вход для проб или запускать обработчик.
 
 ## 4. Подготовь неизменяемый payload и резервную копию
 
@@ -112,10 +131,12 @@ test ! -e "$BACKUP"
 sudo install -d -m 0755 "$PAYLOAD/code" "$PAYLOAD/base" "$PAYLOAD/gui_base"
 git archive "$CODE" src/xgw docs/helpers/desync_batch1_install.py vpn_ui/xgw/overview.py |
   sudo tar --no-same-owner -x -C "$PAYLOAD/code"
-git archive "$BASE" src/xgw/config.py src/xgw/managed.py src/xgw/daemon.py src/xgw/watch/panel.py |
+git archive "$BASE" src/xgw/config.py src/xgw/managed.py src/xgw/daemon.py src/xgw/watch/panel.py src/xgw/zapret2.py |
   sudo tar --no-same-owner -x -C "$PAYLOAD/base"
 git archive "$GUI_BASE" vpn_ui/xgw/overview.py src/xgw/gui/zapret2.py |
   sudo tar --no-same-owner -x -C "$PAYLOAD/gui_base"
+# git archive сохраняет group-write каталогов; убрать его только в новом payload.
+sudo chmod -R go-w -- "$PAYLOAD"
 HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
 sudo "$PY" -I - "$PAYLOAD/code/src" "$CFG" <<'PY'
 import sys
@@ -123,11 +144,14 @@ sys.path.insert(0, sys.argv[1])
 from xgw.config import load
 cfg, warnings = load(sys.argv[2])
 assert cfg.zapret2.mode == "off" and cfg.zapret2.engine == "off", "active policy: STOP"
+from dataclasses import asdict
+from xgw.desync import schema
+assert schema.migrate(asdict(cfg.zapret2)) == cfg.desync, "policy was substituted: STOP"
 print("new config reader: PASS; policy off; warnings:", len(warnings))
 PY
 ```
 
-Helper проверяет root-владельца и права всех родителей, запрет ссылок, совпадение четырёх
+Helper проверяет root-владельца и права всех родителей, запрет ссылок, совпадение пяти
 существующих backend-файлов с BASE и отсутствие конфликтующих новых файлов. Его отказ —
 сигнал разобрать расхождение, а не ослабить проверку. PACKAGE передавай уже разрешённым
 через readlink -f: установленный lib может быть root-owned symlink.
@@ -192,6 +216,7 @@ sudo "$PY" "$HELPER" rollback --backup "$BACKUP"
 1. `zapret2` присутствует; schema_version=1; fresh=true; policy_matched=true; state=off.
 2. `strategy=null`, счётчики null, playback=not_tested. Нет выдуманного успеха видео.
 3. После появления нового status.json нет бесконечного pending/legacy_snapshot.
+   Это обязательно проверить с исходной сохранённой стратегией при off, без её замены.
 4. POST-команды не предлагаются: can_off/can_edit=false; причина видна в GUI.
 5. В реальном новом GUI пропало «Нет данных», главный экран и подробная карточка согласованы.
 6. Светлая/тёмная темы, узкое окно; текст не обрезан; ошибок/None в подписи стратегии нет.
@@ -216,6 +241,11 @@ python3 "$D/gui/vpn_ui/main_xgw.py" --theme light --native-titlebar
 Подтверди миграцию реальных конфигов только чтением/экспортом в D. Не переписывай рабочие
 config.toml/panel.json. Проверь flock/права 0600 на временном отдельном panel.json в D
 через managed.set_desync; не применяй этот тестовый файл к рабочей службе.
+На копии с `mode=off, strategy=hostfakesplit_md5` проверь сохранение стратегии при чтении,
+сохранении и повторном чтении; перевод копии в selective/compare должен отклоняться до
+записи. На рабочей конфигурации режимы не переключай. Исходные probes и domains должны
+сохраниться точно, но не публикуй их. В результатах укажи отдельно DORMANT_LOAD,
+DORMANT_PERSIST и UNSUPPORTED_ACTIVATION_REJECTED.
 
 После успешной проверки оставь новый backend и установленные GUI-накладки. Сначала отмени
 таймер, убедись, что rollback не запустился, и сверь SHA файлов с manifest:
@@ -262,11 +292,11 @@ PY
 
 ```bash
 git fetch origin integration/zapret2-batch1
-git switch -c glm/desync-batch1-report FETCH_HEAD
-git add docs/reports/YYYY-MM-DD_desync-batch1.md
+git switch -c glm/desync-batch1-r2-report FETCH_HEAD
+git add docs/reports/YYYY-MM-DD_desync-batch1-r2.md
 git diff --cached --check
 git diff --cached --stat
-git commit -m 'docs: report Ubuntu 24.04 desync batch 1 acceptance'
+git commit -m 'docs: report Ubuntu 24.04 desync batch 1 r2 acceptance'
 git push origin HEAD:integration/zapret2-batch1
 ```
 

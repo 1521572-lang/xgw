@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
+from .desync.schema import SELECTED_PROFILES
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -54,8 +55,11 @@ def validate(cfg: Config) -> list[str]:
         problems.append("mode: ожидается off, selective или compare")
     if not z.domains or any(not _DOMAIN.fullmatch(d) for d in z.domains):
         problems.append("domains: нужны domain:имя или full:имя")
-    if z.strategy not in ("multisplit", "multidisorder"):
-        problems.append("strategy: ожидается multisplit или multidisorder")
+    # Keep dormant preferences intact; off never executes a selected strategy.
+    # Enabling a profile still requires support in this controller, not just in the schema.
+    strategies = SELECTED_PROFILES if z.mode == "off" else ("multisplit", "multidisorder")
+    if z.strategy not in strategies:
+        problems.append("strategy: неизвестная или неподдерживаемая в выбранном режиме")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
         problems.append("queue_num или probe_port вне допустимого диапазона")
     if z.probe_port in (cfg.capture.tproxy_port, cfg.xray.metrics_port, cfg.xray.socks_port,

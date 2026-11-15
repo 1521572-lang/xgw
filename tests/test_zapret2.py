@@ -94,8 +94,11 @@ class Harness:
         assert z.active(self.current)
 
 
-def test_off_is_original_config_without_starting_anything():
+@pytest.mark.parametrize("strategy", ["multisplit", "hostfakesplit_md5"])
+def test_off_is_original_config_without_starting_anything(strategy):
     result, cfg, _ = _build()
+    cfg.zapret2.strategy = strategy
+    assert not z.validate(cfg)
     assert z.patch(result.config, cfg) == result.config
     runtime = Runtime()
     ctl = z.Controller(Store(), runtime)

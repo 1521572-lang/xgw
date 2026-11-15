@@ -825,7 +825,7 @@ def test_refresh_and_scan_are_passed_to_the_daemon(rig, user):
 def test_free_pool_card_switches_observation(rig, user):
     """Карточка «Бесплатные серверы»: наблюдение включается и выключается (трафик через пул —
     не в этой версии); «Опросить источники» — только при включённом наблюдении."""
-    assert user.state()["free_pool"] == {"mode": "off", "summary": None}
+    assert user.state()["free_pool"] == {"mode": "off", "pin": "", "summary": None}
     assert not user.act("freepool/mode", {"mode": "on"})["ok"]
     assert not user.act("freepool/refresh", {})["ok"]
     assert user.act("freepool/mode", {"mode": "observe"})["ok"]

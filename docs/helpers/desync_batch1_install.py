@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
-BACKEND = ("config.py", "managed.py", "daemon.py", "watch/panel.py",
+BACKEND = ("config.py", "managed.py", "daemon.py", "watch/panel.py", "zapret2.py",
            "watch/zapret2_control.py", "desync/__init__.py", "desync/schema.py")
 GUI = ("vpn_ui/xgw/overview.py", "src/xgw/gui/zapret2.py")
 
@@ -118,7 +118,7 @@ def prepare(args, backup):
 def records(backup):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
-    require(isinstance(rows, list) and 7 <= len(rows) <= 9, "invalid manifest")
+    require(isinstance(rows, list) and 8 <= len(rows) <= 10, "invalid manifest")
     seen = set()
     for row in rows:
         bounded(row["target"], "/opt/xgw")

@@ -160,13 +160,14 @@ def project(policy: dict, *, target: str = "gui-light") -> dict:
 
 Batch 1 does NOT implement standalone on gui-light or the engine on freepool.
 Keep the canonical document for exchange when its target runtime is unsupported.
+Known selected strategies may remain dormant in off mode without substitution.
 """
     _require(target in ("gui-light", "freepool"), "target")
     flat = flatten(policy)
     if target == "gui-light":
         if flat["mode"] == "standalone":
             raise PolicyError("desync: standalone requires batch T04 on gui-light")
-        if flat["strategy"] not in ("multisplit", "multidisorder"):
+        if flat["mode"] != "off" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: selected strategy requires batch T04 on gui-light")
     else:
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):
