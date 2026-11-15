@@ -40,6 +40,7 @@ DEFAULTS = {
     "strategy": "multisplit", "queue_num": 200, "probe_port": 19999, "probe_urls": [],
     "check_seconds": 180, "retry_seconds": 300, "daily_probe_mb": 256,
     "observe_synack": False,
+    "observe_reply_packets": 0,
     "engine": "off", "engine_profile": "seqovl", "engine_queue": 200,
     "engine_offload": True, "blob_dir": "",
 }
@@ -50,6 +51,8 @@ GROUPS = {
     "runtime": ("binary", "lua_dir", "blob_dir", "queue_num", "engine_queue", "probe_port"),
 }
 ENGINE_FIELDS = ("engine", "engine_profile", "engine_queue", "engine_offload", "blob_dir")
+OBSERVATION_FIELDS = ("observe_synack", "observe_reply_packets")
+MAX_REPLY_PACKETS = 8
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
@@ -76,7 +79,8 @@ def validate_patch(value: object) -> dict:
             _require(value[name] in allowed, name)
     for name, lower, upper in (("queue_num", 1, 65535), ("engine_queue", 1, 65535),
                                ("probe_port", 1024, 65535), ("check_seconds", 60, 900),
-                               ("retry_seconds", 60, 3600), ("daily_probe_mb", 1, 1024)):
+                               ("retry_seconds", 60, 3600), ("daily_probe_mb", 1, 1024),
+                               ("observe_reply_packets", 0, MAX_REPLY_PACKETS)):
         if name in value:
             _require(lower <= value[name] <= upper, name)
     for name in ("binary", "lua_dir", "blob_dir"):
@@ -109,7 +113,7 @@ def validate_patch(value: object) -> dict:
 def migrate(value: object, *, source: str = "gui-light") -> dict:
     """Legacy settings or canonical policy -> canonical policy, without writes.
 
-Canonical input must include all required fields. The optional SYN/ACK flag defaults to off.
+Canonical input must include all required fields. Packet observation defaults to off.
 Unknown versions/fields are rejected, never stripped.
 Calling migrate twice returns equal documents; lists preserve order and exact contents.
 """
@@ -123,7 +127,7 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         for group, names in GROUPS.items():
             section = value[group]
             required = set(names)
-            optional = {"observe_synack"} if group == "selected" else set()
+            optional = set(OBSERVATION_FIELDS) if group == "selected" else set()
             _require(isinstance(section, dict) and required <= set(section) <= required | optional,
                      group)
             flat.update(section)
@@ -135,9 +139,10 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         flat.update(validate_patch(value))
     result = {"schema_version": VERSION,
               **{group: {name: flat[name] for name in names} for group, names in GROUPS.items()}}
-    # Preserve the representation and revision of existing policies when the flag is off.
-    if flat.get("observe_synack"):
-        result["selected"]["observe_synack"] = True
+    # Preserve the representation and revision of policies without packet observation.
+    for name in OBSERVATION_FIELDS:
+        if flat.get(name):
+            result["selected"][name] = flat[name]
     return result
 
 
@@ -174,11 +179,13 @@ Known selected strategies may remain dormant in off mode without substitution.
 """
     _require(target in ("gui-light", "freepool"), "target")
     flat = flatten(policy)
+    if flat.get("observe_reply_packets") and not flat.get("observe_synack"):
+        raise PolicyError("desync: observe_reply_packets requires observe_synack")
     if target == "gui-light":
         if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: compare tracing supports multisplit and multidisorder")
     else:
-        if flat.get("observe_synack"):
+        if any(flat.get(name) for name in OBSERVATION_FIELDS):
             raise PolicyError("desync: SYN/ACK observation cannot be represented by freepool")
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):
             raise PolicyError("desync: engine settings cannot be represented by freepool")

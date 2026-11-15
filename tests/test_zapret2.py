@@ -420,6 +420,32 @@ def test_synack_observation_arms_only_marked_handshakes_and_uses_selected_queue(
     assert "queue num" not in nft.render_guard(rules)
 
 
+def test_reply_window_requires_accounting_and_keeps_first_packets_bounded(monkeypatch, tmp_path):
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: None)
+    cfg, _, _ = setup()
+    cfg.zapret2.observe_synack = True
+    cfg.zapret2.observe_reply_packets = 8
+    acct = tmp_path / z.CONNTRACK_ACCT
+    acct.parent.mkdir(parents=True)
+    acct.write_text("0\n")
+    rules, warnings = nft.build_rules(cfg, capture=True, time_uids=(), proc_sys=tmp_path)
+    guard = nft.render_guard(rules)
+    assert "zapret2_reply" in guard and "ct reply packets" not in guard
+    assert any("nf_conntrack_acct=1" in warning for warning in warnings)
+    assert acct.read_text() == "0\n"
+    acct.write_text("1\n")
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=(), proc_sys=tmp_path)
+    guard = nft.render_guard(rules)
+    replies = [line for line in guard.splitlines() if "ct reply packets" in line]
+    assert len(replies) == 2
+    assert "ct direction reply ct state established tcp sport 443" in replies[0]
+    assert "ct mark & 0x18000000 == 0x18000000 ct mark & 0x10000000 @zapret2_live" in replies[0]
+    assert "ct reply packets 2-9" in replies[0] and "queue num 200" in replies[0]
+    assert "ct reply packets > 9 ct mark set ct mark & 0xe7ffffff" in replies[1]
+    rules, _ = nft.build_rules(cfg, capture=False, time_uids=(), proc_sys=tmp_path)
+    assert "ct reply packets" not in nft.render_guard(rules)
+
+
 def test_gate_refresh_is_atomic_and_expires():
     calls = []
     runtime = z.Runtime(lambda argv, **kw: calls.append((argv, kw)))

@@ -231,6 +231,7 @@ class Capture:
             geoip=self.paths.xray_dir / "geoip.dat",
             fp_peers=_fp_peers(self.paths),
             conncheck=_conncheck(self.paths),
+            proc_sys=self.proc_sys,
         )
         if rules.capture6 and not self.ipv6_usable():
             # Нечего перехватывать: утечки через IPv6 быть не может, а команды ip -6

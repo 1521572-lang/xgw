@@ -399,6 +399,7 @@ class Zapret2:
     retry_seconds: int = 300
     daily_probe_mb: int = 256
     observe_synack: bool = False
+    observe_reply_packets: int = 0
     engine: str = "off"
     engine_profile: str = "seqovl"
     engine_queue: int = 200

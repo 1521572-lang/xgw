@@ -129,6 +129,12 @@ engine проверяется MainPID → inode сокета → port ID → н�
 формат политики и сохраняется её fingerprint. Включение добавляет в ту же очередь zapret2
 отмеченный IPv4 SYN/ACK при живом gate. Пакетная метка выбранного выхода, fake-bit и бит
 conntrack для рукопожатия выполняют разные задачи. Флаг не меняет стратегию, sysctl и offload.
+
+`selected.observe_reply_packets` ограничивает первые ответы после SYN/ACK диапазоном 1–8.
+Ноль выключает окно и сохраняет форму старой политики. Для окна требуется `observe_synack`
+и уже включённый `nf_conntrack_acct=1`. Если чтение учёта не подтверждает 1, XGW строит
+прежнее правило SYN/ACK и пишет предупреждение. ACK и повторные пакеты входят в порядковый
+номер conntrack, поэтому число полезных сегментов может быть меньше лимита.
 Формат proc опирается на исходники
 [NFQUEUE](https://github.com/torvalds/linux/blob/master/net/netfilter/nfnetlink_queue.c) и
 [netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).

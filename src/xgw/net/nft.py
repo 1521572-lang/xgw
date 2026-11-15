@@ -82,7 +82,7 @@ from urllib.parse import urlsplit
 from .. import geodat, nfqws2, zapret2
 from .. import tailscale as ts
 from ..config import Config
-from . import lan
+from . import lan, sysctl
 from .cmd import CommandError, Runner
 
 TABLE = "xgw"
@@ -190,6 +190,7 @@ class Rules:
     conncheck_port: int = 80
     zapret2_queue: int | None = None
     zapret2_observe_synack: bool = False
+    zapret2_reply_packets: int = 0
     # Универсальный L3/L4-движок: очередь с bypass и anti-loop по FAKE_MARK.
     engine_queue: int | None = None
 
@@ -291,6 +292,7 @@ def build_rules(
     tailscale: bool = False, xray_down: bool = False, tailnet: bool = False,
     ts_fallback: bool = False, geoip: Path | None = None, fp_peers: tuple[str, ...] = (),
     conncheck: tuple[tuple[str, ...], int] = ((), 80),
+    proc_sys: Path = sysctl.PROC_SYS,
 ) -> tuple[Rules, list[str]]:
     """Параметры правил из конфига. capture=False — перехват снят (обычный роутер);
     blocked=True — перехвата нет, и то, что он вёл бы в Xray, закрыто (режим blocked).
@@ -361,6 +363,13 @@ def build_rules(
             "dns.direct_servers пуст: устройствам в обход VPN и всей сети после "
             "xgw disable некому отвечать на DNS-запросы к шлюзу"
         )
+    observe_synack = cfg.zapret2.selected_enabled and cfg.zapret2.observe_synack
+    reply_packets = cfg.zapret2.observe_reply_packets if capture and observe_synack else 0
+    if reply_packets and sysctl.read(zapret2.CONNTRACK_ACCT, proc_sys) != "1":
+        # An nft counter expression would enable accounting even on a check-only load.
+        # Require existing accounting; the SYN/ACK-only path remains available.
+        warnings.append("zapret2: входящий диапазон требует nf_conntrack_acct=1")
+        reply_packets = 0
     return (
         Rules(
             lan_if=lan_if,
@@ -404,7 +413,8 @@ def build_rules(
             conncheck_port=conncheck[1],
             zapret2_queue=(cfg.zapret2.queue_num
                            if cfg.zapret2.selected_enabled else None),
-            zapret2_observe_synack=cfg.zapret2.selected_enabled and cfg.zapret2.observe_synack,
+            zapret2_observe_synack=observe_synack,
+            zapret2_reply_packets=reply_packets,
             engine_queue=(cfg.zapret2.engine_queue if capture and nfqws2.enabled(cfg)
                           and nfqws2.find_installation(cfg) is not None else None),
         ),
@@ -1192,7 +1202,8 @@ def render_guard(rules: Rules) -> str:
     forward.append("return")
     return _table("inet", GUARD, [
         *zapret2.guard_blocks(rules.zapret2_queue,
-                              observe_synack=rules.zapret2_observe_synack),
+                              observe_synack=rules.zapret2_observe_synack,
+                              observe_reply_packets=rules.zapret2_reply_packets),
         *_nfq_blocks(rules),
         _chain("pass", "", common),
         _chain("transit", "", ["jump pass", *reject]),

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
 from .desync import worker
-from .desync.schema import SELECTED_PROFILES
+from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -31,6 +31,8 @@ FAKE_MARK = MARK | FAKE_BIT
 MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
 # This conntrack bit is independent of skb marks and nft.GUARD_CT.
 SYNACK_CT = 0x10000000
+REPLY_CT = 0x08000000
+CONNTRACK_ACCT = "net/netfilter/nf_conntrack_acct"
 TCP_HANDSHAKE_FLAGS = "(fin | syn | rst | ack)"
 OUT = "xgw-zapret2"
 DIRECT = "xgw-standalone-direct"
@@ -89,6 +91,10 @@ def validate(cfg: Config) -> list[str]:
         problems.append("check_seconds: 60–900; retry_seconds: 60–3600")
     if not 1 <= z.daily_probe_mb <= 1024:
         problems.append("daily_probe_mb: ожидается 1–1024")
+    if not 0 <= z.observe_reply_packets <= MAX_REPLY_PACKETS:
+        problems.append(f"observe_reply_packets: ожидается 0–{MAX_REPLY_PACKETS}")
+    if z.observe_reply_packets and not z.observe_synack:
+        problems.append("observe_reply_packets требует observe_synack")
     for value in (z.binary, z.lua_dir):
         if not value.startswith("/") or any(c in value for c in "\r\n\x00"):
             problems.append("пути binary и lua_dir должны быть абсолютными Linux-путями")
@@ -212,7 +218,9 @@ def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = Tru
     return result
 
 
-def guard_blocks(queue: int | None, *, observe_synack: bool = False) -> list[list[str]]:
+def guard_blocks(
+    queue: int | None, *, observe_synack: bool = False, observe_reply_packets: int = 0,
+) -> list[list[str]]:
     """Внутри xgw_guard: разрешение с TTL, NFQUEUE после NAT, notrack своих копий."""
     if queue is None:
         return []
@@ -234,20 +242,42 @@ def guard_blocks(queue: int | None, *, observe_synack: bool = False) -> list[lis
     outgoing.extend([f"    meta mark {MARK:#x} tcp dport 443 counter queue num {queue}", "  }"])
     blocks.append(outgoing)
     if observe_synack:
-        # SYN/ACK reaches INPUT after conntrack. Consume only our bit before the queue.
-        bit, clear = f"{SYNACK_CT:#x}", f"{0xffffffff ^ SYNACK_CT:#x}"
-        blocks.append([
-            "  chain zapret2_reply {",
-            "    type filter hook input priority -149; policy accept;",
-            f'    iifname != "lo" meta nfproto ipv4 meta mark & {FAKE_BIT:#x} == 0 '
-            f"ct direction reply ct state established tcp sport 443 "
-            f"tcp flags & {TCP_HANDSHAKE_FLAGS} == (syn | ack) "
-            f"ct mark & {bit} == {bit} ct mark & {bit} @{LIVE} "
-            f"limit rate 256/second burst 128 packets "
-            f"counter ct mark set ct mark & {clear} queue num {queue}",
-            "  }",
-        ])
+        blocks.append(_reply_block(queue, observe_reply_packets))
     return blocks
+
+
+def _reply_block(queue: int, observe_reply_packets: int) -> list[str]:
+    # INPUT follows conntrack and only covers replies delivered to this machine.
+    bit = f"{SYNACK_CT:#x}"
+    bits = SYNACK_CT | REPLY_CT
+    qualifier = (f'iifname != "lo" meta nfproto ipv4 meta mark & {FAKE_BIT:#x} == 0 '
+                 "ct direction reply ct state established tcp sport 443")
+    live = f"ct mark & {bit} @{LIVE}"
+    if observe_reply_packets:
+        # Keep SYNACK_CT for the existing gate lookup. REPLY_CT records the observed SYN/ACK.
+        synack_match = f"ct mark & {bits:#x} == {bit}"
+        on_synack = f"ct mark set ct mark | {REPLY_CT:#x}"
+    else:
+        synack_match = f"ct mark & {bit} == {bit}"
+        on_synack = f"ct mark set ct mark & {0xffffffff ^ SYNACK_CT:#x}"
+    lines = [
+        "  chain zapret2_reply {",
+        "    type filter hook input priority -149; policy accept;",
+        f"    {qualifier} tcp flags & {TCP_HANDSHAKE_FLAGS} == (syn | ack) "
+        f"{synack_match} {live} limit rate 256/second burst 128 packets "
+        f"counter {on_synack} queue num {queue}",
+    ]
+    if observe_reply_packets:
+        # The counter includes SYN/ACK and any ACK/retransmit already seen by conntrack.
+        match = f"{qualifier} ct mark & {bits:#x} == {bits:#x}"
+        stop = 1 + observe_reply_packets
+        lines += [
+            f"    {match} {live} tcp flags & syn == 0 ct reply packets 2-{stop} "
+            f"limit rate 128/second burst 64 packets counter queue num {queue}",
+            f"    {match} ct reply packets > {stop} "
+            f"ct mark set ct mark & {0xffffffff ^ bits:#x}",
+        ]
+    return [*lines, "  }"]
 
 
 def guard_rules(queue: int | None) -> list[str]:

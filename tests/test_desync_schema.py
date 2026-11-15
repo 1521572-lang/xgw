@@ -257,6 +257,16 @@ def test_observe_synack_is_optional_and_can_round_trip_without_changing_old_poli
         schema.project(cfg.desync, target="freepool")
 
 
+def test_reply_window_validation_requires_synack_and_rejects_an_unbounded_count():
+    with pytest.raises(schema.PolicyError, match="observe_reply_packets"):
+        schema.migrate({"observe_reply_packets": 9})
+    with pytest.raises(schema.PolicyError, match="requires observe_synack"):
+        schema.project(schema.migrate({"observe_reply_packets": 8}))
+    policy = schema.migrate({"observe_synack": True, "observe_reply_packets": 8})
+    assert schema.project(policy)["observe_reply_packets"] == 8
+    assert schema.migrate({"observe_reply_packets": 0}) == schema.migrate({})
+
+
 @pytest.fixture(params=["desync_batch1_install.py", "gui_catalog_install.py"])
 def installer(monkeypatch, request):
     file = Path(__file__).parents[1] / "docs/helpers" / request.param
