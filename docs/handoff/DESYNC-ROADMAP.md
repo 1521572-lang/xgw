@@ -33,8 +33,8 @@
 | T01 — достоверная карточка | Принята. `watch/panel.py`, `watch/zapret2_control.py`, GUI. Расширять наблюдения, не приписывать worker успех видео | Свежесть, revision, unknown/error/off; ошибки движка не означают «VPN восстановлен» |
 | T02 — единая политика | Принята. `desync/schema.py`, `config.py`, `managed.py`. Добавлены два явных экспериментальных engine-профиля | Миграция без потери настроек; выключенный режим ничего не запускает |
 | T03 — общий контроллер | **Принят на Ubuntu и установлен.** Очередь, поколение, reload, смена режимов и восстановление после SIGKILL подтверждены в [eea38a3](../reports/2026-11-15_desync-t03.md) | История событий H06 продолжается в T08 |
-| T04 — маршруты | **Standalone, клиентский fallback и Compare приняты на ThinkCentre.** T04 с хотфиксом Xray оставлен установленным, рабочая политика возвращена в off/off. [Отчёт 7fa7ffb](../reports/2026-11-16_desync-t04-telemetry-compare.md) | YouTube 720p без VPN 15+5 минут, Compare 4/4, gate и восстановление worker подтверждены. Сохранение результата и статус служебного vpn_control ждут живой проверочный проход |
-| T05 — nft / входящий диапазон | После T03/T04: ранний fake-mark bypass, разные marks, IPv4/IPv6, bounded incoming NFQUEUE, offload. Добавлены H01/H04 и будущий fanout H07 | SYN/ACK и необходимые входящие данные действительно в очереди; измерены CPU, queue drops, RAM, обход повторного capture; аварийный откат |
+| T04 — маршруты | **Принято на ThinkCentre.** Standalone, клиентский fallback, Compare и служебная VPN-проба. Слои оставлены, рабочая политика возвращена в off/off. [Chrome и Compare](../reports/2026-11-16_desync-t04-telemetry-compare.md), [Selective](../reports/2026-11-16_desync-selective-vpn-control.md) | YouTube 720p без VPN 15+5 минут, Compare 4/4, gate и восстановление worker, `vpn_control=pass`, результат сохранён в 41 снимке |
+| T05 — nft / входящий диапазон | **Первая часть готова к стенду.** Опциональный IPv4 SYN/ACK для отмеченных соединений и раннее сохранение selected-меток на IPv6. [ТЗ](T05-SYNACK.md) | Доказать входящий SYN/ACK, границы очереди, CPU/RSS/drops и откат. Начальные входящие данные, IPv6 WAN и H01/H04 продолжаются после этого замера |
 | T06 — комплект / Lua | Частично подготовлено: убран несуществующий altorder=1; CLI dry-run отделён от Lua runtime. H05 — парные static/clone кандидаты | Pin и хэши всех библиотек; dry-run ≠ intercept=0 ≠ исполнение packet handler; произвольный Lua не считать sandbox. Загрузка только доверенных версий; права/TOCTOU/размеры/ресурсы |
 | T07 — автоматизация | После T03/T05/T06: закрепить совместимый zapret-auto, отдельный xgw-auto, сначала shadow-наблюдение H01/H02/H03/H04, затем ротация | Нельзя изменять vendor без manifest. Нет ложной ротации при pause/буфере/idle; причина неизвестна при неполном наблюдении; только новые соединения; bounded cache и timer cleanup |
 | T08 — кэш / события | Подготовлен журнал экспериментов `desync/experiment.py`. Runtime cache и event worker ещё не реализованы. H02/H03/H06/H07 | Atomic snapshot, TTL+policy/network/client context, invalidate, disk full, kill -9, bounded queue; сложный C IPC только после измерения нужды |
@@ -43,10 +43,9 @@
 | T11 — API / GUI | После подтверждённого управления T03–T10: CRUD, задания, отмена, pin/reset, журнал. Сохранить Proton-представление, подписки и страны по IP | Не показывать недействующие кнопки; counters unknown, если нет измерения; APPLY отдельно от transport/playback PASS |
 | T12 — реальная приёмка | Через все батчи, а не только в конце. Текущее задание: [NEXT_STEP](NEXT_STEP.md), матрица ниже | Команды и vision исполняет модель; A/B и контроли; 720p/1080p 15+5; возврат и автопубликация даже при блокере |
 
-T05 может опираться на принятый маршрут Standalone и передачу очереди из T03. Для T09/H10
+T05 опирается на принятый маршрут Standalone и передачу очереди из T03. Для T09/H10
 доступен подтверждённый замер плеера и трафика [в обычном Chrome](YOUTUBE-TELEMETRY.md).
-В H05/H10 использовать `hostfakesplit-md5` как контроль. Для Selective провести короткую
-[приёмку служебной VPN-пробы](SELECTIVE-VPN-CONTROL.md).
+В H05/H10 использовать `hostfakesplit-md5` как контроль.
 Для H06/H07/H11/H12 нужны отдельные реализации и приёмка.
 
 ## Разбор новых предложений

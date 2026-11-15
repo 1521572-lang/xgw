@@ -3,6 +3,7 @@
 import copy
 import json
 import time
+from dataclasses import replace
 
 import pytest
 from test_generator import _build
@@ -386,6 +387,30 @@ def test_nft_does_not_broaden_bypass_or_queue_other_traffic(monkeypatch):
     assert "meta mark 0x10000000 tcp dport 443 counter queue num 200" in guard
     assert "queue num 200 bypass" not in guard
     assert "ct original packets" not in guard  # не требует nf_conntrack_acct/sysctl
+
+
+def test_synack_observation_arms_only_marked_handshakes_and_uses_selected_queue(monkeypatch):
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: None)
+    cfg, _, _ = setup()
+    cfg.zapret2.observe_synack = True
+    cfg.zapret2.queue_num = 201
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    guard = nft.render_guard(rules)
+    arm = next(line for line in guard.splitlines() if "ct mark set ct mark |" in line)
+    assert "meta iif 0 meta nfproto ipv4 meta mark 0x10000000" in arm
+    assert "ct direction original ct state new tcp dport 443" in arm
+    assert "meta mark @zapret2_live" in arm and "== syn" in arm
+    reply = next(line for line in guard.splitlines() if "ct mark set ct mark &" in line)
+    assert 'iifname != "lo" meta nfproto ipv4' in reply
+    assert "ct direction reply ct state established tcp sport 443" in reply
+    assert "== (syn | ack)" in reply and "@zapret2_live" in reply
+    assert "ct mark set ct mark & 0xefffffff queue num 201" in reply
+    assert "ct reply packets" not in guard and "queue num 201 bypass" not in guard
+    ipv6_output = nft.render6(replace(rules, capture6=True)).split("  chain output {", 1)[1]
+    assert ipv6_output.index(f"meta mark {z.MARKS} return") < ipv6_output.index("meta mark set")
+    cfg.zapret2.mode = "off"
+    rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
+    assert "zapret2_reply" not in nft.render_guard(rules)
     assert "meta mark 0x50000000 notrack" in guard
     output = guard.split("chain output {")[1]
     assert output.index("meta mark { 0x10000000, 0x50000000 } counter drop") < output.index(

@@ -39,6 +39,7 @@ DEFAULTS = {
     "binary": "/opt/xgw/zapret2/1.0.7/nfqws2", "lua_dir": "/opt/xgw/zapret2/1.0.7/lua",
     "strategy": "multisplit", "queue_num": 200, "probe_port": 19999, "probe_urls": [],
     "check_seconds": 180, "retry_seconds": 300, "daily_probe_mb": 256,
+    "observe_synack": False,
     "engine": "off", "engine_profile": "seqovl", "engine_queue": 200,
     "engine_offload": True, "blob_dir": "",
 }
@@ -108,7 +109,8 @@ def validate_patch(value: object) -> dict:
 def migrate(value: object, *, source: str = "gui-light") -> dict:
     """Legacy settings or canonical policy -> canonical policy, without writes.
 
-Canonical input must be complete. Unknown versions/fields are rejected, never stripped.
+Canonical input must include all required fields. The optional SYN/ACK flag defaults to off.
+Unknown versions/fields are rejected, never stripped.
 Calling migrate twice returns equal documents; lists preserve order and exact contents.
 """
     _require(source in ("gui-light", "freepool"), "source")
@@ -120,7 +122,10 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         flat = {}
         for group, names in GROUPS.items():
             section = value[group]
-            _require(isinstance(section, dict) and set(section) == set(names), group)
+            required = set(names)
+            optional = {"observe_synack"} if group == "selected" else set()
+            _require(isinstance(section, dict) and required <= set(section) <= required | optional,
+                     group)
             flat.update(section)
         flat = validate_patch(flat)
     else:
@@ -128,8 +133,12 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         if source == "freepool":
             flat["domains"] = list(FREEPOOL_DOMAINS)
         flat.update(validate_patch(value))
-    return {"schema_version": VERSION,
-            **{group: {name: flat[name] for name in names} for group, names in GROUPS.items()}}
+    result = {"schema_version": VERSION,
+              **{group: {name: flat[name] for name in names} for group, names in GROUPS.items()}}
+    # Preserve the representation and revision of existing policies when the flag is off.
+    if flat.get("observe_synack"):
+        result["selected"]["observe_synack"] = True
+    return result
 
 
 def validate_policy(value: object) -> dict:
@@ -151,7 +160,7 @@ def resolve(legacy: dict, policy: dict | None = None, *, source: str = "gui-ligh
     canonical = validate_policy(policy)
     flat = flatten(canonical)
     for name, value in legacy.items():
-        if flat[name] != value:
+        if flat.get(name, DEFAULTS[name]) != value:
             raise PolicyError(f"desync: conflicting legacy field {name}")
     return canonical
 
@@ -169,6 +178,8 @@ Known selected strategies may remain dormant in off mode without substitution.
         if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: compare tracing supports multisplit and multidisorder")
     else:
+        if flat.get("observe_synack"):
+            raise PolicyError("desync: SYN/ACK observation cannot be represented by freepool")
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):
             raise PolicyError("desync: engine settings cannot be represented by freepool")
         for name in ENGINE_FIELDS:

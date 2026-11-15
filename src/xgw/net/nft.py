@@ -189,6 +189,7 @@ class Rules:
     conncheck4: tuple[str, ...] = ()
     conncheck_port: int = 80
     zapret2_queue: int | None = None
+    zapret2_observe_synack: bool = False
     # Универсальный L3/L4-движок: очередь с bypass и anti-loop по FAKE_MARK.
     engine_queue: int | None = None
 
@@ -403,6 +404,7 @@ def build_rules(
             conncheck_port=conncheck[1],
             zapret2_queue=(cfg.zapret2.queue_num
                            if cfg.zapret2.selected_enabled else None),
+            zapret2_observe_synack=cfg.zapret2.selected_enabled and cfg.zapret2.observe_synack,
             engine_queue=(cfg.zapret2.engine_queue if capture and nfqws2.enabled(cfg)
                           and nfqws2.find_installation(cfg) is not None else None),
         ),
@@ -1005,6 +1007,7 @@ def render6(rules: Rules) -> str:
             *_singbox_skip(rules, "return"),
             *(_ts_skip("return") if rules.ts6 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
+            *([f"meta mark {zapret2.MARKS} return"] if rules.zapret2_queue is not None else []),
             "meta l4proto != { tcp, udp } return",
             "fib daddr type local return",
             "ip6 daddr @reserved6 th dport != 53 return",
@@ -1118,7 +1121,7 @@ def render_guard(rules: Rules) -> str:
 
     A scoped capture-table/routing failure leaves this table in place. Explicit
     off/open removes it. Other forwarded networks and non-TCP/UDP keep their policy.
-    Only capture rules write GUARD_CT; the guard itself never sets packet/ct marks.
+    Only capture rules write GUARD_CT. The optional SYN/ACK tap uses a separate ct bit.
 
     Host egress is checked in POSTROUTING: an OUTPUT route-chain can reroute to lo
     while the same hook's nf_hook_state.out still names the original WAN device.
@@ -1188,7 +1191,8 @@ def render_guard(rules: Rules) -> str:
     forward = [f'iifname "{name}" goto transit' for name in dict.fromkeys(ingress)]
     forward.append("return")
     return _table("inet", GUARD, [
-        *zapret2.guard_blocks(rules.zapret2_queue),
+        *zapret2.guard_blocks(rules.zapret2_queue,
+                              observe_synack=rules.zapret2_observe_synack),
         *_nfq_blocks(rules),
         _chain("pass", "", common),
         _chain("transit", "", ["jump pass", *reject]),

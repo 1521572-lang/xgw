@@ -29,6 +29,9 @@ MARK = 0x10000000
 FAKE_BIT = 0x40000000
 FAKE_MARK = MARK | FAKE_BIT
 MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
+# This conntrack bit is independent of skb marks and nft.GUARD_CT.
+SYNACK_CT = 0x10000000
+TCP_HANDSHAKE_FLAGS = "(fin | syn | rst | ack)"
 OUT = "xgw-zapret2"
 DIRECT = "xgw-standalone-direct"
 PROBE = "xgw-zapret2-probe"
@@ -209,19 +212,42 @@ def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = Tru
     return result
 
 
-def guard_blocks(queue: int | None) -> list[list[str]]:
+def guard_blocks(queue: int | None, *, observe_synack: bool = False) -> list[list[str]]:
     """Внутри xgw_guard: разрешение с TTL, NFQUEUE после NAT, notrack своих копий."""
     if queue is None:
         return []
-    return [
+    blocks = [
         [f"  set {LIVE} {{", "    type mark", "    flags timeout", "  }"],
         ["  chain zapret2_raw {", "    type filter hook output priority -401; policy accept;",
          f"    meta mark {FAKE_MARK:#x} notrack", "  }"],
-        ["  chain zapret2_queue {",
-         "    type filter hook postrouting priority 101; policy accept;",
-         f"    meta mark {MARK:#x} tcp dport 443 "
-         f"counter queue num {queue}", "  }"],
     ]
+    outgoing = ["  chain zapret2_queue {",
+                "    type filter hook postrouting priority 101; policy accept;"]
+    if observe_synack:
+        # Only a new locally-originated SYN admitted by the live gate arms a reply.
+        outgoing.append(
+            f"    meta iif 0 meta nfproto ipv4 meta mark {MARK:#x} meta mark @{LIVE} "
+            f"ct direction original ct state new tcp dport 443 "
+            f"tcp flags & {TCP_HANDSHAKE_FLAGS} == syn "
+            f"ct mark & {SYNACK_CT:#x} == 0 counter ct mark set ct mark | {SYNACK_CT:#x}"
+        )
+    outgoing.extend([f"    meta mark {MARK:#x} tcp dport 443 counter queue num {queue}", "  }"])
+    blocks.append(outgoing)
+    if observe_synack:
+        # SYN/ACK reaches INPUT after conntrack. Consume only our bit before the queue.
+        bit, clear = f"{SYNACK_CT:#x}", f"{0xffffffff ^ SYNACK_CT:#x}"
+        blocks.append([
+            "  chain zapret2_reply {",
+            "    type filter hook input priority -149; policy accept;",
+            f'    iifname != "lo" meta nfproto ipv4 meta mark & {FAKE_BIT:#x} == 0 '
+            f"ct direction reply ct state established tcp sport 443 "
+            f"tcp flags & {TCP_HANDSHAKE_FLAGS} == (syn | ack) "
+            f"ct mark & {bit} == {bit} ct mark & {bit} @{LIVE} "
+            f"limit rate 256/second burst 128 packets "
+            f"counter ct mark set ct mark & {clear} queue num {queue}",
+            "  }",
+        ])
+    return blocks
 
 
 def guard_rules(queue: int | None) -> list[str]:

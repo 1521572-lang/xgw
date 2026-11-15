@@ -124,6 +124,11 @@ engine проверяется MainPID → inode сокета → port ID → н�
 время исходной проверки. Во время ожидания повтора у Selective сохраняется исходный результат
 при закрытом gate и снятом прямом правиле. Панель показывает его из свежего снимка с совпавшей
 политикой; успешное подключение по пробе относится к выбранному HTTPS URL и VPN-участнику.
+
+`selected.observe_synack` — опциональный флаг T05. При отсутствии или false действует прежний
+формат политики и сохраняется её fingerprint. Включение добавляет в ту же очередь zapret2
+отмеченный IPv4 SYN/ACK при живом gate. Пакетная метка выбранного выхода, fake-bit и бит
+conntrack для рукопожатия выполняют разные задачи. Флаг не меняет стратегию, sysctl и offload.
 Формат proc опирается на исходники
 [NFQUEUE](https://github.com/torvalds/linux/blob/master/net/netfilter/nfnetlink_queue.c) и
 [netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).

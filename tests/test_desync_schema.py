@@ -243,6 +243,20 @@ def test_persist_once_and_preserve_unrelated_panel_settings(tmp_path, monkeypatc
     # The actual file locking/ownership remains an Ubuntu acceptance check.
 
 
+def test_observe_synack_is_optional_and_can_round_trip_without_changing_old_policy(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[zapret2]\nobserve_synack = true\n', encoding="utf-8")
+    cfg, _ = config.load(path)
+    assert cfg.zapret2.observe_synack is True
+    assert cfg.desync["selected"]["observe_synack"] is True
+    before = schema.migrate({})
+    disabled = schema.migrate({"observe_synack": False})
+    assert disabled == before
+    assert schema.fingerprint(disabled) == schema.fingerprint(before)
+    with pytest.raises(schema.PolicyError, match="cannot be represented"):
+        schema.project(cfg.desync, target="freepool")
+
+
 @pytest.fixture(params=["desync_batch1_install.py", "gui_catalog_install.py"])
 def installer(monkeypatch, request):
     file = Path(__file__).parents[1] / "docs/helpers" / request.param

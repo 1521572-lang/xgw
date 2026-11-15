@@ -26,10 +26,12 @@ T04 = ("apply/applier.py", "cli.py", "config.py", "daemon.py", "desync/schema.py
        "generator/builder.py", "net/nft.py", "nfqws2.py", "watch/standalone.py",
        "watch/zapret2_control.py", "zapret2.py")
 VPN_CONTROL = ("zapret2.py", "watch/zapret2_control.py")
+T05 = ("config.py", "desync/schema.py", "net/nft.py", "zapret2.py")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
 VPN_CONTROL_TIMER = "xgw-desync-vpn-control-rollback.timer"
+T05_TIMER = "xgw-desync-t05-rollback.timer"
 
 
 def require(ok, message):
@@ -178,6 +180,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if args.nft_t05:
+        return T05, T05_TIMER
     if args.vpn_control:
         return VPN_CONTROL, VPN_CONTROL_TIMER
     if args.worker_t04:
@@ -198,6 +202,7 @@ def main():
     stage.add_argument("--worker-t03", action="store_true")
     stage.add_argument("--worker-t04", action="store_true")
     stage.add_argument("--vpn-control", action="store_true")
+    stage.add_argument("--nft-t05", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

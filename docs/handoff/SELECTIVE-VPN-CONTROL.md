@@ -143,9 +143,10 @@ from xgw.desync import schema
 path, url = Path(sys.argv[1]), sys.argv[2]
 current, _ = config.load(path)
 policy = schema.migrate(asdict(current.zapret2))
-policy["selected"].update(mode="selective", strategy="multisplit", queue_num=201,
+policy["selected"].update(mode="selective", strategy="multisplit",
                           domains=["full:" + urlsplit(url).hostname], probe_urls=[url],
                           retry_seconds=300)
+policy["runtime"]["queue_num"] = 201
 policy["engine"]["engine"] = "off"
 managed.set_desync(managed.path_for(path), policy)
 actual, _ = config.load(path)
