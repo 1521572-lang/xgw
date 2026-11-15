@@ -31,6 +31,14 @@ SUB_URL = "https://panel.example.com/sub/s3cr3t-subscription-token"
 SHORT_PASSWORD = "pa55"
 
 
+class FakeDaemonLifecycle:
+    def prepare_desync_reload(self, cfg) -> bool:
+        return True
+
+    def close_desync(self) -> None:
+        pass
+
+
 # --- экспорт логов ------------------------------------------------------------------
 
 
@@ -441,7 +449,7 @@ def test_daemon_rereads_changed_config_without_restarting(root, tmp_path, monkey
         None,  # остановка
     ]
 
-    class FakeDaemon:
+    class FakeDaemon(FakeDaemonLifecycle):
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             self.cfg = cfg
             assert capture is None and list(sinks) == []
@@ -491,7 +499,7 @@ def test_daemon_reloads_capture_rules_after_config_change(root, tmp_path, monkey
     fakexray.write(root)  # Xray запущен с inbound'ом перехвата
     runs: list[bool] = []
 
-    class FakeDaemon:
+    class FakeDaemon(FakeDaemonLifecycle):
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             assert capture is not None  # перехват трафика самой машины включён по умолчанию
 
@@ -861,7 +869,7 @@ def test_daemon_serves_the_panel_and_keeps_it_across_reloads(root, tmp_path, mon
     answers: list[bool] = []
     daemons: list = []
 
-    class FakeDaemon:
+    class FakeDaemon(FakeDaemonLifecycle):
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             self.poke = threading.Event()
             daemons.append(self)
@@ -904,7 +912,7 @@ def test_busy_panel_port_does_not_stop_the_daemon(root, tmp_path, monkeypatch, c
         monkeypatch.setattr(cli, "_sync_panel", REAL_SYNC_PANEL)
         ran: list[bool] = []
 
-        class FakeDaemon:
+        class FakeDaemon(FakeDaemonLifecycle):
             def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
                 pass
 
@@ -982,7 +990,7 @@ def test_reload_keeps_the_old_rules_until_xray_gets_the_new_capture_inbound(
     before = kernel.table
     seen: list[tuple[str, dict]] = []
 
-    class FakeDaemon:
+    class FakeDaemon(FakeDaemonLifecycle):
         def __init__(self, cfg, paths, *, xray_bin, capture=None, sinks=()):
             self.capture = capture
 

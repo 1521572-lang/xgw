@@ -110,8 +110,15 @@ config.toml/panel.json используют Path на машине, где он�
 Просроченные, будущие и некорректные timestamps не подтверждают состояние.
 Причины берутся из allowlist, argv/URL/произвольная ошибка worker в API не попадают.
 
-`zapret2_policy_key` в status.json подтверждает только конфигурацию наблюдения. Это НЕ
-applied_revision общей транзакции: подтверждение worker+очереди+маршрута относится к T03.
+`zapret2_policy_key` в status.json подтверждает конфигурацию наблюдения.
+`zapret2_reservation` в T03 содержит unit, queue и generation текущего владельца слота или
+null. Generation растёт при каждой новой резервации в рамках процесса демона. Слот занят
+с начала запуска до подтверждённой остановки и восстановления offload. Для готовности
+engine проверяется MainPID → inode сокета → port ID → номер NFQUEUE. Selected дополнительно
+требует собственной проверки пути и срока gate. Подтверждение всей транзакции маршрута
+остаётся задачей T04. Формат proc опирается на исходники
+[NFQUEUE](https://github.com/torvalds/linux/blob/master/net/netfilter/nfnetlink_queue.c) и
+[netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).
 
 ## GUI
 

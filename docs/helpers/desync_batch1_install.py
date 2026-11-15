@@ -20,6 +20,10 @@ from pathlib import Path, PurePosixPath
 BACKEND = ("config.py", "managed.py", "daemon.py", "watch/panel.py", "zapret2.py",
            "watch/zapret2_control.py", "desync/__init__.py", "desync/schema.py")
 GUI = ("vpn_ui/xgw/overview.py", "src/xgw/gui/zapret2.py")
+T03 = ("cli.py", "daemon.py", "nfqws2.py", "zapret2.py", "desync/schema.py",
+       "desync/worker.py", "watch/zapret2_control.py")
+TIMER = "xgw-desync-b1-rollback.timer"
+T03_TIMER = "xgw-desync-t03-rollback.timer"
 
 
 def require(ok, message):
@@ -87,8 +91,9 @@ def prepare(args, backup):
                                text=True, timeout=10)
         require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
                 "active/transitioning worker: stop and report, do not disable it")
+    require(not (args.worker_t03 and args.gui), "T03 overlay is backend only")
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
-              payload / "base/src/xgw" / rel) for rel in BACKEND]
+              payload / "base/src/xgw" / rel) for rel in (T03 if args.worker_t03 else BACKEND)]
     if args.gui:
         gui = bounded(args.gui, "/opt/xgw")
         pairs.extend((payload / "code" / rel, gui / rel, payload / "gui_base" / rel)
@@ -115,10 +120,11 @@ def prepare(args, backup):
     atomic(backup / "manifest.json", (json.dumps(rows, indent=2) + "\n").encode(), 0o600)
 
 
-def records(backup):
+def records(backup, *, worker_t03=False):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
-    require(isinstance(rows, list) and 8 <= len(rows) <= 10, "invalid manifest")
+    expected = {len(T03)} if worker_t03 else {len(BACKEND), len(BACKEND) + len(GUI)}
+    require(isinstance(rows, list) and len(rows) in expected, "invalid manifest")
     seen = set()
     for row in rows:
         bounded(row["target"], "/opt/xgw")
@@ -144,8 +150,8 @@ def restore(backup, rows):
             atomic(target, (backup / row["old"]).read_bytes(), row["mode"], row["gid"])
 
 
-def apply(backup, rows):
-    require(service("is-active", "xgw-desync-b1-rollback.timer") == "active",
+def apply(backup, rows, timer=TIMER):
+    require(service("is-active", timer) == "active",
             "arm independent rollback timer before apply")
     for row in rows:
         target = Path(row["target"])
@@ -171,6 +177,7 @@ def main():
     parser.add_argument("--payload")
     parser.add_argument("--package")
     parser.add_argument("--gui")
+    parser.add_argument("--worker-t03", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -184,9 +191,9 @@ def main():
             require(bool(args.payload and args.package), "prepare needs payload and package")
             prepare(args, backup)
         else:
-            rows = records(backup)
+            rows = records(backup, worker_t03=args.worker_t03)
             if args.action == "apply":
-                apply(backup, rows)
+                apply(backup, rows, T03_TIMER if args.worker_t03 else TIMER)
             else:
                 service("stop")
                 restore(backup, rows)

@@ -870,8 +870,11 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
         while True:
             stamp = _stamp(args.config_path)
             capture = capture_for(cfg, paths)
+            desync_ready = previous is None or previous.prepare_desync_reload(cfg)
             if not capture.configured or _root_problem(cfg):
                 capture = None  # следить не за чем либо нечем: правила меняет только root
+            elif reloaded and not desync_ready:
+                logger.info("правила перехвата ждут освобождения очереди zapret2")
             elif reloaded and capture.mode() == "on" and getattr(
                 capture, "inbound_problem", lambda: ""
             )():
@@ -937,8 +940,7 @@ def _cmd_run(args, cfg: config.Config, paths: Paths, logger) -> int:
     finally:
         # В том числе исключение между выходом run по reload и запуском нового цикла.
         if previous is not None:
-            with contextlib.suppress(OSError, cmd.CommandError):
-                previous._nfqws2.close()
+            previous.close_desync()
         if events is not None:
             events.stop()
         if panel is not None:

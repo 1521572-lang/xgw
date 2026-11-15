@@ -47,6 +47,7 @@ from .apply.rotation import (
 )
 from .config import Config, parse_seconds, probe_bytes
 from .desync import schema as desync_schema
+from .desync import worker
 from .freepool import stats as poolstats
 from .freepool import traffic
 from .freepool.pool import FreePool
@@ -789,8 +790,11 @@ class Daemon:
         self._media_verify_at = 0.0
         self._media_verified: tuple[str, ...] = ()
         self._media_view: dict = {"state": "off"}
-        self._zapret2 = zapret2.Controller(self.store)
-        self._nfqws2 = nfqws2.Controller()
+        self._desync_slot = worker.WorkerSlot()
+        self._desync_retired = False
+        self._desync_reload_pending = False
+        self._zapret2 = zapret2.Controller(self.store, zapret2.Runtime(slot=self._desync_slot))
+        self._nfqws2 = nfqws2.Controller(nfqws2.Runtime(slot=self._desync_slot))
         self._nfq_view: dict = {}
         self._media_spent: dict[str, int] | None = None  # суточный расход (_media_budget)
         self._house_synced_at: float | None = None  # срочная сборка по расхождению (_house_sync)
@@ -985,11 +989,7 @@ class Daemon:
             self._loop_progress("sleep", started=started, deadline=deadline,
                                 period=period, step_s=spent)
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
-        with contextlib.suppress(OSError, cmd.CommandError):
-            self._zapret2.close()
-        if stop.is_set():
-            with contextlib.suppress(OSError, cmd.CommandError):
-                self._nfqws2.close()
+        self.close_desync(keep_engine=not stop.is_set())
         self.diary.flush(force=True)
         self.store.close()
         self.log.info("демон XGW остановлен" if stop.is_set() else "настройки изменены")
@@ -1188,15 +1188,20 @@ class Daemon:
         прежний демон начал в фоне, доводит и применяет новый; источники сменились — опрос
         прежних отменяется."""
         self._resume(previous)
-        # Процесс и снимок offload переживают перечитывание TOML. Новые параметры
-        # сверяются контроллером по launch_key, остановка нужна только при завершении.
+        # Совместимый engine и снимок offload переживают перечитывание TOML.
+        # Незавершённая остановка переходит новому watchdog вместе со слотом.
+        previous._desync_retired = True
+        self._desync_slot = previous._desync_slot
+        self._desync_reload_pending = previous._desync_reload_pending
         self._nfqws2 = previous._nfqws2
+        self._zapret2.runtime = previous._zapret2.runtime
+        self._zapret2.cleanup_pending = previous._zapret2.cleanup_pending or previous._zapret2.ready
         self._nfq_view = dict(previous._nfq_view)
-        if self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2:
+        if (self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2
+                and previous._zapret2.comparison is not None):
             self._zapret2.comparison = previous._zapret2.comparison
             self._zapret2.comparison_trace = previous._zapret2.comparison_trace
             self._zapret2.view = previous._zapret2.view
-            self._zapret2.ready = previous._zapret2.ready
         if previous._build is not None:
             # Поток не трогаем и второй параллельно не запускаем. Старый результат
             # отбросим; настройкам нового экземпляра нужен собственный снимок.
@@ -1432,6 +1437,12 @@ class Daemon:
 
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
+        if self._desync_reload_pending and not self._drain_desync_reload():
+            # Старые правила остаются до освобождения слота. Не загружаем другое
+            # назначение очереди, пока её предыдущий обработчик ещё может работать.
+            view, observatory, xray_ok = self._last_status or ([], None, False)
+            self._write_status(view, observatory, xray_ok)
+            return self.machine.state
         now = self.clock()
         self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
         self._tick_spent = {}
@@ -1544,7 +1555,7 @@ class Daemon:
         waiting = self._capture_waits()
         if not waiting:
             self._guard_capture(signals.xray_ok, now)
-        self._nfq_step(view)
+        self._nfq_step(view, selected_route=zapret2.active(applied))
         if self.stopping:
             # Правила и Xray согласованы: правила, которым нужен новый inbound, загрузятся
             # после применения конфига, а его начнёт уже следующий запуск демона.
@@ -1671,7 +1682,8 @@ class Daemon:
         if not self.scan_queue or not probing:
             self._manual_scan = False
         at = self._spent("сканы и замены", at)
-        if not changed and signals.xray_ok and not self.stopping and not self.core_job:
+        if (not changed and signals.xray_ok and not self.stopping and not self.core_job
+                and not self._desync_retired):
             allowed = (self.cfg.zapret2.probe_enabled and self.capture is not None
                        and self.capture.mode() == "on")
             vpn_probe_port = 0
@@ -2387,8 +2399,56 @@ class Daemon:
             self.log.debug("состояние перехвата не прочитано: %s", exc)
             return False
 
-    def _nfq_step(self, view: list[NodeInfo]) -> None:
-        active = bool(self.capture_info and self.capture_info.get("mode") == "on")
+    def close_desync(self, *, keep_engine: bool = False) -> None:
+        if self._desync_retired:
+            return
+        with contextlib.suppress(OSError, cmd.CommandError):
+            self._zapret2.close()
+        if not keep_engine:
+            with contextlib.suppress(OSError, cmd.CommandError):
+                self._nfqws2.close()
+
+    def prepare_desync_reload(self, cfg: Config) -> bool:
+        """Retire the previous worker before capture.up can repurpose its queue."""
+        lease = self._desync_slot.lease
+        if lease is None:
+            return True
+        runtime = self._nfqws2.runtime
+        if (lease.unit == nfqws2.UNIT and not self._desync_reload_pending
+                and nfqws2.enabled(cfg)
+                and cfg.zapret2.engine_profile == self.cfg.zapret2.engine_profile
+                and self._nfqws2.profile):
+            installation = nfqws2.find_installation(cfg)
+            if installation:
+                key = nfqws2.launch_key(cfg, installation, self._nfqws2.profile)
+                if key == runtime.key:
+                    return True
+        self._desync_reload_pending = True
+        return self._drain_desync_reload()
+
+    def _drain_desync_reload(self) -> bool:
+        try:
+            self._zapret2.close()
+            self._nfqws2.close()
+        except (OSError, cmd.CommandError):
+            lease = self._desync_slot.lease
+            if lease is not None and lease.unit == zapret2.UNIT:
+                self._zapret2.view = {"state": "blocked", "reason": "stop_failed"}
+            else:
+                self._nfqws2.view = {"state": "fallback", "reason": "worker_stop_failed"}
+            return False
+        self._desync_reload_pending = False
+        return True
+
+    def _nfq_step(self, view: list[NodeInfo], *, selected_route: bool = False) -> None:
+        if self._desync_retired:
+            return
+        # Повторяем незавершённый stop даже если Xray не готов к шагу прямого маршрута.
+        if self._zapret2.cleanup_pending:
+            with contextlib.suppress(OSError, cmd.CommandError):
+                self._zapret2.close()
+        active = bool(self.capture_info and self.capture_info.get("mode") == "on"
+                      and not selected_route)
         self._nfqws2.step(
             self.cfg, [info.profile for info in view], active=active, cancel=self._stop,
         )
@@ -4397,6 +4457,8 @@ class Daemon:
             view, wanted, wall)}
 
     def _zapret2_apply(self, patched: dict, base: dict) -> bool:
+        if self._desync_retired or (self.stopping and zapret2.active(patched)):
+            return False
         return self._report(self.applier.apply_api_only(patched, base=base), "zapret2: маршрут")
 
     def _media_apply(self, now: float) -> bool:
@@ -7248,8 +7310,10 @@ class Daemon:
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
         snapshot["zapret2"] = dict(self._zapret2.view)
+        lease = self._desync_slot.lease
+        snapshot["zapret2_reservation"] = dataclasses.asdict(lease) if lease else None
         # The card must not label a previous daemon snapshot with newer panel settings.
-        # This identifies observed configuration, not a transaction acknowledgement (T03).
+        # T04 will acknowledge the combined route and worker transaction.
         try:
             policy = desync_schema.migrate(dataclasses.asdict(self.cfg.zapret2))
             snapshot["zapret2_policy_key"] = desync_schema.fingerprint(policy)

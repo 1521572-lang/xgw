@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
+from .desync import worker
 from .desync.schema import SELECTED_PROFILES
 from .net import cmd
 
@@ -30,7 +31,7 @@ FAKE_MARK = MARK | FAKE_BIT
 MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
 OUT = "xgw-zapret2"
 PROBE = "xgw-zapret2-probe"
-UNIT = "xgw-zapret2.service"
+UNIT = worker.SELECTED_UNIT
 LIVE = "zapret2_live"
 BUDGET = "zapret2_probe_budget"
 PROBE_BYTES = 64 * 1024
@@ -210,10 +211,11 @@ def arguments(cfg: Config) -> list[str]:
 
 
 class Runtime:
-    def __init__(self, runner=cmd.run):
+    def __init__(self, runner=cmd.run, *, slot: worker.WorkerSlot | None = None):
         self.runner = runner
-        self.started = False
         self.evidence = None
+        self.slot = slot if slot is not None else worker.WorkerSlot()
+        self.lease: worker.Lease | None = None
 
     def gate(self, seconds: int = 0) -> None:
         from .net.capture import Capture
@@ -233,22 +235,15 @@ class Runtime:
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
         if state != "active":
             return False
-        return self.occupied(queue)
+        return (self.lease is not None and self.slot.lease is self.lease
+                and self.lease.queue == queue and worker.verify_owner(self.runner, UNIT, queue))
 
     @staticmethod
     def occupied(queue: int) -> bool:
-        try:
-            lines = Path("/proc/net/netfilter/nfnetlink_queue").read_text().splitlines()
-        except OSError:
-            return False
-        return any(line.split() and line.split()[0] == str(queue) for line in lines)
+        return worker.occupied(queue)
 
-    def start(self, cfg: Config) -> None:
-        if self.alive(cfg.zapret2.queue_num):
-            # Не перенимаем чужой/оставшийся процесс с неизвестной стратегией.
-            self.stop()
-        if self.occupied(cfg.zapret2.queue_num):
-            raise ValueError("queue_busy")
+    @staticmethod
+    def _check_files(cfg: Config) -> None:
         for name in (cfg.zapret2.binary, f"{cfg.zapret2.lua_dir}/zapret-lib.lua",
                      f"{cfg.zapret2.lua_dir}/zapret-antidpi.lua"):
             path = Path(name).resolve(strict=True)
@@ -259,6 +254,12 @@ class Runtime:
                 info = parent.stat()
                 if info.st_uid != 0 or info.st_mode & 0o022:
                     raise ValueError("unsafe_directory")
+
+    def start(self, cfg: Config) -> None:
+        worker.require_stopped(self.runner, UNIT)
+        if self.occupied(cfg.zapret2.queue_num):
+            raise ValueError("queue_busy")
+        self._check_files(cfg)
         args = arguments(cfg)
         # intercept=0 проверяет Lua, dry-run этого не делает. Вывод не попадает в журнал XGW.
         self.runner([*args, "--intercept=0"], timeout=10)
@@ -269,10 +270,12 @@ class Runtime:
             "ProtectKernelModules=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX",
         ]
+        worker.require_stopped(self.runner, worker.ENGINE_UNIT)
+        self.lease = self.slot.reserve(UNIT, cfg.zapret2.queue_num)
+        self.evidence = None
+        # Даже при таймауте запуска systemd мог уже создать unit.
         self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,
                      *[arg for p in properties for arg in ("--property", p)], *args], timeout=15)
-        self.started = True
-        self.evidence = None
         if cfg.zapret2.mode == "compare":
             from .zapret2_trace import Evidence
 
@@ -287,11 +290,14 @@ class Runtime:
         return self.evidence.finish() if self.evidence is not None else {}
 
     def stop(self) -> None:
+        if self.lease is None or self.slot.lease is not self.lease:
+            return
         self.runner(["systemctl", "stop", UNIT], check=False, timeout=10)
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        if state in ("active", "activating", "deactivating"):
+        if state not in worker.STOPPED:
             raise cmd.CommandError("zapret2: остановка не подтверждена")
-        self.started = False
+        self.slot.release(self.lease)
+        self.lease = None
 
 
 class Controller:
@@ -303,6 +309,7 @@ class Controller:
         self.next_check = 0.0
         self.healthy = False
         self.ready = False
+        self.cleanup_pending = False
         self.last_error = ""
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
@@ -431,15 +438,19 @@ class Controller:
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
         comparing = cfg.zapret2.mode == "compare"
         finished = comparing and self.comparison is not None
-        wanted = (cfg.zapret2.probe_enabled and allowed and not finished
+        cancelled = cancel is not None and cancel.is_set()
+        wanted = (cfg.zapret2.probe_enabled and allowed and not finished and not cancelled
+                  and not self.cleanup_pending
                   and not builder.applied_whole(applied))
         if finished and not present and not self.ready and self.view["state"] == "compared":
             return False
-        if not finished and not wanted and not present and not self.ready:
+        if (not finished and not wanted and not present and not self.ready
+                and not self.cleanup_pending):
             self.view = {"state": "off", "reason": "off"}
             return False
         reason = "off" if not wanted else "waiting_for_probe_urls"
         changed = False
+        starting = False
         try:
             if wanted and configured(cfg):
                 scaffold = patch(applied, cfg, enabled=active(applied))
@@ -453,6 +464,7 @@ class Controller:
                     return changed
                 if not self.ready and now >= self.next_check:
                     self.runtime.gate()
+                    starting = True
                     self.runtime.start(cfg)
                     self.ready = True
                     self.view = {"state": "preparing", "reason": "nfqueue"}
@@ -474,7 +486,9 @@ class Controller:
                         self.healthy = True
                         self.last_error = ""
                         self.next_check = now + cfg.zapret2.check_seconds
-                if self.healthy and not comparing:
+                if self.healthy and not comparing and (cancel is None or not cancel.is_set()):
+                    if not self.runtime.alive(cfg.zapret2.queue_num):
+                        raise ValueError("worker_down")
                     # Старый удачный GET не продлевает разрешение бесконечно.
                     lease = max(1, int(self.next_check - now) + 60)
                     self.runtime.gate(lease)
@@ -489,7 +503,8 @@ class Controller:
         except (OSError, ValueError, cmd.CommandError) as exc:
             # Ни URL, ни argv/вывод nfqws2, ни пароль служебного входа не публикуются.
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
-                     "probe_budget", "probe_failed", "apply_failed"}
+                     "probe_budget", "probe_failed", "apply_failed",
+                     "worker_unit_busy", "worker_handoff_pending"}
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
@@ -508,13 +523,14 @@ class Controller:
         except (ValueError, cmd.CommandError, OSError):
             routed_back = False
         stopped = True
-        if self.ready or present:
+        if self.ready or present or starting or self.cleanup_pending:
             try:
                 self.runtime.stop()
-            except cmd.CommandError:
+            except (OSError, cmd.CommandError):
                 reason = "stop_failed"
                 stopped = False
-        self.ready = comparing and not stopped
+        self.ready = False
+        self.cleanup_pending = not stopped
         if comparing and self.comparison is not None:
             if stopped and self.comparison_trace is None:
                 self.comparison_trace = self.runtime.finish_trace()
@@ -527,15 +543,18 @@ class Controller:
                          "gate_closed": gate_closed, "probes": self.comparison,
                          "trace": self.comparison_trace or {}}
             return changed
-        self.view = {"state": "fallback" if routed_back else "blocked", "reason": reason,
-                     "gate_closed": gate_closed}
+        self.view = {"state": "fallback" if routed_back and stopped else "blocked",
+                     "reason": reason, "gate_closed": gate_closed}
         return changed
 
     def close(self) -> None:
-        if not self.ready:
+        if not self.ready and not self.cleanup_pending:
             return
         try:
             self.runtime.gate()
         finally:
-            self.runtime.stop()
+            self.cleanup_pending = True
             self.ready = self.healthy = False
+            self.runtime.stop()
+            self.cleanup_pending = False
+            self.view = {"state": "off", "reason": "off"}

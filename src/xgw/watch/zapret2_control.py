@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 
-from ..desync import schema
+from ..desync import schema, worker
 
 FRESH_SECONDS = 90
 REASONS = {
@@ -16,6 +16,8 @@ REASONS = {
     "worker_down": "Обработчик или очередь недоступны.",
     "worker_start_timeout": "Обработчик не подтвердил готовность вовремя.",
     "queue_busy": "Номер очереди занят.",
+    "worker_unit_busy": "Служба обработчика уже занята.",
+    "worker_handoff_pending": "Предыдущий обработчик ещё освобождает очередь.",
     "unsafe_files": "Файлы обработчика не прошли проверку прав.",
     "unsafe_directory": "Каталог обработчика не прошёл проверку прав.",
     "runtime_failed": "Ошибка обработчика. Подробности доступны в журнале шлюза.",
@@ -56,7 +58,7 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None) ->
 
 Only allowlisted public fields leave the snapshot. A revision is published by the daemon
 from its effective settings; a newer panel configuration cannot relabel old observations.
-Batch 1 exposes state, not mode-changing commands (T03/T04 have not been implemented).
+The card exposes state only. Mode-changing commands belong to T11.
 """
     now = time.time() if now is None else now
     observed = snapshot.get("updated")
@@ -71,6 +73,7 @@ Batch 1 exposes state, not mode-changing commands (T03/T04 have not been impleme
     key = schema.fingerprint(policy)
     selected = _record(snapshot.get("zapret2"))
     engine = _record(_record(snapshot.get("capture")).get("nfqws2"))
+    reservation = _record(snapshot.get("zapret2_reservation")).get("unit")
     source = "selected" if settings["mode"] != "off" else "engine"
     enabled = settings["mode"] != "off" or settings["engine"] == "auto"
     raw = selected if source == "selected" else engine
@@ -90,16 +93,23 @@ Batch 1 exposes state, not mode-changing commands (T03/T04 have not been impleme
         phase, reason, detail = "pending", "policy_changed", (
             "Настройки изменились. Ожидается снимок демона с новой ревизией.")
     elif not enabled:
-        if any(r.get("state") not in (None, "off") for r in (selected, engine)):
+        if reservation in (worker.SELECTED_UNIT, worker.ENGINE_UNIT) or any(
+                r.get("state") not in (None, "off") for r in (selected, engine)):
             phase, reason, detail = "pending", "stopping", "Выключение ещё не подтверждено."
         else:
             phase, reason, detail = "off", "off", REASONS["off"]
     elif source == "engine":
-        if phase == "fallback":
+        if reservation == worker.SELECTED_UNIT:
+            phase, reason = "pending", "worker_handoff_pending"
+            detail = REASONS[reason]
+        elif phase == "fallback":
             phase = "error"
             detail += " Возврат трафика на VPN этим состоянием не подтверждается."
         elif phase == "off" and reason == "not_found":
             phase = "absent"
+    elif reservation == worker.ENGINE_UNIT:
+        phase, reason = "pending", "worker_handoff_pending"
+        detail = REASONS[reason]
     elif phase == "active":
         until = raw.get("valid_until")
         if not _number(until) or until <= now:

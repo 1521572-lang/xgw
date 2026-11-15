@@ -14,13 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .desync import worker
 from .net import cmd
 
 if TYPE_CHECKING:
     from .config import Config
 
 FAKE_MARK = 0x40000000
-UNIT = "xgw-nfqws2.service"
+UNIT = worker.ENGINE_UNIT
 # MD5 candidates are explicit engine settings, not steps in the VPN server ladder.
 PROFILES = ("seqovl", "hostfakesplit", "disorder-badseq",
             "hostfakesplit-md5", "fakedsplit-md5", "fake-static-md5", "fake-clone-md5")
@@ -300,24 +301,27 @@ class Offload:
 
 
 class Runtime:
-    QUEUE_STATE = Path("/proc/net/netfilter/nfnetlink_queue")
+    QUEUE_STATE = worker.QUEUE_STATE
 
-    def __init__(self, runner=cmd.run):
+    def __init__(self, runner=cmd.run, *, slot: worker.WorkerSlot | None = None):
         self.runner = runner
         self.offload = Offload(runner)
         self.key: LaunchKey | None = None
+        self.slot = slot if slot is not None else worker.WorkerSlot()
+        self.lease: worker.Lease | None = None
 
     @classmethod
     def occupied(cls, queue: int) -> bool:
-        try:
-            lines = cls.QUEUE_STATE.read_text().splitlines()
-        except OSError:
-            return False
-        return any(line.split() and line.split()[0] == str(queue) for line in lines)
+        return worker.occupied(queue, cls.QUEUE_STATE)
 
     def alive(self, queue: int) -> bool:
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        return state == "active" and self.occupied(queue)
+        return state == "active" and self._owns_queue(queue)
+
+    def _owns_queue(self, queue: int) -> bool:
+        return (self.lease is not None and self.slot.lease is self.lease
+                and self.lease.queue == queue and self.occupied(queue)
+                and worker.verify_owner(self.runner, UNIT, queue))
 
     def wait_ready(self, queue: int, cancel: threading.Event | None = None) -> bool:
         """Type=exec подтверждает execve, очередь nfqws2 привязывает позже."""
@@ -330,8 +334,8 @@ class Runtime:
                                 timeout=min(1.0, left)).strip()
             if cancel is not None and cancel.is_set():
                 return False
-            if state == "active" and self.occupied(queue):
-                return True
+            if state == "active" and self._owns_queue(queue):
+                return cancel is None or not cancel.is_set()
             if state not in ("active", "activating"):
                 return False
             pause = min(READY_POLL, max(0.0, deadline - time.monotonic()))
@@ -357,17 +361,16 @@ class Runtime:
 
     def start(self, cfg: Config, installation: Installation, profile: str) -> None:
         key = launch_key(cfg, installation, profile)
-        if self.key is not None or self.offload.interface:
+        if self.lease is not None:
             self.stop()
-        elif self.alive(cfg.zapret2.engine_queue):
-            # Подхватываем оставшийся unit XGW.
-            self.key = key
-            self.stop()
+        worker.require_stopped(self.runner, UNIT)
         if self.occupied(cfg.zapret2.engine_queue):
             raise ValueError("queue_busy")
         self._check_files(installation)
         args = arguments(cfg, installation, profile)
         self.runner([*args, "--intercept=0"], timeout=10)
+        worker.require_stopped(self.runner, worker.SELECTED_UNIT)
+        self.lease = self.slot.reserve(UNIT, cfg.zapret2.engine_queue)
         if cfg.zapret2.engine_offload and profile == "disorder-badseq":
             self.offload.disable(cfg.network.wan_if.strip())
         properties = [
@@ -380,25 +383,22 @@ class Runtime:
         # Таймаут systemd-run не гарантирует, что unit не создан. С этого момента
         # требуется остановка, даже если подтверждения запуска мы не получили.
         self.key = key
-        try:
-            self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,
-                         *[arg for item in properties for arg in ("--property", item)], *args],
-                        timeout=15)
-        except Exception:
-            self.offload.restore()
-            raise
+        self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,
+                     *[arg for item in properties for arg in ("--property", item)], *args],
+                    timeout=15)
 
     def stop(self) -> None:
-        try:
-            if self.key is None:
-                return  # Движок не запускался: не обращаться к systemd/polkit при выходе.
+        if self.lease is None or self.slot.lease is not self.lease:
+            return
+        if self.key is not None:
             self.runner(["systemctl", "stop", UNIT], check=False, timeout=10)
             state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-            if state in ("active", "activating", "deactivating"):
+            if state not in worker.STOPPED:
                 raise cmd.CommandError("nfqws2: остановка не подтверждена")
-            self.key = None  # При ошибке остановки следующая попытка всё ещё обязательна.
-        finally:
-            self.offload.restore()
+            self.key = None
+        self.offload.restore()
+        self.slot.release(self.lease)
+        self.lease = None
 
 
 class Controller:
@@ -460,6 +460,7 @@ class Controller:
                 "offload_interface", "unknown_profile", "worker_start_timeout",
                 "offload_state", "offload_read", "offload_fixed", "offload_apply",
                 "offload_restore",
+                "worker_unit_busy", "worker_handoff_pending",
             } else "runtime_failed"
             error = self._stop()
             self.view = {"state": "fallback", "reason": error or reason, "profile": profile}
@@ -469,3 +470,5 @@ class Controller:
 
     def close(self) -> None:
         self.runtime.stop()
+        self.profile, self.installation = "", None
+        self.view = {"state": "off", "reason": "off"}

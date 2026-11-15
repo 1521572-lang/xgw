@@ -219,6 +219,29 @@ def test_recovery_waits_and_rechecks():
     assert z.active(h.current)
 
 
+def test_uncertain_start_runs_cleanup_and_retries_unconfirmed_stop(monkeypatch):
+    h = Harness()
+    h.step(0)
+
+    def failed_start(cfg):
+        h.runtime.up = True
+        raise CommandError("systemd start timed out")
+
+    def failed_stop():
+        raise CommandError("systemd stop timed out")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(h.runtime, "start", failed_start)
+        patch.setattr(h.runtime, "stop", failed_stop)
+        h.step(1)
+    assert h.runtime.up and h.controller.cleanup_pending
+    assert h.controller.view["state"] == "blocked"
+    assert not z.active(h.current)
+    h.step(2)
+    assert not h.runtime.up and not h.controller.cleanup_pending
+    assert not z.active(h.current)
+
+
 @pytest.mark.parametrize("direct_ok", [False, True])
 def test_compare_runs_both_pairs_without_enabling_client_route(monkeypatch, direct_ok):
     h = Harness()

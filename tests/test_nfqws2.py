@@ -118,6 +118,7 @@ class EngineTests(unittest.TestCase):
         patches.enter_context(mock.patch("xgw.nfqws2.find_installation",
                                          return_value=self.installation))
         patches.enter_context(mock.patch.object(runtime, "occupied", host.occupied))
+        patches.enter_context(mock.patch("xgw.desync.worker.verify_owner", return_value=True))
         patches.enter_context(mock.patch.object(runtime, "_check_files"))
         patches.enter_context(mock.patch.object(nfqws2, "time", SimpleNamespace(
             monotonic=lambda: host.now, sleep=host.sleep,
