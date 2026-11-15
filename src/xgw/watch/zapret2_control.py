@@ -8,6 +8,13 @@ import time
 from ..desync import schema, worker
 
 FRESH_SECONDS = 90
+VPN_CONTROL_REASONS = {
+    "not_run": frozenset({"gate_not_closed", "route_not_restored", "worker_not_stopped",
+                          "cancelled", "no_probe_url", "no_vpn_probe_port", "no_probe_credentials",
+                          "budget_unavailable"}),
+    "pass": frozenset({"ok"}),
+    "fail": frozenset({"request_failed"}),
+}
 REASONS = {
     "off": "Обработка выключена.",
     "disabled": "Обработка выключена в настройках.",
@@ -131,9 +138,17 @@ The card exposes state only. Mode-changing commands belong to T11.
         phase = "unknown"
     without_vpn = (fresh and matched and phase == "active" and settings["mode"] == "standalone"
                    and selected.get("without_vpn") is True)
-    vpn_control = selected.get("vpn_control")
-    vpn_control = vpn_control if (fresh and matched and phase == "fallback"
-                                  and vpn_control in ("pass", "fail")) else "not_run"
+    vpn_control, vpn_control_reason, vpn_control_at = "not_run", None, None
+    if (fresh and matched and not invalid and settings["mode"] == "selective"
+            and phase in ("fallback", "blocked")):
+        verdict = selected.get("vpn_control")
+        if phase == "fallback" and verdict in ("pass", "fail"):
+            vpn_control = verdict
+        why = selected.get("vpn_control_reason")
+        at = selected.get("vpn_control_at")
+        if (verdict == vpn_control and isinstance(why, str)
+                and why in VPN_CONTROL_REASONS[vpn_control] and _number(at) and 0 <= at <= now):
+            vpn_control_reason, vpn_control_at = why, at
     profile = raw.get("profile") if source == "engine" else settings["strategy"]
     allowed = schema.ENGINE_PROFILES if source == "engine" else schema.SELECTED_PROFILES
     profile = profile if isinstance(profile, str) and profile in allowed else None
@@ -156,7 +171,8 @@ The card exposes state only. Mode-changing commands belong to T11.
         "counters": {"queued_original": None, "queued_reply": None,
                      "queue_dropped": None, "strategy_switches": None},
         "evidence": {"transport": "unknown", "playback": "not_tested",
-                     "vpn_control": vpn_control},
+                     "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
+                     "vpn_control_at": vpn_control_at},
         "can_off": False, "can_edit": False,
         "capabilities": {"status": True, "change_mode": False, "edit_policy": False},
         "blockers": {mode: list(unavailable) for mode in schema.MODES},

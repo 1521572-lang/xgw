@@ -120,6 +120,10 @@ engine проверяется MainPID → inode сокета → port ID → н�
 готовность Standalone по свежему снимку. Оно требует применённой конфигурации без
 обхода через VPN, остановленных VPN-мостов XGW, готового worker, правил и gate.
 `evidence.vpn_control` показывает результат отдельной служебной VPN-пробы после возврата.
+`vpn_control_reason` содержит код результата или невыполненного условия, `vpn_control_at` —
+время исходной проверки. Во время ожидания повтора у Selective сохраняется исходный результат
+при закрытом gate и снятом прямом правиле. Панель показывает его из свежего снимка с совпавшей
+политикой; успешное подключение по пробе относится к выбранному HTTPS URL и VPN-участнику.
 Формат proc опирается на исходники
 [NFQUEUE](https://github.com/torvalds/linux/blob/master/net/netfilter/nfnetlink_queue.c) и
 [netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).

@@ -472,6 +472,35 @@ class Controller:
                 })
         return rows
 
+    def _fallback_vpn_control(
+        self, cfg: Config, applied: dict, port: int, cancel, *,
+        gate_closed: bool, routed_back: bool, stopped: bool,
+    ) -> tuple[str, str]:
+        from .generator import builder
+
+        if not gate_closed:
+            return "not_run", "gate_not_closed"
+        if not routed_back:
+            return "not_run", "route_not_restored"
+        if not stopped:
+            return "not_run", "worker_not_stopped"
+        if cancel is not None and cancel.is_set():
+            return "not_run", "cancelled"
+        if not cfg.zapret2.probe_urls:
+            return "not_run", "no_probe_url"
+        if not port:
+            return "not_run", "no_vpn_probe_port"
+        password, _ = builder.probe_state(applied)
+        if not password:
+            return "not_run", "no_probe_credentials"
+        if not self._budget(cfg, vpn_control=True):
+            return "not_run", "budget_unavailable"
+        result = self._request(cfg.zapret2.probe_urls[0], port, password,
+                               cfg.probe.user_agent, cancel)
+        if result.kind == "cancelled":
+            return "not_run", "cancelled"
+        return ("pass", "ok") if result.ok else ("fail", "request_failed")
+
     def step(self, cfg: Config, applied: dict, now: float, apply, *, allowed=True,
              vpn_probe_port: int = 0, cancel=None) -> bool:
         from .generator import builder
@@ -504,6 +533,12 @@ class Controller:
                         raise ValueError("apply_failed")
                     self.view = {"state": "preparing", "reason": "probe_inbound"}
                     return changed
+                if (cfg.zapret2.mode == "selective" and not self.ready and not active(applied)
+                        and now < self.next_check and self.view.get("state") == "fallback"
+                        and self.view.get("gate_closed") is True):
+                    # The closed route and the result belong to the current retry window.
+                    # Replacing the snapshot here used to erase the VPN result on the next tick.
+                    return False
                 if not self.ready and now >= self.next_check:
                     self.runtime.gate()
                     starting = True
@@ -588,14 +623,13 @@ class Controller:
             return changed
         self.view = {"state": "fallback" if routed_back and stopped else "blocked",
                      "reason": reason, "gate_closed": gate_closed}
-        if (cfg.zapret2.mode == "selective" and check_vpn and gate_closed and routed_back
-                and stopped and vpn_probe_port and cfg.zapret2.probe_urls
-                and (cancel is None or not cancel.is_set())):
-            password, _ = builder.probe_state(applied)
-            if password and self._budget(cfg, vpn_control=True):
-                control = self._request(cfg.zapret2.probe_urls[0], vpn_probe_port,
-                                        password, cfg.probe.user_agent, cancel)
-                self.view["vpn_control"] = "pass" if control.ok else "fail"
+        if cfg.zapret2.mode == "selective" and check_vpn:
+            verdict, why = self._fallback_vpn_control(
+                cfg, applied, vpn_probe_port, cancel, gate_closed=gate_closed,
+                routed_back=routed_back, stopped=stopped,
+            )
+            self.view.update(vpn_control=verdict, vpn_control_reason=why,
+                             vpn_control_at=time.time())
         return changed
 
     def step_standalone(self, cfg: Config, applied: dict, now: float, apply,

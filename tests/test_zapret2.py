@@ -237,6 +237,37 @@ def test_vpn_control_runs_after_closing_gate_and_withdrawing_direct_route(monkey
     assert calls == [(h.cfg.zapret2.probe_urls[0], 20011)]
     assert h.controller.view["vpn_control"] == "pass"
     assert h.controller.view["state"] == "fallback"
+    result = dict(h.controller.view)
+    h.step(220, vpn_probe_port=20011)
+    h.step(240, vpn_probe_port=0)
+    assert h.controller.view == result
+    assert len(calls) == 1
+    h.step(500, vpn_probe_port=20011)
+    assert h.controller.view["state"] == "preparing"
+    assert "vpn_control" not in h.controller.view
+
+
+@pytest.mark.parametrize(("port", "budget_ok", "gate_ok", "reason"), [
+    (0, True, True, "no_vpn_probe_port"),
+    (20011, False, True, "budget_unavailable"),
+    (20011, True, False, "gate_not_closed"),
+])
+def test_vpn_control_reports_why_cleanup_or_probe_could_not_complete(
+    monkeypatch, port, budget_ok, gate_ok, reason,
+):
+    h = Harness()
+    h.activate()
+    h.runtime.up = False
+    h.runtime.broken = not gate_ok
+    monkeypatch.setattr(h.controller, "_budget", lambda *_args, **_kwargs: budget_ok)
+    monkeypatch.setattr(h.controller, "_request", lambda *_: pytest.fail("unexpected VPN probe"))
+    h.step(200, vpn_probe_port=port)
+    assert h.controller.view["vpn_control"] == "not_run"
+    assert h.controller.view["vpn_control_reason"] == reason
+    if gate_ok:
+        result = dict(h.controller.view)
+        h.step(220, vpn_probe_port=20011)
+        assert h.controller.view == result
 
 
 def test_uncertain_start_runs_cleanup_and_retries_unconfirmed_stop(monkeypatch):
@@ -344,7 +375,8 @@ def test_missing_gate_stops_worker_and_does_not_claim_active():
     assert "private" not in json.dumps(h.controller.view)
 
 
-def test_nft_does_not_broaden_bypass_or_queue_other_traffic():
+def test_nft_does_not_broaden_bypass_or_queue_other_traffic(monkeypatch):
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: None)
     cfg, _, _ = setup()
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
     guard = nft.render_guard(rules)
@@ -374,7 +406,8 @@ def test_gate_refresh_is_atomic_and_expires():
     assert "bypass" not in script
 
 
-def test_guard_fingerprint_ignores_only_live_lease():
+def test_guard_fingerprint_ignores_only_live_lease(monkeypatch):
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: None)
     cfg, _, _ = setup()
     rules, _ = nft.build_rules(cfg, capture=True, time_uids=())
     text = nft.render_guard(rules)

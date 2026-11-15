@@ -25,9 +25,11 @@ T03 = ("cli.py", "daemon.py", "nfqws2.py", "zapret2.py", "desync/schema.py",
 T04 = ("apply/applier.py", "cli.py", "config.py", "daemon.py", "desync/schema.py", "engine.py",
        "generator/builder.py", "net/nft.py", "nfqws2.py", "watch/standalone.py",
        "watch/zapret2_control.py", "zapret2.py")
+VPN_CONTROL = ("zapret2.py", "watch/zapret2_control.py")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
+VPN_CONTROL_TIMER = "xgw-desync-vpn-control-rollback.timer"
 
 
 def require(ok, message):
@@ -95,9 +97,8 @@ def prepare(args, backup):
                                text=True, timeout=10)
         require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
                 "active/transitioning worker: stop and report, do not disable it")
-    require(not ((args.worker_t03 or args.worker_t04) and args.gui),
-            "T03 and T04 overlays are backend only")
-    files = T04 if args.worker_t04 else T03 if args.worker_t03 else BACKEND
+    files, _timer = overlay(args)
+    require(not (files != BACKEND and args.gui), "this overlay is backend only")
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
               payload / "base/src/xgw" / rel) for rel in files]
     if args.gui:
@@ -126,11 +127,10 @@ def prepare(args, backup):
     atomic(backup / "manifest.json", (json.dumps(rows, indent=2) + "\n").encode(), 0o600)
 
 
-def records(backup, *, worker_t03=False, worker_t04=False):
+def records(backup, files):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
-    expected = ({len(T04)} if worker_t04 else {len(T03)} if worker_t03
-                else {len(BACKEND), len(BACKEND) + len(GUI)})
+    expected = {len(files), len(files) + len(GUI)} if files == BACKEND else {len(files)}
     require(isinstance(rows, list) and len(rows) in expected, "invalid manifest")
     seen = set()
     for row in rows:
@@ -177,6 +177,16 @@ def apply(backup, rows, timer=TIMER):
         raise
 
 
+def overlay(args):
+    if args.vpn_control:
+        return VPN_CONTROL, VPN_CONTROL_TIMER
+    if args.worker_t04:
+        return T04, T04_TIMER
+    if args.worker_t03:
+        return T03, T03_TIMER
+    return BACKEND, TIMER
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("prepare", "apply", "rollback"))
@@ -187,6 +197,7 @@ def main():
     stage = parser.add_mutually_exclusive_group()
     stage.add_argument("--worker-t03", action="store_true")
     stage.add_argument("--worker-t04", action="store_true")
+    stage.add_argument("--vpn-control", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -200,9 +211,9 @@ def main():
             require(bool(args.payload and args.package), "prepare needs payload and package")
             prepare(args, backup)
         else:
-            rows = records(backup, worker_t03=args.worker_t03, worker_t04=args.worker_t04)
+            files, timer = overlay(args)
+            rows = records(backup, files)
             if args.action == "apply":
-                timer = T04_TIMER if args.worker_t04 else T03_TIMER if args.worker_t03 else TIMER
                 apply(backup, rows, timer)
             else:
                 service("stop")

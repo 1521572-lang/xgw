@@ -96,6 +96,22 @@ def test_selected_fallback_requires_gate_and_never_asserts_vpn_health():
     assert view(cfg, snap)["state"] == "blocked"
 
 
+def test_fallback_evidence_is_policy_bound_and_keeps_the_original_probe_time():
+    cfg, snap = fixture(mode="selective", state="fallback", gate_closed=True,
+                        vpn_control="not_run", vpn_control_reason="no_vpn_probe_port",
+                        vpn_control_at=NOW - 120)
+    result = view(cfg, snap)["evidence"]
+    assert result["vpn_control_reason"] == "no_vpn_probe_port"
+    assert result["vpn_control_at"] == NOW - 120
+    snap["zapret2"].update(vpn_control_reason="secret-token")
+    assert view(cfg, snap)["evidence"]["vpn_control_reason"] is None
+    snap["zapret2"].update(vpn_control="pass", vpn_control_reason="ok")
+    assert view(cfg, snap)["evidence"]["vpn_control"] == "pass"
+    snap["zapret2_policy_key"] = "previous"
+    assert view(cfg, snap)["evidence"]["vpn_control"] == "not_run"
+    assert view(cfg, snap)["evidence"]["vpn_control_at"] is None
+
+
 def test_private_and_untrusted_fields_are_not_published():
     cfg, snap = fixture(reason="secret-in-error", profile="secret-profile", queue="secret")
     snap["capture"]["nfqws2"]["probes"] = [{"url": "secret-token"}]
