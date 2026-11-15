@@ -98,6 +98,9 @@ def test_header_clicks_sort_without_selecting_server(app):
     def names():
         return [sidebar.servers.topLevelItem(i).text(0).splitlines()[0] for i in range(3)]
 
+    def headings():
+        return [sidebar.servers.headerItem().text(i) for i in range(3)]
+
     def click(column):
         x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
         QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton,
@@ -106,18 +109,27 @@ def test_header_clicks_sort_without_selecting_server(app):
 
     try:
         assert names() == ["a", "b", "c"]
+        assert not header.isSortIndicatorShown()
+        assert headings() == ["Серверы (3) ▲", "Мбит/с", "Рейтинг"]
         click(0)
         assert names() == ["c", "b", "a"]
+        assert headings() == ["Серверы (3) ▼", "Мбит/с", "Рейтинг"]
         click(1)
         assert names() == ["a", "b", "c"]
+        assert headings() == ["Серверы (3)", "Мбит/с ▼", "Рейтинг"]
         click(1)
         assert names() == ["b", "a", "c"]
+        assert headings() == ["Серверы (3)", "Мбит/с ▲", "Рейтинг"]
         click(2)
         assert names() == ["b", "a", "c"]
+        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▼"]
         click(2)
         assert names() == ["a", "b", "c"]
+        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▲"]
         bridge.gateway_changed.emit()
         assert names() == ["a", "b", "c"]
+        assert not header.isSortIndicatorShown()
+        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▲"]
         assert bridge.sent == []
     finally:
         parent.close()

@@ -174,8 +174,6 @@ class Sidebar(QtWidgets.QFrame):
         self.servers.setRootIsDecorated(False)
         self.servers.setColumnCount(3)
         self.servers.header().setSectionsClickable(True)
-        self.servers.header().setSortIndicatorShown(True)
-        self.servers.header().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         self.servers.header().sectionClicked.connect(self.sort_by_column)
         self.servers.header().setMinimumSectionSize(55)
         self.servers.header().setStretchLastSection(False)
@@ -248,10 +246,6 @@ class Sidebar(QtWidgets.QFrame):
             return
         self._descending = not self._descending if column == self._sort_column else column != 0
         self._sort_column = column
-        direction = (Qt.SortOrder.DescendingOrder if self._descending
-                     else Qt.SortOrder.AscendingOrder)
-        self.servers.header().setSortIndicator(
-            column, direction)
         self.render()
 
     def focus_search(self):
@@ -451,7 +445,14 @@ class Sidebar(QtWidgets.QFrame):
         entries = filtered(self.bridge.entries, self._source, self.search.edit.text(),
                            self.filter.currentData(), order,
                            country_name=country_name, descending=self._descending)
-        self.servers.headerItem().setText(0, f"Серверы ({len(entries)})")
+        # A native Qt sort indicator can point down for ascending order depending on style.
+        header = self.servers.headerItem()
+        arrow = "▼" if self._descending else "▲"
+        direction = "По убыванию" if self._descending else "По возрастанию"
+        for column, title in enumerate((f"Серверы ({len(entries)})", "Мбит/с", "Рейтинг")):
+            active = column == self._sort_column
+            header.setText(column, f"{title} {arrow}" if active else title)
+            header.setToolTip(column, f"{title} · {direction}" if active else title)
         key = tuple(entries)
         if key != self._key:
             self._key = key
