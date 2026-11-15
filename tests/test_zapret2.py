@@ -219,6 +219,26 @@ def test_recovery_waits_and_rechecks():
     assert z.active(h.current)
 
 
+def test_vpn_control_runs_after_closing_gate_and_withdrawing_direct_route(monkeypatch):
+    h = Harness()
+    h.activate()
+    h.ok = False
+    calls = []
+
+    def vpn_control(url, port, *_args):
+        assert not z.active(h.current)
+        assert not h.runtime.up
+        assert ("gate", 0) in h.runtime.events
+        calls.append((url, port))
+        return checks.DownloadResult(True)
+
+    monkeypatch.setattr(h.controller, "_request", vpn_control)
+    h.step(200, vpn_probe_port=20011)
+    assert calls == [(h.cfg.zapret2.probe_urls[0], 20011)]
+    assert h.controller.view["vpn_control"] == "pass"
+    assert h.controller.view["state"] == "fallback"
+
+
 def test_uncertain_start_runs_cleanup_and_retries_unconfirmed_stop(monkeypatch):
     h = Harness()
     h.step(0)

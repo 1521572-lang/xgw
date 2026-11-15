@@ -793,6 +793,8 @@ class Daemon:
         self._desync_slot = worker.WorkerSlot()
         self._desync_retired = False
         self._desync_reload_pending = False
+        self._standalone_retry_at = 0.0
+        self._standalone_exiting = False
         self._zapret2 = zapret2.Controller(self.store, zapret2.Runtime(slot=self._desync_slot))
         self._nfqws2 = nfqws2.Controller(nfqws2.Runtime(slot=self._desync_slot))
         self._nfq_view: dict = {}
@@ -976,6 +978,9 @@ class Daemon:
                 self.log.warning("шаг watchdog занял %d с — состояние обновлено с опозданием (%s)",
                                  spent, self._tick_work())
             pause = WAN_DOWN_INTERVAL if state is State.WAN_DOWN else self.cfg.watchdog.interval_s
+            if self.cfg.zapret2.mode == "standalone":
+                pause = min(pause, zapret2.START_POLL if self._zapret2.start_deadline is not None
+                            else 15)
             if self._build is not None or self._build_next is not None:
                 pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:
@@ -1460,6 +1465,11 @@ class Daemon:
         refresh_asked, self._refresh_asked = self._refresh_asked, False
         scan_asked, self._scan_asked = self._scan_asked, False
         applied = engine.read_json(self.paths.xray_config_file)
+        if self.cfg.zapret2.mode == "standalone" or zapret2.standalone(applied):
+            from .watch import standalone
+
+            return standalone.tick(self, applied, now)
+        self._standalone_exiting = False
         if applied is None:
             # Блокировку ставим до ожидания сети даже на первом шаге и при повреждении
             # конфига. Состояние процесса Xray по одному файлу определить нельзя.
@@ -1687,7 +1697,7 @@ class Daemon:
             allowed = (self.cfg.zapret2.probe_enabled and self.capture is not None
                        and self.capture.mode() == "on")
             vpn_probe_port = 0
-            if self.cfg.zapret2.mode == "compare" and observatory:
+            if self.cfg.zapret2.probe_enabled and observatory:
                 # Один живой участник для обеих проб, через его штатный служебный вход.
                 vpn_probe_port = next((info.probe_port for info in view if info.role == "proxy"
                                        and info.probe_port

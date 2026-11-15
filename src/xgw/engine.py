@@ -232,6 +232,8 @@ def collect(
     подпиской, маршрутом и попыткой и посреди ожидания сети. Кэш подписок прерванный
     опрос не трогает, а неполного списка вызывающий не получает.
     """
+    if cfg.zapret2.mode == "standalone":
+        return Inventory()
     remote = any(sub.url and not sub.url.startswith("file://") for sub in cfg.subscriptions)
     proxy = healthy_http_in(cfg) if via_xray and remote else None
     cache = SubscriptionCache(paths.cache_dir)
@@ -573,6 +575,14 @@ def assemble(
     собирается по тому, что sing-box уже ведёт.
     Сервер, конфиг которого установленный Xray или sing-box не принимает, отбрасывается.
     """
+    if cfg.zapret2.mode == "standalone":
+        selection = builder.Selection()
+        result = builder.build(cfg, selection, hosts={}, containers_tun=containers_tun(cfg),
+                               api_listen=str(paths.xray_api_socket))
+        verdict, detail = validate.validate_config(result.config, xray_bin) if check else (None, "")
+        if verdict is False:
+            raise EngineError(detail or "Xray отклонил конфиг без VPN")
+        return Assembly(result, selection, verdict)
     applied = read_json(paths.xray_config_file)
     applied_sb = read_json(paths.singbox_config_file)
     probe_password, probe_ports = builder.probe_state(applied)

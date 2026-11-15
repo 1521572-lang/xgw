@@ -159,17 +159,15 @@ def resolve(legacy: dict, policy: dict | None = None, *, source: str = "gui-ligh
 def project(policy: dict, *, target: str = "gui-light") -> dict:
     """Project to a supported runtime, refusing semantic loss or silent activation.
 
-Batch 1 does NOT implement standalone on gui-light or the engine on freepool.
+Freepool cannot represent the universal engine.
 Keep the canonical document for exchange when its target runtime is unsupported.
 Known selected strategies may remain dormant in off mode without substitution.
 """
     _require(target in ("gui-light", "freepool"), "target")
     flat = flatten(policy)
     if target == "gui-light":
-        if flat["mode"] == "standalone":
-            raise PolicyError("desync: standalone requires batch T04 on gui-light")
-        if flat["mode"] != "off" and flat["strategy"] not in ("multisplit", "multidisorder"):
-            raise PolicyError("desync: selected strategy requires batch T04 on gui-light")
+        if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
+            raise PolicyError("desync: compare tracing supports multisplit and multidisorder")
     else:
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):
             raise PolicyError("desync: engine settings cannot be represented by freepool")

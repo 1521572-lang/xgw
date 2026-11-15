@@ -62,8 +62,9 @@
    Несовпадение с новой конфигурацией панели показывается как pending, не активный новый режим.
 
 `project(policy, target=...)` экспортирует старую секцию без изменения смысла.
-В gui-light пока отклоняются standalone и дополнительные selected-стратегии freepool
-при включённых selective/compare. При mode=off любая **известная схеме** selected-стратегия
+В действующем backend T04 поддерживает standalone и дополнительные selected-стратегии
+в Selective. Compare принимает две стратегии с Lua-трассировкой, multisplit и multidisorder.
+При mode=off любая **известная схеме** selected-стратегия
 сохраняется без замены и в документе, и в Config.zapret2. Это не разрешение её запуска:
 попытка включить неподдерживаемую стратегию по-прежнему завершается ошибкой до сохранения
 или загрузки. Неизвестная стратегия не принимается даже при off. Отдельный engine сохраняет
@@ -72,7 +73,7 @@
 В freepool отклоняются непредставимые настройки отдельного engine. Сама миграция их
 сохраняет: отказ относится к активации/экспорту, а не к потере исходного документа.
 Различающиеся `strategy=seqovl` и `engine_profile=seqovl` не объединять: параметры различны.
-`engine=auto` вместе с selective/compare сохраняется; текущий runtime подавляет engine,
+`engine=auto` вместе со standalone/selective/compare сохраняется; runtime подавляет engine,
 пока включён контроллер выбранных доменов. Этот батч не разрешает два worker на queue 200.
 
 `managed.set_desync()` сохраняет полную поддерживаемую политику под существующей файловой
@@ -111,12 +112,15 @@ config.toml/panel.json используют Path на машине, где он�
 Причины берутся из allowlist, argv/URL/произвольная ошибка worker в API не попадают.
 
 `zapret2_policy_key` в status.json подтверждает конфигурацию наблюдения.
-`zapret2_reservation` в T03 содержит unit, queue и generation текущего владельца слота или
+`zapret2_reservation` содержит unit, queue и generation текущего владельца слота или
 null. Generation растёт при каждой новой резервации в рамках процесса демона. Слот занят
 с начала запуска до подтверждённой остановки и восстановления offload. Для готовности
 engine проверяется MainPID → inode сокета → port ID → номер NFQUEUE. Selected дополнительно
-требует собственной проверки пути и срока gate. Подтверждение всей транзакции маршрута
-остаётся задачей T04. Формат proc опирается на исходники
+требует подтверждения маршрута и срока gate. Поле `without_vpn` в T04 подтверждает
+готовность Standalone по свежему снимку. Оно требует применённой конфигурации без
+обхода через VPN, остановленных VPN-мостов XGW, готового worker, правил и gate.
+`evidence.vpn_control` показывает результат отдельной служебной VPN-пробы после возврата.
+Формат proc опирается на исходники
 [NFQUEUE](https://github.com/torvalds/linux/blob/master/net/netfilter/nfnetlink_queue.c) и
 [netlink](https://github.com/torvalds/linux/blob/master/net/netlink/af_netlink.c).
 

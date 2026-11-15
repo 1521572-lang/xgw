@@ -35,6 +35,12 @@ REASONS = {
     "comparison_incomplete": "Сравнение завершено не полностью.",
     "comparison_cleanup_failed": "Возврат после сравнения не подтверждён.",
     "worker_ready": "Обработчик готов; доступность сайтов проверяется отдельно.",
+    "nfqueue": "Ожидается привязка обработчика к очереди.",
+    "capture_not_ready": "Правила перехвата ещё не подтверждены.",
+    "core_busy": "Ожидается завершение операции с ядром.",
+    "xray_down": "Локальный маршрутизатор Xray не отвечает.",
+    "vpn_stopping": "Ожидается остановка прежних VPN-мостов XGW.",
+    "vpn_requested": "Ожидается применение настроек VPN.",
 }
 TITLES = {
     "off": "Выключен", "active": "Обработчик готов", "absent": "Не установлен",
@@ -123,8 +129,11 @@ The card exposes state only. Mode-changing commands belong to T11.
             phase = "blocked"
     if not isinstance(phase, str) or phase not in TITLES:
         phase = "unknown"
-    without_vpn = (fresh and matched and settings["mode"] == "standalone"
+    without_vpn = (fresh and matched and phase == "active" and settings["mode"] == "standalone"
                    and selected.get("without_vpn") is True)
+    vpn_control = selected.get("vpn_control")
+    vpn_control = vpn_control if (fresh and matched and phase == "fallback"
+                                  and vpn_control in ("pass", "fail")) else "not_run"
     profile = raw.get("profile") if source == "engine" else settings["strategy"]
     allowed = schema.ENGINE_PROFILES if source == "engine" else schema.SELECTED_PROFILES
     profile = profile if isinstance(profile, str) and profile in allowed else None
@@ -146,7 +155,8 @@ The card exposes state only. Mode-changing commands belong to T11.
                    "queue": queue if trusted else None},
         "counters": {"queued_original": None, "queued_reply": None,
                      "queue_dropped": None, "strategy_switches": None},
-        "evidence": {"transport": "unknown", "playback": "not_tested"},
+        "evidence": {"transport": "unknown", "playback": "not_tested",
+                     "vpn_control": vpn_control},
         "can_off": False, "can_edit": False,
         "capabilities": {"status": True, "change_mode": False, "edit_policy": False},
         "blockers": {mode: list(unavailable) for mode in schema.MODES},

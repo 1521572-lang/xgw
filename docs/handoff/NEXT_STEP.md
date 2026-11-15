@@ -1,18 +1,17 @@
-# T03 — приёмка общего управления очередью на Ubuntu 24.04
+# T04 — Standalone без VPN и возврат Selective
 
-Ветка `integration/zapret2-batch1`. База разработки `077dc52`, базовый слой установленного
-backend `4f53495`. Отчёт `docs/reports/YYYY-MM-DD_desync-t03.md`.
+Ветка integration/zapret2-batch1. База разработки eea38a3, последний установленный слой
+026a935. [Отчёт T03](../reports/2026-11-15_desync-t03.md) подтверждает передачу очереди.
+Сетевой ориентир — [опыт r1](../reports/2026-11-15_desync-hypotheses-r1.md) с hostfakesplit-md5
+и браузером через SABR. Прочитай оба отчёта до начала.
 
-Исполнитель сам запускает команды, проверяет GUI через vision и публикует отчёт на GitHub
-после завершения, включая случаи блокировки. При отсутствии терминала, sudo или GUI запроси
-доступ. Прочитай [отчёт r1](../reports/2026-11-15_desync-hypotheses-r1.md) и
-[план](DESYNC-ROADMAP.md). В этом проходе измеряется переключение обработчиков.
-Для короткого браузерного контроля используй известный рабочий `hostfakesplit-md5`, если
-условия прямого маршрута уже проверены. GET к YouTube SABR для приёмки T03 не нужен.
+Ты сама запускаешь команды на Ubuntu 24.04, открываешь браузер и проверяешь экран через vision.
+Если недоступны терминал, sudo или GUI, запроси доступ. По завершении опубликуй отчёт
+автоматически, включая блокеры и фактическое состояние машины.
 
-## Подготовка
+## Получение и подготовка
 
-В чистом checkout, Bash, обычный пользователь:
+В исходном чистом checkout на шлюзе:
 
 ```bash
 set -euo pipefail
@@ -22,8 +21,8 @@ REPO=$(git rev-parse --show-toplevel)
 git fetch origin integration/zapret2-batch1
 TIP=$(git rev-parse FETCH_HEAD)
 CODE=$(git log -1 --format=%H "$TIP" -- docs/handoff/NEXT_STEP.md)
-git merge-base --is-ancestor 077dc52 "$CODE"
-D=$(mktemp -d "$HOME/xgw-desync-t03.XXXXXXXX")
+git merge-base --is-ancestor eea38a3 "$CODE"
+D=$(mktemp -d "$HOME/xgw-desync-t04.XXXXXXXX")
 git worktree add --detach "$D/source" "$CODE"
 cd "$D/source"
 . /etc/os-release
@@ -32,51 +31,53 @@ uname -r
 nft --version
 ```
 
-Если после CODE есть относящиеся к T03 хотфиксы, проверь diff и закрепи выбранный SHA в отчёте.
-Используй существующее dev-окружение с pytest или создай отдельное. Запусти:
+Если появились хотфиксы, прочитай diff и закрепи SHA, который проверяешь. В имеющемся dev-venv
+выполни pytest. Сравни неожиданные падения с базой. В предыдущем отчёте уже отмечены шесть
+не связанных с T03 падений test_daemon.
 
 ```bash
-python3 -m pytest -q --portable tests/test_desync_worker.py tests/test_desync_schema.py tests/test_zapret2_panel.py
-python3 -m pytest -q tests/test_nfqws2.py tests/test_zapret2.py tests/test_daemon.py tests/test_ops.py
+python3 -m pytest --portable tests/test_desync_standalone.py tests/test_desync_worker.py \
+  tests/test_desync_schema.py tests/test_zapret2_panel.py
+python3 -m pytest -q tests/test_zapret2.py tests/test_nfqws2.py tests/test_applier.py \
+  tests/test_generator.py tests/test_daemon.py tests/test_ops.py
 ```
 
-Зафиксируй фактический ExecStart и подтверди пути PACKAGE/PY/CFG. Сверь эффективные режимы
-`off/off`, исходные PID, хэши TOML и panel.json, очередь, offload и доступность сети.
-Сохрани снимки приватно. Если активен используемый пользователем обработчик, запроси окно
-для проверки. Сравни SHA реального nfqws2 и Lua с предыдущим отчётом. В GUI отдельно проверь,
-что карточка доступна и показывает исходное состояние.
+По ExecStart, launcher и PID проверь установленные PACKAGE/PY/CFG ниже. Сними исходный статус,
+права и хэши конфигов, настройки перехвата и offload, очереди, nft и состояние Xray/sing-box.
+Из исходного захваченного браузера запиши доступность и наблюдаемый выход через VPN.
+Текущие mode и engine должны быть off, а обе службы nfqws2 — неактивны. Если обрабатывается
+рабочий трафик zapret2, согласуй окно его переключения.
 
-## Установка и независимый откат
+## Установка с возвратом
 
-Helper рассчитан на подтверждённые байты установленного слоя. Изменения GUI не входят в
-перечень. Если один из исходных файлов отличается, определи его коммит по журналу установки
-и git, опиши расхождение. Используй другой установленный baseline только после точного
-сопоставления байтов и просмотра diff. Не заменяй несовместимый пакет целиком.
+Helper проверяет установленную базу по байтам. Сопоставь каждый файл с известным исходным
+коммитом, если есть расхождение. Подтверждённые прежние GUI и конфиги владельца сохраняются.
 
 ```bash
-BASE=4f53495
+BASE=026a935
 PACKAGE=$(readlink -f /opt/xgw/lib/xgw)
 PID=$(systemctl show xgw.service -p MainPID --value)
 PY=$(sudo readlink -f "/proc/$PID/exe")
 CFG=$(readlink -f /etc/xgw/config.toml)
 PANEL=$(readlink -f /etc/xgw/panel.json)
-PAYLOAD="/opt/xgw/handoff/desync-t03-$CODE"
-BACKUP="/var/lib/xgw/handoff/desync-t03-$CODE"
-FILES=(cli.py daemon.py nfqws2.py zapret2.py desync/schema.py watch/zapret2_control.py)
+PAYLOAD="/opt/xgw/handoff/desync-t04-$CODE"
+BACKUP="/var/lib/xgw/handoff/desync-t04-$CODE"
+FILES=(apply/applier.py cli.py config.py daemon.py desync/schema.py engine.py \
+       generator/builder.py net/nft.py nfqws2.py watch/zapret2_control.py zapret2.py)
 BASE_FILES=()
 for file in "${FILES[@]}"; do BASE_FILES+=("src/xgw/$file"); done
 sudo test ! -e "$PAYLOAD"
 sudo test ! -e "$BACKUP"
 sudo install -d -m 0755 "$PAYLOAD/code" "$PAYLOAD/base"
-git archive "$CODE" "${BASE_FILES[@]}" src/xgw/desync/worker.py docs/helpers/desync_batch1_install.py |
-  sudo tar --no-same-owner -x -C "$PAYLOAD/code"
+git archive "$CODE" "${BASE_FILES[@]}" src/xgw/watch/standalone.py \
+  docs/helpers/desync_batch1_install.py | sudo tar --no-same-owner -x -C "$PAYLOAD/code"
 git archive "$BASE" "${BASE_FILES[@]}" | sudo tar --no-same-owner -x -C "$PAYLOAD/base"
 sudo chmod -R go-w -- "$PAYLOAD"
 HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
-sudo "$PY" "$HELPER" prepare --worker-t03 --payload "$PAYLOAD" --package "$PACKAGE" --backup "$BACKUP"
+sudo "$PY" "$HELPER" prepare --worker-t04 --payload "$PAYLOAD" \
+  --package "$PACKAGE" --backup "$BACKUP"
 sudo cp --preserve=mode,ownership -- "$PANEL" "$BACKUP/panel.before"
 sudo sha256sum "$CFG" "$PANEL" > "$D/config-before.sha256"
-
 sudo install -m 0700 /dev/stdin "$BACKUP/restore.sh" <<'SH'
 #!/bin/bash
 set -euo pipefail
@@ -85,12 +86,14 @@ helper=$2
 backup=$3
 panel=$4
 mode=$5
+exec 9>"$backup/restore.lock"
+flock 9
 systemctl stop xgw.service
-temp=$(mktemp "$(dirname "$panel")/.xgw-t03-restore.XXXXXXXX")
+temp=$(mktemp "$(dirname "$panel")/.xgw-t04-restore.XXXXXXXX")
 cp --preserve=mode,ownership -- "$backup/panel.before" "$temp"
 mv -fT -- "$temp" "$panel"
 if [ "$mode" = rollback ]; then
-  "$py" "$helper" rollback --worker-t03 --backup "$backup"
+  "$py" "$helper" rollback --worker-t04 --backup "$backup"
 else
   systemctl start xgw.service
 fi
@@ -98,115 +101,136 @@ if [ -e "$backup/network-test-started" ]; then
   timeout 180 /usr/local/bin/xgw apply --now
 fi
 SH
-sudo systemd-run --unit=xgw-desync-t03-rollback --on-active=30m \
+sudo systemd-run --unit=xgw-desync-t04-rollback --on-active=45m \
   /bin/bash "$BACKUP/restore.sh" "$PY" "$HELPER" "$BACKUP" "$PANEL" rollback
-sudo systemctl is-active xgw-desync-t03-rollback.timer
-sudo "$PY" "$HELPER" apply --worker-t03 --backup "$BACKUP"
-sudo systemctl is-active xgw.service
+sudo systemctl is-active xgw-desync-t04-rollback.timer
+sudo "$PY" "$HELPER" apply --worker-t04 --backup "$BACKUP"
 sudo sha256sum -c "$D/config-before.sha256"
 ```
 
-Проверь семь строк манифеста, новую карточку, свежий статус и исходное `off/off`.
-Подтверди, что daemon восстановился, а Xray и доступность HTTPS в норме.
-Перед live-фазой создай root-файл `$BACKUP/network-test-started`, перезапусти именно
-`xgw-desync-t03-rollback.timer` и сверь дедлайн. Если дедлайн сработал, прекращай прогоны
-и сначала проверь восстановление. При ошибке можешь сразу вызвать тот же restore с
-аргументом `rollback`. Следи за временем на протяжении всех шагов. Не редактируй другие
-настройки параллельно с временным изменением panel.json.
-
-## Проверки живого контроллера
-
-Записывай время, PID демона и обоих unit, queue+peer из kernel, effective profile,
-generation в `/run/xgw/status.json` (`zapret2_reservation`) и карточку. Приватный снимок
-содержит данные пользователей. В отчёт включай только нужные поля. `generation` относится
-к текущему процессу демона. Резервация появляется до готовности. Для готовности сопоставь
-MainPID → socket inode в /proc/PID/fd → NETLINK_NETFILTER port ID (Eth=12) →
-`/proc/net/netfilter/nfnetlink_queue`. Проверь то же от запущенного xgw.service, поскольку
-его права могут отличаться от sudo-терминала.
-
-Меняй только временный объект политики в panel.json через `managed.set_desync` и пользуйся
-штатным перечитыванием. Не вызывай `apply --now` посреди PID-тестов: он может перезапустить
-демон. Пример переключателя, после сверки реальных путей PY/PACKAGE/CFG:
+Проверь 12 строк манифеста и точные SHA установленных файлов. Сохрани приватный снимок
+применённых конфигов Xray и VPN-мостов вместе с их активным поколением. До переключения
+убедись, что текущий VPN может восстановиться штатным apply и есть локальный канал доступа.
+Перед сетевыми шагами включи предохранитель:
 
 ```bash
-set_engine() {
-  sudo env PYTHONPATH="$(dirname "$PACKAGE")" "$PY" - "$CFG" "$@" <<'PY'
+sudo touch "$BACKUP/network-test-started"
+sudo systemctl restart xgw-desync-t04-rollback.timer
+sudo systemctl list-timers xgw-desync-t04-rollback.timer
+```
+
+Держи таймер активным. Перезаряжай заранее перед длинным видео. При срабатывании останови
+эксперимент, проверь фактическое состояние и начни новый блок только после восстановления.
+В конце прогона вызови тот же restore с аргументом accept при PASS кода либо rollback при
+регрессии. После сверки конфигов и сети останови таймер. Укажи итоговый режим в отчёте.
+
+## Активация Standalone
+
+Переключайся через штатное чтение panel.json. В панели API пока доступен только статус.
+Временная политика не требует правки TOML, когда текущие условия перехвата подходят:
+fail_mode=closed, hold=block, перехват хотя бы локального или LAN трафика, QUIC=reject.
+Проверь, что capture включён для устройства, с которого открываешь браузер.
+
+```bash
+set_standalone() {
+  sudo env PYTHONPATH="$(dirname "$PACKAGE")" "$PY" - "$CFG" <<'PY'
 from dataclasses import asdict
 from pathlib import Path
 import sys
 from xgw import config, managed
 from xgw.desync import schema
-config_path = Path(sys.argv[1])
-cfg, _ = config.load(config_path)
+path = Path(sys.argv[1])
+cfg, _ = config.load(path)
 policy = schema.migrate(asdict(cfg.zapret2))
-policy["selected"]["mode"] = "off"
-policy["engine"].update(engine=sys.argv[2], engine_profile=sys.argv[3], engine_offload=False)
-policy["runtime"]["engine_queue"] = int(sys.argv[4])
-managed.set_desync(managed.path_for(config_path), policy)
-actual, _ = config.load(config_path)
+policy["selected"].update(mode="standalone", strategy="hostfakesplit_md5",
+                          probe_urls=[], retry_seconds=60)
+policy["engine"]["engine"] = "off"
+policy["selected"]["domains"] = [
+    "domain:youtube.com", "domain:googlevideo.com", "domain:youtubei.googleapis.com",
+    "domain:youtube-nocookie.com", "domain:ytimg.com", "domain:ggpht.com",
+]
+managed.set_desync(managed.path_for(path), policy)
+actual, _ = config.load(path)
 assert schema.migrate(asdict(actual.zapret2)) == policy
 PY
 }
+set_standalone
 ```
 
-1. **Старт engine.** Найди две свободные очереди, предпочтительно текущую 200 и свободную
-   соседнюю. Включи `set_engine auto hostfakesplit-md5 200` (подставь свободный номер).
-   Дождись подтверждения владельца и состояния active. Если выученный профиль имеет
-   приоритет, запиши фактический профиль и не называй его hostfakesplit-md5 без подтверждения.
-2. **Повторное чтение без изменений.** Атомарно перепиши идентичные байты panel.json
-   с исходным владельцем и правами. Проверь по журналу, что reload прошёл, а PID демона,
-   PID engine, queue и generation прежние. Затем измени только queue вызовом `set_engine`
-   с другим свободным номером. Проверь, что предыдущий PID остановлен до переназначения,
-   а новый владелец подтверждён и generation вырос.
-3. **Аварийный выход worker.** Убедись, что цель — только запущенный экспериментальный
-   `xgw-nfqws2.service`. Выполни `sudo systemctl kill --kill-whom=main --signal=SIGKILL
-   xgw-nfqws2.service` одной командой. Проверь исчезновение прежней очереди и появление
-   нового PID и generation после шага watchdog. Проверь краткий контроль HTTPS и API.
-4. **Оба направления передачи.** Проверь Engine → Selective или Compare на том же номере
-   → Engine → Off. Используй принадлежащий вам или доступный для проверки HTTPS endpoint
-   с телом ≥16 KiB. Укажи его домен через `full:`, один URL для selective либо два для
-   compare и стратегию `multisplit`. Для изменения policy возьми предыдущий Python-блок,
-   замени присваивания полей на `selected.mode/strategy/domains/probe_urls` и
-   `runtime.queue_num`; сохрани capture и ограничения из config.load. При несовместимых
-   текущих QUIC/proxy settings или отсутствии входа пометь эту строку NOT_RUN и продолжи
-   независимые проверки. Для приёмки старта selective достаточно подтверждённого слушателя
-   и корректного возврата даже при FAIL пробы. Отдельно проверь готовность маршрута,
-   если проба успешна. Два unit не должны работать одновременно. Для compare не требуй
-   прямого клиентского маршрута.
-5. **Чужая очередь и неудачная остановка.** Основной детерминированный тест выполняется в
-   pytest. На шлюзе разрешается повторить проверку занятой очереди только если есть
-   выделенный тестовый слушатель и очередь вне прежней политики. Конкретный чужой unit
-   не останавливай. При статусе `queue_busy` проверь, что XGW не признал чужой socket
-   своим. Failed stop не имитируй путём отключения systemd на рабочем шлюзе.
-6. **Восстановление.** Подтверди off, освобождённые очереди и пустую резервацию. Верни
-   исходный panel.json и прежние сетевые правила, оставив принятый код только при успешной
-   проверке. Для штатного возврата с сохранением кода вызови скрипт с аргументом `accept`.
-   Для отката кода — `rollback`. Сверь `sha256sum -c`, offload, API/GUI/HTTPS и очереди.
-   После подтверждения останови свой rollback timer. Оставь backup приватным.
+Следи за journal/status.json и списком nft. Опиши переход в standalone, локальный Xray и
+остановку legacy/managed VPN-мостов. Подтверди отсутствие proxy- и pool-outbound,
+VPN-балансировщиков и VPN-наблюдателя в применённом Xray. Проверь queue → netlink → MainPID
+по протоколу T03 и наличие обоих элементов zapret2_live с TTL. Покажи, что без очереди
+выбранный путь закрыт. Сними отдельный контроль обычного сайта через standalone-direct.
+Если профиль не применился или видно только старое соединение, перезапусти конкретную пробу.
 
-Если проверка ownership отдаёт false при доказанном слушателе, сопоставь права и proc из
-контекста systemd. Зафиксируй причину. Совместимый хотфикс допустим с повторной проверкой.
-Отсутствующие доказательства не подменяй проверкой «занят номер очереди».
+### Живое видео
 
-## Отчёт и публикация
+Открой чистый профиль браузера без прокси и с отключённым QUIC. Используй новое окно плеера
+и публичный ролик, на котором ранее был успех, либо другой длинный публичный ролик.
+Сними начальный прогресс и кадр, затем 15 минут и ещё 5 после перемотки. Вручную выбери
+720p или 1080p и запиши фактическое качество, длительность, буфер и остановки. Отдельно
+запиши, удалось ли услышать звук. Отсутствие классического GET URL при SABR ожидаемо.
 
-Укажи CODE и базу установки, версии Ubuntu/kernel/nfqws2, фактический доступ к proc,
-результаты переносимых/Linux-тестов, результат каждого шага, цепочку PID/queue/generation,
-поведение GUI, исходные и итоговые хэши и факт отката. Временные служебные JSON, адреса
-подписок, тело ответов и полный status.json не добавляй в Git.
+Подтверди фактический маршрут страницы и media через outbound xgw-zapret2 и выход на WAN
+(счётчики Xray по тегам, отметка цепочки zapret2_queue и короткое наблюдение свежего
+SABR-потока, как в предыдущих отчётах). Фоновые байты от другого direct-трафика не засчитывай.
+Отсутствие VPN-мостов подтверждается отдельно. Одно лишь движение позиции плеера может
+быть чтением буфера. Публикуй только обезличенные тайминги и счётчики.
+
+### Отказ и восстановление
+
+В том же режиме подведи сетевой браузер к новой точке видео. Заверши только экспериментальный
+xgw-zapret2.service через systemctl kill --kill-whom=main --signal=SIGKILL.
+Проверь, что новые соединения к выбранным именам закрыты, очередь не bypass, gate исчезает
+и клиентское правило снимается, без появления VPN-конфига. Обычный контрольный сайт должен
+оставаться доступен через прямой выход. Докажи восстановление worker и gate на новом
+поколении после retry. Запиши, сколько секунд занял переход. Не засчитывай буфер браузера
+как доказательство доступа в интервале отказа.
+
+## Selective, Compare и Off
+
+Для выхода из Standalone верни policy selected.mode=off через managed.set_desync и дождись
+обычной конфигурации с серверами. Сверь применённый исходный тип маршрута, его реальный выход
+и оба worker. Подтверди, что существующие подписки и настройки остались доступны.
+
+Затем проверь Selective на известном HTTPS endpoint, который отвечает свежим телом ≥16 KiB на
+оба пути. Для этого шага заполни probe_urls, задай domain: или full: этого endpoint и используй
+обычную стратегию или hostfakesplit_md5. Сначала дождись активного прямого правила. Прерывание
+только нового экспериментального worker должно снять прямое правило. Повтори запрос с новым
+соединением через штатный захваченный клиент, сверь VPN-выход и evidence.vpn_control.
+Успех отдельной служебной пробы и реальный новый клиентский поток зафиксируй по отдельности.
+Если URL не даёт валидной прямой пробы, зафиксируй эту причину и не объявляй успешный fallback.
+
+Для Compare используй multisplit и два валидных HTTPS URL выбранных доменов. Запиши результаты
+четырёх проб из status.json, подтверждение отсутствия прямого клиентского правила на протяжении
+раунда и освобождение очереди. При отсутствии VPN-контроля отметь состояние как неполное.
+
+Заверши возвратом исходной политики и восстановлением штатной сети. Сверь исходные SHA,
+VPN-путь, главные службы, offload, очередь и видимое окно. Режим T04 оставляется установленным
+после подтверждённой работы маршрутов. Варианты, которые не удалось воспроизвести, вынеси
+в отчёт с точным условием. Слияние в основную ветку в этот проход не входит.
+
+## Публикация
+
+В отчёте укажи SHA, вывод тестов и результат каждого реального шага. Для видео укажи качество,
+тайминг, выбранный outbound и объём сетевого трафика. Для отказов укажи последовательность
+изменения gate, очереди и правил. Приватные конфиги, URL и записи пакетов оставь на стенде.
+Ошибки окружения разрешены к точечному исправлению с повторной проверкой.
 
 ```bash
 cd "$REPO"
 git fetch origin integration/zapret2-batch1
-git switch -c "glm/desync-t03-$(date -u +%Y%m%dT%H%M%SZ)" FETCH_HEAD
-REPORT="docs/reports/$(date +%F)_desync-t03.md"
-# Заполни REPORT, добавь проверенные хотфиксы отдельными точными путями.
+git switch -c "glm/desync-t04-$(date -u +%Y%m%dT%H%M%SZ)" FETCH_HEAD
+REPORT="docs/reports/$(date +%F)_desync-t04.md"
+# Заполни REPORT. Подтверждённый хотфикс добавляй отдельными точными путями.
 git add "$REPORT"
 git diff --cached --check
 git diff --cached
-git commit -m "docs: report T03 worker lifecycle on Ubuntu 24.04"
+git commit -m "docs: report standalone and fallback T04 on Ubuntu 24.04"
 git push origin HEAD:integration/zapret2-batch1
 git ls-remote origin refs/heads/integration/zapret2-batch1
 ```
 
-Если появилось новое изменение ветки, перечитай его и повтори обычный push после rebase.
+При отклонении push из-за свежего коммита сделай fetch/rebase, сверь изменения и повтори обычный
+push. В итоговом сообщении укажи SHA отчёта и оставленный режим.

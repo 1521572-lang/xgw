@@ -408,6 +408,10 @@ class Zapret2:
     def probe_enabled(self) -> bool:
         return self.mode in ("selective", "compare")
 
+    @property
+    def selected_enabled(self) -> bool:
+        return self.probe_enabled or self.mode == "standalone"
+
 
 @dataclass
 class Media:

@@ -116,6 +116,16 @@ class Applier:
                 return ApplyOutcome("rejected", detail="конфиг изменился во время проверки")
             return self._apply_locked(new_config, restart_now=False, api_only=True)
 
+    def recover_current(self, new_config: dict, *, base: dict) -> ApplyOutcome:
+        """Replace uncertain live API state with a validated on-disk configuration."""
+        ok, output = self.validator(new_config)
+        if not ok:
+            return ApplyOutcome("rejected", detail=output)
+        with file_lock(self.paths.lock_file):
+            if self._read_current() != base or not self.paths.api_dirty_file.exists():
+                return ApplyOutcome("rejected", detail="поколение изменилось до восстановления")
+            return self._restart(new_config, reason="восстановление маршрутов после отказа API")
+
     def rollback(self, reason: str) -> ApplyOutcome:
         """Откат на last-good по решению watchdog: Xray не поднимается с текущим
         конфигом. Если last-good нет или он совпадает с текущим — откатывать нечего."""

@@ -13,7 +13,8 @@ import pytest  # noqa: E402
 GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
 PORTABLE = False
 PORTABLE_TESTS = {"test_desync_schema.py", "test_zapret2_panel.py", "test_geodat.py",
-                  "test_gui_server_data.py", "test_desync_experiment.py", "test_desync_worker.py"}
+                  "test_gui_server_data.py", "test_desync_experiment.py", "test_desync_worker.py",
+                  "test_desync_standalone.py"}
 
 
 def pytest_addoption(parser):

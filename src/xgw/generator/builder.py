@@ -843,7 +843,11 @@ def build(
     if ipv6 is None:
         ipv6 = cfg.network.ipv6_proxy and sysctl.ipv6_usable()
     ipv6 = ipv6 and cfg.capture.local
-    if not selection.members:
+    standalone = cfg.zapret2.mode == "standalone"
+    if standalone:
+        selection = Selection()
+        pool, pool_devices, pool_all, media = (), (), False, None
+    if not selection.members and not standalone:
         raise BuildError("нет участников балансировщика: подписка пуста или всё отфильтровано")
     password = probe_password or secrets.token_urlsafe(24)
 
@@ -1103,7 +1107,7 @@ def build(
     # Резервный выход — дешёвый лимитированный запасной: через него трафик идёт, только
     # когда observatory считает мёртвыми всех участников. В subjectSelector он не входит,
     # поэтому ядро его не пробует. Нет резервного — первый участник.
-    fallback_tag = nodes[0].tag
+    fallback_tag = "block" if standalone else nodes[0].tag
     if selection.reserve is not None:
         fallback_tag = next(
             info.tag for info in nodes if info.fingerprint == selection.reserve.fingerprint
@@ -1192,7 +1196,33 @@ def build(
             },
         },
     }
-    if cfg.zapret2.mode == "selective":
+    if standalone:
+        # Keep the same local inbounds as VPN mode. Only the egress policy changes.
+        clients = [*capture_tags, "http-in", "socks-in"]
+        for inbound in inbounds:
+            if inbound["tag"] in clients:
+                inbound["sniffing"] = sniffing
+        direct = next(out for out in outbounds if out["tag"] == "direct")
+        config["outbounds"] = [
+            {**direct, "tag": zapret2.DIRECT},
+            *(out for out in outbounds if out["tag"] in ("dns-out", "block")),
+            zapret2.selected_outbound(),
+        ]
+        config.pop("burstObservatory")
+        config["dns"]["hosts"] = {}
+        config["dns"]["servers"] = [
+            address if port is None else {"address": address, "port": port}
+            for address, port in direct_dns
+        ]
+        config["routing"] = {"domainStrategy": "AsIs", "rules": [
+            *([{"type": "field", "inboundTag": capture_tags, "port": "53",
+                "outboundTag": "dns-out"}] if capture_tags else []),
+            {"type": "field", "inboundTag": clients, "domain": list(cfg.zapret2.domains),
+             "outboundTag": "block"},
+            {"type": "field", "network": "tcp,udp", "outboundTag": zapret2.DIRECT},
+        ]}
+        fallback_tag = zapret2.DIRECT
+    elif cfg.zapret2.mode == "selective":
         config = zapret2.patch(config, cfg)
     return BuildResult(
         config=config,

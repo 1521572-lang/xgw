@@ -401,7 +401,8 @@ def _cmd_generate(args, cfg: config.Config, paths: Paths, logger) -> int:
 
     out_path = Path(args.out) if args.out else paths.generated_config_file
     atomic_write_json(out_path, result.config)
-    engine.persist(paths, assembly, inventory.quotas, applied=False)
+    if cfg.zapret2.mode != "standalone":
+        engine.persist(paths, assembly, inventory.quotas, applied=False)
 
     if args.print:
         print(json.dumps(result.config, ensure_ascii=False, indent=2))
@@ -454,9 +455,9 @@ def _cmd_apply(args, cfg: config.Config, paths: Paths, logger) -> int:
         print(engine.describe_singbox(singbox_outcome))
     if outcome is None:
         return 1  # sing-box конфиг не принял — Xray не менялся
-    if outcome.mode in ("api", "restart", "unchanged"):
+    if outcome.mode in ("api", "restart", "unchanged") and cfg.zapret2.mode != "standalone":
         engine.persist(paths, assembly, inventory.quotas, record_event=False)
-    if outcome.mode in ("api", "restart"):
+    if outcome.mode in ("api", "restart") and cfg.zapret2.mode != "standalone":
         _restore_pin(paths, applier.api, logger)
     if outcome.mode != "unchanged":
         with _store(paths) as store:

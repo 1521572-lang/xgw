@@ -35,15 +35,11 @@ def test_config_defaults_match_legacy_defaults():
     assert asdict(config.Zapret2()) == schema.DEFAULTS
 
 
-@pytest.mark.parametrize("patch", [
-    {"mode": "standalone"},
-    {"mode": "selective", "strategy": "hostfakesplit_md5"},
-    {"mode": "compare", "strategy": "hostfakesplit_md5"},
-])
-def test_freepool_features_are_preserved_but_not_silently_activated(patch):
-    policy = schema.migrate(patch, source="freepool")
+def test_legacy_compare_strategy_preserved_but_requires_supported_trace():
+    policy = schema.migrate({"mode": "compare", "strategy": "hostfakesplit_md5"},
+                            source="freepool")
     assert schema.migrate(schema.project(policy, target="freepool"), source="freepool") == policy
-    with pytest.raises(schema.PolicyError, match="T04"):
+    with pytest.raises(schema.PolicyError, match="compare tracing"):
         schema.project(policy, target="gui-light")
 
 
@@ -76,8 +72,7 @@ def test_dormant_strategy_loads_losslessly_and_confirms_off(tmp_path, strategy, 
     assert view["strategy"] is None and not view["without_vpn"]
 
 
-@pytest.mark.parametrize("mode", ["selective", "compare", "standalone"])
-def test_dormant_unsupported_strategy_cannot_be_enabled(tmp_path, monkeypatch, mode):
+def test_dormant_strategy_with_no_trace_cannot_be_enabled_in_compare(tmp_path, monkeypatch):
     file = tmp_path / "config.toml"
     file.write_text('[zapret2]\nengine="auto"\n', encoding="utf-8")
     panel = tmp_path / "panel.json"
@@ -91,12 +86,12 @@ def test_dormant_unsupported_strategy_cannot_be_enabled(tmp_path, monkeypatch, m
     monkeypatch.setattr(managed, "file_lock", lambda *a, **kw: nullcontext())
     assert not managed.set_desync(panel, policy)
     requested = copy.deepcopy(policy)
-    requested["selected"]["mode"] = mode
-    with pytest.raises(managed.ManagedError, match="T04"):
+    requested["selected"]["mode"] = "compare"
+    with pytest.raises(managed.ManagedError, match="compare tracing"):
         managed.set_desync(panel, requested)
     assert panel.read_bytes() == original
     panel.write_text(json.dumps({"desync": requested}), encoding="utf-8")
-    with pytest.raises(config.ConfigError, match="T04"):
+    with pytest.raises(config.ConfigError, match="compare tracing"):
         config.load(file)
 
 
@@ -192,7 +187,7 @@ def test_complete_panel_policy_overrides_toml_and_unrelated_writes_preserve_it(t
 
 
 @pytest.mark.parametrize("raw", [
-    {"zapret2": {"mode": "standalone"}},
+    {"zapret2": {"mode": "compare", "strategy": "hostfakesplit_md5"}},
     {"desync": {"schema_version": 999}},
     {"desync": {"engine": "auto"}},
     {"zapret2": {"engine_queue": False}},

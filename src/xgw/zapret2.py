@@ -30,6 +30,7 @@ FAKE_BIT = 0x40000000
 FAKE_MARK = MARK | FAKE_BIT
 MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
 OUT = "xgw-zapret2"
+DIRECT = "xgw-standalone-direct"
 PROBE = "xgw-zapret2-probe"
 UNIT = worker.SELECTED_UNIT
 LIVE = "zapret2_live"
@@ -38,6 +39,21 @@ PROBE_BYTES = 64 * 1024
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
+START_WAIT = 20
+START_POLL = 2
+STANDALONE_LEASE = 60
+TRACED = ("multisplit", "multidisorder")
+_FAKE = "fake:blob=fake_default_tls:{}:repeats=2:tls_mod=rnd,dupsid"
+STRATEGIES = {
+    "multisplit": ("multisplit:pos=1,midsld",),
+    "multidisorder": ("multidisorder:pos=1,midsld",),
+    "fake_md5": (_FAKE.format("tcp_md5"), "multidisorder:pos=1,midsld"),
+    "fake_seq": (_FAKE.format("tcp_seq=-10000"), "multidisorder:pos=1,midsld"),
+    "fake_ts": (_FAKE.format("tcp_ts=-600000"), "multisplit:pos=1,midsld"),
+    "fakedsplit_md5": ("fakedsplit:pos=midsld:tcp_md5",),
+    "hostfakesplit_md5": ("hostfakesplit:midhost=midsld:tcp_md5",),
+    "seqovl": ("multisplit:pos=1:seqovl=681:seqovl_pattern=fake_default_tls",),
+}
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
 
@@ -52,13 +68,13 @@ def matches(host: str, domains: list[str]) -> bool:
 def validate(cfg: Config) -> list[str]:
     z = cfg.zapret2
     problems = []
-    if z.mode not in ("off", "selective", "compare"):
-        problems.append("mode: ожидается off, selective или compare")
+    if z.mode not in ("off", "standalone", "selective", "compare"):
+        problems.append("mode: ожидается off, standalone, selective или compare")
     if not z.domains or any(not _DOMAIN.fullmatch(d) for d in z.domains):
         problems.append("domains: нужны domain:имя или full:имя")
     # Keep dormant preferences intact; off never executes a selected strategy.
     # Enabling a profile still requires support in this controller, not just in the schema.
-    strategies = SELECTED_PROFILES if z.mode == "off" else ("multisplit", "multidisorder")
+    strategies = TRACED if z.mode == "compare" else SELECTED_PROFILES
     if z.strategy not in strategies:
         problems.append("strategy: неизвестная или неподдерживаемая в выбранном режиме")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
@@ -94,8 +110,13 @@ def validate(cfg: Config) -> list[str]:
         problems.append("для YouTube нужны вместе youtube.com и googlevideo.com")
     if z.probe_enabled and cfg.routing.proxy_domains:
         problems.append("первая версия требует общего маршрута через VPN (proxy_domains пуст)")
-    if z.probe_enabled and cfg.network.effective_quic_mode != "reject":
+    if z.selected_enabled and cfg.network.effective_quic_mode != "reject":
         problems.append("для общего выхода страницы и видео требуется network.quic_mode = reject")
+    if z.mode == "standalone":
+        if not cfg.capture.hold_blocks or cfg.capture.fail_mode != "closed":
+            problems.append("standalone требует capture.fail_mode = closed и capture.hold = block")
+        if not (cfg.capture.local or cfg.capture.lan):
+            problems.append("standalone требует настроенного перехвата")
     for mark in (cfg.capture.mark_proxy, cfg.capture.mark_bypass, cfg.capture.mark_containers):
         if mark & (MARK | FAKE_BIT):
             problems.append("метки capture пересекаются с зарезервированными битами zapret2")
@@ -122,6 +143,28 @@ def active(config: dict) -> bool:
                for r in config.get("routing", {}).get("rules", []))
 
 
+def standalone(config: dict | None) -> bool:
+    return any(o.get("tag") == DIRECT for o in (config or {}).get("outbounds", []))
+
+
+def selected_outbound() -> dict:
+    return {
+        "tag": OUT, "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {"sockopt": {"mark": MARK}},
+    }
+
+
+def standalone_route(config: dict, *, enabled: bool) -> dict:
+    """The selected-domain block rule stays in place across open/close."""
+    result = copy.deepcopy(config)
+    rules = [r for r in result["routing"]["rules"] if r.get("outboundTag") != OUT]
+    result["routing"]["rules"] = rules
+    if enabled:
+        index = next(i for i, rule in enumerate(rules) if rule.get("outboundTag") == "block")
+        rules.insert(index, {**rules[index], "network": "tcp", "port": "443", "outboundTag": OUT})
+    return result
+
+
 def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = True) -> dict:
     """Статические вход/выход и временное правило. Полная сборка всегда начинает с VPN."""
     from .generator import builder
@@ -137,10 +180,7 @@ def patch(config: dict, cfg: Config, *, enabled: bool = False, probe: bool = Tru
     password, _ = builder.probe_state(config)
     if not password or any(i.get("port") == cfg.zapret2.probe_port for i in result["inbounds"]):
         raise ValueError("служебный вход zapret2 недоступен")
-    result["outbounds"].append({
-        "tag": OUT, "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"},
-        "streamSettings": {"sockopt": {"mark": MARK}},
-    })
+    result["outbounds"].append(selected_outbound())
     result["inbounds"].append({
         "tag": PROBE, "protocol": "http", "listen": "127.0.0.1", "port": cfg.zapret2.probe_port,
         "settings": {"accounts": [{"user": builder.PROBE_USER, "pass": password}]},
@@ -202,12 +242,12 @@ def arguments(cfg: Config) -> list[str]:
     args = [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
             f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
-    strategy = z.strategy
+    calls = STRATEGIES[z.strategy]
     if z.mode == "compare":
         args += ["--debug=0", "--lua-init=" + LUA]
-        strategy = "xgw_trace:strategy=" + strategy
+        calls = (f"xgw_trace:strategy={z.strategy}:pos=1,midsld",)
     return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",
-            f"--lua-desync={strategy}:pos=1,midsld"]
+            *(f"--lua-desync={call}" for call in calls)]
 
 
 class Runtime:
@@ -310,12 +350,13 @@ class Controller:
         self.healthy = False
         self.ready = False
         self.cleanup_pending = False
+        self.start_deadline: float | None = None
         self.last_error = ""
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
 
-    def _budget(self, cfg: Config) -> bool:
+    def _budget(self, cfg: Config, *, vpn_control: bool = False) -> bool:
         day = int(time.time() // 86400)
         try:
             budget = json.loads(self.store.get_meta(BUDGET) or "{}")
@@ -324,7 +365,7 @@ class Controller:
                 return False
         except (ValueError, TypeError, AttributeError):
             return False  # повреждённый учёт не превращается в бесплатный бюджет
-        charge = len(cfg.zapret2.probe_urls) * PROBE_CHARGE
+        charge = (1 if vpn_control else len(cfg.zapret2.probe_urls)) * PROBE_CHARGE
         if cfg.zapret2.mode == "compare":
             charge *= REDIRECT_LIMIT + 2  # исходный GET, переходы VPN и один прямой GET
         if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
@@ -451,6 +492,7 @@ class Controller:
         reason = "off" if not wanted else "waiting_for_probe_urls"
         changed = False
         starting = False
+        check_vpn = False
         try:
             if wanted and configured(cfg):
                 scaffold = patch(applied, cfg, enabled=active(applied))
@@ -509,6 +551,7 @@ class Controller:
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
             self.next_check = now + cfg.zapret2.retry_seconds
+            check_vpn = reason in ("worker_down", "probe_failed")
         self.healthy = False
         gate_closed = True
         try:
@@ -545,7 +588,78 @@ class Controller:
             return changed
         self.view = {"state": "fallback" if routed_back and stopped else "blocked",
                      "reason": reason, "gate_closed": gate_closed}
+        if (cfg.zapret2.mode == "selective" and check_vpn and gate_closed and routed_back
+                and stopped and vpn_probe_port and cfg.zapret2.probe_urls
+                and (cancel is None or not cancel.is_set())):
+            password, _ = builder.probe_state(applied)
+            if password and self._budget(cfg, vpn_control=True):
+                control = self._request(cfg.zapret2.probe_urls[0], vpn_probe_port,
+                                        password, cfg.probe.user_agent, cancel)
+                self.view["vpn_control"] = "pass" if control.ok else "fail"
         return changed
+
+    def step_standalone(self, cfg: Config, applied: dict, now: float, apply,
+                        *, allowed: bool, blocked_reason: str = "capture_not_ready",
+                        cancel=None) -> None:
+        """Keep selected domains blocked until both NFQUEUE and the route are ready."""
+        reason = blocked_reason
+        queue = cfg.zapret2.queue_num
+        live_route = active(applied)
+        try:
+            if allowed and (cancel is None or not cancel.is_set()):
+                if self.cleanup_pending:
+                    self.close()
+                if not self.ready and now >= self.next_check:
+                    self.runtime.gate()
+                    self.cleanup_pending = True
+                    self.runtime.start(cfg)
+                    self.cleanup_pending = False
+                    self.ready = True
+                    self.start_deadline = now + START_WAIT
+                if self.ready and self.runtime.alive(queue):
+                    if cancel is not None and cancel.is_set():
+                        raise ValueError("stopping")
+                    self.start_deadline = None
+                    # Measure from the start of the nft request, never overstate its TTL.
+                    valid_until = time.time() + STANDALONE_LEASE
+                    self.runtime.gate(STANDALONE_LEASE)
+                    if not live_route:
+                        target = standalone_route(applied, enabled=True)
+                        if not apply(target, applied):
+                            raise ValueError("apply_failed")
+                    self.view = {"state": "active", "reason": "worker_ready",
+                                 "valid_until": valid_until, "without_vpn": True}
+                    return
+                if self.start_deadline is not None and now < self.start_deadline:
+                    self.view = {"state": "preparing", "reason": "nfqueue"}
+                    return
+                if self.ready:
+                    raise ValueError("worker_start_timeout" if self.start_deadline is not None
+                                     else "worker_down")
+                reason = self.last_error or "retry_wait"
+        except (OSError, ValueError, cmd.CommandError) as exc:
+            codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
+                     "worker_start_timeout", "apply_failed", "worker_unit_busy",
+                     "worker_handoff_pending", "stopping"}
+            reason = (str(exc) if isinstance(exc, ValueError) and str(exc) in codes
+                      else "dependency_missing" if isinstance(exc, FileNotFoundError)
+                      else "runtime_failed")
+            self.last_error = reason
+            self.next_check = now + cfg.zapret2.retry_seconds
+        closed = True
+        try:
+            self.close()  # Flush the TTL set before stopping the worker.
+        except (OSError, cmd.CommandError):
+            closed = False
+            if self.cleanup_pending:
+                reason = "stop_failed"
+        if live_route:
+            try:
+                if not apply(standalone_route(applied, enabled=False), applied):
+                    reason = "apply_failed"
+            except (OSError, cmd.CommandError, ValueError):
+                reason = "apply_failed"
+        self.view = {"state": "blocked", "reason": reason, "gate_closed": closed}
 
     def close(self) -> None:
         if not self.ready and not self.cleanup_pending:
@@ -553,6 +667,7 @@ class Controller:
         try:
             self.runtime.gate()
         finally:
+            self.start_deadline = None
             self.cleanup_pending = True
             self.ready = self.healthy = False
             self.runtime.stop()

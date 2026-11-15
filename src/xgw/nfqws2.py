@@ -65,7 +65,7 @@ def validate(cfg: Config) -> list[str]:
 
 
 def enabled(cfg: Config) -> bool:
-    return cfg.zapret2.engine == "auto" and not cfg.zapret2.probe_enabled
+    return cfg.zapret2.engine == "auto" and not cfg.zapret2.selected_enabled
 
 
 def _is_file(path: Path) -> bool:

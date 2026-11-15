@@ -22,8 +22,12 @@ BACKEND = ("config.py", "managed.py", "daemon.py", "watch/panel.py", "zapret2.py
 GUI = ("vpn_ui/xgw/overview.py", "src/xgw/gui/zapret2.py")
 T03 = ("cli.py", "daemon.py", "nfqws2.py", "zapret2.py", "desync/schema.py",
        "desync/worker.py", "watch/zapret2_control.py")
+T04 = ("apply/applier.py", "cli.py", "config.py", "daemon.py", "desync/schema.py", "engine.py",
+       "generator/builder.py", "net/nft.py", "nfqws2.py", "watch/standalone.py",
+       "watch/zapret2_control.py", "zapret2.py")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
+T04_TIMER = "xgw-desync-t04-rollback.timer"
 
 
 def require(ok, message):
@@ -91,9 +95,11 @@ def prepare(args, backup):
                                text=True, timeout=10)
         require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
                 "active/transitioning worker: stop and report, do not disable it")
-    require(not (args.worker_t03 and args.gui), "T03 overlay is backend only")
+    require(not ((args.worker_t03 or args.worker_t04) and args.gui),
+            "T03 and T04 overlays are backend only")
+    files = T04 if args.worker_t04 else T03 if args.worker_t03 else BACKEND
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
-              payload / "base/src/xgw" / rel) for rel in (T03 if args.worker_t03 else BACKEND)]
+              payload / "base/src/xgw" / rel) for rel in files]
     if args.gui:
         gui = bounded(args.gui, "/opt/xgw")
         pairs.extend((payload / "code" / rel, gui / rel, payload / "gui_base" / rel)
@@ -120,10 +126,11 @@ def prepare(args, backup):
     atomic(backup / "manifest.json", (json.dumps(rows, indent=2) + "\n").encode(), 0o600)
 
 
-def records(backup, *, worker_t03=False):
+def records(backup, *, worker_t03=False, worker_t04=False):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
-    expected = {len(T03)} if worker_t03 else {len(BACKEND), len(BACKEND) + len(GUI)}
+    expected = ({len(T04)} if worker_t04 else {len(T03)} if worker_t03
+                else {len(BACKEND), len(BACKEND) + len(GUI)})
     require(isinstance(rows, list) and len(rows) in expected, "invalid manifest")
     seen = set()
     for row in rows:
@@ -177,7 +184,9 @@ def main():
     parser.add_argument("--payload")
     parser.add_argument("--package")
     parser.add_argument("--gui")
-    parser.add_argument("--worker-t03", action="store_true")
+    stage = parser.add_mutually_exclusive_group()
+    stage.add_argument("--worker-t03", action="store_true")
+    stage.add_argument("--worker-t04", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -191,9 +200,10 @@ def main():
             require(bool(args.payload and args.package), "prepare needs payload and package")
             prepare(args, backup)
         else:
-            rows = records(backup, worker_t03=args.worker_t03)
+            rows = records(backup, worker_t03=args.worker_t03, worker_t04=args.worker_t04)
             if args.action == "apply":
-                apply(backup, rows, T03_TIMER if args.worker_t03 else TIMER)
+                timer = T04_TIMER if args.worker_t04 else T03_TIMER if args.worker_t03 else TIMER
+                apply(backup, rows, timer)
             else:
                 service("stop")
                 restore(backup, rows)

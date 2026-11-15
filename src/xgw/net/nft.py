@@ -402,7 +402,7 @@ def build_rules(
             conncheck4=conncheck[0] if capture or blocked else (),
             conncheck_port=conncheck[1],
             zapret2_queue=(cfg.zapret2.queue_num
-                           if cfg.zapret2.probe_enabled else None),
+                           if cfg.zapret2.selected_enabled else None),
             engine_queue=(cfg.zapret2.engine_queue if capture and nfqws2.enabled(cfg)
                           and nfqws2.find_installation(cfg) is not None else None),
         ),
