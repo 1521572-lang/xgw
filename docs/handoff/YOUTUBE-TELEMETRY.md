@@ -1,16 +1,172 @@
 # Измерение реального плеера YouTube и медиатрафика
 
-Дополнение к T04 и прибор для T09/H10. Разработка на Windows; браузерная приёмка только
-на реальной Ubuntu **24.04 LTS**. Код helper не требует установки новой версии служб XGW.
-Он открывает отдельное видимое окно Chrome, читает плеер и CDP, ничего не переключает в шлюзе.
-Переносимые тесты проверяют арифметику и обработку событий; работа с живым YouTube пока NOT_RUN.
+Открытая часть T04 и подготовка T09/H10. На Ubuntu **24.04 LTS** обычный Chrome уже
+воспроизвёл ролик в 720p через Standalone без VPN в течение 15 минут и ещё 5 после перемотки.
+Запущенный через Playwright браузер дал 31,9 с пригодного просмотра в VPN-калибровке и
+около 2 мин в Standalone, где плеер дважды показал ошибку. Причина ошибки не установлена.
+Для следующего длинного замера используй обычный Chrome из рабочего опыта.
+[Отчёт T04](../reports/2026-11-15_desync-t04.md).
 
 Исполнитель сама запускает команды, работает с браузером через vision и публикует отчёт.
 Владелец не должен запускать скрипт или переписывать числа с экрана. Если недоступны терминал,
 GUI или sudo для сетевого этапа T04, запроси доступ. В этой задаче GUI важен: headless не
 считается эквивалентом живого воспроизведения и проверки декодирования.
 
-## Что измеряет прибор
+## Замер в обычном Chrome
+
+Обнови чистый checkout из `origin/integration/zapret2-batch1` и запиши полный SHA. Начни
+с короткого измерения на работающем VPN в исходном режиме off/off, затем используй тот же
+браузер для Standalone. Сбор веди в отдельном тестовом профиле пользователя рабочего стола.
+Ролик `8plwv25NYRo`, 720p, скорость 1×. Закрой автопереход и оставь вкладку видимой.
+
+```bash
+set -euo pipefail
+umask 077
+REPO=$(git rev-parse --show-toplevel)
+CODE=$(git rev-parse HEAD)
+LAB=$(mktemp -d "$HOME/xgw-youtube-telemetry.XXXXXXXX")
+VIDEO=8plwv25NYRo
+CHROME=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)
+open_trial() {
+  TRIAL=$1
+  mkdir "$LAB/$TRIAL"
+  "$CHROME" --user-data-dir="$LAB/$TRIAL/profile" --no-proxy-server --disable-quic \
+    --log-net-log="$LAB/$TRIAL/netlog.json" about:blank >"$LAB/$TRIAL/chrome.log" 2>&1 &
+}
+open_trial calibration-vpn
+```
+
+В DevTools открой Network, включи Preserve log, отключи эмуляцию скорости и оставь
+обычный cache. Затем открой `https://www.youtube.com/watch?v=8plwv25NYRo` в этой вкладке.
+Создай Snippet в Sources → Snippets. Сначала вставь содержимое
+`docs/helpers/youtube_telemetry.js` из checkout, затем добавь в тот же Snippet этот код и
+выполни его до Play. Оба фрагмента читают состояние вкладки и медиасобытия. Каждый замер
+ограничен 30 минутами. После перезагрузки вкладки начни новый замер.
+
+```js
+(() => {
+  if (window.__xgwCapture) return;
+  const start = performance.now();
+  const rows = [];
+  const marks = [];
+  const now = () => (performance.now() - start) / 1000;
+  const sample = () => rows.push({
+    ...window.__xgwTelemetry(),
+    t_s: now(),
+    unix: Date.now() / 1000
+  });
+  const timer = setInterval(sample, 1000);
+  const stop = () => clearInterval(timer);
+  setTimeout(stop, 30 * 60 * 1000);
+  window.__xgwCapture = {
+    rows, marks, stop,
+    mark: name => marks.push({name, t_s: now(), unix: Date.now() / 1000})
+  };
+  sample();
+})();
+```
+
+Поставь Play самой через GUI. Открой «Статистику для сисадминов» и сверь её с рядом.
+В калибровке собери ≥60 с пригодного просмотра, паузу 10 с и перемотку минимум на минуту.
+Сверь высоту кадра, порядок величины буфера и изменение dropped/total. Проверь, что пауза
+исключена из сетевых остановок, а скачок позиции — из времени просмотра. Если ошибка видна
+и в обычном Chrome, запиши точный текст, время и результат контроля через VPN.
+
+Для основных этапов ставь метки в Console, например `__xgwCapture.mark("before-seek")`.
+Используй `play`, `before-seek`, `after-resume` и `end`. Поставь метку `play` перед
+запуском ролика, `before-seek` перед перемоткой и `after-resume` после возобновления.
+Снимай часы шлюза по Unix в моменты начала и конца фаз. Перед закрытием окна в Console выполни
+`__xgwCapture.stop(); copy(JSON.stringify({rows: __xgwCapture.rows, marks: __xgwCapture.marks}))`.
+Вставь результат в локальный `$LAB/$TRIAL/player.json` через редактор и сохрани.
+Построй сводку из уже имеющейся функции, без установки Playwright:
+
+```bash
+cd "$REPO"
+python3 - "$LAB/$TRIAL/player.json" "$VIDEO" <<'PY'
+import json
+import sys
+from pathlib import Path
+from docs.helpers.youtube_telemetry import dump, summarize, write_report
+
+source = Path(sys.argv[1])
+run = json.loads(source.read_text(encoding="utf-8"))
+rows = run["rows"]
+assert rows, "empty player recording"
+video = sys.argv[2]
+summary = summarize(rows, video, 720)
+marks = {mark["name"]: mark["t_s"] for mark in run["marks"]}
+for stage, start, end in (("initial", "play", "before-seek"),
+                          ("after_seek", "after-resume", "end")):
+    if start in marks and end in marks and marks[start] < marks[end]:
+        samples = [row for row in rows if marks[start] <= row["t_s"] <= marks[end]]
+        summary[stage] = summarize(samples, video, 720)
+summary.update(label=source.parent.name, outcome="recorded", video_id=sys.argv[2],
+               marks=run["marks"])
+dump(source.parent / "summary.json", summary)
+write_report(source.parent, summary, rows)
+print(json.dumps(summary, indent=2))
+PY
+```
+
+К сверке добавь свежий медиазапрос в Network по фильтру `domain:*.googlevideo.com videoplayback`
+и запиши его тип (GET/POST), статус, протокол и время. CDN IP нужен локально для сопоставления
+с WAN. Перед сменой режима закрой только тестовое окно и дождись записи NetLog. Если нужно
+пересмотреть запросы, сохрани приватный HAR из Network. В итоговой сводке укажи источник
+медиабайтов: DevTools/NetLog либо счётчик Xray. В этой схеме CSV содержит показатели плеера.
+Пустая колонка `media_encoded_bytes` ожидаема, сопоставь её сетевой эквивалент по времени
+из NetLog или снимков счётчиков до и после каждой фазы. Экспорт целиком оставь на стенде.
+[Snippets](https://developer.chrome.com/docs/devtools/javascript/snippets/),
+[Console copy](https://developer.chrome.com/docs/devtools/console/utilities/#copy),
+[Network](https://developer.chrome.com/docs/devtools/network/reference/),
+[NetLog](https://www.chromium.org/for-testers/providing-network-details/).
+
+### Standalone на уже установленном T04
+
+Проверь XGW в off/off, живой исходный VPN, пустую очередь и неактивные worker. Найди
+`PACKAGE`, `CFG`, `PANEL` и `PY` как в [T04](NEXT_STEP.md). Для исходной установки из
+отчёта `BACKUP=/var/lib/xgw/handoff/desync-t04-ad81542b57b3dd765ed9c115b356c9dd306aae2b`.
+Если после отчёта проводилась другая установка, используй её проверенный каталог.
+Сверь установленные файлы с манифестом тех 12 файлов, которые оставили на машине.
+Проверь `applier.py` по опубликованному хотфиксу. Старый каталог используй как источник
+проверенного `restore.sh`. Сними свежую копию текущего panel и хэши перед любыми изменениями.
+
+```bash
+git show 1e27384:src/xgw/apply/applier.py | sha256sum
+sudo sha256sum "$PACKAGE/apply/applier.py"
+RESTORE_DIR=$(sudo mktemp -d /var/lib/xgw/handoff/youtube-telemetry.XXXXXXXX)
+sudo cp --preserve=mode,ownership "$PANEL" "$RESTORE_DIR/panel.before"
+sudo install -m 0700 "$BACKUP/restore.sh" "$RESTORE_DIR/restore.sh"
+sudo sha256sum "$CFG" "$PANEL" > "$LAB/config-before.sha256"
+sudo touch "$RESTORE_DIR/network-test-started"
+ROLLBACK_UNIT="xgw-youtube-telemetry-$(date +%s)"
+sudo systemd-run --unit="$ROLLBACK_UNIT" --on-active=40m /bin/bash \
+  "$RESTORE_DIR/restore.sh" "$PY" unused "$RESTORE_DIR" "$PANEL" accept
+sudo systemctl is-active "$ROLLBACK_UNIT.timer"
+```
+
+Режим `accept` в проверенном restore-скрипте возвращает сохранённый panel и выполняет
+`xgw apply --now`. Аргумент `unused` занимает место установщика, который нужен только для
+отката файлов. Если установленная база отличается, сначала сверь различия и состояние.
+Выполни [set_standalone](NEXT_STEP.md#активация-standalone) с `hostfakesplit_md5` и теми же
+доменами. Дождись активного gate и очереди, сверь applied Xray и VPN-мосты.
+
+Запусти `open_trial standalone-hostfakesplit-md5-r1`. Запиши 15 минут просмотра и ещё 5
+после перемотки по тому же сценарию. Отдельно
+зафиксируй доступ к звуку. Сопоставь свежие запросы медиапотока, его WAN-выход, дельту
+`xgw-zapret2.downlink` и очередь с метками фаз. Проверь остаток времени таймера перед
+дополнительной проверкой и при необходимости перезаряди его.
+
+По завершении выполни ту же команду восстановления непосредственно через `sudo /bin/bash`
+с теми же аргументами. Сверь `sha256sum -c`, режим off/off, VPN-выход, очередь и offload,
+после чего останови именно `$ROLLBACK_UNIT.timer`. Если тест прервался, запиши фактическое
+состояние после срабатывания таймера.
+
+Приёмка прибора требует ряда с калибровкой и замера 15+5 в обычном браузере, согласованного
+с изображением и независимыми наблюдениями маршрута. Запиши пригодные секунды по каждой
+фазе, разрывы, stall, буфер, dropped/total и качество. При неполном ряде опубликуй частичные
+данные и конкретный блокер с пометкой `COLLECTOR_INCOMPLETE`.
+
+## Что измеряет сборщик Playwright
 
 `docs/helpers/youtube_telemetry.py` и соседний JS дают три ряда наблюдений:
 
@@ -43,102 +199,14 @@ Mystery Text и sCPN не используются как публичный API
 подписанные query, POST body, заголовки и общий HAR не записываются. В отчёт GitHub достаточно
 таблицы агрегатов и коротких обезличенных фрагментов. Полные конфиги/pcap не публикуй.
 
-## Подготовка и запуск исполнителем
+## Дополнительная диагностика в Playwright
 
-Обнови чистый checkout из `origin/integration/zapret2-batch1`, закрепи полный SHA и прочитай
-свежий отчёт. Для сетевых изменений используй порядок установки/возврата из NEXT_STEP.
-Для самого сборщика достаточно двух helper-файлов из одной ревизии.
+При разборе ошибки можно повторить короткий запуск Playwright по исходной инструкции.
+Запиши версию Playwright и браузера, условия прогона, время ошибки и покрытие измерений.
+Для длительного замера используй сценарий обычного Chrome выше.
+[Инструкция запуска Playwright](https://github.com/1521572-lang/xgw/blob/4ab4a745ddf492a4f4940d4f83794ad4b5ecd0cd/docs/handoff/YOUTUBE-TELEMETRY.md#подготовка-и-запуск-исполнителем).
 
-В терминале **пользователя графической сессии**, без root:
-
-```bash
-set -euo pipefail
-umask 077
-REPO=$(git rev-parse --show-toplevel)
-CODE=$(git rev-parse HEAD)
-LAB=$(mktemp -d "$HOME/xgw-youtube-telemetry.XXXXXXXX")
-python3 -m venv "$LAB/venv"
-"$LAB/venv/bin/python" -m pip install playwright
-"$LAB/venv/bin/python" -m pip freeze > "$LAB/dependencies.txt"
-```
-
-По умолчанию используется установленный Google Chrome (`--channel chrome`). Если его нет,
-установи отдельный Chromium средствами `"$LAB/venv/bin/python" -m playwright install chromium`
-и укажи `--channel chromium` во **всех сравниваемых** опытах. Если для системных зависимостей
-нужен доступ, запроси его. Не обходи ошибки sandbox флагом no-sandbox. Изменение браузера
-или кодека — изменение условий, которое надо отразить в отчёте.
-
-Выбери тот же длинный публичный ролик, который использовался в успешном опыте. Укажи его
-11-символьный ID и отключи автопереход к следующему ролику. Воспроизведение/качество выставляет
-сама модель через GUI; collector намеренно не вызывает video.play каждую секунду и не
-снимает паузу, иначе проверка паузы и реальных зависаний была бы искажена.
-
-```bash
-VIDEO=aqz-KE-bpKQ  # пример публичного видео; замени на закреплённый ролик опыта
-"$LAB/venv/bin/python" "$REPO/docs/helpers/youtube_telemetry.py" \
-  --video "$VIDEO" --label calibration-vpn --seconds 180 --height 720 \
-  --disable-quic --out "$LAB/calibration-vpn"
-```
-
-Запусти эту команду через неблокирующую сессию терминала/инструмент фонового запуска, чтобы
-сама могла управлять открывшимся окном и получать прогресс. Не проси владельца нажать Play.
-Открой overlay правой кнопкой на видео, выбери 720p, запусти видео. Consent, рекламу, вход
-или антибот-страницу обработай через обычный интерфейс; если воспроизведение недоступно,
-зафиксируй точную причину через vision. Не считай отсутствие ролика отказом самой тактики.
-
-`--status-file /ФАКТИЧЕСКИЙ/run/status.json` добавляй только при доступе на чтение. Найди путь
-из установленной конфигурации XGW. Не меняй права всего каталога и не запускай браузер root.
-Без этого флага сборщик работает, а сведения о шлюзе сохраняются отдельно средствами T04.
-0 exit code означает завершение сбора, **не PASS видео или zapret2**; 2 означает неполный сбор.
-
-## Сначала проверить достоверность прибора (один короткий проход)
-
-На рабочем VPN-пути:
-
-1. Сверь видимые разрешение и порядок величины буфера с samples.jsonl. `video.buffered` и
-   внутренний буфер YouTube могут немного различаться; запиши расхождение, не подгоняй числа.
-2. После 30–40 секунд поставь паузу на 10 секунд; возобнови; перемотай вперёд минимум на
-   минуту. Убедись, что пауза не стала сетевым stall, а скачок позиции — минутой просмотра.
-3. Сверь изменение кадров с overlay. Переключи 480p → 720p и проверь фактическую смену
-   videoHeight. При рекламе её интервалы исключаются из playback; сеть всей вкладки может
-   содержать рекламные байты, поэтому весь объём нельзя приписывать основному ролику.
-4. В DevTools Network/vision сравни несколько media-запросов и факт POST/h2 с network.jsonl.
-   Есть ли прирост encoded_bytes до loadingFinished у длинного запроса? Если CDP не видит
-   SABR или endpoint изменился, это **COLLECTOR_INCOMPLETE**, а не нулевая скорость сети.
-5. Закрой тестовое окно раньше срока отдельным коротким запуском. Должны остаться частичные
-   samples и summary с outcome browser_closed/browser_error, без выдуманного PASS.
-
-Прибор не перехватывает/подменяет запросы и не отключает cache; новый запуск создаёт чистый
-изолированный профиль. Число encoded_bytes — браузерный объём кодированных передач, не
-Ethernet/TCP bytes с ретрансляциями. Данные из memory/disk cache могут иметь data_bytes > 0,
-encoded_bytes = 0. При ранней остановке активные запросы остаются незавершёнными, это нормально.
-
-## Основной опыт T04 и сравнение тактик
-
-Сначала доведи T04 до подтверждённого standalone с hostfakesplit_md5. Запусти сбор на 1500
-секунд, чтобы поместились подготовка, **15 минут фактического видео и ещё 5 после перемотки**:
-
-```bash
-"$LAB/venv/bin/python" "$REPO/docs/helpers/youtube_telemetry.py" \
-  --video "$VIDEO" --label standalone-hostfakesplit-md5-r1 --seconds 1500 \
-  --height 720 --disable-quic --out "$LAB/standalone-hostfakesplit-md5-r1"
-```
-
-Сама выбери 720p или 1080p и измени --height соответственно; смотри actual videoHeight,
-а не только выбранный пункт качества. Проверь движущееся изображение и звук в начале,
-после перемотки, при подозрении на зависание и в конце. Mute=false не доказывает слышимый звук.
-
-Одновременно сними доказательства из NEXT_STEP: свежий поток, Xray outbound xgw-zapret2,
-NFQUEUE→worker, gate и выход WAN, отсутствие VPN-outbound/мостов. Сопоставь CDN IP и время
-с network.jsonl. При прозрачном прокси remoteIPAddress браузера не доказывает фактический
-внешний маршрут. Приглушённый поток с буфером 118 секунд может играть почти две минуты
-после потери сети; пройденные currentTime секунды без новых медиабайтов не доказывают обход.
-
-В аварийной фазе T04 запускай отдельный опыт с отдельным label; не смешивай его со сравнением
-производительности. Сохрани тайминг SIGKILL и новой попытки загрузки. Уже накопленный буфер
-и незавершённый старый TCP-сеанс отдельно от доступности новых соединений.
-
-После принятия маршрутов при сравнении H05/H10:
+## Последующее сравнение тактик H05/H10
 
 - Контроль VPN подтверждает, что ролик/браузер вообще работоспособны.
 - Контроль «direct без обработки» допустим только при уже подготовленном изолированном
@@ -163,9 +231,9 @@ stalled HTMLMediaElement — задержка получения данных, �
 
 ## Отчёт и публикация без дополнительного подтверждения
 
-При совмещении включи результаты в `docs/reports/YYYY-MM-DD_desync-t04.md`; для отдельной
-приёмки прибора — `docs/reports/YYYY-MM-DD_youtube-telemetry.md`. Укажи полный SHA collector,
-версию Playwright/браузера, контрольные сверки, фактические измерения и ограничения.
+Создай `docs/reports/YYYY-MM-DD_youtube-telemetry.md`. Включи в него дополнительные проверки
+T04, если они выполнены. Укажи ревизионные SHA ТЗ и установленного кода, версию браузера,
+условия каждого прогона, контрольные сверки, фактические измерения и ограничения.
 Исходный режим шлюза восстанови по T04, частичный результат и блокер также публикуй.
 Не используй формулировку «владелец запустил»: все действия выполняет сама модель.
 
