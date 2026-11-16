@@ -13,6 +13,9 @@ from pathlib import Path
 from .experiment import digest, private_path
 
 COMMIT = "2401b7a13837139b0265632464ba563dddbf80d8"
+LIVE_STRATEGY = "flowseal_alt9"
+LIVE_PROFILE = "general (ALT9)"
+LIVE_ROOT = Path("/opt/xgw/flowseal") / COMMIT
 CATALOG_HASHES = {
     "flowseal-youtube-source.json":
         "3ffe3cf7950c4dfb697ded500fca4df00e7abe7b614ef4512eef832885152eac",
@@ -21,6 +24,7 @@ CATALOG_HASHES = {
 }
 YOUTUBE = ("youtube.com,googlevideo.com,youtubei.googleapis.com,"
            "youtube-nocookie.com,ytimg.com,ggpht.com")
+YOUTUBE_DOMAINS = tuple(f"domain:{name}" for name in YOUTUBE.split(","))
 USER_LISTS = {"list-general-user.txt", "list-exclude-user.txt", "ipset-exclude-user.txt"}
 POSITIVE = ("--hostlist=", "--hostlist-domains=", "--ipset=")
 PLACEHOLDER = "%LISTS%"
@@ -62,6 +66,13 @@ def _verified_asset(root: Path, name: str, metadata: dict) -> bytes:
     return data
 
 
+def valid_live_scope(mode: str, domains: list[str]) -> bool:
+    return mode == "off" or (
+        mode == "standalone"
+        and set(YOUTUBE_DOMAINS[:2]) <= set(domains) <= set(YOUTUBE_DOMAINS)
+    )
+
+
 def _profile_plan(profile: dict, scope: str, assets_dir: Path) -> tuple[list, list, dict, list]:
     blocks, included, sources = [], [], {}
     excluded = [entry for entry in profile["profiles"] if entry["status"] != "INCLUDED"]
@@ -88,6 +99,37 @@ def _profile_plan(profile: dict, scope: str, assets_dir: Path) -> tuple[list, li
         blocks.append(arguments)
         included.append(entry | {"worker_profile": len(blocks)})
     return blocks, included, sources, excluded
+
+
+def _arguments(blocks: list[list[str]]) -> list[str]:
+    arguments = []
+    for block in blocks:
+        if arguments:
+            arguments.append("--new")
+        arguments.extend(block)
+    return arguments
+
+
+def live_arguments() -> list[str]:
+    """Compile the approved YouTube adaptation from immutable local input."""
+    from .preflight import trusted_file
+
+    for name in CATALOG_HASHES:
+        path = LIVE_ROOT / name
+        if trusted_file(path) != path:
+            raise ValueError("flowseal_catalog_path")
+    source, translation = load_catalog(LIVE_ROOT)
+    assets_dir = LIVE_ROOT / "alt9" / "assets"
+    blocks, _, sources, _ = _profile_plan(
+        translation["configurations"][LIVE_PROFILE], "youtube", assets_dir,
+    )
+    empty = {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+    for name, upstream in sources.items():
+        path = assets_dir / name
+        if trusted_file(path) != path:
+            raise ValueError("flowseal_asset_path")
+        _verified_asset(assets_dir, name, source["files"][upstream] if upstream else empty)
+    return _arguments(blocks)
 
 
 def prepare(catalog: tuple[dict, dict], root: Path, output: Path, name: str, scope: str) -> dict:
@@ -117,8 +159,7 @@ def prepare(catalog: tuple[dict, dict], root: Path, output: Path, name: str, sco
         "assets": {name: {"source": path, "sha256": hashlib.sha256(
             verified[path] if path else b"").hexdigest()} for name, path in sources.items()},
         "profiles": included, "excluded_profiles": excluded, "notes": profile["notes"],
-        "arguments": [arg for i, block in enumerate(blocks) for arg in
-                      (["--new"] if i else []) + block],
+        "arguments": _arguments(blocks),
     }
     with tempfile.TemporaryDirectory(prefix=".flowseal-", dir=output.parent) as staging:
         dest = Path(staging) / "import"

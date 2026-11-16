@@ -1,7 +1,8 @@
-# T10 — проверяемый импорт Flowseal
+# T10 — Flowseal ALT9 на живом YouTube
 
-**Текущее задание** — [приёмка импорта Flowseal на ThinkCentre](T10-FLOWSEAL-IMPORT.md).
-Собери снимки для двух областей действия и проверь их штатным nfqws2 в изолированной сети.
+**Текущее задание** — [сравнение Flowseal ALT9 и multisplit на ThinkCentre](T10-FLOWSEAL-LIVE.md).
+[Приёмка импорта](../reports/2026-11-17_desync-t10-flowseal-import.md) дала 44/44 снимка и
+9/9 целых ответов с ожидаемыми ветками. Проверь ALT9 в Standalone на реальном YouTube.
 Исполнитель сама запускает команды, использует GUI/vision и публикует отчёт.
 
 [Пересчёт T09](../reports/2026-11-17_desync-t09-cdn-replay.md) дал 12/12 pass.

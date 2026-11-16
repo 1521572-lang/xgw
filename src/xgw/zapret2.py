@@ -15,7 +15,7 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
-from .desync import h05, preflight, worker
+from .desync import flowseal, h05, preflight, worker
 from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES
 from .net import cmd
 
@@ -82,6 +82,8 @@ def validate(cfg: Config) -> list[str]:
     strategies = TRACED if z.mode == "compare" else SELECTED_PROFILES
     if z.strategy not in strategies:
         problems.append("strategy: неизвестная или неподдерживаемая в выбранном режиме")
+    if z.strategy == flowseal.LIVE_STRATEGY and not flowseal.valid_live_scope(z.mode, z.domains):
+        problems.append("Flowseal ALT9 требует Standalone и домены YouTube")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
         problems.append("queue_num или probe_port вне допустимого диапазона")
     if z.probe_port in (cfg.capture.tproxy_port, cfg.xray.metrics_port, cfg.xray.socks_port,
@@ -298,6 +300,10 @@ def arguments(cfg: Config) -> list[str]:
     args = [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
             f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
+    if z.strategy == flowseal.LIVE_STRATEGY:
+        if z.mode != "standalone" or not flowseal.valid_live_scope(z.mode, z.domains):
+            raise ValueError("flowseal_standalone_scope_required")
+        return [*args, *flowseal.live_arguments()]
     if z.strategy in ("fake_static_md5", "fake_clone_md5"):
         source = "static" if z.strategy == "fake_static_md5" else "clone"
         return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",

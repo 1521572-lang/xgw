@@ -14,13 +14,15 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
+from .flowseal import LIVE_STRATEGY, valid_live_scope
+
 VERSION = 1
 MODES = ("off", "standalone", "selective", "compare")
 T09_PROFILES = ("fake_md5_split", "fake_seq_split")
 SELECTED_PROFILES = (
     "multisplit", "multidisorder", "fake_md5", "fake_seq", "fake_ts",
     "fakedsplit_md5", "hostfakesplit_md5", "seqovl", "fake_static_md5", "fake_clone_md5",
-    *T09_PROFILES,
+    *T09_PROFILES, LIVE_STRATEGY,
 )
 ENGINE_PROFILES = (
     "seqovl", "hostfakesplit", "disorder-badseq", "hostfakesplit-md5", "fakedsplit-md5",
@@ -183,6 +185,11 @@ Known selected strategies may remain dormant in off mode without substitution.
     flat = flatten(policy)
     if flat.get("observe_reply_packets") and not flat.get("observe_synack"):
         raise PolicyError("desync: observe_reply_packets requires observe_synack")
+    if flat["strategy"] == LIVE_STRATEGY:
+        if target == "freepool":
+            raise PolicyError("desync: the T10 Flowseal profile cannot be represented by freepool")
+        if not valid_live_scope(flat["mode"], flat["domains"]):
+            raise PolicyError("desync: Flowseal ALT9 requires Standalone and YouTube domains")
     if target == "gui-light":
         if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: compare tracing supports multisplit and multidisorder")

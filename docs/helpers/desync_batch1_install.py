@@ -32,6 +32,7 @@ T06 = ("desync/preflight.py", "nfqws2.py", "zapret2.py", "watch/zapret2_control.
 H05 = ("desync/h05.py", "desync/schema.py", "nfqws2.py", "zapret2.py")
 T08_EVENTS = ("daemon.py", "desync/worker.py", "nfqws2.py", "zapret2.py")
 T09_TOURNAMENT = ("desync/schema.py", "zapret2.py")
+T10_FLOWSEAL = ("desync/schema.py", "desync/flowseal.py", "desync/experiment.py", "zapret2.py")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
@@ -42,6 +43,7 @@ T06_TIMER = "xgw-desync-t06-rollback.timer"
 H05_TIMER = "xgw-desync-h05-rollback.timer"
 T08_EVENTS_TIMER = "xgw-desync-t08-events-rollback.timer"
 T09_TOURNAMENT_TIMER = "xgw-desync-t09-tournament-rollback.timer"
+T10_FLOWSEAL_TIMER = "xgw-desync-t10-flowseal-rollback.timer"
 
 
 def require(ok, message):
@@ -190,6 +192,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if args.flowseal_t10:
+        return T10_FLOWSEAL, T10_FLOWSEAL_TIMER
     if args.tournament_t09:
         return T09_TOURNAMENT, T09_TOURNAMENT_TIMER
     if args.worker_events:
@@ -228,6 +232,7 @@ def main():
     stage.add_argument("--h05-profiles", action="store_true")
     stage.add_argument("--worker-events", action="store_true")
     stage.add_argument("--tournament-t09", action="store_true")
+    stage.add_argument("--flowseal-t10", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

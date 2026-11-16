@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from xgw.desync import flowseal
+from xgw import zapret2
+from xgw.config import Config
+from xgw.desync import flowseal, preflight, schema
 
 CATALOG = Path(__file__).resolve().parents[1] / "docs" / "helpers"
 
@@ -85,3 +87,45 @@ def test_catalog_does_not_trust_options_from_imported_input(tmp_path):
     path.write_text(json.dumps(doc), encoding="utf-8")
     with pytest.raises(ValueError, match="catalog_digest"):
         flowseal.load_catalog(tmp_path)
+
+
+def test_live_uses_verified_assets_and_not_a_stored_command(tmp_path, monkeypatch):
+    catalog = flowseal.load_catalog(CATALOG)
+    source, translation = catalog
+    profile = translation["configurations"][flowseal.LIVE_PROFILE]
+    assets = tmp_path / "alt9" / "assets"
+    assets.mkdir(parents=True)
+    blocks, _, refs, _ = flowseal._profile_plan(profile, "youtube", assets)
+    files = {}
+    for name, path in refs.items():
+        data = path.encode() if path else b""
+        (assets / name).write_bytes(data)
+        if path:
+            files[path] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    (assets.parent / "plan.json").write_text('{"arguments":["--qnum=42"]}', encoding="utf-8")
+
+    monkeypatch.setattr(flowseal, "LIVE_ROOT", tmp_path)
+    monkeypatch.setattr(preflight, "trusted_file", lambda path: path)
+    pinned = (source | {"files": files}, translation)
+    monkeypatch.setattr(flowseal, "load_catalog", lambda _path: pinned)
+    cfg = Config()
+    cfg.zapret2.mode = "standalone"
+    cfg.zapret2.strategy = flowseal.LIVE_STRATEGY
+    args = zapret2.arguments(cfg)
+    assert args[1] == f"--qnum={cfg.zapret2.queue_num}"
+    assert args[5:] == flowseal._arguments(blocks) and "--qnum=42" not in args
+    (assets / "list-exclude-user.txt").write_bytes(b"youtube.com")
+    with pytest.raises(ValueError, match="source_digest"):
+        zapret2.arguments(cfg)
+
+
+def test_alt9_policy_rejects_selective_extra_domains_and_old_runtime():
+    base = {"strategy": flowseal.LIVE_STRATEGY}
+    assert schema.project(schema.migrate(base))["mode"] == "off"
+    with pytest.raises(schema.PolicyError, match="Flowseal"):
+        schema.project(schema.migrate(base), target="freepool")
+    incompatible = ({"mode": "selective"},
+                    {"mode": "standalone", "domains": ["domain:example.com"]})
+    for changes in incompatible:
+        with pytest.raises(schema.PolicyError, match="requires Standalone"):
+            schema.project(schema.migrate(base | changes))
