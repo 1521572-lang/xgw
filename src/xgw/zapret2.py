@@ -330,11 +330,12 @@ class Runtime:
             Capture.ignore_rules_until = time.monotonic() + Capture.RULES_QUIET
 
     def alive(self, queue: int) -> bool:
-        state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        if state != "active":
+        lease = self.lease
+        if lease is None or self.slot.lease is not lease or lease.queue != queue:
             return False
-        return (self.lease is not None and self.slot.lease is self.lease
-                and self.lease.queue == queue and worker.verify_owner(self.runner, UNIT, queue))
+        state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
+        return self.slot.observe_owner(
+            lease, state == "active" and worker.verify_owner(self.runner, UNIT, queue))
 
     @staticmethod
     def occupied(queue: int) -> bool:
@@ -353,7 +354,8 @@ class Runtime:
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX",
         ]
         worker.require_stopped(self.runner, worker.ENGINE_UNIT)
-        self.lease = self.slot.reserve(UNIT, cfg.zapret2.queue_num)
+        self.lease = self.slot.reserve(UNIT, cfg.zapret2.queue_num,
+                                       policy_key=worker.policy_revision(cfg.zapret2))
         self.evidence = None
         # Даже при таймауте запуска systemd мог уже создать unit.
         self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,

@@ -43,6 +43,9 @@ def observation(raw: bytes, metadata: object) -> dict:
 
     rows = shadow.parse_samples(raw)
     signals = shadow.evaluate(rows, video)
+    if any(sample.get("has_video") is True and sample.get("video_id") == video
+           and sample.get("playback_rate") != 1 for sample in rows):
+        raise ValueError("playback_rate_mismatch")
     if not all(number(rows[i].get("unix")) for i in (0, -1)):
         raise ValueError("missing_trial_clock")
     started, finished = rows[0]["unix"], rows[-1]["unix"]
@@ -53,17 +56,21 @@ def observation(raw: bytes, metadata: object) -> dict:
     if sum(coverage.get(phase, 0) for phase in ("missing", "gap", "no_continuous_player")) > 5:
         raise ValueError("missing_trial_coverage")
     playback = summarize(rows, video, TARGET_HEIGHT)
+    eligible = playback["eligible_seconds"]
     if signals["signals"]:
         outcome = "playback_failed"
-    elif playback["eligible_seconds"] >= MIN_PLAYBACK:
-        outcome = ("pass" if playback["target_height_ratio"] >= 0.95
-                   and playback["estimated_playing_seconds"] >= playback["eligible_seconds"] * 0.98
-                   and playback["estimated_stall_seconds"] < 1
-                   else "playback_failed")
-    else:
+    elif eligible < MIN_PLAYBACK:
         raise ValueError("insufficient_playback")
+    elif playback["target_height_ratio"] < 0.95:
+        outcome = "playback_failed"
+    elif playback["content_progress_seconds"] < eligible * 0.98:
+        # Without a confirmed starvation interval, slow progress alone is ambiguous.
+        raise ValueError("unconfirmed_playback")
+    else:
+        outcome = "pass"
 
-    row = {**experiment.context_keys(host, metadata, metadata["client_sha256"]),
+    row = {"measurement_version": cache.MEASUREMENT_VERSION,
+           **experiment.context_keys(host, metadata, metadata["client_sha256"]),
            "recording_id": hashlib.sha256(raw).hexdigest(),
            "candidate": metadata["candidate"], "round": metadata["round"],
            "started": started, "finished": finished, "outcome": outcome}

@@ -307,16 +307,20 @@ class Runtime:
         return worker.occupied(queue, cls.QUEUE_STATE)
 
     def alive(self, queue: int) -> bool:
+        lease = self.lease
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        return state == "active" and self._owns_queue(queue)
+        return self._owns_queue(lease, queue, active=state == "active")
 
-    def _owns_queue(self, queue: int) -> bool:
-        return (self.lease is not None and self.slot.lease is self.lease
-                and self.lease.queue == queue and self.occupied(queue)
-                and worker.verify_owner(self.runner, UNIT, queue))
+    def _owns_queue(self, lease: worker.Lease | None, queue: int, *, active: bool = True) -> bool:
+        if lease is None or self.slot.lease is not lease or lease.queue != queue:
+            return False
+        verified = (active and self.occupied(queue)
+                    and worker.verify_owner(self.runner, UNIT, queue))
+        return self.slot.observe_owner(lease, verified)
 
     def wait_ready(self, queue: int, cancel: threading.Event | None = None) -> bool:
         """Type=exec подтверждает execve, очередь nfqws2 привязывает позже."""
+        lease = self.lease
         deadline = time.monotonic() + READY_TIMEOUT
         while cancel is None or not cancel.is_set():
             left = deadline - time.monotonic()
@@ -326,7 +330,7 @@ class Runtime:
                                 timeout=min(1.0, left)).strip()
             if cancel is not None and cancel.is_set():
                 return False
-            if state == "active" and self._owns_queue(queue):
+            if state == "active" and self._owns_queue(lease, queue):
                 return cancel is None or not cancel.is_set()
             if state not in ("active", "activating"):
                 return False
@@ -346,7 +350,8 @@ class Runtime:
             raise ValueError("queue_busy")
         args = preflight.check(list(key[0]), self.runner)
         worker.require_stopped(self.runner, worker.SELECTED_UNIT)
-        self.lease = self.slot.reserve(UNIT, cfg.zapret2.engine_queue)
+        self.lease = self.slot.reserve(UNIT, cfg.zapret2.engine_queue,
+                                       policy_key=worker.policy_revision(cfg.zapret2))
         if cfg.zapret2.engine_offload and profile == "disorder-badseq":
             self.offload.disable(cfg.network.wan_if.strip())
         properties = [

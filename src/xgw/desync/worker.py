@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+import time
+import uuid
+from collections import deque
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ..net import cmd
+from . import schema
 
 QUEUE_STATE = Path("/proc/net/netfilter/nfnetlink_queue")
 NETLINK_STATE = Path("/proc/net/netlink")
@@ -14,6 +18,7 @@ PROC = Path("/proc")
 ENGINE_UNIT = "xgw-nfqws2.service"
 SELECTED_UNIT = "xgw-zapret2.service"
 STOPPED = {"inactive", "failed", "unknown"}
+EVENT_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -28,19 +33,57 @@ class WorkerSlot:
         self.lease: Lease | None = None
         self._generation = 0
         self._lock = threading.Lock()
+        self._epoch = uuid.uuid4().hex
+        self._seq = 0
+        self._verified = False
+        self._policy_key: str | None = None
+        self._events: deque[dict] = deque(maxlen=EVENT_LIMIT)
 
-    def reserve(self, unit: str, queue: int) -> Lease:
+    def reserve(self, unit: str, queue: int, *, policy_key: str | None = None) -> Lease:
         with self._lock:
             if self.lease is not None:
                 raise ValueError("worker_handoff_pending")
             self._generation += 1
             self.lease = Lease(self._generation, unit, queue)
+            self._verified = False
+            self._policy_key = policy_key
+            self._event("reserved", self.lease)
             return self.lease
+
+    def observe_owner(self, lease: Lease, verified: bool) -> bool:
+        with self._lock:
+            if self.lease is not lease:
+                return False
+            if self._verified != verified:
+                self._verified = verified
+                self._event("owner_verified" if verified else "owner_unverified", lease)
+            return verified
 
     def release(self, lease: Lease | None) -> None:
         with self._lock:
-            if self.lease is lease:
+            if lease is not None and self.lease is lease:
+                self._event("released", lease)
                 self.lease = None
+
+    def _event(self, phase: str, lease: Lease) -> None:
+        self._seq += 1
+        self._events.append({"seq": self._seq, "at": time.time(), "phase": phase,
+                             "policy_key": self._policy_key, **asdict(lease)})
+
+    def snapshot(self) -> tuple[Lease | None, dict]:
+        with self._lock:
+            return self.lease, {
+                "version": 1, "epoch": self._epoch, "last_seq": self._seq,
+                "discarded": self._seq - len(self._events),
+                "events": [dict(event) for event in self._events],
+            }
+
+
+def policy_revision(settings) -> str | None:
+    try:
+        return schema.fingerprint(schema.migrate(vars(settings)))
+    except schema.PolicyError:
+        return None
 
 
 def occupied(queue: int, path: Path = QUEUE_STATE) -> bool:

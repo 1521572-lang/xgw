@@ -7,7 +7,7 @@ import pytest
 from xgw import nfqws2, zapret2
 from xgw.config import Config
 from xgw.desync import preflight as worker_preflight
-from xgw.desync import worker
+from xgw.desync import schema, worker
 from xgw.net.cmd import CommandError
 
 
@@ -107,6 +107,49 @@ def test_active_peer_unit_is_not_taken_over_after_daemon_restart(monkeypatch):
     runtime.stop()
     assert all(argv[0] != "systemd-run" and "stop" not in argv for argv in calls)
     assert runtime.slot.lease is None
+
+
+@pytest.mark.parametrize("module", [zapret2, nfqws2])
+def test_clients_record_only_owner_transitions_for_their_lease(monkeypatch, module):
+    slot = worker.WorkerSlot()
+    runner = Mock(return_value="active")
+    runtime = module.Runtime(runner, slot=slot)
+    cfg = Config()
+    key = schema.fingerprint(schema.migrate(vars(cfg.zapret2)))
+    assert worker.policy_revision(cfg.zapret2) == key
+    lease = slot.reserve(module.UNIT, 201, policy_key=key)
+    runtime.lease = lease
+    monkeypatch.setattr(runtime, "occupied", lambda queue: True)
+    verify = Mock(side_effect=[False, True, True, False])
+    monkeypatch.setattr(worker, "verify_owner", verify)
+
+    assert [runtime.alive(201) for _ in range(4)] == [False, True, True, False]
+    slot.release(lease)
+    newer = slot.reserve(module.UNIT, 201)
+    assert not slot.observe_owner(lease, True)
+    assert not runtime.alive(201)
+    assert slot.snapshot()[0] is newer
+    _, history = slot.snapshot()
+    assert [event["phase"] for event in history["events"]] == [
+        "reserved", "owner_verified", "owner_unverified", "released", "reserved"]
+    assert {event["policy_key"] for event in history["events"][:-1]} == {key}
+    assert [event["generation"] for event in history["events"]] == [1, 1, 1, 1, 2]
+
+
+def test_worker_history_is_capped_and_restart_gets_a_new_epoch():
+    slot = worker.WorkerSlot()
+    for _ in range(worker.EVENT_LIMIT):
+        lease = slot.reserve(zapret2.UNIT, 201)
+        slot.release(lease)
+    lease, history = slot.snapshot()
+    assert lease is None
+    assert len(history["events"]) == history["discarded"] == worker.EVENT_LIMIT
+    assert history["events"][0]["seq"] == history["discarded"] + 1
+    assert history["events"][-1]["seq"] == history["last_seq"]
+    history["events"][-1]["phase"] = "modified"
+    assert slot.snapshot()[1]["events"][-1]["phase"] == "released"
+    _, restarted = worker.WorkerSlot().snapshot()
+    assert restarted["epoch"] != history["epoch"] and restarted["events"] == []
 
 
 @pytest.mark.parametrize(("failing_flag", "expected"), [

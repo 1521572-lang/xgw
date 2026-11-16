@@ -11,6 +11,7 @@ T0 = 1_700_000_000
 
 def trial(index, ip="a", prefix="b", host="c", outcome="pass", **overrides):
     return {
+        "measurement_version": cache.MEASUREMENT_VERSION,
         "context_id": ip * 64, "prefix_context_id": prefix * 64, "host_context_id": host * 64,
         "recording_id": f"{index:064x}", "started": T0 + index * 200,
         "finished": T0 + index * 200 + 130, "outcome": outcome, "candidate": "static",
@@ -65,7 +66,15 @@ def test_rejects_a_duplicate_recording():
         cache.validate_rows([trial(1), trial(2, recording_id=trial(1)["recording_id"])])
 
 
-def test_chrome_import_keeps_real_context_private_and_observes_quality_fall():
+def test_history_excludes_pre_fix_measurements():
+    old = trial(1)
+    del old["measurement_version"]
+    fresh = trial(2)
+    assert cache.validate_rows([old, fresh]) == [fresh]
+
+
+@pytest.fixture
+def capture():
     metadata = {
         "hostname": "r1.googlevideo.com", "address": "8.8.8.8",
         "network": "wan-a", "protocol": "h2", "client": "chrome",
@@ -80,6 +89,11 @@ def test_chrome_import_keeps_real_context_private_and_observes_quality_fall():
         "error_code": None, "height": 720,
         **dict.fromkeys(("paused", "seeking", "hidden", "ended", "ad"), False),
     } for t in range(131)]
+    return rows, metadata
+
+
+def test_chrome_import_keeps_real_context_private_and_observes_quality_fall(capture):
+    rows, metadata = capture
     raw = json.dumps({"rows": rows}).encode()
     row = observation(raw, metadata)
     assert row["outcome"] == "pass"
@@ -96,3 +110,23 @@ def test_chrome_import_keeps_real_context_private_and_observes_quality_fall():
         "outcome"] == "playback_failed"
     with pytest.raises(ValueError, match="evidence_required"):
         observation(raw, metadata | {"verified_direct_single_endpoint": False})
+
+
+def test_sample_jitter_and_a_short_ready_state_change_do_not_reduce_net_playback(capture):
+    rows, metadata = capture
+    for row in rows:
+        if row["t_s"] % 2:
+            row["position"] -= 0.2
+    rows[51].update(position=rows[50]["position"], ready_state=2)
+    rows[52]["position"] = 51.5
+    assert observation(json.dumps({"rows": rows}).encode(), metadata)["outcome"] == "pass"
+
+
+def test_confirmed_starvation_fails_and_coarse_sampling_remains_unavailable(capture):
+    rows, metadata = capture
+    for row in rows[90:]:
+        row.update(position=89, buffer_seconds=0, ready_state=2)
+    assert observation(json.dumps({"rows": rows}).encode(), metadata)[
+        "outcome"] == "playback_failed"
+    with pytest.raises(ValueError, match="missing_trial_coverage"):
+        observation(json.dumps({"rows": rows[::15]}).encode(), metadata)

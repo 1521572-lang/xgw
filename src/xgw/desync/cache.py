@@ -14,7 +14,8 @@ from pathlib import Path
 from ..paths import LockTimeout, atomic_write_json, file_lock
 from .experiment import LABEL, SHA256, TTL, digest, private_path
 
-SCHEMA = 1
+SCHEMA = 2
+MEASUREMENT_VERSION = 2
 LIMIT = 512
 MAX_BYTES = 512 * 1024
 SCOPES = ("context_id", "prefix_context_id", "host_context_id")
@@ -32,19 +33,27 @@ def validate_rows(rows: object) -> list[dict]:
     if not isinstance(rows, list) or len(rows) > LIMIT:
         raise ValueError("history_size")
     seen = set()
+    current = []
     for row in rows:
-        if (not isinstance(row, dict) or set(row) != FIELDS
+        if not isinstance(row, dict) or set(row) not in (FIELDS, FIELDS | {"measurement_version"}):
+            raise ValueError("invalid_observation")
+        version = row.get("measurement_version", 1)
+        if (type(version) is not int or version not in (1, MEASUREMENT_VERSION)
+                or ("measurement_version" in row and version != MEASUREMENT_VERSION)
                 or any(not isinstance(row[k], str) or not SHA256.fullmatch(row[k])
                        for k in HASH_FIELDS)
                 or any(not isinstance(row[k], str) or not LABEL.fullmatch(row[k])
                        for k in LABEL_FIELDS)
                 or not _timestamp(row["started"]) or not _timestamp(row["finished"])
                 or not 0 < row["finished"] - row["started"] <= 3600
-                or row["outcome"] not in ("pass", "playback_failed")
-                or row["recording_id"] in seen):
+                or row["outcome"] not in ("pass", "playback_failed")):
             raise ValueError("invalid_observation")
-        seen.add(row["recording_id"])
-    return rows
+        if version == MEASUREMENT_VERSION:
+            if row["recording_id"] in seen:
+                raise ValueError("invalid_observation")
+            seen.add(row["recording_id"])
+            current.append(row)
+    return current
 
 
 def _read(path: Path) -> bytes:
