@@ -111,4 +111,4 @@
   отчёте только агрегаты (без хэш-идентификаторов по ТЗ раунда).
 - Блокеры: старый tcpdump (PID 1935908, ~24 ч, ~14.9 ГБ, диск 88 %) — требуется
   администратор хоста; H02 без изменений.
-- Publication commit: добавить после push.
+- Publication commit: `0f0cef0b21281ac2120b95fbac245b9c0b97c6fa` (81a3f05 → 0f0cef0, remote verified byte-identical to local HEAD).
