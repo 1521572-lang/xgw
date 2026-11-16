@@ -15,7 +15,7 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
-from .desync import preflight, worker
+from .desync import h05, preflight, worker
 from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES
 from .net import cmd
 
@@ -296,6 +296,10 @@ def arguments(cfg: Config) -> list[str]:
     args = [z.binary, f"--qnum={z.queue_num}", f"--fwmark={FAKE_BIT:#x}",
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
             f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
+    if z.strategy in ("fake_static_md5", "fake_clone_md5"):
+        source = "static" if z.strategy == "fake_static_md5" else "clone"
+        return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",
+                *h05.arguments(source)]
     calls = STRATEGIES[z.strategy]
     if z.mode == "compare":
         args += ["--debug=0", "--lua-init=" + LUA]

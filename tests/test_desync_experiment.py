@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from docs.helpers import flowseal_lab, nfq_lab
-from xgw import nfqws2
+from xgw import nfqws2, zapret2
 from xgw.config import Config
 from xgw.desync import experiment as exp
 from xgw.desync.schema import ENGINE_PROFILES
@@ -112,18 +112,32 @@ def installation():
                               dict.fromkeys(nfqws2.BLOBS))
 
 
-def test_matched_fake_pair_preserves_geometry_and_clone_is_optional():
+def test_matched_fake_pair_is_shared_by_both_workers():
     assert set(ENGINE_PROFILES) == set(nfqws2.PROFILES)
-    for name in ("fake-static-md5", "fake-clone-md5"):
-        args = nfqws2.arguments(Config(), installation(), name)
-        stages = [a.removeprefix("--lua-desync=") for a in args[5:args.index("--new")]
-                  if a.startswith("--lua-desync=")]
-        assert stages == list(nfq_lab.STRATEGIES[name])
-        assert "optional" in stages[-2] and "tcp_md5" in stages[-2]
-        assert stages[-1] == "multisplit:pos=1,midsld"
+    cfg = Config()
+    candidates = []
+    for source in ("static", "clone"):
+        args = nfqws2.arguments(cfg, installation(), f"fake-{source}-md5")
+        cfg.zapret2.mode = "standalone"
+        cfg.zapret2.strategy = f"fake_{source}_md5"
+        selected = zapret2.arguments(cfg)
+        stages = args[args.index("--new") - 3:args.index("--new")]
+        assert selected[-3:] == stages
+        assert stages[-2] == f"--lua-desync=xgw_h05_fake:source={source}:tcp_md5"
+        assert stages[-1] == "--lua-desync=multisplit:pos=1,midsld"
+        candidates.append(stages[0])
+    assert candidates[0] == candidates[1]
     assert not any("altorder=" in arg for arg in
                    nfqws2.arguments(Config(), installation(), "hostfakesplit"))
     assert Config().zapret2.engine_profile == "seqovl"
+
+
+@pytest.mark.parametrize("stage", ["--dry-run", "--intercept=0"])
+def test_legacy_nfq_lab_passes_explicit_preflight_stage(stage):
+    settings = dict(binary="/opt/xgw/nfqws2", strategy="fake-clone-md5",
+                    reassembly="standard", debug=False, domains=["youtube.com"])
+    incoming = nfqws2.arguments(Config(), installation())[1:]
+    assert nfq_lab.build_arguments([*incoming, stage], settings)[-1] == stage
 
 
 @pytest.mark.parametrize("name", sorted(flowseal_lab.CHAINS))
@@ -133,9 +147,9 @@ def test_all_flowseal_chains_have_disjoint_http_tls_and_correct_youtube_scope(na
                     reassembly="standard", debug=False, scope="youtube")
     source = copy.deepcopy(flowseal_lab.CHAINS[name])
     incoming = nfqws2.arguments(Config(), installation())[1:]
-    for mode in ([], ["--intercept=0"]):
+    for mode in ([], ["--intercept=0"], ["--dry-run"]):
         args = flowseal_lab.build_arguments(incoming + mode, settings)
-        assert (args[-1] == "--intercept=0") == bool(mode)
+        assert (args[-1:] == mode) if mode else args[-1] not in ("--intercept=0", "--dry-run")
         assert args[1:5] == incoming[:4]
         for block in flowseal_lab._split_new(args):
             if "--payload=tls_client_hello" in block:

@@ -18,7 +18,7 @@ VERSION = 1
 MODES = ("off", "standalone", "selective", "compare")
 SELECTED_PROFILES = (
     "multisplit", "multidisorder", "fake_md5", "fake_seq", "fake_ts",
-    "fakedsplit_md5", "hostfakesplit_md5", "seqovl",
+    "fakedsplit_md5", "hostfakesplit_md5", "seqovl", "fake_static_md5", "fake_clone_md5",
 )
 ENGINE_PROFILES = (
     "seqovl", "hostfakesplit", "disorder-badseq", "hostfakesplit-md5", "fakedsplit-md5",
@@ -185,6 +185,8 @@ Known selected strategies may remain dormant in off mode without substitution.
         if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: compare tracing supports multisplit and multidisorder")
     else:
+        if flat["strategy"] in ("fake_static_md5", "fake_clone_md5"):
+            raise PolicyError("desync: the H05 selected profiles cannot be represented by freepool")
         if any(flat.get(name) for name in OBSERVATION_FIELDS):
             raise PolicyError("desync: SYN/ACK observation cannot be represented by freepool")
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):

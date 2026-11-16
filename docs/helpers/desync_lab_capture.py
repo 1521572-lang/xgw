@@ -8,10 +8,8 @@ import struct
 import time
 from pathlib import Path
 
-SNAPLEN = 128
 MAX_PACKETS = 16000
 ETH_P_ALL = 3
-_PCAP_HEADER = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, SNAPLEN, 1)
 
 
 def matches(frame: memoryview, addresses: set[bytes]) -> bool:
@@ -28,15 +26,15 @@ def matches(frame: memoryview, addresses: set[bytes]) -> bool:
     return {src, dst} == addresses and 443 in (sport, dport)
 
 
-def capture(interface: str, out: Path, stop: Path, ready: Path) -> int:
+def capture(interface: str, out: Path, stop: Path, ready: Path, *, snaplen: int) -> int:
     addresses = {socket.inet_aton("192.0.2.1"), socket.inet_aton("203.0.113.2")}
-    frame = memoryview(bytearray(SNAPLEN))
+    frame = memoryview(bytearray(snaplen))
     with (socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)) as sock,
           selectors.DefaultSelector() as poll, out.open("xb") as stream):
         sock.bind((interface, ETH_P_ALL))
         sock.setblocking(False)
         poll.register(sock, selectors.EVENT_READ)
-        stream.write(_PCAP_HEADER)
+        stream.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, snaplen, 1))
         stream.flush()
         ready.touch(exist_ok=False)
         count = 0
@@ -48,7 +46,7 @@ def capture(interface: str, out: Path, stop: Path, ready: Path) -> int:
                 size, *_ = sock.recvmsg_into([frame], 0, socket.MSG_TRUNC)
             except BlockingIOError:
                 continue
-            sample = frame[:min(size, SNAPLEN)]
+            sample = frame[:min(size, snaplen)]
             if matches(sample, addresses):
                 now = time.time_ns() // 1000
                 stream.write(struct.pack("<IIII", now // 1000000, now % 1000000, len(sample), size))
@@ -64,5 +62,6 @@ if __name__ == "__main__":
     parser.add_argument("interface", choices=("right0", "left0"))
     for label in ("out", "stop", "ready"):
         parser.add_argument(label, type=Path)
+    parser.add_argument("--snaplen", type=int, choices=(128, 2048), default=128)
     args = parser.parse_args()
-    raise SystemExit(capture(args.interface, args.out, args.stop, args.ready))
+    raise SystemExit(capture(args.interface, args.out, args.stop, args.ready, snaplen=args.snaplen))

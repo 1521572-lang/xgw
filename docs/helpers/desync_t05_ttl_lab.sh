@@ -2,10 +2,12 @@
 # Real kernel, four isolated namespaces, fixed documentation addresses and no default routes.
 set -euo pipefail
 umask 077
-if (( EUID != 0 )) || (( $# != 1 )); then
-  echo "usage: sudo bash docs/helpers/desync_t05_ttl_lab.sh NEW_OUTPUT_DIRECTORY" >&2
+if (( EUID != 0 )) || (( $# < 1 || $# > 2 )); then
+  echo "usage: sudo bash docs/helpers/desync_t05_ttl_lab.sh NEW_OUTPUT_DIRECTORY [ttl|h05]" >&2
   exit 2
 fi
+MODE=${2:-ttl}
+case "$MODE" in ttl|h05) ;; *) exit 2 ;; esac
 HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=$(realpath "$HERE/../../src")
 BIN=/opt/xgw/zapret2/1.0.7/nfqws2
@@ -24,6 +26,9 @@ SERVER=
 CAPS=()
 CAP_STOP=
 LUA_STAGE=
+ACCT_KEY=net.netfilter.nf_conntrack_acct
+ACCT_BEFORE=$(sysctl -n "$ACCT_KEY")
+case "$ACCT_BEFORE" in 0|1) ;; *) exit 2 ;; esac
 
 run() {
   local namespace=$1
@@ -68,6 +73,9 @@ cleanup() {
   if [[ -n "$LUA_STAGE" ]]; then
     rm -f -- "$LUA_STAGE/desync_t05_ttl.lua"
     rmdir -- "$LUA_STAGE" || result=1
+  fi
+  if [[ $(sysctl -n "$ACCT_KEY") != "$ACCT_BEFORE" ]]; then
+    sysctl -qw "$ACCT_KEY=$ACCT_BEFORE" || result=1
   fi
   exit "$result"
 }
@@ -146,11 +154,12 @@ PY
 }
 
 start_worker() {
-  local label=$1 strategy=$2
+  local label=$1
+  shift
   local args=("$BIN" --qnum=201 --fwmark=0x40000000 --debug=0
               "--lua-init=@$LUA/zapret-lib.lua" "--lua-init=@$LUA/zapret-antidpi.lua"
               "--lua-init=@$LUA_STAGE/desync_t05_ttl.lua" --filter-tcp=443 --filter-l7=tls
-              --payload=tls_client_hello --lua-desync=xgw_ttl_observe "--lua-desync=$strategy")
+              --payload=tls_client_hello --lua-desync=xgw_ttl_observe "$@")
   run "$C" timeout 10 "${args[@]}" --intercept=0 >"$OUT/$label.preflight.log" 2>&1
   ip netns exec "$C" "${args[@]}" >"$OUT/$label.worker.log" 2>&1 &
   WORKER=$!
@@ -165,13 +174,14 @@ start_worker() {
 }
 
 trial() {
-  local label=$1
+  local label=$1 snaplen=128
+  if [[ "$MODE" == "h05" ]]; then snaplen=2048; fi
   CAP_STOP="$OUT/$label.capture.stop"
   ip netns exec "$C" python3 "$HERE/desync_lab_capture.py" right0 "$OUT/$label.client.pcap" \
-    "$CAP_STOP" "$OUT/$label.client.ready" >"$OUT/$label.client.log" 2>&1 &
+    "$CAP_STOP" "$OUT/$label.client.ready" --snaplen "$snaplen" >"$OUT/$label.client.log" 2>&1 &
   CAPS+=("$!")
   ip netns exec "$S" python3 "$HERE/desync_lab_capture.py" left0 "$OUT/$label.server.pcap" \
-    "$CAP_STOP" "$OUT/$label.server.ready" >"$OUT/$label.server.log" 2>&1 &
+    "$CAP_STOP" "$OUT/$label.server.ready" --snaplen "$snaplen" >"$OUT/$label.server.log" 2>&1 &
   CAPS+=("$!")
   for (( i=0; i<50; i++ )); do
     if [[ -f "$OUT/$label.client.ready" && -f "$OUT/$label.server.ready" ]]; then break; fi
@@ -190,16 +200,35 @@ trial() {
 
 MD5=hostfakesplit:midhost=midsld:tcp_md5
 AUTO="$MD5:ip_autottl=-1,1-20"
+if [[ "$MODE" == "h05" ]]; then
+  for source in static clone; do
+    label="h05_$source"
+    PYTHONPATH="$SOURCE" python3 - "$source" >"$OUT/$label.args" <<'PY'
+import sys
+from xgw.desync.h05 import arguments
+
+sys.stdout.buffer.write(("\0".join(arguments(sys.argv[1])) + "\0").encode("utf-8"))
+PY
+    mapfile -d '' -t profile <"$OUT/$label.args"
+    rules on
+    start_worker "$label" "${profile[@]}"
+    trial "$label"
+    stop_worker
+    grep -E "XGW_H05 n=[0-9]+ source=$source result=sent" "$OUT/$label.worker.log"
+  done
+  printf 'Private lab artifacts: %s\n' "$OUT"
+  exit
+fi
 rules on
-start_worker md5 "$MD5"
+start_worker md5 "--lua-desync=$MD5"
 trial md5
 stop_worker
 rules off
-start_worker cold_off "$AUTO"
+start_worker cold_off "--lua-desync=$AUTO"
 trial cold_off
 stop_worker
 rules on
-start_worker cold_on "$AUTO"
+start_worker cold_on "--lua-desync=$AUTO"
 trial cold_on
 # Same worker and IP, but no incoming queue and a different real SYN/ACK TTL.
 run "$C" nft flush chain inet xgw_guard zapret2_reply
@@ -209,12 +238,12 @@ run "$S" sysctl -qw net.ipv4.ip_default_ttl=60
 trial warm_off
 stop_worker
 rules on
-start_worker changed_ttl "$AUTO"
+start_worker changed_ttl "--lua-desync=$AUTO"
 trial changed_ttl
 stop_worker
-run "$C" sysctl -qw net.netfilter.nf_conntrack_acct=1
+run "$C" sysctl -qw "$ACCT_KEY=1"
 rules on 8
-start_worker early_reply8 "$MD5"
+start_worker early_reply8 "--lua-desync=$MD5"
 trial early_reply8
 stop_worker
 grep -h 'XGW_T05_TTL' "$OUT/"*.worker.log || true

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .desync import preflight, worker
+from .desync import h05, preflight, worker
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -144,14 +144,7 @@ def arguments(cfg: Config, installation: Installation, profile: str | None = Non
     elif profile == "fakedsplit-md5":
         args.append("--lua-desync=fakedsplit:pos=midsld:tcp_md5")
     elif profile in ("fake-static-md5", "fake-clone-md5"):
-        # Matched experimental pair: only the fake's source changes. Opt-in, not
-        # part of the automatic VPN ladder. Clone failure must not send a real CH.
-        blob = "fake_default_tls"
-        if profile == "fake-clone-md5":
-            args.append("--lua-desync=tls_client_hello_clone:blob=xgw_tls_clone")
-            blob = "xgw_tls_clone"
-        args += [f"--lua-desync=fake:blob={blob}:optional:tls_mod=rnd,rndsni:tcp_md5",
-                 "--lua-desync=multisplit:pos=1,midsld"]
+        args += h05.arguments("static" if profile == "fake-static-md5" else "clone")
     elif profile == "hostfakesplit":
         args += [
             "--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:"

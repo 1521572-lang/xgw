@@ -29,6 +29,7 @@ VPN_CONTROL = ("zapret2.py", "watch/zapret2_control.py")
 T05 = ("config.py", "desync/schema.py", "net/nft.py", "zapret2.py")
 T05_REPLIES = (*T05, "net/capture.py")
 T06 = ("desync/preflight.py", "nfqws2.py", "zapret2.py", "watch/zapret2_control.py")
+H05 = ("desync/h05.py", "desync/schema.py", "nfqws2.py", "zapret2.py")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
@@ -36,6 +37,7 @@ VPN_CONTROL_TIMER = "xgw-desync-vpn-control-rollback.timer"
 T05_TIMER = "xgw-desync-t05-rollback.timer"
 T05_REPLIES_TIMER = "xgw-desync-t05-replies-rollback.timer"
 T06_TIMER = "xgw-desync-t06-rollback.timer"
+H05_TIMER = "xgw-desync-h05-rollback.timer"
 
 
 def require(ok, message):
@@ -184,6 +186,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if args.h05_profiles:
+        return H05, H05_TIMER
     if args.preflight_t06:
         return T06, T06_TIMER
     if args.nft_t05_replies:
@@ -213,6 +217,7 @@ def main():
     stage.add_argument("--nft-t05", action="store_true")
     stage.add_argument("--nft-t05-replies", action="store_true")
     stage.add_argument("--preflight-t06", action="store_true")
+    stage.add_argument("--h05-profiles", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

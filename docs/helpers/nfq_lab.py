@@ -110,7 +110,7 @@ def build_arguments(incoming: list[str], settings: dict) -> list[str]:
             raise ValueError("runtime_lua")
     if not incoming[4].startswith("--filter-tcp="):
         raise ValueError("runtime_filter")
-    preflight = incoming[-1] == "--intercept=0"
+    preflight = incoming[-1] if incoming[-1] in ("--dry-run", "--intercept=0") else ""
     body = incoming[4:-1] if preflight else incoming[4:]
     allowed = ("--filter-tcp=", "--filter-udp=", "--filter-l7=", "--payload=",
                "--lua-desync=", "--blob=")
@@ -127,7 +127,7 @@ def build_arguments(incoming: list[str], settings: dict) -> list[str]:
              "--payload=tls_client_hello"]
     args += ["--lua-desync=" + call for call in STRATEGIES[settings["strategy"]]]
     if preflight:
-        args.append("--intercept=0")
+        args.append(preflight)
     return args
 
 
