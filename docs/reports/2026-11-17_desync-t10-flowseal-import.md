@@ -142,4 +142,4 @@ ns (output-цепочка: сначала пропуск пакетов с fake-
 - Блокеры: старый WAN-захват (PID 1935908) — без изменений, требуется администратор
   хоста (диск 88 %). Запуск YouTube через импортированные стратегии — отдельный этап
   после подтверждения импорта и ветвления (этот раунд).
-- Publication commit: добавить после push.
+- Publication commit: `33a6a3d564ce1b563ef70544fb2ad8f6c7072fb5` (2da5e1e → 33a6a3d, remote verified byte-identical to local HEAD).
