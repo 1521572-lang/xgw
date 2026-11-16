@@ -265,6 +265,8 @@ def translate_profile(num, raw):
         args.append(f"--filter-tcp={o['filter-tcp']}")
     if o.get("filter-udp"):
         args.append(f"--filter-udp={o['filter-udp']}")
+    if o.get("filter-l3"):
+        args.append(f"--filter-l3={o['filter-l3']}")
     if o.get("filter-l7"):
         args.append(f"--filter-l7={o['filter-l7']}")
     for h in o.get_list("hostlist"):
@@ -352,7 +354,7 @@ for conf in m["configurations"]:
             blob_decl_args[name] = f"--blob={name}:{val}"
         else:
             # DATA-файлы устанавливаются с именем, равным имени blob
-            blob_decl_args[name] = f"--blob={name}:%LISTS%{name}"
+            blob_decl_args[name] = f"--blob={name}:@%LISTS%{name}"
     decorated = []
     declared = set()
     for b in blocks:
