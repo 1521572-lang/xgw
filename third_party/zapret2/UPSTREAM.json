@@ -5,6 +5,7 @@
   "files": {
     "docs/LICENSE.txt": "d089978dd77d53cb6aa5dff51cfdbff617e52dd44af1ac44a6df02c6644f17d5",
     "lua/zapret-antidpi.lua": "6d1fa9168e5de1682fef91fd174f68b58c50f6739ef00f42ca7db2b940b6246d",
+    "lua/zapret-auto.lua": "23a9b99a776d868d92f4cc0ee5110f5c1f12fe746620d9c0337022dbc2f52df0",
     "lua/zapret-lib.lua": "6bf528fef1f0fc3c65e189216fc8a06bb873f6e25d1c29d2bfa4695a09b73440",
     "nfq2/Makefile": "3700c0c91f185354a5ea137b319eb333e654d7181e48d45f03d71ee25bf7bbb7",
     "nfq2/andr/getifaddrs.c": "1d69be9311220e95a26848c8f1b95b50de137716649b5b4099d37d13178dd76f",

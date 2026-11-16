@@ -127,6 +127,7 @@ def test_matched_fake_pair_is_shared_by_both_workers():
         assert stages[-1] == "--lua-desync=multisplit:pos=1,midsld"
         candidates.append(stages[0])
     assert candidates[0] == candidates[1]
+    assert 'report(source, sent and "sent" or "send_failed", desync.replay)' in candidates[0]
     assert not any("altorder=" in arg for arg in
                    nfqws2.arguments(Config(), installation(), "hostfakesplit"))
     assert Config().zapret2.engine_profile == "seqovl"

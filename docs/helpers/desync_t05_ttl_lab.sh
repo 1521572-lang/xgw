@@ -3,11 +3,11 @@
 set -euo pipefail
 umask 077
 if (( EUID != 0 )) || (( $# < 1 || $# > 2 )); then
-  echo "usage: sudo bash docs/helpers/desync_t05_ttl_lab.sh NEW_OUTPUT_DIRECTORY [ttl|h05]" >&2
+  echo "usage: sudo bash docs/helpers/desync_t05_ttl_lab.sh NEW_OUTPUT_DIRECTORY [ttl|h05|h05-small-mtu]" >&2
   exit 2
 fi
 MODE=${2:-ttl}
-case "$MODE" in ttl|h05) ;; *) exit 2 ;; esac
+case "$MODE" in ttl|h05|h05-small-mtu) ;; *) exit 2 ;; esac
 HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=$(realpath "$HERE/../../src")
 BIN=/opt/xgw/zapret2/1.0.7/nfqws2
@@ -95,6 +95,10 @@ done
 link() {
   local left=$1 right=$2 prefix=$3
   ip -n "$left" link add right0 type veth peer name left0 netns "$right"
+  if [[ "$MODE" == "h05-small-mtu" ]]; then
+    ip -n "$left" link set right0 mtu 400
+    ip -n "$right" link set left0 mtu 400
+  fi
   ip -n "$left" addr add "$prefix.1/30" dev right0
   ip -n "$right" addr add "$prefix.2/30" dev left0
   ip -n "$left" link set right0 up
@@ -175,7 +179,7 @@ start_worker() {
 
 trial() {
   local label=$1 snaplen=128
-  if [[ "$MODE" == "h05" ]]; then snaplen=2048; fi
+  if [[ "$MODE" != "ttl" ]]; then snaplen=2048; fi
   CAP_STOP="$OUT/$label.capture.stop"
   ip netns exec "$C" python3 "$HERE/desync_lab_capture.py" right0 "$OUT/$label.client.pcap" \
     "$CAP_STOP" "$OUT/$label.client.ready" --snaplen "$snaplen" >"$OUT/$label.client.log" 2>&1 &
@@ -200,7 +204,7 @@ trial() {
 
 MD5=hostfakesplit:midhost=midsld:tcp_md5
 AUTO="$MD5:ip_autottl=-1,1-20"
-if [[ "$MODE" == "h05" ]]; then
+if [[ "$MODE" != "ttl" ]]; then
   for source in static clone; do
     label="h05_$source"
     PYTHONPATH="$SOURCE" python3 - "$source" >"$OUT/$label.args" <<'PY'

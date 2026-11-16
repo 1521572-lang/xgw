@@ -14,7 +14,8 @@ GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
 PORTABLE = False
 PORTABLE_TESTS = {"test_desync_schema.py", "test_zapret2_panel.py", "test_geodat.py",
                   "test_gui_server_data.py", "test_desync_experiment.py", "test_desync_worker.py",
-                  "test_desync_standalone.py", "test_youtube_telemetry.py", "test_zapret2.py"}
+                  "test_desync_standalone.py", "test_desync_shadow.py",
+                  "test_youtube_telemetry.py", "test_zapret2.py"}
 
 
 def pytest_addoption(parser):

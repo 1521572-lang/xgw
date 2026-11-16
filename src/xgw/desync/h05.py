@@ -28,7 +28,7 @@ function xgw_h05_fake(ctx, desync)
         error("xgw_h05_unknown_source", 0)
     end
     if not template then
-        report(source, "no_template", desync.reasm_data)
+        report(source, "no_template", desync.replay)
         return
     end
     -- Upstream fake() calls tls_mod only when reasm_data exists.
@@ -36,11 +36,12 @@ function xgw_h05_fake(ctx, desync)
     local modified = tls_mod_shim(desync, template, "rnd,rndsni", original)
     if type(modified) ~= "string" or #modified == 0 or
         modified == template or modified == original then
-        report(source, "no_modified_fake", desync.reasm_data)
+        report(source, "no_modified_fake", desync.replay)
         return
     end
     local sent = rawsend_payload_segmented(desync, modified)
-    report(source, sent and "sent" or "send_failed", desync.reasm_data)
+    -- nfqws2 also fills reasm_data for an ordinary packet. Only replay indicates reassembly.
+    report(source, sent and "sent" or "send_failed", desync.replay)
     -- Continue with the same multisplit on the untouched original.
 end
 """.strip()
