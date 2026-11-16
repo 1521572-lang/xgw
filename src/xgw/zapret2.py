@@ -52,6 +52,8 @@ STRATEGIES = {
     "multidisorder": ("multidisorder:pos=1,midsld",),
     "fake_md5": (_FAKE.format("tcp_md5"), "multidisorder:pos=1,midsld"),
     "fake_seq": (_FAKE.format("tcp_seq=-10000"), "multidisorder:pos=1,midsld"),
+    "fake_md5_split": (_FAKE.format("tcp_md5"), "multisplit:pos=1,midsld"),
+    "fake_seq_split": (_FAKE.format("tcp_seq=-10000"), "multisplit:pos=1,midsld"),
     "fake_ts": (_FAKE.format("tcp_ts=-600000"), "multisplit:pos=1,midsld"),
     "fakedsplit_md5": ("fakedsplit:pos=midsld:tcp_md5",),
     "hostfakesplit_md5": ("hostfakesplit:midhost=midsld:tcp_md5",),

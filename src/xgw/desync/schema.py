@@ -16,9 +16,11 @@ from urllib.parse import urlsplit
 
 VERSION = 1
 MODES = ("off", "standalone", "selective", "compare")
+T09_PROFILES = ("fake_md5_split", "fake_seq_split")
 SELECTED_PROFILES = (
     "multisplit", "multidisorder", "fake_md5", "fake_seq", "fake_ts",
     "fakedsplit_md5", "hostfakesplit_md5", "seqovl", "fake_static_md5", "fake_clone_md5",
+    *T09_PROFILES,
 )
 ENGINE_PROFILES = (
     "seqovl", "hostfakesplit", "disorder-badseq", "hostfakesplit-md5", "fakedsplit-md5",
@@ -187,6 +189,8 @@ Known selected strategies may remain dormant in off mode without substitution.
     else:
         if flat["strategy"] in ("fake_static_md5", "fake_clone_md5"):
             raise PolicyError("desync: the H05 selected profiles cannot be represented by freepool")
+        if flat["strategy"] in T09_PROFILES:
+            raise PolicyError("desync: the T09 selected profiles cannot be represented by freepool")
         if any(flat.get(name) for name in OBSERVATION_FIELDS):
             raise PolicyError("desync: SYN/ACK observation cannot be represented by freepool")
         if any(flat[name] != DEFAULTS[name] for name in ENGINE_FIELDS):
