@@ -126,6 +126,29 @@ def test_sample_jitter_and_a_short_ready_state_change_do_not_reduce_net_playback
     assert observation(json.dumps({"rows": rows}).encode(), metadata)["outcome"] == "pass"
 
 
+def test_tournament_import_uses_all_verified_endpoints_without_creating_cache_rows(capture):
+    rows, metadata = capture
+    raw = json.dumps({"rows": rows}).encode()
+    first = {key: metadata.pop(key) for key in ("hostname", "address", "protocol")}
+    del metadata["verified_direct_single_endpoint"]
+    second = first | {"address": "8.8.8.9"}
+    metadata.update(verified_direct_all_endpoints=True, endpoints=[first, second])
+    pair = observation(raw, metadata, for_tournament=True)
+    assert pair["outcome"] == "pass"
+    assert pair["endpoint_count"] == 2
+    assert "googlevideo" not in str(pair) and "8.8.8.9" not in str(pair)
+    assert observation(raw, metadata | {"endpoints": [second, first]}, for_tournament=True) == pair
+    single = observation(raw, metadata | {"endpoints": [first]}, for_tournament=True)
+    assert pair["context_id"] != single["context_id"]
+    assert pair["playback_context_id"] == single["playback_context_id"]
+    with pytest.raises(ValueError, match="invalid_observation"):
+        cache.validate_rows([pair])
+    with pytest.raises(ValueError, match="evidence_required"):
+        observation(raw, metadata | {"verified_direct_all_endpoints": False}, for_tournament=True)
+    with pytest.raises(ValueError, match="duplicate_media_endpoint"):
+        observation(raw, metadata | {"endpoints": [first, first]}, for_tournament=True)
+
+
 def test_confirmed_starvation_fails_and_coarse_sampling_remains_unavailable(capture):
     rows, metadata = capture
     for row in rows[90:]:

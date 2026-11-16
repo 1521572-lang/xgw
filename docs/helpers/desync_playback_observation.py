@@ -1,4 +1,4 @@
-"""Build a private shadow-cache observation from a verified real Chrome trial."""
+"""Build a private cache or tournament observation from a verified Chrome trial."""
 
 from __future__ import annotations
 
@@ -12,24 +12,42 @@ import sys
 from pathlib import Path
 
 from docs.helpers.youtube_telemetry import number, summarize
-from xgw.desync import cache, experiment, shadow
+from xgw.desync import cache, experiment, shadow, tournament
 
 MIN_PLAYBACK = 120
 TARGET_HEIGHT = 720
-METADATA = {"hostname", "address", "network", "protocol", "client", "client_sha256",
-            "policy_sha256", "candidate", "round", "video_id", "verified_direct_single_endpoint"}
+SHARED = {"network", "client", "client_sha256", "policy_sha256", "candidate", "round", "video_id"}
+ENDPOINT_FIELDS = {"hostname", "address", "protocol"}
+SINGLE_PROOF = "verified_direct_single_endpoint"
+TOURNAMENT_PROOF = "verified_direct_all_endpoints"
 
 
 class ObservationError(ValueError):
     """A reason safe to show without private input."""
 
 
-def observation(raw: bytes, metadata: object, *, diagnostics: dict | None = None) -> dict:
-    if (not isinstance(metadata, dict) or set(metadata) != METADATA
-            or metadata["verified_direct_single_endpoint"] is not True):
+def _endpoint(value: object) -> tuple[str, str, str]:
+    if (not isinstance(value, dict) or set(value) != ENDPOINT_FIELDS
+            or any(not isinstance(value[key], str) for key in ENDPOINT_FIELDS)):
+        raise ObservationError("invalid_media_endpoint")
+    host, address, protocol = value["hostname"].lower(), value["address"], value["protocol"]
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise ObservationError("invalid_media_endpoint") from None
+    if (not re.fullmatch(r"[a-z0-9.-]{1,253}\.googlevideo\.com", host)
+            or not ip.is_global or "%" in address or protocol not in ("h1", "h2", "h3")):
+        raise ObservationError("invalid_media_endpoint")
+    return host, str(ip), protocol
+
+
+def _context(metadata: object, for_tournament: bool) -> dict:
+    proof = TOURNAMENT_PROOF if for_tournament else SINGLE_PROOF
+    fields = {"endpoints"} if for_tournament else ENDPOINT_FIELDS
+    if (not isinstance(metadata, dict) or set(metadata) != SHARED | fields | {proof}
+            or metadata[proof] is not True):
         raise ObservationError("route_and_endpoint_evidence_required")
-    if any(not isinstance(metadata[k], str) for k in METADATA - {
-            "verified_direct_single_endpoint"}):
+    if any(not isinstance(metadata[k], str) for k in SHARED):
         raise ObservationError("invalid_metadata")
     for key in ("network", "client", "candidate", "round"):
         if not experiment.LABEL.fullmatch(metadata[key]):
@@ -37,14 +55,30 @@ def observation(raw: bytes, metadata: object, *, diagnostics: dict | None = None
     if any(not experiment.SHA256.fullmatch(metadata[key]) for key in (
             "client_sha256", "policy_sha256")):
         raise ObservationError("invalid_revision")
-    host = metadata["hostname"].lower()
-    address = ipaddress.ip_address(metadata["address"])
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", metadata["video_id"]):
+        raise ObservationError("invalid_video_id")
+
+    if not for_tournament:
+        host, _, _ = _endpoint({key: metadata[key] for key in ENDPOINT_FIELDS})
+        return experiment.context_keys(host, metadata, metadata["client_sha256"])
+
+    values = metadata["endpoints"]
+    if not isinstance(values, list) or not 1 <= len(values) <= tournament.MAX_ENDPOINTS:
+        raise ObservationError("invalid_endpoint_count")
+    endpoints = sorted({_endpoint(value) for value in values})
+    if len(endpoints) != len(values):
+        raise ObservationError("duplicate_media_endpoint")
+    shared = {k: metadata[k] for k in SHARED - {"candidate", "round"}}
+    protocols = sorted({entry[2] for entry in endpoints})
+    playback_context = experiment.digest(["t09-playback", shared, protocols])
+    return {"playback_context_id": playback_context, "endpoint_count": len(endpoints),
+            "context_id": experiment.digest([playback_context, endpoints])}
+
+
+def observation(raw: bytes, metadata: object, *, diagnostics: dict | None = None,
+                for_tournament: bool = False) -> dict:
+    context = _context(metadata, for_tournament)
     video = metadata["video_id"]
-    if (not re.fullmatch(r"[a-z0-9.-]{1,253}\.googlevideo\.com", host)
-            or not address.is_global or "%" in metadata["address"]
-            or metadata["protocol"] not in ("h1", "h2", "h3")
-            or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video)):
-        raise ObservationError("invalid_media_endpoint")
 
     rows = shadow.parse_samples(raw)
     signals = shadow.evaluate(rows, video)
@@ -84,14 +118,17 @@ def observation(raw: bytes, metadata: object, *, diagnostics: dict | None = None
         outcome, reason = "pass", "meets_playback_thresholds"
 
     row = {"measurement_version": cache.MEASUREMENT_VERSION,
-           **experiment.context_keys(host, metadata, metadata["client_sha256"]),
+           **context,
            "recording_id": hashlib.sha256(raw).hexdigest(),
            "candidate": metadata["candidate"], "round": metadata["round"],
            "started": started, "finished": finished, "outcome": outcome}
-    checked = cache.validate_rows([row])[0]
+    if for_tournament:
+        tournament.validate_observation(row)
+    else:
+        cache.validate_rows([row])
     if diagnostics is not None:
         diagnostics.update(outcome=outcome, reason=reason)
-    return checked
+    return row
 
 
 def main() -> int:
@@ -100,6 +137,8 @@ def main() -> int:
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--diagnostics", action="store_true",
                         help="report measurement and outcome reason on stderr")
+    parser.add_argument("--tournament", action="store_true",
+                        help="accept a verified CDN endpoint set for T09, outside shadow cache")
     args = parser.parse_args()
     details = {} if args.diagnostics else None
     exit_code = 0
@@ -113,7 +152,8 @@ def main() -> int:
             encoded = context.read(8193)
         if len(encoded) > 8192:
             raise ValueError("metadata_size")
-        row = observation(raw, json.loads(encoded), diagnostics=details)
+        row = observation(raw, json.loads(encoded), diagnostics=details,
+                          for_tournament=args.tournament)
         print(json.dumps(row, sort_keys=True))
     except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:
         print('{"state":"observation_unavailable"}')

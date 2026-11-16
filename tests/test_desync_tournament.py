@@ -82,3 +82,26 @@ def test_rejects_invalid_trial_order_duplicate_recording_and_overlap():
     rows[1]["observation"]["recording_id"] = rows[0]["observation"]["recording_id"]
     with pytest.raises(ValueError, match="invalid_observation"):
         tournament.validate_ledger(rows)
+
+
+def test_delegated_cdn_replay_is_only_descriptive_and_requires_matched_capture_conditions():
+    rows = results(("multisplit", "fake_md5"))
+    for row in rows:
+        obs = row["observation"]
+        del obs["prefix_context_id"], obs["host_context_id"]
+        obs.update(playback_context_id="e" * 64, endpoint_count=1)
+        if row["candidate"] == "multidisorder":
+            obs.update(context_id="d" * 64, endpoint_count=2)
+    report = tournament.summarize(tournament.validate_ledger(rows))
+    window = report["windows"]["t09-1"]
+    assert window["state"] == "mixed_context"
+    assert "pruned" not in window
+    assert window["mixed_endpoint_replay"]["missed_winners"] == ["fake_md5"]
+    assert report["repeatable_winners"] is None
+    rows[1]["observation"]["playback_context_id"] = "f" * 64
+    window = tournament.summarize(rows)["windows"]["t09-1"]
+    assert "mixed_endpoint_replay" not in window
+    rows[1]["observation"] = None
+    window = tournament.summarize(rows)["windows"]["t09-1"]
+    assert window["state"] == "incomplete"
+    assert window["missing"] == ["multidisorder"]

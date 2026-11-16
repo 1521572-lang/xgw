@@ -19,14 +19,28 @@ MEASUREMENT_VERSION = 2
 LIMIT = 512
 MAX_BYTES = 512 * 1024
 SCOPES = ("context_id", "prefix_context_id", "host_context_id")
-HASH_FIELDS = (*SCOPES, "recording_id")
 LABEL_FIELDS = ("candidate", "round")
-FIELDS = {*HASH_FIELDS, *LABEL_FIELDS, "started", "finished", "outcome"}
+MEASUREMENT_FIELDS = {"recording_id", *LABEL_FIELDS, "started", "finished", "outcome"}
+FIELDS = {*SCOPES, *MEASUREMENT_FIELDS}
 TMP_NAME = re.compile(r"\.playback-shadow\.json\.\d+\.\d+\.tmp")
 
 
 def _timestamp(value: object) -> bool:
     return type(value) in (int, float) and 0 < value < 1e11
+
+
+def validate_measurement(row: dict) -> int:
+    version = row.get("measurement_version", 1)
+    if (type(version) is not int or version not in (1, MEASUREMENT_VERSION)
+            or ("measurement_version" in row and version != MEASUREMENT_VERSION)
+            or not isinstance(row["recording_id"], str) or not SHA256.fullmatch(row["recording_id"])
+            or any(not isinstance(row[k], str) or not LABEL.fullmatch(row[k])
+                   for k in LABEL_FIELDS)
+            or not _timestamp(row["started"]) or not _timestamp(row["finished"])
+            or not 0 < row["finished"] - row["started"] <= 3600
+            or row["outcome"] not in ("pass", "playback_failed")):
+        raise ValueError("invalid_observation")
+    return version
 
 
 def validate_rows(rows: object) -> list[dict]:
@@ -37,18 +51,9 @@ def validate_rows(rows: object) -> list[dict]:
     for row in rows:
         if not isinstance(row, dict) or set(row) not in (FIELDS, FIELDS | {"measurement_version"}):
             raise ValueError("invalid_observation")
-        version = row.get("measurement_version", 1)
-        if (type(version) is not int or version not in (1, MEASUREMENT_VERSION)
-                or ("measurement_version" in row and version != MEASUREMENT_VERSION)
-                or any(not isinstance(row[k], str) or not SHA256.fullmatch(row[k])
-                       for k in HASH_FIELDS)
-                or any(not isinstance(row[k], str) or not LABEL.fullmatch(row[k])
-                       for k in LABEL_FIELDS)
-                or not _timestamp(row["started"]) or not _timestamp(row["finished"])
-                or not 0 < row["finished"] - row["started"] <= 3600
-                or row["outcome"] not in ("pass", "playback_failed")):
+        if any(not isinstance(row[k], str) or not SHA256.fullmatch(row[k]) for k in SCOPES):
             raise ValueError("invalid_observation")
-        if version == MEASUREMENT_VERSION:
+        if validate_measurement(row) == MEASUREMENT_VERSION:
             if row["recording_id"] in seen:
                 raise ValueError("invalid_observation")
             seen.add(row["recording_id"])

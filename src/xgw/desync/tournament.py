@@ -28,12 +28,28 @@ SLOTS = tuple((name, strategy)
               for name, sequence in zip(ROUNDS, (ORDER, reversed(ORDER)), strict=True)
               for strategy in sequence)
 FIELDS = {"round", "candidate", "elapsed_seconds", "observation"}
+MAX_ENDPOINTS = 16
+OBSERVATION_FIELDS = {*cache.MEASUREMENT_FIELDS, "measurement_version", "context_id",
+                      "playback_context_id", "endpoint_count"}
+
+
+def validate_observation(row: dict) -> None:
+    if set(row) != OBSERVATION_FIELDS:
+        if not cache.validate_rows([row]):
+            raise ValueError("obsolete_measurement")
+        return
+    cache.validate_measurement(row)
+    if (type(row["endpoint_count"]) is not int or not 1 <= row["endpoint_count"] <= MAX_ENDPOINTS
+            or any(not isinstance(row[key], str) or not experiment.SHA256.fullmatch(row[key])
+                   for key in ("context_id", "playback_context_id"))):
+        raise ValueError("invalid_observation")
 
 
 def validate_ledger(value: object) -> list[dict]:
     if not isinstance(value, list) or len(value) > len(SLOTS):
         raise ValueError("ledger_size")
     observations = []
+    recordings = set()
     for row, (round_id, candidate) in zip(value, SLOTS, strict=False):
         if (not isinstance(row, dict) or set(row) != FIELDS
                 or (row["round"], row["candidate"]) != (round_id, candidate)):
@@ -49,9 +65,12 @@ def validate_ledger(value: object) -> list[dict]:
                 or observation.get("round") != round_id
                 or observation.get("candidate") != candidate):
             raise ValueError("observation_mismatch")
+        validate_observation(observation)
+        recording = observation["recording_id"]
+        if recording in recordings:
+            raise ValueError("invalid_observation")
+        recordings.add(recording)
         observations.append(observation)
-    if len(cache.validate_rows(observations)) != len(observations):
-        raise ValueError("obsolete_measurement")
     for older, newer in pairwise(observations):
         if older["finished"] > newer["started"]:
             raise ValueError("overlapping_observations")
@@ -89,19 +108,33 @@ def _score(order: tuple, rows: dict, winners: set) -> dict:
 def _replay(rows: list[dict]) -> dict:
     by_candidate = {row["candidate"]: row for row in rows if row["observation"] is not None}
     contexts = {row["observation"]["context_id"] for row in by_candidate.values()}
-    if len(by_candidate) != len(ORDER) or len(contexts) != 1:
-        state = "mixed_context" if len(contexts) > 1 else "incomplete"
-        return {"state": state, "accepted": len(by_candidate),
-                "contexts": len(contexts), "missing": sorted(set(ORDER) - by_candidate.keys())}
     winners = {name for name, row in by_candidate.items()
                if row["observation"]["outcome"] == "pass"}
+    if len(by_candidate) != len(ORDER) or len(contexts) != 1:
+        state = "mixed_context" if len(contexts) > 1 else "incomplete"
+        result = {"state": state, "accepted": len(by_candidate), "contexts": len(contexts),
+                  "missing": sorted(set(ORDER) - by_candidate.keys()),
+                  "observed_passes": sorted(winners)}
+        # Mixed CDN windows can describe counterfactual selection over these recordings,
+        # but cannot attribute a difference between candidates to the strategy.
+        playback_contexts = {
+            row["observation"].get("playback_context_id") for row in by_candidate.values()
+        }
+        if len(by_candidate) == len(ORDER) and len(playback_contexts) == 1 and (
+                None not in playback_contexts):
+            result["mixed_endpoint_replay"] = _compare(by_candidate, winners)
+        return result
+    return {"state": "compared", "accepted": len(ORDER), **_compare(by_candidate, winners)}
+
+
+def _compare(by_candidate: dict, winners: set) -> dict:
     bases = ORDER[:2]
     promising = {PROFILES[name][0] for name in bases if name in winners}
     # If neither unmodified geometry passed, the policy falls back to the entire grid.
     keep = tuple(name for name in ORDER if name in bases or not promising
                  or PROFILES[name][0] in promising)
     full, pruned = _score(ORDER, by_candidate, winners), _score(keep, by_candidate, winners)
-    return {"state": "compared", "accepted": len(ORDER), "full": full, "pruned": pruned,
+    return {"full": full, "pruned": pruned,
             "estimated_seconds_saved": round(full["seconds"] - pruned["seconds"], 3),
             "missed_winners": sorted(winners.difference(keep))}
 
