@@ -106,8 +106,12 @@ def test_chrome_import_keeps_real_context_private_and_observes_quality_fall(capt
     assert row["host_context_id"] != other_family["host_context_id"]
     for sample in rows[80:]:
         sample["height"] = 480
-    assert observation(json.dumps({"rows": rows}).encode(), metadata)[
-        "outcome"] == "playback_failed"
+    diagnostics = {}
+    assert observation(json.dumps({"rows": rows}).encode(), metadata,
+                       diagnostics=diagnostics)["outcome"] == "playback_failed"
+    assert diagnostics["reason"] == "low_target_height_ratio"
+    assert 0.60 < diagnostics["target_height_ratio"] < 0.65
+    assert "googlevideo" not in str(diagnostics) and "8.8.8.8" not in str(diagnostics)
     with pytest.raises(ValueError, match="evidence_required"):
         observation(raw, metadata | {"verified_direct_single_endpoint": False})
 
