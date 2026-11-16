@@ -47,7 +47,7 @@ def _managed(name: Path, path: Path) -> bool:
 
 
 def _verify_managed_binary(path: Path, runner: cmd.Runner) -> None:
-    if path != MANAGED_ROOT / VERSION / "nfqws2":
+    if path != (MANAGED_ROOT / VERSION / "nfqws2").resolve():
         raise ValueError("bundle_mismatch")
     manifest = path.with_name("bundle.json")
     try:
@@ -91,7 +91,7 @@ def prepare(args: list[str], runner: cmd.Runner) -> list[str]:
         path = trusted_file(source)
         if prefix == "--lua-init=@" and _managed(source, path):
             expected = LUA_HASHES.get(source.name)
-            if (not expected or path != MANAGED_ROOT / VERSION / "lua" / source.name
+            if (not expected or path != (MANAGED_ROOT / VERSION / "lua" / source.name).resolve()
                     or _digest(path) != expected):
                 raise ValueError("bundle_mismatch")
         prepared.append(prefix + str(path))
