@@ -123,4 +123,5 @@
   **H02 открыт** — все четыре окна (A′/B′/S/s2) обслужены одним адресом CDN, перенос
   между IP по-прежнему без проверочной выборки; ABR-снижение качества после ~530 c —
   кандидат в будущие измерения.
-- Publication commit: добавить после push.
+- Publication commit: `6fd36cada15fd6d2643f787292f1f170564135b5` (bd63347 → 6fd36ca,
+  remote verified byte-identical to local HEAD).
