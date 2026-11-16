@@ -75,14 +75,19 @@ def contexts(spec: dict, client_hash: str) -> dict[str, str]:
     Keep the full hostname: cutting a fixed number of labels is not a public-
     suffix lookup and can accidentally merge unrelated services.
     """
+    return {**context_keys(urlsplit(spec["url"]).hostname, spec, client_hash),
+            "target_id": digest(spec["url"])}
+
+
+def context_keys(hostname: str, spec: dict, client_hash: str) -> dict[str, str]:
     address = ipaddress.ip_address(spec["address"])
     prefix = str(ipaddress.ip_network(f"{address}/{24 if address.version == 4 else 48}",
                                       strict=False))
-    shared = [urlsplit(spec["url"]).hostname, spec["protocol"], spec["network"],
+    shared = [hostname, spec["protocol"], spec["network"],
               spec["policy_sha256"], spec["client"], client_hash]
     return {"context_id": digest([*shared, str(address)]),
             "prefix_context_id": digest([*shared, prefix]),
-            "target_id": digest(spec["url"])}
+            "host_context_id": digest([*shared, address.version])}
 
 
 def curl_config(spec: dict, body: Path) -> str:

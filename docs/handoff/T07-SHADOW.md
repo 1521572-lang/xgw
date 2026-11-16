@@ -69,6 +69,7 @@ for name in ("lua/zapret-lib.lua", "lua/zapret-antidpi.lua"):
 (
   STAGE=$(sudo mktemp -d /run/xgw-t07-lua.XXXXXXXX)
   trap 'sudo rm -f -- "$STAGE/zapret-auto.lua"; sudo rmdir -- "$STAGE"' EXIT
+  sudo chmod 0755 "$STAGE"
   sudo install -m 0644 "$VENDOR/lua/zapret-auto.lua" "$STAGE/zapret-auto.lua"
   sudo sha256sum "$STAGE/zapret-auto.lua"
   LUA=("--lua-init=@$BUNDLE/lua/zapret-lib.lua"

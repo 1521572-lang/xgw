@@ -28,9 +28,13 @@ def load_samples(path: Path) -> list[dict]:
     """Read the ordinary Chrome export or the CDP collector's JSONL."""
     with path.open("rb") as stream:
         raw = stream.read(MAX_BYTES + 1)
+    return parse_samples(raw, jsonl=path.suffix == ".jsonl")
+
+
+def parse_samples(raw: bytes, *, jsonl: bool = False) -> list[dict]:
     if len(raw) > MAX_BYTES:
         raise ValueError("recording too large")
-    if path.suffix == ".jsonl":
+    if jsonl:
         lines = raw.splitlines()
         if len(lines) > MAX_SAMPLES:
             raise ValueError("too many samples")
