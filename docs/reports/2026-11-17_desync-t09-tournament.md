@@ -127,4 +127,5 @@
   изменений, требуется администратор хоста; (3) H02 остаётся открытым — основной адрес
   медиа один во всех валидных окнах, вторичные адреса зафиксированы как отдельные
   endpoint'ы в null-рядах.
-- Publication commit: добавить после push.
+- Publication commit: `e819d6b167135b725a1c3fa879bbf1c4560e4413` (96da366 → e819d6b,
+  remote verified byte-identical to local HEAD).
