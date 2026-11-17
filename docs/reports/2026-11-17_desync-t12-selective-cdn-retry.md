@@ -24,4 +24,4 @@
   до prepare). Установка: **NOT_RUN**; таймер: NOT_RUN; машина в исходном состоянии.
 - Финал: off/off, воркеры inactive, очередь пуста, VPN/panel 200, конфиги
   `89bf2a67…`/`33916cb5…`. Диск 45 ГБ свободно. Tcpdump отсутствует.
-- Publication commit: добавить после push.
+- Publication commit: `77cb8ad57008bf3059aa2d3e8a284fcc7d1c2ae6` (rebase поверх 56d6ade «Prioritize verified playback…», remote verified byte-identical to local HEAD).
