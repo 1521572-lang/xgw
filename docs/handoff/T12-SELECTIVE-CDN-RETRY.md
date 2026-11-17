@@ -1,10 +1,10 @@
-# T12 — сохранение настроек Selective и повтор TLS-пробы CDN
+# T12 — повторная приёмка очистки адресов и TLS-пробы CDN
 
-**Машина** — ThinkCentre, Ubuntu 24.04. Проверяемый код — `3d3e0f551a805c7f8ecfd63e276bdf19f1c005ef`.
-[Предыдущий отчёт](../reports/2026-11-17_desync-t12-selective-recheck.md) подтвердил
-успешную перепроверку с `/t/terms`, затем fallback при таймауте TLS до CDN и ещё один
-такой отказ после замены CDN-адреса. Отдельно воспроизведена ошибка сохранения старого
-списка доменов при выключенном режиме. Причина TLS-таймаутов пока неизвестна.
+**Машина** — ThinkCentre, Ubuntu 24.04. Проверяемый код — `a382971f162db53a8bd7435f124d591b6a5287fa`.
+Предыдущая проверка остановилась на pytest до установки `3d3e0f5`. На машине остался
+слой `601238e`. Исправлен backend команды сохранения. Сначала проверь удаление
+адресов при off и повторный ввод через панель. В том же проходе проверь включение
+Selective, повтор CDN и видео. [Отчёт об остановке](../reports/2026-11-17_desync-t12-selective-cdn-retry.md).
 
 Flash выполняет только техническую приёмку: сама запускает команды, работает с
 обычным Chrome и vision, восстанавливает шлюз и публикует отчёт. При отсутствии
@@ -18,8 +18,8 @@ Flash выполняет только техническую приёмку: с�
 в `off/off`. Проверь, что панель отвечает и отдельный контрольный сайт открывается
 через штатный VPN, запиши исходный VPN-выход локально. Открой отдельный Chrome с
 выключенным QUIC, как в [T12, §2–3](T12-SELECTIVE-ROUTE-EVIDENCE.md). Если слои не
-совпадают или VPN уже не работает, не устанавливай. Подготовь свежий CDN-адрес
-из DevTools этого Chrome непосредственно перед сохранением пары URL.
+совпадают или VPN уже не работает, не устанавливай. Свежий CDN-адрес возьми из
+DevTools непосредственно перед сетевой фазой в конце §2.
 
 ```bash
 set -euo pipefail
@@ -27,7 +27,7 @@ umask 077
 test -z "$(git status --porcelain)"
 REPO=$(git rev-parse --show-toplevel)
 git fetch origin integration/zapret2-batch1
-CODE=3d3e0f551a805c7f8ecfd63e276bdf19f1c005ef
+CODE=a382971f162db53a8bd7435f124d591b6a5287fa
 INFO=601238ef053447e1287be918864f8c839e1a3cf4
 MGMT=f3de0052a4a41a549980a3264d8084887bf4c9b4
 TLS=01379afe2445f49d8406295bfaeb03ed831470ec
@@ -48,7 +48,9 @@ systemctl show xgw-zapret2.service xgw-nfqws2.service -p ActiveState -p MainPID
 ```
 
 Для `pytest` разрешён ранее настроенный dev-venv. При падении теста или работающем
-воркере зафиксируй блокер и остановись до установки. Никаких правок в среде
+воркере зафиксируй блокер до установки и перейди к публикации отчёта в §4.
+Если терминал завершился по `set -e`, открой исходный checkout для публикации.
+Никаких правок в среде
 в обход установщика. Таймер действует 90 минут. Оставь последние 10 на возврат.
 
 ```bash
@@ -118,7 +120,9 @@ verify_manifest new
    ширине и 390 px. Кнопка «Заменить список на домены YouTube» появляется при включении
    HTTPS-опции. Убедись по Network, что кнопка меняет только черновик, без POST.
 2. С включённой опцией оставь прежние 10 доменов или добавь `domain:example.org`
-   к допустимому набору. Заполни оба адреса через подстановку `/t/terms` и свежий CDN.
+   к допустимому набору. Подставь `/t/terms` и введи тестовый адрес
+   `https://r1.googlevideo.com/videoplayback?sig=xgw-clear-fixture`. Он нужен
+   только для проверки хранения в off.
    «Сохранить» должно дать `invalid` с подсказкой о доменах. В `/api/zapret2/overview`
    `config_key` не меняется, а `sudo sha256sum -c "$BACKUP/config-before.sha256"`
    проходит. Черновик остаётся открыт, выбранный режим остаётся off.
@@ -128,8 +132,41 @@ verify_manifest new
    пустые `transport_probes`; воркер ещё не стартовал. Убедись, что в GET и ответах
    POST нет подписанной ссылки, а в форме она больше не отображается. Повторно открой
    настройки и убедись, что сохранены именно подставленные домены.
-4. Проверь таймер, выполни `sudo touch "$BACKUP/network-test-started"`. Зафиксируй
-   исходные маршруты и счётчики через [инструкцию T12, §3](T12-SELECTIVE-ROUTE-EVIDENCE.md#3-дельты-и-подтверждение-маршрута).
+4. При включённой HTTPS-опции отметь «Удалить сохранённые адреса» и сохрани.
+   Ожидай `saved`, затем свежую карточку off/off с `probe_count=0`,
+   `youtube_transport_probe=true` и пустыми результатами проб. Оба воркера
+   inactive, кнопка Selective недоступна. В `blockers.selective` есть подсказка
+   об адресах. Проверь удаление тестовой подписи из действующего хранилища без
+   вывода его содержимого:
+
+   ```bash
+   sudo "$PY" - "$PANEL" <<'PY'
+   import sys
+   from pathlib import Path
+   assert b'xgw-clear-fixture' not in Path(sys.argv[1]).read_bytes()
+   PY
+   ```
+
+   Открой форму снова, повтори очистку с теми же настройками. Ожидай
+   `unchanged` и ту же ревизию. При расхождении запиши `CLEAR_OFF=FAIL`,
+   пропусти сетевую фазу и выполни rollback по §4. При успехе запиши
+   `CLEAR_OFF=PASS`. Открой форму, подставь `/t/terms` и введи **свежий
+   адрес CDN из тестового Chrome**. После сохранения дождись `probe_count=2`,
+   off/off и пустого `blockers.selective` при работающем перехвате.
+5. Проверь таймер, выполни `sudo touch "$BACKUP/network-test-started"`.
+   Для замеров используй checkout `$CODE`. Определи функции в том же терминале
+   и сними исходный снимок перед кликом:
+
+   ```bash
+   snap() {
+     sudo env PYTHONPATH="$PYTHONPATH" python3 -m xgw.desync.route_evidence snapshot >"$D/$1.json"
+   }
+   delta() {
+     python3 -m xgw.desync.route_evidence delta "$D/$1.json" "$D/$2.json"
+   }
+   snap vpn-before
+   ```
+
    Дождись закрытия формы и свежей карточки. Нажми «Домены через zapret2» и подтверди.
    В отчёте укажи, прошёл ли **реальный клик**, ответ POST и режим. Если кнопка
    заблокирована, сохрани `blockers.selective` и видимый текст, проверь после одного
@@ -194,7 +231,8 @@ Chrome. При потере терминала пути сохранены в `r
 `PY=/usr/bin/python3`; при сбое возврата запроси доступ для диагностики.
 
 Автоматически опубликуй **только обезличенный отчёт** даже при блокере, без запроса
-подтверждения. Укажи SHA, PASS/FAIL/BLOCKED/NOT_RUN по шагам, исход клика и сохранения,
+подтверждения. Укажи SHA, результат полного pytest (включая прежний упавший тест),
+PASS/FAIL/BLOCKED/NOT_RUN по шагам, `CLEAR_OFF`, число адресов до и после, исход клика,
 таблицу проб, `RETRY_LIVE` (`RECOVERED`, `FAILED`, `NOT_OBSERVED` или `NOT_RUN`),
 `MEDIA_PATH`, время пригодного 720p, выводы по стабильности, конечное состояние,
 манифест и решение о возврате. Публично никаких исходных адресов и логов.
@@ -202,13 +240,14 @@ Chrome. При потере терминала пути сохранены в `r
 ```bash
 cd "$REPO"
 git fetch origin integration/zapret2-batch1
-git switch -c "flash/t12-selective-cdn-retry-$(date -u +%Y%m%dT%H%M%SZ)" FETCH_HEAD
-REPORT="docs/reports/$(date +%F)_desync-t12-selective-cdn-retry.md"
+git switch -c "flash/t12-selective-cdn-retry-r2-$(date -u +%Y%m%dT%H%M%SZ)" FETCH_HEAD
+REPORT="docs/reports/$(date +%F)_desync-t12-selective-cdn-retry-r2.md"
+test ! -e "$REPORT"
 # Заполни REPORT по фактам, включая блокеры.
 git add "$REPORT"
 test "$(git diff --cached --name-only)" = "$REPORT"
 git diff --cached --check
-git commit -m "docs: verify Selective CDN retry on ThinkCentre"
+git commit -m "docs: verify off-mode probe clearing and Selective CDN retry on ThinkCentre"
 git push origin HEAD:integration/zapret2-batch1
 git ls-remote origin refs/heads/integration/zapret2-batch1
 ```
