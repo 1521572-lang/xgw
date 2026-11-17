@@ -114,4 +114,4 @@
   токенов/cookie/конфигов.
 - Блокеры: старый WAN-захват (PID 1935908) — 21.1 ГБ, диск 96 % (4.2 ГБ свободно) —
   **администратор хоста требуется незамедлительно**, раздел заполняется.
-- Publication commit: добавить после push.
+- Publication commit: `50db02299b1e8e01a537cbc836a01c1c8bda5147` (6e1e353 → 50db022, remote verified byte-identical to local HEAD).
