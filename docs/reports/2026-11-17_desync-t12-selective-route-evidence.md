@@ -103,4 +103,4 @@
    `config_bytes_changed=false` — читаема (проверено на vpn-паре).
 4. Длинный опыт и подтверждение NFQUEUE-пути переносятся на следующую приёмку после
    устранения CDN-пробы.
-- Publication commit: добавить после push.
+- Publication commit: `0f10a6cfe5d9716692deb099c1b62338580290c1` (02d24e4 → 0f10a6c, remote verified byte-identical to local HEAD).
