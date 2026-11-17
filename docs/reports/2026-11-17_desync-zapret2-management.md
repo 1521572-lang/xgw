@@ -55,4 +55,4 @@
   файлов, SHA базы, команды тестов и установки с откатом — приёмка выполняется
   по этому комплекту (401/403 → Proton-сверка → конфликт ревизий в двух вкладках →
   Selective из веба → живой просмотр → выключение → побайтовый возврат).
-- Publication commit: добавить после push.
+- Publication commit: `8c6ee4f3f16636201b80292ee28892de54ab9c75` (7298d90 → 8c6ee4f, remote verified byte-identical to local HEAD).
