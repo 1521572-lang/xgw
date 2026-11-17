@@ -91,4 +91,4 @@ off/off, очередь пуста (proc-файл отсутствует), во�
 panel 200, конфиги `89bf2a67…`/`33916cb5…` byte-identical. Установленный слой
 a8b177f оставлен (8 файлов == new_sha). Диск 46 ГБ свободно. Приватное: скрипты/
 снапы/скриншоты в `~/xgw-sel-r3.fs` (0700/0600); URL-подписи, IP, конфиги — на машине.
-- Publication commit: добавить после push.
+- Publication commit: `536ede68c925e6ece866301174865a0477b94e76` (bb31f21 → 536ede6, remote verified byte-identical to local HEAD).
