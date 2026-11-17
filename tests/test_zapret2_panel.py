@@ -10,7 +10,7 @@ import pytest
 
 from xgw.config import Config
 from xgw.desync import schema
-from xgw.watch.zapret2_control import card
+from xgw.watch.zapret2_control import card, transport_probes
 
 NOW = 1000
 
@@ -71,6 +71,18 @@ def test_transport_probe_details_are_private_and_revision_bound():
     assert all(filtered[field] is None for field in ("phase", "page_kind", "started_at"))
     snap["zapret2_policy_key"] = "previous"
     assert view(cfg, snap)["evidence"]["transport_probes"] == {}
+
+
+@pytest.mark.parametrize(("first", "visible"), [(10000, True), (10501, False), ("secret", False)])
+def test_cdn_retry_diagnostic_is_bounded(first, visible):
+    rows = transport_probes({
+        "page": {"ok": True, "elapsed_ms": 10001, "first_tls_timeout_ms": 10000},
+        "cdn": {"ok": True, "elapsed_ms": 10500, "first_tls_timeout_ms": first},
+    }, now=NOW)
+    assert "first_tls_timeout_ms" not in rows["page"]
+    assert ("first_tls_timeout_ms" in rows["cdn"]) is visible
+    if visible:
+        assert rows["cdn"]["first_tls_timeout_ms"] == first
 
 
 @pytest.mark.parametrize(("state", "reason", "expected"), [

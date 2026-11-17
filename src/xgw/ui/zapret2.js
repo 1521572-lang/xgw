@@ -146,9 +146,15 @@ el("reload-settings").addEventListener("click", async () => {
   if (await refresh()) openSettings();
 });
 function updateProbePreset() {
-  el("use-probe-terms").hidden = !el("setting-youtube").checked || el("setting-clear").checked;
+  const enabled = el("setting-youtube").checked;
+  el("use-youtube-domains").hidden = !enabled || !latest?.youtube_domains?.length;
+  el("use-probe-terms").hidden = !enabled || el("setting-clear").checked;
 }
 el("setting-youtube").addEventListener("change", updateProbePreset);
+el("use-youtube-domains").addEventListener("click", () => {
+  el("setting-domains").value = latest.youtube_domains.join("\n");
+  el("setting-domains").focus();
+});
 el("use-probe-terms").addEventListener("click", () => {
   el("setting-page").value = "https://www.youtube.com/t/terms";
   el("setting-media").focus();
@@ -195,7 +201,10 @@ function probeText(row, missing) {
   if (row.http) parts.push("HTTP " + row.http);
   if (row.connect_http) parts.push("CONNECT " + row.connect_http);
   if (Number.isSafeInteger(row.bytes)) parts.push(count(row.bytes) + " Б");
-  if (Number.isSafeInteger(row.elapsed_ms)) parts.push(count(row.elapsed_ms) + " мс");
+  if (Number.isSafeInteger(row.first_tls_timeout_ms)) {
+    parts.push("Повтор после TLS-таймаута за " + count(row.first_tls_timeout_ms) + " мс");
+    parts.push("Всего " + count(row.elapsed_ms) + " мс");
+  } else if (Number.isSafeInteger(row.elapsed_ms)) parts.push(count(row.elapsed_ms) + " мс");
   return parts.join(" · ");
 }
 

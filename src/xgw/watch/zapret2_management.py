@@ -17,9 +17,24 @@ PROFILES = tuple(p for p in schema.SELECTED_PROFILES if p != schema.LIVE_STRATEG
 MODES = ("off", "standalone", "selective")
 
 
-def candidate(cfg, patch):
+def candidate(cfg, patch, *, editing=False):
     flat = schema.flatten(cfg.desync or schema.migrate(vars(cfg.zapret2)))
     flat.update(patch)
+    mode = flat["mode"]
+    if flat.get("youtube_transport_probe") and (mode != "off" or editing):
+        if mode not in ("off", "selective"):
+            raise schema.PolicyError("HTTPS-проверка YouTube и CDN доступна только для Selective.")
+        if not schema.valid_youtube_domains(flat["domains"]):
+            raise schema.PolicyError(
+                "Для HTTPS-проверки введите только поддерживаемые домены YouTube, "
+                "включая domain:youtube.com и domain:googlevideo.com, "
+                "или подставьте список в форме."
+            )
+        if not schema.valid_youtube_transport("selective", flat["domains"], flat["probe_urls"]):
+            raise schema.PolicyError(
+                "Сохраните HTTPS-адрес страницы YouTube и HTTPS-адрес CDN googlevideo.com "
+                "с путём /videoplayback или отключите HTTPS-проверку YouTube и CDN."
+            )
     policy = schema.migrate(flat)
     projected = schema.project(policy)
     proposed = copy.copy(cfg)
@@ -83,7 +98,7 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
             if body["expected"] != key:
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
-            policy, proposed = candidate(cfg, patch)
+            policy, proposed = candidate(cfg, patch, editing=action == "settings")
             if policy == current:
                 return reply(True, "unchanged", "Настройки уже сохранены.",
                              config_key=key, changed=False)

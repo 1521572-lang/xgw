@@ -101,6 +101,11 @@ def transport_probes(value: object, *, now: float) -> dict:
         if target == "page":
             kind = row.get("page_kind")
             fields["page_kind"] = kind if kind in PAGE_KINDS else None
+        else:
+            first = row.get("first_tls_timeout_ms")
+            elapsed = fields["elapsed_ms"]
+            if type(first) is int and elapsed is not None and 0 <= first <= elapsed:
+                fields["first_tls_timeout_ms"] = first
         probes[target] = fields
     # The CDN is reached only after a successful page probe.
     if not probes.get("page", {}).get("ok"):
@@ -235,6 +240,7 @@ Commands use the same validation as this card; observations remain revision-boun
         "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},
         "blockers": blockers,
         "youtube_transport_probe": settings.get("youtube_transport_probe", False),
+        "youtube_domains": list(schema.YOUTUBE_DOMAINS),
         "youtube_probe_page_kind": page_kind,
         "probe_count": len(settings["probe_urls"]), "probes": [], "probe_expiry": [],
         "check_seconds": settings["check_seconds"], "retry_seconds": settings["retry_seconds"],

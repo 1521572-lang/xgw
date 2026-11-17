@@ -270,6 +270,45 @@ def test_selective_recheck_reports_actual_page_and_new_time(monkeypatch):
     assert "private" not in repr(rows)
 
 
+@pytest.mark.parametrize(("scenario", "attempts", "active"), [
+    ("recovers", 2, True), ("double_timeout", 2, False),
+    ("http_error", 1, False), ("no_budget", 1, False), ("lost_worker", 1, False),
+])
+def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.daily_probe_mb = 1 if scenario == "no_budget" else 256
+    page = "https://www.youtube.com/t/terms"
+    cdn = "https://r1.googlevideo.com/videoplayback?sig=fixture"
+    h.cfg.zapret2.probe_urls = [page, cdn]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    urls = []
+
+    def request(url, *_args, **_options):
+        urls.append(url)
+        if url == page or urls.count(cdn) == 1 or (scenario == "recovers" and urls.count(cdn) == 3):
+            return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
+        if scenario == "http_error":
+            return checks.DownloadResult(ok=False, status=403, kind="http", phase="headers")
+        if scenario == "lost_worker":
+            h.runtime.up = False
+        return checks.DownloadResult(ok=False, kind="timeout", phase="tls")
+
+    h.controller._request = request
+    h.activate()
+    h.step(h.controller.next_check)
+    assert urls == [page, cdn, page, *[cdn] * attempts]
+    assert z.active(h.current) is active
+    reason = "youtube_transport_ok" if active else "youtube_cdn_probe_failed"
+    assert h.controller.view["reason"] == reason
+    row = h.controller.view["transport_probes"]["cdn"]
+    assert row["ok"] is active
+    assert ("first_tls_timeout_ms" in row) is (attempts == 2)
+    assert "fixture" not in repr(row)
+    charged = json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"]
+    assert charged == (3 + attempts) * z.PROBE_CHARGE
+
+
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():
     cfg, _, _ = setup()
     cfg.zapret2.youtube_transport_probe = True

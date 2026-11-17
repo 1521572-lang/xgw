@@ -71,14 +71,15 @@ def _require(ok: bool, field: str) -> None:
         raise PolicyError(f"desync: invalid {field}")
 
 
+def valid_youtube_domains(domains: list[str]) -> bool:
+    return {"domain:youtube.com", "domain:googlevideo.com"} <= set(domains) <= set(YOUTUBE_DOMAINS)
+
+
 def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> bool:
     """Only the selected YouTube page and a real video CDN hostname may use this gate."""
     if mode == "off":
         return True
-    selected = set(domains)
-    if (mode != "selective" or len(urls) != 2
-            or not {"domain:youtube.com", "domain:googlevideo.com"}
-            <= selected <= set(YOUTUBE_DOMAINS)):
+    if mode != "selective" or len(urls) != 2 or not valid_youtube_domains(domains):
         return False
     try:
         page, media = map(urlsplit, urls)

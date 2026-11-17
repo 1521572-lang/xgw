@@ -427,7 +427,7 @@ class Controller:
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
 
-    def _budget(self, cfg: Config, *, vpn_control: bool = False) -> bool:
+    def _budget(self, cfg: Config, *, single_probe: bool = False) -> bool:
         day = int(time.time() // 86400)
         try:
             budget = json.loads(self.store.get_meta(BUDGET) or "{}")
@@ -436,8 +436,8 @@ class Controller:
                 return False
         except (ValueError, TypeError, AttributeError):
             return False  # повреждённый учёт не превращается в бесплатный бюджет
-        charge = (1 if vpn_control else len(cfg.zapret2.probe_urls)) * PROBE_CHARGE
-        if cfg.zapret2.mode == "compare":
+        charge = (1 if single_probe else len(cfg.zapret2.probe_urls)) * PROBE_CHARGE
+        if not single_probe and cfg.zapret2.mode == "compare":
             charge *= REDIRECT_LIMIT + 2  # исходный GET, переходы VPN и один прямой GET
         if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
             return False
@@ -480,6 +480,13 @@ class Controller:
             started_at = time.time() if z.youtube_transport_probe else None
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)
+            first_tls_timeout_ms = None
+            if (media_transport and not verdict.ok and verdict.phase == "tls"
+                    and verdict.kind == "timeout" and (cancel is None or not cancel.is_set())
+                    and self.runtime.alive(z.queue_num) and self._budget(cfg, single_probe=True)):
+                first_tls_timeout_ms = round((time.monotonic() - started) * 1000)
+                verdict = self._request(url, z.probe_port, password, cfg.probe.user_agent,
+                                        cancel, **options)
             ok = verdict.ok and (not media_transport or verdict.status in (200, 204))
             if z.youtube_transport_probe:
                 self.transport_probes["cdn" if media_transport else "page"] = {
@@ -492,6 +499,8 @@ class Controller:
                     "started_at": started_at,
                     **({} if media_transport else {"page_kind": youtube_probe_page_kind(url)}),
                 }
+                if first_tls_timeout_ms is not None:
+                    self.transport_probes["cdn"]["first_tls_timeout_ms"] = first_tls_timeout_ms
             if not ok:
                 if z.youtube_transport_probe:
                     self.probe_failure = ("youtube_cdn_probe_failed" if media_transport
@@ -596,7 +605,7 @@ class Controller:
         password, _ = builder.probe_state(applied)
         if not password:
             return "not_run", "no_probe_credentials"
-        if not self._budget(cfg, vpn_control=True):
+        if not self._budget(cfg, single_probe=True):
             return "not_run", "budget_unavailable"
         result = self._request(cfg.zapret2.probe_urls[0], port, password,
                                cfg.probe.user_agent, cancel)

@@ -112,19 +112,41 @@ def test_modes_require_prerequisites_and_do_not_change_engine(store):
 
 def test_youtube_gate_validates_merged_mode_domains_and_urls(store):
     cfg, panel = store
-    assert send(cfg, {"youtube_transport_probe": True})["ok"]
     before = panel.read_bytes()
+    missing = send(cfg, {"youtube_transport_probe": True})
+    assert missing["code"] == "invalid" and "/videoplayback" in missing["text"]
     assert not send(cfg, "selective", action="mode")["ok"]
-    assert not send(cfg, "standalone", action="mode")["ok"]
     assert panel.read_bytes() == before
-    assert send(cfg, {"probe_urls": ["https://www.youtube.com/watch?v=fixture",
-                                    "https://r1.googlevideo.com/videoplayback?sig=fixture"]})["ok"]
+    valid = {"youtube_transport_probe": True, "probe_urls": [
+        "https://www.youtube.com/t/terms", "https://r1.googlevideo.com/videoplayback?sig=fixture"]}
+    domains = [*schema.YOUTUBE_DOMAINS, "domain:other.example"]
+    rejected = send(cfg, {**valid, "domains": domains})
+    assert rejected["code"] == "invalid" and "domain:googlevideo.com" in rejected["text"]
+    assert "fixture" not in json.dumps(rejected) and panel.read_bytes() == before
+    assert send(cfg, {**valid, "domains": list(schema.YOUTUBE_DOMAINS[:2])})["ok"]
+    assert config.load(cfg)[0].zapret2.mode == "off"
+    assert not send(cfg, "standalone", action="mode")["ok"]
     assert send(cfg, "selective", action="mode")["ok"]
     before = panel.read_bytes()
     assert not send(cfg, {"probe_urls": []})["ok"]
     assert not send(cfg, {"domains": ["domain:example.org"]})["ok"]
     assert panel.read_bytes() == before
     assert config.load(cfg)[0].zapret2.mode == "selective"
+    assert send(cfg, "off", action="mode", ready=False)["ok"]
+    assert send(cfg, {"youtube_transport_probe": False, "domains": domains, "probe_urls": []})["ok"]
+
+
+def test_legacy_off_settings_can_be_corrected_without_activating(store):
+    cfg, panel = store
+    raw = json.loads(panel.read_text(encoding="utf-8"))
+    raw["zapret2"].update(youtube_transport_probe=True, domains=schema.FREEPOOL_DOMAINS)
+    panel.write_text(json.dumps(raw), encoding="utf-8")
+    before = panel.read_bytes()
+    rejected = send(cfg, "selective", action="mode")
+    assert "подставьте список" in rejected["text"] and panel.read_bytes() == before
+    assert send(cfg, {"youtube_transport_probe": False})["ok"]
+    actual = config.load(cfg)[0].zapret2
+    assert actual.mode == "off" and actual.domains == schema.FREEPOOL_DOMAINS
 
 
 def test_two_writers_with_same_expected_have_one_winner(store):
