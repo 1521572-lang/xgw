@@ -122,4 +122,4 @@ endpoint и протоколы включены; policy SHA без поля ст
 - Блокеры: старый WAN-захват (PID 1935908, >25.5 ч, ~15.3 ГБ, диск 91 %) — требуется
   администратор хоста; пофазные счётчики байтов не сняты (см. п. 2); QUIC/SYN —
   отдельные этапы.
-- Publication commit: добавить после push.
+- Publication commit: `9dc8ecd58c4d4f3e7d9b4b2d2fe9374ae0570514` (b0e081f → 9dc8ecd, remote verified byte-identical to local HEAD).
