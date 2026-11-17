@@ -113,4 +113,4 @@
   media-специфичная проверка) — решение за разработчиком; (2) старый WAN-захват
   (PID 1935908, >27 ч, ~15.5 ГБ, диск 93 %) — требуется администратор хоста; (3)
   H02 без изменений.
-- Publication commit: добавить после push.
+- Publication commit: `861bcbfdae09e39f2c521a6b3b9f63d91622a6e8` (f1691ac → 861bcbf, remote verified byte-identical to local HEAD).
