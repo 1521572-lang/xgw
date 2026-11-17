@@ -85,4 +85,4 @@
 3. CLEAR_OFF-контракт (awaiting_urls) и write-only хранение работают как задумано,
    включая запрет активации Selective до ввода адресов и `unchanged` на повторную
    очистку.
-- Publication commit: `добавляется после push` (ветка flash/t12-selective-cdn-retry-r2-20261117T222112Z поверх f4a6668).
+- Publication commit: `1916103078d2436a8ee8289e9a172ef0180fe512` (f4a6668 → 1916103, remote verified byte-identical to local HEAD).
