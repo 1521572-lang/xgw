@@ -39,6 +39,8 @@ UNIT = worker.SELECTED_UNIT
 LIVE = "zapret2_live"
 BUDGET = "zapret2_probe_budget"
 PROBE_BYTES = 64 * 1024
+YOUTUBE_PAGE_MAX_SECONDS = 12
+YOUTUBE_PAGE_SILENCE_SECONDS = 6
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
@@ -409,6 +411,7 @@ class Controller:
         self.start_deadline: float | None = None
         self.last_error = ""
         self.probe_failure = "probe_failed"
+        self.transport_probes: dict[str, dict] = {}
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
@@ -432,13 +435,14 @@ class Controller:
 
     @staticmethod
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
-                 *, max_total: float = 8, min_body: int = 16 * 1024) -> DownloadResult:
+                 *, max_total: float = 8, silence: float = 4,
+                 min_body: int = 16 * 1024) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
         return checks.http_get_via_proxy(
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
-            proxy_pass=password, timeout=5, silence=4, max_total=max_total,
+            proxy_pass=password, timeout=5, silence=silence, max_total=max_total,
             max_bytes=PROBE_BYTES, min_body=min_body, user_agent=user_agent, cancel=cancel,
         )
 
@@ -447,14 +451,31 @@ class Controller:
 
         password, _ = builder.probe_state(applied)
         z = cfg.zapret2
+        self.transport_probes = {}
         if z.youtube_transport_probe and (not configured(cfg) or not password):
             return False
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
-            options = {"min_body": 0} if media_transport else {}
+            options = {}
+            if media_transport:
+                options["min_body"] = 0
+            elif z.youtube_transport_probe:
+                options = {"max_total": YOUTUBE_PAGE_MAX_SECONDS,
+                           "silence": YOUTUBE_PAGE_SILENCE_SECONDS}
+            started = time.monotonic()
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)
-            if not verdict.ok or (media_transport and verdict.status not in (200, 204)):
+            ok = verdict.ok and (not media_transport or verdict.status in (200, 204))
+            if z.youtube_transport_probe:
+                self.transport_probes["cdn" if media_transport else "page"] = {
+                    "ok": ok, "phase": verdict.phase,
+                    "kind": verdict.kind or ("ok" if ok else "http"),
+                    "http": 0 if verdict.phase == "connect" else verdict.status,
+                    "connect_http": verdict.status if verdict.phase == "connect" else 0,
+                    "bytes": verdict.downloaded,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                }
+            if not ok:
                 if z.youtube_transport_probe:
                     self.probe_failure = ("youtube_cdn_probe_failed" if media_transport
                                           else "youtube_page_probe_failed")
@@ -643,6 +664,8 @@ class Controller:
                                      "youtube_transport_ok" if cfg.zapret2.youtube_transport_probe
                                      else "probes_ok"),
                                  "valid_until": time.time() + lease}
+                    if cfg.zapret2.youtube_transport_probe and self.transport_probes:
+                        self.view["transport_probes"] = self.transport_probes
                     return changed
                 reason = self.last_error or "retry_wait"
         except (OSError, ValueError, cmd.CommandError) as exc:
@@ -694,6 +717,9 @@ class Controller:
             return changed
         self.view = {"state": "fallback" if routed_back and stopped else "blocked",
                      "reason": reason, "gate_closed": gate_closed}
+        if (reason in ("youtube_page_probe_failed", "youtube_cdn_probe_failed")
+                and self.transport_probes):
+            self.view["transport_probes"] = self.transport_probes
         if cfg.zapret2.mode == "selective" and check_vpn:
             verdict, why = self._fallback_vpn_control(
                 cfg, applied, vpn_probe_port, cancel, gate_closed=gate_closed,

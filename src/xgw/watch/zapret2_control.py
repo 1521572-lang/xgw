@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 
+from .. import zapret2
 from ..desync import schema, worker
 from . import zapret2_management as management
 
@@ -71,6 +72,32 @@ def _record(value: object) -> dict:
 
 def _number(value: object) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def transport_probes(value: object) -> dict:
+    probes = {}
+    source = _record(value)
+    for target in ("page", "cdn"):
+        row = _record(source.get(target))
+        if type(row.get("ok")) is not bool:
+            continue
+        fields = {"ok": row["ok"]}
+        for name, accepted in (
+            ("phase", ("connect", "tls", "request", "headers", "body")),
+            ("kind", ("ok", "http", "proxy", "connect", "tls", "timeout", "stall",
+                      "truncated", "reset", "io", "cancelled")),
+        ):
+            item = row.get(name)
+            fields[name] = item if isinstance(item, str) and item in accepted else None
+        for name, limit in (("http", 599), ("connect_http", 599),
+                            ("bytes", zapret2.PROBE_BYTES), ("elapsed_ms", 60_000)):
+            item = row.get(name)
+            fields[name] = item if type(item) is int and 0 <= item <= limit else None
+        probes[target] = fields
+    # The CDN is reached only after a successful page probe.
+    if not probes.get("page", {}).get("ok"):
+        probes.pop("cdn", None)
+    return probes
 
 
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None) -> dict:
@@ -165,6 +192,12 @@ Commands use the same validation as this card; observations remain revision-boun
     transport = ("https_reachable"
                  if trusted and phase == "active" and reason == "youtube_transport_ok"
                  and settings.get("youtube_transport_probe") is True else "unknown")
+    transport_failed = (phase in ("fallback", "blocked")
+                        and reason in ("youtube_page_probe_failed", "youtube_cdn_probe_failed"))
+    transport_rows = {}
+    if (trusted and settings["mode"] == "selective" and settings.get("youtube_transport_probe")
+            and (transport == "https_reachable" or transport_failed)):
+        transport_rows = transport_probes(selected.get("transport_probes"))
     blockers = {mode: management.reasons(cfg, mode, ready=fresh, capture=capture)
                 for mode in schema.MODES} if not invalid else {
                     mode: ["Политика zapret2 некорректна."] for mode in schema.MODES}
@@ -184,6 +217,7 @@ Commands use the same validation as this card; observations remain revision-boun
         "counters": {"queued_original": None, "queued_reply": None,
                      "queue_dropped": None, "strategy_switches": None},
         "evidence": {"transport": transport, "playback": "not_tested",
+                     "transport_probes": transport_rows,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
                      "vpn_control_at": vpn_control_at},
         "can_off": not invalid, "can_edit": not invalid,

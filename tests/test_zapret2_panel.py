@@ -44,6 +44,28 @@ def test_youtube_transport_is_never_reported_as_playback():
     assert view(cfg, snap)["evidence"]["transport"] == "unknown"
 
 
+def test_transport_probe_details_are_private_and_revision_bound():
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback",
+                        reason="youtube_page_probe_failed", gate_closed=True)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"]["transport_probes"] = {
+        "page": {"ok": False, "phase": "tls", "kind": "timeout", "connect_http": 0,
+                 "http": 0, "bytes": 0, "elapsed_ms": 4974, "url": "secret-token"},
+        "cdn": {"ok": True, "phase": "body"},
+    }
+    evidence = view(cfg, snap)["evidence"]
+    assert set(evidence["transport_probes"]) == {"page"}
+    assert evidence["transport_probes"]["page"]["elapsed_ms"] == 4974
+    assert evidence["transport"] == "unknown" and evidence["playback"] == "not_tested"
+    assert "secret" not in json.dumps(evidence)
+    snap["zapret2"]["transport_probes"]["page"].update(phase="unexpected-private-value")
+    assert view(cfg, snap)["evidence"]["transport_probes"]["page"]["phase"] is None
+    snap["zapret2_policy_key"] = "previous"
+    assert view(cfg, snap)["evidence"]["transport_probes"] == {}
+
+
 @pytest.mark.parametrize(("state", "reason", "expected"), [
     ("active", "", "active"), ("off", "not_found", "absent"),
     ("fallback", "worker_down", "error"), ("fallback", "queue_busy", "error"),

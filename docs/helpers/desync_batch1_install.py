@@ -38,7 +38,7 @@ ZAPRET2_WEB = ("watch/panel.py", "desync/event_socket.py", "ui/index.html",
                "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js",
                "ui/zapret2.LICENSE.txt", "ui/zapret2.NOTICE.txt")
 ZAPRET2_MANAGEMENT = ("watch/panel.py", "watch/zapret2_control.py", "watch/zapret2_management.py",
-                      "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js")
+                      "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js", "zapret2.py")
 MANAGEMENT_GUI = ("src/xgw/gui/zapret2.py",)
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"

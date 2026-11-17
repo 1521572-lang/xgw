@@ -10,6 +10,11 @@ const phases = {
 };
 const units = {"xgw-zapret2.service": "Выбранные домены", "xgw-nfqws2.service": "Общий обработчик"};
 const vpnChecks = {pass: "Прошла", fail: "Не прошла", not_run: "Не запускалась"};
+const probePhases = {connect: "туннель", tls: "TLS", request: "запрос",
+  headers: "заголовки", body: "тело ответа"};
+const probeFailures = {http: "ответ HTTP", proxy: "отказ прокси", connect: "соединение",
+  tls: "ошибка TLS", timeout: "таймаут", stall: "нет данных", truncated: "неполный ответ",
+  reset: "обрыв", io: "ошибка ввода-вывода", cancelled: "прервана"};
 const number = new Intl.NumberFormat("ru");
 const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medium"});
 const el = id => document.getElementById(id);
@@ -165,6 +170,18 @@ el("settings-form").addEventListener("submit", event => {
   command("settings", {settings, expected: draftKey});
 });
 
+function probeText(row, missing) {
+  if (!row) return missing;
+  const parts = [row.ok ? "Прошла" : "Не прошла"];
+  if (probePhases[row.phase]) parts.push(probePhases[row.phase]);
+  if (!row.ok && probeFailures[row.kind]) parts.push(probeFailures[row.kind]);
+  if (row.http) parts.push("HTTP " + row.http);
+  if (row.connect_http) parts.push("CONNECT " + row.connect_http);
+  if (Number.isSafeInteger(row.bytes)) parts.push(count(row.bytes) + " Б");
+  if (Number.isSafeInteger(row.elapsed_ms)) parts.push(count(row.elapsed_ms) + " мс");
+  return parts.join(" · ");
+}
+
 function render(payload) {
   const card = payload.zapret2;
   if (!card || typeof card.state !== "string") throw new Error("invalid overview");
@@ -188,6 +205,9 @@ function render(payload) {
   put("running", confirmed ? card.strategy : null);
   put("queue", confirmed ? card.worker?.queue : null);
   put("https", evidence.transport === "https_reachable" ? "Доступен" : "Нет подтверждения");
+  const probes = evidence.transport_probes ?? {};
+  put("probe-page", probeText(probes.page, "Нет данных"));
+  put("probe-cdn", probeText(probes.cdn, probes.page?.ok === false ? "Не запускалась" : "Нет данных"));
   put("playback", evidence.playback === "not_tested" ? "Не проверялось" : "Нет данных");
   put("vpn", vpnChecks[evidence.vpn_control] || "Нет данных");
   put("queued-original", count(confirmed ? card.counters?.queued_original : null));
@@ -239,7 +259,7 @@ function unavailable(message) {
   controls();
   put("state", message);
   el("state").dataset.tone = "waiting";
-  for (const id of ["running", "queue", "https", "playback", "vpn",
+  for (const id of ["running", "queue", "https", "probe-page", "probe-cdn", "playback", "vpn",
     "queued-original", "queued-reply", "queue-dropped"]) put(id, "Нет данных");
   put("detail", "");
   renderJournal(null);

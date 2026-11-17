@@ -182,28 +182,58 @@ def test_youtube_transport_gate_only_relaxes_cdn_body_size(enabled, media_status
     h.controller.probe = z.Controller.probe.__get__(h.controller)
     seen = []
 
-    def request(url, *_args, min_body=16 * 1024):
-        seen.append(min_body)
+    def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4):
+        seen.append((min_body, max_total, silence))
         if "googlevideo.com" not in url:
-            return checks.DownloadResult(ok=True, status=200, downloaded=32768)
+            return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
         return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204),
-                                     status=media_status, downloaded=0)
+                                     status=media_status, downloaded=0, phase="headers")
 
     h.controller._request = request
     for now in (0, 1, 2):
         h.step(now)
-    assert seen == [16384, 0 if enabled else 16384]
+    expected_page = (16384, 12, 6) if enabled else (16384, 8, 4)
+    assert seen == [expected_page, (0 if enabled else 16384, 8, 4)]
     assert z.active(h.current) is opens
+    if enabled:
+        rows = h.controller.view["transport_probes"]
+        assert rows["page"]["bytes"] == 32768 and rows["page"]["ok"]
+        assert rows["cdn"]["http"] == media_status and rows["cdn"]["ok"] is opens
+    else:
+        assert "transport_probes" not in h.controller.view
     if opens:
         assert h.controller.view["reason"] == "youtube_transport_ok"
         h.runtime.up = False
         h.step(3)
         assert not z.active(h.current)
         assert h.controller.view["reason"] == "worker_down"
+        assert "transport_probes" not in h.controller.view
     else:
         assert h.controller.view["reason"] == (
             "youtube_cdn_probe_failed" if enabled else "probe_failed"
         )
+
+
+def test_youtube_page_failure_records_phase_and_preserves_closed_route():
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls[1] = "https://r1.googlevideo.com/videoplayback"
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+
+    def request(url, *_args, **options):
+        assert "googlevideo.com" not in url
+        return checks.DownloadResult(ok=False, kind="stall", phase="headers", error="private")
+
+    h.controller._request = request
+    for now in (0, 1, 2, 3):
+        h.step(now)
+    assert not z.active(h.current)
+    view = h.controller.view
+    assert (view["state"], view["reason"]) == ("fallback", "youtube_page_probe_failed")
+    assert set(view["transport_probes"]) == {"page"}
+    row = view["transport_probes"]["page"]
+    assert (row["phase"], row["kind"], row["ok"]) == ("headers", "stall", False)
+    assert "private" not in repr(row)
 
 
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():

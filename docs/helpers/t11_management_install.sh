@@ -31,10 +31,9 @@ cfg, _ = config.load(sys.argv[1])
 assert cfg.zapret2.mode == cfg.zapret2.engine == "off", "expected initial off/off"
 PY
 OLD=(src/xgw/watch/panel.py src/xgw/watch/zapret2_control.py
-     src/xgw/ui/zapret2.html src/xgw/ui/zapret2.css src/xgw/ui/zapret2.js)
+     src/xgw/ui/zapret2.html src/xgw/ui/zapret2.css src/xgw/ui/zapret2.js src/xgw/zapret2.py)
 NEW=("${OLD[@]}" src/xgw/watch/zapret2_management.py src/xgw/gui/zapret2.py)
-DEPS=(src/xgw/config.py src/xgw/managed.py src/xgw/paths.py
-      src/xgw/desync/schema.py src/xgw/zapret2.py)
+DEPS=(src/xgw/config.py src/xgw/managed.py src/xgw/paths.py src/xgw/desync/schema.py)
 sudo install -d -m 0755 "$PAYLOAD/code" "$PAYLOAD/base" "$PAYLOAD/gui_base"
 git archive "$CODE" "${NEW[@]}" docs/helpers/desync_batch1_install.py \
   docs/helpers/t11_management_restore.sh | sudo tar --no-same-owner -x -C "$PAYLOAD/code"
@@ -53,9 +52,10 @@ printf '%s\n' "$PY" | sudo tee "$BACKUP/python.path" > /dev/null
 sudo sha256sum "$CFG" "$PANEL" | sudo tee "$BACKUP/config-before.sha256" > /dev/null
 sudo chmod 0600 "$BACKUP/config-before.sha256" "$BACKUP/panel.before" "$BACKUP/python.path"
 sudo install -m 0700 "$PAYLOAD/code/docs/helpers/t11_management_restore.sh" "$BACKUP/restore.sh"
-sudo systemd-run --unit="$UNIT" --on-active=45m \
+sudo systemd-run --unit="$UNIT" --on-active=90m --timer-property=AccuracySec=1s \
   /bin/bash "$BACKUP/restore.sh" "$PY" "$HELPER" "$BACKUP" "$PANEL" rollback
 sudo systemctl is-active "$UNIT.timer"
+systemctl list-timers "$UNIT.timer" --no-pager
 sudo "$PY" "$HELPER" apply --zapret2-management --backup "$BACKUP"
 sudo sha256sum -c "$BACKUP/config-before.sha256"
 systemctl is-active xgw.service
