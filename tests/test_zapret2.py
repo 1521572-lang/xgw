@@ -236,6 +236,40 @@ def test_youtube_page_failure_records_phase_and_preserves_closed_route():
     assert "private" not in repr(row)
 
 
+def test_selective_recheck_reports_actual_page_and_new_time(monkeypatch):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    page = "https://www.youtube.com/t/terms?private=test"
+    cdn = "https://r1.googlevideo.com/videoplayback?private=test"
+    h.cfg.zapret2.probe_urls = [page, cdn]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    checks_seen = []
+    wall = 1000.0
+    monkeypatch.setattr(z.time, "time", lambda: wall)
+
+    def request(url, *_args, **_kwargs):
+        checks_seen.append(url)
+        if wall == 2000.0 and url == page:
+            return checks.DownloadResult(ok=False, kind="timeout", phase="tls")
+        return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
+
+    h.controller._request = request
+    h.activate()
+    rows = h.controller.view["transport_probes"]
+    assert rows["page"]["page_kind"] == "terms" and rows["page"]["started_at"] == 1000
+    assert "page_kind" not in rows["cdn"]
+
+    wall = 2000.0
+    h.step(h.controller.next_check)
+    assert not z.active(h.current)
+    assert h.controller.view["reason"] == "youtube_page_probe_failed"
+    rows = h.controller.view["transport_probes"]
+    assert set(rows) == {"page"}
+    assert rows["page"]["page_kind"] == "terms" and rows["page"]["started_at"] == 2000
+    assert checks_seen == [page, cdn, page]
+    assert "private" not in repr(rows)
+
+
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():
     cfg, _, _ = setup()
     cfg.zapret2.youtube_transport_probe = True

@@ -56,6 +56,10 @@ ZAPRET2_WEB_TIMER = "xgw-zapret2-web-rollback.timer"
 ZAPRET2_MANAGEMENT_TIMER = "xgw-zapret2-management-rollback.timer"
 SELECTIVE_TLS = ("zapret2.py", "watch/checks.py")
 SELECTIVE_TLS_TIMER = "xgw-selective-tls-rollback.timer"
+SELECTIVE_PROBE_INFO = (
+    "zapret2.py", "watch/zapret2_control.py", "ui/zapret2.html", "ui/zapret2.js",
+)
+SELECTIVE_PROBE_INFO_TIMER = "xgw-selective-probe-info-rollback.timer"
 
 
 def require(ok, message):
@@ -137,7 +141,7 @@ def prepare(args, backup):
         for path in (source, target, baseline):
             trusted(path)
         new = source.read_bytes()
-        if files in (ZAPRET2_WEB, ZAPRET2_MANAGEMENT) and target.parent == package / "ui":
+        if target.parent == package / "ui":
             new.decode("utf-8")
         else:
             compile(new, str(source), "exec")
@@ -210,6 +214,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "selective_probe_info", False):
+        return SELECTIVE_PROBE_INFO, SELECTIVE_PROBE_INFO_TIMER
     if getattr(args, "selective_tls", False):
         return SELECTIVE_TLS, SELECTIVE_TLS_TIMER
     if getattr(args, "zapret2_management", False):
@@ -263,6 +269,7 @@ def main():
     stage.add_argument("--zapret2-web", action="store_true")
     stage.add_argument("--zapret2-management", action="store_true")
     stage.add_argument("--selective-tls", action="store_true")
+    stage.add_argument("--selective-probe-info", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

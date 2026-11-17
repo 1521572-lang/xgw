@@ -15,6 +15,7 @@ const probePhases = {connect: "туннель", tls: "TLS", request: "запро
 const probeFailures = {http: "ответ HTTP", proxy: "отказ прокси", connect: "соединение",
   tls: "ошибка TLS", timeout: "таймаут", stall: "нет данных", truncated: "неполный ответ",
   reset: "обрыв", io: "ошибка ввода-вывода", cancelled: "прервана"};
+const probePageKinds = {terms: "Страница условий", watch: "Страница просмотра", other: "Другая страница"};
 const number = new Intl.NumberFormat("ru");
 const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medium"});
 const el = id => document.getElementById(id);
@@ -66,7 +67,10 @@ function openSettings() {
     el(id).value = "";
     el(id).disabled = false;
   }
-  put("saved-probes", "Сохранено адресов: " + count(latest.probe_count));
+  const pageKind = probePageKinds[latest.youtube_probe_page_kind];
+  put("saved-probes", "Сохранено адресов: " + count(latest.probe_count) +
+    (pageKind ? " · " + pageKind : ""));
+  updateProbePreset();
   put("settings-revision", "");
   el("settings-form").hidden = false;
   controls();
@@ -141,11 +145,20 @@ el("reload-settings").addEventListener("click", async () => {
   if (!window.confirm("Заменить введённые правки текущими настройками шлюза?")) return;
   if (await refresh()) openSettings();
 });
+function updateProbePreset() {
+  el("use-probe-terms").hidden = !el("setting-youtube").checked || el("setting-clear").checked;
+}
+el("setting-youtube").addEventListener("change", updateProbePreset);
+el("use-probe-terms").addEventListener("click", () => {
+  el("setting-page").value = "https://www.youtube.com/t/terms";
+  el("setting-media").focus();
+});
 el("setting-clear").addEventListener("change", () => {
   for (const id of ["setting-page", "setting-media"]) {
     el(id).disabled = el("setting-clear").checked;
     if (el(id).disabled) el(id).value = "";
   }
+  updateProbePreset();
 });
 el("settings-form").addEventListener("submit", event => {
   event.preventDefault();
@@ -173,6 +186,10 @@ el("settings-form").addEventListener("submit", event => {
 function probeText(row, missing) {
   if (!row) return missing;
   const parts = [row.ok ? "Прошла" : "Не прошла"];
+  if (probePageKinds[row.page_kind]) parts.push(probePageKinds[row.page_kind]);
+  if (Number.isFinite(row.started_at) && row.started_at > 0) {
+    parts.push(date.format(new Date(row.started_at * 1000)));
+  }
   if (probePhases[row.phase]) parts.push(probePhases[row.phase]);
   if (!row.ok && probeFailures[row.kind]) parts.push(probeFailures[row.kind]);
   if (row.http) parts.push("HTTP " + row.http);

@@ -156,6 +156,16 @@ def configured(cfg: Config) -> bool:
     return True
 
 
+def youtube_probe_page_kind(url: str) -> str:
+    """Report a fixed category instead of publishing a configured URL."""
+    path = urlsplit(url).path
+    if path == "/t/terms":
+        return "terms"
+    if path == "/watch":
+        return "watch"
+    return "other"
+
+
 def active(config: dict) -> bool:
     return any(r.get("outboundTag") == OUT and r.get("inboundTag") != [PROBE]
                for r in config.get("routing", {}).get("rules", []))
@@ -467,6 +477,7 @@ class Controller:
                 else:
                     options["silence"] = YOUTUBE_PAGE_SILENCE_SECONDS
             started = time.monotonic()
+            started_at = time.time() if z.youtube_transport_probe else None
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)
             ok = verdict.ok and (not media_transport or verdict.status in (200, 204))
@@ -478,6 +489,8 @@ class Controller:
                     "connect_http": verdict.status if verdict.phase == "connect" else 0,
                     "bytes": verdict.downloaded,
                     "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "started_at": started_at,
+                    **({} if media_transport else {"page_kind": youtube_probe_page_kind(url)}),
                 }
             if not ok:
                 if z.youtube_transport_probe:

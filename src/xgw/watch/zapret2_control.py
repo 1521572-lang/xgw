@@ -74,7 +74,10 @@ def _number(value: object) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
-def transport_probes(value: object) -> dict:
+PAGE_KINDS = ("terms", "watch", "other")
+
+
+def transport_probes(value: object, *, now: float) -> dict:
     probes = {}
     source = _record(value)
     for target in ("page", "cdn"):
@@ -93,6 +96,11 @@ def transport_probes(value: object) -> dict:
                             ("bytes", zapret2.PROBE_BYTES), ("elapsed_ms", 60_000)):
             item = row.get(name)
             fields[name] = item if type(item) is int and 0 <= item <= limit else None
+        started = row.get("started_at")
+        fields["started_at"] = started if _number(started) and 0 < started <= now else None
+        if target == "page":
+            kind = row.get("page_kind")
+            fields["page_kind"] = kind if kind in PAGE_KINDS else None
         probes[target] = fields
     # The CDN is reached only after a successful page probe.
     if not probes.get("page", {}).get("ok"):
@@ -197,7 +205,10 @@ Commands use the same validation as this card; observations remain revision-boun
     transport_rows = {}
     if (trusted and settings["mode"] == "selective" and settings.get("youtube_transport_probe")
             and (transport == "https_reachable" or transport_failed)):
-        transport_rows = transport_probes(selected.get("transport_probes"))
+        transport_rows = transport_probes(selected.get("transport_probes"), now=now)
+    urls = settings["probe_urls"]
+    page_kind = (zapret2.youtube_probe_page_kind(urls[0])
+                 if settings.get("youtube_transport_probe") and urls else None)
     blockers = {mode: management.reasons(cfg, mode, ready=fresh, capture=capture)
                 for mode in schema.MODES} if not invalid else {
                     mode: ["Политика zapret2 некорректна."] for mode in schema.MODES}
@@ -224,6 +235,7 @@ Commands use the same validation as this card; observations remain revision-boun
         "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},
         "blockers": blockers,
         "youtube_transport_probe": settings.get("youtube_transport_probe", False),
+        "youtube_probe_page_kind": page_kind,
         "probe_count": len(settings["probe_urls"]), "probes": [], "probe_expiry": [],
         "check_seconds": settings["check_seconds"], "retry_seconds": settings["retry_seconds"],
         "daily_probe_mb": settings["daily_probe_mb"],

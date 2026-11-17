@@ -48,20 +48,27 @@ def test_transport_probe_details_are_private_and_revision_bound():
     cfg, snap = fixture(mode="selective", engine="off", state="fallback",
                         reason="youtube_page_probe_failed", gate_closed=True)
     cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms?secret-token"]
     cfg.desync = schema.migrate(vars(cfg.zapret2))
     snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
     snap["zapret2"]["transport_probes"] = {
         "page": {"ok": False, "phase": "tls", "kind": "timeout", "connect_http": 0,
+                 "page_kind": "terms", "started_at": NOW - 5,
                  "http": 0, "bytes": 0, "elapsed_ms": 4974, "url": "secret-token"},
         "cdn": {"ok": True, "phase": "body"},
     }
     evidence = view(cfg, snap)["evidence"]
+    assert view(cfg, snap)["youtube_probe_page_kind"] == "terms"
     assert set(evidence["transport_probes"]) == {"page"}
     assert evidence["transport_probes"]["page"]["elapsed_ms"] == 4974
+    assert evidence["transport_probes"]["page"]["page_kind"] == "terms"
+    assert evidence["transport_probes"]["page"]["started_at"] == NOW - 5
     assert evidence["transport"] == "unknown" and evidence["playback"] == "not_tested"
     assert "secret" not in json.dumps(evidence)
-    snap["zapret2"]["transport_probes"]["page"].update(phase="unexpected-private-value")
-    assert view(cfg, snap)["evidence"]["transport_probes"]["page"]["phase"] is None
+    snap["zapret2"]["transport_probes"]["page"].update(
+        phase="unexpected-private-value", page_kind="secret-token", started_at=NOW + 1)
+    filtered = view(cfg, snap)["evidence"]["transport_probes"]["page"]
+    assert all(filtered[field] is None for field in ("phase", "page_kind", "started_at"))
     snap["zapret2_policy_key"] = "previous"
     assert view(cfg, snap)["evidence"]["transport_probes"] == {}
 
