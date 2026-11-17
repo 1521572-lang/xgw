@@ -72,4 +72,4 @@
 - Слой TLS-лимита **оставлен** (accept по ТЗ при успешных пробах).
 - Приватное: `~/xgw-tls.fs` (0700/0600) — снапы, дельты, логи, URL-файл, скрипты;
   бэкап `/var/lib/xgw/handoff/selective-tls-…` сохранён. URL/подписи/IP не публикуются.
-- Publication commit: добавить после push.
+- Publication commit: `c733483c661bdf3dbcc3f09b4d2d210dccac79f9` (bbadb4a → c733483, remote verified byte-identical to local HEAD).
