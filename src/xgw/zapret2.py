@@ -39,7 +39,8 @@ UNIT = worker.SELECTED_UNIT
 LIVE = "zapret2_live"
 BUDGET = "zapret2_probe_budget"
 PROBE_BYTES = 64 * 1024
-YOUTUBE_PAGE_MAX_SECONDS = 12
+YOUTUBE_TRANSPORT_MAX_SECONDS = 12
+YOUTUBE_TRANSPORT_TLS_SECONDS = 10
 YOUTUBE_PAGE_SILENCE_SECONDS = 6
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
@@ -436,13 +437,14 @@ class Controller:
     @staticmethod
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
                  *, max_total: float = 8, silence: float = 4,
-                 min_body: int = 16 * 1024) -> DownloadResult:
+                 min_body: int = 16 * 1024, tls_timeout: float | None = None) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
         return checks.http_get_via_proxy(
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
-            proxy_pass=password, timeout=5, silence=silence, max_total=max_total,
+            proxy_pass=password, timeout=5, tls_timeout=tls_timeout, silence=silence,
+            max_total=max_total,
             max_bytes=PROBE_BYTES, min_body=min_body, user_agent=user_agent, cancel=cancel,
         )
 
@@ -457,11 +459,13 @@ class Controller:
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
             options = {}
-            if media_transport:
-                options["min_body"] = 0
-            elif z.youtube_transport_probe:
-                options = {"max_total": YOUTUBE_PAGE_MAX_SECONDS,
-                           "silence": YOUTUBE_PAGE_SILENCE_SECONDS}
+            if z.youtube_transport_probe:
+                options = {"max_total": YOUTUBE_TRANSPORT_MAX_SECONDS,
+                           "tls_timeout": YOUTUBE_TRANSPORT_TLS_SECONDS}
+                if media_transport:
+                    options["min_body"] = 0
+                else:
+                    options["silence"] = YOUTUBE_PAGE_SILENCE_SECONDS
             started = time.monotonic()
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)

@@ -64,6 +64,7 @@ def http_get_via_proxy(
     url: str,
     *,
     timeout: float = 15.0,
+    tls_timeout: float | None = None,
     silence: float = 5.0,
     proxy_user: str = "",
     proxy_pass: str = "",
@@ -87,6 +88,8 @@ def http_get_via_proxy(
     загрузка дольше `max_total` секунд → timeout (защита от «капающего» сервера): это общий
     срок всех этапов — соединения с прокси, CONNECT, рукопожатия TLS и ответа (C03
     кросс-аудита 4cc96b9: раньше каждый этап ждал свои `timeout` секунд сверх него).
+    `tls_timeout` задаёт отдельный предел TLS после CONNECT. По умолчанию используется
+    `timeout`. Общий срок `max_total` ограничивает оба этапа.
     `min_body` — тело короче (ответ 204, пустой 200) — неудача: пробе нужен файл, а не
     ответ без тела (C01).
     `user_agent` — заголовок запроса (probe.user_agent); пусто — «xgw/<версия>».
@@ -144,7 +147,8 @@ def http_get_via_proxy(
                 sock = context.wrap_socket(
                     sock, server_hostname=host, do_handshake_on_connect=False
                 )
-                fetch.wait_io(sock, sock.do_handshake, left(timeout), cancel)
+                handshake_cap = timeout if tls_timeout is None else tls_timeout
+                fetch.wait_io(sock, sock.do_handshake, left(handshake_cap), cancel)
             except TimeoutError as exc:
                 return DownloadResult(ok=False, kind="timeout", error=f"таймаут TLS: {exc}",
                                       phase=phase)

@@ -7,9 +7,13 @@ import ssl
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from xgw import fetch
+from xgw.watch import checks
 from xgw.watch.checks import DownloadResult, http_get_via_proxy, tcp_check, trace_location
 from xgw.watch.scan import classify
 
@@ -417,6 +421,29 @@ def test_tls_timeout_has_tls_phase_after_connect(serve):
         "127.0.0.1", proxy.port, "https://origin.example.com/", timeout=0.5,
     )
     assert not result.ok and (result.phase, result.kind, result.status) == ("tls", "timeout", 0)
+
+
+@pytest.mark.parametrize(("tls_timeout", "total", "expected"), [
+    (None, 12, 5), (10, 12, 10), (10, 8, 6),
+])
+def test_tls_timeout_respects_deadline(monkeypatch, tls_timeout, total, expected):
+    sock, context = Mock(), Mock()
+    context.wrap_socket.return_value = sock
+    connect = Mock(return_value=sock)
+    handshake = Mock(side_effect=TimeoutError)
+    clock = iter((0, 0, 2))  # CONNECT takes two seconds of the shared budget.
+    monkeypatch.setattr(checks, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(fetch, "open_tunnel", connect)
+    monkeypatch.setattr(fetch, "wait_io", handshake)
+
+    result = http_get_via_proxy("127.0.0.1", 1234, "https://origin.example.com/",
+                                timeout=5, max_total=total, tls_timeout=tls_timeout,
+                                tls_context=context)
+    assert connect.call_args.kwargs["timeout"] == 5
+    assert connect.call_args.kwargs["deadline"] == total
+    handshake.assert_called_once_with(sock, sock.do_handshake, expected, None)
+    assert (result.ok, result.phase, result.kind) == (False, "tls", "timeout")
+    sock.close.assert_called_once()
 
 
 def test_probe_request_carries_the_configured_user_agent(serve):

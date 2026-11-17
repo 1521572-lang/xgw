@@ -6,6 +6,7 @@ helper=$2
 backup=$3
 panel=$4
 mode=$5
+overlay=${6:---zapret2-management}
 [[ "$mode" == accept || "$mode" == rollback ]]
 exec 9>"$backup/restore.lock"
 flock 9
@@ -15,7 +16,7 @@ trap 'rm -f -- "$temp"' EXIT
 cp --preserve=mode,ownership -- "$backup/panel.before" "$temp"
 mv -fT -- "$temp" "$panel"
 if [[ "$mode" == rollback ]]; then
-  "$py" "$helper" rollback --zapret2-management --backup "$backup"
+  "$py" "$helper" rollback "$overlay" --backup "$backup"
 else
   systemctl start xgw.service
 fi

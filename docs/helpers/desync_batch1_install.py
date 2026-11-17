@@ -54,6 +54,8 @@ T10_FLOWSEAL_TIMER = "xgw-desync-t10-flowseal-rollback.timer"
 YOUTUBE_TRANSPORT_TIMER = "xgw-selective-youtube-transport-rollback.timer"
 ZAPRET2_WEB_TIMER = "xgw-zapret2-web-rollback.timer"
 ZAPRET2_MANAGEMENT_TIMER = "xgw-zapret2-management-rollback.timer"
+SELECTIVE_TLS = ("zapret2.py", "watch/checks.py")
+SELECTIVE_TLS_TIMER = "xgw-selective-tls-rollback.timer"
 
 
 def require(ok, message):
@@ -208,6 +210,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "selective_tls", False):
+        return SELECTIVE_TLS, SELECTIVE_TLS_TIMER
     if getattr(args, "zapret2_management", False):
         return ZAPRET2_MANAGEMENT, ZAPRET2_MANAGEMENT_TIMER
     if args.zapret2_web:
@@ -258,6 +262,7 @@ def main():
     stage.add_argument("--youtube-transport", action="store_true")
     stage.add_argument("--zapret2-web", action="store_true")
     stage.add_argument("--zapret2-management", action="store_true")
+    stage.add_argument("--selective-tls", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

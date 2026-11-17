@@ -175,15 +175,15 @@ def test_missing_video_probe_does_not_launch_worker():
     [(False, 204, False), (True, 204, True), (True, 200, True),
      (True, 302, False), (True, 403, False)],
 )
-def test_youtube_transport_gate_only_relaxes_cdn_body_size(enabled, media_status, opens):
+def test_youtube_transport_gate_retains_page_and_cdn_checks(enabled, media_status, opens):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = enabled
     h.cfg.zapret2.probe_urls[1] = "https://r1---sn-test.googlevideo.com/videoplayback"
     h.controller.probe = z.Controller.probe.__get__(h.controller)
     seen = []
 
-    def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4):
-        seen.append((min_body, max_total, silence))
+    def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4, tls_timeout=None):
+        seen.append((min_body, max_total, silence, tls_timeout))
         if "googlevideo.com" not in url:
             return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
         return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204),
@@ -192,8 +192,8 @@ def test_youtube_transport_gate_only_relaxes_cdn_body_size(enabled, media_status
     h.controller._request = request
     for now in (0, 1, 2):
         h.step(now)
-    expected_page = (16384, 12, 6) if enabled else (16384, 8, 4)
-    assert seen == [expected_page, (0 if enabled else 16384, 8, 4)]
+    assert seen == ([(16384, 12, 6, 10), (0, 12, 4, 10)] if enabled
+                    else [(16384, 8, 4, None)] * 2)
     assert z.active(h.current) is opens
     if enabled:
         rows = h.controller.view["transport_probes"]
