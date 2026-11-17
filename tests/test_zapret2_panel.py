@@ -31,6 +31,19 @@ def view(cfg, snapshot, **kwargs):
     return card(cfg, snapshot, {"mode": "on"}, True, now=NOW, **kwargs)
 
 
+def test_youtube_transport_is_never_reported_as_playback():
+    cfg, snap = fixture(mode="selective", engine="off", reason="youtube_transport_ok",
+                        valid_until=NOW + 60)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    result = view(cfg, snap)
+    assert result["evidence"]["transport"] == "https_reachable"
+    assert result["evidence"]["playback"] == "not_tested"
+    snap["zapret2"]["valid_until"] = NOW
+    assert view(cfg, snap)["evidence"]["transport"] == "unknown"
+
+
 @pytest.mark.parametrize(("state", "reason", "expected"), [
     ("active", "", "active"), ("off", "not_found", "absent"),
     ("fallback", "worker_down", "error"), ("fallback", "queue_busy", "error"),

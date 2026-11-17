@@ -1,8 +1,10 @@
-# T04/T12 — YouTube через zapret2, остальной трафик через VPN
+# T04/T12 — Selective YouTube с проверкой HTTPS до CDN
 
-**Текущее задание** — [живая проверка Selective на ThinkCentre](T04-SELECTIVE-YOUTUBE.md).
-Используй `multisplit`, штатный VPN и новый сбор счётчиков по фазам. Проверь прямой
-путь YouTube и VPN для контрольного трафика, затем возврат YouTube на VPN при отказе.
+**Текущее задание** — [приёмка новой проверки CDN на ThinkCentre](T04-YOUTUBE-TRANSPORT.md).
+В [отчёте Selective](../reports/2026-11-17_desync-selective-youtube.md) подтверждены
+выходы VPN через Xray и sing-box. Прямой путь не открылся: в опыте YouTube передавал
+видео через SABR POST, а GET давал 204 или короткую заглушку. Проверь новый HTTPS-gate,
+живое воспроизведение через zapret2 и параллельный VPN для контрольного сайта.
 Исполнитель сама запускает команды, использует GUI/vision и публикует отчёт.
 
 [Отчёт ALT9](../reports/2026-11-17_desync-t10-flowseal-live.md) подтвердил две попытки

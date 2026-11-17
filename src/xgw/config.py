@@ -395,6 +395,7 @@ class Zapret2:
     probe_port: int = 19999
     # Адреса задаёт владелец: страница и файл видеосети. Пусто — остаётся VPN.
     probe_urls: list[str] = field(default_factory=list)
+    youtube_transport_probe: bool = False
     check_seconds: int = 180
     retry_seconds: int = 300
     daily_probe_mb: int = 256

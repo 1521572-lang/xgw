@@ -14,7 +14,7 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-from .flowseal import LIVE_STRATEGY, valid_live_scope
+from .flowseal import LIVE_STRATEGY, YOUTUBE_DOMAINS, valid_live_scope
 
 VERSION = 1
 MODES = ("off", "standalone", "selective", "compare")
@@ -45,6 +45,7 @@ DEFAULTS = {
     "check_seconds": 180, "retry_seconds": 300, "daily_probe_mb": 256,
     "observe_synack": False,
     "observe_reply_packets": 0,
+    "youtube_transport_probe": False,
     "engine": "off", "engine_profile": "seqovl", "engine_queue": 200,
     "engine_offload": True, "blob_dir": "",
 }
@@ -56,6 +57,7 @@ GROUPS = {
 }
 ENGINE_FIELDS = ("engine", "engine_profile", "engine_queue", "engine_offload", "blob_dir")
 OBSERVATION_FIELDS = ("observe_synack", "observe_reply_packets")
+OPTIONAL_SELECTED = (*OBSERVATION_FIELDS, "youtube_transport_probe")
 MAX_REPLY_PACKETS = 8
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
@@ -67,6 +69,29 @@ class PolicyError(ValueError):
 def _require(ok: bool, field: str) -> None:
     if not ok:
         raise PolicyError(f"desync: invalid {field}")
+
+
+def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> bool:
+    """Only the selected YouTube page and a real video CDN hostname may use this gate."""
+    if mode == "off":
+        return True
+    selected = set(domains)
+    if (mode != "selective" or len(urls) != 2
+            or not {"domain:youtube.com", "domain:googlevideo.com"}
+            <= selected <= set(YOUTUBE_DOMAINS)):
+        return False
+    try:
+        page, media = map(urlsplit, urls)
+        if any(u.scheme != "https" or u.port not in (None, 443) or u.username is not None
+               or u.password is not None or u.fragment for u in (page, media)):
+            return False
+    except ValueError:
+        return False
+    page_host = page.hostname or ""
+    cdn = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.googlevideo\.com"
+    return ((page_host == "youtube.com" or page_host.endswith(".youtube.com"))
+            and media.path == "/videoplayback"
+            and bool(re.fullmatch(cdn, media.hostname or "")))
 
 
 def validate_patch(value: object) -> dict:
@@ -131,7 +156,7 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         for group, names in GROUPS.items():
             section = value[group]
             required = set(names)
-            optional = set(OBSERVATION_FIELDS) if group == "selected" else set()
+            optional = set(OPTIONAL_SELECTED) if group == "selected" else set()
             _require(isinstance(section, dict) and required <= set(section) <= required | optional,
                      group)
             flat.update(section)
@@ -143,8 +168,8 @@ Calling migrate twice returns equal documents; lists preserve order and exact co
         flat.update(validate_patch(value))
     result = {"schema_version": VERSION,
               **{group: {name: flat[name] for name in names} for group, names in GROUPS.items()}}
-    # Preserve the representation and revision of policies without packet observation.
-    for name in OBSERVATION_FIELDS:
+    # Preserve the representation and revision of policies using the defaults.
+    for name in OPTIONAL_SELECTED:
         if flat.get(name):
             result["selected"][name] = flat[name]
     return result
@@ -185,6 +210,11 @@ Known selected strategies may remain dormant in off mode without substitution.
     flat = flatten(policy)
     if flat.get("observe_reply_packets") and not flat.get("observe_synack"):
         raise PolicyError("desync: observe_reply_packets requires observe_synack")
+    if flat.get("youtube_transport_probe") and (
+        target == "freepool"
+        or not valid_youtube_transport(flat["mode"], flat["domains"], flat["probe_urls"])
+    ):
+        raise PolicyError("desync: youtube_transport_probe requires Selective and two YouTube URLs")
     if flat["strategy"] == LIVE_STRATEGY:
         if target == "freepool":
             raise PolicyError("desync: the T10 Flowseal profile cannot be represented by freepool")

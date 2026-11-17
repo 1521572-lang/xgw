@@ -170,6 +170,53 @@ def test_missing_video_probe_does_not_launch_worker():
     assert not any(name == "start" for name, _ in h.runtime.events)
 
 
+@pytest.mark.parametrize(
+    ("enabled", "media_status", "opens"),
+    [(False, 204, False), (True, 204, True), (True, 200, True),
+     (True, 302, False), (True, 403, False)],
+)
+def test_youtube_transport_gate_only_relaxes_cdn_body_size(enabled, media_status, opens):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = enabled
+    h.cfg.zapret2.probe_urls[1] = "https://r1---sn-test.googlevideo.com/videoplayback"
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    seen = []
+
+    def request(url, *_args, min_body=16 * 1024):
+        seen.append(min_body)
+        if "googlevideo.com" not in url:
+            return checks.DownloadResult(ok=True, status=200, downloaded=32768)
+        return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204),
+                                     status=media_status, downloaded=0)
+
+    h.controller._request = request
+    for now in (0, 1, 2):
+        h.step(now)
+    assert seen == [16384, 0 if enabled else 16384]
+    assert z.active(h.current) is opens
+    if opens:
+        assert h.controller.view["reason"] == "youtube_transport_ok"
+        h.runtime.up = False
+        h.step(3)
+        assert not z.active(h.current)
+        assert h.controller.view["reason"] == "worker_down"
+    else:
+        assert h.controller.view["reason"] == (
+            "youtube_cdn_probe_failed" if enabled else "probe_failed"
+        )
+
+
+def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():
+    cfg, _, _ = setup()
+    cfg.zapret2.youtube_transport_probe = True
+    assert not z.configured(cfg)  # generic CDN URL is insufficient even with opt-in
+    cfg.zapret2.probe_urls[1] = "https://r1---sn-test.googlevideo.com/videoplayback"
+    assert z.configured(cfg)
+    cfg.zapret2.domains.append("domain:example.org")
+    assert not z.configured(cfg)
+    assert z.validate(cfg)
+
+
 def test_conflicting_probe_port_disables_new_mode():
     cfg, _, _ = setup()
     cfg.zapret2.probe_port = cfg.xray.metrics_port

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
 from .desync import flowseal, h05, preflight, worker
-from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES
+from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES, valid_youtube_transport
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -84,6 +84,8 @@ def validate(cfg: Config) -> list[str]:
         problems.append("strategy: неизвестная или неподдерживаемая в выбранном режиме")
     if z.strategy == flowseal.LIVE_STRATEGY and not flowseal.valid_live_scope(z.mode, z.domains):
         problems.append("Flowseal ALT9 требует Standalone и домены YouTube")
+    if z.youtube_transport_probe and not valid_youtube_transport(z.mode, z.domains, z.probe_urls):
+        problems.append("youtube_transport_probe требует Selective, страницу YouTube и CDN")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
         problems.append("queue_num или probe_port вне допустимого диапазона")
     if z.probe_port in (cfg.capture.tproxy_port, cfg.xray.metrics_port, cfg.xray.socks_port,
@@ -140,6 +142,8 @@ def validate(cfg: Config) -> list[str]:
 def configured(cfg: Config) -> bool:
     """Для YouTube нужны обе стороны; пустой адрес никогда не заменяется сторонним CDN."""
     z = cfg.zapret2
+    if z.youtube_transport_probe:
+        return z.probe_enabled and valid_youtube_transport(z.mode, z.domains, z.probe_urls)
     hosts = [urlsplit(url).hostname or "" for url in z.probe_urls]
     if not hosts:
         return False
@@ -404,6 +408,7 @@ class Controller:
         self.cleanup_pending = False
         self.start_deadline: float | None = None
         self.last_error = ""
+        self.probe_failure = "probe_failed"
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
@@ -427,24 +432,32 @@ class Controller:
 
     @staticmethod
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
-                 *, max_total: float = 8) -> DownloadResult:
+                 *, max_total: float = 8, min_body: int = 16 * 1024) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
         return checks.http_get_via_proxy(
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
             proxy_pass=password, timeout=5, silence=4, max_total=max_total,
-            max_bytes=PROBE_BYTES, min_body=16 * 1024, user_agent=user_agent, cancel=cancel,
+            max_bytes=PROBE_BYTES, min_body=min_body, user_agent=user_agent, cancel=cancel,
         )
 
     def probe(self, cfg: Config, applied: dict, cancel) -> bool:
         from .generator import builder
 
         password, _ = builder.probe_state(applied)
-        for url in cfg.zapret2.probe_urls:
-            verdict = self._request(url, cfg.zapret2.probe_port, password or "",
-                                    cfg.probe.user_agent, cancel)
-            if not verdict.ok:
+        z = cfg.zapret2
+        if z.youtube_transport_probe and (not configured(cfg) or not password):
+            return False
+        for index, url in enumerate(z.probe_urls):
+            media_transport = z.youtube_transport_probe and index == 1
+            options = {"min_body": 0} if media_transport else {}
+            verdict = self._request(url, z.probe_port, password or "",
+                                    cfg.probe.user_agent, cancel, **options)
+            if not verdict.ok or (media_transport and verdict.status not in (200, 204)):
+                if z.youtube_transport_probe:
+                    self.probe_failure = ("youtube_cdn_probe_failed" if media_transport
+                                          else "youtube_page_probe_failed")
                 return False
         return True
 
@@ -610,8 +623,9 @@ class Controller:
                         self.runtime.sample_trace()
                     else:
                         self.runtime.gate(cfg.zapret2.check_seconds + 60)
+                        self.probe_failure = "probe_failed"
                         if not self.probe(cfg, applied, cancel):
-                            raise ValueError("probe_failed")
+                            raise ValueError(self.probe_failure)
                         self.healthy = True
                         self.last_error = ""
                         self.next_check = now + cfg.zapret2.check_seconds
@@ -625,21 +639,25 @@ class Controller:
                     changed = target != applied and apply(target, applied)
                     if target != applied and not changed:
                         raise ValueError("apply_failed")
-                    self.view = {"state": "active", "reason": "probes_ok",
+                    self.view = {"state": "active", "reason": (
+                                     "youtube_transport_ok" if cfg.zapret2.youtube_transport_probe
+                                     else "probes_ok"),
                                  "valid_until": time.time() + lease}
                     return changed
                 reason = self.last_error or "retry_wait"
         except (OSError, ValueError, cmd.CommandError) as exc:
             # Ни URL, ни argv/вывод nfqws2, ни пароль служебного входа не публикуются.
+            probe_errors = {"probe_failed", "youtube_cdn_probe_failed",
+                            "youtube_page_probe_failed"}
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
                      "bundle_mismatch", "bad_worker_options", "lua_init_failed",
-                     "probe_budget", "probe_failed", "apply_failed",
-                     "worker_unit_busy", "worker_handoff_pending"}
+                     "probe_budget", "apply_failed",
+                     "worker_unit_busy", "worker_handoff_pending", *probe_errors}
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
             self.next_check = now + cfg.zapret2.retry_seconds
-            check_vpn = reason in ("worker_down", "probe_failed")
+            check_vpn = reason == "worker_down" or reason in probe_errors
         self.healthy = False
         gate_closed = True
         try:

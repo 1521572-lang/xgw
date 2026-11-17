@@ -38,6 +38,9 @@ REASONS = {
     "probe_failed": "Проверка прямого пути не прошла.",
     "probe_budget": "Исчерпан бюджет проверок прямого пути.",
     "probes_ok": "Пробы прямого пути прошли; воспроизведение проверяется отдельно.",
+    "youtube_transport_ok": "HTTPS до страницы YouTube и CDN работает. Видео не проверялось.",
+    "youtube_page_probe_failed": "HTTPS-проверка страницы YouTube не прошла.",
+    "youtube_cdn_probe_failed": "HTTPS-проверка CDN YouTube не прошла.",
     "retry_wait": "Ожидается повтор проверки прямого пути.",
     "apply_failed": "Применение маршрута не подтверждено.",
     "dependency_missing": "Не найдены зависимости обработчика.",
@@ -158,6 +161,9 @@ The card exposes state only. Mode-changing commands belong to T11.
     queue = raw.get("queue") if source == "engine" else settings["queue_num"]
     queue = queue if type(queue) is int and 1 <= queue <= 65535 else None
     trusted = fresh and matched and not invalid
+    transport = ("https_reachable"
+                 if trusted and phase == "active" and reason == "youtube_transport_ok"
+                 and settings.get("youtube_transport_probe") is True else "unknown")
     unavailable = ["Управление режимами пока недоступно в этой версии панели."]
     return {
         "schema_version": schema.VERSION, "mode": settings["mode"], "source": source,
@@ -173,7 +179,7 @@ The card exposes state only. Mode-changing commands belong to T11.
                    "queue": queue if trusted else None},
         "counters": {"queued_original": None, "queued_reply": None,
                      "queue_dropped": None, "strategy_switches": None},
-        "evidence": {"transport": "unknown", "playback": "not_tested",
+        "evidence": {"transport": transport, "playback": "not_tested",
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
                      "vpn_control_at": vpn_control_at},
         "can_off": False, "can_edit": False,
