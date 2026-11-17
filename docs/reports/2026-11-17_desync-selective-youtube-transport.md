@@ -116,4 +116,4 @@
   администратор хоста немедленно** — раздел заполнится при продолжении роста;
   H02 без изменений; деградация плеера (плеер-уровневый watchdog поверх транспортного
   гейта) — отдельная работа по плану.
-- Publication commit: добавить после push.
+- Publication commit: `473dcc6857fce5e8c3aadb63bc9021ffc4dcc7ad` (a15fd14 → 473dcc6, remote verified byte-identical to local HEAD).
