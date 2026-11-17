@@ -124,6 +124,8 @@ _STATIC = {
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/icon.svg": ("icon.svg", "image/svg+xml"),
+    "/zapret2.css": ("zapret2.css", "text/css; charset=utf-8"),
+    "/zapret2.js": ("zapret2.js", "text/javascript; charset=utf-8"),
 }
 _CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
@@ -756,6 +758,31 @@ class Panel:
 
         masked["zapret2"] = zapret2_card(cfg, snapshot, info, daemon is not None, now=now)
         return masked
+
+    def zapret2_overview(self) -> dict:
+        """Use the same card as the main panel, without building its server and device lists."""
+        from ..desync import event_socket
+        from .zapret2_control import card
+
+        now = time.time()
+        snapshot = status.read_status(self.paths, max_age=float("inf")) or {}
+        capture = {"mode": self._capture().mode()}
+        journal = event_socket.cursor_response(snapshot, None, 0, now)
+        events = journal["events"]
+        visible = 16
+        public_fields = ("seq", "at", "phase", "unit", "queue", "generation")
+        return {
+            "zapret2": card(self.cfg, snapshot, capture, self.daemon is not None, now=now),
+            "journal": {
+                "available": journal["state"] == "snapshot",
+                "epoch": journal.get("epoch"),
+                "omitted": journal.get("discarded", 0) + max(0, len(events) - visible),
+                "events": [
+                    {key: event[key] for key in public_fields}
+                    for event in reversed(events[-visible:])
+                ],
+            },
+        }
 
     def _netcheck_card(self) -> dict:
         from .. import netcheck  # он тянет diag → install → эту панель: только здесь
@@ -2039,6 +2066,13 @@ class Panel:
                 handler, "index.html" if authorized else "login.html",
                 "text/html; charset=utf-8", body,
             )
+        elif url.path == "/zapret2":
+            self._file(handler, "zapret2.html" if authorized else "login.html",
+                       "text/html; charset=utf-8", body)
+        elif url.path == "/api/zapret2/overview":
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            self._json(handler, HTTPStatus.OK, self.zapret2_overview(), body)
         elif url.path == "/api/state":
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")

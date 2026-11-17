@@ -319,6 +319,32 @@ def test_bad_requests_get_clear_answers(rig, user):
 # --- что видно ---------------------------------------------------------------------
 
 
+def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
+    from xgw.desync import worker
+
+    slot = worker.WorkerSlot()
+    for _ in range(10):
+        lease = slot.reserve(worker.SELECTED_UNIT, 201, policy_key="1" * 64)
+        slot.release(lease)
+    status.write_status(rig.paths, {**_snapshot(), "zapret2_worker_events": slot.snapshot()[1]})
+    guest_client = Client(rig.panel.port)
+    assert guest_client.request("GET", "/api/zapret2/overview")[0].status == 401
+    response, guest = guest_client.request("GET", "/zapret2")
+    assert response.status == 200 and 'id="domain-list"' not in guest
+    response, page = user.request("GET", "/zapret2")
+    assert response.status == 200 and 'src="/zapret2.js"' in page
+    assert "script-src 'self'" in response.getheader("Content-Security-Policy")
+    response, body = user.request("GET", "/api/zapret2/overview")
+    assert response.status == 200
+    overview = json.loads(body)
+    assert set(overview) == {"zapret2", "journal"}
+    assert overview["journal"]["omitted"] == 4
+    assert [row["seq"] for row in overview["journal"]["events"]] == list(range(20, 4, -1))
+    assert "policy_key" not in body and "probe_urls" not in body and TOKEN not in body
+    response, _ = user.request("GET", "/api/zapret2/overview", host="foreign.test")
+    assert response.status == 403
+
+
 def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     managed.set_servers(rig.store_path, ["dddd4444"], "disabled")
     rig.panel._wake()

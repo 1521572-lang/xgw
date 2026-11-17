@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>zapret2 · XGW</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/zapret2.css">
+  <script src="/zapret2.js" defer></script>
+</head>
+<body>
+  <div class="zmw-shell">
+    <aside class="zmw-side">
+      <a class="zm-brand" href="/">
+        <img src="/icon.svg" width="28" height="28" alt="">
+        <span>XGW</span>
+      </a>
+      <nav class="zmw-nav" aria-label="Разделы zapret2">
+        <a href="#overview">Обзор</a>
+        <a href="#domains">Домены</a>
+        <a href="#events">Журнал</a>
+      </nav>
+      <label class="zm-theme">
+        <span>Тема</span>
+        <select id="theme">
+          <option value="system">Системная</option>
+          <option value="light">Светлая</option>
+          <option value="dark">Тёмная</option>
+        </select>
+      </label>
+    </aside>
+
+    <main class="zm-main">
+      <header id="overview" class="zm-heading">
+        <h1>zapret2</h1>
+        <span class="zm-status" id="state" data-tone="waiting" role="status">Загрузка…</span>
+      </header>
+      <p class="zm-detail" id="detail"></p>
+
+      <div class="zm-cards">
+        <section class="zm-card" aria-labelledby="mode-title">
+          <h2 id="mode-title">Режим</h2>
+          <dl>
+            <dt>Маршрутизация</dt><dd id="mode">—</dd>
+            <dt>Настроенная стратегия</dt><dd id="profile">—</dd>
+            <dt>Активная стратегия</dt><dd id="running">—</dd>
+            <dt>Очередь</dt><dd id="queue">—</dd>
+          </dl>
+        </section>
+        <section class="zm-card" aria-labelledby="evidence-title">
+          <h2 id="evidence-title">Проверки</h2>
+          <dl>
+            <dt>HTTPS до YouTube и CDN</dt><dd id="https">—</dd>
+            <dt>Воспроизведение</dt><dd id="playback">—</dd>
+            <dt>Служебная проба VPN</dt><dd id="vpn">—</dd>
+          </dl>
+        </section>
+        <section class="zm-card" id="domains" aria-labelledby="domains-title">
+          <h2 id="domains-title">Домены в настройках</h2>
+          <ul class="zm-domains" id="domain-list"></ul>
+          <p id="domains-empty" class="muted">—</p>
+        </section>
+        <section class="zm-card" aria-labelledby="counters-title">
+          <h2 id="counters-title">Счётчики очереди</h2>
+          <dl>
+            <dt>Исходящие</dt><dd id="queued-original">—</dd>
+            <dt>Ответы</dt><dd id="queued-reply">—</dd>
+            <dt>Потери</dt><dd id="queue-dropped">—</dd>
+          </dl>
+        </section>
+      </div>
+
+      <section class="zm-card zm-events" id="events" aria-labelledby="events-title">
+        <h2 id="events-title">Журнал обработчиков</h2>
+        <p id="events-note" class="muted">—</p>
+        <ul id="event-list"></ul>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

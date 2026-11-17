@@ -34,6 +34,9 @@ T08_EVENTS = ("daemon.py", "desync/worker.py", "nfqws2.py", "zapret2.py")
 T09_TOURNAMENT = ("desync/schema.py", "zapret2.py")
 T10_FLOWSEAL = ("desync/schema.py", "desync/flowseal.py", "desync/experiment.py", "zapret2.py")
 YOUTUBE_TRANSPORT = (*T10_FLOWSEAL, "config.py", "watch/zapret2_control.py")
+ZAPRET2_WEB = ("watch/panel.py", "desync/event_socket.py", "ui/index.html",
+               "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js",
+               "ui/zapret2.LICENSE.txt", "ui/zapret2.NOTICE.txt")
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
@@ -46,6 +49,7 @@ T08_EVENTS_TIMER = "xgw-desync-t08-events-rollback.timer"
 T09_TOURNAMENT_TIMER = "xgw-desync-t09-tournament-rollback.timer"
 T10_FLOWSEAL_TIMER = "xgw-desync-t10-flowseal-rollback.timer"
 YOUTUBE_TRANSPORT_TIMER = "xgw-selective-youtube-transport-rollback.timer"
+ZAPRET2_WEB_TIMER = "xgw-zapret2-web-rollback.timer"
 
 
 def require(ok, message):
@@ -126,7 +130,10 @@ def prepare(args, backup):
         for path in (source, target, baseline):
             trusted(path)
         new = source.read_bytes()
-        compile(new, str(source), "exec")
+        if files == ZAPRET2_WEB and target.parent == package / "ui":
+            new.decode("utf-8")
+        else:
+            compile(new, str(source), "exec")
         old = target.read_bytes() if target.exists() else None
         if baseline.exists():
             require(old == baseline.read_bytes(), f"installed baseline differs: {target}")
@@ -194,6 +201,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if args.zapret2_web:
+        return ZAPRET2_WEB, ZAPRET2_WEB_TIMER
     if args.youtube_transport:
         return YOUTUBE_TRANSPORT, YOUTUBE_TRANSPORT_TIMER
     if args.flowseal_t10:
@@ -238,6 +247,7 @@ def main():
     stage.add_argument("--tournament-t09", action="store_true")
     stage.add_argument("--flowseal-t10", action="store_true")
     stage.add_argument("--youtube-transport", action="store_true")
+    stage.add_argument("--zapret2-web", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
