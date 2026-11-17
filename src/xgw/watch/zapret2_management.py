@@ -24,13 +24,19 @@ def candidate(cfg, patch, *, editing=False):
     if flat.get("youtube_transport_probe") and (mode != "off" or editing):
         if mode not in ("off", "selective"):
             raise schema.PolicyError("HTTPS-проверка YouTube и CDN доступна только для Selective.")
-        if not schema.valid_youtube_domains(flat["domains"]):
+        awaiting_urls = (mode == "off" and cfg.zapret2.youtube_transport_probe
+                         and not flat["probe_urls"])
+        domains_changed = flat["domains"] != cfg.zapret2.domains
+        if ((domains_changed or not awaiting_urls)
+                and not schema.valid_youtube_domains(flat["domains"])):
             raise schema.PolicyError(
                 "Для HTTPS-проверки введите только поддерживаемые домены YouTube, "
                 "включая domain:youtube.com и domain:googlevideo.com, "
                 "или подставьте список в форме."
             )
-        if not schema.valid_youtube_transport("selective", flat["domains"], flat["probe_urls"]):
+        if not awaiting_urls and not schema.valid_youtube_transport(
+            "selective", flat["domains"], flat["probe_urls"]
+        ):
             raise schema.PolicyError(
                 "Сохраните HTTPS-адрес страницы YouTube и HTTPS-адрес CDN googlevideo.com "
                 "с путём /videoplayback или отключите HTTPS-проверку YouTube и CDN."
