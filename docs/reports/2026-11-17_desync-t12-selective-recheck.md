@@ -100,4 +100,4 @@
    состояния очереди/меток в момент probe (zapret2_live/рейт-лимит) сохраняется.
 3. Recheck-диагностика (started_at/page_kind/elapsed) — работает как задумано.
 4. Длинный опыт — переносится после стабилизации CDN-пробы.
-- Publication commit: добавить после push.
+- Publication commit: `e09044ebc61c4151e37d26c819e8b5eafb2bab6d` (09aa8af → e09044e, remote verified byte-identical to local HEAD).
