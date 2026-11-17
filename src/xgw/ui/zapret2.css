@@ -96,6 +96,20 @@
   padding: .6rem 0;
 }
 .zm-events time { display: block; font-size: .83rem; color: var(--muted); }
+.zm-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: .8rem 0; }
+.zm-actions button { white-space: normal; }
+#settings-form[hidden] { display: none; }
+#settings-fields { min-width: 0; margin-top: 1rem; border: 1px solid var(--line); border-radius: 10px; }
+#settings-fields label { display: grid; gap: .35rem; margin: .8rem 0; }
+#settings-fields input, #settings-fields select, #settings-fields textarea {
+  box-sizing: border-box; width: 100%; min-width: 0; color: var(--text);
+  background: var(--card-2); border: 1px solid var(--line); border-radius: 8px; padding: .65rem;
+}
+#settings-fields .zm-check { display: flex; align-items: center; }
+#settings-fields input[type="checkbox"] { width: auto; }
+.zm-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: .7rem; }
+#command-result { white-space: pre-wrap; }
+#settings-revision { color: var(--warn); }
 
 html[data-zm-theme="light"] {
   color-scheme: light;

@@ -37,6 +37,9 @@ YOUTUBE_TRANSPORT = (*T10_FLOWSEAL, "config.py", "watch/zapret2_control.py")
 ZAPRET2_WEB = ("watch/panel.py", "desync/event_socket.py", "ui/index.html",
                "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js",
                "ui/zapret2.LICENSE.txt", "ui/zapret2.NOTICE.txt")
+ZAPRET2_MANAGEMENT = ("watch/panel.py", "watch/zapret2_control.py", "watch/zapret2_management.py",
+                      "ui/zapret2.html", "ui/zapret2.css", "ui/zapret2.js")
+MANAGEMENT_GUI = ("src/xgw/gui/zapret2.py",)
 TIMER = "xgw-desync-b1-rollback.timer"
 T03_TIMER = "xgw-desync-t03-rollback.timer"
 T04_TIMER = "xgw-desync-t04-rollback.timer"
@@ -50,6 +53,7 @@ T09_TOURNAMENT_TIMER = "xgw-desync-t09-tournament-rollback.timer"
 T10_FLOWSEAL_TIMER = "xgw-desync-t10-flowseal-rollback.timer"
 YOUTUBE_TRANSPORT_TIMER = "xgw-selective-youtube-transport-rollback.timer"
 ZAPRET2_WEB_TIMER = "xgw-zapret2-web-rollback.timer"
+ZAPRET2_MANAGEMENT_TIMER = "xgw-zapret2-management-rollback.timer"
 
 
 def require(ok, message):
@@ -118,19 +122,20 @@ def prepare(args, backup):
         require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
                 "active/transitioning worker: stop and report, do not disable it")
     files, _timer = overlay(args)
-    require(not (files != BACKEND and args.gui), "this overlay is backend only")
+    require(not (files not in (BACKEND, ZAPRET2_MANAGEMENT) and args.gui),
+            "this overlay is backend only")
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
               payload / "base/src/xgw" / rel) for rel in files]
     if args.gui:
         gui = bounded(args.gui, "/opt/xgw")
         pairs.extend((payload / "code" / rel, gui / rel, payload / "gui_base" / rel)
-                     for rel in GUI)
+                     for rel in (MANAGEMENT_GUI if files == ZAPRET2_MANAGEMENT else GUI))
     rows = []
     for index, (source, target, baseline) in enumerate(pairs):
         for path in (source, target, baseline):
             trusted(path)
         new = source.read_bytes()
-        if files == ZAPRET2_WEB and target.parent == package / "ui":
+        if files in (ZAPRET2_WEB, ZAPRET2_MANAGEMENT) and target.parent == package / "ui":
             new.decode("utf-8")
         else:
             compile(new, str(source), "exec")
@@ -153,7 +158,9 @@ def prepare(args, backup):
 def records(backup, files):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
-    expected = {len(files), len(files) + len(GUI)} if files == BACKEND else {len(files)}
+    expected = {len(files)}
+    if files in (BACKEND, ZAPRET2_MANAGEMENT):
+        expected.add(len(files) + len(MANAGEMENT_GUI if files == ZAPRET2_MANAGEMENT else GUI))
     require(isinstance(rows, list) and len(rows) in expected, "invalid manifest")
     seen = set()
     for row in rows:
@@ -201,6 +208,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "zapret2_management", False):
+        return ZAPRET2_MANAGEMENT, ZAPRET2_MANAGEMENT_TIMER
     if args.zapret2_web:
         return ZAPRET2_WEB, ZAPRET2_WEB_TIMER
     if args.youtube_transport:
@@ -248,6 +257,7 @@ def main():
     stage.add_argument("--flowseal-t10", action="store_true")
     stage.add_argument("--youtube-transport", action="store_true")
     stage.add_argument("--zapret2-web", action="store_true")
+    stage.add_argument("--zapret2-management", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

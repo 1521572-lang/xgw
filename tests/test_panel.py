@@ -345,6 +345,45 @@ def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
     assert response.status == 403
 
 
+def test_zapret2_commands_require_session_origin_and_revision(rig, user):
+    from xgw.desync import schema
+
+    expected = schema.fingerprint(config.load(rig.config_path)[0].desync)
+    payload = {"expected": expected, "settings": {"retry_seconds": 120}}
+    guest = Client(rig.panel.port)
+    before = rig.store_path.read_bytes() if rig.store_path.exists() else None
+    assert guest.request("POST", "/api/zapret2/settings", body=payload)[0].status == 401
+    for headers, host in [({}, None),
+                          ({"X-XGW-Panel": "1", "Origin": "https://foreign.test"}, None),
+                          ({"X-XGW-Panel": "1"}, "foreign.test")]:
+        response, _ = user.request("POST", "/api/zapret2/settings", body=payload,
+                                   headers=headers, host=host)
+        assert response.status == 403
+    assert (rig.store_path.read_bytes() if rig.store_path.exists() else None) == before
+    assert user.act("zapret2/settings", payload)["code"] == "saved"
+    after = rig.store_path.read_bytes(), rig.store_path.stat().st_mtime_ns
+    assert user.act("zapret2/settings", payload)["code"] == "conflict"
+    assert (rig.store_path.read_bytes(), rig.store_path.stat().st_mtime_ns) == after
+    state = user.state()["zapret2"]
+    overview = json.loads(user.request("GET", "/api/zapret2/overview")[1])["zapret2"]
+    for field in ("config_key", "blockers", "can_edit", "can_off", "selected_strategy"):
+        assert state[field] == overview[field]
+    assert state["config_key"] != expected and state["can_edit"]
+    rig.daemon.poke.clear()
+    assert user.act("zapret2/settings", {
+        **payload, "expected": state["config_key"]})["code"] == "unchanged"
+    assert not rig.daemon.poke.is_set()
+    assert (rig.store_path.read_bytes(), rig.store_path.stat().st_mtime_ns) == after
+    result = user.act("zapret2/settings", {
+        "expected": state["config_key"], "settings": {"probe_urls": [
+            "https://www.youtube.com/watch?v=PRIVATE-PROBE",
+            "https://r1.googlevideo.com/videoplayback?sig=PRIVATE-PROBE"]}})
+    assert result["ok"]
+    assert "PRIVATE-PROBE" not in json.dumps(result)
+    for path in ("/api/state", "/api/zapret2/overview"):
+        assert "PRIVATE-PROBE" not in user.request("GET", path)[1]
+
+
 def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     managed.set_servers(rig.store_path, ["dddd4444"], "disabled")
     rig.panel._wake()

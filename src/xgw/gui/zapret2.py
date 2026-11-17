@@ -71,7 +71,11 @@ class SettingsDialog(QDialog):
         box.addWidget(plain("Формат доменов — domain:имя или full:имя, по одному на строку."))
         self.strategy = QComboBox()
         self.strategy.addItems(view.get("strategies") or ["multisplit", "multidisorder"])
-        self.strategy.setCurrentText(view.get("strategy", "multisplit"))
+        selected = (view.get("selected_strategy") or view.get("configured_strategy")
+                    or "multisplit")
+        if self.strategy.findText(selected) < 0:
+            self.strategy.addItem(selected)  # Never silently replace a dormant preference.
+        self.strategy.setCurrentText(selected)
         form.addRow("Стратегия", self.strategy)
         self.strategy.setToolTip("Какая стратегия проходит, зависит от провайдера. Сравнение "
                                  "с VPN умеет только multisplit и multidisorder.")
@@ -86,6 +90,9 @@ class SettingsDialog(QDialog):
         box.addWidget(plain(f"Сохранено адресов проверок — {view.get('probe_count', 0)}. "
                             "Пустые поля сохраняют прежние адреса. Для замены заполните оба. "
                             "Адрес файла видео должен быть действующим."))
+        if view.get("youtube_transport_probe"):
+            box.addWidget(plain("Включена HTTPS-проверка YouTube и CDN. Она проверяет "
+                                "доступность транспорта, а не воспроизведение ролика."))
         self.clear_urls = QCheckBox("Удалить сохранённые адреса проверок")
         self.clear_urls.toggled.connect(
             lambda checked: [f.setEnabled(not checked) for f in self.urls])
@@ -184,7 +191,8 @@ class Zapret2Page(Page):
                               "Воспроизведение видео последними проверками ещё не подтверждено."),
             self.mode_control("Вернуться к VPN" if view.get("without_vpn") else
                               "Выключить zapret2", "off",
-                              "Выключить режим zapret2 и вернуть обычный режим VPN? "
+                              "Выключить обработку выбранных доменов и вернуть обычный режим? "
+                              "Если общий движок zapret2 настроен на auto, он возобновит работу. "
                               "Для VPN нужны настроенные серверы. "
                               "Смена режима прервёт соединения."),
         )

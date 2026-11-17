@@ -58,7 +58,8 @@ def test_engine_states(state, reason, expected):
     assert result["state"] != "fallback"
     assert result["without_vpn"] is False
     assert result["evidence"]["playback"] == "not_tested"
-    assert not result["can_off"] and not result["can_edit"]
+    assert result["can_off"] and result["can_edit"]
+    assert result["blockers"]["compare"]
     assert all(value is None for value in result["counters"].values())
 
 

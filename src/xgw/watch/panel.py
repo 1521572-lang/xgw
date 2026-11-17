@@ -1720,6 +1720,20 @@ class Panel:
         try:
             with self._lock:
                 try:
+                    if name in ("zapret2/mode", "zapret2/settings"):
+                        from . import zapret2_management
+
+                        card = self.zapret2_overview()["zapret2"]
+                        result = zapret2_management.command(
+                            self.config_path, name.rsplit("/", 1)[1], body,
+                            ready=card["fresh"], capture={"mode": self._capture().mode()})
+                        if result.get("changed"):
+                            self._wake()
+                        else:
+                            # A conflict may originate from a CLI writer, not this Panel.
+                            with contextlib.suppress(config.ConfigError):
+                                self.cfg, _warnings = config.load(self.config_path)
+                        return result
                     outcome = self._act(name, body)
                 except managed.ManagedError as exc:
                     outcome = actions.Outcome(2, str(exc))

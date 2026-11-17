@@ -20,6 +20,7 @@
       <nav class="zmw-nav" aria-label="Разделы zapret2">
         <a href="#overview">Обзор</a>
         <a href="#domains">Домены</a>
+        <a href="#controls">Управление</a>
         <a href="#events">Журнал</a>
       </nav>
       <label class="zm-theme">
@@ -71,6 +72,46 @@
           </dl>
         </section>
       </div>
+
+      <section class="zm-card zm-events" id="controls" aria-labelledby="controls-title">
+        <h2 id="controls-title">Управление</h2>
+        <p id="command-result" role="status" aria-live="polite" tabindex="-1"></p>
+        <div class="zm-actions">
+          <button type="button" data-mode="standalone" disabled>Без VPN</button>
+          <button type="button" data-mode="selective" disabled>Домены через zapret2</button>
+          <button type="button" data-mode="off" disabled>Выключить выбранный режим</button>
+          <button type="button" id="edit-settings" disabled>Настройки</button>
+        </div>
+        <p id="mode-blockers" class="muted"></p>
+        <form id="settings-form" hidden autocomplete="off">
+          <fieldset id="settings-fields">
+            <legend>Домены и проверки</legend>
+            <p id="settings-revision" role="status"></p>
+            <label>Стратегия<select id="setting-strategy"></select></label>
+            <label>Домены, по одному на строку (domain:имя или full:имя)
+              <textarea id="setting-domains" rows="5" required></textarea></label>
+            <div class="zm-form-grid">
+              <label>Проверка каждые, с<input id="setting-check" type="number" min="60" max="900" required></label>
+              <label>Повтор после отказа, с<input id="setting-retry" type="number" min="60" max="3600" required></label>
+              <label>Бюджет, МБ/сутки<input id="setting-budget" type="number" min="1" max="1024" required></label>
+            </div>
+            <label class="zm-check"><input id="setting-youtube" type="checkbox">HTTPS-проверка YouTube и CDN (только Selective)</label>
+            <p class="muted">Проверяет HTTPS-доступность. Воспроизведение оценивается отдельно.
+              Обычные пробы требуют ответа 2xx и не менее 16 КиБ. Для Standalone пробы не нужны.</p>
+            <p id="saved-probes" class="muted"></p>
+            <label>Новая HTTPS-страница<input id="setting-page" type="password" autocomplete="new-password"></label>
+            <label>Новый HTTPS-файл видео<input id="setting-media" type="password" autocomplete="new-password"></label>
+            <p class="muted">Пустые поля сохраняют прежние адреса. Для замены заполните оба.
+              Подписанная ссылка CDN должна быть действующей.</p>
+            <label class="zm-check"><input id="setting-clear" type="checkbox">Удалить сохранённые адреса</label>
+            <div class="zm-actions">
+              <button type="submit">Сохранить</button>
+              <button type="button" id="reload-settings">Перечитать настройки</button>
+              <button type="button" id="cancel-settings">Отмена</button>
+            </div>
+          </fieldset>
+        </form>
+      </section>
 
       <section class="zm-card zm-events" id="events" aria-labelledby="events-title">
         <h2 id="events-title">Журнал обработчиков</h2>

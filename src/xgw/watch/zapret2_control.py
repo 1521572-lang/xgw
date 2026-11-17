@@ -6,6 +6,7 @@ import math
 import time
 
 from ..desync import schema, worker
+from . import zapret2_management as management
 
 FRESH_SECONDS = 90
 VPN_CONTROL_REASONS = {
@@ -77,7 +78,7 @@ def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None) ->
 
 Only allowlisted public fields leave the snapshot. A revision is published by the daemon
 from its effective settings; a newer panel configuration cannot relabel old observations.
-The card exposes state only. Mode-changing commands belong to T11.
+Commands use the same validation as this card; observations remain revision-bound.
 """
     now = time.time() if now is None else now
     observed = snapshot.get("updated")
@@ -164,7 +165,9 @@ The card exposes state only. Mode-changing commands belong to T11.
     transport = ("https_reachable"
                  if trusted and phase == "active" and reason == "youtube_transport_ok"
                  and settings.get("youtube_transport_probe") is True else "unknown")
-    unavailable = ["Управление режимами пока недоступно в этой версии панели."]
+    blockers = {mode: management.reasons(cfg, mode, ready=fresh, capture=capture)
+                for mode in schema.MODES} if not invalid else {
+                    mode: ["Политика zapret2 некорректна."] for mode in schema.MODES}
     return {
         "schema_version": schema.VERSION, "mode": settings["mode"], "source": source,
         "engine_mode": settings["engine"], "state": phase, "reason": reason,
@@ -174,7 +177,8 @@ The card exposes state only. Mode-changing commands belong to T11.
         "strategy": profile if trusted and phase == "active" else None,
         "configured_strategy": (settings["engine_profile"] if source == "engine"
                                 else settings["strategy"]),
-        "strategies": [], "domains": settings["domains"],
+        "selected_strategy": settings["strategy"],
+        "strategies": list(management.PROFILES), "domains": settings["domains"],
         "worker": {"profile": profile if trusted else None,
                    "queue": queue if trusted else None},
         "counters": {"queued_original": None, "queued_reply": None,
@@ -182,9 +186,10 @@ The card exposes state only. Mode-changing commands belong to T11.
         "evidence": {"transport": transport, "playback": "not_tested",
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
                      "vpn_control_at": vpn_control_at},
-        "can_off": False, "can_edit": False,
-        "capabilities": {"status": True, "change_mode": False, "edit_policy": False},
-        "blockers": {mode: list(unavailable) for mode in schema.MODES},
+        "can_off": not invalid, "can_edit": not invalid,
+        "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},
+        "blockers": blockers,
+        "youtube_transport_probe": settings.get("youtube_transport_probe", False),
         "probe_count": len(settings["probe_urls"]), "probes": [], "probe_expiry": [],
         "check_seconds": settings["check_seconds"], "retry_seconds": settings["retry_seconds"],
         "daily_probe_mb": settings["daily_probe_mb"],

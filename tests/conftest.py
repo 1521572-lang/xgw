@@ -17,7 +17,7 @@ PORTABLE_TESTS = {"test_desync_schema.py", "test_zapret2_panel.py", "test_geodat
                   "test_desync_standalone.py", "test_desync_shadow.py", "test_desync_cache.py",
                   "test_desync_event_socket.py", "test_desync_tournament.py",
                   "test_desync_flowseal.py", "test_desync_route_evidence.py",
-                  "test_youtube_telemetry.py", "test_zapret2.py"}
+                  "test_youtube_telemetry.py", "test_zapret2.py", "test_zapret2_management.py"}
 
 
 def pytest_addoption(parser):
