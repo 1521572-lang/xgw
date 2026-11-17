@@ -156,4 +156,4 @@
 снапы route_evidence, probes.json r2 (страница+CDN), логи фаз, скриншоты UI/Proton,
 chrome-профили; бэкап `/var/lib/xgw/handoff/zapret2-management-…` (panel.before,
 манифест, restore.sh, python.path) — оставлен. Секреты/URL/IP/токены не публикуются.
-- Publication commit: добавить после push.
+- Publication commit: `2770c8f54a406a584b2bcfd671e96cef0ad8eb94` (a7f7556 → 2770c8f, remote verified byte-identical to local HEAD).
