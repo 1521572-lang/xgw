@@ -90,4 +90,4 @@ off/off, воркеры inactive, xgw/xray active, VPN/panel 200, nfnetlink_queu
 4. **Суточная фаза продолжается автономно**: unit читает только API (без проб),
    rollback-таймер вернёт конфиги в 04:1x+26h; день стартует с off/off — SELECTIVE_DAY
    останется NOT_RUN, но UTC-переход и стабильность VPN будут измерены в day.jsonl.
-- Publication commit: `добавляется после push` (отчёт в чистом checkout поверх 3c0b592).
+- Publication commit: `cc4175b29bff109df8236c502d79fadb0b015816` (3c0b592 → cc4175b, remote verified byte-identical to local HEAD).
