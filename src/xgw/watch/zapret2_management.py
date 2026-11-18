@@ -13,8 +13,7 @@ from ..paths import LockTimeout
 
 EDITABLE = frozenset({"strategy", "domains", "probe_urls", "check_seconds",
                       "retry_seconds", "daily_probe_mb", "youtube_transport_probe"})
-# Importing experimental assets and starting comparisons are separate acceptance stages.
-PROFILES = tuple(p for p in schema.SELECTED_PROFILES if p != schema.LIVE_STRATEGY)
+PROFILES = schema.SELECTED_PROFILES
 MODES = ("off", "standalone", "selective")
 
 
@@ -40,7 +39,8 @@ def candidate(cfg, patch, *, editing=False):
         ):
             raise schema.PolicyError(
                 "Сохраните HTTPS-адрес страницы YouTube и HTTPS-адрес CDN googlevideo.com "
-                "с путём /videoplayback или отключите HTTPS-проверку YouTube и CDN."
+                "с путём /videoplayback или /generate_204 без параметров, "
+                "либо отключите HTTPS-проверку YouTube и CDN."
             )
     policy = schema.migrate(flat)
     projected = schema.project(policy)
@@ -87,11 +87,16 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
     sections (including extensions unknown to this backend). Validation is on a copy,
     before atomic replacement. An unchanged policy does not even canonicalize the file.
     """
-    field = "mode" if action == "mode" else "settings"
-    if (action not in ("mode", "settings") or set(body) != {field, "expected"}
+    field = action if action in ("mode", "probe", "import") else "settings"
+    if (action not in ("mode", "settings", "probe", "import") or set(body) != {field, "expected"}
             or not isinstance(body.get("expected"), str)):
         return reply(False, "invalid", "Ожидаются настройки и ревизия expected.")
-    patch = {"mode": body[field]} if action == "mode" else body[field]
+    patch = ({"mode": body[field]} if action == "mode" else
+             {} if action in ("probe", "import") else body[field])
+    if action == "probe" and body[field] != "persistent":
+        return reply(False, "invalid", "Неизвестный вид CDN-пробы.")
+    if action == "import" and body[field] != schema.LIVE_STRATEGY:
+        return reply(False, "invalid", "Доступен только проверенный Flowseal ALT9.")
     if (not isinstance(patch, dict) or (action == "settings" and set(patch) - EDITABLE)
             or (action == "mode" and body[field] not in MODES)):
         return reply(False, "invalid", "Недопустимые поля или режим.")
@@ -108,6 +113,25 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
             if body["expected"] != key:
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
+            if action == "probe":
+                if (cfg.zapret2.mode != "off" or not cfg.zapret2.youtube_transport_probe
+                        or len(cfg.zapret2.probe_urls) != 2):
+                    return reply(False, "blocked", "Выключите режим и сохраните пару проб YouTube.")
+                patch = {"probe_urls": [cfg.zapret2.probe_urls[0],
+                         schema.persistent_youtube_probe(cfg.zapret2.probe_urls[1])]}
+            if action == "import" or patch.get("strategy") == schema.LIVE_STRATEGY:
+                from ..desync import flowseal
+
+                try:
+                    flowseal.live_arguments()
+                except (OSError, ValueError):
+                    return reply(False, "blocked",
+                                 "Проверенные каталоги или ассеты Flowseal отсутствуют.")
+            if action == "import":
+                if cfg.zapret2.mode != "off":
+                    return reply(False, "blocked", "Выключите режим перед импортом.")
+                patch = {"strategy": schema.LIVE_STRATEGY, "youtube_transport_probe": False,
+                         "domains": list(schema.YOUTUBE_DOMAINS)}
             policy, proposed = candidate(cfg, patch, editing=action == "settings")
             if policy == current:
                 return reply(True, "unchanged", "Настройки уже сохранены.",

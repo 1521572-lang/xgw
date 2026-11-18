@@ -236,6 +236,7 @@ def test_panel_state_wires_card_to_real_response(tmp_path, monkeypatch):
     p._servers.return_value = [], []
     p._devices.return_value = []
     p._db.return_value = []
+    p.desync_jobs.public.return_value = {"state": "idle"}
     p._zapret2_card.side_effect = lambda *args: panel.Panel._zapret2_card(p, *args)
     p.daemon.speed_one_pending.return_value = []
     for field in ("refresh_pending", "scan_pending", "speed_pending", "cores_pending"):

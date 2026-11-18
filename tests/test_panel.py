@@ -403,6 +403,18 @@ def test_zapret2_commands_require_session_origin_and_revision(rig, user):
         assert "PRIVATE-PROBE" not in user.request("GET", path)[1]
 
 
+@pytest.mark.parametrize("action", ["job/start", "job/cancel", "job/pin", "job/reset",
+                                   "probe", "import"])
+def test_zapret2_new_actions_keep_auth_and_origin_boundary(rig, user, action):
+    guest = Client(rig.panel.port)
+    path = "/api/zapret2/" + action
+    assert guest.request("POST", path, body={})[0].status == 401
+    assert user.request("POST", path, body={}, headers={})[0].status == 403
+    response, body = user.request("POST", path, body={}, headers={"X-XGW-Panel": "1"})
+    assert response.status == 200
+    assert not json.loads(body)["ok"]
+
+
 def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):
     managed.set_servers(rig.store_path, ["dddd4444"], "disabled")
     rig.panel._wake()

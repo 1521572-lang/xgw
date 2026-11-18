@@ -88,6 +88,10 @@
           <button type="button" id="edit-settings" disabled>Настройки</button>
         </div>
         <p id="mode-blockers" class="muted"></p>
+        <div class="zm-actions">
+          <button type="button" id="persistent-probe">Сохранить CDN-пробу без подписи</button>
+          <button type="button" id="import-flowseal">Подготовить проверенный Flowseal ALT9</button>
+        </div>
         <form id="settings-form" hidden autocomplete="off">
           <fieldset id="settings-fields">
             <legend>Домены и проверки</legend>
@@ -118,6 +122,19 @@
             </div>
           </fieldset>
         </form>
+      </section>
+      <section class="zm-card zm-events">
+        <h2>Проверка стратегий</h2>
+        <p>Два круга HTTPS-проверок. Задание временно меняет профиль и включает Selective.
+          В конце исходные настройки возвращаются. Результат видео проверяется плеером.</p>
+        <div class="zm-actions">
+          <button type="button" id="job-start">Проверить девять стратегий</button>
+          <button type="button" id="job-cancel">Отменить и вернуть настройки</button>
+          <button type="button" id="job-pin">Сохранить успешный профиль</button>
+          <button type="button" id="job-reset">Вернуть исходный профиль</button>
+        </div>
+        <p id="job-status" role="status"></p>
+        <ul id="job-results"></ul>
       </section>
 
       <section class="zm-card zm-events" id="events" aria-labelledby="events-title">

@@ -16,6 +16,11 @@ const probeFailures = {http: "ответ HTTP", proxy: "отказ прокси"
   tls: "ошибка TLS", timeout: "таймаут", stall: "нет данных", truncated: "неполный ответ",
   reset: "обрыв", io: "ошибка ввода-вывода", cancelled: "прервана"};
 const probePageKinds = {terms: "Страница условий", watch: "Страница просмотра", other: "Другая страница"};
+const jobStates = {idle: "Проверка не запускалась", queued: "Ожидает запуска",
+  running: "Проверка идёт", restoring: "Возвращаются настройки", complete: "Проверка завершена",
+  cancelled: "Проверка отменена", interrupted: "Прервана перезапуском",
+  conflict: "Настройки изменены извне", failed: "Ошибка проверки",
+  restore_failed: "Возврат настроек не подтверждён", unavailable: "Состояние недоступно"};
 const number = new Intl.NumberFormat("ru");
 const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medium"});
 const mebibytes = new Intl.NumberFormat("ru", {maximumFractionDigits: 2});
@@ -35,16 +40,53 @@ let generation = 0;
 
 function controls() {
   const usable = online && !busy && !needsLogin && latest;
+  const job = latest?.job;
+  const running = ["queued", "running", "restoring"].includes(job?.state);
   for (const button of document.querySelectorAll("[data-mode]")) {
     const mode = button.dataset.mode;
-    button.disabled = !usable || draftKey !== null ||
+    button.disabled = !usable || running || draftKey !== null ||
       (mode === "off" ? !latest.can_off : (latest.blockers?.[mode]?.length ?? 1) > 0);
   }
-  el("edit-settings").disabled = !usable || !latest.can_edit || draftKey !== null;
+  el("edit-settings").disabled = !usable || running || !latest.can_edit || draftKey !== null;
+  for (const id of ["persistent-probe", "import-flowseal", "job-start", "job-reset"]) {
+    if (el(id)) el(id).disabled = !usable || running || latest.mode !== "off" || draftKey !== null;
+  }
+  if (el("job-cancel")) el("job-cancel").disabled = !usable || !running;
+  if (el("job-reset")) el("job-reset").disabled ||= job?.restore !== "pass";
+  if (el("job-pin")) el("job-pin").disabled = !usable || running || !jobWinner(job)
+    || latest.mode !== "off";
   el("settings-fields").disabled = busy;
   el("settings-form").querySelector('[type="submit"]').disabled = !usable || !latest.can_edit;
   el("reload-settings").disabled = busy || needsLogin || Boolean(pending);
 }
+
+function jobWinner(job) {
+  if (job?.restore !== "pass" || job.rounds !== 2) return null;
+  return job.candidates?.find(candidate => {
+    const rows = job.results.filter(row => row.candidate === candidate);
+    return rows.length === 2 && rows.every(row => row.transport === "https_reachable");
+  });
+}
+
+for (const [id, action, fields] of [
+  ["persistent-probe", "probe", () => ({probe: "persistent"})],
+  ["import-flowseal", "import", () => ({import: "flowseal_alt9"})],
+  ["job-start", "job/start", () => ({
+    candidates: ["multisplit", "multidisorder", "fake_md5_split", "fake_seq",
+      "fake_seq_split", "fake_md5", "hostfakesplit_md5", "fake_static_md5",
+      "fake_clone_md5"], rounds: 2, budget_seconds: 3600,
+  })],
+  ["job-reset", "job/reset", () => ({id: latest.job.id})],
+  ["job-pin", "job/pin", () => ({id: latest.job.id, candidate: jobWinner(latest.job)})],
+]) {
+  el(id)?.addEventListener("click", () => {
+    if (!confirm("Применить выбранное действие zapret2? Проверка стратегий меняет маршруты " +
+      "на время задания. Для возврата используйте отмену.")) return;
+    command(action, {...fields(), expected: latest.config_key});
+  });
+}
+el("job-cancel")?.addEventListener("click", () =>
+  command("job/cancel", {id: latest.job.id}));
 
 function openSettings() {
   if (!online || busy || !latest?.can_edit) return;
@@ -215,6 +257,18 @@ function render(payload) {
   const card = payload.zapret2;
   if (!card || typeof card.state !== "string") throw new Error("invalid overview");
   latest = card;
+  if (el("job-status")) {
+    const job = card.job ?? {state: "idle"};
+    const restored = {pass: "подтверждён", pending: "ожидается", unconfirmed: "не подтверждён"};
+    put("job-status", (jobStates[job.state] || "Нет данных") +
+      (job.restore ? " · возврат " + (restored[job.restore] || "нет данных") : ""));
+    el("job-results").replaceChildren(...(job.results ?? []).map(row => {
+      const item = document.createElement("li");
+      item.textContent = row.candidate + " · круг " + row.round + " · " + row.transport
+        + " · " + row.reason;
+      return item;
+    }));
+  }
   online = true;
   if (draftKey !== null && draftKey !== card.config_key) {
     put("settings-revision", "Настройки шлюза изменились. Эта форма хранит прежнюю ревизию.");

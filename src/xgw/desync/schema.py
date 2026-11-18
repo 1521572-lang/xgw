@@ -79,6 +79,15 @@ def valid_youtube_cdn_host(host: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.googlevideo\.com", host))
 
 
+def persistent_youtube_probe(url: str) -> str:
+    """Keep the saved CDN authority, dropping signed media credentials."""
+    parsed = urlsplit(url)
+    _require(parsed.scheme == "https" and parsed.port in (None, 443)
+             and parsed.username is None and parsed.password is None and not parsed.fragment
+             and valid_youtube_cdn_host(parsed.hostname or ""), "CDN hostname")
+    return f"https://{parsed.hostname}/generate_204"
+
+
 def youtube_cdn_expiry(url: str) -> int | None:
     """Extract one explicit URL deadline. Unknown deadlines keep legacy probe behavior."""
     try:
@@ -111,7 +120,8 @@ def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> b
         return False
     page_host = page.hostname or ""
     return ((page_host == "youtube.com" or page_host.endswith(".youtube.com"))
-            and media.path == "/videoplayback"
+            and (media.path == "/videoplayback"
+                 or (media.path == "/generate_204" and not media.query))
             and valid_youtube_cdn_host(media.hostname or ""))
 
 

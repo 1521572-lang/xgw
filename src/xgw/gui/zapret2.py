@@ -21,11 +21,17 @@ from .widgets import set_text, tone
 
 MODES = {"off": "Выключен", "compare": "Сравнение с VPN", "selective": "Домены с возвратом на VPN",
          "standalone": "zapret2 без VPN"}
+JOB_STATES = {"idle": "Проверка не запускалась", "queued": "Ожидает запуска",
+              "running": "Проверка идёт", "restoring": "Возвращаются настройки",
+              "complete": "Проверка завершена", "cancelled": "Проверка отменена",
+              "interrupted": "Прервана перезапуском", "conflict": "Настройки изменены извне",
+              "failed": "Ошибка проверки", "restore_failed": "Возврат не подтверждён",
+              "unavailable": "Состояние недоступно"}
 
-REQUIREMENTS = ("В режиме «без VPN» адреса проверок не нужны. Для selective и сравнения "
-                "каждый адрес должен отдавать HTTP 2xx и не менее 16 КиБ тела. "
-                "Ответ 204 и маленький служебный файл не подходят. "
-                "Selective не следует перенаправлениям.")
+REQUIREMENTS = ("В режиме «без VPN» адреса проверок не нужны. HTTPS-проверка YouTube "
+                "принимает страницу /t/terms и CDN /videoplayback или экспериментальный "
+                "/generate_204. Она подтверждает доступность соединения. Для обычной "
+                "проверки файла нужны HTTP 2xx и 16 КиБ тела. Перенаправления не выполняются.")
 
 
 def expiry_text(view: dict) -> str:
@@ -131,6 +137,7 @@ class Zapret2Page(Page):
         _, self.status_note, self.status = self.card("Обход блокировок для выбранных доменов")
         _, self.settings_note, self.settings_rows = self.card("Настройки")
         _, self.results_note, self.results = self.card("Последние проверки")
+        _, self.jobs_note, self.jobs_rows = self.card("Проверка стратегий")
         self.body.addStretch(1)
 
     def view(self) -> dict:
@@ -140,6 +147,8 @@ class Zapret2Page(Page):
         view = self.view()
         allowed = (view.get("can_off", False) if mode == "off" else
                    mode in view.get("blockers", {}) and not view["blockers"][mode])
+        allowed = allowed and (view.get("job") or {}).get("state") not in (
+            "queued", "running", "restoring")
         key = view.get("config_key")
         return self.control(
             text, "zapret2/mode", {"mode": mode, "expected": key}, key="zapret2",
@@ -165,6 +174,8 @@ class Zapret2Page(Page):
     def show_state(self, state: dict | None) -> None:
         self.show_hint(state)
         view = (state or {}).get("zapret2") or {}
+        job = view.get("job") or {"state": "idle"}
+        running = job["state"] in ("queued", "running", "restoring")
         kind, title = summary(state, self.main.stale)
         set_text(self.status_note, title)
         tone(self.status_note, kind)
@@ -172,6 +183,7 @@ class Zapret2Page(Page):
             self.status.update_text([("Требуется обновление панели шлюза",
                                       "Установите код поддержки zapret2 в интерфейсе.")])
             self.settings_rows.update_rows([])
+            self.jobs_rows.update_rows([])
             self.results.update_rows([])
             return
         controls = (
@@ -223,8 +235,51 @@ class Zapret2Page(Page):
         settings += "\n" + REQUIREMENTS + "\n" + expiry_text(view)
         self.settings_rows.update_rows([("settings", "Домены и проверки", settings, (
             Control("Настроить", self.edit,
-                    view.get("can_edit", False) and self.can_act("zapret2")),
+                    view.get("can_edit", False) and self.can_act("zapret2") and not running),
+            self.control("CDN-проба без подписи", "zapret2/probe",
+                         {"probe": "persistent", "expected": view.get("config_key")},
+                         key="zapret2", enabled=view["mode"] == "off" and not running,
+                         question="Сохранить служебный HTTPS-адрес того же CDN без подписи? "
+                         "Работу видео нужно проверить отдельно."),
+            self.control("Подготовить Flowseal ALT9", "zapret2/import",
+                         {"import": "flowseal_alt9", "expected": view.get("config_key")},
+                         key="zapret2", enabled=view["mode"] == "off" and not running,
+                         question="Проверить локальные ассеты и сохранить профиль ALT9?"),
         ))])
+        job = view.get("job") or {"state": "idle"}
+        running = job["state"] in ("queued", "running", "restoring")
+        controls = [
+            self.control("Проверить девять стратегий", "zapret2/job/start", {
+                "expected": view.get("config_key"),
+                "candidates": ["multisplit", "multidisorder", "fake_md5_split", "fake_seq",
+                               "fake_seq_split", "fake_md5", "hostfakesplit_md5",
+                               "fake_static_md5", "fake_clone_md5"],
+                "rounds": 2, "budget_seconds": 3600,
+            }, key="zapret2", enabled=not running and view["mode"] == "off",
+                question="Запустить два круга HTTPS-проверок до 60 минут? "
+                         "Задание временно меняет профиль и включает Selective, "
+                         "затем возвращает исходные настройки."),
+            self.control("Отменить и вернуть настройки", "zapret2/job/cancel",
+                         {"id": job.get("id")}, key="zapret2", enabled=running),
+        ]
+        if job.get("restore") == "pass":
+            controls.append(self.control(
+                "Вернуть исходный профиль", "zapret2/job/reset",
+                {"id": job["id"], "expected": view.get("config_key")}, key="zapret2",
+                enabled=not running and view["mode"] == "off"))
+            for profile in job.get("candidates", []):
+                hits = [r for r in job.get("results", []) if r["candidate"] == profile]
+                if len(hits) == 2 and all(r["transport"] == "https_reachable" for r in hits):
+                    controls.append(self.control(
+                        "Сохранить " + profile, "zapret2/job/pin",
+                        {"id": job["id"], "expected": view.get("config_key"),
+                         "candidate": profile}, key="zapret2",
+                        enabled=not running and view["mode"] == "off"))
+        text = "\n".join(f"{r['candidate']} · {r['transport']} · {r['reason']}"
+                         for r in job.get("results", []))
+        self.jobs_rows.update_rows([("job", JOB_STATES.get(job["state"], "Нет данных"),
+                                    text, controls)])
+        set_text(self.jobs_note, "HTTPS-пробы проверяют транспорт. Качество видео измеряет плеер.")
         rows = []
         for row in view.get("probes", []):
             verdict = ("не запускалась" if row.get("verdict") == "not_run" else

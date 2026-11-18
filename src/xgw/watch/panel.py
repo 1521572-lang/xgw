@@ -310,6 +310,12 @@ class Panel:
         # свёрнуто или открыта другая вкладка), closed — закрылась. Ярлык и значок по ним
         # выводят её окно вперёд вместо новой вкладки (tray.open_panel).
         self._page = dict.fromkeys(PAGE_SIGNALS, 0.0)
+        from ..desync.jobs import Jobs
+
+        self.desync_jobs = Jobs(
+            paths.var / "desync-jobs", self.config_path,
+            lambda: self.zapret2_overview()["zapret2"], self._wake,
+        )
 
     @classmethod
     def from_config(cls, cfg: Config, paths: Paths, config_path: Path, **kwargs) -> Panel | None:
@@ -329,6 +335,7 @@ class Panel:
     # --- запуск ------------------------------------------------------------------
 
     def start(self) -> None:
+        self.desync_jobs.recover()
         panel = self
 
         class Handler(httpbound.DeadlineHandler):
@@ -372,6 +379,7 @@ class Panel:
                 self.app_api = api
 
     def stop(self) -> None:
+        self.desync_jobs.stop()
         self.recorder.stop()
         if self.app_api is not None:
             self.app_api.stop()
@@ -755,6 +763,7 @@ class Panel:
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
         masked["zapret2"] = self._zapret2_card(cfg, snapshot, info, daemon is not None, now)
+        masked["zapret2"]["job"] = self.desync_jobs.public()
         return masked
 
     def _zapret2_card(self, cfg, snapshot, capture, daemon_ready, now):
@@ -779,9 +788,10 @@ class Panel:
         events = journal["events"]
         visible = 16
         public_fields = ("seq", "at", "phase", "unit", "queue", "generation")
+        card = self._zapret2_card(self.cfg, snapshot, capture, self.daemon is not None, now)
+        card["job"] = self.desync_jobs.public()
         return {
-            "zapret2": self._zapret2_card(
-                self.cfg, snapshot, capture, self.daemon is not None, now),
+            "zapret2": card,
             "journal": {
                 "available": journal["state"] == "snapshot",
                 "epoch": journal.get("epoch"),
@@ -1729,7 +1739,10 @@ class Panel:
         try:
             with self._lock:
                 try:
-                    if name in ("zapret2/mode", "zapret2/settings"):
+                    if name.startswith("zapret2/job/"):
+                        return self.desync_jobs.command(name.rsplit("/", 1)[1], body)
+                    if name in ("zapret2/mode", "zapret2/settings",
+                                "zapret2/probe", "zapret2/import"):
                         from . import zapret2_management
 
                         card = self.zapret2_overview()["zapret2"]
