@@ -15,7 +15,7 @@ GOLDEN_DIR = Path(__file__).parent / "fixtures" / "golden"
 def pytest_configure(config):
     # XGW — только для Ubuntu 24.04 и 26.04, и тесты с ним: на другой системе они не идут.
     if not sys.platform.startswith("linux"):
-        pytest.exit("тесты XGW запускаются только в Linux (Ubuntu 24.04 или 26.04)", returncode=4)
+        pytest.exit("системные тесты XGW требуют Linux (шлюз Ubuntu 24.04 LTS)", returncode=4)
 
 
 @pytest.fixture(autouse=True)

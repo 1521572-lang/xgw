@@ -1,6 +1,6 @@
 # XGW: архитектурный аудит и план доработок (Blueprint)
 
-Основа — код 0.1.15 (`05a8c68`). Аудит идёт по пяти точкам отказа на Ubuntu 24.04 (ядро 6.8+,
+Основа — код 0.1.15 (`05a8c68`). Аудит идёт по пяти точкам отказа на рабочем шлюзе Ubuntu 24.04 LTS (ядро 6.8+,
 nftables, systemd-resolved, cgroup2) и сверяется с эталонными клиентами: Mullvad (`talpid-core`),
 Proton VPN, Tailscale (`net/netcheck`) и Amnezia VPN.
 
@@ -513,7 +513,7 @@ BACKENDS: tuple[CoreBackend, ...] = (XrayBackend(), SingboxBackend(), AwgBackend
 - Пакеты (PPA Amnezia для Ubuntu: модуль и `awg`; либо бинарь `amneziawg-go` с проверкой
   SHA-256, как в `xraycore/binary.py`) ставятся **только с согласия заказчика**, отдельной
   командой `sudo xgw install-awg`, как `update-singbox`. Без них ссылки по-прежнему
-  пропускаются с пояснением. Перед Ф5 проверить: имя PPA и пакетов для 24.04 и 26.04, тип линка
+  пропускаются с пояснением. Перед Ф5 проверить: имя PPA и пакетов для Ubuntu 24.04 LTS, тип линка
   (`amneziawg`), сборку модуля на ядре 6.8, откуда брать `amneziawg-go` для amd64.
 - Лестница профилей к AWG не применяется (это UDP со своей обфускацией): `profiles()` возвращает
   `("awg:default",)`.

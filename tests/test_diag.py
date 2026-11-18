@@ -29,7 +29,7 @@ class Box:
         self.cfg.network.lan_if = "lan0"
         self.release = tmp_path / "os-release"
         self.release.write_text(
-            'PRETTY_NAME="Ubuntu 26.04.1 LTS"\nID=ubuntu\nVERSION_ID="26.04"\n', encoding="utf-8"
+            'PRETTY_NAME="Ubuntu 24.04.5 LTS"\nID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8"
         )
         self.kwargs: dict = {}
 
@@ -135,7 +135,7 @@ def test_clean_machine_before_install_has_no_failures(box):
     checks = box.diag().run()
     assert not [check for check in checks if check.level == FAIL], diag.render(checks)
     by_name = _by_name(checks)
-    assert by_name["Система"][0].level == OK and "Ubuntu 26.04.1" in by_name["Система"][0].text
+    assert by_name["Система"][0].level == OK and "Ubuntu 24.04.5" in by_name["Система"][0].text
     assert "сеть lan0 и эта машина" in by_name["Конфиг"][0].text
     assert by_name["Xray"][0].level == WARN and "xgw install загрузит" in by_name["Xray"][0].advice
     assert by_name["Ядро"][0].level == OK
@@ -159,7 +159,7 @@ def test_other_system_and_no_root_are_warnings(box, monkeypatch):
     box.release.write_text('PRETTY_NAME="Debian 13"\nID=debian\nVERSION_ID="13"\n')
     checks = box.diag(is_root=False)._system()
     assert [check.level for check in checks] == [WARN, WARN]
-    assert "проверялся только на Ubuntu 24.04 и 26.04" in checks[0].text
+    assert "рабочая система XGW — Ubuntu 24.04 LTS" in checks[0].text
     assert checks[1].advice == "sudo xgw diag"
     assert box.diag(is_root=False)._kernel() == []
 
@@ -172,6 +172,7 @@ def test_tested_ubuntu_releases_are_ok(box, monkeypatch, version):
         f'PRETTY_NAME="Ubuntu {version}.5 LTS"\nID=ubuntu\nVERSION_ID="{version}"\n')
     check = box.diag()._system()[0]
     assert check.level == OK and check.text.startswith(f"Ubuntu {version}.5 LTS, Python")
+    assert ("стенд разработки" in check.text) == (version == "26.04")
     box.release.write_text('PRETTY_NAME="Ubuntu 22.04"\nID=ubuntu\nVERSION_ID="22.04"\n')
     assert box.diag()._system()[0].level == WARN
 
