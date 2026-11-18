@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xgw"
 version = "0.2.0"
-description = "XGW — шлюз Ubuntu 26.04 на Xray-core с автопереключением VPN-серверов (GET-проверка «заморозки»)"
+description = "XGW — шлюз Ubuntu 24.04 LTS на Xray-core с автопереключением VPN-серверов (GET-проверка «заморозки»)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

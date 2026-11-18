@@ -43,7 +43,7 @@ NO_CONFIG = frozenset({"install", "uninstall", "diag", "logs"})
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="xgw", description="XGW — шлюз на Xray-core для Ubuntu 26.04"
+        prog="xgw", description="XGW — шлюз на Xray-core для Ubuntu 24.04 LTS"
     )
     parser.add_argument("--version", action="version", version=f"xgw {__version__}")
     common = argparse.ArgumentParser(add_help=False)
