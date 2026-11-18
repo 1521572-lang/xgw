@@ -63,4 +63,4 @@
    журнал дня сохраняется (день продолжается).
 4. START оставляется для следующего прохода при восстановлении прямого TLS-канала
    к googlevideo; все приготовления (kit, сборщики, пары) проверены.
-- Publication commit: `добавляется после push` (worktree report от FETCH_HEAD поверх 97fbed9).
+- Publication commit: `19b3b3b84f068459d32c099d29115918a8227201` (97fbed9 → 19b3b3b, remote verified byte-identical to local HEAD).
