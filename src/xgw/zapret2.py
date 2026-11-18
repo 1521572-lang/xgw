@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
 from .desync import flowseal, h05, preflight, worker
-from .desync.schema import MAX_REPLY_PACKETS, SELECTED_PROFILES, valid_youtube_transport
+from .desync.schema import (
+    MAX_REPLY_PACKETS,
+    SELECTED_PROFILES,
+    valid_youtube_transport,
+    youtube_cdn_expiry,
+)
 from .net import cmd
 
 if TYPE_CHECKING:
@@ -42,6 +47,7 @@ PROBE_BYTES = 64 * 1024
 YOUTUBE_TRANSPORT_MAX_SECONDS = 12
 YOUTUBE_TRANSPORT_TLS_SECONDS = 10
 YOUTUBE_PAGE_SILENCE_SECONDS = 6
+CDN_EXPIRED = "youtube_cdn_expired"
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 REDIRECT_LIMIT = 5
@@ -164,6 +170,20 @@ def youtube_probe_page_kind(url: str) -> str:
     if path == "/watch":
         return "watch"
     return "other"
+
+
+def probe_expiry(settings) -> int | None:
+    if settings.youtube_transport_probe and len(settings.probe_urls) == 2:
+        return youtube_cdn_expiry(settings.probe_urls[1])
+    return None
+
+
+def probe_lease(seconds: int, expires_at: int | None) -> int:
+    if expires_at is not None:
+        seconds = min(seconds, int(expires_at - time.time()))
+        if seconds < 1:
+            raise ValueError(CDN_EXPIRED)
+    return seconds
 
 
 def active(config: dict) -> bool:
@@ -468,6 +488,10 @@ class Controller:
             return False
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
+            expires_at = probe_expiry(z) if media_transport else None
+            if expires_at is not None and expires_at <= time.time():
+                self.probe_failure = CDN_EXPIRED
+                return False
             options = {}
             if z.youtube_transport_probe:
                 options = {"max_total": YOUTUBE_TRANSPORT_MAX_SECONDS,
@@ -481,6 +505,9 @@ class Controller:
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)
             first_tls_timeout_ms = None
+            if expires_at is not None and expires_at <= time.time():
+                self.probe_failure = CDN_EXPIRED
+                return False
             if (media_transport and not verdict.ok and verdict.phase == "tls"
                     and verdict.kind == "timeout" and (cancel is None or not cancel.is_set())
                     and self.runtime.alive(z.queue_num) and self._budget(cfg, single_probe=True)):
@@ -636,6 +663,12 @@ class Controller:
         check_vpn = False
         try:
             if wanted and configured(cfg):
+                expires_at = probe_expiry(cfg.zapret2)
+                if expires_at is not None and expires_at - time.time() < 1:
+                    if (not present and not self.ready and self.view.get("reason") == CDN_EXPIRED
+                            and self.view.get("gate_closed") is True):
+                        return False
+                    raise ValueError(CDN_EXPIRED)
                 scaffold = patch(applied, cfg, enabled=active(applied))
                 if scaffold != applied:
                     # Сначала служебный вход; прямое правило здесь не появляется.
@@ -669,7 +702,7 @@ class Controller:
                         self.comparison = self._compare(cfg, applied, vpn_probe_port, cancel)
                         self.runtime.sample_trace()
                     else:
-                        self.runtime.gate(cfg.zapret2.check_seconds + 60)
+                        self.runtime.gate(probe_lease(cfg.zapret2.check_seconds + 60, expires_at))
                         self.probe_failure = "probe_failed"
                         if not self.probe(cfg, applied, cancel):
                             raise ValueError(self.probe_failure)
@@ -681,15 +714,19 @@ class Controller:
                         raise ValueError("worker_down")
                     # Старый удачный GET не продлевает разрешение бесконечно.
                     lease = max(1, int(self.next_check - now) + 60)
+                    lease = probe_lease(lease, expires_at)
                     self.runtime.gate(lease)
                     target = patch(applied, cfg, enabled=True)
                     changed = target != applied and apply(target, applied)
                     if target != applied and not changed:
                         raise ValueError("apply_failed")
+                    valid_until = time.time() + lease
+                    if expires_at is not None:
+                        valid_until = min(valid_until, expires_at)
                     self.view = {"state": "active", "reason": (
                                      "youtube_transport_ok" if cfg.zapret2.youtube_transport_probe
                                      else "probes_ok"),
-                                 "valid_until": time.time() + lease}
+                                 "valid_until": valid_until}
                     if cfg.zapret2.youtube_transport_probe and self.transport_probes:
                         self.view["transport_probes"] = self.transport_probes
                     return changed
@@ -700,12 +737,12 @@ class Controller:
                             "youtube_page_probe_failed"}
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
                      "bundle_mismatch", "bad_worker_options", "lua_init_failed",
-                     "probe_budget", "apply_failed",
+                     "probe_budget", "apply_failed", CDN_EXPIRED,
                      "worker_unit_busy", "worker_handoff_pending", *probe_errors}
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
-            self.next_check = now + cfg.zapret2.retry_seconds
+            self.next_check = now if reason == CDN_EXPIRED else now + cfg.zapret2.retry_seconds
             check_vpn = reason == "worker_down" or reason in probe_errors
         self.healthy = False
         gate_closed = True
@@ -715,7 +752,7 @@ class Controller:
             gate_closed = False  # очередь всё ещё без bypass; lease сам истечёт
         try:
             finished = comparing and self.comparison is not None
-            target = patch(applied, cfg, probe=not finished)
+            target = patch(applied, cfg, probe=not finished and reason != CDN_EXPIRED)
             changed = target != applied and apply(target, applied)
             routed_back = (target == applied or changed) and reason != "apply_failed"
         except (ValueError, cmd.CommandError, OSError):

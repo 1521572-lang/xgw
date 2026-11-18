@@ -16,15 +16,18 @@ RELEASE = Path("/opt/xgw/gui/releases") / BASE
 DISPATCHER = Path("/opt/xgw/lib/xgw/gui/app.py")
 FILES = ("vpn_ui/main_xgw.py", "vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/panels.py",
          "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/window.py")
+CATALOG_REFRESH = ("vpn_ui/xgw/catalog.py", "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/panels.py")
 
 
-def delivery(payload):
+def delivery(payload, catalog_refresh=False):
     rows = []
-    for name in FILES:
+    for name in CATALOG_REFRESH if catalog_refresh else FILES:
         before, after = (payload / kind / name for kind in ("before", "after"))
         trusted(before)
         trusted(after)
         rows.append((RELEASE / name, before.read_bytes(), after.read_bytes()))
+    if catalog_refresh:
+        return rows
     saved = Path("/var/lib/xgw/gui-install") / BASE / "patched.py"
     trusted(saved)
     old = saved.read_bytes()
@@ -72,6 +75,7 @@ def switch(rows, action):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "apply", "rollback"))
+    parser.add_argument("--catalog-refresh", action="store_true")
     args = parser.parse_args()
     payload = Path(__file__).parent
     trusted(payload)
@@ -82,7 +86,7 @@ def main():
     fd = os.open(RELEASE, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        switch(delivery(payload), args.action)
+        switch(delivery(payload, args.catalog_refresh), args.action)
     finally:
         os.close(fd)
 

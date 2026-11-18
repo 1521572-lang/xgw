@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from pathlib import Path
 
 from .. import config, managed, zapret2
@@ -67,6 +68,9 @@ def reasons(cfg, mode, *, ready, capture):
         _policy, proposed = candidate(cfg, {"mode": mode})
         if mode == "selective" and not zapret2.configured(proposed):
             result.append("Сохраните HTTPS-пробы страницы и видеосети выбранных доменов.")
+        expires_at = zapret2.probe_expiry(proposed.zapret2) if mode == "selective" else None
+        if expires_at is not None and expires_at - time.time() < 1:
+            result.append("Истёк срок адреса CDN. Сохраните свежий адрес видео.")
     except schema.PolicyError as exc:
         result.append(str(exc))
     return result

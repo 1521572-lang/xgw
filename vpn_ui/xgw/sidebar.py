@@ -179,6 +179,8 @@ class Sidebar(QtWidgets.QFrame):
         self.servers.setRootIsDecorated(False)
         self.servers.setColumnCount(3)
         self.servers.header().setSectionsClickable(True)
+        self.servers.header().setSortIndicatorShown(False)
+        self.servers.header().setIconSize(QtCore.QSize(12, 12))
         self.servers.header().sectionClicked.connect(self.sort_by_column)
         self.servers.header().setMinimumSectionSize(55)
         self.servers.header().setStretchLastSection(False)
@@ -259,6 +261,23 @@ class Sidebar(QtWidgets.QFrame):
                 color: {c.text_weak.qss}; border: none; padding: 6px 3px; font-size: 12px; }}
             QFrame#SidebarPane QHeaderView::section:hover {{ background: {c.bg_weak_hover.qss}; }}
         """)
+        self.update_headings(self.servers.topLevelItemCount())
+
+    def update_headings(self, count):
+        palette = theme.palette()
+        key = (count, self._sort_column, self._descending, palette.name)
+        if key == getattr(self, "_heading_key", None):
+            return
+        self._heading_key = key
+        header = self.servers.headerItem()
+        icon_name = "ChevronDownFilled" if self._descending else "ChevronUpFilled"
+        direction = "По убыванию" if self._descending else "По возрастанию"
+        marker = QtGui.QIcon(svg_loader.icon_pixmap(icon_name, palette.text, 12))
+        for column, title in enumerate((f"Серверы ({count})", "Мбит/с", "Рейтинг")):
+            active = column == self._sort_column
+            header.setText(column, title)
+            header.setIcon(column, marker if active else QtGui.QIcon())
+            header.setToolTip(column, f"{title} · {direction}" if active else title)
 
     def sort_by_column(self, column):
         if column not in (0, 1, 2):
@@ -463,17 +482,15 @@ class Sidebar(QtWidgets.QFrame):
         self.source_note.setText(source.detail if source else
                                  "Добавьте подписку или ссылку сервера")
         order = ("name", "speed", "rating")[self._sort_column]
+        pool_source = self._source == POOL
+        self.filter.setTabText(1, "Допущенные" if pool_source else "Доступные")
+        self.filter.setTabData(1, "admitted" if pool_source else "usable")
+        self.filter.setTabToolTip(1, "Допуск по правилам пула. Ручной выбор зависит от режима."
+                                  if pool_source else "Можно выбрать или уже выбраны")
         entries = filtered(self.bridge.entries, self._source, self.search.edit.text(),
                            self.filter.tabData(self.filter.currentIndex()), order,
                            country_name=country_name, descending=self._descending)
-        # A native Qt sort indicator can point down for ascending order depending on style.
-        header = self.servers.headerItem()
-        arrow = "▼" if self._descending else "▲"
-        direction = "По убыванию" if self._descending else "По возрастанию"
-        for column, title in enumerate((f"Серверы ({len(entries)})", "Мбит/с", "Рейтинг")):
-            active = column == self._sort_column
-            header.setText(column, f"{title} {arrow}" if active else title)
-            header.setToolTip(column, f"{title} · {direction}" if active else title)
+        self.update_headings(len(entries))
         key = tuple(entries)
         if key != self._key:
             self._key = key

@@ -68,8 +68,10 @@ function openSettings() {
     el(id).disabled = false;
   }
   const pageKind = probePageKinds[latest.youtube_probe_page_kind];
+  const expiry = latest.probe_expiry?.find(probe => probe.probe === 2)?.expires_at;
   put("saved-probes", "Сохранено адресов: " + count(latest.probe_count) +
-    (pageKind ? " · " + pageKind : ""));
+    (pageKind ? " · " + pageKind : "") +
+    (expiry ? " · срок CDN до " + new Date(expiry * 1000).toLocaleString("ru-RU") : ""));
   updateProbePreset();
   put("settings-revision", "");
   el("settings-form").hidden = false;

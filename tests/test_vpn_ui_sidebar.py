@@ -10,10 +10,10 @@ os.environ["XGW_UI_QT"] = "PyQt6"
 pytest.importorskip("PyQt6.QtWidgets")
 pytest.importorskip("PyQt6.QtSvg")
 
-from PyQt6.QtTest import QTest
+from PyQt6.QtTest import QSignalSpy, QTest
 from vpn_ui.qt import Qt, QtCore, QtWidgets, Signal
 
-from vpn_ui.xgw.catalog import Entry, Source
+from vpn_ui.xgw.catalog import POOL, Entry, Source
 from vpn_ui.xgw.sidebar import Sidebar
 
 
@@ -25,6 +25,7 @@ class Bridge(QtCore.QObject):
 
     def __init__(self):
         super().__init__()
+        self.pool = {}
         self.sources = [Source("sub:A", "Подписка", "")]
         self.entries = [Entry(str(index), "sub:A", f"Имя {index:02d}", "VLESS · 22 мс", "NL",
                               "member", False, True, 100 - index, 22, rating=0.75)
@@ -33,6 +34,9 @@ class Bridge(QtCore.QObject):
 
     def select(self, identifier):
         self.sent.append(identifier)
+
+    def fetch_pool(self):
+        pass
 
 
 @pytest.fixture(scope="session")
@@ -98,8 +102,11 @@ def test_header_clicks_sort_without_selecting_server(app):
     def names():
         return [sidebar.servers.topLevelItem(i).text(0).splitlines()[0] for i in range(3)]
 
-    def headings():
-        return [sidebar.servers.headerItem().text(i) for i in range(3)]
+    def indicator(column, direction):
+        row = sidebar.servers.headerItem()
+        assert [row.text(i) for i in range(3)] == ["Серверы (3)", "Мбит/с", "Рейтинг"]
+        assert [i for i in range(3) if not row.icon(i).isNull()] == [column]
+        assert row.toolTip(column).endswith(direction)
 
     def click(column):
         x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
@@ -110,26 +117,26 @@ def test_header_clicks_sort_without_selecting_server(app):
     try:
         assert names() == ["a", "b", "c"]
         assert not header.isSortIndicatorShown()
-        assert headings() == ["Серверы (3) ▲", "Мбит/с", "Рейтинг"]
+        indicator(0, "По возрастанию")
         click(0)
         assert names() == ["c", "b", "a"]
-        assert headings() == ["Серверы (3) ▼", "Мбит/с", "Рейтинг"]
+        indicator(0, "По убыванию")
         click(1)
         assert names() == ["a", "b", "c"]
-        assert headings() == ["Серверы (3)", "Мбит/с ▼", "Рейтинг"]
+        indicator(1, "По убыванию")
         click(1)
         assert names() == ["b", "a", "c"]
-        assert headings() == ["Серверы (3)", "Мбит/с ▲", "Рейтинг"]
+        indicator(1, "По возрастанию")
         click(2)
         assert names() == ["b", "a", "c"]
-        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▼"]
+        indicator(2, "По убыванию")
         click(2)
         assert names() == ["a", "b", "c"]
-        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▲"]
+        indicator(2, "По возрастанию")
         bridge.gateway_changed.emit()
         assert names() == ["a", "b", "c"]
         assert not header.isSortIndicatorShown()
-        assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▲"]
+        indicator(2, "По возрастанию")
         QTest.mouseClick(sidebar.filter, Qt.MouseButton.LeftButton,
                          pos=sidebar.filter.tabRect(2).center())
         assert sidebar.servers.topLevelItemCount() == 1
@@ -138,6 +145,20 @@ def test_header_clicks_sort_without_selecting_server(app):
         assert sidebar.servers.topLevelItemCount() == 1
         sidebar.filter.setCurrentIndex(0)
         assert names() == ["a", "b", "c"]
+        bridge.sources.append(Source(POOL, "Бесплатный пул", "Наблюдение"))
+        bridge.entries.extend([
+            replace(bridge.entries[0], id="pool:ok", source=POOL, pool=True,
+                    chosen=False, choosable=False, admitted=True),
+            replace(bridge.entries[1], id="pool:no", source=POOL, pool=True,
+                    chosen=False, choosable=False, admitted=False),
+        ])
+        bridge.gateway_changed.emit()
+        sidebar.sources.setCurrentRow(1)
+        sidebar.filter.setCurrentIndex(1)
+        assert sidebar.filter.tabText(1) == "Допущенные"
+        assert sidebar.servers.topLevelItemCount() == 1
+        sidebar.servers.setCurrentItem(sidebar.servers.topLevelItem(0))
+        assert not sidebar.choose.isEnabled()
         assert bridge.sent == []
     finally:
         parent.close()
@@ -158,7 +179,8 @@ def test_map_pulses_only_for_visible_known_active_country(app):
         assert canvas._pulse.isActive()
         assert canvas._move.state() == QtCore.QAbstractAnimation.State.Running
         before = canvas._phase
-        QTest.qWait(100)
+        ticks = QSignalSpy(canvas._pulse.timeout)
+        assert ticks.wait(1500), "таймер не выпустил ни одного импульса"
         assert canvas._phase != before
         canvas.set_focus("")
         assert not canvas._pulse.isActive()

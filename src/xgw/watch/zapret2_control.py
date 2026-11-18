@@ -43,6 +43,7 @@ REASONS = {
     "youtube_transport_ok": "HTTPS до страницы YouTube и CDN работает. Видео не проверялось.",
     "youtube_page_probe_failed": "HTTPS-проверка страницы YouTube не прошла.",
     "youtube_cdn_probe_failed": "HTTPS-проверка CDN YouTube не прошла.",
+    zapret2.CDN_EXPIRED: "Истёк срок адреса CDN. Сохраните свежий адрес видео.",
     "retry_wait": "Ожидается повтор проверки прямого пути.",
     "apply_failed": "Применение маршрута не подтверждено.",
     "dependency_missing": "Не найдены зависимости обработчика.",
@@ -242,7 +243,9 @@ Commands use the same validation as this card; observations remain revision-boun
         "youtube_transport_probe": settings.get("youtube_transport_probe", False),
         "youtube_domains": list(schema.YOUTUBE_DOMAINS),
         "youtube_probe_page_kind": page_kind,
-        "probe_count": len(settings["probe_urls"]), "probes": [], "probe_expiry": [],
+        "probe_count": len(settings["probe_urls"]), "probes": [],
+        "probe_expiry": [{"probe": 2, "expires_at": schema.youtube_cdn_expiry(urls[1])}]
+        if settings.get("youtube_transport_probe") and len(urls) == 2 else [],
         "check_seconds": settings["check_seconds"], "retry_seconds": settings["retry_seconds"],
         "daily_probe_mb": settings["daily_probe_mb"],
     }

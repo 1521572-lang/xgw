@@ -170,6 +170,57 @@ def test_missing_video_probe_does_not_launch_worker():
     assert not any(name == "start" for name, _ in h.runtime.events)
 
 
+def test_known_cdn_expiry_caps_lease_and_removes_direct_route(monkeypatch):
+    h = Harness()
+    wall = 1_800_000_000
+    monkeypatch.setattr(z.time, "time", lambda: wall)
+    h.cfg.zapret2.youtube_transport_probe = True
+    cdn = "https://r1.googlevideo.com/videoplayback"
+    h.cfg.zapret2.probe_urls[1] = f"{cdn}?expire={wall - 1}"
+    h.step(0)
+    assert h.controller.view["reason"] == z.CDN_EXPIRED
+    assert h.controller.store.get_meta(z.BUDGET) is None
+    assert not h.runtime.up and not z.active(h.current)
+    first_events = list(h.runtime.events)
+    h.step(1)
+    assert first_events == h.runtime.events
+
+    h.cfg.zapret2.probe_urls[1] = f"{cdn}?expire={wall + 20}"
+    for seconds in (2, 3, 4):
+        h.step(seconds)
+    assert z.active(h.current)
+    assert h.controller.view["valid_until"] == wall + 20
+    assert max(seconds for action, seconds in h.runtime.events if action == "gate") == 20
+
+    wall += 20
+    h.step(24)
+    assert h.controller.view == {"state": "fallback", "reason": z.CDN_EXPIRED,
+                                 "gate_closed": True}
+    assert not h.runtime.up and not z.active(h.current)
+    assert not any(item["tag"] == z.PROBE for item in h.current["inbounds"])
+
+
+def test_cdn_expiry_between_page_and_video_skips_media_request(monkeypatch):
+    h = Harness()
+    wall = 1_800_000_000
+    monkeypatch.setattr(z.time, "time", lambda: wall)
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls[1] = f"https://r1.googlevideo.com/videoplayback?expire={wall + 3}"
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+
+    def request(url, *_args, **_kwargs):
+        nonlocal wall
+        assert url == h.cfg.zapret2.probe_urls[0]
+        wall += 3
+        return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
+
+    h.controller._request = request
+    for seconds in (0, 1, 2):
+        h.step(seconds)
+    assert h.controller.view["reason"] == z.CDN_EXPIRED
+    assert not z.active(h.current) and not h.runtime.up
+
+
 @pytest.mark.parametrize(
     ("enabled", "media_status", "opens"),
     [(False, 204, False), (True, 204, True), (True, 200, True),

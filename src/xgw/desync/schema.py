@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from pathlib import PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .flowseal import LIVE_STRATEGY, YOUTUBE_DOMAINS, valid_live_scope
 
@@ -77,6 +77,23 @@ def valid_youtube_domains(domains: list[str]) -> bool:
 
 def valid_youtube_cdn_host(host: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.googlevideo\.com", host))
+
+
+def youtube_cdn_expiry(url: str) -> int | None:
+    """Extract one explicit URL deadline. Unknown deadlines keep legacy probe behavior."""
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.path != "/videoplayback"
+                or not valid_youtube_cdn_host(parsed.hostname or "")):
+            return None
+        expires = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=128).get("expire")
+    except ValueError:
+        return None
+    if expires and len(expires) == 1 and re.fullmatch(r"[0-9]{1,12}", expires[0]):
+        value = int(expires[0])
+        if 0 < value <= 253402300799:
+            return value
+    return None
 
 
 def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> bool:

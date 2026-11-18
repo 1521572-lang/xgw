@@ -44,6 +44,19 @@ def test_youtube_transport_is_never_reported_as_playback():
     assert view(cfg, snap)["evidence"]["transport"] == "unknown"
 
 
+def test_cdn_expiry_exposes_only_deadline_and_blocks_selective():
+    cfg, snap = fixture(engine="off")
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                             "https://r1.googlevideo.com/videoplayback?expire=1000&sig=private"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    result = view(cfg, snap)
+    assert result["probe_expiry"] == [{"probe": 2, "expires_at": 1000}]
+    assert any("Истёк срок" in part for part in result["blockers"]["selective"])
+    assert "sig=private" not in json.dumps(result)
+    assert "r1.googlevideo.com" not in json.dumps(result)
+
+
 def test_transport_probe_details_are_private_and_revision_bound():
     cfg, snap = fixture(mode="selective", engine="off", state="fallback",
                         reason="youtube_page_probe_failed", gate_closed=True)

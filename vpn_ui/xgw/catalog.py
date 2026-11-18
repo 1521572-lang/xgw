@@ -32,6 +32,7 @@ class Entry:
     pool: bool = False
     rating: float | None = None
     active: bool = False
+    admitted: bool = False
 
 
 def _country(row: dict) -> str:
@@ -94,7 +95,8 @@ def catalog(state: dict, pool: dict | None = None) -> tuple[list[Source], list[E
                                  _country(row), "pool", item.pinned, item.choosable,
                                  _number(observed.get("mbps")), _number(row.get("delay_ms")),
                                  pool=True, rating=_number(row.get("score")),
-                                 active=item.rank == 0))
+                                 active=item.rank == 0,
+                                 admitted=bool(row) and not row.get("why")))
     return sources, entries
 
 
@@ -106,7 +108,8 @@ def filtered(entries: list[Entry], source: str, query: str, status: str, order: 
               (not query or query in
                f"{item.name} {item.country} {country_name(item.country)}".casefold()) and
               (status == "all" or (status == "chosen" and item.chosen) or
-               (status == "usable" and (item.choosable or item.chosen)))]
+               (status == "usable" and (item.choosable or item.chosen)) or
+               (status == "admitted" and item.admitted))]
     if descending is None:
         descending = order in ("speed", "rating")
     if order in ("speed", "delay", "rating"):

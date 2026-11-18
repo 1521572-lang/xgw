@@ -116,12 +116,12 @@ class Metric(QtWidgets.QFrame):
         box = QtWidgets.QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(3)
-        caption = plain_label("GatewayCaption")
-        caption.setText(title)
+        self.caption = plain_label("GatewayCaption")
+        self.caption.setText(title)
         self.value = plain_label("GatewayValue")
         self.value.setText("—")
         self.setToolTip(tooltip)
-        box.addWidget(caption)
+        box.addWidget(self.caption)
         box.addWidget(self.value)
 
 
@@ -159,6 +159,9 @@ class Details(QtWidgets.QFrame):
         if self._wide == wide:
             return
         self._wide = wide
+        self.speed.caption.setText("Последний замер" if wide else "Замер скорости")
+        self.rtt.caption.setText("Задержка RTT" if wide else "RTT")
+        self.core.caption.setText("Ядро сервера" if wide else "Ядро")
         for cell in self.cells:
             self.grid.removeWidget(cell)
         for col in range(4):
