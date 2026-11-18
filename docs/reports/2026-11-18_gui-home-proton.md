@@ -85,4 +85,4 @@
 4. Компактный режим 720×660 скрывает нижние метрики частично (в 720px «Последний
    замер/Ядро сервера» переносятся, читаемо); при минимуме 566×609 всё критичное
    доступно.
-- Publication commit: `добавляется после push` (worktree report от FETCH_HEAD поверх 8806bba).
+- Publication commit: `2c4c505e434e05126c9b7a3855e97977c94e2fca` (8806bba → 2c4c505, remote verified byte-identical to local HEAD).
