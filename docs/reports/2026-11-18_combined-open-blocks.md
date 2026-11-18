@@ -48,4 +48,4 @@ assert not result["ok"]  → FAIL
 - Управление `zapret2_management.py` в этом пакете изменено (расширение Flowseal-
   импорта); test_zapret2_management.py в пакете не менялся относительно OLD —
   закрепление осталось прежним.
-- Publication commit: `добавляется после push`.
+- Publication commit: `f9a04e74d3e2600be04b2c1602eb14c054d8836b` (b534c3b → f9a04e7, remote verified byte-identical to local HEAD).
