@@ -144,11 +144,12 @@ def snapshot(path: Path, *, paths: Paths | None = None) -> dict:
             raise EvidenceError("metrics_not_on_loopback")
         sample = metrics.fetch_metrics(int(port), timeout=2)
         when = time.monotonic_ns()
+        unix = time.time()
         if raw != _read_config(path) or epoch != _xray_epoch():
             raise EvidenceError("snapshot_changed_during_read")
     return {"xray_epoch": epoch, "config_sha256": hashlib.sha256(raw).hexdigest(),
             "config_semantic_sha256": identity,
-            "monotonic_ns": when, "client_zapret2_rule": active(applied),
+            "monotonic_ns": when, "unix": unix, "client_zapret2_rule": active(applied),
             "tags": counters(applied, sample)}
 
 

@@ -47,6 +47,49 @@ def test_socket_stats_denied_is_unavailable(monkeypatch):
     assert watch.socket_stats() == {"state": "unavailable", "sockets": []}
 
 
+def media_sample(seconds, packets, *, configured=True, semantic="policy", epoch="xray"):
+    return {
+        "revision": "abc", "worker_invocation": "worker",
+        "probes": {},
+        "gate": {"marked": True},
+        "queue_start_unix": 99.75 + seconds, "queue_end_unix": 99.9 + seconds,
+        "outgoing": {"handle": 8, "packets": packets},
+        "queue": {"peer": 12, "sequence": packets},
+        "route": {
+            "unix": 100 + seconds, "monotonic_ns": seconds * 10**9, "xray_epoch": epoch,
+            "config_sha256": str(seconds), "config_semantic_sha256": semantic,
+            "client_zapret2_rule": configured,
+            "tags": {"xgw-zapret2": {"group": "zapret2", "uplink": packets, "downlink": packets}},
+        },
+    }
+
+
+def test_media_pair_accepts_stable_route_and_records_zero_or_positive_queue_growth():
+    before = media_sample(1, 10)
+    result = watch.media_pair(before, media_sample(4, 25))
+    assert result["state"] == "accepted" and result["config_bytes_changed"]
+    assert (result["start_unix"], result["end_unix"]) == (101, 103.75)
+    assert result["nft_packets"] == result["queue_sequence_delta"] == 15
+    assert result["groups"]["zapret2"]["downlink"] == 15
+    assert watch.media_pair(before, media_sample(4, 10))["nft_packets"] == 0
+
+
+@pytest.mark.parametrize(("after", "reason"), [
+    (media_sample(4, 25) | {"route": None}, "route_sample_missing"),
+    (media_sample(4, 25) | {"worker_invocation": "new"}, "policy_or_worker_changed"),
+    (media_sample(4, 25, configured=False), "client_rule_inactive"),
+    (media_sample(4, 25, semantic="new"), "incomparable_snapshots"),
+    (media_sample(4, 25, epoch="new"), "incomparable_snapshots"),
+    (media_sample(15, 25), "sample_gap"),
+    (media_sample(4, 25) | {"gate": None}, "gate_unconfirmed"),
+    (media_sample(4, 25) | {"queue_start_unix": 101}, "no_shared_window"),
+    (media_sample(4, 25) | {"queue": {"peer": 13, "sequence": 25}}, "queue_changed"),
+])
+def test_media_pair_rejects_changes_and_missing_samples(after, reason):
+    result = watch.media_pair(media_sample(1, 10), after)
+    assert result["state"] == "rejected" and result["reason"] == reason
+
+
 def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypatch):
     monkeypatch.setattr(wan_control, "route", lambda *_args: {"dev": "xgw-tun"})
 
