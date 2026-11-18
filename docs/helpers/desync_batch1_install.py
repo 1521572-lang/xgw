@@ -67,6 +67,8 @@ SELECTIVE_WEB_RESUME_TIMER = "xgw-selective-web-resume-rollback.timer"
 SELECTIVE_EXPIRY = ("zapret2.py", "desync/schema.py", "watch/zapret2_control.py",
                     "watch/zapret2_management.py", "ui/zapret2.js")
 SELECTIVE_EXPIRY_TIMER = "xgw-selective-expiry-rollback.timer"
+SELECTIVE_STATUS = ("watch/zapret2_control.py",)
+SELECTIVE_STATUS_TIMER = "xgw-selective-status-rollback.timer"
 
 
 def require(ok, message):
@@ -221,6 +223,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "selective_status", False):
+        return SELECTIVE_STATUS, SELECTIVE_STATUS_TIMER
     if getattr(args, "selective_expiry", False):
         return SELECTIVE_EXPIRY, SELECTIVE_EXPIRY_TIMER
     if getattr(args, "selective_web_resume", False):
@@ -286,6 +290,7 @@ def main():
     stage.add_argument("--selective-cdn-retry", action="store_true")
     stage.add_argument("--selective-web-resume", action="store_true")
     stage.add_argument("--selective-expiry", action="store_true")
+    stage.add_argument("--selective-status", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

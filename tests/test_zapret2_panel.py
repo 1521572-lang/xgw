@@ -162,6 +162,7 @@ def test_selected_fallback_requires_gate_and_never_asserts_vpn_health():
     assert "проверяется отдельно" in view(cfg, snap)["detail"]
     snap["zapret2"]["gate_closed"] = False
     assert view(cfg, snap)["state"] == "blocked"
+    assert "Возврат маршрута не подтверждён" in view(cfg, snap)["detail"]
 
 
 def test_fallback_evidence_is_policy_bound_and_keeps_the_original_probe_time():
@@ -178,6 +179,35 @@ def test_fallback_evidence_is_policy_bound_and_keeps_the_original_probe_time():
     snap["zapret2_policy_key"] = "previous"
     assert view(cfg, snap)["evidence"]["vpn_control"] == "not_run"
     assert view(cfg, snap)["evidence"]["vpn_control_at"] is None
+
+
+@pytest.mark.parametrize(("reason", "probe", "failure", "expected"), [
+    ("youtube_page_probe_failed", "page",
+     {"phase": "tls", "kind": "timeout"}, "Проба CDN не запускалась"),
+    ("youtube_cdn_probe_failed", "cdn",
+     {"phase": "tls", "kind": "timeout", "first_tls_timeout_ms": 10000,
+      "elapsed_ms": 20100}, "Повтор тоже завершился таймаутом"),
+    ("youtube_cdn_probe_failed", "cdn",
+     {"phase": "headers", "kind": "http", "http": 403}, "CDN вернул HTTP 403"),
+])
+def test_transport_failure_detail_uses_only_current_probe(reason, probe, failure, expected):
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback", reason=reason,
+                        gate_closed=True, vpn_control="pass", vpn_control_reason="ok",
+                        vpn_control_at=NOW - 5)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"]["transport_probes"] = {
+        "page": {"ok": True}, probe: dict(failure, ok=False, url="private signed URL"),
+    }
+    detail = view(cfg, snap)["detail"]
+    assert expected in detail and "Свежая контрольная проба через VPN прошла" in detail
+    assert "private" not in detail
+    snap["zapret2"]["gate_closed"] = False
+    detail = view(cfg, snap)["detail"]
+    assert expected in detail and "Контроллер снял" not in detail and "VPN прошла" not in detail
+    snap["zapret2_policy_key"] = "previous"
+    assert expected not in view(cfg, snap)["detail"]
 
 
 def test_private_and_untrusted_fields_are_not_published():

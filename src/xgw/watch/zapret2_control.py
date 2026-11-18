@@ -114,6 +114,23 @@ def transport_probes(value: object, *, now: float) -> dict:
     return probes
 
 
+def transport_failure_detail(reason: str, probes: dict) -> str:
+    target = "page" if reason == "youtube_page_probe_failed" else "cdn"
+    row = probes.get(target) or {}
+    if row.get("ok") is not False:
+        return REASONS[reason]
+    if row.get("phase") == "tls" and row.get("kind") == "timeout":
+        if target == "page":
+            return "Таймаут TLS страницы YouTube на прямом пути. Проба CDN не запускалась."
+        if row.get("first_tls_timeout_ms") is not None:
+            return "Таймаут TLS до CDN на прямом пути. Повтор тоже завершился таймаутом."
+        return "Таймаут TLS до CDN на прямом пути."
+    if (target == "cdn" and row.get("phase") == "headers" and row.get("kind") == "http"
+            and row.get("http") in (403, 410)):
+        return f"CDN вернул HTTP {row['http']}. Сохраните свежий адрес из плеера."
+    return REASONS[reason]
+
+
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None) -> dict:
     """Always return a card; a worker fault never means that VPN was restored.
 
@@ -178,10 +195,8 @@ Commands use the same validation as this card; observations remain revision-boun
     if phase == "active" and (capture.get("mode") != "on"
                               or _record(snapshot.get("capture")).get("loaded") is not True):
         phase, reason, detail = "unknown", "capture_unconfirmed", "Перехват не подтверждён."
-    if phase == "fallback":
-        detail += " Контроллер снял прямой маршрут; доступность VPN проверяется отдельно."
-        if selected.get("gate_closed") is not True:
-            phase = "blocked"
+    if phase == "fallback" and selected.get("gate_closed") is not True:
+        phase = "blocked"
     if not isinstance(phase, str) or phase not in TITLES:
         phase = "unknown"
     without_vpn = (fresh and matched and phase == "active" and settings["mode"] == "standalone"
@@ -212,6 +227,17 @@ Commands use the same validation as this card; observations remain revision-boun
     if (trusted and settings["mode"] == "selective" and settings.get("youtube_transport_probe")
             and (transport == "https_reachable" or transport_failed)):
         transport_rows = transport_probes(selected.get("transport_probes"), now=now)
+        if transport_failed:
+            detail = transport_failure_detail(reason, transport_rows)
+    if phase == "fallback":
+        detail += " Контроллер снял прямой маршрут."
+        if (vpn_control == "pass" and vpn_control_reason == "ok" and vpn_control_at is not None
+                and now - vpn_control_at <= FRESH_SECONDS):
+            detail += " Свежая контрольная проба через VPN прошла."
+        else:
+            detail += " Доступность VPN проверяется отдельно."
+    elif phase == "blocked" and settings["mode"] == "selective":
+        detail += " Возврат маршрута не подтверждён."
     urls = settings["probe_urls"]
     page_kind = (zapret2.youtube_probe_page_kind(urls[0])
                  if settings.get("youtube_transport_probe") and urls else None)

@@ -179,6 +179,7 @@ class Sidebar(QtWidgets.QFrame):
         self.servers.setRootIsDecorated(False)
         self.servers.setColumnCount(3)
         self.servers.header().setSectionsClickable(True)
+        self.servers.header().setSectionsMovable(False)
         self.servers.header().setSortIndicatorShown(False)
         self.servers.header().setIconSize(QtCore.QSize(12, 12))
         self.servers.header().sectionClicked.connect(self.sort_by_column)
@@ -186,9 +187,9 @@ class Sidebar(QtWidgets.QFrame):
         self.servers.header().setStretchLastSection(False)
         self.servers.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.servers.header().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            1, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.servers.header().setSectionResizeMode(
-            2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            2, QtWidgets.QHeaderView.ResizeMode.Fixed)
         self.servers.setAllColumnsShowFocus(True)
         self.servers.setUniformRowHeights(True)
         self.servers.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -261,7 +262,18 @@ class Sidebar(QtWidgets.QFrame):
                 color: {c.text_weak.qss}; border: none; padding: 6px 3px; font-size: 12px; }}
             QFrame#SidebarPane QHeaderView::section:hover {{ background: {c.bg_weak_hover.qss}; }}
         """)
+        self.size_metric_columns()
         self.update_headings(self.servers.topLevelItemCount())
+
+    def size_metric_columns(self):
+        header = self.servers.header()
+        font = QtGui.QFont(header.font())
+        font.setPixelSize(12)
+        labels = QtGui.QFontMetrics(font)
+        value_width = self.servers.fontMetrics().horizontalAdvance("999999,99") + 8
+        # Reserve the same space for the sort icon in both states.
+        for column, title in enumerate(("Мбит/с", "Рейтинг"), start=1):
+            header.resizeSection(column, max(value_width, labels.horizontalAdvance(title) + 32))
 
     def update_headings(self, count):
         palette = theme.palette()

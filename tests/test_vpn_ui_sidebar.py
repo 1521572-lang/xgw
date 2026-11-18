@@ -86,7 +86,8 @@ def test_preview_is_anchored_and_refresh_keeps_scroll_and_selection(app):
         parent.close()
 
 
-def test_header_clicks_sort_without_selecting_server(app):
+@pytest.mark.parametrize("width", [280, 340])
+def test_header_clicks_sort_without_selecting_server(app, width):
     bridge = Bridge()
     bridge.entries = [replace(bridge.entries[0], name="b", speed=9, rating=0.9, chosen=True),
                       replace(bridge.entries[1], name="a", speed=100, rating=0.1),
@@ -94,10 +95,12 @@ def test_header_clicks_sort_without_selecting_server(app):
     parent = QtWidgets.QWidget()
     sidebar = Sidebar(bridge, parent)
     parent.resize(1024, 720)
-    sidebar.setGeometry(8, 38, 340, 650)
+    sidebar.setGeometry(8, 38, width, 650)
     parent.show()
     app.processEvents()
     header = sidebar.servers.header()
+    positions = [header.sectionViewportPosition(i) for i in range(3)]
+    sizes = [header.sectionSize(i) for i in range(3)]
 
     def names():
         return [sidebar.servers.topLevelItem(i).text(0).splitlines()[0] for i in range(3)]
@@ -107,9 +110,11 @@ def test_header_clicks_sort_without_selecting_server(app):
         assert [row.text(i) for i in range(3)] == ["Серверы (3)", "Мбит/с", "Рейтинг"]
         assert [i for i in range(3) if not row.icon(i).isNull()] == [column]
         assert row.toolTip(column).endswith(direction)
+        assert [header.sectionViewportPosition(i) for i in range(3)] == positions
+        assert [header.sectionSize(i) for i in range(3)] == sizes
 
-    def click(column):
-        x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
+    def click(column, *, near_edge=False):
+        x = positions[column] + (6 if near_edge else sizes[column] // 2)
         QTest.mouseClick(header.viewport(), Qt.MouseButton.LeftButton,
                          pos=QtCore.QPoint(x, header.height() // 2))
         app.processEvents()
@@ -121,7 +126,11 @@ def test_header_clicks_sort_without_selecting_server(app):
         click(0)
         assert names() == ["c", "b", "a"]
         indicator(0, "По убыванию")
-        click(1)
+        # Clicking the visible start of the speed header must still work after an API tick.
+        bridge.entries[1] = replace(bridge.entries[1], speed=123456.7)
+        bridge.gateway_changed.emit()
+        app.processEvents()
+        click(1, near_edge=True)
         assert names() == ["a", "b", "c"]
         indicator(1, "По убыванию")
         click(1)
