@@ -74,4 +74,4 @@
 3. Прямой TLS-канал к googlevideo по-прежнему деградирует (страница `/t/terms` на
    этот раз), сценарий Selective остаётся недоступным до восстановления прямого
    пути — карточка честно показывает «Прямой путь отключён» + VPN-подтверждение.
-- Publication commit: `добавляется после push` (worktree report от FETCH_HEAD поверх a44237a).
+- Publication commit: `aff926542f2fefe5c62abf3f1741744fba03b6ff` (a44237a → aff9265, remote verified byte-identical to local HEAD).
