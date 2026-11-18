@@ -10,7 +10,8 @@ from ..qt import Qt, QtCore, QtGui, QtSvg, QtWidgets
 from ..theme import svg_loader, tokens
 from ..theme.tokens import Metrics
 
-DEFAULT_FOCUS = (640.0, 165.0)  # Европа: пока страна неизвестна
+DEFAULT_FOCUS = (627.0, 132.0)  # Северное море, в кадре Великобритания и континентальная Европа
+MAP_SCALE = 5.25  # логические пиксели на единицу SVG; метки используют тот же масштаб
 ANCHOR_Y = 0.44  # где по высоте окна стоит выбранная страна
 
 
@@ -131,7 +132,7 @@ class MapCanvasView(QtWidgets.QWidget):
 
     def _visible(self) -> QtCore.QRectF:
         """Какая часть карты (в её единицах) попадает в окно при текущем фокусе."""
-        scale, anchor = Metrics.MAP_SCALE, self._anchor()
+        scale, anchor = MAP_SCALE, self._anchor()
         return QtCore.QRectF(self._focus.x() - anchor.x() / scale,
                              self._focus.y() - anchor.y() / scale,
                              self.width() / scale, self.height() / scale)
@@ -141,8 +142,8 @@ class MapCanvasView(QtWidgets.QWidget):
         if point is None:
             return None
         visible = self._visible()
-        return QtCore.QPointF((point[0] - visible.left()) * Metrics.MAP_SCALE,
-                              (point[1] - visible.top()) * Metrics.MAP_SCALE)
+        return QtCore.QPointF((point[0] - visible.left()) * MAP_SCALE,
+                              (point[1] - visible.top()) * MAP_SCALE)
 
     # --- отрисовка -------------------------------------------------------------------
     def _map_pixmap(self) -> QtGui.QPixmap:
@@ -209,6 +210,13 @@ class MapCanvasView(QtWidgets.QWidget):
         top = QtGui.QColor(self._glow)
         if colors.name == "light":
             top.setAlphaF(top.alphaF() * 0.6)  # на белом то же свечение читается резче
+        # У шапки контуры плавно исчезают в цвете состояния соединения.
+        sea = theme.qcolor(colors.map_sea)
+        amount = top.alphaF()
+        top = QtGui.QColor.fromRgbF(
+            top.redF() * amount + sea.redF() * (1 - amount),
+            top.greenF() * amount + sea.greenF() * (1 - amount),
+            top.blueF() * amount + sea.blueF() * (1 - amount))
         clear = QtGui.QColor(top)
         clear.setAlphaF(0.0)
         glow.setColorAt(0.0, top)

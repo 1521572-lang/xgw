@@ -22,8 +22,6 @@ class XgwWindow(MainWindow):
     def __init__(self, bridge, login, session_path, **kwargs):
         self.login, self.session_path = login, session_path
         super().__init__(bridge, title="XGW", **kwargs)
-        self.sidebar_width = 360  # Имя/страна и две отдельные числовые колонки.
-        self._place()
         self.tools = ToolsWindow(bridge, self, arrow_image=self.combo_arrow(tokens.LIGHT))
         bridge.section_requested.connect(self.open_section)
         login.finished.connect(self.on_login)
@@ -48,17 +46,16 @@ class XgwWindow(MainWindow):
         self.drawer.sync_theme()
         app = QtWidgets.QApplication.instance()
         app.setStyleSheet(app.styleSheet() + f"""
-            #TitleBar {{ background: {c.bg_norm.qss}; }}
             #SidebarPane QListWidget, #SidebarPane QTreeWidget {{
-                background: {c.pane.qss}; color: {c.text.qss}; border: 0;
+                background: transparent; color: {c.text.qss}; border: 0;
             }}
             #SidebarPane QTreeWidget::item {{ padding: 8px 4px; }}
-            #SidebarPane QListWidget::item {{ padding: 6px 4px; }}
+            #SidebarPane QListWidget::item {{ padding: 4px 8px; border-radius: 4px; }}
             #SidebarPane QAbstractItemView::item:selected {{
                 background: {c.fill_active.qss}; color: {c.text.qss};
             }}
-            #SidebarPane QPushButton, #SettingsDrawer QPushButton, QToolButton#XgwTool {{
-                background: {c.pane.qss}; color: {c.text.qss};
+            #SidebarPane QPushButton, #SettingsDrawer QPushButton {{
+                background: {c.fill.qss}; color: {c.text.qss};
                 border: 1px solid {c.border_weak.qss}; border-radius: 6px; padding: 5px;
             }}
             #SidebarPane QComboBox, #SettingsDrawer QComboBox {{
@@ -77,24 +74,20 @@ class XgwWindow(MainWindow):
                 background: {c.fill_active.qss};
             }}
             #SidebarPane QPushButton:disabled {{ color: {c.text_hint.qss}; }}
-            QFrame#GatewayDetails {{ background: {c.pane.qss};
-                border: 1px solid {c.border_weak.qss}; border-radius: 12px; }}
-            QLabel#GatewayCaption {{ color: {c.text_weak.qss}; font-size: 12px; }}
-            QLabel#GatewayServer {{ color: {c.text.qss}; font-size: 18px; font-weight: 600; }}
-            QLabel#GatewayStatus {{ color: {c.text_weak.qss}; background: {c.fill.qss};
-                border-radius: 7px; padding: 3px 8px; font-size: 12px; }}
+            QFrame#GatewayDetails, QFrame#GatewayMetric {{ background: transparent; border: none; }}
+            QLabel#GatewayCaption, QLabel#ZapretNote {{
+                color: {c.text_weak.qss}; font-size: 12px; }}
+            QLabel#GatewayStatus {{ color: {c.danger.qss}; font-size: 14px; font-weight: 600; }}
             QLabel#GatewayStatus[tone="ok"] {{ color: {c.success.qss}; }}
+            QLabel#GatewayStatus[tone="direct"] {{ color: {c.text.qss}; }}
             QLabel#GatewayStatus[tone="warn"], QLabel#GatewayStatus[tone="busy"] {{
-                color: {c.text.qss}; background: {c.warning.alpha(0.15).qss}; }}
+                color: {c.text.qss}; }}
             QLabel#GatewayStatus[tone="bad"] {{ color: {c.danger.qss}; }}
-            QFrame#GatewayMetric {{ background: {c.fill.qss}; border: none; border-radius: 7px; }}
             QLabel#GatewayValue {{ color: {c.text.qss}; font-size: 14px; font-weight: 600; }}
-            QPushButton#GatewayLink {{ background: transparent; color: {c.link.qss};
-                border: 1px solid transparent; border-radius: 6px; padding: 5px 8px; }}
-            QPushButton#GatewayLink:hover {{ background: {c.fill_hover.qss}; }}
-            QPushButton#GatewayLink:focus {{ border-color: {c.border_focus.qss}; }}
-            QToolButton#XgwTool[gatewayTone="ok"] {{ border-color: {c.success.qss}; }}
-            QToolButton#XgwTool[gatewayTone="bad"] {{ border-color: {c.danger.qss}; }}
+            QToolButton#XgwTool {{ color: {c.text.qss}; font-size: 12px; }}
+            QLabel#ZapretNote[tone="ok"] {{ color: {c.success.qss}; }}
+            QLabel#ZapretNote[tone="bad"] {{ color: {c.danger.qss}; }}
+            #SidebarPane QPushButton:focus {{ border-color: {c.border_focus.qss}; }}
             #SettingsDrawer QPushButton#SettingsLink {{ text-align: left;
                 background: {c.fill.qss}; border: none; padding: 10px 12px; }}
             #SettingsDrawer QPushButton#SettingsLink:hover {{ background: {c.fill_hover.qss}; }}

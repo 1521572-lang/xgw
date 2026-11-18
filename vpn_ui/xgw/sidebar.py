@@ -139,36 +139,41 @@ class Sidebar(QtWidgets.QFrame):
         page = QtWidgets.QWidget()
         column = QtWidgets.QVBoxLayout(page)
         column.setContentsMargins(12, 12, 12, 12)
+        column.setSpacing(8)
+        self.search = SearchBox(page)
+        self.search.edit.setPlaceholderText("Найти сервер…")
+        self.search.edit.textChanged.connect(self.render)
+        column.addWidget(self.search)
         head = QtWidgets.QHBoxLayout()
-        head.addWidget(QtWidgets.QLabel("Подписки"))
+        title = QtWidgets.QLabel("Подписки")
+        title.setObjectName("ListHeader")
+        head.addWidget(title)
+        head.addStretch()
         manage = QtWidgets.QPushButton("Изменить")
+        manage.setAccessibleName("Изменить подписки")
         manage.clicked.connect(lambda: bridge.section_requested.emit("subscriptions"))
         head.addWidget(manage)
         column.addLayout(head)
         self.sources = QtWidgets.QListWidget()
         self.sources.setAccessibleName("Подписки и источники серверов")
         self.sources.setTextElideMode(Qt.TextElideMode.ElideRight)
-        self.sources.setMaximumHeight(155)
-        self.sources.setMinimumHeight(85)
+        self.sources.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.sources.currentItemChanged.connect(self.source_changed)
         column.addWidget(self.sources)
         self.source_note = QtWidgets.QLabel()
+        self.source_note.setObjectName("GatewayCaption")
         self.source_note.setWordWrap(True)
         self.source_note.setTextFormat(Qt.TextFormat.PlainText)
         column.addWidget(self.source_note)
-        self.search = SearchBox(page)
-        self.search.edit.setPlaceholderText("Найти сервер в подписке")
-        self.search.edit.textChanged.connect(self.render)
-        column.addWidget(self.search)
-        options = QtWidgets.QHBoxLayout()
-        self.filter = QtWidgets.QComboBox()
-        for title, value in (("Все", "all"), ("Доступные", "usable"),
-                             ("Выбран вручную", "chosen")):
-            self.filter.addItem(title, value)
+        self.filter = QtWidgets.QTabBar()
+        self.filter.setObjectName("ServerFilter")
+        self.filter.setDrawBase(False)
+        self.filter.setExpanding(False)
+        for title, value in (("Все", "all"), ("Доступные", "usable"), ("Выбранные", "chosen")):
+            self.filter.setTabData(self.filter.addTab(title), value)
         self.filter.setAccessibleName("Состояние серверов")
-        self.filter.currentIndexChanged.connect(self.render)
-        options.addWidget(self.filter)
-        column.addLayout(options)
+        self.filter.currentChanged.connect(self.render)
+        column.addWidget(self.filter)
         self.servers = QtWidgets.QTreeWidget()
         self.servers.setHeaderLabels(["Серверы", "Мбит/с", "Рейтинг"])
         self.servers.setRootIsDecorated(False)
@@ -206,8 +211,10 @@ class Sidebar(QtWidgets.QFrame):
         self.auto.setToolTip("Вернуть выбор серверов демону. "
                              "Фильтр подписки не ограничивает автовыбор.")
         self.auto.clicked.connect(lambda: bridge.automatic(self._source))
-        column.addWidget(self.choose)
-        column.addWidget(self.auto)
+        actions = QtWidgets.QHBoxLayout()
+        actions.addWidget(self.choose)
+        actions.addWidget(self.auto)
+        column.addLayout(actions)
         self.stack.addWidget(page)
         compact = QtWidgets.QWidget()
         buttons = QtWidgets.QVBoxLayout(compact)
@@ -227,18 +234,30 @@ class Sidebar(QtWidgets.QFrame):
             self.hide_details()
         self.compact = compact
         self.stack.setCurrentIndex(1 if compact else 0)
+        overlay = not compact and self.window().width() < Metrics.SIDEBAR_BREAK
+        if self.property("overlay") != overlay:
+            self.setProperty("overlay", overlay)
+            self.style().unpolish(self)
+            self.style().polish(self)
 
     def retint(self):
         c = theme.palette()
         self.setStyleSheet(f"""
-            QFrame#SidebarPane {{ background: {c.bg_norm.qss};
+            QFrame#SidebarPane {{ background: {c.pane.qss};
                 border: 1px solid {c.border_weak.qss}; border-radius: {Metrics.PANE_RADIUS}px; }}
+            QFrame#SidebarPane[overlay="true"] {{ background: {c.bg_norm.qss}; }}
+            QTabBar#ServerFilter::tab {{ background: transparent; color: {c.text_weak.qss};
+                padding: 6px 7px; border-bottom: 2px solid transparent; }}
+            QTabBar#ServerFilter::tab:selected {{ color: {c.text.qss};
+                border-color: {c.text.qss}; }}
+            QTabBar#ServerFilter::tab:hover {{ background: {c.fill_hover.qss}; }}
+            QTabBar#ServerFilter:focus {{ border: 1px solid {c.border_focus.qss}; }}
             QFrame#SidebarPane QTreeWidget::item {{ padding: 3px 4px; }}
             QFrame#SidebarPane QTreeWidget::item:hover {{ background: {c.fill_hover.qss}; }}
             QFrame#SidebarPane QTreeWidget::item:selected {{ background: {c.fill_selected.qss}; }}
-            QFrame#SidebarPane QHeaderView::section {{ background: {c.bg_norm.qss};
-                color: {c.text_weak.qss}; border: none; padding: 6px 3px; }}
-            QFrame#SidebarPane QHeaderView::section:hover {{ background: {c.fill_hover.qss}; }}
+            QFrame#SidebarPane QHeaderView::section {{ background: {c.bg_weak.qss};
+                color: {c.text_weak.qss}; border: none; padding: 6px 3px; font-size: 12px; }}
+            QFrame#SidebarPane QHeaderView::section:hover {{ background: {c.bg_weak_hover.qss}; }}
         """)
 
     def sort_by_column(self, column):
@@ -432,6 +451,8 @@ class Sidebar(QtWidgets.QFrame):
                 self.sources.addItem(row)
                 if source.id == self._source:
                     self.sources.setCurrentItem(row)
+            height = max(24, self.sources.sizeHintForRow(0))
+            self.sources.setFixedHeight(height * max(1, min(3, len(sources))) + 4)
             if self.sources.currentRow() < 0 and sources:
                 self.sources.setCurrentRow(0)
             current = self.sources.currentItem()
@@ -443,7 +464,7 @@ class Sidebar(QtWidgets.QFrame):
                                  "Добавьте подписку или ссылку сервера")
         order = ("name", "speed", "rating")[self._sort_column]
         entries = filtered(self.bridge.entries, self._source, self.search.edit.text(),
-                           self.filter.currentData(), order,
+                           self.filter.tabData(self.filter.currentIndex()), order,
                            country_name=country_name, descending=self._descending)
         # A native Qt sort indicator can point down for ascending order depending on style.
         header = self.servers.headerItem()

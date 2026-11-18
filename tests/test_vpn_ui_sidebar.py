@@ -84,7 +84,7 @@ def test_preview_is_anchored_and_refresh_keeps_scroll_and_selection(app):
 
 def test_header_clicks_sort_without_selecting_server(app):
     bridge = Bridge()
-    bridge.entries = [replace(bridge.entries[0], name="b", speed=9, rating=0.9),
+    bridge.entries = [replace(bridge.entries[0], name="b", speed=9, rating=0.9, chosen=True),
                       replace(bridge.entries[1], name="a", speed=100, rating=0.1),
                       replace(bridge.entries[2], name="c", speed=None, rating=None)]
     parent = QtWidgets.QWidget()
@@ -130,6 +130,14 @@ def test_header_clicks_sort_without_selecting_server(app):
         assert names() == ["a", "b", "c"]
         assert not header.isSortIndicatorShown()
         assert headings() == ["Серверы (3)", "Мбит/с", "Рейтинг ▲"]
+        QTest.mouseClick(sidebar.filter, Qt.MouseButton.LeftButton,
+                         pos=sidebar.filter.tabRect(2).center())
+        assert sidebar.servers.topLevelItemCount() == 1
+        assert sidebar.servers.topLevelItem(0).text(0).splitlines()[0] == "b"
+        bridge.gateway_changed.emit()
+        assert sidebar.servers.topLevelItemCount() == 1
+        sidebar.filter.setCurrentIndex(0)
+        assert names() == ["a", "b", "c"]
         assert bridge.sent == []
     finally:
         parent.close()
