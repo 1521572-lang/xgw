@@ -1,14 +1,20 @@
 # Одна расширенная приёмка открытых блоков XGW
 
+Редакция от **19 ноября** после [отчёта BLOCKED_TEST](../reports/2026-11-18_combined-open-blocks.md).
+Исправлен вход в Flowseal через обычные настройки. Установка прошлого пакета
+не выполнялась: продолжать нужно с §1 этого документа на новом SHA, а не
+с CLI старого пакета. Это то же единое задание; сетевые фазы и суточная часть
+сохранены, отдельной короткой приёмки только хотфикса нет.
+
 Машина: ThinkCentre, **Ubuntu 24.04 LTS, amd64**. WAN IPv6 отсутствует по
 подтверждению владельца: живая IPv6-фаза **NOT_APPLICABLE_ON_THIS_HOST**.
 Не настраивать IPv6-туннель и не ждать провайдера ради этой приёмки.
 Структурные тесты IPv6 и защита маршрутов остаются.
 
-**Код: 2b78617075e289e5ce9930e092101a565bfe60c8.** База установленного слоя:
+**Код: 3630b44502b872ca3788e0824c6a9d0d8363b561.** База установленного слоя:
 3d117b1cc9cdd9e7b0184892a36604cd4ebec316 (принятый код бюджета 553de56,
-позднейшие коммиты — отчёты). Действующее задание заменяет разрозненные
-повторы бюджета/CDN/UI. Сначала прочитай [последний отчёт](../reports/2026-11-18_selective-budget.md)
+код 2b78617 на машине не устанавливался). Действующее задание заменяет разрозненные
+повторы бюджета/CDN/UI. Сначала прочитай [последний отчёт](../reports/2026-11-18_combined-open-blocks.md)
 и [общий план](DESYNC-ROADMAP.md).
 
 Цель — за одну приёмку проверить пакет T07–T12, а также собрать недостающие
@@ -57,7 +63,7 @@ printf '%s\n' "$PRETTY_NAME"
 test -z "$(git status --porcelain)"
 REPO=$(git rev-parse --show-toplevel)
 BR=integration/zapret2-batch1
-CODE=2b78617075e289e5ce9930e092101a565bfe60c8
+CODE=3630b44502b872ca3788e0824c6a9d0d8363b561
 OLD=3d117b1cc9cdd9e7b0184892a36604cd4ebec316
 GUI_BASE=7c20f59023ec39e5c5ce4606767ea915c3b91f64
 git fetch origin "$BR"
@@ -95,25 +101,79 @@ unlink решением и не повторять прежние неогран
 
 ## 2. Максимальный целевой набор на настоящем Ubuntu
 
-Ниже один набор; повторять его целиком после PASS не нужно. Сохрани вывод в D.
-Ошибки в коде этого пакета блокируют установку. Известную постороннюю ошибку
-сравни с OLD в отдельном временном checkout, не исправляй сама.
+Сначала короткий обязательный набор: любой FAIL/ERROR блокирует установку.
+Здесь есть проверки обеих веток наличия ассетов, поэтому отсутствие Flowseal
+на машине не скрывает дефект ручного выбора. Старый patch4 должен пройти.
+Сохрани вывод и JUnit приватно в D. Исправлять тесты/код самой запрещено.
 
 ```bash
 "$TEST_PY" -m pytest -o addopts='' -q \
   tests/test_desync_jobs.py tests/test_zapret2.py tests/test_zapret2_panel.py \
   tests/test_zapret2_management.py tests/test_zapret2_management_linux.py \
-  tests/test_desync_schema.py tests/test_desync_worker.py tests/test_desync_standalone.py \
-  tests/test_desync_cache.py tests/test_desync_shadow.py tests/test_desync_event_socket.py \
-  tests/test_desync_tournament.py tests/test_desync_flowseal.py tests/test_desync_route_evidence.py \
-  tests/test_selective_probe_watch.py tests/test_youtube_telemetry.py \
-  tests/test_nfqws2.py tests/test_nft.py tests/test_applier.py tests/test_generator.py \
-  tests/test_freepool.py tests/test_freepool_backend.py tests/test_freepool_stats.py \
-  tests/test_freepool_traffic.py >"$D/tests.log" 2>&1
+  tests/test_desync_schema.py tests/test_acceptance_gate.py \
+  --junitxml="$D/core.xml" >"$D/core-tests.log" 2>&1
 "$TEST_PY" -m pytest -o addopts='' -q tests/test_panel.py -k zapret2 >"$D/api-tests.log" 2>&1
 node --check src/xgw/ui/zapret2.js
 bash -n docs/helpers/t11_management_restore.sh
 ```
+
+Затем один расширенный набор. В прошлом отчёте 14 отказов воспроизведены на OLD;
+без полных ошибок нельзя считать доказанным, что все вызваны только версией nft.
+Их не исключают по имени файла и не помечают PASS. Если они повторятся, помощник
+сопоставит каждый testcase, тип failure/error и **полное сообщение assertion** с
+OLD; нормализуется только путь checkout. Временные файлы pytest размещаются
+в одинаковом подкаталоге двух новых изолированных worktree, чтобы разный номер
+системного pytest-tmp не создавал искусственное отличие. Новая/другая ошибка, новая skipped-строка,
+исчезновение/добавление testcase либо неполный JUnit блокируют установку.
+
+Расширенный список одинаков для NEW и OLD. Новые тесты управления и заданий
+в него не включены: они уже прошли обязательный набор и не могут быть оправданы
+отказом старой версии. При полном PASS расширенного NEW старую версию не гонять.
+
+```bash
+BROAD=(tests/test_desync_worker.py tests/test_desync_standalone.py
+       tests/test_desync_cache.py tests/test_desync_shadow.py tests/test_desync_event_socket.py
+       tests/test_desync_tournament.py tests/test_desync_flowseal.py tests/test_desync_route_evidence.py
+       tests/test_selective_probe_watch.py tests/test_youtube_telemetry.py
+       tests/test_nfqws2.py tests/test_nft.py tests/test_applier.py tests/test_generator.py
+       tests/test_freepool.py tests/test_freepool_backend.py tests/test_freepool_stats.py
+       tests/test_freepool_traffic.py)
+run_broad() {
+  local tree=$1 report=$2 log=$3
+  (
+    cd "$tree" || exit 2
+    env PYTHONPATH="$tree/src:$tree" "$TEST_PY" -m pytest -o addopts='' -q \
+      "${BROAD[@]}" --basetemp="$tree/.acceptance-pytest-tmp" --junitxml="$report"
+  ) >"$log" 2>&1
+}
+if run_broad "$D/source" "$D/broad-new.xml" "$D/broad-new.log"; then
+  BROAD_RESULT=PASS
+else
+  NEW_RC=$?
+  test "$NEW_RC" -eq 1
+  git worktree add --detach "$D/baseline" "$OLD"
+  if run_broad "$D/baseline" "$D/broad-old.xml" "$D/broad-old.log"; then
+    OLD_RC=0
+  else
+    OLD_RC=$?
+  fi
+  test "$OLD_RC" -le 1
+  "$PY" docs/helpers/acceptance_test_gate.py \
+    --current "$D/broad-new.xml" --baseline "$D/broad-old.xml" \
+    --current-source "$D/source" --baseline-source "$D/baseline" \
+    >"$D/baseline-comparison.json"
+  BROAD_RESULT=BASELINE_MATCH
+fi
+```
+
+BASELINE_MATCH разрешает продолжить установку при PASS обязательного набора.
+Это означает «старые отказы с теми же сообщениями», а не принятие этих тестов.
+Запиши их количество/идентификаторы и остальной результат. Если сообщения
+различаются только неизвестными помощнику временными данными, не расширяй
+нормализацию и не обходи его код выхода: сохрани обе ошибки для Codex, установка
+BLOCKED_TEST. После тестового блокера выполнить независимые Qt/синтаксис и
+опубликовать отчёт; сетевые фазы без установки не запускать.
+
 
 Для проверки Qt составь копию **реально установленного** GUI с принятыми накладками:
 
@@ -137,8 +197,10 @@ git show "$GUI_BASE:tests/fixtures/gui/state-work.json" >"$D/gui/tests/fixtures/
 Отдельно укажи результаты recovery before/after commit, cancel, conflict,
 матрицы 18 попыток, pin/reset, сохранения посторонних полей, удаления подписи и
 ограничений импорта; это фикстуры, не сетевой эффект. Старый тест UTC-границы
-также остаётся фикстурой. В локальной Windows-проверке Codex были 132 PASS и Qt
-11 PASS; Linux/flock/API/маршруты принимаются здесь.
+также остаётся фикстурой. В локальной Windows-проверке исправления Codex были
+74 PASS управления/карточки/заданий и 5 PASS сравнения JUnit. Qt 11 PASS подтверждён
+предыдущим отчётом, а выше повторяется на новой копии GUI.
+Linux/flock/API/маршруты принимаются здесь.
 
 ## 3. Доставка 7 файлов службы и 1 файла GUI
 
@@ -346,6 +408,22 @@ PASS механики: complete, 18 строк с 9×2, правильный о�
 
 В off нажми импорт в вебе, потом desktop. Стратегия flowseal_alt9 и 6 доменов
 сохранены, HTTPS-gate выключен, режим остаётся off. Попытка Selective отклонена.
+
+| ID | Проверка контракта ALT9 | PASS |
+|---|---|---|
+| FLOW01 | До импорта профиль обычный. Открой обе формы, сравни strategies API | ALT9 не предлагается как обычный новый выбор; исходный patch4 и новый тест с доступными ассетами проходят |
+| FLOW02 | Нажми импорт в вебе; затем импорт в desktop с актуальной ревизией | Только проверенный локальный импорт выбирает ALT9; второй вызов unchanged, mode остаётся off, чужие поля не потеряны |
+| FLOW03 | С ALT9 в вебе измени retry; в desktop открой и сохрани форму с прежним профилем | Оба запроса приняты, ALT9 не теряется; сохранение без изменений unchanged, не требуется повторный импорт |
+| FLOW04 | В off выбери multisplit, снова открой форму | ALT9 больше не предлагается в обычном выборе; возвращается только отдельной кнопкой импорта |
+| FLOW05 | Опубликованные тесты отсутствия/повреждения ассетов и повторной проверки перед Standalone | Import/activation blocked, off разрешён; ошибки не содержат приватных строк. Реальные ассеты ради имитации не удалять и не переименовывать |
+| FLOW06 | Повтори stale expected и запрет Selective на импортированном ALT9 | Конфликт до записи, неподходящий режим не активируется; все старые ограничения сохранены |
+
+Отсутствие ассетов не мешает сохранять уже выбранный выключенный профиль при
+правке других полей и выключать запущенный режим. При новом включении Standalone
+хэши проверяются заново. Эти ветки покрыты обязательными тестами; live-ассеты
+остаются нетронутыми. Сохранённый ALT9 виден в форме как текущий профиль, это не
+предложение выбрать его из обычного списка после переключения на другой.
+
 Standalone включи штатной кнопкой. Проверь worker, nft, очередь и применённый Xray:
 выбранный HTTPS-трафик через zapret2, VPN bridges/балансировщики приостановлены,
 остальной трафик напрямую; это не Selective.
@@ -565,7 +643,8 @@ sudo systemctl stop xgw-combined-day-rollback.timer 2>/dev/null || true
 
 Файл docs/reports/YYYY-MM-DD_combined-open-blocks.md. В отчёте:
 - SHA кода, SHA базы/GUI, Ubuntu, время, доступы, кто реально запускал команды;
-- TESTS / INSTALL 8/8 / UI01–UI08 / JOB01–JOB05;
+- CORE_TESTS / BROAD_RESULT / BASELINE_MATCH (если был) / API / Qt;
+- INSTALL 8/8 / UI01–UI08 / JOB01–JOB05 / FLOW01–FLOW06;
 - A/B/B/A, таблица всех 18 строк, pin/reset, Flowseal, качества плеера и пути;
 - START/RECHECK, MEDIA_PATH, ordinary VPN, Xray/sing-box по отдельности,
   SIGKILL_SELECTIVE, SIGKILL_STANDALONE, budget, UTC_LIVE, DAY, M3 и H01–H12;
