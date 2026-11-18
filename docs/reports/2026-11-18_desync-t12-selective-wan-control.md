@@ -87,4 +87,4 @@
    окне после seek окна буферизации медиа-сегменты не качаются — для приёмки роста
    «у того же владельца» окно надо снимать сразу после исчерпания буфера либо на
    низком буфере.
-- Publication commit: `добавляется после push` (ветка flash/t12-selective-wan-20261118T114113Z поверх 2d01caa).
+- Publication commit: `c86650880fb358617cf34ddbeebacc326eee30ca` (2d01caa → c866508, remote verified byte-identical to local HEAD).
