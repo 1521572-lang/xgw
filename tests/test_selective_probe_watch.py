@@ -101,7 +101,8 @@ def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypat
     assert result["tcp"] == "wan_route_unconfirmed"
 
 
-def test_wan_control_binds_expected_interface_and_uses_configured_bypass(monkeypatch):
+@pytest.mark.parametrize("tls_host", [None, "r1.googlevideo.com"])
+def test_wan_control_binds_expected_interface_and_uses_configured_bypass(monkeypatch, tls_host):
     recorded = []
 
     class Sock:
@@ -136,9 +137,78 @@ def test_wan_control_binds_expected_interface_and_uses_configured_bypass(monkeyp
     monkeypatch.setattr(wan_control, "route", lookup)
     monkeypatch.setattr(wan_control.marknet, "connect_marked", tcp)
     monkeypatch.setattr(wan_control.socket, "SO_BINDTODEVICE", 25, raising=False)
-    result = wan_control.control("203.0.113.4", "wan0", 2, 111, 0)
+
+    def handshake(sock, host):
+        assert isinstance(sock, Sock)
+        recorded.append(host)
+        return {"tls": "connected"}
+
+    monkeypatch.setattr(wan_control, "tls_control", handshake)
+    result = wan_control.control("203.0.113.4", "wan0", 2, 111, 0, tls_host=tls_host)
     assert recorded == [
         ("203.0.113.4", 2, 0), ("203.0.113.4", 0x10000000, 111),
         b"wan0\0", ("203.0.113.4", 443),
-    ]
+    ] + ([tls_host] if tls_host else [])
     assert result["tcp"] == "connected" and result["source_matches_lookup"]
+    assert result.get("tls") == ("connected" if tls_host else None)
+
+
+@pytest.mark.parametrize("error, outcome", [
+    (None, "connected"),
+    (TimeoutError(), "timeout"),
+    (wan_control.ssl.SSLCertVerificationError("local detail"), "certificate_error"),
+])
+def test_wan_tls_checks_name_and_distinguishes_failure(monkeypatch, error, outcome):
+    raw = object()
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, value):
+            assert value == 10
+
+        def do_handshake(self):
+            if error:
+                raise error
+
+        def version(self):
+            return "TLSv1.3"
+
+    class Context:
+        def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect):
+            assert sock is raw and not do_handshake_on_connect
+            assert server_hostname == "r1.googlevideo.com"
+            return Socket()
+
+    if isinstance(error, wan_control.ssl.SSLCertVerificationError):
+        error.verify_code = 62
+    monkeypatch.setattr(wan_control.ssl, "create_default_context", Context)
+    result = wan_control.tls_control(raw, "r1.googlevideo.com")
+    assert result["tls"] == outcome
+    assert result["tls_finished_at"] >= result["tls_started_at"]
+    assert "local detail" not in str(result)
+    if outcome == "certificate_error":
+        assert result["verify_code"] == 62
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_wan_tls_trigger_requires_unique_new_sending_socket(monkeypatch, ambiguous):
+    peer = "203.0.113.4"
+    old = {"socket": "1", "peer_ip": peer, "state": "ESTAB", "bytes_sent": 100}
+    fresh = {**old, "socket": "2"}
+    pending = {**old, "socket": "3", "bytes_sent": 0}
+    other_peer = {**old, "socket": "4", "peer_ip": "203.0.113.5"}
+    sockets = [old, fresh, pending, other_peer]
+    if ambiguous:
+        sockets.append({**fresh, "socket": "5"})
+    samples = iter([[old], sockets])
+    monkeypatch.setattr(watch, "socket_stats", lambda: {"state": "read", "sockets": next(samples)})
+    result = wan_control.wait_for_selective_socket(peer, seconds=5)
+    if ambiguous:
+        assert result["state"] == "multiple_candidates"
+    else:
+        assert result["state"] == "matched" and result["socket"] == fresh

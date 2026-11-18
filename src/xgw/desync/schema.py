@@ -75,6 +75,10 @@ def valid_youtube_domains(domains: list[str]) -> bool:
     return {"domain:youtube.com", "domain:googlevideo.com"} <= set(domains) <= set(YOUTUBE_DOMAINS)
 
 
+def valid_youtube_cdn_host(host: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.googlevideo\.com", host))
+
+
 def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> bool:
     """Only the selected YouTube page and a real video CDN hostname may use this gate."""
     if mode == "off":
@@ -89,10 +93,9 @@ def valid_youtube_transport(mode: str, domains: list[str], urls: list[str]) -> b
     except ValueError:
         return False
     page_host = page.hostname or ""
-    cdn = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.googlevideo\.com"
     return ((page_host == "youtube.com" or page_host.endswith(".youtube.com"))
             and media.path == "/videoplayback"
-            and bool(re.fullmatch(cdn, media.hostname or "")))
+            and valid_youtube_cdn_host(media.hostname or ""))
 
 
 def validate_patch(value: object) -> dict:
