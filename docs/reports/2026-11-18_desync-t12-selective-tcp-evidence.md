@@ -91,4 +91,4 @@
 4. Сборщик с `--socket-stats` (ss fwmark+443, cookie, tcp_info) дал однозначную
    привязку «таймаут ↔ сокет» без захвата пакетов; совпадение endpoint между
    попытками (B) при разных подписанных URL — стабильная цель для следующего опыта.
-- Publication commit: `добавляется после push` (ветка flash/t12-selective-tcp-20261118T054308Z поверх d6c2d0d).
+- Publication commit: `ca1adcadd06b02351e433304e18a3dd3620f700a` (d6c2d0d → ca1adca, remote verified byte-identical to local HEAD).
