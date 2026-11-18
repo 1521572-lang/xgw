@@ -84,7 +84,8 @@ class SettingsDialog(QDialog):
         self.strategy.setCurrentText(selected)
         form.addRow("Стратегия", self.strategy)
         self.strategy.setToolTip("Какая стратегия проходит, зависит от провайдера. Сравнение "
-                                 "с VPN умеет только multisplit и multidisorder.")
+                                 "с VPN умеет только multisplit и multidisorder. "
+                                 "Flowseal ALT9 выбирается отдельной кнопкой подготовки.")
         self.urls = []
         for title in ("HTTPS-страница", "HTTPS-файл видео"):
             field = QLineEdit()

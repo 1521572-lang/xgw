@@ -13,7 +13,8 @@ from ..paths import LockTimeout
 
 EDITABLE = frozenset({"strategy", "domains", "probe_urls", "check_seconds",
                       "retry_seconds", "daily_probe_mb", "youtube_transport_probe"})
-PROFILES = schema.SELECTED_PROFILES
+# Ordinary settings may retain an imported profile, but cannot enter it.
+PROFILES = tuple(p for p in schema.SELECTED_PROFILES if p != schema.LIVE_STRATEGY)
 MODES = ("off", "standalone", "selective")
 
 
@@ -62,7 +63,7 @@ def reasons(cfg, mode, *, ready, capture):
         result.append("Нет свежей связи с демоном.")
     if capture.get("mode") != "on":
         result.append("Сначала включите перехват XGW.")
-    if cfg.zapret2.strategy not in PROFILES:
+    if cfg.zapret2.strategy not in schema.SELECTED_PROFILES:
         result.append("Этот экспериментальный профиль пока не включается из панели.")
     try:
         _policy, proposed = candidate(cfg, {"mode": mode})
@@ -102,7 +103,7 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
         return reply(False, "invalid", "Недопустимые поля или режим.")
     try:
         patch = schema.validate_patch(patch)
-        if "strategy" in patch and patch["strategy"] not in PROFILES:
+        if "strategy" in patch and patch["strategy"] not in schema.SELECTED_PROFILES:
             return reply(False, "invalid", "Профиль пока недоступен для выбора из панели.")
         path = managed.path_for(config_path)
         with managed.file_lock(managed.lock_path(path), timeout=managed.LOCK_TIMEOUT,
@@ -113,13 +114,17 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
             if body["expected"] != key:
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
+            if (action == "settings" and patch.get("strategy") == schema.LIVE_STRATEGY
+                    and cfg.zapret2.strategy != schema.LIVE_STRATEGY):
+                return reply(False, "invalid", "Для выбора Flowseal ALT9 используйте "
+                             "«Подготовить проверенный Flowseal ALT9».")
             if action == "probe":
                 if (cfg.zapret2.mode != "off" or not cfg.zapret2.youtube_transport_probe
                         or len(cfg.zapret2.probe_urls) != 2):
                     return reply(False, "blocked", "Выключите режим и сохраните пару проб YouTube.")
                 patch = {"probe_urls": [cfg.zapret2.probe_urls[0],
                          schema.persistent_youtube_probe(cfg.zapret2.probe_urls[1])]}
-            if action == "import" or patch.get("strategy") == schema.LIVE_STRATEGY:
+            if action == "import":
                 from ..desync import flowseal
 
                 try:
@@ -133,6 +138,15 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
                 patch = {"strategy": schema.LIVE_STRATEGY, "youtube_transport_probe": False,
                          "domains": list(schema.YOUTUBE_DOMAINS)}
             policy, proposed = candidate(cfg, patch, editing=action == "settings")
+            if (proposed.zapret2.mode != "off"
+                    and proposed.zapret2.strategy == schema.LIVE_STRATEGY):
+                from ..desync import flowseal
+
+                try:
+                    flowseal.live_arguments()
+                except (OSError, ValueError):
+                    return reply(False, "blocked", "Проверенные ассеты Flowseal недоступны. "
+                                 "Выключите режим и повторите подготовку профиля.")
             if policy == current:
                 return reply(True, "unchanged", "Настройки уже сохранены.",
                              config_key=key, changed=False)

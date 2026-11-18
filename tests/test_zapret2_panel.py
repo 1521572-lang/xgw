@@ -14,6 +14,19 @@ from xgw.watch.zapret2_control import card, transport_probes
 
 NOW = 1000
 
+def test_imported_alt9_is_retained_but_not_offered_as_an_ordinary_choice():
+    cfg, snap = fixture(engine="off", state="off")
+    cfg.zapret2.strategy = schema.LIVE_STRATEGY
+    cfg.zapret2.domains = list(schema.YOUTUBE_DOMAINS)
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    result = view(cfg, snap)
+    assert result["selected_strategy"] == schema.LIVE_STRATEGY
+    assert schema.LIVE_STRATEGY not in result["strategies"]
+    assert not result["blockers"]["standalone"]
+    assert result["blockers"]["selective"]
+
+
 
 def fixture(*, mode="off", engine="auto", state="active", reason="", **extra):
     cfg = Config()

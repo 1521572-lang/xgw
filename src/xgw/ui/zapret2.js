@@ -96,7 +96,7 @@ function openSettings() {
   el("setting-strategy").replaceChildren(...strategies.map(value => {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = latest.strategies.includes(value) ? value : value + " (выбор недоступен)";
+    option.textContent = latest.strategies.includes(value) ? value : value + " (сохранённый профиль)";
     return option;
   }));
   el("setting-strategy").value = latest.selected_strategy;

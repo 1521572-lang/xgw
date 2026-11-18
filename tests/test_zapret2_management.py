@@ -83,7 +83,6 @@ def test_invalid_edit_is_private_and_never_writes(store, patch):
     assert "private-token" not in json.dumps(result)
     assert panel.read_bytes() == before
 
-
 def test_probes_are_write_only_preserved_when_omitted_and_explicitly_cleared(store):
     cfg, panel = store
     urls = ["https://www.youtube.com/watch?v=private-token",
@@ -215,4 +214,82 @@ def test_error_does_not_save_or_leak_config(store, monkeypatch):
     monkeypatch.setattr(managed, "save", failed)
     result = send(cfg, {"retry_seconds": 120})
     assert result["code"] == "storage_error" and "private-token" not in json.dumps(result)
+    assert panel.read_bytes() == before
+
+@pytest.mark.parametrize("assets_ready", [False, True])
+def test_alt9_entry_requires_import_even_when_assets_are_present(store, monkeypatch, assets_ready):
+    from unittest.mock import Mock
+
+    from xgw.desync import flowseal
+
+    cfg, panel = store
+    verify = Mock(return_value=[], side_effect=None if assets_ready else OSError("private-token"))
+    monkeypatch.setattr(flowseal, "live_arguments", verify)
+    before = panel.read_bytes(), panel.stat().st_mtime_ns
+    result = send(cfg, {"strategy": schema.LIVE_STRATEGY})
+    assert result["code"] == "invalid" and "Flowseal" in result["text"]
+    assert "private-token" not in json.dumps(result)
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == before
+    verify.assert_not_called()
+
+
+def import_alt9(cfg, *, expected=None):
+    return management.command(cfg, "import", {
+        "expected": key(cfg) if expected is None else expected, "import": schema.LIVE_STRATEGY,
+    }, ready=True, capture={"mode": "on"})
+
+
+def test_alt9_import_echo_switch_away_and_reimport(store, monkeypatch):
+    from unittest.mock import Mock
+
+    from xgw.desync import flowseal
+
+    cfg, panel = store
+    verify = Mock(return_value=[])
+    monkeypatch.setattr(flowseal, "live_arguments", verify)
+    old = key(cfg)
+    assert import_alt9(cfg)["code"] == "saved"
+    verify.assert_called_once()
+    imported = config.load(cfg)[0]
+    assert imported.zapret2.mode == "off" and imported.zapret2.engine == "auto"
+    assert imported.zapret2.strategy == schema.LIVE_STRATEGY
+    assert json.loads(panel.read_text())["extension"] == {"keep": [1, 2]}
+    assert import_alt9(cfg, expected=old)["code"] == "conflict"
+    verify.assert_called_once()
+    assert not management.reasons(imported, "standalone", ready=True, capture={"mode": "on"})
+    # Both forms echo the selected strategy when editing an unrelated setting.
+    assert send(cfg, {"strategy": schema.LIVE_STRATEGY, "retry_seconds": 120})["ok"]
+    verify.assert_called_once()
+    before = panel.read_bytes(), panel.stat().st_mtime_ns
+    assert send(cfg, {"strategy": schema.LIVE_STRATEGY})["code"] == "unchanged"
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == before
+    assert send(cfg, {"strategy": "multisplit"})["ok"]
+    assert not send(cfg, {"strategy": schema.LIVE_STRATEGY})["ok"]
+    assert import_alt9(cfg)["ok"]
+    assert verify.call_count == 2
+
+
+def test_alt9_missing_assets_prevent_import_and_activation_but_allow_off(store, monkeypatch):
+    from unittest.mock import Mock
+
+    from xgw.desync import flowseal
+
+    cfg, panel = store
+    verify = Mock(side_effect=OSError("private-token"))
+    monkeypatch.setattr(flowseal, "live_arguments", verify)
+    before = panel.read_bytes()
+    missing = import_alt9(cfg)
+    assert missing["code"] == "blocked" and "private-token" not in json.dumps(missing)
+    assert panel.read_bytes() == before
+    verify.side_effect = None
+    verify.return_value = []
+    assert import_alt9(cfg)["ok"]
+    assert send(cfg, "standalone", action="mode")["ok"]
+    verify.side_effect = ValueError("private-token")
+    # Off must work even when the files disappear after a successful start.
+    assert send(cfg, "off", action="mode", ready=False, capture="off")["ok"]
+    assert send(cfg, {"strategy": schema.LIVE_STRATEGY, "retry_seconds": 120})["ok"]
+    before = panel.read_bytes()
+    blocked = send(cfg, "standalone", action="mode")
+    assert blocked["code"] == "blocked" and "private-token" not in json.dumps(blocked)
     assert panel.read_bytes() == before
