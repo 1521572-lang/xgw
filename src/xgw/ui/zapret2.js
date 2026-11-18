@@ -303,6 +303,7 @@ async function refresh() {
     const response = await fetch("/api/zapret2/overview", {
       cache: "no-store", credentials: "same-origin", signal: request.signal,
     });
+    if (started !== generation || document.hidden) return false;
     if (response.status === 401) {
       needsLogin = true;
       unavailable("Войдите в XGW");
@@ -310,7 +311,7 @@ async function refresh() {
     }
     if (!response.ok) throw new Error("overview unavailable");
     const payload = await response.json();
-    if (started !== generation) return false;
+    if (started !== generation || document.hidden) return false;
     render(payload);
     failures = 0;
     return true;
@@ -345,7 +346,15 @@ applyTheme();
 
 document.addEventListener("visibilitychange", () => {
   clearTimeout(timer);
-  if (document.hidden) pending?.abort();
-  else refresh();
+  if (document.hidden) {
+    generation += 1;
+    online = false;
+    pending?.abort();
+    controls();
+  } else {
+    refresh();
+  }
 });
+window.addEventListener("focus", refresh);
+window.addEventListener("pageshow", refresh);
 refresh();
