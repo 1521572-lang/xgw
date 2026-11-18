@@ -47,7 +47,7 @@ def pytest_configure(config):
                     module.LOCK_EX, module.LOCK_NB, module.LOCK_UN = 2, 4, 8
                 sys.modules[name] = module
     elif not sys.platform.startswith("linux"):
-        pytest.exit("тесты XGW запускаются только в Linux (Ubuntu 24.04 или 26.04)", returncode=4)
+        pytest.exit("системные тесты XGW требуют Linux (шлюз Ubuntu 24.04 LTS)", returncode=4)
 
 
 @pytest.fixture(autouse=True)

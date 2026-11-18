@@ -1,8 +1,10 @@
 # TEST-REPORT-REAL-MACHINE-0.2.0-desync-nfqws2-2026-11-14
 
+Уточнение ОС ThinkCentre по [проверке `/etc/os-release`](reports/2026-11-15_desync-batch1.md).
+
 Дата: 2026-11-14 (прогон начат 2026-11-13 20:27 UTC, остановлен 21:40 UTC); CODE
 eb47e83270cabe4b8dec9852eb9708d4a08f9266, BASE 97af08130321318241be3afc5c54bc8e85b7e273,
-план 919d149 (ветка gui-light). Исполнитель GLM-5.3-Flash; Ubuntu 26.04 amd64, Python 3.12.3.
+план 919d149 (ветка gui-light). Исполнитель GLM-5.3-Flash; Ubuntu 24.04 LTS amd64, Python 3.12.3.
 Root-канал — один systemd-run --system юнит с FIFO-очередью команд, остановлен в конце.
 
 ## Итог: **STOP** — первый непройденный шаг: §3 (pytest, новый FAIL)

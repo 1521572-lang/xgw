@@ -1,8 +1,10 @@
 # TEST-REPORT-REAL-MACHINE-0.2.0-nfqws2-youtube-live-r2-2026-11-14
 
+Уточнение ОС ThinkCentre по [проверке `/etc/os-release`](reports/2026-11-15_desync-batch1.md).
+
 Дата: 2026-11-14; прогон 14:45–15:35 UTC. CODE/PLAN ad76983 (пределы: установлен **только**
 src/xgw/nfqws2.py, SHA 278a5371…; BASE c7500f6, установленный модуль bf278ea9… сверён перед
-заменой). Ветка gui-light. Исполнитель GLM-5.3-Flash; Ubuntu 26.04 amd64; Python 3.12.3;
+заменой). Ветка gui-light. Исполнитель GLM-5.3-Flash; Ubuntu 24.04 LTS amd64; Python 3.12.3;
 Xray 26.10.21; nfqws2 v1.0.7 (038c97e5). Root — один systemd-run --system юнит с FIFO
 (polkit-кэш действовал), остановлен после восстановления. Согласия прежних раундов +
 ограниченный перебор по ТЗ r2; nft-таблица диагностики создавалась со случайным именем

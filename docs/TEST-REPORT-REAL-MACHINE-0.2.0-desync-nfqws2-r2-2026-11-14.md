@@ -1,8 +1,10 @@
 # TEST-REPORT-REAL-MACHINE-0.2.0-desync-nfqws2-r2-2026-11-14
 
+Уточнение ОС ThinkCentre по [проверке `/etc/os-release`](reports/2026-11-15_desync-batch1.md).
+
 Дата: 2026-11-14; прогон 22:41–01:05 UTC (13–14.11). CODE 9b58725354799a6b91c7341c41a311371bdfa4d8
 (установлен на машину), BASE eb47e83 — только эталон старых падений, откат не требовался.
-План e96bd5d, ветка gui-light. Исполнитель GLM-5.3-Flash; Ubuntu 26.04 amd64; Python 3.12.3;
+План e96bd5d, ветка gui-light. Исполнитель GLM-5.3-Flash; Ubuntu 24.04 LTS amd64; Python 3.12.3;
 Xray 26.10.21; sing-box 0.1.13; nfqws2 v1.0.7 (038c97e5). Root — один systemd-run --system
 юнит с FIFO-очередью команд, остановлен после восстановления. Согласия из отчёта e4a791c
 действовали: полный прогон, без `nft flush ruleset` (запрещён планом r2), запуск движка с

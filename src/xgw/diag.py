@@ -180,7 +180,7 @@ class Diag:
 
     def _system(self) -> list[Check]:
         if not sys.platform.startswith("linux"):
-            return [Check("Система", FAIL, "XGW работает только в Linux (Ubuntu 24.04 или 26.04)")]
+            return [Check("Система", FAIL, "XGW работает только в Linux (шлюз Ubuntu 24.04 LTS)")]
         release: dict[str, str] = {}
         try:
             for line in self.os_release.read_text(encoding="utf-8").splitlines():
@@ -193,11 +193,13 @@ class Diag:
         python = f"Python {sys.version_info.major}.{sys.version_info.minor}"
         result: list[Check] = []
         if release.get("ID") == "ubuntu" and release.get("VERSION_ID") in TESTED_UBUNTU:
-            result.append(Check("Система", OK, f"{name}, {python}"))
+            role = (" (стенд разработки, шлюз — Ubuntu 24.04 LTS)"
+                    if release["VERSION_ID"] == "26.04" else "")
+            result.append(Check("Система", OK, f"{name}, {python}{role}"))
         else:
             result.append(Check(
                 "Система", WARN,
-                f"{name}, {python} — XGW проверялся только на Ubuntu 24.04 и 26.04",
+                f"{name}, {python} — рабочая система XGW — Ubuntu 24.04 LTS",
             ))
         if not self.root:
             result.append(Check(

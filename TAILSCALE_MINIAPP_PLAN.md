@@ -1,5 +1,7 @@
 # ТЗ: Tailscale на шлюзе, удалённый доступ и Telegram Mini App через Funnel
 
+Рабочий шлюз XGW и его приёмка — ThinkCentre с Ubuntu 24.04 LTS (amd64).
+
 > **20.10.2026: фазы Т3–Т5 (Mini App) отменены** решением заказчика после испытаний Т2.
 > Вместо Mini App — приложение для Android: `ANDROID_APP_PLAN.md`. Т0–Т2 действуют.
 > Бот Telegram (в том числе `/panel` из §3.2) убран целиком — ASSUMPTIONS п. 222.

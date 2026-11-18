@@ -1,9 +1,11 @@
 # TEST-REPORT-REAL-MACHINE-0.2.0-desync-nfqws2-r4-2026-11-14
 
+Уточнение ОС ThinkCentre по [проверке `/etc/os-release`](reports/2026-11-15_desync-batch1.md).
+
 Дата: 2026-11-14; прогон 10:57–12:05 UTC. CODE d395628ff1d6b5c55fa14435eacce325c93ca748
 (установлен и оставлен), BASE 9b58725354799a6b91c7341c41a311371bdfa4d8 (модули на машине до
 установки, откат по r3). План 1025a07, ветка gui-light. Исполнитель GLM-5.3-Flash; Ubuntu
-26.04 amd64; Python 3.12.3; Xray 26.10.21; nfqws2 v1.0.7. Root — один systemd-run --system юнит
+24.04 LTS amd64; Python 3.12.3; Xray 26.10.21; nfqws2 v1.0.7. Root — один systemd-run --system юнит
 с FIFO-очередью (поднят с третьей попытки — первые два диалога не были подтверждены владельцем),
 остановлен после восстановления. Согласия r2/r3 действовали.
 

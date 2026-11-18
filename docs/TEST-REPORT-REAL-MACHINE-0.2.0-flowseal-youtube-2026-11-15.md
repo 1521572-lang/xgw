@@ -1,9 +1,11 @@
 # TEST-REPORT-REAL-MACHINE-0.2.0-flowseal-youtube-2026-11-15
 
+Уточнение ОС ThinkCentre по [проверке `/etc/os-release`](reports/2026-11-15_desync-batch1.md).
+
 Дата: прогон 2026-11-14 19:40 — 2026-11-15 00:45 UTC (§1 ориентир 6–10 ч выдержан).
 PLAN = ebbb051, BASE = c411689 (установленный пакет соответствует BASE: nfqws2.py 278a5371…
 = ad76983, net/nft.py 3060a07f… = фикс recapture 956db75 — сверены SHA), ветка gui-light.
-Исполнитель GLM-5.3-Flash, сам на ThinkCentre (Ubuntu 26.04, Python 3.12.3, Xray 26.11.19
+Исполнитель GLM-5.3-Flash, сам на ThinkCentre (Ubuntu 24.04 LTS, Python 3.12.3, Xray 26.11.19
 после перезагрузки машины 14.11, nfqws2 v1.0.7 038c97e5). Root — один systemd-run юнит с
 FIFO + таймер-восстановления (keepalive). Источник Flowseal `2401b7a` (1.10.4): 37 файлов
 скачаны и сверены (SHA-256 + git blob SHA-1) по [JSON каталогу](helpers/flowseal-youtube-source.json).
