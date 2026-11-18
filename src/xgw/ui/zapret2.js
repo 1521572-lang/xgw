@@ -18,6 +18,7 @@ const probeFailures = {http: "ответ HTTP", proxy: "отказ прокси"
 const probePageKinds = {terms: "Страница условий", watch: "Страница просмотра", other: "Другая страница"};
 const number = new Intl.NumberFormat("ru");
 const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medium"});
+const mebibytes = new Intl.NumberFormat("ru", {maximumFractionDigits: 2});
 const el = id => document.getElementById(id);
 const put = (id, value) => { el(id).textContent = value ?? "—"; };
 const count = value => Number.isSafeInteger(value) && value >= 0 ? number.format(value) : "Нет данных";
@@ -236,6 +237,18 @@ function render(payload) {
   const probes = evidence.transport_probes ?? {};
   put("probe-page", probeText(probes.page, "Нет данных"));
   put("probe-cdn", probeText(probes.cdn, probes.page?.ok === false ? "Не запускалась" : "Нет данных"));
+  if (el("last-transport-ok")) {
+    put("last-transport-ok", evidence.last_transport_ok_at
+      ? date.format(evidence.last_transport_ok_at * 1000) : "Нет данных");
+  }
+  const budget = card.probe_budget;
+  const mib = 1024 * 1024;
+  if (el("probe-budget")) {
+    put("probe-budget", budget
+      ? mebibytes.format(budget.remaining_bytes / mib) + " из " +
+        mebibytes.format(budget.limit_bytes / mib) + " МиБ · сброс в 00:00 UTC"
+      : "Нет данных");
+  }
   put("playback", evidence.playback === "not_tested" ? "Не проверялось" : "Нет данных");
   put("vpn", vpnChecks[evidence.vpn_control] || "Нет данных");
   put("queued-original", count(confirmed ? card.counters?.queued_original : null));

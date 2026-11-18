@@ -11,7 +11,9 @@ import copy
 import ipaddress
 import json
 import re
+import sqlite3
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
@@ -50,6 +52,7 @@ YOUTUBE_PAGE_SILENCE_SECONDS = 6
 CDN_EXPIRED = "youtube_cdn_expired"
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
+PROBE_DAY_SECONDS = 86400
 REDIRECT_LIMIT = 5
 START_WAIT = 20
 START_POLL = 2
@@ -184,6 +187,51 @@ def probe_lease(seconds: int, expires_at: int | None) -> int:
         if seconds < 1:
             raise ValueError(CDN_EXPIRED)
     return seconds
+
+
+@dataclass(frozen=True)
+class ProbeBudget:
+    day: int
+    spent_bytes: int
+    limit_bytes: int
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.limit_bytes - self.spent_bytes)
+
+    def status(self) -> dict[str, int]:
+        return {
+            "spent_bytes": self.spent_bytes,
+            "limit_bytes": self.limit_bytes,
+            "remaining_bytes": self.remaining_bytes,
+            "resets_at": (self.day + 1) * PROBE_DAY_SECONDS,
+        }
+
+
+def read_probe_budget(raw: str | None, limit_mb: int, *, now: float) -> ProbeBudget | None:
+    day = int(now // PROBE_DAY_SECONDS)
+    used = 0
+    if raw is not None:
+        try:
+            previous = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(previous, dict):
+            return None
+        saved_day, saved_bytes = previous.get("day"), previous.get("bytes")
+        if (type(saved_day) is not int or not 0 <= saved_day <= day
+                or type(saved_bytes) is not int or not 0 <= saved_bytes <= 1024 ** 3):
+            return None
+        if saved_day == day:
+            used = saved_bytes
+    return ProbeBudget(day, used, limit_mb * 1024 * 1024)
+
+
+def probe_charge(settings, *, single_probe: bool = False) -> int:
+    count = 1 if single_probe else len(settings.probe_urls)
+    if not single_probe and settings.mode == "compare":
+        count *= REDIRECT_LIMIT + 2  # исходный GET, переходы VPN и один прямой GET
+    return count * PROBE_CHARGE
 
 
 def active(config: dict) -> bool:
@@ -442,26 +490,31 @@ class Controller:
         self.start_deadline: float | None = None
         self.last_error = ""
         self.probe_failure = "probe_failed"
+        self.last_transport_ok_at: float | None = None
         self.transport_probes: dict[str, dict] = {}
         self.comparison: list[dict] | None = None
         self.comparison_trace: dict | None = None
         self.view = {"state": "off", "reason": "off"}
 
-    def _budget(self, cfg: Config, *, single_probe: bool = False) -> bool:
-        day = int(time.time() // 86400)
+    def _read_budget(self, cfg: Config) -> ProbeBudget | None:
         try:
-            budget = json.loads(self.store.get_meta(BUDGET) or "{}")
-            spent = budget.get("bytes", 0) if budget.get("day") == day else 0
-            if type(spent) is not int or spent < 0:
-                return False
-        except (ValueError, TypeError, AttributeError):
-            return False  # повреждённый учёт не превращается в бесплатный бюджет
-        charge = (1 if single_probe else len(cfg.zapret2.probe_urls)) * PROBE_CHARGE
-        if not single_probe and cfg.zapret2.mode == "compare":
-            charge *= REDIRECT_LIMIT + 2  # исходный GET, переходы VPN и один прямой GET
-        if spent + charge > cfg.zapret2.daily_probe_mb * 1024 * 1024:
+            raw = self.store.get_meta(BUDGET)
+        except sqlite3.Error:
+            return None
+        return read_probe_budget(raw, cfg.zapret2.daily_probe_mb, now=time.time())
+
+    def _budget(self, cfg: Config, *, single_probe: bool = False, vpn: bool = False) -> bool:
+        budget = self._read_budget(cfg)
+        charge = probe_charge(cfg.zapret2, single_probe=single_probe)
+        reserve = PROBE_CHARGE if cfg.zapret2.mode == "selective" and not vpn else 0
+        if budget is None or budget.remaining_bytes < charge + reserve:
             return False
-        self.store.set_meta(BUDGET, json.dumps({"day": day, "bytes": spent + charge}))
+        try:
+            self.store.set_meta(BUDGET, json.dumps({
+                "day": budget.day, "bytes": budget.spent_bytes + charge,
+            }))
+        except sqlite3.Error:
+            return False
         return True
 
     @staticmethod
@@ -632,7 +685,7 @@ class Controller:
         password, _ = builder.probe_state(applied)
         if not password:
             return "not_run", "no_probe_credentials"
-        if not self._budget(cfg, single_probe=True):
+        if not self._budget(cfg, single_probe=True, vpn=True):
             return "not_run", "budget_unavailable"
         result = self._request(cfg.zapret2.probe_urls[0], port, password,
                                cfg.probe.user_agent, cancel)
@@ -646,6 +699,7 @@ class Controller:
 
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
         comparing = cfg.zapret2.mode == "compare"
+        selective = cfg.zapret2.mode == "selective"
         finished = comparing and self.comparison is not None
         cancelled = cancel is not None and cancel.is_set()
         wanted = (cfg.zapret2.probe_enabled and allowed and not finished and not cancelled
@@ -669,6 +723,14 @@ class Controller:
                             and self.view.get("gate_closed") is True):
                         return False
                     raise ValueError(CDN_EXPIRED)
+                if selective and not self.ready and now >= self.next_check:
+                    budget = self._read_budget(cfg)
+                    required = probe_charge(cfg.zapret2) + PROBE_CHARGE
+                    if budget is None or budget.remaining_bytes < required:
+                        if (not present and self.view.get("reason") == "probe_budget"
+                                and self.view.get("gate_closed") is True):
+                            return False
+                        raise ValueError("probe_budget")
                 scaffold = patch(applied, cfg, enabled=active(applied))
                 if scaffold != applied:
                     # Сначала служебный вход; прямое правило здесь не появляется.
@@ -706,6 +768,8 @@ class Controller:
                         self.probe_failure = "probe_failed"
                         if not self.probe(cfg, applied, cancel):
                             raise ValueError(self.probe_failure)
+                        if cfg.zapret2.youtube_transport_probe:
+                            self.last_transport_ok_at = time.time()
                         self.healthy = True
                         self.last_error = ""
                         self.next_check = now + cfg.zapret2.check_seconds
@@ -729,6 +793,8 @@ class Controller:
                                  "valid_until": valid_until}
                     if cfg.zapret2.youtube_transport_probe and self.transport_probes:
                         self.view["transport_probes"] = self.transport_probes
+                    if self.last_transport_ok_at is not None:
+                        self.view["last_transport_ok_at"] = self.last_transport_ok_at
                     return changed
                 reason = self.last_error or "retry_wait"
         except (OSError, ValueError, cmd.CommandError) as exc:
@@ -742,8 +808,10 @@ class Controller:
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
-            self.next_check = now if reason == CDN_EXPIRED else now + cfg.zapret2.retry_seconds
-            check_vpn = reason == "worker_down" or reason in probe_errors
+            self.next_check = (now if reason in (CDN_EXPIRED, "probe_budget")
+                               else now + cfg.zapret2.retry_seconds)
+            check_vpn = (reason == "worker_down" or reason in probe_errors
+                         or (reason == "probe_budget" and active(applied)))
         self.healthy = False
         gate_closed = True
         try:
@@ -752,7 +820,8 @@ class Controller:
             gate_closed = False  # очередь всё ещё без bypass; lease сам истечёт
         try:
             finished = comparing and self.comparison is not None
-            target = patch(applied, cfg, probe=not finished and reason != CDN_EXPIRED)
+            target = patch(applied, cfg, probe=not finished
+                           and reason not in (CDN_EXPIRED, "probe_budget"))
             changed = target != applied and apply(target, applied)
             routed_back = (target == applied or changed) and reason != "apply_failed"
         except (ValueError, cmd.CommandError, OSError):
@@ -780,6 +849,8 @@ class Controller:
             return changed
         self.view = {"state": "fallback" if routed_back and stopped else "blocked",
                      "reason": reason, "gate_closed": gate_closed}
+        if self.last_transport_ok_at is not None:
+            self.view["last_transport_ok_at"] = self.last_transport_ok_at
         if (reason in ("youtube_page_probe_failed", "youtube_cdn_probe_failed")
                 and self.transport_probes):
             self.view["transport_probes"] = self.transport_probes

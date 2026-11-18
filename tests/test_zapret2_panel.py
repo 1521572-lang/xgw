@@ -37,11 +37,15 @@ def test_youtube_transport_is_never_reported_as_playback():
     cfg.zapret2.youtube_transport_probe = True
     cfg.desync = schema.migrate(vars(cfg.zapret2))
     snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"]["last_transport_ok_at"] = NOW - 1
     result = view(cfg, snap)
     assert result["evidence"]["transport"] == "https_reachable"
     assert result["evidence"]["playback"] == "not_tested"
+    assert result["evidence"]["last_transport_ok_at"] == NOW - 1
     snap["zapret2"]["valid_until"] = NOW
     assert view(cfg, snap)["evidence"]["transport"] == "unknown"
+    snap["zapret2_policy_key"] = "previous"
+    assert view(cfg, snap)["evidence"]["last_transport_ok_at"] is None
 
 
 def test_cdn_expiry_exposes_only_deadline_and_blocks_selective():
@@ -232,6 +236,7 @@ def test_panel_state_wires_card_to_real_response(tmp_path, monkeypatch):
     p._servers.return_value = [], []
     p._devices.return_value = []
     p._db.return_value = []
+    p._zapret2_card.side_effect = lambda *args: panel.Panel._zapret2_card(p, *args)
     p.daemon.speed_one_pending.return_value = []
     for field in ("refresh_pending", "scan_pending", "speed_pending", "cores_pending"):
         setattr(p.daemon, field, False)
@@ -241,6 +246,13 @@ def test_panel_state_wires_card_to_real_response(tmp_path, monkeypatch):
     p.recorder.state.return_value = {}
     result = panel.Panel.state(p)
     assert result["zapret2"]["state"] == "error"
+    assert result["zapret2"]["probe_budget"] is None
+    p._db.side_effect = lambda query, *_args: (
+        [{"value": '{"day": 0, "bytes": 262144}'}] if "FROM meta" in query else []
+    )
+    budget = panel.Panel.state(p)["zapret2"]["probe_budget"]
+    assert budget["spent_bytes"] == 256 * 1024 and budget["resets_at"] == 86400
+    assert budget["remaining_bytes"] == budget["limit_bytes"] - budget["spent_bytes"]
     assert result["zapret2"]["source"] == "engine"
     json.dumps(result)  # response must be serializable, not a mock or private object
 

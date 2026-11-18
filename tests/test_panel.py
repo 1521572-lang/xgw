@@ -345,6 +345,25 @@ def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
     assert response.status == 403
 
 
+def test_zapret2_budget_matches_in_both_authenticated_views(rig, user, monkeypatch):
+    from xgw import zapret2
+
+    stamp = 21000 * zapret2.PROBE_DAY_SECONDS + 100
+    monkeypatch.setattr(time, "time", lambda: stamp)
+    ledger = json.dumps({"day": 21000, "bytes": zapret2.PROBE_CHARGE})
+    store = Store(rig.paths.db_file)
+    try:
+        store.set_meta(zapret2.BUDGET, ledger)
+        wide = user.state()["zapret2"]["probe_budget"]
+        compact = json.loads(user.request("GET", "/api/zapret2/overview")[1])
+        assert wide == compact["zapret2"]["probe_budget"]
+        assert wide["spent_bytes"] == zapret2.PROBE_CHARGE
+        assert wide["resets_at"] == 21001 * zapret2.PROBE_DAY_SECONDS
+        assert store.get_meta(zapret2.BUDGET) == ledger
+    finally:
+        store.close()
+
+
 def test_zapret2_commands_require_session_origin_and_revision(rig, user):
     from xgw.desync import schema
 

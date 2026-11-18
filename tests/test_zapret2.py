@@ -195,7 +195,7 @@ def test_known_cdn_expiry_caps_lease_and_removes_direct_route(monkeypatch):
     wall += 20
     h.step(24)
     assert h.controller.view == {"state": "fallback", "reason": z.CDN_EXPIRED,
-                                 "gate_closed": True}
+                                 "gate_closed": True, "last_transport_ok_at": wall - 20}
     assert not h.runtime.up and not z.active(h.current)
     assert not any(item["tag"] == z.PROBE for item in h.current["inbounds"])
 
@@ -328,7 +328,13 @@ def test_selective_recheck_reports_actual_page_and_new_time(monkeypatch):
 def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = True
-    h.cfg.zapret2.daily_probe_mb = 1 if scenario == "no_budget" else 256
+    seed = 0
+    if scenario == "no_budget":
+        h.cfg.zapret2.daily_probe_mb = 2
+        seed = 3 * z.PROBE_CHARGE  # room for two pairs and one VPN control, no CDN retry
+        h.controller.store.set_meta(z.BUDGET, json.dumps({
+            "day": int(time.time() // z.PROBE_DAY_SECONDS), "bytes": seed,
+        }))
     page = "https://www.youtube.com/t/terms"
     cdn = "https://r1.googlevideo.com/videoplayback?sig=fixture"
     h.cfg.zapret2.probe_urls = [page, cdn]
@@ -357,7 +363,7 @@ def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
     assert ("first_tls_timeout_ms" in row) is (attempts == 2)
     assert "fixture" not in repr(row)
     charged = json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"]
-    assert charged == (3 + attempts) * z.PROBE_CHARGE
+    assert charged == seed + (3 + attempts) * z.PROBE_CHARGE
 
 
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():
@@ -680,6 +686,47 @@ def test_corrupt_budget_cannot_grant_probe(spent):
     h.controller.store.set_meta(z.BUDGET, json.dumps({"day": int(time.time() // 86400),
                                                    "bytes": spent}))
     assert not h.controller._budget(h.cfg)
+
+
+def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(monkeypatch):
+    h = Harness()
+    h.cfg.zapret2.daily_probe_mb = 1
+    boundary = 21000 * z.PROBE_DAY_SECONDS
+    wall = boundary - 1
+    monkeypatch.setattr(z.time, "time", lambda: wall)
+    calls = []
+
+    def request(_url, port, *_args):
+        calls.append(port)
+        return checks.DownloadResult(ok=True, status=200)
+
+    h.controller._request = request
+    h.activate()
+    h.step(h.controller.next_check, vpn_probe_port=20011)
+    assert not z.active(h.current) and not h.runtime.up
+    assert h.controller.view["reason"] == "probe_budget"
+    assert h.controller.view["vpn_control"] == "pass"
+    assert calls == [20011]
+    remaining = h.controller._read_budget(h.cfg).remaining_bytes
+    assert remaining == z.PROBE_CHARGE
+
+    recent = list(h.runtime.events)
+    h.step(400, vpn_probe_port=20011)
+    assert h.runtime.events == recent
+
+    wall = boundary
+    assert h.controller._read_budget(h.cfg).status() == {
+        "spent_bytes": 0, "limit_bytes": 1024 ** 2, "remaining_bytes": 1024 ** 2,
+        "resets_at": boundary + z.PROBE_DAY_SECONDS,
+    }
+    for seconds in (401, 402, 403):
+        h.step(seconds, vpn_probe_port=20011)
+    assert h.runtime.up and z.active(h.current)
+
+
+@pytest.mark.parametrize("raw", ['{"day": 1, "bytes": true}', '{"day": 3, "bytes": 0}', '{}'])
+def test_probe_budget_never_rolls_over_untrusted_records(raw):
+    assert z.read_probe_budget(raw, 1, now=2 * z.PROBE_DAY_SECONDS) is None
 
 
 def test_busy_queue_is_not_taken(monkeypatch):

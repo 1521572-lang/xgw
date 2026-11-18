@@ -56,8 +56,11 @@
             <dt>HTTPS до YouTube и CDN</dt><dd id="https">—</dd>
             <dt>Проба страницы</dt><dd id="probe-page">—</dd>
             <dt>Проба CDN</dt><dd id="probe-cdn">—</dd>
+            <dt>Последний успех HTTPS</dt><dd id="last-transport-ok">—</dd>
             <dt>Воспроизведение</dt><dd id="playback">—</dd>
             <dt>Служебная проба VPN</dt><dd id="vpn">—</dd>
+            <dt>Остаток бюджета проб</dt>
+            <dd id="probe-budget" title="Учёт резервов. Selective оставляет 256 КиБ для проверки VPN.">—</dd>
           </dl>
         </section>
         <section class="zm-card" id="domains" aria-labelledby="domains-title">
@@ -95,7 +98,7 @@
             <div class="zm-form-grid">
               <label>Проверка каждые, с<input id="setting-check" type="number" min="60" max="900" required></label>
               <label>Повтор после отказа, с<input id="setting-retry" type="number" min="60" max="3600" required></label>
-              <label>Бюджет, МБ/сутки<input id="setting-budget" type="number" min="1" max="1024" required></label>
+              <label>Бюджет, МиБ/сутки<input id="setting-budget" type="number" min="1" max="1024" required></label>
             </div>
             <label class="zm-check"><input id="setting-youtube" type="checkbox">HTTPS-проверка YouTube и CDN (только Selective)</label>
             <button type="button" id="use-youtube-domains" hidden>Заменить список на домены YouTube</button>

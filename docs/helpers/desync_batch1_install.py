@@ -69,6 +69,17 @@ SELECTIVE_EXPIRY = ("zapret2.py", "desync/schema.py", "watch/zapret2_control.py"
 SELECTIVE_EXPIRY_TIMER = "xgw-selective-expiry-rollback.timer"
 SELECTIVE_STATUS = ("watch/zapret2_control.py",)
 SELECTIVE_STATUS_TIMER = "xgw-selective-status-rollback.timer"
+SELECTIVE_BUDGET = ("zapret2.py", "watch/panel.py", "watch/zapret2_control.py",
+                    "ui/zapret2.html", "ui/zapret2.js")
+SELECTIVE_BUDGET_TIMER = "xgw-selective-budget-rollback.timer"
+
+
+def gui_files(files):
+    if files == BACKEND:
+        return GUI
+    if files in (ZAPRET2_MANAGEMENT, SELECTIVE_BUDGET):
+        return MANAGEMENT_GUI
+    return ()
 
 
 def require(ok, message):
@@ -137,14 +148,14 @@ def prepare(args, backup):
         require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
                 "active/transitioning worker: stop and report, do not disable it")
     files, _timer = overlay(args)
-    require(not (files not in (BACKEND, ZAPRET2_MANAGEMENT) and args.gui),
-            "this overlay is backend only")
+    gui_overlay = gui_files(files)
+    require(not args.gui or bool(gui_overlay), "this overlay is backend only")
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
               payload / "base/src/xgw" / rel) for rel in files]
     if args.gui:
         gui = bounded(args.gui, "/opt/xgw")
         pairs.extend((payload / "code" / rel, gui / rel, payload / "gui_base" / rel)
-                     for rel in (MANAGEMENT_GUI if files == ZAPRET2_MANAGEMENT else GUI))
+                     for rel in gui_overlay)
     rows = []
     for index, (source, target, baseline) in enumerate(pairs):
         for path in (source, target, baseline):
@@ -174,8 +185,8 @@ def records(backup, files):
     trusted(backup / "manifest.json")
     rows = json.loads((backup / "manifest.json").read_text())
     expected = {len(files)}
-    if files in (BACKEND, ZAPRET2_MANAGEMENT):
-        expected.add(len(files) + len(MANAGEMENT_GUI if files == ZAPRET2_MANAGEMENT else GUI))
+    if gui_overlay := gui_files(files):
+        expected.add(len(files) + len(gui_overlay))
     require(isinstance(rows, list) and len(rows) in expected, "invalid manifest")
     seen = set()
     for row in rows:
@@ -223,6 +234,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "selective_budget", False):
+        return SELECTIVE_BUDGET, SELECTIVE_BUDGET_TIMER
     if getattr(args, "selective_status", False):
         return SELECTIVE_STATUS, SELECTIVE_STATUS_TIMER
     if getattr(args, "selective_expiry", False):
@@ -291,6 +304,7 @@ def main():
     stage.add_argument("--selective-web-resume", action="store_true")
     stage.add_argument("--selective-expiry", action="store_true")
     stage.add_argument("--selective-status", action="store_true")
+    stage.add_argument("--selective-budget", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

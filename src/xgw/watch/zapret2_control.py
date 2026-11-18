@@ -38,7 +38,8 @@ REASONS = {
     "offload_restore": "Восстановление настроек сетевого интерфейса не подтверждено.",
     "offload_apply": "Не удалось изменить настройки сетевого интерфейса.",
     "probe_failed": "Проверка прямого пути не прошла.",
-    "probe_budget": "Исчерпан бюджет проверок прямого пути.",
+    "probe_budget": "Недостаточно бюджета для прямых проб и резерва проверки VPN "
+                    "или учёт бюджета недоступен.",
     "probes_ok": "Пробы прямого пути прошли; воспроизведение проверяется отдельно.",
     "youtube_transport_ok": "HTTPS до страницы YouTube и CDN работает. Видео не проверялось.",
     "youtube_page_probe_failed": "HTTPS-проверка страницы YouTube не прошла.",
@@ -131,7 +132,8 @@ def transport_failure_detail(reason: str, probes: dict) -> str:
     return REASONS[reason]
 
 
-def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None) -> dict:
+def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None,
+         probe_budget: dict | None = None) -> dict:
     """Always return a card; a worker fault never means that VPN was restored.
 
 Only allowlisted public fields leave the snapshot. A revision is published by the daemon
@@ -239,11 +241,21 @@ Commands use the same validation as this card; observations remain revision-boun
     elif phase == "blocked" and settings["mode"] == "selective":
         detail += " Возврат маршрута не подтверждён."
     urls = settings["probe_urls"]
+    last_transport_ok_at = selected.get("last_transport_ok_at")
+    if (not trusted or settings["mode"] != "selective"
+            or not settings.get("youtube_transport_probe")
+            or not _number(last_transport_ok_at) or not 0 < last_transport_ok_at <= now):
+        last_transport_ok_at = None
     page_kind = (zapret2.youtube_probe_page_kind(urls[0])
                  if settings.get("youtube_transport_probe") and urls else None)
     blockers = {mode: management.reasons(cfg, mode, ready=fresh, capture=capture)
                 for mode in schema.MODES} if not invalid else {
                     mode: ["Политика zapret2 некорректна."] for mode in schema.MODES}
+    if not invalid and probe_budget is not None and urls:
+        needed = (len(urls) + 1) * zapret2.PROBE_CHARGE
+        if probe_budget["remaining_bytes"] < needed:
+            blockers["selective"].append("Недостаточно остатка для прямых проб "
+                                         "и контрольной проверки VPN.")
     return {
         "schema_version": schema.VERSION, "mode": settings["mode"], "source": source,
         "engine_mode": settings["engine"], "state": phase, "reason": reason,
@@ -261,6 +273,7 @@ Commands use the same validation as this card; observations remain revision-boun
                      "queue_dropped": None, "strategy_switches": None},
         "evidence": {"transport": transport, "playback": "not_tested",
                      "transport_probes": transport_rows,
+                     "last_transport_ok_at": last_transport_ok_at,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
                      "vpn_control_at": vpn_control_at},
         "can_off": not invalid, "can_edit": not invalid,
@@ -274,4 +287,5 @@ Commands use the same validation as this card; observations remain revision-boun
         if settings.get("youtube_transport_probe") and len(urls) == 2 else [],
         "check_seconds": settings["check_seconds"], "retry_seconds": settings["retry_seconds"],
         "daily_probe_mb": settings["daily_probe_mb"],
+        "probe_budget": probe_budget,
     }

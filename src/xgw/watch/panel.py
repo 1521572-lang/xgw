@@ -754,15 +754,23 @@ class Panel:
         masked["tailscale"] = self._tailscale_card()
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
-        from .zapret2_control import card as zapret2_card
-
-        masked["zapret2"] = zapret2_card(cfg, snapshot, info, daemon is not None, now=now)
+        masked["zapret2"] = self._zapret2_card(cfg, snapshot, info, daemon is not None, now)
         return masked
+
+    def _zapret2_card(self, cfg, snapshot, capture, daemon_ready, now):
+        from .. import zapret2
+        from .zapret2_control import card
+
+        rows = self._db("SELECT (SELECT value FROM meta WHERE key = ?) AS value",
+                        (zapret2.BUDGET,))
+        budget = (zapret2.read_probe_budget(rows[0]["value"], cfg.zapret2.daily_probe_mb, now=now)
+                  if rows else None)
+        return card(cfg, snapshot, capture, daemon_ready, now=now,
+                    probe_budget=budget.status() if budget is not None else None)
 
     def zapret2_overview(self) -> dict:
         """Use the same card as the main panel, without building its server and device lists."""
         from ..desync import event_socket
-        from .zapret2_control import card
 
         now = time.time()
         snapshot = status.read_status(self.paths, max_age=float("inf")) or {}
@@ -772,7 +780,8 @@ class Panel:
         visible = 16
         public_fields = ("seq", "at", "phase", "unit", "queue", "generation")
         return {
-            "zapret2": card(self.cfg, snapshot, capture, self.daemon is not None, now=now),
+            "zapret2": self._zapret2_card(
+                self.cfg, snapshot, capture, self.daemon is not None, now),
             "journal": {
                 "available": journal["state"] == "snapshot",
                 "epoch": journal.get("epoch"),

@@ -197,6 +197,10 @@ class Zapret2Page(Page):
                               "Смена режима прервёт соединения."),
         )
         detail = ("Последнее известное состояние. " if self.main.stale else "") + view["detail"]
+        last_transport_ok = (view.get("evidence") or {}).get("last_transport_ok_at")
+        if last_transport_ok and not self.main.stale:
+            stamp = datetime.fromtimestamp(last_transport_ok, UTC).strftime("%d.%m %H:%M:%S UTC")
+            detail += "\nПоследний успех HTTPS: " + stamp
         mode_label = MODES.get(view["mode"], "—")
         if view.get("source") == "engine":
             mode_label = ("Движок zapret2" if view.get("engine_mode") == "auto"
@@ -210,8 +214,12 @@ class Zapret2Page(Page):
         strategy_label = "Стратегия" if view.get("strategy") else "Настроенная стратегия"
         settings = (f"{strategy_label} {strategy} · адресов проверок {view['probe_count']}\n"
                     f"Проверка каждые {view['check_seconds']} с · повтор после отказа "
-                    f"через {view['retry_seconds']} с · бюджет {view['daily_probe_mb']} МБ/сутки\n"
+                    f"через {view['retry_seconds']} с · бюджет {view['daily_probe_mb']} МиБ/сутки\n"
                     + "\n".join(view["domains"]))
+        budget = view.get("probe_budget")
+        if budget and not self.main.stale:
+            remaining = budget["remaining_bytes"] / (1024 * 1024)
+            settings += f"\nОстаток бюджета проб: {remaining:.2f} МиБ · сброс в 00:00 UTC"
         settings += "\n" + REQUIREMENTS + "\n" + expiry_text(view)
         self.settings_rows.update_rows([("settings", "Домены и проверки", settings, (
             Control("Настроить", self.edit,
