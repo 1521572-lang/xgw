@@ -79,4 +79,4 @@
    ответа.
 4. media-pairs механика работает (пары считаются, окна/гейты проверяются) — при
    активном Selective в следующем раунде готова к сбору; шаг 3 с достаточен.
-- Publication commit: `добавляется после push` (ветка flash/t12-selective-media-20261118T161031Z поверх ba62c75).
+- Publication commit: `356be6a489a2b22b9c7d5344da763bb7df211666` (ba62c75 → 356be6a, remote verified byte-identical to local HEAD).
