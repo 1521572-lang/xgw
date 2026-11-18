@@ -87,4 +87,4 @@
    скрытии; «Загрузка…» больше не зависает после возврата видимости.
 4. Сборщик selective_probe_watch дал полную картину (gate/outgoing/queue/invocation
    1 Гц) без захвата пакетов — достаточен для локализации следующего шага.
-- Publication commit: `добавляется после push` (ветка flash/t12-selective-probe-watch-20261118T045151Z поверх 2fa54b8).
+- Publication commit: `ce8c78b8f1334e85abef9902ad34d62d160ab893` (2fa54b8 → ce8c78b, remote verified byte-identical to local HEAD).
