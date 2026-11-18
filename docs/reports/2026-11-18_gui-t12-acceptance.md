@@ -115,4 +115,4 @@
    штатно на форме и в API; утечки подписанных URL в GET нет.
 4. Пары media-pairs готовы к сбору при первом же active — механика проверена в
    media-раунде; в этом проходе не потребовалась.
-- Publication commit: `добавляется после push` (worktree report от FETCH_HEAD поверх 80d0260).
+- Publication commit: `e37fe77c30d9eadda120e8724634520884dfd45c` (80d0260 → e37fe77, remote verified byte-identical to local HEAD).
