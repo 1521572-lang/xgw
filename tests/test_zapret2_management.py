@@ -41,7 +41,9 @@ def send(cfg, patch, *, expected=None, action="settings", **kwargs):
     return management.command(cfg, action, {
         "expected": key(cfg) if expected is None else expected,
         "mode" if action == "mode" else "settings": patch,
-    }, ready=kwargs.get("ready", True), capture={"mode": kwargs.get("capture", "on")})
+    }, ready=kwargs.get("ready", True), capture={"mode": kwargs.get("capture", "on")},
+       budget_reader=kwargs.get("budget_reader", lambda proposed:
+           management.zapret2.read_probe_budget(None, proposed.zapret2.daily_probe_mb, now=0)))
 
 
 def test_atomic_edit_preserves_unrelated_engine_and_toml(store):
@@ -293,3 +295,19 @@ def test_alt9_missing_assets_prevent_import_and_activation_but_allow_off(store, 
     blocked = send(cfg, "standalone", action="mode")
     assert blocked["code"] == "blocked" and "private-token" not in json.dumps(blocked)
     assert panel.read_bytes() == before
+
+@pytest.mark.parametrize("remaining", [None, 0, 262144, 786431, 786432])
+def test_selective_admission_is_checked_before_saving(store, remaining):
+    cfg, panel = store
+    assert send(cfg, {"youtube_transport_probe": True, "domains": list(schema.YOUTUBE_DOMAINS),
+                      "probe_urls": ["https://www.youtube.com/t/terms",
+                                     "https://r1.googlevideo.com/generate_204"]})["ok"]
+    before = panel.read_bytes()
+    def budget(proposed):
+        return (None if remaining is None else
+                management.zapret2.ProbeBudget(0, 1024 ** 2 - remaining, 1024 ** 2))
+    result = send(cfg, "selective", action="mode", budget_reader=budget)
+    assert result["ok"] is (remaining == 786432)
+    if not result["ok"]:
+        assert result["code"] in ("probe_budget", "budget_unavailable")
+        assert panel.read_bytes() == before

@@ -30,13 +30,18 @@ class Cancelled(ValueError):
     pass
 
 
+class AdmissionBlocked(ValueError):
+    pass
+
+
 class Jobs:
-    def __init__(self, directory: Path, config_path: Path, observe, wake):
+    def __init__(self, directory: Path, config_path: Path, observe, wake, *, budget_reader=None):
         self.directory = directory
         self.path = directory / "job.json"
         self.cancel_path = directory / "cancel"
         self.config_path = config_path
         self.observe, self.wake = observe, wake
+        self.budget_reader = budget_reader
         self.thread = None
         self.stopping = threading.Event()
         self.mutex = threading.Lock()
@@ -99,12 +104,15 @@ class Jobs:
         return schema.fingerprint(policy)
 
     def _transition(self, row, patch):
-        from ..watch.zapret2_management import candidate
+        from ..watch.zapret2_management import admission, candidate
 
         cfg, current = self._policy()
         if schema.fingerprint(current) != row["expected"]:
             raise Conflict("policy_changed")
-        policy, _proposed = candidate(cfg, patch)
+        policy, proposed = candidate(cfg, patch)
+        problem = admission(proposed, self.budget_reader)
+        if problem:
+            raise AdmissionBlocked(problem)
         row["pending"] = schema.fingerprint(policy)
         self._write(row)
         row["expected"] = self._replace(row["expected"], policy)
@@ -157,14 +165,26 @@ class Jobs:
                                 raise TimeoutError("time_budget")
                             started = time.monotonic()
                             self._transition(row, {"mode": "selective", "strategy": profile})
-                            view = self._wait(
-                                row, ("active", "fallback", "blocked", "error"),
-                                min(deadline, time.monotonic() + TRIAL_SECONDS),
-                            )
+                            try:
+                                view = self._wait(
+                                    row, ("active", "fallback", "blocked", "error"),
+                                    min(deadline, time.monotonic() + TRIAL_SECONDS),
+                                )
+                            except TimeoutError:
+                                # A candidate timeout is a measurement, not a reason to
+                                # abandon untried candidates. Off must still be confirmed.
+                                view = {"state": "timeout", "reason": "trial_timeout"}
+                            evidence = view.get("evidence", {})
                             row["results"].append({
                                 "round": round_id + 1, "candidate": profile,
                                 "state": view["state"], "reason": view["reason"],
-                                "transport": view.get("evidence", {}).get("transport", "unknown"),
+                                "transport": evidence.get("transport", "unknown"),
+                                "probes": {target: {key: value for key, value in probe.items()
+                                                    if key in ("ok", "phase", "kind", "http",
+                                                               "elapsed_ms", "bytes")}
+                                           for target, probe in
+                                           evidence.get("transport_probes", {}).items()
+                                           if target in ("page", "cdn")},
                                 "elapsed_ms": round((time.monotonic() - started) * 1000),
                                 "at": time.time(),
                             })
@@ -176,6 +196,9 @@ class Jobs:
             except Conflict:
                 outcome = "conflict"
                 row["error"] = "policy_changed"
+            except AdmissionBlocked as exc:
+                outcome = "failed"
+                row["error"] = str(exc)
             except (OSError, ValueError, TimeoutError, LockTimeout, config.ConfigError):
                 outcome = "failed"
                 row["error"] = "trial_failed"
@@ -218,7 +241,7 @@ class Jobs:
                          "Не удалось изменить задание. Перечитайте состояние.")
 
     def _command(self, action, body):
-        from ..watch.zapret2_management import candidate, reply
+        from ..watch.zapret2_management import admission, candidate, reply
 
         with self.mutex:
             self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -280,6 +303,12 @@ class Jobs:
                         or not view.get("policy_matched") or view.get("config_key") != key
                         or view.get("blockers", {}).get("selective", ["unknown"])):
                     return reply(False, "blocked", "Проверьте готовность Selective и бюджет.")
+                _policy, proposed = candidate(cfg, {"mode": "selective",
+                                                    "strategy": profiles[0]})
+                problem = admission(proposed, self.budget_reader)
+                if problem:
+                    return reply(False, problem, "Для задания не хватает бюджета проб "
+                                 "и резерва VPN либо учёт бюджета недоступен.")
                 row = {
                     "version": 1, "id": uuid.uuid4().hex, "state": "queued",
                     "started": time.time(), "original": policy, "expected": key,

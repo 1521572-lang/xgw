@@ -234,6 +234,15 @@ def probe_charge(settings, *, single_probe: bool = False) -> int:
     return count * PROBE_CHARGE
 
 
+def probe_admission(settings, remaining: int | None) -> str | None:
+    """Read-only start/recheck gate; reserving traffic remains in Controller._budget."""
+    if settings.mode != "selective":
+        return None
+    if type(remaining) is not int or remaining < 0:
+        return "budget_unavailable"
+    return "probe_budget" if remaining < probe_charge(settings) + PROBE_CHARGE else None
+
+
 def active(config: dict) -> bool:
     return any(r.get("outboundTag") == OUT and r.get("inboundTag") != [PROBE]
                for r in config.get("routing", {}).get("rules", []))
@@ -723,10 +732,9 @@ class Controller:
                             and self.view.get("gate_closed") is True):
                         return False
                     raise ValueError(CDN_EXPIRED)
-                if selective and not self.ready and now >= self.next_check:
+                if selective and (not self.ready or now >= self.next_check):
                     budget = self._read_budget(cfg)
-                    required = probe_charge(cfg.zapret2) + PROBE_CHARGE
-                    if budget is None or budget.remaining_bytes < required:
+                    if probe_admission(cfg.zapret2, budget.remaining_bytes if budget else None):
                         if (not present and self.view.get("reason") == "probe_budget"
                                 and self.view.get("gate_closed") is True):
                             return False

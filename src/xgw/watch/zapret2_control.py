@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import replace
 
 from .. import zapret2
 from ..desync import schema, worker
@@ -251,11 +252,14 @@ Commands use the same validation as this card; observations remain revision-boun
     blockers = {mode: management.reasons(cfg, mode, ready=fresh, capture=capture)
                 for mode in schema.MODES} if not invalid else {
                     mode: ["Политика zapret2 некорректна."] for mode in schema.MODES}
-    if not invalid and probe_budget is not None and urls:
-        needed = (len(urls) + 1) * zapret2.PROBE_CHARGE
-        if probe_budget["remaining_bytes"] < needed:
-            blockers["selective"].append("Недостаточно остатка для прямых проб "
-                                         "и контрольной проверки VPN.")
+    if not invalid and urls:
+        problem = zapret2.probe_admission(
+            replace(cfg.zapret2, mode="selective"),
+            probe_budget.get("remaining_bytes") if probe_budget is not None else None)
+        if problem:
+            blockers["selective"].append(
+                "Учёт бюджета проб недоступен." if problem == "budget_unavailable" else
+                "Недостаточно остатка для прямых проб и контрольной проверки VPN.")
     return {
         "schema_version": schema.VERSION, "mode": settings["mode"], "source": source,
         "engine_mode": settings["engine"], "state": phase, "reason": reason,

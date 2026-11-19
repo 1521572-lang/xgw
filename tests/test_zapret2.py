@@ -729,6 +729,20 @@ def test_probe_budget_never_rolls_over_untrusted_records(raw):
     assert z.read_probe_budget(raw, 1, now=2 * z.PROBE_DAY_SECONDS) is None
 
 
+
+@pytest.mark.parametrize("remaining", [0, 262144, 786431])
+def test_low_budget_never_creates_probe_inbound_or_starts_worker(remaining):
+    h = Harness()
+    h.cfg.zapret2.daily_probe_mb = 1
+    ledger = json.dumps({"day": int(time.time() // 86400), "bytes": 1024 ** 2 - remaining})
+    h.controller.store.set_meta(z.BUDGET, ledger)
+    h.step(0)
+    assert h.controller.view["reason"] == "probe_budget"
+    assert ("start", 0) not in h.runtime.events
+    assert not any(i.get("tag") == z.PROBE for i in h.current.get("inbounds", []))
+    assert h.controller.store.get_meta(z.BUDGET) == ledger
+
+
 def test_busy_queue_is_not_taken(monkeypatch):
     calls = []
     runtime = z.Runtime(lambda argv, **kw: calls.append(argv) or "inactive")

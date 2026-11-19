@@ -14,6 +14,20 @@ from xgw.watch.zapret2_control import card, transport_probes
 
 NOW = 1000
 
+@pytest.mark.parametrize("remaining", [None, 0, 262144, 786431, 786432])
+def test_selective_budget_blocker_works_before_enabling_the_mode(remaining):
+    cfg, snap = fixture(engine="off", state="off")
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.domains = list(schema.YOUTUBE_DOMAINS)
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                             "https://r1.googlevideo.com/generate_204"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    budget = None if remaining is None else {"remaining_bytes": remaining}
+    result = view(cfg, snap, probe_budget=budget)
+    assert bool(result["blockers"]["selective"]) is (remaining != 786432)
+
+
 def test_imported_alt9_is_retained_but_not_offered_as_an_ordinary_choice():
     cfg, snap = fixture(engine="off", state="off")
     cfg.zapret2.strategy = schema.LIVE_STRATEGY
@@ -249,6 +263,7 @@ def test_panel_state_wires_card_to_real_response(tmp_path, monkeypatch):
     p._servers.return_value = [], []
     p._devices.return_value = []
     p._db.return_value = []
+    p._probe_budget.side_effect = lambda *args: panel.Panel._probe_budget(p, *args)
     p.desync_jobs.public.return_value = {"state": "idle"}
     p._zapret2_card.side_effect = lambda *args: panel.Panel._zapret2_card(p, *args)
     p.daemon.speed_one_pending.return_value = []

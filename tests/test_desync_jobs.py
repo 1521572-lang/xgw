@@ -32,8 +32,12 @@ def job_store(tmp_path, monkeypatch):
                 "config_key": schema.fingerprint(current.desync),
                 "blockers": {"selective": []}, "state": (
                     "active" if current.zapret2.mode == "selective" else "off"),
-                "reason": "youtube_transport_ok", "evidence": {"transport": "https_reachable"}}
-    instance = jobs.Jobs(tmp_path / "jobs", path, observe, lambda: None)
+                "reason": "youtube_transport_ok", "evidence": {"transport": "https_reachable",
+                    "transport_probes": {"page": {"ok": True, "phase": "body", "http": 200,
+                                                  "url": "private-token"}}}}
+    instance = jobs.Jobs(tmp_path / "jobs", path, observe, lambda: None,
+                        budget_reader=lambda cfg: management.zapret2.read_probe_budget(
+                            None, cfg.zapret2.daily_probe_mb, now=0))
     monkeypatch.setattr(instance, "_launch", lambda **kw: None)
     return instance, path, policy
 
@@ -205,4 +209,42 @@ def test_corrupt_job_does_not_prevent_start(job_store):
     instance.recover()
     assert instance.public()["state"] == "unavailable"
 
+def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeypatch):
+    instance, _path, policy = job_store
+    assert start(instance)["ok"]
+    original = instance._wait
+    trials = []
+    def wait(row, states, deadline, **kwargs):
+        if "active" in states:
+            trials.append(instance._policy()[0].zapret2.strategy)
+            if len(trials) == 1:
+                raise TimeoutError("trial_timeout")
+        return original(row, states, deadline, **kwargs)
+    monkeypatch.setattr(instance, "_wait", wait)
+    instance._run()
+    result = instance.public()
+    assert result["state"] == "complete" and result["restore"] == "pass"
+    assert len(trials) == len(result["results"]) == 4
+    assert result["results"][0]["state"] == "timeout"
+    assert instance._policy()[1] == policy
 
+
+def test_low_budget_rejects_job_and_stops_before_next_candidate(job_store):
+    instance, _path, policy = job_store
+    instance.budget_reader = lambda cfg: management.zapret2.ProbeBudget(0, 0, 262144)
+    assert start(instance)["code"] == "probe_budget"
+    assert not instance.path.exists()
+    assert instance._policy()[1] == policy
+    instance.budget_reader = lambda cfg: management.zapret2.ProbeBudget(0, 0, 786432)
+    assert start(instance)["ok"]
+    calls = 0
+    def budget(cfg):
+        nonlocal calls
+        calls += 1
+        return management.zapret2.ProbeBudget(0, 0, 786432 if calls == 1 else 262144)
+    instance.budget_reader = budget
+    instance._run()
+    result = instance.public()
+    assert len(result["results"]) == 1
+    assert result["error"] == "probe_budget" and result["restore"] == "pass"
+    assert instance._policy()[1] == policy

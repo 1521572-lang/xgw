@@ -81,7 +81,15 @@ def reply(ok, code, text, **extra):
     return {"ok": ok, "code": code, "text": text, "notes": [], **extra}
 
 
-def command(config_path: Path, action: str, body: dict, *, ready, capture) -> dict:
+def admission(cfg, budget_reader):
+    if cfg.zapret2.mode != "selective":
+        return None
+    budget = budget_reader(cfg) if budget_reader is not None else None
+    return zapret2.probe_admission(cfg.zapret2, budget.remaining_bytes if budget else None)
+
+
+def command(config_path: Path, action: str, body: dict, *, ready, capture,
+            budget_reader=None) -> dict:
     """CAS under the same interprocess lock used by every managed writer.
 
     Reread the effective TOML + panel policy under that lock. Preserve raw unrelated
@@ -154,6 +162,10 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture) -> di
                 blocked = reasons(proposed, proposed.zapret2.mode, ready=ready, capture=capture)
                 if blocked:
                     return reply(False, "blocked", " ".join(blocked))
+                problem = admission(proposed, budget_reader)
+                if problem:
+                    return reply(False, problem, "Для запуска не хватает бюджета прямых проб "
+                                 "и резерва VPN либо учёт бюджета недоступен.")
             raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
             if not isinstance(raw, dict):
                 return reply(False, "invalid_config", "Хранилище настроек повреждено.")

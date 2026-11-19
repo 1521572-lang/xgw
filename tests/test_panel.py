@@ -364,6 +364,35 @@ def test_zapret2_budget_matches_in_both_authenticated_views(rig, user, monkeypat
         store.close()
 
 
+
+def test_zapret2_low_budget_rejected_by_real_api_without_rewriting_policy(rig, user, monkeypatch):
+    from xgw import zapret2
+    from xgw.desync import schema
+
+    monkeypatch.setattr(Capture, "mode", lambda self: "on")
+    cfg, _ = config.load(rig.config_path)
+    flat = schema.flatten(cfg.desync)
+    flat.update(mode="off", engine="off", daily_probe_mb=1, youtube_transport_probe=True,
+                domains=list(schema.YOUTUBE_DOMAINS), probe_urls=[
+                    "https://www.youtube.com/t/terms", "https://r1.googlevideo.com/generate_204"])
+    managed.set_desync(rig.store_path, schema.migrate(flat))
+    rig.panel._wake()
+    store = Store(rig.paths.db_file)
+    try:
+        store.set_meta(zapret2.BUDGET, json.dumps({
+            "day": int(time.time() // 86400), "bytes": 3 * zapret2.PROBE_CHARGE}))
+        card = user.state()["zapret2"]
+        before = rig.store_path.read_bytes()
+        assert card["probe_budget"]["remaining_bytes"] == zapret2.PROBE_CHARGE
+        assert card["blockers"]["selective"]
+        result = user.act("zapret2/mode", {"expected": card["config_key"], "mode": "selective"})
+        assert result["code"] == "probe_budget"
+        assert rig.store_path.read_bytes() == before
+    finally:
+        store.close()
+
+
+
 def test_zapret2_commands_require_session_origin_and_revision(rig, user):
     from xgw.desync import schema
 

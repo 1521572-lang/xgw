@@ -14,6 +14,23 @@ from docs.helpers.youtube_telemetry import (
 
 VIDEO = "abcdefghijk"
 
+@pytest.mark.parametrize("scenario", ["short", "long", "clock", "no_network", "seek_missing"])
+def test_acceptance_requires_seconds_and_fresh_media_not_sample_counts(scenario):
+    from docs.helpers.acceptance_playback_check import evaluate
+
+    seconds = 60 if scenario == "short" else 901
+    rows = [dict(sample(i), unix=10000 + i, network={"encoded_bytes": i * 65536})
+            for i in range(seconds + 1)]
+    if scenario == "clock":
+        rows[-1]["unix"] += 100
+    if scenario == "no_network":
+        for row in rows:
+            row["network"]["encoded_bytes"] = 0
+    result = evaluate(rows, VIDEO, 900, require_seek=scenario == "seek_missing")
+    assert result["ok"] is (scenario == "long")
+    assert result["route_verdict"] == "UNKNOWN"
+
+
 
 def sample(t, **changes):
     return dict(t_s=t, has_video=True, video_id=VIDEO, document_id=1, media_id=1,

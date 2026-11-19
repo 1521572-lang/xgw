@@ -315,6 +315,7 @@ class Panel:
         self.desync_jobs = Jobs(
             paths.var / "desync-jobs", self.config_path,
             lambda: self.zapret2_overview()["zapret2"], self._wake,
+            budget_reader=self._probe_budget,
         )
 
     @classmethod
@@ -766,14 +767,19 @@ class Panel:
         masked["zapret2"]["job"] = self.desync_jobs.public()
         return masked
 
-    def _zapret2_card(self, cfg, snapshot, capture, daemon_ready, now):
+    def _probe_budget(self, cfg, now=None):
         from .. import zapret2
-        from .zapret2_control import card
 
         rows = self._db("SELECT (SELECT value FROM meta WHERE key = ?) AS value",
                         (zapret2.BUDGET,))
-        budget = (zapret2.read_probe_budget(rows[0]["value"], cfg.zapret2.daily_probe_mb, now=now)
-                  if rows else None)
+        return (zapret2.read_probe_budget(rows[0]["value"], cfg.zapret2.daily_probe_mb,
+                                         now=time.time() if now is None else now)
+                if rows else None)
+
+    def _zapret2_card(self, cfg, snapshot, capture, daemon_ready, now):
+        from .zapret2_control import card
+
+        budget = self._probe_budget(cfg, now)
         return card(cfg, snapshot, capture, daemon_ready, now=now,
                     probe_budget=budget.status() if budget is not None else None)
 
@@ -1748,7 +1754,8 @@ class Panel:
                         card = self.zapret2_overview()["zapret2"]
                         result = zapret2_management.command(
                             self.config_path, name.rsplit("/", 1)[1], body,
-                            ready=card["fresh"], capture={"mode": self._capture().mode()})
+                            ready=card["fresh"], capture={"mode": self._capture().mode()},
+                            budget_reader=self._probe_budget)
                         if result.get("changed"):
                             self._wake()
                         else:

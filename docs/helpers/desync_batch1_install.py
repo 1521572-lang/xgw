@@ -75,6 +75,9 @@ SELECTIVE_BUDGET_TIMER = "xgw-selective-budget-rollback.timer"
 SELECTIVE_JOBS = ("desync/schema.py", "desync/jobs.py", "desync/client.py", "watch/panel.py",
                   "watch/zapret2_management.py", "ui/zapret2.html", "ui/zapret2.js")
 SELECTIVE_JOBS_TIMER = "xgw-selective-jobs-rollback.timer"
+SELECTIVE_ADMISSION = ("zapret2.py", "watch/zapret2_control.py", "watch/panel.py",
+                       "watch/zapret2_management.py", "desync/jobs.py")
+SELECTIVE_ADMISSION_TIMER = "xgw-selective-admission-rollback.timer"
 
 
 def gui_files(files):
@@ -237,6 +240,8 @@ def apply(backup, rows, timer=TIMER):
 
 
 def overlay(args):
+    if getattr(args, "selective_admission", False):
+        return SELECTIVE_ADMISSION, SELECTIVE_ADMISSION_TIMER
     if getattr(args, "selective_jobs", False):
         return SELECTIVE_JOBS, SELECTIVE_JOBS_TIMER
     if getattr(args, "selective_budget", False):
@@ -311,6 +316,7 @@ def main():
     stage.add_argument("--selective-status", action="store_true")
     stage.add_argument("--selective-budget", action="store_true")
     stage.add_argument("--selective-jobs", action="store_true")
+    stage.add_argument("--selective-admission", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
