@@ -118,4 +118,4 @@ engine_states, test_desync_worker (весь модуль). Отказов/про
 - Финал: off-политика не трогалась (standalone остаётся фактическим режимом
   базовой панели), воркеры в исходном состоянии, xgw active, VPN работает,
   disk 42 ГБ, приватные артефакты — в каталоге опыта 0700.
-- Publication commit: `добавляется после push`.
+- Publication commit: `d11b7e17209c423bf93f4ff585f1c8daaf248fa1` (09860ee → d11b7e1, remote verified ancestor).
