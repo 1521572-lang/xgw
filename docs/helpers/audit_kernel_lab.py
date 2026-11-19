@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 
 PEER = "198.51.100.2"
 UID = 65534  # synthetic application UID, independent of the installed service account
@@ -29,10 +30,14 @@ def peer_server():
     print("namespace ready", flush=True)
     if input() != "start":
         raise ValueError("missing start")
-    counts = {"echo": 0, "client_fin": 0, "final_ack": 0, "errors": 0}
+    counts = {"echo": 0, "client_fin": 0, "final_ack": 0, "errors": 0,
+              "last_ack_at_deadline": 0, "other_at_deadline": 0}
     with selectors.DefaultSelector() as events:
         events.register(sys.stdin, selectors.EVENT_READ)
         listeners = []
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind((PEER, 7444))
+        events.register(udp, selectors.EVENT_READ)
         for port in (443, 7443):
             listener = socket.create_server((PEER, port), backlog=16)
             listeners.append(listener)
@@ -40,6 +45,10 @@ def peer_server():
         print("listening", flush=True)
         while True:
             for key, _ in events.select():
+                if key.fileobj is udp:
+                    if udp.recv(64) == b"x":
+                        print("datagram", flush=True)
+                    continue
                 if key.fileobj is sys.stdin:
                     if sys.stdin.readline().strip() != "counts":
                         return
@@ -60,9 +69,15 @@ def peer_server():
                         time.sleep(0.10)
                         conn.shutdown(socket.SHUT_WR)
                         end = time.monotonic() + 0.8
-                        while time.monotonic() < end:
-                            if conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 1)[0] == 7:
+                        while True:
+                            state = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 1)[0]
+                            if state == 7:
                                 counts["final_ack"] += 1  # Linux TCP_CLOSE after LAST_ACK
+                                break
+                            if time.monotonic() >= end:
+                                field = ("last_ack_at_deadline" if state == 9
+                                         else "other_at_deadline")
+                                counts[field] += 1
                                 break
                             time.sleep(0.02)
                     except OSError:
@@ -130,7 +145,7 @@ def path_counters(nft):
 
 
 def tail_counters():
-    listing = json.loads(run("nft", "-j", "list", "chain", "ip", "audit", "before"))
+    listing = json.loads(run("nft", "-j", "list", "table", "ip", "audit"))
     return {
         item["rule"]["comment"]: next(e["counter"]["packets"] for e in item["rule"]["expr"]
                                       if "counter" in e)
@@ -151,14 +166,56 @@ def closes(peer, label):
           "output": {k: end[k] - v for k, v in start.items()}})
 
 
-def lab(host_net):
+def accounting_trials(peer, rules, apply):
+    from xgw.config import Config
+    from xgw.net import nft, sysctl
+
+    def queued():
+        data = json.loads(run("nft", "-j", "list", "table", "inet", nft.GUARD))
+        return sum(expr["counter"]["packets"] for row in data["nftables"]
+                   if row.get("rule", {}).get("chain") == "nfq_output"
+                   for expr in row["rule"]["expr"] if "counter" in expr)
+
+    def burst(client, label):
+        start = queued()
+        for _ in range(8):
+            client.sendto(b"x", (PEER, 7444))
+            if line(peer) != "datagram":
+                raise RuntimeError("missing UDP receipt")
+        emit({"phase": label, "received": 8, "queue_matches": queued() - start})
+
+    cfg = Config()
+    cfg.zapret2.engine = "auto"
+    with (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as old,
+          socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as fresh):
+        for client in (old, fresh):
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, rules.mark_bypass)
+        for value in ("0", "1"):
+            (sysctl.PROC_SYS / sysctl.CONNTRACK_ACCT).write_text(value, encoding="ascii")
+            wanted, _ = nft.build_rules(cfg, capture=True, time_uids=())
+            apply(replace(rules, engine_queue=wanted.engine_queue))
+            actual = sysctl.read(sysctl.CONNTRACK_ACCT)
+            emit({"phase": "install_acct_" + value, "actual": actual, "queue": wanted.engine_queue})
+            if actual != value or (wanted.engine_queue is not None) != (value == "1"):
+                raise RuntimeError("unexpected accounting or missing Engine installation")
+            if value == "0":
+                burst(old, "unaccounted")
+            else:
+                burst(old, "existing_flow_after_enable")
+                burst(fresh, "fresh_flow_after_enable")
+
+
+def lab(host_net, *, candidate=False):
     # An anonymous network AND PID namespace are mandatory even when called by hand.
     if (os.getpid() != 1 or str(os.stat("/proc/self/ns/net").st_ino) == host_net
             or {i["ifname"] for i in json.loads(run("ip", "-j", "link"))} != {"lo"}):
         raise RuntimeError("a new empty network and PID namespace is required")
     # Use the exact installed renderer. No systemctl, XGW daemon or configuration writes.
     sys.dont_write_bytecode = True
-    sys.path.insert(0, "/opt/xgw/lib")
+    lib = Path(__file__).parent / "src" if candidate else Path("/opt/xgw/lib")
+    if not (lib / "xgw/net/nft.py").is_file():
+        raise RuntimeError("requested renderer is missing")
+    sys.path.insert(0, str(lib))
     from xgw import nfqws2, zapret2
     from xgw.net import cmd, iprule, nft, tun
 
@@ -195,6 +252,16 @@ chain before {{
  ip daddr {PEER} tcp dport 7443 counter comment "all"
  ip daddr {PEER} tcp dport 7443 meta skuid {UID} counter comment "uid"
 }}
+chain marked {{
+ type filter hook output priority -149; policy accept;
+ ip daddr {PEER} tcp dport 7443 meta mark 1 counter comment "marked_proxy"
+ ip daddr {PEER} tcp dport 7443 meta mark 0 counter comment "marked_zero"
+}}
+chain delivered {{
+ type filter hook postrouting priority 11; policy accept;
+ ip daddr {PEER} tcp dport 7443 oifname "audit0" counter comment "after_guard_wan"
+ ip daddr {PEER} tcp dport 7443 oifname "audit-tun" counter comment "after_guard_tun"
+}}
 }}
 """)
             closes(peer, "close_control")
@@ -225,6 +292,8 @@ chain before {{
             trial("engine_copy", 2 | nfqws2.FAKE_MARK, 0)
             trial("engine_no_listener", 2, 0)
             trial("engine_other_uid", None, 1, UID - 1)
+            if candidate:
+                accounting_trials(peer, rules, apply)
             # Exercise the actual routines used by Capture.restore_tun independently
             # of the dummy used above. TUN may be unavailable under hardening.
             for stage in ("absent", "down"):
@@ -249,7 +318,7 @@ if __name__ == "__main__":
         if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
             raise SystemExit("peer isolation required")
         peer_server()
-    elif len(sys.argv) == 3 and sys.argv[1] == "lab":
-        lab(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] in ("lab", "candidate"):
+        lab(sys.argv[2], candidate=sys.argv[1] == "candidate")
     else:
         raise SystemExit("use the published ThinkCentre audit assignment")

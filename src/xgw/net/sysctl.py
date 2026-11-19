@@ -18,6 +18,7 @@ from pathlib import Path
 from ..paths import Paths, atomic_write_text
 
 PROC_SYS = Path("/proc/sys")
+CONNTRACK_ACCT = "net/netfilter/nf_conntrack_acct"
 IP_FORWARD = "net/ipv4/ip_forward"
 # Алгоритм управления перегрузкой TCP (network.tcp_bbr): ставит и возвращает перехват
 # (capture.Capture._congestion) — как форвардинг, по записи в /proc/sys.
@@ -74,6 +75,10 @@ def read(key: str, root: Path = PROC_SYS) -> str | None:
         return (root / key).read_text(encoding="ascii").strip()
     except OSError:
         return None
+
+
+def conntrack_accounting(root: Path = PROC_SYS) -> bool:
+    return read(CONNTRACK_ACCT, root) == "1"
 
 
 def write(key: str, value: str, root: Path = PROC_SYS) -> None:

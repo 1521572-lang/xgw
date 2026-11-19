@@ -24,6 +24,7 @@ REASONS = {
     "inactive": "Перехват не включён.",
     "not_found": "Не найден бинарник nfqws2 или обязательные библиотеки Lua.",
     "worker_down": "Обработчик или очередь недоступны.",
+    "conntrack_accounting_required": "Очередь Engine требует учёта пакетов (nf_conntrack_acct=1).",
     "worker_start_timeout": "Обработчик не подтвердил готовность вовремя.",
     "queue_busy": "Номер очереди занят.",
     "worker_unit_busy": "Служба обработчика уже занята.",

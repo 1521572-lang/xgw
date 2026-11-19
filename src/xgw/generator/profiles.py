@@ -48,6 +48,7 @@ from collections.abc import Collection, Mapping
 from .. import nfqws2
 from ..config import Config
 from ..model import ServerNode, variant_key
+from ..net import sysctl
 from . import fragment as fragmenting
 
 XRAY_DEFAULT = "xray:default"
@@ -194,7 +195,8 @@ def available(node: ServerNode, cfg: Config, bridged: Collection[str]) -> list[s
         xr.append(XRAY_DEFAULT)
         if cfg.fragment.mode != "off" and fragmenting.eligible(node.outbound):
             xr += [XRAY_FRAGMENT, *([XRAY_SPLIT] if cfg.fragment.split else [])]
-        if nfqws2.enabled(cfg) and nfqws2.find_installation(cfg) is not None:
+        if (nfqws2.enabled(cfg) and sysctl.conntrack_accounting()
+                and nfqws2.find_installation(cfg) is not None):
             xr.extend(NFQ_PROFILES)
     if pin == "sing-box" and sb:
         xr = []

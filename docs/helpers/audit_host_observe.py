@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
@@ -106,13 +107,67 @@ def watchdog(seconds):
                       "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None}))
 
 
+def desync():
+    sys.path.insert(0, "/opt/xgw/lib")
+    from xgw import config, zapret2
+    from xgw.desync import worker
+    from xgw.net import cmd, nft
+    from xgw.paths import Paths
+    from xgw.watch import status, zapret2_control
+
+    started = time.time()
+    paths = Paths.from_env({})
+    cfg, _ = config.load(paths.config_file)
+    snap = status.read_status(paths, float("inf")) or {}
+    policy = worker.policy_revision(cfg.zapret2)
+    age = started - snap.get("updated", 0)
+    units = {name: unit(name) for name in (worker.SELECTED_UNIT, worker.ENGINE_UNIT)}
+    try:
+        queues = [row.split() for row in worker.QUEUE_STATE.read_text().splitlines()]
+    except OSError:
+        queues = None
+    for name, number in ((worker.SELECTED_UNIT, cfg.zapret2.queue_num),
+                         (worker.ENGINE_UNIT, cfg.zapret2.engine_queue)):
+        row = next((r for r in queues or [] if r and r[0] == str(number)), None)
+        units[name].update(queue=number, listed=row is not None if queues is not None else None,
+                           seq=int(row[7]) if row and len(row) > 7 else None,
+                           owner_verified=worker.verify_owner(cmd.run, name, number))
+    raw = read_command("nft", "-a", "-j", "list", "table", "inet", nft.GUARD)
+    gate_size = None
+    counters = {}
+    if raw is not None:
+        for entry in json.loads(raw)["nftables"]:
+            for kind in ("set", "element"):
+                group = entry.get(kind, {})
+                if group.get("name") == zapret2.LIVE:
+                    gate_size = len(group.get("elem", []))
+            rule = entry.get("rule", {})
+            expr = rule.get("expr", [])
+            if any("queue" in e for e in expr):
+                key = f"{rule['chain']}.{rule['handle']}"
+                packets = (e["counter"]["packets"] for e in expr if "counter" in e)
+                counters[key] = next(packets, None)
+    lease = snap.get("zapret2_reservation") or {}
+    print(json.dumps({"at": started, "span_s": round(time.time() - started, 2),
+                      "mode": cfg.zapret2.mode, "engine": cfg.zapret2.engine,
+                      "daemon": unit("xgw.service"), "status_at": snap.get("updated"),
+                      "policy_key": policy,
+                      "policy_match": bool(policy and snap.get("zapret2_policy_key") == policy),
+                      "fresh": 0 <= age <= zapret2_control.FRESH_SECONDS,
+                      "reservation": lease.get("unit"), "units": units,
+                      "guard_read": raw is not None, "gate_elements": gate_size,
+                      "queue_counters": counters}, sort_keys=True))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("snapshot", "watchdog"))
+    parser.add_argument("action", choices=("snapshot", "watchdog", "desync"))
     parser.add_argument("--seconds", type=int, choices=range(5, 301), default=180,
                         metavar="5..300")
     args = parser.parse_args()
     if args.action == "snapshot":
         snapshot()
+    elif args.action == "desync":
+        desync()
     else:
         watchdog(args.seconds)

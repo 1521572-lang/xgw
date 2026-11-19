@@ -132,6 +132,7 @@ def test_cdn_retry_diagnostic_is_bounded(first, visible):
 @pytest.mark.parametrize(("state", "reason", "expected"), [
     ("active", "", "active"), ("off", "not_found", "absent"),
     ("fallback", "worker_down", "error"), ("fallback", "queue_busy", "error"),
+    ("fallback", "conntrack_accounting_required", "error"),
     ("off", "inactive", "off"), ("preparing", "", "preparing"),
 ])
 def test_engine_states(state, reason, expected):
@@ -139,6 +140,9 @@ def test_engine_states(state, reason, expected):
     result = view(cfg, snap)
     assert result["state"] == expected
     assert result["source"] == "engine"
+    if reason == "conntrack_accounting_required":
+        assert reason == result["reason"]
+        assert "nf_conntrack_acct=1" in result["detail"]
     assert "восстановлен" not in result["title"].lower()
     assert result["state"] != "fallback"
     assert result["without_vpn"] is False

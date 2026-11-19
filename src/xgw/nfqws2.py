@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .desync import h05, preflight, worker
-from .net import cmd
+from .net import cmd, sysctl
 
 if TYPE_CHECKING:
     from .config import Config
@@ -418,6 +418,10 @@ class Controller:
             error = self._stop()
             reason = "disabled" if not enabled(cfg) else ("inactive" if not active else "not_found")
             self.view = {"state": "fallback" if error else "off", "reason": error or reason}
+            return
+        if not sysctl.conntrack_accounting():
+            error = self._stop()
+            self.view = {"state": "fallback", "reason": error or "conntrack_accounting_required"}
             return
         profile = self.selected_profile(cfg, applied)
         try:

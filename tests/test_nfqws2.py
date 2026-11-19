@@ -1,4 +1,5 @@
 import dataclasses
+import tempfile
 import threading
 import unittest
 from contextlib import ExitStack
@@ -11,7 +12,7 @@ from xgw.config import Config
 from xgw.generator import fragment, profiles
 from xgw.generator.builder import build, select_nodes
 from xgw.model import ServerNode
-from xgw.net import nft
+from xgw.net import nft, sysctl
 from xgw.net.cmd import CommandError
 from xgw.nfqws2 import find_installation
 
@@ -115,6 +116,7 @@ class EngineTests(unittest.TestCase):
         host = WorkerHost()
         runtime = nfqws2.Runtime(host.run)
         patches = self.enterContext(ExitStack())
+        patches.enter_context(mock.patch.object(sysctl, "conntrack_accounting", return_value=True))
         patches.enter_context(mock.patch("xgw.nfqws2.find_installation",
                                          return_value=self.installation))
         patches.enter_context(mock.patch.object(runtime, "occupied", host.occupied))
@@ -475,9 +477,54 @@ unrelated-empty-field:
         self.assertIn("queue num 200 bypass", text)
         self.assertIn("meta mark & 0x40000000 == 0x40000000 return", text)
         self.assertIn("meta mark & 0x40000000 == 0x40000000 accept", text)
-        self.assertIn("meta mark 0x2 meta l4proto tcp ct packets <= 8", text)
-        self.assertIn("meta mark 0x2 meta l4proto udp ct packets <= 4", text)
-        self.assertIn("meta skuid 990 meta l4proto tcp ct packets <= 8", text)
+        for selector in ("meta mark 0x2", "meta skuid 990"):
+            for proto, limit in (("tcp", 8), ("udp", 4)):
+                self.assertIn(f"{selector} meta l4proto {proto} ct packets 1-{limit} "
+                              "counter queue num 200 bypass", text)
+
+    def test_accounting_controls_engine_rules_and_warnings(self):
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(nfqws2, "find_installation", return_value=self.installation)):
+            root = Path(directory)
+            acct = root / sysctl.CONNTRACK_ACCT
+            acct.parent.mkdir(parents=True)
+            for value in (None, "0", "1", "0"):
+                with self.subTest(value=value):
+                    if value is not None:
+                        acct.write_text(value, encoding="ascii")
+                    rules, warnings = nft.build_rules(
+                        cfg, capture=True, time_uids=(), proc_sys=root)
+                    self.assertEqual(rules.engine_queue, 200 if value == "1" else None)
+                    self.assertEqual("chain nfq_output" in nft.render_guard(rules), value == "1")
+                    self.assertEqual(any("nf_conntrack_acct" in w for w in warnings), value != "1")
+                    self.assertEqual(sysctl.read(sysctl.CONNTRACK_ACCT, root), value)
+
+    def test_accounting_loss_stops_worker_and_skips_engine_profiles(self):
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
+        node = ServerNode("a", "test", "de", "vless", "203.0.113.1", 443,
+                          {"protocol": "vless", "settings": {}}, "test")
+        runtime = mock.Mock()
+        runtime.wait_ready.return_value = True
+        controller = nfqws2.Controller(runtime)
+        with (mock.patch.object(nfqws2, "find_installation", return_value=self.installation),
+              mock.patch.object(sysctl, "conntrack_accounting") as accounting):
+            for value in (False, True, False, True):
+                accounting.return_value = value
+                controller.step(cfg, [], active=True)
+                choices = profiles.available(node, cfg, ())
+                self.assertIn(profiles.XRAY_DEFAULT, choices)
+                self.assertEqual(profiles.NFQ_SEQOVL in choices, value)
+                if value:
+                    self.assertEqual(controller.view["state"], "active")
+                else:
+                    self.assertEqual(controller.view, {
+                        "state": "fallback", "reason": "conntrack_accounting_required"})
+                    self.assertIsNone(controller.installation)
+            self.assertEqual(runtime.stop.call_count, 2)
+            self.assertEqual(runtime.start.call_count, 2)
 
     def test_generated_packets_skip_capture_before_marks_are_rewritten(self):
         skip = "meta mark & 0x40000000 == 0x40000000 return"
@@ -543,7 +590,8 @@ unrelated-empty-field:
         controller = nfqws2.Controller(runtime)
         cfg = Config()
         cfg.zapret2.engine = "auto"
-        with mock.patch("xgw.nfqws2.find_installation", return_value=self.installation):
+        with (mock.patch("xgw.nfqws2.find_installation", return_value=self.installation),
+              mock.patch.object(sysctl, "conntrack_accounting", return_value=True)):
             controller.step(cfg, [], active=True)
         self.assertEqual(controller.view, {
             "state": "fallback", "reason": "unsafe_files", "profile": "seqovl",
@@ -568,6 +616,7 @@ unrelated-empty-field:
         cfg = Config()
         cfg.zapret2.engine = "auto"
         with (mock.patch("xgw.nfqws2.find_installation", return_value=self.installation),
+              mock.patch.object(sysctl, "conntrack_accounting", return_value=True),
               mock.patch.object(runtime, "occupied", return_value=False),
               mock.patch("xgw.nfqws2.preflight.check", side_effect=ValueError("unsafe_files"))):
             controller.step(cfg, [], active=True)

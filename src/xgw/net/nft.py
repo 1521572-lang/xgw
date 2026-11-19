@@ -365,11 +365,17 @@ def build_rules(
         )
     observe_synack = cfg.zapret2.selected_enabled and cfg.zapret2.observe_synack
     reply_packets = cfg.zapret2.observe_reply_packets if capture and observe_synack else 0
-    if reply_packets and sysctl.read(zapret2.CONNTRACK_ACCT, proc_sys) != "1":
+    if reply_packets and not sysctl.conntrack_accounting(proc_sys):
         # An nft counter expression would enable accounting even on a check-only load.
         # Require existing accounting; the SYN/ACK-only path remains available.
         warnings.append("zapret2: входящий диапазон требует nf_conntrack_acct=1")
         reply_packets = 0
+    engine_queue = None
+    if capture and nfqws2.enabled(cfg) and nfqws2.find_installation(cfg) is not None:
+        if sysctl.conntrack_accounting(proc_sys):
+            engine_queue = cfg.zapret2.engine_queue
+        else:
+            warnings.append("Engine: очередь отключена, требуется nf_conntrack_acct=1")
     return (
         Rules(
             lan_if=lan_if,
@@ -415,8 +421,7 @@ def build_rules(
                            if cfg.zapret2.selected_enabled else None),
             zapret2_observe_synack=observe_synack,
             zapret2_reply_packets=reply_packets,
-            engine_queue=(cfg.zapret2.engine_queue if capture and nfqws2.enabled(cfg)
-                          and nfqws2.find_installation(cfg) is not None else None),
+            engine_queue=engine_queue,
         ),
         warnings,
     )
@@ -1098,7 +1103,7 @@ def render6(rules: Rules) -> str:
 def _nfq_blocks(rules: Rules) -> list[list[str]]:
     if rules.engine_queue is None:
         return []
-    queue = f"queue num {rules.engine_queue} bypass"
+    queue = f"counter queue num {rules.engine_queue} bypass"
     common = [
         "ct state invalid return",
         "ct direction != original return",
@@ -1113,13 +1118,13 @@ def _nfq_blocks(rules: Rules) -> list[list[str]]:
         common.append("ip6 daddr { " + ", ".join(rules.reserved6) + " } return")
     output = [
         *common,
-        f"meta mark {rules.mark_bypass:#x} meta l4proto tcp ct packets <= 8 {queue}",
-        f"meta mark {rules.mark_bypass:#x} meta l4proto udp ct packets <= 4 {queue}",
+        f"meta mark {rules.mark_bypass:#x} meta l4proto tcp ct packets 1-8 {queue}",
+        f"meta mark {rules.mark_bypass:#x} meta l4proto udp ct packets 1-4 {queue}",
     ]
     if rules.singbox_uid is not None:
         output += [
-            f"meta skuid {rules.singbox_uid} meta l4proto tcp ct packets <= 8 {queue}",
-            f"meta skuid {rules.singbox_uid} meta l4proto udp ct packets <= 4 {queue}",
+            f"meta skuid {rules.singbox_uid} meta l4proto tcp ct packets 1-8 {queue}",
+            f"meta skuid {rules.singbox_uid} meta l4proto udp ct packets 1-4 {queue}",
         ]
     return [_chain(
         "nfq_output", "type filter hook output priority 90; policy accept;", output

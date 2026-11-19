@@ -56,7 +56,7 @@ from .generator import profiles as profiling
 from .generator import singbox as singboxing
 from .generator.builder import BALANCER_TAG, POOL_BALANCER, NodeInfo
 from .model import ServerNode
-from .net import cmd, conncheck, tun
+from .net import cmd, conncheck, sysctl, tun
 from .net.capture import capture_inbounds
 from .paths import Paths, atomic_write_json
 from .store import Store, SubscriptionCache
@@ -2424,7 +2424,7 @@ class Daemon:
             return True
         runtime = self._nfqws2.runtime
         if (lease.unit == nfqws2.UNIT and not self._desync_reload_pending
-                and nfqws2.enabled(cfg)
+                and nfqws2.enabled(cfg) and sysctl.conntrack_accounting()
                 and cfg.zapret2.engine_profile == self.cfg.zapret2.engine_profile
                 and self._nfqws2.profile):
             installation = nfqws2.find_installation(cfg)

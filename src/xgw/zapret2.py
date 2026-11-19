@@ -25,6 +25,7 @@ from .desync.schema import (
     youtube_cdn_expiry,
 )
 from .net import cmd
+from .net.sysctl import CONNTRACK_ACCT as CONNTRACK_ACCT
 
 if TYPE_CHECKING:
     from .config import Config
@@ -37,7 +38,6 @@ MARKS = f"{{ {MARK:#x}, {FAKE_MARK:#x} }}"
 # This conntrack bit is independent of skb marks and nft.GUARD_CT.
 SYNACK_CT = 0x10000000
 REPLY_CT = 0x08000000
-CONNTRACK_ACCT = "net/netfilter/nf_conntrack_acct"
 TCP_HANDSHAKE_FLAGS = "(fin | syn | rst | ack)"
 OUT = "xgw-zapret2"
 DIRECT = "xgw-standalone-direct"
