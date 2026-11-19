@@ -10,6 +10,30 @@ from xgw.desync import client, jobs, schema
 from xgw.watch import zapret2_management as management
 
 
+def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path):
+    profiles = list(jobs.CANDIDATES)
+    rows = [{"round": n, "candidate": p, "state": "active", "transport": "https_reachable"}
+            for n, sequence in ((1, profiles), (2, reversed(profiles))) for p in sequence]
+    rows[0].update(state="timeout", transport="unknown")
+    rows[1]["transport"] = "unknown"
+    job = {"id": "a" * 32, "state": "complete", "restore": "pass",
+           "candidates": profiles, "rounds": 2, "results": rows}
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps({"job": job, "secret": "private"}))
+    result = client.matrix_report(path)
+    assert result["ok"] and result["full_matrix"]
+    assert result["states"] == {"timeout": 1, "active": 17}
+    assert result["two_https_pass"] == profiles[2:]
+    assert "private" not in json.dumps(result)
+    job["results"] = rows[:-1]
+    path.write_text(json.dumps(job))
+    assert not client.matrix_report(path)["ok"]
+    job["results"] = [*rows[:-1], rows[0]]
+    path.write_text(json.dumps(job))
+    with pytest.raises(ValueError, match="matrix_row_or_order"):
+        client.matrix_report(path)
+
+
 @pytest.fixture
 def job_store(tmp_path, monkeypatch):
     if sys.platform == "win32":

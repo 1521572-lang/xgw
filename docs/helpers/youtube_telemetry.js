@@ -47,6 +47,10 @@
     const base = {document_id: performance.timeOrigin, media_id: serial,
       at_ms: performance.now(), video_id: /^[\w-]{11}$/.test(requested) ? requested : null,
       has_video: !!v, ad: ad(), hidden: document.hidden,
+      player_error_visible: [...document.querySelectorAll(
+        '#movie_player .ytp-error-content-wrap, #movie_player .ytp-error-content'
+      )].some(el => el.getClientRects().length > 0 &&
+        el.checkVisibility?.({checkOpacity: true, checkVisibilityCSS: true})),
       events: events.splice(0), event_overflow: overflow, stats};
     if (!v) return base;
     let buffer = 0;

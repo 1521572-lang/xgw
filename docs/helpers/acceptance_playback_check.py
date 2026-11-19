@@ -35,11 +35,15 @@ def evaluate(rows, video, minimum, require_seek=False):
     counters = [(r.get("network") or {}).get("encoded_bytes") for r in (rows[0], rows[-1])]
     media = (counters[1] - counters[0] if all(number(v) for v in counters)
              and counters[1] >= counters[0] else 0)
-    ok = (elapsed >= minimum and abs(elapsed - wall) <= 2 and eligible >= minimum
-          and progress >= 0.98 and (result["target_height_ratio"] or 0) >= 0.95
-          and result["sampling_gap_seconds"] <= 5 and result["lost_media_events"] == 0
-          and media >= 1024 * 1024 and (not require_seek or seek_found))
-    return {"ok": ok, "required_seconds": minimum, "samples": len(rows),
+    checks = {"duration": elapsed >= minimum, "clock": abs(elapsed - wall) <= 2,
+              "eligible": eligible >= minimum, "progress": progress >= 0.98,
+              "quality": (result["target_height_ratio"] or 0) >= 0.95,
+              "sampling_gaps": result["sampling_gap_seconds"] <= 5,
+              "events": result["lost_media_events"] == 0, "media_bytes": media >= 1024 * 1024,
+              "seek": not require_seek or seek_found}
+    failed = [name for name, passed in checks.items() if not passed]
+    return {"ok": not failed, "failed_checks": failed, "required_seconds": minimum,
+            "samples": len(rows),
             "measured_seconds": elapsed, "wall_seconds": wall, "eligible_seconds": eligible,
             "progress_ratio": progress, "target_height_ratio": result["target_height_ratio"],
             "sampling_gap_seconds": result["sampling_gap_seconds"],

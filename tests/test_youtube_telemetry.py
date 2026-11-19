@@ -170,3 +170,92 @@ def test_empty_partial_report_stays_unknown(tmp_path):
     assert "browser_error" in report and "UNKNOWN" in report and "NOT_ESTABLISHED" in report
     assert "PASS" not in report
     assert len((tmp_path / "timeline.csv").read_text().splitlines()) == 1
+
+
+class TrialPage:
+    def __init__(self):
+        self.actions = []
+
+    def evaluate(self, script, args):
+        self.actions.append(args["action"])
+        return 407 if args["action"] == "seek" else None
+
+    def bring_to_front(self):
+        self.actions.append("foreground")
+
+
+def trial_row(t, **changes):
+    return changed(t, unix=10000 + t, network={"encoded_bytes": t * 65536}, **changes)
+
+
+def test_trial_waits_for_ready_video_then_requires_measured_progress():
+    from docs.helpers.playback_trial import PlaybackTrial
+
+    trial, page, rows = PlaybackTrial("control", VIDEO), TrialPage(), []
+    for t in range(124):
+        row = trial_row(t)
+        if t == 0:
+            row.update(hidden=True, ready_state=0, paused=True)
+        if t == 1:
+            row.update(paused=True)
+        rows.append(row)
+        outcome = trial.step(page, rows)
+        assert outcome == ("complete" if t == 123 else None)
+    assert page.actions == ["foreground", "play"]
+    assert trial.finish(rows, outcome)["measurement"]["eligible_seconds"] == 120
+
+
+@pytest.mark.parametrize("matched", [True, False])
+def test_seek_trial_requires_event_at_requested_position(matched):
+    from docs.helpers.playback_trial import PlaybackTrial
+
+    trial, page, rows = PlaybackTrial("seek", VIDEO), TrialPage(), []
+    for t in range(303):
+        row = trial_row(t)
+        if t >= 2:
+            row["position"] = 407 + t - 2
+        if t == 2:
+            row["events"] = [{"name": "seeked", "media_id": 1, "position": 407 if matched else 7}]
+        rows.append(row)
+        outcome = trial.step(page, rows)
+        if outcome:
+            break
+    assert page.actions == ["seek"]
+    assert outcome == ("complete" if matched else "seek_unconfirmed")
+    assert trial.finish(rows, outcome)["ok"] is matched
+
+
+def test_error_or_document_change_ends_attempt_without_combining_samples():
+    from docs.helpers.playback_trial import PlaybackTrial
+
+    for change, reason in (({"player_error_visible": True}, "player_error"),
+                           ({"document_id": 2}, "player_replaced")):
+        trial, page, rows = PlaybackTrial("long", VIDEO), TrialPage(), []
+        for row in (trial_row(0), trial_row(1), trial_row(2, **change)):
+            rows.append(row)
+            outcome = trial.step(page, rows)
+        assert outcome == reason
+        result = trial.finish(rows, outcome)
+        assert not result["ok"] and "eligible" in result["measurement"]["failed_checks"]
+
+
+@pytest.mark.parametrize("second_ok", [False, True])
+def test_retries_keep_independent_attempt_verdicts(tmp_path, monkeypatch, second_ok):
+    from argparse import Namespace
+
+    from docs.helpers import youtube_telemetry as telemetry
+
+    def stub(args, trial):
+        args.out.mkdir()
+        ok = second_ok and args.out.name == "attempt-2"
+        telemetry.dump(args.out / "summary.json", {"verification": {
+            "ok": ok, "outcome": "complete" if ok else "playback_interrupted",
+            "measurement": {"eligible_seconds": 900 if ok else 550}}})
+
+    monkeypatch.setattr(telemetry, "collect", stub)
+    monkeypatch.setattr(telemetry.os, "umask", lambda _: 0)
+    dest = tmp_path / "watch"
+    rc = telemetry.verify(Namespace(out=dest, verify="long", video=VIDEO, attempts=2))
+    report = json.loads((dest / "verification.json").read_text())
+    assert rc == (0 if second_ok else 2)
+    assert [r["ok"] for r in report["attempts"]] == [False, second_ok]

@@ -15,6 +15,9 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from collections import Counter
 from itertools import pairwise
@@ -284,7 +287,55 @@ def write_report(out, summary, samples):
     (out / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def collect(args):
+@contextlib.contextmanager
+def browser_context(pw, args):
+    flags = ["--no-proxy-server"]
+    if args.disable_quic:
+        flags.append("--disable-quic")
+    if not args.desktop_chrome:
+        browser = pw.chromium.launch(channel=args.channel, headless=False,
+                                     chromium_sandbox=True, args=flags)
+        try:
+            yield browser, browser.new_context(viewport={"width": 1440, "height": 900})
+        finally:
+            browser.close()
+        return
+
+    chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    if chrome is None:
+        raise OSError("desktop_chrome_missing")
+    with tempfile.TemporaryDirectory(prefix="xgw-chrome-") as profile:
+        port_file = Path(profile) / "DevToolsActivePort"
+        cmd = [chrome, *flags, f"--user-data-dir={profile}", "--remote-debugging-port=0",
+               "--remote-debugging-address=127.0.0.1", "--no-first-run",
+               "--no-default-browser-check", "--window-size=1440,900", "about:blank"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 25
+            while proc.poll() is None and time.monotonic() < deadline:
+                if port_file.exists():
+                    lines = port_file.read_text(encoding="ascii").splitlines()
+                    if (len(lines) == 2 and re.fullmatch("[0-9]{1,5}", lines[0])
+                            and 0 < int(lines[0]) <= 65535
+                            and re.fullmatch(r"/devtools/browser/[0-9a-f-]{36}", lines[1])):
+                        break
+                time.sleep(0.1)
+            else:
+                raise OSError("desktop_chrome_startup")
+            browser = pw.chromium.connect_over_cdp(f"ws://127.0.0.1:{lines[0]}{lines[1]}",
+                                                   timeout=10000)
+            yield browser, browser.contexts[0]
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+
+def collect(args, trial=None):
     # Optional dependency: no browser/OS access is needed to import the analyzer.
     from playwright.sync_api import Error, TimeoutError, sync_playwright
 
@@ -297,6 +348,7 @@ def collect(args):
     meta = {"schema": 1, "label": args.label, "video_id": args.video,
             "started_unix": time.time(), "requested_seconds": args.seconds,
             "channel": args.channel, "disable_quic": args.disable_quic,
+            "browser_launch": "desktop_cdp" if args.desktop_chrome else "playwright",
             "target_height": args.height, "route": "UNKNOWN"}
     dump(args.out / "run.json", meta)
     with (args.out / "network.jsonl").open("w", encoding="utf-8") as network_file, \
@@ -307,14 +359,8 @@ def collect(args):
 
         network = MediaNetwork(emit, clock)
         try:
-            with sync_playwright() as pw:
-                flags = ["--no-proxy-server"]
-                if args.disable_quic:
-                    flags.append("--disable-quic")
-                browser = pw.chromium.launch(channel=args.channel, headless=False,
-                                             chromium_sandbox=True, args=flags)
+            with sync_playwright() as pw, browser_context(pw, args) as (browser, context):
                 meta["browser_version"] = browser.version
-                context = browser.new_context(viewport={"width": 1440, "height": 900})
                 context.add_init_script(path=Path(__file__).with_suffix(".js"))
                 page = context.new_page()
                 session = context.new_cdp_session(page)
@@ -328,8 +374,11 @@ def collect(args):
                 with contextlib.suppress(TimeoutError):
                     page.goto("https://www.youtube.com/watch?v=" + args.video,
                               wait_until="domcontentloaded", timeout=30000)
-                print("Browser opened. Executor: start video, select quality, "
-                      "open Stats for nerds.", flush=True)
+                print("Browser opened. Select quality and handle consent if prompted.", flush=True)
+                if trial:
+                    page.bring_to_front()
+                else:
+                    print("Start the video and open Stats for nerds.", flush=True)
                 deadline = time.monotonic() + args.seconds
                 while time.monotonic() < deadline:
                     tick = time.monotonic()
@@ -343,21 +392,30 @@ def collect(args):
                     sample.update(t_s=clock(), unix=time.time(), network=network.snapshot(),
                                   gateway=gateway_snapshot(args.status_file, time.time()))
                     samples.append(sample)
-                    sample_file.write(json.dumps(sample, allow_nan=False) + "\n")
-                    sample_file.flush()
+                    # Store the sample even if navigating/closing the tab interrupts control.
+                    try:
+                        terminal = trial.step(page, samples) if trial else None
+                    finally:
+                        sample_file.write(json.dumps(sample, allow_nan=False) + "\n")
+                        sample_file.flush()
+                    if terminal:
+                        outcome = terminal
+                        break
                     if len(samples) % 60 == 0:
                         print(f"samples={len(samples)} media_bytes={network.encoded_bytes}",
                               flush=True)
                     page.wait_for_timeout(max(10, (1 - (time.monotonic() - tick)) * 1000))
+                else:
+                    if trial:
+                        outcome = "measurement_timeout"
                 for row in network.active.values():
                     emit({"kind": "inflight_at_stop", "at_s": clock(), **row})
                 # Intentional shutdown must not become a measured transport failure.
                 with contextlib.suppress(Error):
                     session.detach()
-                browser.close()
         except KeyboardInterrupt:
             outcome = "interrupted"
-        except Error:
+        except (Error, OSError):
             # Exception text may contain signed URLs or a browser command line.
             outcome = "browser_error"
         finally:
@@ -365,10 +423,35 @@ def collect(args):
             dump(args.out / "run.json", meta)
             summary = {**meta, **summarize(samples, args.video, args.height),
                        "network": network.snapshot()}
+            if trial:
+                summary["verification"] = trial.finish(samples, outcome)
             dump(args.out / "summary.json", summary)
             write_report(args.out, summary, samples)
             print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if outcome == "complete" and samples else 2
+
+
+def verify(args):
+    from docs.helpers.playback_trial import SECONDS, PlaybackTrial
+
+    os.umask(0o077)
+    args.out.mkdir(parents=True, exist_ok=False)
+    attempts = []
+    for attempt in range(1, args.attempts + 1):
+        folder = args.out / f"attempt-{attempt}"
+        options = argparse.Namespace(**(vars(args) | {
+            "out": folder, "seconds": SECONDS[args.verify] + 150,
+        }))
+        collect(options, PlaybackTrial(args.verify, args.video))
+        result = json.loads((folder / "summary.json").read_text(encoding="utf-8"))["verification"]
+        attempts.append(result)
+        report = {"ok": result["ok"], "attempts": attempts, "route_verdict": "UNKNOWN"}
+        dump(args.out / "verification.json", report)
+        if result["ok"] or result["outcome"] in (
+            "interrupted", "browser_closed", "seek_unavailable", "browser_error"
+        ):
+            break
+    return 0 if attempts[-1]["ok"] else 2
 
 
 def main():
@@ -376,9 +459,15 @@ def main():
     parser.add_argument("--video", required=True, help="Public YouTube video ID (11 characters)")
     parser.add_argument("--label", required=True, help="Trial label; not route evidence")
     parser.add_argument("--out", type=Path, required=True, help="New private output directory")
-    parser.add_argument("--seconds", type=int, default=1200, help="Collection after navigation")
+    parser.add_argument("--seconds", type=int, help="Passive collection time (default 1200 s)")
+    parser.add_argument("--verify", choices=("control", "long", "seek"),
+                        help="Start visible playback and measure 120/900/300 eligible seconds")
+    parser.add_argument("--attempts", type=int, choices=(1, 2), default=1,
+                        help="Maximum independent verification attempts")
     parser.add_argument("--height", type=int, choices=(480, 720, 1080, 1440, 2160), default=720)
     parser.add_argument("--channel", choices=("chrome", "chromium", "msedge"), default="chrome")
+    parser.add_argument("--desktop-chrome", action="store_true",
+                        help="Start installed Google Chrome with its own temporary desktop profile")
     parser.add_argument("--disable-quic", action="store_true", help="Use for the T04 TCP trial")
     parser.add_argument("--status-file", type=Path, help="Optional readable gateway status.json")
     args = parser.parse_args()
@@ -386,10 +475,20 @@ def main():
         parser.error("invalid public video ID")
     if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", args.label):
         parser.error("label must be 1..80 ASCII letters/digits/._-")
-    if not 30 <= args.seconds <= 3600:
+    if args.verify and (args.seconds is not None or args.height != 720):
+        parser.error("verification measures 720p for a fixed time")
+    if args.desktop_chrome and args.channel != "chrome":
+        parser.error("--desktop-chrome requires the chrome channel")
+    if args.attempts != 1 and not args.verify:
+        parser.error("--attempts requires --verify")
+    if args.seconds is not None and not 30 <= args.seconds <= 3600:
         parser.error("seconds must be between 30 and 3600")
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         parser.error("run as the desktop user, not root")
+    if args.verify:
+        return verify(args)
+    if args.seconds is None:
+        args.seconds = 1200
     return collect(args)
 
 

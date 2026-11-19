@@ -6,6 +6,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import time
 from collections import Counter
 from itertools import pairwise
@@ -155,6 +156,48 @@ def analyze(path):
         "note": "Status intervals do not prove playback or a free-pool recovery."}
 
 
+def matrix_report(path):
+    """Recount the ordered results from a single saved job or client status."""
+    with path.open("rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("matrix_size")
+    view = json.loads(raw)
+    if not isinstance(view, dict):
+        raise ValueError("matrix_object")
+    job = view.get("job", view)
+    if (not isinstance(job, dict) or not isinstance(job.get("id"), str)
+            or not re.fullmatch("[0-9a-f]{32}", job["id"])):
+        raise ValueError("matrix_job")
+    profiles, rounds, rows = job.get("candidates"), job.get("rounds"), job.get("results")
+    if (not isinstance(profiles, list) or not 1 <= len(profiles) <= len(CANDIDATES)
+            or any(p not in CANDIDATES for p in profiles) or len(set(profiles)) != len(profiles)
+            or type(rounds) is not int or rounds not in (1, 2) or not isinstance(rows, list)):
+        raise ValueError("matrix_schedule")
+    schedule = [(n + 1, p) for n in range(rounds) for p in profiles[::1 if n == 0 else -1]]
+    if len(rows) > len(schedule):
+        raise ValueError("extra_rows")
+    counts = Counter()
+    results = {p: [] for p in profiles}
+    for row, (n, profile) in zip(rows, schedule, strict=False):
+        if (not isinstance(row, dict) or type(row.get("round")) is not int
+                or (row["round"], row.get("candidate")) != (n, profile)
+                or row.get("state") not in ("active", "fallback", "blocked", "timeout", "error")):
+            raise ValueError("matrix_row_or_order")
+        state = row["state"]
+        counts[state] += 1
+        results[profile].append({"round": n, "state": state, "https_ok": (
+            state == "active" and row.get("transport") == "https_reachable")})
+    complete = (len(rows) == len(schedule) and job.get("state") == "complete"
+                and job.get("restore") == "pass")
+    passed_twice = [p for p, runs in results.items()
+                    if len(runs) == 2 and all(run["https_ok"] for run in runs)]
+    return {"ok": complete, "job_id": job["id"], "expected_rows": len(schedule),
+            "observed_rows": len(rows), "states": dict(counts), "profiles": results,
+            "full_matrix": complete and rounds == 2 and len(profiles) == len(CANDIDATES),
+            "two_https_pass": passed_twice, "playback": "NOT_MEASURED"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -173,10 +216,14 @@ def main():
     watch.add_argument("--interval", type=int, default=60)
     review = sub.add_parser("analyze")
     review.add_argument("input", type=Path)
+    matrix = sub.add_parser("matrix", help="Summarize one saved job without contacting the gateway")
+    matrix.add_argument("input", type=Path)
     args = parser.parse_args()
     try:
-        client = None if args.action == "analyze" else Client()
-        if args.action == "analyze":
+        client = None if args.action in ("analyze", "matrix") else Client()
+        if args.action == "matrix":
+            result = matrix_report(args.input)
+        elif args.action == "analyze":
             result = analyze(args.input)
         elif args.action == "monitor":
             result = monitor(client, args.output, args.seconds, args.interval)
@@ -210,6 +257,9 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("ok", True) else 2
     except (OSError, ValueError, KeyError, http.client.HTTPException):
+        if args.action == "matrix":
+            print(json.dumps({"ok": False, "error": "invalid_or_missing_job_snapshot"}))
+            return 2
         print(json.dumps({"ok": False, "error": "local_api_or_parameters",
                           "text": "Проверьте вход в панель и параметры команды."},
                          ensure_ascii=False))
