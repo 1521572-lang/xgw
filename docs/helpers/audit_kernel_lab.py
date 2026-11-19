@@ -132,31 +132,20 @@ def echo(port, mark=None, uid=None):
     return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
 
 
-def path_counters(nft):
-    counts = {}
-    for family, table in (("ip", nft.TABLE), ("inet", nft.GUARD)):
-        data = json.loads(run("nft", "-a", "-j", "list", "chain", family, table, "output"))
-        for item in data["nftables"]:
-            rule = item.get("rule", {})
-            for expr in rule.get("expr", []):
-                if "counter" in expr:
-                    key = f"{family}.output.{rule['handle']}"
-                    counts[key] = expr["counter"]["packets"]
-    return counts
-
-
-def tail_counters():
+def audit_counters(*, path=False):
+    # Read witness counters from our own table, independently of XGW rule listing.
     listing = json.loads(run("nft", "-j", "list", "table", "ip", "audit"))
     return {
         item["rule"]["comment"]: next(e["counter"]["packets"] for e in item["rule"]["expr"]
                                       if "counter" in e)
         for item in listing["nftables"] if "rule" in item
+        and item["rule"]["comment"].startswith("probe_") == path
     }
 
 
 def closes(peer, label, client=None):
     before = json.loads(request(peer, "counts"))
-    start = tail_counters()
+    start = audit_counters()
     codes = [echo(7443, uid=UID) if client is None else client() for _ in range(12)]
     # The peer serves each accepted TCP session before handling this IPC request.
     after = json.loads(request(peer, "counts"))
@@ -166,7 +155,7 @@ def closes(peer, label, client=None):
            and time.monotonic() < deadline):
         time.sleep(0.05)
         after = json.loads(request(peer, "counts"))
-    end = tail_counters()
+    end = audit_counters()
     emit({"phase": label, "attempts": len(codes), "client_ok": codes.count(0),
           "client_errors": codes.count(2),
           "peer": {k: after[k] - v for k, v in before.items()},
@@ -261,6 +250,23 @@ def accounting_trials(peer, rules, apply):
                 burst(fresh, "fresh_flow_after_enable")
 
 
+def list_rules(*argv, as_json=False):
+    """Keep the data-path measurement available when the listing command fails."""
+    try:
+        result = run("nft", *argv)
+        if as_json:
+            result = json.loads(result)
+            if not isinstance(result, dict) or not isinstance(result.get("nftables"), list):
+                return None, "invalid_output"
+        return result, "ok"
+    except subprocess.CalledProcessError as exc:
+        return None, f"exit:{exc.returncode}"
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except ValueError:
+        return None, "invalid_output"
+
+
 def lab(host_net, *, candidate=False, close_ab=False):
     # An anonymous network AND PID namespace are mandatory even when called by hand.
     if (os.getpid() != 1 or str(os.stat("/proc/self/ns/net").st_ino) == host_net
@@ -313,11 +319,14 @@ chain marked {{
  ip daddr {PEER} tcp dport 7443 meta mark 1 counter comment "marked_proxy"
  ip daddr {PEER} tcp dport 7443 meta mark 0 counter comment "marked_zero"
  ip daddr {PEER} tcp dport 7443 meta mark 2 tcp flags == ack counter comment "marked_bypass_ack"
+ ip daddr {PEER} tcp dport 443 meta mark 1 counter comment "probe_proxy"
 }}
 chain delivered {{
  type filter hook postrouting priority 11; policy accept;
  ip daddr {PEER} tcp dport 7443 oifname "audit0" counter comment "after_guard_wan"
  ip daddr {PEER} tcp dport 7443 oifname "audit-tun" counter comment "after_guard_tun"
+ ip daddr {PEER} tcp dport 443 oifname "audit0" counter comment "probe_wan"
+ ip daddr {PEER} tcp dport 443 oifname "audit-tun" counter comment "probe_tun"
 }}
 }}
 """)
@@ -327,9 +336,9 @@ chain delivered {{
                 run("nft", "-f", "-", script=nft.render(candidate) + nft.render_guard(candidate))
 
             def trial(name, mark, expected, uid=None):
-                before = path_counters(nft)
+                before = audit_counters(path=True)
                 code = echo(443, mark, uid)
-                delta = {k: v - before[k] for k, v in path_counters(nft).items()}
+                delta = {k: v - before[k] for k, v in audit_counters(path=True).items()}
                 emit({"phase": name, "echo_rc": code, "expected_rc": expected,
                       "counter_deltas": {k: v for k, v in delta.items() if v}})
 
@@ -340,15 +349,25 @@ chain delivered {{
             if close_ab:
                 expected = nft.render(rules)
                 table = ("ip", nft.TABLE)
-                initial = run("nft", "list", "table", *table)
+                initial, initial_status = list_rules("-t", "list", "table", *table)
             closes(peer, "close_xgw")
             if close_ab:
-                full = run("nft", "list", "table", *table)
-                emit({"phase": "rule_integrity",
-                      "manifest_ok": nft.manifest(expected, *table) == nft.manifest(full, *table),
-                      "stable": nft.structure(initial, *table) == nft.structure(full, *table)})
                 singbox_closes(peer, UID)
                 trial("other_uid_after_close", None, 1, UID - 1)
+                terse, terse_status = list_rules("-t", "list", "table", *table)
+                full, full_status = list_rules("list", "table", *table)
+                _, json_chain = list_rules("-a", "-j", "list", "chain", *table, "output",
+                                           as_json=True)
+                _, json_ruleset = list_rules("-j", "list", "ruleset", as_json=True)
+                manifest = nft.manifest(expected, *table)
+                emit({"phase": "rule_integrity", "text_initial": initial_status,
+                      "text_final": terse_status, "text_full": full_status,
+                      "json_chain": json_chain, "json_ruleset": json_ruleset,
+                      "manifest_ok": bool(terse and nft.manifest(terse, *table) == manifest),
+                      "stable": bool(initial and terse and full
+                                     and nft.structure(initial, *table)
+                                     == nft.structure(terse, *table)
+                                     == nft.structure(full, *table))})
             apply(replace(rules, zapret2_queue=200))
             trial("closed_selected_copy", zapret2.FAKE_MARK, 1)
             elems = ", ".join(f"{m:#x} timeout 30s" for m in (zapret2.MARK, zapret2.FAKE_MARK))
@@ -390,7 +409,13 @@ def assess_close(path, *, baseline):
                 "other_uid_after_close": 1, "closed_selected_copy": 1, "open_selected_copy": 0,
                 "open_selected_no_listener": 1, "engine_copy": 0, "engine_no_listener": 0,
                 "engine_other_uid": 1}
+    missing = sorted((controls.keys() | {"close_control", "close_xgw", "close_singbox",
+                                         "rule_integrity"}) - phases.keys())
+    if missing:
+        return {"missing_phases": missing, "synthetic_pass": False, "listing_pass": False}
     paths = {name: phases[name]["echo_rc"] == expected for name, expected in controls.items()}
+    protected = ("unmarked_other_uid", "other_uid_after_close", "engine_other_uid")
+    leaks = {name: phases[name]["counter_deltas"].get("probe_wan", 0) for name in protected}
     fib = [r for r in rows if r["phase"] == "fib"]
     marks = {"0x1", "0x2", "0x20000001", "0x20000012", "0x10000000", "0x50000000"}
     routing = (len(fib) == len(marks) and {r["mark"] for r in fib} == marks and
@@ -418,11 +443,15 @@ def assess_close(path, *, baseline):
     else:
         proxy_result = "MIXED_OR_FAILED"
     result = {"side": "old" if baseline else "new", "paths": paths, "fib": routing,
+              "protected_wan_packets": leaks,
               "control": control, "synthetic_expected": close(synthetic, old=baseline),
               "route_seen": route_seen, "integrity": integrity, "installed_binary": proxy_result}
-    result["synthetic_pass"] = all((all(paths.values()), routing, control,
-                                    result["synthetic_expected"], route_seen,
-                                    integrity["manifest_ok"], integrity["stable"]))
+    result["synthetic_pass"] = all((all(paths.values()), not any(leaks.values()), routing, control,
+                                    result["synthetic_expected"], route_seen))
+    result["listing_pass"] = integrity["manifest_ok"] and integrity["stable"] and all(
+        integrity.get(field) == "ok"
+        for field in ("text_initial", "text_final", "text_full", "json_chain", "json_ruleset")
+    )
     return result
 
 
@@ -437,6 +466,6 @@ if __name__ == "__main__":
     elif len(sys.argv) == 3 and sys.argv[1] in ("assess-old", "assess-new"):
         result = assess_close(sys.argv[2], baseline=sys.argv[1] == "assess-old")
         emit(result)
-        raise SystemExit(0 if result["synthetic_pass"] else 1)
+        raise SystemExit(0 if result["synthetic_pass"] and result["listing_pass"] else 1)
     else:
         raise SystemExit("use the published ThinkCentre audit assignment")

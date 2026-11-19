@@ -1110,27 +1110,35 @@ def test_singbox_close_only_restores_header_only_ack_of_local_tun_flow():
     arm, restore = [line for line in output if "@" + name in line]
     assert "meta skuid 27123 meta mark 0 ct direction original ct state established" in arm
     assert "== (fin | ack) fib daddr type unicast update" in arm
-    assert "ip saddr . ip daddr . tcp sport . tcp dport . ct id" in arm
+    assert "ip saddr . ip daddr . tcp sport . tcp dport }" in arm
+    bit = nft.SINGBOX_CLOSE_CT
+    assert arm.endswith(f"ct mark set ct mark or {bit:#x} counter return")
     assert "tcp flags == ack ip frag-off & 0x3fff == 0 ip hdrlength 5" in restore
-    assert all(f"{words} . {20 + 4 * words}" in restore for words in range(5, 16))
-    assert restore.endswith("counter meta mark set 0x11 return")
+    assert f"fib daddr type unicast ct mark & {bit:#x} != 0 ip saddr" in restore
+    assert restore.endswith(f"@{name} jump {nft.SINGBOX_ACK_CHAIN}")
+    ack_body = text.split(f"chain {nft.SINGBOX_ACK_CHAIN} {{", 1)[1].split("}", 1)[0]
+    assert [line.strip() for line in ack_body.splitlines() if line.strip()] == [
+        f"tcp doff {words} ip length {20 + 4 * words} counter meta mark set 0x11 accept"
+        for words in range(5, 16)
+    ]
     assert output.index(arm) < output.index("meta skuid 27123 return") < output.index(restore)
     assert output.index(restore) < len(output) - 1
     for other in (dataclasses.replace(rules, tun=False),
                   dataclasses.replace(rules, singbox_uid=None),
                   dataclasses.replace(rules, capture_local=False)):
         assert name not in nft.render(other)
+        assert nft.SINGBOX_ACK_CHAIN not in nft.render(other)
     assert name not in nft.render_guard(rules)
+    assert f"{bit:#x}" not in nft.render_guard(rules)
     assert name not in nft.render6(dataclasses.replace(rules, capture6=True))
 
 
 def test_singbox_close_set_keeps_rule_integrity_while_connections_expire():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     text = nft.render(dataclasses.replace(rules, tun=True, singbox_uid=27123))
-    listing = text.replace("typeof ip saddr . ip daddr . tcp sport . tcp dport . ct id",
-                           "type ipv4_addr . ipv4_addr . inet_service . inet_service . integer")
-    populated = listing.replace("size 4096", "size 4096\n        elements = { "
-                                "198.51.100.1 . 198.51.100.2 . 40960 . 443 . 1 expires 42s }")
+    listing = text
+    populated = listing.replace("size 4096", "size 4096\t# count 12\n        elements = { "
+                                "198.51.100.1 . 198.51.100.2 . 40960 . 443 expires 42s }")
     assert nft.manifest(text, "ip", nft.TABLE) == nft.manifest(populated, "ip", nft.TABLE)
     digest = nft.structure(populated, "ip", nft.TABLE)
     assert digest == nft.structure(listing, "ip", nft.TABLE)
