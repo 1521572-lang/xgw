@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ubuntu-only, bounded file overlay for batch 1. Does not change network configuration.
+"""Ubuntu-only, bounded file overlay for batch 1.
 
 Run prepare, arm the independent rollback timer from NEXT_STEP, then apply.
 Only root-owned immutable payloads are accepted. Unknown installed versions are refused.
@@ -78,6 +78,9 @@ SELECTIVE_JOBS_TIMER = "xgw-selective-jobs-rollback.timer"
 SELECTIVE_ADMISSION = ("zapret2.py", "watch/zapret2_control.py", "watch/panel.py",
                        "watch/zapret2_management.py", "desync/jobs.py")
 SELECTIVE_ADMISSION_TIMER = "xgw-selective-admission-rollback.timer"
+COMBINED_ADMISSION = (*SELECTIVE_ADMISSION, "daemon.py", "desync/client.py",
+                      "generator/profiles.py", "net/nft.py", "net/sysctl.py", "nfqws2.py")
+COMBINED_ADMISSION_TIMER = "xgw-combined-admission-rollback.timer"
 
 
 def gui_files(files):
@@ -142,18 +145,26 @@ def service(action, name="xgw.service"):
                           text=True, timeout=120).stdout.strip()
 
 
+def require_idle_workers():
+    for unit in ("xgw-nfqws2.service", "xgw-zapret2.service"):
+        probe = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
+                               text=True, timeout=10)
+        require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
+                "active/transitioning worker: stop and report, do not disable it")
+
+
 def prepare(args, backup):
     require(not (backup / "manifest.json").exists(), "backup already prepared")
     payload = bounded(args.payload, "/opt/xgw")
     package = bounded(args.package, "/opt/xgw")
     require(package.name == "xgw" and package.is_dir(), "expected installed xgw package")
     require(service("is-active") == "active", "daemon must initially be active")
-    for unit in ("xgw-nfqws2.service", "xgw-zapret2.service"):
-        probe = subprocess.run(["systemctl", "is-active", unit], capture_output=True,
-                               text=True, timeout=10)
-        require(probe.stdout.strip() in ("inactive", "failed", "unknown"),
-                "active/transitioning worker: stop and report, do not disable it")
     files, _timer = overlay(args)
+    if files == COMBINED_ADMISSION:
+        # Snapshot the owner's policy before arming rollback and switching to off/off.
+        require(service("is-active", "xgw-net.service") == "active", "network unit is unavailable")
+    else:
+        require_idle_workers()
     gui_overlay = gui_files(files)
     require(not args.gui or bool(gui_overlay), "this overlay is backend only")
     pairs = [(payload / "code/src/xgw" / rel, package / rel,
@@ -219,27 +230,37 @@ def restore(backup, rows):
             atomic(target, (backup / row["old"]).read_bytes(), row["mode"], row["gid"])
 
 
-def apply(backup, rows, timer=TIMER):
+def start_services(*, reload_net):
+    if reload_net:
+        service("reload", "xgw-net.service")
+    service("start")
+
+
+def apply(backup, rows, timer=TIMER, *, reload_net=False):
     require(service("is-active", timer) == "active",
             "arm independent rollback timer before apply")
     for row in rows:
         target = Path(row["target"])
         actual = sha(target.read_bytes()) if target.exists() else None
         require(actual == row["old_sha"], "installed files changed after prepare")
+    if reload_net:
+        require_idle_workers()
     service("stop")
     try:
         for row in rows:
             atomic(Path(row["target"]), (backup / row["new"]).read_bytes(),
                    row["mode"], row["gid"])
-        service("start")
+        start_services(reload_net=reload_net)
     except BaseException:
         service("stop")
         restore(backup, rows)
-        service("start")
+        start_services(reload_net=reload_net)
         raise
 
 
 def overlay(args):
+    if getattr(args, "combined_admission", False):
+        return COMBINED_ADMISSION, COMBINED_ADMISSION_TIMER
     if getattr(args, "selective_admission", False):
         return SELECTIVE_ADMISSION, SELECTIVE_ADMISSION_TIMER
     if getattr(args, "selective_jobs", False):
@@ -317,6 +338,7 @@ def main():
     stage.add_argument("--selective-budget", action="store_true")
     stage.add_argument("--selective-jobs", action="store_true")
     stage.add_argument("--selective-admission", action="store_true")
+    stage.add_argument("--combined-admission", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -332,12 +354,13 @@ def main():
         else:
             files, timer = overlay(args)
             rows = records(backup, files)
+            reload_net = files == COMBINED_ADMISSION
             if args.action == "apply":
-                apply(backup, rows, timer)
+                apply(backup, rows, timer, reload_net=reload_net)
             else:
                 service("stop")
                 restore(backup, rows)
-                service("start")
+                start_services(reload_net=reload_net)
     print(args.action + ": complete")
 
 

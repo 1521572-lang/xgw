@@ -316,3 +316,39 @@ def test_partial_deploy_failure_restores_old_files_and_restarts(tmp_path, instal
         module.apply(tmp_path, rows)
     assert original.read_bytes() == b"old" and not added.exists()
     assert calls[-1] == ("start", "xgw.service") or calls[-1] == ("start",)
+
+
+def test_combined_install_reloads_old_network_rules_when_reload_fails(tmp_path, monkeypatch):
+    file = Path(__file__).parents[1] / "docs/helpers/desync_batch1_install.py"
+    spec = importlib.util.spec_from_file_location("combined_install", file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    target = tmp_path / "net_rules.py"
+    target.write_bytes(b"old")
+    (tmp_path / "0.old").write_bytes(b"old")
+    (tmp_path / "0.new").write_bytes(b"new")
+    rows = [{"target": str(target), "old_sha": module.sha(b"old"), "old": "0.old",
+             "new": "0.new", "mode": 0o644, "gid": 0}]
+    calls = []
+
+    def service(action, unit="xgw.service"):
+        content = target.read_bytes()
+        calls.append((action, unit, content))
+        if action == "reload" and content == b"new":
+            raise OSError("new rules failed")
+        return "active"
+
+    monkeypatch.setattr(module, "service", service)
+    monkeypatch.setattr(module, "trusted", lambda path: None)
+    monkeypatch.setattr(module, "atomic", lambda path, data, *args: path.write_bytes(data))
+    monkeypatch.setattr(module, "require_idle_workers", lambda: None)
+    with pytest.raises(OSError, match="new rules failed"):
+        module.apply(tmp_path, rows, module.COMBINED_ADMISSION_TIMER, reload_net=True)
+    assert calls == [
+        ("is-active", module.COMBINED_ADMISSION_TIMER, b"old"),
+        ("stop", "xgw.service", b"old"),
+        ("reload", "xgw-net.service", b"new"),
+        ("stop", "xgw.service", b"new"),
+        ("reload", "xgw-net.service", b"old"),
+        ("start", "xgw.service", b"old"),
+    ]
