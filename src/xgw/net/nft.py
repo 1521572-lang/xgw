@@ -93,6 +93,9 @@ GUARD_TABLE = GUARD
 # It is independent of packet marks (Xray, containers and tailscaled).
 GUARD_CT = 0x20000000
 _GUARD_APPROVE = f"ct mark set ct mark or {GUARD_CT:#x}"
+SINGBOX_CLOSE_SET = "singbox_tcp_close"
+_CLOSE_KEY = "ip saddr . ip daddr . tcp sport . tcp dport . ct id"
+_CLOSE_TYPE = "ipv4_addr . ipv4_addr . inet_service . inet_service . integer"
 TS_SET = "ts_direct"  # метка tailscaled, которая идёт мимо Xray (Т1)
 TS_EXIT_SET = "ts_exit_direct"  # устройства tailnet, выходящие через шлюз напрямую
 TS_MARK = f"{ts.MARK:#x}"
@@ -270,6 +273,25 @@ def singbox_user_uid() -> int | None:
 
 def _singbox_skip(rules: Rules, verdict: str) -> list[str]:
     return [] if rules.singbox_uid is None else [f"meta skuid {rules.singbox_uid} {verdict}"]
+
+
+def _singbox_output4(rules: Rules) -> list[str]:
+    normal = _singbox_skip(rules, "return")
+    if not rules.tun or rules.singbox_uid is None:
+        return normal
+    # After close(), the kernel can send the last ACK without the socket's UID.
+    # Only a FIN from the dedicated UID can insert this local flow into the set.
+    flow = "meta mark 0 ct direction original ct state established"
+    arm = (f"meta skuid {rules.singbox_uid} {flow} tcp flags & (fin | syn | rst | ack) "
+           f"== (fin | ack) fib daddr type unicast update @{SINGBOX_CLOSE_SET} "
+           f"{{ {_CLOSE_KEY} }} counter return")
+    # ACK flags alone also match data. With an ordinary 20-byte IPv4 header,
+    # total length must equal that header plus the TCP header (including options).
+    lengths = ", ".join(f"{words} . {20 + 4 * words}" for words in range(5, 16))
+    tail = (f"{flow} tcp flags == ack ip frag-off & 0x3fff == 0 ip hdrlength 5 "
+            f"tcp doff . ip length {{ {lengths} }} {_CLOSE_KEY} @{SINGBOX_CLOSE_SET} "
+            f"counter meta mark set {rules.mark_bypass:#x} return")
+    return [arm, *normal, tail]
 
 
 def _nfq_generated_skip(rules: Rules, verdict: str) -> list[str]:
@@ -731,10 +753,13 @@ def render(rules: Rules) -> str:
             )
         )
     if rules.capture_local:
+        if rules.tun and rules.singbox_uid is not None:
+            blocks.append([f"set {SINGBOX_CLOSE_SET} {{", f"    typeof {_CLOSE_KEY}",
+                           "    flags dynamic,timeout", "    timeout 2m", "    size 4096", "}"])
         output = [
             *_nfq_generated_skip(rules, "return"),
             f"meta mark {bypass} return",  # сокеты Xray и прямые запросы XGW
-            *_singbox_skip(rules, "return"),
+            *_singbox_output4(rules),
             *(_ts_skip("return") if rules.ts4 else []),
             "ct direction reply return",  # ответы на входящие соединения (SSH на шлюз)
             f"meta mark {zapret2.MARKS} return",  # отдельный барьер в xgw_guard
@@ -1327,16 +1352,16 @@ def structure(text: str, family: str, table: str) -> str:
     наборов в кратком выводе нет) и полных наборов, которые listing(sets=…) ставит перед ней."""
     start = text.rfind(f"table {family} {table} {{")
     result = _COUNTER.sub("counter", text[start:] if start >= 0 else text)
-    if family == "inet" and table == GUARD:
-        # Lease и остаток TTL меняются каждый шаг; правила/тип/flags набора проверяются
-        # как раньше. Само разрешающее правило ограничено двумя фиксированными метками.
-        def without_lease(match: re.Match) -> str:
-            if match.group(1) != zapret2.LIVE:
+    dynamic = {("inet", GUARD): zapret2.LIVE, ("ip", TABLE): SINGBOX_CLOSE_SET}.get((family, table))
+    if dynamic:
+        # A full listing includes expiring elements. Keep the declaration and rules.
+        def without_elements(match: re.Match) -> str:
+            if match.group(1) != dynamic:
                 return match.group(0)
             return re.sub(r"^[ \t]*elements\s*=\s*\{[^}]*\}[ \t]*\n?", "",
                           match.group(0), flags=re.MULTILINE)
 
-        result = _SET.sub(without_lease, result)
+        result = _SET.sub(without_elements, result)
     return result
 
 
@@ -1408,6 +1433,9 @@ def manifest(text: str, family: str, table: str) -> dict[str, tuple] | None:
         before = found.get(f"chain {name}", ("", "", "", 0))
         found[f"chain {name}"] = (*(head if hook else before[:3]), before[3] + rules)
     for name, body in _SET.findall(text[start:]):
+        if family == "ip" and table == TABLE and name == SINGBOX_CLOSE_SET:
+            # nft lists the concrete type of our typeof expression.
+            body = body.replace(f"typeof {_CLOSE_KEY}\n", f"type {_CLOSE_TYPE}\n")
         kind = re.search(r"^\s*type (.+?);?\s*$", body, flags=re.MULTILINE)
         flags = re.search(r"^\s*flags (.+?);?\s*$", body, flags=re.MULTILINE)
         found[f"set {name}"] = (kind.group(1) if kind else "", flags.group(1) if flags else "")

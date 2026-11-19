@@ -1101,6 +1101,42 @@ def test_dedicated_singbox_uid_has_bypass_and_loopback_refusal(monkeypatch):
         assert "meta skuid 27123 accept" in nft.render_guard(rules)
 
 
+def test_singbox_close_only_restores_header_only_ack_of_local_tun_flow():
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    rules = dataclasses.replace(rules, tun=True, singbox_uid=27123, mark_bypass=17)
+    text = nft.render(rules)
+    output = _chain(text, "output")
+    name = nft.SINGBOX_CLOSE_SET
+    arm, restore = [line for line in output if "@" + name in line]
+    assert "meta skuid 27123 meta mark 0 ct direction original ct state established" in arm
+    assert "== (fin | ack) fib daddr type unicast update" in arm
+    assert "ip saddr . ip daddr . tcp sport . tcp dport . ct id" in arm
+    assert "tcp flags == ack ip frag-off & 0x3fff == 0 ip hdrlength 5" in restore
+    assert all(f"{words} . {20 + 4 * words}" in restore for words in range(5, 16))
+    assert restore.endswith("counter meta mark set 0x11 return")
+    assert output.index(arm) < output.index("meta skuid 27123 return") < output.index(restore)
+    assert output.index(restore) < len(output) - 1
+    for other in (dataclasses.replace(rules, tun=False),
+                  dataclasses.replace(rules, singbox_uid=None),
+                  dataclasses.replace(rules, capture_local=False)):
+        assert name not in nft.render(other)
+    assert name not in nft.render_guard(rules)
+    assert name not in nft.render6(dataclasses.replace(rules, capture6=True))
+
+
+def test_singbox_close_set_keeps_rule_integrity_while_connections_expire():
+    rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
+    text = nft.render(dataclasses.replace(rules, tun=True, singbox_uid=27123))
+    listing = text.replace("typeof ip saddr . ip daddr . tcp sport . tcp dport . ct id",
+                           "type ipv4_addr . ipv4_addr . inet_service . inet_service . integer")
+    populated = listing.replace("size 4096", "size 4096\n        elements = { "
+                                "198.51.100.1 . 198.51.100.2 . 40960 . 443 . 1 expires 42s }")
+    assert nft.manifest(text, "ip", nft.TABLE) == nft.manifest(populated, "ip", nft.TABLE)
+    digest = nft.structure(populated, "ip", nft.TABLE)
+    assert digest == nft.structure(listing, "ip", nft.TABLE)
+    assert digest != nft.structure(populated.replace("size 4096", "size 64"), "ip", nft.TABLE)
+
+
 def test_guard_manifest_counts_wrapped_anonymous_set_as_one_rule():
     rules, _ = nft.build_rules(_cfg(), capture=True, time_uids=())
     text = nft.render_guard(rules)

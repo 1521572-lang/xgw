@@ -202,6 +202,25 @@ def test_monitor_analysis_preserves_gaps_and_does_not_claim_playback(tmp_path):
     assert result["large_or_backward_gaps"] == 1
 
 
+def test_monitor_separates_policy_from_state_and_reads_legacy_journals(tmp_path):
+    first = client.observation({"zapret2": {"config_key": "a", "state": "off",
+                               "fresh": True, "policy_matched": True, "mode": "off",
+                               "engine_mode": "off"}})
+    assert first["engine_mode"] == "off"
+    legacy = dict(first)
+    del legacy["engine_mode"]
+    standalone = first | {"config_key": "b", "mode": "standalone", "state": "active"}
+    rows = [legacy, legacy, first, first, standalone, standalone | {"state": "fallback"},
+            standalone | {"fresh": False}, first | {"config_key": None},
+            first | {"config_key": None}]
+    path = tmp_path / "day.jsonl"
+    path.write_text("\n".join(json.dumps(row | {"at": 60 * i}) for i, row in enumerate(rows)))
+    stats = client.analyze(path)
+    assert stats["policy_interval_seconds"] == {
+        "off/unknown": 60, "off/off": 60, "standalone/off": 60, "unconfirmed": 300}
+    assert stats["elapsed_seconds"] == 480
+
+
 def test_corrupt_job_does_not_prevent_start(job_store):
     instance, _path, _policy = job_store
     instance.directory.mkdir()

@@ -9,6 +9,7 @@ import selectors
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -153,17 +154,72 @@ def tail_counters():
     }
 
 
-def closes(peer, label):
+def closes(peer, label, client=None):
     before = json.loads(request(peer, "counts"))
     start = tail_counters()
-    codes = [echo(7443, uid=UID) for _ in range(12)]
+    codes = [echo(7443, uid=UID) if client is None else client() for _ in range(12)]
     # The peer serves each accepted TCP session before handling this IPC request.
     after = json.loads(request(peer, "counts"))
+    # An asynchronous proxy may still be forwarding the last client's FIN.
+    deadline = time.monotonic() + 3
+    while (after["client_fin"] - before["client_fin"] < codes.count(0)
+           and time.monotonic() < deadline):
+        time.sleep(0.05)
+        after = json.loads(request(peer, "counts"))
     end = tail_counters()
     emit({"phase": label, "attempts": len(codes), "client_ok": codes.count(0),
           "client_errors": codes.count(2),
           "peer": {k: after[k] - v for k, v in before.items()},
           "output": {k: end[k] - v for k, v in start.items()}})
+
+
+def through_singbox():
+    try:
+        with (socket.create_connection(("127.0.0.1", 17443), timeout=3) as client,
+              client.makefile("rb") as response):
+            target = f"{PEER}:7443"
+            client.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+            if response.readline(1024).split()[1:2] != [b"200"]:
+                return 2
+            for _ in range(16):
+                if response.readline(1024) == b"\r\n":
+                    client.sendall(b"x")
+                    return 0 if response.read(1) == b"x" else 1
+    except OSError:
+        return 1
+    return 2
+
+
+def singbox_closes(peer, uid):
+    binary = Path("/opt/xgw/sing-box/sing-box")
+    if not binary.is_file():
+        emit({"phase": "close_singbox", "blocked": "missing_installed_binary"})
+        return
+    config = {"inbounds": [{"type": "http", "listen": "127.0.0.1", "listen_port": 17443}],
+              "outbounds": [{"type": "direct", "tag": "direct"}]}
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "config.json"
+        path.write_text(json.dumps(config), encoding="ascii")
+        path.chmod(0o444)
+        Path(directory).chmod(0o711)
+        args = ["setpriv", "--no-new-privs", "--bounding-set=-all", "--clear-groups",
+                f"--reuid={uid}", f"--regid={uid}", str(binary), "run", "-c", str(path)]
+        with subprocess.Popen(args, cwd="/", stdout=subprocess.DEVNULL) as proc:
+            try:
+                end = time.monotonic() + 5
+                while proc.poll() is None and time.monotonic() < end:
+                    try:
+                        with socket.create_connection(("127.0.0.1", 17443), timeout=0.3):
+                            break
+                    except OSError:
+                        time.sleep(0.1)
+                else:
+                    emit({"phase": "close_singbox", "blocked": "startup", "rc": proc.poll()})
+                    return
+                closes(peer, "close_singbox", through_singbox)
+            finally:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 def accounting_trials(peer, rules, apply):
@@ -205,12 +261,12 @@ def accounting_trials(peer, rules, apply):
                 burst(fresh, "fresh_flow_after_enable")
 
 
-def lab(host_net, *, candidate=False):
+def lab(host_net, *, candidate=False, close_ab=False):
     # An anonymous network AND PID namespace are mandatory even when called by hand.
     if (os.getpid() != 1 or str(os.stat("/proc/self/ns/net").st_ino) == host_net
             or {i["ifname"] for i in json.loads(run("ip", "-j", "link"))} != {"lo"}):
         raise RuntimeError("a new empty network and PID namespace is required")
-    # Use the exact installed renderer. No systemctl, XGW daemon or configuration writes.
+    # Load only the renderer selected by the assignment.
     sys.dont_write_bytecode = True
     lib = Path(__file__).parent / "src" if candidate else Path("/opt/xgw/lib")
     if not (lib / "xgw/net/nft.py").is_file():
@@ -256,6 +312,7 @@ chain marked {{
  type filter hook output priority -149; policy accept;
  ip daddr {PEER} tcp dport 7443 meta mark 1 counter comment "marked_proxy"
  ip daddr {PEER} tcp dport 7443 meta mark 0 counter comment "marked_zero"
+ ip daddr {PEER} tcp dport 7443 meta mark 2 tcp flags == ack counter comment "marked_bypass_ack"
 }}
 chain delivered {{
  type filter hook postrouting priority 11; policy accept;
@@ -280,7 +337,18 @@ chain delivered {{
             trial("bypass_control", 2, 0)
             trial("unmarked_other_uid", None, 1, UID - 1)
             trial("off_selected_copy", zapret2.FAKE_MARK, 1)
+            if close_ab:
+                expected = nft.render(rules)
+                table = ("ip", nft.TABLE)
+                initial = run("nft", "list", "table", *table)
             closes(peer, "close_xgw")
+            if close_ab:
+                full = run("nft", "list", "table", *table)
+                emit({"phase": "rule_integrity",
+                      "manifest_ok": nft.manifest(expected, *table) == nft.manifest(full, *table),
+                      "stable": nft.structure(initial, *table) == nft.structure(full, *table)})
+                singbox_closes(peer, UID)
+                trial("other_uid_after_close", None, 1, UID - 1)
             apply(replace(rules, zapret2_queue=200))
             trial("closed_selected_copy", zapret2.FAKE_MARK, 1)
             elems = ", ".join(f"{m:#x} timeout 30s" for m in (zapret2.MARK, zapret2.FAKE_MARK))
@@ -292,7 +360,7 @@ chain delivered {{
             trial("engine_copy", 2 | nfqws2.FAKE_MARK, 0)
             trial("engine_no_listener", 2, 0)
             trial("engine_other_uid", None, 1, UID - 1)
-            if candidate:
+            if candidate and not close_ab:
                 accounting_trials(peer, rules, apply)
             # Exercise the actual routines used by Capture.restore_tun independently
             # of the dummy used above. TUN may be unavailable under hardening.
@@ -312,13 +380,63 @@ chain delivered {{
             peer.wait(timeout=5)
 
 
+def assess_close(path, *, baseline):
+    with Path(path).open(encoding="ascii") as stream:
+        rows = [json.loads(line) for line in stream]
+    phases = {r["phase"]: r for r in rows if r["phase"] != "fib"}
+    if len(phases) != sum(r["phase"] != "fib" for r in rows):
+        raise ValueError("duplicate phase")
+    controls = {"bypass_control": 0, "unmarked_other_uid": 1, "off_selected_copy": 1,
+                "other_uid_after_close": 1, "closed_selected_copy": 1, "open_selected_copy": 0,
+                "open_selected_no_listener": 1, "engine_copy": 0, "engine_no_listener": 0,
+                "engine_other_uid": 1}
+    paths = {name: phases[name]["echo_rc"] == expected for name, expected in controls.items()}
+    fib = [r for r in rows if r["phase"] == "fib"]
+    marks = {"0x1", "0x2", "0x20000001", "0x20000012", "0x10000000", "0x50000000"}
+    routing = (len(fib) == len(marks) and {r["mark"] for r in fib} == marks and
+               all(r["dev"] == ("audit-tun" if r["mark"] == "0x1" else "audit0") for r in fib))
+
+    def close(row, *, old):
+        p = row["peer"]
+        transfer = (row["attempts"] == row["client_ok"] == p["echo"] == p["client_fin"] == 12
+                    and row["client_errors"] == p["errors"] == p["other_at_deadline"] == 0)
+        return transfer and (p["final_ack"], p["last_ack_at_deadline"]) == (
+            (0, 12) if old else (12, 0))
+
+    control = close(phases["close_control"], old=False)
+    synthetic = phases["close_xgw"]
+    delta = synthetic["output"]
+    route_seen = delta["after_guard_tun"] > 0 if baseline else delta["marked_bypass_ack"] >= 12
+    integrity = phases["rule_integrity"]
+    proxy = phases["close_singbox"]
+    if "blocked" in proxy:
+        proxy_result = "BLOCKED"
+    elif close(proxy, old=False):
+        proxy_result = "CLOSED"
+    elif close(proxy, old=True):
+        proxy_result = "LAST_ACK"
+    else:
+        proxy_result = "MIXED_OR_FAILED"
+    result = {"side": "old" if baseline else "new", "paths": paths, "fib": routing,
+              "control": control, "synthetic_expected": close(synthetic, old=baseline),
+              "route_seen": route_seen, "integrity": integrity, "installed_binary": proxy_result}
+    result["synthetic_pass"] = all((all(paths.values()), routing, control,
+                                    result["synthetic_expected"], route_seen,
+                                    integrity["manifest_ok"], integrity["stable"]))
+    return result
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["peer"]:
         # Never listen in the host namespace on a stray direct invocation.
         if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
             raise SystemExit("peer isolation required")
         peer_server()
-    elif len(sys.argv) == 3 and sys.argv[1] in ("lab", "candidate"):
-        lab(sys.argv[2], candidate=sys.argv[1] == "candidate")
+    elif len(sys.argv) == 3 and sys.argv[1] in ("lab", "candidate", "close-ab"):
+        lab(sys.argv[2], candidate=sys.argv[1] != "lab", close_ab=sys.argv[1] == "close-ab")
+    elif len(sys.argv) == 3 and sys.argv[1] in ("assess-old", "assess-new"):
+        result = assess_close(sys.argv[2], baseline=sys.argv[1] == "assess-old")
+        emit(result)
+        raise SystemExit(0 if result["synthetic_pass"] else 1)
     else:
         raise SystemExit("use the published ThinkCentre audit assignment")

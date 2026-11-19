@@ -58,7 +58,8 @@ def observation(state):
     return {
         "at": time.time(), "utc_day": time.strftime("%Y-%m-%d", time.gmtime()),
         "health": state.get("state"), "updated": state.get("updated"),
-        "mode": card.get("mode"), "state": card.get("state"),
+        "mode": card.get("mode"), "engine_mode": card.get("engine_mode"),
+        "state": card.get("state"),
         "reason": card.get("reason"), "fresh": card.get("fresh"),
         "policy_matched": card.get("policy_matched"),
         "config_key": card.get("config_key"),
@@ -105,6 +106,14 @@ def monitor(client, output, seconds, interval):
             "seconds": seconds, "output": str(output)}
 
 
+def _policy_label(row):
+    selected, engine = row.get("mode"), row.get("engine_mode")
+    if selected not in ("off", "selective", "standalone") or engine not in (None, "off", "auto"):
+        return None
+    # Older journals stored the Selected mode but omitted the Engine setting.
+    return f"{selected}/{engine or 'unknown'}"
+
+
 def analyze(path):
     if path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("monitor_size_limit")
@@ -117,26 +126,30 @@ def analyze(path):
             rows.append(row)
             if len(rows) > 6002:
                 raise ValueError("monitor_sample_limit")
-    durations, boundaries, gaps = Counter(), 0, 0
+    durations, policies = Counter(), Counter()
+    boundaries = gaps = 0
     for first, last in pairwise(rows):
         elapsed = last["at"] - first["at"]
         if not 0 < elapsed <= 600:
             gaps += 1
             continue
-        if (first.get("fresh") and last.get("fresh") and first.get("policy_matched")
-                and last.get("policy_matched")
-                and first.get("config_key") == last.get("config_key")
-                and first.get("state") == last.get("state")):
-            durations[str(first["state"])] += elapsed
-        else:
-            durations["unconfirmed"] += elapsed
+        key = first.get("config_key")
+        matched = (isinstance(key, str) and bool(key) and key == last.get("config_key")
+                   and all(row.get("fresh") is True and row.get("policy_matched") is True
+                           for row in (first, last)))
+        state, mode = first.get("state"), _policy_label(first)
+        same_state = matched and isinstance(state, str) and state and state == last.get("state")
+        durations[state if same_state else "unconfirmed"] += elapsed
+        same_mode = matched and mode and mode == _policy_label(last)
+        policies[mode if same_mode else "unconfirmed"] += elapsed
         a, b = first.get("budget") or {}, last.get("budget") or {}
         if (isinstance(a.get("resets_at"), int) and isinstance(b.get("resets_at"), int)
                 and b["resets_at"] - a["resets_at"] == 86400):
             boundaries += 1
     return {"samples": len(rows), "elapsed_seconds": (
         rows[-1]["at"] - rows[0]["at"] if rows else 0),
-        "confirmed_interval_seconds": dict(durations), "large_or_backward_gaps": gaps,
+        "confirmed_interval_seconds": dict(durations), "policy_interval_seconds": dict(policies),
+        "large_or_backward_gaps": gaps,
         "utc_boundary_sample_pairs": boundaries,
         "api_errors": sum(bool(r.get("error")) for r in rows),
         "note": "Status intervals do not prove playback or a free-pool recovery."}
