@@ -143,4 +143,4 @@ test_notify_page ×2 (токен/только чтение), test_panel ×2 (coo
   приборов из /run; смена поколения — не зафиксирована.
 - Приватные артефакты (rules, journal, kernel.err, contracts.log) остаются в
   локальном каталоге опыта (0700), вне Git.
-- Publication commit: `добавляется после push`.
+- Publication commit: `a9ec50a1dc13f0f05271a9b79383db0ea833fdcf` (a7e9ac9 → a9ec50a, remote verified byte-identical).
