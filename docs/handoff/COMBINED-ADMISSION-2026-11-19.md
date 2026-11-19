@@ -1,7 +1,7 @@
 # Единая приёмка бюджета, маршрутизации и воспроизведения
 
 Редакция 19.11.2026. ThinkCentre, Ubuntu **24.04 LTS**, amd64.
-Код **d818e809ea42221e70882b61c75d29e8f1eb3048**.
+Код **08d31ee93963bb00acb7a2275e7a554efcfb0f05**.
 Установленная база **3630b44502b872ca3788e0824c6a9d0d8363b561**,
 принятая [отчётом 19 ноября](../reports/2026-11-19_combined-open-blocks.md).
 База 3d117b1 здесь больше не используется для установки.
@@ -13,6 +13,8 @@
 включая готовый Python-блок проверки API, написаны Codex и исполняются без правок.
 
 ## Что принято и что остаётся
+
+На предыдущем проходе пакета d818e80 прошли 242 основных, 10 API и 5 сетевых тестов. Установку остановило сравнение цепочек output у TUN и TPROXY. Тест теперь подставляет UID sing-box и проверяет оба правила TCP close на своих местах, сохраняя точное сравнение остальных правил. Повтори §2. После прохождения проверки продолжай с §3. [Отчёт о блокере](../reports/2026-11-19_admission-matrix.md)
 
 Установка 8/8, контракт Flowseal, задания и их возврат приняты на 3630b44.
 Standalone воспроизводил 720p и закрылся после SIGKILL без самовключения VPN.
@@ -31,10 +33,11 @@ WAN IPv6 отсутствует: NOT_APPLICABLE_ON_THIS_HOST, не блокер.
 
 ## 1. Завершить прежнее наблюдение и восстановить исходную политику
 
-В последнем отчёте на 17,24 ч наблюдения зафиксированы интервалы off и standalone.
+В предыдущих отчётах зафиксированы интервалы off и standalone. На момент
+последнего отчёта наблюдение продолжалось около 18,2 ч.
 Проверь завершение user-unit xgw-combined-monitor-1795041850 и состояние
 xgw-combined-day-rollback.timer перед установкой. Пока монитор работает, можно
-выполнить §2 в отдельном checkout. [Последний отчёт](../reports/2026-11-19T160130Z_tcp-close-ab-r2.md)
+выполнить §2 в отдельном checkout. [Последний отчёт](../reports/2026-11-19_admission-matrix.md)
 
 Начни от пользователя рабочего стола, в Bash:
 
@@ -49,7 +52,7 @@ uname -r
 /usr/sbin/nft --version
 REPO=$(git rev-parse --show-toplevel)
 BR=integration/zapret2-batch1
-CODE=d818e809ea42221e70882b61c75d29e8f1eb3048
+CODE=08d31ee93963bb00acb7a2275e7a554efcfb0f05
 OLD=3630b44502b872ca3788e0824c6a9d0d8363b561
 GUI_BASE=7c20f59023ec39e5c5ce4606767ea915c3b91f64
 git fetch origin "$BR"
@@ -127,6 +130,7 @@ sudo systemctl stop xgw-selective-jobs-rollback.timer
   tests/test_nfqws2.py::EngineTests::test_accounting_controls_engine_rules_and_warnings \
   tests/test_nfqws2.py::EngineTests::test_accounting_loss_stops_worker_and_skips_engine_profiles \
   tests/test_nfqws2.py::EngineTests::test_nfqueue_is_bounded_fail_open_and_loop_free \
+  tests/test_nft.py::test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain \
   tests/test_nft.py::test_singbox_close_only_restores_header_only_ack_of_local_tun_flow \
   tests/test_nft.py::test_singbox_close_set_keeps_rule_integrity_while_connections_expire \
   --junitxml="$D/network-contracts.xml" >"$D/network-contracts.log" 2>&1
