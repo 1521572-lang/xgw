@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "XGW Playback Recorder",
+  "version": "1.0.0",
+  "permissions": ["activeTab", "scripting"],
+  "action": {
+    "default_title": "XGW Playback Recorder",
+    "default_popup": "popup.html"
+  }
+}

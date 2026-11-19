@@ -43,6 +43,55 @@ def changed(t, **changes):
     return dict(sample(t), **changes)
 
 
+def test_read_netlog_counts_only_successful_media_streams(tmp_path):
+    from docs.helpers.playback_netlog import read_media
+
+    events = []
+    kinds = {}
+
+    def event(kind, source, time, **params):
+        code = kinds.setdefault(kind, len(kinds))
+        events.append({"type": code, "source": {"id": source}, "time": str(time),
+                       "params": params})
+
+    event("TCP_CONNECT_ATTEMPT", 8, 100, remote_address="[::ffff:203.0.113.1]:443")
+    event("HTTP2_SESSION_INITIALIZED", 10, 120, source_dependency={"id": 8})
+    for stream, status in ((1, "206"), (3, "403")):
+        event("HTTP2_SESSION_SEND_HEADERS", 10, 150, stream_id=stream,
+              headers=[":authority: r1.googlevideo.com", ":method: POST",
+                       ":path: /videoplayback?sig=private"])
+        event("HTTP2_SESSION_RECV_HEADERS", 10, 200, stream_id=stream,
+              headers=[f":status: {status}"])
+        event("HTTP2_SESSION_RECV_DATA", 10, 210, stream_id=stream, length=2000)
+    event("HTTP2_SESSION_RECV_DATA", 11, 220, stream_id=1, length=5000)
+    event("HTTP2_SESSION_RECV_DATA", 10, 230, stream_id=1, length=1000)
+    log = tmp_path / "netlog.json"
+    log.write_text(json.dumps({"constants": {"timeTickOffset": "1000000",
+                                             "logEventTypes": kinds}, "events": events}))
+    rows, bounds = read_media(log)
+    assert bounds == (1000.1, 1000.23)
+    assert rows == [{"kind": "media_bytes", "start_unix": 1000.21, "end_unix": 1000.23,
+                     "encoded_bytes": 3000, "remote_ip": "203.0.113.1"}]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_acceptance_passive_seek_requires_jump_outside_prior_buffer(cached):
+    from docs.helpers.acceptance_playback_check import evaluate
+
+    rows = [changed(t, unix=1000 + t, position=(t + 499 if t else 0),
+                    buffer_ranges=[[0, 550 if cached else 20]]) for t in range(123)]
+    rows[1]["events"] = [{"name": name, "media_id": 1, "position": 500}
+                         for name in ("seeking", "seeked")]
+    netlog = ([{"start_unix": 1020, "end_unix": 1021, "encoded_bytes": 1048576}],
+              (999, 1123))
+    verdict = evaluate(rows, VIDEO, 120, minimum_jump=400, netlog=netlog)
+    assert verdict["ok"] is not cached
+    assert verdict["seek_observed"] is not cached
+    partial = evaluate(rows, VIDEO, 120, minimum_jump=400, netlog=([], (1100, 1123)))
+    assert not partial["ok"] and partial["network_source"] == "netlog_incomplete"
+    assert partial["player_ok"] is not cached
+
+
 def test_progress_and_quality_do_not_claim_zapret_or_route():
     result = summarize([sample(i) for i in range(11)], VIDEO, 720)
     assert result["estimated_playing_seconds"] == 10

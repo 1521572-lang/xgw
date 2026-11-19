@@ -54,16 +54,16 @@
       events: events.splice(0), event_overflow: overflow, stats};
     if (!v) return base;
     let buffer = 0;
+    const ranges = v.buffered.length <= 64 ? [] : null;
     for (let i = 0; i < v.buffered.length; i++) {
-      if (v.buffered.start(i) <= v.currentTime && v.currentTime < v.buffered.end(i)) {
-        buffer = v.buffered.end(i) - v.currentTime;
-        break;
-      }
+      const start = v.buffered.start(i), end = v.buffered.end(i);
+      ranges?.push([start, end]);
+      if (start <= v.currentTime && v.currentTime < end) buffer = end - v.currentTime;
     }
     const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
     return {...base, position: v.currentTime, paused: v.paused, seeking: v.seeking,
       ended: v.ended, ready_state: v.readyState, playback_rate: v.playbackRate,
-      width: v.videoWidth, height: v.videoHeight, buffer_seconds: buffer,
+      width: v.videoWidth, height: v.videoHeight, buffer_seconds: buffer, buffer_ranges: ranges,
       total_frames: q ? q.totalVideoFrames : null,
       dropped_frames: q ? q.droppedVideoFrames : null,
       error_code: v.error ? v.error.code : null, muted: v.muted, volume: v.volume};
