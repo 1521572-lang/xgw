@@ -353,9 +353,12 @@ def _tun(**network):
     return cfg
 
 
-def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
+def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain(monkeypatch):
+    uid = 27123
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: uid)
     rules, warnings = nft.build_rules(_tun(), capture=True, time_uids=())
     assert warnings == [] and rules.tun and rules.tun_name == "xgwtun0"
+    assert rules.singbox_uid == uid
     text = nft.render(rules)
     # Сеть LAN — по-прежнему TPROXY, но на lo он больше не нужен.
     assert _chain(text, "prerouting") == [
@@ -369,8 +372,15 @@ def test_tun_leaves_tproxy_for_lan_only_and_keeps_the_marking_chain():
         "udp dport 443 ip daddr != @reserved4 return",
         "meta l4proto { tcp, udp } counter tproxy to 127.0.0.1:12345 meta mark set 0x1 accept",
     ]
-    # Метит трафик машины та же цепочка output: дальше его ведёт маршрут, а не lo.
-    assert _chain(text, "output") == _chain(_render(_cfg()), "output")
+    tproxy = _chain(_render(_cfg()), "output")
+    tun = _chain(text, "output")
+    # TUN adds FIN tracking and late ACK handling around the shared UID bypass.
+    uid_rule = tproxy.index(f"meta skuid {uid} return")
+    arm, bypass, tail = tun[uid_rule:uid_rule + 3]
+    assert arm.startswith(f"meta skuid {uid} ") and f"update @{nft.SINGBOX_CLOSE_SET} " in arm
+    assert bypass == tproxy[uid_rule]
+    assert tail.endswith(f"@{nft.SINGBOX_CLOSE_SET} jump {nft.SINGBOX_ACK_CHAIN}")
+    assert [*tun[:uid_rule], bypass, *tun[uid_rule + 3:]] == tproxy
     assert "loopback_guard" in text
 
 
