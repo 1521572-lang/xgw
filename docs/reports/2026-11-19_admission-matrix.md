@@ -124,4 +124,4 @@ capture=on, loaded=true, has_close=false == expected_close=false (off/off, TUN
 5. Суточный off-монитор 18.51 ч: NOT_COMPLETED по вине расписания (остановлен
    владельцем для продолжения приёмки); интервалы и UTC-пара сохранены в
    previous-day-summary.json.
-- Publication commit: `добавляется после push`.
+- Publication commit: `0579bee12f40a7d1ea0e608c83765118146dd500` (8121c05 → 0579bee, ancestor verified).
