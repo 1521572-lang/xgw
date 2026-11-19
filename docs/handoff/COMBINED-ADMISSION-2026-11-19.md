@@ -1,7 +1,7 @@
-# Единая приёмка: бюджет старта, матрица отказов и измеренное видео
+# Единая приёмка бюджета, маршрутизации и воспроизведения
 
 Редакция 19.11.2026. ThinkCentre, Ubuntu **24.04 LTS**, amd64.
-Код **46c69fde43ff64f9952bf628b404ba8720fa62e7**.
+Код **d818e809ea42221e70882b61c75d29e8f1eb3048**.
 Установленная база **3630b44502b872ca3788e0824c6a9d0d8363b561**,
 принятая [отчётом 19 ноября](../reports/2026-11-19_combined-open-blocks.md).
 База 3d117b1 здесь больше не используется для установки.
@@ -29,12 +29,12 @@ A/B/B/A не выявил пользы удаления подписи при н
 WAN IPv6 отсутствует: NOT_APPLICABLE_ON_THIS_HOST, не блокер. H07/H11/H12,
 перенос кэша между IP и M3 не закрываются одним pass служебной пробы.
 
-## 1. Сначала завершить уже идущие сутки, не перезаписывать их
+## 1. Завершить прежнее наблюдение и восстановить исходную политику
 
-На момент отчёта работает read-only user-unit
-xgw-combined-monitor-1795041850 и root-таймер xgw-combined-day-rollback.timer.
-Не устанавливай новое поверх незавершённого интервала и действующего старого
-rollback. Пока идут сутки, можно выполнять §2 в отдельном checkout.
+В последнем отчёте на 17,24 ч наблюдения зафиксированы интервалы off и standalone.
+Проверь завершение user-unit xgw-combined-monitor-1795041850 и состояние
+xgw-combined-day-rollback.timer перед установкой. Пока монитор работает, можно
+выполнить §2 в отдельном checkout. [Последний отчёт](../reports/2026-11-19T160130Z_tcp-close-ab-r2.md)
 
 Начни от пользователя рабочего стола, в Bash:
 
@@ -43,10 +43,13 @@ set -euo pipefail
 umask 077
 . /etc/os-release
 test "$ID" = ubuntu && test "$VERSION_ID" = 24.04
-test -z "$(git status --porcelain)"
+test "$(dpkg --print-architecture)" = amd64
+printf '%s\n' "$PRETTY_NAME"
+uname -r
+/usr/sbin/nft --version
 REPO=$(git rev-parse --show-toplevel)
 BR=integration/zapret2-batch1
-CODE=46c69fde43ff64f9952bf628b404ba8720fa62e7
+CODE=d818e809ea42221e70882b61c75d29e8f1eb3048
 OLD=3630b44502b872ca3788e0824c6a9d0d8363b561
 GUI_BASE=7c20f59023ec39e5c5ce4606767ea915c3b91f64
 git fetch origin "$BR"
@@ -83,7 +86,8 @@ test -f "$PREV_D/day.jsonl"
 NOT_COMPLETED; не выдавай её за сутки. При недоступности сохранённых данных
 публикуй блокер этой фазы, не придумывай итог. Новый короткий прогон не заменяет сутки.
 
-Проверь elapsed, gaps/api_errors, фактический режим и свежие VPN/обычный сайт.
+Проверь elapsed, policy_interval_seconds, gaps/api_errors и свежие VPN/обычный
+сайт. В старом формате off/unknown означает, что подтверждён только режим Selected.
 UTC_BOUNDARY_VIEW означает смену resets_at в API; UTC_LIVE_PROBES требует первого
 настоящего списания/пробы нового дня. При off/off второе не наблюдалось.
 M3_TRAFFIC=NOT_RUN при отсутствии трафика пула. Сними штатные pool stats и diag.
@@ -101,15 +105,15 @@ sudo systemctl stop xgw-combined-day-rollback.timer
 sudo systemctl stop xgw-selective-jobs-rollback.timer
 ```
 
-Проверь off/off, неактивные оба воркера, новый VPN-сеанс и фактический код базы.
-Если старый таймер успел откатить слой, не подменяй baseline: останови установку
-и запиши SHA/отличающиеся файлы. Пока монитор не завершён, рестарты ради нового кода
-не проводить. После завершения user-unit --collect может исчезнуть — решает файл.
+Проверь VPN и фактический код базы. Если старый таймер откатил слой, останови
+установку и запиши SHA отличающихся файлов. Политика после восстановления может
+быть standalone. Сохрани её в §3 до временного переключения в off/off.
 
 ## 2. Проверки кода на Ubuntu
 
-Локально у Codex: 145 целевых и 25 telemetry-тестов PASS; Linux/API проверяются здесь.
-Один обязательный набор, любой FAIL/ERROR блокирует установку:
+Обязательные проверки охватывают бюджет, API, телеметрию, откат сетевых
+правил, границы очереди Engine и завершение TCP. FAIL, ERROR или SKIP в
+обязательном наборе блокирует установку.
 
 ```bash
 "$TEST_PY" -m pytest -o addopts='' -q \
@@ -117,7 +121,25 @@ sudo systemctl stop xgw-selective-jobs-rollback.timer
   tests/test_desync_jobs.py tests/test_zapret2_management_linux.py \
   tests/test_youtube_telemetry.py tests/test_desync_schema.py tests/test_acceptance_gate.py \
   --junitxml="$D/core.xml" >"$D/core.log" 2>&1
-"$TEST_PY" -m pytest -o addopts='' -q tests/test_panel.py -k zapret2 >"$D/api.log" 2>&1
+"$TEST_PY" -m pytest -o addopts='' -q tests/test_panel.py -k zapret2 \
+  --junitxml="$D/api.xml" >"$D/api.log" 2>&1
+"$TEST_PY" -m pytest -o addopts='' -q \
+  tests/test_nfqws2.py::EngineTests::test_accounting_controls_engine_rules_and_warnings \
+  tests/test_nfqws2.py::EngineTests::test_accounting_loss_stops_worker_and_skips_engine_profiles \
+  tests/test_nfqws2.py::EngineTests::test_nfqueue_is_bounded_fail_open_and_loop_free \
+  tests/test_nft.py::test_singbox_close_only_restores_header_only_ack_of_local_tun_flow \
+  tests/test_nft.py::test_singbox_close_set_keeps_rule_integrity_while_connections_expire \
+  --junitxml="$D/network-contracts.xml" >"$D/network-contracts.log" 2>&1
+"$PY" - "$D/core.xml" "$D/api.xml" "$D/network-contracts.xml" <<'PY'
+import sys
+from pathlib import Path
+from docs.helpers.acceptance_test_gate import read
+
+for filename in sys.argv[1:]:
+    result = read(Path(filename), Path.cwd())
+    assert all(case["outcome"] == "passed" for case in result.values()), filename
+    print(f"{Path(filename).name}: {len(result)} passed")
+PY
 bash -n docs/helpers/t11_management_restore.sh
 ```
 
@@ -127,8 +149,9 @@ bash -n docs/helpers/t11_management_restore.sh
 Проверки воспроизведения должны отвергать 60 секунд с хорошим качеством как «15 минут»,
 пустые сетевые байты, сломанные часы и отсутствие seek.
 
-Расширенный регрессионный набор на реальном Ubuntu сохраняется. Его состав не
-содержит изменённых файлов тестов; при отказах сравнивается с OLD:
+При отказах в расширенном наборе сравниваются общие тесты NEW и OLD. Четыре
+новых теста уже обязательны в предыдущей команде, поэтому общая выборка их
+исключает в обоих checkout.
 
 ```bash
 BROAD=(tests/test_desync_worker.py tests/test_desync_standalone.py
@@ -137,12 +160,18 @@ BROAD=(tests/test_desync_worker.py tests/test_desync_standalone.py
        tests/test_selective_probe_watch.py tests/test_nfqws2.py tests/test_nft.py
        tests/test_applier.py tests/test_generator.py tests/test_freepool.py
        tests/test_freepool_backend.py tests/test_freepool_stats.py tests/test_freepool_traffic.py)
+ADDED=(
+  --deselect=tests/test_nfqws2.py::EngineTests::test_accounting_controls_engine_rules_and_warnings
+  --deselect=tests/test_nfqws2.py::EngineTests::test_accounting_loss_stops_worker_and_skips_engine_profiles
+  --deselect=tests/test_nft.py::test_singbox_close_only_restores_header_only_ack_of_local_tun_flow
+  --deselect=tests/test_nft.py::test_singbox_close_set_keeps_rule_integrity_while_connections_expire
+)
 run_broad() {
   local tree=$1 xml=$2 log=$3
   (
     cd "$tree" || exit 2
     env PYTHONPATH="$tree/src:$tree" "$TEST_PY" -m pytest -o addopts='' -q \
-      "${BROAD[@]}" --basetemp="$tree/.acceptance-pytest-tmp" --junitxml="$xml"
+      "${BROAD[@]}" "${ADDED[@]}" --basetemp="$tree/.acceptance-pytest-tmp" --junitxml="$xml"
   ) >"$log" 2>&1
 }
 if run_broad "$D/source" "$D/new.xml" "$D/new.log"; then
@@ -164,23 +193,33 @@ fi
 нормализацию и не исправляй тесты сама. Qt-база не меняется, прежние 11 PASS
 сохраняются как предыдущий результат; живые UI проверяются ниже.
 
-## 3. Обратимая установка пяти файлов
+## 3. Обратимая установка 11 файлов
 
-Нативный GUI, HTML/CSS и профили не заменяются: блокеры обоих UI приходят из общего
-API. Устанавливаются zapret2.py, обе watch-карточки/команды, panel.py и jobs.py.
-Убедись, что предыдущая суточная фаза закрыта. До apply — off/off, VPN работает,
-очередь свободна, воркеры inactive, конфиги и acct/offload/nft сохранены приватно.
+Пакет объединяет проверку бюджета, ограничение Engine по учёту conntrack,
+правило TCP close для IPv4/TUN и анализ суточного журнала. Установщик перед
+запуском демона обновляет сетевые правила через xgw-net.service. При ошибке
+загрузки восстанавливает прежние файлы и правила. Начни после §1 с рабочим VPN.
+Подтверди доступ к панели из пользовательской сессии. При необходимости сама
+получи свежую ссылку командой `sudo xgw panel` в приватный файл и войди в браузере.
 
 ```bash
 exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock"
 flock -n 9
 PAYLOAD="/opt/xgw/handoff/admission-$CODE"
 BACKUP="/var/lib/xgw/handoff/admission-$CODE"
-UNIT=xgw-selective-admission-rollback
-OVERLAY=--selective-admission
+UNIT=xgw-combined-admission-rollback
+OVERLAY=--combined-admission
 HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
 CORE=(src/xgw/zapret2.py src/xgw/watch/zapret2_control.py src/xgw/watch/panel.py
-      src/xgw/watch/zapret2_management.py src/xgw/desync/jobs.py)
+      src/xgw/watch/zapret2_management.py src/xgw/desync/jobs.py src/xgw/daemon.py
+      src/xgw/desync/client.py src/xgw/generator/profiles.py src/xgw/net/nft.py
+      src/xgw/net/sysctl.py src/xgw/nfqws2.py)
+check_installed() {
+  local tree=$1 file
+  for file in "${CORE[@]}"; do
+    sudo cmp "$tree/$file" "$PACKAGE/${file#src/xgw/}" || return
+  done
+}
 sudo test ! -e "$PAYLOAD"
 sudo test ! -e "$BACKUP"
 sudo install -d -m 0755 "$PAYLOAD/code" "$PAYLOAD/base"
@@ -196,21 +235,80 @@ sudo install -m 0700 "$PAYLOAD/code/docs/helpers/t11_management_restore.sh" "$BA
 sudo systemd-run --unit="$UNIT" --on-active=240m --timer-property=AccuracySec=1s \
   /bin/bash "$BACKUP/restore.sh" "$PY" "$HELPER" "$BACKUP" "$PANEL" rollback "$OVERLAY"
 sudo systemctl is-active "$UNIT.timer"
-sudo "$PY" "$HELPER" apply "$OVERLAY" --backup "$BACKUP"
-sudo sha256sum -c "$BACKUP/config-before.sha256"
-check_installed() {
-  for file in "${CORE[@]}"; do sudo cmp "$file" "$PACKAGE/${file#src/xgw/}"; done
-}
-check_installed
 sudo touch "$BACKUP/network-test-started"
+"$PY" - <<'PY'
+import time
+from xgw.desync.client import Client
+
+client = Client()
+def view():
+    return client.request("/api/zapret2/overview")["zapret2"]
+
+state = view()
+assert state["engine_mode"] == "off", "engine must be off on the expected base"
+if state["mode"] != "off":
+    reply = client.request("/api/zapret2/mode", {
+        "mode": "off", "expected": state["config_key"]})
+    assert reply.get("ok") is True, reply.get("code")
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
+    state = view()
+    if (state["mode"] == state["engine_mode"] == state["state"] == "off"
+            and state["fresh"] and state["policy_matched"]):
+        print("off/off confirmed")
+        break
+    time.sleep(2)
+else:
+    raise SystemExit("off/off not confirmed")
+PY
+sudo sha256sum "$CFG" "$PANEL" >"$D/off-before.sha256"
+sudo flock "$BACKUP/restore.lock" "$PY" "$HELPER" apply "$OVERLAY" --backup "$BACKUP"
+sudo sha256sum -c "$D/off-before.sha256"
+check_installed "$PAYLOAD/code"
 "$PY" -m xgw.desync.client status >"$D/initial.json"
 ```
 
-Ожидается 5/5. Несовпадение baseline — остановка, не копировать текущие файлы
-в baseline. При необходимости сама получи свежую ссылку входа в браузер:
-sudo xgw panel >"$D/panel-login-private.txt"; открой её в своём тестовом браузере.
-Не публикуй файл/токен, не отключай авторизацию. Если sudo/пароль недоступен,
-запроси доступ. Прежнюю потерю сессии нельзя записывать как новый UI PASS.
+После apply ожидается совпадение 11/11. При несовпадении baseline зафиксируй
+отличающиеся пути. При любой ошибке после вооружения таймера выполни rollback
+из §8. Сразу после apply проверь новый VPN-сеанс и правила следующей командой.
+Результат сохраняет число правил, значения режима и состояние перехвата.
+
+```bash
+sudo "$PY" -IB - <<'PY' >"$D/network-after.json"
+import json
+import sys
+sys.path.insert(0, "/opt/xgw/lib")
+from xgw import config
+from xgw.net import cmd, nft, sysctl
+from xgw.net.capture import capture_for
+from xgw.paths import Paths
+
+paths = Paths.from_env()
+cfg, _ = config.load(paths.config_file)
+capture = capture_for(cfg, paths)
+active = capture.loaded()
+rules = capture.rules()
+ruleset = json.loads(cmd.run(["/usr/sbin/nft", "-j", "list", "ruleset"]))
+objects = ruleset["nftables"]
+has_close = any(row.get("set", {}).get("name") == nft.SINGBOX_CLOSE_SET
+                and row["set"].get("table") == nft.TABLE for row in objects)
+has_engine = any(row.get("chain", {}).get("name") == "nfq_output"
+                 and row["chain"].get("table") == nft.GUARD_TABLE for row in objects)
+expected_close = rules.capture_local and rules.tun and rules.singbox_uid is not None
+print(json.dumps({"capture": capture.mode(), "loaded": active, "setup_tcp_close": has_close,
+                  "expected_tcp_close": expected_close, "engine_queue": has_engine,
+                  "acct": sysctl.read(sysctl.CONNTRACK_ACCT)}))
+assert capture.mode() == "on" and active is True
+assert cfg.zapret2.mode == cfg.zapret2.engine == "off"
+assert has_close == expected_close and not has_engine
+PY
+cat "$D/network-after.json"
+```
+
+Проверь свежие состояния обоих воркеров в systemd и отсутствие слушателя их
+очереди по §3 предыдущего ТЗ. Если на рабочем хосте используется TPROXY, результат
+по ветке IPv4/TUN берётся из проведённого лабораторного A/B. Приёмка не требует
+смены способа перехвата или включения nf_conntrack_acct.
 
 ## 4. Бюджет перед запуском — главный дефект
 
@@ -360,11 +458,11 @@ BLOCKED_DEPENDENCY, а не PASS карты. Политику владельца
 512 МиБ, check=180, retry=300, расход дня не сбрасывается.
 
 ```bash
-sudo systemctl stop "$UNIT.timer"
 sudo systemd-run --unit=xgw-admission-day-rollback --on-active=26h \
   --timer-property=AccuracySec=1s /bin/bash "$BACKUP/restore.sh" \
   "$PY" "$HELPER" "$BACKUP" "$PANEL" rollback "$OVERLAY"
 sudo systemctl is-active xgw-admission-day-rollback.timer
+sudo systemctl stop "$UNIT.timer"
 DAY_UNIT="xgw-admission-monitor-$(date +%s)"
 systemd-run --user --unit="$DAY_UNIT" --collect --property=RuntimeMaxSec=25h \
   --property=UMask=0077 /usr/bin/env PYTHONPATH="$PYTHONPATH" "$PY" \
@@ -387,27 +485,42 @@ systemd-run --user --unit="$DAY_UNIT" --collect --property=RuntimeMaxSec=25h \
 вызови независимый restore. Таймер держать до проверки сети и хэшей.
 
 ```bash
-RESULT_MODE=accept
+RESULT_MODE=${RESULT_MODE:-rollback}
 sudo /bin/bash "$BACKUP/restore.sh" "$PY" "$HELPER" "$BACKUP" "$PANEL" \
   "$RESULT_MODE" "$OVERLAY"
 sudo sha256sum -c "$BACKUP/config-before.sha256"
 systemctl is-active xgw.service
 systemctl show xgw-zapret2.service xgw-nfqws2.service -p ActiveState -p MainPID
-sudo cat /proc/net/netfilter/nfnetlink_queue
+if sudo test -r /proc/net/netfilter/nfnetlink_queue; then
+  sudo cat /proc/net/netfilter/nfnetlink_queue >"$D/queues-after-restore.txt"
+fi
 sudo test -f "$BACKUP/restore-completed"
-if [ "$RESULT_MODE" = accept ]; then check_installed; fi
+if [ "$RESULT_MODE" = accept ]; then
+  check_installed "$PAYLOAD/code"
+else
+  check_installed "$PAYLOAD/base"
+fi
+```
+
+Перед штатным возвратом принятого пакета выставь RESULT_MODE=accept. Значение
+по умолчанию rollback подходит для остановки после ошибки.
+После возврата проверь новый VPN-сеанс, обычный сайт, хэши конфигов и фактический
+режим. При исходном standalone ожидается разрешённый воркер этого режима, а при
+исходном off/off оба воркера должны быть неактивны. При rollback дополнительно
+сверь все файлы со слоем OLD и состояние перехвата.
+Расход дня не сбрасывать. Закрой только тестовые браузеры/точно известные user-unit.
+При ошибке restore останови опыты и запроси доступ; всё равно публикуй отчёт.
+
+После подтверждения возврата погаси таймеры этого прогона:
+
+```bash
 sudo systemctl stop "$UNIT.timer"
 sudo systemctl stop xgw-admission-day-rollback.timer 2>/dev/null || true
 ```
 
-Новый VPN-сеанс и обычный сайт должны работать, selective-rule отсутствует,
-worker не поднимается заново, диску ничего не угрожает, конфиги побайтово исходные.
-Расход дня не сбрасывать. Закрой только тестовые браузеры/точно известные user-unit.
-При ошибке restore останови опыты и запроси доступ; всё равно публикуй отчёт.
-
 Файл docs/reports/YYYY-MM-DD_admission-matrix.md. В нём отдельно:
 - предыдущие сутки: действительная длительность/UTC view vs live probes/VPN/M3;
-- CODE/OLD/Ubuntu, CORE/API/BROAD и оставшиеся baseline-failures, INSTALL 5/5;
+- CODE/OLD/Ubuntu, CORE/API/BROAD и оставшиеся baseline-failures, INSTALL 11/11, рабочие правила и очередь;
 - LOW_BUDGET: два API/два UI, отказ прямого POST и job, неизменные policy/spent/PID;
 - все 18 строк матрицы, не только удачные; pin/reset/cancel/restart;
 - long/seek: required/measured/wall/eligible/progress/720p/media bytes/seek, исход
@@ -415,9 +528,36 @@ worker не поднимается заново, диску ничего не у
 - Selective+ordinary VPN, fresh fallback, GUI/session/map, итоговые файлы/режимы,
   хэши, PID, диск, таймеры и свежая VPN-передача.
 
-Flash меняет только обезличенный отчёт. Автоматически fetch/fast-forward в чистом
-исходном REPO, добавь только отчёт, commit и push в integration/zapret2-batch1,
-проверь remote SHA. При конкурентном push rebase только своего отчётного коммита,
-без force. Не проси отдельного подтверждения публикации. При блокере публикуй
-факты и невыполненные части, не замещай их предыдущими PASS.
+Контроль TCP close и читаемость nftables уже приняты на 7ace100 в лаборатории
+ThinkCentre. В этом проходе проверь установку, рабочий перехват и новую
+передачу через VPN. [Отчёт A/B](../reports/2026-11-19T160130Z_tcp-close-ab-r2.md)
+
+Flash публикует один обезличенный Markdown-отчёт в день проверки, в том числе
+при блокере. Для публикации создай отдельный checkout от головы ветки.
+
+```bash
+git -C "$REPO" fetch origin "$BR"
+git -C "$REPO" worktree add --detach "$D/publish" FETCH_HEAD
+cd "$D/publish"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_admission-matrix.md"
+```
+
+Запиши результаты в `$REPORT` и выполни публикацию.
+
+```bash
+test -s "$REPORT"
+git add -- "$REPORT"
+test "$(git diff --cached --name-only)" = "$REPORT"
+git diff --cached --check
+git commit -m "docs: report ThinkCentre routing and admission acceptance"
+if ! git push origin "HEAD:refs/heads/$BR"; then
+  git fetch origin "$BR"
+  git rebase FETCH_HEAD
+  git push origin "HEAD:refs/heads/$BR"
+fi
+SHA=$(git rev-parse HEAD)
+git fetch origin "$BR"
+git merge-base --is-ancestor "$SHA" FETCH_HEAD
+printf 'https://github.com/1521572-lang/xgw/blob/%s/%s\n' "$SHA" "$REPORT"
+```
 
