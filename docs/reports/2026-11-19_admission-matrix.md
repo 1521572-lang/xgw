@@ -37,4 +37,4 @@
   новым output-рендером build_rules (singbox TCP-close-строки), либо ограничить
   добавление close-правил условием. После фикса — тот же гейт должен дать
   ок=true, установка продолжится с §3 без изменений.
-- Publication commit: `добавляется после push`.
+- Publication commit: `50c3a509f61d29ab26a8518e32f39c95a0253c7a` (8121c05 → 50c3a50, ancestor verified).
