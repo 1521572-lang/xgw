@@ -59,13 +59,14 @@ class MediaNetwork:
         self.canceled = 0
         self.statuses = Counter()
         self.protocols = Counter()
+        self.body_intervals = {}
 
     def response(self, row, response):
         status = response.get("status")
         row["status"] = int(status) if number(status) else None
         row["protocol"] = token(response.get("protocol"))
         row["cache"] = bool(response.get("fromDiskCache") or response.get("fromServiceWorker")
-                            or row.get("cache"))
+                            or response.get("fromPrefetchCache") or row.get("cache"))
         try:
             row["remote_ip"] = str(ipaddress.ip_address(response.get("remoteIPAddress", "")))
         except ValueError:
@@ -92,6 +93,9 @@ class MediaNetwork:
                                     "method": token(request.get("method")),
                                     "started_s": self.clock(), "encoded_bytes": 0,
                                     "data_bytes": 0, "cache": False}
+                stamp, wall = params.get("timestamp"), params.get("wallTime")
+                if number(stamp) and number(wall):
+                    self.active[rid].update(request_timestamp=stamp, request_unix=wall)
                 self.emit({"kind": "request", **self.active[rid]})
             return
         if not row:
@@ -107,6 +111,19 @@ class MediaNetwork:
                 value = max(0, int(value)) if number(value) else 0
                 row[dest] += value
                 setattr(self, dest, getattr(self, dest) + value)
+            stamp, size = params.get("timestamp"), params.get("encodedDataLength")
+            if (type(size) is int and size > 0 and row.get("status") in (200, 206)
+                    and not row["cache"] and row.get("remote_ip") and number(stamp)
+                    and "request_timestamp" in row and stamp >= row["request_timestamp"]):
+                # Convert the browser event's own timestamp, not Python callback time.
+                at = row["request_unix"] + (stamp - row["request_timestamp"])
+                block = self.body_intervals.setdefault(row["id"], {
+                    "kind": "media_bytes", "id": row["id"], "remote_ip": row["remote_ip"],
+                    "start_unix": at, "end_unix": at, "encoded_bytes": 0,
+                })
+                block["start_unix"] = min(at, block["start_unix"])
+                block["end_unix"] = max(at, block["end_unix"])
+                block["encoded_bytes"] += size
         elif kind in {"loadingFinished", "loadingFailed"}:
             if kind == "loadingFinished":
                 final = params.get("encodedDataLength", 0)
@@ -121,6 +138,11 @@ class MediaNetwork:
                 self.failures += not row["canceled"]
             self.emit({"kind": kind, "at_s": self.clock(), **row})
             del self.active[rid]
+
+    def flush_body_intervals(self):
+        for block in self.body_intervals.values():
+            self.emit(block)
+        self.body_intervals.clear()
 
     def snapshot(self):
         return {"encoded_bytes": self.encoded_bytes, "data_bytes": self.data_bytes,
@@ -391,6 +413,7 @@ def collect(args, trial=None):
                         sample = {"probe_error": True}
                     sample.update(t_s=clock(), unix=time.time(), network=network.snapshot(),
                                   gateway=gateway_snapshot(args.status_file, time.time()))
+                    network.flush_body_intervals()
                     samples.append(sample)
                     # Store the sample even if navigating/closing the tab interrupts control.
                     try:
@@ -419,6 +442,7 @@ def collect(args, trial=None):
             # Exception text may contain signed URLs or a browser command line.
             outcome = "browser_error"
         finally:
+            network.flush_body_intervals()
             meta.update(outcome=outcome, finished_unix=time.time())
             dump(args.out / "run.json", meta)
             summary = {**meta, **summarize(samples, args.video, args.height),

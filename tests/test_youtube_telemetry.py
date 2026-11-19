@@ -142,6 +142,27 @@ def test_redirect_to_unrelated_origin_stops_tracking():
     assert network.statuses == {"302": 1}
 
 
+def test_media_byte_intervals_use_browser_clock_and_exclude_cache_and_finish_totals():
+    records = []
+    network = MediaNetwork(records.append, lambda: 100)
+    for index, cached in enumerate((False, True)):
+        rid = str(index)
+        network.handle("requestWillBeSent", {"requestId": rid, "timestamp": 50, "wallTime": 1000,
+                       "request": {"url": "https://r1.googlevideo.com/videoplayback?sig=private"}})
+        network.handle("responseReceived", {"requestId": rid, "response": {
+            "status": 206, "remoteIPAddress": "203.0.113.1", "fromDiskCache": cached}})
+        for stamp in (52.25, 52.5):
+            network.handle("dataReceived", {"requestId": rid, "timestamp": stamp,
+                                            "encodedDataLength": 75})
+        network.handle("loadingFinished", {"requestId": rid, "encodedDataLength": 2000})
+    network.flush_body_intervals()
+    network.flush_body_intervals()
+    assert [r for r in records if r["kind"] == "media_bytes"] == [
+        {"kind": "media_bytes", "id": 1, "start_unix": 1002.25, "end_unix": 1002.5,
+         "encoded_bytes": 150, "remote_ip": "203.0.113.1"}]
+    assert "private" not in json.dumps(records)
+
+
 @pytest.mark.parametrize("url", ["https://googlevideo.com.evil.test/videoplayback",
                                  "https://r1.googlevideo.com/other",
                                  "https://www.youtube.com/watch?v=abcdefghijk", "http://[/"])
