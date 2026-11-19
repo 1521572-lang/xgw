@@ -62,3 +62,5 @@ off/off, воркеры inactive, VPN 200, panel 200 (база `08d31ee` 11 фа
 3. matrix recount работает: full_matrix=true, two_https_pass 5 профилей — готово
    для pin в следующих проходах.
 - Publication commit: `добавляется после push`.
+
+- Publication commit: `1b705adc21d2be655b3734fe91fbe70c06e9726b` (3eecaf7 → 1b705ad, ancestor verified).
