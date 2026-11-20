@@ -112,4 +112,4 @@ manifest: **5 файлов вернулись к исходным хэшам**; 
 4. Стратегия hostfakesplit_md5 не проходит HTTPS-допуск на этой линии
    (fallback на действующем адресе) — согласуется с матрицей CDN-PEER, где
    два pass дали только fake_md5/multidisorder.
-- Publication commit: `добавляется после push`.
+- Publication commit: `839e624188b468b5784ca87a5397423d0ac3e870` (a6971e9 → 839e624, ancestor verified).
