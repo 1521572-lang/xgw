@@ -6,12 +6,13 @@ Ubuntu 24.04 LTS. Flash сама выполняет техническую пр�
 наблюдается при штатной работе watchdog. Используй согласованный с
 владельцем короткий сеанс установки и проверяй обычный HTTPS до и после.
 
-В первом проходе тесты, установка и откат прошли. Прямые пробы двух
-CDN дошли до TLS-таймаута. Ранее в том же прогоне один из этих узлов
-дал 206/65536 через VPN. Переход статуса при ротации не проверен.
-В повторе одна штатная попытка Selective даёт измеримый результат и
-при таком отказе. После снятия прямого правила контроллер проверяет
-тот же URL CDN через VPN. [Первый отчёт](../reports/2026-11-20T224355Z_selective-route-status.md)
+В r2 после прямого TLS-таймаута правило было снято. VPN-контроль
+того же URL вернул `request_failed`, а обычный HTTPS через VPN прошёл.
+Кандидат сохраняет фазу, тип ошибки, HTTP-код и байты контрольного запроса.
+После временного сетевого отказа он допускает один повтор через VPN в
+штатной паузе. Сохраняются оба результата. Переход статуса при ротации
+ещё предстоит проверить в окне с успешным прямым допуском.
+[Отчёт r2](../reports/2026-11-20T231435Z_selective-route-status-r2.md)
 
 В r3 `daemon_rebuild` сопоставлен с заменой участника. В отдельном
 пассивном окне off/off за 180 с увидели одну атомарную замену файла и
@@ -30,7 +31,7 @@ CDN дошли до TLS-таймаута. Ранее в том же прогон
 Затем в том же Bash задай:
 
 ```bash
-CANDIDATE=d4b9a7b7f9919808b9fb13662f9abe4e92f6eb97
+CANDIDATE=25b4b94bc9ecc86853ba31290253b85d16a91a28
 OVERLAY=--selective-route-status
 UNIT=xgw-selective-route-status-rollback
 ```
@@ -59,7 +60,7 @@ Control использует уже проверенный в CDN r2 метод 
 
 ```bash
 if live && snapshot route-admission-before; then
-  run route-admission timeout -k 3 125 "$PY" -u -B -P - <<'PY'
+  run route-admission timeout -k 3 205 "$PY" -u -B -P - <<'PY'
 import http.client
 import json
 import time
@@ -80,6 +81,7 @@ if reply.get("ok") is not True or not reply.get("config_key"):
     raise SystemExit("mode_rejected")
 
 deadline = time.monotonic() + 105
+extended = False
 while time.monotonic() < deadline:
     try:
         current = client.request(overview)["zapret2"]
@@ -95,14 +97,23 @@ while time.monotonic() < deadline:
         if ((state == "active" and evidence["transport"] == "https_reachable")
                 or state in ("fallback", "blocked", "error")):
             cdn = evidence["transport_probes"].get("cdn", {})
-            print(json.dumps({
+            pending = evidence["vpn_control_retry_pending"]
+            row = {
                 "state": state, "reason": current["reason"],
                 "cdn_phase": cdn.get("phase"), "cdn_kind": cdn.get("kind"),
                 "vpn_control": evidence.get("vpn_control"),
                 "vpn_control_target": evidence.get("vpn_control_target"),
                 "vpn_control_reason": evidence.get("vpn_control_reason"),
-            }))
-            break
+                "retry_pending": pending,
+                "attempts": evidence["vpn_control_attempts"],
+            }
+            if not pending:
+                print(json.dumps(row))
+                break
+            if not extended:
+                print(json.dumps(row))
+                extended = True
+                deadline = time.monotonic() + 75
     time.sleep(1)
 else:
     raise SystemExit("admission_deadline")
@@ -111,12 +122,21 @@ fi
 ```
 
 - При `fallback` сними `snapshot route-admission-after` и подтверди
-  `client_zapret2_rule=false`. Проверь обычный VPN. Значения
-  `cdn_phase=tls, cdn_kind=timeout, vpn_control_target=cdn,
-  vpn_control=pass` подтверждают доступность одного URL CDN через
-  VPN после прямого отказа. DNS и фактический IP могли отличаться.
-  `fail` означает отказ контрольного запроса. Для `not_run` укажи
-  причину. Плеер и проверку ротации отметь `NOT_RUN` и перейди к §4.
+  `client_zapret2_rule=false`. Проверь обычный VPN. Для
+  `vpn_control_target=cdn` запиши по каждой попытке время относительно
+  первой, `verdict/reason`, `phase/kind`, `http/connect_http` и
+  байты. Первая попытка остаётся в отчёте при любом исходе повтора.
+  Для успешного запроса видео ожидаются HTTP 206 и 65536 байт.
+  Такой ответ подтверждает доступность URL через VPN в это время.
+  DNS и фактический IP могли отличаться между путями.
+- При временном VPN-отказе ожидается максимум одна повторная проба на
+  последующем шаге watchdog, спустя не менее примерно 30 с после
+  первой. При недостатке бюджета повтор может вернуть
+  `not_run/budget_unavailable`. В этом случае итог первой попытки
+  сохраняется. HTTP-отказ или короткий ответ завершает контроль
+  одной попыткой. Отметь, была ли видна вторая запись и сохранился
+  ли закрытый прямой маршрут. Плеер и ротацию при fallback отметь
+  `NOT_RUN` и перейди к §4.
 - При `blocked`, `error`, дедлайне или отказе API опубликуй
   соответствующую фазу и перейди к §4. Одна попытка POST на одну
   ревизию. После потери ответа сверить состояние панели и восстановить.
@@ -170,7 +190,8 @@ fi
 исходными переменными. Подтверди SHA, файлы **6/6**, off/off,
 выключение обоих воркеров, HTTPS через VPN и остановленный таймер.
 Отметь `UNIT_TESTS`, `DAEMON_BASELINE`, `INSTALL`, `ADMISSION`,
-`CDN_VPN_CONTROL` с `target/result/reason`, `STATUS`, `LIVE_PLAY`,
+`CDN_VPN_CONTROL` с `target/result/reason` и обеими строками попыток,
+`STATUS`, `LIVE_PLAY`,
 `FLOW`, `RESTORE` и время наблюдения.
 Однозначно отдели наблюдение ротации на установленном кандидате от
 прежних отчётов, адреса и приватные файлы сохрани на ThinkCentre.
@@ -178,5 +199,5 @@ fi
 При любом исходе опубликуй один обезличенный Markdown-отчёт в
 `integration/zapret2-batch1` по блоку публикации §3
 [ТЗ пересчёта](MEDIA-COUNTERS-2026-11-20.md), с суффиксом
-`_selective-route-status-r2.md`. Проверь коммит в удалённой ветке и
+`_selective-route-status-r3.md`. Проверь коммит в удалённой ветке и
 верни ссылку.
