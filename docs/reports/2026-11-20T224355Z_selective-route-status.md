@@ -72,4 +72,4 @@
    при живом VPN-пути к тому же сервису — полезный маркер для
    автодиагностики линии в панели (сейчас панель покажет fallback без
    причины).
-- Publication commit: `добавляется после push`.
+- Publication commit: `8f5926f54bd20ecd33c5e4f6bcf220c601690a63` (58380f5 → 8f5926f, ancestor verified).
