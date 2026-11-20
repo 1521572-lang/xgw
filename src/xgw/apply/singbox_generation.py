@@ -17,7 +17,7 @@ from ..paths import atomic_write_json, atomic_write_text, file_lock
 from ..watch import checks
 from ..xraycore.service import SystemdXrayService
 from . import singbox_process as processes
-from .applier import ApplyOutcome
+from .applier import ApplyOutcome, ApplySource
 
 
 def digest(config):
@@ -364,7 +364,8 @@ def finish(core, applier, prepared):
         # Оба процесса уже работают; при неопределённом исходе не убивать их.
         state["pending"]["phase"] = "uncertain"
         processes.write(core.paths, state)
-        outcome = applier._apply_locked(prepared.xray, restart_now=False, api_only=True)
+        outcome = applier._apply_locked(prepared.xray, restart_now=False, api_only=True,
+                                        source=ApplySource.SINGBOX_GENERATION)
         if outcome.mode not in ("api", "unchanged"):
             if not core.paths.api_dirty_file.exists():
                 state["pending"]["phase"] = "ready"

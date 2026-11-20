@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 from .. import log
@@ -33,12 +35,26 @@ from ..generator.diff import apply_plan, diff_configs
 from ..generator.validate import find_xray, validate_config
 from ..net import cmd, tun
 from ..net.capture import capture_inbounds
-from ..paths import Paths, atomic_write_json, atomic_write_text, file_lock
+from ..paths import Paths, atomic_write_bytes, atomic_write_json, atomic_write_text, file_lock
 from ..xraycore.api import ApiClient, ApiError
 from ..xraycore.service import XrayService, XrayServiceError
 
 RESTART_WAIT_SECONDS = 15.0
 Validator = Callable[[dict], "tuple[bool | None, str]"]
+# A short digest survives journal token masking and identifies the bytes just written.
+WRITE_FINGERPRINT_LENGTH = 20
+
+
+class ApplySource(StrEnum):
+    APPLY = "apply"
+    API_ONLY = "api_only"
+    DAEMON_REBUILD = "daemon_rebuild"
+    DAEMON_PENDING = "daemon_pending"
+    ZAPRET2_ROUTE = "zapret2_route"
+    YOUTUBE_ROUTE = "youtube_route"
+    SINGBOX_GENERATION = "singbox_generation"
+    API_RECOVERY = "api_recovery"
+    WATCHDOG = "watchdog"
 
 
 @dataclass
@@ -95,7 +111,8 @@ class Applier:
         self.wait_seconds = wait_seconds
 
     def apply(
-        self, new_config: dict, *, urgent: bool = False, force_now: bool = False
+        self, new_config: dict, *, urgent: bool = False, force_now: bool = False,
+        source: ApplySource = ApplySource.APPLY,
     ) -> ApplyOutcome:
         ok, output = self.validator(new_config)
         if not ok:
@@ -103,9 +120,11 @@ class Applier:
             # работать на последнем рабочем.
             return ApplyOutcome("rejected", detail=output)
         with file_lock(self.paths.lock_file):
-            return self._apply_locked(new_config, restart_now=urgent or force_now)
+            return self._apply_locked(new_config, restart_now=urgent or force_now, source=source)
 
-    def apply_api_only(self, new_config: dict, *, base: dict) -> ApplyOutcome:
+    def apply_api_only(
+        self, new_config: dict, *, base: dict, source: ApplySource = ApplySource.API_ONLY,
+    ) -> ApplyOutcome:
         """Только через API (п. 350): Xray не перезапускается ни при каком исходе, вместо этого —
         rejected. base — конфиг, из которого собран new_config: другой на диске — тоже rejected."""
         ok, output = self.validator(new_config)
@@ -114,7 +133,7 @@ class Applier:
         with file_lock(self.paths.lock_file):
             if self._read_current() != base:
                 return ApplyOutcome("rejected", detail="конфиг изменился во время проверки")
-            return self._apply_locked(new_config, restart_now=False, api_only=True)
+            return self._apply_locked(new_config, restart_now=False, api_only=True, source=source)
 
     def recover_current(self, new_config: dict, *, base: dict) -> ApplyOutcome:
         """Replace uncertain live API state with a validated on-disk configuration."""
@@ -124,7 +143,8 @@ class Applier:
         with file_lock(self.paths.lock_file):
             if self._read_current() != base or not self.paths.api_dirty_file.exists():
                 return ApplyOutcome("rejected", detail="поколение изменилось до восстановления")
-            return self._restart(new_config, reason="восстановление маршрутов после отказа API")
+            return self._restart(new_config, reason="восстановление маршрутов после отказа API",
+                                 source=ApplySource.API_RECOVERY)
 
     def rollback(self, reason: str) -> ApplyOutcome:
         """Откат на last-good по решению watchdog: Xray не поднимается с текущим
@@ -136,12 +156,13 @@ class Applier:
                 return ApplyOutcome("unchanged", detail="last-good отсутствует")
             if good == self._read_current():
                 return ApplyOutcome("unchanged", detail="last-good совпадает с текущим конфигом")
-            return self._rollback(reason=reason)
+            return self._rollback(reason=reason, source=ApplySource.WATCHDOG)
 
     # --- внутреннее ------------------------------------------------------------
 
     def _apply_locked(
         self, new_config: dict, *, restart_now: bool, api_only: bool = False,
+        source: ApplySource = ApplySource.APPLY,
     ) -> ApplyOutcome:
         current = self._read_current()
         if api_only:
@@ -165,11 +186,11 @@ class Applier:
                         "failed", detail="исход API неизвестен; оба поколения сохранены")
                 self._clear_dirty()
                 return ApplyOutcome("rejected", detail="ошибка API; прежние мосты восстановлены")
-            self._promote(new_config)
+            self._promote(new_config, source=source, method="api")
             self._clear_dirty()
             return ApplyOutcome("api", ops=ops)
         if current is None:
-            return self._restart(new_config, reason="первый запуск")
+            return self._restart(new_config, reason="первый запуск", source=source)
         if current == new_config:
             self._clear_pending()
             return ApplyOutcome("unchanged")
@@ -196,13 +217,15 @@ class Applier:
                 self._mark_dirty()
                 reasons.append("ошибка API")
             else:
-                self._promote(new_config)
+                self._promote(new_config, source=source, method="api")
                 return ApplyOutcome("api", ops=ops + diff.deferred)
 
         if restart_now:
-            return self._restart(new_config, reason="срочное применение: " + ", ".join(reasons))
+            return self._restart(new_config, reason="срочное применение: " + ", ".join(reasons),
+                                 source=source)
         if in_restart_window(self.cfg.apply.restart_window, self.now_fn()):
-            return self._restart(new_config, reason="окно перезапуска: " + ", ".join(reasons))
+            return self._restart(new_config, reason="окно перезапуска: " + ", ".join(reasons),
+                                 source=source)
         atomic_write_json(self.paths.pending_config_file, new_config)
         return ApplyOutcome(
             "restart_deferred",
@@ -224,12 +247,12 @@ class Applier:
         if plan.routing is not None:
             self.api.replace_routing(current.get("routing", {}))
 
-    def _restart(self, config: dict, *, reason: str) -> ApplyOutcome:
-        self._promote(config)
+    def _restart(self, config: dict, *, reason: str, source: ApplySource) -> ApplyOutcome:
+        self._promote(config, source=source, method="restart")
         error = self._restart_and_wait()
         if error is None:
             return ApplyOutcome("restart", ops=[f"restart ({reason})"])
-        return self._rollback(reason=error)
+        return self._rollback(reason=error, source=source)
 
     def _prepare_tun(self) -> None:
         """Конфиг с inbound `tun`: интерфейс должен появиться раньше Xray и быть
@@ -275,7 +298,7 @@ class Applier:
                 return f"Xray не поднялся за {self.wait_seconds:.0f} с"
             time.sleep(0.5)
 
-    def _rollback(self, *, reason: str) -> ApplyOutcome:
+    def _rollback(self, *, reason: str, source: ApplySource) -> ApplyOutcome:
         last_good = self.paths.last_good_file
         try:
             good_text = last_good.read_text(encoding="utf-8")
@@ -283,7 +306,7 @@ class Applier:
         except (OSError, json.JSONDecodeError) as exc:
             self.log.error("%s; откат невозможен: last-good не читается (%s)", reason, exc)
             return ApplyOutcome("failed", detail=f"{reason}; last-good отсутствует или бит")
-        atomic_write_text(self.paths.xray_config_file, good_text)
+        self._write_current(good_text, source=source, method="rollback")
         error = self._restart_and_wait()
         if error is not None:
             self.log.error("%s; откат на last-good не помог: %s", reason, error)
@@ -301,7 +324,7 @@ class Applier:
             return None
         return loaded if isinstance(loaded, dict) else None
 
-    def _promote(self, new_config: dict) -> None:
+    def _promote(self, new_config: dict, *, source: ApplySource, method: str) -> None:
         """Новый конфиг становится текущим, предыдущий — last-good.
 
         Текущий копируется, а не переносится: между двумя записями конфиг Xray
@@ -310,8 +333,16 @@ class Applier:
         path = self.paths.xray_config_file
         with contextlib.suppress(FileNotFoundError):
             atomic_write_text(self.paths.last_good_file, path.read_text(encoding="utf-8"))
-        atomic_write_json(path, new_config)
+        self._write_current(json.dumps(new_config, ensure_ascii=False, indent=2) + "\n",
+                            source=source, method=method)
         self._clear_pending()
+
+    def _write_current(self, text: str, *, source: ApplySource, method: str) -> None:
+        data = text.encode("utf-8")
+        atomic_write_bytes(self.paths.xray_config_file, data)
+        fingerprint = hashlib.sha256(data).hexdigest()[:WRITE_FINGERPRINT_LENGTH]
+        self.log.info("xray_config_write source=%s method=%s fingerprint=%s mono_ns=%d",
+                      source.value, method, fingerprint, time.monotonic_ns())
 
     def _clear_pending(self) -> None:
         self.paths.pending_config_file.unlink(missing_ok=True)

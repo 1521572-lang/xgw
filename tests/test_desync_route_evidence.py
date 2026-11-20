@@ -1,10 +1,17 @@
+import hashlib
+import io
 import json
+import logging
+import time
 from contextlib import contextmanager
 
 import pytest
 
+from docs.helpers import xray_config_writes
+from xgw.apply.applier import Applier, ApplySource
 from xgw.desync import route_evidence
 from xgw.generator import singbox
+from xgw.log import MaskingFormatter
 from xgw.paths import Paths
 
 
@@ -137,3 +144,33 @@ def test_snapshot_refuses_unconfirmed_live_api_state(tmp_path, monkeypatch):
     monkeypatch.setattr(route_evidence, "file_lock", lock)
     with pytest.raises(route_evidence.EvidenceError, match="xray_api_state_uncertain"):
         route_evidence.snapshot(paths.xray_config_file, paths=paths)
+
+
+def test_config_write_matches_masked_journal_to_exact_disk_bytes(tmp_path):
+    paths = Paths(root=tmp_path)
+    stream = io.StringIO()
+    logger = logging.Logger("xgw.apply")
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(MaskingFormatter("%(name)s: %(message)s"))
+    logger.addHandler(handler)
+    applier = Applier(None, paths, None, None, logger=logger, validator=lambda _: (True, ""))
+    boot = "e6debe06-8450-4f46-8065-6625a1f166b6"
+    before = {"xray_epoch": f"{boot}:31:1", "config_sha256": "0" * 64,
+              "monotonic_ns": time.monotonic_ns()}
+    applier._write_current('{"secret": "test-private-value"}\n',
+                           source=ApplySource.SINGBOX_GENERATION, method="api")
+    after = before | {
+        "config_sha256": hashlib.sha256(paths.xray_config_file.read_bytes()).hexdigest(),
+        "monotonic_ns": time.monotonic_ns(),
+    }
+    message = stream.getvalue().strip()
+    row = {"_BOOT_ID": boot.replace("-", ""), "_SYSTEMD_UNIT": "xgw.service",
+           "_UID": "0", "MESSAGE": message}
+    result = xray_config_writes.analyze(before, after, [row, row | {"_UID": "1000"}])
+    assert result["state"] == "attributed" and result["writes"] == 1
+    assert result["final_write"]["source"] == "singbox_generation"
+    assert result["final_write"]["method"] == "api"
+    assert "test-private-value" not in message and "fingerprint" not in str(result)
+    assert xray_config_writes.analyze(before, after, [])["state"] == "unattributed"
+    foreign = after | {"config_sha256": "2" * 64}
+    assert xray_config_writes.analyze(before, foreign, [row])["state"] == "unattributed"

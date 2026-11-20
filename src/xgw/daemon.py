@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 from . import cores, cost, engine, fetch, log, managed, nfqws2, priority, rating, usage, zapret2
 from . import pin as pinning
 from . import tailscale as ts
-from .apply.applier import ApplyOutcome, in_restart_window
+from .apply.applier import ApplyOutcome, ApplySource, in_restart_window
 from .apply.rotation import (
     REPLACE_NOW_VERDICTS,
     REPLACEABLE_VERDICTS,
@@ -2631,7 +2631,7 @@ class Daemon:
                 urgent = True
             elif not in_restart_window(self.cfg.apply.restart_window, self.now_time()):
                 return False
-        outcome = self._apply(pending, urgent=urgent)
+        outcome = self._apply(pending, urgent=urgent, source=ApplySource.DAEMON_PENDING)
         if outcome.mode == "rejected":
             # Отклонённый конфиг не перепроверяем на каждом шаге: следующее
             # обновление подписки соберёт новый.
@@ -3089,19 +3089,20 @@ class Daemon:
 
     def _apply(
         self, config: dict, *, urgent: bool, singbox: engine.SingboxChange | None = None,
+        source: ApplySource = ApplySource.DAEMON_REBUILD,
     ) -> ApplyOutcome:
         """Сначала sing-box (мосты должны слушать), затем Xray."""
         if singbox is not None and singbox.config is None and self.singbox.read() is not None:
             from .apply import singbox_generation as generations
 
-            outcome = self.applier.apply(config, urgent=urgent)
+            outcome = self.applier.apply(config, urgent=urgent, source=source)
             if outcome.mode in ("api", "restart", "unchanged"):
                 generations.retire(self.singbox)
             return outcome
         rejected = self._apply_singbox(singbox)
         if rejected is not None:
             return rejected
-        return self.applier.apply(config, urgent=urgent)
+        return self.applier.apply(config, urgent=urgent, source=source)
 
     # --- сканы и замена участников ---------------------------------------------
 
@@ -4472,7 +4473,10 @@ class Daemon:
     def _zapret2_apply(self, patched: dict, base: dict) -> bool:
         if self._desync_retired or (self.stopping and zapret2.active(patched)):
             return False
-        return self._report(self.applier.apply_api_only(patched, base=base), "zapret2: маршрут")
+        return self._report(
+            self.applier.apply_api_only(patched, base=base, source=ApplySource.ZAPRET2_ROUTE),
+            "zapret2: маршрут",
+        )
 
     def _media_apply(self, now: float) -> bool:
         """Правило видео — прямо в работающее ядро, только через API (п. 350). Через общую сборку
@@ -4493,8 +4497,10 @@ class Daemon:
         if patched is None or patched == applied:
             self.log.warning("правило видео не встроить в рабочий конфиг")
             return False
-        return self._report(self.applier.apply_api_only(patched, base=applied),
-                            "YouTube: выход для видео")
+        return self._report(
+            self.applier.apply_api_only(patched, base=applied, source=ApplySource.YOUTUBE_ROUTE),
+            "YouTube: выход для видео",
+        )
 
     def _media_confirmed(self, wanted: tuple[str, ...], now: float) -> bool:
         """Ядро знает этот балансировщик и выбирает только его серверы (проверка — один раз на

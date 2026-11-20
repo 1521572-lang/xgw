@@ -3,6 +3,7 @@
 import copy
 import datetime
 import json
+from unittest.mock import Mock
 
 import pytest
 from test_generator import _build
@@ -125,12 +126,16 @@ def _needs_restart(config: dict) -> dict:
 def test_api_path_promotes_files(env):
     paths, current = env
     api = StubApi()
-    outcome = _applier(paths, api).apply(_with_extra_outbound(current))
+    logger = Mock()
+    outcome = _applier(paths, api, logger=logger).apply(_with_extra_outbound(current))
     assert outcome.mode == "api"
     assert api.calls == ["adi", "ado", "adrules"]
     assert "proxy-zz-ffffffff" in [o["tag"] for o in _on_disk(paths)["outbounds"]]
     # старый конфиг стал last-good
     assert json.loads(paths.last_good_file.read_text(encoding="utf-8")) == current
+    logger.info.assert_called_once()
+    template, *args = logger.info.call_args.args
+    assert (template % tuple(args)).startswith("xray_config_write source=apply method=api ")
 
 
 def _with_routing_change(config: dict) -> dict:

@@ -87,7 +87,7 @@ class FakeApplier:
         self.api_only: list[dict] = []
         self.api_only_mode = "api"
 
-    def apply_api_only(self, config, *, base):
+    def apply_api_only(self, config, *, base, source=None):
         self.api_only.append(config)
         if self.api_only_mode == "api" and self.paths.xray_config_file.exists():
             assert json.loads(self.paths.xray_config_file.read_text(encoding="utf-8")) == base
@@ -290,7 +290,7 @@ class Harness(Daemon):
             singbox_ok=self.singbox_ok and not failed,
         )
 
-    def _apply(self, config, *, urgent, singbox=None):
+    def _apply(self, config, *, urgent, singbox=None, source=None):
         rejected = self._apply_singbox(singbox)
         if rejected is not None:
             return rejected
@@ -1637,10 +1637,10 @@ def test_new_config_is_applied_before_the_rules_when_capture_waits_for_it(guarde
     order: list[str] = []
     original_apply, original_loaded = daemon._apply, capture.loaded
 
-    def apply(config, *, urgent, singbox=None):
+    def apply(config, *, urgent, singbox=None, source=None):
         order.append("apply")
         capture.problem = ""  # Xray перезапущен с новым конфигом
-        return original_apply(config, urgent=urgent, singbox=singbox)
+        return original_apply(config, urgent=urgent, singbox=singbox, source=source)
 
     def loaded():
         order.append("rules")
@@ -1671,9 +1671,9 @@ def test_switched_capture_is_reported_as_turned_on_not_as_lost_rules(guarded):
     daemon, capture = guarded
     original_apply = daemon._apply
 
-    def apply(config, *, urgent, singbox=None):
+    def apply(config, *, urgent, singbox=None, source=None):
         capture.problem = ""  # Xray перезапущен с новым конфигом
-        return original_apply(config, urgent=urgent, singbox=singbox)
+        return original_apply(config, urgent=urgent, singbox=singbox, source=source)
 
     daemon._apply = apply
     capture.problem = "в применённом конфиге Xray нет inbound tun-in для интерфейса xgwtun0"
