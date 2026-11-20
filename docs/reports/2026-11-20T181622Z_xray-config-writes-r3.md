@@ -79,4 +79,4 @@ inactive; off/off fresh (3-й опрос); ipify ок; таймер остано
 3. Адмиссия делает 2 записи маршрута (settings + mode) — если желательно
    сократить перезаписи конфига при включении, можно батчить settings+mode
    в один apply.
-- Publication commit: `добавляется после push`.
+- Publication commit: `fac258acf8898287affdf19f37982610ec526945` (c78c11f → fac258a, ancestor verified).
