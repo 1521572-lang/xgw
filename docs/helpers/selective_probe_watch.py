@@ -97,7 +97,7 @@ def worker_invocation():
     return value if re.fullmatch(r"[0-9a-f]{32}", value) and int(value, 16) else None
 
 
-def parse_socket_stats(text):
+def parse_socket_stats(text, *, include_local_endpoint=False):
     sockets = []
     for line in text.splitlines():
         if not line.strip():
@@ -107,7 +107,7 @@ def parse_socket_stats(text):
         fields = line.split(maxsplit=5)
         if len(fields) != 6:
             raise ValueError("invalid socket row")
-        state, _, _, _, remote, details = fields
+        state, _, _, local, remote, details = fields
         address, sep, port = remote.rpartition(":")
         if not sep or port != "443":
             raise ValueError("invalid socket destination")
@@ -125,6 +125,8 @@ def parse_socket_stats(text):
         retrans = re.search(r"(?:^|\s)retrans:\d+/(\d+)(?=\s|$)", details)
         metrics["retrans_total"] = int(retrans[1]) if retrans else (0 if tcp_info else None)
         row = {"socket": match[1], "peer_ip": str(peer), "state": state, **metrics}
+        if include_local_endpoint:
+            row["local_endpoint"] = local
         owners = re.findall(r"\bpid=([1-9][0-9]*),", details)
         if owners:
             row["owner_pids"] = sorted({int(pid) for pid in owners})

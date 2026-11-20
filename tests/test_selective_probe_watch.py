@@ -2,6 +2,7 @@ from itertools import pairwise
 
 import pytest
 
+from docs.helpers import selective_flow_evidence as flow_evidence
 from docs.helpers import selective_media_evidence as evidence
 from docs.helpers import selective_probe_watch as watch
 from docs.helpers import selective_wan_control as wan_control
@@ -32,6 +33,8 @@ def test_socket_stats_distinguishes_received_data_from_missing_tcp_info(monkeypa
     assert (received["bytes_received"], received["data_segs_in"]) == (3456, 3)
     assert unknown["bytes_received"] is None
     assert "192.0.2.1" not in str(result)
+    with_endpoint = watch.parse_socket_stats(text, include_local_endpoint=True)
+    assert with_endpoint["sockets"][0]["local_endpoint"] == "192.0.2.1:43120"
 
 
 @pytest.mark.parametrize(("text", "state"), [
@@ -179,6 +182,46 @@ def test_media_reports_why_matched_sockets_lack_outbound_evidence(
     assert window["queue_above_background"] == background
     assert "198.51.100.2" not in str(result)
     assert "private-server" not in str(result)
+
+
+@pytest.mark.parametrize(("matches", "group", "unmatched"), [
+    (1, "xray", {}),
+    (0, None, {"no_access_record": 1}),
+    (2, None, {"ambiguous": 1}),
+])
+def test_flow_evidence_requires_exact_client_endpoint_and_unique_xray_record(
+    matches, group, unmatched,
+):
+    boot = "01234567-abcd-0123-abcd-0123456789ab"
+    epoch = f"{boot}:42:1"
+    before = media_sample(1, 10, epoch=epoch)["route"]
+    after = media_sample(7, 10, epoch=epoch)["route"]
+    for snapshot in (before, after):
+        snapshot["tags"]["proxy-private"] = {"group": "xray", "uplink": 0, "downlink": 10}
+    player = socket_rows("player-private", "198.51.100.2", 7)
+    for row in player:
+        row["capture_started_unix"] = 104
+        row["sockets"][0]["local_endpoint"] = "[::ffff:192.0.2.1]:43120"
+    event = {
+        "_SYSTEMD_UNIT": "xgw-xray.service", "_BOOT_ID": boot.replace("-", ""), "_PID": "42",
+        "__REALTIME_TIMESTAMP": "104200000",
+        "MESSAGE": "from tcp:192.0.2.1:43120 accepted tcp:198.51.100.2:443 "
+                   "[tun-in -> proxy-private]",
+    }
+    wrong_port = event | {"MESSAGE": event["MESSAGE"].replace("43120", "43121")}
+    wrong_peer = event | {"MESSAGE": event["MESSAGE"].replace("198.51.100.2", "198.51.100.3")}
+    wrong_inbound = event | {"MESSAGE": event["MESSAGE"].replace("tun-in", "zapret2-probe")}
+    other_process = event | {"_PID": "41"}
+    result = flow_evidence.analyze(
+        player, [wrong_port, wrong_peer, wrong_inbound, other_process, *([event] * matches)],
+        before, after,
+    )
+    assert result["qualified_flows"] == 1
+    assert result["groups"] == ({group: 1} if group else {})
+    assert result["unmatched"] == unmatched
+    assert result["state"] == ("observed" if group else "inconclusive")
+    assert all(secret not in str(result)
+               for secret in ("192.0.2.1", "198.51.100.2", "player-private", "proxy-private"))
 
 
 def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypatch):

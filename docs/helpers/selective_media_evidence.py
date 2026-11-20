@@ -9,6 +9,7 @@ from itertools import pairwise
 from pathlib import Path
 
 MAX_LOG_BYTES = 8 * 1024**2
+MAX_LOG_ROWS = 5000
 MIN_MEDIA_BYTES = 32 * 1024
 OUTBOUND_GROUPS = ("zapret2", "xray", "sing-box")
 MAX_DIAGNOSTIC_WINDOWS = 5
@@ -20,11 +21,15 @@ def number(value):
 
 def read_log(path):
     with path.open("rb") as stream:
-        raw = stream.read(MAX_LOG_BYTES + 1)
+        return read_rows(stream)
+
+
+def read_rows(stream):
+    raw = stream.read(MAX_LOG_BYTES + 1)
     if len(raw) > MAX_LOG_BYTES:
         raise ValueError("log_size")
     rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    if len(rows) > 5000 or any(not isinstance(row, dict) for row in rows):
+    if len(rows) > MAX_LOG_ROWS or any(not isinstance(row, dict) for row in rows):
         raise ValueError("log_rows")
     return rows
 

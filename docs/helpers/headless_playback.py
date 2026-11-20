@@ -156,7 +156,7 @@ def player_sockets(pid):
             capture_output=True, text=True, timeout=1, check=True,
         ).stdout
         owned = [line for line in output.splitlines() if re.search(rf"\bpid={pid},", line)]
-        return parse_socket_stats("\n".join(owned))["sockets"]
+        return parse_socket_stats("\n".join(owned), include_local_endpoint=True)["sockets"]
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
 
@@ -254,7 +254,7 @@ def main():
     play.add_argument("--seek-forward", type=int, choices=(480,))
     play.add_argument("--samples", type=Path, required=True)
     play.add_argument("--peers", action="store_true",
-                      help="Record private TCP socket counters for the first 180 s")
+                      help="Record private TCP endpoints and counters for the first 180 s")
     args = parser.parse_args()
     try:
         if os.name != "posix" or not shutil.which("curl" if args.action == "probe" else "mpv"):
