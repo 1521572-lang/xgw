@@ -49,7 +49,7 @@ TEST_PY=${XGW_TEST_PYTHON:-$PY}
 WRITE_GATE=0
 WRITE_FILES=(src/xgw/apply/applier.py src/xgw/apply/singbox_generation.py src/xgw/daemon.py)
 if [[ $OVERLAY == --selective-route-status ]]; then
-  WRITE_FILES+=(src/xgw/watch/zapret2_control.py src/xgw/watch/zapret2_management.py)
+  WRITE_FILES+=(src/xgw/watch/zapret2_control.py src/xgw/watch/zapret2_management.py src/xgw/zapret2.py)
 fi
 
 write_worktrees() {

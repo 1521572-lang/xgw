@@ -1,10 +1,17 @@
-# ThinkCentre — статус Selective после замены участника VPN
+# ThinkCentre — контроль CDN через VPN и статус Selective после ротации
 
 Ubuntu 24.04 LTS. Flash сама выполняет техническую проверку и при любом
 исходе публикует отчёт. При недоступном терминале, панели или sudo запроси
 доступ у владельца. Начни с off/off, проверь обычный VPN. Замена участника
 наблюдается при штатной работе watchdog. Используй согласованный с
 владельцем короткий сеанс установки и проверяй обычный HTTPS до и после.
+
+В первом проходе тесты, установка и откат прошли. Прямые пробы двух
+CDN дошли до TLS-таймаута. Ранее в том же прогоне один из этих узлов
+дал 206/65536 через VPN. Переход статуса при ротации не проверен.
+В повторе одна штатная попытка Selective даёт измеримый результат и
+при таком отказе. После снятия прямого правила контроллер проверяет
+тот же URL CDN через VPN. [Первый отчёт](../reports/2026-11-20T224355Z_selective-route-status.md)
 
 В r3 `daemon_rebuild` сопоставлен с заменой участника. В отдельном
 пассивном окне off/off за 180 с увидели одну атомарную замену файла и
@@ -23,29 +30,101 @@ Ubuntu 24.04 LTS. Flash сама выполняет техническую пр�
 Затем в том же Bash задай:
 
 ```bash
-CANDIDATE=93d87f196e11e20f6748a80c0978fbb5c0b623ff
+CANDIDATE=d4b9a7b7f9919808b9fb13662f9abe4e92f6eb97
 OVERLAY=--selective-route-status
 UNIT=xgw-selective-route-status-rollback
 ```
 
 Выполни оба блока **§1** [ТЗ записи r3](XRAY-CONFIG-WRITES-2026-11-20.md)
 из текущей ветки. Проверь, что в первом блоке сохранены эти переменные,
-а в `WRITE_FILES` ровно пять файлов. Этот вариант включает Applier,
-sing-box generations, daemon, control и management. Control использует
-уже проверенный в CDN r2 метод management. Пять файлов должны совпасть
+а в `WRITE_FILES` ровно шесть файлов. Этот вариант включает Applier,
+sing-box generations, daemon, control, management и `zapret2.py`.
+Control использует уже проверенный в CDN r2 метод management.
+Шесть файлов должны совпасть
 с контрольной базой на соответствующей стороне парного прогона. Включи
 тесты с одним интерпретатором и обычными правами. После `WRITE_GATE_OK`
 временная установка под guard допускается. Если блок установки вернул
 ошибку, переходи к восстановлению по §4 r3 и публикации.
 
-## 2. Один просмотр и наблюдение до четырёх минут
+## 2. Один допуск Selective
 
-Выполни §2 [ТЗ записи r3](XRAY-CONFIG-WRITES-2026-11-20.md). Возьми
-`FORMAT="$VPN_FORMAT"` и начни с off/off. После положительного контроля
-допуска подтверди `fresh=true, policy_matched=true, active,
-https_reachable` перед стартом пары. Обычный HTTPS через VPN продолжает
-работать. Если CDN из VPN через прямой путь не прошёл, запиши фазу,
-код и причину, вернись к off/off и заверши восстановление.
+Возьми определения `snapshot`, `live` и `writers` из первого
+блока §2 [ТЗ записи r3](XRAY-CONFIG-WRITES-2026-11-20.md).
+В том же Bash задай `FORMAT="$VPN_FORMAT"` и начни с off/off.
+Из §2 [MEDIA-PROOF r2](MEDIA-PROOF-2026-11-20-R2.md) возьми
+только блок сохранения настроек `if live && run before-settings off_status`.
+Подтверди `SELECTIVE_SETTINGS_READY`. Используй один свежий URL,
+проверенный через VPN. Переходи с off напрямую в Selective следующим
+блоком. Предыдущий ручной Standalone и перебор IP пропусти.
+
+```bash
+if live && snapshot route-admission-before; then
+  run route-admission timeout -k 3 125 "$PY" -u -B -P - <<'PY'
+import http.client
+import json
+import time
+
+from xgw.desync.client import Client
+
+client = Client()
+overview = "/api/zapret2/overview"
+initial = client.request(overview)["zapret2"]
+if not (initial["fresh"] and initial["policy_matched"]
+        and initial["mode"] == initial["engine_mode"] == initial["state"] == "off"
+        and initial.get("blockers", {}).get("selective") == []):
+    raise SystemExit("settings_not_ready")
+reply = client.request("/api/zapret2/mode", {
+    "mode": "selective", "expected": initial["config_key"],
+})
+if reply.get("ok") is not True or not reply.get("config_key"):
+    raise SystemExit("mode_rejected")
+
+deadline = time.monotonic() + 105
+while time.monotonic() < deadline:
+    try:
+        current = client.request(overview)["zapret2"]
+    except (OSError, http.client.HTTPException, KeyError, ValueError):
+        time.sleep(1)
+        continue
+    if current["config_key"] != reply["config_key"]:
+        raise SystemExit("policy_changed")
+    if (current["fresh"] and current["policy_matched"]
+            and current["mode"] == "selective" and current["engine_mode"] == "off"):
+        state = current["state"]
+        evidence = current["evidence"]
+        if ((state == "active" and evidence["transport"] == "https_reachable")
+                or state in ("fallback", "blocked", "error")):
+            cdn = evidence["transport_probes"].get("cdn", {})
+            print(json.dumps({
+                "state": state, "reason": current["reason"],
+                "cdn_phase": cdn.get("phase"), "cdn_kind": cdn.get("kind"),
+                "vpn_control": evidence.get("vpn_control"),
+                "vpn_control_target": evidence.get("vpn_control_target"),
+                "vpn_control_reason": evidence.get("vpn_control_reason"),
+            }))
+            break
+    time.sleep(1)
+else:
+    raise SystemExit("admission_deadline")
+PY
+fi
+```
+
+- При `fallback` сними `snapshot route-admission-after` и подтверди
+  `client_zapret2_rule=false`. Проверь обычный VPN. Значения
+  `cdn_phase=tls, cdn_kind=timeout, vpn_control_target=cdn,
+  vpn_control=pass` подтверждают доступность одного URL CDN через
+  VPN после прямого отказа. DNS и фактический IP могли отличаться.
+  `fail` означает отказ контрольного запроса. Для `not_run` укажи
+  причину. Плеер и проверку ротации отметь `NOT_RUN` и перейди к §4.
+- При `blocked`, `error`, дедлайне или отказе API опубликуй
+  соответствующую фазу и перейди к §4. Одна попытка POST на одну
+  ревизию. После потери ответа сверить состояние панели и восстановить.
+- При `active` сними `snapshot route-admission-after`, проверь
+  `client_zapret2_rule=true` и переходи к §3. При расхождении
+  зафиксируй обе точки и перейди к §4.
+
+## 3. Один просмотр и наблюдение до четырёх минут
 
 Из §3 [ТЗ записи r3](XRAY-CONFIG-WRITES-2026-11-20.md) возьми определения
 `trace_python` и `trace_playback` по ссылке и используй следующий блок
@@ -85,18 +164,19 @@ fi
   подтверждённой привязке. Запись без привязки к итоговому снимку
   остаётся наблюдением журнала.
 
-## 3. Откат и публикация
+## 4. Откат и публикация
 
 Выполни **§4** [ТЗ записи r3](XRAY-CONFIG-WRITES-2026-11-20.md) с
-исходными переменными. Подтверди SHA, файлы **5/5**, off/off,
+исходными переменными. Подтверди SHA, файлы **6/6**, off/off,
 выключение обоих воркеров, HTTPS через VPN и остановленный таймер.
 Отметь `UNIT_TESTS`, `DAEMON_BASELINE`, `INSTALL`, `ADMISSION`,
-`STATUS`, `LIVE_PLAY`, `FLOW`, `RESTORE` и время наблюдения.
+`CDN_VPN_CONTROL` с `target/result/reason`, `STATUS`, `LIVE_PLAY`,
+`FLOW`, `RESTORE` и время наблюдения.
 Однозначно отдели наблюдение ротации на установленном кандидате от
 прежних отчётов, адреса и приватные файлы сохрани на ThinkCentre.
 
 При любом исходе опубликуй один обезличенный Markdown-отчёт в
 `integration/zapret2-batch1` по блоку публикации §3
 [ТЗ пересчёта](MEDIA-COUNTERS-2026-11-20.md), с суффиксом
-`_selective-route-status.md`. Проверь коммит в удалённой ветке и
+`_selective-route-status-r2.md`. Проверь коммит в удалённой ветке и
 верни ссылку.
