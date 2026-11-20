@@ -194,6 +194,11 @@ function updateProbePreset() {
   const enabled = el("setting-youtube").checked;
   el("use-youtube-domains").hidden = !enabled || !latest?.youtube_domains?.length;
   el("use-probe-terms").hidden = !enabled || el("setting-clear").checked;
+  if (el("cdn-replacement-hint")) {
+    const canReplace = enabled && latest?.can_replace_cdn_probe && !el("setting-clear").checked;
+    el("cdn-replacement-hint").hidden = !canReplace;
+    put("cdn-replacement-hint", canReplace ? "Чтобы обновить пробу CDN, заполните только её адрес." : "");
+  }
 }
 el("setting-youtube").addEventListener("change", updateProbePreset);
 el("use-youtube-domains").addEventListener("click", () => {
@@ -222,14 +227,17 @@ el("settings-form").addEventListener("submit", event => {
     daily_probe_mb: Number(el("setting-budget").value),
     youtube_transport_probe: el("setting-youtube").checked,
   };
-  const urls = [el("setting-page").value.trim(), el("setting-media").value.trim()];
+  const page = el("setting-page").value.trim();
+  const cdn = el("setting-media").value.trim();
   if (el("setting-clear").checked) settings.probe_urls = [];
-  else if (urls.some(Boolean)) {
-    if (!urls.every(Boolean)) {
+  else if (page && cdn) settings.probe_urls = [page, cdn];
+  else if (page || cdn) {
+    if (!page && settings.youtube_transport_probe && latest?.can_replace_cdn_probe) {
+      settings.cdn_probe_url = cdn;
+    } else {
       put("command-result", "Для замены заполните оба адреса.");
       return;
     }
-    settings.probe_urls = urls;
   }
   command("settings", {settings, expected: draftKey});
 });

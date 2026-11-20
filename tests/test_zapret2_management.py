@@ -120,6 +120,52 @@ def test_modes_require_prerequisites_and_do_not_change_engine(store):
     assert config.load(cfg)[0].zapret2.engine == "auto"
 
 
+def test_replacing_only_the_cdn_retains_the_page_and_checks_the_revision(store, monkeypatch):
+    cfg, panel = store
+    page = "https://www.youtube.com/t/terms"
+    old_cdn = "https://r1.googlevideo.com/videoplayback?expire=1&sig=previous"
+    assert send(cfg, {"youtube_transport_probe": True, "probe_urls": [page, old_cdn]})["ok"]
+    old_key = key(cfg)
+    cdn = "https://r2.googlevideo.com/videoplayback?expire=2000000000&sig=secret"
+    result = send(cfg, {"cdn_probe_url": cdn})
+    assert result["ok"] and result["config_key"] != old_key and "secret" not in str(result)
+    assert config.load(cfg)[0].zapret2.probe_urls == [page, cdn]
+    assert "cdn_probe_url" not in panel.read_text()
+    before = panel.read_bytes(), panel.stat().st_mtime_ns
+    assert send(cfg, {"cdn_probe_url": old_cdn}, expected=old_key)["code"] == "conflict"
+    assert send(cfg, {"cdn_probe_url": cdn})["code"] == "unchanged"
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == before
+    assert send(cfg, "selective", action="mode")["ok"]
+    assert send(cfg, {"cdn_probe_url": old_cdn})["code"] == "blocked"
+    assert config.load(cfg)[0].zapret2.probe_urls == [page, cdn]
+    monkeypatch.setattr(management.time, "time", lambda: 2000000001)
+    refreshed = "https://r3.googlevideo.com/videoplayback?expire=2000000600&sig=new"
+    assert send(cfg, {"cdn_probe_url": refreshed})["code"] == "saved"
+    active = config.load(cfg)[0].zapret2
+    assert active.mode == "selective" and active.probe_urls == [page, refreshed]
+
+
+def test_cdn_only_requires_saved_pair_and_rejects_conflicting_or_invalid_inputs(store):
+    cfg, panel = store
+    cdn = "https://r1.googlevideo.com/generate_204"
+    before = panel.read_bytes()
+    assert send(cfg, {"cdn_probe_url": cdn})["code"] == "blocked"
+    assert panel.read_bytes() == before
+    assert send(cfg, {"youtube_transport_probe": True, "probe_urls": [
+        "https://www.youtube.com/t/terms", cdn,
+    ]})["ok"]
+    before = panel.read_bytes()
+    for patch in (
+        {"cdn_probe_url": None},
+        {"cdn_probe_url": cdn, "probe_urls": []},
+        {"cdn_probe_url": cdn, "youtube_transport_probe": False},
+        {"cdn_probe_url": "https://other.test/videoplayback?secret"},
+    ):
+        result = send(cfg, patch)
+        assert not result["ok"] and "secret" not in str(result)
+        assert panel.read_bytes() == before
+
+
 def test_youtube_gate_validates_merged_mode_domains_and_urls(store):
     cfg, panel = store
     before = panel.read_bytes()

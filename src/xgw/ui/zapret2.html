@@ -111,9 +111,10 @@
             <p id="saved-probes" class="muted"></p>
             <label>Новая HTTPS-страница<input id="setting-page" type="password" autocomplete="new-password"></label>
             <button type="button" id="use-probe-terms" hidden>Подставить страницу условий YouTube</button>
-            <label>Новый HTTPS-файл видео<input id="setting-media" type="password" autocomplete="new-password"></label>
-            <p class="muted">Пустые поля сохраняют прежние адреса. Для замены заполните оба.
-              Подписанная ссылка CDN должна быть действующей.</p>
+            <label>Новый HTTPS-адрес CDN<input id="setting-media" type="password" autocomplete="new-password"
+              aria-describedby="saved-probes cdn-replacement-hint"></label>
+            <p class="muted">Пустые поля сохраняют прежние адреса. Подписанная ссылка CDN должна быть действующей.</p>
+            <p id="cdn-replacement-hint" class="muted" hidden></p>
             <label class="zm-check"><input id="setting-clear" type="checkbox">Удалить сохранённые адреса</label>
             <div class="zm-actions">
               <button type="submit">Сохранить</button>

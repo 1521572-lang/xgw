@@ -64,6 +64,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Настройки zapret2")
         self.resize(560, 460)
+        self.can_replace_cdn = view.get("can_replace_cdn_probe") is True
         box = QVBoxLayout(self)
         box.addWidget(plain("Выбранные домены открываются через домашний IP. "
                             "Для YouTube нужны вместе страница и видеосеть."))
@@ -87,16 +88,17 @@ class SettingsDialog(QDialog):
                                  "с VPN умеет только multisplit и multidisorder. "
                                  "Flowseal ALT9 выбирается отдельной кнопкой подготовки.")
         self.urls = []
-        for title in ("HTTPS-страница", "HTTPS-файл видео"):
+        for title in ("HTTPS-страница", "HTTPS-адрес CDN"):
             field = QLineEdit()
             field.setEchoMode(QLineEdit.EchoMode.Password)
             field.setAccessibleName(title)
             self.urls.append(field)
             form.addRow(title, field)
         box.addLayout(form)
+        replacement = ("Для обновления пробы заполните только адрес CDN."
+                       if self.can_replace_cdn else "Для сохранения проб заполните оба адреса.")
         box.addWidget(plain(f"Сохранено адресов проверок — {view.get('probe_count', 0)}. "
-                            "Пустые поля сохраняют прежние адреса. Для замены заполните оба. "
-                            "Адрес файла видео должен быть действующим."))
+                            "Пустые поля сохраняют прежние адреса. " + replacement))
         if view.get("youtube_transport_probe"):
             box.addWidget(plain("Включена HTTPS-проверка YouTube и CDN. Она проверяет "
                                 "доступность транспорта, а не воспроизведение ролика."))
@@ -120,6 +122,8 @@ class SettingsDialog(QDialog):
         urls = [field.text().strip() for field in self.urls]
         if self.clear_urls.isChecked():
             result["probe_urls"] = []
+        elif self.can_replace_cdn and not urls[0] and urls[1]:
+            result["cdn_probe_url"] = urls[1]
         elif any(urls):
             result["probe_urls"] = urls
         return result

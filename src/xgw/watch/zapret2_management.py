@@ -11,11 +11,17 @@ from .. import config, managed, zapret2
 from ..desync import schema
 from ..paths import LockTimeout
 
-EDITABLE = frozenset({"strategy", "domains", "probe_urls", "check_seconds",
+EDITABLE = frozenset({"strategy", "domains", "probe_urls", "cdn_probe_url", "check_seconds",
                       "retry_seconds", "daily_probe_mb", "youtube_transport_probe"})
 # Ordinary settings may retain an imported profile, but cannot enter it.
 PROFILES = tuple(p for p in schema.SELECTED_PROFILES if p != schema.LIVE_STRATEGY)
 MODES = ("off", "standalone", "selective")
+
+
+def can_replace_cdn_probe(settings):
+    return settings.youtube_transport_probe and schema.valid_youtube_transport(
+        "selective", settings.domains, settings.probe_urls,
+    )
 
 
 def candidate(cfg, patch, *, editing=False):
@@ -46,6 +52,7 @@ def candidate(cfg, patch, *, editing=False):
     policy = schema.migrate(flat)
     projected = schema.project(policy)
     proposed = copy.copy(cfg)
+    proposed.desync = policy
     proposed.zapret2 = config.Zapret2(**projected)
     problems = zapret2.validate(proposed)
     if problems:
@@ -109,6 +116,11 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture,
     if (not isinstance(patch, dict) or (action == "settings" and set(patch) - EDITABLE)
             or (action == "mode" and body[field] not in MODES)):
         return reply(False, "invalid", "Недопустимые поля или режим.")
+    cdn_url = patch.get("cdn_probe_url")
+    if "cdn_probe_url" in patch:
+        if "probe_urls" in patch or not isinstance(cdn_url, str):
+            return reply(False, "invalid", "Укажите новый адрес CDN или полную пару проб.")
+        patch = {name: value for name, value in patch.items() if name != "cdn_probe_url"}
     try:
         patch = schema.validate_patch(patch)
         if "strategy" in patch and patch["strategy"] not in schema.SELECTED_PROFILES:
@@ -122,6 +134,13 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture,
             if body["expected"] != key:
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
+            if cdn_url is not None:
+                if (not can_replace_cdn_probe(cfg.zapret2)
+                        or patch.get("youtube_transport_probe") is False):
+                    return reply(False, "blocked", "Сначала сохраните пару HTTPS-проб YouTube.")
+                patch.update(schema.validate_patch({
+                    "probe_urls": [cfg.zapret2.probe_urls[0], cdn_url],
+                }))
             if (action == "settings" and patch.get("strategy") == schema.LIVE_STRATEGY
                     and cfg.zapret2.strategy != schema.LIVE_STRATEGY):
                 return reply(False, "invalid", "Для выбора Flowseal ALT9 используйте "

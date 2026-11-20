@@ -85,12 +85,15 @@ SELECTIVE_RANGE = ("zapret2.py", "desync/jobs.py", "desync/client.py")
 SELECTIVE_RANGE_TIMER = "xgw-selective-range-rollback.timer"
 SELECTIVE_STARTUP = (*SELECTIVE_RANGE, "watch/zapret2_control.py", "daemon.py")
 SELECTIVE_STARTUP_TIMER = "xgw-selective-startup-rollback.timer"
+SELECTIVE_CDN_UPDATE = ("watch/zapret2_management.py", "watch/zapret2_control.py",
+                        "ui/zapret2.html", "ui/zapret2.js")
+SELECTIVE_CDN_UPDATE_TIMER = "xgw-selective-cdn-update-rollback.timer"
 
 
 def gui_files(files):
     if files == BACKEND:
         return GUI
-    if files in (ZAPRET2_MANAGEMENT, SELECTIVE_BUDGET, SELECTIVE_JOBS):
+    if files in (ZAPRET2_MANAGEMENT, SELECTIVE_BUDGET, SELECTIVE_JOBS, SELECTIVE_CDN_UPDATE):
         return MANAGEMENT_GUI
     return ()
 
@@ -263,6 +266,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "selective_cdn_update", False):
+        return SELECTIVE_CDN_UPDATE, SELECTIVE_CDN_UPDATE_TIMER
     if getattr(args, "selective_startup", False):
         return SELECTIVE_STARTUP, SELECTIVE_STARTUP_TIMER
     if getattr(args, "selective_range", False):
@@ -349,6 +354,7 @@ def main():
     stage.add_argument("--combined-admission", action="store_true")
     stage.add_argument("--selective-range", action="store_true")
     stage.add_argument("--selective-startup", action="store_true")
+    stage.add_argument("--selective-cdn-update", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

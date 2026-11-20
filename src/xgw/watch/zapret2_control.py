@@ -283,6 +283,7 @@ Commands use the same validation as this card; observations remain revision-boun
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
                      "vpn_control_at": vpn_control_at},
         "can_off": not invalid, "can_edit": not invalid,
+        "can_replace_cdn_probe": not invalid and management.can_replace_cdn_probe(cfg.zapret2),
         "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},
         "blockers": blockers,
         "youtube_transport_probe": settings.get("youtube_transport_probe", False),

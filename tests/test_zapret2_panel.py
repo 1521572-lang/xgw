@@ -83,9 +83,13 @@ def test_cdn_expiry_exposes_only_deadline_and_blocks_selective():
     cfg.desync = schema.migrate(vars(cfg.zapret2))
     result = view(cfg, snap)
     assert result["probe_expiry"] == [{"probe": 2, "expires_at": 1000}]
+    assert result["can_replace_cdn_probe"] is True
     assert any("Истёк срок" in part for part in result["blockers"]["selective"])
     assert "sig=private" not in json.dumps(result)
     assert "r1.googlevideo.com" not in json.dumps(result)
+    cfg.zapret2.probe_urls = []
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    assert view(cfg, snap)["can_replace_cdn_probe"] is False
 
 
 def test_transport_probe_details_are_private_and_revision_bound():
