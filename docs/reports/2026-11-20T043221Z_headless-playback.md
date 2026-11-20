@@ -98,4 +98,4 @@ Selective не включался (нет пина) — long/seek/pairs/socket-m
    МБ/с, sustain ~200 КБ/с, буфер 0.4–0.5с минимум. Для 900-секундной фазы
    понадобится профиль с большим запасом sustain или долгий предбуфер
    (сейчас кеш не превышает ~45с и падает до нуля при колебаниях).
-- Publication commit: `добавляется после push`.
+- Publication commit: `0f920bf7293461d3bcaf7c39ab07b9c8918b3eed` (09aabe1 → 0f920bf, ancestor verified).
