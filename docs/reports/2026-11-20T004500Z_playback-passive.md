@@ -111,4 +111,4 @@ bitrate/8; **THROTTLED** — stalls>0 или buf_min<5 или speed<потреб
    интеграции headless-инструментов использовать «прямой URL»-режим.
 4. Exit IP VPN ротируется между сессиями — сверка «тот же выход» должна
    допускать смену узла (сравнивать по факту туннеля, не по константе).
-- Publication commit: `добавляется после push`.
+- Publication commit: `8e4fe8d4c4f65b5aba37bcf7837622f49229bc28` (a1039c7 → 8e4fe8d, ancestor verified).
