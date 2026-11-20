@@ -185,6 +185,7 @@ def capture(url, duration, output, required, seek, *, peers=False):
                 sock.settimeout(3)
                 sock.connect(address)
                 player = Player(sock)
+                capture_started_unix = time.time()
                 if player.command("loadfile", url)["error"] != "success":
                     raise ValueError("loadfile")
                 started = time.monotonic()
@@ -193,6 +194,8 @@ def capture(url, duration, output, required, seek, *, peers=False):
                     row = player.sample()
                     row.update(mono=tick, unix=time.time())
                     if peers and tick - started < 180:
+                        row["capture_started_unix"] = capture_started_unix
+                        row["socket_start_unix"] = time.time()
                         row["sockets"] = player_sockets(proc.pid)
                         row["socket_unix"] = time.time()
                     if not rows:

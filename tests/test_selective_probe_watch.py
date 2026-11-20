@@ -1,5 +1,8 @@
+from itertools import pairwise
+
 import pytest
 
+from docs.helpers import selective_media_evidence as evidence
 from docs.helpers import selective_probe_watch as watch
 from docs.helpers import selective_wan_control as wan_control
 from xgw.net import cmd
@@ -47,6 +50,16 @@ def test_socket_stats_denied_is_unavailable(monkeypatch):
     assert watch.socket_stats() == {"state": "unavailable", "sockets": []}
 
 
+def test_marked_socket_sampler_retains_owner_pids(monkeypatch):
+    def run(args, *, timeout):
+        assert "-HtaOeinp" in args and timeout == 1
+        return ('ESTAB 0 0 192.0.2.1:43120 198.51.100.2:443 '
+                'users:(("xray",pid=42,fd=3)) sk:abc rto:100 bytes_received:65536')
+
+    monkeypatch.setattr(watch.cmd, "run", run)
+    assert watch.socket_stats(owners=True)["sockets"][0]["owner_pids"] == [42]
+
+
 def media_sample(seconds, packets, *, configured=True, semantic="policy", epoch="xray"):
     return {
         "revision": "abc", "worker_invocation": "worker",
@@ -88,6 +101,41 @@ def test_media_pair_accepts_stable_route_and_records_zero_or_positive_queue_grow
 def test_media_pair_rejects_changes_and_missing_samples(after, reason):
     result = watch.media_pair(media_sample(1, 10), after)
     assert result["state"] == "rejected" and result["reason"] == reason
+
+
+@pytest.mark.parametrize(("bad_owner", "queued", "probe_overlap", "path", "queue"), [
+    (False, False, False, "SUPPORTED", "UNCONFIRMED"),
+    (False, True, False, "SUPPORTED", "OBSERVED"),
+    (True, True, False, "UNKNOWN", "UNCONFIRMED"),
+    (False, True, True, "UNKNOWN", "UNCONFIRMED"),
+])
+def test_media_matches_owned_socket_and_excludes_probe_time(
+    bad_owner, queued, probe_overlap, path, queue,
+):
+    gateway = [media_sample(t, 10, epoch="boot:42:1") for t in (1, 4, 7)]
+    for row in gateway:
+        row["queue_owner_confirmed"] = True
+        row["probes"] = {"page": {"started_at": 90, "elapsed_ms": 120}}
+    if queued:
+        gateway[-1]["queue"]["sequence"] = gateway[-1]["outgoing"]["packets"] = 100
+    gateway[-1]["route"]["tags"]["xgw-zapret2"]["downlink"] = 131072
+    if probe_overlap:
+        gateway[-1]["probes"]["cdn"] = {"started_at": 105.1, "elapsed_ms": 100}
+    for before, after in pairwise(gateway):
+        after["media_pair"] = watch.media_pair(before, after)
+
+    def rows(sock, peer, owner):
+        return [{"unix": 104.5 + i, "socket_start_unix": 104.5 + i,
+                 "socket_unix": 104.6 + i, "state": "read", "eligible_phase": True,
+                 "sockets": [{"socket": sock, "peer_ip": peer, "owner_pids": [owner],
+                              "bytes_received": i * 65536}]} for i in range(2)]
+
+    player = rows("player", "198.51.100.2", 7)
+    marked = rows("upstream", "198.51.100.2", 2 if bad_owner else 42)
+    result = evidence.analyze(player, marked, gateway)
+    assert (result["media_path"], result["nfqueue"]) == (path, queue)
+    assert result["background_windows"] == 1
+    assert "198.51.100.2" not in str(result)
 
 
 def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypatch):

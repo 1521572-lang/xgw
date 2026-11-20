@@ -17,6 +17,7 @@ TCP_FIELDS = ("bytes_sent", "bytes_acked", "bytes_received", "bytes_retrans", "d
 MAX_SOCKETS = 32
 MEDIA_INTERVAL = 3
 MAX_PAIR_SECONDS = 10
+SOCKET_INTERVAL = 0.4
 
 
 def nft_rows(kind, name):
@@ -123,13 +124,18 @@ def parse_socket_stats(text):
             metrics[name] = int(value[1]) if value else (0 if tcp_info else None)
         retrans = re.search(r"(?:^|\s)retrans:\d+/(\d+)(?=\s|$)", details)
         metrics["retrans_total"] = int(retrans[1]) if retrans else (0 if tcp_info else None)
-        sockets.append({"socket": match[1], "peer_ip": str(peer), "state": state, **metrics})
+        row = {"socket": match[1], "peer_ip": str(peer), "state": state, **metrics}
+        owners = re.findall(r"\bpid=([1-9][0-9]*),", details)
+        if owners:
+            row["owner_pids"] = sorted({int(pid) for pid in owners})
+        sockets.append(row)
     return {"state": "read", "sockets": sockets}
 
 
-def socket_stats():
+def socket_stats(*, owners=False):
     try:
-        text = cmd.run(["ss", "-HtaOein", "state", "big", "fwmark", "=", hex(zapret2.MARK),
+        flags = "-HtaOeinp" if owners else "-HtaOein"
+        text = cmd.run(["ss", flags, "state", "big", "fwmark", "=", hex(zapret2.MARK),
                         "and", "dport", "=", ":443"], timeout=1)
         return parse_socket_stats(text)
     except cmd.CommandError:
@@ -194,6 +200,7 @@ def media_sample(paths, queue, *, sockets=False):
         invocation = row["worker_invocation"]
         if invocation and invocation == worker_invocation():
             row["route"] = snapshot
+            row["queue_owner_confirmed"] = worker.verify_owner(cmd.run, worker.SELECTED_UNIT, queue)
         else:
             row["route_error"] = "worker_changed"
     return row
@@ -235,6 +242,7 @@ def media_pair(before, after):
         return {"state": "rejected", "reason": "queue_changed"}
 
     return {"state": "accepted", "start_unix": start, "end_unix": end,
+            "queue_seconds": after["queue_end_unix"] - before["queue_end_unix"],
             "nft_packets": last_packets - first_packets,
             "queue_sequence_delta": last_queue["sequence"] - first_queue["sequence"],
             "probe_after": after["probes"].get("page", {}).get("started_at"),
@@ -243,14 +251,31 @@ def media_pair(before, after):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--queue", type=int, required=True)
+    parser.add_argument("--queue", type=int)
     parser.add_argument("--seconds", type=int, default=75)
     parser.add_argument("--socket-stats", action="store_true",
                         help="include TCP counters and private peer IPs in the local file")
     parser.add_argument("--media-pairs", action="store_true",
                         help="sample Xray counters with the queue and compare adjacent readings")
+    parser.add_argument("--marked-sockets", action="store_true",
+                        help="sample marked sockets and owner PIDs independently of counters")
     args = parser.parse_args()
-    if not 1 <= args.queue <= 65535 or not 1 <= args.seconds <= 180:
+    if not 1 <= args.seconds <= 180:
+        parser.error("seconds must be 1–180")
+    if args.marked_sockets:
+        if args.queue is not None or args.socket_stats or args.media_pairs:
+            parser.error("--marked-sockets is a standalone collection mode")
+        deadline = time.monotonic() + args.seconds
+        while time.monotonic() < deadline:
+            tick = time.monotonic()
+            start = time.time()
+            details = socket_stats(owners=True)
+            print(json.dumps({"socket_start_unix": start, "socket_unix": time.time(),
+                              "sockets": details["sockets"], "state": details["state"]}),
+                  flush=True)
+            time.sleep(max(0, min(deadline, tick + SOCKET_INTERVAL) - time.monotonic()))
+        return
+    if args.queue is None or not 1 <= args.queue <= 65535:
         parser.error("queue must be 1–65535 and seconds 1–180")
     paths = Paths.from_env()
     deadline = time.monotonic() + args.seconds
