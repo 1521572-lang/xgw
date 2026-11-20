@@ -84,6 +84,37 @@ def _number(value: object) -> bool:
 PAGE_KINDS = ("terms", "watch", "other")
 
 
+def _probe_metrics(row: dict) -> dict:
+    fields = {}
+    for name, accepted in (
+        ("phase", ("connect", "tls", "request", "headers", "body")),
+        ("kind", ("ok", "http", "proxy", "connect", "tls", "timeout", "stall",
+                  "truncated", "reset", "io", "cancelled")),
+    ):
+        item = row.get(name)
+        fields[name] = item if isinstance(item, str) and item in accepted else None
+    for name, limit in (("http", 599), ("connect_http", 599),
+                        ("bytes", zapret2.PROBE_BYTES), ("elapsed_ms", 60_000)):
+        item = row.get(name)
+        fields[name] = item if type(item) is int and 0 <= item <= limit else None
+    return fields
+
+
+def _vpn_attempts(value: object, *, now: float) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    attempts = []
+    for item in value[:2]:
+        row = _record(item)
+        verdict, reason, at = row.get("verdict"), row.get("reason"), row.get("at")
+        if (not isinstance(verdict, str) or verdict not in VPN_CONTROL_REASONS
+                or not isinstance(reason, str) or reason not in VPN_CONTROL_REASONS[verdict]
+                or not _number(at) or not 0 <= at <= now):
+            continue
+        attempts.append({"verdict": verdict, "reason": reason, "at": at, **_probe_metrics(row)})
+    return attempts
+
+
 def transport_probes(value: object, *, now: float) -> dict:
     probes = {}
     source = _record(value)
@@ -91,18 +122,7 @@ def transport_probes(value: object, *, now: float) -> dict:
         row = _record(source.get(target))
         if type(row.get("ok")) is not bool:
             continue
-        fields = {"ok": row["ok"]}
-        for name, accepted in (
-            ("phase", ("connect", "tls", "request", "headers", "body")),
-            ("kind", ("ok", "http", "proxy", "connect", "tls", "timeout", "stall",
-                      "truncated", "reset", "io", "cancelled")),
-        ):
-            item = row.get(name)
-            fields[name] = item if isinstance(item, str) and item in accepted else None
-        for name, limit in (("http", 599), ("connect_http", 599),
-                            ("bytes", zapret2.PROBE_BYTES), ("elapsed_ms", 60_000)):
-            item = row.get(name)
-            fields[name] = item if type(item) is int and 0 <= item <= limit else None
+        fields = {"ok": row["ok"], **_probe_metrics(row)}
         started = row.get("started_at")
         fields["started_at"] = started if _number(started) and 0 < started <= now else None
         if target == "page":
@@ -210,6 +230,8 @@ Commands use the same validation as this card; observations remain revision-boun
                    and selected.get("without_vpn") is True)
     vpn_control, vpn_control_reason, vpn_control_at = "not_run", None, None
     vpn_control_target = None
+    vpn_control_attempts = []
+    vpn_control_retry_pending = False
     if (fresh and matched and not invalid and settings["mode"] == "selective"
             and phase in ("fallback", "blocked")):
         verdict = selected.get("vpn_control")
@@ -223,6 +245,11 @@ Commands use the same validation as this card; observations remain revision-boun
             target = selected.get("vpn_control_target")
             if target in ("page", "cdn"):
                 vpn_control_target = target
+                vpn_control_attempts = _vpn_attempts(selected.get("vpn_control_attempts"), now=now)
+                vpn_control_retry_pending = (
+                    target == "cdn" and phase == "fallback" and vpn_control == "fail"
+                    and selected.get("vpn_control_retry_pending") is True
+                )
     profile = raw.get("profile") if source == "engine" else settings["strategy"]
     allowed = schema.ENGINE_PROFILES if source == "engine" else schema.SELECTED_PROFILES
     profile = profile if isinstance(profile, str) and profile in allowed else None
@@ -244,11 +271,16 @@ Commands use the same validation as this card; observations remain revision-boun
         detail += " Контроллер снял прямой маршрут."
         control_fresh = vpn_control_at is not None and now - vpn_control_at <= FRESH_SECONDS
         if control_fresh and vpn_control_target == "cdn" and vpn_control == "pass":
-            detail += " Тот же пробный URL CDN ответил через VPN."
+            if len(vpn_control_attempts) == 2:
+                detail += " Повторная проба того же URL CDN через VPN прошла."
+            else:
+                detail += " Тот же пробный URL CDN ответил через VPN."
         elif control_fresh and vpn_control_target == "cdn" and vpn_control == "fail":
             detail += " Проба того же URL CDN через VPN тоже не прошла."
+            if vpn_control_retry_pending:
+                detail += " Ожидается один повтор через VPN."
         elif control_fresh and vpn_control_reason == zapret2.CDN_EXPIRED:
-            detail += " Срок адреса CDN истёк к завершению контрольной пробы."
+            detail += " Срок пробного адреса CDN истёк."
         elif control_fresh and vpn_control == "pass" and vpn_control_reason == "ok":
             detail += " Свежая контрольная проба через VPN прошла."
         else:
@@ -293,7 +325,9 @@ Commands use the same validation as this card; observations remain revision-boun
                      "transport_probes": transport_rows,
                      "last_transport_ok_at": last_transport_ok_at,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
-                     "vpn_control_target": vpn_control_target, "vpn_control_at": vpn_control_at},
+                     "vpn_control_target": vpn_control_target, "vpn_control_at": vpn_control_at,
+                     "vpn_control_attempts": vpn_control_attempts,
+                     "vpn_control_retry_pending": vpn_control_retry_pending},
         "can_off": not invalid, "can_edit": not invalid,
         "can_replace_cdn_probe": not invalid and management.can_replace_cdn_probe(cfg.zapret2),
         "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},

@@ -425,7 +425,60 @@ def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes,
     assert h.controller.view["state"] == "fallback"
     assert h.controller.view["vpn_control_target"] == "cdn"
     assert h.controller.view["vpn_control"] == expected
+    assert h.controller.vpn_cdn_retry is None
     assert h.controller._read_budget(h.cfg).spent_bytes == 4 * z.PROBE_CHARGE
+
+
+@pytest.mark.parametrize("limit_mb", [1, 2])
+def test_transient_cdn_vpn_failure_keeps_first_result_and_retries_at_most_once(limit_mb):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.daily_probe_mb = limit_mb
+    page = "https://www.youtube.com/t/terms"
+    cdn = "https://r1.googlevideo.com/videoplayback?sig=fixture"
+    h.cfg.zapret2.probe_urls = [page, cdn]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    vpn_port = 20011
+    vpn_calls = []
+
+    def request(url, port, *_args, **_options):
+        if port == vpn_port:
+            assert url == cdn and not z.active(h.current) and not h.runtime.up
+            vpn_calls.append(url)
+            if len(vpn_calls) == 2:
+                return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES,
+                                             phase="body")
+        elif url == page:
+            return checks.DownloadResult(True, status=200, downloaded=32768)
+        return checks.DownloadResult(False, kind="timeout", phase="tls")
+
+    h.controller._request = request
+    for now in (0, 1, 2):
+        h.step(now, vpn_probe_port=vpn_port)
+    first, = h.controller.view["vpn_control_attempts"]
+    assert (first["verdict"], first["phase"], first["kind"]) == ("fail", "tls", "timeout")
+    assert h.controller.view["vpn_control_retry_pending"]
+    due, _ = h.controller.vpn_cdn_retry
+    events = list(h.runtime.events)
+    h.step(due - 1, vpn_probe_port=vpn_port)
+    assert len(vpn_calls) == 1
+    h.step(due, vpn_probe_port=vpn_port)
+    h.step(due + 20, vpn_probe_port=vpn_port)
+
+    assert h.controller.view["state"] == "fallback"
+    assert not h.controller.view["vpn_control_retry_pending"]
+    original, second = h.controller.view["vpn_control_attempts"]
+    assert original == first
+    assert h.runtime.events == events
+    if limit_mb == 2:
+        assert len(vpn_calls) == 2
+        assert (second["verdict"], second["http"], second["bytes"]) == ("pass", 206, z.PROBE_BYTES)
+        assert h.controller.view["vpn_control"] == "pass"
+    else:
+        assert len(vpn_calls) == 1
+        assert (second["verdict"], second["reason"]) == ("not_run", "budget_unavailable")
+        assert h.controller.view["vpn_control"] == "fail"
+    assert h.controller._read_budget(h.cfg).spent_bytes == (3 + len(vpn_calls)) * z.PROBE_CHARGE
 
 
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():

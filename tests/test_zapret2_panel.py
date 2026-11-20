@@ -275,6 +275,26 @@ def test_fallback_reports_same_cdn_control_only_for_the_current_revision():
     assert view(cfg, snap)["evidence"]["vpn_control_target"] is None
 
 
+def test_vpn_retry_keeps_both_attempts_and_filters_private_details():
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback", gate_closed=True,
+                        vpn_control="pass", vpn_control_target="cdn",
+                        vpn_control_reason="ok", vpn_control_at=NOW - 1)
+    snap["zapret2"]["vpn_control_attempts"] = [
+        {"verdict": "fail", "reason": "request_failed", "at": NOW - 35, "phase": "tls",
+         "kind": "timeout", "error": "private URL"},
+        {"verdict": "pass", "reason": "ok", "at": NOW - 1, "phase": "body",
+         "http": 206, "bytes": 65536},
+    ]
+    result = view(cfg, snap)
+    rows = result["evidence"]["vpn_control_attempts"]
+    assert [(row["verdict"], row["phase"]) for row in rows] == [("fail", "tls"), ("pass", "body")]
+    assert rows[1]["http"] == 206 and rows[1]["bytes"] == 65536
+    assert "private" not in json.dumps(result)
+    assert "Повторная проба" in result["detail"]
+    snap["zapret2_policy_key"] = "previous"
+    assert view(cfg, snap)["evidence"]["vpn_control_attempts"] == []
+
+
 def test_private_and_untrusted_fields_are_not_published():
     cfg, snap = fixture(reason="secret-in-error", profile="secret-profile", queue="secret")
     snap["capture"]["nfqws2"]["probes"] = [{"url": "secret-token"}]

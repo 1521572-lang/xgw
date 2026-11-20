@@ -53,6 +53,9 @@ CDN_EXPIRED = "youtube_cdn_expired"
 # Резерв на тело, TLS и заголовки; списывается до запроса, включая прерванный.
 PROBE_CHARGE = 256 * 1024
 PROBE_DAY_SECONDS = 86400
+VPN_CONTROL_SECONDS = 8
+VPN_CDN_RETRY_DELAY = 30
+VPN_CDN_RETRY_KINDS = frozenset({"connect", "timeout", "reset", "stall", "io"})
 REDIRECT_LIMIT = 5
 START_WAIT = 20
 START_POLL = 2
@@ -497,6 +500,7 @@ class Controller:
         self.ready = False
         self.cleanup_pending = False
         self.start_deadline: float | None = None
+        self.vpn_cdn_retry: tuple[float, str] | None = None
         self.last_error = ""
         self.probe_failure = "probe_failed"
         self.last_transport_ok_at: float | None = None
@@ -512,11 +516,14 @@ class Controller:
             return None
         return read_probe_budget(raw, cfg.zapret2.daily_probe_mb, now=time.time())
 
-    def _budget(self, cfg: Config, *, single_probe: bool = False, vpn: bool = False) -> bool:
+    def _budget(self, cfg: Config, *, single_probe: bool = False, vpn: bool = False,
+                preserve_admission: bool = False) -> bool:
         budget = self._read_budget(cfg)
         charge = probe_charge(cfg.zapret2, single_probe=single_probe)
         reserve = PROBE_CHARGE if cfg.zapret2.mode == "selective" and not vpn else 0
         if budget is None or budget.remaining_bytes < charge + reserve:
+            return False
+        if preserve_admission and probe_admission(cfg.zapret2, budget.remaining_bytes - charge):
             return False
         try:
             self.store.set_meta(BUDGET, json.dumps({
@@ -528,7 +535,7 @@ class Controller:
 
     @staticmethod
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
-                 *, max_total: float = 8, silence: float = 4,
+                 *, max_total: float = VPN_CONTROL_SECONDS, silence: float = 4,
                  min_body: int = 16 * 1024, tls_timeout: float | None = None,
                  range_end: int = 0) -> DownloadResult:
         from .generator import builder
@@ -681,32 +688,32 @@ class Controller:
 
     def _fallback_vpn_control(
         self, cfg: Config, applied: dict, port: int, cancel, *,
-        gate_closed: bool, routed_back: bool, stopped: bool, target: str,
-    ) -> tuple[str, str]:
+        gate_closed: bool, routed_back: bool, stopped: bool, target: str, retry: bool = False,
+    ) -> tuple[str, str, DownloadResult | None]:
         from .generator import builder
 
         if not gate_closed:
-            return "not_run", "gate_not_closed"
+            return "not_run", "gate_not_closed", None
         if not routed_back:
-            return "not_run", "route_not_restored"
+            return "not_run", "route_not_restored", None
         if not stopped:
-            return "not_run", "worker_not_stopped"
+            return "not_run", "worker_not_stopped", None
         if cancel is not None and cancel.is_set():
-            return "not_run", "cancelled"
+            return "not_run", "cancelled", None
         urls = cfg.zapret2.probe_urls
         index = 1 if target == "cdn" else 0
         if len(urls) <= index:
-            return "not_run", "no_probe_url"
+            return "not_run", "no_probe_url", None
         if not port:
-            return "not_run", "no_vpn_probe_port"
+            return "not_run", "no_vpn_probe_port", None
         password, _ = builder.probe_state(applied)
         if not password:
-            return "not_run", "no_probe_credentials"
+            return "not_run", "no_probe_credentials", None
         expires_at = probe_expiry(cfg.zapret2) if target == "cdn" else None
         if expires_at is not None and time.time() >= expires_at:
-            return "not_run", CDN_EXPIRED
-        if not self._budget(cfg, single_probe=True, vpn=True):
-            return "not_run", "budget_unavailable"
+            return "not_run", CDN_EXPIRED, None
+        if not self._budget(cfg, single_probe=True, vpn=True, preserve_admission=retry):
+            return "not_run", "budget_unavailable", None
         url = urls[index]
         media_range = target == "cdn" and urlsplit(url).path == "/videoplayback"
         options = {}
@@ -716,20 +723,55 @@ class Controller:
             options = {"min_body": 0}
         result = self._request(url, port, password, cfg.probe.user_agent, cancel, **options)
         if result.kind == "cancelled":
-            return "not_run", "cancelled"
+            return "not_run", "cancelled", result
         if expires_at is not None and time.time() >= expires_at:
-            return "not_run", CDN_EXPIRED
+            return "not_run", CDN_EXPIRED, result
         ok = result.ok
         if media_range:
             ok = ok and result.status == 206 and result.downloaded == PROBE_BYTES
         elif target == "cdn":
             ok = ok and result.status in (200, 204)
-        return ("pass", "ok") if ok else ("fail", "request_failed")
+        return ("pass", "ok", result) if ok else ("fail", "request_failed", result)
+
+    def _record_vpn_control(
+        self, target: str, control: tuple[str, str, DownloadResult | None], *, retry: bool = False,
+    ) -> None:
+        verdict, reason, result = control
+        at = time.time()
+        attempt = {"verdict": verdict, "reason": reason, "at": at}
+        if result is not None:
+            connect = result.phase == "connect"
+            attempt.update(phase=result.phase, kind=result.kind or ("ok" if verdict == "pass"
+                                                                    else "http"),
+                           http=0 if connect else result.status, bytes=result.downloaded,
+                           connect_http=result.status if connect else 0)
+        attempts = self.view.get("vpn_control_attempts", []) if retry else []
+        self.view["vpn_control_attempts"] = [*attempts, attempt]
+        if not retry or verdict != "not_run":
+            self.view.update(vpn_control=verdict, vpn_control_reason=reason,
+                             vpn_control_target=target, vpn_control_at=at)
+
+    def _retry_cdn_control(self, cfg: Config, applied: dict, port: int, cancel, now: float) -> None:
+        if self.vpn_cdn_retry is None:
+            return
+        due, url = self.vpn_cdn_retry
+        if now < due:
+            return
+        self.vpn_cdn_retry = None
+        self.view["vpn_control_retry_pending"] = False
+        if now + VPN_CONTROL_SECONDS >= self.next_check or cfg.zapret2.probe_urls[1] != url:
+            return
+        control = self._fallback_vpn_control(
+            cfg, applied, port, cancel, gate_closed=True, routed_back=True,
+            stopped=not self.runtime.alive(cfg.zapret2.queue_num), target="cdn", retry=True,
+        )
+        self._record_vpn_control("cdn", control, retry=True)
 
     def step(self, cfg: Config, applied: dict, now: float, apply, *, allowed=True,
              vpn_probe_port: int = 0, cancel=None) -> bool:
         from .generator import builder
 
+        step_started = time.monotonic()
         present = any(o.get("tag") == OUT for o in applied.get("outbounds", []))
         comparing = cfg.zapret2.mode == "compare"
         selective = cfg.zapret2.mode == "selective"
@@ -743,6 +785,7 @@ class Controller:
         if (not finished and not wanted and not present and not self.ready
                 and not self.cleanup_pending):
             self.start_deadline = None
+            self.vpn_cdn_retry = None
             self.view = {"state": "off", "reason": "off"}
             return False
         reason = "off" if not wanted else "waiting_for_probe_urls"
@@ -757,6 +800,13 @@ class Controller:
                             and self.view.get("gate_closed") is True):
                         return False
                     raise ValueError(CDN_EXPIRED)
+                if (selective and not self.ready and not active(applied)
+                        and now < self.next_check and self.view.get("state") == "fallback"
+                        and self.view.get("gate_closed") is True):
+                    # During cooldown the optional control uses only the VPN probe inbound.
+                    self._retry_cdn_control(cfg, applied, vpn_probe_port, cancel, now)
+                    return False
+                self.vpn_cdn_retry = None
                 if selective and (not self.ready or now >= self.next_check):
                     budget = self._read_budget(cfg)
                     if probe_admission(cfg.zapret2, budget.remaining_bytes if budget else None):
@@ -774,12 +824,6 @@ class Controller:
                     self.start_deadline = now + START_WAIT
                     self.view = {"state": "preparing", "reason": "probe_inbound"}
                     return changed
-                if (cfg.zapret2.mode == "selective" and not self.ready and not active(applied)
-                        and now < self.next_check and self.view.get("state") == "fallback"
-                        and self.view.get("gate_closed") is True):
-                    # The closed route and the result belong to the current retry window.
-                    # Replacing the snapshot here used to erase the VPN result on the next tick.
-                    return False
                 if not self.ready and now >= self.next_check:
                     self.runtime.gate()
                     starting = True
@@ -876,6 +920,7 @@ class Controller:
                 stopped = False
         self.ready = False
         self.start_deadline = None
+        self.vpn_cdn_retry = None
         self.cleanup_pending = not stopped
         if comparing and self.comparison is not None:
             if stopped and self.comparison_trace is None:
@@ -901,12 +946,18 @@ class Controller:
             cdn_tls_timeout = (reason == "youtube_cdn_probe_failed"
                                and cdn.get("phase") == "tls" and cdn.get("kind") == "timeout")
             target = "cdn" if cdn_tls_timeout else "page"
-            verdict, why = self._fallback_vpn_control(
+            control = self._fallback_vpn_control(
                 cfg, applied, vpn_probe_port, cancel, gate_closed=gate_closed,
                 routed_back=routed_back, stopped=stopped, target=target,
             )
-            self.view.update(vpn_control=verdict, vpn_control_reason=why,
-                             vpn_control_target=target, vpn_control_at=time.time())
+            self._record_vpn_control(target, control)
+            verdict, _, result = control
+            due = now + (time.monotonic() - step_started) + VPN_CDN_RETRY_DELAY
+            if (target == "cdn" and verdict == "fail" and result is not None
+                    and result.kind in VPN_CDN_RETRY_KINDS
+                    and due + VPN_CONTROL_SECONDS < self.next_check):
+                self.vpn_cdn_retry = (due, cfg.zapret2.probe_urls[1])
+                self.view["vpn_control_retry_pending"] = True
         return changed
 
     def step_standalone(self, cfg: Config, applied: dict, now: float, apply,
