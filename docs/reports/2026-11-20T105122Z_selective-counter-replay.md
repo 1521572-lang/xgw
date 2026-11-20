@@ -73,4 +73,4 @@
 Ubuntu 24.04.5 LTS; REPLAY выполнен от пользователя-владельца журналов;
 sudo не требовался. Шаги: old/new rc пары (0,0)×2; контрольные суммы
 ожидаемых кортежей совпали (matches_report=true ×2); публикация — только
-этот отчёт. Publication commit: `добавляется после push`.
+этот отчёт. Publication commit: `b9deea121aad4950f0b80881c54f5bc4c76a645b` (1dcbfe1 → b9deea1, ancestor verified).
