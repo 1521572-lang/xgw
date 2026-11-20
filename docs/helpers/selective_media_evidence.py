@@ -10,6 +10,8 @@ from pathlib import Path
 
 MAX_LOG_BYTES = 8 * 1024**2
 MIN_MEDIA_BYTES = 32 * 1024
+OUTBOUND_GROUPS = ("zapret2", "xray", "sing-box")
+MAX_DIAGNOSTIC_WINDOWS = 5
 
 
 def number(value):
@@ -80,6 +82,16 @@ def rates(pair):
             pair["nft_packets"] / queue_seconds, pair["queue_sequence_delta"] / queue_seconds)
 
 
+def unmatched_outbound_reason(rate, background):
+    if rate is None:
+        return "counter_unavailable"
+    if rate == 0:
+        return "no_growth"
+    if background is None:
+        return "background_unavailable"
+    return "at_or_below_background"
+
+
 def analyze(player, sockets, gateway):
     counters = Counter()
     probe_windows = set()
@@ -106,15 +118,17 @@ def analyze(player, sockets, gateway):
             counters["owner_unconfirmed"] += 1
             continue
         last_read = max(after["route"]["unix"], after["queue_end_unix"], end)
-        windows.append((start, end, last_read, int(pid), rates(pair)))
+        windows.append((start, end, last_read, int(pid), rates(pair), pair["groups"]))
 
     started = player[0].get("capture_started_unix", player[0]["unix"]) if player else None
-    background = [values for _, _, last, _, values in windows
+    background = [values for _, _, last, _, values, _ in windows
                   if started is not None and last < started]
     baseline = [max((row[i] for row in background if row[i] is not None), default=None)
                 for i in range(3)]
     playback = [row for row in player if row.get("eligible_phase") is True]
-    for start, end, _, pid, values in windows:
+    unmatched_reasons = Counter()
+    unmatched_windows = []
+    for start, end, _, pid, values, groups in windows:
         if started is None or end <= started:
             continue
         counters["comparable_windows"] += 1
@@ -126,12 +140,37 @@ def analyze(player, sockets, gateway):
         increases = [actual is not None and base is not None and actual > base
                      for actual, base in zip(values, baseline, strict=True)]
         counters["outbound_matches"] += increases[0]
-        counters["queue_matches"] += all(increases[1:])
+        queue_increase = all(increases[1:])
+        counters["queue_matches"] += queue_increase
         counters["full_matches"] += all(increases)
+        if not increases[0]:
+            reason = unmatched_outbound_reason(values[0], baseline[0])
+            unmatched_reasons[reason] += 1
+            downlink = {}
+            for group in OUTBOUND_GROUPS:
+                value = groups.get(group, {}).get("downlink")
+                downlink[group] = value if type(value) is int and value >= 0 else None
+            unmatched_windows.append({
+                "offset_seconds": round(start - started, 3),
+                "overlap_seconds": round(end - start, 3),
+                "downlink_bytes": downlink,
+                "zapret2_bytes_per_second": values[0],
+                "queue_above_background": queue_increase,
+                "reason": reason,
+            })
+    unmatched_windows.sort(
+        key=lambda window: max(value or 0 for value in window["downlink_bytes"].values()),
+        reverse=True,
+    )
     return {"counts": dict(counters), "background_windows": len(background),
             "media_path": ("SUPPORTED" if counters["outbound_matches"]
                            else "PARTIAL" if counters["socket_matches"] else "UNKNOWN"),
-            "nfqueue": "OBSERVED" if counters["queue_matches"] else "UNCONFIRMED"}
+            "nfqueue": "OBSERVED" if counters["queue_matches"] else "UNCONFIRMED",
+            "outbound_diagnostics": {
+                "zapret2_background_peak_bytes_per_second": baseline[0],
+                "unmatched_reasons": dict(unmatched_reasons),
+                "top_unmatched_windows": unmatched_windows[:MAX_DIAGNOSTIC_WINDOWS],
+            }}
 
 
 def main():

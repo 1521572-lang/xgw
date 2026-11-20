@@ -103,6 +103,13 @@ def test_media_pair_rejects_changes_and_missing_samples(after, reason):
     assert result["state"] == "rejected" and result["reason"] == reason
 
 
+def socket_rows(sock, peer, owner):
+    return [{"unix": 104.5 + i, "socket_start_unix": 104.5 + i,
+             "socket_unix": 104.6 + i, "state": "read", "eligible_phase": True,
+             "sockets": [{"socket": sock, "peer_ip": peer, "owner_pids": [owner],
+                          "bytes_received": i * 65536}]} for i in range(2)]
+
+
 @pytest.mark.parametrize(("bad_owner", "queued", "probe_overlap", "path", "queue"), [
     (False, False, False, "SUPPORTED", "UNCONFIRMED"),
     (False, True, False, "SUPPORTED", "OBSERVED"),
@@ -124,18 +131,54 @@ def test_media_matches_owned_socket_and_excludes_probe_time(
     for before, after in pairwise(gateway):
         after["media_pair"] = watch.media_pair(before, after)
 
-    def rows(sock, peer, owner):
-        return [{"unix": 104.5 + i, "socket_start_unix": 104.5 + i,
-                 "socket_unix": 104.6 + i, "state": "read", "eligible_phase": True,
-                 "sockets": [{"socket": sock, "peer_ip": peer, "owner_pids": [owner],
-                              "bytes_received": i * 65536}]} for i in range(2)]
-
-    player = rows("player", "198.51.100.2", 7)
-    marked = rows("upstream", "198.51.100.2", 2 if bad_owner else 42)
+    player = socket_rows("player", "198.51.100.2", 7)
+    marked = socket_rows("upstream", "198.51.100.2", 2 if bad_owner else 42)
     result = evidence.analyze(player, marked, gateway)
     assert (result["media_path"], result["nfqueue"]) == (path, queue)
     assert result["background_windows"] == 1
     assert "198.51.100.2" not in str(result)
+
+
+@pytest.mark.parametrize(("last_downlink", "background", "reason"), [
+    (310, True, "no_growth"),
+    (510, True, "at_or_below_background"),
+    (510, False, "background_unavailable"),
+    (None, True, "counter_unavailable"),
+])
+def test_media_reports_why_matched_sockets_lack_outbound_evidence(
+    last_downlink, background, reason,
+):
+    gateway = [media_sample(t, 10, epoch="boot:42:1") for t in (1, 4, 7)]
+    for row, downlink, vpn in zip(gateway, (10, 310, last_downlink), (0, 0, 50000), strict=True):
+        row["queue_owner_confirmed"] = True
+        row["probes"] = {"page": {"started_at": 90, "elapsed_ms": 120}}
+        tags = row["route"]["tags"]
+        tags["xgw-zapret2"]["downlink"] = downlink
+        tags["private-server"] = {"group": "xray", "uplink": 0, "downlink": vpn}
+    gateway[-1]["queue"]["sequence"] = gateway[-1]["outgoing"]["packets"] = 40
+    gateway[0]["queue_owner_confirmed"] = background
+    for before, after in pairwise(gateway):
+        after["media_pair"] = watch.media_pair(before, after)
+
+    player = socket_rows("player", "198.51.100.2", 7)
+    marked = socket_rows("upstream", "198.51.100.2", 42)
+    result = evidence.analyze(player, marked, gateway)
+
+    assert result["media_path"] == "PARTIAL"
+    assert result["counts"]["socket_matches"] == 1
+    assert result["counts"]["outbound_matches"] == 0
+    diagnostics = result["outbound_diagnostics"]
+    assert diagnostics["unmatched_reasons"] == {reason: 1}
+    assert diagnostics["zapret2_background_peak_bytes_per_second"] == (100 if background else None)
+    (window,) = diagnostics["top_unmatched_windows"]
+    assert window["downlink_bytes"] == {
+        "zapret2": None if last_downlink is None else last_downlink - 310,
+        "xray": 50000,
+        "sing-box": None,
+    }
+    assert window["queue_above_background"] == background
+    assert "198.51.100.2" not in str(result)
+    assert "private-server" not in str(result)
 
 
 def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypatch):
