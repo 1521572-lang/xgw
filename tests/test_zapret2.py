@@ -391,6 +391,43 @@ def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
     assert charged == seed + (3 + attempts) * z.PROBE_CHARGE
 
 
+@pytest.mark.parametrize(("vpn_status", "vpn_bytes", "expected"), [
+    (206, z.PROBE_BYTES, "pass"),
+    (200, z.PROBE_BYTES, "fail"),
+    (206, 1, "fail"),
+])
+def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes, expected):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    page = "https://www.youtube.com/t/terms"
+    cdn = "https://r1.googlevideo.com/videoplayback?sig=fixture"
+    h.cfg.zapret2.probe_urls = [page, cdn]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    vpn_port = 20011
+    direct_port = h.cfg.zapret2.probe_port
+    calls = []
+
+    def request(url, port, *_args, **options):
+        calls.append((url, port))
+        if port == vpn_port:
+            assert not z.active(h.current) and not h.runtime.up
+            assert h.runtime.events[-1] == ("stop", 0)
+            assert options == {"min_body": z.PROBE_BYTES, "range_end": z.PROBE_BYTES}
+            return checks.DownloadResult(True, status=vpn_status, downloaded=vpn_bytes)
+        if url == page:
+            return checks.DownloadResult(True, status=200, downloaded=32768)
+        return checks.DownloadResult(False, kind="timeout", phase="tls")
+
+    h.controller._request = request
+    for now in (0, 1, 2, 3):
+        h.step(now, vpn_probe_port=vpn_port)
+    assert calls == [(page, direct_port), (cdn, direct_port), (cdn, direct_port), (cdn, vpn_port)]
+    assert h.controller.view["state"] == "fallback"
+    assert h.controller.view["vpn_control_target"] == "cdn"
+    assert h.controller.view["vpn_control"] == expected
+    assert h.controller._read_budget(h.cfg).spent_bytes == 4 * z.PROBE_CHARGE
+
+
 def test_youtube_transport_rejects_wrong_media_url_or_extra_domains():
     cfg, _, _ = setup()
     cfg.zapret2.youtube_transport_probe = True

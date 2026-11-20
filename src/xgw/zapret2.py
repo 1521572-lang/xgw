@@ -681,7 +681,7 @@ class Controller:
 
     def _fallback_vpn_control(
         self, cfg: Config, applied: dict, port: int, cancel, *,
-        gate_closed: bool, routed_back: bool, stopped: bool,
+        gate_closed: bool, routed_back: bool, stopped: bool, target: str,
     ) -> tuple[str, str]:
         from .generator import builder
 
@@ -693,20 +693,38 @@ class Controller:
             return "not_run", "worker_not_stopped"
         if cancel is not None and cancel.is_set():
             return "not_run", "cancelled"
-        if not cfg.zapret2.probe_urls:
+        urls = cfg.zapret2.probe_urls
+        index = 1 if target == "cdn" else 0
+        if len(urls) <= index:
             return "not_run", "no_probe_url"
         if not port:
             return "not_run", "no_vpn_probe_port"
         password, _ = builder.probe_state(applied)
         if not password:
             return "not_run", "no_probe_credentials"
+        expires_at = probe_expiry(cfg.zapret2) if target == "cdn" else None
+        if expires_at is not None and time.time() >= expires_at:
+            return "not_run", CDN_EXPIRED
         if not self._budget(cfg, single_probe=True, vpn=True):
             return "not_run", "budget_unavailable"
-        result = self._request(cfg.zapret2.probe_urls[0], port, password,
-                               cfg.probe.user_agent, cancel)
+        url = urls[index]
+        media_range = target == "cdn" and urlsplit(url).path == "/videoplayback"
+        options = {}
+        if media_range:
+            options = {"min_body": PROBE_BYTES, "range_end": PROBE_BYTES}
+        elif target == "cdn":
+            options = {"min_body": 0}
+        result = self._request(url, port, password, cfg.probe.user_agent, cancel, **options)
         if result.kind == "cancelled":
             return "not_run", "cancelled"
-        return ("pass", "ok") if result.ok else ("fail", "request_failed")
+        if expires_at is not None and time.time() >= expires_at:
+            return "not_run", CDN_EXPIRED
+        ok = result.ok
+        if media_range:
+            ok = ok and result.status == 206 and result.downloaded == PROBE_BYTES
+        elif target == "cdn":
+            ok = ok and result.status in (200, 204)
+        return ("pass", "ok") if ok else ("fail", "request_failed")
 
     def step(self, cfg: Config, applied: dict, now: float, apply, *, allowed=True,
              vpn_probe_port: int = 0, cancel=None) -> bool:
@@ -879,12 +897,16 @@ class Controller:
                 and self.transport_probes):
             self.view["transport_probes"] = self.transport_probes
         if cfg.zapret2.mode == "selective" and check_vpn:
+            cdn = self.transport_probes.get("cdn", {})
+            cdn_tls_timeout = (reason == "youtube_cdn_probe_failed"
+                               and cdn.get("phase") == "tls" and cdn.get("kind") == "timeout")
+            target = "cdn" if cdn_tls_timeout else "page"
             verdict, why = self._fallback_vpn_control(
                 cfg, applied, vpn_probe_port, cancel, gate_closed=gate_closed,
-                routed_back=routed_back, stopped=stopped,
+                routed_back=routed_back, stopped=stopped, target=target,
             )
             self.view.update(vpn_control=verdict, vpn_control_reason=why,
-                             vpn_control_at=time.time())
+                             vpn_control_target=target, vpn_control_at=time.time())
         return changed
 
     def step_standalone(self, cfg: Config, applied: dict, now: float, apply,

@@ -14,7 +14,7 @@ FRESH_SECONDS = 90
 VPN_CONTROL_REASONS = {
     "not_run": frozenset({"gate_not_closed", "route_not_restored", "worker_not_stopped",
                           "cancelled", "no_probe_url", "no_vpn_probe_port", "no_probe_credentials",
-                          "budget_unavailable"}),
+                          "budget_unavailable", zapret2.CDN_EXPIRED}),
     "pass": frozenset({"ok"}),
     "fail": frozenset({"request_failed"}),
 }
@@ -209,6 +209,7 @@ Commands use the same validation as this card; observations remain revision-boun
     without_vpn = (fresh and matched and phase == "active" and settings["mode"] == "standalone"
                    and selected.get("without_vpn") is True)
     vpn_control, vpn_control_reason, vpn_control_at = "not_run", None, None
+    vpn_control_target = None
     if (fresh and matched and not invalid and settings["mode"] == "selective"
             and phase in ("fallback", "blocked")):
         verdict = selected.get("vpn_control")
@@ -219,6 +220,9 @@ Commands use the same validation as this card; observations remain revision-boun
         if (verdict == vpn_control and isinstance(why, str)
                 and why in VPN_CONTROL_REASONS[vpn_control] and _number(at) and 0 <= at <= now):
             vpn_control_reason, vpn_control_at = why, at
+            target = selected.get("vpn_control_target")
+            if target in ("page", "cdn"):
+                vpn_control_target = target
     profile = raw.get("profile") if source == "engine" else settings["strategy"]
     allowed = schema.ENGINE_PROFILES if source == "engine" else schema.SELECTED_PROFILES
     profile = profile if isinstance(profile, str) and profile in allowed else None
@@ -238,8 +242,14 @@ Commands use the same validation as this card; observations remain revision-boun
             detail = transport_failure_detail(reason, transport_rows)
     if phase == "fallback":
         detail += " Контроллер снял прямой маршрут."
-        if (vpn_control == "pass" and vpn_control_reason == "ok" and vpn_control_at is not None
-                and now - vpn_control_at <= FRESH_SECONDS):
+        control_fresh = vpn_control_at is not None and now - vpn_control_at <= FRESH_SECONDS
+        if control_fresh and vpn_control_target == "cdn" and vpn_control == "pass":
+            detail += " Тот же пробный URL CDN ответил через VPN."
+        elif control_fresh and vpn_control_target == "cdn" and vpn_control == "fail":
+            detail += " Проба того же URL CDN через VPN тоже не прошла."
+        elif control_fresh and vpn_control_reason == zapret2.CDN_EXPIRED:
+            detail += " Срок адреса CDN истёк к завершению контрольной пробы."
+        elif control_fresh and vpn_control == "pass" and vpn_control_reason == "ok":
             detail += " Свежая контрольная проба через VPN прошла."
         else:
             detail += " Доступность VPN проверяется отдельно."
@@ -283,7 +293,7 @@ Commands use the same validation as this card; observations remain revision-boun
                      "transport_probes": transport_rows,
                      "last_transport_ok_at": last_transport_ok_at,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,
-                     "vpn_control_at": vpn_control_at},
+                     "vpn_control_target": vpn_control_target, "vpn_control_at": vpn_control_at},
         "can_off": not invalid, "can_edit": not invalid,
         "can_replace_cdn_probe": not invalid and management.can_replace_cdn_probe(cfg.zapret2),
         "capabilities": {"status": True, "change_mode": not invalid, "edit_policy": not invalid},

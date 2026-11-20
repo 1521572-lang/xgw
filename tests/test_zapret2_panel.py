@@ -262,6 +262,19 @@ def test_transport_failure_detail_uses_only_current_probe(reason, probe, failure
     assert expected not in view(cfg, snap)["detail"]
 
 
+def test_fallback_reports_same_cdn_control_only_for_the_current_revision():
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback", gate_closed=True,
+                        reason="youtube_cdn_probe_failed", vpn_control="pass",
+                        vpn_control_reason="ok", vpn_control_target="cdn", vpn_control_at=NOW - 5)
+    result = view(cfg, snap)
+    assert result["evidence"]["vpn_control_target"] == "cdn"
+    assert "Тот же пробный URL CDN ответил через VPN" in result["detail"]
+    snap["zapret2"]["vpn_control_at"] = NOW - 120
+    assert "CDN ответил через VPN" not in view(cfg, snap)["detail"]
+    snap["zapret2_policy_key"] = "previous"
+    assert view(cfg, snap)["evidence"]["vpn_control_target"] is None
+
+
 def test_private_and_untrusted_fields_are_not_published():
     cfg, snap = fixture(reason="secret-in-error", profile="secret-profile", queue="secret")
     snap["capture"]["nfqws2"]["probes"] = [{"url": "secret-token"}]

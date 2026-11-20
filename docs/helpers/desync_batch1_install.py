@@ -91,7 +91,7 @@ SELECTIVE_CDN_UPDATE_TIMER = "xgw-selective-cdn-update-rollback.timer"
 XRAY_WRITE_TRACE = ("apply/applier.py", "apply/singbox_generation.py", "daemon.py")
 XRAY_WRITE_TRACE_TIMER = "xgw-write-trace-rollback.timer"
 SELECTIVE_ROUTE_STATUS = (
-    *XRAY_WRITE_TRACE, "watch/zapret2_control.py", "watch/zapret2_management.py",
+    *XRAY_WRITE_TRACE, "watch/zapret2_control.py", "watch/zapret2_management.py", "zapret2.py",
 )
 SELECTIVE_ROUTE_STATUS_TIMER = "xgw-selective-route-status-rollback.timer"
 
