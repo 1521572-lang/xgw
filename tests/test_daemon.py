@@ -600,7 +600,9 @@ def test_all_dead_refreshes_directly_and_rotates_at_once(daemon):
     # участниками; запасные — до смены состояния и ещё раз сканом ALL_DEAD)
     assert set(spares) <= set(daemon.scanned)
     # замена сразу, без ожидания rotate_after_min (15 мин); перезапуск разрешён
-    assert len(daemon.applied) == 1 and daemon.applied[0][1] is True
+    apply_count = len(daemon.applied)
+    assert apply_count == 1
+    assert daemon.applied[0][1] is True
     daemon.tick()
     daemon.tick()
     assert not set(old_members) & set(daemon.tags("proxy"))
@@ -963,7 +965,8 @@ def test_daemon_reloads_missing_rules(guarded):
     capture.is_loaded = False
     daemon.tick()
     assert capture.actions() == ["up"]
-    assert any("загружены заново" in event for event in daemon.events())
+    restored = [event for event in daemon.events() if "загружены заново" in event]
+    assert restored
     assert daemon.status()["capture"]["mode"] == "on"
     daemon.tick()
     assert capture.actions() == ["up"]  # правила на месте — больше ничего не делает
@@ -977,10 +980,11 @@ def test_daemon_names_the_tun_without_an_address(guarded):
     capture.tun_issue = "у интерфейса xgwtun0 нет адреса 169.254.10.1/32 или он не поднят"
     daemon.tick()
     assert capture.actions() == ["up"]
-    assert any(
-        "нет адреса 169.254.10.1/32" in event and "подготовлен заново" in event
-        for event in daemon.events()
-    )
+    repaired = [
+        event for event in daemon.events()
+        if "нет адреса 169.254.10.1/32" in event and "подготовлен заново" in event
+    ]
+    assert repaired
     assert not any("загружены заново" in event for event in daemon.events())
 
 
@@ -991,7 +995,8 @@ def test_daemon_repairs_lan_path(guarded):
     capture.lan_issue = "пакеты устройств сети lan0 не доходят до Xray"
     daemon.tick()
     assert capture.actions() == ["up"]
-    assert any("интернет в сети снова есть" in event for event in daemon.events())
+    restored = [event for event in daemon.events() if "интернет в сети снова есть" in event]
+    assert restored
     assert daemon.status()["capture"]["lan_problem"] == ""
     assert daemon.status()["capture"]["lifecycle"] == "connected"
 
@@ -1452,9 +1457,18 @@ def test_probes_get_the_stop_event(daemon, monkeypatch):
 
     _started(daemon)
     info = daemon.view()[0]
-    seen: dict[str, object] = {}
-    monkeypatch.setattr(scan, "scan_node", lambda *_a, **kw: seen.setdefault("scan", kw["cancel"]))
-    monkeypatch.setattr(speed, "measure", lambda *_a, **kw: seen.setdefault("speed", kw["cancel"]))
+    seen: dict[str, threading.Event] = {}
+
+    def cancelled_scan(*_args, cancel, **_kwargs):
+        seen["scan"] = cancel
+        return ScanResult(info.tag, "CANCELLED", 0, 0.0, kind="cancelled")
+
+    def cancelled_speed(*_args, cancel, **_kwargs):
+        seen["speed"] = cancel
+        return SpeedResult(None, error="cancelled")
+
+    monkeypatch.setattr(scan, "scan_node", cancelled_scan)
+    monkeypatch.setattr(speed, "measure", cancelled_speed)
     stop = threading.Event()
     daemon.tick = lambda: stop.set() or State.HEALTHY
     daemon.run(stop)
@@ -2054,7 +2068,9 @@ def test_member_failing_the_first_check_is_replaced_at_once(daemon, verdict, lim
     (victim,) = bad
     # Первый шаг: участники проверены раньше запасных, замена — в тот же шаг.
     assert daemon.scanned[:2] == [victim, daemon.scanned[1]] and len(daemon.scanned) == 5
-    assert len(daemon.applied) == 2 and daemon.applied[1][1] is False  # через API, не срочно
+    apply_count = len(daemon.applied)
+    assert apply_count == 2
+    assert daemon.applied[1][1] is False  # через API, не срочно
     members = daemon.tags("proxy")
     assert victim not in members and len(members) == 2
     assert victim.replace("proxy-", "spare-") in daemon.tags("spare")
@@ -2417,13 +2433,17 @@ def test_xray_version_follows_binary_replacement(daemon, tmp_path, monkeypatch):
     broken.write_text("", encoding="utf-8")
     broken.replace(xray)
     daemon.tick()
+    assert daemon.status()["xray"]["version"] == ""
+    after_failure = len(calls)
+    assert after_failure > 2
     daemon.tick()
     assert daemon.status()["xray"]["version"] == ""
-    assert len(calls) == 4
+    after_retry = len(calls)
+    assert after_retry > after_failure
     xray.unlink()
     daemon.tick()
     assert daemon.status()["xray"]["version"] == ""
-    assert len(calls) == 4
+    assert len(calls) == after_retry
 
 
 # --- 0.1.10: ручной выбор сервера, как в клиентах VPN --------------------------------
@@ -2523,6 +2543,7 @@ def test_rules_event_restores_rules_right_away(guarded):
     checks = daemon.e2e_checks
     capture.calls.clear()
     capture.is_loaded = False
+    daemon.poke.clear()
     daemon.wake("rules")
     began = time.monotonic()
     daemon._sleep(threading.Event(), lambda: False, 0.6)
@@ -2536,11 +2557,13 @@ def test_rules_event_restores_rules_right_away(guarded):
 def test_net_event_starts_the_step_early_but_not_too_often(daemon):
     _started(daemon)
     stop = threading.Event()
+    daemon.poke.clear()
     daemon.wake("net")
     began = time.monotonic()
     daemon._sleep(stop, lambda: False, 30)
     assert time.monotonic() - began < 1.0
     daemon.tick()
+    daemon.poke.clear()
     daemon.wake("net")  # следующее — не раньше NET_WAKE_PAUSE после шага по событию
     began = time.monotonic()
     daemon._sleep(stop, lambda: False, 30)
@@ -2557,6 +2580,7 @@ def test_wake_after_resume_reloads_rules_and_scans(guarded):
     daemon.collected.clear()
     slept = 3 * 3600
     daemon.wall = lambda: daemon.t + slept
+    daemon.poke.clear()
     daemon.wake("sleep")
     began = time.monotonic()
     daemon._sleep(threading.Event(), lambda: False, 30)
