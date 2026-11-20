@@ -88,3 +88,4 @@
   пакет не трогали.
 - Машина: off/off, fresh/matched, воркеры inactive, панель слушает 8781/8782.
 - Таймеры и временные юниты аудитом не создавались.
+- Publication commit: `69bd585023ff589f40e689019ea7f749eb8d645e` (ancestor verified).
