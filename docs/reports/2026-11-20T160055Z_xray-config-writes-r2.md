@@ -86,4 +86,4 @@
 3. После синхронизации сетапа test_daemon на кандидате повтор возможен
    без изменений ТЗ — вся инфраструктура (worktrees, JUnit, gate,
    helpers) подготовлена.
-- Publication commit: `добавляется после push`.
+- Publication commit: `09c46c480c45b38c0abed826d353bf9a6f5de7ae` (088a4ac → 09c46c4, ancestor verified).
