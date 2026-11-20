@@ -6,10 +6,12 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from fakenet import FakeKernel
 from test_generator import _build
 
 from xgw.apply.applier import Applier, in_restart_window
 from xgw.config import Config
+from xgw.net import tun
 from xgw.paths import Paths, file_lock
 from xgw.xraycore.api import ApiError
 
@@ -48,6 +50,7 @@ class StubApi:
         self.healthy_after = healthy_after
         self.calls: list[str] = []
         self.bi_args: list[tuple] = []
+        self.outbound_reads = 0
 
     def _call(self, name: str):
         self.calls.append(name)
@@ -71,10 +74,25 @@ class StubApi:
 
     def balancer_info(self, *balancers):
         self.bi_args.append(balancers)
+        self._require_ready()
+        if self.fail == "bi":
+            raise ApiError("балансировщика нет")
+        return "{}"
+
+    def list_outbounds(self):
+        self.outbound_reads += 1
+        self._require_ready()
+        return []
+
+    def _require_ready(self):
         restarts = self.service.restarts if self.service else 0
         if self.healthy_after is None or restarts < self.healthy_after:
             raise ApiError("API не отвечает")
-        return "{}"
+
+
+@pytest.fixture(autouse=True)
+def _no_host_sysctl(monkeypatch):
+    monkeypatch.setattr(tun.sysctl, "write", lambda *args, **kwargs: None)
 
 
 @pytest.fixture()
@@ -92,6 +110,7 @@ def env(tmp_path, monkeypatch):
 def _applier(paths, api, service=None, *, window="03:00-03:30", now=NOON, **kwargs):
     cfg = Config()
     cfg.apply.restart_window = window
+    kwargs.setdefault("runner", FakeKernel())
     return Applier(
         cfg, paths, api, service or StubService(), now_fn=lambda: now, validator=_valid, **kwargs
     )
@@ -339,8 +358,6 @@ def _with_tun_inbound(config: dict) -> dict:
 def test_tun_interface_is_created_before_xray_starts(env):
     """Интерфейс, созданный самим Xray, исчез бы вместе с ним (и с маршрутом в него);
     постоянный создаёт XGW — и до запуска ядра."""
-    from fakenet import FakeKernel
-
     paths, current = env
     kernel = FakeKernel()
     order: list[str] = []
@@ -360,8 +377,6 @@ def test_tun_interface_is_created_before_xray_starts(env):
 
 
 def test_failed_tun_preparation_does_not_block_the_restart(env):
-    from fakenet import FakeKernel
-
     paths, current = env
     kernel = FakeKernel()
     kernel.refuse = "tuntap add"
@@ -373,8 +388,6 @@ def test_failed_tun_preparation_does_not_block_the_restart(env):
 
 
 def test_no_tun_inbound_means_no_ip_commands(env):
-    from fakenet import FakeKernel
-
     paths, current = env
     kernel = FakeKernel()
     _applier(paths, StubApi(), runner=kernel).apply(_needs_restart(current), force_now=True)
@@ -429,12 +442,26 @@ def test_rollback_to_last_good_when_new_config_does_not_start(env):
     service = StubService()
     # с новым конфигом ядро не отвечает, после отката (второй перезапуск) — отвечает
     api = StubApi(service=service, healthy_after=2)
-    outcome = _applier(paths, api, service, wait_seconds=0.2).apply(
+    logger = Mock()
+    outcome = _applier(paths, api, service, wait_seconds=0.2, logger=logger).apply(
         _needs_restart(current), force_now=True
     )
     assert outcome.mode == "rollback"
     assert service.restarts == 2
     assert _on_disk(paths) == current
+    assert api.outbound_reads > 0
+    assert [call.args[2] for call in logger.info.call_args_list] == ["restart", "rollback"]
+
+
+def test_restart_is_ready_when_only_the_outbound_api_responds(env):
+    paths, current = env
+    service = StubService()
+    api = StubApi(fail="bi", service=service, healthy_after=1)
+    new = _needs_restart(current)
+    outcome = _applier(paths, api, service).apply(new, force_now=True)
+    assert outcome.mode == "restart"
+    assert api.outbound_reads == service.restarts == 1
+    assert _on_disk(paths) == new
 
 
 def test_failed_when_rollback_does_not_help(env):
