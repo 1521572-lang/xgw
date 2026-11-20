@@ -294,6 +294,24 @@ def test_youtube_page_failure_records_phase_and_preserves_closed_route():
     assert "private" not in repr(row)
 
 
+@pytest.mark.parametrize("queue_ready", [True, False])
+def test_selective_waits_for_queue_owner_with_closed_gate(queue_ready):
+    h = Harness()
+    h.step(0)
+    h.step(1)
+    h.runtime.up = False
+    h.step(3)
+    assert h.controller.view["state"] == "preparing" and not z.active(h.current)
+    assert not any(action == "gate" and value for action, value in h.runtime.events)
+    h.runtime.up = queue_ready
+    h.step(1 + z.START_WAIT)
+    assert h.controller.start_deadline is None
+    assert z.active(h.current) is queue_ready
+    if not queue_ready:
+        assert h.controller.view["reason"] == "worker_start_timeout"
+        assert not h.runtime.up
+
+
 def test_selective_recheck_reports_actual_page_and_new_time(monkeypatch):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = True

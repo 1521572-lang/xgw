@@ -20,6 +20,8 @@ MAX_AGE = 6 * 3600
 CANDIDATES = ("multisplit", "multidisorder", "fake_md5_split", "fake_seq",
               "fake_seq_split", "fake_md5", "hostfakesplit_md5",
               "fake_static_md5", "fake_clone_md5")
+WAIT_STAGES = ("status_stale", "policy_pending", "probe_inbound", "nfqueue",
+               "worker_handoff_pending", "matched_other", "no_sample")
 
 
 class Conflict(ValueError):
@@ -32,6 +34,12 @@ class Cancelled(ValueError):
 
 class AdmissionBlocked(ValueError):
     pass
+
+
+class TrialTimeout(TimeoutError):
+    def __init__(self, stage):
+        super().__init__("trial_timeout")
+        self.stage = stage
 
 
 class Jobs:
@@ -119,6 +127,7 @@ class Jobs:
         self._write(row)
 
     def _wait(self, row, states, deadline, *, restoring=False):
+        stage = "no_sample"
         while time.monotonic() < deadline:
             if not restoring and (self.stopping.is_set() or self.cancel_path.exists()):
                 raise Cancelled("cancelled")
@@ -126,12 +135,18 @@ class Jobs:
             if schema.fingerprint(policy) != row["expected"]:
                 raise Conflict("policy_changed")
             view = self.observe()
-            if (view.get("fresh") and view.get("policy_matched")
-                    and view.get("config_key") == row["expected"]
-                    and view.get("state") in states):
-                return view
+            if not view.get("fresh"):
+                stage = "status_stale"
+            elif not view.get("policy_matched") or view.get("config_key") != row["expected"]:
+                stage = "policy_pending"
+            else:
+                if view.get("state") in states:
+                    return view
+                reason = view.get("reason")
+                stage = reason if reason in ("probe_inbound", "nfqueue",
+                                             "worker_handoff_pending") else "matched_other"
             self.stopping.wait(0.5) if not restoring else time.sleep(0.5)
-        raise TimeoutError("trial_timeout")
+        raise TrialTimeout(stage)
 
     def _restore(self, row):
         row["state"] = "restoring"
@@ -170,10 +185,11 @@ class Jobs:
                                     row, ("active", "fallback", "blocked", "error"),
                                     min(deadline, time.monotonic() + TRIAL_SECONDS),
                                 )
-                            except TimeoutError:
+                            except TimeoutError as exc:
                                 # A candidate timeout is a measurement, not a reason to
                                 # abandon untried candidates. Off must still be confirmed.
-                                view = {"state": "timeout", "reason": "trial_timeout"}
+                                view = {"state": "timeout", "reason": "trial_timeout",
+                                        "wait_stage": getattr(exc, "stage", "no_sample")}
                             evidence = view.get("evidence", {})
                             row["results"].append({
                                 "round": round_id + 1, "candidate": profile,
@@ -190,6 +206,8 @@ class Jobs:
                                 "elapsed_ms": round((time.monotonic() - started) * 1000),
                                 "at": time.time(),
                             })
+                            if view.get("wait_stage") in WAIT_STAGES:
+                                row["results"][-1]["wait_stage"] = view["wait_stage"]
                             self._write(row)
                             self._transition(row, {"mode": "off"})
                             self._wait(row, ("off",), min(deadline, time.monotonic() + 90))

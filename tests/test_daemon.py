@@ -3096,6 +3096,17 @@ def test_watchdog_schedule_while_building_keeps_short_period(daemon, monkeypatch
     assert starts == [0, 5] and sleeps == [3, 3]
 
 
+@pytest.mark.parametrize(("now", "state", "pause"), [
+    (10, State.HEALTHY, 2), (22, State.HEALTHY, 20), (10, State.WAN_DOWN, 60),
+])
+def test_watchdog_shortens_pause_during_selective_start(daemon, monkeypatch, now, state, pause):
+    daemon.cfg.zapret2.mode = "selective"
+    daemon._zapret2.start_deadline = 21
+    monkeypatch.setattr(daemon, "clock", lambda: now)
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, state, [0, 0])
+    assert starts == [0, pause] and sleeps == [pause, pause]
+
+
 def test_fresh_health_is_published_before_optional_work_without_faking_new_observation(daemon):
     _started(daemon)
     checkpoints = []

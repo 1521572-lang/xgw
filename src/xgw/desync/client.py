@@ -12,7 +12,7 @@ from collections import Counter
 from itertools import pairwise
 from pathlib import Path
 
-from .jobs import ACTIVE, CANDIDATES
+from .jobs import ACTIVE, CANDIDATES, WAIT_STAGES
 
 
 class Client:
@@ -191,11 +191,18 @@ def matrix_report(path):
         reason = row.get("reason")
         if not isinstance(reason, str) or (reason not in REASONS and reason != "trial_timeout"):
             reason = "unconfirmed"
-        results[profile].append({
+        outcome = {
             "round": n, "state": state, "reason": reason,
             "https_ok": state == "active" and row.get("transport") == "https_reachable",
             "probes": transport_probes(row.get("probes"), now=time.time()),
-        })
+        }
+        stage = row.get("wait_stage")
+        if state == "timeout" and stage in WAIT_STAGES:
+            outcome["wait_stage"] = stage
+        elapsed = row.get("elapsed_ms")
+        if type(elapsed) is int and 0 <= elapsed <= 3_600_000:
+            outcome["elapsed_ms"] = elapsed
+        results[profile].append(outcome)
     complete = (len(rows) == len(schedule) and job.get("state") == "complete"
                 and job.get("restore") == "pass")
     passed_twice = [p for p, runs in results.items()

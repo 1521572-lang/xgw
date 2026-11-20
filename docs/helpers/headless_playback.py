@@ -52,16 +52,17 @@ def read_format(source):
     return url, duration, bitrate * 1000 if number(bitrate) and bitrate > 0 else None
 
 
-def probe(url, size):
+def probe(url, size, *, peer=None):
     # Pass the signed URL through stdin. stdout includes only explicit metrics.
     output = ('{"status":"%{http_code}","bytes":%{size_download},"tls":%{time_appconnect},'
               '"first_byte":%{time_starttransfer},"elapsed":%{time_total},'
               '"remote_ip":"%{remote_ip}"}')
     quoted_url = url.replace("\\", "\\\\").replace('"', '\\"')
+    target = ["--resolve", f"{urlsplit(url).hostname}:443:{peer}"] if peer else []
     proc = subprocess.run(
         ["curl", "-q", "--http1.1", "--noproxy", "*", "--proto", "=https", "--max-time", "20",
          "--connect-timeout", "10", "--max-filesize", str(size), "--range", f"0-{size - 1}",
-         "--silent", "--output", "/dev/null", "--write-out", output, "--config", "-"],
+         "--silent", "--output", "/dev/null", "--write-out", output, *target, "--config", "-"],
         input=f'url = "{quoted_url}"\n', capture_output=True, text=True, timeout=25, check=False,
     )
     result = json.loads(proc.stdout or "{}")
@@ -243,6 +244,8 @@ def main():
     commands = parser.add_subparsers(dest="action", required=True)
     burst = commands.add_parser("probe")
     burst.add_argument("--bytes", type=int, choices=(65536, 10485760), default=65536)
+    burst.add_argument("--peer", type=ipaddress.IPv4Address,
+                       help="Use this public IPv4 address with the original hostname and TLS")
     play = commands.add_parser("play")
     play.add_argument("--seconds", type=int, choices=(120, 300, 900), required=True)
     play.add_argument("--seek-forward", type=int, choices=(480,))
@@ -255,7 +258,9 @@ def main():
             raise ValueError("dependencies")
         url, duration, bitrate = read_format(args.format_json)
         if args.action == "probe":
-            result = probe(url, args.bytes)
+            if args.peer and (not args.peer.is_global or args.peer.is_multicast):
+                raise ValueError("public_ipv4_required")
+            result = probe(url, args.bytes, peer=args.peer)
         else:
             if duration < args.seconds + 65 + (args.seek_forward or 0):
                 raise ValueError("duration")

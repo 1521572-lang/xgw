@@ -980,6 +980,10 @@ class Daemon:
             if self.cfg.zapret2.mode == "standalone":
                 pause = min(pause, zapret2.START_POLL if self._zapret2.start_deadline is not None
                             else 15)
+            elif (state is not State.WAN_DOWN and self.cfg.zapret2.probe_enabled
+                  and self._zapret2.start_deadline is not None
+                  and self.clock() < self._zapret2.start_deadline):
+                pause = min(pause, zapret2.START_POLL)
             if self._build is not None or self._build_next is not None:
                 pause = min(pause, 5)  # сводка продолжает обновляться во время сборки
             if self._manual_scan and self.scan_queue:

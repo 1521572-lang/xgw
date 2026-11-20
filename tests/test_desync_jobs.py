@@ -16,7 +16,7 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
             for n, sequence in ((1, profiles), (2, reversed(profiles))) for p in sequence]
     rows[0].update(state="timeout", transport="unknown")
     rows[1]["transport"] = "unknown"
-    rows[0].update(reason="trial_timeout")
+    rows[0].update(reason="trial_timeout", wait_stage="nfqueue")
     rows[1].update(reason="youtube_page_probe_failed", probes={
         "page": {"ok": False, "phase": "tls", "kind": "timeout", "url": "private"}})
     job = {"id": "a" * 32, "state": "complete", "restore": "pass",
@@ -28,6 +28,7 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
     assert result["states"] == {"timeout": 1, "active": 17}
     assert result["two_https_pass"] == profiles[2:]
     assert result["profiles"][profiles[0]][0]["reason"] == "trial_timeout"
+    assert result["profiles"][profiles[0]][0]["wait_stage"] == "nfqueue"
     assert result["profiles"][profiles[1]][0]["probes"]["page"]["phase"] == "tls"
     assert "private" not in json.dumps(result)
     job["results"] = rows[:-1]
@@ -266,7 +267,7 @@ def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeyp
         if "active" in states:
             trials.append(instance._policy()[0].zapret2.strategy)
             if len(trials) == 1:
-                raise TimeoutError("trial_timeout")
+                raise jobs.TrialTimeout("nfqueue")
         return original(row, states, deadline, **kwargs)
     monkeypatch.setattr(instance, "_wait", wait)
     instance._run()
@@ -274,6 +275,7 @@ def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeyp
     assert result["state"] == "complete" and result["restore"] == "pass"
     assert len(trials) == len(result["results"]) == 4
     assert result["results"][0]["state"] == "timeout"
+    assert result["results"][0]["wait_stage"] == "nfqueue"
     assert instance._policy()[1] == policy
 
 

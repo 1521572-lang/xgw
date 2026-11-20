@@ -724,6 +724,7 @@ class Controller:
             return False
         if (not finished and not wanted and not present and not self.ready
                 and not self.cleanup_pending):
+            self.start_deadline = None
             self.view = {"state": "off", "reason": "off"}
             return False
         reason = "off" if not wanted else "waiting_for_probe_urls"
@@ -752,6 +753,7 @@ class Controller:
                     changed = apply(patch(applied, cfg), applied)
                     if not changed:
                         raise ValueError("apply_failed")
+                    self.start_deadline = now + START_WAIT
                     self.view = {"state": "preparing", "reason": "probe_inbound"}
                     return changed
                 if (cfg.zapret2.mode == "selective" and not self.ready and not active(applied)
@@ -765,10 +767,16 @@ class Controller:
                     starting = True
                     self.runtime.start(cfg)
                     self.ready = True
+                    self.start_deadline = now + START_WAIT
                     self.view = {"state": "preparing", "reason": "nfqueue"}
                     return False  # следующая итерация подтвердит живую очередь
-                if self.ready and not self.runtime.alive(cfg.zapret2.queue_num):
-                    raise ValueError("worker_down")
+                if self.ready:
+                    if not self.runtime.alive(cfg.zapret2.queue_num):
+                        if self.start_deadline is not None and now < self.start_deadline:
+                            return False  # гейт остаётся закрыт до подтверждения очереди
+                        raise ValueError("worker_start_timeout" if self.start_deadline is not None
+                                         else "worker_down")
+                    self.start_deadline = None
                 if self.ready and now >= self.next_check:
                     self.healthy = False
                     if not self._budget(cfg):
@@ -818,7 +826,8 @@ class Controller:
             codes = {"queue_busy", "unsafe_files", "unsafe_directory", "worker_down",
                      "bundle_mismatch", "bad_worker_options", "lua_init_failed",
                      "probe_budget", "apply_failed", CDN_EXPIRED,
-                     "worker_unit_busy", "worker_handoff_pending", *probe_errors}
+                     "worker_unit_busy", "worker_handoff_pending", "worker_start_timeout",
+                     *probe_errors}
             reason = str(exc) if isinstance(exc, ValueError) and str(exc) in codes else (
                 "dependency_missing" if isinstance(exc, FileNotFoundError) else "runtime_failed")
             self.last_error = reason
@@ -848,6 +857,7 @@ class Controller:
                 reason = "stop_failed"
                 stopped = False
         self.ready = False
+        self.start_deadline = None
         self.cleanup_pending = not stopped
         if comparing and self.comparison is not None:
             if stopped and self.comparison_trace is None:
