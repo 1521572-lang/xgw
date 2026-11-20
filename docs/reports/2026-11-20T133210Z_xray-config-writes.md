@@ -75,4 +75,4 @@ MainPID=0; off/off fresh (первый опрос); ipify ок; таймер о�
    journalctl --grep=xray_config_write) установлена, но не отработала ни
    одного живого окна — проверка писателей остаётся открытой для следующего
    кандидата после починки тестов.
-- Publication commit: `добавляется после push`.
+- Publication commit: `463d20c89dd2175d174fb2bb47d5ff7e35dc196b` (6ad275e → 463d20c, ancestor verified).
