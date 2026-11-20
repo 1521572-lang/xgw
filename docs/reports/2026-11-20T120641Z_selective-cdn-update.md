@@ -105,4 +105,4 @@ ipify ок; таймер остановлен (ActiveState=inactive) → **RESTO
    semantic sha.
 4. Запись кнопки «Сохранить CDN-пробу без подпис» видна в форме — путь
    persistent-пробы не проверялся в этом проходе (по ТЗ).
-- Publication commit: `добавляется после push`.
+- Publication commit: `840dd03d14771bb6f4cdaf000ffadd1af3c21d28` (9323c38 → 840dd03, ancestor verified).
