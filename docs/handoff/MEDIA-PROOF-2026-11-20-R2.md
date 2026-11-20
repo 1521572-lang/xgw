@@ -21,8 +21,8 @@ Ubuntu 24.04 LTS amd64. Установленная база `3a00777` повер
 ## 1. Доступ и исходное состояние
 
 Выполняй блоки в одном обычном Bash из репозитория XGW. При сбое
-обязательного шага переходи к публикации `6, если предохранитель ещё
-не запущен, либо к восстановлению `5 и публикации `6, если уже запущен.
+обязательного шага переходи к публикации §6, если предохранитель ещё
+не запущен, либо к восстановлению §5 и публикации §6, если уже запущен.
 Сбои сборщиков и анализатора запиши по отдельности. Пакетный дамп здесь
 не нужен.
 
@@ -55,7 +55,7 @@ awk '/^(NoNewPrivs|CapEff):/ {print}' /proc/self/status
 if [[ -n $REPO && -d $D && $ID == ubuntu && $VERSION_ID == 24.04 &&
       $(dpkg --print-architecture) == amd64 ]] &&
    command -v mpv yt-dlp curl grep ss nft flock >/dev/null &&
-   sudo -v && sudo -n true; then
+   sudo -n true; then
   echo ACCESS_OK
 else
   echo BLOCKED_ENV
@@ -64,7 +64,7 @@ fi
 
 Продолжай только после `ACCESS_OK`. Если `sudo` отклонён из-за
 `NoNewPrivs=1`, запроси обычный терминал на ThinkCentre с sudo и проверь
-заново. Если доступ так и не выдан, опубликуй `BLOCKED_ENV` по `6.
+заново. Если доступ так и не выдан, опубликуй `BLOCKED_ENV` по §6.
 Если тестовый ролик недоступен, допустима одна замена на длинный ролик с
 HTTPS-форматом 720p и длительностью не менее 665 секунд. Задай его ID в
 `VIDEO` и используй тот же ролик для всех сравнений.
@@ -190,9 +190,9 @@ else
 fi
 ```
 
-Если VPN-контроль не подтверждён, переходи к `6. Иначе убедись, что
+Если VPN-контроль не подтверждён, переходи к §6. Иначе убедись, что
 другой сетевой эксперимент не идёт, и запусти восстановление по таймеру
-90 минут. Сохрани shell открытым до `5, чтобы он удерживал общий lock.
+90 минут. Сохрани shell открытым до §5, чтобы он удерживал общий lock.
 
 ```bash
 arm() {
@@ -230,7 +230,7 @@ live() {
     sudo -n test ! -e "$BACKUP/restore-completed"
 }
 if exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock" &&
-   run live-lock flock -n 9 && sudo -v && run arm arm && live; then
+   run live-lock flock -n 9 && sudo -n true && run arm arm && live; then
   echo READY_FOR_LIVE
 else
   echo LIVE_NOT_STARTED
@@ -240,7 +240,7 @@ fi
 После `READY_FOR_LIVE` выбери Standalone с ранее принятым multisplit,
 списком YouTube и выключенной HTTPS-пробой. Дождись
 fresh/matched/active/without_vpn и зафиксируй прямой CDN-контроль.
-При сбое извлечения URL или GET переходи к `5.
+При сбое извлечения URL или GET переходи к §5.
 
 ```bash
 FORMAT="$D/format-direct.json"
@@ -313,7 +313,7 @@ fi
 
 Только после `SELECTIVE_SETTINGS_READY` включи Selective штатной кнопкой.
 Дождись fresh/matched/active с `https_reachable`. При fallback запиши
-`phase/kind/http` проб страницы и CDN и перейди к восстановлению `5.
+`phase/kind/http` проб страницы и CDN и перейди к восстановлению §5.
 
 ## 3. Две короткие фазы с доказательством пути
 
@@ -355,11 +355,11 @@ capture() {
     --player "$D/$label-player.jsonl" --gateway "$D/$label-gateway.jsonl" \
     --marked "$D/$label-marked.jsonl"
 }
-sudo -v && capture initial
+sudo -n true && capture initial
 if live && run between-active selective_active "$D/between-active.json"; then
   run selective-site vpn_site selective-site
   run selective-site-delta delta selective-site-before selective-site-after
-  sudo -v && capture seek --seek-forward 480
+  sudo -n true && capture seek --seek-forward 480
 fi
 ```
 
@@ -384,12 +384,12 @@ fi
 ## 4. Новый CDN-сеанс внутри автоматического fallback
 
 Выполни один SIGKILL только для MainPID `xgw-zapret2.service`. Перед
-этим подтверди active, принадлежность очереди и срок VPN-адреса из `2.
+этим подтверди active, принадлежность очереди и срок VPN-адреса из §2.
 Адрес был получен через VPN, а сам GET откроет новое соединение.
-Если адрес истёк, переходи к ручному контролю в `5 с новой ссылкой.
+Если адрес истёк, переходи к ручному контролю в §5 с новой ссылкой.
 
 ```bash
-if live && sudo -v &&
+if live && sudo -n true &&
    run fallback-active selective_active "$D/fallback-active.json" &&
    run fallback-url "$PY" -c 'import sys
 from pathlib import Path
@@ -483,7 +483,7 @@ fi
 до конца запроса или дельту нельзя отнести к запросу, укажи PARTIAL.
 Если окно доказано, а GET завершился ошибкой, укажи FAIL с кодом и фазой.
 Служебную VPN-пробу и повторный active отметь отдельно. Если нужно
-проверить повторный active, наблюдай панель ещё до 150 секунд, затем `5.
+проверить повторный active, наблюдай панель ещё до 150 секунд, затем §5.
 
 ## 5. Восстановление
 
@@ -526,7 +526,7 @@ finish_restore() {
     echo RESTORE_UNCONFIRMED
   fi
 }
-if [[ -n $BACKUP && -n $UNIT ]] && sudo -v; then
+if [[ -n $BACKUP && -n $UNIT ]] && sudo -n true; then
   if sudo -n test -f "$BACKUP/network-test-started"; then
     run restore sudo -n /bin/bash "$BACKUP/guard.sh" "$BACKUP" "$PY" "$PANEL"
     finish_restore

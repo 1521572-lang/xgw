@@ -1,38 +1,102 @@
-# ThinkCentre — кто применяет конфигурацию Xray во время просмотра
+# ThinkCentre — кто применяет конфигурацию Xray во время просмотра, повтор
 
 Flash проводит проверку и публикует один обезличенный отчёт при любом
 исходе. Рабочая машина — Ubuntu 24.04 LTS. При недоступном терминале,
 панели или sudo запроси нужный доступ у владельца и продолжи сама.
 Пакет временный. Сценарий и код подготовлены Codex.
 
-В [последнем отчёте](../reports/2026-11-20T124752Z_selective-cdn-update-r2.md)
+В [живом отчёте](../reports/2026-11-20T124752Z_selective-cdn-update-r2.md)
 прошли форма, валидация, атомарная замена CDN и 135,1 секунды видео в
 720p. В двух окнах изменились `routing`, `inbounds` и `outbounds` Xray
 при том же PID. Причина перезаписи осталась открытой. В этом проходе
 нужно сопоставить успешную запись конфига с точными границами снимков.
 Замеры CDN-формы, fallback и суточное наблюдение здесь уже не повторяются.
 
-## 1. Временная установка
+В [предыдущей попытке](../reports/2026-11-20T133210Z_xray-config-writes.md)
+установка и откат прошли, тестовый сбой остановил живые фазы. Три
+указанных теста Applier были воспроизведены на исходниках кандидата.
+Заглушка не реализовывала `list_outbounds()`, который вызывается при
+неответившем балансировщике. Этот вызов есть и в принятой базе.
+Упоминание `bytes_read` в отчёте для этих трёх тестов не подтверждено.
+В повторе блокирующие проверки выполняются до установки.
+
+## 1. Тесты и временная установка
 
 Выполни §1 и исходный VPN-контроль §2
 [ТЗ r2](MEDIA-PROOF-2026-11-20-R2.md), остановившись до запуска его
-таймера. Начинай с `sudo -n true`. Для интерактивной авторизации
+таймера. В ссылочных блоках проверяй права через `sudo -n true`.
+Для интерактивной авторизации
 используй обычный TTY. Продолжай в том же Bash. Исходное состояние
-должно быть off/off, VPN и панель доступны. Правило установки ниже
-сверяет три файла с базой `3a00777`, которая включает принятый
-`apply/applier.py` из `1e27384`.
+должно быть off/off, VPN и панель доступны.
+
+Тесты запусти обычным пользователем. Если используется окружение
+pytest, передай его интерпретатор абсолютным путём в `XGW_TEST_PYTHON`.
+Рабочие конфиги и службы при этих проверках остаются вне тестовых
+каталогов. Для сравнения демона используй тот же интерпретатор и
+уровень прав на базе и кандидате.
 
 ```bash
-CANDIDATE=dce7ec8c99ca4149dac465b1d06b31b301da3ff5
+CANDIDATE=e7bbc4a1d4e1cc4bc88c064702f0598ded7e3dc6
+SRC="$D/write-source"
+BASE_SRC="$D/write-baseline"
+TEST_PY=${XGW_TEST_PYTHON:-$PY}
+WRITE_GATE=0
+
+write_worktrees() {
+  git -C "$REPO" fetch origin "$BR" &&
+    git -C "$REPO" merge-base --is-ancestor "$CANDIDATE" FETCH_HEAD &&
+    git -C "$REPO" worktree add --detach "$SRC" "$CANDIDATE" &&
+    git -C "$REPO" worktree add --detach "$BASE_SRC" "$BASE"
+}
+write_test_suite() {
+  local tree=$1 label=$2
+  shift 2
+  (
+    cd "$tree" || exit 2
+    env PYTHONPATH="$tree/src:$tree" "$TEST_PY" -m pytest -o addopts='' -q --tb=short \
+      --basetemp="$tree/.write-trace-pytest-$label" --junitxml="$D/$label.xml" "$@"
+  )
+}
+write_check() {
+  local new_rc=0 old_rc=0
+  run writer-unit write_test_suite "$SRC" writer-unit \
+    tests/test_applier.py tests/test_singbox_generations.py tests/test_desync_route_evidence.py \
+    tests/test_selective_probe_watch.py tests/test_acceptance_gate.py || return
+  run writer-daemon-current write_test_suite "$SRC" daemon-current tests/test_daemon.py ||
+    new_rc=$?
+  run writer-daemon-baseline write_test_suite "$BASE_SRC" daemon-baseline tests/test_daemon.py ||
+    old_rc=$?
+  printf 'daemon exit codes: candidate=%s baseline=%s\n' "$new_rc" "$old_rc"
+  (( new_rc <= 1 && old_rc <= 1 )) || return 1
+  run writer-daemon-comparison "$PY" "$SRC/docs/helpers/acceptance_test_gate.py" \
+    --current "$D/daemon-current.xml" --baseline "$D/daemon-baseline.xml" \
+    --current-source "$SRC" --baseline-source "$BASE_SRC"
+}
+if run writer-worktrees write_worktrees && write_check; then
+  WRITE_GATE=1
+  echo WRITE_GATE_OK
+else
+  echo WRITE_GATE_BLOCKED
+fi
+```
+
+Обязательный набор должен завершиться с кодом 0. Для демона запиши
+`matching_baseline_failures` из отчёта сравнения. Совпавшие отказы
+остаются прежними отказами. Новые или изменившиеся ошибки, пропавшие
+тесты, новые пропуски либо неполный JUnit блокируют установку. При
+сбое укажи точные имена тестов, тип исключения и первую относящуюся к
+нему строку проекта. Файлы JUnit остаются локально. Переходи к
+установке только после `WRITE_GATE_OK`.
+
+Установка сверяет три файла с базой `3a00777`, которая включает
+принятый `apply/applier.py` из `1e27384`.
+
+```bash
 OVERLAY=--xray-write-trace
 UNIT=xgw-write-trace-rollback
 WRITE_FILES=(src/xgw/apply/applier.py src/xgw/apply/singbox_generation.py src/xgw/daemon.py)
-SRC="$D/write-source"
 
 prepare_write_trace() {
-  git -C "$REPO" fetch origin "$BR" &&
-    git -C "$REPO" merge-base --is-ancestor "$CANDIDATE" FETCH_HEAD &&
-    git -C "$REPO" worktree add --detach "$SRC" "$CANDIDATE" || return
   PACKAGE=$(readlink -e /opt/xgw/lib/xgw) || return
   PANEL=$(readlink -e /etc/xgw/panel.json) || return
   CFG=$(readlink -e /etc/xgw/config.toml) || return
@@ -76,7 +140,7 @@ install_write_trace() {
   sudo -n touch "$BACKUP/network-test-started" &&
     sudo -n "$PY" -I "$HELPER" apply "$OVERLAY" --backup "$BACKUP"
 }
-if exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock" &&
+if [[ ${WRITE_GATE:-0} == 1 ]] && exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock" &&
    run write-lock flock -n 9 && sudo -n true &&
    run write-prepare prepare_write_trace && run write-install install_write_trace; then
   export PYTHONPATH="$SRC/src:$SRC"
@@ -87,15 +151,8 @@ fi
 ```
 
 Если таймер уже был создан, при любом сбое переходи к §4. Если база
-разошлась, запиши имя файла и не подменяй базовый SHA. При успехе выполни
-Linux-тесты из кандидата. Сверь off/off после рестарта демона.
-
-```bash
-cd "$SRC"
-run write-tests "${XGW_TEST_PYTHON:-$PY}" -m pytest -q tests/test_applier.py \
-  tests/test_singbox_generations.py tests/test_daemon.py tests/test_desync_route_evidence.py
-run write-off off_status "$D/write-off.json"
-```
+разошлась, запиши имя файла. При успехе выполни
+`run write-off off_status "$D/write-off.json"` после рестарта демона.
 
 ## 2. Проверка журнала в контролируемой фазе
 
@@ -220,10 +277,11 @@ exec 9>&-
 
 При задержке панели после отката повтори проверку из блока и только
 потом сними таймер. Сверь `ActiveState=inactive`. При сбое восстановления
-сообщи владельцу наблюдаемое состояние. Публикуй статусы `INSTALL`,
+сообщи владельцу наблюдаемое состояние. Публикуй статусы `UNIT_TESTS`,
+`DAEMON_BASELINE`, `INSTALL`,
 `WRITER_CONTROL`, `LIVE_PLAY`, `FLOW`, `CONFIG_WRITER` и `RESTORE`,
 правильные SHA кода, источники и число записей. Адреса, теги отдельных
 серверов, отпечатки конфига, PID, подписанные URL и сырые журналы
 остаются на машине. Для публикации используй блок из §3
 [ТЗ пересчёта](MEDIA-COUNTERS-2026-11-20.md) с именем
-`_xray-config-writes.md`. Опубликуй при любом исходе и верни ссылку.
+`_xray-config-writes-r2.md`. Опубликуй при любом исходе и верни ссылку.
