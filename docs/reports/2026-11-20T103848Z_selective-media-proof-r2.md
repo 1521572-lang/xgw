@@ -123,4 +123,4 @@ VPN-снапшоты первого vpn_site писались с umask 022 → `
    повлиял на исходы, но в скриптах ТЗ функции `live/capture/workers_off`
    используются в нескольких блоках — объединить их в один env-файл или
    один скрипт, чтобы исключить человеческий фактор.
-- Publication commit: `добавляется после push`.
+- Publication commit: `7dc7e856119640a1470d0502cd2983f24ea1b09a` (a7db07e → 7dc7e85, ancestor verified).
