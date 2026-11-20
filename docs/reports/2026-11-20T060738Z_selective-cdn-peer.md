@@ -119,4 +119,4 @@ https_reachable** (~50с, bounded polling кандидата).
    на время замеров, либо признать socket-stats достаточным каналом.
 4. Установленная база изменилась (accept): следующим ТЗ задать новую базу
    `08d31ee`+5 файлов явно, чтобы cmp-проверки §1 продолжали работать.
-- Publication commit: `добавляется после push`.
+- Publication commit: `256be6db129a877b4f89c20a483d6508b607dc73` (0b4ec8a → 256be6d, ancestor verified).
