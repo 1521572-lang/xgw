@@ -1,4 +1,4 @@
-# ThinkCentre — кто применяет конфигурацию Xray во время просмотра, повтор
+# ThinkCentre — кто применяет конфигурацию Xray во время просмотра, r3
 
 Flash проводит проверку и публикует один обезличенный отчёт при любом
 исходе. Рабочая машина — Ubuntu 24.04 LTS. При недоступном терминале,
@@ -12,13 +12,14 @@ Flash проводит проверку и публикует один обез�
 нужно сопоставить успешную запись конфига с точными границами снимков.
 Замеры CDN-формы, fallback и суточное наблюдение здесь уже не повторяются.
 
-В [предыдущей попытке](../reports/2026-11-20T133210Z_xray-config-writes.md)
-установка и откат прошли, тестовый сбой остановил живые фазы. Три
-указанных теста Applier были воспроизведены на исходниках кандидата.
-Заглушка не реализовывала `list_outbounds()`, который вызывается при
-неответившем балансировщике. Этот вызов есть и в принятой базе.
-Упоминание `bytes_read` в отчёте для этих трёх тестов не подтверждено.
-В повторе блокирующие проверки выполняются до установки.
+В [r2](../reports/2026-11-20T160055Z_xray-config-writes-r2.md)
+прошёл обязательный набор, включая три исправленных теста Applier.
+Полная проверка демона остановилась на 12 изменившихся диагностических
+сообщениях. Установка и замеры не начались. Счётчик в
+`test_xray_version_follows_binary_replacement` измеряет вызовы чтения
+версии бинарника. Для сравнения r3 обе копии используют одни тесты и
+зависимости. В базовой копии три файла оверлея взяты из установленной
+базы `3a00777`.
 
 ## 1. Тесты и временная установка
 
@@ -32,21 +33,27 @@ Flash проводит проверку и публикует один обез�
 Тесты запусти обычным пользователем. Если используется окружение
 pytest, передай его интерпретатор абсолютным путём в `XGW_TEST_PYTHON`.
 Рабочие конфиги и службы при этих проверках остаются вне тестовых
-каталогов. Для сравнения демона используй тот же интерпретатор и
-уровень прав на базе и кандидате.
+каталогов. Для обеих копий используется один интерпретатор, один
+пользователь и общий набор тестов кандидата.
 
 ```bash
-CANDIDATE=e7bbc4a1d4e1cc4bc88c064702f0598ded7e3dc6
+CANDIDATE=aedb68cda0980b1dc63c420c92861028e67fc892
 SRC="$D/write-source"
 BASE_SRC="$D/write-baseline"
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 WRITE_GATE=0
+WRITE_FILES=(src/xgw/apply/applier.py src/xgw/apply/singbox_generation.py src/xgw/daemon.py)
 
 write_worktrees() {
+  local changed expected
   git -C "$REPO" fetch origin "$BR" &&
     git -C "$REPO" merge-base --is-ancestor "$CANDIDATE" FETCH_HEAD &&
     git -C "$REPO" worktree add --detach "$SRC" "$CANDIDATE" &&
-    git -C "$REPO" worktree add --detach "$BASE_SRC" "$BASE"
+    git -C "$REPO" worktree add --detach "$BASE_SRC" "$CANDIDATE" &&
+    git -C "$BASE_SRC" restore --source="$BASE" --worktree -- "${WRITE_FILES[@]}" || return
+  changed=$(git -C "$BASE_SRC" diff --name-only HEAD) || return
+  expected=$(printf '%s\n' "${WRITE_FILES[@]}")
+  [[ $changed == "$expected" ]]
 }
 write_test_suite() {
   local tree=$1 label=$2
@@ -54,7 +61,7 @@ write_test_suite() {
   (
     cd "$tree" || exit 2
     env PYTHONPATH="$tree/src:$tree" "$TEST_PY" -m pytest -o addopts='' -q --tb=short \
-      --basetemp="$tree/.write-trace-pytest-$label" --junitxml="$D/$label.xml" "$@"
+      -p no:cacheprovider --basetemp="$tree/.write-trace-pytest" --junitxml="$D/$label.xml" "$@"
   )
 }
 write_check() {
@@ -83,10 +90,12 @@ fi
 Обязательный набор должен завершиться с кодом 0. Для демона запиши
 `matching_baseline_failures` из отчёта сравнения. Совпавшие отказы
 остаются прежними отказами. Новые или изменившиеся ошибки, пропавшие
-тесты, новые пропуски либо неполный JUnit блокируют установку. При
-сбое укажи точные имена тестов, тип исключения и первую относящуюся к
-нему строку проекта. Файлы JUnit остаются локально. Переходи к
-установке только после `WRITE_GATE_OK`.
+тесты, новые пропуски либо неполный JUnit блокируют установку. Для
+каждого `changed_failures` сопоставь один и тот же `classname::name`
+в обоих JUnit. Запиши отдельно тип и первую существенную строку
+каждого сообщения с позицией в исходниках. Для числового расхождения
+сверь по тесту, что измеряет счётчик. Файлы JUnit остаются локально.
+Переходи к установке только после `WRITE_GATE_OK`.
 
 Установка сверяет три файла с базой `3a00777`, которая включает
 принятый `apply/applier.py` из `1e27384`.
@@ -94,7 +103,6 @@ fi
 ```bash
 OVERLAY=--xray-write-trace
 UNIT=xgw-write-trace-rollback
-WRITE_FILES=(src/xgw/apply/applier.py src/xgw/apply/singbox_generation.py src/xgw/daemon.py)
 
 prepare_write_trace() {
   PACKAGE=$(readlink -e /opt/xgw/lib/xgw) || return
@@ -284,4 +292,4 @@ exec 9>&-
 серверов, отпечатки конфига, PID, подписанные URL и сырые журналы
 остаются на машине. Для публикации используй блок из §3
 [ТЗ пересчёта](MEDIA-COUNTERS-2026-11-20.md) с именем
-`_xray-config-writes-r2.md`. Опубликуй при любом исходе и верни ссылку.
+`_xray-config-writes-r3.md`. Опубликуй при любом исходе и верни ссылку.
