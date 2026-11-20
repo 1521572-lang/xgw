@@ -78,4 +78,4 @@ matching=12, changed=0, new=0** — пятый стабильный прогон
 3. Механика r3 (retry_pending/attempts в overview) работает: попытка
    видна с полными деталями, контракт «HTTP-отказ завершает одной
    попыткой» соблюдён.
-- Publication commit: `добавляется после push`.
+- Publication commit: `b5c8b51a67c20ff782f5ef5d0974705b05b4f558` (e3a211f → b5c8b51, ancestor verified).
