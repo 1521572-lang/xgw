@@ -109,6 +109,20 @@ def test_live_snapshots_compare_reformatted_config_and_reject_routing_order_chan
     with pytest.raises(route_evidence.EvidenceError, match="incomparable_snapshots") as error:
         route_evidence.deltas(second, third)
     assert error.value.field == "applied_config"
+    assert error.value.details() == {"field": "applied_config", "changed_sections": ["routing"]}
+
+
+def test_config_comparison_groups_unrecognized_sections_without_exposing_values():
+    before = snapshot(1, 10, 10, 10)
+    after = snapshot(2, 20, 20, 20) | {"config_sha256": "different"}
+    before["config_sections_sha256"] = route_evidence._section_hashes({"policy": {}})
+    after["config_sections_sha256"] = route_evidence._section_hashes({
+        "policy": {}, "private_extension": {"value": "private-secret"},
+    })
+    with pytest.raises(route_evidence.EvidenceError, match="incomparable_snapshots") as error:
+        route_evidence.deltas(before, after)
+    assert error.value.details() == {"field": "applied_config", "changed_sections": ["other"]}
+    assert "private_extension" not in str(after) and "private-secret" not in str(after)
 
 
 def test_snapshot_refuses_unconfirmed_live_api_state(tmp_path, monkeypatch):

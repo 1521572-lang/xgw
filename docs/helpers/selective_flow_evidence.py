@@ -90,8 +90,9 @@ def analyze(player, journal, before, after):
         return {"state": "inconclusive", "reason": "journal_limit"}
     try:
         route_evidence.deltas(before, after)
-    except route_evidence.EvidenceError:
-        return {"state": "inconclusive", "reason": "snapshots_incomparable"}
+    except route_evidence.EvidenceError as exc:
+        return {"state": "inconclusive", "reason": "snapshots_incomparable",
+                "snapshot_reason": str(exc), **exc.details()}
     start = player[0].get("capture_started_unix") if player else None
     begin = before["unix"]
     end = after["unix"]

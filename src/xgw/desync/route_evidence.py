@@ -18,14 +18,26 @@ from .experiment import private_path
 GROUPS = ("zapret2", "xray", "sing-box")
 DIRECTIONS = ("uplink", "downlink")
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
+CONFIG_SECTIONS = ("routing", "inbounds", "outbounds", "dns", "policy", "metrics",
+                   "observatory", "burstObservatory", "log", "api", "stats")
 
 
 class EvidenceError(ValueError):
     """A public reason code that contains no configuration details."""
 
-    def __init__(self, reason: str, *, field: str | None = None):
+    def __init__(self, reason: str, *, field: str | None = None,
+                 changed_sections: tuple[str, ...] = ()):
         super().__init__(reason)
         self.field = field
+        self.changed_sections = changed_sections
+
+    def details(self) -> dict:
+        result = {}
+        if self.field is not None:
+            result["field"] = self.field
+        if self.changed_sections:
+            result["changed_sections"] = list(self.changed_sections)
+        return result
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict:
@@ -37,13 +49,32 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def _semantic_hash(value) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _config_identity(raw: bytes) -> tuple[dict, str]:
     applied = json.loads(raw, object_pairs_hook=_unique_object)
     if not isinstance(applied, dict):
         raise EvidenceError("invalid_applied_config")
     # Object order and whitespace are formatting. Array order can change routing priority.
-    canonical = json.dumps(applied, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return applied, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return applied, _semantic_hash(applied)
+
+
+def _section_hashes(applied: dict) -> dict:
+    sections = {name: _semantic_hash(applied[name]) for name in CONFIG_SECTIONS if name in applied}
+    sections["other"] = _semantic_hash({key: value for key, value in applied.items()
+                                        if key not in CONFIG_SECTIONS})
+    return sections
+
+
+def _changed_sections(before: dict, after: dict) -> tuple[str, ...]:
+    first = before.get("config_sections_sha256")
+    last = after.get("config_sections_sha256")
+    if not isinstance(first, dict) or not isinstance(last, dict):
+        return ()
+    return tuple(name for name in (*CONFIG_SECTIONS, "other") if first.get(name) != last.get(name))
 
 
 def counters(applied: dict, sample: dict) -> dict:
@@ -78,7 +109,8 @@ def deltas(before: dict, after: dict) -> dict:
     if before["xray_epoch"] != after["xray_epoch"]:
         raise EvidenceError("incomparable_snapshots", field="xray_epoch")
     if not same_config or before["client_zapret2_rule"] != after["client_zapret2_rule"]:
-        raise EvidenceError("incomparable_snapshots", field="applied_config")
+        raise EvidenceError("incomparable_snapshots", field="applied_config",
+                            changed_sections=_changed_sections(before, after))
     if type(start_time) is not int or type(end_time) is not int or not 0 < start_time < end_time:
         raise EvidenceError("incomparable_snapshots", field="interval")
     if before["tags"].keys() != after["tags"].keys():
@@ -149,6 +181,7 @@ def snapshot(path: Path, *, paths: Paths | None = None) -> dict:
             raise EvidenceError("snapshot_changed_during_read")
     return {"xray_epoch": epoch, "config_sha256": hashlib.sha256(raw).hexdigest(),
             "config_semantic_sha256": identity,
+            "config_sections_sha256": _section_hashes(applied),
             "monotonic_ns": when, "unix": unix, "client_zapret2_rule": active(applied),
             "tags": counters(applied, sample)}
 
@@ -178,9 +211,7 @@ def main() -> int:
         else:
             result = deltas(_read_snapshot(args.before), _read_snapshot(args.after))
     except EvidenceError as exc:
-        result = {"state": "route_counters_unavailable", "reason": str(exc)}
-        if exc.field is not None:
-            result["field"] = exc.field
+        result = {"state": "route_counters_unavailable", "reason": str(exc), **exc.details()}
     except LockTimeout:
         result = {"state": "route_counters_unavailable", "reason": "apply_in_progress"}
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError, IndexError,

@@ -87,6 +87,9 @@ class SettingsDialog(QDialog):
         self.strategy.setToolTip("Какая стратегия проходит, зависит от провайдера. Сравнение "
                                  "с VPN умеет только multisplit и multidisorder. "
                                  "Flowseal ALT9 выбирается отдельной кнопкой подготовки.")
+        self.transport = QCheckBox("HTTPS-проверка YouTube и CDN")
+        self.transport.setChecked(view.get("youtube_transport_probe") is True)
+        form.addRow(self.transport)
         self.urls = []
         for title in ("HTTPS-страница", "HTTPS-адрес CDN"):
             field = QLineEdit()
@@ -95,7 +98,7 @@ class SettingsDialog(QDialog):
             self.urls.append(field)
             form.addRow(title, field)
         box.addLayout(form)
-        replacement = ("Для обновления пробы заполните только адрес CDN."
+        replacement = ("При включённой HTTPS-проверке можно заменить только адрес CDN."
                        if self.can_replace_cdn else "Для сохранения проб заполните оба адреса.")
         box.addWidget(plain(f"Сохранено адресов проверок — {view.get('probe_count', 0)}. "
                             "Пустые поля сохраняют прежние адреса. " + replacement))
@@ -118,11 +121,12 @@ class SettingsDialog(QDialog):
 
     def values(self) -> dict:
         result = {"domains": [s.strip().lower() for s in self.domains.toPlainText().splitlines()
-                              if s.strip()], "strategy": self.strategy.currentText()}
+                              if s.strip()], "strategy": self.strategy.currentText(),
+                  "youtube_transport_probe": self.transport.isChecked()}
         urls = [field.text().strip() for field in self.urls]
         if self.clear_urls.isChecked():
             result["probe_urls"] = []
-        elif self.can_replace_cdn and not urls[0] and urls[1]:
+        elif self.can_replace_cdn and self.transport.isChecked() and not urls[0] and urls[1]:
             result["cdn_probe_url"] = urls[1]
         elif any(urls):
             result["probe_urls"] = urls

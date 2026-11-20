@@ -166,6 +166,28 @@ def test_cdn_only_requires_saved_pair_and_rejects_conflicting_or_invalid_inputs(
         assert panel.read_bytes() == before
 
 
+def test_can_enable_transport_and_replace_cdn_of_saved_pair_in_one_edit(store):
+    cfg, panel = store
+    page = "https://www.youtube.com/t/terms"
+    cdn = "https://r1.googlevideo.com/generate_204"
+    assert send(cfg, {"youtube_transport_probe": False, "probe_urls": [page, cdn]})["ok"]
+    old_key = key(cfg)
+    before = panel.read_bytes()
+    replacement = "https://r2.googlevideo.com/videoplayback?expire=2000000000&sig=private"
+    assert send(cfg, {"cdn_probe_url": replacement})["code"] == "blocked"
+    assert panel.read_bytes() == before
+
+    payload = {"youtube_transport_probe": True, "cdn_probe_url": replacement}
+    assert send(cfg, payload, expected="old")["code"] == "conflict"
+    assert panel.read_bytes() == before
+    result = send(cfg, payload, expected=old_key)
+    assert result["ok"] and result["config_key"] != old_key
+    assert "sig=private" not in str(result)
+    actual = config.load(cfg)[0].zapret2
+    assert actual.youtube_transport_probe and actual.probe_urls == [page, replacement]
+    assert actual.mode == "off"
+
+
 def test_youtube_gate_validates_merged_mode_domains_and_urls(store):
     cfg, panel = store
     before = panel.read_bytes()

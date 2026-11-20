@@ -92,10 +92,11 @@
           <button type="button" id="persistent-probe">Сохранить CDN-пробу без подписи</button>
           <button type="button" id="import-flowseal">Подготовить проверенный Flowseal ALT9</button>
         </div>
-        <form id="settings-form" hidden autocomplete="off">
+        <form id="settings-form" hidden autocomplete="off" novalidate>
           <fieldset id="settings-fields">
             <legend>Домены и проверки</legend>
             <p id="settings-revision" role="status"></p>
+            <p id="settings-error" role="alert" hidden></p>
             <label>Стратегия<select id="setting-strategy"></select></label>
             <label>Домены, по одному на строку (domain:имя или full:имя)
               <textarea id="setting-domains" rows="5" required></textarea></label>

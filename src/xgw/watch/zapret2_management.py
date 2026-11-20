@@ -19,9 +19,7 @@ MODES = ("off", "standalone", "selective")
 
 
 def can_replace_cdn_probe(settings):
-    return settings.youtube_transport_probe and schema.valid_youtube_transport(
-        "selective", settings.domains, settings.probe_urls,
-    )
+    return schema.valid_youtube_transport("selective", settings.domains, settings.probe_urls)
 
 
 def candidate(cfg, patch, *, editing=False):
@@ -135,8 +133,9 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture,
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
             if cdn_url is not None:
-                if (not can_replace_cdn_probe(cfg.zapret2)
-                        or patch.get("youtube_transport_probe") is False):
+                if not patch.get("youtube_transport_probe", cfg.zapret2.youtube_transport_probe):
+                    return reply(False, "blocked", "Включите HTTPS-проверку YouTube и CDN.")
+                if not can_replace_cdn_probe(cfg.zapret2):
                     return reply(False, "blocked", "Сначала сохраните пару HTTPS-проб YouTube.")
                 patch.update(schema.validate_patch({
                     "probe_urls": [cfg.zapret2.probe_urls[0], cdn_url],

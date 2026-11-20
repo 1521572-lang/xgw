@@ -36,10 +36,11 @@ let latest = null;
 let online = false;
 let busy = false;
 let draftKey = null;
+let openingSettings = false;
 let generation = 0;
 
 function controls() {
-  const usable = online && !busy && !needsLogin && latest;
+  const usable = online && !busy && !needsLogin && !openingSettings && latest;
   const job = latest?.job;
   const running = ["queued", "running", "restoring"].includes(job?.state);
   for (const button of document.querySelectorAll("[data-mode]")) {
@@ -88,8 +89,27 @@ for (const [id, action, fields] of [
 el("job-cancel")?.addEventListener("click", () =>
   command("job/cancel", {id: latest.job.id}));
 
+function settingsError(message) {
+  const target = el("settings-error");
+  if (target) {
+    target.textContent = message;
+    target.hidden = !message;
+  } else {
+    put("command-result", message);
+  }
+}
+
 function openSettings() {
   if (!online || busy || !latest?.can_edit) return;
+  const numbers = [
+    ["setting-check", latest.check_seconds],
+    ["setting-retry", latest.retry_seconds],
+    ["setting-budget", latest.daily_probe_mb],
+  ];
+  if (numbers.some(([, value]) => !Number.isSafeInteger(value))) {
+    put("command-result", "Настройки недоступны: панель не вернула интервалы или бюджет.");
+    return;
+  }
   draftKey = latest.config_key;
   const strategies = [...latest.strategies];
   if (!strategies.includes(latest.selected_strategy)) strategies.push(latest.selected_strategy);
@@ -101,9 +121,7 @@ function openSettings() {
   }));
   el("setting-strategy").value = latest.selected_strategy;
   el("setting-domains").value = latest.domains.join("\n");
-  el("setting-check").value = latest.check_seconds;
-  el("setting-retry").value = latest.retry_seconds;
-  el("setting-budget").value = latest.daily_probe_mb;
+  for (const [id, value] of numbers) el(id).value = value;
   el("setting-youtube").checked = latest.youtube_transport_probe;
   el("setting-clear").checked = false;
   for (const id of ["setting-page", "setting-media"]) {
@@ -117,6 +135,8 @@ function openSettings() {
     (expiry ? " · срок CDN до " + new Date(expiry * 1000).toLocaleString("ru-RU") : ""));
   updateProbePreset();
   put("settings-revision", "");
+  settingsError("");
+  put("command-result", "");
   el("settings-form").hidden = false;
   controls();
   el("setting-strategy").focus();
@@ -184,7 +204,13 @@ for (const button of document.querySelectorAll("[data-mode]")) {
     if (window.confirm(warning)) command("mode", {mode, expected});
   });
 }
-el("edit-settings").addEventListener("click", openSettings);
+el("edit-settings").addEventListener("click", () => {
+  if (!online || busy || openingSettings || draftKey !== null || !latest?.can_edit) return;
+  openingSettings = true;
+  put("command-result", "Загружаем настройки…");
+  controls();
+  refresh();
+});
 el("cancel-settings").addEventListener("click", closeSettings);
 el("reload-settings").addEventListener("click", async () => {
   if (!window.confirm("Заменить введённые правки текущими настройками шлюза?")) return;
@@ -219,6 +245,11 @@ el("setting-clear").addEventListener("change", () => {
 el("settings-form").addEventListener("submit", event => {
   event.preventDefault();
   if (draftKey === null || busy || !online) return;
+  settingsError("");
+  if (!event.currentTarget.reportValidity()) {
+    settingsError("Заполните обязательные поля. Проверьте интервалы и бюджет.");
+    return;
+  }
   const settings = {
     strategy: el("setting-strategy").value,
     domains: el("setting-domains").value.split(/\r?\n/).map(s => s.trim().toLowerCase()).filter(Boolean),
@@ -235,7 +266,7 @@ el("settings-form").addEventListener("submit", event => {
     if (!page && settings.youtube_transport_probe && latest?.can_replace_cdn_probe) {
       settings.cdn_probe_url = cdn;
     } else {
-      put("command-result", "Для замены заполните оба адреса.");
+      settingsError("Для замены заполните оба адреса.");
       return;
     }
   }
@@ -400,7 +431,14 @@ async function refresh() {
   } finally {
     clearTimeout(timeout);
     pending = null;
+    const open = openingSettings;
+    openingSettings = false;
     controls();
+    if (open && started === generation && !document.hidden) {
+      if (online) openSettings();
+      else put("command-result", needsLogin ? "Войдите в XGW."
+        : "Не удалось загрузить настройки. Повторите после восстановления связи.");
+    }
     if (!document.hidden && !needsLogin && !busy) {
       timer = setTimeout(refresh, started === generation ? 4000 * 2 ** failures : 0);
     }

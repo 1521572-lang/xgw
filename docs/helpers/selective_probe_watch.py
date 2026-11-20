@@ -221,7 +221,7 @@ def media_pair(before, after):
     try:
         change = route_evidence.deltas(previous, current)
     except route_evidence.EvidenceError as exc:
-        return {"state": "rejected", "reason": str(exc), "field": exc.field}
+        return {"state": "rejected", "reason": str(exc), **exc.details()}
     if current["monotonic_ns"] - previous["monotonic_ns"] > MAX_PAIR_SECONDS * 10**9:
         return {"state": "rejected", "reason": "sample_gap"}
     if not all((row["gate"] or {}).get("marked") is True for row in (before, after)):
