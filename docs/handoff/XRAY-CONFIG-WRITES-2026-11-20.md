@@ -5,8 +5,8 @@ Flash проводит проверку и публикует один обез�
 панели или sudo запроси нужный доступ у владельца и продолжи сама.
 Пакет временный. Сценарий и код подготовлены Codex.
 
-Очередь от 20 ноября начинается с [пассивного окна на установленной базе](NEXT_STEP.md).
-Этот Deploy выполняется отдельным заданием по результату наблюдения.
+Первый проход завершён. Определения для тестов, установки и отката
+используются также в [проверке статуса после ротации](SELECTIVE-ROUTE-STATUS-2026-11-21.md).
 
 В [живом отчёте](../reports/2026-11-20T124752Z_selective-cdn-update-r2.md)
 прошли форма, валидация, атомарная замена CDN и 135,1 секунды видео в
@@ -40,12 +40,17 @@ pytest, передай его интерпретатор абсолютным п
 пользователь и общий набор тестов кандидата.
 
 ```bash
-CANDIDATE=aedb68cda0980b1dc63c420c92861028e67fc892
+CANDIDATE=${CANDIDATE:-aedb68cda0980b1dc63c420c92861028e67fc892}
+OVERLAY=${OVERLAY:---xray-write-trace}
+UNIT=${UNIT:-xgw-write-trace-rollback}
 SRC="$D/write-source"
 BASE_SRC="$D/write-baseline"
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 WRITE_GATE=0
 WRITE_FILES=(src/xgw/apply/applier.py src/xgw/apply/singbox_generation.py src/xgw/daemon.py)
+if [[ $OVERLAY == --selective-route-status ]]; then
+  WRITE_FILES+=(src/xgw/watch/zapret2_control.py src/xgw/watch/zapret2_management.py)
+fi
 
 write_worktrees() {
   local changed expected
@@ -72,6 +77,12 @@ write_check() {
   run writer-unit write_test_suite "$SRC" writer-unit \
     tests/test_applier.py tests/test_singbox_generations.py tests/test_desync_route_evidence.py \
     tests/test_selective_probe_watch.py tests/test_acceptance_gate.py || return
+  if [[ $OVERLAY == --selective-route-status ]]; then
+    run route-unit write_test_suite "$SRC" route-unit tests/test_zapret2_panel.py \
+      tests/test_zapret2.py || return
+    run route-rebuild write_test_suite "$SRC" route-rebuild tests/test_daemon.py \
+      -k zapret2_tick_uses_api_and_restores_vpn_after_worker_death || return
+  fi
   run writer-daemon-current write_test_suite "$SRC" daemon-current tests/test_daemon.py ||
     new_rc=$?
   run writer-daemon-baseline write_test_suite "$BASE_SRC" daemon-baseline tests/test_daemon.py ||
@@ -100,13 +111,10 @@ fi
 сверь по тесту, что измеряет счётчик. Файлы JUnit остаются локально.
 Переходи к установке только после `WRITE_GATE_OK`.
 
-Установка сверяет три файла с базой `3a00777`, которая включает
+Установка сверяет файлы из `WRITE_FILES` с базой `3a00777`, которая включает
 принятый `apply/applier.py` из `1e27384`.
 
 ```bash
-OVERLAY=--xray-write-trace
-UNIT=xgw-write-trace-rollback
-
 prepare_write_trace() {
   PACKAGE=$(readlink -e /opt/xgw/lib/xgw) || return
   PANEL=$(readlink -e /etc/xgw/panel.json) || return
@@ -120,6 +128,10 @@ prepare_write_trace() {
   git -C "$REPO" archive "$CANDIDATE" src/xgw docs/helpers/desync_batch1_install.py \
     docs/helpers/t11_management_restore.sh |
     sudo -n tar --no-same-owner -x -C "$PAYLOAD/code" || return
+  if [[ $OVERLAY == --selective-route-status ]]; then
+    git -C "$REPO" archive "$CANDIDATE" docs/helpers/selective_route_status_watch.py |
+      sudo -n tar --no-same-owner -x -C "$PAYLOAD/code" || return
+  fi
   git -C "$REPO" archive "$BASE" "${WRITE_FILES[@]}" |
     sudo -n tar --no-same-owner -x -C "$PAYLOAD/base" || return
   sudo -n chmod -R go-w -- "$PAYLOAD" &&
