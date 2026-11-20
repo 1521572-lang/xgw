@@ -61,4 +61,4 @@ Xray на этом шлюзе производит демон XGW (источн�
 - Пары с rule=false на границах при active Selective — приоритет для
   следующей проверки (возможно, route_evidence кандидатов считает правило
   по live-конфигу после rebuild — сверить с nft на границах).
-- Publication commit: `добавляется после push`.
+- Publication commit: `79145d2d600059a6468846b2a666615ce4600e13` (360e1a0 → 79145d2, ancestor verified).
