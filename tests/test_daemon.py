@@ -3557,12 +3557,31 @@ def test_zapret2_tick_uses_api_and_restores_vpn_after_worker_death(daemon):
     assert zapret2.active(engine.read_json(daemon.paths.xray_config_file))
     assert daemon._build_count == builds
     assert len(daemon.applier.api_only) == 2  # каркас, затем проверенный маршрут
+
+    daemon.paths.api_dirty_file.touch()
+    assert daemon._zapret2_status(True) == {"state": "unknown", "reason": "route_unconfirmed"}
+    daemon.paths.api_dirty_file.unlink()
+    assert daemon.status()["zapret2"]["state"] == "active"
+
+    # A successful rebuild starts with the VPN route and skips the controller this tick.
+    daemon.refresh_wait = None
+    daemon.cfg.routing.direct_domains = ["domain:other.example"]
+    daemon._rebuild_asked = True
+    daemon.tick()
+    assert not zapret2.active(engine.read_json(daemon.paths.xray_config_file))
+    assert daemon.status()["zapret2"] == {"state": "pending", "reason": "route_reconcile"}
+    assert daemon.poke.is_set()
+    daemon.tick()
+    assert zapret2.active(engine.read_json(daemon.paths.xray_config_file))
+    assert daemon.status()["zapret2"]["state"] == "active"
+    assert len(daemon.applier.api_only) == 3
+
     runtime.up = False
     daemon.t += 1
     daemon.tick()
     assert not zapret2.active(engine.read_json(daemon.paths.xray_config_file))
     assert daemon._zapret2.view["state"] == "fallback"
-    assert daemon._build_count == builds
+    assert daemon._build_count == builds + 1
 
 
 def test_zapret2_compare_uses_live_member_and_exports_probe_rows(daemon):

@@ -1717,6 +1717,11 @@ class Daemon:
         if changed:
             applied = engine.read_json(self.paths.xray_config_file)
             view = builder.applied_nodes(applied, self.inventory.nodes if self.inventory else ())
+            if (self.cfg.zapret2.mode == "selective" and self._zapret2.view["state"] == "active"
+                    and applied is not None and not zapret2.active(applied)):
+                # A rebuild can remove the client rule. Let the controller reconcile
+                # the new config on the next tick without a full watchdog sleep.
+                self.poke.set()
         if self.stopping:
             self._write_status(view, observatory, signals.xray_ok)
             return state
@@ -7289,6 +7294,19 @@ class Daemon:
         else:
             self.log.info("%s", text)
 
+    def _zapret2_status(self, xray_ok: bool) -> dict:
+        selected = self._zapret2.view
+        if self.cfg.zapret2.mode != "selective" or selected["state"] != "active":
+            return dict(selected)
+        if not xray_ok or self.paths.api_dirty_file.exists():
+            return {"state": "unknown", "reason": "route_unconfirmed"}
+        applied = engine.read_json(self.paths.xray_config_file)
+        if applied is None or zapret2.standalone(applied):
+            return {"state": "unknown", "reason": "route_unconfirmed"}
+        if not zapret2.active(applied):
+            return {"state": "pending", "reason": "route_reconcile"}
+        return dict(selected)
+
     def _write_status(
         self, view: list[NodeInfo], observatory: dict | None, xray_ok: bool, *, checkpoint=False,
     ) -> None:
@@ -7328,7 +7346,7 @@ class Daemon:
         snapshot["scan_pacing"] = self._pacing()  # PR-4: паузы плановых проб (п. 330)
         snapshot["selection"] = self._selection_status(view)  # разные пути запаса (п. 341)
         snapshot["media"] = self._media_status()  # выход для видео YouTube (п. 348, 353)
-        snapshot["zapret2"] = dict(self._zapret2.view)
+        snapshot["zapret2"] = self._zapret2_status(xray_ok)
         lease, history = self._desync_slot.snapshot()
         snapshot["zapret2_reservation"] = dataclasses.asdict(lease) if lease else None
         snapshot["zapret2_worker_events"] = history

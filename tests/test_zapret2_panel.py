@@ -75,6 +75,16 @@ def test_youtube_transport_is_never_reported_as_playback():
     assert view(cfg, snap)["evidence"]["last_transport_ok_at"] is None
 
 
+@pytest.mark.parametrize(("phase", "reason"), [
+    ("pending", "route_reconcile"), ("unknown", "route_unconfirmed"),
+])
+def test_route_status_does_not_report_https_ready(phase, reason):
+    cfg, snap = fixture(mode="selective", engine="off", state=phase, reason=reason)
+    result = view(cfg, snap)
+    assert (result["state"], result["reason"]) == (phase, reason)
+    assert result["evidence"]["transport"] == "unknown"
+
+
 def test_cdn_expiry_exposes_only_deadline_and_blocks_selective():
     cfg, snap = fixture(engine="off")
     cfg.zapret2.youtube_transport_probe = True
