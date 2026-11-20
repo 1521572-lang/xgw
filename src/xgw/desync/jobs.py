@@ -181,7 +181,9 @@ class Jobs:
                                 "transport": evidence.get("transport", "unknown"),
                                 "probes": {target: {key: value for key, value in probe.items()
                                                     if key in ("ok", "phase", "kind", "http",
-                                                               "elapsed_ms", "bytes")}
+                                                               "elapsed_ms", "bytes",
+                                                               "started_at", "connect_http",
+                                                               "first_tls_timeout_ms")}
                                            for target, probe in
                                            evidence.get("transport_probes", {}).items()
                                            if target in ("page", "cdn")},

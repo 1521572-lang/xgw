@@ -43,6 +43,22 @@ def changed(t, **changes):
     return dict(sample(t), **changes)
 
 
+def test_headless_playback_counts_elapsed_progress_and_cache_stalls():
+    from docs.helpers.headless_playback import measure
+
+    rows = [{"mono": i + i / 1230, "time-pos": i, "seeking": False, "height": 720,
+             "paused-for-cache": False, "cache-speed": 400000, "demuxer-cache-duration": 10}
+            for i in range(123)]
+    result = measure(rows, 120, 1600000)
+    assert result["ok"] and result["line"] == "OK"
+    rows[20]["paused-for-cache"] = True
+    rows[40]["paused-for-cache"] = True
+    rows[80]["paused-for-cache"] = True
+    result = measure(rows, 120, 1600000)
+    assert not result["ok"] and result["line"] == "THROTTLED"
+    assert result["stall_seconds"] == pytest.approx(3, abs=0.01)
+
+
 def test_read_netlog_counts_only_successful_media_streams(tmp_path):
     from docs.helpers.playback_netlog import read_media
 

@@ -529,7 +529,8 @@ class Controller:
     @staticmethod
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
                  *, max_total: float = 8, silence: float = 4,
-                 min_body: int = 16 * 1024, tls_timeout: float | None = None) -> DownloadResult:
+                 min_body: int = 16 * 1024, tls_timeout: float | None = None,
+                 range_end: int = 0) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
@@ -537,7 +538,8 @@ class Controller:
             "127.0.0.1", port, url, proxy_user=builder.PROBE_USER,
             proxy_pass=password, timeout=5, tls_timeout=tls_timeout, silence=silence,
             max_total=max_total,
-            max_bytes=PROBE_BYTES, min_body=min_body, user_agent=user_agent, cancel=cancel,
+            max_bytes=PROBE_BYTES, min_body=min_body, range_end=range_end,
+            user_agent=user_agent, cancel=cancel,
         )
 
     def probe(self, cfg: Config, applied: dict, cancel) -> bool:
@@ -550,6 +552,7 @@ class Controller:
             return False
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
+            media_file = media_transport and urlsplit(url).path == "/videoplayback"
             expires_at = probe_expiry(z) if media_transport else None
             if expires_at is not None and expires_at <= time.time():
                 self.probe_failure = CDN_EXPIRED
@@ -560,6 +563,8 @@ class Controller:
                            "tls_timeout": YOUTUBE_TRANSPORT_TLS_SECONDS}
                 if media_transport:
                     options["min_body"] = 0
+                    if media_file:
+                        options["range_end"] = PROBE_BYTES
                 else:
                     options["silence"] = YOUTUBE_PAGE_SILENCE_SECONDS
             started = time.monotonic()
@@ -576,7 +581,8 @@ class Controller:
                 first_tls_timeout_ms = round((time.monotonic() - started) * 1000)
                 verdict = self._request(url, z.probe_port, password, cfg.probe.user_agent,
                                         cancel, **options)
-            ok = verdict.ok and (not media_transport or verdict.status in (200, 204))
+            partial = media_file and verdict.status == 206 and verdict.downloaded > 0
+            ok = verdict.ok and (not media_transport or verdict.status in (200, 204) or partial)
             if z.youtube_transport_probe:
                 self.transport_probes["cdn" if media_transport else "page"] = {
                     "ok": ok, "phase": verdict.phase,

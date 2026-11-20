@@ -222,29 +222,36 @@ def test_cdn_expiry_between_page_and_video_skips_media_request(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("enabled", "media_status", "opens"),
-    [(False, 204, False), (True, 204, True), (True, 200, True),
-     (True, 302, False), (True, 403, False)],
+    ("enabled", "path", "media_status", "size", "opens"),
+    [(False, "videoplayback", 204, 0, False),
+     (True, "generate_204", 204, 0, True), (True, "generate_204", 206, 16384, False),
+     (True, "videoplayback", 200, 0, True), (True, "videoplayback", 206, 16384, True),
+     (True, "videoplayback", 206, 0, False), (True, "videoplayback", 302, 0, False),
+     (True, "videoplayback", 403, 0, False)],
 )
-def test_youtube_transport_gate_retains_page_and_cdn_checks(enabled, media_status, opens):
+def test_youtube_transport_gate_retains_page_and_cdn_checks(
+    enabled, path, media_status, size, opens,
+):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = enabled
-    h.cfg.zapret2.probe_urls[1] = "https://r1---sn-test.googlevideo.com/videoplayback"
+    h.cfg.zapret2.probe_urls[1] = f"https://r1---sn-test.googlevideo.com/{path}"
     h.controller.probe = z.Controller.probe.__get__(h.controller)
     seen = []
 
-    def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4, tls_timeout=None):
-        seen.append((min_body, max_total, silence, tls_timeout))
+    def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4, tls_timeout=None,
+                range_end=0):
+        seen.append((min_body, max_total, silence, tls_timeout, range_end))
         if "googlevideo.com" not in url:
             return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
-        return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204),
-                                     status=media_status, downloaded=0, phase="headers")
+        return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204, 206),
+                                     status=media_status, downloaded=size, phase="body")
 
     h.controller._request = request
     for now in (0, 1, 2):
         h.step(now)
-    assert seen == ([(16384, 12, 6, 10), (0, 12, 4, 10)] if enabled
-                    else [(16384, 8, 4, None)] * 2)
+    cdn_range = 65536 if path == "videoplayback" else 0
+    assert seen == ([(16384, 12, 6, 10, 0), (0, 12, 4, 10, cdn_range)] if enabled
+                    else [(16384, 8, 4, None, 0)] * 2)
     assert z.active(h.current) is opens
     if enabled:
         rows = h.controller.view["transport_probes"]

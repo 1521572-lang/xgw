@@ -158,6 +158,8 @@ def analyze(path):
 
 def matrix_report(path):
     """Recount the ordered results from a single saved job or client status."""
+    from ..watch.zapret2_control import REASONS, transport_probes
+
     with path.open("rb") as stream:
         raw = stream.read(1024 * 1024 + 1)
     if len(raw) > 1024 * 1024:
@@ -186,8 +188,14 @@ def matrix_report(path):
             raise ValueError("matrix_row_or_order")
         state = row["state"]
         counts[state] += 1
-        results[profile].append({"round": n, "state": state, "https_ok": (
-            state == "active" and row.get("transport") == "https_reachable")})
+        reason = row.get("reason")
+        if not isinstance(reason, str) or (reason not in REASONS and reason != "trial_timeout"):
+            reason = "unconfirmed"
+        results[profile].append({
+            "round": n, "state": state, "reason": reason,
+            "https_ok": state == "active" and row.get("transport") == "https_reachable",
+            "probes": transport_probes(row.get("probes"), now=time.time()),
+        })
     complete = (len(rows) == len(schedule) and job.get("state") == "complete"
                 and job.get("restore") == "pass")
     passed_twice = [p for p, runs in results.items()

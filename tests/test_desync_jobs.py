@@ -16,6 +16,9 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
             for n, sequence in ((1, profiles), (2, reversed(profiles))) for p in sequence]
     rows[0].update(state="timeout", transport="unknown")
     rows[1]["transport"] = "unknown"
+    rows[0].update(reason="trial_timeout")
+    rows[1].update(reason="youtube_page_probe_failed", probes={
+        "page": {"ok": False, "phase": "tls", "kind": "timeout", "url": "private"}})
     job = {"id": "a" * 32, "state": "complete", "restore": "pass",
            "candidates": profiles, "rounds": 2, "results": rows}
     path = tmp_path / "status.json"
@@ -24,6 +27,8 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
     assert result["ok"] and result["full_matrix"]
     assert result["states"] == {"timeout": 1, "active": 17}
     assert result["two_https_pass"] == profiles[2:]
+    assert result["profiles"][profiles[0]][0]["reason"] == "trial_timeout"
+    assert result["profiles"][profiles[1]][0]["probes"]["page"]["phase"] == "tls"
     assert "private" not in json.dumps(result)
     job["results"] = rows[:-1]
     path.write_text(json.dumps(job))
