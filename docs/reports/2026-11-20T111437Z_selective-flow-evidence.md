@@ -73,4 +73,4 @@ ipify ок) → **RESTORE_VERIFIED**; таймер остановлен; 90 за
    (локальный порт в сэмплах уже пишется новым headless_playback), тогда
    PARTIAL можно будет переклассифицировать по факту, а не по гипотезе.
 3. `sudo -v` заменён на `sudo -n true` (как согласовано в r2-отчёте).
-- Publication commit: `добавляется после push`.
+- Publication commit: `84ea816dff4c0fdb42422362c136cc52af41a56c` (58853f6 → 84ea816, ancestor verified).
