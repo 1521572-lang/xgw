@@ -110,4 +110,4 @@
 4. Служебное предупреждение systemd «triggering units are still
    active» при остановке socket-activated службы — штатное;
    останавливать пару сокет+служба в этом порядке.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `0c2225c5641996de29850bc9d64866c1859c9bb4` (2026-11-21T164610Z_panel-read-service.md).
