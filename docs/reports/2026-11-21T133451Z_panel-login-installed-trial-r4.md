@@ -84,4 +84,4 @@ active, off/off fresh/matched, HTTPS 200, PID Xray сохранён, тайме�
    шаблон для приёмок панели.
 4. Небольшое замечание: 1 skip в panel-тестах — штатный (root-зависимый,
    как и в предыдущих группах).
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `f1ad99924af10c994901be6197eef96cb1ddd867` (224d4f0 → f1ad999, ancestor verified).
