@@ -295,6 +295,24 @@ def test_vpn_retry_keeps_both_attempts_and_filters_private_details():
     assert view(cfg, snap)["evidence"]["vpn_control_attempts"] == []
 
 
+def test_vpn_redirect_card_reports_final_range_without_location():
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback", gate_closed=True,
+                        vpn_control="pass", vpn_control_target="cdn",
+                        vpn_control_reason="ok", vpn_control_at=NOW - 1)
+    snap["zapret2"]["vpn_control_attempts"] = [{
+        "verdict": "pass", "reason": "ok", "at": NOW - 1, "phase": "body", "kind": "ok",
+        "http": 206, "bytes": 65536,
+        "redirect": {"http": 302, "state": "followed", "host_changed": True,
+                     "location": "private"},
+    }]
+    result = view(cfg, snap)
+    row, = result["evidence"]["vpn_control_attempts"]
+    assert row["redirect"] == {"http": 302, "state": "followed", "host_changed": True}
+    assert row["http"] == 206
+    assert "private" not in json.dumps(result)
+    assert "после перенаправления" in result["detail"]
+
+
 def test_private_and_untrusted_fields_are_not_published():
     cfg, snap = fixture(reason="secret-in-error", profile="secret-profile", queue="secret")
     snap["capture"]["nfqws2"]["probes"] = [{"url": "secret-token"}]

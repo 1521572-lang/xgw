@@ -112,3 +112,53 @@ def test_full_chain_reservation_precedes_requests():
     h.cfg.zapret2.daily_probe_mb = 4
     assert h.controller._budget(h.cfg)
     assert json.loads(h.controller.store.get_meta(z.BUDGET))["bytes"] == 14 * z.PROBE_CHARGE
+
+
+@pytest.mark.parametrize(("location", "final_http", "limit_mb", "redirect_state", "verdict"), [
+    ("https://r2.googlevideo.com/videoplayback?sig=private", 206, 2, "followed", "pass"),
+    ("?sig=private", 403, 2, "followed", "fail"),
+    ("?sig=private", 302, 2, "hop_limit", "fail"),
+    ("?sig=private", None, 1, "budget_unavailable", "fail"),
+    ("?expire=1", None, 2, "expired", "fail"),
+    ("/videoplayback", None, 2, "loop", "fail"),
+    ("https://outside.test/videoplayback", None, 2, "blocked", "fail"),
+    ("https://r2.googlevideo.com:bad/videoplayback", None, 2, "blocked", "fail"),
+    ("https://r2.googlevideo.com/generate_204", None, 2, "blocked", "fail"),
+])
+def test_cdn_range_vpn_control_follows_only_one_in_scope_redirect(
+    location, final_http, limit_mb, redirect_state, verdict,
+):
+    h = Harness()
+    cdn = "https://r1.googlevideo.com/videoplayback"
+    h.cfg.zapret2.probe_urls[1] = cdn
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.daily_probe_mb = limit_mb
+    calls = []
+
+    def request(url, port, *_args, **kwargs):
+        calls.append(url)
+        assert port == 20011
+        assert kwargs["range_end"] == kwargs["min_body"] == z.PROBE_BYTES
+        if len(calls) == 1:
+            return DownloadResult(False, status=302, kind="http", phase="headers", location=location)
+        assert len(calls) == 2 and final_http is not None
+        assert 0 < kwargs["max_total"] <= z.VPN_CONTROL_SECONDS
+        return DownloadResult(
+            final_http == 206, status=final_http, phase="body" if final_http == 206 else "headers",
+            downloaded=z.PROBE_BYTES if final_http == 206 else 0, location="?third=private",
+        )
+
+    h.controller._request = request
+    control = h.controller._fallback_vpn_control(
+        h.cfg, h.current, 20011, None, gate_closed=True, routed_back=True,
+        stopped=True, target="cdn",
+    )
+    h.controller._record_vpn_control("cdn", control)
+    row, = h.controller.view["vpn_control_attempts"]
+    assert len(calls) == (1 if final_http is None else 2)
+    assert row["verdict"] == verdict and row["http"] == (final_http or 302)
+    assert row["redirect"]["http"] == 302 and row["redirect"]["state"] == redirect_state
+    if redirect_state == "followed":
+        assert row["redirect"]["host_changed"] == location.startswith("https://r2.")
+    assert "private" not in json.dumps(row)
+    assert h.controller._read_budget(h.cfg).spent_bytes == len(calls) * z.PROBE_CHARGE

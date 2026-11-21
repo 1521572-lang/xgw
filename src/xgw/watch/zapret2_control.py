@@ -16,8 +16,12 @@ VPN_CONTROL_REASONS = {
                           "cancelled", "no_probe_url", "no_vpn_probe_port", "no_probe_credentials",
                           "budget_unavailable", zapret2.CDN_EXPIRED}),
     "pass": frozenset({"ok"}),
-    "fail": frozenset({"request_failed"}),
+    "fail": frozenset({"request_failed", "cdn_redirect_unconfirmed"}),
 }
+CDN_REDIRECT_STATES = frozenset({
+    "followed", "blocked", "loop", "expired", "cancelled", "time_limit",
+    "budget_unavailable", "hop_limit",
+})
 REASONS = {
     "off": "Обработка выключена.",
     "disabled": "Обработка выключена в настройках.",
@@ -111,7 +115,17 @@ def _vpn_attempts(value: object, *, now: float) -> list[dict]:
                 or not isinstance(reason, str) or reason not in VPN_CONTROL_REASONS[verdict]
                 or not _number(at) or not 0 <= at <= now):
             continue
-        attempts.append({"verdict": verdict, "reason": reason, "at": at, **_probe_metrics(row)})
+        attempt = {"verdict": verdict, "reason": reason, "at": at, **_probe_metrics(row)}
+        redirect = _record(row.get("redirect"))
+        state, http = redirect.get("state"), redirect.get("http")
+        if (isinstance(state, str) and state in CDN_REDIRECT_STATES
+                and type(http) is int and http in zapret2.REDIRECT_CODES):
+            changed = redirect.get("host_changed")
+            attempt["redirect"] = {
+                "http": http, "state": state,
+                "host_changed": changed if type(changed) is bool else None,
+            }
+        attempts.append(attempt)
     return attempts
 
 
@@ -270,13 +284,22 @@ Commands use the same validation as this card; observations remain revision-boun
     if phase == "fallback":
         detail += " Контроллер снял прямой маршрут."
         control_fresh = vpn_control_at is not None and now - vpn_control_at <= FRESH_SECONDS
+        latest = next((row for row in reversed(vpn_control_attempts)
+                       if row["at"] == vpn_control_at), {})
         if control_fresh and vpn_control_target == "cdn" and vpn_control == "pass":
-            if len(vpn_control_attempts) == 2:
+            if "redirect" in latest:
+                detail += " CDN ответил через VPN после перенаправления."
+            elif len(vpn_control_attempts) == 2:
                 detail += " Повторная проба того же URL CDN через VPN прошла."
             else:
                 detail += " Тот же пробный URL CDN ответил через VPN."
         elif control_fresh and vpn_control_target == "cdn" and vpn_control == "fail":
-            detail += " Проба того же URL CDN через VPN тоже не прошла."
+            if vpn_control_reason == "cdn_redirect_unconfirmed":
+                detail += " CDN перенаправил запрос через VPN. Диапазон видео не подтверждён."
+            elif latest.get("http") == 403:
+                detail += " CDN вернул HTTP 403 через VPN."
+            else:
+                detail += " Проба URL CDN через VPN тоже не прошла."
             if vpn_control_retry_pending:
                 detail += " Ожидается один повтор через VPN."
         elif control_fresh and vpn_control_reason == zapret2.CDN_EXPIRED:

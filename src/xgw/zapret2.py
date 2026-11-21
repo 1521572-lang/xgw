@@ -21,6 +21,7 @@ from .desync import flowseal, h05, preflight, worker
 from .desync.schema import (
     MAX_REPLY_PACKETS,
     SELECTED_PROFILES,
+    valid_youtube_cdn_host,
     valid_youtube_transport,
     youtube_cdn_expiry,
 )
@@ -57,6 +58,7 @@ VPN_CONTROL_SECONDS = 8
 VPN_CDN_RETRY_DELAY = 30
 VPN_CDN_RETRY_KINDS = frozenset({"connect", "timeout", "reset", "stall", "io"})
 REDIRECT_LIMIT = 5
+REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 START_WAIT = 20
 START_POLL = 2
 STANDALONE_LEASE = 60
@@ -190,6 +192,41 @@ def probe_lease(seconds: int, expires_at: int | None) -> int:
         if seconds < 1:
             raise ValueError(CDN_EXPIRED)
     return seconds
+
+
+def _redirect_target(url: str, location: str, domains: list[str]) -> str | None:
+    if not location or any(ord(c) < 33 or ord(c) > 126 for c in location):
+        return None
+    try:
+        target = urljoin(url, location)
+        parts = urlsplit(target)
+        host = parts.hostname or ""
+        if (parts.scheme != "https" or parts.port not in (None, 443)
+                or parts.username is not None or parts.password is not None
+                or parts.fragment or not matches(host, domains)):
+            return None
+    except ValueError:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return target
+    return None
+
+
+@dataclass(frozen=True)
+class _CdnRedirect:
+    http: int
+    state: str
+    host_changed: bool | None = None
+
+
+@dataclass(frozen=True)
+class _VpnControl:
+    verdict: str
+    reason: str
+    result: DownloadResult | None = None
+    redirect: _CdnRedirect | None = None
 
 
 @dataclass(frozen=True)
@@ -627,26 +664,10 @@ class Controller:
             last_result, last_url, last_hops = result, url, hops
             if not result.ok and time.monotonic() >= deadline:
                 return result, url, hops, "time_limit"
-            if result.phase == "connect" or result.status not in (301, 302, 303, 307, 308):
+            if result.phase == "connect" or result.status not in REDIRECT_CODES:
                 return result, url, hops, redirect
-            try:
-                location = result.location
-                if not location or any(ord(c) < 33 or ord(c) > 126 for c in location):
-                    raise ValueError("bad_location")
-                target = urljoin(url, location)
-                parts = urlsplit(target)
-                host = parts.hostname or ""
-                if (parts.scheme != "https" or parts.port not in (None, 443)
-                        or parts.username is not None or parts.password is not None
-                        or parts.fragment or not matches(host, cfg.zapret2.domains)):
-                    raise ValueError("bad_target")
-                try:
-                    ipaddress.ip_address(host)
-                except ValueError:
-                    pass
-                else:
-                    raise ValueError("literal_ip")
-            except ValueError:
+            target = _redirect_target(url, result.location, cfg.zapret2.domains)
+            if target is None:
                 return result, url, hops, "blocked"
             if target in seen:
                 return result, url, hops, "loop"
@@ -689,31 +710,31 @@ class Controller:
     def _fallback_vpn_control(
         self, cfg: Config, applied: dict, port: int, cancel, *,
         gate_closed: bool, routed_back: bool, stopped: bool, target: str, retry: bool = False,
-    ) -> tuple[str, str, DownloadResult | None]:
+    ) -> _VpnControl:
         from .generator import builder
 
         if not gate_closed:
-            return "not_run", "gate_not_closed", None
+            return _VpnControl("not_run", "gate_not_closed")
         if not routed_back:
-            return "not_run", "route_not_restored", None
+            return _VpnControl("not_run", "route_not_restored")
         if not stopped:
-            return "not_run", "worker_not_stopped", None
+            return _VpnControl("not_run", "worker_not_stopped")
         if cancel is not None and cancel.is_set():
-            return "not_run", "cancelled", None
+            return _VpnControl("not_run", "cancelled")
         urls = cfg.zapret2.probe_urls
         index = 1 if target == "cdn" else 0
         if len(urls) <= index:
-            return "not_run", "no_probe_url", None
+            return _VpnControl("not_run", "no_probe_url")
         if not port:
-            return "not_run", "no_vpn_probe_port", None
+            return _VpnControl("not_run", "no_vpn_probe_port")
         password, _ = builder.probe_state(applied)
         if not password:
-            return "not_run", "no_probe_credentials", None
+            return _VpnControl("not_run", "no_probe_credentials")
         expires_at = probe_expiry(cfg.zapret2) if target == "cdn" else None
         if expires_at is not None and time.time() >= expires_at:
-            return "not_run", CDN_EXPIRED, None
+            return _VpnControl("not_run", CDN_EXPIRED)
         if not self._budget(cfg, single_probe=True, vpn=True, preserve_admission=retry):
-            return "not_run", "budget_unavailable", None
+            return _VpnControl("not_run", "budget_unavailable")
         url = urls[index]
         media_range = target == "cdn" and urlsplit(url).path == "/videoplayback"
         options = {}
@@ -721,22 +742,65 @@ class Controller:
             options = {"min_body": PROBE_BYTES, "range_end": PROBE_BYTES}
         elif target == "cdn":
             options = {"min_body": 0}
+        deadline = time.monotonic() + VPN_CONTROL_SECONDS
         result = self._request(url, port, password, cfg.probe.user_agent, cancel, **options)
+        redirect = None
+        if media_range and result.phase == "headers" and result.status in REDIRECT_CODES:
+            result, redirect = self._follow_cdn_redirect(
+                cfg, result, url, port, password, cancel, deadline, expires_at,
+            )
         if result.kind == "cancelled":
-            return "not_run", "cancelled", result
+            return _VpnControl("not_run", "cancelled", result, redirect)
         if expires_at is not None and time.time() >= expires_at:
-            return "not_run", CDN_EXPIRED, result
+            return _VpnControl("not_run", CDN_EXPIRED, result, redirect)
         ok = result.ok
         if media_range:
             ok = ok and result.status == 206 and result.downloaded == PROBE_BYTES
         elif target == "cdn":
             ok = ok and result.status in (200, 204)
-        return ("pass", "ok", result) if ok else ("fail", "request_failed", result)
+        if ok:
+            return _VpnControl("pass", "ok", result, redirect)
+        reason = ("cdn_redirect_unconfirmed" if redirect and result.status in REDIRECT_CODES
+                  else "request_failed")
+        return _VpnControl("fail", reason, result, redirect)
+
+    def _follow_cdn_redirect(
+        self, cfg: Config, first: DownloadResult, url: str, port: int, password: str, cancel,
+        deadline: float, original_expiry: int | None,
+    ) -> tuple[DownloadResult, _CdnRedirect]:
+        target = _redirect_target(url, first.location, cfg.zapret2.domains)
+        if target is None:
+            return first, _CdnRedirect(first.status, "blocked")
+        parts = urlsplit(target)
+        if parts.path != "/videoplayback" or not valid_youtube_cdn_host(parts.hostname or ""):
+            return first, _CdnRedirect(first.status, "blocked")
+        changed_host = parts.hostname != urlsplit(url).hostname
+        if target == url:
+            return first, _CdnRedirect(first.status, "loop", changed_host)
+        target_expiry = youtube_cdn_expiry(target)
+        expiries = [expiry for expiry in (original_expiry, target_expiry) if expiry is not None]
+        if expiries and min(expiries) <= time.time():
+            return first, _CdnRedirect(first.status, "expired", changed_host)
+        if cancel is not None and cancel.is_set():
+            return first, _CdnRedirect(first.status, "cancelled", changed_host)
+        if time.monotonic() >= deadline:
+            return first, _CdnRedirect(first.status, "time_limit", changed_host)
+        if not self._budget(cfg, single_probe=True, vpn=True, preserve_admission=True):
+            return first, _CdnRedirect(first.status, "budget_unavailable", changed_host)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return first, _CdnRedirect(first.status, "time_limit", changed_host)
+        result = self._request(target, port, password, cfg.probe.user_agent, cancel,
+                               min_body=PROBE_BYTES, range_end=PROBE_BYTES, max_total=remaining)
+        if target_expiry is not None and time.time() >= target_expiry:
+            return first, _CdnRedirect(first.status, "expired", changed_host)
+        state = "hop_limit" if result.status in REDIRECT_CODES else "followed"
+        return result, _CdnRedirect(first.status, state, changed_host)
 
     def _record_vpn_control(
-        self, target: str, control: tuple[str, str, DownloadResult | None], *, retry: bool = False,
+        self, target: str, control: _VpnControl, *, retry: bool = False,
     ) -> None:
-        verdict, reason, result = control
+        verdict, reason, result = control.verdict, control.reason, control.result
         at = time.time()
         attempt = {"verdict": verdict, "reason": reason, "at": at}
         if result is not None:
@@ -745,6 +809,11 @@ class Controller:
                                                                     else "http"),
                            http=0 if connect else result.status, bytes=result.downloaded,
                            connect_http=result.status if connect else 0)
+        if control.redirect is not None:
+            attempt["redirect"] = {
+                "http": control.redirect.http, "state": control.redirect.state,
+                "host_changed": control.redirect.host_changed,
+            }
         attempts = self.view.get("vpn_control_attempts", []) if retry else []
         self.view["vpn_control_attempts"] = [*attempts, attempt]
         if not retry or verdict != "not_run":
@@ -951,10 +1020,9 @@ class Controller:
                 routed_back=routed_back, stopped=stopped, target=target,
             )
             self._record_vpn_control(target, control)
-            verdict, _, result = control
             due = now + (time.monotonic() - step_started) + VPN_CDN_RETRY_DELAY
-            if (target == "cdn" and verdict == "fail" and result is not None
-                    and result.kind in VPN_CDN_RETRY_KINDS
+            if (target == "cdn" and control.verdict == "fail" and control.result is not None
+                    and control.redirect is None and control.result.kind in VPN_CDN_RETRY_KINDS
                     and due + VPN_CONTROL_SECONDS < self.next_check):
                 self.vpn_cdn_retry = (due, cfg.zapret2.probe_urls[1])
                 self.view["vpn_control_retry_pending"] = True
