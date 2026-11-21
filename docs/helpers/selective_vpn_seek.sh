@@ -9,6 +9,12 @@ if [[ $ID != ubuntu || $VERSION_ID != 24.04 || $EUID == 0 ]]; then
   exit 2
 fi
 SRC=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 2
+if [[ $# != 1 || ! $1 =~ ^[0-9a-f]{40}$ ]] ||
+   [[ $(git -C "$SRC" rev-parse HEAD) != "$1" ]]; then
+  echo 'Run from the pinned checkout with its full commit SHA.' >&2
+  exit 2
+fi
+CODE=$1
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 if [[ $TEST_PY != /* || ! -x $TEST_PY ]]; then
@@ -77,9 +83,28 @@ settings() {
   done
 }
 
-snapshot() {
-  timeout -k 2 12 sudo -n env PYTHONPATH=/opt/xgw/lib \
-    "$PY" -B -P -s -m xgw.desync.route_evidence snapshot
+stage_snapshot_tools() {
+  TOOLS=$(sudo -n mktemp -d /tmp/xgw-vpn-seek-tools.XXXXXXXX) || return
+  [[ $TOOLS =~ ^/tmp/xgw-vpn-seek-tools\.[[:alnum:]]{8}$ ]] || return 2
+  # The archive comes from the pinned Git object. Root never imports the working tree.
+  git -C "$SRC" archive "$CODE" src/xgw |
+    timeout -k 2 20 sudo -n tar --no-same-owner --no-same-permissions -x -C "$TOOLS"
+}
+
+snapshot_tool() {
+  timeout -k 2 15 sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "$PY" -I -B -c 'import runpy, sys
+sys.path.insert(0, sys.argv.pop(1))
+runpy.run_module("xgw.desync.route_evidence", run_name="__main__", alter_sys=True)' \
+    "$TOOLS/src" "$@"
+}
+
+cleanup() {
+  local status=$?
+  if [[ $TOOLS =~ ^/tmp/xgw-vpn-seek-tools\.[[:alnum:]]{8}$ ]]; then
+    run route-tools-cleanup timeout -k 2 12 sudo -n rm -r -- "$TOOLS" || status=2
+  fi
+  exit "$status"
 }
 
 snapshot_off() {
@@ -119,12 +144,18 @@ read -r PORT <"$D/http-port.out" || exit 2
 run https-before https_control || exit 2
 run settings-before settings || exit 2
 
+TOOLS=
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 rc=0
-if run resolve timeout -k 2 65 yt-dlp --ignore-config --proxy "http://127.0.0.1:$PORT" \
+if run route-tools stage_snapshot_tools && run route-tools-check snapshot_tool --help &&
+   run resolve timeout -k 2 65 yt-dlp --ignore-config --proxy "http://127.0.0.1:$PORT" \
      --no-playlist --socket-timeout 10 --retries 1 --extractor-retries 1 \
      -f 'bv[height=720][protocol=https]' --dump-single-json \
      'https://www.youtube.com/watch?v=8plwv25NYRo' &&
-   run route-before snapshot && run route-off snapshot_off; then
+   run route-before snapshot_tool snapshot && run route-off snapshot_off; then
   run play-seek timeout -k 4 385 env "PYTHONPATH=$SRC/src:$SRC" "$PY" -B -P \
     -m docs.helpers.headless_playback "$D/resolve.out" play --seconds 300 \
     --seek-forward 480 --strict --peers --samples "$D/play-samples.jsonl" &
@@ -133,9 +164,14 @@ if run resolve timeout -k 2 65 yt-dlp --ignore-config --proxy "http://127.0.0.1:
     kill -0 "$player_job" 2>/dev/null || break
     sleep 5
   done
-  run route-after snapshot || rc=2
+  route_after_ok=0
+  if run route-after snapshot_tool snapshot; then
+    route_after_ok=1
+  else
+    rc=2
+  fi
   wait "$player_job" || rc=2
-  if [[ -s "$D/route-after.out" && -s "$D/play-samples.jsonl" ]]; then
+  if [[ $route_after_ok == 1 && -s "$D/play-samples.jsonl" ]]; then
     run flow-seek flow || rc=2
   fi
 else
