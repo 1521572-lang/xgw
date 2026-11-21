@@ -127,4 +127,4 @@ LIVE_PLAY=NOT_RUN, FLOW=NOT_RUN, счётчики `active_with_rule` /
    перекрылось с системной утилитой окружения рабочего стола — внутренняя
    ошибка подготовки, к кандидату отношения не имеет (POST не ушёл,
    повтор блока единственный).
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `90212a670e6e5fe50db06ae574e2fba444e2e74e` (d8b4a6e → 90212a6, ancestor verified).
