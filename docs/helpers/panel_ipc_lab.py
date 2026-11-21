@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import pwd
+import secrets
+import selectors
 import socket
 import stat
 import subprocess
@@ -18,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from xgw import config  # noqa: E402
 from xgw.desync.event_socket import read_status  # noqa: E402
 from xgw.paths import Paths  # noqa: E402
-from xgw.watch import panel_ipc, zapret2_control  # noqa: E402
+from xgw.watch import panel_ipc, panel_read_http, zapret2_control  # noqa: E402
 
 QUERY = b'{"version":1,"op":"zapret2.overview"}'
 CASES = {
@@ -76,7 +79,128 @@ def wait_for_listener(path):
     raise ValueError("socket_startup")
 
 
-def run():
+def check_process(pid, identity):
+    fields = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
+    check(fields["Uid"].split() == [str(identity.pw_uid)] * 4, "http_uid")
+    check(fields["Gid"].split() == [str(identity.pw_gid)] * 4 and not fields["Groups"].strip(),
+          "http_groups")
+    caps = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+    check(all(int(fields[key], 16) == 0 for key in caps), "http_caps")
+    check(fields["NoNewPrivs"].strip() == "1", "http_no_new_privs")
+    print("http_privileges OK", flush=True)
+
+
+def http_request(port, route, *, token=None, method="GET", headers=()):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+    try:
+        connection.putrequest(method, route, skip_host=True)
+        connection.putheader("Host", f"127.0.0.1:{port}")
+        if token is not None:
+            connection.putheader("Authorization", f"Bearer {token}")
+        for name, value in headers:
+            connection.putheader(name, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        raw = response.read(2049)
+        check(len(raw) <= 2048, "http_body_limit")
+        check(response.getheader("Cache-Control") == "no-store", "http_cache_control")
+        check(response.getheader("Access-Control-Allow-Origin") is None, "http_no_cors")
+        return response.status, json.loads(raw) if raw else None
+    finally:
+        connection.close()
+
+
+def exercise_http(path, identity, unavailable, reads):
+    prefix = [
+        "/usr/bin/setpriv", "--reuid", str(identity.pw_uid), "--regid", str(identity.pw_gid),
+        "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
+        "--no-new-privs", sys.executable, "-I", "-B",
+    ]
+    env = {"PATH": "/usr/bin:/bin"}
+    paths = Paths(Path("/"))
+    check(paths.panel_token_file.is_file(), "panel_token_file_missing")
+    trial = subprocess.run(
+        [*prefix, "-c", "import json, os, sys; "
+         "print(json.dumps([os.access(path, os.R_OK) for path in sys.argv[1:]]))",
+         str(paths.panel_token_file), str(paths.config_file), str(paths.status_file)],
+        cwd="/", env=env, capture_output=True, timeout=5,
+    )
+    check(trial.returncode == 0, "http_file_access_probe")
+    token_readable, config_readable, status_readable = json.loads(trial.stdout)
+    check(token_readable is False, "http_worker_can_read_panel_token")
+    print("http_panel_token_denied OK", flush=True)
+    print("http_file_readability", json.dumps({"config": config_readable,
+                                               "snapshot": status_readable}), flush=True)
+
+    token = secrets.token_urlsafe(32)
+    source = str(Path(__file__).resolve().parents[2] / "src")
+    launch = (
+        "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
+        "runpy.run_module('xgw.watch.panel_read_http', run_name='__main__')"
+    )
+    with subprocess.Popen(
+        [*prefix, "-c", launch, source, str(path)], cwd="/", env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    ) as worker:
+        try:
+            worker.stdin.write(f"{token}\n".encode("ascii"))
+            worker.stdin.close()
+            with selectors.DefaultSelector() as poller:
+                poller.register(worker.stdout, selectors.EVENT_READ)
+                check(bool(poller.select(timeout=5)), "http_startup")
+            port = int(worker.stdout.readline(8))
+            check(0 < port < 65536, "http_port")
+            check_process(worker.pid, identity)
+            route = panel_read_http.ROUTE
+            for name, expected, options in (
+                ("anonymous", 401, {}),
+                ("wrong_key", 401, {"token": "invalid"}),
+                ("duplicate_authorization", 401,
+                 {"token": token, "headers": (("Authorization", "Bearer invalid"),)}),
+                ("other_origin", 403,
+                 {"token": token, "headers": (("Origin", "https://foreign.invalid"),)}),
+                ("duplicate_host", 403,
+                 {"token": token, "headers": (("Host", "foreign.invalid"),)}),
+                ("post", 405, {"token": token, "method": "POST"}),
+            ):
+                status, payload = http_request(port, route, **options)
+                check(status == expected and set(payload) == {"error"}, name)
+                print(f"http_{name} OK", flush=True)
+            check(http_request(port, "/api/state", token=token)[0] == 404, "http_route_boundary")
+            check(not reads, "http_rejected_requests_reached_backend")
+            print("http_only_read_route OK", flush=True)
+            status, payload = http_request(port, route, token=token)
+            check(status == 200 and set(payload) == {"zapret2"}, "http_allowed")
+            print("allowed", json.dumps(payload["zapret2"], sort_keys=True), flush=True)
+            check(http_request(port, route, token=token, method="HEAD") == (200, None),
+                  "http_head")
+            print("http_head OK", flush=True)
+            unavailable.set()
+            check(http_request(port, route, token=token) == (503, {"error": "unavailable"}),
+                  "http_unavailable")
+            print("http_unavailable OK", flush=True)
+            unavailable.clear()
+            check(http_request(port, route, token=token) == (200, payload) and len(reads) == 4,
+                  "http_recovered")
+            print("http_recovered OK", flush=True)
+        finally:
+            worker.terminate()
+            try:
+                worker.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.wait(timeout=3)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        try:
+            probe.connect(("127.0.0.1", port))
+        except ConnectionRefusedError:
+            print("http_cleanup OK", flush=True)
+        else:
+            raise ValueError("http_endpoint_still_listening")
+
+
+def run(*, with_http=False):
     check(os.geteuid() == 0, "root_required")
     permitted = pwd.getpwnam("nobody")
     rejected = pwd.getpwnam("daemon")
@@ -122,6 +246,9 @@ def run():
         check(stat.S_ISSOCK(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o660
               and info.st_uid == 0 and info.st_gid == permitted.pw_gid, "socket_permissions")
         print("socket_permissions OK", flush=True)
+        if with_http:
+            exercise_http(path, permitted, unavailable, reads)
+            return
         overview_status = as_client("allowed")
         print("allowed", json.dumps(overview_status, sort_keys=True), flush=True)
         check(as_client("other_uid", uid=rejected.pw_uid) is True, "other_uid")
@@ -148,6 +275,8 @@ if __name__ == "__main__":
             print(json.dumps(client_case(Path(sys.argv[2]), sys.argv[3])))
         elif len(sys.argv) == 1:
             run()
+        elif sys.argv[1:] == ["--http"]:
+            run(with_http=True)
         else:
             raise ValueError("arguments")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError, config.ConfigError) as exc:
