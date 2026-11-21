@@ -1,4 +1,4 @@
-"""Панель управления: вход по токену, защита запросов, что она показывает и что
+"""Панель управления: вход по одноразовому коду, защита запросов и что
 делают её кнопки. Сервер настоящий (127.0.0.1, свободный порт), система подменена."""
 
 import http.client
@@ -76,8 +76,9 @@ class FakeDaemon:
 class Client:
     """Браузер в миниатюре: помнит cookie и шлёт то же, что страница панели."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, paths: Paths) -> None:
         self.port = port
+        self.paths = paths
         self.cookie = ""
 
     def request(self, method: str, path: str, *, body=None, headers=None, host=None):
@@ -94,7 +95,7 @@ class Client:
         return response, text
 
     def login(self) -> None:
-        response, _text = self.request("GET", f"/?token={TOKEN}")
+        response, _text = self.request("GET", f"/?login={panel_module.new_login(self.paths)}")
         assert response.status == 303
         self.cookie = response.getheader("Set-Cookie").split(";")[0]
 
@@ -171,7 +172,7 @@ class Rig:
         cfg, _warnings = config.load(self.config_path)
         self.panel.configure(cfg, self.daemon)
         self.panel.start()
-        self.client = Client(self.panel.port)
+        self.client = Client(self.panel.port, self.paths)
 
     def _system(self, argv, *, input=None, timeout=15.0, check=True) -> str:
         self.system_calls.append(tuple(argv))
@@ -204,9 +205,10 @@ def user(rig):
 # --- вход и защита запросов --------------------------------------------------------
 
 
-def test_without_token_there_is_only_the_login_page(rig):
+def test_without_session_there_is_only_the_login_page(rig):
     response, text = rig.client.request("GET", "/")
-    assert response.status == 200 and 'name="token"' in text and 'id="power"' not in text
+    assert response.status == 200 and "sudo xgw panel" in text and 'id="power"' not in text
+    assert 'name="token"' not in text
     assert response.getheader("Set-Cookie") is None
     assert "default-src 'none'" in response.getheader("Content-Security-Policy")
     assert rig.client.request("GET", "/api/state")[0].status == 401
@@ -215,17 +217,18 @@ def test_without_token_there_is_only_the_login_page(rig):
     assert response.status == 401 and rig.kernel.calls == []
 
 
-def test_token_moves_into_a_cookie_and_out_of_the_address(rig):
+def test_old_bookmark_redirects_without_issuing_or_replacing_a_session(rig):
+    for value in (TOKEN, "guess", ""):
+        response, _text = rig.client.request("GET", f"/?token={value}")
+        assert response.status == 303 and response.getheader("Location") == "/"
+        assert response.getheader("Set-Cookie") is None
+        assert response.getheader("Referrer-Policy") == "no-referrer"
+    assert "sudo xgw panel" in rig.client.request("GET", "/")[1]
+    assert rig.client.request("GET", "/api/state")[0].status == 401
+    rig.client.login()
     response, _text = rig.client.request("GET", f"/?token={TOKEN}")
-    cookie = response.getheader("Set-Cookie")
-    assert response.status == 303 and response.getheader("Location") == "/"
-    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie and TOKEN not in cookie
-    rig.client.cookie = cookie.split(";")[0]
-    response, text = rig.client.request("GET", "/")
-    assert response.status == 200 and 'id="power"' in text
-    # Чужой токен и чужая cookie не подходят.
-    response, text = rig.client.request("GET", "/?token=guess")
-    assert response.status == 403 and 'name="token"' in text
+    assert response.status == 303 and response.getheader("Set-Cookie") is None
+    assert 'id="power"' in rig.client.request("GET", "/")[1]
     rig.client.cookie = "xgw_panel=" + "0" * 64
     assert rig.client.request("GET", "/api/state")[0].status == 401
 
@@ -248,17 +251,22 @@ def test_one_time_login_code_works_once_and_only_for_a_minute(rig, monkeypatch):
     assert len(stored) == 1 and code not in stored[0].name  # на диске — только SHA-256
     assert panel_module.login_dir(rig.paths).stat().st_mode & 0o777 == 0o700
     assert stored[0].stat().st_mode & 0o777 == 0o600
+    assert rig.client.request("GET", f"/?login={code}", host="foreign.test")[0].status == 403
+    head, _text = rig.client.request("HEAD", f"/?login={code}")
+    assert head.status == 200 and head.getheader("Set-Cookie") is None
     response, _text = rig.client.request("GET", f"/?login={code}")
     cookie = response.getheader("Set-Cookie")
     assert response.status == 303 and response.getheader("Location") == "/"
     assert cookie and code not in cookie and TOKEN not in cookie
+    assert "HttpOnly" in cookie and "SameSite=Strict" in cookie
+    assert response.getheader("Referrer-Policy") == "no-referrer"
     rig.client.cookie = cookie.split(";")[0]
     assert rig.client.request("GET", "/api/state")[0].status == 200
     rig.client.cookie = ""
     # Второй раз код не годится, выдуманный — тоже.
     for value in (code, "guess", "x" * 200):
         response, text = rig.client.request("GET", f"/?login={value}")
-        assert response.status == 403 and 'name="token"' in text
+        assert response.status == 403 and "sudo xgw panel" in text
     assert list(panel_module.login_dir(rig.paths).iterdir()) == []
     # Через минуту код устарел; новый код убирает устаревшие.
     stale = panel_module.new_login(rig.paths)
@@ -327,7 +335,7 @@ def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
         lease = slot.reserve(worker.SELECTED_UNIT, 201, policy_key="1" * 64)
         slot.release(lease)
     status.write_status(rig.paths, {**_snapshot(), "zapret2_worker_events": slot.snapshot()[1]})
-    guest_client = Client(rig.panel.port)
+    guest_client = Client(rig.panel.port, rig.paths)
     assert guest_client.request("GET", "/api/zapret2/overview")[0].status == 401
     response, guest = guest_client.request("GET", "/zapret2")
     assert response.status == 200 and 'id="domain-list"' not in guest
@@ -398,7 +406,7 @@ def test_zapret2_commands_require_session_origin_and_revision(rig, user):
 
     expected = schema.fingerprint(config.load(rig.config_path)[0].desync)
     payload = {"expected": expected, "settings": {"retry_seconds": 120}}
-    guest = Client(rig.panel.port)
+    guest = Client(rig.panel.port, rig.paths)
     before = rig.store_path.read_bytes() if rig.store_path.exists() else None
     assert guest.request("POST", "/api/zapret2/settings", body=payload)[0].status == 401
     for headers, host in [({}, None),
@@ -435,7 +443,7 @@ def test_zapret2_commands_require_session_origin_and_revision(rig, user):
 @pytest.mark.parametrize("action", ["job/start", "job/cancel", "job/pin", "job/reset",
                                    "probe", "import"])
 def test_zapret2_new_actions_keep_auth_and_origin_boundary(rig, user, action):
-    guest = Client(rig.panel.port)
+    guest = Client(rig.panel.port, rig.paths)
     path = "/api/zapret2/" + action
     assert guest.request("POST", path, body={})[0].status == 401
     assert user.request("POST", path, body={}, headers={})[0].status == 403

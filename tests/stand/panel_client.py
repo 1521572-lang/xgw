@@ -1,5 +1,5 @@
-"""Клиент панели XGW для стенда — то, что на настоящей машине делает браузер:
-входит по токену, читает состояние, нажимает кнопки. Запускается на самом шлюзе.
+"""Клиент панели XGW для стенда. Системный ключ используется локально
+для вычисления cookie. Скрипт запускается на самом шлюзе.
 
   panel_client.py <порт> raw <путь>                     — запрос без входа
   panel_client.py <порт> state <токен>                  — состояние панели
@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import http.client
 import json
 import sys
@@ -38,11 +40,9 @@ def request(
         conn.close()
 
 
-def login(port: int, token: str) -> str:
-    response, _text = request(port, "GET", f"/?token={token}")
-    if response.status != 303:
-        raise ValueError(f"вход не удался: HTTP {response.status}")
-    return response.getheader("Set-Cookie").split(";")[0]
+def session_cookie(token: str) -> str:
+    digest = hmac.new(token.encode("utf-8"), b"xgw-panel", hashlib.sha256).hexdigest()
+    return f"xgw_panel={digest}"
 
 
 def main() -> None:
@@ -52,18 +52,18 @@ def main() -> None:
             response, text = request(int(port), "GET", rest[0])
             result = {"status": response.status, "body": text[:4000]}
         elif command == "state":
-            cookie = login(int(port), rest[0])
+            cookie = session_cookie(rest[0])
             response, text = request(int(port), "GET", "/api/state", cookie=cookie)
             result = json.loads(text) if response.status == 200 else {"error": text}
         elif command == "host":
             host, token = rest
             response, text = request(
-                int(port), "GET", "/api/state", cookie=login(int(port), token), host=host)
+                int(port), "GET", "/api/state", cookie=session_cookie(token), host=host)
             result = {"status": response.status, "body": text[:300]}
         elif command == "act":
             token, name, body = rest
             response, text = request(
-                int(port), "POST", f"/api/{name}", cookie=login(int(port), token),
+                int(port), "POST", f"/api/{name}", cookie=session_cookie(token),
                 body=body.encode("utf-8"),
             )
             result = json.loads(text) if response.status == 200 else {

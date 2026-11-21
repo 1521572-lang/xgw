@@ -770,9 +770,6 @@ body.login { display: grid; place-items: center; padding: 1.5rem; }
 .login-card h1 { font-size: 1.35rem; }
 .login-card img { border-radius: 14px; }
 .command { margin: 0; padding: .6rem .8rem; border-radius: 10px; background: var(--card-2); font-family: ui-monospace, "Ubuntu Mono", Menlo, Consolas, monospace; }
-.login-form { display: flex; flex-direction: column; gap: .5rem; margin-top: .3rem; }
-.login-form label { font-weight: 600; }
-.login-form input { padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 10px; background: var(--card-2); }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }

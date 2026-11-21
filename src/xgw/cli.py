@@ -214,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     logs.add_argument("--export", action="store_true", help="собрать архив без секретов")
     logs.add_argument("--out", default=None, help="куда записать архив (с --export)")
     panel = subparsers.add_parser(
-        "panel", parents=[common], help="ссылка на панель управления (открывается в браузере)"
+        "panel", parents=[common], help="одноразовая ссылка входа в панель управления"
     )
     panel.add_argument("--open", action="store_true", help="сразу открыть панель в браузере")
     panel.add_argument(
@@ -1307,15 +1307,6 @@ def _panel_gui_login(cfg: config.Config, paths: Paths) -> int:
     return 0
 
 
-def _open_panel(cfg: config.Config, paths: Paths, url: str) -> int:
-    """`xgw panel --open` — открыть панель в браузере этой машины."""
-    if not _panel_answers(cfg.panel.port):
-        return _fail(_panel_silent(cfg.panel.port))
-    if not webbrowser.open(url):
-        return _fail(f"браузер не открылся — откройте сами: {url}")
-    return 0
-
-
 def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
     from .watch import panel
 
@@ -1325,19 +1316,23 @@ def _cmd_panel(args, cfg: config.Config, paths: Paths, logger) -> int:
         return _panel_gui_login(cfg, paths)
     if args.login:
         return _panel_login(cfg, paths)
-    token = panel.read_token(paths)
-    if not token:
-        problem = _system_root_problem(paths)
-        if problem:
-            return _fail(problem)
-        token = panel.ensure_token(paths)
-    url = f"{panel.address(cfg)}?token={token}"
+    problem = _system_root_problem(paths)
+    if problem:
+        return _fail(problem)
+    if args.open and not _panel_answers(cfg.panel.port):
+        return _fail(_panel_silent(cfg.panel.port))
+    try:
+        url = panel.login_address(cfg, panel.new_login(paths))
+    except OSError:
+        return _fail("не удалось создать одноразовую ссылку входа в панель")
     if args.open:
-        return _open_panel(cfg, paths, url)
+        if not webbrowser.open(url):
+            return _fail(f"браузер не открылся — откройте ссылку вручную: {url}")
+        return 0
     print(f"Панель XGW: {url}")
     print(
-        "Откройте ссылку в браузере на этой машине. Браузер запомнит вход: дальше панель "
-        "открывается ярлыком «XGW» или адресом без токена."
+        f"Откройте ссылку в браузере на этой машине в течение {panel.LOGIN_TTL} с. "
+        "Для закладки используйте адрес панели после входа."
     )
     return 0
 

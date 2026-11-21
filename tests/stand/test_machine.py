@@ -258,7 +258,7 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
     assert "XGW установлен. Подписок пока нет — VPN выключен" in out
     token = _panel_token(gw)
     assert len(token) >= 24
-    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/?token={token}" in out
+    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/\n" in out and token not in out
     assert box.sh("stat -c '%U:%G %a' /var/lib/xgw/panel-token").strip() == "root:root 600"
 
     # Xray запускать не с чем; остальное работает, шлюз — обычный роутер.
@@ -280,10 +280,10 @@ def test_install_without_a_subscription_leaves_the_internet_direct(gw):
     )
     assert check.strip() == "", check
     printed = _xgw(gw, "panel")
-    assert printed.returncode == 0 and f"?token={token}" in printed.stdout
+    assert printed.returncode == 0 and "?login=" in printed.stdout and token not in printed.stdout
 
 
-def test_panel_is_reachable_only_from_the_machine_itself_and_by_token(gw):
+def test_panel_is_reachable_only_from_the_machine_itself_and_with_a_session(gw):
     box, stand = gw.box, gw.stand
 
     def sockets() -> str:
@@ -302,7 +302,7 @@ def test_panel_is_reachable_only_from_the_machine_itself_and_by_token(gw):
         assert "error" in reply and reply.get("status", 0) != 200, reply
 
     assert wait_for(lambda: _panel(gw, "raw", "/").get("status") == 200, 30), box.journal("xgw")
-    assert 'name="token"' in _panel(gw, "raw", "/")["body"]  # без токена — только вход
+    assert "sudo xgw panel" in _panel(gw, "raw", "/")["body"]
     assert _panel(gw, "raw", "/api/state")["status"] == 401
     assert "error" in _panel(gw, "state", "не-тот-токен")
 
@@ -550,7 +550,8 @@ def test_install(gw):
     out = result.stdout
     assert "План установки XGW" in out and "XGW установлен." in out
     assert "ufw: ufw allow in on lan0" in out
-    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/?token={_panel_token(gw)}" in out
+    assert f"Панель управления: http://127.0.0.1:{PANEL_PORT}/\n" in out
+    assert _panel_token(gw) not in out
     assert box.sh(f"stat -c '%U:%G %a' {LAUNCHER}").strip() == "root:root 644"
 
     assert _active(gw) == dict.fromkeys(UNITS, "active")

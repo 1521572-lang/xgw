@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from fake_tailscale import AUTH_URL, ENABLE_URL, FakeTailscale
-from test_panel import TOKEN, Rig
+from test_panel import Rig
 
 from xgw import config, managed, qr, tailscale
 from xgw.config import Config
@@ -241,7 +241,8 @@ def test_tailnet_login_sets_a_secure_cookie(ts_rig):
     response, _text = ts_rig.client.request("GET", f"/?login={code}", host=HOST)
     cookie = response.getheader("Set-Cookie")
     assert response.status == 303 and "Secure" in cookie and "SameSite=Strict" in cookie
-    response, _text = ts_rig.client.request("GET", f"/?token={TOKEN}")
+    local_code = panel_module.new_login(ts_rig.paths)
+    response, _text = ts_rig.client.request("GET", f"/?login={local_code}")
     assert "Secure" not in response.getheader("Set-Cookie")  # http://127.0.0.1 — без него
 
 

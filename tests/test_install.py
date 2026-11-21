@@ -792,7 +792,8 @@ def test_install_sets_up_the_panel_and_uninstall_removes_the_launcher(box):
         assert (box.paths.lib_dir / "xgw" / "ui" / name).is_file(), name
     text = box.text()
     assert "панель управления — http://127.0.0.1:8781/" in text  # в плане
-    assert f"Панель управления: http://127.0.0.1:8781/?token={token}" in text  # в итоге
+    assert "Панель управления: http://127.0.0.1:8781/\n" in text
+    assert token not in text
     assert "sudo xgw panel" in text and "Вставьте в панели" not in text
     journal = Journal(box.paths.journal_file)
     assert journal.get("launcher") == str(desktop) and journal.get("launcher_dir") is True

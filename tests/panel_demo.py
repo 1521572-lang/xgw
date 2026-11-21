@@ -64,7 +64,7 @@ from xgw.net import dnsmasq, lan
 from xgw.paths import Paths, atomic_write_json
 from xgw.store import Store, SubscriptionCache
 from xgw.watch import status
-from xgw.watch.panel import Panel
+from xgw.watch.panel import Panel, new_login
 
 TOKEN = "demo"
 CONFIG = """
@@ -763,7 +763,8 @@ def main() -> None:
         if args.phone_server:
             atomic_write_json(panel.paths.xray_config_file, phone_gateway(args.phone_server))
         panel.start()
-        print(f"Панель: http://127.0.0.1:{panel.port}/?token={TOKEN}", flush=True)
+        code = new_login(panel.paths)
+        print(f"Панель: http://127.0.0.1:{panel.port}/?login={code}", flush=True)
         if args.gui:
             start_gui(panel.port, Path(root))
         if args.app_port:

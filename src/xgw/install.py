@@ -1480,8 +1480,7 @@ class Installer:
             self.out("XGW установлен. Подписок пока нет — VPN выключен, интернет идёт напрямую.")
         if self.cfg.panel.enabled:
             opened = self._browser()
-            token = panel.read_token(self.paths)
-            self.out(f"Панель управления: {panel.address(self.cfg)}?token={token}")
+            self.out(f"Панель управления: {panel.address(self.cfg)}")
             if opened:
                 self.out(
                     f"  Панель уже открыта в браузере пользователя {opened}, вход выполнен. "
@@ -1489,8 +1488,8 @@ class Installer:
                 )
             else:
                 self.out(
-                    "  Откройте эту ссылку в браузере на этой машине (в терминале — Ctrl и "
-                    "щелчок)."
+                    "  Для первого входа выполните sudo xgw panel и откройте одноразовую ссылку "
+                    "в браузере на этой машине."
                 )
             if not sources:
                 if self.capture.effective_mode() == "blocked":
@@ -1500,7 +1499,7 @@ class Installer:
             self.out(
                 "  Дальше панель открывается ярлыком «XGW» в меню приложений. Если браузер "
                 "забудет вход — правая кнопка по ярлыку, «Войти заново» (спросит пароль); "
-                "ссылку заново напечатает и sudo xgw panel."
+                "одноразовую ссылку напечатает и sudo xgw panel."
             )
         if facts.lan_if:
             address = self.cfg.network.lan_address.split("/")[0]

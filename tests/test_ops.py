@@ -677,15 +677,18 @@ def test_logs_export_command_under_sudo_hands_the_archive_over(root, tmp_path, c
 # --- панель: команда, запуск вместе с демоном, первый запуск установки ---------------
 
 
-def test_panel_command_prints_the_link_with_the_token(root, capsys):
+def test_panel_command_prints_a_one_time_link(root, capsys):
     from xgw.watch import panel
 
     root.etc.mkdir(parents=True)
     root.config_file.write_text("[panel]\nport = 8899\n", encoding="utf-8")
+    token = panel.ensure_token(root)
     assert main(["panel"]) == 0
-    token = panel.read_token(root)
-    assert token and f"Панель XGW: http://127.0.0.1:8899/?token={token}" in capsys.readouterr().out
-    assert main(["panel"]) == 0 and panel.read_token(root) == token  # токен не меняется
+    out = capsys.readouterr().out
+    assert out.startswith("Панель XGW: http://127.0.0.1:8899/?login=") and token not in out
+    code = out.splitlines()[0].split("?login=", 1)[1]
+    assert panel.use_login(root, code) and not panel.use_login(root, code)
+    assert panel.read_token(root) == token
     root.config_file.write_text("[panel]\nenabled = false\n", encoding="utf-8")
     assert main(["panel"]) == 2
     assert "панель выключена" in capsys.readouterr().err
@@ -707,9 +710,10 @@ def test_panel_open_waits_for_the_panel(root, capsys, monkeypatch):
         port = listener.getsockname()[1]
         root.config_file.write_text(f"[panel]\nport = {port}\n", encoding="utf-8")
         assert main(["panel", "--open"]) == 0
-        token = panel.read_token(root)
-        assert opened == [f"http://127.0.0.1:{port}/?token={token}"]
-        assert capsys.readouterr().out == ""  # ссылка с токеном в терминал не печатается
+        (url,) = opened
+        assert url.startswith(f"http://127.0.0.1:{port}/?login=")
+        assert panel.use_login(root, url.split("?login=", 1)[1])
+        assert capsys.readouterr().out == ""
     # Панель не отвечает — браузер с пустой страницей не открывается.
     assert main(["panel", "--open"]) == 1 and len(opened) == 1
     assert "панель не отвечает" in capsys.readouterr().err

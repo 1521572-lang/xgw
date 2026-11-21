@@ -167,9 +167,8 @@ def _login_digest(code: str) -> str:
 
 
 def new_login(paths: Paths, now: Callable[[], float] | None = None) -> str:
-    """Одноразовый код входа для ссылки, которую открывает сам XGW (установка, ярлык
-    «XGW» → «Войти заново»). Постоянный токен в адрес не попадает: адрес виден в списке
-    процессов и журнале, а код годится один раз и только LOGIN_TTL секунд. На диске —
+    """Одноразовый код для CLI, установки и ярлыка «Войти заново».
+    Код годится один раз и только LOGIN_TTL секунд. На диске —
     не код, а его SHA-256, в каталоге, который читает только root."""
     now = now or time.time
     directory = login_dir(paths)
@@ -369,7 +368,7 @@ class Panel:
             kwargs={"poll_interval": SHUTDOWN_POLL},
         )
         self._thread.start()
-        self.log.info("панель управления слушает 127.0.0.1, порт %d (по токену)", self.port)
+        self.log.info("панель управления слушает 127.0.0.1, порт %d", self.port)
         if self.app_port is not None:
             api = AppApi(self, self.phones, port=self.app_port, logger=self.log)
             try:
@@ -2047,6 +2046,17 @@ class Panel:
                 return True
         return False
 
+    @staticmethod
+    def _login_redirect(handler: BaseHTTPRequestHandler, cookie: str = "") -> None:
+        handler.send_response(HTTPStatus.SEE_OTHER)
+        handler.send_header("Location", "/")
+        if cookie:
+            handler.send_header("Set-Cookie", cookie)
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Referrer-Policy", "no-referrer")
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+
     def handle(self, handler: BaseHTTPRequestHandler, method: str) -> None:
         if getattr(handler, "cut", False):
             handler.close_connection = True  # запрос не дочитан за срок — отвечать некому
@@ -2077,31 +2087,25 @@ class Panel:
             name, content_type = _STATIC[url.path]
             self._file(handler, name, content_type, body)
             return
-        query = parse_qs(url.query)
-        given = (query.get("token") or [""])[0]
+        query = parse_qs(url.query, keep_blank_values=True)
+        if "token" in query:
+            # Existing bookmarks lead back to the panel with their current session.
+            self._login_redirect(handler)
+            return
         once = (query.get("login") or [""])[0]  # одноразовый код (new_login)
-        if given or once:
-            if not self.token or not (
-                hmac.compare_digest(given.encode("utf-8"), self.token.encode("utf-8"))
-                if given else use_login(self.paths, once)
-            ):
-                time.sleep(0.5)  # перебор токена не должен быть быстрым
+        if method == "GET" and url.path == "/" and once:
+            if not self.token or not use_login(self.paths, once):
+                time.sleep(0.5)
                 self._file(handler, "login.html", "text/html; charset=utf-8", body,
                            code=HTTPStatus.FORBIDDEN)
                 return
-            # Вход переезжает в cookie, токен или код уходит из адресной строки и истории.
             # По tailnet страница открыта по https — cookie туда же и только по https.
             secure = "; Secure" if host == self._tailnet_host() else ""
-            handler.send_response(HTTPStatus.SEE_OTHER)
-            handler.send_header("Location", "/")
-            handler.send_header(
-                "Set-Cookie",
+            self._login_redirect(
+                handler,
                 f"{COOKIE}={self._cookie()}; Path=/; HttpOnly; SameSite=Strict; "
                 f"Max-Age=31536000{secure}",
             )
-            handler.send_header("Cache-Control", "no-store")
-            handler.send_header("Content-Length", "0")
-            handler.end_headers()
             return
         authorized = bool(self.token) and self._authorized(handler)
         if url.path == "/":
@@ -2114,26 +2118,26 @@ class Panel:
                        "text/html; charset=utf-8", body)
         elif url.path == "/api/zapret2/overview":
             if not authorized:
-                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             self._json(handler, HTTPStatus.OK, self.zapret2_overview(), body)
         elif url.path == "/api/state":
             if not authorized:
-                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             if host != self._tailnet_host():
                 self._page_signal(handler.headers.get("X-XGW-Focus") or "")
             self._json(handler, HTTPStatus.OK, self.state(), body)
         elif url.path == "/api/pool":
             if not authorized:
-                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             self._json(handler, HTTPStatus.OK, self.pool_servers(), body)
         elif url.path == "/api/traffic":
             if not authorized:
-                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             self._json(handler, HTTPStatus.OK, self.traffic((query.get("days") or ["1"])[0]),
                        body)
         elif url.path.startswith("/records/"):
             if not authorized:
-                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             self._record_file(handler, url.path.removeprefix("/records/"), body)
         else:
             raise Refused(HTTPStatus.NOT_FOUND, "Нет такой страницы")
@@ -2246,7 +2250,7 @@ class Panel:
     def _post(self, handler: BaseHTTPRequestHandler, path: str, host: str) -> None:
         data = self._read_body(handler)
         if not self.token or not self._authorized(handler):
-            raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход по токену")
+            raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
         # Запрос должен прийти со страницы самой панели: заголовок, которого у
         # формы на чужом сайте быть не может, и источник — тот же адрес.
         origin = handler.headers.get("Origin")
