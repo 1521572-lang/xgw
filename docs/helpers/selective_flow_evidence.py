@@ -20,6 +20,7 @@ from docs.helpers.selective_media_evidence import (
 )
 from xgw.desync import route_evidence
 from xgw.net.capture import CAPTURE_TAGS
+from xgw.zapret2 import OUT
 
 XRAY_UNIT = "xgw-xray.service"
 MAX_CAPTURE_SECONDS = 180
@@ -85,14 +86,7 @@ def access_records(journal, snapshot, start, end):
     return records
 
 
-def analyze(player, journal, before, after):
-    if len(journal) >= MAX_LOG_ROWS:
-        return {"state": "inconclusive", "reason": "journal_limit"}
-    try:
-        route_evidence.deltas(before, after)
-    except route_evidence.EvidenceError as exc:
-        return {"state": "inconclusive", "reason": "snapshots_incomparable",
-                "snapshot_reason": str(exc), **exc.details()}
+def _match_flows(player, journal, before, after):
     start = player[0].get("capture_started_unix") if player else None
     begin = before["unix"]
     end = after["unix"]
@@ -128,16 +122,48 @@ def analyze(player, journal, before, after):
     }
 
 
+def analyze(player, journal, before, after, *, observe_applied_change=False):
+    if len(journal) >= MAX_LOG_ROWS:
+        return {"state": "inconclusive", "reason": "journal_limit"}
+    try:
+        route_evidence.deltas(before, after)
+    except route_evidence.EvidenceError as exc:
+        result = {"state": "inconclusive", "reason": "snapshots_incomparable",
+                  "snapshot_reason": str(exc), **exc.details()}
+        if (observe_applied_change and exc.details().get("field") == "applied_config"
+                and type(before["monotonic_ns"]) is int and type(after["monotonic_ns"]) is int
+                and 0 < before["monotonic_ns"] < after["monotonic_ns"]
+                and all(snap["tags"].get(OUT, {}).get("group") == "zapret2"
+                        for snap in (before, after))):
+            # The reserved tag is meaningful within one Xray epoch. A changed
+            # window can't establish which VPN endpoint was behind other tags.
+            # Keep the primary window verdict and expose only exact journal matches.
+            selected = {**before, "tags": {OUT: {"group": "zapret2"}}}
+            matches = _match_flows(player, journal, selected, after)
+            if "qualified_flows" in matches:
+                total = matches["qualified_flows"]
+                accepted = matches["groups"].get("zapret2", 0)
+                result["logged_zapret2"] = {
+                    "accepted_flows": accepted, "unconfirmed_flows": total - accepted,
+                    "qualified_flows": total,
+                }
+        return result
+    return _match_flows(player, journal, before, after)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--player", type=Path, required=True)
     parser.add_argument("--before", type=Path, required=True)
     parser.add_argument("--after", type=Path, required=True)
+    parser.add_argument("--observe-applied-change", action="store_true",
+                        help="Report exact zapret2 journal matches in an otherwise inconclusive window")
     args = parser.parse_args()
     try:
         result = analyze(read_log(args.player), read_rows(sys.stdin.buffer),
                          route_evidence._read_snapshot(args.before),
-                         route_evidence._read_snapshot(args.after))
+                         route_evidence._read_snapshot(args.after),
+                         observe_applied_change=args.observe_applied_change)
     except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError):
         print(json.dumps({"state": "inconclusive", "reason": "invalid_evidence"}))
         return 2

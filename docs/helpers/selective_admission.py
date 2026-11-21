@@ -79,10 +79,11 @@ def prepare(client, card, format_file):
     return wait_off(client, key)
 
 
-def observe_admission(client, key, checks, since, timeout):
+def observe_admission(client, key, checks, since, timeout, *, recover_cdn_once=False):
     count = 0
     last_sample = since
     pending_seen = False
+    recovery_sample = None
     for card in observations(client, key, time.monotonic() + timeout):
         if card["mode"] != "selective":
             raise TrialError("unexpected_mode")
@@ -91,6 +92,21 @@ def observe_admission(client, key, checks, since, timeout):
         state = card["state"]
         if state in TERMINAL:
             pending = evidence.get("vpn_control_retry_pending") is True
+            started = cdn.get("started_at")
+            if (recover_cdn_once and state == "fallback"
+                    and card["reason"] == "youtube_cdn_probe_failed"
+                    and cdn.get("phase") == "tls" and cdn.get("kind") == "timeout"
+                    and type(started) in (int, float) and since < started <= time.time()):
+                if recovery_sample is None:
+                    recovery_sample = started
+                    count = 0
+                    last_sample = max(last_sample, started)
+                    log("waiting_for_cdn_retry", reason=card["reason"], cdn_phase="tls",
+                        cdn_kind="timeout", control=evidence.get("vpn_control"),
+                        target=evidence.get("vpn_control_target"),
+                        elapsed_s=round(started - since, 2))
+                if recovery_sample == started and count == 0:
+                    continue
             if pending and pending_seen:
                 continue
             log(state, reason=card["reason"], cdn_phase=cdn.get("phase"), cdn_kind=cdn.get("kind"),
@@ -141,7 +157,8 @@ def activate(client, args):
         since = time.time()
         key = update(client, MODE, card["config_key"], mode="selective")
         receipt.write(key + "\n")
-    return observe_admission(client, key, args.checks, since, args.timeout)
+    return observe_admission(client, key, args.checks, since, args.timeout,
+                             recover_cdn_once=args.recover_cdn_once)
 
 
 def disable(client, receipt):
@@ -161,8 +178,10 @@ def main():
     admission.add_argument("receipt", type=Path)
     admission.add_argument("--format", type=Path)
     admission.add_argument("--checks", type=int, choices=(1, 2), default=1)
-    admission.add_argument("--timeout", type=int, choices=range(60, 221), default=180,
-                           metavar="60..220")
+    admission.add_argument("--timeout", type=int, choices=range(60, 361), default=180,
+                           metavar="60..360")
+    admission.add_argument("--recover-cdn-once", action="store_true",
+                           help="Observe one normal watchdog retry after a CDN TLS timeout")
     turn_off = actions.add_parser("off")
     turn_off.add_argument("receipt", type=Path)
     args = parser.parse_args()

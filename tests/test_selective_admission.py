@@ -35,6 +35,26 @@ def test_late_recovery_after_fallback_does_not_qualify_original_trial(monkeypatc
     assert trial.observe_admission(None, "revision", 1, 100, 180) == 2
 
 
+@pytest.mark.parametrize(("next_sample", "expected"), [(None, 0), (160, 2)])
+def test_base_observes_only_one_watchdog_recovery(monkeypatch, next_sample, expected):
+    def fallback(at):
+        return {
+            "mode": "selective", "state": "fallback", "reason": "youtube_cdn_probe_failed",
+            "evidence": {"transport_probes": {
+                "cdn": {"started_at": at, "phase": "tls", "kind": "timeout"},
+            }},
+        }
+
+    samples = [active(105), fallback(110), fallback(110)]
+    if next_sample is not None:
+        samples.append(fallback(next_sample))
+    samples += [active(170), active(230)]
+    monkeypatch.setattr(trial, "observations", lambda *_args: iter(samples))
+    monkeypatch.setattr(trial.time, "time", lambda: 240)
+    assert trial.observe_admission(None, "revision", 2, 100, 360,
+                                   recover_cdn_once=True) == expected
+
+
 def test_admit_posts_once_and_records_the_policy_revision(tmp_path, monkeypatch):
     initial = {"mode": "off", "engine_mode": "off", "state": "off", "fresh": True,
                "policy_matched": True, "config_key": "off-key", "youtube_transport_probe": True,
@@ -48,8 +68,9 @@ def test_admit_posts_once_and_records_the_policy_revision(tmp_path, monkeypatch)
         return {"ok": True, "config_key": "selective-key"}
 
     client = SimpleNamespace(request=request)
-    args = SimpleNamespace(receipt=tmp_path / "receipt", format=None, checks=2, timeout=180)
-    monkeypatch.setattr(trial, "observe_admission", lambda *_args: 0)
+    args = SimpleNamespace(receipt=tmp_path / "receipt", format=None, checks=2, timeout=180,
+                           recover_cdn_once=False)
+    monkeypatch.setattr(trial, "observe_admission", lambda *_args, **_kwargs: 0)
     assert trial.activate(client, args) == 0
     assert args.receipt.read_text().strip() == "selective-key"
     with pytest.raises(FileExistsError):

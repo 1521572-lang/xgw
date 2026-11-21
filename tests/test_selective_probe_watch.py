@@ -224,6 +224,45 @@ def test_flow_evidence_requires_exact_client_endpoint_and_unique_xray_record(
                for secret in ("192.0.2.1", "198.51.100.2", "player-private", "proxy-private"))
 
 
+@pytest.mark.parametrize(("mutation", "accepted"), [
+    ("rotation", 1), ("different_group", None), ("epoch", None),
+    ("vpn_outbound", 0), ("duplicate", 0), ("no_local_port", 0),
+])
+def test_replay_keeps_changed_window_inconclusive_and_reports_exact_zapret2_accepts(
+    mutation, accepted,
+):
+    boot = "01234567-abcd-0123-abcd-0123456789ab"
+    epoch = f"{boot}:42:1"
+    before = media_sample(1, 10, epoch=epoch)["route"]
+    after = media_sample(7, 20, epoch=epoch, semantic="rotation")["route"]
+    if mutation == "epoch":
+        after["xray_epoch"] = f"{boot}:43:1"
+    if mutation == "different_group":
+        after["tags"]["xgw-zapret2"]["group"] = "xray"
+    player = socket_rows("player-private", "198.51.100.2", 7)
+    for row in player:
+        row["capture_started_unix"] = 104
+        if mutation != "no_local_port":
+            row["sockets"][0]["local_endpoint"] = "192.0.2.1:43120"
+    tag = "proxy-private" if mutation == "vpn_outbound" else "xgw-zapret2"
+    entry = {
+        "_SYSTEMD_UNIT": "xgw-xray.service", "_BOOT_ID": boot.replace("-", ""), "_PID": "42",
+        "__REALTIME_TIMESTAMP": "104200000",
+        "MESSAGE": f"from tcp:192.0.2.1:43120 accepted tcp:198.51.100.2:443 [tun-in -> {tag}]",
+    }
+    journal = [entry, entry] if mutation == "duplicate" else [entry]
+    assert "logged_zapret2" not in flow_evidence.analyze(player, journal, before, after)
+    result = flow_evidence.analyze(player, journal, before, after, observe_applied_change=True)
+    assert result["state"] == "inconclusive"
+    if accepted is None:
+        assert "logged_zapret2" not in result
+    else:
+        assert result["logged_zapret2"] == {
+            "accepted_flows": accepted, "unconfirmed_flows": 1 - accepted, "qualified_flows": 1,
+        }
+    assert all(secret not in repr(result) for secret in ("private", "192.0.2.1", "198.51.100.2"))
+
+
 def test_wan_control_skips_tcp_when_bypass_routes_to_another_interface(monkeypatch):
     monkeypatch.setattr(wan_control, "route", lambda *_args: {"dev": "xgw-tun"})
 
