@@ -1,4 +1,4 @@
-# ThinkCentre — временная приёмка одноразового входа на установленной панели, r3
+# ThinkCentre — вход на установленной панели и время сборки состояния, r4
 
 **Ubuntu 24.04 LTS.** Flash сама запускает проверки, следит за
 восстановлением и автоматически публикует отчёт. Если недоступны
@@ -27,6 +27,14 @@ HTTPS и PID Xray восстановлены. Таймер выполнил до
 [Отчёт r1](../reports/2026-11-21T123845Z_panel-login-installed-trial.md)
 · [Отчёт r2](../reports/2026-11-21T130826Z_panel-login-installed-trial.md)
 
+В r3 анонимный `GET /api/state` получал 401 сразу после открытия
+порта. Запрос с действующей cookie на кандидате и возвращённой
+базе попадал в окно задержки. В замере после рестарта первый
+ответ 200 появился примерно через 23 секунды. Таймер после
+отката снят штатно. Новый проход измеряет первый авторизованный
+запрос и пишет длительности этапов сборки ответа.
+[Отчёт r3](../reports/2026-11-21T132112Z_panel-login-installed-trial-r3.md)
+
 ## 1. Запуск
 
 Выполни весь блок в Bash из checkout XGW как пользователь панели
@@ -43,7 +51,7 @@ umask 077
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 BR=integration/zapret2-batch1
-CODE=885b60b92068fb8214446dd17649140d4466c3f0
+CODE=f58ab0c702540fc10cd8ba31125a4748d5294efe
 PROVEN=52d57a533829bdd71592bdf2824ff7ea54e39abb
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -56,15 +64,17 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 git -C "$REPO" merge-base --is-ancestor "$PROVEN" "$CODE"
 git -C "$REPO" diff --quiet "$PROVEN" "$CODE" -- src/xgw tests \
-  docs/helpers/desync_batch1_install.py ':!tests/test_t11_panel_login_check.py'
+  docs/helpers/desync_batch1_install.py ':!src/xgw/watch/panel.py' \
+  ':!tests/test_panel.py' ':!tests/test_t11_panel_login_check.py'
 printf 'CONTRACTS_VERIFIED_FROM_R1\n'
 git -C "$REPO" worktree add --detach "$SRC" "$CODE"
 trap 'git -C "$REPO" worktree remove "$SRC"' EXIT
 cd "$SRC"
 bash -n docs/helpers/t11_panel_login_trial.sh
-timeout -k 3 60 env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest \
+timeout -k 4 300 env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest \
   -o addopts='' -p no:cacheprovider -q tests/test_t11_panel_login_check.py \
-  | tee "$WORK/readiness-tests.out"
+  tests/test_panel.py tests/test_tailscale_t2.py tests/test_appapi.py \
+  | tee "$WORK/panel-tests.out"
 bash docs/helpers/t11_panel_login_trial.sh "$CODE"
 BASH
 ```
@@ -88,19 +98,29 @@ VPN и отсутствие другого прогона. Установщик 
 активной `xgw.service` таймер снимается. Затем фиксируется результат
 HTTP-входа на возвращённой панели.
 
-Перед проверкой входа чекер до 24 секунд ждёт HTTP 401 от
-`GET /api/state` без сессии. Повторяются только сбои соединения и
-таймауты этого запроса. Ответ другого статуса завершает проверку
-с указанием кода. Одноразовая ссылка выдаётся после готовности,
-получение сессии и проверка повтора выполняются по одному разу.
+Чекер до 24 секунд ждёт HTTP 401 от `GET /api/state` без сессии.
+Затем один авторизованный запрос может ждать до 40 секунд.
+`first_state_ms` измеряет время до заголовков ответа 200.
+Одноразовая ссылка выдаётся после этого ответа. Получение сессии
+и проверка повтора выполняются по одному разу. `state_after_login_ms`
+проверяет доступ к состоянию с только что выданной cookie.
+
+Перед откатом скрипт выгружает до 30 строк `panel_state_timing`
+в `candidate-timings.out`. Панель пишет длительности этапов в
+миллисекундах для сборки состояния дольше секунды, до одной
+записи в минуту на экземпляр. Для анализа сопоставь
+`elapsed_ms` с `first_state_ms` и укажи самый долгий этап.
+Если задержка не воспроизвелась, запиши измеренное время и
+наличие записи. Сценарий ограничен двумя перезапусками скрипта.
 
 ## 2. Что проверить и записать
 
 | Проверка | Критерий |
 |---|---|
-| `CONTRACTS` | `CONTRACTS_VERIFIED_FROM_R1` и 4/4 новых тестов чекера. Запиши 12/12 по отчёту r1 и результат нового набора. |
+| `CONTRACTS` | `CONTRACTS_VERIFIED_FROM_R1` и код 0 у набора чекера, панели, Tailscale и Android API. Запиши 12/12 по отчёту r1 и passed/failed/skipped нового набора. |
 | `BASELINE` | Исходные файлы совпадают с базой. off/off fresh/matched, обе службы активны, контроль HTTPS 200. Старый URL отвечает 303 с cookie, имеющаяся сессия получает 200. |
-| `CANDIDATE` | Таймер активен и пять файлов совпадают с кандидатом. `candidate-auth` возвращает `ok=true`. Реальная команда `xgw panel` выдаёт действующий одноразовый код. Старый URL даёт 303 без новой cookie, сессия открывает API. HEAD не расходует код, повторный GET получает 403. Чужие Host/Origin и POST без сессии отклоняются. |
+| `CANDIDATE` | Таймер активен и пять файлов совпадают с кандидатом. `candidate-auth` возвращает `ok=true`. Реальная команда `xgw panel` выдаёт действующий одноразовый код и её cookie открывает `/api/state`. Старый URL даёт 303 без новой cookie, сессия открывает API. HEAD не расходует код, повторный GET получает 403. Чужие Host/Origin и POST без сессии отклоняются. |
+| `TIMINGS` | Запиши `first_state_ms` до установки, на кандидате и после отката. Для кандидата добавь `state_after_login_ms` и разбивку `panel_state_timing`, если есть. Отметь холодную задержку отдельно от результата входа. |
 | `RESTORE` | Коды 0 у rollback, restored-files, restored-service и cancel-timer подтверждают возврат пакета и снятие таймера. Отдельно нужны restored-status, restored-auth, сохранение SHA трёх файлов настроек и ключа панели, HTTPS 200 и прежний PID Xray. |
 
 В отчёте публикуй имена проверок и их коды. Для каждого `*-auth`
@@ -134,7 +154,7 @@ PUB=$(mktemp -d "$HOME/xgw-panel-login-trial-publish.XXXXXXXX")
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-login-installed-trial-r3.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-login-installed-trial-r4.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
