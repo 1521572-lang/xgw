@@ -2,10 +2,13 @@
 
 import json
 import os
+import queue
 import socket
 import stat
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 
@@ -90,19 +93,13 @@ def test_recovery_keeps_an_active_listener_and_foreign_files(tmp_path):
     assert not path.exists()
 
 
-@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")
-def test_local_peer_and_shutdown(tmp_path):
-    path = tmp_path / "panel.sock"
+@contextmanager
+def running_ipc(path, overview, *, tickets=None):
     stop = threading.Event()
-    calls = []
     uid = os.geteuid()
-
-    def overview():
-        calls.append(True)
-        return {"zapret2": STATUS}
-
     thread = threading.Thread(target=panel_ipc.serve,
-                              args=(path, uid, os.getegid(), overview, stop), daemon=True)
+                              args=(path, uid, os.getegid(), overview, stop),
+                              kwargs={"tickets": tickets}, daemon=True)
     thread.start()
     try:
         deadline = time.monotonic() + 2
@@ -118,11 +115,57 @@ def test_local_peer_and_shutdown(tmp_path):
             time.sleep(0.01)
         else:
             pytest.fail("IPC listener did not start")
-        with pytest.raises(panel_ipc.ProtocolError, match="unexpected_server_uid"):
-            panel_ipc.read_overview(path, server_uid=uid + 1)
-        assert panel_ipc.read_overview(path, server_uid=uid) == STATUS
-        assert calls == [True]
+        yield uid
     finally:
         stop.set()
         thread.join(timeout=3)
     assert not thread.is_alive() and not path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")
+def test_local_peer_and_shutdown(tmp_path):
+    path = tmp_path / "panel.sock"
+    calls = []
+
+    def overview():
+        calls.append(True)
+        return {"zapret2": STATUS}
+
+    with running_ipc(path, overview) as uid:
+        with pytest.raises(panel_ipc.ProtocolError, match="unexpected_server_uid"):
+            panel_ipc.read_overview(path, server_uid=uid + 1)
+        assert panel_ipc.read_overview(path, server_uid=uid) == STATUS
+        assert calls == [True]
+
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")
+def test_scoped_requests_run_concurrently_with_bounded_admission(tmp_path, monkeypatch):
+    monkeypatch.setattr(panel_ipc, "MAX_CLIENTS", 2)
+    path = tmp_path / "panel.sock"
+    tickets = panel_ipc.StatusTickets()
+    entered = queue.Queue()
+    release = threading.Event()
+
+    def overview():
+        entered.put(None)
+        if not release.wait(timeout=2):
+            raise TimeoutError
+        return {"zapret2": STATUS}
+
+    with running_ipc(path, overview, tickets=tickets) as uid, ThreadPoolExecutor(2) as clients:
+        def request():
+            with tickets.issue() as ticket:
+                return panel_ipc.read_overview(path, server_uid=uid, ticket=ticket)
+
+        try:
+            first = clients.submit(request)
+            entered.get(timeout=1)
+            second = clients.submit(request)
+            entered.get(timeout=1)
+            with pytest.raises((OSError, panel_ipc.ProtocolError)):
+                request()
+            assert entered.empty()
+        finally:
+            release.set()
+        assert first.result() == second.result() == STATUS
+        assert request() == STATUS

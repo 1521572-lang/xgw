@@ -11,7 +11,7 @@ declare -A BASELINES=(
   [src/xgw/cli.py]=ad81542b57b3dd765ed9c115b356c9dd306aae2b
   [src/xgw/desync/client.py]=3a00777c21ed017760cb7bfd0bb24478fc1f48ad
 )
-PROVEN=b614174b0dfc550c95bbabfc7f6c2a2b556a4f8d
+PROVEN=46e9eb0d702aeab8318b02ab2d82f0f289525843
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 [[ $TEST_PY == /* && -x $TEST_PY ]]
@@ -20,7 +20,7 @@ REPO=$(git rev-parse --show-toplevel)
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 git -C "$REPO" merge-base --is-ancestor "$PROVEN" "$CODE"
 git -C "$REPO" diff --quiet "$PROVEN" "$CODE" -- src/xgw packaging \
-  ':(exclude)src/xgw/watch/panel.py' ':(exclude)src/xgw/desync/client.py'
+  ':(exclude)src/xgw/watch/panel_ipc.py'
 printf 'PINNED %s | %s | %s\n' "$CODE" "$PRETTY_NAME" "$(uname -r)"
 systemctl --version | sed -n '1p'
 sudo -n true
@@ -215,12 +215,13 @@ step baseline-xray xray_pid
 step baseline-https https_control
 mkdir -- "$D/contracts"
 git -C "$REPO" archive "$CODE" src/xgw tests/test_panel_installed_trial.py \
-  tests/test_zapret2_status_reader.py \
+  tests/test_zapret2_status_reader.py tests/test_panel_ipc.py \
   docs/helpers/panel_installed_trial.py docs/helpers/desync_batch1_install.py |
   tar -x -C "$D/contracts"
 step contracts timeout -k 3 60 env "PYTHONPATH=$D/contracts/src" \
   "$TEST_PY" -B -P -m pytest -p no:cacheprovider -q \
-  "$D/contracts/tests/test_panel_installed_trial.py" "$D/contracts/tests/test_zapret2_status_reader.py"
+  "$D/contracts/tests/test_panel_installed_trial.py" "$D/contracts/tests/test_zapret2_status_reader.py" \
+  "$D/contracts/tests/test_panel_ipc.py"
 sudo -n install -d -m 0755 /opt/xgw/handoff
 STAGE=$(sudo -n mktemp -d /opt/xgw/handoff/panel-reader.XXXXXXXX)
 [[ $STAGE =~ ^/opt/xgw/handoff/panel-reader\.[A-Za-z0-9]{8}$ ]]

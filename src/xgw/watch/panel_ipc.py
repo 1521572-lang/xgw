@@ -14,6 +14,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..desync.schema import MODES
@@ -26,6 +27,7 @@ TICKET = re.compile(r"[A-Za-z0-9_-]{43}")
 OPERATION = "zapret2.overview"
 MAX_REQUEST = 256
 MAX_RESPONSE = 1024
+MAX_CLIENTS = 4
 TIMEOUT = 2.0
 STATUS_FIELDS = ("mode", "engine_mode", "state", "fresh", "policy_matched")
 ERRORS = frozenset({"invalid_request", "unsupported_version", "unsupported_operation",
@@ -126,6 +128,55 @@ def _send(connection: socket.socket, payload: bytes) -> None:
         raise ProtocolError("short_packet")
 
 
+def _set_deadline(connection: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    connection.settimeout(remaining)
+
+
+def _serve_client(connection: socket.socket, deadline: float, overview: Callable[[], dict | None],
+                  tickets: StatusTickets | None, slots: threading.BoundedSemaphore) -> None:
+    try:
+        with connection:
+            _set_deadline(connection, deadline)
+            frame = connection.recv(MAX_REQUEST + 1)
+            if frame:
+                payload = json.dumps(reply(frame, overview, tickets=tickets), separators=(",", ":"))
+                _set_deadline(connection, deadline)
+                _send(connection, payload.encode("ascii"))
+    except (OSError, ProtocolError):
+        pass
+    finally:
+        slots.release()
+
+
+def _dispatch(listener: socket.socket, uid: int, overview: Callable[[], dict | None],
+              tickets: StatusTickets | None, stop: threading.Event) -> None:
+    slots = threading.BoundedSemaphore(MAX_CLIENTS)
+    with ThreadPoolExecutor(max_workers=MAX_CLIENTS, thread_name_prefix="xgw-panel-ipc") as pool:
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            deadline = time.monotonic() + TIMEOUT
+            try:
+                authorized = peer_uid(connection) == uid
+            except (OSError, struct.error):
+                authorized = False
+            # Admit only one connection per worker, including submissions awaiting dispatch.
+            if not authorized or not slots.acquire(blocking=False):
+                connection.close()
+                continue
+            try:
+                pool.submit(_serve_client, connection, deadline, overview, tickets, slots)
+            except RuntimeError:
+                connection.close()
+                slots.release()
+                raise
+
+
 def _clear_stale(path: Path, owner: int) -> None:
     try:
         previous = path.lstat()
@@ -167,25 +218,9 @@ def serve(path: Path, uid: int, gid: int, overview: Callable[[], dict | None],
         try:
             os.chown(path, -1, gid)
             path.chmod(0o660)
-            listener.listen(8)
+            listener.listen(MAX_CLIENTS)
             listener.settimeout(0.25)
-            while not stop.is_set():
-                try:
-                    connection, _ = listener.accept()
-                except TimeoutError:
-                    continue
-                try:
-                    with connection:
-                        if peer_uid(connection) != uid:
-                            continue
-                        connection.settimeout(TIMEOUT)
-                        frame = connection.recv(MAX_REQUEST + 1)
-                        if frame:
-                            payload = json.dumps(reply(frame, overview, tickets=tickets),
-                                                 separators=(",", ":"))
-                            _send(connection, payload.encode("ascii"))
-                except (OSError, ProtocolError, struct.error):
-                    continue
+            _dispatch(listener, uid, overview, tickets, stop)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 current = path.lstat()
@@ -198,12 +233,15 @@ def read_overview(path: Path, *, server_uid: int, ticket: str | None = None) -> 
     request = {"version": version, "op": OPERATION}
     if ticket is not None:
         request["ticket"] = ticket
+    deadline = time.monotonic() + TIMEOUT
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-        client.settimeout(TIMEOUT)
+        _set_deadline(client, deadline)
         client.connect(str(path))
         if peer_uid(client) != server_uid:
             raise ProtocolError("unexpected_server_uid")
+        _set_deadline(client, deadline)
         _send(client, json.dumps(request, separators=(",", ":")).encode("ascii"))
+        _set_deadline(client, deadline)
         frame = client.recv(MAX_RESPONSE + 1)
     if not frame or len(frame) > MAX_RESPONSE:
         raise ProtocolError("invalid_response")

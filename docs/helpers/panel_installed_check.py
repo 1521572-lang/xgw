@@ -12,7 +12,9 @@ import pwd
 import stat
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).resolve().parent), "/opt/xgw/lib"]
@@ -95,6 +97,22 @@ def check_candidate(port, token, cookie):
     require(read(port, cookie=cookie, method="HEAD") == (200, b""), "head")
     print("INSTALLED_STATUS_MATCH", json.dumps({"cold_ms": elapsed, **summary}), flush=True)
     print("READER_RUN_READONLY_OK", flush=True)
+
+    concurrent_reads = 4
+    ready = threading.Barrier(concurrent_reads, timeout=3)
+
+    def read_when_ready():
+        try:
+            ready.wait()
+        except threading.BrokenBarrierError as exc:
+            raise ValueError("parallel_start") from exc
+        return read(port, cookie=cookie)
+
+    with ThreadPoolExecutor(concurrent_reads) as clients:
+        calls = [clients.submit(read_when_ready) for _ in range(concurrent_reads)]
+        results = [call.result() for call in calls]
+    require(results == [(200, {"zapret2": summary})] * concurrent_reads, "parallel_status")
+    print("PARALLEL_STATUS_OK", concurrent_reads, flush=True)
 
     systemctl("stop", SOCKET, READER, timeout=15)
     try:
