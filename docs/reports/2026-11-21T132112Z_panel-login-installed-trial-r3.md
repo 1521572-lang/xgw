@@ -95,4 +95,4 @@
 4. Мой рестарт для диагностики выполнен вне окна испытания (off/off,
    воркеры inactive, кратковременно); состояние шлюза подтверждено
    off/off fresh/matched.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `d434777f2f7cdaf10351b1675d605c6e3a577075` (f8c09b0 → d434777, ancestor verified).
