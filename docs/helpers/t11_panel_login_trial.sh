@@ -9,13 +9,21 @@ CODE=$1
 SRC=$(git rev-parse --show-toplevel) || exit 2
 [[ $(git -C "$SRC" rev-parse HEAD) == "$CODE" ]] || exit 2
 BASE=08d31ee93963bb00acb7a2275e7a554efcfb0f05
+CLI_BASE=ad81542b57b3dd765ed9c115b356c9dd306aae2b
 PY=/usr/bin/python3
 UNIT=xgw-panel-login-rollback
 PACKAGE=$(realpath -e /opt/xgw/lib/xgw) || exit 2
 D=$(mktemp -d "$HOME/xgw-panel-login-trial.XXXXXXXX") || exit 2
 printf 'Private run: %s\n' "$D"
-FILES=(src/xgw/cli.py src/xgw/install.py src/xgw/watch/panel.py
-       src/xgw/ui/login.html src/xgw/ui/app.css)
+# The installed CLI predates the overlays that provide the current panel backend.
+declare -A BASELINES=(
+  [src/xgw/cli.py]="$CLI_BASE"
+  [src/xgw/install.py]="$BASE"
+  [src/xgw/watch/panel.py]="$BASE"
+  [src/xgw/ui/login.html]="$BASE"
+  [src/xgw/ui/app.css]="$BASE"
+)
+FILES=("${!BASELINES[@]}")
 CONFIG=(/etc/xgw/config.toml /etc/xgw/panel.json /var/lib/xgw/panel-token)
 
 run() {
@@ -67,20 +75,33 @@ print(port)') || return
 }
 
 package_matches() {
-  local revision=$1 file
+  local phase=$1 file revision rc=0
   for file in "${FILES[@]}"; do
-    git -C "$SRC" show "$revision:$file" | sudo -n cmp - "$PACKAGE/${file#src/xgw/}" || return
+    revision=${BASELINES[$file]}
+    if [[ $phase == candidate ]]; then
+      revision=$CODE
+    fi
+    if git -C "$SRC" show "$revision:$file" | sudo -n cmp -s - "$PACKAGE/${file#src/xgw/}"; then
+      printf '%s\t%s\tmatch\n' "$file" "$revision"
+    else
+      printf '%s\t%s\tmismatch\n' "$file" "$revision"
+      rc=2
+    fi
   done
+  return "$rc"
 }
 stage() {
+  local file
   PAYLOAD=$(sudo -n mktemp -d /opt/xgw/handoff/panel-login.XXXXXXXX) || return
   BACKUP="/var/lib/xgw/handoff/${PAYLOAD##*/}"
   sudo -n install -d -m 0700 "$PAYLOAD/code" "$PAYLOAD/base" || return
   git -C "$SRC" archive "$CODE" "${FILES[@]}" docs/helpers/desync_batch1_install.py \
     docs/helpers/t11_panel_login_check.py |
     sudo -n tar --no-same-owner --no-same-permissions -x -C "$PAYLOAD/code" || return
-  git -C "$SRC" archive "$BASE" "${FILES[@]}" |
-    sudo -n tar --no-same-owner --no-same-permissions -x -C "$PAYLOAD/base" || return
+  for file in "${FILES[@]}"; do
+    git -C "$SRC" archive "${BASELINES[$file]}" "$file" |
+      sudo -n tar --no-same-owner --no-same-permissions -x -C "$PAYLOAD/base" || return
+  done
   HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
   CHECK="$PAYLOAD/code/docs/helpers/t11_panel_login_check.py"
 }
@@ -90,7 +111,7 @@ overlay() { sudo -n "$PY" -I -B "$HELPER" "$1" --panel-login --backup "$BACKUP" 
 finish() {
   local rc=$?
   if run rollback overlay rollback &&
-     run restored-files package_matches "$BASE" &&
+     run restored-files package_matches baseline &&
      run restored-status wait_status && run restored-auth auth restored; then
     run cancel-timer sudo -n systemctl stop "$UNIT.timer" || rc=2
   else
@@ -112,7 +133,7 @@ if systemctl is-active --quiet "$UNIT.timer"; then
 fi
 run status-before status && run https-before https_control &&
   run settings-before settings && run xray-before xray_pid &&
-  run baseline-files package_matches "$BASE" || exit 2
+  run baseline-files package_matches baseline || exit 2
 run stage-parent sudo -n mkdir -p -- /opt/xgw/handoff /var/lib/xgw/handoff || exit 2
 run stage stage && run baseline-auth auth baseline &&
   run prepare overlay prepare --payload "$PAYLOAD" --package "$PACKAGE" || exit 2
@@ -124,7 +145,7 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 run timer-active systemctl is-active --quiet "$UNIT.timer" &&
-  run apply overlay apply && run candidate-files package_matches "$CODE" &&
+  run apply overlay apply && run candidate-files package_matches candidate &&
   run candidate-status wait_status && run candidate-auth auth candidate &&
   run candidate-https https_control && run candidate-settings settings &&
   run candidate-settings-unchanged cmp -s "$D/settings-before.out" "$D/candidate-settings.out" &&
