@@ -82,31 +82,51 @@ def pinned(window, candidate):
             and window.map._pulse.isActive())
 
 
-def snapshot(work, window, name):
-    if not window.map.grab().save(str(work / name)):
+def snapshot(app, work, canvas, code, name, *, phase=(0.15, 0.35)):
+    target = canvas.points[code]
+
+    def settled():
+        focus = canvas._focus
+        return (canvas.focus_code == code and (focus.x(), focus.y()) == target
+                and canvas._pulse.isActive() and phase[0] <= canvas._phase <= phase[1])
+
+    wait(app, settled, "map_frame_not_settled", seconds=4)
+    if not canvas.grab().save(str(work / name)):
         raise ValueError("map_screenshot")
 
 
 def trial(work, app, window, current, candidate):
+    canvas = window.map
+    current_code, candidate_code = country(window, current), country(window, candidate)
     initial_ip = public_ip()
-    snapshot(work, window, "switch-before.png")
+    snapshot(app, work, canvas, current_code, "switch-before.png")
+    positions = set()
+
+    def observe_pan(value):
+        if canvas.focus_code == candidate_code:
+            positions.add((value.x(), value.y()))
+
     unit = f"xgw-map-return-{os.getpid()}"
     command("arm_rollback", "sudo", "-n", "systemd-run", "--collect", f"--unit={unit}",
             "--on-active=120s", "--service-type=oneshot", "--timer-property=AccuracySec=1s",
             "/usr/bin/timeout", "-k", "3", "18", XGW, "unpin")
     attempted = False
+    canvas._move.valueChanged.connect(observe_pan)
     try:
         command("rollback_not_active", "systemctl", "is-active", "--quiet", unit + ".timer")
         print("MAP_SWITCH_ROLLBACK_ARMED", flush=True)
         attempted = True
         command("pin_command", "sudo", "-n", XGW, "pin", candidate["tag"], "--ttl", "90s")
         wait(app, lambda: pinned(window, candidate), "pin_not_confirmed_by_map", seconds=35)
-        if window.map.focus_code == country(window, current):
-            raise ValueError("map_country_did_not_change")
         changed = public_ip() != initial_ip
-        snapshot(work, window, "switch-pinned.png")
+        snapshot(app, work, canvas, candidate_code, "switch-pinned.png")
+        snapshot(app, work, canvas, candidate_code, "switch-pinned-second.png", phase=(0.45, 0.60))
+        if len(positions) < 2 or not pinned(window, candidate):
+            raise ValueError("map_pan_or_pin_not_confirmed")
+        print("MAP_PAN_OK", len(positions), flush=True)
         print("MAP_SWITCH_OK", "PUBLIC_IP_CHANGED", int(changed), flush=True)
     finally:
+        canvas._move.valueChanged.disconnect(observe_pan)
         if attempted:
             command("unpin_command", "sudo", "-n", XGW, "unpin")
             before = window.bridge.received
@@ -114,7 +134,7 @@ def trial(work, app, window, current, candidate):
             wait(app, lambda: window.bridge.received > before and bool(auto_row(window)),
                  "auto_not_restored", seconds=65)
             restored = public_ip()
-            snapshot(work, window, "switch-restored.png")
+            snapshot(app, work, canvas, country(window, auto_row(window)), "switch-restored.png")
             if window.bridge.client.writes:
                 raise ValueError("unexpected_gui_write")
         command("cancel_rollback", "sudo", "-n", "systemctl", "stop", unit + ".timer")
