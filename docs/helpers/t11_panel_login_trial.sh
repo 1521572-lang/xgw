@@ -105,15 +105,17 @@ stage() {
   HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
   CHECK="$PAYLOAD/code/docs/helpers/t11_panel_login_check.py"
 }
-auth() { timeout -k 3 45 sudo -n "$PY" -I -B "$CHECK" "$1"; }
+auth() { timeout -k 3 95 sudo -n "$PY" -I -B "$CHECK" "$1"; }
 overlay() { sudo -n "$PY" -I -B "$HELPER" "$1" --panel-login --backup "$BACKUP" "${@:2}"; }
 
 finish() {
   local rc=$?
   if run rollback overlay rollback &&
      run restored-files package_matches baseline &&
-     run restored-status wait_status && run restored-auth auth restored; then
+     run restored-service systemctl is-active --quiet xgw.service; then
     run cancel-timer sudo -n systemctl stop "$UNIT.timer" || rc=2
+    run restored-status wait_status || rc=2
+    run restored-auth auth restored || rc=2
   else
     rc=2
   fi

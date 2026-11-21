@@ -9,12 +9,15 @@ import http.client
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 class FailedCheck(ValueError):
-    pass
+    def __init__(self, name: str, **details) -> None:
+        super().__init__(name)
+        self.details = details
 
 
 def require(ok: bool, name: str) -> None:
@@ -23,7 +26,8 @@ def require(ok: bool, name: str) -> None:
 
 
 def request(port: int, path: str, *, method: str = "GET", cookie: str = "",
-            headers: dict[str, str] | None = None) -> tuple[int, dict[str, str]]:
+            headers: dict[str, str] | None = None,
+            timeout: float = 5) -> tuple[int, dict[str, str]]:
     headers = dict(headers or {})
     if cookie:
         headers["Cookie"] = cookie
@@ -31,7 +35,7 @@ def request(port: int, path: str, *, method: str = "GET", cookie: str = "",
     if method == "POST":
         headers.update({"Content-Type": "application/json", "X-XGW-Panel": "1"})
         body = "{}"
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
@@ -40,17 +44,56 @@ def request(port: int, path: str, *, method: str = "GET", cookie: str = "",
         connection.close()
 
 
+def error_details(exc: Exception) -> dict:
+    return {"error": type(exc).__name__, "errno": getattr(exc, "errno", None)}
+
+
+def wait_for_guest_api(port: int, wait: float = 24) -> dict:
+    started = time.monotonic()
+    deadline = started + wait
+    attempts = 0
+    last_error = {}
+    while (remaining := deadline - time.monotonic()) > 0:
+        attempts += 1
+        try:
+            status, _headers = request(port, "/api/state", timeout=min(2, remaining))
+        except (ConnectionError, TimeoutError) as exc:
+            last_error = error_details(exc)
+            time.sleep(max(0, min(1, deadline - time.monotonic())))
+        except (OSError, http.client.HTTPException) as exc:
+            raise FailedCheck("guest_api", attempts=attempts, **error_details(exc)) from exc
+        else:
+            if status != 401:
+                raise FailedCheck("guest_api", attempts=attempts, http_status=status)
+            return {"attempts": attempts, "seconds": round(time.monotonic() - started, 3)}
+    raise FailedCheck("guest_api_timeout", attempts=attempts, **last_error)
+
+
+def checked_request(step: str, port: int, path: str, **options) -> tuple[int, dict[str, str]]:
+    try:
+        return request(port, path, **options)
+    except (OSError, http.client.HTTPException) as exc:
+        raise FailedCheck(step, **error_details(exc)) from exc
+
+
 def login_link(port: int, token: str) -> str:
-    cli = subprocess.run(
-        ["/usr/local/bin/xgw", "panel"],
-        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, capture_output=True, text=True, timeout=12,
-    )
+    try:
+        cli = subprocess.run(
+            ["/usr/local/bin/xgw", "panel"],
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            capture_output=True, text=True, timeout=12,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise FailedCheck("cli", **error_details(exc)) from exc
     require(cli.returncode == 0 and bool(cli.stdout.splitlines()), "cli")
     require(token not in (cli.stdout + cli.stderr), "cli_permanent_secret")
     prefix = "Панель XGW: "
     first = cli.stdout.splitlines()[0]
     require(first.startswith(prefix), "cli_output")
-    url = urlsplit(first.removeprefix(prefix))
+    try:
+        url = urlsplit(first.removeprefix(prefix))
+    except ValueError as exc:
+        raise FailedCheck("cli_url", **error_details(exc)) from exc
     query = parse_qs(url.query, keep_blank_values=True)
     require(url.scheme == "http" and url.netloc == f"127.0.0.1:{port}" and url.path == "/"
             and not url.fragment and set(query) == {"login"} and len(query["login"]) == 1
@@ -61,36 +104,44 @@ def login_link(port: int, token: str) -> str:
 def verify(port: int, token: str, phase: str) -> dict:
     api = "/api/state"
     cookie = "xgw_panel=" + hmac.new(token.encode(), b"xgw-panel", hashlib.sha256).hexdigest()
-    require(request(port, api)[0] == 401, "guest_api")
-    require(request(port, api, cookie=cookie)[0] == 200, "existing_session")
+    readiness = wait_for_guest_api(port)
+    require(checked_request("existing_session", port, api, cookie=cookie)[0] == 200,
+            "existing_session")
     legacy = "/?" + urlencode({"token": token})
-    code, headers = request(port, legacy)
+    code, headers = checked_request("legacy_redirect", port, legacy)
     require(code == 303 and headers.get("location") == "/", "legacy_redirect")
     if phase != "candidate":
         require(headers.get("set-cookie", "").split(";", 1)[0] == cookie, "legacy_baseline")
-        return {"ok": True, "phase": phase, "existing_session": True, "legacy_login": True}
+        return {"ok": True, "phase": phase, "http_ready": readiness,
+                "existing_session": True, "legacy_login": True}
 
     require("set-cookie" not in headers and headers.get("referrer-policy") == "no-referrer",
             "legacy_issued_session")
-    require(request(port, legacy, cookie=cookie)[0] == 303, "legacy_session_redirect")
-    require(request(port, api, cookie=cookie)[0] == 200, "legacy_session_retained")
+    status, _headers = checked_request("legacy_session_redirect", port, legacy, cookie=cookie)
+    require(status == 303, "legacy_session_redirect")
+    status, _headers = checked_request("legacy_session_retained", port, api, cookie=cookie)
+    require(status == 200, "legacy_session_retained")
     fresh_link = login_link(port, token)
-    require(request(port, fresh_link, headers={"Host": "unrelated.invalid"})[0] == 403,
-            "foreign_host")
-    code, headers = request(port, fresh_link, method="HEAD")
+    status, _headers = checked_request("foreign_host", port, fresh_link,
+                                       headers={"Host": "unrelated.invalid"})
+    require(status == 403, "foreign_host")
+    code, headers = checked_request("head_consumed_code", port, fresh_link, method="HEAD")
     require(code == 200 and "set-cookie" not in headers, "head_consumed_code")
-    code, headers = request(port, fresh_link)
+    code, headers = checked_request("new_session", port, fresh_link)
     issued = headers.get("set-cookie", "")
     require(code == 303 and headers.get("location") == "/" and issued.split(";", 1)[0] == cookie
             and "HttpOnly" in issued and "SameSite=Strict" in issued, "new_session")
-    code, headers = request(port, fresh_link)
+    code, headers = checked_request("reused_code", port, fresh_link)
     require(code == 403 and "set-cookie" not in headers, "reused_code")
     # No action has this name, even if an authentication check is accidentally dropped.
     inert = "/api/__t11_login_check__"
-    require(request(port, inert, method="POST")[0] == 401, "unauthorized_post")
-    require(request(port, inert, method="POST", cookie=cookie,
-                    headers={"Origin": "http://unrelated.invalid"})[0] == 403, "foreign_origin")
-    return {"ok": True, "phase": phase, "existing_session": True, "legacy_login": False,
+    status, _headers = checked_request("unauthorized_post", port, inert, method="POST")
+    require(status == 401, "unauthorized_post")
+    status, _headers = checked_request("foreign_origin", port, inert, method="POST", cookie=cookie,
+                                       headers={"Origin": "http://unrelated.invalid"})
+    require(status == 403, "foreign_origin")
+    return {"ok": True, "phase": phase, "http_ready": readiness,
+            "existing_session": True, "legacy_login": False,
             "one_time_cli": True, "reused_code": 403, "foreign_host": 403, "foreign_origin": 403}
 
 
@@ -111,10 +162,10 @@ def main() -> int:
         require(bool(token), "missing_signing_key")
         result = verify(cfg.panel.port, token, args.phase)
     except FailedCheck as exc:
-        result = {"ok": False, "phase": args.phase, "failed": str(exc)}
-    except (OSError, http.client.HTTPException, subprocess.SubprocessError, ValueError,
-            config.ConfigError):
-        result = {"ok": False, "phase": args.phase, "failed": "request_or_config"}
+        result = {"ok": False, "phase": args.phase, "failed": str(exc), **exc.details}
+    except (OSError, ValueError, config.ConfigError) as exc:
+        result = {"ok": False, "phase": args.phase, "failed": "read_panel_config",
+                  **error_details(exc)}
     print(json.dumps(result))
     return 0 if result["ok"] else 2
 
