@@ -66,4 +66,4 @@
 4. Цепочка P2.1→P2.11 замкнута: пять полей доступны на всех
    транспортах (IPC, HTTP-UID, socket-activation, Qt, веб) с
    восстановлением после отказов всех уровней.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `7e3bf8556769000e333be36f5e240101bc2a58da` (2026-11-21T205918Z_panel-web-retry.md).
