@@ -59,6 +59,7 @@ class ApiClient(QObject):
         self.actions = model.ActionGuard()
         self.visible = True
         self.running = False
+        self._poll_after_reply = False
         self.link, self.link_text = "", ""
         self.state: dict | None = None
         self.timer = QTimer(self)
@@ -73,6 +74,7 @@ class ApiClient(QObject):
     def set_session(self, session: model.Session | None) -> None:
         self.session = session
         self.gate.drop()
+        self._poll_after_reply = False
         for gate in self.side.values():
             gate.drop()
         self.backoff.reset()
@@ -86,6 +88,7 @@ class ApiClient(QObject):
 
     def stop(self) -> None:
         self.running = False
+        self._poll_after_reply = False
         self.timer.stop()
 
     def close(self) -> None:
@@ -121,6 +124,10 @@ class ApiClient(QObject):
     def poll_soon(self, seconds: float) -> None:
         if not self.running:
             return
+        if seconds <= 0 and self.gate.busy:
+            # F5, window restore and completed actions share one follow-up request.
+            self._poll_after_reply = True
+            return
         self.timer.start(max(0, int(seconds * 1000)))
 
     def _interval(self) -> float:
@@ -135,6 +142,7 @@ class ApiClient(QObject):
         number = self.gate.begin()
         if number is None:
             return  # прежний опрос ещё идёт: его ответ назначит следующий
+        self.timer.stop()
         reply = self.network.get(_request(f"{self.session.base}/api/state",
                                           cookie=self.session.cookie))
         self._send(reply, lambda: self._state_done(reply, number))
@@ -143,27 +151,28 @@ class ApiClient(QObject):
         code, data = _status(reply), bytes(reply.readAll())
         network = reply.errorString() if reply.error() != QNetworkReply.NetworkError.NoError else ""
         reply.deleteLater()
-        fresh = self.gate.finish(number)
-        if not fresh:
+        if not self.gate.finish(number):
             return
+        follow_up, self._poll_after_reply = self._poll_after_reply, False
         if code == 200:
             state = model.parse_json(data)
             if state is not None:
                 self.backoff.reset()
                 self.state = state
                 stale = model.is_stale(state)
+                self.poll_soon(0.0 if follow_up else self._interval())
                 self._set_link(LINK_STALE if stale else LINK_OK,
                                "Данные устарели: демон XGW не отвечает" if stale else "")
                 self.stateReceived.emit(state)
-                self.poll_soon(self._interval())
                 return
             code, network = 0, "ответ панели — не JSON"
         if code == 401:
             self._set_link(LINK_AUTH, model.error_text(401))
             return  # без входа опрашивать незачем: окно попросит войти
+        delay = self.backoff.fail()
+        self.poll_soon(0.0 if follow_up else delay)
         self._set_link(LINK_OFFLINE, model.error_text(code, data.decode("utf-8", "replace"),
                                                       network))
-        self.poll_soon(self.backoff.fail())
 
     def _set_link(self, link: str, text: str) -> None:
         if (link, text) != (self.link, self.link_text):
