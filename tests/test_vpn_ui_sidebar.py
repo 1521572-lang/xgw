@@ -31,9 +31,16 @@ class Bridge(QtCore.QObject):
                               "member", False, True, 100 - index, 22, rating=0.75)
                         for index in range(30)]
         self.sent = []
+        self.message = ""
 
     def select(self, identifier):
         self.sent.append(identifier)
+
+    def send(self, name, body):
+        self.sent.append((name, body))
+
+    def show_message(self, text):
+        self.message = text
 
     def fetch_pool(self):
         pass
@@ -203,3 +210,39 @@ def test_map_pulses_only_for_visible_known_active_country(app):
         assert not canvas._pulse.isActive()
     finally:
         canvas.close()
+
+
+@pytest.mark.parametrize(("button", "pool", "changed", "expected"), [
+    ("На 10 минут", False, False, [("pin", {"tag": "0", "ttl": "10m"})]),
+    ("Бессрочно", False, False, ["0"]),
+    ("Отмена", False, False, []),
+    ("На 10 минут", False, True, []),
+    ("Выбрать", True, False, ["0"]),
+])
+def test_server_confirm_uses_explicit_duration_and_rechecks_row(app, button, pool, changed,
+                                                               expected):
+    bridge = Bridge()
+    if pool:
+        bridge.entries[0] = replace(bridge.entries[0], pool=True, source=POOL)
+    parent = QtWidgets.QWidget()
+    sidebar = Sidebar(bridge, parent)
+    clicked = []
+
+    def answer():
+        box = app.activeModalWidget()
+        if box is None:
+            return
+        buttons = {candidate.text(): candidate for candidate in box.buttons()}
+        clicked.append((box.defaultButton().text(), "На 10 минут" in buttons))
+        if changed:
+            bridge.entries[0] = replace(bridge.entries[0], country="DE")
+        buttons.get(button, buttons["Отмена"]).click()
+
+    try:
+        QtCore.QTimer.singleShot(0, answer)
+        sidebar.select(bridge.entries[0])
+        assert clicked == [("Отмена", not pool)]
+        assert bridge.sent == expected
+        assert bool(bridge.message) is changed
+    finally:
+        parent.close()

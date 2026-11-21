@@ -47,7 +47,7 @@ def confirmed_country(state):
 
 
 @contextlib.contextmanager
-def desktop_window(work):
+def desktop_window(work, *, client_type=ReadOnlyClient):
     session = model.load_session(model.session_file())
     if session is None:
         raise ValueError("no_desktop_session")
@@ -57,7 +57,7 @@ def desktop_window(work):
     prepare_application(app)
     # The installed panel may still compile its first state on the cold path.
     model.REQUEST_TIMEOUT = 25
-    client = ReadOnlyClient(session)
+    client = client_type(session)
     flow = login.LoginFlow(client.exchange, command=lambda: "Используется действующий сеанс.")
     bridge = XgwBridge(client)
     window = XgwWindow(bridge, flow, work / "gui-session.json", theme_name="dark")

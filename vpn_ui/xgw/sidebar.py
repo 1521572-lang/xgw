@@ -342,14 +342,30 @@ class Sidebar(QtWidgets.QFrame):
                   if item.pool else "Закрепить этот сервер в шлюзе?")
         details = (item.name, source, country_name(item.country), action)
         box.setText("\n".join(filter(None, details)))
-        accept = box.addButton("Выбрать", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        accept_role = QtWidgets.QMessageBox.ButtonRole.AcceptRole
+        timed = None if item.pool else box.addButton("На 10 минут", accept_role)
+        accept = box.addButton("Выбрать" if item.pool else "Бессрочно", accept_role)
         cancel = box.addButton("Отмена", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
         c = theme.palette()
         box.setStyleSheet(f"QMessageBox {{ background: {c.bg_norm.qss}; }}")
         box.exec()
-        if box.clickedButton() is accept:
-            self.bridge.select(item.id)
+        button = box.clickedButton()
+        temporary = timed is not None and button is timed
+        if not temporary and button is not accept:
+            return
+        current = self._entry(item.id)
+        if (not self.bridge.can_select or current is None or not current.choosable
+                or (current.source, current.name, current.country, current.pool)
+                != (item.source, item.name, item.country, item.pool)):
+            self.bridge.show_message("Выбор больше недоступен. Проверьте сервер и подтвердите снова.")
+            self.bridge.gateway_changed.emit()
+            return
+        if temporary:
+            self.bridge.send("pin", {"tag": current.id, "ttl": "10m"})
+        else:
+            self.bridge.select(current.id)
 
     def details(self, row=None, _column=0):
         self._details_locked = True

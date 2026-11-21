@@ -11,11 +11,101 @@ import sys
 import time
 from pathlib import Path
 
-from gui_map_visibility import desktop_window, wait
+from gui_map_visibility import ReadOnlyClient, desktop_window, wait
+from vpn_ui.qt import Qt, QtCore, QtWidgets
+from vpn_ui.xgw.backend import GuardedApiClient
 from xgw.gui import model
 
 XGW = "/usr/local/bin/xgw"
 ACTIVE_JOBS = {"queued", "running", "restoring"}
+
+
+class GuiPinClient(ReadOnlyClient):
+    """Allow only the single action explicitly scheduled by the trial."""
+
+    expected = None
+
+    def __init__(self, session):
+        super().__init__(session)
+        self.attempted = []
+        self.results = {}
+        self.actionFinished.connect(self._finish_action)
+
+    def _finish_action(self, key, ok, _text):
+        self.results[key] = ok
+
+    def act(self, name, body=None, key=None):
+        if (name, body or {}) != self.expected:
+            return super().act(name, body, key)
+        self.expected = None
+        started = GuardedApiClient.act(self, name, body, key)
+        if started:
+            self.attempted.append(name)
+        return started
+
+
+def gui_pin(app, window, candidate):
+    sidebar = window.sidebar
+    role = Qt.ItemDataRole.UserRole
+    source = "sub:" + candidate["source"]
+    for index in range(sidebar.sources.count()):
+        if sidebar.sources.item(index).data(role) == source:
+            sidebar.sources.setCurrentRow(index)
+            break
+    else:
+        raise ValueError("gui_source_missing")
+    tag = candidate["tag"]
+    for index in range(sidebar.servers.topLevelItemCount()):
+        row = sidebar.servers.topLevelItem(index)
+        if row.data(0, role) == tag:
+            sidebar.servers.setCurrentItem(row)
+            break
+    else:
+        raise ValueError("gui_candidate_missing")
+    if not sidebar.choose.isEnabled():
+        raise ValueError("gui_choice_disabled")
+
+    def choose_temporary():
+        box = app.activeModalWidget()
+        if isinstance(box, QtWidgets.QMessageBox):
+            for button in box.buttons():
+                if button.text() == "На 10 минут":
+                    button.click()
+                    return
+            box.reject()
+
+    client = window.bridge.client
+    client.expected = ("pin", {"tag": tag, "ttl": "10m"})
+    choose = QtCore.QTimer(window)
+    choose.setSingleShot(True)
+    choose.timeout.connect(choose_temporary)
+    choose.start(0)
+    try:
+        sidebar.choose.click()
+    finally:
+        choose.stop()
+        client.expected = None
+    if client.attempted != ["pin"]:
+        raise ValueError("gui_pin_not_sent")
+
+
+def gui_unpin(app, window):
+    bridge = window.bridge
+    auto = window.sidebar.auto
+    client = bridge.client
+    wait(app, auto.isEnabled, "gui_auto_disabled", seconds=8)
+    before = bridge.received
+    client.expected = ("unpin", {})
+    try:
+        auto.click()
+    finally:
+        client.expected = None
+    if client.attempted != ["pin", "unpin"]:
+        raise ValueError("gui_unpin_not_sent")
+    wait(app, lambda: client.results.get("unpin") is True and bridge.received > before
+         and bool(auto_row(window)),
+         "gui_auto_not_restored", seconds=45)
+    print("MAP_GUI_UNPIN_OK", flush=True)
 
 
 def command(label, *args, timeout=15):
@@ -95,7 +185,7 @@ def snapshot(app, work, canvas, code, name, *, phase=(0.15, 0.35)):
         raise ValueError("map_screenshot")
 
 
-def trial(work, app, window, current, candidate):
+def trial(work, app, window, current, candidate, *, via_gui=False):
     canvas = window.map
     current_code, candidate_code = country(window, current), country(window, candidate)
     initial_ip = public_ip()
@@ -111,13 +201,24 @@ def trial(work, app, window, current, candidate):
             "--on-active=120s", "--service-type=oneshot", "--timer-property=AccuracySec=1s",
             "/usr/bin/timeout", "-k", "3", "18", XGW, "unpin")
     attempted = False
+    restored_in_gui = False
     canvas._move.valueChanged.connect(observe_pan)
     try:
         command("rollback_not_active", "systemctl", "is-active", "--quiet", unit + ".timer")
         print("MAP_SWITCH_ROLLBACK_ARMED", flush=True)
         attempted = True
-        command("pin_command", "sudo", "-n", XGW, "pin", candidate["tag"], "--ttl", "90s")
-        wait(app, lambda: pinned(window, candidate), "pin_not_confirmed_by_map", seconds=35)
+        if via_gui:
+            gui_pin(app, window, candidate)
+        else:
+            command("pin_command", "sudo", "-n", XGW, "pin", candidate["tag"], "--ttl", "90s")
+        wait(app, lambda: pinned(window, candidate)
+             and (not via_gui or window.bridge.client.results.get("pin") is True),
+             "pin_not_confirmed_by_map", seconds=35)
+        if via_gui:
+            remaining = window.bridge.state["pin"]["until"] - time.time()
+            if not 540 <= remaining <= 610:
+                raise ValueError("gui_pin_duration")
+            print("MAP_GUI_PIN_OK TTL_10M", flush=True)
         changed = public_ip() != initial_ip
         snapshot(app, work, canvas, candidate_code, "switch-pinned.png")
         snapshot(app, work, canvas, candidate_code, "switch-pinned-second.png", phase=(0.45, 0.60))
@@ -125,10 +226,14 @@ def trial(work, app, window, current, candidate):
             raise ValueError("map_pan_or_pin_not_confirmed")
         print("MAP_PAN_OK", len(positions), flush=True)
         print("MAP_SWITCH_OK", "PUBLIC_IP_CHANGED", int(changed), flush=True)
+        if via_gui:
+            gui_unpin(app, window)
+            restored_in_gui = True
     finally:
         canvas._move.valueChanged.disconnect(observe_pan)
         if attempted:
-            command("unpin_command", "sudo", "-n", XGW, "unpin")
+            if not restored_in_gui:
+                command("unpin_command", "sudo", "-n", XGW, "unpin")
             before = window.bridge.received
             window.bridge.client.poll_soon(0)
             wait(app, lambda: window.bridge.received > before and bool(auto_row(window)),
@@ -147,9 +252,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("work", type=Path)
     parser.add_argument("--maintenance-window", action="store_true", required=True)
+    parser.add_argument("--via-gui", action="store_true")
     args = parser.parse_args()
     try:
-        with desktop_window(args.work) as (app, window):
+        client_type = GuiPinClient if args.via_gui else ReadOnlyClient
+        with desktop_window(args.work, client_type=client_type) as (app, window):
             wait(app, lambda: bool(auto_row(window)), "no_unambiguous_automatic_route", seconds=18)
             current = auto_row(window)
             candidate = next(eligible(window, current), None)
@@ -166,7 +273,7 @@ def main():
                                for row in eligible(window, current))):
                 raise ValueError("route_changed_during_preflight")
             print("MAP_SWITCH_PREFLIGHT_OK", flush=True)
-            trial(args.work, app, window, current, candidate)
+            trial(args.work, app, window, current, candidate, via_gui=args.via_gui)
     except ValueError as exc:
         print("MAP_SWITCH_FAILED", exc, file=sys.stderr)
         return 2
