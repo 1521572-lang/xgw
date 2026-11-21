@@ -29,7 +29,7 @@ RELAY = Path("/run/xgw-panel-read.sock")
 FILES = (
     "cli.py", "install.py", "watch/panel.py", "ui/login.html", "ui/app.css", "geodat.py",
     "watch/server_geo.py", "paths.py", "watch/httpbound.py", "local_ipc.py", "watch/panel_ipc.py",
-    "watch/panel_read_http.py", "watch/panel_status_runtime.py",
+    "watch/panel_read_http.py", "watch/panel_status_runtime.py", "desync/client.py",
 )
 
 

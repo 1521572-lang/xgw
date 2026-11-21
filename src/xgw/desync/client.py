@@ -15,6 +15,12 @@ from pathlib import Path
 from .jobs import ACTIVE, CANDIDATES, WAIT_STAGES
 
 
+class _HTTPFailure(ValueError):
+    def __init__(self, status: int) -> None:
+        super().__init__("local_api_unavailable_or_login_expired")
+        self.status = status
+
+
 class Client:
     def __init__(self):
         from ..gui.model import load_session, session_file
@@ -38,7 +44,9 @@ class Client:
             connection.request("GET" if body is None else "POST", path, data, headers)
             response = connection.getresponse()
             raw = response.read(1024 * 1024 + 1)
-            if response.status != 200 or len(raw) > 1024 * 1024:
+            if response.status != 200:
+                raise _HTTPFailure(response.status)
+            if len(raw) > 1024 * 1024:
                 raise ValueError("local_api_unavailable_or_login_expired")
             result = json.loads(raw)
             if not isinstance(result, dict):
@@ -216,7 +224,9 @@ def matrix_report(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("status")
+    status = sub.add_parser("status")
+    status.add_argument("--summary", action="store_true",
+                        help="Пять полей статуса через изолированную службу чтения")
     start = sub.add_parser("start")
     start.add_argument("--candidates", nargs="+", choices=CANDIDATES, default=list(CANDIDATES))
     start.add_argument("--rounds", type=int, choices=(1, 2), default=2)
@@ -242,6 +252,10 @@ def main():
             result = analyze(args.input)
         elif args.action == "monitor":
             result = monitor(client, args.output, args.seconds, args.interval)
+        elif args.action == "status" and args.summary:
+            from ..watch.panel_ipc import project
+
+            result = project(client.request("/api/zapret2/status").get("zapret2"))
         else:
             view = client.request("/api/zapret2/overview")["zapret2"]
             job = view.get("job") or {}
@@ -271,9 +285,16 @@ def main():
                 result = client.request("/api/zapret2/" + action, body)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("ok", True) else 2
-    except (OSError, ValueError, KeyError, http.client.HTTPException):
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as exc:
         if args.action == "matrix":
             print(json.dumps({"ok": False, "error": "invalid_or_missing_job_snapshot"}))
+            return 2
+        if (args.action == "status" and args.summary and isinstance(exc, _HTTPFailure)
+                and exc.status in (404, 503)):
+            print(json.dumps({"ok": False, "error": "isolated_status_unavailable",
+                              "http_status": exc.status,
+                              "text": "Изолированная служба статуса недоступна."},
+                             ensure_ascii=False))
             return 2
         print(json.dumps({"ok": False, "error": "local_api_or_parameters",
                           "text": "Проверьте вход в панель и параметры команды."},

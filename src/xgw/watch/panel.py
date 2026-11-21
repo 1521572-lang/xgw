@@ -373,7 +373,7 @@ class Panel:
         if self.status_reader is None:
             from .panel_status_runtime import StatusRuntime
 
-            runtime = StatusRuntime.for_panel(self.paths, self.zapret2_overview, self.log)
+            runtime = StatusRuntime.for_panel(self.paths, self.zapret2_status, self.log)
             if runtime is not None:
                 runtime.start()
                 self._status_runtime = runtime
@@ -828,6 +828,22 @@ class Panel:
         budget = self._probe_budget(cfg, now)
         return card(cfg, snapshot, capture, daemon_ready, now=now,
                     probe_budget=budget.status() if budget is not None else None)
+
+    def zapret2_status(self) -> dict:
+        """Build the IPC status from a bounded daemon snapshot and panel settings."""
+        from ..desync import event_socket
+        from . import panel_ipc
+        from .zapret2_control import card
+
+        cfg, daemon_ready = self.cfg, self.daemon is not None
+        try:
+            snapshot = event_socket.read_status(self.paths.status_file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        capture = {"mode": self.capture_factory(cfg, self.paths, logger=self.log).mode()}
+        return {"zapret2": panel_ipc.project(card(cfg, snapshot, capture, daemon_ready))}
 
     def zapret2_overview(self) -> dict:
         """Use the same card as the main panel, without building its server and device lists."""

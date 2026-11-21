@@ -106,6 +106,7 @@ def run():
                        root_problem=lambda: "Тестовый экземпляр доступен для чтения")
     view.configure(cfg)
     view.zapret2_overview = overview
+    view.zapret2_status = overview
     try:
         start_socket(base, units, paths, identity)
         check(show_unit(f"{units}.socket", "ActiveState") == "active"

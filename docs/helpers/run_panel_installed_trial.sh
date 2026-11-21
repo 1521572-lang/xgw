@@ -16,7 +16,8 @@ UNIT=xgw-panel-reader-rollback
 REPO=$(git rev-parse --show-toplevel)
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 git -C "$REPO" merge-base --is-ancestor "$PROVEN" "$CODE"
-git -C "$REPO" diff --quiet "$PROVEN" "$CODE" -- src/xgw packaging
+git -C "$REPO" diff --quiet "$PROVEN" "$CODE" -- src/xgw packaging \
+  ':(exclude)src/xgw/watch/panel.py' ':(exclude)src/xgw/desync/client.py'
 printf 'PINNED %s | %s | %s\n' "$CODE" "$PRETTY_NAME" "$(uname -r)"
 systemctl --version | sed -n '1p'
 sudo -n true
@@ -129,6 +130,15 @@ print("QT_NETWORK_OK")
 PYTHON
 }
 
+check_cli_summary() {
+  timeout -k 2 15 env PYTHONPATH=/opt/xgw/lib "$PY" -B -P -m xgw.desync.client status --summary |
+    "$PY" -I -c 'import json, sys
+result = json.load(sys.stdin)
+assert result == {"mode": "off", "engine_mode": "off", "state": "off", "fresh": True,
+                  "policy_matched": True}
+print("CLI_SUMMARY_OK")'
+}
+
 snapshot_settings() {
   sudo -n sha256sum /etc/xgw/config.toml /etc/xgw/panel.json /var/lib/xgw/panel-token
 }
@@ -201,11 +211,13 @@ step baseline-settings snapshot_settings
 step baseline-xray xray_pid
 step baseline-https https_control
 mkdir -- "$D/contracts"
-git -C "$REPO" archive "$CODE" tests/test_panel_installed_trial.py \
+git -C "$REPO" archive "$CODE" src/xgw tests/test_panel_installed_trial.py \
+  tests/test_zapret2_status_reader.py \
   docs/helpers/panel_installed_trial.py docs/helpers/desync_batch1_install.py |
   tar -x -C "$D/contracts"
-step contracts timeout -k 3 45 "$TEST_PY" -B -P -m pytest -p no:cacheprovider -q \
-  "$D/contracts/tests/test_panel_installed_trial.py"
+step contracts timeout -k 3 60 env "PYTHONPATH=$D/contracts/src" \
+  "$TEST_PY" -B -P -m pytest -p no:cacheprovider -q \
+  "$D/contracts/tests/test_panel_installed_trial.py" "$D/contracts/tests/test_zapret2_status_reader.py"
 sudo -n install -d -m 0755 /opt/xgw/handoff
 STAGE=$(sudo -n mktemp -d /opt/xgw/handoff/panel-reader.XXXXXXXX)
 [[ $STAGE =~ ^/opt/xgw/handoff/panel-reader\.[A-Za-z0-9]{8}$ ]]
@@ -237,5 +249,6 @@ step apply overlay apply
 step candidate-ready wait_session baseline
 step candidate-http check_http candidate
 step candidate-session check_session candidate
+step candidate-cli-summary check_cli_summary
 step candidate-qt check_qt
 controls candidate
