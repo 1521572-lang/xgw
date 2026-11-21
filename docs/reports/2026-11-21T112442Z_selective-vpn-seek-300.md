@@ -86,4 +86,4 @@ route-tools-cleanup rc=0. Машина в финале: off/off fresh/matched,
 4. Инструментальная цепочка r2 (pinned-коммит → root tmp 0700 →
    isolated python → cleanup) прошла без замечаний — пригодна как
    шаблон для read-only ТЗ.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `f7266fc3f485aec0b5b3b56cabac1facea836882` (1d7ae23 → f7266fc, ancestor verified).
