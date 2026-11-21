@@ -15,6 +15,12 @@ from xgw.net import nft
 from xgw.net.cmd import CommandError
 
 
+@pytest.fixture(autouse=True)
+def _without_system_singbox_user(monkeypatch):
+    """Default to the no-account rules regardless of the test host's user database."""
+    monkeypatch.setattr(nft, "singbox_user_uid", lambda: None)
+
+
 def _cfg(**network) -> Config:
     cfg = Config()
     cfg.network.lan_if = "lan0"
@@ -1109,6 +1115,14 @@ def test_dedicated_singbox_uid_has_bypass_and_loopback_refusal(monkeypatch):
         text6 = nft.render6(rules)
         assert "meta skuid 27123 ct direction original ip6 daddr ::1 counter reject" in text6
         assert "meta skuid 27123 accept" in nft.render_guard(rules)
+        if rules.v6_guard:
+            guard = _chain(text6, "v6_guard")
+            assert guard.index("meta skuid 27123 ct direction original ip6 daddr ::1 "
+                               "counter reject") < guard.index('oifname "lo" accept')
+        if blocked:
+            guard = _chain(text, "block_output")
+            assert guard.index("meta skuid 27123 ct direction original ip daddr 127.0.0.0/8 "
+                               "counter reject") < guard.index('oifname "lo" accept')
 
 
 def test_singbox_close_only_restores_header_only_ack_of_local_tun_flow():

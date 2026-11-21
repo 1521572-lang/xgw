@@ -95,9 +95,10 @@ def test_blocked_lets_tailscale_through_always():
     rules = _rules(cfg, capture=False, blocked=True, tailscale=True)
     text = nft.render(rules)
     output = _chain(text, "block_output")
-    reject = next(i for i, line in enumerate(output) if "reject" in line)
-    assert output.index("meta mark and 0xff0000 == 0x80000 accept") < reject
-    assert output.index('oifname "tailscale0" accept') < reject
+    assert output[-2:] == ["meta l4proto tcp counter reject with tcp reset",
+                           "counter reject with icmp type admin-prohibited"]
+    assert output.index("meta mark and 0xff0000 == 0x80000 accept") < len(output) - 2
+    assert output.index('oifname "tailscale0" accept') < len(output) - 2
     assert "set ts_direct" not in text  # набор в blocked ни к чему
     assert "tailscale0" not in nft.render(_rules(cfg, capture=False, blocked=True))
 
@@ -109,9 +110,10 @@ def test_v6_guard_lets_the_tailnet_and_tailscaled_through(mode):
     rules = _rules(_cfg(), capture=mode == "on", blocked=mode == "blocked", tailscale=True)
     text = nft.render6(rules)
     guard = _chain(text, "v6_guard")
-    reject = next(i for i, line in enumerate(guard) if "reject" in line)
-    assert guard.index('oifname "tailscale0" accept') < reject
-    assert guard.index("meta mark and 0xff0000 @ts_direct accept") < reject
+    assert guard[-2:] == ["meta l4proto tcp counter reject with tcp reset",
+                          "counter reject with icmpv6 type admin-prohibited"]
+    assert guard.index('oifname "tailscale0" accept') < len(guard) - 2
+    assert guard.index("meta mark and 0xff0000 @ts_direct accept") < len(guard) - 2
     assert _set(text) == ["type mark", "elements = { 0x80000 }"]
 
 
