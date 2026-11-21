@@ -78,4 +78,4 @@ LIVE_PLAY=NOT_RUN, FLOW=NOT_RUN.
 4. Механика помощника чистая: receipt до POST, разные штампы по
    206/65536, возврат off по receipt, работу с базовой схемой evidence
    (без attempts/target) — без ошибок.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `6d81e35a31c5c2d56e77232c7f3d3a95f9d81d4c` (ebb14ca → 6d81e35, ancestor verified).
