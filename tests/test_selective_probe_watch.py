@@ -257,8 +257,19 @@ def test_replay_keeps_changed_window_inconclusive_and_reports_exact_zapret2_acce
     if accepted is None:
         assert "logged_zapret2" not in result
     else:
-        assert result["logged_zapret2"] == {
-            "accepted_flows": accepted, "unconfirmed_flows": 1 - accepted, "qualified_flows": 1,
+        replay = result["logged_zapret2"]
+        assert replay["accepted_flows"] == accepted
+        assert replay["unconfirmed_flows"] == 1 - accepted
+        assert replay["qualified_flows"] == 1
+        other = int(mutation == "vpn_outbound")
+        assert replay["accepted_other_outbound_flows"] == other
+        assert replay["unmatched"] == {
+            "duplicate": {"ambiguous": 1},
+            "no_local_port": {"local_endpoint_unconfirmed": 1},
+        }.get(mutation, {})
+        assert accepted + other + sum(replay["unmatched"].values()) == replay["qualified_flows"]
+        assert replay["capture_accept_records"] == {
+            "other" if other else "zapret2": len(journal),
         }
     assert all(secret not in repr(result) for secret in ("private", "192.0.2.1", "198.51.100.2"))
 

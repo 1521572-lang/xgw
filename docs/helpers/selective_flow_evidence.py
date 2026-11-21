@@ -86,7 +86,7 @@ def access_records(journal, snapshot, start, end):
     return records
 
 
-def _match_flows(player, journal, before, after):
+def _match_flows(player, journal, before, after, *, include_record_counts=False):
     start = player[0].get("capture_started_unix") if player else None
     begin = before["unix"]
     end = after["unix"]
@@ -113,13 +113,18 @@ def _match_flows(player, journal, before, after):
             unmatched["no_access_record"] += 1
         else:
             grouped[candidates[0][1]] += 1
-    return {
+    result = {
         "state": "observed" if grouped else "inconclusive",
         "qualified_flows": len(flows),
         "groups": dict(grouped),
         "unmatched": dict(unmatched),
         "client_zapret2_rule": before["client_zapret2_rule"],
     }
+    if include_record_counts:
+        result["capture_accept_records"] = dict(Counter(
+            group for entries in records.values() for _, group in entries
+        ))
+    return result
 
 
 def analyze(player, journal, before, after, *, observe_applied_change=False):
@@ -139,16 +144,19 @@ def analyze(player, journal, before, after, *, observe_applied_change=False):
             # window can't establish which VPN endpoint was behind other tags.
             # Keep the primary window verdict and expose only exact journal matches.
             selected = {**before, "tags": {OUT: {"group": "zapret2"}}}
-            matches = _match_flows(player, journal, selected, after)
+            matches = _match_flows(player, journal, selected, after, include_record_counts=True)
             if "qualified_flows" in matches:
                 total = matches["qualified_flows"]
                 accepted = matches["groups"].get("zapret2", 0)
                 result["logged_zapret2"] = {
                     "accepted_flows": accepted, "unconfirmed_flows": total - accepted,
                     "qualified_flows": total,
+                    "accepted_other_outbound_flows": matches["groups"].get("other", 0),
+                    "unmatched": matches["unmatched"],
+                    "capture_accept_records": matches["capture_accept_records"],
                 }
         return result
-    return _match_flows(player, journal, before, after)
+    return _match_flows(player, journal, before, after, include_record_counts=observe_applied_change)
 
 
 def main():
