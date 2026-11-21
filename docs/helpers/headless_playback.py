@@ -149,6 +149,52 @@ def measure(rows, required, bitrate):
             "cache_read_median_Bps": median_rate, "bitrate_bps": bitrate, "line": verdict}
 
 
+def playback_acceptance(rows, required):
+    """Evaluate the first complete wall-clock window, including frozen playback."""
+    times = [row.get("mono") for row in rows]
+    if (not times or not all(map(number, times))
+            or any(last <= first for first, last in pairwise(times))):
+        return {"ok": False, "reason": "timestamps_unconfirmed"}
+    end = times[0] + required
+    observed = min(required, times[-1] - times[0])
+    sampled = progress = quality = stalls = longest = run = 0.0
+    for first, last in pairwise(rows):
+        if first["mono"] >= end:
+            break
+        duration = last["mono"] - first["mono"]
+        seconds = min(last["mono"], end) - first["mono"]
+        if (duration > 2.5 or any(row.get("seeking") is not False for row in (first, last))
+                or any(type(row.get("paused-for-cache")) is not bool for row in (first, last))
+                or not all(number(row.get("time-pos")) for row in (first, last))):
+            run = 0.0
+            continue
+        movement = last["time-pos"] - first["time-pos"]
+        if not 0 <= movement <= duration + 0.5:
+            run = 0.0
+            continue
+        sampled += seconds
+        if first.get("height") == last.get("height") == 720:
+            quality += seconds
+        if last["paused-for-cache"] or movement <= 0.05:
+            stalls += seconds
+            run += seconds
+            longest = max(longest, run)
+        else:
+            run = 0.0
+            progress += min(duration, movement) * seconds / duration
+    gaps = max(0.0, observed - sampled)
+    progress_ratio = progress / required
+    quality_ratio = quality / sampled if sampled else 0.0
+    return {
+        "ok": (times[-1] >= end and gaps <= 5 and progress_ratio >= 0.98
+               and quality_ratio >= 0.99 and stalls <= 0.01 * required and longest <= 5),
+        "required_seconds": required, "observed_seconds": observed,
+        "progress_ratio": progress_ratio, "target_height_ratio": quality_ratio,
+        "sampling_gap_seconds": gaps, "stall_seconds": stalls,
+        "longest_stall_seconds": longest,
+    }
+
+
 def player_sockets(pid):
     try:
         output = subprocess.run(
@@ -255,6 +301,8 @@ def main():
     play.add_argument("--samples", type=Path, required=True)
     play.add_argument("--peers", action="store_true",
                       help="Record private TCP endpoints and counters for the first 180 s")
+    play.add_argument("--strict", action="store_true",
+                      help="Apply the complete-window playback and stall acceptance limits")
     args = parser.parse_args()
     try:
         if os.name != "posix" or not shutil.which("curl" if args.action == "probe" else "mpv"):
@@ -270,6 +318,9 @@ def main():
             rows, target, outcome = capture(url, duration, args.samples, args.seconds,
                                             args.seek_forward, peers=args.peers)
             result = measure(rows, args.seconds, bitrate)
+            if args.strict:
+                result["acceptance"] = playback_acceptance(rows, args.seconds)
+                result["ok"] = result["acceptance"]["ok"]
             result.update(outcome=outcome, seek_target=target, samples=len(rows),
                           seek_observed=args.seek_forward is not None and bool(rows))
             result["ok"] = result["ok"] and outcome == "elapsed"

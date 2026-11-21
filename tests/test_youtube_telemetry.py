@@ -59,6 +59,43 @@ def test_headless_playback_counts_elapsed_progress_and_cache_stalls():
     assert result["stall_seconds"] == pytest.approx(3, abs=0.01)
 
 
+@pytest.mark.parametrize(("end", "frozen", "paused", "expected"), [
+    (900, set(), set(), True),
+    (900, set(range(50, 56)), set(), False),
+    (900, set(range(50, 54)), set(range(300, 304)), True),
+    (900, set(range(50, 55)), set(range(300, 305)), False),
+    (899, set(), set(), False),
+])
+def test_headless_strict_acceptance_counts_frozen_wall_clock_time(end, frozen, paused, expected):
+    from docs.helpers.headless_playback import playback_acceptance
+
+    rows = []
+    position = 0
+    for i in range(end + 1):
+        if i and i not in frozen | paused:
+            position += 1
+        rows.append({"mono": i, "time-pos": position, "seeking": False, "height": 720,
+                     "paused-for-cache": i in paused})
+    result = playback_acceptance(rows, 900)
+    assert result["ok"] is expected
+    assert result["observed_seconds"] == end
+    assert result["stall_seconds"] == len(frozen | paused)
+    assert result["longest_stall_seconds"] == max(len(frozen), len(paused))
+
+
+def test_headless_strict_acceptance_rejects_sampling_gaps_and_caps_window():
+    from docs.helpers.headless_playback import playback_acceptance
+
+    rows = [{"mono": i, "time-pos": i, "seeking": False, "height": 720 if i <= 900 else 480,
+             "paused-for-cache": False} for i in range(916)]
+    assert playback_acceptance(rows, 900)["ok"]
+    del rows[50:56]
+    result = playback_acceptance(rows, 900)
+    assert not result["ok"]
+    assert result["sampling_gap_seconds"] == 7
+    assert result["observed_seconds"] == 900
+
+
 def test_read_netlog_counts_only_successful_media_streams(tmp_path):
     from docs.helpers.playback_netlog import read_media
 
