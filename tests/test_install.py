@@ -407,9 +407,14 @@ def test_capture_stays_off_when_xray_did_not_start(box):
 
 def test_reinstall_keeps_capture_enabled_even_if_xray_is_down(box):
     assert box.install() == 0
+    box.out.clear()
     box.xray_ok = False
-    assert box.install() == 0
-    assert "tproxy" in box.system.kernel.table  # выбор пользователя не меняется
+    assert box.install() == 1
+    assert "перехват не готов после установки" in box.text()
+    assert "выбранный режим сохранён" in box.text()
+    assert box.installer().capture.mode() == "on"
+    assert "tproxy" in box.system.kernel.table
+    assert box.system.units["xgw.service"]["active"]
 
 
 def test_ufw_rules_are_added_only_after_confirmation(box):
@@ -509,16 +514,25 @@ def test_installer_waits_longer_than_systemd_stops_the_daemon():
 
 @pytest.mark.parametrize("reinstall", [False, True], ids=["first", "reinstall"])
 def test_daemon_that_does_not_start_leaves_the_network_working(box, reinstall):
-    """Сеть, DHCP и правила к запуску демона уже на месте и работают без него: его сбой —
-    предупреждение, а не откат (systemd с Restart=always запустит его сам)."""
+    """Сеть, DHCP и правила продолжают работать при сбое запуска демона.
+
+    На обновлении код 0 требует подтверждённого запуска ранее остановленного демона.
+    """
     if reinstall:
         assert box.install() == 0
         box.out.clear()
-    box.system.refuse["restart xgw.service"] = "Job for xgw.service failed"
-    assert box.install() == 0
+    verb = "start" if reinstall else "restart"
+    box.system.refuse[f"{verb} xgw.service"] = "Job for xgw.service failed"
+    assert box.install() == (1 if reinstall else 0)
     text = box.text()
     assert "Возвращаю сеть" not in text and "демон xgw пока не запущен" in text
-    assert "Job for xgw.service failed" in text and "Предупреждений:" in text
+    assert "Job for xgw.service failed" in text
+    if reinstall:
+        assert "остановленный для обновления демон не запущен" in text
+        assert box.system.commands("systemctl", "stop", "xgw.service")
+        assert len(box.system.commands("systemctl", "start", "xgw.service")) == 2
+    else:
+        assert "Предупреждений:" in text
     _gateway_works(box)
     assert "finished" in Journal(box.paths.journal_file)
 
@@ -1207,8 +1221,12 @@ def test_xray_api_socket_is_open_only_to_the_xray_group():
     assert core["RuntimeDirectory"] == "xgw-xray" and core["RuntimeDirectoryMode"] == "0750"
     assert core["UMask"] == "0007"
     assert "RuntimeDirectoryPreserve" not in core  # каталог со старым сокетом убирается
-    for unit in ("xgw.service", "xgw-core.service"):
-        assert settings(unit)["SupplementaryGroups"] == "xray", unit
+    assert set(settings("xgw.service")["SupplementaryGroups"].split()) == {"xray", "xgw-panel-read"}
+    assert settings("xgw-core.service")["SupplementaryGroups"] == "xray"
+    reader = settings("xgw-panel-read.service")
+    assert reader["User"] == reader["Group"] == "xgw-panel-read"
+    assert "xray" not in reader.get("SupplementaryGroups", "").split()
+    assert "-/run/xgw-xray" in reader["InaccessiblePaths"].split()
     assert Path(builder.API_SOCKET).parent.name == core["RuntimeDirectory"]
 
 
@@ -1336,11 +1354,12 @@ def test_capture_is_refreshed_before_applying_main_config(box):
 
 
 @pytest.mark.parametrize("valid", [True, False])
-def test_changed_singbox_unit_restarts_after_validation_instead_of_reload(
+def test_changed_singbox_unit_validates_generation_before_switching_xray(
     box, monkeypatch, valid,
 ):
     from types import SimpleNamespace
 
+    from xgw.apply import singbox_generation as generations
     from xgw.apply.singbox import SingboxCore
     from xgw.install import engine as install_engine
     from xgw.paths import atomic_write_json
@@ -1357,15 +1376,24 @@ def test_changed_singbox_unit_restarts_after_validation_instead_of_reload(
         reload=lambda: events.append("reload"),
     )
 
-    def validate(candidate):
-        assert candidate == new_config
+    def prepare(core_arg, candidate, xray):
+        assert core_arg is core and candidate == new_config
         events.append("validate")
-        return valid, "invalid candidate" if not valid else ""
+        if not valid:
+            raise ValueError("invalid generation")
+        return SimpleNamespace(xray={**xray, "inbounds": []})
 
-    core = SingboxCore(box.cfg, paths, service, validator=validate)
+    def finish(core_arg, applier_arg, prepared):
+        assert core_arg is core and applier_arg is applier
+        events.append("switch")
+        return applier_arg.apply(prepared.xray, force_now=True)
+
+    core = SingboxCore(box.cfg, paths, service,
+                       validator=lambda _: pytest.fail("unexpected in-place validation"))
     applier = SimpleNamespace(
         api=SimpleNamespace(balancer_info=lambda tag: {}),
-        apply=lambda *args, **kwargs: events.append("xray") or SimpleNamespace(mode="api"),
+        apply=lambda *args, **kwargs: events.append("xray")
+        or SimpleNamespace(mode="api", detail=""),
     )
     assembly = SimpleNamespace(
         singbox=SimpleNamespace(config=new_config, reload=False),
@@ -1378,16 +1406,20 @@ def test_changed_singbox_unit_restarts_after_validation_instead_of_reload(
         quotas={}))
     monkeypatch.setattr(install_engine, "assemble", lambda *args, **kwargs: assembly)
     monkeypatch.setattr(install_engine, "persist", lambda *args: None)
+    monkeypatch.setattr(generations, "prepare", prepare)
+    monkeypatch.setattr(generations, "finish", finish)
     installer = box.installer()
     installer.units_changed = {"xgw-singbox.service"}
     if valid:
         assert installer._first_apply() is True
     else:
-        with pytest.raises(InstallError, match="миграция sing-box не выполнена"):
+        with pytest.raises(InstallError, match="invalid generation"):
             installer._first_apply()
     assert assembly.singbox.reload is True
-    assert events == (["validate", "restart", "xray"] if valid else ["validate"])
-    assert core.read() == (new_config if valid else old_config)
+    assert events == (["validate", "switch", "xray"] if valid else ["validate"])
+    assert installer._singbox_migration_complete is valid
+    assert assembly.result.config == ({"inbounds": []} if valid else {})
+    assert core.read() == old_config  # поколениями управляют prepare/finish
     assert not box.system.commands("systemctl", "try-restart", "xgw-singbox.service")
 
 
@@ -1435,7 +1467,9 @@ def test_existing_singbox_identity_with_shared_privileges_is_rejected(box, uid, 
     assert not box.system.commands("userdel")
 
 
-def test_failed_migration_restores_unit_config_and_dac_before_restarting_old_worker(box):
+def test_failed_migration_restores_unit_config_and_dac_before_restarting_old_worker(
+    box, monkeypatch,
+):
     from xgw.install import SINGBOX_UNIT
 
     box.paths.ensure()
@@ -1448,6 +1482,8 @@ def test_failed_migration_restores_unit_config_and_dac_before_restarting_old_wor
     box.paths.singbox_config_file.chmod(0o640)
     box.paths.singbox_config_dir.chmod(0o2750)
     installer = box.installer()
+    # Box подменяет chown. Включаем ветку снимка DAC для root без запуска pytest от root.
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
     installer._permissions()
     unit.write_text("[Service]\nUser=xgw-singbox\n", encoding="utf-8")
     box.paths.singbox_config_file.write_text('{"new":true}', encoding="utf-8")

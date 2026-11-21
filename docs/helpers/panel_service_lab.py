@@ -139,6 +139,9 @@ def run():
         pid = int(show_unit(f"{units}.service", "MainPID"))
         check(pid > 0, "activated_service_pid")
         check_process(pid, identity, sandbox=True)
+        check(os.statvfs(f"/proc/{pid}/root/run").f_flag & os.ST_RDONLY,
+              "reader_run_writable")
+        print("reader_run_readonly OK", flush=True)
         print(f"cold_activation_ms {round((time.monotonic() - before) * 1000)}", flush=True)
         print("allowed", json.dumps(payload["zapret2"], sort_keys=True), flush=True)
 

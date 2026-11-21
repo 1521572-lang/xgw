@@ -14,6 +14,7 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
+ReadOnlyPaths=/run
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

@@ -112,7 +112,9 @@ test_rc=0
   timeout -k 4 600 env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest \
     -o addopts='' -p no:cacheprovider -q tests/test_panel_ipc.py \
     tests/test_panel_read_http.py tests/test_desync_event_socket.py \
-    tests/test_panel.py tests/test_t11_panel_login_check.py tests/test_install.py
+    tests/test_panel.py tests/test_t11_panel_login_check.py tests/test_install.py \
+    tests/test_singbox_generations.py::test_prepare_api_switch_drain_and_next_generation \
+    tests/test_singbox_generations.py::test_failed_bridge_leaves_old_without_api
 ) | tee "$WORK/tests.out" || test_rc=$?
 printf 'CONTRACT_TESTS_RC %s\n' "$test_rc"
 
