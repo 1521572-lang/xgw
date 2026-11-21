@@ -1,23 +1,25 @@
-# ThinkCentre — проверка прямого CDN до установки кандидата
+# ThinkCentre — один повтор CDN на базе и разбор сохранённых потоков
 
 **Ubuntu 24.04 LTS.** Flash сама запускает команды и при любом исходе
 публикует отчёт. Если терминал, панель или sudo недоступны, запроси доступ.
 Используй согласованное короткое окно на работающем шлюзе. Сбой прямого
-CDN в предыдущих проходах останавливал приёмку до ротации. В r4 через
-VPN наблюдался `302 → 302`, а минутой позже тот же URL вернул
-`206/65536`. Это разные моменты измерения. Начни с двух отдельных
-успешных проб CDN на установленной базе. [Отчёт r4](../reports/2026-11-21T003445Z_selective-route-status-r4.md)
+CDN в предыдущих проходах останавливал приёмку до ротации. Последняя
+проверка базы завершилась после первого TLS-таймаута. На базе
+`3a00777` контроль `control=pass` относится к первому адресу пары,
+то есть к странице YouTube через VPN. Для CDN есть отдельная проба
+`206/65536` до включения Selective. В этом проходе после первого
+таймаута ждём один штатный повтор watchdog. [Отчёт о проверке базы](../reports/2026-11-21T062220Z_selective-direct-preflight.md)
 
 ## 1. База, тест помощника и таймер
 
-В обычном чистом Bash выполни **§1 и первый блок §2 до таймера**
+В обычном чистом Bash выполни **§1**
 [MEDIA-PROOF r2](MEDIA-PROOF-2026-11-20-R2.md). Нужны сверка 11 файлов,
-off/off, рабочий VPN, `VPN_BASELINE_CAPTURED` и приватный `VPN_FORMAT`.
-Продолжай в том же Bash с `umask 077` и работающим `run` из §1.
+off/off и рабочий VPN. Продолжай в том же Bash с `umask 077` и
+работающим `run` из §1.
 
 ```bash
 CANDIDATE=39421a6f1f4e941ea774e43a00ff1d0b74e3c0d5
-TRIAL_CODE=4c9379e964ee63c17a2731d82ad84aa9d2a8ee24
+TRIAL_CODE=f79eec88370ae273abca7d36d684dc967b870a5f
 SRC="$D/route-trial"
 OVERLAY=--selective-route-status
 UNIT=xgw-selective-route-status-rollback
@@ -36,14 +38,71 @@ xgw_trial_source() {
 }
 if run trial-source xgw_trial_source &&
    run trial-helper-unit env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -m pytest \
-       -o addopts='' -p no:cacheprovider -q "$SRC/tests/test_selective_admission.py"; then
+       -o addopts='' -p no:cacheprovider -q "$SRC/tests/test_selective_admission.py" \
+       "$SRC/tests/test_selective_probe_watch.py"; then
   echo TRIAL_TOOLS_READY
 else
   echo TRIAL_TOOLS_BLOCKED
 fi
 ```
 
-После `TRIAL_TOOLS_READY` выполни **второй блок §1**
+### Сохранённые окна
+
+После `TRIAL_TOOLS_READY` разберись с окнами `writer-media` и
+`flow-r2b`, пока не менялась политика. Этот короткий разбор выполняется
+даже при последующем блокере линии. Используй сохранённые пары снимков
+и JSONL плеера. Команда ищет их в приватных каталогах опытов в домашней
+папке. Она выбирает одну пару для каждого имени. При нескольких парах
+сверь окно с исходными [отчётом записи](../reports/2026-11-20T181622Z_xray-config-writes-r3.md)
+и [отчётом CDN r2](../reports/2026-11-20T124752Z_selective-cdn-update-r2.md).
+
+```bash
+xgw_replay_saved() {
+  local prefix=$1 label=$2 bounds boot pid begin end
+  bounds=$("$PY" -I - "${prefix}-route-before.json" "${prefix}-route-after.json" <<'PY'
+import json, math, sys
+from pathlib import Path
+from uuid import UUID
+a, b = (json.loads(Path(p).read_bytes()) for p in sys.argv[1:])
+boot, pid, _ = a["xray_epoch"].split(":")
+assert a["xray_epoch"] == b["xray_epoch"] and int(pid) > 0
+assert 0 < b["unix"] - a["unix"] <= 180
+print(UUID(boot).hex, int(pid), math.floor(a["unix"]), math.ceil(b["unix"]) + 1)
+PY
+  ) || return
+  read -r boot pid begin end <<<"$bounds"
+  timeout -k 2 12 sudo -n journalctl --quiet --no-pager -b "$boot" -u xgw-xray.service "_PID=$pid" \
+    --since "@$begin" --until "@$end" -n 5000 -o json \
+    --output-fields=MESSAGE,_PID,_BOOT_ID,_SYSTEMD_UNIT >"$D/$label-journal.jsonl" || return
+  [[ -s "$D/$label-journal.jsonl" ]] || return 2
+  env "PYTHONPATH=$SRC/src:$SRC" "$PY" -B -P -m docs.helpers.selective_flow_evidence \
+    --observe-applied-change --player "${prefix}-player.jsonl" \
+    --before "${prefix}-route-before.json" --after "${prefix}-route-after.json" \
+    <"$D/$label-journal.jsonl"
+}
+for label in writer-media flow-r2b; do
+  saved=$(find "$HOME" -maxdepth 3 -type f -path "*/xgw-*/$label-route-before.json" -print -quit)
+  if [[ -n $saved ]]; then
+    run "replay-$label" xgw_replay_saved "${saved%-route-before.json}" "$label"
+  else
+    result "replay-$label" NOT_AVAILABLE
+  fi
+done
+```
+
+Сообщи `REPLAY`, `state` и поле `logged_zapret2`, если оно есть.
+Положительный счётчик означает точное сопоставление сокета плеера
+с записью о принятии на выделенный outbound zapret2 в том же процессе
+Xray. Оценка всего изменившегося окна остаётся `inconclusive`.
+Нулевой счётчик означает отсутствие подтверждённых совпадений.
+Если артефакты или журнал уже недоступны, укажи ограничение.
+Сырые данные остаются в приватных каталогах.
+
+### Контроль VPN и подготовка отката
+
+Выполни первый блок §2 [MEDIA-PROOF r2](MEDIA-PROOF-2026-11-20-R2.md)
+до таймера. Для живой части нужны `VPN_BASELINE_CAPTURED` и приватный
+`VPN_FORMAT`. Затем выполни **второй блок §1**
 [ТЗ записи Xray](XRAY-CONFIG-WRITES-2026-11-20.md). При
 `DEFINE_WRITE_TRACE_ONLY=1` он определяет функции установки и
 восстановления. Для точного SHA `39421a6` засчитывается подтверждённый
@@ -70,7 +129,7 @@ xgw_trial_live() {
 }
 xgw_trial_panel() {
   xgw_trial_live &&
-    env "PYTHONPATH=$SRC/src:$SRC" timeout -k 3 270 "$PY" -B -P \
+    env "PYTHONPATH=$SRC/src:$SRC" timeout -k 3 440 "$PY" -B -P \
       -m docs.helpers.selective_admission "$@"
 }
 xgw_route_snapshot() {
@@ -93,19 +152,22 @@ xgw_wait_off() {
 }
 ```
 
-## 2. Две прямые пробы на установленной базе
+## 2. Прямые пробы на установленной базе
 
 После `TRIAL_GUARDED` запусти блок. Настройки временно используют
 60 секунд между проверками. Помощник засчитывает только разные штампы
 успешных проб после включения Selective, по 206 и 65536 байт на одном
-URL. Клиентское правило дополнительно сверяется в применённом Xray.
+URL. Первый CDN TLS-таймаут позволяет дождаться одного штатного
+повтора в том же режиме. Счётчик успешных проб после таймаута начинается
+заново. Повторный TLS-таймаут или истечение 360 секунд завершают проверку.
+Клиентское правило дополнительно сверяется в применённом Xray.
 Записи receipt приватные и используются при возврате off.
 
 ```bash
 INSTALL_OK=0
 if xgw_trial_live &&
    run base-admission xgw_trial_panel admit "$D/base-receipt" \
-       --format "$VPN_FORMAT" --checks 2 --timeout 180 &&
+       --format "$VPN_FORMAT" --checks 2 --recover-cdn-once --timeout 360 &&
    run base-rule xgw_route_snapshot base-ready &&
    run base-rule-check xgw_check_direct_rule base-ready &&
    run base-off xgw_trial_panel off "$D/base-receipt" &&
@@ -120,7 +182,7 @@ else
 fi
 ```
 
-Если база дала таймаут, fallback или недостаточно подтверждений,
+Если база завершила окно с fallback или недостаточно подтверждений,
 отметь `BASE_DIRECT=UNSTABLE` с причиной и перейди к §4.
 Укажи, успел ли запускаться `write-install`. При недоступности панели
 или ошибке установки зафиксируй соответствующий блокер.
@@ -191,9 +253,9 @@ fi
 установки он также возвращает файлы оверлея. Подтверди SHA настроек,
 6/6 файлов базы, off/off, остановленные воркеры, таймер и обычный VPN.
 
-Включи `BASE_DIRECT`, число свежих проб и их интервалы, `INSTALL`,
+Включи `REPLAY`, `BASE_DIRECT`, число свежих проб и их интервалы, `INSTALL`,
 `ADMISSION`, `STATUS`, `LIVE_PLAY`, `FLOW`, `RESTORE`. Публикуй
 обезличенную сводку при любом исходе по §3
 [ТЗ пересчёта](MEDIA-COUNTERS-2026-11-20.md) одним коммитом с суффиксом
-`_selective-direct-preflight.md` в `integration/zapret2-batch1`.
+`_selective-recovery-replay.md` в `integration/zapret2-batch1`.
 Проверь наличие коммита в удалённой ветке и верни ссылку.
