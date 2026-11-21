@@ -7,7 +7,10 @@ umask 077
 [[ $# == 1 && $1 =~ ^[0-9a-f]{40}$ ]]
 CODE=$1
 BASE=08d31ee93963bb00acb7a2275e7a554efcfb0f05
-CLI_BASE=ad81542b57b3dd765ed9c115b356c9dd306aae2b
+declare -A BASELINES=(
+  [src/xgw/cli.py]=ad81542b57b3dd765ed9c115b356c9dd306aae2b
+  [src/xgw/desync/client.py]=3a00777c21ed017760cb7bfd0bb24478fc1f48ad
+)
 PROVEN=b614174b0dfc550c95bbabfc7f6c2a2b556a4f8d
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -230,8 +233,7 @@ listed=$(overlay paths)
 mapfile -t files <<< "$listed"
 git -C "$REPO" archive "$CODE" "${files[@]}" | extract_stage "$STAGE/code"
 for file in "${files[@]}"; do
-  revision=$BASE
-  if [[ $file == src/xgw/cli.py ]]; then revision=$CLI_BASE; fi
+  revision=${BASELINES[$file]:-$BASE}
   if git -C "$REPO" cat-file -e "$revision:$file"; then
     git -C "$REPO" archive "$revision" "$file" | extract_stage "$STAGE/base"
   fi
