@@ -87,4 +87,4 @@
 4. Мелочь: время до первого состояния после рестарта (candidate-ready)
    укладывалось в цикл повторов без ручного вмешательства — пауза
    между stop и start через atomic-замену файлов достаточна.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `b096cd04b21d829d19f773e8a5de6b4107bd8c4f` (2026-11-21T173731Z_panel-read-installed-r2.md).
