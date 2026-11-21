@@ -17,16 +17,18 @@ DISPATCHER = Path("/opt/xgw/lib/xgw/gui/app.py")
 FILES = ("vpn_ui/main_xgw.py", "vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/panels.py",
          "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/window.py")
 CATALOG_REFRESH = ("vpn_ui/xgw/catalog.py", "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/panels.py")
+MAP_REFRESH = ("vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/window.py", "src/xgw/gui/client.py")
 
 
-def delivery(payload, catalog_refresh=False):
+def delivery(payload, catalog_refresh=False, *, map_refresh=False):
     rows = []
-    for name in CATALOG_REFRESH if catalog_refresh else FILES:
+    files = MAP_REFRESH if map_refresh else CATALOG_REFRESH if catalog_refresh else FILES
+    for name in files:
         before, after = (payload / kind / name for kind in ("before", "after"))
         trusted(before)
         trusted(after)
         rows.append((RELEASE / name, before.read_bytes(), after.read_bytes()))
-    if catalog_refresh:
+    if catalog_refresh or map_refresh:
         return rows
     saved = Path("/var/lib/xgw/gui-install") / BASE / "patched.py"
     trusted(saved)
@@ -38,7 +40,12 @@ def delivery(payload, catalog_refresh=False):
     return rows
 
 
-def switch(rows, action):
+def switch(rows, action, *, marker=None):
+    if marker is not None:
+        trusted(marker)
+        if action == "rollback" and not marker.exists():
+            print("MAP_APPLY_NOT_STARTED")
+            return
     changes = []
     for target, before, after in rows:
         trusted(target)
@@ -53,6 +60,10 @@ def switch(rows, action):
     if action == "check":
         print("READY", "changed files:", len(changes))
         return
+    if marker is not None and action == "apply" and not marker.exists():
+        if len(changes) != len(rows):
+            raise ValueError("map_baseline_not_complete")
+        atomic(marker, b"1\n", mode=0o600)
     applied = []
     try:
         for row in changes:
@@ -69,13 +80,17 @@ def switch(rows, action):
             if target.read_bytes() == wanted:
                 atomic(target, current, mode, gid)
         raise
+    if marker is not None and action == "rollback":
+        marker.unlink()
     print("RESTORED" if action == "rollback" else "INSTALLED")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "apply", "rollback"))
-    parser.add_argument("--catalog-refresh", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--catalog-refresh", action="store_true")
+    modes.add_argument("--map-refresh", action="store_true")
     args = parser.parse_args()
     payload = Path(__file__).parent
     trusted(payload)
@@ -86,7 +101,9 @@ def main():
     fd = os.open(RELEASE, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        switch(delivery(payload, args.catalog_refresh), args.action)
+        rows = delivery(payload, args.catalog_refresh, map_refresh=args.map_refresh)
+        marker = payload / "map-apply.started" if args.map_refresh else None
+        switch(rows, args.action, marker=marker)
     finally:
         os.close(fd)
 
