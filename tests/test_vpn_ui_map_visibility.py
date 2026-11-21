@@ -14,7 +14,7 @@ from vpn_ui.qt import QtCore, QtWidgets  # noqa: E402
 from vpn_ui.views.map_canvas_view import MapCanvasView  # noqa: E402
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 def app():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 

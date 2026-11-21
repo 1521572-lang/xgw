@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,8 @@ def confirmed_country(state):
     return str(row.get("endpoint_country") or "").upper()
 
 
-def check(work):
+@contextlib.contextmanager
+def desktop_window(work):
     session = model.load_session(model.session_file())
     if session is None:
         raise ValueError("no_desktop_session")
@@ -60,12 +62,22 @@ def check(work):
     bridge = XgwBridge(client)
     window = XgwWindow(bridge, flow, work / "gui-session.json", theme_name="dark")
     window.setWindowTitle("XGW · проверка карты")
-    canvas = window.map
-    stopped = QtCore.QAbstractAnimation.State.Stopped
     try:
         window.show()
         client.start()
         wait(app, lambda: bridge.received and not bridge.stale, "no_fresh_state", seconds=35)
+        yield app, window
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def check(work):
+    with desktop_window(work) as (app, window):
+        bridge = window.bridge
+        client = bridge.client
+        canvas = window.map
+        stopped = QtCore.QAbstractAnimation.State.Stopped
         wait(app, lambda: bool(canvas.focus_code and canvas._pulse.isActive()),
              "no_confirmed_active_country", seconds=18)
         if canvas.focus_code != confirmed_country(bridge.state):
@@ -103,9 +115,6 @@ def check(work):
         if client.writes:
             raise ValueError("write_attempt")
         print("MAP_HIDE_SHOW_OK POST_0", flush=True)
-    finally:
-        window.close()
-        app.processEvents()
 
 
 if __name__ == "__main__":
