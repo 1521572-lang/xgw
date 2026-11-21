@@ -72,4 +72,4 @@
 3. Отказ отработан штатно: prepare останавливается на первом
    несовпадении, ловушка возвращает stage, шлюз не затронут —
    контракт «NOT_RUN при baseline_mismatch» соблюдён.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `ac43e19e81f877bcb40fbce01daff26918a1024b` (2026-11-21T175259Z_panel-read-summary.md).
