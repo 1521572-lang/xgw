@@ -13,7 +13,7 @@ PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 [[ $TEST_PY == /* && -x $TEST_PY ]]
 REPO=$(git rev-parse --show-toplevel)
-WORK=$(mktemp -d "$HOME/xgw-panel-read-http.XXXXXXXX")
+WORK=$(mktemp -d "$HOME/xgw-panel-read-sandbox.XXXXXXXX")
 SRC="$WORK/source"
 TOOLS=
 BASELINE=no
@@ -55,10 +55,20 @@ print(port)') || return
   printf 'HTTPS 200\n'
 }
 
+stop_transient() {
+  local unit="${TOOLS##*/}.service" state
+  state=$(sudo -n systemctl show "$unit" --property=ActiveState --value) || return
+  if [[ $state != inactive && $state != failed ]]; then
+    sudo -n timeout -k 2 8 systemctl stop "$unit" || return
+    state=$(sudo -n systemctl show "$unit" --property=ActiveState --value) || return
+  fi
+  [[ $state == inactive || $state == failed ]]
+}
+
 finish() {
   local rc=$?
   if [[ -n $TOOLS ]]; then
-    if [[ $TOOLS =~ ^/tmp/xgw-panel-ipc\.[A-Za-z0-9]{8}$ ]] &&
+    if [[ $TOOLS =~ ^/run/xgw-panel-sandbox\.[A-Za-z0-9]{8}$ ]] && stop_transient &&
        sudo -n rm -r -- "$TOOLS" && sudo -n test ! -e "$TOOLS"; then
       printf 'TOOLS_REMOVED\n'
     else
@@ -104,13 +114,14 @@ test_rc=0
 ) | tee "$WORK/tests.out" || test_rc=$?
 printf 'CONTRACT_TESTS_RC %s\n' "$test_rc"
 
-TOOLS=$(sudo -n mktemp -d /tmp/xgw-panel-ipc.XXXXXXXX)
-[[ $TOOLS =~ ^/tmp/xgw-panel-ipc\.[A-Za-z0-9]{8}$ ]]
-git -C "$REPO" archive --format=tar "$CODE" src/xgw docs/helpers/panel_ipc_lab.py |
+TOOLS=$(sudo -n mktemp -d /run/xgw-panel-sandbox.XXXXXXXX)
+[[ $TOOLS =~ ^/run/xgw-panel-sandbox\.[A-Za-z0-9]{8}$ ]]
+git -C "$REPO" archive --format=tar "$CODE" src/xgw docs/helpers/panel_ipc_lab.py \
+  packaging/panel-read-hardening.conf |
   sudo -n tar --no-same-owner --no-same-permissions -xf - -C "$TOOLS"
 sudo -n chmod 0711 "$TOOLS"
-sudo -n chmod -R a+rX -- "$TOOLS/src" "$TOOLS/docs"
-sudo -n timeout -k 3 45 "$PY" -I -B "$TOOLS/docs/helpers/panel_ipc_lab.py" --http |
+sudo -n chmod -R a+rX -- "$TOOLS/src" "$TOOLS/docs" "$TOOLS/packaging"
+sudo -n timeout -k 3 55 "$PY" -I -B "$TOOLS/docs/helpers/panel_ipc_lab.py" --http-sandbox |
   tee "$WORK/isolated-http.out"
 "$PY" -I - "$WORK/before/status" "$WORK/isolated-http.out" <<'PYTHON'
 import json

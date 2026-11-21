@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import http.client
 import json
 import os
@@ -79,15 +80,21 @@ def wait_for_listener(path):
     raise ValueError("socket_startup")
 
 
-def check_process(pid, identity):
+def check_process(pid, identity, *, sandbox):
     fields = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines())
     check(fields["Uid"].split() == [str(identity.pw_uid)] * 4, "http_uid")
-    check(fields["Gid"].split() == [str(identity.pw_gid)] * 4 and not fields["Groups"].strip(),
+    groups = {int(gid) for gid in fields["Groups"].split()}
+    allowed_groups = {identity.pw_gid} if sandbox else set()
+    check(fields["Gid"].split() == [str(identity.pw_gid)] * 4 and groups <= allowed_groups,
           "http_groups")
     caps = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
     check(all(int(fields[key], 16) == 0 for key in caps), "http_caps")
     check(fields["NoNewPrivs"].strip() == "1", "http_no_new_privs")
     print("http_privileges OK", flush=True)
+    if sandbox:
+        check(not os.path.samefile(f"/proc/{pid}/ns/mnt", "/proc/self/ns/mnt"),
+              "http_mount_namespace")
+        print("http_mount_namespace OK", flush=True)
 
 
 def http_request(port, route, *, token=None, method="GET", headers=()):
@@ -110,47 +117,111 @@ def http_request(port, route, *, token=None, method="GET", headers=()):
         connection.close()
 
 
-def exercise_http(path, identity, unavailable, reads):
-    prefix = [
+def plain_python(identity):
+    return [
         "/usr/bin/setpriv", "--reuid", str(identity.pw_uid), "--regid", str(identity.pw_gid),
         "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all",
         "--no-new-privs", sys.executable, "-I", "-B",
     ]
-    env = {"PATH": "/usr/bin:/bin"}
-    paths = Paths(Path("/"))
-    check(paths.panel_token_file.is_file(), "panel_token_file_missing")
+
+
+def file_readability(prefix, files):
     trial = subprocess.run(
         [*prefix, "-c", "import json, os, sys; "
-         "print(json.dumps([os.access(path, os.R_OK) for path in sys.argv[1:]]))",
-         str(paths.panel_token_file), str(paths.config_file), str(paths.status_file)],
-        cwd="/", env=env, capture_output=True, timeout=5,
+         "print(json.dumps([os.access(path, os.R_OK) for path in sys.argv[1:]]))", *map(str, files)],
+        cwd="/", env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=5,
     )
     check(trial.returncode == 0, "http_file_access_probe")
-    token_readable, config_readable, status_readable = json.loads(trial.stdout)
+    return json.loads(trial.stdout)
+
+
+def plain_http_command(path, prefix, paths):
+    check(paths.panel_token_file.is_file(), "panel_token_file_missing")
+    token_readable, config_readable, status_readable = file_readability(
+        prefix, (paths.panel_token_file, paths.config_file, paths.status_file))
     check(token_readable is False, "http_worker_can_read_panel_token")
     print("http_panel_token_denied OK", flush=True)
     print("http_file_readability", json.dumps({"config": config_readable,
                                                "snapshot": status_readable}), flush=True)
 
-    token = secrets.token_urlsafe(32)
     source = str(Path(__file__).resolve().parents[2] / "src")
     launch = (
         "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
         "runpy.run_module('xgw.watch.panel_read_http', run_name='__main__')"
     )
-    with subprocess.Popen(
-        [*prefix, "-c", launch, source, str(path)], cwd="/", env=env,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-    ) as worker:
+    return [*prefix, "-c", launch, source, str(path)]
+
+
+def sandbox_file_check(socket_path, files):
+    for label, file in zip(("config", "snapshot", "token", "database"), files, strict=True):
+        try:
+            fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            continue
+        os.close(fd)
+        raise ValueError(f"sandbox_readable_{label}")
+    print("SANDBOX_FILES_DENIED", flush=True)
+    sys.argv = [__file__, socket_path]
+    panel_read_http.main()
+
+
+def sandbox_command(path, identity, unit, files):
+    base = path.parent.parent
+    policy = configparser.ConfigParser(interpolation=None)
+    policy.optionxform = str
+    with (base / "packaging" / "panel-read-hardening.conf").open() as stream:
+        policy.read_file(stream)
+    return [
+        "/usr/bin/systemd-run", "--quiet", "--pipe", "--collect", "--service-type=exec",
+        f"--unit={unit}", f"--property=User={identity.pw_name}",
+        f"--property=Group={identity.pw_gid}", "--property=RuntimeMaxSec=40s",
+        "--property=TimeoutStopSec=3s",
+        *(f"--property={key}={value}" for key, value in policy.items("Service")),
+        sys.executable, "-I", "-B", __file__, "--sandbox-worker", str(path), *map(str, files),
+    ]
+
+
+def show_unit(unit, prop):
+    return subprocess.check_output(["/usr/bin/systemctl", "show", "--property", prop,
+                                    "--value", unit], timeout=4, text=True).strip()
+
+
+def read_startup(worker):
+    with selectors.DefaultSelector() as poller:
+        poller.register(worker.stdout, selectors.EVENT_READ)
+        check(bool(poller.select(timeout=6)), "http_startup")
+        line = worker.stdout.readline(64)
+    check(line.endswith(b"\n"), "http_startup_output")
+    return line.rstrip(b"\n")
+
+
+def exercise_http(path, identity, unavailable, reads, *, sandbox):
+    unit = f"{path.parent.parent.name}.service" if sandbox else None
+    paths = Paths(Path("/"))
+    prefix = plain_python(identity)
+    if sandbox:
+        files = (paths.config_file, paths.status_file, paths.panel_token_file, paths.db_file)
+        check(all(file.is_file() for file in files), "sandbox_host_files_missing")
+        snapshot_readable, = file_readability(prefix, (paths.status_file,))
+        print("http_unsandboxed_snapshot", json.dumps(snapshot_readable), flush=True)
+        command = sandbox_command(path, identity, unit, files)
+    else:
+        command = plain_http_command(path, prefix, paths)
+
+    token = secrets.token_urlsafe(32)
+    with subprocess.Popen(command, cwd="/", env={"PATH": "/usr/bin:/bin"}, bufsize=0,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as worker:
         try:
             worker.stdin.write(f"{token}\n".encode("ascii"))
             worker.stdin.close()
-            with selectors.DefaultSelector() as poller:
-                poller.register(worker.stdout, selectors.EVENT_READ)
-                check(bool(poller.select(timeout=5)), "http_startup")
-            port = int(worker.stdout.readline(8))
+            if sandbox:
+                check(read_startup(worker) == b"SANDBOX_FILES_DENIED", "http_sandbox_files")
+                print("http_sandbox_files_denied OK", flush=True)
+            port = int(read_startup(worker))
             check(0 < port < 65536, "http_port")
-            check_process(worker.pid, identity)
+            pid = int(show_unit(unit, "MainPID")) if sandbox else worker.pid
+            check(pid > 0, "http_worker_pid")
+            check_process(pid, identity, sandbox=sandbox)
             route = panel_read_http.ROUTE
             for name, expected, options in (
                 ("anonymous", 401, {}),
@@ -184,12 +255,20 @@ def exercise_http(path, identity, unavailable, reads):
                   "http_recovered")
             print("http_recovered OK", flush=True)
         finally:
-            worker.terminate()
             try:
-                worker.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                worker.kill()
-                worker.wait(timeout=3)
+                if sandbox and show_unit(unit, "ActiveState") not in ("inactive", "failed"):
+                    subprocess.run(["/usr/bin/systemctl", "stop", unit], check=True, timeout=6)
+            finally:
+                worker.terminate()
+                try:
+                    worker.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait(timeout=3)
+            if sandbox:
+                check(show_unit(unit, "ActiveState") in ("inactive", "failed"),
+                      "http_unit_still_active")
+                print("http_unit_stopped OK", flush=True)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.settimeout(1)
         try:
@@ -200,7 +279,7 @@ def exercise_http(path, identity, unavailable, reads):
             raise ValueError("http_endpoint_still_listening")
 
 
-def run(*, with_http=False):
+def run(*, with_http=False, sandbox=False):
     check(os.geteuid() == 0, "root_required")
     permitted = pwd.getpwnam("nobody")
     rejected = pwd.getpwnam("daemon")
@@ -247,7 +326,7 @@ def run(*, with_http=False):
               and info.st_uid == 0 and info.st_gid == permitted.pw_gid, "socket_permissions")
         print("socket_permissions OK", flush=True)
         if with_http:
-            exercise_http(path, permitted, unavailable, reads)
+            exercise_http(path, permitted, unavailable, reads, sandbox=sandbox)
             return
         overview_status = as_client("allowed")
         print("allowed", json.dumps(overview_status, sort_keys=True), flush=True)
@@ -277,6 +356,11 @@ if __name__ == "__main__":
             run()
         elif sys.argv[1:] == ["--http"]:
             run(with_http=True)
+        elif sys.argv[1:] == ["--http-sandbox"]:
+            run(with_http=True, sandbox=True)
+        elif len(sys.argv) == 7 and sys.argv[1] == "--sandbox-worker":
+            check(os.getuid() != 0 and os.geteuid() != 0, "unprivileged_client_required")
+            sandbox_file_check(sys.argv[2], sys.argv[3:])
         else:
             raise ValueError("arguments")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError, config.ConfigError) as exc:
