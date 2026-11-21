@@ -914,6 +914,8 @@ def test_busy_panel_port_does_not_stop_the_daemon(root, tmp_path, monkeypatch, c
         monkeypatch.setattr(cli.validate, "find_xray", lambda *args: tmp_path / "xray")
         monkeypatch.setattr(cli, "_root_problem", lambda cfg=None: "нужны права root: sudo xgw …")
         monkeypatch.setattr(cli, "_sync_panel", REAL_SYNC_PANEL)
+        logger = cli.log.get_logger("run")
+        monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
         ran: list[bool] = []
 
         class FakeDaemon(FakeDaemonLifecycle):

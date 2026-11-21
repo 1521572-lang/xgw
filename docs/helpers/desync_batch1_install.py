@@ -94,6 +94,8 @@ SELECTIVE_ROUTE_STATUS = (
     *XRAY_WRITE_TRACE, "watch/zapret2_control.py", "watch/zapret2_management.py", "zapret2.py",
 )
 SELECTIVE_ROUTE_STATUS_TIMER = "xgw-selective-route-status-rollback.timer"
+PANEL_LOGIN = ("cli.py", "install.py", "watch/panel.py", "ui/login.html", "ui/app.css")
+PANEL_LOGIN_TIMER = "xgw-panel-login-rollback.timer"
 
 
 def gui_files(files):
@@ -272,6 +274,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "panel_login", False):
+        return PANEL_LOGIN, PANEL_LOGIN_TIMER
     if getattr(args, "selective_route_status", False):
         return SELECTIVE_ROUTE_STATUS, SELECTIVE_ROUTE_STATUS_TIMER
     if getattr(args, "xray_write_trace", False):
@@ -367,6 +371,7 @@ def main():
     stage.add_argument("--selective-cdn-update", action="store_true")
     stage.add_argument("--xray-write-trace", action="store_true")
     stage.add_argument("--selective-route-status", action="store_true")
+    stage.add_argument("--panel-login", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

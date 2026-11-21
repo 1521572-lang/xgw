@@ -815,7 +815,7 @@ def test_install_opens_the_panel_in_the_browser_of_whoever_ran_sudo(box):
     assert box.install() == 0, box.text()
     text = box.text()
     assert "Панель уже открыта в браузере пользователя alice, вход выполнен" in text
-    assert "Откройте эту ссылку в браузере" not in text
+    assert "Для первого входа выполните sudo xgw panel" not in text
     assert "«Войти заново»" in text
 
     box.out.clear()
@@ -823,7 +823,7 @@ def test_install_opens_the_panel_in_the_browser_of_whoever_ran_sudo(box):
     assert box.install() == 0  # браузер — не повод считать установку неудачной
     text = box.text()
     assert "! панель в браузере не открылась: браузер пользователя alice" in text
-    assert "Откройте эту ссылку в браузере" in text
+    assert "Для первого входа выполните sudo xgw panel и откройте одноразовую ссылку" in text
 
 
 def test_foreign_launchers_survive_uninstall(box):
