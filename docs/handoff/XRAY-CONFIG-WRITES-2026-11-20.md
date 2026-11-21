@@ -79,7 +79,7 @@ write_check() {
     tests/test_selective_probe_watch.py tests/test_acceptance_gate.py || return
   if [[ $OVERLAY == --selective-route-status ]]; then
     run route-unit write_test_suite "$SRC" route-unit tests/test_zapret2_panel.py \
-      tests/test_zapret2.py || return
+      tests/test_zapret2.py tests/test_zapret2_redirect.py || return
     run route-rebuild write_test_suite "$SRC" route-rebuild tests/test_daemon.py \
       -k zapret2_tick_uses_api_and_restores_vpn_after_worker_death || return
   fi
