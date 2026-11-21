@@ -50,7 +50,7 @@ def test_headless_playback_counts_elapsed_progress_and_cache_stalls():
              "paused-for-cache": False, "cache-speed": 400000, "demuxer-cache-duration": 10}
             for i in range(123)]
     result = measure(rows, 120, 1600000)
-    assert result["ok"] and result["line"] == "OK"
+    assert result["ok"]
     assert result["cache_buffer_below_5s"] is False
     assert result["cache_read_to_bitrate_ratio"] == 2
     rows[1]["demuxer-cache-duration"] = 0.56
@@ -58,12 +58,44 @@ def test_headless_playback_counts_elapsed_progress_and_cache_stalls():
     assert result["ok"] and result["stall_seconds"] == 0
     assert result["cache_buffer_below_5s"] is True
     assert result["cache_read_to_bitrate_ratio"] == 2
+    assert result["cache_read_below_bitrate"] is False
     rows[20]["paused-for-cache"] = True
     rows[40]["paused-for-cache"] = True
     rows[80]["paused-for-cache"] = True
     result = measure(rows, 120, 1600000)
-    assert not result["ok"] and result["line"] == "THROTTLED"
+    assert not result["ok"]
     assert result["stall_seconds"] == pytest.approx(3, abs=0.01)
+
+
+def test_headless_replay_separates_short_buffer_from_playback_result(tmp_path):
+    from docs.helpers.headless_playback import replay
+
+    rows = [{"mono": i, "time-pos": 480 + i, "seeking": False, "height": 720,
+             "paused-for-cache": False, "cache-speed": 150000, "demuxer-cache-duration": 2,
+             "eligible_phase": True} for i in range(301)]
+    rows[0]["seek"] = {"from": 2, "cached_until": 6, "target": 480, "landed": 480}
+    samples = tmp_path / "player.jsonl"
+    samples.write_text("\n".join(map(json.dumps, [{"eligible_phase": False}, *rows])))
+    summary = tmp_path / "player.out"
+    previous = {"line": "THROTTLED", "samples": 301, "seek_observed": True,
+                "bitrate_bps": 800000, "cache_min_seconds": 2, "cache_read_median_Bps": 150000,
+                "acceptance": {"ok": True, "required_seconds": 300, "observed_seconds": 300,
+                               "progress_ratio": 1, "target_height_ratio": 1,
+                               "sampling_gap_seconds": 0, "stall_seconds": 0,
+                               "longest_stall_seconds": 0}}
+    summary.write_text(json.dumps(previous))
+    for path in (summary, samples):
+        path.chmod(0o600)
+    result = replay(summary, samples)
+    assert result["ok"] and result["acceptance"]["ok"]
+    assert result["cache_buffer_below_5s"] is True
+    assert result["cache_read_below_bitrate"] is False
+    assert "line" not in result
+
+    previous["samples"] -= 1
+    summary.write_text(json.dumps(previous))
+    result = replay(summary, samples)
+    assert not result["ok"] and result["differing_fields"] == ["samples"]
 
 
 @pytest.mark.parametrize(("end", "frozen", "paused", "expected"), [

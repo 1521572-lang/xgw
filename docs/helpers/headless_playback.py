@@ -18,12 +18,15 @@ from itertools import pairwise
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from docs.helpers.selective_media_evidence import read_log
 from docs.helpers.selective_probe_watch import parse_socket_stats
 from docs.helpers.youtube_telemetry import media_host
+from xgw.desync.experiment import private_path
 from xgw.desync.schema import youtube_cdn_expiry
 
 PROPERTIES = ("time-pos", "height", "paused-for-cache", "cache-speed", "demuxer-cache-time",
               "demuxer-cache-duration", "seeking")
+PLAYBACK_SECONDS = (120, 300, 900)
 
 
 def number(value):
@@ -133,22 +136,16 @@ def measure(rows, required, bitrate):
     quality_ratio = quality / eligible if eligible else 0
     median_rate = statistics.median(speed) if speed else None
     minimum_buffer = min(buffers) if buffers else None
-    verdict = "INSUFFICIENT_DATA"
-    if len(rows) >= 10:
-        verdict = "RATE_UNKNOWN"
-        if (stalls > 0 or (minimum_buffer is not None and minimum_buffer < 5)
-                or (bitrate and median_rate is not None and median_rate < bitrate / 8)):
-            verdict = "THROTTLED"
-        elif bitrate and median_rate is not None and minimum_buffer is not None:
-            verdict = "OK" if median_rate >= 1.5 * bitrate / 8 else "LOW_HEADROOM"
+    read_ratio = 8 * median_rate / bitrate if median_rate is not None and bitrate else None
     return {"ok": eligible >= required and progress_ratio >= 0.98 and quality_ratio >= 0.95
             and gaps <= 5 and stalls <= 0.02 * required,
             "eligible_seconds": eligible, "progress_ratio": progress_ratio,
             "target_height_ratio": quality_ratio, "sampling_gap_seconds": gaps,
             "stall_seconds": stalls, "cache_min_seconds": minimum_buffer,
             "cache_buffer_below_5s": None if minimum_buffer is None else minimum_buffer < 5,
-            "cache_read_to_bitrate_ratio": 8 * median_rate / bitrate if median_rate and bitrate else None,
-            "cache_read_median_Bps": median_rate, "bitrate_bps": bitrate, "line": verdict}
+            "cache_read_to_bitrate_ratio": read_ratio,
+            "cache_read_below_bitrate": None if read_ratio is None else read_ratio < 1,
+            "cache_read_median_Bps": median_rate, "bitrate_bps": bitrate}
 
 
 def playback_acceptance(rows, required):
@@ -195,6 +192,34 @@ def playback_acceptance(rows, required):
         "sampling_gap_seconds": gaps, "stall_seconds": stalls,
         "longest_stall_seconds": longest,
     }
+
+
+def replay(summary_path, samples_path):
+    """Recompute strict playback and cache metrics from a private recorded phase."""
+    private_path(summary_path)
+    private_path(samples_path)
+    with summary_path.open("rb") as stream:
+        raw = stream.read(16385)
+    if len(raw) > 16384:
+        raise ValueError("summary_size")
+    previous = json.loads(raw)
+    required = previous["acceptance"]["required_seconds"]
+    bitrate = previous["bitrate_bps"]
+    if (type(required) is not int or required not in PLAYBACK_SECONDS
+            or (bitrate is not None and (not number(bitrate) or bitrate <= 0))):
+        raise ValueError("summary_metrics")
+    logged = read_log(samples_path)
+    rows = [row for row in logged if row.get("eligible_phase") is True]
+    if not rows or logged[-len(rows):] != rows:
+        raise ValueError("invalid_phase")
+
+    result = measure(rows, required, bitrate)
+    result.update(acceptance=playback_acceptance(rows, required), samples=len(rows),
+                  seek_observed=rows[0].get("seek") is not None)
+    fields = ("acceptance", "samples", "seek_observed", "cache_min_seconds", "cache_read_median_Bps")
+    differing_fields = [name for name in fields if result[name] != previous[name]]
+    result.update(ok=not differing_fields, differing_fields=differing_fields)
+    return result
 
 
 def player_sockets(pid):
@@ -297,25 +322,33 @@ def capture(url, duration, output, required, seek, *, peers=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("format_json", type=Path)
+    parser.add_argument("source", type=Path, help="Format JSON for probe/play, saved summary for replay")
     commands = parser.add_subparsers(dest="action", required=True)
     burst = commands.add_parser("probe")
     burst.add_argument("--bytes", type=int, choices=(65536, 10485760), default=65536)
     burst.add_argument("--peer", type=ipaddress.IPv4Address,
                        help="Use this public IPv4 address with the original hostname and TLS")
     play = commands.add_parser("play")
-    play.add_argument("--seconds", type=int, choices=(120, 300, 900), required=True)
+    play.add_argument("--seconds", type=int, choices=PLAYBACK_SECONDS, required=True)
     play.add_argument("--seek-forward", type=int, choices=(480,))
     play.add_argument("--samples", type=Path, required=True)
     play.add_argument("--peers", action="store_true",
                       help="Record private TCP endpoints and counters for the first 180 s")
     play.add_argument("--strict", action="store_true",
                       help="Apply the complete-window playback and stall acceptance limits")
+    saved = commands.add_parser("replay", help="Recompute saved strict playback without loading media")
+    saved.add_argument("--samples", type=Path, required=True)
     args = parser.parse_args()
     try:
-        if os.name != "posix" or not shutil.which("curl" if args.action == "probe" else "mpv"):
+        if os.name != "posix":
             raise ValueError("dependencies")
-        url, duration, bitrate = read_format(args.format_json)
+        if args.action == "replay":
+            result = replay(args.source, args.samples)
+            print(json.dumps(result, allow_nan=False))
+            return 0 if result["ok"] else 2
+        if not shutil.which("curl" if args.action == "probe" else "mpv"):
+            raise ValueError("dependencies")
+        url, duration, bitrate = read_format(args.source)
         if args.action == "probe":
             if args.peer and (not args.peer.is_global or args.peer.is_multicast):
                 raise ValueError("public_ipv4_required")
@@ -334,7 +367,8 @@ def main():
                           seek_observed=seek_evidence is not None, seek=seek_evidence)
             result["ok"] = result["ok"] and outcome == "elapsed"
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
-        result = {"ok": False, "error": "invalid_format_or_runtime"}
+        result = {"ok": False, "error": ("invalid_replay" if args.action == "replay"
+                                        else "invalid_format_or_runtime")}
     print(json.dumps(result, allow_nan=False))
     return 0 if result["ok"] else 2
 
