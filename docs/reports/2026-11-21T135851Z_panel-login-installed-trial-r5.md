@@ -68,4 +68,4 @@ fresh/matched; PID Xray сохранён; HTTPS 200; таймеров нет.
 3. Для будущих ТЗ: 7-файловый оверлей с пофайловой сверкой и
    mixed-baseline (cli=ad81542) работает штатно — шаблон готов.
 4. 1 skip — штатный root-зависимый тест.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `5c2fed1fb934c43006ca18d8b5b893d32afb9f3f` (90b77c9 → 5c2fed1, ancestor verified).
