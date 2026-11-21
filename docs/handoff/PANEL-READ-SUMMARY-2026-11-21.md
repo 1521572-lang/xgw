@@ -1,4 +1,4 @@
-# ThinkCentre — короткий статус zapret2 на установленной панели
+# ThinkCentre — короткий статус zapret2 на установленной панели, r2
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет готовый сценарий и
 автоматически публикует один обезличенный отчёт при любом исходе.
@@ -9,6 +9,12 @@ GitHub запроси доступ и продолжи сама. Код подг
 за 733 мс, Qt получил пять полей, после остановки читатель
 запустился снова. Откат вернул файлы и права без смены PID Xray.
 [Отчёт P2.6 r2](../reports/2026-11-21T173731Z_panel-read-installed-r2.md)
+
+В первой попытке P2.7 прошли все 12 контрактов. Сценарий остановился
+при сверке `desync/client.py`. Flash установила побайтовое совпадение
+этого файла с `3a00777`. R2 использует подтверждённую ревизию для
+этого файла. Прежние PID XGW и Xray и HTTPS 200 подтверждены.
+[Первый отчёт P2.7](../reports/2026-11-21T175259Z_panel-read-summary.md)
 
 В P2.7 короткий запрос использует ограниченное чтение снимка и
 те же правила оценки актуальности и ревизии, что полный обзор.
@@ -31,7 +37,7 @@ GitHub запроси доступ и продолжи сама. Код подг
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=46e9eb0d702aeab8318b02ab2d82f0f289525843
+CODE=8c32072768c298844da061f44ce0c78483755440
 REPO=$(git rev-parse --show-toplevel)
 cd "$REPO"
 git fetch origin "$BR"
@@ -45,7 +51,7 @@ BASH
 | Этап | Критерий |
 |---|---|
 | `contracts` | Пройдены два контракта отката и десять контрактов короткого чтения и CLI. Они покрывают активное и выключенное состояние, истечение подтверждения, устаревший и отсутствующий снимок, несовпадение ревизии, недоступность читателя при 404 и 503. |
-| `helper-modes`, `stage-modes`, `prepare`, `timer-active` | `STAGE_MODES_OK` дважды, `BASELINE_MATCH 17`, таймер активен до замены. Дополнительный исходный файл `desync/client.py` сверяется с `08d31ee`. Если он отличается, зафиксируй `baseline_mismatch` и `NOT_RUN`. |
+| `helper-modes`, `stage-modes`, `prepare`, `timer-active` | `STAGE_MODES_OK` дважды, `BASELINE_MATCH 17`, таймер активен до замены. `desync/client.py` сверяется с `3a00777`, `cli.py` с `ad81542`, остальные файлы с `08d31ee`. При `baseline_mismatch` запиши имена из вывода и вердикт `NOT_RUN`. |
 | `ONE_TIME_CLI_OK`, `READER_DORMANT_OK`, `INSTALLED_STATUS_MATCH`, `READER_RUN_READONLY_OK` | Одноразовый вход прошёл, читатель активировался первым авторизованным запросом, пять полей равны полному обзору, `/run` только для чтения. Запиши `cold_ms` как замер активации. |
 | `candidate-session`, `candidate-cli-summary`, `candidate-qt` | Обычный CLI и HTTP дают тот же снимок. Новый `status --summary` возвращает ровно пять полей и `CLI_SUMMARY_OK`. Запиши `QT_NETWORK_OK` или `QT_NOT_AVAILABLE`. |
 | `INSTALLED_READER_RECOVERED_OK` | Остановка читателя дала 503 на коротком маршруте и 200 на полном обзоре. После запуска получен 200 с прежними полями, новым PID читателя и прежним PID XGW. |
@@ -74,12 +80,12 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-read-summary.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-read-summary-r2.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre compact zapret2 status acceptance'
+git commit -m 'Report ThinkCentre compact zapret2 status acceptance r2'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
