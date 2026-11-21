@@ -102,4 +102,4 @@ LIVE_PLAY=NOT_RUN, FLOW=NOT_RUN.
    выполнить до сбоя (он не требует root), живая часть продолжена тем
    же окружением после восстановления доступа. Политика в паузе не
    менялась (машина off/off, таймеров не было).
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `ae112717e1fc89e4b504e4f259ab737940b6d80b` (75a15fd → ae11271, ancestor verified).
