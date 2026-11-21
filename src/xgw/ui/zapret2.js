@@ -38,6 +38,7 @@ let busy = false;
 let draftKey = null;
 let openingSettings = false;
 let generation = 0;
+let refreshAfterReply = false;
 
 function controls() {
   const usable = online && !busy && !needsLogin && !openingSettings && latest;
@@ -431,6 +432,8 @@ async function refresh() {
   } finally {
     clearTimeout(timeout);
     pending = null;
+    const repeat = refreshAfterReply || started !== generation;
+    refreshAfterReply = false;
     const open = openingSettings;
     openingSettings = false;
     controls();
@@ -440,7 +443,7 @@ async function refresh() {
         : "Не удалось загрузить настройки. Повторите после восстановления связи.");
     }
     if (!document.hidden && !needsLogin && !busy) {
-      timer = setTimeout(refresh, started === generation ? 4000 * 2 ** failures : 0);
+      timer = setTimeout(refresh, repeat ? 0 : 4000 * 2 ** failures);
     }
   }
 }
@@ -472,4 +475,9 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", refresh);
 window.addEventListener("pageshow", refresh);
+window.addEventListener("online", () => {
+  if (document.hidden || needsLogin || busy) return;
+  if (pending) refreshAfterReply = true;
+  else refresh();
+});
 refresh();
