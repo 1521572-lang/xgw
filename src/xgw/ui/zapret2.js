@@ -25,6 +25,7 @@ const number = new Intl.NumberFormat("ru");
 const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medium"});
 const mebibytes = new Intl.NumberFormat("ru", {maximumFractionDigits: 2});
 const el = id => document.getElementById(id);
+const retryOverview = el("retry-overview");
 const put = (id, value) => { el(id).textContent = value ?? "—"; };
 const count = value => Number.isSafeInteger(value) && value >= 0 ? number.format(value) : "Нет данных";
 let epoch = null;
@@ -60,6 +61,10 @@ function controls() {
   el("settings-fields").disabled = busy;
   el("settings-form").querySelector('[type="submit"]').disabled = !usable || !latest.can_edit;
   el("reload-settings").disabled = busy || needsLogin || Boolean(pending);
+  if (retryOverview) {
+    retryOverview.hidden = online || needsLogin || failures === 0;
+    retryOverview.disabled = document.hidden || busy || Boolean(pending);
+  }
 }
 
 function jobWinner(job) {
@@ -479,5 +484,8 @@ window.addEventListener("online", () => {
   if (document.hidden || needsLogin || busy) return;
   if (pending) refreshAfterReply = true;
   else refresh();
+});
+retryOverview?.addEventListener("click", () => {
+  if (!retryOverview.hidden) refresh();
 });
 refresh();

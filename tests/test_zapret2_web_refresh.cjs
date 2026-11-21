@@ -10,14 +10,19 @@ const source = fs.readFileSync(path.join(__dirname, "../src/xgw/ui/zapret2.js"),
 
 function page() {
   const listeners = new Map();
+  const button = {
+    addEventListener: (event, callback) => listeners.set(event, callback),
+  };
   const element = {
     addEventListener() {},
     querySelector() { return this; },
+    dataset: {},
+    replaceChildren() {},
   };
   const document = {
     hidden: false,
     documentElement: {dataset: {}},
-    getElementById: () => element,
+    getElementById: id => id === "retry-overview" ? button : element,
     querySelectorAll: () => [],
     addEventListener: (event, callback) => listeners.set(event, callback),
   };
@@ -43,10 +48,10 @@ function page() {
     clearTimeout: id => timers.delete(id),
   });
   vm.runInContext(source, context);
-  vm.runInContext("render = () => { online = true; }; unavailable = () => { online = false; };",
-    context);
+  vm.runInContext("render = () => { online = true; controls(); };", context);
   return {
     requests,
+    button,
     emit: event => listeners.get(event)(),
     visibility(hidden) {
       document.hidden = hidden;
@@ -99,6 +104,37 @@ test("online leaves a hidden or unauthenticated page idle", async () => {
   browser.requests[1](401);
   await settle();
   browser.emit("online");
+  assert.equal(browser.requests.length, 2);
+  assert.deepEqual(browser.delays(), []);
+});
+
+test("retry is offered after a read failure and never starts overlapping requests", async () => {
+  const browser = page();
+  assert.equal(browser.button.hidden, true);
+  browser.requests[0](503);
+  await settle();
+  assert.equal(browser.button.hidden, false);
+  assert.equal(browser.button.disabled, false);
+  assert.deepEqual(browser.delays(), [8000]);
+  browser.emit("click");
+  browser.emit("click");
+  assert.equal(browser.button.disabled, true);
+  assert.equal(browser.requests.length, 2);
+  browser.requests[1](200);
+  await settle();
+  assert.equal(browser.button.hidden, true);
+  assert.deepEqual(browser.delays(), [4000]);
+});
+
+test("expired login hides retry and stops polling", async () => {
+  const browser = page();
+  browser.requests[0](503);
+  await settle();
+  browser.emit("click");
+  browser.requests[1](401);
+  await settle();
+  assert.equal(browser.button.hidden, true);
+  browser.emit("click");
   assert.equal(browser.requests.length, 2);
   assert.deepEqual(browser.delays(), []);
 });
