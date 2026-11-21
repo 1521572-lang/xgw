@@ -10,7 +10,7 @@ HELPER = Path(__file__).resolve().parents[1] / "docs/helpers/gui_home_install.py
 
 
 @pytest.fixture()
-def trial(tmp_path, monkeypatch):
+def prepare(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("gui_home_install", HELPER)
     install = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(install)
@@ -24,17 +24,25 @@ def trial(tmp_path, monkeypatch):
         path.chmod(mode)
 
     monkeypatch.setattr(install, "atomic", atomic)
-    for name in install.MAP_REFRESH:
-        for path, value in ((root / name, "before"), (payload / "before" / name, "before"),
-                            (payload / "after" / name, "after")):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(f"# {value}\n".encode())
-        (root / name).chmod(0o640)
-    rows = install.delivery(payload, map_refresh=True)
-    assert [target.relative_to(root).as_posix() for target, _, _ in rows] == list(
-        install.MAP_REFRESH,
-    )
-    return install, rows, payload / "map-apply.started"
+
+    def staged(mode, names):
+        for name in names:
+            for path, value in ((root / name, "before"), (payload / "before" / name, "before"),
+                                (payload / "after" / name, "after")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"# {value}\n".encode())
+            (root / name).chmod(0o640)
+        rows = install.delivery(payload, mode)
+        assert [target.relative_to(root).as_posix() for target, _, _ in rows] == list(names)
+        return install, rows, payload / f"{mode}-apply.started"
+
+    return staged
+
+
+@pytest.fixture()
+def trial(prepare):
+    return prepare("map", ("vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/window.py",
+                          "src/xgw/gui/client.py"))
 
 
 def test_map_install_and_rollback_restore_bytes_and_permissions(trial):
@@ -78,3 +86,19 @@ def test_map_timer_can_finish_rollback_after_a_partial_write_error(trial, monkey
     install.switch(rows, "rollback", marker=marker)
     assert not marker.exists()
     assert all(target.read_bytes() == before for target, before, _ in rows)
+
+
+def test_pin_refresh_modifies_only_the_sidebar_and_can_restore_it(prepare):
+    install, rows, marker = prepare("pin", ("vpn_ui/xgw/sidebar.py",))
+    target, before, after = rows[0]
+    sentinel = target.with_name("window.py")
+    sentinel.write_bytes(b"# installed map\n")
+
+    install.switch(rows, "rollback", marker=marker)
+    assert target.read_bytes() == before and not marker.exists()
+    install.switch(rows, "apply", marker=marker)
+    assert target.read_bytes() == after and marker.exists()
+    install.switch(rows, "rollback", marker=marker)
+    assert target.read_bytes() == before and not marker.exists()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert sentinel.read_bytes() == b"# installed map\n"

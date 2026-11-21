@@ -18,17 +18,18 @@ FILES = ("vpn_ui/main_xgw.py", "vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/pa
          "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/window.py")
 CATALOG_REFRESH = ("vpn_ui/xgw/catalog.py", "vpn_ui/xgw/sidebar.py", "vpn_ui/xgw/panels.py")
 MAP_REFRESH = ("vpn_ui/views/map_canvas_view.py", "vpn_ui/xgw/window.py", "src/xgw/gui/client.py")
+PIN_REFRESH = ("vpn_ui/xgw/sidebar.py",)
+DELIVERIES = {"home": FILES, "catalog": CATALOG_REFRESH, "map": MAP_REFRESH, "pin": PIN_REFRESH}
 
 
-def delivery(payload, catalog_refresh=False, *, map_refresh=False):
+def delivery(payload, mode="home"):
     rows = []
-    files = MAP_REFRESH if map_refresh else CATALOG_REFRESH if catalog_refresh else FILES
-    for name in files:
+    for name in DELIVERIES[mode]:
         before, after = (payload / kind / name for kind in ("before", "after"))
         trusted(before)
         trusted(after)
         rows.append((RELEASE / name, before.read_bytes(), after.read_bytes()))
-    if catalog_refresh or map_refresh:
+    if mode != "home":
         return rows
     saved = Path("/var/lib/xgw/gui-install") / BASE / "patched.py"
     trusted(saved)
@@ -43,8 +44,9 @@ def delivery(payload, catalog_refresh=False, *, map_refresh=False):
 def switch(rows, action, *, marker=None):
     if marker is not None:
         trusted(marker)
+        scope = marker.name.removesuffix("-apply.started")
         if action == "rollback" and not marker.exists():
-            print("MAP_APPLY_NOT_STARTED")
+            print(f"{scope.upper()}_APPLY_NOT_STARTED")
             return
     changes = []
     for target, before, after in rows:
@@ -62,7 +64,7 @@ def switch(rows, action, *, marker=None):
         return
     if marker is not None and action == "apply" and not marker.exists():
         if len(changes) != len(rows):
-            raise ValueError("map_baseline_not_complete")
+            raise ValueError(f"{scope}_baseline_not_complete")
         atomic(marker, b"1\n", mode=0o600)
     applied = []
     try:
@@ -89,8 +91,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "apply", "rollback"))
     modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--catalog-refresh", action="store_true")
-    modes.add_argument("--map-refresh", action="store_true")
+    for mode in ("catalog", "map", "pin"):
+        modes.add_argument(f"--{mode}-refresh", dest="mode", action="store_const", const=mode)
+    parser.set_defaults(mode="home")
     args = parser.parse_args()
     payload = Path(__file__).parent
     trusted(payload)
@@ -101,8 +104,8 @@ def main():
     fd = os.open(RELEASE, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        rows = delivery(payload, args.catalog_refresh, map_refresh=args.map_refresh)
-        marker = payload / "map-apply.started" if args.map_refresh else None
+        rows = delivery(payload, args.mode)
+        marker = payload / f"{args.mode}-apply.started" if args.mode in ("map", "pin") else None
         switch(rows, args.action, marker=marker)
     finally:
         os.close(fd)
