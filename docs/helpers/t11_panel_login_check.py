@@ -101,25 +101,35 @@ def login_link(port: int, token: str) -> str:
     return "/?" + urlencode(query, doseq=True)
 
 
+def session_state_ms(step: str, port: int, cookie: str, *, timeout: float) -> int:
+    started = time.monotonic()
+    status, _headers = checked_request(step, port, "/api/state", cookie=cookie, timeout=timeout)
+    elapsed = round((time.monotonic() - started) * 1000)
+    if status != 200:
+        raise FailedCheck(step, http_status=status, elapsed_ms=elapsed)
+    return elapsed
+
+
 def verify(port: int, token: str, phase: str) -> dict:
-    api = "/api/state"
     cookie = "xgw_panel=" + hmac.new(token.encode(), b"xgw-panel", hashlib.sha256).hexdigest()
     readiness = wait_for_guest_api(port)
-    require(checked_request("existing_session", port, api, cookie=cookie)[0] == 200,
-            "existing_session")
+    # Keep one cold request in flight. Repeated short requests can leave several
+    # concurrent state builds running on the server after the client has timed out.
+    first_state_ms = session_state_ms("existing_session", port, cookie, timeout=40)
     legacy = "/?" + urlencode({"token": token})
     code, headers = checked_request("legacy_redirect", port, legacy)
     require(code == 303 and headers.get("location") == "/", "legacy_redirect")
     if phase != "candidate":
         require(headers.get("set-cookie", "").split(";", 1)[0] == cookie, "legacy_baseline")
         return {"ok": True, "phase": phase, "http_ready": readiness,
-                "existing_session": True, "legacy_login": True}
+                "first_state_ms": first_state_ms, "existing_session": True, "legacy_login": True}
 
     require("set-cookie" not in headers and headers.get("referrer-policy") == "no-referrer",
             "legacy_issued_session")
     status, _headers = checked_request("legacy_session_redirect", port, legacy, cookie=cookie)
     require(status == 303, "legacy_session_redirect")
-    status, _headers = checked_request("legacy_session_retained", port, api, cookie=cookie)
+    status, _headers = checked_request("legacy_session_retained", port, "/api/zapret2/overview",
+                                      cookie=cookie)
     require(status == 200, "legacy_session_retained")
     fresh_link = login_link(port, token)
     status, _headers = checked_request("foreign_host", port, fresh_link,
@@ -140,7 +150,9 @@ def verify(port: int, token: str, phase: str) -> dict:
     status, _headers = checked_request("foreign_origin", port, inert, method="POST", cookie=cookie,
                                        headers={"Origin": "http://unrelated.invalid"})
     require(status == 403, "foreign_origin")
+    after_login = session_state_ms("state_after_login", port, issued.split(";", 1)[0], timeout=10)
     return {"ok": True, "phase": phase, "http_ready": readiness,
+            "first_state_ms": first_state_ms, "state_after_login_ms": after_login,
             "existing_session": True, "legacy_login": False,
             "one_time_cli": True, "reused_code": 403, "foreign_host": 403, "foreign_origin": 403}
 

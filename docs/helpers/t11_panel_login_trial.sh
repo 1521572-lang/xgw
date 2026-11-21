@@ -12,6 +12,7 @@ BASE=08d31ee93963bb00acb7a2275e7a554efcfb0f05
 CLI_BASE=ad81542b57b3dd765ed9c115b356c9dd306aae2b
 PY=/usr/bin/python3
 UNIT=xgw-panel-login-rollback
+CANDIDATE_SINCE=
 PACKAGE=$(realpath -e /opt/xgw/lib/xgw) || exit 2
 D=$(mktemp -d "$HOME/xgw-panel-login-trial.XXXXXXXX") || exit 2
 printf 'Private run: %s\n' "$D"
@@ -105,11 +106,15 @@ stage() {
   HELPER="$PAYLOAD/code/docs/helpers/desync_batch1_install.py"
   CHECK="$PAYLOAD/code/docs/helpers/t11_panel_login_check.py"
 }
-auth() { timeout -k 3 95 sudo -n "$PY" -I -B "$CHECK" "$1"; }
+auth() { timeout -k 3 145 sudo -n "$PY" -I -B "$CHECK" "$1"; }
 overlay() { sudo -n "$PY" -I -B "$HELPER" "$1" --panel-login --backup "$BACKUP" "${@:2}"; }
 
 finish() {
   local rc=$?
+  if [[ -n $CANDIDATE_SINCE ]]; then
+    run candidate-timings timeout -k 2 12 sudo -n journalctl --no-pager -u xgw.service \
+      --since "@$CANDIDATE_SINCE" --grep 'panel_state_timing ' -n 30 -o cat
+  fi
   if run rollback overlay rollback &&
      run restored-files package_matches baseline &&
      run restored-service systemctl is-active --quiet xgw.service; then
@@ -147,6 +152,7 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 run timer-active systemctl is-active --quiet "$UNIT.timer" &&
+  CANDIDATE_SINCE=$(date +%s) &&
   run apply overlay apply && run candidate-files package_matches candidate &&
   run candidate-status wait_status && run candidate-auth auth candidate &&
   run candidate-https https_control && run candidate-settings settings &&

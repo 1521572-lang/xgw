@@ -5,6 +5,7 @@ import http.client
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import fakexray
 import links
@@ -450,6 +451,31 @@ def test_zapret2_new_actions_keep_auth_and_origin_boundary(rig, user, action):
     response, body = user.request("POST", path, body={}, headers={"X-XGW-Panel": "1"})
     assert response.status == 200
     assert not json.loads(body)["ok"]
+
+
+def test_slow_state_logs_only_stage_durations_and_limits_frequency(rig, monkeypatch):
+    elapsed = 10.0
+    monkeypatch.setattr(panel_module, "time", SimpleNamespace(
+        monotonic=lambda: elapsed, time=time.time,
+    ))
+    messages = []
+    monkeypatch.setattr(rig.panel.log, "warning", lambda msg, *args: messages.append(msg % args))
+    original = rig.panel._tailscale_card
+
+    def slow_tailscale():
+        nonlocal elapsed
+        result = original()
+        elapsed += 2
+        return result
+
+    monkeypatch.setattr(rig.panel, "_tailscale_card", slow_tailscale)
+    assert "tailscale" in rig.panel.state()
+    rig.panel.state()
+    logs = [msg for msg in messages if msg.startswith("panel_state_timing ")]
+    assert len(logs) == 1
+    assert "elapsed_ms=2000" in logs[0] and "tailscale_ms=2000" in logs[0]
+    assert all(field.endswith("=0") for field in logs[0].split()[2:]
+               if not field.startswith("tailscale_ms="))
 
 
 def test_state_shows_servers_by_subscription_and_no_secrets(rig, user):

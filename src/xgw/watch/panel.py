@@ -111,6 +111,8 @@ POOL_ROUTE_CLOSED = ("Пока бесплатных серверов нет, з�
 # нескольким вкладкам, и срок на чтение запроса (пятый аудит, A2; httpbound.py).
 PANEL_CONNECTIONS = 32
 PANEL_READ_DEADLINE = 20.0
+STATE_SLOW_SECONDS = 1.0
+STATE_TIMING_INTERVAL = 60.0
 SHUTDOWN_POLL = 0.1
 _ORDER = {"member": 0, "spare": 1, "waiting": 2, "disabled": 3, "skipped": 4}
 _VERDICTS = {"OK": 0, "SLOW": 1, None: 2}  # запасные: сначала пригодные к замене
@@ -289,6 +291,8 @@ class Panel:
         self.cfg = Config()
         self.daemon = None
         self._lock = threading.Lock()  # одно действие за раз
+        self._state_timing_lock = threading.Lock()
+        self._last_state_timing = float("-inf")
         # Кто действует в этом потоке, если не панель (act(origin=…)), и события действия.
         self._acting = threading.local()
         self._selecting: tuple[float, list[str]] = (0.0, [])
@@ -590,11 +594,22 @@ class Panel:
         return snapshot, xray_ok, members, spares
 
     def state(self) -> dict:
+        started = previous = time.monotonic()
+        timings: dict[str, int] = {}
+
+        def mark(stage: str) -> None:
+            nonlocal previous
+            now = time.monotonic()
+            timings[stage] = round((now - previous) * 1000)
+            previous = now
+
         cfg, now = self.cfg, time.time()
         snapshot, xray_ok, members, spares = self._core(now)
+        mark("core")
         xray = snapshot.get("xray") or {}
         capture = self._capture()
         info = capture.describe(check=False)
+        mark("capture")
         written = snapshot.get("capture") or {}
         loaded = written.get("loaded")
         # Жизненный цикл перехвата считает демон (daemon.Lifecycle): панель его только
@@ -613,6 +628,7 @@ class Panel:
         if flow.get("tag"):
             tags.add(flow["tag"])
         countries = server_geo.applied_countries(self.paths, tags) if xray_ok else {}
+        mark("geoip")
         servers, gone = self._servers(members, spares, quotas, countries=countries)
         if countries.get(flow.get("tag")):
             pool_summary = {**pool_summary, "traffic": {
@@ -652,6 +668,7 @@ class Panel:
             }
             for link in cfg.manual.links
         ]
+        mark("catalog")
 
         devices = self._devices(info)
         gateway = lan.gateway(cfg)
@@ -661,6 +678,7 @@ class Panel:
                 "SELECT ts, kind, detail FROM events ORDER BY id DESC LIMIT ?", (EVENTS,)
             )
         ]
+        mark("devices_events")
         daemon = self.daemon
         sources = [sub.name for sub in cfg.subscriptions if sub.url]
         if cfg.manual.links or any(row["source"] == MANUAL for row in servers):
@@ -757,13 +775,27 @@ class Panel:
         }
         masked = masking.mask_obj(result)
         assert isinstance(masked, dict)
+        mark("response")
         # Карточка — мимо маскирования: ссылка входа в Tailscale нужна целиком, а имя и
         # адрес шлюза в tailnet — не секреты для того, кто вошёл в панель.
         masked["tailscale"] = self._tailscale_card()
+        mark("tailscale")
         # Карточка «Телефоны» — тоже мимо маскирования: в QR — адрес и одноразовый код.
         masked["phones"] = self._phones_card()
+        mark("phones")
         masked["zapret2"] = self._zapret2_card(cfg, snapshot, info, daemon is not None, now)
         masked["zapret2"]["job"] = self.desync_jobs.public()
+        mark("zapret2")
+        elapsed = previous - started
+        if elapsed >= STATE_SLOW_SECONDS:
+            with self._state_timing_lock:
+                report = previous - self._last_state_timing >= STATE_TIMING_INTERVAL
+                if report:
+                    self._last_state_timing = previous
+            if report:
+                sections = " ".join(f"{name}_ms={ms}" for name, ms in timings.items())
+                self.log.warning("panel_state_timing elapsed_ms=%d %s",
+                                 round(elapsed * 1000), sections)
         return masked
 
     def _probe_budget(self, cfg, now=None):

@@ -73,3 +73,14 @@ def test_transport_error_during_code_exchange_is_not_retried(monkeypatch):
         check.checked_request("new_session", 8781, "/?login=single-use")
     assert caught.value.details == {"error": "RemoteDisconnected", "errno": None}
     assert calls == [8781]
+
+
+def test_cold_state_uses_one_bounded_request_and_records_wait(monkeypatch, clock):
+    def state(port, path, *, cookie, timeout):
+        assert (port, path, cookie, timeout) == (8781, "/api/state", "session", 40)
+        check.time.sleep(23)
+        return 200, {}
+
+    monkeypatch.setattr(check, "request", state)
+    assert check.session_state_ms("existing_session", 8781, "session", timeout=40) == 23000
+    assert clock() == 23
