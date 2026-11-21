@@ -18,6 +18,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from ..local_ipc import peer_uid as _peer_uid
 from . import worker
 
 VERSION = 1
@@ -34,7 +35,6 @@ POLICY_KEY = re.compile(r"[0-9a-f]{64}")
 PHASES = ("reserved", "owner_verified", "owner_unverified", "released")
 UNITS = (worker.ENGINE_UNIT, worker.SELECTED_UNIT)
 EVENT_FIELDS = ("seq", "at", "phase", "unit", "queue", "generation", "policy_key")
-UCRED = struct.Struct("iII")
 
 
 def _integer(value: object, low: int, high: int) -> bool:
@@ -110,11 +110,6 @@ def read_status(path: Path) -> object:
     if len(raw) > MAX_STATUS:
         raise ValueError("status_too_large")
     return json.loads(raw)
-
-
-def _peer_uid(connection: socket.socket) -> int:
-    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, UCRED.size)
-    return UCRED.unpack(credentials)[1]
 
 
 def _set_deadline(connection: socket.socket, deadline: float) -> None:
