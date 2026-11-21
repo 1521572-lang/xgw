@@ -1,5 +1,6 @@
 """Wire contract and local Unix-socket lifecycle for the panel overview."""
 
+import json
 import os
 import socket
 import stat
@@ -37,6 +38,37 @@ def test_overview_projects_the_public_fields_and_validates_values():
     assert panel_ipc.reply(QUERY, read) == {"version": 1, "ok": True, "status": STATUS}
     for read in (lambda: None, lambda: {"zapret2": {**STATUS, "fresh": 1}}):
         assert panel_ipc.reply(QUERY, read) == {"version": 1, "ok": False, "error": "unavailable"}
+
+
+def test_scoped_ipc_consumes_valid_tickets_and_denies_legacy_requests():
+    calls = []
+    tickets = panel_ipc.StatusTickets()
+
+    def overview():
+        calls.append(True)
+        return {"zapret2": STATUS}
+
+    def reply(ticket, operation=panel_ipc.OPERATION):
+        frame = json.dumps({"version": 2, "op": operation, "ticket": ticket}).encode()
+        return panel_ipc.reply(frame, overview, tickets=tickets)
+
+    assert panel_ipc.reply(QUERY, overview, tickets=tickets)["error"] == "unsupported_version"
+    with tickets.issue() as ticket:
+        assert reply(ticket, "zapret2.mode")["error"] == "unsupported_operation"
+        assert reply(ticket) == {"version": 2, "ok": True, "status": STATUS}
+        assert reply(ticket)["error"] == "unauthorized"
+    assert calls == [True]
+
+
+def test_scoped_tickets_expire_and_are_revoked_when_request_finishes():
+    now = 0.0
+    tickets = panel_ipc.StatusTickets(clock=lambda: now)
+    with tickets.issue() as expired:
+        now = 5.0
+        assert not tickets.consume(expired)
+    with tickets.issue() as revoked:
+        assert revoked != expired
+    assert not tickets.consume(revoked)
 
 
 @pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")

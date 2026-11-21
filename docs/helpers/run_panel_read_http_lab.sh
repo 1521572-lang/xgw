@@ -13,7 +13,7 @@ PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 [[ $TEST_PY == /* && -x $TEST_PY ]]
 REPO=$(git rev-parse --show-toplevel)
-WORK=$(mktemp -d "$HOME/xgw-panel-read-sandbox.XXXXXXXX")
+WORK=$(mktemp -d "$HOME/xgw-panel-read-session.XXXXXXXX")
 SRC="$WORK/source"
 TOOLS=
 BASELINE=no
@@ -121,7 +121,7 @@ git -C "$REPO" archive --format=tar "$CODE" src/xgw docs/helpers/panel_ipc_lab.p
   sudo -n tar --no-same-owner --no-same-permissions -xf - -C "$TOOLS"
 sudo -n chmod 0711 "$TOOLS"
 sudo -n chmod -R a+rX -- "$TOOLS/src" "$TOOLS/docs" "$TOOLS/packaging"
-sudo -n timeout -k 3 55 "$PY" -I -B "$TOOLS/docs/helpers/panel_ipc_lab.py" --http-sandbox |
+sudo -n timeout -k 3 55 "$PY" -I -B "$TOOLS/docs/helpers/panel_ipc_lab.py" --http-session |
   tee "$WORK/isolated-http.out"
 "$PY" -I - "$WORK/before/status" "$WORK/isolated-http.out" <<'PYTHON'
 import json

@@ -275,6 +275,7 @@ class Panel:
         spawn: ts.Spawn = ts.spawn,
         sys_net: Path | None = None,
         app_port: int | None = None,
+        status_reader: Callable[[], dict] | None = None,
     ) -> None:
         self.paths = paths
         self.config_path = Path(config_path)
@@ -304,6 +305,7 @@ class Panel:
         self._ts_running: frozenset[str] = frozenset()  # какие из них шли при прошлом опросе
         self.phones = Phones(paths)
         self.app_port = app_port  # None — API приложения не запускается (тесты панели)
+        self.status_reader = status_reader
         self.app_api: AppApi | None = None
         # Запись трафика устройства: кнопка в строке устройства (record.py).
         self.recorder = Recorder(paths.records_dir, on_done=self._event)
@@ -2113,6 +2115,8 @@ class Panel:
             self._tray(handler, method, url.path, host, body)
             return
         if method == "POST":
+            if self.status_reader is not None and url.path == "/api/zapret2/status":
+                raise Refused(HTTPStatus.METHOD_NOT_ALLOWED, "Маршрут доступен для чтения")
             self._post(handler, url.path, host)
             return
         if url.path in _STATIC:
@@ -2152,6 +2156,18 @@ class Panel:
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
             self._json(handler, HTTPStatus.OK, self.zapret2_overview(), body)
+        elif self.status_reader is not None and url.path == "/api/zapret2/status":
+            origins = handler.headers.get_all("Origin")
+            if (host == self._tailnet_host()
+                    or (origins is not None and origins != [f"http://{host}"])):
+                raise Refused(HTTPStatus.FORBIDDEN, "Недопустимый источник запроса")
+            if not authorized:
+                raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
+            try:
+                status = self.status_reader()
+            except (OSError, ValueError):
+                raise Refused(HTTPStatus.SERVICE_UNAVAILABLE, "Статус запаздывает") from None
+            self._json(handler, HTTPStatus.OK, {"zapret2": status}, body)
         elif url.path == "/api/state":
             if not authorized:
                 raise Refused(HTTPStatus.UNAUTHORIZED, "Нужен вход в панель")
