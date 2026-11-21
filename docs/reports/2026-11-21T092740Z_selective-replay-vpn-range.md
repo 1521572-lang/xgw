@@ -114,4 +114,4 @@ VPN жив (HTTPS-контроль 200 в начале и конце).
    namespace-пакета `docs` из cwd при `python -m pytest` без `-P`).
    Стоит либо добавить `-P` в ТЗ-блоки, либо запускать из worktree
    кандидата (так и сделано).
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `82da3f998f2fcf1a314f842de4b636ff236160b4` (906c20b → 82da3f9, ancestor verified).
