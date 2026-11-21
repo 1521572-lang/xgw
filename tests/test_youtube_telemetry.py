@@ -51,6 +51,13 @@ def test_headless_playback_counts_elapsed_progress_and_cache_stalls():
             for i in range(123)]
     result = measure(rows, 120, 1600000)
     assert result["ok"] and result["line"] == "OK"
+    assert result["cache_buffer_below_5s"] is False
+    assert result["cache_read_to_bitrate_ratio"] == 2
+    rows[1]["demuxer-cache-duration"] = 0.56
+    result = measure(rows, 120, 1600000)
+    assert result["ok"] and result["stall_seconds"] == 0
+    assert result["cache_buffer_below_5s"] is True
+    assert result["cache_read_to_bitrate_ratio"] == 2
     rows[20]["paused-for-cache"] = True
     rows[40]["paused-for-cache"] = True
     rows[80]["paused-for-cache"] = True

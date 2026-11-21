@@ -146,6 +146,8 @@ def measure(rows, required, bitrate):
             "eligible_seconds": eligible, "progress_ratio": progress_ratio,
             "target_height_ratio": quality_ratio, "sampling_gap_seconds": gaps,
             "stall_seconds": stalls, "cache_min_seconds": minimum_buffer,
+            "cache_buffer_below_5s": None if minimum_buffer is None else minimum_buffer < 5,
+            "cache_read_to_bitrate_ratio": 8 * median_rate / bitrate if median_rate and bitrate else None,
             "cache_read_median_Bps": median_rate, "bitrate_bps": bitrate, "line": verdict}
 
 
@@ -210,6 +212,7 @@ def player_sockets(pid):
 def capture(url, duration, output, required, seek, *, peers=False):
     """Return one phase. Begin timing only after playback starts or the seek lands."""
     rows, target, previous = [], None, None
+    seek_request = None
     outcome = "elapsed"
     fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as log, tempfile.TemporaryDirectory() as tmp:
@@ -249,8 +252,11 @@ def capture(url, duration, output, required, seek, *, peers=False):
                         if (number(position) and row["height"] == 720 and row["seeking"] is False
                                 and row["paused-for-cache"] is False
                                 and number(previous) and position > previous):
-                            landed = target is not None and abs(position - target) < 3
+                            landed = (seek_request is not None and abs(position - target) < 3
+                                      and position > seek_request["cached_until"])
                             if seek is None or landed:
+                                if landed:
+                                    row["seek"] = {**seek_request, "landed": position}
                                 rows.append(row)
                             elif target is None and position >= 5:
                                 cache_end = row["demuxer-cache-time"]
@@ -262,6 +268,8 @@ def capture(url, duration, output, required, seek, *, peers=False):
                                 response = player.command("seek", target, "absolute+exact")
                                 if response["error"] != "success":
                                     raise ValueError("seek_rejected")
+                                seek_request = {"from": position, "cached_until": cache_end,
+                                                "target": target}
                         previous = position
                     else:
                         rows.append(row)
@@ -321,8 +329,9 @@ def main():
             if args.strict:
                 result["acceptance"] = playback_acceptance(rows, args.seconds)
                 result["ok"] = result["acceptance"]["ok"]
+            seek_evidence = rows[0].get("seek") if rows else None
             result.update(outcome=outcome, seek_target=target, samples=len(rows),
-                          seek_observed=args.seek_forward is not None and bool(rows))
+                          seek_observed=seek_evidence is not None, seek=seek_evidence)
             result["ok"] = result["ok"] and outcome == "elapsed"
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
         result = {"ok": False, "error": "invalid_format_or_runtime"}
