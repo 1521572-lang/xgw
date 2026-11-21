@@ -33,6 +33,7 @@ class MapCanvasView(QtWidgets.QWidget):
         self._free = QtCore.QRectF()
         self._glow = theme.qcolor(tokens.STATE_GLOW[self.state.value])
         self._phase = 0.0
+        self._mapped = False
         self._renderer: QtSvg.QSvgRenderer | None = None
         self._map_cache: tuple[tuple, QtGui.QPixmap] | None = None
 
@@ -67,7 +68,7 @@ class MapCanvasView(QtWidgets.QWidget):
         self._sync_pulse()
         target = QtCore.QPointF(*self.points.get(code, DEFAULT_FOCUS))
         self._move.stop()
-        if animate and self.isVisible() and target != self._focus:
+        if animate and self._can_animate() and target != self._focus:
             self._move.setStartValue(QtCore.QPointF(self._focus))
             self._move.setEndValue(target)
             self._move.start()
@@ -81,7 +82,7 @@ class MapCanvasView(QtWidgets.QWidget):
         self.state = state
         target = theme.qcolor(tokens.STATE_GLOW[state.value])
         self._tint.stop()
-        if self.isVisible():
+        if self._can_animate():
             self._tint.setStartValue(QtGui.QColor(self._glow))
             self._tint.setEndValue(target)
             self._tint.start()
@@ -91,9 +92,12 @@ class MapCanvasView(QtWidgets.QWidget):
         self.update()
 
     # --- анимации --------------------------------------------------------------------
+    def _can_animate(self) -> bool:
+        return self._mapped and not self.window().isMinimized()
+
     def _sync_pulse(self) -> None:
         active = self.state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED)
-        if self.isVisible() and active and self.focus_code in self.points:
+        if self._can_animate() and active and self.focus_code in self.points:
             if not self._pulse.isActive():
                 self._pulse.start()
         else:
@@ -118,11 +122,16 @@ class MapCanvasView(QtWidgets.QWidget):
         self.update()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
+        self._mapped = True
         self._sync_pulse()
         super().showEvent(event)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
-        self._pulse.stop()
+        # Qt may still report isVisible() after a spontaneous hide (minimize).
+        self._mapped = False
+        self.set_focus(self.focus_code, animate=False)
+        self._tint.stop()
+        self._glow = theme.qcolor(tokens.STATE_GLOW[self.state.value])
         super().hideEvent(event)
 
     # --- геометрия -------------------------------------------------------------------

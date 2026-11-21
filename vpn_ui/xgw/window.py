@@ -125,6 +125,14 @@ class XgwWindow(MainWindow):
         self.raise_()
         self.activateWindow()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.bridge.client.set_visible(not self.isMinimized())
+
+    def hideEvent(self, event):
+        self.bridge.client.set_visible(False)
+        super().hideEvent(event)
+
     def closeEvent(self, event):
         self.tools.hide()
         self.bridge.close()
@@ -136,4 +144,4 @@ class XgwWindow(MainWindow):
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() == QtCore.QEvent.Type.WindowStateChange:
-            self.bridge.client.set_visible(not self.isMinimized())
+            self.bridge.client.set_visible(self.isVisible() and not self.isMinimized())
