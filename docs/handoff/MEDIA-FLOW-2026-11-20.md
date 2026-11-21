@@ -48,7 +48,8 @@ trace_python() {
 }
 trace_playback() {
   local label=$1 media=$2 begin until pid
-  snapshot "$label-route-before" || return
+  local take_snapshot=${XGW_SNAPSHOT_FUNCTION:-snapshot}
+  "$take_snapshot" "$label-route-before" || return
   pid=$(trace_python -c 'import json, sys
 with open(sys.argv[1]) as stream:
     print(int(json.load(stream)["xray_epoch"].split(":")[1]))' "$D/$label-route-before.json") ||
@@ -57,7 +58,7 @@ with open(sys.argv[1]) as stream:
   run "$label-player" timeout 155 env PYTHONPATH="$TRACE/src:$TRACE" "$PY" -B -P \
     -m docs.helpers.headless_playback "$media" play --seconds 120 --peers \
     --samples "$D/$label-player.jsonl" >&2
-  snapshot "$label-route-after" || return
+  "$take_snapshot" "$label-route-after" || return
   until=$(date +%s) || return
   timeout 15 sudo -n journalctl --quiet --no-pager --unit=xgw-xray.service "_PID=$pid" \
     --since "@$begin" --until "@$((until + 1))" --lines 5000 --output=json \

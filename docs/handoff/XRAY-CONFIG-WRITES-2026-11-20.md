@@ -151,7 +151,9 @@ exec 8>"$backup/write-trace-restore.lock"
 flock 8
 [[ -e "$backup/network-test-started" ]] || exit 0
 [[ ! -e "$backup/restore-completed" ]] || exit 0
-/bin/bash "$backup/restore.sh" "$1" "$2" "$backup" "$3" rollback "$4"
+mode=accept
+[[ ! -e "$backup/overlay-apply-started" ]] || mode=rollback
+/bin/bash "$backup/restore.sh" "$1" "$2" "$backup" "$3" "$mode" "$4"
 SH
   sudo -n chmod 0700 "$BACKUP/guard.sh" &&
     printf '%s\n' "$BACKUP" "$HELPER" "$PANEL" "$OVERLAY" "$UNIT" >"$D/install-location" &&
@@ -160,16 +162,18 @@ SH
     sudo -n systemctl is-active "$UNIT.timer"
 }
 install_write_trace() {
-  sudo -n touch "$BACKUP/network-test-started" &&
+  sudo -n touch "$BACKUP/network-test-started" "$BACKUP/overlay-apply-started" &&
     sudo -n "$PY" -I "$HELPER" apply "$OVERLAY" --backup "$BACKUP"
 }
-if [[ ${WRITE_GATE:-0} == 1 ]] && exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock" &&
-   run write-lock flock -n 9 && sudo -n true &&
-   run write-prepare prepare_write_trace && run write-install install_write_trace; then
-  export PYTHONPATH="$SRC/src:$SRC"
-  echo WRITE_TRACE_INSTALLED
-else
-  echo INSTALL_BLOCKED
+if [[ ${DEFINE_WRITE_TRACE_ONLY:-0} != 1 ]]; then
+  if [[ ${WRITE_GATE:-0} == 1 ]] && exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock" &&
+     run write-lock flock -n 9 && sudo -n true &&
+     run write-prepare prepare_write_trace && run write-install install_write_trace; then
+    export PYTHONPATH="$SRC/src:$SRC"
+    echo WRITE_TRACE_INSTALLED
+  else
+    echo INSTALL_BLOCKED
+  fi
 fi
 ```
 
