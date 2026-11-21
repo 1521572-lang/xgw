@@ -2,6 +2,25 @@
 # Apply and verify the accepted desktop map files without restarting the gateway.
 set -euo pipefail
 umask 077
+
+https_control() {
+  local phase=$1 code rc=0
+  code=$(curl -q -4sS --noproxy '*' --connect-timeout 4 --max-time 10 \
+    --proto '=https' --proto-redir '=https' --location --max-redirs 2 \
+    --resolve 'one.one.one.one:443:1.1.1.1' \
+    -o /dev/null -w '%{http_code}' https://one.one.one.one/) || rc=$?
+  if (( rc != 0 )) || [[ ! $code =~ ^2[0-9]{2}$ ]]; then
+    printf 'MAP_HTTPS_CONTROL_FAILED %s CURL_RC %s HTTP %s\n' "$phase" "$rc" "${code:-none}" >&2
+    return 2
+  fi
+  printf 'MAP_HTTPS_CONTROL_OK %s HTTP %s\n' "$phase" "$code"
+}
+
+if [[ $# == 1 && $1 == --check-https ]]; then
+  https_control standalone
+  exit 0
+fi
+
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 [[ $# == 1 && $1 =~ ^[0-9a-f]{40}$ && -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]]
@@ -39,9 +58,25 @@ git -C "$REPO" archive "$BASE" "$CLIENT" | tar -x -C "$D/before"
 git -C "$REPO" archive "$CODE" "${FILES[@]}" | tar -x -C "$D/after"
 git -C "$REPO" archive "$CODE" docs/helpers/gui_home_install.py \
   docs/helpers/gui_catalog_install.py docs/helpers/gui_map_visibility.py \
-  tests/test_gui_home_install.py | tar -x -C "$D"
-timeout -k 3 45 "$PY" -B -P -m pytest -p no:cacheprovider -q "$D/tests/test_gui_home_install.py"
+  docs/helpers/run_gui_map_refresh.sh tests/test_gui_home_install.py \
+  tests/test_gui_map_https.py | tar -x -C "$D"
+timeout -k 3 45 "$PY" -B -P -m pytest -p no:cacheprovider -q \
+  "$D/tests/test_gui_home_install.py" "$D/tests/test_gui_map_https.py"
 printf 'MAP_DEPLOY_CONTRACTS_OK\n'
+
+services() {
+  local unit pid
+  for unit in xgw.service xgw-xray.service; do
+    pid=$(systemctl show "$unit" -p MainPID --value) || return 2
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 2
+    printf '%s\n' "$pid"
+  done
+}
+
+before=$(services)
+https_control baseline
+sudo -n sha256sum /etc/xgw/config.toml /etc/xgw/panel.json >"$D/settings.sha256"
+
 test ! -L "$ROOT"
 if ! sudo -n test -d "$ROOT"; then
   sudo -n install -d -m 0700 "$ROOT"
@@ -62,26 +97,14 @@ overlay() {
   sudo -n /usr/bin/python3 -I -B "$P/gui_home_install.py" "$1" --map-refresh
 }
 
-services() {
-  local unit pid
-  for unit in xgw.service xgw-xray.service; do
-    pid=$(systemctl show "$unit" -p MainPID --value) || return 2
-    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 2
-    printf '%s\n' "$pid"
-  done
-}
-
 controls() {
-  [[ $(services) == "$before" ]] &&
-    sudo -n sha256sum --check --status "$D/settings.sha256" &&
-    https_control
-}
-
-https_control() {
-  local code
-  code=$(curl -q -4sS --noproxy '*' --connect-timeout 4 --max-time 10 \
-    -o /dev/null -w '%{http_code}' https://1.1.1.1/) || return 2
-  [[ $code == 200 ]]
+  if [[ $(services) != "$before" ]] ||
+     ! sudo -n sha256sum --check --status "$D/settings.sha256"; then
+    printf 'MAP_GATEWAY_BASELINE_MISMATCH %s\n' "$1" >&2
+    return 2
+  fi
+  https_control "$1" || return 2
+  printf 'MAP_GATEWAY_UNCHANGED\n'
 }
 
 installed_window() {
@@ -109,9 +132,10 @@ armed=no
 finish() {
   local rc=$?
   if [[ $armed == yes ]]; then
-    if overlay rollback && controls && [[ $(overlay check) == "READY changed files: 3" ]] &&
+    if overlay rollback && [[ $(overlay check) == "READY changed files: 3" ]] &&
        sudo -n systemctl stop "$UNIT.timer"; then
       printf 'MAP_DEPLOY_ROLLED_BACK\n'
+      controls rollback || rc=2
     else
       printf 'MAP_DEPLOY_ROLLBACK_PENDING\n' >&2
       rc=2
@@ -123,14 +147,10 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-before=$(services)
-https_control
-sudo -n sha256sum /etc/xgw/config.toml /etc/xgw/panel.json >"$D/settings.sha256"
 ready=$(overlay check)
 if [[ $ready == "READY changed files: 0" ]]; then
   installed_window
-  controls
-  printf 'MAP_GATEWAY_UNCHANGED HTTPS_200\n'
+  controls installed
   printf 'MAP_ALREADY_INSTALLED_AND_VERIFIED\n'
   exit 0
 fi
@@ -148,8 +168,7 @@ printf 'MAP_DEPLOY_ROLLBACK_ARMED\n'
 overlay apply
 [[ $(overlay check) == "READY changed files: 0" ]]
 installed_window
-controls
-printf 'MAP_GATEWAY_UNCHANGED HTTPS_200\n'
+controls installed
 sudo -n systemctl stop "$UNIT.timer"
 [[ $(overlay check) == "READY changed files: 0" ]]
 armed=no
