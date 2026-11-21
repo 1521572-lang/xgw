@@ -1,4 +1,5 @@
 """Check the VPN-only range benchmark without making network requests."""
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -38,3 +39,33 @@ def test_both_arms_cover_the_same_offsets():
     assert len(chunks) == 4
     assert chunks[0][0] == 0 and chunks[-1][-1] == 4 * bench.MIB - 1
     assert all(right - left + 1 == bench.MIB for left, right in chunks)
+
+
+def test_profile_excludes_incomplete_bins_and_includes_a_full_stall():
+    counts = {0: 5000000, 1: 1000000, 3: 500000, 4: 9000000}
+    raw = f"206\t{sum(counts.values())}\t0.3\t23.4\t1.1\tbytes 0-{bench.PROFILE_BYTES-1}/*\n"
+    measured = bench.summarize_profile(
+        bench.parse_metrics(raw, 28, 0, bench.PROFILE_BYTES - 1), counts, 23, 800000,
+    )
+    assert measured["state"] == "profiled"
+    assert measured["complete_bucket_bytes"] == [5000000, 1000000, 0, 500000]
+    assert measured["first_5s_Bps"] == 1000000
+    assert measured["late_15s_median_Bps"] == 100000
+    assert measured["late_to_bitrate"] == 1
+
+
+def test_profile_checks_body_and_metrics_from_separate_streams(monkeypatch):
+    monkeypatch.setattr(bench, "PROFILE_BYTES", 65536)
+    child = (
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "sys.stdout.buffer.write(bytes(65536))\n"
+        "sys.stderr.write('206\\t65536\\t0.01\\t0.1\\t1.1\\tbytes 0-65535/314159\\n')\n"
+    )
+    monkeypatch.setattr(
+        bench, "curl_request", lambda *args, **kwargs: ([sys.executable, "-u", "-c", child], ""),
+    )
+    measured = bench.profile("unused", 8780, 800000)
+    assert measured["state"] == "short"
+    assert measured["request"]["bytes"] == 65536
+    assert measured["late_15s_median_Bps"] is None

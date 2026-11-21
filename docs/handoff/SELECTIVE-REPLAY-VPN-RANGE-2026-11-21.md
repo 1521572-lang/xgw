@@ -52,9 +52,12 @@ xgw_python() { env "PYTHONPATH=$SRC/src:$SRC" "$PY" -B -P "$@"; }
 Выполни после `SOURCE_READY`:
 
 ```bash
-run helpers env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -m pytest -q -o addopts='' \
-  -p no:cacheprovider "$SRC/tests/test_selective_vpn_range.py" \
-  "$SRC/tests/test_selective_probe_watch.py"
+xgw_range_tests() (
+  cd "$SRC" || exit 2
+  env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest -q -o addopts='' \
+    -p no:cacheprovider tests/test_selective_vpn_range.py tests/test_selective_probe_watch.py
+)
+run helpers xgw_range_tests
 ```
 
 ## 2. Архивы и контроль журналирования
