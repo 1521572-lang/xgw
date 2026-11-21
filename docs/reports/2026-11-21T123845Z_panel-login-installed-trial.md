@@ -72,4 +72,4 @@
 3. Мелочь: ТЗ называет установку «пяти файлов панели», FILES в скрипте —
    три (`cli.py`, `install.py`, `watch/panel.py`); стоит синхронизировать
    формулировку.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `7d041628f8bf1dc4ff6db30130bca09ba2e71627` (eb44f35 → 7d04162, ancestor verified).
