@@ -66,7 +66,9 @@ def applied_countries(paths: Paths, tags: set[str]) -> dict[str, str]:
     xray = _config(paths.xray_config_file)
     if not xray:
         return {}
-    index = geodat.countries(path)
+    index = geodat.countries_if_ready(path)
+    if index is None:
+        return {}
     hosts = (xray.get("dns") or {}).get("hosts") or {}
     result = {}
     peers = None

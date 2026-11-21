@@ -2,6 +2,7 @@
 
 import ipaddress
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -71,3 +72,34 @@ def test_endpoint_country_uses_specific_public_network_and_updated_file(tmp_path
     assert geodat.country(path, "192.168.0.1") == ""
     path.write_bytes(b"\x0a\x05RU")
     assert geodat.country(path, "8.8.8.8") == ""
+
+
+def test_panel_index_build_is_shared_and_published_for_the_current_file(tmp_path, monkeypatch):
+    path = write_geoip(tmp_path / "geoip.dat", {"JP": [("8.8.8.0", 24)]})
+    release, started = Event(), Event()
+    build = geodat._build_countries
+    calls = []
+
+    def slow_build(source):
+        calls.append(source)
+        started.set()
+        assert release.wait(3)
+        return build(source)
+
+    monkeypatch.setattr(geodat, "_build_countries", slow_build)
+    try:
+        assert geodat.countries_if_ready(path) is None
+        assert started.wait(2)
+        for _ in range(4):
+            assert geodat.countries_if_ready(path) is None
+        assert calls == [path]
+    finally:
+        release.set()
+    first = geodat.countries(path)
+    assert first.lookup("8.8.8.8") == "JP"
+    assert geodat.countries_if_ready(path) is first
+    replacement = write_geoip(tmp_path / "replacement.dat", {"SE": [("8.8.8.0", 24)]})
+    replacement.replace(path)
+    assert geodat.countries_if_ready(path) is None
+    assert geodat.countries(path).lookup("8.8.8.8") == "SE"
+    assert calls == [path, path]

@@ -23,6 +23,8 @@ declare -A BASELINES=(
   [src/xgw/watch/panel.py]="$BASE"
   [src/xgw/ui/login.html]="$BASE"
   [src/xgw/ui/app.css]="$BASE"
+  [src/xgw/geodat.py]="$BASE"
+  [src/xgw/watch/server_geo.py]="$BASE"
 )
 FILES=("${!BASELINES[@]}")
 CONFIG=(/etc/xgw/config.toml /etc/xgw/panel.json /var/lib/xgw/panel-token)
@@ -107,6 +109,30 @@ stage() {
   CHECK="$PAYLOAD/code/docs/helpers/t11_panel_login_check.py"
 }
 auth() { timeout -k 3 145 sudo -n "$PY" -I -B "$CHECK" "$1"; }
+geo_state() {
+  timeout -k 3 45 env PYTHONPATH=/opt/xgw/lib "$PY" -B -P - "$1" <<'PY'
+import json
+import sys
+import time
+
+from xgw.desync.client import Client
+
+minimum = int(sys.argv[1])
+client = Client()
+deadline = time.monotonic() + 35
+attempts = 0
+while True:
+    attempts += 1
+    state = client.request("/api/state")
+    live = [row for row in state.get("servers", []) if row.get("tag")]
+    known = sum(isinstance(code := row.get("endpoint_country"), str)
+                and len(code) == 2 and code.isascii() and code.isalpha() for row in live)
+    if known >= minimum or time.monotonic() >= deadline:
+        print(json.dumps({"live_rows": len(live), "with_country": known, "attempts": attempts}))
+        sys.exit(0 if known >= minimum else 2)
+    time.sleep(2)
+PY
+}
 overlay() { sudo -n "$PY" -I -B "$HELPER" "$1" --panel-login --backup "$BACKUP" "${@:2}"; }
 
 finish() {
@@ -142,8 +168,14 @@ run status-before status && run https-before https_control &&
   run settings-before settings && run xray-before xray_pid &&
   run baseline-files package_matches baseline || exit 2
 run stage-parent sudo -n mkdir -p -- /opt/xgw/handoff /var/lib/xgw/handoff || exit 2
-run stage stage && run baseline-auth auth baseline &&
-  run prepare overlay prepare --payload "$PAYLOAD" --package "$PACKAGE" || exit 2
+run stage stage && run baseline-auth auth baseline || exit 2
+BASE_HAS_COUNTRY=0
+if run baseline-geo geo_state 0; then
+  BASE_HAS_COUNTRY=$("$PY" -I -c 'import json, sys
+with open(sys.argv[1]) as stream:
+    print(int(json.load(stream)["with_country"] > 0))' "$D/baseline-geo.out") || exit 2
+fi
+run prepare overlay prepare --payload "$PAYLOAD" --package "$PACKAGE" || exit 2
 run arm-timer sudo -n systemd-run --collect --unit="$UNIT" --on-active=20m \
   --timer-property=AccuracySec=1s \
   "$PY" -I -B "$HELPER" rollback --panel-login --backup "$BACKUP" || exit 2
@@ -158,4 +190,10 @@ run timer-active systemctl is-active --quiet "$UNIT.timer" &&
   run candidate-https https_control && run candidate-settings settings &&
   run candidate-settings-unchanged cmp -s "$D/settings-before.out" "$D/candidate-settings.out" &&
   run candidate-xray xray_pid &&
-  run candidate-xray-unchanged cmp -s "$D/xray-before.out" "$D/candidate-xray.out"
+  run candidate-xray-unchanged cmp -s "$D/xray-before.out" "$D/candidate-xray.out" || exit 2
+rc=0
+run candidate-state-budget "$PY" -I -c 'import json, sys
+with open(sys.argv[1]) as stream:
+    assert json.load(stream)["first_state_ms"] <= 5000' "$D/candidate-auth.out" || rc=2
+run candidate-geo geo_state "$BASE_HAS_COUNTRY" || rc=2
+exit "$rc"

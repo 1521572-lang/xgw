@@ -94,7 +94,8 @@ SELECTIVE_ROUTE_STATUS = (
     *XRAY_WRITE_TRACE, "watch/zapret2_control.py", "watch/zapret2_management.py", "zapret2.py",
 )
 SELECTIVE_ROUTE_STATUS_TIMER = "xgw-selective-route-status-rollback.timer"
-PANEL_LOGIN = ("cli.py", "install.py", "watch/panel.py", "ui/login.html", "ui/app.css")
+PANEL_LOGIN = ("cli.py", "install.py", "watch/panel.py", "ui/login.html", "ui/app.css",
+               "geodat.py", "watch/server_geo.py")
 PANEL_LOGIN_TIMER = "xgw-panel-login-rollback.timer"
 
 

@@ -53,12 +53,13 @@ def test_applied_country_uses_host_pins_and_never_exposes_address(tmp_path):
 
     paths = Paths(root=tmp_path)
     paths.xray_dir.mkdir(parents=True, exist_ok=True)
-    write_geoip(paths.xray_dir / "geoip-ui.dat", {"JP": [("8.8.8.0", 24)]})
+    asset = write_geoip(paths.xray_dir / "geoip-ui.dat", {"JP": [("8.8.8.0", 24)]})
     atomic_write_json(paths.xray_config_file, {
         "dns": {"hosts": {"nl-server.example": ["8.8.8.8"]}},
         "outbounds": [{"tag": "proxy-nl-a", "settings": {
             "vnext": [{"address": "nl-server.example", "users": [{"id": "secret"}]}]}}],
     })
+    geodat.countries(asset)
     assert server_geo.applied_countries(paths, {"proxy-nl-a"}) == {"proxy-nl-a": "JP"}
     paths.api_dirty_file.parent.mkdir(parents=True, exist_ok=True)
     paths.api_dirty_file.touch()

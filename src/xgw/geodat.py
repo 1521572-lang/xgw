@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Iterator
-from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 
 # Сеть короче /8 у страны не бывает: такая запись — порча файла, и в «напрямую» она увела бы
 # мимо VPN полинтернета. Пропускается.
@@ -94,16 +93,59 @@ class Countries:
 
 
 _country_lock = Lock()
+_country_refresh_lock = Lock()
+CountrySource = tuple[Path, int, int, int]
+_country_cache: tuple[CountrySource, Countries] | None = None
+_country_refresh: Thread | None = None
 
 
-def countries(path: Path) -> Countries:
-    """Открыть актуальный индекс; одновременно его строит только один поток."""
+def _country_source(path: Path) -> CountrySource | None:
     try:
         info = path.stat()
     except OSError:
-        return Countries()
+        return None
+    return path, info.st_ino, info.st_mtime_ns, info.st_size
+
+
+def _cached_countries(source: CountrySource) -> Countries | None:
+    cached = _country_cache
+    return cached[1] if cached is not None and cached[0] == source else None
+
+
+def countries(path: Path) -> Countries:
+    """Открыть актуальный индекс. Одновременно его строит только один поток."""
+    global _country_cache
     with _country_lock:
-        return _countries(path, (info.st_ino, info.st_mtime_ns, info.st_size))
+        source = _country_source(path)
+        if source is None:
+            return Countries()
+        cached = _cached_countries(source)
+        if cached is not None:
+            return cached
+        index = _build_countries(path)
+        if _country_source(path) == source:
+            _country_cache = source, index
+        return index
+
+
+def countries_if_ready(path: Path) -> Countries | None:
+    """Вернуть готовый индекс для панели или запустить его фоновую сборку."""
+    global _country_refresh
+    source = _country_source(path)
+    if source is None:
+        return None
+    cached = _cached_countries(source)
+    if cached is not None:
+        return cached
+    # The HTTP thread never takes the build lock, which may be held by the daemon.
+    with _country_refresh_lock:
+        cached = _cached_countries(source)
+        if cached is None and (_country_refresh is None or not _country_refresh.is_alive()):
+            _country_refresh = Thread(
+                target=countries, args=(path,), name="xgw-geoip", daemon=True,
+            )
+            _country_refresh.start()
+    return cached
 
 
 def country(path: Path, address: str) -> str:
@@ -116,8 +158,7 @@ def ui_asset(xray_dir: Path) -> Path:
     return preferred if preferred.is_file() else xray_dir / "geoip.dat"
 
 
-@lru_cache(maxsize=1)
-def _countries(path: Path, _stamp: tuple[int, int, int]) -> Countries:
+def _build_countries(path: Path) -> Countries:
     """Разобрать только двухбуквенные записи, отдавая приоритет более узкой сети."""
     try:
         data = memoryview(path.read_bytes())

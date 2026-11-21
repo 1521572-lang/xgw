@@ -1223,14 +1223,15 @@ def test_panel_connections_are_capped_and_a_slow_request_is_cut(tmp_path, monkey
         rig.panel.stop()
 
 
-def test_server_country_uses_applied_xray_and_singbox_addresses(rig, user):
+def test_server_country_uses_applied_xray_and_singbox_addresses(rig, user, monkeypatch):
     from test_geodat import write_geoip
 
+    from xgw import geodat
     from xgw.generator import singbox
 
     paths = rig.paths
     paths.xray_dir.mkdir(parents=True, exist_ok=True)
-    write_geoip(paths.xray_dir / "geoip.dat", {
+    asset = write_geoip(paths.xray_dir / "geoip.dat", {
         "SE": [("8.8.8.0", 24)], "PT": [("1.1.1.0", 24)], "IT": [("9.9.9.0", 24)],
     })
     hosts = {"masked.example": ["8.8.8.8", "8.8.8.9"]}
@@ -1246,6 +1247,25 @@ def test_server_country_uses_applied_xray_and_singbox_addresses(rig, user):
         {"tag": "proxy-de-bbbb", **bridge},
     ])
     atomic_write_json(paths.xray_config_file, config)
+    release, started = threading.Event(), threading.Event()
+    build = geodat._build_countries
+
+    def slow_build(source):
+        started.set()
+        assert release.wait(3)
+        return build(source)
+
+    monkeypatch.setattr(geodat, "_build_countries", slow_build)
+    try:
+        response, text = user.request("GET", "/api/state")
+        assert response.status == 200
+        assert started.wait(2)
+        cold = json.loads(text)["servers"]
+        assert {"NL-1", "DE-1"} <= {row["name"] for row in cold}
+        assert not any(row.get("endpoint_country") for row in cold)
+    finally:
+        release.set()
+    geodat.countries(asset)
     _response, text = user.request("GET", "/api/state")
     assert "masked.example" not in text and "8.8.8.8" not in text and "1.1.1.1" not in text
     assert "private-secret" not in text
@@ -1257,6 +1277,7 @@ def test_server_country_uses_applied_xray_and_singbox_addresses(rig, user):
     atomic_write_json(paths.xray_config_file, config)
     rows = {row["name"]: row for row in user.state()["servers"]}
     assert "endpoint_country" not in rows["NL-1"]
-    write_geoip(paths.xray_dir / "geoip-ui.dat", {"BE": [("1.1.1.0", 24)]})
+    preferred = write_geoip(paths.xray_dir / "geoip-ui.dat", {"BE": [("1.1.1.0", 24)]})
+    geodat.countries(preferred)
     rows = {row["name"]: row for row in user.state()["servers"]}
     assert rows["DE-1"]["endpoint_country"] == "BE"
