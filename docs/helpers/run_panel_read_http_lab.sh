@@ -13,7 +13,7 @@ PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
 [[ $TEST_PY == /* && -x $TEST_PY ]]
 REPO=$(git rev-parse --show-toplevel)
-WORK=$(mktemp -d "$HOME/xgw-panel-read-session.XXXXXXXX")
+WORK=$(mktemp -d "$HOME/xgw-panel-read-service.XXXXXXXX")
 SRC="$WORK/source"
 TOOLS=
 BASELINE=no
@@ -56,13 +56,15 @@ print(port)') || return
 }
 
 stop_transient() {
-  local unit="${TOOLS##*/}.service" state
-  state=$(sudo -n systemctl show "$unit" --property=ActiveState --value) || return
-  if [[ $state != inactive && $state != failed ]]; then
-    sudo -n timeout -k 2 8 systemctl stop "$unit" || return
+  local units="${TOOLS##*/}-reader" unit state
+  for unit in "$units.socket" "$units.service"; do
     state=$(sudo -n systemctl show "$unit" --property=ActiveState --value) || return
-  fi
-  [[ $state == inactive || $state == failed ]]
+    if [[ $state != inactive && $state != failed ]]; then
+      sudo -n timeout -k 2 8 systemctl stop "$unit" || return
+      state=$(sudo -n systemctl show "$unit" --property=ActiveState --value) || return
+    fi
+    [[ $state == inactive || $state == failed ]] || return 1
+  done
 }
 
 finish() {
@@ -107,21 +109,27 @@ printf 'BASELINE_OK\n'
 test_rc=0
 (
   cd "$SRC"
-  timeout -k 4 300 env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest \
+  timeout -k 4 600 env "PYTHONPATH=$SRC/src:$SRC" "$TEST_PY" -B -P -m pytest \
     -o addopts='' -p no:cacheprovider -q tests/test_panel_ipc.py \
     tests/test_panel_read_http.py tests/test_desync_event_socket.py \
-    tests/test_panel.py tests/test_t11_panel_login_check.py
+    tests/test_panel.py tests/test_t11_panel_login_check.py tests/test_install.py
 ) | tee "$WORK/tests.out" || test_rc=$?
 printf 'CONTRACT_TESTS_RC %s\n' "$test_rc"
 
 TOOLS=$(sudo -n mktemp -d /run/xgw-panel-sandbox.XXXXXXXX)
 [[ $TOOLS =~ ^/run/xgw-panel-sandbox\.[A-Za-z0-9]{8}$ ]]
 git -C "$REPO" archive --format=tar "$CODE" src/xgw docs/helpers/panel_ipc_lab.py \
-  packaging/panel-read-hardening.conf |
+  docs/helpers/panel_service_lab.py packaging |
   sudo -n tar --no-same-owner --no-same-permissions -xf - -C "$TOOLS"
 sudo -n chmod 0711 "$TOOLS"
 sudo -n chmod -R a+rX -- "$TOOLS/src" "$TOOLS/docs" "$TOOLS/packaging"
-sudo -n timeout -k 3 55 "$PY" -I -B "$TOOLS/docs/helpers/panel_ipc_lab.py" --http-session |
+sudo -n systemd-analyze verify "$TOOLS/packaging/xgw.service" \
+  "$TOOLS/packaging/xgw-panel-read.service" \
+  "$TOOLS/packaging/xgw-panel-read.socket"
+printf 'SERVICE_FILES_VERIFIED\n'
+sudo -n timeout -k 3 75 setpriv --groups "$(id -g daemon)" \
+  --bounding-set=-chown,-dac_override,-dac_read_search \
+  "$PY" -I -B "$TOOLS/docs/helpers/panel_service_lab.py" |
   tee "$WORK/isolated-http.out"
 "$PY" -I - "$WORK/before/status" "$WORK/isolated-http.out" <<'PYTHON'
 import json

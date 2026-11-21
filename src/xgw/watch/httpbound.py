@@ -20,11 +20,12 @@ class BoundedServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, *, slots: int, label: str, log=None) -> None:
+    def __init__(self, address, handler, *, slots: int, label: str, log=None,
+                 bind_and_activate: bool = True) -> None:
         self.label = label
         self.log = log
         self._slots = threading.BoundedSemaphore(slots)
-        super().__init__(address, handler)
+        super().__init__(address, handler, bind_and_activate=bind_and_activate)
 
     def process_request(self, request, client_address) -> None:
         if not self._slots.acquire(blocking=False):

@@ -2,8 +2,8 @@
 [Unit]
 Description=XGW: демон (подписки, watchdog, замена серверов)
 Documentation=https://github.com/1521572-lang/xgw
-After=network.target xgw-net.service xgw-xray.service xgw-singbox.service
-Wants=xgw-net.service xgw-xray.service xgw-singbox.service
+After=network.target xgw-net.service xgw-xray.service xgw-singbox.service xgw-panel-read.socket
+Wants=xgw-net.service xgw-xray.service xgw-singbox.service xgw-panel-read.socket
 ConditionPathExists=/etc/xgw/config.toml
 
 [Service]
@@ -16,12 +16,12 @@ TimeoutStopSec=90
 # SIGTERM получает только демон: уже начатая атомарная nft-транзакция должна завершиться.
 # По истечении TimeoutStopSec systemd завершит оставшиеся процессы всей группы.
 KillMode=mixed
-RuntimeDirectory=xgw
+RuntimeDirectory=xgw xgw-panel-ipc
 RuntimeDirectoryPreserve=yes
 ProtectSystem=strict
 # /etc/xgw — в том числе dnsmasq.conf: панель переписывает его, когда устройство уходит
 # мимо VPN (служба DHCP xgw-dhcp читает только его).
-ReadWritePaths=/etc/xgw /var/lib/xgw /run/xgw
+ReadWritePaths=/etc/xgw /var/lib/xgw /run/xgw /run/xgw-panel-ipc
 PrivateTmp=true
 NoNewPrivileges=true
 # CAP_NET_ADMIN — nft, ip rule, sysctl сети и метка SO_MARK на прямых запросах;
@@ -30,7 +30,8 @@ NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID
 # Группа xray — подключение к сокету API Xray (/run/xgw-xray/api.sock, только пользователь и
 # группа xray): без CAP_DAC_OVERRIDE root подключается к нему как обычный член группы.
-SupplementaryGroups=xray
+# xgw-panel-read получает только IPC статуса, привязанный к отдельному UID.
+SupplementaryGroups=xray xgw-panel-read
 # Остальное демону не нужно (третий аудит 0.2.0, ASSUMPTIONS п. 252): модули и журнал ядра,
 # часы, имя машины, свои пространства имён, realtime, setuid-файлы; домашние каталоги и
 # /run/user — только чтение (уведомление идёт через сокет /run/user/<uid>/bus, подключаться к

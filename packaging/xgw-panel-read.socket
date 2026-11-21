@@ -1,0 +1,10 @@
+[Unit]
+Description=XGW local socket for isolated status reads
+PartOf=xgw.service
+
+[Socket]
+ListenStream=/run/xgw-panel-read.sock
+SocketMode=0600
+FileDescriptorName=panel-read-http
+Backlog=8
+RemoveOnStop=yes

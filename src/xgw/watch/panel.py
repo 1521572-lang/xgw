@@ -306,6 +306,7 @@ class Panel:
         self.phones = Phones(paths)
         self.app_port = app_port  # None — API приложения не запускается (тесты панели)
         self.status_reader = status_reader
+        self._status_runtime = None
         self.app_api: AppApi | None = None
         # Запись трафика устройства: кнопка в строке устройства (record.py).
         self.recorder = Recorder(paths.records_dir, on_done=self._event)
@@ -369,6 +370,14 @@ class Panel:
             log=self.log,
         )
         self.port = self._server.server_address[1]
+        if self.status_reader is None:
+            from .panel_status_runtime import StatusRuntime
+
+            runtime = StatusRuntime.for_panel(self.paths, self.zapret2_overview, self.log)
+            if runtime is not None:
+                runtime.start()
+                self._status_runtime = runtime
+                self.status_reader = runtime.read
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="xgw-panel", daemon=True,
             kwargs={"poll_interval": SHUTDOWN_POLL},
@@ -397,6 +406,10 @@ class Panel:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        if self._status_runtime is not None:
+            self._status_runtime.close()
+            self._status_runtime = None
+            self.status_reader = None
 
     # --- что показать -------------------------------------------------------------
 

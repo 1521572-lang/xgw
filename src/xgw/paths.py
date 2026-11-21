@@ -100,6 +100,14 @@ class Paths:
         return self.run / "status.json"
 
     @property
+    def panel_ipc_dir(self) -> Path:
+        return self.root / "run" / "xgw-panel-ipc"
+
+    @property
+    def panel_relay_socket(self) -> Path:
+        return self.root / "run" / "xgw-panel-read.sock"
+
+    @property
     def devices_down_file(self) -> Path:
         """Устройства, чей свой сервер (Ф4) сейчас не отвечает: их ведёт основной. Пишет
         демон (Daemon._device_step), читает сборка конфига (engine.devices_down); после

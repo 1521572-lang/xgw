@@ -34,7 +34,7 @@ from .net import cmd, dnsmasq, lan, nm, sleep, sysctl, ufw
 from .net.capture import Capture, CaptureError
 from .paths import Paths, atomic_write_json, atomic_write_text
 from .sbcore import binary as sbbinary
-from .watch import panel, status_page
+from .watch import panel, panel_status_runtime, status_page
 from .watch.status import join_ru
 from .xraycore import binary
 from .xraycore.api import ApiError
@@ -51,7 +51,7 @@ UNITS = ("xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, "xgw.service")
 FP_UNIT = "xgw-fp@.service"
 UNIT_FILES = (
     "xgw-net.service", "xgw-xray.service", SINGBOX_UNIT, dnsmasq.UNIT, "xgw.service", cores.UNIT,
-    FP_UNIT,
+    FP_UNIT, panel_status_runtime.SOCKET, panel_status_runtime.SERVICE,
 )
 XRAY_USER = "xray"
 SINGBOX_USER = "xgw-singbox"
@@ -782,6 +782,7 @@ class Installer:
             ])
             self.journal.extend("fp_users_created", [name])
             self._step(f"пользователь {name}")
+        self._panel_read_user()
         if facts.user_exists:
             return
         self.runner([
@@ -790,6 +791,26 @@ class Installer:
         ])
         self.journal.set("user_created", True)
         self._step(f"пользователь {XRAY_USER}")
+
+    def _panel_read_user(self) -> None:
+        name = panel_status_runtime.USER
+        account = self.runner(["getent", "passwd", name], check=False).strip()
+        if not account:
+            self.runner(["useradd", "--system", "--user-group", "--no-create-home",
+                         "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin", name])
+            self.journal.set("panel_read_user_created", True)
+            self._step(f"пользователь {name}")
+            return
+        group = self.runner(["getent", "group", name], check=False).strip()
+        gids = self.runner(["id", "-G", name], check=False).split()
+        try:
+            _, _, uid, gid, _, home, shell = account.split(":")
+            if (int(uid) > 0 and int(gid) > 0 and group.split(":")[2] == gid and gids == [gid]
+                    and home == "/nonexistent" and shell == "/usr/sbin/nologin"):
+                return
+        except (IndexError, ValueError):
+            pass
+        raise InstallError(f"{name}: нужна отдельная системная учётная запись без входа")
 
     def _code(self) -> None:
         package = Path(__file__).resolve().parent

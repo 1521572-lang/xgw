@@ -21,11 +21,13 @@ from .install import DAEMON_STOP_WAIT, FP_UNIT, SINGBOX_USER, UNIT_FILES, XRAY_U
 from .net import cmd, dnsmasq, nm, sleep, sysctl, ufw
 from .net.capture import Capture
 from .paths import Paths
+from .watch.panel_status_runtime import USER as PANEL_READ_USER
 
 # Что остаётся в журнале после отката неудачной установки: это установка не
 # откатывает, а при повторном запуске должна помнить, что было до неё.
 _KEPT_AFTER_ROLLBACK = (
     "packages", "user_created", "singbox_user_created", "fp_users_created", "dnsmasq",
+    "panel_read_user_created",
 )
 
 
@@ -275,6 +277,11 @@ class Uninstaller:
                 self.runner(["userdel", SINGBOX_USER], timeout=30.0)
             self.journal.discard("singbox_user_created")
             removed.append(SINGBOX_USER)
+        if self.journal.get("panel_read_user_created"):
+            if self.runner(["getent", "passwd", PANEL_READ_USER], check=False).strip():
+                self.runner(["userdel", PANEL_READ_USER], timeout=30.0)
+            self.journal.discard("panel_read_user_created")
+            removed.append(PANEL_READ_USER)
         if self.journal.get("user_created"):
             self.runner(["userdel", XRAY_USER], timeout=30.0)
             removed.append(XRAY_USER)
@@ -294,7 +301,8 @@ class Uninstaller:
     def _files(self, purge: bool) -> None:
         """Последний шаг: удаляется и код, из которого идёт выполнение."""
         targets = [
-            self.paths.opt, self.paths.var, self.paths.run, self.paths.xray_config_dir,
+            self.paths.opt, self.paths.var, self.paths.run, self.paths.panel_ipc_dir,
+            self.paths.xray_config_dir,
             self.paths.singbox_config_dir,
         ]
         if purge:

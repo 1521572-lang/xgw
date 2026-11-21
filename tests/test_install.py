@@ -332,14 +332,14 @@ def test_second_install_keeps_the_original_state_in_the_journal(box):
     assert box.install() == 0, box.text()
     second = Journal(box.paths.journal_file).data
     for key in ("sysctl", "nm_lan", "nm_wan", "packages", "user_created", "fp_users_created",
-                "singbox_user_created", "sleep"):
+                "singbox_user_created", "panel_read_user_created", "sleep"):
         assert second[key] == first[key], key
     # Профиль один, а не по одному на каждый запуск.
     assert sum(1 for item in box.system.profiles.values()
                if item["connection.id"] == nm.PROFILE) == 1
-    # Оба ядра и два работника бесплатного пула — каждый по одному разу.
+    # Оба ядра, работники пула и читатель панели создаются по одному разу.
     assert [call[-1] for call in box.system.commands("useradd")] == [
-        SINGBOX_USER, "xgw-vpn", "xgw-fps", "xray"]
+        SINGBOX_USER, "xgw-vpn", "xgw-fps", "xgw-panel-read", "xray"]
 
 
 def test_machine_only_mode_does_not_touch_lan_things(box):
@@ -460,7 +460,8 @@ def test_network_failure_rolls_everything_back(box):
     # Код и то, что установка не откатывает, остаются — повторный запуск о них помнит.
     assert box.paths.launcher.exists() and "xray" in system.users
     assert set(Journal(box.paths.journal_file).data) == {
-        "packages", "user_created", "singbox_user_created", "fp_users_created"}
+        "packages", "user_created", "singbox_user_created", "fp_users_created",
+        "panel_read_user_created"}
 
 
 def test_system_failure_stops_before_the_network_is_touched(box):
@@ -1035,6 +1036,9 @@ def test_uninstall_removes_sing_box_files_and_service(box):
     assert not (box.paths.systemd_dir / "xgw-singbox.service").exists()
     assert "xgw-singbox.service" not in box.system.units or not box.system.units[
         "xgw-singbox.service"].get("enabled")
+    for unit in ("xgw-panel-read.service", "xgw-panel-read.socket"):
+        assert not (box.paths.systemd_dir / unit).exists()
+    assert "xgw-panel-read" not in box.system.users
 
 
 @pytest.mark.parametrize("unit, writable, caps", [

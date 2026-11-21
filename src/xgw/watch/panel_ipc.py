@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -125,19 +126,46 @@ def _send(connection: socket.socket, payload: bytes) -> None:
         raise ProtocolError("short_packet")
 
 
+def _clear_stale(path: Path, owner: int) -> None:
+    try:
+        previous = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(previous.st_mode) or previous.st_uid != owner:
+        raise OSError(errno.EADDRINUSE, "unexpected_socket_path")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as probe:
+        probe.settimeout(0.25)
+        try:
+            probe.connect(str(path))
+        except ConnectionRefusedError:
+            pass
+        else:
+            raise OSError(errno.EADDRINUSE, "listener_already_active")
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) != (previous.st_dev, previous.st_ino):
+        raise OSError(errno.EADDRINUSE, "socket_path_changed")
+    path.unlink()
+
+
 def serve(path: Path, uid: int, gid: int, overview: Callable[[], dict | None],
-          stop: threading.Event, *, tickets: StatusTickets | None = None) -> None:
+          stop: threading.Event, *, tickets: StatusTickets | None = None,
+          recover_stale: bool = False) -> None:
     """Admit one configured UID. The group grants access to the socket path."""
     owner = os.geteuid()
     parent = path.parent.lstat()
     if (path.parent.resolve() != path.parent or not stat.S_ISDIR(parent.st_mode)
             or parent.st_uid != owner or parent.st_mode & 0o022):
         raise ValueError("trusted_socket_directory_required")
+    if recover_stale:
+        _clear_stale(path, owner)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
         listener.bind(str(path))
         info = path.lstat()
         try:
-            os.chown(path, owner, gid)
+            os.chown(path, -1, gid)
             path.chmod(0o660)
             listener.listen(8)
             listener.settimeout(0.25)

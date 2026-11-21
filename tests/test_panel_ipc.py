@@ -72,6 +72,25 @@ def test_scoped_tickets_expire_and_are_revoked_when_request_finishes():
 
 
 @pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")
+def test_recovery_keeps_an_active_listener_and_foreign_files(tmp_path):
+    path = tmp_path / "panel.sock"
+    uid = os.geteuid()
+    path.write_text("other", encoding="utf-8")
+    with pytest.raises(OSError, match="unexpected_socket_path"):
+        panel_ipc._clear_stale(path, uid)
+    assert path.read_text(encoding="utf-8") == "other"
+    path.unlink()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as active:
+        active.bind(str(path))
+        active.listen(1)
+        with pytest.raises(OSError, match="listener_already_active"):
+            panel_ipc._clear_stale(path, uid)
+        assert path.is_socket()
+    panel_ipc._clear_stale(path, uid)
+    assert not path.exists()
+
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="requires Linux Unix sockets")
 def test_local_peer_and_shutdown(tmp_path):
     path = tmp_path / "panel.sock"
     stop = threading.Event()

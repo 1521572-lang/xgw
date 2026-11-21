@@ -21,6 +21,7 @@ ROUTE = "/api/zapret2/status"
 LOOPBACK = "127.0.0.1"
 TOKEN = re.compile(rb"[A-Za-z0-9_-]{43}")
 RELAY_HOST = "xgw-panel-status"
+RELAY_FD_NAME = "panel-read-http"
 
 
 class _UnixServer(httpbound.BoundedServer):
@@ -73,7 +74,8 @@ def relay_status(path: Path, uid: int, tickets: panel_ipc.StatusTickets) -> dict
         connection.close()
 
 
-def create_server(path: Path, token: bytes | None, *, relay: Path | None = None):
+def create_server(path: Path, token: bytes | None, *, relay: Path | None = None,
+                  listener: socket.socket | None = None):
     if relay is None:
         if token is None or TOKEN.fullmatch(token) is None:
             raise ValueError("invalid_http_key")
@@ -159,27 +161,59 @@ def create_server(path: Path, token: bytes | None, *, relay: Path | None = None)
         do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_POST
 
     if relay is not None:
-        return _UnixServer(str(relay), Handler, slots=8, label="panel-read-http")
+        server = _UnixServer(str(relay), Handler, slots=8, label="panel-read-http",
+                             bind_and_activate=listener is None)
+        if listener is not None:
+            server.socket.close()
+            server.socket = listener
+        return server
     return httpbound.BoundedServer((LOOPBACK, 0), Handler, slots=8, label="panel-read-http")
+
+
+def activated_listener(path: Path) -> socket.socket:
+    pid, count, name = (os.environ.pop(key, "") for key in
+                        ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"))
+    if (pid, count, name) != (str(os.getpid()), "1", RELAY_FD_NAME):
+        raise ValueError("invalid_socket_activation")
+    listener = socket.socket(fileno=3)
+    try:
+        listener.set_inheritable(False)
+        if (listener.family != socket.AF_UNIX or listener.type != socket.SOCK_STREAM
+                or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+                or listener.getsockname() != str(path)):
+            raise ValueError("invalid_activated_listener")
+    except BaseException:
+        listener.close()
+        raise
+    return listener
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("socket", type=Path)
-    parser.add_argument("--relay", type=Path)
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--relay", type=Path)
+    transport.add_argument("--activated-relay", type=Path)
     args = parser.parse_args()
     if os.geteuid() == 0 or os.getuid() == 0:
         parser.exit(2, "unprivileged_process_required\n")
-    if not args.socket.is_absolute() or (args.relay is not None and not args.relay.is_absolute()):
+    relay = args.activated_relay or args.relay
+    if not args.socket.is_absolute() or (relay is not None and not relay.is_absolute()):
         parser.exit(2, "absolute_socket_path_required\n")
     token = None
-    if args.relay is None:
+    listener = None
+    if args.activated_relay is not None:
+        try:
+            listener = activated_listener(relay)
+        except (OSError, ValueError):
+            parser.exit(2, "invalid_socket_activation\n")
+    if relay is None:
         line = sys.stdin.buffer.readline(45)
         if not line.endswith(b"\n") or TOKEN.fullmatch(line[:-1]) is None:
             parser.exit(2, "invalid_http_key\n")
         token = line[:-1]
-    with create_server(args.socket, token, relay=args.relay) as server:
-        print(server.server_address[1] if args.relay is None else "RELAY_READY", flush=True)
+    with create_server(args.socket, token, relay=relay, listener=listener) as server:
+        print(server.server_address[1] if relay is None else "RELAY_READY", flush=True)
         server.serve_forever()
 
 

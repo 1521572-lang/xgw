@@ -1,0 +1,30 @@
+[Unit]
+Description=XGW isolated status reader
+Requires=xgw-panel-read.socket
+PartOf=xgw.service xgw-panel-read.socket
+After=xgw-panel-read.socket
+
+[Service]
+Type=exec
+User=xgw-panel-read
+Group=xgw-panel-read
+ExecStart=/usr/bin/python3 -I -B -c "import sys; sys.path.insert(0, '/opt/xgw/lib'); from xgw.watch.panel_read_http import main; main()" /run/xgw-panel-ipc/status.sock --activated-relay /run/xgw-panel-read.sock
+TimeoutStopSec=3s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+InaccessiblePaths=/etc/xgw /var/lib/xgw /run/xgw -/run/xgw-xray -/run/xgw-singbox
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
