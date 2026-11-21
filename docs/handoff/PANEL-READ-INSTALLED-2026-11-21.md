@@ -1,4 +1,4 @@
-# ThinkCentre — проверка читателя на установленной панели XGW
+# ThinkCentre — проверка читателя на установленной панели XGW, r2
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет сценарий и автоматически
 публикует один обезличенный отчёт при любом исходе. При недоступности
@@ -9,6 +9,15 @@
 запустил временный reader за 735 мс. `/run` был только для чтения,
 пять полей совпали со штатной панелью и повторная активация прошла.
 [Отчёт P2.5 r2](../reports/2026-11-21T170120Z_panel-read-service-r2.md)
+
+Первая попытка P2.6 остановилась на `prepare`. Распаковка под root
+сохранила права записи группы из Git-архива, и `trusted()` отклонила
+каталог. Шлюз сохранил PID и настройки, временный каталог удалён.
+В r2 распаковка под root использует `umask 077` и
+`--no-same-permissions`. Сценарий проверяет владельца, типы файлов
+и отсутствие записи для группы и остальных сначала перед запуском
+архивированных помощников, затем перед сверкой пакета.
+[Первый отчёт P2.6](../reports/2026-11-21T172641Z_panel-read-installed.md)
 
 В P2.6 сценарий временно заменяет 13 файлов пакета и три файла
 systemd из принятого кандидата. В исходной базе `cli.py` сверяется
@@ -33,7 +42,7 @@ systemd из принятого кандидата. В исходной базе
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=10fe206c1b3dc7d5a4bd98a5464fda1574307f46
+CODE=0852256c15d24630e8aec4ae6d5b5d630b66dab9
 REPO=$(git rev-parse --show-toplevel)
 cd "$REPO"
 git fetch origin "$BR"
@@ -54,6 +63,7 @@ CLI-клиент с сохранённой сессией, `candidate-qt` зап
 
 | Этап | Что записать |
 |---|---|
+| `helper-modes`, `stage-modes` | В обоих этапах `STAGE_MODES_OK`. При `UNTRUSTED_STAGE` запиши имя элемента относительно stage, его режим и код `NOT_RUN`. |
 | `baseline-session`, `baseline-http`, `baseline-https`, `contracts`, `prepare` | SHA кандидата, Ubuntu, ядро, systemd, исходный off/off fresh/matched и HTTPS 200. В старой панели обзор 200, узкий маршрут 404. Оба контракта отката прошли и `BASELINE_MATCH 16`. При `baseline_mismatch` запиши имена файлов и статус `NOT_RUN` живой установки. |
 | `arm-timer`, `timer-active`, `apply`, `candidate-ready` | Таймер активен до первого изменения, файлы кандидата проверены, `CANDIDATE_STARTED`, исходная сессия видит off/off fresh/matched после запуска. |
 | `ONE_TIME_CLI_OK`, `READER_DORMANT_OK` | Команда `xgw panel` выдаёт одноразовую ссылку. HTTP даёт cookie и отклоняет повтор. Запросы без сессии, с чужим Host или Origin, а также POST отклонены. Reader в этот момент остаётся незапущенным. |
@@ -88,12 +98,12 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-read-installed.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_panel-read-installed-r2.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre installed-panel status reader acceptance'
+git commit -m 'Report ThinkCentre installed-panel status reader acceptance r2'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
