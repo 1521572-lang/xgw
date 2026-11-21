@@ -42,6 +42,24 @@ step() {
   return "$rc"
 }
 
+extract_stage() {
+  sudo -n /bin/sh -c '
+    umask 077
+    exec /usr/bin/tar --no-same-owner --no-same-permissions -xf - -C "$1"
+  ' sh "$1"
+}
+
+check_stage_modes() {
+  local unsafe
+  unsafe=$(sudo -n /usr/bin/find "$STAGE" \
+    \( ! -uid 0 -o -perm /022 -o ! \( -type d -o -type f \) \) -print -quit) || return
+  if [[ -n $unsafe ]]; then
+    printf 'UNTRUSTED_STAGE %s\n' "$unsafe" >&2
+    return 2
+  fi
+  printf 'STAGE_MODES_OK\n'
+}
+
 overlay() {
   sudo -n "$PY" -I -B "$STAGE/code/docs/helpers/panel_installed_trial.py" "$1" "$STAGE"
 }
@@ -194,18 +212,20 @@ STAGE=$(sudo -n mktemp -d /opt/xgw/handoff/panel-reader.XXXXXXXX)
 sudo -n install -d -m 0700 "$STAGE/code" "$STAGE/base"
 git -C "$REPO" archive "$CODE" docs/helpers/desync_batch1_install.py \
   docs/helpers/panel_installed_trial.py docs/helpers/panel_installed_check.py \
-  docs/helpers/t11_panel_login_check.py | sudo -n tar --no-same-owner -x -C "$STAGE/code"
+  docs/helpers/t11_panel_login_check.py | extract_stage "$STAGE/code"
+step helper-modes check_stage_modes
 listed=$(overlay paths)
 mapfile -t files <<< "$listed"
-git -C "$REPO" archive "$CODE" "${files[@]}" | sudo -n tar --no-same-owner -x -C "$STAGE/code"
+git -C "$REPO" archive "$CODE" "${files[@]}" | extract_stage "$STAGE/code"
 for file in "${files[@]}"; do
   revision=$BASE
   if [[ $file == src/xgw/cli.py ]]; then revision=$CLI_BASE; fi
   if git -C "$REPO" cat-file -e "$revision:$file"; then
-    git -C "$REPO" archive "$revision" "$file" | sudo -n tar --no-same-owner -x -C "$STAGE/base"
+    git -C "$REPO" archive "$revision" "$file" | extract_stage "$STAGE/base"
   fi
 done
 
+step stage-modes check_stage_modes
 step baseline-http check_http baseline
 step prepare overlay prepare
 step arm-timer sudo -n systemd-run --collect --unit="$UNIT" --on-active=20m --service-type=oneshot \
