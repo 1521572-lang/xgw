@@ -99,4 +99,4 @@ control-unchanged rc=0 — SHA config.toml+panel.json не изменился.
 3. netns-проверка синтаксиса работает на этом ядре для всех девяти
    фикстур — можно встраивать `nft --check` в гейты кандидатов, меняющих
    net/nft.py, без прав на живые правила.
-- Publication commit: _заполняется при публикации_.
+- Publication commit: `2c699584d2c3bfa4b1c1ee5e9694e809ae1fdb11` (df0e1cc → 2c69958, ancestor verified).
