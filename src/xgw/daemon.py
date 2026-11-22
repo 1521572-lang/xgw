@@ -74,7 +74,7 @@ from .xraycore.service import XrayServiceError
 LEAK_INTERVAL = 300.0  # проверка утечки — раз в 5 минут
 WAN_DOWN_INTERVAL = 60.0  # при недоступном провайдере проверки раз в 60 с
 ALL_DEAD_RETRY = 300.0  # как часто повторять внеочередное обновление, пока все мертвы
-SCAN_BUDGET = 8.0  # секунд на сканы за один шаг: watchdog не должен надолго замирать
+SCAN_BUDGET = 8.0  # срок начала сканов и дедлайн дополнительных плановых проб
 # Плановые сканы запасных при исправном рабочем пути (HEALTHY) — не серией подряд, а с паузой
 # SCAN_GAP секунд перед каждой следующей пробой шага (PR-4 ТЗ TS-ANTI-TSPU-HARDENING, п. 330).
 # Пауза входит в SCAN_BUDGET: не помещается — проба ждёт следующего шага. Участники, аварийные
@@ -664,7 +664,7 @@ class Daemon:
                                   "urgent_waited": 0}
         # Неполная проверка адреса проб (_diagnose_target): тег → (итог пробы, когда снят).
         self._diag_partial: dict[str, tuple[scan.ScanResult, float]] = {}
-        self._diag_cut: object | None = None  # отмена проб этой проверки (target.Cutoff)
+        self._scan_cut: target.Cutoff | None = None  # общий дедлайн текущей проверки
         self._diag_last: dict = {}  # итог последней проверки — для status.json (scan_pacing)
         # Первая проверка участников собственной пробой шлюза: отпечатки уже проверенных
         # и теги тех, кто её не прошёл (тег → вердикт) — их меняют без ожидания
@@ -926,6 +926,8 @@ class Daemon:
         self._provider_dns_refresh: _ProviderDnsRefresh | None = None
         self._provider_dns_refresh_started = False
         self._provider_dns_refresh_used = False
+        self._scan_budget_limited_probes = 0
+        self._scan_budget_cancelled = False
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
@@ -1010,6 +1012,8 @@ class Daemon:
                 "provider_attempts": self._provider_attempts,
                 "provider_dns_refresh_started": self._provider_dns_refresh_started,
                 "provider_dns_refresh_used": self._provider_dns_refresh_used,
+                "scan_budget_limited_probes": self._scan_budget_limited_probes,
+                "scan_budget_cancelled": self._scan_budget_cancelled,
             }
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
@@ -1524,6 +1528,8 @@ class Daemon:
         self._provider_attempts = 0
         self._provider_dns_refresh_started = False
         self._provider_dns_refresh_used = False
+        self._scan_budget_limited_probes = 0
+        self._scan_budget_cancelled = False
         if self._desync_reload_pending and not self._drain_desync_reload():
             # Старые правила остаются до освобождения слота. Не загружаем другое
             # назначение очереди, пока её предыдущий обработчик ещё может работать.
@@ -2432,14 +2438,14 @@ class Daemon:
                 if tag in tags and 0.0 <= now - item[1] < DIAG_KEEP}
         todo = target.diagnosis_order(
             [info for info in nodes if info.tag not in kept], verdicts)
-        self._diag_cut = target.Cutoff(self._stop, self.clock() + DIAG_BUDGET, self.clock)
+        cut = self._scan_cut = target.Cutoff(self._stop, self.clock() + DIAG_BUDGET, self.clock)
         try:
             fresh, parallel = target.probe_sample(
                 todo, lambda info: self._scan(info, password), workers=DIAG_WORKERS,
-                cut=self._diag_cut,
+                cut=cut,
             )
         finally:
-            self._diag_cut = None
+            self._scan_cut = None
         done = self.clock()
         merged = {tag: result for tag, (result, _at) in kept.items()}
         merged.update((result.tag, result) for result in fresh)
@@ -3653,7 +3659,9 @@ class Daemon:
         Если к началу планового скана запасных от интервала watchdog осталось меньше
         SCAN_NEXT_WINDOW, откладываем его один раз. На следующем пригодном шаге
         с таким же дефицитом запускаем одну пробу, чтобы очередь продвигалась.
-        Бюджет вышел — новая проба не начинается (начатая доводится до своего таймаута).
+        Бюджет вышел — новая проба не начинается. Дополнительная плановая проба
+        обычного запасного прерывается по дедлайну и повторяется первой в следующем
+        шаге. Проверки с приоритетом и пробы профилей используют свои таймауты.
         Остановка во время паузы или пробы — тег остаётся в очереди; тег сервера, которого нет
         в применённом конфиге (состав сменился), снимается."""
         if not self.scan_queue:
@@ -3700,6 +3708,10 @@ class Daemon:
             self.scan_queue.popleft()
             urgent = probe_tag in self._scan_urgent
             self._scan_urgent.discard(probe_tag)
+            cut = None
+            if planned and previous is not None and info.fingerprint not in self._profile_trial:
+                cut = target.Cutoff(self._stop, started + SCAN_BUDGET, self.clock)
+                self._scan_budget_limited_probes += 1
             pace = [self.clock(), None, planned, None]
             if previous is not None:
                 pace[3] = round(waited, 3)
@@ -3708,9 +3720,14 @@ class Daemon:
             self._scan_pace.append(pace)
             self._scanned = True
             self._queue_probe_count += 1
-            result = self._probe_scan(info, password)
+            self._scan_cut = cut
+            try:
+                result = self._probe_scan(info, password)
+            finally:
+                self._scan_cut = None
             pace[1] = self.clock()
             if result.kind == "cancelled":
+                self._scan_budget_cancelled = cut is not None and cut.is_set() and not self.stopping
                 self.scan_queue.appendleft(probe_tag)  # скан не состоялся
                 if urgent:
                     self._scan_urgent.add(probe_tag)
@@ -3786,8 +3803,8 @@ class Daemon:
         """url — адрес проверки; None — probe.url. Сервер на пробе профиля обхода — файлом
         целиком: по итогу решается, выучен ли профиль, а случайная часть файла короче порога
         «заморозки» дала бы OK и выучила бы негодный профиль (T05 кросс-аудита 4cc96b9)."""
-        # Проба проверки адреса (_diagnose_target) прерывается и общим дедлайном этой проверки.
-        cancel = self._diag_cut if self._diag_cut is not None else self._stop
+        # Диагностика и дополнительные плановые пробы используют общий дедлайн.
+        cancel = self._scan_cut if self._scan_cut is not None else self._stop
         result = scan.scan_node(
             info, self.cfg, probe_pass=password, url=url, cancel=cancel,  # type: ignore[arg-type]
             random_size=info.fingerprint not in self._profile_trial,

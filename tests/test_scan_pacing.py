@@ -6,8 +6,10 @@ from test_daemon import Harness, _started
 
 from xgw import engine
 from xgw.config import Config
-from xgw.daemon import SCAN_BUDGET, SCAN_GAP
+from xgw.daemon import SCAN_BUDGET, SCAN_GAP, Daemon
 from xgw.paths import Paths
+from xgw.watch.checks import DownloadResult
+from xgw.watch.hosts import ProbeHosts
 from xgw.watch.states import State
 
 
@@ -123,6 +125,90 @@ def test_remaining_scan_window_defers_only_planned_spares(daemon, manual, expect
     _step(daemon)
     assert list(daemon.scan_queue) == spares[expected:]
     assert daemon._planned_scan_deferred is not manual
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_additional_plan_probe_shares_budget_across_hosts_and_requeues(daemon, monkeypatch, stop):
+    _started(daemon)
+    daemon.cfg.probe.urls.append("https://probe.example.org/data")
+    daemon.hosts = ProbeHosts(daemon.cfg, clock=daemon.wall)
+    daemon._scan_budget_limited_probes = 0
+    first, second, third = _spares(daemon)
+    daemon.scan_queue.extend([first, second, third])
+    before = daemon.store.scans().get(second)
+    initial = daemon.t
+    requests = []
+
+    def gap(seconds):
+        daemon.t += seconds
+        return False
+
+    def probe(_proxy, port, url, *, cancel, **_kwargs):
+        requests.append((port, url, cancel))
+        if len(requests) == 2:
+            return DownloadResult(ok=False, status=403, kind="http")
+        if len(requests) == 3:
+            assert not cancel.is_set()
+            if stop:
+                daemon._stop.set()
+            else:
+                daemon.t = initial + SCAN_BUDGET
+            assert cancel.is_set()
+            return DownloadResult(ok=False, kind="cancelled", downloaded=100)
+        daemon.t += 0.25
+        return DownloadResult(ok=True, status=200, downloaded=65536)
+
+    monkeypatch.setattr(daemon, "_scan_gap", gap)
+    monkeypatch.setattr(daemon, "_scan_url", lambda _info: None)
+    monkeypatch.setattr(daemon, "_scan", Daemon._scan.__get__(daemon))
+    monkeypatch.setattr("xgw.watch.scan.http_get_via_proxy", probe)
+    _step(daemon)
+    assert len(requests) == 3
+    assert requests[0][2] is daemon._stop
+    assert requests[1][0] == requests[2][0] and requests[1][1] != requests[2][1]
+    assert requests[1][2] is requests[2][2] and requests[1][2] is not daemon._stop
+    assert daemon._scan_cut is None
+    assert daemon._scan_budget_limited_probes == 1
+    assert daemon._scan_budget_cancelled is not stop
+    assert list(daemon.scan_queue) == [second, third]
+    assert daemon.store.scans().get(second) == before
+    if not stop:
+        _step(daemon)
+        assert requests[3][0] == requests[1][0] and requests[3][2] is daemon._stop
+        assert not daemon.scan_queue
+        assert daemon.store.scans()[second]["verdict"] == "OK"
+
+
+@pytest.mark.parametrize("priority", ["manual", "urgent", "degraded", "member", "profile_trial"])
+def test_additional_probe_keeps_full_timeout_for_priority_work(daemon, monkeypatch, priority):
+    _started(daemon)
+    first, second, _ = _spares(daemon)
+    nodes = daemon.view()
+    if priority == "member":
+        second = next(info.probe_tag for info in nodes if info.role == "proxy")
+    elif priority == "profile_trial":
+        spare = next(info for info in nodes if info.probe_tag == second)
+        daemon._profile_trial[spare.fingerprint] = object()
+        monkeypatch.setattr(daemon, "_profile_note", lambda *_args: None)
+    elif priority == "urgent":
+        daemon._scan_urgent.add(second)
+    elif priority == "manual":
+        daemon._manual_scan = True
+    else:
+        daemon.machine.state = State.DEGRADED
+    daemon.scan_queue.extend([first, second])
+    observed = []
+    original = daemon._scan
+
+    def probe(info, password, url=None):
+        observed.append((info.probe_tag, daemon._scan_cut))
+        return original(info, password, url)
+
+    monkeypatch.setattr(daemon, "_scan", probe)
+    monkeypatch.setattr(daemon, "_scan_gap", lambda _seconds: False)
+    _step(daemon)
+    assert observed == [(first, None), (second, None)]
+    assert not daemon.scan_queue and not daemon._scan_budget_cancelled
 
 
 def test_busy_watchdog_defers_once_then_scans_one_spare(daemon):
