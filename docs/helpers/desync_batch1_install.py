@@ -97,6 +97,9 @@ SELECTIVE_ROUTE_STATUS_TIMER = "xgw-selective-route-status-rollback.timer"
 PANEL_LOGIN = ("cli.py", "install.py", "watch/panel.py", "ui/login.html", "ui/app.css",
                "geodat.py", "watch/server_geo.py")
 PANEL_LOGIN_TIMER = "xgw-panel-login-rollback.timer"
+PIN_AUDIT = ("actions.py", "cli.py", "daemon.py", "gui/model.py", "tray.py", "ui/app.js",
+             "watch/notify.py", "watch/panel.py", "watch/states.py")
+PIN_AUDIT_TIMER = "xgw-pin-audit-rollback.timer"
 
 
 def gui_files(files):
@@ -275,6 +278,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "pin_audit", False):
+        return PIN_AUDIT, PIN_AUDIT_TIMER
     if getattr(args, "panel_login", False):
         return PANEL_LOGIN, PANEL_LOGIN_TIMER
     if getattr(args, "selective_route_status", False):
@@ -373,6 +378,7 @@ def main():
     stage.add_argument("--xray-write-trace", action="store_true")
     stage.add_argument("--selective-route-status", action="store_true")
     stage.add_argument("--panel-login", action="store_true")
+    stage.add_argument("--pin-audit", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -390,6 +396,8 @@ def main():
             rows = records(backup, files)
             reload_net = files == COMBINED_ADMISSION
             if args.action == "apply":
+                if files == PIN_AUDIT:
+                    require_idle_workers()
                 apply(backup, rows, timer, reload_net=reload_net)
             else:
                 service("stop")
