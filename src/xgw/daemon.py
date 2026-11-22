@@ -910,8 +910,11 @@ class Daemon:
         # События сети, сна и правил (watch/events.py, другой поток): причины ждут шага
         # watchdog в _wakes, _woken прерывает паузу. wake_reason — последняя причина.
         self._woken = threading.Event()
-        self._wakes: set[str] = set()
+        self._wakes: dict[str, float] = {}
         self._wake_lock = threading.Lock()
+        self._loop_generation = time.monotonic_ns()
+        self._wake_sequence = 0
+        self._last_wake: dict | None = None
         self.wake_reason = ""
         self._net_tick_at = float("-inf")  # когда был последний шаг по событию сети
         self._resumed = False  # машина проснулась после сна: шаг доделает своё (_after_sleep)
@@ -1011,6 +1014,7 @@ class Daemon:
         try:
             atomic_write_json(self.paths.run / "watchdog-step.json", {
                 "phase": phase, "at": time.monotonic(), "interval_s": self.cfg.watchdog.interval_s,
+                "generation": self._loop_generation, "wake": self._last_wake,
                 "previous_step_s": self._loop_step_s, **details,
             }, mode=0o600)
         except OSError as exc:
@@ -1062,15 +1066,24 @@ class Daemon:
         """NetEvents (другой поток): «net» — событие сети, «sleep» — машина проснулась,
         «rules» — кто-то убрал правила XGW. Здесь только отметка: всё делает шаг watchdog."""
         with self._wake_lock:
-            self._wakes.add(reason)
+            self._wakes.setdefault(reason, time.monotonic())
             self.wake_reason = reason
-        self._woken.set()
+            self._woken.set()
 
     def _on_wake(self, deadline: float) -> float:
         """Разбирает причины пробуждения во время паузы; возвращает новый её конец."""
         with self._wake_lock:
             self._woken.clear()
-            reasons, self._wakes = self._wakes, set()
+            reasons, self._wakes = self._wakes, {}
+            handling_at = time.monotonic()
+        received = {reason: reasons[reason] for reason in ("net", "sleep", "rules")
+                    if reason in reasons}
+        if received:
+            self._wake_sequence += 1
+            self._last_wake = {
+                "sequence": self._wake_sequence, "received": received,
+                "handling_at": handling_at,
+            }
         if "rules" in reasons:
             self._guard_now()
         now = time.monotonic()

@@ -2555,20 +2555,27 @@ def test_rules_event_restores_rules_right_away(guarded):
     assert any("загружены заново" in row["detail"] for row in daemon.status()["events"])
 
 
-def test_net_event_starts_the_step_early_but_not_too_often(daemon):
+def test_net_event_starts_the_step_early_but_not_too_often(daemon, monkeypatch):
     _started(daemon)
     stop = threading.Event()
+    now = [100.0]
+
+    def advance(seconds):
+        now[0] += seconds
+        return False
+
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(stop, "wait", advance)
     daemon.poke.clear()
     daemon.wake("net")
-    began = time.monotonic()
     daemon._sleep(stop, lambda: False, 30)
-    assert time.monotonic() - began < 1.0
+    assert now[0] == 100.0
     daemon.tick()
     daemon.poke.clear()
+    now[0] += 0.25
     daemon.wake("net")  # следующее — не раньше NET_WAKE_PAUSE после шага по событию
-    began = time.monotonic()
     daemon._sleep(stop, lambda: False, 30)
-    assert 1.5 <= time.monotonic() - began < 5.0
+    assert now[0] == 102.0
 
 
 def test_wake_after_resume_reloads_rules_and_scans(guarded):
@@ -2590,6 +2597,34 @@ def test_wake_after_resume_reloads_rules_and_scans(guarded):
     assert "up" in capture.actions()
     assert daemon.scanned  # запасные — без ожидания scan_spares_minutes
     assert daemon.collected == [True]  # подписка — через Xray, как в обычный срок
+
+
+def test_watchdog_wake_progress_keeps_first_arrival_and_batch(daemon, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    daemon.wake("net")
+    now[0] = 101.0
+    daemon.wake("net")
+    daemon.wake("private input")
+    now[0] = 102.0
+    daemon.wake("sleep")
+    now[0] = 105.0
+    assert daemon._on_wake(120) == 105.0
+    daemon._loop_progress("tick", started=105.0)
+    progress = daemon.paths.run / "watchdog-step.json"
+    record = json.loads(progress.read_bytes())
+    assert record["wake"] == {
+        "sequence": 1, "received": {"net": 100.0, "sleep": 102.0}, "handling_at": 105.0,
+    }
+    assert not daemon.paths.status_file.exists()
+
+    daemon.wake("net")
+    daemon._on_wake(120)
+    daemon._loop_progress("tick", started=105.0)
+    second = json.loads(progress.read_bytes())
+    assert record["generation"] == second["generation"]
+    assert second["wake"]["sequence"] == 2
+    assert second["wake"]["received"] == {"net": 105.0}
 
 
 def test_late_probe_under_load_is_not_a_failure(daemon):

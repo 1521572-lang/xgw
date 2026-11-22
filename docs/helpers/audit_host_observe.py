@@ -76,15 +76,37 @@ def snapshot():
                       "before_100_including_own": earlier}, sort_keys=True))
 
 
+def wake_sample(row, begin, measured_at):
+    generation, wake = row.get("generation"), row.get("wake")
+    if type(generation) is not int or not isinstance(wake, dict):
+        return None
+    sequence, handled, received = (wake.get(key) for key in
+                                   ("sequence", "handling_at", "received"))
+    if (type(sequence) is not int or sequence < 1 or not isinstance(received, dict)
+            or type(handled) not in (int, float) or not begin <= handled <= measured_at):
+        return None
+    delays = {}
+    for reason in ("net", "sleep", "rules"):
+        at = received.get(reason)
+        if type(at) in (int, float) and begin <= at <= handled:
+            delays[reason] = handled - at
+    return ((generation, sequence), delays) if delays else None
+
+
 def watchdog(seconds):
-    deadline = time.monotonic() + seconds
+    begin = time.monotonic()
+    deadline = begin + seconds
     steps = {}
+    wakes = {}
+    wake_available = False
     misses = 0
     max_age = None
     samples = 0
     while True:
         try:
             row = json.loads(Path("/run/xgw/watchdog-step.json").read_bytes())
+            if not isinstance(row, dict):
+                raise ValueError("format")
             now = time.monotonic()
             age = now - float(row["at"])
             if not math.isfinite(age) or age < 0:
@@ -93,6 +115,10 @@ def watchdog(seconds):
             samples += 1
             if row.get("phase") == "sleep" and isinstance(row.get("step_s"), (int, float)):
                 steps[row["started"]] = row["step_s"]
+            wake_available |= type(row.get("generation")) is int and "wake" in row
+            if sample := wake_sample(row, begin, float(row["at"])):
+                key, delays = sample
+                wakes[key] = delays
         except (OSError, KeyError, ValueError, TypeError):
             misses += 1
         remaining = deadline - time.monotonic()
@@ -100,11 +126,18 @@ def watchdog(seconds):
             break
         time.sleep(min(1, remaining))
     values = sorted(steps.values())
+    by_reason = {}
+    for reason in ("net", "sleep", "rules"):
+        delays = [sample[reason] for sample in wakes.values() if reason in sample]
+        if delays:
+            by_reason[reason] = {"count": len(delays), "max_s": round(max(delays), 4)}
     print(json.dumps({"seconds": seconds, "samples": samples, "missing": misses,
                       "distinct_completed_steps": len(values),
                       "max_record_age_s": round(max_age, 2) if max_age is not None else None,
                       "step_max_s": values[-1] if values else None,
-                      "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None}))
+                      "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None,
+                      "wake": {"available": wake_available, "observed_batches": len(wakes),
+                               "by_reason": by_reason}}))
 
 
 def desync():
