@@ -54,8 +54,10 @@ case "$PROFILE" in
       PREFIX=WATCHDOG_TIMING
       BASE=c69ff9a75dbeec702f0490f8691144d247b0835d
       ACCEPTED=6de2c66658f9889a42e906859e480ed05714d84d
-      NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check)
-      EXPECTED=17
+      TEST_FILES+=(docs/helpers/watchdog_progress_gate.py tests/test_watchdog_progress_gate.py)
+      NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check
+              tests/test_watchdog_progress_gate.py)
+      EXPECTED=22
     else
       TEST_CODE=bb7508e1901f23dc078da8881d808dc6c7e0d8c5
     fi
@@ -147,11 +149,25 @@ PYTHON
 
 check_wake_progress() {
   [[ $PROFILE != --pin-audit ]] || return 0
-  if ! sudo -n "$PY" -I -B - "$PROFILE" <<'PYTHON'
+  if [[ $PROFILE == --watchdog-timing ]]; then
+    local started_us
+    if ! started_us=$(systemctl show xgw.service -p ExecMainStartTimestampMonotonic --value) ||
+       [[ ! $started_us =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s_PROGRESS_UNAVAILABLE result=unknown_process_start\n' "$PREFIX" >&2
+      return 2
+    fi
+    if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
+         sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "$started_us"; then
+      printf '%s_PROGRESS_UNAVAILABLE\n' "$PREFIX" >&2
+      return 2
+    fi
+    printf '%s_PROGRESS_OK\n' "$PREFIX"
+    return 0
+  fi
+  if ! sudo -n "$PY" -I -B - <<'PYTHON'
 import json
 import os
 import stat
-import sys
 import time
 from pathlib import Path
 
@@ -166,11 +182,6 @@ try:
              and row["phase"] in ("tick", "sleep")
              and type(at) in (int, float) and 0 <= time.monotonic() - at <= 180
              and (wake is None or isinstance(wake, dict)))
-    if valid and sys.argv[1] == "--watchdog-timing":
-        step = row.get("last_step")
-        valid = (isinstance(step, dict) and type(step.get("sequence")) is int
-                 and step["sequence"] > 0 and step["started"] <= step["completed_at"] <= at
-                 and isinstance(step.get("parts_s"), dict))
 except (OSError, ValueError, KeyError, TypeError):
     valid = False
 raise SystemExit(not valid)
@@ -223,6 +234,10 @@ wait_status 0
 controls baseline "$D/base"
 if [[ $present == yes ]]; then
   check_wake_progress
+  if [[ $PROFILE == --watchdog-timing ]]; then
+    [[ $(pid xgw.service) == "$daemon_before" ]]
+    controls confirmed "$D/tree"
+  fi
   printf '%s_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED\n' "$PREFIX"
   exit 0
 fi
@@ -267,10 +282,11 @@ armed=yes
 systemctl is-active --quiet "$UNIT.timer"
 printf '%s_ROLLBACK_ARMED\n' "$PREFIX"
 sudo -n "${INSTALL[@]}" apply "${ARGS[@]}"
-wait_status "$(date +%s.%N)"
-check_wake_progress
 daemon_after=$(pid xgw.service)
 [[ $daemon_after != "$daemon_before" ]]
+wait_status "$(date +%s.%N)"
+check_wake_progress
+[[ $(pid xgw.service) == "$daemon_after" ]]
 controls installed "$D/tree"
 sudo -n systemctl stop "$UNIT.timer"
 if systemctl is-active --quiet "$UNIT.service"; then

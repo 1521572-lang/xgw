@@ -1,0 +1,82 @@
+"""Wait for the current XGW process to publish its first completed watchdog step."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+PROGRESS = Path("/run/xgw/watchdog-step.json")
+FATAL_STATES = {"invalid_snapshot", "invalid_format", "unexpected_mode"}
+
+
+def progress_state(path: Path, minimum_generation: int, now: float) -> str:
+    try:
+        with path.open("rb") as stream:
+            if stat.S_IMODE(os.fstat(stream.fileno()).st_mode) != 0o600:
+                return "unexpected_mode"
+            row = json.load(stream)
+    except FileNotFoundError:
+        return "not_written"
+    except OSError:
+        return "unreadable"
+    except ValueError:
+        return "invalid_snapshot"
+
+    if not isinstance(row, dict):
+        return "invalid_format"
+    generation = row.get("generation")
+    if type(generation) is not int or generation <= 0:
+        return "invalid_format"
+    if generation < minimum_generation:
+        return "previous_generation"
+    at, phase = row.get("at"), row.get("phase")
+    if type(at) not in (int, float) or phase not in ("tick", "sleep"):
+        return "invalid_format"
+    if not 0 <= now - at <= 180:
+        return "stale_snapshot"
+    if "last_step" not in row or "wake" not in row:
+        return "invalid_format"
+    if row["wake"] is not None and not isinstance(row["wake"], dict):
+        return "invalid_format"
+    step = row["last_step"]
+    if step is None and phase == "tick":
+        return "waiting_first_step"
+    if not isinstance(step, dict):
+        return "invalid_format"
+    sequence, started, completed = (step.get(key) for key in ("sequence", "started", "completed_at"))
+    if (type(sequence) is not int or sequence <= 0 or type(started) not in (int, float)
+            or type(completed) not in (int, float)
+            or not generation / 1e9 <= started <= completed <= at
+            or not isinstance(step.get("parts_s"), dict)):
+        return "invalid_format"
+    return "ready"
+
+
+def wait_progress(path: Path, minimum_generation: int, seconds: float) -> tuple[str, int, bool]:
+    deadline = time.monotonic() + seconds
+    attempts = 0
+    saw_first_step = False
+    while True:
+        state = progress_state(path, minimum_generation, time.monotonic())
+        attempts += 1
+        saw_first_step |= state == "waiting_first_step"
+        remaining = deadline - time.monotonic()
+        if state == "ready" or state in FATAL_STATES or remaining <= 0:
+            return state, attempts, saw_first_step
+        time.sleep(min(1.0, remaining))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdigit():
+        raise SystemExit(2)
+    minimum_generation = int(sys.argv[1]) * 1000  # systemd reports monotonic microseconds
+    if minimum_generation <= 0:
+        raise SystemExit(2)
+    state, attempts, saw_first_step = wait_progress(PROGRESS, minimum_generation, 120)
+    print(f"WATCHDOG_TIMING_PROGRESS_CHECK result={state} polls={attempts} "
+          f"waiting_first_step={str(saw_first_step).lower()}")
+    raise SystemExit(0 if state == "ready" else 2)
