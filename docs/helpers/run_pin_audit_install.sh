@@ -31,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake|--watchdog-timing)
+  --watchdog-wake|--watchdog-timing|--watchdog-scan)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -49,7 +49,7 @@ case "$PROFILE" in
            tests/test_net.py::test_tun_and_its_route_come_back_after_xray_starts_again
            tests/test_net.py::test_loaded_notices_a_lost_interface_route_or_tproxy)
     EXPECTED=15
-    if [[ $PROFILE == --watchdog-timing ]]; then
+    if [[ $PROFILE != --watchdog-wake ]]; then
       SCOPE=watchdog-timing
       PREFIX=WATCHDOG_TIMING
       BASE=c69ff9a75dbeec702f0490f8691144d247b0835d
@@ -58,6 +58,17 @@ case "$PROFILE" in
       NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check
               tests/test_watchdog_progress_gate.py)
       EXPECTED=22
+      if [[ $PROFILE == --watchdog-scan ]]; then
+        SCOPE=watchdog-scan
+        PREFIX=WATCHDOG_SCAN
+        BASE=6de2c66658f9889a42e906859e480ed05714d84d
+        ACCEPTED=da6d12a21d0fb2fbdc7c4048737b02ecf9835629
+        TEST_FILES+=(tests/test_scan_pacing.py)
+        NODES+=(tests/test_scan_pacing.py tests/test_daemon.py::test_scan_does_not_block_watchdog)
+        EXPECTED=30
+      else
+        TEST_CODE=fd48a39d753ab49bdd4f64571d063b970203f74f
+      fi
     else
       TEST_CODE=bb7508e1901f23dc078da8881d808dc6c7e0d8c5
     fi
@@ -149,15 +160,19 @@ PYTHON
 
 check_wake_progress() {
   [[ $PROFILE != --pin-audit ]] || return 0
-  if [[ $PROFILE == --watchdog-timing ]]; then
+  if [[ $PROFILE != --watchdog-wake ]]; then
     local started_us
     if ! started_us=$(systemctl show xgw.service -p ExecMainStartTimestampMonotonic --value) ||
        [[ ! $started_us =~ ^[1-9][0-9]*$ ]]; then
       printf '%s_PROGRESS_UNAVAILABLE result=unknown_process_start\n' "$PREFIX" >&2
       return 2
     fi
+    local progress_args=("$started_us")
+    if [[ $PROFILE == --watchdog-scan ]]; then
+      progress_args+=(--details)
+    fi
     if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
-         sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "$started_us"; then
+         sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "${progress_args[@]}"; then
       printf '%s_PROGRESS_UNAVAILABLE\n' "$PREFIX" >&2
       return 2
     fi
@@ -234,7 +249,7 @@ wait_status 0
 controls baseline "$D/base"
 if [[ $present == yes ]]; then
   check_wake_progress
-  if [[ $PROFILE == --watchdog-timing ]]; then
+  if [[ $PROFILE == --watchdog-timing || $PROFILE == --watchdog-scan ]]; then
     [[ $(pid xgw.service) == "$daemon_before" ]]
     controls confirmed "$D/tree"
   fi
