@@ -7,6 +7,7 @@ umask 077
 [[ $# == 1 || $# == 2 ]]
 [[ $1 =~ ^[0-9a-f]{40}$ ]]
 CODE=$1
+TEST_CODE=$CODE
 PROFILE=${2:---pin-audit}
 case "$PROFILE" in
   --pin-audit)
@@ -30,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake)
+  --watchdog-wake|--watchdog-timing)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -48,6 +49,16 @@ case "$PROFILE" in
            tests/test_net.py::test_tun_and_its_route_come_back_after_xray_starts_again
            tests/test_net.py::test_loaded_notices_a_lost_interface_route_or_tproxy)
     EXPECTED=15
+    if [[ $PROFILE == --watchdog-timing ]]; then
+      SCOPE=watchdog-timing
+      PREFIX=WATCHDOG_TIMING
+      BASE=c69ff9a75dbeec702f0490f8691144d247b0835d
+      ACCEPTED=6de2c66658f9889a42e906859e480ed05714d84d
+      NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check)
+      EXPECTED=17
+    else
+      TEST_CODE=bb7508e1901f23dc078da8881d808dc6c7e0d8c5
+    fi
     ;;
   *) exit 2 ;;
 esac
@@ -72,9 +83,10 @@ printf 'PINNED %s | %s | %s\nPRIVATE_ARTIFACTS %s\n' "$CODE" "$PRETTY_NAME" "$(u
 mkdir -p "$D/tree/src" "$D/base"
 tar -C /opt/xgw/lib --exclude=__pycache__ -cf - xgw | tar -C "$D/tree/src" -xf -
 [[ -z $(find "$D/tree/src/xgw" ! -type d ! -type f -print -quit) ]]
-git -C "$REPO" archive "$CODE" pyproject.toml "$INSTALLER" \
+git -C "$REPO" archive "$TEST_CODE" pyproject.toml \
   tests/conftest.py tests/links.py tests/fakenet.py tests/fakexray.py \
   tests/test_daemon.py tests/test_panel.py "${TEST_FILES[@]}" | tar -x -C "$D/tree"
+git -C "$REPO" show "$CODE:$INSTALLER" >"$D/tree/$INSTALLER"
 git -C "$REPO" diff --no-ext-diff --no-textconv "$BASE" "$ACCEPTED" -- "${PATHS[@]}" > "$D/audit.patch"
 cd "$D/tree"
 for path in "${PATHS[@]}"; do
@@ -134,11 +146,12 @@ PYTHON
 }
 
 check_wake_progress() {
-  [[ $PROFILE == --watchdog-wake ]] || return 0
-  if ! sudo -n "$PY" -I -B - <<'PYTHON'
+  [[ $PROFILE != --pin-audit ]] || return 0
+  if ! sudo -n "$PY" -I -B - "$PROFILE" <<'PYTHON'
 import json
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -153,15 +166,20 @@ try:
              and row["phase"] in ("tick", "sleep")
              and type(at) in (int, float) and 0 <= time.monotonic() - at <= 180
              and (wake is None or isinstance(wake, dict)))
+    if valid and sys.argv[1] == "--watchdog-timing":
+        step = row.get("last_step")
+        valid = (isinstance(step, dict) and type(step.get("sequence")) is int
+                 and step["sequence"] > 0 and step["started"] <= step["completed_at"] <= at
+                 and isinstance(step.get("parts_s"), dict))
 except (OSError, ValueError, KeyError, TypeError):
     valid = False
 raise SystemExit(not valid)
 PYTHON
   then
-    printf 'WATCHDOG_WAKE_PROGRESS_UNAVAILABLE\n' >&2
+    printf '%s_PROGRESS_UNAVAILABLE\n' "$PREFIX" >&2
     return 2
   fi
-  printf 'WATCHDOG_WAKE_PROGRESS_OK\n'
+  printf '%s_PROGRESS_OK\n' "$PREFIX"
 }
 
 https_control() {
