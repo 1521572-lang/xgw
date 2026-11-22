@@ -3,16 +3,28 @@
 """Генерация flowseal_lab.py (launcher) и translation.json из закреплённого источника Flowseal.
 
 Использование: make_flowseal.py <source.json> <outdir>
+Сверка: make_flowseal.py <source.json> <catalog-dir> --check [--source-tree <dir>]
 Самопроверка: каждая опция каждого профиля либо переведена, либо профиль исключён
 с записанной причиной; неучтённые опции прерывают сборку.
 """
-import json, re, sys
+import argparse
+import hashlib
+import json
+import re
+import sys
 from pathlib import Path
 
-SRC = Path(sys.argv[1])
-OUTDIR = Path(sys.argv[2])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("source", type=Path)
+parser.add_argument("output_dir", type=Path)
+parser.add_argument("--check", action="store_true")
+parser.add_argument("--source-tree", type=Path)
+cli = parser.parse_args()
+if cli.source_tree is not None and not cli.check:
+    parser.error("--source-tree requires --check")
+OUTDIR = cli.output_dir
 
-m = json.loads(SRC.read_text(encoding="utf-8"))
+m = json.loads(cli.source.read_text(encoding="utf-8"))
 assert m["commit"] == "2401b7a13837139b0265632464ba563dddbf80d8"
 assert len(m["configurations"]) == 22
 
@@ -43,6 +55,39 @@ NOTE_WF = ("wf-tcp/wf-udp — фильтры WinDivert (Windows-only); в nfqws2
            "очереди XGW; объём ограничен тестовым YouTube-потоком")
 NOTE_GAMEFILTER_SUBST = "значение disabled-режима GameFilter=12 подразумевается в %GameFilter*%"
 NOTE_IPID = "ip-id=zero применён ко всем стадиям профиля (winws задаёт глобально на профиль)"
+BAT_OPTION = re.compile(r'--([a-zA-Z0-9-]+)(?:=("[^"]*"|[^\s]+))?')
+
+
+def bat_options(line):
+    return [[key, value.strip('"').replace("^!", "!")]
+            for key, value in BAT_OPTION.findall(line) if key != "new"]
+
+
+def check_bat_sources(tree, manifest):
+    """Read the pinned BAT files and compare the order and options of each source section."""
+    for record in manifest["configurations"]:
+        name = record["file"]
+        if not re.fullmatch(r"general(?: \([A-Z0-9 ]+\))?\.bat", name):
+            raise ValueError("invalid BAT filename")
+        expected = manifest["files"][name]
+        path = tree / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{name}: missing regular BAT file")
+        with path.open("rb") as stream:
+            data = stream.read(64 * 1024 + 1)
+        if (len(data) > 64 * 1024 or len(data) != expected["bytes"]
+                or hashlib.sha256(data).hexdigest() != expected["sha256"]):
+            raise ValueError(f"{name}: BAT size or SHA-256 differs")
+        lines = data.decode("utf-8-sig").splitlines()
+        launch = [bat_options(line) for line in lines if '"%BIN%winws.exe"' in line]
+        profiles = [
+            {"profile": number, "options": bat_options(line)}
+            for number, line in enumerate(
+                (line for line in lines if line.startswith("--filter-")), start=1
+            )
+        ]
+        if launch != [record["global_options"]] or profiles != record["all_profiles_in_source_order"]:
+            raise ValueError(f"{name}: BAT sections or option order differ")
 
 
 def blob_name(basename):
@@ -241,7 +286,7 @@ USED_KEYS = {
     "dpi-desync-split-seqovl", "dpi-desync-split-seqovl-pattern",
     "dpi-desync-fakedsplit-pattern", "dpi-desync-fake-tls-mod",
     "dpi-desync-hostfakesplit-mod", "dpi-desync-badseq-increment",
-    "dpi-desync-badack-increment", "dpi-desync-any-protocol", "dpi-desync-cutoff",
+    "dpi-desync-badack-increment", "dpi-desync-any-protocol",
     "dpi-desync-fake-discord", "dpi-desync-fake-stun", "dpi-desync-fake-unknown",
     "dpi-desync-fake-unknown-udp", "filter-l3",
     "hostlist-exclude-domains",
@@ -252,7 +297,7 @@ def translate_profile(num, raw):
     o = OD(optmap(raw))
     kind, reason = classify(o)
     if kind.endswith("_EXCLUDED"):
-        left = [k for k in o if k not in USED_KEYS]
+        left = [k for k in o if k not in USED_KEYS and k != "dpi-desync-cutoff"]
         return kind, None, None, [reason], [], left
     notes = []
     ipid_zero = o.get("ip-id") == "zero"
@@ -295,6 +340,7 @@ def translate_profile(num, raw):
     if need_http and fake_http:
         repeats = o.get("dpi-desync-repeats")
         rep = f":repeats={int(repeats)}" if repeats is not None else ""
+        ipid = ":ip_id=zero" if ipid_zero else ""
         fargs, _ = fooling_args(o.get("dpi-desync-fooling"), o)
         hb = [a for a in args if not a.startswith(("--payload=", "--lua-desync=", "--filter-l7="))]
         hb.append("--filter-l7=http")
@@ -302,7 +348,7 @@ def translate_profile(num, raw):
         for b in fake_http:
             name = blob_name(str(b).split("/")[-1])
             blobs.append(("file", name, b))
-            hb.append(f"--lua-desync=fake:blob={name}{rep}" + "".join(":" + x for x in fargs))
+            hb.append(f"--lua-desync=fake:blob={name}{rep}{ipid}" + "".join(":" + x for x in fargs))
         http_block = hb
         notes.append(NOTES_PAYLOAD)
     left = [k for k in o if k not in USED_KEYS]
@@ -585,8 +631,27 @@ launcher = (LAUNCHER_TEMPLATE
             .replace("@@SOURCE@@", json.dumps(src_compact, ensure_ascii=False, indent=1))
             .replace("@@BLOBS@@", json.dumps({cid: t["blob_decls"] for cid, t in translation["configurations"].items()},
                                              ensure_ascii=False, indent=1)))
+translation_text = json.dumps(translation, ensure_ascii=False, indent=1)
+if cli.check:
+    try:
+        if cli.source_tree is not None:
+            check_bat_sources(cli.source_tree, m)
+        expected = {
+            "flowseal-translation.json": translation_text,
+            "flowseal_lab.py": launcher,
+        }
+        for name, generated in expected.items():
+            if (OUTDIR / name).read_text(encoding="utf-8") != generated:
+                raise ValueError(f"{name}: generated content differs")
+    except (OSError, ValueError) as exc:
+        print(f"FLOWSEAL_CHECK_FAILED {exc}", file=sys.stderr)
+        sys.exit(2)
+    count = 0 if cli.source_tree is None else len(m["configurations"])
+    print(f"FLOWSEAL_CHECK_OK configurations={len(m['configurations'])} source_bat={count}")
+    sys.exit(0)
+
 (OUTDIR / "flowseal_lab.py").write_text(launcher, encoding="utf-8", newline="\n")
-(OUTDIR / "translation.json").write_text(json.dumps(translation, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
+(OUTDIR / "translation.json").write_text(translation_text, encoding="utf-8", newline="\n")
 import py_compile
 try:
     py_compile.compile(str(OUTDIR / "flowseal_lab.py"), doraise=True)
