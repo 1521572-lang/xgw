@@ -2627,6 +2627,28 @@ def test_watchdog_wake_progress_keeps_first_arrival_and_batch(daemon, monkeypatc
     assert second["wake"]["received"] == {"net": 105.0}
 
 
+def test_watchdog_reports_tick_overlap_and_separate_rules_check(daemon, monkeypatch):
+    now = [101.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def guard():
+        now[0] += 1.5
+
+    monkeypatch.setattr(daemon, "_guard_now", guard)
+    daemon.wake("net")
+    now[0] = 106.0
+    daemon.wake("rules")
+    daemon._last_step = {"sequence": 2, "started": 100.0, "completed_at": 108.0, "parts_s": {}}
+    now[0] = 110.0
+    assert daemon._on_wake(120) == 111.5
+    daemon._loop_progress("tick", started=111.5)
+    record = json.loads((daemon.paths.run / "watchdog-step.json").read_bytes())
+    assert record["wake"] == {
+        "sequence": 1, "received": {"net": 101.0, "rules": 106.0}, "handling_at": 110.0,
+        "last_step_overlap_s": {"net": 7.0, "rules": 2.0}, "rules_check_s": 1.5,
+    }
+
+
 def test_late_probe_under_load_is_not_a_failure(daemon):
     """Канал забит: проба не успела, а через выбранный сервер за 10 с прошло 5 МБ —
     провал не засчитывается, счётчик не растёт."""
@@ -3104,6 +3126,14 @@ def _scheduled_run(daemon, monkeypatch, state, durations, spread=1.0):
     monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(module, "jitter", lambda seconds: seconds * spread)
     def tick():
+        progress = json.loads((daemon.paths.run / "watchdog-step.json").read_text())
+        previous = progress["last_step"]
+        if starts:
+            assert previous["sequence"] == len(starts)
+            assert previous["started"] == starts[-1]
+            assert previous["completed_at"] == starts[-1] + durations[len(starts) - 1]
+        else:
+            assert previous is None
         starts.append(now[0])
         now[0] += durations[len(starts) - 1]
         return state
@@ -3112,6 +3142,7 @@ def _scheduled_run(daemon, monkeypatch, state, durations, spread=1.0):
         progress = json.loads((daemon.paths.run / "watchdog-step.json").read_text())
         assert progress["phase"] == "sleep"
         assert progress["step_s"] == durations[len(starts) - 1]
+        assert progress["last_step"]["sequence"] == len(starts)
         now[0] += seconds
         if len(starts) == len(durations):
             stop.set()

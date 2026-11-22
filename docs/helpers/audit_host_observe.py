@@ -11,6 +11,12 @@ import time
 import tomllib
 from pathlib import Path
 
+STEP_PARTS = (
+    "первая сборка конфига", "сигналы ядра", "белый список", "списки бесплатного пула",
+    "перехват и конфиг", "устройства и сервер пула", "подписка и сборка конфига", "сканы и замены",
+    "основной сервер и замеры подписки", "замер пула и YouTube", "ядра и сеть", "запись состояния",
+)
+
 
 def read_command(*argv):
     p = subprocess.run(argv, capture_output=True, text=True, timeout=8)
@@ -93,11 +99,41 @@ def wake_sample(row, begin, measured_at):
     return ((generation, sequence), delays) if delays else None
 
 
+def completed_step(row, begin, measured_at):
+    generation = row.get("generation")
+    if type(generation) is int and isinstance(step := row.get("last_step"), dict):
+        sequence, started, ended = (step.get(key) for key in ("sequence", "started", "completed_at"))
+        if (type(sequence) is not int or sequence < 1 or type(started) not in (int, float)
+                or type(ended) not in (int, float) or not math.isfinite(started) or started > ended
+                or not begin <= ended <= measured_at):
+            return None
+        duration = ended - started
+        raw_parts = step.get("parts_s")
+        parts = {}
+        if isinstance(raw_parts, dict):
+            for name in STEP_PARTS:
+                value = raw_parts.get(name)
+                if type(value) in (int, float) and 0 <= value <= duration:
+                    parts[name] = value
+        return (generation, sequence), duration, parts
+    started, duration = row.get("started"), row.get("step_s")
+    if (row.get("phase") == "sleep" and type(started) in (int, float)
+            and type(duration) in (int, float) and duration >= 0
+            and begin <= started + duration <= measured_at):
+        return (generation if type(generation) is int else None, started), duration, {}
+    return None
+
+
 def watchdog(seconds):
     begin = time.monotonic()
     deadline = begin + seconds
     steps = {}
+    step_sequences = {}
+    part_max = {}
+    intervals = set()
     wakes = {}
+    wake_overlaps = {}
+    checks = {}
     wake_available = False
     misses = 0
     max_age = None
@@ -114,17 +150,33 @@ def watchdog(seconds):
             max_age = max(max_age or 0, age)
             samples += 1
             recorded_at = float(row["at"])
-            generation = row.get("generation")
-            started, duration = row.get("started"), row.get("step_s")
-            if (row.get("phase") == "sleep" and type(started) in (int, float)
-                    and type(duration) in (int, float) and duration >= 0
-                    and begin <= started + duration <= recorded_at):
-                key = (generation if type(generation) is int else None, started)
+            interval = row.get("interval_s")
+            if type(interval) is int and interval >= 0:
+                intervals.add(interval)
+            if sample := completed_step(row, begin, recorded_at):
+                key, duration, parts = sample
                 steps[key] = duration
+                if type(key[0]) is int and isinstance(row.get("last_step"), dict):
+                    generation, sequence = key
+                    step_sequences.setdefault(generation, set()).add(sequence)
+                for name, value in parts.items():
+                    part_max[name] = max(part_max.get(name, 0), value)
             wake_available |= type(row.get("generation")) is int and "wake" in row
             if sample := wake_sample(row, begin, recorded_at):
                 key, delays = sample
                 wakes[key] = delays
+                wake = row["wake"]
+                overlap = wake.get("last_step_overlap_s")
+                if isinstance(overlap, dict):
+                    wake_overlaps[key] = {}
+                    for reason, delay in delays.items():
+                        span = overlap.get(reason)
+                        if type(span) in (int, float) and 0 <= span <= delay:
+                            wake_overlaps[key][reason] = span
+                check = wake.get("rules_check_s")
+                if ("rules" in delays and type(check) in (int, float)
+                        and 0 <= check <= recorded_at - wake["handling_at"]):
+                    checks[key] = check
         except (OSError, KeyError, ValueError, TypeError):
             misses += 1
         remaining = deadline - time.monotonic()
@@ -137,18 +189,30 @@ def watchdog(seconds):
         delays = [sample[reason] for sample in wakes.values() if reason in sample]
         if delays:
             by_reason[reason] = {"count": len(delays), "max_s": round(max(delays), 4)}
+            overlaps = [sample[reason] for sample in wake_overlaps.values() if reason in sample]
+            if overlaps:
+                by_reason[reason]["last_step_overlap"] = {
+                    "count": len(overlaps), "max_s": round(max(overlaps), 4),
+                }
+    wake_details = {}
+    if checks:
+        wake_details["rules_check"] = {"count": len(checks), "max_s": round(max(checks.values()), 4)}
     if wake_available:
         wake_state = "observed" if wakes else "not_observed"
     else:
         wake_state = "not_instrumented" if samples else "unavailable"
+    skipped = sum(max(seq) - min(seq) + 1 - len(seq) for seq in step_sequences.values())
     print(json.dumps({"seconds": seconds, "samples": samples, "missing": misses,
+                      "configured_intervals_s": sorted(intervals),
                       "distinct_completed_steps": len(values),
+                      "unseen_steps_between_samples": skipped if step_sequences else None,
                       "max_record_age_s": round(max_age, 2) if max_age is not None else None,
                       "step_max_s": values[-1] if values else None,
                       "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None,
+                      "step_part_max_s": {name: round(value, 4) for name, value in part_max.items()},
                       "wake": {"available": wake_available, "state": wake_state,
                                "observed_batches": len(wakes),
-                               "by_reason": by_reason}}))
+                               "by_reason": by_reason, **wake_details}}, ensure_ascii=False))
 
 
 def desync():

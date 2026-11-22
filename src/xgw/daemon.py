@@ -956,6 +956,8 @@ class Daemon:
         self._sb_history: dict[str, float] = {}
         self._build_outcome: str | None = None
         self._loop_step_s = 0.0
+        self._loop_sequence = 0
+        self._last_step: dict | None = None
         self._health_observed: float | None = None
 
     # --- цикл ------------------------------------------------------------------
@@ -972,8 +974,14 @@ class Daemon:
             except Exception:  # сбой одного шага не должен ронять демон
                 self.log.exception("шаг watchdog завершился ошибкой")
                 state = self.machine.state
-            spent = time.monotonic() - started
+            completed_at = time.monotonic()
+            spent = completed_at - started
             self._loop_step_s = spent
+            self._loop_sequence += 1
+            self._last_step = {
+                "sequence": self._loop_sequence, "started": started,
+                "completed_at": completed_at, "parts_s": self._tick_spent.copy(),
+            }
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
                 # freepool-recovery, youtube: режим «весь дом» не появлялся в ней 3 минуты).
@@ -1015,6 +1023,7 @@ class Daemon:
             atomic_write_json(self.paths.run / "watchdog-step.json", {
                 "phase": phase, "at": time.monotonic(), "interval_s": self.cfg.watchdog.interval_s,
                 "generation": self._loop_generation, "wake": self._last_wake,
+                "last_step": self._last_step,
                 "previous_step_s": self._loop_step_s, **details,
             }, mode=0o600)
         except OSError as exc:
@@ -1084,8 +1093,17 @@ class Daemon:
                 "sequence": self._wake_sequence, "received": received,
                 "handling_at": handling_at,
             }
+            if self._last_step is not None:
+                step_start = self._last_step["started"]
+                step_end = self._last_step["completed_at"]
+                self._last_wake["last_step_overlap_s"] = {
+                    reason: max(0.0, step_end - max(at, step_start))
+                    for reason, at in received.items()
+                }
         if "rules" in reasons:
+            check_at = time.monotonic()
             self._guard_now()
+            self._last_wake["rules_check_s"] = time.monotonic() - check_at
         now = time.monotonic()
         if "sleep" in reasons:
             self._resumed = True
