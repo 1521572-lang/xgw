@@ -2359,11 +2359,12 @@ class Daemon:
 
     def _handle_leak(self) -> None:
         """Выход в домашнюю страну при включённом перехвате — раз на проверку утечки, а не
-        на каждом шаге. Причин две: сервер, выбранный балансировщиком, сам выходит в эту
-        страну (тогда его меняют запасным), либо трафик идёт мимо Xray (тогда правила
-        перехвата загружаются заново). Событие — только когда меняется его текст."""
+        на каждом шаге. Сверяем результат с явной пробой через Xray. Подтверждённый
+        автоматический сервер с домашним выходом меняем. Если путь остаётся
+        неясным, заново проверяем правила. Событие — только при смене текста."""
         home = self.cfg.routing.home_country.upper()
-        selected = self._selected() if self._exit_via_xray() == home else None
+        via_xray = self._exit_via_xray()
+        selected = self._selected() if via_xray == home else None
         if selected is not None:
             tag, pinned = selected
             member = self._member_by_tag(tag)
@@ -2378,6 +2379,13 @@ class Daemon:
             else:
                 text = f"выход в {home}: сервер {tag} сам выходит в {home}"
         else:
+            if via_xray == home:
+                evidence = "контроль через Xray тоже показал домашнюю страну, сервер не определён"
+            elif via_xray:
+                evidence = "обычный запрос и контроль через Xray показали разные страны"
+            else:
+                evidence = "контроль через Xray не подтвердился"
+            text = f"выход в {home} при включённом перехвате — {evidence}, путь не установлен"
             try:
                 self.reapply_capture()
                 if self.capture is not None and self.capture.loaded() is not True:
@@ -2385,11 +2393,9 @@ class Daemon:
             except Exception as exc:  # сбой сети не должен ронять шаг watchdog
                 self.log.error("правила перехвата не переприменены: %s", exc)
                 # Текст без причины: он сравнивается с прежним, а причина есть в журнале.
-                text = (f"выход в {home} мимо Xray при включённом перехвате — устранение не "
-                        "подтверждено: правила перехвата не загрузились")
+                text += " — применение правил не подтверждено"
             else:
-                text = (f"выход в {home} мимо Xray при включённом перехвате — правила "
-                        "загружены заново и проверены")
+                text += " — правила загружены заново и проверены"
         if text != self._leak_note:
             self._leak_note = text
             self.notifier.event("leak", text, notify=True)

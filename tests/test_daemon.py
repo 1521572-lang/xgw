@@ -1887,11 +1887,11 @@ def test_server_exiting_at_home_is_replaced_and_not_taken_back(tmp_path, monkeyp
         daemon.t += 400
         assert daemon.tick() is State.HEALTHY
 
-        # Выход в RU мимо Xray (через Xray — NL): виноваты правила, их грузят заново.
+        # Страны в двух пробах различаются, правила проверяются повторно.
         daemon.location = "RU"
         daemon.t += 400
         assert daemon.tick() is State.LEAK and reapplied == [1]
-        assert any("мимо Xray" in event for event in daemon.events())
+        assert any("показали разные страны" in event for event in daemon.events())
 
         # Закреплённый вручную сервер не меняется — человеку говорят снять закрепление.
         pinned = daemon.tags("proxy")[0]
@@ -3228,6 +3228,23 @@ def test_leak_reports_success_only_after_the_rules_are_confirmed(guarded, monkey
     capture.loaded = lambda: True
     daemon._handle_leak()
     assert len(leaks()) == 2 and "загружены заново и проверены" in leaks()[0]  # новые — первыми
+
+
+@pytest.mark.parametrize(("via", "message"), [
+    (None, "контроль через Xray не подтвердился"),
+    ("NL", "показали разные страны"),
+    ("RU", "сервер не определён"),
+])
+def test_home_exit_without_route_evidence_does_not_claim_bypass(guarded, monkeypatch, via,
+                                                                message):
+    daemon, capture = guarded
+    monkeypatch.setattr(daemon, "_exit_via_xray", lambda: via)
+    monkeypatch.setattr(daemon, "_selected", lambda: None)
+    daemon._handle_leak()
+    leaks = [event for event in daemon.events() if event.startswith("leak:")]
+    assert len(leaks) == 1
+    assert message in leaks[0] and "путь не установлен" in leaks[0]
+    assert "мимо Xray" not in leaks[0] and capture.actions() == ["up"]
 
 
 # --- п. 348: выход для видео -----------------------------------------------------------------

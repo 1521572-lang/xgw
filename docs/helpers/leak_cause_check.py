@@ -12,6 +12,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 DB = Path("/var/lib/xgw/state.db")
@@ -23,6 +25,10 @@ REFUSED = "не прошло настоящий запрос через мост
 INSTALL_SWITCH = "новое поколение выбрано через API"
 INSTALL_REFUSE = "конфиг sing-box отклонён"
 SUMMARY = re.compile(r"мостов проверено [0-9]+ из [0-9]+(: [a-z]+ [0-9]+(, [a-z]+ [0-9]+)*)?")
+LEAK_CAUSES = ("own_exit", "pinned", "bypass", "xray_probe_failed",
+               "countries_differ", "xray_home_without_server", "other")
+INCIDENT_KINDS = {"LEAK": "home_exit_alert", "DEGRADED": "degraded", "HEALTHY": "healthy",
+                  "capture": "capture_event", "rotation": "rotation", "apply": "apply"}
 
 
 def run(argv, *, timeout=60):
@@ -40,7 +46,49 @@ def classify(detail):
         return "bypass"
     if "сам выходит" in detail:
         return "own_exit"
+    if "контроль через Xray не подтвердился" in detail:
+        return "xray_probe_failed"
+    if "показали разные страны" in detail:
+        return "countries_differ"
+    if "тоже показал домашнюю страну" in detail:
+        return "xray_home_without_server"
     return "other"
+
+
+def incident_label(kind, detail):
+    if kind == "leak":
+        cause = classify(detail)
+        return "legacy_ambiguous" if cause == "bypass" else cause
+    if kind == "pin":
+        if "автовыбор:" in detail or "снят по истечении срока" in detail:
+            return "pin_released"
+        if "выбран вручную" in detail:
+            return "pin_set"
+        return "pin_event"
+    return INCIDENT_KINDS[kind]
+
+
+def incident(start_text, end_text):
+    start, end = map(datetime.fromisoformat, (start_text, end_text))
+    if start.utcoffset() is None or end.utcoffset() is None:
+        raise ValueError("timezone_required")
+    lo, hi = start.timestamp(), end.timestamp()
+    if not 0 < hi - lo <= 3600:
+        raise ValueError("bounded_incident_window_required")
+    kinds = ("leak", "pin", *INCIDENT_KINDS)
+    with closing(sqlite3.connect(f"{DB.as_uri()}?mode=ro", uri=True, timeout=5)) as conn:
+        rows = conn.execute(
+            "SELECT ts, kind, detail FROM events WHERE ts >= ? AND ts < ? "
+            f"AND kind IN ({','.join('?' for _ in kinds)}) ORDER BY ts, id LIMIT 257",
+            (lo, hi, *kinds),
+        ).fetchall()
+    if len(rows) > 256:
+        print("INCIDENT_TOO_MANY_EVENTS")
+        return 2
+    for ts, kind, detail in rows:
+        print(f"INCIDENT_EVENT offset_s={round(ts - lo)} kind={incident_label(kind, detail)}")
+    print(f"INCIDENT_COMPLETE events={len(rows)}")
+    return 0
 
 
 def events(kind, since):
@@ -82,7 +130,7 @@ def report(hours):
         moment = unit_start(unit)
         print(f"INFO unit_start {unit}={clock(moment) if moment else 'none'}", flush=True)
     rows = events("leak", since)
-    totals = dict.fromkeys(("own_exit", "pinned", "bypass", "other"), 0)
+    totals = dict.fromkeys(LEAK_CAUSES, 0)
     for _ts, detail in rows:
         totals[classify(detail)] += 1
     print("INFO leak_totals " + json.dumps(totals, sort_keys=True), flush=True)
@@ -118,6 +166,8 @@ def report(hours):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "incident":
+        return incident(sys.argv[2], sys.argv[3])
     if len(sys.argv) == 3 and sys.argv[1] == "report" and sys.argv[2].isdigit():
         report(int(sys.argv[2]))
         return 0
