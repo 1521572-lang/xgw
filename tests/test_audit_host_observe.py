@@ -85,8 +85,10 @@ def test_watchdog_audit_counts_completions_from_tick_records(observer, monkeypat
         "generation": 1, "at": 101.25, "phase": "tick", "started": 101.25, "interval_s": 20,
         "last_step": {"sequence": 3, "started": 99.75, "completed_at": 100.75,
                       "parts_s": {"сигналы ядра": 0.75, "private value": 1.0},
-                      "details_s": {"end_to_end": 0.5, "private": 0.2, "scan_queue": 2.0},
+                      "details_s": {"end_to_end": 0.5, "provider_resolve": 0.01,
+                                    "private": 0.2, "scan_queue": 2.0},
                       "planned_scan_deferred": True, "provider_attempts": 2,
+                      "provider_dns_refresh_started": False, "provider_dns_refresh_used": True,
                       "scan_deferred_for_step": True, "queue_probe_count": 1},
         "wake": wake,
     }
@@ -111,11 +113,15 @@ def test_watchdog_audit_counts_completions_from_tick_records(observer, monkeypat
     assert result["step_part_max_s"] == {"сигналы ядра": 0.75}
     assert result["step_details"] == {
         "end_to_end": {"steps": 1, "max_s": 0.5, "p50_s": 0.5, "p95_s": 0.5},
+        "provider_resolve": {"steps": 1, "max_s": 0.01, "p50_s": 0.01, "p95_s": 0.01},
     }
     assert result["planned_scan_deferred_steps"] == 1
     assert result["scan_deferred_for_step"] == 1
     assert result["queue_probes"] == {"steps": 1, "steps_with_probes": 1, "total": 1}
     assert result["provider_attempts"] == {"steps": 1, "total": 2, "max": 2}
+    assert result["provider_dns_refresh"] == {
+        "steps": 1, "started": 0, "used": 1, "max_resolve_s_when_used": 0.01,
+    }
     assert result["wake"]["rules_check"] == {"count": 1, "max_s": 0.2}
     assert result["wake"]["by_reason"]["rules"]["last_step_overlap"] == {
         "count": 1, "max_s": 0.75,

@@ -31,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan|--watchdog-scan-slot)
+  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan|--watchdog-scan-slot|--watchdog-wan-dns)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -77,12 +77,24 @@ case "$PROFILE" in
                   tests/test_tspu.py::test_e2e_tries_another_host_and_rests_the_one_that_answered_403
                   tests/test_tspu.py::test_e2e_timings_distinguish_primary_and_fallback)
           EXPECTED=34
-          if [[ $PROFILE == --watchdog-scan-slot ]]; then
+          if [[ $PROFILE != --watchdog-wan ]]; then
             SCOPE=watchdog-scan-slot
             PREFIX=WATCHDOG_SCAN_SLOT
             BASE=1fc8fa526f8353ade444f351f5509e9627059486
             ACCEPTED=aa2a3ab4fc6c46134c5949283b2b6e8b658f250c
             EXPECTED=39
+            if [[ $PROFILE == --watchdog-wan-dns ]]; then
+              SCOPE=watchdog-wan-dns
+              PREFIX=WATCHDOG_WAN_DNS
+              BASE=$ACCEPTED
+              ACCEPTED=ee29dd7ed4f54263a033ebf404a40c0ab25f0124
+              NODES+=(tests/test_tspu.py::test_provider_refreshes_working_host_before_ttl_without_waiting
+                      tests/test_tspu.py::test_provider_keeps_foreground_fallback_when_refresh_is_unavailable
+                      tests/test_tspu.py::test_provider_discards_ready_refresh_after_network_event)
+              EXPECTED=43
+            else
+              TEST_CODE=220a657a787efb062c7867689a51611b6367d7b0
+            fi
           else
             TEST_CODE=adf8e8b86867904324a9a62b6701e55e8ce8bb91
           fi
@@ -155,7 +167,7 @@ pid() {
 }
 
 wait_status() {
-  local release_at=$1 attempt
+  local release_at=$1 attempt rc
   for attempt in {1..30}; do
     if sudo -n "$PY" -I -B - "$release_at" <<'PYTHON'
 import json
@@ -165,15 +177,29 @@ from pathlib import Path
 try:
     status = json.loads(Path("/run/xgw/status.json").read_bytes())
     updated = status["updated"]
-    accepted = (updated >= float(sys.argv[1]) and 0 <= time.time() - updated <= 180
+    release_at = float(sys.argv[1])
+    now = time.time()
+    fresh = updated >= release_at and 0 <= now - updated <= 180
+    pin = status.get("pin")
+    if release_at == 0 and fresh and isinstance(pin, dict) and pin:
+        until = pin.get("until")
+        if until is None or (type(until) in (int, float) and until > now):
+            raise SystemExit(42)
+    accepted = (fresh
                 and status["state"] in {"HEALTHY", "DEGRADED"}
-                and status["xray"]["ok"] is True and not status.get("pin"))
+                and status["xray"]["ok"] is True and not pin)
 except (OSError, ValueError, KeyError, TypeError):
     accepted = False
 raise SystemExit(not accepted)
 PYTHON
     then
       return 0
+    else
+      rc=$?
+      if [[ $rc == 42 ]]; then
+        printf '%s_MANUAL_PIN_ACTIVE\n' "$PREFIX" >&2
+        return 2
+      fi
     fi
     sleep 2
   done
@@ -197,6 +223,8 @@ check_wake_progress() {
       progress_args+=(--provider)
     elif [[ $PROFILE == --watchdog-scan-slot ]]; then
       progress_args+=(--scan-slot)
+    elif [[ $PROFILE == --watchdog-wan-dns ]]; then
+      progress_args+=(--wan-dns)
     fi
     if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
          sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "${progress_args[@]}"; then

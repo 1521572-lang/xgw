@@ -144,6 +144,7 @@ def watchdog(seconds):
     scan_slot_deferrals = {}
     queue_probes = {}
     provider_attempts = {}
+    provider_dns_refresh = {}
     intervals = set()
     wakes = {}
     wake_overlaps = {}
@@ -186,6 +187,10 @@ def watchdog(seconds):
                     attempts = step.get("provider_attempts")
                     if type(attempts) is int and attempts >= 0:
                         provider_attempts[key] = attempts
+                    started = step.get("provider_dns_refresh_started")
+                    used = step.get("provider_dns_refresh_used")
+                    if type(started) is bool and type(used) is bool:
+                        provider_dns_refresh[key] = (started, used)
                     details = step_timings(step.get("details_s"), STEP_DETAILS, duration)
                     for name, value in details.items():
                         detail_times.setdefault(name, {})[key] = value
@@ -262,6 +267,17 @@ def watchdog(seconds):
                           "steps": len(provider_attempts), "total": sum(provider_attempts.values()),
                           "max": max(provider_attempts.values()),
                       } if provider_attempts else None,
+                      "provider_dns_refresh": {
+                          "steps": len(provider_dns_refresh),
+                          "started": sum(started for started, _ in provider_dns_refresh.values()),
+                          "used": sum(used for _, used in provider_dns_refresh.values()),
+                          "max_resolve_s_when_used": max(
+                              (round(value, 4) for key, value
+                               in detail_times.get("provider_resolve", {}).items()
+                               if provider_dns_refresh.get(key, (False, False))[1]),
+                              default=None,
+                          ),
+                      } if provider_dns_refresh else None,
                       "wake": {"available": wake_available, "state": wake_state,
                                "observed_batches": len(wakes),
                                "by_reason": by_reason, **wake_details}}, ensure_ascii=False))

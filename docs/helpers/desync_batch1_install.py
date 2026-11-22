@@ -106,6 +106,7 @@ WATCHDOG_TIMING_TIMER = "xgw-watchdog-timing-rollback.timer"
 WATCHDOG_SCAN_TIMER = "xgw-watchdog-scan-rollback.timer"
 WATCHDOG_WAN_TIMER = "xgw-watchdog-wan-rollback.timer"
 WATCHDOG_SCAN_SLOT_TIMER = "xgw-watchdog-scan-slot-rollback.timer"
+WATCHDOG_WAN_DNS_TIMER = "xgw-watchdog-wan-dns-rollback.timer"
 
 
 def gui_files(files):
@@ -284,6 +285,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "watchdog_wan_dns", False):
+        return WATCHDOG_WAKE, WATCHDOG_WAN_DNS_TIMER
     if getattr(args, "watchdog_scan_slot", False):
         return WATCHDOG_WAKE, WATCHDOG_SCAN_SLOT_TIMER
     if getattr(args, "watchdog_wan", False):
@@ -400,6 +403,7 @@ def main():
     stage.add_argument("--watchdog-scan", action="store_true")
     stage.add_argument("--watchdog-wan", action="store_true")
     stage.add_argument("--watchdog-scan-slot", action="store_true")
+    stage.add_argument("--watchdog-wan-dns", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl

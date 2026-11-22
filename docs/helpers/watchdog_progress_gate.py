@@ -15,7 +15,8 @@ FATAL_STATES = {"invalid_snapshot", "invalid_format", "unexpected_mode"}
 
 def progress_state(path: Path, minimum_generation: int, now: float,
                    *, require_details: bool = False, require_provider: bool = False,
-                   require_scan_slot: bool = False) -> str:
+                   require_scan_slot: bool = False, require_wan_dns: bool = False) -> str:
+    require_scan_slot |= require_wan_dns
     try:
         with path.open("rb") as stream:
             if stat.S_IMODE(os.fstat(stream.fileno()).st_mode) != 0o600:
@@ -67,20 +68,24 @@ def progress_state(path: Path, minimum_generation: int, now: float,
         count = step.get("queue_probe_count")
         if type(count) is not int or count < 0 or type(step.get("scan_deferred_for_step")) is not bool:
             return "invalid_format"
+    if require_wan_dns and (type(step.get("provider_dns_refresh_started")) is not bool
+                            or type(step.get("provider_dns_refresh_used")) is not bool):
+        return "invalid_format"
     return "ready"
 
 
 def wait_progress(path: Path, minimum_generation: int, seconds: float,
                   *, require_details: bool = False,
                   require_provider: bool = False,
-                  require_scan_slot: bool = False) -> tuple[str, int, bool]:
+                  require_scan_slot: bool = False,
+                  require_wan_dns: bool = False) -> tuple[str, int, bool]:
     deadline = time.monotonic() + seconds
     attempts = 0
     saw_first_step = False
     while True:
         state = progress_state(path, minimum_generation, time.monotonic(),
                                require_details=require_details, require_provider=require_provider,
-                               require_scan_slot=require_scan_slot)
+                               require_scan_slot=require_scan_slot, require_wan_dns=require_wan_dns)
         attempts += 1
         saw_first_step |= state == "waiting_first_step"
         remaining = deadline - time.monotonic()
@@ -90,8 +95,8 @@ def wait_progress(path: Path, minimum_generation: int, seconds: float,
 
 
 if __name__ == "__main__":
-    if (len(sys.argv) not in (2, 3) or (len(sys.argv) == 3
-                                       and sys.argv[2] not in ("--details", "--provider", "--scan-slot"))
+    if (len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and
+            sys.argv[2] not in ("--details", "--provider", "--scan-slot", "--wan-dns"))
             or not sys.argv[1].isascii() or not sys.argv[1].isdigit()):
         raise SystemExit(2)
     minimum_generation = int(sys.argv[1]) * 1000  # systemd reports monotonic microseconds
@@ -101,7 +106,7 @@ if __name__ == "__main__":
     state, attempts, saw_first_step = wait_progress(
         PROGRESS, minimum_generation, 120,
         require_details=mode == "--details", require_provider=mode == "--provider",
-        require_scan_slot=mode == "--scan-slot",
+        require_scan_slot=mode == "--scan-slot", require_wan_dns=mode == "--wan-dns",
     )
     print(f"WATCHDOG_TIMING_PROGRESS_CHECK result={state} polls={attempts} "
           f"waiting_first_step={str(saw_first_step).lower()}")
