@@ -139,8 +139,10 @@ def watchdog(seconds):
     steps = {}
     step_sequences = {}
     part_max = {}
-    detail_max, detail_samples = {}, {}
+    detail_times = {}
     scan_deferrals = {}
+    scan_slot_deferrals = {}
+    queue_probes = {}
     provider_attempts = {}
     intervals = set()
     wakes = {}
@@ -175,13 +177,18 @@ def watchdog(seconds):
                     deferred = step.get("planned_scan_deferred")
                     if type(deferred) is bool:
                         scan_deferrals[key] = deferred
+                    deferred_for_step = step.get("scan_deferred_for_step")
+                    if type(deferred_for_step) is bool:
+                        scan_slot_deferrals[key] = deferred_for_step
+                    count = step.get("queue_probe_count")
+                    if type(count) is int and count >= 0:
+                        queue_probes[key] = count
                     attempts = step.get("provider_attempts")
                     if type(attempts) is int and attempts >= 0:
                         provider_attempts[key] = attempts
                     details = step_timings(step.get("details_s"), STEP_DETAILS, duration)
                     for name, value in details.items():
-                        detail_max[name] = max(detail_max.get(name, 0), value)
-                        detail_samples.setdefault(name, set()).add(key)
+                        detail_times.setdefault(name, {})[key] = value
                 for name, value in parts.items():
                     part_max[name] = max(part_max.get(name, 0), value)
             wake_available |= type(row.get("generation")) is int and "wake" in row
@@ -225,6 +232,14 @@ def watchdog(seconds):
     else:
         wake_state = "not_instrumented" if samples else "unavailable"
     skipped = sum(max(seq) - min(seq) + 1 - len(seq) for seq in step_sequences.values())
+    step_details = {}
+    for name, timings in detail_times.items():
+        durations = sorted(timings.values())
+        step_details[name] = {
+            "steps": len(durations), "max_s": round(durations[-1], 4),
+            "p50_s": round(durations[math.ceil(len(durations) / 2) - 1], 4),
+            "p95_s": round(durations[math.ceil(len(durations) * .95) - 1], 4),
+        }
     print(json.dumps({"seconds": seconds, "samples": samples, "missing": misses,
                       "configured_intervals_s": sorted(intervals),
                       "distinct_completed_steps": len(values),
@@ -233,12 +248,16 @@ def watchdog(seconds):
                       "step_max_s": values[-1] if values else None,
                       "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None,
                       "step_part_max_s": {name: round(value, 4) for name, value in part_max.items()},
-                      "step_details": {
-                          name: {"max_s": round(value, 4), "steps": len(detail_samples[name])}
-                          for name, value in detail_max.items()
-                      },
+                      "step_details": step_details,
                       "planned_scan_deferred_steps": sum(scan_deferrals.values())
                       if scan_deferrals else None,
+                      "scan_deferred_for_step": sum(scan_slot_deferrals.values())
+                      if scan_slot_deferrals else None,
+                      "queue_probes": {
+                          "steps": len(queue_probes), "steps_with_probes": sum(
+                              count > 0 for count in queue_probes.values()),
+                          "total": sum(queue_probes.values()),
+                      } if queue_probes else None,
                       "provider_attempts": {
                           "steps": len(provider_attempts), "total": sum(provider_attempts.values()),
                           "max": max(provider_attempts.values()),

@@ -771,6 +771,9 @@ class Daemon:
         self._tick_spent: dict[str, float] = {}  # части шага → секунды (_spent)
         self._tick_detail_spent: dict[str, float] = {}
         self._planned_scan_deferred = False
+        self._scan_waiting_for_slot = False
+        self._scan_deferred_for_step = False
+        self._queue_probe_count = 0
         self._rebuild_spent = (0.0, 0.0)  # последняя сборка: (сборка, применение), секунды
         # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
         # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
@@ -989,6 +992,8 @@ class Daemon:
                 "completed_at": completed_at, "parts_s": self._tick_spent.copy(),
                 "details_s": self._tick_detail_spent.copy(),
                 "planned_scan_deferred": self._planned_scan_deferred,
+                "scan_deferred_for_step": self._scan_deferred_for_step,
+                "queue_probe_count": self._queue_probe_count,
                 "provider_attempts": self._provider_attempts,
             }
             if spent >= TICK_SLOW:
@@ -1497,6 +1502,8 @@ class Daemon:
         self._tick_spent = {}
         self._tick_detail_spent = {}
         self._planned_scan_deferred = False
+        self._scan_deferred_for_step = False
+        self._queue_probe_count = 0
         self._provider_attempts = 0
         if self._desync_reload_pending and not self._drain_desync_reload():
             # Старые правила остаются до освобождения слота. Не загружаем другое
@@ -1725,7 +1732,7 @@ class Daemon:
                 self._queue_scan(view, now)
             self._queue_members(view)
             with self._measure_detail("scan_queue"):
-                self._scan_step(view, applied)
+                self._scan_step(view, applied, now)
             if self.stopping:
                 # Остановка пришла во время сканов: замены и смены класса не начинаем.
                 self._write_status(view, observatory, signals.xray_ok)
@@ -3558,22 +3565,33 @@ class Daemon:
             if (info.fingerprint not in self.vetted or recheck) and info.probe_tag not in queued:
                 self.scan_queue.appendleft(info.probe_tag)
 
-    def _scan_step(self, view: list[NodeInfo], applied: dict) -> None:
+    def _scan_step(self, view: list[NodeInfo], applied: dict, tick_started: float | None = None) -> None:
         """Сканирует узлы из очереди, пока не истёк бюджет времени шага.
 
         Плановые сканы запасных при исправном рабочем пути (HEALTHY, не по кнопке, не срочные)
         идут с паузой SCAN_GAP перед каждой следующей пробой шага (PR-4); пауза считается в
         SCAN_BUDGET. После первой пробы оставляем время на паузу и окно SCAN_NEXT_WINDOW.
+        Если к началу планового скана запасных от интервала watchdog осталось меньше
+        SCAN_NEXT_WINDOW, откладываем его один раз. На следующем пригодном шаге
+        с таким же дефицитом запускаем одну пробу, чтобы очередь продвигалась.
         Бюджет вышел — новая проба не начинается (начатая доводится до своего таймаута).
         Остановка во время паузы или пробы — тег остаётся в очереди; тег сервера, которого нет
         в применённом конфиге (состав сменился), снимается."""
         if not self.scan_queue:
+            self._scan_waiting_for_slot = False
             return
         password, _ports = builder.probe_state(applied)
         nodes = {info.probe_tag: info for info in view}
         started = self.clock()
         calm = self.machine.state is State.HEALTHY and not self._manual_scan
         self._scan_urgent &= set(self.scan_queue)  # отметки ушедших из очереди не копятся
+        interval = self.cfg.watchdog.interval_s
+        limited = (
+            calm and tick_started is not None and interval > 0
+            and started - tick_started + SCAN_NEXT_WINDOW > interval
+            and not self._scan_urgent
+            and not any(nodes[tag].role == "proxy" for tag in self.scan_queue if tag in nodes)
+        )
         previous: list | None = None  # прошлая проба этого шага
         while self.scan_queue and self.clock() - started < SCAN_BUDGET and not self.stopping:
             probe_tag = self.scan_queue[0]
@@ -3583,6 +3601,10 @@ class Daemon:
                 self._scan_urgent.discard(probe_tag)
                 continue
             planned = calm and info.role == "spare" and probe_tag not in self._scan_urgent
+            if planned and limited and not self._scan_waiting_for_slot:
+                self._scan_waiting_for_slot = True
+                self._scan_deferred_for_step = True
+                break
             waited = 0.0
             if planned and previous is not None:
                 pause = random.uniform(*SCAN_GAP)
@@ -3606,6 +3628,7 @@ class Daemon:
             previous = pace
             self._scan_pace.append(pace)
             self._scanned = True
+            self._queue_probe_count += 1
             result = self._probe_scan(info, password)
             pace[1] = self.clock()
             if result.kind == "cancelled":
@@ -3613,6 +3636,7 @@ class Daemon:
                 if urgent:
                     self._scan_urgent.add(probe_tag)
                 break
+            self._scan_waiting_for_slot = False
             self._note_health(info.fingerprint, result.verdict in REPLACEABLE_VERDICTS)
             if result.verdict in REPLACEABLE_VERDICTS and self._closed.pop(
                     info.fingerprint, None) is not None:
@@ -3636,6 +3660,10 @@ class Daemon:
                 "скан %s: %s, %d байт за %.1f с", info.tag, result.verdict,
                 result.bytes_read, result.seconds,
             )
+            if planned and limited:
+                break  # очередь продвинулась на одну пробу, дальше по расписанию
+        if not self.scan_queue:
+            self._scan_waiting_for_slot = False
 
     def _scan_gap(self, seconds: float) -> bool:
         """Пауза между плановыми пробами (событие остановки, монотонные часы); True — демон

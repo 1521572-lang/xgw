@@ -38,8 +38,8 @@ def _fresh_pace(daemon) -> None:
                               planned_outside=0, idle_max=None, urgent=0, urgent_waited=0)
 
 
-def _step(daemon) -> None:
-    daemon._scan_step(daemon.view(), engine.read_json(daemon.paths.xray_config_file))
+def _step(daemon, tick_started=None) -> None:
+    daemon._scan_step(daemon.view(), engine.read_json(daemon.paths.xray_config_file), tick_started)
 
 
 def test_planned_spares_are_spaced_inside_the_budget(daemon):
@@ -123,6 +123,38 @@ def test_remaining_scan_window_defers_only_planned_spares(daemon, manual, expect
     _step(daemon)
     assert list(daemon.scan_queue) == spares[expected:]
     assert daemon._planned_scan_deferred is not manual
+
+
+def test_busy_watchdog_defers_once_then_scans_one_spare(daemon):
+    _started(daemon)
+    spares = _spares(daemon)
+    daemon.scan_queue.extend(spares)
+    daemon.cfg.watchdog.interval_s = 20
+    for expected in (0, 1, 1, 2):
+        daemon._scan_deferred_for_step = False
+        daemon._queue_probe_count = 0
+        _step(daemon, daemon.t - 18)
+        assert list(daemon.scan_queue) == spares[expected:]
+        assert daemon._queue_probe_count == int(not daemon._scan_deferred_for_step)
+    assert len(daemon.scanned) == 2
+
+
+@pytest.mark.parametrize("priority", ["manual", "urgent", "degraded", "member"])
+def test_busy_watchdog_preserves_priority_probes(daemon, priority):
+    _started(daemon)
+    spare = _spares(daemon)[0]
+    daemon.cfg.watchdog.interval_s = 20
+    if priority == "member":
+        member = next(info for info in daemon.view() if info.role == "proxy")
+        daemon.scan_queue.extend([member.probe_tag, spare])
+    else:
+        daemon._queue_first(spare, urgent=priority == "urgent")
+        daemon._manual_scan = priority == "manual"
+        if priority == "degraded":
+            daemon.machine.state = State.DEGRADED
+    _step(daemon, daemon.t - 18)
+    assert not daemon.scan_queue
+    assert daemon.scanned and not daemon._scan_deferred_for_step
 
 
 def test_emergency_requeue_raises_priority_and_drops_vanished_tags(daemon):
