@@ -666,11 +666,11 @@ def _emit(outcome: actions.Outcome) -> int:
 
 
 def _cmd_pin(args, cfg: config.Config, paths: Paths, logger) -> int:
-    return _emit(actions.pin(cfg, paths, args.tag, args.ttl))
+    return _emit(actions.pin(cfg, paths, args.tag, args.ttl, source="cli"))
 
 
 def _cmd_unpin(args, cfg: config.Config, paths: Paths, logger) -> int:
-    return _emit(actions.unpin(cfg, paths))
+    return _emit(actions.unpin(cfg, paths, source="cli"))
 
 
 def _cmd_priority(args, cfg: config.Config, paths: Paths, logger) -> int:

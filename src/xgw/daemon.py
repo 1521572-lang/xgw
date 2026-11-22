@@ -6177,7 +6177,9 @@ class Daemon:
         if not pinning.active(pin, self.wall()):
             if self._release_pin(pin["tag"]):
                 self._save_pin(None)
-                self.notifier.event("pin", f"ручной выбор «{name}» снят по истечении срока")
+                self.notifier.event(
+                    "pin", f"[watchdog:expired] ручной выбор «{name}» снят по истечении срока",
+                )
             return
         if not signals.xray_ok:
             return  # перезапуск Xray закрепление сбросит сам — вернём, когда ядро ответит
@@ -6187,8 +6189,8 @@ class Daemon:
                 self._save_pin(None)
                 self.notifier.event(
                     "pin",
-                    f"выбранного вручную сервера «{name}» больше нет среди серверов (убран из "
-                    "подписки или отключён) — сервер снова выбирает шлюз",
+                    f"[watchdog:removed] выбранного вручную сервера «{name}» больше нет "
+                    "среди серверов (убран из подписки или отключён) — сервер снова выбирает шлюз",
                     notify=True,
                 )
             return
@@ -6201,8 +6203,8 @@ class Daemon:
                 self._save_pin(pin)
                 self._hold_pin(info.tag)
                 self.notifier.event(
-                    "pin", f"выбранный вручную сервер «{name}» снова отвечает — трафик опять "
-                    "идёт через него", notify=True,
+                    "pin", f"[watchdog:resumed] выбранный вручную сервер «{name}» снова отвечает "
+                    "— трафик опять идёт через него", notify=True,
                 )
             return
         entry = observatory.get(info.tag)
@@ -6216,8 +6218,8 @@ class Daemon:
             self._release_pin(info.tag)
             self.notifier.event(
                 "pin",
-                f"выбранный вручную сервер «{name}» не отвечает — трафик идёт через серверы, "
-                "выбранные автоматически; когда он снова ответит, шлюз вернётся к нему",
+                f"[watchdog:suspended] выбранный вручную сервер «{name}» не отвечает — трафик идёт "
+                "через серверы, выбранные автоматически; когда он снова ответит, шлюз вернётся к нему",
                 notify=True,
             )
             return
@@ -7214,6 +7216,9 @@ class Daemon:
         try:
             if self.api.balancer_state(BALANCER_TAG).override != tag:
                 self.api.pin(BALANCER_TAG, tag)
+                self.notifier.event(
+                    "main_override", "[balancer:set] основной сервер закреплён в Xray",
+                )
             self._main_pinned = True
         except ApiError as exc:
             self.log.error("основной сервер %s не закреплён: %s", tag, exc)
@@ -7228,6 +7233,7 @@ class Daemon:
         try:
             if self._main_pinned or self.api.balancer_state(BALANCER_TAG).override:
                 self.api.unpin(BALANCER_TAG)
+                self.notifier.event("main_override", "[balancer:unpin] Xray снова выбирает сервер")
             self._main_pinned = False
         except ApiError as exc:
             self.log.error("закрепление основного сервера не снято: %s", exc)

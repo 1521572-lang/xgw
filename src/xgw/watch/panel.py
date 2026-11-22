@@ -1864,9 +1864,9 @@ class Panel:
                 return actions.Outcome(
                     2, "ожидается тег сервера и срок: " + ", ".join((pinning.FOREVER, *PIN_TTLS)),
                 )
-            return actions.pin(cfg, paths, tag, ttl)
+            return actions.pin(cfg, paths, tag, ttl, source="panel")
         if name == "unpin":
-            return actions.unpin(cfg, paths)
+            return actions.unpin(cfg, paths, source="panel")
         if name == "add":
             return self._add(body, store_path)
         if name == "servers":

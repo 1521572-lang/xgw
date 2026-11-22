@@ -389,6 +389,7 @@ def test_pin_and_unpin(gateway, capsys):
     assert gateway.api.calls == [("pin", "auto", target)]
     store = Store(gateway.paths.db_file)
     pin = json.loads(store.get_meta("pin"))
+    assert store.recent_events(1)[0]["detail"].startswith("[cli:set] ")
     store.close()
     assert pin["tag"] == target and 290 < pin["until"] - time.time() <= 300
 
@@ -397,8 +398,12 @@ def test_pin_and_unpin(gateway, capsys):
 
     assert gateway.run("unpin") == 0
     assert gateway.api.calls[-1] == ("unpin", "auto")
+    assert gateway.run("unpin") == 0  # повторный запрос тоже журналируется как команда
     store = Store(gateway.paths.db_file)
     assert store.get_meta("pin") == ""
+    assert [row["detail"] for row in store.recent_events(2)] == [
+        "[cli:unpin] команда возврата к автовыбору выполнена",
+    ] * 2
     store.close()
 
 

@@ -28,7 +28,20 @@ SUMMARY = re.compile(r"мостов проверено [0-9]+ из [0-9]+(: [a-z
 LEAK_CAUSES = ("own_exit", "pinned", "bypass", "xray_probe_failed",
                "countries_differ", "xray_home_without_server", "other")
 INCIDENT_KINDS = {"LEAK": "home_exit_alert", "DEGRADED": "degraded", "HEALTHY": "healthy",
-                  "capture": "capture_event", "rotation": "rotation", "apply": "apply"}
+                  "capture": "capture_event", "rotation": "rotation", "apply": "apply",
+                  "main_override": "main_override"}
+PIN_MARKERS = {
+    "[cli:set]": ("pin_set", "cli"),
+    "[cli:unpin]": ("unpin_requested", "cli"),
+    "[panel:set]": ("pin_set", "panel"),
+    "[panel:unpin]": ("unpin_requested", "panel"),
+    "[watchdog:expired]": ("pin_expired", "watchdog"),
+    "[watchdog:removed]": ("pin_removed", "watchdog"),
+    "[watchdog:suspended]": ("pin_suspended", "watchdog"),
+    "[watchdog:resumed]": ("pin_resumed", "watchdog"),
+    "[balancer:set]": ("main_override_set", "balancer"),
+    "[balancer:unpin]": ("main_override_released", "balancer"),
+}
 
 
 def run(argv, *, timeout=60):
@@ -55,17 +68,23 @@ def classify(detail):
     return "other"
 
 
-def incident_label(kind, detail):
+def incident_fields(kind, detail):
+    if kind in ("pin", "main_override"):
+        marker = PIN_MARKERS.get(detail.partition(" ")[0])
+        if marker is not None:
+            label, source = marker
+            if (kind == "main_override") == (source == "balancer"):
+                return label, source
     if kind == "leak":
         cause = classify(detail)
-        return "legacy_ambiguous" if cause == "bypass" else cause
+        return ("legacy_ambiguous" if cause == "bypass" else cause), None
     if kind == "pin":
         if "автовыбор:" in detail or "снят по истечении срока" in detail:
-            return "pin_released"
+            return "pin_released", None
         if "выбран вручную" in detail:
-            return "pin_set"
-        return "pin_event"
-    return INCIDENT_KINDS[kind]
+            return "pin_set", None
+        return "pin_event", None
+    return INCIDENT_KINDS[kind], None
 
 
 def incident(start_text, end_text):
@@ -86,7 +105,9 @@ def incident(start_text, end_text):
         print("INCIDENT_TOO_MANY_EVENTS")
         return 2
     for ts, kind, detail in rows:
-        print(f"INCIDENT_EVENT offset_s={round(ts - lo)} kind={incident_label(kind, detail)}")
+        label, source = incident_fields(kind, detail)
+        origin = f" source={source}" if source else ""
+        print(f"INCIDENT_EVENT offset_s={round(ts - lo)} kind={label}{origin}")
     print(f"INCIDENT_COMPLETE events={len(rows)}")
     return 0
 

@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from . import config, engine
 from . import pin as pinning
@@ -194,7 +195,10 @@ def _rollback_dhcp(
 # --- ручное закрепление --------------------------------------------------------
 
 
-def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
+def pin(
+    cfg: config.Config, paths: Paths, tag: str, ttl_text: str,
+    *, source: Literal["cli", "panel"],
+) -> Outcome:
     """Ручной выбор сервера (pinning.py): участника или запасного, на срок или бессрочно
     (ttl_text = pinning.FOREVER). Перестанет отвечать — трафик временно ведёт автовыбор, а
     когда ответит — снова он (демон, _manual_step)."""
@@ -228,7 +232,7 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
         }
         store.set_meta(pinning.META, pinning.dumps(record))
         store.add_event(
-            "pin", f"«{name}» выбран вручную" + ("" if forever else f" на {ttl_text}")
+            "pin", f"[{source}:set] «{name}» выбран вручную" + ("" if forever else f" на {ttl_text}")
         )
     daemon_up = status.read_status(paths, max(3.0 * cfg.watchdog.interval_s, 180.0)) is not None
     notes: tuple[str, ...] = ()
@@ -250,7 +254,7 @@ def pin(cfg: config.Config, paths: Paths, tag: str, ttl_text: str) -> Outcome:
     )
 
 
-def unpin(cfg: config.Config, paths: Paths) -> Outcome:
+def unpin(cfg: config.Config, paths: Paths, *, source: Literal["cli", "panel"]) -> Outcome:
     xray_bin = validate.find_xray(None, paths)
     if xray_bin is None:
         return Outcome(1, f"xray не найден (ожидается {paths.xray_bin} либо XGW_XRAY_BIN)")
@@ -260,7 +264,7 @@ def unpin(cfg: config.Config, paths: Paths) -> Outcome:
         return Outcome(1, str(exc))
     with open_store(paths) as store:
         store.set_meta(pinning.META, "")
-        store.add_event("pin", "автовыбор: ручной выбор сервера снят")
+        store.add_event("pin", f"[{source}:unpin] команда возврата к автовыбору выполнена")
     if cfg.speed.sticky:
         return Outcome(
             0, "автовыбор: через минуту шлюз снова закрепит основной сервер — самый быстрый "

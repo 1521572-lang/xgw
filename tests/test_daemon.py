@@ -759,6 +759,7 @@ def test_pin_expires_and_is_restored_after_apply(daemon):
     assert daemon.status()["pin"] is None
     daemon.tick()
     assert daemon.api.calls.count(("unpin",)) == 1
+    assert sum(event.startswith("pin: [watchdog:expired] ") for event in daemon.events()) == 1
 
 
 def test_leak_is_checked_only_with_capture(tmp_path, monkeypatch):
@@ -827,7 +828,7 @@ def test_pin_is_dropped_when_node_leaves_balancer(daemon):
     daemon.tick()
     assert daemon.api.calls == []  # закреплять нечего: такого сервера нет
     assert daemon.store.get_meta("pin") == ""
-    assert any("больше нет среди серверов" in event for event in daemon.events())
+    assert any(event.startswith("pin: [watchdog:removed] ") for event in daemon.events())
 
 
 def test_hung_xray_is_restarted_when_nothing_to_roll_back(daemon):

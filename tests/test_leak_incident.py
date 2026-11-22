@@ -31,6 +31,10 @@ def test_incident_keeps_legacy_uncertainty_and_redacts_details(helper, capsys):
         (ts + 13, "leak", "выход в RU мимо Xray при включённом перехвате"),
         (ts + 14, "leak", "контроль через Xray не подтвердился"),
         (ts + 15, "HEALTHY", "private route"),
+        (ts + 16, "pin", "[panel:set] «private-server» выбран вручную"),
+        (ts + 17, "pin", "[cli:unpin] команда возврата к автовыбору выполнена"),
+        (ts + 18, "main_override", "[balancer:set] основной сервер закреплён в Xray"),
+        (ts + 19, "pin", "[watchdog:expired] ручной выбор снят по истечении срока"),
         (ts + 1500, "LEAK", "after interval"),
     ]
     with sqlite3.connect(helper.DB) as conn:
@@ -44,7 +48,11 @@ def test_incident_keeps_legacy_uncertainty_and_redacts_details(helper, capsys):
         "INCIDENT_EVENT offset_s=13 kind=legacy_ambiguous",
         "INCIDENT_EVENT offset_s=14 kind=xray_probe_failed",
         "INCIDENT_EVENT offset_s=15 kind=healthy",
-        "INCIDENT_COMPLETE events=6",
+        "INCIDENT_EVENT offset_s=16 kind=pin_set source=panel",
+        "INCIDENT_EVENT offset_s=17 kind=unpin_requested source=cli",
+        "INCIDENT_EVENT offset_s=18 kind=main_override_set source=balancer",
+        "INCIDENT_EVENT offset_s=19 kind=pin_expired source=watchdog",
+        "INCIDENT_COMPLETE events=10",
     ]
 
 

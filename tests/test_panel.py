@@ -934,22 +934,27 @@ def test_wrong_server_requests_change_nothing(rig, user, body):
 def test_pin_goes_through_the_same_code_as_the_command(rig, user, monkeypatch):
     seen: list[tuple] = []
 
-    def fake_pin(cfg, paths, tag, ttl):
-        seen.append((tag, ttl))
+    def fake_pin(cfg, paths, tag, ttl, *, source):
+        seen.append((tag, ttl, source))
         return actions.Outcome(0, f"{tag} закреплён на {ttl}", hints=("снять раньше: xgw unpin",))
 
+    def fake_unpin(cfg, paths, *, source):
+        seen.append(("unpin", source))
+        return actions.Outcome(0, "снято")
+
     monkeypatch.setattr(actions, "pin", fake_pin)
-    monkeypatch.setattr(actions, "unpin", lambda cfg, paths: actions.Outcome(0, "снято"))
-    result = user.act("pin", {"tag": "proxy-nl-aaaa", "ttl": "1h"})
+    monkeypatch.setattr(actions, "unpin", fake_unpin)
+    result = user.act("pin", {"tag": "proxy-nl-aaaa", "ttl": "1h", "source": "cli"})
     # Подсказки с командами терминала панель не показывает.
     assert result == {"ok": True, "text": "proxy-nl-aaaa закреплён на 1h", "notes": []}
-    assert seen == [("proxy-nl-aaaa", "1h")]
+    assert seen == [("proxy-nl-aaaa", "1h", "panel")]
     assert not user.act("pin", {"tag": "proxy-nl-aaaa", "ttl": "99h"})["ok"] and len(seen) == 1
     # Кнопка «Выбрать» — бессрочно, как в клиентах VPN; без срока — тоже бессрочно.
     assert user.act("pin", {"tag": "spare-de-bbbb", "ttl": "forever"})["ok"]
     assert user.act("pin", {"tag": "spare-de-bbbb"})["ok"]
-    assert seen[1:] == [("spare-de-bbbb", "forever")] * 2
+    assert seen[1:] == [("spare-de-bbbb", "forever", "panel")] * 2
     assert user.act("unpin", {})["ok"]
+    assert seen[-1] == ("unpin", "panel")
 
 
 def test_pin_from_the_store_is_shown(rig, user):

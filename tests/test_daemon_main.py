@@ -279,6 +279,11 @@ def test_main_is_released_when_no_member_answers(daemon):
     daemon.set_alive(**{first.replace("-", "_"): False, second.replace("-", "_"): False})
     assert _step(daemon) is State.ALL_DEAD
     assert daemon.api.state.override is None and daemon.main is None
+    _step(daemon)
+    events = [event for event in daemon.events() if event.startswith("main_override:")]
+    assert sum(event.startswith("main_override: [balancer:set] ") for event in events) == 1
+    assert events[0] == "main_override: [balancer:unpin] Xray снова выбирает сервер"
+    assert len(events) == 2
 
 
 def test_limited_servers_are_measured(paths):
