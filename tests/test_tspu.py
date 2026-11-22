@@ -3,6 +3,7 @@
 R4 — монитор bootstrap-DNS и аварийный маршрут Tailscale через VPN."""
 
 import json
+import threading
 
 import pytest
 from test_daemon import Harness, _started
@@ -358,6 +359,109 @@ def test_provider_rechecks_last_success_then_falls_back_in_config_order(hosted, 
     assert not Daemon._check_provider(hosted)
     assert [host for host, _, _ in attempted] == ["ya.ru", "vk.com"]
     assert hosted._provider_attempts == 8
+
+
+def test_provider_refreshes_working_host_before_ttl_without_waiting(hosted, monkeypatch):
+    old, new = "192.0.2.10", "192.0.2.11"
+    host = "ya.ru"
+    hosted.mark = 42
+    hosted._provider_ips[host] = (hosted.t, old)
+    entered, release = threading.Event(), threading.Event()
+    connections = []
+
+    def resolve(name, resolvers, *, mark, cancel):
+        assert (name, resolvers, mark) == (host, hosted.cfg.dns.resolvers, 42)
+        entered.set()
+        if not release.wait(2):
+            raise fetch.ResolveError("test refresh timed out")
+        return [new]
+
+    def connect(address, port, *, mark):
+        connections.append((address, port, mark))
+        return True
+
+    monkeypatch.setattr(fetch, "resolve_domain", resolve)
+    monkeypatch.setattr("xgw.watch.checks.tcp_check", connect)
+    hosted.t += 479
+    assert Daemon._check_provider(hosted)
+    assert not hosted._provider_dns_refresh_started
+    hosted.t += 1
+    try:
+        assert Daemon._check_provider(hosted)
+        job = hosted._provider_dns_refresh
+        assert hosted._provider_dns_refresh_started and entered.wait(2)
+        assert not job.done.is_set()
+        assert Daemon._check_provider(hosted)
+        assert hosted._provider_dns_refresh is job
+    finally:
+        release.set()
+    assert job.done.wait(2)
+    hosted.t += 119
+    assert Daemon._check_provider(hosted)
+    assert not hosted._provider_dns_refresh_used
+    hosted.t += 1
+    assert Daemon._check_provider(hosted)
+    assert hosted._provider_dns_refresh_used
+    assert connections == [(old, 443, 42)] * 4 + [(new, 443, 42)]
+
+
+@pytest.mark.parametrize("finished", [True, False])
+def test_provider_keeps_foreground_fallback_when_refresh_is_unavailable(hosted, monkeypatch,
+                                                                    finished):
+    host, old = "ya.ru", "192.0.2.10"
+    hosted.mark = 42
+    hosted._provider_ips[host] = (hosted.t, old)
+    release = threading.Event()
+    foreground = []
+
+    def resolve(name, resolvers, *, mark, cancel=None):
+        if cancel is None:
+            foreground.append(name)
+        else:
+            release.wait(2)
+        raise fetch.ResolveError("no answer")
+
+    monkeypatch.setattr(fetch, "resolve_domain", resolve)
+    monkeypatch.setattr("xgw.watch.checks.tcp_check",
+                        lambda address, port, *, mark: address == old)
+    hosted.t += 480
+    assert Daemon._check_provider(hosted)
+    job = hosted._provider_dns_refresh
+    try:
+        if finished:
+            release.set()
+            assert job.done.wait(2)
+        assert Daemon._check_provider(hosted)
+        assert hosted._provider_dns_refresh is job and not foreground
+        hosted.t += 120
+        assert Daemon._check_provider(hosted)
+        assert foreground == [host]
+        assert not hosted._provider_dns_refresh_used
+        assert job.cancel.is_set() is not finished
+    finally:
+        release.set()
+        assert job.done.wait(2)
+
+
+def test_provider_discards_ready_refresh_after_network_event(hosted, monkeypatch):
+    host, old, stale, current = "ya.ru", "192.0.2.10", "192.0.2.11", "192.0.2.12"
+    hosted.mark = 42
+    hosted._provider_ips[host] = (hosted.t, old)
+    monkeypatch.setattr(fetch, "resolve_domain",
+                        lambda *args, cancel=None, **kwargs: [current if cancel is None else stale])
+    monkeypatch.setattr("xgw.watch.checks.tcp_check",
+                        lambda address, port, *, mark: address in {old, current})
+    hosted.t += 480
+    assert Daemon._check_provider(hosted)
+    job = hosted._provider_dns_refresh
+    assert job.done.wait(2)
+    hosted._net_event = True
+    hosted.tick()
+    assert job.cancel.is_set()
+    hosted.t += 120
+    assert Daemon._check_provider(hosted)
+    assert hosted._provider_ips[host][1] == current
+    assert not hosted._provider_dns_refresh_used
 
 
 def test_e2e_timings_distinguish_primary_and_fallback(hosted, monkeypatch):

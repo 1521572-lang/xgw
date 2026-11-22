@@ -86,6 +86,7 @@ SCAN_PACE_KEEP = 40  # сколько последних проб скана п�
 RESCAN_PAUSE = 60.0  # внеочередной скан запасных — не чаще
 SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок после неудачи
 PROVIDER_DNS_TTL = 600.0
+PROVIDER_DNS_REFRESH_AHEAD = 120.0
 ROLLBACK_AFTER = 2  # «после двух неудач — откат на last-good»
 FAIL_OPEN_AFTER = 60.0  # fail_mode = "open": Xray недоступен дольше — снять перехват
 WAIT_SLICE = 0.25  # как часто пауза между шагами смотрит, не пора ли проснуться
@@ -511,6 +512,15 @@ class _Fetch:
 
 
 @dataclasses.dataclass
+class _ProviderDnsRefresh:
+    host: str
+    previous: tuple[float, str]
+    cancel: threading.Event = dataclasses.field(default_factory=threading.Event)
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    answer: tuple[float, str] | None = None
+
+
+@dataclasses.dataclass
 class _BuildRequest:
     prefer: list[str] | None
     urgent: bool
@@ -913,6 +923,9 @@ class Daemon:
         self._provider_ips: dict[str, tuple[float, str]] = {}  # хост wan_check → (clock, адрес)
         self._provider_preferred = ""
         self._provider_attempts = 0
+        self._provider_dns_refresh: _ProviderDnsRefresh | None = None
+        self._provider_dns_refresh_started = False
+        self._provider_dns_refresh_used = False
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
@@ -995,6 +1008,8 @@ class Daemon:
                 "scan_deferred_for_step": self._scan_deferred_for_step,
                 "queue_probe_count": self._queue_probe_count,
                 "provider_attempts": self._provider_attempts,
+                "provider_dns_refresh_started": self._provider_dns_refresh_started,
+                "provider_dns_refresh_used": self._provider_dns_refresh_used,
             }
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
@@ -1022,6 +1037,8 @@ class Daemon:
             self._loop_progress("sleep", started=started, deadline=deadline,
                                 period=period, step_s=spent)
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
+        if self._provider_dns_refresh is not None:
+            self._provider_dns_refresh.cancel.set()
         self.close_desync(keep_engine=not stop.is_set())
         self.diary.flush(force=True)
         self.store.close()
@@ -1505,6 +1522,8 @@ class Daemon:
         self._scan_deferred_for_step = False
         self._queue_probe_count = 0
         self._provider_attempts = 0
+        self._provider_dns_refresh_started = False
+        self._provider_dns_refresh_used = False
         if self._desync_reload_pending and not self._drain_desync_reload():
             # Старые правила остаются до освобождения слота. Не загружаем другое
             # назначение очереди, пока её предыдущий обработчик ещё может работать.
@@ -1520,6 +1539,8 @@ class Daemon:
         if resumed or net_event:
             self._net_tick_at = time.monotonic()
             self._provider_preferred = ""
+            if self._provider_dns_refresh is not None:
+                self._provider_dns_refresh.cancel.set()
         if resumed:
             self._after_sleep(now)
         elif net_event:
@@ -2124,6 +2145,7 @@ class Daemon:
             self._provider_attempts += 1
             host, _, port_text = entry.rpartition(":")
             with self._measure_detail("provider_resolve"):
+                self._take_provider_dns_refresh(host)
                 address = self._provider_address(host)
             if address is None:
                 continue
@@ -2131,6 +2153,7 @@ class Daemon:
                 answered = checks.tcp_check(address, int(port_text), mark=self.mark)
             if answered:
                 self._provider_preferred = entry
+                self._schedule_provider_dns_refresh(host)
                 return True
         return False
 
@@ -2152,6 +2175,62 @@ class Daemon:
             return cached[1] if cached else None
         self._provider_ips[host] = (now, address)
         return address
+
+    def _take_provider_dns_refresh(self, host: str) -> None:
+        job = self._provider_dns_refresh
+        if job is None or job.host != host:
+            return
+        now = self.clock()
+        same_entry = self._provider_ips.get(host) is job.previous
+        if same_entry and now - job.previous[0] < PROVIDER_DNS_TTL:
+            return  # штатный срок действия адреса ещё не истёк
+        if not job.done.is_set():
+            job.cancel.set()
+            return  # просроченный кэш по-прежнему обслуживает синхронный путь
+        self._provider_dns_refresh = None
+        if (same_entry and not job.cancel.is_set() and job.answer is not None
+                and 0 <= now - job.answer[0] < PROVIDER_DNS_TTL):
+            self._provider_ips[host] = job.answer
+            self._provider_dns_refresh_used = True
+
+    def _schedule_provider_dns_refresh(self, host: str) -> None:
+        if self.mark is None or self.stopping:
+            return
+        cached = self._provider_ips.get(host)
+        job = self._provider_dns_refresh
+        if job is not None:
+            if job.host == host and job.previous is cached and not job.cancel.is_set():
+                return  # одна попытка на запись кэша, даже при неудачном ответе
+            job.cancel.set()
+            if not job.done.is_set():
+                return
+            self._provider_dns_refresh = None
+        if cached is None:
+            return  # IP-литерал не требует DNS
+        age = self.clock() - cached[0]
+        if not PROVIDER_DNS_TTL - PROVIDER_DNS_REFRESH_AHEAD <= age < PROVIDER_DNS_TTL:
+            return
+        self._provider_dns_refresh = job = _ProviderDnsRefresh(host, cached)
+        worker = threading.Thread(target=self._resolve_provider_dns,
+                                  args=(job, list(self.cfg.dns.resolvers), self.mark),
+                                  name="xgw-wan-dns", daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            job.done.set()
+            self.log.warning("не удалось запустить фоновый DNS для проверки WAN")
+        else:
+            self._provider_dns_refresh_started = True
+
+    def _resolve_provider_dns(self, job: _ProviderDnsRefresh,
+                              resolvers: list[str], mark: int) -> None:
+        try:
+            addresses = fetch.resolve_domain(job.host, resolvers, mark=mark, cancel=job.cancel)
+            job.answer = (self.clock(), addresses[0])
+        except (fetch.ResolveError, fetch.Cancelled):
+            pass
+        finally:
+            job.done.set()
 
     def _check_leak(self) -> str | None:
         """Страна выхода обычным сокетом без метки — то есть через перехват."""
