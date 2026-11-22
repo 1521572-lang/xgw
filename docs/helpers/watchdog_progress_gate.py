@@ -15,7 +15,9 @@ FATAL_STATES = {"invalid_snapshot", "invalid_format", "unexpected_mode"}
 
 def progress_state(path: Path, minimum_generation: int, now: float,
                    *, require_details: bool = False, require_provider: bool = False,
-                   require_scan_slot: bool = False, require_wan_dns: bool = False) -> str:
+                   require_scan_slot: bool = False, require_wan_dns: bool = False,
+                   require_scan_deadline: bool = False) -> str:
+    require_wan_dns |= require_scan_deadline
     require_scan_slot |= require_wan_dns
     try:
         with path.open("rb") as stream:
@@ -64,13 +66,19 @@ def progress_state(path: Path, minimum_generation: int, now: float,
         attempts = step.get("provider_attempts")
         if type(attempts) is not int or attempts < 0:
             return "invalid_format"
-    if require_scan_slot:
-        count = step.get("queue_probe_count")
-        if type(count) is not int or count < 0 or type(step.get("scan_deferred_for_step")) is not bool:
-            return "invalid_format"
+    count = step.get("queue_probe_count")
+    if require_scan_slot and (type(count) is not int or count < 0
+                              or type(step.get("scan_deferred_for_step")) is not bool):
+        return "invalid_format"
     if require_wan_dns and (type(step.get("provider_dns_refresh_started")) is not bool
                             or type(step.get("provider_dns_refresh_used")) is not bool):
         return "invalid_format"
+    if require_scan_deadline:
+        limited = step.get("scan_budget_limited_probes")
+        cancelled = step.get("scan_budget_cancelled")
+        if (type(limited) is not int or not 0 <= limited <= count or type(cancelled) is not bool
+                or (cancelled and limited == 0)):
+            return "invalid_format"
     return "ready"
 
 
@@ -78,14 +86,16 @@ def wait_progress(path: Path, minimum_generation: int, seconds: float,
                   *, require_details: bool = False,
                   require_provider: bool = False,
                   require_scan_slot: bool = False,
-                  require_wan_dns: bool = False) -> tuple[str, int, bool]:
+                  require_wan_dns: bool = False,
+                  require_scan_deadline: bool = False) -> tuple[str, int, bool]:
     deadline = time.monotonic() + seconds
     attempts = 0
     saw_first_step = False
     while True:
         state = progress_state(path, minimum_generation, time.monotonic(),
                                require_details=require_details, require_provider=require_provider,
-                               require_scan_slot=require_scan_slot, require_wan_dns=require_wan_dns)
+                               require_scan_slot=require_scan_slot, require_wan_dns=require_wan_dns,
+                               require_scan_deadline=require_scan_deadline)
         attempts += 1
         saw_first_step |= state == "waiting_first_step"
         remaining = deadline - time.monotonic()
@@ -96,7 +106,8 @@ def wait_progress(path: Path, minimum_generation: int, seconds: float,
 
 if __name__ == "__main__":
     if (len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and
-            sys.argv[2] not in ("--details", "--provider", "--scan-slot", "--wan-dns"))
+            sys.argv[2] not in ("--details", "--provider", "--scan-slot", "--wan-dns",
+                                "--scan-deadline"))
             or not sys.argv[1].isascii() or not sys.argv[1].isdigit()):
         raise SystemExit(2)
     minimum_generation = int(sys.argv[1]) * 1000  # systemd reports monotonic microseconds
@@ -107,6 +118,7 @@ if __name__ == "__main__":
         PROGRESS, minimum_generation, 120,
         require_details=mode == "--details", require_provider=mode == "--provider",
         require_scan_slot=mode == "--scan-slot", require_wan_dns=mode == "--wan-dns",
+        require_scan_deadline=mode == "--scan-deadline",
     )
     print(f"WATCHDOG_TIMING_PROGRESS_CHECK result={state} polls={attempts} "
           f"waiting_first_step={str(saw_first_step).lower()}")

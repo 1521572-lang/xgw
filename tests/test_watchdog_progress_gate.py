@@ -59,6 +59,15 @@ def test_wait_progress_ignores_old_step_and_waits_for_new_completion(gate, tmp_p
     step.update(provider_dns_refresh_started=False, provider_dns_refresh_used=False)
     write_progress(path, 10_000_000_000, at=now[0], step=step)
     assert gate.progress_state(path, 10_000_000_000, 12.0, require_wan_dns=True) == "ready"
+    assert gate.progress_state(path, 10_000_000_000, 12.0,
+                               require_scan_deadline=True) == "invalid_format"
+    step.update(scan_budget_limited_probes=1, scan_budget_cancelled=True)
+    write_progress(path, 10_000_000_000, at=now[0], step=step)
+    assert gate.progress_state(path, 10_000_000_000, 12.0,
+                               require_scan_deadline=True) == "invalid_format"
+    step["queue_probe_count"] = 2
+    write_progress(path, 10_000_000_000, at=now[0], step=step)
+    assert gate.progress_state(path, 10_000_000_000, 12.0, require_scan_deadline=True) == "ready"
 
 
 def test_wait_progress_stops_at_deadline_when_first_step_is_busy(gate, tmp_path, monkeypatch):

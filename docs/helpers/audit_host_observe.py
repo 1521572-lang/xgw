@@ -145,6 +145,7 @@ def watchdog(seconds):
     queue_probes = {}
     provider_attempts = {}
     provider_dns_refresh = {}
+    scan_budget = {}
     intervals = set()
     wakes = {}
     wake_overlaps = {}
@@ -191,9 +192,15 @@ def watchdog(seconds):
                     used = step.get("provider_dns_refresh_used")
                     if type(started) is bool and type(used) is bool:
                         provider_dns_refresh[key] = (started, used)
+                    limited = step.get("scan_budget_limited_probes")
+                    cancelled = step.get("scan_budget_cancelled")
+                    if type(limited) is int and limited >= 0 and type(cancelled) is bool:
+                        scan_budget[key] = (limited, cancelled)
                     details = step_timings(step.get("details_s"), STEP_DETAILS, duration)
                     for name, value in details.items():
                         detail_times.setdefault(name, {})[key] = value
+                    if queue_probes.get(key, 0) > 0 and "scan_queue" in details:
+                        detail_times.setdefault("scan_queue_active", {})[key] = details["scan_queue"]
                 for name, value in parts.items():
                     part_max[name] = max(part_max.get(name, 0), value)
             wake_available |= type(row.get("generation")) is int and "wake" in row
@@ -278,6 +285,17 @@ def watchdog(seconds):
                               default=None,
                           ),
                       } if provider_dns_refresh else None,
+                      "scan_budget": {
+                          "steps": len(scan_budget),
+                          "limited_probes": sum(count for count, _ in scan_budget.values()),
+                          "cancelled_steps": sum(cancelled for _, cancelled in scan_budget.values()),
+                          "max_queue_s_when_cancelled": max(
+                              (round(value, 4) for key, value
+                               in detail_times.get("scan_queue", {}).items()
+                               if scan_budget.get(key, (0, False))[1]),
+                              default=None,
+                          ),
+                      } if scan_budget else None,
                       "wake": {"available": wake_available, "state": wake_state,
                                "observed_batches": len(wakes),
                                "by_reason": by_reason, **wake_details}}, ensure_ascii=False))

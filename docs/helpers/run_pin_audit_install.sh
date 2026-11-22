@@ -31,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan|--watchdog-scan-slot|--watchdog-wan-dns)
+  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan|--watchdog-scan-slot|--watchdog-wan-dns|--watchdog-scan-deadline)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -83,7 +83,7 @@ case "$PROFILE" in
             BASE=1fc8fa526f8353ade444f351f5509e9627059486
             ACCEPTED=aa2a3ab4fc6c46134c5949283b2b6e8b658f250c
             EXPECTED=39
-            if [[ $PROFILE == --watchdog-wan-dns ]]; then
+            if [[ $PROFILE != --watchdog-scan-slot ]]; then
               SCOPE=watchdog-wan-dns
               PREFIX=WATCHDOG_WAN_DNS
               BASE=$ACCEPTED
@@ -92,6 +92,15 @@ case "$PROFILE" in
                       tests/test_tspu.py::test_provider_keeps_foreground_fallback_when_refresh_is_unavailable
                       tests/test_tspu.py::test_provider_discards_ready_refresh_after_network_event)
               EXPECTED=43
+              if [[ $PROFILE == --watchdog-scan-deadline ]]; then
+                SCOPE=watchdog-scan-deadline
+                PREFIX=WATCHDOG_SCAN_DEADLINE
+                BASE=$ACCEPTED
+                ACCEPTED=c101a1f5e60146ed90d9f215efe1f97c3f0706a0
+                EXPECTED=50
+              else
+                TEST_CODE=6438e403ec8c902587d613e041abfdc540ce1850
+              fi
             else
               TEST_CODE=220a657a787efb062c7867689a51611b6367d7b0
             fi
@@ -225,6 +234,8 @@ check_wake_progress() {
       progress_args+=(--scan-slot)
     elif [[ $PROFILE == --watchdog-wan-dns ]]; then
       progress_args+=(--wan-dns)
+    elif [[ $PROFILE == --watchdog-scan-deadline ]]; then
+      progress_args+=(--scan-deadline)
     fi
     if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
          sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "${progress_args[@]}"; then
