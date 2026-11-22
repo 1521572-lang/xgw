@@ -100,6 +100,8 @@ PANEL_LOGIN_TIMER = "xgw-panel-login-rollback.timer"
 PIN_AUDIT = ("actions.py", "cli.py", "daemon.py", "gui/model.py", "tray.py", "ui/app.js",
              "watch/notify.py", "watch/panel.py", "watch/states.py")
 PIN_AUDIT_TIMER = "xgw-pin-audit-rollback.timer"
+WATCHDOG_WAKE = ("daemon.py",)
+WATCHDOG_WAKE_TIMER = "xgw-watchdog-wake-rollback.timer"
 
 
 def gui_files(files):
@@ -278,6 +280,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "watchdog_wake", False):
+        return WATCHDOG_WAKE, WATCHDOG_WAKE_TIMER
     if getattr(args, "pin_audit", False):
         return PIN_AUDIT, PIN_AUDIT_TIMER
     if getattr(args, "panel_login", False):
@@ -379,6 +383,7 @@ def main():
     stage.add_argument("--selective-route-status", action="store_true")
     stage.add_argument("--panel-login", action="store_true")
     stage.add_argument("--pin-audit", action="store_true")
+    stage.add_argument("--watchdog-wake", action="store_true")
     args = parser.parse_args()
     require(sys.platform.startswith("linux") and os.geteuid() == 0, "Ubuntu root required")
     import fcntl
@@ -396,7 +401,7 @@ def main():
             rows = records(backup, files)
             reload_net = files == COMBINED_ADMISSION
             if args.action == "apply":
-                if files == PIN_AUDIT:
+                if files in (PIN_AUDIT, WATCHDOG_WAKE):
                     require_idle_workers()
                 apply(backup, rows, timer, reload_net=reload_net)
             else:

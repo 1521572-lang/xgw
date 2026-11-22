@@ -1,71 +1,102 @@
 #!/usr/bin/env bash
-# Install only the accepted pin audit and home-exit diagnostics on ThinkCentre.
+# Install an accepted, narrowly scoped diagnostics update on ThinkCentre.
 set -euo pipefail
 umask 077
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
-[[ $# == 1 && $1 =~ ^[0-9a-f]{40}$ ]]
+[[ $# == 1 || $# == 2 ]]
+[[ $1 =~ ^[0-9a-f]{40}$ ]]
 CODE=$1
-BASE=a2f37021cf119342d2f8344c91d26bafc12c3673
-AUDIT=4a6636f2a7b2302b714436584c393731233cc6a0
+PROFILE=${2:---pin-audit}
+case "$PROFILE" in
+  --pin-audit)
+    SCOPE=pin-audit
+    PREFIX=PIN_AUDIT
+    BASE=a2f37021cf119342d2f8344c91d26bafc12c3673
+    ACCEPTED=4a6636f2a7b2302b714436584c393731233cc6a0
+    FILES=(actions.py cli.py daemon.py gui/model.py tray.py ui/app.js
+           watch/notify.py watch/panel.py watch/states.py)
+    TEST_FILES=(docs/helpers/leak_cause_check.py tests/test_daemon_main.py
+                tests/test_cli_commands.py tests/test_leak_incident.py)
+    NODES=(tests/test_leak_incident.py
+           tests/test_daemon.py::test_server_exiting_at_home_is_replaced_and_not_taken_back
+           tests/test_daemon.py::test_leak_reports_success_only_after_the_rules_are_confirmed
+           tests/test_daemon.py::test_home_exit_without_route_evidence_does_not_claim_bypass
+           tests/test_cli_commands.py::test_pin_and_unpin
+           tests/test_cli_commands.py::test_pin_api_error
+           tests/test_panel.py::test_pin_goes_through_the_same_code_as_the_command
+           tests/test_daemon.py::test_pin_expires_and_is_restored_after_apply
+           tests/test_daemon.py::test_pin_is_dropped_when_node_leaves_balancer
+           tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
+    EXPECTED=13
+    ;;
+  --watchdog-wake)
+    SCOPE=watchdog-wake
+    PREFIX=WATCHDOG_WAKE
+    BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
+    ACCEPTED=c69ff9a75dbeec702f0490f8691144d247b0835d
+    FILES=(daemon.py)
+    TEST_FILES=(docs/helpers/audit_host_observe.py tests/test_audit_host_observe.py
+                tests/test_net.py)
+    NODES=(tests/test_audit_host_observe.py
+           tests/test_daemon.py::test_watchdog_wake_progress_keeps_first_arrival_and_batch
+           tests/test_daemon.py::test_rules_event_restores_rules_right_away
+           tests/test_daemon.py::test_net_event_starts_the_step_early_but_not_too_often
+           tests/test_daemon.py::test_wake_after_resume_reloads_rules_and_scans
+           tests/test_daemon.py::test_watchdog_schedule_includes_step_work_in_interval
+           tests/test_net.py::test_iprule_ensure_removes_duplicates_and_ignores_foreign_rules
+           tests/test_net.py::test_tun_and_its_route_come_back_after_xray_starts_again
+           tests/test_net.py::test_loaded_notices_a_lost_interface_route_or_tproxy)
+    EXPECTED=15
+    ;;
+  *) exit 2 ;;
+esac
 REPO=$(git rev-parse --show-toplevel)
 PACKAGE=/opt/xgw/lib/xgw
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
-UNIT=xgw-pin-audit-rollback
+UNIT="xgw-$SCOPE-rollback"
 INSTALLER=docs/helpers/desync_batch1_install.py
-FILES=(actions.py cli.py daemon.py gui/model.py tray.py ui/app.js
-       watch/notify.py watch/panel.py watch/states.py)
 PATHS=("${FILES[@]/#/src/xgw/}")
 [[ $TEST_PY == /* && -x $TEST_PY ]]
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
-git -C "$REPO" merge-base --is-ancestor "$AUDIT" "$CODE"
-[[ $(git -C "$REPO" diff --name-only "$BASE" "$AUDIT" -- src/xgw) == \
+git -C "$REPO" merge-base --is-ancestor "$ACCEPTED" "$CODE"
+[[ $(git -C "$REPO" diff --name-only "$BASE" "$ACCEPTED" -- src/xgw) == \
    "$(printf '%s\n' "${PATHS[@]}")" ]]
 sudo -n true
 exec 9>>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock"
 flock -n 9
 
-D=$(mktemp -d "$HOME/xgw-pin-audit-install.XXXXXXXX")
+D=$(mktemp -d "$HOME/xgw-$SCOPE-install.XXXXXXXX")
 printf 'PINNED %s | %s | %s\nPRIVATE_ARTIFACTS %s\n' "$CODE" "$PRETTY_NAME" "$(uname -r)" "$D"
 mkdir -p "$D/tree/src" "$D/base"
 tar -C /opt/xgw/lib --exclude=__pycache__ -cf - xgw | tar -C "$D/tree/src" -xf -
 [[ -z $(find "$D/tree/src/xgw" ! -type d ! -type f -print -quit) ]]
 git -C "$REPO" archive "$CODE" pyproject.toml "$INSTALLER" \
-  docs/helpers/leak_cause_check.py tests/conftest.py tests/links.py tests/fakenet.py \
-  tests/fakexray.py tests/test_daemon.py tests/test_daemon_main.py tests/test_cli_commands.py \
-  tests/test_panel.py tests/test_leak_incident.py | tar -x -C "$D/tree"
-git -C "$REPO" diff --no-ext-diff --no-textconv "$BASE" "$AUDIT" -- "${PATHS[@]}" > "$D/audit.patch"
+  tests/conftest.py tests/links.py tests/fakenet.py tests/fakexray.py \
+  tests/test_daemon.py tests/test_panel.py "${TEST_FILES[@]}" | tar -x -C "$D/tree"
+git -C "$REPO" diff --no-ext-diff --no-textconv "$BASE" "$ACCEPTED" -- "${PATHS[@]}" > "$D/audit.patch"
 cd "$D/tree"
 for path in "${PATHS[@]}"; do
   install -D -m 0600 "$path" "$D/base/$path"
 done
-if git apply --reverse --check "$D/audit.patch" >/dev/null 2>"$D/reverse.err"; then
-  printf 'PIN_AUDIT_ALREADY_PRESENT\n'
+if git -c core.autocrlf=false apply --reverse --check "$D/audit.patch" >/dev/null 2>"$D/reverse.err"; then
+  printf '%s_ALREADY_PRESENT\n' "$PREFIX"
   present=yes
-elif git apply --check "$D/audit.patch" 2>"$D/patch.err"; then
-  git apply "$D/audit.patch"
-  printf 'PIN_AUDIT_PATCH_APPLIED_TO_PRIVATE_COPY\n'
+elif git -c core.autocrlf=false apply --check "$D/audit.patch" 2>"$D/patch.err"; then
+  git -c core.autocrlf=false apply "$D/audit.patch"
+  printf '%s_PATCH_APPLIED_TO_PRIVATE_COPY\n' "$PREFIX"
   present=no
 else
-  printf 'PIN_AUDIT_BASELINE_MISMATCH\n'
+  printf '%s_BASELINE_MISMATCH\n' "$PREFIX"
   exit 2
 fi
 timeout -k 3 120 env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTEST_ADDOPTS= \
   "PYTHONPATH=$D/tree/src:$D/tree/tests" "$TEST_PY" -B -P -m pytest -o addopts= \
   --rootdir "$D/tree" -p no:cacheprovider -q --tb=short \
-  tests/test_leak_incident.py \
-  tests/test_daemon.py::test_server_exiting_at_home_is_replaced_and_not_taken_back \
-  tests/test_daemon.py::test_leak_reports_success_only_after_the_rules_are_confirmed \
-  tests/test_daemon.py::test_home_exit_without_route_evidence_does_not_claim_bypass \
-  tests/test_cli_commands.py::test_pin_and_unpin \
-  tests/test_cli_commands.py::test_pin_api_error \
-  tests/test_panel.py::test_pin_goes_through_the_same_code_as_the_command \
-  tests/test_daemon.py::test_pin_expires_and_is_restored_after_apply \
-  tests/test_daemon.py::test_pin_is_dropped_when_node_leaves_balancer \
-  tests/test_daemon_main.py::test_main_is_released_when_no_member_answers | tee "$D/contracts.out"
-grep -q '^13 passed in ' "$D/contracts.out"
-printf 'PIN_AUDIT_CONTRACTS_OK\n'
+  "${NODES[@]}" | tee "$D/contracts.out"
+grep -q "^$EXPECTED passed in " "$D/contracts.out"
+printf '%s_CONTRACTS_OK\n' "$PREFIX"
 
 pid() {
   local value
@@ -98,8 +129,39 @@ PYTHON
     fi
     sleep 2
   done
-  printf 'PIN_AUDIT_STATUS_TIMEOUT\n' >&2
+  printf '%s_STATUS_TIMEOUT\n' "$PREFIX" >&2
   return 2
+}
+
+check_wake_progress() {
+  [[ $PROFILE == --watchdog-wake ]] || return 0
+  if ! sudo -n "$PY" -I -B - <<'PYTHON'
+import json
+import os
+import stat
+import time
+from pathlib import Path
+
+try:
+    with Path("/run/xgw/watchdog-step.json").open("rb") as stream:
+        row = json.load(stream)
+        mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+    at = row["at"]
+    generation = row["generation"]
+    wake = row["wake"]
+    valid = (mode == 0o600 and type(generation) is int and generation > 0
+             and row["phase"] in ("tick", "sleep")
+             and type(at) in (int, float) and 0 <= time.monotonic() - at <= 180
+             and (wake is None or isinstance(wake, dict)))
+except (OSError, ValueError, KeyError, TypeError):
+    valid = False
+raise SystemExit(not valid)
+PYTHON
+  then
+    printf 'WATCHDOG_WAKE_PROGRESS_UNAVAILABLE\n' >&2
+    return 2
+  fi
+  printf 'WATCHDOG_WAKE_PROGRESS_OK\n'
 }
 
 https_control() {
@@ -117,7 +179,7 @@ PYTHON
   code=$(curl -q -fsS --max-time 10 --max-filesize 131072 --noproxy '' \
     --proxy "http://127.0.0.1:$port" -o /dev/null -w '%{http_code}' https://example.org/) || return
   [[ $code == 200 ]] || return 2
-  printf 'PIN_AUDIT_HTTPS %s 200\n' "$1"
+  printf '%s_HTTPS %s 200\n' "$PREFIX" "$1"
 }
 
 verify_files() {
@@ -142,7 +204,8 @@ daemon_before=$(pid xgw.service)
 wait_status 0
 controls baseline "$D/base"
 if [[ $present == yes ]]; then
-  printf 'PIN_AUDIT_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED\n'
+  check_wake_progress
+  printf '%s_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED\n' "$PREFIX"
   exit 0
 fi
 
@@ -150,8 +213,8 @@ for directory in /opt/xgw/handoff /var/lib/xgw/handoff; do
   [[ ! -L $directory ]]
   sudo -n test -d "$directory" || sudo -n install -d -m 0700 "$directory"
 done
-PAYLOAD=$(sudo -n mktemp -d /opt/xgw/handoff/pin-audit.XXXXXXXX)
-BACKUP=$(sudo -n mktemp -d /var/lib/xgw/handoff/pin-audit.XXXXXXXX)
+PAYLOAD=$(sudo -n mktemp -d "/opt/xgw/handoff/$SCOPE.XXXXXXXX")
+BACKUP=$(sudo -n mktemp -d "/var/lib/xgw/handoff/$SCOPE.XXXXXXXX")
 printf 'ROLLBACK_PAYLOAD %s\nROLLBACK_BACKUP %s\n' "$PAYLOAD" "$BACKUP"
 sudo -n install -m 0600 "$INSTALLER" "$PAYLOAD/install.py"
 for path in "${PATHS[@]}"; do
@@ -159,7 +222,7 @@ for path in "${PATHS[@]}"; do
   sudo -n install -D -m 0600 "$path" "$PAYLOAD/code/$path"
 done
 INSTALL=("$PY" -I -B "$PAYLOAD/install.py")
-ARGS=(--pin-audit --backup "$BACKUP")
+ARGS=("$PROFILE" --backup "$BACKUP")
 sudo -n "${INSTALL[@]}" prepare "${ARGS[@]}" --payload "$PAYLOAD" --package "$PACKAGE"
 
 finish() {
@@ -168,9 +231,9 @@ finish() {
     if sudo -n "${INSTALL[@]}" rollback "${ARGS[@]}" &&
        wait_status "$(date +%s.%N)" && controls restored "$D/base" &&
        sudo -n systemctl stop "$UNIT.timer"; then
-      printf 'PIN_AUDIT_ROLLED_BACK\n'
+      printf '%s_ROLLED_BACK\n' "$PREFIX"
     else
-      printf 'PIN_AUDIT_ROLLBACK_PENDING\n' >&2
+      printf '%s_ROLLBACK_PENDING\n' "$PREFIX" >&2
       rc=2
     fi
   fi
@@ -184,9 +247,10 @@ sudo -n systemd-run --collect --unit="$UNIT" --on-active=15m --service-type=ones
   "${INSTALL[@]}" rollback "${ARGS[@]}"
 armed=yes
 systemctl is-active --quiet "$UNIT.timer"
-printf 'PIN_AUDIT_ROLLBACK_ARMED\n'
+printf '%s_ROLLBACK_ARMED\n' "$PREFIX"
 sudo -n "${INSTALL[@]}" apply "${ARGS[@]}"
 wait_status "$(date +%s.%N)"
+check_wake_progress
 daemon_after=$(pid xgw.service)
 [[ $daemon_after != "$daemon_before" ]]
 controls installed "$D/tree"
@@ -197,4 +261,4 @@ fi
 [[ $(pid xgw.service) == "$daemon_after" ]]
 controls confirmed "$D/tree"
 armed=no
-printf 'PIN_AUDIT_DEPLOYED_AND_VERIFIED\n'
+printf '%s_DEPLOYED_AND_VERIFIED\n' "$PREFIX"
