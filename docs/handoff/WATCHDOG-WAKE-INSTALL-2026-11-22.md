@@ -1,20 +1,21 @@
-# ThinkCentre — установка диагностики длительных шагов watchdog, r2
+# ThinkCentre — установка диагностики длительных шагов watchdog, r3
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет сценарии и автоматически
 публикует один обезличенный отчёт. При недоступности терминала,
 sudo или GitHub запроси доступ. Команды и проверки подготовлены Codex.
 
-Установка первого формата прошла 15/15. В каждом окне наблюдался
-один совместный набор `net` и `rules`. Начало разбора было общим.
-Время до него составило 10,27–10,54 с для `net` и 5,80–6,21 с
-для `rules`. Разность соответствует более раннему поступлению `net`
-в этих двух наборах. FIB и настройки совпали, HTTPS дал 11/12.
-[Отчёт установки](../reports/2026-11-22T132531Z_watchdog-wake-install.md)
+В r2 прошли все 17 контрактов на копии установленного пакета.
+После перезапуска свежий статус появился во время первого шага, когда
+`last_step` ещё был `null`. Однократная проверка остановила установку.
+Сценарий вернул предыдущий слой, подтвердил HTTPS 200, прежний PID Xray
+и контрольные суммы настроек. Наблюдение r2 осталось невыполненным.
+[Отчёт r2](../reports/2026-11-22T134500Z_watchdog-step-attribution.md)
 
-Чтение раз в секунду может пропустить короткую фазу `sleep`. R2 хранит
-последний завершённый шаг в обеих фазах и учитывает пробелы номеров
-между прочитанными записями. Начало разбора события и время отдельной
-проверки правил измеряются независимо.
+R3 сохраняет прежний кандидат `6de2c66` и исправляет готовность установки.
+После проверки свежего статуса сценарий до 120 секунд ждёт завершённый
+шаг процесса, запущенного текущим экземпляром `xgw.service`.
+Сохранившийся снимок прежнего процесса пропускается. Завершение
+учитывается и в записи фазы `tick`, если начался следующий шаг.
 
 ## 1. Установка
 
@@ -28,7 +29,7 @@ sudo или GitHub запроси доступ. Команды и проверк
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=0b4684129fd1b29da6f98b982fc940594b2d1b7f
+CODE=fd48a39d753ab49bdd4f64571d063b970203f74f
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin "$BR"
 git merge-base --is-ancestor "$CODE" FETCH_HEAD
@@ -46,10 +47,12 @@ BASH
 | Маркер | Действие и критерий |
 |---|---|
 | WATCHDOG_TIMING_BASELINE_MISMATCH | Контекст в установленном файле расходится. Укажи имя файла и классификацию сбоя, исходный diff оставь на машине. |
-| WATCHDOG_TIMING_CONTRACTS_OK | Все 17 тестов прошли на копии установленного пакета. При сбое установка останавливается. |
+| WATCHDOG_TIMING_CONTRACTS_OK | Все 22 теста прошли на копии установленного пакета. Пять новых проверяют ожидание первого шага, старый снимок, таймаут и некорректный снимок. При сбое установка останавливается. |
 | WATCHDOG_TIMING_HTTPS baseline 200 | После сверки исходных байтов и свежего статуса начальный HTTPS-контроль через Xray вернул 200. Ручного закрепления нет. |
 | WATCHDOG_TIMING_ROLLBACK_ARMED | Независимый таймер на 15 минут активен перед заменой. Установщик повторно сверил байты и состояние воркеров. |
-| WATCHDOG_TIMING_PROGRESS_OK | Штатный закрытый файл `watchdog-step.json` содержит поколение, `last_step` и `wake`. Для `wake` допустим `null`. |
+| WATCHDOG_TIMING_PROGRESS_CHECK | Укажи `result`, `polls` и `waiting_first_step`. `ready` означает завершённый шаг текущего процесса. `waiting_first_step` как итог означает истечение бюджета ожидания. |
+| WATCHDOG_TIMING_PROGRESS_OK | Закрытый `watchdog-step.json` содержит свежую запись с поколением текущего процесса и подтверждённым `last_step`. Для `wake` допустим `null`. |
+| WATCHDOG_TIMING_PROGRESS_UNAVAILABLE | Запиши итог проверки и результат отката. Отдельно укажи отсутствие свежего снимка, незавершённый шаг, несовместимый формат или смену процесса, если она наблюдалась. |
 | WATCHDOG_TIMING_DEPLOYED_AND_VERIFIED | Файл сверили, XGW опубликовал свежий статус после перезапуска, PID Xray и SHA настроек совпали. HTTPS при установке и подтверждении вернул 200. Таймер снят. Оставь слой установленным. |
 | WATCHDOG_TIMING_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED | Установленные байты совпали с правкой по контексту. Живой процесс подтвердил формат. Повторного перезапуска не было. |
 
@@ -65,7 +68,7 @@ p95. Второе окно на 180 секунд повторяет лёгкую
 bash <<'BASH'
 set -euo pipefail
 umask 077
-CODE=0b4684129fd1b29da6f98b982fc940594b2d1b7f
+CODE=fd48a39d753ab49bdd4f64571d063b970203f74f
 cd "$(git rev-parse --show-toplevel)"
 sudo -n true
 D=$(mktemp -d "$HOME/xgw-wake-observe.XXXXXXXX")
@@ -179,12 +182,12 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-step-attribution.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-step-attribution-r3.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre watchdog step timing and wake attribution'
+git commit -m 'Report ThinkCentre watchdog timing readiness r3'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
