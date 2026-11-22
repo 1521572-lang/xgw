@@ -31,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake|--watchdog-timing|--watchdog-scan)
+  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -58,7 +58,7 @@ case "$PROFILE" in
       NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check
               tests/test_watchdog_progress_gate.py)
       EXPECTED=22
-      if [[ $PROFILE == --watchdog-scan ]]; then
+      if [[ $PROFILE == --watchdog-scan || $PROFILE == --watchdog-wan ]]; then
         SCOPE=watchdog-scan
         PREFIX=WATCHDOG_SCAN
         BASE=6de2c66658f9889a42e906859e480ed05714d84d
@@ -66,6 +66,20 @@ case "$PROFILE" in
         TEST_FILES+=(tests/test_scan_pacing.py)
         NODES+=(tests/test_scan_pacing.py tests/test_daemon.py::test_scan_does_not_block_watchdog)
         EXPECTED=30
+        if [[ $PROFILE == --watchdog-wan ]]; then
+          SCOPE=watchdog-wan
+          PREFIX=WATCHDOG_WAN
+          BASE=da6d12a21d0fb2fbdc7c4048737b02ecf9835629
+          ACCEPTED=1fc8fa526f8353ade444f351f5509e9627059486
+          TEST_FILES+=(tests/test_daemon_main.py tests/test_dualcore.py tests/test_tspu.py)
+          NODES+=(tests/test_tspu.py::test_wan_is_down_only_when_every_check_host_is_down
+                  tests/test_tspu.py::test_provider_rechecks_last_success_then_falls_back_in_config_order
+                  tests/test_tspu.py::test_e2e_tries_another_host_and_rests_the_one_that_answered_403
+                  tests/test_tspu.py::test_e2e_timings_distinguish_primary_and_fallback)
+          EXPECTED=34
+        else
+          TEST_CODE=201c3d0d873ae8e6ea8df6042d0de856545f9d46
+        fi
       else
         TEST_CODE=fd48a39d753ab49bdd4f64571d063b970203f74f
       fi
@@ -170,6 +184,8 @@ check_wake_progress() {
     local progress_args=("$started_us")
     if [[ $PROFILE == --watchdog-scan ]]; then
       progress_args+=(--details)
+    elif [[ $PROFILE == --watchdog-wan ]]; then
+      progress_args+=(--provider)
     fi
     if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
          sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "${progress_args[@]}"; then
@@ -249,7 +265,7 @@ wait_status 0
 controls baseline "$D/base"
 if [[ $present == yes ]]; then
   check_wake_progress
-  if [[ $PROFILE == --watchdog-timing || $PROFILE == --watchdog-scan ]]; then
+  if [[ $PROFILE != --pin-audit && $PROFILE != --watchdog-wake ]]; then
     [[ $(pid xgw.service) == "$daemon_before" ]]
     controls confirmed "$D/tree"
   fi
