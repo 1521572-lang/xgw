@@ -31,7 +31,7 @@ case "$PROFILE" in
            tests/test_daemon_main.py::test_main_is_released_when_no_member_answers)
     EXPECTED=13
     ;;
-  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan)
+  --watchdog-wake|--watchdog-timing|--watchdog-scan|--watchdog-wan|--watchdog-scan-slot)
     SCOPE=watchdog-wake
     PREFIX=WATCHDOG_WAKE
     BASE=c7a0d3fccd30ae9e21aa26b01f0d97d779b58b61
@@ -58,7 +58,7 @@ case "$PROFILE" in
       NODES+=(tests/test_daemon.py::test_watchdog_reports_tick_overlap_and_separate_rules_check
               tests/test_watchdog_progress_gate.py)
       EXPECTED=22
-      if [[ $PROFILE == --watchdog-scan || $PROFILE == --watchdog-wan ]]; then
+      if [[ $PROFILE != --watchdog-timing ]]; then
         SCOPE=watchdog-scan
         PREFIX=WATCHDOG_SCAN
         BASE=6de2c66658f9889a42e906859e480ed05714d84d
@@ -66,7 +66,7 @@ case "$PROFILE" in
         TEST_FILES+=(tests/test_scan_pacing.py)
         NODES+=(tests/test_scan_pacing.py tests/test_daemon.py::test_scan_does_not_block_watchdog)
         EXPECTED=30
-        if [[ $PROFILE == --watchdog-wan ]]; then
+        if [[ $PROFILE != --watchdog-scan ]]; then
           SCOPE=watchdog-wan
           PREFIX=WATCHDOG_WAN
           BASE=da6d12a21d0fb2fbdc7c4048737b02ecf9835629
@@ -77,6 +77,15 @@ case "$PROFILE" in
                   tests/test_tspu.py::test_e2e_tries_another_host_and_rests_the_one_that_answered_403
                   tests/test_tspu.py::test_e2e_timings_distinguish_primary_and_fallback)
           EXPECTED=34
+          if [[ $PROFILE == --watchdog-scan-slot ]]; then
+            SCOPE=watchdog-scan-slot
+            PREFIX=WATCHDOG_SCAN_SLOT
+            BASE=1fc8fa526f8353ade444f351f5509e9627059486
+            ACCEPTED=aa2a3ab4fc6c46134c5949283b2b6e8b658f250c
+            EXPECTED=39
+          else
+            TEST_CODE=adf8e8b86867904324a9a62b6701e55e8ce8bb91
+          fi
         else
           TEST_CODE=201c3d0d873ae8e6ea8df6042d0de856545f9d46
         fi
@@ -186,6 +195,8 @@ check_wake_progress() {
       progress_args+=(--details)
     elif [[ $PROFILE == --watchdog-wan ]]; then
       progress_args+=(--provider)
+    elif [[ $PROFILE == --watchdog-scan-slot ]]; then
+      progress_args+=(--scan-slot)
     fi
     if ! git -C "$REPO" show "$CODE:docs/helpers/watchdog_progress_gate.py" |
          sudo -n /usr/bin/timeout -k 3 125 "$PY" -I -B - "${progress_args[@]}"; then
