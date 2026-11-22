@@ -1,24 +1,24 @@
-# ThinkCentre — порядок WAN-проб и время сквозной проверки, r5
+# ThinkCentre — плановые сканы при долгих шагах watchdog, r6
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет сценарии и автоматически
 публикует один обезличенный отчёт. При недоступности терминала,
 sudo или GitHub запроси доступ. Команды и проверки подготовлены Codex.
 
-В r4 прошли 30 контрактов. Первый запуск откатился после HTTPS-таймаута,
-повторная установка прошла. Плановая проба откладывалась в 4 шагах
-за 180 с и 19 за 600 с. В исходном окне сканов почти не было,
-поэтому эффект правки на общую длительность шага остаётся неизвестным.
-Проверка WAN занимала до 21,14 с, сквозная — до 30,32 с, очередь
-сканов — до 19,88 с. [Отчёт r4](../reports/2026-11-22T154911Z_watchdog-scan-budget.md)
+R5 установлен с первого раза. Прошли 34 контракта, FIB совпал
+во всех восьми снимках. Максимумы после установки достигли
+10,02 с для суммы TCP-подключений WAN, 30,66 с для сквозной проверки
+и 44,00 с для полного шага при интервале 20 с. Число шагов
+в столбце измерений означает охват выборки. Частоту таймаутов
+из максимума и этого числа определить нельзя.
+[Отчёт r5](../reports/2026-11-22T164641Z_watchdog-wan-check.md)
 
-R5 начинает WAN-проверку с последнего ответившего адреса. При отказе
-проверяет остальные по конфигурации. Событие сети или возобновление после
-сна возвращает исходный порядок. Пороги и таймауты остаются прежними.
-Замеры отдельно показывают разрешение имени, TCP-подключение,
-первую, дополнительную и резервную сквозные пробы. В выводе только
-длительности и счётчики, адреса остаются на машине.
+R6 откладывает плановые проверки запасных, если к началу скана
+до конца интервала осталось меньше пяти секунд. Если на следующем
+подходящем шаге остаток такой же короткий, запускается одна проба.
+Ручные и срочные проверки, проверки участников и сканы в аварийных
+состояниях идут по действующему порядку. Сетевые таймауты прежние.
 
-Порядок прогона — раздел 2 с `PHASE=before` на установленном r4,
+Порядок прогона — раздел 2 с `PHASE=before` на установленном r5,
 затем установка из раздела 1, затем раздел 2 с `PHASE=after`.
 
 ## 1. Установка
@@ -33,32 +33,32 @@ R5 начинает WAN-проверку с последнего ответив�
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=adf8e8b86867904324a9a62b6701e55e8ce8bb91
+CODE=220a657a787efb062c7867689a51611b6367d7b0
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin "$BR"
 git merge-base --is-ancestor "$CODE" FETCH_HEAD
 git show "$CODE:docs/helpers/run_pin_audit_install.sh" |
-  bash -s -- "$CODE" --watchdog-wan
+  bash -s -- "$CODE" --watchdog-scan-slot
 BASH
 ~~~
 
-Сценарий накладывает правку из `1fc8fa526f8353ade444f351f5509e9627059486`
-поверх слоя `da6d12a` в копии установленного `daemon.py`.
-Контракты покрывают рабочий и отказавший WAN, порядок повторных проб,
-две попытки сквозной проверки и уже принятые проверки сканирования,
-готовности процесса, расписания, ip rule и TUN.
+Сценарий накладывает правку из `aa2a3ab4fc6c46134c5949283b2b6e8b658f250c`
+поверх слоя `1fc8fa5` в копии установленного `daemon.py`.
+Пять новых контрактов покрывают перенос и продвижение очереди
+при повторном дефиците времени, ручную и срочную пробы, проверку
+участника и аварийный режим. В набор включены 34 контракта r5.
 Приёмка ждёт свежий завершённый шаг текущего процесса до 120 секунд.
 
 | Маркер | Действие и критерий |
 |---|---|
-| WATCHDOG_WAN_BASELINE_MISMATCH | Укажи расхождение контекста. Исходный diff оставь на машине. |
-| WATCHDOG_WAN_CONTRACTS_OK | Все 34 теста прошли на копии установленного пакета. При сбое установка останавливается. |
-| WATCHDOG_WAN_HTTPS baseline 200 | Исходный HTTPS-контроль через Xray вернул 200. |
-| WATCHDOG_WAN_ROLLBACK_ARMED | Независимый таймер активен на 15 минут перед заменой. |
+| WATCHDOG_SCAN_SLOT_BASELINE_MISMATCH | Укажи расхождение контекста. Исходный diff оставь на машине. |
+| WATCHDOG_SCAN_SLOT_CONTRACTS_OK | Все 39 тестов прошли на копии установленного пакета. При сбое установка останавливается. |
+| WATCHDOG_SCAN_SLOT_HTTPS baseline 200 | Исходный HTTPS-контроль через Xray вернул 200. |
+| WATCHDOG_SCAN_SLOT_ROLLBACK_ARMED | Независимый таймер активен на 15 минут перед заменой. |
 | WATCHDOG_TIMING_PROGRESS_CHECK | Укажи `result`, `polls` и `waiting_first_step`. |
-| WATCHDOG_WAN_PROGRESS_OK | Свежий `last_step` текущего процесса содержит `details_s`, `planned_scan_deferred` и `provider_attempts`. |
-| WATCHDOG_WAN_DEPLOYED_AND_VERIFIED | XGW перезапущен, файл сверили, PID Xray и SHA настроек совпали. HTTPS в обеих проверках 200. Таймер снят. Оставь слой установленным. |
-| WATCHDOG_WAN_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED | Байты и формат действующего процесса подтверждены. Замер исходного r4 укажи как `NOT_RUN`, если он не проводился. |
+| WATCHDOG_SCAN_SLOT_PROGRESS_OK | Свежий `last_step` текущего процесса содержит прежние поля, `scan_deferred_for_step` и `queue_probe_count`. |
+| WATCHDOG_SCAN_SLOT_DEPLOYED_AND_VERIFIED | XGW перезапущен, файл сверили, PID Xray и SHA настроек совпали. HTTPS в обеих проверках 200. Таймер снят. Оставь слой установленным. |
+| WATCHDOG_SCAN_SLOT_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED | Байты и формат действующего процесса подтверждены. Замер исходного r5 укажи как `NOT_RUN`, если он не проводился. |
 
 ## 2. Сопоставимые окна до и после
 
@@ -73,7 +73,7 @@ BASH
 bash <<'BASH'
 set -euo pipefail
 umask 077
-CODE=adf8e8b86867904324a9a62b6701e55e8ce8bb91
+CODE=220a657a787efb062c7867689a51611b6367d7b0
 [[ ${PHASE:-} == before || ${PHASE:-} == after ]]
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin integration/zapret2-batch1
@@ -150,11 +150,16 @@ BASH
 `step_details` для `provider_check`, `provider_resolve`,
 `provider_connect`, `end_to_end`, `e2e_primary`,
 `e2e_fallback`, `e2e_reserve` и `scan_queue`.
-Для каждой операции приведи максимум и число шагов. При отсутствии
-отдельного замера пропиши `NOT_OBSERVED`. Приведи `provider_attempts`
-с числом шагов, суммой и максимумом. В исходном формате это поле
-равно `null`. Сравни длительность WAN отдельно от полного шага
-и укажи разницу в активности сканов и состоянии шлюза.
+Для каждой операции приведи число шагов, p50, p95 и максимум.
+При отсутствии замера укажи `NOT_OBSERVED`. Для `provider_attempts`
+приведи число шагов, сумму и максимум. Метрика `scan_deferred_for_step`
+показывает перенос из-за остатка интервала. `queue_probes` показывает
+число шагов с пробами и общее число запусков из очереди. Повтор по
+другому хосту внутри одного запуска отдельно в этом счётчике не виден.
+В исходном r5 оба поля отсутствуют, поэтому сопоставь время `scan_queue`
+и количество наблюдений, отметив ограничение. Если переносов нет,
+эффект переноса остаётся `NOT_OBSERVED`. Разницу p95 учитывай
+вместе с загрузкой WAN, сквозными пробами и активностью очереди.
 Для повторных таймаутов приведи curl_rc, HTTP, код CONNECT и время
 до завершения TLS. Нулевое время TLS означает отсутствие отметки
 о завершённом рукопожатии. Состояние VPN оценивай вместе с контролями FIB,
@@ -173,16 +178,16 @@ BASH
 
 ## 3. Откат
 
-При `WATCHDOG_WAN_ROLLED_BACK` укажи итог восстановления и HTTPS.
-При `WATCHDOG_WAN_ROLLBACK_PENDING` проверь
-`xgw-watchdog-wan-rollback.timer` и `xgw-watchdog-wan-rollback.service`.
+При `WATCHDOG_SCAN_SLOT_ROLLED_BACK` укажи итог восстановления и HTTPS.
+При `WATCHDOG_SCAN_SLOT_ROLLBACK_PENDING` проверь
+`xgw-watchdog-scan-slot-rollback.timer` и `xgw-watchdog-scan-slot-rollback.service`.
 Дождись активного таймера. Если таймер и служба завершились,
 а проверка восстановления не пройдена, используй значения из
 текущего прогона и выполни:
 
 ~~~bash
 sudo /usr/bin/python3 -I -B "$ROLLBACK_PAYLOAD/install.py" \
-  rollback --watchdog-wan --backup "$ROLLBACK_BACKUP"
+  rollback --watchdog-scan-slot --backup "$ROLLBACK_BACKUP"
 ~~~
 
 ## 4. Автоматическая публикация
@@ -203,12 +208,12 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-wan-check.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-scan-slot.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre WAN health check ordering'
+git commit -m 'Report ThinkCentre scan scheduling under long watchdog steps'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
