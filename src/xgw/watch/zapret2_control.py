@@ -171,6 +171,21 @@ def transport_failure_detail(reason: str, probes: dict) -> str:
     return REASONS[reason]
 
 
+def _queue_losses(snapshot: dict, unit: str, queue: int | None, key: str, now: float) -> dict:
+    journal = snapshot.get("zapret2_worker_events")
+    sample = worker.current_queue_counters(journal, now)
+    reservation = _record(snapshot.get("zapret2_reservation"))
+    if (sample is None or sample["unit"] != unit or sample["queue"] != queue
+            or reservation.get("unit") != unit
+            or type(reservation.get("queue")) is not int or reservation["queue"] != queue
+            or type(reservation.get("generation")) is not int
+            or reservation["generation"] != sample["generation"]
+            or journal["events"][-1].get("policy_key") != key):
+        return {}
+    return {"queue_overflow": sample["overflow"], "queue_netlink_dropped": sample["netlink"],
+            "queue_dropped": sample["overflow"] + sample["netlink"]}
+
+
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None,
          probe_budget: dict | None = None) -> dict:
     """Always return a card; a worker fault never means that VPN was restored.
@@ -270,6 +285,11 @@ Commands use the same validation as this card; observations remain revision-boun
     queue = raw.get("queue") if source == "engine" else settings["queue_num"]
     queue = queue if type(queue) is int and 1 <= queue <= 65535 else None
     trusted = fresh and matched and not invalid
+    counters = {"queued_original": None, "queued_reply": None, "queue_dropped": None,
+                "queue_overflow": None, "queue_netlink_dropped": None, "strategy_switches": None}
+    if trusted and phase == "active":
+        unit = worker.SELECTED_UNIT if source == "selected" else worker.ENGINE_UNIT
+        counters.update(_queue_losses(snapshot, unit, queue, key, now))
     transport = ("https_reachable"
                  if trusted and phase == "active" and reason == "youtube_transport_ok"
                  and settings.get("youtube_transport_probe") is True else "unknown")
@@ -342,8 +362,7 @@ Commands use the same validation as this card; observations remain revision-boun
         "strategies": list(management.PROFILES), "domains": settings["domains"],
         "worker": {"profile": profile if trusted else None,
                    "queue": queue if trusted else None},
-        "counters": {"queued_original": None, "queued_reply": None,
-                     "queue_dropped": None, "strategy_switches": None},
+        "counters": counters,
         "evidence": {"transport": transport, "playback": "not_tested",
                      "transport_probes": transport_rows,
                      "last_transport_ok_at": last_transport_ok_at,

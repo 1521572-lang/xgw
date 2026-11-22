@@ -7,6 +7,7 @@ const modes = {
 const phases = {
   reserved: "Очередь зарезервирована", owner_verified: "Владелец очереди подтверждён",
   owner_unverified: "Владелец очереди перестал подтверждаться", released: "Очередь освобождена",
+  queue_drops: "Потери в очереди",
 };
 const units = {"xgw-zapret2.service": "Выбранные домены", "xgw-nfqws2.service": "Общий обработчик"};
 const vpnChecks = {pass: "Прошла", fail: "Не прошла", not_run: "Не запускалась"};
@@ -350,9 +351,7 @@ function render(payload) {
   }
   put("playback", evidence.playback === "not_tested" ? "Не проверялось" : "Нет данных");
   put("vpn", vpnChecks[evidence.vpn_control] || "Нет данных");
-  put("queued-original", count(confirmed ? card.counters?.queued_original : null));
-  put("queued-reply", count(confirmed ? card.counters?.queued_reply : null));
-  put("queue-dropped", count(confirmed ? card.counters?.queue_dropped : null));
+  renderCounters(confirmed ? card.counters : null);
 
   const domains = Array.isArray(card.domains) ? card.domains : [];
   el("domain-list").replaceChildren(...domains.map(domain => {
@@ -363,6 +362,16 @@ function render(payload) {
   el("domains-empty").hidden = domains.length > 0;
   put("domains-empty", "Домены не заданы");
   renderJournal(payload.journal);
+}
+
+function renderCounters(counters) {
+  for (const [id, field] of [
+    ["queued-original", "queued_original"], ["queued-reply", "queued_reply"],
+    ["queue-dropped", "queue_dropped"], ["queue-overflow", "queue_overflow"],
+    ["queue-netlink-dropped", "queue_netlink_dropped"],
+  ]) {
+    if (el(id)) put(id, count(counters?.[field]));
+  }
 }
 
 function renderJournal(journal) {
@@ -385,10 +394,15 @@ function renderJournal(journal) {
     stamp.dateTime = time.toISOString();
     stamp.textContent = date.format(time);
     const description = document.createElement("span");
-    description.textContent = [
+    const fields = [
       phases[event.phase], units[event.unit],
       "очередь " + count(event.queue), "поколение " + count(event.generation),
-    ].join(" · ");
+    ];
+    if (event.phase === "queue_drops") {
+      fields.push("переполнение +" + count(event.overflow_delta),
+        "доставка netlink +" + count(event.netlink_delta));
+    }
+    description.textContent = fields.join(" · ");
     item.append(stamp, description);
     return item;
   }));
@@ -399,8 +413,10 @@ function unavailable(message) {
   controls();
   put("state", message);
   el("state").dataset.tone = "waiting";
-  for (const id of ["running", "queue", "https", "probe-page", "probe-cdn", "playback", "vpn",
-    "queued-original", "queued-reply", "queue-dropped"]) put(id, "Нет данных");
+  for (const id of ["running", "queue", "https", "probe-page", "probe-cdn", "playback", "vpn"]) {
+    put(id, "Нет данных");
+  }
+  renderCounters(null);
   put("detail", "");
   renderJournal(null);
 }

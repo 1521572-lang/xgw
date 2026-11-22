@@ -222,6 +222,12 @@ class Zapret2Page(Page):
         if last_transport_ok and not self.main.stale:
             stamp = datetime.fromtimestamp(last_transport_ok, UTC).strftime("%d.%m %H:%M:%S UTC")
             detail += "\nПоследний успех HTTPS: " + stamp
+        counters = view.get("counters") or {}
+        overflow, netlink = counters.get("queue_overflow"), counters.get("queue_netlink_dropped")
+        if (not self.main.stale and view.get("state") == "active"
+                and view.get("fresh") is True and view.get("policy_matched") is True
+                and all(type(value) is int and value >= 0 for value in (overflow, netlink))):
+            detail += f"\nПотери очереди · переполнение {overflow} · доставка netlink {netlink}"
         mode_label = MODES.get(view["mode"], "—")
         if view.get("source") == "engine":
             mode_label = ("Движок zapret2" if view.get("engine_mode") == "auto"

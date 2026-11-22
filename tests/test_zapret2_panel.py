@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from xgw.config import Config
-from xgw.desync import schema
+from xgw.desync import schema, worker
 from xgw.watch.zapret2_control import card, transport_probes
 
 NOW = 1000
@@ -167,6 +167,41 @@ def test_engine_states(state, reason, expected):
     assert result["can_off"] and result["can_edit"]
     assert result["blockers"]["compare"]
     assert all(value is None for value in result["counters"].values())
+
+
+@pytest.mark.parametrize("mode", ["off", "selective"])
+def test_losses_are_fresh_and_bound_to_the_active_policy_and_generation(mode, monkeypatch):
+    monkeypatch.setattr(worker.time, "time", lambda: NOW)
+    cfg, snap = fixture(mode=mode, valid_until=NOW + 60)
+    slot = worker.WorkerSlot()
+    unit = worker.ENGINE_UNIT if mode == "off" else worker.SELECTED_UNIT
+    queue = 200 if mode == "off" else cfg.zapret2.queue_num
+    lease = slot.reserve(unit, queue, policy_key=snap["zapret2_policy_key"])
+    snap["zapret2_reservation"] = {"unit": unit, "queue": queue, "generation": lease.generation}
+    slot.observe_owner(lease, True, worker.QueueOwner("socket:[1111]", (0, 4, 24)))
+    history = slot.snapshot()[1]
+    snap["zapret2_worker_events"] = history
+    result = view(cfg, snap)
+    keys = ("queue_overflow", "queue_netlink_dropped", "queue_dropped")
+    assert [result["counters"][name] for name in keys] == [0, 4, 4]
+    assert "socket:[" not in json.dumps(result)
+
+    sample = history["queue_counters"]
+    item = history["events"][-1]
+    for target, field, value in (
+        (sample, "at", NOW - 91), (sample, "netlink", False),
+        (snap["zapret2_reservation"], "generation", 2),
+        (snap["zapret2_reservation"], "queue", queue + 1),
+        (item, "policy_key", None), (item, "phase", "owner_unverified"),
+        (snap, "zapret2_policy_key", "previous"),
+    ):
+        original = target[field]
+        target[field] = value
+        assert [view(cfg, snap)["counters"][name] for name in keys] == [None] * 3
+        target[field] = original
+
+    del snap["zapret2_worker_events"]
+    assert all(view(cfg, snap)["counters"][name] is None for name in keys)
 
 
 def test_off_and_unconfirmed_stop():

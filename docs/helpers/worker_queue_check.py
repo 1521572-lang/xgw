@@ -1,19 +1,26 @@
-"""Read counters from a disposable nfqws2 listener in an isolated network namespace."""
+"""Verify listener loss and one-slot NFQUEUE overflow in an isolated network namespace."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 QUEUE = 201
+PORT = 31085
+PACKETS = 8
 BINARY = Path("/opt/xgw/zapret2/1.0.7/nfqws2")
 VERSION = re.compile(rb"^github version v?1\.0\.7 \(038c97e[0-9a-f]*\) lua_compat_ver \d+$",
                      re.MULTILINE)
@@ -35,9 +42,69 @@ def stop(proc):
         proc.wait(timeout=2)
 
 
+@contextmanager
+def overflow_samples(sample):
+    """Read a known one-slot backlog before and after a fixed loopback-only batch."""
+    library = ctypes.CDLL("libnetfilter_queue.so.1")
+    ptr = ctypes.c_void_p
+    callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ptr, ptr, ptr, ptr)
+    for name, result, args in (
+        ("nfq_open", ptr, []), ("nfq_close", ctypes.c_int, [ptr]),
+        ("nfq_create_queue", ptr, [ptr, ctypes.c_uint16, callback_type, ptr]),
+        ("nfq_set_mode", ctypes.c_int, [ptr, ctypes.c_uint8, ctypes.c_uint32]),
+        ("nfq_set_queue_maxlen", ctypes.c_int, [ptr, ctypes.c_uint32]),
+        ("nfq_destroy_queue", ctypes.c_int, [ptr]),
+    ):
+        function = getattr(library, name)
+        function.restype, function.argtypes = result, args
+    handle = library.nfq_open()
+    require(bool(handle), "overflow_nfq_open")
+    queue = None
+    rule_added = False
+    callback = callback_type(lambda *_: 0)
+    nft = "/usr/sbin/nft"
+    try:
+        queue = library.nfq_create_queue(handle, QUEUE, callback, None)
+        require(bool(queue), "overflow_queue_create")
+        require(library.nfq_set_mode(queue, 1, 0) >= 0, "overflow_copy_meta")
+        require(library.nfq_set_queue_maxlen(queue, 1) >= 0, "overflow_queue_length")
+        before = sample()
+        require(before is not None and before.counters == (0, 0, 0), "overflow_baseline")
+
+        subprocess.run(["/usr/sbin/ip", "link", "set", "lo", "up"], check=True, timeout=3)
+        rule = ("table inet xgw_queue_trial { chain trial { "
+                "type filter hook output priority filter; policy accept; "
+                f"ip daddr 127.0.0.1 udp dport {PORT} queue num {QUEUE}; "
+                "} }\n")
+        subprocess.run([nft, "-f", "-"], input=rule, text=True, check=True, timeout=3)
+        rule_added = True
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.settimeout(0.5)
+            for _ in range(PACKETS):
+                try:
+                    sender.sendto(b"xgw-test", ("127.0.0.1", PORT))
+                except OSError as exc:
+                    if exc.errno not in (errno.EPERM, errno.ENOBUFS):
+                        raise
+        after = sample()
+        require(after is not None and after.counters is not None
+                and after.socket == before.socket, "overflow_same_owner")
+        require(after.counters[:2] == (PACKETS - 1, 0), "overflow_expected_counters")
+        yield before, after
+    finally:
+        if queue:
+            library.nfq_destroy_queue(queue)
+        library.nfq_close(handle)
+        if rule_added:
+            subprocess.run([nft, "delete", "table", "inet", "xgw_queue_trial"],
+                           check=True, timeout=3)
+
+
 def run(folder):
     sys.path.insert(0, str(folder / "src"))
+    from xgw.config import Config
     from xgw.desync import event_socket, worker
+    from xgw.watch.zapret2_control import card
 
     status = folder / "status.json"
     endpoint = folder / "events.sock"
@@ -99,6 +166,40 @@ def run(folder):
             slot.release(lease)
             print(json.dumps({"generation": count, "kernel_counters": [0, 0],
                               "event_socket": "ok", "after_listener_loss": None}), flush=True)
+        cfg = Config()
+        cfg.zapret2.engine = "auto"
+        key = worker.policy_revision(cfg.zapret2)
+        lease = slot.reserve(worker.ENGINE_UNIT, QUEUE, policy_key=key)
+        with overflow_samples(
+            lambda: worker.owner_sample(lambda *_a, **_kw: str(os.getpid()), lease.unit, QUEUE),
+        ) as (before, after):
+            slot.observe_owner(lease, True, before)
+            slot.observe_owner(lease, True, after)
+            reply = read()
+            event = reply["events"][-1]
+            require(event["phase"] == "queue_drops" and event["generation"] == lease.generation
+                    and event["overflow_delta"] == PACKETS - 1 and event["netlink_delta"] == 0,
+                    "overflow_event")
+            snapshot = {
+                "daemon": True, "updated": time.time(), "zapret2_policy_key": key,
+                "zapret2_reservation": asdict(lease), "zapret2_worker_events": slot.snapshot()[1],
+                "capture": {"loaded": True, "nfqws2": {
+                    "state": "active", "profile": "seqovl", "queue": QUEUE,
+                }},
+            }
+            losses = card(cfg, snapshot, {"mode": "on"}, True)["counters"]
+            require(losses["queue_overflow"] == PACKETS - 1 and losses["queue_netlink_dropped"] == 0
+                    and losses["queue_dropped"] == PACKETS - 1, "overflow_panel_projection")
+        require(not worker.occupied(QUEUE), "overflow_listener_still_present")
+        slot.observe_owner(lease, False)
+        snapshot["zapret2_worker_events"] = slot.snapshot()[1]
+        require(read()["queue_counters"] is None and
+                card(cfg, snapshot, {"mode": "on"}, True)["counters"]["queue_dropped"] is None,
+                "overflow_cleared_after_close")
+        slot.release(lease)
+        print(json.dumps({"generation": lease.generation, "sent_attempts": PACKETS,
+                          "overflow_delta": PACKETS - 1, "netlink_delta": 0,
+                          "panel_projection": "ok", "after_listener_loss": None}), flush=True)
     finally:
         ending.set()
         service.join(timeout=3)

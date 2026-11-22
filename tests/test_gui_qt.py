@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -152,6 +153,36 @@ def test_login_flow_reads_the_code_from_the_admin_command(qapp, demo):
 def _window(client, tmp_path):
     flow = login.LoginFlow(client.exchange, command=lambda: "нет pkexec")
     return window.MainWindow(client, flow, tmp_path / "gui.json")
+
+
+def test_zapret2_queue_losses_are_visible_and_clear_on_stale_data(qapp):
+    from xgw.config import Config
+    from xgw.gui.zapret2 import Zapret2Page
+    from xgw.watch.zapret2_control import card
+
+    view = card(Config(), {}, {"mode": "off"}, True)
+    view.update(state="active", fresh=True, policy_matched=True)
+    view["counters"].update(queue_overflow=7, queue_netlink_dropped=0)
+    state = {"zapret2": view}
+    main = SimpleNamespace(state=state, stale=False)
+    page = Zapret2Page(main)
+    try:
+        def text():
+            return "\n".join(label.text() for label in page.status.findChildren(QtWidgets.QLabel))
+
+        page.show_state(state)
+        assert "переполнение 7" in text() and "доставка netlink 0" in text()
+        main.stale = True
+        page.show_state(state)
+        assert "Потери очереди" not in text()
+        main.stale = False
+        view["counters"] = {"queue_dropped": 0}  # старый API
+        page.show_state(state)
+        assert "Потери очереди" not in text()
+    finally:
+        page.close()
+        page.deleteLater()
+        qapp.processEvents()
 
 
 def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_path):

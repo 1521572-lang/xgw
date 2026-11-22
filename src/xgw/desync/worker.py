@@ -21,6 +21,8 @@ STOPPED = {"inactive", "failed", "unknown"}
 EVENT_LIMIT = 64
 COUNTER_MAX = (1 << 32) - 1
 QUEUE_SOURCE = "proc_nfnetlink_queue"
+QUEUE_FRESH_SECONDS = 90
+COUNTER_FIELDS = ("unit", "queue", "generation", "source", "at", "overflow", "netlink")
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,33 @@ def policy_revision(settings) -> str | None:
         return schema.fingerprint(schema.migrate(vars(settings)))
     except schema.PolicyError:
         return None
+
+
+def current_queue_counters(journal: object, now: float) -> dict | None:
+    """Project only a fresh sample belonging to the journal's verified owner."""
+    if not isinstance(journal, dict):
+        return None
+    version = journal.get("version")
+    if type(version) is not int or version != 1:
+        return None
+    value, events = journal.get("queue_counters"), journal.get("events")
+    if not isinstance(events, list) or not 1 <= len(events) <= EVENT_LIMIT:
+        return None
+    last = events[-1]
+    if (not isinstance(value, dict) or any(key not in value for key in COUNTER_FIELDS)
+            or not isinstance(last, dict) or last.get("phase") not in ("owner_verified", "queue_drops")
+            or any(value[key] != last.get(key) for key in ("unit", "queue", "generation"))):
+        return None
+    at = value["at"]
+    if (value["source"] != QUEUE_SOURCE or type(at) not in (float, int)
+            or not now - QUEUE_FRESH_SECONDS <= at <= now
+            or value["unit"] not in (ENGINE_UNIT, SELECTED_UNIT)
+            or type(value["queue"]) is not int or not 1 <= value["queue"] <= 65535
+            or type(value["generation"]) is not int or not 1 <= value["generation"] < 1 << 63
+            or not all(type(value[key]) is int and 0 <= value[key] <= COUNTER_MAX
+                       for key in ("overflow", "netlink"))):
+        return None
+    return {key: value[key] for key in COUNTER_FIELDS}
 
 
 def occupied(queue: int, path: Path = QUEUE_STATE) -> bool:

@@ -36,7 +36,6 @@ PHASES = ("reserved", "owner_verified", "owner_unverified", "queue_drops", "rele
 UNITS = (worker.ENGINE_UNIT, worker.SELECTED_UNIT)
 EVENT_FIELDS = ("seq", "at", "phase", "unit", "queue", "generation", "policy_key")
 DROP_FIELDS = ("overflow_delta", "netlink_delta")
-COUNTER_FIELDS = ("unit", "queue", "generation", "source", "at", "overflow", "netlink")
 
 
 def _integer(value: object, low: int, high: int) -> bool:
@@ -80,22 +79,6 @@ def _valid_event(event: object, seq: int) -> bool:
             and valid_revision)
 
 
-def _current_counters(value: object, now: float, last: dict | None) -> dict | None:
-    if (not isinstance(value, dict) or any(key not in value for key in COUNTER_FIELDS)
-            or last is None or last["phase"] not in ("owner_verified", "queue_drops")
-            or any(value[key] != last[key] for key in ("unit", "queue", "generation"))):
-        return None
-    at = value["at"]
-    if (value["source"] != worker.QUEUE_SOURCE or type(at) not in (float, int)
-            or not now - FRESH_SECONDS <= at <= now or value["unit"] not in UNITS
-            or not _integer(value["queue"], 1, 65535)
-            or not _integer(value["generation"], 1, MAX_SEQUENCE)
-            or not all(_integer(value[key], 0, worker.COUNTER_MAX)
-                       for key in ("overflow", "netlink"))):
-        return None
-    return {key: value[key] for key in COUNTER_FIELDS}
-
-
 def cursor_response(snapshot: object, epoch: str | None, after: int, now: float) -> dict:
     if not isinstance(snapshot, dict) or snapshot.get("daemon") is not True:
         return _response("unavailable")
@@ -114,9 +97,7 @@ def cursor_response(snapshot: object, epoch: str | None, after: int, now: float)
         return _response("unavailable")
     positions = {"epoch": current, "last_seq": last, "discarded": discarded}
     if "queue_counters" in journal:
-        positions["queue_counters"] = _current_counters(
-            journal["queue_counters"], now, events[-1] if events else None,
-        )
+        positions["queue_counters"] = worker.current_queue_counters(journal, now)
     if epoch is not None and epoch == current and after > last:
         return _response("invalid_cursor", **positions)
     if epoch != current:

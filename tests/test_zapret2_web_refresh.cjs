@@ -13,16 +13,23 @@ function page() {
   const button = {
     addEventListener: (event, callback) => listeners.set(event, callback),
   };
-  const element = {
+  const makeElement = () => ({
     addEventListener() {},
     querySelector() { return this; },
     dataset: {},
-    replaceChildren() {},
+    replaceChildren(...children) { this.children = children; },
+    append(...children) { this.children = children; },
+  });
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, makeElement());
+    return elements.get(id);
   };
   const document = {
     hidden: false,
     documentElement: {dataset: {}},
-    getElementById: id => id === "retry-overview" ? button : element,
+    getElementById: id => id === "retry-overview" ? button : element(id),
+    createElement: makeElement,
     querySelectorAll: () => [],
     addEventListener: (event, callback) => listeners.set(event, callback),
   };
@@ -52,6 +59,8 @@ function page() {
   return {
     requests,
     button,
+    element,
+    evaluate: script => vm.runInContext(script, context),
     emit: event => listeners.get(event)(),
     visibility(hidden) {
       document.hidden = hidden;
@@ -67,6 +76,36 @@ function page() {
 }
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test("queue loss fields preserve zero and clear absent or stale observations", () => {
+  const browser = page();
+  browser.evaluate(
+    "renderCounters({queue_dropped: 7, queue_overflow: 7, queue_netlink_dropped: 0})",
+  );
+  assert.equal(browser.element("queue-dropped").textContent, "7");
+  assert.equal(browser.element("queue-overflow").textContent, "7");
+  assert.equal(browser.element("queue-netlink-dropped").textContent, "0");
+  browser.evaluate("unavailable('offline')");
+  for (const name of ["queue-dropped", "queue-overflow", "queue-netlink-dropped"]) {
+    assert.equal(browser.element(name).textContent, "Нет данных");
+  }
+  browser.evaluate("renderCounters({queue_dropped: 0})"); // legacy backend
+  assert.equal(browser.element("queue-dropped").textContent, "0");
+  assert.equal(browser.element("queue-overflow").textContent, "Нет данных");
+});
+
+test("queue drop journal spells out the two deltas and their generation", () => {
+  const browser = page();
+  browser.evaluate(`renderJournal({available: true, epoch: "trial", omitted: 0, events: [{
+    phase: "queue_drops", at: 1000, unit: "xgw-nfqws2.service", generation: 12,
+    queue: 201, overflow_delta: 3, netlink_delta: 0
+  }]})`);
+  const [item] = browser.element("event-list").children;
+  const description = item.children[1].textContent;
+  assert.match(description, /поколение 12/);
+  assert.match(description, /переполнение \+3/);
+  assert.match(description, /доставка netlink \+0/);
+});
 
 test("online bypasses backoff and coalesces with an in-flight GET", async () => {
   const browser = page();
