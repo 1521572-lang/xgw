@@ -86,7 +86,7 @@ def test_watchdog_audit_counts_completions_from_tick_records(observer, monkeypat
         "last_step": {"sequence": 3, "started": 99.75, "completed_at": 100.75,
                       "parts_s": {"сигналы ядра": 0.75, "private value": 1.0},
                       "details_s": {"end_to_end": 0.5, "private": 0.2, "scan_queue": 2.0},
-                      "planned_scan_deferred": True},
+                      "planned_scan_deferred": True, "provider_attempts": 2},
         "wake": wake,
     }
     second = {
@@ -110,6 +110,7 @@ def test_watchdog_audit_counts_completions_from_tick_records(observer, monkeypat
     assert result["step_part_max_s"] == {"сигналы ядра": 0.75}
     assert result["step_details"] == {"end_to_end": {"steps": 1, "max_s": 0.5}}
     assert result["planned_scan_deferred_steps"] == 1
+    assert result["provider_attempts"] == {"steps": 1, "total": 2, "max": 2}
     assert result["wake"]["rules_check"] == {"count": 1, "max_s": 0.2}
     assert result["wake"]["by_reason"]["rules"]["last_step_overlap"] == {
         "count": 1, "max_s": 0.75,

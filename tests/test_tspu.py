@@ -330,6 +330,48 @@ def test_wan_is_down_only_when_every_check_host_is_down(hosted, monkeypatch):
     assert Daemon._check_provider(hosted) is True  # проверять нечем
 
 
+def test_provider_rechecks_last_success_then_falls_back_in_config_order(hosted, monkeypatch):
+    working = {"vk.com"}
+    attempted = []
+    monkeypatch.setattr(hosted, "_provider_address", lambda host: host)
+
+    def connect(host, port, *, mark):
+        attempted.append((host, port, mark))
+        return host in working
+
+    monkeypatch.setattr("xgw.watch.checks.tcp_check", connect)
+    assert Daemon._check_provider(hosted)
+    assert [host for host, _, _ in attempted] == ["ya.ru", "vk.com"]
+
+    attempted.clear()
+    assert Daemon._check_provider(hosted)
+    assert attempted == [("vk.com", 443, hosted.mark)]
+
+    working.clear()
+    working.add("mail.ru")
+    attempted.clear()
+    assert Daemon._check_provider(hosted)
+    assert [host for host, _, _ in attempted] == ["vk.com", "ya.ru", "mail.ru"]
+
+    hosted.cfg.watchdog.wan_checks.remove("mail.ru:443")
+    attempted.clear()
+    assert not Daemon._check_provider(hosted)
+    assert [host for host, _, _ in attempted] == ["ya.ru", "vk.com"]
+    assert hosted._provider_attempts == 8
+
+
+def test_e2e_timings_distinguish_primary_and_fallback(hosted, monkeypatch):
+    hosted.bad = hosted.cfg.probe.url
+    alternate = next(url for url in probehosts.all_urls(hosted.cfg) if url != hosted.bad)
+    monkeypatch.setattr(hosted.hosts, "next",
+                        lambda *, avoid=None, stream: alternate if avoid else hosted.bad)
+
+    assert hosted._check_e2e()
+    assert hosted.e2e_urls == [hosted.bad, alternate]
+    assert {"e2e_primary", "e2e_fallback"} <= hosted._tick_detail_spent.keys()
+    assert "e2e_reserve" not in hosted._tick_detail_spent
+
+
 # --- R4a: bootstrap-DNS ------------------------------------------------------------------
 
 

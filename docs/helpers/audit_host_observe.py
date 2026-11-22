@@ -18,6 +18,7 @@ STEP_PARTS = (
 )
 STEP_DETAILS = (
     "core_metrics", "core_api", "provider_check", "end_to_end", "leak_probe", "probe_target",
+    "provider_resolve", "provider_connect", "e2e_primary", "e2e_fallback", "e2e_reserve",
     "scan_queue", "rotation", "rebalance", "reserve_selection", "profile_checks",
 )
 
@@ -140,6 +141,7 @@ def watchdog(seconds):
     part_max = {}
     detail_max, detail_samples = {}, {}
     scan_deferrals = {}
+    provider_attempts = {}
     intervals = set()
     wakes = {}
     wake_overlaps = {}
@@ -173,6 +175,9 @@ def watchdog(seconds):
                     deferred = step.get("planned_scan_deferred")
                     if type(deferred) is bool:
                         scan_deferrals[key] = deferred
+                    attempts = step.get("provider_attempts")
+                    if type(attempts) is int and attempts >= 0:
+                        provider_attempts[key] = attempts
                     details = step_timings(step.get("details_s"), STEP_DETAILS, duration)
                     for name, value in details.items():
                         detail_max[name] = max(detail_max.get(name, 0), value)
@@ -234,6 +239,10 @@ def watchdog(seconds):
                       },
                       "planned_scan_deferred_steps": sum(scan_deferrals.values())
                       if scan_deferrals else None,
+                      "provider_attempts": {
+                          "steps": len(provider_attempts), "total": sum(provider_attempts.values()),
+                          "max": max(provider_attempts.values()),
+                      } if provider_attempts else None,
                       "wake": {"available": wake_available, "state": wake_state,
                                "observed_batches": len(wakes),
                                "by_reason": by_reason, **wake_details}}, ensure_ascii=False))

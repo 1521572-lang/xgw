@@ -908,6 +908,8 @@ class Daemon:
         self._busy = False
         self._scanned = False  # на этом шаге шёл скан: замер скорости подождёт
         self._provider_ips: dict[str, tuple[float, str]] = {}  # хост wan_check → (clock, адрес)
+        self._provider_preferred = ""
+        self._provider_attempts = 0
         self._budget_warnings: tuple[str, ...] = ()
         # Запросы из панели: другой поток только ставит отметку, выполняет её шаг watchdog.
         self.poke = threading.Event()
@@ -987,6 +989,7 @@ class Daemon:
                 "completed_at": completed_at, "parts_s": self._tick_spent.copy(),
                 "details_s": self._tick_detail_spent.copy(),
                 "planned_scan_deferred": self._planned_scan_deferred,
+                "provider_attempts": self._provider_attempts,
             }
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
@@ -1494,6 +1497,7 @@ class Daemon:
         self._tick_spent = {}
         self._tick_detail_spent = {}
         self._planned_scan_deferred = False
+        self._provider_attempts = 0
         if self._desync_reload_pending and not self._drain_desync_reload():
             # Старые правила остаются до освобождения слота. Не загружаем другое
             # назначение очереди, пока её предыдущий обработчик ещё может работать.
@@ -1508,6 +1512,7 @@ class Daemon:
         net_event, self._net_event = self._net_event, False
         if resumed or net_event:
             self._net_tick_at = time.monotonic()
+            self._provider_preferred = ""
         if resumed:
             self._after_sleep(now)
         elif net_event:
@@ -2047,16 +2052,21 @@ class Daemon:
         вопрос один — идёт ли через него трафик. Работает ли сам probe.url, тогда решает
         _probe_target по пробам участников."""
         if self.reserve_mode:
-            result = self._e2e_get(scan.cheap_url(self.cfg))
+            with self._measure_detail("e2e_reserve"):
+                result = self._e2e_get(scan.cheap_url(self.cfg))
             if not result.ok:
                 self._e2e_bytes = result.downloaded
                 self.log.info("сквозная проверка не прошла: %s", result.error)
             return result.ok
         url = self.hosts.next(stream="e2e")
-        result = self._e2e_get(url)
+        with self._measure_detail("e2e_primary"):
+            result = self._e2e_get(url)
         if not result.ok:
             other = self.hosts.next(avoid=url, stream="e2e")
-            second = self._e2e_get(other) if other != url else None
+            second = None
+            if other != url:
+                with self._measure_detail("e2e_fallback"):
+                    second = self._e2e_get(other)
             if second is None or not second.ok:
                 downloaded = result.downloaded + (second.downloaded if second else 0)
                 self._e2e_bytes = downloaded  # их не считать трафиком LAN (_late_under_load)
@@ -2092,19 +2102,28 @@ class Daemon:
             self.notifier.event("probe", text)
 
     def _check_provider(self) -> bool:
-        """TCP-подключение напрямую, сокетом с меткой mark_bypass, к wan_check, а не ответил
-        он — к адресам watchdog.wan_checks по очереди (0.1.18, ТЗ R3): «нет провайдера» —
-        только когда не отвечает ни один."""
+        """Прямая TCP-проба с mark_bypass. Последний ответивший адрес проверяем первым;
+        при отказе проверяем остальные в порядке конфигурации."""
         targets = [
             entry for entry in (self.cfg.watchdog.wan_check, *self.cfg.watchdog.wan_checks)
             if entry.rpartition(":")[0] and entry.rpartition(":")[2].isdigit()
         ]
         if not targets:
             return True  # проверять нечем — провайдера считаем доступным
+        if self._provider_preferred in targets:
+            targets.remove(self._provider_preferred)
+            targets.insert(0, self._provider_preferred)
         for entry in targets:
+            self._provider_attempts += 1
             host, _, port_text = entry.rpartition(":")
-            address = self._provider_address(host)
-            if address is not None and checks.tcp_check(address, int(port_text), mark=self.mark):
+            with self._measure_detail("provider_resolve"):
+                address = self._provider_address(host)
+            if address is None:
+                continue
+            with self._measure_detail("provider_connect"):
+                answered = checks.tcp_check(address, int(port_text), mark=self.mark)
+            if answered:
+                self._provider_preferred = entry
                 return True
         return False
 
