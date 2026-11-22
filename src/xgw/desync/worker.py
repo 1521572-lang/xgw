@@ -19,6 +19,8 @@ ENGINE_UNIT = "xgw-nfqws2.service"
 SELECTED_UNIT = "xgw-zapret2.service"
 STOPPED = {"inactive", "failed", "unknown"}
 EVENT_LIMIT = 64
+COUNTER_MAX = (1 << 32) - 1
+QUEUE_SOURCE = "proc_nfnetlink_queue"
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,12 @@ class Lease:
     generation: int
     unit: str
     queue: int
+
+
+@dataclass(frozen=True)
+class QueueOwner:
+    socket: str
+    counters: tuple[int, int, int] | None  # queue drops, netlink drops, packet sequence
 
 
 class WorkerSlot:
@@ -37,6 +45,8 @@ class WorkerSlot:
         self._seq = 0
         self._verified = False
         self._policy_key: str | None = None
+        self._queue_sample: QueueOwner | None = None
+        self._queue_at = 0.0
         self._events: deque[dict] = deque(maxlen=EVENT_LIMIT)
 
     def reserve(self, unit: str, queue: int, *, policy_key: str | None = None) -> Lease:
@@ -50,13 +60,26 @@ class WorkerSlot:
             self._event("reserved", self.lease)
             return self.lease
 
-    def observe_owner(self, lease: Lease, verified: bool) -> bool:
+    def observe_owner(self, lease: Lease, verified: bool, owner: QueueOwner | None = None) -> bool:
         with self._lock:
             if self.lease is not lease:
                 return False
             if self._verified != verified:
                 self._verified = verified
                 self._event("owner_verified" if verified else "owner_unverified", lease)
+            previous = self._queue_sample
+            self._queue_sample = None
+            if not verified or owner is None or owner.counters is None:
+                return verified
+            self._queue_sample = owner
+            self._queue_at = time.time()
+            if (previous is not None and previous.socket == owner.socket
+                    and previous.counters is not None
+                    and all(a <= b for a, b in zip(previous.counters, owner.counters, strict=True))):
+                overflow = owner.counters[0] - previous.counters[0]
+                netlink = owner.counters[1] - previous.counters[1]
+                if overflow or netlink:
+                    self._event("queue_drops", lease, overflow_delta=overflow, netlink_delta=netlink)
             return verified
 
     def release(self, lease: Lease | None) -> None:
@@ -64,18 +87,27 @@ class WorkerSlot:
             if lease is not None and self.lease is lease:
                 self._event("released", lease)
                 self.lease = None
+                self._queue_sample = None
 
-    def _event(self, phase: str, lease: Lease) -> None:
+    def _event(self, phase: str, lease: Lease, **details: int) -> None:
         self._seq += 1
         self._events.append({"seq": self._seq, "at": time.time(), "phase": phase,
-                             "policy_key": self._policy_key, **asdict(lease)})
+                             "policy_key": self._policy_key, **asdict(lease), **details})
 
     def snapshot(self) -> tuple[Lease | None, dict]:
         with self._lock:
+            counters = None
+            if self.lease is not None and self._queue_sample is not None:
+                overflow, netlink, _ = self._queue_sample.counters
+                counters = {
+                    **asdict(self.lease), "source": QUEUE_SOURCE, "at": self._queue_at,
+                    "overflow": overflow, "netlink": netlink,
+                }
             return self.lease, {
                 "version": 1, "epoch": self._epoch, "last_seq": self._seq,
                 "discarded": self._seq - len(self._events),
                 "events": [dict(event) for event in self._events],
+                "queue_counters": counters,
             }
 
 
@@ -101,7 +133,18 @@ def require_stopped(runner: cmd.Runner, unit: str) -> None:
         raise ValueError("worker_unit_busy")
 
 
-def verify_owner(runner: cmd.Runner, unit: str, queue: int) -> bool:
+def _queue_counters(row: list[str]) -> tuple[int, int, int] | None:
+    # Linux nfqnl_seq_show: queue_dropped, queue_user_dropped, id_sequence.
+    # Leave unfamiliar or truncated rows usable for owner verification only.
+    if len(row) == 9 and row[-1] == "1":
+        overflow, netlink, sequence = row[5:8]
+        if all(len(v) <= 10 and v.isascii() and v.isdecimal() and int(v) <= COUNTER_MAX
+               for v in (overflow, netlink, sequence)):
+            return int(overflow), int(netlink), int(sequence)
+    return None
+
+
+def owner_sample(runner: cmd.Runner, unit: str, queue: int) -> QueueOwner | None:
     """Match the queue's netlink port ID to a socket held by this unit's MainPID.
 
     NETLINK_NETFILTER port IDs identify sockets and are not necessarily PIDs.
@@ -110,23 +153,30 @@ def verify_owner(runner: cmd.Runner, unit: str, queue: int) -> bool:
     pid = runner(["systemctl", "show", unit, "-p", "MainPID", "--value"],
                  check=False, timeout=1).strip()
     if not pid.isascii() or not pid.isdecimal() or int(pid) <= 0:
-        return False
+        return None
     try:
-        peers = {row[1] for row in map(str.split, QUEUE_STATE.read_text().splitlines())
-                 if len(row) >= 2 and row[0] == str(queue)}
-        if len(peers) != 1:
-            return False
+        queues = [row for row in map(str.split, QUEUE_STATE.read_text().splitlines())
+                  if len(row) >= 2 and row[0] == str(queue)]
+        if len(queues) != 1:
+            return None
+        queue_row, = queues
+        peer = queue_row[1]
         sockets = {f"socket:[{row[9]}]"
                    for row in map(str.split, NETLINK_STATE.read_text().splitlines())
-                   if len(row) >= 10 and row[1] == "12" and row[2] in peers and row[9] != "0"}
+                   if len(row) >= 10 and row[1] == "12" and row[2] == peer and row[9] != "0"}
         if not sockets:
-            return False
+            return None
         for fd in (PROC / pid / "fd").iterdir():
             try:
-                if str(fd.readlink()) in sockets:
-                    return True
+                link = str(fd.readlink())
+                if link in sockets:
+                    return QueueOwner(link, _queue_counters(queue_row))
             except FileNotFoundError:
                 continue  # The worker closed an unrelated fd while listing.
     except OSError:
-        return False
-    return False
+        return None
+    return None
+
+
+def verify_owner(runner: cmd.Runner, unit: str, queue: int) -> bool:
+    return owner_sample(runner, unit, queue) is not None

@@ -14,7 +14,7 @@ from xgw.net.cmd import CommandError
 def test_systemd_main_pid_and_netlink_port_id_are_distinct(tmp_path, monkeypatch):
     queue = tmp_path / "queues"
     netlink = tmp_path / "netlink"
-    queue.write_text(" 200 45123 0 2 65535 0 0 1 1\n")
+    queue.write_text(" 200 45123 0 2 65535 3 6 42 1\n")
     netlink.write_text(
         "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n"
         "0 12 45123 00000000 0 0 0 2 0 901\n"
@@ -41,6 +41,11 @@ def test_systemd_main_pid_and_netlink_port_id_are_distinct(tmp_path, monkeypatch
     assert not worker.verify_owner(run, nfqws2.UNIT, 200)
     fd.readlink.return_value = Path("socket:[901]")
     assert worker.verify_owner(run, nfqws2.UNIT, 200)
+    assert worker.owner_sample(run, nfqws2.UNIT, 200) == worker.QueueOwner("socket:[901]", (3, 6, 42))
+    queue.write_text("200 45123 0 2 65535 4294967296 6 42 1\n")
+    assert worker.owner_sample(run, nfqws2.UNIT, 200) == worker.QueueOwner("socket:[901]", None)
+    queue.write_text("200 45123\n")
+    assert worker.owner_sample(run, nfqws2.UNIT, 200) == worker.QueueOwner("socket:[901]", None)
     assert not worker.verify_owner(run, nfqws2.UNIT, 201)
     fd.readlink.side_effect = PermissionError
     assert not worker.verify_owner(run, nfqws2.UNIT, 200)
@@ -120,8 +125,9 @@ def test_clients_record_only_owner_transitions_for_their_lease(monkeypatch, modu
     lease = slot.reserve(module.UNIT, 201, policy_key=key)
     runtime.lease = lease
     monkeypatch.setattr(runtime, "occupied", lambda queue: True)
-    verify = Mock(side_effect=[False, True, True, False])
-    monkeypatch.setattr(worker, "verify_owner", verify)
+    owner = worker.QueueOwner("socket:[901]", None)
+    verify = Mock(side_effect=[None, owner, owner, None])
+    monkeypatch.setattr(worker, "owner_sample", verify)
 
     assert [runtime.alive(201) for _ in range(4)] == [False, True, True, False]
     slot.release(lease)
@@ -134,6 +140,39 @@ def test_clients_record_only_owner_transitions_for_their_lease(monkeypatch, modu
         "reserved", "owner_verified", "owner_unverified", "released", "reserved"]
     assert {event["policy_key"] for event in history["events"][:-1]} == {key}
     assert [event["generation"] for event in history["events"]] == [1, 1, 1, 1, 2]
+
+
+def test_queue_counters_record_only_deltas_with_continuous_owner():
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(worker.ENGINE_UNIT, 201)
+
+    def sample(inode, overflow, netlink, sequence):
+        return slot.observe_owner(lease, True, worker.QueueOwner(inode, (overflow, netlink, sequence)))
+
+    assert sample("first", 8, 12, 50)  # first observation is a baseline
+    assert sample("first", 8, 12, 54)  # incoming packets, no drops
+    assert sample("first", 10, 15, 60)
+    assert sample("next", 35, 45, 100)  # socket changed
+    assert sample("next", 36, 45, 3)  # sequence reset at the same socket
+    assert sample("next", 36, 49, 6)
+    assert sample("next", 0, 0, 8)  # overflow or reset; no fabricated counter wrap
+    assert not slot.observe_owner(lease, False)
+    assert slot.snapshot()[1]["queue_counters"] is None
+    assert sample("next", 10, 10, 1000)  # fresh baseline after loss
+    view = slot.snapshot()[1]
+    assert view["queue_counters"]["generation"] == lease.generation
+    assert view["queue_counters"]["overflow"] == view["queue_counters"]["netlink"] == 10
+    events = view["events"]
+    assert [event["phase"] for event in events] == [
+        "reserved", "owner_verified", "queue_drops", "queue_drops",
+        "owner_unverified", "owner_verified",
+    ]
+    assert [(e["overflow_delta"], e["netlink_delta"]) for e in events if e["phase"] == "queue_drops"
+            ] == [(2, 3), (0, 4)]
+    slot.release(lease)
+    newer = slot.reserve(worker.SELECTED_UNIT, 201)
+    assert not sample("next", 20, 20, 2000)
+    assert slot.snapshot()[1]["queue_counters"] is None and slot.lease is newer
 
 
 def test_worker_history_is_capped_and_restart_gets_a_new_epoch():

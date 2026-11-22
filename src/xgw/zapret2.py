@@ -476,8 +476,8 @@ class Runtime:
         if lease is None or self.slot.lease is not lease or lease.queue != queue:
             return False
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        return self.slot.observe_owner(
-            lease, state == "active" and worker.verify_owner(self.runner, UNIT, queue))
+        owner = worker.owner_sample(self.runner, UNIT, queue) if state == "active" else None
+        return self.slot.observe_owner(lease, owner is not None, owner)
 
     @staticmethod
     def occupied(queue: int) -> bool:

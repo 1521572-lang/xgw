@@ -120,7 +120,8 @@ class EngineTests(unittest.TestCase):
         patches.enter_context(mock.patch("xgw.nfqws2.find_installation",
                                          return_value=self.installation))
         patches.enter_context(mock.patch.object(runtime, "occupied", host.occupied))
-        patches.enter_context(mock.patch("xgw.desync.worker.verify_owner", return_value=True))
+        patches.enter_context(mock.patch("xgw.desync.worker.owner_sample",
+                                         return_value=nfqws2.worker.QueueOwner("test-socket", None)))
         patches.enter_context(mock.patch("xgw.nfqws2.preflight.check", side_effect=lambda a, _: a))
         patches.enter_context(mock.patch.object(nfqws2, "time", SimpleNamespace(
             monotonic=lambda: host.now, sleep=host.sleep,
@@ -620,8 +621,9 @@ unrelated-empty-field:
               mock.patch.object(runtime, "occupied", return_value=False),
               mock.patch("xgw.nfqws2.preflight.check", side_effect=ValueError("unsafe_files"))):
             controller.step(cfg, [], active=True)
+            self.assertEqual(controller.view["reason"], "unsafe_files")
             controller.close()
-        self.assertEqual(controller.view["reason"], "unsafe_files")
+        self.assertEqual(controller.view, {"state": "off", "reason": "off"})
         runner.assert_called_once_with(
             ["systemctl", "is-active", nfqws2.UNIT], check=False, timeout=5,
         )

@@ -314,9 +314,9 @@ class Runtime:
     def _owns_queue(self, lease: worker.Lease | None, queue: int, *, active: bool = True) -> bool:
         if lease is None or self.slot.lease is not lease or lease.queue != queue:
             return False
-        verified = (active and self.occupied(queue)
-                    and worker.verify_owner(self.runner, UNIT, queue))
-        return self.slot.observe_owner(lease, verified)
+        owner = (worker.owner_sample(self.runner, UNIT, queue)
+                 if active and self.occupied(queue) else None)
+        return self.slot.observe_owner(lease, owner is not None, owner)
 
     def wait_ready(self, queue: int, cancel: threading.Event | None = None) -> bool:
         """Type=exec подтверждает execve, очередь nfqws2 привязывает позже."""

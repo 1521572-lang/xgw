@@ -32,9 +32,11 @@ MAX_SEQUENCE = (1 << 63) - 1
 FRESH_SECONDS = 90
 EPOCH = re.compile(r"[0-9a-f]{32}")
 POLICY_KEY = re.compile(r"[0-9a-f]{64}")
-PHASES = ("reserved", "owner_verified", "owner_unverified", "released")
+PHASES = ("reserved", "owner_verified", "owner_unverified", "queue_drops", "released")
 UNITS = (worker.ENGINE_UNIT, worker.SELECTED_UNIT)
 EVENT_FIELDS = ("seq", "at", "phase", "unit", "queue", "generation", "policy_key")
+DROP_FIELDS = ("overflow_delta", "netlink_delta")
+COUNTER_FIELDS = ("unit", "queue", "generation", "source", "at", "overflow", "netlink")
 
 
 def _integer(value: object, low: int, high: int) -> bool:
@@ -65,6 +67,10 @@ def _valid_event(event: object, seq: int) -> bool:
     if not isinstance(event, dict) or any(key not in event for key in EVENT_FIELDS):
         return False
     revision = event["policy_key"]
+    if event["phase"] == "queue_drops":
+        deltas = [event.get(key) for key in DROP_FIELDS]
+        if not all(_integer(v, 0, worker.COUNTER_MAX) for v in deltas) or not any(deltas):
+            return False
     valid_revision = revision is None or (
         isinstance(revision, str) and POLICY_KEY.fullmatch(revision) is not None)
     return (_integer(event["seq"], seq, seq) and type(event["at"]) in (float, int)
@@ -72,6 +78,22 @@ def _valid_event(event: object, seq: int) -> bool:
             and event["unit"] in UNITS and _integer(event["queue"], 1, 65535)
             and _integer(event["generation"], 1, MAX_SEQUENCE)
             and valid_revision)
+
+
+def _current_counters(value: object, now: float, last: dict | None) -> dict | None:
+    if (not isinstance(value, dict) or any(key not in value for key in COUNTER_FIELDS)
+            or last is None or last["phase"] not in ("owner_verified", "queue_drops")
+            or any(value[key] != last[key] for key in ("unit", "queue", "generation"))):
+        return None
+    at = value["at"]
+    if (value["source"] != worker.QUEUE_SOURCE or type(at) not in (float, int)
+            or not now - FRESH_SECONDS <= at <= now or value["unit"] not in UNITS
+            or not _integer(value["queue"], 1, 65535)
+            or not _integer(value["generation"], 1, MAX_SEQUENCE)
+            or not all(_integer(value[key], 0, worker.COUNTER_MAX)
+                       for key in ("overflow", "netlink"))):
+        return None
+    return {key: value[key] for key in COUNTER_FIELDS}
 
 
 def cursor_response(snapshot: object, epoch: str | None, after: int, now: float) -> dict:
@@ -91,14 +113,20 @@ def cursor_response(snapshot: object, epoch: str | None, after: int, now: float)
             or any(not _valid_event(e, i) for i, e in enumerate(events, discarded + 1))):
         return _response("unavailable")
     positions = {"epoch": current, "last_seq": last, "discarded": discarded}
+    if "queue_counters" in journal:
+        positions["queue_counters"] = _current_counters(
+            journal["queue_counters"], now, events[-1] if events else None,
+        )
     if epoch is not None and epoch == current and after > last:
         return _response("invalid_cursor", **positions)
     if epoch != current:
         state, after = ("snapshot" if epoch is None else "reset"), 0
     else:
         state = "gap" if after < discarded else "ok"
-    return _response(state, **positions, events=[{key: e[key] for key in EVENT_FIELDS}
-                                                for e in events if e["seq"] > after])
+    return _response(state, **positions, events=[
+        {key: e[key] for key in EVENT_FIELDS + (DROP_FIELDS if e["phase"] == "queue_drops" else ())}
+        for e in events if e["seq"] > after
+    ])
 
 
 def read_status(path: Path) -> object:
