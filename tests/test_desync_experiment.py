@@ -78,6 +78,71 @@ def test_sustained_requires_time_bytes_protocol_media_and_progress():
                         "h2") == "LATE_STALL_OBSERVED"
 
 
+def early_record(samples, **changes):
+    return dict(schema=1, status=206.0, curl_exit=28, media_type_ok=True,
+                samples=samples) | changes
+
+
+def test_early_pauses_distinguish_recovery_and_end_without_progress():
+    record = early_record([
+        [0.0, 0], [1.0, 16 * 1024], [4.2, 16 * 1024],
+        [6.1, 20 * 1024], [11.3, 20 * 1024],
+    ])
+    result = exp.analyze_early_pauses(record)
+    assert result == {
+        "state": "OBSERVED", "thresholds_s": [3, 5], "output_buffering": "unknown",
+        "pauses": [
+            {"bytes": 16384, "start_s": 1.0, "observed_s": 3.2, "thresholds_s": [3],
+             "outcome": "resumed"},
+            {"bytes": 20480, "start_s": 6.1, "observed_s": 5.2, "thresholds_s": [3, 5],
+             "outcome": "flat_at_end"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(("buffering", "code", "outcome"), [
+    (None, 28, "growth_at_exit"), (None, 0, "growth_at_exit"),
+    ("disabled", 0, "resumed"),
+])
+def test_early_pause_does_not_infer_recovery_from_buffer_flush(buffering, code, outcome):
+    samples = [[0, 0], [1, 16384], [6, 16384], [6.1, 20480]]
+    result = exp.analyze_early_pauses(early_record(
+        samples, output_buffering=buffering, curl_exit=code,
+    ))
+    assert result["state"] == "OBSERVED"
+    assert result["pauses"][0]["outcome"] == outcome
+
+
+@pytest.mark.parametrize(("body", "expected"), [(12287, []), (12288, [3, 5]),
+                                               (24576, [3, 5]), (24577, [])])
+def test_early_pause_uses_inclusive_body_limits(body, expected):
+    result = exp.analyze_early_pauses(early_record([[0, 0], [1, body], [6, body]]))
+    assert [limit for pause in result["pauses"] for limit in pause["thresholds_s"]] == expected
+
+
+def test_short_complete_body_and_http_errors_have_no_terminal_pause():
+    samples = [[0, 0], [0.5, 16384], [9, 16384]]
+    for status, media, exitcode, expectation in (
+        (200, True, 0, "NO_PAUSE"), (204, True, 0, "NOT_APPLICABLE"),
+        (403, True, 28, "NOT_APPLICABLE"), (200, False, 0, "NOT_APPLICABLE"),
+    ):
+        result = exp.analyze_early_pauses(early_record(samples, status=status,
+                                                     media_type_ok=media, curl_exit=exitcode))
+        assert result["state"] == expectation
+        assert result["pauses"] == []
+
+
+@pytest.mark.parametrize("samples", [
+    [[0, 0], [1, 16384], [6, 16384], [5, 16384]],
+    [[0, 0], [1, 16384], [6, 16383]],
+    [[0, 0], [float("nan"), 16384]], [[0, 0], [1, True]], [[0, 0], [1]],
+])
+def test_early_pause_rejects_invalid_sample_history(samples):
+    result = exp.analyze_early_pauses(early_record(samples))
+    assert result["state"] == "INVALID_MEASUREMENT"
+    assert result["pauses"] == []
+
+
 def record(candidate="a", family="split", stamp=99, round_id="r1", **extra):
     return dict(schema=1, context_id="a" * 64, created=stamp, candidate=candidate,
                 family=family, route="direct", round=round_id, verdict="PASS_SUSTAINED", **extra)

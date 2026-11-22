@@ -26,6 +26,8 @@ DURATION = 45
 MIN_BYTES = 1024 * 1024
 MAX_BYTES = 8 * 1024 * 1024
 STALL_SECONDS = 10
+EARLY_PAUSE_BYTES = (12 * 1024, 24 * 1024)
+EARLY_PAUSE_THRESHOLDS = (3, 5)
 TTL = 24 * 3600
 LABEL = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
@@ -160,12 +162,103 @@ def classify(meta: dict, returncode: int, samples: list[tuple[float, int]],
         return "INVALID_MEASUREMENT"
 
 
+def analyze_early_pauses(record: dict) -> dict:
+    """Report plateaus in saved cumulative body samples without changing the verdict."""
+    buffering = "disabled" if record.get("output_buffering") == "disabled" else "unknown"
+    result = {"state": "INVALID_MEASUREMENT", "thresholds_s": list(EARLY_PAUSE_THRESHOLDS),
+              "output_buffering": buffering, "pauses": []}
+    if (type(record.get("schema")) is not int or record["schema"] != VERSION
+            or type(record.get("curl_exit")) is not int):
+        return result
+    status = record.get("status")
+    media = record.get("media_type_ok")
+    if (type(status) not in (int, float) or not 0 <= status <= 599
+            or status != int(status) or type(media) is not bool):
+        return result
+    if status not in (200, 206) or not media:
+        return result | {"state": "NOT_APPLICABLE"}
+    samples = record.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return result
+
+    pauses = []
+    received = 0
+    progress_at = last_at = 0.0
+
+    def observe(outcome: str) -> None:
+        # The next sample with more bytes can only bound the end. Duration is
+        # measured through the last sample that still has the same byte count.
+        duration = round(last_at - progress_at, 3)
+        if EARLY_PAUSE_BYTES[0] <= received <= EARLY_PAUSE_BYTES[1]:
+            crossed = [limit for limit in EARLY_PAUSE_THRESHOLDS if duration >= limit]
+            if crossed:
+                pauses.append({"bytes": received, "start_s": progress_at,
+                               "observed_s": duration, "thresholds_s": crossed,
+                               "outcome": outcome})
+
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, (list, tuple)) or len(sample) != 2:
+            return result
+        timestamp, count = sample
+        try:
+            valid_time = type(timestamp) in (int, float) and math.isfinite(timestamp)
+        except OverflowError:
+            return result
+        if not valid_time or timestamp < last_at or type(count) is not int or count < received:
+            return result
+        if count > received:
+            uncertain_end = index == len(samples) - 1 and (
+                record["curl_exit"] != 0 or buffering == "unknown"
+            )
+            observe("growth_at_exit" if uncertain_end else "resumed")
+            progress_at, received = timestamp, count
+        last_at = timestamp
+    if record["curl_exit"] != 0:
+        observe("flat_at_end")
+    return result | {"state": "OBSERVED" if pauses else "NO_PAUSE", "pauses": pauses}
+
+
 def private_path(path: Path, *, directory: bool = False) -> None:
     info = path.lstat()
     expected = stat.S_ISDIR if directory else stat.S_ISREG
     if (not expected(info.st_mode) or info.st_uid != os.geteuid()
             or stat.S_IMODE(info.st_mode) & 0o077):
         raise ValueError("private_path_required")
+
+
+def sample_curl(curl: Path, body: Path, config: str) -> tuple[int, list[tuple[float, int]], dict, bool]:
+    """Run a bounded curl transfer and sample its unbuffered output until exit."""
+    env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+    with tempfile.TemporaryFile() as metadata:
+        proc = subprocess.Popen([str(curl), "--disable", "--no-buffer", "--config", "-"],
+                                stdin=subprocess.PIPE, stdout=metadata,
+                                stderr=subprocess.DEVNULL, env=env)
+        start = time.monotonic()
+        samples = [(0.0, 0)]
+        budget_stop = False
+        try:
+            proc.stdin.write(config.encode())
+            proc.stdin.close()
+            while proc.poll() is None:
+                elapsed, size = time.monotonic() - start, body.stat().st_size
+                samples.append((round(elapsed, 3), size))
+                if elapsed > DURATION + 5 or size > MAX_BYTES:
+                    budget_stop = True
+                    proc.kill()
+                    break
+                time.sleep(0.25)
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        samples.append((round(time.monotonic() - start, 3), body.stat().st_size))
+        metadata.seek(0)
+        try:
+            meta = json.loads(metadata.read(16384))
+        except (ValueError, UnicodeDecodeError):
+            meta = {}
+    return proc.returncode, samples, meta if isinstance(meta, dict) else {}, budget_stop
 
 
 def run_probe(spec: dict, curl: Path, output: Path) -> dict:
@@ -185,49 +278,17 @@ def run_probe(spec: dict, curl: Path, output: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix=".probe-", dir=output) as temp:
         body = Path(temp) / "body"
         body.touch(mode=0o600)
-        env = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
-        # curlrc is disabled as the FIRST option. URL is sent via stdin, not argv.
-        with tempfile.TemporaryFile() as metadata:
-            proc = subprocess.Popen([str(curl), "--disable", "--config", "-"],
-                                    stdin=subprocess.PIPE, stdout=metadata,
-                                    stderr=subprocess.DEVNULL, env=env)
-            start = time.monotonic()
-            samples = [(0.0, 0)]
-            budget_stop = False
-            try:
-                proc.stdin.write(curl_config(spec, body).encode())
-                proc.stdin.close()
-                while proc.poll() is None:
-                    elapsed, size = time.monotonic() - start, body.stat().st_size
-                    samples.append((round(elapsed, 3), size))
-                    if elapsed > DURATION + 5 or size > MAX_BYTES:
-                        budget_stop = True
-                        proc.kill()
-                        break
-                    time.sleep(0.25)
-                proc.wait(timeout=5)
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            samples.append((round(time.monotonic() - start, 3), body.stat().st_size))
-            metadata.seek(0)
-            try:
-                meta = json.loads(metadata.read(16384))
-                if not isinstance(meta, dict):
-                    meta = {}
-            except (ValueError, UnicodeDecodeError):
-                meta = {}
-    verdict = classify(meta, proc.returncode, samples, spec["protocol"])
+        returncode, samples, meta, budget_stop = sample_curl(curl, body, curl_config(spec, body))
+    verdict = classify(meta, returncode, samples, spec["protocol"])
     if budget_stop:
         verdict = "BUDGET_STOP"
-    elif proc.returncode == 2 and not meta:
+    elif returncode == 2 and not meta:
         verdict = "CLIENT_OPTIONS_UNSUPPORTED"
     elif meta.get("remote_ip") and ipaddress.ip_address(meta["remote_ip"]) != ipaddress.ip_address(
             spec["address"]):
         verdict = "ENDPOINT_MISMATCH"
     # Do not copy server-controlled strings into a public result.
-    result.update(verdict=verdict, curl_exit=proc.returncode, samples=samples,
+    result.update(verdict=verdict, curl_exit=returncode, samples=samples, output_buffering="disabled",
                   bytes=samples[-1][1], seconds=samples[-1][0],
                   media_type_ok=str(meta.get("content_type", "")).lower()
                   .startswith(("video/", "audio/")))
@@ -284,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--spec", required=True, type=Path, help="private JSON input")
     probe.add_argument("--curl", type=Path, default=Path("/usr/bin/curl"))
     probe.add_argument("--out", required=True, type=Path, help="existing private directory")
+    analyze = sub.add_parser("analyze-pauses", help="inspect saved early body progress")
+    analyze.add_argument("--record", required=True, type=Path, help="private probe result JSON")
     emit = sub.add_parser("shortlist", help="emit up to 3 families; never applies policy")
     emit.add_argument("--results", required=True, type=Path)
     emit.add_argument("--context", required=True)
@@ -291,6 +354,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if os.name != "posix":
             raise ValueError("real_linux_required")
+        if args.command == "analyze-pauses":
+            private_path(args.record)
+            if args.record.stat().st_size > 65536:
+                raise ValueError("record_size")
+            record = json.loads(args.record.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("record_schema")
+            result = analyze_early_pauses(record)
+            print(json.dumps(result))
+            return 2 if result["state"] == "INVALID_MEASUREMENT" else 0
         if args.command == "probe":
             private_path(args.spec)
             if args.spec.stat().st_size > 32768:
