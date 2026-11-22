@@ -1,14 +1,20 @@
-# ThinkCentre — установка меток реакции watchdog
+# ThinkCentre — установка диагностики длительных шагов watchdog, r2
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет сценарии и автоматически
 публикует один обезличенный отчёт. При недоступности терминала,
 sudo или GitHub запроси доступ. Команды и проверки подготовлены Codex.
 
-В первом проходе прошли 16 контрактов. FIB совпал во всех четырёх
-снимках, получили 12 ответов HTTPS 200 из 12, максимальные шаги
-в двух окнах составили 5,59 и 6,39 с. Установленный демон использовал
-старый формат прогресса. На машине работают принятые шлюзом Xray
-26.11.9 и sing-box 1.14.4. [Отчёт базовой линии](../reports/2026-11-22T125715Z_watchdog-fib-baseline.md)
+Установка первого формата прошла 15/15. В каждом окне наблюдался
+один совместный набор `net` и `rules`. Начало разбора было общим.
+Время до него составило 10,27–10,54 с для `net` и 5,80–6,21 с
+для `rules`. Разность соответствует более раннему поступлению `net`
+в этих двух наборах. FIB и настройки совпали, HTTPS дал 11/12.
+[Отчёт установки](../reports/2026-11-22T132531Z_watchdog-wake-install.md)
+
+Чтение раз в секунду может пропустить короткую фазу `sleep`. R2 хранит
+последний завершённый шаг в обеих фазах и учитывает пробелы номеров
+между прочитанными записями. Начало разбора события и время отдельной
+проверки правил измеряются независимо.
 
 ## 1. Установка
 
@@ -22,30 +28,30 @@ sudo или GitHub запроси доступ. Команды и проверк
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=bb7508e1901f23dc078da8881d808dc6c7e0d8c5
+CODE=0b4684129fd1b29da6f98b982fc940594b2d1b7f
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin "$BR"
 git merge-base --is-ancestor "$CODE" FETCH_HEAD
 git show "$CODE:docs/helpers/run_pin_audit_install.sh" |
-  bash -s -- "$CODE" --watchdog-wake
+  bash -s -- "$CODE" --watchdog-timing
 BASH
 ~~~
 
-Сценарий применяет принятый diff `c69ff9a` к частной копии
-установленного `daemon.py`. Прогон покрывает метки, окно измерения,
-watchdog, ip rule и TUN. Контракты обновления ядер уже прошли в
-закреплённом дереве предыдущего ТЗ. Установка касается одного файла,
-поэтому версии ядер и конфигурация остаются прежними.
+Сценарий накладывает диагностику из `6de2c66658f9889a42e906859e480ed05714d84d`
+поверх меток `c69ff9a` в копии установленного `daemon.py`.
+Прогон покрывает новый формат, перекрытие ожидания с последним
+шагом, проверку правил, прежние контракты watchdog, ip rule и TUN.
+Установка касается одного файла.
 
 | Маркер | Действие и критерий |
 |---|---|
-| WATCHDOG_WAKE_BASELINE_MISMATCH | Контекст в установленном файле расходится. Укажи имя файла и классификацию сбоя, исходный diff оставь на машине. |
-| WATCHDOG_WAKE_CONTRACTS_OK | 15 тестов прошли на копии установленного пакета. При сбое установка останавливается. |
-| WATCHDOG_WAKE_HTTPS baseline 200 | После сверки исходных байтов и свежего статуса начальный HTTPS-контроль через Xray вернул 200. Ручного закрепления нет. |
-| WATCHDOG_WAKE_ROLLBACK_ARMED | Независимый таймер на 15 минут активен перед заменой. Установщик повторно сверил байты и состояние воркеров. |
-| WATCHDOG_WAKE_PROGRESS_OK | Штатный закрытый файл `watchdog-step.json` обновился и содержит поколение и поле `wake`. Начальное `null` допустимо. |
-| WATCHDOG_WAKE_DEPLOYED_AND_VERIFIED | Файл сверили, XGW опубликовал свежий статус после перезапуска, PID Xray и SHA настроек совпали. HTTPS при установке и подтверждении вернул 200. Таймер снят. Оставь слой установленным. |
-| WATCHDOG_WAKE_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED | Установленные байты совпали с правкой по контексту. Живой процесс подтвердил формат. Повторного перезапуска не было. |
+| WATCHDOG_TIMING_BASELINE_MISMATCH | Контекст в установленном файле расходится. Укажи имя файла и классификацию сбоя, исходный diff оставь на машине. |
+| WATCHDOG_TIMING_CONTRACTS_OK | Все 17 тестов прошли на копии установленного пакета. При сбое установка останавливается. |
+| WATCHDOG_TIMING_HTTPS baseline 200 | После сверки исходных байтов и свежего статуса начальный HTTPS-контроль через Xray вернул 200. Ручного закрепления нет. |
+| WATCHDOG_TIMING_ROLLBACK_ARMED | Независимый таймер на 15 минут активен перед заменой. Установщик повторно сверил байты и состояние воркеров. |
+| WATCHDOG_TIMING_PROGRESS_OK | Штатный закрытый файл `watchdog-step.json` содержит поколение, `last_step` и `wake`. Для `wake` допустим `null`. |
+| WATCHDOG_TIMING_DEPLOYED_AND_VERIFIED | Файл сверили, XGW опубликовал свежий статус после перезапуска, PID Xray и SHA настроек совпали. HTTPS при установке и подтверждении вернул 200. Таймер снят. Оставь слой установленным. |
+| WATCHDOG_TIMING_FILES_ALREADY_PRESENT_RUNTIME_NOT_RESTARTED | Установленные байты совпали с правкой по контексту. Живой процесс подтвердил формат. Повторного перезапуска не было. |
 
 ## 2. Наблюдение после подтверждения
 
@@ -59,7 +65,7 @@ p95. Второе окно на 180 секунд повторяет лёгкую
 bash <<'BASH'
 set -euo pipefail
 umask 077
-CODE=bb7508e1901f23dc078da8881d808dc6c7e0d8c5
+CODE=0b4684129fd1b29da6f98b982fc940594b2d1b7f
 cd "$(git rev-parse --show-toplevel)"
 sudo -n true
 D=$(mktemp -d "$HOME/xgw-wake-observe.XXXXXXXX")
@@ -92,10 +98,11 @@ if [[ -n $port ]]; then
   audit 60 snapshot >"$D/https-before.json" || printf 'FIB_HTTPS_BEFORE_UNAVAILABLE\n'
   (
     for ((i=1; i<=12; i++)); do
+      rc=0
       code=$(curl -q -sS --max-time 5 --max-filesize 131072 --noproxy '' \
         --proxy "http://127.0.0.1:$port" -o /dev/null -w '%{http_code}' \
-        https://example.org/ 2>>"$D/https-private.err") || code=error
-      printf '%s\n' "$code"
+        https://example.org/ 2>>"$D/https-private.err") || rc=$?
+      printf '%s %s\n' "$rc" "${code:-000}"
       if (( i < 12 )); then sleep 10; fi
     done
   ) >"$D/https-codes.txt" &
@@ -103,7 +110,9 @@ if [[ -n $port ]]; then
   audit 190 watchdog --seconds 180 | tee "$D/https.json" || printf 'WATCHDOG_HTTPS_UNAVAILABLE\n'
   wait "$control"
   audit 60 snapshot >"$D/https-after.json" || printf 'FIB_HTTPS_AFTER_UNAVAILABLE\n'
-  awk '$0=="200" {n++} END {printf "HTTPS_CONTROL %d/%d\n", n, NR}' "$D/https-codes.txt"
+  awk '$1=="0" && $2=="200" {n++; next}
+       {print "HTTPS_ERROR curl_rc=" $1 " http=" $2}
+       END {printf "HTTPS_CONTROL %d/%d\n", n, NR}' "$D/https-codes.txt"
 else
   printf 'HTTPS_CONTROL_UNAVAILABLE\n'
 fi
@@ -121,31 +130,35 @@ fi
 BASH
 ~~~
 
-В отчёте приведи число завершённых шагов, максимум, p95 и ошибки
-чтения в каждом окне. При малой выборке пометь p95 как описательный.
-Подсчёт охватывает завершения внутри текущего окна. Отдельно
+В отчёте приведи оба `configured_intervals_s`, число завершённых
+шагов, `unseen_steps_between_samples`, максимум, p95 и ошибки чтения.
+При малой выборке пометь p95 как описательный. Приведи три
+наибольших значения из `step_part_max_s`. Они описывают выборку
+окна. Подсчёт охватывает завершения внутри текущего окна. Отдельно
 укажи `wake.state` и количество наборов. `not_observed` означает,
 что формат доступен, а причин в выборке нет. `not_instrumented`
 означает старый формат. `unavailable` означает отсутствие читаемых
-данных. Для `observed` укажи число и максимум по каждой причине.
-Наблюдатель читает последнюю опубликованную отметку. Число увиденных
-наборов характеризует выборку, а задержка заканчивается в момент
-начала обработки. Из снимков FIB перенеси только классы путей,
+данных. Для `observed` укажи число, максимум задержки и
+`last_step_overlap` по причине. Перекрытие показывает, сколько
+ожидания совпало с интервалом последнего завершённого шага.
+Поле `rules_check` измеряет отдельную проверку после начала разбора
+набора. При отсутствии значений запиши доступную часть. По HTTPS
+укажи числитель, знаменатель и пары кодов отказов. Из снимков FIB перенеси только классы путей,
 типы, таблицы и факт совпадения на границах. Из журнала перенеси
 счётчики сообщений, включая ноль. Приватные данные оставь на машине.
 
 ## 3. Откат
 
-При `WATCHDOG_WAKE_ROLLED_BACK` укажи итог восстановления и HTTPS.
-При `WATCHDOG_WAKE_ROLLBACK_PENDING` проверь
-`xgw-watchdog-wake-rollback.timer` и `xgw-watchdog-wake-rollback.service`.
+При `WATCHDOG_TIMING_ROLLED_BACK` укажи итог восстановления и HTTPS.
+При `WATCHDOG_TIMING_ROLLBACK_PENDING` проверь
+`xgw-watchdog-timing-rollback.timer` и `xgw-watchdog-timing-rollback.service`.
 Дождись активного таймера. Если таймер и служба завершились,
 а проверка восстановления не пройдена, используй значения из
 текущего прогона и выполни:
 
 ~~~bash
 sudo /usr/bin/python3 -I -B "$ROLLBACK_PAYLOAD/install.py" \
-  rollback --watchdog-wake --backup "$ROLLBACK_BACKUP"
+  rollback --watchdog-timing --backup "$ROLLBACK_BACKUP"
 ~~~
 
 ## 4. Автоматическая публикация
@@ -166,12 +179,12 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-wake-install.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_watchdog-step-attribution.md"
 test ! -e "$REPORT"
 cp -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre watchdog wake deployment'
+git commit -m 'Report ThinkCentre watchdog step timing and wake attribution'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
