@@ -437,7 +437,12 @@ def test_scan_does_not_block_watchdog(daemon):
     daemon._scan = slow
     daemon.next_scan = 0.0  # пора сканировать заново
     daemon.tick()
-    assert len(daemon.scanned) == 2  # бюджет 8 с: два скана, третий — на следующем шаге
+    assert len(daemon.scanned) == 1 and daemon._planned_scan_deferred
+    assert {"core_metrics", "provider_check", "end_to_end", "probe_target", "scan_queue"} <= (
+        daemon._tick_detail_spent.keys()
+    )
+    daemon.tick()
+    assert len(daemon.scanned) == 2  # на дополнительную плановую пробу не хватило окна
     daemon.tick()
     assert len(daemon.scanned) == 3
 

@@ -80,6 +80,8 @@ SCAN_BUDGET = 8.0  # секунд на сканы за один шаг: watchdog
 # Пауза входит в SCAN_BUDGET: не помещается — проба ждёт следующего шага. Участники, аварийные
 # состояния (DEGRADED, ALL_DEAD, RESERVE), срочные и ручные проверки паузы не ждут.
 SCAN_GAP = (0.2, 1.5)
+# Дополнительной плановой пробе оставляем окно не короче штатной паузы до таймаута чтения.
+SCAN_NEXT_WINDOW = 5.0
 SCAN_PACE_KEEP = 40  # сколько последних проб скана помнить для status.json (scan_pacing)
 RESCAN_PAUSE = 60.0  # внеочередной скан запасных — не чаще
 SUBSCRIPTION_RETRY = 120.0  # повтор опроса подписок после неудачи
@@ -767,6 +769,8 @@ class Daemon:
         self._pool_speed_ran = False  # на этом шаге шёл замер сервера «pool»
         self._youtube_ran = False  # на этом шаге шла проверка YouTube
         self._tick_spent: dict[str, float] = {}  # части шага → секунды (_spent)
+        self._tick_detail_spent: dict[str, float] = {}
+        self._planned_scan_deferred = False
         self._rebuild_spent = (0.0, 0.0)  # последняя сборка: (сборка, применение), секунды
         # YouTube через сервер (_youtube_step): итоги (meta YOUTUBE_META), счётчики downlink по
         # тегам на прошлом шаге и трафик клиентов с тех пор (Мбит/с), своя проверка прошлого шага
@@ -981,6 +985,8 @@ class Daemon:
             self._last_step = {
                 "sequence": self._loop_sequence, "started": started,
                 "completed_at": completed_at, "parts_s": self._tick_spent.copy(),
+                "details_s": self._tick_detail_spent.copy(),
+                "planned_scan_deferred": self._planned_scan_deferred,
             }
             if spent >= TICK_SLOW:
                 # Состояние пишется в конце шага: долгий шаг — и сводка в панели отстаёт (отчёты
@@ -1050,6 +1056,15 @@ class Daemon:
         moment = time.monotonic()
         self._tick_spent[name] = self._tick_spent.get(name, 0.0) + moment - since
         return moment
+
+    @contextlib.contextmanager
+    def _measure_detail(self, name: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            spent = time.monotonic() - started
+            self._tick_detail_spent[name] = self._tick_detail_spent.get(name, 0.0) + spent
 
     @property
     def stopping(self) -> bool:
@@ -1476,6 +1491,9 @@ class Daemon:
 
     def tick(self) -> State:
         """Один шаг watchdog. За шаг применяется не больше одного изменения конфига."""
+        self._tick_spent = {}
+        self._tick_detail_spent = {}
+        self._planned_scan_deferred = False
         if self._desync_reload_pending and not self._drain_desync_reload():
             # Старые правила остаются до освобождения слота. Не загружаем другое
             # назначение очереди, пока её предыдущий обработчик ещё может работать.
@@ -1484,7 +1502,6 @@ class Daemon:
             return self.machine.state
         now = self.clock()
         self._scanned = self._speed_ran = self._pool_speed_ran = self._youtube_ran = False
-        self._tick_spent = {}
         self._build_applied = False
         at = time.monotonic()
         resumed, self._resumed = self._resumed, False
@@ -1523,7 +1540,8 @@ class Daemon:
         members = [info for info in view if info.role == "proxy"]
         reserve = builder.reserve_tag(applied)
         signals, observatory = self._signals(members, now, reserve=bool(reserve))
-        signals = self._probe_target(view, applied, signals, now)
+        with self._measure_detail("probe_target"):
+            signals = self._probe_target(view, applied, signals, now)
         self._health_observed = time.monotonic()
         at = self._spent("сигналы ядра", at)
         previous = self.machine.state
@@ -1701,7 +1719,8 @@ class Daemon:
                 self.next_scan = now + jitter(self._scan_period(view) * 60.0)
                 self._queue_scan(view, now)
             self._queue_members(view)
-            self._scan_step(view, applied)
+            with self._measure_detail("scan_queue"):
+                self._scan_step(view, applied)
             if self.stopping:
                 # Остановка пришла во время сканов: замены и смены класса не начинаем.
                 self._write_status(view, observatory, signals.xray_ok)
@@ -1714,14 +1733,18 @@ class Daemon:
                 state is State.HEALTHY and self._home_members(view)
                 and not self._manual_active()
             ):
-                changed = self._rotate(view, observatory or {}, state, now)
+                with self._measure_detail("rotation"):
+                    changed = self._rotate(view, observatory or {}, state, now)
             if not changed:
-                changed = self._rebalance(view, observatory or {}, state)
+                with self._measure_detail("rebalance"):
+                    changed = self._rebalance(view, observatory or {}, state)
             if not changed:
-                changed = self._reserve_step(view, applied, state, now)
+                with self._measure_detail("reserve_selection"):
+                    changed = self._reserve_step(view, applied, state, now)
             if not changed:
-                self._member_profiles(view, observatory or {})
-                changed = self._profile_step(view)
+                with self._measure_detail("profile_checks"):
+                    self._member_profiles(view, observatory or {})
+                    changed = self._profile_step(view)
 
         if not self.scan_queue or not probing:
             self._manual_scan = False
@@ -1781,20 +1804,23 @@ class Daemon:
         """reserve — у балансировщика есть резервный выход (builder.reserve_tag)."""
         observatory: dict | None = None
         try:
-            observatory = self._read_observatory()
+            with self._measure_detail("core_metrics"):
+                observatory = self._read_observatory()
             xray_ok = True
         except Exception as exc:
             self.log.debug("метрики недоступны: %s", exc)
             # XRAY_DOWN — когда недоступны и метрики, и API.
             try:
-                self.api.balancer_info(BALANCER_TAG)
+                with self._measure_detail("core_api"):
+                    self.api.balancer_info(BALANCER_TAG)
                 xray_ok, observatory = True, {}
             except ApiError:
                 xray_ok = False
 
         tags = [info.tag for info in members]
         self._busy = self._traffic_busy(now)
-        provider_ok = self._check_provider()
+        with self._measure_detail("provider_check"):
+            provider_ok = self._check_provider()
         if provider_ok and observatory and self.machine.state is State.WAN_DOWN:
             # WAN только что вернулся (шаг по событию сети идёт сразу): «мёртвых» ядро
             # насчитало, пока связи не было, а повторить пробы ещё не успело. На этом шаге
@@ -1818,7 +1844,8 @@ class Daemon:
         e2e_ok = True
         if xray_ok and provider_ok:
             self._e2e_bytes = 0
-            e2e_ok = self._check_e2e()
+            with self._measure_detail("end_to_end"):
+                e2e_ok = self._check_e2e()
             if not e2e_ok and not self.reserve_mode and self._late_under_load(now, downlinks):
                 # Туннель заведомо жив: провал не засчитывается, но и счётчик не обнуляется.
                 e2e_ok = True
@@ -1834,7 +1861,8 @@ class Daemon:
         elif xray_ok and provider_ok and now >= self.next_leak:
             self.next_leak = now + jitter(LEAK_INTERVAL)
             self.leak_fresh = True
-            location = self._check_leak()
+            with self._measure_detail("leak_probe"):
+                location = self._check_leak()
             self.leak = (
                 location is not None and location == self.cfg.routing.home_country.upper()
             )
@@ -3516,7 +3544,7 @@ class Daemon:
 
         Плановые сканы запасных при исправном рабочем пути (HEALTHY, не по кнопке, не срочные)
         идут с паузой SCAN_GAP перед каждой следующей пробой шага (PR-4); пауза считается в
-        SCAN_BUDGET, и проба, которой не хватит бюджета вместе с паузой, ждёт следующего шага.
+        SCAN_BUDGET. После первой пробы оставляем время на паузу и окно SCAN_NEXT_WINDOW.
         Бюджет вышел — новая проба не начинается (начатая доводится до своего таймаута).
         Остановка во время паузы или пробы — тег остаётся в очереди; тег сервера, которого нет
         в применённом конфиге (состав сменился), снимается."""
@@ -3539,11 +3567,15 @@ class Daemon:
             waited = 0.0
             if planned and previous is not None:
                 pause = random.uniform(*SCAN_GAP)
-                if SCAN_BUDGET - (self.clock() - started) <= pause:
-                    break  # с паузой не помещается — следующим шагом
+                if SCAN_BUDGET - (self.clock() - started) < pause + SCAN_NEXT_WINDOW:
+                    self._planned_scan_deferred = True
+                    break
                 before = self.clock()
-                if self._scan_gap(pause) or self.clock() - started >= SCAN_BUDGET:
-                    break  # остановка демона (тег в очереди) или бюджет вышел за паузу
+                if self._scan_gap(pause):
+                    break  # остановка демона (тег остаётся в очереди)
+                if SCAN_BUDGET - (self.clock() - started) < SCAN_NEXT_WINDOW:
+                    self._planned_scan_deferred = True
+                    break
                 waited = self.clock() - before
             self.scan_queue.popleft()
             urgent = probe_tag in self._scan_urgent

@@ -43,6 +43,10 @@ def test_wait_progress_ignores_old_step_and_waits_for_new_completion(gate, tmp_p
     monkeypatch.setattr(gate, "time", clock)
     assert gate.wait_progress(path, 10_000_000_000, 5) == ("ready", 3, True)
     assert now[0] == 12.0
+    assert gate.progress_state(path, 10_000_000_000, 12.0, require_details=True) == "invalid_format"
+    step.update(details_s={}, planned_scan_deferred=False)
+    write_progress(path, 10_000_000_000, at=now[0], step=step)
+    assert gate.progress_state(path, 10_000_000_000, 12.0, require_details=True) == "ready"
 
 
 def test_wait_progress_stops_at_deadline_when_first_step_is_busy(gate, tmp_path, monkeypatch):

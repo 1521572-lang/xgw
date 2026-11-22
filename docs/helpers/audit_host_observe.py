@@ -16,6 +16,10 @@ STEP_PARTS = (
     "перехват и конфиг", "устройства и сервер пула", "подписка и сборка конфига", "сканы и замены",
     "основной сервер и замеры подписки", "замер пула и YouTube", "ядра и сеть", "запись состояния",
 )
+STEP_DETAILS = (
+    "core_metrics", "core_api", "provider_check", "end_to_end", "leak_probe", "probe_target",
+    "scan_queue", "rotation", "rebalance", "reserve_selection", "profile_checks",
+)
 
 
 def read_command(*argv):
@@ -99,6 +103,16 @@ def wake_sample(row, begin, measured_at):
     return ((generation, sequence), delays) if delays else None
 
 
+def step_timings(raw, names, duration):
+    timings = {}
+    if isinstance(raw, dict):
+        for name in names:
+            value = raw.get(name)
+            if type(value) in (int, float) and 0 <= value <= duration:
+                timings[name] = value
+    return timings
+
+
 def completed_step(row, begin, measured_at):
     generation = row.get("generation")
     if type(generation) is int and isinstance(step := row.get("last_step"), dict):
@@ -108,13 +122,7 @@ def completed_step(row, begin, measured_at):
                 or not begin <= ended <= measured_at):
             return None
         duration = ended - started
-        raw_parts = step.get("parts_s")
-        parts = {}
-        if isinstance(raw_parts, dict):
-            for name in STEP_PARTS:
-                value = raw_parts.get(name)
-                if type(value) in (int, float) and 0 <= value <= duration:
-                    parts[name] = value
+        parts = step_timings(step.get("parts_s"), STEP_PARTS, duration)
         return (generation, sequence), duration, parts
     started, duration = row.get("started"), row.get("step_s")
     if (row.get("phase") == "sleep" and type(started) in (int, float)
@@ -130,6 +138,8 @@ def watchdog(seconds):
     steps = {}
     step_sequences = {}
     part_max = {}
+    detail_max, detail_samples = {}, {}
+    scan_deferrals = {}
     intervals = set()
     wakes = {}
     wake_overlaps = {}
@@ -159,6 +169,14 @@ def watchdog(seconds):
                 if type(key[0]) is int and isinstance(row.get("last_step"), dict):
                     generation, sequence = key
                     step_sequences.setdefault(generation, set()).add(sequence)
+                    step = row["last_step"]
+                    deferred = step.get("planned_scan_deferred")
+                    if type(deferred) is bool:
+                        scan_deferrals[key] = deferred
+                    details = step_timings(step.get("details_s"), STEP_DETAILS, duration)
+                    for name, value in details.items():
+                        detail_max[name] = max(detail_max.get(name, 0), value)
+                        detail_samples.setdefault(name, set()).add(key)
                 for name, value in parts.items():
                     part_max[name] = max(part_max.get(name, 0), value)
             wake_available |= type(row.get("generation")) is int and "wake" in row
@@ -210,6 +228,12 @@ def watchdog(seconds):
                       "step_max_s": values[-1] if values else None,
                       "step_p95_s": values[math.ceil(len(values) * .95) - 1] if values else None,
                       "step_part_max_s": {name: round(value, 4) for name, value in part_max.items()},
+                      "step_details": {
+                          name: {"max_s": round(value, 4), "steps": len(detail_samples[name])}
+                          for name, value in detail_max.items()
+                      },
+                      "planned_scan_deferred_steps": sum(scan_deferrals.values())
+                      if scan_deferrals else None,
                       "wake": {"available": wake_available, "state": wake_state,
                                "observed_batches": len(wakes),
                                "by_reason": by_reason, **wake_details}}, ensure_ascii=False))

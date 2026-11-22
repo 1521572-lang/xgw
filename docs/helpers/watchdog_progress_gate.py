@@ -13,7 +13,8 @@ PROGRESS = Path("/run/xgw/watchdog-step.json")
 FATAL_STATES = {"invalid_snapshot", "invalid_format", "unexpected_mode"}
 
 
-def progress_state(path: Path, minimum_generation: int, now: float) -> str:
+def progress_state(path: Path, minimum_generation: int, now: float,
+                   *, require_details: bool = False) -> str:
     try:
         with path.open("rb") as stream:
             if stat.S_IMODE(os.fstat(stream.fileno()).st_mode) != 0o600:
@@ -53,15 +54,20 @@ def progress_state(path: Path, minimum_generation: int, now: float) -> str:
             or not generation / 1e9 <= started <= completed <= at
             or not isinstance(step.get("parts_s"), dict)):
         return "invalid_format"
+    if require_details and (not isinstance(step.get("details_s"), dict)
+                            or type(step.get("planned_scan_deferred")) is not bool):
+        return "invalid_format"
     return "ready"
 
 
-def wait_progress(path: Path, minimum_generation: int, seconds: float) -> tuple[str, int, bool]:
+def wait_progress(path: Path, minimum_generation: int, seconds: float,
+                  *, require_details: bool = False) -> tuple[str, int, bool]:
     deadline = time.monotonic() + seconds
     attempts = 0
     saw_first_step = False
     while True:
-        state = progress_state(path, minimum_generation, time.monotonic())
+        state = progress_state(path, minimum_generation, time.monotonic(),
+                               require_details=require_details)
         attempts += 1
         saw_first_step |= state == "waiting_first_step"
         remaining = deadline - time.monotonic()
@@ -71,12 +77,15 @@ def wait_progress(path: Path, minimum_generation: int, seconds: float) -> tuple[
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdigit():
+    if (len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--details")
+            or not sys.argv[1].isascii() or not sys.argv[1].isdigit()):
         raise SystemExit(2)
     minimum_generation = int(sys.argv[1]) * 1000  # systemd reports monotonic microseconds
     if minimum_generation <= 0:
         raise SystemExit(2)
-    state, attempts, saw_first_step = wait_progress(PROGRESS, minimum_generation, 120)
+    state, attempts, saw_first_step = wait_progress(
+        PROGRESS, minimum_generation, 120, require_details=len(sys.argv) == 3,
+    )
     print(f"WATCHDOG_TIMING_PROGRESS_CHECK result={state} polls={attempts} "
           f"waiting_first_step={str(saw_first_step).lower()}")
     raise SystemExit(0 if state == "ready" else 2)

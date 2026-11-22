@@ -107,6 +107,24 @@ def test_no_new_probe_after_the_budget_and_stop_keeps_the_queue(daemon):
     assert list(daemon.scan_queue) == _spares(daemon)[1:]  # первая прошла, остальные ждут
 
 
+@pytest.mark.parametrize(("manual", "expected"), [(False, 1), (True, 2)])
+def test_remaining_scan_window_defers_only_planned_spares(daemon, manual, expected):
+    _started(daemon)
+    spares = _spares(daemon)
+    daemon.scan_queue.extend(spares)
+    daemon._manual_scan = manual
+    original = daemon._scan
+
+    def slow(info, password, url=None):
+        daemon.t += 5.0
+        return original(info, password, url)
+
+    daemon._scan = slow
+    _step(daemon)
+    assert list(daemon.scan_queue) == spares[expected:]
+    assert daemon._planned_scan_deferred is not manual
+
+
 def test_emergency_requeue_raises_priority_and_drops_vanished_tags(daemon):
     _started(daemon)
     first, second, third = _spares(daemon)
