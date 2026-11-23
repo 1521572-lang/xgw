@@ -45,7 +45,10 @@ def stop(proc):
 @contextmanager
 def overflow_samples(sample):
     """Read a known one-slot backlog before and after a fixed loopback-only batch."""
-    library = ctypes.CDLL("libnetfilter_queue.so.1")
+    try:
+        library = ctypes.CDLL("libnetfilter_queue.so.1")
+    except OSError as exc:
+        raise ValueError("libnetfilter_queue_unavailable") from exc
     ptr = ctypes.c_void_p
     callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ptr, ptr, ptr, ptr)
     for name, result, args in (
@@ -72,10 +75,14 @@ def overflow_samples(sample):
         require(before is not None and before.counters == (0, 0, 0), "overflow_baseline")
 
         subprocess.run(["/usr/sbin/ip", "link", "set", "lo", "up"], check=True, timeout=3)
-        rule = ("table inet xgw_queue_trial { chain trial { "
-                "type filter hook output priority filter; policy accept; "
-                f"ip daddr 127.0.0.1 udp dport {PORT} queue num {QUEUE}; "
-                "} }\n")
+        rule = (
+            "table inet xgw_queue_trial {\n"
+            "  chain trial {\n"
+            "    type filter hook output priority filter; policy accept;\n"
+            f"    ip daddr 127.0.0.1 udp dport {PORT} queue num {QUEUE}\n"
+            "  }\n"
+            "}\n"
+        )
         subprocess.run([nft, "-f", "-"], input=rule, text=True, check=True, timeout=3)
         rule_added = True
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:

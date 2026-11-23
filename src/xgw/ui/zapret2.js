@@ -7,7 +7,13 @@ const modes = {
 const phases = {
   reserved: "Очередь зарезервирована", owner_verified: "Владелец очереди подтверждён",
   owner_unverified: "Владелец очереди перестал подтверждаться", released: "Очередь освобождена",
-  queue_drops: "Потери в очереди",
+  queue_drops: "Потери в очереди", worker_fault: "Диагностика остановки воркера",
+};
+const workerFaults = {
+  hostlist_reload_failed: "Ошибка загрузки списка доменов",
+  ipset_reload_failed: "Ошибка загрузки списка IP-адресов",
+  lua_panic: "Неустранимая ошибка Lua",
+  lua_error_observed: "В журнале этого запуска есть ошибка Lua",
 };
 const units = {"xgw-zapret2.service": "Выбранные домены", "xgw-nfqws2.service": "Общий обработчик"};
 const vpnChecks = {pass: "Прошла", fail: "Не прошла", not_run: "Не запускалась"};
@@ -401,6 +407,8 @@ function renderJournal(journal) {
     if (event.phase === "queue_drops") {
       fields.push("переполнение +" + count(event.overflow_delta),
         "доставка netlink +" + count(event.netlink_delta));
+    } else if (event.phase === "worker_fault" && workerFaults[event.reason]) {
+      fields.push(workerFaults[event.reason]);
     }
     description.textContent = fields.join(" · ");
     item.append(stamp, description);

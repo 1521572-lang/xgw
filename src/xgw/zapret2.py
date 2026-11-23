@@ -477,7 +477,10 @@ class Runtime:
             return False
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
         owner = worker.owner_sample(self.runner, UNIT, queue) if state == "active" else None
-        return self.slot.observe_owner(lease, owner is not None, owner)
+        verified = self.slot.observe_owner(lease, owner is not None, owner)
+        if state in worker.STOPPED:
+            self.slot.observe_stopped(lease, self.runner)
+        return verified
 
     @staticmethod
     def occupied(queue: int) -> bool:
@@ -498,6 +501,7 @@ class Runtime:
         worker.require_stopped(self.runner, worker.ENGINE_UNIT)
         self.lease = self.slot.reserve(UNIT, cfg.zapret2.queue_num,
                                        policy_key=worker.policy_revision(cfg.zapret2))
+        properties.append(self.slot.log_property(self.lease))
         self.evidence = None
         # Даже при таймауте запуска systemd мог уже создать unit.
         self.runner(["systemd-run", "--quiet", "--collect", "--unit", UNIT,

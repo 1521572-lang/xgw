@@ -175,6 +175,54 @@ def test_queue_counters_record_only_deltas_with_continuous_owner():
     assert slot.snapshot()[1]["queue_counters"] is None and slot.lease is newer
 
 
+@pytest.mark.parametrize(("messages", "reason"), [
+    (["hostlists load failed. this is fatal.", "LUA ERROR: private path"], "hostlist_reload_failed"),
+    (["ipset load failed. this is fatal."], "ipset_reload_failed"),
+    (["LUA PANIC: THIS IS FATAL. DYING."], "lua_panic"),
+    (["LUA ERROR: private path"], "lua_error_observed"),
+    (["worker stopped", "an error mentions hostlists load failed. this is fatal."], None),
+])
+def test_fault_observation_is_bound_to_one_worker_launch(messages, reason):
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(worker.ENGINE_UNIT, 201, policy_key="a" * 64)
+    run_field = slot.log_property(lease).removeprefix("LogExtraFields=")
+    runner = Mock(return_value="\n".join(json.dumps({"MESSAGE": item}) for item in messages))
+    slot.observe_stopped(lease, runner)
+    slot.observe_stopped(lease, runner)
+    runner.assert_called_once()
+    command, = runner.call_args.args
+    assert command[-2:] == [f"_SYSTEMD_UNIT={lease.unit}", run_field]
+    assert runner.call_args.kwargs == {"check": False, "timeout": 1}
+    report = slot.snapshot()[1]
+    assert "private path" not in json.dumps(report) and run_field not in json.dumps(report)
+    if reason is None:
+        assert [e["phase"] for e in report["events"]] == ["reserved"]
+    else:
+        assert report["events"][-1]["phase"] == "worker_fault"
+        assert report["events"][-1]["reason"] == reason
+        assert report["events"][-1]["generation"] == lease.generation
+    slot.release(lease)
+    new = slot.reserve(worker.ENGINE_UNIT, 201)
+    assert slot.log_property(new) != slot.log_property(lease)
+    slot.observe_stopped(lease, runner)
+    runner.assert_called_once()
+
+
+@pytest.mark.parametrize("module", [zapret2, nfqws2])
+def test_lost_runtime_collects_fault_only_when_the_service_stops(module, monkeypatch):
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(module.UNIT, 201)
+    runner = Mock(side_effect=["active", "failed", '{"MESSAGE":"LUA ERROR: example"}'])
+    runtime = module.Runtime(runner, slot=slot)
+    runtime.lease = lease
+    monkeypatch.setattr(runtime, "occupied", lambda _queue: True)
+    monkeypatch.setattr(worker, "owner_sample", lambda *_a: None)
+    assert not runtime.alive(201)
+    runner.assert_called_once()
+    assert not runtime.alive(201)
+    assert [e["phase"] for e in slot.snapshot()[1]["events"]] == ["reserved", "worker_fault"]
+
+
 def test_worker_history_is_capped_and_restart_gets_a_new_epoch():
     slot = worker.WorkerSlot()
     for _ in range(worker.EVENT_LIMIT):

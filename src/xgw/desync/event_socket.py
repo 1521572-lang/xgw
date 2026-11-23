@@ -32,10 +32,18 @@ MAX_SEQUENCE = (1 << 63) - 1
 FRESH_SECONDS = 90
 EPOCH = re.compile(r"[0-9a-f]{32}")
 POLICY_KEY = re.compile(r"[0-9a-f]{64}")
-PHASES = ("reserved", "owner_verified", "owner_unverified", "queue_drops", "released")
+PHASES = ("reserved", "owner_verified", "owner_unverified", "queue_drops", "worker_fault", "released")
 UNITS = (worker.ENGINE_UNIT, worker.SELECTED_UNIT)
 EVENT_FIELDS = ("seq", "at", "phase", "unit", "queue", "generation", "policy_key")
 DROP_FIELDS = ("overflow_delta", "netlink_delta")
+
+
+def event_details(phase: str) -> tuple[str, ...]:
+    if phase == "queue_drops":
+        return DROP_FIELDS
+    if phase == "worker_fault":
+        return ("reason",)
+    return ()
 
 
 def _integer(value: object, low: int, high: int) -> bool:
@@ -69,6 +77,10 @@ def _valid_event(event: object, seq: int) -> bool:
     if event["phase"] == "queue_drops":
         deltas = [event.get(key) for key in DROP_FIELDS]
         if not all(_integer(v, 0, worker.COUNTER_MAX) for v in deltas) or not any(deltas):
+            return False
+    if event["phase"] == "worker_fault":
+        reason = event.get("reason")
+        if not isinstance(reason, str) or reason not in worker.FAULT_REASONS:
             return False
     valid_revision = revision is None or (
         isinstance(revision, str) and POLICY_KEY.fullmatch(revision) is not None)
@@ -105,7 +117,7 @@ def cursor_response(snapshot: object, epoch: str | None, after: int, now: float)
     else:
         state = "gap" if after < discarded else "ok"
     return _response(state, **positions, events=[
-        {key: e[key] for key in EVENT_FIELDS + (DROP_FIELDS if e["phase"] == "queue_drops" else ())}
+        {key: e[key] for key in EVENT_FIELDS + event_details(e["phase"])}
         for e in events if e["seq"] > after
     ])
 

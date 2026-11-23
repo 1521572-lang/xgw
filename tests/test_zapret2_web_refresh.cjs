@@ -107,6 +107,16 @@ test("queue drop journal spells out the two deltas and their generation", () => 
   assert.match(description, /доставка netlink \+0/);
 });
 
+test("worker fault journal distinguishes an IP list failure", () => {
+  const browser = page();
+  browser.evaluate(`renderJournal({available: true, epoch: "trial", omitted: 0, events: [{
+    phase: "worker_fault", at: 1000, unit: "xgw-nfqws2.service", generation: 9,
+    queue: 201, reason: "ipset_reload_failed"
+  }]})`);
+  const [item] = browser.element("event-list").children;
+  assert.match(item.children[1].textContent, /поколение 9.*Ошибка загрузки списка IP-адресов/);
+});
+
 test("online bypasses backoff and coalesces with an in-flight GET", async () => {
   const browser = page();
   browser.requests[0](503);

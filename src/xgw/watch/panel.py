@@ -865,8 +865,8 @@ class Panel:
                 "epoch": journal.get("epoch"),
                 "omitted": journal.get("discarded", 0) + max(0, len(events) - visible),
                 "events": [
-                    {key: event[key] for key in public_fields + (
-                        event_socket.DROP_FIELDS if event["phase"] == "queue_drops" else ()
+                    {key: event[key] for key in public_fields + event_socket.event_details(
+                        event["phase"]
                     )}
                     for event in reversed(events[-visible:])
                 ],

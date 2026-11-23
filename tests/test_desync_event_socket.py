@@ -78,6 +78,18 @@ def test_queue_drop_events_and_sampling_remain_bounded_and_backward_compatible(m
     assert transport.cursor_response(status, None, 0, NOW)["state"] == "unavailable"
 
 
+def test_worker_fault_exports_only_allowlisted_reason():
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(worker.ENGINE_UNIT, 201)
+    slot.observe_stopped(lease, lambda *_a, **_kw: '{"MESSAGE":"LUA ERROR: abc-private"}')
+    status = {"daemon": True, "updated": NOW, "zapret2_worker_events": slot.snapshot()[1]}
+    item = transport.cursor_response(status, None, 0, NOW)["events"][-1]
+    assert item["phase"] == "worker_fault" and item["reason"] == "lua_error_observed"
+    assert "abc-private" not in json.dumps(item)
+    status["zapret2_worker_events"]["events"][-1]["reason"] = ["unknown"]
+    assert transport.cursor_response(status, None, 0, NOW)["state"] == "unavailable"
+
+
 @pytest.mark.parametrize("frame", [
     b'{"version":true,"epoch":null,"after":0}\n',
     b'{"version":1,"epoch":null,"after":1}\n',

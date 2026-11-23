@@ -338,6 +338,8 @@ def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
     lease = slot.reserve(worker.SELECTED_UNIT, 201, policy_key="1" * 64)
     slot.observe_owner(lease, True, worker.QueueOwner("socket:[private]", (0, 0, 0)))
     slot.observe_owner(lease, True, worker.QueueOwner("socket:[private]", (7, 2, 3)))
+    slot.observe_owner(lease, False)
+    slot.observe_stopped(lease, lambda *_a, **_kw: '{"MESSAGE":"LUA ERROR: private worker text"}')
     status.write_status(rig.paths, {**_snapshot(), "zapret2_worker_events": slot.snapshot()[1]})
     guest_client = Client(rig.panel.port, rig.paths)
     assert guest_client.request("GET", "/api/zapret2/overview")[0].status == 401
@@ -350,12 +352,13 @@ def test_zapret2_overview_uses_panel_session_and_limits_state(rig, user):
     assert response.status == 200
     overview = json.loads(body)
     assert set(overview) == {"zapret2", "journal"}
-    assert overview["journal"]["omitted"] == 7
+    assert overview["journal"]["omitted"] == 9
     events = overview["journal"]["events"]
-    assert [row["seq"] for row in events] == list(range(23, 7, -1))
-    assert events[0]["phase"] == "queue_drops"
-    assert (events[0]["overflow_delta"], events[0]["netlink_delta"]) == (7, 2)
-    assert "socket:[" not in body
+    assert [row["seq"] for row in events] == list(range(25, 9, -1))
+    assert events[0]["phase"] == "worker_fault" and events[0]["reason"] == "lua_error_observed"
+    assert events[2]["phase"] == "queue_drops"
+    assert (events[2]["overflow_delta"], events[2]["netlink_delta"]) == (7, 2)
+    assert "socket:[" not in body and "private worker text" not in body
     assert "policy_key" not in body and "probe_urls" not in body and TOKEN not in body
     response, _ = user.request("GET", "/api/zapret2/overview", host="foreign.test")
     assert response.status == 403

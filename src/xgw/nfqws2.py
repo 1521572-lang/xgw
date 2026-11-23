@@ -309,7 +309,10 @@ class Runtime:
     def alive(self, queue: int) -> bool:
         lease = self.lease
         state = self.runner(["systemctl", "is-active", UNIT], check=False, timeout=5).strip()
-        return self._owns_queue(lease, queue, active=state == "active")
+        verified = self._owns_queue(lease, queue, active=state == "active")
+        if lease is not None and lease.queue == queue and state in worker.STOPPED:
+            self.slot.observe_stopped(lease, self.runner)
+        return verified
 
     def _owns_queue(self, lease: worker.Lease | None, queue: int, *, active: bool = True) -> bool:
         if lease is None or self.slot.lease is not lease or lease.queue != queue:
@@ -333,6 +336,8 @@ class Runtime:
             if state == "active" and self._owns_queue(lease, queue):
                 return cancel is None or not cancel.is_set()
             if state not in ("active", "activating"):
+                if lease is not None and lease.queue == queue and state in worker.STOPPED:
+                    self.slot.observe_stopped(lease, self.runner)
                 return False
             pause = min(READY_POLL, max(0.0, deadline - time.monotonic()))
             if cancel is None:
@@ -360,6 +365,7 @@ class Runtime:
             "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW", "ProtectKernelTunables=yes",
             "ProtectKernelModules=yes",
             "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX",
+            self.slot.log_property(self.lease),
         ]
         # Таймаут systemd-run не гарантирует, что unit не создан. С этого момента
         # требуется остановка, даже если подтверждения запуска мы не получили.

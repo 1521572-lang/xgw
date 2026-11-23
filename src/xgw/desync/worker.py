@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -23,6 +24,14 @@ COUNTER_MAX = (1 << 32) - 1
 QUEUE_SOURCE = "proc_nfnetlink_queue"
 QUEUE_FRESH_SECONDS = 90
 COUNTER_FIELDS = ("unit", "queue", "generation", "source", "at", "overflow", "netlink")
+RUN_FIELD = "XGW_WORKER_RUN"
+FATAL_MESSAGES = {
+    "hostlists load failed. this is fatal.": "hostlist_reload_failed",
+    "ipset load failed. this is fatal.": "ipset_reload_failed",
+    "LUA PANIC: THIS IS FATAL. DYING.": "lua_panic",
+}
+FAULT_REASONS = frozenset((*FATAL_MESSAGES.values(), "lua_error_observed"))
+JOURNAL_FILTER = r"^(hostlists load failed\.|ipset load failed\.|LUA (PANIC|ERROR):)"
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,7 @@ class WorkerSlot:
         self._seq = 0
         self._verified = False
         self._policy_key: str | None = None
+        self._fault_checked = False
         self._queue_sample: QueueOwner | None = None
         self._queue_at = 0.0
         self._events: deque[dict] = deque(maxlen=EVENT_LIMIT)
@@ -59,6 +69,7 @@ class WorkerSlot:
             self.lease = Lease(self._generation, unit, queue)
             self._verified = False
             self._policy_key = policy_key
+            self._fault_checked = False
             self._event("reserved", self.lease)
             return self.lease
 
@@ -84,6 +95,24 @@ class WorkerSlot:
                     self._event("queue_drops", lease, overflow_delta=overflow, netlink_delta=netlink)
             return verified
 
+    def log_property(self, lease: Lease) -> str:
+        return f"LogExtraFields={self._log_field(lease)}"
+
+    def _log_field(self, lease: Lease) -> str:
+        return f"{RUN_FIELD}={self._epoch}-{lease.generation}"
+
+    def observe_stopped(self, lease: Lease | None, runner: cmd.Runner) -> None:
+        """Record advertised fault markers once after a worker disappears."""
+        with self._lock:
+            if lease is None or self.lease is not lease or self._fault_checked:
+                return
+            self._fault_checked = True
+        reason = read_fault(runner, lease.unit, self._log_field(lease))
+        if reason is not None:
+            with self._lock:
+                if self.lease is lease and not self._verified:
+                    self._event("worker_fault", lease, reason=reason)
+
     def release(self, lease: Lease | None) -> None:
         with self._lock:
             if lease is not None and self.lease is lease:
@@ -91,7 +120,7 @@ class WorkerSlot:
                 self.lease = None
                 self._queue_sample = None
 
-    def _event(self, phase: str, lease: Lease, **details: int) -> None:
+    def _event(self, phase: str, lease: Lease, **details: int | str) -> None:
         self._seq += 1
         self._events.append({"seq": self._seq, "at": time.time(), "phase": phase,
                              "policy_key": self._policy_key, **asdict(lease), **details})
@@ -117,6 +146,30 @@ def policy_revision(settings) -> str | None:
     try:
         return schema.fingerprint(schema.migrate(vars(settings)))
     except schema.PolicyError:
+        return None
+
+
+def read_fault(runner: cmd.Runner, unit: str, log_field: str) -> str | None:
+    """Read a small journal projection for this exact worker launch."""
+    try:
+        rows = runner([
+            "journalctl", "--boot", "--quiet", "--no-pager", "--lines=8", "--output=json",
+            "--output-fields=MESSAGE", "--grep=" + JOURNAL_FILTER, "_SYSTEMD_UNIT=" + unit,
+            log_field,
+        ], check=False, timeout=1)
+        if not isinstance(rows, str):
+            return None
+        lua_observed = False
+        for line in rows.splitlines():
+            row = json.loads(line)
+            message = row.get("MESSAGE") if isinstance(row, dict) else None
+            if not isinstance(message, str):
+                continue
+            if reason := FATAL_MESSAGES.get(message.strip()):
+                return reason
+            lua_observed |= message.startswith("LUA ERROR: ")
+        return "lua_error_observed" if lua_observed else None
+    except (cmd.CommandError, OSError, ValueError, RecursionError):
         return None
 
 
