@@ -78,6 +78,27 @@ def probe(url, size, *, peer=None):
     return result
 
 
+def probe_pair(url):
+    """Require one complete Range response and repeat on the same IPv4 peer."""
+    def full_range(result):
+        return result["ok"] and (result["status"], result["bytes"]) == (206, 65536)
+
+    first = probe(url, 65536)
+    if not full_range(first):
+        return {"ok": False, "state": "initial_range_failed", "first": first}
+    try:
+        peer = ipaddress.IPv4Address(first.get("remote_ip"))
+    except ipaddress.AddressValueError:
+        return {"ok": False, "state": "peer_unconfirmed", "first": first}
+    if not peer.is_global or peer.is_multicast:
+        return {"ok": False, "state": "peer_unconfirmed", "first": first}
+    pinned = probe(url, 65536, peer=peer)
+    same_peer = pinned.get("remote_ip") == str(peer)
+    ok = full_range(pinned) and same_peer
+    return {"ok": ok, "state": "pass" if ok else "pinned_range_unconfirmed", "first": first,
+            "pinned": pinned, "same_peer": same_peer}
+
+
 class Player:
     def __init__(self, sock):
         self.stream = sock.makefile("rwb")
@@ -328,6 +349,7 @@ def main():
     burst.add_argument("--bytes", type=int, choices=(65536, 10485760), default=65536)
     burst.add_argument("--peer", type=ipaddress.IPv4Address,
                        help="Use this public IPv4 address with the original hostname and TLS")
+    commands.add_parser("probe-pair", help="Check a 64 KiB range twice on the same IPv4 peer")
     play = commands.add_parser("play")
     play.add_argument("--seconds", type=int, choices=PLAYBACK_SECONDS, required=True)
     play.add_argument("--seek-forward", type=int, choices=(480,))
@@ -346,13 +368,15 @@ def main():
             result = replay(args.source, args.samples)
             print(json.dumps(result, allow_nan=False))
             return 0 if result["ok"] else 2
-        if not shutil.which("curl" if args.action == "probe" else "mpv"):
+        if not shutil.which("curl" if args.action in ("probe", "probe-pair") else "mpv"):
             raise ValueError("dependencies")
         url, duration, bitrate = read_format(args.source)
         if args.action == "probe":
             if args.peer and (not args.peer.is_global or args.peer.is_multicast):
                 raise ValueError("public_ipv4_required")
             result = probe(url, args.bytes, peer=args.peer)
+        elif args.action == "probe-pair":
+            result = probe_pair(url)
         else:
             if duration < args.seconds + 65 + (args.seek_forward or 0):
                 raise ValueError("duration")

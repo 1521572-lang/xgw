@@ -35,7 +35,7 @@ export PYTHONPATH="$D/tree/src:$D/tree:$D/tree/tests"
 run contracts timeout -k 3 180 env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTEST_ADDOPTS= \
   "$TEST_PY" -B -P -m pytest --portable -o addopts= -p no:cacheprovider -q --tb=short \
   tests/test_desync_jobs.py tests/test_desync_worker.py tests/test_zapret2_panel.py \
-  tests/test_desync_event_socket.py tests/test_desync_schema.py
+  tests/test_desync_event_socket.py tests/test_desync_schema.py tests/test_selective_admission.py
 
 exec 9>"${XDG_RUNTIME_DIR:-$HOME}/xgw-t09-live.lock"
 run live-lock flock -n 9
@@ -44,7 +44,8 @@ PACKAGE=$(readlink -e /opt/xgw/lib/xgw)
 CFG=$(readlink -e /etc/xgw/config.toml)
 PANEL=$(readlink -e /etc/xgw/panel.json)
 FILES=(src/xgw/desync/worker.py src/xgw/desync/jobs.py src/xgw/watch/zapret2_control.py)
-FORMAT="$D/format.json"
+VPN_FORMAT="$D/format.json"
+FORMAT="$VPN_FORMAT"
 armed=0
 
 lease_clear() {
@@ -126,6 +127,35 @@ from xgw.desync.schema import youtube_cdn_expiry
 url, duration, _ = read_format(Path(sys.argv[1]))
 expiry = youtube_cdn_expiry(url)
 assert duration >= 195 and expiry is not None and expiry - time.time() >= int(sys.argv[2])
+PY
+}
+
+resolve() {
+  timeout -k 3 72 yt-dlp "$@" --no-playlist --socket-timeout 10 --retries 1 \
+    --extractor-retries 1 -f 'bv[height=720][protocol=https]' --dump-single-json \
+    "https://www.youtube.com/watch?v=$VIDEO"
+}
+
+standalone_route_check() {
+  "$PY" -B -P -m xgw.desync.route_evidence delta \
+    "$D/standalone-before.out" "$D/standalone-after.out" >"$D/standalone-route.json" &&
+    "$PY" -I - "$D/standalone-route.json" "$VPN_FORMAT" "$FORMAT" \
+      "$D/vpn-range.out" "$D/standalone-range-pair.out" <<'PY'
+import json
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+delta, vpn, direct, vpn_range, direct_pair = (
+    json.loads(Path(file).read_bytes()) for file in sys.argv[1:]
+)
+downlink = delta["groups"]["zapret2"]["downlink"]
+assert delta["client_zapret2_rule"] is True and (downlink or 0) > 0
+vpn_peer = vpn_range.get("remote_ip")
+comparison = {"same_hostname": urlsplit(vpn["url"]).hostname == urlsplit(direct["url"]).hostname,
+              "same_connector_ip": (vpn_peer == direct_pair["first"]["remote_ip"]) if vpn_peer else None,
+              "zapret2_downlink_delta": downlink}
+print(json.dumps(comparison))
 PY
 }
 
@@ -221,9 +251,7 @@ trap 'exit 143' TERM HUP
 run initial-off wait_off
 run initial-base compare_base
 run initial-vpn vpn_check vpn-initial
-run resolve timeout -k 3 72 yt-dlp --no-playlist --socket-timeout 10 --retries 1 \
-  --extractor-retries 1 -f 'bv[height=720][protocol=https]' --dump-single-json \
-  "https://www.youtube.com/watch?v=$VIDEO"
+run resolve resolve
 mv -- "$D/resolve.out" "$FORMAT"
 run format-check format_check 1350
 run vpn-range "$PY" -B -P -m docs.helpers.headless_playback "$FORMAT" probe
@@ -233,6 +261,18 @@ run vpn-range-check "$PY" -I -c \
 
 run guard stage
 sudo -n touch "$BACKUP/network-test-started"
+run standalone-on admission standalone "$D/standalone-receipt"
+run standalone-resolve resolve --ignore-config --proxy '' --force-ipv4
+FORMAT="$D/standalone-resolve.out"
+run standalone-format format_check 1350
+run standalone-revision-before admission check-standalone "$D/standalone-receipt"
+run standalone-before snapshot
+run standalone-range-pair "$PY" -B -P -m docs.helpers.headless_playback "$FORMAT" probe-pair
+run standalone-after snapshot
+run standalone-revision-after admission check-standalone "$D/standalone-receipt"
+run standalone-route standalone_route_check
+run standalone-off admission off "$D/standalone-receipt"
+run standalone-off-confirmed wait_off
 run base-admission admission admit "$D/base-receipt" --format "$FORMAT" --checks 2 \
   --recover-cdn-once --timeout 360
 run base-rule snapshot

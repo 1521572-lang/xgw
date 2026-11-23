@@ -161,10 +161,47 @@ def activate(client, args):
                              recover_cdn_once=args.recover_cdn_once)
 
 
+def standalone_ready(card):
+    return (matched(card) and card["mode"] == "standalone" and card["state"] == "active"
+            and card.get("without_vpn") is True)
+
+
+def start_standalone(client, receipt):
+    card = overview(client)
+    if not off(card):
+        raise TrialError("expected_fresh_off")
+    with receipt.open("x", encoding="utf-8") as stream:
+        key = update(client, "/api/zapret2/settings", card["config_key"], settings={
+            "strategy": "multisplit", "domains": list(YOUTUBE_DOMAINS),
+            "youtube_transport_probe": False,
+        })
+        card = wait_off(client, key)
+        if card.get("blockers", {}).get("standalone") != []:
+            raise TrialError("standalone_settings_not_ready")
+        key = update(client, MODE, key, mode="standalone")
+        stream.write(key + "\n")
+    for card in observations(client, key, time.monotonic() + 120):
+        if standalone_ready(card):
+            log("standalone_ready")
+            return 0
+        if card["state"] in TERMINAL:
+            break
+    raise TrialError("standalone_not_ready")
+
+
+def check_standalone(client, receipt):
+    key = receipt.read_text(encoding="utf-8").strip()
+    card = overview(client)
+    if not key or card["config_key"] != key or not standalone_ready(card):
+        raise TrialError("standalone_not_confirmed")
+    log("standalone_ready")
+    return 0
+
+
 def disable(client, receipt):
     key = receipt.read_text(encoding="utf-8").strip()
     card = overview(client)
-    if not key or card["config_key"] != key or card["mode"] != "selective":
+    if not key or card["config_key"] != key or card["mode"] not in ("selective", "standalone"):
         raise TrialError("policy_changed_or_receipt_missing")
     wait_off(client, update(client, MODE, key, mode="off"))
     log("off")
@@ -184,12 +221,18 @@ def main():
                            help="Observe one normal watchdog retry after a CDN TLS timeout")
     turn_off = actions.add_parser("off")
     turn_off.add_argument("receipt", type=Path)
+    actions.add_parser("standalone").add_argument("receipt", type=Path)
+    actions.add_parser("check-standalone").add_argument("receipt", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
     try:
         client = Client()
         if args.action == "admit":
             return activate(client, args)
+        if args.action == "standalone":
+            return start_standalone(client, args.receipt)
+        if args.action == "check-standalone":
+            return check_standalone(client, args.receipt)
         return disable(client, args.receipt)
     except TrialError as exc:
         log("error", reason=str(exc))

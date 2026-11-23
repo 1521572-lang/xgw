@@ -1,8 +1,10 @@
 """Contract checks for the Selective acceptance helper. No live requests."""
+from ipaddress import IPv4Address
 from types import SimpleNamespace
 
 import pytest
 
+from docs.helpers import headless_playback
 from docs.helpers import selective_admission as trial
 
 
@@ -90,3 +92,61 @@ def test_off_never_posts_against_changed_policy(tmp_path):
 
     with pytest.raises(trial.TrialError, match="policy_changed"):
         trial.disable(SimpleNamespace(request=request), receipt)
+
+
+def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monkeypatch):
+    card = {"mode": "off", "state": "off", "engine_mode": "off", "fresh": True,
+            "policy_matched": True, "config_key": "initial", "blockers": {"standalone": []}}
+    calls = []
+    receipt = tmp_path / "standalone"
+
+    def request(path, body=None):
+        if body is None:
+            return {"zapret2": card}
+        assert receipt.exists()
+        assert body["expected"] == card["config_key"]
+        calls.append((path, body))
+        if path.endswith("/settings"):
+            assert body["settings"]["youtube_transport_probe"] is False
+            card["config_key"] = "settings"
+        else:
+            mode = body["mode"]
+            card.update(mode=mode, state="active" if mode == "standalone" else "off",
+                        without_vpn=True, config_key=mode)
+        return {"ok": True, "config_key": card["config_key"]}
+
+    monkeypatch.setattr(trial, "observations", lambda _client, key, _deadline: iter(
+        [card.copy()] if card["config_key"] == key else []))
+    client = SimpleNamespace(request=request)
+    assert trial.start_standalone(client, receipt) == 0
+    assert receipt.read_text().strip() == "standalone"
+    assert trial.check_standalone(client, receipt) == 0
+    card["without_vpn"] = False
+    with pytest.raises(trial.TrialError, match="standalone_not_confirmed"):
+        trial.check_standalone(client, receipt)
+    assert trial.disable(client, receipt) == 0
+    assert [body.get("mode") for _, body in calls] == [None, "standalone", "off"]
+
+
+@pytest.mark.parametrize(("first_override", "pinned_override", "state", "pinned"), [
+    ({}, {}, "pass", True),
+    ({"status": 200}, {}, "initial_range_failed", False),
+    ({"remote_ip": "127.0.0.1"}, {}, "peer_unconfirmed", False),
+    ({}, {"remote_ip": "8.8.8.8"}, "pinned_range_unconfirmed", True),
+    ({}, {"bytes": 32768}, "pinned_range_unconfirmed", True),
+])
+def test_probe_pair_requires_full_ranges_at_the_same_public_peer(
+        monkeypatch, first_override, pinned_override, state, pinned):
+    calls = []
+    url = "https://r1.googlevideo.com/videoplayback?sig=private"
+
+    def probe(target, size, *, peer=None):
+        assert target == url and size == 65536
+        calls.append(peer)
+        return {"ok": True, "status": 206, "bytes": 65536, "remote_ip": "1.1.1.1",
+                **(first_override if peer is None else pinned_override)}
+
+    monkeypatch.setattr(headless_playback, "probe", probe)
+    result = headless_playback.probe_pair(url)
+    assert result["ok"] is (state == "pass") and result["state"] == state
+    assert calls == ([None, IPv4Address("1.1.1.1")] if pinned else [None])
