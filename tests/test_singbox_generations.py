@@ -4,17 +4,21 @@ import copy
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from xgw import zapret2
 from xgw.apply import singbox_generation as g
 from xgw.apply import singbox_process as p
 from xgw.apply.applier import Applier
 from xgw.apply.singbox import SingboxCore
 from xgw.config import Config
+from xgw.daemon import SINGBOX_RETRY, Daemon
 from xgw.generator import singbox as sb
 from xgw.paths import Paths, atomic_write_json
 from xgw.watch.checks import DownloadResult
+from xgw.watch.standalone import _stop_bridges
 from xgw.xraycore.api import ApiError
 
 NL = chr(10)
@@ -129,6 +133,49 @@ def test_failed_bridge_leaves_old_without_api(gateway, monkeypatch):
         g.prepare(w.core, w.old, w.xray)
     assert w.alive == {p.LEGACY} and w.api.calls == []
     assert w.core.read() == w.old and p.read(w.paths)["pending"] is None
+
+
+def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway, monkeypatch):
+    w = gateway
+    first = g.prepare(w.core, w.old, w.xray)
+    assert g.finish(w.core, w.applier, first).mode == "api"
+    assert p.read(w.paths)["active"] == first.slot
+    atomic_write_json(w.paths.xray_config_file, {"outbounds": [{"tag": zapret2.DIRECT}]})
+    standalone = SimpleNamespace(paths=w.paths, singbox=w.core)
+    assert not _stop_bridges(standalone)
+    assert _stop_bridges(standalone) and _stop_bridges(standalone)
+    assert not w.alive and w.core.read() is None and not p.marker_path(w.paths).exists()
+    assert p.summary(w.paths)["resume_managed"] is True
+
+    # Restore the base service first, then use the ordinary checked generation handoff.
+    w.alive.add(p.LEGACY)
+    atomic_write_json(w.paths.singbox_config_file, w.old)
+    atomic_write_json(w.paths.xray_config_file, w.xray)
+    w.api.items = {row["tag"]: row for row in w.xray["outbounds"]}
+    w.api.calls.clear()
+    assert not g.needed(w.core, w.old) and g.needed(w.core, w.old, resume=True)
+
+    monkeypatch.setattr(w.core, "alive", lambda: True)
+    daemon = SimpleNamespace(singbox=w.core, stopping=False, _singbox_failed=False,
+                             _singbox_resume_at=0, inventory=object(), _build=None,
+                             _build_next=None, _rebuild=Mock(return_value=False))
+    assert not Daemon._singbox_step(daemon, 1)
+    daemon._rebuild.assert_called_once_with(None, urgent=True, reason="Возврат к поколениям sing-box",
+                                            resume_singbox=True)
+    assert not Daemon._singbox_step(daemon, 2) and daemon._rebuild.call_count == 1
+    assert daemon._singbox_resume_at == 1 + SINGBOX_RETRY
+
+    with monkeypatch.context() as patch:
+        patch.setattr(g, "bridge_check", lambda *args: False)
+        with pytest.raises(ValueError, match="настоящий запрос"):
+            g.prepare(w.core, w.old, w.xray)
+    assert w.alive == {p.LEGACY} and not w.api.calls and g.resume_needed(w.core)
+
+    resumed = g.prepare(w.core, w.old, w.xray)
+    assert g.finish(w.core, w.applier, resumed).mode == "api"
+    state = p.read(w.paths)
+    assert state["active"] == resumed.slot and state["draining"]["slot"] == "legacy"
+    assert not p.summary(w.paths)["resume_managed"] and p.marker_path(w.paths).is_file()
 
 
 def test_new_server_composition_gets_disjoint_bridges(gateway):

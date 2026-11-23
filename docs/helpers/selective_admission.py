@@ -11,6 +11,7 @@ from pathlib import Path
 from docs.helpers.headless_playback import read_format
 from xgw.desync.client import Client
 from xgw.desync.schema import YOUTUBE_DOMAINS
+from xgw.zapret2 import STANDALONE_PREPARING_REASONS
 
 OVERVIEW = "/api/zapret2/overview"
 MODE = "/api/zapret2/mode"
@@ -180,12 +181,23 @@ def start_standalone(client, receipt):
             raise TrialError("standalone_settings_not_ready")
         key = update(client, MODE, key, mode="standalone")
         stream.write(key + "\n")
-    for card in observations(client, key, time.monotonic() + 120):
+    started = time.monotonic()
+    last = None
+    for card in observations(client, key, started + 120):
+        if card["mode"] != "standalone":
+            raise TrialError("unexpected_mode")
         if standalone_ready(card):
-            log("standalone_ready")
+            log("standalone_ready", waited_s=round(time.monotonic() - started, 2))
             return 0
-        if card["state"] in TERMINAL:
-            break
+        state, reason = card["state"], card.get("reason")
+        if (state, reason) != last:
+            last = (state, reason)
+            log("standalone_progress", phase=state, reason=reason,
+                waited_s=round(time.monotonic() - started, 2))
+        if state in TERMINAL and not (state == "blocked" and reason in STANDALONE_PREPARING_REASONS):
+            raise TrialError("standalone_not_ready")
+    if last is not None:
+        log("standalone_deadline", phase=last[0], reason=last[1])
     raise TrialError("standalone_not_ready")
 
 

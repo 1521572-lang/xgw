@@ -149,8 +149,16 @@ def describe_composition(counts) -> str:
             f"−{counts['pool_out']}; сменили набор вариантов {counts['variants']})")
 
 
-def needed(core, config):
-    return config is not None and core.read() is not None and config != core.read()
+def resume_needed(core):
+    """The current boot still owes a managed handoff after leaving Standalone."""
+    state = processes.read(core.paths)
+    return state["active"] == "legacy" and state.get("resume_managed") is True
+
+
+def needed(core, config, *, resume=False):
+    current = core.read()
+    return (config is not None and current is not None
+            and (config != current or (resume and resume_needed(core))))
 
 
 def available(core):
@@ -392,6 +400,7 @@ def _promote(core, state, config):
     state.update(active=pending["slot"], pending=None,
                  draining={"slot": state["active"], "until": time.monotonic()
                            + processes.DRAIN_SECONDS, "ports": pending["old_ports"]})
+    state.pop("resume_managed", None)
     processes.write(core.paths, state)
     core.sync_generation()
 
@@ -474,5 +483,6 @@ def retire(core):
         state["draining"] = {"slot": state["active"], "until": time.monotonic()
                              + processes.DRAIN_SECONDS, "ports": sorted(processes.ports(current))}
         state["active"] = "legacy"
+        state.pop("resume_managed", None)
         processes.write(core.paths, state)
         core.paths.singbox_config_file.unlink(missing_ok=True)

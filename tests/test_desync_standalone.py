@@ -97,3 +97,16 @@ def test_standalone_waits_before_open_and_closes_after_worker_failure():
     assert not zapret2.active(applied)
     assert controller.view == {"state": "blocked", "reason": "worker_down", "gate_closed": True}
     runtime.start.assert_called_once()
+
+
+def test_standalone_reports_waiting_for_vpn_without_opening_the_direct_route():
+    cfg = _standalone()
+    applied = builder.build(cfg, builder.Selection(), hosts={}, ipv6=False).config
+    runtime, apply = Mock(), Mock()
+    controller = zapret2.Controller(Mock(), runtime)
+
+    controller.step_standalone(cfg, applied, 0, apply, allowed=False, blocked_reason="vpn_stopping")
+
+    assert controller.view == {"state": "preparing", "reason": "vpn_stopping", "gate_closed": True}
+    runtime.start.assert_not_called()
+    apply.assert_not_called()

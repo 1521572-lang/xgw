@@ -110,6 +110,8 @@ def _stop_bridges(d) -> bool:
             if remaining:
                 return False
             cleared = {**state, "active": "legacy", "pending": None, "draining": None}
+            if state["active"] in processes.SLOTS:
+                cleared["resume_managed"] = True
             if state != cleared:
                 processes.write(d.paths, cleared)
             d.paths.singbox_config_file.unlink(missing_ok=True)
@@ -133,6 +135,8 @@ def _return_to_vpn(d, now: float) -> State:
         return _publish(d, "stop_failed")
     if not d._standalone_exiting:
         d._standalone_exiting = True
+        d.singbox.sync_generation()
+        d._singbox_resume_at = 0.0
         d.next_refresh = 0
     if not d.stopping:
         changed = d._finish_build()

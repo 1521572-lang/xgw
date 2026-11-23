@@ -227,6 +227,7 @@ def summary(paths):
         "active": state["active"], "draining": old["slot"] if old else None,
         "drain_left_s": max(0, round(old["until"] - time.monotonic())) if old else 0,
         "pending": state["pending"]["phase"] if state["pending"] else None,
+        "resume_managed": state.get("resume_managed") is True,
         "process_limit": 2,
         # Права процесса действующего поколения проверены демоном до переключения (identity).
         "identity_ok": (state.get("identity") or {}).get("slot") == state["active"] or None,

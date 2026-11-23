@@ -62,6 +62,7 @@ REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 START_WAIT = 20
 START_POLL = 2
 STANDALONE_LEASE = 60
+STANDALONE_PREPARING_REASONS = frozenset({"xray_down", "capture_not_ready", "vpn_stopping"})
 TRACED = ("multisplit", "multidisorder")
 _FAKE = "fake:blob=fake_default_tls:{}:repeats=2:tls_mod=rnd,dupsid"
 STRATEGIES = {
@@ -1094,7 +1095,10 @@ class Controller:
                     reason = "apply_failed"
             except (OSError, cmd.CommandError, ValueError):
                 reason = "apply_failed"
-        self.view = {"state": "blocked", "reason": reason, "gate_closed": closed}
+        preparing = (closed and reason in STANDALONE_PREPARING_REASONS
+                     and (cancel is None or not cancel.is_set()))
+        self.view = {"state": "preparing" if preparing else "blocked",
+                     "reason": reason, "gate_closed": closed}
 
     def close(self) -> None:
         if not self.ready and not self.cleanup_pending:

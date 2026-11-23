@@ -115,8 +115,14 @@ def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monk
                         without_vpn=True, config_key=mode)
         return {"ok": True, "config_key": card["config_key"]}
 
-    monkeypatch.setattr(trial, "observations", lambda _client, key, _deadline: iter(
-        [card.copy()] if card["config_key"] == key else []))
+    def observations(_client, key, _deadline):
+        assert card["config_key"] == key
+        if key == "standalone":
+            yield {**card, "state": "blocked", "reason": "vpn_stopping", "without_vpn": False}
+            yield {**card, "state": "preparing", "reason": "nfqueue", "without_vpn": False}
+        yield card.copy()
+
+    monkeypatch.setattr(trial, "observations", observations)
     client = SimpleNamespace(request=request)
     assert trial.start_standalone(client, receipt) == 0
     assert receipt.read_text().strip() == "standalone"
@@ -126,6 +132,23 @@ def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monk
         trial.check_standalone(client, receipt)
     assert trial.disable(client, receipt) == 0
     assert [body.get("mode") for _, body in calls] == [None, "standalone", "off"]
+
+
+def test_standalone_reports_a_terminal_blocker_instead_of_waiting(tmp_path, monkeypatch, capsys):
+    card = {"mode": "off", "state": "off", "engine_mode": "off", "fresh": True,
+            "policy_matched": True, "config_key": "initial", "blockers": {"standalone": []}}
+    monkeypatch.setattr(trial, "overview", lambda _client: card)
+    monkeypatch.setattr(trial, "wait_off", lambda _client, _key: card)
+    monkeypatch.setattr(trial, "update", lambda *_a, **_kw: "new-key")
+
+    def observations(*_a):
+        yield {**card, "mode": "standalone", "state": "blocked", "reason": "queue_busy"}
+        pytest.fail("a terminal block must stop admission")
+
+    monkeypatch.setattr(trial, "observations", observations)
+    with pytest.raises(trial.TrialError, match="standalone_not_ready"):
+        trial.start_standalone(None, tmp_path / "receipt")
+    assert "queue_busy" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(("first_override", "pinned_override", "state", "pinned"), [

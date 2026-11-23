@@ -528,10 +528,11 @@ class _BuildRequest:
     reserve: str | None = None
     profiles: dict[str, str] = dataclasses.field(default_factory=dict)
     callbacks: dict = dataclasses.field(default_factory=dict)
+    resume_singbox: bool = False
 
     def key(self) -> tuple:
         return (tuple(self.prefer) if self.prefer is not None else None,
-                self.urgent, self.reserve, tuple(sorted(self.profiles.items())))
+                self.urgent, self.reserve, tuple(sorted(self.profiles.items())), self.resume_singbox)
 
 
 @dataclasses.dataclass
@@ -708,6 +709,7 @@ class Daemon:
         self._singbox_rolled_back = False
         self._singbox_failed = False
         self._singbox_retry_at = 0.0
+        self._singbox_resume_at = 0.0
         self._singbox_alive = True
         self._singbox_version_cache: tuple[float, str] | None = None
         # Обновление ядер (cores.py): фоновая проверка выпусков на GitHub, когда смотреть
@@ -1453,6 +1455,7 @@ class Daemon:
         self._singbox_rolled_back = previous._singbox_rolled_back
         self._singbox_failed = previous._singbox_failed
         self._singbox_retry_at = previous._singbox_retry_at
+        self._singbox_resume_at = previous._singbox_resume_at
         self._cores_thread = previous._cores_thread
         self._netmon_thread = previous._netmon_thread
         self._resolvers_next = previous._resolvers_next
@@ -3002,7 +3005,7 @@ class Daemon:
     def _rebuild(
         self, prefer: list[str] | None, *, urgent: bool, reason: str,
         reserve: str | None = None, profiles: dict[str, str] | None = None,
-        complete=None,
+        complete=None, resume_singbox: bool = False,
     ) -> bool:
         """Запрос сборки: один поток и один объединённый следующий запрос.
 
@@ -3014,7 +3017,7 @@ class Daemon:
         if self.stopping:
             return False
         request = _BuildRequest(copy.deepcopy(prefer), urgent, reason, reserve,
-                                dict(profiles or {}))
+                                dict(profiles or {}), resume_singbox=resume_singbox)
         request.callbacks.update(complete or {})
         job = self._build
         base = self._build_next
@@ -3030,7 +3033,7 @@ class Daemon:
                 request.prefer if request.prefer is not None else base.prefer,
                 base.urgent or request.urgent, reason,
                 request.reserve if request.reserve is not None else base.reserve,
-                {**base.profiles, **request.profiles}, callbacks,
+                {**base.profiles, **request.profiles}, callbacks, request.resume_singbox,
             )
         if job is not None:
             if not job.discard and request.key() == job.request.key():
@@ -3119,7 +3122,8 @@ class Daemon:
         from .apply import singbox_generation as generations
 
         if (not job.preparation_started and assembly.singbox is not None
-                and generations.needed(self.singbox, assembly.singbox.config)):
+                and generations.needed(self.singbox, assembly.singbox.config,
+                                       resume=job.request.resume_singbox)):
             if not generations.available(self.singbox):
                 self._build = job
                 return False
@@ -5908,6 +5912,13 @@ class Daemon:
         if self._singbox_alive:
             self._singbox_down = 0
             self._singbox_rolled_back = False
+            if (now >= self._singbox_resume_at and self.inventory is not None
+                    and self._build is None and self._build_next is None
+                    and generations.resume_needed(self.singbox)
+                    and generations.available(self.singbox)):
+                self._singbox_resume_at = now + SINGBOX_RETRY
+                return self._rebuild(None, urgent=True, reason="Возврат к поколениям sing-box",
+                                     resume_singbox=True)
             return False
         self._singbox_down += 1
         self.log.warning("sing-box не отвечает (шаг %d)", self._singbox_down)
