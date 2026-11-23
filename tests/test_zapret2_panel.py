@@ -211,6 +211,39 @@ def test_off_and_unconfirmed_stop():
     assert view(cfg, snap)["state"] == "pending"
 
 
+def test_startup_value_requires_the_current_active_worker_and_policy(monkeypatch):
+    monkeypatch.setattr(worker.time, "monotonic_ns", Mock(side_effect=[0, 475_000_000]))
+    cfg, snap = fixture(mode="selective", engine="off", valid_until=NOW + 60)
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(worker.SELECTED_UNIT, cfg.zapret2.queue_num,
+                         policy_key=snap["zapret2_policy_key"])
+    reservation = {"unit": lease.unit, "queue": lease.queue, "generation": lease.generation}
+    snap["zapret2_reservation"] = reservation
+
+    def elapsed():
+        return view(cfg, snap)["evidence"]["worker_start_ms"]
+
+    snap["zapret2_worker_events"] = slot.snapshot()[1]
+    assert elapsed() is None
+    slot.observe_owner(lease, True)
+    history = slot.snapshot()[1]
+    snap["zapret2_worker_events"] = history
+    assert elapsed() == 475
+    for target, field, value in (
+        (reservation, "unit", worker.ENGINE_UNIT), (reservation, "generation", 2),
+        (history["startup"], "queue", lease.queue + 1), (history["startup"], "generation", True),
+        (history["startup"], "policy_key", None), (history["startup"], "elapsed_ms", -1),
+        (snap, "updated", NOW - 120), (snap["zapret2"], "state", "fallback"),
+    ):
+        original = target[field]
+        target[field] = value
+        assert elapsed() is None
+        target[field] = original
+    slot.observe_owner(lease, False)
+    snap["zapret2_worker_events"] = slot.snapshot()[1]
+    assert elapsed() is None
+
+
 @pytest.mark.parametrize("stamp", [None, True, NOW - 91, NOW + 1, float("nan")])
 def test_stale_or_invalid_snapshot_clears_active_profile(stamp):
     cfg, snap = fixture()

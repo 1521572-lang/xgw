@@ -186,6 +186,25 @@ def _queue_losses(snapshot: dict, unit: str, queue: int | None, key: str, now: f
             "queue_dropped": sample["overflow"] + sample["netlink"]}
 
 
+def _worker_start_ms(snapshot: dict, unit: str, queue: int | None, key: str) -> int | None:
+    journal = _record(snapshot.get("zapret2_worker_events"))
+    sample = _record(journal.get("startup"))
+    reservation = _record(snapshot.get("zapret2_reservation"))
+    generation = reservation.get("generation")
+    elapsed = sample.get("elapsed_ms")
+    version = journal.get("version")
+    if (type(version) is int and version == 1 and sample.get("policy_key") == key
+            and queue is not None and type(generation) is int and generation > 0
+            and type(sample.get("generation")) is int
+            and type(sample.get("queue")) is int and type(reservation.get("queue")) is int
+            and all(sample.get(field) == reservation.get(field) == expected
+                    for field, expected in (("unit", unit), ("queue", queue),
+                                            ("generation", generation)))
+            and type(elapsed) is int and 0 <= elapsed <= 3_600_000):
+        return elapsed
+    return None
+
+
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None,
          probe_budget: dict | None = None) -> dict:
     """Always return a card; a worker fault never means that VPN was restored.
@@ -287,9 +306,11 @@ Commands use the same validation as this card; observations remain revision-boun
     trusted = fresh and matched and not invalid
     counters = {"queued_original": None, "queued_reply": None, "queue_dropped": None,
                 "queue_overflow": None, "queue_netlink_dropped": None, "strategy_switches": None}
+    worker_start_ms = None
     if trusted and phase == "active":
         unit = worker.SELECTED_UNIT if source == "selected" else worker.ENGINE_UNIT
         counters.update(_queue_losses(snapshot, unit, queue, key, now))
+        worker_start_ms = _worker_start_ms(snapshot, unit, queue, key)
     transport = ("https_reachable"
                  if trusted and phase == "active" and reason == "youtube_transport_ok"
                  and settings.get("youtube_transport_probe") is True else "unknown")
@@ -364,6 +385,7 @@ Commands use the same validation as this card; observations remain revision-boun
                    "queue": queue if trusted else None},
         "counters": counters,
         "evidence": {"transport": transport, "playback": "not_tested",
+                     "worker_start_ms": worker_start_ms,
                      "transport_probes": transport_rows,
                      "last_transport_ok_at": last_transport_ok_at,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,

@@ -196,6 +196,10 @@ class Jobs:
                             phases = {"policy_apply": policy_ms,
                                       "outcome_wait": elapsed_ms - policy_ms}
                             evidence = view.get("evidence", {})
+                            worker_start_ms = evidence.get("worker_start_ms")
+                            if (view["state"] == "active" and type(worker_start_ms) is int
+                                    and 0 <= worker_start_ms <= elapsed_ms):
+                                phases["worker_start"] = worker_start_ms
                             row["results"].append({
                                 "round": round_id + 1, "candidate": profile,
                                 "state": view["state"], "reason": view["reason"],

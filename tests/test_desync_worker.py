@@ -116,6 +116,8 @@ def test_active_peer_unit_is_not_taken_over_after_daemon_restart(monkeypatch):
 
 @pytest.mark.parametrize("module", [zapret2, nfqws2])
 def test_clients_record_only_owner_transitions_for_their_lease(monkeypatch, module):
+    clock = Mock(side_effect=[1_000_000_000, 1_275_000_000, 4_000_000_000])
+    monkeypatch.setattr(worker.time, "monotonic_ns", clock)
     slot = worker.WorkerSlot()
     runner = Mock(return_value="active")
     runtime = module.Runtime(runner, slot=slot)
@@ -129,17 +131,44 @@ def test_clients_record_only_owner_transitions_for_their_lease(monkeypatch, modu
     verify = Mock(side_effect=[None, owner, owner, None])
     monkeypatch.setattr(worker, "owner_sample", verify)
 
-    assert [runtime.alive(201) for _ in range(4)] == [False, True, True, False]
+    assert not runtime.alive(201)
+    assert slot.snapshot()[1]["startup"] is None
+    assert runtime.alive(201)
+    startup = slot.snapshot()[1]["startup"]
+    assert startup == {"unit": module.UNIT, "queue": 201, "generation": lease.generation,
+                       "policy_key": key, "elapsed_ms": 275}
+    assert runtime.alive(201) and slot.snapshot()[1]["startup"] == startup
+    assert not runtime.alive(201) and slot.snapshot()[1]["startup"] is None
     slot.release(lease)
     newer = slot.reserve(module.UNIT, 201)
     assert not slot.observe_owner(lease, True)
     assert not runtime.alive(201)
     assert slot.snapshot()[0] is newer
     _, history = slot.snapshot()
+    assert history["startup"] is None
     assert [event["phase"] for event in history["events"]] == [
         "reserved", "owner_verified", "owner_unverified", "released", "reserved"]
     assert {event["policy_key"] for event in history["events"][:-1]} == {key}
     assert [event["generation"] for event in history["events"]] == [1, 1, 1, 1, 2]
+
+
+def test_worker_start_is_first_verification_within_each_reservation(monkeypatch):
+    clock = Mock(side_effect=[0, 14_000_000, 60_000_000, 137_000_000])
+    monkeypatch.setattr(worker.time, "monotonic_ns", clock)
+    slot = worker.WorkerSlot()
+    lease = slot.reserve(worker.SELECTED_UNIT, 201)
+    assert slot.observe_owner(lease, True)
+    assert slot.snapshot()[1]["startup"]["elapsed_ms"] == 14
+    slot.observe_owner(lease, False)
+    assert slot.snapshot()[1]["startup"] is None
+    assert slot.observe_owner(lease, True)
+    assert slot.snapshot()[1]["startup"]["elapsed_ms"] == 14
+    slot.release(lease)
+    assert slot.snapshot()[1]["startup"] is None
+    next_lease = slot.reserve(worker.SELECTED_UNIT, 201)
+    assert not slot.observe_owner(lease, True)
+    assert slot.observe_owner(next_lease, True)
+    assert slot.snapshot()[1]["startup"]["elapsed_ms"] == 77
 
 
 def test_queue_counters_record_only_deltas_with_continuous_owner():

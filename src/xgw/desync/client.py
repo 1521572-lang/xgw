@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
 
-MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm")
+MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm", "worker_start")
 
 
 class _HTTPFailure(ValueError):
@@ -224,6 +224,9 @@ def matrix_report(path):
                     or phases["policy_apply"] + phases["outcome_wait"] != recorded_elapsed):
                 phases.pop("policy_apply", None)
                 phases.pop("outcome_wait", None)
+            if (state != "active" or recorded_elapsed is None
+                    or phases.get("worker_start", 0) > recorded_elapsed):
+                phases.pop("worker_start", None)
             if phases:
                 outcome["phase_ms"] = phases
         results[profile].append(outcome)
@@ -301,12 +304,14 @@ def matrix_replay(report: dict) -> dict:
             metrics = dict(sample.get("phase_ms", {}))
             if "elapsed_ms" in sample:
                 metrics["attempt"] = sample["elapsed_ms"]
+                if "worker_start" in metrics:
+                    metrics["attempt_with_worker_start"] = sample["elapsed_ms"]
             for target, probe in sample["probes"].items():
                 if probe["elapsed_ms"] is not None:
                     metrics[f"{target}_probe"] = probe["elapsed_ms"]
             for name, value in metrics.items():
                 timings[index].setdefault(name, []).append(value)
-    measures = ("attempt", *MATRIX_PHASES, "page_probe", "cdn_probe")
+    measures = ("attempt", *MATRIX_PHASES, "attempt_with_worker_start", "page_probe", "cdn_probe")
     result = {
         "ok": report["ok"], "expected_rows": report["expected_rows"],
         "observed_rows": report["observed_rows"], "full_matrix": report["full_matrix"],

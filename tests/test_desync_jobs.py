@@ -63,9 +63,11 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
     rows[4].update(state="timeout", transport="unknown", reason="trial_timeout",
                    wait_stage="status_stale", probes={},
                    phase_ms={"policy_apply": 700, "outcome_wait": 8300, "off_confirm": 1000,
-                             "raw_args": "private_phase"})
-    rows[5]["phase_ms"] = {"policy_apply": 10, "outcome_wait": 20, "off_confirm": 0}
-    rows[6]["phase_ms"] = {"policy_apply": False, "outcome_wait": 4000, "off_confirm": -1}
+                             "worker_start": 17, "raw_args": "private_phase"})
+    rows[5]["phase_ms"] = {"policy_apply": 10, "outcome_wait": 20, "off_confirm": 0,
+                           "worker_start": 88}
+    rows[6]["phase_ms"] = {"policy_apply": False, "outcome_wait": 4000, "off_confirm": -1,
+                           "worker_start": 9999}
     rows[7].update(state="fallback", transport="unknown", reason="youtube_page_probe_failed",
                    probes={"page": {"ok": False, "phase": "tls", "kind": "timeout",
                                     "bytes": 0, "url": "private_url"}})
@@ -87,6 +89,8 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
         "policy_apply": {"samples": 1, "total_ms": 700},
         "outcome_wait": {"samples": 1, "total_ms": 8300},
         "off_confirm": {"samples": 2, "total_ms": 1000},
+        "worker_start": {"samples": 1, "total_ms": 88},
+        "attempt_with_worker_start": {"samples": 1, "total_ms": 5000},
         "page_probe": {"samples": 0, "total_ms": None},
         "cdn_probe": {"samples": 0, "total_ms": None},
     }
@@ -381,7 +385,10 @@ def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeyp
             advance(4.5)
         else:
             advance(1.25)
-        return original_wait(row, states, deadline, **kwargs)
+        view = original_wait(row, states, deadline, **kwargs)
+        if view["state"] == "active":
+            view["evidence"]["worker_start_ms"] = 180 if len(trials) == 2 else 99999
+        return view
 
     monkeypatch.setattr(instance, "_transition", transition)
     monkeypatch.setattr(instance, "_wait", wait)
@@ -396,8 +403,9 @@ def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeyp
         "policy_apply": 250, "outcome_wait": 95000, "off_confirm": 1750,
     }
     assert result["results"][1]["phase_ms"] == {
-        "policy_apply": 250, "outcome_wait": 4500, "off_confirm": 1750,
+        "policy_apply": 250, "outcome_wait": 4500, "off_confirm": 1750, "worker_start": 180,
     }
+    assert "worker_start" not in result["results"][2]["phase_ms"]
     assert instance._policy()[1] == policy
 
 

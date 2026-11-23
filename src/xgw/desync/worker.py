@@ -55,6 +55,8 @@ class WorkerSlot:
         self._epoch = uuid.uuid4().hex
         self._seq = 0
         self._verified = False
+        self._reserved_ns = 0
+        self._startup_ms: int | None = None
         self._policy_key: str | None = None
         self._fault_checked = False
         self._queue_sample: QueueOwner | None = None
@@ -68,6 +70,8 @@ class WorkerSlot:
             self._generation += 1
             self.lease = Lease(self._generation, unit, queue)
             self._verified = False
+            self._reserved_ns = time.monotonic_ns()
+            self._startup_ms = None
             self._policy_key = policy_key
             self._fault_checked = False
             self._event("reserved", self.lease)
@@ -79,6 +83,8 @@ class WorkerSlot:
                 return False
             if self._verified != verified:
                 self._verified = verified
+                if verified and self._startup_ms is None:
+                    self._startup_ms = (time.monotonic_ns() - self._reserved_ns) // 1_000_000
                 self._event("owner_verified" if verified else "owner_unverified", lease)
             previous = self._queue_sample
             self._queue_sample = None
@@ -127,6 +133,10 @@ class WorkerSlot:
 
     def snapshot(self) -> tuple[Lease | None, dict]:
         with self._lock:
+            startup = None
+            if self.lease is not None and self._verified and self._startup_ms is not None:
+                startup = {**asdict(self.lease), "policy_key": self._policy_key,
+                           "elapsed_ms": self._startup_ms}
             counters = None
             if self.lease is not None and self._queue_sample is not None:
                 overflow, netlink, _ = self._queue_sample.counters
@@ -138,7 +148,7 @@ class WorkerSlot:
                 "version": 1, "epoch": self._epoch, "last_seq": self._seq,
                 "discarded": self._seq - len(self._events),
                 "events": [dict(event) for event in self._events],
-                "queue_counters": counters,
+                "queue_counters": counters, "startup": startup,
             }
 
 

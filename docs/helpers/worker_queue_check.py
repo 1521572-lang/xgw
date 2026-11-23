@@ -121,6 +121,22 @@ def run(folder):
     service.start()
     frame = b'{"version":1,"epoch":null,"after":0}\n'
     slot = worker.WorkerSlot()
+    selected = Config()
+    selected.zapret2.mode = "selective"
+    selected.zapret2.queue_num = QUEUE
+    selected_key = worker.policy_revision(selected.zapret2)
+
+    def start_ms(lease):
+        now = time.time()
+        snapshot = {
+            "daemon": True, "updated": now, "zapret2_policy_key": selected_key,
+            "zapret2_reservation": asdict(lease), "zapret2_worker_events": slot.snapshot()[1],
+            "capture": {"loaded": True},
+            "zapret2": {"state": "active", "valid_until": now + 10},
+        }
+        return card(selected, snapshot, {"mode": "on"}, True, now=now)["evidence"][
+            "worker_start_ms"
+        ]
 
     def read():
         snapshot = {"daemon": True, "updated": time.time(),
@@ -136,7 +152,8 @@ def run(folder):
 
     try:
         for count in (1, 2):
-            lease = slot.reserve(worker.ENGINE_UNIT, QUEUE)
+            lease = slot.reserve(worker.SELECTED_UNIT, QUEUE, policy_key=selected_key)
+            require(start_ms(lease) is None, "startup_before_listener")
             with (folder / f"worker-{count}.log").open("xb") as log:
                 proc = subprocess.Popen(
                     [str(BINARY), "--intercept=1", f"--qnum={QUEUE}", "--uid=65534:65534",
@@ -154,6 +171,10 @@ def run(folder):
                     time.sleep(0.05)
                 require(sample.counters == (0, 0, 0), "kernel_counter_layout")
                 slot.observe_owner(lease, True, sample)
+                elapsed = start_ms(lease)
+                require(type(elapsed) is int and 0 <= elapsed <= 6_000, "startup_proof")
+                slot.observe_owner(lease, True, sample)
+                require(start_ms(lease) == elapsed, "startup_moved_after_repeat")
                 initial = read()
                 counters = initial.get("queue_counters")
                 require(initial["state"] == "snapshot" and isinstance(counters, dict)
@@ -165,6 +186,7 @@ def run(folder):
             absent = worker.owner_sample(lambda *_a, **_kw: str(proc.pid), lease.unit, QUEUE)
             require(absent is None and not worker.occupied(QUEUE), "listener_still_present")
             slot.observe_owner(lease, False)
+            require(start_ms(lease) is None, "startup_after_listener_loss")
             lost = read()
             require(lost["state"] == "snapshot" and lost["queue_counters"] is None
                     and lost["events"][-1]["phase"] == "owner_unverified"
@@ -172,7 +194,8 @@ def run(folder):
                     "socket_listener_loss")
             slot.release(lease)
             print(json.dumps({"generation": count, "kernel_counters": [0, 0],
-                              "event_socket": "ok", "after_listener_loss": None}), flush=True)
+                              "event_socket": "ok", "worker_start_ms": elapsed,
+                              "after_listener_loss": None}), flush=True)
         cfg = Config()
         cfg.zapret2.engine = "auto"
         key = worker.policy_revision(cfg.zapret2)
