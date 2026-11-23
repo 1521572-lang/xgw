@@ -40,6 +40,82 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
         client.matrix_report(path)
 
 
+def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
+    tmp_path, monkeypatch, capsys,
+):
+    first, second, third, fourth = jobs.CANDIDATES[:4]
+    candidates = [first, second, third, fourth]
+    rows = [
+        {"round": n, "candidate": candidate, "state": "active",
+         "transport": "https_reachable", "elapsed_ms": cost,
+         "probes": {"page": {"ok": True, "bytes": 20000}}}
+        for n, names, costs in ((1, candidates, [5000, 4000, 7000, 1000]),
+                                (2, reversed(candidates), [9000, 5000, 4000, 10000]))
+        for candidate, cost in zip(names, costs, strict=True)
+    ]
+    rows[1].update(state="fallback", transport="unknown", reason="youtube_cdn_expired")
+    rows[3].update(state="fallback", transport="unknown", reason="youtube_cdn_probe_failed",
+                   probes={"page": {"ok": True},
+                           "cdn": {"ok": False, "phase": "body", "kind": "stall", "bytes": 16384}})
+    rows[4].update(state="timeout", transport="unknown", reason="trial_timeout",
+                   wait_stage="status_stale", probes={})
+    rows[7].update(state="fallback", transport="unknown", reason="youtube_page_probe_failed",
+                   probes={"page": {"ok": False, "phase": "tls", "kind": "timeout",
+                                    "bytes": 0, "url": "private_url"}})
+    job = {"id": "b" * 32, "state": "complete", "restore": "pass",
+           "candidates": candidates, "rounds": 2, "results": rows}
+    path = tmp_path / "saved.json"
+    path.write_text(json.dumps({"job": job, "url": "private_url"}))
+    report = client.matrix_replay(client.matrix_report(path))
+    assert report["outcomes_by_round"] == {
+        1: {"https_pass": 2, "expired_cdn_url": 1, "body_stall": 1},
+        2: {"https_pass": 2, "tls_timeout": 1, "control_wait_timeout": 1},
+    }
+    baseline, proposed = (report["replay"][key] for key in ("recorded", "prior_round_order"))
+    assert baseline["order"] == candidates[::-1]
+    assert proposed["order"] == [first, third, fourth, second]
+    assert baseline["first_pass_ms"] == 14000 and proposed["first_pass_ms"] == 15000
+    assert baseline["full_attempt_ms"] == proposed["full_attempt_ms"] == 28000
+    assert baseline["untried_https_passes"] == proposed["untried_https_passes"] == [second]
+    assert proposed["observed_probe_bytes_if_stop_after_pass"] == 20000
+    assert proposed["attempts_with_byte_samples"] == 2
+    assert report["endpoint_context"] == "NOT_VERIFIED" and report["apply"] is False
+    assert "job_id" not in report and "private_url" not in json.dumps(report)
+
+    def network_access():
+        pytest.fail("offline replay must not create an HTTP client")
+
+    monkeypatch.setattr(client, "Client", network_access)
+    monkeypatch.setattr(sys, "argv", ["xgw.desync.client", "matrix", str(path), "--replay"])
+    assert client.main() == 0
+    assert json.loads(capsys.readouterr().out)["replay"] == report["replay"]
+
+    del rows[7]["elapsed_ms"]
+    path.write_text(json.dumps(job))
+    missing = client.matrix_replay(client.matrix_report(path))["replay"]
+    assert missing["prior_round_order"]["first_pass_ms"] is None
+    assert missing["recorded"]["first_pass_ms"] == 14000
+    assert missing["prior_round_order"]["first_pass_attempt"] == 2
+
+    job["results"] = rows[:-1]
+    path.write_text(json.dumps(job))
+    partial = client.matrix_replay(client.matrix_report(path))
+    assert not partial["ok"] and partial["replay"]["state"] == "two_complete_rounds_required"
+
+
+def test_matrix_replay_does_not_guess_expiry_or_transport_failure_without_evidence():
+    row = {"round": 1, "state": "fallback", "https_ok": False,
+           "reason": "youtube_cdn_probe_failed", "probes": {}}
+    assert client._matrix_outcome(row) == "probe_details_unavailable"
+    for kind, phase, expected in (
+        ("http", "headers", "http_or_proxy_failure"),
+        ("truncated", "body", "body_interrupted"),
+        ("cancelled", "request", "probe_cancelled"),
+    ):
+        probe = {"ok": False, "phase": phase, "kind": kind, "http": 403}
+        assert client._matrix_outcome(row | {"probes": {"cdn": probe}}) == expected
+
+
 @pytest.fixture
 def job_store(tmp_path, monkeypatch):
     if sys.platform == "win32":

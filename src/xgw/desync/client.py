@@ -181,7 +181,8 @@ def matrix_report(path):
         raise ValueError("matrix_job")
     profiles, rounds, rows = job.get("candidates"), job.get("rounds"), job.get("results")
     if (not isinstance(profiles, list) or not 1 <= len(profiles) <= len(CANDIDATES)
-            or any(p not in CANDIDATES for p in profiles) or len(set(profiles)) != len(profiles)
+            or any(not isinstance(p, str) or p not in CANDIDATES for p in profiles)
+            or len(set(profiles)) != len(profiles)
             or type(rounds) is not int or rounds not in (1, 2) or not isinstance(rows, list)):
         raise ValueError("matrix_schedule")
     schedule = [(n + 1, p) for n in range(rounds) for p in profiles[::1 if n == 0 else -1]]
@@ -189,6 +190,7 @@ def matrix_report(path):
         raise ValueError("extra_rows")
     counts = Counter()
     results = {p: [] for p in profiles}
+    now = time.time()
     for row, (n, profile) in zip(rows, schedule, strict=False):
         if (not isinstance(row, dict) or type(row.get("round")) is not int
                 or (row["round"], row.get("candidate")) != (n, profile)
@@ -202,7 +204,7 @@ def matrix_report(path):
         outcome = {
             "round": n, "state": state, "reason": reason,
             "https_ok": state == "active" and row.get("transport") == "https_reachable",
-            "probes": transport_probes(row.get("probes"), now=time.time()),
+            "probes": transport_probes(row.get("probes"), now=now),
         }
         stage = row.get("wait_stage")
         if state == "timeout" and stage in WAIT_STAGES:
@@ -219,6 +221,95 @@ def matrix_report(path):
             "observed_rows": len(rows), "states": dict(counts), "profiles": results,
             "full_matrix": complete and rounds == 2 and len(profiles) == len(CANDIDATES),
             "two_https_pass": passed_twice, "playback": "NOT_MEASURED"}
+
+
+def _matrix_outcome(row: dict) -> str:
+    from ..zapret2 import CDN_EXPIRED
+
+    reason = row["reason"]
+    if row["https_ok"]:
+        return "https_pass"
+    if reason == CDN_EXPIRED:
+        return "expired_cdn_url"
+    if row["state"] == "timeout":
+        if row.get("wait_stage") in ("status_stale", "policy_pending", "matched_other", "no_sample"):
+            return "control_wait_timeout"
+        return "trial_timeout"
+    target = {"youtube_page_probe_failed": "page", "youtube_cdn_probe_failed": "cdn"}.get(reason)
+    probe = row["probes"].get(target)
+    if not probe or probe["ok"]:
+        return "probe_details_unavailable" if target else "other_unconfirmed"
+    phase, kind = probe["phase"], probe["kind"]
+    if phase == "tls":
+        return "tls_timeout" if kind == "timeout" else "tls_failure"
+    if phase == "body" and kind in ("stall", "timeout", "truncated", "reset"):
+        return "body_stall" if kind in ("stall", "timeout") else "body_interrupted"
+    if kind in ("http", "proxy"):
+        return "http_or_proxy_failure"
+    if kind == "cancelled":
+        return "probe_cancelled"
+    return "probe_failure_other"
+
+
+def _prefix_score(order: list[str], holdout: dict) -> dict:
+    """Measure a hypothetical first-success stop using only held-out costs and outcomes."""
+    hits = [i for i, candidate in enumerate(order, 1) if holdout[candidate]["https_ok"]]
+    first = hits[0] if hits else None
+    prefix = order[:first]
+
+    def total(candidates: list[str]) -> int | None:
+        costs = [holdout[name].get("elapsed_ms") for name in candidates]
+        return None if None in costs else sum(costs)
+
+    body_sizes = [[probe["bytes"] for probe in holdout[name]["probes"].values()
+                   if probe["bytes"] is not None] for name in prefix]
+    return {
+        "order": order, "full_attempt_ms": total(order),
+        "first_pass_attempt": first, "first_pass_ms": total(prefix) if first else None,
+        "attempts_if_stop_after_pass": len(prefix),
+        "attempt_ms_if_stop_after_pass": total(prefix),
+        "observed_probe_bytes_if_stop_after_pass": sum(sum(sizes) for sizes in body_sizes)
+        if any(body_sizes) else None,
+        "attempts_with_byte_samples": sum(bool(sizes) for sizes in body_sizes),
+        "untried_https_passes": [order[i - 1] for i in hits[1:]],
+    }
+
+
+def matrix_replay(report: dict) -> dict:
+    """Compare a prior-round order on recorded HTTPS trials. No change to gateway policy."""
+    profiles = report["profiles"]
+    outcomes: dict[int, Counter] = {1: Counter(), 2: Counter()}
+    for runs in profiles.values():
+        for sample in runs:
+            outcomes[sample["round"]][_matrix_outcome(sample)] += 1
+    result = {
+        "ok": report["ok"], "expected_rows": report["expected_rows"],
+        "observed_rows": report["observed_rows"], "full_matrix": report["full_matrix"],
+        "outcomes_by_round": {n: dict(counts) for n, counts in outcomes.items()},
+        "replay": {"state": "two_complete_rounds_required"},
+        "endpoint_context": "NOT_VERIFIED", "playback": "NOT_MEASURED", "apply": False,
+    }
+    if not report["ok"] or not all(len(runs) == 2 for runs in profiles.values()):
+        return result
+    baseline = list(reversed(profiles))
+    training = {name: runs[0] for name, runs in profiles.items()}
+    holdout = {name: runs[1] for name, runs in profiles.items()}
+
+    def rank(name: str) -> tuple[bool, float]:
+        prior = training[name]
+        # Unknown or unsuccessful trials stay in the original relative order.
+        if prior["https_ok"]:
+            return False, prior.get("elapsed_ms", float("inf"))
+        return True, float("inf")
+
+    proposed = sorted(baseline, key=rank)
+    result["replay"] = {
+        "state": "descriptive", "training_round": 1, "held_out_round": 2,
+        "training_https_passes": sum(row["https_ok"] for row in training.values()),
+        "recorded": _prefix_score(baseline, holdout),
+        "prior_round_order": _prefix_score(proposed, holdout),
+    }
+    return result
 
 
 def main():
@@ -243,11 +334,14 @@ def main():
     review.add_argument("input", type=Path)
     matrix = sub.add_parser("matrix", help="Summarize one saved job without contacting the gateway")
     matrix.add_argument("input", type=Path)
+    matrix.add_argument("--replay", action="store_true", help="Compare a prior-round order offline")
     args = parser.parse_args()
     try:
         client = None if args.action in ("analyze", "matrix") else Client()
         if args.action == "matrix":
             result = matrix_report(args.input)
+            if args.replay:
+                result = matrix_replay(result)
         elif args.action == "analyze":
             result = analyze(args.input)
         elif args.action == "monitor":
@@ -285,7 +379,7 @@ def main():
                 result = client.request("/api/zapret2/" + action, body)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("ok", True) else 2
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as exc:
+    except (OSError, ValueError, KeyError, RecursionError, http.client.HTTPException) as exc:
         if args.action == "matrix":
             print(json.dumps({"ok": False, "error": "invalid_or_missing_job_snapshot"}))
             return 2
