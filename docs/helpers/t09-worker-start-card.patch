@@ -1,0 +1,24 @@
+--- a/src/xgw/watch/zapret2_control.py
++++ b/src/xgw/watch/zapret2_control.py
+@@ -223,6 +223,13 @@
+     queue = raw.get("queue") if source == "engine" else settings["queue_num"]
+     queue = queue if type(queue) is int and 1 <= queue <= 65535 else None
+     trusted = fresh and matched and not invalid
++    worker_start_ms = None
++    if trusted and phase == "active":
++        unit = worker.SELECTED_UNIT if source == "selected" else worker.ENGINE_UNIT
++        worker_start_ms = worker.startup_duration(
++            snapshot.get("zapret2_worker_events"), snapshot.get("zapret2_reservation"),
++            unit, queue, key,
++        )
+     transport = ("https_reachable"
+                  if trusted and phase == "active" and reason == "youtube_transport_ok"
+                  and settings.get("youtube_transport_probe") is True else "unknown")
+@@ -278,6 +285,7 @@
+         "counters": {"queued_original": None, "queued_reply": None,
+                      "queue_dropped": None, "strategy_switches": None},
+         "evidence": {"transport": transport, "playback": "not_tested",
++                     "worker_start_ms": worker_start_ms,
+                      "transport_probes": transport_rows,
+                      "last_transport_ok_at": last_transport_ok_at,
+                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,

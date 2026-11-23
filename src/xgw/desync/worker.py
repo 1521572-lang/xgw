@@ -210,6 +210,28 @@ def current_queue_counters(journal: object, now: float) -> dict | None:
     return {key: value[key] for key in COUNTER_FIELDS}
 
 
+def startup_duration(journal: object, reservation: object, unit: str, queue: int | None,
+                     policy_key: str) -> int | None:
+    """Project a duration only for the current worker identity and revision."""
+    if not isinstance(journal, dict) or not isinstance(reservation, dict):
+        return None
+    version, sample = journal.get("version"), journal.get("startup")
+    if type(version) is not int or version != 1 or not isinstance(sample, dict):
+        return None
+    generation = reservation.get("generation")
+    elapsed = sample.get("elapsed_ms")
+    if (sample.get("policy_key") == policy_key
+            and queue is not None and type(generation) is int and generation > 0
+            and all(type(row.get(field)) is int for field in ("queue", "generation")
+                    for row in (sample, reservation))
+            and all(sample.get(field) == reservation.get(field) == expected
+                    for field, expected in (("unit", unit), ("queue", queue),
+                                            ("generation", generation)))
+            and type(elapsed) is int and 0 <= elapsed <= 3_600_000):
+        return elapsed
+    return None
+
+
 def occupied(queue: int, path: Path = QUEUE_STATE) -> bool:
     try:
         return any(fields and fields[0] == str(queue)

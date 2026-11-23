@@ -85,6 +85,8 @@ SELECTIVE_RANGE = ("zapret2.py", "desync/jobs.py", "desync/client.py")
 SELECTIVE_RANGE_TIMER = "xgw-selective-range-rollback.timer"
 SELECTIVE_STARTUP = (*SELECTIVE_RANGE, "watch/zapret2_control.py", "daemon.py")
 SELECTIVE_STARTUP_TIMER = "xgw-selective-startup-rollback.timer"
+SELECTIVE_WORKER_TIMING = ("desync/worker.py", "desync/jobs.py", "watch/zapret2_control.py")
+SELECTIVE_WORKER_TIMING_TIMER = "xgw-selective-worker-timing-rollback.timer"
 SELECTIVE_CDN_UPDATE = ("watch/zapret2_management.py", "watch/zapret2_control.py",
                         "ui/zapret2.html", "ui/zapret2.js")
 SELECTIVE_CDN_UPDATE_TIMER = "xgw-selective-cdn-update-rollback.timer"
@@ -286,6 +288,8 @@ def apply(backup, rows, timer=TIMER, *, reload_net=False):
 
 
 def overlay(args):
+    if getattr(args, "selective_worker_timing", False):
+        return SELECTIVE_WORKER_TIMING, SELECTIVE_WORKER_TIMING_TIMER
     if getattr(args, "watchdog_scan_deadline", False):
         return WATCHDOG_WAKE, WATCHDOG_SCAN_DEADLINE_TIMER
     if getattr(args, "watchdog_wan_dns", False):
@@ -396,6 +400,7 @@ def main():
     stage.add_argument("--combined-admission", action="store_true")
     stage.add_argument("--selective-range", action="store_true")
     stage.add_argument("--selective-startup", action="store_true")
+    stage.add_argument("--selective-worker-timing", action="store_true")
     stage.add_argument("--selective-cdn-update", action="store_true")
     stage.add_argument("--xray-write-trace", action="store_true")
     stage.add_argument("--selective-route-status", action="store_true")
@@ -425,7 +430,7 @@ def main():
             rows = records(backup, files)
             reload_net = files == COMBINED_ADMISSION
             if args.action == "apply":
-                if files in (PIN_AUDIT, WATCHDOG_WAKE):
+                if files in (PIN_AUDIT, WATCHDOG_WAKE, SELECTIVE_WORKER_TIMING):
                     require_idle_workers()
                 apply(backup, rows, timer, reload_net=reload_net)
             else:
