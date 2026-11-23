@@ -34,7 +34,7 @@ git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 D=$(mktemp -d "$HOME/xgw-standalone-return.XXXXXXXX")
 printf 'STANDALONE_RETURN_CODE %s\nPRIVATE_ARTIFACTS %s\n' "$CODE" "$D"
 mkdir "$D/tree"
-git -C "$REPO" archive "$CODE" src tests docs/helpers vpn_ui pyproject.toml |
+git -C "$REPO" archive "$CODE" src tests docs/helpers packaging vpn_ui pyproject.toml |
   tar -x -C "$D/tree"
 cd "$D/tree"
 export PYTHONPATH="$D/tree:$D/tree/src:$D/tree/tests"
@@ -123,7 +123,7 @@ BASH
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=21382ec00b90dac4a7521addae3f59fc8ecc4721
+CODE=df78d57e971b9d693d799123cd4692d41e2ace60
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin "$BR"
 git merge-base --is-ancestor "$CODE" FETCH_HEAD
@@ -133,7 +133,8 @@ BASH
 
 Ожидается `STANDALONE_OVERLAY_COPY_PATCHED` либо
 `STANDALONE_OVERLAY_ALREADY_PRESENT`, затем `STANDALONE_OVERLAY_COPY_COMPILES`,
-22 контракта статуса и один контракт возврата на копии. Финальная метка
+6 контрактов статуса и один контракт возврата на копии. Хелпер панели
+проверяется в разделе 1 на полном дереве с его зависимостями. Финальная метка
 `STANDALONE_OVERLAY_INSTALLED_UNCHANGED` подтверждает, что пять
 установленных файлов совпали. При `STANDALONE_OVERLAY_CONTEXT_MISMATCH`
 укажи имя файла и обезличенную причину. Патч и установленный пакет
