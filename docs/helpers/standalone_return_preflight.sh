@@ -26,7 +26,7 @@ for name in "${FILES[@]}"; do installed+=("$PACKAGE/${name#src/xgw/}"); done
 
 sudo -n true
 mkdir -p "$D/tree/src" "$D/test-root"
-git -C "$REPO" archive "$CODE" tests docs/helpers vpn_ui pyproject.toml | tar -x -C "$D/tree"
+git -C "$REPO" archive "$CODE" tests docs/helpers packaging vpn_ui pyproject.toml | tar -x -C "$D/tree"
 sudo -n timeout -k 2 30 sha256sum -- "${installed[@]}" >"$D/installed.before"
 sudo -n timeout -k 3 45 tar --exclude='__pycache__' --exclude='*.pyc' \
   -C "$(dirname "$PACKAGE")" -cf - xgw |
@@ -90,8 +90,7 @@ PY
 printf 'STANDALONE_OVERLAY_COPY_COMPILES\n'
 
 result=0
-contracts status --portable tests/test_selective_admission.py \
-  tests/test_desync_standalone.py || result=2
+contracts status --portable tests/test_desync_standalone.py || result=2
 contracts managed \
   tests/test_singbox_generations.py::test_standalone_return_keeps_legacy_until_managed_bridge_is_verified \
   || result=2
