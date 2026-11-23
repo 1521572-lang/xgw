@@ -12,7 +12,9 @@ from collections import Counter
 from itertools import pairwise
 from pathlib import Path
 
-from .jobs import ACTIVE, CANDIDATES, WAIT_STAGES
+from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
+
+MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm")
 
 
 class _HTTPFailure(ValueError):
@@ -210,8 +212,20 @@ def matrix_report(path):
         if state == "timeout" and stage in WAIT_STAGES:
             outcome["wait_stage"] = stage
         elapsed = row.get("elapsed_ms")
-        if type(elapsed) is int and 0 <= elapsed <= 3_600_000:
+        if type(elapsed) is int and 0 <= elapsed <= MAX_SECONDS * 1000:
             outcome["elapsed_ms"] = elapsed
+        phase_fields = row.get("phase_ms")
+        if isinstance(phase_fields, dict):
+            phases = {key: phase_fields[key] for key in MATRIX_PHASES if (
+                type(phase_fields.get(key)) is int and 0 <= phase_fields[key] <= MAX_SECONDS * 1000
+            )}
+            recorded_elapsed = outcome.get("elapsed_ms")
+            if ("policy_apply" not in phases or "outcome_wait" not in phases
+                    or phases["policy_apply"] + phases["outcome_wait"] != recorded_elapsed):
+                phases.pop("policy_apply", None)
+                phases.pop("outcome_wait", None)
+            if phases:
+                outcome["phase_ms"] = phases
         results[profile].append(outcome)
     complete = (len(rows) == len(schedule) and job.get("state") == "complete"
                 and job.get("restore") == "pass")
@@ -279,13 +293,29 @@ def matrix_replay(report: dict) -> dict:
     """Compare a prior-round order on recorded HTTPS trials. No change to gateway policy."""
     profiles = report["profiles"]
     outcomes: dict[int, Counter] = {1: Counter(), 2: Counter()}
+    timings: dict[int, dict[str, list[int]]] = {1: {}, 2: {}}
     for runs in profiles.values():
         for sample in runs:
-            outcomes[sample["round"]][_matrix_outcome(sample)] += 1
+            index = sample["round"]
+            outcomes[index][_matrix_outcome(sample)] += 1
+            metrics = dict(sample.get("phase_ms", {}))
+            if "elapsed_ms" in sample:
+                metrics["attempt"] = sample["elapsed_ms"]
+            for target, probe in sample["probes"].items():
+                if probe["elapsed_ms"] is not None:
+                    metrics[f"{target}_probe"] = probe["elapsed_ms"]
+            for name, value in metrics.items():
+                timings[index].setdefault(name, []).append(value)
+    measures = ("attempt", *MATRIX_PHASES, "page_probe", "cdn_probe")
     result = {
         "ok": report["ok"], "expected_rows": report["expected_rows"],
         "observed_rows": report["observed_rows"], "full_matrix": report["full_matrix"],
         "outcomes_by_round": {n: dict(counts) for n, counts in outcomes.items()},
+        "two_https_pass": report["two_https_pass"],
+        "timing_by_round": {n: {
+            name: {"samples": len(metrics.get(name, [])),
+                   "total_ms": sum(metrics[name]) if name in metrics else None}
+            for name in measures} for n, metrics in timings.items()},
         "replay": {"state": "two_complete_rounds_required"},
         "endpoint_context": "NOT_VERIFIED", "playback": "NOT_MEASURED", "apply": False,
     }

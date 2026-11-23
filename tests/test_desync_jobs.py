@@ -2,6 +2,7 @@
 import json
 import sys
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,11 +55,17 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
         for candidate, cost in zip(names, costs, strict=True)
     ]
     rows[1].update(state="fallback", transport="unknown", reason="youtube_cdn_expired")
+    rows[0]["probes"]["page"]["elapsed_ms"] = 210
     rows[3].update(state="fallback", transport="unknown", reason="youtube_cdn_probe_failed",
                    probes={"page": {"ok": True},
-                           "cdn": {"ok": False, "phase": "body", "kind": "stall", "bytes": 16384}})
+                           "cdn": {"ok": False, "phase": "body", "kind": "stall",
+                                   "bytes": 16384, "elapsed_ms": 307}})
     rows[4].update(state="timeout", transport="unknown", reason="trial_timeout",
-                   wait_stage="status_stale", probes={})
+                   wait_stage="status_stale", probes={},
+                   phase_ms={"policy_apply": 700, "outcome_wait": 8300, "off_confirm": 1000,
+                             "raw_args": "private_phase"})
+    rows[5]["phase_ms"] = {"policy_apply": 10, "outcome_wait": 20, "off_confirm": 0}
+    rows[6]["phase_ms"] = {"policy_apply": False, "outcome_wait": 4000, "off_confirm": -1}
     rows[7].update(state="fallback", transport="unknown", reason="youtube_page_probe_failed",
                    probes={"page": {"ok": False, "phase": "tls", "kind": "timeout",
                                     "bytes": 0, "url": "private_url"}})
@@ -71,6 +78,18 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
         1: {"https_pass": 2, "expired_cdn_url": 1, "body_stall": 1},
         2: {"https_pass": 2, "tls_timeout": 1, "control_wait_timeout": 1},
     }
+    assert report["two_https_pass"] == [third]
+    assert report["timing_by_round"][1]["off_confirm"] == {"samples": 0, "total_ms": None}
+    assert report["timing_by_round"][1]["page_probe"] == {"samples": 1, "total_ms": 210}
+    assert report["timing_by_round"][1]["cdn_probe"] == {"samples": 1, "total_ms": 307}
+    assert report["timing_by_round"][2] == {
+        "attempt": {"samples": 4, "total_ms": 28000},
+        "policy_apply": {"samples": 1, "total_ms": 700},
+        "outcome_wait": {"samples": 1, "total_ms": 8300},
+        "off_confirm": {"samples": 2, "total_ms": 1000},
+        "page_probe": {"samples": 0, "total_ms": None},
+        "cdn_probe": {"samples": 0, "total_ms": None},
+    }
     baseline, proposed = (report["replay"][key] for key in ("recorded", "prior_round_order"))
     assert baseline["order"] == candidates[::-1]
     assert proposed["order"] == [first, third, fourth, second]
@@ -80,7 +99,7 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
     assert proposed["observed_probe_bytes_if_stop_after_pass"] == 20000
     assert proposed["attempts_with_byte_samples"] == 2
     assert report["endpoint_context"] == "NOT_VERIFIED" and report["apply"] is False
-    assert "job_id" not in report and "private_url" not in json.dumps(report)
+    assert "job_id" not in report and "private" not in json.dumps(report)
 
     def network_access():
         pytest.fail("offline replay must not create an HTTP client")
@@ -337,14 +356,34 @@ def test_corrupt_job_does_not_prevent_start(job_store):
 def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeypatch):
     instance, _path, policy = job_store
     assert start(instance)["ok"]
-    original = instance._wait
+    original_wait, original_transition = instance._wait, instance._transition
+    tick = 0.0
     trials = []
+
+    def advance(seconds):
+        nonlocal tick
+        tick += seconds
+
+    monkeypatch.setattr(jobs, "time", SimpleNamespace(
+        monotonic=lambda: tick, time=lambda: 10000 - tick, sleep=advance,
+    ))
+
+    def transition(row, patch):
+        original_transition(row, patch)
+        advance(0.25 if patch["mode"] == "selective" else 0.5)
+
     def wait(row, states, deadline, **kwargs):
         if "active" in states:
             trials.append(instance._policy()[0].zapret2.strategy)
             if len(trials) == 1:
+                advance(95)
                 raise jobs.TrialTimeout("nfqueue")
-        return original(row, states, deadline, **kwargs)
+            advance(4.5)
+        else:
+            advance(1.25)
+        return original_wait(row, states, deadline, **kwargs)
+
+    monkeypatch.setattr(instance, "_transition", transition)
     monkeypatch.setattr(instance, "_wait", wait)
     instance._run()
     result = instance.public()
@@ -352,6 +391,34 @@ def test_candidate_timeout_continues_only_after_confirmed_off(job_store, monkeyp
     assert len(trials) == len(result["results"]) == 4
     assert result["results"][0]["state"] == "timeout"
     assert result["results"][0]["wait_stage"] == "nfqueue"
+    assert result["results"][0]["elapsed_ms"] == 95250
+    assert result["results"][0]["phase_ms"] == {
+        "policy_apply": 250, "outcome_wait": 95000, "off_confirm": 1750,
+    }
+    assert result["results"][1]["phase_ms"] == {
+        "policy_apply": 250, "outcome_wait": 4500, "off_confirm": 1750,
+    }
+    assert instance._policy()[1] == policy
+
+
+def test_off_wait_failure_leaves_only_observed_phase_times(job_store, monkeypatch):
+    instance, _path, policy = job_store
+    assert start(instance)["ok"]
+    original_wait = instance._wait
+
+    def wait(row, states, deadline, *, restoring=False):
+        if states == ("off",) and not restoring:
+            raise jobs.TrialTimeout("policy_pending")
+        return original_wait(row, states, deadline, restoring=restoring)
+
+    monkeypatch.setattr(instance, "_wait", wait)
+    instance._run()
+    result = instance.public()
+    assert (result["state"], result["restore"]) == ("failed", "pass")
+    (attempt,) = result["results"]
+    assert attempt["state"] == "active"
+    assert set(attempt["phase_ms"]) == {"policy_apply", "outcome_wait"}
+    assert sum(attempt["phase_ms"].values()) == attempt["elapsed_ms"]
     assert instance._policy()[1] == policy
 
 

@@ -180,16 +180,21 @@ class Jobs:
                                 raise TimeoutError("time_budget")
                             started = time.monotonic()
                             self._transition(row, {"mode": "selective", "strategy": profile})
+                            applied = time.monotonic()
                             try:
                                 view = self._wait(
                                     row, ("active", "fallback", "blocked", "error"),
-                                    min(deadline, time.monotonic() + TRIAL_SECONDS),
+                                    min(deadline, applied + TRIAL_SECONDS),
                                 )
                             except TimeoutError as exc:
                                 # A candidate timeout is a measurement, not a reason to
                                 # abandon untried candidates. Off must still be confirmed.
                                 view = {"state": "timeout", "reason": "trial_timeout",
                                         "wait_stage": getattr(exc, "stage", "no_sample")}
+                            elapsed_ms = round((time.monotonic() - started) * 1000)
+                            policy_ms = round((applied - started) * 1000)
+                            phases = {"policy_apply": policy_ms,
+                                      "outcome_wait": elapsed_ms - policy_ms}
                             evidence = view.get("evidence", {})
                             row["results"].append({
                                 "round": round_id + 1, "candidate": profile,
@@ -203,14 +208,17 @@ class Jobs:
                                            for target, probe in
                                            evidence.get("transport_probes", {}).items()
                                            if target in ("page", "cdn")},
-                                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                                "elapsed_ms": elapsed_ms, "phase_ms": phases,
                                 "at": time.time(),
                             })
                             if view.get("wait_stage") in WAIT_STAGES:
                                 row["results"][-1]["wait_stage"] = view["wait_stage"]
                             self._write(row)
+                            off_started = time.monotonic()
                             self._transition(row, {"mode": "off"})
                             self._wait(row, ("off",), min(deadline, time.monotonic() + 90))
+                            phases["off_confirm"] = round((time.monotonic() - off_started) * 1000)
+                            self._write(row)
             except Cancelled:
                 outcome = "cancelled"
             except Conflict:
