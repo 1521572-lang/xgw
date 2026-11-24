@@ -356,6 +356,9 @@ if [[ $MODE != resume ]]; then
     if [[ -n $format ]]; then
       direct_begin=$(date +%s)
       run direct-counters-before snapshot || true
+      if [[ $MODE == cdn-pair ]]; then
+        direct_peer+=(--wan-tcp-snapshot "$D/direct-counters-before.out")
+      fi
       run direct-cdn sample_cdn 32 "$format" "${direct_peer[@]}" || true
       run direct-counters-after snapshot || true
       direct_end=$(($(date +%s) + 1))

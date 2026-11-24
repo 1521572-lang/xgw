@@ -54,7 +54,7 @@ def outcome(result):
     return "transport_failed"
 
 
-def sample(source, first=None):
+def sample(source, first=None, *, wan_tcp_snapshot=None):
     try:
         url, _, _ = read_format(source)
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -72,26 +72,42 @@ def sample(source, first=None):
             peer = ipv4_peer(urlsplit(url).hostname)
         except (OSError, ValueError):
             return {"outcome": "dns_ipv4_unavailable"}
-    record, _ = observe(url, peer)
+    record, _ = observe(url, peer, wan_tcp_snapshot=wan_tcp_snapshot)
     return record
 
 
-def observe(url, peer, *, capture_redirect=False):
+def observe(url, peer, *, capture_redirect=False, wan_tcp_snapshot=None):
     record = {"url_sha256": hashlib.sha256(url.encode()).hexdigest(), "peer": peer}
     started = time.time()
     options = {"capture_redirect": True} if capture_redirect else {}
+    tcp = None
+
+    def transfer():
+        return probe(url, RANGE_BYTES, peer=peer, observe_tls=True, **options)
+
     try:
-        result = probe(url, RANGE_BYTES, peer=peer, observe_tls=True, **options)
+        if wan_tcp_snapshot is None:
+            result = transfer()
+        else:
+            from docs.helpers.cdn_tcp_observation import snapshot_pid, watch_transfer
+
+            pid = snapshot_pid(wan_tcp_snapshot)
+            if pid is None:
+                result, tcp = transfer(), {"state": "snapshot_unavailable"}
+            else:
+                result, tcp = watch_transfer(peer, pid, transfer)
     except (OSError, ValueError, subprocess.SubprocessError):
         return {**record, "outcome": "probe_runtime_error"}, None
+    if tcp is not None:
+        record["wan_tcp"] = tcp
     return {**record, "outcome": outcome(result), "actual_peer": result.get("remote_ip"),
             "started": started, "finished": time.time(),
             "local_ip": result.get("local_ip"), "local_port": result.get("local_port"),
             **{key: result.get(key) for key in METRICS}}, result.get("redirect_url")
 
 
-def run_sample(source, first, *, retry_302=False):
-    record = sample(source, first)
+def run_sample(source, first, *, retry_302=False, wan_tcp_snapshot=None):
+    record = sample(source, first, wan_tcp_snapshot=wan_tcp_snapshot)
     if retry_302 and record["outcome"] == "http_redirect":
         # A fresh curl process repeats the same signed URL and IPv4 without following Location.
         record["retry"] = sample(source, record)
@@ -198,11 +214,22 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route):
         state = "range_unconfirmed"
     else:
         state = "pair_verified"
-    return {"state": state, "same_target": comparable, "same_connected_peer": same_peer,
-            "direct_route_verified": direct_group == "zapret2",
-            "vpn_route_verified": vpn_group in ("xray", "sing-box"),
-            "direct_range_verified": direct_ok, "vpn_range_verified": vpn_ok,
-            "vpn_attempt": "retry" if control is not vpn else "first"}
+    report = {"state": state, "same_target": comparable, "same_connected_peer": same_peer,
+              "direct_route_verified": direct_group == "zapret2",
+              "vpn_route_verified": vpn_group in ("xray", "sing-box"),
+              "direct_range_verified": direct_ok, "vpn_range_verified": vpn_ok,
+              "vpn_attempt": "retry" if control is not vpn else "first"}
+    if "wan_tcp" in direct:
+        from docs.helpers.cdn_tcp_observation import FIELDS
+
+        observed = direct["wan_tcp"]
+        if (direct_group == "zapret2" and direct.get("peer")
+                and direct.get("actual_peer") == direct["peer"]):
+            keys = ("state", "samples", "last_sample_before_end_ms", *FIELDS)
+            report["direct_tcp"] = {key: observed[key] for key in keys if key in observed}
+        else:
+            report["direct_tcp"] = {"state": "path_unconfirmed"}
+    return report
 
 
 def page_sample():
@@ -268,6 +295,7 @@ def main():
     run.add_argument("source", type=Path)
     run.add_argument("--peer-from", type=Path)
     run.add_argument("--retry-302", action="store_true")
+    run.add_argument("--wan-tcp-snapshot", type=Path)
     seed = commands.add_parser("prepare")
     seed.add_argument("source", type=Path)
     seed.add_argument("output", type=Path)
@@ -288,7 +316,8 @@ def main():
         if args.retry_302 and not args.peer_from:
             parser.error("--retry-302 requires --peer-from")
         first = read_sample(args.peer_from) if args.peer_from else None
-        record = run_sample(args.source, first, retry_302=args.retry_302)
+        record = run_sample(args.source, first, retry_302=args.retry_302,
+                            wan_tcp_snapshot=args.wan_tcp_snapshot)
         ok = record.get("retry", record)["outcome"] == "range_complete"
     elif args.action == "prepare":
         record = prepare_pair(args.source, args.output)

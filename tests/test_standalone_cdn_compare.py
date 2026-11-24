@@ -194,3 +194,15 @@ def test_pair_evaluation_requires_exact_range_peer_and_matching_routes(change, e
     result = cdn.evaluate_pair(direct, vpn, direct_route, vpn_route)
     assert result["state"] == expected and result["vpn_attempt"] == "retry"
     assert "private" not in repr(result) and "1.1.1.1" not in repr(result)
+
+
+@pytest.mark.parametrize("route", ["observed", "ambiguous"])
+def test_pair_reports_tcp_only_with_an_observed_direct_route(route):
+    direct = {"url_sha256": "digest", "peer": "1.1.1.1", "actual_peer": "1.1.1.1",
+              "outcome": "tls_timeout",
+              "wan_tcp": {"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518,
+                          "cookie": "private"}}
+    result = cdn.evaluate_pair(direct, {}, {"state": route, "group": "zapret2"}, {})
+    expected = ({"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518}
+                if route == "observed" else {"state": "path_unconfirmed"})
+    assert result["direct_tcp"] == expected
