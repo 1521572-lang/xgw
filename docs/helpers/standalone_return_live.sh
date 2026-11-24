@@ -14,8 +14,8 @@ VIDEO=${XGW_T09_VIDEO:-8plwv25NYRo}
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 [[ $CODE =~ ^[0-9a-f]{40}$ ]]
-[[ $MODE == cycle || $MODE == resume || $MODE == cdn ]]
-if [[ $MODE == cdn ]]; then
+[[ $MODE == cycle || $MODE == resume || $MODE == cdn || $MODE == cdn-pair ]]
+if [[ $MODE == cdn* ]]; then
   [[ $VIDEO =~ ^[A-Za-z0-9_-]{11}$ ]]
   command -v yt-dlp >/dev/null
 fi
@@ -306,6 +306,18 @@ initial_topology=stable
 if [[ $MODE == resume ]]; then initial_topology=legacy_resume; fi
 run baseline-topology topology "$initial_topology" 25
 run baseline-vpn vpn_check
+format=
+if [[ $MODE == cdn-pair ]]; then
+  format="$D/pair-format.json"
+  if ! run baseline-resolve resolve_cdn ||
+     ! run vpn-prepare timeout -k 2 57 "$PY" -B -P -m docs.helpers.standalone_cdn_compare \
+         prepare "$D/baseline-resolve.out" "$format"; then
+    if [[ -f $D/vpn-prepare.out ]]; then cat "$D/vpn-prepare.out"; fi
+    printf 'STANDALONE_LIVE_CDN_PAIR_NOT_STARTED\n'
+    exit 2
+  fi
+  cat "$D/vpn-prepare.out"
+fi
 run stage stage
 run before-apply-topology topology "$initial_topology" 15
 RETURN_STARTED=$(date +%s)
@@ -316,23 +328,26 @@ run candidate-vpn vpn_check
 if [[ $MODE != resume ]]; then
   run candidate-topology topology stable 35
   strategy=multisplit
-  if [[ $MODE == cdn ]]; then
+  if [[ $MODE == cdn* ]]; then
     strategy=fake_md5
     run off-page page_probe || true
-    run off-resolve resolve_cdn || true
+    if [[ $MODE == cdn ]]; then run off-resolve resolve_cdn || true; fi
   fi
   sudo -n systemctl is-active --quiet "$UNIT.timer"
   sudo -n touch "$BACKUP/standalone-issued"
   run standalone-on timeout -k 3 190 "$PY" -B -P -m docs.helpers.selective_admission \
     standalone "$D/standalone-receipt" --strategy "$strategy"
   run standalone-paused topology paused 30
-  if [[ $MODE == cdn ]]; then
+  if [[ $MODE == cdn* ]]; then
     run direct-revision-before timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
       check-standalone "$D/standalone-receipt"
     run direct-page page_probe || true
-    format=
     origin=standalone
-    if run direct-resolve resolve_cdn; then
+    direct_peer=()
+    if [[ $MODE == cdn-pair ]]; then
+      origin=vpn
+      direct_peer=(--peer-from "$format")
+    elif run direct-resolve resolve_cdn; then
       format="$D/direct-resolve.out"
     elif [[ -s $D/off-resolve.out ]]; then
       format="$D/off-resolve.out"
@@ -341,12 +356,16 @@ if [[ $MODE != resume ]]; then
     if [[ -n $format ]]; then
       direct_begin=$(date +%s)
       run direct-counters-before snapshot || true
-      run direct-cdn sample_cdn 32 "$format" || true
+      run direct-cdn sample_cdn 32 "$format" "${direct_peer[@]}" || true
       run direct-counters-after snapshot || true
       direct_end=$(($(date +%s) + 1))
     fi
-    run direct-revision-after timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
-      check-standalone "$D/standalone-receipt" || true
+    if run direct-revision-after timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
+        check-standalone "$D/standalone-receipt"; then
+      direct_revision=confirmed
+    else
+      direct_revision=unconfirmed
+    fi
   fi
   RETURN_STARTED=$(date +%s)
   run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
@@ -354,10 +373,12 @@ if [[ $MODE != resume ]]; then
   run returned-off wait_off
   run returned-vpn vpn_check
   sudo -n touch "$BACKUP/off-confirmed"
-  if [[ $MODE == cdn && -n $format ]]; then
+  if [[ $MODE == cdn* && -n $format ]]; then
     off_begin=$(date +%s)
     run off-counters-before snapshot || true
-    run off-cdn sample_cdn 57 "$format" --peer-from "$D/direct-cdn.out" --retry-302 || true
+    peer_record="$D/direct-cdn.out"
+    if [[ $MODE == cdn-pair ]]; then peer_record=$format; fi
+    run off-cdn sample_cdn 57 "$format" --peer-from "$peer_record" --retry-302 || true
     run off-counters-after snapshot || true
     off_end=$(($(date +%s) + 1))
     run cdn-comparison "$PY" -B -P -m docs.helpers.standalone_cdn_compare compare \
@@ -365,11 +386,18 @@ if [[ $MODE != resume ]]; then
     cat "$D/cdn-comparison.out"
     run direct-route route_observation direct "$direct_begin" "$direct_end" || true
     run off-route route_observation off "$off_begin" "$off_end" || true
+    if [[ $MODE == cdn-pair && $direct_revision == confirmed ]]; then
+      run pair-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate \
+        "$D/direct-cdn.out" "$D/off-cdn.out" "$D/direct-route.out" "$D/off-route.out" || true
+      cat "$D/pair-verdict.out"
+    elif [[ $MODE == cdn-pair ]]; then
+      printf 'STANDALONE_LIVE_CDN_PAIR_REVISION_UNCONFIRMED\n'
+    fi
     for phase in direct off; do
       run "$phase-counters-delta" "$PY" -B -P -m xgw.desync.route_evidence delta \
         "$D/$phase-counters-before.out" "$D/$phase-counters-after.out" || true
     done
-  elif [[ $MODE == cdn ]]; then
+  elif [[ $MODE == cdn* ]]; then
     printf 'STANDALONE_LIVE_CDN_URL_UNAVAILABLE\n'
   fi
 fi

@@ -69,7 +69,7 @@ def tls_events(stderr):
     return events if any(events.values()) else None
 
 
-def probe(url, size, *, peer=None, range_request=True, observe_tls=False):
+def probe(url, size, *, peer=None, range_request=True, observe_tls=False, capture_redirect=False):
     # Pass the signed URL through stdin. stdout includes only explicit metrics.
     output = ('{"status":"%{http_code}","bytes":%{size_download},"tcp":%{time_connect},'
               '"tls":%{time_appconnect},'
@@ -84,21 +84,36 @@ def probe(url, size, *, peer=None, range_request=True, observe_tls=False):
         output += ',"local_ip":"%{local_ip}","local_port":%{local_port}'
         environment = os.environ.copy()
         environment.pop("SSLKEYLOGFILE", None)
+    output += "}"
+    if range_request:
+        output += r"\n%header{content-range}"
+    if capture_redirect:
+        output += r"\n%{redirect_url}"
     proc = subprocess.run(
-        ["curl", "-q", "--http1.1", "--noproxy", "*", "--proto", "=https", "--max-time", "20",
+        ["curl", "-q", "--globoff", "--http1.1", "--noproxy", "*", "--proto", "=https",
+         "--max-time", "20",
          "--connect-timeout", "10", "--max-filesize", str(size), *transfer,
-         "--silent", *diagnostics, "--output", "/dev/null", "--write-out", output + "}",
+         "--silent", *diagnostics, "--output", "/dev/null", "--write-out", output,
          *target, "--config", "-"],
         input=f'url = "{quoted_url}"\n', capture_output=True, text=True, errors="replace",
         env=environment, timeout=25, check=False,
     )
-    result = json.loads(proc.stdout or "{}")
+    summary, _, headers = proc.stdout.partition("\n")
+    result = json.loads(summary or "{}")
     result["status"] = int(result.get("status") or 0)
     if result.get("remote_ip"):
         result["remote_ip"] = str(ipaddress.ip_address(result["remote_ip"]))
     result["ok"] = (proc.returncode == 0 and result.get("status") in (200, 206)
                     and result.get("bytes", 0) > 0)
     result["curl_rc"] = proc.returncode
+    if range_request:
+        header, _, headers = headers.partition("\n")
+        span = re.fullmatch(rf"bytes 0-{size - 1}/([0-9]{{1,20}}|\*)", header.strip())
+        result["content_range_ok"] = span is not None and (
+            span[1] == "*" or int(span[1]) >= size
+        )
+    if capture_redirect and 0 < len(headers) <= 32768:
+        result["redirect_url"] = headers
     if observe_tls:
         result["tls_events"] = tls_events(proc.stderr)
     return result

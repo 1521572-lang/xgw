@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -13,9 +14,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from docs.helpers.headless_playback import probe, read_format
+from xgw.desync.schema import youtube_cdn_expiry
 
 RANGE_BYTES = 65536
-METRICS = ("status", "bytes", "tcp", "tls", "first_byte", "elapsed", "curl_rc", "tls_events")
+METRICS = ("status", "bytes", "tcp", "tls", "first_byte", "elapsed", "curl_rc", "tls_events",
+           "content_range_ok")
 
 
 def public_ipv4(value):
@@ -35,7 +38,8 @@ def ipv4_peer(host):
 
 
 def outcome(result):
-    if result.get("ok") and (result["status"], result["bytes"]) == (206, RANGE_BYTES):
+    if (result.get("ok") and (result["status"], result["bytes"]) == (206, RANGE_BYTES)
+            and result.get("content_range_ok") is not False):
         return "range_complete"
     if result.get("curl_rc") == 28:
         if not result.get("tcp"):
@@ -68,16 +72,22 @@ def sample(source, first=None):
             peer = ipv4_peer(urlsplit(url).hostname)
         except (OSError, ValueError):
             return {"outcome": "dns_ipv4_unavailable"}
-    record = {"url_sha256": digest, "peer": peer}
+    record, _ = observe(url, peer)
+    return record
+
+
+def observe(url, peer, *, capture_redirect=False):
+    record = {"url_sha256": hashlib.sha256(url.encode()).hexdigest(), "peer": peer}
     started = time.time()
+    options = {"capture_redirect": True} if capture_redirect else {}
     try:
-        result = probe(url, RANGE_BYTES, peer=peer, observe_tls=True)
+        result = probe(url, RANGE_BYTES, peer=peer, observe_tls=True, **options)
     except (OSError, ValueError, subprocess.SubprocessError):
-        return {**record, "outcome": "probe_runtime_error"}
+        return {**record, "outcome": "probe_runtime_error"}, None
     return {**record, "outcome": outcome(result), "actual_peer": result.get("remote_ip"),
             "started": started, "finished": time.time(),
             "local_ip": result.get("local_ip"), "local_port": result.get("local_port"),
-            **{key: result.get(key) for key in METRICS}}
+            **{key: result.get(key) for key in METRICS}}, result.get("redirect_url")
 
 
 def run_sample(source, first, *, retry_302=False):
@@ -95,6 +105,65 @@ def public_sample(record):
             **{key: record.get(key) for key in METRICS}}
 
 
+def range_verified(record):
+    return (record.get("outcome") == "range_complete"
+            and (record.get("status"), record.get("bytes"), record.get("curl_rc"))
+            == (206, RANGE_BYTES, 0) and record.get("content_range_ok") is True
+            and bool(record.get("peer")) and record.get("actual_peer") == record["peer"])
+
+
+def redirect_candidate(location):
+    if (not isinstance(location, str) or not 0 < len(location) <= 32768
+            or "#" in location or "\\" in location
+            or any(ord(char) < 33 or ord(char) > 126 for char in location)):
+        return None
+    expires = youtube_cdn_expiry(location)
+    if expires is None or expires <= time.time():
+        return None
+    parts = urlsplit(location)
+    if parts.username is not None or parts.password is not None:
+        return None
+    try:
+        return location if parts.port in (None, 443) else None
+    except ValueError:
+        return None
+
+
+def prepare_pair(source, output):
+    """Find one exact range through the working VPN and save its target privately."""
+    try:
+        url, duration, bitrate = read_format(source)
+        record, location = observe(url, ipv4_peer(urlsplit(url).hostname), capture_redirect=True)
+    except (OSError, ValueError, TypeError, KeyError):
+        return {"state": "source_unavailable"}
+    report = {"original": public_sample(record), "redirect": "not_needed"}
+    if record["outcome"] == "http_redirect":
+        report["redirect"] = "rejected"
+        target = redirect_candidate(location)
+        if not target or target == url or record.get("actual_peer") != record.get("peer"):
+            return {"state": "redirect_unusable", **report}
+        report["redirect"] = "followed"
+        url = target
+        try:
+            record, _ = observe(url, ipv4_peer(urlsplit(url).hostname))
+        except (OSError, ValueError):
+            return {"state": "redirect_peer_unavailable", **report}
+        report["target"] = public_sample(record)
+    if not range_verified(record):
+        return {"state": "vpn_range_unconfirmed", **report}
+    if not output.is_absolute():
+        return {"state": "output_unavailable", **report}
+    try:
+        with os.fdopen(os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w",
+                       encoding="utf-8") as stream:
+            json.dump({"url": url, "height": 720, "duration": duration,
+                       "vbr": bitrate / 1000 if bitrate else None,
+                       "url_sha256": record["url_sha256"], "peer": record["peer"]}, stream)
+    except (OSError, ValueError):
+        return {"state": "output_unavailable", **report}
+    return {"state": "vpn_range_verified", **report}
+
+
 def same_target(first, second):
     return bool(first.get("url_sha256") and first.get("peer")
                 and all(first[key] == second.get(key) for key in ("url_sha256", "peer")))
@@ -102,11 +171,38 @@ def same_target(first, second):
 
 def compare(direct, vpn, origin):
     control = public_sample(vpn)
-    if "retry" in vpn:
+    if vpn.get("outcome") == "http_redirect" and "retry" in vpn:
         control["retry"] = {**public_sample(vpn["retry"]),
                             "same_url_and_requested_ipv4": same_target(direct, vpn["retry"])}
     return {"url_origin": origin, "same_url_and_requested_ipv4": same_target(direct, vpn),
             "standalone": public_sample(direct), "vpn": control}
+
+
+def evaluate_pair(direct, vpn, direct_route, vpn_route):
+    control, route = vpn, vpn_route
+    if vpn.get("outcome") == "http_redirect" and "retry" in vpn:
+        control = vpn["retry"]
+        route = vpn_route.get("retry", {})
+    direct_group = direct_route.get("group") if direct_route.get("state") == "observed" else None
+    vpn_group = route.get("group") if route.get("state") == "observed" else None
+    comparable = same_target(direct, vpn) and same_target(direct, control)
+    same_peer = bool(comparable and all(
+        record.get("actual_peer") == direct["peer"] for record in (direct, control)
+    ))
+    direct_ok, vpn_ok = range_verified(direct), range_verified(control)
+    if not comparable:
+        state = "target_unconfirmed"
+    elif not same_peer or direct_group != "zapret2" or vpn_group not in ("xray", "sing-box"):
+        state = "path_unconfirmed"
+    elif not (direct_ok and vpn_ok):
+        state = "range_unconfirmed"
+    else:
+        state = "pair_verified"
+    return {"state": state, "same_target": comparable, "same_connected_peer": same_peer,
+            "direct_route_verified": direct_group == "zapret2",
+            "vpn_route_verified": vpn_group in ("xray", "sing-box"),
+            "direct_range_verified": direct_ok, "vpn_range_verified": vpn_ok,
+            "vpn_attempt": "retry" if control is not vpn else "first"}
 
 
 def page_sample():
@@ -172,6 +268,12 @@ def main():
     run.add_argument("source", type=Path)
     run.add_argument("--peer-from", type=Path)
     run.add_argument("--retry-302", action="store_true")
+    seed = commands.add_parser("prepare")
+    seed.add_argument("source", type=Path)
+    seed.add_argument("output", type=Path)
+    decision = commands.add_parser("evaluate")
+    for name in ("direct", "vpn", "direct_route", "vpn_route"):
+        decision.add_argument(name, type=Path)
     commands.add_parser("page")
     summary = commands.add_parser("compare")
     summary.add_argument("direct", type=Path)
@@ -188,6 +290,18 @@ def main():
         first = read_sample(args.peer_from) if args.peer_from else None
         record = run_sample(args.source, first, retry_302=args.retry_302)
         ok = record.get("retry", record)["outcome"] == "range_complete"
+    elif args.action == "prepare":
+        record = prepare_pair(args.source, args.output)
+        ok = record["state"] == "vpn_range_verified"
+    elif args.action == "evaluate":
+        try:
+            record = evaluate_pair(
+                read_sample(args.direct), read_sample(args.vpn),
+                read_sample(args.direct_route), read_sample(args.vpn_route),
+            )
+        except (TypeError, AttributeError):
+            record = {"state": "invalid_evidence"}
+        ok = record["state"] == "pair_verified"
     elif args.action == "page":
         try:
             record = page_sample()
