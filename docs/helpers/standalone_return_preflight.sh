@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 CODE=$1
 FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
-FIX=6d25c5f2418421d80520e099b845bfa02c82283e
+FIX=7094d2c045dccf11ef6f3c8e74860c6ac8b49b6f
 BR=integration/zapret2-batch1
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -96,4 +96,6 @@ contracts managed \
   tests/test_singbox_generations.py::test_standalone_return_keeps_legacy_until_managed_bridge_is_verified \
   tests/test_singbox_generations.py::test_off_during_standalone_start_preserves_or_finishes_bridge_shutdown \
   || result=2
+contracts watchdog \
+  tests/test_daemon.py::test_pending_singbox_resume_uses_a_busy_watchdog_build || result=2
 exit "$result"

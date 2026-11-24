@@ -3,8 +3,9 @@
 set -euo pipefail
 umask 077
 CODE=$1
+MODE=${2:-cycle}
 FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
-FIX=6d25c5f2418421d80520e099b845bfa02c82283e
+FIX=7094d2c045dccf11ef6f3c8e74860c6ac8b49b6f
 BR=integration/zapret2-batch1
 UNIT=xgw-standalone-return-rollback
 OVERLAY=--standalone-return
@@ -12,6 +13,7 @@ PY=/usr/bin/python3
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 [[ $CODE =~ ^[0-9a-f]{40}$ ]]
+[[ $MODE == cycle || $MODE == resume ]]
 REPO=$(git rev-parse --show-toplevel)
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
@@ -42,6 +44,7 @@ PANEL=$(readlink -e /etc/xgw/panel.json)
 FILES=(src/xgw/zapret2.py src/xgw/watch/standalone.py src/xgw/apply/singbox_generation.py
        src/xgw/apply/singbox_process.py src/xgw/daemon.py)
 armed=0
+recovered=0
 
 wait_off() {
   timeout -k 3 85 "$PY" -B -P - <<'PY'
@@ -99,7 +102,12 @@ while time.monotonic() < deadline:
     if sample != last:
         print(json.dumps(sample, sort_keys=True), flush=True)
         last = sample
-    if wanted == "paused":
+    if wanted == "observed":
+        ready = True
+    elif wanted == "legacy_resume":
+        ready = (active == "legacy" and not marker and resume and not pending and not draining
+                 and not stopping and unit_state.get("xgw-singbox.service") == "active")
+    elif wanted == "paused":
         ready = (active == "legacy" and not marker and resume and not pending and not draining
                  and not stopping
                  and all(value in ("inactive", "failed") for value in unit_state.values()))
@@ -232,11 +240,15 @@ restore_on_exit() {
        run final-vpn vpn_check &&
        run final-timer sudo -n systemctl stop "$UNIT.timer"; then
       printf 'STANDALONE_LIVE_FILES_AND_VPN_RESTORED\n'
-      if run final-topology topology managed 35; then
-        printf 'STANDALONE_LIVE_FINAL_MANAGED\n'
+      if (( recovered )); then
+        if run final-topology topology managed 35; then
+          printf 'STANDALONE_LIVE_FINAL_MANAGED\n'
+        else
+          printf 'STANDALONE_LIVE_FINAL_TOPOLOGY_NOT_VERIFIED\n'
+          rc=3
+        fi
       else
-        printf 'STANDALONE_LIVE_FINAL_TOPOLOGY_NOT_VERIFIED\n'
-        rc=3
+        run final-topology topology observed 10 || true
       fi
     else
       printf 'STANDALONE_LIVE_RESTORE_NOT_VERIFIED\n'
@@ -250,27 +262,36 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
 run baseline-off wait_off
-run baseline-topology topology stable 25
+initial_topology=stable
+if [[ $MODE == resume ]]; then initial_topology=legacy_resume; fi
+run baseline-topology topology "$initial_topology" 25
 run baseline-vpn vpn_check
 run stage stage
-run before-apply-topology topology stable 15
+run before-apply-topology topology "$initial_topology" 15
+RETURN_STARTED=$(date +%s)
 run apply apply_trial
 run candidate-files compare_package code
 run candidate-off wait_off
-run candidate-topology topology stable 35
 run candidate-vpn vpn_check
-sudo -n systemctl is-active --quiet "$UNIT.timer"
-sudo -n touch "$BACKUP/standalone-issued"
-run standalone-on timeout -k 3 190 "$PY" -B -P -m docs.helpers.selective_admission \
-  standalone "$D/standalone-receipt"
-run standalone-paused topology paused 30
-RETURN_STARTED=$(date +%s)
-run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
-  off "$D/standalone-receipt"
-run returned-off wait_off
-run returned-vpn vpn_check
-sudo -n touch "$BACKUP/off-confirmed"
-run recovered-managed topology managed 240
+if [[ $MODE == cycle ]]; then
+  run candidate-topology topology stable 35
+  sudo -n systemctl is-active --quiet "$UNIT.timer"
+  sudo -n touch "$BACKUP/standalone-issued"
+  run standalone-on timeout -k 3 190 "$PY" -B -P -m docs.helpers.selective_admission \
+    standalone "$D/standalone-receipt"
+  run standalone-paused topology paused 30
+  RETURN_STARTED=$(date +%s)
+  run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
+    off "$D/standalone-receipt"
+  run returned-off wait_off
+  run returned-vpn vpn_check
+  sudo -n touch "$BACKUP/off-confirmed"
+fi
+if ! run recovered-managed topology managed 240; then
+  run return-attribution return_attributed || true
+  exit 2
+fi
+recovered=1
 run recovered-vpn vpn_check
 run return-attribution return_attributed
 printf 'STANDALONE_LIVE_MANAGED_RETURN_OK\n'
