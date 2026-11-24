@@ -365,6 +365,8 @@ Commands use the same validation as this card; observations remain revision-boun
                                 else settings["strategy"]),
         "selected_strategy": settings["strategy"],
         "strategies": list(management.PROFILES), "domains": settings["domains"],
+        "flowseal_exclude_domains": settings.get("flowseal_exclude_domains", []),
+        "can_edit_flowseal_exclusions": not invalid and settings["mode"] == "off",
         "worker": {"profile": profile if trusted else None,
                    "queue": queue if trusted else None},
         "counters": counters,

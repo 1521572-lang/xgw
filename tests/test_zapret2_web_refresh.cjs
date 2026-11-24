@@ -14,8 +14,11 @@ function page() {
     addEventListener: (event, callback) => listeners.set(event, callback),
   };
   const makeElement = () => ({
-    addEventListener() {},
+    events: {},
+    addEventListener(event, callback) { this.events[event] = callback; },
     querySelector() { return this; },
+    focus() {},
+    reportValidity() { return true; },
     dataset: {},
     replaceChildren(...children) { this.children = children; },
     append(...children) { this.children = children; },
@@ -76,6 +79,42 @@ function page() {
 }
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test("ALT9 form only writes changed exclusions while the backend allows editing", () => {
+  const browser = page();
+  browser.evaluate(`
+    online = true;
+    latest = {mode: "off", can_edit: true, can_edit_flowseal_exclusions: true,
+      selected_strategy: "flowseal_alt9", config_key: "initial",
+      strategies: ["multisplit"], domains: ["domain:youtube.com", "domain:googlevideo.com"],
+      flowseal_exclude_domains: ["saved.youtube.com"], check_seconds: 180, retry_seconds: 300,
+      daily_probe_mb: 256};
+    command = (action, body) => { sent = {action, body}; };
+    openSettings();
+  `);
+  const field = browser.element("setting-flowseal-exclusions");
+  const form = browser.element("settings-form");
+  const submit = () => {
+    form.events.submit({preventDefault() {}, currentTarget: form});
+    return JSON.parse(browser.evaluate("JSON.stringify(sent)"));
+  };
+  assert.equal(browser.element("flowseal-exclusion-settings").hidden, false);
+  assert.equal(field.value, "saved.youtube.com");
+  assert.equal(submit().body.settings.flowseal_exclude_domains, undefined);
+  field.value = "  NEW.GOOGLEVIDEO.COM\r\n\n";
+  const update = submit();
+  assert.deepEqual(update.body.settings.flowseal_exclude_domains, ["new.googlevideo.com"]);
+  assert.equal(update.body.expected, "initial");
+  browser.evaluate(`latest.can_edit_flowseal_exclusions = false; controls();`);
+  assert.equal(field.readOnly, true);
+  assert.equal(submit().body.settings.flowseal_exclude_domains, undefined);
+  browser.evaluate(`latest.can_edit_flowseal_exclusions = true; controls();`);
+  field.value = "";
+  assert.deepEqual(submit().body.settings.flowseal_exclude_domains, []);
+  browser.evaluate(`delete latest.flowseal_exclude_domains; openSettings();`);
+  assert.equal(browser.element("flowseal-exclusion-settings").hidden, true);
+  assert.equal(submit().body.settings.flowseal_exclude_domains, undefined);
+});
 
 test("queue loss fields preserve zero and clear absent or stale observations", () => {
   const browser = page();

@@ -87,6 +87,17 @@ class SettingsDialog(QDialog):
         self.strategy.setToolTip("Какая стратегия проходит, зависит от провайдера. Сравнение "
                                  "с VPN умеет только multisplit и multidisorder. "
                                  "Flowseal ALT9 выбирается отдельной кнопкой подготовки.")
+        self.flowseal_exclusions = None
+        self.saved_flowseal_exclusions = view.get("flowseal_exclude_domains")
+        if isinstance(self.saved_flowseal_exclusions, list) and (
+            selected == "flowseal_alt9" or self.saved_flowseal_exclusions
+        ):
+            self.flowseal_exclusions = QPlainTextEdit("\n".join(self.saved_flowseal_exclusions))
+            self.flowseal_exclusions.setMaximumHeight(72)
+            self.flowseal_exclusions.setAccessibleName("Исключения ALT9, по одному имени на строку")
+            self.flowseal_exclusions.setReadOnly(view.get("can_edit_flowseal_exclusions") is not True)
+            self.flowseal_exclusions.setToolTip("Имена и поддомены. Для правки выключите выбранный режим.")
+            form.addRow("Исключения ALT9", self.flowseal_exclusions)
         self.transport = QCheckBox("HTTPS-проверка YouTube и CDN")
         self.transport.setChecked(view.get("youtube_transport_probe") is True)
         form.addRow(self.transport)
@@ -123,6 +134,11 @@ class SettingsDialog(QDialog):
         result = {"domains": [s.strip().lower() for s in self.domains.toPlainText().splitlines()
                               if s.strip()], "strategy": self.strategy.currentText(),
                   "youtube_transport_probe": self.transport.isChecked()}
+        if self.flowseal_exclusions is not None and not self.flowseal_exclusions.isReadOnly():
+            exclusions = [s.strip().lower() for s in self.flowseal_exclusions.toPlainText().splitlines()
+                          if s.strip()]
+            if exclusions != self.saved_flowseal_exclusions:
+                result["flowseal_exclude_domains"] = exclusions
         urls = [field.text().strip() for field in self.urls]
         if self.clear_urls.isChecked():
             result["probe_urls"] = []

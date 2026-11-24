@@ -32,6 +32,31 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+def test_alt9_settings_dialog_preserves_saved_exclusions_and_sends_intentional_clear(qapp):
+    from xgw.gui.zapret2 import SettingsDialog
+
+    view = {"selected_strategy": "flowseal_alt9", "flowseal_exclude_domains": ["old.youtube.com"],
+            "can_edit_flowseal_exclusions": True}
+    dialog = SettingsDialog(None, view)
+    try:
+        field = dialog.flowseal_exclusions
+        assert field.toPlainText() == "old.youtube.com" and not field.isReadOnly()
+        assert "flowseal_exclude_domains" not in dialog.values()
+        field.setPlainText("  NEW.GOOGLEVIDEO.COM  \n")
+        assert dialog.values()["flowseal_exclude_domains"] == ["new.googlevideo.com"]
+        field.clear()
+        assert dialog.values()["flowseal_exclude_domains"] == []
+    finally:
+        dialog.close()
+    active = SettingsDialog(None, view | {"can_edit_flowseal_exclusions": False})
+    try:
+        assert active.flowseal_exclusions.isReadOnly()
+        active.flowseal_exclusions.clear()
+        assert "flowseal_exclude_domains" not in active.values()
+    finally:
+        active.close()
+
+
 def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

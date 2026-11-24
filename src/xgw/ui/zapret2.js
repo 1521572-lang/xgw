@@ -33,6 +33,8 @@ const date = new Intl.DateTimeFormat("ru", {dateStyle: "short", timeStyle: "medi
 const mebibytes = new Intl.NumberFormat("ru", {maximumFractionDigits: 2});
 const el = id => document.getElementById(id);
 const retryOverview = el("retry-overview");
+const flowsealSettings = el("flowseal-exclusion-settings");
+const exclusionsField = el("setting-flowseal-exclusions");
 const put = (id, value) => { el(id).textContent = value ?? "—"; };
 const count = value => Number.isSafeInteger(value) && value >= 0 ? number.format(value) : "Нет данных";
 let epoch = null;
@@ -44,6 +46,7 @@ let latest = null;
 let online = false;
 let busy = false;
 let draftKey = null;
+let draftFlowsealExclusions = null;
 let openingSettings = false;
 let generation = 0;
 let refreshAfterReply = false;
@@ -66,6 +69,7 @@ function controls() {
   if (el("job-pin")) el("job-pin").disabled = !usable || running || !jobWinner(job)
     || latest.mode !== "off";
   el("settings-fields").disabled = busy;
+  if (exclusionsField) exclusionsField.readOnly = latest?.can_edit_flowseal_exclusions !== true;
   el("settings-form").querySelector('[type="submit"]').disabled = !usable || !latest.can_edit;
   el("reload-settings").disabled = busy || needsLogin || Boolean(pending);
   if (retryOverview) {
@@ -134,6 +138,13 @@ function openSettings() {
   }));
   el("setting-strategy").value = latest.selected_strategy;
   el("setting-domains").value = latest.domains.join("\n");
+  draftFlowsealExclusions = Array.isArray(latest.flowseal_exclude_domains) &&
+    (latest.selected_strategy === "flowseal_alt9" || latest.flowseal_exclude_domains.length)
+    ? latest.flowseal_exclude_domains.join("\n") : null;
+  if (flowsealSettings && exclusionsField) {
+    flowsealSettings.hidden = draftFlowsealExclusions === null;
+    exclusionsField.value = draftFlowsealExclusions ?? "";
+  }
   for (const [id, value] of numbers) el(id).value = value;
   el("setting-youtube").checked = latest.youtube_transport_probe;
   el("setting-clear").checked = false;
@@ -157,6 +168,8 @@ function openSettings() {
 
 function closeSettings() {
   draftKey = null;
+  draftFlowsealExclusions = null;
+  if (exclusionsField) exclusionsField.value = "";
   el("setting-page").value = "";
   el("setting-media").value = "";
   el("settings-form").hidden = true;
@@ -271,6 +284,10 @@ el("settings-form").addEventListener("submit", event => {
     daily_probe_mb: Number(el("setting-budget").value),
     youtube_transport_probe: el("setting-youtube").checked,
   };
+  if (draftFlowsealExclusions !== null && exclusionsField && !exclusionsField.readOnly) {
+    const exclusions = exclusionsField.value.split(/\r?\n/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (exclusions.join("\n") !== draftFlowsealExclusions) settings.flowseal_exclude_domains = exclusions;
+  }
   const page = el("setting-page").value.trim();
   const cdn = el("setting-media").value.trim();
   if (el("setting-clear").checked) settings.probe_urls = [];

@@ -41,6 +41,18 @@ def test_imported_alt9_is_retained_but_not_offered_as_an_ordinary_choice():
     assert result["blockers"]["selective"]
 
 
+@pytest.mark.parametrize("mode", ["off", "standalone"])
+def test_alt9_view_exposes_saved_exclusions_with_edit_capability_only_while_off(mode):
+    cfg, snap = fixture(mode=mode, engine="off", state="off")
+    cfg.zapret2.strategy = schema.LIVE_STRATEGY
+    cfg.zapret2.flowseal_exclude_domains = ["sample.googlevideo.com"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    result = view(cfg, snap)
+    assert result["flowseal_exclude_domains"] == ["sample.googlevideo.com"]
+    assert result["can_edit_flowseal_exclusions"] is (mode == "off")
+
+
 
 def fixture(*, mode="off", engine="auto", state="active", reason="", **extra):
     cfg = Config()

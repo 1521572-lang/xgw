@@ -103,6 +103,12 @@
             <label>Стратегия<select id="setting-strategy"></select></label>
             <label>Домены, по одному на строку (domain:имя или full:имя)
               <textarea id="setting-domains" rows="5" required></textarea></label>
+            <div id="flowseal-exclusion-settings" hidden>
+              <label>Исключения ALT9, по одному имени на строку
+                <textarea id="setting-flowseal-exclusions" rows="3" spellcheck="false"
+                  aria-describedby="flowseal-exclusion-hint"></textarea></label>
+              <p id="flowseal-exclusion-hint" class="muted">Действуют для имени и его поддоменов. Для правки выключите выбранный режим.</p>
+            </div>
             <div class="zm-form-grid">
               <label>Проверка каждые, с<input id="setting-check" type="number" min="60" max="900" required></label>
               <label>Повтор после отказа, с<input id="setting-retry" type="number" min="60" max="3600" required></label>
