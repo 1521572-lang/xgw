@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -71,6 +74,71 @@ def test_history_excludes_pre_fix_measurements():
     del old["measurement_version"]
     fresh = trial(2)
     assert cache.validate_rows([old, fresh]) == [fresh]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the cache CLI uses private POSIX files and flock")
+def test_exact_cache_exclusion_survives_rebuild_and_preserves_other_contexts(tmp_path, monkeypatch, capsys):
+    ctx, other = "a" * 64, "d" * 64
+    now = T0 + 900
+    monkeypatch.setattr(cache.time, "time", lambda: now)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    source = tmp_path / "history.json"
+    source.write_text(json.dumps([trial(0), trial(1), trial(2, ip="d"), trial(3, ip="d")]))
+    source.chmod(0o600)
+    history = source.read_bytes()
+    exclusions = state / cache.EXCLUSIONS
+
+    def invoke(action, *extra):
+        options = ["--history", str(source)] if action in ("rebuild", "lookup") else []
+        monkeypatch.setattr(sys, "argv", ["cache", action, "--state-dir", str(state), *options, *extra])
+        rc = cache.main()
+        report = json.loads(capsys.readouterr().out)
+        assert report["apply"] is False
+        return rc, report
+
+    assert invoke("rebuild")[0] == 0
+    assert invoke("lookup", "--context", ctx)[1]["state"] == "hit"
+    assert invoke("exclude", "--context", ctx)[1]["changed"] is True
+    before = exclusions.read_bytes(), exclusions.stat().st_ino, exclusions.stat().st_mtime_ns
+    assert invoke("exclude", "--context", ctx)[1]["changed"] is False
+    assert (exclusions.read_bytes(), exclusions.stat().st_ino, exclusions.stat().st_mtime_ns) == before
+    assert exclusions.stat().st_mode & 0o777 == 0o600
+    assert invoke("exclusions")[1]["contexts"] == [ctx]
+    assert invoke("rebuild")[0] == 0
+    assert invoke("lookup", "--context", ctx)[1] == {"state": "excluded", "apply": False, "candidates": []}
+    assert invoke("lookup", "--context", other)[1]["state"] == "hit"
+    assert invoke("restore", "--context", ctx)[1]["changed"] is True
+    assert invoke("lookup", "--context", ctx)[1]["state"] == "hit"
+    assert source.read_bytes() == history
+
+    exclusions.write_text('["bad"]')
+    rc, result = invoke("lookup", "--context", ctx)
+    assert (rc, result["state"], result["candidates"]) == (2, "input_or_storage_error", [])
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the cache CLI uses private POSIX files and flock")
+def test_exact_cache_exclusion_lock_and_failed_replacement(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    contexts = ["a" * 64, "b" * 64]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        changes = list(pool.map(lambda ctx: cache.update_exclusions(state, ctx, exclude=True), contexts))
+    assert all(result["changed"] for result in changes)
+    path = state / cache.EXCLUSIONS
+    original = path.read_bytes()
+
+    def fail(_temporary, target):
+        assert target == path
+        raise OSError("test_interrupted_replace")
+
+    with monkeypatch.context() as writer:
+        writer.setattr(os, "replace", fail)
+        with pytest.raises(OSError, match="test_interrupted_replace"):
+            cache.update_exclusions(state, contexts[0], exclude=False)
+    assert path.read_bytes() == original
+    assert cache.read_exclusions(path) == set(contexts)
+    assert not list(state.glob(".playback-shadow*.tmp"))
 
 
 @pytest.fixture

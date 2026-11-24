@@ -22,7 +22,8 @@ SCOPES = ("context_id", "prefix_context_id", "host_context_id")
 LABEL_FIELDS = ("candidate", "round")
 MEASUREMENT_FIELDS = {"recording_id", *LABEL_FIELDS, "started", "finished", "outcome"}
 FIELDS = {*SCOPES, *MEASUREMENT_FIELDS}
-TMP_NAME = re.compile(r"\.playback-shadow\.json\.\d+\.\d+\.tmp")
+EXCLUSIONS = "playback-shadow-exclusions.json"
+TMP_NAME = re.compile(r"\.playback-shadow(?:-exclusions)?\.json\.\d+\.\d+\.tmp")
 
 
 def _timestamp(value: object) -> bool:
@@ -75,6 +76,41 @@ def read_history(path: Path) -> tuple[list[dict], str]:
     return validate_rows(json.loads(raw)), hashlib.sha256(raw).hexdigest()
 
 
+def read_exclusions(path: Path) -> set[str]:
+    try:
+        contexts = json.loads(_read(path))
+    except FileNotFoundError:
+        return set()
+    if (not isinstance(contexts, list) or len(contexts) > LIMIT
+            or not all(isinstance(item, str) and SHA256.fullmatch(item) for item in contexts)
+            or len(set(contexts)) != len(contexts)):
+        raise ValueError("invalid_exclusions")
+    return set(contexts)
+
+
+def _clean_orphans(state_dir: Path) -> None:
+    for entry in state_dir.glob(".playback-shadow*.tmp"):
+        if TMP_NAME.fullmatch(entry.name):
+            entry.unlink()
+
+
+def update_exclusions(state_dir: Path, context: str, *, exclude: bool) -> dict:
+    if not SHA256.fullmatch(context):
+        raise ValueError("context")
+    private_path(state_dir, directory=True)
+    path = state_dir / EXCLUSIONS
+    with file_lock(state_dir / ".playback-shadow.lock", timeout=3, mode=0o600):
+        current = read_exclusions(path)
+        changed = (context in current) != exclude
+        if changed:
+            updated = current | {context} if exclude else current - {context}
+            if len(updated) > LIMIT:
+                raise ValueError("exclusions_size")
+            _clean_orphans(state_dir)
+            atomic_write_json(path, sorted(updated), mode=0o600)
+    return {"state": "excluded" if exclude else "restored", "changed": changed, "apply": False}
+
+
 def _recent(rows: list[dict], now: float) -> list[dict]:
     return [row for row in rows if now - TTL < row["finished"] <= now]
 
@@ -104,8 +140,10 @@ def build(rows: list[dict], revision: str, now: float) -> dict:
     return {"snapshot": payload, "sha256": digest(payload)}
 
 
-def lookup(snapshot: dict, revision: str, context: str, now: float) -> dict:
+def lookup(snapshot: dict, revision: str, context: str, now: float, *, excluded=()) -> dict:
     result = {"candidates": [], "apply": False}
+    if context in excluded:
+        return {"state": "excluded", **result}
     payload = snapshot.get("snapshot") if isinstance(snapshot, dict) else None
     if (not isinstance(payload, dict) or payload.get("schema") != SCHEMA
             or digest(payload) != snapshot.get("sha256")):
@@ -169,12 +207,13 @@ def compare(rows: list[dict]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("rebuild", "lookup", "compare"):
+    for command in ("rebuild", "lookup", "compare", "exclusions", "exclude", "restore"):
         action = sub.add_parser(command)
-        action.add_argument("--history", type=Path, required=True)
+        if command in ("rebuild", "lookup", "compare"):
+            action.add_argument("--history", type=Path, required=True)
         if command != "compare":
             action.add_argument("--state-dir", type=Path, required=True)
-        if command == "lookup":
+        if command in ("lookup", "exclude", "restore"):
             action.add_argument("--context", required=True)
     args = parser.parse_args()
     try:
@@ -186,13 +225,16 @@ def main() -> int:
         else:
             private_path(args.state_dir, directory=True)
             snapshot = args.state_dir / "playback-shadow.json"
-            if args.command == "rebuild":
+            if args.command == "exclusions":
+                report = {"state": "exclusions", "contexts": sorted(read_exclusions(args.state_dir / EXCLUSIONS)),
+                          "apply": False}
+            elif args.command in ("exclude", "restore"):
+                report = update_exclusions(args.state_dir, args.context, exclude=args.command == "exclude")
+            elif args.command == "rebuild":
                 with file_lock(args.state_dir / ".playback-shadow.lock", timeout=3, mode=0o600):
                     rows, revision = read_history(args.history)
                     state = build(rows, revision, time.time())
-                    for entry in args.state_dir.glob(".playback-shadow.json.*.tmp"):
-                        if TMP_NAME.fullmatch(entry.name):
-                            entry.unlink()
+                    _clean_orphans(args.state_dir)
                     atomic_write_json(snapshot, state, mode=0o600)
                 report = {"state": "rebuilt", "contexts": len(state["snapshot"]["exact"]),
                           "apply": False}
@@ -204,7 +246,8 @@ def main() -> int:
                     state = json.loads(_read(snapshot))
                 except FileNotFoundError:
                     state = build([], revision, time.time())
-                report = lookup(state, revision, args.context, time.time())
+                excluded = read_exclusions(args.state_dir / EXCLUSIONS)
+                report = lookup(state, revision, args.context, time.time(), excluded=excluded)
         print(json.dumps(report, sort_keys=True))
         return 0
     except (OSError, ValueError, LockTimeout, RecursionError):
