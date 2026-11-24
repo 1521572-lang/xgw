@@ -123,7 +123,7 @@ BASH
 bash <<'BASH'
 set -euo pipefail
 BR=integration/zapret2-batch1
-CODE=df78d57e971b9d693d799123cd4692d41e2ace60
+CODE=947cf7236f5a7466c49d0630699ceb6167c95d80
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin "$BR"
 git merge-base --is-ancestor "$CODE" FETCH_HEAD
@@ -133,7 +133,8 @@ BASH
 
 Ожидается `STANDALONE_OVERLAY_COPY_PATCHED` либо
 `STANDALONE_OVERLAY_ALREADY_PRESENT`, затем `STANDALONE_OVERLAY_COPY_COMPILES`,
-6 контрактов статуса и один контракт возврата на копии. Хелпер панели
+6 контрактов статуса и три контракта возврата на копии. Среди них
+отмена раннего входа до остановки мостов и в процессе остановки. Хелпер панели
 проверяется в разделе 1 на полном дереве с его зависимостями. Финальная метка
 `STANDALONE_OVERLAY_INSTALLED_UNCHANGED` подтверждает, что пять
 установленных файлов совпали. При `STANDALONE_OVERLAY_CONTEXT_MISMATCH`
