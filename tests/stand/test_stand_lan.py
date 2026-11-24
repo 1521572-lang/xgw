@@ -13,6 +13,7 @@ Xray; адрес WAN шлюза (5.5.5.2) — ушёл напрямую, с ма
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,9 @@ from pathlib import Path
 import netns
 import pytest
 from stand import Stand, wait_for
+
+from xgw.desync import lan_control, route_evidence, vpn_access
+from xgw.xraycore.access import endpoint, parse_accepted
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
 HERE = Path(__file__).resolve().parent
@@ -107,6 +111,68 @@ def test_lan_survives_src_valid_mark(gateway):
     restored = gateway.xgw("net", "up")
     assert restored.returncode == 0, restored.stderr
     assert gateway.exit_ip("lan") == VIA_VPN and _capture(gateway)["lan_problem"] == ""
+
+
+@pytest.mark.skipif(not shutil.which("openssl") or not shutil.which("curl"),
+                    reason="для локального HTTPS нужны openssl и curl")
+def test_lan_https_attributes_real_tproxy_socket(gateway):
+    host = lan_control.TRACE_HOST
+    certificate = gateway.workdir / "lan-https-cert.pem"
+    key = gateway.workdir / "lan-https-key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", f"/CN={host}", "-addext", f"subjectAltName=DNS:{host}",
+                    "-out", str(certificate), "-keyout", str(key)],
+                   capture_output=True, timeout=12, check=True)
+    gateway._spawn("https-origin", "inet", [
+        sys.executable, str(HERE / "origin.py"), "--host", netns.INET_IP, "--port", "443",
+        "--tls-cert", str(certificate), "--tls-key", str(key),
+    ], "READY")
+    config_path = gateway.root / "etc/xgw/xray/config.json"
+    log_path = gateway.root / "run/xgw/xray.log"
+    boot = "12345678123412341234123456789abc"
+
+    def snapshot():
+        raw = config_path.read_bytes()
+        return {"unix": time.time(), "monotonic_ns": time.monotonic_ns(),
+                "xray_epoch": f"{boot}:{gateway.xray_pid()}:1",
+                "config_sha256": hashlib.sha256(raw).hexdigest(), "client_zapret2_rule": False,
+                "tags": route_evidence.counters(json.loads(raw), {"stats": {"outbound": {}}})}
+
+    offset = log_path.stat().st_size
+    before = snapshot()
+    # Only this test supplies a temporary CA and pins the hostname to the private lab link.
+    command = ("import json, sys; from docs.helpers.lan_https_sample import sample; "
+               "print(json.dumps(sample(curl_options=sys.argv[1:])))")
+    transfer = gateway.run_in("lan", sys.executable, "-B", "-P", "-c", command,
+                              "--cacert", str(certificate), "--resolve", f"{host}:443:{netns.INET_IP}")
+    assert transfer.returncode == 0, transfer.stderr
+    client = json.loads(transfer.stdout)
+    assert client["http"] == 200 and client["curl_rc"] == 0, client
+
+    def observed_log():
+        with log_path.open(encoding="utf-8") as stream:
+            stream.seek(offset)
+            relevant = []
+            for line in stream:
+                message = line.rstrip("\r\n")
+                entry = parse_accepted(message)
+                if (entry is not None and entry.inbound == "tproxy-in"
+                        and endpoint(entry.source) == (client["local_ip"], client["local_port"])):
+                    relevant.append(message)
+            return relevant
+
+    assert wait_for(observed_log, 2), gateway.xray_log()
+    after = snapshot()
+    # This file contains genuine access lines. Journald metadata is represented by the
+    # isolated process identity and the observation time within the bounded test window.
+    when = (round(before["unix"] * 1e6) + round(after["unix"] * 1e6)) // 2
+    journal = [{"_SYSTEMD_UNIT": vpn_access.UNIT, "_PID": str(gateway.xray_pid()),
+                "_BOOT_ID": boot, "__REALTIME_TIMESTAMP": str(when), "MESSAGE": message}
+               for message in observed_log()]
+    result = lan_control.analyze(client, netns.GW_LAN_IP, journal, before, after)
+    assert result["https_complete"] is True
+    assert result["accepted_route"] == {"state": "observed", "group": "xray",
+                                        "matches_pinned_outbound": None}
 
 
 def test_bypass_host_goes_direct(gateway):

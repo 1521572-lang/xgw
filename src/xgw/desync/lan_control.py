@@ -27,13 +27,17 @@ def _lan_address(value):
 
 
 def _client_route(client, gateway, before, after):
+    if not client.get("next_hop"):
+        raise route_evidence.EvidenceError("client_next_hop_missing")
     host, source, hop = (_lan_address(item) for item in
                          (gateway, client.get("local_ip"), client.get("next_hop")))
     peer_text, port = client.get("remote_ip"), client.get("local_port")
     if not isinstance(peer_text, str) or type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("client_socket")
     peer = ipaddress.IPv4Address(peer_text)
-    if host != hop or source == host or not peer.is_global or peer.is_multicast:
+    if host != hop:
+        raise route_evidence.EvidenceError("client_gateway_mismatch")
+    if source == host or not peer.is_global or peer.is_multicast:
         raise ValueError("client_route")
     stamps = [round(row["unix"] * vpn_access.MICROSECONDS) for row in (before, after)]
     return vpn_access.Connection(*stamps, (str(source), port), (TRACE_HOST, 443),
@@ -51,8 +55,10 @@ def analyze(client, gateway, journal, before, after):
               "https_complete": curl_rc == 0 and http == 200 and 0 < size <= MAX_TRACE_BYTES}
     try:
         connection = _client_route(client, gateway, before, after)
+    except route_evidence.EvidenceError as exc:
+        result["accepted_route"] = {"state": "client_route_unconfirmed", "reason": str(exc)}
     except ValueError:
-        result["accepted_route"] = {"state": "client_route_unconfirmed"}
+        result["accepted_route"] = {"state": "client_route_unconfirmed", "reason": "invalid_socket"}
     else:
         result["accepted_route"] = vpn_access.match(connection, journal, before, after)
     return result

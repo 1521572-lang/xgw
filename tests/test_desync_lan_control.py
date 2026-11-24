@@ -35,14 +35,16 @@ def test_lan_https_matches_original_peer_or_sniffed_hostname(target):
     assert not any(value in public for value in (CLIENT["local_ip"], CLIENT["remote_ip"], TAG, BOOT))
 
 
-@pytest.mark.parametrize("changes", [
-    {"local_ip": GATEWAY}, {"local_ip": "127.0.0.1"}, {"next_hop": "192.168.100.8"},
-    {"local_port": True}, {"remote_ip": "192.168.100.100"},
+@pytest.mark.parametrize("changes,reason", [
+    ({"local_ip": GATEWAY}, "invalid_socket"), ({"local_ip": "127.0.0.1"}, "invalid_socket"),
+    ({"next_hop": None}, "client_next_hop_missing"),
+    ({"next_hop": "192.168.100.8"}, "client_gateway_mismatch"),
+    ({"local_port": True}, "invalid_socket"), ({"remote_ip": "192.168.100.100"}, "invalid_socket"),
 ])
-def test_lan_https_requires_client_next_hop_and_usable_socket(changes):
+def test_lan_https_requires_client_next_hop_and_usable_socket(changes, reason):
     result = lan_control.analyze(CLIENT | changes, GATEWAY, [], BEFORE, AFTER)
     assert result["https_complete"] is True
-    assert result["accepted_route"] == {"state": "client_route_unconfirmed"}
+    assert result["accepted_route"] == {"state": "client_route_unconfirmed", "reason": reason}
 
 
 def test_lan_https_can_report_route_with_incomplete_http_and_rejects_ambiguous_logs():

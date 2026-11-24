@@ -9,11 +9,12 @@ FORMAT = ('{"http":"%{http_code}","bytes":%{size_download},"local_ip":"%{local_i
           '"local_port":%{local_port},"remote_ip":"%{remote_ip}"}')
 
 
-def sample():
+def sample(*, curl_options=()):
     transfer = subprocess.run(
         ["curl", "-q", "--noproxy", "*", "--ipv4", "--http1.1", "--connect-timeout", "4",
          "--max-time", "8", "--max-filesize", "4096", "--silent", "--output", "/dev/null",
-         "--write-out", FORMAT, URL], capture_output=True, text=True, timeout=10, check=False,
+         "--write-out", FORMAT, *curl_options, URL],
+        capture_output=True, text=True, timeout=10, check=False,
     )
     result = json.loads(transfer.stdout)
     result["http"] = int(result["http"])

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -57,7 +58,7 @@ class OriginHandler(BaseHTTPRequestHandler):
         if parts.path == "/slow":
             size = int(query.get("bytes", ["1000000"])[0])
             return size, float(query.get("seconds", ["10"])[0]), None
-        if parts.path == "/trace":
+        if parts.path in ("/trace", "/cdn-cgi/trace"):
             body = f"fl=stand\nip={self.client_address[0]}\nloc={self.country}\n".encode()
             return len(body), 0.0, body
         if parts.path.startswith("/sub/") and self.sub_file:
@@ -169,13 +170,21 @@ def main() -> None:
     )
     parser.add_argument("--country", default="NL", help="значение loc= в /trace")
     parser.add_argument("--sub-file", default="", help="файл подписки для /sub/…")
+    parser.add_argument("--tls-cert")
+    parser.add_argument("--tls-key")
     args = parser.parse_args()
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("--tls-cert and --tls-key must be used together")
 
     OriginHandler.country = args.country
     OriginHandler.sub_file = args.sub_file
     server_class = Server6 if ":" in args.host else ThreadingHTTPServer
     server = server_class((args.host, args.port), OriginHandler)
     server.daemon_threads = True
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     if args.dns_port:
         for host in (args.host, *args.dns_also):
             serve_dns(host, args.dns_port, args.answer, args.answer6)
