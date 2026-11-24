@@ -3,7 +3,8 @@
 set -euo pipefail
 umask 077
 CODE=$1
-FIX=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a
+FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
+FIX=6d25c5f2418421d80520e099b845bfa02c82283e
 BR=integration/zapret2-batch1
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -52,7 +53,7 @@ for index in "${!FILES[@]}"; do
     exit 2
   fi
 done
-git -C "$REPO" diff --no-ext-diff --no-textconv --binary "$FIX^" "$FIX" -- "${FILES[@]}" \
+git -C "$REPO" diff --no-ext-diff --no-textconv --binary "$FIX_BASE" "$FIX" -- "${FILES[@]}" \
   >"$D/return.patch"
 [[ -s $D/return.patch ]]
 if git -c core.autocrlf=false apply --reverse --check "$D/return.patch" \
@@ -93,5 +94,6 @@ result=0
 contracts status --portable tests/test_desync_standalone.py || result=2
 contracts managed \
   tests/test_singbox_generations.py::test_standalone_return_keeps_legacy_until_managed_bridge_is_verified \
+  tests/test_singbox_generations.py::test_off_during_standalone_start_preserves_or_finishes_bridge_shutdown \
   || result=2
 exit "$result"

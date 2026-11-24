@@ -3,7 +3,8 @@
 set -euo pipefail
 umask 077
 CODE=$1
-FIX=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a
+FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
+FIX=6d25c5f2418421d80520e099b845bfa02c82283e
 BR=integration/zapret2-batch1
 UNIT=xgw-standalone-return-rollback
 OVERLAY=--standalone-return
@@ -92,16 +93,18 @@ while time.monotonic() < deadline:
     marker = (runtime / "singbox-managed").is_file()
     pending, draining = bool(state["pending"]), bool(state["draining"])
     resume = state.get("resume_managed") is True
+    stopping = state.get("standalone_stopping") is True
     sample = {"active": active, "marker": marker, "pending": pending, "draining": draining,
-              "resume_managed": resume, "units": unit_state}
+              "resume_managed": resume, "standalone_stopping": stopping, "units": unit_state}
     if sample != last:
         print(json.dumps(sample, sort_keys=True), flush=True)
         last = sample
     if wanted == "paused":
         ready = (active == "legacy" and not marker and resume and not pending and not draining
+                 and not stopping
                  and all(value in ("inactive", "failed") for value in unit_state.values()))
     else:
-        managed = (active in ("blue", "green") and marker and not pending and not resume
+        managed = (active in ("blue", "green") and marker and not pending and not resume and not stopping
                    and unit_state.get(f"xgw-singbox-{active}.service") == "active")
         ready = managed and (wanted != "stable" or (
             not draining and all(name == f"xgw-singbox-{active}.service"
@@ -165,7 +168,7 @@ stage() {
   git -C "$REPO" archive "$CODE" docs/helpers/desync_batch1_install.py \
     docs/helpers/t11_management_restore.sh |
     sudo -n tar --no-same-owner --no-same-permissions -x -C "$PAYLOAD/code" || return
-  git -C "$REPO" diff --no-ext-diff --no-textconv --binary "$FIX^" "$FIX" -- "${FILES[@]}" \
+  git -C "$REPO" diff --no-ext-diff --no-textconv --binary "$FIX_BASE" "$FIX" -- "${FILES[@]}" \
     >"$D/return.patch" || return
   [[ -s $D/return.patch ]] &&
     sudo -n git -c core.autocrlf=false -C "$PAYLOAD/code" apply --check - <"$D/return.patch" &&
