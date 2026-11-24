@@ -124,6 +124,7 @@ def test_selective_requires_exact_video_range_over_loopback(tunnel, reply, expec
         h.step(now)
     assert connected == [PAGE, CDN]
     assert h.controller.view["transport_probes"]["cdn"]["kind"] == expected
+    assert h.controller.view["transport_probes"]["cdn"]["range_verified"] is (expected == "ok")
     assert z.active(h.current) is (expected == "ok")
     if expected != "ok":
         assert h.controller.view["gate_closed"] and not h.runtime.up

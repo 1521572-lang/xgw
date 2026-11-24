@@ -691,6 +691,8 @@ class Controller:
                     "started_at": started_at,
                     **({} if media_transport else {"page_kind": youtube_probe_page_kind(url)}),
                 }
+                if media_file:
+                    self.transport_probes["cdn"]["range_verified"] = ok
                 if first_tls_timeout_ms is not None:
                     self.transport_probes["cdn"]["first_tls_timeout_ms"] = first_tls_timeout_ms
             if not ok:
@@ -873,6 +875,8 @@ class Controller:
                                                                     else "http"),
                            http=0 if connect else result.status, bytes=result.downloaded,
                            connect_http=result.status if connect else 0)
+            if target == "cdn" and verdict == "pass" and result.range_verified:
+                attempt["range_verified"] = True
         if control.redirect is not None:
             attempt["redirect"] = {
                 "http": control.redirect.http, "state": control.redirect.state,

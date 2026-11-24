@@ -8,11 +8,13 @@ from docs.helpers import headless_playback
 from docs.helpers import selective_admission as trial
 
 
-def active(at, *, http=206, size=65536):
+def active(at, *, started=None, http=206, size=65536, proof=True):
+    started = at - 1 if started is None else started
     return {
         "mode": "selective", "state": "active",
         "evidence": {"transport": "https_reachable", "last_transport_ok_at": at,
-                     "transport_probes": {"cdn": {"ok": True, "http": http, "bytes": size}}},
+                     "transport_probes": {"cdn": {"ok": True, "http": http, "bytes": size,
+                                                   "range_verified": proof, "started_at": started}}},
     }
 
 
@@ -20,6 +22,12 @@ def active(at, *, http=206, size=65536):
     ([active(110), active(110), active(170)], 0),
     ([active(110), active(110)], 2),
     ([active(110), active(170, http=200)], 2),
+    ([active(110), active(170, proof=None)], 2),
+    ([active(110), active(170, proof=False)], 2),
+    ([active(110), active(170, started=109)], 2),
+    ([active(110), active(170, started=110)], 2),
+    ([active(110), active(170, started=171)], 2),
+    ([active(110), active(150, started=109), active(170)], 0),
     ([active(99), active(110)], 2),
 ])
 def test_two_checks_require_distinct_fresh_range_results(monkeypatch, samples, result):

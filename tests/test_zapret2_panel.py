@@ -87,6 +87,37 @@ def test_youtube_transport_is_never_reported_as_playback():
     assert view(cfg, snap)["evidence"]["last_transport_ok_at"] is None
 
 
+@pytest.mark.parametrize(("path", "http", "written", "expected"), [
+    ("videoplayback", 206, True, True),
+    ("videoplayback", 206, None, None),
+    ("videoplayback", 206, "true", None),
+    ("videoplayback", 200, True, False),
+    ("generate_204", 204, None, None),
+    ("generate_204", 206, True, None),
+])
+def test_cdn_range_proof_is_explicit_and_revision_bound(path, http, written, expected):
+    cfg, snap = fixture(mode="selective", engine="off", reason="youtube_transport_ok",
+                        valid_until=NOW + 60)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                             f"https://r1.googlevideo.com/{path}"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"]["transport_probes"] = {
+        "page": {"ok": True},
+        "cdn": {"ok": True, "phase": "body", "http": http, "bytes": 65536,
+                "range_verified": written, "content-range": "private-header"},
+    }
+    result = view(cfg, snap)
+    assert result["evidence"]["playback"] == "not_tested"
+    assert result["evidence"]["transport_probes"]["cdn"].get("range_verified") is expected
+    assert ("проверочный диапазон" in result["detail"]) is (expected is True)
+    assert ("служебный адрес" in result["detail"]) is (path == "generate_204")
+    assert "private-header" not in json.dumps(result)
+    snap["zapret2_policy_key"] = "previous"
+    assert not view(cfg, snap)["evidence"]["transport_probes"]
+
+
 @pytest.mark.parametrize(("phase", "reason"), [
     ("pending", "route_reconcile"), ("unknown", "route_unconfirmed"),
 ])
@@ -385,7 +416,7 @@ def test_vpn_redirect_card_reports_final_range_without_location():
                         vpn_control_reason="ok", vpn_control_at=NOW - 1)
     snap["zapret2"]["vpn_control_attempts"] = [{
         "verdict": "pass", "reason": "ok", "at": NOW - 1, "phase": "body", "kind": "ok",
-        "http": 206, "bytes": 65536,
+        "http": 206, "bytes": 65536, "range_verified": True,
         "redirect": {"http": 302, "state": "followed", "host_changed": True,
                      "location": "private"},
     }]
@@ -393,8 +424,10 @@ def test_vpn_redirect_card_reports_final_range_without_location():
     row, = result["evidence"]["vpn_control_attempts"]
     assert row["redirect"] == {"http": 302, "state": "followed", "host_changed": True}
     assert row["http"] == 206
+    assert row["range_verified"] is True
     assert "private" not in json.dumps(result)
     assert "после перенаправления" in result["detail"]
+    assert "Диапазон CDN через VPN подтверждён" in result["detail"]
 
 
 def test_private_and_untrusted_fields_are_not_published():

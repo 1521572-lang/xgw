@@ -322,6 +322,7 @@ function probeText(row, missing) {
   if (row.http) parts.push("HTTP " + row.http);
   if (row.connect_http) parts.push("CONNECT " + row.connect_http);
   if (Number.isSafeInteger(row.bytes)) parts.push(count(row.bytes) + " Б");
+  if (row.range_verified === true) parts.push("Точный диапазон");
   if (Number.isSafeInteger(row.first_tls_timeout_ms)) {
     parts.push("Повтор после TLS-таймаута за " + count(row.first_tls_timeout_ms) + " мс");
     parts.push("Всего " + count(row.elapsed_ms) + " мс");

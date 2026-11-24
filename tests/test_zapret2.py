@@ -353,6 +353,8 @@ def test_youtube_transport_gate_retains_page_and_cdn_checks(
         rows = h.controller.view["transport_probes"]
         assert rows["page"]["bytes"] == 32768 and rows["page"]["ok"]
         assert rows["cdn"]["http"] == media_status and rows["cdn"]["ok"] is opens
+        assert "range_verified" not in rows["page"]
+        assert rows["cdn"].get("range_verified") is (opens if path == "videoplayback" else None)
     else:
         assert "transport_probes" not in h.controller.view
     if opens:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import replace
+from urllib.parse import urlsplit
 
 from .. import zapret2
 from ..desync import schema, worker
@@ -105,7 +106,15 @@ def _probe_metrics(row: dict) -> dict:
     return fields
 
 
-def _vpn_attempts(value: object, *, now: float) -> list[dict]:
+def _range_verified(row: dict, metrics: dict, successful: bool) -> bool | None:
+    evidence = row.get("range_verified")
+    if type(evidence) is not bool:
+        return None
+    return (evidence and successful and metrics["phase"] == "body"
+            and (metrics["http"], metrics["bytes"]) == (206, zapret2.PROBE_BYTES))
+
+
+def _vpn_attempts(value: object, *, now: float, target: str) -> list[dict]:
     if not isinstance(value, list):
         return []
     attempts = []
@@ -117,6 +126,10 @@ def _vpn_attempts(value: object, *, now: float) -> list[dict]:
                 or not _number(at) or not 0 <= at <= now):
             continue
         attempt = {"verdict": verdict, "reason": reason, "at": at, **_probe_metrics(row)}
+        if target == "cdn":
+            proof = _range_verified(row, attempt, verdict == "pass")
+            if proof is not None:
+                attempt["range_verified"] = proof
         redirect = _record(row.get("redirect"))
         state, http = redirect.get("state"), redirect.get("http")
         if (isinstance(state, str) and state in CDN_REDIRECT_STATES
@@ -144,6 +157,9 @@ def transport_probes(value: object, *, now: float) -> dict:
             kind = row.get("page_kind")
             fields["page_kind"] = kind if kind in PAGE_KINDS else None
         else:
+            proof = _range_verified(row, fields, row["ok"])
+            if proof is not None:
+                fields["range_verified"] = proof
             first = row.get("first_tls_timeout_ms")
             elapsed = fields["elapsed_ms"]
             if type(first) is int and elapsed is not None and 0 <= first <= elapsed:
@@ -279,7 +295,9 @@ Commands use the same validation as this card; observations remain revision-boun
             target = selected.get("vpn_control_target")
             if target in ("page", "cdn"):
                 vpn_control_target = target
-                vpn_control_attempts = _vpn_attempts(selected.get("vpn_control_attempts"), now=now)
+                vpn_control_attempts = _vpn_attempts(
+                    selected.get("vpn_control_attempts"), now=now, target=target,
+                )
                 vpn_control_retry_pending = (
                     target == "cdn" and phase == "fallback" and vpn_control == "fail"
                     and selected.get("vpn_control_retry_pending") is True
@@ -290,6 +308,9 @@ Commands use the same validation as this card; observations remain revision-boun
     queue = raw.get("queue") if source == "engine" else settings["queue_num"]
     queue = queue if type(queue) is int and 1 <= queue <= 65535 else None
     trusted = fresh and matched and not invalid
+    urls = settings["probe_urls"]
+    cdn_path = (urlsplit(urls[1]).path if settings.get("youtube_transport_probe")
+                and len(urls) == 2 else None)
     counters = {"queued_original": None, "queued_reply": None, "queue_dropped": None,
                 "queue_overflow": None, "queue_netlink_dropped": None, "strategy_switches": None}
     worker_start_ms = None
@@ -309,15 +330,30 @@ Commands use the same validation as this card; observations remain revision-boun
     if (trusted and settings["mode"] == "selective" and settings.get("youtube_transport_probe")
             and (transport == "https_reachable" or transport_failed)):
         transport_rows = transport_probes(selected.get("transport_probes"), now=now)
+        if cdn_path != "/videoplayback":
+            transport_rows.get("cdn", {}).pop("range_verified", None)
         if transport_failed:
             detail = transport_failure_detail(reason, transport_rows)
+        elif cdn_path == "/videoplayback" and transport_rows.get("cdn", {}).get("range_verified"):
+            detail = ("CDN передал проверочный диапазон 65 536 байт. "
+                      "Воспроизведение проверяется отдельно.")
+        elif cdn_path == "/generate_204":
+            detail = ("Страница и служебный адрес CDN доступны по HTTPS. "
+                      "Воспроизведение проверяется отдельно.")
     if phase == "fallback":
         detail += " Контроллер снял прямой маршрут."
         control_fresh = vpn_control_at is not None and now - vpn_control_at <= FRESH_SECONDS
         latest = next((row for row in reversed(vpn_control_attempts)
                        if row["at"] == vpn_control_at), {})
         if control_fresh and vpn_control_target == "cdn" and vpn_control == "pass":
-            if "redirect" in latest:
+            if latest.get("range_verified") is True:
+                if "redirect" in latest:
+                    detail += " Диапазон CDN через VPN подтверждён после перенаправления."
+                elif len(vpn_control_attempts) == 2:
+                    detail += " Повторная проба через VPN подтвердила диапазон CDN."
+                else:
+                    detail += " Диапазон того же CDN через VPN подтверждён."
+            elif "redirect" in latest:
                 detail += " CDN ответил через VPN после перенаправления."
             elif len(vpn_control_attempts) == 2:
                 detail += " Повторная проба того же URL CDN через VPN прошла."
@@ -340,7 +376,6 @@ Commands use the same validation as this card; observations remain revision-boun
             detail += " Доступность VPN проверяется отдельно."
     elif phase == "blocked" and settings["mode"] == "selective":
         detail += " Возврат маршрута не подтверждён."
-    urls = settings["probe_urls"]
     last_transport_ok_at = selected.get("last_transport_ok_at")
     if (not trusted or settings["mode"] != "selective"
             or not settings.get("youtube_transport_probe")

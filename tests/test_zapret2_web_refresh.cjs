@@ -80,6 +80,16 @@ function page() {
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+test("CDN probe text shows range only for explicit positive evidence", () => {
+  const browser = page();
+  const text = input => browser.evaluate("probeText(" + JSON.stringify(input) + ', "Нет данных")');
+  const media = {ok: true, phase: "body", http: 206, bytes: 65536};
+  assert.match(text({...media, range_verified: true}), /Точный диапазон/);
+  assert.doesNotMatch(text(media), /Точный диапазон/);
+  assert.doesNotMatch(text({...media, range_verified: false}), /Точный диапазон/);
+  assert.doesNotMatch(text({ok: true, http: 204, bytes: 0}), /Точный диапазон/);
+});
+
 test("ALT9 form only writes changed exclusions while the backend allows editing", () => {
   const browser = page();
   browser.evaluate(`

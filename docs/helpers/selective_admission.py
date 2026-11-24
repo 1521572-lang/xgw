@@ -133,6 +133,12 @@ def observe_admission(client, key, checks, since, timeout, *, recover_cdn_once=F
         if cdn.get("ok") is not True or (cdn.get("http"), cdn.get("bytes")) != (206, RANGE_BYTES):
             log("not_ready", reason="range_unconfirmed", http=cdn.get("http"), bytes=cdn.get("bytes"))
             return 2
+        if cdn.get("range_verified") is not True:
+            log("not_ready", reason="range_evidence_unavailable", http=206, bytes=RANGE_BYTES)
+            return 2
+        started = cdn.get("started_at")
+        if type(started) not in (int, float) or not last_sample < started <= at:
+            continue
         count += 1
         last_sample = at
         log("ready" if count == checks else "checking", checks=count, http=206, bytes=RANGE_BYTES,

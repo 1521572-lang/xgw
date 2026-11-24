@@ -210,6 +210,42 @@ def test_zapret2_queue_losses_are_visible_and_clear_on_stale_data(qapp):
         qapp.processEvents()
 
 
+def test_zapret2_qt_distinguishes_video_range_and_service_endpoint(qapp):
+    from test_zapret2_panel import NOW, fixture, view
+
+    from xgw.desync import schema
+    from xgw.gui.zapret2 import Zapret2Page
+
+    cfg, snap = fixture(mode="selective", engine="off", reason="youtube_transport_ok",
+                        valid_until=NOW + 60)
+    cfg.zapret2.youtube_transport_probe = True
+    main = SimpleNamespace(state=None, stale=False)
+    widget = Zapret2Page(main)
+    try:
+        for path, proof, message in [
+            ("videoplayback", True, "проверочный диапазон 65 536 байт"),
+            ("generate_204", None, "служебный адрес CDN"),
+        ]:
+            cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                                     f"https://r1.googlevideo.com/{path}"]
+            cfg.desync = schema.migrate(vars(cfg.zapret2))
+            snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+            snap["zapret2"]["transport_probes"] = {
+                "page": {"ok": True}, "cdn": {"ok": True, "phase": "body",
+                    "http": 206 if proof else 204, "bytes": 65536 if proof else 0,
+                    "range_verified": proof},
+            }
+            main.state = {"zapret2": view(cfg, snap)}
+            widget.show_state(main.state)
+            text = "\n".join(label.text() for label in widget.status.findChildren(QtWidgets.QLabel))
+            assert message in text and "Воспроизведение проверяется отдельно" in text
+            assert ("проверочный диапазон" in text) is bool(proof)
+    finally:
+        widget.close()
+        widget.deleteLater()
+        qapp.processEvents()
+
+
 def test_window_shows_real_state_and_keeps_working_when_resized(qapp, demo, tmp_path):
     client = _client(demo.port)
     win = _window(client, tmp_path)
