@@ -154,10 +154,13 @@ def check_phase(root, phase, args, queue, context):
 def check_matching(root, snapshots):
     queue = int(next(arg for arg in snapshots["base"] if arg.startswith("--qnum=")).split("=", 1)[1])
     cmd.run(["/usr/sbin/ip", "link", "set", "lo", "up"], timeout=3)
-    rules = ("table inet xgw_scope_trial { chain loopback_only { "
-             "type filter hook output priority filter; policy accept; "
-             f'oifname "lo" ip daddr 127.0.0.0/8 tcp dport {PORT} queue num {queue}; '
-             "} }\n")
+    rules = f'''table inet xgw_scope_trial {{
+  chain loopback_only {{
+    type filter hook output priority filter; policy accept;
+    oifname "lo" ip daddr 127.0.0.0/8 tcp dport {PORT} queue num {queue}
+  }}
+}}
+'''
     try:
         with https_server(root) as context:
             cmd.run(["/usr/sbin/nft", "-f", "-"], input=rules, timeout=3)
