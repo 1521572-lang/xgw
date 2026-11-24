@@ -189,8 +189,9 @@ def test_media_reports_why_matched_sockets_lack_outbound_evidence(
     (0, None, {"no_access_record": 1}),
     (2, None, {"ambiguous": 1}),
 ])
+@pytest.mark.parametrize("target_prefix", ["tcp:", "//"])
 def test_flow_evidence_requires_exact_client_endpoint_and_unique_xray_record(
-    matches, group, unmatched,
+    matches, group, unmatched, target_prefix,
 ):
     boot = "01234567-abcd-0123-abcd-0123456789ab"
     epoch = f"{boot}:42:1"
@@ -205,15 +206,22 @@ def test_flow_evidence_requires_exact_client_endpoint_and_unique_xray_record(
     event = {
         "_SYSTEMD_UNIT": "xgw-xray.service", "_BOOT_ID": boot.replace("-", ""), "_PID": "42",
         "__REALTIME_TIMESTAMP": "104200000",
-        "MESSAGE": "from tcp:192.0.2.1:43120 accepted tcp:198.51.100.2:443 "
+        "MESSAGE": f"from tcp:192.0.2.1:43120 accepted {target_prefix}198.51.100.2:443 "
                    "[tun-in -> proxy-private]",
     }
     wrong_port = event | {"MESSAGE": event["MESSAGE"].replace("43120", "43121")}
     wrong_peer = event | {"MESSAGE": event["MESSAGE"].replace("198.51.100.2", "198.51.100.3")}
     wrong_inbound = event | {"MESSAGE": event["MESSAGE"].replace("tun-in", "zapret2-probe")}
+    untrusted_target = event | {
+        "MESSAGE": event["MESSAGE"].replace(":443 ", ":443/path?private=1 "),
+    }
+    non_tcp = event | {"MESSAGE": event["MESSAGE"].replace(
+        f"accepted {target_prefix}", "accepted udp:",
+    )}
     other_process = event | {"_PID": "41"}
     result = flow_evidence.analyze(
-        player, [wrong_port, wrong_peer, wrong_inbound, other_process, *([event] * matches)],
+        player, [wrong_port, wrong_peer, wrong_inbound, untrusted_target, non_tcp, other_process,
+                 *([event] * matches)],
         before, after,
     )
     assert result["qualified_flows"] == 1

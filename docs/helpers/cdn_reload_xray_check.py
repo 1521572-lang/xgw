@@ -3,7 +3,6 @@
 import contextlib
 import json
 import os
-import re
 import socket
 import subprocess
 import tempfile
@@ -12,6 +11,7 @@ from pathlib import Path
 
 from test_zapret2 import Harness
 
+from docs.helpers.xray_access import endpoint, parse_accepted
 from xgw import zapret2
 from xgw.apply.applier import Applier, ApplySource
 from xgw.paths import Paths
@@ -32,16 +32,26 @@ def require(condition, label):
 def observe_route(log, host, outbound):
     log_size = log.stat().st_size if log.exists() else 0
     with socket.create_connection(("127.0.0.1", CLIENT_PORT), timeout=2) as client:
+        local = client.getsockname()
         client.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
         with contextlib.suppress(ConnectionError, TimeoutError):
             client.recv(4096)
-    pattern = rf"accepted tcp:{re.escape(host)}:443 \[tproxy-in (?:->|>>|==>) (\S+)\]"
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         if log.exists():
-            with log.open(encoding="utf-8") as stream:
+            with log.open("rb") as stream:
                 stream.seek(log_size)
-                matches = re.findall(pattern, stream.read())
+                complete, _, _ = stream.read().rpartition(b"\n")
+            matches = []
+            for line in complete.decode("utf-8").splitlines():
+                accepted = parse_accepted(line)
+                if accepted is None or (accepted.target, accepted.inbound) != (
+                    f"{host}:443", "tproxy-in"
+                ):
+                    continue
+                with contextlib.suppress(ValueError):
+                    if endpoint(accepted.source) == local:
+                        matches.append(accepted.outbound)
             if matches:
                 return matches == [outbound]
         time.sleep(0.05)

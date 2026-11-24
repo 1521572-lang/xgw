@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
-import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -18,25 +16,13 @@ from docs.helpers.selective_media_evidence import (
     read_log,
     read_rows,
 )
+from docs.helpers.xray_access import endpoint, parse_accepted
 from xgw.desync import route_evidence
 from xgw.net.capture import CAPTURE_TAGS
 from xgw.zapret2 import OUT
 
 XRAY_UNIT = "xgw-xray.service"
 MAX_CAPTURE_SECONDS = 180
-ACCESS = re.compile(
-    r"(?:^|\s)from (?:tcp:)?(\S+) accepted tcp:(\S+) \[(\S+) (?:->|>>|==>) (\S+?)\]"
-)
-
-
-def endpoint(value):
-    host, separator, port = value.rpartition(":")
-    if not separator or not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
-        raise ValueError("invalid_endpoint")
-    address = ipaddress.ip_address(host.removeprefix("[").removesuffix("]"))
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
-        address = address.ipv4_mapped
-    return str(address), int(port)
 
 
 def media_flows(player, start, end):
@@ -72,14 +58,14 @@ def access_records(journal, snapshot, start, end):
         message = row.get("MESSAGE")
         if not start <= when <= end or not isinstance(message, str):
             continue
-        match = ACCESS.search(message)
-        if not match or match[3] not in CAPTURE_TAGS:
+        accepted = parse_accepted(message)
+        if accepted is None or accepted.inbound not in CAPTURE_TAGS:
             continue
         try:
-            source, target = endpoint(match[1]), endpoint(match[2])
+            source, target = endpoint(accepted.source), endpoint(accepted.target)
         except ValueError:
             continue
-        group = snapshot["tags"].get(match[4], {}).get("group")
+        group = snapshot["tags"].get(accepted.outbound, {}).get("group")
         records[source, target].append(
             (when, group if group in route_evidence.GROUPS else "other")
         )

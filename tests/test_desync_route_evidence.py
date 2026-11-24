@@ -58,7 +58,8 @@ def test_rejects_restart_config_change_and_counter_reset():
         route_evidence.deltas(before, snapshot(2, 9, 20, 20))
 
 
-def test_cdn_access_match_uses_socket_window_and_xray_epoch():
+@pytest.mark.parametrize("prefix", ["tcp:", "//"])
+def test_cdn_access_match_uses_socket_window_and_xray_epoch(prefix):
     from docs.helpers.standalone_cdn_compare import route_match
 
     boot = "12345678123412341234123456789abc"
@@ -69,17 +70,54 @@ def test_cdn_access_match_uses_socket_window_and_xray_epoch():
               "peer": "1.1.1.1", "started": 104, "finished": 114}
     entry = {"_SYSTEMD_UNIT": "xgw-xray.service", "_BOOT_ID": boot, "_PID": "42",
              "__REALTIME_TIMESTAMP": "105000000",
-             "MESSAGE": "from 192.0.2.1:50123 accepted tcp:1.1.1.1:443 [tproxy-in -> xgw-zapret2]"}
+             "MESSAGE": f"from 192.0.2.1:50123 accepted {prefix}1.1.1.1:443 "
+                        "[tproxy-in -> xgw-zapret2]"}
     wrong_process = {**entry, "_PID": "43"}
     later = {**entry, "__REALTIME_TIMESTAMP": "120000000"}
     assert route_match(sample, [entry, wrong_process, later], before, after) == {
         "state": "observed", "group": "zapret2",
     }
     assert route_match(sample, [wrong_process, later], before, after) == {"state": "no_access_record"}
-    assert route_match(sample, [entry, entry], before, after) == {"state": "ambiguous"}
+    other_prefix = "//" if prefix == "tcp:" else "tcp:"
+    duplicate = {**entry, "MESSAGE": entry["MESSAGE"].replace(
+        f"accepted {prefix}", f"accepted {other_prefix}",
+    )}
+    assert route_match(sample, [entry, duplicate], before, after) == {"state": "ambiguous"}
     assert route_match(sample, [entry], before, {**after, "xray_epoch": "changed"})["state"] == (
         "snapshots_incomparable"
     )
+
+
+@pytest.mark.parametrize("prefix", ["tcp:", "//"])
+def test_xray_reload_trial_matches_only_the_current_connect(tmp_path, monkeypatch, prefix):
+    from docs.helpers.cdn_reload_xray_check import MEDIA, observe_route
+
+    log = tmp_path / "xray-access.log"
+    # An earlier row with the same endpoints lies outside the appended window.
+    line = f"2026/11/24 19:00:00.000001 from 127.0.0.1:41000 accepted {prefix}{MEDIA}:443"
+    log.write_text(f"{line} [tproxy-in -> old]\n", encoding="utf-8")
+
+    class Connection:
+        def getsockname(self):
+            return ("127.0.0.1", 41000)
+
+        def sendall(self, data):
+            assert data.startswith(f"CONNECT {MEDIA}:443 ".encode())
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write(f"{line.replace(':41000', ':41001')} [tproxy-in -> other]\n")
+                stream.write(f"{line} [probe-in -> other]\n")
+                stream.write(f"{line} [tproxy-in -> vpn-fixture]\n")
+
+        def recv(self, _size):
+            return b"HTTP/1.1 200 Connection established\r\n\r\n"
+
+    @contextmanager
+    def connect(_address, *, timeout):
+        assert timeout == 2
+        yield Connection()
+
+    monkeypatch.setattr("docs.helpers.cdn_reload_xray_check.socket.create_connection", connect)
+    assert observe_route(log, MEDIA, "vpn-fixture")
 
 
 def test_live_snapshots_compare_reformatted_config_and_reject_routing_order_changes(
