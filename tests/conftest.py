@@ -19,7 +19,7 @@ PORTABLE_TESTS = {"test_desync_schema.py", "test_zapret2_panel.py", "test_geodat
                   "test_desync_flowseal.py", "test_desync_route_evidence.py",
                   "test_youtube_telemetry.py", "test_zapret2.py", "test_zapret2_management.py",
                   "test_selective_probe_watch.py", "test_desync_jobs.py",
-                  "test_desync_monitor_budget.py",
+                  "test_desync_monitor_budget.py", "test_desync_monitor_expiry.py",
                   "test_selective_admission.py", "test_standalone_cdn_compare.py",
                   "test_acceptance_gate.py"}
 

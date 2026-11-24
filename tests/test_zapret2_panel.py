@@ -4,12 +4,13 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from xgw.config import Config
-from xgw.desync import schema, worker
+from xgw.desync import client, schema, worker
 from xgw.watch.zapret2_control import card, transport_probes
 
 NOW = 1000
@@ -146,6 +147,51 @@ def test_cdn_expiry_exposes_only_deadline_and_blocks_selective():
     cfg.zapret2.probe_urls = []
     cfg.desync = schema.migrate(vars(cfg.zapret2))
     assert view(cfg, snap)["can_replace_cdn_probe"] is False
+
+
+def test_monitor_tracks_cdn_expiry_from_panel_without_leaking_probe(tmp_path, monkeypatch):
+    expiry = NOW + 20
+    cfg, snap = fixture(mode="selective", engine="off", reason="youtube_transport_ok",
+                        valid_until=expiry)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                             f"https://r1.googlevideo.com/videoplayback?expire={expiry}&sig=private"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    clock = SimpleNamespace(elapsed=0)
+
+    def sleep(seconds):
+        clock.elapsed += seconds
+
+    time_api = client.time
+    monkeypatch.setattr(client, "time", SimpleNamespace(
+        time=lambda: NOW + clock.elapsed, monotonic=lambda: clock.elapsed, sleep=sleep,
+        strftime=time_api.strftime, gmtime=time_api.gmtime))
+
+    def panel_request(path):
+        assert path == "/api/state"
+        if clock.elapsed >= 45:
+            snap["updated"] = NOW + 42
+            snap["zapret2"].update(state="fallback", gate_closed=True, reason="youtube_cdn_expired")
+        return {"zapret2": card(cfg, snap, {"mode": "on"}, True, now=NOW + clock.elapsed)}
+
+    journal = tmp_path / "expiry.jsonl"
+    result = client.monitor(SimpleNamespace(request=panel_request), journal, seconds=60, interval=15)
+    assert result["samples"] == 5
+    raw = journal.read_text(encoding="utf-8")
+    assert "sig=private" not in raw and "r1.googlevideo.com" not in raw
+    assert all(row["cdn_expires_at"] == expiry for row in map(json.loads, raw.splitlines()))
+    summary = client.analyze(journal)["cdn_expiry"]
+    assert summary["observed_crossings"] == summary["crossings_with_post_expiry_status"] == 1
+    assert summary["confirmed_expiry_reactions"] == {"fallback": 1}
+
+
+@pytest.mark.parametrize("expiry", [None, "1020", True, -1, 253402300800])
+def test_monitor_ignores_missing_or_malformed_cdn_deadline(expiry):
+    observation = client.observation({"zapret2": {
+        "mode": "selective", "probe_expiry": [{"probe": 2, "expires_at": expiry}],
+    }})
+    assert "cdn_expires_at" not in observation and "observed_at" not in observation
 
 
 def test_transport_probe_details_are_private_and_revision_bound():

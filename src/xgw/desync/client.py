@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
 from .monitor_budget import MAX_TIME, budget_summary
+from .monitor_expiry import cdn_expiry_summary, valid_cdn_deadline
 from .monitor_probes import MAX_SAMPLE_GAP_SECONDS, matched_policy, probe_summary, vpn_probe_attempts
 
 MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm", "worker_start")
@@ -60,6 +61,21 @@ class Client:
             connection.close()
 
 
+def _observed_cdn_deadline(card, now):
+    probes = card.get("probe_expiry")
+    if card.get("mode") != "selective" or not isinstance(probes, list) or len(probes) != 1:
+        return {}
+    probe = probes[0]
+    if not isinstance(probe, dict) or type(probe.get("probe")) is not int or probe["probe"] != 2:
+        return {}
+    deadline = probe.get("expires_at")
+    if not valid_cdn_deadline(deadline):
+        return {}
+    observed = card.get("observed_at")
+    return {"cdn_expires_at": deadline, "observed_at": (
+        observed if type(observed) in (int, float) and 0 <= observed <= now else None)}
+
+
 def observation(state):
     """Whitelist only aggregate metrics: no servers, URLs, cookies, IPs or device IDs."""
     card = state.get("zapret2") or {}
@@ -83,6 +99,7 @@ def observation(state):
                                          "limit_bytes", "resets_at") if k in budget},
         "job_state": (card.get("job") or {}).get("state"),
         "pool_mode": pool.get("mode"), "pool_closed": traffic.get("closed"),
+        **_observed_cdn_deadline(card, now),
         "probes": {name: {k: row[k] for k in ("ok", "phase", "kind", "elapsed_ms",
                                              "http", "bytes", "started_at", "first_tls_timeout_ms",
                                              "range_verified")
@@ -183,6 +200,7 @@ def analyze(path):
         "fallback_seconds_by_reason": dict(fallback),
         "observed_probe_attempts": probe_summary(rows),
         "budget": budget_summary(rows),
+        "cdn_expiry": cdn_expiry_summary(rows),
         "note": "Sampled status and probe outcomes do not prove playback or a free-pool recovery."}
 
 
