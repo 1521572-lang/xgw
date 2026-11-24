@@ -13,6 +13,8 @@ from itertools import pairwise
 from pathlib import Path
 
 from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
+from .monitor_budget import MAX_TIME, budget_summary
+from .monitor_probes import MAX_SAMPLE_GAP_SECONDS, matched_policy, probe_summary, vpn_probe_attempts
 
 MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm", "worker_start")
 
@@ -66,8 +68,9 @@ def observation(state):
     pool = state.get("free_pool") or {}
     summary = pool.get("summary") or {}
     traffic = summary.get("traffic") or {}
+    now = time.time()
     return {
-        "at": time.time(), "utc_day": time.strftime("%Y-%m-%d", time.gmtime()),
+        "at": now, "utc_day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "health": state.get("state"), "updated": state.get("updated"),
         "mode": card.get("mode"), "engine_mode": card.get("engine_mode"),
         "state": card.get("state"),
@@ -81,11 +84,13 @@ def observation(state):
         "job_state": (card.get("job") or {}).get("state"),
         "pool_mode": pool.get("mode"), "pool_closed": traffic.get("closed"),
         "probes": {name: {k: row[k] for k in ("ok", "phase", "kind", "elapsed_ms",
-                                             "http", "bytes", "range_verified")
+                                             "http", "bytes", "started_at", "first_tls_timeout_ms",
+                                             "range_verified")
                          if k in row and (k != "range_verified"
                                           or (name == "cdn" and type(row[k]) is bool))}
                    for name, row in (evidence.get("transport_probes") or {}).items()
                    if name in ("page", "cdn") and isinstance(row, dict)},
+        "vpn_probe_attempts": vpn_probe_attempts(evidence, now),
     }
 
 
@@ -128,34 +133,44 @@ def _policy_label(row):
 
 
 def analyze(path):
+    from ..watch.zapret2_control import REASONS, TITLES
+
     if path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("monitor_size_limit")
     rows = []
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
-            if not isinstance(row, dict) or type(row.get("at")) not in (int, float):
+            at = row.get("at") if isinstance(row, dict) else None
+            if type(at) not in (int, float) or not 0 <= at < MAX_TIME:
                 raise ValueError("monitor_schema")
             rows.append(row)
             if len(rows) > 6002:
                 raise ValueError("monitor_sample_limit")
-    durations, policies = Counter(), Counter()
+    durations, policies, fallback = Counter(), Counter(), Counter()
     boundaries = gaps = 0
+    latest_at = rows[0]["at"] if rows else 0
     for first, last in pairwise(rows):
         elapsed = last["at"] - first["at"]
-        if not 0 < elapsed <= 600:
+        overlaps = first["at"] < latest_at
+        latest_at = max(latest_at, last["at"])
+        if overlaps or not 0 < elapsed <= MAX_SAMPLE_GAP_SECONDS:
             gaps += 1
             continue
-        key = first.get("config_key")
-        matched = (isinstance(key, str) and bool(key) and key == last.get("config_key")
-                   and all(row.get("fresh") is True and row.get("policy_matched") is True
-                           for row in (first, last)))
+        matched = matched_policy(first, last)
         state, mode = first.get("state"), _policy_label(first)
-        same_state = matched and isinstance(state, str) and state and state == last.get("state")
+        same_state = (matched and isinstance(state, str) and state in TITLES
+                      and state == last.get("state"))
         durations[state if same_state else "unconfirmed"] += elapsed
+        if same_state and state == "fallback":
+            reason = first.get("reason")
+            known = isinstance(reason, str) and reason in REASONS and reason == last.get("reason")
+            fallback[reason if known else "unconfirmed"] += elapsed
         same_mode = matched and mode and mode == _policy_label(last)
         policies[mode if same_mode else "unconfirmed"] += elapsed
-        a, b = first.get("budget") or {}, last.get("budget") or {}
+        a, b = first.get("budget"), last.get("budget")
+        a = a if isinstance(a, dict) else {}
+        b = b if isinstance(b, dict) else {}
         if (isinstance(a.get("resets_at"), int) and isinstance(b.get("resets_at"), int)
                 and b["resets_at"] - a["resets_at"] == 86400):
             boundaries += 1
@@ -165,7 +180,10 @@ def analyze(path):
         "large_or_backward_gaps": gaps,
         "utc_boundary_sample_pairs": boundaries,
         "api_errors": sum(bool(r.get("error")) for r in rows),
-        "note": "Status intervals do not prove playback or a free-pool recovery."}
+        "fallback_seconds_by_reason": dict(fallback),
+        "observed_probe_attempts": probe_summary(rows),
+        "budget": budget_summary(rows),
+        "note": "Sampled status and probe outcomes do not prove playback or a free-pool recovery."}
 
 
 def matrix_report(path):

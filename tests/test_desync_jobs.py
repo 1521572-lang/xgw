@@ -423,6 +423,44 @@ def test_monitor_separates_policy_from_state_and_reads_legacy_journals(tmp_path)
     assert stats["elapsed_seconds"] == 480
 
 
+def test_monitor_counts_distinct_probe_attempts_and_bounded_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(client.time, "time", lambda: 120)
+    exact = {"range_verified": True, "phase": "body", "http": 206, "bytes": 65536}
+    state = {"config_key": "same", "state": "fallback", "fresh": True, "policy_matched": True,
+             "reason": "youtube_cdn_probe_failed"}
+    first_vpn = {"at": 110, "verdict": "fail", "url": "private-token"}
+    first = client.observation({"zapret2": state | {"evidence": {
+        "transport_probes": {"page": {"ok": True, "started_at": 101},
+                             "cdn": {"ok": False, "started_at": 102, "elapsed_ms": 700,
+                                     "first_tls_timeout_ms": 360, "range_verified": False}},
+        "vpn_control_target": "cdn", "vpn_control_attempts": [first_vpn],
+    }}})
+    retry = client.observation({"zapret2": state | {"evidence": {
+        "vpn_control_target": "cdn", "vpn_control_attempts": [
+            first_vpn, {"at": 119, "verdict": "pass", "url": "private-token", **exact}],
+    }}})
+    legacy = first | {"probes": {"cdn": {"ok": True, **exact}}}
+    stale = first | {"fresh": False, "probes": {"cdn": {"ok": True, "started_at": 498, **exact}}}
+    rows = [first, first | {"at": 180}, retry | {"at": 240},
+            legacy | {"at": 300, "reason": "private-token"}, stale | {"at": 500},
+            first | {"at": 240}, first | {"at": 300}]
+    path = tmp_path / "monitor.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    result = client.analyze(path)
+    assert "private-token" not in json.dumps(first) + json.dumps(retry) + json.dumps(result)
+    assert result["fallback_seconds_by_reason"] == {"youtube_cdn_probe_failed": 120,
+                                                   "unconfirmed": 60}
+    assert result["large_or_backward_gaps"] == 2
+    assert result["observed_probe_attempts"] == {
+        "direct_page": {"first_pass": 1},
+        "direct_cdn": {"first_fail": 1, "retry_fail": 1, "range_unavailable": 1,
+                       "range_unverified": 1},
+        "vpn_page": {},
+        "vpn_cdn": {"first_fail": 1, "retry_pass": 1, "range_unavailable": 1,
+                    "range_verified": 1},
+    }
+
+
 def test_corrupt_job_does_not_prevent_start(job_store):
     instance, _path, _policy = job_store
     instance.directory.mkdir()
