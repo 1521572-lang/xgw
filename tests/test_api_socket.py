@@ -13,7 +13,7 @@ from xgw import engine
 from xgw.generator import builder
 from xgw.paths import Paths
 from xgw.xraycore import api as api_module
-from xgw.xraycore.service import PidfileXrayService
+from xgw.xraycore.service import PidfileXrayService, ProcessXrayService, XrayServiceError
 
 
 def test_config_api_listens_on_the_socket_by_default_and_on_the_given_path():
@@ -84,6 +84,26 @@ def test_process_service_makes_the_socket_dir_and_drops_a_stale_socket(tmp_path)
         assert not sock_path.exists()
     finally:
         service.stop()
+
+
+@pytest.mark.parametrize("service_class", [PidfileXrayService, ProcessXrayService])
+def test_process_service_rejects_long_api_path_before_start_or_stop(
+        tmp_path, monkeypatch, service_class):
+    listen = "/" + "я" * 54 + "/api.sock"
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"api": {"listen": listen}}), encoding="utf-8")
+    args = (tmp_path / "run" / "xray.pid",) if service_class is PidfileXrayService else ()
+    service = service_class(tmp_path / "xray", config, *args)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("некорректный адрес должен быть проверен до изменения процесса")
+
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(service, "stop", forbidden)
+    for action in (service.start, service.restart):
+        with pytest.raises(XrayServiceError, match="предел 107"):
+            action()
+    assert not (tmp_path / "run").exists()
 
 
 def test_xray_api_output_is_bounded():

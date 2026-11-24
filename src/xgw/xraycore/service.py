@@ -21,13 +21,20 @@ from pathlib import Path
 
 from .. import log, masking
 from ..paths import atomic_write_json
-from .api import applied_listen
+from .api import applied_listen, listen_path_error
 
 MAX_LOG_BYTES = 2 * 1024 * 1024
 
 
 class XrayServiceError(Exception):
     pass
+
+
+def _checked_listen(config_path: str) -> str:
+    listen = applied_listen(Path(config_path))
+    if error := listen_path_error(listen):
+        raise XrayServiceError(error)
+    return listen
 
 
 class XrayService(ABC):
@@ -121,6 +128,7 @@ class ProcessXrayService(XrayService):
     def start(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
+        _checked_listen(self.config_path)
         if self._err is not None:
             self._err.close()
         self._err = tempfile.TemporaryFile()  # noqa: SIM115 — живёт, пока жив процесс
@@ -153,6 +161,7 @@ class ProcessXrayService(XrayService):
                 self._proc.wait(timeout=self.grace)
 
     def restart(self) -> None:
+        _checked_listen(self.config_path)
         self.stop()
         self.start()
 
@@ -335,11 +344,11 @@ class PidfileXrayService(XrayService):
                 f"процесс из {self.pid_file} не удалось проверить ({exc}) — второй экземпляр "
                 "не запускаю"
             ) from exc
+        listen = _checked_listen(self.config_path)
         self.pid_file.parent.mkdir(parents=True, exist_ok=True)
         # Каталог сокета API: у службы его создаёт (и убирает при любой остановке) systemd —
         # RuntimeDirectory, здесь — сами. Ядро не работает (is_active выше), а сокет остался —
         # процесс убили без уборки: новый Xray с ним не запустится (address already in use).
-        listen = applied_listen(Path(self.config_path))
         if listen.startswith("/"):
             socket_path = Path(listen)
             socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,5 +427,6 @@ class PidfileXrayService(XrayService):
         self.identity_file.unlink(missing_ok=True)
 
     def restart(self) -> None:
+        _checked_listen(self.config_path)
         self.stop()
         self.start()

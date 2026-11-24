@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from xgw.generator import validate
 from xgw.xraycore import binary
 
@@ -33,6 +35,22 @@ def _fake_xray(monkeypatch, *, version: str, reject: str = ""):
 def test_no_binary_means_not_verified():
     verdict, output = validate.validate_config({}, None)
     assert verdict is None and "не найден" in output
+
+
+@pytest.mark.parametrize(("listen", "expected"), [
+    ("/" + "a" * 106, True), ("/" + "я" * 53, True), ("127.0.0.1:10085", True),
+    ("/" + "a" * 107, False), ("/" + "я" * 53 + "a", False),
+])
+def test_xray_socket_length_is_checked_in_bytes_before_starting_validation(
+        monkeypatch, tmp_path, listen, expected):
+    calls = _fake_xray(monkeypatch, version="26.3.27")
+    ok, detail = validate.validate_config({"api": {"listen": listen}}, tmp_path / "xray")
+    assert ok is expected
+    if expected:
+        assert calls[-1][1:3] == ["run", "-test"]
+    else:
+        assert calls == []
+        assert "108 байт, предел 107" in detail and listen not in detail
 
 
 def test_old_xray_is_refused_before_test(monkeypatch, tmp_path):

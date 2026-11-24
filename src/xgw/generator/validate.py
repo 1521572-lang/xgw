@@ -20,6 +20,7 @@ from typing import TypeVar
 from .. import masking
 from ..paths import Paths, secret_tempdir
 from ..xraycore import binary
+from ..xraycore.api import config_listen, listen_path_error
 
 T = TypeVar("T")
 
@@ -98,11 +99,13 @@ def _test_once(config: dict, xray_bin: Path) -> tuple[bool | None, str]:
 
 
 def validate_config(config: dict, xray_bin: Path | None) -> tuple[bool | None, str]:
-    """True/False — вердикт xray run -test; None — Xray не найден (проверка пропущена).
+    """Проверка адреса сокета и xray run -test; None — вердикт ядра недоступен.
 
     Xray старше минимальной версии — отказ ещё до проверки: такой бинарник
     конфиг примет, но поле httpMethod проигнорирует.
     """
+    if error := listen_path_error(config_listen(config)):
+        return False, error
     if xray_bin is None:
         return None, "xray не найден — проверка xray run -test пропущена"
     version = binary.installed_version(xray_bin)

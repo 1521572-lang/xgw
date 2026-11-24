@@ -71,15 +71,30 @@ def server_address(listen: str) -> str:
     return f"unix://{listen}" if listen.startswith("/") else listen
 
 
+def config_listen(config: object) -> str:
+    api = config.get("api") if isinstance(config, dict) else None
+    listen = api.get("listen") if isinstance(api, dict) else None
+    return listen if isinstance(listen, str) else ""
+
+
+def listen_path_error(listen: str) -> str:
+    """Linux stores a filesystem socket address in 108 bytes including the NUL."""
+    if not listen.startswith("/"):
+        return ""
+    size = len(os.fsencode(listen))
+    if size <= 107:
+        return ""
+    return (f"Путь сокета API Xray слишком длинный ({size} байт, предел 107). "
+            "Укажите более короткий XGW_ROOT.")
+
+
 def applied_listen(config_file: Path) -> str:
     """api.listen из файла конфига Xray; "" — файла нет, он не читается или адреса в нём нет."""
     try:
         config = json.loads(config_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
-    api = config.get("api") if isinstance(config, dict) else None
-    listen = api.get("listen") if isinstance(api, dict) else None
-    return listen if isinstance(listen, str) else ""
+    return config_listen(config)
 
 
 
