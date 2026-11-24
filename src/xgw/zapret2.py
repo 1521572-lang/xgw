@@ -942,14 +942,20 @@ class Controller:
                                 and self.view.get("gate_closed") is True):
                             return False
                         raise ValueError("probe_budget")
-                scaffold = patch(applied, cfg, enabled=active(applied))
+                keep_direct = self.ready and self.healthy and active(applied)
+                scaffold = patch(applied, cfg, enabled=keep_direct)
                 if scaffold != applied:
-                    # Сначала служебный вход; прямое правило здесь не появляется.
+                    # До новой пробы оставляем только служебный маршрут. В применённом
+                    # Xray может ещё быть клиентское правило от предыдущего контроллера.
                     self.cdn_gate_until = None
                     self.runtime.gate()
-                    changed = apply(patch(applied, cfg), applied)
+                    target = patch(applied, cfg) if keep_direct else scaffold
+                    changed = apply(target, applied)
                     if not changed:
                         raise ValueError("apply_failed")
+                    if self.healthy:
+                        self.healthy = False
+                        self.next_check = now
                     self.start_deadline = now + START_WAIT
                     self.view = {"state": "preparing", "reason": "probe_inbound"}
                     return changed

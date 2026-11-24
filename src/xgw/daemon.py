@@ -2615,6 +2615,13 @@ class Daemon:
     def close_desync(self, *, keep_engine: bool = False) -> None:
         if self._desync_retired:
             return
+        if keep_engine and self.cfg.zapret2.mode == "selective":
+            applied = engine.read_json(self.paths.xray_config_file)
+            if applied is not None and zapret2.active(applied):
+                # Пока перехват и прежний воркер согласованы, возвращаем новые
+                # клиентские соединения на обычный маршрут до остановки воркера.
+                with contextlib.suppress(OSError, ValueError, cmd.CommandError):
+                    self._zapret2_apply(zapret2.patch(applied, self.cfg, probe=False), applied)
         with contextlib.suppress(OSError, cmd.CommandError):
             self._zapret2.close()
         if not keep_engine:

@@ -3759,6 +3759,43 @@ def test_zapret2_status_waits_for_confirmed_fallback_after_gate_expires(daemon):
     assert daemon._zapret2_status(True) == {"state": "unknown", "reason": "expired"}
 
 
+@pytest.mark.parametrize("api_accepts", [True, False])
+def test_selective_reload_withdraws_client_rule_before_stopping_worker(
+    daemon, monkeypatch, api_accepts,
+):
+    from test_zapret2 import Runtime
+
+    from xgw import zapret2
+
+    _started(daemon)
+    daemon.capture = FakeCapture()
+    daemon.cfg.zapret2.mode = "selective"
+    daemon.cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                                    "https://r1.googlevideo.com/videoplayback"]
+    runtime = Runtime()
+    daemon._zapret2.runtime = runtime
+    daemon._zapret2.probe = lambda *args: True
+    for _ in range(3):
+        daemon.t += 1
+        daemon.tick()
+    assert runtime.up and zapret2.active(engine.read_json(daemon.paths.xray_config_file))
+    apply_route = daemon._zapret2_apply
+    runtime.events.clear()
+
+    def withdraw(target, base):
+        assert not runtime.events and runtime.up
+        assert zapret2.active(base) and not zapret2.active(target)
+        assert all(item["tag"] != zapret2.PROBE for item in target["inbounds"])
+        runtime.events.append(("withdraw", 0))
+        return api_accepts and apply_route(target, base)
+
+    monkeypatch.setattr(daemon, "_zapret2_apply", withdraw)
+    daemon.close_desync(keep_engine=True)
+    assert runtime.events == [("withdraw", 0), ("gate", 0), ("stop", 0)]
+    assert not runtime.up
+    assert zapret2.active(engine.read_json(daemon.paths.xray_config_file)) == (not api_accepts)
+
+
 def test_signed_cdn_deadline_survives_config_reload(daemon):
     settings = daemon.cfg.zapret2
     settings.mode = "selective"

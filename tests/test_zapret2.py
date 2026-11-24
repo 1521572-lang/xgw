@@ -631,6 +631,67 @@ def test_recovery_waits_and_rechecks():
     assert z.active(h.current)
 
 
+@pytest.mark.parametrize("case", ["passed", "new_cdn_failed", "withdrawal_rejected"])
+def test_cdn_change_with_unresolved_previous_route(case):
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    page = "https://www.youtube.com/t/terms"
+    old_cdn = "https://r1.googlevideo.com/videoplayback?sig=old-fixture"
+    new_cdn = "https://r2.googlevideo.com/videoplayback?sig=new-fixture"
+    h.cfg.zapret2.probe_urls = [page, old_cdn]
+    h.activate()
+    previous = h.controller
+    previous.close()
+    h.runtime.events.clear()
+    h.cfg.zapret2.probe_urls[1] = new_cdn
+    assert z.patch(h.current, h.cfg, enabled=True) == h.current
+    h.controller = z.Controller(previous.store, h.runtime)
+    h.accept = case != "withdrawal_rejected"
+    calls = []
+
+    def request(url, *_args, **_options):
+        assert h.runtime.up and not z.active(h.current)
+        calls.append(url)
+        if url == new_cdn and case == "new_cdn_failed":
+            return checks.DownloadResult(False, status=403, kind="http", phase="headers")
+        return checks.DownloadResult(True, status=200, downloaded=32768, phase="body")
+
+    h.controller._request = request
+    h.step(3)
+    assert h.runtime.events[:2] == [("gate", 0), ("apply", False)]
+    if case == "withdrawal_rejected":
+        assert all(action != "start" and (action != "gate" or not value)
+                   for action, value in h.runtime.events)
+        assert h.controller.view["state"] == "blocked" and not calls
+        assert not h.runtime.up and z.active(h.current)
+        return
+    assert not h.runtime.up and not z.active(h.current) and not calls
+    h.step(4)
+    assert h.runtime.up and not z.active(h.current) and not calls
+    h.step(5)
+    assert calls == [page, new_cdn]
+    assert z.active(h.current) is (case == "passed")
+    assert h.controller.view["state"] == ("active" if case == "passed" else "fallback")
+
+
+def test_changed_probe_listener_requires_new_proof_before_restoring_client_route():
+    h = Harness()
+    h.activate()
+    h.cfg.zapret2.probe_port += 1
+    h.step(3)
+    assert not z.active(h.current) and not h.controller.healthy
+    calls = []
+
+    def probe(*_args):
+        assert not z.active(h.current)
+        calls.append(h.cfg.zapret2.probe_port)
+        return True
+
+    h.controller.probe = probe
+    h.step(4)
+    assert z.active(h.current) and calls == [h.cfg.zapret2.probe_port]
+
+
 def test_vpn_control_runs_after_closing_gate_and_withdrawing_direct_route(monkeypatch):
     h = Harness()
     h.activate()
