@@ -36,13 +36,25 @@ def applied_config():
 
 def test_vpn_control_only_uses_unambiguous_pinned_listeners():
     applied = applied_config()
-    assert list(vpn_control._targets(applied)) == ["http_in", "xray", "sing-box"]
+    assert list(vpn_control._targets(applied)[0]) == ["http_in", "xray", "sing-box"]
     applied["inbounds"][2]["listen"] = "0.0.0.0"
-    assert list(vpn_control._targets(applied)) == ["http_in", "xray"]
+    assert list(vpn_control._targets(applied)[0]) == ["http_in", "xray"]
     applied["routing"]["rules"].insert(0, {"type": "field", "outboundTag": "direct"})
-    assert list(vpn_control._targets(applied)) == ["http_in"]
+    assert list(vpn_control._targets(applied)[0]) == ["http_in"]
     applied["outbounds"].append({"tag": zapret2.DIRECT, "protocol": "freedom"})
-    assert not vpn_control._targets(applied)
+    assert not vpn_control._availability(applied)[0]
+
+
+def test_vpn_control_distinguishes_absent_members_from_missing_probe_listeners():
+    applied = applied_config()
+    applied["inbounds"] = [applied["inbounds"][0]]
+    _, report = vpn_control._availability(applied)
+    assert report["sing-box"] == {"result": "unavailable", "reason": "no_pinned_probe",
+                                 "applied_members": 1}
+    applied["outbounds"] = [applied["outbounds"][0]]
+    _, report = vpn_control._availability(applied)
+    assert report["sing-box"] == {"result": "unavailable", "reason": "no_applied_member",
+                                 "applied_members": 0}
 
 
 @pytest.mark.parametrize("body", [b"no trace", b"ip=127.0.0.1", b"ip=224.0.0.1", b"ip=\xff",
@@ -79,7 +91,8 @@ def test_vpn_control_preview_sends_no_requests(rig, monkeypatch):
     monkeypatch.setattr(vpn_control.checks, "http_get_via_proxy", forbidden)
     result = vpn_control.observe(rig[0])
     assert not result["live"]
-    assert all(row == {"result": "available"} for row in result["paths"].values())
+    assert all(row["result"] == "available" for row in result["paths"].values())
+    assert result["paths"]["sing-box"]["applied_members"] == 1
 
 
 def test_vpn_control_runs_bounded_separate_requests_and_redacts_results(rig, monkeypatch):

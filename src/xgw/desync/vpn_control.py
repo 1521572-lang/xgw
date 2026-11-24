@@ -33,8 +33,6 @@ class _Target:
 
 
 def _targets(applied):
-    if zapret2.standalone(applied):
-        return {}
     inbounds = [row for row in applied["inbounds"] if row.get("listen") == "127.0.0.1"
                 and row.get("protocol") == "http" and type(row.get("port")) is int
                 and 1 <= row["port"] <= 65535]
@@ -47,10 +45,18 @@ def _targets(applied):
         raise evidence.EvidenceError("ambiguous_outbounds")
     rules = applied["routing"]["rules"]
     result = {}
+    members = Counter()
     if "http-in" in listeners:
         result["http_in"] = _Target(listeners["http-in"]["port"])
     for node in builder.applied_nodes(applied):
-        if node.role != "proxy" or node.probe_tag not in listeners:
+        if node.role != "proxy":
+            continue
+        outbound = outbounds[node.tag]
+        if outbound.get("protocol") in (None, "", "freedom", "blackhole", "dns", "loopback"):
+            continue
+        lane = "sing-box" if singbox.bridge_variant(outbound) else "xray"
+        members[lane] += 1
+        if node.probe_tag not in listeners:
             continue
         # Rules for unrelated inbounds can precede the pinned node's rule. A
         # general or conditional matching rule makes this node unsuitable.
@@ -63,15 +69,26 @@ def _targets(applied):
         if len(accounts) != 1 or accounts[0].get("user") != builder.PROBE_USER:
             continue
         password = accounts[0].get("pass")
-        outbound = outbounds[node.tag]
-        protocol = outbound.get("protocol")
-        if not password or not isinstance(password, str) or protocol in (
-            None, "", "freedom", "blackhole", "dns", "loopback"
-        ):
+        if not password or not isinstance(password, str):
             continue
-        lane = "sing-box" if singbox.bridge_variant(outbound) else "xray"
         result.setdefault(lane, _Target(listener["port"], node.tag, password, node.probe_tag))
-    return result
+    return result, members
+
+
+def _availability(applied):
+    if zapret2.standalone(applied):
+        return {}, {lane: {"result": "unavailable", "reason": "standalone"} for lane in LANES}
+    targets, members = _targets(applied)
+    paths = {}
+    for lane in LANES:
+        row = {"result": "available" if lane in targets else "unavailable"}
+        if lane != "http_in":
+            row["applied_members"] = members[lane]
+        if lane not in targets:
+            row["reason"] = ("no_local_http_in" if lane == "http_in" else
+                             "no_pinned_probe" if members[lane] else "no_applied_member")
+        paths[lane] = row
+    return targets, paths
 
 
 def _exit_address(body):
@@ -119,9 +136,8 @@ def observe(paths: Paths, *, live: bool = False, route: bool = False) -> dict:
     raw = evidence._read_config(path)
     if hashlib.sha256(raw).hexdigest() != before["config_sha256"]:
         raise evidence.EvidenceError("snapshot_changed_during_read")
-    targets = _targets(json.loads(raw))
-    result = {"live": live, "paths": {lane: {"result": "available" if lane in targets
-                                             else "unavailable"} for lane in LANES}}
+    targets, paths_view = _availability(json.loads(raw))
+    result = {"live": live, "paths": paths_view}
     if not live or not targets:
         return result
 
@@ -139,8 +155,9 @@ def observe(paths: Paths, *, live: bool = False, route: bool = False) -> dict:
             target = targets[lane]
             sockets = []
             start = time.time_ns() // 1000
-            result["paths"][lane], addresses[lane] = _probe(
+            transfer, addresses[lane] = _probe(
                 target, url, cfg.probe.user_agent, on_connect=sockets.append if route else None)
+            paths_view[lane].update(transfer)
             if authority is not None:
                 connections[lane] = vpn_access.Connection(
                     start, time.time_ns() // 1000, sockets[0] if len(sockets) == 1 else None,

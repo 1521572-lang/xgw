@@ -26,10 +26,11 @@ import netns
 import pytest
 from stand import Stand, wait_for
 
-from xgw.desync import lan_control, route_evidence, vpn_access
+from xgw.desync import lan_control, route_evidence, vpn_access, vpn_control
 from xgw.xraycore.access import endpoint, parse_accepted
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
+SINGBOX_BIN = os.environ.get("XGW_SINGBOX_BIN", "")
 HERE = Path(__file__).resolve().parent
 VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
@@ -47,12 +48,20 @@ pytestmark = [
 
 
 @pytest.fixture()
-def gateway(tmp_path):
+def gateway(tmp_path, request):
     """Шлюз с включённым перехватом: Xray работает, участники живы."""
-    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns")
+    bridge = getattr(request, "param", "xray") == "sing-box"
+    if bridge and (not SINGBOX_BIN or not Path(SINGBOX_BIN).is_file()):
+        pytest.skip("нет установленного XGW_SINGBOX_BIN для проверки моста")
+    stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns",
+                  singbox_bin=Path(SINGBOX_BIN) if bridge else None)
     try:
         stand.start()
-        stand.up(capture=True)
+        if bridge:
+            stand.add_singbox_server("hk", "hysteria2")
+            stand.up(names=("hk",), capture=True, max_members=1)
+        else:
+            stand.up(capture=True)
         enabled = stand.xgw("enable")
         assert enabled.returncode == 0, enabled.stderr
         assert "перехват включён" in enabled.stdout and "внимание" not in enabled.stdout
@@ -115,7 +124,11 @@ def test_lan_survives_src_valid_mark(gateway):
 
 @pytest.mark.skipif(not shutil.which("openssl") or not shutil.which("curl"),
                     reason="для локального HTTPS нужны openssl и curl")
+@pytest.mark.parametrize("gateway", ["xray", "sing-box"], indirect=True)
 def test_lan_https_attributes_real_tproxy_socket(gateway):
+    group = "sing-box" if gateway.singbox_bin else "xray"
+    _, available = vpn_control._availability(gateway.applied())
+    assert available[group]["result"] == "available" and available[group]["applied_members"] > 0
     host = lan_control.TRACE_HOST
     certificate = gateway.workdir / "lan-https-cert.pem"
     key = gateway.workdir / "lan-https-key.pem"
@@ -171,7 +184,7 @@ def test_lan_https_attributes_real_tproxy_socket(gateway):
                for message in observed_log()]
     result = lan_control.analyze(client, netns.GW_LAN_IP, journal, before, after)
     assert result["https_complete"] is True
-    assert result["accepted_route"] == {"state": "observed", "group": "xray",
+    assert result["accepted_route"] == {"state": "observed", "group": group,
                                         "matches_pinned_outbound": None}
 
 
