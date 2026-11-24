@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from test_zapret2 import Harness
@@ -162,3 +163,46 @@ def test_cdn_range_vpn_control_follows_only_one_in_scope_redirect(
         assert row["redirect"]["host_changed"] == location.startswith("https://r2.")
     assert "private" not in json.dumps(row)
     assert h.controller._read_budget(h.cfg).spent_bytes == len(calls) * z.PROBE_CHARGE
+
+
+@pytest.mark.parametrize(("original_ttl", "target_ttl", "elapsed", "verdict", "redirect_state"), [
+    (7, 4, 1, "pass", "followed"),
+    (7, 4, 2, "fail", "expired"),
+    (4, 7, 2, "not_run", "expired"),
+])
+def test_cdn_expiry_bounds_vpn_control_and_redirect(
+    monkeypatch, original_ttl, target_ttl, elapsed, verdict, redirect_state,
+):
+    h = Harness()
+    wall, monotonic = 1_800_000_000, 100
+    monkeypatch.setattr(z, "time", SimpleNamespace(time=lambda: wall, monotonic=lambda: monotonic))
+    cdn = f"https://r1.googlevideo.com/videoplayback?expire={wall + original_ttl}"
+    redirect = f"https://r2.googlevideo.com/videoplayback?expire={wall + target_ttl}"
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls[1] = cdn
+    calls = []
+
+    def request(url, *_args, **options):
+        nonlocal wall, monotonic
+        calls.append((url, options["max_total"]))
+        if url == cdn:
+            wall += 2
+            monotonic += 2
+            return DownloadResult(False, status=302, kind="http", phase="headers",
+                                  location=redirect)
+        assert options["range_end"] == z.PROBE_BYTES
+        wall -= 1
+        monotonic += elapsed
+        return DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body")
+
+    h.controller._request = request
+    control = h.controller._fallback_vpn_control(
+        h.cfg, h.current, 20011, None, gate_closed=True, routed_back=True,
+        stopped=True, target="cdn",
+    )
+    h.controller._record_vpn_control("cdn", control)
+    row, = h.controller.view["vpn_control_attempts"]
+    assert calls == [(cdn, original_ttl), (redirect, 2)]
+    assert row["verdict"] == verdict and row["redirect"]["state"] == redirect_state
+    assert row["http"] == (206 if verdict == "pass" else 302)
+    assert "expire=" not in json.dumps(row)

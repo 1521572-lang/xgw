@@ -199,6 +199,23 @@ def probe_lease(seconds: int, expires_at: int | None) -> int:
     return seconds
 
 
+@dataclass(frozen=True)
+class _CdnExpiry:
+    """Time remaining for one probe chain, guarded against wall-clock rollback."""
+
+    wall: int
+    monotonic: float
+
+    @classmethod
+    def from_timestamp(cls, stamp: int | None) -> _CdnExpiry | None:
+        if stamp is None:
+            return None
+        return cls(stamp, time.monotonic() + (stamp - time.time()))
+
+    def remaining(self) -> float:
+        return min(self.wall - time.time(), self.monotonic - time.monotonic())
+
+
 def _redirect_target(url: str, location: str, domains: list[str]) -> str | None:
     if not location or any(ord(c) < 33 or ord(c) > 126 for c in location):
         return None
@@ -603,16 +620,19 @@ class Controller:
         self.transport_probes = {}
         if z.youtube_transport_probe and (not configured(cfg) or not password):
             return False
+        expiry = _CdnExpiry.from_timestamp(probe_expiry(z))
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
             media_file = media_transport and urlsplit(url).path == "/videoplayback"
-            expires_at = probe_expiry(z) if media_transport else None
-            if expires_at is not None and expires_at <= time.time():
+            limit = YOUTUBE_TRANSPORT_MAX_SECONDS
+            if expiry:
+                limit = min(limit, expiry.remaining())
+            if limit <= 0:
                 self.probe_failure = CDN_EXPIRED
                 return False
             options = {}
             if z.youtube_transport_probe:
-                options = {"max_total": YOUTUBE_TRANSPORT_MAX_SECONDS,
+                options = {"max_total": limit,
                            "tls_timeout": YOUTUBE_TRANSPORT_TLS_SECONDS}
                 if media_transport:
                     options["min_body"] = 0
@@ -625,15 +645,24 @@ class Controller:
             verdict = self._request(url, z.probe_port, password or "",
                                     cfg.probe.user_agent, cancel, **options)
             first_tls_timeout_ms = None
-            if expires_at is not None and expires_at <= time.time():
+            if expiry and expiry.remaining() <= 0:
                 self.probe_failure = CDN_EXPIRED
                 return False
             if (media_transport and not verdict.ok and verdict.phase == "tls"
                     and verdict.kind == "timeout" and (cancel is None or not cancel.is_set())
                     and self.runtime.alive(z.queue_num) and self._budget(cfg, single_probe=True)):
                 first_tls_timeout_ms = round((time.monotonic() - started) * 1000)
+                if expiry:
+                    limit = min(YOUTUBE_TRANSPORT_MAX_SECONDS, expiry.remaining())
+                    if limit <= 0:
+                        self.probe_failure = CDN_EXPIRED
+                        return False
+                    options["max_total"] = limit
                 verdict = self._request(url, z.probe_port, password, cfg.probe.user_agent,
                                         cancel, **options)
+                if expiry and expiry.remaining() <= 0:
+                    self.probe_failure = CDN_EXPIRED
+                    return False
             partial = media_file and verdict.status == 206 and verdict.downloaded > 0
             ok = verdict.ok and (not media_transport or verdict.status in (200, 204) or partial)
             if z.youtube_transport_probe:
@@ -739,8 +768,8 @@ class Controller:
         password, _ = builder.probe_state(applied)
         if not password:
             return _VpnControl("not_run", "no_probe_credentials")
-        expires_at = probe_expiry(cfg.zapret2) if target == "cdn" else None
-        if expires_at is not None and time.time() >= expires_at:
+        expiry = _CdnExpiry.from_timestamp(probe_expiry(cfg.zapret2)) if target == "cdn" else None
+        if expiry and expiry.remaining() <= 0:
             return _VpnControl("not_run", CDN_EXPIRED)
         if not self._budget(cfg, single_probe=True, vpn=True, preserve_admission=retry):
             return _VpnControl("not_run", "budget_unavailable")
@@ -752,15 +781,20 @@ class Controller:
         elif target == "cdn":
             options = {"min_body": 0}
         deadline = time.monotonic() + VPN_CONTROL_SECONDS
+        if expiry:
+            remaining = min(VPN_CONTROL_SECONDS, expiry.remaining())
+            if remaining <= 0:
+                return _VpnControl("not_run", CDN_EXPIRED)
+            options["max_total"] = remaining
         result = self._request(url, port, password, cfg.probe.user_agent, cancel, **options)
         redirect = None
         if media_range and result.phase == "headers" and result.status in REDIRECT_CODES:
             result, redirect = self._follow_cdn_redirect(
-                cfg, result, url, port, password, cancel, deadline, expires_at,
+                cfg, result, url, port, password, cancel, deadline, expiry,
             )
         if result.kind == "cancelled":
             return _VpnControl("not_run", "cancelled", result, redirect)
-        if expires_at is not None and time.time() >= expires_at:
+        if expiry and expiry.remaining() <= 0:
             return _VpnControl("not_run", CDN_EXPIRED, result, redirect)
         ok = result.ok
         if media_range:
@@ -775,7 +809,7 @@ class Controller:
 
     def _follow_cdn_redirect(
         self, cfg: Config, first: DownloadResult, url: str, port: int, password: str, cancel,
-        deadline: float, original_expiry: int | None,
+        deadline: float, original_expiry: _CdnExpiry | None,
     ) -> tuple[DownloadResult, _CdnRedirect]:
         target = _redirect_target(url, first.location, cfg.zapret2.domains)
         if target is None:
@@ -786,9 +820,9 @@ class Controller:
         changed_host = parts.hostname != urlsplit(url).hostname
         if target == url:
             return first, _CdnRedirect(first.status, "loop", changed_host)
-        target_expiry = youtube_cdn_expiry(target)
+        target_expiry = _CdnExpiry.from_timestamp(youtube_cdn_expiry(target))
         expiries = [expiry for expiry in (original_expiry, target_expiry) if expiry is not None]
-        if expiries and min(expiries) <= time.time():
+        if any(expiry.remaining() <= 0 for expiry in expiries):
             return first, _CdnRedirect(first.status, "expired", changed_host)
         if cancel is not None and cancel.is_set():
             return first, _CdnRedirect(first.status, "cancelled", changed_host)
@@ -799,9 +833,13 @@ class Controller:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return first, _CdnRedirect(first.status, "time_limit", changed_host)
+        expiry_remaining = min((expiry.remaining() for expiry in expiries), default=remaining)
+        remaining = min(remaining, expiry_remaining)
+        if remaining <= 0:
+            return first, _CdnRedirect(first.status, "expired", changed_host)
         result = self._request(target, port, password, cfg.probe.user_agent, cancel,
                                min_body=PROBE_BYTES, range_end=PROBE_BYTES, max_total=remaining)
-        if target_expiry is not None and time.time() >= target_expiry:
+        if any(expiry.remaining() <= 0 for expiry in expiries):
             return first, _CdnRedirect(first.status, "expired", changed_host)
         state = "hop_limit" if result.status in REDIRECT_CODES else "followed"
         return result, _CdnRedirect(first.status, state, changed_host)

@@ -4,6 +4,7 @@ import copy
 import json
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from test_generator import _build
@@ -219,6 +220,42 @@ def test_cdn_expiry_between_page_and_video_skips_media_request(monkeypatch):
         h.step(seconds)
     assert h.controller.view["reason"] == z.CDN_EXPIRED
     assert not z.active(h.current) and not h.runtime.up
+
+
+def test_cdn_expiry_bounds_retry_and_rejects_late_success_after_clock_rollback(monkeypatch):
+    h = Harness()
+    wall, monotonic = 1_800_000_000, 100
+    monkeypatch.setattr(z, "time", SimpleNamespace(time=lambda: wall, monotonic=lambda: monotonic))
+    page = "https://www.youtube.com/t/terms"
+    cdn = f"https://r1.googlevideo.com/videoplayback?expire={wall + 10}"
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls = [page, cdn]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    calls = []
+
+    def request(url, *_args, **options):
+        nonlocal wall, monotonic
+        calls.append((url, options["max_total"]))
+        if url == page:
+            wall += 2
+            monotonic += 2
+            return checks.DownloadResult(True, status=200, downloaded=32768, phase="body")
+        if len(calls) == 2:
+            wall += 4
+            monotonic += 4
+            return checks.DownloadResult(False, kind="timeout", phase="tls")
+        assert len(calls) == 3
+        wall -= 5
+        monotonic += 4
+        return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body")
+
+    h.controller._request = request
+    for seconds in (0, 1, 2):
+        h.step(seconds)
+    assert calls == [(page, 10), (cdn, 8), (cdn, 4)]
+    assert h.controller.view == {"state": "fallback", "reason": z.CDN_EXPIRED, "gate_closed": True}
+    assert not z.active(h.current) and not h.runtime.up
+    assert h.controller._read_budget(h.cfg).spent_bytes == 3 * z.PROBE_CHARGE
 
 
 @pytest.mark.parametrize(
