@@ -3,6 +3,7 @@
 import ipaddress
 import re
 from typing import NamedTuple
+from uuid import UUID
 
 _ACCEPTED = re.compile(
     r"(?:^|[ \t])from (?:tcp:)?(?P<source>\S+) accepted (?:tcp:|//)"
@@ -35,3 +36,23 @@ def endpoint(value: str) -> tuple[str, int]:
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
         address = address.ipv4_mapped
     return str(address), int(port)
+
+
+def destination(value: str) -> tuple[str, int]:
+    """Access logs can represent the CONNECT destination as an IP or hostname."""
+    try:
+        return endpoint(value)
+    except ValueError:
+        host, _, port = value.rpartition(":")
+        host = host.rstrip(".").lower()
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", host)
+                or not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535):
+            raise ValueError("invalid_destination") from None
+        return host, int(port)
+
+
+def journal_identity(epoch: str) -> tuple[str, str]:
+    boot, pid, _ = epoch.split(":")
+    if not re.fullmatch(r"[1-9][0-9]{0,15}", pid):
+        raise ValueError("invalid_xray_epoch")
+    return UUID(boot).hex, pid

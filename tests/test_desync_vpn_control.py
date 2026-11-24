@@ -1,10 +1,11 @@
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
 from xgw import config, zapret2
-from xgw.desync import vpn_control
+from xgw.desync import vpn_access, vpn_control
 from xgw.generator import singbox
 from xgw.paths import Paths
 from xgw.watch.checks import DownloadResult
@@ -120,3 +121,67 @@ def test_vpn_control_drops_results_if_xray_changes(rig, monkeypatch):
                         lambda *_a, **_kw: DownloadResult(False, error="private failure"))
     with pytest.raises(vpn_control.evidence.EvidenceError, match="incomparable_snapshots"):
         vpn_control.observe(paths, live=True)
+
+
+BOOT = "12345678123412341234123456789abc"
+EPOCH = f"{BOOT}:42:120"
+
+
+def record(message, **fields):
+    return {"_SYSTEMD_UNIT": vpn_access.UNIT, "_BOOT_ID": BOOT, "_PID": "42",
+            "__REALTIME_TIMESTAMP": "100200000", "MESSAGE": message} | fields
+
+
+@pytest.mark.parametrize("prefix", ["//", "tcp:"])
+def test_vpn_connect_attribution_uses_exact_window_and_route(prefix):
+    before = {"unix": 100.0, "monotonic_ns": 10**9, "xray_epoch": EPOCH,
+              "tags": {BRIDGE: {"group": "sing-box"}, NATIVE: {"group": "xray"}}}
+    after = before | {"unix": 101.0, "monotonic_ns": 2 * 10**9}
+    conn = vpn_access.Connection(100100000, 100500000, ("127.0.0.1", 15001),
+                                 ("trace.example.test", 443), "http-in", "")
+    message = (f"from tcp:127.0.0.1:15001 accepted {prefix}TRACE.example.test:443 "
+               f"[http-in -> {BRIDGE}]")
+    actual = record(message)
+    wrong = [record(message.replace("15001", "15002")), record(message, _PID="43"),
+             record(message, __REALTIME_TIMESTAMP="100099999"),
+             record(message.replace(":443", ":80")),
+             record(message.replace("[http-in", "[probe-other"))]
+    result = vpn_access.match(conn, [*wrong, actual], before, after)
+    assert result == {"state": "observed", "group": "sing-box", "matches_pinned_outbound": None}
+    assert vpn_access.match(conn, wrong, before, after) == {"state": "no_access_record"}
+    assert vpn_access.match(replace(conn, pinned=NATIVE), [actual], before, after)[
+        "matches_pinned_outbound"] is False
+    assert vpn_access.match(replace(conn, pinned=BRIDGE), [actual], before, after)[
+        "matches_pinned_outbound"] is True
+    assert vpn_access.match(conn, [actual, actual], before, after) == {"state": "ambiguous"}
+    assert vpn_access.match(conn, [actual] * vpn_access.MAX_LOG_ROWS, before, after) == {
+        "state": "journal_limit"}
+    assert vpn_access.match(conn, [actual], before, after | {"xray_epoch": "changed"}) == {
+        "state": "window_unconfirmed"}
+    assert vpn_access.match(conn, [actual], before, after | {"unix": 110.0}) == {
+        "state": "window_unconfirmed"}
+    assert NATIVE not in json.dumps(result) and BRIDGE not in json.dumps(result)
+
+
+def test_vpn_control_reads_route_for_current_socket_only(rig, monkeypatch):
+    paths, _, snapshot = rig
+    replies = iter((snapshot(10**9, 0, EPOCH) | {"unix": 100},
+                    snapshot(2 * 10**9, 327, EPOCH) | {"unix": 101}))
+    monkeypatch.setattr(vpn_control.evidence, "snapshot", lambda *_a, **_kw: next(replies))
+    timestamps = iter(range(100100000000, 100700000000, 100000000))
+    monkeypatch.setattr(vpn_control.time, "time_ns", lambda: next(timestamps))
+
+    def probe(_host, port, _url, **kwargs):
+        kwargs["on_connect"](("127.0.0.1", port + 1))
+        return DownloadResult(True, status=200, downloaded=11, body=b"ip=8.8.4.4\n")
+
+    def journal(epoch, start, end):
+        assert (epoch, start, end) == (EPOCH, 100100000, 100600000)
+        return [record(f"from 127.0.0.1:17002 accepted //trace.example.test:443 [http-in -> {NATIVE}]")]
+
+    monkeypatch.setattr(vpn_control.checks, "http_get_via_proxy", probe)
+    monkeypatch.setattr(vpn_access, "_journal_rows", journal)
+    paths = vpn_control.observe(paths, live=True, route=True)["paths"]
+    assert paths["http_in"]["accepted_route"]["group"] == "xray"
+    assert paths["xray"]["accepted_route"] == {"state": "no_access_record"}
+    assert paths["sing-box"]["accepted_route"] == {"state": "no_access_record"}

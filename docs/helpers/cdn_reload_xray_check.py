@@ -11,10 +11,10 @@ from pathlib import Path
 
 from test_zapret2 import Harness
 
-from docs.helpers.xray_access import endpoint, parse_accepted
 from xgw import zapret2
 from xgw.apply.applier import Applier, ApplySource
 from xgw.paths import Paths
+from xgw.xraycore.access import endpoint, parse_accepted
 from xgw.xraycore.api import ApiClient
 
 XRAY = Path("/opt/xgw/xray/xray")

@@ -30,6 +30,7 @@ class FakeServer(threading.Thread):
         super().__init__(daemon=True)
         self.script = script
         self.requests: list[bytes] = []
+        self.peers: list[tuple[str, int]] = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(4)
@@ -46,6 +47,7 @@ class FakeServer(threading.Thread):
 
     def _serve(self, conn: socket.socket):
         try:
+            self.peers.append(conn.getpeername())
             self.requests.append(conn.recv(65536))
             for step in self.script:
                 if isinstance(step, bytes):
@@ -153,6 +155,17 @@ def test_proxy_auth_failure_is_not_ok(serve):
     result = _get(serve(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
     assert not result.ok and result.status == 407 and result.kind == "proxy"
     assert classify(result, 0.1) == "CONNECT_FAIL"
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_https_connect_reports_source_only_for_accepted_tunnel(serve, accepted):
+    status = b"200 Connection established" if accepted else b"407 Authentication required"
+    proxy = serve(b"HTTP/1.1 " + status + b"\r\n\r\n")
+    observed = []
+    http_get_via_proxy("127.0.0.1", proxy.port, "https://trace.example.test/",
+                       max_total=3, on_connect=observed.append)
+    assert len(proxy.peers) == 1
+    assert observed == (proxy.peers if accepted else [])
 
 
 def test_http_error_is_not_ok(serve):

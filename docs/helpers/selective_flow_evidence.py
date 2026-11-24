@@ -6,7 +6,6 @@ import json
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from uuid import UUID
 
 from docs.helpers.selective_media_evidence import (
     MAX_LOG_ROWS,
@@ -16,9 +15,9 @@ from docs.helpers.selective_media_evidence import (
     read_log,
     read_rows,
 )
-from docs.helpers.xray_access import endpoint, parse_accepted
 from xgw.desync import route_evidence
 from xgw.net.capture import CAPTURE_TAGS
+from xgw.xraycore.access import endpoint, journal_identity, parse_accepted
 from xgw.zapret2 import OUT
 
 XRAY_UNIT = "xgw-xray.service"
@@ -47,8 +46,7 @@ def media_flows(player, start, end):
 
 
 def access_records(journal, snapshot, start, end):
-    boot, pid, _ = snapshot["xray_epoch"].split(":")
-    boot = UUID(boot).hex
+    boot, pid = journal_identity(snapshot["xray_epoch"])
     records = defaultdict(list)
     for row in journal:
         if ((row.get("_SYSTEMD_UNIT"), row.get("_BOOT_ID"), row.get("_PID"))

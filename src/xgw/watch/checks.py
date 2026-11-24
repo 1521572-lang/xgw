@@ -15,6 +15,7 @@ import socket
 import ssl
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -81,6 +82,7 @@ def http_get_via_proxy(
     require_exact_range: bool = False,
     min_body: int = 0,
     accept_gzip: bool = False,
+    on_connect: Callable[[tuple[str, int]], None] | None = None,
 ) -> DownloadResult:
     """GET через http-прокси (http-in или probe-inbound Xray).
 
@@ -108,6 +110,7 @@ def http_get_via_proxy(
     Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
     При require_exact_range нужен точный 206 с Content-Range и полным телом диапазона.
     `accept_gzip` — запросить сжатое тело; распаковка остаётся у вызывающего.
+    `on_connect` — передать локальный адрес установленного HTTPS CONNECT до TLS.
     """
     if require_exact_range and (range_end <= 0 or (max_bytes and max_bytes < range_end)):
         raise ValueError("предел скачивания должен вмещать запрошенный диапазон")
@@ -146,6 +149,8 @@ def http_get_via_proxy(
             except OSError as exc:  # в т. ч. таймаут: inbound не открыл туннель
                 return DownloadResult(ok=False, kind="connect", error=f"connect: {exc}",
                                       phase=phase)
+            if on_connect is not None:
+                on_connect(sock.getsockname())
             phase = "tls"
             context = tls_context or ssl.create_default_context()
             try:

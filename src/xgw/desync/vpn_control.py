@@ -16,7 +16,9 @@ from ..generator import builder, singbox
 from ..net import cmd
 from ..paths import LockTimeout, Paths
 from ..watch import checks
+from ..xraycore.access import destination
 from . import route_evidence as evidence
+from . import vpn_access
 
 LANES = ("http_in", "xray", "sing-box")
 MAX_BODY = 4096
@@ -27,6 +29,7 @@ class _Target:
     port: int
     tag: str = ""
     password: str = field(default="", repr=False)
+    inbound: str = "http-in"
 
 
 def _targets(applied):
@@ -67,7 +70,7 @@ def _targets(applied):
         ):
             continue
         lane = "sing-box" if singbox.bridge_variant(outbound) else "xray"
-        result.setdefault(lane, _Target(listener["port"], node.tag, password))
+        result.setdefault(lane, _Target(listener["port"], node.tag, password, node.probe_tag))
     return result
 
 
@@ -82,12 +85,13 @@ def _exit_address(body):
     return address if address.is_global and not address.is_multicast else None
 
 
-def _probe(target, url, user_agent):
+def _probe(target, url, user_agent, *, on_connect=None):
     start = time.monotonic()
     response = checks.http_get_via_proxy(
         "127.0.0.1", target.port, url, timeout=5, max_total=8, silence=3, min_body=1,
         keep_body=MAX_BODY, max_bytes=MAX_BODY, user_agent=user_agent,
         proxy_user=builder.PROBE_USER if target.password else "", proxy_pass=target.password,
+        on_connect=on_connect,
     )
     complete = response.ok and response.status == 200 and 0 < response.downloaded < MAX_BODY
     address = _exit_address(response.body) if complete else None
@@ -109,7 +113,7 @@ def _counter_activity(before, after, tag):
     return all(end[key] > start[key] for key in evidence.DIRECTIONS)
 
 
-def observe(paths: Paths, *, live: bool = False) -> dict:
+def observe(paths: Paths, *, live: bool = False, route: bool = False) -> dict:
     path = paths.xray_config_file
     before = evidence.snapshot(path, paths=paths)
     raw = evidence._read_config(path)
@@ -128,13 +132,24 @@ def observe(paths: Paths, *, live: bool = False) -> dict:
             or parts.username is not None or parts.password is not None or parts.fragment
             or parts.query or any(ord(c) < 33 for c in url)):
         raise evidence.EvidenceError("ordinary_https_trace_unavailable")
-    addresses = {}
+    addresses, connections = {}, {}
+    authority = destination(f"{parts.hostname.encode('idna').decode('ascii')}:443") if route else None
     for lane in LANES:
         if lane in targets:
-            result["paths"][lane], addresses[lane] = _probe(targets[lane], url, cfg.probe.user_agent)
+            target = targets[lane]
+            sockets = []
+            start = time.time_ns() // 1000
+            result["paths"][lane], addresses[lane] = _probe(
+                target, url, cfg.probe.user_agent, on_connect=sockets.append if route else None)
+            if authority is not None:
+                connections[lane] = vpn_access.Connection(
+                    start, time.time_ns() // 1000, sockets[0] if len(sockets) == 1 else None,
+                    authority, target.inbound, target.tag)
 
     after = evidence.snapshot(path, paths=paths)
     evidence.deltas(before, after)
+    for lane, matched in vpn_access.routes(connections, before, after).items():
+        result["paths"][lane]["accepted_route"] = matched
     for lane, target in targets.items():
         result["paths"][lane]["pinned_outbound_counters_increased"] = _counter_activity(
             before, after, target.tag)
@@ -148,9 +163,12 @@ def observe(paths: Paths, *, live: bool = False) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="Send up to three bounded HTTPS GETs")
+    parser.add_argument("--route", action="store_true", help="Match new CONNECTs in the Xray journal")
     args = parser.parse_args()
+    if args.route and not args.live:
+        parser.error("--route requires --live")
     try:
-        report = observe(Paths.from_env(), live=args.live)
+        report = observe(Paths.from_env(), live=args.live, route=args.route)
     except evidence.EvidenceError as exc:
         report = {"state": "inconclusive", "reason": str(exc), **exc.details()}
     except LockTimeout:

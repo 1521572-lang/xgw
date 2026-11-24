@@ -241,8 +241,8 @@ def page_sample():
 def route_match(record, journal, before, after):
     from docs.helpers.selective_flow_evidence import MAX_CAPTURE_SECONDS, access_records
     from docs.helpers.selective_media_evidence import MAX_LOG_ROWS, number
-    from docs.helpers.xray_access import endpoint
     from xgw.desync import route_evidence
+    from xgw.xraycore.access import endpoint
 
     try:
         route_evidence.deltas(before, after)
