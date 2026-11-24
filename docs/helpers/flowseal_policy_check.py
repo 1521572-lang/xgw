@@ -72,7 +72,7 @@ def run(root):
             "rejection_wrote_policy")
     live = send("mode", "standalone", "saved")
     selected = load()
-    _, scoped_blocks = check_scope(selected, domains, exclusions)
+    narrowed, scoped_blocks = check_scope(selected, domains, exclusions)
     require(scoped_blocks == blocks and worker.policy_revision(selected.zapret2) == live,
             "worker_revision")
     before = panel.read_bytes()
@@ -99,12 +99,14 @@ def run(root):
     require(restored == base, "rollback_arguments")
     require(send("mode", "off", "saved") == import_key, "final_off_revision")
     print("FLOWSEAL_POLICY_ROLLBACK_OK", flush=True)
+    return {"base": base, "narrowed": narrowed, "restored": restored}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--host-netns", required=True, type=int)
+    parser.add_argument("--match", action="store_true", help="Also check profile selection over loopback TLS")
     args = parser.parse_args()
     try:
         os.umask(0o077)
@@ -116,7 +118,12 @@ def main():
         require(args.out.parent == Path("/run") and args.out.name.startswith("xgw-flowseal-policy.")
                 and stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o700,
                 "private_output_required")
-        run(args.out)
+        snapshots = run(args.out)
+        if args.match:
+            from docs.helpers.flowseal_policy_match import check_matching
+
+            if not check_matching(args.out, snapshots):
+                return 2
     except (OSError, ValueError, cmd.CommandError) as error:
         # Detailed paths and messages remain in the private stderr.
         print(f"FLOWSEAL_POLICY_FAILED {type(error).__name__}", flush=True)

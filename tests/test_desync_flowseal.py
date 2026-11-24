@@ -287,3 +287,36 @@ def test_alt9_refuses_an_entirely_excluded_scope_without_changing_legacy_revisio
     assert schema.project(schema.migrate(patch | {"mode": "off"}))["mode"] == "off"
     with pytest.raises(schema.PolicyError, match="nonempty"):
         schema.project(schema.migrate(patch | {"mode": "standalone"}))
+
+
+def test_alt9_match_observation_keeps_profiles_and_replaces_packet_actions():
+    from docs.helpers import flowseal_policy_match as trial
+
+    args = ["nfqws2", "--qnum=200", "--hostlist-domains=youtube.com", "--lua-desync=one",
+            "--new", "--hostlist-exclude-domains=child.youtube.com", "--lua-desync=two"]
+    observed = trial.observation_args(args)
+    assert observed[3:] == [trial.PASS if item.startswith("--lua-desync=") else item
+                            for item in args[1:]]
+    assert "return VERDICT_PASS" in observed[2]
+    assert args[-1] == "--lua-desync=two"
+
+
+def test_alt9_match_report_needs_a_tls_hostname_and_preserves_conflicting_decisions():
+    from docs.helpers import flowseal_policy_match as trial
+
+    prefix = "desync profile search for ipv4 ip=127.0.0.2 port=443 icmp=0:0"
+    trace = "\n".join((
+        f"{prefix} l7proto=unknown ssid='' mark=0x0 hostname=''",
+        "desync profile 0 (default) matches",
+        f"{prefix} l7proto=tls ssid='' mark=0x0 hostname='test.youtube.com'",
+        "* hostlist check for profile 2",
+        "desync profile 2 (noname) matches",
+        f"{prefix} l7proto=tls ssid='' mark=0x0 hostname='other.example.test'",
+        "desync profile not found",
+        f"{prefix} l7proto=tls ssid='' mark=0x0 hostname='test.youtube.com'",
+        "desync profile 0 (default) matches",
+        f"{prefix} l7proto=http ssid='' mark=0x0 hostname='http.youtube.com'",
+        "desync profile 7 (noname) matches",
+        f"{prefix} l7proto=tls ssid='' mark=0x0 hostname='unproven.youtube.com'",
+    ))
+    assert trial.matched_profiles(trace) == {"test.youtube.com": {0, 2}, "other.example.test": {0}}
