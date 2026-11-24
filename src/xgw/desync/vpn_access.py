@@ -1,4 +1,4 @@
-"""Attribute a fresh VPN control session to one accepted Xray CONNECT."""
+"""Attribute a bounded TCP session to one accepted Xray connection."""
 
 from dataclasses import dataclass
 from json import loads
@@ -20,6 +20,7 @@ class Connection:
     target: tuple[str, int]
     inbound: str
     pinned: str
+    peer_target: tuple[str, int] | None = None
 
 
 def _journal_rows(epoch, start, end):
@@ -63,7 +64,7 @@ def match(connection, journal, before, after):
             continue
         try:
             same_socket = endpoint(entry.source) == connection.source
-            same_target = destination(entry.target) == connection.target
+            same_target = destination(entry.target) in (connection.target, connection.peer_target)
         except ValueError:
             continue
         if same_socket and same_target:
