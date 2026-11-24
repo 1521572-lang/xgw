@@ -321,6 +321,10 @@ def test_fallback_evidence_is_policy_bound_and_keeps_the_original_probe_time():
       "elapsed_ms": 20100}, "Повтор тоже завершился таймаутом"),
     ("youtube_cdn_probe_failed", "cdn",
      {"phase": "headers", "kind": "http", "http": 403}, "CDN вернул HTTP 403"),
+    ("youtube_cdn_probe_failed", "cdn",
+     {"phase": "headers", "kind": "range", "http": 200}, "не подтвердила полный диапазон"),
+    ("youtube_cdn_probe_failed", "cdn",
+     {"phase": "body", "kind": "truncated", "http": 206}, "не подтвердила полный диапазон"),
 ])
 def test_transport_failure_detail_uses_only_current_probe(reason, probe, failure, expected):
     cfg, snap = fixture(mode="selective", engine="off", state="fallback", reason=reason,

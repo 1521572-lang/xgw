@@ -652,6 +652,20 @@ def _read(*steps, **kwargs):
                                  deadline=time.monotonic() + 10.0, **kwargs)
 
 
+@pytest.mark.parametrize(("frames", "kind"), [
+    ((b"4\r\ndata\r\n", b"0\r\n\r\n"), ""),
+    ((b"4\r\ndata\r\n",), "truncated"),
+    ((b"5\r\ndata!\r\n", b"0\r\n\r\n"), "range"),
+])
+def test_exact_range_waits_for_chunk_terminator_at_the_body_limit(frames, kind):
+    head = (b"HTTP/1.1 206 Partial Content\r\n"
+            b"Content-Range: bytes 0-3/4\r\nTransfer-Encoding: chunked\r\n\r\n")
+    result = _read(head, *frames, exact_range=4, max_bytes=4)
+    assert result.kind == kind
+    assert result.ok is (kind == "")
+    assert result.range_verified is result.ok
+
+
 def test_chunked_body_is_parsed_and_framing_is_not_counted():
     """C01 кросс-аудита 4cc96b9: тело «частями» с расширением и трейлером, хоть по байту —
     целое; в downloaded и body только полезные байты, без разметки."""

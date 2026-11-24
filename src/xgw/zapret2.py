@@ -604,7 +604,7 @@ class Controller:
     def _request(url: str, port: int, password: str, user_agent: str, cancel,
                  *, max_total: float = VPN_CONTROL_SECONDS, silence: float = 4,
                  min_body: int = 16 * 1024, tls_timeout: float | None = None,
-                 range_end: int = 0) -> DownloadResult:
+                 range_end: int = 0, require_exact_range: bool = False) -> DownloadResult:
         from .generator import builder
         from .watch import checks
 
@@ -613,6 +613,7 @@ class Controller:
             proxy_pass=password, timeout=5, tls_timeout=tls_timeout, silence=silence,
             max_total=max_total,
             max_bytes=PROBE_BYTES, min_body=min_body, range_end=range_end,
+            require_exact_range=require_exact_range,
             user_agent=user_agent, cancel=cancel,
         )
 
@@ -650,6 +651,7 @@ class Controller:
                     options["min_body"] = 0
                     if media_file:
                         options["range_end"] = PROBE_BYTES
+                        options["require_exact_range"] = True
                 else:
                     options["silence"] = YOUTUBE_PAGE_SILENCE_SECONDS
             started = time.monotonic()
@@ -675,12 +677,13 @@ class Controller:
                 if expiry and expiry.remaining() <= 0:
                     self.probe_failure = CDN_EXPIRED
                     return False
-            partial = media_file and verdict.status == 206 and verdict.downloaded > 0
-            ok = verdict.ok and (not media_transport or verdict.status in (200, 204) or partial)
+            ok = verdict.ok
+            if media_transport:
+                ok = ok and (verdict.range_verified if media_file else verdict.status in (200, 204))
             if z.youtube_transport_probe:
                 self.transport_probes["cdn" if media_transport else "page"] = {
                     "ok": ok, "phase": verdict.phase,
-                    "kind": verdict.kind or ("ok" if ok else "http"),
+                    "kind": verdict.kind or ("ok" if ok else "range" if media_file else "http"),
                     "http": 0 if verdict.phase == "connect" else verdict.status,
                     "connect_http": verdict.status if verdict.phase == "connect" else 0,
                     "bytes": verdict.downloaded,
@@ -789,7 +792,8 @@ class Controller:
         media_range = target == "cdn" and urlsplit(url).path == "/videoplayback"
         options = {}
         if media_range:
-            options = {"min_body": PROBE_BYTES, "range_end": PROBE_BYTES}
+            options = {"min_body": PROBE_BYTES, "range_end": PROBE_BYTES,
+                       "require_exact_range": True}
         elif target == "cdn":
             options = {"min_body": 0}
         deadline = time.monotonic() + VPN_CONTROL_SECONDS
@@ -810,7 +814,7 @@ class Controller:
             return _VpnControl("not_run", CDN_EXPIRED, result, redirect)
         ok = result.ok
         if media_range:
-            ok = ok and result.status == 206 and result.downloaded == PROBE_BYTES
+            ok = ok and result.range_verified
         elif target == "cdn":
             ok = ok and result.status in (200, 204)
         if ok:
@@ -850,7 +854,8 @@ class Controller:
         if remaining <= 0:
             return first, _CdnRedirect(first.status, "expired", changed_host)
         result = self._request(target, port, password, cfg.probe.user_agent, cancel,
-                               min_body=PROBE_BYTES, range_end=PROBE_BYTES, max_total=remaining)
+                               min_body=PROBE_BYTES, range_end=PROBE_BYTES,
+                               require_exact_range=True, max_total=remaining)
         if any(expiry.remaining() <= 0 for expiry in expiries):
             return first, _CdnRedirect(first.status, "expired", changed_host)
         state = "hop_limit" if result.status in REDIRECT_CODES else "followed"
@@ -1084,7 +1089,10 @@ class Controller:
             cdn = self.transport_probes.get("cdn", {})
             cdn_tls_timeout = (reason == "youtube_cdn_probe_failed"
                                and cdn.get("phase") == "tls" and cdn.get("kind") == "timeout")
-            target = "cdn" if cdn_tls_timeout else "page"
+            cdn_range_failed = (reason == "youtube_cdn_probe_failed"
+                                and urlsplit(cfg.zapret2.probe_urls[1]).path == "/videoplayback"
+                                and (cdn.get("kind") == "range" or cdn.get("http") == 206))
+            target = "cdn" if cdn_tls_timeout or cdn_range_failed else "page"
             control = self._fallback_vpn_control(
                 cfg, applied, vpn_probe_port, cancel, gate_closed=gate_closed,
                 routed_back=routed_back, stopped=stopped, target=target,

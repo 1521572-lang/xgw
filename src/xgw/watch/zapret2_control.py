@@ -93,7 +93,7 @@ def _probe_metrics(row: dict) -> dict:
     fields = {}
     for name, accepted in (
         ("phase", ("connect", "tls", "request", "headers", "body")),
-        ("kind", ("ok", "http", "proxy", "connect", "tls", "timeout", "stall",
+        ("kind", ("ok", "http", "range", "proxy", "connect", "tls", "timeout", "stall",
                   "truncated", "reset", "io", "cancelled")),
     ):
         item = row.get(name)
@@ -169,6 +169,10 @@ def transport_failure_detail(reason: str, probes: dict) -> str:
     if (target == "cdn" and row.get("phase") == "headers" and row.get("kind") == "http"
             and row.get("http") in (403, 410)):
         return f"CDN вернул HTTP {row['http']}. Сохраните свежий адрес из плеера."
+    if target == "cdn" and (row.get("kind") == "range" or (
+            row.get("http") == 206 and row.get("kind") in ("truncated", "stall", "timeout", "reset")
+    )):
+        return "Прямая проба CDN не подтвердила полный диапазон видео."
     return REASONS[reason]
 
 

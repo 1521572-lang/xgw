@@ -19,7 +19,8 @@ const units = {"xgw-zapret2.service": "Выбранные домены", "xgw-nf
 const vpnChecks = {pass: "Прошла", fail: "Не прошла", not_run: "Не запускалась"};
 const probePhases = {connect: "туннель", tls: "TLS", request: "запрос",
   headers: "заголовки", body: "тело ответа"};
-const probeFailures = {http: "ответ HTTP", proxy: "отказ прокси", connect: "соединение",
+const probeFailures = {http: "ответ HTTP", range: "диапазон не подтверждён",
+  proxy: "отказ прокси", connect: "соединение",
   tls: "ошибка TLS", timeout: "таймаут", stall: "нет данных", truncated: "неполный ответ",
   reset: "обрыв", io: "ошибка ввода-вывода", cancelled: "прервана"};
 const probePageKinds = {terms: "Страница условий", watch: "Страница просмотра", other: "Другая страница"};

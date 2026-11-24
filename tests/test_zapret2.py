@@ -311,15 +311,20 @@ def test_cdn_expiry_bounds_retry_and_rejects_late_success_after_clock_rollback(m
 
 
 @pytest.mark.parametrize(
-    ("enabled", "path", "media_status", "size", "opens"),
-    [(False, "videoplayback", 204, 0, False),
-     (True, "generate_204", 204, 0, True), (True, "generate_204", 206, 16384, False),
-     (True, "videoplayback", 200, 0, True), (True, "videoplayback", 206, 16384, True),
-     (True, "videoplayback", 206, 0, False), (True, "videoplayback", 302, 0, False),
-     (True, "videoplayback", 403, 0, False)],
+    ("enabled", "path", "media_status", "size", "exact", "opens"),
+    [(False, "videoplayback", 204, 0, False, False),
+     (True, "generate_204", 204, 0, False, True),
+     (True, "generate_204", 206, 16384, False, False),
+     (True, "videoplayback", 200, 0, False, False),
+     (True, "videoplayback", 206, 16384, False, False),
+     (True, "videoplayback", 206, 65536, False, False),
+     (True, "videoplayback", 206, 65536, True, True),
+     (True, "videoplayback", 206, 0, False, False),
+     (True, "videoplayback", 302, 0, False, False),
+     (True, "videoplayback", 403, 0, False, False)],
 )
 def test_youtube_transport_gate_retains_page_and_cdn_checks(
-    enabled, path, media_status, size, opens,
+    enabled, path, media_status, size, exact, opens,
 ):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = enabled
@@ -328,19 +333,21 @@ def test_youtube_transport_gate_retains_page_and_cdn_checks(
     seen = []
 
     def request(url, *_args, min_body=16 * 1024, max_total=8, silence=4, tls_timeout=None,
-                range_end=0):
-        seen.append((min_body, max_total, silence, tls_timeout, range_end))
+                range_end=0, require_exact_range=False):
+        seen.append((min_body, max_total, silence, tls_timeout, range_end, require_exact_range))
         if "googlevideo.com" not in url:
             return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
         return checks.DownloadResult(ok=min_body == 0 and media_status in (200, 204, 206),
-                                     status=media_status, downloaded=size, phase="body")
+                                     status=media_status, downloaded=size, phase="body",
+                                     range_verified=exact)
 
     h.controller._request = request
     for now in (0, 1, 2):
         h.step(now)
     cdn_range = 65536 if path == "videoplayback" else 0
-    assert seen == ([(16384, 12, 6, 10, 0), (0, 12, 4, 10, cdn_range)] if enabled
-                    else [(16384, 8, 4, None, 0)] * 2)
+    assert seen == ([(16384, 12, 6, 10, 0, False),
+                     (0, 12, 4, 10, cdn_range, bool(cdn_range))] if enabled
+                    else [(16384, 8, 4, None, 0, False)] * 2)
     assert z.active(h.current) is opens
     if enabled:
         rows = h.controller.view["transport_probes"]
@@ -416,6 +423,9 @@ def test_selective_recheck_reports_actual_page_and_new_time(monkeypatch):
         checks_seen.append(url)
         if wall == 2000.0 and url == page:
             return checks.DownloadResult(ok=False, kind="timeout", phase="tls")
+        if url == cdn:
+            return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body",
+                                         range_verified=True)
         return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
 
     h.controller._request = request
@@ -457,8 +467,11 @@ def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
 
     def request(url, *_args, **_options):
         urls.append(url)
-        if url == page or urls.count(cdn) == 1 or (scenario == "recovers" and urls.count(cdn) == 3):
+        if url == page:
             return checks.DownloadResult(ok=True, status=200, downloaded=32768, phase="body")
+        if urls.count(cdn) == 1 or (scenario == "recovers" and urls.count(cdn) == 3):
+            return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body",
+                                         range_verified=True)
         if scenario == "http_error":
             return checks.DownloadResult(ok=False, status=403, kind="http", phase="headers")
         if scenario == "lost_worker":
@@ -480,12 +493,13 @@ def test_selective_cdn_retry_is_bounded_and_charged(scenario, attempts, active):
     assert charged == seed + (3 + attempts) * z.PROBE_CHARGE
 
 
-@pytest.mark.parametrize(("vpn_status", "vpn_bytes", "expected"), [
-    (206, z.PROBE_BYTES, "pass"),
-    (200, z.PROBE_BYTES, "fail"),
-    (206, 1, "fail"),
+@pytest.mark.parametrize(("vpn_status", "vpn_bytes", "exact", "expected"), [
+    (206, z.PROBE_BYTES, True, "pass"),
+    (200, z.PROBE_BYTES, False, "fail"),
+    (206, z.PROBE_BYTES, False, "fail"),
+    (206, 1, False, "fail"),
 ])
-def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes, expected):
+def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes, exact, expected):
     h = Harness()
     h.cfg.zapret2.youtube_transport_probe = True
     page = "https://www.youtube.com/t/terms"
@@ -501,8 +515,10 @@ def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes,
         if port == vpn_port:
             assert not z.active(h.current) and not h.runtime.up
             assert h.runtime.events[-1] == ("stop", 0)
-            assert options == {"min_body": z.PROBE_BYTES, "range_end": z.PROBE_BYTES}
-            return checks.DownloadResult(True, status=vpn_status, downloaded=vpn_bytes)
+            assert options == {"min_body": z.PROBE_BYTES, "range_end": z.PROBE_BYTES,
+                               "require_exact_range": True}
+            return checks.DownloadResult(True, status=vpn_status, downloaded=vpn_bytes,
+                                         range_verified=exact)
         if url == page:
             return checks.DownloadResult(True, status=200, downloaded=32768)
         return checks.DownloadResult(False, kind="timeout", phase="tls")
@@ -516,6 +532,38 @@ def test_cdn_tls_timeout_checks_the_same_url_once_via_vpn(vpn_status, vpn_bytes,
     assert h.controller.view["vpn_control"] == expected
     assert h.controller.vpn_cdn_retry is None
     assert h.controller._read_budget(h.cfg).spent_bytes == 4 * z.PROBE_CHARGE
+
+
+def test_unverified_media_range_checks_the_same_url_after_fallback():
+    h = Harness()
+    h.cfg.zapret2.youtube_transport_probe = True
+    page = "https://www.youtube.com/t/terms"
+    media = "https://r1.googlevideo.com/videoplayback?sig=fixture"
+    h.cfg.zapret2.probe_urls = [page, media]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    vpn_port = 20011
+    calls = []
+
+    def request(url, port, *_args, **options):
+        calls.append((url, port))
+        if url == page:
+            return checks.DownloadResult(True, status=200, downloaded=32768)
+        assert options["require_exact_range"]
+        if port == vpn_port:
+            assert not z.active(h.current) and not h.runtime.up
+            return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES,
+                                         range_verified=True)
+        return checks.DownloadResult(False, kind="range", phase="headers", status=206)
+
+    h.controller._request = request
+    for now in (0, 1, 2):
+        h.step(now, vpn_probe_port=vpn_port)
+    direct = h.cfg.zapret2.probe_port
+    assert calls == [(page, direct), (media, direct), (media, vpn_port)]
+    assert h.controller.view["vpn_control"] == "pass"
+    assert h.controller.view["vpn_control_target"] == "cdn"
+    assert h.controller.view["state"] == "fallback"
+    assert h.controller.view["gate_closed"] and h.controller.last_transport_ok_at is None
 
 
 @pytest.mark.parametrize("limit_mb", [1, 2])
@@ -536,7 +584,7 @@ def test_transient_cdn_vpn_failure_keeps_first_result_and_retries_at_most_once(l
             vpn_calls.append(url)
             if len(vpn_calls) == 2:
                 return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES,
-                                             phase="body")
+                                             phase="body", range_verified=True)
         elif url == page:
             return checks.DownloadResult(True, status=200, downloaded=32768)
         return checks.DownloadResult(False, kind="timeout", phase="tls")
@@ -654,6 +702,9 @@ def test_cdn_change_with_unresolved_previous_route(case):
         calls.append(url)
         if url == new_cdn and case == "new_cdn_failed":
             return checks.DownloadResult(False, status=403, kind="http", phase="headers")
+        if url == new_cdn:
+            return checks.DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body",
+                                         range_verified=True)
         return checks.DownloadResult(True, status=200, downloaded=32768, phase="body")
 
     h.controller._request = request

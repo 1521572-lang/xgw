@@ -33,7 +33,7 @@ class DownloadResult:
     downloaded: int = 0            # сколько байт ТЕЛА успели скачать (заголовки не в счёт)
     stalled: bool = False          # True = тишина дольше порога при открытом соединении
     error: str = ""
-    # Этап сбоя: connect | proxy | tls | http | stall | truncated | timeout | reset | io.
+    # Этап сбоя: connect | proxy | tls | http | range | stall | truncated | timeout | reset | io.
     # reset — соединение оборвано после отправки запроса (RST, ошибка TLS посреди ответа):
     # код ответа и пришедшие байты тела сохраняются (C02 кросс-аудита 4cc96b9).
     kind: str = ""
@@ -51,6 +51,7 @@ class DownloadResult:
 
     body_time_limited: bool = False  # чтение прервал именно лимит времени тела
     phase: str = ""  # connect, tls, request, headers или body
+    range_verified: bool = False
 
     @property
     def frozen(self) -> bool:
@@ -77,6 +78,7 @@ def http_get_via_proxy(
     cancel: threading.Event | None = None,
     rtt: bool = False,
     range_end: int = 0,
+    require_exact_range: bool = False,
     min_body: int = 0,
     accept_gzip: bool = False,
 ) -> DownloadResult:
@@ -104,8 +106,11 @@ def http_get_via_proxy(
     разы — у «польша 2» 340–470 мс при RTT 40–60.
     `range_end` — сколько байт тела просить (Range: bytes=0-…, ответ 206); 0 — весь файл.
     Сервер, который Range не понимает, отдаёт файл целиком (200) — так тоже удача.
+    При require_exact_range нужен точный 206 с Content-Range и полным телом диапазона.
     `accept_gzip` — запросить сжатое тело; распаковка остаётся у вызывающего.
     """
+    if require_exact_range and (range_end <= 0 or (max_bytes and max_bytes < range_end)):
+        raise ValueError("предел скачивания должен вмещать запрошенный диапазон")
     headers = {"Range": f"bytes=0-{range_end - 1}"} if range_end > 0 else {}
     if accept_gzip:
         headers["Accept-Encoding"] = "gzip"
@@ -180,8 +185,10 @@ def http_get_via_proxy(
         result = _read_response(
             sock, silence=silence, deadline=deadline, keep_body=keep_body,
             max_bytes=max_bytes, max_body_seconds=max_body_seconds, cancel=cancel,
+            exact_range=range_end if require_exact_range else 0,
         )
-        result.phase = "body" if 200 <= result.status < 300 else phase
+        if not result.phase:
+            result.phase = "body" if 200 <= result.status < 300 else phase
         if result.ok and result.downloaded < min_body:
             return DownloadResult(
                 ok=False, kind="http", status=result.status, downloaded=result.downloaded,
@@ -310,6 +317,7 @@ def _recv(
 def _read_response(
     sock: socket.socket, *, silence: float, deadline: float, keep_body: int = 0,
     max_bytes: int = 0, max_body_seconds: float = 0.0, cancel: threading.Event | None = None,
+    exact_range: int = 0,
 ) -> DownloadResult:
     """Читает ответ: заголовки, затем тело до Content-Length, последней части ответа «частями»
     или закрытия (либо до max_bytes / max_body_seconds — тогда загрузка удачная, хоть и не до
@@ -344,6 +352,12 @@ def _read_response(
         kind = "proxy" if status == 407 else "http"
         return DownloadResult(ok=False, kind=kind, status=status, error=f"HTTP {status}",
                               location=_header(head, "location") if 300 <= status < 400 else "")
+    if exact_range and (
+        status != 206 or length not in (None, exact_range)
+        or not _exact_content_range(head, exact_range)
+    ):
+        return DownloadResult(False, kind="range", status=status, phase="headers",
+                              error="заголовки не подтверждают запрошенный диапазон")
     if status == 204:
         length, chunked = 0, False  # тела у ответа 204 нет (RFC 9110): закрытия не ждать
 
@@ -364,7 +378,9 @@ def _read_response(
                     error=f"ответ частями не по стандарту: {parts.error}",
                     body_seconds=time.monotonic() - started,
                 )
-            if max_bytes and downloaded >= max_bytes:
+            if exact_range and downloaded > exact_range:
+                break
+            if not exact_range and max_bytes and downloaded >= max_bytes:
                 return DownloadResult(
                     ok=True, downloaded=downloaded, status=status, body=body,
                     body_seconds=time.monotonic() - started,
@@ -398,7 +414,7 @@ def _read_response(
             return DownloadResult(ok=False, downloaded=downloaded, kind="cancelled", status=status,
                                   error="проверка прервана",
                                   body_seconds=time.monotonic() - started)
-        if body_deadline < deadline and downloaded > 0:
+        if not exact_range and body_deadline < deadline and downloaded > 0:
             return DownloadResult(ok=True, downloaded=downloaded, status=status, body=body,
                                   body_seconds=time.monotonic() - started, body_time_limited=True)
         return DownloadResult(
@@ -407,6 +423,9 @@ def _read_response(
             body_seconds=time.monotonic() - started,
         )
     seconds = time.monotonic() - started
+    if exact_range and downloaded > exact_range:
+        return DownloadResult(False, downloaded=downloaded, kind="range", status=status,
+                              error="размер ответа превышает диапазон", body_seconds=seconds)
     if length is not None and downloaded < length:
         return DownloadResult(
             ok=False, downloaded=downloaded, kind="truncated", status=status, body=body,
@@ -420,14 +439,27 @@ def _read_response(
             error=f"соединение закрыто посреди ответа частями, после {downloaded} байт тела",
             body_seconds=seconds,
         )
+    if exact_range and downloaded != exact_range:
+        return DownloadResult(False, downloaded=downloaded, kind="truncated", status=status,
+                              error="получен неполный диапазон", body_seconds=seconds)
     result = DownloadResult(
-        ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds
+        ok=True, downloaded=downloaded, status=status, body=body, body_seconds=seconds,
+        range_verified=bool(exact_range),
     )
     # Тело дочитано по длине или по кадрам, а сервер не обещал закрыть соединение — им можно
     # отправить следующий запрос (замер RTT).
     result.reusable = (length is not None or chunked) and b"connection: close" not in (
         head.lower())
     return result
+
+
+def _exact_content_range(head: bytes, size: int) -> bool:
+    values = re.findall(rb"^content-range:[ \t]*([^\r\n]*)", head, re.I | re.M)
+    if len(values) != 1:
+        return False
+    span = re.fullmatch(rb"bytes 0-" + str(size - 1).encode() + rb"/([0-9]{1,20}|\*)",
+                        values[0].strip(), re.I)
+    return span is not None and (span[1] == b"*" or int(span[1]) >= size)
 
 
 def _parse_head(head: bytes) -> tuple[int | None, int | None, bool]:

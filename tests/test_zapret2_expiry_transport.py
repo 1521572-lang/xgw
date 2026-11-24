@@ -18,6 +18,7 @@ REDIRECT_CDN = "r2.googlevideo.com"
 FULL_PAGE = b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n" + b"x" * z.PROBE_BYTES
 FULL_RANGE = (b"HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\n"
               b"Content-Range: bytes 0-65535/131072\r\n\r\n" + b"x" * z.PROBE_BYTES)
+MISSING_RANGE = FULL_RANGE.replace(b"Content-Range: bytes 0-65535/131072\r\n", b"")
 
 
 def read_headers(stream):
@@ -100,6 +101,34 @@ def media_url(host, expires):
     return f"https://{host}/videoplayback?expire={expires}"
 
 
+@pytest.mark.parametrize(("reply", "expected"), [
+    (FULL_PAGE, "range"),
+    (MISSING_RANGE, "range"),
+    (FULL_RANGE.replace(b"0-65535", b"1-65536"), "range"),
+    (FULL_RANGE.replace(b"0-65535/131072", b"0-65535/65535"), "range"),
+    (FULL_RANGE.replace(b"Content-Range:",
+                        b"Content-Range: bytes 0-65535/131072\r\nContent-Range:"),
+     "range"),
+    (FULL_RANGE[:-1], "truncated"),
+    (FULL_RANGE, "ok"),
+], ids=["http_200", "missing", "shifted", "invalid_total", "duplicate", "partial", "exact"])
+def test_selective_requires_exact_video_range_over_loopback(tunnel, reply, expected):
+    port, responses, connected = tunnel
+    responses.update({PAGE: FULL_PAGE, CDN: reply})
+    h = Harness()
+    h.cfg.zapret2.probe_port = port
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls = [f"https://{PAGE}/t/terms", media_url(CDN, int(time.time()) + 30)]
+    h.controller.probe = z.Controller.probe.__get__(h.controller)
+    for now in (0, 1, 2):
+        h.step(now)
+    assert connected == [PAGE, CDN]
+    assert h.controller.view["transport_probes"]["cdn"]["kind"] == expected
+    assert z.active(h.current) is (expected == "ok")
+    if expected != "ok":
+        assert h.controller.view["gate_closed"] and not h.runtime.up
+
+
 @pytest.mark.parametrize("stall_page", [False, True],
                          ids=["active_then_expired", "page_tls_stalled"])
 def test_selective_cdn_expiry_over_loopback(tunnel, stall_page):
@@ -133,8 +162,9 @@ def test_selective_cdn_expiry_over_loopback(tunnel, stall_page):
     assert h.controller.view["gate_closed"] and not z.active(h.current) and not h.runtime.up
 
 
-@pytest.mark.parametrize("stall_target", [False, True], ids=["full_range", "redirect_tls_stalled"])
-def test_vpn_redirect_respects_shorter_cdn_expiry_over_loopback(tunnel, stall_target):
+@pytest.mark.parametrize("reply", [FULL_RANGE, MISSING_RANGE, None],
+                         ids=["full_range", "missing_content_range", "redirect_tls_stalled"])
+def test_vpn_redirect_respects_shorter_cdn_expiry_over_loopback(tunnel, reply):
     port, responses, connected = tunnel
     h = Harness()
     expires = int(time.time()) + 3
@@ -142,7 +172,7 @@ def test_vpn_redirect_respects_shorter_cdn_expiry_over_loopback(tunnel, stall_ta
     responses[CDN] = (
         f"HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n".encode()
     )
-    responses[REDIRECT_CDN] = None if stall_target else FULL_RANGE
+    responses[REDIRECT_CDN] = reply
     h.cfg.zapret2.youtube_transport_probe = True
     h.cfg.zapret2.probe_urls[1] = media_url(CDN, expires + 4)
 
@@ -152,11 +182,14 @@ def test_vpn_redirect_respects_shorter_cdn_expiry_over_loopback(tunnel, stall_ta
         target="cdn",
     )
     assert connected == [CDN, REDIRECT_CDN]
-    if stall_target:
+    if reply is None:
         assert time.monotonic() - started < 4.5
         assert time.time() + 0.1 >= expires
         assert control.verdict == "fail" and control.result.status == 302
         assert control.redirect.state == "expired"
-    else:
+    elif reply == FULL_RANGE:
         assert control.verdict == "pass" and control.redirect.state == "followed"
         assert (control.result.status, control.result.downloaded) == (206, z.PROBE_BYTES)
+    else:
+        assert control.verdict == "fail" and control.redirect.state == "followed"
+        assert (control.result.status, control.result.kind) == (206, "range")

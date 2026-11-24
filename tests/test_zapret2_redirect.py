@@ -140,6 +140,7 @@ def test_cdn_range_vpn_control_follows_only_one_in_scope_redirect(
         calls.append(url)
         assert port == 20011
         assert kwargs["range_end"] == kwargs["min_body"] == z.PROBE_BYTES
+        assert kwargs["require_exact_range"] is True
         if len(calls) == 1:
             return DownloadResult(False, status=302, kind="http", phase="headers", location=location)
         assert len(calls) == 2 and final_http is not None
@@ -147,6 +148,7 @@ def test_cdn_range_vpn_control_follows_only_one_in_scope_redirect(
         return DownloadResult(
             final_http == 206, status=final_http, phase="body" if final_http == 206 else "headers",
             downloaded=z.PROBE_BYTES if final_http == 206 else 0, location="?third=private",
+            range_verified=final_http == 206,
         )
 
     h.controller._request = request
@@ -193,7 +195,8 @@ def test_cdn_expiry_bounds_vpn_control_and_redirect(
         assert options["range_end"] == z.PROBE_BYTES
         wall -= 1
         monotonic += elapsed
-        return DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body")
+        return DownloadResult(True, status=206, downloaded=z.PROBE_BYTES, phase="body",
+                              range_verified=True)
 
     h.controller._request = request
     control = h.controller._fallback_vpn_control(
