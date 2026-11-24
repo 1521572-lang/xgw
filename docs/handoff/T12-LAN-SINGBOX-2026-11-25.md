@@ -1,16 +1,17 @@
-# ThinkCentre · проверка LAN через мост sing-box
+# ThinkCentre · HTTPS через мост sing-box, разделение запросов, r2
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет готовые команды и публикует
 обезличенный отчёт при любом исходе. При недоступности терминала,
 sudo, pytest, установленного ядра или GitHub запроси доступ. Остальные
 фазы выполни независимо. Код и тесты подготовлены Codex.
 
-[Отчёт r2](../reports/2026-11-24T225151Z_t12-lan-kernel-r2.md) подтвердил
-18 контрактов, воспроизводимый запуск с коротким путём сокета и точное
-сопоставление HTTPS через `tproxy-in` с нативным Xray. Теперь тот же
-HTTPS-опыт проводится на изолированном шлюзе с одним участником через
-sing-box. Обычный Xray служит контролем. Обе сети стенда и TLS-источник
-локальные. Действующий шлюз читается только в `PREVIEW` и снимках.
+[Отчёт первого прогона](../reports/2026-11-24T233700Z_t12-lan-singbox.md)
+подтвердил 35 контрактов, чтение конфигурации и HTTPS через нативный Xray.
+Клиент sing-box получил таймаут. В серверном журнале наблюдался порт 8080,
+который использует и фоновый HTTP-контроль стенда. В r2 адрес TLS-источника
+отличается от адреса фоновой пробы, а точный сокет LAN фиксируется даже
+при таймауте. Дополнительный HTTPS-запрос через закреплённый вход моста
+проверяет тот же TLS-источник. Правила действующего шлюза при этом не меняются.
 
 ## Запуск
 
@@ -20,6 +21,8 @@ sing-box. Обычный Xray служит контролем. Обе сети �
 `XGW_TEST_XRAY` и `XGW_TEST_SINGBOX`. При отсутствии sing-box запиши
 пропуск сценария моста и выполни остальные фазы. Стенд использует
 изолированные процессы и короткий `--basetemp` в своём `/run`.
+Каталог `kernel-private` открывается для стенда внутри его mount namespace,
+поэтому диагностические файлы сохраняются при выходе из пространства.
 
 ~~~bash
 bash <<'BASH'
@@ -28,7 +31,7 @@ umask 077
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 BR=integration/zapret2-batch1
-CODE=b8c6985070975af3c535f75adc77bd2f35397bfd
+CODE=1fc6065b831f06e3190044ae22346444db9a956e
 REPO=$(git rev-parse --show-toplevel)
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -37,7 +40,7 @@ SB_BIN=${XGW_TEST_SINGBOX:-/opt/xgw/sing-box/sing-box}
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 D=$(mktemp -d "$HOME/xgw-t12-lan-singbox.XXXXXXXX")
-mkdir "$D/tree"
+mkdir "$D/tree" "$D/kernel-private"
 git -C "$REPO" archive "$CODE" src tests docs/helpers vpn_ui packaging pyproject.toml \
   | tar -x -C "$D/tree"
 printf 'OS %s\nPINNED %s\nPRIVATE_ARTIFACTS %s\n' "$PRETTY_NAME" "$CODE" "$D"
@@ -77,12 +80,15 @@ kernel() {
   sudo -n timeout -k 5 180 unshare --mount --propagation private --pid --fork \
     --kill-child --mount-proc /bin/sh -c '
       mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run || exit 3
+      mkdir /run/lan-artifacts || exit 3
+      mount --bind "$1" /run/lan-artifacts || exit 3
+      shift
       exec "$@"
-    ' sh /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    ' sh "$D/kernel-private" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     "PYTHONPATH=$PYTHONPATH" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
     XGW_XRAY_BIN="$XRAY_BIN" XGW_SINGBOX_BIN="$SB_BIN" \
-    "$TEST_PY" -B -P -m pytest -o addopts= -p no:cacheprovider --color=no -v -rs --tb=short \
-    --basetemp /run/lan-test \
+    "$TEST_PY" -B -P -m pytest -o addopts= -p no:cacheprovider --color=no -v -rs -s --tb=short \
+    --basetemp /run/lan-artifacts/p \
     tests/stand/test_stand_lan.py::test_lan_https_attributes_real_tproxy_socket
 }
 
@@ -122,9 +128,13 @@ BASH
   подтверждается отдельным запросом. PREVIEW таких запросов не делает.
 - **KERNEL** — отдельный результат для `[xray]` и `[sing-box]`. В обоих
   случаях ожидается HTTP 200 с проверкой сертификата, точный сокет в
-  `tproxy-in`, доступный пробный вход и собственная категория выхода.
-  Для sing-box стенд использует существующий локальный Hysteria2-сервер.
-  В отчёте укажи исход теста и полную причину пропуска или сбоя.
+  `tproxy-in`, доступный пробный вход и своя категория выхода. Если LAN
+  всё ещё падает, запиши `lan`, `tproxy_destination_ports`, `bridge_lan`,
+  `pinned_bridge` и `bridge_pinned` из структурированного вывода. Отдельно
+  укажи, был ли dial `trace_443`, `trace_other_port` либо `health_8080`.
+  Последняя категория относится к адресу фоновой проверки. При отсутствии
+  признака укажи неопределённость, не подставляй исход по общему счётчику.
+  При необходимости из сохранённых журналов сверь этап и формат строки.
 - **Шлюз** — снимки до и после и категории отличий. Живой проход LAN
   остаётся открытым до получения доступа к отдельному устройству.
   Живая проверка sing-box ждёт рабочего участника через мост.
@@ -144,17 +154,17 @@ REPORT_SRC=$1
 BR=integration/zapret2-batch1
 [[ $REPORT_SRC == /* && -s $REPORT_SRC ]]
 REPO=$(git rev-parse --show-toplevel)
-PUB=$(mktemp -d "$HOME/xgw-t12-lan-singbox-report.XXXXXXXX")
+PUB=$(mktemp -d "$HOME/xgw-t12-lan-singbox-r2-report.XXXXXXXX")
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_t12-lan-singbox.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_t12-lan-singbox-r2.md"
 test ! -e "$REPORT"
 install -m 0644 -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre isolated LAN HTTPS through the sing-box bridge'
+git commit -m 'Report ThinkCentre separated LAN HTTPS and sing-box probe evidence'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
