@@ -221,7 +221,7 @@ class Stand:
         )
         return env
 
-    def start(self) -> None:
+    def start(self, *, dns_hosts: dict[str, str] | None = None) -> None:
         if self.mode == "netns" and self._topology is None:
             self._topology = netns.Topology(ipv6=self.ipv6)
             self._topology.create()
@@ -229,6 +229,8 @@ class Stand:
         also = ["--dns-also", netns.INET_DNS_IP] if self.mode == "netns" else []
         if self.ipv6:
             also += ["--answer6", netns.INET_IP6]
+        for host, address in (dns_hosts or {}).items():
+            also += ["--answer-host", host, address]
         self._spawn(
             "origin", "inet",
             [sys.executable, str(HERE / "origin.py"), "--host", self.inet_ip,

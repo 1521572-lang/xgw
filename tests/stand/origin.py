@@ -112,14 +112,17 @@ class Server6(ThreadingHTTPServer):
     address_family = socket.AF_INET6
 
 
-def dns_answer(query: bytes, address: str, address6: str = "") -> bytes | None:
+def dns_answer(query: bytes, address: str, address6: str = "", hosts=None) -> bytes | None:
     """Ответ на DNS-запрос: A-запись с заданным адресом (для AAAA — адрес address6,
     если он задан), на прочие типы — пусто."""
     if len(query) < 17:
         return None
     offset = 12
+    labels = []
     while offset < len(query) and query[offset]:
-        offset += query[offset] + 1
+        end = offset + query[offset] + 1
+        labels.append(query[offset + 1:end].lower())
+        offset = end
     question_end = offset + 5
     if question_end > len(query):
         return None
@@ -127,6 +130,8 @@ def dns_answer(query: bytes, address: str, address6: str = "") -> bytes | None:
         query[13 : 13 + len(LOOPBACK_LABEL)].lower() == LOOPBACK_LABEL
     ):
         address, address6 = "127.0.0.1", "::1" if address6 else ""
+    elif hosts:
+        address = hosts.get(b".".join(labels), address)
     qtype = struct.unpack(">H", query[offset + 1 : offset + 3])[0]
     question = query[12:question_end]
     answers = 1 if qtype == 1 or (qtype == 28 and address6) else 0
@@ -139,7 +144,7 @@ def dns_answer(query: bytes, address: str, address6: str = "") -> bytes | None:
     return header + question + record
 
 
-def serve_dns(host: str, port: int, address: str, address6: str = "") -> socket.socket:
+def serve_dns(host: str, port: int, address: str, address6: str = "", hosts=None) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
 
@@ -149,7 +154,7 @@ def serve_dns(host: str, port: int, address: str, address6: str = "") -> socket.
                 query, peer = sock.recvfrom(4096)
             except OSError:
                 return
-            answer = dns_answer(query, address, address6)
+            answer = dns_answer(query, address, address6, hosts)
             if answer:
                 sock.sendto(answer, peer)
 
@@ -164,6 +169,7 @@ def main() -> None:
     parser.add_argument("--dns-port", type=int, default=0, help="0 — без DNS-заглушки")
     parser.add_argument("--answer", default="127.0.0.1", help="адрес в ответах DNS")
     parser.add_argument("--answer6", default="", help="адрес IPv6 в ответах на AAAA")
+    parser.add_argument("--answer-host", nargs=2, action="append", default=[])
     parser.add_argument(
         "--dns-also", action="append", default=[],
         help="ещё один адрес DNS-заглушки (можно несколько раз)",
@@ -186,8 +192,9 @@ def main() -> None:
         context.load_cert_chain(args.tls_cert, args.tls_key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
     if args.dns_port:
+        hosts = {name.encode("ascii").lower(): address for name, address in args.answer_host}
         for host in (args.host, *args.dns_also):
-            serve_dns(host, args.dns_port, args.answer, args.answer6)
+            serve_dns(host, args.dns_port, args.answer, args.answer6, hosts)
     print("READY", flush=True)
     server.serve_forever()
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import pytest
 from stand import Stand, wait_for
 
 from xgw.desync import lan_control, route_evidence, vpn_access, vpn_control
-from xgw.xraycore.access import endpoint, parse_accepted
+from xgw.xraycore.access import destination, endpoint, parse_accepted
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
 SINGBOX_BIN = os.environ.get("XGW_SINGBOX_BIN", "")
@@ -35,6 +36,8 @@ HERE = Path(__file__).resolve().parent
 VIA_VPN = netns.INET_IP
 DIRECT = netns.GW_WAN_IP
 SWITCH_LIMIT = 25.0
+TLS_PEER = "5.5.5.54"  # isolated alias, separate from the background HTTP probe at INET_IP
+TLS_LOCAL_PORT = 41443
 
 pytestmark = [
     pytest.mark.skipif(
@@ -56,7 +59,11 @@ def gateway(tmp_path, request):
     stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns",
                   singbox_bin=Path(SINGBOX_BIN) if bridge else None)
     try:
-        stand.start()
+        tls_hosts = {lan_control.TRACE_HOST: TLS_PEER} if hasattr(request, "param") else None
+        stand.start(dns_hosts=tls_hosts)
+        if tls_hosts:
+            alias = stand.run_in("inet", "ip", "addr", "add", f"{TLS_PEER}/32", "dev", "eth0")
+            assert alias.returncode == 0, alias.stderr
         if bridge:
             stand.add_singbox_server("hk", "hysteria2")
             stand.up(names=("hk",), capture=True, max_members=1)
@@ -137,11 +144,12 @@ def test_lan_https_attributes_real_tproxy_socket(gateway):
                     "-out", str(certificate), "-keyout", str(key)],
                    capture_output=True, timeout=12, check=True)
     gateway._spawn("https-origin", "inet", [
-        sys.executable, str(HERE / "origin.py"), "--host", netns.INET_IP, "--port", "443",
+        sys.executable, str(HERE / "origin.py"), "--host", TLS_PEER, "--port", "443",
         "--tls-cert", str(certificate), "--tls-key", str(key),
     ], "READY")
     config_path = gateway.root / "etc/xgw/xray/config.json"
     log_path = gateway.root / "run/xgw/xray.log"
+    server_log = gateway.logs / "server-hk.log"
     boot = "12345678123412341234123456789abc"
 
     def snapshot():
@@ -152,15 +160,16 @@ def test_lan_https_attributes_real_tproxy_socket(gateway):
                 "tags": route_evidence.counters(json.loads(raw), {"stats": {"outbound": {}}})}
 
     offset = log_path.stat().st_size
+    server_offset = server_log.stat().st_size if group == "sing-box" else 0
     before = snapshot()
     # Only this test supplies a temporary CA and pins the hostname to the private lab link.
     command = ("import json, sys; from docs.helpers.lan_https_sample import sample; "
                "print(json.dumps(sample(curl_options=sys.argv[1:])))")
     transfer = gateway.run_in("lan", sys.executable, "-B", "-P", "-c", command,
-                              "--cacert", str(certificate), "--resolve", f"{host}:443:{netns.INET_IP}")
+                              "--cacert", str(certificate), "--resolve", f"{host}:443:{TLS_PEER}",
+                              "--interface", netns.LAN_IP, "--local-port", str(TLS_LOCAL_PORT))
     assert transfer.returncode == 0, transfer.stderr
     client = json.loads(transfer.stdout)
-    assert client["http"] == 200 and client["curl_rc"] == 0, client
 
     def observed_log():
         with log_path.open(encoding="utf-8") as stream:
@@ -170,22 +179,74 @@ def test_lan_https_attributes_real_tproxy_socket(gateway):
                 message = line.rstrip("\r\n")
                 entry = parse_accepted(message)
                 if (entry is not None and entry.inbound == "tproxy-in"
-                        and endpoint(entry.source) == (client["local_ip"], client["local_port"])):
+                        and endpoint(entry.source) == (netns.LAN_IP, TLS_LOCAL_PORT)):
                     relevant.append(message)
             return relevant
 
-    assert wait_for(observed_log, 2), gateway.xray_log()
+    matching = wait_for(observed_log, 2) or []
     after = snapshot()
     # This file contains genuine access lines. Journald metadata is represented by the
     # isolated process identity and the observation time within the bounded test window.
     when = (round(before["unix"] * 1e6) + round(after["unix"] * 1e6)) // 2
     journal = [{"_SYSTEMD_UNIT": vpn_access.UNIT, "_PID": str(gateway.xray_pid()),
                 "_BOOT_ID": boot, "__REALTIME_TIMESTAMP": str(when), "MESSAGE": message}
-               for message in observed_log()]
+               for message in matching]
     result = lan_control.analyze(client, netns.GW_LAN_IP, journal, before, after)
+    port_counts: dict[int, int] = {}
+    for message in matching:
+        _, port = destination(parse_accepted(message).target)
+        port_counts[port] = port_counts.get(port, 0) + 1
+    diagnostic = {"lan": result, "tproxy_destination_ports": port_counts}
+    if group == "sing-box":
+        diagnostic["bridge_lan"] = _bridge_dials(server_log, server_offset)
+        server_offset = server_log.stat().st_size
+        diagnostic["pinned_bridge"] = _pinned_bridge_https(gateway, certificate)
+        diagnostic["bridge_pinned"] = _bridge_dials(server_log, server_offset)
+    print(json.dumps(diagnostic, sort_keys=True))
     assert result["https_complete"] is True
     assert result["accepted_route"] == {"state": "observed", "group": group,
                                         "matches_pinned_outbound": None}
+
+
+def _bridge_dials(path, offset):
+    counts = dict(trace_443=0, trace_other_port=0, health_8080=0)
+    with path.open(encoding="utf-8") as stream:
+        stream.seek(offset)
+        for line in stream:
+            match = re.search(r"outbound/direct\[out\]: outbound connection to (\S+)", line)
+            if not match:
+                continue
+            try:
+                host, port = destination(match[1])
+            except ValueError:
+                continue
+            if host in (TLS_PEER, lan_control.TRACE_HOST):
+                counts["trace_443" if port == 443 else "trace_other_port"] += 1
+            elif (host, port) == (netns.INET_IP, 8080):
+                counts["health_8080"] += 1
+    return counts
+
+
+def _pinned_bridge_https(gateway, ca):
+    command = """import json, ssl, sys
+from pathlib import Path
+from xgw.desync.vpn_control import _availability
+from xgw.watch.checks import http_get_via_proxy
+from xgw.generator.builder import PROBE_USER
+applied = json.loads(Path(sys.argv[1]).read_bytes())
+target = _availability(applied)[0]["sing-box"]
+result = http_get_via_proxy("127.0.0.1", target.port, sys.argv[3], timeout=4, max_total=8,
+                            min_body=1, max_bytes=4096, proxy_user=PROBE_USER,
+                            proxy_pass=target.password, tls_context=ssl.create_default_context(
+                                cafile=sys.argv[2]))
+print(json.dumps({"ok": result.ok, "http": result.status, "bytes": result.downloaded,
+                  "phase": result.phase, "kind": result.kind}))
+"""
+    trace = f"https://{lan_control.TRACE_HOST}/cdn-cgi/trace"
+    path = gateway.root / "etc/xgw/xray/config.json"
+    result = gateway.run_in("gw", sys.executable, "-B", "-P", "-c", command,
+                            str(path), str(ca), trace)
+    return json.loads(result.stdout) if result.returncode == 0 else {"state": "unavailable"}
 
 
 def test_bypass_host_goes_direct(gateway):
