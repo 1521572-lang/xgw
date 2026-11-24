@@ -208,7 +208,9 @@ class Jobs:
                                                     if key in ("ok", "phase", "kind", "http",
                                                                "elapsed_ms", "bytes",
                                                                "started_at", "connect_http",
-                                                               "first_tls_timeout_ms")}
+                                                               "first_tls_timeout_ms")
+                                                    or (target == "cdn" and key == "range_verified"
+                                                        and type(value) is bool)}
                                            for target, probe in
                                            evidence.get("transport_probes", {}).items()
                                            if target in ("page", "cdn")},

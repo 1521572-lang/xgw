@@ -1,6 +1,7 @@
 """Durable job transitions. Real flock runs on Ubuntu; Windows checks policy logic only."""
 import json
 import sys
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ def test_matrix_report_validates_one_job_and_two_distinct_https_rounds(tmp_path)
     assert result["ok"] and result["full_matrix"]
     assert result["states"] == {"timeout": 1, "active": 17}
     assert result["two_https_pass"] == profiles[2:]
+    assert result["two_range_pass"] == []
     assert result["profiles"][profiles[0]][0]["reason"] == "trial_timeout"
     assert result["profiles"][profiles[0]][0]["wait_stage"] == "nfqueue"
     assert result["profiles"][profiles[1]][0]["probes"]["page"]["phase"] == "tls"
@@ -81,6 +83,8 @@ def test_matrix_replay_ranks_from_round_one_and_measures_cost_in_round_two(
         2: {"https_pass": 2, "tls_timeout": 1, "control_wait_timeout": 1},
     }
     assert report["two_https_pass"] == [third]
+    assert report["two_range_pass"] == []
+    assert report["range_by_round"] == {1: {"unavailable": 4}, 2: {"unavailable": 4}}
     assert report["timing_by_round"][1]["off_confirm"] == {"samples": 0, "total_ms": None}
     assert report["timing_by_round"][1]["page_probe"] == {"samples": 1, "total_ms": 210}
     assert report["timing_by_round"][1]["cdn_probe"] == {"samples": 1, "total_ms": 307}
@@ -132,11 +136,47 @@ def test_matrix_replay_does_not_guess_expiry_or_transport_failure_without_eviden
     assert client._matrix_outcome(row) == "probe_details_unavailable"
     for kind, phase, expected in (
         ("http", "headers", "http_or_proxy_failure"),
+        ("range", "headers", "range_unconfirmed"),
         ("truncated", "body", "body_interrupted"),
         ("cancelled", "request", "probe_cancelled"),
     ):
         probe = {"ok": False, "phase": phase, "kind": kind, "http": 403}
         assert client._matrix_outcome(row | {"probes": {"cdn": probe}}) == expected
+
+
+def test_matrix_counts_only_separate_verified_ranges_in_a_restored_job(tmp_path):
+    verified, repeated, legacy = jobs.CANDIDATES[:3]
+    profiles = [verified, repeated, legacy]
+    rows = []
+    for index, profile in enumerate([*profiles, *reversed(profiles)]):
+        at = 120 + 10 * index
+        cdn = {"ok": True, "phase": "body", "http": 206, "bytes": 65536,
+               "started_at": at - 2, "location": "private-token"}
+        if profile != legacy:
+            cdn["range_verified"] = True
+        if profile == repeated and index >= 3:
+            cdn["started_at"] = 128
+        rows.append({"round": index // 3 + 1, "candidate": profile, "at": at, "state": "active",
+                     "transport": "https_reachable", "probes": {"page": {"ok": True}, "cdn": cdn}})
+    job = {"id": "a" * 32, "state": "complete", "restore": "pass", "started": 100,
+           "candidates": profiles, "rounds": 2, "results": rows}
+    path = tmp_path / "matrix.json"
+    path.write_text(json.dumps(job))
+    result = client.matrix_report(path)
+    assert result["two_https_pass"] == profiles
+    assert result["two_range_pass"] == [verified]
+    assert [row["range_ok"] for row in result["profiles"][repeated]] == [True, False]
+    assert result["profiles"][legacy][0]["range_ok"] is None
+    replay = client.matrix_replay(result)
+    assert replay["two_range_pass"] == [verified]
+    assert replay["range_by_round"] == {
+        1: {"verified": 2, "unavailable": 1},
+        2: {"verified": 1, "unconfirmed": 1, "unavailable": 1},
+    }
+    assert replay["playback"] == "NOT_MEASURED" and replay["apply"] is False
+    assert "private-token" not in json.dumps(result)
+    path.write_text(json.dumps(job | {"restore": "unconfirmed"}))
+    assert client.matrix_report(path)["two_range_pass"] == []
 
 
 @pytest.fixture
@@ -188,6 +228,33 @@ def test_complete_matrix_restores_policy_and_preserves_unrelated_fields(job_stor
     assert instance._policy()[1] == policy
     assert json.loads(managed.path_for(path).read_text())["extension"] == 42
     assert "private-token" not in json.dumps(public)
+
+
+def test_job_and_monitor_keep_only_the_cdn_range_proof(job_store, monkeypatch):
+    instance, _path, _policy = job_store
+    original = instance.observe
+
+    def observe():
+        result = original()
+        probes = result["evidence"]["transport_probes"]
+        probes["page"]["range_verified"] = True
+        probes["cdn"] = {"ok": True, "phase": "body", "http": 206, "bytes": 65536,
+                         "range_verified": True, "started_at": time.time(),
+                         "url": "private-token"}
+        return result
+
+    monkeypatch.setattr(instance, "observe", observe)
+    monitor = client.observation({"zapret2": observe()})
+    assert monitor["probes"]["cdn"]["range_verified"] is True
+    assert "range_verified" not in monitor["probes"]["page"]
+    assert "private-token" not in json.dumps(monitor)
+    assert start(instance)["ok"]
+    instance._run()
+    report = client.matrix_report(instance.path)
+    assert report["two_range_pass"] == ["multisplit", "multidisorder"]
+    row = instance.public()["results"][0]["probes"]
+    assert row["cdn"]["range_verified"] is True and "range_verified" not in row["page"]
+    assert "private-token" not in json.dumps(row)
 
 
 def test_cancel_before_run_restores_and_terminal_cancel_is_rejected(job_store):
@@ -291,11 +358,17 @@ def test_persistent_probe_drops_credentials_and_import_checks_assets(job_store, 
     assert cfg.zapret2.probe_urls[1] == "https://r1.googlevideo.com/generate_204"
     assert schema.valid_youtube_transport("selective", cfg.zapret2.domains, cfg.zapret2.probe_urls)
     assert "private-token" not in managed.path_for(path).read_text()
-    def missing():
+    def missing(domains, *, exclusions):
+        assert list(domains) == cfg.zapret2.domains and list(exclusions) == []
         raise ValueError("private-token")
+
+    def available(domains, *, exclusions):
+        assert list(domains) == cfg.zapret2.domains and list(exclusions) == []
+        return []
+
     monkeypatch.setattr(flowseal, "live_arguments", missing)
     assert command("import", **{"import": schema.LIVE_STRATEGY})["code"] == "blocked"
-    monkeypatch.setattr(flowseal, "live_arguments", lambda: [])
+    monkeypatch.setattr(flowseal, "live_arguments", available)
     assert command("import", **{"import": schema.LIVE_STRATEGY})["ok"]
     assert config.load(path)[0].zapret2.strategy == schema.LIVE_STRATEGY
     assert config.load(path)[0].zapret2.mode == "off"

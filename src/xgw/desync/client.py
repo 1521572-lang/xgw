@@ -81,7 +81,9 @@ def observation(state):
         "job_state": (card.get("job") or {}).get("state"),
         "pool_mode": pool.get("mode"), "pool_closed": traffic.get("closed"),
         "probes": {name: {k: row[k] for k in ("ok", "phase", "kind", "elapsed_ms",
-                                             "http", "bytes") if k in row}
+                                             "http", "bytes", "range_verified")
+                         if k in row and (k != "range_verified"
+                                          or (name == "cdn" and type(row[k]) is bool))}
                    for name, row in (evidence.get("transport_probes") or {}).items()
                    if name in ("page", "cdn") and isinstance(row, dict)},
     }
@@ -193,6 +195,11 @@ def matrix_report(path):
     counts = Counter()
     results = {p: [] for p in profiles}
     now = time.time()
+
+    def timestamp(value):
+        return value if type(value) in (int, float) and 0 < value <= now else None
+
+    previous_at = timestamp(job.get("started"))
     for row, (n, profile) in zip(rows, schedule, strict=False):
         if (not isinstance(row, dict) or type(row.get("round")) is not int
                 or (row["round"], row.get("candidate")) != (n, profile)
@@ -203,10 +210,20 @@ def matrix_report(path):
         reason = row.get("reason")
         if not isinstance(reason, str) or (reason not in REASONS and reason != "trial_timeout"):
             reason = "unconfirmed"
+        probes = transport_probes(row.get("probes"), now=now)
+        cdn = probes.get("cdn", {})
+        started, observed_at = cdn.get("started_at"), timestamp(row.get("at"))
+        https_ok = state == "active" and row.get("transport") == "https_reachable"
+        explicit = cdn.get("range_verified")
+        range_ok = None if explicit is None else (
+            explicit and https_ok and previous_at is not None and started is not None
+            and observed_at is not None and previous_at < started <= observed_at
+        )
+        if previous_at is None or (observed_at is not None and previous_at <= observed_at):
+            previous_at = observed_at
         outcome = {
             "round": n, "state": state, "reason": reason,
-            "https_ok": state == "active" and row.get("transport") == "https_reachable",
-            "probes": transport_probes(row.get("probes"), now=now),
+            "https_ok": https_ok, "range_ok": range_ok, "probes": probes,
         }
         stage = row.get("wait_stage")
         if state == "timeout" and stage in WAIT_STAGES:
@@ -234,10 +251,13 @@ def matrix_report(path):
                 and job.get("restore") == "pass")
     passed_twice = [p for p, runs in results.items()
                     if len(runs) == 2 and all(run["https_ok"] for run in runs)]
+    range_passed_twice = [p for p, runs in results.items()
+                          if complete and len(runs) == 2 and all(run["range_ok"] for run in runs)]
     return {"ok": complete, "job_id": job["id"], "expected_rows": len(schedule),
             "observed_rows": len(rows), "states": dict(counts), "profiles": results,
             "full_matrix": complete and rounds == 2 and len(profiles) == len(CANDIDATES),
-            "two_https_pass": passed_twice, "playback": "NOT_MEASURED"}
+            "two_https_pass": passed_twice, "two_range_pass": range_passed_twice,
+            "playback": "NOT_MEASURED"}
 
 
 def _matrix_outcome(row: dict) -> str:
@@ -261,6 +281,8 @@ def _matrix_outcome(row: dict) -> str:
         return "tls_timeout" if kind == "timeout" else "tls_failure"
     if phase == "body" and kind in ("stall", "timeout", "truncated", "reset"):
         return "body_stall" if kind in ("stall", "timeout") else "body_interrupted"
+    if kind == "range":
+        return "range_unconfirmed"
     if kind in ("http", "proxy"):
         return "http_or_proxy_failure"
     if kind == "cancelled":
@@ -296,11 +318,14 @@ def matrix_replay(report: dict) -> dict:
     """Compare a prior-round order on recorded HTTPS trials. No change to gateway policy."""
     profiles = report["profiles"]
     outcomes: dict[int, Counter] = {1: Counter(), 2: Counter()}
+    ranges: dict[int, Counter] = {1: Counter(), 2: Counter()}
     timings: dict[int, dict[str, list[int]]] = {1: {}, 2: {}}
+    range_status = {None: "unavailable", False: "unconfirmed", True: "verified"}
     for runs in profiles.values():
         for sample in runs:
             index = sample["round"]
             outcomes[index][_matrix_outcome(sample)] += 1
+            ranges[index][range_status[sample.get("range_ok")]] += 1
             metrics = dict(sample.get("phase_ms", {}))
             if "elapsed_ms" in sample:
                 metrics["attempt"] = sample["elapsed_ms"]
@@ -317,6 +342,8 @@ def matrix_replay(report: dict) -> dict:
         "observed_rows": report["observed_rows"], "full_matrix": report["full_matrix"],
         "outcomes_by_round": {n: dict(counts) for n, counts in outcomes.items()},
         "two_https_pass": report["two_https_pass"],
+        "two_range_pass": report.get("two_range_pass", []),
+        "range_by_round": {n: dict(counts) for n, counts in ranges.items()},
         "timing_by_round": {n: {
             name: {"samples": len(metrics.get(name, [])),
                    "total_ms": sum(metrics[name]) if name in metrics else None}
