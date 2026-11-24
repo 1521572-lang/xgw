@@ -448,6 +448,8 @@ domains = ["domain:youtube.com", "domain:googlevideo.com",
 binary = "/opt/xgw/zapret2/1.0.7/nfqws2"
 lua_dir = "/opt/xgw/zapret2/1.0.7/lua"
 strategy = "multisplit" # также multidisorder; результат зависит от провайдера
+# Локальные исключения обработки ALT9, хранятся отдельно от каталога Flowseal.
+# flowseal_exclude_domains = ["example.googlevideo.com"]
 queue_num = 200
 probe_port = 19999
 probe_urls = [] # HTTPS-страница YouTube и HTTPS-файл видеосети; пусто — остаётся VPN

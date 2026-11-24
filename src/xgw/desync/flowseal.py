@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -25,6 +26,8 @@ CATALOG_HASHES = {
 YOUTUBE = ("youtube.com,googlevideo.com,youtubei.googleapis.com,"
            "youtube-nocookie.com,ytimg.com,ggpht.com")
 YOUTUBE_DOMAINS = tuple(f"domain:{name}" for name in YOUTUBE.split(","))
+MAX_EXCLUSIONS = 64
+DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 USER_LISTS = {"list-general-user.txt", "list-exclude-user.txt", "ipset-exclude-user.txt"}
 POSITIVE = ("--hostlist=", "--hostlist-domains=", "--ipset=")
 PLACEHOLDER = "%LISTS%"
@@ -66,14 +69,26 @@ def _verified_asset(root: Path, name: str, metadata: dict) -> bytes:
     return data
 
 
-def valid_live_scope(mode: str, domains: list[str]) -> bool:
-    return mode == "off" or (
-        mode == "standalone"
-        and set(YOUTUBE_DOMAINS[:2]) <= set(domains) <= set(YOUTUBE_DOMAINS)
+def valid_exclusions(values: list[str] | tuple[str, ...]) -> bool:
+    roots = YOUTUBE.split(",")
+    return len(values) <= MAX_EXCLUSIONS and all(
+        isinstance(name, str) and len(name) <= 253
+        and all(DNS_LABEL.fullmatch(label) for label in name.split("."))
+        and any(name == root or name.endswith("." + root) for root in roots)
+        for name in values
     )
 
 
-def _profile_plan(profile: dict, scope: str, assets_dir: Path) -> tuple[list, list, dict, list]:
+def valid_live_scope(mode: str, domains, exclusions=()) -> bool:
+    return mode == "off" or (
+        mode == "standalone"
+        and set(YOUTUBE_DOMAINS[:2]) <= set(domains) <= set(YOUTUBE_DOMAINS)
+        and any(domain.removeprefix("domain:") not in exclusions for domain in domains)
+    )
+
+
+def _profile_plan(profile: dict, scope: str, assets_dir: Path, *,
+                  hosts: str = YOUTUBE, exclusions: str = "") -> tuple[list, list, dict, list]:
     blocks, included, sources = [], [], {}
     excluded = [entry for entry in profile["profiles"] if entry["status"] != "INCLUDED"]
     runnable = (entry for entry in profile["profiles"] if entry["status"] == "INCLUDED")
@@ -83,7 +98,9 @@ def _profile_plan(profile: dict, scope: str, assets_dir: Path) -> tuple[list, li
             continue
         arguments = []
         if scope == "youtube":
-            arguments.append("--hostlist-domains=" + YOUTUBE)
+            arguments.append("--hostlist-domains=" + hosts)
+            if exclusions:
+                arguments.append("--hostlist-exclude-domains=" + exclusions)
         for arg in block:
             if scope == "youtube" and arg.startswith(POSITIVE):
                 continue
@@ -110,10 +127,14 @@ def _arguments(blocks: list[list[str]]) -> list[str]:
     return arguments
 
 
-def live_arguments() -> list[str]:
+def live_arguments(domains=YOUTUBE_DOMAINS, *, exclusions=()) -> list[str]:
     """Compile the approved YouTube adaptation from immutable local input."""
     from .preflight import trusted_file
 
+    if not valid_exclusions(exclusions) or not valid_live_scope("standalone", domains, exclusions):
+        raise ValueError("flowseal_standalone_scope_required")
+    hosts = ",".join(name.removeprefix("domain:") for name in YOUTUBE_DOMAINS if name in domains)
+    local = ",".join(dict.fromkeys(exclusions))
     for name in CATALOG_HASHES:
         path = LIVE_ROOT / name
         if trusted_file(path) != path:
@@ -121,7 +142,7 @@ def live_arguments() -> list[str]:
     source, translation = load_catalog(LIVE_ROOT)
     assets_dir = LIVE_ROOT / "alt9" / "assets"
     blocks, _, sources, _ = _profile_plan(
-        translation["configurations"][LIVE_PROFILE], "youtube", assets_dir,
+        translation["configurations"][LIVE_PROFILE], "youtube", assets_dir, hosts=hosts, exclusions=local,
     )
     empty = {"bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
     for name, upstream in sources.items():

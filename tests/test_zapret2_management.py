@@ -364,6 +364,89 @@ def test_alt9_missing_assets_prevent_import_and_activation_but_allow_off(store, 
     assert blocked["code"] == "blocked" and "private-token" not in json.dumps(blocked)
     assert panel.read_bytes() == before
 
+
+def test_alt9_local_exclusions_update_atomically_and_survive_reimport(store, monkeypatch):
+    from unittest.mock import Mock
+
+    from xgw.desync import flowseal
+
+    cfg, panel = store
+    verify = Mock(return_value=[])
+    monkeypatch.setattr(flowseal, "live_arguments", verify)
+    domains = list(flowseal.YOUTUBE_DOMAINS[:2])
+    assert send(cfg, {"domains": ["domain:example.org"]})["ok"]
+    incompatible = panel.read_bytes(), panel.stat().st_mtime_ns
+    assert import_alt9(cfg)["code"] == "invalid"
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == incompatible
+    verify.assert_not_called()
+    assert send(cfg, {"domains": domains})["ok"]
+    assert import_alt9(cfg)["ok"]
+    old = key(cfg)
+    original = ["example.googlevideo.com"]
+    patch = {"flowseal_exclude_domains": original}
+    assert send(cfg, patch)["code"] == "saved"
+    revision = key(cfg)
+    assert revision != old
+    assert config.load(cfg)[0].zapret2.flowseal_exclude_domains == original
+    stored = panel.read_bytes(), panel.stat().st_mtime_ns
+    assert send(cfg, patch)["code"] == "unchanged"
+    assert send(cfg, {"flowseal_exclude_domains": ["example.org"]})["code"] == "invalid"
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == stored
+    assert send(cfg, {"strategy": "multisplit"})["ok"]
+    assert import_alt9(cfg)["ok"]
+    verify.assert_called_with(domains, exclusions=original)
+    assert config.load(cfg)[0].zapret2.domains == domains
+    assert send(cfg, "standalone", action="mode")["ok"]
+    stored = panel.read_bytes(), panel.stat().st_mtime_ns
+    assert send(cfg, {"flowseal_exclude_domains": []})["code"] == "blocked"
+    assert (panel.read_bytes(), panel.stat().st_mtime_ns) == stored
+    assert send(cfg, "off", action="mode")["ok"]
+    assert send(cfg, {"flowseal_exclude_domains": []})["ok"]
+    assert key(cfg) == old
+
+
+def test_alt9_interrupted_replacement_keeps_the_previous_list(store, monkeypatch):
+    from xgw import paths
+
+    cfg, panel = store
+    previous = {"flowseal_exclude_domains": ["old.googlevideo.com"]}
+    assert send(cfg, previous)["ok"]
+    before = panel.read_bytes()
+    revision = key(cfg)
+    patch = {"flowseal_exclude_domains": ["new.googlevideo.com"]}
+
+    def interrupt(_temporary, destination):
+        assert destination == panel
+        raise OSError("injected before replace")
+
+    with monkeypatch.context() as operation:
+        operation.setattr(paths.os, "replace", interrupt)
+        assert send(cfg, patch, expected=revision)["code"] == "storage_error"
+    assert panel.read_bytes() == before and key(cfg) == revision
+    assert not list(panel.parent.glob(f".{panel.name}.*.tmp"))
+    assert send(cfg, patch, expected=revision)["ok"]
+
+
+@pytest.mark.parametrize(("arguments", "hosts"), [
+    (["--domains", "example.googlevideo.com"], ["example.googlevideo.com"]),
+    (["--clear"], []),
+])
+def test_alt9_cli_sends_replacement_using_the_observed_revision(monkeypatch, arguments, hosts):
+    from types import SimpleNamespace
+
+    from xgw.desync import client
+
+    def request(path, body=None):
+        if path.endswith("/overview"):
+            return {"zapret2": {"config_key": "revision"}}
+        assert path == "/api/zapret2/settings"
+        assert body == {"expected": "revision", "settings": {"flowseal_exclude_domains": hosts}}
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "Client", lambda: SimpleNamespace(request=request))
+    monkeypatch.setattr(sys, "argv", ["xgw-desync", "flowseal-exclusions", *arguments])
+    assert client.main() == 0
+
 @pytest.mark.parametrize("remaining", [None, 0, 262144, 786431, 786432])
 def test_selective_admission_is_checked_before_saving(store, remaining):
     cfg, panel = store

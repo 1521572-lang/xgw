@@ -396,6 +396,7 @@ class Zapret2:
     # Адреса задаёт владелец: страница и файл видеосети. Пусто — остаётся VPN.
     probe_urls: list[str] = field(default_factory=list)
     youtube_transport_probe: bool = False
+    flowseal_exclude_domains: list[str] = field(default_factory=list)
     check_seconds: int = 180
     retry_seconds: int = 300
     daily_probe_mb: int = 256

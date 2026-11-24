@@ -230,7 +230,7 @@ def test_live_uses_verified_assets_and_not_a_stored_command(tmp_path, monkeypatc
     profile = translation["configurations"][flowseal.LIVE_PROFILE]
     assets = tmp_path / "alt9" / "assets"
     assets.mkdir(parents=True)
-    blocks, _, refs, _ = flowseal._profile_plan(profile, "youtube", assets)
+    _, _, refs, _ = flowseal._profile_plan(profile, "youtube", assets)
     files = {}
     for name, path in refs.items():
         data = path.encode() if path else b""
@@ -246,9 +246,16 @@ def test_live_uses_verified_assets_and_not_a_stored_command(tmp_path, monkeypatc
     cfg = Config()
     cfg.zapret2.mode = "standalone"
     cfg.zapret2.strategy = flowseal.LIVE_STRATEGY
+    cfg.zapret2.domains = ["domain:googlevideo.com", "domain:youtube.com"]
+    cfg.zapret2.flowseal_exclude_domains = ["example.googlevideo.com", "example.googlevideo.com"]
+    blocks, _, _, _ = flowseal._profile_plan(profile, "youtube", assets, hosts="youtube.com,googlevideo.com",
+                                            exclusions="example.googlevideo.com")
     args = zapret2.arguments(cfg)
     assert args[1] == f"--qnum={cfg.zapret2.queue_num}"
     assert args[5:] == flowseal._arguments(blocks) and "--qnum=42" not in args
+    assert args.count("--hostlist-domains=youtube.com,googlevideo.com") == len(blocks)
+    assert args.count("--hostlist-exclude-domains=example.googlevideo.com") == len(blocks)
+    assert (assets / "list-exclude-user.txt").read_bytes() == b""
     (assets / "list-exclude-user.txt").write_bytes(b"youtube.com")
     with pytest.raises(ValueError, match="source_digest"):
         zapret2.arguments(cfg)
@@ -264,3 +271,19 @@ def test_alt9_policy_rejects_selective_extra_domains_and_old_runtime():
     for changes in incompatible:
         with pytest.raises(schema.PolicyError, match="requires Standalone"):
             schema.project(schema.migrate(base | changes))
+
+
+@pytest.mark.parametrize("bad", ["evilgooglevideo.com", "googlevideo.com.example", "*.googlevideo.com",
+                                 "-bad.googlevideo.com", "sub..youtube.com", "a.youtube.com,b.youtube.com"])
+def test_alt9_validates_each_local_hostname(bad):
+    with pytest.raises(schema.PolicyError, match="flowseal_exclude_domains"):
+        schema.validate_patch({"flowseal_exclude_domains": [bad]})
+
+
+def test_alt9_refuses_an_entirely_excluded_scope_without_changing_legacy_revisions():
+    assert schema.migrate({"flowseal_exclude_domains": []}) == schema.migrate({})
+    patch = {"strategy": flowseal.LIVE_STRATEGY, "domains": list(flowseal.YOUTUBE_DOMAINS[:2]),
+             "flowseal_exclude_domains": ["youtube.com", "googlevideo.com"]}
+    assert schema.project(schema.migrate(patch | {"mode": "off"}))["mode"] == "off"
+    with pytest.raises(schema.PolicyError, match="nonempty"):
+        schema.project(schema.migrate(patch | {"mode": "standalone"}))

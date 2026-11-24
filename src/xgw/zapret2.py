@@ -100,8 +100,12 @@ def validate(cfg: Config) -> list[str]:
     strategies = TRACED if z.mode == "compare" else SELECTED_PROFILES
     if z.strategy not in strategies:
         problems.append("strategy: неизвестная или неподдерживаемая в выбранном режиме")
-    if z.strategy == flowseal.LIVE_STRATEGY and not flowseal.valid_live_scope(z.mode, z.domains):
-        problems.append("Flowseal ALT9 требует Standalone и домены YouTube")
+    if not flowseal.valid_exclusions(z.flowseal_exclude_domains):
+        problems.append("flowseal_exclude_domains: нужны имена внутри области YouTube")
+    if z.strategy == flowseal.LIVE_STRATEGY and not flowseal.valid_live_scope(
+        z.mode, z.domains, z.flowseal_exclude_domains,
+    ):
+        problems.append("Flowseal ALT9 требует Standalone и непустой области YouTube")
     if z.youtube_transport_probe and not valid_youtube_transport(z.mode, z.domains, z.probe_urls):
         problems.append("youtube_transport_probe требует Selective, страницу YouTube и CDN")
     if not 1 <= z.queue_num <= 65535 or not 1024 <= z.probe_port <= 65535:
@@ -436,9 +440,9 @@ def arguments(cfg: Config) -> list[str]:
             f"--lua-init=@{z.lua_dir}/zapret-lib.lua",
             f"--lua-init=@{z.lua_dir}/zapret-antidpi.lua"]
     if z.strategy == flowseal.LIVE_STRATEGY:
-        if z.mode != "standalone" or not flowseal.valid_live_scope(z.mode, z.domains):
+        if z.mode != "standalone":
             raise ValueError("flowseal_standalone_scope_required")
-        return [*args, *flowseal.live_arguments()]
+        return [*args, *flowseal.live_arguments(z.domains, exclusions=z.flowseal_exclude_domains)]
     if z.strategy in ("fake_static_md5", "fake_clone_md5"):
         source = "static" if z.strategy == "fake_static_md5" else "clone"
         return [*args, "--filter-tcp=443", "--filter-l7=tls", "--payload=tls_client_hello",

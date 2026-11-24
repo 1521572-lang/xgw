@@ -12,7 +12,8 @@ from ..desync import schema
 from ..paths import LockTimeout
 
 EDITABLE = frozenset({"strategy", "domains", "probe_urls", "cdn_probe_url", "check_seconds",
-                      "retry_seconds", "daily_probe_mb", "youtube_transport_probe"})
+                      "retry_seconds", "daily_probe_mb", "youtube_transport_probe",
+                      "flowseal_exclude_domains"})
 # Ordinary settings may retain an imported profile, but cannot enter it.
 PROFILES = tuple(p for p in schema.SELECTED_PROFILES if p != schema.LIVE_STRATEGY)
 MODES = ("off", "standalone", "selective")
@@ -132,6 +133,8 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture,
             if body["expected"] != key:
                 return reply(False, "conflict", "Настройки изменены в другом окне. "
                              "Перечитайте их перед повторным сохранением.", config_key=key)
+            if "flowseal_exclude_domains" in patch and cfg.zapret2.mode != "off":
+                return reply(False, "blocked", "Выключите выбранный режим перед изменением исключений ALT9.")
             if cdn_url is not None:
                 if not patch.get("youtube_transport_probe", cfg.zapret2.youtube_transport_probe):
                     return reply(False, "blocked", "Включите HTTPS-проверку YouTube и CDN.")
@@ -153,23 +156,26 @@ def command(config_path: Path, action: str, body: dict, *, ready, capture,
             if action == "import":
                 from ..desync import flowseal
 
+                if cfg.zapret2.mode != "off":
+                    return reply(False, "blocked", "Выключите режим перед импортом.")
+                if not flowseal.valid_live_scope("standalone", cfg.zapret2.domains,
+                                                cfg.zapret2.flowseal_exclude_domains):
+                    return reply(False, "invalid", "Сохраните непустую область YouTube для ALT9.")
                 try:
-                    flowseal.live_arguments()
+                    flowseal.live_arguments(cfg.zapret2.domains,
+                                            exclusions=cfg.zapret2.flowseal_exclude_domains)
                 except (OSError, ValueError):
                     return reply(False, "blocked",
                                  "Проверенные каталоги или ассеты Flowseal отсутствуют.")
-            if action == "import":
-                if cfg.zapret2.mode != "off":
-                    return reply(False, "blocked", "Выключите режим перед импортом.")
-                patch = {"strategy": schema.LIVE_STRATEGY, "youtube_transport_probe": False,
-                         "domains": list(schema.YOUTUBE_DOMAINS)}
+                patch = {"strategy": schema.LIVE_STRATEGY, "youtube_transport_probe": False}
             policy, proposed = candidate(cfg, patch, editing=action == "settings")
             if (proposed.zapret2.mode != "off"
                     and proposed.zapret2.strategy == schema.LIVE_STRATEGY):
                 from ..desync import flowseal
 
                 try:
-                    flowseal.live_arguments()
+                    flowseal.live_arguments(proposed.zapret2.domains,
+                                            exclusions=proposed.zapret2.flowseal_exclude_domains)
                 except (OSError, ValueError):
                     return reply(False, "blocked", "Проверенные ассеты Flowseal недоступны. "
                                  "Выключите режим и повторите подготовку профиля.")

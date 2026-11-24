@@ -359,6 +359,10 @@ def main():
     start.add_argument("--seconds", type=int, default=3600)
     for name in ("cancel", "reset", "probe-persistent", "import-flowseal"):
         sub.add_parser(name)
+    exclusions = sub.add_parser("flowseal-exclusions", help="Заменить исключения ALT9 в режиме off")
+    changes = exclusions.add_mutually_exclusive_group(required=True)
+    changes.add_argument("--domains", nargs="+", metavar="HOST")
+    changes.add_argument("--clear", dest="domains", action="store_const", const=[])
     pin = sub.add_parser("pin")
     pin.add_argument("candidate", choices=CANDIDATES)
     watch = sub.add_parser("monitor")
@@ -409,6 +413,8 @@ def main():
                     action, body["probe"] = "probe", "persistent"
                 elif args.action == "import-flowseal":
                     action, body["import"] = "import", "flowseal_alt9"
+                elif args.action == "flowseal-exclusions":
+                    action, body["settings"] = "settings", {"flowseal_exclude_domains": args.domains}
                 else:
                     action = "job/" + args.action
                 result = client.request("/api/zapret2/" + action, body)

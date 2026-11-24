@@ -14,7 +14,7 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
-from .flowseal import LIVE_STRATEGY, YOUTUBE_DOMAINS, valid_live_scope
+from .flowseal import LIVE_STRATEGY, YOUTUBE_DOMAINS, valid_exclusions, valid_live_scope
 
 VERSION = 1
 MODES = ("off", "standalone", "selective", "compare")
@@ -46,6 +46,7 @@ DEFAULTS = {
     "observe_synack": False,
     "observe_reply_packets": 0,
     "youtube_transport_probe": False,
+    "flowseal_exclude_domains": [],
     "engine": "off", "engine_profile": "seqovl", "engine_queue": 200,
     "engine_offload": True, "blob_dir": "",
 }
@@ -57,7 +58,7 @@ GROUPS = {
 }
 ENGINE_FIELDS = ("engine", "engine_profile", "engine_queue", "engine_offload", "blob_dir")
 OBSERVATION_FIELDS = ("observe_synack", "observe_reply_packets")
-OPTIONAL_SELECTED = (*OBSERVATION_FIELDS, "youtube_transport_probe")
+OPTIONAL_SELECTED = (*OBSERVATION_FIELDS, "youtube_transport_probe", "flowseal_exclude_domains")
 MAX_REPLY_PACKETS = 8
 _DOMAIN = re.compile(r"(?:domain|full):[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 
@@ -155,6 +156,8 @@ def validate_patch(value: object) -> dict:
         _require(0 < len(value["domains"]) <= 1024, "domains")
         _require(all(isinstance(d, str) and len(d) <= 260 and _DOMAIN.fullmatch(d)
                      for d in value["domains"]), "domains")
+    if "flowseal_exclude_domains" in value:
+        _require(valid_exclusions(value["flowseal_exclude_domains"]), "flowseal_exclude_domains")
     if "probe_urls" in value:
         _require(len(value["probe_urls"]) <= 4, "probe_urls")
         for item in value["probe_urls"]:
@@ -249,12 +252,14 @@ Known selected strategies may remain dormant in off mode without substitution.
     if flat["strategy"] == LIVE_STRATEGY:
         if target == "freepool":
             raise PolicyError("desync: the T10 Flowseal profile cannot be represented by freepool")
-        if not valid_live_scope(flat["mode"], flat["domains"]):
-            raise PolicyError("desync: Flowseal ALT9 requires Standalone and YouTube domains")
+        if not valid_live_scope(flat["mode"], flat["domains"], flat.get("flowseal_exclude_domains", ())):
+            raise PolicyError("desync: Flowseal ALT9 requires Standalone and nonempty YouTube scope")
     if target == "gui-light":
         if flat["mode"] == "compare" and flat["strategy"] not in ("multisplit", "multidisorder"):
             raise PolicyError("desync: compare tracing supports multisplit and multidisorder")
     else:
+        if flat.get("flowseal_exclude_domains"):
+            raise PolicyError("desync: Flowseal exclusions cannot be represented by freepool")
         if flat["strategy"] in ("fake_static_md5", "fake_clone_md5"):
             raise PolicyError("desync: the H05 selected profiles cannot be represented by freepool")
         if flat["strategy"] in T09_PROFILES:
