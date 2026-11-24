@@ -174,7 +174,7 @@ def test_missing_video_probe_does_not_launch_worker():
 def test_known_cdn_expiry_caps_lease_and_removes_direct_route(monkeypatch):
     h = Harness()
     wall = 1_800_000_000
-    monkeypatch.setattr(z.time, "time", lambda: wall)
+    monkeypatch.setattr(z, "time", SimpleNamespace(time=lambda: wall, monotonic=lambda: 100))
     h.cfg.zapret2.youtube_transport_probe = True
     cdn = "https://r1.googlevideo.com/videoplayback"
     h.cfg.zapret2.probe_urls[1] = f"{cdn}?expire={wall - 1}"
@@ -199,6 +199,58 @@ def test_known_cdn_expiry_caps_lease_and_removes_direct_route(monkeypatch):
                                  "gate_closed": True, "last_transport_ok_at": wall - 20}
     assert not h.runtime.up and not z.active(h.current)
     assert not any(item["tag"] == z.PROBE for item in h.current["inbounds"])
+
+
+def test_signed_cdn_gate_cannot_be_extended_by_wall_clock_rollback(monkeypatch):
+    h = Harness()
+    wall, monotonic = 1_800_000_000, 100
+    monkeypatch.setattr(z, "time", SimpleNamespace(time=lambda: wall, monotonic=lambda: monotonic))
+    cdn = "https://r1.googlevideo.com/videoplayback"
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls[1] = f"{cdn}?expire={wall + 12}"
+    h.activate()
+    assert h.controller.cdn_gate_until == 112
+    last_ok = h.controller.view["last_transport_ok_at"]
+
+    wall -= 60
+    monotonic = 104
+    h.step(6)
+    assert h.runtime.events[-1] == ("gate", 8)
+    assert h.controller.cdn_gate_until == 112
+    assert h.controller.view["last_transport_ok_at"] == last_ok
+
+    monotonic = 112
+    h.step(14)
+    assert h.controller.view["reason"] == z.CDN_EXPIRED
+    assert h.controller.view["gate_closed"] and not z.active(h.current)
+    assert h.controller.cdn_gate_until is None
+
+    wall += 72
+    h.cfg.zapret2.probe_urls[1] = f"{cdn}?expire={wall + 20}"
+    for seconds in (15, 16, 17):
+        h.step(seconds)
+    assert h.controller.cdn_gate_until == 132
+    assert h.controller.view["state"] == "active"
+    assert h.controller.view["last_transport_ok_at"] == wall
+
+
+def test_signed_cdn_observed_expiry_is_not_reversed_by_clock_correction(monkeypatch):
+    h = Harness()
+    wall, monotonic = 1_800_000_000, 100
+    monkeypatch.setattr(z, "time", SimpleNamespace(time=lambda: wall, monotonic=lambda: monotonic))
+    h.cfg.zapret2.youtube_transport_probe = True
+    h.cfg.zapret2.probe_urls[1] = f"https://r1.googlevideo.com/videoplayback?expire={wall + 15}"
+    h.activate()
+    wall += 15
+    monotonic += 3
+    h.step(5)
+    events = list(h.runtime.events)
+    wall -= 12
+    monotonic += 1
+    h.step(6)
+    assert h.runtime.events == events
+    assert h.controller.view["reason"] == z.CDN_EXPIRED
+    assert not h.runtime.up and not z.active(h.current)
 
 
 def test_cdn_expiry_between_page_and_video_skips_media_request(monkeypatch):

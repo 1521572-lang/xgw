@@ -3275,6 +3275,13 @@ def test_watchdog_shortens_pause_during_selective_start(daemon, monkeypatch, now
     assert starts == [0, pause] and sleeps == [pause, pause]
 
 
+def test_watchdog_wakes_at_signed_cdn_gate_end(daemon, monkeypatch):
+    daemon.cfg.zapret2.mode = "selective"
+    daemon._zapret2.cdn_gate_until = 6
+    starts, sleeps = _scheduled_run(daemon, monkeypatch, State.HEALTHY, [2, 0])
+    assert starts == [0, 6] and sleeps == [4, 2]
+
+
 def test_fresh_health_is_published_before_optional_work_without_faking_new_observation(daemon):
     _started(daemon)
     checkpoints = []
@@ -3743,6 +3750,29 @@ def test_zapret2_tick_uses_api_and_restores_vpn_after_worker_death(daemon):
     assert not zapret2.active(engine.read_json(daemon.paths.xray_config_file))
     assert daemon._zapret2.view["state"] == "fallback"
     assert daemon._build_count == builds + 1
+
+
+def test_zapret2_status_waits_for_confirmed_fallback_after_gate_expires(daemon):
+    daemon.cfg.zapret2.mode = "selective"
+    daemon._zapret2.view = {"state": "active", "reason": "youtube_transport_ok"}
+    daemon._zapret2.cdn_gate_until = time.monotonic() - 1
+    assert daemon._zapret2_status(True) == {"state": "unknown", "reason": "expired"}
+
+
+def test_signed_cdn_deadline_survives_config_reload(daemon):
+    settings = daemon.cfg.zapret2
+    settings.mode = "selective"
+    settings.youtube_transport_probe = True
+    expires = int(time.time()) + 30
+    settings.probe_urls = ["https://www.youtube.com/t/terms",
+                           f"https://r1.googlevideo.com/videoplayback?expire={expires}"]
+    expiry = daemon._zapret2._expiry_for(settings)
+    second = _second(daemon, lambda cfg: setattr(cfg.filters, "max_members", 1))
+    try:
+        assert expiry is not None
+        assert second._zapret2._expiry_for(second.cfg.zapret2) is expiry
+    finally:
+        second.store.close()
 
 
 def test_zapret2_compare_uses_live_member_and_exports_probe_rows(daemon):

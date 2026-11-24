@@ -29,7 +29,7 @@ from .net import cmd
 from .net.sysctl import CONNTRACK_ACCT as CONNTRACK_ACCT
 
 if TYPE_CHECKING:
-    from .config import Config
+    from .config import Config, Zapret2
     from .watch.checks import DownloadResult
 
 MARK = 0x10000000
@@ -191,17 +191,17 @@ def probe_expiry(settings) -> int | None:
     return None
 
 
-def probe_lease(seconds: int, expires_at: int | None) -> int:
-    if expires_at is not None:
-        seconds = min(seconds, int(expires_at - time.time()))
+def probe_lease(seconds: int, expiry: _CdnExpiry | None) -> int:
+    if expiry is not None:
+        seconds = min(seconds, int(expiry.remaining()))
         if seconds < 1:
             raise ValueError(CDN_EXPIRED)
     return seconds
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CdnExpiry:
-    """Time remaining for one probe chain, guarded against wall-clock rollback."""
+    """A signed deadline that can move earlier but never later."""
 
     wall: int
     monotonic: float
@@ -213,7 +213,9 @@ class _CdnExpiry:
         return cls(stamp, time.monotonic() + (stamp - time.time()))
 
     def remaining(self) -> float:
-        return min(self.wall - time.time(), self.monotonic - time.monotonic())
+        now = time.monotonic()
+        self.monotonic = min(self.monotonic, now + (self.wall - time.time()))
+        return self.monotonic - now
 
 
 def _redirect_target(url: str, location: str, domains: list[str]) -> str | None:
@@ -563,6 +565,8 @@ class Controller:
         self.ready = False
         self.cleanup_pending = False
         self.start_deadline: float | None = None
+        self.cdn_expiry: _CdnExpiry | None = None
+        self.cdn_gate_until: float | None = None
         self.vpn_cdn_retry: tuple[float, str] | None = None
         self.last_error = ""
         self.probe_failure = "probe_failed"
@@ -612,6 +616,14 @@ class Controller:
             user_agent=user_agent, cancel=cancel,
         )
 
+    def _expiry_for(self, settings: Zapret2) -> _CdnExpiry | None:
+        stamp = probe_expiry(settings)
+        if stamp is None:
+            return None
+        if self.cdn_expiry is None or self.cdn_expiry.wall != stamp:
+            self.cdn_expiry = _CdnExpiry.from_timestamp(stamp)
+        return self.cdn_expiry
+
     def probe(self, cfg: Config, applied: dict, cancel) -> bool:
         from .generator import builder
 
@@ -620,7 +632,7 @@ class Controller:
         self.transport_probes = {}
         if z.youtube_transport_probe and (not configured(cfg) or not password):
             return False
-        expiry = _CdnExpiry.from_timestamp(probe_expiry(z))
+        expiry = self._expiry_for(z)
         for index, url in enumerate(z.probe_urls):
             media_transport = z.youtube_transport_probe and index == 1
             media_file = media_transport and urlsplit(url).path == "/videoplayback"
@@ -768,7 +780,7 @@ class Controller:
         password, _ = builder.probe_state(applied)
         if not password:
             return _VpnControl("not_run", "no_probe_credentials")
-        expiry = _CdnExpiry.from_timestamp(probe_expiry(cfg.zapret2)) if target == "cdn" else None
+        expiry = self._expiry_for(cfg.zapret2) if target == "cdn" else None
         if expiry and expiry.remaining() <= 0:
             return _VpnControl("not_run", CDN_EXPIRED)
         if not self._budget(cfg, single_probe=True, vpn=True, preserve_admission=retry):
@@ -910,8 +922,8 @@ class Controller:
         check_vpn = False
         try:
             if wanted and configured(cfg):
-                expires_at = probe_expiry(cfg.zapret2)
-                if expires_at is not None and expires_at - time.time() < 1:
+                expiry = self._expiry_for(cfg.zapret2)
+                if expiry is not None and expiry.remaining() < 1:
                     if (not present and not self.ready and self.view.get("reason") == CDN_EXPIRED
                             and self.view.get("gate_closed") is True):
                         return False
@@ -933,6 +945,7 @@ class Controller:
                 scaffold = patch(applied, cfg, enabled=active(applied))
                 if scaffold != applied:
                     # Сначала служебный вход; прямое правило здесь не появляется.
+                    self.cdn_gate_until = None
                     self.runtime.gate()
                     changed = apply(patch(applied, cfg), applied)
                     if not changed:
@@ -964,7 +977,7 @@ class Controller:
                         self.comparison = self._compare(cfg, applied, vpn_probe_port, cancel)
                         self.runtime.sample_trace()
                     else:
-                        self.runtime.gate(probe_lease(cfg.zapret2.check_seconds + 60, expires_at))
+                        self.runtime.gate(probe_lease(cfg.zapret2.check_seconds + 60, expiry))
                         self.probe_failure = "probe_failed"
                         if not self.probe(cfg, applied, cancel):
                             raise ValueError(self.probe_failure)
@@ -978,15 +991,18 @@ class Controller:
                         raise ValueError("worker_down")
                     # Старый удачный GET не продлевает разрешение бесконечно.
                     lease = max(1, int(self.next_check - now) + 60)
-                    lease = probe_lease(lease, expires_at)
+                    gate_started = time.monotonic()
+                    lease = probe_lease(lease, expiry)
+                    gate_until = gate_started + lease
                     self.runtime.gate(lease)
                     target = patch(applied, cfg, enabled=True)
                     changed = target != applied and apply(target, applied)
                     if target != applied and not changed:
                         raise ValueError("apply_failed")
-                    valid_until = time.time() + lease
-                    if expires_at is not None:
-                        valid_until = min(valid_until, expires_at)
+                    self.cdn_gate_until = gate_until if expiry is not None else None
+                    valid_until = time.time() + max(0, gate_until - time.monotonic())
+                    if expiry is not None:
+                        valid_until = min(valid_until, expiry.wall)
                     self.view = {"state": "active", "reason": (
                                      "youtube_transport_ok" if cfg.zapret2.youtube_transport_probe
                                      else "probes_ok"),
@@ -1014,6 +1030,7 @@ class Controller:
             check_vpn = (reason == "worker_down" or reason in probe_errors
                          or (reason == "probe_budget" and active(applied)))
         self.healthy = False
+        self.cdn_gate_until = None
         gate_closed = True
         try:
             self.runtime.gate()
@@ -1143,6 +1160,7 @@ class Controller:
                      "reason": reason, "gate_closed": closed}
 
     def close(self) -> None:
+        self.cdn_gate_until = None
         if not self.ready and not self.cleanup_pending:
             return
         try:

@@ -1041,7 +1041,16 @@ class Daemon:
             # 20–24 с дают 28–32 с без нового статуса даже без долгой сборки.
             # WAN_DOWN и ручной скан сохраняют прежнюю паузу ПОСЛЕ работы.
             relative = state is not State.WAN_DOWN and not (self._manual_scan and self.scan_queue)
-            deadline = (started if relative else time.monotonic()) + period
+            origin = started if relative else time.monotonic()
+            deadline = origin + period
+            gate_until = self._zapret2.cdn_gate_until
+            if (state is not State.WAN_DOWN and self.cfg.zapret2.mode == "selective"
+                    and gate_until is not None):
+                # If this tick was busy past expiry, leave a bounded pause before retrying.
+                recheck_at = gate_until if gate_until > completed_at else (
+                    completed_at + zapret2.START_POLL)
+                deadline = min(deadline, recheck_at)
+                period = deadline - origin
             self._loop_progress("sleep", started=started, deadline=deadline,
                                 period=period, step_s=spent)
             self._sleep(stop, changed, max(0.0, deadline - time.monotonic()))
@@ -1282,6 +1291,7 @@ class Daemon:
         self._desync_reload_pending = previous._desync_reload_pending
         self._nfqws2 = previous._nfqws2
         self._zapret2.runtime = previous._zapret2.runtime
+        self._zapret2.cdn_expiry = previous._zapret2.cdn_expiry
         self._zapret2.cleanup_pending = previous._zapret2.cleanup_pending or previous._zapret2.ready
         self._nfq_view = dict(previous._nfq_view)
         if (self.cfg.zapret2.mode == "compare" and self.cfg.zapret2 == previous.cfg.zapret2
@@ -7590,6 +7600,9 @@ class Daemon:
         selected = self._zapret2.view
         if self.cfg.zapret2.mode != "selective" or selected["state"] != "active":
             return dict(selected)
+        gate_until = self._zapret2.cdn_gate_until
+        if gate_until is not None and time.monotonic() >= gate_until:
+            return {"state": "unknown", "reason": "expired"}
         if not xray_ok or self.paths.api_dirty_file.exists():
             return {"state": "unknown", "reason": "route_unconfirmed"}
         applied = engine.read_json(self.paths.xray_config_file)

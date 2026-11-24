@@ -51,6 +51,7 @@ REASONS = {
     "youtube_page_probe_failed": "HTTPS-проверка страницы YouTube не прошла.",
     "youtube_cdn_probe_failed": "HTTPS-проверка CDN YouTube не прошла.",
     zapret2.CDN_EXPIRED: "Истёк срок адреса CDN. Сохраните свежий адрес видео.",
+    "expired": "Подтверждение прямого пути истекло.",
     "retry_wait": "Ожидается повтор проверки прямого пути.",
     "apply_failed": "Применение маршрута не подтверждено.",
     "dependency_missing": "Не найдены зависимости обработчика.",
@@ -247,7 +248,7 @@ Commands use the same validation as this card; observations remain revision-boun
     elif phase == "active":
         until = raw.get("valid_until")
         if not _number(until) or until <= now:
-            phase, reason, detail = "unknown", "expired", "Подтверждение прямого пути истекло."
+            phase, reason, detail = "unknown", "expired", REASONS["expired"]
     if phase == "active" and (capture.get("mode") != "on"
                               or _record(snapshot.get("capture")).get("loaded") is not True):
         phase, reason, detail = "unknown", "capture_unconfirmed", "Перехват не подтверждён."
