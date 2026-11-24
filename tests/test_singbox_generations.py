@@ -135,8 +135,9 @@ def test_failed_bridge_leaves_old_without_api(gateway, monkeypatch):
     assert w.core.read() == w.old and p.read(w.paths)["pending"] is None
 
 
-def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway, monkeypatch):
+def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway, monkeypatch, caplog):
     w = gateway
+    caplog.set_level("INFO", logger=w.core.log.name)
     first = g.prepare(w.core, w.old, w.xray)
     assert g.finish(w.core, w.applier, first).mode == "api"
     assert p.read(w.paths)["active"] == first.slot
@@ -171,12 +172,14 @@ def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway
         with pytest.raises(ValueError, match="настоящий запрос"):
             g.prepare(w.core, w.old, w.xray)
     assert w.alive == {p.LEGACY} and not w.api.calls and g.resume_needed(w.core)
+    assert not any("sing-box resume committed:" in line for line in caplog.messages)
 
     resumed = g.prepare(w.core, w.old, w.xray)
     assert g.finish(w.core, w.applier, resumed).mode == "api"
     state = p.read(w.paths)
     assert state["active"] == resumed.slot and state["draining"]["slot"] == "legacy"
     assert not p.summary(w.paths)["resume_managed"] and p.marker_path(w.paths).is_file()
+    assert f"sing-box resume committed: slot={resumed.slot} mode=api" in caplog.messages
 
 
 @pytest.mark.parametrize("stop_started", [False, True])

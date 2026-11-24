@@ -381,8 +381,11 @@ def finish(core, applier, prepared):
                 processes.write(core.paths, state)
                 _abort_locked(core, prepared)
             return outcome
+        resumed = state["active"] == "legacy" and state.get("resume_managed") is True
         _promote(core, state, prepared.config)
         core.paths.singbox_pending_file.unlink(missing_ok=True)
+        if resumed:
+            core.log.info("sing-box resume committed: slot=%s mode=%s", prepared.slot, outcome.mode)
         return outcome
 
 
