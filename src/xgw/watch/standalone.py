@@ -17,6 +17,7 @@ def tick(d, applied: dict | None, now: float) -> State:
         return _return_to_vpn(d, now)
     if d.stopping:
         return d.machine.state
+    d._standalone_exiting = False
 
     # A build from the previous policy may still be holding a prepared sing-box slot.
     if d._fetch is not None:
@@ -105,18 +106,24 @@ def _stop_bridges(d) -> bool:
                 return False
             remaining = [slot for slot in (*processes.SLOTS, "legacy")
                          if not processes.stopped(slot)]
+            cleared = {**state, "active": "legacy", "pending": None, "draining": None}
+            cleared.pop("standalone_stopping", None)
+            if state["active"] in processes.SLOTS:
+                cleared["resume_managed"] = True
+            stale_files = (d.paths.singbox_config_file, d.paths.singbox_pending_file,
+                           processes.marker_path(d.paths))
+            if not remaining and state == cleared and not any(path.exists() for path in stale_files):
+                return True
+            # Keep the intent until both the async stops and removal of stale files finish.
+            if state.get("standalone_stopping") is not True:
+                processes.write(d.paths, {**state, "standalone_stopping": True})
             for slot in remaining:
                 processes.stop(slot)
             if remaining:
                 return False
-            cleared = {**state, "active": "legacy", "pending": None, "draining": None}
-            if state["active"] in processes.SLOTS:
-                cleared["resume_managed"] = True
-            if state != cleared:
-                processes.write(d.paths, cleared)
-            d.paths.singbox_config_file.unlink(missing_ok=True)
-            d.paths.singbox_pending_file.unlink(missing_ok=True)
-            processes.marker_path(d.paths).unlink(missing_ok=True)
+            for path in stale_files:
+                path.unlink(missing_ok=True)
+            processes.write(d.paths, cleared)
             return True
     except (OSError, ValueError, cmd.CommandError, LockTimeout):
         return False
@@ -134,8 +141,14 @@ def _return_to_vpn(d, now: float) -> State:
     if not _stop_selected(d):
         return _publish(d, "stop_failed")
     if not d._standalone_exiting:
+        try:
+            if processes.read(d.paths).get("standalone_stopping") is True:
+                if d.stopping or not _stop_bridges(d):
+                    return _publish(d, "vpn_requested")
+            d.singbox.sync_generation()
+        except (OSError, ValueError):
+            return _publish(d, "stop_failed")
         d._standalone_exiting = True
-        d.singbox.sync_generation()
         d._singbox_resume_at = 0.0
         d.next_refresh = 0
     if not d.stopping:

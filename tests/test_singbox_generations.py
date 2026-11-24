@@ -18,7 +18,7 @@ from xgw.daemon import SINGBOX_RETRY, Daemon
 from xgw.generator import singbox as sb
 from xgw.paths import Paths, atomic_write_json
 from xgw.watch.checks import DownloadResult
-from xgw.watch.standalone import _stop_bridges
+from xgw.watch.standalone import _return_to_vpn, _stop_bridges
 from xgw.xraycore.api import ApiError
 
 NL = chr(10)
@@ -176,6 +176,50 @@ def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway
     state = p.read(w.paths)
     assert state["active"] == resumed.slot and state["draining"]["slot"] == "legacy"
     assert not p.summary(w.paths)["resume_managed"] and p.marker_path(w.paths).is_file()
+
+
+@pytest.mark.parametrize("stop_started", [False, True])
+def test_off_during_standalone_start_preserves_or_finishes_bridge_shutdown(
+    gateway, monkeypatch, stop_started,
+):
+    w = gateway
+    first = g.prepare(w.core, w.old, w.xray)
+    assert g.finish(w.core, w.applier, first).mode == "api"
+    w.alive.discard(p.LEGACY)
+    atomic_write_json(w.paths.xray_config_file, {"outbounds": [{"tag": zapret2.DIRECT}]})
+    daemon = SimpleNamespace(
+        paths=w.paths, singbox=w.core, cfg=w.core.cfg, stopping=False,
+        _zapret2=SimpleNamespace(close=Mock(), view={}), _standalone_exiting=False,
+        _finish_build=Mock(return_value=False), _build=None, _build_next=None,
+        _fetch=None, inventory=SimpleNamespace(nodes=[object()]), _rebuild=Mock(),
+        machine=SimpleNamespace(), _write_status=Mock(),
+    )
+
+    def stop(slot):
+        assert slot == first.slot
+        assert p.read(w.paths)["standalone_stopping"] is True
+
+    stop_request = Mock(side_effect=stop)
+    monkeypatch.setattr(p, "stop", stop_request)
+    if stop_started:
+        assert not _stop_bridges(daemon)
+        _return_to_vpn(daemon, 1)
+        daemon._rebuild.assert_not_called()
+        assert not daemon._standalone_exiting and w.core.read() == first.config
+        w.alive.discard(p.unit(first.slot))
+
+    _return_to_vpn(daemon, 2)
+    daemon._rebuild.assert_called_once_with(None, urgent=True, reason="Возврат к VPN")
+    state = p.read(w.paths)
+    assert "standalone_stopping" not in state
+    if stop_started:
+        assert state["active"] == "legacy" and state["resume_managed"] is True
+        assert w.core.read() is None and not p.marker_path(w.paths).exists()
+        assert not w.alive
+    else:
+        assert state["active"] == first.slot and w.core.read() == first.config
+        assert w.alive == {p.unit(first.slot)}
+        stop_request.assert_not_called()
 
 
 def test_new_server_composition_gets_disjoint_bridges(gateway):
