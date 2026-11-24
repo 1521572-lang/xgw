@@ -1,4 +1,4 @@
-"""Record one bounded HTTPS range and compare two samples without exposing the URL or peer."""
+"""Compare bounded HTTPS observations and correlate accepted Xray connections."""
 from __future__ import annotations
 
 import argparse
@@ -7,13 +7,15 @@ import ipaddress
 import json
 import socket
 import subprocess
+import sys
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from docs.helpers.headless_playback import probe, read_format
 
 RANGE_BYTES = 65536
-METRICS = ("status", "bytes", "tcp", "tls", "first_byte", "elapsed", "curl_rc")
+METRICS = ("status", "bytes", "tcp", "tls", "first_byte", "elapsed", "curl_rc", "tls_events")
 
 
 def public_ipv4(value):
@@ -41,6 +43,8 @@ def outcome(result):
         if not result.get("tls"):
             return "tls_timeout"
         return "body_timeout" if result.get("first_byte") else "response_timeout"
+    if (result.get("curl_rc"), result.get("status")) == (0, 302):
+        return "http_redirect"
     if result.get("status"):
         return "http_or_range_incomplete"
     return "transport_failed"
@@ -53,43 +57,109 @@ def sample(source, first=None):
         return {"outcome": "url_expired" if str(exc) == "media_url_expired" else "invalid_format"}
     digest = hashlib.sha256(url.encode()).hexdigest()
     if first is not None:
-        if first.get("url_sha256") != digest or not first.get("peer"):
+        if first.get("url_sha256") != digest:
             return {"outcome": "original_target_unavailable"}
-        peer = public_ipv4(first["peer"])
+        try:
+            peer = public_ipv4(first.get("peer"))
+        except ValueError:
+            return {"outcome": "original_target_unavailable"}
     else:
         try:
             peer = ipv4_peer(urlsplit(url).hostname)
         except (OSError, ValueError):
             return {"outcome": "dns_ipv4_unavailable"}
     record = {"url_sha256": digest, "peer": peer}
+    started = time.time()
     try:
-        result = probe(url, RANGE_BYTES, peer=peer)
+        result = probe(url, RANGE_BYTES, peer=peer, observe_tls=True)
     except (OSError, ValueError, subprocess.SubprocessError):
         return {**record, "outcome": "probe_runtime_error"}
     return {**record, "outcome": outcome(result), "actual_peer": result.get("remote_ip"),
+            "started": started, "finished": time.time(),
+            "local_ip": result.get("local_ip"), "local_port": result.get("local_port"),
             **{key: result.get(key) for key in METRICS}}
 
 
+def run_sample(source, first, *, retry_302=False):
+    record = sample(source, first)
+    if retry_302 and record["outcome"] == "http_redirect":
+        # A fresh curl process repeats the same signed URL and IPv4 without following Location.
+        record["retry"] = sample(source, record)
+    return record
+
+
+def public_sample(record):
+    return {"outcome": record.get("outcome"),
+            "connected_to_requested_ipv4": (record["actual_peer"] == record["peer"]
+                                            if record.get("actual_peer") else None),
+            **{key: record.get(key) for key in METRICS}}
+
+
+def same_target(first, second):
+    return bool(first.get("url_sha256") and first.get("peer")
+                and all(first[key] == second.get(key) for key in ("url_sha256", "peer")))
+
+
 def compare(direct, vpn, origin):
-    same_target = bool(direct.get("url_sha256") and direct.get("peer")
-                       and direct["url_sha256"] == vpn.get("url_sha256")
-                       and direct["peer"] == vpn.get("peer"))
-    return {
-        "url_origin": origin, "same_url_and_requested_ipv4": same_target,
-        **{phase: {"outcome": record.get("outcome"),
-                   "connected_to_requested_ipv4": (record["actual_peer"] == record["peer"]
-                                                   if record.get("actual_peer") else None),
-                   **{key: record.get(key) for key in METRICS}}
-           for phase, record in (("standalone", direct), ("vpn", vpn))},
-    }
+    control = public_sample(vpn)
+    if "retry" in vpn:
+        control["retry"] = {**public_sample(vpn["retry"]),
+                            "same_url_and_requested_ipv4": same_target(direct, vpn["retry"])}
+    return {"url_origin": origin, "same_url_and_requested_ipv4": same_target(direct, vpn),
+            "standalone": public_sample(direct), "vpn": control}
+
+
+def page_sample():
+    result = probe("https://www.youtube.com/t/terms", 1048576, range_request=False, observe_tls=True)
+    return {"ok": result["ok"] and result["status"] == 200,
+            **{key: result.get(key) for key in METRICS}}
+
+
+def route_match(record, journal, before, after):
+    from docs.helpers.selective_flow_evidence import MAX_CAPTURE_SECONDS, access_records, endpoint
+    from docs.helpers.selective_media_evidence import MAX_LOG_ROWS, number
+    from xgw.desync import route_evidence
+
+    try:
+        route_evidence.deltas(before, after)
+    except route_evidence.EvidenceError as exc:
+        return {"state": "snapshots_incomparable", "reason": str(exc)}
+    if len(journal) >= MAX_LOG_ROWS:
+        return {"state": "journal_limit"}
+    if not 0 < after["unix"] - before["unix"] <= MAX_CAPTURE_SECONDS:
+        return {"state": "window_unconfirmed"}
+
+    def match(attempt):
+        start, end = attempt.get("started"), attempt.get("finished")
+        if not (number(start) and number(end) and before["unix"] <= start < end <= after["unix"]):
+            return {"state": "window_unconfirmed"}
+        address, port, peer = attempt.get("local_ip"), attempt.get("local_port"), attempt.get("actual_peer")
+        if not address or not peer or peer != attempt.get("peer") or type(port) is not int:
+            return {"state": "socket_unconfirmed"}
+        try:
+            source = endpoint(f"{address}:{port}")
+            target = (public_ipv4(peer), 443)
+        except ValueError:
+            return {"state": "socket_unconfirmed"}
+        entries = access_records(journal, before, start, end).get((source, target), ())
+        if len(entries) == 1:
+            return {"state": "observed", "group": entries[0][1]}
+        return {"state": "ambiguous" if entries else "no_access_record"}
+
+    result = match(record)
+    if "retry" in record:
+        result["retry"] = match(record["retry"])
+    return result
 
 
 def read_sample(path):
-    if not path or not path.is_file() or path.stat().st_size > 4096:
+    if path is None:
         return {}
     try:
-        record = json.loads(path.read_bytes())
-    except ValueError:
+        with path.open("rb") as stream:
+            raw = stream.read(4097)
+        record = json.loads(raw) if len(raw) <= 4096 else None
+    except (OSError, ValueError):
         return {}
     return record if isinstance(record, dict) else {}
 
@@ -100,18 +170,44 @@ def main():
     run = commands.add_parser("sample")
     run.add_argument("source", type=Path)
     run.add_argument("--peer-from", type=Path)
+    run.add_argument("--retry-302", action="store_true")
+    commands.add_parser("page")
     summary = commands.add_parser("compare")
     summary.add_argument("direct", type=Path)
     summary.add_argument("vpn", type=Path)
     summary.add_argument("origin", choices=("standalone", "vpn"))
+    route = commands.add_parser("route")
+    route.add_argument("sample", type=Path)
+    route.add_argument("before", type=Path)
+    route.add_argument("after", type=Path)
     args = parser.parse_args()
     if args.action == "sample":
+        if args.retry_302 and not args.peer_from:
+            parser.error("--retry-302 requires --peer-from")
         first = read_sample(args.peer_from) if args.peer_from else None
-        record = sample(args.source, first)
+        record = run_sample(args.source, first, retry_302=args.retry_302)
+        ok = record.get("retry", record)["outcome"] == "range_complete"
+    elif args.action == "page":
+        try:
+            record = page_sample()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            record = {"ok": False, "error": "probe_runtime_error"}
+        ok = record["ok"]
+    elif args.action == "route":
+        from docs.helpers.selective_media_evidence import read_rows
+        from xgw.desync.route_evidence import _read_snapshot
+
+        try:
+            record = route_match(read_sample(args.sample), read_rows(sys.stdin.buffer),
+                                 _read_snapshot(args.before), _read_snapshot(args.after))
+        except (OSError, KeyError, TypeError, ValueError, AttributeError):
+            record = {"state": "invalid_evidence"}
+        ok = record["state"] == "observed" or record.get("retry", {}).get("state") == "observed"
     else:
         record = compare(read_sample(args.direct), read_sample(args.vpn), args.origin)
+        ok = True
     print(json.dumps(record, allow_nan=False))
-    return 0 if args.action == "compare" or record["outcome"] == "range_complete" else 2
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":

@@ -19,7 +19,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from docs.helpers.selective_media_evidence import read_log
-from docs.helpers.selective_probe_watch import parse_socket_stats
 from docs.helpers.youtube_telemetry import media_host
 from xgw.desync.experiment import private_path
 from xgw.desync.schema import youtube_cdn_expiry
@@ -55,19 +54,43 @@ def read_format(source):
     return url, duration, bitrate * 1000 if number(bitrate) and bitrate > 0 else None
 
 
-def probe(url, size, *, peer=None):
+def tls_events(stderr):
+    """Retain counts of client-side OpenSSL log events, never the raw trace."""
+    events = {"client_hello": 0, "server_hello": 0, "inbound_alert": 0}
+    for line in stderr.splitlines():
+        if not line.startswith("* TLSv"):
+            continue
+        if line.endswith(" (OUT), TLS handshake, Client hello (1):"):
+            events["client_hello"] += 1
+        elif line.endswith(" (IN), TLS handshake, Server hello (2):"):
+            events["server_hello"] += 1
+        elif " (IN), TLS alert, " in line:
+            events["inbound_alert"] += 1
+    return events if any(events.values()) else None
+
+
+def probe(url, size, *, peer=None, range_request=True, observe_tls=False):
     # Pass the signed URL through stdin. stdout includes only explicit metrics.
     output = ('{"status":"%{http_code}","bytes":%{size_download},"tcp":%{time_connect},'
               '"tls":%{time_appconnect},'
               '"first_byte":%{time_starttransfer},"elapsed":%{time_total},'
-              '"remote_ip":"%{remote_ip}"}')
+              '"remote_ip":"%{remote_ip}"')
     quoted_url = url.replace("\\", "\\\\").replace('"', '\\"')
     target = ["--resolve", f"{urlsplit(url).hostname}:443:{peer}"] if peer else []
+    transfer = ["--range", f"0-{size - 1}"] if range_request else ["-4"]
+    diagnostics = ["--verbose"] if observe_tls else []
+    environment = None
+    if observe_tls:
+        output += ',"local_ip":"%{local_ip}","local_port":%{local_port}'
+        environment = os.environ.copy()
+        environment.pop("SSLKEYLOGFILE", None)
     proc = subprocess.run(
         ["curl", "-q", "--http1.1", "--noproxy", "*", "--proto", "=https", "--max-time", "20",
-         "--connect-timeout", "10", "--max-filesize", str(size), "--range", f"0-{size - 1}",
-         "--silent", "--output", "/dev/null", "--write-out", output, *target, "--config", "-"],
-        input=f'url = "{quoted_url}"\n', capture_output=True, text=True, timeout=25, check=False,
+         "--connect-timeout", "10", "--max-filesize", str(size), *transfer,
+         "--silent", *diagnostics, "--output", "/dev/null", "--write-out", output + "}",
+         *target, "--config", "-"],
+        input=f'url = "{quoted_url}"\n', capture_output=True, text=True, errors="replace",
+        env=environment, timeout=25, check=False,
     )
     result = json.loads(proc.stdout or "{}")
     result["status"] = int(result.get("status") or 0)
@@ -76,6 +99,8 @@ def probe(url, size, *, peer=None):
     result["ok"] = (proc.returncode == 0 and result.get("status") in (200, 206)
                     and result.get("bytes", 0) > 0)
     result["curl_rc"] = proc.returncode
+    if observe_tls:
+        result["tls_events"] = tls_events(proc.stderr)
     return result
 
 
@@ -245,6 +270,8 @@ def replay(summary_path, samples_path):
 
 
 def player_sockets(pid):
+    from docs.helpers.selective_probe_watch import parse_socket_stats
+
     try:
         output = subprocess.run(
             ["ss", "-HtaOeinp", "state", "big", "dport", "=", ":443"],

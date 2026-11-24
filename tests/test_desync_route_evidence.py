@@ -58,6 +58,30 @@ def test_rejects_restart_config_change_and_counter_reset():
         route_evidence.deltas(before, snapshot(2, 9, 20, 20))
 
 
+def test_cdn_access_match_uses_socket_window_and_xray_epoch():
+    from docs.helpers.standalone_cdn_compare import route_match
+
+    boot = "12345678123412341234123456789abc"
+    epoch = f"{boot}:42:120"
+    before = {**snapshot(1, 10, 10, 10), "unix": 100, "xray_epoch": epoch}
+    after = {**snapshot(2, 10, 20, 10), "unix": 124, "xray_epoch": epoch}
+    sample = {"local_ip": "192.0.2.1", "local_port": 50123, "actual_peer": "1.1.1.1",
+              "peer": "1.1.1.1", "started": 104, "finished": 114}
+    entry = {"_SYSTEMD_UNIT": "xgw-xray.service", "_BOOT_ID": boot, "_PID": "42",
+             "__REALTIME_TIMESTAMP": "105000000",
+             "MESSAGE": "from 192.0.2.1:50123 accepted tcp:1.1.1.1:443 [tproxy-in -> xgw-zapret2]"}
+    wrong_process = {**entry, "_PID": "43"}
+    later = {**entry, "__REALTIME_TIMESTAMP": "120000000"}
+    assert route_match(sample, [entry, wrong_process, later], before, after) == {
+        "state": "observed", "group": "zapret2",
+    }
+    assert route_match(sample, [wrong_process, later], before, after) == {"state": "no_access_record"}
+    assert route_match(sample, [entry, entry], before, after) == {"state": "ambiguous"}
+    assert route_match(sample, [entry], before, {**after, "xray_epoch": "changed"})["state"] == (
+        "snapshots_incomparable"
+    )
+
+
 def test_live_snapshots_compare_reformatted_config_and_reject_routing_order_changes(
     tmp_path, monkeypatch,
 ):

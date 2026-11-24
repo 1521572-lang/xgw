@@ -178,10 +178,7 @@ resolve_cdn() {
 }
 
 page_probe() {
-  curl -q -4 --silent --noproxy '*' --proto '=https' --http1.1 --connect-timeout 10 \
-    --max-time 16 --max-filesize 1048576 --output /dev/null \
-    --write-out 'http=%{http_code} tcp_s=%{time_connect} tls_s=%{time_appconnect} bytes=%{size_download}\n' \
-    https://www.youtube.com/t/terms
+  timeout -k 2 27 "$PY" -B -P -m docs.helpers.standalone_cdn_compare page
 }
 
 snapshot() {
@@ -189,7 +186,18 @@ snapshot() {
 }
 
 sample_cdn() {
-  timeout -k 2 32 "$PY" -B -P -m docs.helpers.standalone_cdn_compare sample "$@"
+  local deadline=$1
+  shift
+  timeout -k 2 "$deadline" "$PY" -B -P -m docs.helpers.standalone_cdn_compare sample "$@"
+}
+
+route_observation() {
+  local phase=$1 begin=$2 end=$3
+  sudo -n timeout -k 2 12 journalctl -b -u xgw-xray.service --quiet --no-pager \
+    --since "@$begin" --until "@$end" -n 5000 -o json \
+    --output-fields=MESSAGE,_PID,_BOOT_ID,_SYSTEMD_UNIT |
+    "$PY" -B -P -m docs.helpers.standalone_cdn_compare route \
+      "$D/$phase-cdn.out" "$D/$phase-counters-before.out" "$D/$phase-counters-after.out"
 }
 
 stage() {
@@ -331,9 +339,11 @@ if [[ $MODE != resume ]]; then
       origin=vpn
     fi
     if [[ -n $format ]]; then
+      direct_begin=$(date +%s)
       run direct-counters-before snapshot || true
-      run direct-cdn sample_cdn "$format" || true
+      run direct-cdn sample_cdn 32 "$format" || true
       run direct-counters-after snapshot || true
+      direct_end=$(($(date +%s) + 1))
     fi
     run direct-revision-after timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
       check-standalone "$D/standalone-receipt" || true
@@ -345,12 +355,16 @@ if [[ $MODE != resume ]]; then
   run returned-vpn vpn_check
   sudo -n touch "$BACKUP/off-confirmed"
   if [[ $MODE == cdn && -n $format ]]; then
+    off_begin=$(date +%s)
     run off-counters-before snapshot || true
-    run off-cdn sample_cdn "$format" --peer-from "$D/direct-cdn.out" || true
+    run off-cdn sample_cdn 57 "$format" --peer-from "$D/direct-cdn.out" --retry-302 || true
     run off-counters-after snapshot || true
+    off_end=$(($(date +%s) + 1))
     run cdn-comparison "$PY" -B -P -m docs.helpers.standalone_cdn_compare compare \
       "$D/direct-cdn.out" "$D/off-cdn.out" "$origin"
     cat "$D/cdn-comparison.out"
+    run direct-route route_observation direct "$direct_begin" "$direct_end" || true
+    run off-route route_observation off "$off_begin" "$off_end" || true
     for phase in direct off; do
       run "$phase-counters-delta" "$PY" -B -P -m xgw.desync.route_evidence delta \
         "$D/$phase-counters-before.out" "$D/$phase-counters-after.out" || true
