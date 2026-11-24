@@ -35,6 +35,7 @@ const el = id => document.getElementById(id);
 const retryOverview = el("retry-overview");
 const flowsealSettings = el("flowseal-exclusion-settings");
 const exclusionsField = el("setting-flowseal-exclusions");
+const flowsealHint = el("flowseal-exclusion-hint");
 const put = (id, value) => { el(id).textContent = value ?? "—"; };
 const count = value => Number.isSafeInteger(value) && value >= 0 ? number.format(value) : "Нет данных";
 let epoch = null;
@@ -69,7 +70,12 @@ function controls() {
   if (el("job-pin")) el("job-pin").disabled = !usable || running || !jobWinner(job)
     || latest.mode !== "off";
   el("settings-fields").disabled = busy;
-  if (exclusionsField) exclusionsField.readOnly = latest?.can_edit_flowseal_exclusions !== true;
+  if (exclusionsField) {
+    exclusionsField.readOnly = latest?.can_edit_flowseal_exclusions !== true;
+    if (flowsealHint) flowsealHint.textContent = exclusionsField.readOnly
+      ? "Только чтение. Выключите выбранный режим, чтобы изменить список."
+      : "Исключение действует для имени и его поддоменов.";
+  }
   el("settings-form").querySelector('[type="submit"]').disabled = !usable || !latest.can_edit;
   el("reload-settings").disabled = busy || needsLogin || Boolean(pending);
   if (retryOverview) {

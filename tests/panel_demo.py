@@ -375,8 +375,11 @@ class DemoCapture:
         self.lan_if = cfg.network.lan_if
         self.capturing = self.configured = True
 
-    def up(self) -> str:  # правила в демо не загружаются
+    def mode(self) -> str:
         return DemoCapture.mode_now
+
+    def up(self) -> str:  # правила в демо не загружаются
+        return self.mode()
 
     def describe(self, *, check: bool = True) -> dict:
         return {"mode": DemoCapture.mode_now, "lan_if": self.lan_if, "lan": True, "local": True,

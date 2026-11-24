@@ -101,6 +101,7 @@ def check(browser, panel, port, work):
     browser.get(base + "/zapret2")
     field = open_settings()
     assert field.get_property("value") == EXTERNAL and field.get_property("readOnly"), "active_not_locked"
+    assert "Только чтение" in element("flowseal-exclusion-hint").text, "readonly_label"
     browser.execute_script("arguments[0].scrollIntoView({block: 'center'})", field)
     assert browser.save_screenshot(str(work / "alt9-active.png")), "active_screenshot"
     set_demo_policy(panel, mode="off", exclusions=[EXTERNAL])
@@ -126,15 +127,14 @@ def main():
         set_demo_policy(panel, mode="off", exclusions=[SAVED])
         panel.start()
         try:
-            profile = args.work / "profiles"
-            profile.mkdir(mode=0o700)
-            service = Service(executable_path=args.geckodriver, log_output=subprocess.DEVNULL,
-                              service_args=["--profile-root", str(profile)])
-            options = webdriver.FirefoxOptions()
-            options.set_preference("network.proxy.type", 0)
-            with webdriver.Firefox(service=service, options=options) as browser:
-                print("FLOWSEAL_WEB_BROWSER Firefox", browser.capabilities.get("browserVersion"), flush=True)
-                check(browser, panel, port, args.work)
+            with tempfile.TemporaryDirectory(prefix="profiles-", dir=args.work) as profile:
+                service = Service(executable_path=args.geckodriver, log_output=subprocess.DEVNULL,
+                                  service_args=["--profile-root", profile])
+                options = webdriver.FirefoxOptions()
+                options.set_preference("network.proxy.type", 0)
+                with webdriver.Firefox(service=service, options=options) as browser:
+                    print("FLOWSEAL_WEB_BROWSER Firefox", browser.capabilities.get("browserVersion"), flush=True)
+                    check(browser, panel, port, args.work)
         except (OSError, AssertionError, WebDriverException) as exc:
             print("FLOWSEAL_WEB_FAILED", type(exc).__name__, file=sys.stderr, flush=True)
             print(str(exc), file=sys.stderr)

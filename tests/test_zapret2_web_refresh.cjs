@@ -107,6 +107,7 @@ test("ALT9 form only writes changed exclusions while the backend allows editing"
   assert.equal(update.body.expected, "initial");
   browser.evaluate(`latest.can_edit_flowseal_exclusions = false; controls();`);
   assert.equal(field.readOnly, true);
+  assert.match(browser.element("flowseal-exclusion-hint").textContent, /Только чтение/);
   assert.equal(submit().body.settings.flowseal_exclude_domains, undefined);
   browser.evaluate(`latest.can_edit_flowseal_exclusions = true; controls();`);
   field.value = "";
