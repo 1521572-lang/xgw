@@ -552,6 +552,7 @@ class _Build:
     spent: float = 0.0
     discard: bool = False
     preparation_started: bool = False
+    resume_attempt: bool = False
     generation: object = None
     generation_core: object = None
 
@@ -710,6 +711,7 @@ class Daemon:
         self._singbox_failed = False
         self._singbox_retry_at = 0.0
         self._singbox_resume_at = 0.0
+        self._singbox_resume_phase = ""
         self._singbox_alive = True
         self._singbox_version_cache: tuple[float, str] | None = None
         # Обновление ядер (cores.py): фоновая проверка выпусков на GitHub, когда смотреть
@@ -1456,6 +1458,7 @@ class Daemon:
         self._singbox_failed = previous._singbox_failed
         self._singbox_retry_at = previous._singbox_retry_at
         self._singbox_resume_at = previous._singbox_resume_at
+        self._singbox_resume_phase = previous._singbox_resume_phase
         self._cores_thread = previous._cores_thread
         self._netmon_thread = previous._netmon_thread
         self._resolvers_next = previous._resolvers_next
@@ -1673,6 +1676,9 @@ class Daemon:
             changed = self._finish_build()
         if not changed and state is not State.XRAY_DOWN and not self.core_job:
             changed = self._singbox_step(now)
+        elif self._singbox_resume_phase != "checking":
+            self._note_singbox_resume("core_update" if self.core_job else
+                                      "xray_down" if state is State.XRAY_DOWN else "config_applied")
         if (
             not changed and self.inventory is not None and not self._singbox_failed
             and self.paths.singbox_pending_file.exists() and self._singbox_window()
@@ -3102,6 +3108,9 @@ class Daemon:
                 from .apply import singbox_generation as generations
 
                 generations.abort(job.generation_core, job.generation)
+            if job.request.resume_singbox or job.resume_attempt:
+                self._singbox_resume_at = 0.0
+                self._note_singbox_resume("stale_candidate")
             self._build_discarded += 1
             self.log.info("устаревшая сборка конфига отброшена без применения")
             if self._build_next is None and not job.discard:
@@ -3113,6 +3122,8 @@ class Daemon:
                 self._start_build(request)
             return False
         if job.error is not None:
+            if job.request.resume_singbox:
+                self._note_singbox_resume("assembly_failed")
             if isinstance(job.error, engine.EngineError):
                 self.notifier.event("config", f"{job.request.reason}: {job.error}", notify=True)
                 return False
@@ -3121,12 +3132,31 @@ class Daemon:
         assert assembly is not None
         from .apply import singbox_generation as generations
 
-        if (not job.preparation_started and assembly.singbox is not None
-                and generations.needed(self.singbox, assembly.singbox.config,
-                                       resume=job.request.resume_singbox)):
-            if not generations.available(self.singbox):
+        if not job.preparation_started:
+            sb_config = assembly.singbox.config if assembly.singbox is not None else None
+            requires_generation = generations.needed(self.singbox, sb_config)
+            resume = (not requires_generation and sb_config is not None
+                      and (job.request.resume_singbox or self.clock() >= self._singbox_resume_at)
+                      and generations.resume_needed(self.singbox) and not self._singbox_failed
+                      and self.singbox.alive())
+            available = (generations.available(self.singbox)
+                         if requires_generation or resume else False)
+            if requires_generation and not available:
                 self._build = job
                 return False
+            if resume and not available:
+                self._note_singbox_resume("generation_busy")
+            if job.request.resume_singbox and not available:
+                if not resume:
+                    self._note_singbox_resume("assembly_not_ready")
+                return False
+        else:
+            available = False
+        if available:
+            job.resume_attempt = resume
+            if resume or job.request.resume_singbox:
+                self._singbox_resume_at = self.clock() + SINGBOX_RETRY
+                self._note_singbox_resume("checking")
             job.preparation_started = True
             job.generation_core = self.singbox
             job.done.clear()
@@ -3137,12 +3167,13 @@ class Daemon:
             def prepare_generation():
                 try:
                     job.generation = generations.prepare(
-                        job.generation_core, assembly.singbox.config, assembly.result.config,
+                        job.generation_core, sb_config, assembly.result.config,
                         rank=rank, usable=usable)
                 except Exception as exc:
                     self.log.warning("подготовка поколения sing-box не выполнена: %s", exc)
-                    job.error = engine.EngineError(
-                        "поколение sing-box не подготовлено; прежнее сохранено")
+                    if not job.resume_attempt:
+                        job.error = engine.EngineError(
+                            "поколение sing-box не подготовлено; прежнее сохранено")
                 finally:
                     job.spent = time.monotonic() - job.began
                     job.done.set()
@@ -3151,8 +3182,15 @@ class Daemon:
                 target=prepare_generation, name="xgw-singbox-prepare", daemon=True).start()
             return False
         began = time.monotonic()
+        if job.resume_attempt and job.generation is None:
+            self._note_singbox_resume("candidate_rejected")
+            if job.request.resume_singbox:
+                return False
         if job.generation is not None:
             outcome = generations.finish(self.singbox, self.applier, job.generation)
+            if job.resume_attempt:
+                self._note_singbox_resume("applied" if outcome.mode in ("api", "unchanged")
+                                          else "apply_rejected", confirmed=True)
             if outcome.mode == "api":
                 assembly.result.config.clear()
                 assembly.result.config.update(job.generation.xray)
@@ -3169,7 +3207,9 @@ class Daemon:
         self._build_outcome = outcome.mode
         if outcome.mode in ("api", "restart", "unchanged"):
             engine.persist(self.paths, assembly, self.inventory.quotas, record_event=False)
-        changed = self._report(outcome, job.request.reason)
+        reason = ("Возврат к поколениям sing-box"
+                  if job.resume_attempt and job.generation is not None else job.request.reason)
+        changed = self._report(outcome, reason)
         self._build_applied = True
         for callback in job.request.callbacks.values():
             callback(changed)
@@ -5893,6 +5933,16 @@ class Daemon:
 
     # --- sing-box --------------------------------------------------------------
 
+    def _note_singbox_resume(self, phase: str, *, confirmed: bool = False) -> None:
+        from .apply import singbox_generation as generations
+
+        if not confirmed and not generations.resume_needed(self.singbox):
+            self._singbox_resume_phase = ""
+            return
+        if self._singbox_resume_phase != phase:
+            self.log.info("sing-box resume: %s", phase)
+            self._singbox_resume_phase = phase
+
     def _singbox_step(self, now: float) -> bool:
         """Слежение за sing-box (ТЗ 5.3): не отвечает — перезапуск, после двух неудач — откат
         на last-good, дальше — серверы переводятся на Xray. True — конфиг Xray пересобран."""
@@ -5903,8 +5953,10 @@ class Daemon:
         generations.recover(self.singbox)
         self.singbox.sync_generation()
         if self._singbox_failed:
+            self._note_singbox_resume("legacy_unhealthy")
             return self._singbox_recover(now)
         if not self.singbox.expected():
+            self._note_singbox_resume("legacy_config_missing")
             self._singbox_down = 0
             self._singbox_alive = True
             return False
@@ -5912,14 +5964,23 @@ class Daemon:
         if self._singbox_alive:
             self._singbox_down = 0
             self._singbox_rolled_back = False
-            if (now >= self._singbox_resume_at and self.inventory is not None
-                    and self._build is None and self._build_next is None
-                    and generations.resume_needed(self.singbox)
-                    and generations.available(self.singbox)):
-                self._singbox_resume_at = now + SINGBOX_RETRY
-                return self._rebuild(None, urgent=True, reason="Возврат к поколениям sing-box",
-                                     resume_singbox=True)
+            if generations.resume_needed(self.singbox):
+                if self._build is not None or self._build_next is not None or self._build_applied:
+                    if self._build is None or not self._build.resume_attempt:
+                        self._note_singbox_resume("waiting_build", confirmed=True)
+                elif now < self._singbox_resume_at:
+                    self._note_singbox_resume("retry_wait", confirmed=True)
+                elif self.inventory is None:
+                    self._note_singbox_resume("inventory_missing", confirmed=True)
+                elif not generations.available(self.singbox):
+                    self._note_singbox_resume("generation_busy", confirmed=True)
+                else:
+                    self._singbox_resume_at = now + SINGBOX_RETRY
+                    self._note_singbox_resume("building", confirmed=True)
+                    return self._rebuild(None, urgent=True, reason="Возврат к поколениям sing-box",
+                                         resume_singbox=True)
             return False
+        self._note_singbox_resume("legacy_unhealthy")
         self._singbox_down += 1
         self.log.warning("sing-box не отвечает (шаг %d)", self._singbox_down)
         error = self.singbox.restart()
@@ -6170,7 +6231,9 @@ class Daemon:
             "alive": (not self._singbox_failed and self._singbox_alive) if expected else None,
             "failed": self._singbox_failed,
             "bridged": bridged,
-            "generations": generations.summary(self.paths),
+            "generations": generations.summary(self.paths) | {
+                "resume_phase": self._singbox_resume_phase or None,
+            },
         }
 
     def _singbox_version(self) -> str:

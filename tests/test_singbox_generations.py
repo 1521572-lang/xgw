@@ -158,7 +158,8 @@ def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway
     monkeypatch.setattr(w.core, "alive", lambda: True)
     daemon = SimpleNamespace(singbox=w.core, stopping=False, _singbox_failed=False,
                              _singbox_resume_at=0, inventory=object(), _build=None,
-                             _build_next=None, _rebuild=Mock(return_value=False))
+                             _build_next=None, _build_applied=False,
+                             _note_singbox_resume=Mock(), _rebuild=Mock(return_value=False))
     assert not Daemon._singbox_step(daemon, 1)
     daemon._rebuild.assert_called_once_with(None, urgent=True, reason="Возврат к поколениям sing-box",
                                             resume_singbox=True)

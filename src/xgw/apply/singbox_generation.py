@@ -156,9 +156,10 @@ def resume_needed(core):
 
 
 def needed(core, config, *, resume=False):
+    if config is None:
+        return False
     current = core.read()
-    return (config is not None and current is not None
-            and (config != current or (resume and resume_needed(core))))
+    return current is not None and (config != current or (resume and resume_needed(core)))
 
 
 def available(core):

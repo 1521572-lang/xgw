@@ -2971,6 +2971,78 @@ def test_background_build_keeps_status_and_applies_in_main(daemon):
             daemon._build.done.wait(5)
 
 
+@pytest.mark.parametrize("bridge_ok", [True, False])
+def test_pending_singbox_resume_uses_a_busy_watchdog_build(daemon, monkeypatch, bridge_ok):
+    from types import SimpleNamespace
+
+    from xgw.apply import singbox_generation as generations
+    from xgw.apply import singbox_process as processes
+
+    d = _started(daemon)
+    sb_config = {"inbounds": []}
+    atomic_write_json(d.paths.singbox_config_file, sb_config)
+    processes.write(d.paths, {"active": "legacy", "pending": None, "draining": None,
+                              "resume_managed": True})
+    monkeypatch.setattr(d.singbox, "alive", lambda: True)
+    original_assemble = d._assemble
+
+    def assemble(*args, **kwargs):
+        result = original_assemble(*args, **kwargs)
+        result.singbox = engine.SingboxChange(config=sb_config, reload=True)
+        return result
+
+    monkeypatch.setattr(d, "_assemble", assemble)
+    gate, entered, _ = _blocked_build(d)
+    callbacks = []
+    prepared = []
+    regular_applies = []
+    original_apply = d._apply
+
+    def apply(*args, **kwargs):
+        regular_applies.append(True)
+        return original_apply(*args, **kwargs)
+
+    monkeypatch.setattr(d, "_apply", apply)
+
+    def prepare(_core, config, applied, **kwargs):
+        prepared.append(config)
+        if not bridge_ok:
+            raise ValueError("fixture bridge failed")
+        return SimpleNamespace(config=config, old=config, xray=dict(applied), parts=(), fields=())
+
+    def finish(*_args):
+        processes.write(d.paths, {"active": "blue", "pending": None, "draining": None})
+        return ApplyOutcome("api")
+
+    monkeypatch.setattr(generations, "prepare", prepare)
+    monkeypatch.setattr(generations, "finish", finish)
+    try:
+        d._rebuild(None, urgent=False, reason="ordinary",
+                   complete={"test": callbacks.append})
+        assert entered.wait(2)
+        job = d._build
+        d.tick()
+        assert d._singbox_resume_phase == "waiting_build" and not prepared
+        assert d.status()["singbox"]["generations"]["resume_phase"] == "waiting_build"
+        gate.set()
+        assert job.done.wait(5)
+        d.tick()
+        assert d._build is job and job.resume_attempt and job.done.wait(5)
+        d.tick()
+        assert prepared == [sb_config] and len(callbacks) == 1
+        assert d._singbox_resume_at > d.t
+        if bridge_ok:
+            assert processes.read(d.paths)["active"] == "blue"
+            assert any("Возврат к поколениям sing-box" in event for event in d.events())
+        else:
+            assert generations.resume_needed(d.singbox)
+            assert regular_applies == [True] and not callbacks[0]
+    finally:
+        gate.set()
+        if d._build:
+            d._build.done.wait(5)
+
+
 @pytest.mark.parametrize("change", ["config", "inventory", "file"])
 def test_background_build_discards_stale_inputs(daemon, change):
     _started(daemon)
