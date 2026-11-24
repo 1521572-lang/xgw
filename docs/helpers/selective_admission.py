@@ -167,13 +167,13 @@ def standalone_ready(card):
             and card.get("without_vpn") is True)
 
 
-def start_standalone(client, receipt):
+def start_standalone(client, receipt, *, strategy="multisplit"):
     card = overview(client)
     if not off(card):
         raise TrialError("expected_fresh_off")
     with receipt.open("x", encoding="utf-8") as stream:
         key = update(client, "/api/zapret2/settings", card["config_key"], settings={
-            "strategy": "multisplit", "domains": list(YOUTUBE_DOMAINS),
+            "strategy": strategy, "domains": list(YOUTUBE_DOMAINS),
             "youtube_transport_probe": False,
         })
         card = wait_off(client, key)
@@ -233,7 +233,9 @@ def main():
                            help="Observe one normal watchdog retry after a CDN TLS timeout")
     turn_off = actions.add_parser("off")
     turn_off.add_argument("receipt", type=Path)
-    actions.add_parser("standalone").add_argument("receipt", type=Path)
+    standalone = actions.add_parser("standalone")
+    standalone.add_argument("receipt", type=Path)
+    standalone.add_argument("--strategy", choices=("multisplit", "fake_md5"), default="multisplit")
     actions.add_parser("check-standalone").add_argument("receipt", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
@@ -242,7 +244,7 @@ def main():
         if args.action == "admit":
             return activate(client, args)
         if args.action == "standalone":
-            return start_standalone(client, args.receipt)
+            return start_standalone(client, args.receipt, strategy=args.strategy)
         if args.action == "check-standalone":
             return check_standalone(client, args.receipt)
         return disable(client, args.receipt)

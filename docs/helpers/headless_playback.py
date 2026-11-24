@@ -57,7 +57,8 @@ def read_format(source):
 
 def probe(url, size, *, peer=None):
     # Pass the signed URL through stdin. stdout includes only explicit metrics.
-    output = ('{"status":"%{http_code}","bytes":%{size_download},"tls":%{time_appconnect},'
+    output = ('{"status":"%{http_code}","bytes":%{size_download},"tcp":%{time_connect},'
+              '"tls":%{time_appconnect},'
               '"first_byte":%{time_starttransfer},"elapsed":%{time_total},'
               '"remote_ip":"%{remote_ip}"}')
     quoted_url = url.replace("\\", "\\\\").replace('"', '\\"')

@@ -1,19 +1,24 @@
 #!/bin/bash
-# One guarded cycle with the five-file Standalone return patch.
+# One guarded cycle with the five-file Standalone return patch, optionally measuring CDN.
 set -euo pipefail
 umask 077
 CODE=$1
 MODE=${2:-cycle}
 FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
-FIX=7094d2c045dccf11ef6f3c8e74860c6ac8b49b6f
+FIX=3ccda9467cc60b75381e544b9559820fe723e120
 BR=integration/zapret2-batch1
 UNIT=xgw-standalone-return-rollback
 OVERLAY=--standalone-return
 PY=/usr/bin/python3
+VIDEO=${XGW_T09_VIDEO:-8plwv25NYRo}
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 [[ $CODE =~ ^[0-9a-f]{40}$ ]]
-[[ $MODE == cycle || $MODE == resume ]]
+[[ $MODE == cycle || $MODE == resume || $MODE == cdn ]]
+if [[ $MODE == cdn ]]; then
+  [[ $VIDEO =~ ^[A-Za-z0-9_-]{11}$ ]]
+  command -v yt-dlp >/dev/null
+fi
 REPO=$(git rev-parse --show-toplevel)
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
@@ -145,12 +150,18 @@ PY
 }
 
 return_attributed() {
-  local attempt
+  local attempt slot=
+  if (( recovered )); then
+    slot=$("$PY" -I -B -c 'import json,sys; print(json.loads(sys.stdin.readlines()[-1])["active"])' \
+      <"$D/recovered-managed.out") || return
+    [[ $slot == blue || $slot == green ]] || return 2
+  fi
   for attempt in {1..3}; do
     sudo -n timeout -k 2 8 journalctl -b -u xgw.service --since "@$RETURN_STARTED" \
       --quiet --no-pager -o cat >"$D/return-journal.out" || return
-    if grep -F 'Возврат к поколениям sing-box: применено через API без перезапуска' \
-        "$D/return-journal.out" >/dev/null; then
+    if [[ -n $slot ]] && grep -Eq "sing-box resume committed: slot=$slot mode=(api|unchanged)$" \
+        "$D/return-journal.out"; then
+      grep -Eo "sing-box resume committed: slot=$slot mode=(api|unchanged)$" "$D/return-journal.out"
       printf 'STANDALONE_LIVE_RETURN_ATTRIBUTED\n'
       return 0
     fi
@@ -158,6 +169,27 @@ return_attributed() {
   done
   printf 'STANDALONE_LIVE_RETURN_ATTRIBUTION_NOT_VERIFIED\n'
   return 2
+}
+
+resolve_cdn() {
+  timeout -k 3 42 yt-dlp --ignore-config --proxy '' --force-ipv4 --no-playlist \
+    --socket-timeout 9 --retries 0 --extractor-retries 0 \
+    -f 'bv[height=720][protocol=https]' --dump-single-json "https://www.youtube.com/watch?v=$VIDEO"
+}
+
+page_probe() {
+  curl -q -4 --silent --noproxy '*' --proto '=https' --http1.1 --connect-timeout 10 \
+    --max-time 16 --max-filesize 1048576 --output /dev/null \
+    --write-out 'http=%{http_code} tcp_s=%{time_connect} tls_s=%{time_appconnect} bytes=%{size_download}\n' \
+    https://www.youtube.com/t/terms
+}
+
+snapshot() {
+  sudo -n timeout -k 2 12 env "PYTHONPATH=$D/tree/src" "$PY" -B -P -m xgw.desync.route_evidence snapshot
+}
+
+sample_cdn() {
+  timeout -k 2 32 "$PY" -B -P -m docs.helpers.standalone_cdn_compare sample "$@"
 }
 
 stage() {
@@ -273,19 +305,59 @@ run apply apply_trial
 run candidate-files compare_package code
 run candidate-off wait_off
 run candidate-vpn vpn_check
-if [[ $MODE == cycle ]]; then
+if [[ $MODE != resume ]]; then
   run candidate-topology topology stable 35
+  strategy=multisplit
+  if [[ $MODE == cdn ]]; then
+    strategy=fake_md5
+    run off-page page_probe || true
+    run off-resolve resolve_cdn || true
+  fi
   sudo -n systemctl is-active --quiet "$UNIT.timer"
   sudo -n touch "$BACKUP/standalone-issued"
   run standalone-on timeout -k 3 190 "$PY" -B -P -m docs.helpers.selective_admission \
-    standalone "$D/standalone-receipt"
+    standalone "$D/standalone-receipt" --strategy "$strategy"
   run standalone-paused topology paused 30
+  if [[ $MODE == cdn ]]; then
+    run direct-revision-before timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
+      check-standalone "$D/standalone-receipt"
+    run direct-page page_probe || true
+    format=
+    origin=standalone
+    if run direct-resolve resolve_cdn; then
+      format="$D/direct-resolve.out"
+    elif [[ -s $D/off-resolve.out ]]; then
+      format="$D/off-resolve.out"
+      origin=vpn
+    fi
+    if [[ -n $format ]]; then
+      run direct-counters-before snapshot || true
+      run direct-cdn sample_cdn "$format" || true
+      run direct-counters-after snapshot || true
+    fi
+    run direct-revision-after timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
+      check-standalone "$D/standalone-receipt" || true
+  fi
   RETURN_STARTED=$(date +%s)
   run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
     off "$D/standalone-receipt"
   run returned-off wait_off
   run returned-vpn vpn_check
   sudo -n touch "$BACKUP/off-confirmed"
+  if [[ $MODE == cdn && -n $format ]]; then
+    run off-counters-before snapshot || true
+    run off-cdn sample_cdn "$format" --peer-from "$D/direct-cdn.out" || true
+    run off-counters-after snapshot || true
+    run cdn-comparison "$PY" -B -P -m docs.helpers.standalone_cdn_compare compare \
+      "$D/direct-cdn.out" "$D/off-cdn.out" "$origin"
+    cat "$D/cdn-comparison.out"
+    for phase in direct off; do
+      run "$phase-counters-delta" "$PY" -B -P -m xgw.desync.route_evidence delta \
+        "$D/$phase-counters-before.out" "$D/$phase-counters-after.out" || true
+    done
+  elif [[ $MODE == cdn ]]; then
+    printf 'STANDALONE_LIVE_CDN_URL_UNAVAILABLE\n'
+  fi
 fi
 if ! run recovered-managed topology managed 240; then
   run return-attribution return_attributed || true

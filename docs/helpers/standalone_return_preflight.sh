@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 CODE=$1
 FIX_BASE=d8a4a0967a009ec6fb1a4b6dcf81fa27e5836c5a^
-FIX=7094d2c045dccf11ef6f3c8e74860c6ac8b49b6f
+FIX=3ccda9467cc60b75381e544b9559820fe723e120
 BR=integration/zapret2-batch1
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -98,4 +98,6 @@ contracts managed \
   || result=2
 contracts watchdog \
   tests/test_daemon.py::test_pending_singbox_resume_uses_a_busy_watchdog_build || result=2
+contracts observation --portable tests/test_selective_admission.py \
+  tests/test_standalone_cdn_compare.py || result=2
 exit "$result"

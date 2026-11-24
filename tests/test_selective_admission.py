@@ -94,7 +94,8 @@ def test_off_never_posts_against_changed_policy(tmp_path):
         trial.disable(SimpleNamespace(request=request), receipt)
 
 
-def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monkeypatch):
+@pytest.mark.parametrize("strategy", ["multisplit", "fake_md5"])
+def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monkeypatch, strategy):
     card = {"mode": "off", "state": "off", "engine_mode": "off", "fresh": True,
             "policy_matched": True, "config_key": "initial", "blockers": {"standalone": []}}
     calls = []
@@ -108,6 +109,7 @@ def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monk
         calls.append((path, body))
         if path.endswith("/settings"):
             assert body["settings"]["youtube_transport_probe"] is False
+            assert body["settings"]["strategy"] == strategy
             card["config_key"] = "settings"
         else:
             mode = body["mode"]
@@ -124,7 +126,7 @@ def test_standalone_uses_a_confirmed_revision_and_can_restore_off(tmp_path, monk
 
     monkeypatch.setattr(trial, "observations", observations)
     client = SimpleNamespace(request=request)
-    assert trial.start_standalone(client, receipt) == 0
+    assert trial.start_standalone(client, receipt, strategy=strategy) == 0
     assert receipt.read_text().strip() == "standalone"
     assert trial.check_standalone(client, receipt) == 0
     card["without_vpn"] = False
