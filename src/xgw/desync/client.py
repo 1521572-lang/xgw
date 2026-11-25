@@ -15,6 +15,7 @@ from pathlib import Path
 from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
 from .monitor_budget import MAX_TIME, budget_summary
 from .monitor_expiry import cdn_expiry_summary, valid_cdn_deadline
+from .monitor_policy import policy_changes, policy_label
 from .monitor_probes import MAX_SAMPLE_GAP_SECONDS, matched_policy, probe_summary, vpn_probe_attempts
 from .monitor_recovery import recovery_summary, valid_status_time
 
@@ -142,14 +143,6 @@ def monitor(client, output, seconds, interval):
             "seconds": seconds, "output": str(output)}
 
 
-def _policy_label(row):
-    selected, engine = row.get("mode"), row.get("engine_mode")
-    if selected not in ("off", "selective", "standalone") or engine not in (None, "off", "auto"):
-        return None
-    # Older journals stored the Selected mode but omitted the Engine setting.
-    return f"{selected}/{engine or 'unknown'}"
-
-
 def analyze(path):
     from ..watch.zapret2_control import REASONS, TITLES
 
@@ -176,7 +169,7 @@ def analyze(path):
             gaps += 1
             continue
         matched = matched_policy(first, last)
-        state, mode = first.get("state"), _policy_label(first)
+        state, mode = first.get("state"), policy_label(first)
         same_state = (matched and isinstance(state, str) and state in TITLES
                       and state == last.get("state"))
         durations[state if same_state else "unconfirmed"] += elapsed
@@ -184,7 +177,7 @@ def analyze(path):
             reason = first.get("reason")
             known = isinstance(reason, str) and reason in REASONS and reason == last.get("reason")
             fallback[reason if known else "unconfirmed"] += elapsed
-        same_mode = matched and mode and mode == _policy_label(last)
+        same_mode = matched and mode and mode == policy_label(last)
         policies[mode if same_mode else "unconfirmed"] += elapsed
         a, b = first.get("budget"), last.get("budget")
         a = a if isinstance(a, dict) else {}
@@ -203,6 +196,7 @@ def analyze(path):
         "budget": budget_summary(rows),
         "cdn_expiry": cdn_expiry_summary(rows),
         "selected_recovery": recovery_summary(rows),
+        "policy_changes": policy_changes(rows),
         "note": "Sampled status and probe outcomes do not prove playback or a free-pool recovery."}
 
 

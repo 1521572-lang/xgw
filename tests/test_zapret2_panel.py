@@ -214,6 +214,36 @@ def test_monitor_records_a_selected_recovery_without_a_cdn_deadline(tmp_path, mo
     assert client.analyze(path)["selected_recovery"]["by_fallback_reason"] == {"probe_failed": 1}
 
 
+def test_monitor_waits_for_daemon_to_confirm_new_policy(tmp_path, monkeypatch):
+    cfg, snap = fixture(engine="off", state="off")
+    now = NOW
+    monkeypatch.setattr(client.time, "time", lambda: now)
+
+    def sample():
+        return client.observation({"zapret2": card(cfg, snap, {"mode": "on"}, True, now=now)})
+
+    before = sample()
+    cfg.zapret2.mode = "selective"
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    now += 15
+    waiting = sample()
+    assert waiting["state"] == "pending" and waiting["reason"] == "policy_changed"
+    assert waiting["policy_matched"] is False
+    now += 15
+    snap["updated"] = now
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"] = {"state": "active", "reason": "probes_ok", "valid_until": now + 60}
+    confirmed = sample()
+
+    path = tmp_path / "policy.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in (before, waiting, confirmed)), encoding="utf-8")
+    result = client.analyze(path)["policy_changes"]
+    assert result["confirmed_samples"] == 2
+    assert result["by_policy"] == {"off/off → selective/off": 1}
+    assert before["config_key"] not in json.dumps(result)
+    assert confirmed["config_key"] not in json.dumps(result)
+
+
 def test_transport_probe_details_are_private_and_revision_bound():
     cfg, snap = fixture(mode="selective", engine="off", state="fallback",
                         reason="youtube_page_probe_failed", gate_closed=True)
