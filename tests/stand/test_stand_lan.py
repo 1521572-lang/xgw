@@ -31,7 +31,9 @@ import netns
 import pytest
 from stand import Stand, wait_for
 
+from xgw import config
 from xgw.desync import lan_control, route_evidence, vpn_access, vpn_control
+from xgw.net import nft
 from xgw.xraycore.access import destination, endpoint, parse_accepted
 
 XRAY_BIN = os.environ.get("XGW_XRAY_BIN", "")
@@ -80,8 +82,11 @@ def gateway(tmp_path, request):
         assert enabled.returncode == 0, enabled.stderr
         assert "перехват включён" in enabled.stdout and "внимание" not in enabled.stdout
         if bridge_uid is not None:
-            rules = stand.gw_run("nft", "-n", "list", "chain", "ip", "xgw", "output")
-            assert re.search(rf'meta skuid (?:{bridge_uid}|"?xgw-singbox"?) return\b', rules)
+            def read_rules(argv, **_kwargs):
+                return stand.gw_run(*argv)
+
+            cfg, _ = config.load(stand.config_file)
+            assert nft.singbox_output_exempt(read_rules, bridge_uid, cfg.capture.mark_proxy) is True
             print("BRIDGE_OUTPUT_RULE dedicated_uid_return=true")
         yield stand
 

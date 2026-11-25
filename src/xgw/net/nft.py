@@ -1352,6 +1352,24 @@ def listing(
     return "".join(part if part.endswith("\n") else part + "\n" for part in full) + text
 
 
+def singbox_output_exempt(runner: Runner, uid: int, proxy_mark: int) -> bool | None:
+    """Read the unconditional UID return before the IPv4 capture mark is set."""
+    try:
+        text = runner(["nft", "-n", "list", "chain", "ip", TABLE, "output"], timeout=5)
+    except CommandError:
+        return None
+    if not re.search(r"\btype route hook output\b", text):
+        return None
+    for line in text.splitlines():
+        rule = line.split("#", 1)[0].strip().removesuffix(";")
+        if re.fullmatch(rf'meta skuid (?:{uid}|"?xgw-singbox"?) return', rule):
+            return True
+        mark = re.search(r"\bmeta mark set (0x[0-9a-fA-F]+|[0-9]+)\b", rule)
+        if mark and int(mark[1], 16 if mark[1].startswith("0x") else 10) == proxy_mark:
+            return False
+    return False
+
+
 _COUNTER = re.compile(r"counter packets \d+ bytes \d+")
 
 

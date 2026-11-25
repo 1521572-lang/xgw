@@ -40,6 +40,34 @@ def _chain(text: str, name: str) -> list[str]:
     return [line.strip() for line in lines[1:]]
 
 
+@pytest.mark.parametrize(("rules", "expected"), [
+    (["meta skuid 27123 return", "meta l4proto tcp meta mark set 0x1"], True),
+    (["meta skuid 27123 return", "meta l4proto tcp meta mark set 1"], True),
+    (["meta l4proto tcp meta mark set 1", "meta skuid 27123 return"], False),
+    (["meta skuid 27123 udp dport 123 return", "meta mark set 1"], False),
+    (["meta skuid 0 return", "meta mark set 1"], False),
+    ([], False),
+])
+def test_singbox_output_rule_matches_the_exact_uid_before_the_capture_mark(rules, expected):
+    header = "type route hook output priority mangle; policy accept;"
+    text = "\n".join(["table ip xgw {", "chain output {", header, *rules, "}", "}"])
+
+    def runner(argv, *, timeout):
+        assert argv == ["nft", "-n", "list", "chain", "ip", "xgw", "output"]
+        assert timeout == 5
+        return text
+
+    assert nft.singbox_output_exempt(runner, 27123, 1) is expected
+
+
+def test_singbox_output_rule_unreadable_is_unknown():
+    def unavailable(*_args, **_kwargs):
+        raise CommandError("Operation not permitted")
+
+    assert nft.singbox_output_exempt(unavailable, 27123, 1) is None
+    assert nft.singbox_output_exempt(lambda *_args, **_kw: "", 27123, 1) is None
+
+
 def test_gateway_with_lan_and_local_capture():
     text = _render(_cfg())
     # Таблица заменяется атомарно и только своя: никакого flush ruleset.

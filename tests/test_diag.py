@@ -113,19 +113,28 @@ def test_core_identity_checks_running_uid_and_all_capability_sets(box, monkeypat
             return props
         return box.system(argv, **kwargs)
 
-    def write_status(uids="910 910 910 910", bounding="0"):
+    def write_status(uids="910 910 910 910", bounding="0", no_new_privs="1"):
         (proc / "status").write_text(
-            f"Uid:\t{uids}\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t{bounding}\n",
+            f"Uid:\t{uids}\nCapInh:\t0\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\n"
+            f"CapBnd:\t{bounding}\nNoNewPrivs:\t{no_new_privs}\n",
             encoding="utf-8",
         )
 
     write_status()
     checker = box.diag(runner=runner, proc=proc.parent)
+    monkeypatch.setattr(diag.Capture, "mode", lambda _self: "off")
     assert checker._core_users()[0].level == OK
     write_status(bounding="1000")
     assert checker._core_users()[0].level == FAIL
     write_status(uids="0 910 910 910")
     assert checker._core_users()[0].level == FAIL
+    write_status(no_new_privs="0")
+    assert checker._core_users()[0].level == FAIL
+    write_status()
+    monkeypatch.setattr(diag.Capture, "mode", lambda _self: "on")
+    for value, level in ((True, OK), (False, FAIL), (None, WARN)):
+        monkeypatch.setattr(diag.nft, "singbox_output_exempt", lambda *_args: value)
+        assert checker._core_users()[-1].level == level
     (proc / "status").unlink()
     assert checker._core_users()[0].level == WARN
 

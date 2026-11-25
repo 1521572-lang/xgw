@@ -534,15 +534,34 @@ class Diag:
                           if ":" in line)
             uids = [int(value) for value in fields["Uid"].split()]
             caps = [int(fields[key].strip(), 16)
-                    for key in ("CapEff", "CapPrm", "CapAmb", "CapBnd")]
+                    for key in ("CapInh", "CapEff", "CapPrm", "CapAmb", "CapBnd")]
+            no_new_privs = fields["NoNewPrivs"].strip() == "1"
         except (OSError, KeyError, ValueError, ImportError):
             return [Check(name, WARN, "пользователь или права sing-box не прочитаны")]
         if props.get("User") != "xgw-singbox" or len(uids) != 4 or any(
-                value != expected_uid for value in uids) or any(caps):
+                value != expected_uid for value in uids) or any(caps) or not no_new_privs:
             return [Check(name, WARN if self.preinstall else FAIL,
-                          "sing-box ещё работает с общим пользователем или правами на сеть",
+                          "не подтверждены UID xgw-singbox, отсутствие capabilities "
+                          "или NoNewPrivileges",
                           "sudo xgw install — применить службу с отдельным пользователем")]
-        return [Check(name, OK, "sing-box: отдельный пользователь xgw-singbox, возможности сняты")]
+        checks = [Check(name, OK, "sing-box: UID xgw-singbox, без capabilities, NoNewPrivileges")]
+        if not self.cfg.capture.local:
+            return checks
+        capture = Capture(self.cfg, self.paths, runner=self.runner, logger=self.log,
+                          proc_sys=self.proc_sys)
+        if capture.mode() != "on":
+            return checks
+        exempt = nft.singbox_output_exempt(self.runner, expected_uid, self.cfg.capture.mark_proxy)
+        name = "sing-box: перехват IPv4"
+        if exempt is True:
+            checks.append(Check(name, OK, "правило UID расположено перед маркировкой перехвата"))
+        elif exempt is False:
+            checks.append(Check(name, WARN if self.preinstall else FAIL,
+                                "нет исключения UID перед меткой перехвата",
+                                "sudo xgw net up — сверить и загрузить штатные правила"))
+        else:
+            checks.append(Check(name, WARN, "цепочка output не прочитана"))
+        return checks
 
     def _tun(self) -> list[Check]:
         """Интерфейс TUN — для трафика машины (capture.method = tun) или контейнеров Docker:
