@@ -1,4 +1,4 @@
-"""Verify listener loss and one-slot NFQUEUE overflow in an isolated network namespace."""
+"""Verify the two NFQUEUE drop counters in an isolated network namespace."""
 
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ from pathlib import Path
 
 QUEUE = 201
 PORT = 31085
-PACKETS = 8
+OVERFLOW_PACKETS = 8
+NETLINK_PACKETS = 32
+NETLINK_RCVBUF = 2048
 BINARY = Path("/opt/xgw/zapret2/1.0.7/nfqws2")
 VERSION = re.compile(rb"^github version v?1\.0\.7 \(038c97e[0-9a-f]*\) lua_compat_ver \d+$",
                      re.MULTILINE)
@@ -43,8 +45,8 @@ def stop(proc):
 
 
 @contextmanager
-def overflow_samples(sample):
-    """Read a known one-slot backlog before and after a fixed loopback-only batch."""
+def queue_samples(sample, *, limit_netlink):
+    """Fill either a one-slot queue or a small, undrained netlink receive buffer."""
     try:
         library = ctypes.CDLL("libnetfilter_queue.so.1")
     except OSError as exc:
@@ -57,22 +59,30 @@ def overflow_samples(sample):
         ("nfq_set_mode", ctypes.c_int, [ptr, ctypes.c_uint8, ctypes.c_uint32]),
         ("nfq_set_queue_maxlen", ctypes.c_int, [ptr, ctypes.c_uint32]),
         ("nfq_destroy_queue", ctypes.c_int, [ptr]),
+        ("nfq_fd", ctypes.c_int, [ptr]),
     ):
         function = getattr(library, name)
         function.restype, function.argtypes = result, args
     handle = library.nfq_open()
-    require(bool(handle), "overflow_nfq_open")
+    require(bool(handle), "test_nfq_open")
     queue = None
     rule_added = False
     callback = callback_type(lambda *_: 0)
     nft = "/usr/sbin/nft"
     try:
         queue = library.nfq_create_queue(handle, QUEUE, callback, None)
-        require(bool(queue), "overflow_queue_create")
-        require(library.nfq_set_mode(queue, 1, 0) >= 0, "overflow_copy_meta")
-        require(library.nfq_set_queue_maxlen(queue, 1) >= 0, "overflow_queue_length")
+        require(bool(queue), "test_queue_create")
+        require(library.nfq_set_mode(queue, 1, 0) >= 0, "test_copy_meta")
+        packets = NETLINK_PACKETS if limit_netlink else OVERFLOW_PACKETS
+        maxlen = NETLINK_PACKETS * 2 if limit_netlink else 1
+        require(library.nfq_set_queue_maxlen(queue, maxlen) >= 0, "test_queue_length")
+        receive_buffer = None
+        if limit_netlink:
+            with socket.fromfd(library.nfq_fd(handle), socket.AF_NETLINK, socket.SOCK_RAW) as receiver:
+                receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, NETLINK_RCVBUF)
+                receive_buffer = receiver.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         before = sample()
-        require(before is not None and before.counters == (0, 0, 0), "overflow_baseline")
+        require(before is not None and before.counters == (0, 0, 0), "test_queue_baseline")
 
         subprocess.run(["/usr/sbin/ip", "link", "set", "lo", "up"], check=True, timeout=3)
         rule = (
@@ -87,7 +97,7 @@ def overflow_samples(sample):
         rule_added = True
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
             sender.settimeout(0.5)
-            for _ in range(PACKETS):
+            for _ in range(packets):
                 try:
                     sender.sendto(b"xgw-test", ("127.0.0.1", PORT))
                 except OSError as exc:
@@ -95,9 +105,19 @@ def overflow_samples(sample):
                         raise
         after = sample()
         require(after is not None and after.counters is not None
-                and after.socket == before.socket, "overflow_same_owner")
-        require(after.counters[:2] == (PACKETS - 1, 0), "overflow_expected_counters")
-        yield before, after
+                and after.socket == before.socket, "test_queue_same_owner")
+        overflow, netlink, sequence = after.counters
+        if limit_netlink:
+            print(json.dumps({
+                "case": "netlink", "sent_attempts": packets, "receive_buffer": receive_buffer,
+                "observed_overflow": overflow, "observed_netlink": netlink,
+                "observed_sequence": sequence,
+            }), flush=True)
+            require(overflow == 0 and 0 < netlink < packets and sequence == packets,
+                    "netlink_expected_counters")
+        else:
+            require((overflow, netlink) == (packets - 1, 0), "overflow_expected_counters")
+        yield before, after, packets, receive_buffer
     finally:
         if queue:
             library.nfq_destroy_queue(queue)
@@ -199,56 +219,62 @@ def run(folder):
         cfg = Config()
         cfg.zapret2.engine = "auto"
         key = worker.policy_revision(cfg.zapret2)
-        lease = slot.reserve(worker.ENGINE_UNIT, QUEUE, policy_key=key)
-        snapshot = {
-            "daemon": True, "zapret2_policy_key": key, "zapret2_reservation": asdict(lease),
-            "capture": {"loaded": True, "nfqws2": {
-                "state": "active", "profile": "seqovl", "queue": QUEUE,
-            }},
-        }
 
-        def engine_card():
+        def engine_card(snapshot):
             snapshot["updated"] = time.time()
             snapshot["zapret2_worker_events"] = slot.snapshot()[1]
             return card(cfg, snapshot, {"mode": "on"}, True)
 
-        with overflow_samples(
-            lambda: worker.owner_sample(lambda *_a, **_kw: str(os.getpid()), lease.unit, QUEUE),
-        ) as (before, after):
-            slot.observe_owner(lease, True, before)
-            first = client.observation({"zapret2": engine_card()})
-            slot.observe_owner(lease, True, after)
-            reply = read()
-            event = reply["events"][-1]
-            require(event["phase"] == "queue_drops" and event["generation"] == lease.generation
-                    and event["overflow_delta"] == PACKETS - 1 and event["netlink_delta"] == 0,
-                    "overflow_event")
-            current = engine_card()
-            losses = current["counters"]
-            require(losses["queue_overflow"] == PACKETS - 1 and losses["queue_netlink_dropped"] == 0
-                    and losses["queue_dropped"] == PACKETS - 1, "overflow_panel_projection")
-            last = client.observation({"zapret2": current})
-        require(not worker.occupied(QUEUE), "overflow_listener_still_present")
-        slot.observe_owner(lease, False)
-        current = engine_card()
-        require(read()["queue_counters"] is None and current["counters"]["queue_dropped"] is None,
-                "overflow_cleared_after_close")
-        missing = client.observation({"zapret2": current})
-        require("queue_loss_sample" not in missing, "monitor_listener_loss")
-        journal = folder / "queue-monitor.jsonl"
-        with journal.open("x", encoding="utf-8") as stream:
-            for row in (first, last, missing):
-                stream.write(json.dumps(row) + "\n")
-        observed = client.analyze(journal)["queue_losses"]
-        summary = observed["by_policy"].get("off/auto", {})
-        require(observed["samples_with_counters"] == 2 and summary.get("intervals") == 1
-                and summary.get("overflow_delta") == PACKETS - 1 and summary.get("netlink_delta") == 0,
-                "monitor_overflow_delta")
-        slot.release(lease)
-        print(json.dumps({"generation": lease.generation, "sent_attempts": PACKETS,
-                          "overflow_delta": PACKETS - 1, "netlink_delta": 0,
-                          "panel_projection": "ok", "after_listener_loss": None,
-                          "monitor_losses": observed}), flush=True)
+        def sample_engine():
+            return worker.owner_sample(lambda *_a, **_kw: str(os.getpid()), worker.ENGINE_UNIT, QUEUE)
+
+        for case in ("overflow", "netlink"):
+            lease = slot.reserve(worker.ENGINE_UNIT, QUEUE, policy_key=key)
+            snapshot = {
+                "daemon": True, "zapret2_policy_key": key, "zapret2_reservation": asdict(lease),
+                "capture": {"loaded": True, "nfqws2": {
+                    "state": "active", "profile": "seqovl", "queue": QUEUE,
+                }},
+            }
+
+            with queue_samples(sample_engine, limit_netlink=case == "netlink") as (
+                before, after, packets, receive_buffer,
+            ):
+                slot.observe_owner(lease, True, before)
+                first = client.observation({"zapret2": engine_card(snapshot)})
+                slot.observe_owner(lease, True, after)
+                overflow, netlink, _ = after.counters
+                event = read()["events"][-1]
+                require(event["phase"] == "queue_drops" and event["generation"] == lease.generation
+                        and event["overflow_delta"] == overflow and event["netlink_delta"] == netlink,
+                        "drop_event")
+                current = engine_card(snapshot)
+                losses = current["counters"]
+                require(losses["queue_overflow"] == overflow
+                        and losses["queue_netlink_dropped"] == netlink
+                        and losses["queue_dropped"] == overflow + netlink, "drop_panel_projection")
+                last = client.observation({"zapret2": current})
+            require(not worker.occupied(QUEUE), "test_listener_still_present")
+            slot.observe_owner(lease, False)
+            current = engine_card(snapshot)
+            require(read()["queue_counters"] is None and current["counters"]["queue_dropped"] is None,
+                    "test_cleared_after_close")
+            missing = client.observation({"zapret2": current})
+            require("queue_loss_sample" not in missing, "monitor_listener_loss")
+            journal = folder / f"queue-monitor-{case}.jsonl"
+            with journal.open("x", encoding="utf-8") as stream:
+                for row in (first, last, missing):
+                    stream.write(json.dumps(row) + "\n")
+            observed = client.analyze(journal)["queue_losses"]
+            summary = observed["by_policy"].get("off/auto", {})
+            require(observed["samples_with_counters"] == 2 and summary.get("intervals") == 1
+                    and summary.get("overflow_delta") == overflow
+                    and summary.get("netlink_delta") == netlink, "monitor_drop_delta")
+            slot.release(lease)
+            print(json.dumps({"case": case, "generation": lease.generation, "sent_attempts": packets,
+                              "receive_buffer": receive_buffer, "overflow_delta": overflow,
+                              "netlink_delta": netlink, "panel_projection": "ok",
+                              "after_listener_loss": None, "monitor_losses": observed}), flush=True)
     finally:
         ending.set()
         service.join(timeout=3)
