@@ -41,7 +41,8 @@ git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" merge-base --is-ancestor "$CODE" FETCH_HEAD
 D=$(mktemp -d "$HOME/xgw-t04-resume-flag.XXXXXXXX")
 mkdir "$D/tree"
-git -C "$REPO" archive "$CODE" src tests docs/helpers vpn_ui pyproject.toml | tar -x -C "$D/tree"
+git -C "$REPO" archive "$CODE" src tests docs/helpers packaging vpn_ui pyproject.toml \
+  | tar -x -C "$D/tree"
 printf 'OS %s\nPINNED %s\nPRIVATE_ARTIFACTS %s\n' "$PRETTY_NAME" "$CODE" "$D"
 uname -r
 export PYTHONPATH="$D/tree:$D/tree/src:$D/tree/tests"
