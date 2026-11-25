@@ -18,14 +18,16 @@ def _timestamp(value, sample_at):
     return type(value) in (int, float) and 0 < value <= sample_at
 
 
+def exact_range_verified(row, ok):
+    http, length = row.get("http"), row.get("bytes")
+    return (row.get("range_verified") is True and ok is True and row.get("phase") == "body"
+            and type(http) is int and http == 206 and type(length) is int and length == PROBE_BYTES)
+
+
 def _probe_outcome(row, ok):
     fields = {"ok": ok}
-    verified = row.get("range_verified")
-    if type(verified) is bool:
-        http, length = row.get("http"), row.get("bytes")
-        fields["range_verified"] = (verified and ok and row.get("phase") == "body"
-                                    and type(http) is int and http == 206
-                                    and type(length) is int and length == PROBE_BYTES)
+    if type(row.get("range_verified")) is bool:
+        fields["range_verified"] = exact_range_verified(row, ok)
     return fields
 
 

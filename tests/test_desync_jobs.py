@@ -412,15 +412,26 @@ def test_monitor_separates_policy_from_state_and_reads_legacy_journals(tmp_path)
     legacy = dict(first)
     del legacy["engine_mode"]
     standalone = first | {"config_key": "b", "mode": "standalone", "state": "active"}
-    rows = [legacy, legacy, first, first, standalone, standalone | {"state": "fallback"},
-            standalone | {"fresh": False}, first | {"config_key": None},
+    standalone_fallback = standalone | {"state": "fallback"}
+    selective = standalone | {"mode": "selective", "config_key": "c"}
+    rows = [legacy, legacy, first, first, standalone, standalone, standalone_fallback,
+            standalone_fallback, selective, selective, selective | {"fresh": False},
+            first | {"config_key": None},
             first | {"config_key": None}]
     path = tmp_path / "day.jsonl"
     path.write_text("\n".join(json.dumps(row | {"at": 60 * i}) for i, row in enumerate(rows)))
     stats = client.analyze(path)
     assert stats["policy_interval_seconds"] == {
-        "off/unknown": 60, "off/off": 60, "standalone/off": 60, "unconfirmed": 300}
-    assert stats["elapsed_seconds"] == 480
+        "off/unknown": 60, "off/off": 60, "standalone/off": 180, "selective/off": 60,
+        "unconfirmed": 360}
+    assert stats["policy_state_intervals"] == {
+        "seconds_by_policy_and_state": {
+            "off/unknown": {"off": 60}, "off/off": {"off": 60},
+            "standalone/off": {"active": 60, "fallback": 60}, "selective/off": {"active": 60},
+        },
+        "unconfirmed_seconds": 420,
+    }
+    assert stats["elapsed_seconds"] == 720
 
 
 def test_monitor_counts_distinct_probe_attempts_and_bounded_fallback(tmp_path, monkeypatch):

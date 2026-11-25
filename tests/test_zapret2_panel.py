@@ -244,6 +244,80 @@ def test_monitor_waits_for_daemon_to_confirm_new_policy(tmp_path, monkeypatch):
     assert confirmed["config_key"] not in json.dumps(result)
 
 
+@pytest.mark.parametrize(("changes", "error"), [
+    ({"mode": "off"}, "selective_not_active"),
+    ({"mode": "standalone"}, "selective_not_active"),
+    ({"state": "fallback"}, "selective_not_active"),
+    ({"policy_matched": False}, "selective_not_active"),
+    ({"fresh": False}, "selective_not_active"),
+    ({"observed_at": None}, "direct_cdn_range_unconfirmed"),
+    ({"transport": "unknown"}, "direct_cdn_range_unconfirmed"),
+    ({"cdn_expires_at": NOW}, "direct_cdn_range_unconfirmed"),
+    ({"http": 204}, "direct_cdn_range_unconfirmed"),
+    ({"bytes": 65535}, "direct_cdn_range_unconfirmed"),
+    ({"range_verified": None}, "direct_cdn_range_unconfirmed"),
+    ({"started_at": NOW + 1}, "direct_cdn_range_unconfirmed"),
+    ({"error": "api_unavailable"}, "api_unavailable"),
+])
+def test_selective_monitor_admission_fails_before_creating_journal(
+    tmp_path, monkeypatch, capsys, changes, error,
+):
+    cdn = {"ok": True, "phase": "body", "http": 206, "bytes": 65536,
+           "range_verified": True, "started_at": NOW - 5} | changes
+    row = {"at": NOW, "observed_at": NOW, "mode": "selective", "state": "active",
+           "fresh": True, "policy_matched": True, "config_key": "private",
+           "transport": "https_reachable", "probes": {"cdn": cdn}} | changes
+    monkeypatch.setattr(client, "Client", lambda: object())
+    monkeypatch.setattr(client, "_monitor_sample", lambda _: row)
+    journal = tmp_path / "daily.jsonl"
+    monkeypatch.setattr(sys, "argv", ["xgw", "monitor", "--output", str(journal),
+                                     "--require-selective"])
+    assert client.main() == 2
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": error}
+    assert not journal.exists()
+
+
+def test_selective_monitor_starts_from_panel_range_and_records_later_fallback(tmp_path, monkeypatch):
+    cfg, snap = fixture(mode="selective", engine="off", reason="youtube_transport_ok",
+                        valid_until=NOW + 60)
+    cfg.zapret2.youtube_transport_probe = True
+    cfg.zapret2.probe_urls = ["https://www.youtube.com/t/terms",
+                             "https://r1.googlevideo.com/videoplayback"]
+    cfg.desync = schema.migrate(vars(cfg.zapret2))
+    snap["zapret2_policy_key"] = schema.fingerprint(cfg.desync)
+    snap["zapret2"]["transport_probes"] = {
+        "page": {"ok": True, "phase": "body", "http": 200, "started_at": NOW - 10},
+        "cdn": {"ok": True, "phase": "body", "http": 206, "bytes": 65536,
+                "range_verified": True, "started_at": NOW - 5},
+    }
+    clock = SimpleNamespace(elapsed=0)
+
+    def sleep(seconds):
+        clock.elapsed += seconds
+
+    time_api = client.time
+    monkeypatch.setattr(client, "time", SimpleNamespace(
+        time=lambda: NOW + clock.elapsed, monotonic=lambda: clock.elapsed,
+        sleep=sleep, strftime=time_api.strftime, gmtime=time_api.gmtime))
+
+    def request(path):
+        assert path == "/api/state"
+        now = NOW + clock.elapsed
+        snap["updated"] = now
+        if clock.elapsed >= 30:
+            snap["zapret2"].update(state="fallback", gate_closed=True, reason="probe_failed")
+        return {"zapret2": card(cfg, snap, {"mode": "on"}, True, now=now)}
+
+    journal = tmp_path / "daily.jsonl"
+    output = client.monitor(SimpleNamespace(request=request), journal, seconds=60, interval=15,
+                            require_selective=True)
+    assert output["states"] == {"active": 2, "fallback": 3}
+    assert client.analyze(journal)["policy_state_intervals"] == {
+        "seconds_by_policy_and_state": {"selective/off": {"active": 15, "fallback": 30}},
+        "unconfirmed_seconds": 15,
+    }
+
+
 def test_transport_probe_details_are_private_and_revision_bound():
     cfg, snap = fixture(mode="selective", engine="off", state="fallback",
                         reason="youtube_page_probe_failed", gate_closed=True)

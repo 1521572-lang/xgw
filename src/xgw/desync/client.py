@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from itertools import pairwise
 from pathlib import Path
 
@@ -16,7 +16,9 @@ from .jobs import ACTIVE, CANDIDATES, MAX_SECONDS, WAIT_STAGES
 from .monitor_budget import MAX_TIME, budget_summary
 from .monitor_expiry import cdn_expiry_summary, valid_cdn_deadline
 from .monitor_policy import policy_changes, policy_label
-from .monitor_probes import MAX_SAMPLE_GAP_SECONDS, matched_policy, probe_summary, vpn_probe_attempts
+from .monitor_probes import (
+    MAX_SAMPLE_GAP_SECONDS, exact_range_verified, matched_policy, probe_summary, vpn_probe_attempts,
+)
 from .monitor_recovery import recovery_summary, valid_status_time
 
 MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm", "worker_start")
@@ -26,6 +28,10 @@ class _HTTPFailure(ValueError):
     def __init__(self, status: int) -> None:
         super().__init__("local_api_unavailable_or_login_expired")
         self.status = status
+
+
+class _MonitorAdmissionError(ValueError):
+    pass
 
 
 class Client:
@@ -113,21 +119,45 @@ def observation(state):
     }
 
 
-def monitor(client, output, seconds, interval):
+def _monitor_sample(client):
+    try:
+        return observation(client.request("/api/state"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return {"at": time.time(), "error": "api_unavailable"}
+
+
+def _require_selective_sample(row):
+    if row.get("error"):
+        raise _MonitorAdmissionError("api_unavailable")
+    if (row.get("mode") != "selective" or row.get("state") != "active"
+            or not matched_policy(row, row)):
+        raise _MonitorAdmissionError("selective_not_active")
+    observed = row.get("observed_at")
+    cdn = row["probes"].get("cdn", {})
+    if (row.get("transport") != "https_reachable"
+            or not exact_range_verified(cdn, cdn.get("ok"))
+            or ("cdn_expires_at" in row and row["cdn_expires_at"] <= row["at"])
+            or not valid_status_time(observed, row["at"])
+            or not valid_status_time(cdn.get("started_at"), observed)):
+        raise _MonitorAdmissionError("direct_cdn_range_unconfirmed")
+
+
+def monitor(client, output, seconds, interval, *, require_selective=False):
     if not 60 <= seconds <= 90000 or not 15 <= interval <= 300:
         raise ValueError("monitor_bounds_60_90000s_interval_15_300s")
+    first = None
+    if require_selective:
+        first = _monitor_sample(client)
+        _require_selective_sample(first)
     deadline = time.monotonic() + seconds
     counts = Counter()
     size = samples = 0
     fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         while True:
-            try:
-                row = observation(client.request("/api/state"))
-                counts[str(row["state"])] += 1
-            except (OSError, ValueError, http.client.HTTPException):
-                row = {"at": time.time(), "error": "api_unavailable"}
-                counts["api_unavailable"] += 1
+            row = first if first is not None else _monitor_sample(client)
+            first = None
+            counts[row["error"] if "error" in row else str(row["state"])] += 1
             line = json.dumps(row, ensure_ascii=False) + "\n"
             size += len(line.encode())
             if size > 16 * 1024 * 1024:
@@ -159,6 +189,8 @@ def analyze(path):
             if len(rows) > 6002:
                 raise ValueError("monitor_sample_limit")
     durations, policies, fallback = Counter(), Counter(), Counter()
+    seconds_by_policy_and_state = defaultdict(Counter)
+    unconfirmed_policy_state = 0
     boundaries = gaps = 0
     latest_at = rows[0]["at"] if rows else 0
     for first, last in pairwise(rows):
@@ -179,6 +211,10 @@ def analyze(path):
             fallback[reason if known else "unconfirmed"] += elapsed
         same_mode = matched and mode and mode == policy_label(last)
         policies[mode if same_mode else "unconfirmed"] += elapsed
+        if same_mode and same_state:
+            seconds_by_policy_and_state[mode][state] += elapsed
+        else:
+            unconfirmed_policy_state += elapsed
         a, b = first.get("budget"), last.get("budget")
         a = a if isinstance(a, dict) else {}
         b = b if isinstance(b, dict) else {}
@@ -197,6 +233,11 @@ def analyze(path):
         "cdn_expiry": cdn_expiry_summary(rows),
         "selected_recovery": recovery_summary(rows),
         "policy_changes": policy_changes(rows),
+        "policy_state_intervals": {
+            "seconds_by_policy_and_state": {mode: dict(states)
+                                            for mode, states in seconds_by_policy_and_state.items()},
+            "unconfirmed_seconds": unconfirmed_policy_state,
+        },
         "note": "Sampled status and probe outcomes do not prove playback or a free-pool recovery."}
 
 
@@ -428,6 +469,8 @@ def main():
     watch.add_argument("--output", type=Path, required=True)
     watch.add_argument("--seconds", type=int, default=86400)
     watch.add_argument("--interval", type=int, default=60)
+    watch.add_argument("--require-selective", action="store_true",
+                       help="Начать только при active Selective и подтверждённом диапазоне CDN")
     review = sub.add_parser("analyze")
     review.add_argument("input", type=Path)
     matrix = sub.add_parser("matrix", help="Summarize one saved job without contacting the gateway")
@@ -443,7 +486,8 @@ def main():
         elif args.action == "analyze":
             result = analyze(args.input)
         elif args.action == "monitor":
-            result = monitor(client, args.output, args.seconds, args.interval)
+            result = monitor(client, args.output, args.seconds, args.interval,
+                             require_selective=args.require_selective)
         elif args.action == "status" and args.summary:
             from ..watch.panel_ipc import project
 
@@ -479,6 +523,9 @@ def main():
                 result = client.request("/api/zapret2/" + action, body)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("ok", True) else 2
+    except _MonitorAdmissionError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 2
     except (OSError, ValueError, KeyError, RecursionError, http.client.HTTPException) as exc:
         if args.action == "matrix":
             print(json.dumps({"ok": False, "error": "invalid_or_missing_job_snapshot"}))
