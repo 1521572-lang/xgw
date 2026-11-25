@@ -194,6 +194,26 @@ def test_monitor_ignores_missing_or_malformed_cdn_deadline(expiry):
     assert "cdn_expires_at" not in observation and "observed_at" not in observation
 
 
+def test_monitor_records_a_selected_recovery_without_a_cdn_deadline(tmp_path, monkeypatch):
+    cfg, snap = fixture(mode="selective", engine="off", state="fallback",
+                        reason="probe_failed", gate_closed=True)
+    snap["zapret2"]["private"] = "not-for-journal"
+    monkeypatch.setattr(client.time, "time", lambda: NOW)
+    before = client.observation({"zapret2": view(cfg, snap)})
+    snap["updated"] = NOW + 15
+    snap["zapret2"].update(state="active", reason="probes_ok", valid_until=NOW + 60)
+    monkeypatch.setattr(client.time, "time", lambda: NOW + 16)
+    after = client.observation({"zapret2": card(cfg, snap, {"mode": "on"}, True, now=NOW + 16)})
+
+    assert [before["observed_at"], after["observed_at"]] == [NOW, NOW + 15]
+    assert "cdn_expires_at" not in before and "cdn_expires_at" not in after
+    path = tmp_path / "recovery.jsonl"
+    data = "\n".join(json.dumps(row) for row in (before, after))
+    assert "not-for-journal" not in data
+    path.write_text(data, encoding="utf-8")
+    assert client.analyze(path)["selected_recovery"]["by_fallback_reason"] == {"probe_failed": 1}
+
+
 def test_transport_probe_details_are_private_and_revision_bound():
     cfg, snap = fixture(mode="selective", engine="off", state="fallback",
                         reason="youtube_page_probe_failed", gate_closed=True)
