@@ -188,6 +188,13 @@ def same_target(first, second):
                 and all(first[key] == second.get(key) for key in ("url_sha256", "peer")))
 
 
+def direct_retry_allowed(first, pinned, route):
+    return (first.get("outcome") == "http_redirect" and first.get("status") == 302
+            and first.get("curl_rc") == 0 and same_target(first, pinned)
+            and route.get("state") == "observed" and route.get("group") == "zapret2"
+            and first.get("actual_peer") == first["peer"])
+
+
 def compare(direct, vpn, origin):
     control = public_sample(vpn)
     if vpn.get("outcome") == "http_redirect" and "retry" in vpn:
@@ -197,7 +204,18 @@ def compare(direct, vpn, origin):
             "standalone": public_sample(direct), "vpn": control}
 
 
-def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None):
+def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None, retry=None):
+    attempts = None
+    direct_attempt = "first"
+    if retry is not None:
+        repeated, repeated_route, repeated_queue = retry
+        attempts = {"first": evaluate_direct(direct, direct_route, queue_snapshots=queue_snapshots),
+                    "retry": evaluate_direct(repeated, repeated_route, queue_snapshots=repeated_queue)}
+        if (direct_retry_allowed(direct, vpn, direct_route) and same_target(direct, repeated)
+                and attempts["retry"]["direct_route_verified"]
+                and repeated.get("actual_peer") == direct["peer"]):
+            direct, direct_route, queue_snapshots = repeated, repeated_route, repeated_queue
+            direct_attempt = "retry"
     control, route = vpn, vpn_route
     if vpn.get("outcome") == "http_redirect" and "retry" in vpn:
         control = vpn["retry"]
@@ -221,6 +239,8 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None)
               "vpn_route_verified": vpn_group in ("xray", "sing-box"),
               "vpn_range_verified": vpn_ok,
               "vpn_attempt": "retry" if control is not vpn else "first"}
+    if attempts is not None:
+        report.update(direct_attempt=direct_attempt, direct_attempts=attempts)
     return {**report, **direct_evidence(direct, direct_group == "zapret2", queue_snapshots)}
 
 
@@ -324,12 +344,19 @@ def main():
     run.add_argument("--peer-from", type=Path)
     run.add_argument("--retry-302", action="store_true")
     run.add_argument("--wan-tcp-snapshot", type=Path)
+    eligibility = commands.add_parser("can-retry-direct")
+    eligibility.add_argument("first", type=Path)
+    eligibility.add_argument("pinned", type=Path)
+    eligibility.add_argument("route", type=Path)
     seed = commands.add_parser("prepare")
     seed.add_argument("source", type=Path)
     seed.add_argument("output", type=Path)
     decision = commands.add_parser("evaluate")
     for name in ("direct", "vpn", "direct_route", "vpn_route"):
         decision.add_argument(name, type=Path)
+    for name in ("direct-retry", "direct-retry-route", "direct-retry-queue-before",
+                 "direct-retry-queue-after"):
+        decision.add_argument(f"--{name}", type=Path)
     direct = commands.add_parser("evaluate-direct")
     direct.add_argument("direct", type=Path)
     direct.add_argument("direct_route", type=Path)
@@ -353,6 +380,11 @@ def main():
         record = run_sample(args.source, first, retry_302=args.retry_302,
                             wan_tcp_snapshot=args.wan_tcp_snapshot)
         ok = record.get("retry", record)["outcome"] == "range_complete"
+    elif args.action == "can-retry-direct":
+        ok = direct_retry_allowed(
+            read_sample(args.first), read_sample(args.pinned), read_sample(args.route),
+        )
+        record = {"eligible": ok}
     elif args.action == "prepare":
         record = prepare_pair(args.source, args.output)
         ok = record["state"] == "vpn_range_verified"
@@ -366,8 +398,14 @@ def main():
             if args.action == "evaluate-direct":
                 record = evaluate_direct(direct_record, direct_route, queue_snapshots=snapshots)
             else:
+                retry = None
+                if args.direct_retry is not None:
+                    retry = (read_sample(args.direct_retry), read_sample(args.direct_retry_route),
+                             (read_sample(args.direct_retry_queue_before),
+                              read_sample(args.direct_retry_queue_after)))
                 record = evaluate_pair(direct_record, read_sample(args.vpn), direct_route,
-                                       read_sample(args.vpn_route), queue_snapshots=snapshots)
+                                       read_sample(args.vpn_route), queue_snapshots=snapshots,
+                                       retry=retry)
         except (TypeError, AttributeError):
             record = {"state": "invalid_evidence"}
         ok = record["state"] in ("pair_verified", "direct_observed")

@@ -241,3 +241,56 @@ def test_direct_report_preserves_redirect_and_tcp_without_a_vpn_sample():
     assert result["direct_route_verified"] and not result["direct_range_verified"]
     assert result["direct_tcp"] == direct["wan_tcp"]
     assert "private" not in repr(result) and "1.1.1.1" not in repr(result)
+
+
+@pytest.mark.parametrize(("changes", "route", "expected"), [
+    ({}, {"state": "observed", "group": "zapret2"}, True),
+    ({"outcome": "tls_timeout"}, {"state": "observed", "group": "zapret2"}, False),
+    ({"status": 403}, {"state": "observed", "group": "zapret2"}, False),
+    ({"curl_rc": 28}, {"state": "observed", "group": "zapret2"}, False),
+    ({"actual_peer": "8.8.8.8"}, {"state": "observed", "group": "zapret2"}, False),
+    ({"url_sha256": "changed"}, {"state": "observed", "group": "zapret2"}, False),
+    ({}, {"state": "observed", "group": "xray"}, False),
+    ({}, {"state": "ambiguous"}, False),
+])
+def test_direct_retry_requires_a_confirmed_redirect_on_the_original_target(changes, route, expected):
+    pinned = {"peer": "1.1.1.1", "url_sha256": "private"}
+    first = pinned | {"outcome": "http_redirect", "status": 302, "curl_rc": 0,
+                      "actual_peer": pinned["peer"]} | changes
+    assert cdn.direct_retry_allowed(first, pinned, route) is expected
+
+
+@pytest.mark.parametrize(("changes", "retry_route", "used", "verdict"), [
+    ({}, {"state": "observed", "group": "zapret2"}, "retry", "pair_verified"),
+    ({"content_range_ok": False}, {"state": "observed", "group": "zapret2"},
+     "retry", "range_unconfirmed"),
+    ({"outcome": "http_redirect", "status": 302}, {"state": "observed", "group": "zapret2"},
+     "retry", "range_unconfirmed"),
+    ({}, {"state": "ambiguous"}, "first", "range_unconfirmed"),
+    ({"actual_peer": "8.8.8.8"}, {"state": "observed", "group": "zapret2"},
+     "first", "range_unconfirmed"),
+    ({"url_sha256": "changed"}, {"state": "observed", "group": "zapret2"},
+     "first", "range_unconfirmed"),
+])
+def test_pair_keeps_direct_attempts_separate(changes, retry_route, used, verdict, monkeypatch):
+    from docs.helpers import cdn_queue_observation as queue
+
+    vpn = {"peer": "1.1.1.1", "actual_peer": "1.1.1.1", "url_sha256": "private",
+           "outcome": "range_complete", "status": 206, "bytes": 65536, "curl_rc": 0,
+           "content_range_ok": True}
+    first = vpn | {"outcome": "http_redirect", "status": 302, "content_range_ok": False,
+                   "wan_tcp": {"bytes_received": 100}}
+    repeated = vpn | {"wan_tcp": {"bytes_received": 65536}} | changes
+    direct_route = {"state": "observed", "group": "zapret2"}
+    vpn_route = {"state": "observed", "group": "xray"}
+    first_queue = ({"assigned_ids": 1}, {})
+    repeated_queue = ({"assigned_ids": 2}, {})
+    monkeypatch.setattr(queue, "summarize", lambda before, _after, _request: before)
+    result = cdn.evaluate_pair(first, vpn, direct_route, vpn_route, queue_snapshots=first_queue,
+                               retry=(repeated, retry_route, repeated_queue))
+    assert result["state"] == verdict and result["direct_attempt"] == used
+    assert result["direct_attempts"]["first"]["direct"]["status"] == 302
+    assert result["direct_attempts"]["retry"]["direct"]["outcome"] == repeated["outcome"]
+    assert result["direct_queue"] == {"assigned_ids": 2 if used == "retry" else 1}
+    assert result["direct_tcp"] == {"bytes_received": 65536 if used == "retry" else 100}
+    assert "private" not in json.dumps(result) and "1.1.1.1" not in json.dumps(result)

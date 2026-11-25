@@ -161,6 +161,26 @@ route_observation() {
       "$D/$phase-cdn.out" "$D/$phase-counters-before.out" "$D/$phase-counters-after.out"
 }
 
+measure_direct_retry() {
+  local format=$1 begin end
+  begin=$(date +%s)
+  run direct-retry-counters-before snapshot || true
+  run direct-retry-queue-before queue_snapshot || true
+  run direct-retry-cdn sample_cdn 32 "$format" --peer-from "$D/direct-cdn.out" \
+    --wan-tcp-snapshot "$D/direct-retry-counters-before.out" || true
+  run direct-retry-queue-after queue_snapshot || true
+  run direct-retry-counters-after snapshot || true
+  end=$(($(date +%s) + 1))
+  if run direct-retry-revision-after timeout -k 2 12 "$PY" -B -P \
+      -m docs.helpers.selective_admission check-standalone "$D/standalone-receipt"; then
+    run direct-retry-route route_observation direct-retry "$begin" "$end" || true
+  fi
+  run direct-retry-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate-direct \
+    "$D/direct-retry-cdn.out" "$D/direct-retry-route.out" \
+    --queue-before "$D/direct-retry-queue-before.out" \
+    --queue-after "$D/direct-retry-queue-after.out" || true
+}
+
 stage() {
   local file
   sudo -n test -d /opt/xgw/handoff || sudo -n install -d -m 0755 /opt/xgw/handoff || return
@@ -300,6 +320,7 @@ if [[ $MODE != resume ]]; then
     standalone "$D/standalone-receipt" --strategy "$strategy"
   run standalone-paused topology paused 30
   direct_route_observed=0
+  direct_retry_args=()
   if [[ $MODE == cdn* ]]; then
     run direct-revision-before timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
       check-standalone "$D/standalone-receipt"
@@ -343,6 +364,17 @@ if [[ $MODE != resume ]]; then
       run direct-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate-direct \
         "$D/direct-cdn.out" "$D/direct-route.out" \
         --queue-before "$D/direct-queue-before.out" --queue-after "$D/direct-queue-after.out" || true
+      if [[ $direct_route_observed == 1 ]] &&
+         run direct-retry-eligible "$PY" -B -P -m docs.helpers.standalone_cdn_compare \
+           can-retry-direct "$D/direct-cdn.out" "$format" "$D/direct-route.out" &&
+         run direct-retry-revision-before timeout -k 2 12 "$PY" -B -P \
+           -m docs.helpers.selective_admission check-standalone "$D/standalone-receipt"; then
+        measure_direct_retry "$format"
+        direct_retry_args=(--direct-retry "$D/direct-retry-cdn.out"
+                           --direct-retry-route "$D/direct-retry-route.out"
+                           --direct-retry-queue-before "$D/direct-retry-queue-before.out"
+                           --direct-retry-queue-after "$D/direct-retry-queue-after.out")
+      fi
     fi
   fi
   RETURN_STARTED=$(date +%s)
@@ -372,7 +404,8 @@ if [[ $MODE != resume ]]; then
     if [[ $MODE == cdn-pair && $direct_revision == confirmed ]]; then
       run pair-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate \
         "$D/direct-cdn.out" "$D/off-cdn.out" "$D/direct-route.out" "$D/off-route.out" \
-        --queue-before "$D/direct-queue-before.out" --queue-after "$D/direct-queue-after.out" || true
+        --queue-before "$D/direct-queue-before.out" --queue-after "$D/direct-queue-after.out" \
+        "${direct_retry_args[@]}" || true
       cat "$D/pair-verdict.out"
     elif [[ $MODE == cdn-pair ]]; then
       printf 'STANDALONE_LIVE_CDN_PAIR_REVISION_UNCONFIRMED\n'
