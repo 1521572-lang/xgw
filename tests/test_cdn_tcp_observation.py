@@ -100,6 +100,24 @@ def test_tcp_coverage_distinguishes_syn_sent_from_established_without_tcp_info()
                       "syn_sent_only_polls": 1, "established_polls_without_tcp_info": 1}
 
 
+@pytest.mark.parametrize(("times", "tls_timeout", "expected"), [
+    ((2, 5, 9.7), True, "syn_sent_without_established"),
+    ((2, 5, 8.5), True, "insufficient_coverage"),
+    ((5, 9.7), True, "insufficient_coverage"),
+    ((2, 5, 9.7), False, "insufficient_coverage"),
+])
+def test_syn_sent_verdict_requires_a_terminal_timeout_and_late_coverage(times, tls_timeout, expected):
+    socket = socket_row(state="SYN-SENT", retrans_total=3)
+    result = tcp.summarize(
+        listing(), [(at, listing(socket, socket)) for at in times],
+        peer=PEER, pid=PID, finished=10, tls_timeout=tls_timeout,
+    )
+    assert result["state"] == expected
+    assert result["syn_sent_only_polls"] == len(times) and result["established_polls"] == 0
+    assert result["syn_sent_retrans_total"] == 3
+    assert result["last_syn_sent_before_end_ms"] == round((10 - times[-1]) * 1000)
+
+
 def test_tcp_sampler_uses_only_one_marked_peer_and_keeps_transfer_when_unavailable(monkeypatch):
     def run(argv, *, timeout):
         assert argv[:4] == ["sudo", "-n", "--", "ss"]

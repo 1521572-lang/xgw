@@ -49,7 +49,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wanted", choices=("observed", "legacy_resume", "paused", "managed",
                                           "stable"))
-    parser.add_argument("seconds", type=int, choices=range(1, 241), metavar="1..240")
+    max_wait = processes.DRAIN_SECONDS + 60
+    parser.add_argument("seconds", type=int, choices=range(1, max_wait + 1),
+                        metavar=f"1..{max_wait}")
     args = parser.parse_args()
     runtime = Path("/run/xgw")
     deadline = time.monotonic() + args.seconds

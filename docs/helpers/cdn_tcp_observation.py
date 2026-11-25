@@ -11,6 +11,7 @@ INTERVAL = 0.25
 MAX_SAMPLES = 64
 MAX_WINDOW = 16
 LATE_SAMPLE_SECONDS = 1.0
+MIN_OBSERVATIONS = 3
 FIELDS = ("bytes_sent", "bytes_acked", "bytes_received", "bytes_retrans",
           "data_segs_in", "retrans_total")
 TIMING_FIELDS = (
@@ -48,8 +49,7 @@ def _sample_timing(samples, started):
     first_sample = samples[0][0]
     return {
         "first_sample_ms": round((first_sample - started) * 1000),
-        "largest_sample_gap_ms": max(
-            (round((late[0] - early[0]) * 1000) for early, late in pairwise(samples)), default=None),
+        "largest_sample_gap_ms": _largest_sample_gap_ms(samples),
         **{
             label: next((round((at - started) * 1000) for at, row in samples if criterion(row)),
                         None)
@@ -64,6 +64,11 @@ def _sample_timing(samples, started):
     }
 
 
+def _largest_sample_gap_ms(samples):
+    return max((round((late[0] - early[0]) * 1000) for early, late in pairwise(samples)),
+               default=None)
+
+
 def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, started=None):
     observations = [(at, row) for at, row in observations
                     if at <= finished and (started is None or started <= at)]
@@ -72,10 +77,12 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
     existing = {row["socket"] for row in baseline["sockets"]}
     candidates = set()
     samples = []
+    syn_samples = []
     unowned = False
-    established_polls = syn_sent_only_polls = 0
+    established_polls = 0
     for observed, listing in observations:
-        established = syn_sent = False
+        established = False
+        syn_sent = None
         measured = set()
         for row in listing["sockets"]:
             if (row["socket"] in existing or row["peer_ip"] != peer
@@ -88,13 +95,15 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
                 continue
             candidates.add(row["socket"])
             established |= row["state"] == "ESTAB"
-            syn_sent |= row["state"] == "SYN-SENT"
+            if row["state"] == "SYN-SENT" and syn_sent is None:
+                syn_sent = row
             if (row["state"] == "ESTAB" and row["socket"] not in measured
                     and all(type(row.get(key)) is int for key in FIELDS)):
                 measured.add(row["socket"])
                 samples.append((observed, row))
         established_polls += established
-        syn_sent_only_polls += syn_sent and not established
+        if syn_sent is not None and not established:
+            syn_samples.append((observed, syn_sent))
     if len(candidates) > 1:
         return {"state": "ambiguous"}
     if unowned:
@@ -103,10 +112,21 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
         return {"state": "socket_unobserved"}
     coverage = {
         "established_polls": established_polls,
-        "syn_sent_only_polls": syn_sent_only_polls,
+        "syn_sent_only_polls": len(syn_samples),
         "established_polls_without_tcp_info": established_polls - len(samples),
     }
     if not samples:
+        if syn_samples and established_polls == 0:
+            last_at, last_syn = syn_samples[-1]
+            elapsed = finished - last_at
+            state = ("syn_sent_without_established" if tls_timeout
+                     and len(syn_samples) >= MIN_OBSERVATIONS
+                     and elapsed <= LATE_SAMPLE_SECONDS else "insufficient_coverage")
+            retrans = last_syn.get("retrans_total")
+            return {"state": state, **coverage,
+                    "last_syn_sent_before_end_ms": round(elapsed * 1000),
+                    "largest_sample_gap_ms": _largest_sample_gap_ms(syn_samples),
+                    "syn_sent_retrans_total": retrans if type(retrans) is int else None}
         return {"state": "tcp_info_unobserved", **coverage}
 
     last_at, counters = samples[-1]
@@ -117,7 +137,7 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
         result.update(_sample_timing(samples, started))
     if counters["bytes_received"] > 0 and counters["data_segs_in"] > 0:
         state = "tcp_data_received"
-    elif not tls_timeout or late_gap > LATE_SAMPLE_SECONDS or len(samples) < 3:
+    elif not tls_timeout or late_gap > LATE_SAMPLE_SECONDS or len(samples) < MIN_OBSERVATIONS:
         state = "insufficient_coverage"
     elif not counters["bytes_sent"]:
         state = "send_unobserved"

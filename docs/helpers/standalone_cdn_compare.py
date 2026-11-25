@@ -258,11 +258,15 @@ def direct_evidence(direct, route_verified, queue_snapshots):
         if observed_path:
             keys = ("state", "samples", "last_sample_before_end_ms", *FIELDS)
             report["direct_tcp"] = {key: observed[key] for key in keys if key in observed}
+            if "syn_sent_retrans_total" in observed:
+                value = observed["syn_sent_retrans_total"]
+                if value is None or type(value) is int and 0 <= value <= (1 << 32) - 1:
+                    report["direct_tcp"]["syn_sent_retrans_total"] = value
             for key in POLL_FIELDS:
                 value = observed.get(key)
                 if type(value) is int and 0 <= value <= MAX_SAMPLES:
                     report["direct_tcp"][key] = value
-            for key in TIMING_FIELDS:
+            for key in (*TIMING_FIELDS, "last_syn_sent_before_end_ms"):
                 if key in observed:
                     value = observed[key]
                     if value is None or type(value) is int and 0 <= value <= MAX_WINDOW * 1000:
