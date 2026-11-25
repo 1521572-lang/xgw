@@ -53,6 +53,10 @@ def write(paths, state):
     atomic_write_json(state_path(paths), state, mode=0o600)
 
 
+def resume_requested(state):
+    return state["active"] == "legacy" and state.get("resume_managed") is True
+
+
 def config_path(paths, slot):
     unit(slot)
     return paths.singbox_config_dir / f"generation-{slot}.json"
@@ -184,6 +188,10 @@ def xray_ports(config):
 def reap(core):
     """Вызывается под общей блокировкой; не останавливать процесс, на который ещё ссылаются."""
     state = read(core.paths)
+    if state["active"] in SLOTS and "resume_managed" in state:
+        # A previous build or rollback can leave the legacy handoff flag behind.
+        state.pop("resume_managed")
+        write(core.paths, state)
     old = state["draining"]
     if old and time.monotonic() >= old["until"] and not core.paths.api_dirty_file.exists():
         try:
@@ -227,7 +235,7 @@ def summary(paths):
         "active": state["active"], "draining": old["slot"] if old else None,
         "drain_left_s": max(0, round(old["until"] - time.monotonic())) if old else 0,
         "pending": state["pending"]["phase"] if state["pending"] else None,
-        "resume_managed": state.get("resume_managed") is True,
+        "resume_managed": resume_requested(state),
         "process_limit": 2,
         # Права процесса действующего поколения проверены демоном до переключения (identity).
         "identity_ok": (state.get("identity") or {}).get("slot") == state["active"] or None,

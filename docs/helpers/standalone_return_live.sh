@@ -77,57 +77,8 @@ PY
 }
 
 topology() {
-  sudo -n timeout -k 3 "$(($2 + 15))" "$PY" -I -B - "$1" "$2" <<'PY'
-import json
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-runtime = Path("/run/xgw")
-state_file = runtime / "singbox-generations.json"
-wanted, seconds = sys.argv[1], int(sys.argv[2])
-deadline = time.monotonic() + seconds
-last = None
-while time.monotonic() < deadline:
-    units = subprocess.check_output(
-        ["systemctl", "list-units", "--type=service", "--all", "--plain", "--no-legend",
-         "--no-pager", "xgw-singbox*.service"],
-        timeout=8, text=True,
-    )
-    unit_state = {row[0]: row[2] for row in map(str.split, units.splitlines()) if len(row) >= 3}
-    state = json.loads(state_file.read_bytes())
-    active = state["active"]
-    marker = (runtime / "singbox-managed").is_file()
-    pending, draining = bool(state["pending"]), bool(state["draining"])
-    resume = state.get("resume_managed") is True
-    stopping = state.get("standalone_stopping") is True
-    sample = {"active": active, "marker": marker, "pending": pending, "draining": draining,
-              "resume_managed": resume, "standalone_stopping": stopping, "units": unit_state}
-    if sample != last:
-        print(json.dumps(sample, sort_keys=True), flush=True)
-        last = sample
-    if wanted == "observed":
-        ready = True
-    elif wanted == "legacy_resume":
-        ready = (active == "legacy" and not marker and resume and not pending and not draining
-                 and not stopping and unit_state.get("xgw-singbox.service") == "active")
-    elif wanted == "paused":
-        ready = (active == "legacy" and not marker and resume and not pending and not draining
-                 and not stopping
-                 and all(value in ("inactive", "failed") for value in unit_state.values()))
-    else:
-        managed = (active in ("blue", "green") and marker and not pending and not resume and not stopping
-                   and unit_state.get(f"xgw-singbox-{active}.service") == "active")
-        ready = managed and (wanted != "stable" or (
-            not draining and all(name == f"xgw-singbox-{active}.service"
-                                 or value in ("inactive", "failed")
-                                 for name, value in unit_state.items())))
-    if ready:
-        raise SystemExit(0)
-    time.sleep(2)
-raise SystemExit("topology_not_confirmed")
-PY
+  sudo -n timeout -k 3 "$(($2 + 15))" env "PYTHONPATH=$D/tree:$D/tree/src" "$PY" -B -P \
+    -m docs.helpers.standalone_topology "$1" "$2"
 }
 
 vpn_check() {

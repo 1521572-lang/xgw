@@ -135,6 +135,34 @@ def test_failed_bridge_leaves_old_without_api(gateway, monkeypatch):
     assert w.core.read() == w.old and p.read(w.paths)["pending"] is None
 
 
+@pytest.mark.parametrize("slot", p.SLOTS)
+def test_recovery_clears_only_obsolete_resume_flag_for_a_managed_slot(gateway, slot):
+    w = gateway
+    w.alive.clear()
+    w.alive.add(p.unit(slot))
+    state = {"active": slot, "pending": None, "draining": None,
+             "identity": {"slot": slot}, "resume_managed": True}
+    p.write(w.paths, state)
+    p.marker_path(w.paths).write_text("managed\n", encoding="utf-8")
+    assert not g.resume_needed(w.core) and not p.summary(w.paths)["resume_managed"]
+    g.recover(w.core)
+    expected = state.copy()
+    del expected["resume_managed"]
+    assert p.read(w.paths) == expected
+    assert w.alive == {p.unit(slot)} and w.api.calls == []
+    assert p.marker_path(w.paths).is_file()
+
+
+def test_recovery_preserves_legacy_resume_request(gateway):
+    w = gateway
+    state = {"active": "legacy", "pending": None, "draining": None, "resume_managed": True}
+    p.write(w.paths, state)
+    g.recover(w.core)
+    assert p.read(w.paths) == state
+    assert g.resume_needed(w.core) and p.summary(w.paths)["resume_managed"]
+    assert w.alive == {p.LEGACY} and w.api.calls == []
+
+
 def test_standalone_return_keeps_legacy_until_managed_bridge_is_verified(gateway, monkeypatch, caplog):
     w = gateway
     caplog.set_level("INFO", logger=w.core.log.name)

@@ -151,8 +151,7 @@ def describe_composition(counts) -> str:
 
 def resume_needed(core):
     """The current boot still owes a managed handoff after leaving Standalone."""
-    state = processes.read(core.paths)
-    return state["active"] == "legacy" and state.get("resume_managed") is True
+    return processes.resume_requested(processes.read(core.paths))
 
 
 def needed(core, config, *, resume=False):
@@ -381,7 +380,7 @@ def finish(core, applier, prepared):
                 processes.write(core.paths, state)
                 _abort_locked(core, prepared)
             return outcome
-        resumed = state["active"] == "legacy" and state.get("resume_managed") is True
+        resumed = processes.resume_requested(state)
         _promote(core, state, prepared.config)
         core.paths.singbox_pending_file.unlink(missing_ok=True)
         if resumed:
