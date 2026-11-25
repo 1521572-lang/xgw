@@ -62,3 +62,37 @@ def test_monitor_distinguishes_measured_zero_from_unavailable_counters(tmp_path)
     assert summarize(tmp_path, row(100, None), row(120, None)) == {
         "samples_with_counters": 0, "by_policy": {},
     }
+
+
+def test_monitor_uses_matching_denominators_for_netlink_delivery(tmp_path):
+    stats = summarize(
+        tmp_path, row(100, sample(95, 8, 6, packet_ids=20)),
+        row(120, sample(115, 15, 34, packet_ids=52)),
+        row(140, sample(135, 15, 36)),
+        row(160, sample(155, 15, 36, packet_ids=60)),
+        row(180, sample(175, 15, 36, packet_ids=68)),
+    )
+    assert stats["by_policy"]["selective/off"]["netlink_delta"] == 30
+    assert stats["netlink_delivery_by_policy"] == {
+        "selective/off": {
+            "intervals": 2, "seconds": 40, "assigned_ids": 40, "failed_delivery": 28,
+            "loss_fraction": 0.7,
+        },
+    }
+
+
+@pytest.mark.parametrize("packet_ids", [True, -1, 40, 51, 1 << 32])
+def test_monitor_excludes_inconsistent_delivery_denominators(tmp_path, packet_ids):
+    stats = summarize(tmp_path, row(100, sample(95, 0, 10, packet_ids=50)),
+                      row(120, sample(115, 0, 12, packet_ids=packet_ids)))
+    assert stats["by_policy"]["selective/off"]["netlink_delta"] == 2
+    assert "netlink_delivery_by_policy" not in stats
+
+
+def test_monitor_no_assigned_ids_means_no_loss_fraction(tmp_path):
+    stats = summarize(tmp_path, row(100, sample(95, 0, 0, packet_ids=0)),
+                      row(120, sample(115, 1, 0, packet_ids=0)))
+    assert stats["netlink_delivery_by_policy"]["selective/off"] == {
+        "intervals": 1, "seconds": 20, "assigned_ids": 0, "failed_delivery": 0,
+        "loss_fraction": None,
+    }

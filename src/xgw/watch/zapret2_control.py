@@ -203,7 +203,8 @@ def _queue_sample(snapshot: dict, unit: str, queue: int | None, key: str, now: f
             or reservation["generation"] != sample["generation"]
             or journal["events"][-1].get("policy_key") != key):
         return None
-    return {**sample, "epoch": journal.get("epoch"), "series": journal.get("queue_series")}
+    return {**sample, "epoch": journal.get("epoch"), "series": journal.get("queue_series"),
+            "packet_ids": journal["queue_counters"].get("packet_ids")}
 
 
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None,

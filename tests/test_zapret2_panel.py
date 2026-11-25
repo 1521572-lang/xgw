@@ -399,6 +399,7 @@ def test_losses_are_fresh_and_bound_to_the_active_policy_and_generation(mode, mo
     assert [result["counters"][name] for name in keys] == [0, 4, 4]
     assert result["evidence"]["queue_loss_sample"] == {
         "epoch": history["epoch"], "series": 1, "at": NOW, "overflow": 0, "netlink": 4,
+        "packet_ids": 24,
     }
     assert "socket:[" not in json.dumps(result)
 
@@ -409,6 +410,10 @@ def test_losses_are_fresh_and_bound_to_the_active_policy_and_generation(mode, mo
     history["queue_series"] = series
 
     sample = history["queue_counters"]
+    packet_ids = sample.pop("packet_ids")
+    old_sample = view(cfg, snap)["evidence"]["queue_loss_sample"]
+    assert old_sample["netlink"] == 4 and "packet_ids" not in old_sample
+    sample["packet_ids"] = packet_ids
     item = history["events"][-1]
     for target, field, value in (
         (sample, "at", NOW - 91), (sample, "netlink", False),

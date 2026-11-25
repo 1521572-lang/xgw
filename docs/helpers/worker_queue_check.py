@@ -243,7 +243,7 @@ def run(folder):
                 slot.observe_owner(lease, True, before)
                 first = client.observation({"zapret2": engine_card(snapshot)})
                 slot.observe_owner(lease, True, after)
-                overflow, netlink, _ = after.counters
+                overflow, netlink, assigned = after.counters
                 event = read()["events"][-1]
                 require(event["phase"] == "queue_drops" and event["generation"] == lease.generation
                         and event["overflow_delta"] == overflow and event["netlink_delta"] == netlink,
@@ -267,9 +267,14 @@ def run(folder):
                     stream.write(json.dumps(row) + "\n")
             observed = client.analyze(journal)["queue_losses"]
             summary = observed["by_policy"].get("off/auto", {})
+            delivery = observed["netlink_delivery_by_policy"]["off/auto"]
             require(observed["samples_with_counters"] == 2 and summary.get("intervals") == 1
                     and summary.get("overflow_delta") == overflow
                     and summary.get("netlink_delta") == netlink, "monitor_drop_delta")
+            require(assigned == (packets if case == "netlink" else 1)
+                    and delivery["intervals"] == 1 and delivery["seconds"] == summary["seconds"]
+                    and delivery["assigned_ids"] == assigned and delivery["failed_delivery"] == netlink
+                    and delivery["loss_fraction"] == netlink / assigned, "monitor_delivery_fraction")
             slot.release(lease)
             print(json.dumps({"case": case, "generation": lease.generation, "sent_attempts": packets,
                               "receive_buffer": receive_buffer, "overflow_delta": overflow,

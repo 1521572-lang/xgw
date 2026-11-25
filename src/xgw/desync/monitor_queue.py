@@ -9,6 +9,7 @@ from .worker import monitor_queue_sample
 
 def queue_losses(rows: list[dict]) -> dict:
     by_policy = defaultdict(Counter)
+    delivery_by_policy = defaultdict(Counter)
     latest_at = -1
     previous_row = previous_sample = None
     samples = 0
@@ -34,6 +35,19 @@ def queue_losses(rows: list[dict]) -> dict:
             if 0 < seconds <= MAX_SAMPLE_GAP_SECONDS and overflow >= 0 and netlink >= 0:
                 by_policy[label].update(intervals=1, seconds=seconds,
                                         overflow_delta=overflow, netlink_delta=netlink)
+                if "packet_ids" in previous_sample and "packet_ids" in sample:
+                    assigned = sample["packet_ids"] - previous_sample["packet_ids"]
+                    # A delivery failure already has an ID. Queue overflow can occur earlier.
+                    if assigned >= netlink:
+                        delivery_by_policy[label].update(intervals=1, seconds=seconds,
+                                                        assigned_ids=assigned, failed_delivery=netlink)
         previous_row, previous_sample = row, sample
-    return {"samples_with_counters": samples,
-            "by_policy": {label: dict(counts) for label, counts in by_policy.items()}}
+    result = {"samples_with_counters": samples,
+              "by_policy": {label: dict(counts) for label, counts in by_policy.items()}}
+    if delivery_by_policy:
+        result["netlink_delivery_by_policy"] = {
+            label: {**counts, "loss_fraction": (counts["failed_delivery"] / counts["assigned_ids"]
+                                               if counts["assigned_ids"] else None)}
+            for label, counts in delivery_by_policy.items()
+        }
+    return result

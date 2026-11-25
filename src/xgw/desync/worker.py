@@ -143,10 +143,10 @@ class WorkerSlot:
                            "elapsed_ms": self._startup_ms}
             counters = None
             if self.lease is not None and self._queue_sample is not None:
-                overflow, netlink, _ = self._queue_sample.counters
+                overflow, netlink, packet_ids = self._queue_sample.counters
                 counters = {
                     **asdict(self.lease), "source": QUEUE_SOURCE, "at": self._queue_at,
-                    "overflow": overflow, "netlink": netlink,
+                    "overflow": overflow, "netlink": netlink, "packet_ids": packet_ids,
                 }
             return self.lease, {
                 "version": 1, "epoch": self._epoch, "last_seq": self._seq,
@@ -225,7 +225,11 @@ def monitor_queue_sample(value: object, now: float) -> dict | None:
             or not all(type(value.get(key)) is int and 0 <= value[key] <= COUNTER_MAX
                        for key in ("overflow", "netlink"))):
         return None
-    return {key: value[key] for key in ("epoch", "series", "at", "overflow", "netlink")}
+    result = {key: value[key] for key in ("epoch", "series", "at", "overflow", "netlink")}
+    packet_ids = value.get("packet_ids")
+    if type(packet_ids) is int and 0 <= packet_ids <= COUNTER_MAX:
+        result["packet_ids"] = packet_ids
+    return result
 
 
 def startup_duration(journal: object, reservation: object, unit: str, queue: int | None,
