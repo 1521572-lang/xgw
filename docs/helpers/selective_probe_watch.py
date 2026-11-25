@@ -14,6 +14,10 @@ from xgw.watch import status
 from xgw.watch.zapret2_control import transport_probes
 
 TCP_FIELDS = ("bytes_sent", "bytes_acked", "bytes_received", "bytes_retrans", "data_segs_in")
+TCP_INFO_OPTIONS = re.compile(
+    r"(?:^|\s)(?:(?:mss|advmss|cwnd|pmtu|segs_in|segs_out):[0-9]+"
+    r"|rto:[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)(?=\s|$)"
+)
 MAX_SOCKETS = 32
 MEDIA_INTERVAL = 3
 MAX_PAIR_SECONDS = 10
@@ -117,13 +121,7 @@ def parse_socket_stats(text, *, include_local_endpoint=False):
         match = re.search(r"(?:^|\s)sk:([a-f0-9]+)(?=\s|$)", details)
         if match is None:
             raise ValueError("missing socket cookie")
-        tcp_info = re.search(r"(?:^|\s)rto:\d+(?=\s|$)", details) is not None
-        metrics = {}
-        for name in TCP_FIELDS:
-            value = re.search(rf"(?:^|\s){name}:(\d+)(?=\s|$)", details)
-            metrics[name] = int(value[1]) if value else (0 if tcp_info else None)
-        retrans = re.search(r"(?:^|\s)retrans:\d+/(\d+)(?=\s|$)", details)
-        metrics["retrans_total"] = int(retrans[1]) if retrans else (0 if tcp_info else None)
+        metrics = _tcp_metrics(details)
         row = {"socket": match[1], "peer_ip": str(peer), "state": state, **metrics}
         if include_local_endpoint:
             row["local_endpoint"] = local
@@ -132,6 +130,20 @@ def parse_socket_stats(text, *, include_local_endpoint=False):
             row["owner_pids"] = sorted({int(pid) for pid in owners})
         sockets.append(row)
     return {"state": "read", "sockets": sockets}
+
+
+def _tcp_metrics(details):
+    present = {}
+    for name in TCP_FIELDS:
+        if field := re.search(rf"(?:^|\s){name}:(\S*)", details):
+            present[name] = int(field[1]) if re.fullmatch(r"[0-9]+", field[1]) else None
+    if field := re.search(r"(?:^|\s)retrans:(\S*)", details):
+        retrans = re.fullmatch(r"[0-9]+/([0-9]+)", field[1])
+        present["retrans_total"] = int(retrans[1]) if retrans else None
+    # ss can suppress rto, and it prints many TCP counters only when they are nonzero.
+    tcp_info = TCP_INFO_OPTIONS.search(details) or any(value is not None for value in present.values())
+    absent = 0 if tcp_info else None
+    return {name: present.get(name, absent) for name in (*TCP_FIELDS, "retrans_total")}
 
 
 def socket_stats(*, owners=False):

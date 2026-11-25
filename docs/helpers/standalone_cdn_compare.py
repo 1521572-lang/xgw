@@ -250,12 +250,18 @@ def direct_evidence(direct, route_verified, queue_snapshots):
     observed_path = bool(route_verified and direct.get("peer")
                          and direct["peer"] == direct.get("actual_peer"))
     if "wan_tcp" in direct:
-        from docs.helpers.cdn_tcp_observation import FIELDS, MAX_WINDOW, TIMING_FIELDS
+        from docs.helpers.cdn_tcp_observation import (
+            FIELDS, MAX_SAMPLES, MAX_WINDOW, POLL_FIELDS, TIMING_FIELDS,
+        )
 
         observed = direct["wan_tcp"]
         if observed_path:
             keys = ("state", "samples", "last_sample_before_end_ms", *FIELDS)
             report["direct_tcp"] = {key: observed[key] for key in keys if key in observed}
+            for key in POLL_FIELDS:
+                value = observed.get(key)
+                if type(value) is int and 0 <= value <= MAX_SAMPLES:
+                    report["direct_tcp"][key] = value
             for key in TIMING_FIELDS:
                 if key in observed:
                     value = observed[key]

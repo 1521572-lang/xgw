@@ -37,6 +37,23 @@ def test_socket_stats_distinguishes_received_data_from_missing_tcp_info(monkeypa
     assert with_endpoint["sockets"][0]["local_endpoint"] == "192.0.2.1:43120"
 
 
+@pytest.mark.parametrize(("details", "expected"), [
+    ("cubic mss:1448 cwnd:1 bytes_sent:3619 bytes_acked:1 bytes_retrans:3102 retrans:1/6",
+     (3619, 1, 0, 3102, 0, 6)),
+    ("bytes_received:4188 data_segs_in:3", (0, 0, 4188, 0, 3, 0)),
+    ("rto:201.75", (0, 0, 0, 0, 0, 0)),
+    ("rto:1.2e+03", (0, 0, 0, 0, 0, 0)),
+    ("rto:200 bytes_acked:unknown bytes_received: retrans:1/",
+     (0, None, None, 0, 0, None)),
+    ("uid:150 ino:99", (None,) * 6),
+])
+def test_ss_counters_are_observable_without_an_integer_rto(details, expected):
+    row, = watch.parse_socket_stats(
+        f"ESTAB 0 0 192.0.2.1:43120 198.51.100.2:443 sk:abc {details}\n",
+    )["sockets"]
+    assert tuple(row[name] for name in (*watch.TCP_FIELDS, "retrans_total")) == expected
+
+
 @pytest.mark.parametrize(("text", "state"), [
     ("", "read"), ("unexpected row\n", "unexpected_format"),
 ])

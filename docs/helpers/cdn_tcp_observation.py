@@ -17,6 +17,7 @@ TIMING_FIELDS = (
     "first_sample_ms", "largest_sample_gap_ms", "first_send_ms", "first_payload_ack_ms",
     "first_receive_ms", "first_retransmit_ms",
 )
+POLL_FIELDS = ("established_polls", "syn_sent_only_polls", "established_polls_without_tcp_info")
 
 
 def read_sockets(peer):
@@ -72,7 +73,9 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
     candidates = set()
     samples = []
     unowned = False
+    established_polls = syn_sent_only_polls = 0
     for observed, listing in observations:
+        established = syn_sent = False
         measured = set()
         for row in listing["sockets"]:
             if (row["socket"] in existing or row["peer_ip"] != peer
@@ -84,18 +87,27 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
             if owners != [pid]:
                 continue
             candidates.add(row["socket"])
+            established |= row["state"] == "ESTAB"
+            syn_sent |= row["state"] == "SYN-SENT"
             if (row["state"] == "ESTAB" and row["socket"] not in measured
                     and all(type(row.get(key)) is int for key in FIELDS)):
                 measured.add(row["socket"])
                 samples.append((observed, row))
+        established_polls += established
+        syn_sent_only_polls += syn_sent and not established
     if len(candidates) > 1:
         return {"state": "ambiguous"}
     if unowned:
         return {"state": "owner_unconfirmed"}
     if not candidates:
         return {"state": "socket_unobserved"}
+    coverage = {
+        "established_polls": established_polls,
+        "syn_sent_only_polls": syn_sent_only_polls,
+        "established_polls_without_tcp_info": established_polls - len(samples),
+    }
     if not samples:
-        return {"state": "tcp_info_unobserved"}
+        return {"state": "tcp_info_unobserved", **coverage}
 
     last_at, counters = samples[-1]
     late_gap = max(0, finished - last_at)
@@ -115,7 +127,7 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, start
         state = "retransmit_without_payload_ack"
     else:
         state = "ack_inconclusive"
-    return {"state": state, **result}
+    return {"state": state, **result, **coverage}
 
 
 def watch_transfer(peer, pid, transfer):

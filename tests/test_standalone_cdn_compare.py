@@ -204,10 +204,13 @@ def test_pair_reports_tcp_only_with_an_observed_direct_route(route):
                           "first_send_ms": 280, "first_payload_ack_ms": 340,
                           "first_receive_ms": None, "first_retransmit_ms": "private",
                           "largest_sample_gap_ms": 99999, "first_sample_ms": True,
+                          "established_polls": 23, "syn_sent_only_polls": 70,
+                          "established_polls_without_tcp_info": 0,
                           "cookie": "private"}}
     result = cdn.evaluate_pair(direct, {}, {"state": route, "group": "zapret2"}, {})
     expected = ({"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518,
-                 "first_send_ms": 280, "first_payload_ack_ms": 340, "first_receive_ms": None}
+                 "first_send_ms": 280, "first_payload_ack_ms": 340, "first_receive_ms": None,
+                 "established_polls": 23, "established_polls_without_tcp_info": 0}
                 if route == "observed" else {"state": "path_unconfirmed"})
     assert result["direct_tcp"] == expected
 

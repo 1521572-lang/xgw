@@ -86,6 +86,18 @@ def test_duplicate_rows_in_one_poll_do_not_supply_multiple_tcp_observations():
     assert result["state"] == "insufficient_coverage" and result["samples"] == 1
     assert result["largest_sample_gap_ms"] is None
     assert result["first_receive_ms"] is None and result["first_retransmit_ms"] is None
+    assert result["established_polls"] == 1
+
+
+def test_tcp_coverage_distinguishes_syn_sent_from_established_without_tcp_info():
+    incomplete = socket_row(bytes_acked=None)
+    result = tcp.summarize(
+        listing(), [(8, listing(socket_row(state="SYN-SENT"))),
+                    (9, listing(incomplete, incomplete))],
+        peer=PEER, pid=PID, finished=10, tls_timeout=True,
+    )
+    assert result == {"state": "tcp_info_unobserved", "established_polls": 1,
+                      "syn_sent_only_polls": 1, "established_polls_without_tcp_info": 1}
 
 
 def test_tcp_sampler_uses_only_one_marked_peer_and_keeps_transfer_when_unavailable(monkeypatch):
