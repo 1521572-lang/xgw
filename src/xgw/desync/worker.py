@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -61,6 +62,7 @@ class WorkerSlot:
         self._fault_checked = False
         self._queue_sample: QueueOwner | None = None
         self._queue_at = 0.0
+        self._queue_series = 0
         self._events: deque[dict] = deque(maxlen=EVENT_LIMIT)
 
     def reserve(self, unit: str, queue: int, *, policy_key: str | None = None) -> Lease:
@@ -99,6 +101,8 @@ class WorkerSlot:
                 netlink = owner.counters[1] - previous.counters[1]
                 if overflow or netlink:
                     self._event("queue_drops", lease, overflow_delta=overflow, netlink_delta=netlink)
+            else:
+                self._queue_series += 1
             return verified
 
     def log_property(self, lease: Lease) -> str:
@@ -148,7 +152,7 @@ class WorkerSlot:
                 "version": 1, "epoch": self._epoch, "last_seq": self._seq,
                 "discarded": self._seq - len(self._events),
                 "events": [dict(event) for event in self._events],
-                "queue_counters": counters, "startup": startup,
+                "queue_counters": counters, "queue_series": self._queue_series, "startup": startup,
             }
 
 
@@ -208,6 +212,20 @@ def current_queue_counters(journal: object, now: float) -> dict | None:
                        for key in ("overflow", "netlink"))):
         return None
     return {key: value[key] for key in COUNTER_FIELDS}
+
+
+def monitor_queue_sample(value: object, now: float) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    epoch, series, at = value.get("epoch"), value.get("series"), value.get("at")
+    if (not isinstance(epoch, str) or re.fullmatch("[0-9a-f]{32}", epoch) is None
+            or type(series) is not int or not 1 <= series < 1 << 63
+            or type(at) not in (int, float) or not 0 < at <= now
+            or now - at > QUEUE_FRESH_SECONDS
+            or not all(type(value.get(key)) is int and 0 <= value[key] <= COUNTER_MAX
+                       for key in ("overflow", "netlink"))):
+        return None
+    return {key: value[key] for key in ("epoch", "series", "at", "overflow", "netlink")}
 
 
 def startup_duration(journal: object, reservation: object, unit: str, queue: int | None,

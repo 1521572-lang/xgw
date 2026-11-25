@@ -181,14 +181,18 @@ def test_queue_counters_record_only_deltas_with_continuous_owner():
     assert sample("first", 8, 12, 50)  # first observation is a baseline
     assert sample("first", 8, 12, 54)  # incoming packets, no drops
     assert sample("first", 10, 15, 60)
+    assert slot.snapshot()[1]["queue_series"] == 1
     assert sample("next", 35, 45, 100)  # socket changed
+    assert slot.snapshot()[1]["queue_series"] == 2
     assert sample("next", 36, 45, 3)  # sequence reset at the same socket
+    assert slot.snapshot()[1]["queue_series"] == 3
     assert sample("next", 36, 49, 6)
     assert sample("next", 0, 0, 8)  # overflow or reset; no fabricated counter wrap
     assert not slot.observe_owner(lease, False)
     assert slot.snapshot()[1]["queue_counters"] is None
     assert sample("next", 10, 10, 1000)  # fresh baseline after loss
     view = slot.snapshot()[1]
+    assert view["queue_series"] == 5
     assert view["queue_counters"]["generation"] == lease.generation
     assert view["queue_counters"]["overflow"] == view["queue_counters"]["netlink"] == 10
     events = view["events"]

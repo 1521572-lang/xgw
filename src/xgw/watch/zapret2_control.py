@@ -192,7 +192,7 @@ def transport_failure_detail(reason: str, probes: dict) -> str:
     return REASONS[reason]
 
 
-def _queue_losses(snapshot: dict, unit: str, queue: int | None, key: str, now: float) -> dict:
+def _queue_sample(snapshot: dict, unit: str, queue: int | None, key: str, now: float) -> dict | None:
     journal = snapshot.get("zapret2_worker_events")
     sample = worker.current_queue_counters(journal, now)
     reservation = _record(snapshot.get("zapret2_reservation"))
@@ -202,9 +202,8 @@ def _queue_losses(snapshot: dict, unit: str, queue: int | None, key: str, now: f
             or type(reservation.get("generation")) is not int
             or reservation["generation"] != sample["generation"]
             or journal["events"][-1].get("policy_key") != key):
-        return {}
-    return {"queue_overflow": sample["overflow"], "queue_netlink_dropped": sample["netlink"],
-            "queue_dropped": sample["overflow"] + sample["netlink"]}
+        return None
+    return {**sample, "epoch": journal.get("epoch"), "series": journal.get("queue_series")}
 
 
 def card(cfg, snapshot: dict, capture: dict, daemon_ready: bool, *, now=None,
@@ -314,9 +313,13 @@ Commands use the same validation as this card; observations remain revision-boun
     counters = {"queued_original": None, "queued_reply": None, "queue_dropped": None,
                 "queue_overflow": None, "queue_netlink_dropped": None, "strategy_switches": None}
     worker_start_ms = None
+    queue_loss_sample = None
     if trusted and phase == "active":
         unit = worker.SELECTED_UNIT if source == "selected" else worker.ENGINE_UNIT
-        counters.update(_queue_losses(snapshot, unit, queue, key, now))
+        if sample := _queue_sample(snapshot, unit, queue, key, now):
+            counters.update(queue_overflow=sample["overflow"], queue_netlink_dropped=sample["netlink"],
+                            queue_dropped=sample["overflow"] + sample["netlink"])
+            queue_loss_sample = worker.monitor_queue_sample(sample, now)
         worker_start_ms = worker.startup_duration(
             snapshot.get("zapret2_worker_events"), snapshot.get("zapret2_reservation"),
             unit, queue, key,
@@ -412,6 +415,7 @@ Commands use the same validation as this card; observations remain revision-boun
         "counters": counters,
         "evidence": {"transport": transport, "playback": "not_tested",
                      "worker_start_ms": worker_start_ms,
+                     "queue_loss_sample": queue_loss_sample,
                      "transport_probes": transport_rows,
                      "last_transport_ok_at": last_transport_ok_at,
                      "vpn_control": vpn_control, "vpn_control_reason": vpn_control_reason,

@@ -19,7 +19,9 @@ from .monitor_policy import policy_changes, policy_label
 from .monitor_probes import (
     MAX_SAMPLE_GAP_SECONDS, exact_range_verified, matched_policy, probe_summary, vpn_probe_attempts,
 )
+from .monitor_queue import queue_losses
 from .monitor_recovery import recovery_summary, valid_status_time
+from .worker import monitor_queue_sample
 
 MATRIX_PHASES = ("policy_apply", "outcome_wait", "off_confirm", "worker_start")
 
@@ -92,6 +94,7 @@ def observation(state):
     traffic = summary.get("traffic") or {}
     now = time.time()
     observed = card.get("observed_at")
+    queue_sample = monitor_queue_sample(evidence.get("queue_loss_sample"), now)
     return {
         "at": now, "utc_day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "health": state.get("state"), "updated": state.get("updated"),
@@ -108,6 +111,7 @@ def observation(state):
         "pool_mode": pool.get("mode"), "pool_closed": traffic.get("closed"),
         **({"observed_at": observed} if valid_status_time(observed, now) else {}),
         **_observed_cdn_deadline(card),
+        **({"queue_loss_sample": queue_sample} if queue_sample is not None else {}),
         "probes": {name: {k: row[k] for k in ("ok", "phase", "kind", "elapsed_ms",
                                              "http", "bytes", "started_at", "first_tls_timeout_ms",
                                              "range_verified")
@@ -233,6 +237,7 @@ def analyze(path):
         "cdn_expiry": cdn_expiry_summary(rows),
         "selected_recovery": recovery_summary(rows),
         "policy_changes": policy_changes(rows),
+        "queue_losses": queue_losses(rows),
         "policy_state_intervals": {
             "seconds_by_policy_and_state": {mode: dict(states)
                                             for mode, states in seconds_by_policy_and_state.items()},

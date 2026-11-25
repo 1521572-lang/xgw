@@ -110,7 +110,7 @@ def overflow_samples(sample):
 def run(folder):
     sys.path.insert(0, str(folder / "src"))
     from xgw.config import Config
-    from xgw.desync import event_socket, worker
+    from xgw.desync import client, event_socket, worker
     from xgw.watch.zapret2_control import card
 
     status = folder / "status.json"
@@ -200,36 +200,55 @@ def run(folder):
         cfg.zapret2.engine = "auto"
         key = worker.policy_revision(cfg.zapret2)
         lease = slot.reserve(worker.ENGINE_UNIT, QUEUE, policy_key=key)
+        snapshot = {
+            "daemon": True, "zapret2_policy_key": key, "zapret2_reservation": asdict(lease),
+            "capture": {"loaded": True, "nfqws2": {
+                "state": "active", "profile": "seqovl", "queue": QUEUE,
+            }},
+        }
+
+        def engine_card():
+            snapshot["updated"] = time.time()
+            snapshot["zapret2_worker_events"] = slot.snapshot()[1]
+            return card(cfg, snapshot, {"mode": "on"}, True)
+
         with overflow_samples(
             lambda: worker.owner_sample(lambda *_a, **_kw: str(os.getpid()), lease.unit, QUEUE),
         ) as (before, after):
             slot.observe_owner(lease, True, before)
+            first = client.observation({"zapret2": engine_card()})
             slot.observe_owner(lease, True, after)
             reply = read()
             event = reply["events"][-1]
             require(event["phase"] == "queue_drops" and event["generation"] == lease.generation
                     and event["overflow_delta"] == PACKETS - 1 and event["netlink_delta"] == 0,
                     "overflow_event")
-            snapshot = {
-                "daemon": True, "updated": time.time(), "zapret2_policy_key": key,
-                "zapret2_reservation": asdict(lease), "zapret2_worker_events": slot.snapshot()[1],
-                "capture": {"loaded": True, "nfqws2": {
-                    "state": "active", "profile": "seqovl", "queue": QUEUE,
-                }},
-            }
-            losses = card(cfg, snapshot, {"mode": "on"}, True)["counters"]
+            current = engine_card()
+            losses = current["counters"]
             require(losses["queue_overflow"] == PACKETS - 1 and losses["queue_netlink_dropped"] == 0
                     and losses["queue_dropped"] == PACKETS - 1, "overflow_panel_projection")
+            last = client.observation({"zapret2": current})
         require(not worker.occupied(QUEUE), "overflow_listener_still_present")
         slot.observe_owner(lease, False)
-        snapshot["zapret2_worker_events"] = slot.snapshot()[1]
-        require(read()["queue_counters"] is None and
-                card(cfg, snapshot, {"mode": "on"}, True)["counters"]["queue_dropped"] is None,
+        current = engine_card()
+        require(read()["queue_counters"] is None and current["counters"]["queue_dropped"] is None,
                 "overflow_cleared_after_close")
+        missing = client.observation({"zapret2": current})
+        require("queue_loss_sample" not in missing, "monitor_listener_loss")
+        journal = folder / "queue-monitor.jsonl"
+        with journal.open("x", encoding="utf-8") as stream:
+            for row in (first, last, missing):
+                stream.write(json.dumps(row) + "\n")
+        observed = client.analyze(journal)["queue_losses"]
+        summary = observed["by_policy"].get("off/auto", {})
+        require(observed["samples_with_counters"] == 2 and summary.get("intervals") == 1
+                and summary.get("overflow_delta") == PACKETS - 1 and summary.get("netlink_delta") == 0,
+                "monitor_overflow_delta")
         slot.release(lease)
         print(json.dumps({"generation": lease.generation, "sent_attempts": PACKETS,
                           "overflow_delta": PACKETS - 1, "netlink_delta": 0,
-                          "panel_projection": "ok", "after_listener_loss": None}), flush=True)
+                          "panel_projection": "ok", "after_listener_loss": None,
+                          "monitor_losses": observed}), flush=True)
     finally:
         ending.set()
         service.join(timeout=3)

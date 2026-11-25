@@ -397,7 +397,16 @@ def test_losses_are_fresh_and_bound_to_the_active_policy_and_generation(mode, mo
     result = view(cfg, snap)
     keys = ("queue_overflow", "queue_netlink_dropped", "queue_dropped")
     assert [result["counters"][name] for name in keys] == [0, 4, 4]
+    assert result["evidence"]["queue_loss_sample"] == {
+        "epoch": history["epoch"], "series": 1, "at": NOW, "overflow": 0, "netlink": 4,
+    }
     assert "socket:[" not in json.dumps(result)
+
+    series = history.pop("queue_series")
+    previous = view(cfg, snap)
+    assert previous["evidence"]["queue_loss_sample"] is None
+    assert previous["counters"]["queue_dropped"] == 4
+    history["queue_series"] = series
 
     sample = history["queue_counters"]
     item = history["events"][-1]
@@ -410,7 +419,9 @@ def test_losses_are_fresh_and_bound_to_the_active_policy_and_generation(mode, mo
     ):
         original = target[field]
         target[field] = value
-        assert [view(cfg, snap)["counters"][name] for name in keys] == [None] * 3
+        invalid = view(cfg, snap)
+        assert [invalid["counters"][name] for name in keys] == [None] * 3
+        assert invalid["evidence"]["queue_loss_sample"] is None
         target[field] = original
 
     del snap["zapret2_worker_events"]

@@ -21,7 +21,7 @@ PORTABLE_TESTS = {"test_desync_schema.py", "test_zapret2_panel.py", "test_geodat
                   "test_selective_probe_watch.py", "test_desync_jobs.py",
                   "test_desync_monitor_budget.py", "test_desync_monitor_expiry.py",
                   "test_desync_monitor_recovery.py",
-                  "test_desync_monitor_policy.py",
+                  "test_desync_monitor_policy.py", "test_desync_monitor_queue.py",
                   "test_desync_vpn_control.py", "test_desync_lan_control.py",
                   "test_selective_admission.py", "test_standalone_cdn_compare.py",
                   "test_acceptance_gate.py"}

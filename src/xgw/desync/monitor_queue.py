@@ -1,0 +1,39 @@
+"""Summarize changes in kernel queue counters across contiguous observations."""
+
+from collections import Counter, defaultdict
+
+from .monitor_policy import policy_label
+from .monitor_probes import MAX_SAMPLE_GAP_SECONDS, matched_policy
+from .worker import monitor_queue_sample
+
+
+def queue_losses(rows: list[dict]) -> dict:
+    by_policy = defaultdict(Counter)
+    latest_at = -1
+    previous_row = previous_sample = None
+    samples = 0
+    for row in rows:
+        at = row["at"]
+        if at <= latest_at:
+            previous_row = previous_sample = None
+            continue
+        latest_at = at
+        label = policy_label(row)
+        sample = (monitor_queue_sample(row.get("queue_loss_sample"), at)
+                  if label and row.get("state") == "active" and matched_policy(row, row) else None)
+        if sample is not None:
+            samples += 1
+        if (sample is not None and previous_sample is not None
+                and at - previous_row["at"] <= MAX_SAMPLE_GAP_SECONDS
+                and label == policy_label(previous_row) and matched_policy(previous_row, row)
+                and (sample["epoch"], sample["series"]) ==
+                (previous_sample["epoch"], previous_sample["series"])):
+            seconds = sample["at"] - previous_sample["at"]
+            overflow = sample["overflow"] - previous_sample["overflow"]
+            netlink = sample["netlink"] - previous_sample["netlink"]
+            if 0 < seconds <= MAX_SAMPLE_GAP_SECONDS and overflow >= 0 and netlink >= 0:
+                by_policy[label].update(intervals=1, seconds=seconds,
+                                        overflow_delta=overflow, netlink_delta=netlink)
+        previous_row, previous_sample = row, sample
+    return {"samples_with_counters": samples,
+            "by_policy": {label: dict(counts) for label, counts in by_policy.items()}}
