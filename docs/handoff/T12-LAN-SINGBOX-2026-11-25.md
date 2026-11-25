@@ -1,25 +1,28 @@
-# ThinkCentre · HTTPS через мост sing-box, разделение запросов, r2
+# ThinkCentre · HTTPS через мост под штатным UID sing-box, r3
 
 **Ubuntu 24.04 LTS.** Flash сама выполняет готовые команды и публикует
 обезличенный отчёт при любом исходе. При недоступности терминала,
 sudo, pytest, установленного ядра или GitHub запроси доступ. Остальные
 фазы выполни независимо. Код и тесты подготовлены Codex.
 
-[Отчёт первого прогона](../reports/2026-11-24T233700Z_t12-lan-singbox.md)
-подтвердил 35 контрактов, чтение конфигурации и HTTPS через нативный Xray.
-Клиент sing-box получил таймаут. В серверном журнале наблюдался порт 8080,
-который использует и фоновый HTTP-контроль стенда. В r2 адрес TLS-источника
-отличается от адреса фоновой пробы, а точный сокет LAN фиксируется даже
-при таймауте. Дополнительный HTTPS-запрос через закреплённый вход моста
-проверяет тот же TLS-источник. Правила действующего шлюза при этом не меняются.
+[Отчёт r2](../reports/2026-11-25T001317Z_t12-lan-singbox-r2.md) подтвердил
+порт 443 и маршрут клиента до моста. На стенде собственный UDP туннеля
+снова попал в `tproxy-in`. Стендовая служба запускала sing-box от root,
+а штатный выход из перехвата применяется к UID `xgw-singbox`. Для r3
+тест запускает временный процесс моста от штатного UID и GID, без
+capabilities и с `NoNewPrivileges`. Приёмка проверяет оба HTTPS-сеанса,
+серверный dial и отсутствие повторного захвата UDP. Правила действующего
+шлюза в этом проходе не меняются.
 
 ## Запуск
 
 Начни из обычной рабочей копии. При необходимости задай интерпретатор
 с pytest через `XGW_TEST_PYTHON` и пройди `sudo -v`. Если ядра уже
 установлены в нестандартных местах, укажи абсолютные пути через
-`XGW_TEST_XRAY` и `XGW_TEST_SINGBOX`. При отсутствии sing-box запиши
-пропуск сценария моста и выполни остальные фазы. Стенд использует
+`XGW_TEST_XRAY` и `XGW_TEST_SINGBOX`. Для сценария моста также нужны
+`setpriv`, `ss` и установленные учётная запись и группа `xgw-singbox`.
+При отсутствии зависимости укажи пропуск и выполни остальные фазы.
+Стенд использует
 изолированные процессы и короткий `--basetemp` в своём `/run`.
 Каталог `kernel-private` открывается для стенда внутри его mount namespace,
 поэтому диагностические файлы сохраняются при выходе из пространства.
@@ -31,7 +34,7 @@ umask 077
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $EUID != 0 ]]
 BR=integration/zapret2-batch1
-CODE=1fc6065b831f06e3190044ae22346444db9a956e
+CODE=c814b1589d0e392c331d8ca1de0d044e83d38f40
 REPO=$(git rev-parse --show-toplevel)
 PY=/usr/bin/python3
 TEST_PY=${XGW_TEST_PYTHON:-$PY}
@@ -126,15 +129,15 @@ BASH
   конфигурации нет моста, зафиксируй причину и число участников.
   `available` означает подходящую конфигурацию, доступность внешней сети
   подтверждается отдельным запросом. PREVIEW таких запросов не делает.
-- **KERNEL** — отдельный результат для `[xray]` и `[sing-box]`. В обоих
-  случаях ожидается HTTP 200 с проверкой сертификата, точный сокет в
-  `tproxy-in`, доступный пробный вход и своя категория выхода. Если LAN
-  всё ещё падает, запиши `lan`, `tproxy_destination_ports`, `bridge_lan`,
-  `pinned_bridge` и `bridge_pinned` из структурированного вывода. Отдельно
-  укажи, был ли dial `trace_443`, `trace_other_port` либо `health_8080`.
-  Последняя категория относится к адресу фоновой проверки. При отсутствии
-  признака укажи неопределённость, не подставляй исход по общему счётчику.
-  При необходимости из сохранённых журналов сверь этап и формат строки.
+- **KERNEL** — результаты `[xray]` и `[sing-box]`. В обоих ожидаются
+  HTTP 200 с проверкой сертификата, точный сокет в `tproxy-in`, порт 443
+  и соответствующая категория выхода. Для sing-box укажи `BRIDGE_IDENTITY`, `BRIDGE_OUTPUT_RULE`,
+  `bridge_udp_recaptured`, `pinned_bridge`, `bridge_lan`, `bridge_pinned`.
+  Ожидается ноль повторно захваченных UDP-сеансов и HTTPS через
+  закреплённый вход. Серверный dial сверить по `trace_443` или сохранённой
+  записи подтверждённого запроса. `health_8080` указывает на фоновый адрес.
+  При сбое зафиксируй первый неподтверждённый этап и приложи только метки
+  и агрегаты. При отсутствии признака оставь этап открытым.
 - **Шлюз** — снимки до и после и категории отличий. Живой проход LAN
   остаётся открытым до получения доступа к отдельному устройству.
   Живая проверка sing-box ждёт рабочего участника через мост.
@@ -154,17 +157,17 @@ REPORT_SRC=$1
 BR=integration/zapret2-batch1
 [[ $REPORT_SRC == /* && -s $REPORT_SRC ]]
 REPO=$(git rev-parse --show-toplevel)
-PUB=$(mktemp -d "$HOME/xgw-t12-lan-singbox-r2-report.XXXXXXXX")
+PUB=$(mktemp -d "$HOME/xgw-t12-lan-singbox-r3-report.XXXXXXXX")
 git -C "$REPO" fetch origin "$BR"
 git -C "$REPO" worktree add --detach "$PUB/repo" FETCH_HEAD
 trap 'git -C "$REPO" worktree remove "$PUB/repo" && rmdir -- "$PUB"' EXIT
 cd "$PUB/repo"
-REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_t12-lan-singbox-r2.md"
+REPORT="docs/reports/$(date -u +%Y-%m-%dT%H%M%SZ)_t12-lan-singbox-r3.md"
 test ! -e "$REPORT"
 install -m 0644 -- "$REPORT_SRC" "$REPORT"
 git add -- "$REPORT"
 git diff --cached --check
-git commit -m 'Report ThinkCentre separated LAN HTTPS and sing-box probe evidence'
+git commit -m 'Report ThinkCentre LAN bridge under the sing-box service identity'
 if ! git push origin "HEAD:refs/heads/$BR"; then
   git fetch origin "$BR"
   git rebase FETCH_HEAD
