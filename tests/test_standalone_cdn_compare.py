@@ -229,3 +229,15 @@ def test_queue_comparison_is_published_only_for_the_observed_direct_peer(monkeyp
     direct["actual_peer"] = "8.8.8.8"
     after = cdn.evaluate_pair(direct, {}, route, {}, queue_snapshots=snapshots)
     assert after["direct_queue"] == {"state": "path_unconfirmed"}
+
+
+def test_direct_report_preserves_redirect_and_tcp_without_a_vpn_sample():
+    direct = {"peer": "1.1.1.1", "actual_peer": "1.1.1.1", "url_sha256": "private",
+              "outcome": "http_redirect", "status": 302,
+              "wan_tcp": {"state": "tcp_data_received", "bytes_received": 4188}}
+    result = cdn.evaluate_direct(direct, {"state": "observed", "group": "zapret2"})
+    assert result["state"] == "direct_observed"
+    assert result["direct"]["status"] == 302 and result["direct"]["outcome"] == "http_redirect"
+    assert result["direct_route_verified"] and not result["direct_range_verified"]
+    assert result["direct_tcp"] == direct["wan_tcp"]
+    assert "private" not in repr(result) and "1.1.1.1" not in repr(result)

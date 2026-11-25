@@ -218,16 +218,22 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None)
     else:
         state = "pair_verified"
     report = {"state": state, "same_target": comparable, "same_connected_peer": same_peer,
-              "direct_route_verified": direct_group == "zapret2",
               "vpn_route_verified": vpn_group in ("xray", "sing-box"),
-              "direct_range_verified": direct_ok, "vpn_range_verified": vpn_ok,
+              "vpn_range_verified": vpn_ok,
               "vpn_attempt": "retry" if control is not vpn else "first"}
+    return {**report, **direct_evidence(direct, direct_group == "zapret2", queue_snapshots)}
+
+
+def direct_evidence(direct, route_verified, queue_snapshots):
+    report = {"direct_route_verified": route_verified,
+              "direct_range_verified": range_verified(direct)}
+    observed_path = bool(route_verified and direct.get("peer")
+                         and direct["peer"] == direct.get("actual_peer"))
     if "wan_tcp" in direct:
         from docs.helpers.cdn_tcp_observation import FIELDS, MAX_WINDOW, TIMING_FIELDS
 
         observed = direct["wan_tcp"]
-        if (direct_group == "zapret2" and direct.get("peer")
-                and direct.get("actual_peer") == direct["peer"]):
+        if observed_path:
             keys = ("state", "samples", "last_sample_before_end_ms", *FIELDS)
             report["direct_tcp"] = {key: observed[key] for key in keys if key in observed}
             for key in TIMING_FIELDS:
@@ -240,12 +246,18 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None)
     if queue_snapshots is not None:
         from docs.helpers.cdn_queue_observation import summarize
 
-        if (direct_group == "zapret2" and direct.get("peer")
-                and direct.get("peer") == direct.get("actual_peer")):
+        if observed_path:
             report["direct_queue"] = summarize(*queue_snapshots, direct)
         else:
             report["direct_queue"] = {"state": "path_unconfirmed"}
     return report
+
+
+def evaluate_direct(direct, route, *, queue_snapshots=None):
+    verified = route.get("state") == "observed" and route.get("group") == "zapret2"
+    return {"state": "direct_observed" if direct else "direct_unavailable",
+            "direct": public_sample(direct),
+            **direct_evidence(direct, verified, queue_snapshots)}
 
 
 def page_sample():
@@ -318,8 +330,12 @@ def main():
     decision = commands.add_parser("evaluate")
     for name in ("direct", "vpn", "direct_route", "vpn_route"):
         decision.add_argument(name, type=Path)
-    decision.add_argument("--queue-before", type=Path)
-    decision.add_argument("--queue-after", type=Path)
+    direct = commands.add_parser("evaluate-direct")
+    direct.add_argument("direct", type=Path)
+    direct.add_argument("direct_route", type=Path)
+    for command in (decision, direct):
+        command.add_argument("--queue-before", type=Path)
+        command.add_argument("--queue-after", type=Path)
     commands.add_parser("page")
     summary = commands.add_parser("compare")
     summary.add_argument("direct", type=Path)
@@ -340,20 +356,21 @@ def main():
     elif args.action == "prepare":
         record = prepare_pair(args.source, args.output)
         ok = record["state"] == "vpn_range_verified"
-    elif args.action == "evaluate":
+    elif args.action in ("evaluate", "evaluate-direct"):
         if bool(args.queue_before) != bool(args.queue_after):
             parser.error("--queue-before and --queue-after must be supplied together")
         snapshots = ((read_sample(args.queue_before), read_sample(args.queue_after))
                      if args.queue_before is not None else None)
         try:
-            record = evaluate_pair(
-                read_sample(args.direct), read_sample(args.vpn),
-                read_sample(args.direct_route), read_sample(args.vpn_route),
-                queue_snapshots=snapshots,
-            )
+            direct_record, direct_route = read_sample(args.direct), read_sample(args.direct_route)
+            if args.action == "evaluate-direct":
+                record = evaluate_direct(direct_record, direct_route, queue_snapshots=snapshots)
+            else:
+                record = evaluate_pair(direct_record, read_sample(args.vpn), direct_route,
+                                       read_sample(args.vpn_route), queue_snapshots=snapshots)
         except (TypeError, AttributeError):
             record = {"state": "invalid_evidence"}
-        ok = record["state"] == "pair_verified"
+        ok = record["state"] in ("pair_verified", "direct_observed")
     elif args.action == "page":
         try:
             record = page_sample()

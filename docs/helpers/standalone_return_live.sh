@@ -190,6 +190,11 @@ queue_snapshot() {
     -m docs.helpers.cdn_queue_observation
 }
 
+exit_snapshot() {
+  sudo -n timeout -k 1 4 env "PYTHONPATH=$D/tree:$D/tree/src" "$PY" -B -P \
+    -m docs.helpers.standalone_exit_evidence
+}
+
 sample_cdn() {
   local deadline=$1
   shift
@@ -343,6 +348,7 @@ if [[ $MODE != resume ]]; then
   run standalone-on timeout -k 3 190 "$PY" -B -P -m docs.helpers.selective_admission \
     standalone "$D/standalone-receipt" --strategy "$strategy"
   run standalone-paused topology paused 30
+  direct_route_observed=0
   if [[ $MODE == cdn* ]]; then
     run direct-revision-before timeout -k 2 12 "$PY" -B -P -m docs.helpers.selective_admission \
       check-standalone "$D/standalone-receipt"
@@ -378,11 +384,23 @@ if [[ $MODE != resume ]]; then
     else
       direct_revision=unconfirmed
     fi
+    if [[ $MODE == cdn-pair && -n $format ]]; then
+      if [[ $direct_revision == confirmed ]] &&
+         run direct-route route_observation direct "$direct_begin" "$direct_end"; then
+        direct_route_observed=1
+      fi
+      run direct-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate-direct \
+        "$D/direct-cdn.out" "$D/direct-route.out" \
+        --queue-before "$D/direct-queue-before.out" --queue-after "$D/direct-queue-after.out" || true
+    fi
   fi
   RETURN_STARTED=$(date +%s)
-  run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
-    off "$D/standalone-receipt"
-  run returned-off wait_off
+  if ! run standalone-off timeout -k 3 70 "$PY" -B -P -m docs.helpers.selective_admission \
+      off "$D/standalone-receipt" || ! run returned-off wait_off; then
+    run off-daemon exit_snapshot || true
+    run off-topology topology observed 1 || true
+    exit 2
+  fi
   run returned-vpn vpn_check
   sudo -n touch "$BACKUP/off-confirmed"
   if [[ $MODE == cdn* && -n $format ]]; then
@@ -396,7 +414,9 @@ if [[ $MODE != resume ]]; then
     run cdn-comparison "$PY" -B -P -m docs.helpers.standalone_cdn_compare compare \
       "$D/direct-cdn.out" "$D/off-cdn.out" "$origin"
     cat "$D/cdn-comparison.out"
-    run direct-route route_observation direct "$direct_begin" "$direct_end" || true
+    if [[ $direct_route_observed == 0 ]]; then
+      run direct-route route_observation direct "$direct_begin" "$direct_end" || true
+    fi
     run off-route route_observation off "$off_begin" "$off_end" || true
     if [[ $MODE == cdn-pair && $direct_revision == confirmed ]]; then
       run pair-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate \
