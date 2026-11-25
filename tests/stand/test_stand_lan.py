@@ -13,15 +13,19 @@ Xray; адрес WAN шлюза (5.5.5.2) — ушёл напрямую, с ма
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
 import sys
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import netns
 import pytest
@@ -58,7 +62,9 @@ def gateway(tmp_path, request):
         pytest.skip("нет установленного XGW_SINGBOX_BIN для проверки моста")
     stand = Stand(tmp_path, Path(XRAY_BIN), mode="netns",
                   singbox_bin=Path(SINGBOX_BIN) if bridge else None)
-    try:
+    with ExitStack() as stack:
+        stack.callback(stand.stop)
+        bridge_uid = None
         tls_hosts = {lan_control.TRACE_HOST: TLS_PEER} if hasattr(request, "param") else None
         stand.start(dns_hosts=tls_hosts)
         if tls_hosts:
@@ -67,14 +73,74 @@ def gateway(tmp_path, request):
         if bridge:
             stand.add_singbox_server("hk", "hysteria2")
             stand.up(names=("hk",), capture=True, max_members=1)
+            bridge_uid = stack.enter_context(_run_bridge_as_service_user(stand))
         else:
             stand.up(capture=True)
         enabled = stand.xgw("enable")
         assert enabled.returncode == 0, enabled.stderr
         assert "перехват включён" in enabled.stdout and "внимание" not in enabled.stdout
+        if bridge_uid is not None:
+            rules = stand.gw_run("nft", "-n", "list", "chain", "ip", "xgw", "output")
+            assert re.search(rf'meta skuid (?:{bridge_uid}|"?xgw-singbox"?) return\b', rules)
+            print("BRIDGE_OUTPUT_RULE dedicated_uid_return=true")
         yield stand
-    finally:
-        stand.stop()
+
+
+@contextmanager
+def _run_bridge_as_service_user(stand):
+    """Use the real service identity in the isolated capture namespace."""
+    if not shutil.which("setpriv"):
+        pytest.skip("для запуска моста от xgw-singbox нужен setpriv")
+    try:
+        uid = pwd.getpwnam("xgw-singbox").pw_uid
+        gid = grp.getgrnam("xgw-singbox").gr_gid
+    except KeyError:
+        pytest.skip("нет штатной учётной записи xgw-singbox")
+    assert uid > 0 and gid > 0
+    applied = stand.root / "etc/xgw/sing-box/config.json"
+    cfg = json.loads(applied.read_bytes())
+    ports = [inbound["listen_port"] for inbound in cfg["inbounds"]]
+    assert ports
+    cfg["log"] = {"level": "info"}
+    with TemporaryDirectory(prefix="xgw-lan-sb-", dir="/run") as directory:
+        root = Path(directory)
+        path = root / "config.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        os.chown(path, 0, gid)
+        path.chmod(0o640)
+        os.chown(root, 0, gid)
+        root.chmod(0o710)
+        stand.singbox_service().stop()
+        child = stand.gw_popen("bridge-core", [
+            "setpriv", "--reuid", str(uid), "--regid", str(gid), "--clear-groups",
+            "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+            str(stand.singbox_bin), "--disable-color", "run", "-c", str(path),
+        ])
+        try:
+            def listening():
+                if child.poll() is not None:
+                    pytest.fail("изолированный мост завершился до открытия пробных портов")
+                return all(stand.gw_run("ss", "-Hln", "sport", "=", f":{port}").strip()
+                           for port in ports)
+
+            assert wait_for(listening, 5), "изолированный мост не открыл пробные порты"
+            status = Path(f"/proc/{child.pid}/status").read_text(encoding="ascii")
+            values = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+            assert values["Uid"].split() == [str(uid)] * 4
+            assert values["Gid"].split() == [str(gid)] * 4
+            for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+                assert int(values[key].strip(), 16) == 0
+            assert values["NoNewPrivs"].strip() == "1"
+            print("BRIDGE_IDENTITY dedicated_uid=true capabilities=0 no_new_privs=true")
+            yield uid
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=5)
 
 
 def _capture(stand: Stand) -> dict:
@@ -202,10 +268,25 @@ def test_lan_https_attributes_real_tproxy_socket(gateway):
         server_offset = server_log.stat().st_size
         diagnostic["pinned_bridge"] = _pinned_bridge_https(gateway, certificate)
         diagnostic["bridge_pinned"] = _bridge_dials(server_log, server_offset)
+        diagnostic["bridge_udp_recaptured"] = _bridge_udp_recaptured(
+            log_path, offset, gateway.servers["hk"])
     print(json.dumps(diagnostic, sort_keys=True))
     assert result["https_complete"] is True
     assert result["accepted_route"] == {"state": "observed", "group": group,
                                         "matches_pinned_outbound": None}
+    if group == "sing-box":
+        assert diagnostic["bridge_udp_recaptured"] == 0
+        assert diagnostic["pinned_bridge"].get("ok") is True
+        assert diagnostic["pinned_bridge"].get("http") == 200
+
+
+def _bridge_udp_recaptured(path, offset, server):
+    destinations = (f"{netns.INET_IP}:{server.relay_port}", f"{server.domain}:{server.relay_port}")
+    with path.open(encoding="utf-8") as stream:
+        stream.seek(offset)
+        return sum("[tproxy-in " in line and
+                   any(f"accepted udp:{target} " in line for target in destinations)
+                   for line in stream)
 
 
 def _bridge_dials(path, offset):
