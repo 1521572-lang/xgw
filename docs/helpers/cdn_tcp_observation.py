@@ -2,6 +2,7 @@
 
 import threading
 import time
+from itertools import pairwise
 
 from xgw import zapret2
 from xgw.net import cmd
@@ -12,6 +13,10 @@ MAX_WINDOW = 16
 LATE_SAMPLE_SECONDS = 1.0
 FIELDS = ("bytes_sent", "bytes_acked", "bytes_received", "bytes_retrans",
           "data_segs_in", "retrans_total")
+TIMING_FIELDS = (
+    "first_sample_ms", "largest_sample_gap_ms", "first_send_ms", "first_payload_ack_ms",
+    "first_receive_ms", "first_retransmit_ms",
+)
 
 
 def read_sockets(peer):
@@ -38,8 +43,29 @@ def snapshot_pid(path):
     return pid if pid > 0 else None
 
 
-def summarize(baseline, observations, *, peer, pid, finished, tls_timeout):
-    observations = [(at, row) for at, row in observations if at <= finished]
+def _sample_timing(samples, started):
+    first_sample = samples[0][0]
+    return {
+        "first_sample_ms": round((first_sample - started) * 1000),
+        "largest_sample_gap_ms": max(
+            (round((late[0] - early[0]) * 1000) for early, late in pairwise(samples)), default=None),
+        **{
+            label: next((round((at - started) * 1000) for at, row in samples if criterion(row)),
+                        None)
+            for label, criterion in (
+                ("first_send_ms", lambda row: row["bytes_sent"] > 0),
+                ("first_payload_ack_ms", lambda row: row["bytes_acked"] > 1),
+                ("first_receive_ms",
+                 lambda row: row["bytes_received"] > 0 and row["data_segs_in"] > 0),
+                ("first_retransmit_ms", lambda row: row["bytes_retrans"] > 0),
+            )
+        },
+    }
+
+
+def summarize(baseline, observations, *, peer, pid, finished, tls_timeout, started=None):
+    observations = [(at, row) for at, row in observations
+                    if at <= finished and (started is None or started <= at)]
     if baseline["state"] != "read" or any(row["state"] != "read" for _, row in observations):
         return {"state": "socket_stats_unavailable"}
     existing = {row["socket"] for row in baseline["sockets"]}
@@ -47,6 +73,7 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout):
     samples = []
     unowned = False
     for observed, listing in observations:
+        measured = set()
         for row in listing["sockets"]:
             if (row["socket"] in existing or row["peer_ip"] != peer
                     or row["state"] not in ("ESTAB", "SYN-SENT")):
@@ -57,7 +84,9 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout):
             if owners != [pid]:
                 continue
             candidates.add(row["socket"])
-            if row["state"] == "ESTAB" and all(type(row.get(key)) is int for key in FIELDS):
+            if (row["state"] == "ESTAB" and row["socket"] not in measured
+                    and all(type(row.get(key)) is int for key in FIELDS)):
+                measured.add(row["socket"])
                 samples.append((observed, row))
     if len(candidates) > 1:
         return {"state": "ambiguous"}
@@ -72,6 +101,8 @@ def summarize(baseline, observations, *, peer, pid, finished, tls_timeout):
     late_gap = max(0, finished - last_at)
     result = {"samples": len(samples), "last_sample_before_end_ms": round(late_gap * 1000),
               **{key: counters[key] for key in FIELDS}}
+    if started is not None:
+        result.update(_sample_timing(samples, started))
     if counters["bytes_received"] > 0 and counters["data_segs_in"] > 0:
         state = "tcp_data_received"
     elif not tls_timeout or late_gap > LATE_SAMPLE_SECONDS or len(samples) < 3:
@@ -94,7 +125,8 @@ def watch_transfer(peer, pid, transfer):
 
     stop = threading.Event()
     observations = []
-    deadline = time.monotonic() + MAX_WINDOW
+    started = time.monotonic()
+    deadline = started + MAX_WINDOW
 
     def collect():
         for _ in range(MAX_SAMPLES):
@@ -118,5 +150,5 @@ def watch_transfer(peer, pid, transfer):
         watcher.join()
     tls_timeout = (result.get("curl_rc") == 28 and bool(result.get("tcp"))
                    and not result.get("tls"))
-    return result, summarize(baseline, observations, peer=peer, pid=pid, finished=finished,
-                             tls_timeout=tls_timeout)
+    return result, summarize(baseline, observations, peer=peer, pid=pid, started=started,
+                             finished=finished, tls_timeout=tls_timeout)

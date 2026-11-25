@@ -220,13 +220,18 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route):
               "direct_range_verified": direct_ok, "vpn_range_verified": vpn_ok,
               "vpn_attempt": "retry" if control is not vpn else "first"}
     if "wan_tcp" in direct:
-        from docs.helpers.cdn_tcp_observation import FIELDS
+        from docs.helpers.cdn_tcp_observation import FIELDS, MAX_WINDOW, TIMING_FIELDS
 
         observed = direct["wan_tcp"]
         if (direct_group == "zapret2" and direct.get("peer")
                 and direct.get("actual_peer") == direct["peer"]):
             keys = ("state", "samples", "last_sample_before_end_ms", *FIELDS)
             report["direct_tcp"] = {key: observed[key] for key in keys if key in observed}
+            for key in TIMING_FIELDS:
+                if key in observed:
+                    value = observed[key]
+                    if value is None or type(value) is int and 0 <= value <= MAX_WINDOW * 1000:
+                        report["direct_tcp"][key] = value
         else:
             report["direct_tcp"] = {"state": "path_unconfirmed"}
     return report

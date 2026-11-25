@@ -201,8 +201,12 @@ def test_pair_reports_tcp_only_with_an_observed_direct_route(route):
     direct = {"url_sha256": "digest", "peer": "1.1.1.1", "actual_peer": "1.1.1.1",
               "outcome": "tls_timeout",
               "wan_tcp": {"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518,
+                          "first_send_ms": 280, "first_payload_ack_ms": 340,
+                          "first_receive_ms": None, "first_retransmit_ms": "private",
+                          "largest_sample_gap_ms": 99999, "first_sample_ms": True,
                           "cookie": "private"}}
     result = cdn.evaluate_pair(direct, {}, {"state": route, "group": "zapret2"}, {})
-    expected = ({"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518}
+    expected = ({"state": "ack_without_tcp_data", "samples": 23, "bytes_acked": 518,
+                 "first_send_ms": 280, "first_payload_ack_ms": 340, "first_receive_ms": None}
                 if route == "observed" else {"state": "path_unconfirmed"})
     assert result["direct_tcp"] == expected
