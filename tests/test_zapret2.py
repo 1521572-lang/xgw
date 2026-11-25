@@ -1006,9 +1006,14 @@ def test_corrupt_budget_cannot_grant_probe(spent):
     assert not h.controller._budget(h.cfg)
 
 
-def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(monkeypatch):
+def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(monkeypatch, tmp_path):
+    from xgw.desync import client, schema
+    from xgw.watch.zapret2_control import card
+
     h = Harness()
     h.cfg.zapret2.daily_probe_mb = 1
+    h.cfg.desync = schema.migrate(vars(h.cfg.zapret2))
+    key = schema.fingerprint(h.cfg.desync)
     boundary = 21000 * z.PROBE_DAY_SECONDS
     wall = boundary - 1
     monkeypatch.setattr(z.time, "time", lambda: wall)
@@ -1017,6 +1022,13 @@ def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(m
     def request(_url, port, *_args):
         calls.append(port)
         return checks.DownloadResult(ok=True, status=200)
+
+    def sample():
+        snapshot = {"updated": wall - 0.5, "capture": {"loaded": True},
+                    "zapret2": h.controller.view, "zapret2_policy_key": key}
+        budget = h.controller._read_budget(h.cfg).status()
+        return client.observation({"zapret2": card(
+            h.cfg, snapshot, {"mode": "on"}, True, now=wall, probe_budget=budget)})
 
     h.controller._request = request
     h.activate()
@@ -1027,6 +1039,7 @@ def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(m
     assert calls == [20011]
     remaining = h.controller._read_budget(h.cfg).remaining_bytes
     assert remaining == z.PROBE_CHARGE
+    rows = [sample()]
 
     recent = list(h.runtime.events)
     h.step(400, vpn_probe_port=20011)
@@ -1038,8 +1051,19 @@ def test_exhausted_budget_preserves_vpn_control_and_reopens_after_utc_boundary(m
         "resets_at": boundary + z.PROBE_DAY_SECONDS,
     }
     for seconds in (401, 402, 403):
+        wall += 5
         h.step(seconds, vpn_probe_port=20011)
+        rows.append(sample())
     assert h.runtime.up and z.active(h.current)
+    assert [(row["state"], row["reason"]) for row in rows] == [
+        ("fallback", "probe_budget"), ("preparing", "probe_inbound"),
+        ("preparing", "nfqueue"), ("active", "probes_ok"),
+    ]
+    path = tmp_path / "rollover.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    summary = client.analyze(path)
+    assert summary["budget"]["confirmed_utc_rollovers"] == 1
+    assert summary["selected_recovery"]["by_fallback_reason"] == {"probe_budget": 1}
 
 
 @pytest.mark.parametrize("raw", ['{"day": 1, "bytes": true}', '{"day": 3, "bytes": 0}', '{}'])

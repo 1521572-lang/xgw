@@ -58,6 +58,36 @@ def test_monitor_does_not_infer_a_transition_across_an_intervening_sample(tmp_pa
     assert stats["observed_returns_to_active"] == 0
 
 
+def test_monitor_counts_retry_stages_and_repeated_preparing_snapshot(tmp_path):
+    stats = summarize(
+        tmp_path, sample(100, "fallback"), sample(120, "preparing", reason="probe_inbound"),
+        sample(140, "preparing", reason="probe_inbound", observed_at=119),
+        sample(160, "preparing", reason="nfqueue"), sample(180, "active"),
+        sample(200, "active"),
+    )
+    assert stats["observed_returns_to_active"] == 1
+    assert stats["by_fallback_reason"] == {"youtube_cdn_probe_failed": 1}
+    assert stats["max_sampling_window_seconds"] == 80
+
+
+@pytest.mark.parametrize("middle", [
+    sample(140, "preparing", reason="probe_inbound"),
+    sample(140, "preparing", reason="nfqueue", observed_at=118),
+    sample(140, "preparing", reason="nfqueue", config_key="changed"),
+    sample(140, "preparing", reason="nfqueue", fresh=False),
+    sample(140, "pending", reason="route_reconcile"),
+    {"at": 140, "error": "api_unavailable"},
+    sample(100, "preparing", reason="nfqueue"),
+    sample(500, "preparing", reason="nfqueue"),
+])
+def test_monitor_requires_a_contiguous_ordered_retry_within_one_window(tmp_path, middle):
+    last_at = 701 if middle["at"] == 500 else 160
+    stats = summarize(tmp_path, sample(100, "fallback"), sample(120, "preparing", reason="nfqueue"),
+                      middle, sample(last_at, "active"))
+    assert stats["observed_returns_to_active"] == 0
+    assert stats["max_sampling_window_seconds"] is None
+
+
 def test_monitor_keeps_legacy_or_rewound_samples_out_of_recovery_count(tmp_path):
     old_sample = sample(100, "fallback")
     del old_sample["observed_at"]
