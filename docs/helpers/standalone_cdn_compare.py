@@ -79,6 +79,7 @@ def sample(source, first=None, *, wan_tcp_snapshot=None):
 def observe(url, peer, *, capture_redirect=False, wan_tcp_snapshot=None):
     record = {"url_sha256": hashlib.sha256(url.encode()).hexdigest(), "peer": peer}
     started = time.time()
+    started_monotonic_ns = time.monotonic_ns()
     options = {"capture_redirect": True} if capture_redirect else {}
     tcp = None
 
@@ -100,6 +101,8 @@ def observe(url, peer, *, capture_redirect=False, wan_tcp_snapshot=None):
         return {**record, "outcome": "probe_runtime_error"}, None
     if tcp is not None:
         record["wan_tcp"] = tcp
+        record["started_monotonic_ns"] = started_monotonic_ns
+        record["finished_monotonic_ns"] = time.monotonic_ns()
     return {**record, "outcome": outcome(result), "actual_peer": result.get("remote_ip"),
             "started": started, "finished": time.time(),
             "local_ip": result.get("local_ip"), "local_port": result.get("local_port"),
@@ -194,7 +197,7 @@ def compare(direct, vpn, origin):
             "standalone": public_sample(direct), "vpn": control}
 
 
-def evaluate_pair(direct, vpn, direct_route, vpn_route):
+def evaluate_pair(direct, vpn, direct_route, vpn_route, *, queue_snapshots=None):
     control, route = vpn, vpn_route
     if vpn.get("outcome") == "http_redirect" and "retry" in vpn:
         control = vpn["retry"]
@@ -234,6 +237,14 @@ def evaluate_pair(direct, vpn, direct_route, vpn_route):
                         report["direct_tcp"][key] = value
         else:
             report["direct_tcp"] = {"state": "path_unconfirmed"}
+    if queue_snapshots is not None:
+        from docs.helpers.cdn_queue_observation import summarize
+
+        if (direct_group == "zapret2" and direct.get("peer")
+                and direct.get("peer") == direct.get("actual_peer")):
+            report["direct_queue"] = summarize(*queue_snapshots, direct)
+        else:
+            report["direct_queue"] = {"state": "path_unconfirmed"}
     return report
 
 
@@ -307,6 +318,8 @@ def main():
     decision = commands.add_parser("evaluate")
     for name in ("direct", "vpn", "direct_route", "vpn_route"):
         decision.add_argument(name, type=Path)
+    decision.add_argument("--queue-before", type=Path)
+    decision.add_argument("--queue-after", type=Path)
     commands.add_parser("page")
     summary = commands.add_parser("compare")
     summary.add_argument("direct", type=Path)
@@ -328,10 +341,15 @@ def main():
         record = prepare_pair(args.source, args.output)
         ok = record["state"] == "vpn_range_verified"
     elif args.action == "evaluate":
+        if bool(args.queue_before) != bool(args.queue_after):
+            parser.error("--queue-before and --queue-after must be supplied together")
+        snapshots = ((read_sample(args.queue_before), read_sample(args.queue_after))
+                     if args.queue_before is not None else None)
         try:
             record = evaluate_pair(
                 read_sample(args.direct), read_sample(args.vpn),
                 read_sample(args.direct_route), read_sample(args.vpn_route),
+                queue_snapshots=snapshots,
             )
         except (TypeError, AttributeError):
             record = {"state": "invalid_evidence"}

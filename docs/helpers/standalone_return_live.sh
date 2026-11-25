@@ -185,6 +185,11 @@ snapshot() {
   sudo -n timeout -k 2 12 env "PYTHONPATH=$D/tree/src" "$PY" -B -P -m xgw.desync.route_evidence snapshot
 }
 
+queue_snapshot() {
+  sudo -n timeout -k 1 4 env "PYTHONPATH=$D/tree:$D/tree/src" "$PY" -B -P \
+    -m docs.helpers.cdn_queue_observation
+}
+
 sample_cdn() {
   local deadline=$1
   shift
@@ -358,8 +363,12 @@ if [[ $MODE != resume ]]; then
       run direct-counters-before snapshot || true
       if [[ $MODE == cdn-pair ]]; then
         direct_peer+=(--wan-tcp-snapshot "$D/direct-counters-before.out")
+        run direct-queue-before queue_snapshot || true
       fi
       run direct-cdn sample_cdn 32 "$format" "${direct_peer[@]}" || true
+      if [[ $MODE == cdn-pair ]]; then
+        run direct-queue-after queue_snapshot || true
+      fi
       run direct-counters-after snapshot || true
       direct_end=$(($(date +%s) + 1))
     fi
@@ -391,7 +400,8 @@ if [[ $MODE != resume ]]; then
     run off-route route_observation off "$off_begin" "$off_end" || true
     if [[ $MODE == cdn-pair && $direct_revision == confirmed ]]; then
       run pair-verdict "$PY" -B -P -m docs.helpers.standalone_cdn_compare evaluate \
-        "$D/direct-cdn.out" "$D/off-cdn.out" "$D/direct-route.out" "$D/off-route.out" || true
+        "$D/direct-cdn.out" "$D/off-cdn.out" "$D/direct-route.out" "$D/off-route.out" \
+        --queue-before "$D/direct-queue-before.out" --queue-after "$D/direct-queue-after.out" || true
       cat "$D/pair-verdict.out"
     elif [[ $MODE == cdn-pair ]]; then
       printf 'STANDALONE_LIVE_CDN_PAIR_REVISION_UNCONFIRMED\n'

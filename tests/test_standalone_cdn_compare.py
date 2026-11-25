@@ -210,3 +210,22 @@ def test_pair_reports_tcp_only_with_an_observed_direct_route(route):
                  "first_send_ms": 280, "first_payload_ack_ms": 340, "first_receive_ms": None}
                 if route == "observed" else {"state": "path_unconfirmed"})
     assert result["direct_tcp"] == expected
+
+
+def test_queue_comparison_is_published_only_for_the_observed_direct_peer(monkeypatch):
+    from docs.helpers import cdn_queue_observation as queue
+
+    direct = {"peer": "1.1.1.1", "actual_peer": "1.1.1.1"}
+    route = {"state": "observed", "group": "zapret2"}
+    snapshots = ({"boundary": "before"}, {"boundary": "after"})
+
+    def summarize(before, after, request):
+        assert (before, after) == snapshots and request is direct
+        return {"state": "observed", "netlink_delta": 0}
+
+    monkeypatch.setattr(queue, "summarize", summarize)
+    before = cdn.evaluate_pair(direct, {}, route, {}, queue_snapshots=snapshots)
+    assert before["direct_queue"] == {"state": "observed", "netlink_delta": 0}
+    direct["actual_peer"] = "8.8.8.8"
+    after = cdn.evaluate_pair(direct, {}, route, {}, queue_snapshots=snapshots)
+    assert after["direct_queue"] == {"state": "path_unconfirmed"}
