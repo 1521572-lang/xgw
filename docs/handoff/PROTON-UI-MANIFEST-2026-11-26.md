@@ -4,7 +4,7 @@
 
 ### 1. Получить и установить клиент из одного дерева
 
-В текущем локальном клоне XGW открыть Bash. Если объекта ещё нет, получить вместе с ТЗ файл `xgw-proton-p1.bundle` и задать `BUNDLE` равным его абсолютному пути. Для импорта нужен базовый коммит `9e4c025`. Если его нет в клоне, выполнить `git fetch origin integration/zapret2-batch1`. Если файла bundle нет на машине, запросить его у владельца. Команды ниже выполнять подряд в одном терминале.
+В локальном клоне XGW открыть Bash и выполнить команды подряд в одном терминале. Если закреплённой ревизии ещё нет в клоне, команды получат bundle из ветки `docs/flash-proton-ui-manifest` на GitHub, сверят SHA-256 и импортируют код. Для импорта нужна история до `9e4c025`. [Git bundle](artifacts/xgw-proton-p1.bundle)
 
 ```bash
 set -euo pipefail
@@ -15,12 +15,17 @@ test "$(id -u)" != 0
 /usr/bin/python3 -I -c 'from PyQt6 import QtWidgets, QtSvg'
 repo=$(git rev-parse --show-toplevel)
 pin=92053147a07a923a662bc91edc9ff1e8a00db1db
-if ! git -C "$repo" cat-file -e "$pin^{commit}" 2>/dev/null; then
-    git -C "$repo" bundle verify "${BUNDLE:?нужен путь к переданному bundle}"
-    git -C "$repo" fetch "$BUNDLE" refs/heads/feat/reproducible-proton-ui-and-manifest
-fi
 umask 077
 d=$(mktemp -d)
+if ! git -C "$repo" cat-file -e "$pin^{commit}" 2>/dev/null; then
+    bundle="$d/xgw-proton-p1.bundle"
+    git -C "$repo" fetch --no-tags origin refs/heads/docs/flash-proton-ui-manifest
+    git -C "$repo" show FETCH_HEAD:docs/handoff/artifacts/xgw-proton-p1.bundle > "$bundle"
+    printf '%s  %s\n' '90b271a8694ce384251ce2ed17ab179c68b232828f1d509b1da17b3f4b0ab907' "$bundle" | sha256sum --check -
+    git -C "$repo" bundle verify "$bundle"
+    git -C "$repo" fetch "$bundle" refs/heads/feat/reproducible-proton-ui-and-manifest
+fi
+git -C "$repo" cat-file -e "$pin^{commit}"
 mkdir "$d/source" "$d/previous" "$d/clean" "$d/update" "$d/prefs"
 git -C "$repo" archive "$pin" | tar -x -C "$d/source"
 git -C "$repo" archive 2c98b28 src packaging config.example.toml | tar -x -C "$d/previous"
